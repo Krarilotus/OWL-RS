@@ -87,7 +87,14 @@ planned.
   Under `owl2-dl`, budgets and undecided candidates give `sound-only` (raise the `dl.*`
   budgets, or ask `dl-answers=exact` to get an error instead), and an operator that isn't
   monotone over answers that may be missing gives `unsound`
-  ([what an answer promises](what-it-covers.md#what-an-answer-promises)).
+  ([what an answer promises](what-it-covers.md#what-an-answer-promises)). Under `owl2-dl`
+  and `owl2-ql`, a query that matches a number or a date it names or computes against the
+  data gives `sound-only` at best: the store matches it as written, so `"01"^^xsd:integer`
+  doesn't find a stored `"1"`. Compare values in a `FILTER` instead
+  ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)). Any value
+  the query computes counts, so a computed string or IRI matched against the data
+  (`BIND(CONCAT(…) AS ?n)`, `BIND(IRI(…) AS ?s)`) gives `sound-only` too, though nothing
+  is missed.
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo` and make no new blank nodes; with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)). None known.
@@ -95,11 +102,50 @@ planned.
   (a budget or the timeout) goes through, and the status says `unknown`; no answer is then
   complete ([consistency](spec/reasoning-semantics.md#consistency)). Raise `dl.timeout`
   and the `dl.*` budgets ([configuration](ops/config-reference.md#reasoner)).
+- Under `owl2-dl`, an ontology with annotation-property axioms (a domain, range or
+  super-property of an annotation property) or a punned name (one IRI as a class or
+  property and as an individual) leaves the rules-only route. With annotation-property
+  axioms every answer is `unsound`; with punning, every answer is `unsound` where an
+  `owl:sameAs` reaches a punned name. Both are the whole ontology's, not the query's
+  ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
+  Remove such axioms, give the individual its own IRI, or use `owl2-rl`, whose promise
+  is the rules' reading.
+- Under `owl2-dl`, where the OWL 2 RL rules find a clash in such an ontology, this release
+  doesn't decide whether the data is consistent under OWL 2 DL: the commit is refused,
+  saying so, and data loaded with such a clash is `undecided` and quarantined, with the
+  reason in `/dataset/info` (`consistency_reason`). The check is the whole ontology's, so a
+  real clash beside an unrelated punned name reads `undecided` too, and a DL engine's later
+  verdict at a query doesn't change readiness. In quarantine, each commit rebuilds the
+  inferences in full, and under `owl2-dl` reads the asserted ontology once more to tell
+  `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
+  annotation property's domain, range or super-property, or give the individual its own
+  IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
+- An undeclared property used with literal values is read as a data property. Declare
+  annotation properties such as `skos:prefLabel` (`skos:prefLabel a owl:AnnotationProperty`);
+  otherwise a labelled class reads as punned, and under `owl2-dl` it leaves the rules-only
+  route. Nothing in this release shows which properties were typed by their use; this
+  query lists the ones used with literals and given no declaration:
+
+  ```sparql
+  PREFIX owl: <http://www.w3.org/2002/07/owl#>
+  SELECT DISTINCT ?property WHERE {
+    ?subject ?property ?value .
+    FILTER(isLiteral(?value))
+    FILTER NOT EXISTS {
+      VALUES ?kind { owl:DatatypeProperty owl:ObjectProperty owl:AnnotationProperty }
+      ?property a ?kind .
+    }
+    FILTER(!STRSTARTS(STR(?property), "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+        && !STRSTARTS(STR(?property), "http://www.w3.org/2000/01/rdf-schema#")
+        && !STRSTARTS(STR(?property), STR(owl:)))
+  }
+  ```
 - Bulk loads skip the commit gates ([storage](spec/02-storage-and-transactions.md#bulk-loads)):
   neither SHACL nor the OWL 2 DL consistency check runs. With reasoning on,
   `nrese-server load` recomputes the inferences and fails when the rules' consistency
-  checks find a violation (under `owl2-dl`, those of OWL 2 RL); the data stays loaded, and
-  the store is quarantined until it is repaired. With reasoning off, nothing is checked
+  checks find a violation (under `owl2-dl`, those of OWL 2 RL; `undecided`, as above, where
+  OWL 2 DL may read the ontology otherwise); the data stays loaded, and the store is
+  quarantined until it is repaired. With reasoning off, nothing is checked
   ([consistency](spec/reasoning-semantics.md#consistency)). For the gates, load over HTTP
   (Graph Store), or validate after the load with `GET /dataset/shacl`.
 

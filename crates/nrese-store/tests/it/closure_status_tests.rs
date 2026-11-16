@@ -12,6 +12,7 @@ use nrese_store::{
 };
 
 use crate::dl::{PREFIXES, insert, pipeline, pipeline_with};
+use crate::ql_rewriting_tests::Rng;
 
 /// eq-ref (OWL 2 Profiles §4.3, table 4), which the RL rules leave out: `:rex owl:sameAs
 /// :rex` is entailed, so NOT EXISTS removes `:rex` and the certain answers are none.
@@ -225,7 +226,14 @@ fn member_wrongs(store: &StoreService) -> Vec<String> {
 /// [`DATA`] under `owl2-dl`, on the RL route ([`DATA`] is in OWL 2 RL) or off it (an
 /// existential superclass is outside OWL 2 RL).
 fn dl(off_the_rl_route: bool) -> nrese_store::MutationPipeline {
-    let dl = pipeline();
+    dl_in(pipeline(), off_the_rl_route)
+}
+
+/// [`dl`] in `dl`'s configuration.
+fn dl_in(
+    dl: nrese_store::MutationPipeline,
+    off_the_rl_route: bool,
+) -> nrese_store::MutationPipeline {
     let existential = ":Dog rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :owns ; \
                        owl:someValuesFrom :Dog ] .";
     let data = format!("{DATA} {}", if off_the_rl_route { existential } else { "" });
@@ -493,7 +501,8 @@ fn only_operators_that_can_make_a_row_wrong_label_a_dl_answer_unsound() {
 /// decides, saying so (docs/spec/reasoning-semantics.md, "A plan's status"). One read per
 /// status and reason kind: a plain read, a denied one (an annotation, the one part of the
 /// reserved vocabulary print prints), that under NOT EXISTS, an ordered slice, and the
-/// `owl:sameAs` entry, on and off the RL route.
+/// `owl:sameAs` entry, on and off the RL route; under OWL 2 DL also with user rules and
+/// with `dl.consistency = "off"`, whose reasons the run adds whatever path decides.
 #[test]
 fn every_place_gives_a_query_the_answers_status() {
     use nrese_sparql::Completeness;
@@ -514,12 +523,42 @@ fn every_place_gives_a_query_the_answers_status() {
     let ql = closure(DATA, Ruleset::Owl2Ql, QlRewritingMode::Auto);
     let rl = closure(DATA, Ruleset::Owl2Rl, QlRewritingMode::Auto);
     let (on, off) = (dl(false), dl(true));
+    // The two reasons the DL run adds whatever path decides: user rules (one that reads
+    // nothing of DATA) and a consistency that isn't checked.
+    let rules = || {
+        let rule = "{ ?x a <http://example.com/Special> } => { ?x a <http://example.com/Rare> } .";
+        crate::user_rules_tests::pipeline(nrese_reasoner::ReasoningMode::Owl2Dl, rule)
+    };
+    let unchecked = || {
+        pipeline_with(DlConfig {
+            consistency: nrese_store::DlConsistency::Off,
+            ..DlConfig::default()
+        })
+    };
+    let (rules_on, rules_off) = (dl_in(rules(), false), dl_in(rules(), true));
+    let (unchecked_on, unchecked_off) = (dl_in(unchecked(), false), dl_in(unchecked(), true));
     let stores = [
         ("owl2-rl with the rewriting", &printed_for, true),
         ("owl2-ql", &ql, false),
         ("owl2-rl", &rl, false),
         ("owl2-dl on the RL route", on.store(), false),
         ("owl2-dl off it", off.store(), false),
+        (
+            "owl2-dl with user rules on the RL route",
+            rules_on.store(),
+            false,
+        ),
+        ("owl2-dl with user rules off it", rules_off.store(), false),
+        (
+            "owl2-dl, consistency off, on the RL route",
+            unchecked_on.store(),
+            false,
+        ),
+        (
+            "owl2-dl, consistency off, off it",
+            unchecked_off.store(),
+            false,
+        ),
     ];
     fn report(r: &Option<nrese_sparql::ql::QlReport>) -> Option<&nrese_sparql::Completeness> {
         r.as_ref().map(|r| &r.completeness)
@@ -724,4 +763,689 @@ fn owl2_dl_same_as_of_a_term_the_upper_bound_doesnt_type_is_never_complete() {
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `:a0`'s value of `:d1` is the integer 2, written `"2"`; `"+2"` is another lexical form of
+/// the same value (XML Schema Datatypes, `xsd:integer`'s lexical space).
+const PLUS_TWO: &str = ":d1 a owl:DatatypeProperty . :a0 :d1 \"2\"^^xsd:integer .";
+
+/// Each `(data, read, certain)` loaded and asked, run and planned: the answer holds every
+/// IRI of `certain`, or neither status says `complete`. The wrong ones, as lines.
+fn misses_and_says_complete(
+    store: impl Fn(&str) -> StoreService,
+    cases: &[(&str, &str, &[&str])],
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for &(data, read, certain) in cases {
+        let (rows, status) = answer(&store(data), read);
+        let missing: Vec<_> = certain
+            .iter()
+            .filter(|t| !rows.contains(&format!("example.com/{t}\"")))
+            .collect();
+        eprintln!("{read}: missing {missing:?}, {status:?}");
+        if !missing.is_empty() && status.contains(&"complete") {
+            wrong.push(format!("{data} / {read}: missing {missing:?}, {status:?}"));
+        }
+    }
+    wrong
+}
+
+/// A key on one data value in two lexical forms (`1` and `"01"` as xsd:integer) equates
+/// `:a` and `:b` (OWL 2 Direct Semantics, HasKey), so `:b :p :x` is entailed. The owl2-rl
+/// closure lacks it: the rule set leaves out dt-eq. Its `false` must not be labelled
+/// complete at any place the read reaches (run, plan, and the rewriting's report in both),
+/// with the rewriting on or not; that the other places give the same value is
+/// [`every_place_gives_a_query_the_answers_status`]'s. Each status is printed.
+#[test]
+fn owl2_rl_calls_no_answer_a_key_misses_by_term_complete() {
+    never_complete(":ssn a owl:DatatypeProperty .");
+}
+
+/// As [`owl2_rl_calls_no_answer_a_key_misses_by_term_complete`], with `:ssn` undeclared: the
+/// rewriting's schema reads no assertions, so it can't tell `:ssn` carries data values.
+#[test]
+fn owl2_rl_calls_no_answer_a_key_on_an_undeclared_property_misses_complete() {
+    never_complete("");
+}
+
+/// A max cardinality in plain Turtle (`1`, an xsd:integer): at most one `:p` equates `:x`
+/// and `:y` (OWL 2 Direct Semantics), but the owl2-rl rules read only the mapping's
+/// spelling (`"1"^^xsd:nonNegativeInteger`). Its `false` must not be labelled complete at
+/// any place, as the key's: neither the equality's nor that of `:y :q :z`, which follows
+/// from it and reads no equality.
+#[test]
+fn owl2_rl_calls_no_answer_a_plain_max_cardinality_misses_complete() {
+    let data = ":C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+           owl:maxCardinality 1 ] . \
+         :p a owl:ObjectProperty . :q a owl:ObjectProperty . \
+         :c a :C ; :p :x , :y . :x :q :z .";
+    for read in ["ASK { :x owl:sameAs :y }", "ASK { :y :q :z }"] {
+        no_place_complete(data, read);
+    }
+}
+
+/// A maximum qualified by `owl:onDataRange rdfs:Literal`: at most no value of `:age`, and
+/// `:c` has one, so the data has no model and every statement is entailed. No owl2-rl rule
+/// reads `owl:onDataRange` (cls-maxqc1-4 read `owl:onClass`), so the closure misses the
+/// clash: no place may call `ASK { :c a :Z }`'s `false` complete.
+#[test]
+fn owl2_rl_calls_no_answer_a_qualified_data_maximum_misses_complete() {
+    no_place_complete(
+        ":age a owl:DatatypeProperty . \
+         :C a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :age ; \
+           owl:maxQualifiedCardinality \"0\"^^xsd:nonNegativeInteger ; \
+           owl:onDataRange rdfs:Literal ] . \
+         :c a :C ; :age 5 .",
+        "ASK { :c a :Z }",
+    );
+}
+
+/// An existential on `:age`, which is undeclared and carries a literal, filled by `filler`.
+fn data_existential(filler: &str) -> String {
+    format!(
+        ":Aged a owl:Class . \
+         [ a owl:Restriction ; owl:onProperty :age ; owl:someValuesFrom {filler} ] \
+           rdfs:subClassOf :Aged . \
+         :a :age 5 ."
+    )
+}
+
+/// An existential on `:knows`, which is undeclared and carries an individual of `:B`, `:C`
+/// and `:D`, filled by the class expression `classes`.
+fn object_existential(classes: &str) -> String {
+    format!(
+        ":B a owl:Class . :C a owl:Class . :D a owl:Class . \
+         [ a owl:Restriction ; owl:onProperty :knows ; owl:someValuesFrom {classes} ] \
+           rdfs:subClassOf :Social . \
+         :a :knows :x . :x a :B , :C , :D ."
+    )
+}
+
+/// What the four places (run, rewriting, plan, plan's rewriting) call an answer: `complete`
+/// everywhere with the rewriting on, or `sound-only`; the rewriting's reports are there with
+/// it on only.
+fn matrix(complete: bool, ql: QlRewritingMode) -> [&'static str; 4] {
+    match ql {
+        QlRewritingMode::On if complete => ["complete"; 4],
+        QlRewritingMode::On => ["sound-only"; 4],
+        _ => ["sound-only", "none", "sound-only", "none"],
+    }
+}
+
+/// An undeclared property's existential, read by its filler alone (the rewriting's schema
+/// reads no assertions). The rows are OWL 2 RL's data ranges (Profiles §4.2.4, grammar in
+/// §6.3: `DataRange := Datatype | DataIntersectionOf`): a datatype of RL (§4.2.1;
+/// `rdfs:Literal`'s answer is the entailed one, see
+/// [`owl2_rl_answers_an_undeclared_data_existential_over_any_literal`]), one a
+/// DatatypeDefinition names, an intersection typed `rdfs:Datatype` or not, one nested, and
+/// one whose operands are one shared intersection (`_:r` twice, typed or not: a shared
+/// expression the reader reads, no cycle); then two outside RL: a union with an
+/// intersection in it, and an untyped datatype restriction. 5 is in each, so `:a :age 5`
+/// makes `:a` `:Aged` (OWL 2 Direct Semantics, DataSomeValuesFrom), by dt-type2, which the
+/// rule set leaves out: the closure's `false` is `sound-only` at the run and the plan, and
+/// at both rewriting reports with the rewriting on (`none` without it). Each row's control
+/// fills the existential on `:knows` with classes of the same shape, an object restriction
+/// the rules derive (cls-int1, cls-uni, cls-svf1): `true`, `sound-only` at the run and the
+/// plan without the rewriting, and with it `complete` in every place (a data reading would
+/// call it so in none).
+#[test]
+fn owl2_rl_reads_an_undeclared_existential_by_its_filler() {
+    // (the data range's definitions, the data range, the control's definitions, the control)
+    let rows = [
+        ("", "xsd:integer", "", ":B"),
+        (
+            ":Number a rdfs:Datatype ; owl:equivalentClass xsd:integer .",
+            ":Number",
+            "",
+            ":B",
+        ),
+        (
+            "",
+            "[ a rdfs:Datatype ; owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
+            "",
+            "[ a owl:Class ; owl:intersectionOf ( :B :C ) ]",
+        ),
+        (
+            "",
+            "[ owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
+            "",
+            "[ owl:intersectionOf ( :B :C ) ]",
+        ),
+        (
+            "",
+            "[ owl:intersectionOf ( [ owl:intersectionOf ( xsd:integer xsd:decimal ) ] xsd:int ) ]",
+            "",
+            "[ owl:intersectionOf ( [ owl:intersectionOf ( :B :C ) ] :D ) ]",
+        ),
+        (
+            "_:r owl:intersectionOf ( xsd:integer xsd:decimal ) .",
+            "[ owl:intersectionOf ( _:r _:r ) ]",
+            "_:o owl:intersectionOf ( :B :C ) .",
+            "[ owl:intersectionOf ( _:o _:o ) ]",
+        ),
+        (
+            "_:r a rdfs:Datatype ; owl:intersectionOf ( xsd:integer xsd:decimal ) .",
+            "[ owl:intersectionOf ( _:r _:r ) ]",
+            "_:o a owl:Class ; owl:intersectionOf ( :B :C ) .",
+            "[ owl:intersectionOf ( _:o _:o ) ]",
+        ),
+        (
+            "",
+            "[ owl:unionOf ( [ owl:intersectionOf ( xsd:integer xsd:decimal ) ] xsd:string ) ]",
+            "",
+            "[ owl:unionOf ( [ owl:intersectionOf ( :B :C ) ] :D ) ]",
+        ),
+        (
+            "",
+            "[ owl:onDatatype xsd:integer ; owl:withRestrictions ( [ xsd:minInclusive 1 ] ) ]",
+            "",
+            ":B",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    let mut check = |name: String, data: &str, read: &str, answer: &str| {
+        eprintln!("{name}:");
+        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+            let (text, line, statuses, _) = places(data, read, ql);
+            if !text.contains(answer) || statuses != matrix(answer == "true", ql) {
+                wrong.push(format!("{name}: {line}"));
+            }
+        }
+    };
+    for (definitions, range, defined, classes) in rows {
+        let data = format!("{definitions} {}", data_existential(range));
+        let filler = format!("filler {}", [definitions, range].join(" ").trim());
+        check(filler, &data, "ASK { :a a :Aged }", "false");
+        let control = format!("{defined} {}", object_existential(classes));
+        let name = format!("control {}", [defined, classes].join(" ").trim());
+        check(name, &control, "ASK { :a a :Social }", "true");
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `:a :age 5` and ∃age.rdfs:Literal ⊑ :Aged entail `:a a :Aged` (every literal is in
+/// `rdfs:Literal`; no datatype rule is needed). With the rewriting on, the filler says the
+/// undeclared `:age` is a data property, and the answer is the entailed `true`; on `Auto`,
+/// the closure's `false` is called complete in no place.
+#[test]
+fn owl2_rl_answers_an_undeclared_data_existential_over_any_literal() {
+    let data = data_existential("rdfs:Literal");
+    let mut wrong = Vec::new();
+    for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+        let (text, line, statuses, _) = places(&data, "ASK { :a a :Aged }", ql);
+        let right = match ql {
+            QlRewritingMode::On => text.contains("true"),
+            _ => text.contains("false") && !statuses.contains(&"complete"),
+        };
+        if !right {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The generated tests' seed, in their names.
+const SEED: u64 = 0x5eed_da7a;
+
+/// Fillers in Turtle, from a seed. Each composite node is written in place (`[ … ]`) or as
+/// a shared blank node defined once (`_:sN …`), which later nodes may name again, twice in
+/// one list too; a node names only earlier ones, so there is no cycle.
+struct Fillers {
+    random: Rng,
+    definitions: Vec<String>,
+    shared: Vec<String>,
+}
+
+impl Fillers {
+    /// A fresh generator from [`SEED`].
+    fn new() -> Self {
+        Self {
+            random: Rng(SEED),
+            definitions: Vec::new(),
+            shared: Vec::new(),
+        }
+    }
+
+    /// The node of `po` (its predicates and objects), in place or shared.
+    fn node(&mut self, po: String) -> String {
+        if !self.random.chance(40) {
+            return format!("[ {po} ]");
+        }
+        let name = format!("_:s{}", self.definitions.len());
+        self.definitions.push(format!("{name} {po} ."));
+        self.shared.push(name.clone());
+        name
+    }
+
+    /// Now and then a shared node already defined, named again.
+    fn again(&mut self) -> Option<String> {
+        (!self.shared.is_empty() && self.random.chance(30))
+            .then(|| self.shared[self.random.below(self.shared.len())].clone())
+    }
+
+    /// The shared nodes' definitions so far, and a fresh start for the next filler.
+    fn take(&mut self) -> String {
+        self.shared.clear();
+        std::mem::take(&mut self.definitions).join(" ")
+    }
+
+    /// A data range of depth at most `depth`: a datatype, an enumeration of literals or a
+    /// datatype restriction, or a complement, intersection or union of data ranges; typed
+    /// `rdfs:Datatype` or not.
+    fn data(&mut self, depth: usize) -> String {
+        if let Some(name) = self.again() {
+            return name;
+        }
+        let typed = if self.random.chance(30) {
+            "a rdfs:Datatype ; "
+        } else {
+            ""
+        };
+        let po = match self.random.below(if depth == 0 { 3 } else { 6 }) {
+            0 => {
+                let datatypes = ["xsd:integer", "xsd:decimal", "xsd:int", "xsd:string"];
+                return datatypes[self.random.below(4)].to_owned();
+            }
+            1 => format!("{typed}owl:oneOf ( 5 7 )"),
+            2 => format!(
+                "{typed}owl:onDatatype xsd:integer ; owl:withRestrictions ( [ xsd:minInclusive 1 ] )"
+            ),
+            3 => format!("{typed}owl:datatypeComplementOf {}", self.data(depth - 1)),
+            kind => {
+                let operands: Vec<String> = (0..2).map(|_| self.data(depth - 1)).collect();
+                let operator = if kind == 4 {
+                    "intersectionOf"
+                } else {
+                    "unionOf"
+                };
+                format!("{typed}owl:{operator} ( {} )", operands.join(" "))
+            }
+        };
+        self.node(po)
+    }
+
+    /// A data range of RL (Profiles §4.2.4) that holds every `xsd:int`: `xsd:int` or a
+    /// datatype above it, or an intersection of such; typed `rdfs:Datatype` or not.
+    fn rl_data(&mut self, depth: usize) -> String {
+        if let Some(name) = self.again() {
+            return name;
+        }
+        let typed = if self.random.chance(30) {
+            "a rdfs:Datatype ; "
+        } else {
+            ""
+        };
+        if self.random.below(if depth == 0 { 1 } else { 2 }) == 0 {
+            return ["xsd:int", "xsd:integer", "xsd:decimal"][self.random.below(3)].to_owned();
+        }
+        let operands: Vec<String> = (0..2).map(|_| self.rl_data(depth - 1)).collect();
+        let operands = operands.join(" ");
+        self.node(format!("{typed}owl:intersectionOf ( {operands} )"))
+    }
+
+    /// A class expression of depth at most `depth` that `:x`, in `:B`, `:C` and `:D`, is in:
+    /// one of them, an intersection of such, or a union of such with or without a complement
+    /// of a named class beside them; typed `owl:Class` or not.
+    fn classes(&mut self, depth: usize) -> String {
+        if let Some(name) = self.again() {
+            return name;
+        }
+        let named = |random: &mut Rng| [":B", ":C", ":D"][random.below(3)];
+        if depth == 0 || self.random.chance(30) {
+            return named(&mut self.random).to_owned();
+        }
+        let typed = if self.random.chance(30) {
+            "a owl:Class ; "
+        } else {
+            ""
+        };
+        let mut operands: Vec<String> = (0..2).map(|_| self.classes(depth - 1)).collect();
+        let operator = if self.random.chance(50) {
+            "intersectionOf"
+        } else {
+            if self.random.chance(50) {
+                operands.push(format!("[ owl:complementOf {} ]", named(&mut self.random)));
+            }
+            "unionOf"
+        };
+        self.node(format!("{typed}owl:{operator} ( {} )", operands.join(" ")))
+    }
+}
+
+/// [`owl2_rl_reads_an_undeclared_existential_by_its_filler`] over generated fillers, a wrong
+/// case named by its half and index:
+/// - 200 data ranges ([`Fillers::data`]: every constructor the reader classifies, nested to
+///   depth three, with shared nodes named again). Each says the undeclared `:age` is a data
+///   property: the places say what the table's data rows say, whatever the answer.
+/// - Most of those are outside RL, where a class reading is `sound-only` too. So 200 of RL's
+///   own ([`Fillers::rl_data`]), each holding the `xsd:int` 5 by its build: `:a a :Aged` is
+///   entailed, so the answer is `true` or no place calls it complete.
+/// - The mirror, 200 class expressions `:x` is in ([`Fillers::classes`]): object ones, the
+///   rules derive `:a a :Social`, `complete` in every place with the rewriting on. With a
+///   complement in them it is `sound-only`: RL has no complement in a subclass expression
+///   (Profiles §4.2.3, `subClassExpression`).
+#[test]
+fn generated_fillers_are_read_by_their_kind_seed_5eedda7a() {
+    let mut wrong = Vec::new();
+    let mut check = |name: String, data: &str, read: &str, answer: &str, complete: bool| {
+        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+            let (text, line, statuses, _) = places(data, read, ql);
+            if !text.contains(answer) || statuses != matrix(complete, ql) {
+                wrong.push(format!("{name}: {data} / {line}"));
+            }
+        }
+    };
+    let (aged, social) = ("ASK { :a a :Aged }", "ASK { :a a :Social }");
+    let mut fillers = Fillers::new();
+    for i in 0..200 {
+        let range = fillers.data(3);
+        let data = format!("{} {}", fillers.take(), data_existential(&range));
+        check(format!("data {i}"), &data, aged, "", false);
+        let classes = fillers.classes(3);
+        let control = format!("{} {}", fillers.take(), object_existential(&classes));
+        let complete = !control.contains("owl:complementOf");
+        check(format!("control {i}"), &control, social, "true", complete);
+    }
+    let mut fillers = Fillers::new();
+    for i in 0..200 {
+        let range = fillers.rl_data(3);
+        let data = format!(
+            "{} {} :a :age \"5\"^^xsd:int .",
+            fillers.take(),
+            data_existential(&range)
+        );
+        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+            let (text, line, statuses, _) = places(&data, aged, ql);
+            if !text.contains("true") && statuses.contains(&"complete") {
+                wrong.push(format!("rl {i}: {data} / {line}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong: {wrong:#?}", wrong.len());
+}
+
+/// Thirty intersections, each of the one before twice (`_:c1` is `( _:c0 _:c0 )`, …): a data
+/// range, read once per node. A walk along every path would take 2³⁰ steps; this one reads
+/// it in the test's ordinary time, and no place calls the answer complete.
+#[test]
+fn a_deep_chain_of_shared_data_ranges_is_read_once_per_node() {
+    let chain: Vec<String> = (1..=30)
+        .map(|i| {
+            let before = i - 1;
+            format!("_:c{i} owl:intersectionOf ( _:c{before} _:c{before} ) .")
+        })
+        .collect();
+    let data = format!(
+        "_:c0 owl:intersectionOf ( xsd:integer xsd:decimal ) . {} {}",
+        chain.join(" "),
+        data_existential("_:c30")
+    );
+    let started = std::time::Instant::now();
+    no_place_complete(&data, "ASK { :a a :Aged }");
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(60), "{took:?}");
+}
+
+/// The key's case, `:ssn` declared by `declaration`: see [`no_place_complete`].
+fn never_complete(declaration: &str) {
+    let data = format!(
+        ":Person owl:hasKey ( :ssn ) . {declaration} \
+         :p a owl:ObjectProperty . :a a :Person ; :ssn 1 ; :p :x . \
+         :b a :Person ; :ssn \"01\"^^xsd:integer ."
+    );
+    no_place_complete(&data, "ASK { :b :p :x }");
+}
+
+/// `data` under owl2-rl, and `read`, entailed but `false` over the closure: no place calls
+/// it complete, with the rewriting on or not.
+fn no_place_complete(data: &str, read: &str) {
+    let wrong = complete_anywhere(data, read);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// [`no_place_complete`]'s check, its wrong answers as lines.
+fn complete_anywhere(data: &str, read: &str) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+        let (text, line, statuses, reported) = places(data, read, ql);
+        // With the rewriting on, its report is one of the places.
+        let complete = statuses.contains(&"complete");
+        if !text.contains("false") || complete || (ql == QlRewritingMode::On && !reported) {
+            wrong.push(line);
+        }
+    }
+    wrong
+}
+
+/// An `owl2-dl` store loaded with `data` in one commit.
+fn owl2_dl(data: &str) -> StoreService {
+    let dl = pipeline();
+    insert(&dl, data).expect("data");
+    dl.store().as_ref().clone()
+}
+
+/// Under the OWL 2 Direct Semantics a literal denotes its value, so a pattern's constant
+/// in another lexical form of a stored value matches it (OWL 2 Direct Semantics §2.2, the
+/// literal interpretation `⋅LT`; seed 86's `"+2"`, and seed 113's `"01"` against `"1"` and
+/// `"+1"`). Spec: an `owl2-dl` answer that misses such a match isn't `complete`, for a
+/// constant in the pattern, through `VALUES` and through `BIND`, on the RL route (`"+2"`), on
+/// the bounds' path (a key over `:d0` reads its values: seed 113), and for a value an
+/// individual holds only through an equality ([`THROUGH_EQUALITY`]).
+#[test]
+fn owl2_dl_calls_no_answer_complete_that_a_constants_other_spelling_misses() {
+    let seed_113 = ":d0 a owl:DatatypeProperty . :C0 owl:hasKey ( :d0 ) . \
+                    :a1 a :C0 ; :d0 \"1\"^^xsd:integer . :a2 a :C0 ; :d0 \"+1\"^^xsd:integer .";
+    let wrong = misses_and_says_complete(
+        owl2_dl,
+        &[
+            (THROUGH_EQUALITY, ONE_AS_PLUS_ONE, &["a0", "a1", "a2"]),
+            (THROUGH_EQUALITY, ONE_AS_ZERO_ONE, &["a0", "a1", "a2"]),
+            (
+                PLUS_TWO,
+                "SELECT ?v { ?v :d1 \"+2\"^^xsd:integer }",
+                &["a0"],
+            ),
+            (
+                PLUS_TWO,
+                "SELECT ?v { VALUES ?n { \"+2\"^^xsd:integer } ?v :d1 ?n }",
+                &["a0"],
+            ),
+            (
+                PLUS_TWO,
+                "SELECT ?v { BIND(\"+2\"^^xsd:integer AS ?n) ?v :d1 ?n }",
+                &["a0"],
+            ),
+            (
+                seed_113,
+                "SELECT ?v { ?v :d0 \"01\"^^xsd:integer }",
+                &["a1", "a2"],
+            ),
+        ],
+    );
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// [`owl2_dl_calls_no_answer_complete_that_a_constants_other_spelling_misses`] under
+/// `owl2-ql`, where the rewriting's `complete` is the same promise ("no certain answer under
+/// the OWL 2 Direct Semantics is missing", docs/spec/reasoning-semantics.md).
+#[test]
+fn owl2_ql_calls_no_answer_complete_that_a_constants_other_spelling_misses() {
+    let store = |data: &str| closure(data, Ruleset::Owl2Ql, QlRewritingMode::Auto);
+    let wrong = misses_and_says_complete(
+        store,
+        &[
+            (
+                PLUS_TWO,
+                "SELECT ?v { ?v :d1 \"+2\"^^xsd:integer }",
+                &["a0"],
+            ),
+            (THROUGH_EQUALITY, ONE_AS_PLUS_ONE, &["a0", "a1", "a2"]),
+            (THROUGH_EQUALITY, ONE_AS_ZERO_ONE, &["a0", "a1", "a2"]),
+        ],
+    );
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Seed 2577: `:a0` is in `:C2`, so it is its own `:p1` value, and `:C2` allows at most one;
+/// `:a1` and `:a2` are its `:p1` values too, so all three are one individual (OWL 2 Direct
+/// Semantics, `ObjectMaxCardinality`), and `:a1` and `:a2` hold `:a0`'s `"1"` only through
+/// that equality.
+const THROUGH_EQUALITY: &str = ":p1 a owl:ObjectProperty . :d1 a owl:DatatypeProperty . \
+     :C2 owl:equivalentClass [ a owl:Restriction ; owl:onProperty :p1 ; owl:hasValue :a0 ] ; \
+     rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p1 ; owl:maxCardinality 1 ] . \
+     :a0 a :C2 ; :p1 :a1 , :a2 ; :d1 \"1\"^^xsd:integer .";
+
+/// [`THROUGH_EQUALITY`]'s value asked in two other spellings.
+const ONE_AS_PLUS_ONE: &str = "SELECT ?v { ?v :d1 \"+1\"^^xsd:integer }";
+const ONE_AS_ZERO_ONE: &str = "SELECT ?v { ?v :d1 \"01\"^^xsd:integer }";
+
+/// The control: a string has one lexical form per value (`xsd:string`), and a language-tagged
+/// string is its own value, so matching by term is matching by value. Spec: such a constant,
+/// in the pattern or through `VALUES`, leaves the answer `complete` under `owl2-dl`, run and
+/// planned.
+#[test]
+fn a_string_constant_leaves_an_owl2_dl_answer_complete() {
+    let data = ":name a owl:DatatypeProperty . :a0 :name \"Rex\" , \"Rex\"@en .";
+    let mut wrong = Vec::new();
+    for read in [
+        "SELECT ?v { ?v :name \"Rex\" }",
+        "SELECT ?v { ?v :name \"Rex\"@en }",
+        "SELECT ?v { VALUES ?n { \"Rex\" } ?v :name ?n }",
+    ] {
+        let (rows, status) = answer(&owl2_dl(data), read);
+        eprintln!("{read}: {rows} {status:?}");
+        if !rows.contains("example.com/a0") || status != ["complete"; 2] {
+            wrong.push(format!("{read}: {rows} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The control for a typed constant that no pattern matches: bound to a variable that is
+/// only compared in a `FILTER` (which SPARQL does by value), or only projected
+/// (`(1 AS ?k)`), it misses no row, whatever its spelling. Spec: under `owl2-dl` and
+/// `owl2-ql` such an answer holds its row and is `complete`, run and planned.
+#[test]
+fn a_typed_constant_no_pattern_matches_leaves_an_answer_complete() {
+    let data = ":age a owl:DatatypeProperty . :a0 :age 7 .";
+    let ql = |data: &str| closure(data, Ruleset::Owl2Ql, QlRewritingMode::Auto);
+    let mut wrong = Vec::new();
+    for read in [
+        "SELECT ?v { ?v :age ?a BIND(5 AS ?n) FILTER(?a > ?n) }",
+        "SELECT ?v (1 AS ?k) { ?v :age ?a }",
+    ] {
+        for (regime, store) in [("owl2-dl", owl2_dl(data)), ("owl2-ql", ql(data))] {
+            let (rows, status) = answer(&store, read);
+            eprintln!("{regime} {read}: {rows} {status:?}");
+            if !rows.contains("example.com/a0") || status != ["complete"; 2] {
+                wrong.push(format!("{regime} {read}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A value the query computes and then matches against the data: `2 + 3` is the integer 5,
+/// which `:a0`'s `"05"` is too, and a copy (`BIND(?c AS ?d)`) carries the same value. Under
+/// the OWL 2 Direct Semantics `:a0` is a certain answer of both. Spec: under `owl2-dl` and
+/// `owl2-ql` an answer that misses it isn't `complete`, run and planned.
+#[test]
+fn no_answer_is_complete_that_a_computed_values_other_spelling_misses() {
+    let data = ":p a owl:DatatypeProperty . :a0 :p \"05\"^^xsd:integer .";
+    let reads: [(&str, &str, &[&str]); 2] = [
+        (data, "SELECT ?x { BIND(2 + 3 AS ?c) ?x :p ?c }", &["a0"]),
+        (
+            data,
+            "SELECT ?x { BIND(5 AS ?c) BIND(?c AS ?d) ?x :p ?d }",
+            &["a0"],
+        ),
+    ];
+    let ql = |data: &str| closure(data, Ruleset::Owl2Ql, QlRewritingMode::Auto);
+    let mut wrong = misses_and_says_complete(owl2_dl, &reads);
+    wrong.extend(misses_and_says_complete(ql, &reads));
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The known over-mark: a computed value is counted whatever its type, so a string or an
+/// IRI the query computes and matches against the data lowers the answer, though a string
+/// or an IRI has one spelling and the match misses nothing. Spec (docs/limits.md): under
+/// `owl2-dl` and `owl2-ql` such an answer holds its row and is `sound-only`, run and planned.
+#[test]
+fn a_computed_string_or_iri_at_a_patterns_end_is_marked_sound_only() {
+    let data = ":name a owl:DatatypeProperty . :a0 :name \"Rex\" .";
+    let ql = |data: &str| closure(data, Ruleset::Owl2Ql, QlRewritingMode::Auto);
+    let mut wrong = Vec::new();
+    for read in [
+        "SELECT ?v { BIND(CONCAT(\"R\", \"ex\") AS ?n) ?v :name ?n }",
+        "SELECT ?v { BIND(IRI(\"http://example.com/a0\") AS ?v) ?v :name \"Rex\" }",
+    ] {
+        for (regime, store) in [("owl2-dl", owl2_dl(data)), ("owl2-ql", ql(data))] {
+            let (rows, status) = answer(&store, read);
+            eprintln!("{regime} {read}: {rows} {status:?}");
+            if !rows.contains("example.com/a0") || status != ["sound-only"; 2] {
+                wrong.push(format!("{regime} {read}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `read` over `data`'s owl2-rl closure with the rewriting `ql`: its answer, a printed line
+/// with what each place (the run, its rewriting, the plan, the plan's rewriting) calls it,
+/// those four names (`none`: no status), and whether the run has the rewriting's report.
+fn places(
+    data: &str,
+    read: &str,
+    ql: QlRewritingMode,
+) -> (String, String, [&'static str; 4], bool) {
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}{read}"));
+    let name = |c: Option<&nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
+    let store = closure(data, Ruleset::Owl2Rl, ql);
+    let run = store.execute_query(&request).expect("answered");
+    let prepared = store.prepare_query(&request).expect("prepared");
+    let planned = store
+        .plan_query(&prepared, &CancellationToken::new())
+        .expect("planned");
+    let text = String::from_utf8_lossy(&run.payload).into_owned();
+    let places = [
+        ("run", run.completeness.as_ref()),
+        ("ql", run.ql.as_ref().map(|r| &r.completeness)),
+        ("plan", planned.completeness.as_ref()),
+        ("plan's ql", planned.ql.as_ref().map(|r| &r.completeness)),
+    ];
+    let line = format!(
+        "rewriting {ql:?}: {text} {:?}",
+        places.map(|(p, c)| (p, name(c)))
+    );
+    eprintln!("{line}");
+    (text, line, places.map(|(_, c)| name(c)), run.ql.is_some())
+}
+
+/// cls-maxc2 names its cardinality as the term `"1"^^xsd:nonNegativeInteger`, and the rule
+/// set leaves out dt-eq: under owl2-rl only that spelling is read, and plain Turtle
+/// `owl:maxCardinality 1` (an xsd:integer) or `"01"^^xsd:nonNegativeInteger` doesn't
+/// equate `:x` and `:y`.
+#[test]
+fn owl2_rl_reads_only_the_mappings_spelling_of_a_max_cardinality() {
+    let mut wrong = Vec::new();
+    for (card, read) in [
+        ("\"1\"^^xsd:nonNegativeInteger", true),
+        ("1", false),
+        ("\"01\"^^xsd:nonNegativeInteger", false),
+    ] {
+        let data = format!(
+            ":C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+               owl:maxCardinality {card} ] . \
+             :p a owl:ObjectProperty . :c a :C ; :p :x , :y ."
+        );
+        let store = closure(&data, Ruleset::Owl2Rl, QlRewritingMode::Auto);
+        let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ :x owl:sameAs :y }}"));
+        let run = store.execute_query(&request).expect("answered");
+        let text = String::from_utf8_lossy(&run.payload).into_owned();
+        eprintln!("owl2-rl maxCardinality {card}: ASK {{ :x owl:sameAs :y }} answers {text}");
+        if text.contains("true") != read {
+            wrong.push(format!("{card}: {text}"));
+        }
+    }
+    assert!(wrong.is_empty(), "spellings read otherwise: {wrong:#?}");
 }

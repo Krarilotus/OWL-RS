@@ -113,7 +113,7 @@ fn tsv(view: &impl ReadView, text: &str, options: &QueryOptions) -> Vec<u8> {
 /// `text`'s answer on `view` as TSV the way the store writes it: from the cache's bytes, or
 /// written and offered to it.
 fn tsv_through_the_cache(view: &impl ReadView, text: &str, options: &QueryOptions) -> Vec<u8> {
-    match cached_output(view, &parse(text), options, TSV, "") {
+    match cached_output(view, &parse(text), options, TSV, b"") {
         CachedOutput::Hit(bytes) => bytes.to_vec(),
         CachedOutput::Miss(slot) => {
             let written = tsv(view, text, options);
@@ -419,7 +419,7 @@ fn an_output_slot_offered_after_a_commit_answers_no_other_revision() {
     let options = with_cache(&cache);
     let text = &queries()[0];
     let old = engine.snapshot();
-    let CachedOutput::Miss(old_slot) = cached_output(&old, &parse(text), &options, TSV, "") else {
+    let CachedOutput::Miss(old_slot) = cached_output(&old, &parse(text), &options, TSV, b"") else {
         panic!("nothing cached yet");
     };
     let old_bytes = tsv(&old, text, &QueryOptions::default());
@@ -433,7 +433,7 @@ fn an_output_slot_offered_after_a_commit_answers_no_other_revision() {
     old_slot.offer(old_bytes.clone(), std::time::Duration::from_millis(1));
     assert_eq!(tsv_through_the_cache(&new, text, &options), new_bytes);
     assert!(matches!(
-        cached_output(&old, &parse(text), &options, TSV, ""),
+        cached_output(&old, &parse(text), &options, TSV, b""),
         CachedOutput::Miss(_)
     ));
 }
@@ -603,7 +603,7 @@ fn a_refused_canonical_view_is_never_answered_from_the_expanded_bytes() {
     };
     tsv_through_the_cache(&snapshot, &text, &expanded);
     assert!(matches!(
-        cached_output(&snapshot, &parse(&text), &expanded, TSV, ""),
+        cached_output(&snapshot, &parse(&text), &expanded, TSV, b""),
         CachedOutput::Hit(_)
     ));
     let canonical = QueryOptions {
@@ -616,7 +616,7 @@ fn a_refused_canonical_view_is_never_answered_from_the_expanded_bytes() {
     };
     assert!(
         !matches!(
-            cached_output(&snapshot, &parse(&text), &canonical, TSV, ""),
+            cached_output(&snapshot, &parse(&text), &canonical, TSV, b""),
             CachedOutput::Hit(_)
         ),
         "a canonical request read the expanded answer's bytes"

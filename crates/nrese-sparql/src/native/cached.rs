@@ -366,7 +366,7 @@ pub(crate) fn output_key(
     query: &nrese_sparql_syntax::Query,
     options: &crate::QueryOptions,
     format: &str,
-    context: &str,
+    context: &[u8],
 ) -> Option<Arc<[u8]>> {
     use nrese_sparql_syntax::Query;
     if options.pre_bound.is_some() {
@@ -400,7 +400,8 @@ pub(crate) fn output_key(
         encoder.tag(u8::from(read.canonical));
     }
     encoder.text(format);
-    encoder.text(context);
+    encoder.number(context.len() as u64);
+    encoder.bytes.extend_from_slice(context);
     // The QL rewriting changes the answer of the query as parsed (parts see it in the
     // algebra they evaluate): its closure and bounds; its TBox is the snapshot's.
     match super::ql_rewriting(query, options) {
@@ -705,7 +706,7 @@ mod tests {
             ..QueryOptions::default()
         };
         let key = |canonical: bool| {
-            super::output_key(&snapshot, &query, &options(canonical), "text/csv", "")
+            super::output_key(&snapshot, &query, &options(canonical), "text/csv", b"")
                 .expect("an answer that is cached")
         };
         let (canonical, given) = (key(true), key(false));

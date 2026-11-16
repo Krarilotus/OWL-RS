@@ -87,10 +87,18 @@ pub enum StoreError {
     /// committed.
     #[error("the load was cancelled; nothing of it was committed")]
     LoadCancelled,
+    /// A classification or realisation request gave up waiting for the computation under
+    /// way for its revision, which runs on and is kept.
+    #[error("the classification request was cancelled while it waited")]
+    ClassificationCancelled,
     /// A quarantined statement that isn't there, isn't open or can't be admitted as asked
     /// ([`crate::quarantine`]).
     #[error("{0}")]
     Quarantine(String),
+    /// Under `owl2-dl`, the rules' violations aren't decided ([`crate::WhyUndecided`]): no
+    /// answer that rests on the data's consistency.
+    #[error("{0}")]
+    Undecided(String),
     /// Under `owl2-dl` with exact answers asked for (`dl.answers = exact`), or for an OWL 2
     /// DL explanation that wasn't decided: the store can't prove the answers complete, for
     /// the reasons given.
@@ -246,6 +254,8 @@ impl StoreError {
             | Self::MemoryUnreadable { .. }
             | Self::MemoryLimitWithoutAmounts { .. }
             | Self::LoadCancelled
+            | Self::Undecided(_)
+            | Self::ClassificationCancelled
             // Answered by the transport as what it is (the query is fine; its answers
             // can't be proven complete).
             | Self::Incomplete(_) => false,
