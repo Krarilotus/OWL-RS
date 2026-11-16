@@ -80,7 +80,7 @@ fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
         &mut bytes,
         |report| {
             assert_eq!(report.unwrap().checks, 1);
-            String::new()
+            Vec::new()
         },
     )
     .unwrap()
@@ -96,7 +96,7 @@ fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
         &token,
         &nrese_exec::Envelope::unlimited(),
         std::io::sink(),
-        |_| String::new(),
+        |_| Vec::new(),
     )
     .unwrap()
     .unwrap();
@@ -130,7 +130,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
                 .as_ref(),
             );
             tx.commit().unwrap();
-            "same-context".to_owned()
+            b"same-context".to_vec()
         },
     )
     .unwrap();
@@ -149,7 +149,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
                 &prepared.query,
                 &options,
                 prepared.media_type(),
-                "same-context"
+                b"same-context"
             ),
             CachedOutput::Hit(_)
         ),
@@ -165,7 +165,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
         &mut bytes,
         |_| {
             token.cancel();
-            "same-context".to_owned()
+            b"same-context".to_vec()
         },
     )
     .unwrap_err();
@@ -188,7 +188,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
         &CancellationToken::new(),
         &settings.query_envelope(&prepared),
         &mut second,
-        |_| "same-context".to_owned(),
+        |_| b"same-context".to_vec(),
     )
     .unwrap();
     assert_eq!(first, second);
@@ -205,7 +205,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
             &token,
             &nrese_exec::Envelope::unlimited(),
             &mut writer,
-            |_| { "same-context".to_owned() }
+            |_| { b"same-context".to_vec() }
         ),
         Err(StoreError::SparqlEvaluation(
             QueryEvaluationError::Cancelled
@@ -338,7 +338,7 @@ fn prepared_serializers_agree_with_standalone_execution_for_every_form_and_forma
                 &token,
                 &nrese_exec::Envelope::unlimited(),
                 &mut actual,
-                |_| String::new(),
+                |_| Vec::new(),
             )
             .unwrap()
             .unwrap();
