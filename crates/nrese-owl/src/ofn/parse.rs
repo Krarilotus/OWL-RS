@@ -736,6 +736,7 @@ impl<'t, 'm> Parser<'t, 'm> {
             "SubAnnotationPropertyOf" | "AnnotationPropertyDomain" | "AnnotationPropertyRange" => {
                 let property = self.entity()?;
                 self.model.uses.entry(property).or_default().annotation = true;
+                self.model.annotation_schema.push(property);
                 if keyword == "SubAnnotationPropertyOf" {
                     let sup = self.entity()?;
                     self.model.uses.entry(sup).or_default().annotation = true;

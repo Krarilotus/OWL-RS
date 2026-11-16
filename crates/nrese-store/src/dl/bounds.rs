@@ -176,11 +176,14 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// The route the ontology's profile gives (`nrese_owl::profile`): an OWL 2 RL ontology
 /// to the RL rules alone, unless an axiom's rules would compare or type data values: the
 /// rule set leaves out dt-eq and dt-type2 (`nrese_owl::ql::reads_data_values`), so the DL
-/// path decides it by value; or unless a cardinality is spelled otherwise than the rules
-/// name it (`Ontology::noncanonical_cardinality`), so they wouldn't read it.
+/// path decides it by value; or where theorem PR1 doesn't hold, which needs no punning and
+/// no annotation-property axioms (`query::reads_differently` says what that costs); or
+/// unless a cardinality is spelled otherwise than the rules name it
+/// (`Ontology::noncanonical_cardinality`), so they wouldn't read it.
 fn routed_to_rules(ontology: &Ontology) -> bool {
     nrese_owl::profile::of_ontology(ontology).rl
         && nrese_owl::ql::reads_data_values(ontology).is_none()
+        && !nrese_owl::profile::rules_read_differently(ontology)
         && ontology.noncanonical_cardinality.is_none()
 }
 
@@ -212,17 +215,25 @@ impl Kinds {
     /// Whether an asserted triple, inserted or deleted, leaves every term the kinds the
     /// reader gave it, which it gives by use (`nrese_owl::profile::Signature`): a known
     /// annotation property's statement gives none; any other leaves the schema as it is,
-    /// names no class or property as subject or IRI object, and its predicate is
-    /// `rdf:type` with a known class, `owl:sameAs`, or a property known only as the kind
-    /// its object needs (a literal a data property, an IRI an object property). A deleted
-    /// literal needs a declared data property: one that is data only by its literals may
-    /// lose the last one, and its other axioms then read it as an object property.
+    /// names no class or property, and no name of the reserved vocabulary, which the reader
+    /// leaves out (`nrese_owl::diagnostics::reserved_name`), as subject or IRI object, and
+    /// its predicate is `rdf:type` with a known class, `owl:sameAs`, or a property known
+    /// only as the kind its object needs (a literal a data property, an IRI an object
+    /// property). A deleted literal needs a declared data property: one that is data only
+    /// by its literals may lose the last one, and its other axioms then read it as an
+    /// object property.
     fn keep(&self, tx: &Transaction<'_>, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
         let k = &self.signature;
         if k.annotations.contains(&p) {
             return true;
         }
-        if changes_schema(tx, triple) || k.names.contains(&s) {
+        let reserved = |t: u64| match tx.decode(TermId::from_raw(t)) {
+            Some(nrese_rdf::Term::NamedNode(n)) => {
+                nrese_owl::diagnostics::reserved_name(n.as_str())
+            }
+            _ => false,
+        };
+        if changes_schema(tx, triple) || k.names.contains(&s) || reserved(s) {
             return false;
         }
         let iri = TermId::from_raw(o).kind() == nrese_engine::TermKind::Iri;
@@ -234,7 +245,7 @@ impl Kinds {
                 && (!deleted || k.declared_data.contains(&p))
         } else {
             let property = k.objects.contains(&p) && !k.data.contains(&p);
-            !k.names.contains(&o) && (Some(p) == self.same_as || property)
+            !k.names.contains(&o) && !reserved(o) && (Some(p) == self.same_as || property)
         }
     }
 }

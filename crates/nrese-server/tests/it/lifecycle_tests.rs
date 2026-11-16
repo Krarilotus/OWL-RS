@@ -73,3 +73,40 @@ async fn inconsistent_data_is_quarantined_but_readable_and_repairable()
     assert_eq!(ready.status(), StatusCode::OK);
     Ok(())
 }
+
+/// Under `owl2-dl`, a rules clash in an ontology OWL 2 DL reads differently (an annotation
+/// property's domain, disjoint with its subject's class) is undecided: quarantined as an
+/// inconsistent store is, while the dataset's figures say `undecided`, with the violations
+/// and why.
+#[tokio::test]
+async fn an_undecided_store_is_quarantined_and_says_why() -> Result<(), Box<dyn std::error::Error>>
+{
+    let store = StoreService::new(StoreConfig::in_memory())?;
+    let import = MutationPipeline::new(
+        std::sync::Arc::new(store.clone()),
+        std::sync::Arc::new(ReasonerService::new(ReasonerConfig::default())),
+    );
+    import.execute_update(&SparqlUpdateRequest::new(format!(
+        "INSERT DATA {{ <{EX}note> a <http://www.w3.org/2002/07/owl#AnnotationProperty> ;
+                         <http://www.w3.org/2000/01/rdf-schema#domain> <{EX}C> .
+                       <{EX}C> <http://www.w3.org/2002/07/owl#disjointWith> <{EX}D> .
+                       <{EX}x> a <{EX}D> ; <{EX}note> \"v\" }}"
+    )))?;
+    let dl = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl);
+    store.rematerialise(dl.materialised_program().expect("the OWL 2 RL closure"))?;
+    let app = test_app_with_store(store, PolicyConfig::default(), dl)?;
+
+    let ready = app.clone().oneshot(get("/readyz")).await?;
+    assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let info = body_text(app.oneshot(get("/dataset/info")).await?).await?;
+    let info: serde_json::Value = serde_json::from_str(&info)?;
+    assert_eq!(info["status"], "quarantined", "{info}");
+    assert_eq!(info["consistency"], "undecided", "{info}");
+    assert!(info["violations"].as_u64() > Some(0), "{info}");
+    let why = info["consistency_reason"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("annotation-property axioms or a punned name"),
+        "{info}"
+    );
+    Ok(())
+}
