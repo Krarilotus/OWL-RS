@@ -141,3 +141,27 @@ fn dl_answers_derive_nothing_from_graphs_the_reader_cannot_read() {
     let (visible, _) = read(&dl, reader(false), "SELECT ?x { ?x a :F }");
     assert!(visible.contains("example.com/a"), "{visible}");
 }
+
+/// Spec (the replica's fail-closed form): a read replica interns no term
+/// (its dictionary continues the primary's). Where the bounds' terms haven't come with the
+/// records (the data was committed past the pipeline, by `StoreService::bulk_load`, so the
+/// primary never interned them), it answers over L, with no row outside the union's members,
+/// and says `not-certified`.
+#[test]
+fn a_replica_interns_nothing_and_says_not_certified() {
+    let dl = pipeline();
+    crate::support::load_past_the_pipeline(dl.store(), &format!("{PREFIXES}\n{UNION}"));
+    dl.store().mark_replica();
+    let terms = dl.store().engine_stats().dictionary.terms;
+    let (rows, status) = query(&dl, "SELECT ?x { ?x a :D }");
+    assert_eq!(
+        dl.store().engine_stats().dictionary.terms,
+        terms,
+        "the replica interned a term"
+    );
+    assert!(
+        rows.iter().all(|r| ["w", "x", "y"].contains(&r.as_str())),
+        "{rows:?}"
+    );
+    assert_eq!(status.shared.as_str(), "not-certified", "{status:?}");
+}

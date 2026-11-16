@@ -3170,6 +3170,16 @@
               }
             },
             "description": "This server isn't a primary"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "A compact primary serves no replica"
           }
         },
         "summary": "A replica's start: an image of the latest revision, streamed. Administrators only; a\nprimary's.",
@@ -3220,6 +3230,16 @@
               }
             },
             "description": "This server isn't a primary"
+          },
+          "409": {
+            "content": {
+              "application/problem+json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            },
+            "description": "A compact primary serves no replica"
           },
           "410": {
             "content": {
