@@ -1390,6 +1390,81 @@ fn a_computed_string_or_iri_at_a_patterns_end_is_marked_sound_only() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// `:a0`'s value of `:p` is the integer 5, written `"05"`: `2 + 3` and a copy of `5` are the
+/// same value.
+const FIVE: &str = ":p a owl:DatatypeProperty . :a0 :p \"05\"^^xsd:integer .";
+
+/// [`owl2_dl_calls_no_answer_complete_that_a_constants_other_spelling_misses`] under
+/// `owl2-rl` with the QL rewriting on, whose `complete` is the same promise ("no certain
+/// answer under the OWL 2 Direct Semantics is missing", docs/spec/reasoning-semantics.md):
+/// a constant in the pattern, through `VALUES` and through `BIND`, a computed value and a
+/// copy. Spec: an answer that misses the stored value's other spelling isn't `complete`.
+#[test]
+fn owl2_rl_with_the_rewriting_calls_no_answer_complete_that_a_constants_other_spelling_misses() {
+    let store = |data: &str| closure(data, Ruleset::Owl2Rl, QlRewritingMode::On);
+    let wrong = misses_and_says_complete(
+        store,
+        &[
+            (
+                PLUS_TWO,
+                "SELECT ?v { ?v :d1 \"+2\"^^xsd:integer }",
+                &["a0"],
+            ),
+            (
+                PLUS_TWO,
+                "SELECT ?v { VALUES ?n { \"+2\"^^xsd:integer } ?v :d1 ?n }",
+                &["a0"],
+            ),
+            (
+                PLUS_TWO,
+                "SELECT ?v { BIND(\"+2\"^^xsd:integer AS ?n) ?v :d1 ?n }",
+                &["a0"],
+            ),
+            (FIVE, "SELECT ?x { BIND(2 + 3 AS ?c) ?x :p ?c }", &["a0"]),
+            (
+                FIVE,
+                "SELECT ?x { BIND(5 AS ?c) BIND(?c AS ?d) ?x :p ?d }",
+                &["a0"],
+            ),
+        ],
+    );
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The controls under `owl2-rl`. Without the rewriting its answers are never `complete`
+/// (docs/spec/reasoning-semantics.md, "What `complete` refers to"): a typed constant in
+/// either spelling, or a string, leaves them `sound-only`. With the rewriting a string
+/// constant (one spelling per value) and a typed constant only compared in a `FILTER`
+/// (by value) miss nothing and stay `complete`. Spec: run and planned, each answer holds
+/// `:a0` where `:a0` is stored in the read's spelling, with that status.
+#[test]
+fn owl2_rl_keeps_its_status_without_the_rewriting_and_where_no_spelling_is_missed() {
+    let name = ":name a owl:DatatypeProperty . :a0 :name \"Rex\" .";
+    let string = "SELECT ?v { ?v :name \"Rex\" }";
+    let filter = "SELECT ?v { ?v :d1 ?a BIND(1 AS ?n) FILTER(?a > ?n) }";
+    let two = "SELECT ?v { ?v :d1 \"2\"^^xsd:integer }";
+    let plus_two = "SELECT ?v { ?v :d1 \"+2\"^^xsd:integer }";
+    let (auto, on) = (QlRewritingMode::Auto, QlRewritingMode::On);
+    let cases = [
+        (auto, PLUS_TWO, two, true, "sound-only"),
+        (auto, PLUS_TWO, plus_two, false, "sound-only"),
+        (auto, name, string, true, "sound-only"),
+        (on, name, string, true, "complete"),
+        (on, PLUS_TWO, filter, true, "complete"),
+    ];
+    let mut wrong = Vec::new();
+    for (ql, data, read, holds, expected) in cases {
+        let (rows, status) = answer(&closure(data, Ruleset::Owl2Rl, ql), read);
+        eprintln!("{ql:?} {read}: {rows} {status:?}");
+        if rows.contains("example.com/a0\"") != holds || status != [expected; 2] {
+            wrong.push(format!(
+                "{ql:?} {read}: {rows} {status:?}, expected {expected}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// `read` over `data`'s owl2-rl closure with the rewriting `ql`: its answer, a printed line
 /// with what each place (the run, its rewriting, the plan, the plan's rewriting) calls it,
 /// those four names (`none`: no status), and whether the run has the rewriting's report.
