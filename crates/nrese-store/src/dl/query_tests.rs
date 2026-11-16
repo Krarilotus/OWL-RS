@@ -2,16 +2,15 @@ use super::*;
 use nrese_dl::limits::Deadline;
 
 fn lower_true_store() -> Arc<StoreService> {
+    lower_true_store_with(crate::StoreConfig::in_memory())
+}
+
+fn lower_true_store_with(config: crate::StoreConfig) -> Arc<StoreService> {
     use crate::{
         MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest,
     };
     use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-    let store = Arc::new(
-        StoreService::new(crate::StoreConfig {
-            ..crate::StoreConfig::in_memory()
-        })
-        .unwrap(),
-    );
+    let store = Arc::new(StoreService::new(config).unwrap());
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
         Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
@@ -289,6 +288,7 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
             &store,
             &prepared,
             &analyse(prepared.query()),
+            &crate::dl::bounds::view(&store),
             &token,
             &nrese_exec::Envelope::unlimited(),
             mode,
@@ -556,4 +556,63 @@ fn a_read_of_the_inferred_statements_alone_keeps_the_mark_of_its_revision() {
         assert!(path != "run" || answer.contains("true"), "{line}");
         assert_eq!(status.as_str(), "unsound", "{line}");
     }
+}
+
+/// R1-F5: the ontology read the status needs, refused at its budget (nothing cached for the
+/// revision and the bounds' memory spent, between the decision and the status): whether
+/// OWL 2 DL reads the data otherwise than the rules isn't known, so the answers are
+/// `unsound` with that reason, and an exact read is refused. The control: the same exact
+/// read with the memory free is answered.
+#[test]
+fn an_ontology_read_refused_at_its_budget_leaves_the_answers_unsound() {
+    let store = lower_true_store_with(crate::StoreConfig {
+        total_query_memory_bytes: 64 << 20,
+        ..crate::StoreConfig::in_memory()
+    });
+    let mut request = crate::SparqlQueryRequest::all("ASK { ?x a <urn:test:B> }");
+    request.dl_answers = Some(crate::DlAnswers::Exact);
+    let prepared = store.prepare_query(&request).unwrap();
+    let run = || {
+        store.run_query_reporting(
+            &prepared,
+            &CancellationToken::new(),
+            &mut Vec::new(),
+            |_| (),
+        )
+    };
+    assert!(run().is_ok(), "the control: {:?}", run().map(|_| ()));
+    let kept = Arc::clone(store.dl().bounds.kept());
+    let spent = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (cache, budget, held) = (
+        Arc::clone(&store),
+        Arc::clone(&kept),
+        std::rc::Rc::clone(&spent),
+    );
+    crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || {
+        drop(cache.dl().query_ontology.0.lock().unwrap().take());
+        let rest = budget.remaining();
+        budget.charge(rest).unwrap();
+        held.set(rest);
+    })));
+    let refused = run();
+    kept.release(spent.get());
+    assert!(spent.get() > 0, "the hook spent the bounds' memory");
+    let answer = match refused {
+        Err(crate::StoreError::Incomplete(answer)) => answer,
+        other => panic!(
+            "expected the exact read refused, got {:?}",
+            other.map(|_| ())
+        ),
+    };
+    let reasons: Vec<&str> = answer
+        .status
+        .reasons
+        .iter()
+        .map(|r| r.text.as_str())
+        .collect();
+    assert_eq!(answer.status.as_str(), "unsound", "{reasons:?}");
+    assert!(
+        reasons.iter().any(|r| r.contains("isn't known")),
+        "{reasons:?}"
+    );
 }

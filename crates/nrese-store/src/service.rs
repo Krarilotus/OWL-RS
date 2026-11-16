@@ -7,6 +7,7 @@ use nrese_sparql::CancellationToken;
 use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, export_dataset};
 use crate::bulk_load::{BulkLoadReport, BulkLoadRequest, bulk_load};
 use crate::config::{StoreConfig, StoreMode};
+use crate::dl::query::Revision;
 use crate::error::StoreResult;
 use crate::graph_store::{
     GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport, GraphWriteRequest,
@@ -1066,7 +1067,8 @@ impl StoreService {
     /// OWL 2 QL rewriting's where it applies, else a ruleset closure's
     /// ([`Self::status_without_dl`]). One status, [`nrese_sparql::Completeness`].
     /// A reader of some graphs who sees every inference is told `not-certified` where the
-    /// rewriting ran: its assessment reads the schema of every graph.
+    /// rewriting ran, and any reader of some graphs under `owl2-dl`: either assessment reads
+    /// the schema of every graph.
     pub fn run_query_reporting(
         &self,
         prepared: &PreparedQuery,
@@ -1106,6 +1108,7 @@ impl StoreService {
         Option<nrese_sparql::ql::QlReport>,
     )> {
         let run = self.run_reporting_whole(prepared, cancellation, out, report);
+        let run = run.map_err(|error| refusal_for_its_reader(prepared, error));
         for_its_reader(prepared, crate::EntryPoint::Run, run, |_| {})
     }
 
@@ -1131,14 +1134,14 @@ impl StoreService {
             let detail =
                 match crate::dl::query::answer(self, prepared, cancellation, &memory, mode)? {
                     Outcome::Answers(answers, status, detail) => {
-                        report(Some(status));
+                        report(status_for_its_reader(prepared, Some(status), false));
                         crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
                         detail
                     }
                     // Streamed over the snapshot the status was decided on (L's view where
                     // L adds memberships, kept per revision, whose identity is its own),
-                    // never a later revision's; or, for a status that holds whatever the
-                    // revision (sound only), over the latest.
+                    // never a later revision's; or, for a reader of some graphs, whose
+                    // status is withheld, over the latest.
                     Outcome::Stream(status, read, detail) => {
                         let snapshot = match read {
                             Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
@@ -1155,7 +1158,7 @@ impl StoreService {
                             &memory,
                             out,
                             |_| {
-                                report(Some(status));
+                                report(status_for_its_reader(prepared, Some(status), false));
                                 context
                             },
                         )?;
@@ -1173,7 +1176,7 @@ impl StoreService {
             &memory,
             out,
             |ql| {
-                let status = self.status_outside_dl(prepared, ql);
+                let status = self.status_outside_dl(prepared, ql, Revision::Committed(&snapshot));
                 // The cache's context is the whole assessment, not what the reader is told.
                 let context = format!("{status:?}");
                 report(status_for_its_reader(prepared, status, ql.is_some()));
@@ -1185,15 +1188,17 @@ impl StoreService {
 
     /// The status of answers outside the DL bounds: the QL rewriting's report where it ran,
     /// as it left the rewriting with what neither it nor the closure answers composed onto
-    /// it ([`crate::dl::query::certify_report`]); else [`Self::status_without_dl`].
+    /// it ([`crate::dl::query::certify_report`]); else [`Self::status_without_dl`], marked
+    /// for the data `at` the answers were read from.
     fn status_outside_dl(
         &self,
         prepared: &PreparedQuery,
         ql: Option<&nrese_sparql::ql::QlReport>,
+        at: Revision<'_>,
     ) -> Option<nrese_sparql::Completeness> {
         match ql {
             Some(ql) => Some(ql.completeness.clone()),
-            None => self.status_without_dl(prepared),
+            None => self.status_without_dl_at(prepared, at),
         }
     }
 
@@ -1209,6 +1214,15 @@ impl StoreService {
         &self,
         prepared: &PreparedQuery,
     ) -> Option<nrese_sparql::Completeness> {
+        self.status_without_dl_at(prepared, Revision::Committed(&self.engine.snapshot()))
+    }
+
+    /// [`Self::status_without_dl`] of a read of the data `at` (R1-F2, F3).
+    fn status_without_dl_at(
+        &self,
+        prepared: &PreparedQuery,
+        at: Revision<'_>,
+    ) -> Option<nrese_sparql::Completeness> {
         if prepared.read_model() == ReadModel::Asserted {
             return None;
         }
@@ -1221,7 +1235,7 @@ impl StoreService {
                     .to_owned(),
             );
             crate::dl::query::certify_closure(&mut status, prepared.query(), "dl");
-            crate::dl::query::mark(self, &mut status);
+            crate::dl::query::mark(self, at, &mut status);
             return Some(status);
         }
         let ruleset = self
@@ -1301,13 +1315,9 @@ impl StoreService {
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         let memory = self.settings.query_envelope(prepared);
-        let mut explanation = explain_prepared(
-            &self.read_snapshot_within(prepared.access(), &memory, cancellation)?,
-            prepared,
-            &self.settings,
-            cancellation,
-            &memory,
-        )?;
+        let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
+        let mut explanation =
+            explain_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         if let Some(mode) = self.dl_mode(prepared) {
             // The status as the query would answer, never failing for it.
             let mode = match mode {
@@ -1326,7 +1336,9 @@ impl StoreService {
                 refuted: detail.refuted,
             });
         } else {
-            explanation.completeness = self.status_outside_dl(prepared, explanation.ql.as_ref());
+            let at = Revision::Committed(&snapshot);
+            explanation.completeness =
+                self.status_outside_dl(prepared, explanation.ql.as_ref(), at);
         }
         Ok(explanation)
     }
@@ -1359,16 +1371,13 @@ impl StoreService {
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
         let memory = self.settings.query_envelope(prepared);
-        let mut planned = plan_prepared(
-            &self.read_snapshot_within(prepared.access(), &memory, cancellation)?,
-            prepared,
-            &self.settings,
-            cancellation,
-            &memory,
-        )?;
+        let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
+        let mut planned =
+            plan_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
+        let at = Revision::Committed(&snapshot);
         planned.completeness = match self.dl_mode(prepared) {
             Some(_) => Some(crate::dl::query::plan_status(self, prepared)),
-            None => self.status_outside_dl(prepared, planned.ql.as_ref()),
+            None => self.status_outside_dl(prepared, planned.ql.as_ref(), at),
         };
         Ok(planned)
     }
@@ -1585,10 +1594,11 @@ impl StoreService {
                             .to_owned(),
                     );
                             crate::dl::query::certify_closure(&mut status, prepared.query(), "dl");
-                            crate::dl::query::mark(self, &mut status);
+                            let at = Revision::Pending(snapshot);
+                            crate::dl::query::mark(self, at, &mut status);
                             Some(status)
                         }
-                        false => self.status_outside_dl(prepared, ql),
+                        false => self.status_outside_dl(prepared, ql, Revision::Pending(snapshot)),
                     };
                     if deletes && let Some(status) = &mut status {
                         status.unsound(
@@ -2313,16 +2323,34 @@ fn read_model(infer: bool) -> crate::ReadModel {
 /// reader of some graphs who sees every inference (`inferred = "visible"`) is told
 /// `not-certified` wherever the OWL 2 QL rewriting ran: its assessment reads the schema of
 /// every graph. Whether the rewriting runs depends on the query and the configuration, not
-/// on the schema, so the token tells nothing of hidden data.
+/// on the schema, so the token tells nothing of hidden data. So is every reader of some
+/// graphs told it for a status under `owl2-dl` (R1-F1): whether OWL 2 DL reads the data
+/// otherwise than the rules is a question of every graph's axioms
+/// ([`crate::dl::query::mark`]), and the regime is the configuration's.
 fn status_for_its_reader(
     prepared: &PreparedQuery,
     status: Option<nrese_sparql::Completeness>,
     rewritten: bool,
 ) -> Option<nrese_sparql::Completeness> {
-    match rewritten && withholds_certification(prepared) {
+    let dl = status.as_ref().and_then(|s| s.regime) == Some(nrese_sparql::Regime::Owl2Dl);
+    match (rewritten && withholds_certification(prepared)) || (dl && prepared.access().is_some()) {
         true => Some(nrese_sparql::Completeness::not_certified()),
         false => status,
     }
+}
+
+/// An exact answer's refusal as its reader may be told it: its status through
+/// [`status_for_its_reader`], its unresolved candidates only where that is the status.
+fn refusal_for_its_reader(prepared: &PreparedQuery, error: crate::StoreError) -> crate::StoreError {
+    let crate::StoreError::Incomplete(mut answer) = error else {
+        return error;
+    };
+    let told = status_for_its_reader(prepared, Some(answer.status.clone()), false);
+    if let Some(told) = told.filter(|told| *told != answer.status) {
+        answer.status = told;
+        answer.unresolved.clear();
+    }
+    crate::StoreError::Incomplete(answer)
 }
 
 /// [`status_for_its_reader`] for an answer that carries the rewriting's report too, as an
