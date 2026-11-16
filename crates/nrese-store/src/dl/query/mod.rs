@@ -421,6 +421,8 @@ pub(crate) fn answer(
     cancellation.check()?;
     let analysis = analyse(prepared.query());
     let mut outcome = decide_answers(store, prepared, &analysis, cancellation, memory, mode)?;
+    #[cfg(test)]
+    crate::service::hooks::run(&crate::service::hooks::AFTER_DECIDED);
     cancellation.check()?;
     match &mut outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => {
