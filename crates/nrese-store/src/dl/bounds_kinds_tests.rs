@@ -16,18 +16,25 @@ use crate::{
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 
 const PREFIXES: &str = "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#> \
+     PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> \
      PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
      PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
 
-/// A store under `owl2-dl` with `data` committed, on the RL route.
-fn on_the_route(data: &str) -> (Arc<StoreService>, MutationPipeline) {
-    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+/// A store of `config` under `owl2-dl`, and its pipeline.
+fn opened(config: StoreConfig) -> (Arc<StoreService>, MutationPipeline) {
+    let store = Arc::new(StoreService::new(config).unwrap());
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
         Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
             ReasoningMode::Owl2Dl,
         ))),
     );
+    (store, pipeline)
+}
+
+/// A store under `owl2-dl` with `data` committed, on the RL route.
+fn on_the_route(data: &str) -> (Arc<StoreService>, MutationPipeline) {
+    let (store, pipeline) = opened(StoreConfig::in_memory());
     commit(&store, &pipeline, data);
     assert_eq!(
         store.dl_bounds().last,
@@ -60,6 +67,22 @@ fn update(store: &StoreService, pipeline: &MutationPipeline, text: &str) -> bool
     // An unfired hook would fire at a later commit's read.
     seam::set(&store.dl().bounds, Point::Read, || {});
     read
+}
+
+/// `ASK { pattern }`: its answer and its status, as `"<status> <reasons>"`.
+fn ask(store: &StoreService, pattern: &str) -> (bool, String) {
+    let request = crate::SparqlQueryRequest::all(format!("{PREFIXES} ASK {{ {pattern} }}"));
+    let prepared = store.prepare_query(&request).unwrap();
+    let (mut out, mut status) = (Vec::new(), None);
+    store
+        .run_query_reporting(&prepared, &crate::CancellationToken::new(), &mut out, |s| {
+            status = s
+        })
+        .unwrap();
+    let status = status.map_or("none".to_owned(), |s| {
+        format!("{} {:?}", s.as_str(), s.reasons)
+    });
+    (String::from_utf8(out).unwrap().contains("true"), status)
 }
 
 /// Two property names, then an equality of them: it makes them individuals too.
@@ -114,26 +137,98 @@ fn a_later_value_that_is_a_class_reads_again() {
 
 /// A key on an undeclared property, then literal values of it: they make it a data
 /// property, so the key compares data values, which the RL rules don't do by value
-/// (`nrese_owl::ql::reads_data_values`): the ontology leaves the route.
+/// (`nrese_owl::ql::reads_data_values`): the ontology leaves the route, and `:a` and `:b`,
+/// one key value in two lexical forms, are the same individual, so `:b :p :x` holds.
 #[test]
 fn a_later_literal_of_an_undeclared_key_property_leaves_the_route() {
-    let (store, pipeline) = on_the_route(":P owl:hasKey ( :ssn ) . :a a :P . :b a :P .");
+    let (store, pipeline) = on_the_route(":Person owl:hasKey ( :ssn ) . :p a owl:ObjectProperty .");
     assert!(commit(
         &store,
         &pipeline,
-        ":a :ssn \"1\"^^xsd:integer . :b :ssn \"01\"^^xsd:integer .",
+        ":a a :Person ; :ssn 1 ; :p :x . :b a :Person ; :ssn \"01\"^^xsd:integer .",
     ));
     assert_ne!(store.dl_bounds().last, "rules");
+    let (holds, status) = ask(&store, ":b :p :x");
+    eprintln!("ASK {{ :b :p :x }}: {holds}, {status}");
+    assert!(holds, "{status}");
+    assert!(
+        status.starts_with("complete") || status.starts_with("sound-only"),
+        "{status}"
+    );
 }
 
 /// An undeclared property, data only by its one literal, with a datatype range; then that
 /// literal deleted: the range's property is then read as an object property, whose range
-/// can't be a datatype (a reserved name, not read), so the ontology leaves the route.
+/// can't be a datatype (a reserved name, not read), so the ontology leaves the route, and
+/// the reader reports the range it left out.
 #[test]
 fn deleting_the_literal_that_makes_a_property_data_valued_leaves_the_route() {
     let (store, pipeline) = on_the_route(":p rdfs:range xsd:integer . :a :p 1 .");
     assert!(update(&store, &pipeline, "DELETE DATA { :a :p 1 . }"));
     assert_ne!(store.dl_bounds().last, "rules");
+    let snapshot = store.read_snapshot(None).unwrap();
+    let budget = Arc::new(nrese_exec::Budget::unlimited());
+    let read = super::source::read_snapshot(&snapshot, budget).unwrap();
+    assert!(
+        read.diagnostics
+            .iter()
+            .any(|d| matches!(d, nrese_owl::Diagnostic::Reserved { .. })),
+        "{:?}",
+        read.diagnostics
+    );
+}
+
+/// A name of the reserved vocabulary used as an individual is OWL 2 Full, which the reader
+/// leaves out (`nrese_owl::diagnostics::reserved_name`): a commit that so uses one reads
+/// again, and the ontology leaves the route. A built-in annotation property already
+/// known, on either side of an equality; a class of the vocabulary; a reserved value of a
+/// known property.
+#[test]
+fn a_later_individual_use_of_a_reserved_name_reads_again() {
+    for (data, later) in [
+        (
+            ":a a :C ; rdfs:label \"hello\" .",
+            "rdfs:label owl:sameAs :alias .",
+        ),
+        (
+            ":a a :C ; rdfs:label \"hello\" .",
+            ":alias owl:sameAs rdfs:label .",
+        ),
+        (":a a :C .", "owl:Class owl:sameAs :alias ."),
+        (
+            ":owns a owl:ObjectProperty . :ann :owns :rex .",
+            ":ann :owns rdf:nil .",
+        ),
+    ] {
+        let (store, pipeline) = on_the_route(data);
+        assert!(commit(&store, &pipeline, later), "{later}");
+        assert_ne!(store.dl_bounds().last, "rules", "{later}");
+    }
+}
+
+/// The control: the store reopened on that data reads it afresh, off the route as the
+/// commit that read again left it.
+#[test]
+fn a_reopened_store_reads_a_reserved_name_as_an_individual_alike() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let (store, pipeline) = opened(StoreConfig::on_disk(dir.path()));
+        commit(&store, &pipeline, ":a a :C ; rdfs:label \"hello\" .");
+        commit(&store, &pipeline, "rdfs:label owl:sameAs :alias .");
+    }
+    let (store, _pipeline) = opened(StoreConfig::on_disk(dir.path()));
+    assert_ne!(store.dl_bounds().last, "rules");
+}
+
+/// The built-in annotation properties are the reader's vocabulary, interned at every read
+/// (`source::intern_vocabulary`): a store's first `rdfs:label`, then its first
+/// `rdfs:comment`, read nothing again.
+#[test]
+fn a_first_built_in_annotation_keeps_the_short_cut() {
+    let (store, pipeline) = on_the_route(":Dog a owl:Class . :rex a :Dog .");
+    assert!(!commit(&store, &pipeline, ":rex rdfs:label \"rex\" ."));
+    assert!(!commit(&store, &pipeline, ":Dog rdfs:comment \"a dog\" ."));
+    assert_eq!(store.dl_bounds().last, "rules");
 }
 
 /// What keeps the short cut: an assertion with a known class, a known property of its
