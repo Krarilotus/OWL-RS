@@ -351,7 +351,16 @@ impl Engine {
                     .any(|t| t.predicate == same_as)
         });
         self.inner
-            .publish_record(record, false, None, dictionary_len, regroup, same_as, None)
+            .publish_record(
+                record,
+                false,
+                None,
+                dictionary_len,
+                regroup,
+                same_as,
+                None,
+                None,
+            )
             .map(|_| ())
     }
 }
@@ -809,6 +818,7 @@ mod tests {
                 asserted_content: current.asserted_content,
                 canonical: Default::default(),
                 own: Default::default(),
+                certificate: None,
             });
         let mut records = decoded(&batch.frames);
         records.truncate(2);

@@ -223,7 +223,7 @@ fn with_equality() -> (Engine, Terms, TermId) {
     tx.insert_encoded(quad(terms.point, terms.graphs[0]));
     tx.insert_encoded(EncodedQuad::new(s, same_as, alias, TermId::DEFAULT_GRAPH));
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     (engine, terms, alias)
 }
 
@@ -716,7 +716,7 @@ fn a_read_where_equality_applies_expands_over_a_default_graph_stack() {
     assert!(tx.insert_encoded(quad(terms.point, TermId::DEFAULT_GRAPH)));
     assert!(tx.insert_encoded(EncodedQuad::new(s, same_as, alias, TermId::DEFAULT_GRAPH)));
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     let snapshot = engine.snapshot();
     assert_eq!(
         layouts(&snapshot)[0],

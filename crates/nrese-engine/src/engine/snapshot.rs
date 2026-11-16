@@ -876,6 +876,11 @@ impl Snapshot {
             reading: self.version.reading,
             canonical: Default::default(),
             own: Default::default(),
+            // A restriction or a derivation: the source's, as it is published as its source
+            // is. An addition: statements no one vouched for.
+            certificate: (!matches!(of, ViewOf::Addition))
+                .then(|| self.version.certificate.clone())
+                .flatten(),
         });
         let canonical_data = self.canonical_view(&version);
         Snapshot {
@@ -1357,6 +1362,12 @@ impl Snapshot {
 
     pub fn revision(&self) -> u64 {
         self.version.revision
+    }
+
+    /// What was vouched for its version ([`super::Certificate`]). A pending or private
+    /// snapshot carries its base's: it is unpublished ([`Self::shared_state`]).
+    pub fn certificate(&self) -> Option<&super::Certificate> {
+        self.version.certificate.as_ref()
     }
 
     /// What its asserted statements are ([`super::AssertedIdentity`]): shared across the
@@ -2943,7 +2954,7 @@ mod canonical_lifetime_tests {
                 object: rep,
             });
             tx.commit().unwrap();
-            engine.transaction().install_reading(Some(same_as));
+            engine.transaction().install(Some(same_as), None);
             let snapshot = engine.snapshot();
             let canonical = snapshot.with_canonical_equality();
             assert!(!canonical.triple_terms_name_aliases());
@@ -3039,7 +3050,7 @@ mod count_visiting_tests {
             tx.remove(statement(i).as_ref());
         }
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(same_as));
+        engine.transaction().install(Some(same_as), None);
         let snapshot = engine.snapshot();
         let p = snapshot.lookup(ex("p").as_ref().into()).unwrap();
         let pattern = QuadPattern {
