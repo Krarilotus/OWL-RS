@@ -1260,8 +1260,9 @@ impl StoreService {
     /// status of its `route` (the closure's, the QL report's or the bounds'), each step only
     /// taking away. A read of a version no one vouched for, or of an unpublished one passed
     /// as committed, is `not-certified`: `None` only where the version carries no
-    /// certificate, no reasoner is registered and the inferred stack is empty. Pending operations aren't reasoned over before the commit,
-    /// and may delete what their inferences rest on. Under `owl2-dl` the question-only
+    /// certificate, no reasoner is registered and the inferred stack is empty. Pending
+    /// operations aren't reasoned over before the commit, and may delete what their
+    /// inferences rest on. Under `owl2-dl` the question-only
     /// individuals ([`crate::dl::query::mark`]); then the negation rule again, over all that
     /// was taken away.
     pub(crate) fn assess(
@@ -1308,8 +1309,9 @@ impl StoreService {
     /// told its status here reads the rules' closure without the bounds: the inferred
     /// statements alone (`onto:implicit`, `Self::dl_mode`; SYN-72 slice 2 r1 F1), or every
     /// statement outside a transaction; sound only, never complete. A read of every
-    /// statement inside one lacks only its pending operations' reasoning (`Self::assess`). Either is unsound where a missing row can make a returned
-    /// one wrong (`NOT EXISTS`, `MINUS`, …: [`crate::dl::query::certify_closure`]). As
+    /// statement inside one lacks only its pending operations' reasoning (`Self::assess`).
+    /// Either is unsound where a missing row can make a returned one wrong (`NOT EXISTS`,
+    /// `MINUS`, …: [`crate::dl::query::certify_closure`]). As
     /// `prepared`'s reader is told it (`status_for_its_reader`).
     pub fn status_without_dl(
         &self,
