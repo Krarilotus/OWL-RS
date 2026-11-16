@@ -348,6 +348,11 @@ fn a_refused_expanded_read_fails_the_query() {
 /// endpoint's SELECT path): at every limit from 1 KiB to 16 MiB the writer reports success
 /// only with all 20,000 rows written, and otherwise the query's memory error, never success
 /// with the rows read before the refusal.
+///
+/// What it holds: for this query the refusal is reported by the native evaluator's checks
+/// in `Context::holding` and, without that one, in `Context::reshaped`
+/// (`nrese-sparql/src/native/mod.rs`). With both removed, 1 KiB answers success with none
+/// of the rows.
 #[test]
 fn a_refused_expanded_read_written_directly_fails_the_query() {
     use nrese_sparql::{QueryEvaluationError, WriteResultsError};
