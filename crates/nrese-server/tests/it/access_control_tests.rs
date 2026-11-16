@@ -830,3 +830,86 @@ default_graph = "read"
     );
     Ok(())
 }
+
+/// Whether a query's results announce RDF 1.2 (the media type's `version`, JSON's
+/// `version` member, `VERSION "1.2"` first in a graph result) tells a reader nothing of a
+/// graph it can't read: a triple term only there is announced as none at all; one in a
+/// graph it reads is, as its results may then hold it.
+#[tokio::test]
+async fn the_rdf12_announcement_tells_nothing_of_a_graph_the_reader_cannot_read()
+-> Result<(), Box<dyn std::error::Error>> {
+    let term = format!("<{EX}s> <{EX}says> <<( <{EX}x> <{EX}y> <{EX}z> )>>");
+    let (json, member) = ("application/sparql-results+json", "\"version\":\"1.2\"");
+    let mut wrong = Vec::new();
+    for (form, query, accept, marker) in [
+        ("SELECT", "SELECT * WHERE { ?s ?p ?o }", json, member),
+        ("ASK", "ASK { ?s ?p ?o }", json, member),
+        (
+            "CONSTRUCT",
+            "CONSTRUCT WHERE { ?s ?p ?o }",
+            "text/turtle",
+            "VERSION \"1.2\"\n",
+        ),
+    ] {
+        let mut told = Vec::new();
+        for graph in [None, Some("g/secret"), Some("g/pub/1")] {
+            let app = app()?;
+            let data = graph.map_or(String::new(), |graph| {
+                format!("GRAPH <{EX}{graph}> {{ {term} }}")
+            });
+            let insert = format!(
+                "INSERT DATA {{ GRAPH <{EX}g/pub/1> {{ <{EX}a> <{EX}p> <{EX}b> }} {data} }}"
+            );
+            assert_eq!(
+                update(&app, &["nrese.admin"], &insert).await?,
+                StatusCode::NO_CONTENT
+            );
+            // Not `send`: it drops the headers.
+            let request = Request::builder()
+                .uri("/dataset/query")
+                .method(Method::POST)
+                .header(
+                    "authorization",
+                    format!("Bearer {}", token(&["nrese.read", "analyst"])),
+                )
+                .header("accept", accept)
+                .header("content-type", "application/sparql-query")
+                .body(Body::from(query))?;
+            let response = app.oneshot(request).await?;
+            assert_eq!(response.status(), StatusCode::OK, "{form}");
+            let media_type = response
+                .headers()
+                .get("content-type")
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or_default()
+                .to_owned();
+            let body = body_text(response).await?;
+            let in_body = if form == "CONSTRUCT" {
+                body.starts_with(marker)
+            } else {
+                body.contains(marker)
+            };
+            told.push(match (media_type.contains("version=1.2"), in_body) {
+                (false, false) => "none".to_owned(),
+                (true, true) => "1.2".to_owned(),
+                (in_type, in_body) => format!("media type {in_type}, body {in_body}"),
+            });
+        }
+        let got = told.join(" / ");
+        let want = "none / none / 1.2";
+        let cell = format!(
+            "the {form}'s announcement, no term / one only in a graph it can't read / one in a graph it reads"
+        );
+        if got == want {
+            println!("CASE {cell}: right {got}");
+        } else {
+            println!("CASE {cell}: WRONG {got}, want {want}");
+            wrong.push(form);
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "announced from a graph the reader can't read: {wrong:?}"
+    );
+    Ok(())
+}
