@@ -1140,8 +1140,13 @@ fn probe_bytes(answers: &ProbeAnswers) -> usize {
 
 /// `ASK { :e{i} :worksFor ?y }`'s answer over `snapshot`.
 fn works_for(snapshot: &Snapshot, options: &QueryOptions, i: usize) -> bool {
+    asks(snapshot, options, &format!("{EX}e{i}"))
+}
+
+/// `ASK { <employee> :worksFor ?y }`'s answer over `snapshot`.
+fn asks(snapshot: &Snapshot, options: &QueryOptions, employee: &str) -> bool {
     let query = SparqlParser::new()
-        .parse_query(&format!("ASK {{ <{EX}e{i}> <{EX}worksFor> ?y }}"))
+        .parse_query(&format!("ASK {{ <{employee}> <{EX}worksFor> ?y }}"))
         .unwrap();
     let QueryResults::Boolean(answer) = evaluate_query(snapshot, &query, options).unwrap() else {
         panic!("a boolean expected");
@@ -1201,4 +1206,26 @@ fn the_probe_answers_kept_for_one_view_stay_within_their_cap() {
             "{name}: asked again"
         );
     }
+}
+
+/// One probe answer counted at the cap is kept; one counted a byte over it, which alone
+/// would pass the cap, is not. The question is answered right both times, and asked again.
+#[test]
+fn a_probe_answer_counted_over_the_cap_on_its_own_is_not_kept() {
+    // The bytes kept on a fresh published view after asking about `employee` twice.
+    let kept = |employee: &str| {
+        let engine = engine(&format!("<{employee}> a :Employee . "));
+        let ql = Arc::new(QlRewriting::new(Closure { lists: true }));
+        let (options, snapshot) = (sharing(&ql), engine.snapshot());
+        let answers = [0; 2].map(|_| asks(&snapshot, &options, employee));
+        let iri = employee.len();
+        assert_eq!(answers, [true; 2], "{iri}: every employee works for one");
+        probe_bytes(&kept_probes(&ql).1)
+    };
+    let employee = |n: usize| format!("{EX}e{}", "a".repeat(n));
+    let one = kept(&employee(1));
+    assert_eq!(kept(&employee(2)), one + 1, "an IRI byte, a byte counted");
+    let at_cap = PROBE_CAP + 1 - one;
+    let (at, over) = (kept(&employee(at_cap)), kept(&employee(at_cap + 1)));
+    assert_eq!((at, over), (PROBE_CAP, 0), "at the cap: kept; over: not");
 }
