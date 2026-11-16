@@ -24,7 +24,7 @@ reads them there (NRESE_FAMILY).
 A family file (benches/abba/NAME.toml, or what `run` writes):
 
     name = "lcp"                  # the jobs' names: abba-lcp-...
-    host = "phuoc-yu"             # optional: pin every block to this host (--host overrides); without
+    host = "timed-a"              # optional: pin every block to this host (--host overrides); without
                                   # it the fleet picks a timing host by capability
     blocks = 3                    # a round's blocks: at least 3 (one whole square), in whole squares
     [sides]
@@ -71,7 +71,7 @@ sys.path.insert(0, str(ROOT / "benches" / "fast"))
 spec.loader.exec_module(rg)
 
 SIDES = ("a", "a2", "b")  # A, A' (A's build, another copy), B: the palindrome's order
-MIN_BLOCKS = 3  # one whole Latin square of A, A' and B; a family may ask for more (owner, 20 Oct 2026)
+MIN_BLOCKS = 3  # one whole Latin square of A, A' and B; a family may ask for more
 NO_LOSS, LOSS_SHOWN, INVALID, NO_VERDICT, CONFIRMED, NOT_COMPARED = 0, 1, 2, 3, 4, 5
 NAME = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 REV = re.compile(r"^[0-9a-f]{7,40}$")
@@ -303,7 +303,7 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
     exclusive: the fleet keeps an exclusive job's host only before an exclusive step (planner
     held_between_steps; Sol r1 S1) and only while the host's policy takes exclusive work, so an
     untimed first step could build where timing is closed and the blocks then go elsewhere,
-    without its builds (2 Nov 2026: built on office-pc by day, outside its timing window). The job
+    without its builds (2 Nov 2026: built on the shared host by day, outside its timing window). The job
     starts only where it can time, and builds and blocks share that host."""
     a, b = family["sides"]["a"], family["sides"]["b"]
     prefix = f"abba-{family['name']}-{b[:8]}" + (f"-r{round_}" if round_ > 1 else "")
@@ -628,7 +628,7 @@ def report(family: dict, rounds: list[Path]) -> tuple[int, str, dict]:
     decided = rg.decide([[ab for _, _, ab, _ in judged]])
     out["decided"] = {k: decided[k] for k in ("losses", "pending", "m")}
     # A hypothesis the gate didn't test in some round, for its stated reason: no part of a pass
-    # (SHACL lead, 8 Nov 2026: every hypothesis untested, decided over none, read "no loss"); the
+    # (every hypothesis untested, decided over none, read "no loss"); the
     # decision's own, as the release verdict reads it (release_gate.decide).
     untested = decided["not_compared"]
     out["not_compared"] = untested
@@ -734,7 +734,7 @@ def run(args) -> int:
     code, said = rg.fleet_call("check", str(set_path))
     print("  fleet check" + (f" (exit {code})" if code else "") + ":\n    " + "\n    ".join(said.splitlines() or ["-"]))
     if args.plan:
-        # A plan the fleet refuses isn't one to read as taken (STAGE2's lead, 8 Nov 2026: exit 0 with
+        # A plan the fleet refuses isn't one to read as taken (exit 0 with
         # "(exit 1)" in its text): it exits as an unsubmitted run does.
         print("plan only: nothing queued" + ("; fleet check refuses it (above)" if code else ""))
         return 1 if code else 0

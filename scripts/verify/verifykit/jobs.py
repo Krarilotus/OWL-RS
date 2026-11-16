@@ -1,5 +1,5 @@
 """The fleet jobs of a /verify run: a debug build of nrese-server at one commit, then the scenarios
-against it, both on gamergrill (WSL, cgroup v2: each step capped at its ram_gb), never on a timed
+against it, both on the checks host (WSL, cgroup v2: each step capped at its ram_gb), never on a timed
 host.
 
 The build runs there too: fleet stages only git inputs onto a WSL host (fleet-hosts copy.rs

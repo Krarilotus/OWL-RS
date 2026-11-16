@@ -7,7 +7,7 @@ use nrese_sparql::CancellationToken;
 use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, export_dataset};
 use crate::bulk_load::{BulkLoadReport, BulkLoadRequest, bulk_load};
 use crate::config::{StoreConfig, StoreMode};
-use crate::dl::query::{Revision, answer, plan_status};
+use crate::dl::query::{Revision, answer, certify_closure, plan_status};
 use crate::error::StoreResult;
 use crate::graph_store::{
     GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport, GraphWriteRequest,
@@ -802,11 +802,11 @@ impl StoreService {
     /// holds triple terms) announce it ([`PreparedQuery::announce_rdf12`]).
     pub fn prepare_query(&self, request: &SparqlQueryRequest) -> StoreResult<PreparedQuery> {
         let mut prepared = PreparedQuery::parse_with(request, Some(&self.namespaces.all()))?;
-        if prepared.uses_rdf12()
+        if PreparedQuery::uses_rdf12(prepared.query())
             || self
                 .engine
                 .snapshot()
-                .holds_triple_terms(prepared.read_model())
+                .holds_triple_terms(prepared.read_model(), |_| true)
         {
             prepared.announce_rdf12();
         }
@@ -1259,9 +1259,10 @@ impl StoreService {
     /// The one composition of a read's status (T3), on the snapshot `at` it read, after the
     /// status of its `route` (the closure's, the QL report's or the bounds'), each step only
     /// taking away. A read of a version no one vouched for, or of an unpublished one passed
-    /// as committed, is `not-certified`: `None` only where no reasoner is registered and the
-    /// inferred stack is empty. Pending operations aren't reasoned over before the commit,
-    /// and may delete what their inferences rest on. Under `owl2-dl` the question-only
+    /// as committed, is `not-certified`: `None` only where the version carries no
+    /// certificate, no reasoner is registered and the inferred stack is empty. Pending
+    /// operations aren't reasoned over before the commit, and may delete what their
+    /// inferences rest on. Under `owl2-dl` the question-only
     /// individuals ([`crate::dl::query::mark`]); then the negation rule again, over all that
     /// was taken away.
     pub(crate) fn assess(
@@ -1277,6 +1278,7 @@ impl StoreService {
         let unpublished = matches!(at, Revision::Committed(_)) && snapshot.shared_state().is_none();
         let Some(certificate) = Certificate::of(snapshot).filter(|_| !unpublished) else {
             let bare = snapshot.len_in(ReadModel::Inferred) == 0 && !self.supports.has_rules();
+            let bare = bare && Certificate::of(snapshot).is_none();
             return (!bare).then(nrese_sparql::Completeness::not_certified);
         };
         let mut status = route?;
@@ -1295,7 +1297,7 @@ impl StoreService {
         if matches!(at, Revision::Pending(..)) {
             crate::dl::query::negation_rule(&mut status, reads, source);
         } else if certificate.dl {
-            crate::dl::query::certify(&mut status, reads, "dl", decided);
+            crate::dl::query::certify(&mut status, reads, "dl", decided, Some(at.snapshot()));
         }
         Some(status)
     }
@@ -1304,10 +1306,12 @@ impl StoreService {
     /// runs. `None` only where no reasoning path can leave answers out: asserted statements
     /// alone, or no reasoning. Over a ruleset's closure: sound, and complete only for what
     /// the ruleset derives, never certain answers under OWL 2 DL. Under `owl2-dl`, a read
-    /// that isn't of every statement (the inferred ones alone, `onto:implicit`) reads the
-    /// rules' closure without the bounds (`Self::dl_mode`): sound only, never complete
-    /// (SYN-72 slice 2 r1 F1). Either is unsound where a missing row can make a returned
-    /// one wrong (`NOT EXISTS`, `MINUS`, …: [`crate::dl::query::certify_closure`]). As
+    /// told its status here reads the rules' closure without the bounds: the inferred
+    /// statements alone (`onto:implicit`, `Self::dl_mode`; SYN-72 slice 2 r1 F1), or every
+    /// statement outside a transaction; sound only, never complete. A read of every
+    /// statement inside one lacks only its pending operations' reasoning (`Self::assess`).
+    /// Either is unsound where a missing row can make a returned one wrong (`NOT EXISTS`,
+    /// `MINUS`, …: [`crate::dl::query::certify_closure`]). As
     /// `prepared`'s reader is told it (`status_for_its_reader`).
     pub fn status_without_dl(
         &self,
@@ -1329,18 +1333,19 @@ impl StoreService {
         }
         let certificate = Certificate::of(at.snapshot())?;
         if certificate.dl {
-            // A read of every statement here is one inside a transaction: what it lacks is
-            // the pending operations' reasoning (`Self::assess`).
+            // A read of every statement inside a transaction lacks only the pending
+            // operations' reasoning (`Self::assess`); any other read, the DL bounds.
             let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
-            if prepared.read_model() != ReadModel::Materialised {
+            let pending = matches!(at, Revision::Pending(..));
+            if prepared.read_model() != ReadModel::Materialised || !pending {
                 status.incomplete(
                     "dl",
-                    "a read of the inferred statements alone: the rules' closure, without the DL \
+                    "a read of the rules' closure alone, without the DL \
                      bounds; certain answers under OWL 2 DL may be missing"
                         .to_owned(),
                 );
             }
-            crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
+            certify_closure(&mut status, prepared.reads(), "dl", Some(at.snapshot()));
             return Some(status);
         }
         let ruleset = certificate.state.ruleset.clone();
@@ -1354,7 +1359,7 @@ impl StoreService {
                  certain answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
             ),
         );
-        crate::dl::query::certify_closure(&mut status, prepared.reads(), "rules");
+        certify_closure(&mut status, prepared.reads(), "rules", Some(at.snapshot()));
         Some(status)
     }
 
@@ -1528,7 +1533,7 @@ impl StoreService {
         if let nrese_sparql::ql::Printed::Query { completeness, .. } = &mut printed {
             completeness.regime = Some(nrese_sparql::Regime::Owl2Rl);
             let reads = crate::dl::query::Reads::default();
-            crate::dl::query::certify_closure(completeness, (&query, &reads), "ql");
+            certify_closure(completeness, (&query, &reads), "ql", Some(&snapshot));
         }
         Ok(printed)
     }
@@ -2241,7 +2246,11 @@ impl StoreService {
     /// change of rules; commits keep it current afterwards. Register `program` as well
     /// ([`Self::use_reasoning_rules`]; the mutation pipeline registers its own): while the
     /// rules in place aren't the ones the stack was made with, readers of some graphs who
-    /// see inferred statements are refused until the store is rematerialised.
+    /// see inferred statements are refused until the store is rematerialised. A store used
+    /// as a library that rematerialises with no reasoner registered (no pipeline) reads a
+    /// later version without inferred statements or certificate as one no reasoning can
+    /// leave answers out of: no status, not `not-certified`; a server registers its rules
+    /// first.
     pub fn rematerialise(
         &self,
         program: impl Into<nrese_reasoner::RuleProgram>,

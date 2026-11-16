@@ -666,6 +666,51 @@ fn statements_about_the_ontology_are_annotations() {
     );
 }
 
+/// OWL 2's built-in annotation properties are declared implicitly (Structural Specification
+/// 5.5 and 5.8, Table 5; 3.6): undeclared, a domain, a range and a super-property of one
+/// are annotation axioms (Mapping to RDF 3.2.5, Table 16), and a property under one matches
+/// no pattern there. Each is read as the property's annotation-property axiom, and no
+/// logical axiom names it.
+#[test]
+fn the_built_in_annotation_properties_schema_is_annotations() {
+    let builtins = [
+        "rdfs:label",
+        "rdfs:comment",
+        "rdfs:seeAlso",
+        "rdfs:isDefinedBy",
+        "owl:versionInfo",
+        "owl:deprecated",
+        "owl:priorVersion",
+        "owl:backwardCompatibleWith",
+        "owl:incompatibleWith",
+    ];
+    let mut wrong = Vec::new();
+    for a in builtins {
+        let iri = a
+            .replace("rdfs:", "http://www.w3.org/2000/01/rdf-schema#")
+            .replace("owl:", "http://www.w3.org/2002/07/owl#");
+        for form in [
+            format!("{a} rdfs:domain ex:C . ex:x {a} ex:v ."),
+            format!("{a} rdfs:range ex:C . ex:x {a} ex:v ."),
+            format!("{a} rdfs:subPropertyOf ex:sup . ex:sup a owl:AnnotationProperty ."),
+            format!("ex:p rdfs:subPropertyOf {a} . ex:x ex:p ex:v ."),
+        ] {
+            let mut table = Table::default();
+            let statements = load(&mut table, &form);
+            let ontology = read(&statements, &table);
+            let lines = rendered(&ontology, &table);
+            let named = lines.iter().any(|l| l.contains(&iri));
+            if ontology.annotation_schema != [table.iri(&iri).unwrap()] || named {
+                wrong.push(format!(
+                    "{form}: {:?}, {lines:?}",
+                    ontology.annotation_schema
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The built-in annotation properties are known to each read by the terms it reads with:
 /// one the terms gain after an earlier read (`rdfs:comment`, which the first read's terms
 /// don't have) is an annotation property to the later read, as `rdfs:label` is to both.

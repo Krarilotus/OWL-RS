@@ -146,7 +146,7 @@ class Context:
         setting = self.setting("DOCKER_MEMORY")
         # Under fleet no container runs uncapped or past what the job declared: Docker can't
         # join the step's slice, so its ceiling is the slice's limit less a GiB for the driver
-        # (14 Oct 2026: an uncounted 10.7 GB container in a whole-host OOM on Office). An
+        # (14 Oct 2026: an uncounted 10.7 GB container in a whole-host OOM on the shared host). An
         # explicit cap above that ceiling is refused, never shrunk (PROTOCOL.md §3).
         declared = slice_limit_mib()
         ceiling = max(declared - 1024, 512) if declared is not None else None

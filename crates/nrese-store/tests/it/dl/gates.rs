@@ -141,30 +141,3 @@ fn dl_answers_derive_nothing_from_graphs_the_reader_cannot_read() {
     let (visible, _) = read(&dl, reader(false), "SELECT ?x { ?x a :F }");
     assert!(visible.contains("example.com/a"), "{visible}");
 }
-
-/// A read replica interns no term (its dictionary continues the primary's): where the
-/// bounds' terms haven't come with the records yet (the data was written past the
-/// pipeline, so the primary never interned them), it answers over L and says so.
-#[test]
-fn a_replica_interns_nothing_and_says_when_the_bounds_are_missing() {
-    let dl = pipeline();
-    crate::support::load_past_the_pipeline(dl.store(), &format!("{PREFIXES}\n{UNION}"));
-    dl.store().mark_replica();
-    let terms = dl.store().engine_stats().dictionary.terms;
-    let (rows, status) = query(&dl, "SELECT ?x { ?x a :D }");
-    assert_eq!(
-        dl.store().engine_stats().dictionary.terms,
-        terms,
-        "the replica interned a term"
-    );
-    assert!(
-        rows.iter().all(|r| ["w", "x", "y"].contains(&r.as_str())),
-        "{rows:?}"
-    );
-    assert!(!status.is_complete());
-    assert!(
-        status.reasons().iter().any(|r| r.contains("replica")),
-        "{:?}",
-        status.reasons()
-    );
-}

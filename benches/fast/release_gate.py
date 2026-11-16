@@ -491,7 +491,7 @@ def compare_case(cand: dict, base: dict, side: str, checked_queries: set[str], f
     # commit on Windows: its kind is named) and the phases' are reported, as is the cgroup's.
     # A baseline that reports none doesn't support it (an older perf lab, another system): stated.
     # The candidate must then report it on every pass: a reading lost on the candidate blocks
-    # (Sol, 20 Oct 2026: it left the hypothesis untested and the gate passed a confirmed loss).
+    # (it left the hypothesis untested and the gate passed a confirmed loss).
     for name, field in (("memory/anon_kernel", "anon_kernel"), ("memory/live", "live")):
         on_base = [v is not None for v in base[field]]
         on_cand = [v is not None for v in cand[field]]
@@ -785,8 +785,8 @@ def decide(parts: list[list[dict]]) -> dict:
 # The one file that accepts what the bar forbids, read at the candidate's commit by `verdict`
 # (release_verdict()), never from a report: a report holds what its harness tree held.
 POLICY_FILE = "benches/release-tradeoffs.toml"
-# Bar exceptions and trade-offs are Johannes's alone (role.owners); an entry carries his words and
-# where he said them (rule.record-owner-intent-verbatim).
+# Bar exceptions and trade-offs are the owner's alone; an entry carries the owner's words and
+# where they were said.
 OWNER = "Johannes"
 AUTHORITY_KEYS = {"approved", "by", "reason", "quote", "source"}
 TRADEOFF_KEYS = {"case", "dimension", "max_ratio", "pays_with"} | AUTHORITY_KEYS
@@ -1886,7 +1886,7 @@ def blocks(plan_: list[str], measure: dict, min_blocks: int = CAMPAIGN_BLOCKS, *
     """The cases of each block: block k (from 1) runs those whose blocks (measure.toml, at least the
     round's `min_blocks`) reach k, each case's count in whole squares of `square` blocks
     (whole_squares(): the timed sides); a declared outcome's case (`checked`) only the first, where
-    it is checked, not timed. `square` has no default (Sol r1, 20 Oct 2026: a call without it
+    it is checked, not timed. `square` has no default (a call without it
     planned 2 and 8 blocks for three sides). Sol r2: the plan files are the job's block steps
     (jobs() counts with the same minimum), and a declared outcome isn't rounded up to a square."""
     need = {c: 1 if c in checked else whole_squares(max(int(measure.get(c, {}).get("blocks", min_blocks)), min_blocks),
@@ -2232,8 +2232,8 @@ def catalogue_makers(makers: dict) -> tuple[dict[str, list[str]], set[str], str,
 
 
 MAKER_KEYS = ("needs", "form_only", "sparql", "container", "note")
-# The makers a job runs where its host lacks a frozen file (Johannes, 2 Nov 2026, decisions 1 and 8:
-# "a job sets up what it needs where it's missing", never a blanket copy; orchestrator, 7 Nov):
+# The makers a job runs where its host lacks a frozen file (2 Nov 2026:
+# "a job sets up what it needs where it's missing", never a blanket copy):
 # a `made_by` command's start -> what the job asks the fleet for to run it. Each writes into a
 # directory aside (NRESE_DATASET_DIR; the Docker makers bind-mount it instead of the shared volume),
 # checked against its pins before it enters the cache (data_state()). Every other maker's files
@@ -2319,7 +2319,7 @@ def harness_tables(checkout: str | Path, harness: str) -> DataTables:
     [makers] (before pkg/maker-containers, PR #129's included) is refused whatever its code says, and
     nothing of its release_gate.py is read: a reader of tables kept as code sees what one literal
     says, while the harness's code can change it (fix check r3 R3-W1 of pkg/maker-containers: an alias
-    added Docker to LUBM's needs, planned with no container; the master, 8 Nov 2026: "remove the legacy
+    added Docker to LUBM's needs, planned with no container; "remove the legacy
     reader"). Merging engine-v2, which every timing plan does, gives a harness [makers]."""
     import subprocess
 
@@ -2412,7 +2412,7 @@ def data_job(cases: list[dict], requires: dict, *, harness: tuple[str, str] | No
 
 def data_needs(cases: list[dict], tables: DataTables | None = None) -> list[str]:
     """What a host must hold or run for the cases' frozen inputs (fleet `has`). The job makes what
-    benches/sparql/prepare.sh and the DATASET_MAKERS can (Johannes, 2 Nov 2026: "Data is the job's
+    benches/sparql/prepare.sh and the DATASET_MAKERS can ("Data is the job's
     responsibility, not the fleet's"), asking what its makers need (Docker) and its disk
     (data_disk_gb()); the verified bench assets (hosts.toml `inputs`) only for a file no maker
     here makes, an ORE ontology or a reference taxonomy. So a plan the fleet takes places the job

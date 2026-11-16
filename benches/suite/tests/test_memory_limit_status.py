@@ -19,7 +19,7 @@ import fast  # noqa: E402
 import release_gate as rg  # noqa: E402
 from suitekit import cases  # noqa: E402
 
-# support-ladder-256 on 62b9e1854 (the release smoke's record, office-pc, 11 Nov 2026): the
+# support-ladder-256 on 62b9e1854 (the release smoke's record, the shared host, 11 Nov 2026): the
 # shared budget refused the first restricted read; the process exited 1.
 STDERR = ("Error: SparqlEvaluation(MemoryLimit(BudgetExceeded { limit: 4831838208, requested: 134217792, "
           "used: 4716745931, shared: true }))\n")

@@ -23,7 +23,7 @@ from suitekit import adapters, driver, manifest, ns  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec  # noqa: E402
 from test_job_namespace import BASH  # noqa: E402  (Git's bash on Windows, not WSL's launcher)
 
-JOB = "Consol-SCC@office"  # case and punctuation kept: the watcher reads the label's exact value
+JOB = "Consol-SCC@shared"  # case and punctuation kept: the watcher reads the label's exact value
 DECLARED = {"FLEET_JOB": JOB, "NRESE_SUITE_MEMORY_GB": "1.5"}  # a fraction: Docker's `1.5g` isn't exact bytes
 BYTES = f"{3 * 2**29}b"  # 1.5 GiB
 
