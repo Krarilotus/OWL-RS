@@ -167,9 +167,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// The route the ontology's profile gives (`nrese_owl::profile`): an OWL 2 RL ontology
-/// to the RL rules alone.
+/// to the RL rules alone, unless an axiom's rules would compare or type data values: the
+/// rule set leaves out dt-eq and dt-type2 (`nrese_owl::ql::reads_data_values`), so the DL
+/// path decides it by value.
 fn routed_to_rules(ontology: &Ontology) -> bool {
     nrese_owl::profile::of_ontology(ontology).rl
+        && nrese_owl::ql::reads_data_values(ontology).is_none()
 }
 
 /// U1's place on the RL route: not compiled.

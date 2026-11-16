@@ -175,3 +175,317 @@ fn an_axiom_outside_rl_takes_the_ontology_off_the_rules_route() {
     .expect("its list removed");
     assert_eq!(dl.store().dl_bounds().last, "rules");
 }
+
+/// One data value in two lexical forms: `"1"` and `"01"` as xsd:integer, and `"1"` as
+/// xsd:int and as xsd:integer (OWL 2 Structural Specification §4: xsd:int's value space
+/// is part of xsd:integer's). The rule set leaves out dt-eq, so where an axiom compares
+/// data values it sees two: such an ontology leaves the RL route (`routed_to_rules`), and
+/// the DL path decides it by value.
+const ONE_VALUE: [(&str, &str); 2] = [
+    ("\"1\"^^xsd:integer", "\"01\"^^xsd:integer"),
+    ("\"1\"^^xsd:int", "\"1\"^^xsd:integer"),
+];
+
+/// A union on the right of a subclass axiom: outside OWL 2 RL, so beside any data it
+/// takes the ontology off the RL route to the bounds and the DL engines.
+const OUTSIDE_RL: &str = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet .";
+
+/// Each of `data` committed (with [`OUTSIDE_RL`] where `outside`), and each of `reads`,
+/// all entailed by it, asked: each must answer `true`, labelled complete. The wrong ones,
+/// as lines; every answer is printed with the route.
+fn missed(data: &[String], outside: bool, reads: &[&str]) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for data in data {
+        let dl = pipeline();
+        let extra = if outside { OUTSIDE_RL } else { "" };
+        insert(&dl, &format!("{data} {extra}")).expect("consistent");
+        let route = dl.store().dl_bounds().last;
+        for read in reads {
+            let (rows, status) = query(&dl, read);
+            let line = format!(
+                "{data} / route {route}: {read} answers {rows:?}, complete {}",
+                status.is_complete()
+            );
+            eprintln!("{line}");
+            if rows != ["true"] || !status.is_complete() {
+                wrong.push(line);
+            }
+        }
+    }
+    wrong
+}
+
+/// Each of `data`, inconsistent, committed (with [`OUTSIDE_RL`] where `outside`): it must
+/// be rejected as inconsistent, by no other error. The others, as lines; every outcome is
+/// printed.
+fn accepted(data: &[String], outside: bool) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for data in data {
+        let dl = pipeline();
+        let extra = if outside { OUTSIDE_RL } else { "" };
+        let result = insert(&dl, &format!("{data} {extra}"));
+        let line = match &result {
+            Ok(_) => format!("{data} / committed, route {}", dl.store().dl_bounds().last),
+            Err(e) => format!("{data} / rejected: {e}"),
+        };
+        eprintln!("{line}");
+        let inconsistent = matches!(&result, Err(nrese_store::MutationError::Rejected(r))
+            if r.kind == nrese_store::RejectKind::Inconsistent);
+        if !inconsistent {
+            wrong.push(line);
+        }
+    }
+    wrong
+}
+
+/// prp-key: a key equates the named individuals that agree on its values (OWL 2 Direct
+/// Semantics, HasKey), so `:a = :b` and `:b :p :x` is entailed from `:a :p :x`.
+fn key() -> Vec<String> {
+    ONE_VALUE
+        .map(|(left, right)| {
+            format!(
+                ":Person owl:hasKey ( :ssn ) . :ssn a owl:DatatypeProperty . \
+                 :p a owl:ObjectProperty . :a a :Person ; :ssn {left} ; :p :x . \
+                 :b a :Person ; :ssn {right} ."
+            )
+        })
+        .to_vec()
+}
+
+const KEY_READS: [&str; 2] = ["ASK { :b :p :x }", "ASK { :a owl:sameAs :b }"];
+
+#[test]
+fn a_key_on_one_value_in_two_lexical_forms_equates_in_rl() {
+    let wrong = missed(&key(), false, &KEY_READS);
+    assert!(wrong.is_empty(), "complete and wrong: {wrong:#?}");
+}
+
+#[test]
+fn a_key_on_one_value_in_two_lexical_forms_equates_outside_rl() {
+    let wrong = missed(&key(), true, &KEY_READS);
+    assert!(wrong.is_empty(), "complete and wrong: {wrong:#?}");
+}
+
+/// cls-hv2: an individual with the value is in the hasValue class (OWL 2 Direct
+/// Semantics, DataHasValue), in a subclass axiom's left side or an equivalence.
+fn has_value() -> Vec<String> {
+    ONE_VALUE
+        .map(|(left, right)| {
+            format!(
+                ":age a owl:DatatypeProperty . \
+                 [ a owl:Restriction ; owl:onProperty :age ; owl:hasValue {left} ] \
+                   rdfs:subClassOf :One . \
+                 :Adult owl:equivalentClass \
+                   [ a owl:Restriction ; owl:onProperty :age ; owl:hasValue {left} ] . \
+                 :a :age {right} ."
+            )
+        })
+        .to_vec()
+}
+
+const HAS_VALUE_READS: [&str; 2] = ["ASK { :a a :One }", "ASK { :a a :Adult }"];
+
+#[test]
+fn a_data_has_value_class_holds_one_value_in_two_lexical_forms_in_rl() {
+    let wrong = missed(&has_value(), false, &HAS_VALUE_READS);
+    assert!(wrong.is_empty(), "complete and wrong: {wrong:#?}");
+}
+
+#[test]
+fn a_data_has_value_class_holds_one_value_in_two_lexical_forms_outside_rl() {
+    let wrong = missed(&has_value(), true, &HAS_VALUE_READS);
+    assert!(wrong.is_empty(), "complete and wrong: {wrong:#?}");
+}
+
+/// prp-npa2: a negative data property assertion denies the value in every lexical form.
+fn negative_assertion() -> Vec<String> {
+    ONE_VALUE
+        .map(|(left, right)| {
+            format!(
+                ":age a owl:DatatypeProperty . \
+                 [ a owl:NegativePropertyAssertion ; owl:sourceIndividual :a ; \
+                   owl:assertionProperty :age ; owl:targetValue {left} ] . \
+                 :a :age {right} ."
+            )
+        })
+        .to_vec()
+}
+
+#[test]
+fn a_negative_data_assertion_denies_one_value_in_two_lexical_forms_in_rl() {
+    let wrong = accepted(&negative_assertion(), false);
+    assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
+}
+
+#[test]
+fn a_negative_data_assertion_denies_one_value_in_two_lexical_forms_outside_rl() {
+    let wrong = accepted(&negative_assertion(), true);
+    assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
+}
+
+/// prp-pdw and prp-adp: disjoint data properties share no pair, whatever the value's form.
+fn disjoint_data_properties() -> Vec<String> {
+    let mut data = Vec::new();
+    for (left, right) in ONE_VALUE {
+        data.push(format!(
+            ":p1 a owl:DatatypeProperty ; owl:propertyDisjointWith :p2 . \
+             :p2 a owl:DatatypeProperty . :a :p1 {left} ; :p2 {right} ."
+        ));
+        data.push(format!(
+            ":q1 a owl:DatatypeProperty . :q2 a owl:DatatypeProperty . \
+             :q3 a owl:DatatypeProperty . \
+             [ a owl:AllDisjointProperties ; owl:members ( :q1 :q2 :q3 ) ] . \
+             :a :q1 {left} ; :q3 {right} ."
+        ));
+    }
+    data
+}
+
+#[test]
+fn disjoint_data_properties_share_no_value_in_two_lexical_forms_in_rl() {
+    let wrong = accepted(&disjoint_data_properties(), false);
+    assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
+}
+
+#[test]
+fn disjoint_data_properties_share_no_value_in_two_lexical_forms_outside_rl() {
+    let wrong = accepted(&disjoint_data_properties(), true);
+    assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
+}
+
+/// A maximum qualified data cardinality (OWL 2 Direct Semantics, DataMaxCardinality with a
+/// data range, `owl:onDataRange`): at most 0, or at most 1, integers of `:age`, and `:c`
+/// has two. The rule set reads `owl:onClass` (cls-maxqc1-4), not `owl:onDataRange`, and
+/// checking the range would type the values (dt-type2, which it leaves out).
+fn qualified_data_cardinality() -> Vec<String> {
+    [
+        "\"0\"^^xsd:nonNegativeInteger",
+        "\"1\"^^xsd:nonNegativeInteger",
+    ]
+    .map(|n| {
+        format!(
+            ":age a owl:DatatypeProperty . \
+                 :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :age ; \
+                   owl:maxQualifiedCardinality {n} ; owl:onDataRange xsd:integer ] . \
+                 :c a :C ; :age 5 , 6 ."
+        )
+    })
+    .to_vec()
+}
+
+#[test]
+fn a_qualified_data_cardinality_is_kept_in_rl() {
+    let wrong = accepted(&qualified_data_cardinality(), false);
+    assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
+}
+
+#[test]
+fn a_qualified_data_cardinality_is_kept_outside_rl() {
+    let wrong = accepted(&qualified_data_cardinality(), true);
+    assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
+}
+
+/// The same over `rdfs:Literal` (OWL 2 Profiles §4.2.4 admits it in RL): at most `n`
+/// values of `:age` at all, and `:c` has one. No rule reads `owl:onDataRange`, whatever
+/// the range.
+fn literal_qualified_data_cardinality(n: u32) -> String {
+    format!(
+        ":age a owl:DatatypeProperty . \
+         :C a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :age ; \
+           owl:maxQualifiedCardinality \"{n}\"^^xsd:nonNegativeInteger ; \
+           owl:onDataRange rdfs:Literal ] . \
+         :c a :C ; :age 5 ."
+    )
+}
+
+#[test]
+fn a_qualified_data_cardinality_over_any_literal_is_kept() {
+    for outside in [false, true] {
+        let wrong = accepted(&[literal_qualified_data_cardinality(0)], outside);
+        assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
+        // The control: at most one, and one, is consistent.
+        let dl = pipeline();
+        let extra = if outside { OUTSIDE_RL } else { "" };
+        let data = literal_qualified_data_cardinality(1);
+        insert(&dl, &format!("{data} {extra}")).expect("consistent");
+    }
+}
+
+/// cls-svf1 on a data property: an individual with a value of the filler is in the class
+/// (OWL 2 Direct Semantics, DataSomeValuesFrom). Its premise `5 rdf:type xsd:integer` is
+/// dt-type2's, which the rule set leaves out.
+fn data_some() -> Vec<String> {
+    vec![
+        ":age a owl:DatatypeProperty . \
+         [ a owl:Restriction ; owl:onProperty :age ; owl:someValuesFrom xsd:integer ] \
+           rdfs:subClassOf :Aged . \
+         [ a owl:Restriction ; owl:onProperty :age ; owl:someValuesFrom rdfs:Literal ] \
+           rdfs:subClassOf :Valued . \
+         :a :age 5 ."
+            .to_owned(),
+    ]
+}
+
+const DATA_SOME_READS: [&str; 2] = ["ASK { :a a :Aged }", "ASK { :a a :Valued }"];
+
+#[test]
+fn a_data_some_values_class_holds_a_value_of_its_filler_in_rl() {
+    let wrong = missed(&data_some(), false, &DATA_SOME_READS);
+    assert!(wrong.is_empty(), "complete and wrong: {wrong:#?}");
+}
+
+#[test]
+fn a_data_some_values_class_holds_a_value_of_its_filler_outside_rl() {
+    let wrong = missed(&data_some(), true, &DATA_SOME_READS);
+    assert!(wrong.is_empty(), "complete and wrong: {wrong:#?}");
+}
+
+/// prp-fp on a functional data property with one value in two lexical forms: the rule
+/// equates the two terms, and dt-diff compares their values, which are one: consistent
+/// (OWL 2 Direct Semantics, FunctionalDataProperty). Two values are not. Under owl2-dl in
+/// RL and outside it, and under owl2-rl; every outcome is printed.
+#[test]
+fn a_functional_data_property_with_one_value_in_two_lexical_forms_commits() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    use nrese_store::{MutationPipeline, StoreService};
+    use std::sync::Arc;
+    let owl2_rl = || {
+        MutationPipeline::new(
+            Arc::new(StoreService::new(crate::support::in_memory_store_config()).expect("store")),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Rl,
+            ))),
+        )
+    };
+    let mut wrong = Vec::new();
+    let pairs = ONE_VALUE
+        .map(|pair| (pair, true))
+        .into_iter()
+        .chain([(("\"1\"^^xsd:integer", "\"2\"^^xsd:integer"), false)]);
+    for ((left, right), consistent) in pairs {
+        let data = format!(
+            ":age a owl:DatatypeProperty , owl:FunctionalProperty . :a :age {left} , {right} ."
+        );
+        for (mode, extra) in [("owl2-dl", ""), ("owl2-dl", OUTSIDE_RL), ("owl2-rl", "")] {
+            let pipeline = if mode == "owl2-rl" {
+                owl2_rl()
+            } else {
+                pipeline()
+            };
+            let result = insert(&pipeline, &format!("{data} {extra}"));
+            let line = format!(
+                "{mode} {left} / {right} {}: {}",
+                if extra.is_empty() { "" } else { "outside RL" },
+                match &result {
+                    Ok(_) => "committed".to_owned(),
+                    Err(e) => format!("rejected: {e}"),
+                }
+            );
+            eprintln!("{line}");
+            if result.is_ok() != consistent {
+                wrong.push(line);
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
