@@ -325,12 +325,12 @@ async fn refused(
             .any(|r| r["source"] == want.0 && line(r).contains(want.1)),
         "{got}"
     );
-    for reason in reasons.iter().map(line) {
-        assert!(
-            without.contains(&reason),
-            "{label}: {reason:?} isn't among the reasons without exact, {without}"
-        );
-    }
+    // The same reasons, in the same order, as the read without exact: none dropped, none added.
+    let all = reasons.iter().map(line).collect::<Vec<_>>().join("; ");
+    assert!(
+        without.contains(&format!("reasons=\"{all}\"")),
+        "{label}: the reasons {all:?} aren't those without exact, {without}"
+    );
     Ok(())
 }
 
@@ -435,6 +435,38 @@ async fn exact_refuses_a_read_with_changes_pending() -> Result<(), Box<dyn std::
         in_tx(&exact).body(Body::empty())?,
         &status,
         ("transaction", "may delete"),
+    )
+    .await?;
+    // An annotation property declared only by the pending operations: the pending state's
+    // ontology marks the answers `unsound`, and the refusal carries that mark too.
+    let tx = begin(&app).await?;
+    let in_tx = |extra: &str| {
+        Request::builder()
+            .method(Method::PUT)
+            .uri(format!("{tx}?action={extra}"))
+            .header("accept", "application/sparql-results+json")
+            .header("content-type", "text/turtle")
+    };
+    let response = app
+        .clone()
+        .oneshot(in_tx("ADD").body(Body::from(
+            "<http://example.com/note> a <http://www.w3.org/2002/07/owl#AnnotationProperty> ; \
+             <http://www.w3.org/2000/01/rdf-schema#domain> <http://example.com/Q> .",
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (status, _) = answer(&app, in_tx(&query).body(Body::empty())?).await?;
+    let status = status.unwrap_or_default();
+    assert!(
+        status.starts_with("unsound; regime=owl2-dl") && status.contains("example.com/note"),
+        "an annotation property pending, without exact: {status}"
+    );
+    refused(
+        &app,
+        "an annotation property pending, exact",
+        in_tx(&exact).body(Body::empty())?,
+        &status,
+        ("dl", "example.com/note> has annotation-property axioms"),
     )
     .await
 }
