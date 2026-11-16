@@ -1323,19 +1323,19 @@ async fn repository_patches_at_once_keep_each_other() {
 
 /// An import that stops changes no answer: under `owl2-ql`, an answer through the rewriting
 /// the reasoning certificate switches on stays after a cut document fails, imported at once
-/// (400) or as a job (`failed`), in the process and after a restart; the marker on disk stays.
+/// (400) or as a job (`failed`), and the marker on disk stays. (A restart can't show the
+/// marker lost: the server reasons at its start where the certificate isn't current. The
+/// store's reopen without reasoning is in `document_end_tests`.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_import_changes_no_answer() {
     let dir = tempfile::tempdir().unwrap();
     let store_dir = dir.path().join("store");
-    let app = || {
-        test_app_with_store_config(
-            StoreConfig::on_disk(&store_dir),
-            PolicyConfig::default(),
-            ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Ql),
-        )
-        .unwrap()
-    };
+    let first = test_app_with_store_config(
+        StoreConfig::on_disk(&store_dir),
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Ql),
+    )
+    .unwrap();
     let base = "/api/v1/repositories/nrese";
     let prefixes = "@prefix : <http://example.com/> . \
         @prefix owl: <http://www.w3.org/2002/07/owl#> . \
@@ -1361,7 +1361,6 @@ async fn a_failed_import_changes_no_answer() {
         value["boolean"].as_bool().expect("a boolean")
     };
     let marker = || std::fs::read(store_dir.join("reasoning.state")).ok();
-    let first = app();
     let import = format!("{base}/import");
     let (status, text) = send(
         &first,
@@ -1399,10 +1398,6 @@ async fn a_failed_import_changes_no_answer() {
     }
     if !ask(first.clone()).await || marker() != written {
         wrong.push("the cut job changed the answer or the marker".to_owned());
-    }
-    drop(first);
-    if !ask(app()).await {
-        wrong.push("after a restart, the answer changed".to_owned());
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
