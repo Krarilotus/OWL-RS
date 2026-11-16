@@ -69,6 +69,7 @@ fn an_inserted_transitive_edge_s_closure_counts_towards_the_stop() {
             rules: &rules,
             lists: None,
             schema: &schema,
+            equality: crate::representatives::same_as(&rules, schema.same_as()),
         };
         let text: Vec<String> = (0..n)
             .map(|i| format!("ex:a{i} rdfs:seeAlso ex:x"))

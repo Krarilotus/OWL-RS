@@ -39,6 +39,7 @@ fn input() -> (Vec<Triple>, crate::eval::GroundProgram) {
             rules: &rules,
             lists: None,
             schema: &schema,
+            equality: crate::representatives::same_as(&rules, schema.same_as()),
         },
     );
     let heads: String = (0..N).map(|i| format!("ex:a rdfs:r ex:y{i}\n")).collect();
@@ -113,6 +114,7 @@ fn product_input() -> (Vec<Triple>, crate::eval::GroundProgram, Vec<Triple>) {
             rules: &rules,
             lists: None,
             schema: &schema,
+            equality: crate::representatives::same_as(&rules, schema.same_as()),
         },
     );
     let mut closure: Vec<Triple> = asserted.iter().chain(&derived).copied().collect();

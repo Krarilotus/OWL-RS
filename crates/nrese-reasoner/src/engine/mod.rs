@@ -97,6 +97,7 @@ impl Program {
             rules: &self.rules,
             lists: self.lists.as_ref(),
             schema: &self.schema,
+            equality: self.same_as,
         }
     }
 

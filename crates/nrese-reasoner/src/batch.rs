@@ -2193,7 +2193,11 @@ pub(crate) struct Equality {
 /// The rules the equality module replaces, over `same_as`: `eq-rep-s`, `eq-rep-p` and
 /// `eq-rep-o` by what they say ([`super::equality_rules`]).
 pub(crate) fn is_replacement_rule(rule: &Rule, same_as: u64) -> bool {
-    let rule = super::equality_rules::equality_rule(rule, same_as);
+    is_replacement(super::equality_rules::equality_rule(rule, same_as))
+}
+
+/// Whether the built-in equality rule `rule` is one the module replaces.
+pub(crate) fn is_replacement(rule: Option<&str>) -> bool {
     matches!(rule, Some("eq-rep-s" | "eq-rep-p" | "eq-rep-o"))
 }
 
@@ -2201,13 +2205,17 @@ impl Equality {
     /// The module for `rules`, if they hold the equality rules over `same_as`
     /// ([`super::equality_rules::of`]).
     pub(crate) fn for_rules(rules: &[Rule], same_as: u64) -> Option<Self> {
-        let same_as = super::equality_rules::of(rules, same_as)?;
-        Some(Self {
+        super::equality_rules::of(rules, same_as).map(Self::over)
+    }
+
+    /// The module over `same_as`.
+    pub(crate) fn over(same_as: u64) -> Self {
+        Self {
             same_as,
             produced: HashSet::new(),
             member_scans: 0,
             partners: None,
-        })
+        }
     }
 
     /// The class of `x`: itself and its `sameAs` partners, sorted; [`Stopped`] where its

@@ -130,6 +130,7 @@ fn an_evaluation_stops_within_its_poll_interval() {
             rules: &rules,
             lists: None,
             schema: &schema,
+            equality: crate::representatives::same_as(&rules, schema.same_as()),
         };
         let asserted = load(&mut vocabulary, &row.asserted.join("\n"));
         let inserted = load(&mut vocabulary, row.inserted);
@@ -427,6 +428,7 @@ fn a_cancelled_support_update_stops_within_its_poll_interval() {
         rules: &rules,
         lists: None,
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let text: Vec<String> = (0..n)
         .map(|i| format!("ex:x{i} rdfs:q ex:y{i}"))
