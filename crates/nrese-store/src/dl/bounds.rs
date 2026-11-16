@@ -45,6 +45,10 @@ mod token_tests;
 #[path = "bounds_lock_tests.rs"]
 mod lock_tests;
 
+#[cfg(test)]
+#[path = "bounds_kinds_tests.rs"]
+mod kinds_tests;
+
 /// Where the lock tests hold U1's work mid-way: a hook run once, on the thread doing that
 /// work, for the store whose bounds it names.
 #[cfg(test)]
@@ -61,6 +65,8 @@ pub(crate) mod seam {
         Taxonomy,
         /// A revision's read view, not begun.
         View,
+        /// A commit's ontology read again, not begun.
+        Read,
     }
 
     type Hook = Box<dyn FnOnce() + Send>;
@@ -108,9 +114,10 @@ struct State {
     /// The TBox's taxonomy for L's memberships ([`super::lower`]): computed on the first
     /// read, kept as long as U1's compilation (both change only with the schema).
     taxonomy: Option<KeptTaxonomy>,
-    /// The ontology is in OWL 2 RL: the RL rules decide it (theorem PR1 of OWL 2
-    /// Profiles: complete for its assertions and its consistency), and U1 isn't compiled.
-    rules: bool,
+    /// `Some`: the ontology is in OWL 2 RL, so the RL rules decide it (theorem PR1 of OWL 2
+    /// Profiles: complete for its assertions and its consistency) and U1 isn't compiled;
+    /// with the kinds the route was decided on.
+    kinds: Option<Arc<Kinds>>,
 }
 
 /// The bounds' U1 (`None`: none), and the revision below which nothing is published: what
@@ -173,6 +180,69 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn routed_to_rules(ontology: &Ontology) -> bool {
     nrese_owl::profile::of_ontology(ontology).rl
         && nrese_owl::ql::reads_data_values(ontology).is_none()
+}
+
+/// What the RL route was decided on: the TBox signature as the reader typed it, the
+/// built-in annotation properties among its annotation properties, and the ids of
+/// `rdf:type` and `owl:sameAs` (`None`: not in the dictionary then).
+pub(crate) struct Kinds {
+    signature: nrese_owl::profile::Signature,
+    rdf_type: Option<u64>,
+    same_as: Option<u64>,
+}
+
+impl Kinds {
+    fn of(ontology: &Ontology, lookup: &dyn Fn(&str) -> Option<TermId>) -> Arc<Self> {
+        let id = |iri: &str| lookup(iri).map(TermId::raw);
+        let mut signature = nrese_owl::profile::signature(ontology);
+        signature.annotations.extend(
+            nrese_owl::BUILTIN_ANNOTATIONS
+                .iter()
+                .filter_map(|iri| id(iri)),
+        );
+        Arc::new(Self {
+            signature,
+            rdf_type: id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            same_as: id("http://www.w3.org/2002/07/owl#sameAs"),
+        })
+    }
+
+    /// Whether an asserted triple, inserted or deleted, leaves every term the kinds the
+    /// reader gave it, which it gives by use (`nrese_owl::profile::Signature`): a known
+    /// annotation property's statement gives none; any other leaves the schema as it is,
+    /// names no class or property, and no name of the reserved vocabulary, which the reader
+    /// leaves out (`nrese_owl::diagnostics::reserved_name`), as subject or IRI object, and
+    /// its predicate is `rdf:type` with a known class, `owl:sameAs`, or a property known
+    /// only as the kind its object needs (a literal a data property, an IRI an object
+    /// property). A deleted literal needs a declared data property: one that is data only
+    /// by its literals may lose the last one, and its other axioms then read it as an
+    /// object property.
+    fn keep(&self, tx: &Transaction<'_>, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
+        let k = &self.signature;
+        if k.annotations.contains(&p) {
+            return true;
+        }
+        let reserved = |t: u64| match tx.decode(TermId::from_raw(t)) {
+            Some(nrese_rdf::Term::NamedNode(n)) => {
+                nrese_owl::diagnostics::reserved_name(n.as_str())
+            }
+            _ => false,
+        };
+        if changes_schema(tx, triple) || k.names.contains(&s) || reserved(s) {
+            return false;
+        }
+        let iri = TermId::from_raw(o).kind() == nrese_engine::TermKind::Iri;
+        if Some(p) == self.rdf_type {
+            k.classes.contains(&o)
+        } else if !iri {
+            k.data.contains(&p)
+                && !k.objects.contains(&p)
+                && (!deleted || k.declared_data.contains(&p))
+        } else {
+            let property = k.objects.contains(&p) && !k.data.contains(&p);
+            !k.names.contains(&o) && !reserved(o) && (Some(p) == self.same_as || property)
+        }
+    }
 }
 
 /// U1's place on the RL route: not compiled.
@@ -282,7 +352,7 @@ pub(crate) enum Prepared {
     /// U1 had given up, and nothing it was compiled from changed.
     Unavailable,
     /// The ontology is (still) in OWL 2 RL: the RL rules decide it, no U1.
-    Rules,
+    Rules(Arc<Kinds>),
 }
 
 /// A commit's preparation: what to install, and what U1 after the commit says about
@@ -321,24 +391,29 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     };
     // U1 at the base, taken under the state and changed without it (U1-I): readers never
     // wait for a commit's (parallel) change.
-    let current: Option<(bool, Result<Arc<Upper>, GaveUp>)> = lock(&store.dl().bounds.state)
+    let current = lock(&store.dl().bounds.state)
         .as_ref()
         .filter(|s| s.revision == base)
-        .map(|s| (s.rules, s.upper.clone()));
+        .map(|s| (s.kinds.clone(), s.upper.clone()));
     // The commit's asserted changes, read from the transaction each time: no copy of them.
     let asserted = || tx.inserted().chain(tx.deleted()).map(quad_triple);
-    if let Some((true, _)) = current
-        && !asserted().any(|t| changes_schema(tx, t))
+    // On the RL route, a commit that gives no term a new kind leaves what the reader reads,
+    // and so the route, as they were; any other is read again below.
+    if let Some((Some(kinds), _)) = &current
+        && tx.inserted().all(|q| kinds.keep(tx, quad_triple(q), false))
+        && tx.deleted().all(|q| kinds.keep(tx, quad_triple(q), true))
     {
         return Preparation {
             base,
-            prepared: Prepared::Rules,
+            prepared: Prepared::Rules(Arc::clone(kinds)),
             proves_consistency: true,
             decided_by: "rules",
             ontology: None,
         };
     }
-    if let Some((_, upper)) = current {
+    // Off the route only: on it there is no U1, and "nothing U1 is compiled from changed"
+    // would keep a route the commit may change.
+    if let Some((None, upper)) = current {
         match upper.as_deref() {
             // A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
             Ok(upper)
@@ -397,6 +472,8 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         }
     }
     source::intern_vocabulary(tx);
+    #[cfg(test)]
+    seam::at(&store.dl().bounds, seam::Point::Read);
     let Ok(ontology) = source::read_pending(tx, Arc::clone(store.dl().bounds.kept())) else {
         return Preparation {
             base,
@@ -410,9 +487,10 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     };
     if routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal()) {
         // The RL gate that ran before has decided the commit's consistency.
+        let lookup = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
         return Preparation {
             base,
-            prepared: Prepared::Rules,
+            prepared: Prepared::Rules(Kinds::of(&ontology, &lookup)),
             proves_consistency: true,
             decided_by: "rules",
             ontology: None,
@@ -542,10 +620,10 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
                 last: "rebuilt",
                 compiled: bounds.compiled(),
                 taxonomy: None,
-                rules: false,
+                kinds: None,
             },
         ),
-        Prepared::Rules => publish(
+        Prepared::Rules(kinds) => publish(
             &mut state,
             State {
                 revision,
@@ -553,7 +631,7 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
                 last: "rules",
                 compiled: bounds.compiled(),
                 taxonomy: None,
-                rules: true,
+                kinds: Some(kinds),
             },
         ),
         Prepared::Delta(change) => match state.get_mut() {
@@ -658,7 +736,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
             Some(s) if s.revision > revision => return None,
             Some(s) if s.revision == revision => Some((
                 s.compiled,
-                s.rules,
+                s.kinds.is_some(),
                 s.upper.as_ref().ok().map(|u| u.program.names.rdf_type),
                 s.taxonomy.clone(),
             )),
@@ -694,7 +772,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
                         snapshot,
                         s.revision,
                         s.upper.as_deref(),
-                        s.rules,
+                        s.kinds.is_some(),
                         &lower,
                         kept,
                     )
@@ -712,7 +790,8 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
             // lets it go only when the taxonomy below reads this revision's, after the build
             // has read in its room (N1).
             store.dl().query_ontology.evict_below(revision);
-            let (upper, rules) = afresh(store, snapshot);
+            let (upper, kinds) = afresh(store, snapshot);
+            let rules = kinds.is_some();
             let compiled = bounds.compiled();
             let taxonomy = match &upper {
                 Ok(_) if !rules => Some(taxonomy(store, snapshot, compiled, None)),
@@ -741,7 +820,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
                     last,
                     compiled,
                     taxonomy: taxonomy.and_then(Result::ok),
-                    rules,
+                    kinds,
                 };
                 publish(&mut lock(&bounds.state), state);
             }
@@ -766,24 +845,30 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
     Some(view)
 }
 
-/// U1 compiled and evaluated afresh over `snapshot` (or, `true`, the RL route's place).
-fn afresh(store: &StoreService, snapshot: &Snapshot) -> (Result<Upper, GaveUp>, bool) {
+/// U1 compiled and evaluated afresh over `snapshot` (or, with the kinds it was decided on,
+/// the RL route's place).
+fn afresh(
+    store: &StoreService,
+    snapshot: &Snapshot,
+) -> (Result<Upper, GaveUp>, Option<Arc<Kinds>>) {
     let replica = store.dl().replica();
     // U1's names are system vocabulary: the bounds keep them for every later read, so they
     // take shared ids (dictionary lifecycle V1), never a request's private ones.
     if !replica && source::intern_system_vocabulary(store.engine()).is_err() {
         return (
             Err(GaveUp::refused(source::refused("the vocabulary"))),
-            false,
+            None,
         );
     }
     let latest = store.engine().snapshot();
     let ontology = match source::read_snapshot(snapshot, Arc::clone(store.dl().bounds.kept())) {
         Ok(ontology) => ontology,
-        Err(_) => return (Err(GaveUp::refused(source::refused("the revision"))), false),
+        Err(_) => return (Err(GaveUp::refused(source::refused("the revision"))), None),
     };
     if routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal()) {
-        return (Err(not_compiled()), true);
+        let lookup =
+            |iri: &str| snapshot.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
+        return (Err(not_compiled()), Some(Kinds::of(&ontology, &lookup)));
     }
     let normalised = nrese_owl::normalise(&ontology);
     let deadline = Deadline::after(store.config().dl.timeout);
@@ -805,7 +890,7 @@ fn afresh(store: &StoreService, snapshot: &Snapshot) -> (Result<Upper, GaveUp>, 
     let kept = store.dl().bounds.kept();
     let upper = Upper::build(&ontology, &normalised, snapshot, &resolve, &stop, kept)
         .map_err(|gave_up| gave_up.by_memory(&memory_hit));
-    (upper, false)
+    (upper, None)
 }
 
 /// A taxonomy for a read: kept, with its charge, or (`Err`) one only this read uses, never

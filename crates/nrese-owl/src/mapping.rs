@@ -416,6 +416,20 @@ pub const DECLARATION_KINDS: [(&str, EntityKind); 8] = [
     ),
 ];
 
+/// The annotation properties OWL 2 builds in (Structural Specification §5.5): the reader
+/// reads a statement of one as an annotation, which gives its terms no kind.
+pub const BUILTIN_ANNOTATIONS: [&str; 9] = [
+    "http://www.w3.org/2000/01/rdf-schema#label",
+    "http://www.w3.org/2000/01/rdf-schema#comment",
+    "http://www.w3.org/2000/01/rdf-schema#seeAlso",
+    "http://www.w3.org/2000/01/rdf-schema#isDefinedBy",
+    "http://www.w3.org/2002/07/owl#deprecated",
+    "http://www.w3.org/2002/07/owl#versionInfo",
+    "http://www.w3.org/2002/07/owl#priorVersion",
+    "http://www.w3.org/2002/07/owl#backwardCompatibleWith",
+    "http://www.w3.org/2002/07/owl#incompatibleWith",
+];
+
 /// `Some(id) == Some(x)` without matching an absent term.
 fn is(id: Term, term: Option<Term>) -> bool {
     term == Some(id)
@@ -1469,18 +1483,7 @@ impl<'a> Reader<'a> {
 
     /// `rdfs:label` and the other annotation properties OWL 2 builds in.
     fn is_builtin_annotation(&self, predicate: Term) -> bool {
-        const BUILT_IN: [&str; 9] = [
-            "http://www.w3.org/2000/01/rdf-schema#label",
-            "http://www.w3.org/2000/01/rdf-schema#comment",
-            "http://www.w3.org/2000/01/rdf-schema#seeAlso",
-            "http://www.w3.org/2000/01/rdf-schema#isDefinedBy",
-            "http://www.w3.org/2002/07/owl#deprecated",
-            "http://www.w3.org/2002/07/owl#versionInfo",
-            "http://www.w3.org/2002/07/owl#priorVersion",
-            "http://www.w3.org/2002/07/owl#backwardCompatibleWith",
-            "http://www.w3.org/2002/07/owl#incompatibleWith",
-        ];
-        BUILT_IN
+        BUILTIN_ANNOTATIONS
             .iter()
             .any(|iri| self.terms.iri(iri) == Some(predicate))
             || self.terms.iri("http://www.w3.org/2002/07/owl#versionIRI") == Some(predicate)
