@@ -3,6 +3,8 @@
 //! and the replica says why; a directory once started as a primary doesn't vouch for the
 //! records it applied as a replica.
 
+use std::path::{Path, PathBuf};
+
 use axum::body::Body;
 use axum::http::{Method, Request};
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
@@ -13,6 +15,7 @@ use nrese_server::{AppState, DeploymentPosture, build_app};
 use nrese_store::{StoreConfig, StoreService};
 use tower::util::ServiceExt;
 
+use super::upgrade_tests::{Server, configure};
 use crate::support::body_text;
 
 const PREFIXES: &str = "PREFIX ex: <http://example.com/> \
@@ -401,6 +404,240 @@ async fn a_replica_through_the_ql_rewriting_says_not_certified() -> TestResult<(
                 "{label}: the primary {rows}, the replica {replica_rows} {status:?}"
             ));
         }
+    }
+    assert!(unmet.is_empty(), "{unmet:#?}");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    Ok(())
+}
+
+/// Spec (master 18:14, Q2): a primary whose served version is stored compact
+/// (`reasoner.equality = "compact"` under `owl2-rl`, which closes equality) refuses a
+/// replica its image as it refuses its log: 409, with the sentence. The refusal is the
+/// primary's state, not a failure of the server (500).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_compact_primary_refuses_its_image_with_409_and_the_sentence() -> TestResult<()> {
+    let primary_dir = tempfile::tempdir()?;
+    let primary_state = server(
+        StoreService::new(StoreConfig {
+            equality_by_representatives: true,
+            equality_compact: true,
+            ..StoreConfig::on_disk(primary_dir.path())
+        })?,
+        ReasoningMode::Owl2Rl,
+        primary(),
+    );
+    let base = serve(&primary_state).await?;
+    update(
+        &base,
+        "INSERT DATA { ex:Dog rdfs:subClassOf ex:Animal . ex:a a ex:Dog . \
+         ex:a owl:sameAs ex:b }",
+    )
+    .await;
+    let response = reqwest::Client::new()
+        .get(format!("{base}/api/v1/replication/image"))
+        .send()
+        .await?;
+    let status = response.status();
+    let text = response.text().await?;
+    println!("CASE image: {status} {text}");
+    assert!(text.contains(REFUSED), "the sentence: {status} {text}");
+    assert_eq!(status, reqwest::StatusCode::CONFLICT, "{text}");
+    Ok(())
+}
+
+/// Spec (master 18:25 (c)): a directory once started as a primary (its marker vouching for
+/// its reasoning), then a replica that applied its primary's records, started again as a
+/// store of its own (the promotion docs/ops/replication.md describes) is not current under
+/// its rules: its start reasons again, and no marker made before the records vouches for
+/// them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_promoted_replica_is_not_current_until_it_reasons() -> TestResult<()> {
+    let rdfs = ReasonerConfig::for_mode(ReasoningMode::Rdfs)
+        .materialised_program()
+        .expect("RDFS reasons");
+    let primary_dir = tempfile::tempdir()?;
+    let primary_store = StoreService::new(StoreConfig::on_disk(primary_dir.path()))?;
+    primary_store.rematerialise(&rdfs)?;
+    let base = serve(&server(primary_store, ReasoningMode::Rdfs, primary())).await?;
+    let replica_dir = tempfile::tempdir()?;
+    {
+        let once_a_primary = StoreService::new(StoreConfig::on_disk(replica_dir.path()))?;
+        once_a_primary.rematerialise(&rdfs)?;
+        assert!(
+            once_a_primary.reasoning_is_current(rdfs.clone()),
+            "the precondition: its marker vouches for its reasoning"
+        );
+    }
+    {
+        let replica_state = server(
+            StoreService::new(StoreConfig::on_disk(replica_dir.path()))?,
+            ReasoningMode::Rdfs,
+            replica_of(&base),
+        );
+        update(
+            &base,
+            "INSERT DATA { ex:Dog rdfs:subClassOf ex:Animal . ex:rex a ex:Dog }",
+        )
+        .await;
+        let client = reqwest::Client::new();
+        let mut applied = 0;
+        loop {
+            match replication::pull_once(&client, &base, &replica_state).await? {
+                0 => break,
+                n => applied += n,
+            }
+        }
+        assert!(
+            applied > 0,
+            "the precondition: the replica applied its primary's records"
+        );
+    }
+    let promoted = StoreService::new(StoreConfig::on_disk(replica_dir.path()))?;
+    assert!(
+        !promoted.reasoning_is_current(rdfs),
+        "the promoted directory's marker vouches for the records it applied"
+    );
+    Ok(())
+}
+
+/// The data the started directories are given: `ex:rex a ex:Animal` is inferred under `rdfs`.
+const ANIMALS: &str = "INSERT DATA { ex:Dog rdfs:subClassOf ex:Animal . ex:rex a ex:Dog }";
+
+/// The reasoned read the started stores are asked; its one row is inferred.
+const ANIMAL_QUERY: &str = "PREFIX ex: <http://example.com/> SELECT ?x WHERE { ?x a ex:Animal }";
+
+/// A data directory as this build's server leaves it under `rdfs`, in `dir`: started as a
+/// primary (its start reasons and writes the reasoning marker), given [`ANIMALS`], stopped.
+/// Its configuration file, its data directory, and what its [`ANIMAL_QUERY`] read gave.
+async fn reasoned_directory(
+    dir: &Path,
+) -> TestResult<(PathBuf, PathBuf, Vec<String>, Option<String>)> {
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data)?;
+    let file = configure(dir, &data)?;
+    let owl2_rl = "[reasoner]\nmode = \"owl2-rl\"\n";
+    let text = std::fs::read_to_string(&file)?;
+    if !text.contains(owl2_rl) {
+        return Err(format!("the configuration has no {owl2_rl:?}:\n{text}").into());
+    }
+    std::fs::write(
+        &file,
+        text.replace(owl2_rl, "[reasoner]\nmode = \"rdfs\"\n"),
+    )?;
+    let primary = Server::start(&file).await?;
+    primary
+        .update("nrese", &format!("{PREFIXES}{ANIMALS}"))
+        .await?;
+    let (rows, status) = primary.query_status("nrese", ANIMAL_QUERY).await?;
+    drop(primary);
+    Ok((file, data, rows, status))
+}
+
+/// The result cache's hits, as `/api/v1/repositories/nrese/cache` counts them.
+async fn cache_hits(server: &Server) -> TestResult<u64> {
+    let view: serde_json::Value =
+        serde_json::from_str(&server.get("/api/v1/repositories/nrese/cache").await?)?;
+    view["hits"]
+        .as_u64()
+        .ok_or_else(|| format!("no hits in {view}").into())
+}
+
+/// The marker `text` with its fingerprint changed: one of another semantics.
+fn other_semantics(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            match line
+                .strip_prefix("fingerprint ")
+                .and_then(|hex| u64::from_str_radix(hex, 16).ok())
+            {
+                Some(fingerprint) => format!("fingerprint {:016x}\n", fingerprint ^ 1),
+                None => format!("{line}\n"),
+            }
+        })
+        .collect()
+}
+
+/// Spec (master 18:18 and 18:25): a replica started by this build's server over a
+/// directory holding a reasoning marker takes no certificate from it. Its reasoned read,
+/// before it applies any batch (its primary is unreachable), gives the rows as stored and
+/// says `not-certified`. Two markers: the one this build wrote (`as accepted`), and one of
+/// another semantics (`after an upgrade`: its fingerprint changed). Then a query pinned at
+/// the replica's open (`NRESE_PINNED_QUERIES`, `pinned`), answered from the result cache,
+/// says `not-certified` too, as a fresh read does (`pinned, fresh`). The preconditions: the
+/// directory's own read as a primary is certified (`sound-only` under `rdfs`), its marker
+/// is in place, and the pinned answer comes from the cache. Each case is printed.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replica_started_over_a_marker_says_not_certified() -> TestResult<()> {
+    let (mut wrong, mut unmet) = (Vec::new(), Vec::new());
+    for case in ["as accepted", "after an upgrade", "pinned"] {
+        let dir = tempfile::tempdir()?;
+        let (file, data, want, certified) = reasoned_directory(dir.path()).await?;
+        if !certified
+            .as_deref()
+            .is_some_and(|s| s.starts_with("sound-only"))
+        {
+            unmet.push(format!(
+                "{case}: the primary's read is certified: {certified:?}"
+            ));
+            continue;
+        }
+        let marker = data.join("reasoning.state");
+        let Ok(text) = std::fs::read_to_string(&marker) else {
+            unmet.push(format!("{case}: the directory holds its marker"));
+            continue;
+        };
+        if case == "after an upgrade" {
+            let changed = other_semantics(&text);
+            if changed == text {
+                unmet.push(format!(
+                    "{case}: the marker names its fingerprint: {text:?}"
+                ));
+                continue;
+            }
+            std::fs::write(&marker, changed)?;
+        }
+        let replica = std::fs::read_to_string(&file)?
+            + "[replication]\nmode = \"replica\"\nprimary = \"http://127.0.0.1:9\"\n";
+        std::fs::write(&file, replica)?;
+        let pinned = dir.path().join("animals.rq");
+        std::fs::write(&pinned, ANIMAL_QUERY)?;
+        let pinned = pinned.display().to_string();
+        let env = match case {
+            "pinned" => vec![("NRESE_PINNED_QUERIES", pinned.as_str())],
+            _ => Vec::new(),
+        };
+        let server = Server::start_with(&file, &env).await?;
+        let before = cache_hits(&server).await?;
+        let (rows, status) = server.query_status("nrese", ANIMAL_QUERY).await?;
+        let after = cache_hits(&server).await?;
+        if case == "pinned" && after <= before {
+            unmet.push(format!(
+                "{case}: the answer came from the cache: hits {before} -> {after}"
+            ));
+        }
+        let right = rows == want && status.as_deref() == Some("not-certified");
+        println!(
+            "CASE {case}: {} {status:?} {rows:?}",
+            if right { "right" } else { "WRONG" }
+        );
+        if !right {
+            wrong.push(format!("{case}: {status:?} {rows:?}, want {want:?}"));
+        }
+        if case == "pinned" {
+            let fresh = ANIMAL_QUERY.replace("?x", "?y");
+            let (_, status) = server.query_status("nrese", &fresh).await?;
+            let right = status.as_deref() == Some("not-certified");
+            println!(
+                "CASE pinned, fresh: {} {status:?}",
+                if right { "right" } else { "WRONG" }
+            );
+            if !right {
+                wrong.push(format!("pinned, fresh: {status:?}"));
+            }
+        }
+    }
+    for line in &unmet {
+        eprintln!("UNMET {line}");
     }
     assert!(unmet.is_empty(), "{unmet:#?}");
     assert!(wrong.is_empty(), "{wrong:#?}");
