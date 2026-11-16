@@ -6,10 +6,10 @@
 use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-use nrese_store::{MutationPipeline, StoreService};
+use nrese_store::{MutationPipeline, StoreConfig, StoreService};
 
 use super::queries::query;
-use super::{ask, insert, pipeline};
+use super::{ask, insert, pipeline, update};
 
 /// A union on the right of a subclass axiom: outside OWL 2 RL, so beside the data it takes
 /// the ontology off the RL route, to the bounds.
@@ -80,6 +80,71 @@ fn a_key_binds_no_anonymous_instance() {
             (data, answer, complete)
         });
     let wrong = answered(&cases, "ASK { :d2 a :E }");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// An object key whose value's `sameAs` class is all anonymous (`_:z1`, `_:z2`) binds
+/// nothing; a later commit that adds the named `:n` to the class makes it bind, and the
+/// commit that deletes that statement unbinds it again. Each answer and its status is the
+/// one a store given the same statements in one commit gives; in both equality modes, every
+/// identity stored and representatives stored.
+#[test]
+fn a_key_binds_from_the_commit_that_names_its_value() {
+    let anonymous = object_key("_:z1", "_:z1 owl:sameAs _:z2 .");
+    let named = object_key("_:z1", "_:z1 owl:sameAs _:z2 . _:z2 owl:sameAs :n .");
+    let steps = [
+        (
+            format!("INSERT DATA {{ {anonymous} }}"),
+            &anonymous,
+            "false",
+        ),
+        (
+            "INSERT { ?z owl:sameAs :n } WHERE { :a :p ?z }".to_owned(),
+            &named,
+            "true",
+        ),
+        (
+            "DELETE { ?z owl:sameAs :n } WHERE { ?z owl:sameAs :n }".to_owned(),
+            &anonymous,
+            "false",
+        ),
+    ];
+    let store = |compact: bool| {
+        let config = StoreConfig {
+            equality_compact: compact,
+            ..crate::support::in_memory_store_config()
+        };
+        let dl = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl);
+        MutationPipeline::new(
+            Arc::new(StoreService::new(config).expect("store")),
+            Arc::new(ReasonerService::new(dl)),
+        )
+    };
+    let read = "ASK { :a a :D }";
+    let mut wrong = Vec::new();
+    for compact in [false, true] {
+        let committed = store(compact);
+        for (change, data, answer) in &steps {
+            update(&committed, change).expect("commit");
+            let (rows, status) = query(&committed, read);
+            let once = store(compact);
+            insert(&once, data).expect("consistent");
+            let (once_rows, once_status) = query(&once, read);
+            let line = format!(
+                "compact {compact}, {change}: {rows:?}, complete {}; in one commit {once_rows:?}, \
+                 complete {}",
+                status.is_complete(),
+                once_status.is_complete()
+            );
+            eprintln!("{line}");
+            if rows != [*answer]
+                || once_rows != [*answer]
+                || status.is_complete() != once_status.is_complete()
+            {
+                wrong.push(line);
+            }
+        }
+    }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 

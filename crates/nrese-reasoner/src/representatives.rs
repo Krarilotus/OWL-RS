@@ -122,6 +122,10 @@ fn concludes_its_inequality_equal(rule: &Rule, same_as: u64) -> bool {
     else {
         return false;
     };
+    #[cfg(test)]
+    if !named.is_empty() && KEYS_OVER_CLASSES.get() {
+        return false;
+    }
     let (low, high) = nrese_engine::TermId::kind_range(nrese_engine::TermKind::BlankNode);
     let blank = (low.raw(), high.raw());
     let named = named
@@ -131,6 +135,23 @@ fn concludes_its_inequality_equal(rule: &Rule, same_as: u64) -> bool {
         && heads.iter().all(|&Atom([s, p, o])| {
             p == Term::Const(same_as) && ((s, o) == (*a, *b) || (s, o) == (*b, *a))
         })
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: `owl2-dl`'s `prp-key` runs over the classes on this thread ([`keys_over_classes`]).
+    static KEYS_OVER_CLASSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: `run`, with `owl2-dl`'s `prp-key` on this thread over the classes' members
+/// ([`Guard::OverClasses`]) instead of left to its representatives: the reference its
+/// exemption must answer as.
+#[cfg(test)]
+pub(crate) fn keys_over_classes<R>(run: impl FnOnce() -> R) -> R {
+    KEYS_OVER_CLASSES.set(true);
+    let result = run();
+    KEYS_OVER_CLASSES.set(false);
+    result
 }
 
 /// Whether members of the classes of the guards' variables' values (a constant stands for
