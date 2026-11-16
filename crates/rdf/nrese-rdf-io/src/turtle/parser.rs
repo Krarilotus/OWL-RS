@@ -500,8 +500,10 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 let syntax = matches!(error, RdfParseError::Syntax(_));
                 // A statement whose failing token was its own `.` has ended there already:
                 // recovery goes on right after it, skipping nothing more (`resync`).
-                self.done =
-                    !(syntax && self.settings.recover && !self.settings.n3 && self.resync());
+                let recovers = syntax && self.settings.recover && !self.settings.n3;
+                self.done = !(recovers && self.resync());
+                // Recovery found no end of the statement before the input's: it may be cut off.
+                let cut = recovers && self.done && self.input.held.is_none();
                 self.unclosed.clear();
                 self.failed = None;
                 self.ending = Ending::Dot;
@@ -511,7 +513,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     }
                     other => other,
                 };
-                return Some(Err(error));
+                return Some(Err(error.ending(cut, true)));
             }
             self.own_triple_terms();
         }
