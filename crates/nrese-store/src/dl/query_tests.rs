@@ -832,9 +832,10 @@ fn first_named(reason: &Option<String>) -> Option<String> {
 /// for reason, but for the parts left out: a committed read is told what the commit recorded
 /// (which must be the whole's), a pending one the base's record; a part left out that no
 /// record tells comes after the indexes' decision. Which part left out a reason names first
-/// follows the read's order, so it isn't compared. `NRESE_FUZZ_SEED` (default 0) varies the
-/// stores; each run prints how often the indexes decided and how often the whole ontology
-/// found each reason.
+/// follows the read's order, so it isn't compared. And wherever the indexes decide, their
+/// answer is the whole ontology's past what it left out (most random stores leave a part out,
+/// whose reason comes first). `NRESE_FUZZ_SEED` (default 0) varies the stores; each run prints
+/// how often the indexes decided and how often the whole ontology found each reason.
 #[test]
 fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() {
     use crate::{MutationCommand, MutationTicket, Requester, SparqlUpdateRequest};
@@ -936,6 +937,8 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
     // By the indexes: a reason, none, the ontology's to decide; by the whole ontology: an
     // annotation reason, a part left out, a punning one.
     let (mut by_indexes, mut found) = ([0usize; 3], [0usize; 3]);
+    // Past what the whole ontology left out: an annotation reason, a punning one.
+    let mut past_found = [0usize; 2];
     for case in 0..CASES {
         let compact = r.below(2) == 0;
         let config = crate::StoreConfig {
@@ -1022,6 +1025,23 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
                 Some(None) => 1,
                 None => 2,
             }] += 1;
+            // The indexes decide annotation-property axioms and punning, which the whole
+            // ontology tells after what it left out.
+            let mut kept = whole.value().clone();
+            kept.diagnostics.retain(|d| !d.leaves_out());
+            let past = by_ontology(read, &kept);
+            if let Some(reason) = &past {
+                past_found[usize::from(!reason.contains("annotation-property axioms"))] += 1;
+            }
+            if let Some(decided) = by_index(read)
+                && decided != past
+            {
+                wrong.push(format!(
+                    "case {case} ({of}, compact equality {compact}): the indexes {decided:?}, \
+                     the whole ontology past what it left out {past:?}\n  committed: {data}\n  \
+                     pending: + {added:?} - {removed:?}"
+                ));
+            }
             if let Some(reason) = &full {
                 found[if reason.contains("annotation-property axioms") {
                     0
@@ -1043,8 +1063,15 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
     eprintln!(
         "NRESE_FUZZ_SEED={fuzz}: {CASES} stores, {refused} refused; by the indexes: {} \
          reasons, {} none, {} to the ontology; by the whole ontology: {} annotation, {} \
-         left-out and {} punning reasons",
-        by_indexes[0], by_indexes[1], by_indexes[2], found[0], found[1], found[2]
+         left-out and {} punning reasons; past what it left out: {} annotation and {} punning",
+        by_indexes[0],
+        by_indexes[1],
+        by_indexes[2],
+        found[0],
+        found[1],
+        found[2],
+        past_found[0],
+        past_found[1]
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert!(
