@@ -147,6 +147,9 @@ leave something out.
     while it is built; the working state of a cyclic count (triangles, four-cycles); and what reasoning allocates,
     which is watched rather than charged, so an overshoot is seen within 10 ms. The full list is on
     [contracts](architecture/contracts.md#memory).
+  - A checkpoint's working memory, a background one's and the one a bulk load commits by, counts
+    against no limit, not even `budgets.process_memory`. It grows with the whole dictionary, about
+    17 to 23 bytes per term: about 720 MiB for DBpedia core's 40.5 million terms. Leave room for it.
   - A join may take half the room left when it starts. That is a reading, not a reservation: it is checked every
     1,024 rows, and joins running at once can read the same room.
   - A design that bounds the rest follows this release.

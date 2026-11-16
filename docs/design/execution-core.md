@@ -111,6 +111,8 @@ This section owns the execution policy; there is no setting for it besides `dl.t
   (cached per revision: an envelope of their own within the catalog's budget, not the
   requesting operation's, besides `dl.memory` and the process limit;
   `store/dl/classification.rs`), rule materialisation, bulk spill and background storage.
+  A checkpoint's working memory is charged to no budget: the store leaves the engine's
+  `admission` unset (the store's `EngineConfig` in `nrese-store/src/service.rs`; [limits](../limits.md#memory-and-stopping)).
   A cached result keeps what it retains after the request that computed it ends.
 - **A Rayon worker never waits on a cache flight.** A part another query computes is
   waited for only off the pool; a request on a worker computes it itself, so no wait can
