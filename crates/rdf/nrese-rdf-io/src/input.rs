@@ -139,6 +139,13 @@ impl<'a, R: Read> Lines<'a, R> {
         }
     }
 
+    /// `error`, the line returned last failing, in the document ([`Self::in_document`]): a
+    /// statement or a directive alike. Without its terminator the input ended inside it, so
+    /// the error ends the document, which may be cut off.
+    pub(crate) fn failed(&self, error: RdfParseError) -> RdfParseError {
+        self.in_document(error).ending(self.unterminated, true)
+    }
+
     /// The document's lines before these, counted at the first error and kept: counting
     /// reads the document up to the chunk, and a recovering parse can meet an error on every
     /// line (D16-546: N-Quads named `.nt`, each line counted again, took time quadratic in
