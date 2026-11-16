@@ -1487,11 +1487,11 @@ fn bound(rows: &str, var: &str) -> usize {
 
 /// The shapes that compare data values by term: a join on one (over a declared and an
 /// undeclared property, on a blank node, written or made by a path's sequence, and at the
-/// start of a path with a reversed step under `+`), and `DISTINCT`, `GROUP BY` and
-/// `COUNT(DISTINCT)` over one (and `DISTINCT` and `GROUP BY` over an alias of one). Each
-/// `(shape, data, read, right)`, `right` holding of the rows OWL 2 gives by value over
-/// [`SEVEN`]: `:a` and `:b` share their value, which is one value.
-const SHAPES: [(&str, &str, &str, Right); 10] = [
+/// start of a path with a reversed step, under `+` or in an alternative), and `DISTINCT`,
+/// `GROUP BY` and `COUNT(DISTINCT)` over one (and `DISTINCT` and `GROUP BY` over an alias of
+/// one). Each `(shape, data, read, right)`, `right` holding of the rows OWL 2 gives by value
+/// over [`SEVEN`]: `:a` and `:b` share their value, which is one value.
+const SHAPES: [(&str, &str, &str, Right); 11] = [
     (
         "a join",
         SEVEN,
@@ -1520,6 +1520,12 @@ const SHAPES: [(&str, &str, &str, Right); 10] = [
         "a join at a reversed path's start",
         SEVEN,
         "SELECT ?x ?y { ?n (^:age)+ ?x . ?n (^:age)+ ?y FILTER(?x != ?y) }",
+        |rows| rows.contains("example.com/a\""),
+    ),
+    (
+        "a join at an alternative's reversed start",
+        SEVEN,
+        "SELECT ?x ?y { ?n (^:age|:p) ?x . ?n (^:age|:p) ?y FILTER(?x != ?y) }",
         |rows| rows.contains("example.com/a\""),
     ),
     (
@@ -1816,6 +1822,26 @@ fn a_string_beside_a_number_is_sound_only_though_no_row_is_missed() {
         eprintln!("{read}: {rows} {status:?}");
         if !right(&rows) || status != ["sound-only"; 2] {
             wrong.push(format!("{read}: {rows} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The control for a path's start: a path with no reversed step starts at a subject (an IRI
+/// or a blank node, never a data value), so a join there compares no value, though the
+/// store holds a number. Spec: the join keeps its rows and `complete`, run and planned,
+/// under each regime that promises it.
+#[test]
+fn a_join_at_the_start_of_a_path_without_a_reversed_step_stays_complete() {
+    let data = ":knows a owl:ObjectProperty . :c :knows :a , :b . :a :age 7 .";
+    let read = "SELECT ?x ?y { ?z :knows+ ?x . ?z :knows+ ?y FILTER(?x != ?y) }";
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        let (rows, status) = answer(&store(data), read);
+        eprintln!("{regime}: {rows} {status:?}");
+        let pair = rows.contains("example.com/a\"") && rows.contains("example.com/b\"");
+        if !pair || status != ["complete"; 2] {
+            wrong.push(format!("{regime}: {rows} {status:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
