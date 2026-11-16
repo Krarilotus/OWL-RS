@@ -2389,13 +2389,14 @@ impl GroundProgram {
     }
 
     /// [`Self::add`], with the schema facts the instance was grounded on, the closed
-    /// family it is an instance of, if any ([`closed_family`]), and its equality rule.
+    /// family it is an instance of, if any ([`closed_family`]), and the `owl:sameAs` id its
+    /// equality rule is known by: the rule filed, its tautological heads removed, is asked.
     fn add_with(
         &mut self,
         rule: Rule,
         premises: Vec<Triple>,
         family: Option<u64>,
-        equality: Option<&'static str>,
+        same_as: Option<u64>,
     ) -> Option<usize> {
         if let Some(p) = transitive_predicate(&rule) {
             self.transitive_with(p, premises);
@@ -2427,6 +2428,7 @@ impl GroundProgram {
             if let Head::Facts(heads) = &rule.head {
                 self.heads.push_atoms(self.rules.len(), heads);
             }
+            let equality = same_as.and_then(|id| super::equality_rules::equality_rule(&rule, id));
             self.rules.push(rule);
             self.premises.push(premises);
             self.families.push(family);
@@ -2654,8 +2656,7 @@ impl GroundProgram {
                     .chain(extra.iter().copied())
                     .collect();
                 if let Some(rule) = schema.rewrite_heads(g.rule) {
-                    let equality = super::equality_rules::equality_rule(&rule, schema.same_as());
-                    facts.extend(self.add_with(rule, premises, family, equality));
+                    facts.extend(self.add_with(rule, premises, family, Some(schema.same_as())));
                 }
             }
         }
