@@ -191,8 +191,8 @@ const ONE_VALUE: [(&str, &str); 2] = [
 const OUTSIDE_RL: &str = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet .";
 
 /// Each of `data` committed (with [`OUTSIDE_RL`] where `outside`), and each of `reads`,
-/// all entailed by it, asked: an answer `false` labelled complete is wrong. The wrong
-/// ones, as lines; every answer is printed with the route.
+/// all entailed by it, asked: each must answer `true`, labelled complete. The wrong ones,
+/// as lines; every answer is printed with the route.
 fn missed(data: &[String], outside: bool, reads: &[&str]) -> Vec<String> {
     let mut wrong = Vec::new();
     for data in data {
@@ -207,7 +207,7 @@ fn missed(data: &[String], outside: bool, reads: &[&str]) -> Vec<String> {
                 status.is_complete()
             );
             eprintln!("{line}");
-            if rows == ["false"] && status.is_complete() {
+            if rows != ["true"] || !status.is_complete() {
                 wrong.push(line);
             }
         }
@@ -216,7 +216,8 @@ fn missed(data: &[String], outside: bool, reads: &[&str]) -> Vec<String> {
 }
 
 /// Each of `data`, inconsistent, committed (with [`OUTSIDE_RL`] where `outside`): it must
-/// be rejected. The ones committed, as lines; every outcome is printed.
+/// be rejected as inconsistent, by no other error. The others, as lines; every outcome is
+/// printed.
 fn accepted(data: &[String], outside: bool) -> Vec<String> {
     let mut wrong = Vec::new();
     for data in data {
@@ -228,7 +229,9 @@ fn accepted(data: &[String], outside: bool) -> Vec<String> {
             Err(e) => format!("{data} / rejected: {e}"),
         };
         eprintln!("{line}");
-        if result.is_ok() {
+        let inconsistent = matches!(&result, Err(nrese_store::MutationError::Rejected(r))
+            if r.kind == nrese_store::RejectKind::Inconsistent);
+        if !inconsistent {
             wrong.push(line);
         }
     }
@@ -447,6 +450,32 @@ fn the_mappings_spelling_of_a_max_cardinality_keeps_the_rules_route() {
     let (rows, status) = query(&dl, "ASK { :y :q :z }");
     assert_eq!(rows, ["true"]);
     assert!(status.is_complete(), "{:?}", status.reasons());
+}
+
+/// The same over `rdfs:Literal` (OWL 2 Profiles §4.2.4 admits it in RL): at most `n`
+/// values of `:age` at all, and `:c` has one. No rule reads `owl:onDataRange`, whatever
+/// the range.
+fn literal_qualified_data_cardinality(n: u32) -> String {
+    format!(
+        ":age a owl:DatatypeProperty . \
+         :C a owl:Class ; rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :age ; \
+           owl:maxQualifiedCardinality \"{n}\"^^xsd:nonNegativeInteger ; \
+           owl:onDataRange rdfs:Literal ] . \
+         :c a :C ; :age 5 ."
+    )
+}
+
+#[test]
+fn a_qualified_data_cardinality_over_any_literal_is_kept() {
+    for outside in [false, true] {
+        let wrong = accepted(&[literal_qualified_data_cardinality(0)], outside);
+        assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
+        // The control: at most one, and one, is consistent.
+        let dl = pipeline();
+        let extra = if outside { OUTSIDE_RL } else { "" };
+        let data = literal_qualified_data_cardinality(1);
+        insert(&dl, &format!("{data} {extra}")).expect("consistent");
+    }
 }
 
 /// cls-svf1 on a data property: an individual with a value of the filler is in the class

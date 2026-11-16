@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::tbox::{Basic, Type};
 use crate::mapping::Ontology;
-use crate::model::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, Term};
+use crate::model::{Axiom, Characteristic, ClassExpr, ExprId, Term};
 
 /// An axiom the rewriting doesn't follow, by the property or class it is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -74,7 +74,8 @@ pub enum Hazard {
 /// two terms to it, and a literal has no datatype. A key on it (prp-key), a negative
 /// assertion of it (prp-npa2), disjoint data properties (prp-pdw, prp-adp), a hasValue
 /// (cls-hv2), a someValuesFrom (cls-svf1) or a qualified maximum (`owl:onDataRange`, which
-/// cls-maxqc1-4 don't read) on it. `None`: the closure's answers don't rest on these.
+/// cls-maxqc1-4 don't read: [`Ontology::qualified_data_max`]) on it. `None`: the closure's
+/// answers don't rest on these.
 pub fn reads_data_values(ontology: &Ontology) -> Option<Term> {
     let axiom = ontology.axioms.iter().find_map(|axiom| match axiom {
         Axiom::HasKey(_, _, data) => data.first().copied(),
@@ -83,11 +84,10 @@ pub fn reads_data_values(ontology: &Ontology) -> Option<Term> {
         _ => None,
     });
     let classes = &ontology.classes;
-    axiom.or_else(|| {
+    axiom.or(ontology.qualified_data_max).or_else(|| {
         (0..classes.len() as u32).find_map(|e| match *classes.get(e) {
             ClassExpr::DataHasValue(p, _) => Some(p),
             ClassExpr::DataSome(p, _) => Some(p),
-            ClassExpr::DataMax(_, p, r) if *ontology.range(r) != DataRange::Literal => Some(p),
             _ => None,
         })
     })

@@ -756,3 +756,56 @@ async fn query_answers_say_whether_answers_through_existentials_are_complete()
     assert!(String::from_utf8(body.to_vec())?.contains("<http://example.com/bob>"));
     Ok(())
 }
+
+/// Under owl2-rl, `:a` is `:Aged` through an existential on `:age`, undeclared and with a
+/// literal (OWL 2 Direct Semantics, DataSomeValuesFrom), but the rules lack dt-type2 for
+/// it: the header of the closure's `false` never says complete, with the rewriting on or
+/// not.
+#[tokio::test]
+async fn an_undeclared_data_existentials_answer_is_never_complete_in_its_header()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nrese_store::{QlRewritingMode, StoreConfig};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("aged.ttl");
+    std::fs::write(
+        &path,
+        "@prefix : <http://example.com/> . \
+         @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . \
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> . \
+         :Aged a owl:Class . \
+         [ a owl:Restriction ; owl:onProperty :age ; owl:someValuesFrom xsd:integer ] \
+           rdfs:subClassOf :Aged . \
+         :a :age 5 .",
+    )?;
+    for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+        let app = crate::support::test_app_with_store_config(
+            StoreConfig {
+                ql_rewriting: ql,
+                ..StoreConfig::in_memory().with_ontology(path.clone())
+            },
+            PolicyConfig::default(),
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+        )?;
+        let request = Request::builder()
+            .uri("/dataset/query")
+            .method(Method::POST)
+            .header("content-type", "application/sparql-query")
+            .header("accept", "application/sparql-results+json")
+            .body(Body::from(
+                "ASK { <http://example.com/a> a <http://example.com/Aged> }",
+            ))?;
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let header = response.headers()["nrese-completeness"]
+            .to_str()?
+            .to_owned();
+        let body = crate::support::body_text(response).await?;
+        eprintln!("rewriting {ql:?}: {body} with {header}");
+        assert!(
+            body.contains("false") && !header.starts_with("complete"),
+            "rewriting {ql:?}: {body} with {header}"
+        );
+    }
+    Ok(())
+}
