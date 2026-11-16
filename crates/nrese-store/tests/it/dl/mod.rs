@@ -9,6 +9,7 @@ mod explain;
 mod gap;
 mod gates;
 mod identity;
+mod keys;
 mod mode;
 mod queries;
 mod representatives;

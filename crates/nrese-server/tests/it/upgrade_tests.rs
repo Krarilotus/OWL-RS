@@ -583,6 +583,50 @@ async fn a_store_written_by_main_opens_with_its_data_answers_and_settings()
     Ok(())
 }
 
+/// A store whose closure the plain `owl2-rl` program wrote, as `owl2-dl` stores were written
+/// before their keys bound named individuals only, opened by this build's server twice. As
+/// `owl2-rl` it is current at both starts; as `owl2-dl` its closure is rebuilt once, at the
+/// first start, under this build's `owl2-dl` program, and kept at the second.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_owl2_dl_store_rebuilds_its_closure_once_for_its_keys()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (mode, kept) in [("owl2-rl", [true, true]), ("owl2-dl", [false, true])] {
+        let dir = tempfile::tempdir()?;
+        let data = dir.path().join("data");
+        let written = nrese_store::StoreService::new(nrese_store::StoreConfig::on_disk(&data))?;
+        written.rematerialise(&RuleProgram::builtin(Ruleset::Owl2Rl))?;
+        drop(written);
+        let config = configure(dir.path(), &data)?;
+        let text = std::fs::read_to_string(&config)?.replace("\"owl2-rl\"", &format!("\"{mode}\""));
+        std::fs::write(&config, text)?;
+        let program = nrese_reasoner::ReasonerConfig::for_mode(
+            nrese_reasoner::ReasoningMode::from_name(mode).expect("a mode"),
+        )
+        .materialised_program()
+        .expect("rules");
+        let mut starts = Vec::new();
+        for _ in 0..2 {
+            let server = Server::start(&config).await?;
+            starts.push(
+                server
+                    .process
+                    .output()
+                    .contains("inferred stack is current"),
+            );
+            assert_eq!(
+                marker(&data)["fingerprint"],
+                format!("{:016x}", program.fingerprint()),
+                "{mode}: not current"
+            );
+        }
+        assert_eq!(
+            starts, kept,
+            "{mode}: the closure kept at the first and second start"
+        );
+    }
+    Ok(())
+}
+
 /// Main's image backup restores with this build (`nrese-server restore`) and serves what
 /// main served.
 #[tokio::test(flavor = "multi_thread")]
