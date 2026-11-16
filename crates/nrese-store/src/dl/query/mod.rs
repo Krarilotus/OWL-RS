@@ -297,27 +297,27 @@ pub(crate) fn plan_status(
     let analysis = analyse(prepared.query());
     let at = super::bounds::view_until(store, Some(&|| cancellation.is_cancelled()))
         .ok_or(crate::QueryEvaluationError::Cancelled)?;
-    let mut completeness = plan_status_built(store, prepared, &analysis, &at).completeness;
-    certify(&mut completeness, prepared.reads(), "dl", true);
-    mark(store, prepared, Revision::Decided(&at), &mut completeness);
-    Ok(completeness)
+    let completeness = plan_status_built(store, prepared, &analysis, &at).completeness;
+    let assessed = store.assess(prepared, Revision::Decided(&at), Some(completeness));
+    Ok(assessed.unwrap_or_else(Completeness::not_certified))
 }
 
 /// The data a status is composed for ([`mark`]): the view the answers were decided on, or
 /// the snapshot a read without the bounds ran on, committed or with a transaction's
-/// operations pending (whose revision number is its base's, so it is read afresh).
+/// operations pending (whose revision number is its base's, so it is read afresh), and
+/// whether one of them may delete.
 #[derive(Clone, Copy)]
 pub(crate) enum Revision<'a> {
     Decided(&'a (Snapshot, Arc<View>)),
     Committed(&'a Snapshot),
-    Pending(&'a Snapshot),
+    Pending(&'a Snapshot, bool),
 }
 
 impl Revision<'_> {
     pub(crate) fn snapshot(&self) -> &Snapshot {
         match self {
             Revision::Decided((snapshot, _)) => snapshot,
-            Revision::Committed(snapshot) | Revision::Pending(snapshot) => snapshot,
+            Revision::Committed(snapshot) | Revision::Pending(snapshot, _) => snapshot,
         }
     }
 }
@@ -356,11 +356,10 @@ pub(crate) fn mark(
         any(&by_subject).or_else(|| any(&by_object)).is_some()
     };
     let read = match at {
-        Revision::Pending(_) => read_ontology,
+        Revision::Pending(..) => read_ontology,
         _ => ontology_at,
     };
-    if completeness.complete
-        && let Some(iri) = named_outside(prepared.query(), held)
+    if let Some(iri) = named_outside(prepared.query(), held)
         && read(store, snapshot).ok().is_none_or(|o| {
             o.value()
                 .axioms
@@ -396,7 +395,7 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
         Revision::Decided((_, view)) if view.rules => return None,
         Revision::Decided((snapshot, _)) => (snapshot, false),
         Revision::Committed(snapshot) => (snapshot, false),
-        Revision::Pending(snapshot) => (snapshot, true),
+        Revision::Pending(snapshot, _) => (snapshot, true),
     };
     if let Some(decided) = by_index(snapshot) {
         return decided;
@@ -540,7 +539,7 @@ pub(crate) struct Reads {
 }
 
 /// [`certify_closure`], on the bounds' path where `bounds` (what [`denied`] allows there).
-fn certify(
+pub(crate) fn certify(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
     source: &'static str,
@@ -562,6 +561,17 @@ fn certify(
     if let Some(reason) = constant {
         completeness.incomplete(source, reason.clone());
     }
+    negation_rule(completeness, (query, reads), source);
+}
+
+/// Where rows may be missing, an operator under which a missing row can make a returned
+/// one wrong makes the answers unsound ([`negation`]): the last step of [`certify`], and of
+/// a read inside a transaction whatever the regime, whose pending rows the closure lacks.
+pub(crate) fn negation_rule(
+    completeness: &mut Completeness,
+    (query, reads): (&Query, &Reads),
+    source: &'static str,
+) {
     if completeness.complete {
         return;
     }
@@ -646,13 +656,9 @@ pub(crate) fn answer(
     #[cfg(test)]
     crate::service::hooks::run(&crate::service::hooks::AFTER_DECIDED);
     cancellation.check()?;
-    match &mut outcome {
-        Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => {
-            certify(status, prepared.reads(), "dl", true);
-            mark(store, prepared, Revision::Decided(&at), status);
-        }
-    }
-    let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &outcome;
+    let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &mut outcome;
+    let assessed = store.assess(prepared, Revision::Decided(&at), Some(status.clone()));
+    *status = assessed.unwrap_or_else(Completeness::not_certified);
     refuse_unless_complete(mode, status, || detail.unresolved.clone())?;
     Ok(outcome)
 }
