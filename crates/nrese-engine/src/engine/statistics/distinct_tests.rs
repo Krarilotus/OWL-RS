@@ -492,3 +492,34 @@ fn a_pending_snapshot_at_the_same_revision_gets_its_own() {
         "the pending ask left the published snapshot's count in place"
     );
 }
+
+/// - Spec: published snapshots of one revision that read differently share no kept count: one
+///   reading `owl:sameAs` classes gets its own estimate, not the one kept for the statements as
+///   stored (the identity serves a kept count, not the revision; review r1, F2).
+/// - Input: 3000 subjects of `p`; 1000 aliases, each inferred `owl:sameAs` one subject; the
+///   published snapshot as stored asked, then the same snapshot reading equality classes.
+/// - Expected: 3000 as stored; no estimate for the expanding read (its 4000 matches are past a
+///   quarter of the kept count's, and an expanded pattern's distinct values aren't walked).
+#[test]
+fn a_published_snapshot_reading_equality_classes_gets_its_own() {
+    let engine = Engine::new(config()).unwrap();
+    commit(&engine, "p", 0..3000);
+    let mut tx = engine.transaction();
+    let same_as = tx.intern(iri("sameAs").as_ref().into());
+    for i in 0..1000 {
+        let subject = tx.intern(iri(&format!("s{i}")).as_ref().into());
+        let alias = tx.intern(iri(&format!("alias{i}")).as_ref().into());
+        assert!(tx.insert_inferred(EncodedTriple::new(alias, same_as, subject)));
+    }
+    tx.commit().unwrap();
+    let stored = engine.snapshot();
+    let expanding = stored.with_equality(Some(same_as));
+    assert_eq!(stored.identity().revision, expanding.identity().revision);
+    let ask = |snapshot: &Snapshot| {
+        let pattern = of(snapshot, "p");
+        let model = ReadModel::Materialised;
+        snapshot.distinct_estimate_in(model, &pattern, Permutation::Gpso, &|_| true)
+    };
+    assert_eq!(ask(&stored), Ok(Some(3000)));
+    assert_eq!(ask(&expanding), Ok(None));
+}
