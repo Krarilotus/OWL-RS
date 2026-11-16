@@ -79,7 +79,7 @@ fn queries_during_commits_read_u1_at_their_snapshots_revision() {
 }
 
 /// Runs `q` inside a transaction with `ops` pending: its rows and status.
-fn in_transaction(
+pub(super) fn in_transaction(
     dl: &MutationPipeline,
     ops: Vec<StatementOp>,
     q: &str,
@@ -102,7 +102,7 @@ fn in_transaction(
     (String::from_utf8(out).expect("utf8"), status)
 }
 
-fn ntriples(text: &str) -> RdfPayload {
+pub(super) fn ntriples(text: &str) -> RdfPayload {
     RdfPayload {
         payload: text.as_bytes().to_vec().into(),
         format: GraphResultFormat::NTriples,

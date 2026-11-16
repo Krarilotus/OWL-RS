@@ -81,6 +81,10 @@ pub struct Ontology {
     pub diagnostics: Vec<Diagnostic>,
     /// Annotation statements and the ontology header, read past.
     pub annotations: usize,
+    /// The annotation properties given a domain, a range or a super-property, read past
+    /// among [`Self::annotations`]: OWL 2 DL gives these axioms no meaning, while the OWL 2
+    /// RL rules over the triples (prp-dom, prp-rng, prp-spo1) read them. Sorted, each once.
+    pub annotation_schema: Vec<Term>,
     /// The source's ids of the properties with a fixed meaning.
     pub builtin: BuiltinProperties,
     /// The literals, datatypes and facets of the data axioms, as the source gives them.
@@ -89,6 +93,10 @@ pub struct Ontology {
     pub anonymous: BTreeSet<Term>,
     /// DL-safe rules (`crate::rules`; not OWL 2), each with a [`Diagnostic::Rule`].
     pub rules: Vec<crate::rules::Rule>,
+    /// The first data property with a maximum written with a data range (`owl:onDataRange`,
+    /// `rdfs:Literal` too), which OWL 2 RL's rules don't read: its range can't tell it from
+    /// an unqualified maximum.
+    pub qualified_data_max: Option<Term>,
 }
 
 /// The properties OWL 2 gives a fixed meaning, by their ids in the source (`None` where
@@ -367,6 +375,7 @@ struct Reader<'a> {
     /// Properties used with literal objects.
     used_with_literals: HashSet<Term>,
     used_with_nodes: HashSet<Term>,
+    qualified_data_max: Option<Term>,
     class_memo: HashMap<Term, Option<ExprId>>,
     range_memo: HashMap<Term, Option<RangeId>>,
     /// Blank nodes read as operands, and how often.
@@ -382,6 +391,7 @@ struct Reader<'a> {
     diagnostics: Vec<Diagnostic>,
     reported: HashSet<(Term, &'static str)>,
     annotations: usize,
+    annotation_schema: Vec<Term>,
 }
 
 /// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
@@ -409,6 +419,20 @@ pub const DECLARATION_KINDS: [(&str, EntityKind); 8] = [
         Vocabulary::iri("owl_named_individual"),
         EntityKind::NamedIndividual,
     ),
+];
+
+/// The annotation properties OWL 2 builds in (Structural Specification §5.5): the reader
+/// reads a statement of one as an annotation, which gives its terms no kind.
+pub const BUILTIN_ANNOTATIONS: [&str; 9] = [
+    "http://www.w3.org/2000/01/rdf-schema#label",
+    "http://www.w3.org/2000/01/rdf-schema#comment",
+    "http://www.w3.org/2000/01/rdf-schema#seeAlso",
+    "http://www.w3.org/2000/01/rdf-schema#isDefinedBy",
+    "http://www.w3.org/2002/07/owl#deprecated",
+    "http://www.w3.org/2002/07/owl#versionInfo",
+    "http://www.w3.org/2002/07/owl#priorVersion",
+    "http://www.w3.org/2002/07/owl#backwardCompatibleWith",
+    "http://www.w3.org/2002/07/owl#incompatibleWith",
 ];
 
 /// `Some(id) == Some(x)` without matching an absent term.
@@ -441,6 +465,7 @@ impl<'a> Reader<'a> {
             declared: BTreeMap::new(),
             used_with_literals,
             used_with_nodes,
+            qualified_data_max: None,
             class_memo: HashMap::new(),
             range_memo: HashMap::new(),
             uses: HashMap::new(),
@@ -453,6 +478,7 @@ impl<'a> Reader<'a> {
             diagnostics: Vec::new(),
             reported: HashSet::new(),
             annotations: 0,
+            annotation_schema: Vec::new(),
         }
     }
 
@@ -758,10 +784,75 @@ impl<'a> Reader<'a> {
         }))
     }
 
+    /// Whether the restriction `node` says its undeclared property is a data property, where
+    /// no literal use does (a schema read alone): its value a literal, or its filler a data
+    /// range ([`Self::is_data_range`]).
+    fn says_data(&mut self, node: Term) -> bool {
+        let first = |reader: &Self, p| reader.objects(node, p).first().copied();
+        if let Some(value) = first(self, self.v.owl_has_value) {
+            return self.kind(value) == TermKind::Literal;
+        }
+        let filler = first(self, self.v.owl_some_values_from);
+        let Some(filler) = filler.or_else(|| first(self, self.v.owl_all_values_from)) else {
+            return false;
+        };
+        self.is_data_range(filler, &mut HashMap::new())
+    }
+
+    /// Whether `term` is a data range by its own statements: a datatype (declared, or of
+    /// OWL 2's datatype map, whose names no class may take), or a blank node typed
+    /// `rdfs:Datatype` (`owl:DataRange` in OWL 1), restricting a datatype, a datatype's
+    /// complement, an enumeration of literals, or an intersection or union of data ranges.
+    /// A mix with classes, an empty list or a cycle is no evidence: read as before. `seen`
+    /// holds each operator node's answer, `false` while on the path (a shared one is read once).
+    fn is_data_range(&mut self, term: Term, seen: &mut HashMap<Term, bool>) -> bool {
+        let v = self.v;
+        match self.kind(term) {
+            TermKind::Iri => {
+                self.declared_as(term, EntityKind::Datatype)
+                    || crate::vocab::DATA_IRIS
+                        .iter()
+                        .any(|&iri| self.terms.iri(iri) == Some(term))
+            }
+            TermKind::Blank => {
+                let first = |reader: &Self, p| reader.objects(term, p).first().copied();
+                if self.has_type(term, v.rdfs_datatype)
+                    || self.has_type(term, v.owl_data_range)
+                    || first(self, v.owl_on_datatype).is_some()
+                    || first(self, v.owl_datatype_complement_of).is_some()
+                {
+                    return true;
+                }
+                if let Some(list) = first(self, v.owl_one_of) {
+                    let members = self.list(list).unwrap_or_default();
+                    return !members.is_empty()
+                        && members.iter().all(|&m| self.kind(m) == TermKind::Literal);
+                }
+                if let Some(&data) = seen.get(&term) {
+                    return data;
+                }
+                seen.insert(term, false);
+                let operands =
+                    first(self, v.owl_intersection_of).or_else(|| first(self, v.owl_union_of));
+                let members = operands
+                    .and_then(|list| self.list(list))
+                    .unwrap_or_default();
+                let data =
+                    !members.is_empty() && members.iter().all(|&m| self.is_data_range(m, seen));
+                seen.insert(term, data);
+                data
+            }
+            _ => false,
+        }
+    }
+
     /// A restriction on `property`.
     fn restriction(&mut self, node: Term, property: Term) -> Option<ExprId> {
         let v = self.v;
-        let data = self.kind(property) == TermKind::Iri && self.is_data_property(property);
+        let data = self.kind(property) == TermKind::Iri
+            && (self.is_data_property(property)
+                || (!self.declared_as(property, EntityKind::ObjectProperty)
+                    && self.says_data(node)));
         let number = |reader: &mut Self, predicate: Option<Term>| -> Option<Option<u32>> {
             let literal = reader.one(node, predicate)?;
             let parsed = reader
@@ -813,6 +904,9 @@ impl<'a> Reader<'a> {
                 if let Some(n) = number(self, qualified) {
                     let filler = self.one(node, v.owl_on_data_range)?;
                     let range = self.range(filler)?;
+                    if qualified == v.owl_max_qualified {
+                        self.qualified_data_max.get_or_insert(property);
+                    }
                     return Some(self.intern_class(make(n?, property, range)));
                 }
             }
@@ -1159,6 +1253,7 @@ impl<'a> Reader<'a> {
         } else if is(p, v.rdfs_sub_property_of) {
             if self.declared_as(s, EntityKind::AnnotationProperty) {
                 self.annotations += 1;
+                self.annotation_schema.push(s);
             } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
                 self.add(Axiom::SubDataPropertyOf(s, o), triple);
             } else if let (Some(sub), Some(sup)) =
@@ -1213,6 +1308,7 @@ impl<'a> Reader<'a> {
             let domain = is(p, v.rdfs_domain);
             if self.declared_as(s, EntityKind::AnnotationProperty) {
                 self.annotations += 1;
+                self.annotation_schema.push(s);
             } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
                 if domain {
                     if let Some(class) = self.class(o) {
@@ -1395,18 +1491,7 @@ impl<'a> Reader<'a> {
 
     /// `rdfs:label` and the other annotation properties OWL 2 builds in.
     fn is_builtin_annotation(&self, predicate: Term) -> bool {
-        const BUILT_IN: [&str; 9] = [
-            "http://www.w3.org/2000/01/rdf-schema#label",
-            "http://www.w3.org/2000/01/rdf-schema#comment",
-            "http://www.w3.org/2000/01/rdf-schema#seeAlso",
-            "http://www.w3.org/2000/01/rdf-schema#isDefinedBy",
-            "http://www.w3.org/2002/07/owl#deprecated",
-            "http://www.w3.org/2002/07/owl#versionInfo",
-            "http://www.w3.org/2002/07/owl#priorVersion",
-            "http://www.w3.org/2002/07/owl#backwardCompatibleWith",
-            "http://www.w3.org/2002/07/owl#incompatibleWith",
-        ];
-        BUILT_IN
+        BUILTIN_ANNOTATIONS
             .iter()
             .any(|iri| self.terms.iri(iri) == Some(predicate))
             || self.terms.iri("http://www.w3.org/2002/07/owl#versionIRI") == Some(predicate)
@@ -1419,6 +1504,8 @@ impl<'a> Reader<'a> {
             axioms.push(axiom);
             sources.push(from);
         }
+        self.annotation_schema.sort_unstable();
+        self.annotation_schema.dedup();
         let mut ontology = Ontology {
             classes: self.classes,
             ranges: self.ranges,
@@ -1426,10 +1513,12 @@ impl<'a> Reader<'a> {
             sources,
             diagnostics: self.diagnostics,
             annotations: self.annotations,
+            annotation_schema: self.annotation_schema,
             builtin: BuiltinProperties::of(&self.v),
             data: DataTerms::default(),
             anonymous: BTreeSet::new(),
             rules: Vec::new(),
+            qualified_data_max: self.qualified_data_max,
         };
         complete(&mut ontology, self.terms);
         ontology

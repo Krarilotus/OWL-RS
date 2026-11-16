@@ -56,6 +56,9 @@ pub enum RejectKind {
     /// The data shown is inconsistent (an OWL 2 RL consistency rule, or OWL 2 DL): the
     /// whole data for a reader of every graph, else the committer's own graphs.
     Inconsistent,
+    /// Under `owl2-dl`, the OWL 2 RL rules find a clash in the whole data that OWL 2 DL may
+    /// read as consistent, and the store doesn't decide which (`crate::WhyUndecided`).
+    Undecided,
     /// The data shown has SHACL results the gate rejects for, as above.
     ShapesViolated,
     /// The committer's graphs show no reason by themselves: the same for every gate.
