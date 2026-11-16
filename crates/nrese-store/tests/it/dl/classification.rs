@@ -585,3 +585,13 @@ fn an_irregular_ontology_whose_data_ranges_the_el_classifier_skips_is_not_answer
     );
     assert_lower_bound(&report);
 }
+
+/// A sub-property of an annotation property OWL 2 builds in (`rdfs:label`) is an annotation
+/// axiom, as the ontology reader reads it, a blank subject's included: it says nothing about
+/// classes, and the EL classifier's answer stays complete.
+#[test]
+fn a_sub_property_of_a_built_in_annotation_property_leaves_the_el_answer_complete() {
+    let report = irregular("_:x a owl:AnnotationProperty ; rdfs:subPropertyOf rdfs:label .");
+    assert_eq!(report.engine, "el");
+    assert!(report.complete(), "{:?}", report.incomplete);
+}
