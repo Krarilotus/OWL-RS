@@ -191,6 +191,20 @@ impl StoreError {
         }
     }
 
+    /// This error, or the refusal before rematerialisation ([`Self::NotRematerialised`]) an
+    /// update's `WHERE` met, which its evaluation carries as its dataset's failure: a read of
+    /// a session's pending operations is refused as any other read.
+    pub(crate) fn refusal_within(self) -> Self {
+        let replica = match self.evaluation() {
+            Some(QueryEvaluationError::Dataset(error)) => match error.downcast_ref::<Self>() {
+                Some(&Self::NotRematerialised { replica }) => Some(replica),
+                _ => None,
+            },
+            _ => None,
+        };
+        replica.map_or(self, |replica| Self::NotRematerialised { replica })
+    }
+
     /// The evaluation error, of a query or of an update's pattern: both are classified
     /// alike (the review of 3 October 2026, A6).
     fn evaluation(&self) -> Option<&QueryEvaluationError> {
