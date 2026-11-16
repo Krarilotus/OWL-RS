@@ -570,7 +570,9 @@ fn a_supported_reader_whose_view_uses_another_program_is_refused() {
 /// not show the reader the copy only `secret` asserts: the read is refused until the store is
 /// rematerialised, with `secret` or without it. A server reaches the mismatch while a
 /// repository's reasoning changes: the catalog's `settle` publishes the new certificate
-/// before the new write path sets the new program.
+/// before the new write path sets the new program. So, too, once the certificate is gone
+/// and the stack kept (`invalidate_reasoning`, as a bulk load leaves it until its
+/// rematerialisation): nothing then vouches for the stack, and the read is refused alike.
 #[test]
 fn a_reader_of_some_graphs_learns_nothing_from_a_hidden_graph_under_another_program() {
     const EX: &str = "http://example.com/";
@@ -589,8 +591,8 @@ fn a_reader_of_some_graphs_learns_nothing_from_a_hidden_graph_under_another_prog
     };
     // The ASK's answer to `scope` (`true`, `false`, or `refused` where the refusal names
     // rematerialisation), `secret` asserting SECRET or not, the stack certified under rdfs and
-    // maintained under `live`.
-    let asked = |scope: &ReadScope, live: Ruleset, secret: bool| {
+    // maintained under `live`, its certificate forgotten where `forgotten`.
+    let asked = |scope: &ReadScope, live: Ruleset, forgotten: bool, secret: bool| {
         let store = StoreService::new(StoreConfig::in_memory()).expect("store");
         let hidden = if secret {
             format!("GRAPH ex:secret {{ {SECRET} }}")
@@ -604,6 +606,9 @@ fn a_reader_of_some_graphs_learns_nothing_from_a_hidden_graph_under_another_prog
             .expect("data");
         store.rematerialise(Ruleset::Rdfs).expect("reasoned");
         store.use_reasoning_rules(Some(live.into()));
+        if forgotten {
+            store.invalidate_reasoning().expect("invalidated");
+        }
         let request = SparqlQueryRequest::new(
             format!("PREFIX ex: <{EX}> ASK {{ {SECRET} }}"),
             scope.clone(),
@@ -621,11 +626,20 @@ fn a_reader_of_some_graphs_learns_nothing_from_a_hidden_graph_under_another_prog
     };
     for (kind, by_support) in [("visible", false), ("supported", true)] {
         let scope = reader(by_support);
-        for (live_name, live, want) in [
-            ("rdfs", Ruleset::Rdfs, "false / false"),
-            ("owl2-rl", Ruleset::Owl2Rl, "refused / refused"),
+        for (live_name, live, forgotten, want) in [
+            ("rdfs", Ruleset::Rdfs, false, "false / false"),
+            ("owl2-rl", Ruleset::Owl2Rl, false, "refused / refused"),
+            (
+                "owl2-rl, no certificate",
+                Ruleset::Owl2Rl,
+                true,
+                "refused / refused",
+            ),
         ] {
-            let (without, with) = (asked(&scope, live, false), asked(&scope, live, true));
+            let (without, with) = (
+                asked(&scope, live, forgotten, false),
+                asked(&scope, live, forgotten, true),
+            );
             cells.header(
                 &format!("{kind}, {live_name}: the ASK without secret / with it"),
                 &format!("{without} / {with}"),
