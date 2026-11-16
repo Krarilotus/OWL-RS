@@ -27,7 +27,7 @@ env -u NRESE_DL_STEPS "$BIN" --ignored dl::outside::planted_ > "$OUT/planted.log
 # alone); the rows set aside, where the two references differ, to be read by hand; the writes
 # the store declined as undecided (class: HermiT's word on the data; outcome: Openllet's).
 S=$OUT/summary.tsv
-[ ! -f "$S" ] || { awk -F'\t' '{n[$6]++} END {for (k in n) print k, n[k]}' "$S" | sort
+[ ! -f "$S" ] || { awk -F'\t' '{n[$6]++} $5 ~ /^(declined|undecided)-/ {n[$5]++} END {for (k in n) print k, n[k]}' "$S" | sort
   awk -F'\t' '!c[$1]++ {all++} $4 != "write" && $5 !~ /^(reference-undecided|not-judged)$/ && !q[$1]++ {n++}
     END {print "cases", all; print "cases with a query judged", n + 0}' "$S"
   echo "not judged: an inconsistent state after the first commit that the store accepted"

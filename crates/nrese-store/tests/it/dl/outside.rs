@@ -580,7 +580,7 @@ fn fails(class: &str) -> bool {
     matches!(
         class,
         "missing" | "wrong" | "wrong-refusal" | "wrong-acceptance" | "unclassified"
-    )
+    ) || class.starts_with("undecided-")
 }
 
 /// Per candidate row of a query: the row, its positive questions and its negated ones.
@@ -692,9 +692,14 @@ impl Case {
                     Reply::Undecided(why) => ("reference-undecided", why),
                 };
                 // Declined as undecided: honest, so no failure, but never a pass; a kind the
-                // check doesn't know fails the run.
+                // check doesn't know fails the run. As OWL 2 DL reads the case otherwise than
+                // the rules, only with a punned name or an annotation property's axiom.
+                let pun = |g: &Group| g.tag == "annotation" || g.tag.starts_with("pun-");
+                let unfounded = |text: &str| why.contains(text) && !self.kept(skip).any(pun);
                 let class = match kind.as_str() {
                     "Inconsistent" => class.to_owned(),
+                    "Undecided" if unfounded("reads differently") => "undecided-unfounded".into(),
+                    "Undecided" if unfounded("within its budget") => "undecided-unchecked".into(),
                     "Undecided" if class == "reference-undecided" => "declined-no-answer".into(),
                     "Undecided" => format!("declined-{said}"),
                     _ => "unclassified".into(),
@@ -961,7 +966,8 @@ fn dl_answers_agree_with_outside_reasoners() {
 /// nothing. A refusal is read by its kind: one declined as undecided is counted as such,
 /// neither a pass nor a wrong verdict; one of a kind the check doesn't know fails the run.
 /// A read is judged by its label, the inferred statements' too: a row the references don't
-/// entail is counted under `unsound` and fails under any other label.
+/// entail is counted under `unsound` and fails under any other label. A refusal as undecided
+/// of declarations alone (no pun, no annotation property's axiom) fails, apart by its reason.
 #[test]
 #[cfg(unix)]
 fn planted_answers_are_judged_by_kind_and_label() {
@@ -987,6 +993,14 @@ fn planted_answers_are_judged_by_kind_and_label() {
     for label in ["sound-only", "complete", "not-certified"] {
         assert_eq!(verdict(&inferred, &read(label)), "wrong", "{label}");
     }
+    let plain: BTreeSet<usize> = (1..case.groups.len()).collect();
+    let mut undecided = |why: &str| {
+        let got = Err(("Undecided".to_owned(), why.to_owned(), String::new()));
+        let v = case.verdicts(&plain, &[], &got, &mut nothing, "hermit");
+        v[0].1.clone()
+    };
+    assert_eq!(undecided("reads differently"), "undecided-unfounded");
+    assert_eq!(undecided("within its budget"), "undecided-unchecked");
 }
 
 /// The real references, for the planted faults below (run by outside.sh before a campaign).
