@@ -1040,7 +1040,7 @@ impl Fillers {
 ///   property: the places say what the table's data rows say, whatever the answer.
 /// - Most of those are outside RL, where a class reading is `sound-only` too. So 200 of RL's
 ///   own ([`Fillers::rl_data`]), each holding the `xsd:int` 5 by its build: `:a a :Aged` is
-///   entailed, and the closure's `false` is the table's, `sound-only`.
+///   entailed, so the answer is `true` or no place calls it complete.
 /// - The mirror, 200 class expressions `:x` is in ([`Fillers::classes`]): object ones, the
 ///   rules derive `:a a :Social`, `complete` in every place with the rewriting on. With a
 ///   complement in them it is `sound-only`: RL has no complement in a subclass expression
@@ -1075,7 +1075,12 @@ fn generated_fillers_are_read_by_their_kind_seed_5eedda7a() {
             fillers.take(),
             data_existential(&range)
         );
-        check(format!("rl {i}"), &data, aged, "false", false);
+        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+            let (text, line, statuses, _) = places(&data, aged, ql);
+            if !text.contains("true") && statuses.contains(&"complete") {
+                wrong.push(format!("rl {i}: {data} / {line}"));
+            }
+        }
     }
     assert!(wrong.is_empty(), "{} wrong: {wrong:#?}", wrong.len());
 }
