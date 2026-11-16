@@ -502,3 +502,68 @@ fn an_error_inside_a_multi_line_token_has_a_position() {
     let error = parse(RdfFormat::Turtle, text).unwrap_err();
     assert!(error.to_string().contains("line"), "{error}");
 }
+
+/// A reader that gives at most `.1` bytes per call.
+struct Chunks<'a>(&'a [u8], usize);
+
+impl Read for Chunks<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.len().min(self.1).min(out.len());
+        out[..n].copy_from_slice(&self.0[..n]);
+        self.0 = &self.0[n..];
+        Ok(n)
+    }
+}
+
+/// Recovering, a malformed string is skipped to its closing quote only within
+/// `MAX_STATEMENT_TEXT` bytes, counted from its opening quote through its closing one: at the
+/// limit and below it, one error and parsing goes on; one byte past it, the error ends the
+/// document, whatever the input already holds. For both quote characters, short strings
+/// (broken by a line end) and long ones (a bad escape), from a slice and from readers giving
+/// any size of chunk.
+#[test]
+fn a_malformed_string_is_skipped_within_the_window_only() {
+    use nrese_rdf_io::MAX_STATEMENT_TEXT as MAX;
+    let readers: [usize; 4] = [7, 4096, 65_536, 3 << 20];
+    for format in [RdfFormat::Turtle, RdfFormat::TriG] {
+        for (quote, bad) in [("\"", "\n"), ("'", "\n"), ("\"\"\"", r"\q"), ("'''", r"\q")] {
+            for length in [MAX - 1, MAX, MAX + 1] {
+                // The string from its opening quote through its closing one is `length` bytes;
+                // nothing between it and the predicate, so the skip starts at its quote.
+                let body = length - 2 * quote.len() - bad.len();
+                let string = format!("{quote}{bad}{}{quote}", "x".repeat(body));
+                assert_eq!(string.len(), length);
+                let text = format!(
+                    "<urn:a> <urn:p> <urn:o> .\n<urn:s> <urn:p>{string} .\n<urn:b> <urn:p> <urn:o> .\n"
+                );
+                let within = length <= MAX;
+                let parser = RdfParser::from_format(format).recovering();
+                let mut inputs: Vec<(String, Vec<Result<Quad, RdfParseError>>)> = vec![(
+                    "slice".into(),
+                    parser.clone().for_slice(text.as_bytes()).collect(),
+                )];
+                for chunk in readers {
+                    let reader = Chunks(text.as_bytes(), chunk);
+                    let results = parser.clone().for_reader(reader).collect();
+                    inputs.push((format!("chunks of {chunk}"), results));
+                }
+                for (input, results) in inputs {
+                    let row = format!("{format:?} {quote:?} {length} ({input})");
+                    let shape: Vec<&str> = results
+                        .iter()
+                        .map(|r| match r {
+                            Ok(_) => "Ok",
+                            Err(e) if e.ends_document() => "Err ending",
+                            Err(_) => "Err",
+                        })
+                        .collect();
+                    let expected: &[&str] = match within {
+                        true => &["Ok", "Err", "Ok"],
+                        false => &["Ok", "Err ending"],
+                    };
+                    assert_eq!(shape, expected, "{row}");
+                }
+            }
+        }
+    }
+}
