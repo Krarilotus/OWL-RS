@@ -16,8 +16,9 @@
 //! their lists longer than [`PAIRWISE_MEMBERS`] become one rule per kind of axiom whose
 //! [`Guard::SameList`] asks an index of the members which lists they share: linear in the
 //! members however many there are. The only length limit left is the rule format's: a
-//! property chain or a key over more than [`MAX_RULE_MEMBERS`] properties can't be one
-//! rule (variables are numbered by `u8`) and is diagnosed.
+//! property chain over more than [`MAX_RULE_MEMBERS`] properties, or a key over more than
+//! [`MAX_KEY_MEMBERS`], can't be one rule (variables and atoms are numbered by `u8`) and is
+//! diagnosed.
 
 use super::ir::{Atom, Guard, Head, OWL, RDF, Rule, Term, Vocabulary};
 
@@ -184,6 +185,10 @@ pub const PAIRWISE_MEMBERS: usize = 100;
 /// numbered by `u8`).
 pub const MAX_RULE_MEMBERS: usize = 250;
 
+/// The most properties of a key that one rule can hold: its rule has two atoms per property
+/// and two more, and a rule's atoms are numbered by `u8`.
+pub const MAX_KEY_MEMBERS: usize = 127;
+
 /// Why a list axiom wasn't instantiated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ListProblem {
@@ -193,8 +198,9 @@ pub enum ListProblem {
     Cycle { node: u64 },
     /// Equality gives the list more than [`MAX_VARIANTS`] member sequences.
     TooManyVariants,
-    /// A property chain or key with more than [`MAX_RULE_MEMBERS`] properties.
-    TooLong { members: usize },
+    /// A list with more than `most` members ([`MAX_RULE_MEMBERS`], [`MAX_KEY_MEMBERS`], or
+    /// a rule past [`crate::eval::MAX_RULE_ATOMS`]).
+    TooLong { members: usize, most: usize },
 }
 
 impl ListProblem {
@@ -242,8 +248,8 @@ impl ListDiagnostic {
             ListProblem::TooManyVariants => {
                 format!("owl:sameAs gives it more than {MAX_VARIANTS} member sequences")
             }
-            ListProblem::TooLong { members } => {
-                format!("it has {members} properties, more than a rule holds ({MAX_RULE_MEMBERS})")
+            ListProblem::TooLong { members, most } => {
+                format!("it has {members} members, more than a rule holds ({most})")
             }
         };
         format!(
@@ -298,6 +304,7 @@ pub fn instantiate_with_premises(
     let mut diagnostics: Vec<ListDiagnostic> = Vec::new();
     let mut lists =
         |predicate: u64, name: &'static str, rules: &mut Vec<Rule>, make: &mut MakeRules| {
+            debug_assert!(voc.is_list_fact([0, predicate, 0]), "read, not a list fact");
             for (subject, head) in facts.pairs(predicate) {
                 let mut diagnose = |problem| {
                     let diagnostic = ListDiagnostic {
@@ -314,12 +321,25 @@ pub fn instantiate_with_premises(
                 match voc.list(facts, head) {
                     Ok(variants) => {
                         for (members, used) in variants {
+                            let most = match predicate == voc.has_key {
+                                true => MAX_KEY_MEMBERS,
+                                false => MAX_RULE_MEMBERS,
+                            };
                             let rule_sized = !(predicate == voc.property_chain_axiom
                                 || predicate == voc.has_key)
-                                || members.len() <= MAX_RULE_MEMBERS;
+                                || members.len() <= most;
                             if rule_sized {
                                 let before = rules.len();
                                 make(subject, &members, rules);
+                                // Whatever its shape, a rule the format can't hold.
+                                if !rules[before..].iter().all(Rule::fits) {
+                                    rules.truncate(before);
+                                    diagnose(ListProblem::TooLong {
+                                        members: members.len(),
+                                        most: crate::eval::MAX_RULE_ATOMS,
+                                    });
+                                    continue;
+                                }
                                 let mut facts_used = used;
                                 facts_used.push([subject, predicate, head]);
                                 if predicate == voc.members || predicate == voc.distinct_members {
@@ -339,6 +359,7 @@ pub fn instantiate_with_premises(
                             } else {
                                 diagnose(ListProblem::TooLong {
                                     members: members.len(),
+                                    most,
                                 });
                             }
                         }
@@ -463,7 +484,10 @@ pub fn instantiate_with_premises(
         },
     );
     // cax-adc, eq-diff2, prp-adp: pairwise over `members`, by the type of the axiom node.
-    let typed = |node: u64, class: u64| facts.objects(node, ty).contains(&class);
+    let typed = |node: u64, class: u64| {
+        debug_assert!(voc.is_list_fact([node, ty, class]), "read, not a list fact");
+        facts.objects(node, ty).contains(&class)
+    };
     // The premise that makes two members of an AllDifferent axiom inconsistent: `a sameAs b`,
     // or, when the list names one individual twice, the axiom itself (`a sameAs a` holds by
     // eq-ref, which isn't materialised).
