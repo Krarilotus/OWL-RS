@@ -75,7 +75,7 @@ fn store(n: usize, commits: usize, named: bool, alias: bool, extra: &[Triple]) -
         });
         tx.commit().unwrap();
         if same_as.is_some() {
-            engine.set_equality(same_as);
+            engine.transaction().install_reading(same_as);
         }
     }
     engine
