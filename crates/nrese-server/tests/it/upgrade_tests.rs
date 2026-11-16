@@ -704,9 +704,11 @@ fn query_brings_a_closure_an_older_semantics_wrote_up_to_date()
 /// row 1 wrote: that build made a hidden union class's members things because a rule was named
 /// `scm-cls`, here a symmetry rule that makes nothing a thing (Sol's review r1, S1). Opened by
 /// `nrese-server query` and by the server's start, the closure is rebuilt under this build's
-/// rules, where `ex:x` is no `owl:Thing`. The older closure is written by this build under the
-/// same rules and one more that makes things; its marker is the older build's for these rules:
-/// their fingerprint with the value `skip` had then, written down here.
+/// rules, where `ex:x` is no `owl:Thing`. Opened by `nrese-server query` configured as a read
+/// replica, which reasons nothing, the query is refused with the way out (rebuild the primary
+/// and re-bootstrap the replica), not answered from that closure. The older closure is written
+/// by this build under the same rules and one more that makes things; its marker is the older
+/// build's for these rules: their fingerprint with the value `skip` had then, written down here.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -726,7 +728,7 @@ async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
         RuleProgram::new(None, Some(Arc::new(rules))).expect("a program")
     };
     let mut wrong = Vec::new();
-    for way in ["query", "start"] {
+    for way in ["query", "start", "replica query"] {
         let dir = tempfile::tempdir()?;
         let data = dir.path().join("data");
         {
@@ -778,8 +780,25 @@ async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
             text.contains("unnamed_classes = \"skip\""),
             "the reasoner section was rewritten:\n{text}"
         );
-        std::fs::write(&config, text)?;
-        let thing = if way == "query" {
+        // A replica's directory that holds this marker, from its time as a primary: the
+        // closure isn't the configured rules', and nothing reasons on a replica to rebuild
+        // it. Its primary is never asked: `query` doesn't follow one.
+        let replica = "[replication]\nmode = \"replica\"\nprimary = \"http://127.0.0.1:9\"\n";
+        std::fs::write(
+            &config,
+            text + if way == "replica query" { replica } else { "" },
+        )?;
+        let (got, must, right) = if way == "start" {
+            let server = Server::start(&config).await?;
+            let things = server
+                .query(
+                    "nrese",
+                    "SELECT ?x { ?x a <http://www.w3.org/2002/07/owl#Thing> }",
+                )
+                .await?;
+            let thing = things.contains(&"<http://example.com/x>".to_owned());
+            (format!("ex:x a owl:Thing: {thing}"), "false", !thing)
+        } else {
             let (status, output) = Process::spawn(
                 Command::new(env!("CARGO_BIN_EXE_nrese-server"))
                     .arg("query")
@@ -789,21 +808,21 @@ async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
                     .env("RUST_LOG", "warn"),
             )?
             .finish(QUERY)?;
-            assert!(status.success(), "{status}:\n{output}");
-            output.contains("true")
-        } else {
-            let server = Server::start(&config).await?;
-            let things = server
-                .query(
-                    "nrese",
-                    "SELECT ?x { ?x a <http://www.w3.org/2002/07/owl#Thing> }",
-                )
-                .await?;
-            things.contains(&"<http://example.com/x>".to_owned())
+            if way == "query" {
+                assert!(status.success(), "{status}:\n{output}");
+                let thing = output.contains("true");
+                (format!("ex:x a owl:Thing: {thing}"), "false", !thing)
+            } else {
+                // Refused, with the way out: not an answer from that closure.
+                let refused = !status.success() && output.contains("re-bootstrap");
+                let thing = status.success() && output.contains("true");
+                let got = format!("{status}, ex:x a owl:Thing: {thing}, refused: {refused}");
+                (got, "refused with the way out", refused)
+            }
         };
-        let verdict = if thing { "WRONG" } else { "right" };
-        println!("CASE {way}: {verdict}: ex:x a owl:Thing: {thing}, must be false");
-        if thing {
+        let verdict = if right { "right" } else { "WRONG" };
+        println!("CASE {way}: {verdict}: {got}, must be {must}");
+        if !right {
             wrong.push(way);
         }
     }
