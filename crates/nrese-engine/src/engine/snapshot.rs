@@ -44,7 +44,7 @@ pub use counted::CountedSnapshot;
 /// interned later (even by an open transaction) are reported as unknown, which keeps term
 /// identity stable for the lifetime of a query.
 ///
-/// With equality by representatives on ([`crate::Engine::set_equality`]), reads of the
+/// With equality by representatives on (a version's reading), reads of the
 /// default graph with inferred statements expand the stored closure to every identity of
 /// its terms (`super::equality`); [`Self::stored`] reads the statements as stored.
 #[derive(Clone)]
@@ -439,14 +439,15 @@ impl Snapshot {
     }
 
     /// [`Self::new`] of a version the engine has installed or recovered: published, so it
-    /// grants a [`SharedState`]. Only the engine's own snapshot acquisition calls it.
+    /// grants a [`SharedState`], read as installed (its [`Version::reading`]). Only the
+    /// engine's own snapshot acquisition calls it.
     pub(super) fn published(
         version: Arc<Version>,
         dictionary: Arc<Dictionary>,
         statistics: Arc<Statistics>,
-        equality: Option<TermId>,
         views: Arc<nrese_exec::Budget>,
     ) -> Self {
+        let equality = version.reading;
         Self {
             published: true,
             ..Self::new(version, dictionary, statistics, equality, views)
@@ -477,7 +478,7 @@ impl Snapshot {
     /// This snapshot reading the default graph expanded over the `owl:sameAs` classes of
     /// its inferred stack (each identity other than its class's representative stored as
     /// `identity sameAs representative`), as snapshots read with equality by
-    /// representatives on ([`crate::Engine::set_equality`]): for a stack kept so beside
+    /// representatives on (a version's reading): for a stack kept so beside
     /// the store's own, as the OWL 2 DL upper bound is (`nrese-store`'s `dl` module).
     /// `None` reads the statements as stored ([`Self::stored`]).
     pub fn with_equality(&self, same_as: Option<TermId>) -> Snapshot {
@@ -872,6 +873,7 @@ impl Snapshot {
             committed_micros: self.version.committed_micros,
             dictionary_len: self.version.dictionary_len,
             equality: Default::default(),
+            reading: self.version.reading,
             canonical: Default::default(),
             own: Default::default(),
         });
@@ -1383,7 +1385,7 @@ impl Snapshot {
 
     /// Number of quads `model`'s stacks hold. O(1); exact because the stacks are disjoint.
     /// It is the number visible in `model` where reads take the stacks as they are. Under
-    /// equality ([`crate::Engine::set_equality`]) they don't: reads skip the default graph's
+    /// equality (a version's reading) they don't: reads skip the default graph's
     /// statements that name an alias (the inferred `alias sameAs representative` among
     /// them) and expand what representatives hold to every identity, so the visible number
     /// may be lower or higher; over [`Self::with_canonical_equality`], which expands
@@ -2941,7 +2943,7 @@ mod canonical_lifetime_tests {
                 object: rep,
             });
             tx.commit().unwrap();
-            engine.set_equality(Some(same_as));
+            engine.transaction().install_reading(Some(same_as));
             let snapshot = engine.snapshot();
             let canonical = snapshot.with_canonical_equality();
             assert!(!canonical.triple_terms_name_aliases());
@@ -3037,7 +3039,7 @@ mod count_visiting_tests {
             tx.remove(statement(i).as_ref());
         }
         tx.commit().unwrap();
-        engine.set_equality(Some(same_as));
+        engine.transaction().install_reading(Some(same_as));
         let snapshot = engine.snapshot();
         let p = snapshot.lookup(ex("p").as_ref().into()).unwrap();
         let pattern = QuadPattern {

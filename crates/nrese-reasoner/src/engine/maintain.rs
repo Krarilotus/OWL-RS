@@ -825,7 +825,9 @@ mod tests {
             tx.insert_encoded(encode([o[0], same_as, o[i]]).in_default_graph());
         }
         tx.commit().unwrap();
-        engine.set_equality(Some(TermId::from_raw(same_as)));
+        engine
+            .transaction()
+            .install_reading(Some(TermId::from_raw(same_as)));
         let tx = engine.transaction();
         let base = EngineBase::new(&tx, &[]);
         let gaps = EngineGaps::new(Site::ExpandCopies);
@@ -881,7 +883,9 @@ mod tests {
             tx.insert_encoded(encode([s, same_as, t]).in_default_graph());
         }
         tx.commit().unwrap();
-        engine.set_equality(Some(TermId::from_raw(same_as)));
+        engine
+            .transaction()
+            .install_reading(Some(TermId::from_raw(same_as)));
         let tx = engine.transaction();
         let base = EngineBase::new(&tx, &[]);
         let gaps = EngineGaps::new(Site::ScanSteps);
@@ -1086,7 +1090,7 @@ mod tests {
                         .storing_representatives(compact)
                         .maintaining_by(plan);
                     if compact {
-                        engine.set_equality(program.same_as.map(TermId::from_raw));
+                        tx.read_equality_as(program.same_as.map(TermId::from_raw));
                     }
                     let iri = |s: &str| {
                         let name = format!("http://example.com/{s}");
@@ -1355,7 +1359,7 @@ mod tests {
             tx.insert_encoded(encode([rep.raw(), p.raw(), o.raw()]).in_default_graph());
         }
         tx.commit().unwrap();
-        engine.set_equality(Some(same_as));
+        engine.transaction().install_reading(Some(same_as));
         let tx = engine.transaction();
         let base = EngineBase::new(&tx, &[]);
         let asks = AtomicUsize::new(0);
@@ -1563,7 +1567,7 @@ mod tests {
                 Program::compile(&crate::rulesets::Ruleset::Owl2Rl.into(), &|t| tx.intern(t))
                     .hiding_unnamed_classes(true)
                     .storing_representatives(true);
-            engine.set_equality(program.same_as.map(TermId::from_raw));
+            tx.read_equality_as(program.same_as.map(TermId::from_raw));
             let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
             let [a, b, p, x, class] =
                 ["a", "b", "p", "x", "Class"].map(|s| iri(&format!("http://example.com/{s}")));
