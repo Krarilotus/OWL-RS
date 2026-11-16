@@ -57,7 +57,9 @@ pub struct Program {
     /// Leave out memberships in unnamed classes nothing consumes (W7).
     hide_unnamed_classes: bool,
     unnamed: UnnamedVocabulary,
-    /// The rules make a declared class a subclass of `owl:Thing` (scm-cls).
+    /// The program makes a declared class's members things
+    /// ([`crate::unnamed::members_are_things`]), asked only of a program that hides unnamed
+    /// classes.
     things: bool,
     /// For the datatype checks ([`super::datatypes`]).
     rdf_type: u64,
@@ -131,7 +133,6 @@ impl Program {
             .then(|| ListVocabulary::new(&mut constants).named_keys(blank_nodes));
         let schema = Schema::owl(&mut constants);
         let unnamed = UnnamedVocabulary::new(&mut constants);
-        let things = rules.iter().any(|rule| rule.name == "scm-cls");
         let rdf_type = constants.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
         let same_as = crate::representatives::same_as(&rules, schema.same_as());
         let mut axioms = program
@@ -148,7 +149,7 @@ impl Program {
             schema,
             hide_unnamed_classes: false,
             unnamed,
-            things,
+            things: false,
             rdf_type,
             same_as,
             by_representatives: true,
@@ -202,6 +203,7 @@ impl Program {
     #[must_use]
     pub fn hiding_unnamed_classes(mut self, hide: bool) -> Self {
         self.hide_unnamed_classes = hide;
+        self.things = hide && crate::unnamed::members_are_things(&self.program);
         self
     }
 
