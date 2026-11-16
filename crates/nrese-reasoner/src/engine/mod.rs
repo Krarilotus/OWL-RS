@@ -91,14 +91,24 @@ impl std::fmt::Debug for Program {
 }
 
 impl Program {
-    /// Whether a run over `snapshot` would leave out a list axiom (any list diagnostic).
-    pub fn leaves_out_a_list(&self, snapshot: &Snapshot) -> bool {
+    /// Whether a run of a program with list rules over `snapshot` would leave out a list
+    /// axiom (any list diagnostic). Only the list vocabulary is bound, by the snapshot's ids
+    /// (an IRI it doesn't hold gets an id no statement uses); no rule is compiled.
+    pub fn leaves_out_a_list(snapshot: &Snapshot) -> bool {
+        let absent = TermId::from_raw(u64::MAX >> 1);
+        let intern = |term: TermRef<'_>| {
+            Ok::<_, std::convert::Infallible>(snapshot.lookup(term).unwrap_or(absent))
+        };
+        let lists = ListVocabulary::new(&mut Constants {
+            intern: &intern,
+            refused: None,
+        });
         let base = explain::SnapshotBase {
             snapshot,
             axioms: &[],
         };
         let facts = crate::eval::AllFacts(&crate::explain::Whole(&base));
-        (self.lists.as_ref()).is_some_and(|l| !crate::lists::instantiate(l, &facts).1.is_empty())
+        !crate::lists::instantiate(&lists, &facts).1.is_empty()
     }
 
     /// The rules as the delta executor takes them.

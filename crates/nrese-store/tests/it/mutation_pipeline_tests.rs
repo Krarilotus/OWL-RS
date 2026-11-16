@@ -1601,7 +1601,12 @@ fn a_later_list_fact_leaves_an_aliased_key_out_and_no_answer_complete() {
 /// member, not 2^7 member sequences. Its answer is true. It isn't `complete`, one commit
 /// early: the commit's program, ground over the closure it stored (expanded, with equality's
 /// `rdf:first` copies), leaves the key out for the next commit, and the mark follows that
-/// program. A sound mark, less precise than the closure.
+/// program. A sound mark, less precise than the closure; grounding the commit's lists over
+/// representatives too would make it exact. The other way is guarded elsewhere: were the mark
+/// ever missing where a list is left out,
+/// `a_later_list_fact_leaves_an_aliased_key_out_and_no_answer_complete` (this key, left out by
+/// the next commit) and every row of
+/// `an_unbuilt_key_leaves_no_answer_complete_under_owl2_rl` would answer `complete` and turn red.
 #[test]
 fn aliases_leave_a_key_built() {
     let pipeline = ql_pipeline(in_memory_store_config());
