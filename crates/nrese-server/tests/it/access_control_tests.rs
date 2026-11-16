@@ -1073,3 +1073,166 @@ async fn a_readers_view_refused_for_memory_is_the_servers_503()
     assert!(got == want && calibrated, "{got}: {text}");
     Ok(())
 }
+
+/// `request` sent by a requester with `roles` (none: anonymous), its response recorded: the
+/// status line, every header in the order the response holds them, a blank line, the body;
+/// with the number of frames the body came in.
+async fn recorded(
+    app: &axum::Router,
+    roles: Option<&[&str]>,
+    request: axum::http::request::Builder,
+    body: String,
+) -> Result<(StatusCode, Vec<u8>, usize), Box<dyn std::error::Error>> {
+    use http_body_util::BodyExt;
+    let request = match roles {
+        Some(roles) => request.header("authorization", format!("Bearer {}", token(roles))),
+        None => request,
+    };
+    let response = app.clone().oneshot(request.body(Body::from(body))?).await?;
+    let status = response.status();
+    let mut out = format!("{:?} {status}\n", response.version()).into_bytes();
+    for (name, value) in response.headers() {
+        out.extend_from_slice(name.as_str().as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.push(b'\n');
+    }
+    out.push(b'\n');
+    let mut body = response.into_body();
+    let mut frames = 0;
+    while let Some(frame) = body.frame().await {
+        if let Ok(data) = frame?.into_data() {
+            frames += 1;
+            out.extend_from_slice(&data);
+        }
+    }
+    Ok((status, out, frames))
+}
+
+/// A reader of every graph, the admin of an access policy and anyone without one, is
+/// answered the same whatever the store's announcement decides for readers of some graphs:
+/// each response (status line, every header, body), to every query form in several formats,
+/// asked twice (the second from the result cache), with and without a triple term in a graph,
+/// and inside a transaction, is recorded where `NRESE_RESPONSES_OUT` names a directory, for
+/// the same run at another tree to compare byte for byte. Here, what makes that comparison
+/// worth it: every request answered, and the large results in several frames (the stream
+/// sends a frame per 64 KiB).
+#[tokio::test]
+async fn a_reader_of_every_graph_is_answered_as_recorded() -> Result<(), Box<dyn std::error::Error>>
+{
+    let out = std::env::var_os("NRESE_RESPONSES_OUT").map(std::path::PathBuf::from);
+    let rows: String = (0..4_000)
+        .map(|i| format!("<{EX}s{i}> <{EX}p> \"value {i}\" . "))
+        .collect();
+    let term =
+        format!("GRAPH <{EX}g/secret> {{ <{EX}s> <{EX}says> <<( <{EX}x> <{EX}y> <{EX}z> )>> }}");
+    let pending = format!("INSERT DATA {{ <{EX}t> <{EX}says> <<( <{EX}x> <{EX}y> <{EX}z> )>> }}");
+    let json = "application/sparql-results+json";
+    let all = "SELECT * WHERE { ?s ?p ?o }";
+    let construct = "CONSTRUCT WHERE { ?s ?p ?o }";
+    // (name, query, accept, large)
+    let queries = [
+        ("select-json", all, json, true),
+        ("select-xml", all, "application/sparql-results+xml", true),
+        ("select-tsv", all, "text/tab-separated-values", true),
+        ("ask-json", "ASK { ?s ?p ?o }", json, false),
+        ("construct-turtle", construct, "text/turtle", true),
+        (
+            "construct-ntriples",
+            construct,
+            "application/n-triples",
+            true,
+        ),
+        (
+            "graphs-json",
+            "SELECT * WHERE { GRAPH ?g { ?s ?p ?o } }",
+            json,
+            false,
+        ),
+    ];
+    let mut files = Vec::new();
+    let mut thin = Vec::new();
+    for (reader, roles) in [("admin", Some(&["nrese.admin"][..])), ("open", None)] {
+        for (data, extra) in [("no-term", ""), ("term", term.as_str())] {
+            let app = match roles {
+                Some(_) => app()?,
+                None => crate::support::test_app()?,
+            };
+            let insert = format!(
+                "INSERT DATA {{ {rows} GRAPH <{EX}g/pub/1> {{ <{EX}a> <{EX}p> <{EX}b> }} {extra} }}"
+            );
+            let (status, _, _) = recorded(
+                &app,
+                roles,
+                Request::builder()
+                    .uri("/dataset/update")
+                    .method(Method::POST)
+                    .header("content-type", "application/sparql-update"),
+                insert,
+            )
+            .await?;
+            assert_eq!(status, StatusCode::NO_CONTENT, "{reader} {data}");
+            for (name, query, accept, large) in queries {
+                for round in ["first", "again"] {
+                    let request = Request::builder()
+                        .uri("/dataset/query")
+                        .method(Method::POST)
+                        .header("accept", accept)
+                        .header("content-type", "application/sparql-query");
+                    let (status, bytes, frames) =
+                        recorded(&app, roles, request, query.to_owned()).await?;
+                    let file = format!("{reader}-{data}-{name}-{round}.txt");
+                    assert_eq!(status, StatusCode::OK, "{file}");
+                    if large && frames < 2 {
+                        thin.push(format!("{file}: {frames} frame"));
+                    }
+                    files.push((file, bytes, frames));
+                }
+            }
+            // Inside an RDF4J transaction, a triple term pending in it.
+            let begin = Request::builder()
+                .uri("/repositories/nrese/transactions")
+                .method(Method::POST);
+            let request = match roles {
+                Some(roles) => begin.header("authorization", format!("Bearer {}", token(roles))),
+                None => begin,
+            };
+            let response = app.clone().oneshot(request.body(Body::empty())?).await?;
+            assert_eq!(response.status(), StatusCode::CREATED);
+            let tx = response.headers()[axum::http::header::LOCATION]
+                .to_str()?
+                .to_owned();
+            let update = Request::builder()
+                .uri(format!("{tx}?action=UPDATE"))
+                .method(Method::PUT)
+                .header("content-type", "application/x-www-form-urlencoded");
+            let form = serde_urlencoded::to_string([("update", pending.as_str())])?;
+            let (status, _, _) = recorded(&app, roles, update, form).await?;
+            assert_eq!(status, StatusCode::OK, "{reader} {data} pending update");
+            let query = Request::builder()
+                .uri(format!(
+                    "{tx}?action=QUERY&{}",
+                    serde_urlencoded::to_string([("query", all)])?
+                ))
+                .method(Method::PUT)
+                .header("accept", json);
+            let (status, bytes, frames) = recorded(&app, roles, query, String::new()).await?;
+            let file = format!("{reader}-{data}-transaction-select-json.txt");
+            assert_eq!(status, StatusCode::OK, "{file}");
+            files.push((file, bytes, frames));
+            let rollback = Request::builder().uri(tx).method(Method::DELETE);
+            recorded(&app, roles, rollback, String::new()).await?;
+        }
+    }
+    if let Some(dir) = out {
+        std::fs::create_dir_all(&dir)?;
+        let mut counts = String::new();
+        for (file, bytes, frames) in &files {
+            std::fs::write(dir.join(file), bytes)?;
+            counts.push_str(&format!("{file} {frames}\n"));
+        }
+        std::fs::write(dir.join("frames.txt"), counts)?;
+    }
+    assert!(thin.is_empty(), "large results in one frame: {thin:?}");
+    Ok(())
+}
