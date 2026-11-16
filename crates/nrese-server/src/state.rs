@@ -359,12 +359,13 @@ impl AppState {
         }
     }
 
-    /// The data is inconsistent under the configured reasoning: readable and repairable,
-    /// but not ready.
+    /// The data is inconsistent under the configured reasoning, or its rules' violations
+    /// are undecided: readable and repairable, but not ready.
     pub fn is_quarantined(&self) -> bool {
         matches!(
             self.store().consistency(),
             nrese_store::ConsistencyStatus::Inconsistent { .. }
+                | nrese_store::ConsistencyStatus::Undecided { .. }
         )
     }
 

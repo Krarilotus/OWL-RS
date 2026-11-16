@@ -67,6 +67,7 @@ pub(super) struct Model {
     pub axioms: BTreeMap<Axiom, ()>,
     pub diagnostics: Vec<Diagnostic>,
     pub annotations: usize,
+    pub annotation_schema: Vec<Term>,
     pub uses: HashMap<Term, Uses>,
     pub rules: Vec<crate::rules::Rule>,
     pub qualified_data_max: Option<Term>,
@@ -115,7 +116,10 @@ impl<'a> FunctionalReader<'a> {
             model.diagnostics.push(Diagnostic::Rule { rule });
         }
         let axioms: Vec<Axiom> = model.axioms.into_keys().collect();
+        model.annotation_schema.sort_unstable();
+        model.annotation_schema.dedup();
         let mut ontology = Ontology {
+            annotation_schema: model.annotation_schema,
             classes: model.classes,
             ranges: model.ranges,
             sources: vec![Vec::new(); axioms.len()],
@@ -126,6 +130,8 @@ impl<'a> FunctionalReader<'a> {
             data: Default::default(),
             anonymous: BTreeSet::new(),
             rules: model.rules,
+            // Functional syntax writes a cardinality as a number: no spelling to mark.
+            noncanonical_cardinality: None,
             qualified_data_max: model.qualified_data_max,
         };
         crate::mapping::complete(&mut ontology, terms);
