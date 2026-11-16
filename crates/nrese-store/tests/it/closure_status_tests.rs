@@ -1692,14 +1692,25 @@ const DERIVED: [&str; 2] = [
     ":s a owl:DatatypeProperty . :a :s \"Rex\"^^xsd:normalizedString .",
 ];
 
+/// The reads that match `"Rex"` against `:s`: as a pattern's object, and bound by `VALUES`
+/// or `BIND`.
+const NAMES_REX: [&str; 3] = [
+    "SELECT ?x { ?x :s \"Rex\" }",
+    "SELECT ?x { VALUES ?n { \"Rex\" } ?x :s ?n }",
+    "SELECT ?x { BIND(\"Rex\" AS ?n) ?x :s ?n }",
+];
+
 /// The store matches the plain string as written and misses `:a`'s value spelled with a
-/// derived string type. Spec: a query naming `"Rex"` over [`DERIVED`] finds `:a` or isn't
+/// derived string type. Spec: each of [`NAMES_REX`] over [`DERIVED`] finds `:a` or isn't
 /// `complete`, run and planned, under each regime that promises `complete`.
 #[test]
 fn a_plain_string_misses_no_derived_string_type_and_says_complete() {
     let mut wrong = Vec::new();
     for (regime, store) in PROMISING {
-        let cases = DERIVED.map(|data| (data, "SELECT ?x { ?x :s \"Rex\" }", &["a"][..]));
+        let cases: Vec<_> = DERIVED
+            .iter()
+            .flat_map(|data| NAMES_REX.map(|read| (*data, read, &["a"][..])))
+            .collect();
         for missed in misses_and_says_complete(store, &cases) {
             wrong.push(format!("{regime}: {missed}"));
         }
@@ -1707,17 +1718,71 @@ fn a_plain_string_misses_no_derived_string_type_and_says_complete() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// The control: a plain string stored and asked is one term. Spec: the query finds `:a`
-/// and stays `complete`, run and planned, under each regime that promises it.
+/// The control: a plain string stored and asked is one term. Spec: each of [`NAMES_REX`]
+/// finds `:a` and stays `complete`, run and planned, under each regime that promises it.
 #[test]
 fn a_plain_string_asked_where_one_is_stored_stays_complete() {
     let data = ":s a owl:DatatypeProperty . :a :s \"Rex\" .";
     let mut wrong = Vec::new();
     for (regime, store) in PROMISING {
-        let (rows, status) = answer(&store(data), "SELECT ?x { ?x :s \"Rex\" }");
-        eprintln!("{regime}: {rows} {status:?}");
-        if !rows.contains("example.com/a\"") || status != ["complete"; 2] {
-            wrong.push(format!("{regime}: {rows} {status:?}"));
+        for read in NAMES_REX {
+            let (rows, status) = answer(&store(data), read);
+            eprintln!("{regime}, {read}: {rows} {status:?}");
+            if !rows.contains("example.com/a\"") || status != ["complete"; 2] {
+                wrong.push(format!("{regime}, {read}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// An aggregate over a data value compared by term gives a wrong number or wrong groups
+/// (`COUNT(DISTINCT)` counts `"07"` and `7` as two values; OWL 2 as one), not only missing
+/// rows. Spec: the `GROUP BY` and `COUNT(DISTINCT)` shapes of [`SHAPES`] are `unsound`, run
+/// and planned, under each regime that promises `complete`.
+#[test]
+fn an_aggregate_over_data_values_compared_by_term_is_unsound() {
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        for (shape, data, read, _) in SHAPES {
+            if !matches!(shape, "GROUP BY" | "COUNT(DISTINCT)") {
+                continue;
+            }
+            let (rows, status) = answer(&store(data), read);
+            eprintln!("{regime}, {shape}: {rows} {status:?}");
+            if status != ["unsound"; 2] {
+                wrong.push(format!("{regime}, {shape}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Two marks the check makes where no row is wrong, kept as they are: a join of a property
+/// that holds only strings with one that holds a number (no string equals a number), and a
+/// string constant against a property that holds strings and numbers. The check asks per
+/// property whether it holds a value other than a string, not which value meets which.
+/// Spec: under `owl2-dl`, each keeps its rows and is `sound-only`, run and planned.
+#[test]
+fn a_string_beside_a_number_is_sound_only_though_no_row_is_missed() {
+    let cases: [(&str, &str, Right); 2] = [
+        (
+            ":name a owl:DatatypeProperty . :age a owl:DatatypeProperty .              :a :name \"7\" . :b :age 7 .",
+            "SELECT ?x ?y { ?x :name ?v . ?y :age ?v }",
+            |rows| !rows.contains("example.com/"),
+        ),
+        (
+            ":p a owl:DatatypeProperty . :a :p \"Rex\" . :b :p 7 .",
+            "SELECT ?x { ?x :p \"Rex\" }",
+            |rows| rows.contains("example.com/a\"") && !rows.contains("example.com/b\""),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (data, read, right) in cases {
+        let (rows, status) = answer(&owl2_dl(data), read);
+        eprintln!("{read}: {rows} {status:?}");
+        if !right(&rows) || status != ["sound-only"; 2] {
+            wrong.push(format!("{read}: {rows} {status:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
