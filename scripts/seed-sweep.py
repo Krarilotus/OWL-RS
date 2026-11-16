@@ -21,7 +21,7 @@ new seed starts past the budget. A failure is data, never the chunk's end: the c
 and says FAILED with the seed, and every chunk's summary counts the sweep's findings so far,
 the earlier chunks' included (the queue goes on with the sweep).
 
-A failure found on a host under diagnosis (hosts.toml [[host.<key>.unstable]], Khaleesi since
+A failure found on a host under diagnosis (hosts.toml [[host.<key>.unstable]], the development machine since
 12 Oct 2026) is reproduced on another host before anyone acts on it.
 """
 from __future__ import annotations
