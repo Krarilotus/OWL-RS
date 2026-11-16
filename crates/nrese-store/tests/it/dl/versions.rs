@@ -79,7 +79,7 @@ fn queries_during_commits_read_u1_at_their_snapshots_revision() {
 }
 
 /// Runs `q` inside a transaction with `ops` pending: its rows and status.
-fn in_transaction(
+pub(super) fn in_transaction(
     dl: &MutationPipeline,
     ops: Vec<StatementOp>,
     q: &str,

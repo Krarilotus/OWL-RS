@@ -6,9 +6,10 @@
 use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-use nrese_store::{MutationPipeline, StoreConfig, StoreService};
+use nrese_store::{MutationError, MutationPipeline, StoreConfig, StoreService};
 
 use super::queries::query;
+use super::versions::in_transaction;
 use super::{ask, insert, pipeline, update};
 
 /// A union on the right of a subclass axiom: outside OWL 2 RL, so beside the data it takes
@@ -232,4 +233,170 @@ fn owl2_rl_keeps_its_key_rule_and_its_fingerprint() {
         format!("{:016x}", program.fingerprint()),
         OWL2_RL_FINGERPRINT
     );
+}
+
+/// An `owl2-dl` store, every identity stored (`compact` false) or representatives stored.
+fn owl2_dl(compact: bool) -> MutationPipeline {
+    let config = StoreConfig {
+        equality_compact: compact,
+        ..crate::support::in_memory_store_config()
+    };
+    MutationPipeline::new(
+        Arc::new(StoreService::new(config).expect("store")),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    )
+}
+
+/// No anonymous individual occurs in a `SameIndividual` axiom of an OWL 2 DL ontology
+/// (*OWL 2 Structural Specification* §11.2), but the Direct Semantics reads every OWL 2
+/// ontology (*OWL 2 Direct Semantics* §2.3.7–2.4): an anonymous individual is existential.
+/// Held as a constant, every conclusion that doesn't name it stays, and a key binds it only
+/// where it equals a named individual (the only use of NAMED, §2.3.5). Spec: under `owl2-dl`
+/// an answer through such an equality is the entailed one and complete, for a blank node
+/// equal to a named one (`:a a :D` through `_:b`) and for two blank nodes equal (`:y a :D`
+/// through an inverse functional property whose values they are); in both equality modes,
+/// and read inside a transaction with nothing pending.
+#[test]
+fn an_anonymous_individual_in_same_as_answers_complete() {
+    let cases = [
+        ("_:b owl:sameAs :a . _:b a :D .", "ASK { :a a :D }"),
+        (
+            "_:b owl:sameAs _:c . :r a owl:ObjectProperty , owl:InverseFunctionalProperty . \
+             :x :r _:b ; a :D . :y :r _:c .",
+            "ASK { :y a :D }",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for compact in [false, true] {
+        for (data, read) in cases {
+            let dl = owl2_dl(compact);
+            insert(&dl, data).expect("accepted");
+            let route = dl.store().dl_bounds().last;
+            let (rows, status) = query(&dl, read);
+            let (text, pending) = in_transaction(&dl, Vec::new(), read);
+            let pending = pending.expect("a status");
+            let line = format!(
+                "compact {compact}, {data} / route {route}: {read} answers {rows:?}, complete {}; \
+                 inside a transaction {text}, {}",
+                status.is_complete(),
+                pending.as_str()
+            );
+            eprintln!("{line}");
+            if rows != ["true"]
+                || !status.is_complete()
+                || !text.contains("true")
+                || !(pending.sound && pending.complete)
+            {
+                wrong.push(line);
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `:A` is the union of `:B` and `:C`, both disjoint from `:D`: no `:A` is a `:D`. A union on
+/// the right, so neither the OWL 2 RL rules nor the context core decide it: the hypertableau
+/// does.
+const NO_A_IS_A_D: &str = ":A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . \
+     :B owl:disjointWith :D . :C owl:disjointWith :D .";
+
+/// A data key of `:K` shared by `d1`, a `:D`, and the named `:d2`, an `:A`, and `more`: where the
+/// key equates them, the data has no model.
+fn keyed_d_and_a(d1: &str, more: &str) -> String {
+    format!(
+        "{NO_A_IS_A_D} :k a owl:DatatypeProperty . :K owl:hasKey ( :k ) . \
+         {d1} a :K , :D ; :k 7 . :d2 a :K , :A ; :k 7 . {more}"
+    )
+}
+
+/// The hypertableau's keys bind elements in NAMED only (*OWL 2 Direct Semantics* §2.3.5,
+/// NAMED in §2.2): an anonymous individual equal to a named one is that one's element in
+/// every model, so it binds; one equal to none binds nothing. Spec: the commit's consistency
+/// check, by the hypertableau, rejects the data where the key's anonymous instance is equal
+/// to the named `:m` (asserted, and through a functional property: a merge in the tableau),
+/// as where the instance is named; it accepts the data where the instance equals no named
+/// individual.
+#[test]
+fn the_hypertableau_binds_an_anonymous_instance_only_through_a_named_one() {
+    let functional = ":f a owl:ObjectProperty , owl:FunctionalProperty . :w :f _:d1 , :m .";
+    let cases = [
+        (":d1", "", false),
+        ("_:d1", "_:d1 owl:sameAs :m .", false),
+        ("_:d1", functional, false),
+        ("_:d1", "", true),
+    ];
+    let mut wrong = Vec::new();
+    for (d1, more, consistent) in cases {
+        let dl = pipeline();
+        let data = keyed_d_and_a(d1, more);
+        let found = match insert(&dl, &data) {
+            Ok(_) => {
+                let checked = dl.store().dl().status().expect("a DL status").consistency;
+                format!("accepted, {} {:?}", checked.engine, checked.verdict)
+            }
+            Err(MutationError::Rejected(reject)) => format!("rejected: {}", reject.detail),
+            Err(other) => format!("failed: {other:?}"),
+        };
+        let line = format!("{d1} {more}: {found}");
+        eprintln!("{line}");
+        let expected = match consistent {
+            true => "accepted, hypertableau Consistent",
+            false => "found by the hypertableau",
+        };
+        if !found.contains(expected) {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The exact check's keys are the hypertableau's: the anonymous `_:d1` shares a data key with
+/// the named `:d2`, and `:w`, in one of two classes each of which has at most one `:r` value,
+/// has the values `_:d1` and `:m`. A union in an assertion, so the OWL 2 RL rules (the lower
+/// bound) don't equate `_:d1` with `:m`; the upper bound applies the key to every individual
+/// and holds `:d2 a :E`. Spec: with the two classes bounding `:r`, `_:d1` is `:m` in every
+/// model, so the key binds it and `:d2 a :E` is entailed (§2.3.5); without them it equals no
+/// named individual and isn't. Each answer comes from the exact check of that one
+/// candidate, complete.
+#[test]
+fn the_exact_check_binds_an_anonymous_instance_only_through_a_named_one() {
+    let at_most_one_r = |class: &str| {
+        format!(
+            "{class} rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; \
+             owl:maxCardinality \"1\"^^xsd:nonNegativeInteger ] ."
+        )
+    };
+    let data = |bounded: bool| {
+        let bounds = match bounded {
+            true => format!("{} {}", at_most_one_r(":F1"), at_most_one_r(":F2")),
+            false => String::new(),
+        };
+        format!(
+            ":k a owl:DatatypeProperty . :K owl:hasKey ( :k ) . :r a owl:ObjectProperty . \
+             _:d1 a :K , :E ; :k 7 . :d2 a :K ; :k 7 . \
+             :w a [ owl:unionOf ( :F1 :F2 ) ] ; :r _:d1 , :m . {bounds}"
+        )
+    };
+    let mut wrong = Vec::new();
+    for (bounded, answer) in [(true, "true"), (false, "false")] {
+        let dl = pipeline();
+        insert(&dl, &data(bounded)).expect("consistent");
+        let (rows, status) = query(&dl, "ASK { :d2 a :E }");
+        let line = format!(
+            ":r bounded {bounded}: {rows:?}, complete {}, paths {:?}, bounds {:?}",
+            status.is_complete(),
+            status.paths,
+            status.bounds
+        );
+        eprintln!("{line}");
+        if rows != [answer]
+            || !status.is_complete()
+            || status.paths.as_slice() != ["exact-ground-entailment"]
+        {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
