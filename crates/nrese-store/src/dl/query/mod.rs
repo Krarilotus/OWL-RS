@@ -388,7 +388,7 @@ const SPELLING: &str = "a stored value written another way doesn't match it, tho
 /// both DL entry points, [`plan_status`] and [`answer`], after the bounds; over a ruleset's
 /// closure, with or without the QL rewriting): each step only lowers what the status
 /// asserts. Under `rdfs` and `custom` the regime is the closure's own: what it lacks isn't
-/// entailed. A read [`denied`] names misses rows, and under `owl2-dl` and `owl2-ql` so does
+/// entailed. A read [`denied`] names misses rows, and so does
 /// a typed constant ([`typed_constant`]); and where rows may be missing, an operator under
 /// which a missing row can make a returned one wrong ([`negation`]) makes the answers
 /// unsound. Each from `source`.
@@ -439,7 +439,7 @@ fn certify(
     if let Some(reason) = read {
         completeness.incomplete(source, reason.clone());
     }
-    if matches!(completeness.regime, Some(Owl2Dl | Owl2Ql)) {
+    if matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
         let constant = reads.constant.get_or_init(|| {
             typed_constant(query).map(|c| format!("the query names {c}: {SPELLING}"))
         });
