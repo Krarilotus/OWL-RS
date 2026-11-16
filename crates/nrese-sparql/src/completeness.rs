@@ -331,16 +331,23 @@ impl Completeness {
 /// `text` in quotes, ASCII only (as [`Completeness::header`] says).
 fn quoted(out: &mut String, text: &str) {
     out.push('"');
-    for c in text.chars() {
+    // Runs of plain ASCII are copied at once; the character after each is escaped.
+    let mut start = 0;
+    for (i, c) in text.char_indices() {
+        if (c.is_ascii_graphic() || c == ' ') && c != '"' && c != '\\' {
+            continue;
+        }
+        out.push_str(&text[start..i]);
+        start = i + c.len_utf8();
         match c {
             '"' | '\\' => {
                 out.push('\\');
                 out.push(c);
             }
-            c if c.is_ascii_graphic() || c == ' ' => out.push(c),
             c => out.extend(c.escape_unicode()),
         }
     }
+    out.push_str(&text[start..]);
     out.push('"');
 }
 
