@@ -46,6 +46,8 @@ pub struct StoreService {
     /// The reasoning state recorded this process (also for in-memory stores, which have no
     /// file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
+    /// Shared by the store's clones: a clone with its own record would never see a commit's mark.
+    pub(crate) lists: std::sync::Arc<crate::reasoning::ListsKept>,
     /// The certificate's epoch, a sequence lock over its changes ([`Self::certificate_epoch`]):
     /// odd while one is in progress (under the writer slot, [`CertificateTransition`]), even
     /// once it is settled in memory and on disk.
@@ -334,6 +336,7 @@ impl StoreService {
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             unavailable,
             materialised: std::sync::Arc::default(),
+            lists: Default::default(),
             certificate_epoch: std::sync::Arc::default(),
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             outside_profile: std::sync::Arc::new(std::sync::RwLock::new(outside_profile)),
@@ -1253,8 +1256,8 @@ impl StoreService {
 
     /// The status of answers outside the DL bounds: the QL rewriting's report where it ran,
     /// as it left the rewriting with what neither it nor the closure answers composed onto
-    /// it ([`crate::dl::query::certify_report`]); else [`Self::status_without_dl`], marked
-    /// for the data `at` the answers were read from.
+    /// it ([`crate::dl::query::certify_report`]) and the list mark ([`Self::ql_status`]);
+    /// else [`Self::status_without_dl`], marked for the data `at` the answers were read from.
     fn status_outside_dl(
         &self,
         prepared: &PreparedQuery,
@@ -1262,7 +1265,7 @@ impl StoreService {
         at: Revision<'_>,
     ) -> Option<nrese_sparql::Completeness> {
         let route = match ql {
-            Some(ql) => Some(ql.completeness.clone()),
+            Some(ql) => Some(self.ql_status(ql, at.snapshot())),
             None => self.status_without_dl_at(prepared, at),
         };
         self.assess(prepared, at, route)
@@ -1660,7 +1663,17 @@ impl StoreService {
         )?;
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
             Some(reading) => reading.pending(&tx, &budget)?,
-            None => tx.pending_snapshot_within(&budget)?,
+            // Operations that touch no input of the list scan (a list fact; under compact
+            // equality, any) leave out the lists their base does (a reader's own view, above,
+            // may drop equality's copies of list cells: it scans).
+            None => {
+                use crate::reasoning::Program;
+                let view = tx.pending_snapshot_within(&budget)?;
+                if !Program::touches_a_list(&view, tx.inserted().chain(tx.deleted())) {
+                    self.lists.own(&view, || false);
+                }
+                view
+            }
         };
         self.sessions.keep_view(
             tx.base().clone(),
@@ -2185,6 +2198,40 @@ impl StoreService {
             })
         })
         .hiding_unnamed_classes(self.config.hide_unnamed_classes)
+    }
+
+    /// A revision no commit here recorded (a reopened store's, a replica's) is scanned. Only
+    /// a scan of the published version writes the record: a pending or a reader's own view
+    /// of it takes the latest version's answer at its revision, else the record's, else left
+    /// out, with a scan of its own statements.
+    pub(crate) fn lists_left_out(&self, snapshot: &nrese_engine::Snapshot) -> bool {
+        use crate::reasoning::Program;
+        let latest = self.engine.snapshot();
+        let base = match latest.revision() == snapshot.revision() {
+            true => {
+                (self.lists).left_out(latest.revision(), || Program::leaves_out_a_list(&latest))
+            }
+            false => self.lists.known(snapshot.revision()).unwrap_or(true),
+        };
+        base || (!latest.same_version(snapshot)
+            && (self.lists).own(snapshot, || Program::leaves_out_a_list(snapshot)))
+    }
+
+    /// The QL rewriting's status at `snapshot`: under `owl2-rl`, not `complete` where the
+    /// closure leaves out a list axiom, whose conclusions an answer may miss.
+    fn ql_status(
+        &self,
+        ql: &nrese_sparql::ql::QlReport,
+        snapshot: &nrese_engine::Snapshot,
+    ) -> nrese_sparql::Completeness {
+        let mut status = ql.completeness.clone();
+        let rl = status.regime == Some(nrese_sparql::Regime::Owl2Rl);
+        if status.complete && rl && self.lists_left_out(snapshot) {
+            let why =
+                "a list axiom the rules can't build is left out of the closure (a list diagnostic)";
+            status.incomplete("rules", why.to_owned());
+        }
+        status
     }
 
     /// A statement by the snapshot's ids; `None` if a term isn't in the store.

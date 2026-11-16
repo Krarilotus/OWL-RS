@@ -85,9 +85,9 @@ leave something out.
   return one for each, though an asserted one is returned. It checks the datatype rules in part,
   and of the axiomatic triples it holds only `dt-type1`'s 32 datatype statements, in every store
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
-  Lists past their limits (a property chain or key of more than 250 properties, more than
-  64 member sequences) aren't used at all, never truncated, and each is reported in the log
-  and the reasoning diagnostics
+  Lists past their limits (a property chain of more than 250 properties, a key of more than
+  127, an intersection of more than 256 classes, more than 64 member sequences) aren't used
+  at all, never truncated, and each is reported in the log and the reasoning diagnostics
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)); none known beyond
   keeping lists within those limits. Literals aren't
   equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
@@ -119,7 +119,8 @@ leave something out.
   a repository's QL rewriting made in between takes effect with that rebuild, not at once. Run
   the rebuild again ([HTTP interface](ops/http-api.md#engine-api-apiv1)).
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
-  `log:notEqualTo` and make no new blank nodes, and with user rules no answer is claimed
+  `log:notEqualTo`, make no new blank nodes, and hold at most 256 atoms in a rule's
+  premises or conclusion (split a longer rule); with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)).
 - Under `owl2-dl`, a commit whose consistency check isn't decided
   (a budget or the timeout) goes through, and the status says `unknown`. No answer is then

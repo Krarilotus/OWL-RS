@@ -287,6 +287,10 @@ impl MutationPipeline {
                             .map_or(MutationError::Cancelled, &store_error)
                     })?;
             tracing::debug!(?materialisation, "commit-path materialisation");
+            // Whether the closure the commit leaves leaves out a list axiom: its program's
+            // whole list diagnostics (the report's are only the new ones).
+            let lists_left_out =
+                (changed.as_ref().or(cached)).is_some_and(|p| !p.list_diagnostics.is_empty());
             crate::reasoning::log_diagnostics(
                 &materialisation.diagnostics,
                 materialisation.diagnostics_total,
@@ -428,6 +432,7 @@ impl MutationPipeline {
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
             }
+            (self.store.lists).commit(before, summary.revision, lists_left_out);
             if let Some((gate, bounds)) = dl {
                 crate::dl::bounds::install(&self.store, bounds, summary.revision);
                 self.store.dl().record(crate::dl::DlStatus {
