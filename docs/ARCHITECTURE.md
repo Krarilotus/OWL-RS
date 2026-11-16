@@ -1,4 +1,4 @@
-# NRESE Architecture (Engine v2)
+# NRESE Architecture
 
 This page says which layer owns which concern, which way dependencies may point and, most important for day-to-day work, at which layer a kind of problem is fixed. The specs under `docs/spec/` refine single concerns, and where one contradicts this page, this page wins and the spec is corrected.
 
