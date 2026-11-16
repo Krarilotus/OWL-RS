@@ -4,6 +4,10 @@ else pyflakes reports does. A suite test that replaces a whole function never ru
 before 12 Nov 2026 a name missing there (`ROOT` after #132's merge) passed every test and failed
 only on a fleet host.
 
+The same push tier runs the suite contracts for a change to the gate's own scripts or hooks, which
+they test: #362 changed scripts/check.sh alone, its push tier ran no contract, and the merge set's
+gate found three of them failing.
+
 Run: python benches/suite/tests/isolation.py discover -s benches/suite/tests -p test_python_names.py
 An assertion tagged `SPEC <tag>` states the behaviour its test is for.
 """
@@ -53,7 +57,7 @@ class Checker(unittest.TestCase):
 
 
 # Stand-ins, each call one line in $FAKE/calls: cargo (metadata: no package), the W3C data fetch, the
-# name lint and the checker itself, which finds a name while $FAKE/undefined exists.
+# name lint, the suite contracts and the checker itself, which finds a name while $FAKE/undefined exists.
 CARGO = '#!/bin/sh\necho "cargo $*" >> "$FAKE/calls"\n[ "$1" != metadata ] || echo \'{"packages":[]}\'\nexit 0\n'
 STUBS = {
     "scripts/fetch-w3c-tests.sh": '#!/bin/sh\nexit 0\n',
@@ -61,6 +65,7 @@ STUBS = {
     "scripts/check-python-names.py": 'import os, sys\nopen(os.environ["FAKE"] + "/calls", "a")'
                                      '.write("names " + " ".join(sys.argv[1:]) + "\\n")\n'
                                      'sys.exit(os.path.exists(os.environ["FAKE"] + "/undefined"))\n',
+    "benches/suite/tests/isolation.py": 'import os\nopen(os.environ["FAKE"] + "/calls", "a").write("suite\\n")\n',
 }
 
 
@@ -90,6 +95,7 @@ class PushTier(unittest.TestCase):
         (self.repo / "scripts").mkdir()
         shutil.copy(ROOT / "scripts/check.sh", self.repo / "scripts/check.sh")
         for rel, text in STUBS.items():
+            (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.repo / rel).write_text(text, newline="\n")
         for args in (["add", "-A"], ["commit", "-q", "-m", "base"],
                      ["update-ref", "refs/remotes/origin/refactor/engine-v2", "HEAD"]):
@@ -115,6 +121,19 @@ class PushTier(unittest.TestCase):
                 if undefined:
                     self.assertRegex(done.stdout, r"(?m)^  1  python names \(",
                                      f"SPEC python-names-push-tier: the summary names the step:\n{out}")
+
+    def test_a_change_to_the_gates_scripts_alone_runs_the_suite_contracts(self):
+        for changed in ("scripts/check.sh", "scripts/lib/gate-key.sh", ".githooks/pre-push"):
+            with self.subTest(changed=changed):
+                (self.fake / "calls").unlink(missing_ok=True)
+                self.files.write_text(changed + "\n", newline="\n")
+                done = subprocess.run([BASH, "scripts/check.sh", "push"], cwd=self.repo, capture_output=True,
+                                      text=True, env=self.env, timeout=120, stdin=subprocess.DEVNULL)
+                out = done.stdout + done.stderr
+                calls = (self.fake / "calls").read_text().splitlines() if (self.fake / "calls").exists() else []
+                self.assertEqual([c for c in calls if c == "suite"], ["suite"],
+                                 f"SPEC gate-scripts-run-contracts: the contracts that test them run once:\n{out}")
+                self.assertRegex(done.stdout, r"(?m)^  0  suite contracts \(", out)
 
 
 if __name__ == "__main__":
