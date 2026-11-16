@@ -409,9 +409,12 @@ fn commit(pipeline: &crate::MutationPipeline, update: &str) {
 const MARK_PREFIXES: &str = "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#> \
      PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
 
-/// `ASK { :x a :C }` over `first` committed, with `then` committed between the answer's
-/// decision and its status (the hook `AFTER_DECIDED`): the answer and its status.
-fn decided_then(first: &str, then: &'static str) -> (String, nrese_sparql::Completeness) {
+/// A store under `owl2-dl` with `first` committed, `then` set to be committed once what a
+/// read reads is fixed, before its status (the hook `AFTER_DECIDED`), and whether it was.
+fn racing(
+    first: &str,
+    then: &'static str,
+) -> (Arc<StoreService>, std::rc::Rc<std::cell::Cell<bool>>) {
     use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
     let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
     let pipeline = std::rc::Rc::new(crate::MutationPipeline::new(
@@ -427,9 +430,19 @@ fn decided_then(first: &str, then: &'static str) -> (String, nrese_sparql::Compl
         commit(&racer, then);
         seen.set(true);
     })));
+    (store, ran)
+}
+
+/// `query` over [`racing`]`(first, then)`, run: the answer and its status.
+fn decided_then(
+    first: &str,
+    then: &'static str,
+    query: &str,
+) -> (String, nrese_sparql::Completeness) {
+    let (store, ran) = racing(first, then);
     let prepared = store
         .prepare_query(&crate::SparqlQueryRequest::all(format!(
-            "{MARK_PREFIXES}ASK {{ :x a :C }}"
+            "{MARK_PREFIXES}{query}"
         )))
         .unwrap();
     let (mut out, mut status) = (Vec::new(), None);
@@ -454,6 +467,7 @@ fn an_answer_keeps_the_mark_of_its_revision_when_a_commit_repairs_the_ontology()
     let (answer, status) = decided_then(
         ":note a owl:AnnotationProperty ; rdfs:domain :C . :C a owl:Class . :x :note \"n\" .",
         "DELETE DATA { :note rdfs:domain :C }",
+        "ASK { :x a :C }",
     );
     let line = format!("{answer} {} {:?}", status.as_str(), status.reasons);
     eprintln!("{line}");
@@ -472,6 +486,7 @@ fn an_answer_takes_no_mark_from_a_later_revision() {
     let (answer, status) = decided_then(
         ":note a owl:ObjectProperty ; rdfs:domain :C . :C a owl:Class . :x :note :v .",
         "INSERT DATA { :other a owl:AnnotationProperty ; rdfs:domain :D . :D a owl:Class . }",
+        "ASK { :x a :C }",
     );
     let line = format!("{answer} {} {:?}", status.as_str(), status.reasons);
     eprintln!("{line}");
@@ -480,4 +495,65 @@ fn an_answer_takes_no_mark_from_a_later_revision() {
         "the decided revision's answer: {line}"
     );
     assert_ne!(status.as_str(), "unsound", "{line}");
+}
+
+/// R1-F2, a query naming its dataset: its rows are read at the revision its status was
+/// decided on. A commit after the decision removes the statement it asks for; the answer
+/// is still `true`.
+#[test]
+fn a_query_naming_its_dataset_reads_the_revision_it_was_decided_on() {
+    let (answer, status) = decided_then(
+        "GRAPH :g { :x a :C . :C a owl:Class . }",
+        "DELETE DATA { GRAPH :g { :x a :C } }",
+        "ASK FROM :g { :x a :C }",
+    );
+    let line = format!("{answer} {} {:?}", status.as_str(), status.reasons);
+    eprintln!("{line}");
+    assert!(
+        answer.contains("true"),
+        "the decided revision's answer: {line}"
+    );
+}
+
+/// R1-F2, a read of the inferred statements alone (`FROM onto:implicit`): run, EXPLAIN and
+/// the plan each give the status of the revision the read was on. There an annotation
+/// property's domain puts `:x a :C` in L only; a commit between the read and its status
+/// removes the domain. The status stays `unsound`.
+#[test]
+fn a_read_of_the_inferred_statements_alone_keeps_the_mark_of_its_revision() {
+    let read = "ASK FROM <http://www.ontotext.com/implicit> { :x a :C }";
+    for path in ["run", "explain", "plan"] {
+        let (store, ran) = racing(
+            ":note a owl:AnnotationProperty ; rdfs:domain :C . :C a owl:Class . :x :note \"n\" .",
+            "DELETE DATA { :note rdfs:domain :C }",
+        );
+        let request = crate::SparqlQueryRequest::all(format!("{MARK_PREFIXES}{read}"));
+        let (prepared, cancel) = (
+            store.prepare_query(&request).unwrap(),
+            CancellationToken::new(),
+        );
+        let (mut answer, mut status) = (Vec::new(), None);
+        match path {
+            "run" => store
+                .run_query_reporting(&prepared, &cancel, &mut answer, |s| status = s)
+                .unwrap(),
+            "explain" => {
+                status = store
+                    .explain_query(&prepared, &cancel)
+                    .unwrap()
+                    .completeness
+            }
+            _ => status = store.plan_query(&prepared, &cancel).unwrap().completeness,
+        }
+        let status = status.expect("a status");
+        let answer = String::from_utf8(answer).unwrap();
+        let line = format!("{path}: {answer} {} {:?}", status.as_str(), status.reasons);
+        eprintln!("{line}");
+        assert!(
+            ran.get(),
+            "{line}: no commit between the read and its status"
+        );
+        assert!(path != "run" || answer.contains("true"), "{line}");
+        assert_eq!(status.as_str(), "unsound", "{line}");
+    }
 }
