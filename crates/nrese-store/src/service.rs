@@ -77,7 +77,7 @@ pub struct StoreService {
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
-const REASONING_MARKER: &str = "reasoning.state";
+pub(crate) const REASONING_MARKER: &str = "reasoning.state";
 
 /// A change of the reasoning certificate in progress
 /// ([`StoreService::certificate_epoch`]): made odd by its start, the epoch is even again when
@@ -209,6 +209,7 @@ impl StoreService {
                             .then_some(config.bulk_load_memory_bytes),
                         wal_archive: config.wal_archive,
                         wal_damage: config.wal_damage,
+                        forget_on_cut: Some(REASONING_MARKER),
                         ..defaults.durability
                     },
                     ..defaults
@@ -579,28 +580,26 @@ impl StoreService {
         let _transition = self.certificate_transition(writer);
         #[cfg(test)]
         hooks::run(&hooks::INSIDE_INVALIDATION);
+        // The marker first, the certificate in memory once it is gone: a removal that fails
+        // fails the write before it changes anything, and leaves the certificate whole (its QL
+        // rewriting and equality setting included) over the data it was computed for. Until
+        // the write publishes, that is the data readers see.
+        if self.marker.load(Ordering::Acquire)
+            && let Some(path) = self.marker_path()
+        {
+            // The removal durable too (DUR-3): a marker back after a power loss would claim the
+            // inferred stack exact for reasoning it no longer reflects. Gone already (an
+            // earlier try whose sync failed) still needs the sync ([`crate::metadata::remove`]).
+            // Failed, the file may still be there, or its removal not durable: the next
+            // invalidation tries again (the review of 3 October 2026, A4).
+            crate::metadata::remove(&path).map_err(crate::error::StoreError::Io)?;
+        }
+        self.marker.store(false, Ordering::Release);
         self.settings
             .equality_closed
             .store(false, Ordering::Release);
         *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        if !self.marker.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
-        if let Some(path) = self.marker_path() {
-            // The removal durable too (DUR-3): a marker back after a power loss would claim the
-            // inferred stack exact for reasoning it no longer reflects. Gone already (an
-            // earlier try whose sync failed) still needs the sync ([`crate::metadata::remove`]).
-            match crate::metadata::remove(&path) {
-                Ok(()) => {}
-                Err(error) => {
-                    // The file may still be there, or its removal not durable: the next
-                    // invalidation tries again (the review of 3 October 2026, A4).
-                    self.marker.store(true, Ordering::Release);
-                    return Err(crate::error::StoreError::Io(error));
-                }
-            }
-        }
         Ok(())
     }
 
@@ -1605,7 +1604,8 @@ impl StoreService {
                         nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
                     status.incomplete(
                         "dl",
-                        "a read inside a transaction: its pending operations aren't reasoned                          over before the commit (the committed closure, no DL bounds)"
+                        "a read inside a transaction: its pending operations aren't reasoned \
+                         over before the commit (the committed closure, no DL bounds)"
                             .to_owned(),
                     );
                     crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
@@ -1617,7 +1617,8 @@ impl StoreService {
             if deletes && let Some(status) = &mut status {
                 status.unsound(
                     "transaction",
-                    "the pending operations may delete statements whose inferences remain                      until the commit"
+                    "the pending operations may delete statements whose inferences remain \
+                     until the commit"
                         .to_owned(),
                 );
             }
@@ -2459,7 +2460,9 @@ pub(crate) mod hooks {
     pub(crate) type Hook = RefCell<Option<Box<dyn FnOnce()>>>;
 
     thread_local! {
-        /// A bulk load has cleared the reasoning certificate and is about to load.
+        /// A bulk load holds the writer slot and is about to read its files.
+        pub(crate) static BEFORE_LOAD_READS: Hook = const { RefCell::new(None) };
+        /// A bulk load has cleared the reasoning certificate and is about to publish.
         pub(crate) static AFTER_INVALIDATION: Hook = const { RefCell::new(None) };
         /// A rematerialisation has published its inferences and is about to certify them.
         pub(crate) static AFTER_PUBLICATION: Hook = const { RefCell::new(None) };
@@ -2575,7 +2578,8 @@ mod certificate_tests {
         (a, b)
     }
 
-    /// C1: a rematerialisation between a bulk load's clearing of the certificate and its load.
+    /// C1: a rematerialisation between a bulk load's clearing of the certificate and its
+    /// publication.
     /// Before the fix the load cleared the certificate before it took the writer slot: the
     /// rematerialisation then certified RDFS, and the load committed `C subClassOf D` under it.
     #[test]
@@ -2596,6 +2600,87 @@ mod certificate_tests {
         drop(store);
         let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
         stale(&store, "after a reopen", &mut wrong);
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// A bulk load clears the certificate before it publishes, never after, and a load whose
+    /// clearing fails (the marker can't be removed) changes nothing: it publishes nothing, and
+    /// the certificate stays whole, the QL rewriting it switches on included, so every answer
+    /// stays, in the process and after a reopen. Published first, the load's data would be
+    /// served and on disk under the old marker; the rewriting dropped first, the existential's
+    /// answer would go while the marker still certifies the data.
+    #[test]
+    fn a_load_that_cannot_clear_the_certificate_publishes_nothing() {
+        const EX: &str = "http://example.com/";
+        let dir = tempfile::tempdir().unwrap();
+        // `:a :p ?o` holds only through the rewriting of the existential, which the
+        // certificate switches on.
+        let ontology = dir.path().join("ontology.ttl");
+        std::fs::write(
+            &ontology,
+            format!(
+                "@prefix : <{EX}> .\n@prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+                 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+                 :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+                 owl:someValuesFrom owl:Thing ] .\n:a a :A .\n"
+            ),
+        )
+        .unwrap();
+        let more = dir.path().join("more.nt");
+        std::fs::write(&more, format!("<{EX}b> <{EX}q> <{EX}c> .\n")).unwrap();
+        let store_dir = dir.path().join("store");
+        let config = || StoreConfig {
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..StoreConfig::on_disk(&store_dir)
+        };
+        let marker = || std::fs::read(store_dir.join(super::REASONING_MARKER)).ok();
+        let ask = |store: &StoreService, query: &str| {
+            let answer = store.execute_query_str(query).unwrap();
+            String::from_utf8_lossy(&answer.payload).contains("true")
+        };
+        let store = StoreService::new(config()).unwrap();
+        load(&store, &ontology);
+        store
+            .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Ql)
+            .unwrap();
+        let existential = format!("ASK {{ <{EX}a> <{EX}p> ?o }}");
+        assert!(ask(&store, &existential), "the rewriting answers it");
+        let certified = (store.reasoning_state(), store.consistency(), marker());
+        assert!(certified.0.is_some() && certified.2.is_some(), "certified");
+        crate::metadata::tests::FAIL_REMOVE.set(true);
+        let failed = store.bulk_load(&crate::BulkLoadRequest {
+            files: vec![more],
+            replace: false,
+            graph: crate::GraphTarget::DefaultGraph,
+            invalid: None,
+        });
+        crate::metadata::tests::FAIL_REMOVE.set(false);
+        let mut wrong = Vec::new();
+        if failed.is_ok() {
+            wrong.push("the load succeeded without clearing the certificate".to_owned());
+        }
+        let mut unchanged = |store: &StoreService, when: &str| {
+            let seen = [
+                (ask(store, &existential), "the existential's answer"),
+                (
+                    !ask(store, &format!("ASK {{ <{EX}b> <{EX}q> <{EX}c> }}")),
+                    "nothing published",
+                ),
+                (
+                    (store.reasoning_state(), store.consistency(), marker()) == certified,
+                    "the certificate and its marker",
+                ),
+            ];
+            for (held, what) in seen {
+                if !held {
+                    wrong.push(format!("{when}: {what} changed"));
+                }
+            }
+        };
+        unchanged(&store, "in process");
+        drop(store);
+        let store = StoreService::new(config()).unwrap();
+        unchanged(&store, "after a reopen");
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 

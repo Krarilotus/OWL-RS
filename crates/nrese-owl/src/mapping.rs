@@ -374,6 +374,9 @@ struct Reader<'a> {
     v: Vocabulary,
     /// [`DECLARATION_KINDS`] by the source's ids.
     declaration_kinds: [(Option<Term>, EntityKind); 8],
+    /// [`BUILTIN_ANNOTATIONS`] and `owl:versionIRI` by the source's ids, looked up once per
+    /// read: [`Self::is_builtin_annotation`] meets them on every assertion.
+    builtin_annotations: ([Option<Term>; 9], Option<Term>),
     terms: &'a dyn Terms,
     statements: &'a [Statement],
     /// Per subject: (predicate, object, graph).
@@ -467,6 +470,10 @@ impl<'a> Reader<'a> {
         Self {
             v,
             declaration_kinds: DECLARATION_KINDS.map(|(iri, kind)| (terms.iri(iri), kind)),
+            builtin_annotations: (
+                BUILTIN_ANNOTATIONS.map(|iri| terms.iri(iri)),
+                terms.iri("http://www.w3.org/2002/07/owl#versionIRI"),
+            ),
             terms,
             statements,
             by_subject,
@@ -1516,10 +1523,8 @@ impl<'a> Reader<'a> {
 
     /// `rdfs:label` and the other annotation properties OWL 2 builds in.
     fn is_builtin_annotation(&self, predicate: Term) -> bool {
-        BUILTIN_ANNOTATIONS
-            .iter()
-            .any(|iri| self.terms.iri(iri) == Some(predicate))
-            || self.terms.iri("http://www.w3.org/2002/07/owl#versionIRI") == Some(predicate)
+        let (builtin, version_iri) = &self.builtin_annotations;
+        builtin.contains(&Some(predicate)) || *version_iri == Some(predicate)
     }
 
     fn finish(mut self) -> Ontology {

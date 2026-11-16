@@ -198,31 +198,29 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             "<urn:g> { <urn:s> <urn:p> [ <urn:q> . } <urn:after> <urn:p> <urn:o> .",
             vec![None, Some(&after)],
         ),
-        // A quote with no closing quote anywhere after it (a missing closer): the quote
-        // alone is skipped and its text read as tokens, the `[` still open. The `(` in it is
-        // opened by the skip; the `]` matches nothing the skip opened, so it closes the `[`
-        // (and the `(` in it), and the `.` after it ends the statement (the policy of
-        // `turtle_tests::recovering_parsers_skip_bad_statements_and_go_on`).
+        // A quote with no closing quote anywhere after it (a missing closer): the document
+        // ends inside that string, so the error ends it, as a cut file's does, and nothing
+        // after it is read. Before, the quote alone was skipped and its text read as tokens,
+        // and `urn:after` came after the error.
         (
             true,
             RdfFormat::Turtle,
             "<urn:s> <urn:p> [ <urn:q> \"open ; <urn:r> ( 1 2 ] .\n<urn:after> <urn:p> <urn:o> .",
-            vec![None, Some(&after)],
+            vec![None],
         ),
         // The same when the quote comes while the rest is skipped (sol-loop A1B-R2-F1).
         (
             true,
             RdfFormat::Turtle,
             "<urn:s> <urn:p> [ <urn:q> . \"open ; <urn:r> ( 1 2 ] .\n<urn:after> <urn:p> <urn:o> .",
-            vec![None, Some(&after)],
+            vec![None],
         ),
-        // A missing closing quote with a statement in its text, inside the `[`: the `[`
-        // stays open over it, so the statement is skipped with the rest (fix check r2).
+        // And with a statement in the string's text: it isn't read as one (fix check r2).
         (
             false,
             RdfFormat::Turtle,
             "<urn:s> <urn:p> [ <urn:q> \"open . <urn:u> <urn:v> <urn:w> . ] . <urn:after> <urn:p> <urn:o> .",
-            vec![None, Some(&after)],
+            vec![None],
         ),
         // Bytes the lexer can't read keep what is open: a stray `%` in the failed
         // statement, or met while its rest is skipped (fix check r2, A1B-R1-F1).
@@ -485,13 +483,14 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             "<urn:s> <urn:p> [ <urn:q> . \"a\n] . <urn:u> <urn:v> <urn:w> .\" ] . <urn:after> <urn:p> <urn:o> .",
             vec![None, Some(&after)],
         ),
-        // A long string with no closing quotes says nothing of a later short string: that
-        // one's closing quote is still searched for and found (sol-loop r2 S1).
+        // A long string with no closing quotes: the document ends inside it, so the error
+        // ends the document, whatever short string its text holds. Before, the long string's
+        // quote alone was skipped and the short one's closing quote found (sol-loop r2 S1).
         (
             false,
             RdfFormat::Turtle,
             "<urn:s> <urn:p> [ <urn:q> \"\"\" \"a\n] . <urn:u> <urn:v> <urn:w> .\" ] . <urn:after> <urn:p> <urn:o> .",
-            vec![None, Some(&after)],
+            vec![None],
         ),
         // An escaped quote before the closing one is part of the string (the lexer's rule).
         (
@@ -701,7 +700,8 @@ fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
 /// count per bracket pair; no search after one has reached the end; reading at least as much
 /// again before searching again); these rows check the output. Guards: they held before.
 /// The escaped quotes are fewer: before, each was searched to the end again, so the parent's
-/// red run would take quadratic time on them.
+/// red run would take quadratic time on them. Their string never closes, so the document
+/// ends inside it and the error ends the document; before, the read went on after it.
 #[test]
 fn recovery_over_large_malformed_input() {
     let after = triple("urn:after", "urn:p", iri("urn:o"));
@@ -749,7 +749,11 @@ fn recovery_over_large_malformed_input() {
             ("byte reader", drain(parser().for_reader(bytes()))),
         ] {
             let got: Vec<Option<&Quad>> = items.iter().map(|item| item.as_ref().ok()).collect();
-            table.row(true, (case, path), same(got, vec![None, Some(&after)]));
+            let want = match case {
+                "escaped quotes after a missing one" => vec![None],
+                _ => vec![None, Some(&after)],
+            };
+            table.row(true, (case, path), same(got, want));
         }
     }
     table.done();
@@ -937,6 +941,47 @@ fn a_read_error_ends_the_document() {
                 (format, recovering, "always fails"),
                 shaped(&items, &[false]),
             );
+        }
+    }
+    table.done();
+}
+
+/// In every format the parser reads, a read error inside a document is returned as a read
+/// error, never as a syntax error (which a recovering consumer would skip), and ends the
+/// document: what came before it, then the error, then nothing.
+#[test]
+fn a_read_error_is_a_read_error_in_every_format() {
+    let mut table = Table::default();
+    for format in [
+        RdfFormat::NTriples,
+        RdfFormat::NQuads,
+        RdfFormat::Turtle,
+        RdfFormat::TriG,
+        RdfFormat::RdfXml,
+        RdfFormat::JsonLd,
+        RdfFormat::N3,
+        RdfFormat::BinaryRdf,
+    ] {
+        let mut writer = nrese_rdf_io::RdfSerializer::from_format(format).for_writer(Vec::new());
+        for k in 0..3 {
+            let quad = triple(
+                &format!("urn:s{k}"),
+                "urn:p",
+                Literal::new_simple_literal("v"),
+            );
+            writer.serialize_quad(&quad).unwrap();
+        }
+        let document: &'static [u8] = Box::leak(writer.finish().unwrap().into_boxed_slice());
+        let (before, after) = document.split_at(document.len() / 2);
+        for recovering in [false, true] {
+            let parser = recovering_if(RdfParser::from_format(format), recovering);
+            let pieces = Pieces(vec![Ok(before), Err(io::ErrorKind::Other), Ok(after)].into());
+            let items: Vec<_> = parser.for_reader(pieces).take(9).collect();
+            let outcome = match items.split_last() {
+                Some((Err(RdfParseError::Io(_)), read)) if read.iter().all(Result::is_ok) => Ok(()),
+                _ => Err(format!("want quads, then one read error, got {items:?}")),
+            };
+            table.row(format != RdfFormat::RdfXml, (format, recovering), outcome);
         }
     }
     table.done();

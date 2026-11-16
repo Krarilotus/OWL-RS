@@ -1099,6 +1099,12 @@ fn shacl_checks_restored_memberships_before_a_revival_and_split_commit() {
 #[test]
 fn dl_commits_a_revival_and_split_with_its_final_closure() {
     let baseline = hidden_range_pipeline("", false);
+    // The baseline's closure is owl2-rl's. owl2-dl's program keeps anonymous individuals out
+    // of its keys and records its own fingerprint, so a commit under owl2-dl would first
+    // rebuild that closure, one revision of its own. Materialised with owl2-dl's program, the
+    // commit is the one revision this test counts.
+    let dl = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl).materialised_program();
+    baseline.store().rematerialise(dl.unwrap()).unwrap();
     let pipeline = MutationPipeline::new(
         Arc::clone(baseline.store()),
         Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
