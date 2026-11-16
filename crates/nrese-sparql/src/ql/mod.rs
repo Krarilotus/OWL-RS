@@ -452,11 +452,21 @@ impl QlRewriting {
     /// What decides its rewritings besides the snapshot's TBox, as numbers for the result
     /// cache's key of an answer: the closure and every bound, read from the fields where
     /// the key is written (no text is made). The key's test builds both field by field, so
-    /// a field added to either fails it until it is written here too.
+    /// a field added to either fails it until it is written here too; a field added to the
+    /// rewriting itself doesn't compile here until it is written or named as derived.
     pub(crate) fn fingerprint(&self) -> [u64; 10] {
-        let (l, n) = (&self.limits, |v: usize| v as u64);
+        // The compiled schemas, probes and commit notes follow from the snapshots read, which
+        // a key holds: no part of a key.
+        let Self {
+            closure,
+            limits: l,
+            cached: _,
+            realised: _,
+            notes: _,
+        } = self;
+        let n = |v: usize| v as u64;
         [
-            u64::from(self.closure.lists),
+            u64::from(closure.lists),
             n(l.existential_vars),
             n(l.candidates),
             n(l.witnesses),

@@ -479,8 +479,10 @@ pub enum CachedOutput<'s> {
 /// ```
 pub struct OutputSlot<'s> {
     cache: Arc<ResultCache>,
-    state: Admission<'s>,
-    part: Arc<[u8]>,
+    /// The admission it was looked up with: the slot doesn't outlive its snapshot.
+    _state: Admission<'s>,
+    /// The key it was looked up by, made once.
+    key: Key,
 }
 
 impl OutputSlot<'_> {
@@ -495,8 +497,7 @@ impl OutputSlot<'_> {
         // Not a part computed: no miss (the query's parts counted theirs). No floor: a hit
         // replaces the whole request, whose parsing and key it pays as well.
         let len = bytes.len();
-        let key = Key::admitted(self.state, self.part);
-        self.cache.admit(&key, len, cost, Duration::ZERO, || {
+        self.cache.admit(&self.key, len, cost, Duration::ZERO, || {
             Some(Payload::Output(bytes.into()))
         });
     }
@@ -520,23 +521,18 @@ pub(crate) enum Claim<'c> {
 /// [`Computing::finish`], it lets its waiters compute the part themselves.
 pub(crate) struct Computing<'c> {
     cache: &'c ResultCache,
-    /// The admission it was claimed with: its key is this snapshot's ([`Self::key`]).
-    state: Admission<'c>,
-    part: Arc<[u8]>,
+    /// The key it was claimed by, made once from the claim's admission.
+    key: Key,
     flight: Arc<Flight>,
     finished: bool,
 }
 
 impl Computing<'_> {
-    fn key(&self) -> Key {
-        Key::admitted(self.state, Arc::clone(&self.part))
-    }
-
     /// Whether a part of `bytes` that took `cost` to compute is wanted: the cache would
     /// admit it, or a query waits for it.
     pub(crate) fn wants(&self, bytes: usize, cost: Duration) -> bool {
         self.flight.waiters.load(Ordering::Acquire) > 0
-            || self.cache.state().pinned(&self.part)
+            || self.cache.state().pinned(&self.key.part)
             || self.cache.worth(bytes, cost, MIN_COST)
     }
 
@@ -545,18 +541,16 @@ impl Computing<'_> {
     /// doesn't fit in the budget beside the other pinned ones.
     pub(crate) fn finish(mut self, part: Option<Part>, cost: Duration) -> Result<(), String> {
         self.finished = true;
-        let key = self.key();
+        let key = &self.key;
         let part = part.map(Arc::new);
         let stored = match &part {
-            Some(part) => self
-                .cache
-                .store(&key, Payload::Part(Arc::clone(part)), cost),
+            Some(part) => self.cache.store(key, Payload::Part(Arc::clone(part)), cost),
             None => {
                 self.cache.rejected.fetch_add(1, Ordering::Relaxed);
                 Ok(())
             }
         };
-        self.cache.land(&key, &self.flight, part);
+        self.cache.land(key, &self.flight, part);
         stored
     }
 }
@@ -564,7 +558,7 @@ impl Computing<'_> {
 impl Drop for Computing<'_> {
     fn drop(&mut self) {
         if !self.finished {
-            self.cache.land(&self.key(), &self.flight, None);
+            self.cache.land(&self.key, &self.flight, None);
         }
     }
 }
@@ -703,8 +697,7 @@ impl ResultCache {
         let computing = |flight| {
             Claim::Compute(Computing {
                 cache: self,
-                state: token,
-                part: Arc::clone(part),
+                key: key.clone(),
                 flight,
                 finished: false,
             })
@@ -761,12 +754,13 @@ impl ResultCache {
         if !self.admits(token) {
             return CachedOutput::Off;
         }
-        match self.hit(&mut self.state(), &Key::admitted(token, Arc::clone(&part))) {
+        let key = Key::admitted(token, part);
+        match self.hit(&mut self.state(), &key) {
             Some(Payload::Output(bytes)) => CachedOutput::Hit(bytes),
             _ => CachedOutput::Miss(OutputSlot {
                 cache: Arc::clone(self),
-                state: token,
-                part,
+                _state: token,
+                key,
             }),
         }
     }
