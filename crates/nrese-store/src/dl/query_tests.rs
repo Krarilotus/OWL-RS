@@ -710,8 +710,9 @@ fn a_store_without_annotation_axioms_or_equality_is_marked_without_the_ontology(
 
 /// With the consistency check off, a commit reads no ontology, so its revision has no
 /// record of what the reader left out. Committed reads at that revision (a plan, EXPLAIN,
-/// the inferred statements alone) are each told the same mark, the reader's, and their
-/// marks pass over the whole ontology at most once between them, not once per read.
+/// the inferred statements alone), one after another, are each told the same mark, the
+/// reader's, and their marks pass over the whole ontology at most once between them, not
+/// once per read. (Two that miss at once may each pass; both publish the same mark.)
 #[test]
 fn committed_reads_without_a_record_pass_over_the_ontology_at_most_once() {
     use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
