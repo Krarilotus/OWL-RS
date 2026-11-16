@@ -56,8 +56,9 @@ impl UnnamedVocabulary {
 /// class and a member, two blank nodes no rule can name. A rule with no guard carries over to
 /// any store under any mapping of those two terms, and the whole program derives at least what
 /// its guard-free part does; a program that makes things only through a guarded rule answers
-/// false, and the memberships it hides are left out with nothing in their place.
-pub fn members_are_things(program: &crate::RuleProgram) -> bool {
+/// false, and the memberships it hides are left out with nothing in their place. A process
+/// past its memory limit interrupts the question: the interruption, never an answer.
+pub fn members_are_things(program: &crate::RuleProgram) -> Result<bool, crate::delta::Interrupted> {
     let vocabulary = &mut crate::vocabulary::LocalVocabulary::default();
     let mut rules = program.rules(vocabulary).expect("checked at startup");
     rules.retain(|rule| rule.guards.is_empty());
@@ -71,8 +72,9 @@ pub fn members_are_things(program: &crate::RuleProgram) -> bool {
     input.push([class, terms.rdf_type, terms.owl_class]);
     input.push([member, terms.rdf_type, class]);
     let schema = crate::eval::Schema::owl(vocabulary);
-    let closure = crate::batch::materialise(&input, &rules, None, &schema);
-    closure.derived.contains(&[member, terms.rdf_type, thing])
+    let never = crate::eval::NEVER;
+    let closure = crate::batch::materialise_owned_until(input, &rules, None, &schema, never)?;
+    Ok(closure.derived.contains(&[member, terms.rdf_type, thing]))
 }
 
 /// The unnamed classes among `candidates` (subjects of `owl:unionOf` that are blank

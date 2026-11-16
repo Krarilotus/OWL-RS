@@ -199,12 +199,13 @@ impl Program {
         self
     }
 
-    /// This program leaving out memberships in unnamed classes nothing consumes, or not.
-    #[must_use]
-    pub fn hiding_unnamed_classes(mut self, hide: bool) -> Self {
+    /// This program leaving out memberships in unnamed classes nothing consumes, or not; or
+    /// the interruption of asking whether its rules make those classes' members things, by
+    /// the process's memory limit ([`crate::unnamed::members_are_things`]).
+    pub fn hiding_unnamed_classes(mut self, hide: bool) -> Result<Self, delta::Interrupted> {
         self.hide_unnamed_classes = hide;
-        self.things = hide && crate::unnamed::members_are_things(&self.program);
-        self
+        self.things = hide && crate::unnamed::members_are_things(&self.program)?;
+        Ok(self)
     }
 
     /// The ruleset's axiomatic triples, sorted.

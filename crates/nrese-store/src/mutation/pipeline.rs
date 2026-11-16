@@ -252,13 +252,25 @@ impl MutationPipeline {
 
         if let Some(rules) = self.reasoner.config().materialised_program() {
             // Reasoner v2: the closure goes into the inferred stack, in this transaction.
-            let program = self.program.get_or_init(|| {
-                let tx = &tx;
-                crate::reasoning::Program::compile(&rules, &|term| tx.intern(term))
-                    .hiding_unnamed_classes(self.store.config().hide_unnamed_classes)
-                    .by_representatives(self.store.config().equality_by_representatives)
-                    .storing_representatives(self.store.config().equality_compact)
-            });
+            // A compilation the process's memory interrupts refuses the commit and caches
+            // nothing: the next commit compiles again. Writers are serialised by the
+            // transaction, and the program is a function of the rules, the configuration and
+            // the dictionary's ids for the rules' constants, which never change once interned;
+            // so a second compilation is the first one's value, and whichever is set stands.
+            let program = match self.program.get() {
+                Some(program) => program,
+                None => {
+                    let config = self.store.config();
+                    let compiled = crate::reasoning::Program::compile(&rules, &|t| tx.intern(t))
+                        .hiding_unnamed_classes(config.hide_unnamed_classes)
+                        .map_err(|interrupted| {
+                            store_error(self.store.interruption_refusal(interrupted))
+                        })?
+                        .by_representatives(config.equality_by_representatives)
+                        .storing_representatives(config.equality_compact);
+                    self.program.get_or_init(|| compiled)
+                }
+            };
             // The commit's stack is read as the program keeps it, installed with it: expanded
             // over representatives from the commit that brings the store's first `owl:sameAs`.
             tx.read_equality_as(program.stored_equality());

@@ -2013,7 +2013,7 @@ impl StoreService {
         statement: [nrese_rdf::TermRef<'_>; 3],
     ) -> StoreResult<Option<Vec<crate::reasoning::InferenceStep>>> {
         let snapshot = self.engine.snapshot();
-        let program = self.bound_program(&snapshot, program);
+        let program = self.bound_program(&snapshot, program)?;
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
         };
@@ -2063,7 +2063,7 @@ impl StoreService {
         mode: crate::reasoning::JustificationMode,
     ) -> StoreResult<Option<crate::reasoning::JustificationAnswer>> {
         let snapshot = self.engine.snapshot();
-        let program = self.bound_program(&snapshot, program);
+        let program = self.bound_program(&snapshot, program)?;
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
         };
@@ -2090,12 +2090,13 @@ impl StoreService {
     }
 
     /// `program` with its constants by the snapshot's ids, without the writer: a constant
-    /// the store doesn't hold gets an id no statement uses (its rules can't fire).
+    /// the store doesn't hold gets an id no statement uses (its rules can't fire); or the
+    /// refusal of a process past its memory limit ([`Self::interruption_refusal`]).
     fn bound_program(
         &self,
         snapshot: &nrese_engine::Snapshot,
         program: nrese_reasoner::RuleProgram,
-    ) -> crate::reasoning::Program {
+    ) -> StoreResult<crate::reasoning::Program> {
         let unknown = std::cell::Cell::new(u64::MAX >> 1);
         crate::reasoning::Program::compile(&program, &|term| {
             snapshot.lookup(term).unwrap_or_else(|| {
@@ -2104,6 +2105,7 @@ impl StoreService {
             })
         })
         .hiding_unnamed_classes(self.config.hide_unnamed_classes)
+        .map_err(|interrupted| self.interruption_refusal(interrupted))
     }
 
     /// A statement by the snapshot's ids; `None` if a term isn't in the store.
@@ -2145,6 +2147,18 @@ impl StoreService {
     /// ([`nrese_exec::memory::MemoryStopCause::Unread`]).
     pub(crate) fn memory_stop(&self) -> MemoryStop {
         MemoryStop::of(self.process_memory_bytes())
+    }
+
+    /// The refusal of an operation the process's memory `interrupted` before it reasoned (a
+    /// program's compilation, [`crate::reasoning::Program::hiding_unnamed_classes`]), as
+    /// [`MemoryStop::error`] names it; nothing of the operation is applied.
+    pub(crate) fn interruption_refusal(
+        &self,
+        interrupted: nrese_reasoner::delta::Interrupted,
+    ) -> crate::StoreError {
+        let limit = nrese_exec::memory::process_limit().unwrap_or(0);
+        let refusal = self.memory_stop().error(interrupted);
+        refusal.unwrap_or(crate::StoreError::ProcessMemoryLimit { limit })
     }
 
     /// A part of the process's budget ([`crate::Runtime::memory`]) of its own, for what
@@ -2201,6 +2215,7 @@ impl StoreService {
         let program =
             crate::reasoning::Program::compile(rules, &|term| rematerialisation.intern(term))
                 .hiding_unnamed_classes(self.config.hide_unnamed_classes)
+                .map_err(|interrupted| self.interruption_refusal(interrupted))?
                 .by_representatives(self.config.equality_by_representatives)
                 .storing_representatives(self.config.equality_compact);
         let memory = self.memory_stop();
