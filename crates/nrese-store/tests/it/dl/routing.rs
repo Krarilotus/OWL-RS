@@ -9,10 +9,11 @@ use std::sync::Arc;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_sparql::Completeness;
 use nrese_store::{
-    MutationError, MutationPipeline, RejectKind, StatementOp, StoreConfig, StoreService,
+    DlAnswers, MutationError, MutationPipeline, RejectKind, StatementOp, StoreConfig, StoreError,
+    StoreService,
 };
 
-use super::queries::query;
+use super::queries::{query, query_with};
 use super::versions::{in_transaction, ntriples};
 use super::{insert, pipeline};
 
@@ -1604,6 +1605,80 @@ fn a_clash_through_a_long_property_chain_is_rejected() {
                 dl.store().dl_bounds().last,
                 dl.store().dl().status().map(|s| s.consistency)
             ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `:K`'s key of `n` object properties `:k1 … :kn`, `:x` and `:y` named members of `:K` with
+/// the same value on each, and `:y :tag :z`.
+fn tagged_key(n: usize) -> String {
+    let mut data = format!(
+        ":K a owl:Class ; owl:hasKey {} . :tag a owl:ObjectProperty . \
+         :x a owl:NamedIndividual, :K . :y a owl:NamedIndividual, :K ; :tag :z .",
+        properties("k", n)
+    );
+    for i in 1..=n {
+        data.push_str(&format!(
+            " :k{i} a owl:ObjectProperty . :x :k{i} :v{i} . :y :k{i} :v{i} ."
+        ));
+    }
+    data
+}
+
+/// prp-key (OWL 2 Profiles §4.3; `HasKey` in the Direct Semantics): the key equates the two
+/// named members of `:K`, so `:x :tag :z` is entailed and no member of `:K` lacks a `:tag`
+/// of `:z`. With 127 key properties the rules build the key and the read stays on the RL
+/// route; with 128 they leave it out, and the read leaves the route. Each read is judged
+/// answer first: the entailed answer, or a status that withholds what the answer gets
+/// wrong (`complete: false` for a missing `true`, `sound: false` for a row the entailment
+/// doesn't hold); an exact read answers `true` or is refused.
+#[test]
+fn a_key_the_rules_leave_out_leaves_no_wrong_answer_told_right() {
+    let ask = "ASK { :x :tag :z }";
+    let negated = "SELECT ?x { ?x a :K FILTER NOT EXISTS { ?x :tag :z } }";
+    let mut wrong = Vec::new();
+    for n in [127, 128] {
+        for path in ["commit", "read"] {
+            let dl = pipeline();
+            if path == "commit" {
+                insert(&dl, &tagged_key(n)).expect("an RL ontology");
+            } else {
+                let turtle = format!("{}{}", super::PREFIXES, tagged_key(n));
+                crate::support::load_past_the_pipeline(dl.store(), &turtle);
+                dl.store().rematerialise(rl_rules()).expect("rebuilt");
+            }
+            let (answer, asked) = query(&dl, ask);
+            let route = dl.store().dl_bounds().last;
+            let exact = match query_with(&dl, ask, Some(DlAnswers::Exact)) {
+                Ok((rows, _)) => rows.join(","),
+                Err(StoreError::Incomplete(_)) => "refused".to_owned(),
+                Err(e) => format!("{e:?}"),
+            };
+            let (rows, read) = query(&dl, negated);
+            let line = format!(
+                "key {n}, {path}: route {route}; ask {answer:?} sound {} complete {}; \
+                 exact {exact}; negated {rows:?} sound {} complete {}",
+                asked.shared.sound, asked.shared.complete, read.shared.sound, read.shared.complete
+            );
+            eprintln!("{line}");
+            eprintln!(
+                "  reasons: ask {:?}; negated {:?}",
+                asked.reasons(),
+                read.reasons()
+            );
+            let entailed = answer == ["true"];
+            let honest = if n <= 127 {
+                route == "rules" && entailed && exact == "true" && rows.is_empty()
+            } else {
+                route != "rules"
+                    && (entailed || !asked.shared.complete)
+                    && (exact == "true" || exact == "refused")
+                    && (rows.is_empty() || !read.shared.sound)
+            };
+            if !honest {
+                wrong.push(line);
+            }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
