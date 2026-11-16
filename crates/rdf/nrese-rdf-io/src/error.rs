@@ -27,6 +27,11 @@ pub struct RdfSyntaxError {
     lines: bool,
 }
 
+/// The longest text of a skipped statement a consumer keeps whole (a quarantine), and so the
+/// most a recovering Turtle or TriG parser reads ahead for a string's closing quote: a
+/// statement longer than that can't be kept, and past it the error ends the document.
+pub const MAX_STATEMENT_TEXT: usize = 1 << 20;
+
 /// The statement a syntax error is in: where it is in the document, and what reading it
 /// again on its own needs. A recovering parser ([`crate::RdfParser::recovering`]) goes
 /// on after it. Known for the line formats and for Turtle and TriG; built only for an

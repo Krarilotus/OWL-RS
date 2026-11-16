@@ -46,7 +46,7 @@ const PARTIAL: &str = "partial";
 /// Quarantined statements a load report names (the first in its files' order).
 pub const EXAMPLES: usize = 5;
 /// The longest text kept of one statement; a longer one is kept truncated, and marked so.
-const MAX_TEXT: u64 = 1 << 20;
+const MAX_TEXT: u64 = nrese_rdf_io::MAX_STATEMENT_TEXT as u64;
 /// Quarantined statements logged one by one (the rest are only counted).
 const LOGGED: u64 = 20;
 
