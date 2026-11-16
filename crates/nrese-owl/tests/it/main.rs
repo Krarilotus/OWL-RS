@@ -404,6 +404,38 @@ ex:p a owl:DatatypeProperty . owl:topDataProperty rdfs:subPropertyOf ex:p .
     assert_eq!(n.unsupported.len(), 1);
 }
 
+/// OWL 2 RL's rules read only max cardinalities (cls-maxc1/2, cls-maxqc1-4), and only as
+/// the RDF mapping writes them: a max or max-qualified one spelled otherwise is marked
+/// (`Ontology::noncanonical_cardinality`, which the RL route and the rewriting's status read).
+/// The mapping's spelling isn't, and neither is an exact or min one, whose spelling no rule
+/// reads, so plain `owl:cardinality 1` gives no `CardinalitySpelling` hazard.
+#[test]
+fn only_a_max_cardinality_the_rules_dont_read_is_marked() {
+    for (restriction, marked) in [
+        ("owl:maxCardinality 1", true),
+        ("owl:maxCardinality \"01\"^^xsd:nonNegativeInteger", true),
+        ("owl:maxQualifiedCardinality 1 ; owl:onClass ex:D", true),
+        ("owl:maxCardinality \"1\"^^xsd:nonNegativeInteger", false),
+        ("owl:cardinality 1", false),
+        ("owl:minCardinality 1", false),
+    ] {
+        let mut table = Table::default();
+        let statements = load(
+            &mut table,
+            &format!(
+                "ex:p a owl:ObjectProperty . ex:D a owl:Class .
+                 ex:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p ; {restriction} ] ."
+            ),
+        );
+        let ontology = read(&statements, &table);
+        assert_eq!(
+            ontology.noncanonical_cardinality.is_some(),
+            marked,
+            "{restriction}"
+        );
+    }
+}
+
 #[test]
 fn malformed_input_is_reported() {
     let mut table = Table::default();
