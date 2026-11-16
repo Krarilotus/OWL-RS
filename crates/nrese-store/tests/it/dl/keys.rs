@@ -296,30 +296,39 @@ fn a_key_binds_an_anonymous_individual_equal_to_a_named_one() {
 /// AsymmetricObjectProperty, and DisjointObjectProperties", and `HasKey` is not among them.
 /// So a key reads the values a property chain implies. `:x :p1 :b` and `:b :p2 :z` give
 /// `:x :p3 :z` by the chain `:p1 o :p2`; `:y :p3 :z` shares the value, so the key on `:C`
-/// makes `:x` and `:y` the same, and the answer is complete. HermiT answers "not entailed"
-/// here: the reference misses it, and the store must not be changed to agree. On the rules
-/// route and off it (with `OUTSIDE_RL`), in both equality modes.
+/// makes `:x` and `:y` the same, and `:x` is in `:D` as `:y` is, complete. HermiT answers
+/// "not entailed" here: the reference misses it, and the store must not be changed to
+/// agree. On the rules route and off it (with `OUTSIDE_RL`), in both equality modes. The
+/// `owl:sameAs` read answers `true` on both routes; it is complete off the rules route
+/// only, because on it a read of the `owl:` vocabulary is never complete (OWL 2 entails
+/// statements of it that no closure holds in full).
 #[test]
 fn a_key_reads_a_value_a_property_chain_implies() {
     let data = ":p1 a owl:ObjectProperty . :p2 a owl:ObjectProperty . \
          :p3 a owl:ObjectProperty ; owl:propertyChainAxiom ( :p1 :p2 ) . \
-         :C a owl:Class ; owl:hasKey ( :p3 ) . \
+         :C a owl:Class ; owl:hasKey ( :p3 ) . :D a owl:Class . \
          :x a owl:NamedIndividual , :C ; :p1 :b . :b a owl:NamedIndividual ; :p2 :z . \
-         :y a owl:NamedIndividual , :C ; :p3 :z . :z a owl:NamedIndividual .";
+         :y a owl:NamedIndividual , :C , :D ; :p3 :z . :z a owl:NamedIndividual .";
     let mut wrong = Vec::new();
     for (more, rules) in [("", true), (OUTSIDE_RL, false)] {
         for compact in [false, true] {
             let dl = store(compact);
             insert(&dl, &format!("{data} {more}")).expect("consistent");
             let route = dl.store().dl_bounds().last;
-            let (rows, status) = query(&dl, "ASK { :x owl:sameAs :y }");
-            let line = format!(
-                "{more} / compact {compact}, route {route}: answers {rows:?}, complete {}",
-                status.is_complete()
-            );
-            eprintln!("{line}");
-            if rows != ["true"] || !status.is_complete() || (route == "rules") != rules {
-                wrong.push(line);
+            for read in ["ASK { :x a :D }", "ASK { :x owl:sameAs :y }"] {
+                let (rows, status) = query(&dl, read);
+                let line = format!(
+                    "{more} / compact {compact}, route {route}: {read} answers {rows:?}, complete {}",
+                    status.is_complete()
+                );
+                eprintln!("{line}");
+                let complete = !(rules && read.contains("sameAs"));
+                if rows != ["true"]
+                    || (complete && !status.is_complete())
+                    || (route == "rules") != rules
+                {
+                    wrong.push(line);
+                }
             }
         }
     }
