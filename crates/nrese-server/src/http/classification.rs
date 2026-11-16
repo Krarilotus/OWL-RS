@@ -144,18 +144,23 @@ pub async fn classify(
         move |stop| store.classify_until(&scope, stop),
     )
     .await?;
-    #[cfg(test)]
-    tests::built(true);
-    let mut text = report
-        .outside
-        .as_ref()
-        .map_or_else(String::new, outside_comment);
-    text.push_str(&triples_head(&report.consistency));
-    for (sub, sup) in &report.subsumptions {
-        text.push_str(&format!("<{sub}> <{SUB_CLASS_OF}> <{sup}> .\n"));
-    }
-    for class in &report.unsatisfiable {
-        text.push_str(&format!("<{class}> <{SUB_CLASS_OF}> <{NOTHING}> .\n"));
+    let status = completeness(&report.incomplete, report.outside.clone());
+    // Only the form asked for is built: each holds about as much memory as the answer (D16-700).
+    if wants_triples(headers) {
+        #[cfg(test)]
+        tests::built(true);
+        let mut text = report
+            .outside
+            .as_ref()
+            .map_or_else(String::new, outside_comment);
+        text.push_str(&triples_head(&report.consistency));
+        for (sub, sup) in &report.subsumptions {
+            text.push_str(&format!("<{sub}> <{SUB_CLASS_OF}> <{sup}> .\n"));
+        }
+        for class in &report.unsatisfiable {
+            text.push_str(&format!("<{class}> <{SUB_CLASS_OF}> <{NOTHING}> .\n"));
+        }
+        return respond(true, text, serde_json::Value::Null, &status);
     }
     #[cfg(test)]
     tests::built(false);
@@ -180,8 +185,7 @@ pub async fn classify(
             "not_guaranteed": outside.not_guaranteed,
         });
     }
-    let status = completeness(&report.incomplete, report.outside);
-    respond(wants_triples(headers), text, json, &status)
+    respond(false, String::new(), json, &status)
 }
 
 pub async fn realise(
@@ -195,13 +199,17 @@ pub async fn realise(
         store.realise_until(&scope, stop)
     })
     .await?;
-    #[cfg(test)]
-    tests::built(true);
-    let mut text = triples_head(&report.consistency);
-    for (individual, types) in &report.types {
-        for class in types {
-            text.push_str(&format!("<{individual}> <{RDF_TYPE}> <{class}> .\n"));
+    let status = completeness(&report.incomplete, None);
+    if wants_triples(headers) {
+        #[cfg(test)]
+        tests::built(true);
+        let mut text = triples_head(&report.consistency);
+        for (individual, types) in &report.types {
+            for class in types {
+                text.push_str(&format!("<{individual}> <{RDF_TYPE}> <{class}> .\n"));
+            }
         }
+        return respond(true, text, serde_json::Value::Null, &status);
     }
     #[cfg(test)]
     tests::built(false);
@@ -221,8 +229,7 @@ pub async fn realise(
         "micros": report.micros,
         "types": types,
     });
-    let status = completeness(&report.incomplete, None);
-    respond(wants_triples(headers), text, json, &status)
+    respond(false, String::new(), json, &status)
 }
 
 #[cfg(test)]
