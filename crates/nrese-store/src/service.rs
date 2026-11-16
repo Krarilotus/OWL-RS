@@ -2483,6 +2483,53 @@ mod certificate_tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    /// A bulk load clears the certificate before it publishes, never after: one whose clearing
+    /// fails (the marker can't be removed) publishes nothing, so the certificate is never left
+    /// over the load's data, in the process or after a reopen. Published first, the load's
+    /// data would be served and on disk under the old marker.
+    #[test]
+    fn a_load_that_cannot_clear_the_certificate_publishes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (a, b) = files(dir.path());
+        let store_dir = dir.path().join("store");
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        load(&store, &a);
+        store.rematerialise(rdfs()).unwrap();
+        crate::metadata::tests::FAIL_REMOVE.set(true);
+        let failed = store.bulk_load(&crate::BulkLoadRequest {
+            files: vec![b],
+            replace: false,
+            graph: crate::GraphTarget::DefaultGraph,
+            invalid: None,
+        });
+        crate::metadata::tests::FAIL_REMOVE.set(false);
+        let mut wrong = Vec::new();
+        if failed.is_ok() {
+            wrong.push("the load succeeded without clearing the certificate".to_owned());
+        }
+        let mut certified_over_it = |store: &StoreService, when: &str| {
+            let answer = store
+                .execute_query_str(
+                    "ASK { <http://example.com/C> \
+                     <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://example.com/D> }",
+                )
+                .unwrap();
+            let published = String::from_utf8_lossy(&answer.payload).contains("true");
+            let current = store.reasoning_is_current(rdfs());
+            eprintln!("{when}: the load's data published {published}, RDFS current {current}");
+            if published && current {
+                wrong.push(format!(
+                    "{when}: the load's data published under the certificate"
+                ));
+            }
+        };
+        certified_over_it(&store, "in process");
+        drop(store);
+        let store = StoreService::new(StoreConfig::on_disk(&store_dir)).unwrap();
+        certified_over_it(&store, "after a reopen");
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// The QL schema is part of the certificate (sol-loop r1, S3): a bulk load between a QL
     /// setting's read of the certificate and its installing the rewriting. The rewriting
     /// relies on the `owl2-rl` closure; once the load leaves no certificate, none may be
