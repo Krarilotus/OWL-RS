@@ -2063,3 +2063,42 @@ fn a_readers_status_doesnt_follow_what_they_cant_read() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// OWL 2 doesn't define triple terms, so its regimes can't say what a complete answer over a
+/// typed value inside one is: `<<( :s :age "07"^^xsd:integer )>>` is the stored
+/// `<<( :s :age 7 )>>` if the value counts, and isn't if the spelling does. Spec: a query that
+/// matches a typed literal inside a triple term, written in its pattern or bound by `VALUES`,
+/// isn't `complete`, run and planned, under each regime that promises `complete`; one that
+/// matches a plain string inside one keeps its row and `complete`.
+#[test]
+fn a_typed_value_inside_a_triple_term_is_never_complete() {
+    let data = ":a :says <<( :s :age 7 )>> . :b :says <<( :s :name \"Rex\" )>> .";
+    let typed = "<<( :s :age \"07\"^^xsd:integer )>>";
+    let cases = [
+        (
+            "a typed constant",
+            format!("SELECT ?x {{ ?x :says {typed} }}"),
+        ),
+        (
+            "a typed constant bound by VALUES",
+            format!("SELECT ?x {{ VALUES ?t {{ {typed} }} ?x :says ?t }}"),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        let store = store(data);
+        for (case, read) in &cases {
+            let (rows, status) = answer(&store, read);
+            eprintln!("{regime}, {case}: {rows} {status:?}");
+            if status.contains(&"complete") {
+                wrong.push(format!("{regime}, {case}: {rows} {status:?}"));
+            }
+        }
+        let (rows, status) = answer(&store, "SELECT ?x { ?x :says <<( :s :name \"Rex\" )>> }");
+        eprintln!("{regime}, a plain string: {rows} {status:?}");
+        if !rows.contains("example.com/b\"") || status != ["complete"; 2] {
+            wrong.push(format!("{regime}, a plain string: {rows} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
