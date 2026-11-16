@@ -14,9 +14,10 @@
 //! - **Bad statements** ([`InvalidStatements`]). By default a statement with a syntax error
 //!   goes into the repository's quarantine ([`crate::quarantine`]) and the load goes on: a
 //!   line of N-Triples or N-Quads, a statement of Turtle or TriG up to its `.`, the rest of
-//!   an RDF/XML node element below `rdf:RDF`, a top-level node object of JSON-LD. Other
-//!   formats, malformed XML or JSON, still stop; a read error always does. Strict, the
-//!   first stops the load.
+//!   an RDF/XML node element below `rdf:RDF`, a top-level node object of JSON-LD. An error
+//!   after which the parser reads no further stops the load, nothing committed: malformed
+//!   XML or JSON, any error in N3 or Binary RDF, a file that ends inside a statement (it may
+//!   be cut off), and a read error. Strict, the first error stops the load.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -81,9 +82,11 @@ struct Skipping<'c, 'q> {
 }
 
 impl Skipping<'_, '_> {
-    /// `Ok` (quarantined) for a syntax error, the error otherwise.
+    /// `Ok` (quarantined) for a syntax error the parser reads on after, the error otherwise:
+    /// skipping one that ends its document would load its first part as the whole.
     fn skip(&self, error: RdfParseError) -> StoreResult<()> {
         match error {
+            error if error.ends_document() => Err(error.into()),
             RdfParseError::Syntax(syntax) => self.collector.add(self.file, &syntax),
             error => Err(error.into()),
         }
@@ -130,8 +133,8 @@ pub(crate) fn bulk_load(
     progress: &LoadProgress,
     invalid: InvalidStatements,
     quarantine: &Quarantine,
-    // Clears the reasoning certificate once the load holds the writer slot: a load doesn't
-    // maintain the inferences.
+    // Clears the reasoning certificate under the load's writer slot as it publishes: a load
+    // doesn't maintain the inferences.
     invalidate: &dyn Fn(nrese_engine::WriterHeld<'_>) -> StoreResult<()>,
 ) -> StoreResult<BulkLoadReport> {
     let started = Instant::now();
@@ -146,9 +149,8 @@ pub(crate) fn bulk_load(
         false => BulkMode::Append,
     };
     let load = engine.bulk_load(mode);
-    invalidate(load.writer())?;
     #[cfg(test)]
-    crate::service::hooks::run(&crate::service::hooks::AFTER_INVALIDATION);
+    crate::service::hooks::run(&crate::service::hooks::BEFORE_LOAD_READS);
     let blank_nodes = BlankNodeScope::new(engine.snapshot().revision());
     let collector = match invalid {
         InvalidStatements::Strict => None,
@@ -190,7 +192,21 @@ pub(crate) fn bulk_load(
     if progress.is_cancelled() {
         return Err(StoreError::LoadCancelled);
     }
-    let summary = load.finish();
+    // The certificate goes as part of the publication, never at the load's start: a load
+    // that stops or adds nothing keeps it. First the certificate, then the data: its marker's
+    // removal is synced before the checkpoint is written, and the marker holds no revision.
+    // A crash or a reader in between finds the old data without a certificate; never one
+    // over data it wasn't computed for. A checkpoint that then fails leaves the old data
+    // without one: the safe side (reasoning has to run again, and the store says so).
+    let summary = load.finish_with(|writer| {
+        invalidate(writer).map_err(|error| match error {
+            StoreError::Io(error) => nrese_engine::EngineError::Io(error),
+            error => nrese_engine::EngineError::Io(std::io::Error::other(error.to_string())),
+        })?;
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::AFTER_INVALIDATION);
+        Ok(())
+    });
     memory::release_all();
     let summary = summary?;
     // Committed: so is its quarantine.

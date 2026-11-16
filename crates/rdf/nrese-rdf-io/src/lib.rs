@@ -34,7 +34,9 @@ mod oracle;
 #[path = "../tests/it/recovery_inputs.rs"]
 mod recovery_inputs;
 
-pub use error::{RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition};
+pub use error::{
+    MAX_STATEMENT_TEXT, RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition,
+};
 pub use format::RdfFormat;
 pub use ntriples::parse_term;
 pub use parser::{QuadParser, RdfParser};

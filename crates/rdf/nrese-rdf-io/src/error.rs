@@ -20,7 +20,17 @@ pub struct RdfSyntaxError {
     location: Range<TextPosition>,
     /// The statement it is in, where the parser knows it.
     statement: Option<Box<SkippedStatement>>,
+    /// Nothing of the document after it is read; `cut`: it ended inside a statement. `lines`:
+    /// the location's line and column are known (RDF/XML and Binary RDF keep the offset only).
+    ends: bool,
+    cut: bool,
+    lines: bool,
 }
+
+/// The longest text of a skipped statement a consumer keeps whole (a quarantine), and so the
+/// most a recovering Turtle or TriG parser reads ahead for a string's closing quote: a
+/// statement longer than that can't be kept, and past it the error ends the document.
+pub const MAX_STATEMENT_TEXT: usize = 1 << 20;
 
 /// The statement a syntax error is in: where it is in the document, and what reading it
 /// again on its own needs. A recovering parser ([`crate::RdfParser::recovering`]) goes
@@ -44,7 +54,21 @@ impl RdfSyntaxError {
             message: message.into(),
             location,
             statement: None,
+            ends: false,
+            cut: false,
+            lines: true,
         }
+    }
+
+    /// The error with its location's offset only: no line or column it doesn't know.
+    pub(crate) fn without_lines(mut self) -> Self {
+        self.lines = false;
+        self
+    }
+
+    /// Whether its location's line and column are known; its text says what is otherwise.
+    pub fn knows_lines(&self) -> bool {
+        self.lines
     }
 
     pub fn message(&self) -> &str {
@@ -78,16 +102,18 @@ impl RdfSyntaxError {
     }
 }
 
+const CUT: &str = "; the document ends inside a statement, so it may be cut off";
+
 impl fmt::Display for RdfSyntaxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let start = self.location.start;
-        write!(
-            f,
-            "line {}, column {}: {}",
-            start.line + 1,
-            start.column + 1,
-            self.message
-        )
+        let cut = if self.cut { CUT } else { "" };
+        match (self.lines, start.offset) {
+            (true, _) => write!(f, "line {}, column {}: ", start.line + 1, start.column + 1)?,
+            (false, 0) => {}
+            (false, offset) => write!(f, "byte {offset}: ")?,
+        }
+        write!(f, "{}{cut}", self.message)
     }
 }
 
@@ -98,6 +124,30 @@ pub enum RdfParseError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Syntax(#[from] RdfSyntaxError),
+}
+
+impl RdfParseError {
+    /// Whether the parser reads nothing of the document after this error (a read error
+    /// always): skipping it would take the document's first part for the whole.
+    pub fn ends_document(&self) -> bool {
+        !matches!(self, Self::Syntax(error) if !error.ends)
+    }
+
+    /// The error, as the document's last if `ends`; `cut`: the document ended inside the
+    /// statement, whose start it then shows.
+    pub(crate) fn ending(self, ends: bool, cut: bool) -> Self {
+        match self {
+            Self::Syntax(mut error) if ends => {
+                error.ends = true;
+                if cut && let Some(statement) = &error.statement {
+                    error.location.start = statement.span.start;
+                }
+                error.cut |= cut;
+                Self::Syntax(error)
+            }
+            other => other,
+        }
+    }
 }
 
 impl From<RdfParseError> for io::Error {
