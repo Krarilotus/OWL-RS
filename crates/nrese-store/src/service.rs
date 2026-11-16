@@ -7,7 +7,7 @@ use nrese_sparql::CancellationToken;
 use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, export_dataset};
 use crate::bulk_load::{BulkLoadReport, BulkLoadRequest, bulk_load};
 use crate::config::{StoreConfig, StoreMode};
-use crate::dl::query::{Revision, answer, plan_status};
+use crate::dl::query::{Revision, answer, certify_closure, plan_status};
 use crate::error::StoreResult;
 use crate::graph_store::{
     GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport, GraphWriteRequest,
@@ -802,11 +802,11 @@ impl StoreService {
     /// holds triple terms) announce it ([`PreparedQuery::announce_rdf12`]).
     pub fn prepare_query(&self, request: &SparqlQueryRequest) -> StoreResult<PreparedQuery> {
         let mut prepared = PreparedQuery::parse_with(request, Some(&self.namespaces.all()))?;
-        if prepared.uses_rdf12()
+        if PreparedQuery::uses_rdf12(prepared.query())
             || self
                 .engine
                 .snapshot()
-                .holds_triple_terms(prepared.read_model())
+                .holds_triple_terms(prepared.read_model(), |_| true)
         {
             prepared.announce_rdf12();
         }
@@ -1296,7 +1296,7 @@ impl StoreService {
         if matches!(at, Revision::Pending(..)) {
             crate::dl::query::negation_rule(&mut status, reads, source);
         } else if certificate.dl {
-            crate::dl::query::certify(&mut status, reads, "dl", decided);
+            crate::dl::query::certify(&mut status, reads, "dl", decided, Some(at.snapshot()));
         }
         Some(status)
     }
@@ -1343,7 +1343,7 @@ impl StoreService {
                         .to_owned(),
                 );
             }
-            crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
+            certify_closure(&mut status, prepared.reads(), "dl", Some(at.snapshot()));
             return Some(status);
         }
         let ruleset = certificate.state.ruleset.clone();
@@ -1357,7 +1357,7 @@ impl StoreService {
                  certain answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
             ),
         );
-        crate::dl::query::certify_closure(&mut status, prepared.reads(), "rules");
+        certify_closure(&mut status, prepared.reads(), "rules", Some(at.snapshot()));
         Some(status)
     }
 
@@ -1531,7 +1531,7 @@ impl StoreService {
         if let nrese_sparql::ql::Printed::Query { completeness, .. } = &mut printed {
             completeness.regime = Some(nrese_sparql::Regime::Owl2Rl);
             let reads = crate::dl::query::Reads::default();
-            crate::dl::query::certify_closure(completeness, (&query, &reads), "ql");
+            certify_closure(completeness, (&query, &reads), "ql", Some(&snapshot));
         }
         Ok(printed)
     }

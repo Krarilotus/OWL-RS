@@ -1,6 +1,6 @@
 # Benchmark status
 
-Generated 2026-11-11 by `python benches/suite/suite.py status --write` from [suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run records in [runs/](runs/README.md). Don't edit it by hand: change those and regenerate. How to read and extend it: [README.md](README.md).
+Generated 2026-11-16 by `python benches/suite/suite.py status --write` from [suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run records in [runs/](runs/README.md). Don't edit it by hand: change those and regenerate. How to read and extend it: [README.md](README.md).
 
 ## At a glance
 
@@ -728,7 +728,7 @@ Each contender's home-turf cases, whether they can run here and its newest verdi
 
 | Contender | Home-turf cases | Runnable here | Newest verdict on its home turf |
 |---|---|---|---|
-| qlever | q-large-result, text-search, clients-sweep, cache-replay, sparqloscope-dblp | yes; cache-replay: no content check (not timed); sparqloscope-dblp: no content check (not timed) | q-large-result: not measured; text-search: not measured; clients-sweep: win 2026-10-10†; cache-replay: not measured; sparqloscope-dblp: not measured |
+| qlever | q-large-result, text-search, clients-sweep, cache-replay, sparqloscope-dblp | yes; cache-replay: no content check (not timed); sparqloscope-dblp: declared memory-limit; sparqloscope-dblp: no content check (not timed) | q-large-result: not measured; text-search: not measured; clients-sweep: win 2026-10-10†; cache-replay: not measured; sparqloscope-dblp: not measured |
 | oxigraph | open-first-query, watdiv-10m | yes; watdiv-10m: no content check (not timed) | open-first-query: not measured; watdiv-10m: not measured |
 | virtuoso | clients-lookups, writes-under-readers, bsbm-explore-100m, bsbm-bi-100m | yes; bsbm-explore-100m: no content check (not timed); bsbm-bi-100m: no content check (not timed) | clients-lookups: tie 2026-10-10†; writes-under-readers: not measured; bsbm-explore-100m: not measured; bsbm-bi-100m: not measured |
 | jena | horst-lubm10, load-entities, watdiv-100m | yes; horst-lubm10: no content check (not timed); watdiv-100m: no content check (not timed) | horst-lubm10: not measured; load-entities: not measured; watdiv-100m: not measured |
