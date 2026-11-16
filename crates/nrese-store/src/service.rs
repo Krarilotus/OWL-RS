@@ -578,28 +578,26 @@ impl StoreService {
         let _transition = self.certificate_transition(writer);
         #[cfg(test)]
         hooks::run(&hooks::INSIDE_INVALIDATION);
+        // The marker first, the certificate in memory once it is gone: a removal that fails
+        // fails the write before it changes anything, and leaves the certificate whole (its QL
+        // rewriting and equality setting included) over the data it was computed for. Until
+        // the write publishes, that is the data readers see.
+        if self.marker.load(Ordering::Acquire)
+            && let Some(path) = self.marker_path()
+        {
+            // The removal durable too (DUR-3): a marker back after a power loss would claim the
+            // inferred stack exact for reasoning it no longer reflects. Gone already (an
+            // earlier try whose sync failed) still needs the sync ([`crate::metadata::remove`]).
+            // Failed, the file may still be there, or its removal not durable: the next
+            // invalidation tries again (the review of 3 October 2026, A4).
+            crate::metadata::remove(&path).map_err(crate::error::StoreError::Io)?;
+        }
+        self.marker.store(false, Ordering::Release);
         self.settings
             .equality_closed
             .store(false, Ordering::Release);
         *self.settings.ql.write().unwrap_or_else(|p| p.into_inner()) = None;
         *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = None;
-        if !self.marker.swap(false, Ordering::AcqRel) {
-            return Ok(());
-        }
-        if let Some(path) = self.marker_path() {
-            // The removal durable too (DUR-3): a marker back after a power loss would claim the
-            // inferred stack exact for reasoning it no longer reflects. Gone already (an
-            // earlier try whose sync failed) still needs the sync ([`crate::metadata::remove`]).
-            match crate::metadata::remove(&path) {
-                Ok(()) => {}
-                Err(error) => {
-                    // The file may still be there, or its removal not durable: the next
-                    // invalidation tries again (the review of 3 October 2026, A4).
-                    self.marker.store(true, Ordering::Release);
-                    return Err(crate::error::StoreError::Io(error));
-                }
-            }
-        }
         Ok(())
     }
 
