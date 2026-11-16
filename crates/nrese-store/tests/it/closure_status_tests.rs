@@ -2064,15 +2064,16 @@ fn a_readers_status_doesnt_follow_what_they_cant_read() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// OWL 2 doesn't define triple terms, so its regimes can't say what a complete answer over a
-/// typed value inside one is: `<<( :s :age "07"^^xsd:integer )>>` is the stored
-/// `<<( :s :age 7 )>>` if the value counts, and isn't if the spelling does. Spec: a query that
-/// matches a typed literal inside a triple term, written in its pattern or bound by `VALUES`,
-/// isn't `complete`, run and planned, under each regime that promises `complete`; one that
-/// matches a plain string inside one keeps its row and `complete`.
+/// OWL 2 doesn't define triple terms, so its regimes can't say what a complete answer that
+/// uses one is: `<<( :s :age "07"^^xsd:integer )>>` is the stored `<<( :s :age 7 )>>` if the
+/// value counts and isn't if the spelling does, and a variable inside one joins by either.
+/// Spec: a query with a triple term, a typed or plain constant inside it, bound by `VALUES`,
+/// or with a variable inside it joined outside, isn't `complete`, run and planned, under each
+/// regime that promises `complete`.
 #[test]
-fn a_typed_value_inside_a_triple_term_is_never_complete() {
-    let data = ":a :says <<( :s :age 7 )>> . :b :says <<( :s :name \"Rex\" )>> .";
+fn no_query_with_a_triple_term_is_complete_under_owl_2() {
+    let data = ":age a owl:DatatypeProperty . :y :age \"07\"^^xsd:integer .
+        :a :says <<( :s :age 7 )>> . :b :says <<( :s :name \"Rex\" )>> .";
     let typed = "<<( :s :age \"07\"^^xsd:integer )>>";
     let cases = [
         (
@@ -2082,6 +2083,14 @@ fn a_typed_value_inside_a_triple_term_is_never_complete() {
         (
             "a typed constant bound by VALUES",
             format!("SELECT ?x {{ VALUES ?t {{ {typed} }} ?x :says ?t }}"),
+        ),
+        (
+            "a variable joined outside",
+            "SELECT ?x ?y { ?x :says <<( :s :age ?n )>> . ?y :age ?n }".to_owned(),
+        ),
+        (
+            "a plain string, which OWL 2 doesn't define inside a triple term either",
+            "SELECT ?x { ?x :says <<( :s :name \"Rex\" )>> }".to_owned(),
         ),
     ];
     let mut wrong = Vec::new();
@@ -2093,11 +2102,6 @@ fn a_typed_value_inside_a_triple_term_is_never_complete() {
             if status.contains(&"complete") {
                 wrong.push(format!("{regime}, {case}: {rows} {status:?}"));
             }
-        }
-        let (rows, status) = answer(&store, "SELECT ?x { ?x :says <<( :s :name \"Rex\" )>> }");
-        eprintln!("{regime}, a plain string: {rows} {status:?}");
-        if !rows.contains("example.com/b\"") || status != ["complete"; 2] {
-            wrong.push(format!("{regime}, a plain string: {rows} {status:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
