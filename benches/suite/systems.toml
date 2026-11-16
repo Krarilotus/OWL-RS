@@ -221,8 +221,8 @@ capabilities = [
   "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12",
 ]
 
-# Its evaluation licence was refused (AllegroGraph's too): it runs
-# nowhere, now or later. Its home turf compares NRESE with VLog and GLog on RDFox's own
+# We hold no licence for it (nor for AllegroGraph): it runs
+# nowhere here, now or later. Its home turf compares NRESE with VLog and GLog on RDFox's own
 # programs, and RDFox's published numbers are reported rows (benches/reasoning/reported).
 [rdfox]
 name = "RDFox"
