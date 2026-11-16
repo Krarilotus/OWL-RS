@@ -13,14 +13,28 @@ pub struct TextPosition {
     pub offset: u64,
 }
 
-/// Input that isn't valid in the format: what is wrong, and where.
+/// Input that isn't valid in the format: what is wrong, and where. One pointer wide: every
+/// result a parser returns, and every error it travels in, carries it.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub struct RdfSyntaxError {
+pub struct RdfSyntaxError(Box<Detail>);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Detail {
     message: String,
     location: Range<TextPosition>,
     /// The statement it is in, where the parser knows it.
-    statement: Option<Box<SkippedStatement>>,
+    statement: Option<SkippedStatement>,
+    /// Nothing of the document after it is read; `cut`: it ended inside a statement. `lines`:
+    /// the location's line and column are known (RDF/XML and Binary RDF keep the offset only).
+    ends: bool,
+    cut: bool,
+    lines: bool,
 }
+
+/// The longest text of a skipped statement a consumer keeps whole (a quarantine), and so the
+/// most a recovering Turtle or TriG parser reads ahead for a string's closing quote: a
+/// statement longer than that can't be kept, and past it the error ends the document.
+pub const MAX_STATEMENT_TEXT: usize = 1 << 20;
 
 /// The statement a syntax error is in: where it is in the document, and what reading it
 /// again on its own needs. A recovering parser ([`crate::RdfParser::recovering`]) goes
@@ -40,37 +54,51 @@ pub struct SkippedStatement {
 
 impl RdfSyntaxError {
     pub(crate) fn new(message: impl Into<String>, location: Range<TextPosition>) -> Self {
-        Self {
+        Self(Box::new(Detail {
             message: message.into(),
             location,
             statement: None,
-        }
+            ends: false,
+            cut: false,
+            lines: true,
+        }))
+    }
+
+    /// The error with its location's offset only: no line or column it doesn't know.
+    pub(crate) fn without_lines(mut self) -> Self {
+        self.0.lines = false;
+        self
+    }
+
+    /// Whether its location's line and column are known; its text says what is otherwise.
+    pub fn knows_lines(&self) -> bool {
+        self.0.lines
     }
 
     pub fn message(&self) -> &str {
-        &self.message
+        &self.0.message
     }
 
     pub fn location(&self) -> Range<TextPosition> {
-        self.location.clone()
+        self.0.location.clone()
     }
 
     /// The statement the error is in, where the parser knows it.
     pub fn statement(&self) -> Option<&SkippedStatement> {
-        self.statement.as_deref()
+        self.0.statement.as_ref()
     }
 
     pub(crate) fn with_statement(mut self, statement: SkippedStatement) -> Self {
-        self.statement = Some(Box::new(statement));
+        self.0.statement = Some(statement);
         self
     }
 
     /// The error with its lines counted from `lines` earlier: a chunk's lines are numbered
     /// from its start, the document's from the first line.
     pub(crate) fn after_lines(mut self, lines: u64) -> Self {
-        self.location.start.line += lines;
-        self.location.end.line += lines;
-        if let Some(statement) = &mut self.statement {
+        self.0.location.start.line += lines;
+        self.0.location.end.line += lines;
+        if let Some(statement) = &mut self.0.statement {
             statement.span.start.line += lines;
             statement.span.end.line += lines;
         }
@@ -78,16 +106,19 @@ impl RdfSyntaxError {
     }
 }
 
+const CUT: &str = "; the document ends inside a statement, so it may be cut off";
+
 impl fmt::Display for RdfSyntaxError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let start = self.location.start;
-        write!(
-            f,
-            "line {}, column {}: {}",
-            start.line + 1,
-            start.column + 1,
-            self.message
-        )
+        let error = &self.0;
+        let start = error.location.start;
+        let cut = if error.cut { CUT } else { "" };
+        match (error.lines, start.offset) {
+            (true, _) => write!(f, "line {}, column {}: ", start.line + 1, start.column + 1)?,
+            (false, 0) => {}
+            (false, offset) => write!(f, "byte {offset}: ")?,
+        }
+        write!(f, "{}{cut}", error.message)
     }
 }
 
@@ -98,6 +129,35 @@ pub enum RdfParseError {
     Io(#[from] io::Error),
     #[error(transparent)]
     Syntax(#[from] RdfSyntaxError),
+}
+
+// Every parse result carries this error, and the store's errors and a mutation's carry it in
+// turn: it stays two pointers wide, a read error or the syntax error behind its box.
+const _: () = assert!(std::mem::size_of::<RdfParseError>() <= 16);
+
+impl RdfParseError {
+    /// Whether the parser reads nothing of the document after this error (a read error
+    /// always): skipping it would take the document's first part for the whole.
+    pub fn ends_document(&self) -> bool {
+        !matches!(self, Self::Syntax(error) if !error.0.ends)
+    }
+
+    /// The error, as the document's last if `ends`; `cut`: the document ended inside the
+    /// statement, whose start it then shows.
+    pub(crate) fn ending(self, ends: bool, cut: bool) -> Self {
+        match self {
+            Self::Syntax(mut error) if ends => {
+                let detail = &mut *error.0;
+                detail.ends = true;
+                if cut && let Some(statement) = &detail.statement {
+                    detail.location.start = statement.span.start;
+                }
+                detail.cut |= cut;
+                Self::Syntax(error)
+            }
+            other => other,
+        }
+    }
 }
 
 impl From<RdfParseError> for io::Error {

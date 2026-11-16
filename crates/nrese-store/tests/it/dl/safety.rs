@@ -267,7 +267,8 @@ const HIDDEN: [&str; 3] = [
 ];
 
 /// What `reader` is told of `q`, one line per path: the run, the exact run, EXPLAIN, the
-/// plan, the inferred statements alone, a read with an addition pending, and the store's
+/// plan, the inferred statements alone, a read with an addition pending (and its exact
+/// refusal), and the store's
 /// public status of the inferred statements alone (`status_without_dl`). Each with the rows
 /// and the status, or the refusal.
 fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<String> {
@@ -289,7 +290,7 @@ fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<
         );
         format!("{} {status:?} {:?}", rows(out), result.err())
     };
-    let pending = {
+    let pending = |mode| {
         let add = StatementOp::Add {
             data: super::versions::ntriples(
                 "<http://example.com/y> <http://example.com/r> <http://example.com/w> .",
@@ -299,7 +300,7 @@ fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<
         let (mut out, mut status) = (Vec::new(), None);
         let result = store.run_query_pending_reporting(
             &nrese_store::StatementsRequest::new(vec![add]),
-            &prepare(q, None),
+            &prepare(q, mode),
             &CancellationToken::new(),
             &mut out,
             |s| status = s,
@@ -320,7 +321,8 @@ fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<
         format!("explain: {explained:?}"),
         format!("plan: {planned:?}"),
         format!("inferred alone: {}", run(&implicit, None)),
-        format!("pending: {pending}"),
+        format!("pending: {}", pending(None)),
+        format!("pending, exact: {}", pending(Some(DlAnswers::Exact))),
         format!("status without dl: {without_dl:?}"),
     ]
 }

@@ -18,8 +18,10 @@
 //! leaves the explanation undecided, never "doesn't hold".
 
 use nrese_dl::limits::{Deadline, Limit};
+use std::collections::BTreeMap;
 use std::time::Instant;
 
+use nrese_engine::{QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_owl::{Axiom, Ontology, ProofGraph};
 
 use super::consistency::{self, Budget, Verdict};
@@ -209,8 +211,8 @@ pub(crate) fn justify_among(
 pub struct ExplainedAxiom {
     /// The axiom in the functional-style syntax.
     pub axiom: String,
-    /// Where it was read from: per graph (`None`: the default graph), the triples of its
-    /// RDF form (N-Triples terms).
+    /// Where it was read from: per graph (`None`: the default graph, first; then by IRI),
+    /// the triples of its RDF form that graph asserts (N-Triples terms).
     pub sources: Vec<(Option<String>, Vec<[String; 3]>)>,
 }
 
@@ -224,28 +226,32 @@ pub struct DlExplanation {
     pub micros: u64,
 }
 
-/// The justification's axioms with their sources, decoded.
+/// The justification's axioms with their sources, decoded: each triple of an axiom's RDF
+/// form under every graph of `snapshot` (its ontology's) that asserts it.
 pub(crate) fn explained(
     ontology: &Ontology,
     justification: &Justification,
     decode: &dyn Fn(u64) -> String,
+    snapshot: &Snapshot,
 ) -> Vec<ExplainedAxiom> {
-    justification
-        .axioms
-        .iter()
-        .map(|&i| ExplainedAxiom {
-            axiom: ontology.functional(&ontology.axioms[i], decode),
-            sources: ontology.sources[i]
-                .iter()
-                .map(|source| {
-                    let graph = (source.graph != nrese_engine::TermId::DEFAULT_GRAPH.raw())
-                        .then(|| decode(source.graph));
-                    let triples = source.triples.iter().map(|t| t.map(decode)).collect();
-                    (graph, triples)
-                })
-                .collect(),
-        })
-        .collect()
+    let explain = |i: usize| {
+        let mut sources = BTreeMap::<_, Vec<_>>::new();
+        for &triple in ontology.sources[i].iter().flat_map(|s| &s.triples) {
+            let (mut held, decoded) = (QuadPattern::all(), triple.map(decode));
+            [held.subject, held.predicate, held.object] = triple.map(|t| Some(TermId::from_raw(t)));
+            for quad in snapshot.quads_for_pattern_in(ReadModel::Asserted, &held) {
+                let graph = (!quad.graph.is_default_graph()).then(|| decode(quad.graph.raw()));
+                let triples = sources.entry(graph).or_default();
+                if !triples.contains(&decoded) {
+                    triples.push(decoded.clone());
+                }
+            }
+        }
+        let axiom = ontology.functional(&ontology.axioms[i], decode);
+        let sources = sources.into_iter().collect();
+        ExplainedAxiom { axiom, sources }
+    };
+    justification.axioms.iter().map(|&i| explain(i)).collect()
 }
 
 /// An explanation OWL 2 DL didn't decide, for `why`: an answer that can't be proven
@@ -272,7 +278,6 @@ impl crate::StoreService {
         scope: &crate::ReadScope,
         statement: [nrese_rdf::TermRef<'_>; 3],
     ) -> crate::StoreResult<Option<DlExplanation>> {
-        use nrese_engine::TermId;
         use nrese_rdf::NamedNodeRef;
         // Before any term is looked up: the refusal is the same whatever the statement, so
         // the reader can't tell a term of a hidden graph from one the store doesn't hold.
@@ -339,7 +344,7 @@ impl crate::StoreService {
                 .map_or_else(|| format!("#{t}"), |term| term.to_string())
         };
         Ok(Some(DlExplanation {
-            axioms: explained(&ontology, &justification, &decode),
+            axioms: explained(&ontology, &justification, &decode, &snapshot),
             minimal: justification.minimal,
             verified: justification.verified,
             tests: justification.tests,
