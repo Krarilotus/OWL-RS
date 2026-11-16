@@ -476,13 +476,13 @@ class FastComparison(unittest.TestCase):
 
     def test_runs_across_a_host_configuration_change_are_refused_unless_flagged(self):
         # A host registry of the test's own: hosts.toml's epochs are operational records.
-        registry = {"host": {"phuoc-yu": {"hostname": "Phuoc-Yu", "config": [{"since": "2026-10-09"},
+        registry = {"host": {"timed-a": {"hostname": "Timed-A", "config": [{"since": "2026-10-09"},
                                                                              {"since": "2026-10-12T13:00"}]}}}
         self.enterContext(patch.object(fast.hosts, "load", return_value=registry))
 
         def on(started, governor=None):
             data = report(1)
-            data["machine"] = {"host": "Phuoc-Yu", **({"governor": governor} if governor else {})}
+            data["machine"] = {"host": "Timed-A", **({"governor": governor} if governor else {})}
             data["started"] = started
             return data
         before, after = on("2026-10-12T10:51:30"), on("2026-10-12T14:00:00")
