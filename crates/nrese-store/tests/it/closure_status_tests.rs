@@ -763,3 +763,177 @@ fn owl2_dl_same_as_of_a_term_the_upper_bound_doesnt_type_is_never_complete() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// `:a0`'s value of `:d1` is the integer 2, written `"2"`; `"+2"` is another lexical form of
+/// the same value (XML Schema Datatypes, `xsd:integer`'s lexical space).
+const PLUS_TWO: &str = ":d1 a owl:DatatypeProperty . :a0 :d1 \"2\"^^xsd:integer .";
+
+/// Each `(data, read, certain)` loaded and asked, run and planned: the answer holds every
+/// IRI of `certain`, or neither status says `complete`. The wrong ones, as lines.
+fn misses_and_says_complete(
+    store: impl Fn(&str) -> StoreService,
+    cases: &[(&str, &str, &[&str])],
+) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for &(data, read, certain) in cases {
+        let (rows, status) = answer(&store(data), read);
+        let missing: Vec<_> = certain
+            .iter()
+            .filter(|t| !rows.contains(&format!("example.com/{t}\"")))
+            .collect();
+        eprintln!("{read}: missing {missing:?}, {status:?}");
+        if !missing.is_empty() && status.contains(&"complete") {
+            wrong.push(format!("{data} / {read}: missing {missing:?}, {status:?}"));
+        }
+    }
+    wrong
+}
+
+/// An `owl2-dl` store loaded with `data` in one commit.
+fn owl2_dl(data: &str) -> StoreService {
+    let dl = pipeline();
+    insert(&dl, data).expect("data");
+    dl.store().as_ref().clone()
+}
+
+/// Under the OWL 2 Direct Semantics a literal denotes its value, so a pattern's constant
+/// in another lexical form of a stored value matches it (OWL 2 Direct Semantics §2.2, the
+/// literal interpretation `⋅LT`; seed 86's `"+2"`, and seed 113's `"01"` against `"1"` and
+/// `"+1"`). Spec: an `owl2-dl` answer that misses such a match isn't `complete`, for a
+/// constant in the pattern, through `VALUES` and through `BIND`, on the RL route (`"+2"`), on
+/// the bounds' path (a key over `:d0` reads its values: seed 113), and for a value an
+/// individual holds only through an equality ([`THROUGH_EQUALITY`]).
+#[test]
+fn owl2_dl_calls_no_answer_complete_that_a_constants_other_spelling_misses() {
+    let seed_113 = ":d0 a owl:DatatypeProperty . :C0 owl:hasKey ( :d0 ) . \
+                    :a1 a :C0 ; :d0 \"1\"^^xsd:integer . :a2 a :C0 ; :d0 \"+1\"^^xsd:integer .";
+    let wrong = misses_and_says_complete(
+        owl2_dl,
+        &[
+            (THROUGH_EQUALITY, ONE_AS_PLUS_ONE, &["a0", "a1", "a2"]),
+            (THROUGH_EQUALITY, ONE_AS_ZERO_ONE, &["a0", "a1", "a2"]),
+            (
+                PLUS_TWO,
+                "SELECT ?v { ?v :d1 \"+2\"^^xsd:integer }",
+                &["a0"],
+            ),
+            (
+                PLUS_TWO,
+                "SELECT ?v { VALUES ?n { \"+2\"^^xsd:integer } ?v :d1 ?n }",
+                &["a0"],
+            ),
+            (
+                PLUS_TWO,
+                "SELECT ?v { BIND(\"+2\"^^xsd:integer AS ?n) ?v :d1 ?n }",
+                &["a0"],
+            ),
+            (
+                seed_113,
+                "SELECT ?v { ?v :d0 \"01\"^^xsd:integer }",
+                &["a1", "a2"],
+            ),
+        ],
+    );
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// [`owl2_dl_calls_no_answer_complete_that_a_constants_other_spelling_misses`] under
+/// `owl2-ql`, where the rewriting's `complete` is the same promise ("no certain answer under
+/// the OWL 2 Direct Semantics is missing", docs/spec/reasoning-semantics.md).
+#[test]
+fn owl2_ql_calls_no_answer_complete_that_a_constants_other_spelling_misses() {
+    let store = |data: &str| closure(data, Ruleset::Owl2Ql, QlRewritingMode::Auto);
+    let wrong = misses_and_says_complete(
+        store,
+        &[
+            (
+                PLUS_TWO,
+                "SELECT ?v { ?v :d1 \"+2\"^^xsd:integer }",
+                &["a0"],
+            ),
+            (THROUGH_EQUALITY, ONE_AS_PLUS_ONE, &["a0", "a1", "a2"]),
+            (THROUGH_EQUALITY, ONE_AS_ZERO_ONE, &["a0", "a1", "a2"]),
+        ],
+    );
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Seed 2577: `:a0` is in `:C2`, so it is its own `:p1` value, and `:C2` allows at most one;
+/// `:a1` and `:a2` are its `:p1` values too, so all three are one individual (OWL 2 Direct
+/// Semantics, `ObjectMaxCardinality`), and `:a1` and `:a2` hold `:a0`'s `"1"` only through
+/// that equality.
+const THROUGH_EQUALITY: &str = ":p1 a owl:ObjectProperty . :d1 a owl:DatatypeProperty . \
+     :C2 owl:equivalentClass [ a owl:Restriction ; owl:onProperty :p1 ; owl:hasValue :a0 ] ; \
+     rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p1 ; owl:maxCardinality 1 ] . \
+     :a0 a :C2 ; :p1 :a1 , :a2 ; :d1 \"1\"^^xsd:integer .";
+
+/// [`THROUGH_EQUALITY`]'s value asked in two other spellings.
+const ONE_AS_PLUS_ONE: &str = "SELECT ?v { ?v :d1 \"+1\"^^xsd:integer }";
+const ONE_AS_ZERO_ONE: &str = "SELECT ?v { ?v :d1 \"01\"^^xsd:integer }";
+
+/// The control: a string has one lexical form per value (`xsd:string`), and a language-tagged
+/// string is its own value, so matching by term is matching by value. Spec: such a constant,
+/// in the pattern or through `VALUES`, leaves the answer `complete` under `owl2-dl`, run and
+/// planned.
+#[test]
+fn a_string_constant_leaves_an_owl2_dl_answer_complete() {
+    let data = ":name a owl:DatatypeProperty . :a0 :name \"Rex\" , \"Rex\"@en .";
+    let mut wrong = Vec::new();
+    for read in [
+        "SELECT ?v { ?v :name \"Rex\" }",
+        "SELECT ?v { ?v :name \"Rex\"@en }",
+        "SELECT ?v { VALUES ?n { \"Rex\" } ?v :name ?n }",
+    ] {
+        let (rows, status) = answer(&owl2_dl(data), read);
+        eprintln!("{read}: {rows} {status:?}");
+        if !rows.contains("example.com/a0") || status != ["complete"; 2] {
+            wrong.push(format!("{read}: {rows} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The control for a typed constant that no pattern matches: bound to a variable that is
+/// only compared in a `FILTER` (which SPARQL does by value), or only projected
+/// (`(1 AS ?k)`), it misses no row, whatever its spelling. Spec: under `owl2-dl` and
+/// `owl2-ql` such an answer holds its row and is `complete`, run and planned.
+#[test]
+fn a_typed_constant_no_pattern_matches_leaves_an_answer_complete() {
+    let data = ":age a owl:DatatypeProperty . :a0 :age 7 .";
+    let ql = |data: &str| closure(data, Ruleset::Owl2Ql, QlRewritingMode::Auto);
+    let mut wrong = Vec::new();
+    for read in [
+        "SELECT ?v { ?v :age ?a BIND(5 AS ?n) FILTER(?a > ?n) }",
+        "SELECT ?v (1 AS ?k) { ?v :age ?a }",
+    ] {
+        for (regime, store) in [("owl2-dl", owl2_dl(data)), ("owl2-ql", ql(data))] {
+            let (rows, status) = answer(&store, read);
+            eprintln!("{regime} {read}: {rows} {status:?}");
+            if !rows.contains("example.com/a0") || status != ["complete"; 2] {
+                wrong.push(format!("{regime} {read}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A value the query computes and then matches against the data: `2 + 3` is the integer 5,
+/// which `:a0`'s `"05"` is too, and a copy (`BIND(?c AS ?d)`) carries the same value. Under
+/// the OWL 2 Direct Semantics `:a0` is a certain answer of both. Spec: under `owl2-dl` and
+/// `owl2-ql` an answer that misses it isn't `complete`, run and planned.
+#[test]
+fn no_answer_is_complete_that_a_computed_values_other_spelling_misses() {
+    let data = ":p a owl:DatatypeProperty . :a0 :p \"05\"^^xsd:integer .";
+    let reads: [(&str, &str, &[&str]); 2] = [
+        (data, "SELECT ?x { BIND(2 + 3 AS ?c) ?x :p ?c }", &["a0"]),
+        (
+            data,
+            "SELECT ?x { BIND(5 AS ?c) BIND(?c AS ?d) ?x :p ?d }",
+            &["a0"],
+        ),
+    ];
+    let ql = |data: &str| closure(data, Ruleset::Owl2Ql, QlRewritingMode::Auto);
+    let mut wrong = misses_and_says_complete(owl2_dl, &reads);
+    wrong.extend(misses_and_says_complete(ql, &reads));
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
