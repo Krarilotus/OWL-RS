@@ -770,47 +770,73 @@ fn data_existential(filler: &str) -> String {
     )
 }
 
-/// cls-svf1 on `:age`, which is undeclared and carries a literal: `:a` is `:Aged` (OWL 2
-/// Direct Semantics, DataSomeValuesFrom), whose premise (`5` in the filler) is dt-type2's,
-/// which the rule set leaves out. The rewriting's schema reads no assertions, so only the
-/// filler says `:age` is a data property: a datatype, or an anonymous data range (OWL 2 RL
-/// admits data intersections, Profiles §4.2.4), typed `rdfs:Datatype` or not, nested in
-/// a union too. 5 is an integer and a decimal.
+/// An undeclared property's existential, read by its filler alone (the rewriting's schema
+/// reads no assertions). The rows are OWL 2 RL's data ranges (Profiles §4.2.4, grammar in
+/// §6.3: `DataRange := Datatype | DataIntersectionOf`): a datatype of RL (§4.2.1;
+/// `rdfs:Literal`'s answer is the entailed one, see
+/// [`owl2_rl_answers_an_undeclared_data_existential_over_any_literal`]), one a
+/// DatatypeDefinition names, an intersection typed `rdfs:Datatype` or not, and one nested;
+/// then two outside RL: a union with an intersection in it, and an untyped datatype
+/// restriction. 5 is in each, so `:a :age 5` makes `:a` `:Aged` (OWL 2 Direct Semantics,
+/// DataSomeValuesFrom), by dt-type2, which the rule set leaves out: the closure's `false`
+/// is called complete in no place, with the rewriting on or not. Each row's control fills
+/// the existential on `:knows` with classes of the same shape, an object restriction the
+/// rules derive (cls-int1, cls-uni, cls-svf1): `true`, and with the rewriting on every
+/// place calls it complete (a data reading would call it so in none).
 #[test]
-fn owl2_rl_calls_no_answer_an_undeclared_data_existential_misses_complete() {
-    let wrong: Vec<String> = [
-        "xsd:integer",
-        "[ a rdfs:Datatype ; owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
-        "[ owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
-        "[ owl:unionOf ( [ owl:intersectionOf ( xsd:integer xsd:decimal ) ] xsd:string ) ]",
-    ]
-    .iter()
-    .flat_map(|filler| {
-        eprintln!("filler {filler}:");
-        let wrong = complete_anywhere(&data_existential(filler), "ASK { :a a :Aged }");
-        wrong
-            .into_iter()
-            .map(move |line| format!("{filler}: {line}"))
-    })
-    .collect();
-    assert!(wrong.is_empty(), "{wrong:#?}");
-}
-
-/// cls-int1 and cls-svf1: `:x` is `:B` and `:C`, so `:a :knows :x` makes `:a` `:Social`,
-/// and the rules derive it. `:knows` is undeclared and the filler an intersection of
-/// classes, no data range: the restriction is an object one, and with the rewriting on
-/// every place calls the `true` complete (a data reading would call it so in none).
-#[test]
-fn owl2_rl_reads_an_undeclared_object_intersection_existential_as_object() {
-    let data = ":B a owl:Class . :C a owl:Class . \
-         [ a owl:Restriction ; owl:onProperty :knows ; \
-           owl:someValuesFrom [ owl:intersectionOf ( :B :C ) ] ] rdfs:subClassOf :Social . \
-         :a :knows :x . :x a :B , :C .";
+fn owl2_rl_reads_an_undeclared_existential_by_its_filler() {
+    // (the filler's definitions, the data range, its control over classes)
+    let rows = [
+        ("", "xsd:integer", ":B"),
+        (
+            ":Number a rdfs:Datatype ; owl:equivalentClass xsd:integer .",
+            ":Number",
+            ":B",
+        ),
+        (
+            "",
+            "[ a rdfs:Datatype ; owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
+            "[ a owl:Class ; owl:intersectionOf ( :B :C ) ]",
+        ),
+        (
+            "",
+            "[ owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
+            "[ owl:intersectionOf ( :B :C ) ]",
+        ),
+        (
+            "",
+            "[ owl:intersectionOf ( [ owl:intersectionOf ( xsd:integer xsd:decimal ) ] xsd:int ) ]",
+            "[ owl:intersectionOf ( [ owl:intersectionOf ( :B :C ) ] :D ) ]",
+        ),
+        (
+            "",
+            "[ owl:unionOf ( [ owl:intersectionOf ( xsd:integer xsd:decimal ) ] xsd:string ) ]",
+            "[ owl:unionOf ( [ owl:intersectionOf ( :B :C ) ] :D ) ]",
+        ),
+        (
+            "",
+            "[ owl:onDatatype xsd:integer ; owl:withRestrictions ( [ xsd:minInclusive 1 ] ) ]",
+            ":B",
+        ),
+    ];
     let mut wrong = Vec::new();
-    for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
-        let (text, line, complete, _) = places(data, "ASK { :a a :Social }", ql);
-        if !text.contains("true") || (ql == QlRewritingMode::On && complete != 4) {
-            wrong.push(line);
+    for (definitions, range, classes) in rows {
+        eprintln!("filler {range}:");
+        let data = format!("{definitions} {}", data_existential(range));
+        let lines = complete_anywhere(&data, "ASK { :a a :Aged }");
+        wrong.extend(lines.into_iter().map(|line| format!("{range}: {line}")));
+        eprintln!("control {classes}:");
+        let control = format!(
+            ":B a owl:Class . :C a owl:Class . :D a owl:Class . \
+             [ a owl:Restriction ; owl:onProperty :knows ; owl:someValuesFrom {classes} ] \
+               rdfs:subClassOf :Social . \
+             :a :knows :x . :x a :B , :C , :D ."
+        );
+        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+            let (text, line, complete, _) = places(&control, "ASK { :a a :Social }", ql);
+            if !text.contains("true") || (ql == QlRewritingMode::On && complete != 4) {
+                wrong.push(format!("control {classes}: {line}"));
+            }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
