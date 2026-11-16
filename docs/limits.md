@@ -164,7 +164,7 @@ leave something out.
 
 ## Storage and transactions
 
-- One writer at a time, and a commit holds at most 4 GiB of log payload, about 130 M quads.
+- A commit holds at most 4 GiB of log payload, about 130 M quads.
   Larger loads go through the bulk loader
   ([storage](spec/02-storage-and-transactions.md#limits)).
 - Client transactions read the latest commit, and `SNAPSHOT` and `SERIALIZABLE` isolation are

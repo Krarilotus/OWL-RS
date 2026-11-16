@@ -120,9 +120,8 @@ default, in that order ([precedence](config-reference.md#precedence)).
   `0.0.0.0:8080` behind a TLS proxy.
 - **How it reasons:** [`reasoner.mode`](config-reference.md#reasoner) and the
   [SHACL gate](config-reference.md#shacl).
-- **An ontology at start:** `store.ontology_path` (`NRESE_ONTOLOGY_PATH`) loads a file at
-  every start. A missing file stops the start, and with the setting unset nothing is loaded,
-  whatever the working directory.
+- **An ontology at start:** [`store.ontology_path`](config-reference.md#store.ontology_path)
+  loads a file at every start.
 
 ## Behind a TLS proxy
 
@@ -363,8 +362,7 @@ huge pages back it on Linux, where one touched byte makes 2 MiB resident. In a s
 2 MiB once warm and never more than 15 MiB, while the process held about 250 to 310 MiB, within the
 about 600 MiB the allocator reserved in the first minutes. That is not a leak: the program's own
 memory stays level, and `crates/nrese-store/tests/memory_churn.rs` checks it. With `off` the same
-soak held about 100 MiB, and materialising LUBM 100 took 26 % longer. `bulk` uses huge pages only
-while a load or a materialisation runs.
+soak held about 100 MiB.
 
 `benches/probes/soak.py` reads every gauge above beside the resident memory and prints each
 one's slope.
