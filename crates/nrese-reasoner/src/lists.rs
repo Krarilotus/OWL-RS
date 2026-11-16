@@ -112,6 +112,12 @@ impl ListVocabulary {
                 .contains(&o))
     }
 
+    /// Whether a change of `fact` can change what [`instantiate`] reads: a list fact, or an
+    /// `owl:sameAs`, by whose classes a read of list facts may expand (in any equality mode).
+    pub fn is_scan_input(&self, fact: [u64; 3]) -> bool {
+        self.is_list_fact(fact) || fact[1] == self.same_as
+    }
+
     /// Every member sequence of the list starting at `head`, or why it is malformed.
     ///
     /// Equality makes a node's `rdf:first` (or `rdf:rest`) ambiguous: `eq-rep-o` copies
