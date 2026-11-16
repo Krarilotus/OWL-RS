@@ -87,7 +87,7 @@ impl AppState {
             .store()
             .unavailable_flag();
         let state = Self {
-            pipeline: Arc::clone(&repositories.default_repository().pipeline),
+            pipeline: repositories.default_repository().pipeline.clone(),
             policy: Arc::new(policy),
             repository: Arc::from(DEFAULT_REPOSITORY),
             shared: Arc::new(Shared {
