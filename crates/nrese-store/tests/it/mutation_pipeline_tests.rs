@@ -1700,6 +1700,35 @@ fn a_pending_read_leaves_the_committed_revisions_mark() {
     left_out_answer(store, &ask);
 }
 
+/// A revision read first with nothing left out is recorded clean. A commit on it then adds a
+/// key of 128 properties, past what one rule holds: the commit itself must record the key left
+/// out, as the record would otherwise carry the clean range on to the new revision unscanned.
+/// `:x :name "Y"` is entailed (the key makes `:x` and `:y` one), so a read after the commit is
+/// true or not `complete`.
+#[test]
+fn a_commit_after_a_clean_read_records_its_key_left_out() {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let write = |data: &str| {
+        let ticket = MutationTicket::new();
+        (pipeline.apply(insert(data), &nrese_store::Requester::all(), &ticket)).expect("the data");
+    };
+    let ask = format!("<{EX}x> <{EX}name> \"Y\"");
+    write(&format!("<{EX}y> <{EX}name> \"Y\" ."));
+    let clean = (pipeline.store())
+        .execute_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "ASK {{ {ask} }}"
+        )))
+        .expect("answered")
+        .completeness;
+    println!("clean read: {clean:?}");
+    assert!(
+        clean.as_ref().is_some_and(|c| c.complete),
+        "the first read must be complete, so that it records its revision clean: {clean:?}"
+    );
+    write(&long_key(128));
+    left_out_answer(pipeline.store(), &ask);
+}
+
 /// `owl2-rl` with the QL rewriting on, over a store of `config`.
 fn ql_pipeline(config: nrese_store::StoreConfig) -> MutationPipeline {
     let config = nrese_store::StoreConfig {
