@@ -1279,7 +1279,8 @@ impl StoreService {
     /// status of its `route` (the closure's, the QL report's or the bounds'), each step only
     /// taking away. A read of a version no one vouched for, or of an unpublished one passed
     /// as committed, is `not-certified`: `None` only where the version carries no
-    /// certificate, no reasoner is registered and the inferred stack is empty. Pending
+    /// certificate, no reasoner was ever registered on the store (clearing the rules
+    /// doesn't count) and the inferred stack is empty. Pending
     /// operations aren't reasoned over before the commit, and may delete what their
     /// inferences rest on. Under `owl2-dl` the question-only
     /// individuals ([`crate::dl::query::mark`]); then the negation rule again, over all that
