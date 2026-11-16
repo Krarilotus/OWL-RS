@@ -1477,6 +1477,9 @@ const PROMISING: Promising = [
 /// `:a`'s and `:b`'s value of `:age` is the integer 7, written `"07"` and `7`.
 const SEVEN: &str = ":age a owl:DatatypeProperty . :a :age \"07\"^^xsd:integer . :b :age 7 .";
 
+/// Whether rows (SPARQL JSON results) are the ones OWL 2 gives.
+type Right = fn(&str) -> bool;
+
 /// How many rows `rows` (SPARQL JSON results) binds `var` in.
 fn bound(rows: &str, var: &str) -> usize {
     rows.matches(&format!("\"{var}\":{{")).count()
@@ -1486,7 +1489,7 @@ fn bound(rows: &str, var: &str) -> usize {
 /// undeclared property), and `DISTINCT`, `GROUP BY` and `COUNT(DISTINCT)` over one. Each
 /// `(shape, data, read, right)`, `right` holding of the rows OWL 2 gives by value over
 /// [`SEVEN`]: `:a` and `:b` share their value, which is one value.
-const SHAPES: [(&str, &str, &str, fn(&str) -> bool); 5] = [
+const SHAPES: [(&str, &str, &str, Right); 5] = [
     (
         "a join",
         SEVEN,
@@ -1550,7 +1553,7 @@ fn comparing_iris_or_strings_by_term_leaves_an_answer_complete() {
     let names = ":name a owl:DatatypeProperty . :a :name \"Rex\" . :b :name \"Rex\" , \"Max\"@en .";
     let beside = ":name a owl:DatatypeProperty . :a :name \"Rex\" ; :age 7 . :b :name \"Rex\" .";
     let pair = |rows: &str| rows.contains("example.com/a\"") && rows.contains("example.com/b\"");
-    let cases: [(&str, &str, fn(&str) -> bool); 7] = [
+    let cases: [(&str, &str, Right); 7] = [
         (
             knows,
             "SELECT ?x ?y { ?x :knows ?z . ?y :knows ?z FILTER(?x != ?y) }",
@@ -1601,7 +1604,7 @@ fn comparing_iris_or_strings_by_term_leaves_an_answer_complete() {
 fn owl2_ql_keeps_complete_over_undeclared_properties_of_iris_or_strings() {
     let store = |data: &str| closure(data, Ruleset::Owl2Ql, QlRewritingMode::Auto);
     let pair = |rows: &str| rows.contains("example.com/a\"") && rows.contains("example.com/b\"");
-    let cases: [(&str, &str, fn(&str) -> bool); 4] = [
+    let cases: [(&str, &str, Right); 4] = [
         (
             ":a :q :c . :b :q :c .",
             "SELECT ?x ?y { ?x :q ?z . ?y :q ?z FILTER(?x != ?y) }",
