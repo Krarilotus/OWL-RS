@@ -335,6 +335,7 @@ impl<'e> BulkLoad<'e> {
                     equality: Default::default(),
                     // An empty inferred stack, kept by no program: read as stored.
                     reading: None,
+                    certificate: None,
                     canonical: Default::default(),
                     own: Default::default(),
                 };
@@ -395,6 +396,7 @@ impl<'e> BulkLoad<'e> {
                     equality: Default::default(),
                     // The inferred stack kept (less what is now asserted): read as before.
                     reading: current.reading,
+                    certificate: None,
                     canonical: Default::default(),
                     own: Default::default(),
                 };
@@ -621,6 +623,7 @@ fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
                 inferred,
                 equality: Arc::clone(&imaged.equality),
                 reading: imaged.reading,
+                certificate: imaged.certificate.clone(),
                 revision,
                 committed_micros,
                 dictionary_len: imaged.dictionary_len,
@@ -684,6 +687,7 @@ fn publish_streamed(
             equality: Default::default(),
             // An empty inferred stack, kept by no program: read as stored.
             reading: None,
+            certificate: None,
             canonical: Default::default(),
             own: Default::default(),
         };
@@ -763,6 +767,7 @@ fn publish_streamed(
         equality: Default::default(),
         // An empty inferred stack, kept by no program: read as stored.
         reading: None,
+        certificate: None,
         canonical: Default::default(),
         own: Default::default(),
     };
@@ -877,7 +882,7 @@ impl<'e> Rematerialisation<'e> {
     /// one it replaces ([`Self::finish_held`] gives it a reading of its own).
     pub fn finish(self, inferred: Vec<EncodedTriple>) -> EngineResult<CommitSummary> {
         let reading = self.base.version().reading;
-        self.finish_held(inferred, reading)
+        self.finish_held(inferred, reading, None)
             .map(|finished| finished.summary())
     }
 
@@ -886,12 +891,13 @@ impl<'e> Rematerialisation<'e> {
     /// before any other write can change the data they were computed over. The new stack is
     /// installed with `reading` ([`Version::reading`]), in one install: a reader reads the old
     /// stack in its reading or the new one in this. A stack whose stored rows don't change
-    /// still takes `reading`, without a new revision (`Shared::install_reading`). A failure
-    /// installs nothing.
+    /// still takes `reading`, without a new revision (`Shared::install`). The new stack
+    /// carries `certificate` ([`super::Certificate`]). A failure installs nothing.
     pub fn finish_held(
         self,
         inferred: Vec<EncodedTriple>,
         reading: Option<crate::TermId>,
+        certificate: Option<super::Certificate>,
     ) -> EngineResult<super::Finished<'e>> {
         let Self {
             engine,
@@ -935,7 +941,7 @@ impl<'e> Rematerialisation<'e> {
             asserted: base.asserted_identity(),
         };
         if inserted + deleted == 0 {
-            shared.install_reading(reading);
+            shared.install(reading, certificate);
             let summary = CommitSummary {
                 revision: base.revision(),
                 ..summary
@@ -960,6 +966,7 @@ impl<'e> Rematerialisation<'e> {
             dictionary_len: shared.dictionary.len(),
             equality: Default::default(),
             reading,
+            certificate,
             canonical: Default::default(),
             own: Default::default(),
         };

@@ -40,7 +40,7 @@ fn a_private_same_as_change_searches_its_own_classes() {
         }
         tx.insert(Quad::new(ex("filler"), ex("p"), ex("o"), ex("g")).as_ref());
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(same_as));
+        engine.transaction().install(Some(same_as), None);
         (engine, ids, same_as)
     };
     let mut failed = Vec::new();
@@ -129,7 +129,7 @@ fn a_private_removal_of_a_same_as_written_representative_first_drops_the_alias()
             }
         }
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(same_as));
+        engine.transaction().install(Some(same_as), None);
         (engine, triple)
     };
     let search = |snapshot: &Snapshot| {
