@@ -396,6 +396,55 @@ fn owl2_dl_reading_inside_a_transaction_labels_it_unsound() {
     assert_eq!(status.map(|s| s.as_str()), Some("unsound"));
 }
 
+/// The reasons a read inside a transaction gives its user, word for word: under `owl2-dl`,
+/// with an update pending that may delete, that the pending operations aren't reasoned over,
+/// and that their deletions' inferences remain until the commit.
+#[test]
+fn a_read_inside_a_transaction_gives_its_reasons_as_written() {
+    let dl = pipeline();
+    insert(&dl, SAME_AS.0).expect("data");
+    let store = dl.store();
+    let prepared = store
+        .prepare_query(&SparqlQueryRequest::all(format!("{PREFIXES}{}", SAME_AS.1)))
+        .expect("prepared");
+    let pending = StatementsRequest::new(vec![StatementOp::Update(
+        nrese_store::SparqlUpdateRequest::new(format!("{PREFIXES}DELETE DATA {{ :rex a :Dog }}")),
+    )]);
+    let (mut out, mut status) = (Vec::new(), None);
+    store
+        .run_query_pending_reporting(
+            &pending,
+            &prepared,
+            &CancellationToken::new(),
+            &mut out,
+            |s| status = s,
+        )
+        .expect("answered");
+    let reasons: Vec<_> = status
+        .expect("a status")
+        .reasons
+        .iter()
+        .map(|r| (r.source, r.text.clone()))
+        .collect();
+    for want in [
+        (
+            "dl",
+            "a read inside a transaction: its pending operations aren't reasoned over before \
+             the commit (the committed closure, no DL bounds)",
+        ),
+        (
+            "transaction",
+            "the pending operations may delete statements whose inferences remain until the \
+             commit",
+        ),
+    ] {
+        assert!(
+            reasons.iter().any(|(s, t)| (*s, t.as_str()) == want),
+            "{want:?} not in {reasons:#?}"
+        );
+    }
+}
+
 /// Spec (docs/spec/reasoning-semantics.md, `exact-refusals`): under `owl2-dl`, `exact`
 /// refuses a read of the inferred statements alone, and one inside a transaction with an
 /// addition pending, before it runs: the query never reaches the executor and writes no
