@@ -1109,7 +1109,7 @@ fn a_compact_store_under_custom_rules_reopened_answers_as_they_entail() {
 
 /// A primary under `reasoner.equality = "compact"` whose program closes equality
 /// (`RuleProgram::closes_equality`), so that its rows are stored over representatives, sends
-/// no replica its log (the replica's fail-closed form, half page point 3; master 12:15:
+/// no replica its log (the replica's fail-closed form:
 /// refused at the store): a replica would read those rows with no reading. The primary
 /// commits the type through a subclass, then `owl:sameAs`. The replica follows the log from
 /// an empty directory, between the two and after (`pulled between`) or once after both

@@ -643,7 +643,7 @@ fn bound(rows: &str) -> Vec<String> {
         .collect()
 }
 
-/// Lists each aspect of a replica's `got` that isn't a replica's (half page point 1): each
+/// Lists each aspect of a replica's `got` that isn't a replica's: each
 /// read's rows are `want`'s, a loaded store's, but, where the column's QL rewriting applies,
 /// the existential's, which only the rewriting answers and which rides on the certificate a
 /// replica doesn't carry: no row `want` lacks; its status `not-certified` where the column
@@ -683,7 +683,7 @@ fn replica_compare(cell: &str, column: &Column, got: &Seen, want: &Seen, wrong: 
     }
 }
 
-/// Spec (half page point 1, master 14:38): the replica of an inconsistent primary. The
+/// Spec: the replica of an inconsistent primary. The
 /// primary is quarantined (readable, not ready); its replica carries no consistency of its
 /// own (`Unknown`) and so is ready.
 async fn quarantine_cell(wrong: &mut Vec<String>, unmet: &mut Vec<String>) -> TestResult<()> {
@@ -916,8 +916,8 @@ async fn every_way_to_a_store_reads_as_a_loaded_store() -> TestResult<()> {
     Ok(())
 }
 
-/// Spec (the replica's fail-closed form, half page point 1 and its table; master 12:15 and
-/// 14:38): a read replica reached by each of [`REPLICA_WAYS`] under each column reads as
+/// Spec (the replica's fail-closed form):
+/// a read replica reached by each of [`REPLICA_WAYS`] under each column reads as
 /// [`replica_compare`] says, against a freshly loaded store of that column. Under a compact
 /// column ([`refused`]) the way is refused with the sentence, at its image. Across a change
 /// of its primary's rules a replica is told to start again ([`START_AGAIN`]), except under
@@ -1099,7 +1099,7 @@ async fn certificate_cell(
         let placed = replication::bootstrap(&config, &replica_dir).await;
         if route == "leftover certificate" {
             // A removed store's certificate beside an empty directory: the image isn't placed
-            // there (`place_image`; half page, its table's certificate row; master 12:15).
+            // there (`place_image`).
             // This test pins that refusal; the replica's fail-closed form doesn't make it.
             let right = placed
                 .as_ref()
