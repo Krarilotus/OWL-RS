@@ -1827,10 +1827,12 @@ fn a_pending_key_left_out_leaves_the_pending_read_not_complete() {
 /// isn't `complete` for it. Each order, on a store of its own: neither reader's answer may be
 /// the other's. The read asks `:absent`, a predicate the store doesn't hold: the QL rewriting
 /// can't read the list at `:n1` (not a blank node), and its hazard marks a query on any held
-/// term first; one on no held term is told by the list record alone.
+/// term first; one on no held term is told by the list record alone. It asks for the IRI
+/// `:Y`, not a string: a restricted reader's string comparison is never `complete` (a
+/// property may hold other values in graphs it can't read), and the row tests the record.
 #[test]
 fn two_readers_of_one_revision_are_each_told_their_own_views_lists() {
-    let ask = format!("ASK {{ <{EX}x> <{EX}absent> \"Y\" }}");
+    let ask = format!("ASK {{ <{EX}x> <{EX}absent> <{EX}Y> }}");
     for order in [["aliases", "default"], ["default", "aliases"]] {
         let pipeline = aliased_cell();
         for who in order {
@@ -1883,18 +1885,90 @@ fn a_pending_deleted_list_fact_leaves_the_pending_read_not_complete() {
 /// touches no list. Its view of the pending data drops equality's copies derived through
 /// `:secret`, as its view of the revision does, so its key's list is malformed there: the
 /// read isn't `complete` for it, though the published revision leaves no list out. It asks
-/// `:absent`, which the store doesn't hold, as in
-/// [`two_readers_of_one_revision_are_each_told_their_own_views_lists`].
+/// `:absent`, which the store doesn't hold, for the IRI `:Y`, not a string, as in
+/// [`two_readers_of_one_revision_are_each_told_their_own_views_lists`] and for its reason.
 #[test]
 fn a_restricted_pending_read_scans_its_own_view() {
     let pipeline = aliased_cell();
     let request = nrese_store::SparqlQueryRequest::new(
-        format!("ASK {{ <{EX}x> <{EX}absent> \"Y\" }}"),
+        format!("ASK {{ <{EX}x> <{EX}absent> <{EX}Y> }}"),
         by_support(Vec::new()),
     );
     let add = format!("INSERT DATA {{ <{EX}w> <{EX}name> \"W\" }}");
     let status = pending_status(pipeline.store(), request, &add);
     assert!(status.as_ref().is_some_and(list_left_out), "{status:?}");
+}
+
+/// Under compact equality, a transaction adds (RDF4J `ADD`, which deletes nothing) one
+/// `owl:sameAs` for each of a committed key's seven properties, and `:z`, which agrees with
+/// `:x` on the key. No list fact is added, but the pending data's equality gives the key's
+/// list 2^7 member sequences, more than the rules build. `:x` and `:z` are the same by the
+/// key, so `:x :name :Z` is entailed: the pending read answers it, or isn't `complete`.
+#[test]
+fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
+    let pipeline = ql_pipeline(nrese_store::StoreConfig {
+        equality_by_representatives: true,
+        equality_compact: true,
+        ..in_memory_store_config()
+    });
+    // N-Triples, for the ADD: `rdf:type` written out (it has no `a`).
+    let (owl, a) = (
+        "http://www.w3.org/2002/07/owl#",
+        "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>",
+    );
+    let property = format!("{a} <{owl}ObjectProperty>");
+    let keys: Vec<String> = (1..=7).map(|i| format!("<{EX}k{i}>")).collect();
+    let mut data = format!("<{EX}K> <{owl}hasKey> ( {} ) .", keys.join(" "));
+    data.push_str(&format!(
+        " <{EX}x> a <{EX}K> . <{EX}seed> <{EX}name> <{EX}Z> ."
+    ));
+    let mut add = format!("<{EX}z> {a} <{EX}K> .\n<{EX}z> <{EX}name> <{EX}Z> .\n");
+    for i in 1..=7 {
+        data.push_str(&format!(
+            " <{EX}k{i}> {property} . <{EX}x> <{EX}k{i}> <{EX}v{i}> ."
+        ));
+        add.push_str(&format!(
+            "<{EX}k{i}> <{owl}sameAs> <{EX}j{i}> .\n<{EX}j{i}> {property} .\n\
+             <{EX}z> <{EX}k{i}> <{EX}v{i}> .\n"
+        ));
+    }
+    (pipeline.apply(
+        insert(&data),
+        &nrese_store::Requester::all(),
+        &MutationTicket::new(),
+    ))
+    .expect("the data");
+    let store = pipeline.store();
+    let ask = format!("ASK {{ <{EX}x> <{EX}name> <{EX}Z> }}");
+    let prepared =
+        (store.prepare_query(&nrese_store::SparqlQueryRequest::all(ask))).expect("prepared");
+    let ops = vec![nrese_store::StatementOp::Add {
+        data: nrese_store::RdfPayload {
+            payload: add.into_bytes().into(),
+            format: nrese_store::GraphResultFormat::NTriples,
+            base_iri: None,
+        },
+        contexts: Vec::new(),
+    }];
+    let (mut answer, mut status) = (Vec::new(), None);
+    store
+        .run_query_pending_reporting(
+            &nrese_store::StatementsRequest::new(ops),
+            &prepared,
+            &nrese_store::CancellationToken::new(),
+            &mut answer,
+            |s| status = s,
+        )
+        .expect("the pending read");
+    let answer = String::from_utf8(answer).expect("utf8");
+    println!("pending equality read: {answer} with {status:?}");
+    assert!(
+        answer.contains("true") || status.as_ref().is_some_and(|s| !s.complete),
+        "answered without :x :name :Z and complete: {answer} with {status:?}"
+    );
+    if !answer.contains("true") {
+        assert!(status.as_ref().is_some_and(list_left_out), "{status:?}");
+    }
 }
 
 /// A key of one property whose list cell `:n1` holds nothing itself: it is the same

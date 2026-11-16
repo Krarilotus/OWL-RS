@@ -191,7 +191,9 @@ fn load_takes_a_long_intersection() -> Result<(), Box<dyn std::error::Error>> {
 
 /// A panic in the rebuild of the inferences (forced: `NRESE_TEST_PANIC_IN_REBUILD`, a
 /// debug build's), after `load` and at the start: the process ends with an error that
-/// names the store and how to start without reasoning.
+/// names the store and how to start without reasoning. Only where the server is built with
+/// debug assertions: a release build compiles the forced panic out, so its rebuild succeeds.
+#[cfg(debug_assertions)]
 #[test]
 fn a_panic_in_the_rebuild_ends_in_a_message_naming_the_store()
 -> Result<(), Box<dyn std::error::Error>> {
