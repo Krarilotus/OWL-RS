@@ -439,8 +439,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
                         return Preparation {
                             base,
                             decided_by: "upper-bound",
-                            proves_consistency: !upper.left_out
-                                && upper.program.proves_consistency()
+                            proves_consistency: upper.program.proves_consistency()
                                 && upper.clashes_after(&change) == 0,
                             prepared: Prepared::Delta(Box::new(change)),
                             ontology: None,

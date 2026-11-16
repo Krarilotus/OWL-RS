@@ -696,8 +696,6 @@ pub struct Upper {
     classes: nrese_reasoner::representatives::EqualityClasses,
     rdf_type: u64,
     same_as: u64,
-    /// The reader left a part out (a fatal diagnostic): U1 then proves nothing consistent.
-    pub(crate) left_out: bool,
     /// How long the last evaluation or maintenance took.
     pub elapsed: Duration,
 }
@@ -900,10 +898,6 @@ impl Upper {
             ground: None,
             values,
             classes: m.classes,
-            left_out: ontology
-                .diagnostics
-                .iter()
-                .any(nrese_owl::Diagnostic::is_fatal),
             elapsed: started.elapsed(),
         })
     }
@@ -1085,7 +1079,7 @@ impl Upper {
     /// Whether U1 proves the ontology consistent (PAGOdA, Theorem 5.5 (i)): no clash, and
     /// U1 checks every `⊥` ([`bounds::Program::proves_consistency`]).
     pub fn proves_consistency(&self) -> bool {
-        !self.left_out && self.program.proves_consistency() && self.clashes() == 0
+        self.program.proves_consistency() && self.clashes() == 0
     }
 
     /// U1's `owl:sameAs` classes: its stack is over their representatives, each other
