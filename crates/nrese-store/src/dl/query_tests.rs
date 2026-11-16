@@ -616,3 +616,65 @@ fn an_ontology_read_refused_at_its_budget_leaves_the_answers_unsound() {
         "{reasons:?}"
     );
 }
+
+/// A question naming an individual the data doesn't name is decided only where the
+/// ontology has no key. Where the ontology can't be read within its budget (nothing cached
+/// for the revision and the bounds' memory spent, between the decision and the status), it
+/// isn't known whether it has one, so the answer isn't `complete`. On the rules route, whose
+/// status reads no ontology otherwise. The control: the same read with the memory free, over
+/// an ontology without keys, is decided.
+#[test]
+fn a_question_naming_an_individual_the_data_doesnt_is_not_complete_when_the_ontology_isnt_read() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let store = Arc::new(
+        StoreService::new(crate::StoreConfig {
+            total_query_memory_bytes: 64 << 20,
+            ..crate::StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    let pipeline = crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    );
+    commit(
+        &pipeline,
+        "INSERT DATA { :A a owl:Class . :a a :A . :r a owl:ObjectProperty . :a :r :x . }",
+    );
+    assert_eq!(store.dl_bounds().last, "rules", "the rules route");
+    let prepared = store
+        .prepare_query(&crate::SparqlQueryRequest::all(format!(
+            "{MARK_PREFIXES}ASK {{ :b a :A }}"
+        )))
+        .unwrap();
+    let status = || {
+        let mut status = None;
+        store
+            .run_query_reporting(&prepared, &CancellationToken::new(), &mut Vec::new(), |s| {
+                status = s
+            })
+            .unwrap();
+        status.expect("a status")
+    };
+    let free = status();
+    assert!(free.complete, "the control: {free:?}");
+    let kept = Arc::clone(store.dl().bounds.kept());
+    let spent = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (cache, budget, held) = (
+        Arc::clone(&store),
+        Arc::clone(&kept),
+        std::rc::Rc::clone(&spent),
+    );
+    crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || {
+        drop(cache.dl().query_ontology.0.lock().unwrap().take());
+        let rest = budget.remaining();
+        budget.charge(rest).unwrap();
+        held.set(rest);
+    })));
+    let refused = status();
+    kept.release(spent.get());
+    assert!(spent.get() > 0, "the hook spent the bounds' memory");
+    assert!(!refused.complete, "with the ontology unread: {refused:?}");
+}

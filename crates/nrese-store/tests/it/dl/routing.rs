@@ -185,6 +185,122 @@ fn an_axiom_outside_rl_takes_the_ontology_off_the_rules_route() {
     assert_eq!(dl.store().dl_bounds().last, "rules");
 }
 
+/// Under `HasKey(owl:Thing (:r) ())`, `owl:Thing ⊑ ∃:r.{:a}` and `:A(:a)`, an individual
+/// `:b` named only in the question is in NAMED by the letter of the Direct Semantics (§2.2,
+/// §4): it shares `:a` with `:a`, so `:b : :A` and `:b = :a`. Implementations read the
+/// ontology's signature only and answer false. Which reading holds is undecided, so a false
+/// may not say `complete`: under the letter it misses the answer. A probe (the small-scope
+/// campaign's probe 79).
+#[test]
+fn an_individual_named_only_in_the_question_is_not_decided_complete_under_a_key() {
+    let dl = pipeline();
+    let inserted = insert(
+        &dl,
+        ":r a owl:ObjectProperty . :A a owl:Class . :a a owl:NamedIndividual , :A . \
+         owl:Thing owl:hasKey ( :r ) ; \
+         rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:hasValue :a ] .",
+    );
+    eprintln!("insert: {inserted:?}");
+    let route = dl.store().dl_bounds().last;
+    let mut wrong = Vec::new();
+    for read in ["ASK { :b a :A }", "ASK { :b owl:sameAs :a }"] {
+        let (rows, status) = query(&dl, read);
+        let line = format!(
+            "route {route}: {read} answers {rows:?}, status {} ({:?})",
+            status.shared.as_str(),
+            status.reasons()
+        );
+        eprintln!("{line}");
+        if rows == ["false"] && status.is_complete() {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "false labelled complete: {wrong:#?}");
+}
+
+/// The keys of [`an_individual_named_only_in_the_question_is_not_decided_complete_under_a_key`].
+const KEYS: &str = ":r a owl:ObjectProperty . :A a owl:Class . :a a owl:NamedIndividual , :A . \
+     owl:Thing owl:hasKey ( :r ) ; \
+     rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:hasValue :a ] .";
+
+/// An individual whose statements were all deleted is named only in the question again,
+/// though the store's dictionary still holds its name: under the keys, a `false` about it
+/// may not say `complete` either.
+#[test]
+fn an_individual_whose_data_was_deleted_is_not_decided_complete_under_a_key() {
+    let dl = pipeline();
+    insert(&dl, KEYS).expect("the keys");
+    insert(&dl, ":b :note \"b\" .").expect("b named");
+    super::update(&dl, "DELETE DATA { :b :note \"b\" . }").expect("b's data deleted");
+    let (rows, status) = query(&dl, "ASK { :b a :A }");
+    let line = format!(
+        "{rows:?}, status {} ({:?})",
+        status.shared.as_str(),
+        status.reasons()
+    );
+    eprintln!("{line}");
+    assert!(
+        !(rows == ["false"] && status.is_complete()),
+        "false labelled complete: {line}"
+    );
+}
+
+/// Where no key can reach a name the question alone gives, the read is decided as before:
+/// under the keys, a question about an individual the data names (`:a a :A`, true); and
+/// without keys, one about an individual named only in the question (`:b a :A`, false: no
+/// key makes it equal to a named one).
+#[test]
+fn a_question_no_key_can_reach_is_decided_as_before() {
+    let mut wrong = Vec::new();
+    let without = KEYS.replace("owl:Thing owl:hasKey ( :r ) ; ", "owl:Thing ");
+    for (data, read, answer) in [
+        (KEYS, "ASK { :a a :A }", "true"),
+        (without.as_str(), "ASK { :b a :A }", "false"),
+    ] {
+        let dl = pipeline();
+        insert(&dl, data).expect("the ontology");
+        let (rows, status) = query(&dl, read);
+        let line = format!(
+            "{read} over {data}: {rows:?}, status {} ({:?})",
+            status.shared.as_str(),
+            status.reasons()
+        );
+        eprintln!("{line}");
+        if rows != [answer] || !status.is_complete() {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "not decided as before: {wrong:#?}");
+}
+
+/// The keys' question on the other reads with a status: inside a transaction with
+/// operations pending, and of the inferred statements alone. Neither says `complete`.
+#[test]
+fn the_other_reads_of_an_individual_named_only_in_the_question_are_not_complete() {
+    let dl = pipeline();
+    insert(&dl, KEYS).expect("the keys");
+    let pending = StatementOp::Add {
+        data: ntriples("<http://example.com/c> <http://example.com/note> \"c\" ."),
+        contexts: Vec::new(),
+    };
+    let (rows, inside) = in_transaction(&dl, vec![pending], "ASK { :b a :A }");
+    let inside = inside.expect("a status");
+    let implicit = dl
+        .store()
+        .prepare_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "{}ASK FROM <http://www.ontotext.com/implicit> {{ :b a :A }}",
+            super::PREFIXES
+        )))
+        .expect("prepared");
+    let alone = dl.store().status_without_dl(&implicit).expect("a status");
+    let lines = [
+        format!("pending: {rows}, {} {:?}", inside.as_str(), inside.reasons),
+        format!("inferred alone: {} {:?}", alone.as_str(), alone.reasons),
+    ];
+    eprintln!("{lines:#?}");
+    assert!(!inside.complete && !alone.complete, "{lines:#?}");
+}
+
 /// One data value in two lexical forms: `"1"` and `"01"` as xsd:integer, and `"1"` as
 /// xsd:int and as xsd:integer (OWL 2 Structural Specification §4: xsd:int's value space
 /// is part of xsd:integer's). The rule set leaves out dt-eq, so where an axiom compares
