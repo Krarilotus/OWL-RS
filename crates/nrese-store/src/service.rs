@@ -2240,6 +2240,10 @@ impl StoreService {
             },
         )
         .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
+        // Reads expand by the id the program keeps the stack over, not by what the published
+        // dictionary holds: a closure that published nothing has not published `owl:sameAs`
+        // either (`note_equality`'s lookup, which the open keeps: its store is all there is).
+        self.engine.set_equality(program.stored_equality());
         drop(finished);
         if let Some(why) = undecided {
             let text = why.text(violations);
