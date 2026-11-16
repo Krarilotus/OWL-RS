@@ -1,4 +1,4 @@
-"""The problem-finders' chunk tools (13 Oct 2026, Khaleesi's staged load test): a command under
+"""The problem-finders' chunk tools (13 Oct 2026, the development machine's staged load test): a command under
 a memory cap and a time budget (scripts/capped-chunk.py), a seed sweep's order and resumption
 (scripts/seed-sweep.py).
 

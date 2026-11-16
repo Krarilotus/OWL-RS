@@ -289,7 +289,7 @@ class Driver(unittest.TestCase):
         suite = self.suite(runs=1)
         suite.manifest.update(images={"img:t": "sha256:B"})
         # Docker's own answers mocked like every other docker call here: a host without docker runs
-        # this too (gate-windows-59532fff57-1794140734, khaleesi: FileNotFoundError).
+        # this too (gate-windows-59532fff57-1794140734, the development machine: FileNotFoundError).
         with patch.object(driver.ns, "pinned", return_value={"img:t": "sha256:A"}), \
                 patch.object(driver, "run_quiet", return_value=Mock(returncode=0, stdout="\n", stderr="")):
             self.run_tiers(suite, [Plan("w", "1")], self.system(images=["img:t", "img:u"]))
@@ -298,7 +298,7 @@ class Driver(unittest.TestCase):
                          {"img:t": "sha256:A", "img:u": {"unknown": "not in the run's pin map"}})
 
     def test_a_receipt_names_the_source_commit_an_image_was_built_at(self):
-        """Orchestrator, 8 Nov 13:39: an image built from a source checkout (images.sh: MillenniumDB,
+        """An image built from a source checkout (images.sh: MillenniumDB,
         G-CARE) carries its source commit beside its context's tree, both read off the id that ran,
         so a build at another commit than its Dockerfile declares is visible as such."""
         labels = {"sha256:A": ("benches/competitors/millenniumdb@" + "t" * 40, "ecbf6dde" + "0" * 32),
@@ -827,7 +827,7 @@ class Driver(unittest.TestCase):
                     self.assertIn(str(where.resolve()), controlled["unknown"])
 
     def test_an_export_goes_beside_its_checkout_and_a_config_there_is_named(self):
-        """P1e (build-controlled-build-3, phuoc-yu): the launcher's free-disk guard measures the
+        """P1e (build-controlled-build-3, the timed host): the launcher's free-disk guard measures the
         filesystem it runs from, the export's; one in the system's temporary directory (a small /tmp)
         refused a build whose target had room. The export goes beside the build's own checkout,
         wherever TEMP is, on the filesystem the guard always measured. Cargo reads a .cargo/config

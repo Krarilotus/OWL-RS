@@ -116,7 +116,7 @@ class FleetCells(unittest.TestCase):
         self.assertEqual(len(tokens), 2)
 
     def test_job_declares_resources_identity_answers_and_private_landing(self):
-        # Fleet owner 8 Nov: spec 9, exclusive host, memory-only containers covered by step RAM.
+        # Spec 9, exclusive host, memory-only containers covered by step RAM.
         code, text = self.run_plan("--budget-hours", "50", "--plan")
         self.assertEqual(code, 0, text)
         job = self.document()["job"][0]
