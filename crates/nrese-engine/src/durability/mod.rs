@@ -138,6 +138,10 @@ pub struct DurabilityConfig {
     /// Damage in the newest WAL segment: refuse to open (the default), or keep the log up
     /// to it.
     pub wal_damage: WalDamage,
+    /// A file in the store's directory the open removes, durably, before it cuts the log back
+    /// (a torn or damaged tail, a point-in-time cut): what it says about the data may be about
+    /// commits the cut takes.
+    pub forget_on_cut: Option<&'static str>,
 }
 
 impl Default for DurabilityConfig {
@@ -153,6 +157,7 @@ impl Default for DurabilityConfig {
             recover_until: None,
             recover_until_micros: None,
             wal_damage: WalDamage::Refuse,
+            forget_on_cut: None,
         }
     }
 }
@@ -450,6 +455,7 @@ impl Durable {
                         .zip(record.committed_micros)
                         .is_some_and(|(until, committed)| committed > until);
                 if after {
+                    forget_before_cut(root, &config)?;
                     // Point-in-time restore: the log ends before this record.
                     kept = match index {
                         0 => {
@@ -521,6 +527,7 @@ impl Durable {
                         );
                     }
                 }
+                forget_before_cut(root, &config)?;
                 kept = wal::truncate_segment(path, at)?;
                 changed = true;
             }
@@ -698,6 +705,17 @@ fn now_micros() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_micros() as u64)
+}
+
+/// Removes [`DurabilityConfig::forget_on_cut`] from `root`, durably; gone already is fine.
+fn forget_before_cut(root: &Path, config: &DurabilityConfig) -> EngineResult<()> {
+    let Some(name) = config.forget_on_cut else {
+        return Ok(());
+    };
+    match fs::remove_file(root.join(name)) {
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.into()),
+        _ => sync_dir(root),
+    }
 }
 
 /// Makes a rename, creation or removal in `dir` durable, on every platform ([`place`]).

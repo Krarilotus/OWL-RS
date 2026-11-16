@@ -139,19 +139,17 @@ impl Context<'_> {
         encoder
     }
 
-    /// `pattern`'s key and its variables by number; `None` if it isn't cached.
+    /// `pattern`'s key bytes and its variables by number; `None` if it isn't cached. Not
+    /// yet a [`Key`]: a claim makes its own (under its admission), and a key is hashed when
+    /// it is made.
     fn cache_key(
         &self,
         scope: &CacheScope,
         pattern: &GraphPattern,
-    ) -> Option<(Key, Vec<Variable>)> {
+    ) -> Option<(Arc<[u8]>, Vec<Variable>)> {
         let mut encoder = self.key_start(scope);
         encoder.pattern(pattern).ok()?;
-        let key = Key {
-            snapshot: scope.snapshot,
-            part: encoder.bytes.into(),
-        };
-        Some((key, encoder.vars))
+        Some((encoder.bytes.into(), encoder.vars))
     }
 
     fn cancelled(&self) -> bool {
@@ -194,12 +192,12 @@ impl Context<'_> {
         // A LIMIT for a basic graph pattern: its rows are some of the part's, so they
         // aren't kept; the whole part's rows will do.
         if self.limit.get().is_some() {
-            return match scope.cache.lookup(&key) {
+            return match scope.cache.lookup(&Key::new(scope.snapshot, key)) {
                 Some(part) => self.solutions_of(&part, &vars, step, "hit"),
                 None => self.eval_operator(pattern),
             };
         }
-        match scope.cache.claim(token, &key.part, pin.as_ref()) {
+        match scope.cache.claim(token, &key, pin.as_ref()) {
             Claim::Hit(part) => self.solutions_of(&part, &vars, step, "hit"),
             Claim::Wait(flight) => match flight.wait(|| self.cancelled()) {
                 Err(()) => Err(QueryEvaluationError::Cancelled.into()),
@@ -366,7 +364,7 @@ pub(crate) fn output_key(
     query: &nrese_sparql_syntax::Query,
     options: &crate::QueryOptions,
     format: &str,
-    context: &str,
+    context: &[u8],
 ) -> Option<Arc<[u8]>> {
     use nrese_sparql_syntax::Query;
     if options.pre_bound.is_some() {
@@ -400,13 +398,16 @@ pub(crate) fn output_key(
         encoder.tag(u8::from(read.canonical));
     }
     encoder.text(format);
-    encoder.text(context);
+    encoder.number(context.len() as u64);
+    encoder.bytes.extend_from_slice(context);
     // The QL rewriting changes the answer of the query as parsed (parts see it in the
     // algebra they evaluate): its closure and bounds; its TBox is the snapshot's.
     match super::ql_rewriting(query, options) {
         Some(ql) => {
             encoder.tag(b'q');
-            encoder.text(&ql.fingerprint());
+            for value in ql.fingerprint() {
+                encoder.number(value);
+            }
         }
         None => encoder.tag(b'-'),
     }
@@ -562,10 +563,7 @@ impl Context<'_> {
                         #[cfg(test)]
                         KEY_BYTES.with(|bytes| bytes.set(bytes.get() + encoder.bytes.len()));
                         link = Sha256::digest(&encoder.bytes).into();
-                        Key {
-                            snapshot: scope.snapshot,
-                            part: encoder.bytes.as_slice().into(),
-                        }
+                        Key::new(scope.snapshot, encoder.bytes.as_slice().into())
                     }));
                     keys.numbered.push(encoder.vars.len());
                 }
@@ -705,7 +703,7 @@ mod tests {
             ..QueryOptions::default()
         };
         let key = |canonical: bool| {
-            super::output_key(&snapshot, &query, &options(canonical), "text/csv", "")
+            super::output_key(&snapshot, &query, &options(canonical), "text/csv", b"")
                 .expect("an answer that is cached")
         };
         let (canonical, given) = (key(true), key(false));
@@ -714,6 +712,72 @@ mod tests {
             "the canonical reading is written"
         );
         assert_ne!(canonical, given);
+    }
+
+    /// The QL rewriting decides an answer by its closure and every one of its bounds: two
+    /// requests that differ in one of them never share an answer's key, nor does a request
+    /// without the rewriting (the key wrote the rewriting's debug text before; its numbers
+    /// must tell requests apart as that text did).
+    ///
+    /// - Input: one query and snapshot; a rewriting built field by field, then that base with
+    ///   one field changed, for each field of its closure and its bounds; no rewriting.
+    /// - Expected: the base's key twice the same; every other key unseen before it.
+    #[test]
+    fn every_field_of_the_ql_rewriting_changes_the_output_key() {
+        use crate::ql::{Closure, Limits, QlRewriting};
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let snapshot = engine.snapshot();
+        let query = SparqlParser::new()
+            .parse_query("SELECT ?x WHERE { ?x a <http://e/C> }")
+            .unwrap();
+        let key = |ql: Option<(Closure, Limits)>| {
+            let options = QueryOptions {
+                result_cache: Some(std::sync::Arc::new(ResultCache::new(1 << 20))),
+                ql: ql.map(|(c, l)| std::sync::Arc::new(QlRewriting::new(c).with_limits(l))),
+                ..QueryOptions::default()
+            };
+            super::output_key(&snapshot, &query, &options, "text/csv", b"")
+                .expect("an answer that is cached")
+        };
+        let base = (
+            Closure { lists: false },
+            Limits {
+                existential_vars: 1,
+                candidates: 2,
+                witnesses: 3,
+                branches: 4,
+                size: 5,
+                work: 6,
+                query_work: 7,
+                checks: 8,
+                check_rows: 9,
+            },
+        );
+        let changed: [fn(&mut (Closure, Limits)); 10] = [
+            |(c, _)| c.lists = true,
+            |(_, l)| l.existential_vars += 10,
+            |(_, l)| l.candidates += 10,
+            |(_, l)| l.witnesses += 10,
+            |(_, l)| l.branches += 10,
+            |(_, l)| l.size += 10,
+            |(_, l)| l.work += 10,
+            |(_, l)| l.query_work += 10,
+            |(_, l)| l.checks += 10,
+            |(_, l)| l.check_rows += 10,
+        ];
+        assert_eq!(key(Some(base)), key(Some(base)));
+        let mut seen = vec![key(Some(base)), key(None)];
+        assert_ne!(seen[0], seen[1], "no rewriting gives the base's key");
+        for (i, change) in changed.into_iter().enumerate() {
+            let mut ql = base;
+            change(&mut ql);
+            let bytes = key(Some(ql));
+            assert!(
+                !seen.contains(&bytes),
+                "change {i} gives a key already seen"
+            );
+            seen.push(bytes);
+        }
     }
 
     /// A path of n steps is a basic graph pattern of n triples, and each prefix of its join

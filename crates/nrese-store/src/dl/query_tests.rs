@@ -2,16 +2,15 @@ use super::*;
 use nrese_dl::limits::Deadline;
 
 fn lower_true_store() -> Arc<StoreService> {
+    lower_true_store_with(crate::StoreConfig::in_memory())
+}
+
+fn lower_true_store_with(config: crate::StoreConfig) -> Arc<StoreService> {
     use crate::{
         MutationCommand, MutationPipeline, MutationTicket, Requester, SparqlUpdateRequest,
     };
     use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-    let store = Arc::new(
-        StoreService::new(crate::StoreConfig {
-            ..crate::StoreConfig::in_memory()
-        })
-        .unwrap(),
-    );
+    let store = Arc::new(StoreService::new(config).unwrap());
     let pipeline = MutationPipeline::new(
         Arc::clone(&store),
         Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
@@ -289,6 +288,7 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
             &store,
             &prepared,
             &analyse(prepared.query()),
+            &crate::dl::bounds::view(&store),
             &token,
             &nrese_exec::Envelope::unlimited(),
             mode,
@@ -391,5 +391,228 @@ fn a_cold_build_keeps_the_cached_ontology_of_its_own_revision() {
         Some(Some(after.revision)),
         "the cache as revision {}'s build began",
         after.revision
+    );
+}
+
+/// Commits `update` (with the prefixes of [`decided_then`]) through the `owl2-dl` pipeline.
+fn commit(pipeline: &crate::MutationPipeline, update: &str) {
+    use crate::{MutationCommand, MutationTicket, Requester, SparqlUpdateRequest};
+    pipeline
+        .apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!("{MARK_PREFIXES}{update}"))),
+            &Requester::all(),
+            &MutationTicket::new(),
+        )
+        .unwrap();
+}
+
+const MARK_PREFIXES: &str = "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#> \
+     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
+
+/// A store under `owl2-dl` with `first` committed, `then` set to be committed once what a
+/// read reads is fixed, before its status (the hook `AFTER_DECIDED`), and whether it was.
+fn racing(
+    first: &str,
+    then: &'static str,
+) -> (Arc<StoreService>, std::rc::Rc<std::cell::Cell<bool>>) {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
+    let pipeline = std::rc::Rc::new(crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    ));
+    commit(&pipeline, &format!("INSERT DATA {{ {first} }}"));
+    let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (racer, seen) = (std::rc::Rc::clone(&pipeline), std::rc::Rc::clone(&ran));
+    crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || {
+        commit(&racer, then);
+        seen.set(true);
+    })));
+    (store, ran)
+}
+
+/// `query` over [`racing`]`(first, then)`, run: the answer and its status.
+fn decided_then(
+    first: &str,
+    then: &'static str,
+    query: &str,
+) -> (String, nrese_sparql::Completeness) {
+    let (store, ran) = racing(first, then);
+    let prepared = store
+        .prepare_query(&crate::SparqlQueryRequest::all(format!(
+            "{MARK_PREFIXES}{query}"
+        )))
+        .unwrap();
+    let (mut out, mut status) = (Vec::new(), None);
+    store
+        .run_query_reporting(&prepared, &CancellationToken::new(), &mut out, |s| {
+            status = s
+        })
+        .unwrap();
+    assert!(
+        ran.get(),
+        "the commit ran between the decision and the status"
+    );
+    (String::from_utf8(out).unwrap(), status.expect("a status"))
+}
+
+/// R1-F2, one way: at the decided revision an annotation property's domain puts `:x a :C`
+/// in L only (OWL 2 DL gives the domain no meaning for what it annotates); a commit then
+/// removes the domain. The answer `true`, read at the decided revision, may only come
+/// `unsound`: its status is that revision's, not the later one's.
+#[test]
+fn an_answer_keeps_the_mark_of_its_revision_when_a_commit_repairs_the_ontology() {
+    let (answer, status) = decided_then(
+        ":note a owl:AnnotationProperty ; rdfs:domain :C . :C a owl:Class . :x :note \"n\" .",
+        "DELETE DATA { :note rdfs:domain :C }",
+        "ASK { :x a :C }",
+    );
+    let line = format!("{answer} {} {:?}", status.as_str(), status.reasons);
+    eprintln!("{line}");
+    assert!(
+        answer.contains("true"),
+        "the decided revision's answer: {line}"
+    );
+    assert_eq!(status.as_str(), "unsound", "{line}");
+}
+
+/// R1-F2, the other way: at the decided revision an ordinary property's domain entails
+/// `:x a :C` (the rules' route); a commit then adds an annotation property's domain on other
+/// terms. The answer `true`, entailed at its revision, isn't marked by the later one.
+#[test]
+fn an_answer_takes_no_mark_from_a_later_revision() {
+    let (answer, status) = decided_then(
+        ":note a owl:ObjectProperty ; rdfs:domain :C . :C a owl:Class . :x :note :v .",
+        "INSERT DATA { :other a owl:AnnotationProperty ; rdfs:domain :D . :D a owl:Class . }",
+        "ASK { :x a :C }",
+    );
+    let line = format!("{answer} {} {:?}", status.as_str(), status.reasons);
+    eprintln!("{line}");
+    assert!(
+        answer.contains("true"),
+        "the decided revision's answer: {line}"
+    );
+    assert_ne!(status.as_str(), "unsound", "{line}");
+}
+
+/// R1-F2, a query naming its dataset: its rows are read at the revision its status was
+/// decided on. A commit after the decision removes the statement it asks for; the answer
+/// is still `true`.
+#[test]
+fn a_query_naming_its_dataset_reads_the_revision_it_was_decided_on() {
+    let (answer, status) = decided_then(
+        "GRAPH :g { :x a :C . :C a owl:Class . }",
+        "DELETE DATA { GRAPH :g { :x a :C } }",
+        "ASK FROM :g { :x a :C }",
+    );
+    let line = format!("{answer} {} {:?}", status.as_str(), status.reasons);
+    eprintln!("{line}");
+    assert!(
+        answer.contains("true"),
+        "the decided revision's answer: {line}"
+    );
+}
+
+/// R1-F2, a read of the inferred statements alone (`FROM onto:implicit`): run, EXPLAIN and
+/// the plan each give the status of the revision the read was on. There an annotation
+/// property's domain puts `:x a :C` in L only; a commit between the read and its status
+/// removes the domain. The status stays `unsound`.
+#[test]
+fn a_read_of_the_inferred_statements_alone_keeps_the_mark_of_its_revision() {
+    let read = "ASK FROM <http://www.ontotext.com/implicit> { :x a :C }";
+    for path in ["run", "explain", "plan"] {
+        let (store, ran) = racing(
+            ":note a owl:AnnotationProperty ; rdfs:domain :C . :C a owl:Class . :x :note \"n\" .",
+            "DELETE DATA { :note rdfs:domain :C }",
+        );
+        let request = crate::SparqlQueryRequest::all(format!("{MARK_PREFIXES}{read}"));
+        let (prepared, cancel) = (
+            store.prepare_query(&request).unwrap(),
+            CancellationToken::new(),
+        );
+        let (mut answer, mut status) = (Vec::new(), None);
+        match path {
+            "run" => store
+                .run_query_reporting(&prepared, &cancel, &mut answer, |s| status = s)
+                .unwrap(),
+            "explain" => {
+                status = store
+                    .explain_query(&prepared, &cancel)
+                    .unwrap()
+                    .completeness
+            }
+            _ => status = store.plan_query(&prepared, &cancel).unwrap().completeness,
+        }
+        let status = status.expect("a status");
+        let answer = String::from_utf8(answer).unwrap();
+        let line = format!("{path}: {answer} {} {:?}", status.as_str(), status.reasons);
+        eprintln!("{line}");
+        assert!(
+            ran.get(),
+            "{line}: no commit between the read and its status"
+        );
+        assert!(path != "run" || answer.contains("true"), "{line}");
+        assert_eq!(status.as_str(), "unsound", "{line}");
+    }
+}
+
+/// R1-F5: the ontology read the status needs, refused at its budget (nothing cached for the
+/// revision and the bounds' memory spent, between the decision and the status): whether
+/// OWL 2 DL reads the data otherwise than the rules isn't known, so the answers are
+/// `unsound` with that reason, and an exact read is refused. The control: the same exact
+/// read with the memory free is answered.
+#[test]
+fn an_ontology_read_refused_at_its_budget_leaves_the_answers_unsound() {
+    let store = lower_true_store_with(crate::StoreConfig {
+        total_query_memory_bytes: 64 << 20,
+        ..crate::StoreConfig::in_memory()
+    });
+    let mut request = crate::SparqlQueryRequest::all("ASK { ?x a <urn:test:B> }");
+    request.dl_answers = Some(crate::DlAnswers::Exact);
+    let prepared = store.prepare_query(&request).unwrap();
+    let run = || {
+        store.run_query_reporting(
+            &prepared,
+            &CancellationToken::new(),
+            &mut Vec::new(),
+            |_| (),
+        )
+    };
+    assert!(run().is_ok(), "the control: {:?}", run().map(|_| ()));
+    let kept = Arc::clone(store.dl().bounds.kept());
+    let spent = std::rc::Rc::new(std::cell::Cell::new(0));
+    let (cache, budget, held) = (
+        Arc::clone(&store),
+        Arc::clone(&kept),
+        std::rc::Rc::clone(&spent),
+    );
+    crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || {
+        drop(cache.dl().query_ontology.0.lock().unwrap().take());
+        let rest = budget.remaining();
+        budget.charge(rest).unwrap();
+        held.set(rest);
+    })));
+    let refused = run();
+    kept.release(spent.get());
+    assert!(spent.get() > 0, "the hook spent the bounds' memory");
+    let answer = match refused {
+        Err(crate::StoreError::Incomplete(answer)) => answer,
+        other => panic!(
+            "expected the exact read refused, got {:?}",
+            other.map(|_| ())
+        ),
+    };
+    let reasons: Vec<&str> = answer
+        .status
+        .reasons
+        .iter()
+        .map(|r| r.text.as_str())
+        .collect();
+    assert_eq!(answer.status.as_str(), "unsound", "{reasons:?}");
+    assert!(
+        reasons.iter().any(|r| r.contains("isn't known")),
+        "{reasons:?}"
     );
 }

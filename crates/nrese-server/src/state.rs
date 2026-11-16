@@ -18,8 +18,18 @@ use axum::http::HeaderMap;
 pub struct AppState {
     /// The repository's write path; a reconfiguration replaces it.
     pipeline: crate::repositories::PipelineSlot,
-    ready: Arc<AtomicBool>,
     policy: Arc<PolicyConfig>,
+    /// The repository this state serves.
+    repository: Arc<str>,
+    /// What every repository's state shares, behind one count: each layer and the handler
+    /// of every request clone the state.
+    shared: Arc<Shared>,
+}
+
+/// What [`AppState`] shares with its clones and every repository's state.
+#[derive(Clone)]
+struct Shared {
+    ready: Arc<AtomicBool>,
     ai: Arc<AiSuggestionService>,
     deployment_posture: DeploymentPosture,
     rate_limiter: Arc<RateLimiter>,
@@ -27,15 +37,13 @@ pub struct AppState {
     repositories: Arc<Catalog>,
     /// Users, workspaces and graph policies ([`crate::access`]), server-wide.
     access: Arc<nrese_store::access::AccessControl>,
-    /// The repository this state serves.
-    repository: Arc<str>,
     /// Long operations (imports) running or finished ([`nrese_store::jobs`]).
     jobs: Arc<nrese_store::jobs::Jobs>,
     /// This server's part in replication ([`crate::replication`]).
     replication: Arc<crate::replication::ReplicationState>,
     /// Why the default repository can't serve until a restart, if it can't
     /// ([`nrese_store::StoreService::unavailable`]): read on every request
-    /// ([`crate::app`]'s `default_repository_available`), one atomic load.
+    /// ([`crate::app`]'s `screen`), one atomic load.
     default_unavailable: Arc<std::sync::OnceLock<String>>,
 }
 
@@ -80,18 +88,20 @@ impl AppState {
             .unavailable_flag();
         let state = Self {
             pipeline: Arc::clone(&repositories.default_repository().pipeline),
-            default_unavailable,
-            ready: Arc::new(AtomicBool::new(false)),
             policy: Arc::new(policy),
-            ai: Arc::new(ai),
-            deployment_posture,
-            rate_limiter: Arc::new(RateLimiter::default()),
-            request_metrics: Arc::default(),
-            repositories,
-            access,
             repository: Arc::from(DEFAULT_REPOSITORY),
-            jobs: Arc::default(),
-            replication: Arc::default(),
+            shared: Arc::new(Shared {
+                default_unavailable,
+                ready: Arc::new(AtomicBool::new(false)),
+                ai: Arc::new(ai),
+                deployment_posture,
+                rate_limiter: Arc::new(RateLimiter::default()),
+                request_metrics: Arc::default(),
+                repositories,
+                access,
+                jobs: Arc::default(),
+                replication: Arc::default(),
+            }),
         };
         state.prepare_support_sets();
         Ok(state)
@@ -100,11 +110,12 @@ impl AppState {
     /// With `inferred = "supported"` in the access state, every repository's support
     /// graph sets computed in the background, so first reads don't wait for them.
     pub fn prepare_support_sets(&self) {
-        if self.access.state().settings.inferred != nrese_store::access::Inferred::Supported {
+        if self.shared.access.state().settings.inferred != nrese_store::access::Inferred::Supported
+        {
             return;
         }
-        for (id, _) in self.repositories.list() {
-            if let Some(repository) = self.repositories.get(&id) {
+        for (id, _) in self.shared.repositories.list() {
+            if let Some(repository) = self.shared.repositories.get(&id) {
                 repository.pipeline.read().store().prepare_support_sets();
             }
         }
@@ -138,7 +149,7 @@ impl AppState {
             .map(str::trim)
             .filter(|token| token.starts_with(nrese_store::access::SESSION_PREFIX))
         {
-            return match self.access.session(token) {
+            return match self.shared.access.session(token) {
                 Some(principal) => Ok(principal.user.map(identity)),
                 None => Err(ApiError::unauthorized(
                     "the session has ended; log in again",
@@ -157,7 +168,7 @@ impl AppState {
             .split_once(':')
             .ok_or_else(|| ApiError::unauthorized("malformed Basic credentials"))?;
         let (user, password) = (user.to_owned(), password.to_owned());
-        let access = Arc::clone(&self.access);
+        let access = Arc::clone(&self.shared.access);
         let principal = tokio::task::spawn_blocking(move || access.login(&user, &password, client))
             .await
             .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -173,12 +184,12 @@ impl AppState {
 
     /// Long operations (imports), server-wide.
     pub fn jobs(&self) -> &Arc<nrese_store::jobs::Jobs> {
-        &self.jobs
+        &self.shared.jobs
     }
 
     /// The access state ([`crate::access`]).
     pub fn access(&self) -> &nrese_store::access::AccessControl {
-        &self.access
+        &self.shared.access
     }
 
     /// The id of the repository this state serves.
@@ -189,7 +200,7 @@ impl AppState {
     /// What `identity` may read and write in this state's repository.
     pub fn access_view(&self, identity: &crate::auth::Identity) -> crate::access::AccessView {
         let principal = crate::access::principal(identity);
-        let mut view = self.access.view(&principal, &self.repository);
+        let mut view = self.shared.access.view(&principal, &self.repository);
         view.origin = Some(principal.display());
         view
     }
@@ -207,12 +218,12 @@ impl AppState {
 
     /// The repositories ([`nrese_store::catalog`]).
     pub fn repositories(&self) -> &Catalog {
-        &self.repositories
+        &self.shared.repositories
     }
 
     /// Why the default repository can't serve until a restart, if it can't.
     pub fn default_unavailable(&self) -> Option<&str> {
-        self.default_unavailable.get().map(String::as_str)
+        self.shared.default_unavailable.get().map(String::as_str)
     }
 
     /// The repositories that can't serve: `id: unavailable` each, the default first (for
@@ -222,7 +233,8 @@ impl AppState {
             .map(|_| DEFAULT_REPOSITORY.to_owned())
             .into_iter()
             .chain(
-                self.repositories
+                self.shared
+                    .repositories
                     .unavailable_list()
                     .into_iter()
                     .map(|(id, _)| id),
@@ -243,8 +255,8 @@ impl AppState {
             }
             return Ok(self.clone());
         }
-        let Some(repository) = self.repositories.get(id) else {
-            return Err(match self.repositories.unavailable(id) {
+        let Some(repository) = self.shared.repositories.get(id) else {
+            return Err(match self.shared.repositories.unavailable(id) {
                 Some(_) => ApiError::unavailable(format!("repository '{id}' {UNAVAILABLE}")),
                 None => ApiError::not_found(format!("no repository '{id}'")),
             });
@@ -269,7 +281,7 @@ impl AppState {
 
     /// Request outcomes and latencies, for `/metrics`.
     pub fn request_metrics(&self) -> &RequestMetrics {
-        &self.request_metrics
+        &self.shared.request_metrics
     }
 
     /// This state with `replication` as its part in replication (set once at start).
@@ -278,13 +290,14 @@ impl AppState {
             // Its dictionary continues the primary's: nothing here may intern a term.
             self.store().mark_replica();
         }
-        self.replication = Arc::new(crate::replication::ReplicationState::new(replication));
+        Arc::make_mut(&mut self.shared).replication =
+            Arc::new(crate::replication::ReplicationState::new(replication));
         self
     }
 
     /// This server's part in replication ([`crate::replication`]).
     pub fn replication(&self) -> &crate::replication::ReplicationState {
-        &self.replication
+        &self.shared.replication
     }
 
     pub fn store(&self) -> Arc<StoreService> {
@@ -299,7 +312,8 @@ impl AppState {
     /// The repository's settings: those it was created with, or for the default
     /// repository those changed through the engine API (empty: the server's).
     pub fn repository_settings(&self) -> crate::repository_config::RepositorySettings {
-        self.repositories
+        self.shared
+            .repositories
             .settings(self.repository_id())
             .unwrap_or_default()
     }
@@ -311,7 +325,8 @@ impl AppState {
     pub fn observe_repository(
         &self,
     ) -> Option<(crate::repository_config::RepositorySettings, &'static str)> {
-        self.repositories
+        self.shared
+            .repositories
             .observe(self.repository_id())
             .map(|(settings, pipeline)| (settings, pipeline.reasoner().mode_name()))
     }
@@ -330,11 +345,11 @@ impl AppState {
             crate::repositories::CatalogError,
         >,
     ) -> Result<(), ApiError> {
-        Ok(self.repositories.patch(self.repository_id(), edit)?)
+        Ok(self.shared.repositories.patch(self.repository_id(), edit)?)
     }
 
     pub fn mark_ready(&self) {
-        self.ready.store(true, Ordering::Release);
+        self.shared.ready.store(true, Ordering::Release);
     }
 
     /// Started and serving strictly: not in reasoning quarantine (see
@@ -345,7 +360,7 @@ impl AppState {
 
     /// Startup has finished (the server accepts requests).
     pub fn is_started(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.shared.ready.load(Ordering::Acquire)
     }
 
     /// Requests are served once startup has finished, also in quarantine: reads there
@@ -359,12 +374,13 @@ impl AppState {
         }
     }
 
-    /// The data is inconsistent under the configured reasoning: readable and repairable,
-    /// but not ready.
+    /// The data is inconsistent under the configured reasoning, or its rules' violations
+    /// are undecided: readable and repairable, but not ready.
     pub fn is_quarantined(&self) -> bool {
         matches!(
             self.store().consistency(),
             nrese_store::ConsistencyStatus::Inconsistent { .. }
+                | nrese_store::ConsistencyStatus::Undecided { .. }
         )
     }
 
@@ -389,11 +405,11 @@ impl AppState {
     }
 
     pub fn ai(&self) -> Arc<AiSuggestionService> {
-        Arc::clone(&self.ai)
+        Arc::clone(&self.shared.ai)
     }
 
     pub fn deployment_posture(&self) -> DeploymentPosture {
-        self.deployment_posture
+        self.shared.deployment_posture
     }
 
     pub fn runtime_posture(&self) -> RuntimePosture {
@@ -413,7 +429,7 @@ impl AppState {
         match self.local_identity(headers, client).await? {
             Some(mut identity) => {
                 let principal = crate::access::principal(&identity);
-                identity.admin = self.access.state().is_admin(&principal);
+                identity.admin = self.shared.access.state().is_admin(&principal);
                 let mut grants = std::collections::BTreeSet::from([crate::auth::AccessGrant::Read]);
                 if identity.admin {
                     grants.insert(crate::auth::AccessGrant::Admin);
@@ -437,7 +453,7 @@ impl AppState {
         action: PolicyAction,
         authenticated: &crate::auth::Authenticated,
     ) -> Result<crate::auth::Identity, ApiError> {
-        let state = self.access.state();
+        let state = self.shared.access.state();
         let also = |identity: &crate::auth::Identity| {
             let principal = crate::access::principal(identity);
             match action {
@@ -453,7 +469,9 @@ impl AppState {
             }
         };
         let identity = authenticated.check(action, &also)?;
-        self.rate_limiter.enforce(action, self.policy.rate_limits)?;
+        self.shared
+            .rate_limiter
+            .enforce(action, self.policy.rate_limits)?;
         Ok(identity)
     }
 
@@ -535,6 +553,26 @@ fn access_config(template: &nrese_store::StoreConfig) -> nrese_store::StoreConfi
 mod tests {
     use nrese_store::memory::Unread;
     use nrese_store::{ProcessMemory, StoreConfig};
+
+    /// The states of one server share what the server holds: every request's layers and
+    /// handler hold a clone of the state, and the start marked through one is seen through a
+    /// clone made before it and through the default repository's state.
+    #[test]
+    fn a_states_clones_share_the_servers_start() {
+        let state = super::AppState::new(
+            nrese_store::StoreService::new(StoreConfig::in_memory()).unwrap(),
+            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
+            crate::policy::PolicyConfig::default(),
+            crate::ai::AiSuggestionService::disabled(),
+            super::DeploymentPosture::OpenWorkbench,
+        );
+        let clone = state.clone();
+        let default = state.for_repository(super::DEFAULT_REPOSITORY).unwrap();
+        assert!(!clone.is_started() && !default.is_started());
+        state.mark_ready();
+        assert!(clone.is_started(), "a clone");
+        assert!(default.is_started(), "the default repository's state");
+    }
 
     /// DC-07 S1 (Sol, round 1): the system store takes the default store's memory policy.
     /// With the limit switched off (0) it needs no reading, so a server whose memory can't

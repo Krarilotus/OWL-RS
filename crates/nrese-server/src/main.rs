@@ -300,11 +300,21 @@ async fn run() -> Result<()> {
     if let CliCommand::Load(load) = cli.command {
         bulk_load(&store, load)?;
         if let Some(program) = &program {
+            // The rebuild under the mode the server will run, as its pipeline sets it.
+            store.use_dl(
+                default_reasoner.mode().is_dl(),
+                default_reasoner.rules.is_some(),
+            );
             let report =
                 rematerialise(&store, program).context("reasoning after the bulk load failed")?;
             if report.violations > 0 {
                 // The data stays loaded (for diagnosis and repair); the server will start
                 // in quarantine.
+                if let nrese_store::ConsistencyStatus::Undecided { violations, why } =
+                    store.consistency()
+                {
+                    anyhow::bail!("the loaded data: {}", why.text(violations));
+                }
                 anyhow::bail!(
                     "the loaded data is inconsistent under {}: {}{} violation(s)",
                     program.name(),
@@ -599,10 +609,10 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
             report.load.as_deref().unwrap_or_default()
         );
         for example in &report.examples {
-            eprintln!(
-                "  {} line {}: {}",
-                example.file, example.line, example.reason
-            );
+            match example.line {
+                0 => eprintln!("  {}: {}", example.file, example.reason),
+                line => eprintln!("  {} line {line}: {}", example.file, example.reason),
+            }
         }
     }
     Ok(())
