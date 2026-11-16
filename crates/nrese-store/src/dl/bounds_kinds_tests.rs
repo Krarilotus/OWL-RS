@@ -75,9 +75,15 @@ fn ask(store: &StoreService, pattern: &str) -> (bool, String) {
     let prepared = store.prepare_query(&request).unwrap();
     let (mut out, mut status) = (Vec::new(), None);
     store
-        .run_query_reporting(&prepared, &crate::CancellationToken::new(), &mut out, |s| {
-            status = s
-        })
+        .run_query_reporting(
+            &prepared,
+            &crate::CancellationToken::new(),
+            &mut out,
+            |s, _| {
+                status = s;
+                None
+            },
+        )
         .unwrap();
     let status = status.map_or("none".to_owned(), |s| {
         format!("{} {:?}", s.as_str(), s.reasons)

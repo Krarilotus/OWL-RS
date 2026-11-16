@@ -174,15 +174,16 @@ pub fn term_heap(term: &Term) -> usize {
 pub(crate) enum Payload {
     /// A part's result as id columns.
     Part(Arc<Part>),
-    /// A whole query's answer in one output format.
-    Output(Arc<[u8]>),
+    /// A whole query's answer in one output format, and the status header its writer kept
+    /// with it (the same for every request of its key: [`OutputSlot::offer`]).
+    Output(Arc<[u8]>, Option<Arc<str>>),
 }
 
 impl Payload {
     fn bytes(&self) -> usize {
         match self {
             Self::Part(part) => part.bytes(),
-            Self::Output(bytes) => bytes.len(),
+            Self::Output(bytes, header) => bytes.len() + header.as_ref().map_or(0, |h| h.len()),
         }
     }
 }
@@ -426,8 +427,8 @@ impl std::fmt::Debug for ResultCache {
 /// A query's whole answer in one output format, as the result cache holds it
 /// ([`crate::query::cached_output`]), for the snapshot `'s` borrows.
 pub enum CachedOutput<'s> {
-    /// The answer's bytes, as written before.
-    Hit(Arc<[u8]>),
+    /// The answer's bytes, as written before, and the status header kept with them.
+    Hit(Arc<[u8]>, Option<Arc<str>>),
     /// Not cached: write the answer, then offer its bytes to the slot.
     Miss(OutputSlot<'s>),
     /// Not cached and not to be (no cache, a transaction view, a volatile query, a pin).
@@ -453,7 +454,7 @@ pub enum CachedOutput<'s> {
 ///     CachedOutput::Miss(slot) => slot,
 ///     _ => unreachable!("nothing is cached yet"),
 /// };
-/// slot.offer(b"s,p,o\r\n".to_vec(), std::time::Duration::from_millis(1));
+/// slot.offer(b"s,p,o\r\n".to_vec(), None, std::time::Duration::from_millis(1));
 /// ```
 ///
 /// Kept past its snapshot, it doesn't compile:
@@ -475,7 +476,7 @@ pub enum CachedOutput<'s> {
 ///         _ => unreachable!("nothing is cached yet"),
 ///     }
 /// };
-/// slot.offer(b"s,p,o\r\n".to_vec(), std::time::Duration::from_millis(1));
+/// slot.offer(b"s,p,o\r\n".to_vec(), None, std::time::Duration::from_millis(1));
 /// ```
 pub struct OutputSlot<'s> {
     cache: Arc<ResultCache>,
@@ -491,14 +492,16 @@ impl OutputSlot<'_> {
         self.cache.capacity / 4
     }
 
-    /// Offers the answer's `bytes`, which took `cost` to evaluate and write: kept if that
-    /// is worth their bytes (module docs).
-    pub fn offer(self, bytes: Vec<u8>, cost: Duration) {
+    /// Offers the answer's `bytes`, which took `cost` to evaluate and write, with the status
+    /// `header` its writer sent before them: kept if that is worth their bytes and the
+    /// header's (module docs). The header must be the same for every request of this
+    /// answer's key: the context the key holds decides it.
+    pub fn offer(self, bytes: Vec<u8>, header: Option<Arc<str>>, cost: Duration) {
         // Not a part computed: no miss (the query's parts counted theirs). No floor: a hit
         // replaces the whole request, whose parsing and key it pays as well.
-        let len = bytes.len();
+        let len = bytes.len() + header.as_ref().map_or(0, |h| h.len());
         self.cache.admit(&self.key, len, cost, Duration::ZERO, || {
-            Some(Payload::Output(bytes.into()))
+            Some(Payload::Output(bytes.into(), header))
         });
     }
 }
@@ -730,7 +733,7 @@ impl ResultCache {
     pub(crate) fn lookup(&self, key: &Key) -> Option<Arc<Part>> {
         match self.hit(&mut self.state(), key)? {
             Payload::Part(part) => Some(part),
-            Payload::Output(_) => None,
+            Payload::Output(..) => None,
         }
     }
 
@@ -756,7 +759,7 @@ impl ResultCache {
         }
         let key = Key::admitted(token, part);
         match self.hit(&mut self.state(), &key) {
-            Some(Payload::Output(bytes)) => CachedOutput::Hit(bytes),
+            Some(Payload::Output(bytes, header)) => CachedOutput::Hit(bytes, header),
             _ => CachedOutput::Miss(OutputSlot {
                 cache: Arc::clone(self),
                 _state: token,
@@ -831,7 +834,7 @@ impl ResultCache {
         let pinned = state.pinned(&key.part);
         let floor = match payload {
             Payload::Part(_) => MIN_COST,
-            Payload::Output(_) => Duration::ZERO,
+            Payload::Output(..) => Duration::ZERO,
         };
         state.advance(key.snapshot.revision);
         let reject = |state: &mut State, reason: Option<String>| {
@@ -912,7 +915,7 @@ impl ResultCache {
         let answers = state
             .entries
             .values()
-            .filter(|entry| matches!(entry.payload, Payload::Output(_)))
+            .filter(|entry| matches!(entry.payload, Payload::Output(..)))
             .count();
         ResultCacheStats {
             hits: self.hits.load(Ordering::Relaxed),
@@ -947,7 +950,7 @@ impl ResultCache {
                     revision: held.map(|(key, _)| key.snapshot.revision),
                     rows: held.map_or(0, |(_, entry)| match &entry.payload {
                         Payload::Part(part) => part.table.len(),
-                        Payload::Output(_) => 0,
+                        Payload::Output(..) => 0,
                     }),
                     bytes: held.map_or(0, |(_, entry)| entry.bytes),
                 }
@@ -1545,20 +1548,43 @@ mod tests {
         let CachedOutput::Miss(slot) = output(&cache, &answer) else {
             panic!("nothing cached")
         };
-        slot.offer(vec![b'x'; 100], Duration::from_micros(5));
+        slot.offer(vec![b'x'; 100], None, Duration::from_micros(5));
         assert!(matches!(
             output(&cache, &answer),
-            CachedOutput::Hit(bytes) if bytes.len() == 100
+            CachedOutput::Hit(bytes, _) if bytes.len() == 100
         ));
         // Unless copying them costs as much as writing them did.
         let large = key(&one, "large");
         let CachedOutput::Miss(slot) = output(&cache, &large) else {
             panic!("nothing cached")
         };
-        slot.offer(vec![b'x'; 100_000], Duration::from_micros(5));
+        slot.offer(vec![b'x'; 100_000], None, Duration::from_micros(5));
         assert!(matches!(output(&cache, &large), CachedOutput::Miss(_)));
         let stats = cache.stats();
         assert_eq!((stats.answers, stats.entries), (1, 1));
+    }
+
+    #[test]
+    fn an_answers_header_is_given_back_with_it_and_counted_in_its_bytes() {
+        let one = published(1);
+        let cache = Arc::new(ResultCache::new(1 << 20));
+        let mut charged = Vec::new();
+        for (part, header) in [
+            ("bare", None),
+            ("told", Some(Arc::<str>::from("sound-only"))),
+        ] {
+            let answer = key(&one, part);
+            let CachedOutput::Miss(slot) = output(&cache, &answer) else {
+                panic!("nothing cached")
+            };
+            let before = cache.stats().bytes;
+            slot.offer(vec![b'x'; 100], header.clone(), Duration::from_micros(5));
+            charged.push(cache.stats().bytes - before);
+            assert!(
+                matches!(output(&cache, &answer), CachedOutput::Hit(_, kept) if kept == header)
+            );
+        }
+        assert_eq!(charged[1] - charged[0], "sound-only".len());
     }
 
     #[test]

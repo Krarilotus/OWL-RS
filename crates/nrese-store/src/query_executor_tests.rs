@@ -76,7 +76,7 @@ fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
             &token,
             &nrese_exec::Envelope::unlimited(),
             &mut bytes,
-            |_| panic!("cancelled before reporting")
+            |_| -> (Vec<u8>, fn(_) -> _) { panic!("cancelled before reporting") },
         ),
         Err(StoreError::SparqlEvaluation(
             QueryEvaluationError::Cancelled
@@ -93,7 +93,7 @@ fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
         &mut bytes,
         |report| {
             assert_eq!(report.unwrap().checks, 1);
-            Vec::new()
+            (Vec::new(), |_| None)
         },
     )
     .unwrap()
@@ -109,7 +109,7 @@ fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
         &token,
         &nrese_exec::Envelope::unlimited(),
         std::io::sink(),
-        |_| Vec::new(),
+        |_| (Vec::new(), |_| None),
     )
     .unwrap()
     .unwrap();
@@ -143,7 +143,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
                 .as_ref(),
             );
             tx.commit().unwrap();
-            b"same-context".to_vec()
+            (b"same-context".to_vec(), |_| None)
         },
     )
     .unwrap();
@@ -165,11 +165,12 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
                 prepared.media_type(),
                 b"same-context"
             ),
-            CachedOutput::Hit(_)
+            CachedOutput::Hit(..)
         ),
         "original key retained"
     );
     let mut bytes = Vec::new();
+    let cancel = &token;
     let error = run_query(
         &snapshot,
         &prepared,
@@ -177,9 +178,12 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
         &token,
         &nrese_exec::Envelope::unlimited(),
         &mut bytes,
-        |_| {
-            token.cancel();
-            b"same-context".to_vec()
+        // A hit: the report that cancels is the one handed the kept status header.
+        move |_| {
+            (b"same-context".to_vec(), move |_| {
+                cancel.cancel();
+                None
+            })
         },
     )
     .unwrap_err();
@@ -202,7 +206,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
         &CancellationToken::new(),
         &settings.query_envelope(&prepared),
         &mut second,
-        |_| b"same-context".to_vec(),
+        |_| (b"same-context".to_vec(), |_| None),
     )
     .unwrap();
     assert_eq!(first, second);
@@ -219,7 +223,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
             &token,
             &nrese_exec::Envelope::unlimited(),
             &mut writer,
-            |_| { b"same-context".to_vec() }
+            |_| (b"same-context".to_vec(), |_| None),
         ),
         Err(StoreError::SparqlEvaluation(
             QueryEvaluationError::Cancelled
@@ -374,7 +378,7 @@ fn prepared_serializers_agree_with_standalone_execution_for_every_form_and_forma
                 &token,
                 &nrese_exec::Envelope::unlimited(),
                 &mut actual,
-                |_| Vec::new(),
+                |_| (Vec::new(), |_| None),
             )
             .unwrap()
             .unwrap();
