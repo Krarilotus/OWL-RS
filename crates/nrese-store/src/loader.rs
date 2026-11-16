@@ -41,6 +41,14 @@ pub(crate) fn preload_ontology(
             Ok(())
         },
     )?;
+    // A preload that adds statements drops the reasoning certificate before it publishes them,
+    // as a bulk load does: an open that fails after this commit leaves none for data it never
+    // described.
+    if config.mode == crate::StoreMode::OnDisk
+        && tx.asserted_identity_after() != tx.base().asserted_identity()
+    {
+        crate::metadata::remove(&config.data_dir.join(crate::service::REASONING_MARKER))?;
+    }
     let summary = tx.commit()?;
     info!(
         ontology_path = %ontology_path.display(),

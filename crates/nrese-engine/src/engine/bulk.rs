@@ -200,6 +200,17 @@ impl<'e> BulkLoad<'e> {
     /// Publishes the loaded quads as one new revision (see the module docs for durability).
     /// Returns the revision and the asserted and inferred quads added and removed.
     pub fn finish(self) -> EngineResult<CommitSummary> {
+        self.finish_with(|_| Ok(()))
+    }
+
+    /// [`finish`](Self::finish), calling `before_publish` once the load is known to publish,
+    /// under its writer slot and before anything of the new version is written (its
+    /// checkpoint) or served. A load that changes nothing, or fails before, doesn't call it;
+    /// its error fails the load, nothing published.
+    pub fn finish_with(
+        self,
+        before_publish: impl FnOnce(super::WriterHeld<'_>) -> EngineResult<()>,
+    ) -> EngineResult<CommitSummary> {
         // A load that spilled sends what is left as its last chunk.
         if self.spiller.lock().is_some() {
             self.spill(true);
@@ -267,6 +278,8 @@ impl<'e> BulkLoad<'e> {
         });
         renumbered?;
         if let Some(spill) = spilled {
+            // A load spills only what it holds: it publishes.
+            before_publish(super::WriterHeld::new())?;
             return publish_spilled(engine, spill, current, started);
         }
         // By radix over the bits the ids use ([`nrese_exec::sort`]).
@@ -399,6 +412,7 @@ impl<'e> BulkLoad<'e> {
             });
         }
 
+        before_publish(super::WriterHeld::new())?;
         let built = started.elapsed();
         publish(engine, next)?;
         // The writer slot is held: the latest version is the one just published.
