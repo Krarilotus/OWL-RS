@@ -1642,6 +1642,7 @@ impl StoreService {
             )
             .map(|_| ())
         });
+        let run = run.map_err(|error| refusal_for_its_reader(prepared, error));
         for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {})
     }
 
