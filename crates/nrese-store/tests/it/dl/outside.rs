@@ -587,6 +587,43 @@ fn fails(class: &str) -> bool {
 type Rows = Vec<(Vec<String>, Vec<String>, Vec<String>)>;
 
 impl Case {
+    /// Whether a key names an object property that isn't simple (Structural Specification
+    /// §11.1: a chain into it or a transitive property under it). OWL 2 DL allows it: §11.2's
+    /// list of axioms that need simple properties has no HasKey (w3c2012owl2syntax.txt:
+    /// 4966-4970). But both references miss a key over a value only a chain implies, and a
+    /// wrong "consistent" moves every answer. Keys come from the rows above, as a list of
+    /// names; the generator draws no equivalent properties and pairs inverses among simple ones.
+    fn reference_gap(&self) -> bool {
+        let all: Vec<&str> = self.groups.iter().map(|g| g.turtle.as_str()).collect();
+        let mut text = all.join(" ").replace('>', "");
+        for (iri, short) in [(F, "f:"), (OWL, "owl:"), (RDFS, "rdfs:")] {
+            text = text.replace(&format!("<{iri}"), short);
+        }
+        let t: Vec<&str> = text.split_whitespace().collect();
+        let w: Vec<&[&str]> = t.windows(3).collect();
+        let inverse = w
+            .iter()
+            .filter(|x| x[1] == "owl:inverseOf" && x[0].starts_with("_:"));
+        let inverse: BTreeMap<&str, &str> = inverse.map(|x| (x[0], x[2])).collect();
+        let of = |x: &str| inverse.get(x).unwrap_or(&x).to_string();
+        let composite = w
+            .iter()
+            .filter(|x| x[1] == "owl:propertyChainAxiom" || x[2] == "owl:TransitiveProperty");
+        let mut not_simple: BTreeSet<String> = composite.map(|x| of(x[0])).collect();
+        let sub = w.iter().filter(|x| x[1] == "rdfs:subPropertyOf");
+        let sub: Vec<(String, String)> = sub.map(|x| (of(x[0]), of(x[2]))).collect();
+        for _ in 0..sub.len() {
+            for (a, b) in &sub {
+                if not_simple.contains(a) {
+                    not_simple.insert(b.clone());
+                }
+            }
+        }
+        let keys = (2..t.len()).filter(|&i| t[i - 2] == "owl:hasKey");
+        let mut keys = keys.flat_map(|i| t[i..].iter().take_while(|x| **x != ")"));
+        keys.any(|p| not_simple.contains(&of(p)))
+    }
+
     fn kept<'a>(&'a self, skip: &'a BTreeSet<usize>) -> impl Iterator<Item = &'a Group> {
         let all = 0..self.groups.len();
         all.filter(move |i| !skip.contains(i))
@@ -882,6 +919,15 @@ fn dl_answers_agree_with_outside_reasoners() {
             s.spawn(move || {
                 for seed in (first + w..first + cases).step_by(workers as usize) {
                     let case = generate(seed);
+                    let tags: BTreeSet<&str> = case.groups.iter().map(|g| g.tag).collect();
+                    let tags = tags.into_iter().collect::<Vec<_>>().join(",");
+                    if case.reference_gap() {
+                        let why = "a key over a property that isn't simple";
+                        let row = format!("{seed}\t{}\t{tags}\tcase\treference-gap", case.shape);
+                        let mut file = summary.lock().expect("summary");
+                        writeln!(file, "{row}\treference-gap\t{why}").expect("summary.tsv");
+                        continue;
+                    }
                     let (none, picked) = (BTreeSet::new(), case.picked(case.queries.len() + 1));
                     let texts: Vec<String> = picked.iter().map(|&k| case.text(k)).collect();
                     let got = store(&case.commits(&none), &texts);
@@ -892,8 +938,6 @@ fn dl_answers_agree_with_outside_reasoners() {
                         true => case.verdicts(&none, &picked, &got, &mut reference, "openllet"),
                         false => Vec::new(),
                     };
-                    let tags: BTreeSet<&str> = case.groups.iter().map(|g| g.tag).collect();
-                    let tags = tags.into_iter().collect::<Vec<_>>().join(",");
                     for (i, class, detail) in &hermit {
                         let openllet = openllet.iter().find(|(j, _, _)| j == i);
                         let second = openllet.map(|(_, c, _)| c);
@@ -1001,6 +1045,14 @@ fn planted_answers_are_judged_by_kind_and_label() {
     };
     assert_eq!(undecided("reads differently"), "undecided-unfounded");
     assert_eq!(undecided("within its budget"), "undecided-unchecked");
+    let keyed = |key: &str| {
+        let mut case = generate(0);
+        case.groups.truncate(1);
+        let chain = "f:p3 owl:propertyChainAxiom ( f:p1 f:p2 ) .";
+        case.groups[0].turtle = format!("{chain} f:C1 owl:hasKey ( {key} ) .");
+        case.reference_gap()
+    };
+    assert!(keyed("f:p3") && !keyed("f:p0"));
 }
 
 /// The real references, for the planted faults below (run by outside.sh before a campaign).
