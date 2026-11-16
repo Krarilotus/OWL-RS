@@ -281,19 +281,30 @@ async fn an_undecided_dl_explanation_is_an_incomplete_answer()
 }
 
 /// `request`'s answer must be the documented refusal of exact answers (`docs/ops/http-api.md`,
-/// `dl-answers`): 422, the incomplete-answer problem under owl2-dl with its reasons. What
+/// `dl-answers`), given before any answer is evaluated: 422, an `application/problem+json`
+/// incomplete-answer problem under owl2-dl, with no bounds and no unresolved candidate. Its
+/// reasons are those the same read reports without exact (`without`, its
+/// NRESE-Completeness), and one of them is `want` (its source, words of its text). What
 /// came instead is in the failure: the HTTP status, NRESE-Completeness and the body.
 async fn refused(
     app: &axum::Router,
     label: &str,
     request: Request<Body>,
+    without: &str,
+    want: (&str, &str),
 ) -> Result<(), Box<dyn std::error::Error>> {
     let response = app.clone().oneshot(request).await?;
     let code = response.status();
     let status = response.headers().get("nrese-completeness").cloned();
+    let media = response.headers().get("content-type").cloned();
     let body = body_text(response).await?;
     let got = format!("{label}: got {code}, NRESE-Completeness {status:?}, body {body}");
     assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{got}");
+    assert_eq!(
+        media.as_ref().and_then(|m| m.to_str().ok()),
+        Some("application/problem+json"),
+        "{got}"
+    );
     let problem: serde_json::Value = serde_json::from_str(&body)?;
     assert_eq!(
         problem["type"], "https://nrese.dev/problems/incomplete-answer",
@@ -301,11 +312,43 @@ async fn refused(
     );
     assert_eq!(problem["status"], 422, "{got}");
     assert_eq!(problem["regime"], "owl2-dl", "{got}");
+    assert_eq!(problem["bounds"], serde_json::Value::Null, "{got}");
+    assert_eq!(problem["unresolved"], serde_json::json!([]), "{got}");
+    let reasons = problem["reasons"].as_array().cloned().unwrap_or_default();
+    let line = |r: &serde_json::Value| {
+        let part = |key: &str| r[key].as_str().unwrap_or_default().to_owned();
+        format!("{}: {}", part("source"), part("text"))
+    };
     assert!(
-        problem["reasons"].as_array().is_some_and(|r| !r.is_empty()),
+        reasons
+            .iter()
+            .any(|r| r["source"] == want.0 && line(r).contains(want.1)),
         "{got}"
     );
+    for reason in reasons.iter().map(line) {
+        assert!(
+            without.contains(&reason),
+            "{label}: {reason:?} isn't among the reasons without exact, {without}"
+        );
+    }
     Ok(())
+}
+
+/// A new transaction's path, from `/repositories/`.
+async fn begin(app: &axum::Router) -> Result<String, Box<dyn std::error::Error>> {
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::POST)
+                .uri("/repositories/nrese/transactions")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let location = response.headers()["location"].to_str()?.to_owned();
+    let at = location.find("/repositories/").expect("a transaction path");
+    Ok(location[at..].to_owned())
 }
 
 /// Spec (`dl-answers=exact`, `docs/spec/reasoning-semantics.md`): under owl2-dl, exact answers
@@ -323,18 +366,7 @@ async fn exact_refuses_a_read_with_changes_pending() -> Result<(), Box<dyn std::
         PolicyConfig::default(),
         ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
     )?;
-    let response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .method(Method::POST)
-                .uri("/repositories/nrese/transactions")
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(response.status(), StatusCode::CREATED);
-    let location = response.headers()["location"].to_str()?.to_owned();
-    let tx = &location[location.find("/repositories/").expect("a transaction path")..];
+    let tx = begin(&app).await?;
     let in_tx = |extra: &str| {
         Request::builder()
             .method(Method::PUT)
@@ -371,6 +403,38 @@ async fn exact_refuses_a_read_with_changes_pending() -> Result<(), Box<dyn std::
         &app,
         "an addition pending, exact",
         in_tx(&exact).body(Body::empty())?,
+        &status,
+        ("dl", "a read inside a transaction"),
+    )
+    .await?;
+    // A deletion alone pending: the same refusal, and the deletion's reason in it.
+    let tx = begin(&app).await?;
+    let in_tx = |extra: &str| {
+        Request::builder()
+            .method(Method::PUT)
+            .uri(format!("{tx}?action={extra}"))
+            .header("accept", "application/sparql-results+json")
+            .header("content-type", "text/turtle")
+    };
+    let response = app
+        .clone()
+        .oneshot(in_tx("DELETE").body(Body::from(
+            "<http://example.com/y> a <http://example.com/B> .",
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let (status, _) = answer(&app, in_tx(&query).body(Body::empty())?).await?;
+    let status = status.unwrap_or_default();
+    assert!(
+        status.starts_with("unsound; regime=owl2-dl"),
+        "a deletion pending, without exact: {status}"
+    );
+    refused(
+        &app,
+        "a deletion pending, exact",
+        in_tx(&exact).body(Body::empty())?,
+        &status,
+        ("transaction", "may delete"),
     )
     .await
 }
@@ -396,11 +460,11 @@ async fn exact_refuses_an_inferred_only_read() -> Result<(), Box<dyn std::error:
         "&{}",
         serde_urlencoded::to_string([("default-graph-uri", IMPLICIT)])?
     );
-    let (status, _) = answer(&app, get(&from, "")?).await?;
-    let status = status.unwrap_or_default();
+    let (inferred, _) = answer(&app, get(&from, "")?).await?;
+    let inferred = inferred.unwrap_or_default();
     assert!(
-        status.starts_with("sound-only; regime=owl2-dl"),
-        "inferred only, without exact: {status}"
+        inferred.starts_with("sound-only; regime=owl2-dl"),
+        "inferred only, without exact: {inferred}"
     );
     let (status, _) = answer(&app, get(plain, "&dl-answers=exact")?).await?;
     let status = status.unwrap_or_default();
@@ -408,16 +472,37 @@ async fn exact_refuses_an_inferred_only_read() -> Result<(), Box<dyn std::error:
         status.starts_with("complete; regime=owl2-dl"),
         "the whole store, exact: {status}"
     );
+    let want = ("dl", "the inferred statements alone");
     refused(
         &app,
         "FROM onto:implicit, exact",
         get(&from, "&dl-answers=exact")?,
+        &inferred,
+        want,
     )
     .await?;
     refused(
         &app,
         "default-graph-uri onto:implicit, exact",
         get(plain, &format!("{by_param}&dl-answers=exact"))?,
+        &inferred,
+        want,
+    )
+    .await?;
+    // Exact as the repository's default (`dl.answers = "exact"`), no parameter: the same.
+    let mut config = StoreConfig::in_memory().with_ontology(dir.path().join("union.ttl"));
+    config.dl.answers = nrese_store::DlAnswers::Exact;
+    let by_default = test_app_with_store_config(
+        config,
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
+    )?;
+    refused(
+        &by_default,
+        "FROM onto:implicit, exact by default",
+        get(&from, "")?,
+        &inferred,
+        want,
     )
     .await
 }
