@@ -1737,9 +1737,14 @@ impl Snapshot {
         self.columns_of_stacks(model, &plan, permutation, components, budget)
     }
 
-    /// Whether a statement read in `model` has a triple term (RDF 1.2): triple terms are
-    /// objects only and their ids one range, so this is one seek in the object-first index.
-    pub fn holds_triple_terms(&self, model: ReadModel) -> bool {
+    /// Whether a statement read in `model` in a graph `graph` admits has a triple term (RDF
+    /// 1.2): triple terms are objects only and their ids one range, so this is one seek in
+    /// the object-first index, and a walk over the triple terms of the graphs it doesn't admit.
+    pub fn holds_triple_terms(
+        &self,
+        model: ReadModel,
+        mut graph: impl FnMut(TermId) -> bool,
+    ) -> bool {
         let (low, high) = TermId::kind_range(crate::TermKind::Triple);
         self.scan_range_in(
             model,
@@ -1748,7 +1753,7 @@ impl Snapshot {
             low,
             high,
         )
-        .is_some_and(|mut quads| quads.next().is_some())
+        .is_some_and(|mut quads| quads.any(|quad| graph(quad.graph)))
     }
 
     /// Whether a statement read in `model` with `predicate` (any, where `None`) has an object

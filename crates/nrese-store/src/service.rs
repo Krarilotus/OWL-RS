@@ -749,7 +749,7 @@ impl StoreService {
             || self
                 .engine
                 .snapshot()
-                .holds_triple_terms(prepared.read_model())
+                .holds_triple_terms(prepared.read_model(), |_| true)
         {
             prepared.announce_rdf12();
         }
