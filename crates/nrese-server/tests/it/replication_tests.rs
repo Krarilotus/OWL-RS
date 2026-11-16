@@ -493,6 +493,102 @@ async fn a_replica_of_a_compact_primary_gives_its_primarys_rows()
     Ok(())
 }
 
+/// With the QL rewriting on (`owl2-ql`, where `auto` switches it on, and `owl2-rl` with it
+/// on), a replica answers through it as its primary does, over the data of its image and of
+/// a commit applied after it: an existential no rule materialises gives each member of its
+/// class a row only through the rewriting. Each row's primary must give those rows first;
+/// then the replica's rows, and its status, must equal the primary's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_answers_through_the_ql_rewriting_as_its_primary()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nrese_store::QlRewritingMode::{Auto, On};
+    let owl = "PREFIX owl: <http://www.w3.org/2002/07/owl#> ";
+    let query = format!("{PREFIXES}SELECT ?x WHERE {{ ?x ex:worksFor ?y }} ORDER BY ?x");
+    let (mut unmet, mut wrong) = (Vec::new(), Vec::new());
+    for (label, mode, ql) in [
+        ("owl2-ql, auto", ReasoningMode::Owl2Ql, Auto),
+        ("owl2-rl, on", ReasoningMode::Owl2Rl, On),
+    ] {
+        let reasoner = || ReasonerService::new(ReasonerConfig::for_mode(mode));
+        let config = |dir: &std::path::Path| StoreConfig {
+            ql_rewriting: ql,
+            ..StoreConfig::on_disk(dir)
+        };
+        let primary_dir = tempfile::tempdir()?;
+        let primary_state = AppState::new(
+            StoreService::new(config(primary_dir.path()))?,
+            reasoner(),
+            PolicyConfig::default(),
+            AiSuggestionService::disabled(),
+            DeploymentPosture::OpenWorkbench,
+        )
+        .with_replication(ReplicationConfig {
+            mode: ReplicationMode::Primary,
+            ..ReplicationConfig::default()
+        });
+        primary_state.mark_ready();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let base = format!("http://{}", listener.local_addr()?);
+        let primary_app = build_app(primary_state.clone());
+        tokio::spawn(async move {
+            axum::serve(listener, primary_app).await.expect("primary");
+        });
+        update(
+            &base,
+            &format!(
+                "{owl}INSERT DATA {{ ex:Employee rdfs:subClassOf [ a owl:Restriction ; \
+                 owl:onProperty ex:worksFor ; owl:someValuesFrom owl:Thing ] . \
+                 ex:bob a ex:Employee }}"
+            ),
+        )
+        .await;
+
+        let replica_dir = tempfile::tempdir()?;
+        let replication = ReplicationConfig {
+            mode: ReplicationMode::Replica,
+            primary: Some(base.clone()),
+            poll: std::time::Duration::from_millis(20),
+            ..ReplicationConfig::default()
+        };
+        replication::bootstrap(&replication, replica_dir.path()).await?;
+        let replica_state = AppState::new(
+            StoreService::new(config(replica_dir.path()))?,
+            reasoner(),
+            PolicyConfig::default(),
+            AiSuggestionService::disabled(),
+            DeploymentPosture::OpenWorkbench,
+        )
+        .with_replication(replication);
+        replica_state.mark_ready();
+        update(&base, "INSERT DATA { ex:alice a ex:Employee }").await;
+        catch_up(&base, &replica_state).await;
+
+        let (rows, status) = answered(build_app(primary_state.clone()), &query).await?;
+        if !["alice", "bob"]
+            .iter()
+            .all(|x| rows.contains(&format!("example.com/{x}\"")))
+        {
+            unmet.push(format!("{label}: the primary's rows: {rows}"));
+            continue;
+        }
+        let (replica_rows, replica_status) =
+            answered(build_app(replica_state.clone()), &query).await?;
+        if replica_rows != rows {
+            wrong.push(format!(
+                "{label}: rows: the primary {rows}, the replica {replica_rows}"
+            ));
+        }
+        if replica_status != status {
+            wrong.push(format!(
+                "{label}: status: the primary {status:?}, the replica {replica_status:?}"
+            ));
+        }
+    }
+    assert!(unmet.is_empty(), "{unmet:#?}");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    Ok(())
+}
+
 /// A replica's data directory, made by its bootstrap, is durably named (sol-loop round 3 on
 /// DUR-3 review r1, S1): into `sealed/a`, where `sealed` exists but can't be opened (mode
 /// 0o311), so its sync, which must name `a`, fails, the bootstrap must refuse. Before the fix it
