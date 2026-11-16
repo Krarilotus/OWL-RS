@@ -1320,3 +1320,89 @@ async fn repository_patches_at_once_keep_each_other() {
         lost.len()
     );
 }
+
+/// An import that stops changes no answer: under `owl2-ql`, an answer through the rewriting
+/// the reasoning certificate switches on stays after a cut document fails, imported at once
+/// (400) or as a job (`failed`), in the process and after a restart; the marker on disk stays.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_import_changes_no_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("store");
+    let app = || {
+        test_app_with_store_config(
+            StoreConfig::on_disk(&store_dir),
+            PolicyConfig::default(),
+            ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Ql),
+        )
+        .unwrap()
+    };
+    let base = "/api/v1/repositories/nrese";
+    let prefixes = "@prefix : <http://example.com/> . \
+        @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n";
+    // `:a :p ?o` holds only through the rewriting of the existential.
+    let ontology = format!(
+        "{prefixes}:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+         owl:someValuesFrom owl:Thing ] .\n:a a :A .\n"
+    );
+    let cut = format!("{prefixes}:c a :A .\n:d a :");
+    let ask = |app: Router| async move {
+        let query = "ASK { <http://example.com/a> <http://example.com/p> ?o }";
+        let (status, text) = send(
+            &app,
+            Method::POST,
+            &format!("{base}/query"),
+            Some("application/sparql-query"),
+            query,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["boolean"].as_bool().expect("a boolean")
+    };
+    let marker = || std::fs::read(store_dir.join("reasoning.state")).ok();
+    let first = app();
+    let import = format!("{base}/import");
+    let (status, text) = send(
+        &first,
+        Method::POST,
+        &import,
+        Some("text/turtle"),
+        &ontology,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(
+        ask(first.clone()).await,
+        "the rewriting answers the existential"
+    );
+    let written = marker();
+    assert!(
+        written.is_some(),
+        "the import's reasoning certified the store"
+    );
+    let mut wrong = Vec::new();
+    let (status, text) = send(&first, Method::POST, &import, Some("text/turtle"), &cut).await;
+    if status != StatusCode::BAD_REQUEST {
+        wrong.push(format!("the cut import: {status} {text}"));
+    }
+    if !ask(first.clone()).await || marker() != written {
+        wrong.push("the cut import changed the answer or the marker".to_owned());
+    }
+    let jobs = format!("{import}?async=true");
+    let (status, text) = send(&first, Method::POST, &jobs, Some("text/turtle"), &cut).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+    let started: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let job = finished(&first, started["path"].as_str().unwrap()).await;
+    if job["state"] != "failed" {
+        wrong.push(format!("the cut job: {job}"));
+    }
+    if !ask(first.clone()).await || marker() != written {
+        wrong.push("the cut job changed the answer or the marker".to_owned());
+    }
+    drop(first);
+    if !ask(app()).await {
+        wrong.push("after a restart, the answer changed".to_owned());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
