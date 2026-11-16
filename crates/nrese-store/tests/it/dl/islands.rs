@@ -3,7 +3,9 @@
 //! split with its member like any other.
 //!
 //! The rows run under explicit DL settings, those of the check that found the case: a 5 s
-//! timeout and at most 100,000 nodes and 100,000 branch points.
+//! timeout and at most 100,000 nodes and 100,000 branch points. Before the fix, a release
+//! build panicked under these settings, and a debug build panicked under the default settings
+//! too.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::time::Duration;
