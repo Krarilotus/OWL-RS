@@ -1,0 +1,60 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 511" width="400" height="511" role="img" aria-labelledby="title desc">
+<!-- Generated; the light and dark variants differ only in <style>. -->
+<title id="title">Invalid statements in a bulk load</title>
+<desc id="desc">A bulk load sends valid statements to the data, what queries, reasoning and exports see. A statement with a syntax error goes to the quarantine, kept with its file and reason, and its text and line where known; it is not data. Re-admission, drawn dashed: fixed if need be, it is checked like any write; refused, it stays in quarantine; otherwise it becomes data. Today re-admission is a store function only; its HTTP API and command are proposed. With --strict, a syntax error stops the whole load, and none of it is committed.</desc>
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #E6EDF3; }
+  .paper { fill: #0D1117; }
+  .name { font-size: 16px; font-weight: 600; }
+  .text { font-size: 14.5px; }
+  .muted { font-size: 14.5px; fill: #9198A1; }
+  .edge { font-size: 14px; font-style: italic; fill: #9198A1; }
+  .code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; }
+  .box { fill: #0D1117; stroke: #6E7681; stroke-width: 1.25; }
+  .band { fill: #151B23; }
+  .chip { fill: #0D1117; stroke: #6E7681; stroke-width: 1.1; }
+  .chip-on { fill: #E6EDF3; }
+  .chip-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; fill: #0D1117; }
+  .asserted { fill: #0D1117; stroke: #6E7681; stroke-width: 1.1; }
+  .inferred { fill: #2B2111; stroke: #9E6A03; stroke-width: 1.1; }
+  .inferred-text { font-size: 16px; font-weight: 600; fill: #E3B341; }
+  .track { fill: #262C36; }
+  .frame { fill: none; stroke: #6E7681; stroke-width: 1.25; }
+  .divider { fill: none; stroke: #6E7681; stroke-width: 1.25; }
+  .mark { fill: none; stroke: #E6EDF3; stroke-width: 2; }
+  .seg-on { fill: #0D1117; stroke: #6E7681; stroke-width: 1; }
+  .seg-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; font-weight: 600; }
+  .refused { fill: #FF8A80; }
+  .refused-text { fill: #FF8A80; font-weight: 600; }
+  .inferred-word { fill: #E3B341; font-weight: 600; }
+  .flow { fill: none; stroke: #9198A1; stroke-width: 1.4; }
+  .flow-refused { fill: none; stroke: #FF8A80; stroke-width: 1.4; }
+</style>
+<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow" d="M1 1 L9 5 L1 9"/></marker><marker id="head-refused" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow-refused" d="M1 1 L9 5 L1 9"/></marker></defs>
+<rect class="paper" x="0" y="0" width="400" height="511" rx="0"/>
+<rect class="box" x="0" y="0" width="400" height="34" rx="6"/>
+<text x="14" y="22" class="name">Bulk load</text>
+<text x="46" y="59" class="edge">valid</text>
+<path class="flow" d="M134 36 V71" marker-end="url(#head)"/>
+<text x="146" y="59" class="edge">syntax error</text>
+<rect class="box" x="104" y="74" width="296" height="99" rx="6"/>
+<text x="118" y="100" class="name">Quarantine</text>
+<text x="118" y="122" class="text">kept with its file and reason, and</text>
+<text x="118" y="141" class="text">its text and line where known;</text>
+<text x="118" y="160" class="text">not data</text>
+<path class="flow" stroke-dasharray="5 4" d="M134 175 V210" marker-end="url(#head)"/>
+<rect stroke-dasharray="5 4" class="box" x="104" y="213" width="296" height="144" rx="6"/>
+<text x="118" y="239" class="name">Re-admission</text>
+<text x="118" y="261" class="text">fixed if need be, then checked like</text>
+<text x="118" y="280" class="text">any write; refused, it stays in</text>
+<text x="118" y="299" class="text">quarantine</text>
+<text x="118" y="325" class="text"><tspan class="muted">today a store function only; its</tspan></text>
+<text x="118" y="344" class="text"><tspan class="muted">HTTP API and command are proposed</tspan></text>
+<path class="flow" stroke-dasharray="5 4" d="M134 359 V394" marker-end="url(#head)"/>
+<rect class="box" x="0" y="397" width="400" height="61" rx="6"/>
+<text x="14" y="423" class="name">Data</text>
+<text x="14" y="445" class="text">what queries, reasoning and exports see</text>
+<path class="flow" d="M34 36 V394" marker-end="url(#head)"/>
+<text x="1" y="484" class="muted"><tspan class="muted">With </tspan><tspan class="code">--strict</tspan><tspan class="muted">, a syntax error stops the whole load,</tspan></text>
+<text x="1" y="503" class="muted">and none of it is committed.</text>
+</svg>
