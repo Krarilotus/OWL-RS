@@ -107,6 +107,64 @@ fn memberships_through_a_union_come_from_the_taxonomy_or_ground_entailment() {
     assert_eq!(dl.store().dl_bounds().lower_facts, 1);
 }
 
+/// `s` is an A or a B, and both have the value `v` on `:q`: `s :q v` holds in every model,
+/// whatever the value is. `{value}` is that value, `{other}` another value `:q` has.
+fn has_value_through_a_union(value: &str, other: &str) -> String {
+    format!(
+        ":s a [ owl:unionOf ( :A :B ) ] . \
+         :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :q ; owl:hasValue {value} ] . \
+         :B rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :q ; owl:hasValue {value} ] . \
+         :z :q {other} ."
+    )
+}
+
+/// Spec (module docs: every answer is sound and says whether it is complete): a statement
+/// that holds in every model is never a complete `false`. Here the property's values are
+/// triple terms; the control is the same ontology with IRI values (true, by ground
+/// entailment).
+#[test]
+fn a_value_every_model_gives_through_a_union_is_never_a_complete_false_for_a_triple_term() {
+    let triple = pipeline();
+    insert(
+        &triple,
+        &has_value_through_a_union("<<( :a :b :c )>>", "<<( :d :e :f )>>"),
+    )
+    .expect("data");
+    // Exact answers: an answer that isn't complete is the error `Incomplete`.
+    let answer = query_with(
+        &triple,
+        "ASK { :s :q <<( :a :b :c )>> }",
+        Some(DlAnswers::Exact),
+    );
+    let iri = pipeline();
+    insert(&iri, &has_value_through_a_union(":v", ":t")).expect("data");
+    let control = query_with(&iri, "ASK { :s :q :v }", Some(DlAnswers::Exact));
+    let described = |answer: &Result<(Vec<String>, Completeness), StoreError>| match answer {
+        Ok((rows, status)) => format!(
+            "{rows:?} complete={} paths={:?} reasons={:?} bounds={:?}",
+            status.is_complete(),
+            status.paths,
+            status.reasons(),
+            status.bounds
+        ),
+        Err(error) => format!("{error:?}"),
+    };
+    assert!(
+        match &answer {
+            Ok((rows, status)) => *rows == ["true"] || !status.is_complete(),
+            Err(error) => matches!(error, StoreError::Incomplete(_)),
+        },
+        "s :q <<( :a :b :c )>> holds in every model, answered {}; the IRI control: {}",
+        described(&answer),
+        described(&control),
+    );
+    assert!(
+        matches!(&control, Ok((rows, status)) if *rows == ["true"] && status.is_complete()),
+        "{}",
+        described(&control)
+    );
+}
+
 #[test]
 fn a_membership_the_taxonomy_gives_closes_its_class() {
     let dl = pipeline();
