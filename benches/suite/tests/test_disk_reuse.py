@@ -1,4 +1,4 @@
-"""What benchmark runs leave on a shared host's disk (notes/2026-10-19-office-disk.md): a gate's
+"""What benchmark runs leave on a shared host's disk (19 Oct 2026): a gate's
 prepared data once per host, not once per gate name; the cleanup's volumes by our names alone,
 and Docker's build cache bounded."""
 from __future__ import annotations
@@ -55,7 +55,7 @@ BASH = os.environ.get("NRESE_BASH") or next(
 @unittest.skipUnless(BASH, "needs bash")
 class CleanupCache(unittest.TestCase):
     def test_the_build_cache_is_bounded_and_nothing_unlabelled_is_pruned_or_removed(self):
-        """Office's disk, 19 Oct 2026: bench-cleanup never touched Docker's build cache. It is
+        """The shared host's disk, 19 Oct 2026: bench-cleanup never touched Docker's build cache. It is
         bounded now; volumes stay the label sweep's (scripts/lib/ns.sh), never a wildcard prune."""
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)

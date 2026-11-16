@@ -1,6 +1,6 @@
 # A job of this repository on the fleet: submit, follow, fetch (sourced by scripts/lib/fleet-gate.sh).
 #
-# The fleet's CLI: NRESE_FLEET_BIN, else git config nrese.fleetBin, else the main PC's. Its owner
+# The fleet's CLI: NRESE_FLEET_BIN, else git config nrese.fleetBin, else the development machine's. Its owner
 # is FLEET_OWNER (your own thread: fleet-scheduler/skills/fleet-jobs). Every call has a deadline.
 #
 #   fleet_submit FILE             submits the job FILE; sets fleet_id (empty: refused, why on stderr)
