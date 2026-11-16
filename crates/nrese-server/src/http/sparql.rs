@@ -300,7 +300,21 @@ pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiEr
         }
         // Exact answers asked for under owl2-dl, and the store can't prove them complete.
         StoreError::Incomplete(answer) => ApiError::IncompleteAnswer(answer),
-        error => ApiError::internal(error.to_string()),
+        error => refused_or(error, ApiError::internal),
+    }
+}
+
+/// A store error of a read (query, RDF4J, Graph Store), `otherwise` unless it is a refusal
+/// until the store is rematerialised ([`StoreError::NotRematerialised`]): that is 503, with the
+/// store's sentence and, on a primary, the administrator's route. A replica refuses that route
+/// (`guard::enforce_admin_write`), so its answer adds nothing.
+pub(crate) fn refused_or(error: StoreError, otherwise: fn(String) -> ApiError) -> ApiError {
+    match error {
+        StoreError::NotRematerialised { replica: false } => ApiError::unavailable(format!(
+            "{error} (an administrator: POST /api/v1/repositories/{{id}}/reasoning/rematerialise)"
+        )),
+        error @ StoreError::NotRematerialised { .. } => ApiError::unavailable(error.to_string()),
+        error => otherwise(error.to_string()),
     }
 }
 

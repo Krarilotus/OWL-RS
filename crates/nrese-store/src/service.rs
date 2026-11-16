@@ -127,6 +127,13 @@ impl Certificate {
         snapshot.certificate()?.downcast_ref()
     }
 
+    /// Whether `snapshot` was never reasoned over: no inferred statement, no certificate, and
+    /// no rules in place (`rules`). Anything else without a certificate is a stack nothing
+    /// vouches for.
+    pub(crate) fn bare(snapshot: &Snapshot, rules: bool) -> bool {
+        snapshot.len_in(ReadModel::Inferred) == 0 && !rules && Self::of(snapshot).is_none()
+    }
+
     /// Whether `snapshot` reads under `owl2-dl`, and whether user rules run with it: as its
     /// certificate says, else as the mode `dl` is now (a read without one is told
     /// `not-certified` all the same).
@@ -902,6 +909,7 @@ impl StoreService {
             by_representatives: self.config.equality_by_representatives,
             compact: self.config.equality_compact,
             cap: self.config.support_sets,
+            replica: self.dl.replica(),
         }
     }
 
@@ -1289,8 +1297,7 @@ impl StoreService {
         let snapshot = at.snapshot();
         let unpublished = matches!(at, Revision::Committed(_)) && snapshot.shared_state().is_none();
         let Some(certificate) = Certificate::of(snapshot).filter(|_| !unpublished) else {
-            let bare = snapshot.len_in(ReadModel::Inferred) == 0 && !self.supports.has_rules();
-            let bare = bare && Certificate::of(snapshot).is_none();
+            let bare = Certificate::bare(snapshot, self.supports.has_rules());
             return (!bare).then(nrese_sparql::Completeness::not_certified);
         };
         let mut status = route?;

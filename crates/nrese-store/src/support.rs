@@ -148,8 +148,9 @@ pub enum Unavailable {
     /// The reading query was cancelled, or its time ran out, while the view was computed.
     Cancelled,
     /// The rules in place aren't the ones the snapshot's certificate was made with (they
-    /// were changed or removed, the store not rematerialised).
-    OtherProgram,
+    /// were changed or removed, the store not rematerialised), or nothing vouches for its
+    /// inferred statements; true: the store is a read replica ([`Compilation::replica`]).
+    OtherProgram(bool),
 }
 
 impl From<BudgetExceeded> for Unavailable {
@@ -169,9 +170,7 @@ impl From<Unavailable> for crate::StoreError {
                 limit: nrese_exec::memory::process_limit().unwrap_or(0),
             },
             Unavailable::Cancelled => nrese_sparql::QueryEvaluationError::Cancelled.into(),
-            Unavailable::OtherProgram => crate::StoreError::Configuration(
-                "the inferred statements aren't the rules' closure: rematerialise first".to_owned(),
-            ),
+            Unavailable::OtherProgram(replica) => crate::StoreError::NotRematerialised { replica },
         }
     }
 }
@@ -1802,14 +1801,17 @@ struct Generation {
 }
 
 /// Whether `snapshot`'s certificate was made with other rules than `generation`'s (they were
-/// changed or removed, the store not rematerialised); `hide`: unnamed classes' memberships
+/// changed or removed, the store not rematerialised), or it has none and isn't bare (its stack
+/// kept, its certificate gone: nothing vouches for it); `hide`: unnamed classes' memberships
 /// left out ([`Compilation::hide_unnamed_classes`]).
 fn made_with_other_rules(generation: &Generation, snapshot: &Snapshot, hide: bool) -> bool {
-    crate::service::Certificate::of(snapshot).is_some_and(|made| {
-        generation.rules.as_ref().is_none_or(|rules| {
+    let rules = generation.rules.as_ref();
+    match crate::service::Certificate::of(snapshot) {
+        Some(made) => rules.is_none_or(|rules| {
             fingerprint(rules, hide, made.state.compact_equality) != made.state.fingerprint
-        })
-    })
+        }),
+        None => !crate::service::Certificate::bare(snapshot, rules.is_some()),
+    }
 }
 
 #[derive(Debug)]
@@ -1907,6 +1909,8 @@ pub(crate) struct Compilation {
     pub(crate) by_representatives: bool,
     pub(crate) compact: bool,
     pub(crate) cap: usize,
+    /// The store is a read replica ([`crate::dl::Dl::replica`]): a refusal says so.
+    pub(crate) replica: bool,
 }
 
 /// What one read sees of the store, the one decision of it ([`Reading::of`]): of a committed
@@ -1966,7 +1970,7 @@ impl Reading {
     pub(crate) fn committed(&self, snapshot: &Snapshot) -> Result<Snapshot, Unavailable> {
         let generation = self.supports.state().generation.clone();
         if made_with_other_rules(&generation, snapshot, self.compilation.hide_unnamed_classes) {
-            return Err(Unavailable::OtherProgram);
+            return Err(Unavailable::OtherProgram(self.compilation.replica));
         }
         match self.through_view(snapshot) {
             true => self.supports.view(
@@ -2266,7 +2270,7 @@ impl Supports {
             // which a graph the reader can't read may decide: refused, nothing kept. Asked
             // again here, of the rules the view is made with.
             if made_with_other_rules(&generation, snapshot, compilation.hide_unnamed_classes) {
-                return Err(Unavailable::OtherProgram);
+                return Err(Unavailable::OtherProgram(compilation.replica));
             }
             let (_, cell, rederiving, views) = state.latest_for(snapshot, &self.kept)?;
             let view = match views.iter().find(|(seen, _)| **seen == **access) {

@@ -115,6 +115,11 @@ pub enum StoreError {
         .limit >> 20
     )]
     MemoryLimitWithoutAmounts { limit: usize, shared: bool },
+    /// A reader of some graphs who sees inferences, refused while nothing vouches that the
+    /// inferred statements are the closure of the rules in place: until the store is
+    /// rematerialised, which a read replica isn't (`replica`).
+    #[error("{}", not_rematerialised(.replica))]
+    NotRematerialised { replica: bool },
 }
 
 /// Why graph-level access control refused a request.
@@ -256,6 +261,7 @@ impl StoreError {
             | Self::LoadCancelled
             | Self::Undecided(_)
             | Self::ClassificationCancelled
+            | Self::NotRematerialised { .. }
             // Answered by the transport as what it is (the query is fine; its answers
             // can't be proven complete).
             | Self::Incomplete(_) => false,
@@ -269,6 +275,17 @@ fn memory_refusal(shared: &bool) -> &'static str {
     match shared {
         true => "the server's query memory is in use",
         false => "query memory budget exceeded",
+    }
+}
+
+/// What a refusal before rematerialisation says, on a primary and on a read replica.
+fn not_rematerialised(replica: &bool) -> &'static str {
+    match replica {
+        false => "the inferred statements aren't the rules' closure: rematerialise first",
+        true => {
+            "the inferred statements aren't known to be the rules' closure, and this store \
+             is a read replica: it doesn't serve this read"
+        }
     }
 }
 
