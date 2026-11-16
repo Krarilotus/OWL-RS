@@ -6,7 +6,7 @@ restart, BSBM over HTTP and in the perf lab, resident memory over a load, load m
 against the bulk-load budget, the baseline branch against today's, plain against
 FSST-compressed vocabularies.
 
-They assume the office PC's layout by default (`~/nrese-bench` with the repository in it
+They assume the checks host's layout by default (`~/nrese-bench` with the repository in it
 and datasets under `scratch/`, prepared by `scripts/office/`); `NRESE_BENCH` and
 `NRESE_SCRATCH` override it ([common.sh](common.sh)). Most need Linux (`/proc`).
 Clean up after a run (`scripts/bench-cleanup.sh`); the probes remove their own stores.

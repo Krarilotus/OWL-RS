@@ -30,7 +30,7 @@ and two branches, 4-17 atoms; none reaches a bound.
 
 ### Times
 
-On the main PC (`benches/probes/ql-rewriting-ab.sh npd owl2-ql`, 4 ABBA pairs of 5
+On the development machine (`benches/probes/ql-rewriting-ab.sh npd owl2-ql`, 4 ABBA pairs of 5
 measured runs, medians; sum of the 31 medians 77.7 ms off, 103.8 ms on):
 - the 19 queries not rewritten: 0.75-1.26x, noise around equal;
 - q28-q30, which gain answers: 1.8-1.9x (+0.5-0.9 ms);
@@ -44,7 +44,7 @@ measured runs, medians; sum of the 31 medians 77.7 ms off, 103.8 ms on):
 Since 7 October (design §3), a witness whose tree the data
 has at every individual it folds to is left out. The nine are now run as written (EXPLAIN:
 `realised` 1, `patterns` 0); q28-q30 keep their witness and their answers. Same protocol,
-on the branch's base and then with the change (main PC, both runs on 7 October):
+on the branch's base and then with the change (development machine, both runs on 7 October):
 
 | | sum of 31 medians off → on | q17, q20-q27 on/off | q28-q30 on/off |
 |---|---|---|---|

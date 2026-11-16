@@ -67,12 +67,12 @@ ones, which the report still lists; 0 only when every declared hypothesis was te
 ## Rules
 
 - What may be timed:
-  - a job whose benchmark mode or harness is new waits for that harness's review r1;
+  - a job whose benchmark mode or harness is new waits for that harness's review;
   - cases and harness come from the current engine-v2 head, for both sides;
-  - timing runs on the fleet's timing hosts only: the main PC builds and tests, it never times.
+  - timing runs on the fleet's timing hosts only: the development machine builds and tests, it never times.
 - The comparison: A-B-B-A, interleaved, exclusive, on one host, with each run's spread
   reported. A timing claim names its job, family and rule (Holm, the A-A' floor).
-- Effort follows spread (owner, 20 Oct 2026):
+- Effort follows spread:
   - size the first round from the case's recorded spread on that host: long, stable cases get
     one Latin square (3 blocks), noisy short ones more;
   - add blocks only to undecided cases: stop on precision, not on p-values;
@@ -90,10 +90,10 @@ missing runs, had no interleaved A-A' arm, or counted results instead of checkin
 ## Why A' and a copy per block: the session bias
 
 Byte-identical binaries read significantly apart in both directions in different sessions:
-- On office-pc, lks-abba-11 and lks-abba-13 timed the same SHA-checked pair (075f7b7c against
+- On the checks host, two rounds timed the same SHA-checked pair (075f7b7c against
   c9be1609). creaders `commits.read_p50_ms` read x1.032 in one and x0.951 in the other, both at
   p = 0.001 with 8 runs a side; crdfs `dept` behaved alike (±4 to 6 %).
-- lks-aa-20 timed one build against a byte-identical copy: the copy read 4.7 % apart on that
+- An A-A round timed one build against a byte-identical copy: the copy read 4.7 % apart on that
   series in every block of the session, against 0.75 % between blocks.
 
 The offset belongs to the file's cached instance and stays while the file is in the page cache.
@@ -103,12 +103,10 @@ it a loss.
 The harness answers it in two ways:
 - **A copy of each build per block** (`fast.py block --fresh-copies`) draws the offset anew each
   block, so it becomes the blocks' variance instead of a bias. Validated on 20 Oct 2026:
-  - lks-aa-21, lks-aa-20 replayed with a copy per block: the 4.7 % offset was gone, within 1.2 to
+  - that A-A round, replayed with a copy per block: the 4.7 % offset was gone, within 1.2 to
     1.9 standard errors;
-  - ff-phuoc-851e987d on phuoc-yu: a fixed pair kept cold-start offsets of 2.3 to 7.5 %, gone with
+  - on the timed host, a fixed pair kept cold-start offsets of 2.3 to 7.5 %, gone with
     copies.
-
-  The analyses are Harness/notes/2026-10-20-lks-aa-21-copies.md and 2026-10-20-ff-phuoc-copies.md.
 - **The A-A' arm** (A' is A's build again, a copy of its own, interleaved in every block) measures
   the round's own floor. A round whose A-A' arm itself differs has no verdict (3). B against A is
   judged with a spread of at least that arm's, or the host's recorded floor

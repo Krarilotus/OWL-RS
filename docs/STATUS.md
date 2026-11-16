@@ -115,7 +115,7 @@ specification rules out, for a resource limit or for a reader diagnostic
   pair, and in keys; the datatype theory's search for distinct values (exact to the
   deadline) and its pattern limit (per combination).
 
-The coverage proof ([design](design/owl2-dl.md) §11; [the campaigns](../benches/reasoning/dl/README.md#the-small-scope-12-october-2026-main-pc))
+The coverage proof ([design](design/owl2-dl.md) §11; [the campaigns](../benches/reasoning/dl/README.md#the-small-scope-12-october-2026-development-machine))
 consists of every OWL 2 DL ontology of the small scope `4,4,4` (2,761,335 after symmetry reduction:
 every constructor and axiom type, one axiom up to size 4, two and three up to total size
 4) and a covering array of every pair and triple of the 67 features beyond it (3,354

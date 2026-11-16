@@ -14,20 +14,20 @@ holds the reasons and the costs. The rules every run follows are in
 (sections "Benchmarks and systems to add" and "Fair benchmark protocol") and further
 search.
 
-**Evidence levels.** Sizes and runtimes marked *measured* come from our runs (the office PC,
+**Evidence levels.** Sizes and runtimes marked *measured* come from our runs (the checks host,
 3 October: run records office-a and office-b). Everything else is *reported* (the
 benchmark's paper or site) or *est.* (estimated from the measured rates below); both are
 hypotheses until we measure them (PROTOCOL.md).
 
 ## 1. The budget
 
-| Resource | Main PC | Office PC | Draco |
+| Resource | Development machine | Checks host | Cluster |
 |---|---|---|---|
-| Cores, memory | 16 threads; 64 GB, of which Docker's VM has 31 GiB | Ryzen 9 5950X, 31 GiB | cluster nodes (owner's OK per job) |
+| Cores, memory | 16 threads; 64 GB, of which Docker's VM has 31 GiB | Ryzen 9 5950X, 31 GiB | cluster nodes (approved per job) |
 | Disk for datasets | 277 GB free of 1.9 TB; the volume `nrese-bench-data` holds 63 GB; budget 300 GB (`datasets.toml`), datasets go below 100 GB free | as configured | node-local scratch |
 | Use | the fast suite; development tiers; capped runs | queued batches; claim runs on Linux | scale tiers, distribution, claim runs |
 
-**Measured rates** (office PC, Docker, medians of 3, DBpedia core: 67 M statements, 9.2 GB
+**Measured rates** (the checks host, Docker, medians of 3, DBpedia core: 67 M statements, 9.2 GB
 of N-Triples). Runtime estimates below are statements ÷ load rate, plus the query or
 reasoning work where known.
 
@@ -54,7 +54,7 @@ materialisation about 100 B per final statement at peak.
 |---|---|---|---|
 | RDF load and storage | basics mix (5 real datasets), entities load curve | | yes: both ready |
 | SPARQL, synthetic | Sparqloscope on our datasets | WatDiv | LUBM materialised, basics mix |
-| SPARQL, real logs | | WDBench (Wikidata, from logs): later, on Draco | basics mix's hand-written mixes only |
+| SPARQL, real logs | | WDBench (Wikidata, from logs): later, on a cluster | basics mix's hand-written mixes only |
 | Updates, writes under readers | LDBC SPB; commit latency under 0-64 readers (ours) | BSBM explore and update | write scaling, concurrency scorecard, soak |
 | Rule reasoning | LUBM, OWL2Bench RL | real ontologies (DBpedia, YAGO); Datalog graph programs (TC, SG, CSPA) | LUBM, OWL2Bench (QL wrong today) |
 | Incremental maintenance | SSPE, Claros (clique-targeted), LUBM batches | | commit latency on LUBM (`local-bulk.sh`) only |
@@ -71,7 +71,7 @@ materialisation about 100 B per final statement at peak.
 | KG construction | | Text2KGBench; GTFS-Madrid-Bench / KGCW challenge | none |
 | Concurrency and soak | commit latency under readers (as above); the client sweep (1-64 clients, Sparqloscope DBLP and BSBM explore) | SPB's concurrent mode; BSBM multi-client | scorecard, `soak.py`; fast cases `clients-sweep`, `writes-under-readers` |
 | Larger than memory | the memory-budget series (16 to 2 GB) on LUBM 1000 | WDBench under a cap | bulk-load budget |
-| Distribution | | LUBM 8000 and WatDiv 1 B on Draco | none (G6 not built) |
+| Distribution | | LUBM 8000 and WatDiv 1 B on a cluster | none (G6 not built) |
 
 The fast suite (§6) takes one small, generated case per bottleneck from this table; it
 doesn't replace these benchmarks.
@@ -89,13 +89,13 @@ the suite's driver.
 |---|---|---|---|---|---|
 | Basics mix (olympics, YAGO tiny, DBpedia core, Wikidata lexemes 60 M, entities 10 M) | load, store size, restart, a hand-written query mix on real data; ours | row counts across systems | the store's size and serving memory against QLever's, where QLever leads (performance.md §1) | core | ready, run on 3 Oct |
 | Entities load curve (harness `generate`, 1 M to 1 B) | load throughput and memory as data grows; ours | statements read back | where the load stops scaling with cores (P5) and when it spills | core | 10 M ready; curve not run |
-| Wikidata truthy, full | load and queries at about 8 B statements; QLever, MillenniumDB, Virtuoso publish | row counts | whether the store holds Wikidata on one node | later (Draco) | – |
+| Wikidata truthy, full | load and queries at about 8 B statements; QLever, MillenniumDB, Virtuoso publish | row counts | whether the store holds Wikidata on one node | later (a cluster) | – |
 
 | Benchmark | Licence, redistribution | Data: disk / NRESE RAM | Setup | Runtime (est. unless measured) | Systems |
 |---|---|---|---|---|---|
 | Basics mix | CC-BY-SA (DBpedia), CC-BY (YAGO), CC0 (Wikidata), olympics CC-BY-SA; we don't redistribute, `prepare-datasets.sh` fetches | 22 GB N-Triples in the volume; stores 0.1-3.7 GB; load peaks to 6.8 GB (measured) | 0 | DBpedia core per system above; a full basics run of 6 systems × 5 tiers × 3 runs about 6 h (measured, office batch) | all SPARQL systems |
 | Entities curve | ours | 1 B: 110 GB N-Triples (est.), store 56 GB, budgeted load | 0.5 | NRESE 5 min at 1 B, QLever 20 min, Jena 3 h (est.) | all SPARQL systems |
-| Wikidata truthy | CC0 | about 1 TB N-Triples (est.), NRESE store 450 GB (est.): beyond the main PC's disk | 2 | NRESE 45 min load (est.), QLever 3 h (reported: hours), Jena days | QLever, Virtuoso, MillenniumDB, NRESE |
+| Wikidata truthy | CC0 | about 1 TB N-Triples (est.), NRESE store 450 GB (est.): beyond the development machine's disk | 2 | NRESE 45 min load (est.), QLever 3 h (reported: hours), Jena days | QLever, Virtuoso, MillenniumDB, NRESE |
 
 ### 3.2 SPARQL query: synthetic and from logs
 
@@ -106,7 +106,7 @@ the suite's driver.
 | BSBM (Berlin) | e-commerce explore, BI, explore and update; most vendors published | its qualification mode | see 3.3; BI queries stress aggregates | representative (3.3) | probes `bsbm-http.sh`, `bsbm-bi-lab.sh` |
 | SP2Bench | DBLP-shaped data, 17 queries (OPTIONAL, negation, long chains) | its reference counts | OPTIONAL and negation at scale | later | – |
 | LUBM materialised | the 14 LUBM queries over a closure every engine loads | published answers (LUBM 1), counts | engines on their own turf | covered | ready |
-| WDBench (ISWC 2022) | about 2,650 queries (reported) from Wikidata's logs over 1.2 B direct-property statements: BGPs, OPTIONAL, paths, navigational; Jena, Virtuoso, Blazegraph and Neo4j published (MillenniumDB's authors left their own out) | row counts across systems | real query shapes and path queries at scale | representative (real logs); later, a Draco run, not in the fast suite (owner, 5 Oct 2026) | – |
+| WDBench (ISWC 2022) | about 2,650 queries (reported) from Wikidata's logs over 1.2 B direct-property statements: BGPs, OPTIONAL, paths, navigational; Jena, Virtuoso, Blazegraph and Neo4j published (MillenniumDB's authors left their own out) | row counts across systems | real query shapes and path queries at scale | representative (real logs); later, a cluster run, not in the fast suite | – |
 | FEASIBLE | mixes sampled from real logs (DBpedia, SWDF) by feature coverage | counts | the log mix of a given endpoint, e.g. HisQu's | later | – |
 | DBpedia SPARQL Benchmark | the 2011 log-derived DBpedia benchmark | counts | superseded by FEASIBLE and WDBench | later | – |
 | LSQ, Wikidata SPARQL logs | query logs as data (sources, not benchmarks) | – | input for FEASIBLE-style mixes; Saleem et al. 2019 justify a mix's features | source | – |
@@ -115,7 +115,7 @@ the suite's driver.
 | Benchmark | Licence, redistribution | Data: disk / NRESE RAM | Setup | Runtime (est.) | Systems |
 |---|---|---|---|---|---|
 | Sparqloscope | Apache-2.0 | none of its own: our datasets (DBpedia core 9.2 GB); its own tier DBLP, about 500 M statements (to confirm at download) | 1 | DBpedia core: 105 queries × 3 runs, under 10 min per system for the fast engines, an hour or more for Jena; DBLP: NRESE load 3 min, QLever 10 min | all SPARQL systems |
-| WatDiv | no licence stated (generator source on GitHub); data generated, not redistributed; internal use only: ask the authors before publishing (owner, 5 Oct 2026) | 100 M: 15 GB N-Triples, 5.6 GB store; 1 B on Draco | 1.5 (C++ generator with Boost, in Docker) | 100 M: NRESE load 30 s, QLever 2 min, Jena 20 min; 400 queries: minutes | all SPARQL systems |
+| WatDiv | no licence stated (generator source on GitHub); data generated, not redistributed; internal use only: ask the authors before publishing | 100 M: 15 GB N-Triples, 5.6 GB store; 1 B on a cluster | 1.5 (C++ generator with Boost, in Docker) | 100 M: NRESE load 30 s, QLever 2 min, Jena 20 min; 400 queries: minutes | all SPARQL systems |
 | SP2Bench | its site (to check) | generated, 10 M-1 B | 1 | as WatDiv | all |
 | WDBench | data CC0 (Wikidata), on Figshare; queries in the repo (no licence stated: to check) | 1.2 B: about 150 GB N-Triples (est.), NRESE store 70 GB; load peak capped by the bulk-load budget | 2 | NRESE load 6-10 min, QLever 25 min, Jena 4 h (est.); queries with a 60 s limit each, about 2 h per system | QLever, Virtuoso, Jena, Oxigraph (slow load), MillenniumDB, NRESE |
 | FEASIBLE | AGPL-3.0 (code; we run it, don't ship it) | the log's dataset | 2 | – | all |
@@ -127,10 +127,10 @@ until measured here, PROTOCOL.md):
 | Bar | QLever's figure | Our run | Mark |
 |---|---|---|---|
 | Sparqloscope on DBLP (502 M statements) | 0.18 s geometric mean over about 105 queries (penalty 2), the best of six engines (sparqloscope2025 Table 2) | planned (3.2 above) | core |
-| Sparqloscope on Wikidata truthy (7.9 B) | 2.43 s geometric mean, 2.0 % of the queries failed (Table 2) | later, on Draco | core (Draco) |
+| Sparqloscope on Wikidata truthy (7.9 B) | 2.43 s geometric mean, 2.0 % of the queries failed (Table 2) | later, on a cluster | core (a cluster) |
 | SPARQL with text (`ql:contains-word`, `ql:contains-entity`) | QLever's text search joined with patterns | `text-search` (fast suite) on NRESE's text index; QLever's text index to wire into its adapter | representative |
 | Export of large results | streamed results of millions of rows (TSV, CSV, JSON) | `q-large-result`, `http-large-results.sh` | representative |
-| Load and serve DBLP, then Wikidata truthy | DBLP index in minutes; full Wikidata (about 21 B) in about 5 h with about 20 GB RAM | DBLP planned; Wikidata truthy on Draco | core |
+| Load and serve DBLP, then Wikidata truthy | DBLP index in minutes; full Wikidata (about 21 B) in about 5 h with about 20 GB RAM | DBLP planned; Wikidata truthy on a cluster | core |
 
 Later goals, from QLever's other strengths (catalogue rows only; no work now):
 
@@ -181,11 +181,11 @@ Later goals, from QLever's other strengths (catalogue rows only; no work now):
 | LUBM | generator GPL-2.0; data generated | 1000: 24.7 GB N-Triples, 21.7 GiB peak, 5.3 GB store (measured) | 0 | 100: NRESE 6.5 s, Nemo 411 s; 1000: NRESE 82 s (measured) | NRESE, Nemo, owlrl, Jena, GraphDB, RDFox, RDF4J (RDFS) |
 | OWL2Bench | generator Apache-2.0, queries CC-BY-4.0 | RL-1: 7.7 MB, 1.0 GiB serving (measured, an anomaly, P2) | 0 | RL-1: NRESE 0.9 s, Nemo 31 min (measured) | as LUBM |
 | Real ontologies | as the basics mix | DBpedia core + ontology: 9.2 GB; closure est. 100-150 M statements, 15 GB peak | 1 | NRESE minutes; Nemo hours (est. from LUBM) | NRESE, Nemo, Jena, GraphDB, RDFox |
-| Claros, Reactome, UniProt | Claros: research data from RDFox's test sets, licence unstated (ask Oxford); Reactome CC-BY 4.0; UniProt CC-BY 4.0 | Claros: about 19 M facts in (reported); LE's closure is many times that: size it on Draco first | 2 | Claros-L minutes; LE hours | NRESE, Nemo, VLog, RDFox, GraphDB |
+| Claros, Reactome, UniProt | Claros: research data from RDFox's test sets, licence unstated (ask Oxford); Reactome CC-BY 4.0; UniProt CC-BY 4.0 | Claros: about 19 M facts in (reported); LE's closure is many times that: size it on a cluster first | 2 | Claros-L minutes; LE hours | NRESE, Nemo, VLog, RDFox, GraphDB |
 | SSPE | ours to generate, from the paper's description | small: millions of edges | 1 | seconds to minutes per batch | NRESE, RDFox, GraphDB |
 | TC, SG, CSPA | FlowLog's datasets (Hugging Face, no licence stated: fetched, never committed); programs Apache-2.0 | TC/SG on G10K: 100 M facts each; CSPA httpd: 324.5 M facts, NRESE 22.9 GB, Soufflé 9.8 GB (measured, 4 CPUs) | 0 (built) | CSPA httpd at 4 CPUs (measured, one run): Soufflé 56.5 s, NRESE 195 s, Nemo 612 s | NRESE, Nemo, Soufflé (UPL-1.0), VLog, GLog |
 | Doop | as FlowLog's datasets | batik: 106 MB zipped | 0 (vendored) | Soufflé 651 s at 4 threads (reported) | Soufflé, Nemo |
-| ChaseBench | no licence stated; internal use only: ask the authors before publishing (owner, 5 Oct 2026) | to 1 GB | 3 | – | Nemo, VLog, RDFox |
+| ChaseBench | no licence stated; internal use only: ask the authors before publishing | to 1 GB | 3 | – | Nemo, VLog, RDFox |
 
 ### 3.5 OWL 2 DL: consistency, classification, realisation
 
@@ -199,8 +199,8 @@ Later goals, from QLever's other strengths (catalogue rows only; no work now):
 
 | Benchmark | Licence, redistribution | Data: disk / RAM | Setup | Runtime | Systems |
 |---|---|---|---|---|---|
-| W3C DL | W3C | small | 0 | minutes (main PC, 20 s budget per test) | NRESE, HermiT, Openllet, Konclude |
-| ORE 2015 | per ontology (Zenodo corpus; we fetch, don't ship) | about 5 GB corpus (reported); up to a few GB RAM per task | 0 (kit), Draco for full | full: 1,920 × 3 tasks × 1,800 s worst case: Draco only; dev: under 1 h per reasoner (measured) | NRESE, HermiT, Openllet, Konclude, ELK |
+| W3C DL | W3C | small | 0 | minutes (development machine, 20 s budget per test) | NRESE, HermiT, Openllet, Konclude |
+| ORE 2015 | per ontology (Zenodo corpus; we fetch, don't ship) | about 5 GB corpus (reported); up to a few GB RAM per task | 0 (kit), a cluster for full | full: 1,920 × 3 tasks × 1,800 s worst case: a cluster only; dev: under 1 h per reasoner (measured) | NRESE, HermiT, Openllet, Konclude, ELK |
 | OWL2Bench EL/DL | as above | DL-10: tens of MB | 0.5 | Konclude past the limit (reported) | as above |
 | PAGOdA suite | per dataset (PAGOdA's site); PAGOdA's own code: to check | to 10 M facts | 2 | minutes to hours | NRESE, PAGOdA, HermiT |
 | GO, ChEBI, NCIt, GALEN; SNOMED | CC-BY 4.0 (GO, ChEBI); NCIt CC-BY 4.0; GALEN free; SNOMED CT affiliate licence: never redistributed, results internal | 50-500 MB | 1 | seconds (ELK) to minutes | as above |
@@ -229,7 +229,7 @@ Later goals, from QLever's other strengths (catalogue rows only; no work now):
 
 | Benchmark | Licence | Data | Setup | Runtime | Systems |
 |---|---|---|---|---|---|
-| ERA-SHACL | none stated in the repository (ERA's data terms); internal use only: ask the authors before publishing (owner, 5 Oct 2026) | 55 M statements: 8 GB N-Triples (est.), NRESE store 3 GB | 1.5 | minutes per engine for NRESE and RDF4J; pySHACL hours (reported scale) | NRESE, Jena, RDF4J, TopBraid SHACL, pySHACL |
+| ERA-SHACL | none stated in the repository (ERA's data terms); internal use only: ask the authors before publishing | 55 M statements: 8 GB N-Triples (est.), NRESE store 3 GB | 1.5 | minutes per engine for NRESE and RDF4J; pySHACL hours (reported scale) | NRESE, Jena, RDF4J, TopBraid SHACL, pySHACL |
 
 ### 3.8 GeoSPARQL
 
@@ -241,7 +241,7 @@ Later goals, from QLever's other strengths (catalogue rows only; no work now):
 
 | Benchmark | Licence | Data | Setup | Runtime | Systems |
 |---|---|---|---|---|---|
-| Geographica 2 | not stated (Mercurial repo at strabon.di.uoa.gr); internal use only: ask the authors before publishing (owner, 5 Oct 2026) | real set a few GB; synthetic scalable | 2 (Java runner) | minutes to an hour per system | NRESE, Jena (GeoSPARQL), RDF4J, QLever (subset), GraphDB, Stardog |
+| Geographica 2 | not stated (Mercurial repo at strabon.di.uoa.gr); internal use only: ask the authors before publishing | real set a few GB; synthetic scalable | 2 (Java runner) | minutes to an hour per system | NRESE, Jena (GeoSPARQL), RDF4J, QLever (subset), GraphDB, Stardog |
 | osm2rdf extracts | ODbL (redistribution with attribution, share-alike) | a country: 100 M-1 B statements | 1 | as WatDiv by size | NRESE, QLever, Virtuoso |
 
 ### 3.9 Full-text search
@@ -254,7 +254,7 @@ Later goals, from QLever's other strengths (catalogue rows only; no work now):
 
 | Benchmark | Licence | Data | Setup | Runtime | Systems |
 |---|---|---|---|---|---|
-| LUBMft | none stated (l3s.de); internal use only: ask the authors before publishing (owner, 5 Oct 2026) | as LUBM | 1.5 | minutes | NRESE, Jena (text), Virtuoso, QLever, RDF4J, GraphDB |
+| LUBMft | none stated (l3s.de); internal use only: ask the authors before publishing | as LUBM | 1.5 | minutes | NRESE, Jena (text), Virtuoso, QLever, RDF4J, GraphDB |
 | BEIR | Apache-2.0 code; per set (SciFact CC-BY-NC, NFCorpus and FiQA see BEIR's table: internal results until checked) | 5 k-60 k documents: MBs | 1 | seconds per set | NRESE, Lucene/Pyserini BM25 as reference |
 
 ### 3.10 RDF 1.2 and RDF-star
@@ -297,7 +297,7 @@ today and its interactive reads can be written in SPARQL (labelled as a SPARQL v
 
 | Benchmark | Licence | Data | Setup | Runtime | Systems |
 |---|---|---|---|---|---|
-| SNB Interactive v2 | Apache-2.0; the LDBC fair-use rule (unaudited = "not an LDBC benchmark result") | SF1 1 GB CSV (about 30 M edges), SF10 10 GB, SF100 on Draco | 5 (datagen in Spark, driver, a SPARQL or GQL implementation) | SF10: an hour per system | NRESE, Neo4j Community, Memgraph, DuckPGQ, froGQL; Kùzu archived in Oct 2025 |
+| SNB Interactive v2 | Apache-2.0; the LDBC fair-use rule (unaudited = "not an LDBC benchmark result") | SF1 1 GB CSV (about 30 M edges), SF10 10 GB, SF100 on a cluster | 5 (datagen in Spark, driver, a SPARQL or GQL implementation) | SF10: an hour per system | NRESE, Neo4j Community, Memgraph, DuckPGQ, froGQL; Kùzu archived in Oct 2025 |
 | openCypher TCK | Apache-2.0 | none | 1 once a parser exists | minutes | as above |
 | Graphalytics | Apache-2.0; datasets per graph | XS to L graphs, 0.1-10 GB | 3 | minutes per algorithm and graph | NRESE, Neo4j GDS (licence check), DuckPGQ, GAP reference |
 | GAP | BSD-3-Clause | generated, 2^20-2^26 vertices | 0.5 | seconds | as above |
@@ -376,8 +376,8 @@ about 30 min per system. This is QLever's and Virtuoso's home turf.
 | Benchmark | Measures | Check | Mark | Now |
 |---|---|---|---|---|
 | Memory-budget series (report item 20): LUBM 1000 load, reasoning and queries under 16, 12, 8, 6, 4, 2 GB caps | the slowdown curve, or where it stops | the same closure and answers as uncapped | core | bulk-load budget measured on DBpedia only (5.47 → 4.02 GB peak, +18 % time) |
-| WDBench under a cap | real queries on 1.2 B statements with less RAM than the data | counts | representative; later, on Draco | – |
-| Wikidata truthy | 8 B statements on one node | counts | later (Draco) | – |
+| WDBench under a cap | real queries on 1.2 B statements with less RAM than the data | counts | representative; later, on a cluster | – |
+| Wikidata truthy | 8 B statements on one node | counts | later (a cluster) | – |
 
 Costs: LUBM 1000 is in the volume (24.7 GB); six points × (82 s to a few times that) per
 run: about 1 h per system and repetition. Only systems with a memory limit of their own
@@ -387,7 +387,7 @@ cap, which is a result too (`failed`, never a time).
 ### 3.18 Distribution (G6)
 
 No published protocol exists for distributed maintenance with deletions (report item 12).
-The candidates are the scale tiers above, run on Draco once tier 1 (leader reasons,
+The candidates are the scale tiers above, run on a cluster once tier 1 (leader reasons,
 replicas serve) exists: LUBM 8000 (about 1.1 B asserted, 0.7 B inferred, est.), WatDiv 1 B,
 WDBench; replica read modes measured as staleness and latency. Mark: representative (LUBM
 8000 and WatDiv 1 B), later; setup 3 days on top of the kits; data 200-300 GB on node-local
@@ -436,24 +436,24 @@ through an adapter.
 
 ## 5. What it costs in total
 
-| Set | Setup | Disk (new) | One full run on the main PC or office PC |
+| Set | Setup | Disk (new) | One full run on the development machine or the checks host |
 |---|---|---|---|
 | Already ready (basics, LUBM, OWL2Bench, write scaling, DL kit) | 0 | 0 (63 GB present) | about 8-10 h for all systems, 3 repetitions |
 | Core additions: Sparqloscope, SPB, commit under readers, SSPE, Claros-L, LUBM batches, memory-budget series | 12 days | 60 GB (SPB 256 M, Claros) | about 10 h |
-| Representatives without a G8/G10/G11 dependency: WatDiv, WDBench, BSBM, real ontologies, TC/SG/CSPA, OWL2Bench EL/DL, PAGOdA, NPD, LUBM∃, ERA-SHACL, Geographica 2, LUBMft, BEIR, StarBench, FedShop, VIBE, big-ann filtered, ann-benchmarks | 30 days | 230 GB (WDBench 150, WatDiv 15, BSBM 25, rest small): above the 300 GB budget with the present 63 GB, so WDBench lives on Draco or replaces Wikidata lexemes | 20-30 h |
+| Representatives without a G8/G10/G11 dependency: WatDiv, WDBench, BSBM, real ontologies, TC/SG/CSPA, OWL2Bench EL/DL, PAGOdA, NPD, LUBM∃, ERA-SHACL, Geographica 2, LUBMft, BEIR, StarBench, FedShop, VIBE, big-ann filtered, ann-benchmarks | 30 days | 230 GB (WDBench 150, WatDiv 15, BSBM 25, rest small): above the 300 GB budget with the present 63 GB, so WDBench lives on a cluster or replaces Wikidata lexemes | 20-30 h |
 | Representatives waiting on capabilities: SNB, openCypher TCK, Graphalytics (G8); GTFS/KGCW (G10); GraphRAG-Bench, chat-with-data, QALD-10, Text2KGBench (G11) | 20 days | 20 GB | plus LLM costs |
 
 ## 6. The fast suite (built; benches/fast)
 
 The benchmarks above take hours and run in bulk. The fast suite is the opposite: many small
-cases, each 10-300 s, all of them in under an hour on the main PC, run like unit tests for
+cases, each 10-300 s, all of them in under an hour on the development machine, run like unit tests for
 performance ([fast/README.md](fast/README.md)). Each case is one bottleneck, on generated
 data with a fixed seed or a pinned file, checked before its time counts, with time and
 peak memory under a memory cap and, where a plan or engine path should handle it, that
 path asserted. Results go to `baselines/fast/` and are compared beyond a confidence
 interval.
 
-**Who runs a case** (owner, 5 October 2026):
+**Who runs a case**:
 - **NRESE runs every case:** every reasoning profile (rdfs, rdfs-full, rdfs-plus,
   owl-horst, owl2-ql, owl2-rl, N3 rules, compact equality, EL, DL), every feature,
   operator and route. Each case keeps its own NRESE baseline.
@@ -477,7 +477,7 @@ interval.
   chosen from what the literature wiki documents (QLever: large read-only data, large
   results and text; Konclude: DL classification; ELK: EL classification; Openllet: DL
   consistency; Nemo: Datalog; HermiT: hypertableau classification) or, where the wiki is
-  thin (Jena, Virtuoso, Oxigraph, RDF4J, GLog/VLog), from the owner's examples: Jena's bulk
+  thin (Jena, Virtuoso, Oxigraph, RDF4J, GLog/VLog), from these examples: Jena's bulk
   load and rules, Virtuoso's many small concurrent requests, Oxigraph's small embedded store
   opened for a first query, RDF4J's small transactions, GLog/VLog's single-threaded
   materialisation (no runner yet: Nemo stands in).
@@ -485,7 +485,7 @@ interval.
 Frontier cases expect a known limit (`outcome`): they show the gap until it closes, and a
 fix shows as a changed status.
 
-**The performance phase** (owner, 6 October 2026): every level it optimises has cases that
+**The performance phase**: every level it optimises has cases that
 show a gain or a regression there, deciding by deterministic counts and routes where they
 can and by times where they must ([fast/README.md](fast/README.md), "a case per level"):
 kernels (128-bit sorts, intersections of skewed lengths), layout (bytes per statement under
@@ -497,7 +497,7 @@ The micro-benchmarks follow what the fastest systems publish (research notes R3-
 R3-S2, R3-S3, R3-G1, Store-2, DL-D, DL-F of the literature wiki) and the investigation of 6
 October (its §5, all nine items).
 
-**QL rewriting and the DL mode** (owner, 6 October 2026): `ql-owl2bench` asserts the
+**QL rewriting and the DL mode**: `ql-owl2bench` asserts the
 tree-witness rewrite on the OWL2Bench queries that need it and its absence on the others.
 The `dlmode-*` cases run the `owl2-dl` mode: LUBM 1's queries with each answer's status and
 the path that decided it, commits under it, and the consistency gate on commit (the RL check
@@ -629,7 +629,7 @@ the tableau). Pairs that hang are recorded in their case (`hangs`) and not run a
 | `alloc-lubm10` | memory | owl2-rl | none: NRESE's own column |  | LUBM 10 loaded, materialised (OWL 2 RL) and queried, with allocations and peak memory counted per phase |
 | `alloc-load` | memory | none | none: NRESE's own column |  | a 10 M-statement bulk load with allocations and peak memory counted |
 | `eq-giant-split` | reasoning | owl2-rl | nemo: owl2-rl, graphdb: owl2-rl, qlever: rewritten, oxigraph: rewritten, virtuoso: rewritten |  | a 300-member owl:sameAs class (two chains and a bridge link) beside 5,000 small ones; one commit deletes the bridge and the class splits (6 Oct 2026: a 500-member split took 68 s in one commit, 1,000 failed after 242 s, while materialising took 0.2-0.8 s) |
-| `first-load-chain` | maintenance | owl2-rl | none: NRESE's own column |  | a first commit into an empty store: a 250-class subclass chain and 400 members of its last class, as one INSERT DATA (DMW's A/B chain; 21 Oct 2026: the repository route held 854-862 MiB VmHWM, main 518-558) |
+| `first-load-chain` | maintenance | owl2-rl | none: NRESE's own column |  | a first commit into an empty store: a 250-class subclass chain and 400 members of its last class, as one INSERT DATA (an application's A/B chain; 21 Oct 2026: the repository route held 854-862 MiB VmHWM, main 518-558) |
 | `first-load-chain-ranged` | maintenance | owl2-rl | none: NRESE's own column |  | first-load-chain plus a ranged property with one literal value, whose conclusion (the literal's type) no store holds (PR #46 review r1 F1: such a load ran the batch, dropped it and ran the delta executor) |
 | `deletes-tail` | maintenance | owl2-rl | graphdb: owl2-rl |  | 3,000 people of the data deleted one per commit under OWL 2 RL: the tail of deletion latency (p99) |
 | `dl-pipeline` | dl | dl | hermit: dl, openllet: dl, konclude: dl |  | a 60,000-class Horn ontology through the DL pipeline: reading, normalisation and the tableau's phases timed apart |

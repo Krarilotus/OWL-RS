@@ -31,8 +31,8 @@ The pass medians fall into two clusters (one process fast, the next slow), the s
 | lab-dbpedia-core | q03-top-birthplaces | main f9b515e8 (perf-lab datasets) | 3.224 | 0.161 | 2.648, 3.65, 2.859, 3.589 |
 | writes-under-readers | --readers 32 | v1.5 0f465633 | 0.1638 | 0.213 | 0.1937, 0.1925, 0.1352, 0.1318 |
 
-**dl-roles blocking: a probable engine effect, by run order within a process** (19 Oct 2026; for a
-DL owner, not the harness). The tableau tool runs the case's file four times in one process
+**dl-roles blocking: a probable engine effect, by run order within a process** (19 Oct 2026; for the
+DL engine, not the harness). The tableau tool runs the case's file four times in one process
 (`repeat = 4`). In every pass, of v1.5 0f465633, v2 32ecf1e5 and c9be1609 alike, the first two runs'
 blocking phase takes 0.053–0.062 ms, the third 0.32–0.36 ms (six times as long), the fourth
 either 0.29–0.31 ms or 0.053–0.060 ms again; the other phases don't move with it (saturate

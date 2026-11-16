@@ -3,23 +3,21 @@
 The standards and features beyond core SPARQL and reasoning, for release 1.5: SHACL,
 GeoSPARQL, full-text search, RDF 1.2, federation, vector search and data larger than memory.
 Each benchmark is the one its competitors publish on, run in their documented best
-configuration ([CATALOG.md](../CATALOG.md) §3.7–3.11, §3.13, §3.16–3.17; the owner, 12
-October 2026: "each contender ... on their home turf against us ... on equal and fair
-terms"). A win counts only where NRESE beats a system at what that system does best.
+configuration ([CATALOG.md](../CATALOG.md) §3.7–3.11, §3.13, §3.16–3.17), on equal and fair terms. A win counts only where NRESE beats a system at what that system does best.
 
 The rules are [PROTOCOL.md](../PROTOCOL.md)'s. The families, their order and the queue are the
 suite's ([suite/workloads.toml](../suite/workloads.toml), [suite/schedule.toml](../suite/schedule.toml),
 [suite/measurement_queue.py](../suite/measurement_queue.py)); results go through its one schema
 ([suitekit/schema.py](../suite/suitekit/schema.py)) to `suite.py report` and `compare`.
 
-## The benchmarks, in the owner's order (12 October 2026)
+## The benchmarks, in order of priority
 
 First this week: the filtered vector search, ann-benchmarks, Geographica 2, ERA-SHACL. Then
 the backlog.
 
 | Benchmark | Home turf of | Contenders as run | Published numbers | NRESE's support | State |
 |---|---|---|---|---|---|
-| Filtered vector search (`vector-recall`) | – (NRESE's own gate) | the fast cases `vector-knn-exact`, `vector-knn-filtered` | – | `SERVICE nrv:search` | **fixed**: recall 0.56 → 0.98 on Phuoc-Yu ([record](../runs/2026-10-12-vector-filtered-fix-phuoc.toml)); Office-PC's jobs queued |
+| Filtered vector search (`vector-recall`) | – (NRESE's own gate) | the fast cases `vector-knn-exact`, `vector-knn-filtered` | – | `SERVICE nrv:search` | **fixed**: recall 0.56 → 0.98 on the timed host ([record](../runs/2026-10-12-vector-filtered-fix-phuoc.toml)); the checks host's jobs queued |
 | [ann-benchmarks](vectors/) | Qdrant, pgvector; hnswlib as the library reference | upstream's harness at 2e081ad, NRESE as a module (its server in the container, SPARQL per query); all at M 16; Qdrant 1.19.2, pgvector v0.8.7 | ann-benchmarks.com | HNSW over vector literals, through SPARQL | images and SIFT, GloVe jobs queued |
 | [Geographica 2](geographica2/) | Jena GeoSPARQL, RDF4J; QLever and Virtuoso as far as they go | the suite's adapters, each system's spatial setup when a workload needs `geosparql` | RDF4J 2.4.3, Strabon, uSeekM, Parliament (2019, the paper's Tables 13/14) | GeoSPARQL 1.1 | data pinned; jobs queued |
 | [ERA-SHACL](era-shacl/) | Jena, TopBraid, RDF4J, pySHACL; maplib (the Rust rival) | upstream's engines at fe109c9, their versions, prebuilt; one memory cap and heap for all | per engine in upstream's `results/` | SHACL Core and SHACL-SPARQL, in memory | data pinned; jobs queued |
@@ -71,7 +69,7 @@ Licensed systems run on our machines only; their rows carry
 - Docs: `docs/ops/http-api.md` says SHACL validation is "SHACL Core only", while
   `systems.toml` and the fast suite's `shacl-lubm` case run SHACL-SPARQL.
 
-## Decisions (the owner, 12 October 2026)
+## Decisions (12 October 2026)
 
 - LUBMft stays in the backlog with its note: the generator and the query template are lost.
 - The interface changes (the tasks `validate` and `index`, `Plan.inputs_for` and

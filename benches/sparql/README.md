@@ -1,22 +1,21 @@
 # The SPARQL stores on their home turf
 
-Release 1.5's comparison of NRESE with the SPARQL query engines, each on what it does best
-(owner, 12 Oct 2026: "each contender ... on their home turf against us ... on equal and fair
-terms"). A win counts only where NRESE beats a system at its own benchmark, at its published
+Release 1.5's comparison of NRESE with the SPARQL query engines, each on what it does best,
+on equal and fair terms. A win counts only where NRESE beats a system at its own benchmark, at its published
 scale, in its documented best configuration, on the same host under the same resources. The
 cases are in [../cases/sparql.toml](../cases/sparql.toml); they run through the suite's driver
 and are judged by its `versus` and `standings` ([../suite/README.md](../suite/README.md)).
 
-## Priorities (owner, 12 Oct 2026)
+## Priorities
 
 | Order | Benchmark | Home turf of | State |
 |---|---|---|---|
-| 1 | Sparqloscope on DBLP | QLever | data, queries, bar ready; NRESE qualified once on the monthly dump (which proved the wrong data, below); QLever's reproduction queued on phuoc-yu |
+| 1 | Sparqloscope on DBLP | QLever | data, queries, bar ready; NRESE qualified once on the monthly dump (which proved the wrong data, below); QLever's reproduction queued on the timed host |
 | 1 | BSBM V3.1 explore and BI, 1 to 64 clients | Virtuoso | data (exact published sizes), driver, qualification ready; runs queued |
 | 1 | WatDiv basic testing | Oxigraph, Jena | 10 M (56 queries) and 100 M (196 queries) ready; 10 M runs the runtime's qualification |
 | 1 | G-CARE | the planner's estimates (G-CARE's estimators) | data, queries, truths, both runners ready; NRESE measured on HUMAN |
 | backlog | SP2Bench | Oxigraph, Jena | data generated; the generated documents don't reproduce the paper's result sizes (below) |
-| backlog | WDBench | MillenniumDB | prepared; needs khaleesi S: or Draco |
+| backlog | WDBench | MillenniumDB | prepared; needs a host with more disk, or a cluster |
 | backlog | MillenniumDB's paths, FEASIBLE, gMark, BeSEPPI | | |
 
 ## The benchmarks
@@ -31,11 +30,11 @@ and are judged by its `versus` and `standings` ([../suite/README.md](../suite/RE
 
 ## Configurations
 
-Where (owner, 12 Oct 2026): phuoc-yu (Ryzen 7 7800X3D, 16 threads, 29 GiB), every system from its
+Where: the timed host (Ryzen 7 7800X3D, 16 threads, 29 GiB, Linux), every system from its
 Docker image, unpacked and run with bubblewrap (the suite's rootfs runtime: same images, the host's
 network and kernel, a systemd scope with the same memory cap for every system); NRESE as a host
 process under the same cap. Before any comparison counts the runtime is qualified against Docker: equal
-answers on WatDiv 10 M (office-pc under Docker, phuoc-yu under rootfs) and the contenders' published
+answers on WatDiv 10 M (the checks host under Docker, the timed host under rootfs) and the contenders' published
 figures reproduced (QLever's Sparqloscope figure, Virtuoso's BSBM V3.1 figures). The published
 configurations assume 32 GB; on 29 GiB every memory envelope is scaled by the same factor for every
 system (QLever's 26 GB for queries becomes 23 GB, its 6 GB cache 5 GB; NRESE gets the same 23 GB).
@@ -46,7 +45,7 @@ system (QLever's 26 GB for queries becomes 23 GB, its 6 GB cache 5 GB; NRESE get
 | Virtuoso | 7.2.17; `NumberOfBuffers` 2720000, `MaxDirtyBuffers` 2000000 (virtuoso.ini's values for 32 GB, the paper's) | the same buffers; `ServerThreads` 100 and `ThreadsPerQuery` 8 as the report's virtuoso.ini |
 | MillenniumDB | built from ecbf6dd (the paper's commit) on Ubuntu 24.04 ([../competitors/millenniumdb/Dockerfile](../competitors/millenniumdb/Dockerfile)); `--threads 2 --versioned-buffer 22GB --unversioned-buffer 2GB --strings-static 4GB --strings-dynamic 4GB --timeout 180` | - |
 | Jena | 6.2.0, `tdb2.xloader` as the paper loads DBLP; Fuseki `--timeout` at the query limit; heap within the container | `tdb2.tdbloader` |
-| NRESE | on-disk store; the memory QLever's configuration gives its queries, per query and in all (`QUERY_MEMORY_MIB`, `TOTAL_QUERY_MEMORY_MIB`; 23 GB on phuoc-yu) | the same |
+| NRESE | on-disk store; the memory QLever's configuration gives its queries, per query and in all (`QUERY_MEMORY_MIB`, `TOTAL_QUERY_MEMORY_MIB`; 23 GB on the timed host) | the same |
 
 The settings are environment variables of the suite's adapters (`QLEVER_INDEX_SETTINGS`,
 `QLEVER_VOCABULARY_TYPE`, `QLEVER_CACHE_MAX_SIZE`, `QLEVER_RUNTIME`,
@@ -66,7 +65,7 @@ benches/sparql/watdiv/queries.sh watdiv-10m 5                 # then split.py in
 ## Findings kept for the backlog
 
 - SP2Bench's generated documents don't reproduce its paper's result sizes. NRESE on
-  sp2bench-1m (12 Oct 2026, phuoc-yu, 1b611e7): q1, q9, q10, q11 equal Table V, but q2 32,452
+  sp2bench-1m (12 Oct 2026, the timed host, 1b611e7): q1, q9, q10, q11 equal Table V, but q2 32,452
   (paper 32,770), q3a 52,406 (52,676), q3b 402 (379), q4 2,583,025 (2,586,733), q5b 34,870
   (35,241), q7 303 (292), q8 491 (400). The differences across most queries point at the
   document (the generator compiled for 64 bits with a current compiler), not at the engine;

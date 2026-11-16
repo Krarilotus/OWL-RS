@@ -116,10 +116,10 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
   regardless of run length, and cannot establish that brief peaks were absent.
 - **Isolation.**
   - No other benchmark runs on the machine at the same time.
-  - Containers that must stay up (the DMW containers on the main PC) are idle.
+  - Containers that must stay up are idle.
   - The manifest records the machine's Docker CPU and memory limits.
 
-**Claim runs on Linux** (the checks host, a Linux workstation, or the Draco cluster) add what a desktop can't promise:
+**Claim runs on Linux** (the checks host, a Linux workstation, or a cluster) add what a desktop can't promise:
 - the memory limit of each system's cgroup (`memory.max`) and its peak (`memory.peak`) instead of sampled RSS, beside the process's peak RSS: the cgroup's counts the page cache its reads were charged, which depends on what the host had cached (the fast suite's LUBM 100: 2,375 to 4,700 MiB for one build);
 - the system's cores pinned (`--cpuset-cpus`), the client on others;
 - the CPU governor on `performance`, turbo as configured and recorded;
@@ -150,8 +150,7 @@ the DL performance plan ([docs/design/owl2-dl-performance.md](../docs/design/owl
 
 One question: does the head lose, in time or memory, on any workload, against **both** the
 v1.5 baseline (0f465633) and `main` (f9b515e8)? No loss is tolerated: a clear loss blocks
-whatever its size, unless it is an owner-approved trade-off (the owner, 18 Oct 2026: "I would
-only approve tradeoffs"). With it: every guard of
+whatever its size, unless it is an approved trade-off (below). With it: every guard of
 [docs/design/performance.md §0](../docs/design/performance.md) green, and every W3C suite at
 its required counts. `fast/release_gate.py` decides; `scripts/release-gate.sh` runs it as fleet
 steps; `release-gate.sh jobs HEAD` writes the jobs. Each part's verdict is `passed` only when
@@ -230,7 +229,7 @@ report` exit 5), its reason listed, until the family or the baseline changes. Tw
 change the family. A case whose baseline's *product* lacks the capability says so in the
 catalogue (`absent = { main = "<capability>" }`): no hypothesis against that baseline, and the
 verdict lists it as "main has no <capability>". A baseline whose product has it but whose
-measurement build can't run it yet is absent only by Johannes's *absence* entry (below), listed
+measurement build can't run it yet is absent only by an *absence* entry (below), listed
 as "not compared by the owner's decision"; without one it stays not compared and blocks. A timed
 block never runs a side declared absent either way (its record says `absent`), and the verdict
 then counts, per baseline, the cases compared and those absent by product and by decision. The
@@ -252,17 +251,16 @@ the timed host and the big host); a declared hypothesis a round doesn't test cou
 - *The unit.* A block's contrast is log(head's median in the block / the baseline's). With
   several layouts the blocks of a layout are averaged first: the layout is the unit, so its
   variance (tau^2 / K) stays in the error however many blocks repeat it; with one build per side
-  each block is a unit. A block is a unit only because it times copies of its own (lks, 20 Oct
-  2026): two rounds timing the same two files gave creaders' read p50 x1.032 and x0.951, each at
-  p = 0.001, and a build against a byte-identical copy of itself (lks-aa-20) x1.048 in one session
+  each block is a unit. A block is a unit only because it times copies of its own: two rounds timing the same two files gave creaders' read p50 x1.032 and x0.951, each at
+  p = 0.001, and a build against a byte-identical copy of itself x1.048 in one session
   and x0.983 in the next, the same in every block of a session. The offset belongs to the file's
   cached instance (up to 0.045 in log against 0.0075 between blocks of one instance); blocks
   timing one instance share it, so the round's blocks weren't independent and its p was
   anti-conservative. A copy per block draws the offset anew: it is in the blocks' variance, and
   a confirmation round no longer inherits round 1's instances. That each copy draws it
-  independently is assumed, not yet shown: lks-aa-20 shows that two fixed files differ, not
+  independently is assumed, not yet shown: that run shows that two fixed files differ, not
   that copying and deleting per block redraws the offset (pages can be reused). The first A-A'
-  floor run (the timed host) tests it, its copy-to-copy spread across blocks against lks-aa-20's
+  floor run (the timed host) tests it, its copy-to-copy spread across blocks against that run's
   between-file spread; until then the false-block rates of `probes/gate-falseblock.py` (0 of
   2,000 simulated A/A gates with copies, against 0.2 % to 100 % without, by blocks a round) hold
   under that assumption only.
@@ -414,8 +412,9 @@ arises, the same for every side:
   the checks host's powersave with energy preference balance_performance (a shared host).
 
 **Trade-offs and exceptions.** [release-tradeoffs.toml](release-tradeoffs.toml) is the only thing
-that accepts what the bar forbids, and only Johannes adds to it. Each entry carries his approval:
-the date, `by = "Johannes"`, the reason, his words verbatim and their source. A *trade-off*
+that accepts what the bar forbids, and only the project's owner adds to it. Each entry carries the approval:
+the date, `by` (the gate accepts the owner's name alone), the reason, the approval's words verbatim
+and their source. A *trade-off*
 accepts a loss: it names a case, a dimension, optionally the baseline, the largest ratio the
 loss's interval may reach, and the win that pays for it, which must show as *better* in the same
 report. A covered loss is reported as an *accepted trade-off*; anything beyond its bound, without
@@ -425,10 +424,10 @@ them yet: it names the baseline (`side`), the reason and the `port` planned to c
 candidate's `wrong` outcome blocks unless one names that case and outcome, wherever the baselines
 stand, even where the case declares the outcome and every baseline is wrong too; a declared
 `outcome` and `known` issue explain evidence and grant nothing. Only `wrong`, plus confirmed
-losses as now, needs a named Johannes exception. A declared `memory-limit`, `gave-up`, `timeout`
+losses as now, needs a named exception. A declared `memory-limit`, `gave-up`, `timeout`
 or `unsupported` blocks where a baseline completes. Where every side stops, it's listed in the
-verdict and doesn't block (the orchestrator, 9 Nov 2026: only wrong answers disqualify, and the
-bar's time and memory loss rule). The verdict reads
+verdict and doesn't block: only wrong answers disqualify, and the bar's time and memory loss
+rule. The verdict reads
 the file at the candidate's commit, never from a report, and lists every entry it applied and
 every exception the candidate didn't need. The list starts empty.
 
@@ -515,7 +514,7 @@ bash scripts/release-gate.sh verdict HEAD R/rg-H8-timed R/rg-H8-confirm R/rg-H8-
 
 | Threat | Answer |
 |---|---|
-| Docker Desktop's VM on Windows adds overhead to I/O and memory | every system runs under the same VM; the manifest records its limits; claim runs repeat on Linux (the checks host, or the Draco cluster) |
+| Docker Desktop's VM on Windows adds overhead to I/O and memory | every system runs under the same VM; the manifest records its limits; claim runs repeat on Linux (the checks host, or a cluster) |
 | The OS page cache makes a second load faster | interleave fresh-store repetitions; identify OS-cold numbers only when the recorded cache-control procedure was used |
 | A load timed around `docker run` includes the container's start (a few hundred ms on Docker Desktop), which dominates the smallest tiers | the manifest records a no-op container's start (`container_start_ms`); NRESE's own load phases are in its load log; small tiers are read as start-up plus load, and claims about load speed use tiers whose loads take seconds |
 | Sampled `docker stats` can miss short peaks differently across systems | retain kernel lifetime accounting through container exit, record its scope and qualify its lifecycle; otherwise label memory as sampled/unavailable and withhold lifetime-peak claims |
