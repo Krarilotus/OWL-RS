@@ -351,6 +351,7 @@ design. Each part has a gauge in `/metrics`:
 | The full-text index | the dictionary's literals, from the first text search on | as the dictionary | `nrese_text_index_terms` |
 | The result cache | repeated queries on an unchanged store (after a commit, the first result stored drops the older revisions' entries) | `budgets.result_cache` | `nrese_query_cache_bytes` |
 | The write-ahead log (on disk) | writes | `store.checkpoint_after_wal`, then a checkpoint | `nrese_wal_bytes_since_checkpoint` |
+| A checkpoint's working memory, outside every memory limit ([limits](../limits.md#memory-and-stopping)) | the dictionary's terms | the checkpoint's end | |
 | The log archive (`store.wal_archive` on) | every checkpoint | `nrese-server prune-archive` | |
 | Sessions, running queries | open client transactions, queries | their end (an idle session after ten minutes) | `nrese_sessions_open`, `nrese_queries_running` |
 | The allocator | the most the program held at once, across its threads | what it reserved, within minutes | `nrese_allocator_bytes{kind="committed"}` |
