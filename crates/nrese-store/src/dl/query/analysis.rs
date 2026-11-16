@@ -378,23 +378,26 @@ pub(super) fn typed_constant(query: &Query) -> Option<String> {
     })
 }
 
-/// The data values `query` compares by term: each variable at the object end of two or
-/// more patterns or paths, or of one and bound by `VALUES` or `BIND` (a join), or at one
-/// that `DISTINCT` or `REDUCED` returns, `GROUP BY` groups or a `DISTINCT` aggregate reads;
-/// and each string constant at an object end (a stored `"Rex"^^xsd:token` is `"Rex"` to
-/// OWL 2). What it is, and the predicates of its ends (`None`: a variable predicate or a
-/// path, any). The store compares terms, the regime
-/// values; whether a value read there has another spelling is the data's ([`certify`]
-/// asks the snapshot read, so a variable's IRIs-only ends, `rdf:type`'s too, mark
-/// nothing). One walk, once per query ([`Reads`]).
+/// The data values `query` compares by term: each variable (or blank node, which a path's
+/// sequence makes) at the object end of two or more patterns or paths (or a path's start,
+/// where it has a reversed step), or of one and bound by `VALUES` or `BIND` (a join), or at
+/// one that `DISTINCT` or `REDUCED` returns, `GROUP BY` groups or a `DISTINCT` aggregate
+/// reads (or an alias `(?n AS ?m)` of one under `DISTINCT` or `GROUP BY`, which the walk
+/// meets first); and each string constant at an object end (a stored `"Rex"^^xsd:token` is
+/// `"Rex"` to OWL 2). What it is, and the predicates of its ends (`None`: a variable
+/// predicate or a path, any). The store compares terms, the regime values; whether a value
+/// read there has another spelling is the data's ([`certify`] asks the snapshot read, so a
+/// variable's IRIs-only ends, `rdf:type`'s too, mark nothing). One walk, once per query
+/// ([`Reads`]).
 pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>)> {
-    use nrese_sparql_syntax::algebra::AggregateExpression::{CountSolutions, FunctionCall};
+    use nrese_sparql_syntax::algebra::{AggregateExpression::*, Expression};
     let (mut ends, mut grouped, mut bound) =
         (HashMap::<_, Vec<_>>::new(), HashSet::new(), HashSet::new());
     let (mut distinct, mut all, mut strings) = (false, false, Vec::new());
     pattern_of(query).find(&mut |node| {
         let mut end = |t: &TermPattern, p: Option<String>| match t {
             TermPattern::Variable(v) => ends.entry(v.as_str().to_owned()).or_default().push(p),
+            TermPattern::BlankNode(b) => ends.entry(b.to_string()).or_default().push(p),
             TermPattern::Literal(l) if l.is_plain() => {
                 strings.push((format!("the string {l}"), vec![p]))
             }
@@ -406,12 +409,27 @@ pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>
                     .iter()
                     .for_each(|t| end(&t.object, pattern_reads(t).0));
             }
-            Node::Pattern(GraphPattern::Path { object, .. }) => end(object, None),
+            Node::Pattern(GraphPattern::Path {
+                subject,
+                path,
+                object,
+            }) => {
+                end(object, None);
+                if reversed(path) {
+                    end(subject, None);
+                }
+            }
             Node::Pattern(GraphPattern::Values { variables, .. }) => {
                 bound.extend(variables.iter().map(|v| v.as_str().to_owned()));
             }
             Node::Pattern(GraphPattern::Extend { bindings, .. }) => {
-                bound.extend(bindings.iter().map(|(v, _)| v.as_str().to_owned()));
+                for (v, e) in bindings.iter().map(|(v, e)| (v.as_str(), e)) {
+                    let alias = distinct || grouped.contains(v);
+                    if alias && let Expression::Variable(n) = e {
+                        grouped.insert(n.as_str().to_owned());
+                    }
+                    bound.insert(v.to_owned());
+                }
             }
             Node::Pattern(GraphPattern::Distinct { .. } | GraphPattern::Reduced { .. }) => {
                 distinct = true;
@@ -424,12 +442,10 @@ pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>
                 grouped.extend(variables.iter().map(|v| v.as_str().to_owned()));
                 for (_, aggregate) in aggregates {
                     match aggregate {
-                        FunctionCall {
-                            expr,
-                            distinct: true,
-                            ..
-                        } => variables_of(expr, &mut grouped),
-                        CountSolutions { distinct: true } => all = true,
+                        CountSolutions { distinct } => all |= *distinct,
+                        FunctionCall { expr, distinct, .. } if *distinct => {
+                            variables_of(expr, &mut grouped)
+                        }
                         _ => {}
                     }
                 }
@@ -447,7 +463,7 @@ pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>
             } else if distinct && shown.as_ref().is_none_or(|s| s.contains(&v)) {
                 "DISTINCT over"
             } else if all || grouped.contains(&v) {
-                "GROUP BY or a DISTINCT aggregate over"
+                "GROUP BY or DISTINCT over"
             } else {
                 return None;
             };
@@ -457,6 +473,18 @@ pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>
     compared.extend(strings);
     compared.sort();
     compared
+}
+
+/// Whether `path` has a reversed step (`^p`, `!(^p)`) anywhere, under `*`, `+`, `?`, `|` or
+/// `/`: its start can then be a data value, as its end can.
+fn reversed(path: &PropertyPathExpression) -> bool {
+    use PropertyPathExpression as P;
+    match path {
+        P::Reverse(_) => true,
+        P::NamedNode(_) | P::NegatedPropertySet(_) => false,
+        P::Sequence(paths) | P::Alternative(paths) => paths.iter().any(reversed),
+        P::ZeroOrMore(p) | P::OneOrMore(p) | P::ZeroOrOne(p) => reversed(p),
+    }
 }
 
 /// Whether `iri` is in a reserved namespace, rdf:, rdfs: or owl:, whose entailed statements
