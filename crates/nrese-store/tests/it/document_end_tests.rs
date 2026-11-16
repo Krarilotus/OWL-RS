@@ -3,9 +3,12 @@
 //! inside a statement, the last line end missing and a read error, in both modes:
 //! - a load that returns Ok has read every byte, and every statement is committed or
 //!   quarantined, with its text where the parser keeps it (not RDF/XML or JSON-LD);
-//! - a file that ends inside a statement stops the load in every format; the error names the
-//!   file, the line the statement starts on (where the format has lines) and that nothing was
-//!   loaded; a last statement without a line end still loads;
+//! - a file that ends inside a statement (cut off, or in Turtle and TriG a bracket that never
+//!   closes) stops the load in every format, and the error names the file and that nothing
+//!   was loaded; in N-Triples and N-Quads, and in Turtle and TriG by default, it also says the
+//!   file ends inside a statement, with the line it starts on (strict Turtle and TriG don't
+//!   recover, so don't look for its end; the other formats' errors say what is open: an
+//!   element, a record, a string); a last statement without a line end still loads;
 //! - a quarantined statement and an error show no position the parser doesn't know;
 //! - a format that goes on after a bad statement does so by default; `strict` stops;
 //! - a load that stops commits nothing and quarantines nothing.
@@ -39,6 +42,9 @@ enum Case {
     BadStatement,
     /// Cut inside the statement that starts on this line.
     Cut(usize),
+    /// Turtle and TriG: a bracket that never closes in the statement on this line, near the
+    /// top, the rest well-formed. Recovery finds no end of it: the document ends inside it.
+    Unclosed(usize),
     /// A directory where the file should be: a read error at the first read.
     Unreadable,
 }
@@ -146,12 +152,12 @@ fn broken(row: (RdfFormat, Case, bool), file: &str, seen: &Seen) -> Vec<&'static
         Err(error) => {
             let message = error.to_string();
             let says = |text: &str| message.contains(text);
-            let cut = matches!(case, Case::Cut(_));
+            let cut = matches!(case, Case::Cut(_) | Case::Unclosed(_));
             let goes_on = !matches!(format, N3 | BinaryRdf);
+            // Strict Turtle and TriG don't recover, so they don't look for the end.
+            let worded = cut && (matches!(format, NTriples | NQuads) || !strict && matches!(format, Turtle | TriG));
             let line_named = match case {
-                Case::Cut(line) => {
-                    !knows_lines(format, Case::Whole) || says(&format!("line {line}"))
-                }
+                Case::Cut(line) | Case::Unclosed(line) => !worded || says(&format!("line {line}")),
                 _ => true,
             };
             vec![
@@ -159,21 +165,26 @@ fn broken(row: (RdfFormat, Case, bool), file: &str, seen: &Seen) -> Vec<&'static
                 (!matches!(case, Case::Whole | Case::NoLastLineEnd), "a well-formed file loads"),
                 (strict || case != Case::BadStatement || !goes_on, "a format that goes on does"),
                 (!cut || says(file), "a cut names the file"),
-                (!cut || says("ends inside a statement"), "a cut says the file ends inside one"),
+                (!worded || says("ends inside a statement"), "a cut says the file ends inside one"),
                 (!cut || says("nothing was loaded"), "a cut says nothing was loaded"),
                 (line_named, "a cut names the line its statement starts on"),
                 (knows_lines(format, case) || !says("line "), "no line the parser doesn't know"),
+                (!strict || !says("ends inside a statement") || matches!(format, NTriples | NQuads), "strict reads no further than its error"),
             ]
         }
         Ok(_) => {
             let without_text = matches!(format, RdfXml | JsonLd);
             let texts = seen.quarantined.iter().all(|s| s.text.is_some());
             let unplaced = seen.quarantined.iter().all(|s| (s.line, s.column) == (0, 0));
+            // Its reason says what the parser knows: RDF/XML the byte, JSON-LD nothing more.
+            let said = |s: &QuarantinedStatement| s.reason.starts_with("byte ") == (format == RdfXml);
+            let said = seen.quarantined.iter().all(|s| !s.reason.contains("line ") && said(s));
             vec![
-                (!matches!(case, Case::Cut(_) | Case::Unreadable), "Ok: every byte read, none cut"),
+                (!matches!(case, Case::Cut(_) | Case::Unclosed(_) | Case::Unreadable), "Ok: every byte read, none cut"),
                 (seen.committed + q == N as u64, "each statement committed or quarantined"),
                 (without_text || texts, "quarantined with its text where the parser keeps it"),
                 (!without_text || unplaced, "quarantined at no position the parser doesn't know"),
+                (!without_text || said, "a record's reason says what is known, and no line"),
                 (!strict || q == 0, "strict quarantines nothing"),
             ]
         }
@@ -200,6 +211,13 @@ fn a_load_reads_each_file_to_its_end_or_stops() {
         ];
         if knows_lines(format, Case::Whole) {
             cases.push((Case::NoLastLineEnd, document.trim_ascii_end().to_vec()));
+        }
+        if matches!(format, Turtle | TriG) {
+            // Statement 1's object opens a `[` that never closes; 38 statements follow it.
+            let at = find_once(&document, br#""v1""#);
+            let line = document[..at].iter().filter(|&&b| b == b'\n').count() + 1;
+            let unclosed = replace_once(&document, br#""v1""#, br#"[ <http://example.com/q> "v1""#);
+            cases.push((Case::Unclosed(line), unclosed));
         }
         for (i, (case, bytes)) in cases.into_iter().enumerate() {
             let name = format!("case{i}.{}", format.file_extension());

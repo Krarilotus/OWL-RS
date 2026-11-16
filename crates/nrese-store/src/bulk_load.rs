@@ -14,9 +14,10 @@
 //! - **Bad statements** ([`InvalidStatements`]). By default a statement with a syntax error
 //!   goes into the repository's quarantine ([`crate::quarantine`]) and the load goes on: a
 //!   line of N-Triples or N-Quads, a statement of Turtle or TriG up to its `.`, the rest of
-//!   an RDF/XML node element below `rdf:RDF`, a top-level node object of JSON-LD. Other
-//!   formats, malformed XML or JSON, still stop; a read error always does. Strict, the
-//!   first stops the load.
+//!   an RDF/XML node element below `rdf:RDF`, a top-level node object of JSON-LD. An error
+//!   after which the parser reads no further stops the load, nothing committed: malformed
+//!   XML or JSON, any error in N3 or Binary RDF, a file that ends inside a statement (it may
+//!   be cut off), and a read error. Strict, the first error stops the load.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -81,9 +82,11 @@ struct Skipping<'c, 'q> {
 }
 
 impl Skipping<'_, '_> {
-    /// `Ok` (quarantined) for a syntax error, the error otherwise.
+    /// `Ok` (quarantined) for a syntax error the parser reads on after, the error otherwise:
+    /// skipping one that ends its document would load its first part as the whole.
     fn skip(&self, error: RdfParseError) -> StoreResult<()> {
         match error {
+            error if error.ends_document() => Err(error.into()),
             RdfParseError::Syntax(syntax) => self.collector.add(self.file, &syntax),
             error => Err(error.into()),
         }

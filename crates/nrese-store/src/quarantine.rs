@@ -85,7 +85,8 @@ pub struct QuarantinedStatement {
     pub id: String,
     pub load: String,
     pub file: String,
-    /// Where it starts in the document, from 1; the column counts characters.
+    /// Where it starts in the document, from 1; the column counts characters. 0 where the
+    /// parser doesn't know it (RDF/XML, JSON-LD): `reason` then says what it knows.
     pub line: u64,
     pub column: u64,
     pub reason: String,
@@ -1014,13 +1015,18 @@ impl Collector<'_> {
                 (Some(text), length > MAX_TEXT, not_utf8)
             }
         };
+        let lines = error.knows_lines();
         let statement = QuarantinedStatement {
             id: format!("{}.{file}.{}", self.load, start.offset),
             load: self.load.clone(),
             file: source.path.display().to_string(),
-            line: start.line + 1,
-            column: start.column + 1,
-            reason: error.message().to_owned(),
+            line: if lines { start.line + 1 } else { 0 },
+            column: if lines { start.column + 1 } else { 0 },
+            reason: if lines {
+                error.message().to_owned()
+            } else {
+                error.to_string()
+            },
             format: source.format.file_extension().to_owned(),
             text,
             truncated,

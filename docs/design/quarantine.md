@@ -12,7 +12,13 @@ store whose asserted data is inconsistent. This one holds statements that are no
 
 1. A bulk load loads every valid statement. Each invalid one goes into the repository's
    quarantine: its text verbatim (within the limits of §2), file, the document's line, the
-   reason, and the load. Malformed XML or JSON and read errors still stop the load.
+   reason, and the load. RDF/XML and JSON-LD are the exception: the record has no text and
+   no line, and stands for the whole node element or top-level node object the parser
+   skipped, which can hold several statements. An error after which the parser reads no
+   further stops the load and commits nothing: malformed XML or JSON, any error in N3 or
+   Binary RDF, a read error, and a file that ends inside a statement, which may be cut off
+   (its error says so, with the line the statement starts on). A last statement without a
+   line end is not cut: it loads.
 2. Quarantined statements are not data: queries, reasoning, exports and statistics don't
    see them. By construction: they never reach the engine.
 3. The load warns: its report carries the count, the load's id and the first examples
