@@ -204,7 +204,7 @@ The [contracts](#endpoint-contracts) say how to send them.
 | `ASK` | `application/sparql-results+json`, `application/sparql-results+xml` |
 | `CONSTRUCT`, `DESCRIBE` | `application/n-triples`, `text/turtle`, `application/rdf+xml`, `application/ld+json`, `application/n-quads`, `application/trig`, `application/x-binary-rdf` (RDF4J's Binary RDF, also accepted as a payload) |
 
-`application/json` and `application/xml` are taken as the SPARQL results formats, `application/x-turtle` as Turtle, and `text/plain` as N-Triples.
+`application/json` and `application/xml` are taken as the SPARQL results formats. Other names RDF4J clients send are taken as the graph formats, in `Accept` and as a payload: `application/x-turtle` as Turtle, `text/x-nquads` and `text/nquads` as N-Quads, `application/x-trig` as TriG. A response names the standard type. `text/plain` is taken as N-Triples in `Accept` only; a payload sent as `text/plain` is refused (415).
 
 ## Classification
 
