@@ -314,7 +314,9 @@ impl StoreService {
             service.invalidate_held(writer)?;
         }
         if let Some(state) = service.reasoning_state() {
-            service.note_equality(writer, &state);
+            // The reading isn't on disk: the certified stack's is installed before the store
+            // is anyone's. Without a certificate the stack is read as stored.
+            tx.install_reading(service.note_equality(writer, &state));
             // Kept in memory too: reads ask for it per query ([`Self::status_without_dl`]).
             *service
                 .materialised
@@ -329,23 +331,28 @@ impl StoreService {
     /// Whether the recorded reasoning closes the data under `owl:sameAs` (a ruleset with
     /// the equality rules): queries may then rely on it.
     ///
-    /// A stack kept over representatives (`reasoner.equality = "compact"`) is read
-    /// expanded: the engine learns `owl:sameAs` ([`nrese_engine::Engine::set_equality`]).
-    fn note_equality(&self, writer: nrese_engine::WriterHeld<'_>, state: &crate::ReasoningState) {
+    /// Returns how the certified stack is read: a stack kept over representatives
+    /// (`reasoner.equality = "compact"`) expanded by `owl:sameAs`, else as stored. Its
+    /// publication installed that already; the open installs it
+    /// ([`nrese_engine::Transaction::install_reading`]).
+    fn note_equality(
+        &self,
+        writer: nrese_engine::WriterHeld<'_>,
+        state: &crate::ReasoningState,
+    ) -> Option<nrese_engine::TermId> {
         self.note_ql(writer, state);
         let closed = nrese_reasoner::RuleProgram::closes_equality(&state.ruleset);
         self.settings
             .equality_closed
             .store(closed, std::sync::atomic::Ordering::Release);
-        let same_as = (closed && state.compact_equality)
+        (closed && state.compact_equality)
             .then(|| {
                 self.engine.snapshot().lookup(
                     nrese_rdf::NamedNodeRef::new_unchecked("http://www.w3.org/2002/07/owl#sameAs")
                         .into(),
                 )
             })
-            .flatten();
-        self.engine.set_equality(same_as);
+            .flatten()
     }
 
     /// Switches the QL rewriting on for a closure it can rewrite over (docs/design/
@@ -634,11 +641,9 @@ impl StoreService {
     pub fn clear_inferred(&self) -> StoreResult<u64> {
         let rematerialisation = self.engine.rematerialisation();
         self.invalidate_held(rematerialisation.writer())?;
-        self.engine.set_equality(None);
-        if rematerialisation.base().len_in(ReadModel::Inferred) == 0 {
-            return Ok(0);
-        }
-        Ok(rematerialisation.finish(Vec::new())?.inferred_deleted)
+        // An empty stack is read as stored, installed even where it was empty already.
+        let finished = rematerialisation.finish_held(Vec::new(), None)?;
+        Ok(finished.summary().inferred_deleted)
     }
 
     /// Waits until the engine's background maintenance has nothing requested or running
@@ -2219,19 +2224,15 @@ impl StoreService {
         // heap's peak, is built (as between the reasoner's rounds).
         nrese_engine::memory::release_between_rounds();
         nrese_exec::heap::phase("store: inferred stack");
-        // The new stack is read as its program keeps it from its first reader on: expanded by
-        // the id it is kept over, not by what the published dictionary holds, or as stored.
-        // Until it is published, readers read the old one in that reading, uncertified
-        // (`invalidate_held` above). A publication that fails installs nothing: the old stack
-        // keeps its reading, as a catalog's change that fails keeps its old reasoning.
-        let reading = self.engine.equality();
-        self.engine.set_equality(program.stored_equality());
         #[cfg(test)]
         hooks::run(&hooks::BEFORE_PUBLICATION);
-        // Published with the writer slot still held: certified before any other write.
-        let finished = rematerialisation
-            .finish_held(closure.inferred)
-            .inspect_err(|_| self.engine.set_equality(reading))?;
+        // Published with the writer slot still held: certified before any other write. The
+        // new stack comes with its reading, as its program keeps it (expanded by the id it is
+        // kept over, or as stored), in one install: until then readers read the old stack in
+        // its own reading, uncertified (`invalidate_held` above). A publication that fails
+        // installs nothing, so there is nothing to put back.
+        let finished =
+            rematerialisation.finish_held(closure.inferred, program.stored_equality())?;
         let summary = finished.summary();
         nrese_exec::heap::phase("store: done");
         nrese_engine::memory::release_all();
