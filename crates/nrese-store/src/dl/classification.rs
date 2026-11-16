@@ -803,7 +803,8 @@ mod tests {
     /// Two requests on one revision while nothing is kept run one computation: the second
     /// gets the first's result (D16-655: a client asking again after a 408 started a second
     /// classification beside the first). Counted, not timed: the first computation holds
-    /// until the second request has computed too, or for 2 s, ample for it to be waiting.
+    /// until the second request is asleep on it or has computed too (the two overlap
+    /// either way); a 10 s safety limit fails the test.
     #[test]
     fn two_requests_on_one_revision_run_one_computation() {
         use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
@@ -819,10 +820,7 @@ mod tests {
                     || {
                         calls.fetch_add(1, SeqCst);
                         started.wait();
-                        let until = Instant::now() + Duration::from_secs(2);
-                        while calls.load(SeqCst) < 2 && Instant::now() < until {
-                            std::thread::sleep(Duration::from_millis(1));
-                        }
+                        until(|| calls.load(SeqCst) >= 2 || asleep(&slot, 7, 1));
                         1
                     },
                 )
@@ -843,21 +841,24 @@ mod tests {
         });
     }
 
-    /// Holds a computation until a request waits for it (at most 10 s, then fails).
-    fn until_waiting<T>(slot: &Slot<T>, revision: u64) {
-        let until = Instant::now() + Duration::from_secs(10);
-        loop {
-            if let Claim::Wait(build) = slot.building.claim(revision, Kind::Opaque, || None)
-                && build.waiting() > 0
-            {
-                return;
-            }
-            assert!(
-                Instant::now() < until,
-                "no request waited for the computation"
-            );
+    /// Whether `n` requests are asleep on `revision`'s computation under way.
+    fn asleep<T>(slot: &Slot<T>, revision: u64, n: usize) -> bool {
+        matches!(slot.building.claim(revision, Kind::Opaque, || None),
+            Claim::Wait(build) if build.waiting() >= n)
+    }
+
+    /// Holds the caller until `event`; past a 10 s safety limit the test fails.
+    fn until(event: impl Fn() -> bool) {
+        let limit = Instant::now() + Duration::from_secs(10);
+        while !event() {
+            assert!(Instant::now() < limit, "the awaited event never came");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    /// Holds a computation until a request waits for it (at most 10 s, then fails).
+    fn until_waiting<T>(slot: &Slot<T>, revision: u64) {
+        until(|| asleep(slot, revision, 1));
     }
 
     /// A computation that panics while a request waits for it leaves that request its own
@@ -881,7 +882,12 @@ mod tests {
             });
             started.wait();
             let second = cached(&slot, 7, |_| true, || 2);
-            assert!(first.join().is_err());
+            let failure = first.join().expect_err("the computation panics");
+            assert_eq!(
+                failure.downcast_ref::<&str>(),
+                Some(&"the computation fails"),
+                "the computation failed in its setup, not by the injected panic"
+            );
             assert_eq!(*second, 2);
             assert!(Arc::ptr_eq(&second, &latest(&slot, 7).unwrap()));
         });
@@ -978,5 +984,156 @@ mod tests {
             assert_eq!(calls.load(SeqCst), 1, "computations for one revision");
             assert!(Arc::ptr_eq(&first, &latest(&slot, 7).unwrap()));
         });
+    }
+
+    const WAITERS: usize = 4;
+
+    /// Several requests asleep on a computation give up (their policy timeouts: each client
+    /// has its 408), and the computation then ends with nothing to share, incomplete or by a
+    /// panic, before they look at their stops again: each returns with no result, and none
+    /// starts a computation of its own (review r1, R1: a request that had its 408 started a
+    /// fresh computation nobody could stop). Counted by computations, not timed.
+    fn stopped_waiters_take_no_replacement(panics: bool) {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        let slot = Slot::<(bool, usize)>::default();
+        let (calls, gave_up) = (AtomicUsize::new(0), AtomicBool::new(false));
+        let started = std::sync::Barrier::new(2);
+        let stop = || gave_up.load(SeqCst);
+        std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                super::cached(
+                    &slot,
+                    7,
+                    NEVER,
+                    |r| r.0,
+                    || {
+                        calls.fetch_add(1, SeqCst);
+                        started.wait();
+                        until(|| asleep(&slot, 7, WAITERS));
+                        gave_up.store(true, SeqCst);
+                        if panics {
+                            panic!("the computation fails");
+                        }
+                        (false, 1)
+                    },
+                )
+            });
+            started.wait();
+            let waiters: Vec<_> = (0..WAITERS)
+                .map(|_| {
+                    s.spawn(|| {
+                        super::cached(
+                            &slot,
+                            7,
+                            &stop,
+                            |r| r.0,
+                            || {
+                                calls.fetch_add(1, SeqCst);
+                                (true, 2)
+                            },
+                        )
+                    })
+                })
+                .collect();
+            for waiter in waiters {
+                let result = waiter.join().unwrap();
+                assert!(result.is_none(), "a waiter that gave up got a result");
+            }
+            match first.join() {
+                Err(failure) => {
+                    assert!(panics && failure.downcast_ref() == Some(&"the computation fails"))
+                }
+                Ok(result) => assert!(!panics && result.is_some_and(|r| *r == (false, 1))),
+            }
+            assert_eq!(
+                calls.load(SeqCst),
+                1,
+                "computations after the requests gave up"
+            );
+            assert!(latest(&slot, 7).is_none());
+        });
+    }
+
+    #[test]
+    fn stopped_waiters_on_an_incomplete_computation_take_no_replacement() {
+        stopped_waiters_take_no_replacement(false);
+    }
+
+    #[test]
+    fn stopped_waiters_on_a_panicking_computation_take_no_replacement() {
+        stopped_waiters_take_no_replacement(true);
+    }
+
+    /// Several requests that never give up, asleep on a computation that ends incomplete: at
+    /// most one replacement computation runs at a time (review r1, R1: each ran its own,
+    /// unclaimed, all at once). If a replacement completes, every request gets its result;
+    /// if each ends incomplete too (a budget that runs out every time), every request still
+    /// returns, having computed at most once. Counted, not timed: a computation holds until
+    /// two have run at once (the fault; then all are let go) or every request that hasn't
+    /// computed is asleep on it; a 10 s safety limit fails the test.
+    fn interested_waiters_compute_one_at_a_time(replacement_completes: bool) {
+        use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+        let slot = Slot::<(bool, usize)>::default();
+        let (calls, active, most) = (
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+            AtomicUsize::new(0),
+        );
+        let started = std::sync::Barrier::new(2);
+        let computation = || {
+            let call = calls.fetch_add(1, SeqCst) + 1;
+            most.fetch_max(active.fetch_add(1, SeqCst) + 1, SeqCst);
+            let others = (WAITERS + 1).saturating_sub(call);
+            until(|| most.load(SeqCst) >= 2 || asleep(&slot, 7, others));
+            active.fetch_sub(1, SeqCst);
+            (call > 1 && replacement_completes, call)
+        };
+        std::thread::scope(|s| {
+            let first = s.spawn(|| {
+                cached(
+                    &slot,
+                    7,
+                    |r| r.0,
+                    || {
+                        started.wait();
+                        computation()
+                    },
+                )
+            });
+            started.wait();
+            let waiters: Vec<_> = (0..WAITERS)
+                .map(|_| s.spawn(|| cached(&slot, 7, |r| r.0, computation)))
+                .collect();
+            let results: Vec<_> = waiters.into_iter().map(|w| w.join().unwrap()).collect();
+            assert_eq!(*first.join().unwrap(), (false, 1));
+            assert_eq!(most.load(SeqCst), 1, "replacement computations at once");
+            if replacement_completes {
+                assert!(
+                    results.iter().all(|r| **r == (true, 2)),
+                    "a waiter's result"
+                );
+                assert_eq!(
+                    calls.load(SeqCst),
+                    2,
+                    "computations: the first and one replacement"
+                );
+            } else {
+                assert!(results.iter().all(|r| !r.0), "a waiter's result");
+                assert!(
+                    calls.load(SeqCst) <= WAITERS + 1,
+                    "computations over requests"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn interested_waiters_share_one_replacement_at_a_time() {
+        interested_waiters_compute_one_at_a_time(true);
+    }
+
+    #[test]
+    fn interested_waiters_on_computations_ending_incomplete_compute_one_at_a_time() {
+        interested_waiters_compute_one_at_a_time(false);
     }
 }
