@@ -256,21 +256,28 @@ fn owl2_dl(compact: bool) -> MutationPipeline {
 /// where it equals a named individual (the only use of NAMED, §2.3.5). Spec: under `owl2-dl`
 /// an answer through such an equality is the entailed one and complete, for a blank node
 /// equal to a named one (`:a a :D` through `_:b`) and for two blank nodes equal (`:y a :D`
-/// through an inverse functional property whose values they are); in both equality modes,
-/// and read inside a transaction with nothing pending.
+/// through an inverse functional property whose values they are); and for a key's value
+/// whose `sameAs` class holds no IRI (`_:z1 owl:sameAs _:z2`), which the key doesn't bind
+/// (points 2 and 3 of docs/design/owl2-dl.md §16), so `:a a :D` is not entailed: `false`.
+/// Each read is a class membership, which may be complete (docs/spec/reasoning-semantics.md,
+/// "What may be complete"), so the decided reading is pinned by the answer and its status
+/// together; in both equality modes, and read inside a transaction with nothing pending.
 #[test]
 fn an_anonymous_individual_in_same_as_answers_complete() {
+    let all_blank_key = object_key("_:z1", "_:z1 owl:sameAs _:z2 .");
     let cases = [
-        ("_:b owl:sameAs :a . _:b a :D .", "ASK { :a a :D }"),
+        ("_:b owl:sameAs :a . _:b a :D .", "ASK { :a a :D }", "true"),
         (
             "_:b owl:sameAs _:c . :r a owl:ObjectProperty , owl:InverseFunctionalProperty . \
              :x :r _:b ; a :D . :y :r _:c .",
             "ASK { :y a :D }",
+            "true",
         ),
+        (all_blank_key.as_str(), "ASK { :a a :D }", "false"),
     ];
     let mut wrong = Vec::new();
     for compact in [false, true] {
-        for (data, read) in cases {
+        for (data, read, answer) in cases {
             let dl = owl2_dl(compact);
             insert(&dl, data).expect("accepted");
             let route = dl.store().dl_bounds().last;
@@ -284,9 +291,9 @@ fn an_anonymous_individual_in_same_as_answers_complete() {
                 pending.as_str()
             );
             eprintln!("{line}");
-            if rows != ["true"]
+            if rows != [answer]
                 || !status.is_complete()
-                || !text.contains("true")
+                || !text.contains(answer)
                 || !(pending.sound && pending.complete)
             {
                 wrong.push(line);
@@ -357,8 +364,8 @@ fn the_hypertableau_binds_an_anonymous_instance_only_through_a_named_one() {
 /// has the values `_:d1` and `:m`. A union in an assertion, so the OWL 2 RL rules (the lower
 /// bound) don't equate `_:d1` with `:m`; the upper bound applies the key to every individual
 /// and holds `:d2 a :E`. Spec: with the two classes bounding `:r`, `_:d1` is `:m` in every
-/// model, so the key binds it and `:d2 a :E` is entailed (§2.3.5); without them it equals no
-/// named individual and isn't. Each answer comes from the exact check of that one
+/// model, so the key binds it and `:d2 a :E` is entailed (§2.3.5); without them, equality
+/// with a named individual is not entailed, and neither is `:d2 a :E`. Each answer comes from the exact check of that one
 /// candidate, complete.
 #[test]
 fn the_exact_check_binds_an_anonymous_instance_only_through_a_named_one() {
