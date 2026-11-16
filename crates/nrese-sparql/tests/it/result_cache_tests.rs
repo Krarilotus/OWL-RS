@@ -293,7 +293,11 @@ fn a_renamed_select_is_answered_with_its_own_names() {
         else {
             panic!("nothing cached yet")
         };
-        slot.offer(b"?s\t?o\n".to_vec(), std::time::Duration::from_millis(5));
+        slot.offer(
+            b"?s\t?o\n".to_vec(),
+            None,
+            std::time::Duration::from_millis(5),
+        );
     }
     let renamed = parse(&format!("SELECT ?x ?y WHERE {{ ?x <{EX}p> ?y }}"));
     for format in [TSV, json] {
@@ -309,7 +313,7 @@ fn a_renamed_select_is_answered_with_its_own_names() {
     let again = parse(&format!("SELECT ?s ?o WHERE {{ ?s <{EX}p> ?o }}"));
     assert!(matches!(
         cached_output(&snapshot, &again, &options, TSV, b""),
-        CachedOutput::Hit(_)
+        CachedOutput::Hit(..)
     ));
 }
 
@@ -325,8 +329,8 @@ fn serialised_answers_are_kept_per_format_form_and_snapshot() {
         panic!("nothing cached yet")
     };
     let written = tsv(&snapshot, &select, &options);
-    slot.offer(written.clone(), std::time::Duration::from_millis(5));
-    let CachedOutput::Hit(bytes) = cached_output(&snapshot, &select, &options, TSV, b"") else {
+    slot.offer(written.clone(), None, std::time::Duration::from_millis(5));
+    let CachedOutput::Hit(bytes, _) = cached_output(&snapshot, &select, &options, TSV, b"") else {
         panic!("the bytes just offered")
     };
     assert_eq!(&*bytes, written.as_slice());
@@ -345,9 +349,9 @@ fn serialised_answers_are_kept_per_format_form_and_snapshot() {
         let CachedOutput::Miss(slot) = cached_output(&snapshot, &other, &options, TSV, b"") else {
             panic!("another query")
         };
-        slot.offer(b"other".to_vec(), std::time::Duration::from_millis(5));
+        slot.offer(b"other".to_vec(), None, std::time::Duration::from_millis(5));
     }
-    let CachedOutput::Hit(bytes) = cached_output(&snapshot, &select, &options, TSV, b"") else {
+    let CachedOutput::Hit(bytes, _) = cached_output(&snapshot, &select, &options, TSV, b"") else {
         panic!("still cached")
     };
     assert_eq!(&*bytes, written.as_slice());
@@ -369,10 +373,10 @@ fn serialised_answers_are_kept_per_format_form_and_snapshot() {
     let CachedOutput::Miss(slot) = cached_output(&snapshot, &select, &options, TSV, &one) else {
         panic!("nothing cached under this status yet")
     };
-    slot.offer(b"one".to_vec(), std::time::Duration::from_millis(5));
+    slot.offer(b"one".to_vec(), None, std::time::Duration::from_millis(5));
     assert!(matches!(
         cached_output(&snapshot, &select, &options, TSV, &one),
-        CachedOutput::Hit(_)
+        CachedOutput::Hit(..)
     ));
     assert!(matches!(
         cached_output(&snapshot, &select, &options, TSV, &other),
@@ -463,13 +467,13 @@ fn serialised_answers_equal_fresh_ones_over_random_commits() {
                     },
                 );
                 let answer = match cached_output(&snapshot, &query, &options, TSV, b"") {
-                    CachedOutput::Hit(bytes) => {
+                    CachedOutput::Hit(bytes, _) => {
                         from_bytes += 1;
                         bytes.to_vec()
                     }
                     CachedOutput::Miss(slot) => {
                         let written = tsv(&snapshot, &query, &options);
-                        slot.offer(written.clone(), std::time::Duration::from_millis(1));
+                        slot.offer(written.clone(), None, std::time::Duration::from_millis(1));
                         written
                     }
                     CachedOutput::Off => continue,

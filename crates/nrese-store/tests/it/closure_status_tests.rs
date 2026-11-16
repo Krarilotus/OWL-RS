@@ -389,7 +389,10 @@ fn owl2_dl_reading_inside_a_transaction_labels_it_unsound() {
             &prepared,
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         )
         .expect("answered");
     assert!(String::from_utf8(out).unwrap().contains("example.com/rex"));
@@ -417,7 +420,10 @@ fn a_read_inside_a_transaction_gives_its_reasons_as_written() {
             &prepared,
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         )
         .expect("answered");
     let reasons: Vec<_> = status
@@ -1622,6 +1628,31 @@ fn owl2_rl_reads_only_the_mappings_spelling_of_a_max_cardinality() {
     assert!(wrong.is_empty(), "spellings read otherwise: {wrong:#?}");
 }
 
+/// The rule sets read a property's domain, range and super-property whatever its typing
+/// (prp-dom, prp-rng, prp-spo1; rdfs2, rdfs3, rdfs7): one typed OWL 1's
+/// `owl:OntologyProperty`, which the OWL 2 mapping reads as an annotation property, has
+/// them in the `owl2-rl`, `owl2-ql` and `rdfs` closures, the rewriting on or off.
+#[test]
+fn the_rule_sets_read_an_ontology_propertys_schema() {
+    let data = ":note a owl:OntologyProperty ; rdfs:domain :C ; rdfs:range :D ; \
+                rdfs:subPropertyOf :q . :x :note :v .";
+    let mut wrong = Vec::new();
+    for (ruleset, ql) in [
+        (Ruleset::Owl2Rl, QlRewritingMode::Auto),
+        (Ruleset::Owl2Rl, QlRewritingMode::On),
+        (Ruleset::Owl2Ql, QlRewritingMode::Auto),
+        (Ruleset::Owl2Ql, QlRewritingMode::Off),
+        (Ruleset::Rdfs, QlRewritingMode::Auto),
+    ] {
+        let store = closure(data, ruleset, ql);
+        let (text, status) = answer(&store, "ASK { :x a :C . :v a :D . :x :q :v }");
+        if !text.contains("true") {
+            wrong.push(format!("{} {ql:?}: {text} {status:?}", ruleset.name()));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// An `owl2-dl` store loaded with `data` and an existential superclass, which is outside
 /// OWL 2 RL: off the RL route.
 fn owl2_dl_off_route(data: &str) -> StoreService {
@@ -1866,8 +1897,9 @@ fn a_prepared_query_is_marked_by_what_its_property_holds_at_each_run() {
     let status = |label: &str| -> [&'static str; 2] {
         let mut run = None;
         store
-            .run_query_reporting(&prepared, &CancellationToken::new(), Vec::new(), |s| {
-                run = s
+            .run_query_reporting(&prepared, &CancellationToken::new(), Vec::new(), |s, _| {
+                run = s;
+                None
             })
             .expect("ran");
         let plan = store
@@ -2211,7 +2243,10 @@ fn a_readers_status_doesnt_follow_what_they_cant_read() {
         for _ in 0..2 {
             let (mut run, mut rows) = (None, Vec::new());
             store
-                .run_query_reporting(&prepared, &CancellationToken::new(), &mut rows, |s| run = s)
+                .run_query_reporting(&prepared, &CancellationToken::new(), &mut rows, |s, _| {
+                    run = s;
+                    None
+                })
                 .expect("ran");
             let plan = store
                 .plan_query(&prepared, &CancellationToken::new())

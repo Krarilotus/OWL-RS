@@ -321,6 +321,30 @@ fn the_other_reads_of_an_individual_named_only_in_the_question_are_not_complete(
     assert!(!inside.complete && !alone.complete, "{lines:#?}");
 }
 
+/// A read of every statement outside a transaction, told without the DL bounds
+/// (`status_without_dl`): the rules' closure alone, which lacks an existential's certain
+/// answer here (`:a` has an `:r`), so it is not `complete`.
+#[test]
+fn a_read_of_every_statement_without_the_bounds_is_not_complete() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":r a owl:ObjectProperty . \
+         :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] . \
+         :a a :A .",
+    )
+    .expect("the existential");
+    let read = dl
+        .store()
+        .prepare_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "{}ASK {{ :a :r ?y }}",
+            super::PREFIXES
+        )))
+        .expect("prepared");
+    let status = dl.store().status_without_dl(&read).expect("a status");
+    assert!(!status.complete, "{} {:?}", status.as_str(), status.reasons);
+}
+
 /// The plan's status of a question about an individual the data doesn't name, under a key
 /// on the RL route, where nothing else keeps the plan from `complete`: the plan says why it
 /// isn't, that reason alone.
@@ -942,7 +966,8 @@ const BUILTIN_ANNOTATIONS: [&str; 9] = [
     "owl:incompatibleWith",
 ];
 
-/// An annotation property, built in (declared or not) or declared (`:note`), as the
+/// An annotation property, built in (declared or not) or declared (`:note`, also by OWL 1's
+/// `owl:OntologyProperty`), as the
 /// subject of a domain, a range or a sub-property, and as the super-property of `:p`
 /// (undeclared, a data property or an object property). The Mapping to RDF (3.2.5, Table
 /// 16) reads the first three as annotation axioms, which the Direct Semantics give no
@@ -955,7 +980,9 @@ fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
     let mut cases = Vec::new();
     for a in BUILTIN_ANNOTATIONS.into_iter().chain([":note"]) {
         let declared = format!("{a} a owl:AnnotationProperty . ");
-        for decl in [String::new(), declared] {
+        // OWL 1's typing, which Table 6 of the Mapping to RDF (3.1.2) replaces with the one above.
+        let ontology = (a == ":note").then(|| format!("{a} a owl:OntologyProperty . "));
+        for decl in [String::new(), declared].into_iter().chain(ontology) {
             if a == ":note" && decl.is_empty() {
                 continue;
             }
@@ -1014,7 +1041,7 @@ fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
         "{} reads told without the reason: {wrong:#?}",
         wrong.len()
     );
-    assert_eq!(cases.len(), 116, "the table's rows");
+    assert_eq!(cases.len(), 120, "the table's rows");
 }
 
 /// `data` (with `extra`) committed: the RL rules clash where OWL 2 DL is consistent, and
