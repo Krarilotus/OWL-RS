@@ -1,11 +1,13 @@
 //! Step 8: explanations of DL answers, as minimal sets of the ontology's axioms with the
 //! triples each was read from (the black-box justification of design §10).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use nrese_rdf::{NamedNode, TermRef};
+use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_sparql::GraphAccess;
-use nrese_store::{DlConfig, MutationError, ReadScope, Refusal, StoreError};
+use nrese_store::{DatasetBackupFormat, DlConfig, MutationError, ReadScope, Refusal, StoreError};
 
 use super::{insert, pipeline, pipeline_with};
 
@@ -139,6 +141,7 @@ fn a_dl_explanation_stopped_before_its_first_test_is_undecided() {
 /// `w a D`'s explanation over `B ⊑ D`, `C ⊑ D` (default graph) and `data`, which asserts `w`
 /// a union of `B` and `C` in named graphs: per axiom, per graph (the default graph `None`,
 /// a named one by its last segment) the predicates of its triples by local name, sorted.
+/// Every triple it lists under a graph is checked first to be asserted in that graph.
 fn graphs_explained(data: &str) -> Vec<Vec<(Option<String>, Vec<String>)>> {
     let dl = pipeline();
     let subclasses = ":B rdfs:subClassOf :D . :C rdfs:subClassOf :D .";
@@ -170,6 +173,27 @@ fn graphs_explained(data: &str) -> Vec<Vec<(Option<String>, Vec<String>)>> {
         .explain_dl(&ReadScope::All, statement)
         .expect("decided")
         .expect("w a D holds under OWL 2 DL");
+    // Every triple listed under a graph is asserted in that graph: the store's asserted
+    // quads, as N-Triples terms, by graph (`None`: the default graph).
+    let export = dl
+        .store()
+        .export_dataset(&ReadScope::All, DatasetBackupFormat::NQuads)
+        .expect("an export");
+    let parser = RdfParser::from_format(RdfFormat::NQuads).for_reader(&export.payload[..]);
+    let asserted: HashSet<(Option<String>, [String; 3])> = parser
+        .map(|quad| {
+            let q = quad.expect("the export's quads");
+            let graph = (!q.graph_name.is_default_graph()).then(|| q.graph_name.to_string());
+            let (s, p, o) = (q.subject, q.predicate, q.object);
+            (graph, [s.to_string(), p.to_string(), o.to_string()])
+        })
+        .collect();
+    for (graph, triples) in explained.axioms.iter().flat_map(|a| &a.sources) {
+        for triple in triples {
+            let listed = (graph.clone(), triple.clone());
+            assert!(asserted.contains(&listed), "{listed:?} isn't asserted");
+        }
+    }
     let mut axioms: Vec<_> = explained
         .axioms
         .iter()
