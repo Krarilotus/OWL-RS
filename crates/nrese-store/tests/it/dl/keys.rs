@@ -85,30 +85,83 @@ fn a_key_binds_no_anonymous_instance() {
 
 /// An object key whose value's `sameAs` class is all anonymous (`_:z1`, `_:z2`) binds
 /// nothing; a later commit that adds the named `:n` to the class makes it bind, and the
-/// commit that deletes that statement unbinds it again. Each answer and its status is the
-/// one a store given the same statements in one commit gives; in both equality modes, every
-/// identity stored and representatives stored.
+/// commit that deletes that statement unbinds it again. `owl:sameAs` on a blank node is
+/// outside OWL 2 DL (*OWL 2 Structural Specification* §11.2), so no status is required:
+/// each answer and its status is the one a store given the same statements in one commit
+/// gives; in both equality modes, every identity stored and representatives stored.
 #[test]
 fn a_key_binds_from_the_commit_that_names_its_value() {
     let anonymous = object_key("_:z1", "_:z1 owl:sameAs _:z2 .");
     let named = object_key("_:z1", "_:z1 owl:sameAs _:z2 . _:z2 owl:sameAs :n .");
-    let steps = [
-        (
-            format!("INSERT DATA {{ {anonymous} }}"),
-            &anonymous,
-            "false",
-        ),
-        (
-            "INSERT { ?z owl:sameAs :n } WHERE { :a :p ?z }".to_owned(),
-            &named,
-            "true",
-        ),
-        (
-            "DELETE { ?z owl:sameAs :n } WHERE { ?z owl:sameAs :n }".to_owned(),
-            &anonymous,
-            "false",
-        ),
-    ];
+    let wrong = commits_answer_as_one_load(
+        &[
+            (
+                format!("INSERT DATA {{ {anonymous} }}"),
+                anonymous.clone(),
+                "false",
+            ),
+            (
+                "INSERT { ?z owl:sameAs :n } WHERE { :a :p ?z }".to_owned(),
+                named,
+                "true",
+            ),
+            (
+                "DELETE { ?z owl:sameAs :n } WHERE { ?z owl:sameAs :n }".to_owned(),
+                anonymous,
+                "false",
+            ),
+        ],
+        None,
+    );
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// [`a_key_binds_from_the_commit_that_names_its_value`] inside OWL 2 DL: the values `_:z1`
+/// and `_:z2` are equal through a functional property of the anonymous `_:w`, and a commit
+/// names them by giving `_:w` the value `:n`. The anonymous individuals form a tree with
+/// `_:w` at most once next to a named one (§11.2), and no `owl:sameAs` is asserted: an OWL 2
+/// RL ontology, so each answer must also be complete.
+#[test]
+fn a_key_binds_from_the_commit_that_names_its_value_by_a_functional_property() {
+    let data = |more: &str| {
+        format!(
+            ":p a owl:ObjectProperty . :K owl:hasKey ( :p ) . :a a :K ; :p _:z1 . \
+             :b a owl:NamedIndividual , :K , :D ; :p _:z2 . \
+             :f a owl:ObjectProperty , owl:FunctionalProperty . _:w :f _:z1 , _:z2 {more} ."
+        )
+    };
+    let (anonymous, named) = (data(""), data(", :n"));
+    let wrong = commits_answer_as_one_load(
+        &[
+            (
+                format!("INSERT DATA {{ {anonymous} }}"),
+                anonymous.clone(),
+                "false",
+            ),
+            (
+                "INSERT { ?w :f :n } WHERE { ?w :f ?z }".to_owned(),
+                named,
+                "true",
+            ),
+            (
+                "DELETE { ?w :f :n } WHERE { ?w :f :n }".to_owned(),
+                anonymous,
+                "false",
+            ),
+        ],
+        Some(true),
+    );
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Each `(change, the same statements as data, answer)` committed in turn, `ASK { :a a :D }`
+/// asked after each: the answer must be `[answer]`, and it and its status the ones of a
+/// store given the data in one commit; complete or not as `complete` says (either, if
+/// `None`). In both equality modes. The wrong ones, as lines; every answer is printed.
+fn commits_answer_as_one_load(
+    steps: &[(String, String, &str)],
+    complete: Option<bool>,
+) -> Vec<String> {
     let store = |compact: bool| {
         let config = StoreConfig {
             equality_compact: compact,
@@ -124,7 +177,7 @@ fn a_key_binds_from_the_commit_that_names_its_value() {
     let mut wrong = Vec::new();
     for compact in [false, true] {
         let committed = store(compact);
-        for (change, data, answer) in &steps {
+        for (change, data, answer) in steps {
             update(&committed, change).expect("commit");
             let (rows, status) = query(&committed, read);
             let once = store(compact);
@@ -140,12 +193,13 @@ fn a_key_binds_from_the_commit_that_names_its_value() {
             if rows != [*answer]
                 || once_rows != [*answer]
                 || status.is_complete() != once_status.is_complete()
+                || complete.is_some_and(|c| c != status.is_complete())
             {
                 wrong.push(line);
             }
         }
     }
-    assert!(wrong.is_empty(), "{wrong:#?}");
+    wrong
 }
 
 /// Under `owl2-rl` the key rule (prp-key, OWL 2 Profiles §4.3, Table 5) has no condition on
