@@ -1,7 +1,9 @@
 # NRESE
 
-NRESE is an RDF database with OWL reasoning, written in Rust. Its inferences are committed with
-the write they follow from and kept apart from what you stored, and every query answer carries a
+NRESE is an RDF database with OWL reasoning, written in Rust as a hobby project. Most work with
+data comes down to organising and standardising it, and an ontology is where that is written
+down, so NRESE is built to follow the ontology itself. Its inferences are committed with the
+write they follow from and kept apart from what you stored, and every query answer carries a
 status that says whether rows may be missing.
 
 - You get one server, built from source or as a Docker image: SPARQL 1.1, the Graph Store
@@ -51,12 +53,10 @@ checks. Everything it does, with the [standards and their tests](docs/what-it-co
 is in [features and standards](docs/what-it-covers.md), and where it stops is in
 [limits](docs/limits.md).
 
-Most work with data comes down to organising and standardising it, and an ontology is where
-that is written down. We wanted a store that follows the ontology itself, so that a write is
-checked against it, an inference changes with the data, and an answer says how far it can be
-trusted. NRESE is a hobby project, built part by part from the research literature with the W3C
-test suites as its floor, and where a standard could go further for a use case, we want to help
-move it.
+We wanted a store in which a write is checked against the ontology, an inference changes with
+the data, and an answer says how far it can be trusted. NRESE is built part by part from the
+research literature, with the W3C test suites as its floor, and where a standard could go
+further for a use case, we want to help move it.
 
 ## Quick start
 

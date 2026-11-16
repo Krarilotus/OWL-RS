@@ -53,9 +53,10 @@ content-type: application/problem+json
  "title":"SHACL Reject","type":"https://nrese.dev/problems/shacl-reject"}
 ```
 
-Its `detail` names `ex:felix` as the focus node and the `sh:minCount` constraint it fails. Three
-more headers are left out here, and the body, which comes as one line, is broken between its
-fields; the `detail` line is left whole.
+Three more headers are left out here, and the body, which comes as one line, is broken between
+its fields; the `detail` line is left whole. It reads
+`the commit introduces 1 SHACL result(s) and 0 failure(s); first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>`:
+`ex:felix` is the focus node, and `sh:minCount` the constraint it fails.
 
 Nothing of the rejected commit remains, so the query still answers no rows. With a name, the
 commit passes:
@@ -86,10 +87,12 @@ until curl -sf http://localhost:8080/readyz; do sleep 1; done
 
 Next, load your own file, `my.ttl` in [Turtle](https://www.w3.org/TR/turtle/), into the same
 server. The upload replaces the [default graph](glossary.md#graph) with your file, so the
-example's statements go. The SHACL gate checks an upload as it checks an update, and unless you
-started over, the example's shape is still there, in its own graph: if your file says something
-is an `ex:Animal` and gives it no `ex:name`, the upload is refused with a `400` that names it,
-and nothing of the file is stored.
+example's statements go.
+
+To load into an empty store, [start over](#start-over) first. Otherwise the example's shape is
+still there, in its own graph, and the SHACL gate checks the upload against it as it checks an
+update: anything your file says is an `ex:Animal` needs an `ex:name`, or the upload is refused
+with a `400` that names it, and nothing of the file is stored.
 
 ```bash
 curl -X PUT -H 'Content-Type: text/turtle' --data-binary @my.ttl 'http://localhost:8080/dataset/data?default'
@@ -126,7 +129,8 @@ the log before it is acknowledged, so not even a kill loses one
 ([durability](spec/02-storage-and-transactions.md#durability-on-disk-mode)).
 
 Queries are standard SPARQL ([SPARQL 1.1 Query Language](https://www.w3.org/TR/sparql11-query/#basicpatterns)).
-This one gives the names of the animals older than 5, in order:
+This one gives the names of the animals older than 5, in order, for data with `ex:age` and
+`ex:name`; over a file without them it answers no rows:
 
 ```bash
 curl http://localhost:8080/dataset/query --data-urlencode 'query=
