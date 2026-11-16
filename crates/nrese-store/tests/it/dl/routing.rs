@@ -838,6 +838,95 @@ fn annotation_property_axioms_entail_nothing_about_annotated_terms() {
     );
 }
 
+/// OWL 2's nine built-in annotation properties (Structural Specification 5.5 and 5.8, Table
+/// 5) are declared implicitly (3.6: AllDecl holds them).
+const BUILTIN_ANNOTATIONS: [&str; 9] = [
+    "rdfs:label",
+    "rdfs:comment",
+    "rdfs:seeAlso",
+    "rdfs:isDefinedBy",
+    "owl:versionInfo",
+    "owl:deprecated",
+    "owl:priorVersion",
+    "owl:backwardCompatibleWith",
+    "owl:incompatibleWith",
+];
+
+/// An annotation property, built in (declared or not) or declared (`:note`), as the
+/// subject of a domain, a range or a sub-property, and as the super-property of `:p`
+/// (undeclared, a data property or an object property). The Mapping to RDF (3.2.5, Table
+/// 16) reads the first three as annotation axioms, which the Direct Semantics give no
+/// meaning (1), and matches the fourth to no pattern, so its graph is no OWL 2 DL ontology.
+/// No read is entailed: an answer `true` is told `unsound` with the annotation reason, on
+/// the RL route and off it.
+#[test]
+fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
+    let common = ":C a owl:Class . :x a owl:NamedIndividual . :v a owl:NamedIndividual .";
+    let mut cases = Vec::new();
+    for a in BUILTIN_ANNOTATIONS.into_iter().chain([":note"]) {
+        let declared = format!("{a} a owl:AnnotationProperty . ");
+        for decl in [String::new(), declared] {
+            if a == ":note" && decl.is_empty() {
+                continue;
+            }
+            let sub = ":sup a owl:AnnotationProperty .";
+            cases.extend([
+                (
+                    format!("{decl}{a} rdfs:domain :C . :x {a} \"x\" ."),
+                    "ASK { :x a :C }".into(),
+                ),
+                (
+                    format!("{decl}{a} rdfs:domain :C . :x {a} :v ."),
+                    "ASK { :x a :C }".into(),
+                ),
+                (
+                    format!("{decl}{a} rdfs:range :C . :x {a} :v ."),
+                    "ASK { :v a :C }".into(),
+                ),
+                (
+                    format!("{decl}{a} rdfs:subPropertyOf :sup . {sub} :x {a} :v ."),
+                    "ASK { :x :sup :v }".into(),
+                ),
+            ]);
+        }
+        let note = if a == ":note" {
+            ":note a owl:AnnotationProperty . "
+        } else {
+            ""
+        };
+        for (kind, value) in [
+            ("", "2"),
+            ("", ":v"),
+            (":p a owl:DatatypeProperty . ", "2"),
+            (":p a owl:ObjectProperty . ", ":v"),
+        ] {
+            let data = format!("{note}{kind}:p rdfs:subPropertyOf {a} . :x :p {value} .");
+            cases.push((data, format!("ASK {{ :x {a} {value} }}")));
+        }
+    }
+    let mut wrong = Vec::new();
+    for (data, read) in &cases {
+        for extra in ["", OUTSIDE_RL] {
+            let dl = pipeline();
+            insert(&dl, &format!("{data} {common} {extra}")).expect("committed");
+            let (rows, status) = query(&dl, read);
+            let (label, reasons) = (status.shared.as_str(), status.reasons());
+            let marked = reasons
+                .iter()
+                .any(|r| r.contains("annotation-property axioms"));
+            if rows == ["true"] && !(label == "unsound" && marked) {
+                wrong.push(format!("{data} {extra} / {read}: {label} {reasons:?}"));
+            }
+        }
+    }
+    assert_eq!(cases.len(), 116, "the table's rows");
+    assert!(
+        wrong.is_empty(),
+        "{} reads told without the reason: {wrong:#?}",
+        wrong.len()
+    );
+}
+
 /// `data` (with `extra`) committed: the RL rules clash where OWL 2 DL is consistent, and
 /// this release refuses the commit as undecided (`WhyUndecided`), not as an inconsistency.
 /// When OWL 2 DL decides these clashes, the tests that call this expect the commit.

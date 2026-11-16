@@ -810,7 +810,8 @@ impl Draw {
 /// What the store's indexes decide of the mark is what the whole ontology decides. Random
 /// stores under `owl2-dl`, with and without compact equality: declarations, schema
 /// statements and blank-node class expressions (whole or broken) on names, on blank nodes and
-/// on the built-in annotation property `rdfs:label`; property assertions with names and
+/// on the nine built-in annotation properties, as subjects and as super-properties; property
+/// assertions with names and
 /// literals (a property's kind flips with its use); `owl:sameAs`, asserted and through
 /// functional properties; over the default and two named graphs. Each is read committed and
 /// with random pending additions and deletions: the mark equals the whole ontology's, reason
@@ -834,6 +835,12 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         iri("http://www.w3.org/2004/02/skos/core#", "prefLabel"),
         rdfs("label"),
     ]);
+    // The other eight built-in annotation properties (rdfs:label is a name), as subjects and
+    // as objects (a property's super-property), never declared.
+    let builtins: Vec<NamedNode> = nrese_owl::BUILTIN_ANNOTATIONS[1..]
+        .iter()
+        .map(|i| NamedNode::new_unchecked(*i))
+        .collect();
     let blanks: Vec<BlankNode> = (0..4)
         .map(|i| BlankNode::new_unchecked(format!("x{i}")))
         .collect();
@@ -868,6 +875,7 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
     ];
     let mut objects: Vec<Term> = names.iter().cloned().map(Term::from).collect();
     objects.extend(blanks.iter().cloned().map(Term::from));
+    objects.extend(builtins.iter().cloned().map(Term::from));
     objects.extend([
         Literal::new_simple_literal("l").into(),
         rdf("nil").into(),
@@ -880,8 +888,9 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         iri("urn:test:", "g2").into(),
     ];
     let statement = |r: &mut Draw| {
-        let subject: NamedOrBlankNode = match r.below(4) {
+        let subject: NamedOrBlankNode = match r.below(5) {
             0 => r.pick(&blanks).into(),
+            1 => r.pick(&builtins).into(),
             _ => r.pick(&names).into(),
         };
         let (predicate, object): (NamedNode, Term) = match r.below(6) {
