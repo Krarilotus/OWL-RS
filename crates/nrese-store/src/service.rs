@@ -1209,12 +1209,15 @@ impl StoreService {
     /// that isn't of every statement (the inferred ones alone, `onto:implicit`) reads the
     /// rules' closure without the bounds (`Self::dl_mode`): sound only, never complete
     /// (SYN-72 slice 2 r1 F1). Either is unsound where a missing row can make a returned
-    /// one wrong (`NOT EXISTS`, `MINUS`, …: [`crate::dl::query::certify_closure`]).
+    /// one wrong (`NOT EXISTS`, `MINUS`, …: [`crate::dl::query::certify_closure`]). As
+    /// `prepared`'s reader is told it (`status_for_its_reader`).
     pub fn status_without_dl(
         &self,
         prepared: &PreparedQuery,
     ) -> Option<nrese_sparql::Completeness> {
-        self.status_without_dl_at(prepared, Revision::Committed(&self.engine.snapshot()))
+        let status =
+            self.status_without_dl_at(prepared, Revision::Committed(&self.engine.snapshot()));
+        status_for_its_reader(prepared, status, false)
     }
 
     /// [`Self::status_without_dl`] of a read of the data `at` (R1-F2, F3).
