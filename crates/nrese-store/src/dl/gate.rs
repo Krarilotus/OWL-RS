@@ -347,10 +347,11 @@ fn axiom_evidence(
         tx.decode(nrese_engine::TermId::from_raw(t))
             .map_or_else(|| format!("#{t}"), |term| term.to_string())
     };
-    super::explain::explained(ontology, justification, &decode)
-        .into_iter()
-        .flat_map(|axiom| axiom.sources)
-        .flat_map(|(_, triples)| triples)
+    justification
+        .axioms
+        .iter()
+        .flat_map(|&i| &ontology.sources[i])
+        .flat_map(|source| source.triples.iter().map(|t| t.map(decode)))
         .map(|[s, p, o]| nrese_reasoner::RejectEvidence {
             role: "axiom",
             subject: s,
