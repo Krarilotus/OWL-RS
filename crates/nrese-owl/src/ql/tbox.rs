@@ -173,7 +173,8 @@ impl Tbox {
         // Over RL's closure, an axiom that compares data values: its conclusions may be
         // missing for any term, named individuals included. The Tbox reads no assertions, so
         // it can't see a property's use: a key or a disjointness on a property not declared
-        // an object property counts as one on data values.
+        // an object property counts as one on data values. So does a cardinality the rules
+        // don't read: spelled otherwise than the mapping writes it.
         if closure.lists && tbox.hazards.global.is_none() {
             let undeclared = |p: &&ObjProp| {
                 let declared = Axiom::Declaration(EntityKind::ObjectProperty, p.named());
@@ -187,7 +188,10 @@ impl Tbox {
             });
             tbox.hazards.global = super::hazards::reads_data_values(ontology)
                 .or(by_use)
-                .map(Hazard::DataValues);
+                .map(Hazard::DataValues)
+                .or(ontology
+                    .noncanonical_cardinality
+                    .map(Hazard::CardinalitySpelling));
         }
         tbox.rewritable = tbox.rewritable_terms();
         tbox

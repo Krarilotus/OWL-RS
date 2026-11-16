@@ -569,6 +569,73 @@ fn a_qualified_data_cardinality_is_kept_outside_rl() {
     assert!(wrong.is_empty(), "inconsistent and committed: {wrong:#?}");
 }
 
+/// cls-maxc2 and cls-maxqc3 name their cardinality as the term `"1"^^xsd:nonNegativeInteger`;
+/// the ontology's reader takes the number in any form, so `owl:maxCardinality 1` (Turtle's
+/// xsd:integer), `"01"^^xsd:nonNegativeInteger` or a qualified `1` is in RL. At most one
+/// `:p` equates `:x` and `:y`, so `:y :q :z` is entailed.
+fn max_cardinality() -> Vec<String> {
+    [
+        "owl:maxCardinality 1",
+        "owl:maxCardinality \"01\"^^xsd:nonNegativeInteger",
+        "owl:maxQualifiedCardinality 1 ; owl:onClass :D",
+    ]
+    .map(|n| {
+        format!(
+            ":C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; {n} ] . \
+             :p a owl:ObjectProperty . :q a owl:ObjectProperty . :D a owl:Class . \
+             :c a :C ; :p :x , :y . :x a :D ; :q :z . :y a :D ."
+        )
+    })
+    .to_vec()
+}
+
+/// Such an ontology leaves the RL route, and the DL path reads the cardinality by its
+/// value: `:y :q :z` is answered true, complete.
+#[test]
+fn a_max_cardinality_in_another_lexical_form_equates_in_rl() {
+    let mut wrong = Vec::new();
+    for data in max_cardinality() {
+        let dl = pipeline();
+        insert(&dl, &data).expect("consistent");
+        let route = dl.store().dl_bounds().last;
+        let (rows, status) = query(&dl, "ASK { :y :q :z }");
+        let line = format!(
+            "{data} / route {route}: answers {rows:?}, complete {}",
+            status.is_complete()
+        );
+        eprintln!("{line}");
+        if rows != ["true"] || !status.is_complete() || route == "rules" {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[test]
+fn a_max_cardinality_in_another_lexical_form_equates_outside_rl() {
+    let wrong = missed(&max_cardinality(), true, &["ASK { :y :q :z }"]);
+    assert!(wrong.is_empty(), "complete and wrong: {wrong:#?}");
+}
+
+/// The mapping's spelling, `"1"^^xsd:nonNegativeInteger`, is the term cls-maxc2 names: the
+/// ontology keeps the RL route, and the rules equate `:x` and `:y`.
+#[test]
+fn the_mappings_spelling_of_a_max_cardinality_keeps_the_rules_route() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+           owl:maxCardinality \"1\"^^xsd:nonNegativeInteger ] . \
+         :p a owl:ObjectProperty . :q a owl:ObjectProperty . \
+         :c a :C ; :p :x , :y . :x :q :z .",
+    )
+    .expect("consistent");
+    assert_eq!(dl.store().dl_bounds().last, "rules");
+    let (rows, status) = query(&dl, "ASK { :y :q :z }");
+    assert_eq!(rows, ["true"]);
+    assert!(status.is_complete(), "{:?}", status.reasons());
+}
+
 /// The same over `rdfs:Literal` (OWL 2 Profiles §4.2.4 admits it in RL): at most `n`
 /// values of `:age` at all, and `:c` has one. No rule reads `owl:onDataRange`, whatever
 /// the range.
