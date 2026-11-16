@@ -61,12 +61,7 @@ impl UserRules {
         };
         let mut vocabulary = LocalVocabulary::default();
         let compiled = rules.compile(&mut vocabulary)?;
-        // A proof's own steps are named so (`crate::explain::valid_step`).
-        let reserved = |r: &&Rule| r.name == "asserted" || r.name == "axiom";
-        if let Some(rule) = compiled.rules.iter().find(reserved) {
-            let message = "the name is reserved for a proof's own steps; rename the rule";
-            return Err(ParseError::new(rule.name.clone(), message));
-        }
+        super::ir::refuse_reserved_names(&compiled.rules)?;
         if format == RuleFormat::Pie {
             rules.context_relations = super::pie::context_relations(&compiled, &vocabulary);
         }
