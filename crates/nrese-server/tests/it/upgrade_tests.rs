@@ -699,3 +699,114 @@ fn query_brings_a_closure_an_older_semantics_wrote_up_to_date()
     assert!(output.contains("true"), "{output}");
     Ok(())
 }
+
+/// A store under `reasoner.unnamed_classes = "skip"` whose closure the build before D16-773
+/// row 1 wrote: that build made a hidden union class's members things because a rule was named
+/// `scm-cls`, here a symmetry rule that makes nothing a thing (Sol's review r1, S1). Opened by
+/// `nrese-server query` and by the server's start, the closure is rebuilt under this build's
+/// rules, where `ex:x` is no `owl:Thing`. The older closure is written by this build under the
+/// same rules and one more that makes things; its marker is the older build's for these rules:
+/// their fingerprint with the value `skip` had then, written down here.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
+-> Result<(), Box<dyn std::error::Error>> {
+    const OLD_SKIP: u64 = 0x5717_c1a5_5e5f_0007;
+    const ASK: &str = "ASK { <http://example.com/x> a <http://www.w3.org/2002/07/owl#Thing> }";
+    let pie = |more: &str| {
+        format!(
+            "Prefices\n{{\n  ex : http://example.com/\n  rdf : http://www.w3.org/1999/02/22-rdf-syntax-ns#\n  \
+             rdfs : http://www.w3.org/2000/01/rdf-schema#\n  owl : http://www.w3.org/2002/07/owl#\n}}\n\
+             Axioms\n{{\n}}\nRules\n{{\nId: prp-rng\n  p <rdfs:range> c\n  x p y\n  ---\n  y <rdf:type> c\n\n\
+             Id: scm-cls\n  x <ex:knows> y\n  ---\n  y <ex:knows> x\n{more}}}\n"
+        )
+    };
+    let things = "\nId: things\n  c <rdf:type> <owl:Class>\n  x <rdf:type> c\n  ---\n  x <rdf:type> <owl:Thing>\n";
+    let program = |text: String| {
+        let rules = UserRules::pie("user.pie", text).expect("the rules compile");
+        RuleProgram::new(None, Some(Arc::new(rules))).expect("a program")
+    };
+    let mut wrong = Vec::new();
+    for way in ["query", "start"] {
+        let dir = tempfile::tempdir()?;
+        let data = dir.path().join("data");
+        {
+            let store = nrese_store::StoreService::new(nrese_store::StoreConfig {
+                hide_unnamed_classes: true,
+                ..nrese_store::StoreConfig::on_disk(&data)
+            })?;
+            // Asserted only: written without reasoning, the older closure made below.
+            let unreasoned = nrese_reasoner::ReasonerService::new(Default::default());
+            nrese_store::MutationPipeline::new(Arc::new(store.clone()), Arc::new(unreasoned))
+                .execute_update_str(
+                "PREFIX ex: <http://example.com/> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> \
+                 PREFIX owl: <http://www.w3.org/2002/07/owl#> \
+                 INSERT DATA { ex:p rdfs:range [ a owl:Class ; owl:unionOf ( ex:A ex:B ) ] . ex:s ex:p ex:x }",
+            )?;
+            store.rematerialise(program(pie(things)))?;
+            let older = String::from_utf8(store.execute_query_str(ASK)?.payload)?;
+            assert!(
+                older.contains("true"),
+                "the older closure holds ex:x a owl:Thing"
+            );
+        }
+        let old = format!(
+            "fingerprint {:016x}",
+            program(pie("")).fingerprint() ^ OLD_SKIP
+        );
+        let state = data.join("reasoning.state");
+        let marker: Vec<String> = std::fs::read_to_string(&state)?
+            .lines()
+            .map(|line| {
+                if line.starts_with("fingerprint ") {
+                    old.clone()
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect();
+        std::fs::write(&state, marker.join("\n") + "\n")?;
+        let rules = dir.path().join("user.pie");
+        std::fs::write(&rules, pie(""))?;
+        let config = configure(dir.path(), &data)?;
+        let reasoner = format!(
+            "[reasoner]\nmode = \"custom\"\nrules = \"{}\"\nunnamed_classes = \"skip\"\n",
+            rules.display().to_string().replace('\\', "/")
+        );
+        let text = std::fs::read_to_string(&config)?
+            .replace("[reasoner]\nmode = \"owl2-rl\"\n", &reasoner);
+        assert!(
+            text.contains("unnamed_classes = \"skip\""),
+            "the reasoner section was rewritten:\n{text}"
+        );
+        std::fs::write(&config, text)?;
+        let thing = if way == "query" {
+            let (status, output) = Process::spawn(
+                Command::new(env!("CARGO_BIN_EXE_nrese-server"))
+                    .arg("query")
+                    .arg("--config")
+                    .arg(&config)
+                    .arg(ASK)
+                    .env("RUST_LOG", "warn"),
+            )?
+            .finish(QUERY)?;
+            assert!(status.success(), "{status}:\n{output}");
+            output.contains("true")
+        } else {
+            let server = Server::start(&config).await?;
+            let things = server
+                .query(
+                    "nrese",
+                    "SELECT ?x { ?x a <http://www.w3.org/2002/07/owl#Thing> }",
+                )
+                .await?;
+            things.contains(&"<http://example.com/x>".to_owned())
+        };
+        let verdict = if thing { "WRONG" } else { "right" };
+        println!("CASE {way}: {verdict}: ex:x a owl:Thing: {thing}, must be false");
+        if thing {
+            wrong.push(way);
+        }
+    }
+    assert!(wrong.is_empty(), "wrong: {wrong:?}");
+    Ok(())
+}
