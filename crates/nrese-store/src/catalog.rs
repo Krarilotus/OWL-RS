@@ -247,29 +247,37 @@ pub const DEFAULT_REPOSITORY: &str = "nrese";
 /// same store ([`Catalog::change`]): from outside it is read, never written, so the store a
 /// server state was built over (and checked, `AppState::with_replication`) stays its store.
 ///
-/// Read from outside, it compiles:
+/// Read from outside, it compiles, as a view that hands out no lock:
 ///
 /// ```no_run
 /// fn now(slot: &nrese_store::catalog::PipelineSlot) {
-///     let _now = slot.read();
+///     let _now: parking_lot::MappedRwLockReadGuard<'_, _> = slot.read();
 /// }
 /// ```
 ///
-/// Written from outside, it doesn't. On a stable toolchain a `compile_fail` passes on any
-/// error; its twin above, one line apart, is what shows the rest compiles:
+/// Written from outside, it doesn't: neither through the field nor through the lock a read
+/// came from. On a stable toolchain a `compile_fail` passes on any error; their twin above,
+/// one line apart from each, is what shows the rest compiles:
 ///
 /// ```compile_fail
 /// fn now(slot: &nrese_store::catalog::PipelineSlot) {
 ///     let _now = slot.0.write();
 /// }
 /// ```
+///
+/// ```compile_fail
+/// fn now(slot: &nrese_store::catalog::PipelineSlot) {
+///     let _now = parking_lot::RwLockReadGuard::rwlock(&slot.read());
+/// }
+/// ```
 #[derive(Clone)]
 pub struct PipelineSlot(Arc<RwLock<Arc<MutationPipeline>>>);
 
 impl PipelineSlot {
-    /// The write path now.
-    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, Arc<MutationPipeline>> {
-        self.0.read()
+    /// The write path now. A mapped guard: a plain one would hand out its lock
+    /// (`RwLockReadGuard::rwlock`), and with it the write.
+    pub fn read(&self) -> parking_lot::MappedRwLockReadGuard<'_, Arc<MutationPipeline>> {
+        parking_lot::RwLockReadGuard::map(self.0.read(), |pipeline| pipeline)
     }
 }
 
