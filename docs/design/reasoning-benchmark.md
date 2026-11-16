@@ -37,7 +37,7 @@ Ontology reasoning is what NRESE is built to be best at. Load, storage and plain
 | **NRESE v1** (`rules-mvp`) | Bounded RDFS and OWL rules; commit gate only, inferences not queryable | RT4, RT5 (partial) | Today's baseline, honest about its limits |
 | **NRESE v2** | Materialised, incremental, per [reasoner-v2.md](reasoner-v2.md) | all | Arrives through M3 (R1–R6) |
 | **GraphDB 11.5** | Forward chaining with rulesets; `isSupported` retraction | RT1–RT5, RT7 | Needs a licence file (Free); results need Ontotext's permission to publish |
-| **RDFox 7.6** | Parallel datalog materialisation; B/F/FBF maintenance | RT1–RT5, RT7 | Evaluation licence requested; results need OST's approval |
+| **RDFox 7.6** | Parallel datalog materialisation; B/F/FBF maintenance | RT1–RT5, RT7 | We hold no licence for RDFox, so it runs nowhere here; its figures are shown as its authors published them, with their hardware |
 | **AnzoGraph 3.5** (Altair Graph Lakehouse) | RDFS-plus and an OWL 2 RL subset | RT1, RT3 | Free up to 8 GB RAM; results need CSI's consent |
 | **Stardog** | Query-time reasoning (RL/QL/EL/SL) | RT3, RT4 | Free developer licence; licence terms still to be checked |
 | **Apache Jena** | Rule reasoners (RDFS, OWL micro/mini/full) in memory | RT1, RT3 (small) | Apache 2.0, publishable |
