@@ -38,6 +38,7 @@ pub mod witness;
 
 pub use durability::checkpoint::image_revision;
 pub use durability::{DurabilityConfig, SyncPolicy, WalDamage, place};
+pub use engine::Certificate;
 pub use engine::{
     Admission, Applied, AssertedIdentity, BulkLoad, BulkMode, CommitNote, CommitSummary, Content,
     CorpusTuning, Count, CountedSnapshot, DEFAULT_READER_CORPUS_BYTES, Engine, EngineConfig,
