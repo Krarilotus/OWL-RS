@@ -1085,3 +1085,52 @@ async fn transaction_deletes_of_a_default_graph_alias_stay_in_the_default_graph(
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// Every media type RDF4J's own format registry lists for a format we read (RDF4J 6.1.0,
+/// `core/rio/api/src/main/java/org/eclipse/rdf4j/rio/RDFFormat.java`), as an RDF4J client sends
+/// it to `/statements`: each is stored, or refused (415) where taking it could guess a payload
+/// wrong: `application/xml` and `text/xml` (TriX and SPARQL results are XML too), `text/plain`
+/// (any text), `text/n3` and `text/rdf+n3` (N3 beyond Turtle; we read no N3).
+#[tokio::test]
+async fn statements_take_rdf4j_media_types_or_refuse_the_ambiguous() {
+    const NT: &str = "<http://example.com/s> <http://example.com/p> \"o\" .\n";
+    const NQ: &str =
+        "<http://example.com/s> <http://example.com/p> \"o\" <http://example.com/g> .\n";
+    const TRIG: &str =
+        "<http://example.com/g> { <http://example.com/s> <http://example.com/p> \"o\" . }\n";
+    const XML: &str = "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" \
+                       xmlns:ex=\"http://example.com/\"><rdf:Description rdf:about=\"http://example.com/s\">\
+                       <ex:p>o</ex:p></rdf:Description></rdf:RDF>";
+    const JSONLD: &str = "{\"@id\": \"http://example.com/s\", \"http://example.com/p\": \"o\"}";
+    let cases: &[(&str, &str, StatusCode)] = &[
+        ("application/n-quads", NQ, StatusCode::NO_CONTENT),
+        ("text/x-nquads", NQ, StatusCode::NO_CONTENT),
+        ("text/nquads", NQ, StatusCode::NO_CONTENT),
+        ("application/trig", TRIG, StatusCode::NO_CONTENT),
+        ("application/x-trig", TRIG, StatusCode::NO_CONTENT),
+        ("text/turtle", NT, StatusCode::NO_CONTENT),
+        ("application/x-turtle", NT, StatusCode::NO_CONTENT),
+        ("application/n-triples", NT, StatusCode::NO_CONTENT),
+        ("application/rdf+xml", XML, StatusCode::NO_CONTENT),
+        ("application/ld+json", JSONLD, StatusCode::NO_CONTENT),
+        ("application/xml", XML, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ("text/xml", XML, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ("text/plain", NT, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ("text/n3", NT, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+        ("text/rdf+n3", NT, StatusCode::UNSUPPORTED_MEDIA_TYPE),
+    ];
+    let mut failures = Vec::new();
+    for &(media_type, body, expected) in cases {
+        let app = test_app().unwrap();
+        let uri = format!("{REPO}/statements");
+        let (status, text) = send(&app, Method::POST, &uri, Some(media_type), None, body).await;
+        let stored = size(&app, None).await;
+        let want = u64::from(expected == StatusCode::NO_CONTENT);
+        if status != expected || stored != want {
+            failures.push(format!(
+                "{media_type}: {status} with {stored} stored, expected {expected} with {want} ({text})"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
