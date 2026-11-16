@@ -12,6 +12,7 @@ use nrese_store::{
 };
 
 use crate::dl::{PREFIXES, insert, pipeline, pipeline_with};
+use crate::ql_rewriting_tests::Rng;
 
 /// eq-ref (OWL 2 Profiles §4.3, table 4), which the RL rules leave out: `:rex owl:sameAs
 /// :rex` is entailed, so NOT EXISTS removes `:rex` and the certain answers are none.
@@ -770,74 +771,110 @@ fn data_existential(filler: &str) -> String {
     )
 }
 
+/// An existential on `:knows`, which is undeclared and carries an individual of `:B`, `:C`
+/// and `:D`, filled by the class expression `classes`.
+fn object_existential(classes: &str) -> String {
+    format!(
+        ":B a owl:Class . :C a owl:Class . :D a owl:Class . \
+         [ a owl:Restriction ; owl:onProperty :knows ; owl:someValuesFrom {classes} ] \
+           rdfs:subClassOf :Social . \
+         :a :knows :x . :x a :B , :C , :D ."
+    )
+}
+
 /// An undeclared property's existential, read by its filler alone (the rewriting's schema
 /// reads no assertions). The rows are OWL 2 RL's data ranges (Profiles §4.2.4, grammar in
 /// §6.3: `DataRange := Datatype | DataIntersectionOf`): a datatype of RL (§4.2.1;
 /// `rdfs:Literal`'s answer is the entailed one, see
 /// [`owl2_rl_answers_an_undeclared_data_existential_over_any_literal`]), one a
-/// DatatypeDefinition names, an intersection typed `rdfs:Datatype` or not, and one nested;
-/// then two outside RL: a union with an intersection in it, and an untyped datatype
-/// restriction. 5 is in each, so `:a :age 5` makes `:a` `:Aged` (OWL 2 Direct Semantics,
-/// DataSomeValuesFrom), by dt-type2, which the rule set leaves out: the closure's `false`
-/// is called complete in no place, with the rewriting on or not. Each row's control fills
-/// the existential on `:knows` with classes of the same shape, an object restriction the
-/// rules derive (cls-int1, cls-uni, cls-svf1): `true`, and with the rewriting on every
-/// place calls it complete (a data reading would call it so in none).
+/// DatatypeDefinition names, an intersection typed `rdfs:Datatype` or not, one nested, and
+/// one whose operands are one shared intersection (`_:r` twice, typed or not: a shared
+/// expression the reader reads, no cycle); then two outside RL: a union with an
+/// intersection in it, and an untyped datatype restriction. 5 is in each, so `:a :age 5`
+/// makes `:a` `:Aged` (OWL 2 Direct Semantics, DataSomeValuesFrom), by dt-type2, which the
+/// rule set leaves out: the closure's `false` is `sound-only` at the run and the plan, and
+/// at both rewriting reports with the rewriting on (`none` without it). Each row's control
+/// fills the existential on `:knows` with classes of the same shape, an object restriction
+/// the rules derive (cls-int1, cls-uni, cls-svf1): `true`, `sound-only` at the run and the
+/// plan without the rewriting, and with it `complete` in every place (a data reading would
+/// call it so in none).
 #[test]
 fn owl2_rl_reads_an_undeclared_existential_by_its_filler() {
-    // (the filler's definitions, the data range, its control over classes)
+    // (the data range's definitions, the data range, the control's definitions, the control)
     let rows = [
-        ("", "xsd:integer", ":B"),
+        ("", "xsd:integer", "", ":B"),
         (
             ":Number a rdfs:Datatype ; owl:equivalentClass xsd:integer .",
             ":Number",
+            "",
             ":B",
         ),
         (
             "",
             "[ a rdfs:Datatype ; owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
+            "",
             "[ a owl:Class ; owl:intersectionOf ( :B :C ) ]",
         ),
         (
             "",
             "[ owl:intersectionOf ( xsd:integer xsd:decimal ) ]",
+            "",
             "[ owl:intersectionOf ( :B :C ) ]",
         ),
         (
             "",
             "[ owl:intersectionOf ( [ owl:intersectionOf ( xsd:integer xsd:decimal ) ] xsd:int ) ]",
+            "",
             "[ owl:intersectionOf ( [ owl:intersectionOf ( :B :C ) ] :D ) ]",
+        ),
+        (
+            "_:r owl:intersectionOf ( xsd:integer xsd:decimal ) .",
+            "[ owl:intersectionOf ( _:r _:r ) ]",
+            "_:o owl:intersectionOf ( :B :C ) .",
+            "[ owl:intersectionOf ( _:o _:o ) ]",
+        ),
+        (
+            "_:r a rdfs:Datatype ; owl:intersectionOf ( xsd:integer xsd:decimal ) .",
+            "[ owl:intersectionOf ( _:r _:r ) ]",
+            "_:o a owl:Class ; owl:intersectionOf ( :B :C ) .",
+            "[ owl:intersectionOf ( _:o _:o ) ]",
         ),
         (
             "",
             "[ owl:unionOf ( [ owl:intersectionOf ( xsd:integer xsd:decimal ) ] xsd:string ) ]",
+            "",
             "[ owl:unionOf ( [ owl:intersectionOf ( :B :C ) ] :D ) ]",
         ),
         (
             "",
             "[ owl:onDatatype xsd:integer ; owl:withRestrictions ( [ xsd:minInclusive 1 ] ) ]",
+            "",
             ":B",
         ),
     ];
+    // What the four places call an answer: the rewriting's reports are there with it on.
+    let expected = |answer: &str, ql| match ql {
+        QlRewritingMode::On if answer == "true" => ["complete"; 4],
+        QlRewritingMode::On => ["sound-only"; 4],
+        _ => ["sound-only", "none", "sound-only", "none"],
+    };
     let mut wrong = Vec::new();
-    for (definitions, range, classes) in rows {
-        eprintln!("filler {range}:");
-        let data = format!("{definitions} {}", data_existential(range));
-        let lines = complete_anywhere(&data, "ASK { :a a :Aged }");
-        wrong.extend(lines.into_iter().map(|line| format!("{range}: {line}")));
-        eprintln!("control {classes}:");
-        let control = format!(
-            ":B a owl:Class . :C a owl:Class . :D a owl:Class . \
-             [ a owl:Restriction ; owl:onProperty :knows ; owl:someValuesFrom {classes} ] \
-               rdfs:subClassOf :Social . \
-             :a :knows :x . :x a :B , :C , :D ."
-        );
+    let mut check = |name: String, data: &str, read: &str, answer: &str| {
+        eprintln!("{name}:");
         for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
-            let (text, line, complete, _) = places(&control, "ASK { :a a :Social }", ql);
-            if !text.contains("true") || (ql == QlRewritingMode::On && complete != 4) {
-                wrong.push(format!("control {classes}: {line}"));
+            let (text, line, statuses, _) = places(data, read, ql);
+            if !text.contains(answer) || statuses != expected(answer, ql) {
+                wrong.push(format!("{name}: {line}"));
             }
         }
+    };
+    for (definitions, range, defined, classes) in rows {
+        let data = format!("{definitions} {}", data_existential(range));
+        let filler = format!("filler {}", [definitions, range].join(" ").trim());
+        check(filler, &data, "ASK { :a a :Aged }", "false");
+        let control = format!("{defined} {}", object_existential(classes));
+        let name = format!("control {}", [defined, classes].join(" ").trim());
+        check(name, &control, "ASK { :a a :Social }", "true");
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
@@ -851,16 +888,176 @@ fn owl2_rl_answers_an_undeclared_data_existential_over_any_literal() {
     let data = data_existential("rdfs:Literal");
     let mut wrong = Vec::new();
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
-        let (text, line, complete, _) = places(&data, "ASK { :a a :Aged }", ql);
+        let (text, line, statuses, _) = places(&data, "ASK { :a a :Aged }", ql);
         let right = match ql {
             QlRewritingMode::On => text.contains("true"),
-            _ => text.contains("false") && complete == 0,
+            _ => text.contains("false") && !statuses.contains(&"complete"),
         };
         if !right {
             wrong.push(line);
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The generated tests' seed, in their names.
+const SEED: u64 = 0x5eed_da7a;
+
+/// Fillers in Turtle, from a seed. Each composite node is written in place (`[ … ]`) or as
+/// a shared blank node defined once (`_:sN …`), which later nodes may name again, twice in
+/// one list too; a node names only earlier ones, so there is no cycle.
+struct Fillers {
+    random: Rng,
+    definitions: Vec<String>,
+    shared: Vec<String>,
+}
+
+impl Fillers {
+    /// The node of `po` (its predicates and objects), in place or shared.
+    fn node(&mut self, po: String) -> String {
+        if !self.random.chance(40) {
+            return format!("[ {po} ]");
+        }
+        let name = format!("_:s{}", self.definitions.len());
+        self.definitions.push(format!("{name} {po} ."));
+        self.shared.push(name.clone());
+        name
+    }
+
+    /// Now and then a shared node already defined, named again.
+    fn again(&mut self) -> Option<String> {
+        (!self.shared.is_empty() && self.random.chance(30))
+            .then(|| self.shared[self.random.below(self.shared.len())].clone())
+    }
+
+    /// The shared nodes' definitions so far, and a fresh start for the next filler.
+    fn take(&mut self) -> String {
+        self.shared.clear();
+        std::mem::take(&mut self.definitions).join(" ")
+    }
+
+    /// A data range of depth at most `depth`: a datatype, an enumeration of literals or a
+    /// datatype restriction, or a complement, intersection or union of data ranges; typed
+    /// `rdfs:Datatype` or not.
+    fn data(&mut self, depth: usize) -> String {
+        if let Some(name) = self.again() {
+            return name;
+        }
+        let typed = if self.random.chance(30) {
+            "a rdfs:Datatype ; "
+        } else {
+            ""
+        };
+        let po = match self.random.below(if depth == 0 { 3 } else { 6 }) {
+            0 => {
+                let datatypes = ["xsd:integer", "xsd:decimal", "xsd:int", "xsd:string"];
+                return datatypes[self.random.below(4)].to_owned();
+            }
+            1 => format!("{typed}owl:oneOf ( 5 7 )"),
+            2 => format!(
+                "{typed}owl:onDatatype xsd:integer ; owl:withRestrictions ( [ xsd:minInclusive 1 ] )"
+            ),
+            3 => format!("{typed}owl:datatypeComplementOf {}", self.data(depth - 1)),
+            kind => {
+                let operands: Vec<String> = (0..2).map(|_| self.data(depth - 1)).collect();
+                let operator = if kind == 4 {
+                    "intersectionOf"
+                } else {
+                    "unionOf"
+                };
+                format!("{typed}owl:{operator} ( {} )", operands.join(" "))
+            }
+        };
+        self.node(po)
+    }
+
+    /// A class expression of depth at most `depth` that `:x`, in `:B`, `:C` and `:D`, is in:
+    /// one of them, an intersection of such, or a union of such with or without a complement
+    /// of a named class beside them; typed `owl:Class` or not.
+    fn classes(&mut self, depth: usize) -> String {
+        if let Some(name) = self.again() {
+            return name;
+        }
+        let named = |random: &mut Rng| [":B", ":C", ":D"][random.below(3)];
+        if depth == 0 || self.random.chance(30) {
+            return named(&mut self.random).to_owned();
+        }
+        let typed = if self.random.chance(30) {
+            "a owl:Class ; "
+        } else {
+            ""
+        };
+        let mut operands: Vec<String> = (0..2).map(|_| self.classes(depth - 1)).collect();
+        let operator = if self.random.chance(50) {
+            "intersectionOf"
+        } else {
+            if self.random.chance(50) {
+                operands.push(format!("[ owl:complementOf {} ]", named(&mut self.random)));
+            }
+            "unionOf"
+        };
+        self.node(format!("{typed}owl:{operator} ( {} )", operands.join(" ")))
+    }
+}
+
+/// [`owl2_rl_reads_an_undeclared_existential_by_its_filler`] over 200 generated data ranges
+/// ([`Fillers::data`]: every constructor the reader classifies, nested to depth three, with
+/// shared nodes named again): each says the undeclared `:age` is a data property, so no
+/// place calls the answer complete, and with the rewriting on it reports. Whether 5 is in a
+/// range is the data's; how the filler was read is the status's. The mirror, 200 generated
+/// class expressions `:x` is in ([`Fillers::classes`]): object ones, the rules derive `:a a
+/// :Social`, and with the rewriting on every place calls it complete. A wrong case prints
+/// its data.
+#[test]
+fn generated_fillers_are_read_by_their_kind_seed_5eedda7a() {
+    let mut fillers = Fillers {
+        random: Rng(SEED),
+        definitions: Vec::new(),
+        shared: Vec::new(),
+    };
+    let mut wrong = Vec::new();
+    for _ in 0..200 {
+        let range = fillers.data(3);
+        let data = format!("{} {}", fillers.take(), data_existential(&range));
+        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+            let (_, line, statuses, reported) = places(&data, "ASK { :a a :Aged }", ql);
+            if statuses.contains(&"complete") || (ql == QlRewritingMode::On && !reported) {
+                wrong.push(format!("{data} / {line}"));
+            }
+        }
+        let classes = fillers.classes(3);
+        let control = format!("{} {}", fillers.take(), object_existential(&classes));
+        for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+            let (text, line, statuses, _) = places(&control, "ASK { :a a :Social }", ql);
+            if !text.contains("true") || (ql == QlRewritingMode::On && statuses != ["complete"; 4])
+            {
+                wrong.push(format!("{control} / {line}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{} wrong: {wrong:#?}", wrong.len());
+}
+
+/// Thirty intersections, each of the one before twice (`_:c1` is `( _:c0 _:c0 )`, …): a data
+/// range, read once per node. A walk along every path would take 2³⁰ steps; this one reads
+/// it in the test's ordinary time, and no place calls the answer complete.
+#[test]
+fn a_deep_chain_of_shared_data_ranges_is_read_once_per_node() {
+    let chain: Vec<String> = (1..=30)
+        .map(|i| {
+            let before = i - 1;
+            format!("_:c{i} owl:intersectionOf ( _:c{before} _:c{before} ) .")
+        })
+        .collect();
+    let data = format!(
+        "_:c0 owl:intersectionOf ( xsd:integer xsd:decimal ) . {} {}",
+        chain.join(" "),
+        data_existential("_:c30")
+    );
+    let started = std::time::Instant::now();
+    no_place_complete(&data, "ASK { :a a :Aged }");
+    let took = started.elapsed();
+    assert!(took < std::time::Duration::from_secs(60), "{took:?}");
 }
 
 /// The key's case, `:ssn` declared by `declaration`: see [`no_place_complete`].
@@ -884,9 +1081,10 @@ fn no_place_complete(data: &str, read: &str) {
 fn complete_anywhere(data: &str, read: &str) -> Vec<String> {
     let mut wrong = Vec::new();
     for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
-        let (text, line, complete, reported) = places(data, read, ql);
+        let (text, line, statuses, reported) = places(data, read, ql);
         // With the rewriting on, its report is one of the places.
-        if !text.contains("false") || complete > 0 || (ql == QlRewritingMode::On && !reported) {
+        let complete = statuses.contains(&"complete");
+        if !text.contains("false") || complete || (ql == QlRewritingMode::On && !reported) {
             wrong.push(line);
         }
     }
@@ -895,8 +1093,12 @@ fn complete_anywhere(data: &str, read: &str) -> Vec<String> {
 
 /// `read` over `data`'s owl2-rl closure with the rewriting `ql`: its answer, a printed line
 /// with what each place (the run, its rewriting, the plan, the plan's rewriting) calls it,
-/// how many places call it complete, and whether the run has the rewriting's report.
-fn places(data: &str, read: &str, ql: QlRewritingMode) -> (String, String, usize, bool) {
+/// those four names (`none`: no status), and whether the run has the rewriting's report.
+fn places(
+    data: &str,
+    read: &str,
+    ql: QlRewritingMode,
+) -> (String, String, [&'static str; 4], bool) {
     let request = SparqlQueryRequest::all(format!("{PREFIXES}{read}"));
     let name = |c: Option<&nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
     let store = closure(data, Ruleset::Owl2Rl, ql);
@@ -917,9 +1119,5 @@ fn places(data: &str, read: &str, ql: QlRewritingMode) -> (String, String, usize
         places.map(|(p, c)| (p, name(c)))
     );
     eprintln!("{line}");
-    let complete = places
-        .iter()
-        .filter(|(_, c)| name(*c) == "complete")
-        .count();
-    (text, line, complete, run.ql.is_some())
+    (text, line, places.map(|(_, c)| name(c)), run.ql.is_some())
 }
