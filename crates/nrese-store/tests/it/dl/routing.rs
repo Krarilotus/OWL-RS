@@ -919,12 +919,12 @@ fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
             }
         }
     }
-    assert_eq!(cases.len(), 116, "the table's rows");
     assert!(
         wrong.is_empty(),
         "{} reads told without the reason: {wrong:#?}",
         wrong.len()
     );
+    assert_eq!(cases.len(), 116, "the table's rows");
 }
 
 /// `data` (with `extra`) committed: the RL rules clash where OWL 2 DL is consistent, and
