@@ -356,6 +356,8 @@ fn canonical_version(
         asserted_content: super::AssertedIdentity::fresh(),
         canonical: Default::default(),
         own: Default::default(),
+        // The same statements in another form.
+        certificate: version.certificate.clone(),
     });
     Ok(Some(View(Some(Arc::new(ViewData {
         version,
@@ -1511,7 +1513,7 @@ mod tests {
             .as_ref(),
         );
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(same_as));
+        engine.transaction().install(Some(same_as), None);
         let snapshot = engine.snapshot();
         let p = snapshot.lookup(node("p").as_ref().into()).unwrap();
         let pattern = QuadPattern {
@@ -1600,7 +1602,7 @@ mod tests {
         }
         tx.insert(quad(&names[subject], "p", "o").as_ref());
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(predicate));
+        engine.transaction().install(Some(predicate), None);
         let snapshot = engine.snapshot();
         let p = snapshot.lookup(node("p").as_ref().into()).unwrap();
         let pattern = QuadPattern {
@@ -1803,7 +1805,7 @@ mod tests {
             tx.insert(statement("rep", "p", &format!("o{i}")).as_ref());
         }
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(same_as));
+        engine.transaction().install(Some(same_as), None);
         let snapshot = engine.snapshot();
         let (pattern, model) = (QuadPattern::all(), ReadModel::Materialised);
         let plain: Vec<_> = snapshot

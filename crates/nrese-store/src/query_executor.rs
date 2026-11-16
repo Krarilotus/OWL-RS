@@ -54,9 +54,6 @@ pub(crate) struct StoreSettings {
     /// Who answers `SERVICE` calls, once the application installs a client
     /// ([`StoreService::set_service_client`](crate::StoreService::set_service_client)).
     pub services: std::sync::Arc<std::sync::OnceLock<nrese_sparql::Services>>,
-    /// The inferred stack is current under a ruleset with equality reasoning
-    /// ([`QueryOptions::equality_closed`](nrese_sparql::QueryOptions)).
-    pub equality_closed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// [`StoreConfig::equality_canonical_answers`](crate::StoreConfig).
     pub equality_canonical: bool,
     /// [`StoreConfig::equality_early_expansion`](crate::StoreConfig).
@@ -64,10 +61,6 @@ pub(crate) struct StoreSettings {
     /// The results of query parts, shared by every query on a committed snapshot
     /// ([`StoreConfig::query_cache_bytes`](crate::StoreConfig)).
     pub result_cache: Option<std::sync::Arc<nrese_sparql::ResultCache>>,
-    /// The QL rewriting, while the inferred stack is current under a ruleset that makes the
-    /// data H-complete ([`StoreConfig::ql_rewriting`](crate::StoreConfig)).
-    pub ql:
-        std::sync::Arc<std::sync::RwLock<Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>>>>,
     /// [`StoreConfig::search_scope`](crate::StoreConfig), or the repository's: read once
     /// per query and update, so a change applies to the next one.
     pub search_scope: std::sync::Arc<std::sync::RwLock<nrese_sparql::SearchScope>>,
@@ -86,11 +79,6 @@ impl StoreSettings {
     /// The envelope of a query request: its memory limit within the catalog's budget.
     pub(crate) fn query_envelope(&self, prepared: &PreparedQuery) -> nrese_exec::Envelope {
         self.envelope(prepared.memory_limit)
-    }
-
-    /// The QL rewriting queries get now.
-    pub(crate) fn ql(&self) -> Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>> {
-        self.ql.read().unwrap_or_else(|p| p.into_inner()).clone()
     }
 
     pub(crate) fn search_scope(&self) -> nrese_sparql::SearchScope {
@@ -428,20 +416,23 @@ pub(crate) fn protocol_dataset(
 /// `owl2-dl` mode with its `dl-answers` option, the completeness status it reports): part
 /// of the key of the answer's bytes in the result cache. A part's rows don't depend on it
 /// (every path evaluates with the same options; the QL rewriting is in the algebra).
-pub(crate) fn run_query(
+/// With it, `report` returns `tell`, handed next, before any bytes, the status header kept
+/// with a cached answer (`None` where none is), which returns the header it made for an
+/// answer written now: made shared and kept with the answer only where that is offered.
+pub(crate) fn run_query<T: FnOnce(crate::service::StatusHeader) -> Option<String>>(
     view: &impl ReadView,
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
     out: impl Write,
-    report: impl FnOnce(Option<&nrese_sparql::ql::QlReport>) -> Vec<u8>,
+    report: impl FnOnce(Option<&nrese_sparql::ql::QlReport>) -> (Vec<u8>, T),
 ) -> StoreResult<Option<nrese_sparql::ql::QlReport>> {
-    let mut options = query_options(prepared, store, cancellation, memory);
+    let mut options = query_options(view, prepared, store, cancellation, memory);
     let (query, mut ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
     let completeness = ql.as_mut().map(|r| &mut r.completeness);
     certify_report(completeness, prepared.reads(), view.snapshot());
-    let context = report(ql.as_ref());
+    let (context, tell) = report(ql.as_ref());
     cancellation.check()?;
     // A repeated query's answer as written before, in this format; else written, and its
     // bytes offered to the cache with the time writing them took (`nrese_sparql::cache`).
@@ -453,7 +444,8 @@ pub(crate) fn run_query(
         prepared.media_type(),
         &context,
     ) {
-        CachedOutput::Hit(bytes) => {
+        CachedOutput::Hit(bytes, header) => {
+            tell(header);
             cancellation.check()?;
             out.write_all(&bytes)?;
             cancellation.check()?;
@@ -462,24 +454,28 @@ pub(crate) fn run_query(
         CachedOutput::Miss(slot) => Some(slot),
         CachedOutput::Off => None,
     };
+    let header = tell(None);
     // The key above uses the original query/options. Execution consumes their prepared
     // algebra and must not run the semantic QL stage a second time.
     options.ql = None;
     let Some(slot) = slot else {
+        drop(header);
         serialize(view, prepared, &query, &options, cancellation, out)?;
         return Ok(ql);
     };
     let mut tee = Tee {
         inner: out,
         copy: Some(Vec::new()),
-        limit: slot.limit(),
+        limit: slot
+            .limit()
+            .saturating_sub(header.as_ref().map_or(0, |h| h.len())),
     };
     // What the bytes save: this answer's evaluation, as far as the cache didn't answer
     // its parts, and its serialisation (written at the end, on every core, for JSON).
     let started = std::time::Instant::now();
     serialize(view, prepared, &query, &options, cancellation, &mut tee)?;
     if let Some(copy) = tee.copy {
-        slot.offer(copy, started.elapsed());
+        slot.offer(copy, header.map(Into::into), started.elapsed());
     }
     Ok(ql)
 }
@@ -605,7 +601,7 @@ pub(crate) fn evaluate_bound(
 ) -> StoreResult<nrese_sparql::TypedResults> {
     #[cfg(test)]
     BOUND_EVALUATIONS.with(|n| n.set(n.get() + 1));
-    let options = query_options(prepared, store, cancellation, memory);
+    let options = query_options(view, prepared, store, cancellation, memory);
     Ok(nrese_sparql::evaluate_query_typed(
         view,
         &prepared.query,
@@ -645,7 +641,7 @@ pub(crate) fn explain_prepared(
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
 ) -> StoreResult<Explanation> {
-    let options = query_options(prepared, store, cancellation, memory);
+    let options = query_options(view, prepared, store, cancellation, memory);
     let mut explanation = explain_query(view, &prepared.query, &options)?;
     let report = explanation.ql.as_mut().map(|r| &mut r.completeness);
     certify_report(report, prepared.reads(), view.snapshot());
@@ -661,7 +657,7 @@ pub(crate) fn plan_prepared(
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
 ) -> StoreResult<PlannedQuery> {
-    let options = query_options(prepared, store, cancellation, memory);
+    let options = query_options(view, prepared, store, cancellation, memory);
     let mut planned = plan_query(view, &prepared.query, &options)?;
     let report = planned.ql.as_mut().map(|r| &mut r.completeness);
     certify_report(report, prepared.reads(), view.snapshot());
@@ -669,13 +665,17 @@ pub(crate) fn plan_prepared(
 }
 
 /// The options `prepared` runs with, for execution and explanation alike, drawing from
-/// the request's envelope `memory` ([`StoreSettings::envelope`]).
+/// the request's envelope `memory` ([`StoreSettings::envelope`]). The QL rewriting and
+/// whether the stack is closed under `owl:sameAs` are `view`'s certificate's: none without
+/// one, so a read never takes them from another version.
 fn query_options(
+    view: &impl ReadView,
     prepared: &PreparedQuery,
     store: &StoreSettings,
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
 ) -> QueryOptions {
+    let certificate = view.snapshot().and_then(crate::service::Certificate::of);
     QueryOptions {
         dataset: prepared.dataset.clone(),
         resources: nrese_sparql::Resources {
@@ -688,9 +688,7 @@ fn query_options(
         union_default_graph: store.union_default_graph,
         geosparql_stated_only: store.geosparql_stated_only,
         services: store.services.get().cloned(),
-        equality_closed: store
-            .equality_closed
-            .load(std::sync::atomic::Ordering::Acquire),
+        equality_closed: certificate.is_some_and(|c| c.equality_closed),
         equality_canonical: store.equality_canonical,
         equality_early_expansion: store.equality_early_expansion,
         pre_bound: None,
@@ -700,7 +698,7 @@ fn query_options(
         access: prepared.access.clone(),
         result_cache: store.result_cache.clone(),
         pin: prepared.pin.clone(),
-        ql: store.ql(),
+        ql: certificate.and_then(|c| c.ql.clone()),
         search_scope: store.search_scope(),
     }
 }

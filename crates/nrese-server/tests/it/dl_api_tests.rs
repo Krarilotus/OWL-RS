@@ -504,7 +504,7 @@ async fn exact_refuses_an_inferred_only_read() -> Result<(), Box<dyn std::error:
         status.starts_with("complete; regime=owl2-dl"),
         "the whole store, exact: {status}"
     );
-    let want = ("dl", "the inferred statements alone");
+    let want = ("dl", "without the DL bounds");
     refused(
         &app,
         "FROM onto:implicit, exact",

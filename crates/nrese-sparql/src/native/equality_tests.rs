@@ -416,7 +416,7 @@ fn compact() -> Engine {
     }
     assert!(tx.insert_inferred(EncodedTriple::new(i.b, i.link, i.a)));
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(i.link));
+    engine.transaction().install(Some(i.link), None);
     engine
 }
 
@@ -565,7 +565,7 @@ fn a_refused_request_build_answers_without_classes() {
         assert!(tx.insert_inferred(EncodedTriple::new(alias, i.link, i.a)));
     }
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(i.link));
+    engine.transaction().install(Some(i.link), None);
     let mut writer = engine.transaction();
     assert!(writer.insert_encoded(asserted(i.k2, i.p0, i.a)));
     let pending = writer.pending_snapshot();

@@ -138,6 +138,7 @@ pub fn compile_with(
         top_object,
         top_data,
     };
+    c.program.left_out = ontology.diagnostics.iter().any(|d| d.is_fatal());
     // Datatype definitions only refine data ranges, which `ranges` evaluates; keys are
     // rules here (`axiom`), which the clauses leave to the engines that apply them.
     c.program.incomplete = normalised
@@ -339,6 +340,8 @@ impl Compiler<'_> {
                     body.push(self.type_atom(x, *c));
                     body.push(self.type_atom(y, *c));
                 }
+                // `next` saturates only past 253 properties, whose rule (over 506 atoms) the
+                // store refuses before evaluation (`ir::Rule::fits`), U1 then incomplete.
                 let mut next = 2u8;
                 for &r in objects {
                     // Over `owl:topObjectProperty` the shared value can be `x` itself.

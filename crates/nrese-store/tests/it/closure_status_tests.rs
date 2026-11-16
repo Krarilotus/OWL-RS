@@ -389,7 +389,10 @@ fn owl2_dl_reading_inside_a_transaction_labels_it_unsound() {
             &prepared,
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         )
         .expect("answered");
     assert!(String::from_utf8(out).unwrap().contains("example.com/rex"));
@@ -417,7 +420,10 @@ fn a_read_inside_a_transaction_gives_its_reasons_as_written() {
             &prepared,
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         )
         .expect("answered");
     let reasons: Vec<_> = status
@@ -1891,8 +1897,9 @@ fn a_prepared_query_is_marked_by_what_its_property_holds_at_each_run() {
     let status = |label: &str| -> [&'static str; 2] {
         let mut run = None;
         store
-            .run_query_reporting(&prepared, &CancellationToken::new(), Vec::new(), |s| {
-                run = s
+            .run_query_reporting(&prepared, &CancellationToken::new(), Vec::new(), |s, _| {
+                run = s;
+                None
             })
             .expect("ran");
         let plan = store
@@ -2236,7 +2243,10 @@ fn a_readers_status_doesnt_follow_what_they_cant_read() {
         for _ in 0..2 {
             let (mut run, mut rows) = (None, Vec::new());
             store
-                .run_query_reporting(&prepared, &CancellationToken::new(), &mut rows, |s| run = s)
+                .run_query_reporting(&prepared, &CancellationToken::new(), &mut rows, |s, _| {
+                    run = s;
+                    None
+                })
                 .expect("ran");
             let plan = store
                 .plan_query(&prepared, &CancellationToken::new())

@@ -402,7 +402,7 @@ fn a_joined_read_gives_up(explain: bool) {
             first_token.clone(),
         );
         std::thread::spawn(move || {
-            store.run_query_reporting(&prepared, &token, std::io::sink(), |_| {})
+            store.run_query_reporting(&prepared, &token, std::io::sink(), |_, _| None)
         })
     };
     holding
@@ -426,7 +426,7 @@ fn a_joined_read_gives_up(explain: bool) {
         std::thread::spawn(move || {
             let result = match explain {
                 true => store.plan_query(&prepared, &token).map(drop),
-                false => store.run_query_reporting(&prepared, &token, std::io::sink(), |_| {}),
+                false => store.run_query_reporting(&prepared, &token, std::io::sink(), |_, _| None),
             };
             let _ = answer.send((result, ended.load(Ordering::SeqCst)));
         });
@@ -473,7 +473,7 @@ fn a_stopped_read_starts_no_view_build() {
     seam::set(&store.dl().bounds, Point::View, move || {
         counted.fetch_add(1, Ordering::SeqCst);
     });
-    assert!(view_until(&store, Some(&|| true)).is_none());
+    assert!(view_until(&store, &store.engine().snapshot(), Some(&|| true)).is_none());
     assert_eq!(builds.load(Ordering::SeqCst), 0, "views built");
     assert!(store.dl().bounds.views.is_idle(), "a view build under way");
     assert!(lock(&store.dl().bounds.view).is_none(), "a view kept");
