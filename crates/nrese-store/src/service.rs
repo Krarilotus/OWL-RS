@@ -2037,9 +2037,7 @@ impl StoreService {
     /// A revision no commit here recorded (a reopened store's, a replica's) is scanned.
     pub(crate) fn lists_left_out(&self, snapshot: &nrese_engine::Snapshot) -> bool {
         self.lists.left_out(snapshot.revision(), || {
-            let rules = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
-            let program = self.bound_program(snapshot, nrese_reasoner::RuleProgram::builtin(rules));
-            program.leaves_out_a_list(snapshot)
+            crate::reasoning::Program::leaves_out_a_list(snapshot)
         })
     }
 
