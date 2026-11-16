@@ -1820,6 +1820,148 @@ fn a_pending_key_left_out_leaves_the_pending_read_not_complete() {
     );
 }
 
+/// Two readers of one revision with views of their own: one reads `:secret`, where the key's
+/// list cell is equated with the cell that holds its members, the other doesn't. The first's
+/// view keeps equality's `rdf:first`/`rdf:rest` copies and leaves no list out; the second's
+/// drops them (derived through `:secret`), so its key's list is malformed there and its read
+/// isn't `complete` for it. Each order, on a store of its own: neither reader's answer may be
+/// the other's. The read asks `:absent`, a predicate the store doesn't hold: the QL rewriting
+/// can't read the list at `:n1` (not a blank node), and its hazard marks a query on any held
+/// term first; one on no held term is told by the list record alone.
+#[test]
+fn two_readers_of_one_revision_are_each_told_their_own_views_lists() {
+    let ask = format!("ASK {{ <{EX}x> <{EX}absent> \"Y\" }}");
+    for order in [["aliases", "default"], ["default", "aliases"]] {
+        let pipeline = aliased_cell();
+        for who in order {
+            let graphs = match who {
+                "aliases" => vec![format!("{EX}secret")],
+                _ => Vec::new(),
+            };
+            let status = (pipeline.store())
+                .execute_query(&nrese_store::SparqlQueryRequest::new(
+                    ask.clone(),
+                    by_support(graphs),
+                ))
+                .expect("answered")
+                .completeness;
+            println!("{order:?}, {who}: {status:?}");
+            let marked = status.as_ref().is_some_and(list_left_out);
+            assert_eq!(marked, who == "default", "{order:?}, {who}: {status:?}");
+        }
+    }
+}
+
+/// A transaction deletes the `rdf:rest` of a key's one list cell and reads inside it. The
+/// committed revision leaves no list out; the pending data does (the list is malformed), and
+/// only the pending read's own scan finds it: a deleted list fact is one the read must scan for.
+/// The store holds no `:name`, so the QL rewriting marks nothing on the query: the record decides.
+#[test]
+fn a_pending_deleted_list_fact_leaves_the_pending_read_not_complete() {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    (pipeline.apply(
+        insert(&format!(
+            "<{EX}K> <http://www.w3.org/2002/07/owl#hasKey> <{EX}l1> . \
+             <{EX}l1> <{rdf}first> <{EX}k1> . <{EX}l1> <{rdf}rest> <{rdf}nil> . \
+             <{EX}k1> a <http://www.w3.org/2002/07/owl#ObjectProperty> ."
+        )),
+        &nrese_store::Requester::all(),
+        &MutationTicket::new(),
+    ))
+    .expect("the data");
+    let delete = format!("DELETE DATA {{ <{EX}l1> <{rdf}rest> <{rdf}nil> }}");
+    let status = pending_status(
+        pipeline.store(),
+        nrese_store::SparqlQueryRequest::all(format!("ASK {{ <{EX}x> <{EX}name> \"Y\" }}")),
+        &delete,
+    );
+    assert!(status.as_ref().is_some_and(list_left_out), "{status:?}");
+}
+
+/// A reader of the default graph only reads inside a transaction whose pending operation
+/// touches no list. Its view of the pending data drops equality's copies derived through
+/// `:secret`, as its view of the revision does, so its key's list is malformed there: the
+/// read isn't `complete` for it, though the published revision leaves no list out. It asks
+/// `:absent`, which the store doesn't hold, as in
+/// [`two_readers_of_one_revision_are_each_told_their_own_views_lists`].
+#[test]
+fn a_restricted_pending_read_scans_its_own_view() {
+    let pipeline = aliased_cell();
+    let request = nrese_store::SparqlQueryRequest::new(
+        format!("ASK {{ <{EX}x> <{EX}absent> \"Y\" }}"),
+        by_support(Vec::new()),
+    );
+    let add = format!("INSERT DATA {{ <{EX}w> <{EX}name> \"W\" }}");
+    let status = pending_status(pipeline.store(), request, &add);
+    assert!(status.as_ref().is_some_and(list_left_out), "{status:?}");
+}
+
+/// A key of one property whose list cell `:n1` holds nothing itself: it is the same
+/// (`owl:sameAs`, in `:secret`) as `:n2`, which holds the member `:k1` and ends the list.
+/// `:x` and `:y` agree on `:k1`; `:y :name "Y"`.
+fn aliased_cell() -> MutationPipeline {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let (rdf, owl) = (
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+        "http://www.w3.org/2002/07/owl#",
+    );
+    let data = format!(
+        "<{EX}K> <{owl}hasKey> <{EX}n1> . GRAPH <{EX}secret> {{ <{EX}n1> <{owl}sameAs> <{EX}n2> }} \
+         <{EX}n2> <{rdf}first> <{EX}k1> . <{EX}n2> <{rdf}rest> <{rdf}nil> . \
+         <{EX}k1> a <{owl}ObjectProperty> . <{EX}x> a <{EX}K> . <{EX}y> a <{EX}K> . \
+         <{EX}x> <{EX}k1> <{EX}v> . <{EX}y> <{EX}k1> <{EX}v> . <{EX}y> <{EX}name> \"Y\" ."
+    );
+    (pipeline.apply(
+        insert(&data),
+        &nrese_store::Requester::all(),
+        &MutationTicket::new(),
+    ))
+    .expect("the data");
+    pipeline
+}
+
+/// A reader of the default graph and `graphs`, inferences by support.
+fn by_support(graphs: Vec<String>) -> nrese_store::ReadScope {
+    nrese_store::ReadScope::Graphs(Arc::new(nrese_sparql::GraphAccess {
+        graphs,
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..nrese_sparql::GraphAccess::default()
+    }))
+}
+
+/// The status of `request` read inside a transaction with the one update `update` pending,
+/// printed.
+fn pending_status(
+    store: &StoreService,
+    request: nrese_store::SparqlQueryRequest,
+    update: &str,
+) -> Option<nrese_sparql::Completeness> {
+    let prepared = store.prepare_query(&request).expect("prepared");
+    let ops = vec![nrese_store::StatementOp::Update(SparqlUpdateRequest::new(
+        update.to_owned(),
+    ))];
+    let mut status = None;
+    store
+        .run_query_pending_reporting(
+            &nrese_store::StatementsRequest::new(ops),
+            &prepared,
+            &nrese_store::CancellationToken::new(),
+            &mut Vec::<u8>::new(),
+            |s| status = s,
+        )
+        .expect("the pending read");
+    println!("pending read with {update}: {status:?}");
+    status
+}
+
+/// Not `complete`, for a list axiom left out.
+fn list_left_out(status: &nrese_sparql::Completeness) -> bool {
+    !status.complete && (status.reasons.iter()).any(|r| r.text.contains("list axiom"))
+}
+
 /// [`a_restricted_read_leaves_an_aliased_keys_mark`]'s store: the aliased key of 7 properties,
 /// its `owl:sameAs` facts in `:secret`, then the later commit that leaves it out.
 fn aliased_key_with_hidden_aliases() -> MutationPipeline {
