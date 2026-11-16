@@ -2226,6 +2226,8 @@ impl StoreService {
         // keeps its reading, as a catalog's change that fails keeps its old reasoning.
         let reading = self.engine.equality();
         self.engine.set_equality(program.stored_equality());
+        #[cfg(test)]
+        hooks::run(&hooks::BEFORE_PUBLICATION);
         // Published with the writer slot still held: certified before any other write.
         let finished = rematerialisation
             .finish_held(closure.inferred)
@@ -2445,6 +2447,9 @@ pub(crate) mod hooks {
     thread_local! {
         /// A bulk load has cleared the reasoning certificate and is about to load.
         pub(crate) static AFTER_INVALIDATION: Hook = const { RefCell::new(None) };
+        /// A rematerialisation has dropped the old certificate and computed its inferences, and
+        /// is about to publish them.
+        pub(crate) static BEFORE_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A rematerialisation has published its inferences and is about to certify them.
         pub(crate) static AFTER_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A change of the QL rewriting setting has read the certificate and is about to
@@ -3177,5 +3182,74 @@ mod equality_publication_tests {
             }
         }
         assert!(wrong.is_empty(), "wrong: {wrong:?}");
+    }
+
+    /// A reader while a compact store's reasoning changes, after the old certificate is gone
+    /// and before the new stack is published (`hooks::BEFORE_PUBLICATION`), answers as one of
+    /// the two programs, uncertified: as RDFS-Plus before the change or as RDFS after it. Over
+    /// `a sameAs b . b a Dog . Dog subClassOf Animal`, `a` loaded first so that it has the
+    /// smaller id and represents the class: RDFS-Plus's stack keeps `a a Animal` over it and
+    /// is read expanded (`a`, `b`); RDFS entails only `b a Animal`. `a` alone is neither.
+    #[test]
+    fn a_store_read_while_its_reasoning_changes_answers_as_one_program() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("data.nt");
+        std::fs::write(
+            &file,
+            "<http://example.com/a> <http://www.w3.org/2002/07/owl#sameAs> \
+             <http://example.com/b> .\n\
+             <http://example.com/b> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://example.com/Dog> .\n\
+             <http://example.com/Dog> <http://www.w3.org/2000/01/rdf-schema#subClassOf> \
+             <http://example.com/Animal> .\n",
+        )
+        .expect("data");
+        let store = Arc::new(
+            StoreService::new(StoreConfig {
+                equality_by_representatives: true,
+                equality_compact: true,
+                ..StoreConfig::on_disk(dir.path().join("store"))
+            })
+            .expect("store"),
+        );
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![file],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .expect("load");
+        let program = |mode| {
+            nrese_reasoner::ReasonerConfig::for_mode(mode)
+                .materialised_program()
+                .expect("it reasons")
+        };
+        store
+            .rematerialise(program(ReasoningMode::RdfsPlus))
+            .expect("RDFS-Plus");
+        let before = answers(&store);
+        let window = Arc::new(Mutex::new(None));
+        let (reader, seen) = (Arc::clone(&store), Arc::clone(&window));
+        hooks::BEFORE_PUBLICATION.set(Some(Box::new(move || {
+            *seen.lock().unwrap() = Some((answers(&reader), reader.reasoning_state().is_some()));
+        })));
+        store
+            .rematerialise(program(ReasoningMode::Rdfs))
+            .expect("RDFS");
+        let after = answers(&store);
+        let (between, certified) = window.lock().unwrap().take().expect("the hook ran");
+        println!(
+            "CASE RdfsPlus to Rdfs: before {before:?} | between {between:?} | after {after:?}"
+        );
+        assert_ne!(
+            before, after,
+            "the two programs answer alike: the case shows nothing"
+        );
+        assert!(!certified, "a certificate in the window");
+        assert!(
+            between == before || between == after,
+            "between {between:?} is neither RDFS-Plus's {before:?} nor RDFS's {after:?}"
+        );
     }
 }
