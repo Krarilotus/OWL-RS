@@ -11,7 +11,7 @@ A job (TOML):
 
     id = "sparql-bsbm-100k-1"           # unique on its host
     group = "sparql"                    # who asks (benches/cases/ group)
-    host = "office-pc"                  # hosts.toml key: every system of the job runs there
+    host = "shared-a"                   # hosts.toml key: every system of the job runs there
     checkout = "suite/sparql"           # a local ref; submit pushes it to the host as queue/<id>
     commands = [["python3", "benches/fast/fast.py", "build"],
                 ["python3", "benches/fast/fast.py", "compete", "--cases", "bsbm-explore-100k"]]
@@ -22,7 +22,7 @@ A job (TOML):
     priority = 5                        # within a family, lower first; then the order of submission
     est_min = 90
 
-`work` runs on the host (not as suite.py: the office PC's guard stops suite.py and fast.py
+`work` runs on the host (not as suite.py: the shared host's guard stops suite.py and fast.py
 processes when its owners come back, the jobs but not their runner). Per job: a fresh
 worktree of its checkout, the commands in order with its environment (QUEUE_JOB and
 QUEUE_RESULTS name the job and its results directory, ~/owlrs/results/<id>), a log, then the

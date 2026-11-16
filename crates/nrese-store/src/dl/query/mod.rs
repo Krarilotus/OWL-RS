@@ -27,7 +27,7 @@ use nrese_dl::limits::{Deadline, Limit};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use nrese_engine::{ReadModel, Snapshot, TermId};
+use nrese_engine::{QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_owl::{Axiom, ClassExpr, ExprId, Literal, ObjProp, Ontology};
 use nrese_rdf::{NamedNodeRef, Term};
 use nrese_sparql::CancellationToken;
@@ -298,8 +298,8 @@ pub(crate) fn plan_status(
     let at = super::bounds::view_until(store, Some(&|| cancellation.is_cancelled()))
         .ok_or(crate::QueryEvaluationError::Cancelled)?;
     let mut completeness = plan_status_built(store, prepared, &analysis, &at).completeness;
-    certify(&mut completeness, prepared.reads(), "dl", true);
-    mark(store, Revision::Decided(&at), &mut completeness);
+    mark(store, prepared, Revision::Decided(&at), &mut completeness);
+    certify(&mut completeness, prepared.reads(), "dl", true, Some(&at.0));
     Ok(completeness)
 }
 
@@ -313,56 +313,169 @@ pub(crate) enum Revision<'a> {
     Pending(&'a Snapshot),
 }
 
+impl Revision<'_> {
+    pub(crate) fn snapshot(&self) -> &Snapshot {
+        let (Revision::Decided((at, _)) | Revision::Committed(at) | Revision::Pending(at)) = *self;
+        at
+    }
+}
+
 /// Every answer `unsound` where OWL 2 DL may not entail what the RL closure (L) holds
 /// ([`reads_differently`]) in the data `at` it was read from, never a later revision's (R1-F2,
-/// F3): composed last by both DL entry points, by a read of the inferred statements alone
+/// F3): composed before certification by both DL entry points, last by an inferred-only read
 /// (`StoreService::status_without_dl`) and by a read inside a transaction with operations
 /// pending (`StoreService::run_query_pending_reporting`). It reads every graph, and a reader
 /// of some graphs is told no status under `owl2-dl` (`status_for_its_reader`); the ontology
-/// it reads is the asserted statements', which a reader's view leaves as they are.
-pub(crate) fn mark(store: &StoreService, at: Revision<'_>, completeness: &mut Completeness) {
+/// it reads is the asserted statements', which a reader's view leaves as they are. And
+/// at most sound-only where `prepared` names an individual the data doesn't and the
+/// ontology `at` has keys, or wasn't read within its budget: whether a key reaches an
+/// individual named only in a query is unsettled (the Direct Semantics' NAMED).
+pub(crate) fn mark(
+    store: &StoreService,
+    prepared: &PreparedQuery,
+    at: Revision<'_>,
+    completeness: &mut Completeness,
+) {
     if let Some(reason) = reads_differently(store, at) {
         completeness.unsound("dl", reason);
     }
+    let snapshot = match at {
+        Revision::Decided((snapshot, _)) => snapshot,
+        Revision::Committed(snapshot) | Revision::Pending(snapshot) => snapshot,
+    };
+    let held = |iri: &str| {
+        let Some(t) = snapshot.lookup(NamedNodeRef::new_unchecked(iri).into()) else {
+            return false;
+        };
+        let (mut by_subject, mut by_object) = (QuadPattern::all(), QuadPattern::all());
+        (by_subject.subject, by_object.object) = (Some(t), Some(t));
+        let any = |p| {
+            snapshot
+                .quads_for_pattern_in(ReadModel::Materialised, p)
+                .next()
+        };
+        any(&by_subject).or_else(|| any(&by_object)).is_some()
+    };
+    let read = match at {
+        Revision::Pending(_) => read_ontology,
+        _ => ontology_at,
+    };
+    if completeness.complete
+        && let Some(iri) = named_outside(prepared.query(), held)
+        && read(store, snapshot).ok().is_none_or(|o| {
+            o.value()
+                .axioms
+                .iter()
+                .any(|a| matches!(a, Axiom::HasKey(..)))
+        })
+    {
+        completeness.incomplete(
+            "dl",
+            format!(
+                "the query names <{iri}>, which the data doesn't, and the ontology has keys \
+                 (or wasn't read within its budget): whether OWL 2 DL's keys reach an \
+                 individual named only in a query is unsettled, so an answer may be missing"
+            ),
+        );
+    }
 }
+
+const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, and the \
+                    answers are read from their closure; use the owl2-rl mode, whose \
+                    promise is the rules' reading";
 
 /// Why L may hold what OWL 2 DL doesn't entail, where it may: theorem PR1 of OWL 2
 /// Profiles, by which L's statements are entailed, needs no annotation-property axioms
 /// (OWL 2 DL gives them no meaning for the terms annotated; the rules use them) and no
 /// punning, of which only an equality reaching a class or property name reads otherwise
 /// (OWL 2 DL equates the individuals only; the rules the names too). Off the RL route only,
-/// which both leave (`routed_to_rules` needs neither): one read of the ontology `at`
-/// ([`ontology_at`], a pending one's of its own), whose refusal leaves it unknown.
+/// which both leave (`routed_to_rules` needs neither): what the store's indexes decide
+/// ([`by_index`]), else one read of the ontology `at` ([`ontology_at`], a pending one's of
+/// its own), whose refusal leaves it unknown.
 fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
-    const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, and the \
-                        answers are read from their closure; use the owl2-rl mode, whose \
-                        promise is the rules' reading";
-    let (snapshot, ontology) = match at {
+    let (snapshot, pending) = match at {
         Revision::Decided((_, view)) if view.rules => return None,
-        Revision::Decided((snapshot, _)) => (snapshot, ontology_at(store, snapshot)),
-        Revision::Committed(snapshot) => (snapshot, ontology_at(store, snapshot)),
-        Revision::Pending(snapshot) => (snapshot, read_ontology(store, snapshot)),
+        Revision::Decided((snapshot, _)) => (snapshot, false),
+        Revision::Committed(snapshot) => (snapshot, false),
+        Revision::Pending(snapshot) => (snapshot, true),
     };
-    let Ok(ontology) = ontology else {
+    if let Some(decided) = by_index(snapshot) {
+        return decided;
+    }
+    #[cfg(test)]
+    cancellation_tests::ONTOLOGY_PASSES.set(cancellation_tests::ONTOLOGY_PASSES.get() + 1);
+    let read = if pending { read_ontology } else { ontology_at };
+    let Ok(ontology) = read(store, snapshot) else {
         return Some(format!(
             "whether OWL 2 DL reads the ontology otherwise than the OWL 2 RL rules isn't known \
              ({}): {ONLY}",
             source::refused("the revision")
         ));
     };
+    by_ontology(snapshot, ontology.value())
+}
+
+/// What the store's indexes decide of [`reads_differently`] without the ontology: `Some`
+/// with the reason or with none, `None` where only the ontology decides. Annotation-property
+/// axioms exactly, by the reader's rule: an annotation property (declared, or built in) as
+/// the subject of `rdfs:domain`, `rdfs:range` or `rdfs:subPropertyOf`, or as the object of
+/// one whose subject is none; the smallest named, probed per property. A
+/// pun needs a term equal to another: without one there is none; with one, the ontology
+/// decides.
+fn by_index(snapshot: &Snapshot) -> Option<Option<String>> {
+    use nrese_owl::vocab::{OWL, RDFS};
+    let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+    let quads = |model, subject, predicate, object| {
+        let mut pattern = QuadPattern::all();
+        (pattern.subject, pattern.predicate, pattern.object) = (subject, predicate, object);
+        snapshot.quads_for_pattern_in(model, &pattern)
+    };
+    let (ty, annotation) = (id(RDF_TYPE), id(&format!("{OWL}AnnotationProperty")));
+    let asserted = |s, p, o| quads(ReadModel::Asserted, s, p, o);
+    let typed = ty.and(annotation).map(|a| asserted(None, ty, Some(a)));
+    let declared = typed.into_iter().flatten().map(|q| q.subject);
+    let named = declared.filter(|s| s.kind() == nrese_engine::TermKind::Iri);
+    let builtin = nrese_owl::BUILTIN_ANNOTATIONS.map(id).into_iter().flatten();
+    let properties: Vec<TermId> = named.chain(builtin).collect();
+    let schema = ["domain", "range", "subPropertyOf"].map(|l| id(&format!("{RDFS}{l}")));
+    let axioms = |s: TermId| {
+        let of = |p| asserted(Some(s), Some(p), None).next().is_some();
+        let under = schema[2].map(|p| asserted(None, Some(p), Some(s)));
+        let mut under = under.into_iter().flatten();
+        schema.into_iter().flatten().any(of) || under.any(|q| !properties.contains(&q.subject))
+    };
+    if let Some(property) = properties.iter().copied().filter(|&s| axioms(s)).min() {
+        return Some(Some(annotation_reason(snapshot, property.raw())));
+    }
+    let Some(same_as) = id(OWL_SAME_AS) else {
+        return Some(None);
+    };
+    let equal =
+        quads(ReadModel::Materialised, None, Some(same_as), None).any(|q| q.object != q.subject);
+    (!equal).then_some(None)
+}
+
+/// [`reads_differently`]'s reason where `property` has annotation-property axioms.
+fn annotation_reason(snapshot: &Snapshot, property: u64) -> String {
+    let name = snapshot.decode(TermId::from_raw(property));
+    let name = name.map_or_else(|| format!("term {property}"), |term| term.to_string());
+    format!(
+        "{name} has annotation-property axioms (a domain, a range, or a sub-property on either \
+         side), which OWL 2 DL gives no meaning for the terms it annotates: {ONLY}, or remove them"
+    )
+}
+
+/// [`reads_differently`] of `snapshot`'s whole `ontology`.
+fn by_ontology(snapshot: &Snapshot, ontology: &Ontology) -> Option<String> {
     let name = |t: u64| {
         let term = snapshot.decode(TermId::from_raw(t));
         term.map_or_else(|| format!("term {t}"), |term| term.to_string())
     };
-    if let Some(&property) = ontology.value().annotation_schema.first() {
-        return Some(format!(
-            "{} has annotation-property axioms, which OWL 2 DL gives no meaning for the terms \
-             it annotates: {ONLY}, or remove them",
-            name(property)
-        ));
+    if let Some(&property) = ontology.annotation_schema.first() {
+        return Some(annotation_reason(snapshot, property));
     }
     let same_as = snapshot.lookup(NamedNodeRef::new_unchecked(OWL_SAME_AS).into())?;
-    let equated = nrese_owl::profile::punned(ontology.value())
+    let equated = nrese_owl::profile::punned(ontology)
         .into_iter()
         .find(|&t| {
             let equal = nrese_engine::QuadPattern {
@@ -390,33 +503,45 @@ const DENIED: &str = "OWL 2 entails statements of the rdf:, rdfs: and owl: vocab
 const SPELLING: &str = "a stored value written another way doesn't match it, though OWL 2 \
                         entails the row by its value";
 
+/// Why a value [`compared_values`] names may give wrong rows.
+const COMPARED: &str = "two spellings of one value are two terms to the store, which compares \
+                        terms, though OWL 2 compares values";
+
 /// The one rule of every path's status under an OWL 2 regime, composed last onto it (by
 /// both DL entry points, [`plan_status`] and [`answer`], after the bounds; over a ruleset's
 /// closure, with or without the QL rewriting): each step only lowers what the status
 /// asserts. Under `rdfs` and `custom` the regime is the closure's own: what it lacks isn't
 /// entailed. A read [`denied`] names misses rows, and so does
-/// a typed constant ([`typed_constant`]); and where rows may be missing, an operator under
-/// which a missing row can make a returned one wrong ([`negation`]) makes the answers
+/// a typed constant ([`typed_constant`]); a data value compared by term ([`compared_values`])
+/// through a property that holds a literal other than a string, in `snapshot` (the data
+/// read; unknown, or read for a restricted reader: every property), can give wrong rows;
+/// and where rows may be missing, an operator
+/// under which a missing row can make a returned one wrong ([`negation`]) makes the answers
 /// unsound. Each from `source`.
 pub(crate) fn certify_closure(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
     source: &'static str,
+    snapshot: Option<&Snapshot>,
 ) {
-    certify(completeness, (query, reads), source, false);
+    certify(completeness, (query, reads), source, false, snapshot);
 }
 
 /// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN and plan), with
 /// the whole composition ([`certify_closure`]) on it: the answer's status is this report
 /// (`StoreService::status_outside_dl`), so the two are one value.
-pub(crate) fn certify_report(completeness: Option<&mut Completeness>, query: (&Query, &Reads)) {
+pub(crate) fn certify_report(
+    completeness: Option<&mut Completeness>,
+    query: (&Query, &Reads),
+    snapshot: Option<&Snapshot>,
+) {
     if let Some(completeness) = completeness {
-        certify_closure(completeness, query, "ql");
+        certify_closure(completeness, query, "ql", snapshot);
     }
 }
 
-/// What [`certify`] reads of a query, which depends on the query alone, as the reasons it
-/// gives: each found on its first use and kept with the prepared query
+/// What [`certify`] reads of a query, which depends on the query and its reader alone, as the
+/// reasons it gives: each found on its first use and kept with the prepared query
 /// (`PreparedQuery::reads`), so a query run again walks and formats nothing.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Reads {
@@ -426,6 +551,22 @@ pub(crate) struct Reads {
     negation: std::sync::OnceLock<Option<String>>,
     /// [`typed_constant`]'s.
     constant: std::sync::OnceLock<Option<String>>,
+    /// [`compared_values`]'.
+    compared: std::sync::OnceLock<Vec<(String, Vec<Option<String>>)>>,
+    /// The reader's graphs, where their view is restricted: [`certify`] then takes every
+    /// property to hold values other than strings, so the status doesn't follow what hidden
+    /// graphs hold, and reads triple terms in their graphs alone.
+    access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
+}
+
+impl Reads {
+    /// Nothing found yet, for a reader of every graph (`None`) or of `access`.
+    pub(crate) fn new(access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>) -> Self {
+        Self {
+            access,
+            ..Self::default()
+        }
+    }
 }
 
 /// [`certify_closure`], on the bounds' path where `bounds` (what [`denied`] allows there).
@@ -434,6 +575,7 @@ fn certify(
     (query, reads): (&Query, &Reads),
     source: &'static str,
     bounds: bool,
+    snapshot: Option<&Snapshot>,
 ) {
     use nrese_sparql::Regime::{Owl2Dl, Owl2Ql, Owl2Rl};
     if !matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
@@ -445,11 +587,40 @@ fn certify(
     if let Some(reason) = read {
         completeness.incomplete(source, reason.clone());
     }
+    if crate::PreparedQuery::uses_rdf12(query) {
+        let why = "the query uses a triple term or a base direction, which OWL 2 doesn't define";
+        completeness.incomplete(source, why.to_owned());
+    }
+    // The graphs the reader reads: the test the evaluation restricts their dataset by. The
+    // inferred statements live in the default graph.
+    let access = reads.access.as_deref();
+    if snapshot.is_none_or(|s| {
+        let read = |g| access.is_none_or(|a| a.allows_id(s, g));
+        s.holds_triple_terms(ReadModel::Asserted, read)
+            || (access.is_none_or(|a| a.inferred)
+                && s.holds_triple_terms(ReadModel::Inferred, read))
+    }) {
+        let why = "the data read holds a triple term, which OWL 2 doesn't define";
+        completeness.incomplete(source, why.to_owned());
+    }
     let constant = reads
         .constant
         .get_or_init(|| typed_constant(query).map(|c| format!("the query names {c}: {SPELLING}")));
     if let Some(reason) = constant {
         completeness.incomplete(source, reason.clone());
+    }
+    let snapshot = snapshot.filter(|_| access.is_none());
+    let typed = |predicate: &Option<String>| {
+        snapshot.is_none_or(|s| match predicate {
+            Some(p) => s
+                .lookup(NamedNodeRef::new_unchecked(p).into())
+                .is_some_and(|p| s.holds_typed_literals(ReadModel::Materialised, Some(p))),
+            None => s.holds_typed_literals(ReadModel::Materialised, None),
+        })
+    };
+    let compared = reads.compared.get_or_init(|| compared_values(query));
+    if let Some((what, _)) = compared.iter().find(|(_, by)| by.iter().any(typed)) {
+        completeness.incomplete(source, format!("the query compares {what}: {COMPARED}"));
     }
     if completeness.complete {
         return;
@@ -537,8 +708,8 @@ pub(crate) fn answer(
     cancellation.check()?;
     match &mut outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => {
-            certify(status, prepared.reads(), "dl", true);
-            mark(store, Revision::Decided(&at), status);
+            mark(store, prepared, Revision::Decided(&at), status);
+            certify(status, prepared.reads(), "dl", true, Some(&at.0));
         }
     }
     let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &outcome;

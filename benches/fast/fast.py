@@ -76,7 +76,7 @@ VOLUME_SCRATCH = f"/fast/scratch/{ns.name('scratch', ROOT)}"
 FAST_LOCK = ns.lock_dir() / "fast-data.lock"
 SCRATCH = ROOT / "tmp" / "fast"
 BASELINES = Path(os.environ.get("NRESE_FAST_BASELINES") or ROOT / "benches" / "baselines" / "fast")
-# The full reports, outside git (the same path on the main and the office PC).
+# The full reports, outside git (the same path on the development machine and the shared host).
 REPORTS = Path(os.environ.get("NRESE_BENCH_REPORTS") or Path.home() / "nrese-bench" / "reports") / "fast"
 CASE_TIMEOUT_S = 900
 # A tool handed the case's limit stopped itself up to 1.7 s past it (the tableau, October 2026).
@@ -1910,7 +1910,7 @@ def loaded_digest(key: str) -> str | None:
 # each file under FAST_DATA lives once, read-only, as SHARED/blobs/<sha256>, hardlinked into each
 # gate's FAST_DATA, and SHARED/index/<generator>.json says which files a data file and its
 # sidecars were, so that the next gate links them in instead of generating them again (the data
-# is deterministic in the generator, perf_lab/generate.rs, and its parameters). Office kept a
+# is deterministic in the generator, perf_lab/generate.rs, and its parameters). The shared host kept a
 # 6.1 GB copy per gate name (19 Oct 2026).
 SHARED = Path(os.environ["NRESE_FAST_SHARED"]) if os.environ.get("NRESE_FAST_SHARED") else None
 
@@ -2239,7 +2239,7 @@ def palindrome(sides: list[str], block: int, seed: str | None = None) -> list[tu
     in advance can line up with whatever else repeats on the host).
 
     The mirror alone cancels a drift linear in time, not a first run's own cost. tf2-gate-1 (20 Oct
-    2026, phuoc-yu, M P N N P M in every block, M and P one build): the opener's run 1 was 15.8 %
+    2026, the timed host, M P N N P M in every block, M and P one build): the opener's run 1 was 15.8 %
     slower than its run 2 on olympics q06-text-filter p50 (t 6.5 over 6 blocks), the other places
     symmetric, so P read 7.4 % faster than M. A mirror alternating per pair of blocks kept the
     middle side out of the first place for good, A' in an A-B-B-A and main in the gate: a bias of
@@ -2280,7 +2280,7 @@ def block_copies(sides: list[dict], root: Path | None, block: int):
     """The sides as this block times them: with `root` (fast.py block --fresh-copies), copies
     (fresh_copies()) in a directory made for this block alone under it (mkdtemp, never one that
     was there), written back before timing, and that directory removed after the block, also
-    when a copy fails. Nothing else under `root` is touched (Sol, 20 Oct 2026)."""
+    when a copy fails. Nothing else under `root` is touched."""
     if root is None:
         yield sides
         return

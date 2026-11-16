@@ -12,11 +12,10 @@ workloads.toml: the sizes a full comparison runs.
 from __future__ import annotations
 
 import argparse
-import datetime
 from pathlib import Path
 
 from .adapters import adapter
-from .ledger import PRE_RESET, PRE_RESET_NOTE, load_records, pre_reset
+from .ledger import PRE_RESET, PRE_RESET_NOTE, load_records, page_date, pre_reset
 from .workloads import DEFINITIONS, plans
 
 MARK = {"ok": "ok", "partial": "part", "wrong": "WRONG", "failed": "FAIL", "timeout": "T/O",
@@ -84,7 +83,7 @@ def newest(records: list[dict]) -> dict[tuple, tuple[str, dict, str]]:
 def render(root: Path, systems: dict, workloads: dict) -> str:
     records = load_records(root / "benches/runs")
     evidence = newest(records)
-    today = datetime.date.today().isoformat()
+    today = page_date()
     out = ["# Benchmark status", "",
            f"Generated {today} by `python benches/suite/suite.py status --write` from "
            "[suite/systems.toml](suite/systems.toml), [suite/workloads.toml](suite/workloads.toml) and the run "

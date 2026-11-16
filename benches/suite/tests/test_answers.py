@@ -677,43 +677,43 @@ class Hosts(unittest.TestCase):
     REGISTRY = {
         "assets": {"root": "/assets"},
         "inputs": {"ore": {"path": "ore/files", "env": "NRESE_ORE_DIR"}},
-        "host": {"office-pc": {"hostname": "sus-ai", "ssh": "Office-PC", "has": ["docker", "java"], "assets": True},
-                 "phuoc-yu": {"hostname": "Phuoc-Yu", "has": [], "assets": True},
-                 "khaleesi": {"has": [], "assets": False}},
+        "host": {"shared-a": {"hostname": "box-7", "ssh": "Shared-A", "has": ["docker", "java"], "assets": True},
+                 "timed-a": {"hostname": "Timed-A", "has": [], "assets": True},
+                 "dev-a": {"has": [], "assets": False}},
     }
 
     def test_a_host_is_found_by_its_name(self):
-        self.assertEqual(hosts.current(self.REGISTRY, "sus-ai")[0], "office-pc")
-        self.assertEqual(hosts.current(self.REGISTRY, "phuoc-yu.local")[0], "phuoc-yu")
+        self.assertEqual(hosts.current(self.REGISTRY, "box-7")[0], "shared-a")
+        self.assertEqual(hosts.current(self.REGISTRY, "timed-a.local")[0], "timed-a")
         self.assertIsNone(hosts.current(self.REGISTRY, "laptop"))
 
     def test_inputs_come_from_the_variable_else_the_assets(self):
-        self.assertEqual(hosts.input_path("ore", self.REGISTRY, "sus-ai", {}), Path("/assets/ore/files"))
-        self.assertEqual(hosts.input_path("ore", self.REGISTRY, "sus-ai", {"NRESE_ORE_DIR": "/x"}), Path("/x"))
-        self.assertIsNone(hosts.input_path("ore", self.REGISTRY, "khaleesi", {}))
+        self.assertEqual(hosts.input_path("ore", self.REGISTRY, "box-7", {}), Path("/assets/ore/files"))
+        self.assertEqual(hosts.input_path("ore", self.REGISTRY, "box-7", {"NRESE_ORE_DIR": "/x"}), Path("/x"))
+        self.assertIsNone(hosts.input_path("ore", self.REGISTRY, "dev-a", {}))
         self.assertIsNone(hosts.input_path("ore", self.REGISTRY, "laptop", {}))
 
     def test_a_host_without_docker_is_refused_an_unknown_one_is_not(self):
-        self.assertEqual(hosts.lacking(["docker"], self.REGISTRY, "Phuoc-Yu"), ["docker"])
-        self.assertEqual(hosts.lacking(["docker"], self.REGISTRY, "sus-ai"), [])
+        self.assertEqual(hosts.lacking(["docker"], self.REGISTRY, "Timed-A"), ["docker"])
+        self.assertEqual(hosts.lacking(["docker"], self.REGISTRY, "box-7"), [])
         self.assertEqual(hosts.lacking(["docker"], self.REGISTRY, "laptop"), [])
 
     def test_a_missing_image_resolves_to_its_verified_preserved_alias(self):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "images.json").write_text(json.dumps({"images": [
                 {"original_tags": ["nrese-bench/dl-reference:latest"], "loaded_id": "sha256:aa",
-                 "preserved_tag": "nrese-preserved/dl-reference:kraris-aa"}]}), encoding="utf-8")
+                 "preserved_tag": "nrese-preserved/dl-reference:win-aa"}]}), encoding="utf-8")
             registry = {**self.REGISTRY, "assets": {"root": tmp, "images": "images.json"}}
-            local = {"nrese-preserved/dl-reference:kraris-aa": "sha256:aa"}
-            self.assertEqual(hosts.image("nrese-bench/dl-reference", registry, "sus-ai", local.get),
-                             "nrese-preserved/dl-reference:kraris-aa")
+            local = {"nrese-preserved/dl-reference:win-aa": "sha256:aa"}
+            self.assertEqual(hosts.image("nrese-bench/dl-reference", registry, "box-7", local.get),
+                             "nrese-preserved/dl-reference:win-aa")
             # The tag itself when Docker has it; the tag when the alias's ID isn't the verified one.
-            self.assertEqual(hosts.image("nrese-bench/dl-reference", registry, "sus-ai",
+            self.assertEqual(hosts.image("nrese-bench/dl-reference", registry, "box-7",
                                          {"nrese-bench/dl-reference": "sha256:bb"}.get), "nrese-bench/dl-reference")
-            self.assertEqual(hosts.image("nrese-bench/dl-reference", registry, "sus-ai",
-                                         {"nrese-preserved/dl-reference:kraris-aa": "sha256:cc"}.get),
+            self.assertEqual(hosts.image("nrese-bench/dl-reference", registry, "box-7",
+                                         {"nrese-preserved/dl-reference:win-aa": "sha256:cc"}.get),
                              "nrese-bench/dl-reference")
-            self.assertEqual(hosts.image("nrese-bench/dl-reference", registry, "khaleesi", local.get),
+            self.assertEqual(hosts.image("nrese-bench/dl-reference", registry, "dev-a", local.get),
                              "nrese-bench/dl-reference")
 
     def test_volumes_come_from_the_registry_or_their_variable(self):
@@ -723,13 +723,13 @@ class Hosts(unittest.TestCase):
         self.assertEqual(hosts.volume("data", environ={}), "nrese-bench-data")
 
     def test_a_hosts_configuration_is_the_one_in_force_when_a_run_started(self):
-        registry = {"host": {"phuoc-yu": {"hostname": "Phuoc-Yu", "config": [
+        registry = {"host": {"timed-a": {"hostname": "Timed-A", "config": [
             {"since": "2026-10-12T13:00", "governor": "performance"}, {"since": "2026-10-09", "governor": "powersave"}]}}}
-        self.assertEqual(hosts.configuration("phuoc-yu", "2026-10-12T12:14:30", registry)["governor"], "powersave")
-        self.assertEqual(hosts.configuration("phuoc-yu", "2026-10-12T13:00:00+02:00", registry)["governor"], "performance")
-        self.assertIsNone(hosts.configuration("phuoc-yu", "2026-10-01", registry))
-        self.assertEqual(hosts.run_identity({"host": "Phuoc-Yu"}, "2026-10-12T10:51:30", registry),
-                         {"host": "phuoc-yu", "config": "2026-10-09", "governor": None})
+        self.assertEqual(hosts.configuration("timed-a", "2026-10-12T12:14:30", registry)["governor"], "powersave")
+        self.assertEqual(hosts.configuration("timed-a", "2026-10-12T13:00:00+02:00", registry)["governor"], "performance")
+        self.assertIsNone(hosts.configuration("timed-a", "2026-10-01", registry))
+        self.assertEqual(hosts.run_identity({"host": "Timed-A"}, "2026-10-12T10:51:30", registry),
+                         {"host": "timed-a", "config": "2026-10-09", "governor": None})
         self.assertEqual(hosts.run_identity({"host": "laptop"}, "2026-10-12", registry)["config"], "-")
 
     def test_the_repository_registry_reads(self):

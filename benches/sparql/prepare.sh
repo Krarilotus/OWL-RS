@@ -7,7 +7,7 @@
 #   benches/sparql/prepare.sh DATASET... [--out DIR]     (Linux with Docker; DIR default ~/owlrs/sparql-data)
 #
 # DATASET: dblp | dblp-kg | watdiv-10m | watdiv-100m | bsbm-10m | bsbm-100m | sp2bench-1m | sp2bench-25m
-#          | gcare | wdbench (the last needs 1 TB free: khaleesi S: or Draco, not office-pc)
+#          | gcare | wdbench (the last needs 1 TB free: the development machine S: or a SLURM cluster, not the shared host)
 #
 # Downloads go to DIR/src/ (untrusted: unpacked there, never run from the repository);
 # generators run in throwaway containers named sparql-prep-*, capped (8 CPUs, 8 GB, lowest
@@ -186,8 +186,8 @@ gcare() {
 
 # WDBench (ISWC 2022): Wikidata truthy of 2021-06-23 reduced to its direct properties, as
 # its authors publish it on Figshare (CC0), about 1.25 B statements. Needs about 1 TB of
-# disk for the file and the stores, and more memory than office-pc and phuoc-yu have for
-# the competitors' loads: khaleesi S: or Draco.
+# disk for the file and the stores, and more memory than the shared host and the timed host have for
+# the competitors' loads: the development machine S: or a SLURM cluster.
 wdbench() {
   local f=$SRC/wdbench-truthy-direct.nt.bz2
   fetch "${WDBENCH_URL:?set WDBENCH_URL to the Figshare file of figshare.com/s/50b7544ad6b1f51de060}" "$f"

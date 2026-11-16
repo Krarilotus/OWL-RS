@@ -1,6 +1,6 @@
 #!/bin/bash
 # One system on one tier of the integration workload (benches/integration), on a whole
-# node of a SLURM cluster. Written for Draco (FSU Jena) from its documentation; see
+# node of a SLURM cluster. Written for a SLURM cluster from its documentation; see
 # README.md for what has and hasn't been run.
 #
 #   sbatch benches/cluster/integration.sbatch nrese example
