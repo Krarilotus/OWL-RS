@@ -13,6 +13,7 @@
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
+use nrese_reasoner::eval::Stop;
 use nrese_sparql::{Completeness, Outside, Regime};
 use nrese_store::dl::Verdict;
 
@@ -76,19 +77,23 @@ fn wants_triples(headers: &HeaderMap) -> bool {
     accept.contains("application/n-triples") || accept.contains("text/plain")
 }
 
-/// Runs `work` off the async threads within the query timeout.
+/// Runs `work` off the async threads within the query timeout, with a stop that fires
+/// when the request ends (at the timeout or when the client is gone).
 async fn blocking<T: Send + 'static>(
     state: &AppState,
-    what: &str,
-    work: impl FnOnce() -> nrese_store::StoreResult<T> + Send + 'static,
+    timeout_message: &'static str,
+    work: impl FnOnce(Stop<'_>) -> nrese_store::StoreResult<T> + Send + 'static,
 ) -> Result<T, ApiError> {
-    tokio::time::timeout(
+    let cancellation = nrese_store::CancellationToken::new();
+    let token = cancellation.clone();
+    let stop = move || token.is_cancelled();
+    super::blocking::within(
         state.policy().timeouts.query,
-        tokio::task::spawn_blocking(work),
+        cancellation,
+        timeout_message,
+        move || work(&stop),
     )
-    .await
-    .map_err(|_| ApiError::timeout(format!("{what} exceeded policy timeout")))?
-    .map_err(|error| ApiError::internal(error.to_string()))?
+    .await?
     .map_err(|error| ApiError::internal(error.to_string()))
 }
 
@@ -133,7 +138,12 @@ pub async fn classify(
 ) -> Result<Response, ApiError> {
     state.ensure_serving()?;
     let store = state.store();
-    let report = blocking(&state, "classification", move || store.classify(&scope)).await?;
+    let report = blocking(
+        &state,
+        "classification exceeded policy timeout",
+        move |stop| store.classify_until(&scope, stop),
+    )
+    .await?;
     let mut text = report
         .outside
         .as_ref()
@@ -177,7 +187,10 @@ pub async fn realise(
 ) -> Result<Response, ApiError> {
     state.ensure_serving()?;
     let store = state.store();
-    let report = blocking(&state, "realisation", move || store.realise(&scope)).await?;
+    let report = blocking(&state, "realisation exceeded policy timeout", move |stop| {
+        store.realise_until(&scope, stop)
+    })
+    .await?;
     let mut text = triples_head(&report.consistency);
     for (individual, types) in &report.types {
         for class in types {
