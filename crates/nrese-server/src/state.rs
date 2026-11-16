@@ -536,6 +536,26 @@ mod tests {
     use nrese_store::memory::Unread;
     use nrese_store::{ProcessMemory, StoreConfig};
 
+    /// The states of one server share what the server holds: every request's layers and
+    /// handler hold a clone of the state, and the start marked through one is seen through a
+    /// clone made before it and through the default repository's state.
+    #[test]
+    fn a_states_clones_share_the_servers_start() {
+        let state = super::AppState::new(
+            nrese_store::StoreService::new(StoreConfig::in_memory()).unwrap(),
+            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
+            crate::policy::PolicyConfig::default(),
+            crate::ai::AiSuggestionService::disabled(),
+            super::DeploymentPosture::OpenWorkbench,
+        );
+        let clone = state.clone();
+        let default = state.for_repository(super::DEFAULT_REPOSITORY).unwrap();
+        assert!(!clone.is_started() && !default.is_started());
+        state.mark_ready();
+        assert!(clone.is_started(), "a clone");
+        assert!(default.is_started(), "the default repository's state");
+    }
+
     /// DC-07 S1 (Sol, round 1): the system store takes the default store's memory policy.
     /// With the limit switched off (0) it needs no reading, so a server whose memory can't
     /// be read, and whose limits are all 0, opens its system store too.
