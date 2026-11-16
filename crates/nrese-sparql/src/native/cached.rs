@@ -694,7 +694,7 @@ mod tests {
         tx.insert(quad.as_ref());
         tx.insert_inferred(nrese_engine::EncodedTriple::new(alias, same_as, rep));
         tx.commit().unwrap();
-        engine.set_equality(Some(same_as));
+        engine.transaction().install_reading(Some(same_as));
         let snapshot = engine.snapshot();
         let query = SparqlParser::new()
             .parse_query("SELECT ?x WHERE { ?x <http://e/p> <http://e/o> }")

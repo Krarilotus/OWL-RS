@@ -66,7 +66,7 @@ fn scan(snapshot: &Snapshot, model: ReadModel) -> BTreeSet<EncodedQuad> {
 
 #[test]
 fn equality_reenabled_after_a_disabled_commit_matches_reopening() {
-    // Spec: Engine::set_equality expands the current version's classes. Removing
+    // Spec: a version's reading expands the current version's classes. Removing
     // a sameAs edge while disabled must split the class after re-enabling, just as
     // reopening does; an older snapshot must retain its original answers.
     let dir = tempfile::tempdir().unwrap();
@@ -79,7 +79,7 @@ fn equality_reenabled_after_a_disabled_commit_matches_reopening() {
     let (a, b, same_as, p, o) = (id(1), id(2), id(3), id(4), id(5));
     let edge = EncodedTriple::new(a, same_as, b).in_default_graph();
     let fact = EncodedTriple::new(a, p, o).in_default_graph();
-    engine.set_equality(Some(same_as));
+    engine.transaction().install_reading(Some(same_as));
     let mut tx = engine.transaction();
     tx.insert_encoded(edge);
     tx.insert_encoded(fact);
@@ -87,11 +87,11 @@ fn equality_reenabled_after_a_disabled_commit_matches_reopening() {
     let held = engine.snapshot();
     let before = scan(&held, ReadModel::Materialised);
     assert!(before.contains(&EncodedTriple::new(b, p, o).in_default_graph()));
-    engine.set_equality(None);
+    engine.transaction().install_reading(None);
     let mut tx = engine.transaction();
     tx.remove_encoded(edge);
     tx.commit().unwrap();
-    engine.set_equality(Some(same_as));
+    engine.transaction().install_reading(Some(same_as));
     let after = scan(&engine.snapshot(), ReadModel::Materialised);
     assert_eq!(
         after,
@@ -106,8 +106,21 @@ fn equality_reenabled_after_a_disabled_commit_matches_reopening() {
     drop(held);
     drop(engine);
     let reopened = Engine::open(dir.path(), config).unwrap();
-    reopened.set_equality(Some(same_as));
+    reopened.transaction().install_reading(Some(same_as));
     assert_eq!(after, scan(&reopened.snapshot(), ReadModel::Materialised));
+}
+
+#[test]
+fn a_commit_after_its_own_install_publishes_the_installed_reading() {
+    // Spec: a commit given no reading publishes the installed version's, one its own
+    // transaction installed under the writer slot included: never its base's older one.
+    let engine = engine();
+    let same_as = id(3);
+    let mut tx = engine.transaction();
+    tx.install_reading(Some(same_as));
+    tx.insert_encoded(triple(1, 4, 5).in_default_graph());
+    tx.commit().unwrap();
+    assert_eq!(engine.equality(), Some(same_as), "the published reading");
 }
 
 #[test]
@@ -747,7 +760,7 @@ fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
         assert!(tx.insert_encoded(EncodedQuad::new(subject, p, o, g)));
     }
     tx.commit().expect("commit");
-    engine.set_equality(Some(same_as));
+    engine.transaction().install_reading(Some(same_as));
     let stored = engine.snapshot();
     let canonical = stored.with_canonical_equality();
     let in_g = QuadPattern::in_graph(g);
@@ -812,7 +825,7 @@ fn equality_subset_emptiness_agrees_with_reads() {
     assert!(tx.insert_inferred(EncodedTriple::new(rep, same_as, rep)));
     assert!(tx.insert_inferred(EncodedTriple::new(alias, same_as, rep)));
     tx.commit().expect("commit");
-    engine.set_equality(Some(same_as));
+    engine.transaction().install_reading(Some(same_as));
     let marker = EncodedTriple::new(alias, same_as, rep).in_default_graph();
     let subset = engine
         .snapshot()
@@ -850,7 +863,7 @@ fn emptiness_under_equality_makes_no_copies() {
         assert!(tx.insert_inferred(EncodedTriple::new(alias, same_as, rep)));
     }
     tx.commit().expect("commit");
-    engine.set_equality(Some(same_as));
+    engine.transaction().install_reading(Some(same_as));
     let view = engine
         .snapshot()
         .reading_within(std::sync::Arc::new(nrese_exec::Budget::new(256 << 10)))

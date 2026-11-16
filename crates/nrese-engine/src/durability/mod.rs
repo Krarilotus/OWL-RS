@@ -305,6 +305,9 @@ impl Durable {
                     },
                     dictionary_len: 0,
                     equality: Default::default(),
+                    // No reading is on disk: the store's open installs its own
+                    // (`Transaction::install_reading`) before anyone reads.
+                    reading: None,
                     canonical: Default::default(),
                     own: Default::default(),
                 }
