@@ -873,6 +873,7 @@
             "type": "string"
           },
           "line": {
+            "description": "From 1; 0 where the format's parser doesn't know it (RDF/XML, JSON-LD), and `reason`\nthen says what it knows, such as the byte offset.",
             "format": "int64",
             "minimum": 0,
             "type": "integer"
