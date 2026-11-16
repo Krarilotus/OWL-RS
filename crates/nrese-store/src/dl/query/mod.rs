@@ -287,14 +287,20 @@ impl Status {
 }
 
 /// What can be said before running `prepared`: complete where every predicate it reads
-/// is closed; otherwise the bounds decide when it runs.
-pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Completeness {
+/// is closed; otherwise the bounds decide when it runs. `Cancelled` where the request stopped
+/// while it waited for another request's build of the bounds' view, which runs on and is kept.
+pub(crate) fn plan_status(
+    store: &StoreService,
+    prepared: &PreparedQuery,
+    cancellation: &CancellationToken,
+) -> StoreResult<Completeness> {
     let analysis = analyse(prepared.query());
-    let at = super::bounds::view(store);
+    let at = super::bounds::view_until(store, Some(&|| cancellation.is_cancelled()))
+        .ok_or(crate::QueryEvaluationError::Cancelled)?;
     let mut completeness = plan_status_built(store, prepared, &analysis, &at).completeness;
     certify(&mut completeness, prepared.reads(), "dl", true);
     mark(store, Revision::Decided(&at), &mut completeness);
-    completeness
+    Ok(completeness)
 }
 
 /// The data a status is composed for ([`mark`]): the view the answers were decided on, or
@@ -380,13 +386,18 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
 const DENIED: &str = "OWL 2 entails statements of the rdf:, rdfs: and owl: vocabulary that \
                       no closure, rewriting or bound holds in full";
 
+/// Why a constant [`typed_constant`] names may miss rows.
+const SPELLING: &str = "a stored value written another way doesn't match it, though OWL 2 \
+                        entails the row by its value";
+
 /// The one rule of every path's status under an OWL 2 regime, composed last onto it (by
 /// both DL entry points, [`plan_status`] and [`answer`], after the bounds; over a ruleset's
 /// closure, with or without the QL rewriting): each step only lowers what the status
 /// asserts. Under `rdfs` and `custom` the regime is the closure's own: what it lacks isn't
-/// entailed. A read [`denied`] names misses rows; and where rows may be missing, an
-/// operator under which a missing row can make a returned one wrong ([`negation`]) makes
-/// the answers unsound. Each from `source`.
+/// entailed. A read [`denied`] names misses rows, and so does
+/// a typed constant ([`typed_constant`]); and where rows may be missing, an operator under
+/// which a missing row can make a returned one wrong ([`negation`]) makes the answers
+/// unsound. Each from `source`.
 pub(crate) fn certify_closure(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
@@ -413,6 +424,8 @@ pub(crate) struct Reads {
     denied: [std::sync::OnceLock<Option<String>>; 2],
     /// [`negation`]'s.
     negation: std::sync::OnceLock<Option<String>>,
+    /// [`typed_constant`]'s.
+    constant: std::sync::OnceLock<Option<String>>,
 }
 
 /// [`certify_closure`], on the bounds' path where `bounds` (what [`denied`] allows there).
@@ -430,6 +443,12 @@ fn certify(
         denied(query, bounds).map(|what| format!("the query reads {what}: {DENIED}"))
     });
     if let Some(reason) = read {
+        completeness.incomplete(source, reason.clone());
+    }
+    let constant = reads
+        .constant
+        .get_or_init(|| typed_constant(query).map(|c| format!("the query names {c}: {SPELLING}")));
+    if let Some(reason) = constant {
         completeness.incomplete(source, reason.clone());
     }
     if completeness.complete {
@@ -510,7 +529,8 @@ pub(crate) fn answer(
     cancellation.check()?;
     let analysis = analyse(prepared.query());
     // One view for the answers and their status: a commit in between changes neither (R1-F2).
-    let at = super::bounds::view(store);
+    let at = super::bounds::view_until(store, Some(&|| cancellation.is_cancelled()))
+        .ok_or(crate::QueryEvaluationError::Cancelled)?;
     let mut outcome = decide_answers(store, prepared, &analysis, &at, cancellation, memory, mode)?;
     #[cfg(test)]
     crate::service::hooks::run(&crate::service::hooks::AFTER_DECIDED);
@@ -521,21 +541,27 @@ pub(crate) fn answer(
             mark(store, Revision::Decided(&at), status);
         }
     }
-    let status = match &outcome {
-        Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => status,
-    };
+    let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &outcome;
+    refuse_unless_complete(mode, status, || detail.unresolved.clone())?;
+    Ok(outcome)
+}
+
+/// The one rule of exact answers: under [`DlAnswers::Exact`] an answer whose `status` isn't
+/// complete is refused, with that status and the candidates left `unresolved`. Both the
+/// bounds' path ([`answer`]) and the reads past the bounds, before they run
+/// (`StoreService::refuse_exact`), ask it.
+pub(crate) fn refuse_unless_complete(
+    mode: DlAnswers,
+    status: &Completeness,
+    unresolved: impl FnOnce() -> Vec<String>,
+) -> StoreResult<()> {
     if mode == DlAnswers::Exact && !status.complete {
-        let unresolved = match &outcome {
-            Outcome::Stream(_, _, detail) | Outcome::Answers(_, _, detail) => {
-                detail.unresolved.clone()
-            }
-        };
         return Err(StoreError::Incomplete(Box::new(crate::IncompleteAnswer {
             status: status.clone(),
-            unresolved,
+            unresolved: unresolved(),
         })));
     }
-    Ok(outcome)
+    Ok(())
 }
 
 #[cfg(test)]
