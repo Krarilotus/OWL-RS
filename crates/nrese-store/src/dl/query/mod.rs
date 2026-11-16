@@ -403,9 +403,52 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
 }
 
 /// What the store's indexes decide of [`reads_differently`] without the ontology: `Some`
-/// with the reason or with none, `None` where only the ontology decides.
-fn by_index(_snapshot: &Snapshot) -> Option<Option<String>> {
-    None
+/// with the reason or with none, `None` where only the ontology decides. Annotation-property
+/// axioms exactly, by the reader's rule: an IRI declared an annotation property, as the
+/// subject of `rdfs:domain`, `rdfs:range` or `rdfs:subPropertyOf` (the smallest named). A
+/// pun needs a term equal to another: without one there is none; with one, the ontology
+/// decides.
+fn by_index(snapshot: &Snapshot) -> Option<Option<String>> {
+    use nrese_owl::vocab::{OWL, RDFS};
+    let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+    let quads = |model, subject, predicate, object| {
+        let mut pattern = QuadPattern::all();
+        (pattern.subject, pattern.predicate, pattern.object) = (subject, predicate, object);
+        snapshot.quads_for_pattern_in(model, &pattern)
+    };
+    let (ty, annotation) = (id(RDF_TYPE), id(&format!("{OWL}AnnotationProperty")));
+    let declared = |s: TermId| match (s.kind(), ty, annotation) {
+        (nrese_engine::TermKind::Iri, Some(t), Some(a)) => {
+            quads(ReadModel::Asserted, Some(s), Some(t), Some(a))
+                .next()
+                .is_some()
+        }
+        _ => false,
+    };
+    let schema = ["domain", "range", "subPropertyOf"].map(|l| id(&format!("{RDFS}{l}")));
+    let axioms = schema
+        .into_iter()
+        .flatten()
+        .flat_map(|p| quads(ReadModel::Asserted, None, Some(p), None));
+    if let Some(property) = axioms.map(|q| q.subject).filter(|&s| declared(s)).min() {
+        return Some(Some(annotation_reason(snapshot, property.raw())));
+    }
+    let Some(same_as) = id(OWL_SAME_AS) else {
+        return Some(None);
+    };
+    let equal =
+        quads(ReadModel::Materialised, None, Some(same_as), None).any(|q| q.object != q.subject);
+    (!equal).then_some(None)
+}
+
+/// [`reads_differently`]'s reason where `property` has annotation-property axioms.
+fn annotation_reason(snapshot: &Snapshot, property: u64) -> String {
+    let name = snapshot.decode(TermId::from_raw(property));
+    let name = name.map_or_else(|| format!("term {property}"), |term| term.to_string());
+    format!(
+        "{name} has annotation-property axioms, which OWL 2 DL gives no meaning for the terms \
+         it annotates: {ONLY}, or remove them"
+    )
 }
 
 /// [`reads_differently`] of `snapshot`'s whole `ontology`.
@@ -415,11 +458,7 @@ fn by_ontology(snapshot: &Snapshot, ontology: &Ontology) -> Option<String> {
         term.map_or_else(|| format!("term {t}"), |term| term.to_string())
     };
     if let Some(&property) = ontology.annotation_schema.first() {
-        return Some(format!(
-            "{} has annotation-property axioms, which OWL 2 DL gives no meaning for the terms \
-             it annotates: {ONLY}, or remove them",
-            name(property)
-        ));
+        return Some(annotation_reason(snapshot, property));
     }
     let same_as = snapshot.lookup(NamedNodeRef::new_unchecked(OWL_SAME_AS).into())?;
     let equated = nrese_owl::profile::punned(ontology)
