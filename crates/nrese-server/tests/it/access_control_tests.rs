@@ -12,7 +12,7 @@ use nrese_server::policy::PolicyConfig;
 use serde::Serialize;
 use tower::util::ServiceExt;
 
-use crate::support::{body_text, test_app_with_settings};
+use crate::support::{body_text, test_app_with_settings, test_state_with_store_config};
 
 const EX: &str = "http://example.com/";
 
@@ -58,10 +58,15 @@ fn app_with(policy: &str) -> Result<axum::Router, Box<dyn std::error::Error>> {
 }
 
 fn app_in(policy: &str, mode: ReasoningMode) -> Result<axum::Router, Box<dyn std::error::Error>> {
+    test_app_with_settings(policy_of(policy)?, ReasonerConfig::for_mode(mode))
+}
+
+/// The server's policy: test-secret bearer tokens and the access policy `policy`.
+fn policy_of(policy: &str) -> Result<PolicyConfig, Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("access.toml");
     std::fs::write(&path, policy)?;
-    let policy = PolicyConfig {
+    Ok(PolicyConfig {
         auth: AuthConfig::BearerJwt(JwtBearerConfig {
             shared_secret: "test-secret".to_owned(),
             issuer: None,
@@ -72,8 +77,7 @@ fn app_in(policy: &str, mode: ReasoningMode) -> Result<axum::Router, Box<dyn std
         }),
         access: Some(Arc::new(nrese_server::access::load(&path)?)),
         ..PolicyConfig::default()
-    };
-    test_app_with_settings(policy, ReasonerConfig::for_mode(mode))
+    })
 }
 
 async fn send(
@@ -828,5 +832,58 @@ default_graph = "read"
         !ask(&app, &["nrese.admin"], &marked).await?,
         "the update's WHERE read an inferred statement the editor doesn't see"
     );
+    Ok(())
+}
+
+/// A reader of some graphs who sees inferences, refused its read while the inferred statements
+/// aren't the closure of the rules in place, is answered 503 with the refusal's sentence: the
+/// read may succeed once the store is rematerialised (`POST
+/// /api/v1/repositories/{id}/reasoning/rematerialise`), and the refusal is no fault of the
+/// server's (no 500). The stack is certified under rdfs and the rules in place are owl2-rl,
+/// as a change of a repository's reasoning leaves it for a moment.
+#[tokio::test]
+async fn a_read_refused_until_the_store_is_rematerialised_is_answered_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    const READER: &str = r#"
+default = "deny"
+inferred = "visible"
+
+[[role]]
+name = "reader"
+read = ["http://example.com/g/pub/*"]
+default_graph = "read"
+"#;
+    let rdfs = ReasonerConfig::for_mode(ReasoningMode::Rdfs);
+    let state = test_state_with_store_config(Default::default(), policy_of(READER)?, rdfs)?;
+    let app = nrese_server::build_app(state.clone());
+    let owl2_rl = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
+    state.store().use_reasoning_rules(Some(owl2_rl.into()));
+    let query = Some("application/sparql-query");
+    let (status, body) = send(
+        &app,
+        &["reader"],
+        Method::POST,
+        "/dataset/query",
+        query,
+        "ASK { ?s ?p ?o }",
+    )
+    .await?;
+    let sentence =
+        body.contains("the inferred statements aren't the rules' closure: rematerialise first");
+    let got = format!(
+        "{} {}",
+        status.as_u16(),
+        if sentence {
+            "with the sentence"
+        } else {
+            "without it"
+        }
+    );
+    let want = "503 with the sentence";
+    match got == want {
+        true => println!("CASE the refused read's status: right {got}"),
+        false => println!("CASE the refused read's status: WRONG {got}, want {want}"),
+    }
+    assert_eq!(got, want, "{body}");
     Ok(())
 }
