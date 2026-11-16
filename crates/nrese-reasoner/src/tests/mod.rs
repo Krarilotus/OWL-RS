@@ -35,19 +35,21 @@ fn a_class_with_an_iri_has_an_iri_representative() {
 /// closure is the one the key gives over the members (`Guard::OverClasses`). Generated
 /// `sameAs` classes of 1 to 8 members, all named, all anonymous, one named among
 /// anonymous ones, or drawn, are the instances and the object values of a key of one to
-/// three object and data properties. Blank nodes take the top half of the ids, as the
-/// engine's sort after its IRIs. Both ways of the key must occur: instances equated, and
+/// three object and data properties. Blank nodes take the engine's blank-node ids, which
+/// sort after its IRIs and are the range the exemption keeps out; the exemption must be
+/// taken in every case, and both ways of the key must occur: instances equated, and
 /// instances agreeing on every value kept apart by an anonymous class.
 #[test]
 fn a_named_only_key_over_representatives_answers_as_over_the_classes() {
-    use super::representatives::{self, RepresentativeClosure, keys_over_classes};
+    use super::representatives::{self, RepresentativeClosure, keys_exempted, keys_over_classes};
     let mut next = rng(0x6b65_795f_2026_1116);
-    let (mut equated, mut kept_apart) = (0, 0);
+    let (mut equated, mut kept_apart, mut exempted) = (0, 0, 0);
     for case in 0..300 {
         let mut vocabulary = LocalVocabulary::default();
         let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
-        let blank_nodes = vocabulary.blank_node_ids();
-        let lists = ListVocabulary::new(&mut vocabulary).named_keys(blank_nodes);
+        let (low, high) = nrese_engine::TermId::kind_range(nrese_engine::TermKind::BlankNode);
+        let blank_nodes = (low.raw(), high.raw());
+        let lists = ListVocabulary::new(&mut vocabulary).named_keys(Some(blank_nodes));
         let schema = Schema::owl(&mut vocabulary);
         let (rdf, owl) = (super::ir::RDF, super::ir::OWL);
         let integer = format!("{}integer", super::ir::XSD);
@@ -62,7 +64,7 @@ fn a_named_only_key_over_representatives_answers_as_over_the_classes() {
             format!("{EX}K"),
         ]
         .map(&mut iri);
-        let mut blank = blank_nodes.unwrap().0;
+        let mut blank = blank_nodes.0;
         // Classes 0 to 2 hold the instances, 3 to 5 the object values.
         let mut classes: Vec<Vec<u64>> = Vec::new();
         for c in 0..6 {
@@ -124,7 +126,9 @@ fn a_named_only_key_over_representatives_answers_as_over_the_classes() {
                 .flat_map(|&f| closure.classes.expand(f))
                 .collect()
         };
+        let before = keys_exempted();
         let (exempt, over_classes) = (closure(), keys_over_classes(closure));
+        exempted += usize::from(keys_exempted() > before);
         assert_eq!(
             expanded(&exempt),
             expanded(&over_classes),
@@ -142,6 +146,7 @@ fn a_named_only_key_over_representatives_answers_as_over_the_classes() {
             }
         }
     }
+    assert_eq!(exempted, 300, "cases with the exemption taken");
     assert!(equated > 50 && kept_apart > 50, "{equated} {kept_apart}");
 }
 

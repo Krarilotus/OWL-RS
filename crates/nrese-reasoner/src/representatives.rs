@@ -95,6 +95,10 @@ pub(crate) fn over_classes(
     let mut guarded = Guarded::default();
     for rule in rules {
         let lists = rule.guards.iter().any(|g| matches!(g, Guard::SameList(..)));
+        #[cfg(test)]
+        if rule.guards.len() > 1 && concludes_its_inequality_equal(rule, same_as) {
+            KEYS_EXEMPTED.set(KEYS_EXEMPTED.get() + 1);
+        }
         if rule.guards.is_empty() || lists || concludes_its_inequality_equal(rule, same_as) {
             continue;
         }
@@ -141,6 +145,16 @@ fn concludes_its_inequality_equal(rule: &Rule, same_as: u64) -> bool {
 thread_local! {
     /// Tests: `owl2-dl`'s `prp-key` runs over the classes on this thread ([`keys_over_classes`]).
     static KEYS_OVER_CLASSES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Tests: how often a rule with guards beyond `?a != ?b` was left to its
+    /// representatives on this thread ([`keys_exempted`]).
+    static KEYS_EXEMPTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Tests: how often, on this thread, `owl2-dl`'s `prp-key` was left to its representatives
+/// (the exemption taken).
+#[cfg(test)]
+pub(crate) fn keys_exempted() -> usize {
+    KEYS_EXEMPTED.get()
 }
 
 /// Tests: `run`, with `owl2-dl`'s `prp-key` on this thread over the classes' members
