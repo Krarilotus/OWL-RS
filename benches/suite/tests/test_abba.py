@@ -222,7 +222,7 @@ class Abba(unittest.TestCase):
         self.assertEqual([s for s, _ in fixture.fast.palindrome(list(abba.SIDES), 1)], ["a", "a2", "b", "b", "a2", "a"])
 
     def test_passes_from_another_fleet_host_than_the_manifest_s_have_no_verdict(self):
-        """Review r1 R1-F1 (HOST_IDENTITY): passes all timed on phuoc-yu, a manifest naming
+        """Review r1 R1-F1 (HOST_IDENTITY): passes all timed on the timed host, a manifest naming
         the shared host, got "no loss shown" against the shared host's floor. The fleet may move a timed job
         between steps when a host's window closes; such a round has no verdict, and so has one whose
         passes don't say which fleet host ran them."""
