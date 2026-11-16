@@ -49,8 +49,8 @@ Results: one record per run in [../runs/](../runs/README.md).
 
 The settings below describe the legacy scorecard. New comparisons use the
 [suite protocol](../PROTOCOL.md); a fixed JVM
-heap is not an equal total-memory budget. The current campaigns run on Office-PC,
-with Phuoc-Yu reserved for compatible Office-built native binaries. Never compare
+heap is not an equal total-memory budget. The current campaigns run on the checks host,
+with the timed host reserved for compatible native binaries built on the checks host. Never compare
 a result from one host with NRESE's from another.
 
 - Same input and host: every system reads the same file from the same Docker volume and writes to a fresh volume.

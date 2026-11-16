@@ -22,7 +22,7 @@ Where this directory sits among the kits, and the life of a run from plan to rec
 |---|---|
 | `systems.toml` | The systems, their capabilities, whether their results may be published, and how the suite can start them |
 | `workloads.toml` | The workloads: what each measures, what it needs, where it comes from, its licence, how a result is checked, and whether the repository runs it today |
-| `suitekit/runtime.py` | Where a system runs: Docker, Apptainer (SIF images, for Draco) or a host process; wall time, peak memory, exit code; the cleanup |
+| `suitekit/runtime.py` | Where a system runs: Docker, Apptainer (SIF images, for a cluster) or a host process; wall time, peak memory, exit code; the cleanup |
 | `suitekit/adapters.py` | One adapter per system: load (reasoning included where the system reasons at load), serve, stop; the regimes it runs |
 | `suitekit/workloads.py` | Per workload and tier: the inputs, queries, expected answer counts, regime preference, and how the data is made |
 | `suitekit/schema.py` | The one result schema |
@@ -99,4 +99,4 @@ next to this directory keep their own drivers for what they do beyond the suite
 ([../README.md](../README.md), "Kits"), and they write their run records by hand
 ([../runs/README.md](../runs/README.md)).
 
-The order of work (owner decision, 30 September 2026) is this: NRESE implements and tunes every capability first; the comparison runs come after.
+The order of work (30 September 2026) is this: NRESE implements and tunes every capability first; the comparison runs come after.

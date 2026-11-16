@@ -1,6 +1,6 @@
 # Reported numbers: contenders that don't run here
 
-RDFox's evaluation licence was refused (owner, 12 Oct 2026), so RDFox runs nowhere in the
+RDFox's evaluation licence was refused, so RDFox runs nowhere in the
 suite, now or later. What its authors published stands beside our measurements as
 reported rows: the suite's result schema ([../../suite/suitekit/schema.py](../../suite/suitekit/schema.py)),
 `runtime = reported`, the paper's hardware in `host`, its year in `date`, and the source, table and
@@ -16,7 +16,7 @@ workload, tier and setup and reads the hardware apart.
 
 | Paper | Its setup | Ours (benches/reasoning/datalog, maintenance) |
 |---|---|---|
-| AAAI 2014 | Claros (18.8 M triples) with the 2014 L and LE programs (owl:sameAs axiomatised); 1, 2, 8, 16, 24, 32 threads on 16 cores / 32 threads | the same data and programs (`claros` `l`, `le`); NRESE at 1, 2, 8, 16 and 32 CPUs on Office-PC's 16 cores / 32 threads; the closure's size checked against the paper's 95.5 M and 555.1 M |
+| AAAI 2014 | Claros (18.8 M triples) with the 2014 L and LE programs (owl:sameAs axiomatised); 1, 2, 8, 16, 24, 32 threads on 16 cores / 32 threads | the same data and programs (`claros` `l`, `le`); NRESE at 1, 2, 8, 16 and 32 CPUs on the checks host's 16 cores / 32 threads; the closure's size checked against the paper's 95.5 M and 555.1 M |
 | AAAI 2014 | LUBM 01K (133.6 M triples), LUBM L and LE | LUBM(1000) from our frozen data, 138.3 M triples (the same generator family, another version): close, not identical; the paper's 182.4 M and 332.6 M beside our sizes |
 | VLDB 2021 (GLog) | single thread; LUBM with 125 universities, Claros L/LE | NRESE at 1 CPU beside VLog and GLog, which run single-threaded by design, on the same programs (`rdfox-l-125`, `rdfox-le-125`, `l`, `le`) |
 | AIJ 2019 | single thread; Claros L/LE with equality off (owl:sameAs as an ordinary property, no axiomatisation); 1,000 facts deleted, and added, by uniform sampling, mean over 30 samples | the `l-noeq` and `le-noeq` programs (the 2014 programs without the 862 and 884 rules that read owl:sameAs: 1,312 and 1,339 rules against the paper's 1,310 and 1,337); NRESE at 1 CPU, 1,000-fact deletions and additions over SPARQL Update; the closure's size checked against the paper's 73.8 M and 533.3 M |

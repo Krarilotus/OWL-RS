@@ -48,8 +48,7 @@ VLog and GLog print no count of what they derived: every run stores the material
 (`--storemat`) and the files are counted afterwards; the storing time VLog logs comes off the
 wall time.
 
-RDFox doesn't run here, now or later: its evaluation licence was refused (owner, 12 Oct
-2026). On its home turf NRESE runs against VLog and GLog on RDFox's own programs, matched to
+RDFox doesn't run here, now or later: its evaluation licence was refused. On its home turf NRESE runs against VLog and GLog on RDFox's own programs, matched to
 the setups RDFox's papers report (the `*-noeq` variants, LUBM(1000), the papers' thread
 counts), and RDFox's published numbers are reported rows in [../reported](../reported/README.md),
 with their hardware and setup, never measured. NRESE's qualifying run counts the whole
