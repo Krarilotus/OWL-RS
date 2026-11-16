@@ -90,7 +90,7 @@ def receipt(kind: str, commit: str, tree: str, **changes) -> dict:
     # the join then reads its own receipts, and shows what it accepts, not a receipt it can't read.
     attempt = {"attempt": ATTEMPT} if "attempt" in gate_module.CheckReceipt._fields else {}
     return {"kind": kind, "commit": commit, "tree": tree, "dirty": False, "identity": IDENTITY,
-            "host": "office-pc", "job": "rg-cand-checks", **attempt,
+            "host": "shared-a", "job": "rg-cand-checks", **attempt,
             "outcomes": [{"unit": unit, "exit": 0, "log_sha256": "0" * 64, "summary": True} for unit in units],
             **changes}
 
