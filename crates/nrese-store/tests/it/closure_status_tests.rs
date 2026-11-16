@@ -389,7 +389,10 @@ fn owl2_dl_reading_inside_a_transaction_labels_it_unsound() {
             &prepared,
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         )
         .expect("answered");
     assert!(String::from_utf8(out).unwrap().contains("example.com/rex"));

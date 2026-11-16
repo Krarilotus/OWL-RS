@@ -68,10 +68,11 @@ fn retained_dl_answers_honor_reporting_cancellation_before_writing() {
     let token = CancellationToken::new();
     let mut reported = false;
     let mut bytes = Vec::new();
-    let result = store.run_query_reporting(&prepared, &token, &mut bytes, |status| {
+    let result = store.run_query_reporting(&prepared, &token, &mut bytes, |status, _| {
         assert!(status.unwrap().complete);
         reported = true;
         token.cancel();
+        None
     });
     assert!(reported);
     assert!(matches!(
