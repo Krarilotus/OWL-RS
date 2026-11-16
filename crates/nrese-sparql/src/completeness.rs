@@ -376,7 +376,7 @@ mod tests {
                 not_guaranteed: "n",
             }),
         };
-        let changed: [fn(&mut Completeness); 14] = [
+        let changed: [fn(&mut Completeness); 19] = [
             |c| c.sound = false,
             |c| c.complete = true,
             |c| c.certification_withheld = true,
@@ -387,11 +387,16 @@ mod tests {
                 c.reasons.pop();
             },
             |c| c.bounds = None,
+            |c| c.bounds.as_mut().unwrap().lower = 0,
+            |c| c.bounds.as_mut().unwrap().upper = 3,
             |c| c.bounds.as_mut().unwrap().unresolved = 0,
             |c| c.regime = Some(Regime::Owl2Rl),
             |c| c.regime = None,
             |c| c.outside = None,
             |c| c.outside.as_mut().unwrap().what.push("y"),
+            |c| c.outside.as_mut().unwrap().what[0] = "z",
+            |c| c.outside.as_mut().unwrap().by = "dl",
+            |c| c.outside.as_mut().unwrap().guaranteed = "h",
             |c| c.outside.as_mut().unwrap().not_guaranteed = "m",
         ];
         let bytes = |c: &Completeness| {
@@ -409,6 +414,74 @@ mod tests {
         }
         // Equal statuses, equal bytes.
         assert_eq!(bytes(&base), bytes(&base.clone()));
+    }
+
+    /// The header's quoting writes, for any text, what quoting it one character at a time
+    /// writes (`by_char`, the reference): over a fixed seed's strings that mix plain runs with
+    /// every character it escapes, at the start, at the end and back to back, non-ASCII ones,
+    /// and the empty string.
+    #[test]
+    fn quoting_writes_what_quoting_by_character_writes() {
+        fn by_char(out: &mut String, text: &str) {
+            out.push('"');
+            for c in text.chars() {
+                match c {
+                    '"' | '\\' => {
+                        out.push('\\');
+                        out.push(c);
+                    }
+                    c if c.is_ascii_graphic() || c == ' ' => out.push(c),
+                    c => out.extend(c.escape_unicode()),
+                }
+            }
+            out.push('"');
+        }
+        let pieces = [
+            "",
+            "a",
+            "plain run, of: <text>",
+            " ",
+            "~",
+            "\"",
+            "\\",
+            "\t",
+            "\n",
+            "\r",
+            "\0",
+            "\u{1f}",
+            "\u{7f}",
+            "é",
+            "→",
+            "😀",
+            "ql: ",
+            "\"\\\"",
+        ];
+        let mut texts: Vec<String> = pieces.iter().map(|p| (*p).to_owned()).collect();
+        for p in &pieces[4..] {
+            texts.push(format!("{p}a{p}"));
+            texts.push(format!("a{p}{p}a"));
+        }
+        let mut seed: u64 = 0x5eed_1116;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for _ in 0..2000 {
+            let n = next() % 9;
+            texts.push(
+                (0..n)
+                    .map(|_| pieces[(next() % pieces.len() as u64) as usize])
+                    .collect(),
+            );
+        }
+        for text in &texts {
+            let (mut written, mut reference) = (String::new(), String::new());
+            quoted(&mut written, text);
+            by_char(&mut reference, text);
+            assert_eq!(written, reference, "{text:?}");
+        }
     }
 
     #[test]
