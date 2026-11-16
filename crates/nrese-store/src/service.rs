@@ -3193,6 +3193,48 @@ mod equality_publication_tests {
         assert!(wrong.is_empty(), "wrong: {wrong:?}");
     }
 
+    /// A certified compact store reopened to store its closure expanded, then rematerialised
+    /// under the same program, answers as that program entails: over DATA, RDFS-Plus makes
+    /// `b` an Animal. The expanded closure reads as the compact stack did; it is stored
+    /// otherwise, and its own rows go in.
+    #[test]
+    fn a_compact_store_rematerialised_expanded_answers_as_its_program_entails() {
+        let program = || {
+            nrese_reasoner::ReasonerConfig::for_mode(ReasoningMode::RdfsPlus)
+                .materialised_program()
+                .expect("it reasons")
+        };
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("data.nt");
+        std::fs::write(&file, DATA).expect("data");
+        let config = |compact| StoreConfig {
+            equality_by_representatives: true,
+            equality_compact: compact,
+            ..StoreConfig::on_disk(dir.path().join("store"))
+        };
+        let store = StoreService::new(config(true)).expect("store");
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![file],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .expect("load");
+        store.rematerialise(program()).expect("the compact closure");
+        assert!(store.reasoning_state().is_some(), "not certified");
+        drop(store);
+        let store = StoreService::new(config(false)).expect("the reopened store");
+        store
+            .rematerialise(program())
+            .expect("the expanded closure");
+        let animals = answers(&store);
+        assert!(
+            animals[0].contains("http://example.com/b"),
+            "b is no Animal: {animals:?}"
+        );
+    }
+
     /// A reader while a compact store's reasoning changes, after the old certificate is gone
     /// and before the new stack is published (`hooks::BEFORE_PUBLICATION`), answers as one of
     /// the two programs, uncertified: as RDFS-Plus before the change or as RDFS after it. Over
