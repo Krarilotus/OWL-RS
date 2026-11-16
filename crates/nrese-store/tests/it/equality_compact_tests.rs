@@ -1018,3 +1018,47 @@ fn a_store_written_sameas_first_reads_right_after_a_reopen() {
     }
     assert!(wrong.is_empty(), "wrong: {wrong:?}");
 }
+
+/// A store whose closure was recorded while it held nothing (a server's first start on an
+/// empty data directory), closed and opened again, answers through the `owl:sameAs` its
+/// first commits bring as a store under `representatives` does: in one commit and in two,
+/// under every program that closes equality ([`programs`]), with `reasoner.equality`
+/// `compact`. Every case is printed, and the wrong ones listed.
+#[test]
+fn a_store_recorded_empty_and_reopened_reads_its_first_equalities_expanded() {
+    const TYPE: &str = "ex:Dog rdfs:subClassOf ex:Animal . ex:a a ex:Dog .";
+    const SAME: &str = "ex:a owl:sameAs ex:b .";
+    const QUERY: &str = "SELECT ?x WHERE { ?x a ex:Animal } ORDER BY ?x";
+    let mut wrong = Vec::new();
+    for (program, reasoner) in programs() {
+        for (way, commits) in [
+            ("load", vec![format!("{TYPE} {SAME}")]),
+            ("commit", vec![TYPE.to_owned(), SAME.to_owned()]),
+        ] {
+            let dir = tempfile::tempdir().expect("dir");
+            {
+                let started = equality_store(&reasoner, true, Some(dir.path()));
+                let rules = reasoner.materialised_program().expect("a program");
+                started
+                    .store()
+                    .rematerialise(&rules)
+                    .expect("the start's reasoning");
+            }
+            let reopened = equality_store(&reasoner, true, Some(dir.path()));
+            let want = equality_store(&reasoner, false, None);
+            for commit in &commits {
+                update(&reopened, &format!("INSERT DATA {{ {commit} }}"));
+                update(&want, &format!("INSERT DATA {{ {commit} }}"));
+            }
+            let (got, expected) = (answer(&reopened, QUERY), answer(&want, QUERY));
+            let case = format!("{program} {way}");
+            if got == expected {
+                println!("CASE {case}: right");
+            } else {
+                println!("CASE {case}: WRONG {got} | want {expected}");
+                wrong.push(case);
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "wrong: {wrong:?}");
+}
