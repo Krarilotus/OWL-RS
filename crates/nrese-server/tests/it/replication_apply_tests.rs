@@ -107,7 +107,10 @@ fn replica(dir: &Path) -> Result<AppState, Box<dyn std::error::Error>> {
 
 fn replica_of(dir: &Path, primary: Option<String>) -> Result<AppState, Box<dyn std::error::Error>> {
     let state = AppState::new(
-        StoreService::new(StoreConfig::on_disk(dir))?,
+        StoreService::new(StoreConfig {
+            replica: true,
+            ..StoreConfig::on_disk(dir)
+        })?,
         ReasonerService::new(ReasonerConfig::default()),
         PolicyConfig::default(),
         AiSuggestionService::disabled(),

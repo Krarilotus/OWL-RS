@@ -67,6 +67,14 @@ fn replica_of(base: &str) -> ReplicationConfig {
     }
 }
 
+/// `config` for a replica's store: opened with the role ([`replica_of`]'s state takes it).
+fn as_replica(config: StoreConfig) -> StoreConfig {
+    StoreConfig {
+        replica: true,
+        ..config
+    }
+}
+
 async fn update(base: &str, text: &str) {
     let response = reqwest::Client::new()
         .post(format!("{base}/dataset/update"))
@@ -130,7 +138,11 @@ async fn primary_and_replica(
     update(&base, first).await;
     let following = replica_of(&base);
     replication::bootstrap(&following, dirs[1].path()).await?;
-    let replica_state = server(StoreService::new(config(dirs[1].path()))?, mode, following);
+    let replica_state = server(
+        StoreService::new(as_replica(config(dirs[1].path())))?,
+        mode,
+        following,
+    );
     update(&base, second).await;
     let client = reqwest::Client::new();
     while replication::pull_once(&client, &base, &replica_state).await? > 0 {}
@@ -202,7 +214,7 @@ async fn a_replica_of_a_compact_primary_fails_with_the_sentence() -> TestResult<
 
         // Refused, the replica's directory stays empty: it follows from its own empty store.
         let replica_state = server(
-            StoreService::new(compact(replica_dir.path()))?,
+            StoreService::new(as_replica(compact(replica_dir.path())))?,
             mode,
             config,
         );
@@ -273,7 +285,7 @@ async fn a_directory_once_a_primary_does_not_vouch_for_records_it_applied() -> T
     }
     let open = || -> TestResult<AppState> {
         Ok(server(
-            StoreService::new(StoreConfig::on_disk(replica_dir.path()))?,
+            StoreService::new(as_replica(StoreConfig::on_disk(replica_dir.path())))?,
             ReasoningMode::Rdfs,
             replica_of(&base),
         ))
@@ -470,7 +482,7 @@ async fn a_promoted_replica_is_not_current_until_it_reasons() -> TestResult<()> 
     }
     {
         let replica_state = server(
-            StoreService::new(StoreConfig::on_disk(replica_dir.path()))?,
+            StoreService::new(as_replica(StoreConfig::on_disk(replica_dir.path())))?,
             ReasoningMode::Rdfs,
             replica_of(&base),
         );
@@ -640,6 +652,126 @@ async fn a_replica_started_over_a_marker_says_not_certified() -> TestResult<()> 
         eprintln!("UNMET {line}");
     }
     assert!(unmet.is_empty(), "{unmet:#?}");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    Ok(())
+}
+
+/// The result cache's hits, as `state`'s `/api/v1/repositories/nrese/cache` counts them.
+async fn state_hits(state: &AppState) -> TestResult<u64> {
+    let response = build_app(state.clone())
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/repositories/nrese/cache")
+                .body(Body::empty())?,
+        )
+        .await?;
+    let view: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    view["hits"]
+        .as_u64()
+        .ok_or_else(|| format!("no hits in {view}").into())
+}
+
+/// What `with_replication` says when the role it is given isn't its store's.
+const OTHER_ROLE: &str = "the store's role";
+
+/// Spec (master 19:37, S1): a server state's role in replication is its store's, from the
+/// store's open (`StoreConfig::replica`), checked at construction in both directions. Over a
+/// directory whose marker vouches for its `rdfs` reasoning, with an unreachable primary and
+/// before any batch: a store opened as a primary built into a replica's state is refused, as
+/// a store opened as a replica built into a primary's is; a store opened as a replica built
+/// into a replica's state reads [`ANIMAL_QUERY`]'s stored rows, says `not-certified`, fresh
+/// and from the result cache, and its consistency is `Unknown`. The precondition: the
+/// directory's marker is current for `rdfs`. Each case is printed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_state_takes_its_role_in_replication_from_its_store_s_open() -> TestResult<()> {
+    let rdfs = ReasonerConfig::for_mode(ReasoningMode::Rdfs)
+        .materialised_program()
+        .expect("RDFS reasons");
+    let dir = tempfile::tempdir()?;
+    {
+        let store = StoreService::new(StoreConfig::on_disk(dir.path()))?;
+        nrese_store::MutationPipeline::new(
+            std::sync::Arc::new(store.clone()),
+            std::sync::Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Rdfs,
+            ))),
+        )
+        .execute_update(&nrese_store::SparqlUpdateRequest::new(format!(
+            "{PREFIXES}{ANIMALS}"
+        )))?;
+        store.rematerialise(&rdfs)?;
+        assert!(
+            store.reasoning_is_current(rdfs.clone()),
+            "the precondition: the marker vouches for the reasoning"
+        );
+    }
+    let opened = |replica: bool| -> TestResult<StoreService> {
+        Ok(StoreService::new(StoreConfig {
+            replica,
+            ..StoreConfig::on_disk(dir.path())
+        })?)
+    };
+    let mut wrong = Vec::new();
+    for (case, replica, role) in [
+        (
+            "opened as a primary, built as a replica",
+            false,
+            replica_of("http://127.0.0.1:9"),
+        ),
+        ("opened as a replica, built as a primary", true, primary()),
+    ] {
+        let store = opened(replica)?;
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            server(store, ReasoningMode::Rdfs, role)
+        }));
+        match built {
+            Err(panic) => {
+                let text = panic.downcast_ref::<String>().cloned().unwrap_or_default();
+                let right = text.contains(OTHER_ROLE);
+                println!(
+                    "CASE {case}: {} refused: {text:?}",
+                    if right { "right" } else { "WRONG" }
+                );
+                if !right {
+                    wrong.push(format!("{case}: refused otherwise: {text:?}"));
+                }
+            }
+            Ok(state) => {
+                let (rows, status) = answered(build_app(state.clone()), ANIMAL_QUERY).await?;
+                let consistency = state.store().consistency();
+                println!("CASE {case}: WRONG built: {status:?} {consistency:?} {rows}");
+                wrong.push(format!("{case}: built: {status:?} {consistency:?}"));
+            }
+        }
+    }
+    let state = server(
+        opened(true)?,
+        ReasoningMode::Rdfs,
+        replica_of("http://127.0.0.1:9"),
+    );
+    let (rows, status) = answered(build_app(state.clone()), ANIMAL_QUERY).await?;
+    let before = state_hits(&state).await?;
+    let (cached, again) = answered(build_app(state.clone()), ANIMAL_QUERY).await?;
+    let after = state_hits(&state).await?;
+    assert!(
+        after > before,
+        "the precondition: the second answer came from the cache: hits {before} -> {after}"
+    );
+    let consistency = state.store().consistency();
+    let right = rows.contains("example.com/rex\"")
+        && cached == rows
+        && status.as_deref() == Some("not-certified")
+        && again.as_deref() == Some("not-certified")
+        && consistency == nrese_store::ConsistencyStatus::Unknown;
+    println!(
+        "CASE opened as a replica, built as one: {} {status:?} {again:?} {consistency:?} {rows}",
+        if right { "right" } else { "WRONG" }
+    );
+    if !right {
+        wrong.push(format!(
+            "built as one: {status:?} {again:?} {consistency:?} {rows}"
+        ));
+    }
     assert!(wrong.is_empty(), "{wrong:#?}");
     Ok(())
 }

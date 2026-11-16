@@ -159,7 +159,8 @@ impl Column {
         self.state_with(dir, mode, replication, None)
     }
 
-    /// [`Self::state`], with `ontology` as the store's `ontology_path`.
+    /// [`Self::state`], with `ontology` as the store's `ontology_path`; a replica's store
+    /// opened with the role.
     fn state_with(
         &self,
         dir: &Path,
@@ -168,6 +169,9 @@ impl Column {
         ontology: Option<&Path>,
     ) -> TestResult<AppState> {
         let config = StoreConfig {
+            replica: replication
+                .as_ref()
+                .is_some_and(|r| r.mode == ReplicationMode::Replica),
             ontology_path: ontology.map(Path::to_path_buf),
             ..self.config(dir)
         };
