@@ -259,6 +259,12 @@ impl MutationPipeline {
                     .by_representatives(self.store.config().equality_by_representatives)
                     .storing_representatives(self.store.config().equality_compact)
             });
+            // Reads expand what it keeps over representatives from this commit on, the one
+            // that brings the store's first `owl:sameAs` included (`note_equality`).
+            let stored = program.stored_equality();
+            if self.store.engine().equality() != stored {
+                self.store.engine().set_equality(stored);
+            }
             let revision = tx.base().revision();
             // Writers are serialised by the transaction, so the cache can't change meanwhile.
             let mut ground = self.ground.lock().unwrap_or_else(|p| p.into_inner());

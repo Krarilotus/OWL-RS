@@ -167,16 +167,26 @@ impl Program {
     }
 
     /// This program keeping the closure over representatives in the store (with
-    /// [`Self::by_representatives`]), or every copy.
+    /// [`Self::by_representatives`]), or every copy. Only a program whose name says it
+    /// closes equality ([`RuleProgram::closes_equality`]) keeps them: that name is what the
+    /// read side expands by, a reopened store's included.
     #[must_use]
     pub fn storing_representatives(mut self, store: bool) -> Self {
-        self.store_representatives = store;
+        self.store_representatives = store && RuleProgram::closes_equality(&self.program.name());
         self
     }
 
     /// Whether the inferred stack holds the closure over representatives.
     pub fn stores_representatives(&self) -> bool {
         self.by_representatives && self.store_representatives && self.same_as.is_some()
+    }
+
+    /// The `owl:sameAs` id the inferred stack is kept over, if it is
+    /// ([`Self::stores_representatives`]): what reads expand by.
+    pub fn stored_equality(&self) -> Option<TermId> {
+        self.same_as
+            .filter(|_| self.stores_representatives())
+            .map(TermId::from_raw)
     }
 
     /// This program maintaining every commit by `plan` where it applies, or by the
