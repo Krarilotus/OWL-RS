@@ -1664,7 +1664,8 @@ impl StoreService {
             &mut |tx, request| {
                 crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
             },
-        )?;
+        )
+        .map_err(crate::StoreError::refusal_within)?;
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
             Some(reading) => reading.pending(&tx, &budget)?,
             None => tx.pending_snapshot_within(&budget)?,
@@ -2101,6 +2102,11 @@ impl StoreService {
         statement: [nrese_rdf::TermRef<'_>; 3],
     ) -> StoreResult<Option<Vec<crate::reasoning::InferenceStep>>> {
         let snapshot = self.engine.snapshot();
+        // Admitted as every read is ([`Self::view_of`]) before anything of the snapshot is
+        // read: a proof under rules nothing vouches its stack for would show a reader of
+        // some graphs what a premise it can't read decides.
+        let envelope = self.settings.envelope(None);
+        self.view_of(&snapshot, scope.access(), &envelope, None)?;
         let program = self.bound_program(&snapshot, program);
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
@@ -2151,6 +2157,9 @@ impl StoreService {
         mode: crate::reasoning::JustificationMode,
     ) -> StoreResult<Option<crate::reasoning::JustificationAnswer>> {
         let snapshot = self.engine.snapshot();
+        // Admitted before anything of it is read, as [`Self::explain_statement_whole`].
+        let envelope = self.settings.envelope(None);
+        self.view_of(&snapshot, scope.access(), &envelope, None)?;
         let program = self.bound_program(&snapshot, program);
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
