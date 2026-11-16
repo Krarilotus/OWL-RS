@@ -808,6 +808,22 @@ fn owl2_rl_calls_no_answer_a_key_on_an_undeclared_property_misses_complete() {
     never_complete("");
 }
 
+/// A max cardinality in plain Turtle (`1`, an xsd:integer): at most one `:p` equates `:x`
+/// and `:y` (OWL 2 Direct Semantics), but the owl2-rl rules read only the mapping's
+/// spelling (`"1"^^xsd:nonNegativeInteger`). Its `false` must not be labelled complete at
+/// any place, as the key's: neither the equality's nor that of `:y :q :z`, which follows
+/// from it and reads no equality.
+#[test]
+fn owl2_rl_calls_no_answer_a_plain_max_cardinality_misses_complete() {
+    let data = ":C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+           owl:maxCardinality 1 ] . \
+         :p a owl:ObjectProperty . :q a owl:ObjectProperty . \
+         :c a :C ; :p :x , :y . :x :q :z .";
+    for read in ["ASK { :x owl:sameAs :y }", "ASK { :y :q :z }"] {
+        no_place_complete(data, read);
+    }
+}
+
 /// A maximum qualified by `owl:onDataRange rdfs:Literal`: at most no value of `:age`, and
 /// `:c` has one, so the data has no model and every statement is entailed. No owl2-rl rule
 /// reads `owl:onDataRange` (cls-maxqc1-4 read `owl:onClass`), so the closure misses the
@@ -1379,4 +1395,33 @@ fn places(
     );
     eprintln!("{line}");
     (text, line, places.map(|(_, c)| name(c)), run.ql.is_some())
+}
+
+/// cls-maxc2 names its cardinality as the term `"1"^^xsd:nonNegativeInteger`, and the rule
+/// set leaves out dt-eq: under owl2-rl only that spelling is read, and plain Turtle
+/// `owl:maxCardinality 1` (an xsd:integer) or `"01"^^xsd:nonNegativeInteger` doesn't
+/// equate `:x` and `:y`.
+#[test]
+fn owl2_rl_reads_only_the_mappings_spelling_of_a_max_cardinality() {
+    let mut wrong = Vec::new();
+    for (card, read) in [
+        ("\"1\"^^xsd:nonNegativeInteger", true),
+        ("1", false),
+        ("\"01\"^^xsd:nonNegativeInteger", false),
+    ] {
+        let data = format!(
+            ":C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+               owl:maxCardinality {card} ] . \
+             :p a owl:ObjectProperty . :c a :C ; :p :x , :y ."
+        );
+        let store = closure(&data, Ruleset::Owl2Rl, QlRewritingMode::Auto);
+        let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ :x owl:sameAs :y }}"));
+        let run = store.execute_query(&request).expect("answered");
+        let text = String::from_utf8_lossy(&run.payload).into_owned();
+        eprintln!("owl2-rl maxCardinality {card}: ASK {{ :x owl:sameAs :y }} answers {text}");
+        if text.contains("true") != read {
+            wrong.push(format!("{card}: {text}"));
+        }
+    }
+    assert!(wrong.is_empty(), "spellings read otherwise: {wrong:#?}");
 }
