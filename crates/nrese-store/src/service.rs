@@ -1376,7 +1376,7 @@ impl StoreService {
             plan_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         let at = Revision::Committed(&snapshot);
         planned.completeness = match self.dl_mode(prepared) {
-            Some(_) => Some(crate::dl::query::plan_status(self, prepared)),
+            Some(_) => Some(crate::dl::query::plan_status(self, prepared, cancellation)?),
             None => self.status_outside_dl(prepared, planned.ql.as_ref(), at),
         };
         Ok(planned)
