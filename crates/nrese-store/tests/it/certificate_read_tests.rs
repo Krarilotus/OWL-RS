@@ -306,6 +306,59 @@ fn a_read_inside_a_transaction_is_told_no_more_than_its_base_allows() {
     cells.finish();
 }
 
+/// Under `owl2-dl`, a question about an individual the data doesn't name, in an ontology with
+/// a key, is told the keys' reason whatever reason came before it: reasons accumulate as the
+/// status only weakens, so a user who clears the first one isn't then met by one they were
+/// never told.
+/// - Inside a transaction, after the pending operations' reason (the guard's cell).
+/// - With a typed constant, after its reason (the order's: the negation rule and the
+///   query's own reasons come after the mark).
+#[test]
+fn the_keys_reason_is_given_beside_every_earlier_reason() {
+    let mut cells = Cells::default();
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":r a owl:ObjectProperty . :A a owl:Class . :a a owl:NamedIndividual , :A . \
+         owl:Thing owl:hasKey ( :r ) ; \
+         rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:hasValue :a ] .",
+    )
+    .expect("the keys");
+    let store = dl.store();
+    let keys = "the ontology has keys";
+    let both = |cells: &mut Cells, name: &str, got: &str, first: &str| {
+        cells.header(
+            name,
+            got,
+            |h| h.contains(first) && h.contains(keys),
+            &format!("both \"{first}\" and \"{keys}\""),
+        );
+    };
+    let add = vec![StatementOp::Add {
+        data: nrese_store::RdfPayload {
+            payload: b"<http://example.com/c> <http://example.com/note> \"c\" ."
+                .to_vec()
+                .into(),
+            format: nrese_store::GraphResultFormat::NTriples,
+            base_iri: None,
+        },
+        contexts: Vec::new(),
+    }];
+    both(
+        &mut cells,
+        "the keys' reason after the pending one",
+        &pending(store, add, "ASK { :b a :A }"),
+        "a read inside a transaction",
+    );
+    both(
+        &mut cells,
+        "the keys' reason after a typed constant's",
+        &status(store, "ASK { :b a :A . :a :note \"1\"^^xsd:integer }"),
+        "a stored value written another way",
+    );
+    cells.finish();
+}
+
 /// A store whose certificate was dropped (`invalidate_reasoning`) holds the old inferred
 /// statements and no certificate for them: every reasoned read is `not-certified`, on every
 /// path. With the QL rewriting on, the rewriting's own `complete` included (35); EXPLAIN and
