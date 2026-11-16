@@ -634,10 +634,14 @@ impl<'a> Graph<'a> {
         let mut declared = Vec::new();
         for &[s, p, o] in triples {
             graph.by_subject.entry(s).or_default().push((p, o));
+            // A property's declaration is of an IRI (the RDF mapping's Table 6), as the
+            // ontology reader reads it: a blank node so typed declares nothing.
             match names.declared(p, o) {
                 Some(EntityKind::Datatype) => declared.push(s),
-                Some(EntityKind::DataProperty) => graph.data_properties.extend([s]),
-                Some(EntityKind::AnnotationProperty) => graph.annotation_properties.extend([s]),
+                Some(EntityKind::DataProperty) if named(s) => graph.data_properties.extend([s]),
+                Some(EntityKind::AnnotationProperty) if named(s) => {
+                    graph.annotation_properties.extend([s])
+                }
                 _ => {}
             }
         }
