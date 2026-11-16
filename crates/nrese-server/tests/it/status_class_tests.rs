@@ -81,6 +81,15 @@ const REFUSED: &str = "serves no replica";
 /// the replica's next revision (410 Gone). The replica fails closed.
 const START_AGAIN: &str = "start this replica again";
 
+/// The columns whose replica follows across a change of its primary's rules: there the
+/// restart's reasoning changes no inferred statement, so it installs without a new revision
+/// or a checkpoint (`nrese-engine/src/engine/bulk.rs:943-949`), and the replica reads on.
+const FOLLOWED: [&str; 3] = [
+    "custom representatives ql=auto",
+    "owl2-ql representatives ql=auto",
+    "owl2-ql representatives ql=off",
+];
+
 /// Whether `way` reaches a store through a replica of a primary under `column` whose rows are
 /// stored over representatives: `reasoner.equality = "compact"`, whose every column's rules
 /// close equality (`rdfs-plus`, `owl-horst`, `owl2-rl`, and `owl2-dl`, whose certified
@@ -260,6 +269,8 @@ fn both() -> String {
 struct Keep {
     dirs: Vec<tempfile::TempDir>,
     served: Vec<Served>,
+    /// Across a change of rules, the primary's revision before and after its restart.
+    restarted: Option<(u64, u64)>,
 }
 
 impl Keep {
@@ -282,6 +293,8 @@ struct Served {
     base: String,
     stop: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
+    /// The served store, released by [`Served::end`] once no other handle holds it.
+    store: std::sync::Arc<StoreService>,
 }
 
 impl Served {
@@ -298,11 +311,21 @@ impl Served {
                 .await
                 .expect("serve");
         });
-        Ok(Self { base, stop, task })
+        Ok(Self {
+            base,
+            stop,
+            task,
+            store: state.store(),
+        })
     }
 
-    /// Ends the server, and waits until its task has stopped: the store it serves is
-    /// released, so its directory can be opened again.
+    /// Ends the server, and waits until its task has stopped and the store it serves is
+    /// released, so its directory can be opened again. A connection's task of axum's lets
+    /// the server's end go on before it drops its clone of the app, and with it the store
+    /// (axum 0.8.8, `serve/mod.rs:389-415`: `close_rx` goes first, the connection after):
+    /// the store is dropped here once this is its only handle, its lock released before
+    /// this returns. A wait is printed (`DETAIL`); after 10 s it goes on (`ERROR`), the
+    /// reopen's error then shown as it is.
     async fn end(self) {
         let _ = self.stop.send(());
         let mut task = self.task;
@@ -312,6 +335,22 @@ impl Served {
         {
             task.abort();
             let _ = task.await;
+        }
+        let (started, others) = (
+            std::time::Instant::now(),
+            std::sync::Arc::strong_count(&self.store) - 1,
+        );
+        while std::sync::Arc::strong_count(&self.store) > 1 {
+            if started.elapsed() > Duration::from_secs(10) {
+                let handles = std::sync::Arc::strong_count(&self.store) - 1;
+                eprintln!("ERROR served end: {handles} handles after 10 s");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        if others > 0 {
+            let waited = started.elapsed().as_millis();
+            eprintln!("DETAIL served end: waited {waited} ms, {others} other handles at the start");
         }
     }
 }
@@ -498,19 +537,20 @@ async fn reach(way: &str, column: &Column, keep: &mut Keep) -> TestResult<AppSta
             reopened(column, &replica_dir)
         }
         "replica across a change of rules" => {
-            let (state, served) = {
+            let (state, served, before) = {
                 let primary_state = column.state(&dir, other(column.mode), Some(primary()))?;
                 update(&primary_state, &both()).await?;
                 let served = Served::start(&primary_state).await?;
                 let (state, _) = replica(column, &served.base, keep).await?;
                 catch_up(&served.base, &state).await?;
-                (state, served)
+                (state, served, primary_state.store().current_revision())
             };
             served.end().await;
             // The primary restarts under the column's rules: its start reasons again, and
-            // the replica asks for its log ([`START_AGAIN`]).
+            // the replica asks for its log ([`START_AGAIN`], [`FOLLOWED`]).
             let primary_state = column.state(&dir, column.mode, Some(primary()))?;
             start(&primary_state)?;
+            keep.restarted = Some((before, primary_state.store().current_revision()));
             let served = Served::start(&primary_state).await?;
             catch_up(&served.base, &state).await?;
             keep.served.push(served);
@@ -876,8 +916,11 @@ async fn every_way_to_a_store_reads_as_a_loaded_store() -> TestResult<()> {
 /// 14:38): a read replica reached by each of [`REPLICA_WAYS`] under each column reads as
 /// [`replica_compare`] says, against a freshly loaded store of that column. Under a compact
 /// column ([`refused`]) the way is refused with the sentence, at its image. Across a change
-/// of its primary's rules a replica is told to start again ([`START_AGAIN`]), under every
-/// column. Then the replica of a quarantined primary
+/// of its primary's rules a replica is told to start again ([`START_AGAIN`]), except under
+/// [`FOLLOWED`], where it reads on, and under a compact column, whose restarted primary
+/// refuses it with the sentence ([`REFUSED`]: its log, as its image, serves no replica);
+/// the primary's revision moves across its restart exactly
+/// where the replica is told to start again. Then the replica of a quarantined primary
 /// ([`quarantine_cell`]). Every wrong cell is printed (`WRONG …`), every cell that couldn't
 /// run too (`ERROR …`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -911,9 +954,25 @@ async fn a_replica_reads_its_primarys_rows_and_says_not_certified() -> TestResul
                 seen(&state).await
             })
             .await;
-            let gone = way == "replica across a change of rules";
+            let across = way == "replica across a change of rules";
+            let gone = across && !FOLLOWED.contains(&column.name.as_str());
+            let told = if refused(way, &column) {
+                REFUSED
+            } else {
+                START_AGAIN
+            };
+            match keep.restarted {
+                Some((before, after)) if across && (before == after) == gone => {
+                    wrong.push(format!("{cell} | revision {before} -> {after}"));
+                }
+                None if across => wrong.push(format!("{cell} | no revision read")),
+                _ => {}
+            }
             match got {
-                Ok(Err(error)) if gone && error.to_string().contains(START_AGAIN) => {}
+                Ok(Err(error)) if gone && error.to_string().contains(told) => {}
+                Ok(Err(error)) if across && error.to_string().contains(START_AGAIN) => {
+                    wrong.push(format!("{cell} | told to start again"));
+                }
                 Ok(Ok(_)) if gone || refused(way, &column) => {
                     eprintln!("DETAIL {cell}: served");
                     wrong.push(format!("{cell} | served"));
