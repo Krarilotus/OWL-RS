@@ -66,13 +66,15 @@ fn a_key_binds_no_anonymous_value() {
 }
 
 /// A data key shared by an anonymous instance (`_:d1`) and a named one doesn't equate them,
-/// so `:d2 a :E` isn't entailed; with the instance named (`:d1`) it is. Outside OWL 2 RL:
-/// the bounds decide it. Their upper bound applies the key to every individual, so the
-/// `false` is sound, not complete.
+/// so `:d2 a :E` isn't entailed; with the instance named (`:d1`) it is. Under the Direct
+/// Semantics a key equates only elements in NAMED (*OWL 2 Direct Semantics* §2.3.5,
+/// Table 9). Outside OWL 2 RL: the bounds decide it. Their upper bound applies the key to
+/// every individual and so holds `:d2 a :E`; the exact check of that one candidate refutes
+/// it, so the `false` is complete.
 #[test]
 fn a_key_binds_no_anonymous_instance() {
     let cases =
-        [("_:d1", "false", Some(false)), (":d1", "true", None)].map(|(d1, answer, complete)| {
+        [("_:d1", "false", Some(true)), (":d1", "true", None)].map(|(d1, answer, complete)| {
             let data = format!(
                 ":k a owl:DatatypeProperty . :D owl:hasKey ( :k ) . \
              {d1} a :D , :E ; :k 7 . :d2 a :D ; :k 7 . {OUTSIDE_RL}"
@@ -81,6 +83,18 @@ fn a_key_binds_no_anonymous_instance() {
         });
     let wrong = answered(&cases, "ASK { :d2 a :E }");
     assert!(wrong.is_empty(), "{wrong:#?}");
+    // The anonymous instance's `false`: the upper bound's one candidate, refuted exactly.
+    let dl = pipeline();
+    insert(&dl, &cases[0].0).expect("consistent");
+    let (_, status) = query(&dl, "ASK { :d2 a :E }");
+    let refuted = status
+        .bounds
+        .map(|b| (b.lower, b.upper, b.refuted, b.unresolved));
+    assert_eq!(
+        (status.paths.as_slice(), refuted),
+        (&["exact-ground-entailment"][..], Some((0, Some(1), 1, 0))),
+        "{status:?}"
+    );
 }
 
 /// An object key whose value's `sameAs` class is all anonymous (`_:z1`, `_:z2`) binds
