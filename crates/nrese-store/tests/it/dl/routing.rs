@@ -321,6 +321,30 @@ fn the_other_reads_of_an_individual_named_only_in_the_question_are_not_complete(
     assert!(!inside.complete && !alone.complete, "{lines:#?}");
 }
 
+/// A read of every statement outside a transaction, told without the DL bounds
+/// (`status_without_dl`): the rules' closure alone, which lacks an existential's certain
+/// answer here (`:a` has an `:r`), so it is not `complete`.
+#[test]
+fn a_read_of_every_statement_without_the_bounds_is_not_complete() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":r a owl:ObjectProperty . \
+         :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] . \
+         :a a :A .",
+    )
+    .expect("the existential");
+    let read = dl
+        .store()
+        .prepare_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "{}ASK {{ :a :r ?y }}",
+            super::PREFIXES
+        )))
+        .expect("prepared");
+    let status = dl.store().status_without_dl(&read).expect("a status");
+    assert!(!status.complete, "{} {:?}", status.as_str(), status.reasons);
+}
+
 /// The plan's status of a question about an individual the data doesn't name, under a key
 /// on the RL route, where nothing else keeps the plan from `complete`: the plan says why it
 /// isn't, that reason alone.

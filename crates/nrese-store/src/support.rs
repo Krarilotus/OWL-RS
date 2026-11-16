@@ -2058,6 +2058,11 @@ impl Supports {
         *state = State::new(&self.kept, Generation { rules, epoch });
     }
 
+    /// Whether rules are registered ([`Self::use_rules`]): a reasoner maintains the stack.
+    pub(crate) fn has_rules(&self) -> bool {
+        self.state().generation.rules.is_some()
+    }
+
     /// How many times the rules were set ([`Self::use_rules`]): what a read decided under
     /// them, a session's kept view included ([`crate::sessions`]), holds while it is the same.
     pub(crate) fn epoch(&self) -> u64 {

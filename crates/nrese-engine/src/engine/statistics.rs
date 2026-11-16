@@ -941,7 +941,7 @@ mod tests {
             tx.insert(Quad::new(node("rep"), node("p"), object, GraphName::DefaultGraph).as_ref());
         }
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(same_as));
+        engine.transaction().install(Some(same_as), None);
         let snapshot = engine.snapshot();
         let heavy = |snapshot: &Snapshot| {
             snapshot.heavy_groups_in(

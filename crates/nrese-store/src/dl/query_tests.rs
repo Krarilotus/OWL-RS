@@ -40,6 +40,7 @@ fn lower_true_ask_evaluates_once_and_delivers_that_result() {
     crate::query_executor::BOUND_EVALUATIONS.with(|n| n.set(0));
     let outcome = answer(
         &store,
+        &store.engine().snapshot(),
         &prepared,
         &CancellationToken::new(),
         &nrese_exec::Envelope::unlimited(),
@@ -301,6 +302,7 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
         assert!(matches!(
             answer(
                 &store,
+                &store.engine().snapshot(),
                 &prepared,
                 &token,
                 &nrese_exec::Envelope::unlimited(),
@@ -980,7 +982,7 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         let pending = tx.pending_snapshot().unwrap();
         let reads = [
             ("committed", Revision::Committed(&snapshot), &snapshot),
-            ("pending", Revision::Pending(&pending), &pending),
+            ("pending", Revision::Pending(&pending, true), &pending),
         ];
         for (of, at, read) in reads {
             let Ok(whole) = read_ontology(&store, read) else {
