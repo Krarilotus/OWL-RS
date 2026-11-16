@@ -1605,7 +1605,8 @@ impl StoreService {
                         nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
                     status.incomplete(
                         "dl",
-                        "a read inside a transaction: its pending operations aren't reasoned                          over before the commit (the committed closure, no DL bounds)"
+                        "a read inside a transaction: its pending operations aren't reasoned \
+                         over before the commit (the committed closure, no DL bounds)"
                             .to_owned(),
                     );
                     crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
@@ -1617,7 +1618,8 @@ impl StoreService {
             if deletes && let Some(status) = &mut status {
                 status.unsound(
                     "transaction",
-                    "the pending operations may delete statements whose inferences remain                      until the commit"
+                    "the pending operations may delete statements whose inferences remain \
+                     until the commit"
                         .to_owned(),
                 );
             }
