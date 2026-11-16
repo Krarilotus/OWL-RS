@@ -232,7 +232,7 @@ fn a_panic_in_the_rebuild_ends_in_a_message_naming_the_store()
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
             !output.status.success()
-                && stderr.contains(&data.display().to_string())
+                && stderr.contains(&data.display().to_string().replace('\\', "/"))
                 && stderr.contains("reasoner.mode = \"disabled\""),
             "{place}: {}:\n{stderr}",
             output.status
