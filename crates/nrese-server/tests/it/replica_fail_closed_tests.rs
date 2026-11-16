@@ -112,13 +112,47 @@ async fn last_error(replica: &AppState) -> TestResult<Option<String>> {
     Ok(status["last_error"].as_str().map(str::to_owned))
 }
 
+/// A primary under `mode` given `first` and served; its replica bootstrapped from the image
+/// and caught up after `second`. Both stores configured by `config`; the directories go with
+/// them.
+async fn primary_and_replica(
+    mode: ReasoningMode,
+    config: impl Fn(&std::path::Path) -> StoreConfig,
+    first: &str,
+    second: &str,
+) -> TestResult<(AppState, AppState, [tempfile::TempDir; 2])> {
+    let dirs = [tempfile::tempdir()?, tempfile::tempdir()?];
+    let primary_state = server(StoreService::new(config(dirs[0].path()))?, mode, primary());
+    let base = serve(&primary_state).await?;
+    update(&base, first).await;
+    let following = replica_of(&base);
+    replication::bootstrap(&following, dirs[1].path()).await?;
+    let replica_state = server(StoreService::new(config(dirs[1].path()))?, mode, following);
+    update(&base, second).await;
+    let client = reqwest::Client::new();
+    while replication::pull_once(&client, &base, &replica_state).await? > 0 {}
+    Ok((primary_state, replica_state, dirs))
+}
+
+/// The values a result's rows bind `?x` to.
+fn bound(rows: &str) -> Vec<String> {
+    let rows: serde_json::Value = serde_json::from_str(rows).unwrap_or_default();
+    rows["results"]["bindings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["x"]["value"].as_str().map(str::to_owned))
+        .collect()
+}
+
 /// Spec (the replica's fail-closed form, half page point 3; master 12:15 and 14:38): a
 /// primary whose served version is stored compact (`reasoner.equality = "compact"` under
 /// `owl2-rl`, which closes equality) serves no replica. A replica starting from it fails
 /// with the sentence (`bootstrap`); one following its log from a store it holds fails with
 /// it (a round), and its `/replication/status` gives it as `last_error` (`follow`). Under
 /// `rdfs` the same configuration stores rows as they are: the replica starts from the image
-/// and follows the next commit. Each case is printed.
+/// and follows the next commit. Each case is printed. (It takes the place of the test that
+/// had such a replica give its primary's rows.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_of_a_compact_primary_fails_with_the_sentence() -> TestResult<()> {
     let compact = |dir: &std::path::Path| StoreConfig {
@@ -276,5 +310,99 @@ async fn a_directory_once_a_primary_does_not_vouch_for_records_it_applied() -> T
         Some("not-certified"),
         "the reopened replica vouches for records it applied"
     );
+    Ok(())
+}
+
+/// Spec (the replica's fail-closed form, half page point 1; master 14:38): under `owl2-rl`,
+/// a replica over the data of its image and of a commit after it answers each read with its
+/// primary's rows, and says `not-certified` where the primary gives a status ("every
+/// reasoned read on a replica says `not-certified`"). The precondition: the primary's read
+/// of an inferred statement is certified (`sound-only` under `owl2-rl`). The wrong reads are
+/// listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_s_reads_under_owl2_rl_say_not_certified() -> TestResult<()> {
+    let (primary_state, replica_state, _dirs) = primary_and_replica(
+        ReasoningMode::Owl2Rl,
+        |dir| StoreConfig {
+            ql_rewriting: nrese_store::QlRewritingMode::Off,
+            ..StoreConfig::on_disk(dir)
+        },
+        "INSERT DATA { ex:Dog rdfs:subClassOf ex:Animal . ex:rex a ex:Dog }",
+        "INSERT DATA { ex:Cat rdfs:subClassOf ex:Animal }",
+    )
+    .await?;
+    let (primary_app, replica_app) = (build_app(primary_state), build_app(replica_state));
+    let (_, status) = answered(primary_app.clone(), "ASK { ex:rex a ex:Animal }").await?;
+    assert!(
+        status
+            .as_deref()
+            .is_some_and(|s| s.starts_with("sound-only; regime=owl2-rl")),
+        "the precondition: the primary's inferred read is certified: {status:?}"
+    );
+    let mut wrong = Vec::new();
+    for query in [
+        "ASK { ex:Dog ?p ex:Animal }",
+        "ASK { ex:Dog rdfs:subClassOf ex:Animal }",
+        "ASK { ex:rex a ex:Animal }",
+    ] {
+        let want = answered(primary_app.clone(), query).await?;
+        let got = answered(replica_app.clone(), query).await?;
+        let status = want.1.as_ref().map(|_| "not-certified".to_owned());
+        if got != (want.0.clone(), status) {
+            wrong.push(format!(
+                "{query}: the primary {want:?}, the replica {got:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+    Ok(())
+}
+
+/// Spec (half page points 1 and 2): with the QL rewriting on (`owl2-ql`, where `auto`
+/// switches it on, and `owl2-rl` with it on), the members of an existential no rule
+/// materialises get their rows on the primary only through the rewriting, which rides on
+/// the reasoning certificate. A replica over the data of its image and of a commit after it
+/// gives no row its primary doesn't (fewer are allowed) and says `not-certified`. The
+/// precondition: the primary gives both members.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_through_the_ql_rewriting_says_not_certified() -> TestResult<()> {
+    use nrese_store::QlRewritingMode::{Auto, On};
+    let query = "SELECT ?x WHERE { ?x ex:worksFor ?y } ORDER BY ?x";
+    let (mut unmet, mut wrong) = (Vec::new(), Vec::new());
+    for (label, mode, ql) in [
+        ("owl2-ql, auto", ReasoningMode::Owl2Ql, Auto),
+        ("owl2-rl, on", ReasoningMode::Owl2Rl, On),
+    ] {
+        let (primary_state, replica_state, _dirs) = primary_and_replica(
+            mode,
+            |dir| StoreConfig {
+                ql_rewriting: ql,
+                ..StoreConfig::on_disk(dir)
+            },
+            "INSERT DATA { ex:Employee rdfs:subClassOf [ a owl:Restriction ; \
+             owl:onProperty ex:worksFor ; owl:someValuesFrom owl:Thing ] . ex:bob a ex:Employee }",
+            "INSERT DATA { ex:alice a ex:Employee }",
+        )
+        .await?;
+        let (rows, _) = answered(build_app(primary_state), query).await?;
+        let want = bound(&rows);
+        if !["alice", "bob"]
+            .iter()
+            .all(|x| want.contains(&format!("http://example.com/{x}")))
+        {
+            unmet.push(format!("{label}: the primary's rows: {rows}"));
+            continue;
+        }
+        let (replica_rows, status) = answered(build_app(replica_state), query).await?;
+        if !bound(&replica_rows).iter().all(|x| want.contains(x))
+            || status.as_deref() != Some("not-certified")
+        {
+            wrong.push(format!(
+                "{label}: the primary {rows}, the replica {replica_rows} {status:?}"
+            ));
+        }
+    }
+    assert!(unmet.is_empty(), "{unmet:#?}");
+    assert!(wrong.is_empty(), "{wrong:#?}");
     Ok(())
 }
