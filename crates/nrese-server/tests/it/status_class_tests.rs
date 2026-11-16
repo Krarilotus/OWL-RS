@@ -125,7 +125,7 @@ impl Column {
     ) -> TestResult<AppState> {
         let state = AppState::new(
             StoreService::new(self.config(dir))?,
-            ReasonerService::new(ReasonerConfig::for_mode(mode)),
+            ReasonerService::new(reasoner(mode)?),
             PolicyConfig::default(),
             AiSuggestionService::disabled(),
             DeploymentPosture::OpenWorkbench,
@@ -139,12 +139,38 @@ impl Column {
     }
 }
 
+/// The `custom` mode's program: the user's rules alone.
+const CUSTOM: &str = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+{ ?x rdf:type ?c . ?c rdfs:subClassOf ?d } => { ?x rdf:type ?d } .
+";
+
+/// The reasoner of `mode`; `custom` with [`CUSTOM`].
+fn reasoner(mode: ReasoningMode) -> TestResult<ReasonerConfig> {
+    let config = ReasonerConfig::for_mode(mode);
+    if !matches!(mode, ReasoningMode::Custom) {
+        return Ok(config);
+    }
+    let rules = nrese_reasoner::UserRules::n3("custom.n3", CUSTOM)?;
+    Ok(config.with_rules(Some(std::sync::Arc::new(rules)))?)
+}
+
 /// Every mode; each `reasoner.equality` value where the rules close equality (`eq-rep-s`);
 /// QL rewriting on and off where it can apply.
+///
+/// `custom` is one column. A reader reads its data through three branches that depend on the
+/// program's name (`custom:custom.n3`). `RuleProgram::closes_equality` takes the arm of a name
+/// with no built-in base, so it closes no equality and no `reasoner.equality` value changes
+/// how its data is read (nrese-reasoner program.rs:202-211; its own arm, hence its column).
+/// `note_ql` takes its catch-all arm, no rewriting (nrese-store service.rs:356-360). The
+/// status's regime takes `Regime::of_ruleset`'s catch-all arm, `custom`, as `rdfs-full`,
+/// `rdfs-plus` and `owl-horst` do (nrese-sparql completeness.rs:95-101).
 fn columns() -> Vec<Column> {
     use Equality::{Compact, Replicate, Representatives};
     use QlRewritingMode::{Auto, Off, On};
-    use ReasoningMode::{Disabled, Owl2Dl, Owl2Ql, Owl2Rl, OwlHorst, Rdfs, RdfsFull, RdfsPlus};
+    use ReasoningMode::{
+        Custom, Disabled, Owl2Dl, Owl2Ql, Owl2Rl, OwlHorst, Rdfs, RdfsFull, RdfsPlus,
+    };
     let equalities = [Representatives, Compact, Replicate];
     let mut columns = vec![
         Column::new(Disabled, Representatives, Auto),
@@ -167,6 +193,7 @@ fn columns() -> Vec<Column> {
     for equality in equalities {
         columns.push(Column::new(Owl2Dl, equality, Auto));
     }
+    columns.push(Column::new(Custom, Representatives, Auto));
     columns
 }
 
