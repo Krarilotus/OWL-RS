@@ -127,3 +127,39 @@ fn print_query_output_starts_with_its_completeness_comment()
     );
     Ok(())
 }
+
+/// An annotation property's domain, disjoint with its subject's class: the OWL 2 RL rules
+/// clash (prp-dom on the annotation), while OWL 2 DL gives the axiom no meaning there.
+const ANNOTATION_CLASH: &str = "<http://example.com/note> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/2002/07/owl#AnnotationProperty> .
+<http://example.com/note> <http://www.w3.org/2000/01/rdf-schema#domain> <http://example.com/C> .
+<http://example.com/C> <http://www.w3.org/2002/07/owl#disjointWith> <http://example.com/D> .
+<http://example.com/x> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/D> .
+<http://example.com/x> <http://example.com/note> \"v\" .
+";
+
+/// Under `owl2-dl`, `load` of [`ANNOTATION_CLASH`] into a fresh on-disk store fails, and
+/// says what is known: the rules' clash, which this release doesn't decide, not an
+/// inconsistency.
+#[test]
+fn load_of_a_clash_owl2_dl_reads_differently_fails_as_undecided()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("annotation-clash.nt");
+    std::fs::write(&file, ANNOTATION_CLASH)?;
+    let output = run(nrese(dir.path(), &dir.path().join("data"))
+        .env("NRESE_REASONING_MODE", "owl2-dl")
+        .arg("load")
+        .arg(&file))?;
+    assert!(
+        !output.status.success()
+            && output
+                .stderr
+                .contains("annotation-property axioms or a punned name")
+            && !output.stderr.contains("inconsistent under"),
+        "{}:\n{}\n{}",
+        output.status,
+        output.stdout,
+        output.stderr
+    );
+    Ok(())
+}

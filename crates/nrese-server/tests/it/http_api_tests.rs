@@ -578,6 +578,66 @@ async fn owl2_rl_rejects_disjoint_type_conflicts_and_surfaces_reason()
     Ok(())
 }
 
+/// Under `owl2-dl`, a write whose rules clash OWL 2 DL may read as consistent (an
+/// annotation property's domain, disjoint with its subject's class) is refused as
+/// undecided, and a program tells it from an inconsistency by the problem's type and title,
+/// not by its sentence.
+#[tokio::test]
+async fn an_undecided_refusal_and_an_inconsistency_differ_in_their_problem_type()
+-> Result<(), Box<dyn std::error::Error>> {
+    let app = test_app_with_settings(
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
+    )?;
+    let ex = "http://example.com/";
+    let owl = "http://www.w3.org/2002/07/owl#";
+    let rdfs = "http://www.w3.org/2000/01/rdf-schema#";
+    let undecided = format!(
+        "INSERT DATA {{ <{ex}note> a <{owl}AnnotationProperty> ; <{rdfs}domain> <{ex}C> .
+            <{ex}C> <{owl}disjointWith> <{ex}D> . <{ex}x> a <{ex}D> ; <{ex}note> \"v\" }}"
+    );
+    let inconsistent = format!(
+        "INSERT DATA {{ <{ex}A> <{owl}disjointWith> <{ex}B> . <{ex}y> a <{ex}A> , <{ex}B> }}"
+    );
+    let mut seen = Vec::new();
+    for write in [undecided, inconsistent] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dataset/update")
+                    .method(Method::POST)
+                    .header("content-type", "application/sparql-update")
+                    .body(Body::from(write))?,
+            )
+            .await?;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let problem: serde_json::Value = serde_json::from_slice(&body)?;
+        eprintln!("{status} {} {}", problem["type"], problem["title"]);
+        seen.push((status, problem["type"].clone(), problem["title"].clone()));
+    }
+    let expected = [
+        (
+            "https://nrese.dev/problems/undecided-reject",
+            "Undecided Reject",
+        ),
+        (
+            "https://nrese.dev/problems/reasoner-reject",
+            "Reasoner Reject",
+        ),
+    ];
+    for ((status, kind, title), (want_kind, want_title)) in seen.iter().zip(expected) {
+        assert_eq!(*status, StatusCode::BAD_REQUEST, "{seen:?}");
+        assert_eq!(
+            (kind.as_str(), title.as_str()),
+            (Some(want_kind), Some(want_title)),
+            "{seen:?}"
+        );
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn graph_store_head_returns_content_type() -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app()?;

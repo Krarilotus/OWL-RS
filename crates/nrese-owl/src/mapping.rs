@@ -81,6 +81,10 @@ pub struct Ontology {
     pub diagnostics: Vec<Diagnostic>,
     /// Annotation statements and the ontology header, read past.
     pub annotations: usize,
+    /// The annotation properties given a domain, a range or a super-property, read past
+    /// among [`Self::annotations`]: OWL 2 DL gives these axioms no meaning, while the OWL 2
+    /// RL rules over the triples (prp-dom, prp-rng, prp-spo1) read them. Sorted, each once.
+    pub annotation_schema: Vec<Term>,
     /// The source's ids of the properties with a fixed meaning.
     pub builtin: BuiltinProperties,
     /// The literals, datatypes and facets of the data axioms, as the source gives them.
@@ -387,6 +391,7 @@ struct Reader<'a> {
     diagnostics: Vec<Diagnostic>,
     reported: HashSet<(Term, &'static str)>,
     annotations: usize,
+    annotation_schema: Vec<Term>,
 }
 
 /// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
@@ -473,6 +478,7 @@ impl<'a> Reader<'a> {
             diagnostics: Vec::new(),
             reported: HashSet::new(),
             annotations: 0,
+            annotation_schema: Vec::new(),
         }
     }
 
@@ -1247,6 +1253,7 @@ impl<'a> Reader<'a> {
         } else if is(p, v.rdfs_sub_property_of) {
             if self.declared_as(s, EntityKind::AnnotationProperty) {
                 self.annotations += 1;
+                self.annotation_schema.push(s);
             } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
                 self.add(Axiom::SubDataPropertyOf(s, o), triple);
             } else if let (Some(sub), Some(sup)) =
@@ -1301,6 +1308,7 @@ impl<'a> Reader<'a> {
             let domain = is(p, v.rdfs_domain);
             if self.declared_as(s, EntityKind::AnnotationProperty) {
                 self.annotations += 1;
+                self.annotation_schema.push(s);
             } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
                 if domain {
                     if let Some(class) = self.class(o) {
@@ -1496,6 +1504,8 @@ impl<'a> Reader<'a> {
             axioms.push(axiom);
             sources.push(from);
         }
+        self.annotation_schema.sort_unstable();
+        self.annotation_schema.dedup();
         let mut ontology = Ontology {
             classes: self.classes,
             ranges: self.ranges,
@@ -1503,6 +1513,7 @@ impl<'a> Reader<'a> {
             sources,
             diagnostics: self.diagnostics,
             annotations: self.annotations,
+            annotation_schema: self.annotation_schema,
             builtin: BuiltinProperties::of(&self.v),
             data: DataTerms::default(),
             anonymous: BTreeSet::new(),
