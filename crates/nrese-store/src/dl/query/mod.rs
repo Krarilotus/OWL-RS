@@ -55,9 +55,13 @@ use analysis::*;
 pub(crate) use exact::{Ids, ground_axiom};
 
 /// The ontology of a revision, kept for the exact services of its queries, charged to the
-/// bounds' budget while kept (SYN-61).
+/// bounds' budget while kept (SYN-61); and the mark it gave a committed revision
+/// ([`reads_differently`]), so the reads at that revision pass over it once.
 #[derive(Debug, Default)]
-pub(crate) struct OntologyCache(std::sync::Mutex<Option<(u64, KeptOntology)>>);
+pub(crate) struct OntologyCache(
+    std::sync::Mutex<Option<(u64, KeptOntology)>>,
+    std::sync::Mutex<Option<(u64, Option<String>)>>,
+);
 
 impl OntologyCache {
     /// Lets the cache's entry go if it is of a revision below `revision`, so that its charge
@@ -418,6 +422,14 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
         (Some(None), Some(None)) => return None,
         _ => {}
     }
+    let marked = &store.dl().query_ontology.1;
+    let marked = || marked.lock().unwrap_or_else(|p| p.into_inner());
+    if !pending
+        && let Some((revision, why)) = &*marked()
+        && *revision == snapshot.revision()
+    {
+        return why.clone();
+    }
     #[cfg(test)]
     cancellation_tests::ONTOLOGY_PASSES.set(cancellation_tests::ONTOLOGY_PASSES.get() + 1);
     let read = if pending { read_ontology } else { ontology_at };
@@ -428,7 +440,11 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
             source::refused("the revision")
         ));
     };
-    by_ontology(snapshot, ontology.value())
+    let why = by_ontology(snapshot, ontology.value());
+    if !pending {
+        *marked() = Some((snapshot.revision(), why.clone()));
+    }
+    why
 }
 
 /// What the store's indexes decide of [`reads_differently`] without the ontology: `Some`
