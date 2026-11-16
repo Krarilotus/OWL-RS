@@ -765,6 +765,8 @@ struct ImportReport {
 struct QuarantineExample {
     id: String,
     file: String,
+    /// From 1; 0 where the format's parser doesn't know it (RDF/XML, JSON-LD), and `reason`
+    /// then says what it knows, such as the byte offset.
     line: u64,
     column: u64,
     reason: String,
