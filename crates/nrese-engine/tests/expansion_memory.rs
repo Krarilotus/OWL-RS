@@ -49,7 +49,7 @@ fn snapshot(size: usize) -> Snapshot {
         );
     }
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     let snapshot = engine.snapshot();
     snapshot
         .count_in(ReadModel::Materialised, &QuadPattern::all())

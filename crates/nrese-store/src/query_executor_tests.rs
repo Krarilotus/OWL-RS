@@ -44,7 +44,20 @@ fn fixture() -> (Engine, PreparedQuery, StoreSettings) {
     })
     .unwrap();
     let settings = store.query_settings().clone();
-    *settings.ql.write().unwrap() = Some(Arc::new(QlRewriting::new(Closure { lists: true })));
+    // The QL rewriting comes with the version's certificate.
+    let rl = nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl)
+        .materialised_program()
+        .expect("OWL 2 RL reasons");
+    let certificate = crate::service::Certificate {
+        state: crate::ReasoningState::of(&rl, 0),
+        ql: Some(Arc::new(QlRewriting::new(Closure { lists: true }))),
+        equality_closed: false,
+        dl: false,
+        user_rules: false,
+    };
+    engine
+        .transaction()
+        .install(None, Some(Arc::new(certificate)));
     (engine, prepared, settings)
 }
 
@@ -63,7 +76,7 @@ fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
             &token,
             &nrese_exec::Envelope::unlimited(),
             &mut bytes,
-            |_| panic!("cancelled before reporting")
+            |_| -> (Vec<u8>, fn(_) -> _) { panic!("cancelled before reporting") },
         ),
         Err(StoreError::SparqlEvaluation(
             QueryEvaluationError::Cancelled
@@ -80,7 +93,7 @@ fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
         &mut bytes,
         |report| {
             assert_eq!(report.unwrap().checks, 1);
-            Vec::new()
+            (Vec::new(), |_| None)
         },
     )
     .unwrap()
@@ -96,7 +109,7 @@ fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
         &token,
         &nrese_exec::Envelope::unlimited(),
         std::io::sink(),
-        |_| Vec::new(),
+        |_| (Vec::new(), |_| None),
     )
     .unwrap()
     .unwrap();
@@ -130,13 +143,14 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
                 .as_ref(),
             );
             tx.commit().unwrap();
-            b"same-context".to_vec()
+            (b"same-context".to_vec(), |_| None)
         },
     )
     .unwrap();
     let text = std::str::from_utf8(&first).unwrap();
     assert!(text.contains("ann") && !text.contains("bob"));
     let options = query_options(
+        &snapshot,
         &prepared,
         &settings,
         &token,
@@ -151,11 +165,12 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
                 prepared.media_type(),
                 b"same-context"
             ),
-            CachedOutput::Hit(_)
+            CachedOutput::Hit(..)
         ),
         "original key retained"
     );
     let mut bytes = Vec::new();
+    let cancel = &token;
     let error = run_query(
         &snapshot,
         &prepared,
@@ -163,9 +178,12 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
         &token,
         &nrese_exec::Envelope::unlimited(),
         &mut bytes,
-        |_| {
-            token.cancel();
-            b"same-context".to_vec()
+        // A hit: the report that cancels is the one handed the kept status header.
+        move |_| {
+            (b"same-context".to_vec(), move |_| {
+                cancel.cancel();
+                None
+            })
         },
     )
     .unwrap_err();
@@ -188,7 +206,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
         &CancellationToken::new(),
         &settings.query_envelope(&prepared),
         &mut second,
-        |_| b"same-context".to_vec(),
+        |_| (b"same-context".to_vec(), |_| None),
     )
     .unwrap();
     assert_eq!(first, second);
@@ -205,7 +223,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
             &token,
             &nrese_exec::Envelope::unlimited(),
             &mut writer,
-            |_| { b"same-context".to_vec() }
+            |_| (b"same-context".to_vec(), |_| None),
         ),
         Err(StoreError::SparqlEvaluation(
             QueryEvaluationError::Cancelled
@@ -291,15 +309,36 @@ fn collected_response_keeps_the_first_preparation_report() {
 
 #[test]
 fn prepared_serializers_agree_with_standalone_execution_for_every_form_and_format() {
-    let (engine, _, settings) = fixture();
-    let mut tx = engine.transaction();
-    for quad in RdfParser::from_format(RdfFormat::Turtle)
-        .for_reader(b"<http://example.org/bob> a <http://example.org/Employee> .".as_slice())
-    {
-        tx.insert(quad.unwrap().as_ref());
-    }
-    tx.commit().unwrap();
-    let snapshot = engine.snapshot();
+    // Written as a server writes, through the pipeline, so the version read carries the
+    // certificate its QL rewriting comes with.
+    let store = Arc::new(
+        crate::StoreService::new(crate::StoreConfig {
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..crate::StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(nrese_reasoner::ReasonerService::new(
+            nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
+        )),
+    )
+    .apply(
+        crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(
+            "PREFIX : <http://example.org/>
+            PREFIX owl: <http://www.w3.org/2002/07/owl#>
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+            INSERT DATA { :Employee rdfs:subClassOf [ a owl:Restriction ;
+                owl:onProperty :worksFor ; owl:someValuesFrom :Organisation ] .
+                :ann a :Employee ; :worksFor :acme . :bob a :Employee . }",
+        )),
+        &crate::Requester::all(),
+        &crate::MutationTicket::new(),
+    )
+    .unwrap();
+    let settings = store.query_settings().clone();
+    let snapshot = store.engine().snapshot();
     for text in [
         "SELECT ?x WHERE { ?x <http://example.org/worksFor> ?y } ORDER BY ?x",
         "ASK { <http://example.org/bob> <http://example.org/worksFor> ?y }",
@@ -321,6 +360,7 @@ fn prepared_serializers_agree_with_standalone_execution_for_every_form_and_forma
                 &prepared,
                 &prepared.query,
                 &query_options(
+                    &snapshot,
                     &prepared,
                     &settings,
                     &token,
@@ -338,7 +378,7 @@ fn prepared_serializers_agree_with_standalone_execution_for_every_form_and_forma
                 &token,
                 &nrese_exec::Envelope::unlimited(),
                 &mut actual,
-                |_| Vec::new(),
+                |_| (Vec::new(), |_| None),
             )
             .unwrap()
             .unwrap();

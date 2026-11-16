@@ -66,6 +66,8 @@ pub struct Transaction<'e> {
     /// The reading the commit installs with its stack ([`Self::read_equality_as`]); `None`
     /// keeps the base's.
     reading: Option<Option<TermId>>,
+    /// What the commit publishes as its certificate ([`Self::vouch`]); `None` by default.
+    vouched: Option<super::Certificate>,
 }
 
 impl<'e> Transaction<'e> {
@@ -77,6 +79,7 @@ impl<'e> Transaction<'e> {
             after: OnceLock::new(),
             note: None,
             reading: None,
+            vouched: None,
         }
     }
 
@@ -93,18 +96,24 @@ impl<'e> Transaction<'e> {
         self.reading = Some(same_as);
     }
 
-    /// Installs the current stack with `same_as` as its reading now, under this
-    /// transaction's writer slot: its statements, revision and time unchanged, nothing
-    /// logged or checkpointed. A store's open, whose reading isn't on disk. Nothing for a
-    /// speculative transaction.
-    pub fn install_reading(&self, same_as: Option<TermId>) {
+    /// Installs the current stack with `same_as` as its reading and `certificate` as its
+    /// certificate now, under this transaction's writer slot: its statements, revision and
+    /// time unchanged, nothing logged or checkpointed. A store's open, whose reading and
+    /// certificate aren't on disk. Nothing for a speculative transaction.
+    pub fn install(&self, same_as: Option<TermId>, certificate: Option<super::Certificate>) {
         if self._slot.is_some() {
-            self.engine.shared.install_reading(same_as);
+            self.engine.shared.install(same_as, certificate);
         }
     }
 
+    /// The commit publishes `certificate` with its version, for statements whose closure
+    /// it maintained; without this it publishes none.
+    pub fn vouch(&mut self, certificate: super::Certificate) {
+        self.vouched = Some(certificate);
+    }
+
     /// The reading the commit installs: the one given, or the installed version's (the base's,
-    /// or one [`Self::install_reading`] installed since: under the slot nothing else does).
+    /// or one [`Self::install`] installed since: under the slot nothing else does).
     fn reading(&self) -> Option<TermId> {
         let installed = || self.engine.shared.versions.load().reading;
         self.reading.unwrap_or_else(installed)
@@ -231,6 +240,7 @@ impl<'e> Transaction<'e> {
                 dictionary_len: self.engine.shared.dictionary.len(),
                 equality,
                 reading: seen.reading,
+                certificate: seen.certificate.clone(),
                 canonical: Default::default(),
                 // Empty, as every new version's: what this pending version's readers keep
                 // (its memo's hits share it, as they share the version).
@@ -309,6 +319,7 @@ impl<'e> Transaction<'e> {
                 dictionary_len: self.engine.shared.dictionary.len(),
                 equality,
                 reading: seen.reading,
+                certificate: seen.certificate.clone(),
                 canonical: Default::default(),
                 // Empty, as every new version's: what this pending version's readers keep.
                 own: Default::default(),
@@ -363,6 +374,7 @@ impl<'e> Transaction<'e> {
                 false => std::sync::Arc::clone(&base.equality),
             },
             reading: base.reading,
+            certificate: base.certificate.clone(),
             canonical: Default::default(),
             own: Default::default(),
         };
@@ -402,6 +414,7 @@ impl<'e> Transaction<'e> {
                 false => std::sync::Arc::clone(&seen.equality),
             },
             reading: seen.reading,
+            certificate: seen.certificate.clone(),
             canonical: Default::default(),
             own: Default::default(),
         };
@@ -685,6 +698,7 @@ impl<'e> Transaction<'e> {
             pending,
             after,
             note,
+            vouched,
             ..
         } = self;
         // The pending changes' charge, bound first so it drops last: after the sets are freed,
@@ -742,6 +756,7 @@ impl<'e> Transaction<'e> {
             dictionary_len,
             changes_equality,
             reading,
+            vouched,
             note,
         )? {
             summary.asserted = new;
@@ -775,6 +790,7 @@ impl Inner {
         dictionary_len: u64,
         changes_equality: bool,
         reading: Option<TermId>,
+        certificate: Option<super::Certificate>,
         note: Option<super::CommitNote<'_>>,
     ) -> EngineResult<Option<super::AssertedIdentity>> {
         // New where the record changes asserted statements; kept for an inferred-only one.
@@ -846,6 +862,7 @@ impl Inner {
                 // With its changes, in the one install: a reader reads the old stack in its
                 // reading or this one in the commit's.
                 reading,
+                certificate: certificate.clone(),
                 canonical: Default::default(),
                 own: Default::default(),
             }

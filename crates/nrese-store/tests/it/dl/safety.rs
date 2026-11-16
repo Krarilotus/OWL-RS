@@ -289,7 +289,10 @@ fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<
             &prepare(q, mode),
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         );
         format!("{} {status:?} {:?}", rows(out), result.err())
     };
@@ -306,7 +309,10 @@ fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<
             &prepare(q, mode),
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         );
         format!("{} {status:?} {:?}", rows(out), result.err())
     };

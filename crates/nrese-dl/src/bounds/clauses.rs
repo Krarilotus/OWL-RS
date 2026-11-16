@@ -15,6 +15,8 @@ use crate::internal::u1;
 pub(super) struct Bindings {
     slots: Vec<(Var, Slot)>,
     pub(super) next: u8,
+    /// All 256 rule variables (numbered by `u8`) are taken.
+    full: bool,
 }
 
 impl Bindings {
@@ -27,7 +29,10 @@ impl Bindings {
             return slot;
         }
         let slot = Slot::Var(self.next);
-        self.next += 1;
+        match self.next.checked_add(1) {
+            Some(next) => self.next = next,
+            None => self.full = true,
+        }
         self.slots.push((var, slot));
         slot
     }
@@ -113,6 +118,7 @@ impl Compiler<'_> {
         let mut b = Bindings {
             slots: Vec::new(),
             next: 0,
+            full: false,
         };
         let (mut body, unbound_top) = self.body(clause, &mut b);
         let sources = clause_sources(clause);
@@ -229,6 +235,15 @@ impl Compiler<'_> {
                 .find(Var::X)
                 .unwrap_or(Slot::Const(self.program.names.clash));
             head.push(self.clash(at));
+        }
+        // A rule numbers its variables by `u8`: a clause with more (an at-most adds two) isn't
+        // a rule, and U1 doesn't cover its axioms.
+        if b.full || (!at_most.is_empty() && b.next > u8::MAX - 2) {
+            for &axiom in sources.iter().flatten() {
+                let why = "a clause with more variables than a rule holds";
+                self.program.incomplete.push((axiom, why));
+            }
+            return;
         }
         let provenance = |approximations| Provenance {
             origin: Origin::Clause(index),

@@ -444,6 +444,7 @@ fn own_version(
         dictionary_len: end,
         equality: Default::default(),
         reading: seen.reading,
+        certificate: seen.certificate.clone(),
         canonical: Default::default(),
         own: Default::default(),
     }
