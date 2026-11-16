@@ -1556,7 +1556,16 @@ impl StoreService {
         )?;
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
             Some(reading) => reading.pending(&tx, &budget)?,
-            None => tx.pending_snapshot_within(&budget)?,
+            // Operations that touch no list fact leave out the lists their base does (a
+            // reader's own view, above, may drop equality's copies of list cells: it scans).
+            None => {
+                use crate::reasoning::Program;
+                let view = tx.pending_snapshot_within(&budget)?;
+                if !Program::touches_a_list(&view, tx.inserted().chain(tx.deleted())) {
+                    self.lists.own(&view, || false);
+                }
+                view
+            }
         };
         self.sessions.keep_view(
             tx.base().clone(),
@@ -2125,7 +2134,8 @@ impl StoreService {
             }
             false => self.lists.known(snapshot.revision()).unwrap_or(true),
         };
-        base || (!latest.same_version(snapshot) && Program::leaves_out_a_list(snapshot))
+        base || (!latest.same_version(snapshot)
+            && (self.lists).own(snapshot, || Program::leaves_out_a_list(snapshot)))
     }
 
     /// The QL rewriting's status at `snapshot`: under `owl2-rl`, not `complete` where the

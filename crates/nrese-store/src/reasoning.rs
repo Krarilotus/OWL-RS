@@ -22,13 +22,16 @@ pub use nrese_reasoner::engine::{
 /// list diagnostic), as one range `[from, to]` (`from > to`: empty), and the last revision a
 /// scan found leaving one out. A commit off `to` that leaves none out extends it, any other
 /// commit empties it, and a scan past it that finds none starts it there: a mark is never
-/// lost, for a reader of any revision. Outside it, a revision is scanned.
+/// lost, for a reader of any revision. Outside it, a revision is scanned. Beside it, what the
+/// last 32 scans of views and pending versions found, by their identity, never the record.
 #[derive(Debug)]
-pub(crate) struct ListsKept(std::sync::Mutex<(u64, u64, u64)>);
+pub(crate) struct ListsKept(std::sync::Mutex<(u64, u64, u64)>, Own);
+
+type Own = std::sync::Mutex<std::collections::VecDeque<(nrese_engine::SnapshotIdentity, bool)>>;
 
 impl Default for ListsKept {
     fn default() -> Self {
-        Self(std::sync::Mutex::new((1, 0, u64::MAX)))
+        Self(std::sync::Mutex::new((1, 0, u64::MAX)), Own::default())
     }
 }
 
@@ -57,6 +60,20 @@ impl ListsKept {
             false => {}
         }
         found
+    }
+
+    /// What the own scan of `view` (a reader's view or a pending version) found; if none is
+    /// noted, `scan`, noted by its identity (the newest 32 kept). Scanned outside the lock.
+    pub(crate) fn own(&self, view: &nrese_engine::Snapshot, scan: impl FnOnce() -> bool) -> bool {
+        let noted = (self.1.lock().unwrap_or_else(|p| p.into_inner()).iter())
+            .find_map(|&(at, found)| (at == view.identity()).then_some(found));
+        noted.unwrap_or_else(|| {
+            let found = scan();
+            let mut own = self.1.lock().unwrap_or_else(|p| p.into_inner());
+            own.push_front((view.identity(), found));
+            own.truncate(32);
+            found
+        })
     }
 }
 

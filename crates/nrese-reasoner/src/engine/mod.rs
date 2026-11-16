@@ -91,24 +91,38 @@ impl std::fmt::Debug for Program {
 }
 
 impl Program {
-    /// Whether a run of a program with list rules over `snapshot` would leave out a list
-    /// axiom (any list diagnostic). Only the list vocabulary is bound, by the snapshot's ids
-    /// (an IRI it doesn't hold gets an id no statement uses); no rule is compiled.
-    pub fn leaves_out_a_list(snapshot: &Snapshot) -> bool {
+    /// The list vocabulary by `snapshot`'s ids: an IRI it doesn't hold gets an id no statement
+    /// uses.
+    fn list_vocabulary(snapshot: &Snapshot) -> ListVocabulary {
         let absent = TermId::from_raw(u64::MAX >> 1);
         let intern = |term: TermRef<'_>| {
             Ok::<_, std::convert::Infallible>(snapshot.lookup(term).unwrap_or(absent))
         };
-        let lists = ListVocabulary::new(&mut Constants {
+        ListVocabulary::new(&mut Constants {
             intern: &intern,
             refused: None,
-        });
+        })
+    }
+
+    /// Whether a run of a program with list rules over `snapshot` would leave out a list
+    /// axiom (any list diagnostic). Only the list vocabulary is bound, by the snapshot's ids
+    /// ([`Self::list_vocabulary`]); no rule is compiled.
+    pub fn leaves_out_a_list(snapshot: &Snapshot) -> bool {
+        let lists = Self::list_vocabulary(snapshot);
         let base = explain::SnapshotBase {
             snapshot,
             axioms: &[],
         };
         let facts = crate::eval::AllFacts(&crate::explain::Whole(&base));
         !crate::lists::instantiate(&lists, &facts).1.is_empty()
+    }
+
+    /// Whether one of `quads` (by `at`'s ids) is a fact [`Self::leaves_out_a_list`] reads
+    /// ([`ListVocabulary::is_list_fact`]). If none is, a version that differs from its base by
+    /// `quads` alone leaves out the lists its base does.
+    pub fn touches_a_list(at: &Snapshot, mut quads: impl Iterator<Item = EncodedQuad>) -> bool {
+        let lists = Self::list_vocabulary(at);
+        quads.any(|quad| lists.is_list_fact(triple(quad)))
     }
 
     /// The rules as the delta executor takes them.
