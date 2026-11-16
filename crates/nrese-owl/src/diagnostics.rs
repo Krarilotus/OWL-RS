@@ -92,9 +92,14 @@ impl Diagnostic {
     /// DL forbids but whose meaning is unambiguous: an undeclared property (typed by its
     /// use), a blank node shared by expressions (OWL 1 ontologies do it; the expression
     /// is the same), a structure no axiom uses (it says nothing), an anonymous individual
-    /// in a nominal or `hasValue` (one individual: held as a constant, every model of the
-    /// ontology gives one of it and back, so consistency and every conclusion that doesn't
-    /// name it stay as they are).
+    /// in a nominal or `hasValue`.
+    ///
+    /// *OWL 2 Structural Specification* §11.2 keeps anonymous individuals out of OWL 2 DL in
+    /// more places: in a nominal or `hasValue` (flagged here) and, unflagged, in
+    /// `SameIndividual`, `DifferentIndividuals` or a negative assertion, and in assertions
+    /// whose anonymous individuals don't form its forest. None of them is fatal: why the
+    /// answers on such input stay those of the Direct Semantics, and what witnesses it, is in
+    /// docs/design/owl2-dl.md §16 ("Anonymous individuals where §11.2 keeps them out").
     pub fn is_fatal(&self) -> bool {
         !matches!(
             self,
