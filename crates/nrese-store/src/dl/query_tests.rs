@@ -992,11 +992,11 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
          punning reasons",
         by_indexes[0], by_indexes[1], by_indexes[2], found[0], found[1]
     );
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert!(
         refused * 4 < CASES,
         "{refused} of {CASES} stores or reads refused"
     );
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// A question naming an individual the data doesn't name is decided only where the
