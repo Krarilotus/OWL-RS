@@ -37,6 +37,11 @@ S=$OUT/summary.tsv
     w[$1] += $5 == "wrong"} END {for (k in s) print k, u[k], r[k], w[k]}' "$S" | sort -n > "$OUT/marks.tsv"
   awk -F'\t' '{u += $2; r += $3; w += $4} END {print "marked unsound and wrong", u + 0
     print "marked unsound and right", r + 0; print "not marked and wrong (must be 0)", w + 0}' "$OUT/marks.tsv"
+  # Key rows by outcome; in a run of 100 cases or more each control needs 5 passes by both references.
+  awk -F'\t' '$4 ~ /^(anon|named|mixed)-/ {n[$4 " " $6]++} END {for (k in n) print "key row", k, n[k]}' "$S" | sort
+  awk -F'\t' '!c[$1]++ {all++} $4 ~ /^(named|mixed)-/ {s[$4]; p[$4] += $6 == "pass" && $5 != "reference-undecided"}
+    END {for (r in s) if (all >= 100 && p[r] < 5) print "control not established for " r}' "$S"
   awk -F'\t' '$6 == "set-aside"' "$S" > "$OUT/set-aside.tsv"
   awk -F'\t' '$5 ~ /^declined/' "$S" > "$OUT/declined.tsv"; } > "$OUT/counts.txt"
+! grep -q '^control not established' "$OUT/counts.txt" || { echo "a control not established" >&2; exit 7; }
 exit "${rc:-0}"

@@ -64,8 +64,8 @@ chain | f:p3 owl:propertyChainAxiom ( f:p1 f:p2 ) . f:a0 f:p1 f:a1 . f:a1 f:p2 f
 ";
 
 /// Keys over anonymous individuals, one a line (name | Turtle as in [`TEMPLATES`] | the question
-/// the key answers, an atom of [`QUERIES`] over names | who judges it), each in a case with
-/// probability 1/4. `hermit`: HermiT alone; `both`: a control, where the references must agree.
+/// the key answers, an atom of [`QUERIES`] over names | who judges it), one of them in one case
+/// in three. `hermit`: HermiT alone; `both`: a control, where the references must agree.
 /// OWL 2 DL has no anonymous individual in `owl:sameAs`: such a class comes of a functional `f:pk`.
 const KEYS: &str = "
 anon-object | {C1} owl:hasKey ( {P} ) . f:a1 a {C1} ; {P} _:k1 . f:a2 a {C1} ; {P} _:k1 . | S f:a1 f:a2 | hermit
@@ -217,30 +217,31 @@ fn generate(seed: u64) -> Case {
     let deletable: Vec<usize> = (1..groups.len()).filter(|&g| plain(&groups[g])).collect();
     let deleted = (!deletable.is_empty() && r.one_in(2))
         .then(|| deletable[r.below(deletable.len() as u64) as usize]);
-    // [`KEYS`], from a stream of their own after every other draw, so a seed keeps its case.
+    // In one case in three, one row of [`KEYS`] (two could make each other's `f:a1`, `f:a2` the
+    // same), from a stream of its own after every other draw, so a seed keeps its case.
     let mut k = Rng::new(seed ^ 0x6b65_7973);
-    for line in KEYS.lines() {
+    let rows: Vec<&'static str> = KEYS.lines().filter(|l| l.contains('|')).collect();
+    if k.one_in(3) {
+        let line = rows[k.below(rows.len() as u64) as usize];
         let parts: Vec<&'static str> = line.split('|').map(str::trim).collect();
         let [tag, template, question, by] = parts[..] else {
-            continue;
+            panic!("a row of KEYS: {line}");
         };
-        if k.one_in(4) {
-            let [turtle, question] = fill([template, question], &mut k);
-            let names = Vec::new();
-            groups.push(Group { tag, turtle, names });
-            commits.push(k.one_in(2) as usize);
-            let mut terms = question.split_whitespace();
-            let kind = terms.next().and_then(|t| t.chars().next()).expect("a kind");
-            let pos = vec![(kind, terms.map(|t| T::I(t.replace("f:", F))).collect())];
-            let (values, neg, alone) = (Vec::new(), Vec::new(), Some(by == "hermit"));
-            queries.push(Query {
-                name: tag,
-                values,
-                pos,
-                neg,
-                alone,
-            });
-        }
+        let [turtle, question] = fill([template, question], &mut k);
+        let names = Vec::new();
+        groups.push(Group { tag, turtle, names });
+        commits.push(k.one_in(2) as usize);
+        let mut terms = question.split_whitespace();
+        let kind = terms.next().and_then(|t| t.chars().next()).expect("a kind");
+        let pos = vec![(kind, terms.map(|t| T::I(t.replace("f:", F))).collect())];
+        let (values, neg, alone) = (Vec::new(), Vec::new(), Some(by == "hermit"));
+        queries.push(Query {
+            name: tag,
+            values,
+            pos,
+            neg,
+            alone,
+        });
     }
     Case {
         seed,
@@ -889,11 +890,19 @@ fn dl_answers_agree_with_outside_reasoners() {
                     let tags: BTreeSet<&str> = case.groups.iter().map(|g| g.tag).collect();
                     let tags = tags.into_iter().collect::<Vec<_>>().join(",");
                     for (i, class, detail) in &hermit {
-                        let second = openllet.iter().find(|(j, _, _)| j == i).map(|(_, c, _)| c);
+                        let openllet = openllet.iter().find(|(j, _, _)| j == i);
+                        let second = openllet.map(|(_, c, _)| c);
                         let alone = case.queries.get(*i).and_then(|q| q.alone);
                         let outcome = match (fails(class), second) {
                             // A control's references must agree: else the premise below is wrong.
-                            (_, Some(c)) if alone == Some(false) && c != class => "control-split",
+                            // One giving up while the other agrees with the store is listed apart.
+                            (_, Some(c)) if alone == Some(false) && c != class => {
+                                match [class, c].iter().any(|x| *x == "reference-undecided") {
+                                    true if fails(class) || fails(c) => "FAIL",
+                                    true => "control-undecided",
+                                    false => "control-split",
+                                }
+                            }
                             // A declined write: the class is HermiT's word, the outcome Openllet's.
                             (false, Some(c)) if class.starts_with("declined") => c.as_str(),
                             (false, _) => ["pass", "pass-one"][(alone == Some(true)) as usize],
@@ -905,7 +914,8 @@ fn dl_answers_agree_with_outside_reasoners() {
                         };
                         let (shape, name) = (case.shape, case.name(*i));
                         let row = format!("{seed}\t{shape}\t{tags}\t{name}\t{class}\t{outcome}");
-                        let second = second.map_or("not asked", |c| c.as_str());
+                        let second =
+                            openllet.map_or("not asked".into(), |(_, c, d)| format!("{c}, {d}"));
                         let row = format!("{row}\t{detail}; openllet: {second}");
                         writeln!(summary.lock().expect("summary"), "{row}").expect("summary.tsv");
                         // Written whole, to be read by hand: it shrinks against HermiT alone.
