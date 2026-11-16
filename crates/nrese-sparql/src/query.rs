@@ -201,7 +201,7 @@ pub fn cached_output<'v, V: ReadView>(
     query: &Query,
     options: &QueryOptions,
     format: &str,
-    context: &str,
+    context: &[u8],
 ) -> crate::cache::CachedOutput<'v> {
     use crate::cache::{CachedOutput, ResultCache};
     let (Some(shared), Some(snapshot), None) =

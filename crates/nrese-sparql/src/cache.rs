@@ -431,7 +431,7 @@ pub enum CachedOutput<'s> {
 ///     .parse_query("SELECT * WHERE { ?s ?p ?o }")
 ///     .unwrap();
 /// let snapshot = engine.snapshot();
-/// let slot = match cached_output(&snapshot, &query, &options, "text/csv", "") {
+/// let slot = match cached_output(&snapshot, &query, &options, "text/csv", b"") {
 ///     CachedOutput::Miss(slot) => slot,
 ///     _ => unreachable!("nothing is cached yet"),
 /// };
@@ -452,7 +452,7 @@ pub enum CachedOutput<'s> {
 ///     .unwrap();
 /// let slot = {
 ///     let snapshot = engine.snapshot();
-///     match cached_output(&snapshot, &query, &options, "text/csv", "") {
+///     match cached_output(&snapshot, &query, &options, "text/csv", b"") {
 ///         CachedOutput::Miss(slot) => slot,
 ///         _ => unreachable!("nothing is cached yet"),
 ///     }
