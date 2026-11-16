@@ -197,9 +197,19 @@ fn primary_only(state: &AppState) -> Result<(), ApiError> {
     }
 }
 
+/// A store's refusal to serve a replica, as the transport answers it: a compact primary's
+/// (`StoreError::CompactPrimary`, 409 with its sentence) on every ask, anything else 500.
+fn answered(error: nrese_store::StoreError) -> ApiError {
+    match error {
+        nrese_store::StoreError::CompactPrimary => ApiError::conflict(error.to_string()),
+        error => ApiError::internal(error.to_string()),
+    }
+}
+
 #[utoipa::path(get, path = "/api/v1/replication/log", tag = "replication", params(LogQuery),
     responses((status = 200, description = "The committed records after `after`, back to back (`application/vnd.nrese.log`); headers `x-nrese-records`, `x-nrese-last-revision`, `x-nrese-latest-revision`"),
         (status = 404, description = "This server isn't a primary", body = crate::http::openapi::Problem),
+        (status = 409, description = "A compact primary serves no replica", body = crate::http::openapi::Problem),
         (status = 410, description = "The log no longer holds the records after `after`: start from an image", body = crate::http::openapi::Problem)))]
 /// A replica's feed: the committed records after revision `after`, from the write-ahead
 /// log. Administrators only; a primary's.
@@ -224,10 +234,7 @@ pub async fn log(
                 query.after
             )));
         }
-        Err(error @ nrese_store::StoreError::CompactPrimary) => {
-            return Err(ApiError::conflict(error.to_string()));
-        }
-        Err(error) => return Err(ApiError::internal(error.to_string())),
+        Err(error) => return Err(answered(error)),
     };
     let mut response = (StatusCode::OK, batch.frames).into_response();
     let headers = response.headers_mut();
@@ -244,7 +251,8 @@ pub async fn log(
 
 #[utoipa::path(get, path = "/api/v1/replication/image", tag = "replication",
     responses((status = 200, description = "An image of the latest revision (a checkpoint file); its manifest, as JSON, in `x-nrese-image-manifest`"),
-        (status = 404, description = "This server isn't a primary", body = crate::http::openapi::Problem)))]
+        (status = 404, description = "This server isn't a primary", body = crate::http::openapi::Problem),
+        (status = 409, description = "A compact primary serves no replica", body = crate::http::openapi::Problem)))]
 /// A replica's start: an image of the latest revision, streamed. Administrators only; a
 /// primary's.
 pub async fn image(
@@ -257,14 +265,12 @@ pub async fn image(
     let (dir, manifest) = tokio::task::spawn_blocking(move || {
         let dir =
             tempfile::tempdir_in(&store.config().data_dir).or_else(|_| tempfile::tempdir())?;
-        let manifest = store
-            .replication_image(dir.path())
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        Ok::<_, std::io::Error>((dir, manifest))
+        Ok::<_, std::io::Error>(store.replication_image(dir.path()).map(|m| (dir, m)))
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| ApiError::internal(error.to_string()))?;
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(answered)?;
     let path = dir.path().join(&manifest.file);
     let manifest_json =
         serde_json::to_string(&manifest).map_err(|error| ApiError::internal(error.to_string()))?;

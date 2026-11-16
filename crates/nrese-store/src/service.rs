@@ -1,7 +1,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-use nrese_engine::{Engine, EngineConfig, ReadModel, Snapshot, TermId};
+use nrese_engine::{Engine, EngineConfig, EngineError, ReadModel, Snapshot, TermId};
 use nrese_sparql::CancellationToken;
 
 use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, export_dataset};
@@ -379,7 +379,9 @@ impl StoreService {
         let writer = tx.writer().expect("a transaction holds the writer slot");
         let kept = Certificate::of(tx.base()).and_then(|c| c.ql.clone());
         let reading = self.note_equality(writer, &state);
-        tx.install(reading, Some(self.certificate(state, kept)));
+        // A replica's reads are told `not-certified` ([`crate::StoreConfig::replica`]).
+        let certificate = (!self.config.replica).then(|| self.certificate(state, kept));
+        tx.install(reading, certificate);
     }
 
     /// `state`'s certificate under the store's settings now; `kept`, the QL schema to keep
@@ -577,9 +579,11 @@ impl StoreService {
     }
 
     /// Whether the data is consistent under the recorded reasoning (see
-    /// [`crate::reasoning_state`] for the quarantine this reports).
+    /// [`crate::reasoning_state`] for the quarantine this reports). `Unknown` on a replica:
+    /// it reasons nothing, and its primary's records don't say ([`crate::StoreConfig::replica`]).
     pub fn consistency(&self) -> crate::ConsistencyStatus {
         self.reasoning_state()
+            .filter(|_| !self.config.replica)
             .map_or(crate::ConsistencyStatus::Unknown, |state| {
                 state.consistency()
             })
@@ -1892,7 +1896,8 @@ impl StoreService {
     /// longer holds them (`EngineError::LogTruncated`): the replica starts from an image.
     /// Refused ([`crate::StoreError::CompactPrimary`]) where the version served is stored
     /// over representatives: the records don't say so, and a replica would read them as
-    /// they are.
+    /// they are. Where the log no longer holds them, the version served now answers: a
+    /// replica started again from an image would be refused that image too.
     pub fn replication_log(
         &self,
         after: u64,
@@ -1900,7 +1905,10 @@ impl StoreService {
     ) -> StoreResult<nrese_engine::LogBatch> {
         self.engine
             .log_since(after, max_bytes)
-            .map_err(crate::StoreError::Engine)
+            .map_err(|error| match (error, self.engine.equality()) {
+                (EngineError::LogTruncated { .. }, Some(_)) => crate::StoreError::CompactPrimary,
+                (error, _) => crate::StoreError::Engine(error),
+            })
             .and_then(|batch| match batch.equality {
                 Some(_) => Err(crate::StoreError::CompactPrimary),
                 None => Ok(batch),

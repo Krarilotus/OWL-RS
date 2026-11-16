@@ -152,6 +152,10 @@ pub struct StoreConfig {
     pub shacl_gate: ShaclGate,
     /// The `owl2-dl` mode's settings (`dl.*`), used when the reasoner runs that mode.
     pub dl: crate::dl::DlConfig,
+    /// Opened as a read replica (`replication.mode = "replica"`), set before the open: its
+    /// reasoned reads carry no certificate, from the open on, whatever marker the data
+    /// directory holds; its primary's records carry no certificate either (until v1.6).
+    pub replica: bool,
 }
 
 /// When queries get the OWL 2 QL answers through existentials (`reasoner.ql_rewriting`).
@@ -384,6 +388,7 @@ impl StoreConfig {
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
             dl: crate::dl::DlConfig::default(),
+            replica: false,
         }
     }
 
@@ -423,6 +428,7 @@ impl StoreConfig {
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
             dl: crate::dl::DlConfig::default(),
+            replica: false,
         }
     }
 
