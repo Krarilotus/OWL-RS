@@ -536,21 +536,27 @@ pub(crate) fn answer(
             mark(store, Revision::Decided(&at), status);
         }
     }
-    let status = match &outcome {
-        Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => status,
-    };
+    let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &outcome;
+    refuse_unless_complete(mode, status, || detail.unresolved.clone())?;
+    Ok(outcome)
+}
+
+/// The one rule of exact answers: under [`DlAnswers::Exact`] an answer whose `status` isn't
+/// complete is refused, with that status and the candidates left `unresolved`. Both the
+/// bounds' path ([`answer`]) and the reads past the bounds, before they run
+/// (`StoreService::refuse_exact`), ask it.
+pub(crate) fn refuse_unless_complete(
+    mode: DlAnswers,
+    status: &Completeness,
+    unresolved: impl FnOnce() -> Vec<String>,
+) -> StoreResult<()> {
     if mode == DlAnswers::Exact && !status.complete {
-        let unresolved = match &outcome {
-            Outcome::Stream(_, _, detail) | Outcome::Answers(_, _, detail) => {
-                detail.unresolved.clone()
-            }
-        };
         return Err(StoreError::Incomplete(Box::new(crate::IncompleteAnswer {
             status: status.clone(),
-            unresolved,
+            unresolved: unresolved(),
         })));
     }
-    Ok(outcome)
+    Ok(())
 }
 
 #[cfg(test)]

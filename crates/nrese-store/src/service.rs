@@ -1270,27 +1270,22 @@ impl StoreService {
     }
 
     /// Exact answers asked for under `owl2-dl` on a read past the bounds (the inferred
-    /// statements alone, or a transaction's pending state), which is never proven complete:
-    /// refused before it runs, as [`crate::dl::query::answer`] refuses, with the `status`
-    /// the read would carry.
+    /// statements alone, or a transaction's pending state), which isn't certified complete:
+    /// refused before it runs by the rule the bounds' path follows
+    /// ([`crate::dl::query::refuse_unless_complete`]), with the `status` the read would
+    /// carry, built only when exact answers are asked for.
     fn refuse_exact(
         &self,
         prepared: &PreparedQuery,
         status: impl FnOnce() -> Option<nrese_sparql::Completeness>,
     ) -> StoreResult<()> {
-        let exact = prepared.dl_answers().unwrap_or(self.config.dl.answers);
-        if !self.dl.active() || exact != crate::DlAnswers::Exact {
+        let mode = prepared.dl_answers().unwrap_or(self.config.dl.answers);
+        if !self.dl.active() || mode != crate::DlAnswers::Exact {
             return Ok(());
         }
-        match status() {
-            Some(status) if !status.complete => Err(crate::StoreError::Incomplete(Box::new(
-                crate::IncompleteAnswer {
-                    status,
-                    unresolved: Vec::new(),
-                },
-            ))),
-            _ => Ok(()),
-        }
+        status().map_or(Ok(()), |status| {
+            crate::dl::query::refuse_unless_complete(mode, &status, Vec::new)
+        })
     }
 
     /// What every query gets from the store.
