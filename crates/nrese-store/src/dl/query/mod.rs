@@ -297,35 +297,54 @@ pub(crate) fn mark(store: &StoreService, at: Revision<'_>, completeness: &mut Co
     }
 }
 
+const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, and the \
+                    answers are read from their closure; use the owl2-rl mode, whose \
+                    promise is the rules' reading";
+
 /// Why L may hold what OWL 2 DL doesn't entail, where it may: theorem PR1 of OWL 2
 /// Profiles, by which L's statements are entailed, needs no annotation-property axioms
 /// (OWL 2 DL gives them no meaning for the terms annotated; the rules use them) and no
 /// punning, of which only an equality reaching a class or property name reads otherwise
 /// (OWL 2 DL equates the individuals only; the rules the names too). Off the RL route only,
-/// which both leave (`routed_to_rules` needs neither): one read of the ontology `at`
-/// ([`ontology_at`], a pending one's of its own), whose refusal leaves it unknown.
+/// which both leave (`routed_to_rules` needs neither): what the store's indexes decide
+/// ([`by_index`]), else one read of the ontology `at` ([`ontology_at`], a pending one's of
+/// its own), whose refusal leaves it unknown.
 fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
-    const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, and the \
-                        answers are read from their closure; use the owl2-rl mode, whose \
-                        promise is the rules' reading";
-    let (snapshot, ontology) = match at {
+    let (snapshot, pending) = match at {
         Revision::Decided((_, view)) if view.rules => return None,
-        Revision::Decided((snapshot, _)) => (snapshot, ontology_at(store, snapshot)),
-        Revision::Committed(snapshot) => (snapshot, ontology_at(store, snapshot)),
-        Revision::Pending(snapshot) => (snapshot, read_ontology(store, snapshot)),
+        Revision::Decided((snapshot, _)) => (snapshot, false),
+        Revision::Committed(snapshot) => (snapshot, false),
+        Revision::Pending(snapshot) => (snapshot, true),
     };
-    let Ok(ontology) = ontology else {
+    if let Some(decided) = by_index(snapshot) {
+        return decided;
+    }
+    #[cfg(test)]
+    cancellation_tests::ONTOLOGY_PASSES.set(cancellation_tests::ONTOLOGY_PASSES.get() + 1);
+    let read = if pending { read_ontology } else { ontology_at };
+    let Ok(ontology) = read(store, snapshot) else {
         return Some(format!(
             "whether OWL 2 DL reads the ontology otherwise than the OWL 2 RL rules isn't known \
              ({}): {ONLY}",
             source::refused("the revision")
         ));
     };
+    by_ontology(snapshot, ontology.value())
+}
+
+/// What the store's indexes decide of [`reads_differently`] without the ontology: `Some`
+/// with the reason or with none, `None` where only the ontology decides.
+fn by_index(_snapshot: &Snapshot) -> Option<Option<String>> {
+    None
+}
+
+/// [`reads_differently`] of `snapshot`'s whole `ontology`.
+fn by_ontology(snapshot: &Snapshot, ontology: &Ontology) -> Option<String> {
     let name = |t: u64| {
         let term = snapshot.decode(TermId::from_raw(t));
         term.map_or_else(|| format!("term {t}"), |term| term.to_string())
     };
-    if let Some(&property) = ontology.value().annotation_schema.first() {
+    if let Some(&property) = ontology.annotation_schema.first() {
         return Some(format!(
             "{} has annotation-property axioms, which OWL 2 DL gives no meaning for the terms \
              it annotates: {ONLY}, or remove them",
@@ -333,7 +352,7 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
         ));
     }
     let same_as = snapshot.lookup(NamedNodeRef::new_unchecked(OWL_SAME_AS).into())?;
-    let equated = nrese_owl::profile::punned(ontology.value())
+    let equated = nrese_owl::profile::punned(ontology)
         .into_iter()
         .find(|&t| {
             let equal = nrese_engine::QuadPattern {
