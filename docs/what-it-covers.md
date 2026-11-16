@@ -50,7 +50,7 @@ reason, beside its runner.
 | Read [Notation3](https://w3c.github.io/N3/spec/) data, in the library | Only what RDF can hold; rules are read by the reasoner. Not offered over HTTP. W3C N3 group's parser tests, one known failure listed ([runner](../crates/rdf/nrese-rdf-io/tests/w3c_n3)) |
 | RDF4J Binary RDF, versions 1 and 2 | Read in both versions, written as version 2; as a payload and a result format |
 | [RDF Dataset Canonicalization](https://www.w3.org/TR/rdf-canon/) (RDFC-1.0) | |
-| Bulk loading, N-Triples and N-Quads read on all cores; statements that don't parse are quarantined, not fatal ([loading data](ops/server-setup.md#loading-data)) | Malformed XML or JSON and read errors still stop the load, and strict mode stops at the first bad statement ([quarantine](design/quarantine.md)) |
+| Bulk loading, N-Triples and N-Quads read on all cores; statements that don't parse are quarantined, not fatal ([loading data](ops/server-setup.md#loading-data)) | A cut-off file, or another error the loader can't read past, stops the load with nothing loaded ([which](ops/server-setup.md#loading-data)); strict mode stops at the first bad statement ([quarantine](design/quarantine.md)) |
 
 ## Reasoning
 

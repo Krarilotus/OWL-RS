@@ -10,7 +10,7 @@ store whose asserted data is inconsistent. This one holds statements that are no
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="../img/quarantine-dark.svg">
-  <img src="../img/quarantine-light.svg" width="480" alt="A bulk load sends valid statements to the data, what queries, reasoning and exports see. A statement with a syntax error goes to the quarantine, kept with its file and reason, and its text and line where known; it is not data. Re-admission, drawn dashed: fixed if need be, it is checked like any write; refused, it stays in quarantine; otherwise it becomes data. Today re-admission is a store function only; its HTTP API and command are proposed. With --strict, a syntax error stops the whole load, and none of it is committed.">
+  <img src="../img/quarantine-light.svg" width="480" alt="A bulk load sends valid statements to the data, what queries, reasoning and exports see. A statement with a syntax error goes to the quarantine, kept with its file and reason, and its text and line where known; it is not data. Re-admission, drawn dashed: fixed if need be, it is checked like any write; refused, it stays in quarantine; otherwise it becomes data. Today re-admission is a store function only; its HTTP API and command are proposed. A cut-off file, or another error the loader can't read past, stops the whole load, as a syntax error does with --strict; none of it is committed.">
 </picture>
 
 ## 1. The rule

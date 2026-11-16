@@ -1,7 +1,7 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 511" width="400" height="511" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 530" width="400" height="530" role="img" aria-labelledby="title desc">
 <!-- Generated; the light and dark variants differ only in <style>. -->
 <title id="title">Invalid statements in a bulk load</title>
-<desc id="desc">A bulk load sends valid statements to the data, what queries, reasoning and exports see. A statement with a syntax error goes to the quarantine, kept with its file and reason, and its text and line where known; it is not data. Re-admission, drawn dashed: fixed if need be, it is checked like any write; refused, it stays in quarantine; otherwise it becomes data. Today re-admission is a store function only; its HTTP API and command are proposed. With --strict, a syntax error stops the whole load, and none of it is committed.</desc>
+<desc id="desc">A bulk load sends valid statements to the data, what queries, reasoning and exports see. A statement with a syntax error goes to the quarantine, kept with its file and reason, and its text and line where known; it is not data. Re-admission, drawn dashed: fixed if need be, it is checked like any write; refused, it stays in quarantine; otherwise it becomes data. Today re-admission is a store function only; its HTTP API and command are proposed. A cut-off file, or another error the loader can't read past, stops the whole load, as a syntax error does with --strict; none of it is committed.</desc>
 <style>
   text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #1F2328; }
   .paper { fill: #FFFFFF; }
@@ -31,7 +31,7 @@
   .flow-refused { fill: none; stroke: #B42318; stroke-width: 1.4; }
 </style>
 <defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow" d="M1 1 L9 5 L1 9"/></marker><marker id="head-refused" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow-refused" d="M1 1 L9 5 L1 9"/></marker></defs>
-<rect class="paper" x="0" y="0" width="400" height="511" rx="0"/>
+<rect class="paper" x="0" y="0" width="400" height="530" rx="0"/>
 <rect class="box" x="0" y="0" width="400" height="34" rx="6"/>
 <text x="14" y="22" class="name">Bulk load</text>
 <text x="46" y="59" class="edge">valid</text>
@@ -55,6 +55,7 @@
 <text x="14" y="423" class="name">Data</text>
 <text x="14" y="445" class="text">what queries, reasoning and exports see</text>
 <path class="flow" d="M34 36 V394" marker-end="url(#head)"/>
-<text x="1" y="484" class="muted"><tspan class="muted">With </tspan><tspan class="code">--strict</tspan><tspan class="muted">, a syntax error stops the whole load,</tspan></text>
-<text x="1" y="503" class="muted">and none of it is committed.</text>
+<text x="1" y="484" class="muted">A cut-off file, or another error the loader can't</text>
+<text x="1" y="503" class="muted">read past, stops the whole load, as a syntax error</text>
+<text x="1" y="522" class="muted"><tspan class="muted">does with </tspan><tspan class="code">--strict</tspan><tspan class="muted">; none of it is committed.</tspan></text>
 </svg>

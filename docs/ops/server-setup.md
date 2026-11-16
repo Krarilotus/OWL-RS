@@ -198,11 +198,30 @@ docker start nrese
   their graphs. Blank nodes are fresh for each load.
 - `--replace` replaces the dataset instead of adding to it.
 - A statement that can't be read goes to the repository's [quarantine](../design/quarantine.md),
-  and the load goes on (`store.invalid_statements = "quarantine"`, the default). There it is kept
-  with its file, line and reason, out of queries, reasoning and exports, until it is fixed and
-  admitted through the usual checks, or discarded. The load prints the count and the first few.
-  With `--strict` the first one stops the load, and nothing of it is committed. Malformed XML or
-  JSON, and files that can't be read, always stop it.
+  and the load goes on (`store.invalid_statements = "quarantine"`, the default), where the loader
+  can read past it: a line in N-Triples and N-Quads, a statement up to its `.` in Turtle and
+  TriG, a node element below `rdf:RDF` in RDF/XML, a top-level node object in JSON-LD. There it
+  is kept with its file and reason, and its text and line where known, out of queries, reasoning
+  and exports, until it is fixed and admitted through the usual checks, or discarded. The load
+  prints the count and the first few.
+- An error the loader can't read past stops the load, and nothing of it is loaded or
+  quarantined: a file that ends inside a statement or a directive (cut off, say), malformed XML
+  or JSON, any error in N3 or Binary RDF, a file that can't be read, and in Turtle and TriG a
+  string that never closes, or a short one (`"…"`, `'…'`) broken by a line break that doesn't
+  close within 1 MiB. With `--strict` the first error of any kind stops it. The message names
+  the file and, where it can, the line the open statement starts on, says what is still open (a
+  statement, an element, a string), and ends with `nothing was loaded`.
+  Check that the file is complete (download it again, or compare its size or checksum with the
+  source's); if only its last statement is broken, fix or delete it and load again. A file cut
+  exactly at a statement's end can't be told from a complete one, and loads.
+- A load or import that stops changes no answer, in the running server and after a restart:
+  queries, `/readyz` and the consistency report stay as they were. A disk error is the
+  exception: if writing the load's result fails, the data stays unchanged, but the reasoning has
+  to be run again; if it fails while the reasoning's marker file is being removed, nothing is
+  loaded and the server answers as before, but a restart may find the marker gone and derive the
+  inferences again. While a load that commits writes its result, queries still see the old data,
+  but without the answers that need its inferences to be current (OWL 2 QL's answers through
+  existentials, say).
 - A load isn't refused the way a write is: the SHACL gate doesn't run, and a load that leaves
   the data inconsistent under the ruleset exits `1` with the count of violations, the data stays
   loaded, and the server starts in quarantine.
