@@ -20,9 +20,12 @@ const OUTSIDE_RL: &str = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :
 const NAMES: &str = ":C a owl:Class . :D a owl:Class . :x a owl:NamedIndividual . \
                      :v a owl:NamedIndividual .";
 
-/// Whether a reason says the reader left an axiom out.
+/// Whether a reason says the reader left an axiom out whose statements the rules may still
+/// read: the mark's, not the consistency verdict's, which says only that it isn't known.
 fn says_left_out(reasons: &[String]) -> bool {
-    reasons.iter().any(|r| r.contains("leaves out"))
+    reasons
+        .iter()
+        .any(|r| r.contains("left out") && r.contains("may still read"))
 }
 
 /// (case, data, read): every read not entailed, the last case's answer `false` (a broken
@@ -146,6 +149,25 @@ fn every_read_over_an_axiom_the_reader_leaves_out_is_unsound() {
     assert_eq!(cases.len(), 13, "the table's rows");
 }
 
+/// The store's consistency verdict over each case: `unknown`, never `consistent`, though U1,
+/// built from what the reader kept, may prove that part consistent: consistent only if
+/// nothing of the source was left out (`dl::consistency::check`).
+#[test]
+fn a_store_with_a_left_out_axiom_is_not_told_consistent() {
+    let mut wrong = Vec::new();
+    for (name, data, _) in cases() {
+        for extra in ["", OUTSIDE_RL] {
+            let dl = pipeline();
+            insert(&dl, &format!("{data} {NAMES} {extra}")).expect("committed");
+            let verdict = dl.store().dl().status().map(|s| s.consistency.verdict);
+            if verdict.as_ref().map(|v| v.as_str()) != Some("unknown") {
+                wrong.push(format!("{name} {extra}: {verdict:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The other paths that report a status read the same record: EXPLAIN, the plan, a read of
 /// the inferred statements alone, the store's status of them (`status_without_dl`), and a
 /// read with an addition pending.
@@ -205,11 +227,15 @@ fn every_path_that_reports_a_status_tells_the_left_out_axiom() {
 }
 
 /// A pending addition of such an axiom over a store without one: the read inside the
-/// transaction is told it before the commit.
+/// transaction is told from its base, and its own additions aren't reasoned over before the
+/// commit, which the transaction's reason says: `sound-only`, not `unsound`, a limit of a
+/// read in a transaction (the commit's gate judges the addition). Committed, the store's
+/// reads are `unsound`.
 #[test]
-fn a_pending_addition_of_a_left_out_axiom_is_told_before_its_commit() {
+fn a_pending_addition_of_a_left_out_axiom_is_told_at_its_commit() {
     let dl = pipeline();
     insert(&dl, NAMES).expect("committed");
+    let axiom = format!("<{RDF}value> rdfs:domain :C . :x <{RDF}value> :v .");
     let add = StatementOp::Add {
         data: ntriples(&format!(
             "<{RDF}value> <http://www.w3.org/2000/01/rdf-schema#domain> <http://example.com/C> .\n\
@@ -221,8 +247,36 @@ fn a_pending_addition_of_a_left_out_axiom_is_told_before_its_commit() {
     let status = status.expect("a status");
     let reasons: Vec<String> = status.reasons.iter().map(|r| r.text.clone()).collect();
     assert!(
-        status.as_str() == "unsound" && says_left_out(&reasons),
-        "{rows} {status:?}"
+        status.as_str() == "sound-only" && !says_left_out(&reasons),
+        "pending: {rows} {status:?}"
+    );
+    insert(&dl, &axiom).expect("committed");
+    let (rows, status) = query(&dl, "SELECT ?x { ?x a :C }");
+    let (label, reasons) = (status.shared.as_str(), status.reasons());
+    assert!(
+        label == "unsound" && says_left_out(&reasons),
+        "committed: {rows:?} {label} {reasons:?}"
+    );
+}
+
+/// Without the consistency check (`dl.consistency = off`) no verdict says what the reader
+/// left out: the mark reads the ontology itself, and the read is `unsound` all the same.
+#[test]
+fn without_the_consistency_check_a_left_out_axiom_is_still_told() {
+    let dl = super::pipeline_with(nrese_store::DlConfig {
+        consistency: nrese_store::DlConsistency::Off,
+        ..nrese_store::DlConfig::default()
+    });
+    insert(
+        &dl,
+        &format!("<{RDF}value> rdfs:domain :C . :x <{RDF}value> :v . {NAMES}"),
+    )
+    .expect("committed");
+    let (rows, status) = query(&dl, "ASK { :x a :C }");
+    let (label, reasons) = (status.shared.as_str(), status.reasons());
+    assert!(
+        label == "unsound" && says_left_out(&reasons),
+        "{rows:?} {label} {reasons:?}"
     );
 }
 
