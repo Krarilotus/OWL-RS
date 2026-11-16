@@ -334,9 +334,11 @@ impl Engine {
     /// published at `dictionary_len` entries (the writer slot held).
     fn apply_record(&self, record: &CommitRecord, dictionary_len: u64) -> EngineResult<()> {
         let shared = &self.inner.shared;
-        // Equality classes are found again where `sameAs` statements changed.
-        let same_as = *shared.equality.read();
-        let changes_equality = same_as.is_some_and(|same_as| {
+        // Equality classes are found again where `sameAs` statements changed. The record is
+        // read as the replica's installed stack is: the records don't carry the primary's
+        // reading.
+        let same_as = shared.versions.load().reading;
+        let regroup = same_as.is_some_and(|same_as| {
             record
                 .inserts
                 .iter()
@@ -349,7 +351,7 @@ impl Engine {
                     .any(|t| t.predicate == same_as)
         });
         self.inner
-            .publish_record(record, false, None, dictionary_len, changes_equality, None)
+            .publish_record(record, false, None, dictionary_len, regroup, same_as, None)
             .map(|_| ())
     }
 }
@@ -802,6 +804,7 @@ mod tests {
                 committed_micros: current.committed_micros,
                 dictionary_len: current.dictionary_len,
                 equality: std::sync::Arc::clone(&current.equality),
+                reading: current.reading,
                 content: current.content,
                 asserted_content: current.asserted_content,
                 canonical: Default::default(),
