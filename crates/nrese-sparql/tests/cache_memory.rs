@@ -93,7 +93,7 @@ fn the_result_cache_holds_no_more_heap_than_its_budget() {
                     // The answer's bytes too, as the store keeps them.
                     let format = "text/tab-separated-values";
                     if let CachedOutput::Miss(slot) =
-                        cached_output(&snapshot, query, &options, format, "")
+                        cached_output(&snapshot, query, &options, format, b"")
                     {
                         let mut written = Vec::new();
                         let tsv = nrese_sparql::ResultsFormat::Tsv;
@@ -165,7 +165,7 @@ fn equal_context_output_hits_stay_within_the_cache_budget() {
             for marker in *b"abcd" {
                 let context = String::from_utf8(vec![marker; 32 << 10]).unwrap();
                 let CachedOutput::Miss(slot) =
-                    cached_output(&snapshot, &query, &options, format, &context)
+                    cached_output(&snapshot, &query, &options, format, context.as_bytes())
                 else {
                     panic!("each distinct context must start with a miss");
                 };
@@ -180,7 +180,7 @@ fn equal_context_output_hits_stay_within_the_cache_budget() {
                 for marker in *b"abcd" {
                     let context = String::from_utf8(vec![marker; 32 << 10]).unwrap();
                     let CachedOutput::Hit(bytes) =
-                        cached_output(&snapshot, &query, &options, format, &context)
+                        cached_output(&snapshot, &query, &options, format, context.as_bytes())
                     else {
                         panic!("all four admitted answers must be hits");
                     };
