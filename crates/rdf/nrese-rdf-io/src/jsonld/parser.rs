@@ -87,6 +87,7 @@ fn processing(error: JsonLdError) -> RdfParseError {
         error.to_string(),
         TextPosition::default()..TextPosition::default(),
     )
+    .without_lines()
     .into()
 }
 
@@ -132,7 +133,9 @@ impl<'a> JsonLdParser<'a> {
             Ok(false) => None,
             // The state says whether to go on: a step that fails leaves it `Done`, unless
             // it skipped one element of a stream and recovers.
-            Err(error) => Some(Err(error)),
+            Err(error) => Some(Err(
+                error.ending(matches!(self.core.state, State::Done), false)
+            )),
         }
     }
 

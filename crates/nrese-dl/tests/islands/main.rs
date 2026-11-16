@@ -604,3 +604,51 @@ fn touched_islands_decide_as_a_cold_check_does() {
          incrementally, {inconsistent} inconsistent"
     );
 }
+
+/// `chain(1)`'s individual, another in `A`, and `statement` over 300 (and 301): the islands'
+/// sizes as the split gives them, the batches holding `statement`, and the verdict by islands
+/// against the whole ABox's.
+fn split_beside(statement: Option<Axiom>, sizes: &[usize]) {
+    let mut o = chain(1, false);
+    let a = ExprId(o.classes.intern(ClassExpr::Class(1)));
+    o.axioms.push(Axiom::ClassAssertion(a, 200));
+    o.axioms.extend(statement.clone());
+    o.sources = vec![Vec::new(); o.axioms.len()];
+    let Split::Islands(split) = islands::split(&o) else {
+        panic!("{statement:?}: decided whole");
+    };
+    assert_eq!(split.sizes, sizes, "{statement:?}: the islands' sizes");
+    if let Some(statement) = &statement {
+        let holding = split
+            .batches
+            .iter()
+            .filter(|b| b.axioms.contains(statement));
+        assert_eq!(holding.count(), 1, "{statement:?}: batches holding it");
+    }
+    let config = Config::default();
+    assert_eq!(
+        islands::by_islands(&o, &config).answer,
+        tableau::consistency(&o, &config).answer,
+        "{statement:?}: by islands and whole"
+    );
+}
+
+/// `a owl:sameAs a` is read as a `SameIndividual` of one member (the reader removes the
+/// repeat): it sits in its member's island, and the ABox splits and decides as it does whole.
+#[test]
+fn a_one_member_same_individual_splits_with_its_member() {
+    split_beside(Some(Axiom::SameIndividual(vec![300])), &[1, 1, 1]);
+}
+
+/// A `DifferentIndividuals` of one member sits in its member's island as well.
+#[test]
+fn a_one_member_different_individuals_splits_with_its_member() {
+    split_beside(Some(Axiom::DifferentIndividuals(vec![300])), &[1, 1, 1]);
+}
+
+/// The controls: two members join their island; no statement leaves two islands.
+#[test]
+fn two_members_and_none_split_as_before() {
+    split_beside(Some(Axiom::SameIndividual(vec![300, 301])), &[2, 1, 1]);
+    split_beside(None, &[1, 1]);
+}

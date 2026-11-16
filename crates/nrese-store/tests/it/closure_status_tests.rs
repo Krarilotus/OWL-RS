@@ -396,6 +396,55 @@ fn owl2_dl_reading_inside_a_transaction_labels_it_unsound() {
     assert_eq!(status.map(|s| s.as_str()), Some("unsound"));
 }
 
+/// The reasons a read inside a transaction gives its user, word for word: under `owl2-dl`,
+/// with an update pending that may delete, that the pending operations aren't reasoned over,
+/// and that their deletions' inferences remain until the commit.
+#[test]
+fn a_read_inside_a_transaction_gives_its_reasons_as_written() {
+    let dl = pipeline();
+    insert(&dl, SAME_AS.0).expect("data");
+    let store = dl.store();
+    let prepared = store
+        .prepare_query(&SparqlQueryRequest::all(format!("{PREFIXES}{}", SAME_AS.1)))
+        .expect("prepared");
+    let pending = StatementsRequest::new(vec![StatementOp::Update(
+        nrese_store::SparqlUpdateRequest::new(format!("{PREFIXES}DELETE DATA {{ :rex a :Dog }}")),
+    )]);
+    let (mut out, mut status) = (Vec::new(), None);
+    store
+        .run_query_pending_reporting(
+            &pending,
+            &prepared,
+            &CancellationToken::new(),
+            &mut out,
+            |s| status = s,
+        )
+        .expect("answered");
+    let reasons: Vec<_> = status
+        .expect("a status")
+        .reasons
+        .iter()
+        .map(|r| (r.source, r.text.clone()))
+        .collect();
+    for want in [
+        (
+            "dl",
+            "a read inside a transaction: its pending operations aren't reasoned over before \
+             the commit (the committed closure, no DL bounds)",
+        ),
+        (
+            "transaction",
+            "the pending operations may delete statements whose inferences remain until the \
+             commit",
+        ),
+    ] {
+        assert!(
+            reasons.iter().any(|(s, t)| (*s, t.as_str()) == want),
+            "{want:?} not in {reasons:#?}"
+        );
+    }
+}
+
 /// Spec (docs/spec/reasoning-semantics.md, `exact-refusals`): under `owl2-dl`, `exact`
 /// refuses a read of the inferred statements alone, and one inside a transaction with an
 /// addition pending, before it runs: the query never reaches the executor and writes no
@@ -1433,6 +1482,81 @@ fn a_computed_string_or_iri_at_a_patterns_end_is_marked_sound_only() {
             if !rows.contains("example.com/a0") || status != ["sound-only"; 2] {
                 wrong.push(format!("{regime} {read}: {rows} {status:?}"));
             }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `:a0`'s value of `:p` is the integer 5, written `"05"`: `2 + 3` and a copy of `5` are the
+/// same value.
+const FIVE: &str = ":p a owl:DatatypeProperty . :a0 :p \"05\"^^xsd:integer .";
+
+/// [`owl2_dl_calls_no_answer_complete_that_a_constants_other_spelling_misses`] under
+/// `owl2-rl` with the QL rewriting on, whose `complete` is the same promise ("no certain
+/// answer under the OWL 2 Direct Semantics is missing", docs/spec/reasoning-semantics.md):
+/// a constant in the pattern, through `VALUES` and through `BIND`, a computed value and a
+/// copy. Spec: an answer that misses the stored value's other spelling isn't `complete`.
+#[test]
+fn owl2_rl_with_the_rewriting_calls_no_answer_complete_that_a_constants_other_spelling_misses() {
+    let store = |data: &str| closure(data, Ruleset::Owl2Rl, QlRewritingMode::On);
+    let wrong = misses_and_says_complete(
+        store,
+        &[
+            (
+                PLUS_TWO,
+                "SELECT ?v { ?v :d1 \"+2\"^^xsd:integer }",
+                &["a0"],
+            ),
+            (
+                PLUS_TWO,
+                "SELECT ?v { VALUES ?n { \"+2\"^^xsd:integer } ?v :d1 ?n }",
+                &["a0"],
+            ),
+            (
+                PLUS_TWO,
+                "SELECT ?v { BIND(\"+2\"^^xsd:integer AS ?n) ?v :d1 ?n }",
+                &["a0"],
+            ),
+            (FIVE, "SELECT ?x { BIND(2 + 3 AS ?c) ?x :p ?c }", &["a0"]),
+            (
+                FIVE,
+                "SELECT ?x { BIND(5 AS ?c) BIND(?c AS ?d) ?x :p ?d }",
+                &["a0"],
+            ),
+        ],
+    );
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The controls under `owl2-rl`. Without the rewriting its answers are never `complete`
+/// (docs/spec/reasoning-semantics.md, "What `complete` refers to"): a typed constant in
+/// either spelling, or a string, leaves them `sound-only`. With the rewriting a string
+/// constant (one spelling per value) and a typed constant only compared in a `FILTER`
+/// (by value) miss nothing and stay `complete`. Spec: run and planned, each answer holds
+/// `:a0` where `:a0` is stored in the read's spelling, with that status.
+#[test]
+fn owl2_rl_keeps_its_status_without_the_rewriting_and_where_no_spelling_is_missed() {
+    let name = ":name a owl:DatatypeProperty . :a0 :name \"Rex\" .";
+    let string = "SELECT ?v { ?v :name \"Rex\" }";
+    let filter = "SELECT ?v { ?v :d1 ?a BIND(1 AS ?n) FILTER(?a > ?n) }";
+    let two = "SELECT ?v { ?v :d1 \"2\"^^xsd:integer }";
+    let plus_two = "SELECT ?v { ?v :d1 \"+2\"^^xsd:integer }";
+    let (auto, on) = (QlRewritingMode::Auto, QlRewritingMode::On);
+    let cases = [
+        (auto, PLUS_TWO, two, true, "sound-only"),
+        (auto, PLUS_TWO, plus_two, false, "sound-only"),
+        (auto, name, string, true, "sound-only"),
+        (on, name, string, true, "complete"),
+        (on, PLUS_TWO, filter, true, "complete"),
+    ];
+    let mut wrong = Vec::new();
+    for (ql, data, read, holds, expected) in cases {
+        let (rows, status) = answer(&closure(data, Ruleset::Owl2Rl, ql), read);
+        eprintln!("{ql:?} {read}: {rows} {status:?}");
+        if rows.contains("example.com/a0\"") != holds || status != [expected; 2] {
+            wrong.push(format!(
+                "{ql:?} {read}: {rows} {status:?}, expected {expected}"
+            ));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
