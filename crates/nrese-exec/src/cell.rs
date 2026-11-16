@@ -39,6 +39,10 @@ pub enum Kind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Busy;
 
+/// How often an asleep waiter with a stop asks it: the stores' stops are flags, polled, not
+/// signalled. Waiters without one sleep until woken.
+const STOP_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
@@ -77,12 +81,16 @@ impl<V> Build<V> {
     /// helped with until then; [`Busy`] at once on a pool thread for an opaque build that
     /// isn't over.
     pub fn wait(&self) -> Result<Option<Arc<V>>, Busy> {
-        self.wait_until(&|| false).unwrap_or(Err(Busy)) // never given up
+        self.wait_until(None).unwrap_or(Err(Busy)) // never given up
     }
 
     /// [`Self::wait`], given up (`None`) when `stop` fires, which an asleep waiter asks
-    /// every 50 ms; the build goes on.
-    pub fn wait_until(&self, stop: &dyn Fn() -> bool) -> Option<Result<Option<Arc<V>>, Busy>> {
+    /// every 50 ms (`STOP_POLL`); the build goes on. A waiter helping with a slice asks once it
+    /// is done, so a sliced build's slice bounds how late it gives up.
+    pub fn wait_until(
+        &self,
+        stop: Option<&dyn Fn() -> bool>,
+    ) -> Option<Result<Option<Arc<V>>, Busy>> {
         loop {
             let work = {
                 let state = lock(&self.state);
@@ -101,7 +109,7 @@ impl<V> Build<V> {
             if let Some(done) = &state.done {
                 return Some(Ok(done.clone()));
             }
-            if stop() {
+            if stop.is_some_and(|stop| stop()) {
                 return None;
             }
             let same = match (&state.work, &work) {
@@ -111,11 +119,18 @@ impl<V> Build<V> {
             };
             if same {
                 self.waiting.fetch_add(1, Ordering::SeqCst);
-                state = self
-                    .changed
-                    .wait_timeout(state, std::time::Duration::from_millis(50))
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .0;
+                state = match stop {
+                    Some(_) => {
+                        self.changed
+                            .wait_timeout(state, STOP_POLL)
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .0
+                    }
+                    None => self
+                        .changed
+                        .wait(state)
+                        .unwrap_or_else(PoisonError::into_inner),
+                };
                 self.waiting.fetch_sub(1, Ordering::SeqCst);
             }
             drop(state);
