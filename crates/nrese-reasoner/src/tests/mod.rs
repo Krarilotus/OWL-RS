@@ -16,6 +16,20 @@ mod sources;
 mod stops;
 mod support_refusal;
 
+/// A `sameAs` class of a blank node and an IRI is represented by the IRI, whatever their
+/// numbers within their kinds: the largest IRI id against the smallest blank node's. The
+/// key rule's exemption over representatives rests on it (`owl2-dl`'s `prp-key` keeps
+/// blank nodes out on the representative).
+#[test]
+fn a_class_with_an_iri_has_an_iri_representative() {
+    use nrese_engine::{TermId, TermKind};
+    let iri = TermId::kind_range(TermKind::Iri).1.raw();
+    let blank = TermId::kind_range(TermKind::BlankNode).0.raw();
+    let mut classes = super::representatives::EqualityClasses::default();
+    classes.union(blank, iri);
+    assert_eq!(classes.representative(blank), iri);
+}
+
 const EX: &str = "http://example.com/";
 
 /// Parses `s p o` lines of prefixed names (`ex:`, `rdf:`, `rdfs:`, `owl:`); `_:x` are
