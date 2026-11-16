@@ -54,6 +54,9 @@ enum Case {
     Stray,
     /// The same, with more than the window after the quote: the load stops.
     StrayFar,
+    /// Turtle and TriG: statement 20, on this line, bad and longer than the parser's buffer
+    /// (64 KiB), so it is read across a refill. Its record is where it starts.
+    LongBad(usize),
     /// A directory where the file should be: a read error at the first read.
     Unreadable,
 }
@@ -172,7 +175,7 @@ fn broken(row: (RdfFormat, Case, bool), file: &str, seen: &Seen) -> Vec<&'static
             vec![
                 (seen.committed == 0 && q == 0, "a stop commits and quarantines nothing"),
                 (!matches!(case, Case::Whole | Case::NoLastLineEnd), "a well-formed file loads"),
-                (strict || !matches!(case, Case::BadStatement | Case::Stray) || !goes_on, "a format that goes on does"),
+                (strict || !matches!(case, Case::BadStatement | Case::Stray | Case::LongBad(_)) || !goes_on, "a format that goes on does"),
                 (case != Case::StrayFar || says(file) && says("line 2, ") && !says("ends inside"), "a string not closed within the window names its file and line"),
                 (!cut || says(file), "a cut names the file"),
                 (!worded || says("ends inside a statement"), "a cut says the file ends inside one"),
@@ -189,6 +192,7 @@ fn broken(row: (RdfFormat, Case, bool), file: &str, seen: &Seen) -> Vec<&'static
             // Its reason says what the parser knows: RDF/XML the byte, JSON-LD nothing more.
             let said = |s: &QuarantinedStatement| s.reason.starts_with("byte ") == (format == RdfXml);
             let said = seen.quarantined.iter().all(|s| !s.reason.contains("line ") && said(s));
+            let starts = |line| seen.quarantined.iter().all(|s| (s.line, s.column) == (line as u64, 1));
             vec![
                 (!matches!(case, Case::Cut(_) | Case::Unclosed(_) | Case::Unreadable), "Ok: every byte read, none cut"),
                 (case != Case::StrayFar, "a string not closed within the window stops"),
@@ -197,6 +201,7 @@ fn broken(row: (RdfFormat, Case, bool), file: &str, seen: &Seen) -> Vec<&'static
                 (!without_text || unplaced, "quarantined at no position the parser doesn't know"),
                 (!without_text || said, "a record's reason says what is known, and no line"),
                 (!strict || q == 0, "strict quarantines nothing"),
+                (if let Case::LongBad(line) = case { starts(line) } else { true }, "a record is where its statement starts"),
             ]
         }
     };
@@ -229,6 +234,11 @@ fn a_load_reads_each_file_to_its_end_or_stops() {
             let line = document[..at].iter().filter(|&&b| b == b'\n').count() + 1;
             let unclosed = replace_once(&document, br#""v1""#, br#"[ <http://example.com/q> "v1""#);
             cases.push((Case::Unclosed(line), unclosed));
+            let at = find_once(&document, br#""v20""#);
+            let line = document[..at].iter().filter(|&&b| b == b'\n').count() + 1;
+            let long = format!("\"v20{}\" \"extra\"", "x".repeat(70_000));
+            let long = replace_once(&document, br#""v20""#, long.as_bytes());
+            cases.push((Case::LongBad(line), long));
             for (case, n) in [(Case::Stray, N), (Case::StrayFar, FAR)] {
                 let statement = |k| match k {
                     1 => format!("<{EX}s1> <{EX}p> \"stray .\n"),
