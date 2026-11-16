@@ -1090,7 +1090,8 @@ async fn transaction_deletes_of_a_default_graph_alias_stay_in_the_default_graph(
 /// `core/rio/api/src/main/java/org/eclipse/rdf4j/rio/RDFFormat.java`), as an RDF4J client sends
 /// it to `/statements`: each is stored, or refused (415) where taking it could guess a payload
 /// wrong: `application/xml` and `text/xml` (TriX and SPARQL results are XML too), `text/plain`
-/// (any text), `text/n3` and `text/rdf+n3` (N3 beyond Turtle; we read no N3).
+/// (any text), `text/n3` and `text/rdf+n3` (the HTTP endpoints have no N3 format, in or out;
+/// only the bulk loader reads N3 files).
 #[tokio::test]
 async fn statements_take_rdf4j_media_types_or_refuse_the_ambiguous() {
     const NT: &str = "<http://example.com/s> <http://example.com/p> \"o\" .\n";
