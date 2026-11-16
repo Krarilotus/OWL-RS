@@ -804,6 +804,7 @@ fn background_checkpoints_bound_the_wal() {
             recover_until: None,
             recover_until_micros: None,
             wal_damage: WalDamage::Refuse,
+            forget_on_cut: None,
         },
         ..EngineConfig::default()
     };
