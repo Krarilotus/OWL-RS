@@ -745,7 +745,7 @@ impl StoreService {
     /// holds triple terms) announce it ([`PreparedQuery::announce_rdf12`]).
     pub fn prepare_query(&self, request: &SparqlQueryRequest) -> StoreResult<PreparedQuery> {
         let mut prepared = PreparedQuery::parse_with(request, Some(&self.namespaces.all()))?;
-        if prepared.uses_rdf12()
+        if PreparedQuery::uses_rdf12(prepared.query())
             || self
                 .engine
                 .snapshot()

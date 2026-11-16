@@ -474,6 +474,14 @@ fn certify(
     if let Some(reason) = read {
         completeness.incomplete(source, reason.clone());
     }
+    if crate::PreparedQuery::uses_rdf12(query) {
+        let why = "the query uses a triple term or a base direction, which OWL 2 doesn't define";
+        completeness.incomplete(source, why.to_owned());
+    }
+    if reads.restricted || snapshot.is_none_or(|s| s.holds_triple_terms(ReadModel::Materialised)) {
+        let why = "the data read may hold a triple term, which OWL 2 doesn't define";
+        completeness.incomplete(source, why.to_owned());
+    }
     if matches!(completeness.regime, Some(Owl2Dl | Owl2Ql)) {
         let constant = reads.constant.get_or_init(|| {
             typed_constant(query).map(|c| format!("the query names {c}: {SPELLING}"))
