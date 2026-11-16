@@ -37,5 +37,6 @@ mod service_description_tests;
 mod session_lease_tests;
 mod shacl_api_tests;
 mod status_class_tests;
+mod status_header_cache_tests;
 mod tell_api_tests;
 mod upgrade_tests;
