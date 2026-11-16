@@ -586,7 +586,8 @@ async fn a_store_written_by_main_opens_with_its_data_answers_and_settings()
 /// A store whose closure the plain `owl2-rl` program wrote, as `owl2-dl` stores were written
 /// before their keys bound named individuals only, opened by this build's server twice. As
 /// `owl2-rl` it is current at both starts; as `owl2-dl` its closure is rebuilt once, at the
-/// first start, under this build's `owl2-dl` program, and kept at the second.
+/// first start, under this build's `owl2-dl` program, and kept at the second. Not main's
+/// fixture: main has no `owl2-dl`, so the only such store is one this engine wrote before.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_owl2_dl_store_rebuilds_its_closure_once_for_its_keys()
 -> Result<(), Box<dyn std::error::Error>> {
