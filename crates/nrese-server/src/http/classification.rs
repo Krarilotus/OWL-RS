@@ -144,6 +144,8 @@ pub async fn classify(
         move |stop| store.classify_until(&scope, stop),
     )
     .await?;
+    #[cfg(test)]
+    tests::built(true);
     let mut text = report
         .outside
         .as_ref()
@@ -155,6 +157,8 @@ pub async fn classify(
     for class in &report.unsatisfiable {
         text.push_str(&format!("<{class}> <{SUB_CLASS_OF}> <{NOTHING}> .\n"));
     }
+    #[cfg(test)]
+    tests::built(false);
     let (consistent, consistency) = verdict_json(&report.consistency);
     let mut json = serde_json::json!({
         "profile": "OWL 2 DL",
@@ -191,12 +195,16 @@ pub async fn realise(
         store.realise_until(&scope, stop)
     })
     .await?;
+    #[cfg(test)]
+    tests::built(true);
     let mut text = triples_head(&report.consistency);
     for (individual, types) in &report.types {
         for class in types {
             text.push_str(&format!("<{individual}> <{RDF_TYPE}> <{class}> .\n"));
         }
     }
+    #[cfg(test)]
+    tests::built(false);
     let types: serde_json::Map<String, serde_json::Value> = report
         .types
         .iter()
@@ -215,4 +223,86 @@ pub async fn realise(
     });
     let status = completeness(&report.incomplete, None);
     respond(wants_triples(headers), text, json, &status)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::Cell;
+
+    use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+    use nrese_reasoner::{ReasonerConfig, ReasonerService};
+    use nrese_store::{ReadScope, StoreConfig, StoreService};
+
+    use crate::ai::AiSuggestionService;
+    use crate::policy::PolicyConfig;
+    use crate::runtime_posture::DeploymentPosture;
+    use crate::state::AppState;
+
+    thread_local! {
+        /// The forms built on this thread so far: (N-Triples, JSON).
+        static BUILT: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
+    }
+
+    /// Where a handler builds a form (N-Triples if `triples`, else JSON), it counts it here.
+    pub(super) fn built(triples: bool) {
+        BUILT.with(|b| {
+            let (t, j) = b.get();
+            b.set(if triples { (t + 1, j) } else { (t, j + 1) });
+        });
+    }
+
+    const ONTOLOGY: &str = r#"
+@prefix ex: <http://example.com/> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+ex:Dog rdfs:subClassOf ex:Animal .
+ex:rex a ex:Dog .
+"#;
+
+    /// A request for one form builds that form only, never the other as well: each form of
+    /// a large answer holds about as much memory as the answer (D16-700). Counted by the
+    /// builds, on the test's own thread, where the handler builds them; not timed.
+    async fn one_form_built(realisation: bool) {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("pets.ttl");
+        std::fs::write(&path, ONTOLOGY).expect("the ontology written");
+        let store = StoreService::new(StoreConfig::in_memory().with_ontology(path))
+            .expect("the store with the ontology");
+        let state = AppState::new(
+            store,
+            ReasonerService::new(ReasonerConfig::default()),
+            PolicyConfig::default(),
+            AiSuggestionService::disabled(),
+            DeploymentPosture::OpenWorkbench,
+        );
+        state.mark_ready(); // startup over, as `main` marks it
+        for (accept, want) in [
+            ("application/n-triples", (1, 0)),
+            ("application/json", (0, 1)),
+        ] {
+            BUILT.with(|b| b.set((0, 0)));
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT, HeaderValue::from_static(accept));
+            let answer = match realisation {
+                true => super::realise(state.clone(), &headers, ReadScope::All).await,
+                false => super::classify(state.clone(), &headers, ReadScope::All).await,
+            };
+            let response = answer.unwrap_or_else(|e| panic!("no answer for {accept}: {e:?}"));
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                BUILT.with(Cell::get),
+                want,
+                "forms built (N-Triples, JSON) for {accept}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_classification_request_builds_only_the_form_it_asked_for() {
+        one_form_built(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_realisation_request_builds_only_the_form_it_asked_for() {
+        one_form_built(true).await;
+    }
 }
