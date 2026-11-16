@@ -827,7 +827,7 @@ mod tests {
         tx.commit().unwrap();
         engine
             .transaction()
-            .install_reading(Some(TermId::from_raw(same_as)));
+            .install(Some(TermId::from_raw(same_as)), None);
         let tx = engine.transaction();
         let base = EngineBase::new(&tx, &[]);
         let gaps = EngineGaps::new(Site::ExpandCopies);
@@ -885,7 +885,7 @@ mod tests {
         tx.commit().unwrap();
         engine
             .transaction()
-            .install_reading(Some(TermId::from_raw(same_as)));
+            .install(Some(TermId::from_raw(same_as)), None);
         let tx = engine.transaction();
         let base = EngineBase::new(&tx, &[]);
         let gaps = EngineGaps::new(Site::ScanSteps);
@@ -1359,7 +1359,7 @@ mod tests {
             tx.insert_encoded(encode([rep.raw(), p.raw(), o.raw()]).in_default_graph());
         }
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(same_as));
+        engine.transaction().install(Some(same_as), None);
         let tx = engine.transaction();
         let base = EngineBase::new(&tx, &[]);
         let asks = AtomicUsize::new(0);

@@ -317,7 +317,7 @@ impl StoreService {
         if let Some(state) = service.reasoning_state() {
             // The reading isn't on disk: the certified stack's is installed before the store
             // is anyone's. Without a certificate the stack is read as stored.
-            tx.install_reading(service.note_equality(writer, &state));
+            tx.install(service.note_equality(writer, &state), None);
             // Kept in memory too: reads ask for it per query ([`Self::status_without_dl`]).
             *service
                 .materialised
@@ -335,7 +335,7 @@ impl StoreService {
     /// Returns how the certified stack is read: a stack kept over representatives
     /// (`reasoner.equality = "compact"`) expanded by `owl:sameAs`, else as stored. Its
     /// publication installed that already; the open installs it
-    /// ([`nrese_engine::Transaction::install_reading`]).
+    /// ([`nrese_engine::Transaction::install`]).
     fn note_equality(
         &self,
         writer: nrese_engine::WriterHeld<'_>,
@@ -643,7 +643,7 @@ impl StoreService {
         #[cfg(test)]
         hooks::run(&hooks::BEFORE_CLEAR_PUBLICATION);
         // An empty stack is read as stored, installed even where it was empty already.
-        let finished = rematerialisation.finish_held(Vec::new(), None)?;
+        let finished = rematerialisation.finish_held(Vec::new(), None, None)?;
         Ok(finished.summary().inferred_deleted)
     }
 
@@ -2260,7 +2260,7 @@ impl StoreService {
         // its own reading, uncertified (`invalidate_held` above). A publication that fails
         // installs nothing, so there is nothing to put back.
         let finished =
-            rematerialisation.finish_held(closure.inferred, program.stored_equality())?;
+            rematerialisation.finish_held(closure.inferred, program.stored_equality(), None)?;
         let summary = finished.summary();
         nrese_exec::heap::phase("store: done");
         nrese_engine::memory::release_all();
