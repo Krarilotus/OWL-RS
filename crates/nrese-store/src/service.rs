@@ -1688,10 +1688,7 @@ impl StoreService {
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         let scope = crate::ReadScope::of(prepared.access().cloned());
-        let deletes = pending
-            .ops
-            .iter()
-            .any(|op| !matches!(op, crate::StatementOp::Add { .. }));
+        let deletes = !pending.ops.iter().all(adds_only);
         let memory = self.settings.query_envelope(prepared);
         let run = self.with_pending(pending, &scope, &memory, cancellation, |snapshot| {
             // The status the answers carry, of the pending state `at` they are read from.
@@ -2479,6 +2476,20 @@ fn withholds_certification(prepared: &PreparedQuery) -> bool {
     prepared
         .access()
         .is_some_and(|access| access.inferred && !access.inferred_by_support)
+}
+
+/// Whether `op` only adds statements: an Add, or an update of `INSERT DATA` alone as it
+/// parses without the store's prefixes (one that needs them counts as one that may delete).
+fn adds_only(op: &crate::StatementOp) -> bool {
+    use nrese_sparql_syntax::GraphUpdateOperation as Op;
+    let update = match op {
+        crate::StatementOp::Add { .. } => return true,
+        crate::StatementOp::Update(update) => &update.update,
+        _ => return false,
+    };
+    let insert = |op: &Op| matches!(op, Op::InsertData { .. });
+    let parsed = nrese_sparql_syntax::SparqlParser::new().parse_update(update);
+    parsed.is_ok_and(|u| u.operations.iter().all(insert))
 }
 
 /// The result cache's context of an answer under `owl2-dl` in `mode`: a tag no other
