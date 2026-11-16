@@ -117,6 +117,11 @@ fn split_into(ontology: &Ontology, batch: usize, touched: Option<&HashSet<Term>>
             },
             Axiom::NegativeObjectPropertyAssertion(_, a, b) => parts.join(*a, *b),
             Axiom::SameIndividual(xs) | Axiom::DifferentIndividuals(xs) => {
+                // A one-member statement (`a owl:sameAs a`) has no pair: its member still
+                // needs its place.
+                for &x in xs {
+                    parts.add(x);
+                }
                 for pair in xs.windows(2) {
                     parts.join(pair[0], pair[1]);
                 }

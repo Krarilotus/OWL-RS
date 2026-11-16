@@ -4,7 +4,7 @@
 //! built revision never waits for either.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::seam::{self, Point};
@@ -338,4 +338,154 @@ fn child() {
         now.revision,
         afresh.len()
     );
+}
+
+/// A read off the rules route: the schema is outside OWL 2 RL, so the answer reads the view.
+const QUERY: &str = "PREFIX : <urn:test:> ASK { :a1 a :A }";
+
+/// Holds the caller until `event`; past a 10 s safety limit the test fails.
+fn until(event: impl Fn() -> bool) {
+    let limit = Instant::now() + Duration::from_secs(10);
+    while !event() {
+        assert!(Instant::now() < limit, "the awaited event never came");
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// Whether a read is asleep on the view build of `revision` under way (only while one is).
+fn asleep(store: &StoreService, revision: u64) -> bool {
+    matches!(store.dl().bounds.views.claim(revision, Kind::Opaque, || None),
+        Claim::Wait(build) if build.waiting() >= 1)
+}
+
+fn cancelled(result: &crate::StoreResult<()>) -> bool {
+    matches!(
+        result,
+        Err(crate::StoreError::SparqlEvaluation(
+            crate::QueryEvaluationError::Cancelled
+        ))
+    )
+}
+
+/// A read that joins the revision's view build under way gives up when its own request
+/// stops (its policy timeout or a client gone: the client has its 408): it returns
+/// `Cancelled` while the build is still held, so it holds no thread, and it builds nothing of
+/// its own. The build runs on, its own request stopped too, and is kept: the next read gets
+/// that view without building. The joined read is a query's answers or, with `explain`, its
+/// EXPLAIN plan. Counted by builds and waiters, not timed: the build is held at
+/// `Point::View` until the joined read has returned, or for 20 s, a guard only, and the joined
+/// read notes whether the build had ended when it returned.
+fn a_joined_read_gives_up(explain: bool) {
+    use std::sync::mpsc;
+    let (store, _pipeline) = pipeline();
+    let revision = store.engine().snapshot().revision();
+    let prepared = Arc::new(
+        store
+            .prepare_query(&crate::SparqlQueryRequest::all(QUERY))
+            .unwrap(),
+    );
+    let (held, holding) = mpsc::channel();
+    let (release, released) = mpsc::channel::<()>();
+    let ended = Arc::new(AtomicBool::new(false));
+    let ends = Arc::clone(&ended);
+    seam::set(&store.dl().bounds, Point::View, move || {
+        held.send(()).unwrap();
+        let _ = released.recv_timeout(Duration::from_secs(20));
+        ends.store(true, Ordering::SeqCst);
+    });
+    // The first read builds the view, held at `Point::View`.
+    let first_token = crate::CancellationToken::new();
+    let first = {
+        let (store, prepared, token) = (
+            Arc::clone(&store),
+            Arc::clone(&prepared),
+            first_token.clone(),
+        );
+        std::thread::spawn(move || {
+            store.run_query_reporting(&prepared, &token, std::io::sink(), |_| {})
+        })
+    };
+    holding
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the first read builds the view");
+    // Any other build of a view from here on is counted.
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&builds);
+    seam::set(&store.dl().bounds, Point::View, move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+    });
+    let joined_token = crate::CancellationToken::new();
+    let (answer, answered) = mpsc::channel();
+    {
+        let (store, prepared, token, ended) = (
+            Arc::clone(&store),
+            Arc::clone(&prepared),
+            joined_token.clone(),
+            Arc::clone(&ended),
+        );
+        std::thread::spawn(move || {
+            let result = match explain {
+                true => store.plan_query(&prepared, &token).map(drop),
+                false => store.run_query_reporting(&prepared, &token, std::io::sink(), |_| {}),
+            };
+            let _ = answer.send((result, ended.load(Ordering::SeqCst)));
+        });
+    }
+    until(|| asleep(&store, revision));
+    joined_token.cancel();
+    first_token.cancel();
+    // Past the build's guard: a joined read that is held returns once the guard lets it go.
+    let joined = answered.recv_timeout(Duration::from_secs(30));
+    let others = builds.load(Ordering::SeqCst);
+    // Gone if the build's own guard ran out first, as when the joined read was held.
+    let _ = release.send(());
+    let (joined, after_build) = joined.expect("the joined read never returned");
+    assert!(
+        !after_build,
+        "the joined read returned only after the build ended"
+    );
+    assert!(
+        cancelled(&joined),
+        "the joined read that gave up: {joined:?}"
+    );
+    assert_eq!(others, 0, "views built beside the held one");
+    // The build went on after its own request stopped, and is kept.
+    let first = first.join().unwrap();
+    assert!(cancelled(&first), "the first read, stopped: {first:?}");
+    let kept = lock(&store.dl().bounds.view)
+        .clone()
+        .expect("the view the stopped build made is kept");
+    assert_eq!(kept.revision, revision);
+    let (_, next) = view(&store);
+    assert!(Arc::ptr_eq(&next, &kept), "the next read builds again");
+    assert_eq!(builds.load(Ordering::SeqCst), 0, "views built in all");
+    seam::at(&store.dl().bounds, Point::View); // the counting hook, unused, goes
+}
+
+/// A read whose request has stopped before it asks for the view claims no build: it starts
+/// nothing nobody can stop (as a stopped classification request, `classification::cached`).
+/// Counted by builds: none reaches `Point::View`, none is under way, none is kept.
+#[test]
+fn a_stopped_read_starts_no_view_build() {
+    let (store, _pipeline) = pipeline();
+    let builds = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&builds);
+    seam::set(&store.dl().bounds, Point::View, move || {
+        counted.fetch_add(1, Ordering::SeqCst);
+    });
+    assert!(view_until(&store, Some(&|| true)).is_none());
+    assert_eq!(builds.load(Ordering::SeqCst), 0, "views built");
+    assert!(store.dl().bounds.views.is_idle(), "a view build under way");
+    assert!(lock(&store.dl().bounds.view).is_none(), "a view kept");
+    seam::at(&store.dl().bounds, Point::View); // the counting hook, unused, goes
+}
+
+#[test]
+fn a_joined_query_gives_up_while_the_view_is_built() {
+    a_joined_read_gives_up(false);
+}
+
+#[test]
+fn a_joined_explain_gives_up_while_the_view_is_built() {
+    a_joined_read_gives_up(true);
 }

@@ -1052,6 +1052,28 @@ input, never assumed.
 | the reserved vocabulary used as a class, property or individual (`rdfs:Class`, `rdf:type`, `rdf:first`; §2.4) | the axioms left out, each with a `Diagnostic::Reserved`; they were read as fresh names, which decided what OWL 2 Full says otherwise | monotonicity only |
 | a non-simple property where a simple one is required, an irregular hierarchy (§11) | kept in the model, left out of the clauses | monotonicity; the certificate checks the axiom itself |
 | an ill-typed literal (§5.7), syntax and mapping errors | left out | monotonicity only |
+| an anonymous individual where §11.2 keeps it out: in `owl:sameAs`, `owl:differentFrom`, a negative assertion, a nominal or `hasValue`, or in assertions that form no forest of §11.2's shape | read as it is; a nominal or `hasValue` with a non-fatal `Diagnostic::AnonymousIndividual`, the rest unflagged | our argument (below); its witness covers the derived form only; the asserted forms are judged by no reference (one refuses, the other reads blank nodes as named) |
+
+**Anonymous individuals where §11.2 keeps them out.** §11.2 keeps OWL 2 DL decidable and its
+anonymous individuals eliminable; the Direct Semantics still reads every OWL 2 ontology
+(*Direct Semantics* §2.3.7–2.4). The answers on such input are read as follows:
+
+1. An anonymous individual is existential (§2.4). Held as a constant, every model of the
+   ontology gives one of it and back. So consistency, and every conclusion that doesn't name
+   it, stay as they are, whatever axiom it occurs in.
+2. Only keys use NAMED (§2.3.5). A blank node held as a constant is named exactly when it is
+   equal to a named individual, so a key binds it only through that one.
+3. A blank node is an individual that exists without a name, and a key binds only what a name
+   denotes. Reading each blank node as a fresh IRI would bind keys the semantics doesn't.
+   That the rules, with keys over classes that hold an IRI, lose no certain answer on such
+   input is our argument; it has no source to cite.
+
+**What witnesses it.** HermiT on the derived form, inside OWL 2 DL: two anonymous values equal
+through a functional property (`[] :f _:z1 , _:z2`, `:f` functional) as a key's value; it
+says the key's conclusion is not entailed, as the store answers. That covers the derived form
+only. The asserted forms (`_:z1 owl:sameAs _:z2`) are judged by no reference: HermiT refuses
+the input, and Openllet reads blank nodes as named and binds the key. There our reading
+stands alone.
 
 **Monotonicity.** What the reader reads is part of what the input says: "inconsistent"
 and every entailment of the DL part hold for the input. For an RDF graph outside OWL 2
