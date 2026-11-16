@@ -294,7 +294,7 @@ fn a_question_no_key_can_reach_is_decided_as_before() {
 }
 
 /// The keys' question on the other reads with a status: inside a transaction with
-/// operations pending, and of the inferred statements alone. Neither says `complete`.
+/// operations pending, of the inferred statements alone, and its plan. None says `complete`.
 #[test]
 fn the_other_reads_of_an_individual_named_only_in_the_question_are_not_complete() {
     let dl = pipeline();
@@ -313,12 +313,29 @@ fn the_other_reads_of_an_individual_named_only_in_the_question_are_not_complete(
         )))
         .expect("prepared");
     let alone = dl.store().status_without_dl(&implicit).expect("a status");
+    let asked = dl
+        .store()
+        .prepare_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "{}ASK {{ :b a :A }}",
+            super::PREFIXES
+        )))
+        .expect("prepared");
+    let plan = dl
+        .store()
+        .plan_query(&asked, &nrese_store::CancellationToken::new())
+        .expect("planned")
+        .completeness
+        .expect("a status");
     let lines = [
         format!("pending: {rows}, {} {:?}", inside.as_str(), inside.reasons),
         format!("inferred alone: {} {:?}", alone.as_str(), alone.reasons),
+        format!("plan: {} {:?}", plan.as_str(), plan.reasons),
     ];
     eprintln!("{lines:#?}");
-    assert!(!inside.complete && !alone.complete, "{lines:#?}");
+    assert!(
+        !inside.complete && !alone.complete && !plan.complete,
+        "{lines:#?}"
+    );
 }
 
 /// One data value in two lexical forms: `"1"` and `"01"` as xsd:integer, and `"1"` as
