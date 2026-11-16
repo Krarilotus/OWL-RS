@@ -142,7 +142,7 @@ fn engine(fixture: usize) -> Engine {
         object: rep,
     });
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     engine
 }
 
@@ -511,7 +511,7 @@ fn a_count_past_64_bits_fails_as_a_range_limit() {
         tx.insert_inferred(same_as_rep(identity));
     }
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     let snapshot = engine.snapshot();
     let query = SparqlParser::new()
         .parse_query("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }")

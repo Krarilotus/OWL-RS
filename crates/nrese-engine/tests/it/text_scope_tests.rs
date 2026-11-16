@@ -472,7 +472,7 @@ fn random_commits(seed: u64, failed: &mut Vec<String>) {
         (same_as, subjects)
     };
     // Reads expand the classes, as a store with equality by representatives does.
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     let mut asserted: Vec<(String, String, Option<&str>)> = Vec::new();
     let mut inferred: Vec<EncodedTriple> = Vec::new();
     // Of the 3 readers × 6 scopes × 3 models, 16 (within the 64 corpora kept).
@@ -1006,7 +1006,7 @@ fn a_literal_related_by_equality_is_in_the_corpus_after_a_commit() {
     }));
     tx.insert(label("filler", "beta", None).as_ref());
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     // A kept corpus to derive from.
     every(&engine.snapshot(), "alpha");
     let mut tx = engine.transaction();
@@ -1060,7 +1060,7 @@ fn a_corpus_walk_under_expansion_reads_within_the_search_budget() {
         tx.insert(label("class/0", &format!("alpha {i}"), None).as_ref());
     }
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     let mut failed = Vec::new();
     for (limit, want_refused) in [(16usize << 10, true), (1 << 30, false)] {
         // A fresh engine store of corpora each time: nothing kept from the other row.
@@ -1151,7 +1151,7 @@ fn a_statement_about_a_non_iri_identity_changes_its_class_in_the_iri_corpus() {
             assert!(tx.insert_encoded(held));
         }
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(same_as));
+        engine.transaction().install(Some(same_as), None);
         let scope = TextScope::Graphs(GraphSelector::Exact(held.graph));
         (engine, held, scope)
     };
@@ -1268,7 +1268,7 @@ fn a_reader_of_classes_walks_past_a_step_without_its_subjects() {
             assert!(tx.insert(held().as_ref()));
         }
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(same_as));
+        engine.transaction().install(Some(same_as), None);
         engine
     };
     let search = |snapshot: &Snapshot| {
