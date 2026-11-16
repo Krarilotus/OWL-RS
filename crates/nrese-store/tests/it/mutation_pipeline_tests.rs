@@ -1503,13 +1503,19 @@ fn a_retired_pipeline_refuses_writes() {
 
 /// `:K owl:hasKey ( :k1 … :kn )`, and `:x` and `:y` in `:K` with the same value on every
 /// key property: prp-key (OWL 2 Profiles §4.3, table 5) makes them one individual, so
-/// `:x :name "Y"` holds through `:y`'s (eq-rep-s).
+/// `:x :name "Y"` holds through `:y`'s (eq-rep-s). Each `:ki` is declared an object property,
+/// as its values are: an undeclared key property is a QL concern of its own.
 fn long_key(n: usize) -> String {
     let keys: Vec<String> = (1..=n).map(|i| format!("<{EX}k{i}>")).collect();
     let mut data = format!(
         "<{EX}K> <http://www.w3.org/2002/07/owl#hasKey> ( {} ) .",
         keys.join(" ")
     );
+    for key in &keys {
+        data.push_str(&format!(
+            " {key} a <http://www.w3.org/2002/07/owl#ObjectProperty> ."
+        ));
+    }
     for x in ["x", "y"] {
         data.push_str(&format!(" <{EX}{x}> a <{EX}K> ."));
         for i in 1..=n {
@@ -1728,6 +1734,7 @@ fn left_out_answer(store: &StoreService, ask: &str) {
         .expect("answered");
     let payload = String::from_utf8(answer.payload).expect("utf8");
     let status = answer.completeness.as_ref();
+    println!("plain read: {ask}: {payload} with {status:?}");
     assert!(
         payload.contains("true") || status.is_some_and(|c| !c.complete),
         "{ask}: {payload} with {status:?}"
@@ -1735,12 +1742,14 @@ fn left_out_answer(store: &StoreService, ask: &str) {
 }
 
 /// [`long_key`] with each key property `:ki` the same as a `:ji` (`owl:sameAs`): every cell
-/// of the key's list then has two first members, and the list 2^n member sequences.
+/// of the key's list then has two first members, and the list 2^n member sequences. Each
+/// `:ji` is declared an object property too.
 fn aliased_key(n: usize) -> String {
     let mut data = long_key(n);
     for i in 1..=n {
         data.push_str(&format!(
-            " <{EX}k{i}> <http://www.w3.org/2002/07/owl#sameAs> <{EX}j{i}> ."
+            " <{EX}k{i}> <http://www.w3.org/2002/07/owl#sameAs> <{EX}j{i}> . \
+             <{EX}j{i}> a <http://www.w3.org/2002/07/owl#ObjectProperty> ."
         ));
     }
     data
