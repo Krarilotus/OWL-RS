@@ -649,16 +649,18 @@ fn a_question_naming_an_individual_the_data_doesnt_is_not_complete_when_the_onto
             "{MARK_PREFIXES}ASK {{ :b a :A }}"
         )))
         .unwrap();
+    // The run and its status, which is told before the answers are evaluated (a status other
+    // than the cached answer's evaluates them afresh, and may then find the memory spent).
     let status = || {
         let mut status = None;
-        store
-            .run_query_reporting(&prepared, &CancellationToken::new(), &mut Vec::new(), |s| {
+        let run =
+            store.run_query_reporting(&prepared, &CancellationToken::new(), &mut Vec::new(), |s| {
                 status = s
-            })
-            .unwrap();
-        status.expect("a status")
+            });
+        (run, status.expect("a status"))
     };
-    let free = status();
+    let (run, free) = status();
+    run.unwrap();
     assert!(free.complete, "the control: {free:?}");
     let kept = Arc::clone(store.dl().bounds.kept());
     let spent = std::rc::Rc::new(std::cell::Cell::new(0));
@@ -673,7 +675,7 @@ fn a_question_naming_an_individual_the_data_doesnt_is_not_complete_when_the_onto
         budget.charge(rest).unwrap();
         held.set(rest);
     })));
-    let refused = status();
+    let (_, refused) = status();
     kept.release(spent.get());
     assert!(spent.get() > 0, "the hook spent the bounds' memory");
     assert!(!refused.complete, "with the ontology unread: {refused:?}");
