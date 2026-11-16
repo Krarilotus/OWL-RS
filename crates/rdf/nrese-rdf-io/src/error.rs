@@ -126,6 +126,10 @@ pub enum RdfParseError {
     Syntax(#[from] RdfSyntaxError),
 }
 
+// Every parse result carries this error, and the store's errors and a mutation's carry it in
+// turn: it stays two pointers wide, a read error or the syntax error behind its box.
+const _: () = assert!(std::mem::size_of::<RdfParseError>() <= 16);
+
 impl RdfParseError {
     /// Whether the parser reads nothing of the document after this error (a read error
     /// always): skipping it would take the document's first part for the whole.
