@@ -3085,3 +3085,92 @@ mod context_tests {
         }
     }
 }
+
+/// A rematerialisation under `reasoner.equality = "compact"` is read as it will be certified
+/// from the moment its stack is published: a reader between the publication and the
+/// certificate (`hooks::AFTER_PUBLICATION`) answers as a reader after both, its rows and their
+/// count. Over an `owl:sameAs`, from a closure that closes no equality (RDFS: every copy
+/// stored, nothing expanded) to one kept over representatives (RDFS-Plus), and back.
+#[cfg(test)]
+mod equality_publication_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{StoreService, hooks};
+    use crate::StoreConfig;
+    use nrese_reasoner::ReasoningMode;
+
+    const DATA: &str = "<http://example.com/a> <http://www.w3.org/2002/07/owl#sameAs> \
+                        <http://example.com/b> .\n\
+                        <http://example.com/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+                        <http://example.com/Dog> .\n\
+                        <http://example.com/Dog> <http://www.w3.org/2000/01/rdf-schema#subClassOf> \
+                        <http://example.com/Animal> .\n";
+    const READS: [&str; 2] = [
+        "SELECT ?x WHERE { ?x a <http://example.com/Animal> } ORDER BY ?x",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?x a <http://example.com/Animal> }",
+    ];
+
+    fn answers(store: &StoreService) -> Vec<String> {
+        READS
+            .iter()
+            .map(|read| {
+                let result = store.execute_query_str(read).expect("query");
+                String::from_utf8(result.payload).expect("utf-8")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_compact_stack_is_read_expanded_from_its_publication() {
+        let program = |mode| {
+            nrese_reasoner::ReasonerConfig::for_mode(mode)
+                .materialised_program()
+                .expect("it reasons")
+        };
+        let mut wrong = Vec::new();
+        for (from, to) in [
+            (ReasoningMode::Rdfs, ReasoningMode::RdfsPlus),
+            (ReasoningMode::RdfsPlus, ReasoningMode::Rdfs),
+        ] {
+            let dir = tempfile::tempdir().expect("dir");
+            let file = dir.path().join("data.nt");
+            std::fs::write(&file, DATA).expect("data");
+            let store = Arc::new(
+                StoreService::new(StoreConfig {
+                    equality_by_representatives: true,
+                    equality_compact: true,
+                    ..StoreConfig::on_disk(dir.path().join("store"))
+                })
+                .expect("store"),
+            );
+            store
+                .bulk_load(&crate::BulkLoadRequest {
+                    files: vec![file],
+                    replace: false,
+                    graph: crate::GraphTarget::DefaultGraph,
+                    invalid: None,
+                })
+                .expect("load");
+            store
+                .rematerialise(program(from))
+                .expect("the first closure");
+            let between = Arc::new(Mutex::new(Vec::new()));
+            let (reader, seen) = (Arc::clone(&store), Arc::clone(&between));
+            hooks::AFTER_PUBLICATION.set(Some(Box::new(move || {
+                *seen.lock().unwrap() = answers(&reader);
+            })));
+            store
+                .rematerialise(program(to))
+                .expect("the second closure");
+            let (between, after) = (between.lock().unwrap().clone(), answers(&store));
+            let case = format!("{from:?} to {to:?}");
+            if between == after {
+                println!("CASE {case}: right {after:?}");
+            } else {
+                println!("CASE {case}: WRONG between {between:?} | after {after:?}");
+                wrong.push(case);
+            }
+        }
+        assert!(wrong.is_empty(), "wrong: {wrong:?}");
+    }
+}
