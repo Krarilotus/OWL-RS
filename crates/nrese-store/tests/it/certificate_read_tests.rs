@@ -651,6 +651,109 @@ fn a_reader_of_some_graphs_learns_nothing_from_a_hidden_graph_under_another_prog
     cells.finish();
 }
 
+/// A reader of `open` who sees inferences, by support or every one, learns nothing from a
+/// graph it can't read through an explanation or a justification either, while nothing
+/// vouches that the stack is the closure of the rules in place: `ex:a ex:q ex:b` is in both
+/// stacks, made under P0 from `open`, and under P1 it follows only
+/// with the premise `secret` asserts. Explained or justified under P1 over P0's certificate,
+/// or once the certificate is gone (`invalidate_reasoning`), the request is refused, with
+/// `secret` or without it; under P0, its certificate's, it is answered alike.
+#[test]
+fn an_explanation_learns_nothing_from_a_hidden_premise_over_an_unvouched_stack() {
+    const EX: &str = "http://example.com/";
+    let program = |rule: &str| {
+        let text = format!("@prefix ex: <{EX}> .\n{rule}\n");
+        let rules = UserRules::n3("rules.n3", &text).expect("the rules compile");
+        nrese_reasoner::RuleProgram::new(None, Some(Arc::new(rules))).expect("a program")
+    };
+    let p0 = program("{ ?s ex:p ?o } => { ?s ex:q ?o } .");
+    let p1 = program("{ ?s ex:p ?o . ex:k ex:secret ex:v } => { ?s ex:q ?o } .");
+    let mut cells = Cells::default();
+    let reader = |by_support: bool| {
+        ReadScope::Graphs(Arc::new(GraphAccess {
+            graphs: vec![format!("{EX}open")],
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: by_support,
+            ..GraphAccess::default()
+        }))
+    };
+    // What `scope` is told of `ex:a ex:q ex:b` under `live` (`explained` or `justified`,
+    // `none`, or `refused` where the refusal names rematerialisation), explained where
+    // `explain` and justified otherwise, `secret` asserting `ex:k ex:secret ex:v` or not, the
+    // stack certified under P0 and maintained under `live`, its certificate forgotten where
+    // `forgotten`.
+    let told = |scope: &ReadScope,
+                live: &nrese_reasoner::RuleProgram,
+                forgotten: bool,
+                secret: bool,
+                explain: bool| {
+        let store = StoreService::new(StoreConfig::in_memory()).expect("store");
+        let hidden = match secret {
+            true => "GRAPH ex:secret { ex:k ex:secret ex:v }",
+            false => "",
+        };
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ ex:a ex:p ex:b }} {hidden} }}"
+            )))
+            .expect("data");
+        store.rematerialise(&p0).expect("reasoned");
+        store.use_reasoning_rules(Some(live.clone()));
+        if forgotten {
+            store.invalidate_reasoning().expect("invalidated");
+        }
+        let term = |local: &str| nrese_rdf::NamedNode::new_unchecked(format!("{EX}{local}"));
+        let (s, p, o) = (term("a"), term("q"), term("b"));
+        let statement: [nrese_rdf::TermRef<'_>; 3] =
+            [s.as_ref().into(), p.as_ref().into(), o.as_ref().into()];
+        let answer = match explain {
+            true => store
+                .explain_statement(live, scope, statement[0], statement[1], statement[2])
+                .map(|found| found.map(|_| "explained")),
+            false => store
+                .justify_statement(
+                    live,
+                    scope,
+                    statement,
+                    nrese_store::reasoning::JustificationMode::One,
+                )
+                .map(|found| found.map(|_| "justified")),
+        };
+        match answer {
+            Ok(Some(found)) => found.to_owned(),
+            Ok(None) => "none".to_owned(),
+            Err(error) if error.to_string().contains("rematerialis") => "refused".to_owned(),
+            Err(error) => format!("refused otherwise: {error}"),
+        }
+    };
+    for (entry, explain, answered) in [
+        ("the explanation", true, "explained / explained"),
+        ("the justification", false, "justified / justified"),
+    ] {
+        for (kind, by_support) in [("visible", false), ("supported", true)] {
+            let scope = reader(by_support);
+            for (row, live, forgotten, want) in [
+                ("P0", &p0, false, answered),
+                ("P1 over P0's certificate", &p1, false, "refused / refused"),
+                ("P1, no certificate", &p1, true, "refused / refused"),
+            ] {
+                let (without, with) = (
+                    told(&scope, live, forgotten, false, explain),
+                    told(&scope, live, forgotten, true, explain),
+                );
+                cells.header(
+                    &format!("{entry}, {kind}, {row}: without secret / with it"),
+                    &format!("{without} / {with}"),
+                    |got| got == want,
+                    want,
+                );
+            }
+        }
+    }
+    cells.finish();
+}
+
 /// A commit made without reasoning leaves the inferred statements uncertified; a restart
 /// before the next rematerialisation opens them so: `not-certified`, not certified by the
 /// open and not read as if no reasoning could leave answers out.
