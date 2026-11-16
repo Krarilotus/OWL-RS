@@ -1846,3 +1846,22 @@ fn a_join_at_the_start_of_a_path_without_a_reversed_step_stays_complete() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// The control for a negated set with a reversed member: a join at its start compares a data
+/// value, and every route already says no more than `sound-only` there (a negated set reads
+/// the vocabulary OWL 2 entails, and the parser turns `!(^:p)` into a path ending at `?n`).
+/// Spec: the join over [`SEVEN`] isn't `complete`, run and planned, under each regime that
+/// promises `complete`.
+#[test]
+fn a_join_at_a_negated_reversed_sets_start_is_not_complete() {
+    let read = "SELECT ?x ?y { ?n !(^:p) ?x . ?n !(^:p) ?y FILTER(?x != ?y) }";
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        let (rows, status) = answer(&store(SEVEN), read);
+        eprintln!("{regime}: {status:?}");
+        if status.contains(&"complete") {
+            wrong.push(format!("{regime}: {rows} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
