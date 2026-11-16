@@ -1366,6 +1366,30 @@ fn no_answer_is_complete_that_a_computed_values_other_spelling_misses() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The known over-mark: a computed value is counted whatever its type, so a string or an
+/// IRI the query computes and matches against the data lowers the answer, though a string
+/// or an IRI has one spelling and the match misses nothing. Spec (docs/limits.md): under
+/// `owl2-dl` and `owl2-ql` such an answer holds its row and is `sound-only`, run and planned.
+#[test]
+fn a_computed_string_or_iri_at_a_patterns_end_is_marked_sound_only() {
+    let data = ":name a owl:DatatypeProperty . :a0 :name \"Rex\" .";
+    let ql = |data: &str| closure(data, Ruleset::Owl2Ql, QlRewritingMode::Auto);
+    let mut wrong = Vec::new();
+    for read in [
+        "SELECT ?v { BIND(CONCAT(\"R\", \"ex\") AS ?n) ?v :name ?n }",
+        "SELECT ?v { BIND(IRI(\"http://example.com/a0\") AS ?v) ?v :name \"Rex\" }",
+    ] {
+        for (regime, store) in [("owl2-dl", owl2_dl(data)), ("owl2-ql", ql(data))] {
+            let (rows, status) = answer(&store, read);
+            eprintln!("{regime} {read}: {rows} {status:?}");
+            if !rows.contains("example.com/a0") || status != ["sound-only"; 2] {
+                wrong.push(format!("{regime} {read}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// `read` over `data`'s owl2-rl closure with the rewriting `ql`: its answer, a printed line
 /// with what each place (the run, its rewriting, the plan, the plan's rewriting) calls it,
 /// those four names (`none`: no status), and whether the run has the rewriting's report.

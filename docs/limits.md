@@ -91,7 +91,10 @@ planned.
   and `owl2-ql`, a query that matches a number or a date it names or computes against the
   data gives `sound-only` at best: the store matches it as written, so `"01"^^xsd:integer`
   doesn't find a stored `"1"`. Compare values in a `FILTER` instead
-  ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)).
+  ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)). Any value
+  the query computes counts, so a computed string or IRI matched against the data
+  (`BIND(CONCAT(…) AS ?n)`, `BIND(IRI(…) AS ?s)`) gives `sound-only` too, though nothing
+  is missed.
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo` and make no new blank nodes; with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)). None known.
