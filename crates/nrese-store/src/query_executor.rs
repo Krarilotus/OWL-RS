@@ -465,6 +465,7 @@ pub(crate) fn run_query<T: FnOnce(crate::service::StatusHeader) -> Option<String
     // algebra and must not run the semantic QL stage a second time.
     options.ql = None;
     let Some(slot) = slot else {
+        drop(header);
         serialize(view, prepared, &query, &options, cancellation, out)?;
         return Ok(ql);
     };
