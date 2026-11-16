@@ -156,6 +156,7 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
         "original key retained"
     );
     let mut bytes = Vec::new();
+    let cancel = &token;
     let error = run_query(
         &snapshot,
         &prepared,
@@ -163,9 +164,12 @@ fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
         &token,
         &nrese_exec::Envelope::unlimited(),
         &mut bytes,
-        |_| {
-            token.cancel();
-            (b"same-context".to_vec(), |_| None)
+        // A hit: the report that cancels is the one handed the kept status header.
+        move |_| {
+            (b"same-context".to_vec(), move |_| {
+                cancel.cancel();
+                None
+            })
         },
     )
     .unwrap_err();
