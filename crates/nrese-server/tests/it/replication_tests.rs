@@ -413,6 +413,86 @@ async fn a_replica_gives_its_primarys_status_under_owl2_rl()
     Ok(())
 }
 
+/// A replica of a primary that keeps its closure over representatives
+/// (`reasoner.equality = "compact"`) answers with its primary's rows: a read expands each
+/// `owl:sameAs` class, on the replica as on the primary, over the data of its image and of a
+/// commit applied after it. Both stores are configured alike. The rows are checked first,
+/// the status second.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_of_a_compact_primary_gives_its_primarys_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rl = || ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Owl2Rl));
+    let config = |dir: &std::path::Path| StoreConfig {
+        equality_by_representatives: true,
+        equality_compact: true,
+        ..StoreConfig::on_disk(dir)
+    };
+    let primary_dir = tempfile::tempdir()?;
+    let primary_state = AppState::new(
+        StoreService::new(config(primary_dir.path()))?,
+        rl(),
+        PolicyConfig::default(),
+        AiSuggestionService::disabled(),
+        DeploymentPosture::OpenWorkbench,
+    )
+    .with_replication(ReplicationConfig {
+        mode: ReplicationMode::Primary,
+        ..ReplicationConfig::default()
+    });
+    primary_state.mark_ready();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let primary_app = build_app(primary_state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, primary_app).await.expect("primary");
+    });
+    let owl = "PREFIX owl: <http://www.w3.org/2002/07/owl#> ";
+    update(
+        &base,
+        &format!(
+            "{owl}INSERT DATA {{ ex:Dog rdfs:subClassOf ex:Animal . ex:a a ex:Dog . \
+             ex:a owl:sameAs ex:b }}"
+        ),
+    )
+    .await;
+
+    let replica_dir = tempfile::tempdir()?;
+    let replication = ReplicationConfig {
+        mode: ReplicationMode::Replica,
+        primary: Some(base.clone()),
+        poll: std::time::Duration::from_millis(20),
+        ..ReplicationConfig::default()
+    };
+    replication::bootstrap(&replication, replica_dir.path()).await?;
+    let replica_state = AppState::new(
+        StoreService::new(config(replica_dir.path()))?,
+        rl(),
+        PolicyConfig::default(),
+        AiSuggestionService::disabled(),
+        DeploymentPosture::OpenWorkbench,
+    )
+    .with_replication(replication);
+    replica_state.mark_ready();
+    update(
+        &base,
+        &format!("{owl}INSERT DATA {{ ex:c owl:sameAs ex:a }}"),
+    )
+    .await;
+    catch_up(&base, &replica_state).await;
+    let query = format!("{PREFIXES}SELECT ?x WHERE {{ ?x a ex:Animal }} ORDER BY ?x");
+    let (rows, status) = answered(build_app(primary_state.clone()), &query).await?;
+    for x in ["a", "b", "c"] {
+        assert!(
+            rows.contains(&format!("example.com/{x}\"")),
+            "the primary's rows: {rows}"
+        );
+    }
+    let (replica_rows, replica_status) = answered(build_app(replica_state.clone()), &query).await?;
+    assert_eq!(replica_rows, rows, "the replica's rows");
+    assert_eq!(replica_status, status, "the replica's status");
+    Ok(())
+}
+
 /// A replica's data directory, made by its bootstrap, is durably named (sol-loop round 3 on
 /// DUR-3 review r1, S1): into `sealed/a`, where `sealed` exists but can't be opened (mode
 /// 0o311), so its sync, which must name `a`, fails, the bootstrap must refuse. Before the fix it
