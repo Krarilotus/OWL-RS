@@ -375,9 +375,15 @@ impl MutationPipeline {
                     &|view, dl_gate_budget| self.view_reason(view, dl_gate_budget, &resources),
                     &envelope,
                 );
-                (gate, bounds)
+                // What the reader left out: none where consistent (`consistency::check`).
+                let read = bounds
+                    .ontology
+                    .take()
+                    .map(|o| crate::dl::query::left_out(&o));
+                let consistent = gate.checked.verdict == crate::dl::Verdict::Consistent;
+                (gate, bounds, read.or(consistent.then_some(None)))
             });
-            if let Some((gate, _)) = &mut dl
+            if let Some((gate, _, _)) = &mut dl
                 && let Some(reject) = gate.reject.take()
             {
                 return Err(MutationError::Rejected(Box::new(reject)));
@@ -419,11 +425,12 @@ impl MutationPipeline {
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
             }
-            if let Some((gate, bounds)) = dl {
+            if let Some((gate, bounds, left_out)) = dl {
                 crate::dl::bounds::install(&self.store, bounds, summary.revision);
                 self.store.dl().record(crate::dl::DlStatus {
                     revision: summary.revision,
                     consistency: gate.checked,
+                    left_out,
                 });
             }
             // The program now describes the committed state.
