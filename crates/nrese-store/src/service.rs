@@ -76,7 +76,7 @@ pub struct StoreService {
 }
 
 /// The file recording what the inferred stack is exact for ([`crate::reasoning_state`]).
-const REASONING_MARKER: &str = "reasoning.state";
+pub(crate) const REASONING_MARKER: &str = "reasoning.state";
 
 /// A change of the reasoning certificate in progress
 /// ([`StoreService::certificate_epoch`]): made odd by its start, the epoch is even again when
@@ -208,6 +208,7 @@ impl StoreService {
                             .then_some(config.bulk_load_memory_bytes),
                         wal_archive: config.wal_archive,
                         wal_damage: config.wal_damage,
+                        forget_on_cut: Some(REASONING_MARKER),
                         ..defaults.durability
                     },
                     ..defaults
