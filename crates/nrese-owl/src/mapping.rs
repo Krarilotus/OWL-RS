@@ -545,18 +545,19 @@ impl<'a> Reader<'a> {
         self.terms.kind(term)
     }
 
-    /// The objects of `subject`'s `predicate` statements.
+    /// The objects of `subject`'s `predicate` statements, each once: the ontology is the
+    /// union of the graphs, where a statement in two graphs is one.
     fn objects(&self, subject: Term, predicate: Option<Term>) -> Vec<Term> {
         let Some(predicate) = predicate else {
             return Vec::new();
         };
-        self.by_subject
-            .get(&subject)
-            .into_iter()
-            .flatten()
-            .filter(|&&(p, _, _)| p == predicate)
-            .map(|&(_, o, _)| o)
-            .collect()
+        let mut objects = Vec::new();
+        for &(p, o, _) in self.by_subject.get(&subject).into_iter().flatten() {
+            if p == predicate && !objects.contains(&o) {
+                objects.push(o);
+            }
+        }
+        objects
     }
 
     /// The single object of `subject`'s `predicate`, collected as structural.
@@ -1090,11 +1091,14 @@ impl<'a> Reader<'a> {
             let list = self.one(node, v.owl_with_restrictions)?;
             let mut facets = Vec::new();
             for restriction in self.list(list)? {
-                let pairs = self
+                let mut pairs = self
                     .by_subject
                     .get(&restriction)
                     .cloned()
                     .unwrap_or_default();
+                // Each statement once, in whichever graphs (`objects`).
+                pairs.sort_unstable();
+                pairs.dedup_by_key(|&mut (p, o, _)| (p, o));
                 let [(facet, value, _)] = pairs[..] else {
                     self.report(Diagnostic::Malformed {
                         node: restriction,
