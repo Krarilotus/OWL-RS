@@ -12,6 +12,7 @@ mod closure_status_tests;
 mod convert_tests;
 mod dl;
 mod dl_oracle_tests;
+mod document_end_tests;
 mod entailment_tests;
 mod equality_compact_tests;
 mod equality_pending_tests;

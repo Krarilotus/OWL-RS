@@ -247,6 +247,16 @@ pub fn place_image(
             data_dir.display()
         )));
     }
+    // A store removed but for its reasoning certificate: kept, a start would trust it for the
+    // image's data.
+    let marker = data_dir.join(crate::service::REASONING_MARKER);
+    if marker.exists() {
+        return Err(StoreError::Configuration(format!(
+            "{} is a removed store's reasoning certificate: \
+             remove it, or restore into an empty data directory",
+            marker.display()
+        )));
+    }
     // Every new level durably named (review r1, R1-F2), as the placement owns it.
     nrese_engine::place::create_dir_all(data_dir).map_err(|e| io(e, data_dir))?;
     let target = data_dir.join(&name);

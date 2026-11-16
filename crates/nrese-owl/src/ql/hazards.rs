@@ -64,6 +64,9 @@ pub enum Hazard {
     /// ([`reads_data_values`]), or a property not declared an object property in a key or
     /// a disjointness, which may be one: global.
     DataValues(Term),
+    /// A restriction whose cardinality isn't spelled as the RDF mapping writes it
+    /// ([`Ontology::noncanonical_cardinality`]), which OWL 2 RL's rules don't read: global.
+    CardinalitySpelling(Term),
 }
 
 /// A data property whose values OWL 2 RL's rules would compare or type, where the rule
@@ -113,7 +116,8 @@ impl Hazard {
             | Self::OpenLeft(t)
             | Self::OutsideProfile(t)
             | Self::Dropped(t)
-            | Self::DataValues(t) => t,
+            | Self::DataValues(t)
+            | Self::CardinalitySpelling(t) => t,
             Self::Equating => return None,
         })
     }
@@ -167,6 +171,10 @@ impl Hazard {
                 "an axiom may compare or type values of {t}, and the rule set leaves out dt-eq \
                  and dt-type2: one value in two lexical forms isn't matched, nor a value's \
                  datatype read"
+            ),
+            Self::CardinalitySpelling(_) => format!(
+                "the cardinality at {t} isn't written as the RDF mapping writes it, and the \
+                 rules read only the mapping's spelling (\"0\" or \"1\"^^xsd:nonNegativeInteger)"
             ),
         }
     }
