@@ -1027,7 +1027,7 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
             }] += 1;
             // The indexes decide annotation-property axioms and punning, which the whole
             // ontology tells after what it left out.
-            let mut kept = whole.value().clone();
+            let mut kept = nrese_owl::Ontology::clone(whole.value());
             kept.diagnostics.retain(|d| !d.leaves_out());
             let past = by_ontology(read, &kept);
             if let Some(reason) = &past {
