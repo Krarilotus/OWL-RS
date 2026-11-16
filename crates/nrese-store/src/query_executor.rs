@@ -9,6 +9,7 @@
 //! in its chunked join and grouping loops, and here on every result row.
 
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
 
 use nrese_engine::ReadModel;
 
@@ -109,6 +110,10 @@ pub struct PreparedQuery {
     /// Whether the results may use RDF 1.2 (triple terms): then they announce
     /// `version=1.2` ([`Self::announce_rdf12`]).
     rdf12: bool,
+    /// Whether what its reader reads holds a triple term, decided by its run on that view
+    /// ([`Self::announce_on`]); shared by its clones, so a transport that keeps one reads
+    /// the run's decision.
+    holds_rdf12: std::sync::Arc<AtomicBool>,
     /// Under `owl2-dl`: which answers this query asks for (`None`: `dl.answers`).
     dl_answers: Option<crate::DlAnswers>,
     /// Told when the query is handed to the executor ([`Self::on_evaluation`]).
@@ -189,6 +194,7 @@ impl PreparedQuery {
             origin: None,
             pin: None,
             rdf12: false,
+            holds_rdf12: Default::default(),
             dl_answers: request.dl_answers,
             on_evaluation: None,
             reads: crate::dl::query::Reads::new(request.scope.access().cloned()),
@@ -251,6 +257,21 @@ impl PreparedQuery {
     /// N-Quads (RDF 1.2 Concepts §2.1; SPARQL 1.2 Query Results JSON §3.1.3).
     pub fn announce_rdf12(&mut self) {
         self.rdf12 = true;
+    }
+
+    /// Decides the data's half of the announcement on `view`, the snapshot the run reads
+    /// as its reader reads it: a triple term in a graph the reader reads.
+    pub(crate) fn announce_on(&self, view: &nrese_engine::Snapshot) {
+        let access = self.access.as_deref();
+        let read = |graph| access.is_none_or(|a| a.allows_id(view, graph));
+        let holds = view.holds_triple_terms(self.read_model, read);
+        self.holds_rdf12.store(holds, Relaxed);
+    }
+
+    /// Whether the results announce RDF 1.2: the query uses it, or its run found a triple
+    /// term in what its reader reads.
+    fn announced(&self) -> bool {
+        self.rdf12 || self.holds_rdf12.load(Relaxed)
     }
 
     /// Pins the query's result in the result cache under `name` when it runs: kept while
@@ -324,7 +345,7 @@ impl PreparedQuery {
     }
 
     pub fn media_type(&self) -> &'static str {
-        match (self.kind(), self.rdf12) {
+        match (self.kind(), self.announced()) {
             (QueryResultKind::Solutions | QueryResultKind::Boolean, false) => {
                 self.solutions_format.media_type()
             }
@@ -520,7 +541,7 @@ fn serialize(
         entered();
     }
     let mut out = out;
-    let version = prepared.rdf12.then_some("1.2");
+    let version = prepared.announced().then_some("1.2");
     let format = match prepared.solutions_format {
         SolutionsResultFormat::Json => Some(ResultsFormat::Json),
         SolutionsResultFormat::Tsv => Some(ResultsFormat::Tsv),
@@ -551,7 +572,7 @@ fn serialize_answers(
     cancellation: &CancellationToken,
 ) -> StoreResult<()> {
     cancellation.check()?;
-    let version = prepared.rdf12.then_some("1.2");
+    let version = prepared.announced().then_some("1.2");
     match answers {
         QueryResults::Boolean(value) => {
             results_serializer(prepared, version).serialize_boolean_to_writer(out, value)?;

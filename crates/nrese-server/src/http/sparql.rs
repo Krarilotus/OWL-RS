@@ -1,4 +1,5 @@
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
 use nrese_store::{
     CancellationToken, GraphResultFormat, MutationCommand, QueryResultKind, SolutionsResultFormat,
@@ -120,6 +121,7 @@ pub async fn execute_query_in(
         *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
         made
     };
+    let announced = prepared.clone();
     let mut response = stream_blocking(
         Pace::Total(deadline),
         cancellation,
@@ -136,6 +138,10 @@ pub async fn execute_query_in(
         },
     )
     .await?;
+    // The run decided the announcement on what its reader reads before its first byte, which
+    // `stream_blocking` waits for: the media type is the run's (its place among the headers kept).
+    let media_type = HeaderValue::from_static(announced.media_type());
+    response.headers_mut().insert(CONTENT_TYPE, media_type);
     let reported = status.lock().unwrap_or_else(|p| p.into_inner()).take();
     if let Some(value) = reported {
         let headers = response.headers_mut();
