@@ -73,15 +73,17 @@ the store, so to run the example again, [start over](#change-a-setting-start-ove
 
 Next, load your own file, `my.ttl` in [Turtle](https://www.w3.org/TR/turtle/), into the same
 server. The upload replaces the [default graph](glossary.md#graph) with your file, so the
-example's statements go. To load into an empty store, [start over](#change-a-setting-start-over)
-first.
+example's statements go. The SHACL gate checks an upload as it checks an update, and the shape
+stays in its own graph: if your file says something is an `ex:Animal` and gives it no `ex:name`,
+the upload is refused with a `400` that names it, and nothing of the file is stored. To load
+into an empty store, [start over](#change-a-setting-start-over) first.
 
 ```bash
 curl -X PUT -H 'Content-Type: text/turtle' --data-binary @my.ttl 'http://localhost:8080/dataset/data?default'
 ```
 
-It answers `204 No Content`, so curl prints nothing. Other syntaxes take their media type as
-`Content-Type`. A `PUT` takes at most 128 MiB
+It answers `204 No Content`, so curl prints nothing; a refused upload prints the reason. Other
+syntaxes take their media type as `Content-Type`. A `PUT` takes at most 128 MiB
 ([`budgets.upload_size`](ops/config-reference.md#budgets.upload_size)); larger files load offline
 with `nrese-server load` ([loading data](ops/server-setup.md#loading-data)).
 
@@ -157,10 +159,10 @@ To start over with no data, run `docker rm -f nrese && docker volume rm nrese-da
 
 ## This example is a test
 
-The quick start's first query, the retraction and the refused write are also a test,
-[first-example.toml](../scripts/verify/scenarios/first-example.toml), which sends each of them and
-checks the answer. To run it you also need [Python](https://www.python.org/downloads/) 3.11 or
-later. Start a fresh server as the [quick start](../README.md#quick-start) says, then run this from
+The quick start's first query, the retraction, the refused write and a checked upload are also a
+test, [first-example.toml](../scripts/verify/scenarios/first-example.toml), which sends each
+of them and checks the answer. To run it you also need [Python](https://www.python.org/downloads/)
+3.11 or later. Start a fresh server as the [quick start](../README.md#quick-start) says, then run this from
 the repository's root:
 
 ```bash
