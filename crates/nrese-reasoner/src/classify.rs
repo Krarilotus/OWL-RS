@@ -47,6 +47,7 @@
 use std::time::{Duration, Instant};
 
 use hashbrown::{HashMap, HashSet};
+use nrese_owl::mapping::AnnotationProperties;
 use nrese_owl::{DECLARATION_KINDS, EntityKind};
 use nrese_xsd::owl::Datatype;
 
@@ -246,6 +247,7 @@ struct Names {
     /// What an `rdf:type` object declares its subject as: nrese-owl's table, so that a
     /// declaration is read as the mapping reads it.
     declarations: TermTable<EntityKind>,
+    annotation_properties: AnnotationProperties,
 }
 
 impl Names {
@@ -287,6 +289,7 @@ impl Names {
                 .iter()
                 .map(|&(class, kind)| (iri(class), kind))
                 .collect(),
+            annotation_properties: AnnotationProperties::new(&mut |text| Some(iri(text))),
         };
         // Every predicate of the mapping's class expressions and data ranges (OWL 2 Mapping to
         // RDF Graphs, Tables 1 to 3): the constructors a node has one of, their fields, and
@@ -611,7 +614,7 @@ struct Graph<'a> {
     data_properties: HashSet<u64>,
     /// The declared annotation properties, whose domains, ranges and sub-properties say
     /// nothing about classes.
-    annotation_properties: HashSet<u64>,
+    annotation_properties: AnnotationProperties,
     /// The blank nodes no class expression of EL can be read from, whatever uses them, and
     /// why: those declared datatypes, a data range, and those whose predicates of the
     /// mapping's class expressions say something EL lacks, decided once per node.
@@ -627,17 +630,19 @@ impl<'a> Graph<'a> {
             by_subject: HashMap::new(),
             names,
             data_properties: HashSet::new(),
-            annotation_properties: HashSet::new(),
+            annotation_properties: names.annotation_properties.clone(),
             refused: HashMap::new(),
             datatypes: std::iter::empty().collect(),
         };
         let mut declared = Vec::new();
         for &[s, p, o] in triples {
             graph.by_subject.entry(s).or_default().push((p, o));
+            graph.annotation_properties.read([s, p, o], named(s));
+            // A property's declaration is of an IRI (the RDF mapping's Table 6), as the
+            // ontology reader reads it: a blank node so typed declares nothing.
             match names.declared(p, o) {
                 Some(EntityKind::Datatype) => declared.push(s),
-                Some(EntityKind::DataProperty) => graph.data_properties.extend([s]),
-                Some(EntityKind::AnnotationProperty) => graph.annotation_properties.extend([s]),
+                Some(EntityKind::DataProperty) if named(s) => graph.data_properties.extend([s]),
                 _ => {}
             }
         }
@@ -1004,13 +1009,15 @@ fn build(
                     }
                 }
             }
-            // An annotation property's domain, range and sub-properties say nothing about
-            // classes, as nrese-owl's mapping reads them.
+            // An annotation property's domain, range and sub-properties, and a sub-property of
+            // one, say nothing about classes, as nrese-owl's mapping reads them.
             Disposition::Property(
                 PropertyAxiom::Sub { equivalent: false }
                 | PropertyAxiom::Domain
                 | PropertyAxiom::Range,
-            ) if graph.annotation_properties.contains(&s) => {}
+            ) if graph.annotation_properties.contains(s) => {}
+            Disposition::Property(PropertyAxiom::Sub { equivalent: false })
+                if graph.annotation_properties.contains(o) => {}
             Disposition::Property(axiom) => match names.roles(axiom, [s, p, o], named) {
                 Err(kind) => skipped.push((p, kind)),
                 Ok(PropertyAxiom::Sub { equivalent }) => {
@@ -2777,6 +2784,159 @@ mod tests {
             ..Classification::default()
         };
         assert_eq!(result, expected);
+    }
+
+    /// The RDF mapping's declarations (§3.1.2, Table 6) are of IRIs: a blank node typed an
+    /// annotation or a data property declares nothing, as the ontology reader reads it, so
+    /// its axioms are read as an inverse property's, which EL lacks: here a range, skipped
+    /// and reported, never left out unsaid.
+    #[test]
+    fn a_blank_nodes_property_typing_declares_nothing() {
+        for kind in ["AnnotationProperty", "OntologyProperty", "DatatypeProperty"] {
+            let (_, result) = run(&format!(
+                "_:i rdf:type owl:{kind}
+                 _:i owl:inverseOf ex:p
+                 _:i rdfs:range ex:C"
+            ));
+            let skipped = result.skipped.iter().any(|s| s.1 == "inverse property");
+            assert!(skipped, "{kind}: {:?}", result.skipped);
+        }
+    }
+
+    /// A sub-property of an annotation property is an annotation axiom whatever its subject
+    /// (the RDF mapping's Table 16, as the ontology reader reads it): it says nothing about
+    /// classes, and nothing is skipped for it, a blank subject's included.
+    #[test]
+    fn a_sub_property_of_an_annotation_property_names_no_class() {
+        for kind in ["AnnotationProperty", "OntologyProperty", "DatatypeProperty"] {
+            let (_, result) = run(&format!(
+                "ex:A rdf:type owl:Class
+                 ex:ap rdf:type owl:AnnotationProperty
+                 _:x rdf:type owl:{kind}
+                 _:x rdfs:subPropertyOf ex:ap"
+            ));
+            assert!(result.skipped.is_empty(), "{kind}: {:?}", result.skipped);
+        }
+    }
+
+    /// How much the classifier reads from `text`: the role inclusions, ranges and told
+    /// subsumers its TBox gets, and the axioms it skips. A statement it passes over adds none.
+    fn reads(text: &str) -> usize {
+        let mut v = LocalVocabulary::default();
+        let triples = load(&mut v, text);
+        let snapshot = v.clone();
+        let named = move |id: u64| snapshot.text(id).starts_with('<');
+        let stop = OperationStop::new(crate::eval::NEVER);
+        let fired = || stop.fired();
+        let poll = Poller::new(&fired).expect("a poller");
+        let checkpoint = Checkpoint { poll, stop: &stop };
+        let Ok((tbox, _, _, skipped)) = build(&triples, &mut v, &named, &checkpoint) else {
+            panic!("never stopped");
+        };
+        let told: usize = tbox.told.iter().map(Vec::len).sum();
+        tbox.sub_roles.len() + tbox.ranges.len() + told + skipped.len()
+    }
+
+    /// The annotation statements and annotation-property schema the ontology reader reads
+    /// past in `text` ([`nrese_owl::Ontology::annotations`]).
+    fn annotations(text: &str) -> usize {
+        struct Source<'a>(&'a LocalVocabulary, std::collections::HashMap<String, u64>);
+        impl nrese_owl::Terms for Source<'_> {
+            fn kind(&self, term: u64) -> nrese_owl::TermKind {
+                match self.0.text(term).as_bytes()[0] {
+                    b'<' => nrese_owl::TermKind::Iri,
+                    b'_' => nrese_owl::TermKind::Blank,
+                    _ => nrese_owl::TermKind::Literal,
+                }
+            }
+            fn lexical(&self, _: u64) -> Option<String> {
+                None
+            }
+            fn iri(&self, iri: &str) -> Option<u64> {
+                self.1.get(iri).copied()
+            }
+        }
+        let mut v = LocalVocabulary::default();
+        let known = nrese_owl::Vocabulary::iris()
+            .into_iter()
+            .map(|(_, iri)| iri);
+        let known = known.chain(nrese_owl::BUILTIN_ANNOTATIONS.map(str::to_owned));
+        let ids = known.map(|iri| (iri.clone(), v.iri(&iri))).collect();
+        let graph = v.iri("urn:graph");
+        let statements: Vec<nrese_owl::Statement> = load(&mut v, text)
+            .into_iter()
+            .map(|triple| nrese_owl::Statement { triple, graph })
+            .collect();
+        nrese_owl::read(&statements, &Source(&v, ids)).annotations
+    }
+
+    /// A sub-property of an annotation property OWL 2 builds in is an annotation axiom
+    /// whatever its subject, as the ontology reader reads it: the classifier reads nothing
+    /// from it, a blank subject's and a declared object property's included.
+    #[test]
+    fn a_sub_property_of_a_built_in_annotation_property_names_no_class() {
+        for (name, kind) in [("_:x", "AnnotationProperty"), ("ex:p", "ObjectProperty")] {
+            let declared = format!("{name} rdf:type owl:{kind}");
+            let with = format!("{declared}\n{name} rdfs:subPropertyOf rdfs:label");
+            assert_eq!(reads(&with), reads(&declared), "{with}");
+        }
+    }
+
+    /// The statements the classifier passes over as annotation schema are those the
+    /// ontology reader reads as annotation schema, over generated property schemas: a
+    /// statement of `rdfs:subPropertyOf`, `owl:equivalentProperty`, `rdfs:domain` or
+    /// `rdfs:range` after a few declarations, over named, blank and built-in properties, adds
+    /// one to the reader's annotations exactly where the classifier reads nothing from it.
+    /// 3,000 seeded schemas.
+    #[test]
+    fn the_classifier_passes_over_what_the_reader_reads_as_annotation_schema() {
+        let terms = [
+            "ex:a",
+            "ex:b",
+            "_:x",
+            "_:y",
+            "rdfs:label",
+            "owl:versionInfo",
+        ];
+        let kinds = [
+            "AnnotationProperty",
+            "OntologyProperty",
+            "ObjectProperty",
+            "DatatypeProperty",
+            "Class",
+        ];
+        let schema = [
+            "rdfs:subPropertyOf",
+            "owl:equivalentProperty",
+            "rdfs:domain",
+            "rdfs:range",
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut pick = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for round in 0..3_000 {
+            let declarations: Vec<String> = (0..1 + pick(3))
+                .map(|_| format!("{} rdf:type owl:{}", terms[pick(6)], kinds[pick(5)]))
+                .collect();
+            let declarations = declarations.join("\n");
+            let (s, p) = (terms[pick(6)], schema[pick(4)]);
+            let o = if p.contains("Property") {
+                terms[pick(6)]
+            } else {
+                "ex:C"
+            };
+            let with = format!("{declarations}\n{s} {p} {o}");
+            let reader = annotations(&with) == annotations(&declarations) + 1;
+            let classifier = reads(&with) == reads(&declarations);
+            assert_eq!(
+                reader, classifier,
+                "round {round}, the reader's {reader}:\n{with}"
+            );
+        }
     }
 
     /// A name declared `owl:DataRange` is a datatype, as one declared `rdfs:Datatype` is (the
