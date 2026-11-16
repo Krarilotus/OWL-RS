@@ -1019,8 +1019,8 @@ fn dl_answers_agree_with_outside_reasoners() {
 #[test]
 #[cfg(unix)]
 fn planted_answers_are_judged_by_kind_and_label() {
-    let command = r#"awk -F'\t' '{ printf "c"; for (i = 3; i <= NF; i++) if ($i != "") printf "0"
-        print ""; fflush() }'"#;
+    let command = r#"awk -W interactive -F'\t' '{ printf "c"; for (i = 3; i <= NF; i++)
+        if ($i != "") printf "0"; print ""; fflush() }'"#;
     let mut nothing = Reference::new(command.to_owned(), Duration::from_secs(10));
     let (case, none) = (generate(0), BTreeSet::new());
     let mut verdict = |picked: &[usize], got: &Answers| {
