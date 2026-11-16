@@ -66,14 +66,15 @@ chain | f:p3 owl:propertyChainAxiom ( f:p1 f:p2 ) . f:a0 f:p1 f:a1 . f:a1 f:p2 f
 /// Keys over anonymous individuals, one a line (name | Turtle as in [`TEMPLATES`] | the question
 /// the key answers, an atom of [`QUERIES`] over names | who judges it), each in a case with
 /// probability 1/4. `hermit`: HermiT alone; `both`: a control, where the references must agree.
+/// OWL 2 DL has no anonymous individual in `owl:sameAs`: such a class comes of a functional `f:pk`.
 const KEYS: &str = "
 anon-object | {C1} owl:hasKey ( {P} ) . f:a1 a {C1} ; {P} _:k1 . f:a2 a {C1} ; {P} _:k1 . | S f:a1 f:a2 | hermit
 anon-subject | {C1} owl:hasKey ( {D} ) . f:a1 a {C1} ; {D} {V} . _:k2 a {C1} , {C2} ; {D} {W} . | T {C2} f:a1 | hermit
-anon-value-class | {C1} owl:hasKey ( {P} ) . f:a1 a {C1} ; {P} _:k3 . f:a2 a {C1} ; {P} _:k4 . _:k3 owl:sameAs _:k4 . | S f:a1 f:a2 | hermit
+anon-value-class | {C1} owl:hasKey ( {P} ) . f:pk a owl:ObjectProperty , owl:FunctionalProperty . f:a1 a {C1} ; {P} _:k3 . f:a2 a {C1} ; {P} _:k4 . [] f:pk _:k3 , _:k4 . | S f:a1 f:a2 | hermit
 named-value-class | {C1} owl:hasKey ( {P} ) . f:a1 a {C1} ; {P} f:a3 . f:a2 a {C1} ; {P} f:a0 . f:a3 owl:sameAs f:a0 . | S f:a1 f:a2 | both
-mixed-value-class | {C1} owl:hasKey ( {P} ) . f:a1 a {C1} ; {P} _:k5 . f:a2 a {C1} ; {P} _:k6 . _:k5 owl:sameAs f:a3 . _:k6 owl:sameAs f:a3 . | S f:a1 f:a2 | both
-named-subject-class | {C1} owl:hasKey ( {P} ) . _:k7 a {C1} ; {P} f:a3 ; owl:sameAs f:a1 . f:a2 a {C1} ; {P} f:a3 . | S f:a1 f:a2 | both
-anon-subject-class | {C1} owl:hasKey ( {P} ) . _:k8 a {C1} ; {P} f:a3 ; owl:sameAs _:k9 . _:k9 a {C2} . f:a2 a {C1} ; {P} f:a3 . | T {C2} f:a2 | hermit
+mixed-value-class | {C1} owl:hasKey ( {P} ) . f:pk a owl:ObjectProperty , owl:FunctionalProperty . f:a1 a {C1} ; {P} _:k5 . f:a2 a {C1} ; {P} _:k6 . [] f:pk _:k5 , _:k6 , f:a3 . | S f:a1 f:a2 | both
+named-subject-class | {C1} owl:hasKey ( {P} ) . f:pk a owl:ObjectProperty , owl:FunctionalProperty . _:k7 a {C1} ; {P} f:a3 . [] f:pk _:k7 , f:a1 . f:a2 a {C1} ; {P} f:a3 . | S f:a1 f:a2 | both
+anon-subject-class | {C1} owl:hasKey ( {P} ) . f:pk a owl:ObjectProperty , owl:FunctionalProperty . _:k8 a {C1} ; {P} f:a3 . _:k9 a {C2} . [] f:pk _:k8 , _:k9 . f:a2 a {C1} ; {P} f:a3 . | T {C2} f:a2 | hermit
 named-two | {C1} owl:hasKey ( {P} {D} ) . f:a1 a {C1} ; {P} f:a3 ; {D} {V} . f:a2 a {C1} ; {P} f:a3 ; {D} {W} . | S f:a1 f:a2 | both
 anon-two | {C1} owl:hasKey ( {P} {D} ) . f:a1 a {C1} ; {P} _:k10 ; {D} {V} . f:a2 a {C1} ; {P} _:k10 ; {D} {W} . | S f:a1 f:a2 | hermit
 ";
