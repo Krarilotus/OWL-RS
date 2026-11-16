@@ -26,7 +26,7 @@ squeue -u $USER
 cat /work/$USER/nrese/results/*/integration.csv
 ```
 
-The example tier takes seconds. For the project's cohort and full data, build them in the workload's repository first (its `just` recipes; the RG source needs a token of a project member), then:
+The example tier takes seconds. For the project's cohort and full data, build them in the workload's repository first (its `just` recipes), then:
 
 ```sh
 sbatch --export=ALL,TIER_NAME=cohort benches/cluster/integration.sbatch nrese current
