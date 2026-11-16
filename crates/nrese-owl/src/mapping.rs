@@ -81,7 +81,8 @@ pub struct Ontology {
     pub diagnostics: Vec<Diagnostic>,
     /// Annotation statements and the ontology header, read past.
     pub annotations: usize,
-    /// The annotation properties given a domain, a range or a super-property, read past
+    /// The annotation properties (declared or built in) given a domain, a range, a
+    /// super-property, or a sub-property of another kind (no OWL 2 DL axiom), read past
     /// among [`Self::annotations`]: OWL 2 DL gives these axioms no meaning, while the OWL 2
     /// RL rules over the triples (prp-dom, prp-rng, prp-spo1) read them. Sorted, each once.
     pub annotation_schema: Vec<Term>,
@@ -1268,9 +1269,10 @@ impl<'a> Reader<'a> {
                 self.add(Axiom::DisjointUnion(s, canonical(classes)), triple);
             }
         } else if is(p, v.rdfs_sub_property_of) {
-            if self.declared_as(s, EntityKind::AnnotationProperty) {
+            let subject = self.annotation_property(s);
+            if subject || self.annotation_property(o) {
                 self.annotations += 1;
-                self.annotation_schema.push(s);
+                self.annotation_schema.push(if subject { s } else { o });
             } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
                 self.add(Axiom::SubDataPropertyOf(s, o), triple);
             } else if let (Some(sub), Some(sup)) =
@@ -1323,7 +1325,7 @@ impl<'a> Reader<'a> {
             }
         } else if is(p, v.rdfs_domain) || is(p, v.rdfs_range) {
             let domain = is(p, v.rdfs_domain);
-            if self.declared_as(s, EntityKind::AnnotationProperty) {
+            if self.annotation_property(s) {
                 self.annotations += 1;
                 self.annotation_schema.push(s);
             } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
@@ -1504,6 +1506,12 @@ impl<'a> Reader<'a> {
             v.owl_imports,
         ]
         .contains(&Some(predicate))
+    }
+
+    /// Declared an annotation property, or one OWL 2 builds in (declared implicitly: §5.8).
+    fn annotation_property(&self, term: Term) -> bool {
+        let builtin = BUILTIN_ANNOTATIONS.map(|iri| self.terms.iri(iri));
+        self.declared_as(term, EntityKind::AnnotationProperty) || builtin.contains(&Some(term))
     }
 
     /// `rdfs:label` and the other annotation properties OWL 2 builds in.
