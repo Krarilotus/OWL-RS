@@ -903,7 +903,8 @@ impl Upper {
     /// in a known class, an object property U1 knows as one between named individuals, a
     /// data property it knows as one with a literal, or an equality. Anything else
     /// (schema, blank nodes, OWL's vocabulary, new vocabulary, a property used as the
-    /// other kind, which the reading of the ontology then gives it) means recompiling.
+    /// other kind or as both, whose kind the reading then gives by its uses) means
+    /// recompiling.
     pub fn is_assertion(&self, [s, p, o]: Triple) -> bool {
         let named = |t: u64| TermId::from_raw(t).kind() == nrese_engine::TermKind::Iri;
         if !named(s) {
@@ -915,8 +916,10 @@ impl Upper {
         if p == self.same_as {
             return named(o);
         }
-        (named(o) && self.object_properties.contains(&p))
-            || (TermId::from_raw(o).kind().is_literal() && self.data_properties.contains(&p))
+        let object = self.object_properties.contains(&p);
+        let data = self.data_properties.contains(&p);
+        (named(o) && object && !data)
+            || (TermId::from_raw(o).kind().is_literal() && data && !object)
     }
 
     /// The stack's change for a commit, computed before it and applied after it
