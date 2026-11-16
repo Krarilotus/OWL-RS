@@ -1,7 +1,6 @@
 """The endpoint's classification as a case (fast.py `endpoint-classify`): GET /dataset/classification
 timed alone, its answer in one form for every side's server, and an answer the server didn't give
-(refused, incomplete, undecided, not 200) failing as not answered, never as wrong and never as a pass
-(the master, 14 Nov 2026 18:24).
+(refused, incomplete, undecided, not 200) failing as not answered, never as wrong and never as a pass.
 
     python -m unittest discover benches/suite/tests
 """

@@ -67,7 +67,7 @@ fn a_first_load_reports_what_every_plan_reports() {
                         .storing_representatives(compact)
                         .maintaining_by(plan);
                     if compact {
-                        engine.set_equality(Some(
+                        tx.read_equality_as(Some(
                             tx.intern(
                                 nrese_rdf::NamedNodeRef::new_unchecked(
                                     "http://www.w3.org/2002/07/owl#sameAs",

@@ -67,7 +67,7 @@ gate_key() {
 
 # windows_inputs COMMIT: the hash of what the Windows part may read at COMMIT: every tracked file
 # but the documentation (docs/, the top level's *.md) no other file names. Any file but those can
-# be read (a crate's tests read the Dockerfile and ops/: Sol, 26 Oct 2026), and a doc that code,
+# be read (a crate's tests read the Dockerfile and ops/), and a doc that code,
 # a test or a comment names by its path may be (docs/ops/config-reference.md, compiled into
 # nrese-server), so it stays an input.
 windows_inputs() {
@@ -76,7 +76,7 @@ windows_inputs() {
   docs=$(printf '%s\n' "$files" | awk -F '\t' '$2 ~ /^docs\// || $2 ~ /^[^\/]*\.md$/ { print $2 }')
   if [ -n "$docs" ]; then
     # Bare matches whatever the user's settings (line numbers, columns, colour, files taken for
-    # binary, which give "Binary file ... matches": Sol, 26 Oct 2026).
+    # binary, which give "Binary file ... matches").
     named=$(printf '%s\n' "$docs" | git grep -a --no-line-number --no-column --no-color -h -o -F -f - "$1" -- . \
       ':(exclude)docs' ':(exclude,glob)*.md')
     [ $? -le 1 ] || return 1

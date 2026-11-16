@@ -47,7 +47,7 @@
 # steps; results go to FLEET_OUT. GATE_CASES limits the cases (a dry run), GATE_MAX_GB is the
 # memory the host gives a case (default 24: a larger cap is not run, never lowered),
 # GATE_MIN_BLOCKS the blocks of the round (default 2; fewer is diagnostic). GATE_BIG_GB and
-# GATE_BIG_HOST: cases with caps up to it run on that Linux host instead (khaleesi-wsl; its own
+# GATE_BIG_HOST: cases with caps up to it run on that Linux host instead (the development machine's WSL VM; its own
 # job: GATE_MIN_GB the timed host's limit, GATE_MAX_GB the big one's). No case is waived: only an owner-approved
 # trade-off accepts a loss, and an exception a wrong answer (benches/release-tradeoffs.toml). SPARQL_DATA (default
 # ~/owlrs/sparql-data) holds the SPARQL workloads' data and their generated query sets.
@@ -63,7 +63,7 @@ export GIT_NO_REPLACE_OBJECTS=1 GIT_GRAFT_FILE=/dev/null
 # characters) passes Windows' 260, which Git for Windows refuses without core.longpaths (the
 # Windows merge check of PR #60's R4; git elsewhere ignores the key). Added to a caller's own
 # GIT_CONFIG_COUNT settings, never in their place. Python reads such paths where Windows' long
-# paths are on (LongPathsEnabled: KRARIS-GPTLER); where not, the check fails closed.
+# paths are on (LongPathsEnabled: the Windows host); where not, the check fails closed.
 configs=${GIT_CONFIG_COUNT:-0}
 export GIT_CONFIG_COUNT=$((configs + 1)) "GIT_CONFIG_KEY_$configs=core.longpaths" "GIT_CONFIG_VALUE_$configs=true"
 GATE=${NRESE_GATE_DIR:-$HOME/owlrs/${GATE_NAME:-gate-v2}}
@@ -82,7 +82,7 @@ anchored() { case $1 in /* | [A-Za-z]:[/\\]*) printf '%s' "$1" ;; *) printf '%s/
 GATE=$(anchored "$GATE") GATE_BIN=$(anchored "$GATE_BIN") OUT=$(anchored "$OUT")
 SPARQL_DATA=$(anchored "$SPARQL_DATA") SHARED=$(anchored "$SHARED")
 mkdir -p "$GATE" "$GATE_BIN" "$OUT"
-# A desktop's file indexer (GNOME's localsearch on phuoc-yu indexes all of $HOME) reads every
+# A desktop's file indexer (GNOME's localsearch on the timed host indexes all of $HOME) reads every
 # file the gate writes, during the passes: these directories are excluded from it (Tracker's
 # ignored-directories-with-content; the file's removal undoes it).
 for dir in "$GATE" "$GATE_BIN"; do [ -e "$dir/.trackerignore" ] || echo "release gate: not indexed" > "$dir/.trackerignore"; done
@@ -365,7 +365,7 @@ from suitekit import hosts; print(hosts.input_path("general") or "")')
   fast_env
   # The plan: what this host runs at the cases' declared caps. Replaced only whole and only
   # when made: a failed plan left the passes of another job in this directory an empty one
-  # (aa3-phuoc-timed, 19 Oct 2026).
+  # (an A-A' run on the timed host, 19 Oct 2026).
   # The family's baselines: GATE_BASELINES (default base,main; an A-B-B-A of two sides: base).
   (cd "$tree" && py benches/fast/release_gate.py plan --max-gb "$MAX_GB" --min-gb "${GATE_MIN_GB:-0}" \
      --baselines "${GATE_BASELINES:-base,main}" \
@@ -375,7 +375,7 @@ from suitekit import hosts; print(hosts.input_path("general") or "")')
   cp "$GATE/plan.json" "$OUT/plan.json"
   cases=$(planned)
   log "plan: $(py -c 'import json,sys; d=json.load(open(sys.argv[1])); print(len(d["run"]), "cases;", len(d["not_run"]), "not run;", len(d["elsewhere"]), "in the big part")' "$GATE/plan.json")"
-  # The cases' SPARQL data is this job's to make (Johannes, 2 Nov 2026), into the host's cache
+  # The cases' SPARQL data is this job's to make, into the host's cache
   # (SPARQL_DATA, benches/hosts.toml [caches]): what benches/sparql/prepare.sh makes and the host
   # lacks is made now, and the query sets are checked by name and SHA-256 (release_gate.py
   # data_state(), their one validator; review r1 R1-F2); anything not as pinned stops preparation.
@@ -540,7 +540,7 @@ block)
   # 2026: a restart accepted a disturbed block, or ran a third attempt).
   state=$OUT/passes/block-$n.state
   # Each state is a prerequisite of what follows it: written aside, synced, renamed over the old
-  # one, the directory synced; if any of it fails the step ends there (Sol, 20 Oct 2026: a failed
+  # one, the directory synced; if any of it fails the step ends there (a failed
   # rename went unnoticed and the block ran a third time).
   set_state() {
     py -c 'import os, sys
@@ -659,7 +659,7 @@ print(v if v in ("quiet", "disturbed", "unwatched") else "")' "$OUT/passes/quiet
   # A disturbed block (work not the job's own busy too often, quiet-watch.py) is left out of the
   # statistics, both sides (the disturbance is the host's, not a side's: dropping it is unbiased),
   # its reports kept aside as disturbed-*; it runs once more. A repeat disturbed again is kept,
-  # and the report says so (the orchestrator's policy, 20 Oct 2026).
+  # and the report says so.
   while :; do
     case $stage in
       start | running)
@@ -851,7 +851,7 @@ pack)
   ;;
 
 unpack)
-  # The binaries are Linux ELF: on any other system (native Windows: khaleesi, not khaleesi-wsl)
+  # The binaries are Linux ELF: on any other system (native Windows: the development machine, not the development machine's WSL VM)
   # nothing is unpacked and the job fails, never runs them some other way.
   [ "$(uname -s)" = Linux ] || { log "unpack: $(uname -s) is not Linux: the gate's binaries can't run here"; exit 2; }
   src=${FLEET_INPUT_BINARIES:?the binaries of the build job, its input named binaries}

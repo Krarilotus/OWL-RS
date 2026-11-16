@@ -436,7 +436,7 @@ esac
                              f"SPEC whole-record: {state} {result}\n{err}")
 
     def test_a_job_compiles_and_tests_on_the_cores_it_asks_for(self):
-        """A host shared under a presence cap (office-pc, khaleesi) limits memory, not CPUs: the job's
+        """A host shared under a presence cap (the shared host, the development machine) limits memory, not CPUs: the job's
         compilers and test runners use the cores it asks for (remote-gates, uncommitted, 21 Oct)."""
         (self.fake / "status-gate-1").write_text(json.dumps({"state": "pending", "host": "-"}))
         self.env["NRESE_GATE_START_S"] = "0"
@@ -467,7 +467,7 @@ esac
                              f"SPEC gate-repair: {repair!r}")
 
     def test_the_merge_checks_jobs_are_merge_gates(self):
-        """The orchestrator, 31 Oct 2026: the merge check's jobs go ahead as the fleet's merge gates, either
+        """The merge check's jobs go ahead as the fleet's merge gates, either
         tier's for a commit that goes to refactor/engine-v2, as its caller states (NRESE_PUSH_REF). Sol,
         merge-gate-class r1: told by the parents instead, a merge check of merges chained before their
         push wasn't one, and a package that merges another was. PR #69 r1 R1: every Windows check was
@@ -524,7 +524,7 @@ esac
                 self.assertIn('hosts = ["office-pc", "phuoc-yu", "gamergrill"]', (self.fake / "job-2.toml").read_text())
 
     def test_a_windows_failure_on_khaleesi_is_checked_again_on_a_windows_host(self):
-        """The Windows part's re-check after an unconfirmed failure goes to kraris-gptler: a Linux host
+        """The Windows part's re-check after an unconfirmed failure goes to the Windows host: a Linux host
         would never start it."""
         failing = {"code": 1, "steps": [{"name": "test", "code": 1, "seconds": 1}]}
         self.job(1, "khaleesi", "failed", tier="windows", **failing)
@@ -883,7 +883,7 @@ class WindowsCheck(Repo):
 
     def test_a_commit_that_changes_an_input_runs_again(self):
         """Rust code, any file but documentation (a crate's tests read the Dockerfile and ops/), and a
-        doc that code names are inputs: a change to one runs the Windows part again (Sol, 26 Oct), also
+        doc that code names are inputs: a change to one runs the Windows part again, also
         when the user's settings decorate git's grep output or take files for binary."""
         for key in ("grep.lineNumber", "grep.column", "diff.default.binary"):
             self.git(self.repo, "config", "--global", key, "true")

@@ -4,7 +4,7 @@ built anywhere else).
 
 On a shared host several jobs run at once or back to back, and fleet checks every job out into a
 directory named `work`: names derived from the checkout's directory collided, so jobs timed each
-other's builds and one job's cleanup removed another's volumes (office-pc, 19 Oct 2026). Here:
+other's builds and one job's cleanup removed another's volumes (the shared host, 19 Oct 2026). Here:
 
     namespace(root)      the job's namespace: FLEET_JOB (the fleet job's id) when set, else a
                          digest of the checkout's path; every name below carries it
