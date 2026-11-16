@@ -100,8 +100,9 @@ planned.
   are two terms to the store. A reader of only some graphs gets it wherever the query
   compares values, so their status says nothing about graphs they can't read. Compare values
   in a `FILTER` instead. A query with a triple term or a base-direction literal, or whose
-  reader's graphs hold a triple term, is never `complete`: OWL 2 doesn't define them. None
-  known ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)).
+  reader's graphs hold a triple term, is never `complete`: OWL 2 doesn't define them. For
+  triple terms, none known
+  ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)).
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo` and make no new blank nodes; with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)). None known.
