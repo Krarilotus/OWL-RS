@@ -32,6 +32,11 @@ S=$OUT/summary.tsv
     END {print "cases", all; print "cases with a query judged", n + 0}' "$S"
   echo "not judged: an inconsistent state after the first commit that the store accepted"
   echo "failures not written (unwritten.tsv, with why): $(wc -l < "$OUT/unwritten.tsv")"
+  # The certification: answers marked unsound and wrong, unsound and right, unmarked and wrong.
+  awk -F'\t' -v OFS='\t' '{s[$1]; u[$1] += $5 == "unsound-wrong"; r[$1] += $5 == "unsound-right"
+    w[$1] += $5 == "wrong"} END {for (k in s) print k, u[k], r[k], w[k]}' "$S" | sort -n > "$OUT/marks.tsv"
+  awk -F'\t' '{u += $2; r += $3; w += $4} END {print "marked unsound and wrong", u + 0
+    print "marked unsound and right", r + 0; print "not marked and wrong (must be 0)", w + 0}' "$OUT/marks.tsv"
   awk -F'\t' '$6 == "set-aside"' "$S" > "$OUT/set-aside.tsv"
   awk -F'\t' '$5 ~ /^declined/' "$S" > "$OUT/declined.tsv"; } > "$OUT/counts.txt"
 exit "${rc:-0}"

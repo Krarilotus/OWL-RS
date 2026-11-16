@@ -726,10 +726,11 @@ impl Case {
             .filter(|r| asked(r) && !expected.contains(r))
             .collect();
         let missing: Vec<_> = expected.iter().filter(|r| !a.rows.contains(**r)).collect();
-        // Every read by its label, the inferred statements' too: `unsound` and `not-certified`
-        // are counted, with what was wrong in the detail.
+        // Is the certification honest: a row the references don't entail passes only under
+        // `unsound`, counted apart, wrong or right (the coarse mark's price).
         let class = match (a.label.as_str(), wrong.is_empty(), missing.is_empty()) {
-            ("complete" | "none" | "sound-only", false, _) => "wrong",
+            ("unsound", right, _) => ["unsound-wrong", "unsound-right"][right as usize],
+            (_, false, _) => "wrong",
             ("complete" | "none", true, false) => "missing",
             ("sound-only", true, false) => "sound-only-missing",
             ("complete" | "none" | "sound-only", true, true) => "agree",
@@ -895,8 +896,8 @@ fn dl_answers_agree_with_outside_reasoners() {
 /// Planted answers, with a stand-in reference that calls all data consistent and entails
 /// nothing. A refusal is read by its kind: one declined as undecided is counted as such,
 /// neither a pass nor a wrong verdict; one of a kind the check doesn't know fails the run.
-/// A read is judged by its label, the inferred statements' too: a wrong row is counted
-/// under `unsound` and fails under `sound-only`.
+/// A read is judged by its label, the inferred statements' too: a row the references don't
+/// entail is counted under `unsound` and fails under any other label.
 #[test]
 #[cfg(unix)]
 fn planted_answers_are_judged_by_kind_and_label() {
@@ -918,8 +919,10 @@ fn planted_answers_are_judged_by_kind_and_label() {
         Ok((vec![Ok(Answer { label, paths, rows })], String::new()))
     };
     let inferred = [case.queries.len()];
-    assert_eq!(verdict(&inferred, &read("unsound")), "unsound");
-    assert_eq!(verdict(&inferred, &read("sound-only")), "wrong");
+    assert_eq!(verdict(&inferred, &read("unsound")), "unsound-wrong");
+    for label in ["sound-only", "complete", "not-certified"] {
+        assert_eq!(verdict(&inferred, &read(label)), "wrong", "{label}");
+    }
 }
 
 /// The real references, for the planted faults below (run by outside.sh before a campaign).
