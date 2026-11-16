@@ -35,7 +35,7 @@ pub struct AppState {
     replication: Arc<crate::replication::ReplicationState>,
     /// Why the default repository can't serve until a restart, if it can't
     /// ([`nrese_store::StoreService::unavailable`]): read on every request
-    /// ([`crate::app`]'s `default_repository_available`), one atomic load.
+    /// ([`crate::app`]'s `screen`), one atomic load.
     default_unavailable: Arc<std::sync::OnceLock<String>>,
 }
 
