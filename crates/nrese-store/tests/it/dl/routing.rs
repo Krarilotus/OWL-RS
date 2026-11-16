@@ -1426,3 +1426,185 @@ fn a_pending_annotation_declaration_marks_the_read_inside_the_transaction() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+/// `( :{prefix}1 … :{prefix}n )`.
+fn properties(prefix: &str, n: usize) -> String {
+    let members: Vec<String> = (1..=n).map(|i| format!(":{prefix}{i}")).collect();
+    format!("( {} )", members.join(" "))
+}
+
+/// `:p` the chain of `n` properties, and a path `:a0 :p1 :a1 … :a{n-1} :pn :an`.
+fn chain(n: usize) -> String {
+    let mut data = format!(":p owl:propertyChainAxiom {} .", properties("p", n));
+    for i in 1..=n {
+        data.push_str(&format!(" :a{} :p{i} :a{i} .", i - 1));
+    }
+    data
+}
+
+/// Two `:K` with the same value on each of `n` key properties.
+fn key_of(n: usize) -> String {
+    let mut data = format!(":K owl:hasKey {} .", properties("k", n));
+    for x in ["x", "y"] {
+        data.push_str(&format!(" :{x} a :K"));
+        for i in 1..=n {
+            data.push_str(&format!(" ; :k{i} :v{i}"));
+        }
+        data.push_str(" .");
+    }
+    data
+}
+
+/// `:C` the intersection of `n` classes, and `:x` in each of them.
+fn intersection(n: usize) -> String {
+    let mut data = format!(
+        ":C owl:equivalentClass [ owl:intersectionOf {} ] . :x",
+        properties("A", n)
+    );
+    let types: Vec<String> = (1..=n).map(|i| format!(" a :A{i}")).collect();
+    data.push_str(&types.join(" ;"));
+    data.push_str(" .");
+    data
+}
+
+/// The chain of seven properties `:q1 … :q7` written node by node (`_:l1 … _:l7`), with a
+/// path `:a0 :q1 :a1 … :q7 :a7`; and a second list `_:m1 … _:m7` of `:r1 … :r7`, each node
+/// the same as the first list's. The closure gives each of the chain's nodes two members
+/// and two rests: 2^7 member sequences, more than the reasoner reads (`MAX_VARIANTS`, 64).
+/// With `cycle`, the last node is instead the same as the first: the chain's list returns
+/// to its head through `owl:sameAs`, which the reader, reading the statements as written,
+/// doesn't see.
+fn aliased_chain(cycle: bool) -> String {
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let node = |list: &str, i: usize, member: &str| {
+        let rest = match i {
+            7 => format!("<{RDF}nil>"),
+            _ => format!("_:{list}{}", i + 1),
+        };
+        format!(" _:{list}{i} <{RDF}first> :{member}{i} ; <{RDF}rest> {rest} .")
+    };
+    let mut data = String::from(":p owl:propertyChainAxiom _:l1 .");
+    for i in 1..=7 {
+        data.push_str(&node("l", i, "q"));
+        data.push_str(&format!(" :a{} :q{i} :a{i} .", i - 1));
+        if !cycle {
+            data.push_str(&node("m", i, "r"));
+            data.push_str(&format!(" _:m{i} owl:sameAs _:l{i} ."));
+        }
+    }
+    if cycle {
+        data.push_str(" _:l7 owl:sameAs _:l1 .");
+    }
+    data
+}
+
+/// The OWL 2 RL closure the store under `owl2-dl` keeps.
+fn rl_rules() -> nrese_reasoner::RuleProgram {
+    ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+        .materialised_program()
+        .expect("owl2-dl keeps the OWL 2 RL closure")
+}
+
+/// A list axiom of OWL 2 RL that the rules build (the control rows), or leave out: a
+/// chain past [`nrese_reasoner::lists::MAX_RULE_MEMBERS`] (250), a key past
+/// `MAX_KEY_MEMBERS` (127), an intersection past 256 classes (cls-int1's atoms), a list
+/// with more member sequences than `MAX_VARIANTS`, and one that returns to its head through
+/// `owl:sameAs`. Each with the query its rule (prp-spo2, prp-key, cls-int1; OWL 2 Profiles
+/// §4.3) entails `true`, on both ways a route is taken: a commit (`prepare`) and a read of
+/// data that came past the gates (`afresh`). A control stays on the rules' route and
+/// answers `true`. A row the rules leave out leaves the route, and answers `true`, or
+/// `false` with `complete: false`: an ASK that misses an entailed `true` says it may be
+/// incomplete. (Every query here entails `true`, so no answer is a row the entailment
+/// doesn't hold, which would need `sound: false`.) A malformed list, or one with a cycle as
+/// written, is the reader's fatal `BrokenList`: off the route whatever the record says, so
+/// not here.
+#[test]
+fn a_list_axiom_the_rules_leave_out_leaves_the_rl_route() {
+    let rows: [(&str, String, &str, bool); 9] = [
+        ("chain 250", chain(250), "ASK { :a0 :p :a250 }", true),
+        ("chain 251", chain(251), "ASK { :a0 :p :a251 }", false),
+        ("key 127", key_of(127), "ASK { :x owl:sameAs :y }", true),
+        ("key 128", key_of(128), "ASK { :x owl:sameAs :y }", false),
+        (
+            "intersection 256",
+            intersection(256),
+            "ASK { :x a :C }",
+            true,
+        ),
+        (
+            "intersection 257",
+            intersection(257),
+            "ASK { :x a :C }",
+            false,
+        ),
+        (
+            "variants",
+            aliased_chain(false),
+            "ASK { :a0 :p :a7 }",
+            false,
+        ),
+        (
+            "sameAs cycle",
+            aliased_chain(true),
+            "ASK { :a0 :p :a7 }",
+            false,
+        ),
+        (
+            "chain 7",
+            aliased_chain(false).replace("owl:sameAs", ":alias"),
+            "ASK { :a0 :p :a7 }",
+            true,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, data, read, built) in rows {
+        for path in ["commit", "read"] {
+            let dl = pipeline();
+            if path == "commit" {
+                insert(&dl, &data).expect("an RL ontology");
+            } else {
+                let turtle = format!("{}{data}", super::PREFIXES);
+                crate::support::load_past_the_pipeline(dl.store(), &turtle);
+                dl.store().rematerialise(rl_rules()).expect("rebuilt");
+            }
+            let (rows, status) = query(&dl, read);
+            let route = dl.store().dl_bounds().last;
+            let line = format!("{what}, {path}: route {route}, {rows:?}, {status:?}");
+            eprintln!("{line}");
+            let entailed = rows == ["true"];
+            let honest = if built {
+                route == "rules" && entailed
+            } else {
+                route != "rules" && (entailed || !status.shared.complete)
+            };
+            if !honest {
+                wrong.push(line);
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// prp-spo2, prp-rng and cax-dw: `:a0 :p :an` through the chain puts `:an` in `:p`'s
+/// range `:R`, which is disjoint from `:S`; with `:an a :S` the data has no model, and the
+/// commit that adds the clash is rejected. (A range on a chain's super-property is OWL 2 DL
+/// and RL; disjoint properties would need a simple property, which `:p` isn't.)
+#[test]
+fn a_clash_through_a_long_property_chain_is_rejected() {
+    let mut wrong = Vec::new();
+    for n in [250, 251] {
+        let dl = pipeline();
+        insert(&dl, &chain(n)).expect("an RL ontology");
+        let clash = insert(
+            &dl,
+            &format!(":p rdfs:range :R . :R owl:disjointWith :S . :a{n} a :S ."),
+        );
+        if clash.is_ok() {
+            wrong.push(format!(
+                "{n} properties: accepted, route {}, consistency {:?}",
+                dl.store().dl_bounds().last,
+                dl.store().dl().status().map(|s| s.consistency)
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
