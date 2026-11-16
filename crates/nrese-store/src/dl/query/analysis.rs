@@ -548,6 +548,32 @@ fn reserved(iri: &str) -> bool {
     .any(|ns| iri.starts_with(ns))
 }
 
+/// The first IRI outside the [`reserved`] namespaces that `query` names as a pattern's
+/// subject or object and `held` says the data doesn't hold.
+pub(super) fn named_outside(query: &Query, held: impl Fn(&str) -> bool) -> Option<String> {
+    let mut found = None;
+    pattern_of(query).find(&mut |node| {
+        let ends = match node {
+            Node::Pattern(GraphPattern::Bgp { patterns }) => patterns
+                .iter()
+                .flat_map(|t| [&t.subject, &t.object])
+                .collect(),
+            Node::Pattern(GraphPattern::Path {
+                subject, object, ..
+            }) => vec![subject, object],
+            _ => Vec::new(),
+        };
+        found = ends.into_iter().find_map(|end| match end {
+            TermPattern::NamedNode(n) if !reserved(n.as_str()) && !held(n.as_str()) => {
+                Some(n.as_str().to_owned())
+            }
+            _ => None,
+        });
+        found.is_some()
+    });
+    found
+}
+
 /// The first read of `query` that may miss entailed rows wherever it is answered (default
 /// deny): any but a predicate outside the [`reserved`] namespaces or `rdf:type` with a
 /// class constant outside them. A variable predicate, a negated property set and DESCRIBE

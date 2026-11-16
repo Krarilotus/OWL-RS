@@ -448,6 +448,9 @@ case "$mode" in
     # windows_inputs; process review 20 Oct 2026, §3A).
     mapfile -t files < <(changed_files commit)
     step fmt cargo fmt --all --check
+    # No run of spaces inside a product string: a string continued on the next line without its
+    # `\` keeps that line's indentation, and the message reaches its reader with it.
+    step "message strings" bash -c '! git grep -n -E "^\s*\"[^\"]*[a-z,;:)] {6,}[a-z(]" -- "crates/*/src/*.rs" ":!*tests*"'
     if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
       step locks bash scripts/check-locks.sh
       step features bash scripts/check-features.sh
