@@ -236,6 +236,65 @@ fn equality_rules_under_other_names_answer_as_ordinary_rules_through_a_restart()
     assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
 }
 
+/// [`EQUALITY_N3`] without `eq-sym` and `eq-trans`: the subclass rule and the three rules that
+/// copy a fact to a `sameAs` partner of its subject, predicate or object, which are not all of
+/// the equality rules, so each runs as written. Over `a sameAs b`, `b sameAs c`, `a a Dog` and
+/// `d a Dog` they entail `b` and `c` Dogs, `b sameAs b`, `c sameAs c`, `c sameAs b` and
+/// `a sameAs c` (the object copy of `a sameAs b` to `c`); not `b sameAs a`, `a sameAs a` or
+/// `c sameAs a`, which [`EQUALITY_N3`] entails.
+const COPIES_N3: &str = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+{ ?x rdf:type ?c . ?c rdfs:subClassOf ?d } => { ?x rdf:type ?d } .
+{ ?s owl:sameAs ?t . ?s ?p ?o } => { ?t ?p ?o } .
+{ ?p owl:sameAs ?q . ?s ?p ?o } => { ?s ?q ?o } .
+{ ?o owl:sameAs ?t . ?s ?p ?o } => { ?s ?p ?t } .
+";
+
+/// After a store's rules change, its commits answer as the new rules entail: two commits under
+/// [`EQUALITY_N3`], then a pipeline with [`COPIES_N3`] takes the store over, and its second
+/// commit, maintained from the first, brings `b sameAs c`. Those rules copy `owl:sameAs` facts
+/// as they copy any other.
+#[test]
+fn a_commit_after_the_rules_change_answers_as_the_new_rules_entail() {
+    let store = Arc::new(StoreService::new(in_memory_store_config()).expect("store"));
+    let pipeline = |n3: &str| {
+        let rules = Arc::new(UserRules::n3("rules.n3", n3).expect("the rules parse"));
+        let config = ReasonerConfig::for_mode(ReasoningMode::Custom)
+            .with_rules(Some(rules))
+            .expect("custom rules");
+        MutationPipeline::new(store.clone(), Arc::new(ReasonerService::new(config)))
+    };
+    let same = format!("<{OWL}sameAs>");
+    let before = pipeline(EQUALITY_N3);
+    apply(
+        &before,
+        &format!("INSERT DATA {{ <{EX}a> {same} <{EX}b> }}"),
+    );
+    apply(&before, &format!("INSERT DATA {{ <{EX}a> a <{EX}Dog> }}"));
+    // As a repository's new rules take over its store.
+    before.retire();
+    let after = pipeline(COPIES_N3);
+    apply(&after, &format!("INSERT DATA {{ <{EX}d> a <{EX}Dog> }}"));
+    apply(&after, &format!("INSERT DATA {{ <{EX}b> {same} <{EX}c> }}"));
+    let expected: Vec<(String, bool)> = [
+        ("b", "a", "Dog", true),
+        ("c", "a", "Dog", true),
+        ("b", same.as_str(), "b", true),
+        ("c", same.as_str(), "c", true),
+        ("c", same.as_str(), "b", true),
+        ("a", same.as_str(), "c", true),
+        ("b", same.as_str(), "a", false),
+        ("a", same.as_str(), "a", false),
+        ("c", same.as_str(), "a", false),
+    ]
+    .iter()
+    .map(|&(s, p, o, holds)| (format!("<{EX}{s}> {p} <{EX}{o}>"), holds))
+    .collect();
+    let wrong = ask_all("after the rules change", &after, &expected);
+    assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
+}
+
 /// A user's rule named `eq-rep-p` that copies `p` to `q`, beside a rule that copies `q` back
 /// to `p`: the two derive each other. Deleting the only asserted statement leaves neither: the
 /// program entails nothing from an empty store.
