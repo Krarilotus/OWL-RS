@@ -393,3 +393,91 @@ fn a_cold_build_keeps_the_cached_ontology_of_its_own_revision() {
         after.revision
     );
 }
+
+/// Commits `update` (with the prefixes of [`decided_then`]) through the `owl2-dl` pipeline.
+fn commit(pipeline: &crate::MutationPipeline, update: &str) {
+    use crate::{MutationCommand, MutationTicket, Requester, SparqlUpdateRequest};
+    pipeline
+        .apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!("{MARK_PREFIXES}{update}"))),
+            &Requester::all(),
+            &MutationTicket::new(),
+        )
+        .unwrap();
+}
+
+const MARK_PREFIXES: &str = "PREFIX : <urn:test:> PREFIX owl: <http://www.w3.org/2002/07/owl#> \
+     PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
+
+/// `ASK { :x a :C }` over `first` committed, with `then` committed between the answer's
+/// decision and its status (the hook `AFTER_DECIDED`): the answer and its status.
+fn decided_then(first: &str, then: &'static str) -> (String, nrese_sparql::Completeness) {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
+    let pipeline = std::rc::Rc::new(crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    ));
+    commit(&pipeline, &format!("INSERT DATA {{ {first} }}"));
+    let ran = std::rc::Rc::new(std::cell::Cell::new(false));
+    let (racer, seen) = (std::rc::Rc::clone(&pipeline), std::rc::Rc::clone(&ran));
+    crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || {
+        commit(&racer, then);
+        seen.set(true);
+    })));
+    let prepared = store
+        .prepare_query(&crate::SparqlQueryRequest::all(format!(
+            "{MARK_PREFIXES}ASK {{ :x a :C }}"
+        )))
+        .unwrap();
+    let (mut out, mut status) = (Vec::new(), None);
+    store
+        .run_query_reporting(&prepared, &CancellationToken::new(), &mut out, |s| {
+            status = s
+        })
+        .unwrap();
+    assert!(
+        ran.get(),
+        "the commit ran between the decision and the status"
+    );
+    (String::from_utf8(out).unwrap(), status.expect("a status"))
+}
+
+/// R1-F2, one way: at the decided revision an annotation property's domain puts `:x a :C`
+/// in L only (OWL 2 DL gives the domain no meaning for what it annotates); a commit then
+/// removes the domain. The answer `true`, read at the decided revision, may only come
+/// `unsound`: its status is that revision's, not the later one's.
+#[test]
+fn an_answer_keeps_the_mark_of_its_revision_when_a_commit_repairs_the_ontology() {
+    let (answer, status) = decided_then(
+        ":note a owl:AnnotationProperty ; rdfs:domain :C . :C a owl:Class . :x :note \"n\" .",
+        "DELETE DATA { :note rdfs:domain :C }",
+    );
+    let line = format!("{answer} {} {:?}", status.as_str(), status.reasons);
+    eprintln!("{line}");
+    assert!(
+        answer.contains("true"),
+        "the decided revision's answer: {line}"
+    );
+    assert_eq!(status.as_str(), "unsound", "{line}");
+}
+
+/// R1-F2, the other way: at the decided revision an ordinary property's domain entails
+/// `:x a :C` (the rules' route); a commit then adds an annotation property's domain on other
+/// terms. The answer `true`, entailed at its revision, isn't marked by the later one.
+#[test]
+fn an_answer_takes_no_mark_from_a_later_revision() {
+    let (answer, status) = decided_then(
+        ":note a owl:ObjectProperty ; rdfs:domain :C . :C a owl:Class . :x :note :v .",
+        "INSERT DATA { :other a owl:AnnotationProperty ; rdfs:domain :D . :D a owl:Class . }",
+    );
+    let line = format!("{answer} {} {:?}", status.as_str(), status.reasons);
+    eprintln!("{line}");
+    assert!(
+        answer.contains("true"),
+        "the decided revision's answer: {line}"
+    );
+    assert_ne!(status.as_str(), "unsound", "{line}");
+}

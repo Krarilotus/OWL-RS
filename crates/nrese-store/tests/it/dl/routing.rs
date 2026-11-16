@@ -859,3 +859,44 @@ fn a_read_inside_a_transaction_carries_the_marks() {
     });
     assert!(wrong.is_empty(), "not marked: {wrong:#?}");
 }
+
+/// R1-F3: an addition alone can change how the committed statements read as OWL. Committed:
+/// an ordinary property's domain, which entails `:x a :C` (in the committed closure). Pending:
+/// only `:note a owl:AnnotationProperty`, after which the domain and the assertion are
+/// annotations, which entail nothing about `:x`. The read inside the transaction still finds
+/// `:x a :C` in the committed closure: that `true` may only come `unsound`. The committed
+/// read after it is told what it was told before.
+#[test]
+fn a_pending_annotation_declaration_marks_the_read_inside_the_transaction() {
+    let dl = pipeline();
+    insert(&dl, ":note rdfs:domain :C . :x :note :v . :C a owl:Class .").expect("committed");
+    let read = "ASK { :x a :C }";
+    let (rows, before) = query(&dl, read);
+    let before = format!("{rows:?} {} {:?}", before.shared.as_str(), before.reasons());
+    let declare = StatementOp::Add {
+        data: ntriples(
+            "<http://example.com/note> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://www.w3.org/2002/07/owl#AnnotationProperty> .",
+        ),
+        contexts: Vec::new(),
+    };
+    let (answer, status) = in_transaction(&dl, vec![declare], read);
+    let status = status.expect("a status");
+    let line = format!(
+        "pending: {answer}, status {} ({:?})",
+        status.as_str(),
+        status.reasons
+    );
+    let (rows, after) = query(&dl, read);
+    let after = format!("{rows:?} {} {:?}", after.shared.as_str(), after.reasons());
+    eprintln!("committed before: {before}\n{line}\ncommitted after: {after}");
+    assert!(
+        before.starts_with(r#"["true"]"#),
+        "the committed control: {before}"
+    );
+    assert!(
+        !answer.contains("true") || status.as_str() == "unsound",
+        "{line}"
+    );
+    assert_eq!(before, after, "the pending read changed the committed one");
+}

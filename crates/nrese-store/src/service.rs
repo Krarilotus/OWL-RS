@@ -2391,6 +2391,8 @@ pub(crate) mod hooks {
         /// An invalidation of the certificate has begun its change of the epoch, and the old
         /// certificate is still in place.
         pub(crate) static INSIDE_INVALIDATION: Hook = const { RefCell::new(None) };
+        /// An `owl2-dl` query has decided its answers and is about to compose their status.
+        pub(crate) static AFTER_DECIDED: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {
