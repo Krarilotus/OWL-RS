@@ -665,11 +665,14 @@ impl Case {
         }
     }
 
-    fn name(&self, i: usize) -> &'static str {
-        match self.queries.get(i) {
-            Some(q) => q.name,
-            None if i == self.queries.len() => "inferred",
-            None => "write",
+    /// A query's own name: its kind, then `-2`, `-3` for the kind's later queries in the case.
+    fn name(&self, i: usize) -> String {
+        let last = ["write", "inferred"][(i == self.queries.len()) as usize];
+        let kind = self.queries.get(i).map_or(last, |q| q.name);
+        let earlier = self.queries.iter().take(i).filter(|q| q.name == kind);
+        match earlier.count() {
+            0 => kind.to_owned(),
+            k => format!("{kind}-{}", k + 1),
         }
     }
 
@@ -1053,6 +1056,9 @@ fn planted_answers_are_judged_by_kind_and_label() {
         case.reference_gap()
     };
     assert!(keyed("f:p3") && !keyed("f:p0"));
+    let c = generate(173); // three same-ask queries, two data-ask
+    let names: BTreeSet<String> = (0..c.queries.len() + 2).map(|i| c.name(i)).collect();
+    assert_eq!(names.len(), c.queries.len() + 2, "{names:?}");
 }
 
 /// The real references, for the planted faults below (run by outside.sh before a campaign).
