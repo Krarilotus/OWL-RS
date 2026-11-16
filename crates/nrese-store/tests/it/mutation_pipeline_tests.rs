@@ -1909,7 +1909,8 @@ fn a_restricted_pending_read_scans_its_own_view() {
 /// `owl:sameAs` for each of a committed key's seven properties, and `:z`, which agrees with
 /// `:x` on the key. No list fact is added, but the pending data's equality gives the key's
 /// list 2^7 member sequences, more than the rules build. `:x` and `:z` are the same by the
-/// key, so `:x :name :Z` is entailed: the pending read answers it, or isn't `complete`.
+/// key, so `:x :name :Z` is entailed: the pending read answers it, or is told the list is left
+/// out (any pending read is not `complete`: its operations aren't reasoned over).
 #[test]
 fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
     let pipeline = ql_pipeline(nrese_store::StoreConfig {
@@ -1971,10 +1972,6 @@ fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
         .expect("the pending read");
     let answer = String::from_utf8(answer).expect("utf8");
     println!("pending equality read: {answer} with {status:?}");
-    assert!(
-        answer.contains("true") || status.as_ref().is_some_and(|s| !s.complete),
-        "answered without :x :name :Z and complete: {answer} with {status:?}"
-    );
     if !answer.contains("true") {
         assert!(status.as_ref().is_some_and(list_left_out), "{status:?}");
     }
@@ -1984,23 +1981,19 @@ fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
 /// (interned first), and a transaction adds (RDF4J `ADD`) only `:K :hk :head`: no list fact
 /// as written. The read of `owl:hasKey` reads `:hk` and expands it, so the list scan sees a
 /// key of `:head`'s 128 properties, more than the rules build. `:x` and `:z` agree on all of
-/// them, so `:x :name :Z` is entailed: the pending read answers it, or isn't `complete`. A
-/// restricted reader of the same data, whose pending read always scans its own view, shows
-/// what the scan sees. The store is filled with reasoning off and then closed under
-/// `owl2-rl`, as a store is whose user IRIs were interned before the rules' first compile
-/// (one filled with reasoning off, or preloaded): written through the `owl2-rl` pipeline
-/// first, `owl:hasKey` would be the older id and `:hk` the alias, and no read would reach the
-/// raw pending fact.
+/// them, so `:x :name :Z` is entailed: the pending read answers it, or is told the list is
+/// left out (any pending read is not `complete`). A restricted reader of the same data, whose
+/// pending read always scans its own view, shows what the scan sees. The store is filled with
+/// reasoning off and then closed under `owl2-rl`, as a store is whose user IRIs were interned
+/// before the rules' first compile (one filled with reasoning off, or preloaded): written
+/// through the `owl2-rl` pipeline first, `owl:hasKey` would be the older id and `:hk` the
+/// alias, and no read would reach the raw pending fact.
 #[test]
 fn a_pending_fact_through_an_alias_of_has_key_leaves_out_a_list_under_compact_equality() {
     let (answer, status, scanned) = alias_of_has_key(true);
     assert!(
         scanned.as_ref().is_some_and(list_left_out),
         "the scan doesn't see the key: {scanned:?}"
-    );
-    assert!(
-        answer.contains("true") || status.as_ref().is_some_and(|s| !s.complete),
-        "answered without :x :name :Z and complete: {answer} with {status:?}"
     );
     if !answer.contains("true") {
         assert!(status.as_ref().is_some_and(list_left_out), "{status:?}");
