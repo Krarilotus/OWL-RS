@@ -1971,6 +1971,147 @@ fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
     }
 }
 
+/// Under compact equality, `:hk` is the same as `owl:hasKey` and its class's representative
+/// (interned first), and a transaction adds (RDF4J `ADD`) only `:K :hk :head`: no list fact
+/// as written. The read of `owl:hasKey` reads `:hk` and expands it, so the list scan sees a
+/// key of `:head`'s 128 properties, more than the rules build. `:x` and `:z` agree on all of
+/// them, so `:x :name :Z` is entailed: the pending read answers it, or isn't `complete`. A
+/// restricted reader of the same data, whose pending read always scans its own view, shows
+/// what the scan sees. The store is filled with reasoning off and then closed under
+/// `owl2-rl`, as a store is whose user IRIs were interned before the rules' first compile
+/// (one filled with reasoning off, or preloaded): written through the `owl2-rl` pipeline
+/// first, `owl:hasKey` would be the older id and `:hk` the alias, and no read would reach the
+/// raw pending fact.
+#[test]
+fn a_pending_fact_through_an_alias_of_has_key_leaves_out_a_list_under_compact_equality() {
+    let (answer, status, scanned) = alias_of_has_key(true);
+    assert!(
+        scanned.as_ref().is_some_and(list_left_out),
+        "the scan doesn't see the key: {scanned:?}"
+    );
+    assert!(
+        answer.contains("true") || status.as_ref().is_some_and(|s| !s.complete),
+        "answered without :x :name :Z and complete: {answer} with {status:?}"
+    );
+    if !answer.contains("true") {
+        assert!(status.as_ref().is_some_and(list_left_out), "{status:?}");
+    }
+}
+
+/// [`a_pending_fact_through_an_alias_of_has_key_leaves_out_a_list_under_compact_equality`]'s
+/// data with equality kept as every copy: there reads take the statements as written (no
+/// expansion), and pending statements are not reasoned over, so the scan and the pending skip
+/// see the same raw facts. `:K :hk :head` is no key there: the pending read and the
+/// restricted reader's scan both leave no list out. The store is filled in the same order, so
+/// that `:hk` is again its class's representative.
+#[test]
+fn a_pending_fact_through_an_alias_of_has_key_is_no_key_when_equality_keeps_every_copy() {
+    let (answer, status, scanned) = alias_of_has_key(false);
+    assert!(
+        scanned.as_ref().is_some_and(|s| !list_left_out(s)),
+        "the scan sees a list left out: {scanned:?}"
+    );
+    assert!(
+        status.as_ref().is_some_and(|s| !list_left_out(s)),
+        "{answer} with {status:?}"
+    );
+}
+
+/// The committed data of [`a_pending_fact_through_an_alias_of_has_key_leaves_out_a_list_under_compact_equality`]
+/// (`compact` or not), and, as `:K :hk :head` pending would leave it, the answer and status of
+/// `ASK { :x :name :Z }` and the status of the same read by a restricted reader.
+fn alias_of_has_key(
+    compact: bool,
+) -> (
+    String,
+    Option<nrese_sparql::Completeness>,
+    Option<nrese_sparql::Completeness>,
+) {
+    let store = Arc::new(
+        StoreService::new(nrese_store::StoreConfig {
+            ql_rewriting: nrese_store::QlRewritingMode::On,
+            equality_by_representatives: true,
+            equality_compact: compact,
+            ..in_memory_store_config()
+        })
+        .expect("store"),
+    );
+    let (rdf, owl) = (
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#",
+        "http://www.w3.org/2002/07/owl#",
+    );
+    // `:hk` first, so that its id is the smaller one of its class: written with reasoning
+    // off, which compiles no rule, so no constant of the rules is interned before it.
+    let mut data = format!("<{EX}hk> <{owl}sameAs> <{owl}hasKey> .");
+    let cell = |i: usize| match i {
+        1 => format!("<{EX}head>"),
+        129 => format!("<{rdf}nil>"),
+        i => format!("<{EX}c{i}>"),
+    };
+    for i in 1..=128 {
+        data.push_str(&format!(
+            " {} <{rdf}first> <{EX}p{i}> . {} <{rdf}rest> {} . <{EX}p{i}> a <{owl}ObjectProperty> . \
+             <{EX}x> <{EX}p{i}> <{EX}v{i}> . <{EX}z> <{EX}p{i}> <{EX}v{i}> .",
+            cell(i),
+            cell(i),
+            cell(i + 1)
+        ));
+    }
+    data.push_str(&format!(
+        " <{EX}x> a <{EX}K> . <{EX}z> a <{EX}K> . <{EX}z> <{EX}name> <{EX}Z> ."
+    ));
+    let with = |mode| {
+        MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
+        )
+    };
+    (with(ReasoningMode::Disabled).apply(
+        insert(&data),
+        &nrese_store::Requester::all(),
+        &MutationTicket::new(),
+    ))
+    .expect("the data");
+    (store.rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)).expect("the closure");
+    let _rules = with(ReasoningMode::Owl2Rl);
+    let ask = format!("ASK {{ <{EX}x> <{EX}name> <{EX}Z> }}");
+    let add = || {
+        nrese_store::StatementsRequest::new(vec![nrese_store::StatementOp::Add {
+            data: nrese_store::RdfPayload {
+                payload: format!("<{EX}K> <{EX}hk> <{EX}head> .\n")
+                    .into_bytes()
+                    .into(),
+                format: nrese_store::GraphResultFormat::NTriples,
+                base_iri: None,
+            },
+            contexts: Vec::new(),
+        }])
+    };
+    let read = |request: nrese_store::SparqlQueryRequest| {
+        let prepared = store.prepare_query(&request).expect("prepared");
+        let (mut answer, mut status) = (Vec::new(), None);
+        store
+            .run_query_pending_reporting(
+                &add(),
+                &prepared,
+                &nrese_store::CancellationToken::new(),
+                &mut answer,
+                |s| status = s,
+            )
+            .expect("the pending read");
+        (String::from_utf8(answer).expect("utf8"), status)
+    };
+    let (answer, status) = read(nrese_store::SparqlQueryRequest::all(ask.clone()));
+    let (_, scanned) = read(nrese_store::SparqlQueryRequest::new(
+        ask,
+        by_support(Vec::new()),
+    ));
+    println!(
+        "alias of hasKey (compact {compact}): {answer} with {status:?}; restricted {scanned:?}"
+    );
+    (answer, status, scanned)
+}
+
 /// A key of one property whose list cell `:n1` holds nothing itself: it is the same
 /// (`owl:sameAs`, in `:secret`) as `:n2`, which holds the member `:k1` and ends the list.
 /// `:x` and `:y` agree on `:k1`; `:y :name "Y"`.
