@@ -125,8 +125,6 @@ leave something out.
 
 ## SHACL
 
-- SHACL Core and SHACL-SPARQL. Not supported: SHACL Advanced Features, and `sh:entailment`,
-  which is reported as a failure ([HTTP interface](ops/http-api.md#shacl-validation)).
 - The commit gate is off by default, and when it is on, it checks only what a commit introduces
   ([configuration](ops/config-reference.md)). To check data already stored, validate it
   with `GET /dataset/shacl`.
