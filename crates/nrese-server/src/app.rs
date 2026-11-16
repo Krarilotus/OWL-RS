@@ -25,9 +25,10 @@ pub fn build_app(state: AppState) -> Router {
         .layer(screened)
         .layer(metrics)
         .layer(DefaultBodyLimit::max(body_limit))
-        // Inside the request id, so each problem document carries it.
-        .layer(axum::middleware::from_fn(problems))
         .layer(PropagateRequestIdLayer::x_request_id())
+        // Inside the request id, outside its propagation: each problem document reads the id
+        // its response carries.
+        .layer(axum::middleware::map_response(problems))
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         .layer(TraceLayer::new_for_http())
 }
