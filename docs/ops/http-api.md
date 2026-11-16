@@ -1,6 +1,6 @@
 # HTTP interface
 
-This page says what the server answers on which URL, in the version it comes with, not in a plan or another version. Paths are relative to the server's address (default `http://127.0.0.1:8080`). Which surfaces are switched on depends on the deployment posture ([config-reference.md](config-reference.md)), and a disabled surface answers 404.
+This page says what the server answers on which URL, in the version it comes with. Paths are relative to the server's address (default `http://127.0.0.1:8080`). Which surfaces are switched on depends on the deployment posture ([config-reference.md](config-reference.md)), and a disabled surface answers 404.
 
 ## SPARQL
 

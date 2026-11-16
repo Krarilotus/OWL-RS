@@ -2,7 +2,7 @@
 
 This page says which layer owns which concern, which way dependencies may point and, most important for day-to-day work, at which layer a kind of problem is fixed. The specs under `docs/spec/` refine single concerns, and where one contradicts this page, this page wins and the spec is corrected.
 
-Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/). Like every page here, this one describes the version it comes with, not a plan or another version. What NRESE covers today is in [features and standards](what-it-covers.md), and what is planned is in [ROADMAP.md](ROADMAP.md).
+Decisions with lasting consequences are recorded as ADRs in [`docs/adr/`](adr/). Like every page here, this one describes the version it comes with. What NRESE covers today is in [features and standards](what-it-covers.md), and what is planned is in [ROADMAP.md](ROADMAP.md).
 
 ## 1. Product target
 
