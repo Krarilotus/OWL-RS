@@ -999,6 +999,10 @@ mod tests {
     /// panic, before they look at their stops again: each returns with no result, and none
     /// starts a computation of its own (review r1, R1: a request that had its 408 started a
     /// fresh computation nobody could stop). Counted by computations, not timed.
+    /// Not a strict witness (review r2, F2; D16-709): if every waiter's 50 ms poll sees its
+    /// stop before the computation's end reaches it, none takes the terminal path, and the
+    /// test can, rarely, pass on a build that is wrong there. The mutant that computes on
+    /// that path (`tr`) still turns it red.
     fn stopped_waiters_take_no_replacement(panics: bool) {
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
         let slot = Slot::<(bool, usize)>::default();
