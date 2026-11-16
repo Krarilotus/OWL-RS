@@ -254,6 +254,16 @@ pub struct Rule {
 }
 
 impl Rule {
+    /// Whether the rule format holds it: at most [`crate::eval::MAX_RULE_ATOMS`] atoms in its
+    /// body, and in its conclusion beside a body.
+    pub fn fits(&self) -> bool {
+        let heads = match &self.head {
+            Head::Facts(heads) if !self.body.is_empty() => heads.len(),
+            _ => 0,
+        };
+        self.body.len().max(heads) <= crate::eval::MAX_RULE_ATOMS
+    }
+
     /// Number of distinct variables (they are numbered densely from 0).
     pub fn variables(&self) -> usize {
         let mut max = None;
@@ -332,7 +342,19 @@ impl std::error::Error for ParseError {}
 
 /// Parses rules in the syntax above, interning constants through `vocabulary`.
 pub fn parse_rules(text: &str, vocabulary: &mut impl Vocabulary) -> Result<Vec<Rule>, ParseError> {
-    parse_sources(rule_sources(text)?, vocabulary)
+    let rules = parse_sources(rule_sources(text)?, vocabulary)?;
+    refuse_reserved_names(&rules)?;
+    Ok(rules)
+}
+
+/// Refuses a rule named as a proof's own steps are (`crate::explain::valid_step`).
+pub(crate) fn refuse_reserved_names(rules: &[Rule]) -> Result<(), ParseError> {
+    let reserved = |r: &&Rule| r.name == "asserted" || r.name == "axiom";
+    if let Some(rule) = rules.iter().find(reserved) {
+        let message = "the name is reserved for a proof's own steps; rename the rule";
+        return Err(ParseError::new(rule.name.clone(), message));
+    }
+    Ok(())
 }
 
 /// One rule's text: its name, its source (continuation lines joined) and the line it

@@ -373,10 +373,11 @@ fn data_terms(o: &Ontology, terms: &dyn Terms) -> DataTerms {
 struct Reader<'a> {
     v: Vocabulary,
     /// [`DECLARATION_KINDS`] by the source's ids.
-    declaration_kinds: [(Option<Term>, EntityKind); 8],
+    declaration_kinds: [(Option<Term>, EntityKind); 9],
     /// [`BUILTIN_ANNOTATIONS`] and `owl:versionIRI` by the source's ids, looked up once per
     /// read: [`Self::is_builtin_annotation`] meets them on every assertion.
     builtin_annotations: ([Option<Term>; 9], Option<Term>),
+    annotation_properties: AnnotationProperties,
     terms: &'a dyn Terms,
     statements: &'a [Statement],
     /// Per subject: (predicate, object, graph).
@@ -406,10 +407,11 @@ struct Reader<'a> {
 }
 
 /// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
-/// OWL 1 synonyms the mapping reads as them (`rdfs:Class`, `owl:DataRange`). [`read`]
+/// OWL 1 synonyms the mapping reads as them (`rdfs:Class`, `owl:DataRange`, and
+/// `owl:OntologyProperty` by Table 6 of §3.1.2). [`read`]
 /// declares by this table, and a reader of RDF elsewhere that tells what a name is from its
 /// declarations reads by it too, so that both read a declaration as the same kind.
-pub const DECLARATION_KINDS: [(&str, EntityKind); 8] = [
+pub const DECLARATION_KINDS: [(&str, EntityKind); 9] = [
     (Vocabulary::iri("owl_class"), EntityKind::Class),
     (Vocabulary::iri("rdfs_class"), EntityKind::Class),
     (
@@ -422,6 +424,10 @@ pub const DECLARATION_KINDS: [(&str, EntityKind); 8] = [
     ),
     (
         Vocabulary::iri("owl_annotation_property"),
+        EntityKind::AnnotationProperty,
+    ),
+    (
+        Vocabulary::iri("owl_ontology_property"),
         EntityKind::AnnotationProperty,
     ),
     (Vocabulary::iri("rdfs_datatype"), EntityKind::Datatype),
@@ -445,6 +451,35 @@ pub const BUILTIN_ANNOTATIONS: [&str; 9] = [
     "http://www.w3.org/2002/07/owl#backwardCompatibleWith",
     "http://www.w3.org/2002/07/owl#incompatibleWith",
 ];
+
+/// The annotation properties as [`read`] reads them (§5.8), for every reader of the RDF: the
+/// built-in ones, and each IRI declared one by [`DECLARATION_KINDS`] (no blank node). Holds
+/// the declarations' `rdf:type` and class, and the properties.
+#[derive(Debug, Clone)]
+pub struct AnnotationProperties(Vec<[Option<Term>; 2]>, HashSet<Term>);
+
+impl AnnotationProperties {
+    /// The built-in ones, by the source's ids (`iri`).
+    pub fn new(iri: &mut dyn FnMut(&str) -> Option<Term>) -> Self {
+        let ty = iri(Vocabulary::iri("rdf_type"));
+        let kinds = DECLARATION_KINDS.iter();
+        let annotation = kinds.filter(|d| d.1 == EntityKind::AnnotationProperty);
+        let declaring = annotation.map(|d| [ty, iri(d.0)]).collect();
+        let properties = BUILTIN_ANNOTATIONS.iter().filter_map(|b| iri(b)).collect();
+        Self(declaring, properties)
+    }
+
+    /// Reads a statement, whose subject is an IRI where `named`.
+    pub fn read(&mut self, [s, p, o]: [Term; 3], named: bool) {
+        if named && self.0.contains(&[Some(p), Some(o)]) {
+            self.1.insert(s);
+        }
+    }
+
+    pub fn contains(&self, term: Term) -> bool {
+        self.1.contains(&term)
+    }
+}
 
 /// `Some(id) == Some(x)` without matching an absent term.
 fn is(id: Term, term: Option<Term>) -> bool {
@@ -474,6 +509,7 @@ impl<'a> Reader<'a> {
                 BUILTIN_ANNOTATIONS.map(|iri| terms.iri(iri)),
                 terms.iri("http://www.w3.org/2002/07/owl#versionIRI"),
             ),
+            annotation_properties: AnnotationProperties::new(&mut |iri| terms.iri(iri)),
             terms,
             statements,
             by_subject,
@@ -572,6 +608,7 @@ impl<'a> Reader<'a> {
             if !is(p, v.rdf_type) || self.kind(s) != TermKind::Iri {
                 continue;
             }
+            self.annotation_properties.read(statement.triple, true);
             for &(class, kind) in &kinds {
                 if is(o, class) {
                     let entry = self.declared.entry(s).or_default();
@@ -1460,7 +1497,6 @@ impl<'a> Reader<'a> {
             v.owl_annotation,
             v.owl_deprecated_class,
             v.owl_deprecated_property,
-            v.owl_ontology_property,
             // The typing of properties and list cells in RDF: nothing under the direct
             // semantics (a property is typed by its declaration or its use).
             v.rdf_property,
@@ -1517,8 +1553,7 @@ impl<'a> Reader<'a> {
 
     /// Declared an annotation property, or one OWL 2 builds in (declared implicitly: §5.8).
     fn annotation_property(&self, term: Term) -> bool {
-        let builtin = &self.builtin_annotations.0;
-        self.declared_as(term, EntityKind::AnnotationProperty) || builtin.contains(&Some(term))
+        self.annotation_properties.contains(term)
     }
 
     /// `rdfs:label` and the other annotation properties OWL 2 builds in.
