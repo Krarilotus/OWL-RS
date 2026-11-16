@@ -309,7 +309,7 @@ pub(crate) enum Revision<'a> {
 
 impl Revision<'_> {
     pub(crate) fn snapshot(&self) -> &Snapshot {
-        let (Revision::Decided((at, _)) | Revision::Committed(at) | Revision::Pending(at)) = self;
+        let (Revision::Decided((at, _)) | Revision::Committed(at) | Revision::Pending(at)) = *self;
         at
     }
 }
