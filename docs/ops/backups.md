@@ -56,19 +56,28 @@ The older `/ops/api/admin/dataset/backup` and `/restore` still answer.
 
 With [`store.wal_archive`](config-reference.md#store.wal_archive) on, checkpoints move the log segments they
 cover into `wal-archive/` of the data directory instead of deleting them. An image and the log
-after it then restore the store to any later revision:
+after it then restore the store to a later revision, if the log holds every commit between
+them. A bulk load or a rematerialisation writes a checkpoint, not a log record, so take a new
+image after one:
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../img/restore-dark.svg">
+  <img src="../img/restore-light.svg" width="480" alt="The log lies in two parts, oldest first: wal-archive/, then wal/. A restore places an image at revision R, at or before the target N, a revision or a time, and replays the commits R+1 to N from the log; the log before the image and after the target is not replayed.">
+</picture>
 
 ```bash
 nrese-server restore DIR --wal DATA/wal-archive --wal DATA/wal --until-revision N
 nrese-server restore DIR --wal DATA/wal-archive --wal DATA/wal --until-time 2026-10-02T14:05:00Z
 ```
 
-- `--until-revision N` replays the commits up to revision `N`. Every commit is one revision:
-  the logs record it, and `GET /api/v1/repositories/{id}/info` gives the current one to
-  whole-dataset readers and administrators.
+- `--until-revision N` replays the commits up to revision `N`, and fails if the log ends
+  before it. Every commit is one revision; `GET /api/v1/repositories/{id}/info` gives the
+  current one to whole-dataset readers and administrators.
 - `--until-time T` replays the commits made up to `T`, an RFC 3339 time with a zone, read by the
   `xsd:dateTime` calendar: no leap second `:60`, offsets within ±14:00, `24:00:00` the next day's
-  midnight, and digits past the microsecond cut off.
+  midnight, and digits past the microsecond cut off. It doesn't check that the log reaches
+  `T`: the `restored` log line names the revision reached, so compare it with the one you expect.
+- With both, it stops at `N`, and fails if a commit after `T` comes before `N`.
 - Without either, it replays as far as the log goes.
 
 A restore by time refuses an image whose last commit was made after `T` (take an older image),
@@ -82,8 +91,8 @@ and an image with no commit time (restore it by revision). These have none:
 To get restore by time for such a store, export it as N-Quads and `nrese-server load` the export
 into a new, empty data directory. That store's images have commit times.
 
-The target data directory must hold no store. After a refusal it holds the placed image, so clear
-it before you try again.
+The target data directory must hold no store. After a failed restore, try again into a fresh,
+empty directory: a refusal can come before the image is placed, with the directory as it was.
 
 `nrese-server prune-archive R` removes the archived segments whose records all come before
 revision `R`, so after an image at revision `R - 1` or later. It is safe while the server runs.

@@ -1,74 +1,61 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 604 484" width="604" height="484" role="img" aria-labelledby="title desc">
-<!-- The light and dark variants of this drawing differ only in <style>. -->
-<title id="title">What a commit does</title>
-<desc id="desc">A write is planned under the single writer slot on a snapshot; a write that is invalid, not allowed or too big is refused there. When reasoning is on, the reasoner derives the inferences and checks consistency, with the DL engines under owl2-dl; an inconsistent write is refused. When the SHACL gate is on, the shapes validate what the change can affect; under enforce a violation refuses the write. A timeout before Publish refuses it too. A refused write commits nothing, and the response says why. Otherwise the asserted and inferred changes are published as one revision, logged first in on-disk mode, and every query that starts after sees all of it.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 581" width="400" height="581" role="img" aria-labelledby="title desc">
+<!-- Generated; the light and dark variants differ only in <style>. -->
+<title id="title">What happens to a write</title>
+<desc id="desc">A write goes through four steps in order. Apply works out the change, and no query sees it yet; it is refused if not allowed or invalid. Reasoning, when it is on, updates the inferred statements; it is refused if found to make the data inconsistent. Under owl2-dl, a check that runs out of its own budget doesn't refuse; consistency is then unknown. SHACL, when it is on, checks the data the write can affect against your shapes; with enforce it is refused if it introduces a violation or a shape can't be checked. The request's deadline or memory stops the write up to here. Publish: the asserted and inferred changes become one revision, on disk saved before you get the answer. A refused write commits nothing; the response says why.</desc>
 <style>
-  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #1B2330; }
-  .panel { fill: #F4F6F9; }
-  .t { font-size: 18px; font-weight: 600; }
-  .n { font-size: 16px; font-weight: 600; }
-  .d { font-size: 14px; fill: #566173; }
-  .lbl { font-size: 14px; fill: #566173; }
-  .r { font-size: 14px; }
-  .lvl { font-size: 22px; font-weight: 600; fill: #566173; }
-  .band { fill: #E3E7ED; }
-  .boundary { fill: none; stroke: #9AA4B2; stroke-width: 1.2; stroke-dasharray: 6 5; }
-  .box { fill: #FFFFFF; stroke: #9AA4B2; stroke-width: 1.2; }
-  .chip { fill: #FFFFFF; stroke: #9AA4B2; stroke-width: 1; }
-  .client { fill: #1B2330; }
-  .client-t { fill: #FFFFFF; font-size: 16px; font-weight: 600; }
-  .commit { fill: #EEE8F8; stroke: #6440A8; stroke-width: 2; }
-  .commit-chip { fill: #FFFFFF; stroke: #6440A8; stroke-width: 1; }
-  .query { fill: #E3F2F0; stroke: #0B766F; stroke-width: 2; }
-  .query-chip { fill: #FFFFFF; stroke: #0B766F; stroke-width: 1; }
-  .asserted { fill: #E3E7ED; stroke: #9AA4B2; stroke-width: 1; }
-  .inferred { fill: #EEE8F8; stroke: #6440A8; stroke-width: 1; }
-  .w-tell { fill: #6440A8; font-weight: 600; font-size: 15px; }
-  .w-ask { fill: #0B766F; font-weight: 600; font-size: 15px; }
-  .w-refuse { fill: #B42330; font-weight: 600; font-size: 15px; }
-  .a { fill: none; stroke-width: 1.6; }
-  .a-ink { stroke: #566173; }
-  .a-tell { stroke: #6440A8; }
-  .a-ask { stroke: #0B766F; }
-  .a-refuse { stroke: #B42330; stroke-dasharray: 5 4; }
-  .m-ink { fill: #566173; }
-  .m-tell { fill: #6440A8; }
-  .m-ask { fill: #0B766F; }
-  .m-refuse { fill: #B42330; }
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #1F2328; }
+  .paper { fill: #FFFFFF; }
+  .name { font-size: 16px; font-weight: 600; }
+  .text { font-size: 14.5px; }
+  .muted { font-size: 14.5px; fill: #59636E; }
+  .edge { font-size: 14px; font-style: italic; fill: #59636E; }
+  .code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; }
+  .box { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1.25; }
+  .band { fill: #F6F8FA; }
+  .chip { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1.1; }
+  .chip-on { fill: #1F2328; }
+  .chip-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; fill: #FFFFFF; }
+  .asserted { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1.1; }
+  .inferred { fill: #FFF3D6; stroke: #D4A72C; stroke-width: 1.1; }
+  .inferred-text { font-size: 16px; font-weight: 600; fill: #8A5300; }
+  .track { fill: #E6EAEF; }
+  .frame { fill: none; stroke: #8C959F; stroke-width: 1.25; }
+  .divider { fill: none; stroke: #8C959F; stroke-width: 1.25; }
+  .mark { fill: none; stroke: #1F2328; stroke-width: 2; }
+  .seg-on { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1; }
+  .seg-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; font-weight: 600; }
+  .refused { fill: #B42318; }
+  .refused-text { fill: #B42318; font-weight: 600; }
+  .inferred-word { fill: #8A5300; font-weight: 600; }
+  .flow { fill: none; stroke: #59636E; stroke-width: 1.4; }
+  .flow-refused { fill: none; stroke: #B42318; stroke-width: 1.4; }
 </style>
-<defs><marker id="h-ink" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-ink" d="M0 0 L10 5 L0 10 z"/></marker><marker id="h-tell" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-tell" d="M0 0 L10 5 L0 10 z"/></marker><marker id="h-ask" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-ask" d="M0 0 L10 5 L0 10 z"/></marker><marker id="h-refuse" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path class="m-refuse" d="M0 0 L10 5 L0 10 z"/></marker></defs>
-<rect class="panel" x="0" y="0" width="604" height="484" rx="14"/>
-<rect class="client" x="74" y="20" width="200" height="40" rx="20"/>
-<text x="174" y="45" class="client-t" text-anchor="middle">a write</text>
-<rect class="box" x="366" y="20" width="214" height="314" rx="8"/>
-<text x="382" y="46" class="w-refuse">Refused</text>
-<text x="382" y="68" class="d">nothing is committed,</text>
-<text x="382" y="86" class="d">the response says why</text>
-<text x="382" y="316" class="lbl">or a timeout before Publish</text>
-<path class="a a-tell" d="M174 60 V82" marker-end="url(#h-tell)"/>
-<rect class="commit-chip" x="24" y="84" width="300" height="56" rx="6"/>
-<text x="42" y="107" class="n">Plan</text>
-<text x="42" y="127" class="d">the writer slot, a snapshot, the change</text>
-<path class="a a-tell" d="M174 140 V166" marker-end="url(#h-tell)"/>
-<path class="a a-refuse" d="M324 112 H364" marker-end="url(#h-refuse)"/>
-<text x="382" y="117" class="r">not allowed, invalid,</text>
-<text x="382" y="135" class="r">or over a memory limit</text>
-<rect class="commit-chip" x="24" y="168" width="300" height="56" rx="6"/>
-<text x="42" y="191" class="n">Infer and check</text>
-<text x="42" y="211" class="d">when reasoning is on; DL under owl2-dl</text>
-<path class="a a-tell" d="M174 224 V250" marker-end="url(#h-tell)"/>
-<path class="a a-refuse" d="M324 196 H364" marker-end="url(#h-refuse)"/>
-<text x="382" y="201" class="r">inconsistent</text>
-<rect class="commit-chip" x="24" y="252" width="300" height="56" rx="6"/>
-<text x="42" y="275" class="n">Validate</text>
-<text x="42" y="295" class="d">SHACL, when its gate is on</text>
-<path class="a a-tell" d="M174 308 V334" marker-end="url(#h-tell)"/>
-<path class="a a-refuse" d="M324 280 H364" marker-end="url(#h-refuse)"/>
-<text x="382" y="285" class="r">a violation, gate enforce</text>
-<rect class="commit-chip" x="24" y="336" width="300" height="56" rx="6"/>
-<text x="42" y="359" class="n">Publish</text>
-<text x="42" y="379" class="d">one revision; on disk, logged first</text>
-<path class="a a-tell" d="M174 392 V418" marker-end="url(#h-tell)"/>
-<rect class="commit" x="44" y="420" width="260" height="40" rx="20"/>
-<text x="174" y="445" class="n" text-anchor="middle">seen whole by later queries</text>
+<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow" d="M1 1 L9 5 L1 9"/></marker><marker id="head-refused" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow-refused" d="M1 1 L9 5 L1 9"/></marker></defs>
+<rect class="paper" x="0" y="0" width="400" height="581" rx="0"/>
+<rect class="box" x="0" y="0" width="400" height="94" rx="6"/>
+<text x="16" y="26" class="name">Apply</text>
+<text x="16" y="50" class="text">works out the change; no query sees it yet</text>
+<text x="16" y="77" class="text"><tspan class="refused-text">Refused if</tspan> not allowed or invalid</text>
+<path class="flow" d="M28 96 V127" marker-end="url(#head)"/>
+<rect class="box" x="0" y="130" width="400" height="140" rx="6"/>
+<text x="16" y="156" class="name">Reasoning</text>
+<text x="384" y="156" class="muted" text-anchor="end">when it is on</text>
+<text x="16" y="180" class="text">updates the <tspan class="inferred-word">inferred</tspan> statements</text>
+<text x="16" y="207" class="text"><tspan class="refused-text">Refused if</tspan> found to make the data inconsistent</text>
+<text x="16" y="234" class="text"><tspan class="muted">Under </tspan><tspan class="code">owl2-dl</tspan><tspan class="muted">, a check that runs out of its own</tspan></text>
+<text x="16" y="253" class="text"><tspan class="muted">budget doesn't refuse; consistency is then </tspan><tspan class="code">unknown</tspan></text>
+<path class="flow" d="M28 272 V303" marker-end="url(#head)"/>
+<rect class="box" x="0" y="306" width="400" height="113" rx="6"/>
+<text x="16" y="332" class="name">SHACL</text>
+<text x="384" y="332" class="muted" text-anchor="end">when it is on</text>
+<text x="16" y="356" class="text">checks the data the write can affect against your shapes</text>
+<text x="16" y="383" class="text"><tspan class="refused-text">Refused if</tspan> with <tspan class="code">enforce</tspan>, it introduces a violation</text>
+<text x="16" y="402" class="text">or a shape can't be checked</text>
+<path class="flow" d="M28 421 V452" marker-end="url(#head)"/>
+<text x="42" y="442" class="edge">the request's deadline or memory stops it up to here</text>
+<rect class="box" x="0" y="455" width="400" height="86" rx="6"/>
+<text x="16" y="481" class="name">Publish</text>
+<text x="16" y="505" class="text">asserted and <tspan class="inferred-word">inferred</tspan> changes become one revision;</text>
+<text x="16" y="524" class="text">on disk, saved before you get the answer</text>
+<text x="1" y="571" class="text">A refused write commits nothing; the response says why.</text>
 </svg>

@@ -181,6 +181,11 @@ leave something out.
 - A commit keeps every term it added, even one no statement uses (an `INSERT` and a `DELETE` of it in one
   transaction), and such terms behave like those of deleted statements. Reclaiming them is
   planned for v1.6.
+- A point-in-time restore doesn't cross a bulk load or a rematerialisation: they write a
+  checkpoint, not a log record, so it needs an image taken after them. A restore by time can't
+  tell a complete log from one missing its end, and replays log records without a commit time
+  whatever the time; compare the revision it reports with the one you expect
+  ([point-in-time restore](ops/backups.md#point-in-time-restore)).
 
 ## Access control
 

@@ -21,9 +21,9 @@ move it.
   ([what a commit does](docs/what-it-covers.md#what-a-commit-does)).
 - **Asserted and inferred are kept apart.** A query reads both, or only one of them
   ([queries](docs/ops/http-api.md#queries)).
-- **Writes that break the data are refused.** Under the OWL 2 modes, a SPARQL update, Graph Store
-  write or transaction is refused as a whole when the consistency check finds it would make the
-  data inconsistent, and with the SHACL gate set to `enforce`, when it violates a shape. The
+- **Writes that break the data are refused.** With reasoning on, a SPARQL update, Graph Store
+  write or transaction is refused as a whole when the reasoner finds it would make the data
+  inconsistent, and with the SHACL gate set to `enforce`, when it introduces a violation. The
   response gives the reason, as far as the writer may read the data behind it.
 - **Every answer carries a status.** `complete`, `sound-only` (rows may be missing), `unsound`
   (rows may be missing or wrong) or `not-certified`, in a header on every query answer over HTTP
@@ -55,7 +55,7 @@ is in [features and standards](docs/what-it-covers.md), and where it stops is in
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/overview-dark.svg">
-  <img src="docs/img/overview-light.svg" width="720" alt="Your application tells NRESE something with SPARQL Update or the Graph Store protocol, and asks with a SPARQL query. A write is one commit, all of it or none: when reasoning is on, the reasoner infers and checks consistency, and SHACL validates when its gate is on. The commit writes asserted and inferred statements, kept apart, as one revision. A query never waits for a write: it reads a snapshot, and its status says whether rows may be missing. Under owl2-dl, where cheaper checks can't decide, the commit asks the OWL 2 DL engines whether the data is consistent, and the query asks whether a row follows. Storage is in memory, or on disk, where the data directory holds the log and checkpoints. Each arrow points from the part that calls to the part it calls.">
+  <img src="docs/img/overview-light.svg" width="480" alt="You tell NRESE statements with SPARQL Update, the Graph Store Protocol, RDF4J's protocol or an RDF document, over HTTP; a write is all of it or nothing, and a refusal says why. You ask it with SPARQL queries and, with reasoning on, why a statement holds; each SPARQL answer says if rows may be missing or wrong. A bulk load skips the checks below. Reasoning is off by default (disabled, rdfs, owl2-rl, owl2-dl and more): when on, it infers with every write and refuses a write found to make the data inconsistent. SHACL validation is off by default: report logs the results a write introduces, and enforce refuses a write that introduces a violation. Storage keeps what you told it (asserted) apart from what reasoning derived (inferred). It is in memory by default, which is lost when the server stops; on-disk saves each commit before confirming it, and the container image uses it.">
 </picture>
 
 ## Quick start

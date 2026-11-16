@@ -8,6 +8,11 @@ with your data loaded, and how to stop and upgrade it. Every setting is in the
 
 ## What runs
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../img/deployment-dark.svg">
+  <img src="../img/deployment-light.svg" width="480" alt="Clients reach your TLS proxy over HTTPS, and the proxy reaches nrese-server over HTTP, over loopback or a private network. On the server's machine, nrese-server is one process: the HTTP APIs, /ops, and /console when the console is built in. It reads and writes its data directory, on disk only. For the default repository: checkpoint-*.nck, the saved state; wal/, the writes since then; wal-archive/, the older log, if kept; and repositories/&lt;id&gt;/ holds each other repository, laid out alike. The directory is locked: one process at a time. On another machine, if you want one, a read replica, a second nrese-server that answers queries from its own data directory on disk, both servers set up for replication, pulls the server's log over HTTP.">
+</picture>
+
 - One process serves one data directory. It holds the default repository, and each repository
   created over the API in its `repositories/<id>/` ([repositories](http-api.md#rdf4j-protocol)).
 - The store is in memory unless `store.mode` is `on-disk` (`NRESE_STORE_MODE`, which the image
