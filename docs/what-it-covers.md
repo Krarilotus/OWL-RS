@@ -1,8 +1,7 @@
 # Features and standards
 
 <a id="scope"></a>
-What NRESE does in the commit these pages come with: first the standards it follows and their
-tests, then each area with its limits beside it. What it leaves out, and where it departs from a
+What NRESE does in the commit these pages come with. What it leaves out, and where it departs from a
 standard with what to do instead, is in [limits](limits.md), which starts with
 [when to choose another system](limits.md#choose-another-system-when).
 
@@ -160,9 +159,8 @@ The two checks:
    they don't decide lets the commit through, with the status `unknown`.
 2. With the SHACL gate on, the shapes validate the focus nodes the change can affect, inferred
    statements included. Only what the commit introduces counts, so data that was invalid before
-   doesn't block it. With the gate on, either setting refuses a write while the stored shapes
-   can't be used. Whatever the setting, shapes written to the shapes graph are refused if they
-   don't compile.
+   doesn't block it. Shapes that can't be used can refuse a write under any setting
+   ([`shacl.gate`](ops/config-reference.md#shacl.gate) says when).
 
 If a check refuses the write, or the request times out before publishing starts, nothing
 of the request is committed, neither an asserted statement nor an inference, and the response

@@ -22,8 +22,6 @@ These also hold.
 
 ### Types and scopes
 
-The tables use these words.
-
 | Type | What the value is |
 |---|---|
 | text | Any text |
@@ -150,8 +148,6 @@ The deployment posture has these effects.
 
 The result cache (`budgets.result_cache`, older key `store.query_cache_bytes`) and its pins (`budgets.result_cache_pins`) are in [Budgets](#budgets), with their details [below](#the-result-cache).
 
-These settings need more than their row.
-
 - **`store.default_graph`**: what a query, or an update's `WHERE`, reads when it names no dataset:
   - `default`: only the default graph, as the SPARQL specification describes a plain dataset;
   - `union`: the merge of all graphs, as GraphDB, RDF4J stores and Blazegraph do. A statement counts once, however many graphs hold it.
@@ -209,7 +205,7 @@ Set by `budgets.result_cache` (`NRESE_QUERY_CACHE_BYTES`; older key `store.query
 | <a id="shacl.gate"></a>`shacl.gate` | `NRESE_SHACL_GATE` | choice: `off`, `report`, `enforce` | `off` | start | SHACL as a commit gate (below) |
 | <a id="shacl.gate_severity"></a>`shacl.gate_severity` | `NRESE_SHACL_GATE_SEVERITY` | choice: `violation`, `warning`, `info` | `violation` | start | The least severity `enforce` rejects |
 
-`report` validates every commit against the shapes graph and logs what it introduces; `enforce` also rejects a commit that introduces a result at or above `gate_severity`, or a validation failure, and the commit changes nothing. Only what a commit introduces counts: data that was invalid before doesn't block writes (validation at `/dataset/shacl` reports it). The check validates the focus nodes the commit can affect, after reasoning; a commit that changes the shapes graph is validated in full.
+`report` validates every commit against the shapes graph and logs what it introduces; `enforce` also rejects a commit that introduces a result at or above `gate_severity`, or a validation failure, and the commit changes nothing. Only what a commit introduces counts: data that was invalid before doesn't block writes (validation at `/dataset/shacl` reports it). The check validates the focus nodes the commit can affect, after reasoning; a commit that changes the shapes graph is validated in full. With the gate on, either setting refuses a commit while the stored shapes can't be used, and whatever the setting, a commit that leaves shapes in the shapes graph that don't compile is refused.
 
 ## Reasoner
 
@@ -236,8 +232,6 @@ Set by `budgets.result_cache` (`NRESE_QUERY_CACHE_BYTES`; older key `store.query
 - `owl2-dl`: OWL 2 DL ([design](../design/owl2-dl.md) §8). The OWL 2 RL closure is materialised as the lower bound, as with `owl2-rl`, and the DL engines are added: commits checked for consistency under OWL 2 DL, the upper bound, and a completeness status on every answer (the `dl.*` settings below)
 - `custom`: the user's rules only (`reasoner.rules`)
 - unknown values are a startup error (a typo must not silently disable consistency checking); `rules-mvp`, the removed v1 reasoner, is an error that names its replacement
-
-These settings need more than their row.
 
 - **`reasoner.rules`**: a Notation3 file (`.n3`) or a GraphDB ruleset (`.pie`) of user rules. With `custom` they are the whole program; with any other reasoning mode they are added to its ruleset. They are compiled at startup, and a rule the reasoner can't run stops the startup with the rule and the reason. What compiles:
   - `{ premises } => { conclusions } .` (and `<=`), with quick variables `?x`; blank nodes in the premises are variables
@@ -524,8 +518,6 @@ All AI settings are scope start. Secrets are never printed and are refused by `-
 | <a id="ai.openrouter.app_name"></a>`ai.openrouter.app_name` | `NRESE_AI_OPENROUTER_APP_NAME` | text | none | The application name sent to OpenRouter |
 
 ## Ownership rules
-
-These rules say where the configuration is defined and documented.
 
 - typed runtime defaults and validation live in owning crates
 - external config parsing and precedence live in `crates/nrese-server/src/config/`
