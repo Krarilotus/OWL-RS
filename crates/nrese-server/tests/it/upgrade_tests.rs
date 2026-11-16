@@ -595,7 +595,7 @@ async fn an_owl2_dl_store_rebuilds_its_closure_once_for_its_keys()
         let dir = tempfile::tempdir()?;
         let data = dir.path().join("data");
         let written = nrese_store::StoreService::new(nrese_store::StoreConfig::on_disk(&data))?;
-        written.rematerialise(&RuleProgram::builtin(Ruleset::Owl2Rl))?;
+        written.rematerialise(RuleProgram::builtin(Ruleset::Owl2Rl))?;
         drop(written);
         let config = configure(dir.path(), &data)?;
         let text = std::fs::read_to_string(&config)?.replace("\"owl2-rl\"", &format!("\"{mode}\""));
