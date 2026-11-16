@@ -243,8 +243,35 @@ const SETTINGS_FILE: &str = "repository.json";
 /// The default repository's id.
 pub const DEFAULT_REPOSITORY: &str = "nrese";
 
-/// A repository's write path, which a change of its reasoning replaces ([`Catalog::change`]).
-pub type PipelineSlot = Arc<RwLock<Arc<MutationPipeline>>>;
+/// A repository's write path. Only a change of its reasoning replaces it, here and over the
+/// same store ([`Catalog::change`]): from outside it is read, never written, so the store a
+/// server state was built over (and checked, `AppState::with_replication`) stays its store.
+///
+/// Read from outside, it compiles:
+///
+/// ```no_run
+/// fn now(slot: &nrese_store::catalog::PipelineSlot) {
+///     let _now = slot.read();
+/// }
+/// ```
+///
+/// Written from outside, it doesn't. On a stable toolchain a `compile_fail` passes on any
+/// error; its twin above, one line apart, is what shows the rest compiles:
+///
+/// ```compile_fail
+/// fn now(slot: &nrese_store::catalog::PipelineSlot) {
+///     let _now = slot.0.write();
+/// }
+/// ```
+#[derive(Clone)]
+pub struct PipelineSlot(Arc<RwLock<Arc<MutationPipeline>>>);
+
+impl PipelineSlot {
+    /// The write path now.
+    pub fn read(&self) -> parking_lot::RwLockReadGuard<'_, Arc<MutationPipeline>> {
+        self.0.read()
+    }
+}
 
 /// One repository: its write path (and store) and its settings.
 #[derive(Clone)]
@@ -258,7 +285,7 @@ pub struct Repository {
 impl Repository {
     fn new(pipeline: MutationPipeline, settings: RepositorySettings) -> Self {
         Self {
-            pipeline: Arc::new(RwLock::new(Arc::new(pipeline))),
+            pipeline: PipelineSlot(Arc::new(RwLock::new(Arc::new(pipeline)))),
             settings: Arc::new(RwLock::new(settings)),
             lifecycle: Arc::default(),
         }
@@ -275,7 +302,7 @@ impl Repository {
 
     /// Publishes `settings`, and `pipeline` if it changes too, at once ([`Self::observe`]).
     fn publish(&self, pipeline: Option<Arc<MutationPipeline>>, settings: RepositorySettings) {
-        let mut slot = self.pipeline.write();
+        let mut slot = self.pipeline.0.write();
         let mut saved = self.settings.write();
         if let Some(pipeline) = pipeline {
             *slot = pipeline;
@@ -778,7 +805,7 @@ impl Catalog {
             // the new ones.
             previous.retire();
             let restore = || {
-                *repository.pipeline.write() = Arc::new(MutationPipeline::new(
+                *repository.pipeline.0.write() = Arc::new(MutationPipeline::new(
                     Arc::clone(&store),
                     Arc::clone(previous.reasoner()),
                 ));
