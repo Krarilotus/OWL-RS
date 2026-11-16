@@ -1052,6 +1052,7 @@ input, never assumed.
 | the reserved vocabulary used as a class, property or individual (`rdfs:Class`, `rdf:type`, `rdf:first`; §2.4) | the axioms left out, each with a `Diagnostic::Reserved`; they were read as fresh names, which decided what OWL 2 Full says otherwise | monotonicity only |
 | a non-simple property where a simple one is required, an irregular hierarchy (§11) | kept in the model, left out of the clauses | monotonicity; the certificate checks the axiom itself |
 | an ill-typed literal (§5.7), syntax and mapping errors | left out | monotonicity only |
+| an anonymous individual where §11.2 keeps it out: in `owl:sameAs`, `owl:differentFrom`, a negative assertion, a nominal or `hasValue`, or in assertions that form no forest of §11.2's shape | read as it is; a nominal or `hasValue` with a non-fatal `Diagnostic::AnonymousIndividual`, the rest unflagged | the asserted form: our reading; HermiT refuses the input; Openllet reads blank nodes as named and binds the key; HermiT's verdict on the derived form is the witness; the asserted forms are judged by no reference (one refuses, the other reads blank nodes as named) (`Diagnostic::is_fatal`) |
 
 **Monotonicity.** What the reader reads is part of what the input says: "inconsistent"
 and every entailment of the DL part hold for the input. For an RDF graph outside OWL 2
