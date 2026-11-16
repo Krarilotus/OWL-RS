@@ -402,7 +402,8 @@ const COMPARED: &str = "two spellings of one value are two terms to the store, w
 /// entailed. A read [`denied`] names misses rows, and under `owl2-dl` and `owl2-ql` so does
 /// a typed constant ([`typed_constant`]); a data value compared by term ([`compared_values`])
 /// through a property that holds a literal other than a string, in `snapshot` (the data
-/// read; unknown: `None`), can give wrong rows; and where rows may be missing, an operator
+/// read; unknown, or read for a restricted reader: every property), can give wrong rows;
+/// and where rows may be missing, an operator
 /// under which a missing row can make a returned one wrong ([`negation`]) makes the answers
 /// unsound. Each from `source`.
 pub(crate) fn certify_closure(
@@ -427,8 +428,8 @@ pub(crate) fn certify_report(
     }
 }
 
-/// What [`certify`] reads of a query, which depends on the query alone, as the reasons it
-/// gives: each found on its first use and kept with the prepared query
+/// What [`certify`] reads of a query, which depends on the query and its reader alone, as the
+/// reasons it gives: each found on its first use and kept with the prepared query
 /// (`PreparedQuery::reads`), so a query run again walks and formats nothing.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Reads {
@@ -440,6 +441,19 @@ pub(crate) struct Reads {
     constant: std::sync::OnceLock<Option<String>>,
     /// [`compared_values`]'.
     compared: std::sync::OnceLock<Vec<(String, Vec<Option<String>>)>>,
+    /// Whether the reader's view is restricted: [`certify`] then takes every property to hold
+    /// values other than strings, so the status doesn't follow what hidden graphs hold.
+    restricted: bool,
+}
+
+impl Reads {
+    /// Nothing found yet, for a reader whose view is restricted or not.
+    pub(crate) fn new(restricted: bool) -> Self {
+        Self {
+            restricted,
+            ..Self::default()
+        }
+    }
 }
 
 /// [`certify_closure`], on the bounds' path where `bounds` (what [`denied`] allows there).
@@ -468,6 +482,7 @@ fn certify(
             completeness.incomplete(source, reason.clone());
         }
     }
+    let snapshot = snapshot.filter(|_| !reads.restricted);
     let typed = |predicate: &Option<String>| {
         snapshot.is_none_or(|s| match predicate {
             Some(p) => s
