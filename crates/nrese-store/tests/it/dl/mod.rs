@@ -12,6 +12,7 @@ mod identity;
 mod islands;
 mod keys;
 mod mode;
+mod outside;
 mod plans;
 mod queries;
 mod representatives;
