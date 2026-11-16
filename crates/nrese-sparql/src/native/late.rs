@@ -327,7 +327,7 @@ mod tests {
             object: a,
         });
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(same_as));
+        engine.transaction().install(Some(same_as), None);
         let snapshot = engine.snapshot();
         let classes = snapshot.equality_classes().expect("a class");
         let (class, _) = classes.iter().next().expect("a class");

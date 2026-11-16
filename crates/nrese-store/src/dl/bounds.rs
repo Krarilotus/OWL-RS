@@ -681,53 +681,54 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
 /// a read off the pool waits for the build under way, one on a Rayon worker builds its
 /// own (U1-B).
 pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
-    view_until(store, None).expect("a read with no stop never gives up")
-}
-
-/// [`view`] for a request: given up (`None`) once `stop` fires, before it claims a build or
-/// while it waits for another read's, polled as `nrese_exec::cell::Build::wait_until` says.
-/// The build runs on and is kept; one this read claimed runs to its end whatever its stop
-/// says, as others may wait for it (a classification waiter's way, `classification::cached`).
-pub(crate) fn view_until(
-    store: &StoreService,
-    stop: Option<&dyn Fn() -> bool>,
-) -> Option<(Snapshot, Arc<View>)> {
-    let bounds = &store.dl().bounds;
     loop {
-        if stop.is_some_and(|stop| stop()) {
-            return None;
-        }
         let snapshot = store.engine().snapshot();
-        let revision = snapshot.revision();
-        let cached = || {
-            lock(&bounds.view)
-                .as_ref()
-                .filter(|view| view.revision == revision)
-                .map(Arc::clone)
-        };
-        if let Some(view) = cached() {
-            return Some((snapshot, view));
-        }
-        let built = match bounds
-            .views
-            .claim(revision, Kind::Opaque, || cached().map(Some))
-        {
-            Claim::Build(builder) => {
-                let built = read(store, &snapshot);
-                builder.finish(built.clone());
-                built
-            }
-            Claim::Wait(flight) => match flight.wait_until(stop)? {
-                Ok(built) => built,
-                Err(nrese_exec::cell::Busy) => read(store, &snapshot),
-            },
-        };
-        // None: the bounds describe a later revision than the snapshot now, or the build
-        // failed. Again, from the latest snapshot.
-        if let Some(view) = built {
-            return Some((snapshot, view));
+        if let Some(view) = view_until(store, &snapshot, None).expect("no stop never gives up") {
+            return (snapshot, view);
         }
     }
+}
+
+/// [`view`] of `snapshot` for a request, never another snapshot's (T3 (a)): given up
+/// (`None`) once `stop` fires, before it claims a build or while it waits for another
+/// read's, polled as `nrese_exec::cell::Build::wait_until` says; `Some(None)` where the
+/// bounds describe a later revision than `snapshot`, or the build failed. The build runs on
+/// and is kept; one this read claimed runs to its end whatever its stop says, as others may
+/// wait for it (a classification waiter's way, `classification::cached`).
+pub(crate) fn view_until(
+    store: &StoreService,
+    snapshot: &Snapshot,
+    stop: Option<&dyn Fn() -> bool>,
+) -> Option<Option<Arc<View>>> {
+    let bounds = &store.dl().bounds;
+    if stop.is_some_and(|stop| stop()) {
+        return None;
+    }
+    let revision = snapshot.revision();
+    let cached = || {
+        lock(&bounds.view)
+            .as_ref()
+            .filter(|view| view.revision == revision)
+            .map(Arc::clone)
+    };
+    if let Some(view) = cached() {
+        return Some(Some(view));
+    }
+    let built = match bounds
+        .views
+        .claim(revision, Kind::Opaque, || cached().map(Some))
+    {
+        Claim::Build(builder) => {
+            let built = read(store, snapshot);
+            builder.finish(built.clone());
+            built
+        }
+        Claim::Wait(flight) => match flight.wait_until(stop)? {
+            Ok(built) => built,
+            Err(nrese_exec::cell::Busy) => read(store, snapshot),
+        },
+    };
+    Some(built)
 }
 
 /// The view of `snapshot`'s revision, published; `None` if the bounds describe a later

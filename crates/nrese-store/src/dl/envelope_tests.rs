@@ -74,6 +74,7 @@ fn run(store: &StoreService, memory: &Envelope) -> End {
         .unwrap();
     let end = match answer(
         store,
+        &store.engine().snapshot(),
         &prepared,
         &CancellationToken::new(),
         memory,

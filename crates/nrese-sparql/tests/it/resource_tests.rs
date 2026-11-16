@@ -434,7 +434,7 @@ fn a_class_of_1000_over_20_statements() -> Engine {
         tx.insert(Quad::new(node("rep"), node("p"), object, GraphName::DefaultGraph).as_ref());
     }
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     engine
 }
 
@@ -469,7 +469,7 @@ fn a_late_expansion_past_memory_fails_the_query() {
         tx.insert_inferred(same_as_rep(identity));
     }
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     let snapshot = engine.snapshot();
     let query = SparqlParser::new()
         .parse_query("SELECT * WHERE { ?s ?p ?o . ?o ?q ?x }")

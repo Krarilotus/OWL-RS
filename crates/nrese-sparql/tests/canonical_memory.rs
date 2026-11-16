@@ -60,7 +60,7 @@ fn engine(size: usize) -> Engine {
         });
     }
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     engine
 }
 

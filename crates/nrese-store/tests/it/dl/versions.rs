@@ -33,7 +33,9 @@ fn split(rows: &[String]) -> (usize, usize) {
 /// Commits alternate: `:iN` in the union with `:jN a :B` (`:iN` a `:D` through U1 and an
 /// exact service only, `:jN` one in L), then `:iN a :B` (every `:D` in L again: the
 /// predicate is closed). A query that decided on one revision and read another would see
-/// the `j`s of one and the `i`s of the other; at one revision there are as many of both.
+/// the `j`s of one and the `i`s of the other; at one revision there are as many of both,
+/// or, over the RL closure alone (a later commit's bounds replaced the revision's while it
+/// was read), as many or one `j` more: the open union's `:iN` is a `:D` through U1 only.
 #[test]
 fn queries_during_commits_read_u1_at_their_snapshots_revision() {
     let dl = pipeline();
@@ -48,8 +50,21 @@ fn queries_during_commits_read_u1_at_their_snapshots_revision() {
                     while !done.load(std::sync::atomic::Ordering::Acquire) || reads == 0 {
                         let (rows, status) = query(&dl, "SELECT ?x { ?x a :D }");
                         let (i, j) = split(&rows);
-                        assert_eq!(i, j, "one revision: {rows:?} {status:?}");
-                        assert!(status.is_complete(), "{:?}", status.reasons());
+                        // Complete, or, when a later commit's bounds replaced this
+                        // revision's while it was read, sound-only for that reason alone.
+                        let reasons = status.reasons();
+                        let later = status.shared.sound
+                            && !reasons.is_empty()
+                            && reasons
+                                .iter()
+                                .all(|r| r.starts_with("a later commit's bounds replaced"));
+                        assert!(
+                            status.is_complete() || later,
+                            "{} {reasons:?}",
+                            status.shared.as_str()
+                        );
+                        let one = i == j || (!status.is_complete() && j == i + 1);
+                        assert!(one, "one revision: {rows:?} {status:?}");
                         reads += 1;
                     }
                     reads
