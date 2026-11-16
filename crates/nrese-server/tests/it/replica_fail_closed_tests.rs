@@ -826,3 +826,91 @@ async fn a_replica_rematerialised_from_the_library_says_not_certified() -> TestR
     );
     Ok(())
 }
+
+/// Spec: a replica's reasoned reads say `not-certified` whatever is registered on its store.
+/// Over a directory holding [`ANIMALS`] as asserted statements alone (written without
+/// reasoning, so its inferred stack is empty), opened as a replica and built into a replica's
+/// state under `rdfs`, with an unreachable primary and before any batch: its reasoned read of
+/// [`ANIMAL_QUERY`] says `not-certified` (the precondition), and after the rules its store
+/// maintains are cleared from the library (`StoreService::use_reasoning_rules(None)`, on the
+/// store its pipeline writes) it still says `not-certified`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_whose_rules_were_cleared_says_not_certified() -> TestResult<()> {
+    let dir = tempfile::tempdir()?;
+    {
+        let store = StoreService::new(StoreConfig::on_disk(dir.path()))?;
+        nrese_store::MutationPipeline::new(
+            std::sync::Arc::new(store),
+            std::sync::Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Disabled,
+            ))),
+        )
+        .execute_update(&nrese_store::SparqlUpdateRequest::new(format!(
+            "{PREFIXES}{ANIMALS}"
+        )))?;
+    }
+    let state = server(
+        StoreService::new(as_replica(StoreConfig::on_disk(dir.path())))?,
+        ReasoningMode::Rdfs,
+        replica_of("http://127.0.0.1:9"),
+    );
+    let (_, before) = answered(build_app(state.clone()), ANIMAL_QUERY).await?;
+    assert_eq!(
+        before.as_deref(),
+        Some("not-certified"),
+        "the precondition: the replica's read before"
+    );
+    state.store().use_reasoning_rules(None);
+    let (rows, status) = answered(build_app(state.clone()), ANIMAL_QUERY).await?;
+    let right = status.as_deref() == Some("not-certified");
+    println!(
+        "CASE a replica whose rules were cleared: {} {status:?} {rows}",
+        if right { "right" } else { "WRONG" }
+    );
+    assert!(
+        right,
+        "the replica whose rules were cleared answers: {status:?}"
+    );
+    Ok(())
+}
+
+/// Spec: a reasoned read of a version no one vouched for says `not-certified` while its
+/// reasoner's inferences are missing from it, whatever is registered on its store. A primary
+/// under `rdfs` given [`ANIMALS`] through its pipeline, its inferred stack then emptied from
+/// the library (`StoreService::clear_inferred`, which leaves the version uncertified): its
+/// reasoned read of [`ANIMAL_QUERY`] says `not-certified` (the precondition), and after the
+/// rules its store maintains are cleared (`StoreService::use_reasoning_rules(None)`) it still
+/// says `not-certified`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_primary_cleared_of_its_inferences_and_rules_says_not_certified() -> TestResult<()> {
+    let dir = tempfile::tempdir()?;
+    let state = server(
+        StoreService::new(StoreConfig::on_disk(dir.path()))?,
+        ReasoningMode::Rdfs,
+        primary(),
+    );
+    state
+        .pipeline()
+        .execute_update(&nrese_store::SparqlUpdateRequest::new(format!(
+            "{PREFIXES}{ANIMALS}"
+        )))?;
+    state.store().clear_inferred()?;
+    let (_, before) = answered(build_app(state.clone()), ANIMAL_QUERY).await?;
+    assert_eq!(
+        before.as_deref(),
+        Some("not-certified"),
+        "the precondition: the primary's read with its inferences cleared"
+    );
+    state.store().use_reasoning_rules(None);
+    let (rows, status) = answered(build_app(state.clone()), ANIMAL_QUERY).await?;
+    let right = status.as_deref() == Some("not-certified");
+    println!(
+        "CASE a primary cleared of its inferences and rules: {} {status:?} {rows}",
+        if right { "right" } else { "WRONG" }
+    );
+    assert!(
+        right,
+        "the primary cleared of its rules answers: {status:?}"
+    );
+    Ok(())
+}
