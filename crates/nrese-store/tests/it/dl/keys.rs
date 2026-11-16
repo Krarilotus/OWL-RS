@@ -52,7 +52,11 @@ fn answered(cases: &[(String, &str, Option<bool>)], read: &str) -> Vec<String> {
 /// An object key whose shared value is an anonymous individual (`_:z`) doesn't equate `:a`
 /// and `:b`, so `:a a :D` isn't entailed; with the value named (`:z`) it is, and so it is
 /// when the anonymous value is the named `:n` (`_:z owl:sameAs :n`): the key binds the
-/// individual, whatever names it. An OWL 2 RL ontology: the rules decide it alone.
+/// individual, whatever names it. The rules decide it alone. The first two cases are OWL 2
+/// RL ontologies; the third asserts `owl:sameAs` on a blank node, so it is outside OWL 2 DL
+/// (*OWL 2 Structural Specification* §11.2: no anonymous individual in SameIndividual) and
+/// so outside OWL 2 RL too. That case tests how the store handles the equality, not the
+/// Direct Semantics.
 #[test]
 fn a_key_binds_no_anonymous_value() {
     let cases = [
@@ -176,17 +180,6 @@ fn commits_answer_as_one_load(
     steps: &[(String, String, &str)],
     complete: Option<bool>,
 ) -> Vec<String> {
-    let store = |compact: bool| {
-        let config = StoreConfig {
-            equality_compact: compact,
-            ..crate::support::in_memory_store_config()
-        };
-        let dl = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl);
-        MutationPipeline::new(
-            Arc::new(StoreService::new(config).expect("store")),
-            Arc::new(ReasonerService::new(dl)),
-        )
-    };
     let read = "ASK { :a a :D }";
     let mut wrong = Vec::new();
     for compact in [false, true] {
@@ -214,6 +207,86 @@ fn commits_answer_as_one_load(
         }
     }
     wrong
+}
+
+/// An `owl2-dl` store, equality stored compactly or not.
+fn store(compact: bool) -> MutationPipeline {
+    let config = StoreConfig {
+        equality_compact: compact,
+        ..crate::support::in_memory_store_config()
+    };
+    let dl = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl);
+    MutationPipeline::new(
+        Arc::new(StoreService::new(config).expect("store")),
+        Arc::new(ReasonerService::new(dl)),
+    )
+}
+
+/// A key binds an anonymous individual that the data makes equal to a named one: as its
+/// instance (`_:b`, by an inverse-functional `:p`, is `:a`) and as its value (`_:w`, by an
+/// inverse-functional `:q` through a second anonymous individual, is `:n`). The key's
+/// condition is on domain elements in NAMED (*OWL 2 Direct Semantics* §2.3.5, Table 9),
+/// "a subset of ΔI such that (a)I ∈ NAMED for each named individual a" (§2.2): an
+/// anonymous individual equal to a named one in every model is that one's element, so the
+/// key applies, and `:a` is `:c`. Each form is inside OWL 2 DL: *OWL 2 Structural
+/// Specification* §11.2 restricts the axioms ("No anonymous individual occurs in Ax in an
+/// axiom of type … SameIndividual"), not an equality they entail, and each tree of
+/// anonymous individuals has one with at most one named neighbour. Each form has a named
+/// control and an unmerged one (the key doesn't apply). The answers are HermiT's and
+/// Openllet's, which agree on every case; in both equality modes, `:a a :D` complete.
+#[test]
+fn a_key_binds_an_anonymous_individual_equal_to_a_named_one() {
+    let instance = |b: &str, merged: bool| {
+        format!(
+            ":p a owl:ObjectProperty , owl:InverseFunctionalProperty . :k a owl:DatatypeProperty . \
+             :C a owl:Class ; owl:hasKey ( :k ) . :D a owl:Class . :v a owl:NamedIndividual . \
+             :a a owl:NamedIndividual , :C {} . \
+             :c a owl:NamedIndividual , :C , :D ; :k \"1\"^^xsd:integer . \
+             {b} a :C ; :p :v ; :k \"1\"^^xsd:integer .",
+            if merged { "; :p :v" } else { "" }
+        )
+    };
+    let value = |w: &str, x: &str, merged: bool| {
+        format!(
+            ":q a owl:ObjectProperty , owl:InverseFunctionalProperty . :k a owl:ObjectProperty . \
+             :C a owl:Class ; owl:hasKey ( :k ) . :D a owl:Class . \
+             :a a owl:NamedIndividual , :C ; :k {w} . {w} :q {x} . \
+             :n a owl:NamedIndividual {} . \
+             :c a owl:NamedIndividual , :C , :D ; :k :n .",
+            if merged {
+                format!("; :q {x}")
+            } else {
+                String::new()
+            }
+        )
+    };
+    let cases = [
+        (instance("_:b", true), "true"),
+        (instance(":b", true), "true"),
+        (instance("_:b", false), "false"),
+        (value("_:w", "_:x", true), "true"),
+        (value(":w", ":x", true), "true"),
+        (value("_:w", "_:x", false), "false"),
+    ];
+    let mut wrong = Vec::new();
+    for (data, answer) in &cases {
+        for compact in [false, true] {
+            let dl = store(compact);
+            insert(&dl, data).expect("consistent");
+            for read in ["ASK { :a owl:sameAs :c }", "ASK { :a a :D }"] {
+                let (rows, status) = query(&dl, read);
+                let line = format!(
+                    "{data} / compact {compact}: {read} answers {rows:?}, complete {}",
+                    status.is_complete()
+                );
+                eprintln!("{line}");
+                if rows != [*answer] || (read.contains(":D") && !status.is_complete()) {
+                    wrong.push(line);
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// Under `owl2-rl` the key rule (prp-key, OWL 2 Profiles §4.3, Table 5) has no condition on
