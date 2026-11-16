@@ -23,7 +23,7 @@ filters = ["islands_decide_as_the_whole_abox_does", "touched_islands_decide_as_a
 crate = "nrese-dl"
 test = "tableau_fuzz"
 filters = ["answers_agree_with_the_semantics"]
-# Seed 600026 needs 6,062 MiB (14 Oct 2026, reproduced on the main PC: every answer right).
+# Seed 600026 needs 6,062 MiB (14 Oct 2026, reproduced on the development machine: every answer right).
 memory_mib = 8192
 
 [[target]]

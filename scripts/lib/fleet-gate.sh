@@ -26,9 +26,9 @@
 # check by hand that names no ref.
 #
 # A failure on a host whose failures don't count alone (NRESE_GATE_UNCONFIRMED_HOSTS, default
-# khaleesi and khaleesi-wsl: the owner, 20 Oct 2026, its RAM never formally verified) is reported
+# the development machine and its WSL VM: its RAM never formally verified) is reported
 # as unconfirmed and the gate runs again on another host (NRESE_GATE_CONFIRM_HOSTS, default
-# office-pc, phuoc-yu, gamergrill; for windows kraris-gptler). The tree fails only if that run
+# the shared host, the timed host, the checks host; for windows the Windows host). The tree fails only if that run
 # fails too; if it passes, the pass counts and both jobs are named as a possible fault of the
 # first host.
 #
@@ -73,10 +73,10 @@ reason="the $mode gate of a pushed commit (scripts/check.sh); no push without it
 case $mode in
   push) cores=${NRESE_GATE_CORES:-8} ram=${NRESE_GATE_RAM_GB:-12} est=${NRESE_GATE_EST_MIN:-40} ;;
   windows)
-    # 9 GB: the suite's measured peak is 7.5 GB (five runs on kraris-gptler). The fleet admits a job
+    # 9 GB: the suite's measured peak is 7.5 GB (five runs on the Windows host). The fleet admits a job
     # there only with 16 GB available and its ask within available less the 6.3 GB headroom, so a
     # 9 GB job admitted at 16 GB that peaks at 7.5 GB still leaves 8.5 GB, clear of the 4 GB
-    # eviction floor (the fleet's owner, 27 Oct 2026). 16 GB kept checks waiting while 11-15 GB
+    # eviction floor. 16 GB kept checks waiting while 11-15 GB
     # was free.
     # est: the slowest whole 4-core run, 1,547 s, x 1.5 (others took 1,011-1,073 s).
     cores=${NRESE_GATE_CORES:-4} ram=${NRESE_GATE_RAM_GB:-9} est=${NRESE_GATE_EST_MIN:-39}
@@ -84,7 +84,7 @@ case $mode in
     # What the tier uses there, in the fleet config's names: `rust`, rustup with its MSVC toolchain
     # and linker (scripts/lib/windows-job.sh installs the tree's pinned release). The rest comes with
     # every Windows host of the fleet, unnamed: Git Bash, a stdlib `python` on PATH (the cache's
-    # lock), long paths, PowerShell 5.1 with Add-Type, outbound HTTPS (the fleet's owner, 2 Nov 2026).
+    # lock), long paths, PowerShell 5.1 with Add-Type, outbound HTTPS.
     # The suite's Python and packages the job brings itself (scripts/lib/suite-python.sh).
     has='["rust"]'
     reason="the merge check's Windows part (scripts/check.sh windows); no merge without it" ;;

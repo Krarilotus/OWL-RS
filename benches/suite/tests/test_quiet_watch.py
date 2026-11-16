@@ -78,7 +78,7 @@ class Watch(unittest.TestCase):
         self.assertAlmostEqual(unowned_cores, 8.0, places=1)
         # A slot that knows no owner (no FLEET_JOB, no slice: a manual run) suspends nothing,
         # whatever the uid, nor pauses a container, not even one labelled with the checkout's own
-        # namespace (Sol, 20 Oct 2026: it did). Built as the watcher builds it.
+        # namespace (it did). Built as the watcher builds it.
         nobody = watch.Owner({})
         self.assertEqual(watch.busy(TABLE, now, 1.0, mine | ancestors, nobody, environ_of, cgroup_of)[0], [])
         self.assertEqual([owner.owns_container(label) for label in ("job-a", "job-b", "")], [True, False, False])
@@ -89,7 +89,7 @@ class Watch(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(watch.signal, "SIGCONT"), "POSIX signals (the watcher runs on Linux)")
     def test_a_resume_settles_only_what_it_continued_or_proved_gone_and_the_watch_fails_on_the_rest(self):
-        """Sol, 20 Oct 2026: an EPERM on SIGCONT, or a stat that couldn't be read, counted as
+        """An EPERM on SIGCONT, or a stat that couldn't be read, counted as
         settled: the record of a process left stopped was deleted, and the watch exited 0."""
         with tempfile.TemporaryDirectory() as tmp:
             frozen = Path(tmp) / "frozen"
@@ -115,7 +115,7 @@ class Watch(unittest.TestCase):
                 self.assertEqual(watch.watch(Path(tmp), 12345, "token"), 1)
 
     def test_a_docker_that_doesnt_answer_fails_the_resume_and_keeps_its_line(self):
-        """Sol, 20 Oct 2026: docker unpause had no time limit; a wedged daemon held the slot's
+        """docker unpause had no time limit; a wedged daemon held the slot's
         lock (and a block's recovery) forever."""
         bounds = []
 
@@ -130,7 +130,7 @@ class Watch(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
     def test_no_suspension_follows_a_journal_whose_directory_couldnt_be_synced(self):
-        """Sol, 20 Oct 2026: a failed directory sync of a new journal was swallowed and the process
+        """A failed directory sync of a new journal was swallowed and the process
         stopped all the same: a power loss could lose the only record of it."""
         import stat
         owner, mine = watch.Owner({"FLEET_JOB": "job-a"}), (lambda pid: {"FLEET_JOB": "job-a"})
@@ -148,7 +148,7 @@ class Watch(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
     def test_a_directory_sync_that_keeps_failing_stops_every_later_suspension_too(self):
-        """Sol, 20 Oct 2026 (r3): after a failed first sync the journal file existed, so the next
+        """After a failed first sync the journal file existed, so the next
         suspension skipped the directory sync and stopped the process; so did the next container."""
         import stat
         owner, mine = watch.Owner({"FLEET_JOB": "job-a"}), (lambda pid: {"FLEET_JOB": "job-a"})
@@ -183,7 +183,7 @@ class Watch(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
     def test_an_unknown_boot_proves_nothing_gone_and_suspends_nothing(self):
-        """Sol, 20 Oct 2026: an unreadable boot id became "?", unequal to the recorded boot, so the
+        """An unreadable boot id became "?", unequal to the recorded boot, so the
         record of a process still stopped was dropped without looking at it."""
         owner, mine = watch.Owner({"FLEET_JOB": "job-a"}), (lambda pid: {"FLEET_JOB": "job-a"})
         with tempfile.TemporaryDirectory() as tmp:
@@ -203,7 +203,7 @@ class Watch(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(watch.signal, "SIGSTOP"), "POSIX signals (the watcher runs on Linux)")
     def test_signals_go_through_a_handle_proven_to_hold_the_recorded_process_never_by_bare_pid(self):
-        """Sol, 20 Oct 2026: the start time was read, then kill(pid) sent: a pid reused between
+        """The start time was read, then kill(pid) sent: a pid reused between
         the two got SIGSTOP or SIGCONT. Every signal now goes through a pidfd whose process was
         alive after its identity and ownership were read; without pidfds, nothing is signalled."""
         owner = watch.Owner({"FLEET_JOB": "job-a"})
@@ -238,7 +238,7 @@ class Watch(unittest.TestCase):
 
     @unittest.skipUnless(hasattr(watch.signal, "SIGCONT"), "POSIX signals (the watcher runs on Linux)")
     def test_a_journal_is_replaced_whole_or_not_at_all_and_its_directory_synced(self):
-        """Sol, 20 Oct 2026: the unsettled lines were written over the journal in place, so a
+        """The unsettled lines were written over the journal in place, so a
         crash midway left it empty, and the next resume deleted it and reported success."""
         with tempfile.TemporaryDirectory() as tmp:
             frozen = Path(tmp) / "frozen"

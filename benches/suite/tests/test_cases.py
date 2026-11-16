@@ -85,7 +85,7 @@ class Mistakes(unittest.TestCase):
             ({"phases": ["read"]}, "phases: only a classifier tool's case"),
             ({"tool": "classify-el", "phases": ["read", "parse"]}, "phases: a non-empty list of what classify-el prints"),
             ({"tool": "classify-el", "phases": []}, "phases: a non-empty list of what classify-el prints"),
-            # A phase left out still counts in the whole process (master, 14 Nov 2026 08:12: nothing
+            # A phase left out still counts in the whole process (nothing
             # unobserved after the drop).
             ({"tool": "classify-el", "phases": ["read", "normalise", "saturate", "assemble", "write"]},
              "phases: leaving out prepare, it declares wall"),
