@@ -3139,9 +3139,10 @@ mod equality_publication_tests {
                 .expect("it reasons")
         };
         let mut wrong = Vec::new();
-        for (from, to) in [
-            (ReasoningMode::Rdfs, ReasoningMode::RdfsPlus),
-            (ReasoningMode::RdfsPlus, ReasoningMode::Rdfs),
+        // The Animals `to` entails over DATA: `a, b` under RDFS-Plus, `a` alone under RDFS.
+        for (from, to, entailed) in [
+            (ReasoningMode::Rdfs, ReasoningMode::RdfsPlus, 2),
+            (ReasoningMode::RdfsPlus, ReasoningMode::Rdfs, 1),
         ] {
             let dir = tempfile::tempdir().expect("dir");
             let file = dir.path().join("data.nt");
@@ -3175,7 +3176,14 @@ mod equality_publication_tests {
                 .expect("the second closure");
             let (between, after) = (between.lock().unwrap().clone(), answers(&store));
             let case = format!("{from:?} to {to:?}");
-            if between == after {
+            // Written in: a fresh store goes through the same `finish_held` and would be as wrong.
+            if !after[1].contains(&format!("\"value\":\"{entailed}\"")) {
+                println!(
+                    "CASE {case}: WRONG count {} where {to:?} entails {entailed}",
+                    after[1]
+                );
+                wrong.push(case);
+            } else if between == after {
                 println!("CASE {case}: right {after:?}");
             } else {
                 println!("CASE {case}: WRONG between {between:?} | after {after:?}");
