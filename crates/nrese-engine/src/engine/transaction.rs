@@ -766,6 +766,7 @@ impl Inner {
     ///
     /// A local commit's `note` ([`Transaction::note_commit`]) is called at the point that
     /// method names: in the log's append, or, in memory, before the publication.
+    #[expect(clippy::too_many_arguments, reason = "a record and its reading")]
     pub(super) fn publish_record(
         &self,
         record: &CommitRecord,
