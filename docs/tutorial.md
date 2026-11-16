@@ -1,9 +1,17 @@
 # Tutorial: from the first answer to your own data
 
 This page picks up where the README's [quick start](../README.md#quick-start) ends. The server
-`nrese` runs as started there, with OWL 2 DL reasoning and the SHACL gate on, and the [first
-query](../README.md#a-first-answer) answered `ex:tom` and `ex:rex`. Every step here runs against
-that server, and `ex:` stands for `http://example.org/`.
+`nrese` runs as started there, with OWL 2 DL reasoning and the SHACL gate on, and holds the
+statements of the [first answer](../README.md#a-first-answer): cats and dogs are animals, every pet
+is a cat or a dog, Tom is a cat and Rex a pet. Every step here runs against that server, and `ex:`
+stands for `http://example.org/`. The query there, for every animal, answered `ex:tom` and
+`ex:rex`, and the steps below ask it again:
+
+```bash
+curl http://localhost:8080/dataset/query --data-urlencode 'query=
+  PREFIX ex: <http://example.org/>
+  SELECT ?x WHERE { ?x a ex:Animal }'
+```
 
 ## Retract, and the inferences go
 
@@ -15,13 +23,13 @@ curl http://localhost:8080/dataset/update --data-urlencode 'update=
   DELETE DATA { ex:tom a ex:Cat . ex:rex a ex:Pet }'
 ```
 
-The same query now answers no rows: `{"head":{"vars":["x"]},"results":{"bindings":[]}}`.
+The query now answers no rows: `{"head":{"vars":["x"]},"results":{"bindings":[]}}`.
 
 ## Validate on commit
 
 Now add a [shape](glossary.md#shape-shapes-graph-shacl-gate) that says every animal needs a name,
 in the shapes graph NRESE reads by default, the one [RDF4J](https://rdf4j.org/documentation/programming/shacl/)
-uses. A cat without a name is an animal by inference, so the gate rejects it:
+uses. A cat without a name is an animal by inference, so the gate refuses it:
 
 ```bash
 curl http://localhost:8080/dataset/update --data-urlencode 'update=
@@ -39,49 +47,79 @@ curl -i http://localhost:8080/dataset/update --data-urlencode 'update=
 ```text
 HTTP/1.1 400 Bad Request
 content-type: application/problem+json
-x-request-id: 63f55350-5736-4b00-a1d4-1f63e22b0fe4
-content-length: 333
-date: Sun, 15 Nov 2026 22:20:44 GMT
 
-{"detail":"the commit introduces 1 SHACL result(s) and 0 failure(s); first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>","reasoner_reject":null,"request_id":"63f55350-5736-4b00-a1d4-1f63e22b0fe4","status":400,"title":"SHACL Reject","type":"https://nrese.dev/problems/shacl-reject"}
+{"detail":"the commit introduces 1 SHACL result(s) and 0 failure(s); first: focus node <http://example.org/felix>, <http://www.w3.org/ns/shacl#MinCountConstraintComponent>",
+ "reasoner_reject":null,"request_id":"63f55350-5736-4b00-a1d4-1f63e22b0fe4","status":400,
+ "title":"SHACL Reject","type":"https://nrese.dev/problems/shacl-reject"}
 ```
 
-Nothing of the rejected commit remains, so the query still answers no rows. With a name
-(`INSERT DATA { ex:felix a ex:Cat ; ex:name "Felix" }`) the commit passes, and the query
-answers `ex:felix`. [What a commit does](what-it-covers.md#what-a-commit-does) explains when each
-part of a commit becomes visible and what the checks see. The shape stays in the store, so to run
-the example again, [start over](#change-a-setting-start-over) first.
+Its `detail` names `ex:felix` as the focus node and the `sh:minCount` constraint it fails. Three
+more headers are left out here, and the body, which comes as one line, is broken to fit the page.
+
+Nothing of the rejected commit remains, so the query still answers no rows. With a name, the
+commit passes:
+
+```bash
+curl http://localhost:8080/dataset/update --data-urlencode 'update=
+  PREFIX ex: <http://example.org/>
+  INSERT DATA { ex:felix a ex:Cat ; ex:name "Felix" }'
+```
+
+The query now answers `ex:felix`. [What a commit does](what-it-covers.md#what-a-commit-does)
+explains when each part of a commit becomes visible and what the checks see. The shape stays in
+the store, so to run the example again, [start over](#change-a-setting-start-over) first.
 
 ## Your own data
 
 Next, load your own file, `my.ttl` in [Turtle](https://www.w3.org/TR/turtle/), into the same
-server, count its statements, and see that they are still there after a restart:
+server. The upload replaces the [default graph](glossary.md#graph) with your file, so the
+example's statements go. The shape stays, in its own graph, so whatever your file makes an
+`ex:Animal` needs an `ex:name` too, or the upload is refused as Felix was. To load into an empty
+store, [start over](#change-a-setting-start-over) first.
 
 ```bash
 curl -X PUT -H 'Content-Type: text/turtle' --data-binary @my.ttl 'http://localhost:8080/dataset/data?default'
+```
+
+When the upload passes, curl prints nothing (the answer is `204 No Content`); when it is refused,
+it prints the reason. Other syntaxes take their media type as `Content-Type`. A `PUT` takes at
+most 128 MiB ([`budgets.upload_size`](ops/config-reference.md#budgets.upload_size)); larger files
+load offline with `nrese-server load` ([loading data](ops/server-setup.md#loading-data)).
+
+Count the statements you stored:
+
+```bash
 curl http://localhost:8080/dataset/query --data-urlencode infer=false \
   --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
+```
+
+`infer=false` reads the asserted statements only, so the count is the number of statements in
+your file (for a file of three, `"value":"3"`). Without it the inferred ones count too, some of
+them even in an empty store ([why](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
+
+Restart the server and count again:
+
+```bash
 docker restart nrese
 until curl -sf http://localhost:8080/readyz; do sleep 1; done
 curl http://localhost:8080/dataset/query --data-urlencode infer=false \
   --data-urlencode 'query=SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }'
 ```
 
-- The `PUT` answers `204 No Content` and replaces the [default graph](glossary.md#graph) with your file.
-- `infer=false` reads the asserted statements only, so the count is the number of statements in
-  your file (for a file of three, `"value":"3"`). Without it the inferred ones count too, some
-  of them even in an empty store ([why](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
-- After the restart the count is the same. On Docker's stop signal the server lets the
-  requests in flight finish, closes the store and exits
-  ([stopping](ops/server-setup.md#stopping)). Every commit is synced to the log
-  before it is acknowledged, so not even a kill loses one
-  ([durability](spec/02-storage-and-transactions.md#durability-on-disk-mode)).
-- Other syntaxes take their media type as `Content-Type`. A `PUT` takes at most 128 MiB
-  ([`budgets.upload_size`](ops/config-reference.md#budgets.upload_size)); larger files load
-  offline with `nrese-server load` ([loading data](ops/server-setup.md#loading-data)).
-- Queries are standard SPARQL ([SPARQL 1.1 Query Language](https://www.w3.org/TR/sparql11-query/#basicpatterns)).
-  This one, sent as `query=` like the count, gives the names of the animals older than 5, in order:
-  `PREFIX ex: <http://example.org/> SELECT ?name WHERE { ?a a ex:Animal ; ex:age ?age ; ex:name ?name . FILTER(?age > 5) } ORDER BY ?name`.
+The count is the same. On Docker's stop signal the server lets the requests in flight finish,
+closes the store and exits ([stopping](ops/server-setup.md#stopping)). Every commit is synced to
+the log before it is acknowledged, so not even a kill loses one
+([durability](spec/02-storage-and-transactions.md#durability-on-disk-mode)).
+
+Queries are standard SPARQL ([SPARQL 1.1 Query Language](https://www.w3.org/TR/sparql11-query/#basicpatterns)).
+This one gives the names of the animals older than 5, in order:
+
+```bash
+curl http://localhost:8080/dataset/query --data-urlencode 'query=
+  PREFIX ex: <http://example.org/>
+  SELECT ?name WHERE { ?a a ex:Animal ; ex:age ?age ; ex:name ?name . FILTER(?age > 5) }
+  ORDER BY ?name'
+```
 
 ## Change a setting, start over
 
