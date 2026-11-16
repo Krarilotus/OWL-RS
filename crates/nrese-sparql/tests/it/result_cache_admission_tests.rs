@@ -531,7 +531,7 @@ fn canonical_and_expanded_answers_keep_their_own_bytes_in_both_orders() {
     tx.insert(quad("Rep", "p", "o").as_ref());
     tx.insert_inferred(EncodedTriple::new(alias, same_as, rep));
     tx.commit().unwrap();
-    engine.set_equality(Some(same_as));
+    engine.transaction().install_reading(Some(same_as));
     let snapshot = engine.snapshot();
     let text = format!("SELECT ?x WHERE {{ ?x <{EX}p> <{EX}o> }}");
     let reading = |canonical: bool, cache: Option<&Arc<ResultCache>>| QueryOptions {
@@ -591,7 +591,7 @@ fn a_refused_canonical_view_is_never_answered_from_the_expanded_bytes() {
     tx.insert(named.as_ref());
     tx.insert_inferred(EncodedTriple::new(alias, same_as, rep));
     tx.commit().unwrap();
-    engine.set_equality(Some(same_as));
+    engine.transaction().install_reading(Some(same_as));
     engine.set_canonical_view_budget(Arc::new(nrese_exec::Budget::new(1)));
     let snapshot = engine.snapshot();
     let text = format!("SELECT ?x WHERE {{ ?x <{EX}p> <{EX}o> }}");

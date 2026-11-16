@@ -35,7 +35,7 @@ rm -rf -- "$out/gate.json" "$out/check.log"
 attempt="${FLEET_JOB:-none}:${FLEET_STEP:-0}:${EPOCHREALTIME/[.,]/}:$$"
 echo "$attempt" > "$out/attempt"
 export PATH="$cache/bin:$HOME/.cargo/bin:$PATH"
-# Nothing here may reach a Docker daemon (Office's volumes and images are its colleagues').
+# Nothing here may reach a Docker daemon (the shared host's volumes and images belong to others).
 export DOCKER_HOST=unix:///nonexistent/owlrs-gate-has-no-docker.sock
 infra() { echo "gate-job: $*" >&2; exit 3; }
 # A tool's run, its output shown only when it fails.
@@ -75,7 +75,7 @@ fi
 cd "$wt" || infra "no worktree"
 
 # Rust links through the system's C compiler: a host without one can't run a gate, and that is
-# the host's failure, not the tree's (khaleesi-wsl, 20 Oct 2026: every build script failed).
+# the host's failure, not the tree's (the development machine's WSL VM, 20 Oct 2026: every build script failed).
 linker=${NRESE_GATE_CC:-cc}
 command -v "$linker" > /dev/null || infra "no C compiler and linker ($linker) on this host: its owner installs one (build-essential)"
 # ... and one that links: a tiny program, built.
@@ -83,7 +83,7 @@ printf 'int main(void) { return 0; }\n' > "$cache/link-probe.c"
 quiet "$linker" "$cache/link-probe.c" -o "$cache/link-probe" \
   || infra "the C compiler here ($linker) doesn't link a program: its owner repairs it (build-essential)"
 rm -f -- "$cache/link-probe.c" "$cache/link-probe"
-# A host without rustup (khaleesi-wsl, 20 Oct 2026) gets one of the gate's own, under the cache:
+# A host without rustup (the development machine's WSL VM, 20 Oct 2026) gets one of the gate's own, under the cache:
 # the host's own home and PATH stay as they are.
 if ! command -v rustup > /dev/null; then
   export RUSTUP_HOME="$cache/rustup" CARGO_HOME="$cache/cargo"

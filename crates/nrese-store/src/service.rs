@@ -7,7 +7,7 @@ use nrese_sparql::CancellationToken;
 use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, export_dataset};
 use crate::bulk_load::{BulkLoadReport, BulkLoadRequest, bulk_load};
 use crate::config::{StoreConfig, StoreMode};
-use crate::dl::query::Revision;
+use crate::dl::query::{Revision, certify_closure};
 use crate::error::StoreResult;
 use crate::graph_store::{
     GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport, GraphWriteRequest,
@@ -315,7 +315,9 @@ impl StoreService {
             service.invalidate_held(writer)?;
         }
         if let Some(state) = service.reasoning_state() {
-            service.note_equality(writer, &state);
+            // The reading isn't on disk: the certified stack's is installed before the store
+            // is anyone's. Without a certificate the stack is read as stored.
+            tx.install_reading(service.note_equality(writer, &state));
             // Kept in memory too: reads ask for it per query ([`Self::status_without_dl`]).
             *service
                 .materialised
@@ -330,23 +332,28 @@ impl StoreService {
     /// Whether the recorded reasoning closes the data under `owl:sameAs` (a ruleset with
     /// the equality rules): queries may then rely on it.
     ///
-    /// A stack kept over representatives (`reasoner.equality = "compact"`) is read
-    /// expanded: the engine learns `owl:sameAs` ([`nrese_engine::Engine::set_equality`]).
-    fn note_equality(&self, writer: nrese_engine::WriterHeld<'_>, state: &crate::ReasoningState) {
+    /// Returns how the certified stack is read: a stack kept over representatives
+    /// (`reasoner.equality = "compact"`) expanded by `owl:sameAs`, else as stored. Its
+    /// publication installed that already; the open installs it
+    /// ([`nrese_engine::Transaction::install_reading`]).
+    fn note_equality(
+        &self,
+        writer: nrese_engine::WriterHeld<'_>,
+        state: &crate::ReasoningState,
+    ) -> Option<nrese_engine::TermId> {
         self.note_ql(writer, state);
         let closed = nrese_reasoner::RuleProgram::closes_equality(&state.ruleset);
         self.settings
             .equality_closed
             .store(closed, std::sync::atomic::Ordering::Release);
-        let same_as = (closed && state.compact_equality)
+        (closed && state.compact_equality)
             .then(|| {
                 self.engine.snapshot().lookup(
                     nrese_rdf::NamedNodeRef::new_unchecked("http://www.w3.org/2002/07/owl#sameAs")
                         .into(),
                 )
             })
-            .flatten();
-        self.engine.set_equality(same_as);
+            .flatten()
     }
 
     /// Switches the QL rewriting on for a closure it can rewrite over (docs/design/
@@ -633,11 +640,9 @@ impl StoreService {
     pub fn clear_inferred(&self) -> StoreResult<u64> {
         let rematerialisation = self.engine.rematerialisation();
         self.invalidate_held(rematerialisation.writer())?;
-        self.engine.set_equality(None);
-        if rematerialisation.base().len_in(ReadModel::Inferred) == 0 {
-            return Ok(0);
-        }
-        Ok(rematerialisation.finish(Vec::new())?.inferred_deleted)
+        // An empty stack is read as stored, installed even where it was empty already.
+        let finished = rematerialisation.finish_held(Vec::new(), None)?;
+        Ok(finished.summary().inferred_deleted)
     }
 
     /// Waits until the engine's background maintenance has nothing requested or running
@@ -744,11 +749,11 @@ impl StoreService {
     /// holds triple terms) announce it ([`PreparedQuery::announce_rdf12`]).
     pub fn prepare_query(&self, request: &SparqlQueryRequest) -> StoreResult<PreparedQuery> {
         let mut prepared = PreparedQuery::parse_with(request, Some(&self.namespaces.all()))?;
-        if prepared.uses_rdf12()
+        if PreparedQuery::uses_rdf12(prepared.query())
             || self
                 .engine
                 .snapshot()
-                .holds_triple_terms(prepared.read_model())
+                .holds_triple_terms(prepared.read_model(), |_| true)
         {
             prepared.announce_rdf12();
         }
@@ -1236,8 +1241,8 @@ impl StoreService {
                  bounds; certain answers under OWL 2 DL may be missing"
                     .to_owned(),
             );
-            crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
-            crate::dl::query::mark(self, at, &mut status);
+            certify_closure(&mut status, prepared.reads(), "dl", Some(at.snapshot()));
+            crate::dl::query::mark(self, prepared, at, &mut status);
             return Some(status);
         }
         let ruleset = self
@@ -1257,7 +1262,7 @@ impl StoreService {
                  certain answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
             ),
         );
-        crate::dl::query::certify_closure(&mut status, prepared.reads(), "rules");
+        certify_closure(&mut status, prepared.reads(), "rules", Some(at.snapshot()));
         Some(status)
     }
 
@@ -1430,7 +1435,7 @@ impl StoreService {
         if let nrese_sparql::ql::Printed::Query { completeness, .. } = &mut printed {
             completeness.regime = Some(nrese_sparql::Regime::Owl2Rl);
             let reads = crate::dl::query::Reads::default();
-            crate::dl::query::certify_closure(completeness, (&query, &reads), "ql");
+            certify_closure(completeness, (&query, &reads), "ql", Some(&snapshot));
         }
         Ok(printed)
     }
@@ -1608,8 +1613,8 @@ impl StoreService {
                          over before the commit (the committed closure, no DL bounds)"
                             .to_owned(),
                     );
-                    crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
-                    crate::dl::query::mark(self, at, &mut status);
+                    certify_closure(&mut status, prepared.reads(), "dl", Some(at.snapshot()));
+                    crate::dl::query::mark(self, prepared, at, &mut status);
                     Some(status)
                 }
                 false => self.status_outside_dl(prepared, ql, at),
@@ -2245,8 +2250,15 @@ impl StoreService {
         // heap's peak, is built (as between the reasoner's rounds).
         nrese_engine::memory::release_between_rounds();
         nrese_exec::heap::phase("store: inferred stack");
-        // Published with the writer slot still held: certified before any other write.
-        let finished = rematerialisation.finish_held(closure.inferred)?;
+        #[cfg(test)]
+        hooks::run(&hooks::BEFORE_PUBLICATION);
+        // Published with the writer slot still held: certified before any other write. The
+        // new stack comes with its reading, as its program keeps it (expanded by the id it is
+        // kept over, or as stored), in one install: until then readers read the old stack in
+        // its own reading, uncertified (`invalidate_held` above). A publication that fails
+        // installs nothing, so there is nothing to put back.
+        let finished =
+            rematerialisation.finish_held(closure.inferred, program.stored_equality())?;
         let summary = finished.summary();
         nrese_exec::heap::phase("store: done");
         nrese_engine::memory::release_all();
@@ -2464,6 +2476,9 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_LOAD_READS: Hook = const { RefCell::new(None) };
         /// A bulk load has cleared the reasoning certificate and is about to publish.
         pub(crate) static AFTER_INVALIDATION: Hook = const { RefCell::new(None) };
+        /// A rematerialisation has dropped the old certificate and computed its inferences, and
+        /// is about to publish them.
+        pub(crate) static BEFORE_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A rematerialisation has published its inferences and is about to certify them.
         pub(crate) static AFTER_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A change of the QL rewriting setting has read the certificate and is about to
@@ -3189,5 +3204,213 @@ mod context_tests {
                 assert_ne!(a, b);
             }
         }
+    }
+}
+
+/// A rematerialisation under `reasoner.equality = "compact"` is read as it will be certified
+/// from the moment its stack is published: a reader between the publication and the
+/// certificate (`hooks::AFTER_PUBLICATION`) answers as a reader after both, its rows and their
+/// count. Over an `owl:sameAs`, from a closure that closes no equality (RDFS: every copy
+/// stored, nothing expanded) to one kept over representatives (RDFS-Plus), and back.
+#[cfg(test)]
+mod equality_publication_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{StoreService, hooks};
+    use crate::StoreConfig;
+    use nrese_reasoner::ReasoningMode;
+
+    const DATA: &str = "<http://example.com/a> <http://www.w3.org/2002/07/owl#sameAs> \
+                        <http://example.com/b> .\n\
+                        <http://example.com/a> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+                        <http://example.com/Dog> .\n\
+                        <http://example.com/Dog> <http://www.w3.org/2000/01/rdf-schema#subClassOf> \
+                        <http://example.com/Animal> .\n";
+    const READS: [&str; 2] = [
+        "SELECT ?x WHERE { ?x a <http://example.com/Animal> } ORDER BY ?x",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?x a <http://example.com/Animal> }",
+    ];
+
+    fn answers(store: &StoreService) -> Vec<String> {
+        READS
+            .iter()
+            .map(|read| {
+                let result = store.execute_query_str(read).expect("query");
+                String::from_utf8(result.payload).expect("utf-8")
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_compact_stack_is_read_expanded_from_its_publication() {
+        let program = |mode| {
+            nrese_reasoner::ReasonerConfig::for_mode(mode)
+                .materialised_program()
+                .expect("it reasons")
+        };
+        let mut wrong = Vec::new();
+        // The Animals `to` entails over DATA: `a, b` under RDFS-Plus, `a` alone under RDFS.
+        for (from, to, entailed) in [
+            (ReasoningMode::Rdfs, ReasoningMode::RdfsPlus, 2),
+            (ReasoningMode::RdfsPlus, ReasoningMode::Rdfs, 1),
+        ] {
+            let dir = tempfile::tempdir().expect("dir");
+            let file = dir.path().join("data.nt");
+            std::fs::write(&file, DATA).expect("data");
+            let store = Arc::new(
+                StoreService::new(StoreConfig {
+                    equality_by_representatives: true,
+                    equality_compact: true,
+                    ..StoreConfig::on_disk(dir.path().join("store"))
+                })
+                .expect("store"),
+            );
+            store
+                .bulk_load(&crate::BulkLoadRequest {
+                    files: vec![file],
+                    replace: false,
+                    graph: crate::GraphTarget::DefaultGraph,
+                    invalid: None,
+                })
+                .expect("load");
+            store
+                .rematerialise(program(from))
+                .expect("the first closure");
+            let between = Arc::new(Mutex::new(Vec::new()));
+            let (reader, seen) = (Arc::clone(&store), Arc::clone(&between));
+            hooks::AFTER_PUBLICATION.set(Some(Box::new(move || {
+                *seen.lock().unwrap() = answers(&reader);
+            })));
+            store
+                .rematerialise(program(to))
+                .expect("the second closure");
+            let (between, after) = (between.lock().unwrap().clone(), answers(&store));
+            let case = format!("{from:?} to {to:?}");
+            // Written in: a fresh store goes through the same `finish_held` and would be as wrong.
+            if !after[1].contains(&format!("\"value\":\"{entailed}\"")) {
+                println!(
+                    "CASE {case}: WRONG count {} where {to:?} entails {entailed}",
+                    after[1]
+                );
+                wrong.push(case);
+            } else if between == after {
+                println!("CASE {case}: right {after:?}");
+            } else {
+                println!("CASE {case}: WRONG between {between:?} | after {after:?}");
+                wrong.push(case);
+            }
+        }
+        assert!(wrong.is_empty(), "wrong: {wrong:?}");
+    }
+
+    /// A certified compact store reopened to store its closure expanded, then rematerialised
+    /// under the same program, answers as that program entails: over DATA, RDFS-Plus makes
+    /// `b` an Animal. The expanded closure reads as the compact stack did; it is stored
+    /// otherwise, and its own rows go in.
+    #[test]
+    fn a_compact_store_rematerialised_expanded_answers_as_its_program_entails() {
+        let program = || {
+            nrese_reasoner::ReasonerConfig::for_mode(ReasoningMode::RdfsPlus)
+                .materialised_program()
+                .expect("it reasons")
+        };
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("data.nt");
+        std::fs::write(&file, DATA).expect("data");
+        let config = |compact| StoreConfig {
+            equality_by_representatives: true,
+            equality_compact: compact,
+            ..StoreConfig::on_disk(dir.path().join("store"))
+        };
+        let store = StoreService::new(config(true)).expect("store");
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![file],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .expect("load");
+        store.rematerialise(program()).expect("the compact closure");
+        assert!(store.reasoning_state().is_some(), "not certified");
+        drop(store);
+        let store = StoreService::new(config(false)).expect("the reopened store");
+        store
+            .rematerialise(program())
+            .expect("the expanded closure");
+        let animals = answers(&store);
+        assert!(
+            animals[0].contains("http://example.com/b"),
+            "b is no Animal: {animals:?}"
+        );
+    }
+
+    /// A reader while a compact store's reasoning changes, after the old certificate is gone
+    /// and before the new stack is published (`hooks::BEFORE_PUBLICATION`), answers as one of
+    /// the two programs, uncertified: as RDFS-Plus before the change or as RDFS after it. Over
+    /// `a sameAs b . b a Dog . Dog subClassOf Animal`, `a` loaded first so that it has the
+    /// smaller id and represents the class: RDFS-Plus's stack keeps `a a Animal` over it and
+    /// is read expanded (`a`, `b`); RDFS entails only `b a Animal`. `a` alone is neither.
+    #[test]
+    fn a_store_read_while_its_reasoning_changes_answers_as_one_program() {
+        let dir = tempfile::tempdir().expect("dir");
+        let file = dir.path().join("data.nt");
+        std::fs::write(
+            &file,
+            "<http://example.com/a> <http://www.w3.org/2002/07/owl#sameAs> \
+             <http://example.com/b> .\n\
+             <http://example.com/b> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://example.com/Dog> .\n\
+             <http://example.com/Dog> <http://www.w3.org/2000/01/rdf-schema#subClassOf> \
+             <http://example.com/Animal> .\n",
+        )
+        .expect("data");
+        let store = Arc::new(
+            StoreService::new(StoreConfig {
+                equality_by_representatives: true,
+                equality_compact: true,
+                ..StoreConfig::on_disk(dir.path().join("store"))
+            })
+            .expect("store"),
+        );
+        store
+            .bulk_load(&crate::BulkLoadRequest {
+                files: vec![file],
+                replace: false,
+                graph: crate::GraphTarget::DefaultGraph,
+                invalid: None,
+            })
+            .expect("load");
+        let program = |mode| {
+            nrese_reasoner::ReasonerConfig::for_mode(mode)
+                .materialised_program()
+                .expect("it reasons")
+        };
+        store
+            .rematerialise(program(ReasoningMode::RdfsPlus))
+            .expect("RDFS-Plus");
+        let before = answers(&store);
+        let window = Arc::new(Mutex::new(None));
+        let (reader, seen) = (Arc::clone(&store), Arc::clone(&window));
+        hooks::BEFORE_PUBLICATION.set(Some(Box::new(move || {
+            *seen.lock().unwrap() = Some((answers(&reader), reader.reasoning_state().is_some()));
+        })));
+        store
+            .rematerialise(program(ReasoningMode::Rdfs))
+            .expect("RDFS");
+        let after = answers(&store);
+        let (between, certified) = window.lock().unwrap().take().expect("the hook ran");
+        println!(
+            "CASE RdfsPlus to Rdfs: before {before:?} | between {between:?} | after {after:?}"
+        );
+        assert_ne!(
+            before, after,
+            "the two programs answer alike: the case shows nothing"
+        );
+        assert!(!certified, "a certificate in the window");
+        assert!(
+            between == before || between == after,
+            "between {between:?} is neither RDFS-Plus's {before:?} nor RDFS's {after:?}"
+        );
     }
 }

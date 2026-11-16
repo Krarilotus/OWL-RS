@@ -23,7 +23,7 @@ filters = ["islands_decide_as_the_whole_abox_does", "touched_islands_decide_as_a
 crate = "nrese-dl"
 test = "tableau_fuzz"
 filters = ["answers_agree_with_the_semantics"]
-# Seed 600026 needs 6,062 MiB (14 Oct 2026, reproduced on the main PC: every answer right).
+# Seed 600026 needs 6,062 MiB (14 Oct 2026, reproduced on the development machine: every answer right).
 memory_mib = 8192
 
 [[target]]
@@ -107,6 +107,11 @@ filters = ["native_differential_tests::native_results_equal_the_reference_on_ran
            "native_differential_tests::streamed_groups_equal_the_reference",
            "native_differential_tests::eager_aggregation_equals_the_reference_on_random_groups",
            "native_differential_tests::paths_ordered_with_patterns_equal_the_reference"]
+
+[[target]]
+crate = "nrese-store"
+lib = true
+filters = ["dl::query::cancellation_tests::the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores"]
 
 [[target]]
 crate = "nrese-store"

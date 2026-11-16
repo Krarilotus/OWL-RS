@@ -55,7 +55,7 @@ fn compact(size: usize, facts: usize) -> Snapshot {
         );
     }
     tx.commit().unwrap();
-    engine.set_equality(Some(same_as));
+    engine.transaction().install_reading(Some(same_as));
     engine.snapshot()
 }
 
@@ -312,7 +312,7 @@ fn class_build_units(n: usize) -> u64 {
     }
     tx.insert(Quad::new(node("s0"), node("p"), node("o"), GraphName::DefaultGraph).as_ref());
     tx.commit().unwrap();
-    engine.set_equality(Some(same_as));
+    engine.transaction().install_reading(Some(same_as));
     let snapshot = engine.snapshot();
     let p = snapshot.lookup(node("p").as_ref().into()).unwrap();
     let pattern = QuadPattern {

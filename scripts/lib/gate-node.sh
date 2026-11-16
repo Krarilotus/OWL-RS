@@ -1,7 +1,7 @@
 # The console's Node for a gate job (scripts/check.sh's console step): nodejs.org's build of the
 # version scripts/lib/gate-tools.txt pins, taken only by its archive's sha256, unpacked under the
 # host's cache (`node-<version>-<sha12>`), never the host's own Node and never a global install.
-# Toolchains on hosts belong to the job (the owner, 2 Nov 2026). Sourced by the gate jobs,
+# Toolchains on hosts belong to the job. Sourced by the gate jobs,
 # scripts/lib/gate-job.sh on Linux and scripts/lib/windows-job.sh on Windows.
 #
 #   gate_node CACHE TOOLS

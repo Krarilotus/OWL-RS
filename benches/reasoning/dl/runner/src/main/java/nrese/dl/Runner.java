@@ -125,12 +125,12 @@ public final class Runner {
         System.exit(0);
     }
 
-    private static String clean(String s) {
+    static String clean(String s) {
         String one = s.replace('\t', ' ').replace('\n', ' ').replace('\r', ' ');
         return one.length() > 300 ? one.substring(0, 300) : one;
     }
 
-    private static String[] failure(Throwable e) {
+    static String[] failure(Throwable e) {
         String name = e.getClass().getName();
         if (name.contains("Unsupported") || name.contains("UnsupportedEntailment")
             || name.contains("UnsupportedDatatype") || name.contains("OWLReasonerRuntime")
@@ -145,7 +145,7 @@ public final class Runner {
         return new String[] {"error", name + ": " + e.getMessage()};
     }
 
-    private static OWLReasonerFactory factory(String name) {
+    static OWLReasonerFactory factory(String name) {
         return switch (name) {
             case "hermit" -> new org.semanticweb.HermiT.ReasonerFactory();
             case "elk" -> new org.semanticweb.elk.owlapi.ElkReasonerFactory();
