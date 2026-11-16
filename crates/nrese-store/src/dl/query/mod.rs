@@ -410,23 +410,27 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
 
 /// What the store's indexes decide of [`reads_differently`] without the ontology: `Some`
 /// with the reason or with none, `None` where only the ontology decides. Annotation-property
-/// axioms exactly, by the reader's rule: an annotation property (declared, or built in) as
+/// axioms exactly, by the reader's rule: an annotation property (declared by the reader's
+/// table, OWL 1's `owl:OntologyProperty` too, or built in) as
 /// the subject of `rdfs:domain`, `rdfs:range` or `rdfs:subPropertyOf`, or as the object of
 /// one whose subject is none; the smallest named, probed per property. A
 /// pun needs a term equal to another: without one there is none; with one, the ontology
 /// decides.
 fn by_index(snapshot: &Snapshot) -> Option<Option<String>> {
-    use nrese_owl::vocab::{OWL, RDFS};
+    use nrese_owl::{EntityKind, vocab::RDFS};
     let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
     let quads = |model, subject, predicate, object| {
         let mut pattern = QuadPattern::all();
         (pattern.subject, pattern.predicate, pattern.object) = (subject, predicate, object);
         snapshot.quads_for_pattern_in(model, &pattern)
     };
-    let (ty, annotation) = (id(RDF_TYPE), id(&format!("{OWL}AnnotationProperty")));
+    let ty = id(RDF_TYPE);
     let asserted = |s, p, o| quads(ReadModel::Asserted, s, p, o);
-    let typed = ty.and(annotation).map(|a| asserted(None, ty, Some(a)));
-    let declared = typed.into_iter().flatten().map(|q| q.subject);
+    // Declared by the reader's table: `owl:AnnotationProperty`, and OWL 1's typing.
+    let annotation = nrese_owl::DECLARATION_KINDS.into_iter();
+    let annotation = annotation.filter(|&(_, k)| k == EntityKind::AnnotationProperty);
+    let typed = annotation.filter_map(|(iri, _)| ty.and(id(iri)));
+    let declared = typed.flat_map(|a| asserted(None, ty, Some(a)).map(|q| q.subject));
     let named = declared.filter(|s| s.kind() == nrese_engine::TermKind::Iri);
     let builtin = nrese_owl::BUILTIN_ANNOTATIONS.map(id).into_iter().flatten();
     let properties: Vec<TermId> = named.chain(builtin).collect();
