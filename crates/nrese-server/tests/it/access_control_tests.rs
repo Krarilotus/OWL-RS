@@ -836,11 +836,12 @@ default_graph = "read"
 }
 
 /// A reader of some graphs who sees inferences, refused its read while the inferred statements
-/// aren't the closure of the rules in place, is answered 503 with the refusal's sentence: the
-/// read may succeed once the store is rematerialised (`POST
-/// /api/v1/repositories/{id}/reasoning/rematerialise`), and the refusal is no fault of the
-/// server's (no 500). The stack is certified under rdfs and the rules in place are owl2-rl,
-/// as a change of a repository's reasoning leaves it for a moment.
+/// aren't the closure of the rules in place, is answered 503 with the refusal's sentence and,
+/// on a primary, the administrator's route: the read may succeed once the store is
+/// rematerialised (`POST /api/v1/repositories/{id}/reasoning/rematerialise`), and the refusal
+/// is no fault of the server's (no 500). A primary's answer names no replica. The stack is
+/// certified under rdfs and the rules in place are owl2-rl, as a change of a repository's
+/// reasoning leaves it for a moment.
 #[tokio::test]
 async fn a_read_refused_until_the_store_is_rematerialised_is_answered_unavailable()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -870,16 +871,28 @@ default_graph = "read"
     .await?;
     let sentence =
         body.contains("the inferred statements aren't the rules' closure: rematerialise first");
+    let route =
+        body.contains("(an administrator: POST /api/v1/repositories/{id}/reasoning/rematerialise)");
     let got = format!(
-        "{} {}",
+        "{} {}, {}, {}",
         status.as_u16(),
         if sentence {
             "with the sentence"
         } else {
-            "without it"
+            "without the sentence"
+        },
+        if route {
+            "with the route"
+        } else {
+            "without the route"
+        },
+        if body.contains("replica") {
+            "naming a replica"
+        } else {
+            "naming no replica"
         }
     );
-    let want = "503 with the sentence";
+    let want = "503 with the sentence, with the route, naming no replica";
     match got == want {
         true => println!("CASE the refused read's status: right {got}"),
         false => println!("CASE the refused read's status: WRONG {got}, want {want}"),
