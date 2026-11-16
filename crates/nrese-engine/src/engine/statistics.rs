@@ -707,19 +707,23 @@ impl Statistics {
     ) -> Result<Option<u64>, Stopped> {
         let key = (model, *pattern, permutation);
         let slot = Self::distinct_slot(&key);
-        let identity = snapshot.identity();
-        let kept = self
-            .distinct
-            .lock()
-            .as_ref()
-            .and_then(|slots| match slots[slot] {
-                Some((kept, distinct, _, Some((seen, count))))
-                    if kept == key && seen == identity =>
-                {
-                    Some(distinct.min(count))
-                }
-                _ => None,
-            });
+        // Only a published snapshot records the gate's count (below), so only one can find
+        // its own: any other asks as before, with no identity to make and no lookup.
+        let state = snapshot.shared_state().filter(|_| !self.view);
+        let identity = state.as_ref().map(|_| snapshot.identity());
+        let kept = identity.and_then(|identity| {
+            self.distinct
+                .lock()
+                .as_ref()
+                .and_then(|slots| match slots[slot] {
+                    Some((kept, distinct, _, Some((seen, count))))
+                        if kept == key && seen == identity =>
+                    {
+                        Some(distinct.min(count))
+                    }
+                    _ => None,
+                })
+        });
         if let Some(distinct) = kept {
             // No count to visit, but a stopped reader still gets no value.
             return match crate::visit::stopped(visit) {
@@ -736,7 +740,7 @@ impl Statistics {
             && *kept == key
             && count.abs_diff(*at) <= *at / 4
         {
-            if snapshot.shared_state().is_some() {
+            if let Some(identity) = identity {
                 *seen = Some((identity, count));
             }
             return Ok(Some((*distinct).min(count)));
@@ -748,9 +752,7 @@ impl Statistics {
         let Some(distinct) = snapshot.distinct_in(model, pattern, permutation, visit)? else {
             return Ok(None);
         };
-        if !self.view
-            && let Some(state) = snapshot.shared_state()
-        {
+        if let Some(state) = state {
             self.keep_distinct(&state, slot, key, distinct, count);
         }
         // Capped as a kept one is: a pattern has no more distinct values than matches, and
