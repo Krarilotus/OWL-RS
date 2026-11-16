@@ -25,6 +25,10 @@ use nrese_reasoner::ir::Triple;
 
 use crate::StoreService;
 
+#[cfg(test)]
+#[path = "lower_tests.rs"]
+mod tests;
+
 /// The taxonomy of `ontology`'s TBox (its assertions left out).
 pub(crate) fn tbox_taxonomy(store: &StoreService, ontology: &Ontology) -> Taxonomy {
     let mut tbox = Ontology {
