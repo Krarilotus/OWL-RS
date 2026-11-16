@@ -213,6 +213,7 @@ mod tests {
             let config = store.config();
             let program = Program::compile(&Ruleset::Owl2Rl.into(), &|term| tx.intern(term))
                 .hiding_unnamed_classes(config.hide_unnamed_classes)
+                .unwrap()
                 .by_representatives(config.equality_by_representatives)
                 .storing_representatives(config.equality_compact);
             assert!(program.stores_representatives());
