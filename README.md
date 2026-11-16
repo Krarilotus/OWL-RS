@@ -2,20 +2,14 @@
 
 NRESE is an RDF database with OWL reasoning, written in Rust. Its inferences are committed with
 the write they follow from and kept apart from what you stored, and every query answer carries a
-status that says whether rows may be missing. You get one server, built from source or as a Docker
-image: SPARQL 1.1, the Graph Store Protocol and RDF4J's protocol over HTTP, and a browser console.
-It takes one writer at a time, and the data must fit one machine: read replicas follow it, but
-nothing fails over or partitions the data ([limits](docs/limits.md)).
+status that says whether rows may be missing.
 
-These pages describe version 1.5, not yet released, which the [quick start](#quick-start) builds
-from the branch `refactor/engine-v2`; `main` holds the earlier version.
-
-Most work with data comes down to organising and standardising it, and an ontology is where
-that is written down. We wanted a store that follows the ontology itself, so that a write is
-checked against it, an inference changes with the data, and an answer says how far it can be
-trusted. NRESE is a hobby project, built part by part from the research literature with the W3C
-test suites as its floor, and where a standard could go further for a use case, we want to help
-move it.
+- You get one server, built from source or as a Docker image: SPARQL 1.1, the Graph Store
+  Protocol and RDF4J's protocol over HTTP, and a browser console.
+- It takes one writer at a time, and the data must fit one machine: read replicas follow it,
+  but nothing fails over or partitions the data ([limits](docs/limits.md)).
+- These pages describe version 1.5, not yet released, which the [quick start](#quick-start)
+  builds from the branch `refactor/engine-v2`; `main` holds the earlier version.
 
 ## What it does
 
@@ -57,11 +51,19 @@ checks. Everything it does, with the [standards and their tests](docs/what-it-co
 is in [features and standards](docs/what-it-covers.md), and where it stops is in
 [limits](docs/limits.md).
 
+Most work with data comes down to organising and standardising it, and an ontology is where
+that is written down. We wanted a store that follows the ontology itself, so that a write is
+checked against it, an inference changes with the data, and an answer says how far it can be
+trusted. NRESE is a hobby project, built part by part from the research literature with the W3C
+test suites as its floor, and where a standard could go further for a use case, we want to help
+move it.
+
 ## Quick start
 
 You need git, Docker with BuildKit, curl, a POSIX shell (Linux, macOS, or Git Bash or WSL on
 Windows) and a free port 8080. The image builds the server and its browser console, so you need
-no Rust or Node.js, and the first build takes several minutes.
+no Rust or Node.js, and the first build takes several minutes. The image targets x86-64-v3 and
+Neoverse N1 CPUs; on an older CPU, add `--build-arg NRESE_TARGET_CPU=portable` to `docker build`.
 
 ```bash
 git clone --branch refactor/engine-v2 https://github.com/Krarilotus/OWL-RS.git
@@ -76,8 +78,7 @@ The server now listens on this machine only, without sign-in, reasons under OWL 
 writes that violate a SHACL shape, and keeps its data on the volume `nrese-data`. The console is at
 <http://localhost:8080/console>. If `docker run` itself fails, Docker says why (often the
 name or the port is taken); if the last line never returns, `docker logs nrese` shows why
-([startup errors](docs/ops/server-setup.md#startup-errors)). The image targets x86-64-v3 and
-Neoverse N1 CPUs, and on an older CPU you build with `--build-arg NRESE_TARGET_CPU=portable`.
+([startup errors](docs/ops/server-setup.md#startup-errors)).
 
 ### A first answer
 
@@ -128,10 +129,15 @@ and a changed setting. To build from source instead, see
 
 ## How it fits together
 
+<p align="center">
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="docs/img/overview-dark.svg">
   <img src="docs/img/overview-light.svg" width="480" alt="You tell NRESE statements with SPARQL Update, the Graph Store Protocol, RDF4J's protocol or an RDF document, over HTTP; a write is all of it or nothing, and a refusal says why. You ask it with SPARQL queries and, with reasoning on, why a statement holds; each SPARQL answer says if rows may be missing or wrong. A bulk load skips the checks below. Reasoning is off by default (disabled, rdfs, owl2-rl, owl2-dl and more): when on, it infers with every write and refuses a write found to make the data inconsistent. SHACL validation is off by default: report logs the results a write introduces, and enforce refuses a write that introduces a violation. Storage keeps what you told it (asserted) apart from what reasoning derived (inferred). It is in memory by default, which is lost when the server stops; on-disk saves each commit before confirming it, and the container image uses it.">
 </picture>
+</p>
+
+Reasoning and the SHACL gate are off by default, as the picture says; the quick start turns them
+on with `NRESE_REASONING_MODE=owl2-dl` and `NRESE_SHACL_GATE=enforce`.
 
 ## Documentation
 
