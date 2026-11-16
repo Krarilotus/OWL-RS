@@ -2222,10 +2222,14 @@ impl StoreService {
         // The new stack is read as its program keeps it from its first reader on: expanded by
         // the id it is kept over, not by what the published dictionary holds, or as stored.
         // Until it is published, readers read the old one in that reading, uncertified
-        // (`invalidate_held` above).
+        // (`invalidate_held` above). A publication that fails installs nothing: the old stack
+        // keeps its reading, as a catalog's change that fails keeps its old reasoning.
+        let reading = self.engine.equality();
         self.engine.set_equality(program.stored_equality());
         // Published with the writer slot still held: certified before any other write.
-        let finished = rematerialisation.finish_held(closure.inferred)?;
+        let finished = rematerialisation
+            .finish_held(closure.inferred)
+            .inspect_err(|_| self.engine.set_equality(reading))?;
         let summary = finished.summary();
         nrese_exec::heap::phase("store: done");
         nrese_engine::memory::release_all();
