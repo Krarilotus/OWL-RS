@@ -30,6 +30,121 @@ fn a_class_with_an_iri_has_an_iri_representative() {
     assert_eq!(classes.representative(blank), iri);
 }
 
+/// `owl2-dl`'s key binds named individuals only; over representatives it runs on them, not
+/// over the classes' members (the exemption in `representatives::over_classes`). Spec: the
+/// closure is the one the key gives over the members (`Guard::OverClasses`). Generated
+/// `sameAs` classes of 1 to 8 members, all named, all anonymous, one named among
+/// anonymous ones, or drawn, are the instances and the object values of a key of one to
+/// three object and data properties. Blank nodes take the top half of the ids, as the
+/// engine's sort after its IRIs. Both ways of the key must occur: instances equated, and
+/// instances agreeing on every value kept apart by an anonymous class.
+#[test]
+fn a_named_only_key_over_representatives_answers_as_over_the_classes() {
+    use super::representatives::{self, RepresentativeClosure, keys_over_classes};
+    let mut next = rng(0x6b65_795f_2026_1116);
+    let (mut equated, mut kept_apart) = (0, 0);
+    for case in 0..300 {
+        let mut vocabulary = LocalVocabulary::default();
+        let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+        let blank_nodes = vocabulary.blank_node_ids();
+        let lists = ListVocabulary::new(&mut vocabulary).named_keys(blank_nodes);
+        let schema = Schema::owl(&mut vocabulary);
+        let (rdf, owl) = (super::ir::RDF, super::ir::OWL);
+        let integer = format!("{}integer", super::ir::XSD);
+        let mut iri = |name: String| vocabulary.iri(&name);
+        let [ty, same_as, has_key, first, rest, nil, class] = [
+            format!("{rdf}type"),
+            format!("{owl}sameAs"),
+            format!("{owl}hasKey"),
+            format!("{rdf}first"),
+            format!("{rdf}rest"),
+            format!("{rdf}nil"),
+            format!("{EX}K"),
+        ]
+        .map(&mut iri);
+        let mut blank = blank_nodes.unwrap().0;
+        // Classes 0 to 2 hold the instances, 3 to 5 the object values.
+        let mut classes: Vec<Vec<u64>> = Vec::new();
+        for c in 0..6 {
+            let (size, mode) = (1 + next(8), next(4));
+            let mut members = Vec::new();
+            for m in 0..size {
+                members.push(match (mode, m + 1 == size, next(2)) {
+                    (0, ..) | (2, true, _) | (3, _, 0) => iri(format!("{EX}t{c}x{m}")),
+                    _ => {
+                        blank += 1;
+                        blank
+                    }
+                });
+            }
+            classes.push(members);
+        }
+        let mut input: Vec<Triple> = classes
+            .iter()
+            .flat_map(|members| members.windows(2).map(|w| [w[1], same_as, w[0]]))
+            .collect();
+        let width = 1 + next(3);
+        let mut properties: Vec<(u64, bool)> = Vec::new();
+        for k in 0..width {
+            properties.push((iri(format!("{EX}p{k}")), next(2) == 0));
+        }
+        let cells: Vec<u64> = (0..width).map(|k| iri(format!("{EX}l{k}"))).collect();
+        let literals: Vec<u64> = (0..2)
+            .map(|v| vocabulary.literal(&v.to_string(), &integer))
+            .collect();
+        input.push([class, has_key, cells[0]]);
+        for (k, &(property, _)) in properties.iter().enumerate() {
+            input.push([cells[k], first, property]);
+            input.push([cells[k], rest, cells.get(k + 1).copied().unwrap_or(nil)]);
+        }
+        // Each instance: its class, a member of it, and per property which value: a class
+        // (object; a member of it is the value) or a literal (data).
+        let mut instances: Vec<(usize, u64, Vec<usize>)> = Vec::new();
+        for _ in 0..6 {
+            let c = next(3);
+            let x = classes[c][next(classes[c].len())];
+            input.push([x, ty, class]);
+            let mut chosen = Vec::new();
+            for &(property, data) in &properties {
+                let v = if data { next(2) } else { 3 + next(3) };
+                let value = match data {
+                    true => literals[v],
+                    false => classes[v][next(classes[v].len())],
+                };
+                input.push([x, property, value]);
+                chosen.push(v);
+            }
+            instances.push((c, x, chosen));
+        }
+        let closure = || representatives::materialise(&input, &rules, Some(&lists), &schema);
+        let expanded = |closure: &RepresentativeClosure| -> std::collections::BTreeSet<Triple> {
+            closure
+                .facts
+                .iter()
+                .flat_map(|&f| closure.classes.expand(f))
+                .collect()
+        };
+        let (exempt, over_classes) = (closure(), keys_over_classes(closure));
+        assert_eq!(
+            expanded(&exempt),
+            expanded(&over_classes),
+            "case {case}: {input:?}"
+        );
+        for (i, (c, x, values)) in instances.iter().enumerate() {
+            for (d, y, others) in &instances[i + 1..] {
+                let agree = values == others;
+                if c != d && agree {
+                    let one =
+                        exempt.classes.representative(*x) == exempt.classes.representative(*y);
+                    (equated, kept_apart) =
+                        (equated + usize::from(one), kept_apart + usize::from(!one));
+                }
+            }
+        }
+    }
+    assert!(equated > 50 && kept_apart > 50, "{equated} {kept_apart}");
+}
+
 const EX: &str = "http://example.com/";
 
 /// Parses `s p o` lines of prefixed names (`ex:`, `rdf:`, `rdfs:`, `owl:`); `_:x` are
