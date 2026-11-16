@@ -7,6 +7,9 @@ image: SPARQL 1.1, the Graph Store Protocol and RDF4J's protocol over HTTP, and 
 It takes one writer at a time, and the data must fit one machine: read replicas follow it, but
 nothing fails over or partitions the data ([limits](docs/limits.md)).
 
+These pages describe version 1.5, not yet released, which the [quick start](#quick-start) builds
+from the branch `refactor/engine-v2`; `main` holds the earlier version.
+
 Most work with data comes down to organising and standardising it, and an ontology is where
 that is written down. We wanted a store that follows the ontology itself, so that a write is
 checked against it, an inference changes with the data, and an answer says how far it can be
@@ -54,19 +57,11 @@ checks. Everything it does, with the [standards and their tests](docs/what-it-co
 is in [features and standards](docs/what-it-covers.md), and where it stops is in
 [limits](docs/limits.md).
 
-## How it fits together
-
-<picture>
-  <source media="(prefers-color-scheme: dark)" srcset="docs/img/overview-dark.svg">
-  <img src="docs/img/overview-light.svg" width="480" alt="You tell NRESE statements with SPARQL Update, the Graph Store Protocol, RDF4J's protocol or an RDF document, over HTTP; a write is all of it or nothing, and a refusal says why. You ask it with SPARQL queries and, with reasoning on, why a statement holds; each SPARQL answer says if rows may be missing or wrong. A bulk load skips the checks below. Reasoning is off by default (disabled, rdfs, owl2-rl, owl2-dl and more): when on, it infers with every write and refuses a write found to make the data inconsistent. SHACL validation is off by default: report logs the results a write introduces, and enforce refuses a write that introduces a violation. Storage keeps what you told it (asserted) apart from what reasoning derived (inferred). It is in memory by default, which is lost when the server stops; on-disk saves each commit before confirming it, and the container image uses it.">
-</picture>
-
 ## Quick start
 
 You need git, Docker with BuildKit, curl, a POSIX shell (Linux, macOS, or Git Bash or WSL on
 Windows) and a free port 8080. The image builds the server and its browser console, so you need
-no Rust or Node.js, and the first build takes several minutes. These pages describe the branch
-`refactor/engine-v2`, where version 1.5 is prepared, and `main` still holds the earlier version.
+no Rust or Node.js, and the first build takes several minutes.
 
 ```bash
 git clone --branch refactor/engine-v2 https://github.com/Krarilotus/OWL-RS.git
@@ -112,27 +107,31 @@ curl -i http://localhost:8080/dataset/query --data-urlencode 'query=
 HTTP/1.1 200 OK
 content-type: application/sparql-results+json
 nrese-completeness: complete; regime=owl2-dl
-access-control-expose-headers: nrese-completeness
-x-request-id: a20dd9b2-6f62-4d57-b234-5693005725f4
-transfer-encoding: chunked
-date: Sun, 15 Nov 2026 22:20:42 GMT
 
 {"head":{"vars":["x"]},"results":{"bindings":[
   {"x":{"type":"uri","value":"http://example.org/tom"}},
   {"x":{"type":"uri","value":"http://example.org/rex"}}]}}
 ```
 
-The body comes as one line; it is broken here to fit the page.
+Four more headers are left out here, and the body, which comes as one line, is broken to fit the
+page.
 
 Tom is an animal by a rule: the update's commit also stored `ex:tom a ex:Animal`. Rex is one
 only by cases, as a pet is a cat or a dog and either is an animal. No rule draws that, but the
 OWL 2 DL engines prove from the ontology that every pet is an animal, so Rex is in the answer,
-and the header says the answer is `complete`: no row is missing. The rows may come in either
-order. Ask again with `--data infer=false` and you read only what you stored: no rows.
+and its `nrese-completeness` header says the answer is `complete`: no row is missing. The rows
+may come in either order. Ask again with `--data infer=false` and you read only what you stored: no rows.
 
 The [tutorial](docs/tutorial.md) goes on from here with a delete, a refused write, your own data
 and a changed setting. To build from source instead, see
 [getting started](docs/dev/getting-started.md#run-the-server).
+
+## How it fits together
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/overview-dark.svg">
+  <img src="docs/img/overview-light.svg" width="480" alt="You tell NRESE statements with SPARQL Update, the Graph Store Protocol, RDF4J's protocol or an RDF document, over HTTP; a write is all of it or nothing, and a refusal says why. You ask it with SPARQL queries and, with reasoning on, why a statement holds; each SPARQL answer says if rows may be missing or wrong. A bulk load skips the checks below. Reasoning is off by default (disabled, rdfs, owl2-rl, owl2-dl and more): when on, it infers with every write and refuses a write found to make the data inconsistent. SHACL validation is off by default: report logs the results a write introduces, and enforce refuses a write that introduces a violation. Storage keeps what you told it (asserted) apart from what reasoning derived (inferred). It is in memory by default, which is lost when the server stops; on-disk saves each commit before confirming it, and the container image uses it.">
+</picture>
 
 ## Documentation
 
