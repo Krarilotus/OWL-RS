@@ -9,11 +9,13 @@ This page lists every setting of `nrese-server` in the version it comes with. Fo
 Every setting has a key in the configuration file and an environment variable (the tables below, and the server's registry of them is `crates/nrese-server/src/config/settings.rs`). A value is taken from the first of these.
 
 1. the command line: `--set KEY=VALUE` with a file key (`--set budgets.query_timeout=2min`), repeatable, for every command; secrets (tokens, keys, passwords) are refused there, since a command line shows in the process list; the server never prints them
-2. the environment variable
+2. the environment variable, which a `.env` file can also set (below)
 3. the configuration file: the path from `--config` or `-c`, else `NRESE_CONFIG_PATH`
 4. the built-in default
 
-To return a setting to its default, remove it from the command line, the environment and the file, then restart. A repository's own value (scope `repo` below) is removed with `PATCH /api/v1/repositories/{id}` and `null` ([HTTP API](http-api.md#engine-api-apiv1)).
+Before it reads anything else, every command of `nrese-server` looks for a file named `.env` in its working directory, then in each folder above it, and reads the nearest one. Each `NAME=value` line in it sets that variable unless the environment already has it: a variable set in the environment wins over the file, and of two lines with the same name the first wins. A line that can't be read ends the reading without a message: the lines before it are applied, the rest are not.
+
+To return a setting to its default, remove it from the command line, the environment, a `.env` file the server finds and the configuration file, then restart. A repository's own value (scope `repo` below) is removed with `PATCH /api/v1/repositories/{id}` and `null` ([HTTP API](http-api.md#engine-api-apiv1)).
 - The reasoner's profile comes from `reasoner.mode` and `reasoner.rules` alone (there is no `preset` or feature-override input); the server resolves them into one runtime profile before diagnostics, capabilities and the console see it. The other `reasoner.*` settings below tune it.
 
 ### Types and scopes
