@@ -909,7 +909,15 @@ thread_local! {
     /// false makes it none (a build that failed or wasn't kept). A test's way to cancel a
     /// query while it asks.
     static STATISTICS_ASKED: RefCell<Option<Box<dyn Fn() -> bool>>> = const { RefCell::new(None) };
+    /// Run with each `n` a distinct estimate asks its visitor for ([`Context::distinct`]),
+    /// before the answer (`0`: whether the query has stopped). A test's way to cancel a
+    /// query while it estimates, and to see what is asked after.
+    static DISTINCT_ASKED: RefCell<Option<DistinctAsked>> = const { RefCell::new(None) };
 }
+
+/// What [`DISTINCT_ASKED`] runs.
+#[cfg(test)]
+type DistinctAsked = Box<dyn Fn(u64)>;
 
 /// One more pattern counted by [`Context::bgp`] ([`BGP_ESTIMATES`]).
 #[cfg(test)]
@@ -4366,7 +4374,13 @@ impl<'a> Context<'a> {
                 if let Some(&kept) = self.distinct_counts.borrow().get(&key) {
                     return kept;
                 }
-                let going = |_| {
+                let going = |#[cfg_attr(not(test), expect(unused_variables))] units: u64| {
+                    #[cfg(test)]
+                    DISTINCT_ASKED.with_borrow(|asked| {
+                        if let Some(asked) = asked {
+                            asked(units);
+                        }
+                    });
                     !self
                         .cancellation
                         .as_ref()

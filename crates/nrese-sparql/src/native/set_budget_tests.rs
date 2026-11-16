@@ -845,6 +845,52 @@ fn a_query_cancelled_while_it_asks_for_the_statistics_gets_no_plan() {
     }
 }
 
+/// Spec: a query's stop sees its distinct estimates ([`Context::distinct`]; the visitor
+/// contract, `nrese_engine::visit`: a stopped read does no more work). A query cancelled
+/// while its planning asks for an estimate ends cancelled, and each estimate the planning
+/// asks for after that only asks whether the query has stopped: no unit of work is visited.
+/// Seen to fail with a count that doesn't ask that first.
+#[test]
+fn a_query_cancelled_while_it_estimates_visits_nothing_more() {
+    let engine = people();
+    let snapshot = engine.snapshot();
+    let query = nrese_sparql_syntax::SparqlParser::new()
+        .parse_query(
+            "SELECT * WHERE { ?x <http://e/p0> ?a . ?x <http://e/p1> ?b . \
+             ?x <http://e/p3> ?c . ?x <http://e/city> ?d }",
+        )
+        .unwrap();
+    let token = CancellationToken::new();
+    let options = QueryOptions {
+        resources: Resources {
+            cancellation: Some(token.clone()),
+            ..Resources::default()
+        },
+        ..QueryOptions::default()
+    };
+    // The first ask cancels the query; after it, the asks and the units they ask for.
+    let after = std::rc::Rc::new(Cell::new((0usize, 0u64)));
+    let seen = std::rc::Rc::clone(&after);
+    DISTINCT_ASKED.set(Some(Box::new(move |units| {
+        if token.is_cancelled() {
+            let (asks, visited) = seen.get();
+            seen.set((asks + 1, visited + units));
+        } else {
+            token.cancel();
+        }
+    })));
+    let result = typed_results::evaluate(snapshot.clone(), &query, &options).map(drop);
+    DISTINCT_ASKED.set(None);
+    assert!(
+        matches!(result, Err(QueryEvaluationError::Cancelled)),
+        "{result:?}"
+    );
+    let (asks, visited) = after.get();
+    assert_eq!(visited, 0, "units visited after the cancel, in {asks} asks");
+    // The case this is about: the planning asked again after the cancel.
+    assert!(asks > 0, "no estimate asked for after the cancel");
+}
+
 /// Spec: the master's order of 13 November, "plain planning pays only for what it uses: no
 /// search state built when the gate keeps a group from the sets": a search without the
 /// characteristic sets keeps no star predicates or edges in its states (only the estimates
