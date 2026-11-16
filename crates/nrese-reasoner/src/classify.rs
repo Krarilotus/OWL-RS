@@ -1008,13 +1008,15 @@ fn build(
                     }
                 }
             }
-            // An annotation property's domain, range and sub-properties say nothing about
-            // classes, as nrese-owl's mapping reads them.
+            // An annotation property's domain, range and sub-properties, and a sub-property of
+            // one, say nothing about classes, as nrese-owl's mapping reads them.
             Disposition::Property(
                 PropertyAxiom::Sub { equivalent: false }
                 | PropertyAxiom::Domain
                 | PropertyAxiom::Range,
             ) if graph.annotation_properties.contains(&s) => {}
+            Disposition::Property(PropertyAxiom::Sub { equivalent: false })
+                if graph.annotation_properties.contains(&o) => {}
             Disposition::Property(axiom) => match names.roles(axiom, [s, p, o], named) {
                 Err(kind) => skipped.push((p, kind)),
                 Ok(PropertyAxiom::Sub { equivalent }) => {
