@@ -74,8 +74,6 @@ the W3C tests of each profile are under [standards](#standards).
 | `owl2-dl` | The OWL 2 RL rules as a lower bound, and the [OWL 2 Direct Semantics](https://www.w3.org/TR/owl2-direct-semantics/) through engines of its own, a hypertableau and a consequence-based core, for consistency and the certain answers ([design](design/owl2-dl.md)) | Rows the rules leave open are tested by those engines, within the [`dl.*` budgets](ops/config-reference.md#reasoner) |
 | `custom` | Your rules alone, in [Notation3](https://w3c.github.io/N3/spec/) or the `.pie` rule format. Such rules can be added to every other mode that reasons | Nothing |
 
-In every mode, the same engines answer the class hierarchy and realisation (`/classification`, `/realisation`).
-
 To choose: `rdfs` for class and property hierarchies with domains and ranges, `owl2-rl` for most
 OWL ontologies, where every inference is made at the write and a query only reads, and `owl2-dl`
 when the ontology says what rules can't follow, such as that every pet is a cat or a dog, and you

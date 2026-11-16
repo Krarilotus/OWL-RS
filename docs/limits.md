@@ -76,8 +76,8 @@ What each mode computes and what its answers promise is in
 [the reasoning contract](spec/reasoning-semantics.md#modes). These are the parts of it that
 leave something out.
 
-- Inferences are materialised, in the default graph. A statement both asserted and derivable counts as
-  asserted ([storage](spec/02-storage-and-transactions.md#data-model)).
+- A statement both asserted and derivable counts as asserted
+  ([storage](spec/02-storage-and-transactions.md#data-model)).
 - `rdfs` has no axiomatic triples, and `rdfs-full` leaves out `rdfD1` and the axioms about
   `rdf:_1`, `rdf:_2`, … ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset),
   [modes](spec/reasoning-semantics.md#modes)).
