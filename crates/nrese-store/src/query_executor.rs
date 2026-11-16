@@ -23,6 +23,7 @@ use nrese_sparql_results::{QueryResultsFormat, QueryResultsSerializer};
 use nrese_sparql_syntax::Query;
 use nrese_sparql_syntax::algebra::QueryDataset;
 
+use crate::dl::query::certify_report;
 use crate::error::{StoreError, StoreResult};
 use crate::query::{GraphResultFormat, QueryResultKind, SolutionsResultFormat, SparqlQueryRequest};
 
@@ -190,7 +191,7 @@ impl PreparedQuery {
             rdf12: false,
             dl_answers: request.dl_answers,
             on_evaluation: None,
-            reads: Default::default(),
+            reads: crate::dl::query::Reads::new(request.scope.access().cloned()),
         })
     }
 
@@ -204,18 +205,22 @@ impl PreparedQuery {
         self.on_evaluation = Some(OnEvaluation(std::sync::Arc::new(entered)));
     }
 
-    /// Whether the query itself makes or matches RDF 1.2 terms: triple term patterns
-    /// (in its pattern or template), `TRIPLE(…)`, `STRLANGDIR(…)`, or a literal with a base
-    /// direction.
-    pub(crate) fn uses_rdf12(&self) -> bool {
+    /// Whether `query` itself makes or matches RDF 1.2 terms: a triple term or a literal with
+    /// a base direction (in its pattern, template or `VALUES`), `TRIPLE(…)` or `STRLANGDIR(…)`.
+    pub(crate) fn uses_rdf12(query: &Query) -> bool {
         use nrese_sparql_syntax::algebra::{Expression, Function, GraphPattern};
         use nrese_sparql_syntax::term::TermPattern;
         use nrese_sparql_syntax::visit::Node;
-        let triple = |t: &nrese_sparql_syntax::term::TriplePattern| {
-            matches!(t.subject, TermPattern::Triple(_))
-                || matches!(t.object, TermPattern::Triple(_))
+        let term = |t: &TermPattern| match t {
+            TermPattern::Literal(l) => l.direction().is_some(),
+            TermPattern::Triple(_) => true,
+            TermPattern::NamedNode(_) | TermPattern::BlankNode(_) | TermPattern::Variable(_) => {
+                false
+            }
         };
-        let (pattern, template) = match &self.query {
+        let triple =
+            |t: &nrese_sparql_syntax::term::TriplePattern| term(&t.subject) || term(&t.object);
+        let (pattern, template) = match query {
             Query::Select { pattern, .. }
             | Query::Ask { pattern, .. }
             | Query::Describe { pattern, .. } => (pattern, &[][..]),
@@ -228,9 +233,9 @@ impl PreparedQuery {
                 Node::Pattern(GraphPattern::Bgp { patterns }) => patterns.iter().any(triple),
                 Node::Pattern(GraphPattern::Path {
                     subject, object, ..
-                }) => {
-                    matches!(subject, TermPattern::Triple(_))
-                        || matches!(object, TermPattern::Triple(_))
+                }) => term(subject) || term(object),
+                Node::Pattern(GraphPattern::Values { bindings, .. }) => {
+                    (bindings.iter().flatten().flatten()).any(|v| term(&v.clone().into()))
                 }
                 Node::Expression(Expression::FunctionCall(
                     Function::Triple | Function::StrLangDir,
@@ -422,7 +427,8 @@ pub(crate) fn run_query(
 ) -> StoreResult<Option<nrese_sparql::ql::QlReport>> {
     let mut options = query_options(view, prepared, store, cancellation, memory);
     let (query, mut ql) = nrese_sparql::prepare_ql_query(view, &prepared.query, &options)?;
-    crate::dl::query::certify_report(ql.as_mut().map(|r| &mut r.completeness), prepared.reads());
+    let completeness = ql.as_mut().map(|r| &mut r.completeness);
+    certify_report(completeness, prepared.reads(), view.snapshot());
     let context = report(ql.as_ref());
     cancellation.check()?;
     // A repeated query's answer as written before, in this format; else written, and its
@@ -630,7 +636,7 @@ pub(crate) fn explain_prepared(
     let options = query_options(view, prepared, store, cancellation, memory);
     let mut explanation = explain_query(view, &prepared.query, &options)?;
     let report = explanation.ql.as_mut().map(|r| &mut r.completeness);
-    crate::dl::query::certify_report(report, prepared.reads());
+    certify_report(report, prepared.reads(), view.snapshot());
     Ok(explanation)
 }
 
@@ -646,7 +652,7 @@ pub(crate) fn plan_prepared(
     let options = query_options(view, prepared, store, cancellation, memory);
     let mut planned = plan_query(view, &prepared.query, &options)?;
     let report = planned.ql.as_mut().map(|r| &mut r.completeness);
-    crate::dl::query::certify_report(report, prepared.reads());
+    certify_report(report, prepared.reads(), view.snapshot());
     Ok(planned)
 }
 

@@ -538,7 +538,7 @@ def capped_post(url: str, data: dict, timeout: float = 30) -> tuple[int, str]:
     NRESE_ANSWER_CAP_MB (default 256 MiB) of JSON, else (-1, why) and the connection closed.
     An answer past the cap isn't compared here; holding it would let one unlimited answer
     (a LIMIT query's reference without its LIMIT: on DBLP every typed statement) exhaust the
-    host's memory, as it did on 12 Oct 2026 (the queue service of phuoc-yu killed at 25.6 GB)."""
+    host's memory, as it did on 12 Oct 2026 (the queue service of the timed host killed at 25.6 GB)."""
     import urllib.error
     import urllib.parse
     import urllib.request
