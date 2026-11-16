@@ -131,6 +131,7 @@ impl ReasonerConfig {
     /// The program whose closure the store materialises, if any.
     pub fn materialised_program(&self) -> Option<RuleProgram> {
         RuleProgram::new(self.mode.ruleset(), self.rules.clone())
+            .map(|program| program.with_named_keys(self.mode.is_dl()))
     }
 
     /// Which statements reads see: `materialised` (asserted and inferred) with reasoning,

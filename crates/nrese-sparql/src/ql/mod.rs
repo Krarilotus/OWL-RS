@@ -449,10 +449,24 @@ impl QlRewriting {
         self.closure
     }
 
-    /// What decides its rewritings besides the snapshot's TBox: the closure and the
-    /// bounds (part of the result cache's key of an answer).
-    pub(crate) fn fingerprint(&self) -> String {
-        format!("{:?} {:?}", self.closure, self.limits)
+    /// What decides its rewritings besides the snapshot's TBox, as numbers for the result
+    /// cache's key of an answer: the closure and every bound, read from the fields where
+    /// the key is written (no text is made). The key's test builds both field by field, so
+    /// a field added to either fails it until it is written here too.
+    pub(crate) fn fingerprint(&self) -> [u64; 10] {
+        let (l, n) = (&self.limits, |v: usize| v as u64);
+        [
+            u64::from(self.closure.lists),
+            n(l.existential_vars),
+            n(l.candidates),
+            n(l.witnesses),
+            n(l.branches),
+            n(l.size),
+            n(l.work),
+            n(l.query_work),
+            n(l.checks),
+            l.check_rows,
+        ]
     }
 
     pub(crate) fn limits(&self) -> &Limits {

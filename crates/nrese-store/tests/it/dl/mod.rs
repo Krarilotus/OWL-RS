@@ -10,6 +10,7 @@ mod gap;
 mod gates;
 mod identity;
 mod islands;
+mod keys;
 mod mode;
 mod plans;
 mod queries;
