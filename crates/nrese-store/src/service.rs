@@ -1243,7 +1243,7 @@ impl StoreService {
                     .to_owned(),
             );
             crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
-            crate::dl::query::mark(self, at, &mut status);
+            crate::dl::query::mark(self, prepared, at, &mut status);
             return Some(status);
         }
         let ruleset = self
@@ -1615,7 +1615,7 @@ impl StoreService {
                             .to_owned(),
                     );
                     crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
-                    crate::dl::query::mark(self, at, &mut status);
+                    crate::dl::query::mark(self, prepared, at, &mut status);
                     Some(status)
                 }
                 false => self.status_outside_dl(prepared, ql, at),
