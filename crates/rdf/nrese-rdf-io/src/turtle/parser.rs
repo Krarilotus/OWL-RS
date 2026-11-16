@@ -25,10 +25,7 @@ use nrese_rdf::{
     QuadRef, TermRef, TripleRef,
 };
 
-use super::lexer::{
-    Brackets, Kind, Lexed, Malformed, Opening, Token, characters, known_missing, lex, malformed,
-    pair,
-};
+use super::lexer::{Brackets, Kind, Lexed, Malformed, Token, characters, lex, malformed, pair};
 use super::split::Cut;
 use crate::blank::BlankNodes;
 use crate::error::{
@@ -342,11 +339,6 @@ pub(crate) struct TurtleParser<'a, R> {
     /// When a statement fails: what its form says ends it besides a `.` (see [`Ending`]),
     /// noted as it fails (`ends_with`); read and cleared as `unclosed` is.
     ending: Ending,
-    /// Per quote (`"`, `'`) and width (short, long), whether no later string has a closing
-    /// quote: a search for one reached the input's end without it ([`known_missing`] says
-    /// why that answers for later ones). Recovery then neither lexes nor searches such a
-    /// string again (see `resync`).
-    no_closing: [[bool; 2]; 2],
     /// The current statement.
     arena: String,
     triples: Vec<Triple>,
@@ -451,7 +443,6 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             unclosed: Vec::new(),
             failed: None,
             ending: Ending::Dot,
-            no_closing: [[false; 2]; 2],
             arena: String::new(),
             triples: Vec::new(),
             handed_out: 0,
@@ -595,12 +586,10 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     ///   closes nothing.
     ///
     /// A token the lexer can't read is skipped whole where its end is known, and nothing
-    /// open is forgotten (see `skip_malformed`). Where a quote has no closing quote after it
-    /// (a missing closer), only the quote is skipped and the text after it is read as tokens,
-    /// what was open still open: nothing inside the failed statement is ever emitted, and its
-    /// span, to where parsing resumes, is the error's skipped statement. A string already
-    /// known to have no closing quote (`no_closing`) is skipped so before it is lexed, which
-    /// would search to the end again. `false` at the end of the input, or on a read error.
+    /// open is forgotten (see `skip_malformed`): nothing inside the failed statement is ever
+    /// emitted, and its span, to where parsing resumes, is the error's skipped statement. A
+    /// string open at the end of the input isn't skipped: the document ends inside it.
+    /// `false` at the end of the input, or on a read error.
     /// Cold, and never inlined: recovery stays out of the parsing path.
     #[cold]
     #[inline(never)]
@@ -656,16 +645,6 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     /// short string (`ending`).
     fn skip_rest(&mut self, open: &mut Brackets, braces: &mut i64, ending: &mut Ending) -> bool {
         loop {
-            if self.no_closing != [[false; 2]; 2] {
-                let no_closing = self.no_closing;
-                let missing =
-                    |opening: Opening| no_closing[quote(opening)][usize::from(opening.long)];
-                let data = &self.input.data()[self.input.position..];
-                if let Some(n) = known_missing(data, self.input.eof(), missing) {
-                    self.input.consume(n);
-                    continue;
-                }
-            }
             match self.fill() {
                 Ok(()) => {}
                 Err(RdfParseError::Io(error)) => {
@@ -752,33 +731,22 @@ impl<'a, R: Read> TurtleParser<'a, R> {
 
     /// Skips the token the lexer couldn't read, where `fill` stopped: a string up to its
     /// closing quote, by the lexer's own string rules with line breaks allowed
-    /// ([`malformed`]); a string with no closing quote after it, its quote only (noted in
-    /// `no_closing`: a failed short search answers for later strings of that quote, a
-    /// failed long one for later long ones); anything else, one byte. Before searching
-    /// again for more input, it reads at least as much again as it has, so a long string
-    /// costs linear work even from a reader that gives a byte at a time. A read error while
-    /// reading ahead is held (`Input::held`) and the search goes on with what was read: the
-    /// error comes when the input is next needed, after what it already holds. `false` at
-    /// the end of the input, when the string's end can't be read (the error then held), or
-    /// when it isn't within [`MAX_STATEMENT_TEXT`] bytes: a statement the quarantine couldn't
-    /// keep, and the search would hold the rest of the document.
+    /// ([`malformed`]); anything else, one byte. Before searching again for more input, it
+    /// reads at least as much again as it has, so a long string costs linear work even from
+    /// a reader that gives a byte at a time. A read error while reading ahead is held
+    /// (`Input::held`) and the search goes on with what was read: the error comes when the
+    /// input is next needed, after what it already holds. `false` at the end of the input;
+    /// for a string still open there, whatever follows its quote (the document ends inside
+    /// it: skipping only the quote would read the string's text as statements); when the
+    /// string's end can't be read (the error then held); or when it isn't within
+    /// [`MAX_STATEMENT_TEXT`] bytes: a statement the quarantine couldn't keep, and the search
+    /// would hold the rest of the document.
     fn skip_malformed(&mut self) -> bool {
         loop {
-            let no_closing = self.no_closing;
-            let search = |opening: Opening| !no_closing[quote(opening)][usize::from(opening.long)];
             let data = &self.input.data()[self.input.position..];
-            match malformed(data, self.input.eof(), search) {
-                Malformed::Skip(0) => return false,
+            match malformed(data, self.input.eof()) {
+                Malformed::Skip(0) | Malformed::Unclosed => return false,
                 Malformed::Skip(n) => {
-                    self.input.consume(n);
-                    return true;
-                }
-                Malformed::Missing(n, opening) => {
-                    let quote = quote(opening);
-                    self.no_closing[quote][1] = true;
-                    if !opening.long {
-                        self.no_closing[quote][0] = true;
-                    }
                     self.input.consume(n);
                     return true;
                 }
@@ -1777,11 +1745,6 @@ impl<'a, R: Read> TurtleParser<'a, R> {
             _ => Term::Static(rdf::NIL),
         })
     }
-}
-
-/// The index of a string opening's quote in `no_closing`: `"` then `'`.
-fn quote(opening: Opening) -> usize {
-    usize::from(opening.quote == b'\'')
 }
 
 /// A key random per document, for generated blank nodes.
