@@ -559,7 +559,7 @@ fn next_quad<'p, R: Read>(
                     match parser.parse(text, line, offset) {
                         Ok(None) => continue,
                         Ok(Some(_)) => unreachable!("a directive has no statement"),
-                        Err(error) => return Some(Err(lines.in_document(error.into()))),
+                        Err(error) => return Some(Err(lines.failed(error.into()))),
                     }
                 }
                 break (range, line, offset);
@@ -574,11 +574,7 @@ fn next_quad<'p, R: Read>(
                     },
                 ),
                 Ok(None) => unreachable!("parsed to a statement above"),
-                // A failing last line without a line end: the input ended inside it.
-                Err(error) => {
-                    let error = lines.in_document(error.into());
-                    return Some(Err(error.ending(lines.unterminated, true)));
-                }
+                Err(error) => return Some(Err(lines.failed(error.into()))),
             }
         }
     };
