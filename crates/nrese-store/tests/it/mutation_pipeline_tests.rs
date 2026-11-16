@@ -1538,47 +1538,144 @@ fn a_key_past_the_rule_format_is_reported_and_not_built() {
     }
 }
 
-/// A key that is reported and not built is a missing rule: an answer it would change
-/// isn't `complete` because of it. Under `owl2-rl`, where the QL rewriting can certify an
-/// answer (`ql_rewriting = "on"`).
+/// A list axiom the rules leave out (reported, not built) is a missing rule: an answer it
+/// would change isn't `complete` because of it. Under `owl2-rl`, where the QL rewriting can
+/// certify an answer (`ql_rewriting = "on"`), each in a store of its own: a key past 127
+/// properties, an intersection past 256 classes and a chain past 250 properties. Every row is
+/// checked; the wrong ones are listed.
 #[test]
 fn an_unbuilt_key_leaves_no_answer_complete_under_owl2_rl() {
-    let store = Arc::new(
-        StoreService::new(nrese_store::StoreConfig {
-            ql_rewriting: nrese_store::QlRewritingMode::On,
-            ..in_memory_store_config()
-        })
-        .expect("store"),
-    );
-    let owl = MutationPipeline::new(
-        Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
-    );
-    unbuilt_key_status(&owl);
+    let rows = [
+        (
+            "key 128",
+            long_key(128),
+            format!("<{EX}x> <{EX}name> \"Y\""),
+        ),
+        (
+            "intersection 257",
+            long_intersection(257),
+            format!("<{EX}x> a <{EX}C>"),
+        ),
+        (
+            "chain 251",
+            long_chain(251),
+            format!("<{EX}a0> <{EX}chain> <{EX}a251>"),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (row, data, ask) in rows {
+        let pipeline = || ql_pipeline(in_memory_store_config());
+        if std::panic::catch_unwind(|| left_out_status(&pipeline(), &data, &ask)).is_err() {
+            wrong.push(row);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:?}");
 }
 
-fn unbuilt_key_status(pipeline: &MutationPipeline) {
+/// Aliases (`owl:sameAs`) of a key's 7 properties leave the key built: equality by
+/// representatives, the default, reads each cell of its list as one member, not 2^7 member
+/// sequences. Its answer is true and `complete`.
+#[test]
+fn aliases_leave_a_key_built() {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let ask = format!("ASK {{ <{EX}x> <{EX}name> \"Y\" }}");
     pipeline
         .apply(
-            insert(&long_key(128)),
+            insert(&aliased_key(7)),
             &nrese_store::Requester::all(),
             &MutationTicket::new(),
         )
-        .expect("the key's data");
-    let answer = pipeline
-        .store()
+        .expect("the data");
+    let answer = (pipeline.store())
+        .execute_query(&nrese_store::SparqlQueryRequest::all(ask))
+        .expect("answered");
+    let (payload, status) = (String::from_utf8(answer.payload), answer.completeness);
+    println!("aliased key: {payload:?} with {status:?}");
+    assert!(payload.expect("utf8").contains("true"));
+    assert!(status.is_some_and(|c| c.complete));
+}
+
+/// A store holding a key the rules leave out, opened again with its closure current (so
+/// not rebuilt): its answers aren't `complete` either.
+#[test]
+fn a_reopened_store_with_an_unbuilt_key_leaves_no_answer_complete() {
+    let dir = tempfile::tempdir().expect("dir");
+    let ask = format!("<{EX}x> <{EX}name> \"Y\"");
+    left_out_status(
+        &ql_pipeline(nrese_store::StoreConfig::on_disk(dir.path())),
+        &long_key(128),
+        &ask,
+    );
+    left_out_answer(
+        ql_pipeline(nrese_store::StoreConfig::on_disk(dir.path())).store(),
+        &ask,
+    );
+}
+
+/// `owl2-rl` with the QL rewriting on, over a store of `config`.
+fn ql_pipeline(config: nrese_store::StoreConfig) -> MutationPipeline {
+    let config = nrese_store::StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::On,
+        ..config
+    };
+    MutationPipeline::new(
+        Arc::new(StoreService::new(config).expect("store")),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    )
+}
+
+/// `data` written, then `ASK { ask }` either true or not `complete`.
+fn left_out_status(pipeline: &MutationPipeline, data: &str, ask: &str) {
+    pipeline
+        .apply(
+            insert(data),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .expect("the data");
+    left_out_answer(pipeline.store(), ask);
+}
+
+fn left_out_answer(store: &StoreService, ask: &str) {
+    let answer = store
         .execute_query(&nrese_store::SparqlQueryRequest::all(format!(
-            "ASK {{ <{EX}x> <{EX}name> \"Y\" }}"
+            "ASK {{ {ask} }}"
         )))
         .expect("answered");
     let payload = String::from_utf8(answer.payload).expect("utf8");
     let status = answer.completeness.as_ref();
     assert!(
         payload.contains("true") || status.is_some_and(|c| !c.complete),
-        "{payload} with {status:?}"
+        "{ask}: {payload} with {status:?}"
     );
+}
+
+/// [`long_key`] with each key property `:ki` the same as a `:ji` (`owl:sameAs`): every cell
+/// of the key's list then has two first members, and the list 2^n member sequences.
+fn aliased_key(n: usize) -> String {
+    let mut data = long_key(n);
+    for i in 1..=n {
+        data.push_str(&format!(
+            " <{EX}k{i}> <http://www.w3.org/2002/07/owl#sameAs> <{EX}j{i}> ."
+        ));
+    }
+    data
+}
+
+/// `:chain owl:propertyChainAxiom ( :p1 … :pn )` and a path `:a0 :p1 :a1 … :pn :an`:
+/// prp-spo2 makes `:a0 :chain :an`.
+fn long_chain(n: usize) -> String {
+    let links: Vec<String> = (1..=n).map(|i| format!("<{EX}p{i}>")).collect();
+    let mut data = format!(
+        "<{EX}chain> <http://www.w3.org/2002/07/owl#propertyChainAxiom> ( {} ) .",
+        links.join(" ")
+    );
+    for i in 1..=n {
+        data.push_str(&format!(" <{EX}a{}> <{EX}p{i}> <{EX}a{i}> .", i - 1));
+    }
+    data
 }
 
 /// `:C owl:intersectionOf ( :A1 … :An )` and an `:x` in every `:Ai`: cls-int1 (OWL 2
