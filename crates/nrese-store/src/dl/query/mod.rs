@@ -439,13 +439,11 @@ fn certify(
     if let Some(reason) = read {
         completeness.incomplete(source, reason.clone());
     }
-    if matches!(completeness.regime, Some(Owl2Dl | Owl2Ql | Owl2Rl)) {
-        let constant = reads.constant.get_or_init(|| {
-            typed_constant(query).map(|c| format!("the query names {c}: {SPELLING}"))
-        });
-        if let Some(reason) = constant {
-            completeness.incomplete(source, reason.clone());
-        }
+    let constant = reads
+        .constant
+        .get_or_init(|| typed_constant(query).map(|c| format!("the query names {c}: {SPELLING}")));
+    if let Some(reason) = constant {
+        completeness.incomplete(source, reason.clone());
     }
     if completeness.complete {
         return;
