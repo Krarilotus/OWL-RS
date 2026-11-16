@@ -666,6 +666,27 @@ fn statements_about_the_ontology_are_annotations() {
     );
 }
 
+/// The built-in annotation properties are known to each read by the terms it reads with:
+/// one the terms gain after an earlier read (`rdfs:comment`, which the first read's terms
+/// don't have) is an annotation property to the later read, as `rdfs:label` is to both.
+#[test]
+fn a_built_in_annotation_first_met_in_a_later_read_is_known() {
+    let mut table = Table::default();
+    let first = load(&mut table, r#"ex:a ex:p ex:b ; rdfs:label "a" ."#);
+    let before = read(&first, &table);
+    assert_eq!(before.annotations, 1, "{:?}", before.axioms);
+    let later = load(
+        &mut table,
+        r#"ex:a ex:p ex:b ; rdfs:label "a" ; rdfs:comment ex:c ."#,
+    );
+    let after = read(&later, &table);
+    assert_eq!(after.annotations, 2, "{:?}", after.axioms);
+    assert_eq!(
+        after.axioms, before.axioms,
+        "rdfs:comment read as a property"
+    );
+}
+
 /// An expression the reader can't take leaves its axiom out with a diagnostic, never
 /// silently (a qualified cardinality without its class was dropped without one).
 #[test]
