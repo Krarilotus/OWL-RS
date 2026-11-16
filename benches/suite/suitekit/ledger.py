@@ -76,7 +76,7 @@ def dump(record: dict) -> str:
 
 
 # The reset of 25 Oct 2026: refactor/engine-v2 started again from 59e5e24c and takes the earlier lines'
-# work package by package (Harness notes, Sol-line integration). A record started before it measured an
+# work package by package. A record started before it measured an
 # engine the current line doesn't continue as it was: its results stay, as history, marked wherever they
 # are shown, never read as the current engine's; the v1.6 baseline measures the current one whole.
 RESET_DATE, RESET_BASE = "2026-10-25", "59e5e24c"

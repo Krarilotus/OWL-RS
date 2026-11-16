@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""A query's swing at two or more revisions (the owner, 14 Oct 2026: q02-born-in-berlin on dbpedia-core runs
+"""A query's swing at two or more revisions (q02-born-in-berlin on dbpedia-core runs
 3.3 or 7.5 ms on the candidate, 2.0-2.1 on main; an unstable plan or schedule is a defect even where
 the minimum holds). Per revision: N processes of its perf_lab, each loading the data, timing the
 query RUNS times (after a warm-up) and then EXPLAINing it once (an execution of its own, with every

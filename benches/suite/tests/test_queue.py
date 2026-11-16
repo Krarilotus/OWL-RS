@@ -175,7 +175,7 @@ class Running(unittest.TestCase):
 
     @unittest.skipUnless(Path("/proc").is_dir(), "the quiet watcher watches /proc (Linux)")
     def test_a_timed_chunk_neither_starts_over_unresolved_suspensions_nor_passes_when_its_watcher_left_some(self):
-        """Sol, 20 Oct 2026: the queue started the timed command before reconciling an earlier
+        """The queue started the timed command before reconciling an earlier
         watcher's record, and ran it on when that failed; nor did a watcher left with
         suspensions fail the chunk."""
         q = queue.Queue(self.q.directory, self.repo, self.q.results, self.q.worktrees, watch=True)

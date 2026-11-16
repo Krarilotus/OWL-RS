@@ -1,6 +1,6 @@
 """The images benches/sparql/images.sh builds (MillenniumDB, G-CARE) say what they were built from:
 the context's git tree and the source commit, as labels on the image itself, which a cell's receipt
-reads off the id that ran (driver.Suite.image_source). Orchestrator, 8 Nov 2026 13:39: only from a
+reads off the id that ran (driver.Suite.image_source). Only from a
 clean checkout; a build at another source commit says so in its own label. Review
 image-source-commit r1 (orchestrator 18:26): a checkout whose cleanliness can't be read gets no
 label (F1), and the source commit its Dockerfile declares is one value, or the build refuses."""
