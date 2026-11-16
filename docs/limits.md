@@ -122,7 +122,9 @@ leave something out.
   complete ([consistency](spec/reasoning-semantics.md#consistency)). Raise `dl.timeout`
   and the `dl.*` budgets ([configuration](ops/config-reference.md#reasoner)).
 - Under `owl2-dl`, an ontology with annotation-property axioms (a domain, range or
-  super-property of an annotation property) or a punned name (one IRI as a class or
+  super-property of an annotation property, or another kind of property made its
+  sub-property; `rdfs:label`, `rdfs:comment` and the other built-in ones count without a
+  declaration) or a punned name (one IRI as a class or
   property and as an individual) leaves the rules-only route. With annotation-property
   axioms every answer is `unsound`; with punning, every answer is `unsound` where an
   `owl:sameAs` reaches a punned name. Both are the whole ontology's, not the query's
@@ -137,10 +139,11 @@ leave something out.
   verdict at a query doesn't change readiness. In quarantine, each commit rebuilds the
   inferences in full, and under `owl2-dl` reads the asserted ontology once more to tell
   `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
-  annotation property's domain, range or super-property, or give the individual its own
+  annotation property's domain, range, super-property or sub-property, or give the individual its own
   IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
 - An undeclared property used with literal values is read as a data property. Declare
-  annotation properties such as `skos:prefLabel` (`skos:prefLabel a owl:AnnotationProperty`);
+  annotation properties other than the built-in ones, such as `skos:prefLabel`
+  (`skos:prefLabel a owl:AnnotationProperty`);
   otherwise a labelled class reads as punned, and under `owl2-dl` it leaves the rules-only
   route. Nothing in this release shows which properties were typed by their use; this
   query lists the ones used with literals and given no declaration:
