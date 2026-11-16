@@ -232,17 +232,9 @@ fn generate(seed: u64) -> Case {
         let names = Vec::new();
         groups.push(Group { tag, turtle, names });
         commits.push(k.one_in(2) as usize);
-        let mut terms = question.split_whitespace();
-        let kind = terms.next().and_then(|t| t.chars().next()).expect("a kind");
-        let pos = vec![(kind, terms.map(|t| T::I(t.replace("f:", F))).collect())];
-        let (values, neg, alone) = (Vec::new(), Vec::new(), Some(by == "hermit"));
-        queries.push(Query {
-            name: tag,
-            values,
-            pos,
-            neg,
-            alone,
-        });
+        let mut q = query(tag, &question, &mut k);
+        q.alone = Some(by == "hermit");
+        queries.push(q);
     }
     Case {
         seed,
@@ -293,28 +285,34 @@ fn queries(r: &mut Rng) -> Vec<Query> {
     let mut out = Vec::new();
     for _ in 0..12 {
         let (name, spec) = shapes[r.below(shapes.len() as u64) as usize];
-        let (mut values, mut pos, mut neg, mut a) = (Vec::new(), Vec::new(), Vec::new(), 0);
-        let (mut tokens, mut negated) = (spec.split_whitespace(), false);
-        while let Some(kind) = tokens.next() {
-            if kind == "!" {
-                negated = true;
-                continue;
-            }
-            let arity = if "TSF".contains(kind) { 2 } else { 3 };
-            let terms = tokens.by_ref().take(arity);
-            let terms: Vec<T> = terms.map(|t| draw(t, r, &mut a, &mut values)).collect();
-            let atom = (kind.chars().next().expect("a kind"), terms);
-            if negated { &mut neg } else { &mut pos }.push(atom);
-        }
-        out.push(Query {
-            name,
-            values,
-            pos,
-            neg,
-            alone: None,
-        });
+        out.push(query(name, spec, r));
     }
     out
+}
+
+/// A query of `spec` (a line of [`QUERIES`], or atoms over names), its terms drawn.
+fn query(name: &'static str, spec: &str, r: &mut Rng) -> Query {
+    let (mut values, mut pos, mut neg, mut a) = (Vec::new(), Vec::new(), Vec::new(), 0);
+    let (mut tokens, mut negated) = (spec.split_whitespace(), false);
+    while let Some(kind) = tokens.next() {
+        if kind == "!" {
+            negated = true;
+            continue;
+        }
+        let arity = if "TSF".contains(kind) { 2 } else { 3 };
+        let terms = tokens.by_ref().take(arity);
+        let terms: Vec<T> = terms.map(|t| draw(t, r, &mut a, &mut values)).collect();
+        let atom = (kind.chars().next().expect("a kind"), terms);
+        if negated { &mut neg } else { &mut pos }.push(atom);
+    }
+    let alone = None;
+    Query {
+        name,
+        values,
+        pos,
+        neg,
+        alone,
+    }
 }
 
 /// A term of [`QUERIES`], drawn; `a` keeps the last `a` for `b`.
@@ -340,6 +338,7 @@ fn draw(t: &str, r: &mut Rng, a: &mut u64, values: &mut Vec<bool>) -> T {
             T::I(n("a", *a))
         }
         "b" => T::I(n("a", (*a + 1 + r.below(3)) % 4)),
+        t if t.starts_with("f:") => T::I(t.replace("f:", F)),
         _ => {
             let v = r.below(3);
             T::L(format!("{}{v}", ["", "0", "+"][r.below(3) as usize]), v)
@@ -430,8 +429,8 @@ struct Answer {
 /// types it (never read from its sentence), why, and the state it would have made.
 type Answers = Result<(Vec<Result<Answer, String>>, String), (String, String, String)>;
 
-/// The store's answers to `texts` after `commits` (each an update and the state after it; a
-/// deletion's, the group it takes away).
+/// The store's answers to `texts` after `commits` (each an update and the state the check
+/// expects after it, passed on to the references: nothing they read comes from the store).
 fn store(commits: &[(String, String)], texts: &[String]) -> Answers {
     let dl = pipeline_with(DlConfig {
         timeout: Some(Duration::from_secs(5)),
@@ -439,40 +438,100 @@ fn store(commits: &[(String, String)], texts: &[String]) -> Answers {
         max_branch_points: Some(100_000),
         ..DlConfig::default()
     });
-    let mut state = String::new();
     for (write, after) in commits {
-        // A deletion leaves what the store held less the group's triples, as the store
-        // spells them: the reference reads that, so a deletion left undone shows.
-        state = if write.starts_with("DELETE") {
-            let p = PREFIXES.replace("@prefix", "PREFIX").replace("> .", ">");
-            let gone = held(&dl, &format!("{p} CONSTRUCT {{ {after} }} WHERE {{}}"))?;
-            let mut all = held(&dl, "CONSTRUCT WHERE { ?s ?p ?o }")?;
-            all.retain(|t| !gone.contains(t));
-            all.join("\n")
-        } else {
-            after.clone()
-        };
         if let Err(e) = update(&dl, &format!("PREFIX f: <{F}> PREFIX rdf: <{RDF}> {write}")) {
             let kind = match &e {
                 MutationError::Rejected(r) => format!("{:?}", r.kind),
                 other => format!("{other:?}"),
             };
-            return Err((kind, e.to_string(), state));
+            return Err((kind, e.to_string(), after.clone()));
         }
     }
+    let state = commits.last().map_or(String::new(), |c| c.1.clone());
     Ok((texts.iter().map(|q| answer(&dl, q)).collect(), state))
 }
 
-/// The triples of `construct` over the store's asserted statements, one a line.
-fn held(dl: &MutationPipeline, construct: &str) -> Result<Vec<String>, (String, String, String)> {
-    let mut request = SparqlQueryRequest::all(construct.to_owned());
-    request.read_model = Some(nrese_store::ReadModel::Asserted);
-    let (s, mut out) = (dl.store(), Vec::new());
-    let prepared = s.prepare_query(&request);
-    let read = prepared.and_then(|p| run_dl(s, &p, &mut out));
-    read.map_err(|e| ("read".to_owned(), e.to_string(), String::new()))?;
-    let held = String::from_utf8_lossy(&out);
-    Ok(held.lines().map(str::to_owned).collect())
+/// The triples of a case's Turtle (every token spaced, as [`TEMPLATES`] and the writer give
+/// it), each term in full, each blank-node label marked with `scope`: a write's labels are its
+/// own (SPARQL 1.1 Update §3.1.1). The check's own reading, so a state never comes from the store.
+fn triples(turtle: &str, scope: &str) -> Vec<[String; 3]> {
+    let tokens = turtle.split_whitespace().peekable();
+    let mut r = Reader {
+        tokens,
+        out: Vec::new(),
+        fresh: 0,
+        scope,
+    };
+    while r.tokens.peek().is_some() {
+        let s = r.node();
+        r.props(&s);
+        r.tokens.next(); // `.`
+    }
+    r.out
+}
+
+struct Reader<'a> {
+    tokens: std::iter::Peekable<std::str::SplitWhitespace<'a>>,
+    out: Vec<[String; 3]>,
+    fresh: usize,
+    scope: &'a str,
+}
+
+impl Reader<'_> {
+    fn blank(&mut self) -> String {
+        self.fresh += 1;
+        format!("_:n{}{}", self.fresh, self.scope)
+    }
+
+    /// A term, a `[ … ]` or a `( … )`, and the triples it makes.
+    fn node(&mut self) -> String {
+        match self.tokens.next().expect("a term") {
+            "[]" => self.blank(),
+            "[" => {
+                let b = self.blank();
+                self.props(&b);
+                self.tokens.next(); // `]`
+                b
+            }
+            "(" => self.list(),
+            "a" => format!("<{RDF}type>"),
+            t if t.starts_with("_:") => format!("{t}{}", self.scope),
+            t if t.starts_with('<') => t.to_owned(),
+            t if t.starts_with('"') => t.replace("^^xsd:integer", &format!("^^<{INT}>")),
+            t if t.parse::<u64>().is_ok() => format!("\"{t}\"^^<{INT}>"),
+            t => {
+                let prefixes = [("f:", F), ("rdf:", RDF), ("rdfs:", RDFS), ("owl:", OWL)];
+                let (p, iri) = prefixes.iter().find(|(p, _)| t.starts_with(p)).expect(t);
+                format!("<{iri}{}>", &t[p.len()..])
+            }
+        }
+    }
+
+    /// The rest of a list after its `(`.
+    fn list(&mut self) -> String {
+        if self.tokens.next_if_eq(&")").is_some() {
+            return format!("<{RDF}nil>");
+        }
+        let (b, first) = (self.blank(), self.node());
+        let rest = self.list();
+        self.out.push([b.clone(), format!("<{RDF}first>"), first]);
+        self.out.push([b.clone(), format!("<{RDF}rest>"), rest]);
+        b
+    }
+
+    /// A subject's predicates and objects, with `;` and `,` between them.
+    fn props(&mut self, s: &str) {
+        let mut p = self.node();
+        loop {
+            let o = self.node();
+            self.out.push([s.to_owned(), p.clone(), o]);
+            match self.tokens.next_if(|t| *t == "," || *t == ";") {
+                Some(",") => {}
+                Some(_) => p = self.node(),
+                None => return,
+            }
+        }
+    }
 }
 
 /// The store's answer to `q`; `none` is the label where no reasoning path can leave
@@ -539,8 +598,6 @@ impl Reference {
 
     fn ask(&mut self, reasoner: &str, turtle: &str, questions: &BTreeSet<String>) -> Reply {
         let q: Vec<&str> = questions.iter().map(String::as_str).collect();
-        // One request a line: a state read back from the store comes one triple a line.
-        let turtle = turtle.replace('\n', " ");
         let line = format!("{reasoner}\t{PREFIXES} {turtle}\t{}\n", q.join("\t"));
         let (_, stdin, rx) = self.child.get_or_insert_with(|| {
             let mut child = Command::new("sh")
@@ -582,6 +639,39 @@ fn fails(class: &str) -> bool {
         class,
         "missing" | "wrong" | "wrong-refusal" | "wrong-acceptance" | "unclassified"
     ) || class.starts_with("undecided-")
+}
+
+/// A verdict on a query or the write: its index, class, what each side gave, and the answer's
+/// keys (the rows expected, each wrong and each missing row; a write's is its class).
+type Verdict = (usize, String, String, BTreeSet<String>);
+
+/// A row's outcome from HermiT's verdict and Openllet's, if asked. A failure needs both to fail
+/// it alike on the same answer: the same expected rows or one wrong or missing row in common.
+fn outcome(hermit: &Verdict, openllet: Option<&Verdict>, alone: Option<bool>) -> String {
+    let (_, class, _, keys) = hermit;
+    let alike = |(_, c, _, k): &Verdict| c == class && !k.is_disjoint(keys);
+    let out = match (fails(class), openllet) {
+        // A control's references must agree: else the premise below is wrong. One giving
+        // up while the other agrees with the store is listed apart.
+        (_, Some((_, c, _, _))) if alone == Some(false) && c != class => {
+            match [class, c].iter().any(|x| *x == "reference-undecided") {
+                true if fails(class) || fails(c) => "FAIL",
+                true => "control-undecided",
+                false => "control-split",
+            }
+        }
+        // A declined write: the class is HermiT's word, the outcome Openllet's.
+        (false, Some((_, c, _, _))) if class.starts_with("declined") => c.as_str(),
+        // Unjudged, so never a pass.
+        (false, _) if class == "not-judged" || class == "reference-undecided" => class.as_str(),
+        (false, _) => ["pass", "pass-one"][(alone == Some(true)) as usize],
+        // A key binds named individuals only: HermiT follows that, Openllet reads a blank
+        // node as a named individual.
+        (true, _) if alone == Some(true) => "FAIL-one",
+        (true, Some(o)) if alike(o) => "FAIL",
+        (true, _) => "set-aside",
+    };
+    out.to_owned()
 }
 
 /// Per candidate row of a query: the row, its positive questions and its negated ones.
@@ -631,27 +721,32 @@ impl Case {
             .map(move |i| &self.groups[i])
     }
 
-    /// The commits under `skip`, each an update and the state after it as Turtle: the groups
-    /// of the first commit, those of the second, then the deletion of `deleted`, with the
-    /// group it takes away in place of the state; only the first NRESE_DL_STEPS if it is set.
+    /// The commits under `skip`, each an update and the state after it, the triples the
+    /// check reads in the writes: the groups of the first commit, those of the second, then
+    /// the deletion of `deleted`, its triples taken away; only the first NRESE_DL_STEPS if set.
     fn commits(&self, skip: &BTreeSet<usize>) -> Vec<(String, String)> {
-        let turtle = |keep: &dyn Fn(usize) -> bool| {
-            let kept = (0..self.groups.len()).filter(|&g| !skip.contains(&g) && keep(g));
+        let turtle = |c: usize| {
+            let kept = (0..self.groups.len()).filter(|g| !skip.contains(g));
+            let kept = kept.filter(|&g| self.commits[g] == c);
             kept.map(|g| self.groups[g].turtle.as_str())
                 .collect::<Vec<_>>()
                 .join(" ")
         };
-        let mut out = Vec::new();
+        let text = |s: &BTreeSet<[String; 3]>| -> String {
+            s.iter().map(|t| t.join(" ") + " . ").collect()
+        };
+        let (mut out, mut state) = (Vec::new(), BTreeSet::new());
         for c in 0..2 {
-            let write = turtle(&|g| self.commits[g] == c);
+            let write = turtle(c);
             if !write.is_empty() {
-                let state = turtle(&|g| self.commits[g] <= c);
-                out.push((format!("INSERT DATA {{ {write} }}"), state));
+                state.extend(triples(&write, &format!("c{c}")));
+                out.push((format!("INSERT DATA {{ {write} }}"), text(&state)));
             }
         }
         if let Some(d) = self.deleted.filter(|d| !skip.contains(d)) {
-            let turtle = &self.groups[d].turtle;
-            out.push((format!("DELETE DATA {{ {turtle} }}"), turtle.clone()));
+            let (turtle, gone) = (&self.groups[d].turtle, triples(&self.groups[d].turtle, ""));
+            state.retain(|t| !gone.contains(t));
+            out.push((format!("DELETE DATA {{ {turtle} }}"), text(&state)));
         }
         out.truncate(env("NRESE_DL_STEPS").map_or(usize::MAX, |n| n as usize));
         out
@@ -696,7 +791,9 @@ impl Case {
                 true => (0..3).map(|v: u64| v.to_string()).collect(),
                 false => individuals.clone(),
             };
-            range.extend(a.rows.iter().map(|r| r[k].clone()));
+            // All but a term no question can name: a blank node or another literal.
+            let named = a.rows.iter().map(|r| &r[k]).filter(|x| !x.starts_with('?'));
+            range.extend(named.cloned());
             let next = tuples.iter().flat_map(|t| {
                 range
                     .iter()
@@ -723,8 +820,8 @@ impl Case {
         got: &Answers,
         reference: &mut Reference,
         reasoner: &str,
-    ) -> Vec<(usize, String, String)> {
-        let write = self.queries.len() + 1;
+    ) -> Vec<Verdict> {
+        let (write, on_write) = (self.queries.len() + 1, BTreeSet::from(["write".to_owned()]));
         let (answers, turtle) = match got {
             Err((kind, why, state)) => {
                 let (class, said) = match reference.ask(reasoner, state, &BTreeSet::new()) {
@@ -746,19 +843,16 @@ impl Case {
                     _ => "unclassified".into(),
                 };
                 let detail = format!("store: refused, {kind} ({why}); {reasoner}: {said}");
-                return vec![(write, class, detail + "; no query judged")];
+                return vec![(write, class, detail + "; no query judged", on_write)];
             }
             Ok((answers, state)) => (answers, state),
         };
         let names = self.kept(skip).flat_map(|g| g.names.clone());
-        let individuals: BTreeSet<String> = names.collect();
-        // A row with a blank node or another literal leaves a query unjudged, but the inferred.
-        let odd = |a: &&Answer| a.rows.iter().flatten().any(|x| x.starts_with('?'));
-        let (mut asked, mut per, last) = (BTreeSet::new(), Vec::new(), self.queries.len());
+        let known: BTreeSet<String> = names.collect();
+        let (mut asked, mut per) = (BTreeSet::new(), Vec::new());
         for (&i, a) in picked.iter().zip(answers) {
-            let a = a.as_ref().ok().filter(|a| i == last || !odd(a));
-            let rows = a.map(|a| self.rows(i, a, &individuals));
-            for (_, p, n) in rows.iter().flatten() {
+            let rows = a.as_ref().map_or(Vec::new(), |a| self.rows(i, a, &known));
+            for (_, p, n) in &rows {
                 asked.extend(p.iter().chain(n).cloned());
             }
             per.push(rows);
@@ -769,53 +863,43 @@ impl Case {
                 let complete = answers.iter().flatten().any(|a| a.label == "complete");
                 let class = ["accepted-inconsistent", "wrong-acceptance"][complete as usize];
                 let detail = format!("store: accepted; {reasoner}: inconsistent");
-                return vec![(write, class.into(), detail)];
+                return vec![(write, class.into(), detail, on_write)];
             }
             Reply::Undecided(why) => {
-                return picked
-                    .iter()
-                    .map(|&i| (i, "reference-undecided".into(), why.clone()))
-                    .collect();
+                let undecided = "reference-undecided".to_owned();
+                let v = |&i: &usize| (i, undecided.clone(), why.clone(), BTreeSet::new());
+                return picked.iter().map(v).collect();
             }
         };
-        let judged = picked
-            .iter()
-            .zip(answers)
-            .zip(per)
-            .map(|((&i, a), rows)| match (a, rows) {
-                (Ok(a), Some(rows)) => {
-                    let (class, detail) = self.judge(i, a, &rows, &entailed, reasoner);
-                    (i, class, detail)
-                }
-                (Err(why), _) => (i, "not-judged".into(), why.clone()),
-                (Ok(_), None) => (i, "not-judged".into(), "a blank node or literal".into()),
-            });
+        let judged = picked.iter().zip(answers).zip(per);
+        let judged = judged.map(|((&i, a), rows)| match a {
+            Ok(a) => {
+                let (class, detail, keys) = Self::judge(a, &rows, &entailed, reasoner);
+                (i, class, detail, keys)
+            }
+            Err(why) => (i, "not-judged".into(), why.clone(), BTreeSet::new()),
+        });
         judged.collect()
     }
 
-    /// The class of the store's answer `a` to query `i`, given its candidate rows and what
-    /// `reasoner` entails, and what each side gave.
+    /// The class of the store's answer `a`, given its candidate rows and what `reasoner`
+    /// entails; what each side gave; and the answer's keys.
     fn judge(
-        &self,
-        i: usize,
         a: &Answer,
         rows: &Rows,
         entailed: &BTreeMap<String, bool>,
         reasoner: &str,
-    ) -> (String, String) {
-        let inferred = i == self.queries.len();
+    ) -> (String, String, BTreeSet<String>) {
         let all = |qs: &[String]| qs.iter().all(|q| entailed[q]);
         let holds = rows
             .iter()
             .filter(|(_, p, n)| all(p) && (n.is_empty() || !all(n)));
         let expected: BTreeSet<&Vec<String>> = holds.map(|(t, _, _)| t).collect();
-        // An inferred statement is judged only where it is an OWL axiom over the case's names.
-        let asked = |r: &Vec<String>| !inferred || rows.iter().any(|(t, _, _)| t == r);
-        let wrong: Vec<_> = a
-            .rows
-            .iter()
-            .filter(|r| asked(r) && !expected.contains(r))
-            .collect();
+        // A row no question asks (a blank node, another literal, an inferred statement that
+        // isn't an OWL axiom over the case's names) is counted unchecked; every other is judged.
+        let asks = |r: &&Vec<String>| rows.iter().any(|(t, _, _)| t == *r);
+        let (asked, unchecked): (Vec<_>, Vec<_>) = a.rows.iter().partition(asks);
+        let wrong: Vec<_> = asked.iter().filter(|r| !expected.contains(*r)).collect();
         let missing: Vec<_> = expected.iter().filter(|r| !a.rows.contains(**r)).collect();
         // Is the certification honest: a row the references don't entail passes only under
         // `unsound`, counted apart, wrong or right (the coarse mark's price).
@@ -830,7 +914,11 @@ impl Case {
         let mut detail = format!("store: {} [{}] {:?}; {reasoner}:", a.label, a.paths, a.rows);
         detail += &format!(" {expected:?}");
         detail += &format!("; wrong {wrong:?}; missing {missing:?}");
-        (class.into(), detail)
+        detail += &format!("; unchecked {}", unchecked.len());
+        let keys = wrong.iter().map(|r| format!("wrong {r:?}"));
+        let keys = keys.chain(missing.iter().map(|r| format!("missing {r:?}")));
+        let keys = keys.chain([format!("{expected:?}")]).collect();
+        (class.into(), detail, keys)
     }
 
     /// Removes groups while the verdict on query `i` stays `class` under HermiT.
@@ -844,7 +932,7 @@ impl Case {
                 if skip.insert(g) {
                     let got = store(&self.commits(&skip), &texts);
                     let v = self.verdicts(&skip, &picked, &got, reference, "hermit");
-                    if !v.iter().any(|(j, c, _)| *j == i && c == class) {
+                    if !v.iter().any(|(j, c, ..)| *j == i && c == class) {
                         skip.remove(&g);
                     }
                 }
@@ -869,7 +957,7 @@ impl Case {
         let steps = env("NRESE_DL_STEPS").map_or(String::new(), |n| format!(", {n} steps"));
         let mut ttl = format!("# seed {seed}, shape {shape}{steps}, {name} (query {i}): {query}\n");
         for reasoner in ["hermit", "openllet"] {
-            for (j, class, detail) in self.verdicts(skip, &picked, &got, reference, reasoner) {
+            for (j, class, detail, _) in self.verdicts(skip, &picked, &got, reference, reasoner) {
                 let detail = detail.replace('\n', " ");
                 ttl += &format!("# {reasoner}\t{}\t{class}\t{detail}\n", self.name(j));
             }
@@ -925,6 +1013,7 @@ fn dl_answers_agree_with_outside_reasoners() {
                     let case = generate(seed);
                     let tags: BTreeSet<&str> = case.groups.iter().map(|g| g.tag).collect();
                     let tags = tags.into_iter().collect::<Vec<_>>().join(",");
+                    let tags = tags + ["", ",deletion"][case.deleted.is_some() as usize];
                     if case.reference_gap() {
                         let why = "a key over a property that isn't simple";
                         let row = format!("{seed}\t{}\t{tags}\tcase\treference-gap", case.shape);
@@ -938,37 +1027,19 @@ fn dl_answers_agree_with_outside_reasoners() {
                     let hermit = case.verdicts(&none, &picked, &got, &mut reference, "hermit");
                     let twice = |c: &String| fails(c) || c.starts_with("declined");
                     let control = case.queries.iter().any(|q| q.alone == Some(false));
-                    let openllet = match control || hermit.iter().any(|(_, c, _)| twice(c)) {
+                    let openllet = match control || hermit.iter().any(|(_, c, ..)| twice(c)) {
                         true => case.verdicts(&none, &picked, &got, &mut reference, "openllet"),
                         false => Vec::new(),
                     };
-                    for (i, class, detail) in &hermit {
-                        let openllet = openllet.iter().find(|(j, _, _)| j == i);
-                        let second = openllet.map(|(_, c, _)| c);
+                    for v in &hermit {
+                        let (i, class, detail) = (&v.0, &v.1, &v.2);
+                        let openllet = openllet.iter().find(|o| o.0 == *i);
                         let alone = case.queries.get(*i).and_then(|q| q.alone);
-                        let outcome = match (fails(class), second) {
-                            // A control's references must agree: else the premise below is wrong.
-                            // One giving up while the other agrees with the store is listed apart.
-                            (_, Some(c)) if alone == Some(false) && c != class => {
-                                match [class, c].iter().any(|x| *x == "reference-undecided") {
-                                    true if fails(class) || fails(c) => "FAIL",
-                                    true => "control-undecided",
-                                    false => "control-split",
-                                }
-                            }
-                            // A declined write: the class is HermiT's word, the outcome Openllet's.
-                            (false, Some(c)) if class.starts_with("declined") => c.as_str(),
-                            (false, _) => ["pass", "pass-one"][(alone == Some(true)) as usize],
-                            // A key binds named individuals only: HermiT follows that, Openllet
-                            // reads a blank node as a named individual.
-                            (true, _) if alone == Some(true) => "FAIL-one",
-                            (true, Some(c)) if c == class => "FAIL",
-                            (true, _) => "set-aside",
-                        };
+                        let outcome = outcome(v, openllet, alone);
                         let (shape, name) = (case.shape, case.name(*i));
                         let row = format!("{seed}\t{shape}\t{tags}\t{name}\t{class}\t{outcome}");
                         let second =
-                            openllet.map_or("not asked".into(), |(_, c, d)| format!("{c}, {d}"));
+                            openllet.map_or("not asked".into(), |o| format!("{}, {}", o.1, o.2));
                         let row = format!("{row}\t{detail}; openllet: {second}");
                         writeln!(summary.lock().expect("summary"), "{row}").expect("summary.tsv");
                         // Written whole, to be read by hand: it shrinks against HermiT alone.
@@ -1016,6 +1087,7 @@ fn dl_answers_agree_with_outside_reasoners() {
 /// A read is judged by its label, the inferred statements' too: a row the references don't
 /// entail is counted under `unsound` and fails under any other label. A refusal as undecided
 /// of declarations alone (no pun, no annotation property's axiom) fails, apart by its reason.
+/// A row missing under `complete` fails, and a wrong one beside a blank node.
 #[test]
 #[cfg(unix)]
 fn planted_answers_are_judged_by_kind_and_label() {
@@ -1060,6 +1132,32 @@ fn planted_answers_are_judged_by_kind_and_label() {
     let c = generate(173); // three same-ask queries, two data-ask
     let names: BTreeSet<String> = (0..c.queries.len() + 2).map(|i| c.name(i)).collect();
     assert_eq!(names.len(), c.queries.len() + 2, "{names:?}");
+    // Answers to a type query over a0..a3, judged against what is planted as entailed.
+    let mut typed = generate(0);
+    typed.queries = vec![query("type", "T f:C0 x", &mut Rng::new(0))];
+    let a = |i: u64| n("a", i);
+    let judge = |served: &[String], yes: &[String]| -> Verdict {
+        let (label, paths) = ("complete".to_owned(), String::new());
+        let rows = served.iter().map(|x| vec![x.clone()]).collect();
+        let answer = Answer { label, paths, rows };
+        let rows = typed.rows(0, &answer, &(0..4).map(a).collect());
+        let e = rows.iter().map(|r| (r.1[0].clone(), yes.contains(&r.0[0])));
+        let (class, detail, keys) = Case::judge(&answer, &rows, &e.collect(), "hermit");
+        (0, class, detail, keys)
+    };
+    assert_eq!(judge(&[], &[a(0)]).1, "missing");
+    // A wrong named row beside a blank node: the one judged, the other counted unchecked.
+    let v = judge(&[a(1), "?_:b0".into()], &[]);
+    assert_eq!(v.1, "wrong", "{v:?}");
+    assert!(v.2.ends_with("unchecked 1"), "{v:?}");
+    // Two references fail an answer alike only on a row in common.
+    let missed = |yes: &[String]| judge(&[a(0)], yes);
+    let (one, two) = (missed(&[a(0), a(1)]), missed(&[a(0), a(2)]));
+    assert_eq!(outcome(&one, Some(&two), None), "set-aside");
+    let three = missed(&[a(0), a(1), a(2)]);
+    assert_eq!(outcome(&one, Some(&three), None), "FAIL");
+    let unjudged = (0, "not-judged".to_owned(), String::new(), BTreeSet::new());
+    assert_eq!(outcome(&unjudged, None, None), "not-judged");
 }
 
 /// The real references, for the planted faults below (run by outside.sh before a campaign).
@@ -1068,27 +1166,31 @@ fn references() -> Reference {
     Reference::new(command, Duration::from_secs(60))
 }
 
-/// A deletion the store leaves undone (planted: a `DELETE DATA` that removes nothing) shows
-/// as an inferred statement the references don't entail; the deletion done passes, its
-/// state read back from the store over several lines.
+/// Writes the store gets wrong (planted): a deletion left undone (a `DELETE DATA` that removes
+/// nothing), and an insert lost before a deletion of other triples. Each shows at the answer,
+/// as the references read the state the writes should leave; the writes done agree.
 #[test]
 #[ignore = "needs the DL kit's reference reasoners: benches/reasoning/dl/outside.sh"]
-fn planted_deletion_left_undone() {
+fn planted_writes_lost() {
     let (mut case, none) = (generate(0), BTreeSet::new());
-    case.groups.truncate(2);
+    case.groups.truncate(3);
     case.groups[0].turtle = "f:C0 rdfs:subClassOf f:C1 . f:C1 rdfs:subClassOf f:C2 .".into();
     case.groups[1].turtle = "f:a0 a f:C0 .".into();
-    (case.queries, case.commits, case.deleted) = (Vec::new(), vec![0, 0], Some(1));
+    case.groups[2].turtle = "f:a1 a f:C0 .".into();
+    case.queries = vec![query("type", "T f:C2 x", &mut Rng::new(0))];
+    (case.commits, case.deleted) = (vec![0, 0, 0], Some(1));
     let (mut reference, texts) = (references(), vec![case.text(0)]);
     let mut verdict = |commits: Vec<(String, String)>| {
         let got = store(&commits, &texts);
-        case.verdicts(&none, &[0], &got, &mut reference, "hermit")
+        let v = case.verdicts(&none, &[0], &got, &mut reference, "hermit");
+        v[0].1.clone()
     };
-    let mut undone = case.commits(&none);
+    let (mut undone, mut lost) = (case.commits(&none), case.commits(&none));
     undone[1].0 = "DELETE DATA { }".into();
-    assert_eq!(verdict(case.commits(&none))[0].1, "agree");
-    let v = verdict(undone);
-    assert_eq!(v[0].1, "wrong", "{v:?}");
+    lost[0].0 = lost[0].0.replace("f:a1 a f:C0 .", "");
+    assert_eq!(verdict(case.commits(&none)), "agree");
+    assert_eq!(verdict(undone), "wrong");
+    assert_eq!(verdict(lost), "missing");
 }
 
 /// A long chain's clash the store accepted (planted: a `complete` answer over the chain of
