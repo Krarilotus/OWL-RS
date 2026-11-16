@@ -259,6 +259,56 @@ Id: back
 }
 "#;
 
+/// A user's subclass rule `C ⊑ D` named `eq-rep-p`, beside `D ⊑ C` and `B ⊑ C`: `C` and `D` derive
+/// each other, and only `B` supports them. Deleting the one asserted `a a B` leaves neither: the
+/// program entails nothing from an empty store.
+const CLASSES_NAMED_EQ_REP_P: &str = r#"
+Prefices
+{
+  ex : http://example.com/
+  rdf : http://www.w3.org/1999/02/22-rdf-syntax-ns#
+}
+
+Rules
+{
+Id: from-b
+  x <rdf:type> <ex:B>
+  ---------------
+  x <rdf:type> <ex:C>
+
+Id: eq-rep-p
+  x <rdf:type> <ex:C>
+  ---------------
+  x <rdf:type> <ex:D>
+
+Id: back
+  x <rdf:type> <ex:D>
+  ---------------
+  x <rdf:type> <ex:C>
+}
+"#;
+
+/// A deletion maintained over a cycle of class rules, one of them named `eq-rep-p`, takes out
+/// what the cycle derived from the deleted statement: `back` is on a cycle with the rule named
+/// `eq-rep-p`, so `a a C` is not kept by its one step from `a a D`.
+#[test]
+fn a_deletion_takes_out_a_cycle_through_a_class_rule_named_like_an_equality_rule() {
+    let store = store_with(CLASSES_NAMED_EQ_REP_P, &format!("<{EX}a> a <{EX}B> ."));
+    let (c, d) = (format!("<{EX}a> a <{EX}C>"), format!("<{EX}a> a <{EX}D>"));
+    let mut wrong = ask_all(
+        "before the deletion",
+        &store,
+        &[(c.clone(), true), (d.clone(), true)],
+    );
+    apply(&store, &format!("DELETE DATA {{ <{EX}a> a <{EX}B> }}"));
+    wrong.extend(ask_all(
+        "after the deletion",
+        &store,
+        &[(c, false), (d, false)],
+    ));
+    assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
+}
+
 /// A deletion maintained over a user's rule named `eq-rep-p` takes out what only that rule and
 /// its partner derived from the deleted statement.
 #[test]
