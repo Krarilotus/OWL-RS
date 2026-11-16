@@ -137,17 +137,17 @@ fn a_later_value_that_is_a_class_reads_again() {
 
 /// A key on an undeclared property, then literal values of it: they make it a data
 /// property, so the key compares data values, which the RL rules don't do by value
-/// (`nrese_owl::ql::reads_data_values`): the ontology leaves the route, and `:a` and `:b`,
-/// one key value in two lexical forms, are the same individual, so `:b :p :x` holds.
+/// (`nrese_owl::ql::reads_data_values`): `:a` and `:b`, one key value in two lexical forms,
+/// are the same individual, so `:b :p :x` holds and is answered; the commit read the
+/// ontology again, and the ontology left the route.
 #[test]
 fn a_later_literal_of_an_undeclared_key_property_leaves_the_route() {
     let (store, pipeline) = on_the_route(":Person owl:hasKey ( :ssn ) . :p a owl:ObjectProperty .");
-    assert!(commit(
+    let read = commit(
         &store,
         &pipeline,
         ":a a :Person ; :ssn 1 ; :p :x . :b a :Person ; :ssn \"01\"^^xsd:integer .",
-    ));
-    assert_ne!(store.dl_bounds().last, "rules");
+    );
     let (holds, status) = ask(&store, ":b :p :x");
     eprintln!("ASK {{ :b :p :x }}: {holds}, {status}");
     assert!(holds, "{status}");
@@ -155,6 +155,8 @@ fn a_later_literal_of_an_undeclared_key_property_leaves_the_route() {
         status.starts_with("complete") || status.starts_with("sound-only"),
         "{status}"
     );
+    assert!(read, "the commit read the ontology again");
+    assert_ne!(store.dl_bounds().last, "rules");
 }
 
 /// An undeclared property, data only by its one literal, with a datatype range; then that
