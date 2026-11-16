@@ -493,14 +493,14 @@ fn a_publication_of_new_statements_is_certified_only_by_what_built_them() {
 /// A reader who sees the inferences its graphs support reads a view built with the support
 /// program the store was told to use (`use_reasoning_rules`). Where that program isn't the
 /// one the certificate was made with, the view's inferred statements are no certified
-/// closure: the read is never answered as certified (R4), with no program and with another
-/// one: `not-certified`, or refused until the store is rematerialised. Under the matching
-/// program the status is the certified one, as `ql_rewriting_tests`'
+/// closure, and the view may show what a graph the reader can't read asserts: the read is
+/// refused until the store is rematerialised (R4), with no program and with another one.
+/// Under the matching program the status is the certified one, as `ql_rewriting_tests`'
 /// `rewritten_answers_follow_the_readers_graph_access` pins. A server reaches the mismatch
 /// while a repository's reasoning changes: the catalog's `settle` publishes the new
 /// certificate before the new write path sets the new program.
 #[test]
-fn a_supported_reader_whose_view_uses_another_program_is_told_not_certified() {
+fn a_supported_reader_whose_view_uses_another_program_is_refused() {
     let mut cells = Cells::default();
     let store = certified(
         StoreConfig {
@@ -536,11 +536,8 @@ fn a_supported_reader_whose_view_uses_another_program_is_told_not_certified() {
             cells.header(
                 &format!("R4 a supported reader's view, {name}"),
                 &read(),
-                |got| {
-                    class(got) == "not-certified"
-                        || (got.starts_with("refused") && got.contains("rematerialis"))
-                },
-                "not-certified, or a refusal naming rematerialisation",
+                |got| got.starts_with("refused") && got.contains("rematerialis"),
+                "a refusal naming rematerialisation",
             );
         }
     }
@@ -551,7 +548,8 @@ fn a_supported_reader_whose_view_uses_another_program_is_told_not_certified() {
 /// or not a graph it can't read asserts a statement, also while the program the store
 /// maintains its stack with isn't its certificate's: a stronger live program finds that
 /// `ex:b ex:q ex:a` follows from `open`, which the certified rdfs closure doesn't, and must
-/// not show the reader the copy only `secret` asserts. A server reaches the mismatch while a
+/// not show the reader the copy only `secret` asserts: the read is refused until the store is
+/// rematerialised, with `secret` or without it. A server reaches the mismatch while a
 /// repository's reasoning changes: the catalog's `settle` publishes the new certificate
 /// before the new write path sets the new program.
 #[test]
@@ -570,8 +568,9 @@ fn a_reader_of_some_graphs_learns_nothing_from_a_hidden_graph_under_another_prog
             ..GraphAccess::default()
         }))
     };
-    // The ASK's answer to `scope`, `secret` asserting SECRET or not, the stack certified under
-    // rdfs and maintained under `live`.
+    // The ASK's answer to `scope` (`true`, `false`, or `refused` where the refusal names
+    // rematerialisation), `secret` asserting SECRET or not, the stack certified under rdfs and
+    // maintained under `live`.
     let asked = |scope: &ReadScope, live: Ruleset, secret: bool| {
         let store = StoreService::new(StoreConfig::in_memory()).expect("store");
         let hidden = if secret {
@@ -590,18 +589,29 @@ fn a_reader_of_some_graphs_learns_nothing_from_a_hidden_graph_under_another_prog
             format!("PREFIX ex: <{EX}> ASK {{ {SECRET} }}"),
             scope.clone(),
         );
-        let payload = store.execute_query(&request).expect("answered").payload;
-        String::from_utf8(payload).expect("utf-8").contains("true")
+        match store.execute_query(&request) {
+            Ok(result) => {
+                let found = String::from_utf8(result.payload)
+                    .expect("utf-8")
+                    .contains("true");
+                found.to_string()
+            }
+            Err(error) if error.to_string().contains("rematerialis") => "refused".to_owned(),
+            Err(error) => format!("refused otherwise: {error}"),
+        }
     };
     for (kind, by_support) in [("visible", false), ("supported", true)] {
         let scope = reader(by_support);
-        for (live_name, live) in [("rdfs", Ruleset::Rdfs), ("owl2-rl", Ruleset::Owl2Rl)] {
+        for (live_name, live, want) in [
+            ("rdfs", Ruleset::Rdfs, "false / false"),
+            ("owl2-rl", Ruleset::Owl2Rl, "refused / refused"),
+        ] {
             let (without, with) = (asked(&scope, live, false), asked(&scope, live, true));
             cells.header(
                 &format!("{kind}, {live_name}: the ASK without secret / with it"),
                 &format!("{without} / {with}"),
-                |got| got == "false / false",
-                "false / false",
+                |got| got == want,
+                want,
             );
         }
     }
