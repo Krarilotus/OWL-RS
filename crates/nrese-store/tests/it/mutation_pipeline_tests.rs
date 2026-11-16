@@ -1050,3 +1050,160 @@ fn a_retired_pipeline_refuses_writes() {
         2
     );
 }
+
+/// `:K owl:hasKey ( :k1 … :kn )`, and `:x` and `:y` in `:K` with the same value on every
+/// key property: prp-key (OWL 2 Profiles §4.3, table 5) makes them one individual, so
+/// `:x :name "Y"` holds through `:y`'s (eq-rep-s).
+fn long_key(n: usize) -> String {
+    let keys: Vec<String> = (1..=n).map(|i| format!("<{EX}k{i}>")).collect();
+    let mut data = format!(
+        "<{EX}K> <http://www.w3.org/2002/07/owl#hasKey> ( {} ) .",
+        keys.join(" ")
+    );
+    for x in ["x", "y"] {
+        data.push_str(&format!(" <{EX}{x}> a <{EX}K> ."));
+        for i in 1..=n {
+            data.push_str(&format!(" <{EX}{x}> <{EX}k{i}> <{EX}v{i}> ."));
+        }
+    }
+    data.push_str(&format!(" <{EX}y> <{EX}name> \"Y\" ."));
+    data
+}
+
+/// A key's rule has two atoms per property and two more, and a rule holds at most 256:
+/// a key of 127 properties is one rule, one of 128 is reported (`list-too-long`, prp-key)
+/// and not built, never a failed commit (docs/spec/reasoning-semantics.md, "Lists").
+#[test]
+fn a_key_past_the_rule_format_is_reported_and_not_built() {
+    for n in [127, 128] {
+        let owl = pipeline(ReasoningMode::Owl2Rl);
+        owl.apply(
+            insert(&long_key(n)),
+            &nrese_store::Requester::all(),
+            &MutationTicket::new(),
+        )
+        .unwrap_or_else(|error| panic!("{n} properties: {error}"));
+        let equal = contains(&owl, &format!("<{EX}x> <{EX}name> \"Y\""));
+        let reported = owl
+            .last_reasoning_run()
+            .expect("run")
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == "list-too-long" && d.rules == "prp-key");
+        assert_eq!((equal, reported), (n == 127, n == 128), "{n} properties");
+    }
+}
+
+/// A store that holds such a key, written with reasoning off, then opened with reasoning
+/// on: the inferences are rebuilt as the server does at its start (and `nrese-server load`
+/// after loading), and the rebuild completes with the key reported.
+#[test]
+fn a_store_holding_a_key_past_the_rule_format_is_rebuilt_with_reasoning_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = nrese_store::StoreConfig {
+        mode: nrese_store::StoreMode::OnDisk,
+        data_dir: dir.path().to_path_buf(),
+        query_cache_bytes: 0,
+        ..nrese_store::StoreConfig::default()
+    };
+    {
+        let plain = MutationPipeline::new(
+            Arc::new(StoreService::new(config.clone()).expect("store")),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Disabled,
+            ))),
+        );
+        plain
+            .apply(
+                insert(&long_key(128)),
+                &nrese_store::Requester::all(),
+                &MutationTicket::new(),
+            )
+            .expect("written with reasoning off");
+    }
+    let store = StoreService::new(config).expect("reopen");
+    let program = ReasonerConfig::for_mode(ReasoningMode::Owl2Rl)
+        .materialised_program()
+        .expect("owl2-rl materialises");
+    assert!(!store.reasoning_is_current(&program));
+    let report = store.rematerialise(&program).expect("rebuilt");
+    assert_eq!(report.violations, 0);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == "list-too-long" && d.rules == "prp-key"),
+        "{:?}",
+        report.diagnostics
+    );
+}
+
+/// `:C owl:intersectionOf ( :A1 … :An )` and an `:x` in every `:Ai`: cls-int1 (OWL 2
+/// Profiles §4.3, table 6) makes `:x` a `:C`. Its rule has one atom per member, and a
+/// rule's atoms are numbered by `u8`.
+fn long_intersection(n: usize) -> String {
+    let members: Vec<String> = (1..=n).map(|i| format!("<{EX}A{i}>")).collect();
+    let mut data = format!(
+        "<{EX}C> <http://www.w3.org/2002/07/owl#intersectionOf> ( {} ) .",
+        members.join(" ")
+    );
+    for member in &members {
+        data.push_str(&format!(" <{EX}x> a {member} ."));
+    }
+    data
+}
+
+/// An intersection of 256 members is one rule; one of 257 is either one too or reported
+/// and not built, never a panic and never a failed commit: on a write, and when a store
+/// holding one, written with reasoning off, is rebuilt with reasoning on.
+#[test]
+fn a_long_intersection_is_built_or_reported() {
+    let mut wrong = Vec::new();
+    for n in [256, 257] {
+        let run = std::panic::catch_unwind(|| {
+            let owl = pipeline(ReasoningMode::Owl2Rl);
+            owl.apply(
+                insert(&long_intersection(n)),
+                &nrese_store::Requester::all(),
+                &MutationTicket::new(),
+            )
+            .map_err(|error| error.to_string())?;
+            let entailed = contains(&owl, &format!("<{EX}x> a <{EX}C>"));
+            let reported = owl.last_reasoning_run().is_some_and(|run| {
+                run.diagnostics
+                    .iter()
+                    .any(|d| d.rules.starts_with("cls-int"))
+            });
+            Ok::<_, String>((entailed, reported))
+        });
+        let rebuilt = std::panic::catch_unwind(|| {
+            let plain = pipeline(ReasoningMode::Disabled);
+            plain
+                .apply(
+                    insert(&long_intersection(n)),
+                    &nrese_store::Requester::all(),
+                    &MutationTicket::new(),
+                )
+                .map_err(|error| error.to_string())?;
+            let report = plain
+                .store()
+                .rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+                .map_err(|error| error.to_string())?;
+            let entailed = contains(&plain, &format!("<{EX}x> a <{EX}C>"));
+            let reported = report
+                .diagnostics
+                .iter()
+                .any(|d| d.rules.starts_with("cls-int"));
+            Ok::<_, String>((entailed, reported))
+        });
+        for (place, outcome) in [("write", run), ("rebuild", rebuilt)] {
+            match outcome {
+                Ok(Ok((true, _))) => {}
+                Ok(Ok((false, reported))) if n == 257 && reported => {}
+                Ok(outcome) => wrong.push(format!("{place}, {n} members: {outcome:?}")),
+                Err(_) => wrong.push(format!("{place}, {n} members: panicked")),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

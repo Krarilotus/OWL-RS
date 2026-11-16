@@ -196,12 +196,16 @@ impl Compiler {
         if compiled.is_empty() {
             return Err("a rule whose premises are only builtins".to_owned());
         }
-        Ok(Some(Rule {
+        let rule = Rule {
             name: name.to_owned(),
             body: compiled,
             guards,
             head,
-        }))
+        };
+        if !rule.fits() {
+            return Err(too_many_atoms());
+        }
+        Ok(Some(rule))
     }
 
     /// A term with the substitutions so far applied.
@@ -302,6 +306,14 @@ fn formula<'a>(
 }
 
 /// A fact outside formulas, as ids.
+/// A user rule past the rule format ([`Rule::fits`]): a parse error.
+pub(crate) fn too_many_atoms() -> String {
+    format!(
+        "more than {} atoms in a rule's premises or conclusion",
+        super::eval::MAX_RULE_ATOMS
+    )
+}
+
 fn fact(quad: &N3Quad, vocabulary: &mut impl Vocabulary) -> Result<[u64; 3], String> {
     let mut ids = [0; 3];
     for (slot, term) in ids
@@ -443,6 +455,23 @@ mod tests {
                 Ok((program, _)) => {
                     assert!(expected.is_empty() && program.rules.is_empty(), "{text}")
                 }
+            }
+        }
+    }
+
+    /// A rule's atoms are numbered by a byte: 256 premises are one rule, 257 a parse error.
+    #[test]
+    fn a_rule_past_256_premises_is_an_error() {
+        for n in [256, 257] {
+            let premises: Vec<String> = (1..=n).map(|i| format!("?x :a{i} ?y")).collect();
+            let text = format!(
+                "@prefix : <http://e/> .\n{{ {} }} => {{ ?x :b ?y }} .",
+                premises.join(" . ")
+            );
+            match (n, compiled(&text)) {
+                (256, Ok((program, _))) => assert_eq!(program.rules[0].body.len(), 256),
+                (257, Err(error)) => assert!(error.message.contains("atoms"), "{error}"),
+                (n, other) => panic!("{n} premises: {:?}", other.map(|(p, _)| p.rules.len())),
             }
         }
     }
