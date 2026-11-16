@@ -1517,7 +1517,7 @@ impl<'a> Reader<'a> {
 
     /// Declared an annotation property, or one OWL 2 builds in (declared implicitly: §5.8).
     fn annotation_property(&self, term: Term) -> bool {
-        let builtin = BUILTIN_ANNOTATIONS.map(|iri| self.terms.iri(iri));
+        let builtin = &self.builtin_annotations.0;
         self.declared_as(term, EntityKind::AnnotationProperty) || builtin.contains(&Some(term))
     }
 
