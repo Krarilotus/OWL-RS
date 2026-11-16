@@ -172,7 +172,8 @@ fn assertion_change(store: &StoreService, tx: &Transaction<'_>) -> Option<HashSe
     }
     let mut touched = HashSet::new();
     for quad in tx.deleted() {
-        if super::bounds::changes_schema(tx, super::bounds::quad_triple(quad)) {
+        let triple = super::bounds::quad_triple(quad);
+        if super::bounds::changes_schema(tx, triple) || super::bounds::may_retype(tx, triple) {
             return None;
         }
     }
