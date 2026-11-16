@@ -389,7 +389,7 @@ one's slope.
 <a id="131-upgrading-a-store-from-main-to-v2"></a>
 ## Upgrading
 
-A data directory written by an earlier NRESE, `main` (d9a4b24) included, opens as it is, with no
+A data directory written by an earlier NRESE, `main` included, opens as it is, with no
 migration step. Checkpoints of formats 4 to 11 are read, and the log is replayed (also after a
 crash or a kill). The repositories, their settings and rules, the namespaces, the access state
 (users, local logins, roles, workspaces, saved queries) and the image backups carry over. Sessions
@@ -400,9 +400,9 @@ and the result cache start empty, as at every start.
 2. Start the new binary with the same configuration. The first start brings each repository's
    inferred statements in line with the new rules: they are kept where the rules didn't change
    (the fingerprint in `reasoning.state`), and derived again before the server reports ready
-   where they did, which takes about as long as reasoning after a bulk load. From `main` to v2,
-   `owl2-ql` and `owl-horst` are derived again, and `rdfs`, `owl2-rl` and repositories with their
-   own rules are kept.
+   where they did, which takes about as long as reasoning after a bulk load. From `main`, every
+   repository with reasoning on is derived again: the version of the rules' semantics is part of
+   every fingerprint, and it changed.
 3. Check `/readyz`, read `revision` and `quad_count` from `GET /api/v1/repositories/{id}/info`,
    and compare a few known queries with the old server's answers.
 
