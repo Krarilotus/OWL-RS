@@ -122,6 +122,8 @@ date: Sun, 15 Nov 2026 22:20:42 GMT
   {"x":{"type":"uri","value":"http://example.org/rex"}}]}}
 ```
 
+The body comes as one line; it is broken here to fit the page.
+
 Tom is an animal by a rule: the update's commit also stored `ex:tom a ex:Animal`. Rex is one
 only by cases, as a pet is a cat or a dog and either is an animal. No rule draws that, but the
 OWL 2 DL engines prove from the ontology that every pet is an animal, so Rex is in the answer,
