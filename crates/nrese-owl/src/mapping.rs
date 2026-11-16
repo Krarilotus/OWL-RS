@@ -373,7 +373,7 @@ fn data_terms(o: &Ontology, terms: &dyn Terms) -> DataTerms {
 struct Reader<'a> {
     v: Vocabulary,
     /// [`DECLARATION_KINDS`] by the source's ids.
-    declaration_kinds: [(Option<Term>, EntityKind); 8],
+    declaration_kinds: [(Option<Term>, EntityKind); 9],
     /// [`BUILTIN_ANNOTATIONS`] and `owl:versionIRI` by the source's ids, looked up once per
     /// read: [`Self::is_builtin_annotation`] meets them on every assertion.
     builtin_annotations: ([Option<Term>; 9], Option<Term>),
@@ -406,10 +406,11 @@ struct Reader<'a> {
 }
 
 /// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
-/// OWL 1 synonyms the mapping reads as them (`rdfs:Class`, `owl:DataRange`). [`read`]
+/// OWL 1 synonyms the mapping reads as them (`rdfs:Class`, `owl:DataRange`, and
+/// `owl:OntologyProperty` by Table 6 of §3.1.2). [`read`]
 /// declares by this table, and a reader of RDF elsewhere that tells what a name is from its
 /// declarations reads by it too, so that both read a declaration as the same kind.
-pub const DECLARATION_KINDS: [(&str, EntityKind); 8] = [
+pub const DECLARATION_KINDS: [(&str, EntityKind); 9] = [
     (Vocabulary::iri("owl_class"), EntityKind::Class),
     (Vocabulary::iri("rdfs_class"), EntityKind::Class),
     (
@@ -422,6 +423,10 @@ pub const DECLARATION_KINDS: [(&str, EntityKind); 8] = [
     ),
     (
         Vocabulary::iri("owl_annotation_property"),
+        EntityKind::AnnotationProperty,
+    ),
+    (
+        Vocabulary::iri("owl_ontology_property"),
         EntityKind::AnnotationProperty,
     ),
     (Vocabulary::iri("rdfs_datatype"), EntityKind::Datatype),
@@ -1460,7 +1465,6 @@ impl<'a> Reader<'a> {
             v.owl_annotation,
             v.owl_deprecated_class,
             v.owl_deprecated_property,
-            v.owl_ontology_property,
             // The typing of properties and list cells in RDF: nothing under the direct
             // semantics (a property is typed by its declaration or its use).
             v.rdf_property,
