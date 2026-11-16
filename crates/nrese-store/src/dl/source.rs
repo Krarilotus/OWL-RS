@@ -19,11 +19,14 @@ pub(crate) fn fresh_iri(i: usize) -> String {
     nrese_dl::internal::individual(i)
 }
 
-/// The OWL vocabulary's IRIs and the fresh individuals of entailment tests.
+/// The OWL vocabulary's IRIs, the built-in annotation properties (so the RL route's kinds
+/// know one before its first use: `bounds::Kinds`) and the fresh individuals of
+/// entailment tests.
 fn vocabulary() -> impl Iterator<Item = String> {
     nrese_owl::Vocabulary::iris()
         .into_iter()
         .map(|(_, iri)| iri)
+        .chain(nrese_owl::BUILTIN_ANNOTATIONS.map(str::to_owned))
         .chain((0..FRESH).map(fresh_iri))
 }
 

@@ -12,7 +12,7 @@
 //! `COUNT(*)` over a single pattern reads the count from the index.
 
 mod aggregate;
-mod cache_key;
+pub(crate) mod cache_key;
 mod cached;
 pub(crate) use cached::output_key;
 mod calendar;
@@ -54,6 +54,8 @@ mod budget_tests;
 mod graph_tests;
 #[cfg(test)]
 mod handover_tests;
+#[cfg(test)]
+mod id_set_tests;
 #[cfg(test)]
 mod join_order_tests;
 #[cfg(test)]
@@ -909,7 +911,15 @@ thread_local! {
     /// false makes it none (a build that failed or wasn't kept). A test's way to cancel a
     /// query while it asks.
     static STATISTICS_ASKED: RefCell<Option<Box<dyn Fn() -> bool>>> = const { RefCell::new(None) };
+    /// Run with each `n` a distinct estimate asks its visitor for ([`Context::distinct`]),
+    /// before the answer (`0`: whether the query has stopped). A test's way to cancel a
+    /// query while it estimates, and to see what is asked after.
+    static DISTINCT_ASKED: RefCell<Option<DistinctAsked>> = const { RefCell::new(None) };
 }
+
+/// What [`DISTINCT_ASKED`] runs.
+#[cfg(test)]
+type DistinctAsked = Box<dyn Fn(u64)>;
 
 /// One more pattern counted by [`Context::bgp`] ([`BGP_ESTIMATES`]).
 #[cfg(test)]
@@ -4366,7 +4376,13 @@ impl<'a> Context<'a> {
                 if let Some(&kept) = self.distinct_counts.borrow().get(&key) {
                     return kept;
                 }
-                let going = |_| {
+                let going = |#[cfg_attr(not(test), expect(unused_variables))] units: u64| {
+                    #[cfg(test)]
+                    DISTINCT_ASKED.with_borrow(|asked| {
+                        if let Some(asked) = asked {
+                            asked(units);
+                        }
+                    });
                     !self
                         .cancellation
                         .as_ref()
@@ -7431,11 +7447,14 @@ fn placed_in(expr: &Expression, patterns: &[TriplePattern]) -> bool {
     })
 }
 
-/// Sorted, disjoint id ranges for membership tests: single ids of one kind in a bitmap over
-/// their payloads, the few wider ranges (whole kinds) in a list.
+/// Sorted, disjoint id ranges for membership tests: ranges of at most 64 ids of one kind in
+/// a bitmap over their payloads, the wider ones in a sorted list searched by their ends.
+/// A string test's passing terms can merge into thousands of wide runs (3,114 of 737,454
+/// ranges for a broad prefix over input-order ids), so the list is never walked.
 struct IdSet {
     /// Per kind tag: a bitmap over payloads, if the kind has single ids.
     bits: Vec<Vec<u64>>,
+    /// Inclusive raw ranges, increasing and apart.
     wide: Vec<(u64, u64)>,
 }
 
@@ -7459,6 +7478,10 @@ impl IdSet {
                 bits[word] |= 1 << (payload % 64);
             }
         }
+        debug_assert!(
+            set.wide.windows(2).all(|w| w[0].1 < w[1].0),
+            "sorted, disjoint"
+        );
         set
     }
 
@@ -7469,7 +7492,9 @@ impl IdSet {
         let in_bits = self.bits[term.kind() as usize]
             .get((payload / 64) as usize)
             .is_some_and(|word| word & (1 << (payload % 64)) != 0);
-        in_bits || self.wide.iter().any(|&(low, high)| low <= id && id <= high)
+        // The first wide range not ending below `id` is the only one that can hold it.
+        let at = self.wide.partition_point(|&(_, high)| high < id);
+        in_bits || self.wide.get(at).is_some_and(|&(low, _)| low <= id)
     }
 }
 

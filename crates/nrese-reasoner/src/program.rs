@@ -95,19 +95,33 @@ impl UserRules {
 pub struct RuleProgram {
     base: Option<Ruleset>,
     user: Option<Arc<UserRules>>,
+    /// Keys bind named individuals only, as under the Direct Semantics (`owl2-dl`).
+    pub(crate) named_keys: bool,
 }
 
 impl RuleProgram {
     /// The program of `base` and `user`; `None` if there are neither.
     pub fn new(base: Option<Ruleset>, user: Option<Arc<UserRules>>) -> Option<Self> {
-        (base.is_some() || user.is_some()).then_some(Self { base, user })
+        (base.is_some() || user.is_some()).then_some(Self {
+            base,
+            user,
+            named_keys: false,
+        })
     }
 
     pub fn builtin(ruleset: Ruleset) -> Self {
         Self {
             base: Some(ruleset),
             user: None,
+            named_keys: false,
         }
+    }
+
+    /// This program with keys that bind named individuals only, if `named`: another
+    /// closure, so another fingerprint.
+    pub fn with_named_keys(mut self, named: bool) -> Self {
+        self.named_keys = named;
+        self
     }
 
     pub fn base(&self) -> Option<Ruleset> {
@@ -130,9 +144,15 @@ impl RuleProgram {
 
     /// Identifies what the program derives: the built-in ruleset's fingerprint, and
     /// FNV-1a over [`SEMANTICS_VERSION`], the user rules' text, the relations their
-    /// contexts compile to and the versions of the semantic parts they use. Stable across
-    /// builds and platforms.
+    /// contexts compile to and the versions of the semantic parts they use, and whether
+    /// keys bind named individuals only. Stable across builds and platforms.
     pub fn fingerprint(&self) -> u64 {
+        const NAMED_KEYS: u64 = 0x4e4d_ed4b_e75b_0001;
+        self.rules_fingerprint() ^ if self.named_keys { NAMED_KEYS } else { 0 }
+    }
+
+    /// [`Self::fingerprint`] of the rules alone.
+    fn rules_fingerprint(&self) -> u64 {
         let Some(user) = &self.user else {
             return self.base.map_or(0, Ruleset::fingerprint);
         };

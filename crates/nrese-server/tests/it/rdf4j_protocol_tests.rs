@@ -1085,3 +1085,80 @@ async fn transaction_deletes_of_a_default_graph_alias_stay_in_the_default_graph(
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// Every media type RDF4J's own format registry lists for a format we read (RDF4J 6.1.0,
+/// `core/rio/api/src/main/java/org/eclipse/rdf4j/rio/RDFFormat.java`), as an RDF4J client sends
+/// it to `/statements`: each is stored, or refused (415) where taking it could guess a payload
+/// wrong: `application/xml` and `text/xml` (TriX and SPARQL results are XML too), `text/plain`
+/// (any text), `text/n3` and `text/rdf+n3` (the HTTP endpoints have no N3 format, in or out;
+/// only the bulk loader reads N3 files). What is stored is the statement sent, in the graph
+/// the payload names (the default graph for triple formats), and nothing else.
+#[tokio::test]
+async fn statements_take_rdf4j_media_types_or_refuse_the_ambiguous() {
+    const G: &str = "<http://example.com/g>";
+    const DEFAULT: &str = "null";
+    const NT: &str = "<http://example.com/s> <http://example.com/p> \"o\" .\n";
+    const NQ: &str =
+        "<http://example.com/s> <http://example.com/p> \"o\" <http://example.com/g> .\n";
+    const TRIG: &str =
+        "<http://example.com/g> { <http://example.com/s> <http://example.com/p> \"o\" . }\n";
+    const XML: &str = "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" \
+                       xmlns:ex=\"http://example.com/\"><rdf:Description rdf:about=\"http://example.com/s\">\
+                       <ex:p>o</ex:p></rdf:Description></rdf:RDF>";
+    const JSONLD: &str = "{\"@id\": \"http://example.com/s\", \"http://example.com/p\": \"o\"}";
+    // The graph the statement is stored in; `None`: refused.
+    let cases: &[(&str, &str, Option<&str>)] = &[
+        ("application/n-quads", NQ, Some(G)),
+        ("text/x-nquads", NQ, Some(G)),
+        ("text/nquads", NQ, Some(G)),
+        ("application/trig", TRIG, Some(G)),
+        ("application/x-trig", TRIG, Some(G)),
+        ("text/turtle", NT, Some(DEFAULT)),
+        ("application/x-turtle", NT, Some(DEFAULT)),
+        ("application/n-triples", NT, Some(DEFAULT)),
+        ("application/rdf+xml", XML, Some(DEFAULT)),
+        ("application/ld+json", JSONLD, Some(DEFAULT)),
+        ("application/xml", XML, None),
+        ("text/xml", XML, None),
+        ("text/plain", NT, None),
+        ("text/n3", NT, None),
+        ("text/rdf+n3", NT, None),
+    ];
+    let mut failures = Vec::new();
+    for &(media_type, body, graph) in cases {
+        let app = test_app().unwrap();
+        let uri = format!("{REPO}/statements");
+        let (status, text) = send(&app, Method::POST, &uri, Some(media_type), None, body).await;
+        // The statement sent, read back by pattern from the graph it belongs in.
+        let pattern = encode(&[
+            ("subj", "<http://example.com/s>"),
+            ("pred", "<http://example.com/p>"),
+            ("obj", "\"o\""),
+            ("context", graph.unwrap_or(DEFAULT)),
+        ]);
+        let uri = format!("{REPO}/statements?{pattern}");
+        let accept = Some("application/n-quads");
+        let (_, found) = send(&app, Method::GET, &uri, None, accept, "").await;
+        let got = (
+            status,
+            size(&app, None).await,
+            found.lines().filter(|line| !line.trim().is_empty()).count(),
+            size(&app, Some(DEFAULT)).await,
+        );
+        let want = match graph {
+            Some(G) => (StatusCode::NO_CONTENT, 1, 1, 0),
+            Some(_) => (StatusCode::NO_CONTENT, 1, 1, 1),
+            None => (StatusCode::UNSUPPORTED_MEDIA_TYPE, 0, 0, 0),
+        };
+        if got != want {
+            failures.push(format!(
+                "{media_type}: {} {:?} (status, stored, the statement in {}, in the default graph), \
+                 expected {want:?} ({text})",
+                got.0,
+                (got.1, got.2, got.3),
+                graph.unwrap_or(DEFAULT)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

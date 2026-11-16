@@ -11,6 +11,8 @@
 //! grammar (EL's on property chains and ranges, QL's and RL's on anonymous individuals in
 //! assertions); an axiom outside every profile is still OWL 2 DL.
 
+use std::collections::HashSet;
+
 use crate::model::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, RangeId};
 use crate::{Ontology, Term};
 
@@ -767,6 +769,80 @@ pub fn concludes_equality(
         // Any other conclusion on an equating property (a chain into a functional one).
         _ => properties(o, axiom).iter().any(|t| equating.contains(t)),
     }
+}
+
+/// The TBox signature as the reader typed it, the individuals left out: the reader types
+/// terms by use, assertions included, so an assertion whose terms already have these kinds
+/// changes nothing it reads.
+#[derive(Debug, Clone, Default)]
+pub struct Signature {
+    /// Every class and property name.
+    pub names: TermSet,
+    pub classes: TermSet,
+    /// The properties declared, or asserted, as object, as data, as annotation properties.
+    pub objects: TermSet,
+    pub data: TermSet,
+    pub annotations: TermSet,
+    /// The data properties declared so: the others are data properties only while they
+    /// have a literal (`mapping.rs`, `is_data_property`).
+    pub declared_data: TermSet,
+}
+
+/// A set of term ids, hashed fast (ids aren't chosen by an adversary).
+pub type TermSet = HashSet<Term, foldhash::fast::RandomState>;
+
+/// [`Signature`] of `o`. O(axioms + class expressions); an assertion of a property or a
+/// named class costs a lookup or two, no walk.
+pub fn signature(o: &Ontology) -> Signature {
+    use crate::model::EntityKind::{AnnotationProperty, Class, DataProperty, ObjectProperty};
+    let mut s = Signature::default();
+    for e in 0..o.classes.len() as u32 {
+        if let ClassExpr::Class(c) = o.classes.get(e) {
+            s.classes.insert(*c);
+        }
+    }
+    for axiom in &o.axioms {
+        let _ = match axiom {
+            Axiom::Declaration(Class, t) => s.classes.insert(*t),
+            Axiom::Declaration(ObjectProperty, t) | Axiom::ObjectPropertyAssertion(t, ..) => {
+                s.objects.insert(*t)
+            }
+            Axiom::Declaration(DataProperty, t) => {
+                s.declared_data.insert(*t);
+                s.data.insert(*t)
+            }
+            Axiom::DataPropertyAssertion(t, ..) => s.data.insert(*t),
+            Axiom::Declaration(AnnotationProperty, t) => s.annotations.insert(*t),
+            Axiom::ClassAssertion(c, _) if matches!(o.class(*c), ClassExpr::Class(_)) => false,
+            _ => {
+                s.names.extend(properties(o, axiom));
+                false
+            }
+        };
+    }
+    // A property declared and never used is a name too.
+    let declared = [&s.classes, &s.annotations, &s.objects, &s.data];
+    s.names.extend(declared.into_iter().flatten());
+    s
+}
+
+/// The names `o` puns (OWL 2 Structural Specification §5.9): each read both as a named
+/// individual and as a class or a property ([`Signature::names`]). Theorem PR1 (OWL 2
+/// Profiles §4.3) needs none, and an equality the RL rules carry to such a name (eq-rep-p,
+/// eq-rep-o) equates the class or property, which the Direct Semantics doesn't. Sorted.
+pub fn punned(o: &Ontology) -> Vec<Term> {
+    let names = signature(o).names;
+    let mut punned = o.named_individuals();
+    punned.retain(|t| names.contains(t));
+    punned
+}
+
+/// Whether the OWL 2 RL rules may read `o` otherwise than OWL 2 DL does: `o` has
+/// annotation-property axioms ([`Ontology::annotation_schema`]) or puns ([`punned`]), which
+/// theorem PR1 (OWL 2 Profiles §4.3) excludes. The one detection the route, the answers'
+/// status and the consistency verdicts take.
+pub fn rules_read_differently(o: &Ontology) -> bool {
+    !o.annotation_schema.is_empty() || !punned(o).is_empty()
 }
 
 /// The profiles every axiom of `o` is in.

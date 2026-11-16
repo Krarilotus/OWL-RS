@@ -13,7 +13,7 @@ mod witness;
 #[cfg(test)]
 mod tests;
 
-pub use hazards::Hazard;
+pub use hazards::{Hazard, reads_data_values};
 pub use rewrite::{Branch, Budget, Limits, Outcome, Part, Probe, Rewriting, rewrite, rewrite_with};
 pub use tbox::{Basic, Closure, Role, Tbox};
 
