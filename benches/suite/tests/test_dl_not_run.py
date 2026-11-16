@@ -209,6 +209,100 @@ class ElTrack(unittest.TestCase):
         self.assertEqual((first, second), (2, 0))
 
 
+def link(target, name):
+    """A symbolic link, or the test skipped where this host can't make one (Windows without the right)."""
+    try:
+        os.symlink(target, name, target_is_directory=Path(target).is_dir())
+    except OSError as error:
+        raise unittest.SkipTest(f"no symbolic link here: {error}")
+
+
+class RunsSomething(unittest.TestCase):
+    """D16-642 (the master, 15 Nov 2026): the kit refuses an ontology folder its conversion container
+    cannot see, and a driver whose task list runs nothing fails. Twice a row was lost this way: ore80-nrese
+    r2 (14 Nov) and fc-dlnrese-4e0ff30f-1115b (15 Nov) linked CASES/files to the host's folder, and every
+    EL conversion found no input."""
+    cases, classify, run_el = ElTrack.cases, ElTrack.classify, ElTrack.run_el
+
+    def with_files(self, tmp, linked):
+        """The EL cases, their two ontologies in a folder outside CASES; CASES/files is a link to that
+        folder (`folder`), a real folder holding a link to one file (`file`), or a real folder of hard
+        links (`hard`: files of their own, as ore80-nrese-86cf08a7-r1 made them)."""
+        cases, outside = Path(tmp) / "cases", Path(tmp) / "shared"
+        cases.mkdir()
+        outside.mkdir()
+        for task in (EL1, EL2):
+            (outside / f"{task.split('-el-')[0]}.owl").write_text("Ontology()\n", encoding="utf-8")
+        if linked == "folder":
+            link(outside, cases / "files")
+        else:
+            (cases / "files").mkdir()
+            for i, task in enumerate((EL1, EL2)):
+                name = f"{task.split('-el-')[0]}.owl"
+                if linked == "file" and i == 0:
+                    link(outside / name, cases / "files" / name)
+                else:
+                    os.link(outside / name, cases / "files" / name)
+        return self.cases(cases)
+
+    def test_a_linked_ontology_folder_or_file_is_refused_before_any_conversion(self):
+        # Spec: D16-642: the conversion's container mounts CASES alone (nrese.ntriples: -v CASES:/work), so a
+        # link names a path it does not have. Refused: no container started, no row written, exit 2.
+        for linked in ("folder", "file"):
+            with self.subTest(linked), tempfile.TemporaryDirectory() as tmp:
+                status, rows, commands = self.run_el(self.with_files(tmp, linked), converting)
+                self.assertEqual([c for c in commands if "batch" in c], [])
+                self.assertEqual(status, 2)
+                self.assertEqual(ours(rows, "nrese-el"), {})
+
+    def test_hard_linked_files_are_converted_and_classified(self):
+        # Spec: D16-642: copies and hard links are files of their own, which the container sees.
+        with tempfile.TemporaryDirectory() as tmp:
+            status, rows, commands = self.run_el(self.with_files(tmp, "hard"), converting)
+        self.assertEqual(len([c for c in commands if "batch" in c]), 1)
+        self.assertEqual({t: s for t, (s, _) in ours(rows, "nrese-el").items()}, {EL1: "classified", EL2: "classified"})
+        self.assertEqual(status, 0)
+
+    def test_a_driver_whose_task_list_is_empty_fails(self):
+        # Spec: D16-642: a task list that runs nothing is a failure (before: exit 0, a pass). Each driver on
+        # CASES whose results.tsv has no task of its kind (here: one reference row of another kind), and the DL
+        # drivers with an --only that names no task; nothing launched, exit 2.
+        other = "ore_ont_9-dl-consistency\thermit\tconsistency\tconsistent\t9\t\n"
+        classification = "ore_ont_9-dl-classification\thermit\tclassify\tclassified\t9\th\n"
+        drivers = (("el", nrese.el, other, SimpleNamespace(binary="classify", threads=1, timeout=60)),
+                   ("dl", nrese.dl, other, SimpleNamespace(binary="dl_classify", only=None, threads=1, timeout=300,
+                                                           again=False, extra=[])),
+                   ("consistency", nrese.consistency, classification,
+                    SimpleNamespace(binary="tableau_consistency", beyond="dl_beyond", only=None, timeout=300,
+                                    again=False)),
+                   ("dl --only", nrese.dl, classification,
+                    SimpleNamespace(binary="dl_classify", only="12345", threads=1, timeout=300, again=False,
+                                    extra=[])))
+        for name, driver, results, args in drivers:
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                (Path(tmp) / "results.tsv").write_text(results, encoding="utf-8")
+                args.cases = tmp
+                launched = []
+                with patch.object(nrese.subprocess, "run", side_effect=lambda c, **_: launched.append(c) or ok()), \
+                        patch.object(ns, "pin_images", return_value={}), \
+                        patch.object(ns, "image_id", return_value=PINNED):
+                    status, _ = drive(driver, args)
+                self.assertEqual(status, 2)
+                self.assertEqual(launched, [])
+
+    def test_a_run_with_every_task_answered_before_passes(self):
+        # Spec: nrese.py's docstring: a later run takes only the tasks without an answer; with none left it
+        # runs nothing and that is no failure (the list is not empty: its tasks are done).
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = self.cases(tmp)
+            with open(cases / "results.tsv", "a", encoding="utf-8") as f:
+                for task in (EL1, EL2):
+                    f.write(f"{task}\tnrese-el\tclassify\tclassified\t5\th\n")
+            status, _, commands = self.run_el(cases, converting)
+        self.assertEqual(status, 0)
+        self.assertEqual(commands, [])
+
+
 class DlTracks(unittest.TestCase):
     def cases(self, tmp, kind, with_source=True, earlier=""):
         cases = Path(tmp)
