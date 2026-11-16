@@ -1754,9 +1754,75 @@ fn a_restricted_read_leaves_a_hidden_keys_mark() {
 /// its `owl:sameAs` facts in `:secret`: the later commit leaves the key out through equality's
 /// `rdf:first` copies, derived through `:secret`. A reader of the default graph only
 /// (inferences by support) reads that revision first; a reader of every graph then reads it
-/// too: `:x :name "Z"` is entailed, so the second read is true or not `complete`.
+/// too: `:x :name "Z"` is entailed, so the second read is true or not `complete`. The control,
+/// a store of its own with the same data read by a reader of every graph alone, is not
+/// `complete`: what differs is the restricted read first.
 #[test]
 fn a_restricted_read_leaves_an_aliased_keys_mark() {
+    let ask = format!("<{EX}x> <{EX}name> \"Z\"");
+    let control = aliased_key_with_hidden_aliases();
+    let answer = (control.store())
+        .execute_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "ASK {{ {ask} }}"
+        )))
+        .expect("answered");
+    println!("control read: {:?}", answer.completeness);
+    assert!(
+        answer.completeness.as_ref().is_some_and(|c| !c.complete),
+        "control: a reader of every graph alone must be told not complete: {:?}",
+        answer.completeness
+    );
+    let pipeline = aliased_key_with_hidden_aliases();
+    restricted_read(pipeline.store(), &ask);
+    left_out_answer(pipeline.store(), &ask);
+}
+
+/// A transaction inserts a key of 128 properties and reads inside it: its pending operations
+/// aren't reasoned over before the commit, and the key is past what one rule holds, so
+/// `:x :name "Y"` (entailed through the key) isn't answered and the read isn't `complete`.
+/// The committed revision has nothing left out: only the pending read's own scan finds it.
+#[test]
+fn a_pending_key_left_out_leaves_the_pending_read_not_complete() {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let store = pipeline.store();
+    (pipeline.apply(
+        insert(&format!("<{EX}w> <{EX}name> \"W\" .")),
+        &nrese_store::Requester::all(),
+        &MutationTicket::new(),
+    ))
+    .expect("the data");
+    let ask = format!("ASK {{ <{EX}x> <{EX}name> \"Y\" }}");
+    let prepared =
+        (store.prepare_query(&nrese_store::SparqlQueryRequest::all(ask))).expect("prepared");
+    let key = format!("INSERT DATA {{ {} }}", long_key(128));
+    let ops = vec![nrese_store::StatementOp::Update(SparqlUpdateRequest::new(
+        key,
+    ))];
+    let mut answer = Vec::new();
+    let mut pending = None;
+    store
+        .run_query_pending_reporting(
+            &nrese_store::StatementsRequest::new(ops),
+            &prepared,
+            &nrese_store::CancellationToken::new(),
+            &mut answer,
+            |status| pending = status,
+        )
+        .expect("the pending read");
+    let answer = String::from_utf8(answer).expect("utf8");
+    println!("pending insert read: {answer} with {pending:?}");
+    let left_out = |c: &nrese_sparql::Completeness| {
+        !c.complete && (c.reasons.iter()).any(|r| r.text.contains("list axiom"))
+    };
+    assert!(
+        pending.as_ref().is_some_and(left_out),
+        "not complete for the key left out: {answer} with {pending:?}"
+    );
+}
+
+/// [`a_restricted_read_leaves_an_aliased_keys_mark`]'s store: the aliased key of 7 properties,
+/// its `owl:sameAs` facts in `:secret`, then the later commit that leaves it out.
+fn aliased_key_with_hidden_aliases() -> MutationPipeline {
     let pipeline = ql_pipeline(in_memory_store_config());
     let write = |data: &str| {
         let ticket = MutationTicket::new();
@@ -1778,9 +1844,7 @@ fn a_restricted_read_leaves_an_aliased_keys_mark() {
         later.push_str(&format!(" <{EX}z> <{EX}k{i}> <{EX}v{i}> ."));
     }
     write(&later);
-    let ask = format!("<{EX}x> <{EX}name> \"Z\"");
-    restricted_read(pipeline.store(), &ask);
-    left_out_answer(pipeline.store(), &ask);
+    pipeline
 }
 
 /// `ASK { ask }` by a reader of the default graph only, inferences by support (a view of its
