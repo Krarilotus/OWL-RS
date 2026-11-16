@@ -1556,8 +1556,9 @@ impl StoreService {
         )?;
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
             Some(reading) => reading.pending(&tx, &budget)?,
-            // Operations that touch no list fact leave out the lists their base does (a
-            // reader's own view, above, may drop equality's copies of list cells: it scans).
+            // Operations that touch no input of the list scan (a list fact, `owl:sameAs`)
+            // leave out the lists their base does (a reader's own view, above, may drop
+            // equality's copies of list cells: it scans).
             None => {
                 use crate::reasoning::Program;
                 let view = tx.pending_snapshot_within(&budget)?;
