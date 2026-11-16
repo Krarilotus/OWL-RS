@@ -2070,16 +2070,10 @@ fn a_readers_status_doesnt_follow_what_they_cant_read() {
 /// §5, §7.1), and a variable inside one joins by either. Spec: under each regime that promises
 /// `complete`, run and planned, no answer is `complete` to a query with a triple term (a typed
 /// or plain constant inside it, bound by `VALUES`, or a variable inside it joined outside) or
-/// a base-direction literal, over a store with no triple term; to a reader of everything over
-/// a store that holds one, reached only through a variable; or, under the regimes a
-/// restricted reader is served by, to a restricted reader whatever the store holds.
+/// a base-direction literal, over a store with no triple term; or to a reader of everything
+/// over a store that holds one, reached only through a variable.
 #[test]
 fn no_query_with_a_triple_term_is_complete_under_owl_2() {
-    use std::sync::Arc;
-
-    use nrese_sparql::GraphAccess;
-    use nrese_store::ReadScope;
-
     let plain = ":age a owl:DatatypeProperty . :y :age \"07\"^^xsd:integer . :a :name \"Rex\" .";
     let holds = ":a :says <<( :s :age 7 )>> . :b :says <<( :s :age \"07\"^^xsd:integer )>> .";
     let typed = "<<( :s :age \"07\"^^xsd:integer )>>";
@@ -2125,33 +2119,109 @@ fn no_query_with_a_triple_term_is_complete_under_owl_2() {
             }
         }
     }
-    let scope = ReadScope::Graphs(Arc::new(GraphAccess {
-        default_graph: true,
-        inferred: true,
-        inferred_by_support: true,
-        ..GraphAccess::default()
-    }));
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A reader of `:open` (and of the default graph, or not), with the inferences their graphs
+/// support, under `owl2-ql` and `owl2-rl` with the rewriting on. A triple term in a graph
+/// the reader can't read takes no part in their answers, so it has no say in their status.
+/// Spec: the status is `complete` (run and planned, rows kept) where no graph they read holds
+/// a triple term: none in the store, one only in a hidden named graph, one only in the
+/// default graph when they can't read it; and not `complete` where one they read does: in
+/// `:open`, in the default graph they read, or inferred where they see it (`rdfs:subPropertyOf`
+/// copies the object, so `:claims` holds the triple term).
+#[test]
+fn a_readers_status_follows_the_triple_terms_they_may_read() {
+    use std::sync::Arc;
+
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, SparqlUpdateRequest};
+
+    use crate::support::Writes;
+
+    let fact = "GRAPH :open { :a :p \"Rex\" }";
+    let term = ":b :says <<( :s :age 7 )>>";
+    let read = "SELECT ?x ?n { GRAPH :open { ?x :p ?n } }";
+    let cases = [
+        (true, "no triple term anywhere", fact.to_owned(), read, true),
+        (
+            true,
+            "a triple term only in a graph they can't read",
+            format!("{fact} GRAPH :secret {{ {term} }}"),
+            read,
+            true,
+        ),
+        (
+            false,
+            "a triple term only in the default graph, which they can't read",
+            format!("{fact} {term}"),
+            read,
+            true,
+        ),
+        (
+            true,
+            "a triple term in a graph they read",
+            format!("GRAPH :open {{ :a :p \"Rex\" . {term} }}"),
+            read,
+            false,
+        ),
+        (
+            true,
+            "a triple term in the default graph they read",
+            format!("{fact} {term}"),
+            read,
+            false,
+        ),
+        (
+            false,
+            "an inferred triple term they see",
+            format!("GRAPH :open {{ :says rdfs:subPropertyOf :claims . {term} }}"),
+            "SELECT ?x ?t { ?x :claims ?t }",
+            false,
+        ),
+    ];
+    let mut wrong = Vec::new();
     for (regime, ruleset, ql) in [
         ("owl2-ql", Ruleset::Owl2Ql, QlRewritingMode::Auto),
         ("owl2-rl rewriting on", Ruleset::Owl2Rl, QlRewritingMode::On),
     ] {
-        let store = closure(plain, ruleset, ql);
-        let request = SparqlQueryRequest::new(
-            format!("{PREFIXES}SELECT ?x ?n {{ ?x :name ?n }}"),
-            scope.clone(),
-        );
-        let result = store.execute_query(&request).expect("answered");
-        let prepared = store.prepare_query(&request).expect("prepared");
-        let planned = store
-            .plan_query(&prepared, &CancellationToken::new())
-            .expect("planned");
-        let status =
-            [result.completeness, planned.completeness].map(|c| c.map_or("none", |c| c.as_str()));
-        let rows = String::from_utf8(result.payload).unwrap();
-        let case = "a restricted reader over a store with no triple term";
-        eprintln!("{regime}, {case}: {rows} {status:?}");
-        if status.contains(&"complete") {
-            wrong.push(format!("{regime}, {case}: {rows} {status:?}"));
+        for (default_graph, case, data, read, complete) in &cases {
+            let store = StoreService::new(StoreConfig {
+                ql_rewriting: ql,
+                ..StoreConfig::in_memory()
+            })
+            .unwrap();
+            let update = format!("{PREFIXES}INSERT DATA {{ :p a owl:DatatypeProperty . {data} }}");
+            store
+                .execute_update(&SparqlUpdateRequest::new(update))
+                .unwrap();
+            store.rematerialise(ruleset).unwrap();
+            store.use_reasoning_rules(Some(ruleset.into()));
+            let scope = ReadScope::Graphs(Arc::new(GraphAccess {
+                graphs: vec!["http://example.com/open".to_owned()],
+                default_graph: *default_graph,
+                inferred: true,
+                inferred_by_support: true,
+                ..GraphAccess::default()
+            }));
+            let request = SparqlQueryRequest::new(format!("{PREFIXES}{read}"), scope);
+            let result = store.execute_query(&request).expect("answered");
+            let prepared = store.prepare_query(&request).expect("prepared");
+            let planned = store
+                .plan_query(&prepared, &CancellationToken::new())
+                .expect("planned");
+            let status = [result.completeness, planned.completeness]
+                .map(|c| c.map_or("none", |c| c.as_str()));
+            let rows = String::from_utf8(result.payload).unwrap();
+            eprintln!("{regime}, {case}: {rows} {status:?}");
+            let kept = rows.contains("example.com/a\"") || rows.contains("example.com/b\"");
+            let right = match complete {
+                true => status == ["complete"; 2],
+                false => !status.contains(&"complete"),
+            };
+            if !kept || !right {
+                wrong.push(format!("{regime}, {case}: {rows} {status:?}"));
+            }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
