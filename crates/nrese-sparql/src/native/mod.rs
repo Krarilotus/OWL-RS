@@ -7433,8 +7433,8 @@ fn placed_in(expr: &Expression, patterns: &[TriplePattern]) -> bool {
     })
 }
 
-/// Sorted, disjoint id ranges for membership tests: ranges of fewer than 64 ids of one kind
-/// in a bitmap over their payloads, the wider ones in a sorted list searched by their ends.
+/// Sorted, disjoint id ranges for membership tests: ranges of at most 64 ids of one kind in
+/// a bitmap over their payloads, the wider ones in a sorted list searched by their ends.
 /// A string test's passing terms can merge into thousands of wide runs (3,114 of 737,454
 /// ranges for a broad prefix over input-order ids), so the list is never walked.
 struct IdSet {
