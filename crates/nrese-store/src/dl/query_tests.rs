@@ -560,7 +560,8 @@ fn a_read_of_the_inferred_statements_alone_keeps_the_mark_of_its_revision() {
 }
 
 /// R1-F5: the ontology read the status needs, refused at its budget (nothing cached for the
-/// revision and the bounds' memory spent, between the decision and the status): whether
+/// revision, neither its ontology nor its mark, and the bounds' memory spent, between the
+/// decision and the status): whether
 /// OWL 2 DL reads the data otherwise than the rules isn't known, so the answers are
 /// `unsound` with that reason, and an exact read is refused. The control: the same exact
 /// read with the memory free is answered. The store holds a term equal to another, so the
@@ -595,6 +596,8 @@ fn an_ontology_read_refused_at_its_budget_leaves_the_answers_unsound() {
     );
     crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || {
         drop(cache.dl().query_ontology.0.lock().unwrap().take());
+        // Nor the mark the control's read kept for the revision.
+        drop(cache.dl().query_ontology.1.lock().unwrap().take());
         let rest = budget.remaining();
         budget.charge(rest).unwrap();
         held.set(rest);
