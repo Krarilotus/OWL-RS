@@ -808,7 +808,8 @@ impl Draw {
 }
 
 /// What the store's indexes decide of the mark is what the whole ontology decides. Random
-/// stores under `owl2-dl`, with and without compact equality: declarations, schema
+/// stores under `owl2-dl`, with and without compact equality: declarations (OWL 1's
+/// `owl:OntologyProperty` among them), schema
 /// statements and blank-node class expressions (whole or broken) on names, on blank nodes and
 /// on the nine built-in annotation properties, as subjects and as super-properties; property
 /// assertions with names and
@@ -849,6 +850,7 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         "ObjectProperty",
         "DatatypeProperty",
         "AnnotationProperty",
+        "OntologyProperty",
         "NamedIndividual",
         "Restriction",
         "FunctionalProperty",

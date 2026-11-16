@@ -2756,6 +2756,29 @@ mod tests {
         assert_eq!(result, expected);
     }
 
+    /// OWL 1's `owl:OntologyProperty` typing declares an annotation property (the RDF
+    /// mapping, §3.1.2 Table 6, replaces it with `owl:AnnotationProperty`): its domain, range
+    /// and sub-properties name no class and leave nothing out, as a declared one's.
+    #[test]
+    fn an_ontology_propertys_axioms_name_no_class() {
+        let (mut v, result) = run("ex:A rdf:type owl:Class
+             ex:T rdf:type owl:Class
+             owl:Thing rdfs:subClassOf ex:T
+             ex:note rdf:type owl:OntologyProperty
+             ex:note rdfs:domain ex:X
+             ex:source rdf:type owl:OntologyProperty
+             ex:source rdfs:range ex:Y
+             ex:remark rdf:type owl:OntologyProperty
+             ex:remark rdfs:subPropertyOf ex:note");
+        let [a, t] = ["A", "T"].map(|name| v.iri(&format!("{EX}{name}")));
+        let expected = Classification {
+            subsumptions: vec![(a, t)],
+            top: vec![t],
+            ..Classification::default()
+        };
+        assert_eq!(result, expected);
+    }
+
     /// A name declared `owl:DataRange` is a datatype, as one declared `rdfs:Datatype` is (the
     /// RDF mapping reads OWL 1's `owl:DataRange` as `rdfs:Datatype`): an equivalence between
     /// two of them is no class axiom, and is left out as a data range.
