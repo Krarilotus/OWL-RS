@@ -187,8 +187,8 @@ impl<R: Read> Input<'_, R> {
 
     /// The text position of `start`, its column in bytes. Exact while the bytes between the
     /// position it was taken at and it are buffered (always for slices); after a reader's
-    /// buffer moved past them, its line is the one of that position (only blank lines and
-    /// comments lie between).
+    /// buffer moved past them, its line is the one of that position. A statement's start is
+    /// taken at its first token (`TurtleParser::statement_start`), so nothing lies between.
     fn resolve(&self, start: Start) -> TextPosition {
         let Some(from) = start.from.checked_sub(self.base) else {
             return TextPosition {
@@ -530,10 +530,15 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     /// on past it.)
     fn statement_start(&mut self) -> Step<Start> {
         let at = match self.fill() {
-            Ok(()) => self
-                .lookahead
-                .as_ref()
-                .map_or(self.input.position, |token| token.start),
+            // What is before its first token is consumed now, so its line is counted while it
+            // is buffered: a refill inside the statement drops it.
+            Ok(()) => {
+                let token = self.lookahead.as_mut().expect("`fill` sets the lookahead");
+                let gap = token.start - self.input.position;
+                token.consumed -= gap;
+                self.input.consume(gap);
+                token.start
+            }
             Err(error @ RdfParseError::Io(_)) => return Err(error),
             Err(_) => self.input.position,
         };
