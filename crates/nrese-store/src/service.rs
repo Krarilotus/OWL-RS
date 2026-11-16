@@ -106,6 +106,14 @@ pub(crate) struct Certificate {
     pub(crate) user_rules: bool,
 }
 
+/// What a read inside a transaction lacks ([`StoreService::assess`]), under `owl2-dl` with
+/// [`CLOSURE`]; and where its operations may delete, [`DELETES`].
+const PENDING: &str = "a read inside a transaction: its pending operations aren't reasoned over \
+                       before the commit";
+const CLOSURE: &str = " (the committed closure, no DL bounds)";
+const DELETES: &str = "the pending operations may delete statements whose inferences remain \
+                       until the commit";
+
 /// A certificate's QL rewriting, if it has one.
 type Ql = Option<std::sync::Arc<nrese_sparql::ql::QlRewriting>>;
 
@@ -1246,10 +1254,55 @@ impl StoreService {
         ql: Option<&nrese_sparql::ql::QlReport>,
         at: Revision<'_>,
     ) -> Option<nrese_sparql::Completeness> {
-        match ql {
+        let route = match ql {
             Some(ql) => Some(ql.completeness.clone()),
             None => self.status_without_dl_at(prepared, at),
+        };
+        self.assess(prepared, at, route)
+    }
+
+    /// The one composition of a read's status (T3), on the snapshot `at` it read, after the
+    /// status of its `route` (the closure's, the QL report's or the bounds'), each step only
+    /// taking away. A read of a version no one vouched for, or of an unpublished one passed
+    /// as committed, is `not-certified`: `None` only where no reasoner is registered and the
+    /// inferred stack is empty. Pending operations aren't reasoned over before the commit,
+    /// and may delete what their inferences rest on. Under `owl2-dl` the question-only
+    /// individuals ([`crate::dl::query::mark`]); then the negation rule again, over all that
+    /// was taken away.
+    pub(crate) fn assess(
+        &self,
+        prepared: &PreparedQuery,
+        at: Revision<'_>,
+        route: Option<nrese_sparql::Completeness>,
+    ) -> Option<nrese_sparql::Completeness> {
+        if prepared.read_model() == ReadModel::Asserted {
+            return None;
         }
+        let snapshot = at.snapshot();
+        let unpublished = matches!(at, Revision::Committed(_)) && snapshot.shared_state().is_none();
+        let Some(certificate) = Certificate::of(snapshot).filter(|_| !unpublished) else {
+            let bare = snapshot.len_in(ReadModel::Inferred) == 0 && !self.supports.has_rules();
+            return (!bare).then(nrese_sparql::Completeness::not_certified);
+        };
+        let mut status = route?;
+        let source = if certificate.dl { "dl" } else { "transaction" };
+        if let Revision::Pending(_, deletes) = at {
+            let closure = if certificate.dl { CLOSURE } else { "" };
+            status.incomplete(source, format!("{PENDING}{closure}"));
+            if deletes {
+                status.unsound("transaction", DELETES.to_owned());
+            }
+        }
+        if certificate.dl {
+            crate::dl::query::mark(self, prepared, at, &mut status);
+        }
+        let (reads, decided) = (prepared.reads(), matches!(at, Revision::Decided(_)));
+        if matches!(at, Revision::Pending(..)) {
+            crate::dl::query::negation_rule(&mut status, reads, source);
+        } else if certificate.dl {
+            crate::dl::query::certify(&mut status, reads, "dl", decided);
+        }
+        Some(status)
     }
 
     /// The status of answers that don't go through the DL bounds; known before the query
@@ -1266,7 +1319,7 @@ impl StoreService {
         prepared: &PreparedQuery,
     ) -> Option<nrese_sparql::Completeness> {
         let status =
-            self.status_without_dl_at(prepared, Revision::Committed(&self.engine.snapshot()));
+            self.status_outside_dl(prepared, None, Revision::Committed(&self.engine.snapshot()));
         status_for_its_reader(prepared, status, false)
     }
 
@@ -1279,19 +1332,23 @@ impl StoreService {
         if prepared.read_model() == ReadModel::Asserted {
             return None;
         }
-        if Certificate::route(at.snapshot(), &self.dl).0 {
+        let certificate = Certificate::of(at.snapshot())?;
+        if certificate.dl {
+            // A read of every statement here is one inside a transaction: what it lacks is
+            // the pending operations' reasoning (`Self::assess`).
             let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
-            status.incomplete(
-                "dl",
-                "a read of the inferred statements alone: the rules' closure, without the DL \
-                 bounds; certain answers under OWL 2 DL may be missing"
-                    .to_owned(),
-            );
+            if prepared.read_model() != ReadModel::Materialised {
+                status.incomplete(
+                    "dl",
+                    "a read of the inferred statements alone: the rules' closure, without the DL \
+                     bounds; certain answers under OWL 2 DL may be missing"
+                        .to_owned(),
+                );
+            }
             crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
-            crate::dl::query::mark(self, prepared, at, &mut status);
             return Some(status);
         }
-        let ruleset = Certificate::of(at.snapshot())?.state.ruleset.clone();
+        let ruleset = certificate.state.ruleset.clone();
         let mut status =
             nrese_sparql::Completeness::under(nrese_sparql::Regime::of_ruleset(&ruleset));
         status.incomplete(
@@ -1641,37 +1698,11 @@ impl StoreService {
             .iter()
             .any(|op| !matches!(op, crate::StatementOp::Add { .. }));
         let memory = self.settings.query_envelope(prepared);
-        // The status the answers carry, of the pending state `at` they are read from.
-        let status_of = |ql: Option<&nrese_sparql::ql::QlReport>, at: Revision<'_>| {
-            let mut status = match self.dl_mode(prepared, at.snapshot()).is_some() {
-                true => {
-                    let mut status =
-                        nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
-                    status.incomplete(
-                        "dl",
-                        "a read inside a transaction: its pending operations aren't reasoned \
-                         over before the commit (the committed closure, no DL bounds)"
-                            .to_owned(),
-                    );
-                    crate::dl::query::certify_closure(&mut status, prepared.reads(), "dl");
-                    crate::dl::query::mark(self, prepared, at, &mut status);
-                    Some(status)
-                }
-                false => self.status_outside_dl(prepared, ql, at),
-            };
-            if deletes && let Some(status) = &mut status {
-                status.unsound(
-                    "transaction",
-                    "the pending operations may delete statements whose inferences remain \
-                     until the commit"
-                        .to_owned(),
-                );
-            }
-            status
-        };
         let run = self.with_pending(pending, &scope, &memory, cancellation, |snapshot| {
+            // The status the answers carry, of the pending state `at` they are read from.
             // Under `owl2-dl` the QL rewriting doesn't run: the status needs no report.
-            let status = || status_of(None, Revision::Pending(snapshot));
+            let at = Revision::Pending(snapshot, deletes);
+            let status = || self.status_outside_dl(prepared, None, at);
             self.refuse_exact(prepared, snapshot, status)?;
             run_query(
                 snapshot,
@@ -1682,7 +1713,7 @@ impl StoreService {
                 out,
                 |ql| {
                     // A transaction's pending state: never answered from the cache.
-                    let status = status_of(ql, Revision::Pending(snapshot));
+                    let status = self.status_outside_dl(prepared, ql, at);
                     report(status_for_its_reader(prepared, status, ql.is_some()));
                     Vec::new()
                 },
