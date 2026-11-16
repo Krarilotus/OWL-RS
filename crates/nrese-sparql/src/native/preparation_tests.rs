@@ -37,7 +37,7 @@ fn preparation_uses_the_executors_equality_view_at_the_probe_row_limit() {
         object: alias.object,
     });
     tx.commit().unwrap();
-    engine.set_equality(Some(same_as));
+    engine.transaction().install_reading(Some(same_as));
     let snapshot = engine.snapshot();
     let query = Query::parse("SELECT ?x WHERE { ?x <http://e/p> ?y } ORDER BY ?x", None).unwrap();
     for canonical in [false, true] {

@@ -63,6 +63,9 @@ pub struct Transaction<'e> {
     after: OnceLock<super::AssertedIdentity>,
     /// The commit's note in a journal of the caller's ([`Self::note_commit`]).
     note: Option<super::CommitNote<'e>>,
+    /// The reading the commit installs with its stack ([`Self::read_equality_as`]); `None`
+    /// keeps the base's.
+    reading: Option<Option<TermId>>,
 }
 
 impl<'e> Transaction<'e> {
@@ -73,12 +76,38 @@ impl<'e> Transaction<'e> {
             _slot: slot,
             after: OnceLock::new(),
             note: None,
+            reading: None,
         }
     }
 
     /// Proof that this transaction holds the writer slot; `None` for a speculative one.
     pub fn writer(&self) -> Option<super::WriterHeld<'_>> {
         self._slot.as_ref().map(|_| super::WriterHeld::new())
+    }
+
+    /// The stack this commit publishes is read with `same_as` ([`Version::reading`]): its
+    /// inferred stack holds the closure over representatives of `same_as` classes, or with
+    /// `None` is read as stored. Installed with the commit's changes, in one install; a commit
+    /// without changes installs nothing.
+    pub fn read_equality_as(&mut self, same_as: Option<TermId>) {
+        self.reading = Some(same_as);
+    }
+
+    /// Installs the current stack with `same_as` as its reading now, under this
+    /// transaction's writer slot: its statements, revision and time unchanged, nothing
+    /// logged or checkpointed. A store's open, whose reading isn't on disk. Nothing for a
+    /// speculative transaction.
+    pub fn install_reading(&self, same_as: Option<TermId>) {
+        if self._slot.is_some() {
+            self.engine.shared.install_reading(same_as);
+        }
+    }
+
+    /// The reading the commit installs: the one given, or the installed version's (the base's,
+    /// or one [`Self::install_reading`] installed since: under the slot nothing else does).
+    fn reading(&self) -> Option<TermId> {
+        let installed = || self.engine.shared.versions.load().reading;
+        self.reading.unwrap_or_else(installed)
     }
 
     /// Has the commit note itself in a journal of the caller's, so that the journal and the
@@ -201,6 +230,7 @@ impl<'e> Transaction<'e> {
                 committed_micros: seen.committed_micros,
                 dictionary_len: self.engine.shared.dictionary.len(),
                 equality,
+                reading: seen.reading,
                 canonical: Default::default(),
                 // Empty, as every new version's: what this pending version's readers keep
                 // (its memo's hits share it, as they share the version).
@@ -278,6 +308,7 @@ impl<'e> Transaction<'e> {
                 committed_micros: seen.committed_micros,
                 dictionary_len: self.engine.shared.dictionary.len(),
                 equality,
+                reading: seen.reading,
                 canonical: Default::default(),
                 // Empty, as every new version's: what this pending version's readers keep.
                 own: Default::default(),
@@ -331,6 +362,7 @@ impl<'e> Transaction<'e> {
                 true => Default::default(),
                 false => std::sync::Arc::clone(&base.equality),
             },
+            reading: base.reading,
             canonical: Default::default(),
             own: Default::default(),
         };
@@ -369,6 +401,7 @@ impl<'e> Transaction<'e> {
                 true => Default::default(),
                 false => std::sync::Arc::clone(&seen.equality),
             },
+            reading: seen.reading,
             canonical: Default::default(),
             own: Default::default(),
         };
@@ -378,7 +411,7 @@ impl<'e> Transaction<'e> {
     /// Whether the pending changes touch an `owl:sameAs` statement while reads expand
     /// equality classes: then the next version computes its classes anew.
     fn changes_equality(&self) -> bool {
-        let Some(same_as) = *self.engine.shared.equality.read() else {
+        let Some(same_as) = self.reading() else {
             return false;
         };
         self.pending.touches_predicate(same_as)
@@ -639,6 +672,7 @@ impl<'e> Transaction<'e> {
         }
         self.take_over_inferred();
         let changes_equality = self.changes_equality();
+        let reading = self.reading();
         // The id the commit publishes where it changes asserted statements: the one
         // reserved ([`Self::asserted_identity_after`]), or one chosen when published. Never
         // the base's: a change after an answer of "unchanged" still gets a new one.
@@ -651,6 +685,7 @@ impl<'e> Transaction<'e> {
             pending,
             after,
             note,
+            ..
         } = self;
         // The pending changes' charge, bound first so it drops last: after the sets are freed,
         // and after the record made of them is published.
@@ -706,6 +741,7 @@ impl<'e> Transaction<'e> {
             reserved,
             dictionary_len,
             changes_equality,
+            reading,
             note,
         )? {
             summary.asserted = new;
@@ -730,6 +766,7 @@ impl Inner {
     ///
     /// A local commit's `note` ([`Transaction::note_commit`]) is called at the point that
     /// method names: in the log's append, or, in memory, before the publication.
+    #[expect(clippy::too_many_arguments, reason = "a record and its reading")]
     pub(super) fn publish_record(
         &self,
         record: &CommitRecord,
@@ -737,6 +774,7 @@ impl Inner {
         reserved: Option<super::AssertedIdentity>,
         dictionary_len: u64,
         changes_equality: bool,
+        reading: Option<TermId>,
         note: Option<super::CommitNote<'_>>,
     ) -> EngineResult<Option<super::AssertedIdentity>> {
         // New where the record changes asserted statements; kept for an inferred-only one.
@@ -801,10 +839,13 @@ impl Inner {
                 // While expansion is disabled no predicate is tracked. A published
                 // version must not inherit a cell an older snapshot may still fill.
                 // Pending views instead keep their base's frozen equality mode.
-                equality: match changes_equality || shared.equality.read().is_none() {
+                equality: match changes_equality || reading.is_none() {
                     true => Default::default(),
                     false => std::sync::Arc::clone(&current.equality),
                 },
+                // With its changes, in the one install: a reader reads the old stack in its
+                // reading or this one in the commit's.
+                reading,
                 canonical: Default::default(),
                 own: Default::default(),
             }
