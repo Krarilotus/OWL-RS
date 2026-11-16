@@ -464,3 +464,43 @@ fn rules_named_like_the_equality_rules_beside_the_five_entail_what_they_say() {
     }
     assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
 }
+
+/// Case A under each `reasoner.equality`: a symmetry rule named `eq-rep-s` engages no equality
+/// mode, so `ex:knows` is never read as `owl:sameAs`.
+#[test]
+fn a_symmetry_rule_named_eq_rep_s_entails_what_it_says_under_each_equality_mode() {
+    let rules = Arc::new(UserRules::pie("user.pie", SYMMETRY_NAMED_EQ_REP_S).expect("it compiles"));
+    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Custom)
+        .with_rules(Some(rules))
+        .expect("custom rules");
+    let mut wrong = Vec::new();
+    for (equality, representatives, compact) in [
+        ("representatives", true, false),
+        ("compact", true, true),
+        ("replicate", false, false),
+    ] {
+        let config = nrese_store::StoreConfig {
+            equality_by_representatives: representatives,
+            equality_compact: compact,
+            ..in_memory_store_config()
+        };
+        let store = MutationPipeline::new(
+            Arc::new(StoreService::new(config).expect("store")),
+            Arc::new(ReasonerService::new(reasoner.clone())),
+        );
+        apply(
+            &store,
+            &format!("INSERT DATA {{ <{EX}a> <{EX}knows> <{EX}b> . <{EX}a> a <{EX}Dog> }}"),
+        );
+        wrong.extend(ask_all(
+            &format!("A under {equality}"),
+            &store,
+            &[
+                (format!("<{EX}b> <{EX}knows> <{EX}a>"), true),
+                (format!("<{EX}b> a <{EX}Dog>"), false),
+                (format!("<{EX}a> <{EX}knows> <{EX}a>"), false),
+            ],
+        ));
+    }
+    assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
+}
