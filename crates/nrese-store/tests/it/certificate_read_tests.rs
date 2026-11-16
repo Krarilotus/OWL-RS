@@ -159,7 +159,10 @@ fn pending(store: &StoreService, ops: Vec<StatementOp>, query: &str) -> String {
             &prepared,
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         )
         .expect("answered");
     header(status)
