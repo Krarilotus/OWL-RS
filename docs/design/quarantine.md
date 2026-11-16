@@ -17,7 +17,18 @@ store whose asserted data is inconsistent. This one holds statements that are no
 
 1. A bulk load loads every valid statement. Each invalid one goes into the repository's
    quarantine: its text verbatim (within the limits of §2), file, the document's line, the
-   reason, and the load. Malformed XML or JSON and read errors still stop the load.
+   reason, and the load. RDF/XML and JSON-LD are the exception: the record has no text and
+   no line, and stands for the whole node element or top-level node object the parser
+   skipped, which can hold several statements. An error after which the parser reads no
+   further stops the load and commits nothing: malformed XML or JSON, any error in N3 or
+   Binary RDF, a read error, and a file that ends inside a statement or a directive, which
+   may be cut off (its error says so, with the line the statement starts on). A last
+   statement without a line end is not cut: it loads. A Turtle or TriG string still open at
+   the end of the file is a cut too, whatever follows its quote (a stray quote with no other
+   after it, say). Recovery looks for a malformed string's closing quote within 1 MiB of
+   where the string starts, counted in bytes (§2's limit), whatever the parser has already
+   read: past that the load stops too, with the string's line. A malformed statement whose
+   end recovery finds is quarantined however long it is, its text `truncated` past 1 MiB.
 2. Quarantined statements are not data: queries, reasoning, exports and statistics don't
    see them. By construction: they never reach the engine.
 3. The load warns: its report carries the count, the load's id and the first examples
@@ -55,9 +66,10 @@ A record (`QuarantinedStatement`, one JSON line):
 | `blank_nodes` | the prefix the load gave its blank-node labels |
 
 With `context`, `graph`, `target` and `base` the text reads on its own, into the place the
-load would have put it. RDF/XML and JSON-LD give the line and reason only (their recovery
-skips an element whose end the parser knows only after the error): re-admitting one takes
-the fixed text.
+load would have put it. RDF/XML and JSON-LD give the reason only, no text and no line
+(`line` and `column` 0; an RDF/XML reason starts with the byte offset where the parser
+kept one): their recovery skips an element whose end the parser knows only after the
+error. Re-admitting one takes the fixed text.
 
 ## 3. Where it is kept
 
@@ -65,7 +77,8 @@ the fixed text.
 
 - `load-<id>.jsonl`: one file per load that quarantined something, written as the load
   goes (`load-<id>.partial`) and renamed once the load committed. A load that fails or is
-  cancelled removes its file; a `.partial` found at a start is from a load that didn't
+  cancelled removes its file, and `quarantine/` if that leaves it empty; a `.partial`
+  found at a start is from a load that didn't
   commit (a crash between the engine's commit and the rename loses that load's
   quarantine, not its data) and is removed.
 - `resolutions.jsonl`: append-only, one record per resolved statement (`outcome`

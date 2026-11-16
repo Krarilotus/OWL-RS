@@ -437,7 +437,7 @@ pub(crate) fn characters(bytes: &[u8]) -> u64 {
 /// Where the next token starts: past whitespace and comments. `None` if a comment may
 /// still go on (more input may come).
 #[inline(always)]
-fn space(input: &[u8], eof: bool) -> Option<usize> {
+pub(crate) fn space(input: &[u8], eof: bool) -> Option<usize> {
     let len = input.len();
     let mut i = 0;
     loop {
@@ -456,91 +456,39 @@ fn space(input: &[u8], eof: bool) -> Option<usize> {
     }
 }
 
-/// A string's opening quote: the quote character, and whether it is long (`"""`, `'''`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Opening {
-    pub(crate) quote: u8,
-    pub(crate) long: bool,
-}
-
 /// How much of the input a token [`lex`] couldn't read spans, for a recovering parser to
 /// skip it whole and go on (see `TurtleParser::resync`).
 pub(crate) enum Malformed {
     /// Skip this many bytes (whitespace before the token included): a string to its
     /// closing quote, or anything else's first byte.
     Skip(usize),
-    /// A string with no closing quote anywhere after it (the input has ended): skip this
-    /// many bytes, up to and including the first byte of its opening only.
-    Missing(usize, Opening),
+    /// A string with no closing quote before the input's end: the document ends inside it,
+    /// whatever follows its quote.
+    Unclosed,
     /// The input ends before the token does; more may come.
     NeedMore,
-}
-
-/// Where the token at the start of `input` starts (after whitespace and comments), and its
-/// opening if it is a string. `None` if more input may change that.
-fn token_start(input: &[u8], eof: bool) -> Option<(usize, Option<Opening>)> {
-    let start = space(input, eof)?;
-    let Some(&quote) = input.get(start) else {
-        return eof.then_some((start, None));
-    };
-    if !matches!(quote, b'"' | b'\'') {
-        return Some((start, None));
-    }
-    if start + 2 >= input.len() && !eof {
-        return None;
-    }
-    let long = input.get(start + 1) == Some(&quote) && input.get(start + 2) == Some(&quote);
-    Some((start, Some(Opening { quote, long })))
 }
 
 /// The extent of the token at the start of `input` (after whitespace and comments) that
 /// [`lex`] failed on. A string ends at its closing quote by [`string`]'s own rules
 /// (escapes, short and long), line breaks allowed, since a line break in a short string is
-/// what fails it; `search` says whether to look for that quote (false where an earlier
-/// search reached the end without one, so that none comes after this one either: see
-/// [`known_missing`]). Anything else (a `%`, a lone `>` or `|`, a bad `@` keyword or
-/// number, invalid UTF-8) spans its first byte. An IRI never fails here before the input's
-/// end: [`lex`] takes `<…>` up to the next `>`.
-pub(crate) fn malformed(input: &[u8], eof: bool, search: impl Fn(Opening) -> bool) -> Malformed {
-    let Some((start, opening)) = token_start(input, eof) else {
+/// what fails it. Anything else (a `%`, a lone `>` or `|`, a bad `@` keyword or number,
+/// invalid UTF-8) spans its first byte. An IRI never fails here before the input's end:
+/// [`lex`] takes `<…>` up to the next `>`.
+pub(crate) fn malformed(input: &[u8], eof: bool) -> Malformed {
+    let Some(start) = space(input, eof) else {
         return Malformed::NeedMore;
     };
-    match opening {
-        Some(opening) if search(opening) => match string::<true>(input, start, eof) {
+    match input.get(start) {
+        Some(b'"' | b'\'') => match string::<true>(input, start, eof) {
             Lexed::Token(token) => Malformed::Skip(token.consumed),
             Lexed::NeedMore => Malformed::NeedMore,
-            Lexed::Error(..) => Malformed::Missing(start + 1, opening),
+            // With line breaks allowed, a string fails only at the input's end.
+            Lexed::Error(..) => Malformed::Unclosed,
         },
-        Some(opening) => Malformed::Missing(start + 1, opening),
-        None if start == input.len() => Malformed::Skip(start),
-        None => Malformed::Skip(start + 1),
-    }
-}
-
-/// If the token at the start of `input` is a string whose opening `missing` says has no
-/// closing quote after it: how many bytes to skip, up to and including the first byte of
-/// that opening (as [`Malformed::Missing`]). For a recovering parser to skip it before
-/// lexing it, which would search to the end again.
-///
-/// Why one failed search answers for later ones: a search reads the bytes after the
-/// opening, a `\` and the byte after it as one escape, and a quote outside an escape as
-/// the end (three in a row for a long string).
-/// - A failed short search: every quote after its opening is in an escape, in that
-///   reading. A later opening's first quote is then in one too, so that reading resumes
-///   right after it, where a later search starts, and reads the same escapes from there.
-///   A later string of that quote, short or long, has no closing quote either.
-/// - A failed long search: no three quotes outside escapes are in a row. A later long
-///   opening's first quote was in an escape (else that reading meets its three quotes),
-///   and from there the readings agree, as above. A single quote outside an escape is
-///   allowed, so it says nothing of later short strings.
-pub(crate) fn known_missing(
-    input: &[u8],
-    eof: bool,
-    missing: impl Fn(Opening) -> bool,
-) -> Option<usize> {
-    match token_start(input, eof)? {
-        (start, Some(opening)) if missing(opening) => Some(start + 1),
-        _ => None,
+        Some(_) => Malformed::Skip(start + 1),
+        None if eof => Malformed::Skip(start),
+        None => Malformed::NeedMore,
     }
 }
 

@@ -95,6 +95,18 @@ impl StoreService {
     /// Classifies the asserted statements of every graph under OWL 2 DL; for a scope that
     /// reads every graph.
     pub fn classify(&self, scope: &crate::ReadScope) -> StoreResult<ClassificationReport> {
+        self.classify_until(scope, nrese_reasoner::eval::NEVER)
+    }
+
+    /// [`Self::classify`], given up when `stop` fires while it waits for another request's
+    /// computation of this revision: then
+    /// [`ClassificationCancelled`](crate::StoreError::ClassificationCancelled). That
+    /// computation, and one it runs itself, run to their end.
+    pub fn classify_until(
+        &self,
+        scope: &crate::ReadScope,
+        stop: nrese_reasoner::eval::Stop<'_>,
+    ) -> StoreResult<ClassificationReport> {
         scope.require_all("classification")?;
         let started = Instant::now();
         let snapshot = self.engine().snapshot();
@@ -103,7 +115,8 @@ impl StoreService {
         let answer = match dl::kept_el(self, &snapshot) {
             Some(el) => Ok(el),
             None => {
-                let taxonomy = dl::taxonomy(self, &snapshot);
+                let taxonomy = dl::taxonomy(self, &snapshot, stop)
+                    .ok_or(crate::StoreError::ClassificationCancelled)?;
                 match dl::el_answer(self, &snapshot, &taxonomy, started) {
                     Some(ElRoute::Answered(el)) => Ok(el),
                     None => Err((taxonomy, None)),
@@ -160,10 +173,20 @@ impl StoreService {
     /// Realises the asserted statements of every graph under OWL 2 DL: each named
     /// individual's types; for a scope that reads every graph.
     pub fn realise(&self, scope: &crate::ReadScope) -> StoreResult<RealisationReport> {
+        self.realise_until(scope, nrese_reasoner::eval::NEVER)
+    }
+
+    /// [`Self::realise`], given up as [`Self::classify_until`] is.
+    pub fn realise_until(
+        &self,
+        scope: &crate::ReadScope,
+        stop: nrese_reasoner::eval::Stop<'_>,
+    ) -> StoreResult<RealisationReport> {
         scope.require_all("realisation")?;
         let started = Instant::now();
         let snapshot = self.engine().snapshot();
-        let r = crate::dl::classification::realisation(self, &snapshot);
+        let r = crate::dl::classification::realisation(self, &snapshot, stop)
+            .ok_or(crate::StoreError::ClassificationCancelled)?;
         let consistency = r.taxonomy.classification.consistency.clone();
         let mut types: Vec<(String, Vec<String>)> = r
             .individuals

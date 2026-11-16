@@ -448,6 +448,9 @@ impl<'t, 'm> Parser<'t, 'm> {
                 let r = if self.at_close() {
                     self.r(DataRange::Literal)
                 } else {
+                    if keyword == "DataMaxCardinality" {
+                        self.model.qualified_data_max.get_or_insert(p);
+                    }
                     self.range()?
                 };
                 match keyword {
@@ -733,6 +736,7 @@ impl<'t, 'm> Parser<'t, 'm> {
             "SubAnnotationPropertyOf" | "AnnotationPropertyDomain" | "AnnotationPropertyRange" => {
                 let property = self.entity()?;
                 self.model.uses.entry(property).or_default().annotation = true;
+                self.model.annotation_schema.push(property);
                 if keyword == "SubAnnotationPropertyOf" {
                     let sup = self.entity()?;
                     self.model.uses.entry(sup).or_default().annotation = true;

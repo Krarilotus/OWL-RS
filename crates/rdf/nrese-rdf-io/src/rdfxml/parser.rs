@@ -253,7 +253,7 @@ impl<R: BufRead> RdfXmlParser<R> {
                 self.queue.clear();
                 let syntax = matches!(error, RdfParseError::Syntax(_));
                 self.done = !(syntax && self.settings.recover && self.resync());
-                return Err(error);
+                return Err(error.ending(self.done, false));
             }
         }
     }
@@ -309,7 +309,7 @@ impl<R: BufRead> RdfXmlParser<R> {
             column: 0,
             offset,
         };
-        RdfSyntaxError::new(message, at..at).into()
+        RdfSyntaxError::new(message, at..at).without_lines().into()
     }
 
     fn base(&self) -> Option<&Iri<String>> {
@@ -610,6 +610,8 @@ impl<R: BufRead> RdfXmlParser<R> {
     fn dispatch(&mut self, buffer: &mut Vec<u8>) -> Step<()> {
         let event = match self.reader.read_event_into(buffer) {
             Ok(event) => event,
+            // A read error is one, not a syntax error a recovering reader would skip.
+            Err(quick_xml::Error::Io(e)) => return Err(std::io::Error::new(e.kind(), e).into()),
             Err(e) => {
                 self.broken = true;
                 return Err(self.error(format!("not well-formed XML: {e}")));

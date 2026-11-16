@@ -289,7 +289,7 @@ fn a_renamed_select_is_answered_with_its_own_names() {
     let json = "application/sparql-results+json";
     let first = parse(&format!("SELECT ?s ?o WHERE {{ ?s <{EX}p> ?o }}"));
     for format in [TSV, json] {
-        let CachedOutput::Miss(slot) = cached_output(&snapshot, &first, &options, format, "")
+        let CachedOutput::Miss(slot) = cached_output(&snapshot, &first, &options, format, b"")
         else {
             panic!("nothing cached yet")
         };
@@ -299,7 +299,7 @@ fn a_renamed_select_is_answered_with_its_own_names() {
     for format in [TSV, json] {
         assert!(
             matches!(
-                cached_output(&snapshot, &renamed, &options, format, ""),
+                cached_output(&snapshot, &renamed, &options, format, b""),
                 CachedOutput::Miss(_)
             ),
             "{format}: the renamed query's own answer"
@@ -308,7 +308,7 @@ fn a_renamed_select_is_answered_with_its_own_names() {
     // The same names: the answer kept.
     let again = parse(&format!("SELECT ?s ?o WHERE {{ ?s <{EX}p> ?o }}"));
     assert!(matches!(
-        cached_output(&snapshot, &again, &options, TSV, ""),
+        cached_output(&snapshot, &again, &options, TSV, b""),
         CachedOutput::Hit(_)
     ));
 }
@@ -321,19 +321,19 @@ fn serialised_answers_are_kept_per_format_form_and_snapshot() {
     let options = with_cache(&cache, ReadModel::Materialised);
     let select = parse(&format!("SELECT ?s ?o WHERE {{ ?s <{EX}p> ?o }}"));
     let snapshot = engine.snapshot();
-    let CachedOutput::Miss(slot) = cached_output(&snapshot, &select, &options, TSV, "") else {
+    let CachedOutput::Miss(slot) = cached_output(&snapshot, &select, &options, TSV, b"") else {
         panic!("nothing cached yet")
     };
     let written = tsv(&snapshot, &select, &options);
     slot.offer(written.clone(), std::time::Duration::from_millis(5));
-    let CachedOutput::Hit(bytes) = cached_output(&snapshot, &select, &options, TSV, "") else {
+    let CachedOutput::Hit(bytes) = cached_output(&snapshot, &select, &options, TSV, b"") else {
         panic!("the bytes just offered")
     };
     assert_eq!(&*bytes, written.as_slice());
     // Another format, another form or template over the same pattern: not these bytes.
     let json = "application/sparql-results+json";
     assert!(matches!(
-        cached_output(&snapshot, &select, &options, json, ""),
+        cached_output(&snapshot, &select, &options, json, b""),
         CachedOutput::Miss(_)
     ));
     for other in [
@@ -342,19 +342,40 @@ fn serialised_answers_are_kept_per_format_form_and_snapshot() {
         format!("CONSTRUCT {{ ?o <{EX}r> ?s }} WHERE {{ ?s <{EX}p> ?o }}"),
     ] {
         let other = parse(&other);
-        let CachedOutput::Miss(slot) = cached_output(&snapshot, &other, &options, TSV, "") else {
+        let CachedOutput::Miss(slot) = cached_output(&snapshot, &other, &options, TSV, b"") else {
             panic!("another query")
         };
         slot.offer(b"other".to_vec(), std::time::Duration::from_millis(5));
     }
-    let CachedOutput::Hit(bytes) = cached_output(&snapshot, &select, &options, TSV, "") else {
+    let CachedOutput::Hit(bytes) = cached_output(&snapshot, &select, &options, TSV, b"") else {
         panic!("still cached")
     };
     assert_eq!(&*bytes, written.as_slice());
     // Another caller context (the store's reasoning mode, the status it reports), or the
     // QL rewriting on: not these bytes.
     assert!(matches!(
-        cached_output(&snapshot, &select, &options, TSV, "owl2-dl"),
+        cached_output(&snapshot, &select, &options, TSV, b"owl2-dl"),
+        CachedOutput::Miss(_)
+    ));
+    // Two statuses that differ in one reason's text alone never share an answer.
+    let context = |text: &str| {
+        let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Ql);
+        status.incomplete("ql", text.to_owned());
+        let mut out = Vec::new();
+        status.write_cache_context(&mut out);
+        out
+    };
+    let (one, other) = (context("reads <a>"), context("reads <b>"));
+    let CachedOutput::Miss(slot) = cached_output(&snapshot, &select, &options, TSV, &one) else {
+        panic!("nothing cached under this status yet")
+    };
+    slot.offer(b"one".to_vec(), std::time::Duration::from_millis(5));
+    assert!(matches!(
+        cached_output(&snapshot, &select, &options, TSV, &one),
+        CachedOutput::Hit(_)
+    ));
+    assert!(matches!(
+        cached_output(&snapshot, &select, &options, TSV, &other),
         CachedOutput::Miss(_)
     ));
     let rewriting = QueryOptions {
@@ -364,7 +385,7 @@ fn serialised_answers_are_kept_per_format_form_and_snapshot() {
         ..options.clone()
     };
     assert!(matches!(
-        cached_output(&snapshot, &select, &rewriting, TSV, ""),
+        cached_output(&snapshot, &select, &rewriting, TSV, b""),
         CachedOutput::Miss(_)
     ));
     // Never answered from bytes: a volatile query, a pin, a transaction's pending state.
@@ -372,7 +393,7 @@ fn serialised_answers_are_kept_per_format_form_and_snapshot() {
         "SELECT ?s ?r WHERE {{ ?s <{EX}p> ?o BIND(RAND() AS ?r) }}"
     ));
     assert!(matches!(
-        cached_output(&snapshot, &volatile, &options, TSV, ""),
+        cached_output(&snapshot, &volatile, &options, TSV, b""),
         CachedOutput::Off
     ));
     let pinning = QueryOptions {
@@ -383,19 +404,19 @@ fn serialised_answers_are_kept_per_format_form_and_snapshot() {
         ..options.clone()
     };
     assert!(matches!(
-        cached_output(&snapshot, &select, &pinning, TSV, ""),
+        cached_output(&snapshot, &select, &pinning, TSV, b""),
         CachedOutput::Off
     ));
     let mut tx = engine.transaction();
     tx.insert(Quad::new(ex("c"), ex("p"), ex("d"), GraphName::DefaultGraph).as_ref());
     assert!(matches!(
-        cached_output(&tx, &select, &options, TSV, ""),
+        cached_output(&tx, &select, &options, TSV, b""),
         CachedOutput::Off
     ));
     tx.commit().unwrap();
     // A commit: the older bytes don't answer the newer snapshot.
     assert!(matches!(
-        cached_output(&engine.snapshot(), &select, &options, TSV, ""),
+        cached_output(&engine.snapshot(), &select, &options, TSV, b""),
         CachedOutput::Miss(_)
     ));
 }
@@ -441,7 +462,7 @@ fn serialised_answers_equal_fresh_ones_over_random_commits() {
                         ..QueryOptions::default()
                     },
                 );
-                let answer = match cached_output(&snapshot, &query, &options, TSV, "") {
+                let answer = match cached_output(&snapshot, &query, &options, TSV, b"") {
                     CachedOutput::Hit(bytes) => {
                         from_bytes += 1;
                         bytes.to_vec()

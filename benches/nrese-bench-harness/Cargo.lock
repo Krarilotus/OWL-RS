@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-dl"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "hashbrown 0.16.1",
  "nrese-exec",
@@ -1012,7 +1012,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-engine"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "aho-corasick",
  "crc32fast",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-exec"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash 0.2.0",
  "hashbrown 0.16.1",
@@ -1044,7 +1044,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-json"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "memchr",
  "thiserror 2.0.21",
@@ -1052,14 +1052,14 @@ dependencies = [
 
 [[package]]
 name = "nrese-owl"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash 0.2.0",
 ]
 
 [[package]]
 name = "nrese-rdf"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash 0.2.0",
  "nrese-xsd",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-rdf-io"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash 0.2.0",
  "memchr",
@@ -1082,7 +1082,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-reasoner"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "hashbrown 0.16.1",
  "nrese-engine",
@@ -1098,7 +1098,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-shacl"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "nrese-engine",
  "nrese-exec",
@@ -1112,7 +1112,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-sparql"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "geo",
  "hashbrown 0.16.1",
@@ -1138,7 +1138,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-sparql-results"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "memchr",
  "nrese-json",
@@ -1149,7 +1149,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-sparql-syntax"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "nrese-rdf",
  "smallvec",
@@ -1158,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-store"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "argon2",
  "bytes",
@@ -1188,7 +1188,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-vector"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "nrese-exec",
  "parking_lot",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-xsd"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "iri-string",
  "regex-syntax",

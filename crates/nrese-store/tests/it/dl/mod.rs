@@ -9,13 +9,17 @@ mod explain;
 mod gap;
 mod gates;
 mod identity;
+mod islands;
+mod keys;
 mod mode;
+mod plans;
 mod queries;
 mod representatives;
 mod review;
 mod routing;
 mod safety;
 mod speculative;
+mod undecided;
 mod versions;
 
 use std::sync::Arc;
