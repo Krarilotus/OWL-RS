@@ -1106,3 +1106,94 @@ fn a_compact_store_under_custom_rules_reopened_answers_as_they_entail() {
     }
     assert!(wrong.is_empty(), "wrong: {wrong:?}");
 }
+
+/// A primary under `reasoner.equality = "compact"` whose program closes equality
+/// (`RuleProgram::closes_equality`), so that its rows are stored over representatives, sends
+/// no replica its log (the replica's fail-closed form, half page point 3; master 12:15:
+/// refused at the store): a replica would read those rows with no reading. The primary
+/// commits the type through a subclass, then `owl:sameAs`. The replica follows the log from
+/// an empty directory, between the two and after (`pulled between`) or once after both
+/// (`pulled once`): its first pull is refused with the sentence. Under a program that doesn't
+/// close equality (custom rules: its rows are stored as they are) it follows, and answers
+/// through the `owl:sameAs` as the primary does. Always through the store's own calls
+/// (`replication_log`, `apply_replication_log`), as the server's pull; the image's refusal is
+/// the server's (its replica tests). Under every program of [`programs`] but `owl2-rl`,
+/// whose first closure writes no record, so its log starts after it. Every case is printed;
+/// a refusal otherwise, or a replica that couldn't follow, is an ERROR.
+#[test]
+fn a_compact_primary_sends_no_replica_its_log() {
+    const TYPE: &str = "INSERT DATA { ex:Dog rdfs:subClassOf ex:Animal . ex:a a ex:Dog }";
+    const SAME: &str = "INSERT DATA { ex:a owl:sameAs ex:b }";
+    const QUERY: &str = "SELECT ?x WHERE { ?x a ex:Animal } ORDER BY ?x";
+    // What a refusal says, in part.
+    const REFUSED: &str = "serves no replica";
+    let mut wrong = Vec::new();
+    for (program, reasoner) in programs() {
+        if program == "Owl2Rl" {
+            continue;
+        }
+        let refused = reasoner
+            .materialised_program()
+            .is_some_and(|p| nrese_reasoner::RuleProgram::closes_equality(&p.name()));
+        for way in ["pulled between", "pulled once"] {
+            let (at, follows) = (
+                tempfile::tempdir().expect("dir"),
+                tempfile::tempdir().expect("dir"),
+            );
+            let primary = equality_store(&reasoner, true, Some(at.path()));
+            let case = format!("{program} {way}");
+            update(&primary, TYPE);
+            let replica = equality_store(&reasoner, true, Some(follows.path()));
+            replica.store().mark_replica();
+            let pull = || -> Result<(), String> {
+                let after = replica.store().current_revision();
+                let batch = primary
+                    .store()
+                    .replication_log(after, 1 << 20)
+                    .map_err(|e| format!("log after {after}: {e}"))?;
+                let expected = nrese_store::LogExpectation {
+                    after,
+                    records: batch.records as u64,
+                    last: batch.last,
+                };
+                let stop = nrese_exec::stop::StopSource::new(None, None);
+                let applied = replica
+                    .store()
+                    .apply_replication_log(&batch.frames, &expected, &stop)
+                    .map_err(|e| format!("apply after {after}: {e}"))?;
+                (applied.revision == primary.store().current_revision())
+                    .then_some(())
+                    .ok_or(format!("at {} of {}", applied.revision, batch.latest))
+            };
+            let caught_up = match way {
+                "pulled between" => pull(),
+                _ => Ok(()),
+            };
+            update(&primary, SAME);
+            let followed = caught_up.and_then(|()| pull());
+            match followed {
+                Err(error) if refused && error.contains(REFUSED) => {
+                    println!("CASE {case}: right, refused: {error}");
+                }
+                Err(error) => {
+                    println!("CASE {case}: ERROR {error}");
+                    wrong.push(case);
+                }
+                Ok(()) if refused => {
+                    println!("CASE {case}: WRONG served its log");
+                    wrong.push(case);
+                }
+                Ok(()) => {
+                    let (got, want) = (answer(&replica, QUERY), answer(&primary, QUERY));
+                    if got == want {
+                        println!("CASE {case}: right");
+                    } else {
+                        println!("CASE {case}: WRONG {got} | primary {want}");
+                        wrong.push(case);
+                    }
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "wrong: {wrong:?}");
+}
