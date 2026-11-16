@@ -942,6 +942,47 @@ fn a_read_error_ends_the_document() {
     table.done();
 }
 
+/// In every format the parser reads, a read error inside a document is returned as a read
+/// error, never as a syntax error (which a recovering consumer would skip), and ends the
+/// document: what came before it, then the error, then nothing.
+#[test]
+fn a_read_error_is_a_read_error_in_every_format() {
+    let mut table = Table::default();
+    for format in [
+        RdfFormat::NTriples,
+        RdfFormat::NQuads,
+        RdfFormat::Turtle,
+        RdfFormat::TriG,
+        RdfFormat::RdfXml,
+        RdfFormat::JsonLd,
+        RdfFormat::N3,
+        RdfFormat::BinaryRdf,
+    ] {
+        let mut writer = nrese_rdf_io::RdfSerializer::from_format(format).for_writer(Vec::new());
+        for k in 0..3 {
+            let quad = triple(
+                &format!("urn:s{k}"),
+                "urn:p",
+                Literal::new_simple_literal("v"),
+            );
+            writer.serialize_quad(&quad).unwrap();
+        }
+        let document: &'static [u8] = Box::leak(writer.finish().unwrap().into_boxed_slice());
+        let (before, after) = document.split_at(document.len() / 2);
+        for recovering in [false, true] {
+            let parser = recovering_if(RdfParser::from_format(format), recovering);
+            let pieces = Pieces(vec![Ok(before), Err(io::ErrorKind::Other), Ok(after)].into());
+            let items: Vec<_> = parser.for_reader(pieces).take(9).collect();
+            let outcome = match items.split_last() {
+                Some((Err(RdfParseError::Io(_)), read)) if read.iter().all(Result::is_ok) => Ok(()),
+                _ => Err(format!("want quads, then one read error, got {items:?}")),
+            };
+            table.row(format != RdfFormat::RdfXml, (format, recovering), outcome);
+        }
+    }
+    table.done();
+}
+
 // --- An error the parser's own layer finds stops a strict format --------------------------
 
 #[test]
