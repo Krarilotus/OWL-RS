@@ -146,6 +146,9 @@ pub enum Unavailable {
     MemoryUnreadable,
     /// The reading query was cancelled, or its time ran out, while the view was computed.
     Cancelled,
+    /// The rules in place aren't the ones the snapshot's certificate was made with (they
+    /// were changed or removed, the store not rematerialised).
+    OtherProgram,
 }
 
 impl From<BudgetExceeded> for Unavailable {
@@ -165,6 +168,9 @@ impl From<Unavailable> for crate::StoreError {
                 limit: nrese_exec::memory::process_limit().unwrap_or(0),
             },
             Unavailable::Cancelled => nrese_sparql::QueryEvaluationError::Cancelled.into(),
+            Unavailable::OtherProgram => crate::StoreError::Configuration(
+                "the inferred statements aren't the rules' closure: rematerialise first".to_owned(),
+            ),
         }
     }
 }
@@ -2237,6 +2243,19 @@ impl Supports {
         let (cell, rederiving, view, generation) = {
             let mut state = self.state();
             let generation = state.generation.clone();
+            // A view under other rules than its certificate's would show what they derive,
+            // which a graph the reader can't read may decide: refused, nothing kept.
+            if let Some(made) = crate::service::Certificate::of(snapshot)
+                && generation.rules.as_ref().is_none_or(|rules| {
+                    crate::reasoning_state::fingerprint(
+                        rules,
+                        compilation.hide_unnamed_classes,
+                        made.state.compact_equality,
+                    ) != made.state.fingerprint
+                })
+            {
+                return Err(Unavailable::OtherProgram);
+            }
             let (_, cell, rederiving, views) = state.latest_for(snapshot, &self.kept)?;
             let view = match views.iter().find(|(seen, _)| **seen == **access) {
                 Some((_, view)) => view.clone(),
