@@ -168,6 +168,38 @@ fn a_store_with_a_left_out_axiom_is_not_told_consistent() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The ontology is the union of the store's graphs: a restriction whose statements are
+/// written in two named graphs, one of them in both, is the restriction it is in one graph.
+/// Its read is entailed: `true` and `complete`, as with no copy, nothing told left out.
+#[test]
+fn a_structure_repeated_across_named_graphs_is_read_as_in_one() {
+    let names = ":p a owl:ObjectProperty . :x :p :v . :v a :D . _:r rdfs:subClassOf :C .";
+    let stores = [
+        (
+            "repeated",
+            "GRAPH :g1 { _:r owl:onProperty :p ; owl:someValuesFrom :D . } \
+             GRAPH :g2 { _:r owl:onProperty :p . }",
+        ),
+        (
+            "once",
+            "GRAPH :g1 { _:r owl:onProperty :p ; owl:someValuesFrom :D . }",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (store, graphs) in stores {
+        for extra in ["", OUTSIDE_RL] {
+            let dl = pipeline();
+            insert(&dl, &format!("{NAMES} {names} {graphs} {extra}")).expect("committed");
+            let (rows, status) = query(&dl, "ASK { :x a :C }");
+            let reasons = status.reasons();
+            if rows != ["true"] || !status.is_complete() || says_left_out(&reasons) {
+                wrong.push(format!("{store} {extra}: {rows:?} {reasons:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The other paths that report a status read the same record: EXPLAIN, the plan, a read of
 /// the inferred statements alone, the store's status of them (`status_without_dl`), and a
 /// read with an addition pending.
@@ -282,13 +314,14 @@ fn without_the_consistency_check_a_left_out_axiom_is_still_told() {
 
 /// What a commit makes or ends is what the next read is told: each sequence read after
 /// every commit, expected `complete` before the axiom the reader leaves out, `unsound`
-/// with its reason while it is there (also after a commit of a plain assertion beside it,
-/// off the rules route a delta of U1, which then may not prove the store consistent), and
-/// `complete` again once it is gone. The changes
+/// with its reason and the store not told consistent while it is there (also after a
+/// commit of a plain assertion beside it, off the rules route a delta of U1, which then may
+/// not prove the store consistent), and `complete` again once it is gone. The changes
 /// are a reserved name first used, a list's last `rdf:rest` deleted, a restriction's filler
-/// deleted, an `owl:onProperty` added on an IRI, and a reserved name as an assertion's value
-/// (off the rules route an assertion over U1's kinds, which U1 takes as a delta), each
-/// undone, each on the rules route and off it.
+/// deleted, an `owl:onProperty` added on an IRI, a reserved name as an assertion's value
+/// (off the rules route an assertion over U1's kinds, which U1 takes as a delta), and an
+/// undeclared data property's last value deleted (an assertion only, which changes the
+/// property's kind), each undone, each on the rules route and off it.
 #[test]
 fn a_commit_that_makes_or_ends_a_left_out_axiom_changes_the_status() {
     let rest = format!("<{RDF}rest>");
@@ -331,6 +364,16 @@ fn a_commit_that_makes_or_ends_a_left_out_axiom_changes_the_status() {
             "DELETE DATA { :x :q rdfs:Resource . }".to_owned(),
             "ASK { :x a :C }",
         ),
+        (
+            // An assertion only, deleted: an undeclared property is a data property by its
+            // literal values (Mapping §3.2.1); with none left, it is an object property,
+            // whose range `rdfs:Literal` is then a reserved class name.
+            "a data property's last value deleted",
+            format!("{NAMES} :p rdfs:range rdfs:Literal . :x :p \"v\" ."),
+            "DELETE DATA { :x :p \"v\" . }".to_owned(),
+            "INSERT DATA { :x :p \"v\" . }".to_owned(),
+            "ASK { :x a :C }",
+        ),
     ];
     let assertion = "INSERT DATA { :w a :D . }".to_owned();
     let mut wrong = Vec::new();
@@ -352,13 +395,15 @@ fn a_commit_that_makes_or_ends_a_left_out_axiom_changes_the_status() {
             let (rows, status) = query(&dl, read);
             let (label, reasons) = (status.shared.as_str(), status.reasons());
             let told = label == "unsound" && says_left_out(&reasons);
+            let verdict = dl.store().dl().status().map(|s| s.consistency.verdict);
+            let consistent = verdict.as_ref().map(|v| v.as_str()) == Some("consistent");
             let ok = match left_out {
-                true => told,
+                true => told && !consistent,
                 false => status.is_complete() && !says_left_out(&reasons),
             };
             if !ok {
                 wrong.push(format!(
-                    "{name} {extra}, {step}: {rows:?} {label} {reasons:?}"
+                    "{name} {extra}, {step}: {rows:?} {label} {reasons:?} {verdict:?}"
                 ));
             }
         }

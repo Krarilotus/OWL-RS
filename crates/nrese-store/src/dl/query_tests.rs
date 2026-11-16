@@ -705,6 +705,55 @@ fn a_store_without_annotation_axioms_or_equality_is_marked_without_the_ontology(
     );
 }
 
+/// With the consistency check off, a commit reads no ontology, so its revision has no
+/// record of what the reader left out. Committed reads at that revision (a plan, EXPLAIN,
+/// the inferred statements alone) are each told the same mark, the reader's, and their
+/// marks pass over the whole ontology at most once between them, not once per read.
+#[test]
+fn committed_reads_without_a_record_pass_over_the_ontology_at_most_once() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let value = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#value>";
+    let stores = [
+        ("nothing left out", ":tib :owner :ann .".to_owned(), false),
+        (
+            "a reserved name",
+            format!("{value} rdfs:domain :Pet . :ann {value} :tib ."),
+            true,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, data, left_out) in stores {
+        let config = crate::StoreConfig {
+            dl: crate::DlConfig {
+                consistency: crate::DlConsistency::Off,
+                ..crate::DlConfig::default()
+            },
+            ..crate::StoreConfig::in_memory()
+        };
+        let store = Arc::new(StoreService::new(config).unwrap());
+        let reasoner = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl);
+        let pipeline = crate::MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(reasoner)),
+        );
+        commit(&pipeline, &format!("INSERT DATA {{ {OFF_ROUTE}{data} }}"));
+        commit(&pipeline, "INSERT DATA { :rex a :Pet . }");
+        let snapshot = store.engine().snapshot();
+        let reads: Vec<(bool, usize)> = (0..3)
+            .map(|_| {
+                ONTOLOGY_PASSES.set(0);
+                let told = reads_differently(&store, Revision::Committed(&snapshot));
+                (told.is_some(), ONTOLOGY_PASSES.get())
+            })
+            .collect();
+        let passes: usize = reads.iter().map(|&(_, p)| p).sum();
+        if passes > 1 || reads.iter().any(|&(told, _)| told != left_out) {
+            wrong.push(format!("{name}: (told, passes) {reads:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 const PREF_LABEL: &str = "<http://www.w3.org/2004/02/skos/core#prefLabel>";
 
 /// A store with an annotation-property axiom of each kind (a domain, a range, a

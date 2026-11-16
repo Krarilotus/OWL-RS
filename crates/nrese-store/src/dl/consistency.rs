@@ -336,6 +336,37 @@ mod tests {
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
+    /// Where the reader left a part out, no verdict but an inconsistency stands: one that
+    /// ran out of time is unknown for what was left out, not for the time, since no time
+    /// would decide it; an inconsistency found in what was read is one of the whole.
+    #[test]
+    fn a_left_out_part_makes_every_verdict_but_an_inconsistency_unknown_for_it() {
+        let left_out = |mut ontology: Ontology| {
+            let term = 7;
+            ontology
+                .diagnostics
+                .push(nrese_owl::Diagnostic::Reserved { term });
+            ontology
+        };
+        let expired = Budget {
+            timeout: Some(Duration::ZERO),
+            ..budget()
+        };
+        let out_of_time = check(&left_out(shared_name()), &expired).verdict;
+        assert!(
+            matches!(&out_of_time, Verdict::Unknown(why) if why.contains("were left out")),
+            "{out_of_time:?}"
+        );
+        let mut inconsistent = shared_name();
+        let nothing = ExprId(inconsistent.classes.intern(ClassExpr::Nothing));
+        inconsistent
+            .axioms
+            .push(Axiom::ClassAssertion(nothing, 100));
+        inconsistent.sources.push(Vec::new());
+        let found = check(&left_out(inconsistent), &budget()).verdict;
+        assert_eq!(found, Verdict::Inconsistent);
+    }
+
     #[test]
     fn the_request_flag_reaches_context_consistency_and_entailment() {
         let request = nrese_sparql::CancellationToken::new();
