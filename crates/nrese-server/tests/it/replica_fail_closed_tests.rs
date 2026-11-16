@@ -213,7 +213,9 @@ async fn a_replica_of_a_compact_primary_fails_with_the_sentence() -> TestResult<
 /// started once as a primary (reasoned at its start, as `serve` does, so its marker vouches
 /// for that reasoning) and then started as a replica of a primary at the same revision,
 /// which applies the primary's records and restarts, doesn't vouch for what it applied: a
-/// reasoned read after the restart gives the primary's rows and is never `complete`.
+/// reasoned read after the restart gives the primary's rows and says `not-certified`
+/// ("every reasoned read on a replica says `not-certified`"), where the primary's read,
+/// certified, says its regime's status (under `rdfs` never `complete`, so that is no test).
 /// Before that, it is a working replica: caught up, with the primary's rows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_directory_once_a_primary_does_not_vouch_for_records_it_applied() -> TestResult<()> {
@@ -253,10 +255,14 @@ async fn a_directory_once_a_primary_does_not_vouch_for_records_it_applied() -> T
     .await;
     let client = reqwest::Client::new();
     while replication::pull_once(&client, &base, &replica_state).await? > 0 {}
-    let (want, _) = answered(build_app(primary_state.clone()), query).await?;
+    let (want, certified) = answered(build_app(primary_state.clone()), query).await?;
     assert!(
         want.contains("example.com/rex\""),
         "the primary's rows: {want}"
+    );
+    assert!(
+        certified.as_deref().is_some_and(|s| s != "not-certified"),
+        "the precondition: the primary's read is certified: {certified:?}"
     );
     let (rows, _) = answered(build_app(replica_state.clone()), query).await?;
     assert_eq!(rows, want, "the precondition: the replica caught up");
@@ -265,11 +271,10 @@ async fn a_directory_once_a_primary_does_not_vouch_for_records_it_applied() -> T
     let reopened = open()?;
     let (rows, status) = answered(build_app(reopened.clone()), query).await?;
     assert_eq!(rows, want, "the reopened replica's rows");
-    assert!(
-        status
-            .as_deref()
-            .is_some_and(|s| s != "complete" && !s.starts_with("complete; ")),
-        "the reopened replica vouches for records it applied: {status:?}"
+    assert_eq!(
+        status.as_deref(),
+        Some("not-certified"),
+        "the reopened replica vouches for records it applied"
     );
     Ok(())
 }
