@@ -56,7 +56,7 @@ pub(crate) use exact::{Ids, ground_axiom};
 
 /// The ontology of a revision, kept for the exact services of its queries, charged to the
 /// bounds' budget while kept (SYN-61); and the mark it gave a committed revision
-/// ([`reads_differently`]), so the reads at that revision pass over it once.
+/// ([`reads_differently`]), so reads at that revision one after another pass over it once.
 #[derive(Debug, Default)]
 pub(crate) struct OntologyCache(
     std::sync::Mutex<Option<(u64, KeptOntology)>>,
