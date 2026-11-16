@@ -114,6 +114,10 @@ leave something out.
   reader's graphs hold a triple term, is never `complete`: OWL 2 doesn't define them. For
   triple terms, none known
   ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)).
+- A rebuild of the inferences (`POST …/reasoning/rematerialise`) that fails while it replaces
+  them leaves them uncertified: answers are `not-certified` until a rebuild succeeds. A change of
+  a repository's QL rewriting made in between takes effect with that rebuild, not at once. Run
+  the rebuild again ([HTTP interface](ops/http-api.md#engine-api-apiv1)).
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo` and make no new blank nodes, and with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)).
