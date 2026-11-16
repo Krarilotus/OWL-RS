@@ -18,7 +18,9 @@ store whose asserted data is inconsistent. This one holds statements that are no
    further stops the load and commits nothing: malformed XML or JSON, any error in N3 or
    Binary RDF, a read error, and a file that ends inside a statement, which may be cut off
    (its error says so, with the line the statement starts on). A last statement without a
-   line end is not cut: it loads.
+   line end is not cut: it loads. A Turtle or TriG string whose closing quote isn't within
+   1 MiB of its start (a stray quote, say) stops the load too, with the string's line: a
+   statement longer than the record's text can keep (§2, the same 1 MiB) isn't quarantined.
 2. Quarantined statements are not data: queries, reasoning, exports and statistics don't
    see them. By construction: they never reach the engine.
 3. The load warns: its report carries the count, the load's id and the first examples

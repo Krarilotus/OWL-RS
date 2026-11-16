@@ -31,7 +31,9 @@ use super::lexer::{
 };
 use super::split::Cut;
 use crate::blank::BlankNodes;
-use crate::error::{RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition};
+use crate::error::{
+    MAX_STATEMENT_TEXT, RdfParseError, RdfSyntaxError, SkippedStatement, TextPosition,
+};
 use crate::text::{NOT_IN_IRI, decode_iri, decode_string};
 
 mod n3;
@@ -502,8 +504,10 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 // recovery goes on right after it, skipping nothing more (`resync`).
                 let recovers = syntax && self.settings.recover && !self.settings.n3;
                 self.done = !(recovers && self.resync());
-                // Recovery found no end of the statement before the input's: it may be cut off.
-                let cut = recovers && self.done && self.input.held.is_none();
+                // Recovery stopped with no read error: it found no end of the statement before
+                // the input's (it may be cut off), or a string's closing quote isn't within
+                // the window (`skip_malformed`). Either ends the document.
+                let ends = recovers && self.done && self.input.held.is_none();
                 self.unclosed.clear();
                 self.failed = None;
                 self.ending = Ending::Dot;
@@ -513,7 +517,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     }
                     other => other,
                 };
-                return Some(Err(error.ending(cut, true)));
+                return Some(Err(error.ending(ends, self.input.eof())));
             }
             self.own_triple_terms();
         }
@@ -750,7 +754,9 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     /// costs linear work even from a reader that gives a byte at a time. A read error while
     /// reading ahead is held (`Input::held`) and the search goes on with what was read: the
     /// error comes when the input is next needed, after what it already holds. `false` at
-    /// the end of the input, or when the string's end can't be read (the error then held).
+    /// the end of the input, when the string's end can't be read (the error then held), or
+    /// when it isn't within [`MAX_STATEMENT_TEXT`] bytes: a statement the quarantine couldn't
+    /// keep, and the search would hold the rest of the document.
     fn skip_malformed(&mut self) -> bool {
         loop {
             let no_closing = self.no_closing;
@@ -772,11 +778,12 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                     return true;
                 }
                 Malformed::NeedMore => {
-                    if self.input.held.is_some() {
-                        // The end can't be read: recovery stops, the error comes next.
+                    // The end can't be read (the error comes next), or isn't within the window:
+                    // recovery stops.
+                    if self.input.held.is_some() || data.len() > MAX_STATEMENT_TEXT {
                         return false;
                     }
-                    let wanted = 2 * data.len() + 1;
+                    let wanted = (2 * data.len() + 1).min(MAX_STATEMENT_TEXT + 1);
                     while self.input.data().len() - self.input.position < wanted
                         && !self.input.eof()
                     {
