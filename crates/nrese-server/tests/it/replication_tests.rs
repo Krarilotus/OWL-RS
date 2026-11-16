@@ -326,6 +326,90 @@ async fn a_replica_gives_its_primarys_dl_answers() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// Under `owl2-rl` with the QL rewriting on, a replica gives its primary's status: over a key
+/// the rules build, and over one past 127 properties, which they leave out (reported, not
+/// built), where neither may say `complete` for an answer the key would change.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_gives_its_primarys_status_over_a_key_the_rules_leave_out()
+-> Result<(), Box<dyn std::error::Error>> {
+    let rl = || ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Owl2Rl));
+    let config = |dir: &std::path::Path| StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::On,
+        ..StoreConfig::on_disk(dir)
+    };
+    let posture = DeploymentPosture::OpenWorkbench;
+    let primary_dir = tempfile::tempdir()?;
+    let primary_state = AppState::new(
+        StoreService::new(config(primary_dir.path()))?,
+        rl(),
+        PolicyConfig::default(),
+        AiSuggestionService::disabled(),
+        posture,
+    )
+    .with_replication(ReplicationConfig {
+        mode: ReplicationMode::Primary,
+        ..ReplicationConfig::default()
+    });
+    primary_state.mark_ready();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let primary_app = build_app(primary_state.clone());
+    tokio::spawn(async move {
+        axum::serve(listener, primary_app).await.expect("primary");
+    });
+    // `ex:Kn owl:hasKey ( ex:k1 … ex:kn )`, an `ex:x` and an `ex:y` in `ex:Kn` with the
+    // same values, and `ex:y ex:nameN "Y"`: the key makes them one, so `ex:x` has the name.
+    let key = |n: usize| {
+        let keys: Vec<String> = (1..=n).map(|i| format!("ex:k{i}")).collect();
+        let values: Vec<String> = (1..=n).map(|i| format!("ex:k{i} ex:v{i}")).collect();
+        format!(
+            "PREFIX owl: <http://www.w3.org/2002/07/owl#> INSERT DATA {{ \
+             ex:K{n} owl:hasKey ( {} ) . ex:x{n} a ex:K{n} ; {} . \
+             ex:y{n} a ex:K{n} ; {} ; ex:name{n} \"Y\" }}",
+            keys.join(" "),
+            values.join(" ; "),
+            values.join(" ; ")
+        )
+    };
+    update(&base, &key(2)).await;
+
+    let replica_dir = tempfile::tempdir()?;
+    let replication = ReplicationConfig {
+        mode: ReplicationMode::Replica,
+        primary: Some(base.clone()),
+        poll: std::time::Duration::from_millis(20),
+        ..ReplicationConfig::default()
+    };
+    replication::bootstrap(&replication, replica_dir.path()).await?;
+    let replica_state = AppState::new(
+        StoreService::new(config(replica_dir.path()))?,
+        rl(),
+        PolicyConfig::default(),
+        AiSuggestionService::disabled(),
+        posture,
+    )
+    .with_replication(replication);
+    replica_state.mark_ready();
+    let same = async |n: usize| -> Result<Option<String>, Box<dyn std::error::Error>> {
+        catch_up(&base, &replica_state).await;
+        let query = format!("{PREFIXES}ASK {{ ex:x{n} ex:name{n} \"Y\" }}");
+        let want = answered(build_app(primary_state.clone()), &query).await?;
+        let got = answered(build_app(replica_state.clone()), &query).await?;
+        assert_eq!(got, want, "{n} properties");
+        Ok(want.1)
+    };
+    same(2).await?;
+    update(&base, &key(128)).await;
+    let status = same(128).await?;
+    assert!(
+        status
+            .as_deref()
+            .is_some_and(|s| !s.starts_with("complete")),
+        "{status:?}"
+    );
+    Ok(())
+}
+
 /// A replica's data directory, made by its bootstrap, is durably named (sol-loop round 3 on
 /// DUR-3 review r1, S1): into `sealed/a`, where `sealed` exists but can't be opened (mode
 /// 0o311), so its sync, which must name `a`, fails, the bootstrap must refuse. Before the fix it
