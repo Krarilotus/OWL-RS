@@ -827,7 +827,7 @@ class Driver(unittest.TestCase):
                     self.assertIn(str(where.resolve()), controlled["unknown"])
 
     def test_an_export_goes_beside_its_checkout_and_a_config_there_is_named(self):
-        """P1e (build-controlled-build-3, phuoc-yu): the launcher's free-disk guard measures the
+        """P1e (build-controlled-build-3, the timed host): the launcher's free-disk guard measures the
         filesystem it runs from, the export's; one in the system's temporary directory (a small /tmp)
         refused a build whose target had room. The export goes beside the build's own checkout,
         wherever TEMP is, on the filesystem the guard always measured. Cargo reads a .cargo/config

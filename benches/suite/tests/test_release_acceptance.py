@@ -889,7 +889,7 @@ def exception(case: str = "lab-olympics", outcome: str = "wrong", by: str = "Joh
 
 
 class Authority(Scratch):
-    """D16-125 (audit T03): a known issue explains evidence; only Johannes grants a release exception,
+    """D16-125 (audit T03): a known issue explains evidence; only the owner grants a release exception,
     named and scoped, in the candidate tree's one policy file."""
 
     def test_a_declared_wrong_answer_without_an_owner_exception_blocks_and_is_named(self):
