@@ -360,6 +360,96 @@ fn the_plan_of_an_individual_named_only_in_the_question_is_not_complete_under_a_
     );
 }
 
+/// The same question under the same key, with a triple term the query makes: two reasons
+/// it may not be `complete`, the individual named only in the question under keys and the
+/// RDF 1.2 term OWL 2 doesn't define. Spec: neither its plan nor its run says `complete`,
+/// and each gives both reasons; one doesn't stand in for the other.
+#[test]
+fn a_triple_term_beside_an_individual_named_only_in_the_question_keeps_both_reasons() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":r a owl:ObjectProperty . :A a owl:Class ; owl:hasKey ( :r ) . :a a :A ; :r :x .",
+    )
+    .expect("the key");
+    let read = "SELECT ?t { :b a :A . BIND(TRIPLE(:a, :r, :x) AS ?t) }";
+    let asked = dl
+        .store()
+        .prepare_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "{}{read}",
+            super::PREFIXES
+        )))
+        .expect("prepared");
+    let plan = dl
+        .store()
+        .plan_query(&asked, &nrese_store::CancellationToken::new())
+        .expect("planned")
+        .completeness
+        .expect("a status");
+    let (_, run) = query(&dl, read);
+    let mut wrong = Vec::new();
+    for (place, status) in [("plan", &plan), ("run", &run.shared)] {
+        let texts: Vec<_> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+        let keys = texts
+            .iter()
+            .any(|t| t.starts_with("the query names <") && t.contains("example.com/b"));
+        let rdf12 = texts
+            .iter()
+            .any(|t| t.starts_with("the query uses a triple term"));
+        let line = format!("{place}: {} {texts:?}", status.as_str());
+        eprintln!("{line}");
+        if status.complete || !keys || !rdf12 {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The same question under the same key, with a negation: the individual named only in the
+/// question may miss an answer, and under `NOT EXISTS` a missing answer can make a returned
+/// one wrong. Spec: neither its plan nor its run says `sound` (so neither `complete`), and
+/// each gives both reasons, the keys' and the negation's.
+#[test]
+fn a_negation_beside_an_individual_named_only_in_the_question_is_unsound_under_a_key() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":r a owl:ObjectProperty . :A a owl:Class ; owl:hasKey ( :r ) . :a a :A ; :r :x .",
+    )
+    .expect("the key");
+    let read = "SELECT * { :b a :A . FILTER NOT EXISTS { :b :r :x } }";
+    let asked = dl
+        .store()
+        .prepare_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "{}{read}",
+            super::PREFIXES
+        )))
+        .expect("prepared");
+    let plan = dl
+        .store()
+        .plan_query(&asked, &nrese_store::CancellationToken::new())
+        .expect("planned")
+        .completeness
+        .expect("a status");
+    let (_, run) = query(&dl, read);
+    let mut wrong = Vec::new();
+    for (place, status) in [("plan", &plan), ("run", &run.shared)] {
+        let texts: Vec<_> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+        let keys = texts
+            .iter()
+            .any(|t| t.starts_with("the query names <") && t.contains("example.com/b"));
+        let negation = texts
+            .iter()
+            .any(|t| t.starts_with("the query uses EXISTS over answers that may be missing"));
+        let line = format!("{place}: {} {texts:?}", status.as_str());
+        eprintln!("{line}");
+        if status.sound || status.complete || !keys || !negation {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// One data value in two lexical forms: `"1"` and `"01"` as xsd:integer, and `"1"` as
 /// xsd:int and as xsd:integer (OWL 2 Structural Specification §4: xsd:int's value space
 /// is part of xsd:integer's). The rule set leaves out dt-eq, so where an axiom compares
