@@ -769,13 +769,11 @@ async fn certified_answer(cell: &str, state: &AppState, wrong: &mut Vec<String>)
     };
     let ex = |name: &str| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{name}"));
     let conclusion = nrese_rdf::Triple::new(ex("x"), nrese_rdf::vocab::rdf::TYPE, ex("D"));
-    match state.store().entails(program, &[conclusion]) {
-        Ok(nrese_store::Entailment::NotEntailed) => {
-            eprintln!("DETAIL {cell} | entails: not entailed, status {status:?}");
-            wrong.push(format!("{cell} | entails"));
-        }
-        // Entailed, or refused: the inferred statements aren't certified.
-        Ok(_) | Err(_) => {}
+    // Entailed, or refused (the inferred statements aren't certified), is right.
+    let entailed = state.store().entails(program, &[conclusion]);
+    if let Ok(nrese_store::Entailment::NotEntailed) = entailed {
+        eprintln!("DETAIL {cell} | entails: not entailed, status {status:?}");
+        wrong.push(format!("{cell} | entails"));
     }
     Ok(())
 }

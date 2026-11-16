@@ -216,9 +216,10 @@ async fn answered(
     Ok((body_text(response).await?, status))
 }
 
-/// Under `owl2-dl` a replica gives its primary's answers with the same status: it builds
-/// the bounds from the records, interning no term (its dictionary continues the
-/// primary's, which interns the bounds' terms in its commits).
+/// Under `owl2-dl` a replica gives its primary's answers, `not-certified`: no certificate
+/// comes with the records it applies. It builds the bounds from the records, interning no
+/// term (its dictionary continues the primary's, which interns the bounds' terms in its
+/// commits).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_replica_gives_its_primarys_dl_answers() -> Result<(), Box<dyn std::error::Error>> {
     let dl = || ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Owl2Dl));
@@ -291,7 +292,7 @@ async fn a_replica_gives_its_primarys_dl_answers() -> Result<(), Box<dyn std::er
         let query = format!("{PREFIXES}{query}");
         let want = answered(primary_app.clone(), &query).await?;
         let got = answered(replica_app.clone(), &query).await?;
-        assert_eq!(got, want, "{query}");
+        assert_eq!(got.0, want.0, "{query}");
         assert!(want.1.is_some(), "a status: {query}");
     }
     let (text, status) = answered(
@@ -302,7 +303,7 @@ async fn a_replica_gives_its_primarys_dl_answers() -> Result<(), Box<dyn std::er
     assert!(
         status
             .as_deref()
-            .is_some_and(|s| s == "complete" || s.starts_with("complete; ")),
+            .is_some_and(|s| s.starts_with("not-certified")),
         "{status:?}"
     );
     for x in ["x", "w", "y"] {
