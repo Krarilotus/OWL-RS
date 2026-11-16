@@ -989,20 +989,32 @@ fn a_planned_read_charges_its_view_to_the_query() {
     );
 }
 
-/// Without rules registered the sets can't be computed: no inferred statement is shown.
+/// With the rules switched off and the store not rematerialised, its stack is OWL 2 RL's
+/// closure while no program is in place: a reader of some graphs who sees inferred
+/// statements, by their support or every one, is refused until the store is rematerialised.
 #[test]
-fn without_rules_nothing_inferred_is_shown() {
+fn without_rules_a_reader_of_some_graphs_who_sees_inferences_is_refused() {
     let store = store();
     store.use_reasoning_rules(None);
-    assert!(classes(&store, &reader(true), "a").is_empty());
-    assert_eq!(classes(&store, &reader(false), "a"), ["<D>", "<E>", "<F>"]);
+    for by_support in [true, false] {
+        let read = store.statements(
+            &ReadContext::new(reader(by_support)),
+            &StatementPattern::default(),
+        );
+        let error = read.expect_err("refused");
+        assert!(
+            error.to_string().contains("rematerialis"),
+            "by support {by_support}: {error}"
+        );
+    }
 }
 
 /// A read inside a session answers by the rules in place, as one outside it does
-/// (`without_rules_nothing_inferred_is_shown`; review of O4's fix round, S1): the session's
-/// kept view of its first read is no answer once the rules are switched off. A supported
-/// reader asks for `ex:a a ex:D` inside a session with one unrelated operation, before and
-/// after; outside the session it is no longer shown, and inside it neither.
+/// (`without_rules_a_reader_of_some_graphs_who_sees_inferences_is_refused`; review of O4's
+/// fix round, S1): the session's kept view of its first read is no answer once the rules are
+/// switched off. A supported reader asks for `ex:a a ex:D` inside a session with one
+/// unrelated operation, before and after; after it, outside the session and inside it, the
+/// read is refused until the store is rematerialised.
 #[test]
 fn a_session_read_follows_a_change_of_the_rules() {
     use nrese_store::{CancellationToken, PreparedQuery, StatementOp, StatementsRequest};
@@ -1017,6 +1029,7 @@ fn a_session_read_follows_a_change_of_the_rules() {
         ops: sessions.pending(&id, None).unwrap(),
         session: Some(id.clone()),
     };
+    // The ASK's answer, or the refusal's text.
     let ask = |pending: &StatementsRequest| {
         let prepared = PreparedQuery::parse(&SparqlQueryRequest::new(
             format!("PREFIX ex: <{EX}> ASK {{ ex:a a ex:D }}"),
@@ -1026,13 +1039,22 @@ fn a_session_read_follows_a_change_of_the_rules() {
         let mut out = Vec::new();
         store
             .run_query_pending(pending, &prepared, &CancellationToken::new(), &mut out)
-            .unwrap();
-        String::from_utf8(out).unwrap().contains("true")
+            .map_err(|error| error.to_string())?;
+        Ok::<_, String>(String::from_utf8(out).unwrap().contains("true"))
     };
-    assert!(ask(&in_session), "derived under the rules");
+    assert_eq!(ask(&in_session), Ok(true), "derived under the rules");
     store.use_reasoning_rules(None);
-    assert!(!ask(&StatementsRequest::default()), "outside the session");
-    assert!(!ask(&in_session), "inside the session");
+    for (name, pending) in [
+        ("outside the session", StatementsRequest::default()),
+        ("inside the session", in_session),
+    ] {
+        let got = ask(&pending);
+        assert!(
+            got.as_ref()
+                .is_err_and(|error| error.contains("rematerialis")),
+            "{name}: {got:?}"
+        );
+    }
 }
 
 /// Commits through the mutation pipeline update the sets instead of computing them
