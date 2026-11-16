@@ -7,7 +7,7 @@ use nrese_sparql::CancellationToken;
 use crate::backup::{DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, export_dataset};
 use crate::bulk_load::{BulkLoadReport, BulkLoadRequest, bulk_load};
 use crate::config::{StoreConfig, StoreMode};
-use crate::dl::query::Revision;
+use crate::dl::query::{Revision, answer, plan_status};
 use crate::error::StoreResult;
 use crate::graph_store::{
     GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport, GraphWriteRequest,
@@ -1185,40 +1185,35 @@ impl StoreService {
         let snapshot = self.view_of(latest, prepared.access(), &memory, Some(cancellation))?;
         if let Some(mode) = self.dl_mode(prepared, &snapshot) {
             use crate::dl::query::{Outcome, Read};
-            let detail =
-                match crate::dl::query::answer(self, prepared, cancellation, &memory, mode)? {
-                    Outcome::Answers(answers, status, detail) => {
-                        report(status_for_its_reader(prepared, Some(status), false));
-                        crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
-                        detail
-                    }
-                    // Streamed over the snapshot the status was decided on (L's view where
-                    // L adds memberships, kept per revision, whose identity is its own),
-                    // never a later revision's; or, for a reader of some graphs, whose
-                    // status is withheld, over the latest.
-                    Outcome::Stream(status, read, detail) => {
-                        let snapshot = match read {
-                            Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
-                            Read::Latest => {
-                                self.read_snapshot_within(prepared.access(), &memory, cancellation)?
-                            }
-                        };
-                        let context = dl_context(mode, &status);
-                        run_query(
-                            &snapshot,
-                            prepared,
-                            &self.settings,
-                            cancellation,
-                            &memory,
-                            out,
-                            |_| {
-                                report(status_for_its_reader(prepared, Some(status), false));
-                                context
-                            },
-                        )?;
-                        detail
-                    }
-                };
+            let detail = match answer(self, &snapshot, prepared, cancellation, &memory, mode)? {
+                Outcome::Answers(answers, status, detail) => {
+                    report(status_for_its_reader(prepared, Some(status), false));
+                    crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
+                    detail
+                }
+                // Streamed over the snapshot the status was decided on (L's view where
+                // L adds memberships, kept per revision, whose identity is its own),
+                // never a later revision's.
+                Outcome::Stream(status, read, detail) => {
+                    let snapshot = match read {
+                        Read::Lower(snapshot) | Read::At(snapshot) => snapshot,
+                    };
+                    let context = dl_context(mode, &status);
+                    run_query(
+                        &snapshot,
+                        prepared,
+                        &self.settings,
+                        cancellation,
+                        &memory,
+                        out,
+                        |_| {
+                            report(status_for_its_reader(prepared, Some(status), false));
+                            context
+                        },
+                    )?;
+                    detail
+                }
+            };
             return Ok((Some(detail), None));
         }
         #[cfg(test)]
@@ -1448,11 +1443,11 @@ impl StoreService {
                 crate::DlAnswers::Exact => crate::DlAnswers::CertainWhereComplete,
                 other => other,
             };
-            let (status, detail) =
-                match crate::dl::query::answer(self, prepared, cancellation, &memory, mode)? {
-                    crate::dl::query::Outcome::Answers(_, status, detail)
-                    | crate::dl::query::Outcome::Stream(status, _, detail) => (status, detail),
-                };
+            let answered = answer(self, &snapshot, prepared, cancellation, &memory, mode)?;
+            let (status, detail) = match answered {
+                crate::dl::query::Outcome::Answers(_, status, detail)
+                | crate::dl::query::Outcome::Stream(status, _, detail) => (status, detail),
+            };
             explanation.completeness = Some(status);
             explanation.decided_by = detail.paths;
             explanation.candidates = Some(nrese_sparql::Candidates {
@@ -1500,7 +1495,7 @@ impl StoreService {
             plan_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         let at = Revision::Committed(&snapshot);
         planned.completeness = match self.dl_mode(prepared, &snapshot) {
-            Some(_) => Some(crate::dl::query::plan_status(self, prepared, cancellation)?),
+            Some(_) => Some(plan_status(self, &snapshot, prepared, cancellation)?),
             None => self.status_outside_dl(prepared, planned.ql.as_ref(), at),
         };
         Ok(planned)
