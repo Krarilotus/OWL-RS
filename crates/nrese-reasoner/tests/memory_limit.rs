@@ -39,6 +39,7 @@ fn reasoning_stops_at_the_process_memory_limit() {
         rules: &rules,
         lists: None,
         schema: &schema,
+        equality: nrese_reasoner::representatives::same_as(&rules, schema.same_as()),
     };
     let update = delta::update_until(&base, &[[x, ty, b]], &[], compiled, None, NEVER);
     assert!(matches!(update, Err(Interrupted { .. })), "commit");

@@ -131,6 +131,7 @@ eq-sym: (?x rdfs:seeAlso ?y) -> (?y rdfs:isDefinedBy ?x)";
         rules: &rules,
         lists: None,
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let closure = |asserted: &[_]| batch::materialise(asserted, &rules, None, &schema).derived;
     let after: Vec<_> = asserted

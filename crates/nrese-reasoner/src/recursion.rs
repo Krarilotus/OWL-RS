@@ -55,20 +55,21 @@ fn node(atom: &Atom, rdf_type: u64, head: bool) -> Node {
 
 /// Which rules of a ground program are non-recursive (by index into `rules`).
 /// `same_as` is the `owl:sameAs` id the rules do equality over, if they do: then the
-/// replacement rules among them are the module's (see the module docs); every other rule,
-/// whatever its name, is counted as written. `partners` gives the `owl:sameAs` partners of
-/// a term (other than itself): classes and properties with partners are linked to them (see the module docs). Its error ends the
+/// replacement rules among them (by `equality`, each rule's built-in equality rule) are the
+/// module's (see the module docs); every other rule, whatever its name, is counted as written.
+/// `partners` gives the `owl:sameAs` partners of a term (other than itself): classes and
+/// properties with partners are linked to them (see the module docs). Its error ends the
 /// answer: the keys it is asked about come from the grounded rules, one class pair per
 /// subclass edge, so they grow with the schema (fix check r2, R3-F1: a stopped read as "no
 /// partners" let it read every later key's).
 pub fn non_recursive<E>(
     rules: &[Rule],
+    equality: &[Option<&str>],
     rdf_type: u64,
     same_as: Option<u64>,
     partners: &dyn Fn(u64) -> Result<Vec<u64>, E>,
 ) -> Result<Vec<bool>, E> {
-    let counted =
-        |rule: &Rule| !same_as.is_some_and(|s| super::batch::is_replacement_rule(rule, s));
+    let counted = |r: usize| !(same_as.is_some() && super::batch::is_replacement(equality[r]));
     let mut index: HashMap<Node, usize> = HashMap::new();
     let id = |n: Node, index: &mut HashMap<Node, usize>| {
         let next = index.len();
@@ -76,8 +77,8 @@ pub fn non_recursive<E>(
     };
     let mut edges: Vec<(usize, usize)> = Vec::new();
     let mut atoms_of: Vec<(Vec<usize>, Vec<usize>)> = Vec::with_capacity(rules.len());
-    for rule in rules {
-        let (body, head): (Vec<usize>, Vec<usize>) = match (&rule.head, counted(rule)) {
+    for (r, rule) in rules.iter().enumerate() {
+        let (body, head): (Vec<usize>, Vec<usize>) = match (&rule.head, counted(r)) {
             (Head::Facts(atoms), true) => (
                 rule.body
                     .iter()
@@ -99,7 +100,7 @@ pub fn non_recursive<E>(
         // of its terms: the copy keeps the fact's key (or moves it to a partner key,
         // linked below), but it depends on the `sameAs` fact, which therefore feeds every
         // key.
-        if !counted(rule) {
+        if !counted(r) {
             for atom in &rule.body {
                 if let Node::Predicate(_) = node(atom, rdf_type, false) {
                     let same_as = id(node(atom, rdf_type, false), &mut index);
@@ -162,9 +163,9 @@ pub fn non_recursive<E>(
     let component = components(index.len(), &edges);
     Ok(atoms_of
         .iter()
-        .zip(rules)
-        .map(|((body, head), rule)| {
-            counted(rule)
+        .enumerate()
+        .map(|(r, (body, head))| {
+            counted(r)
                 && !head.is_empty()
                 && !body.is_empty()
                 && head
@@ -262,7 +263,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            non_recursive(&rules, ty, None, &no_partners),
+            non_recursive(&rules, &[None::<&str>; 6], ty, None, &no_partners),
             Ok(vec![true, true, false, false, true, false])
         );
         // C sameAs D: C and D are one component, so C ⊑ D is recursive.
@@ -274,7 +275,7 @@ mod tests {
             })
         };
         assert_eq!(
-            non_recursive(&rules[..2], ty, None, &same),
+            non_recursive(&rules[..2], &[None; 2], ty, None, &same),
             Ok(vec![false, true]),
             "D ⊑ E stays non-recursive"
         );
@@ -294,7 +295,7 @@ mod tests {
             ),
         ];
         assert_eq!(
-            non_recursive(&rules, ty, None, &no_partners),
+            non_recursive(&rules, &[None::<&str>; 3], ty, None, &no_partners),
             Ok(vec![false, false, false])
         );
     }

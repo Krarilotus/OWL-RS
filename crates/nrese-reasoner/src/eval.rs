@@ -2335,6 +2335,9 @@ pub struct GroundProgram {
     pub rules: Vec<Rule>,
     /// Per rule: the closed family it is an instance of, if any ([`closed_family`]).
     families: Vec<Option<u64>>,
+    /// Per rule: the built-in equality rule it is over `owl:sameAs`, if any, asked once as
+    /// it is filed ([`super::equality_rules`]); one filed by [`Self::add`] is none.
+    pub equality: Vec<Option<&'static str>>,
     /// The relations closed families read and produce by name (`cax-sco`'s `rdf:type`),
     /// each with its family: the family claims the relation's closed part.
     pub family_relations: std::collections::BTreeMap<u64, u64>,
@@ -2378,16 +2381,17 @@ impl std::fmt::Debug for GroundProgram {
 impl GroundProgram {
     /// Files one ground fact rule; returns its index if it is new and has a body.
     pub fn add(&mut self, rule: Rule) -> Option<usize> {
-        self.add_with(rule, Vec::new(), None)
+        self.add_with(rule, Vec::new(), None, None)
     }
 
-    /// [`Self::add`], with the schema facts the instance was grounded on, and the closed
-    /// family it is an instance of, if any ([`closed_family`]).
+    /// [`Self::add`], with the schema facts the instance was grounded on, the closed
+    /// family it is an instance of, if any ([`closed_family`]), and its equality rule.
     fn add_with(
         &mut self,
         rule: Rule,
         premises: Vec<Triple>,
         family: Option<u64>,
+        equality: Option<&'static str>,
     ) -> Option<usize> {
         if let Some(p) = transitive_predicate(&rule) {
             self.transitive_with(p, premises);
@@ -2422,6 +2426,7 @@ impl GroundProgram {
             self.rules.push(rule);
             self.premises.push(premises);
             self.families.push(family);
+            self.equality.push(equality);
             Some(self.rules.len() - 1)
         }
     }
@@ -2645,7 +2650,8 @@ impl GroundProgram {
                     .chain(extra.iter().copied())
                     .collect();
                 if let Some(rule) = schema.rewrite_heads(g.rule) {
-                    facts.extend(self.add_with(rule, premises, family));
+                    let equality = super::equality_rules::equality_rule(&rule, schema.same_as());
+                    facts.extend(self.add_with(rule, premises, family, equality));
                 }
             }
         }

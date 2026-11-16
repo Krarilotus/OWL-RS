@@ -93,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rules: &rules,
         lists: Some(&lists),
         schema: &schema,
+        equality: nrese_reasoner::representatives::same_as(&rules, schema.same_as()),
     };
     let base_before = MemoryBase::new(&asserted, &closure.derived);
     let cache = program(&base_before, compiled);
