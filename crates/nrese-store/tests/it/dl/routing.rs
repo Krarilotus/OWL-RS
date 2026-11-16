@@ -4,8 +4,13 @@
 //! engine), Horn and EL ontologies to the context core, the rest to the hypertableau.
 //! Each test names the route that must be taken (the performance choice's guard).
 
+use std::sync::Arc;
+
+use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_sparql::Completeness;
-use nrese_store::{MutationError, MutationPipeline, RejectKind, StatementOp};
+use nrese_store::{
+    MutationError, MutationPipeline, RejectKind, StatementOp, StoreConfig, StoreService,
+};
 
 use super::queries::query;
 use super::versions::{in_transaction, ntriples};
@@ -640,22 +645,34 @@ fn a_plain_clash_is_rejected_as_inconsistent_on_both_routes() {
 }
 
 /// A class name that is also an individual (punning, OWL 2 Structural Specification §5.9)
-/// with no equality reaching it: PR1 needs no punning, so the ontology leaves the RL
-/// route, and `:rex a :Dog`, entailed, keeps the status the DL path gives it.
+/// with no equality reaching it, or only its own (`:Dog owl:sameAs :Dog`, R1-F5): PR1
+/// needs no punning, so the ontology leaves the RL route, and `:rex a :Dog`, entailed,
+/// keeps the status the DL path gives it.
 #[test]
 fn a_punned_class_with_no_equality_stays_sound_off_the_rules_route() {
-    let dl = pipeline();
-    insert(&dl, ":Dog a owl:Class . :Dog a :Species . :rex a :Dog .").expect("a punned class name");
-    let route = dl.store().dl_bounds().last;
-    let (rows, status) = query(&dl, "ASK { :rex a :Dog }");
-    eprintln!(
-        "route {route}: answers {rows:?}, status {} ({:?})",
-        status.shared.as_str(),
-        status.reasons()
-    );
-    assert_ne!(route, "rules", "a punning ontology stayed on the RL route");
-    assert_eq!(rows, ["true"]);
-    assert_ne!(status.shared.as_str(), "unsound", "{:?}", status.reasons());
+    for extra in ["", ":Dog owl:sameAs :Dog ."] {
+        let dl = pipeline();
+        insert(
+            &dl,
+            &format!(":Dog a owl:Class . :Dog a :Species . :rex a :Dog . {extra}"),
+        )
+        .expect("a punned class name");
+        let route = dl.store().dl_bounds().last;
+        let (rows, status) = query(&dl, "ASK { :rex a :Dog }");
+        eprintln!(
+            "{extra} route {route}: answers {rows:?}, status {} ({:?})",
+            status.shared.as_str(),
+            status.reasons()
+        );
+        assert_ne!(route, "rules", "a punning ontology stayed on the RL route");
+        assert_eq!(rows, ["true"]);
+        assert_ne!(
+            status.shared.as_str(),
+            "unsound",
+            "{extra} {:?}",
+            status.reasons()
+        );
+    }
 }
 
 /// Under `owl2-rl` the answer is the closure's: the punning and the annotation inputs give
@@ -806,10 +823,14 @@ fn a_property_under_a_built_in_one_entails_no_subclass() {
     );
 }
 
+/// Beside each ontology of [`unmarked`]: `:y a :E`, entailed under both readings.
+const ENTAILED: &str = ":y a :F . :F rdfs:subClassOf :E .";
+
 /// Over an ontology with annotation-property axioms, and over one with an equality
-/// reaching a punned name, the status line of each whose `read` isn't `unsound` with the
-/// reason.
-fn unmarked(read: impl Fn(&MutationPipeline) -> Completeness) -> Vec<String> {
+/// reaching a punned name, each with [`ENTAILED`] beside it: the line of each whose `read`
+/// of `?x a :E` doesn't answer `y` alone (the entailed row kept, R1-F5), or isn't `unsound`
+/// with the reason.
+fn unmarked(read: impl Fn(&MutationPipeline) -> (Vec<String>, Completeness)) -> Vec<String> {
     let mut wrong = Vec::new();
     for (data, reason) in [
         (ANNOTATION_AXIOMS, "annotation-property axioms"),
@@ -819,13 +840,16 @@ fn unmarked(read: impl Fn(&MutationPipeline) -> Completeness) -> Vec<String> {
         ),
     ] {
         let dl = pipeline();
-        insert(&dl, data).expect("committed");
-        let status = read(&dl);
+        insert(&dl, &format!("{data} {ENTAILED}")).expect("committed");
+        let (rows, status) = read(&dl);
         let reasons: Vec<&str> = status.reasons.iter().map(|r| r.text.as_str()).collect();
-        let line = format!("{reason}: status {} ({reasons:?})", status.as_str());
+        let line = format!(
+            "{reason}: {rows:?}, status {} ({reasons:?})",
+            status.as_str()
+        );
         eprintln!("{line}");
         let named = reasons.iter().any(|r| r.contains(reason));
-        if status.as_str() != "unsound" || !named {
+        if rows != ["y"] || status.as_str() != "unsound" || !named {
             wrong.push(line);
         }
     }
@@ -837,8 +861,11 @@ fn unmarked(read: impl Fn(&MutationPipeline) -> Completeness) -> Vec<String> {
 /// everywhere).
 #[test]
 fn a_read_of_the_inferred_statements_alone_carries_the_marks() {
-    let read = "SELECT ?x FROM <http://www.ontotext.com/implicit> { ?x ?p ?o }";
-    let wrong = unmarked(|dl| query(dl, read).1.shared);
+    let read = "SELECT ?x FROM <http://www.ontotext.com/implicit> { ?x a :E }";
+    let wrong = unmarked(|dl| {
+        let (rows, status) = query(dl, read);
+        (rows, status.shared)
+    });
     assert!(wrong.is_empty(), "not marked: {wrong:#?}");
 }
 
@@ -853,10 +880,58 @@ fn a_read_inside_a_transaction_carries_the_marks() {
             ),
             contexts: Vec::new(),
         };
-        in_transaction(dl, vec![add], "SELECT ?x { ?x ?p ?o }")
-            .1
-            .expect("a status")
+        let (out, status) = in_transaction(dl, vec![add], "SELECT ?x { ?x a :E }");
+        let json: serde_json::Value = serde_json::from_str(&out).expect("json results");
+        let rows = json["results"]["bindings"]
+            .as_array()
+            .expect("bindings")
+            .iter();
+        let rows = rows.map(|row| row["x"]["value"].as_str().unwrap_or("-"));
+        let rows = rows.map(|x| x.trim_start_matches("http://example.com/").to_owned());
+        (rows.collect(), status.expect("a status"))
     });
+    assert!(wrong.is_empty(), "not marked: {wrong:#?}");
+}
+
+/// R1-F5: under compact equality the inferred statements keep one name per class of equal
+/// terms, its representative (the smallest id, so the name met first), and reads expand
+/// it. A class name that is also an individual equal to another is found either way: as
+/// its class's representative (`:Dog` first) and as an alias (`:Canis` first). The answer
+/// `true` comes `unsound` with the reason.
+#[test]
+fn a_punned_name_equal_to_another_marks_the_answers_under_compact_equality() {
+    let mut wrong = Vec::new();
+    for data in [
+        ":Dog a owl:Class , :Species ; owl:sameAs :Canis . :rex a :Dog .",
+        ":Canis owl:sameAs :Dog . :Dog a owl:Class , :Species . :rex a :Dog .",
+    ] {
+        let config = StoreConfig {
+            equality_by_representatives: true,
+            equality_compact: true,
+            ..crate::support::in_memory_store_config()
+        };
+        let dl = MutationPipeline::new(
+            Arc::new(StoreService::new(config).expect("store")),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Dl,
+            ))),
+        );
+        insert(&dl, data).expect("committed");
+        let (rows, status) = query(&dl, "ASK { :rex a :Dog }");
+        let line = format!(
+            "{data}: {rows:?}, status {} ({:?})",
+            status.shared.as_str(),
+            status.reasons()
+        );
+        eprintln!("{line}");
+        let named = status
+            .reasons()
+            .iter()
+            .any(|r| r.contains("an individual equal"));
+        if rows != ["true"] || status.shared.as_str() != "unsound" || !named {
+            wrong.push(line);
+        }
+    }
     assert!(wrong.is_empty(), "not marked: {wrong:#?}");
 }
 

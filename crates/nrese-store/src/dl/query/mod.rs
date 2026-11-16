@@ -104,16 +104,26 @@ pub(crate) fn ontology_at(
     // The previous revision's, let go by the cache before this one is read and charged (a
     // reader still holding it keeps its charge).
     drop(cache.take());
+    let held = read_ontology(store, snapshot)?;
+    *cache = Some((snapshot.revision(), Arc::clone(&held)));
+    Ok(held)
+}
+
+/// The asserted ontology of `snapshot`, read and charged as [`ontology_at`] reads it, and
+/// held by its reader alone: for a transaction's pending state, whose revision number is
+/// its base's and so names other data in the cache (R1-F3).
+fn read_ontology(
+    store: &StoreService,
+    snapshot: &Snapshot,
+) -> Result<KeptOntology, nrese_exec::BudgetExceeded> {
     let kept = store.dl().bounds.kept();
     let ontology = Arc::new(source::read_snapshot(snapshot, Arc::clone(kept))?);
     let bytes = nrese_dl::memory::ontology_bytes(&ontology);
-    let held = Arc::new(nrese_exec::cell::Kept::charge(
+    Ok(Arc::new(nrese_exec::cell::Kept::charge(
         ontology,
         bytes,
         Arc::clone(kept),
-    )?);
-    *cache = Some((snapshot.revision(), Arc::clone(&held)));
-    Ok(held)
+    )?))
 }
 
 /// The data's consistency at `snapshot`'s revision: recorded by its commit, proved by U1,
@@ -257,19 +267,32 @@ impl Status {
 /// is closed; otherwise the bounds decide when it runs.
 pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Completeness {
     let analysis = analyse(prepared.query());
-    let mut completeness = plan_status_built(store, prepared, &analysis).completeness;
+    let at = super::bounds::view(store);
+    let mut completeness = plan_status_built(prepared, &analysis, &at).completeness;
     certify(&mut completeness, prepared.query(), "dl", true);
-    mark(store, &mut completeness);
+    mark(store, Revision::Decided(&at), &mut completeness);
     completeness
 }
 
+/// The data a status is composed for ([`mark`]): the view the answers were decided on, or
+/// the snapshot a read without the bounds ran on, committed or with a transaction's
+/// operations pending (whose revision number is its base's, so it is read afresh).
+#[derive(Clone, Copy)]
+pub(crate) enum Revision<'a> {
+    Decided(&'a (Snapshot, Arc<View>)),
+    Committed(&'a Snapshot),
+    Pending(&'a Snapshot),
+}
+
 /// Every answer `unsound` where OWL 2 DL may not entail what the RL closure (L) holds
-/// ([`reads_differently`]): composed last by both DL entry points, by a read of the
-/// inferred statements alone (`StoreService::status_without_dl`) and by a read inside a
-/// transaction with operations pending (`StoreService::run_query_pending_reporting`).
-pub(crate) fn mark(store: &StoreService, completeness: &mut Completeness) {
-    let (snapshot, view) = super::bounds::view(store);
-    if let Some(reason) = reads_differently(store, &snapshot, &view) {
+/// ([`reads_differently`]) in the data `at` it was read from, never a later revision's (R1-F2,
+/// F3): composed last by both DL entry points, by a read of the inferred statements alone
+/// (`StoreService::status_without_dl`) and by a read inside a transaction with operations
+/// pending (`StoreService::run_query_pending_reporting`). It reads every graph, and a reader
+/// of some graphs is told no status under `owl2-dl` (`status_for_its_reader`); the ontology
+/// it reads is the asserted statements', which a reader's view leaves as they are.
+pub(crate) fn mark(store: &StoreService, at: Revision<'_>, completeness: &mut Completeness) {
+    if let Some(reason) = reads_differently(store, at) {
         completeness.unsound("dl", reason);
     }
 }
@@ -279,16 +302,19 @@ pub(crate) fn mark(store: &StoreService, completeness: &mut Completeness) {
 /// (OWL 2 DL gives them no meaning for the terms annotated; the rules use them) and no
 /// punning, of which only an equality reaching a class or property name reads otherwise
 /// (OWL 2 DL equates the individuals only; the rules the names too). Off the RL route only,
-/// which both leave: one read of the revision's ontology ([`ontology_at`]), whose refusal
-/// leaves it unknown.
-fn reads_differently(store: &StoreService, snapshot: &Snapshot, view: &View) -> Option<String> {
+/// which both leave (`routed_to_rules` needs neither): one read of the ontology `at`
+/// ([`ontology_at`], a pending one's of its own), whose refusal leaves it unknown.
+fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
     const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, and the \
                         answers are read from their closure; use the owl2-rl mode, whose \
                         promise is the rules' reading";
-    if view.rules {
-        return None;
-    }
-    let Ok(ontology) = ontology_at(store, snapshot) else {
+    let (snapshot, ontology) = match at {
+        Revision::Decided((_, view)) if view.rules => return None,
+        Revision::Decided((snapshot, _)) => (snapshot, ontology_at(store, snapshot)),
+        Revision::Committed(snapshot) => (snapshot, ontology_at(store, snapshot)),
+        Revision::Pending(snapshot) => (snapshot, read_ontology(store, snapshot)),
+    };
+    let Ok(ontology) = ontology else {
         return Some(format!(
             "whether OWL 2 DL reads the ontology otherwise than the OWL 2 RL rules isn't known \
              ({}): {ONLY}",
@@ -375,29 +401,28 @@ fn certify(completeness: &mut Completeness, query: &Query, source: &'static str,
 }
 
 fn plan_status_built(
-    store: &StoreService,
     prepared: &PreparedQuery,
     analysis: &Analysis,
+    (snapshot, view): &(Snapshot, Arc<View>),
 ) -> Status {
     if prepared.access().is_some() || prepared.has_dataset() {
         return Status::sound_only(
             "the query reads part of the data: not checked against the bounds",
         );
     }
-    let (snapshot, view) = super::bounds::view(store);
     if let Some(what) = unbounded(analysis) {
         return Status::sound_only(format!(
             "the query reads {what}: entailed schema statements aren't bounded"
         ));
     }
-    if let Some(what) = untyped_same_as(prepared.query(), &view) {
+    if let Some(what) = untyped_same_as(prepared.query(), view) {
         return Status::sound_only(format!("the query reads {what}: {DENIED}"));
     }
     // Answered over L alone; [`certify_closure`] says what that misses.
     if analysis.reflexive_same_as {
         return Status::complete();
     }
-    if closed(analysis, &view, &snapshot) {
+    if closed(analysis, view, snapshot) {
         let mut status = Status::complete();
         status.path("closed-predicates");
         return status;
@@ -420,14 +445,16 @@ pub(crate) fn answer(
 ) -> StoreResult<Outcome> {
     cancellation.check()?;
     let analysis = analyse(prepared.query());
-    let mut outcome = decide_answers(store, prepared, &analysis, cancellation, memory, mode)?;
+    // One view for the answers and their status: a commit in between changes neither (R1-F2).
+    let at = super::bounds::view(store);
+    let mut outcome = decide_answers(store, prepared, &analysis, &at, cancellation, memory, mode)?;
     #[cfg(test)]
     crate::service::hooks::run(&crate::service::hooks::AFTER_DECIDED);
     cancellation.check()?;
     match &mut outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => {
             certify(status, prepared.query(), "dl", true);
-            mark(store, status);
+            mark(store, Revision::Decided(&at), status);
         }
     }
     let status = match &outcome {
@@ -466,8 +493,8 @@ pub(crate) enum Outcome {
 /// What a streamed answer reads: the revision its status was decided on, never a later
 /// one (a commit in between could add what only U1 finds).
 pub(crate) enum Read {
-    /// The store's latest snapshot as the reader sees it: for a status decided without the
-    /// bounds (sound only, whatever the revision).
+    /// The store's latest snapshot as the reader sees it: for a reader of some graphs, whose
+    /// status under `owl2-dl` is withheld (`status_for_its_reader`), so no revision's.
     Latest,
     /// The snapshot the status was decided on, where L adds nothing to it (cacheable).
     At(Snapshot),
@@ -479,6 +506,7 @@ fn decide_answers(
     store: &StoreService,
     prepared: &PreparedQuery,
     analysis: &Analysis,
+    (snapshot, view): &(Snapshot, Arc<View>),
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
     mode: DlAnswers,
@@ -493,15 +521,15 @@ fn decide_answers(
         .stream(Read::Latest));
     }
     if prepared.has_dataset() {
+        // Over the decided snapshot, every graph's for this reader: the status's (R1-F2).
         return Ok(Status::sound_only(
             "the query names its dataset: answers are over those graphs, not checked \
              against the bounds",
         )
-        .stream(Read::Latest));
+        .stream(Read::At(snapshot.clone())));
     }
-    let (snapshot, view) = super::bounds::view(store);
     let mut status = Status::complete();
-    let consistency = consistency_at(store, &snapshot, &view, cancellation, deadline, memory);
+    let consistency = consistency_at(store, snapshot, view, cancellation, deadline, memory);
     cancellation.check()?;
     match consistency {
         Verdict::Consistent => {}
@@ -526,49 +554,49 @@ fn decide_answers(
             "the query reads {what}: entailed schema statements aren't bounded (the RL \
              closure's are sound; /classification has the subsumptions under OWL 2 DL)"
         ));
-        return Ok(status.stream(lower_view(&view)));
+        return Ok(status.stream(lower_view(view)));
     }
-    if let Some(what) = untyped_same_as(prepared.query(), &view) {
+    if let Some(what) = untyped_same_as(prepared.query(), view) {
         status.add(format!("the query reads {what}: {DENIED}"));
-        return Ok(status.stream(lower_view(&view)));
+        return Ok(status.stream(lower_view(view)));
     }
     // Answered over L alone; [`certify_closure`] says what that misses.
     if analysis.reflexive_same_as {
-        return Ok(status.stream(lower_view(&view)));
+        return Ok(status.stream(lower_view(view)));
     }
-    if closed(analysis, &view, &snapshot) {
+    if closed(analysis, view, snapshot) {
         // One evaluation, streamed: L's answers are the certain ones.
         status.path("closed-predicates");
-        return Ok(status.stream(lower_view(&view)));
+        return Ok(status.stream(lower_view(view)));
     }
-    if closed_for_answers(analysis, &view, &snapshot) {
+    if closed_for_answers(analysis, view, snapshot) {
         // The same, where the gap has only individuals no answer can name.
         status.path("skolem-only-gap");
         #[cfg(debug_assertions)]
         return Ok(status.answers(check_closed_for_answers(
-            &view,
+            view,
             prepared,
             settings,
             cancellation,
             memory,
         )?));
         #[cfg(not(debug_assertions))]
-        return Ok(status.stream(lower_view(&view)));
+        return Ok(status.stream(lower_view(view)));
     }
     if let Some(why) = &view.unavailable {
         status.add(why.clone());
-        return Ok(status.stream(lower_view(&view)));
+        return Ok(status.stream(lower_view(view)));
     }
     if mode == DlAnswers::Sound {
         status.add("dl.answers = sound: the lower bound alone".to_owned());
-        return Ok(status.stream(lower_view(&view)));
+        return Ok(status.stream(lower_view(view)));
     }
     if let Some(op) = analysis.not_monotone {
         status.add(format!(
             "the query uses {op}, which isn't monotone, over predicates whose lower and upper \
              bounds differ"
         ));
-        return Ok(status.stream(lower_view(&view)));
+        return Ok(status.stream(lower_view(view)));
     }
     if matches!(prepared.query(), Query::Construct { .. }) {
         status.add(
@@ -576,7 +604,7 @@ fn decide_answers(
              predicates it reads are closed"
                 .to_owned(),
         );
-        return Ok(status.stream(lower_view(&view)));
+        return Ok(status.stream(lower_view(view)));
     }
     use crate::query_executor::evaluate_bound;
     use nrese_sparql::TypedResults;
