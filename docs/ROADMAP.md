@@ -2,7 +2,7 @@
 
 This page gives the order of work, the detail of the "planned" list in the
 [scope](what-it-covers.md#scope), and only a stage marked done here is in the code. What is done
-is in [STATUS.md](STATUS.md), what is left before v2 goes to `main` is the status table of the
+is in [STATUS.md](STATUS.md), what is left before 1.5 goes to `main` is the status table of the
 [merge checklist](plan/2026-10-05-v2-merge-checklist.md), and why things are decided as they
 are is in [adr/](adr/), above all [ADR-0010](adr/0010-standing-product-decisions.md).
 
@@ -17,13 +17,13 @@ machines only read replicas are built so far.
 
 This order dates from 5 October 2026.
 
-1. Finish v2 with the open items of the merge checklist, as its
+1. Finish 1.5 with the open items of the merge checklist, as its
    [status table](plan/2026-10-05-v2-merge-checklist.md) lists them.
 2. Benchmark it with the fast regression suite, the core workloads with a real
    reasoning workload, workloads other stores are designed for as well (so that no result
    rests on a choice that suits NRESE), and a defaults track beside the
    best-configuration track ([benches/PROTOCOL.md](../benches/PROTOCOL.md)).
-3. Merge v2 into `main` when every guard is green and nothing regressed.
+3. Bring 1.5 to `main` when every guard is green and nothing regressed.
 4. Concise docs and a major refactoring, with the README and docs short enough to
    contribute from, files over about 600 lines split, Miri over the unsafe code, measured
    test coverage, work on duplicate dependency versions and the last typed errors.

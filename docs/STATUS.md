@@ -10,7 +10,7 @@ in the branch), deferred (not done, with the reason and where it went) or open.
 The [roadmap](ROADMAP.md) says why and in which order, and the designs are in
 [design/](design/).
 
-What is left before v2 goes to `main`, and its state, is the status table of the
+What is left before 1.5 goes to `main`, and its state, is the status table of the
 [merge checklist](plan/2026-10-05-v2-merge-checklist.md) §1, and the sections from "Audit
 work" on are the record by goal.
 
@@ -18,7 +18,7 @@ work" on are the record by goal.
 
 These are the changes that affect stored data, answers or clients, with their dates and what to
 do.
-- For a store written by an earlier version, [upgrade](ops/server-setup.md#131-upgrading-a-store-from-main-to-v2)
+- For a store written by an earlier version, [upgrade](ops/server-setup.md#upgrading)
   says what changes on purpose and how to roll back.
 - Reasoning semantics versions 4 (7 November 2026) and 3 (28 October 2026) rebuild some stored
   verdicts and closures once, and [reasoning semantics](spec/reasoning-semantics.md) says which.

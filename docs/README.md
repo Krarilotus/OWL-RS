@@ -14,7 +14,7 @@ list wins, and the lower one is corrected in the same change.
 | Which shared contract should a caller use, and where are the known bypasses? | [architecture/contracts.md](architecture/contracts.md) |
 | Why was it decided so? | [adr/](adr/), and the standing decisions in [ADR-0010](adr/0010-standing-product-decisions.md) |
 | In which order is it built? | [ROADMAP.md](ROADMAP.md) |
-| What is done, what is open? | [STATUS.md](STATUS.md), with the open-work list, and before v2 goes to `main`, the status table of the [merge checklist](plan/2026-10-05-v2-merge-checklist.md) |
+| What is done, what is open? | [STATUS.md](STATUS.md), with the open-work list, and before 1.5 goes to `main`, the status table of the [merge checklist](plan/2026-10-05-v2-merge-checklist.md) |
 | Where are the gaps, who owns each? | [plan/2026-10-05-coverage.md](plan/2026-10-05-coverage.md) |
 | How is NRESE fast, which ideas worked and which didn't? | [design/performance.md](design/performance.md), with the wins to keep and their guards (§0), the ideas by layer and the lab log |
 | How does a component work? | [design/](#design) |

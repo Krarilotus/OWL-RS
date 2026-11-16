@@ -386,7 +386,6 @@ soak held about 100 MiB.
 `benches/probes/soak.py` reads every gauge above beside the resident memory and prints each
 one's slope.
 
-<a id="131-upgrading-a-store-from-main-to-v2"></a>
 ## Upgrading
 
 A data directory written by an earlier NRESE, `main` included, opens as it is, with no
