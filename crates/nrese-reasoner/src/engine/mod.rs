@@ -133,7 +133,7 @@ impl Program {
         let unnamed = UnnamedVocabulary::new(&mut constants);
         let things = rules.iter().any(|rule| rule.name == "scm-cls");
         let rdf_type = constants.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
-        let same_as = crate::representatives::same_as(&rules);
+        let same_as = crate::representatives::same_as(&rules, schema.same_as());
         let mut axioms = program
             .axiom_triples(&mut constants)
             .expect("the built-in axioms parse (tested), user facts are checked at startup");

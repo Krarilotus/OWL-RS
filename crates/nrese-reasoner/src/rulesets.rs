@@ -87,6 +87,10 @@ pub enum SemanticPart {
     /// the guards hold where members of the classes satisfy them, not the representatives
     /// alone (`representatives::over_classes`).
     GuardsOverClasses,
+    /// Rules named like OWL 2 RL's equality rules, or holding them under other names. 1 (16 Nov
+    /// 2026): the equality module stands in for the rules that say what those say, whatever
+    /// their names (`equality_rules`), not for the rules so named.
+    EqualityRules,
 }
 
 impl SemanticPart {
@@ -94,6 +98,7 @@ impl SemanticPart {
     pub fn version(self) -> (&'static str, u32) {
         match self {
             Self::GuardsOverClasses => ("guards-over-classes", 1),
+            Self::EqualityRules => ("equality-rules", 1),
         }
     }
 }

@@ -523,7 +523,7 @@ fn update_body<B: Base + ?Sized>(
     // terms whose facts are overdeleted at once and derived again. Deleted equalities
     // may split classes; the policy decides from the classes' size, before any other
     // work, as a rebuild needs none of it.
-    let same_as = super::batch::same_as_of(rules.rules);
+    let same_as = super::equality_rules::of(rules.rules, rules.schema.same_as());
     let is_equality = |t: &Triple| Some(t[1]) == same_as && t[0] != t[2];
     let mut region: HashSet<u64> = HashSet::new();
     if let Some(same_as) = same_as {
@@ -580,7 +580,8 @@ fn update_body<B: Base + ?Sized>(
         };
         // A partner read a stop cut short ends the update: the keys asked about are the
         // grounded rules', which grow with the schema (fix check r2, R3-F1).
-        super::recursion::non_recursive(&old_program.rules, schema.rdf_type(), &|term| {
+        let ground = &old_program.rules;
+        super::recursion::non_recursive(ground, schema.rdf_type(), same_as, &|term| {
             super::recursion::same_as_partners(&before, same_as, term, &stage)
         })
         .map_err(stopped)?
@@ -705,7 +706,7 @@ fn update_body<B: Base + ?Sized>(
             // A stopped read ends the job list (fix check r2, R3-F1).
             for (r, i) in old_program.variants(&extra, &stage).map_err(stopped)? {
                 let rule = &old_program.rules[r];
-                if !region.is_empty() && is_equality_rule(rule) {
+                if !region.is_empty() && is_equality_rule(rule, same_as) {
                     equality_jobs.extend(Job::variant(&outside, rule, i, &stage).map_err(stopped)?);
                 } else {
                     jobs.extend(Job::variant(&old, rule, i, &stage).map_err(stopped)?);
@@ -990,7 +991,7 @@ fn update_body<B: Base + ?Sized>(
             let not_equality: Vec<bool> = program
                 .rules
                 .iter()
-                .map(|rule| !is_equality_rule(rule))
+                .map(|rule| !is_equality_rule(rule, same_as))
                 .collect();
             // Bodiless instances too: their schema facts are what remains, every open fact
             // hidden.
@@ -1101,9 +1102,9 @@ fn update_body<B: Base + ?Sized>(
     let mut extra = Store::new(seeds);
     let mut module_output: HashSet<Triple> = HashSet::new();
     // The equality module replaces eq-rep-s/p/o here, as in the batch executor.
-    let mut equality = Equality::for_rules(rules.rules);
-    let module_equality = equality.is_some();
-    let replaced = |rule: &Rule| module_equality && is_replacement_rule(rule);
+    // Over `same_as`, the id the rules hold the equality rules over, if they do.
+    let mut equality = Equality::for_rules(rules.rules, rules.schema.same_as());
+    let replaced = |rule: &Rule| same_as.is_some_and(|s| is_replacement_rule(rule, s));
     let mut reclose = recloses;
     loop {
         check_stop()?;
@@ -1466,12 +1467,10 @@ fn mentions(terms: &HashSet<u64>, fact: Triple) -> bool {
 }
 
 /// The equality rules, which a recomputed region leaves out of overdeletion and
-/// rederivation ([`policy::Plan::Recompute`]).
-fn is_equality_rule(rule: &Rule) -> bool {
-    matches!(
-        rule.name.as_str(),
-        "eq-rep-s" | "eq-rep-p" | "eq-rep-o" | "eq-sym" | "eq-trans"
-    )
+/// rederivation ([`policy::Plan::Recompute`]): those over `same_as` the rules hold
+/// ([`super::equality_rules`]).
+fn is_equality_rule(rule: &Rule, same_as: Option<u64>) -> bool {
+    same_as.is_some_and(|same_as| super::equality_rules::equality_rule(rule, same_as).is_some())
 }
 
 /// A source whose delta leaves out the facts of the region being recomputed: what the

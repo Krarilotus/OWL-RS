@@ -537,6 +537,7 @@ impl<S: Source + ?Sized> Facts for AllFacts<'_, S> {
 #[derive(Clone)]
 pub struct Schema {
     rdf_type: u64,
+    same_as: u64,
     thing: u64,
     /// Unnamed classes whose memberships aren't derived (work package W7,
     /// [`super::unnamed`]): each with whether a membership stands for `owl:Thing`.
@@ -549,6 +550,11 @@ impl Schema {
     /// The id of `rdf:type`.
     pub fn rdf_type(&self) -> u64 {
         self.rdf_type
+    }
+
+    /// The id of `owl:sameAs`: what the equality rules are over ([`super::equality_rules`]).
+    pub fn same_as(&self) -> u64 {
+        self.same_as
     }
 
     /// The RDFS and OWL 2 schema vocabulary. It includes the list vocabulary, so a change
@@ -609,6 +615,7 @@ impl Schema {
         .collect();
         Self {
             rdf_type,
+            same_as: vocabulary.iri(&format!("{OWL}sameAs")),
             thing: vocabulary.iri(&format!("{OWL}Thing")),
             hidden: HashMap::new(),
             predicates,

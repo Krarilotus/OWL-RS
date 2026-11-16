@@ -9,7 +9,8 @@
 
 use std::sync::Arc;
 
-use super::ir::{ParseError, Rule, Vocabulary};
+use super::equality_rules;
+use super::ir::{OWL, ParseError, Rule, Vocabulary};
 use super::n3::{self, N3Program};
 use super::rulesets::{Ruleset, SEMANTICS_VERSION, SemanticPart};
 use super::vocabulary::LocalVocabulary;
@@ -66,6 +67,15 @@ impl UserRules {
         }
         if compiled.rules.iter().any(|rule| !rule.guards.is_empty()) {
             rules.parts.push(SemanticPart::GuardsOverClasses);
+        }
+        // Where a build before the part read equality from the rules' names.
+        let same_as = vocabulary.iri(&format!("{OWL}sameAs"));
+        let named = compiled
+            .rules
+            .iter()
+            .any(|r| equality_rules::named(&r.name));
+        if named || equality_rules::of(&compiled.rules, same_as).is_some() {
+            rules.parts.push(SemanticPart::EqualityRules);
         }
         Ok(rules)
     }
