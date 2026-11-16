@@ -294,7 +294,7 @@ fn a_question_no_key_can_reach_is_decided_as_before() {
 }
 
 /// The keys' question on the other reads with a status: inside a transaction with
-/// operations pending, of the inferred statements alone, and its plan. None says `complete`.
+/// operations pending, and of the inferred statements alone. Neither says `complete`.
 #[test]
 fn the_other_reads_of_an_individual_named_only_in_the_question_are_not_complete() {
     let dl = pipeline();
@@ -313,6 +313,26 @@ fn the_other_reads_of_an_individual_named_only_in_the_question_are_not_complete(
         )))
         .expect("prepared");
     let alone = dl.store().status_without_dl(&implicit).expect("a status");
+    let lines = [
+        format!("pending: {rows}, {} {:?}", inside.as_str(), inside.reasons),
+        format!("inferred alone: {} {:?}", alone.as_str(), alone.reasons),
+    ];
+    eprintln!("{lines:#?}");
+    assert!(!inside.complete && !alone.complete, "{lines:#?}");
+}
+
+/// The plan's status of a question about an individual the data doesn't name, under a key
+/// on the RL route, where nothing else keeps the plan from `complete`: the plan says why it
+/// isn't, that reason alone.
+#[test]
+fn the_plan_of_an_individual_named_only_in_the_question_is_not_complete_under_a_key() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":r a owl:ObjectProperty . :A a owl:Class ; owl:hasKey ( :r ) . :a a :A ; :r :x .",
+    )
+    .expect("the key");
+    let route = dl.store().dl_bounds().last;
     let asked = dl
         .store()
         .prepare_query(&nrese_store::SparqlQueryRequest::all(format!(
@@ -326,15 +346,17 @@ fn the_other_reads_of_an_individual_named_only_in_the_question_are_not_complete(
         .expect("planned")
         .completeness
         .expect("a status");
-    let lines = [
-        format!("pending: {rows}, {} {:?}", inside.as_str(), inside.reasons),
-        format!("inferred alone: {} {:?}", alone.as_str(), alone.reasons),
-        format!("plan: {} {:?}", plan.as_str(), plan.reasons),
-    ];
-    eprintln!("{lines:#?}");
+    let line = format!("route {route}, plan: {} {:?}", plan.as_str(), plan.reasons);
+    eprintln!("{line}");
+    assert_eq!(route, "rules", "{line}");
     assert!(
-        !inside.complete && !alone.complete && !plan.complete,
-        "{lines:#?}"
+        plan.sound && !plan.complete && plan.reasons.len() == 1,
+        "{line}"
+    );
+    let reason = &plan.reasons[0].text;
+    assert!(
+        reason.starts_with("the query names <") && reason.contains("example.com/b"),
+        "{line}"
     );
 }
 
