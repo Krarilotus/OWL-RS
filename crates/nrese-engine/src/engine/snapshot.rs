@@ -1751,6 +1751,32 @@ impl Snapshot {
         .is_some_and(|mut quads| quads.next().is_some())
     }
 
+    /// Whether a statement read in `model` with `predicate` (any, where `None`) has an object
+    /// literal other than a plain or language-tagged string: an inline number, boolean, date
+    /// or dateTime, or one in the dictionary (any other datatype, and every non-canonical
+    /// spelling). Those kinds' ids are three ranges, so this is up to three seeks in the
+    /// predicate-first index (object-first without a predicate); `true` where the index can't
+    /// answer by range. Canonical numbers count though each has one spelling: an integer `7`
+    /// and a decimal `7.0` are one value with two ids, so no finer test (non-canonical
+    /// spellings only) would do.
+    pub fn holds_typed_literals(&self, model: ReadModel, predicate: Option<TermId>) -> bool {
+        use crate::TermKind::{DateTime, DerivedInteger, Integer, TypedLiteral};
+        let mut pattern = QuadPattern::all();
+        pattern.predicate = predicate;
+        let index = predicate.map_or(Permutation::Ospg, |_| Permutation::Posg);
+        [
+            (Integer, DateTime),
+            (TypedLiteral, TypedLiteral),
+            (DerivedInteger, DerivedInteger),
+        ]
+        .into_iter()
+        .any(|(first, last)| {
+            let (low, high) = (TermId::kind_range(first).0, TermId::kind_range(last).1);
+            let quads = self.scan_range_in(model, &pattern, index, low, high);
+            quads.is_none_or(|mut quads| quads.next().is_some())
+        })
+    }
+
     /// Exact number of quads [`scan_range_in`](Self::scan_range_in) yields.
     pub fn count_range_in(
         &self,

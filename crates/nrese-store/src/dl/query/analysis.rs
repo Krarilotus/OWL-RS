@@ -378,6 +378,87 @@ pub(super) fn typed_constant(query: &Query) -> Option<String> {
     })
 }
 
+/// The data values `query` compares by term: each variable at the object end of two or
+/// more patterns or paths, or of one and bound by `VALUES` or `BIND` (a join), or at one
+/// that `DISTINCT` or `REDUCED` returns, `GROUP BY` groups or a `DISTINCT` aggregate reads;
+/// and each string constant at an object end (a stored `"Rex"^^xsd:token` is `"Rex"` to
+/// OWL 2). What it is, and the predicates of its ends (`None`: a variable predicate or a
+/// path, any). The store compares terms, the regime
+/// values; whether a value read there has another spelling is the data's ([`certify`]
+/// asks the snapshot read, so a variable's IRIs-only ends, `rdf:type`'s too, mark
+/// nothing). One walk, once per query ([`Reads`]).
+pub(super) fn compared_values(query: &Query) -> Vec<(String, Vec<Option<String>>)> {
+    use nrese_sparql_syntax::algebra::AggregateExpression::{CountSolutions, FunctionCall};
+    let (mut ends, mut grouped, mut bound) =
+        (HashMap::<_, Vec<_>>::new(), HashSet::new(), HashSet::new());
+    let (mut distinct, mut all, mut strings) = (false, false, Vec::new());
+    pattern_of(query).find(&mut |node| {
+        let mut end = |t: &TermPattern, p: Option<String>| match t {
+            TermPattern::Variable(v) => ends.entry(v.as_str().to_owned()).or_default().push(p),
+            TermPattern::Literal(l) if l.is_plain() => {
+                strings.push((format!("the string {l}"), vec![p]))
+            }
+            _ => {}
+        };
+        match node {
+            Node::Pattern(GraphPattern::Bgp { patterns }) => {
+                patterns
+                    .iter()
+                    .for_each(|t| end(&t.object, pattern_reads(t).0));
+            }
+            Node::Pattern(GraphPattern::Path { object, .. }) => end(object, None),
+            Node::Pattern(GraphPattern::Values { variables, .. }) => {
+                bound.extend(variables.iter().map(|v| v.as_str().to_owned()));
+            }
+            Node::Pattern(GraphPattern::Extend { bindings, .. }) => {
+                bound.extend(bindings.iter().map(|(v, _)| v.as_str().to_owned()));
+            }
+            Node::Pattern(GraphPattern::Distinct { .. } | GraphPattern::Reduced { .. }) => {
+                distinct = true;
+            }
+            Node::Pattern(GraphPattern::Group {
+                variables,
+                aggregates,
+                ..
+            }) => {
+                grouped.extend(variables.iter().map(|v| v.as_str().to_owned()));
+                for (_, aggregate) in aggregates {
+                    match aggregate {
+                        FunctionCall {
+                            expr,
+                            distinct: true,
+                            ..
+                        } => variables_of(expr, &mut grouped),
+                        CountSolutions { distinct: true } => all = true,
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+        false
+    });
+    let shown = answer_variables(query);
+    let mut compared: Vec<_> = ends
+        .into_iter()
+        .filter_map(|(v, through)| {
+            let what = if through.len() > 1 || bound.contains(&v) {
+                "a join on"
+            } else if distinct && shown.as_ref().is_none_or(|s| s.contains(&v)) {
+                "DISTINCT over"
+            } else if all || grouped.contains(&v) {
+                "GROUP BY or a DISTINCT aggregate over"
+            } else {
+                return None;
+            };
+            Some((format!("{what} ?{v}"), through))
+        })
+        .collect();
+    compared.extend(strings);
+    compared.sort();
+    compared
+}
+
 /// Whether `iri` is in a reserved namespace, rdf:, rdfs: or owl:, whose entailed statements
 /// no closure, rewriting or bound holds in full.
 fn reserved(iri: &str) -> bool {
