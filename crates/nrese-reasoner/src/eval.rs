@@ -2089,6 +2089,10 @@ pub(crate) mod references_read {
     }
 }
 
+/// The most atoms a rule's body, and its conclusion beside a body, may hold: [`Dispatch`]
+/// numbers them by a byte. Longer rules are refused where they are made ([`Rule::fits`]).
+pub const MAX_RULE_ATOMS: usize = 256;
+
 /// Ground rules' atoms indexed by what they can match, so a round only visits the rules
 /// with an atom that can match a fact of the delta (the "dispatch tables" of design §3.2):
 /// `(?x type C)` atoms by `(type, C)`, other constant-predicate atoms by predicate.

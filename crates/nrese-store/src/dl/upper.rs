@@ -800,7 +800,7 @@ impl Upper {
             resolve,
             missing: false,
         };
-        let program = bounds::compile(ontology, normalised, &mut |iri| {
+        let mut program = bounds::compile(ontology, normalised, &mut |iri| {
             ir::Vocabulary::iri(&mut vocabulary, iri)
         });
         let schema = Schema::owl(&mut vocabulary);
@@ -825,7 +825,17 @@ impl Upper {
                 }
             }
         }
-        let rules = reasoner_rules(&program, &values);
+        let mut rules = reasoner_rules(&program, &values);
+        // A rule longer than the reasoner numbers (`ir::Rule::fits`: a key of more than 127
+        // properties) can't be evaluated: it is left out, and U1 doesn't cover its axioms.
+        for (rule, ours) in program.rules.iter().zip(&rules) {
+            if !ours.fits() {
+                let axiom = rule.provenance.sources.iter().flatten().next().copied();
+                let why = "a rule longer than the reasoner holds";
+                program.incomplete.push((axiom.unwrap_or(usize::MAX), why));
+            }
+        }
+        rules.retain(ir::Rule::fits);
         let facts: HashSet<Triple> = program_facts.iter().map(|&f| values.map(f)).collect();
         for t in input.iter_mut() {
             *t = values.map(*t);

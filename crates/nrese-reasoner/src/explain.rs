@@ -287,7 +287,7 @@ struct Proved {
 }
 
 /// A [`Base`] as a [`Source`] whose every fact is old; reads count on the base's.
-struct Whole<'a, B: ?Sized>(&'a B);
+pub(crate) struct Whole<'a, B: ?Sized>(pub(crate) &'a B);
 
 impl<B: Base + ?Sized> Visits for Whole<'_, B> {
     fn visit(&self, pattern: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {

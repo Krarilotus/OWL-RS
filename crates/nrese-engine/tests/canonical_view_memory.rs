@@ -49,7 +49,7 @@ fn engine(size: usize, views: &Arc<Budget>) -> Engine {
         tx.insert(Quad::new(node("alias"), node("p"), object, node("g")).as_ref());
     }
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     engine
         .snapshot()
         .count_in(ReadModel::Materialised, &QuadPattern::all())
