@@ -5,7 +5,7 @@ and the A-A' floor (PROTOCOL.md §5, "the unit"; 20 Oct 2026). Evidence for a re
     gate-falseblock.py RESULTS [--blocks 4 6 12] [--gates 2000] [--modes old old-kept new copies] [--scale X]
 
 RESULTS: lks-aa-20's results (`fleet results lks-aa-20`, its out/ directory). That job timed a build
-against a byte-identical copy of it on office-pc (`<workload>-<n>-<a|b>.json`, a and b the two
+against a byte-identical copy of it on the shared host (`<workload>-<n>-<a|b>.json`, a and b the two
 files), in blocks of four runs (a b b a), the blocks alternating between two layouts (two file
 pairs). Per workload and metric it gives sigma_w, the sd of one block's log contrast between two
 fixed files, and sigma_p, the sd of the contrast's file-instance component, from the two pairs:
@@ -37,7 +37,7 @@ and checked against gatestats.loss_test on the first gate of each --blocks value
 ASSUMED, NOT YET VALIDATED: in `new` and `copies` each block's copies draw their offsets
 independently, from the spread lks-aa-20 saw between two files. lks-aa-20 shows that two fixed
 files differ; it does not show that copying and deleting a file for every block redraws the offset
-each time (pages can be reused, placement need not change). The A-A' floor run on phuoc-yu is to
+each time (pages can be reused, placement need not change). The A-A' floor run on the timed host is to
 test exactly that: the spread of copy-to-copy contrasts across its blocks against lks-aa-20's
 between-file spread. Until then the `new` rates hold under this model only. Zero events in 2,000
 gates bounds the rate at 0.15 % (one-sided 95 %), not at 0.

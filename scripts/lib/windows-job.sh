@@ -44,7 +44,7 @@ windows_job_toolchain_ready() { rustc -vV > /dev/null 2>&1 && cargo clippy --ver
 # CHANNEL, under the cache's rustup.lock: the toolchain and its components installed, unless another
 # job installed them while this one waited. Install only, with a deadline (NRESE_RUSTUP_DEADLINE_S,
 # default 900 s): the rustup home is the host's, shared with other projects' jobs, so never
-# `rustup default`, `update`, `self update` or `uninstall` (the fleet's owner, 2 Nov 2026).
+# `rustup default`, `update`, `self update` or `uninstall`.
 windows_job_toolchain() {
   windows_job_toolchain_ready && return
   timeout "${NRESE_RUSTUP_DEADLINE_S:-900}" \

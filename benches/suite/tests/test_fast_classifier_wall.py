@@ -1,6 +1,6 @@
 """A classifier process's whole run (fast.py PROCESS_WALL, the series `wall`), timed by the case's
 shell, not by the tool: a phase the tool can't resolve, left out of the case's comparison, still
-counts (master, 14 Nov 2026 08:12: nothing unobserved after el-classify's prepare was left out)."""
+counts (nothing unobserved after el-classify's prepare was left out)."""
 import os
 import shutil
 import subprocess

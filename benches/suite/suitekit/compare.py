@@ -9,7 +9,7 @@ order, so that nothing lost hides behind a time:
    their run past the limit.
 3. **Time:** what got slower or faster beyond the thresholds; work counters; throughput.
 4. **Memory, by kind:** peaks compared only with peaks of their kind, and only kinds that
-   measure memory in use, never cache (the owner's decision, 13 Oct 2026): `lifetime`, a
+   measure memory in use, never cache: `lifetime`, a
    process's peak resident memory (NRESE's own A/Bs); `anon-kernel`, a container's or
    scope's anonymous plus kernel memory from memory.stat, sampled (cross-system: a contender
    runs several processes in its container); `sampled`, `docker stats` readings about a
@@ -764,7 +764,7 @@ def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0, al
                   "code change")
         print()
     # Its records stay: a case refused for its input is judged in status, checks and answers, and its
-    # measures not at all (compare_cases `unmeasured`; the master, 8 Nov 2026: the record filter here
+    # measures not at all (compare_cases `unmeasured`; the record filter here
     # dropped a wrong status, as R3-F1 found for the units in #135).
     no_input = bool(other_input) and any(all(r["case"] in other_input for r in report.get("records", []))
                                          for report in (base_report, new_report))
@@ -1026,7 +1026,7 @@ def main(argv: list[str]) -> int:
     systems = set(args.systems.split(",")) if args.systems else None
     base_files, new_files = files(args.base), files(args.new)
     # The input rule of compare_reports() (input_difference()), over the /data files the runs read:
-    # another release of a dataset is no evidence of a code change (the orchestrator, 7 Nov 2026).
+    # another release of a dataset is no evidence of a code change.
     (base_sha, base_bytes), (new_sha, new_bytes) = suite_inputs(base_files), suite_inputs(new_files)
     if base_sha != {} or new_sha != {}:
         if why := input_difference(base_sha, new_sha, base_bytes, new_bytes):

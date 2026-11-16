@@ -9,14 +9,13 @@ the verdict. A licensed system shows only that it ran: its results stay local.
 from __future__ import annotations
 
 import argparse
-import datetime
 import tomllib
 from collections import defaultdict
 from pathlib import Path
 
 from . import cases as registry
 from .compare import CROSS_SYSTEM_KIND
-from .ledger import PRE_RESET, PRE_RESET_NOTE, load_records, pre_reset
+from .ledger import PRE_RESET, PRE_RESET_NOTE, load_records, page_date, pre_reset
 
 VERDICTS = ("win", "tie", "loss", "no-verdict")
 
@@ -115,7 +114,7 @@ def render(records: list[dict], systems: dict, root: Path) -> str:
     lines = [
         "# Standings: NRESE against every contender",
         "",
-        f"Generated {datetime.date.today().isoformat()} by `python benches/suite/suite.py standings --write` from the "
+        f"Generated {page_date()} by `python benches/suite/suite.py standings --write` from the "
         "run records' `versus` entries ([runs/](runs/README.md)). Don't edit it by hand.",
         "",
         "Per case and contender, the newest comparison on each host: answers first (each system against the "
