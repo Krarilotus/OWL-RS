@@ -298,8 +298,8 @@ pub(crate) fn plan_status(
     let at = super::bounds::view_until(store, Some(&|| cancellation.is_cancelled()))
         .ok_or(crate::QueryEvaluationError::Cancelled)?;
     let mut completeness = plan_status_built(store, prepared, &analysis, &at).completeness;
-    certify(&mut completeness, prepared.reads(), "dl", true, Some(&at.0));
     mark(store, prepared, Revision::Decided(&at), &mut completeness);
+    certify(&mut completeness, prepared.reads(), "dl", true, Some(&at.0));
     Ok(completeness)
 }
 
@@ -322,7 +322,7 @@ impl Revision<'_> {
 
 /// Every answer `unsound` where OWL 2 DL may not entail what the RL closure (L) holds
 /// ([`reads_differently`]) in the data `at` it was read from, never a later revision's (R1-F2,
-/// F3): composed last by both DL entry points, by a read of the inferred statements alone
+/// F3): composed before certification by both DL entry points, last by an inferred-only read
 /// (`StoreService::status_without_dl`) and by a read inside a transaction with operations
 /// pending (`StoreService::run_query_pending_reporting`). It reads every graph, and a reader
 /// of some graphs is told no status under `owl2-dl` (`status_for_its_reader`); the ontology
@@ -707,8 +707,8 @@ pub(crate) fn answer(
     cancellation.check()?;
     match &mut outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => {
-            certify(status, prepared.reads(), "dl", true, Some(&at.0));
             mark(store, prepared, Revision::Decided(&at), status);
+            certify(status, prepared.reads(), "dl", true, Some(&at.0));
         }
     }
     let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &outcome;
