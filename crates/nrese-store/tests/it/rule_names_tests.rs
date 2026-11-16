@@ -29,7 +29,12 @@ const PREFICES: &str = "Prefices
 
 /// Reasoning with the PIE `rules` alone (custom mode, no built-in part).
 fn custom(rules: &str) -> ReasonerConfig {
-    let pie = format!("{PREFICES}\nRules\n{{\n{rules}}}\n");
+    custom_with("", rules)
+}
+
+/// [`custom`] with the PIE `axioms` (one statement a line) as well.
+fn custom_with(axioms: &str, rules: &str) -> ReasonerConfig {
+    let pie = format!("{PREFICES}\nAxioms\n{{\n{axioms}}}\nRules\n{{\n{rules}}}\n");
     let rules = Arc::new(UserRules::pie("user.pie", pie).expect("the ruleset compiles"));
     ReasonerConfig::for_mode(ReasoningMode::Custom)
         .with_rules(Some(rules))
@@ -212,6 +217,42 @@ fn a_member_the_rules_keep_from_being_a_thing_is_never_called_one() {
             ..in_memory_store_config()
         };
         let pipeline = store_with(config, custom(&format!("{RANGE}{things}")), &data);
+        let nobody = holds(&pipeline, "ex:nobody a owl:Thing");
+        check(&mut wrong, mode, "ASK ex:nobody a owl:Thing", nobody, false);
+        if !hide {
+            let x = holds(&pipeline, "ex:x a owl:Thing");
+            check(&mut wrong, mode, "ASK ex:x a owl:Thing", x, true);
+        }
+    }
+    assert!(wrong.is_empty(), "wrong: {wrong:#?}");
+}
+
+/// The same, the named individual reaching the rule's inequality through a variable: the
+/// rule makes a declared class's members things except the one the axiom
+/// `ex:nobody ex:is ex:special` marks (`x != n`, `n` bound by `n ex:is ex:special`; no
+/// constant in the inequality). `ex:x` and `ex:nobody` are both members of `_:u` by the range
+/// rule; the store calls `ex:nobody` an `owl:Thing` neither under `"skip"` nor under `"keep"`,
+/// and under `"keep"` `ex:x` is one.
+#[test]
+fn a_member_marked_by_an_axiom_against_being_a_thing_is_never_called_one() {
+    let axiom = "<ex:nobody> <ex:is> <ex:special>\n";
+    let things = "Id: things-but-special
+  x <rdf:type> c
+  c <rdf:type> <owl:Class>
+  n <ex:is> <ex:special>  [Constraint x != n]
+  ---
+  x <rdf:type> <owl:Thing>
+
+";
+    let data = format!("{DATA} . ex:s ex:p ex:nobody");
+    let mut wrong = Vec::new();
+    for (mode, hide) in [("skip", true), ("keep", false)] {
+        let config = StoreConfig {
+            hide_unnamed_classes: hide,
+            ..in_memory_store_config()
+        };
+        let rules = custom_with(axiom, &format!("{RANGE}{things}"));
+        let pipeline = store_with(config, rules, &data);
         let nobody = holds(&pipeline, "ex:nobody a owl:Thing");
         check(&mut wrong, mode, "ASK ex:nobody a owl:Thing", nobody, false);
         if !hide {
