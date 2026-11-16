@@ -124,6 +124,34 @@ fn a_commit_after_its_own_install_publishes_the_installed_reading() {
 }
 
 #[test]
+fn a_rematerialisation_that_changes_no_statement_installs_its_reading() {
+    // Spec: a rematerialisation installs its stack with the reading it is given, a stack that
+    // doesn't change included (a store whose reasoning changes only how its stack is read,
+    // or that clears an empty stack), and takes no new revision for it.
+    let engine = engine();
+    let same_as = id(3);
+    let mut tx = engine.transaction();
+    tx.insert_encoded(triple(1, 4, 5).in_default_graph());
+    tx.commit().unwrap();
+    let revision = engine.snapshot().revision();
+    for reading in [Some(same_as), None] {
+        let finished = engine.rematerialisation().finish_held(Vec::new(), reading);
+        assert_eq!(
+            finished.unwrap().summary().revision,
+            revision,
+            "no new revision"
+        );
+        assert_eq!(engine.equality(), reading, "the installed reading");
+        let expands = engine.snapshot().equality_classes().is_some();
+        assert_eq!(
+            expands,
+            reading.is_some(),
+            "a new reader expands by the reading"
+        );
+    }
+}
+
+#[test]
 fn read_models_select_the_stacks() {
     let engine = engine();
     let asserted = triple(1, 2, 3).in_default_graph();
