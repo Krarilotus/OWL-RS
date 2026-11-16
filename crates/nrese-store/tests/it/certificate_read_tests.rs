@@ -148,6 +148,104 @@ fn pending(store: &StoreService, ops: Vec<StatementOp>, query: &str) -> String {
     header(status)
 }
 
+/// A store holding `data` (over [`PREFIXES`]), certified under each regime: `rdfs`, user rules
+/// (`custom`: a subclass rule and a transitive property's), `owl2-rl` with the QL rewriting
+/// off and on, and `owl2-dl`.
+fn regimes(data: &str) -> [(&'static str, StoreService); 5] {
+    let ruleset = |ruleset: Ruleset, ql: QlRewritingMode| {
+        let store = StoreService::new(StoreConfig {
+            ql_rewriting: ql,
+            ..StoreConfig::in_memory()
+        })
+        .expect("store");
+        load(&store, data, false);
+        store.rematerialise(ruleset).expect("reasoned");
+        store
+    };
+    let dl = pipeline();
+    insert(&dl, data).expect("data");
+    let rules = UserRules::n3(
+        "subclass.n3",
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
+         @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+         { ?x rdf:type ?c . ?c rdfs:subClassOf ?d } => { ?x rdf:type ?d } .\n\
+         { ?p rdf:type owl:TransitiveProperty . ?x ?p ?y . ?y ?p ?z } => { ?x ?p ?z } .\n",
+    )
+    .expect("the rules compile");
+    let custom = MutationPipeline::new(
+        Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store")),
+        Arc::new(ReasonerService::new(
+            ReasonerConfig::for_mode(ReasoningMode::Custom)
+                .with_rules(Some(Arc::new(rules)))
+                .expect("a mode for the rules"),
+        )),
+    );
+    insert(&custom, data).expect("data");
+    [
+        ("rdfs", ruleset(Ruleset::Rdfs, QlRewritingMode::Off)),
+        ("custom", custom.store().as_ref().clone()),
+        (
+            "owl2-rl, ql off",
+            ruleset(Ruleset::Owl2Rl, QlRewritingMode::Off),
+        ),
+        (
+            "owl2-rl, ql on",
+            ruleset(Ruleset::Owl2Rl, QlRewritingMode::On),
+        ),
+        ("owl2-dl", dl.store().as_ref().clone()),
+    ]
+}
+
+/// A read inside a transaction whose pending operations are all additions of statements
+/// (`StatementOp::Add`, the route that knows nothing is deleted): the additions aren't
+/// reasoned over, so an entailed row may be missing (`:x :p :z`, with `:p` transitive and
+/// `:y :p :z` pending): `sound-only`, never `complete`, in every regime (30a over the
+/// additions' own route). With N3 beside it as the guard: an addition under a negation is
+/// `unsound`.
+#[test]
+fn a_read_inside_a_transaction_of_additions_alone_is_never_complete() {
+    let mut cells = Cells::default();
+    let read = "SELECT ?o { :x :p ?o }";
+    let add = |triple: &str| {
+        vec![StatementOp::Add {
+            data: nrese_store::RdfPayload {
+                payload: triple.as_bytes().to_vec().into(),
+                format: nrese_store::GraphResultFormat::NTriples,
+                base_iri: None,
+            },
+            contexts: Vec::new(),
+        }]
+    };
+    let ex = |name: &str| format!("<http://example.com/{name}>");
+    let transitive = || add(&format!("{} {} {} .", ex("y"), ex("p"), ex("z")));
+    let subclass = || {
+        add(&format!(
+            "{} <http://www.w3.org/2000/01/rdf-schema#subClassOf> {} .",
+            ex("C"),
+            ex("D")
+        ))
+    };
+    for (name, store) in &regimes(&format!("{DATA} :p a owl:TransitiveProperty . :x :p :y .")) {
+        let base = status(store, read);
+        if matches!(class(&base), "none" | "not-certified") {
+            cells.unmet(name, &format!("the base isn't certified: {base}"));
+            continue;
+        }
+        cells.class(
+            &format!("30a additions alone | {name}"),
+            &pending(store, transitive(), read),
+            "sound-only",
+        );
+        cells.class(
+            &format!("N3 an addition alone under a negation | {name}"),
+            &pending(store, subclass(), NEGATED),
+            "unsound",
+        );
+    }
+    cells.finish();
+}
+
 /// The transaction's reads, over a certified base and over one that no certificate covers:
 /// - additions only: never `complete`; the answers are entailed but some may be missing,
 ///   so `sound-only` (30a, 30e);
@@ -172,42 +270,7 @@ fn a_read_inside_a_transaction_is_told_no_more_than_its_base_allows() {
         ]
     };
     let subclass = || vec![op("INSERT DATA { :C rdfs:subClassOf :D }")];
-    let rl = |ql| StoreConfig {
-        ql_rewriting: ql,
-        ..StoreConfig::in_memory()
-    };
-    let dl = pipeline();
-    insert(&dl, DATA).expect("data");
-    let rules = UserRules::n3(
-        "subclass.n3",
-        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n\
-         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\
-         { ?x rdf:type ?c . ?c rdfs:subClassOf ?d } => { ?x rdf:type ?d } .\n",
-    )
-    .expect("the rules compile");
-    let custom = MutationPipeline::new(
-        Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store")),
-        Arc::new(ReasonerService::new(
-            ReasonerConfig::for_mode(ReasoningMode::Custom)
-                .with_rules(Some(Arc::new(rules)))
-                .expect("a mode for the rules"),
-        )),
-    );
-    insert(&custom, DATA).expect("data");
-    let stores: [(&str, StoreService); 5] = [
-        ("rdfs", certified(rl(QlRewritingMode::Off), Ruleset::Rdfs)),
-        ("custom", custom.store().as_ref().clone()),
-        (
-            "owl2-rl, ql off",
-            certified(rl(QlRewritingMode::Off), Ruleset::Owl2Rl),
-        ),
-        (
-            "owl2-rl, ql on",
-            certified(rl(QlRewritingMode::On), Ruleset::Owl2Rl),
-        ),
-        ("owl2-dl", dl.store().as_ref().clone()),
-    ];
-    for (name, store) in &stores {
+    for (name, store) in &regimes(DATA) {
         let base = status(store, READ);
         if matches!(class(&base), "none" | "not-certified") {
             cells.unmet(name, &format!("the base isn't certified: {base}"));
