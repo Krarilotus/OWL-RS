@@ -744,7 +744,12 @@ impl<'a, R: Read> TurtleParser<'a, R> {
     fn skip_malformed(&mut self) -> bool {
         loop {
             let data = &self.input.data()[self.input.position..];
-            match malformed(data, self.input.eof()) {
+            // The search reads at most the window, in bytes from where the token's text starts
+            // (the whitespace before it included), whatever the input already holds past it:
+            // its end is the input's only if the input ends within it.
+            let within = data.len() <= MAX_STATEMENT_TEXT;
+            let window = &data[..data.len().min(MAX_STATEMENT_TEXT)];
+            match malformed(window, self.input.eof() && within) {
                 Malformed::Skip(0) | Malformed::Unclosed => return false,
                 Malformed::Skip(n) => {
                     self.input.consume(n);
@@ -753,7 +758,7 @@ impl<'a, R: Read> TurtleParser<'a, R> {
                 Malformed::NeedMore => {
                     // The end can't be read (the error comes next), or isn't within the window:
                     // recovery stops.
-                    if self.input.held.is_some() || data.len() > MAX_STATEMENT_TEXT {
+                    if self.input.held.is_some() || !within {
                         return false;
                     }
                     let wanted = (2 * data.len() + 1).min(MAX_STATEMENT_TEXT + 1);
