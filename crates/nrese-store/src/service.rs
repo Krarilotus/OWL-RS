@@ -2107,11 +2107,20 @@ impl StoreService {
         .hiding_unnamed_classes(self.config.hide_unnamed_classes)
     }
 
-    /// A revision no commit here recorded (a reopened store's, a replica's) is scanned.
+    /// A revision no commit here recorded (a reopened store's, a replica's) is scanned. Only
+    /// a scan of the published version writes the record: a pending or a reader's own view
+    /// of it takes the latest version's answer at its revision, else the record's, else left
+    /// out, with a scan of its own statements.
     pub(crate) fn lists_left_out(&self, snapshot: &nrese_engine::Snapshot) -> bool {
-        self.lists.left_out(snapshot.revision(), || {
-            crate::reasoning::Program::leaves_out_a_list(snapshot)
-        })
+        use crate::reasoning::Program;
+        let latest = self.engine.snapshot();
+        let base = match latest.revision() == snapshot.revision() {
+            true => {
+                (self.lists).left_out(latest.revision(), || Program::leaves_out_a_list(&latest))
+            }
+            false => self.lists.known(snapshot.revision()).unwrap_or(true),
+        };
+        base || (!latest.same_version(snapshot) && Program::leaves_out_a_list(snapshot))
     }
 
     /// The QL rewriting's status at `snapshot`: under `owl2-rl`, not `complete` where the
