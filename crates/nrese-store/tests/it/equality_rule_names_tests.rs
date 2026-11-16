@@ -331,3 +331,136 @@ fn a_deletion_takes_out_what_a_rule_named_like_an_equality_rule_derived() {
     ));
     assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
 }
+
+/// OWL 2 RL's five equality rules over `owl:sameAs` under other names, beside two of the user's
+/// rules named like equality rules that say something else: an inverse rule named `eq-sym` and
+/// a copy of `p` to `q` named `eq-rep-p`. The five engage the equality module; the two are
+/// ordinary rules. As ordinary rules, over `a sameAs b`, `anna hasChild ben` and `a p c`, they
+/// entail `ben hasParent anna`, `a q c`, and the copies `b p c` and `b q c`.
+const FIVE_BESIDE_NAMESAKES: &str = r#"
+Prefices
+{
+  ex : http://example.com/
+  owl : http://www.w3.org/2002/07/owl#
+}
+
+Rules
+{
+Id: same-sym
+  x <owl:sameAs> y
+  ---------------
+  y <owl:sameAs> x
+
+Id: same-trans
+  x <owl:sameAs> y
+  y <owl:sameAs> z
+  ---------------
+  x <owl:sameAs> z
+
+Id: same-subject
+  s <owl:sameAs> t
+  s p o
+  ---------------
+  t p o
+
+Id: same-predicate
+  p <owl:sameAs> q
+  s p o
+  ---------------
+  s q o
+
+Id: same-object
+  o <owl:sameAs> t
+  s p o
+  ---------------
+  s p t
+
+Id: eq-sym
+  x <ex:hasChild> y
+  ---------------
+  y <ex:hasParent> x
+
+Id: eq-rep-p
+  x <ex:p> y
+  ---------------
+  x <ex:q> y
+}
+"#;
+
+/// Where the five equality rules engage the module, a user's rules named like equality rules
+/// still entail what they say, under each `reasoner.equality`: at the first commit, after an
+/// insertion and after deletions maintained over them (of an equality, then of a statement).
+#[test]
+fn rules_named_like_the_equality_rules_beside_the_five_entail_what_they_say() {
+    let rules = Arc::new(UserRules::pie("user.pie", FIVE_BESIDE_NAMESAKES).expect("it compiles"));
+    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Custom)
+        .with_rules(Some(rules))
+        .expect("custom rules");
+    let same = format!("<{OWL}sameAs>");
+    let fact = |s: &str, p: &str, o: &str| format!("<{EX}{s}> <{EX}{p}> <{EX}{o}>");
+    let cell = |s: &str, p: &str, o: &str, holds: bool| (fact(s, p, o), holds);
+    let mut wrong = Vec::new();
+    for (equality, representatives, compact) in [
+        ("representatives", true, false),
+        ("compact", true, true),
+        ("replicate", false, false),
+    ] {
+        let config = nrese_store::StoreConfig {
+            equality_by_representatives: representatives,
+            equality_compact: compact,
+            ..in_memory_store_config()
+        };
+        let store = MutationPipeline::new(
+            Arc::new(StoreService::new(config).expect("store")),
+            Arc::new(ReasonerService::new(reasoner.clone())),
+        );
+        let first = format!(
+            "INSERT DATA {{ <{EX}a> {same} <{EX}b> . {} . {} }}",
+            fact("anna", "hasChild", "ben"),
+            fact("a", "p", "c")
+        );
+        apply(&store, &first);
+        let case = format!("{equality}, the first commit");
+        wrong.extend(ask_all(
+            &case,
+            &store,
+            &[
+                cell("ben", "hasParent", "anna", true),
+                cell("anna", "hasParent", "ben", false),
+                cell("a", "q", "c", true),
+                cell("b", "p", "c", true),
+                cell("b", "q", "c", true),
+                cell("c", "q", "a", false),
+            ],
+        ));
+        apply(
+            &store,
+            &format!("INSERT DATA {{ {} }}", fact("d", "p", "e")),
+        );
+        let case = format!("{equality}, after an insertion");
+        wrong.extend(ask_all(&case, &store, &[cell("d", "q", "e", true)]));
+        apply(&store, &format!("DELETE DATA {{ <{EX}a> {same} <{EX}b> }}"));
+        let case = format!("{equality}, after the equality's deletion");
+        wrong.extend(ask_all(
+            &case,
+            &store,
+            &[
+                cell("a", "q", "c", true),
+                cell("b", "p", "c", false),
+                cell("b", "q", "c", false),
+                cell("ben", "hasParent", "anna", true),
+            ],
+        ));
+        apply(
+            &store,
+            &format!("DELETE DATA {{ {} }}", fact("a", "p", "c")),
+        );
+        let case = format!("{equality}, after a statement's deletion");
+        wrong.extend(ask_all(
+            &case,
+            &store,
+            &[cell("a", "q", "c", false), cell("d", "q", "e", true)],
+        ));
+    }
+    assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
+}
