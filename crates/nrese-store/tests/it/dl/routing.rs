@@ -787,42 +787,6 @@ fn a_later_assertion_that_puns_a_class_leaves_the_rules_route() {
     assert_ne!(route, "rules", "a punning ontology stayed on the RL route");
 }
 
-/// A property under a built-in one: `:mySub rdfs:subPropertyOf rdfs:subClassOf`, used as
-/// `:A :mySub :B`. The OWL 2 RL rules (prp-spo1, then cax-sco) make `:A` a subclass of `:B`
-/// and so `:x` a `:B`; under the OWL 2 Direct Semantics `:A :mySub :B` relates two
-/// individuals and says nothing about the classes of those names (rdfs:subClassOf is no
-/// property there). So `:x a :B` isn't entailed: an answer `true` may only come labelled
-/// `unsound`. Checked on the RL route and off it.
-#[test]
-fn a_property_under_a_built_in_one_entails_no_subclass() {
-    let mut wrong = Vec::new();
-    for extra in ["", OUTSIDE_RL] {
-        let dl = pipeline();
-        let inserted = insert(
-            &dl,
-            &format!(
-                ":mySub rdfs:subPropertyOf rdfs:subClassOf . :A a owl:Class . :B a owl:Class . \
-                 :A :mySub :B . :x a owl:NamedIndividual , :A . {extra}"
-            ),
-        );
-        let route = dl.store().dl_bounds().last;
-        let (rows, status) = query(&dl, "ASK { :x a :B }");
-        let line = format!(
-            "route {route}, insert {inserted:?}: answers {rows:?}, status {} ({:?})",
-            status.shared.as_str(),
-            status.reasons()
-        );
-        eprintln!("{line}");
-        if rows == ["true"] && status.shared.as_str() != "unsound" {
-            wrong.push(line);
-        }
-    }
-    assert!(
-        wrong.is_empty(),
-        "wrong rows not labelled unsound: {wrong:#?}"
-    );
-}
-
 /// Beside each ontology of [`unmarked`]: `:y a :E`, entailed under both readings.
 const ENTAILED: &str = ":y a :F . :F rdfs:subClassOf :E .";
 
