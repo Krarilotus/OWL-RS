@@ -1281,6 +1281,42 @@ impl Groups<'_> {
         }
     }
 
+    /// The number of groups [`Self::next`] would still hand out, counted without handing
+    /// them out: the walk's blocks loaded and counted on `account` as `next` loads them, in
+    /// the same order, and each column scanned once for its value changes. `Err` once the
+    /// account has stopped. It spends the cursor: `next` answers `None` after it.
+    ///
+    /// The planner's distinct count walks millions of keys at a query's first planning
+    /// (`index::count_distinct`); a group at a time through `next`, each value cost about
+    /// four times what this scan does.
+    pub(crate) fn count_rest(&mut self, account: &mut impl Account) -> Result<u64, Stopped> {
+        let mut count = 0u64;
+        loop {
+            let column = &self.column[self.at..];
+            let mut value = self.value;
+            let mut changes = 0u64;
+            for &v in column {
+                changes += u64::from(v != value);
+                value = v;
+            }
+            if changes > 0 {
+                // The open group is the column's last run of equal values.
+                let start = column
+                    .iter()
+                    .rposition(|&v| v != value)
+                    .map_or(0, |k| k + 1);
+                (self.value, self.from) = (value, self.base + self.at + start);
+                count += changes;
+            }
+            self.at = self.column.len();
+            match self.load(account)? {
+                Loaded::More => {}
+                Loaded::Group(_) => count += 1,
+                Loaded::Done => return Ok(count),
+            }
+        }
+    }
+
     /// The next block, once the column is read: the range's last group at its end, else the
     /// gallop over the blocks' first keys that hold only the open value, then a constant
     /// block (a group if its value differs) or the block's column decoded. Each counted on
@@ -1491,6 +1527,124 @@ mod tests {
                 let mut got = Vec::new();
                 packed.groups(start, end, position, |v, from, to| got.push((v, from, to)));
                 assert_eq!(got, expected, "{start}..{end} at {position}");
+            }
+        }
+    }
+
+    /// An account that records each portion asked of it, granted or not, and refuses from
+    /// its `refuse_at`-th.
+    struct Log {
+        takes: Vec<u64>,
+        refuse_at: usize,
+    }
+
+    impl Account for Log {
+        fn take(&mut self, n: u64) -> bool {
+            self.takes.push(n);
+            self.takes.len() <= self.refuse_at
+        }
+    }
+
+    /// Spec (`Groups::count_rest`): counting the rest of a group walk answers how many more
+    /// groups `next` hands out, and asks its account for the same portions in the same order;
+    /// an account that refuses one of them stops both at it, with nothing asked after. From
+    /// any point of the walk: none, one or a few groups taken by `next` first. Once counted,
+    /// `next` hands out nothing more. The ranges of `groups_are_the_runs_of_equal_values`:
+    /// many small groups, few large ones spanning constant blocks, a range of one group; and
+    /// empty ranges. Refused at the first portion, the last, and one between.
+    #[test]
+    fn counting_the_rest_of_a_group_walk_is_the_walk_and_its_charges() {
+        let mut state = 31;
+        let mut long: Vec<Key> = (0..20_000u64)
+            .map(|i| {
+                [
+                    (1 << TAG_SHIFT) | (i / 3000),
+                    (1 << TAG_SHIFT) | (i % 7),
+                    i,
+                    0,
+                ]
+            })
+            .collect();
+        long.sort_unstable();
+        for keys in [
+            random_keys(&mut state, 70_000),
+            random_keys(&mut state, 300),
+            long,
+        ] {
+            let packed = PackedKeys::from_sorted(&keys);
+            for _ in 0..100 {
+                let (start, end, position) = match rng(&mut state) % 8 {
+                    0 | 1 => (0, keys.len(), 0),
+                    2 => {
+                        let at = (rng(&mut state) as usize) % (keys.len() + 1);
+                        (at, at, 1)
+                    }
+                    _ => {
+                        let probe = keys[(rng(&mut state) as usize) % keys.len()][0];
+                        let start = keys.partition_point(|k| k[0] < probe);
+                        let end = keys.partition_point(|k| k[0] <= probe);
+                        (start, end, 1)
+                    }
+                };
+                let taken = (rng(&mut state) % 4) as usize;
+                // `taken` groups by `next`, then the rest counted, or walked by `next`.
+                let run = |refuse_at: usize, counted: bool| {
+                    let mut account = Log {
+                        takes: Vec::new(),
+                        refuse_at,
+                    };
+                    let mut groups = packed.group_cursor(start, end, position);
+                    let mut result = Ok(0u64);
+                    for _ in 0..taken {
+                        if let Err(stopped) = groups.next(&mut account) {
+                            result = Err(stopped);
+                            break;
+                        }
+                    }
+                    if result.is_ok() {
+                        result = if counted {
+                            let counted = groups.count_rest(&mut account);
+                            if counted.is_ok() {
+                                assert_eq!(groups.next(&mut crate::visit::Free), Ok(None));
+                            }
+                            counted
+                        } else {
+                            let mut n = 0u64;
+                            loop {
+                                match groups.next(&mut account) {
+                                    Ok(Some(_)) => n += 1,
+                                    Ok(None) => break Ok(n),
+                                    Err(stopped) => break Err(stopped),
+                                }
+                            }
+                        };
+                    }
+                    (result, account.takes)
+                };
+                let (walked, takes) = run(usize::MAX, false);
+                assert_eq!(
+                    run(usize::MAX, true),
+                    (walked, takes.clone()),
+                    "{start}..{end} at {position}, {taken} taken"
+                );
+                let mut groups = 0;
+                let mut i = start;
+                while i < end {
+                    i += keys[i..end].partition_point(|k| k[position] == keys[i][position]);
+                    groups += 1;
+                }
+                assert_eq!(walked, Ok((groups as u64).saturating_sub(taken as u64)));
+                let last = takes.len().saturating_sub(1);
+                let between = (rng(&mut state) as usize) % takes.len().max(1);
+                for refuse_at in [0, between, last].into_iter().filter(|_| !takes.is_empty()) {
+                    let (counted, asked) = run(refuse_at, true);
+                    assert_eq!(counted, Err(Stopped), "refused at portion {refuse_at}");
+                    assert_eq!(
+                        (counted, asked),
+                        run(refuse_at, false),
+                        "{start}..{end} at {position}, refused at portion {refuse_at}"
+                    );
+                }
             }
         }
     }

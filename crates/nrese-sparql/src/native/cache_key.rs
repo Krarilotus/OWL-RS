@@ -21,10 +21,11 @@ use nrese_sparql_syntax::algebra::{
 };
 use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
-/// Writes a part's key; [`Encoder::vars`] are its variables by number.
+/// Writes a part's key; [`Encoder::vars`] are its variables by number. Its byte writers
+/// also write the answer's status into the key (`Completeness::write_cache_context`).
 #[derive(Default)]
-pub(super) struct Encoder {
-    pub(super) bytes: Vec<u8>,
+pub(crate) struct Encoder {
+    pub(crate) bytes: Vec<u8>,
     /// The part's variables in the order they first occur: a variable's number is its
     /// position.
     pub(super) vars: Vec<Variable>,
@@ -38,15 +39,15 @@ pub(super) struct Uncacheable;
 type Encoded = Result<(), Uncacheable>;
 
 impl Encoder {
-    pub(super) fn tag(&mut self, tag: u8) {
+    pub(crate) fn tag(&mut self, tag: u8) {
         self.bytes.push(tag);
     }
 
-    pub(super) fn number(&mut self, value: u64) {
+    pub(crate) fn number(&mut self, value: u64) {
         self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
-    pub(super) fn text(&mut self, text: &str) {
+    pub(crate) fn text(&mut self, text: &str) {
         self.number(text.len() as u64);
         self.bytes.extend_from_slice(text.as_bytes());
     }
