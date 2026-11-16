@@ -85,8 +85,9 @@ impl<V> Build<V> {
     }
 
     /// [`Self::wait`], given up (`None`) when `stop` fires, which an asleep waiter asks
-    /// every 50 ms (`STOP_POLL`); the build goes on. A waiter helping with a slice asks once it
-    /// is done, so a sliced build's slice bounds how late it gives up.
+    /// every 50 ms (`STOP_POLL`); the build goes on. A waiter helping with a sliced build
+    /// takes slices until none is left and asks only then: the rest of the scan is opaque to
+    /// `stop`, not one slice.
     pub fn wait_until(
         &self,
         stop: Option<&dyn Fn() -> bool>,
