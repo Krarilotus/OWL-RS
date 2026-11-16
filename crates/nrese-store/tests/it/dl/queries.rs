@@ -122,6 +122,12 @@ fn has_value_through_a_union(value: &str, other: &str) -> String {
 /// that holds in every model is never a complete `false`. Here the property's values are
 /// triple terms; the control is the same ontology with IRI values (true, by ground
 /// entailment).
+///
+/// What it holds: the datatype theory's refusal of a value it can't read (the reader takes a
+/// triple term for a literal). Read as no value instead, `:A` and `:B` have no model, so
+/// this consistent data is rejected as inconsistent: the wrong outcome caught at the insert.
+/// The exact services' refusal of a triple-term atom alone isn't held by this test: with the
+/// first refusal in place, the answer stays incomplete without it.
 #[test]
 fn a_value_every_model_gives_through_a_union_is_never_a_complete_false_for_a_triple_term() {
     let triple = pipeline();
