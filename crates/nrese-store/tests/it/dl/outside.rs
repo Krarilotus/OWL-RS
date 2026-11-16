@@ -42,8 +42,9 @@ const PREFIXES: &str = "@prefix f: <http://example.org/fuzz#> . \
 
 /// The constructs `fuzz` doesn't draw, one a line (name | Turtle | the names it uses as
 /// individuals), each in a case with probability 1/4. `{C1}`, `{C2}` are classes; `{S}` a
-/// simple property, `{Q}` one that isn't, `{P}` any; `{D}` a data property; `{A1}`, `{A2}` two
-/// individuals; `{V}` an integer, `{W}` it in another lexical form, `{X}` any in any form.
+/// simple property, `{Q}` one that isn't, `{P}` any but the chain's target p3 (a reference gap
+/// under a key); `{D}` a data property; `{A1}`, `{A2}` two individuals; `{V}` an integer, `{W}`
+/// it in another lexical form, `{X}` any in any form.
 const TEMPLATES: &str = "
 lexical | {A1} {D} {W} . |
 cardinality | {C1} rdfs:subClassOf [ a owl:Restriction ; owl:onProperty {S} ; owl:maxCardinality 1 ] . f:a0 a {C1} ; {S} f:a1 , f:a2 . |
@@ -274,7 +275,7 @@ fn fill<const K: usize>(texts: [&str; K], r: &mut Rng) -> [String; K] {
         ("{C2}", format!("f:C{}", r.below(4))),
         ("{S}", format!("f:p{}", r.below(2))),
         ("{Q}", format!("f:p{}", 2 + r.below(2))),
-        ("{P}", format!("f:p{}", r.below(4))),
+        ("{P}", format!("f:p{}", r.below(4) % 3)),
         ("{D}", format!("f:d{}", r.below(2))),
         ("{A1}", format!("f:a{a1}")),
         ("{A2}", format!("f:a{}", (a1 + 1 + r.below(3)) % 4)),
