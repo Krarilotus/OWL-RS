@@ -1208,8 +1208,10 @@ fn the_probe_answers_kept_for_one_view_stay_within_their_cap() {
     }
 }
 
-/// One probe answer counted at the cap is kept; one counted a byte over it, which alone
-/// would pass the cap, is not. The question is answered right both times, and asked again.
+/// One probe answer counted at the cap is kept; one counted over it, which alone would pass
+/// the cap, is not. The question is answered right both times, and asked again. Through a
+/// query, the nearest size over the cap is one IRI byte's step (the probe names the IRI
+/// more than once); one byte over is inserted directly.
 #[test]
 fn a_probe_answer_counted_over_the_cap_on_its_own_is_not_kept() {
     // The bytes kept on a fresh published view after asking about `employee` twice.
@@ -1224,8 +1226,15 @@ fn a_probe_answer_counted_over_the_cap_on_its_own_is_not_kept() {
     };
     let employee = |n: usize| format!("{EX}e{}", "a".repeat(n));
     let one = kept(&employee(1));
-    assert_eq!(kept(&employee(2)), one + 1, "an IRI byte, a byte counted");
-    let at_cap = PROBE_CAP + 1 - one;
+    // The probe names the employee more than once: the bytes counted per IRI byte.
+    let step = kept(&employee(2)) - one;
+    assert!(step > 0 && (PROBE_CAP - one) % step == 0, "{one} {step}");
+    let at_cap = 1 + (PROBE_CAP - one) / step;
     let (at, over) = (kept(&employee(at_cap)), kept(&employee(at_cap + 1)));
-    assert_eq!((at, over), (PROBE_CAP, 0), "at the cap: kept; over: not");
+    assert_eq!((at, over), (PROBE_CAP, 0), "at the cap, {step} over");
+    // One byte over, straight into a view's answers.
+    let mut probes = Probes::default();
+    let mode = ProbeMode::of(&QueryOptions::default());
+    probes.insert(mode, &"a".repeat(PROBE_CAP + 1 - 48), true);
+    assert!(probes.all().is_empty(), "one byte over the cap: not kept");
 }
