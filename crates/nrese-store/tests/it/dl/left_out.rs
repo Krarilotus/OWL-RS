@@ -6,7 +6,7 @@
 //! image (*OWL 2 Mapping to RDF Graphs* §3) or uses the reserved vocabulary (*Structural
 //! Specification* §2.4), and its read is not entailed by what is read.
 
-use nrese_store::{CancellationToken, SparqlQueryRequest, StatementOp};
+use nrese_store::{CancellationToken, DlAnswers, SparqlQueryRequest, StatementOp};
 
 use super::queries::query;
 use super::versions::{in_transaction, ntriples};
@@ -170,7 +170,8 @@ fn a_store_with_a_left_out_axiom_is_not_told_consistent() {
 
 /// The ontology is the union of the store's graphs: a restriction whose statements are
 /// written in two named graphs, one of them in both, is the restriction it is in one graph.
-/// Its read is entailed: `true` and `complete`, as with no copy, nothing told left out.
+/// Its read is entailed: `true` and `complete`, as with no copy, nothing told left out, and
+/// a read that asks for exact answers is answered.
 #[test]
 fn a_structure_repeated_across_named_graphs_is_read_as_in_one() {
     let names = ":p a owl:ObjectProperty . :x :p :v . :v a :D . _:r rdfs:subClassOf :C .";
@@ -192,8 +193,12 @@ fn a_structure_repeated_across_named_graphs_is_read_as_in_one() {
             insert(&dl, &format!("{NAMES} {names} {graphs} {extra}")).expect("committed");
             let (rows, status) = query(&dl, "ASK { :x a :C }");
             let reasons = status.reasons();
+            let exact = super::queries::query_with(&dl, "ASK { :x a :C }", Some(DlAnswers::Exact));
             if rows != ["true"] || !status.is_complete() || says_left_out(&reasons) {
                 wrong.push(format!("{store} {extra}: {rows:?} {reasons:?}"));
+            }
+            if !exact.as_ref().is_ok_and(|(rows, _)| rows == &["true"]) {
+                wrong.push(format!("{store} {extra}, exact: {exact:?}"));
             }
         }
     }
@@ -374,19 +379,65 @@ fn a_commit_that_makes_or_ends_a_left_out_axiom_changes_the_status() {
             "INSERT DATA { :x :p \"v\" . }".to_owned(),
             "ASK { :x a :C }",
         ),
+        (
+            // An assertion only, deleted: an undeclared property with literal and node
+            // values is an object property; with no node value left, a data property, and
+            // its range, a class expression, is then no data range.
+            "a property's last node value deleted beside a literal one",
+            format!("{NAMES} :p rdfs:range [ owl:complementOf owl:Nothing ] . :x :p \"v\", :v ."),
+            "DELETE DATA { :x :p :v . }".to_owned(),
+            "INSERT DATA { :x :p :v . }".to_owned(),
+            "ASK { :x a :C }",
+        ),
+        (
+            // An assertion only, inserted: a node value for a property that is a data
+            // property by its literal value (an inverse names it, which declares nothing)
+            // makes it an object property, whose range `rdfs:Literal` is a reserved name.
+            "a node value inserted beside a data property's literal",
+            format!("{NAMES} :p rdfs:range rdfs:Literal . :x :p \"v\" . :q owl:inverseOf :p ."),
+            "INSERT DATA { :x :p :v . }".to_owned(),
+            "DELETE DATA { :x :p :v . }".to_owned(),
+            "ASK { :x a :C }",
+        ),
     ];
+    // The controls: the property's kind stays, by a node value left or by its declaration,
+    // so no step leaves anything out.
+    let range = ":p rdfs:range [ owl:complementOf owl:Nothing ] . :x :p \"v\", :v .";
+    let kept = [
+        (
+            "a node value deleted beside another",
+            format!("{NAMES} {range} :v :p :x ."),
+        ),
+        (
+            "a declared object property's node value deleted",
+            format!("{NAMES} {range} :p a owl:ObjectProperty ."),
+        ),
+    ]
+    .map(|(name, data)| {
+        let (change, undo) = ("DELETE DATA { :x :p :v . }", "INSERT DATA { :x :p :v . }");
+        (
+            name,
+            data,
+            change.to_owned(),
+            undo.to_owned(),
+            "ASK { :x a :C }",
+        )
+    });
     let assertion = "INSERT DATA { :w a :D . }".to_owned();
     let mut wrong = Vec::new();
-    for ((name, data, change, undo, read), extra) in sequences
+    let cases = sequences
         .iter()
-        .flat_map(|s| ["", OUTSIDE_RL].map(|extra| (s, extra)))
+        .map(|s| (s, true))
+        .chain(kept.iter().map(|s| (s, false)));
+    for (((name, data, change, undo, read), flips), extra) in
+        cases.flat_map(|s| ["", OUTSIDE_RL].map(|extra| (s, extra)))
     {
         let dl = pipeline();
         insert(&dl, &format!("{data} {extra}")).expect("committed");
         for (step, update_text, left_out) in [
             ("before", None, false),
-            ("changed", Some(change), true),
-            ("an assertion beside it", Some(&assertion), true),
+            ("changed", Some(change), flips),
+            ("an assertion beside it", Some(&assertion), flips),
             ("undone", Some(undo), false),
         ] {
             if let Some(text) = update_text {
