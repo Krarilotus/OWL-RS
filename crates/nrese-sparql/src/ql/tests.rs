@@ -1228,7 +1228,8 @@ fn a_probe_answer_counted_over_the_cap_on_its_own_is_not_kept() {
     let one = kept(&employee(1));
     // The probe names the employee more than once: the bytes counted per IRI byte.
     let step = kept(&employee(2)) - one;
-    assert!(step > 0 && (PROBE_CAP - one) % step == 0, "{one} {step}");
+    let whole = step > 0 && (PROBE_CAP - one).is_multiple_of(step);
+    assert!(whole, "{one} bytes, {step} a byte: the cap in whole steps");
     let at_cap = 1 + (PROBE_CAP - one) / step;
     let (at, over) = (kept(&employee(at_cap)), kept(&employee(at_cap + 1)));
     assert_eq!((at, over), (PROBE_CAP, 0), "at the cap, {step} over");
