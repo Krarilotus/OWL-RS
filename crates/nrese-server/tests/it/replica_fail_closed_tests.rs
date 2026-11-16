@@ -160,7 +160,7 @@ fn bound(rows: &str) -> Vec<String> {
         .collect()
 }
 
-/// Spec (the replica's fail-closed form, half page point 3; master 12:15 and 14:38): a
+/// Spec (the replica's fail-closed form): a
 /// primary whose served version is stored compact (`reasoner.equality = "compact"` under
 /// `owl2-rl`, which closes equality) serves no replica. A replica starting from it fails
 /// with the sentence (`bootstrap`); one following its log from a store it holds fails with
@@ -258,7 +258,7 @@ async fn a_replica_of_a_compact_primary_fails_with_the_sentence() -> TestResult<
     Ok(())
 }
 
-/// Spec (the replica's fail-closed form, half page point 1; master 14:38): a directory
+/// Spec (the replica's fail-closed form): a directory
 /// started once as a primary (reasoned at its start, as `serve` does, so its marker vouches
 /// for that reasoning) and then started as a replica of a primary at the same revision,
 /// which applies the primary's records and restarts, doesn't vouch for what it applied: a
@@ -328,7 +328,7 @@ async fn a_directory_once_a_primary_does_not_vouch_for_records_it_applied() -> T
     Ok(())
 }
 
-/// Spec (the replica's fail-closed form, half page point 1; master 14:38): under `owl2-rl`,
+/// Spec (the replica's fail-closed form): under `owl2-rl`,
 /// a replica over the data of its image and of a commit after it answers each read with its
 /// primary's rows, and says `not-certified` where the primary gives a status ("every
 /// reasoned read on a replica says `not-certified`"). The precondition: the primary's read
@@ -373,7 +373,7 @@ async fn a_replica_s_reads_under_owl2_rl_say_not_certified() -> TestResult<()> {
     Ok(())
 }
 
-/// Spec (half page points 1 and 2): with the QL rewriting on (`owl2-ql`, where `auto`
+/// Spec: with the QL rewriting on (`owl2-ql`, where `auto`
 /// switches it on, and `owl2-rl` with it on), the members of an existential no rule
 /// materialises get their rows on the primary only through the rewriting, which rides on
 /// the reasoning certificate. A replica over the data of its image and of a commit after it
@@ -422,7 +422,7 @@ async fn a_replica_through_the_ql_rewriting_says_not_certified() -> TestResult<(
     Ok(())
 }
 
-/// Spec (master 18:14, Q2): a primary whose served version is stored compact
+/// Spec: a primary whose served version is stored compact
 /// (`reasoner.equality = "compact"` under `owl2-rl`, which closes equality) refuses a
 /// replica its image as it refuses its log: 409, with the sentence. The refusal is the
 /// primary's state, not a failure of the server (500).
@@ -457,7 +457,7 @@ async fn a_compact_primary_refuses_its_image_with_409_and_the_sentence() -> Test
     Ok(())
 }
 
-/// Spec (master 18:25 (c)): a directory once started as a primary (its marker vouching for
+/// Spec: a directory once started as a primary (its marker vouching for
 /// its reasoning), then a replica that applied its primary's records, started again as a
 /// store of its own (the promotion docs/ops/replication.md describes) is not current under
 /// its rules: its start reasons again, and no marker made before the records vouches for
@@ -569,7 +569,7 @@ fn other_semantics(text: &str) -> String {
         .collect()
 }
 
-/// Spec (master 18:18 and 18:25): a replica started by this build's server over a
+/// Spec: a replica started by this build's server over a
 /// directory holding a reasoning marker takes no certificate from it. Its reasoned read,
 /// before it applies any batch (its primary is unreachable), gives the rows as stored and
 /// says `not-certified`. Two markers: the one this build wrote (`as accepted`), and one of
@@ -674,7 +674,7 @@ async fn state_hits(state: &AppState) -> TestResult<u64> {
 /// What `with_replication` says when the role it is given isn't its store's.
 const OTHER_ROLE: &str = "the store's role";
 
-/// Spec (master 19:37, S1): a server state's role in replication is its store's, from the
+/// Spec: a server state's role in replication is its store's, from the
 /// store's open (`StoreConfig::replica`), checked at construction in both directions. Over a
 /// directory whose marker vouches for its `rdfs` reasoning, with an unreachable primary and
 /// before any batch: a store opened as a primary built into a replica's state is refused, as

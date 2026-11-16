@@ -41,7 +41,7 @@ fn update(pipeline: &MutationPipeline, text: &str) {
         .unwrap_or_else(|error| panic!("{text}: {error}"));
 }
 
-/// Spec (the replica's fail-closed form, half page point 3; master 12:15): a store whose
+/// Spec (the replica's fail-closed form): a store whose
 /// served version is stored compact refuses `replication_log` with the sentence, whichever
 /// revision it is asked after; under `rdfs`, which closes no equality, the same
 /// configuration serves the last commit's record. `backup_image`, an operator's backup,

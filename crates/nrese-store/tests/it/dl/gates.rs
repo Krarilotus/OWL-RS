@@ -142,7 +142,7 @@ fn dl_answers_derive_nothing_from_graphs_the_reader_cannot_read() {
     assert!(visible.contains("example.com/a"), "{visible}");
 }
 
-/// Spec (the replica's fail-closed form, half page point 1): a read replica interns no term
+/// Spec (the replica's fail-closed form): a read replica interns no term
 /// (its dictionary continues the primary's). Where the bounds' terms haven't come with the
 /// records (the data was committed past the pipeline, by `StoreService::bulk_load`, so the
 /// primary never interned them), it answers over L, with no row outside the union's members,
