@@ -87,7 +87,8 @@ leave something out.
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
   Lists past their limits (a property chain of more than 250 properties, a key of more than
   127, an intersection of more than 256 classes, more than 64 member sequences) aren't used
-  at all, never truncated, and each is reported in the log and the reasoning diagnostics
+  at all, never truncated, and each is reported in the log and the reasoning diagnostics;
+  while one is left out, no answer that reads the inferences is `complete`
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)); none known beyond
   keeping lists within those limits. Literals aren't
   equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
