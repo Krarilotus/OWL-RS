@@ -60,7 +60,7 @@ missing = { rules-nary = "not planned: user rules are over triples (Galen, Doop,
 
 # The same server with FSST-compressed vocabularies (`store.vocabulary = "fsst"`): next to
 # `nrese` (plain, the default) it shows the trade-off of a smaller store and less memory
-# against decoding the terms a query reads (office PC: stores 12–16 % smaller, memory 16–25 %
+# against decoding the terms a query reads (the shared host: stores 12–16 % smaller, memory 16–25 %
 # lower, query totals even, a scan of the dictionary 14 % slower).
 [nrese-fsst]
 name = "NRESE (FSST vocabulary)"
@@ -221,7 +221,7 @@ capabilities = [
   "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12",
 ]
 
-# Its evaluation licence was refused (owner, 12 Oct 2026; AllegroGraph's too): it runs
+# Its evaluation licence was refused (AllegroGraph's too): it runs
 # nowhere, now or later. Its home turf compares NRESE with VLog and GLog on RDFox's own
 # programs, and RDFox's published numbers are reported rows (benches/reasoning/reported).
 [rdfox]

@@ -139,7 +139,7 @@ class Abba(unittest.TestCase):
                 self.assertEqual(code, expected)
 
     def test_hypotheses_nothing_compared_never_read_as_no_loss(self):
-        """SHACL lead, 8 Nov 2026 (orchestrator 04:31): A's answers differ from the pinned ones and B's
+        """A's answers differ from the pinned ones and B's
         match, so the gate takes neither side's time there (release_gate.compare_case, not_compared);
         the report decided over no test at all and said "No loss shown (exit 0)", its rows `- | 1 | -`.
         It names each hypothesis not compared and why, with B's own numbers, and never exits 0."""
@@ -186,7 +186,7 @@ class Abba(unittest.TestCase):
         self.assertIn("2 of 2 hypotheses not compared", text)
 
     def test_a_plan_the_fleet_refuses_exits_as_refused(self):
-        """STAGE2's lead, 8 Nov 2026: `abba.py run --plan` exited 0 when the fleet check it ran
+        """`abba.py run --plan` exited 0 when the fleet check it ran
         refused the set ("(exit 1)" in its text only), so a script read a refused plan as taken. It
         exits 1, as a run that wasn't submitted does; a plan the fleet takes still exits 0."""
         catalog = abba.cases_registry.load()
@@ -223,7 +223,7 @@ class Abba(unittest.TestCase):
 
     def test_passes_from_another_fleet_host_than_the_manifest_s_have_no_verdict(self):
         """Review r1 R1-F1 (HOST_IDENTITY): passes all timed on phuoc-yu, a manifest naming
-        office-pc, got "no loss shown" against office-pc's floor. The fleet may move a timed job
+        the shared host, got "no loss shown" against the shared host's floor. The fleet may move a timed job
         between steps when a host's window closes; such a round has no verdict, and so has one whose
         passes don't say which fleet host ran them."""
         read = []
@@ -356,7 +356,7 @@ systems = []
         self.assertIn("pin_reason", timed)
 
     def test_a_job_asks_for_what_making_its_data_takes(self):
-        """Orchestrator, 7 Nov 2026: a set makes the datasets its cases read where its host lacks
+        """A set makes the datasets its cases read where its host lacks
         them (LUBM's in Docker), so it asks for Docker and the disk to make them in, not the bench
         assets; asked for nothing, it could land where its data can be neither found nor made."""
         self.path.write_bytes(abba.family_text("t", {"a": A, "b": B}, ["dlmode-lubm1"], 6).encode("utf-8"))
@@ -482,7 +482,7 @@ systems = []
         # The fleet keeps an exclusive job's host only before an exclusive step (planner
         # held_between_steps; Sol r1 S1) and while the host takes exclusive work: every step is
         # exclusive, none untimed, so the job starts only where it can time (2 Nov 2026: an untimed
-        # first step built on office-pc outside its timing window, and the blocks were offered
+        # first step built on the shared host outside its timing window, and the blocks were offered
         # another host). The check, every build and the preparation are its first step.
         self.assertNotIn("untimed_steps", job)
         self.assertEqual(job["class"], "exclusive")

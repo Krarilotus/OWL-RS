@@ -136,7 +136,7 @@ class ElTrack(unittest.TestCase):
         self.assertEqual([c for c in commands if "batch" not in c], [])
 
     def test_a_task_the_conversion_fails_is_not_run_and_the_others_classify(self):
-        # Spec: the master, 14 Nov 2026: a task without its N-Triples is `not-run` with its reason; one the
+        # Spec: a task without its N-Triples is `not-run` with its reason; one the
         # runner converted is classified. The runner's row for a failed conversion (Runner.java:
         # status, then its message) names the reason.
         def conversion(command):
@@ -157,7 +157,7 @@ class ElTrack(unittest.TestCase):
     def test_the_conversion_container_carries_the_job_label_the_declared_limits_and_the_pinned_id(self):
         # Spec: fleet Spec 9 (a container in a declared job's step needs `fleet.job=<id>`, a declared memory and,
         # in a job sharing its host, the declared CPUs: ore80-nrese-06886882-r1 stopped at a container without a
-        # CPU limit); the master, 14 Nov 2026: through ns.run_args and the pinned image ID, never the tag.
+        # CPU limit); through ns.run_args and the pinned image ID, never the tag.
         with tempfile.TemporaryDirectory() as tmp:
             _, _, commands = self.run_el(self.cases(tmp), converting, environ=JOB)
         start = next(c for c in commands if "batch" in c)
@@ -170,7 +170,7 @@ class ElTrack(unittest.TestCase):
         self.assertNotIn(nrese.reference.IMAGE, start)
 
     def test_the_classifier_killed_at_its_timeout_is_a_timeout_and_the_next_task_runs(self):
-        # Spec: the master, 14 Nov 2026 (the EL timeout fixed in the same place): `classify` has no budget of its
+        # Spec: `classify` has no budget of its
         # own; killed at --timeout, the row says `timeout`, and the run goes on.
         def classifier(command):
             if command[-1].endswith(f"{EL1}.nt"):
@@ -347,7 +347,7 @@ class DlTracks(unittest.TestCase):
                 self.assertEqual(len(calls), 1 if with_source else 0)
 
     def test_the_beyond_path_not_starting_is_not_run_naming_it(self):
-        # Spec: the master, 14 Nov 2026: one launch path for the three drivers; the consistency track's second
+        # Spec: one launch path for the three drivers; the consistency track's second
         # program not starting is `not-run` with the path named, never the tableau's `unsupported`.
         refused = ok(stdout="ore_ont_7.owl\tunsupported\t-\t13 reader diagnostics (not OWL 2 DL, left out)\n")
 
@@ -400,7 +400,7 @@ class Readers(unittest.TestCase):
         return cases
 
     def test_compare_counts_a_not_run_row_as_no_answer_and_exits_2(self):
-        # Spec: the master, 14 Nov 2026 (`compare` counts them; impossible to read as an answer): the task's
+        # Spec: the task's
         # verdict is the references', the not-run row's own verdict column says `not-run`; a task no reasoner
         # ran (EL2) is no `undecided` task either (review round 1, R5).
         h = "c" * 64
@@ -424,7 +424,7 @@ class Readers(unittest.TestCase):
         self.assertIn("NOT RUN (no answer; the step did not run): nrese-el 2", printed.getvalue())
 
     def test_stats_leaves_not_run_tasks_out_of_solved_and_par2(self):
-        # Spec: the master, 14 Nov 2026: a not-run task is no outcome, so neither unsolved at the limit nor in
+        # Spec: a not-run task is no outcome, so neither unsolved at the limit nor in
         # PAR-2; its own column counts it, a reasoner's latest row of each task. By hand: nrese-el
         # ran one task (EL2, retried after a not-run row) in 2 s: solved 1/1, PAR-2 2.0 s, not run 1.
         results = (f"{EL1}\thermit\tclassify\tclassified\t1000\th\n{EL2}\thermit\tclassify\tclassified\t1000\th\n"
@@ -534,7 +534,7 @@ class W3cReaders(unittest.TestCase):
                 self.w3c = load("w3c_not_run_contract", DL / "w3c.py")
 
     def test_a_not_run_row_is_no_result_in_compare_or_against(self):
-        # Spec: the master, 14 Nov 2026 (impossible to read as an answer anywhere downstream): a Rejected test
+        # Spec: a Rejected test
         # with a not-run row is neither `wrong-result` nor a published pass lost; both readers exit 2.
         with tempfile.TemporaryDirectory() as tmp:
             cases = Path(tmp)

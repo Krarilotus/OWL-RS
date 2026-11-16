@@ -1,5 +1,5 @@
 # The Python packages the suite contracts, scripts/check-doc-paths.py and
-# scripts/check-python-names.py import (scripts/check.sh runs them), at the versions the main PC has. A gate on a fleet host installs them into its own
+# scripts/check-python-names.py import (scripts/check.sh runs them), at the versions the development machine has. A gate on a fleet host installs them into its own
 # environment (scripts/lib/suite-python.sh), never into the host's Python, and only these files:
 # each pin lists the sha256 of every file PyPI holds for it (pip's hash-checking mode; the form
 # `pip-compile --generate-hashes` writes, from https://pypi.org/pypi/<name>/<version>/json).

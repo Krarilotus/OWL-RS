@@ -914,7 +914,7 @@ class Authority(Scratch):
 
     def test_an_exception_governs_its_wrong_answer_where_a_baseline_answers_right(self):
         # Spec: sol-loop r1 S2: the candidate wrong, as the case declares, every baseline right. Without an
-        # exception: NOT PASSED, and the round alone never passes; with Johannes's for that case and outcome:
+        # exception: NOT PASSED, and the round alone never passes; with the owner's for that case and outcome:
         # PASSED, no other blocker left standing for the same outcome.
         def records_of(side, n):
             return [fixtures.record(status="wrong" if side == "cand" else "ok", expected="wrong")]
@@ -929,7 +929,7 @@ class Authority(Scratch):
         self.assertEqual(done.returncode, 0, f"SPEC the exception governs its wrong answer\n{done.stdout}")
 
     def test_an_entry_without_johannes_s_word_is_refused(self):
-        # Spec: role.owners (bar exceptions are Johannes's) and rule.record-owner-intent-verbatim: an entry
+        # Spec: bar exceptions are the owner's, in the owner's recorded words: an entry
         # by anyone else, or without the quote and its source, is a policy error: NOT PASSED.
         for policy in (exception(by="the owner"), exception(extra="")):
             a = self.repo.commit(policy=policy)
@@ -989,7 +989,7 @@ def absence(side: str = "main", scope: str = 'cases = ["lab-olympics"]', by: str
 class DeclaredAbsence(Scratch):
     """A baseline that can't run a case (the release rehearsal of 11 Nov: main's measurement build
     refuses 105 of the 172 cases, base's 57). The master's decision of 11 Nov on IB1347: a product
-    gap is a fact the catalogue states with the case; a harness gap is accepted only by Johannes's
+    gap is a fact the catalogue states with the case; a harness gap is accepted only by the owner's
     entry in the policy file; an undeclared refusal still blocks; the verdict counts, per baseline,
     what was compared and what is absent by product and by decision."""
 
@@ -1017,7 +1017,7 @@ class DeclaredAbsence(Scratch):
 
     def test_a_harness_gap_blocks_unless_johannes_s_entry_names_its_case_and_side(self):
         # Spec: decisions 1b and 2: main refuses the case's arguments; with no entry the hypothesis stays
-        # not compared and blocks, as before; Johannes's [[absence]] entry naming the case (or a pattern
+        # not compared and blocks, as before; the owner's [[absence]] entry naming the case (or a pattern
         # matching it) and main lists it "not compared by the owner's decision" and passes; an entry for
         # another side or case leaves main's refusal blocking.
         catalog = [absent_case()]
