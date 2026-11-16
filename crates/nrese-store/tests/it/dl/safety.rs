@@ -255,3 +255,144 @@ fn an_upper_bound_with_classes_derives_nothing_from_graphs_the_reader_cannot_rea
     assert!(!text.contains("example.com/d"), "{text}");
     assert!(!status.is_complete(), "{:?}", status.reasons());
 }
+
+/// The reader's own graph `open` and what a graph it can't read, `secret`, may hold: an
+/// annotation property's domain (a reason to mark L's answers under `owl2-dl`), another one
+/// by another name, or nothing.
+const OPEN: &str = "GRAPH :open { :x a :Public . :Public rdfs:subClassOf :Known }";
+const HIDDEN: [&str; 3] = [
+    "GRAPH :secret { :privateNote a owl:AnnotationProperty ; rdfs:domain :PrivateClass }",
+    "GRAPH :secret { :otherNote a owl:AnnotationProperty ; rdfs:domain :OtherClass }",
+    "",
+];
+
+/// What `reader` is told of `q`, one line per path: the run, the exact run, EXPLAIN, the
+/// plan, the inferred statements alone, a read with an addition pending (and its exact
+/// refusal), and the store's
+/// public status of the inferred statements alone (`status_without_dl`). Each with the rows
+/// and the status, or the refusal.
+fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<String> {
+    use nrese_store::{CancellationToken, DlAnswers, SparqlQueryRequest, StatementOp};
+    let store = dl.store();
+    let prepare = |q: &str, mode: Option<DlAnswers>| {
+        let mut request = SparqlQueryRequest::new(format!("{PREFIXES}{q}"), reader.clone());
+        request.dl_answers = mode;
+        store.prepare_query(&request).expect("prepared")
+    };
+    let rows = |out: Vec<u8>| String::from_utf8(out).expect("utf8");
+    let run = |q: &str, mode| {
+        let (mut out, mut status) = (Vec::new(), None);
+        let result = store.run_query_reporting(
+            &prepare(q, mode),
+            &CancellationToken::new(),
+            &mut out,
+            |s, _| {
+                status = s;
+                None
+            },
+        );
+        format!("{} {status:?} {:?}", rows(out), result.err())
+    };
+    let pending = |mode| {
+        let add = StatementOp::Add {
+            data: super::versions::ntriples(
+                "<http://example.com/y> <http://example.com/r> <http://example.com/w> .",
+            ),
+            contexts: Vec::new(),
+        };
+        let (mut out, mut status) = (Vec::new(), None);
+        let result = store.run_query_pending_reporting(
+            &nrese_store::StatementsRequest::new(vec![add]),
+            &prepare(q, mode),
+            &CancellationToken::new(),
+            &mut out,
+            |s, _| {
+                status = s;
+                None
+            },
+        );
+        format!("{} {status:?} {:?}", rows(out), result.err())
+    };
+    let explained = store
+        .explain_query(&prepare(q, None), &CancellationToken::new())
+        .map(|e| e.completeness);
+    let planned = store
+        .plan_query(&prepare(q, None), &CancellationToken::new())
+        .map(|p| p.completeness);
+    let implicit = q.replacen('{', "FROM <http://www.ontotext.com/implicit> {", 1);
+    let without_dl = store.status_without_dl(&prepare(&implicit, None));
+    vec![
+        format!("run: {}", run(q, None)),
+        format!("exact: {}", run(q, Some(DlAnswers::Exact))),
+        format!("explain: {explained:?}"),
+        format!("plan: {planned:?}"),
+        format!("inferred alone: {}", run(&implicit, None)),
+        format!("pending: {}", pending(None)),
+        format!("pending, exact: {}", pending(Some(DlAnswers::Exact))),
+        format!("status without dl: {without_dl:?}"),
+    ]
+}
+
+/// R1-F1: what a reader of some graphs is told doesn't depend on a graph it can't read.
+/// Three stores alike in `open`: the hidden graph holds an annotation property's domain,
+/// another under another name, or nothing. The reader of `open` is told the same rows, the
+/// same status and the same refusal on every path, whatever the hidden graph holds.
+#[test]
+fn a_hidden_graph_changes_nothing_a_reader_of_some_graphs_is_told() {
+    let told: Vec<Vec<String>> = HIDDEN
+        .iter()
+        .map(|hidden| {
+            let dl = pipeline();
+            insert(&dl, &format!("{OPEN} {hidden}")).expect("data");
+            told(&dl, &open_reader(), "SELECT ?x { ?x a :Known }")
+        })
+        .collect();
+    for (hidden, lines) in HIDDEN.iter().zip(&told) {
+        eprintln!("hidden {hidden:?}:\n  {}", lines.join("\n  "));
+    }
+    assert_eq!(
+        told[0], told[1],
+        "the hidden graph's names reach the reader"
+    );
+    assert_eq!(
+        told[0], told[2],
+        "the hidden graph's hazard reaches the reader"
+    );
+}
+
+/// The same query by a reader of every graph and by a reader of `open`, on a store whose
+/// hidden graph holds the hazard and on one where it holds nothing: the first is told its
+/// full status (on the first store `unsound`, with the reason naming the property), the
+/// second `not-certified` on both, on every path that reports a status.
+#[test]
+fn a_reader_of_every_graph_is_told_the_mark_and_a_reader_of_some_not_certified() {
+    let mut wrong = Vec::new();
+    for hidden in [HIDDEN[0], HIDDEN[2]] {
+        let dl = pipeline();
+        insert(&dl, &format!("{OPEN} {hidden}")).expect("data");
+        let (rows, status) = query(&dl, "SELECT ?x { ?x a :Known }");
+        let reasons = status.reasons();
+        let line = format!(
+            "hidden {hidden:?}, every graph: {rows:?} {} {reasons:?}",
+            status.shared.as_str()
+        );
+        eprintln!("{line}");
+        let marked = status.shared.as_str() == "unsound"
+            && reasons.iter().any(|r| r.contains("privateNote"));
+        if rows != ["x"] || marked != !hidden.is_empty() {
+            wrong.push(line);
+        }
+        for told in told(&dl, &open_reader(), "SELECT ?x { ?x a :Known }") {
+            eprintln!("hidden {hidden:?}, open: {told}");
+            if !told.contains("certification_withheld: true") {
+                wrong.push(format!(
+                    "not `not-certified`: hidden {hidden:?}, open: {told}"
+                ));
+            }
+            if told.contains("privateNote") {
+                wrong.push(format!("named: hidden {hidden:?}, open: {told}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

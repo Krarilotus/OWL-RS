@@ -51,7 +51,7 @@ use nrese_exec::cell::{self, Build, BuildCell, Builder, Claim, Kind, Scan};
 use parking_lot::Mutex;
 
 use super::characteristic::{CharacteristicSets, Gathered, PairCounts, Partial, SetCount};
-use super::snapshot::HeavyGroups;
+use super::snapshot::{HeavyGroups, SnapshotIdentity};
 use super::{ReadModel, SharedState, Snapshot, Version};
 use crate::quad::{GraphSelector, Permutation, QuadPattern};
 use crate::term::{TermId, TermKind};
@@ -94,9 +94,10 @@ const MAX_MATCHES: u64 = 1 << 22;
 
 type Key = (ReadModel, QuadPattern, Permutation);
 
-/// A distinct-count cache slot: the key, its distinct count and the match count it was
-/// computed at.
-type Slot = Option<(Key, u64, u64)>;
+/// A distinct-count cache slot: the key, its distinct count, the match count it was
+/// computed at, and the published snapshot that last counted the key's matches here with
+/// that count: the same snapshot asks again without counting them again.
+type Slot = Option<(Key, u64, u64, Option<(SnapshotIdentity, u64)>)>;
 
 /// The engine's distinct-count cache, shared by all snapshots.
 #[derive(Default)]
@@ -694,6 +695,8 @@ impl Statistics {
     /// kept for a published snapshot of the engine alone (a view's statistics keep none).
     /// `Ok(None)` where [`Snapshot::distinct_in`] can't answer. The match count that gates
     /// the walk and the walk are counted on `visit`: `Err` once it has stopped, nothing kept.
+    /// The gate's count is taken once per published snapshot that asks: one with the same
+    /// [identity](Snapshot::identity) reads every count alike, so it gets the count kept.
     pub(crate) fn distinct(
         &self,
         snapshot: &Snapshot,
@@ -703,17 +706,44 @@ impl Statistics {
         visit: Visitor<'_>,
     ) -> Result<Option<u64>, Stopped> {
         let key = (model, *pattern, permutation);
+        let slot = Self::distinct_slot(&key);
+        // Only a published snapshot records the gate's count (below), so only one can find
+        // its own: any other asks as before, with no identity to make and no lookup.
+        let state = snapshot.shared_state().filter(|_| !self.view);
+        let identity = state.as_ref().map(|_| snapshot.identity());
+        let kept = identity.and_then(|identity| {
+            self.distinct
+                .lock()
+                .as_ref()
+                .and_then(|slots| match slots[slot] {
+                    Some((kept, distinct, _, Some((seen, count))))
+                        if kept == key && seen == identity =>
+                    {
+                        Some(distinct.min(count))
+                    }
+                    _ => None,
+                })
+        });
+        if let Some(distinct) = kept {
+            // No count to visit, but a stopped reader still gets no value.
+            return match crate::visit::stopped(visit) {
+                true => Err(Stopped),
+                false => Ok(Some(distinct)),
+            };
+        }
         let count = snapshot
             .count_visited(model, pattern, visit)
             .ok_or(Stopped)?
             .at_least();
-        let slot = Self::distinct_slot(&key);
-        if let Some(slots) = &*self.distinct.lock()
-            && let Some((kept, distinct, at)) = slots[slot]
-            && kept == key
-            && count.abs_diff(at) <= at / 4
+        if let Some(slots) = &mut *self.distinct.lock()
+            && let Some((kept, distinct, at, seen)) = &mut slots[slot]
+            && *kept == key
+            && count.abs_diff(*at) <= *at / 4
         {
-            return Ok(Some(distinct.min(count)));
+            if let Some(identity) = identity {
+                *seen = Some((identity, count));
+            }
+            return Ok(Some((*distinct).min(count)));
         }
         if count > MAX_MATCHES {
             return Ok(None);
@@ -722,9 +752,7 @@ impl Statistics {
         let Some(distinct) = snapshot.distinct_in(model, pattern, permutation, visit)? else {
             return Ok(None);
         };
-        if !self.view
-            && let Some(state) = snapshot.shared_state()
-        {
+        if let Some(state) = state {
             self.keep_distinct(&state, slot, key, distinct, count);
         }
         // Capped as a kept one is: a pattern has no more distinct values than matches, and
@@ -743,11 +771,11 @@ impl Statistics {
     /// Keeps `distinct` for `key` in its `slot`, as computed at `count` matches, replacing
     /// what the slot held. The slots are allocated in full at the first entry, charged to
     /// the budget at their capacity; where it can't take them, nothing is kept (the next
-    /// entry asks again). The key has no snapshot dimension: the token proves only that a
-    /// published snapshot computed it.
+    /// entry asks again). The key has no snapshot dimension: the token proves that a
+    /// published snapshot computed it, and names the snapshot that counted `count`.
     fn keep_distinct(
         &self,
-        _state: &SharedState<'_>,
+        state: &SharedState<'_>,
         slot: usize,
         key: Key,
         distinct: u64,
@@ -766,7 +794,8 @@ impl Statistics {
             *cache = Some(slots);
         }
         if let Some(slots) = cache.as_mut() {
-            slots[slot] = Some((key, distinct, count));
+            let seen = (state.snapshot().identity(), count);
+            slots[slot] = Some((key, distinct, count, Some(seen)));
         }
     }
 

@@ -215,6 +215,7 @@ impl IntoResponse for ApiError {
 fn reject_label(kind: RejectKind) -> (&'static str, &'static str) {
     match kind {
         RejectKind::Inconsistent => ("reasoner-reject", "Reasoner Reject"),
+        RejectKind::Undecided => ("undecided-reject", "Undecided Reject"),
         RejectKind::ShapesViolated => ("shacl-reject", "SHACL Reject"),
         RejectKind::NotShown => ("commit-reject", "Commit Reject"),
     }
