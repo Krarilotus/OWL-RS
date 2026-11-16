@@ -91,6 +91,16 @@ impl std::fmt::Debug for Program {
 }
 
 impl Program {
+    /// Whether a run over `snapshot` would leave out a list axiom (any list diagnostic).
+    pub fn leaves_out_a_list(&self, snapshot: &Snapshot) -> bool {
+        let base = explain::SnapshotBase {
+            snapshot,
+            axioms: &[],
+        };
+        let facts = crate::eval::AllFacts(&crate::explain::Whole(&base));
+        (self.lists.as_ref()).is_some_and(|l| !crate::lists::instantiate(l, &facts).1.is_empty())
+    }
+
     /// The rules as the delta executor takes them.
     pub fn rules(&self) -> delta::Rules<'_> {
         delta::Rules {

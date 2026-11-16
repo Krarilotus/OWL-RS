@@ -41,6 +41,8 @@ pub struct StoreService {
     /// The reasoning state recorded this process (also for in-memory stores, which have no
     /// file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
+    /// Shared by the store's clones: a clone with its own record would never see a commit's mark.
+    pub(crate) lists: std::sync::Arc<crate::reasoning::ListsKept>,
     /// The certificate's epoch, a sequence lock over its changes ([`Self::certificate_epoch`]):
     /// odd while one is in progress (under the writer slot, [`CertificateTransition`]), even
     /// once it is settled in memory and on disk.
@@ -289,6 +291,7 @@ impl StoreService {
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             unavailable,
             materialised: std::sync::Arc::default(),
+            lists: Default::default(),
             certificate_epoch: std::sync::Arc::default(),
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             outside_profile: std::sync::Arc::new(std::sync::RwLock::new(outside_profile)),
@@ -1164,7 +1167,7 @@ impl StoreService {
             out,
             |ql| {
                 let status = ql
-                    .map(|ql| ql.completeness.clone())
+                    .map(|ql| self.ql_status(ql, &snapshot))
                     .or_else(|| self.status_without_dl(prepared));
                 // The cache's context is the whole assessment, not what the reader is told.
                 let context = format!("{status:?}");
@@ -1275,13 +1278,9 @@ impl StoreService {
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         let memory = self.settings.query_envelope(prepared);
-        let mut explanation = explain_prepared(
-            &self.read_snapshot_within(prepared.access(), &memory, cancellation)?,
-            prepared,
-            &self.settings,
-            cancellation,
-            &memory,
-        )?;
+        let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
+        let mut explanation =
+            explain_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         if let Some(mode) = self.dl_mode(prepared) {
             // The status as the query would answer, never failing for it.
             let mode = match mode {
@@ -1300,10 +1299,11 @@ impl StoreService {
                 refuted: detail.refuted,
             });
         } else {
-            explanation.completeness = explanation
-                .ql
-                .as_ref()
-                .map(|ql| ql.completeness.clone())
+            explanation.completeness = (explanation.ql.as_mut())
+                .map(|ql| {
+                    ql.completeness = self.ql_status(ql, &snapshot);
+                    ql.completeness.clone()
+                })
                 .or_else(|| self.status_without_dl(prepared));
         }
         Ok(explanation)
@@ -1337,19 +1337,16 @@ impl StoreService {
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
         let memory = self.settings.query_envelope(prepared);
-        let mut planned = plan_prepared(
-            &self.read_snapshot_within(prepared.access(), &memory, cancellation)?,
-            prepared,
-            &self.settings,
-            cancellation,
-            &memory,
-        )?;
+        let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
+        let mut planned =
+            plan_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         planned.completeness = match self.dl_mode(prepared) {
             Some(_) => Some(crate::dl::query::plan_status(self, prepared)),
-            None => planned
-                .ql
-                .as_ref()
-                .map(|ql| ql.completeness.clone())
+            None => (planned.ql.as_mut())
+                .map(|ql| {
+                    ql.completeness = self.ql_status(ql, &snapshot);
+                    ql.completeness.clone()
+                })
                 .or_else(|| self.status_without_dl(prepared)),
         };
         Ok(planned)
@@ -1562,7 +1559,7 @@ impl StoreService {
                             Some(status)
                         }
                         false => ql
-                            .map(|ql| ql.completeness.clone())
+                            .map(|ql| self.ql_status(ql, snapshot))
                             .or_else(|| self.status_without_dl(prepared)),
                     };
                     if deletes && let Some(status) = &mut status {
@@ -2035,6 +2032,32 @@ impl StoreService {
             })
         })
         .hiding_unnamed_classes(self.config.hide_unnamed_classes)
+    }
+
+    /// A revision no commit here recorded (a reopened store's, a replica's) is scanned.
+    pub(crate) fn lists_left_out(&self, snapshot: &nrese_engine::Snapshot) -> bool {
+        self.lists.left_out(snapshot.revision(), || {
+            let rules = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
+            let program = self.bound_program(snapshot, nrese_reasoner::RuleProgram::builtin(rules));
+            program.leaves_out_a_list(snapshot)
+        })
+    }
+
+    /// The QL rewriting's status at `snapshot`: under `owl2-rl`, not `complete` where the
+    /// closure leaves out a list axiom, whose conclusions an answer may miss.
+    fn ql_status(
+        &self,
+        ql: &nrese_sparql::ql::QlReport,
+        snapshot: &nrese_engine::Snapshot,
+    ) -> nrese_sparql::Completeness {
+        let mut status = ql.completeness.clone();
+        let rl = status.regime == Some(nrese_sparql::Regime::Owl2Rl);
+        if status.complete && rl && self.lists_left_out(snapshot) {
+            let why =
+                "a list axiom the rules can't build is left out of the closure (a list diagnostic)";
+            status.incomplete("rules", why.to_owned());
+        }
+        status
     }
 
     /// A statement by the snapshot's ids; `None` if a term isn't in the store.

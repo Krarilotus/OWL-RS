@@ -1596,9 +1596,12 @@ fn a_later_list_fact_leaves_an_aliased_key_out_and_no_answer_complete() {
     left_out_answer(pipeline.store(), &format!("<{EX}x> <{EX}name> \"Z\""));
 }
 
-/// Aliases (`owl:sameAs`) of a key's 7 properties leave the key built: equality by
-/// representatives, the default, reads each cell of its list as one member, not 2^7 member
-/// sequences. Its answer is true and `complete`.
+/// Aliases (`owl:sameAs`) of a key's 7 properties leave the key built by the commit that
+/// writes it: equality by representatives, the default, reads each cell of its list as one
+/// member, not 2^7 member sequences. Its answer is true. It isn't `complete`, one commit
+/// early: the commit's program, ground over the closure it stored (expanded, with equality's
+/// `rdf:first` copies), leaves the key out for the next commit, and the mark follows that
+/// program. A sound mark, less precise than the closure.
 #[test]
 fn aliases_leave_a_key_built() {
     let pipeline = ql_pipeline(in_memory_store_config());
@@ -1616,7 +1619,12 @@ fn aliases_leave_a_key_built() {
     let (payload, status) = (String::from_utf8(answer.payload), answer.completeness);
     println!("aliased key: {payload:?} with {status:?}");
     assert!(payload.expect("utf8").contains("true"));
-    assert!(status.is_some_and(|c| c.complete));
+    let status = status.expect("a status");
+    assert!(!status.complete, "{status:?}");
+    assert!(
+        (status.reasons.iter()).any(|r| r.text.contains("list axiom")),
+        "{status:?}"
+    );
 }
 
 /// A store holding a key the rules leave out, opened again with its closure current (so

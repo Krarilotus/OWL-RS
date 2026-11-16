@@ -18,6 +18,43 @@ pub use nrese_reasoner::engine::{
     materialise, materialise_until, materialise_with, materialise_within,
 };
 
+/// The revisions whose closure leaves out no list axiom (a list the rules can't build, any
+/// list diagnostic), as one range `[from, to]` (`from > to`: empty), and the last revision a
+/// scan found leaving one out. A commit off `to` that leaves none out extends it, any other
+/// commit empties it, and a scan past it that finds none starts it there: a mark is never
+/// lost, for a reader of any revision. Outside it, a revision is scanned.
+#[derive(Debug)]
+pub(crate) struct ListsKept(std::sync::Mutex<(u64, u64, u64)>);
+
+impl Default for ListsKept {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new((1, 0, u64::MAX)))
+    }
+}
+
+impl ListsKept {
+    pub(crate) fn commit(&self, base: u64, revision: u64, left_out: bool) {
+        let mut r = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let clean = !left_out && r.0 <= base && base == r.1;
+        (r.0, r.1) = if clean { (r.0, revision) } else { (1, 0) };
+    }
+
+    pub(crate) fn left_out(&self, revision: u64, scan: impl FnOnce() -> bool) -> bool {
+        let r = *self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if (r.0..=r.1).contains(&revision) || r.2 == revision {
+            return r.2 == revision;
+        }
+        let found = scan();
+        let mut r = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match found {
+            true => r.2 = revision,
+            false if revision > r.1 => (r.0, r.1) = (revision, revision),
+            false => {}
+        }
+        found
+    }
+}
+
 /// The most diagnostics a report lists; `diagnostics_total` counts them all.
 pub const MAX_REPORTED_DIAGNOSTICS: usize = 100;
 
@@ -157,6 +194,28 @@ mod tests {
     use nrese_rdf::{GraphName, Literal, NamedNode, Quad, vocab::owl};
     use nrese_reasoner::rulesets::Ruleset;
     use std::collections::HashSet;
+
+    /// A reader of a revision whose closure left out a list keeps the mark after a later
+    /// commit deletes that list (and after the scan of a later clean revision); revisions the
+    /// record doesn't know are scanned, and clean commits off a clean revision extend it.
+    #[test]
+    fn a_reader_of_a_revision_with_a_list_left_out_keeps_the_mark() {
+        let kept = ListsKept::default();
+        let unknown = || panic!("scanned a known revision");
+        assert!(!kept.left_out(1, || false), "revision 1, scanned clean");
+        kept.commit(1, 2, true); // the long list written
+        assert!(kept.left_out(2, || true), "revision 2, scanned");
+        assert!(kept.left_out(2, unknown), "revision 2, as found");
+        kept.commit(2, 3, false); // the long list deleted
+        assert!(!kept.left_out(3, || false), "revision 3, scanned clean");
+        kept.commit(3, 4, false);
+        assert!(!kept.left_out(4, unknown), "revision 4, extended");
+        assert!(kept.left_out(2, || true), "the older reader keeps the mark");
+        assert!(
+            !kept.left_out(1, || false),
+            "revision 1 scanned again, clean"
+        );
+    }
 
     /// `eq-giant-split`'s shape: a class of `size` members (two `owl:sameAs` chains and a
     /// bridge) beside classes of ten. Deleting the bridge splits the class; over a compact
