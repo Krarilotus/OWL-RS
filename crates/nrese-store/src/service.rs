@@ -640,6 +640,8 @@ impl StoreService {
     pub fn clear_inferred(&self) -> StoreResult<u64> {
         let rematerialisation = self.engine.rematerialisation();
         self.invalidate_held(rematerialisation.writer())?;
+        #[cfg(test)]
+        hooks::run(&hooks::BEFORE_CLEAR_PUBLICATION);
         // An empty stack is read as stored, installed even where it was empty already.
         let finished = rematerialisation.finish_held(Vec::new(), None)?;
         Ok(finished.summary().inferred_deleted)
@@ -2496,6 +2498,11 @@ pub(crate) mod hooks {
         /// What a read reads is fixed and its status is still to come: an `owl2-dl` query has
         /// decided its answers, or another read has taken its snapshot.
         pub(crate) static AFTER_DECIDED: Hook = const { RefCell::new(None) };
+        /// A clear of the inferred stack has invalidated the certificate and is about to
+        /// publish the empty stack.
+        pub(crate) static BEFORE_CLEAR_PUBLICATION: Hook = const { RefCell::new(None) };
+        /// A reasoning commit in quarantine has published and is about to revalidate.
+        pub(crate) static BEFORE_REVALIDATION: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {
@@ -3206,6 +3213,10 @@ mod context_tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "certificate_lifecycle_tests.rs"]
+mod certificate_lifecycle_tests;
 
 /// A rematerialisation under `reasoner.equality = "compact"` is read as it will be certified
 /// from the moment its stack is published: a reader between the publication and the

@@ -439,6 +439,8 @@ impl MutationPipeline {
                 }
             }
             drop(ground);
+            #[cfg(test)]
+            crate::service::hooks::run(&crate::service::hooks::BEFORE_REVALIDATION);
             // In quarantine the commit checked only its own facts: revalidate everything, so
             // the store leaves quarantine once the data is repaired. The commit itself stands.
             if matches!(
