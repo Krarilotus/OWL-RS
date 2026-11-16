@@ -287,14 +287,20 @@ impl Status {
 }
 
 /// What can be said before running `prepared`: complete where every predicate it reads
-/// is closed; otherwise the bounds decide when it runs.
-pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Completeness {
+/// is closed; otherwise the bounds decide when it runs. `Cancelled` where the request stopped
+/// while it waited for another request's build of the bounds' view, which runs on and is kept.
+pub(crate) fn plan_status(
+    store: &StoreService,
+    prepared: &PreparedQuery,
+    cancellation: &CancellationToken,
+) -> StoreResult<Completeness> {
     let analysis = analyse(prepared.query());
-    let at = super::bounds::view(store);
+    let at = super::bounds::view_until(store, Some(&|| cancellation.is_cancelled()))
+        .ok_or(crate::QueryEvaluationError::Cancelled)?;
     let mut completeness = plan_status_built(store, prepared, &analysis, &at).completeness;
     certify(&mut completeness, prepared.reads(), "dl", true, Some(&at.0));
     mark(store, Revision::Decided(&at), &mut completeness);
-    completeness
+    Ok(completeness)
 }
 
 /// The data a status is composed for ([`mark`]): the view the answers were decided on, or
@@ -399,7 +405,7 @@ const COMPARED: &str = "two spellings of one value are two terms to the store, w
 /// both DL entry points, [`plan_status`] and [`answer`], after the bounds; over a ruleset's
 /// closure, with or without the QL rewriting): each step only lowers what the status
 /// asserts. Under `rdfs` and `custom` the regime is the closure's own: what it lacks isn't
-/// entailed. A read [`denied`] names misses rows, and under `owl2-dl` and `owl2-ql` so does
+/// entailed. A read [`denied`] names misses rows, and so does
 /// a typed constant ([`typed_constant`]); a data value compared by term ([`compared_values`])
 /// through a property that holds a literal other than a string, in `snapshot` (the data
 /// read; unknown, or read for a restricted reader: every property), can give wrong rows;
@@ -491,13 +497,11 @@ fn certify(
         let why = "the data read holds a triple term, which OWL 2 doesn't define";
         completeness.incomplete(source, why.to_owned());
     }
-    if matches!(completeness.regime, Some(Owl2Dl | Owl2Ql)) {
-        let constant = reads.constant.get_or_init(|| {
-            typed_constant(query).map(|c| format!("the query names {c}: {SPELLING}"))
-        });
-        if let Some(reason) = constant {
-            completeness.incomplete(source, reason.clone());
-        }
+    let constant = reads
+        .constant
+        .get_or_init(|| typed_constant(query).map(|c| format!("the query names {c}: {SPELLING}")));
+    if let Some(reason) = constant {
+        completeness.incomplete(source, reason.clone());
     }
     let snapshot = snapshot.filter(|_| access.is_none());
     let typed = |predicate: &Option<String>| {
@@ -590,7 +594,8 @@ pub(crate) fn answer(
     cancellation.check()?;
     let analysis = analyse(prepared.query());
     // One view for the answers and their status: a commit in between changes neither (R1-F2).
-    let at = super::bounds::view(store);
+    let at = super::bounds::view_until(store, Some(&|| cancellation.is_cancelled()))
+        .ok_or(crate::QueryEvaluationError::Cancelled)?;
     let mut outcome = decide_answers(store, prepared, &analysis, &at, cancellation, memory, mode)?;
     #[cfg(test)]
     crate::service::hooks::run(&crate::service::hooks::AFTER_DECIDED);
@@ -601,21 +606,27 @@ pub(crate) fn answer(
             mark(store, Revision::Decided(&at), status);
         }
     }
-    let status = match &outcome {
-        Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => status,
-    };
+    let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &outcome;
+    refuse_unless_complete(mode, status, || detail.unresolved.clone())?;
+    Ok(outcome)
+}
+
+/// The one rule of exact answers: under [`DlAnswers::Exact`] an answer whose `status` isn't
+/// complete is refused, with that status and the candidates left `unresolved`. Both the
+/// bounds' path ([`answer`]) and the reads past the bounds, before they run
+/// (`StoreService::refuse_exact`), ask it.
+pub(crate) fn refuse_unless_complete(
+    mode: DlAnswers,
+    status: &Completeness,
+    unresolved: impl FnOnce() -> Vec<String>,
+) -> StoreResult<()> {
     if mode == DlAnswers::Exact && !status.complete {
-        let unresolved = match &outcome {
-            Outcome::Stream(_, _, detail) | Outcome::Answers(_, _, detail) => {
-                detail.unresolved.clone()
-            }
-        };
         return Err(StoreError::Incomplete(Box::new(crate::IncompleteAnswer {
             status: status.clone(),
-            unresolved,
+            unresolved: unresolved(),
         })));
     }
-    Ok(outcome)
+    Ok(())
 }
 
 #[cfg(test)]
