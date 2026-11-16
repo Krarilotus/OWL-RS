@@ -13,7 +13,7 @@
 //!   `dl.timeout`; an incomplete one still gives only entailed subsumptions.
 //!   It uses the same store-owned classification options and process-memory watch policy
 //!   as an explicit classification request.
-//! - **The memberships** are computed per revision from L's (one scan of each subclass's
+//! - **The memberships** are computed per revision from L's (one scan of each class's
 //!   members) and kept in the read view, beside the engine's stacks, as U1's facts are.
 
 use std::collections::HashMap;
@@ -24,6 +24,10 @@ use nrese_owl::Ontology;
 use nrese_reasoner::ir::Triple;
 
 use crate::StoreService;
+
+#[cfg(test)]
+#[path = "lower_tests.rs"]
+mod tests;
 
 /// The taxonomy of `ontology`'s TBox (its assertions left out).
 pub(crate) fn tbox_taxonomy(store: &StoreService, ontology: &Ontology) -> Taxonomy {
@@ -43,8 +47,10 @@ pub(crate) fn tbox_taxonomy(store: &StoreService, ontology: &Ontology) -> Taxono
 
 /// The memberships `taxonomy` adds to `snapshot`'s: `(a rdf:type D)` for each member `a`
 /// of `C` and superclass `D` of `C`, where `snapshot` doesn't have it; sorted, each once.
-/// Store-scale, so the list and each subclass's members are charged to `budget` as they grow
-/// (SYN-61); `Err` where it can't take them. O(members of the subclasses × their superclasses).
+/// Each class of a subsumption has its members read once, by one scan, and sorted; a pair is
+/// then a sorted difference, so no point read per member and superclass (D16-712). The member
+/// lists, all held at once, and the list are charged to `budget` as they grow (SYN-61); `Err`
+/// where it can't take them. O(the classes' members × log, plus each pair's two lists).
 pub(crate) fn memberships(
     snapshot: &Snapshot,
     taxonomy: &Taxonomy,
@@ -55,44 +61,38 @@ pub(crate) fn memberships(
     for &(sub, sup) in &taxonomy.classification.subsumptions {
         supers.entry(sub).or_default().push(sup);
     }
-    let has = |t: Triple| {
-        snapshot
-            .quads_for_pattern_in(ReadModel::Materialised, &pattern(t))
-            .next()
-            .is_some()
-    };
-    let mut out = nrese_exec::ChargedVec::new(std::sync::Arc::clone(budget));
-    for (sub, sups) in &supers {
-        let mut members = nrese_exec::ChargedVec::new(std::sync::Arc::clone(budget));
+    let classes = supers
+        .iter()
+        .flat_map(|(sub, sups)| std::iter::once(sub).chain(sups));
+    let mut members = HashMap::new();
+    for class in classes.copied().collect::<std::collections::HashSet<u64>>() {
+        let mut of = nrese_exec::ChargedVec::new(std::sync::Arc::clone(budget));
         for q in snapshot.quads_for_pattern_in(
             ReadModel::Materialised,
             &QuadPattern {
                 subject: None,
                 predicate: Some(TermId::from_raw(rdf_type)),
-                object: Some(TermId::from_raw(*sub)),
+                object: Some(TermId::from_raw(class)),
                 graph: GraphSelector::Any,
             },
         ) {
-            members.push(q.subject.raw())?;
+            of.push(q.subject.raw())?;
         }
-        for &a in members.iter() {
-            for &sup in sups {
-                let fact = [a, rdf_type, sup];
-                if !has(fact) {
-                    out.push(fact)?;
+        of.sort_unstable();
+        members.insert(class, of);
+    }
+    let mut out = nrese_exec::ChargedVec::new(std::sync::Arc::clone(budget));
+    for (sub, sups) in &supers {
+        for &sup in sups {
+            let mut typed = members[&sup].iter().peekable();
+            for &a in members[sub].iter() {
+                while typed.next_if(|&&t| t < a).is_some() {}
+                if typed.peek() != Some(&&a) {
+                    out.push([a, rdf_type, sup])?;
                 }
             }
         }
     }
     super::upper::sort_dedup(&mut out);
     Ok(out)
-}
-
-fn pattern([s, p, o]: Triple) -> QuadPattern {
-    QuadPattern {
-        subject: Some(TermId::from_raw(s)),
-        predicate: Some(TermId::from_raw(p)),
-        object: Some(TermId::from_raw(o)),
-        graph: GraphSelector::Any,
-    }
 }
