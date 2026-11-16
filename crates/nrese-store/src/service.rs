@@ -1860,12 +1860,22 @@ impl StoreService {
 
     /// Writes an image backup of the latest snapshot into `dir` ([`crate::image_backup`]).
     pub fn backup_image(&self, dir: &std::path::Path) -> StoreResult<crate::ImageManifest> {
-        crate::image_backup::backup_image(&self.engine, dir)
+        crate::image_backup::backup_image(&self.engine, dir, false)
+    }
+
+    /// A read replica's start: [`Self::backup_image`], refused
+    /// ([`crate::StoreError::CompactPrimary`]) where the version written is stored over
+    /// representatives, which the image doesn't say.
+    pub fn replication_image(&self, dir: &std::path::Path) -> StoreResult<crate::ImageManifest> {
+        crate::image_backup::backup_image(&self.engine, dir, true)
     }
 
     /// A read replica's feed: the committed records after revision `after`, at most about
     /// `max_bytes` ([`nrese_engine::Engine::log_since`]). An error for a log that no
     /// longer holds them (`EngineError::LogTruncated`): the replica starts from an image.
+    /// Refused ([`crate::StoreError::CompactPrimary`]) where the version served is stored
+    /// over representatives: the records don't say so, and a replica would read them as
+    /// they are.
     pub fn replication_log(
         &self,
         after: u64,
@@ -1874,6 +1884,10 @@ impl StoreService {
         self.engine
             .log_since(after, max_bytes)
             .map_err(crate::StoreError::Engine)
+            .and_then(|batch| match batch.equality {
+                Some(_) => Err(crate::StoreError::CompactPrimary),
+                None => Ok(batch),
+            })
     }
 
     /// Applies a primary's records on this store, a read replica: each becomes a commit
@@ -1891,6 +1905,11 @@ impl StoreService {
         expected: &nrese_engine::LogExpectation,
         stop: &nrese_exec::stop::StopSource,
     ) -> StoreResult<nrese_engine::Applied> {
+        // A marker left from a start as a primary would vouch, after a restart, for the
+        // records applied here (nothing reasons on a replica to write one again).
+        if self.marker.load(std::sync::atomic::Ordering::Acquire) {
+            self.invalidate_reasoning()?;
+        }
         let before = self.current_revision();
         let applied = self.engine.apply_log(frames, expected, stop);
         // Whatever was published, a whole answer or the records before a stop or a

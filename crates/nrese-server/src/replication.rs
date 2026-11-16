@@ -224,6 +224,9 @@ pub async fn log(
                 query.after
             )));
         }
+        Err(error @ nrese_store::StoreError::CompactPrimary) => {
+            return Err(ApiError::conflict(error.to_string()));
+        }
         Err(error) => return Err(ApiError::internal(error.to_string())),
     };
     let mut response = (StatusCode::OK, batch.frames).into_response();
@@ -255,7 +258,7 @@ pub async fn image(
         let dir =
             tempfile::tempdir_in(&store.config().data_dir).or_else(|_| tempfile::tempdir())?;
         let manifest = store
-            .backup_image(dir.path())
+            .replication_image(dir.path())
             .map_err(|error| std::io::Error::other(error.to_string()))?;
         Ok::<_, std::io::Error>((dir, manifest))
     })

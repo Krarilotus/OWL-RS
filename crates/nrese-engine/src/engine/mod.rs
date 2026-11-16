@@ -133,6 +133,9 @@ pub struct ImageInfo {
     pub revision: u64,
     pub quads: u64,
     pub inferred: u64,
+    /// The written version's reading ([`Engine::equality`]): `Some` where its rows are
+    /// stored over representatives. For the store to read; the image doesn't hold it.
+    pub equality: Option<TermId>,
 }
 
 /// Point-in-time engine statistics.
@@ -1316,6 +1319,7 @@ impl Engine {
             revision: snapshot.revision(),
             quads: version.asserted.len(),
             inferred: version.inferred.len(),
+            equality: version.reading,
         })
     }
 
