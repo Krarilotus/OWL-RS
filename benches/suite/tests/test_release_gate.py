@@ -126,7 +126,7 @@ CONTEXT = {"host": "phuoc-yu", "round": 0, "prefix": "rg-cccccccc", "max_gb": 24
 def remove_checkout(tree, repo=ROOT) -> subprocess.CompletedProcess:
     """A checkout a test made, removed by its path alone (never a `prune`). With core.longpaths: a
     job's temp root on a Windows host can put the repository's deepest files past 260 characters,
-    where git without it can't delete them (khaleesi's Windows tier, 2 Nov 2026: "Filename too long";
+    where git without it can't delete them (the development machine's Windows tier, 2 Nov 2026: "Filename too long";
     other platforms ignore the setting)."""
     return subprocess.run(["git", "-c", "core.longpaths=true", "worktree", "remove", "--force", Path(tree).as_posix()],
                           cwd=repo, capture_output=True, text=True)
@@ -153,7 +153,7 @@ def remove_checkouts_under(root, repo=ROOT) -> list[str]:
 
 class Checkouts(unittest.TestCase):
     def test_a_test_s_checkout_past_the_windows_path_limit_is_removed(self):
-        """khaleesi's Windows tier, 2 Nov 2026: a test's harness checkout under the job's deep temp
+        """The development machine's Windows tier, 2 Nov 2026: a test's harness checkout under the job's deep temp
         root stayed registered ("Filename too long"), failing the test that made it."""
         if os.name != "nt":
             self.skipTest("the 260-character limit is Windows'")
@@ -177,7 +177,7 @@ class Checkouts(unittest.TestCase):
             self.assertFalse(tree.exists())
 
     def test_a_test_removes_only_its_own_checkouts_never_prunes(self):
-        """Orchestrator, 2 Nov 2026 (rule.delete-only-what-you-created): three tests ran `git worktree
+        """Three tests ran `git worktree
         prune` in the repository the suite runs in, which drops every registration whose directory
         this process can't see, another agent's live checkout among them. A test removes the
         checkouts under its own temporary directory, by path, and nothing else."""
@@ -432,7 +432,7 @@ class Layouts(unittest.TestCase):
         false block. Six passes of one build, one round: q06 at 0.0 in all, and no wall, blocks every
         split; q06 at 0.0 in three and 5.0 in three has emerged where every block's baseline is a 0.0
         and its candidate a 5.0, 3! 3! of 6! orders, 0.05 (one round rejects nothing by Holm). With
-        no series left to test, the shares divided by zero (Sol r2)."""
+        no series left to test, the shares divided by zero."""
         spec_ = importlib.util.spec_from_file_location("gate_power", ROOT / "benches/probes/gate-power.py")
         probe = importlib.util.module_from_spec(spec_)
         spec_.loader.exec_module(probe)
@@ -625,7 +625,7 @@ class Rounds(unittest.TestCase):
     def test_a_part_asks_for_the_data_its_cases_read(self):
         """The fleet places by `has` only what the job can't make: the verified bench assets (frozen
         datasets, ORE ontologies, reference taxonomies). What benches/sparql/prepare.sh makes is the
-        job's own (Johannes, 2 Nov 2026: "Data is the job's responsibility, not the fleet's"): no
+        job's own ("Data is the job's responsibility, not the fleet's"): no
         capability, but the disk to make it in, its source and its file."""
         need = gate_module.data_needs
         self.assertEqual(need([{"data": "social people=1000"}]), [])
@@ -641,8 +641,8 @@ class Rounds(unittest.TestCase):
                          -(-2 * frozen["lubm-10.nt"]["bytes"] // 10 ** 9))
 
     def test_a_part_asks_for_what_its_data_s_makers_need_not_the_assets(self):
-        """Orchestrator, 7 Nov 2026 (Johannes's 2 Nov decisions 1 and 8: a job sets up what it needs
-        where it's missing, never a blanket copy): a set makes the datasets its cases read where a
+        """A job sets up what it needs
+        where it's missing, never a blanket copy: a set makes the datasets its cases read where a
         host lacks them; only a file no maker here can make asks for the bench assets. The LUBM and
         OWL2Bench makers run in Docker; perf_lab's support-stress generator needs only the build.
         REAS (abba-run-8ac6a2b5-91f067f1) passed --plan and failed at its data step: its
@@ -1010,7 +1010,7 @@ class Rounds(unittest.TestCase):
                                  {"url:https://example.org/x.nt": None})
 
     def test_which_external_files_a_case_loads_has_one_answer(self):
-        """The orchestrator, 7 Nov 2026 (18:12): the recorder and the comparison decide what an input
+        """The recorder and the comparison decide what an input
         is by one function (suitekit.inputs.declared()); a kind it doesn't know is external, of
         unknown bytes; only a bare generator spec is generated."""
         from suitekit import inputs
@@ -1045,7 +1045,7 @@ class Rounds(unittest.TestCase):
         self.assertEqual((changed["sha256"], changed["frozen"]), ("3" * 64, "2026-11-08"))
 
     def test_the_data_step_makes_a_missing_file_aside_and_keeps_only_what_its_pin_accepts(self):
-        """Orchestrator, 7 Nov 2026: a maker writes into a directory aside (NRESE_DATASET_DIR, never
+        """A maker writes into a directory aside (NRESE_DATASET_DIR, never
         the shared volume); each file the cases need is checked against its pin and only then renamed
         into the cache. A file that isn't its pin stays out, the cache as it was, and only it fails."""
         import hashlib
@@ -1654,7 +1654,7 @@ class Memory(unittest.TestCase):
 
 
 class BelowResolution(unittest.TestCase):
-    """The below-resolution design (14 Nov 2026, master's GO): a block median below the counter's
+    """The below-resolution design (14 Nov 2026): a block median below the counter's
     step is a reading, standing for half a step, never dropped. Below it on both sides in every
     block: `below resolution`, outside the Holm family, covered by the case's measured whole run or
     blocking; on the candidate alone: `vanished`, a gain."""
@@ -1716,7 +1716,7 @@ class BelowResolution(unittest.TestCase):
         self.assertEqual(self.dim([0.0] * 3, [5.0] * 3)["status"], "emerged")
 
     def test_an_emerged_cost_blocks_the_verdict_unless_the_owner_s_entry_covers_it(self):
-        # Spec (master, 14 Nov 09:15: a blocking verdict of its own, which the owner may take out):
+        # Spec (a blocking verdict of its own, which the owner may take out):
         # a phase at 0.0 on both baselines in every block and 5.0 on the candidate, its case's
         # whole run alike, blocks the release; an [[emerged]] entry for its case and dimension whose
         # `max` reaches the candidate's 5.0 accepts it, one below 5.0 doesn't.
@@ -1768,7 +1768,7 @@ class BelowResolution(unittest.TestCase):
         self.assertIn("no measured time/wall covers it", blocks[0])
 
     def test_only_a_case_counting_live_bytes_declares_the_live_peak(self):
-        # Spec (master, 12 Nov 10:36): --count-allocations alone counts calls and bytes, as the
+        # Spec: --count-allocations alone counts calls and bytes, as the
         # baselines' perf labs do, and declares no live peak, so the three counted cases are
         # compared on time and anon/kernel memory only; a case counting live bytes (--count-live)
         # declares memory/live against each baseline it isn't absent for.
@@ -1811,7 +1811,7 @@ class ToolPhases(unittest.TestCase):
 
 class Evidence(unittest.TestCase):
     def test_a_declared_hypothesis_without_candidate_evidence_fails_closed(self):
-        """Sol, 20 Oct 2026: with the baseline's memory reading and none from the candidate, the
+        """With the baseline's memory reading and none from the candidate, the
         hypothesis went untested and the gate passed a confirmed loss. A reading lost on the
         candidate blocks; a baseline without the metric is stated, not missing."""
         dims = ("time/q01", "time/q06", "memory/anon_kernel")
@@ -1933,7 +1933,7 @@ class Parts(unittest.TestCase):
         self.assertEqual(tomllib.loads(gate_module.toml_job(timed))["steps"], timed["steps"])
 
     def test_the_big_cases_run_on_a_linux_host_never_native_windows(self):
-        """Round 8: the big job went to khaleesi, native Windows, with the build's ELF binaries. It
+        """Round 8: the big job went to the development machine, native Windows, with the build's ELF binaries. It
         asks for Linux and the memory of its cases, and builds its own binaries there."""
         found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None)
         big = found["rg-test-big"]
@@ -2122,7 +2122,7 @@ point {head} "$b"
         self.assertEqual(left, [], "the harness checkout this test made stayed registered")
 
     def test_a_main_that_is_the_base_is_timed_once_and_declared_once(self):
-        """Orchestrator, 20 Oct 2026: the jobs require a main, so a confirmation passes the base
+        """The jobs require a main, so a confirmation passes the base
         twice and every block timed it twice. The gate takes the base's runs for it, and its
         hypotheses aren't declared beside the base's."""
         sides = {"cand": REVS["cand"], "base": REVS["base"], "main": REVS["base"]}
@@ -2239,7 +2239,7 @@ printf "no linker" > "$d/release/other"; lld_of "$d" 2>/dev/null || echo not-lld
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "the watcher watches /proc (Linux)")
     def test_a_blocks_attempts_from_every_crash_point_one_repeat_at_most_a_verdict_before_acceptance(self):
-        """The orchestrator, 20 Oct 2026: a disturbed block is left out of the statistics, both
+        """A disturbed block is left out of the statistics, both
         sides, and repeated once; a disturbed repeat is kept and listed. Sol, 20 Oct 2026: a restart
         accepted a disturbed block, or ran a third attempt. One table over the states a crash leaves
         a block in: what the restarted step runs and keeps. git, the watcher and fast.py are faked
@@ -2580,7 +2580,7 @@ class Instances(unittest.TestCase):
         self.assertIn("timed its side's build in place", " ".join(run_gate(ps)["errors"]))
 
     def test_a_block_removes_only_the_copies_it_made_also_when_a_copy_fails(self):
-        """Sol, 20 Oct 2026: block removed a block-<n>-<pid> directory that was there before it,
+        """block removed a block-<n>-<pid> directory that was there before it,
         copied outside its cleanup, and took any side name as a path."""
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / "instances"
@@ -3536,7 +3536,7 @@ done
 
 class AbsentSides(unittest.TestCase):
     """The master's decision of 11 Nov on IB1347, 2: a side declared absent for a case (the
-    catalogue's product gap, or Johannes's [[absence]] entry in the policy file of the tree the block
+    catalogue's product gap, or the owner's [[absence]] entry in the policy file of the tree the block
     runs) is never run in the timed blocks."""
 
     def test_a_declared_absent_side_is_never_run_and_the_block_s_schedule_still_holds(self):
