@@ -765,21 +765,57 @@ impl<'a> Reader<'a> {
     }
 
     /// Whether the restriction `node` says its undeclared property is a data property, where
-    /// no literal use does (a schema read alone): its value a literal, or its filler a
-    /// datatype (declared, or of OWL 2's datatype map, whose names no class may take).
-    fn says_data(&self, node: Term) -> bool {
-        let first = |p| self.objects(node, p).first().copied();
-        if let Some(value) = first(self.v.owl_has_value) {
+    /// no literal use does (a schema read alone): its value a literal, or its filler a data
+    /// range ([`Self::is_data_range`]).
+    fn says_data(&mut self, node: Term) -> bool {
+        let first = |reader: &Self, p| reader.objects(node, p).first().copied();
+        if let Some(value) = first(self, self.v.owl_has_value) {
             return self.kind(value) == TermKind::Literal;
         }
-        let filler = first(self.v.owl_some_values_from);
-        let Some(filler) = filler.or_else(|| first(self.v.owl_all_values_from)) else {
+        let filler = first(self, self.v.owl_some_values_from);
+        let Some(filler) = filler.or_else(|| first(self, self.v.owl_all_values_from)) else {
             return false;
         };
-        self.declared_as(filler, EntityKind::Datatype)
-            || crate::vocab::DATA_IRIS
-                .iter()
-                .any(|&iri| self.terms.iri(iri) == Some(filler))
+        self.is_data_range(filler, &mut HashSet::new())
+    }
+
+    /// Whether `term` is a data range by its own statements: a datatype (declared, or of
+    /// OWL 2's datatype map, whose names no class may take), or a blank node typed
+    /// `rdfs:Datatype` (`owl:DataRange` in OWL 1), restricting a datatype, a datatype's
+    /// complement, an enumeration of literals, or an intersection or union of data ranges.
+    /// A mix with classes, an empty list or a cycle (`seen`) is no evidence: read as before.
+    fn is_data_range(&mut self, term: Term, seen: &mut HashSet<Term>) -> bool {
+        let v = self.v;
+        match self.kind(term) {
+            TermKind::Iri => {
+                self.declared_as(term, EntityKind::Datatype)
+                    || crate::vocab::DATA_IRIS
+                        .iter()
+                        .any(|&iri| self.terms.iri(iri) == Some(term))
+            }
+            TermKind::Blank if seen.insert(term) => {
+                let first = |reader: &Self, p| reader.objects(term, p).first().copied();
+                if self.has_type(term, v.rdfs_datatype)
+                    || self.has_type(term, v.owl_data_range)
+                    || first(self, v.owl_on_datatype).is_some()
+                    || first(self, v.owl_datatype_complement_of).is_some()
+                {
+                    return true;
+                }
+                if let Some(list) = first(self, v.owl_one_of) {
+                    let members = self.list(list).unwrap_or_default();
+                    return !members.is_empty()
+                        && members.iter().all(|&m| self.kind(m) == TermKind::Literal);
+                }
+                let operands =
+                    first(self, v.owl_intersection_of).or_else(|| first(self, v.owl_union_of));
+                let members = operands
+                    .and_then(|list| self.list(list))
+                    .unwrap_or_default();
+                !members.is_empty() && members.iter().all(|&m| self.is_data_range(m, seen))
+            }
+            _ => false,
+        }
     }
 
     /// A restriction on `property`.
