@@ -100,7 +100,7 @@ fn tsv(view: &impl ReadView, text: &str, options: &QueryOptions) -> Vec<u8> {
 /// `text`'s answer on `view` as TSV the way the store writes it: from the cache's bytes, or
 /// written and offered.
 fn tsv_through_the_cache(view: &impl ReadView, text: &str, options: &QueryOptions) -> Vec<u8> {
-    match cached_output(view, &parse(text), options, TSV, "") {
+    match cached_output(view, &parse(text), options, TSV, b"") {
         CachedOutput::Hit(bytes) => bytes.to_vec(),
         CachedOutput::Miss(slot) => {
             let written = tsv(view, text, options);

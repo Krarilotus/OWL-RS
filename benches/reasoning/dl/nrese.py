@@ -36,11 +36,16 @@ appended to CASES/results.tsv, so that `ore.py compare` sets them beside the ref
 A task whose step did not run (its input file missing, its program not started, its N-Triples
 not made) gets a `not-run` row: time 0, the reason in the detail column. It is no answer:
 `ore.py` counts it apart from every outcome, the driver exits 2, and a later run takes the
-task again.
+task again. A driver whose task list is empty (no row of its tasks in CASES/results.tsv, or
+none `--only` names) ran nothing: it exits 2 too. `el` refuses, before any conversion and
+without a row, a CASES/files or CASES/tax reached through a link, or a task's file that is
+one: the conversion's container mounts CASES alone and cannot follow it (copy or hard-link
+the files instead).
 """
 
 import argparse
 import hashlib
+import os
 import pathlib
 import subprocess
 import sys
@@ -88,6 +93,23 @@ def finished(missed):
     if missed:
         print(f"{missed} tasks did not run (rows `{NOT_RUN}`)", file=sys.stderr)
     return 2 if missed else 0
+
+
+def nothing_ran(kind, cases):
+    """The exit status of a driver whose task list is empty: 2, never a pass (D16-642)."""
+    print(f"no {kind} task in {pathlib.Path(cases) / 'results.tsv'}: nothing ran", file=sys.stderr)
+    return 2
+
+
+def unseen(cases, tasks):
+    """What of CASES the conversion's container cannot read for `tasks`: it mounts CASES alone, so a
+    folder or file reached through a link names a path it does not have (D16-642: ore80-nrese r2 on
+    14 Nov and fc-dlnrese-4e0ff30f-1115b linked CASES/files to a host folder, and every conversion
+    found no input). Hard links and copies are files of their own."""
+    links = [d for d in (cases / "files", cases / "tax") if d.is_symlink()]
+    if not links:
+        links = [p for p in (cases / "files" / f"{t.split('-el-')[0]}.owl" for t in tasks) if p.is_symlink()]
+    return [f"{p} (a link to {os.readlink(p)})" for p in links]
 
 
 RECORD = "ntriples.tsv"  # CASES/tax: each completed conversion, task and its file's sha256
@@ -142,9 +164,17 @@ def el(args):
     path, rows = results(cases)
     have = answered(rows)
     tasks = sorted({r[0] for r in rows if "-el-classification" in r[0]})
+    if not tasks:
+        return nothing_ran("EL classification", cases)
     todo = [t for t in tasks if (t, "nrese-el") not in have]
     made = converted(cases)
     missing = [t for t in todo if t not in made]
+    hidden = unseen(cases, missing) if missing else []
+    if hidden:
+        print("the conversion's container mounts CASES alone and cannot follow a link (copy or hard-link "
+              "the files): " + "; ".join(hidden[:5]) + (f"; {len(hidden) - 5} more" if len(hidden) > 5 else ""),
+              file=sys.stderr)
+        return 2
     unmade = ntriples(cases, missing) if missing else {}
     binary = pathlib.Path(args.binary)
     missed = 0
@@ -244,6 +274,8 @@ def dl(args):
     path, rows = results(cases)
     have = answered(rows)
     tasks = dl_tasks(rows, ("classify", "realise"), args.only)
+    if not tasks:
+        return nothing_ran("classification or realisation", cases)
     binary = pathlib.Path(args.binary)
     missed = 0
     with open(path, "a", encoding="utf-8", newline="\n") as out:
@@ -301,9 +333,12 @@ def consistency(args):
     cases = pathlib.Path(args.cases).resolve()
     path, rows = results(cases)
     have = answered(rows)
+    tasks = dl_tasks(rows, ("consistency",), args.only)
+    if not tasks:
+        return nothing_ran("consistency", cases)
     missed = 0
     with open(path, "a", encoding="utf-8", newline="\n") as out:
-        for t, _ in dl_tasks(rows, ("consistency",), args.only):
+        for t, _ in tasks:
             if (t, "nrese-dl") in have and not args.again:
                 continue
             source = str(cases / "files" / f"{t.split('-')[0]}.owl")

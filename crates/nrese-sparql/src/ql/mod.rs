@@ -449,10 +449,34 @@ impl QlRewriting {
         self.closure
     }
 
-    /// What decides its rewritings besides the snapshot's TBox: the closure and the
-    /// bounds (part of the result cache's key of an answer).
-    pub(crate) fn fingerprint(&self) -> String {
-        format!("{:?} {:?}", self.closure, self.limits)
+    /// What decides its rewritings besides the snapshot's TBox, as numbers for the result
+    /// cache's key of an answer: the closure and every bound, read from the fields where
+    /// the key is written (no text is made). The key's test builds both field by field, so
+    /// a field added to either fails it until it is written here too; a field added to the
+    /// rewriting itself doesn't compile here until it is written or named as derived.
+    pub(crate) fn fingerprint(&self) -> [u64; 10] {
+        // The compiled schemas, probes and commit notes follow from the snapshots read, which
+        // a key holds: no part of a key.
+        let Self {
+            closure,
+            limits: l,
+            cached: _,
+            realised: _,
+            notes: _,
+        } = self;
+        let n = |v: usize| v as u64;
+        [
+            u64::from(closure.lists),
+            n(l.existential_vars),
+            n(l.candidates),
+            n(l.witnesses),
+            n(l.branches),
+            n(l.size),
+            n(l.work),
+            n(l.query_work),
+            n(l.checks),
+            l.check_rows,
+        ]
     }
 
     pub(crate) fn limits(&self) -> &Limits {
@@ -751,8 +775,14 @@ impl ProbeMode {
 }
 
 /// One view's probe answers, by mode ([`ProbeMode`]), then by probe.
+/// And the bytes they take, each counted as its key's length and [`PROBE_ENTRY`] bytes: at
+/// most [`PROBE_BYTES`], past which they are all dropped; an answer past it alone is never
+/// kept (docs/design/ql-rewriting.md §2).
 #[derive(Debug, Default)]
-pub(crate) struct Probes(HashMap<ProbeMode, HashMap<String, bool>>);
+pub(crate) struct Probes(HashMap<ProbeMode, HashMap<String, bool>>, usize);
+
+const PROBE_BYTES: usize = 4 << 20;
+const PROBE_ENTRY: usize = 48;
 
 /// [`Probes::all`]: each probe's answer, with its mode and its query, sorted.
 #[cfg(test)]
@@ -764,10 +794,19 @@ impl Probes {
     }
 
     fn insert(&mut self, mode: ProbeMode, key: &str, known: bool) {
-        self.0
-            .entry(mode)
-            .or_default()
-            .insert(key.to_owned(), known);
+        let bytes = key.len() + PROBE_ENTRY;
+        if bytes > PROBE_BYTES {
+            // Past the cap alone: not kept, so asked again when next needed.
+            return;
+        }
+        if self.1 + bytes > PROBE_BYTES {
+            // A dropped answer is asked again when next needed, never guessed.
+            *self = Self::default();
+        }
+        let kept = self.0.entry(mode).or_default();
+        if kept.insert(key.to_owned(), known).is_none() {
+            self.1 += bytes;
+        }
     }
 
     /// Every answer, with its mode.

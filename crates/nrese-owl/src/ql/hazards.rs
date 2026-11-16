@@ -60,6 +60,37 @@ pub enum Hazard {
     /// A structure the mapping drops (malformed, unsupported, a broken list), at the node
     /// it reports: the axiom it was part of isn't read at all (I24c-2).
     Dropped(Term),
+    /// A data property whose values OWL 2 RL's rules would compare or type
+    /// ([`reads_data_values`]), or a property not declared an object property in a key or
+    /// a disjointness, which may be one: global.
+    DataValues(Term),
+    /// A restriction whose cardinality isn't spelled as the RDF mapping writes it
+    /// ([`Ontology::noncanonical_cardinality`]), which OWL 2 RL's rules don't read: global.
+    CardinalitySpelling(Term),
+}
+
+/// A data property whose values OWL 2 RL's rules would compare or type, where the rule
+/// set leaves out dt-eq and dt-type2: one value in two lexical forms (`"1"`, `"01"`) is
+/// two terms to it, and a literal has no datatype. A key on it (prp-key), a negative
+/// assertion of it (prp-npa2), disjoint data properties (prp-pdw, prp-adp), a hasValue
+/// (cls-hv2), a someValuesFrom (cls-svf1) or a qualified maximum (`owl:onDataRange`, which
+/// cls-maxqc1-4 don't read: [`Ontology::qualified_data_max`]) on it. `None`: the closure's
+/// answers don't rest on these.
+pub fn reads_data_values(ontology: &Ontology) -> Option<Term> {
+    let axiom = ontology.axioms.iter().find_map(|axiom| match axiom {
+        Axiom::HasKey(_, _, data) => data.first().copied(),
+        Axiom::NegativeDataPropertyAssertion(p, ..) => Some(*p),
+        Axiom::DisjointDataProperties(ps) => ps.first().copied(),
+        _ => None,
+    });
+    let classes = &ontology.classes;
+    axiom.or(ontology.qualified_data_max).or_else(|| {
+        (0..classes.len() as u32).find_map(|e| match *classes.get(e) {
+            ClassExpr::DataHasValue(p, _) => Some(p),
+            ClassExpr::DataSome(p, _) => Some(p),
+            _ => None,
+        })
+    })
 }
 
 impl Hazard {
@@ -84,7 +115,9 @@ impl Hazard {
             | Self::Untyped(t)
             | Self::OpenLeft(t)
             | Self::OutsideProfile(t)
-            | Self::Dropped(t) => t,
+            | Self::Dropped(t)
+            | Self::DataValues(t)
+            | Self::CardinalitySpelling(t) => t,
             Self::Equating => return None,
         })
     }
@@ -134,6 +167,15 @@ impl Hazard {
             }
             Self::Equating => "an axiom outside the profile equates individuals".to_owned(),
             Self::Dropped(_) => format!("a schema structure at {t} that can't be read"),
+            Self::DataValues(_) => format!(
+                "an axiom may compare or type values of {t}, and the rule set leaves out dt-eq \
+                 and dt-type2: one value in two lexical forms isn't matched, nor a value's \
+                 datatype read"
+            ),
+            Self::CardinalitySpelling(_) => format!(
+                "the cardinality at {t} isn't written as the RDF mapping writes it, and the \
+                 rules read only the mapping's spelling (\"0\" or \"1\"^^xsd:nonNegativeInteger)"
+            ),
         }
     }
 }

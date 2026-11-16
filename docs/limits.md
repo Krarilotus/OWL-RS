@@ -88,18 +88,25 @@ leave something out.
   Lists past their limits (a property chain or key of more than 250 properties, more than
   64 member sequences) aren't used at all, never truncated, and each is reported in the log
   and the reasoning diagnostics
-  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)), so keep lists within
-  those limits. Literals aren't equated by value (`"1"^^xsd:integer` and
-  `"01"^^xsd:integer` stay two terms), so compare values in a `FILTER` (`?v = 1`), which SPARQL
-  does by value.
-- Without the OWL 2 QL rewriting, every answer over a ruleset's closure is `sound-only`
-  ([completeness](spec/reasoning-semantics.md#completeness)). Under `owl2-rl`, turn the
-  rewriting on with `reasoner.ql_rewriting = "on"`. Under `owl2-dl`, raise the `dl.*` budgets
-  where they leave answers `sound-only`, or ask `dl-answers=exact` to get an error instead.
-- Over a ruleset's closure, an answer under `OPTIONAL`, `MINUS`, `EXISTS`, `NOT EXISTS`, an
-  aggregate, or `LIMIT` or `OFFSET` after `ORDER BY` also says `sound-only`, though a missing
-  inference can make one of its rows wrong there, and the status doesn't say so yet. Read such
-  answers as `unsound`.
+  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)); none known beyond
+  keeping lists within those limits. Literals aren't
+  equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
+  values in a `FILTER` (`?v = 1`), which SPARQL does by value. Otherwise none known.
+- Without the OWL 2 QL rewriting, every answer over a
+  ruleset's closure is `sound-only`. The rewriting runs by default under `owl2-ql` only;
+  under `owl2-rl`, `reasoner.ql_rewriting = "on"` checks each query as under `owl2-ql`.
+  Under `owl2-dl`, budgets and undecided candidates give `sound-only` (raise the `dl.*`
+  budgets, or ask `dl-answers=exact` to get an error instead), and an operator that isn't
+  monotone over answers that may be missing gives `unsound`
+  ([what an answer promises](what-it-covers.md#what-an-answer-promises)). Under `owl2-dl`
+  and `owl2-ql`, and under `owl2-rl` with the rewriting on, a query that matches a number
+  or a date it names or computes against the data gives `sound-only` at best: the store
+  matches it as written, so `"01"^^xsd:integer` doesn't find a stored `"1"`. Compare values
+  in a `FILTER` instead
+  ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)). Any value
+  the query computes counts, so a computed string or IRI matched against the data
+  (`BIND(CONCAT(…) AS ?n)`, `BIND(IRI(…) AS ?s)`) gives `sound-only` too, though nothing
+  is missed.
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo` and make no new blank nodes, and with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)).
@@ -107,6 +114,44 @@ leave something out.
   (a budget or the timeout) goes through, and the status says `unknown`. No answer is then
   complete ([consistency](spec/reasoning-semantics.md#consistency)). Raise `dl.timeout`
   and the `dl.*` budgets ([configuration](ops/config-reference.md#reasoner)).
+- Under `owl2-dl`, an ontology with annotation-property axioms (a domain, range or
+  super-property of an annotation property) or a punned name (one IRI as a class or
+  property and as an individual) leaves the rules-only route. With annotation-property
+  axioms every answer is `unsound`; with punning, every answer is `unsound` where an
+  `owl:sameAs` reaches a punned name. Both are the whole ontology's, not the query's
+  ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
+  Remove such axioms, give the individual its own IRI, or use `owl2-rl`, whose promise
+  is the rules' reading.
+- Under `owl2-dl`, where the OWL 2 RL rules find a clash in such an ontology, this release
+  doesn't decide whether the data is consistent under OWL 2 DL: the commit is refused,
+  saying so, and data loaded with such a clash is `undecided` and quarantined, with the
+  reason in `/dataset/info` (`consistency_reason`). The check is the whole ontology's, so a
+  real clash beside an unrelated punned name reads `undecided` too, and a DL engine's later
+  verdict at a query doesn't change readiness. In quarantine, each commit rebuilds the
+  inferences in full, and under `owl2-dl` reads the asserted ontology once more to tell
+  `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
+  annotation property's domain, range or super-property, or give the individual its own
+  IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
+- An undeclared property used with literal values is read as a data property. Declare
+  annotation properties such as `skos:prefLabel` (`skos:prefLabel a owl:AnnotationProperty`);
+  otherwise a labelled class reads as punned, and under `owl2-dl` it leaves the rules-only
+  route. Nothing in this release shows which properties were typed by their use; this
+  query lists the ones used with literals and given no declaration:
+
+  ```sparql
+  PREFIX owl: <http://www.w3.org/2002/07/owl#>
+  SELECT DISTINCT ?property WHERE {
+    ?subject ?property ?value .
+    FILTER(isLiteral(?value))
+    FILTER NOT EXISTS {
+      VALUES ?kind { owl:DatatypeProperty owl:ObjectProperty owl:AnnotationProperty }
+      ?property a ?kind .
+    }
+    FILTER(!STRSTARTS(STR(?property), "http://www.w3.org/1999/02/22-rdf-syntax-ns#")
+        && !STRSTARTS(STR(?property), "http://www.w3.org/2000/01/rdf-schema#")
+        && !STRSTARTS(STR(?property), STR(owl:)))
+  }
+  ```
 - An explanation of what the rules derived (`/explain`) examines at most 4,096 statements.
   Outside `owl2-dl`, a derivation it doesn't find within them is answered 404, the same as for a
   statement that doesn't hold, so you can't tell the two apart. Justifications
@@ -120,8 +165,7 @@ leave something out.
   consistency check runs. To have the checks, load over HTTP (Graph Store), or validate after
   the load with `GET /dataset/shacl`.
 - Under `owl2-dl`, a large `owl:sameAs` class is proven member by member, which can be slow. At a budget the answer
-  is `sound-only` and partial (about 18 s for a class of 20,000 members, with 1,002 of 20,002 rows certain). Proofs
-  per class are planned for v1.6. Raise `dl.timeout` and the `dl.*` budgets.
+  is `sound-only` and partial. Proofs per class are planned for v1.6. Raise `dl.timeout` and the `dl.*` budgets.
 
 ## SHACL
 
