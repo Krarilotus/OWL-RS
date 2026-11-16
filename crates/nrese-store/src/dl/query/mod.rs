@@ -27,7 +27,7 @@ use nrese_dl::limits::{Deadline, Limit};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use nrese_engine::{ReadModel, Snapshot, TermId};
+use nrese_engine::{QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_owl::{Axiom, ClassExpr, ExprId, Literal, ObjProp, Ontology};
 use nrese_rdf::{NamedNodeRef, Term};
 use nrese_sparql::CancellationToken;
@@ -270,7 +270,7 @@ pub(crate) fn plan_status(store: &StoreService, prepared: &PreparedQuery) -> Com
     let at = super::bounds::view(store);
     let mut completeness = plan_status_built(prepared, &analysis, &at).completeness;
     certify(&mut completeness, prepared.query(), "dl", true);
-    mark(store, Revision::Decided(&at), &mut completeness);
+    mark(store, prepared, Revision::Decided(&at), &mut completeness);
     completeness
 }
 
@@ -290,10 +290,57 @@ pub(crate) enum Revision<'a> {
 /// (`StoreService::status_without_dl`) and by a read inside a transaction with operations
 /// pending (`StoreService::run_query_pending_reporting`). It reads every graph, and a reader
 /// of some graphs is told no status under `owl2-dl` (`status_for_its_reader`); the ontology
-/// it reads is the asserted statements', which a reader's view leaves as they are.
-pub(crate) fn mark(store: &StoreService, at: Revision<'_>, completeness: &mut Completeness) {
+/// it reads is the asserted statements', which a reader's view leaves as they are. And
+/// at most sound-only where `prepared` names an individual the data doesn't and the
+/// ontology `at` has keys, or wasn't read within its budget: whether a key reaches an
+/// individual named only in a query is unsettled (the Direct Semantics' NAMED).
+pub(crate) fn mark(
+    store: &StoreService,
+    prepared: &PreparedQuery,
+    at: Revision<'_>,
+    completeness: &mut Completeness,
+) {
     if let Some(reason) = reads_differently(store, at) {
         completeness.unsound("dl", reason);
+    }
+    let snapshot = match at {
+        Revision::Decided((snapshot, _)) => snapshot,
+        Revision::Committed(snapshot) | Revision::Pending(snapshot) => snapshot,
+    };
+    let held = |iri: &str| {
+        let Some(t) = snapshot.lookup(NamedNodeRef::new_unchecked(iri).into()) else {
+            return false;
+        };
+        let (mut by_subject, mut by_object) = (QuadPattern::all(), QuadPattern::all());
+        (by_subject.subject, by_object.object) = (Some(t), Some(t));
+        let any = |p| {
+            snapshot
+                .quads_for_pattern_in(ReadModel::Materialised, p)
+                .next()
+        };
+        any(&by_subject).or_else(|| any(&by_object)).is_some()
+    };
+    let read = match at {
+        Revision::Pending(_) => read_ontology,
+        _ => ontology_at,
+    };
+    if completeness.complete
+        && let Some(iri) = named_outside(prepared.query(), held)
+        && read(store, snapshot).ok().is_none_or(|o| {
+            o.value()
+                .axioms
+                .iter()
+                .any(|a| matches!(a, Axiom::HasKey(..)))
+        })
+    {
+        completeness.incomplete(
+            "dl",
+            format!(
+                "the query names <{iri}>, which the data doesn't, and the ontology has keys \
+                 (or wasn't read within its budget): whether OWL 2 DL's keys reach an \
+                 individual named only in a query is unsettled, so an answer may be missing"
+            ),
+        );
     }
 }
 
@@ -454,7 +501,7 @@ pub(crate) fn answer(
     match &mut outcome {
         Outcome::Stream(status, _, _) | Outcome::Answers(_, status, _) => {
             certify(status, prepared.query(), "dl", true);
-            mark(store, Revision::Decided(&at), status);
+            mark(store, prepared, Revision::Decided(&at), status);
         }
     }
     let status = match &outcome {
