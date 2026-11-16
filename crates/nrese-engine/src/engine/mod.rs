@@ -246,6 +246,14 @@ pub(crate) struct Version {
     pub(crate) dictionary_len: u64,
     /// Its `owl:sameAs` classes, once a read needs them ([`equality`]).
     pub(crate) equality: Arc<equality::EqualityCell>,
+    /// How its inferred stack is read: `Some(sameAs)` where it holds the closure over one
+    /// representative per `owl:sameAs` class (each other identity stored as `identity sameAs
+    /// representative`), so that the default graph is read expanded to every identity; `None`
+    /// reads the stacks as stored. Part of what is installed: a stack and its reading are
+    /// published together, and only the holder of the writer slot changes it (a commit,
+    /// [`Transaction::install_reading`], a rematerialisation's `finish_held`). No default:
+    /// each construction chooses; a layout-only change keeps its source's.
+    pub(crate) reading: Option<TermId>,
     /// What its statements are: kept where only their layout changes (compaction, a
     /// checkpoint mapped), new for any other version ([`Content`]).
     pub(crate) content: Content,
@@ -316,6 +324,7 @@ impl Version {
             committed_micros: Some(0),
             dictionary_len: 0,
             equality: Default::default(),
+            reading: None,
             content: Content::fresh(),
             asserted_content: AssertedIdentity::fresh(),
             canonical: Default::default(),
@@ -347,6 +356,7 @@ impl Version {
             committed_micros,
             dictionary_len: self.dictionary_len,
             equality: Arc::clone(&self.equality),
+            reading: self.reading,
             content: self.content,
             asserted_content: self.asserted_content,
             canonical: Default::default(),
@@ -362,6 +372,7 @@ impl Version {
             committed_micros: self.committed_micros,
             dictionary_len: self.dictionary_len,
             equality: Arc::clone(&self.equality),
+            reading: self.reading,
             // Only compaction replaces a stack this way: the same statements.
             content: self.content,
             asserted_content: self.asserted_content,
@@ -546,9 +557,6 @@ struct Shared {
     maintaining: AtomicBool,
     /// Checkpoints written.
     checkpoints: AtomicU64,
-    /// `owl:sameAs`, when the inferred stack holds the closure over representatives
-    /// ([`Engine::set_equality`]).
-    equality: RwLock<Option<TermId>>,
     /// What the canonical views versions keep are charged to
     /// ([`Engine::set_canonical_view_budget`]).
     views: RwLock<Arc<nrese_exec::Budget>>,
@@ -586,14 +594,31 @@ impl Shared {
 
     /// The installed version, published: the one constructor of a snapshot that grants a
     /// [`snapshot::SharedState`].
+    ///
+    /// Its reading is the version's, taken with it in one load: the stack and how it is read
+    /// come from one install. The snapshot keeps its own (`Snapshot::with_equality`, `stored`
+    /// set one for that reader alone); at every published snapshot the two agree, and a reader
+    /// obeys the snapshot's.
     fn snapshot(&self) -> Snapshot {
         Snapshot::published(
             self.versions.load(),
             Arc::clone(&self.dictionary),
             Arc::clone(&self.statistics),
-            *self.equality.read(),
             Arc::clone(&self.views.read()),
         )
+    }
+
+    /// Installs the current version with `reading`, its statements and revision unchanged:
+    /// nothing is logged, checkpointed or stamped. The caller holds the writer slot
+    /// ([`Transaction::install_reading`], `Rematerialisation::finish_held`). Writing nothing is
+    /// right: a reading isn't stored, every open derives it again from the store's certificate.
+    fn install_reading(&self, reading: Option<TermId>) {
+        if self.versions.load().reading != reading {
+            self.versions.publish(|current| Version {
+                reading,
+                ..current.with_time(current.committed_micros)
+            });
+        }
     }
 
     /// Writes a checkpoint of the latest revision and releases the WAL it covers. Writers
@@ -675,6 +700,7 @@ impl Shared {
                     committed_micros: current.committed_micros,
                     dictionary_len: current.dictionary_len,
                     equality: Arc::clone(&current.equality),
+                    reading: current.reading,
                     content: current.content,
                     // A checkpoint mapped: the same statements.
                     asserted_content: current.asserted_content,
@@ -1031,7 +1057,6 @@ impl Engine {
             wants_checkpoint: AtomicBool::new(false),
             maintaining: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
-            equality: RwLock::new(None),
             views: RwLock::new(Arc::new(nrese_exec::Budget::unlimited())),
             admission: config.admission,
             clock: AtomicU64::new(clock),
@@ -1081,16 +1106,6 @@ impl Engine {
         self.inner.shared.statistics.set_budget(budget);
     }
 
-    /// Equality by representatives (work package W4, stage B): with `Some(sameAs)`, the
-    /// inferred stack holds the closure over one representative per `owl:sameAs` class,
-    /// each other identity stored as `identity sameAs representative`, and snapshots taken
-    /// from now on read the default graph expanded to every identity
-    /// (`equality`). The reasoner that fills the stack decides; `None`
-    /// reads the stacks as stored.
-    pub fn set_equality(&self, same_as: Option<TermId>) {
-        *self.inner.shared.equality.write() = same_as;
-    }
-
     /// What the canonical views of versions are charged to while their versions keep them
     /// (canonical equality answers; `Snapshot::with_canonical_equality`): unlimited unless
     /// given one. A view the budget refuses is made on its reader's own budget, for that
@@ -1129,9 +1144,10 @@ impl Engine {
         self.inner.shared.dictionary.set_vector_builder(builder);
     }
 
-    /// `owl:sameAs` if reads expand equality classes ([`Self::set_equality`]).
+    /// `owl:sameAs` if the installed version's reads expand equality classes (its reading,
+    /// [`Transaction::install_reading`]).
     pub fn equality(&self) -> Option<TermId> {
-        *self.inner.shared.equality.read()
+        self.inner.shared.versions.load().reading
     }
 
     /// Starts a transaction, waiting for the writer slot. Dropping it without
