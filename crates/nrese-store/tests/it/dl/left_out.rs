@@ -463,15 +463,19 @@ fn a_commit_that_makes_or_ends_a_left_out_axiom_changes_the_status() {
 }
 
 /// A property's kind decides what its axioms say (*OWL 2 Mapping to RDF Graphs* §3.2.1):
-/// with a node value beside two literals, a functional property is an object property,
-/// which the literals don't bear on; with the node value deleted, it is a data property
-/// with two values, which no model has, though nothing is left out. Deleting an assertion
-/// changes the schema here, so the commit is checked whole and rejected; declared an object
-/// property, it keeps its kind, and the deletion is committed. Off the rules route, whose
-/// rules read statements, not kinds.
+/// with a node value beside three literals, a property `:x`'s class allows at most two
+/// values of is an object property, which the literals don't bear on; with the node value
+/// deleted, it is a data property with three values, which no model has, though nothing is
+/// left out. Deleting an assertion changes the schema here, so the commit is checked whole
+/// and rejected; declared an object property, it keeps its kind, and the deletion is
+/// committed. The cardinality is outside OWL 2 RL, whose rules read statements, not kinds.
 #[test]
 fn deleting_the_value_that_gave_a_property_its_kind_is_checked_as_a_schema_change() {
-    let data = format!("{NAMES} :p a owl:FunctionalProperty . :x :p \"v\", \"w\", :v .");
+    let two = "\"2\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger>";
+    let data = format!(
+        "{NAMES} :C rdfs:subClassOf [ owl:onProperty :p ; owl:maxCardinality {two} ] . \
+         :x a :C ; :p \"u\", \"v\", \"w\", :v ."
+    );
     let mut wrong = Vec::new();
     for (declared, rejected) in [("", true), (":p a owl:ObjectProperty .", false)] {
         let dl = pipeline();
