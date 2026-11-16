@@ -272,7 +272,11 @@ async fn run() -> Result<()> {
             tracing::info!(revision, primary = ?config.replication.primary, "replica started from an image");
         }
     }
-    let store = StoreService::new(config.store.clone())?;
+    // The role is the store's before it opens: a replica takes no certificate at its open.
+    let store = StoreService::new(nrese_store::StoreConfig {
+        replica,
+        ..config.store.clone()
+    })?;
     default.apply(&store);
     if let CliCommand::Backup(dir) = &cli.command {
         let manifest = store
