@@ -1594,7 +1594,7 @@ mod tests {
         infer("alias", "rep", same_as);
         tx.insert(Quad::new(node("b"), node("p"), node("c"), GraphName::DefaultGraph).as_ref());
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(same_as));
+        engine.transaction().install(Some(same_as), None);
         let snapshot = engine.snapshot();
         let p = p.raw();
         let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
@@ -1667,7 +1667,7 @@ mod tests {
                 add(&format!("x{j}"), "c1");
             }
             tx.commit().unwrap();
-            engine.transaction().install_reading(Some(same_as));
+            engine.transaction().install(Some(same_as), None);
             let snapshot = engine.snapshot();
             let p = snapshot.lookup(node("p").as_ref().into()).unwrap().raw();
             let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));

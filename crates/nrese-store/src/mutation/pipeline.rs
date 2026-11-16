@@ -413,9 +413,15 @@ impl MutationPipeline {
             let supports = self.store.supports();
             let touched = supports.wants_commits().then(|| supports.touched(&tx));
             let before = tx.base().revision();
-            // With the rewriting on, the QL schema notes what the commit changes of
-            // individuals' memberships of class expressions, before the commit publishes.
-            let summary = match self.store.query_settings().ql() {
+            // The commit maintained the closure: its version carries its base's certificate,
+            // the same object. With the rewriting on, that certificate's QL schema notes what
+            // the commit changes of individuals' memberships of class expressions, before the
+            // commit publishes.
+            let ql = crate::service::Certificate::of(tx.base()).and_then(|c| c.ql.clone());
+            if let Some(certificate) = tx.base().certificate().cloned() {
+                tx.vouch(certificate);
+            }
+            let summary = match ql {
                 Some(ql) => ql.commit(tx),
                 None => tx.commit(),
             }
@@ -444,6 +450,8 @@ impl MutationPipeline {
                 }
             }
             drop(ground);
+            #[cfg(test)]
+            crate::service::hooks::run(&crate::service::hooks::BEFORE_REVALIDATION);
             // In quarantine the commit checked only its own facts: revalidate everything, so
             // the store leaves quarantine once the data is repaired. The commit itself stands.
             if matches!(
