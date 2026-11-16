@@ -1100,6 +1100,14 @@ impl Drop for Collector<'_> {
             && partial.exists()
         {
             let _ = fs::remove_file(partial);
+            // The directory too, if this load made it: only an empty one is removed.
+            // Resolutions need a stored statement, and a stop drops the collector under the
+            // load's writer slot, so nothing else writes into an empty one then. (After a
+            // failed `finish` the slot is gone: a load starting at once could lose its new
+            // directory before its first record, and stop.)
+            if let Some(dir) = partial.parent() {
+                let _ = fs::remove_dir(dir);
+            }
         }
     }
 }
