@@ -396,6 +396,54 @@ fn owl2_dl_reading_inside_a_transaction_labels_it_unsound() {
     assert_eq!(status.map(|s| s.as_str()), Some("unsound"));
 }
 
+/// Spec (docs/spec/reasoning-semantics.md, `exact-refusals`): under `owl2-dl`, `exact`
+/// refuses a read of the inferred statements alone, and one inside a transaction with an
+/// addition pending, before it runs: the query never reaches the executor and writes no
+/// row. Without `exact` the same reads run (so the probe is wired on both routes).
+#[test]
+fn exact_refuses_reads_past_the_bounds_before_they_run() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dl = pipeline();
+    insert(&dl, SAME_AS.0).expect("data");
+    let store = dl.store();
+    let pending = StatementsRequest::new(vec![StatementOp::Update(
+        nrese_store::SparqlUpdateRequest::new(format!("{PREFIXES}INSERT DATA {{ :tom a :Dog }}")),
+    )]);
+    let mut wrong = Vec::new();
+    for exact in [true, false] {
+        for (route, read) in [
+            (
+                "inferred only",
+                "SELECT ?x FROM <http://www.ontotext.com/implicit> { ?x a :Animal }",
+            ),
+            ("pending", "SELECT ?x { ?x a :Animal }"),
+        ] {
+            let mut request = SparqlQueryRequest::all(format!("{PREFIXES}{read}"));
+            request.dl_answers = exact.then_some(nrese_store::DlAnswers::Exact);
+            let mut prepared = store.prepare_query(&request).expect("prepared");
+            let entered = std::sync::Arc::new(AtomicBool::new(false));
+            prepared.on_evaluation({
+                let entered = std::sync::Arc::clone(&entered);
+                move || entered.store(true, Ordering::Release)
+            });
+            let (token, mut out) = (CancellationToken::new(), Vec::new());
+            let result = match route {
+                "pending" => store.run_query_pending(&pending, &prepared, &token, &mut out),
+                _ => store.run_query(&prepared, &token, &mut out),
+            };
+            let refused = matches!(result, Err(nrese_store::StoreError::Incomplete(_)));
+            let entered = entered.load(Ordering::Acquire);
+            eprintln!("exact {exact}, {route}: refused {refused}, entered {entered}");
+            if refused != exact || entered == exact || (exact && !out.is_empty()) {
+                wrong.push(format!(
+                    "exact {exact}, {route}: {result:?}, entered {entered}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Guards (hold on the base too): what can only miss rows stays `sound-only`. A monotone
 /// read, and LIMIT, OFFSET and GRAPH over one: each row they return is one of the
 /// closure's answers, which are entailed.
