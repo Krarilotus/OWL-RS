@@ -87,10 +87,15 @@ pub(super) fn decide_until(
         if let Some(most) = config.max_candidates
             && i >= most
         {
-            jobs.push(Err(Limit::Candidates.reached(most)));
+            jobs.push(Err(Entailed::Unknown(Limit::Candidates.reached(most))));
             continue;
         }
         let instantiated = instantiate(shape, variables, row, snapshot);
+        let reserved = |atoms: &Vec<_>| atoms.iter().any(|a| reserved_individual(a, snapshot, ids));
+        if instantiated.as_ref().is_ok_and(reserved) {
+            jobs.push(Err(Entailed::No));
+            continue;
+        }
         let built = instantiated.and_then(|atoms| {
             tests_of(
                 &mut ontology,
@@ -101,6 +106,7 @@ pub(super) fn decide_until(
                 &mut paths,
             )
         });
+        let built = built.map_err(Entailed::Unknown);
         jobs.push(built.map(|built| {
             let start = tests.len();
             tests.extend(built);
@@ -156,7 +162,7 @@ pub(super) fn decide_until(
     let verdicts = workers.map(&jobs, |job| {
         let range = match job {
             Ok(range) => range,
-            Err(why) => return Entailed::Unknown(why.clone()),
+            Err(verdict) => return verdict.clone(),
         };
         let mut answer = Entailed::Yes;
         for i in range.clone() {
@@ -291,6 +297,29 @@ impl Ids {
             same_as: id(OWL_SAME_AS),
             thing: id(OWL_THING),
         }
+    }
+}
+
+/// Whether an atom puts a reserved IRI where an individual goes: the subject of `rdf:type`, the
+/// subject or the object of a non-reserved property; not a class's place, nor a reserved
+/// property's ends (`rdfs:label`, `owl:sameAs`, the list vocabulary). OWL 2 DL has no such
+/// individual (Structural Specification §5.6.1), though U1 and the rewriting of
+/// `owl:topObjectProperty` (`nrese_owl`'s `universal`) give that IRI one.
+fn reserved_individual([s, p, o]: &[Slot; 3], snapshot: &Snapshot, ids: Ids) -> bool {
+    use nrese_owl::vocab::{OWL, RDF, RDFS, XSD};
+    let reserved = |t: &Slot| match t {
+        Slot::Const(t) => match snapshot.decode(TermId::from_raw(*t)) {
+            Some(Term::NamedNode(n)) => [RDF, RDFS, OWL, XSD]
+                .iter()
+                .any(|ns| n.as_str().starts_with(ns)),
+            _ => false,
+        },
+        Slot::Var(_) => false,
+    };
+    match p {
+        Slot::Const(t) if Some(*t) == ids.rdf_type => reserved(s),
+        _ if reserved(p) => false,
+        _ => reserved(s) || reserved(o),
     }
 }
 
