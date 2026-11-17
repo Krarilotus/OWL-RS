@@ -382,14 +382,10 @@ impl AppState {
         }
     }
 
-    /// The data is inconsistent under the configured reasoning, or its rules' violations
-    /// are undecided: readable and repairable, but not ready.
+    /// The store is in quarantine ([`nrese_store::StoreService::is_quarantined`]): readable
+    /// and repairable, but not ready.
     pub fn is_quarantined(&self) -> bool {
-        matches!(
-            self.store().consistency(),
-            nrese_store::ConsistencyStatus::Inconsistent { .. }
-                | nrese_store::ConsistencyStatus::Undecided { .. }
-        )
+        self.store().is_quarantined()
     }
 
     pub fn reasoner_profile_name(&self) -> &'static str {
