@@ -2399,7 +2399,7 @@ impl Supports {
         if compilation.compact {
             return Ok(Shared::new(Rederived::empty(&self.kept), &self.kept)?);
         }
-        let program = self.program(rules, snapshot, compilation);
+        let program = self.program(rules, snapshot, compilation)?;
         let ground = program.ground_program(snapshot);
         let schema = ground.schema_premises();
         let mut axioms: Kept<Triple> =
@@ -2721,13 +2721,14 @@ impl Supports {
         Ok(view)
     }
 
-    /// The program the rules compile to over `snapshot`'s ids, as the store configures it.
+    /// The program the rules compile to over `snapshot`'s ids, as the store configures it;
+    /// unavailable where the process's memory interrupts compiling it.
     fn program(
         &self,
         rules: &RuleProgram,
         snapshot: &Snapshot,
         compilation: Compilation,
-    ) -> Program {
+    ) -> Result<Program, Unavailable> {
         // The program's constants by the snapshot's ids: a constant the store doesn't hold
         // gets an id no statement uses (its rules can't fire).
         let unknown = std::cell::Cell::new(u64::MAX >> 1);
@@ -2738,7 +2739,12 @@ impl Supports {
             })
         })
         .hiding_unnamed_classes(compilation.hide_unnamed_classes)
-        .by_representatives(compilation.by_representatives)
+        .map_err(|interrupted| match interrupted.memory {
+            Some(nrese_exec::memory::MemoryStopCause::OverLimit) => Unavailable::ProcessMemory,
+            Some(nrese_exec::memory::MemoryStopCause::Unread) => Unavailable::MemoryUnreadable,
+            None => Unavailable::Cancelled,
+        })
+        .map(|program| program.by_representatives(compilation.by_representatives))
     }
 
     /// The closure of the statements a reader with `access` reads in `snapshot`, sorted,
@@ -2752,7 +2758,7 @@ impl Supports {
         compilation: Compilation,
         working: &Work,
     ) -> Result<Kept<Triple>, Unavailable> {
-        let program = self.program(rules, snapshot, compilation);
+        let program = self.program(rules, snapshot, compilation)?;
         let mut axioms: Kept<Triple> =
             ChargedVec::with_capacity(Arc::clone(working), program.axioms().len())?;
         axioms.extend_from_slice(program.axioms())?;
@@ -2813,7 +2819,7 @@ impl Supports {
         if compilation.compact {
             return Ok(None);
         }
-        let program = self.program(rules, snapshot, compilation);
+        let program = self.program(rules, snapshot, compilation)?;
         let cap = compilation.cap.max(1);
         let revision = snapshot.revision();
         self.in_use
