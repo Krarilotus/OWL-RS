@@ -602,11 +602,13 @@ impl StoreService {
     /// inconsistent, or its rules' violations undecided, under the recorded reasoning; or,
     /// since a commit on a store in quarantine, its consistency not assessed again.
     ///
-    /// The mark, the assessment, the mark again: one observation. A commit in quarantine
+    /// The mark, the assessment, the mark again, in that order. A commit in quarantine
     /// raises the mark before it removes the assessment, so an assessment read as removed
     /// comes with a mark read as raised; a recording clears the mark after it records, so a
     /// mark read as cleared comes with the assessment recorded. A mark that moved between the
-    /// two readings is quarantine: the reading straddled the start or the end of one.
+    /// two readings is answered as quarantine, as the reading may have straddled the start or
+    /// the end of one; it may also have seen one already finished, and answers quarantine
+    /// then too.
     pub fn is_quarantined(&self) -> bool {
         use crate::ConsistencyStatus::{Inconsistent, Undecided};
         let mark = self.unassessed.load(std::sync::atomic::Ordering::Acquire);
