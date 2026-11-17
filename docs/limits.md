@@ -141,6 +141,26 @@ leave something out.
   (a budget or the timeout) goes through, and the status says `unknown`. No answer is then
   complete ([consistency](spec/reasoning-semantics.md#consistency)). Raise `dl.timeout`
   and the `dl.*` budgets ([configuration](ops/config-reference.md#reasoner)).
+- Under `owl2-dl`, the datatypes of the standard vocabularies outside the OWL 2 datatype map
+  (`xsd:date`, `xsd:gYear`, `xsd:duration` and the like) have no values the checks read.
+  Where such a value can decide a clash (under a range, a functional property or a
+  cardinality, or compared), the consistency is `unknown` and no read is `complete`; a date
+  nothing reads changes nothing. Use `xsd:dateTime`, which is in the map, where you can
+  ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
+- Under `owl2-dl`, a key or a negative property assertion over a value the store's quick
+  proof of consistency can't read (an `xsd:date` written two ways; also, stricter than needed,
+  an integer beyond 128 bits or a string with a base direction) leaves the consistency
+  `unknown`. Keys on strings and language-tagged strings are decided. Once the store met
+  such a value, later commits are decided without that proof, by the slower checks, until
+  the store is restarted or its inferences are rebuilt (`POST …/reasoning/rematerialise`).
+- Under `owl2-dl`, a literal OWL 2 DL gives no meaning is told as the rules tell it where
+  they can. An ill-typed literal of the map (`"abc"^^xsd:integer`) alone leaves the store
+  consistent and its reads `complete`; under a range its commit is refused; where the full
+  check must read its value (beside a `hasValue`), the consistency is `unknown`. A literal of
+  a datatype the ontology names itself (`"x"^^:T`) is kept as written and never compared
+  by value; where the full check must read it, the consistency is `unknown`. A literal typed
+  `rdfs:Literal` is ill-typed: under any range, `rdfs:Literal` included, its commit is
+  refused.
 - Under `owl2-dl`, an ontology with annotation-property axioms (a domain, range or
   super-property of an annotation property, or another kind of property made its
   sub-property; `rdfs:label`, `rdfs:comment` and the other built-in ones count without a
