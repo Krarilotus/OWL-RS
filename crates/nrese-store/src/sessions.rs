@@ -170,23 +170,25 @@ impl Sessions {
         owner: Option<&str>,
         mut ops: Vec<StatementOp>,
     ) -> Result<bool, BudgetExceeded> {
-        let mut open = self.lock();
-        let Some(session) = self.live(&mut open, id, owner) else {
-            return Ok(false);
-        };
         if let Some((namespaces, search_scope)) = &self.update_settings {
+            let mut captured = None;
             for op in &mut ops {
                 if let StatementOp::Update(update) = op {
-                    update.staged.get_or_insert_with(|| {
+                    let staged = captured.get_or_insert_with(|| {
                         let scope = search_scope.read().unwrap_or_else(PoisonError::into_inner);
                         Arc::new(crate::update::StagedUpdate {
                             namespaces: namespaces.all().into_iter().collect(),
                             search_scope: *scope,
                         })
                     });
+                    update.staged = Some(Arc::clone(staged));
                 }
             }
         }
+        let mut open = self.lock();
+        let Some(session) = self.live(&mut open, id, owner) else {
+            return Ok(false);
+        };
         let (refused, ops) = match session.ops.append_within(ops, &self.kept) {
             Ok(()) => {
                 session.view = None;

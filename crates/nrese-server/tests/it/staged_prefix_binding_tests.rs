@@ -59,7 +59,6 @@ fn assert_staged_binding(before_rebind: &Value, after_rebind: &Value, committed:
 }
 
 #[tokio::test]
-#[ignore = "Staged updates do not retain their original prefix binding"]
 async fn rdf4j_transaction_preserves_staged_prefix_binding() {
     // Spec: A staged operation means what it meant when staged. After a rebind,
     // both transaction reads and the committed triple use only the original IRI.
@@ -145,20 +144,31 @@ async fn staging_context_keeps_the_search_scope_from_staging() {
 
 #[tokio::test]
 async fn staging_context_one_shot_uses_the_live_namespace() {
-    // Spec: A one-shot update uses the namespace binding in force when it runs.
+    // Spec: A one-shot update uses the live namespace binding even while an open
+    // transaction has staged an update under an earlier binding.
     let app = app(false, false);
     bind_ex(&app, REPO, ORIGINAL_NAMESPACE).await;
+    let location = begin(&app).await;
+    update(&app, &format!("{location}?action=UPDATE"), INSERT).await;
     bind_ex(&app, REPO, REBOUND_NAMESPACE).await;
     update(&app, STATEMENTS, INSERT).await;
     assert_eq!(
         read_predicates(&app, REPO).await,
         json!([{"p":{"type":"uri","value":"http://example.com/b/p"}}]),
-        "one-shot update after the rebind"
+        "one-shot update while the transaction is open"
+    );
+    commit(&app, &location).await;
+    assert_eq!(
+        read_predicates(&app, REPO).await,
+        json!([
+            {"p":{"type":"uri","value":"http://example.com/a/p"}},
+            {"p":{"type":"uri","value":"http://example.com/b/p"}},
+        ]),
+        "transaction commit adds the predicate from the staged binding"
     );
 }
 
 #[tokio::test]
-#[ignore = "Staged updates do not retain their original prefix binding"]
 async fn native_session_preserves_staged_prefix_binding() {
     // Spec: A staged operation means what it meant when staged. After a rebind,
     // both session reads and the committed triple use only the original IRI.
