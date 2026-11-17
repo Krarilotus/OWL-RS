@@ -51,6 +51,8 @@ pub(crate) use pushdown::per_solution;
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
+mod graph_scope_tests;
+#[cfg(test)]
 mod graph_tests;
 #[cfg(test)]
 mod handover_tests;
