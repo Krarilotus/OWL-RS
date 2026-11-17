@@ -361,6 +361,7 @@ impl Compiler<'_> {
                     body.push(Atom([y, Slot::Const(d), z]));
                 }
                 if objects.is_empty() && data.is_empty() {
+                    self.program.incomplete.push((index, "an empty key"));
                     return;
                 }
                 let head = vec![self.same(x, y)];
