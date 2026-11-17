@@ -24,6 +24,9 @@
 # Code is generated for this machine's CPU unless NRESE_TARGET_CPU says otherwise
 # (`portable`, `x86-64-v3`, …; see scripts/lib/target-cpu.sh).
 set -euo pipefail
+# A command that fails under `set -e` ends the script with only its own message, if any: the call and
+# the line say it was this script that stopped, not cargo. Cargo's own failure (set +e) is not one.
+trap 'failed=$?; [[ $- != *e* ]] || printf "cargo-guarded.sh (cargo %s): stopped at line %s: %s (exit %s)\n" "$*" "$LINENO" "$BASH_COMMAND" "$failed" >&2' ERR
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 # shellcheck source=lib/disk.sh
@@ -354,8 +357,11 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
     for t in "$ADMIT"/queue/*; do if [ -e "$t" ] && ! holds "${t##*-}"; then rm -f "$t"; fi; done
     for r in "$ADMIT"/run/*; do if [ -e "$r" ] && ! holds "${r##*/}"; then rm -rf "$r"; fi; done
     running=0 others=0
+    # A run that ends removes its slot without this lock (cleanup): one gone between the look and the
+    # read holds nothing.
     for r in "$ADMIT"/run/*; do
-      if [ -e "$r/peak" ]; then read -r held < "$r/peak"; running=$((running + 1)); others=$((others + held)); fi
+      [ -e "$r/peak" ] && read -r held 2> /dev/null < "$r/peak" || continue
+      running=$((running + 1)) others=$((others + held))
     done
     read_memory
     room=$(( FREE_MB - FLOOR_MB - others ))
