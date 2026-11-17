@@ -533,6 +533,39 @@ fn a_key_over_the_universal_property_equates() {
     }
 }
 
+/// A key of no property makes every named member of its class one (OWL 2 Direct Semantics,
+/// §2.3.5), which U1 doesn't compile: it marks the key not compiled, so it proves no
+/// consistency over it, here against `a ≠ b`. The reader leaves such a key out of the source
+/// (*Structural Specification* §9.5), so it is given to U1 past the reader.
+#[test]
+fn u1_proves_no_consistency_over_a_key_it_did_not_compile() {
+    use nrese_owl::{Axiom, ClassExpr, ExprId};
+    let mut table = Table::default();
+    let input = table.parse(
+        RdfFormat::Turtle,
+        b"@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+:K a owl:Class . :a a owl:NamedIndividual , :K . :b a owl:NamedIndividual , :K .
+:a owl:differentFrom :b .",
+    );
+    let (mut ontology, _) = support::read(&mut table, &input);
+    let k = ex(&mut table, "K");
+    let class = ExprId(ontology.classes.intern(ClassExpr::Class(k)));
+    ontology
+        .axioms
+        .push(Axiom::HasKey(class, Vec::new(), Vec::new()));
+    ontology.sources.push(Vec::new());
+    let normalised = nrese_owl::normalise(&ontology);
+    let program = support::compile(&mut table, &ontology, &normalised);
+    let upper = support::upper(&mut table, &program, &input);
+    let clash = upper.facts.iter().any(|f| f[1] == program.names.clash);
+    assert!(
+        clash || !program.proves_consistency(),
+        "proved consistent; incomplete {:?}",
+        program.incomplete
+    );
+}
+
 /// U1 proves an ontology consistent only where it has a model. Without one:
 /// - a data existential over a defined datatype with no value (review A-1705): `xsd:string`
 ///   and `xsd:integer` have disjoint value spaces (OWL 2 Structural Specification, §4), so
