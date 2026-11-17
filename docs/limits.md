@@ -184,12 +184,14 @@ leave something out.
 - Under `owl2-dl`, an ontology with annotation-property axioms (a domain, range or
   super-property of an annotation property, or another kind of property made its
   sub-property; `rdfs:label`, `rdfs:comment` and the other built-in ones count without a
-  declaration) or a punned name (one IRI as a class or
-  property and as an individual) leaves the rules-only route. The SHACL shapes graph is a
+  declaration), a punned name (one IRI as a class or
+  property and as an individual), or an empty intersection or union (`owl:intersectionOf
+  rdf:nil`, used or not) leaves the rules-only route: reads that were `complete` by the rules
+  alone lose that or take a slower way. The SHACL shapes graph is a
   graph of the store and is read too: a shape's `sh:targetClass ex:Animal` makes `ex:Animal`
   an individual as well as a class, a punned name. With annotation-property
   axioms every answer is `unsound`; with punning, every answer is `unsound` where an
-  `owl:sameAs` reaches a punned name. Both are the whole ontology's, not the query's
+  `owl:sameAs` reaches a punned name. Each is the whole ontology's, not the query's
   ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
   Remove such axioms, give the individual its own IRI, or use `owl2-rl`, whose promise
   is the rules' reading.
@@ -197,12 +199,12 @@ leave something out.
   doesn't decide whether the data is consistent under OWL 2 DL: the commit is refused,
   saying so, and data loaded with such a clash is `undecided` and quarantined, with the
   reason in `/dataset/info` (`consistency_reason`). The check is the whole ontology's, so a
-  real clash beside an unrelated punned name reads `undecided` too, and a DL engine's later
+  real clash beside an unrelated punned name or empty list reads `undecided` too, and a DL engine's later
   verdict at a query doesn't change readiness. In quarantine, each commit rebuilds the
   inferences in full, and under `owl2-dl` reads the asserted ontology once more to tell
   `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
-  annotation property's domain, range, super-property or sub-property, or give the individual its own
-  IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
+  annotation property's domain, range, super-property or sub-property or the empty list, or give
+  the individual its own IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
 - Labels and notes on a store with `owl:sameAs` read as `unsound`. Under `owl2-dl`, and under `owl2-ql`
   and `owl2-rl` where the QL rewriting answers, a query that reads an annotation property
   (`rdfs:label`, `rdfs:comment`, or one the data declares) or any predicate (a variable
