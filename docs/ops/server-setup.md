@@ -436,8 +436,9 @@ open at once.
 
 To roll back: the earlier binary opens the directory again until the new one writes its first
 checkpoint (a bulk load, a background or an explicit checkpoint). From then on checkpoints are
-format 12, which earlier binaries refuse (`UnsupportedFormat`), so restore the image backup taken
-before the upgrade, with the earlier binary. Before that point the earlier binary opens the
+format 12, which earlier binaries refuse: the earlier binary stops with "… uses an unsupported storage format; reload the data into a new directory".
+Its advice to reload isn't the way back: open the copy of the data directory taken before the
+upgrade with the earlier binary, or restore the image backup taken then. Before that point the earlier binary opens the
 directory, deriving again where the rules differ. It doesn't open a repository switched to a mode
 it lacks (`owl2-dl`), so switch that back first. It ignores settings it doesn't know
 (`ql_rewriting`, `query_timeout_ms`), and reads `inferred = "supported"` as `hidden`.
