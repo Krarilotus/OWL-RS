@@ -562,8 +562,9 @@ fn by_index(snapshot: &Snapshot) -> Option<Option<String>> {
 }
 
 /// The annotation properties by the reader's rule: declared by its table (OWL 1's
-/// `owl:OntologyProperty` too) in a graph `readable` takes, IRIs only, then the built-ins
-/// the store knows; lazily, a declaring type at a time.
+/// `owl:OntologyProperty` too) in a graph `readable` takes, IRIs only and not `rdf:type`,
+/// whose declaration the reader leaves out as reserved, then the built-ins the store knows;
+/// lazily, a declaring type at a time.
 fn annotation_properties(
     snapshot: &Snapshot,
     readable: impl Fn(TermId) -> bool,
@@ -579,7 +580,7 @@ fn annotation_properties(
     let named = typed.flat_map(quads).filter(move |q| readable(q.graph));
     let named = named
         .map(|q| q.subject)
-        .filter(|s| s.kind() == TermKind::Iri);
+        .filter(move |&s| s.kind() == TermKind::Iri && Some(s) != ty);
     named.chain(BUILTIN.into_iter().filter_map(id))
 }
 
@@ -806,7 +807,8 @@ pub(crate) fn certify(
 /// statement ([`copied`]) makes the answers unsound: OWL 2 DL gives annotations no meaning, so
 /// an equality or an annotation axiom entails no copy. From `snapshot` as given (with none,
 /// every read but `rdf:type`); for a reader of some graphs, membership from its own graphs.
-pub(crate) fn annotation_rule(
+/// Every read inside a transaction meets it here too, through [`certify_closure`].
+fn annotation_rule(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
     source: &'static str,
@@ -819,7 +821,7 @@ pub(crate) fn annotation_rule(
     let access = reads.access.as_deref();
     let found = match snapshot {
         _ if access.is_some_and(|a| !a.inferred) => None,
-        Some(s) => copied(s, |g| access.is_none_or(|a| a.allows_id(s, g)), read),
+        Some(s) => copied(s, access, read),
         None => read.first(),
     };
     let Some(p) = found else { return };
@@ -835,27 +837,33 @@ const COPIES: &str = "and the closure may hold the rules' copies of annotation s
 /// The first of `read` that may return a copy in `snapshot`: an annotation property (one of
 /// [`annotation_properties`], for `None`; a constant by its own declarations or as built in,
 /// none where the store doesn't know the IRI) with statements held where an equality between
-/// two different terms is, or inferred ones.
+/// two different terms is, or inferred ones. For a reader by support (`access`), held only in
+/// the graphs it reads: a copy it sees has its support there, or copies an inferred statement.
 fn copied<'a>(
     snapshot: &Snapshot,
-    readable: impl Fn(TermId) -> bool + Copy,
+    access: Option<&nrese_sparql::GraphAccess>,
     read: &'a [Option<String>],
 ) -> Option<&'a Option<String>> {
     use ReadModel::{Inferred, Materialised};
     use nrese_owl::{BUILTIN_ANNOTATIONS as BUILTIN, DECLARATION_KINDS, EntityKind};
+    let readable = |g: TermId| access.is_none_or(|a| a.allows_id(snapshot, g));
+    let by_support = access.is_some_and(|a| a.inferred_by_support);
     let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+    let asserted = |pattern| snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern);
     let equal = std::cell::OnceCell::new();
+    // A reader by support sees the copy of a statement in its own graphs, or of an inferred one.
     let copies = |p| {
         let equal = *equal.get_or_init(|| equal_terms(snapshot));
-        let model = if equal { Materialised } else { Inferred };
-        snapshot.exists_in(model, &any_graph(None, Some(p), None))
+        let (of, held) = (any_graph(None, Some(p), None), equal && !by_support);
+        let model = if held { Materialised } else { Inferred };
+        let seen = equal && by_support && asserted(of).any(|q| readable(q.graph));
+        seen || snapshot.exists_in(model, &of)
     };
     let kind = |k: &str| DECLARATION_KINDS.contains(&(k, EntityKind::AnnotationProperty));
     let declares = |q: nrese_engine::EncodedQuad| {
         let object = snapshot.decode(q.object);
         readable(q.graph) && matches!(object, Some(Term::NamedNode(k)) if kind(k.as_str()))
     };
-    let asserted = |pattern| snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern);
     read.iter().find(|p| match p.as_deref() {
         None => annotation_properties(snapshot, readable).any(copies),
         Some(iri) => id(iri).is_some_and(|p| {
