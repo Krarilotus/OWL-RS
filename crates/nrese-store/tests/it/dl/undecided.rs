@@ -339,3 +339,54 @@ fn a_repaired_store_is_told_what_a_clean_store_is_told() {
     };
     assert_eq!(told(&q), told(&clean));
 }
+
+/// Spec: a rebuild that finds a clash and changes no rows keeps its revision (an individual
+/// different from itself: the rules check it without materialising `:w owl:sameAs :w`). A
+/// view of that revision built before the rebuild, while nothing had assessed the data the
+/// load brought, carries no claim past it: the read after it is told what the full check
+/// finds.
+#[test]
+fn a_rebuild_finding_a_clash_at_a_revision_already_read_is_told_by_the_clash() {
+    let dl = store(StoreConfig::in_memory(), ReasoningMode::Owl2Dl);
+    assert_eq!(loaded(&dl, CLEAN), ConsistencyStatus::Consistent);
+    crate::support::load_past_the_pipeline(
+        dl.store(),
+        &format!("{PREFIXES}:w owl:differentFrom :w ."),
+    );
+    let revision = dl.store().current_revision();
+    in_h(&dl, None).expect("the read before the rebuild");
+    dl.store().rematerialise(rules()).expect("rebuilt");
+    assert_told_inconsistent(&dl, "after the rebuild");
+    assert!(
+        matches!(
+            dl.store().consistency(),
+            ConsistencyStatus::Inconsistent { .. }
+        ),
+        "the setup: {:?}",
+        dl.store().consistency()
+    );
+    assert_eq!(
+        dl.store().current_revision(),
+        revision,
+        "the setup: the rebuild took a new revision"
+    );
+}
+
+/// Spec: data loaded past the gates are assessed by no one until the rebuild (the load
+/// clears the certificate as it publishes): a read in between is told `not-certified`, never
+/// `complete`, and `exact` refuses it; no verdict is recorded for its revision (nothing it is
+/// told depends on one).
+#[test]
+fn a_read_after_a_load_and_before_its_rebuild_is_told_not_certified() {
+    let dl = store(StoreConfig::in_memory(), ReasoningMode::Owl2Dl);
+    assert_eq!(loaded(&dl, CLEAN), ConsistencyStatus::Consistent);
+    crate::support::load_past_the_pipeline(dl.store(), &format!("{PREFIXES}:w a :B ."));
+    let (_, status) = in_h(&dl, None).expect("answered");
+    assert_eq!(status.shared.as_str(), "not-certified", "{status:?}");
+    let answer = in_h(&dl, Some(DlAnswers::Exact));
+    assert!(
+        matches!(answer, Err(StoreError::Incomplete(_))),
+        "{answer:?}"
+    );
+    assert!(dl.store().dl().status().is_none());
+}
