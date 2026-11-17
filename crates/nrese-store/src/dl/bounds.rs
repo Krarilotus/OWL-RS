@@ -466,6 +466,7 @@ pub(crate) fn prepare(
                             base,
                             decided_by: "upper-bound",
                             proves_consistency: upper.program.proves_consistency()
+                                && upper.reads_every_value(&change)
                                 && upper.clashes_after(&change) == 0,
                             prepared: Prepared::Delta(Box::new(change)),
                             ontology: None,
