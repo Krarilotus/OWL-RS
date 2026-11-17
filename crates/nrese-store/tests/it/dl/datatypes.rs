@@ -340,3 +340,79 @@ fn a_literal_of_the_ontologys_own_datatype_is_kept_as_written() {
             .collect(),
     );
 }
+
+/// The upper bound reads by value the literals its rules compare (a key's, a negative
+/// assertion's), so it joins equal values written differently. A literal whose value it can't
+/// read (`xsd:date`, outside the map) stands for itself: the same date written two ways (`Z`
+/// and `+00:00`, one time zone offset) is two values to it, and a key or a negative assertion
+/// over them derives no clash. A consistency proof would then rest on what it didn't read: the
+/// store isn't told `consistent`, the full check tells `unknown`, at the first commit and at a
+/// later one. The map's `xsd:dateTime` is read: one instant at one offset written two ways is one
+/// value (OWL 2 Structural Specification §4.7), so the key equates two different individuals
+/// and the commit is refused.
+#[test]
+fn a_value_the_upper_bound_cant_read_proves_no_consistency() {
+    const KEY: &str = ":C a owl:Class ; owl:hasKey ( :born ) . :born a owl:DatatypeProperty . \
+         :a a owl:NamedIndividual , :C ; owl:differentFrom :b . :b a owl:NamedIndividual , :C .";
+    const Z: &str = r#":a :born "2020-01-01Z"^^xsd:date ."#;
+    const OFFSET: &str = r#":b :born "2020-01-01+00:00"^^xsd:date ."#;
+    const NOT: &str = r#"[] a owl:NegativePropertyAssertion ; owl:sourceIndividual :a ;
+         owl:assertionProperty :born ; owl:targetValue "2020-01-01+00:00"^^xsd:date ."#;
+    const INSTANT: &str = r#":a :born "2020-01-01T00:00:00Z"^^xsd:dateTime .
+         :b :born "2020-01-01T00:00:00+00:00"^^xsd:dateTime ."#;
+    let mut cells: Vec<(String, String, &[&str])> = vec![
+        (
+            "the same date written two ways under a key".into(),
+            told_after("key", &[KEY, Z, OFFSET]),
+            NOT_TOLD,
+        ),
+        (
+            "the same date written two ways in an assertion and a negative one".into(),
+            told_after("negative", &[DATA, Z, NOT]),
+            NOT_TOLD,
+        ),
+        (
+            "the same dateTime written two ways under a key".into(),
+            told_after("instant", &[KEY, INSTANT]),
+            REFUSED,
+        ),
+    ];
+    // A later commit: values the change reads first (the first commit's only value is 5), and
+    // a change over a first commit that holds a date already.
+    let first_key = format!("{KEY} :c a owl:NamedIndividual ; :born 5 .");
+    for (name, first, later, want) in [
+        (
+            "the same date written two ways under a key, in a later commit",
+            first_key.clone(),
+            format!("{Z} {OFFSET}"),
+            NOT_TOLD,
+        ),
+        (
+            "the same date written two ways in an assertion and a negative one, in a later commit",
+            format!("{DATA} {NOT}"),
+            Z.to_owned(),
+            NOT_TOLD,
+        ),
+        (
+            "the same dateTime written two ways under a key, in a later commit",
+            first_key,
+            INSTANT.to_owned(),
+            REFUSED,
+        ),
+    ] {
+        let dl = pipeline();
+        insert(&dl, &first).expect("the first commit");
+        let got = match insert(&dl, &later) {
+            Ok(_) => told(&dl, name),
+            Err(MutationError::Rejected(_)) => "refused".to_owned(),
+            Err(other) => panic!("{name}: {other:?}"),
+        };
+        cells.push((name.to_owned(), got, want));
+    }
+    judge(
+        cells
+            .iter()
+            .map(|(name, got, want)| (name.as_str(), got.clone(), *want))
+            .collect(),
+    );
+}
