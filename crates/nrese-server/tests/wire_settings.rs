@@ -162,10 +162,7 @@ async fn configured_idle_expiry_refuses_all_actions_without_partial_writes() {
             .send()
             .await
             .unwrap();
-        assert_eq!(
-            ping.text().await.unwrap().trim(),
-            if expires { "1000" } else { "600000" }
-        );
+        let idle = ping.text().await.unwrap();
         assert_eq!(
             client
                 .put(format!("{url}?action=UPDATE"))
@@ -200,6 +197,7 @@ async fn configured_idle_expiry_refuses_all_actions_without_partial_writes() {
                 "{action}"
             );
         }
+        assert_eq!(idle.trim(), if expires { "1000" } else { "600000" });
         let response: serde_json::Value = client
             .post(format!("{}/repositories/nrese", server.base))
             .header("content-type", "application/sparql-query")
