@@ -479,6 +479,7 @@ fn a_version_no_one_published_read_without_its_operations_is_not_certified() {
     let mut cells = Cells::default();
     let dir = tempfile::tempdir().expect("dir");
     let store = certified(dir.path());
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
     if !owl2_rl(&status(&store, READ)) {
         cells.unmet("row 14", "not certified under owl2-rl");
         cells.finish();

@@ -13,6 +13,7 @@ use crate::http::rdf_payload::{
     parse_graph_content_format, parse_graph_target, parse_rdf_base_iri,
 };
 use crate::http::result_stream::{Pace, stream_blocking};
+use crate::http::sparql::refused_or;
 use crate::state::AppState;
 
 /// A graph (Graph Store Protocol `GET`), streamed as it is read: a whole graph in constant
@@ -41,7 +42,7 @@ pub async fn get_graph(
                 // Graph Store Protocol §5.2: a graph that doesn't exist is 404, not an empty
                 // document. Nothing is written for it, so the status is still open.
                 Ok(false) => Err(ApiError::not_found("the graph does not exist")),
-                Err(error) => Err(ApiError::bad_request(error.to_string())),
+                Err(error) => Err(refused_or(error, ApiError::bad_request)),
             }
         },
     )
@@ -68,7 +69,7 @@ pub async fn head_graph(
     .await
     .map_err(|_| ApiError::timeout("graph read exceeded policy timeout"))?
     .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    .map_err(|error| refused_or(error, ApiError::bad_request))?;
     if !exists {
         return Err(ApiError::not_found("the graph does not exist"));
     }

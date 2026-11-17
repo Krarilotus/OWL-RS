@@ -134,6 +134,13 @@ impl Certificate {
         snapshot.certificate()?.downcast_ref()
     }
 
+    /// Whether `snapshot` was never reasoned over: no inferred statement, no certificate, and
+    /// no rules in place (`rules`). Anything else without a certificate is a stack nothing
+    /// vouches for.
+    pub(crate) fn bare(snapshot: &Snapshot, rules: bool) -> bool {
+        snapshot.len_in(ReadModel::Inferred) == 0 && !rules && Self::of(snapshot).is_none()
+    }
+
     /// Whether `snapshot` reads under `owl2-dl`, and whether user rules run with it: as its
     /// certificate says, else as the mode `dl` is now (a read without one is told
     /// `not-certified` all the same).
@@ -348,6 +355,12 @@ impl StoreService {
             outside_profile: std::sync::Arc::new(std::sync::RwLock::new(outside_profile)),
             last_materialisation: std::sync::Arc::default(),
         };
+        // Every store a replica server opens is a replica's from its open on, the default and
+        // the catalog's others alike: its `owl2-dl` mode interns no term (the default's
+        // dictionary continues the primary's), and its refusals say the replica's sentence.
+        if service.config.replica {
+            service.dl.set_replica();
+        }
         // The planner's statistics are the store's, shared by its requests: an envelope of
         // their own within the catalog's budget, exact (no request's credit: it lives as long
         // as the store).
@@ -937,6 +950,7 @@ impl StoreService {
             by_representatives: self.config.equality_by_representatives,
             compact: self.config.equality_compact,
             cap: self.config.support_sets,
+            replica: self.dl.replica(),
         }
     }
 
@@ -992,13 +1006,6 @@ impl StoreService {
         if let Some(state) = self.reasoning_state() {
             self.certify(&tx, state);
         }
-    }
-
-    /// Marks the store as a read replica: it follows a primary's log, whose dictionary
-    /// its own must continue, so the `owl2-dl` mode interns no term here (it reads the
-    /// terms the primary's records bring).
-    pub fn mark_replica(&self) {
-        self.dl.set_replica();
     }
 
     /// The `owl2-dl` mode's state.
@@ -1326,8 +1333,7 @@ impl StoreService {
         let snapshot = at.snapshot();
         let unpublished = matches!(at, Revision::Committed(_)) && snapshot.shared_state().is_none();
         let Some(certificate) = Certificate::of(snapshot).filter(|_| !unpublished) else {
-            let bare = snapshot.len_in(ReadModel::Inferred) == 0 && !self.supports.has_rules();
-            let bare = bare && Certificate::of(snapshot).is_none();
+            let bare = Certificate::bare(snapshot, self.supports.has_rules());
             return (!bare).then(nrese_sparql::Completeness::not_certified);
         };
         let mut status = route?;
@@ -1694,7 +1700,8 @@ impl StoreService {
             &mut |tx, request| {
                 crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
             },
-        )?;
+        )
+        .map_err(crate::StoreError::refusal_within)?;
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
             Some(reading) => reading.pending(&tx, &budget)?,
             // Operations that touch no input of the list scan (a list fact; under compact
@@ -2172,6 +2179,11 @@ impl StoreService {
         statement: [nrese_rdf::TermRef<'_>; 3],
     ) -> StoreResult<Option<Vec<crate::reasoning::InferenceStep>>> {
         let snapshot = self.engine.snapshot();
+        // Admitted as every read is ([`Self::view_of`]) before anything of the snapshot is
+        // read: a proof under rules nothing vouches its stack for would show a reader of
+        // some graphs what a premise it can't read decides.
+        let envelope = self.settings.envelope(None);
+        self.view_of(&snapshot, scope.access(), &envelope, None)?;
         let program = self.bound_program(&snapshot, program);
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
@@ -2222,6 +2234,9 @@ impl StoreService {
         mode: crate::reasoning::JustificationMode,
     ) -> StoreResult<Option<crate::reasoning::JustificationAnswer>> {
         let snapshot = self.engine.snapshot();
+        // Admitted before anything of it is read, as [`Self::explain_statement_whole`].
+        let envelope = self.settings.envelope(None);
+        self.view_of(&snapshot, scope.access(), &envelope, None)?;
         let program = self.bound_program(&snapshot, program);
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
@@ -2367,10 +2382,14 @@ impl StoreService {
 
     /// Replaces the inferred stack with `program`'s closure over the asserted data, as one
     /// revision (see [`crate::reasoning`]). For after bulk loads, at startup and after a
-    /// change of rules; commits keep it current afterwards. A store used as a library that
-    /// rematerialises with no reasoner registered (no pipeline) reads a later version
-    /// without inferred statements or certificate as one no reasoning can leave answers
-    /// out of: no status, not `not-certified`; a server registers its rules first.
+    /// change of rules; commits keep it current afterwards. Register `program` as well
+    /// ([`Self::use_reasoning_rules`]; the mutation pipeline registers its own): while the
+    /// rules in place aren't the ones the stack was made with, readers of some graphs who
+    /// see inferred statements are refused until the store is rematerialised. A store used
+    /// as a library that rematerialises with no reasoner registered (no pipeline) reads a
+    /// later version without inferred statements or certificate as one no reasoning can
+    /// leave answers out of: no status, not `not-certified`; a server registers its rules
+    /// first.
     pub fn rematerialise(
         &self,
         program: impl Into<nrese_reasoner::RuleProgram>,
