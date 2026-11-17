@@ -435,8 +435,11 @@ pub(crate) fn mark(
 /// stand). The element is a name in no axiom, and OWL 2 has no unique-name assumption, so it
 /// may denote any element: `O ⊨ Q(fresh)` iff `O ⊨ ⊤ ⊑ Q`. `None`: refuted, so no name
 /// answers the query that the store's individuals don't. Undecided: two answer variables or
-/// more, one beside a name the atom holds of the element, or a query the exact services
-/// don't take. The reasons hold of either name the store has no individual for.
+/// more, one beside a name the atom holds of the element or reaching the answer through an
+/// expression, or a query the exact services don't take. A proof under a filter is only of
+/// the pattern (the exact services don't evaluate filters), so it says "may"; a refutation
+/// still holds, as a filter only drops rows. The reasons hold of either name the store has
+/// no individual for.
 fn stand_in(
     store: &StoreService,
     view: &View,
@@ -453,11 +456,11 @@ fn stand_in(
         let (v, lower) = (&s.projected, &view.lower);
         let rows = [vec![Some(Term::NamedNode(domain)); v.len()]];
         let mut decided = exact::decide_until(store, lower, analysis, v, &rows, cancel, by, memory);
-        decided.verdicts.pop()
+        decided.verdicts.pop().map(|verdict| (verdict, s.filter))
     });
     let (how, is) = match verdict {
-        Some(Entailed::No) => return None,
-        Some(Entailed::Yes) => ("holds of every element", "is"),
+        Some((Entailed::No, _)) => return None,
+        Some((Entailed::Yes, false)) => ("holds of every element", "is"),
         _ => ("may hold of every element (undecided)", "may be"),
     };
     Some(format!(
@@ -863,6 +866,8 @@ pub(crate) fn answer(
     {
         status.incomplete("dl", why);
     }
+    // A cancellation while the element was posed is the read's, not a reason.
+    cancellation.check()?;
     refuse_unless_complete(mode, status, || detail.unresolved.clone())?;
     Ok(outcome)
 }
