@@ -622,3 +622,65 @@ fn an_entailment_check_reads_one_snapshot_while_a_clear_publishes() {
     }
     cells.finish();
 }
+
+/// A change of a repository's reasoning (`Catalog::change`) rebuilds its inferences under the
+/// new rules before its new write path registers them. A reader of every graph between the
+/// rebuild's publication and that registration is told `not-certified`: the closure published
+/// isn't that of the rules registered then. After the change it is told the new rules' status,
+/// byte-equal to a store rebuilt under them with them registered.
+#[test]
+fn a_change_of_reasoning_is_not_certified_until_its_rules_are_registered() {
+    use crate::catalog::{Catalog, DEFAULT_REPOSITORY, RepositorySettings};
+    let mut cells = Cells::default();
+    let (dir, other) = (
+        tempfile::tempdir().expect("dir"),
+        tempfile::tempdir().expect("dir"),
+    );
+    let store = certified(dir.path());
+    let reader = store.clone();
+    let served_under = ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Owl2Rl));
+    let catalog = Catalog::open(store, served_under).expect("catalog");
+    let before = reads(&reader);
+    if !owl2_rl(&before[0]) {
+        cells.unmet(
+            "the window",
+            &format!("not certified under owl2-rl: {before:?}"),
+        );
+        cells.finish();
+        return;
+    }
+    let seen = Arc::new(Mutex::new(None));
+    let (inside, kept) = (reader.clone(), Arc::clone(&seen));
+    hooks::AFTER_PUBLICATION.set(Some(Box::new(move || {
+        *kept.lock().unwrap() = Some(reads(&inside));
+    })));
+    let rdfs = RepositorySettings {
+        reasoning: Some("rdfs".to_owned()),
+        ..RepositorySettings::default()
+    };
+    catalog.change(DEFAULT_REPOSITORY, rdfs).expect("changed");
+    hooks::AFTER_PUBLICATION.set(None);
+    let rebuilt = {
+        let store = Arc::new(StoreService::new(StoreConfig::on_disk(other.path())).expect("store"));
+        let _rdfs = pipeline(&store, ReasoningMode::Rdfs);
+        load(&store, DATA);
+        store.rematerialise(Ruleset::Rdfs).expect("reasoned");
+        reads(&store)
+    };
+    let after = reads(&reader);
+    let seen = seen.lock().unwrap().take();
+    for (i, read) in ["a read", "a negated read"].into_iter().enumerate() {
+        match &seen {
+            Some(got) => cells.class(&format!("the window | {read}"), &got[i], "not-certified"),
+            None => cells.unmet("the window", "the rebuild didn't reach its publication"),
+        }
+        let want = rebuilt[i].clone();
+        cells.check(
+            &format!("after the change | {read}"),
+            &after[i],
+            |h| h == want,
+            &rebuilt[i],
+        );
+    }
+    cells.finish();
+}

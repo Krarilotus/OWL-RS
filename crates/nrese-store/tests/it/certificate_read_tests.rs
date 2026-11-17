@@ -781,3 +781,86 @@ fn a_restart_after_a_commit_without_reasoning_opens_not_certified() {
     cells.class("a restart", &status(&store, READ), "not-certified");
     cells.finish();
 }
+
+/// A store a library reasoned under its own rules and opened again under others: the closure it
+/// keeps is the earlier rules', and a read of it is told `not-certified` until the store is
+/// rebuilt, whether the new rules are registered alone or by a write path. With no rules
+/// registered again (`use_reasoning_rules(None)`), it is told what its marker says, as before
+/// any registration. Opened again under the same rules, it is told exactly what it was told
+/// before it closed.
+#[test]
+fn a_closure_other_rules_made_is_not_certified_where_the_rules_change_between_opens() {
+    const ASK: &str =
+        "ASK { <http://example.com/b> <http://example.com/knows> <http://example.com/a> }";
+    let pie = |rule: &str| {
+        format!(
+            "Prefices\n{{\n  ex : http://example.com/\n}}\nAxioms\n{{\n}}\nRules\n{{\n\
+             Id: {rule}\n  x <ex:{rule}> y\n  ---\n  y <ex:{rule}> x\n}}\n"
+        )
+    };
+    let rules =
+        |rule: &str| Arc::new(UserRules::pie("user.pie", pie(rule)).expect("the rules compile"));
+    let program =
+        |rule: &str| nrese_reasoner::RuleProgram::new(None, Some(rules(rule))).expect("a program");
+    let read = |store: &StoreService| {
+        let answer = store.execute_query_str(ASK).expect("answered");
+        let thing = String::from_utf8(answer.payload)
+            .expect("utf-8")
+            .contains("true");
+        format!("{thing}, {}", header(answer.completeness))
+    };
+    let mut cells = Cells::default();
+    for way in [
+        "rules changed, registered",
+        "rules changed, a write path",
+        "rules changed, then none",
+        "rules unchanged",
+    ] {
+        let dir = tempfile::tempdir().expect("dir");
+        let config = || StoreConfig::on_disk(dir.path().join("store"));
+        let before = {
+            let store = StoreService::new(config()).expect("store");
+            store.use_reasoning_rules(Some(program("knows")));
+            let data = "<http://example.com/a> <http://example.com/knows> <http://example.com/b> .";
+            load(&store, data, false);
+            store.rematerialise(program("knows")).expect("reasoned");
+            read(&store)
+        };
+        if !before.starts_with("true, sound-only") {
+            cells.unmet(way, &format!("not certified before it closed: {before}"));
+            continue;
+        }
+        let store = StoreService::new(config()).expect("store");
+        let rule = if way == "rules unchanged" {
+            "knows"
+        } else {
+            "likes"
+        };
+        let _pipeline = if way.ends_with("a write path") {
+            let reasoner = ReasonerConfig::for_mode(ReasoningMode::Custom)
+                .with_rules(Some(rules(rule)))
+                .expect("a mode for the rules");
+            let store = Arc::new(store.clone());
+            Some(MutationPipeline::new(
+                store,
+                Arc::new(ReasonerService::new(reasoner)),
+            ))
+        } else {
+            store.use_reasoning_rules(Some(program(rule)));
+            None
+        };
+        let got = read(&store);
+        if way == "rules unchanged" {
+            cells.header(way, &got, |got| got == before, &before);
+        } else {
+            let right = |got: &str| got.starts_with("false") || got == "true, not-certified";
+            cells.header(way, &got, right, "false, or not-certified");
+        }
+        if way == "rules changed, then none" {
+            store.use_reasoning_rules(None);
+            let name = format!("{way}: none registered");
+            cells.header(&name, &read(&store), |got| got == before, &before);
+        }
+    }
+    cells.finish();
+}
