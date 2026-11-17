@@ -10,7 +10,7 @@ in the branch), deferred (not done, with the reason and where it went) or open.
 The [roadmap](ROADMAP.md) says why and in which order, and the designs are in
 [design/](design/).
 
-What is left before 1.5 goes to `main`, and its state, is the status table of the
+The items checked for 1.5's merge to `main`, with their state, are the status table of the
 [merge checklist](plan/2026-10-05-v2-merge-checklist.md) §1, and the sections from "Audit
 work" on are the record by goal.
 
