@@ -393,6 +393,74 @@ fn a_row_a_negation_keeps_over_a_missing_answer_is_never_told_sound() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A reserved name is no individual of an OWL 2 DL ontology (Structural Specification §5.6.1),
+/// so the regime binds none in an individual's place and holds no read that puts one there,
+/// though the rewriting of `owl:topObjectProperty` reuses its IRI for an individual of its own.
+/// Where U is a domain, a range or a restriction's property, or only declared, no read returns
+/// it there, told sound or not: `?x a :C0` answers the data's names, and no read types
+/// `owl:topObjectProperty` (by `rdf:type` it has only its declaration, `owl:ObjectProperty`,
+/// a class's place). So no read returns a reserved IRI that the engines brought in where the
+/// regime binds a non-reserved name, on either route.
+#[test]
+fn a_reserved_name_is_never_an_answer_in_an_individuals_place() {
+    let some = "[ a owl:Restriction ; owl:onProperty owl:topObjectProperty ; \
+        owl:someValuesFrom :C1 ] rdfs:subClassOf :C0 .";
+    let stores = [
+        "owl:topObjectProperty rdfs:domain :C0 .",
+        "owl:topObjectProperty rdfs:range :C0 .",
+        some,
+        "owl:topObjectProperty a owl:ObjectProperty . :C1 rdfs:subClassOf :C0 .",
+    ];
+    let reads = [
+        TYPE_C0,
+        "SELECT ?x { owl:topObjectProperty a ?x }",
+        "ASK { owl:topObjectProperty a :C0 }",
+    ];
+    let mut wrong = Vec::new();
+    for data in stores {
+        let dl = pipeline();
+        insert(&dl, &format!("{data} {TOP}")).expect("committed");
+        let route = dl.store().dl_bounds().last;
+        for read in reads {
+            for mode in [None, Some(nrese_store::DlAnswers::Sound)] {
+                let (rows, status) = query_with(&dl, read, mode).expect("answers");
+                let reserved = read == TYPE_C0 && rows.iter().any(|r| r.contains("w3.org/"));
+                let held = read.starts_with("ASK") && rows == ["true"];
+                let typed = read.contains("a ?x") && rows.iter().any(|r| r != OBJECT_PROPERTY);
+                if reserved || held || typed {
+                    let told = status.shared.as_str();
+                    wrong.push(format!(
+                        "{data} (route {route}) {read} {mode:?}: {rows:?}, {told}"
+                    ));
+                }
+            }
+        }
+    }
+    // A reserved IRI the data itself states in such a place belongs to a part the reader
+    // leaves out, and a read that returns it is told `unsound` with the left-out reason.
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":p a owl:ObjectProperty . :a0 :p rdf:nil . :p rdfs:range :C0 .",
+    )
+    .expect("ok");
+    for read in ["SELECT ?x { :a0 :p ?x }", TYPE_C0, "ASK { rdf:nil a :C0 }"] {
+        let (rows, status) = query_with(&dl, read, None).expect("answers");
+        let told = status.shared.as_str();
+        let left_out = status.reasons().iter().any(|r| r.contains("were left out"));
+        if !told.starts_with("unsound") || !left_out || status.bounds.is_some_and(|c| c.refuted > 0)
+        {
+            wrong.push(format!(
+                "rdf:nil {read}: {rows:?}, {told}, {:?}",
+                status.reasons()
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+const OBJECT_PROPERTY: &str = "http://www.w3.org/2002/07/owl#ObjectProperty";
+
 /// The exact services don't evaluate filters, so that U1's element for every element is
 /// entailed in C0 says nothing of `?x a :C0` under a filter: such a read, `FILTER(false)`
 /// (no answers) or `FILTER(?x = :C2)` (C2 alone), is never told that every name is an answer.
