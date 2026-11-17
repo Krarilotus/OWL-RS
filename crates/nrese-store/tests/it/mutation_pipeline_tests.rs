@@ -341,7 +341,31 @@ fn owl2_rl_commits_keep_the_inferred_stack_exact() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(150);
+    // Now and then, before a round's commit, a statement loaded past the pipeline (the
+    // closure rebuilt) and an empty update: from draws of their own, so the commits'
+    // draws stay as they were; NRESE_FUZZ_SEED (a number) varies them.
+    let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
+    let mut seed = 0x2026_1117_0148u64 ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut aside = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
     for _ in 0..rounds {
+        if aside(8) == 0 {
+            let loaded = format!("{} .", random_triple(&mut aside));
+            crate::support::load_past_the_pipeline(pipeline.store(), &loaded);
+            let rules = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
+            pipeline.store().rematerialise(rules).expect("rebuilt");
+            let all = nrese_store::Requester::all();
+            pipeline
+                .apply(insert(""), &all, &MutationTicket::new())
+                .expect("empty update");
+        }
         let deleting = !asserted.is_empty() && next(3) == 0;
         let (triple, graph) = if deleting {
             asserted.swap_remove(next(asserted.len() as u64) as usize)
