@@ -160,6 +160,34 @@ fn a_type_every_element_has_is_never_complete_without_every_name() {
     assert!(found.is_empty(), "{found:#?}");
 }
 
+/// Every element is in C0 through an individual, which the TBox alone doesn't say: one
+/// element only, a0, a member (`owl:Thing ⊑ {a0}`), or every element related by the top
+/// property to a0, a member of C1 (`∃U.C1 ⊑ C0`). The TBox's taxonomy puts no class
+/// equivalent to `owl:Thing`, so it can't keep these reads `complete`.
+#[test]
+fn a_type_every_element_has_through_an_individual_is_never_complete_without_every_name() {
+    let one = "owl:Thing rdfs:subClassOf [ owl:oneOf ( :a0 ) ] .";
+    let top = "[ a owl:Restriction ; owl:onProperty owl:topObjectProperty ; \
+        owl:someValuesFrom :C1 ] rdfs:subClassOf :C0 .";
+    let cases: Vec<Case> = vec![
+        (
+            "one",
+            with(&[one, TOP, ":a0 a :C0 ."]),
+            TYPE_C0,
+            "C0 C1 a0 a1",
+        ),
+        ("top-some", with(&[top, TOP]), TYPE_C0, "C0 C1 a0 a1"),
+        (
+            "one-ask",
+            with(&[one, TOP, ":a0 a :C0 ."]),
+            "ASK { :C1 a :C0 }",
+            "true",
+        ),
+    ];
+    let wrong = wrong(&cases, false);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A ground question about a name with no individual view, `ASK { :C2 a :C0 }`, holds where
 /// every element is in C0: its `false` is never `complete`.
 #[test]
