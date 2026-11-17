@@ -24,6 +24,7 @@ static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std:
 fn operators() -> ServerConfig {
     ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
+        public_url: None,
         deployment_posture: DeploymentPosture::OpenWorkbench,
         store: StoreConfig {
             index_encoding: IndexEncoding::Compact,

@@ -54,6 +54,26 @@ impl Default for PolicyConfig {
 }
 
 impl PolicyConfig {
+    pub fn challenge(&self, headers: &axum::http::HeaderMap) -> &'static str {
+        const BASIC: &str = "Basic realm=\"nrese\", charset=\"UTF-8\"";
+        let scheme = headers
+            .get("authorization")
+            .and_then(|h| h.to_str().ok())
+            .and_then(|h| h.split_whitespace().next())
+            .unwrap_or_default();
+        if scheme.eq_ignore_ascii_case("Basic") {
+            return BASIC;
+        }
+        let fetch = headers
+            .get("sec-fetch-mode")
+            .is_some_and(|h| h != "navigate");
+        if scheme.eq_ignore_ascii_case("Bearer") || fetch || !self.local_logins {
+            "Bearer"
+        } else {
+            "Basic realm=\"nrese\", charset=\"UTF-8\", Bearer"
+        }
+    }
+
     pub fn enforce_query_bytes(&self, size: usize) -> Result<(), ApiError> {
         enforce_size_limit("query", size, self.limits.max_query_bytes)
     }

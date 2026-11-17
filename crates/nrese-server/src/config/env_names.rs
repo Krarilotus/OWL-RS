@@ -1,5 +1,6 @@
 pub const CONFIG_PATH: &str = "NRESE_CONFIG_PATH";
 pub const BIND_ADDR: &str = "NRESE_BIND_ADDR";
+pub const PUBLIC_URL: &str = "NRESE_PUBLIC_URL";
 pub const DEPLOYMENT_POSTURE: &str = "NRESE_DEPLOYMENT_POSTURE";
 pub const DATA_DIR: &str = "NRESE_DATA_DIR";
 pub const STORE_MODE: &str = "NRESE_STORE_MODE";

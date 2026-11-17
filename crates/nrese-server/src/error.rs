@@ -24,7 +24,7 @@ pub enum ApiError {
         reject: Box<Option<RejectExplanationView>>,
     },
     #[error("unauthorized: {0}")]
-    Unauthorized(String),
+    Unauthorized(String, &'static str),
     #[error("forbidden: {0}")]
     Forbidden(String),
     #[error("not found: {0}")]
@@ -68,7 +68,14 @@ impl ApiError {
     }
 
     pub fn unauthorized(message: impl Into<String>) -> Self {
-        Self::Unauthorized(message.into())
+        Self::Unauthorized(message.into(), "Bearer")
+    }
+
+    pub fn with_challenge(mut self, challenge: &'static str) -> Self {
+        if let Self::Unauthorized(_, value) = &mut self {
+            *value = challenge;
+        }
+        self
     }
 
     pub fn rejected(
@@ -172,6 +179,10 @@ impl IntoResponse for ApiError {
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
             return response;
         }
+        let challenge = match &self {
+            Self::Unauthorized(_, challenge) => Some(*challenge),
+            _ => None,
+        };
         let (status, detail, reasoner_reject) = match self {
             Self::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail, None),
             Self::BadRequestPlainText(detail) => {
@@ -183,7 +194,7 @@ impl IntoResponse for ApiError {
                 return response;
             }
             Self::Rejected { detail, reject, .. } => (StatusCode::BAD_REQUEST, detail, *reject),
-            Self::Unauthorized(detail) => (StatusCode::UNAUTHORIZED, detail, None),
+            Self::Unauthorized(detail, _) => (StatusCode::UNAUTHORIZED, detail, None),
             Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
             Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
             Self::Conflict(detail) => (StatusCode::CONFLICT, detail, None),
@@ -211,7 +222,7 @@ impl IntoResponse for ApiError {
             }
             None => kind(status),
         };
-        problem(
+        let mut response = problem(
             status,
             &ProblemJson {
                 r#type: problem_type,
@@ -220,7 +231,14 @@ impl IntoResponse for ApiError {
                 detail,
                 reasoner_reject,
             },
-        )
+        );
+        if let Some(challenge) = challenge {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static(challenge),
+            );
+        }
+        response
     }
 }
 

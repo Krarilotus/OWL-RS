@@ -132,15 +132,19 @@ impl<'a> Range<'a> {
 /// that names an offer decides its weight. Ties go to the earlier offer. Without an
 /// `Accept` header the first offer is sent. `None`: the client accepts none of them.
 pub fn negotiate<T: Copy>(accept: Option<&str>, offers: Offers<T>) -> Option<T> {
+    negotiate_offer(accept, offers).map(|(_, format)| format)
+}
+
+fn negotiate_offer<T: Copy>(accept: Option<&str>, offers: Offers<T>) -> Option<(&'static str, T)> {
     let ranges: Vec<Range<'_>> = accept
         .unwrap_or_default()
         .split(',')
         .filter_map(Range::parse)
         .collect();
     if ranges.is_empty() {
-        return offers.first().map(|&(_, format)| format);
+        return offers.first().copied();
     }
-    let mut best: Option<(u16, T)> = None;
+    let mut best = None;
     for &(media_type, format) in offers {
         let quality = ranges
             .iter()
@@ -149,15 +153,18 @@ pub fn negotiate<T: Copy>(accept: Option<&str>, offers: Offers<T>) -> Option<T> 
             .max_by_key(|&(specificity, _)| specificity)
             .map_or(0, |(_, quality)| quality);
         if quality > 0 && best.is_none_or(|(best, _)| quality > best) {
-            best = Some((quality, format));
+            best = Some((quality, (media_type, format)));
         }
     }
     best.map(|(_, format)| format)
 }
 
 /// [`negotiate`], or 406 naming what the endpoint can send.
-pub fn negotiated<T: Copy>(accept: Option<&str>, offers: Offers<T>) -> Result<T, ApiError> {
-    negotiate(accept, offers).ok_or_else(|| {
+pub fn negotiated<T: Copy>(
+    accept: Option<&str>,
+    offers: Offers<T>,
+) -> Result<(&'static str, T), ApiError> {
+    negotiate_offer(accept, offers).ok_or_else(|| {
         let mut names: Vec<&str> = offers.iter().map(|(media_type, _)| *media_type).collect();
         names.dedup();
         ApiError::not_acceptable(format!(

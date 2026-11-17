@@ -61,11 +61,13 @@ pub async fn execute_query_in(
         prepared.set_origin(origin);
     }
     // The query form decides which formats exist; an EXPLAIN is always JSON.
-    if explain == Explain::No {
-        let (solutions, graph) = negotiate_formats(prepared.kind(), accept)?;
+    let media_type = if explain == Explain::No {
+        let (solutions, graph, media_type) = negotiate_formats(prepared.kind(), accept)?;
         prepared.set_formats(solutions, graph);
-    }
-    let media_type = prepared.media_type();
+        media_type
+    } else {
+        prepared.media_type()
+    };
     let store = state.store();
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
@@ -345,12 +347,24 @@ pub async fn execute_update(
 fn negotiate_formats(
     kind: QueryResultKind,
     accept: Option<&str>,
-) -> Result<(SolutionsResultFormat, GraphResultFormat), ApiError> {
+) -> Result<(SolutionsResultFormat, GraphResultFormat, &'static str), ApiError> {
     let (solutions, graph) = (SolutionsResultFormat::Json, GraphResultFormat::NTriples);
     Ok(match kind {
-        QueryResultKind::Solutions => (negotiated(accept, SOLUTIONS)?, graph),
-        QueryResultKind::Boolean => (negotiated(accept, BOOLEAN)?, graph),
-        QueryResultKind::Graph => (solutions, negotiated(accept, GRAPHS)?),
+        QueryResultKind::Solutions | QueryResultKind::Boolean => {
+            let (media_type, format) = negotiated(
+                accept,
+                if kind == QueryResultKind::Boolean {
+                    BOOLEAN
+                } else {
+                    SOLUTIONS
+                },
+            )?;
+            (format, graph, media_type)
+        }
+        QueryResultKind::Graph => {
+            let (media_type, format) = negotiated(accept, GRAPHS)?;
+            (solutions, format, media_type)
+        }
     })
 }
 
@@ -378,7 +392,7 @@ mod tests {
 
     #[test]
     fn the_query_form_decides_which_formats_are_negotiated() {
-        let formats = |kind, accept| negotiate_formats(kind, accept).ok();
+        let formats = |kind, accept| negotiate_formats(kind, accept).ok().map(|(s, g, _)| (s, g));
         assert_eq!(
             formats(
                 QueryResultKind::Solutions,

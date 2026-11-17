@@ -454,7 +454,7 @@ async fn statements(
     state.ensure_serving()?;
     let pairs = pairs(&raw)?;
     let pattern = pattern(&pairs)?;
-    let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
+    let (media_type, format) = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let store = state.store();
     let (scope, infer) = (access.read_scope(), infer(&pairs));
     // Streamed as read: a whole repository in constant memory, for as long as the client
@@ -465,7 +465,7 @@ async fn statements(
     super::result_stream::stream_blocking(
         pace,
         cancellation,
-        format.media_type(),
+        media_type,
         "reading the statements exceeded the policy timeout",
         move |out| {
             let read = nrese_store::ReadContext::new(scope)
@@ -739,7 +739,10 @@ pub async fn graph_store_delete(
 /// or a proxy's `X-Forwarded-Host` and `X-Forwarded-Proto`): RDF4J's client follows a new
 /// transaction's `Location` as given and fails on a relative one ("Target host is not
 /// specified"). Without a host, the path alone.
-fn absolute(headers: &HeaderMap, path: &str) -> String {
+fn absolute(state: &AppState, headers: &HeaderMap, path: &str) -> String {
+    if let Some(url) = state.public_url() {
+        return format!("{}{path}", url.trim_end_matches('/'));
+    }
     let value = |name: &str| {
         headers
             .get(name)
@@ -836,7 +839,11 @@ pub async fn transaction_begin(
         .sessions()
         .begin(access.origin.as_deref())
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    let location = absolute(&headers, &format!("/repositories/{id}/transactions/{txid}"));
+    let location = absolute(
+        &state,
+        &headers,
+        &format!("/repositories/{id}/transactions/{txid}"),
+    );
     let mut response = StatusCode::CREATED.into_response();
     response.headers_mut().insert(
         header::LOCATION,

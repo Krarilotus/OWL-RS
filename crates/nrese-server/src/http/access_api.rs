@@ -604,6 +604,7 @@ struct Session {
 pub async fn login(
     State(state): State<AppState>,
     crate::http::authentication::ClientAddress(client): crate::http::authentication::ClientAddress,
+    headers: HeaderMap,
     bytes: Bytes,
 ) -> Result<Response, ApiError> {
     if !state.policy().local_logins {
@@ -630,7 +631,8 @@ pub async fn login(
             Err(ApiError::too_many_requests(message))
         }
         Err(nrese_store::access::AccessError::Busy(message)) => Err(ApiError::busy(message)),
-        Err(_) => Err(ApiError::unauthorized("wrong user name or password")),
+        Err(_) => Err(ApiError::unauthorized("wrong user name or password")
+            .with_challenge(state.policy().challenge(&headers))),
     }
 }
 
@@ -646,7 +648,10 @@ pub async fn logout(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .map(str::trim)
-        .ok_or_else(|| ApiError::unauthorized("no session token"))?;
+        .ok_or_else(|| {
+            ApiError::unauthorized("no session token")
+                .with_challenge(state.policy().challenge(&headers))
+        })?;
     match state.access().close_session(token) {
         true => Ok(axum::http::StatusCode::NO_CONTENT),
         false => Err(ApiError::not_found("no such session")),

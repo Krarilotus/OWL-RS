@@ -42,6 +42,8 @@ use store_env::parse_store_config;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub bind_address: SocketAddr,
+    /// The externally reachable server URL, including a reverse proxy's path prefix.
+    pub public_url: Option<String>,
     pub deployment_posture: DeploymentPosture,
     pub store: StoreConfig,
     pub reasoner: ReasonerConfig,
@@ -94,6 +96,12 @@ impl ServerConfig {
         };
         let lines = [
             ("server.bind_address", self.bind_address.to_string()),
+            (
+                "server.public_url",
+                self.public_url
+                    .clone()
+                    .unwrap_or_else(|| "(none)".to_owned()),
+            ),
             (
                 "server.deployment_posture",
                 self.deployment_posture.as_str().to_owned(),
@@ -283,6 +291,7 @@ impl ServerConfig {
 
         Ok(Self {
             bind_address,
+            public_url: source.get(names::PUBLIC_URL),
             deployment_posture,
             store,
             reasoner,

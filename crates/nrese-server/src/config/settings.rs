@@ -150,6 +150,13 @@ pub const SETTINGS: &[Setting] = &[
          needs authentication, replacement-grade also on-disk storage and problem+json parse \
          errors.",
     ),
+    setting(
+        "server.public_url",
+        names::PUBLIC_URL,
+        Text,
+        Unset::Nothing("unset, use the request host and forwarded headers"),
+        "Externally reachable server URL, including a reverse proxy path prefix.",
+    ),
     // [store]
     setting(
         "store.mode",

@@ -89,7 +89,7 @@ pub async fn validate(
     scope: nrese_store::ReadScope,
 ) -> Result<Response, ApiError> {
     state.ensure_serving()?;
-    let format = negotiated(accept_header_value(&headers), REPORTS)?;
+    let (_, format) = negotiated(accept_header_value(&headers), REPORTS)?;
     let mut request = request_from(raw_query.as_deref())?;
     if let Some(payload) = shapes {
         state.policy().enforce_rdf_upload_bytes(payload.len())?;

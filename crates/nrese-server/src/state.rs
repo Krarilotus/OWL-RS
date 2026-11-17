@@ -29,6 +29,8 @@ pub struct AppState {
 /// What [`AppState`] shares with its clones and every repository's state.
 #[derive(Clone)]
 struct Shared {
+    /// The server URL clients reach, including its proxy path prefix, if configured.
+    public_url: Option<String>,
     ready: Arc<AtomicBool>,
     ai: Arc<AiSuggestionService>,
     deployment_posture: DeploymentPosture,
@@ -91,6 +93,7 @@ impl AppState {
             policy: Arc::new(policy),
             repository: Arc::from(DEFAULT_REPOSITORY),
             shared: Arc::new(Shared {
+                public_url: None,
                 default_unavailable,
                 ready: Arc::new(AtomicBool::new(false)),
                 ai: Arc::new(ai),
@@ -304,6 +307,17 @@ impl AppState {
         &self.shared.replication
     }
 
+    /// Sets the externally reachable URL once at server startup.
+    pub fn with_public_url(mut self, public_url: Option<String>) -> Self {
+        Arc::make_mut(&mut self.shared).public_url = public_url;
+        self
+    }
+
+    /// The externally reachable server URL, if configured.
+    pub fn public_url(&self) -> Option<&str> {
+        self.shared.public_url.as_deref()
+    }
+
     pub fn store(&self) -> Arc<StoreService> {
         Arc::clone(self.pipeline.read().store())
     }
@@ -426,7 +440,12 @@ impl AppState {
         headers: &HeaderMap,
         client: Option<std::net::IpAddr>,
     ) -> Result<crate::auth::Authenticated, ApiError> {
-        match self.local_identity(headers, client).await? {
+        let challenged = |error: ApiError| error.with_challenge(self.policy.challenge(headers));
+        match self
+            .local_identity(headers, client)
+            .await
+            .map_err(challenged)?
+        {
             Some(mut identity) => {
                 let principal = crate::access::principal(&identity);
                 identity.admin = self.shared.access.state().is_admin(&principal);
@@ -441,7 +460,12 @@ impl AppState {
                     refusal: "the local login does not grant access to this endpoint",
                 })
             }
-            None => self.policy.auth.authenticate(headers).await,
+            None => self
+                .policy
+                .auth
+                .authenticate(headers)
+                .await
+                .map_err(challenged),
         }
     }
 
