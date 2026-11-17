@@ -100,13 +100,15 @@ impl WhyUndecided {
 }
 
 /// The fingerprint of `program` as the store runs it: leaving out unnamed classes'
-/// memberships is another closure.
+/// memberships is another closure. Its value changed when the program, not a rule's name,
+/// came to say whether those classes' members are things: every closure an older
+/// build left out memberships in is rebuilt once.
 pub(crate) fn fingerprint(
     program: &RuleProgram,
     hide_unnamed_classes: bool,
     compact_equality: bool,
 ) -> u64 {
-    const HIDDEN_UNNAMED_CLASSES: u64 = 0x5717_c1a5_5e5f_0007;
+    const HIDDEN_UNNAMED_CLASSES: u64 = 0x5717_c1a5_5e5f_0008;
     // Another form of the stack, not another closure; still not interchangeable.
     const COMPACT_EQUALITY: u64 = 0x0e9a_11c0_3a5c_0b02;
     program.fingerprint()

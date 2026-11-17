@@ -1367,7 +1367,7 @@ fn hidden_unnamed_classes_leave_the_rest_of_the_closure() {
                 let unnamed = UnnamedVocabulary::new(&mut vocabulary);
                 let names = vocabulary.clone();
                 let rules = ruleset.rules(&mut vocabulary).unwrap();
-                let things = rules.iter().any(|r| r.name == "scm-cls");
+                let things = super::unnamed::members_are_things(&ruleset.into()).unwrap();
                 let hidden = hidden_classes_in(
                     &input,
                     &unnamed,

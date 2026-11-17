@@ -161,6 +161,7 @@ impl StoreService {
         }
         let compiled = crate::reasoning::Program::compile(program, &|term| tx.intern(term))
             .hiding_unnamed_classes(config.hide_unnamed_classes)
+            .map_err(|interrupted| self.interruption_refusal(interrupted))?
             .by_representatives(config.equality_by_representatives)
             .storing_representatives(config.equality_compact);
         let report = self.operation_memory();
