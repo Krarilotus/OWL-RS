@@ -349,6 +349,12 @@ impl StoreService {
             outside_profile: std::sync::Arc::new(std::sync::RwLock::new(outside_profile)),
             last_materialisation: std::sync::Arc::default(),
         };
+        // Every store a replica server opens is a replica's from its open on, the default and
+        // the catalog's others alike: its `owl2-dl` mode interns no term (the default's
+        // dictionary continues the primary's), and its refusals say the replica's sentence.
+        if service.config.replica {
+            service.dl.set_replica();
+        }
         // The planner's statistics are the store's, shared by its requests: an envelope of
         // their own within the catalog's budget, exact (no request's credit: it lives as long
         // as the store).
@@ -972,13 +978,6 @@ impl StoreService {
         if let Some(state) = self.reasoning_state() {
             self.certify(&tx, state);
         }
-    }
-
-    /// Marks the store as a read replica: it follows a primary's log, whose dictionary
-    /// its own must continue, so the `owl2-dl` mode interns no term here (it reads the
-    /// terms the primary's records bring).
-    pub fn mark_replica(&self) {
-        self.dl.set_replica();
     }
 
     /// The `owl2-dl` mode's state.
