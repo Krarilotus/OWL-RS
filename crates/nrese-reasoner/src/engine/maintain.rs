@@ -1566,6 +1566,7 @@ mod tests {
             let program =
                 Program::compile(&crate::rulesets::Ruleset::Owl2Rl.into(), &|t| tx.intern(t))
                     .hiding_unnamed_classes(true)
+                    .unwrap()
                     .storing_representatives(true);
             tx.read_equality_as(program.same_as.map(TermId::from_raw));
             let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();

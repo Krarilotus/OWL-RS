@@ -35,6 +35,7 @@ mod reasoner_ttl_fixture_tests;
 mod replica_fail_closed_tests;
 mod repository_catalog_tests;
 mod restricted_evidence_tests;
+mod rule_names_tests;
 mod scope_tests;
 mod search_scope_tests;
 mod shacl_gate_tests;
