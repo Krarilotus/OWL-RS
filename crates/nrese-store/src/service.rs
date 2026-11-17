@@ -1369,9 +1369,6 @@ impl StoreService {
         }
         let (reads, decided) = (prepared.reads(), matches!(at, Revision::Decided(_)));
         if matches!(at, Revision::Pending(..)) {
-            if certificate.dl {
-                crate::dl::query::annotation_rule(&mut status, reads, "dl", Some(snapshot));
-            }
             crate::dl::query::negation_rule(&mut status, reads, source);
         } else if certificate.dl {
             crate::dl::query::certify(&mut status, reads, "dl", decided, Some(at.snapshot()));
