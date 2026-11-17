@@ -179,7 +179,9 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// path decides it by value; or where theorem PR1 doesn't hold, which needs no punning and
 /// no annotation-property axioms (`query::reads_differently` says what that costs); or
 /// unless a cardinality is spelled otherwise than the rules name it
-/// (`Ontology::noncanonical_cardinality`), so they wouldn't read it.
+/// (`Ontology::noncanonical_cardinality`), so they wouldn't read it. Its callers also leave
+/// the route where the closure leaves out a list axiom (`StoreService::lists_left_out`): the
+/// rules lack that axiom's conclusions, and PR1's premise doesn't hold.
 fn routed_to_rules(ontology: &Ontology) -> bool {
     nrese_owl::profile::of_ontology(ontology).rl
         && nrese_owl::ql::reads_data_values(ontology).is_none()
@@ -371,8 +373,14 @@ pub(crate) struct Preparation {
 
 /// Prepares U1 for the commit `tx` (after the RL reasoning applied its changes): the
 /// change by the delta executor where only assertions over U1's signature changed, else
-/// U1 afresh. Cost: the change's, or the closure's on a rebuild.
-pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>) -> Preparation {
+/// U1 afresh. Cost: the change's, or the closure's on a rebuild. `lists_left_out`: whether
+/// the closure the commit leaves leaves out a list axiom (then never the RL route).
+pub(crate) fn prepare(
+    store: &StoreService,
+    tx: &Transaction<'_>,
+    stop: Stop<'_>,
+    lists_left_out: bool,
+) -> Preparation {
     let base = tx.base().revision();
     let pending = tx.pending_snapshot();
     let deadline = Deadline::after(store.config().dl.timeout);
@@ -399,6 +407,7 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
     // On the RL route, a commit that gives no term a new kind leaves what the reader reads,
     // and so the route, as they were; any other is read again below.
     if let Some((Some(kinds), _)) = &current
+        && !lists_left_out
         && tx.inserted().all(|q| kinds.keep(tx, quad_triple(q), false))
         && tx.deleted().all(|q| kinds.keep(tx, quad_triple(q), true))
     {
@@ -486,7 +495,8 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
             ontology: None,
         };
     };
-    if routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal()) {
+    let fatal = ontology.diagnostics.iter().any(|d| d.is_fatal());
+    if routed_to_rules(&ontology) && !fatal && !lists_left_out {
         // The RL gate that ran before has decided the commit's consistency.
         let lookup = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
         return Preparation {
@@ -911,7 +921,8 @@ fn afresh(
         Ok(ontology) => ontology,
         Err(_) => return (Err(GaveUp::refused(source::refused("the revision"))), None),
     };
-    if routed_to_rules(&ontology) && ontology.diagnostics.iter().all(|d| !d.is_fatal()) {
+    let fatal = ontology.diagnostics.iter().any(|d| d.is_fatal());
+    if routed_to_rules(&ontology) && !fatal && !store.lists_left_out(snapshot) {
         let lookup =
             |iri: &str| snapshot.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
         return (Err(not_compiled()), Some(Kinds::of(&ontology, &lookup)));
