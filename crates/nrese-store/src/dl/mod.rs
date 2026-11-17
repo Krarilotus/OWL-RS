@@ -75,7 +75,8 @@ pub struct Dl {
     /// The reasoner runs user rules besides OWL 2 RL: their conclusions from OWL 2 DL's
     /// entailments aren't computed, so no answer is claimed complete.
     user_rules: AtomicBool,
-    /// A read replica: the DL engines intern no term here ([`source::resolve`]).
+    /// A read replica: the DL engines intern no term here ([`source::resolve`]). Set at the
+    /// store's open, from [`crate::StoreConfig::replica`].
     replica: AtomicBool,
     status: Mutex<Option<DlStatus>>,
     pub(crate) classification: classification::Cache,
@@ -98,7 +99,7 @@ impl Dl {
         self.replica.store(true, Ordering::Release);
     }
 
-    /// Whether the store is a read replica ([`crate::StoreService::mark_replica`]).
+    /// Whether the store is a read replica ([`crate::StoreConfig::replica`]).
     pub fn replica(&self) -> bool {
         self.replica.load(Ordering::Acquire)
     }
