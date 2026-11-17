@@ -225,6 +225,14 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
     if matches!(query, Query::Describe { .. }) {
         analysis.not_monotone = Some("DESCRIBE");
     }
+    // An ASK's projection, the parser's `SELECT *` under a `LIMIT` or `OFFSET` if any (an ASK
+    // has no `DISTINCT`), returns no variable ([`answer_variables`]): the walk passes it to
+    // `reaching` by no other name than its address, as one starting under it would skip the
+    // slice above it.
+    let mut ask = matches!(query, Query::Ask { .. }).then_some(pattern);
+    while let Some(GraphPattern::Slice { inner, .. }) = ask {
+        ask = Some(inner);
+    }
     pattern.find(&mut |node| {
         match node {
             Node::Pattern(p) => {
@@ -270,7 +278,9 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
                     }
                     _ => not_monotone(p),
                 };
-                reaching(p, &mut analysis.reaching);
+                if !ask.is_some_and(|a| std::ptr::eq(a, p)) {
+                    reaching(p, &mut analysis.reaching);
+                }
                 if analysis.not_monotone.is_none() {
                     analysis.not_monotone = op;
                 }
