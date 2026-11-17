@@ -109,6 +109,12 @@ impl Terms for Table {
             .copied()
     }
 
+    // Not given, though the table holds it: the cases' profile labels are compared with every
+    // literal's datatype unknown (giving it would change what the profile test checks).
+    fn datatype(&self, _: Term) -> Option<String> {
+        None
+    }
+
     fn iri_text(&self, term: Term) -> Option<String> {
         match &self.terms[term as usize] {
             RdfTerm::NamedNode(n) => Some(n.as_str().to_owned()),
