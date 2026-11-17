@@ -6,11 +6,11 @@ use std::sync::Arc;
 
 use nrese_sparql::GraphAccess;
 use nrese_store::{
-    DlAnswers, DlConfig, MutationPipeline, ReadScope, SparqlQueryRequest, StoreError,
+    DlAnswers, DlConfig, MutationPipeline, ReadScope, SparqlQueryRequest, StoreConfig, StoreError,
 };
 
 use super::queries::query;
-use super::{PREFIXES, insert, pipeline, pipeline_with};
+use super::{PREFIXES, insert, pipeline, pipeline_of, pipeline_with};
 
 const UNION: &str = ":A rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . :B rdfs:subClassOf :D . \
      :C rdfs:subClassOf :D . :x a :A . :y a :B . :w a [ owl:unionOf ( :B :C ) ] .";
@@ -149,9 +149,11 @@ fn dl_answers_derive_nothing_from_graphs_the_reader_cannot_read() {
 /// and says `not-certified`.
 #[test]
 fn a_replica_interns_nothing_and_says_not_certified() {
-    let dl = pipeline();
+    let dl = pipeline_of(StoreConfig {
+        replica: true,
+        ..crate::support::in_memory_store_config()
+    });
     crate::support::load_past_the_pipeline(dl.store(), &format!("{PREFIXES}\n{UNION}"));
-    dl.store().mark_replica();
     let terms = dl.store().engine_stats().dictionary.terms;
     let (rows, status) = query(&dl, "SELECT ?x { ?x a :D }");
     assert_eq!(
