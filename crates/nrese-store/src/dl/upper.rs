@@ -268,7 +268,9 @@ fn pattern([s, p, o]: [Option<u64>; 3]) -> QuadPattern {
 /// over data values match equal values written differently (`"07"` and `"7"` as
 /// `xsd:integer`, `"7"^^xsd:integer` and `"7.0"^^xsd:decimal`), as OWL 2 DL does: without
 /// it, U1 would miss what such an equality entails and stop being an upper bound. A
-/// literal whose value can't be read (ill-typed, beyond the value spaces) is its own.
+/// literal whose value can't be read (ill-typed, outside the map, beyond the value spaces)
+/// is its own, and U1 then proves no consistency: an equal value written otherwise would be
+/// a join it misses ([`Upper::proves_consistency`], [`Upper::reads_every_value`]).
 /// Representatives are ids the store has already: nothing is interned (replicas too).
 #[derive(Debug, Default)]
 pub(crate) struct Values {
@@ -279,6 +281,8 @@ pub(crate) struct Values {
     by_value: HashMap<nrese_xsd::owl::Value, u64>,
     /// Literals already read.
     seen: HashSet<u64>,
+    /// A compared literal's value couldn't be read.
+    unread: bool,
 }
 
 impl Values {
@@ -288,6 +292,7 @@ impl Values {
             return;
         }
         let Some(value) = value_of(view, id) else {
+            self.unread = true;
             return;
         };
         match self.by_value.entry(value) {
@@ -341,6 +346,7 @@ impl Values {
         }
         self.by_value.extend(noted.by_value);
         self.seen.extend(noted.seen);
+        self.unread |= noted.unread;
     }
 }
 
@@ -361,6 +367,7 @@ impl Noting<'_> {
             return;
         }
         let Some(value) = value_of(view, id) else {
+            self.added.unread = true;
             return;
         };
         let known = self.base.by_value.get(&value);
@@ -1084,7 +1091,13 @@ impl Upper {
     /// Whether U1 proves the ontology consistent (PAGOdA, Theorem 5.5 (i)): no clash, and
     /// U1 checks every `⊥` ([`bounds::Program::proves_consistency`]).
     pub fn proves_consistency(&self) -> bool {
-        self.program.proves_consistency() && self.clashes() == 0
+        self.program.proves_consistency() && self.clashes() == 0 && !self.values.unread
+    }
+
+    /// Whether U1 and `change` read the value of every literal its rules compare: else a
+    /// clash-free U1 proves nothing ([`Values`]).
+    pub fn reads_every_value(&self, change: &Change) -> bool {
+        !self.values.unread && !change.noted.unread
     }
 
     /// U1's `owl:sameAs` classes: its stack is over their representatives, each other
