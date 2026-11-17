@@ -150,6 +150,16 @@ leave something out.
   `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
   annotation property's domain, range, super-property or sub-property, or give the individual its own
   IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
+- Under `owl2-dl`, an ontology with a part the reader leaves out (such as a reserved name
+  used as a class or individual, OWL's vocabulary outside the mapping's forms, a malformed
+  structure or list) is never told consistent: every verdict but an inconsistency is
+  `unknown`, and every answer is `unsound`, since the OWL 2 RL rules may still read those
+  statements. The reason gives how many parts were left out and the kind of the first, not
+  which axiom it is; no log or endpoint names it yet. A read inside a transaction is told what
+  was left out of the revision it began on, so an addition still pending that would be left
+  out may be told `sound-only` until it is committed
+  ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
+  Remove such statements, or use `owl2-rl`, whose promise is the rules' reading.
 - An undeclared property used with literal values is read as a data property. Declare
   annotation properties other than the built-in ones, such as `skos:prefLabel`
   (`skos:prefLabel a owl:AnnotationProperty`);
