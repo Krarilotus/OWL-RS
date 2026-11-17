@@ -10,8 +10,8 @@ status that says whether rows may be missing.
   Protocol and RDF4J's protocol over HTTP, and a browser console.
 - It takes one writer at a time, and the data must fit one machine: read replicas follow it,
   but nothing fails over or partitions the data ([limits](docs/limits.md)).
-- These pages describe version 1.5, not yet released, which the [quick start](#quick-start)
-  builds from the branch `refactor/engine-v2`; `main` holds the earlier version.
+- These pages describe the 1.5 prerelease, tagged `v1.5.0-pre.1`, which the
+  [quick start](#quick-start) builds.
 
 ## What it does
 
@@ -66,7 +66,7 @@ no Rust or Node.js, and the first build takes several minutes. The image targets
 Neoverse N1 CPUs; on an older CPU, add `--build-arg NRESE_TARGET_CPU=portable` to `docker build`.
 
 ```bash
-git clone --branch refactor/engine-v2 https://github.com/Krarilotus/OWL-RS.git
+git clone https://github.com/Krarilotus/OWL-RS.git
 cd OWL-RS
 docker build -t nrese .
 docker run -d --name nrese -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/data \
