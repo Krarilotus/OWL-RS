@@ -4,6 +4,7 @@ mod bounds;
 mod cache_admission;
 pub(crate) mod classification;
 mod consistency;
+mod datatypes;
 mod entailment;
 mod explain;
 mod gap;
