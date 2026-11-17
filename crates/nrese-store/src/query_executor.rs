@@ -9,7 +9,7 @@
 //! in its chunked join and grouping loops, and here on every result row.
 
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering::Relaxed};
+use std::sync::OnceLock;
 
 use nrese_engine::ReadModel;
 
@@ -113,7 +113,7 @@ pub struct PreparedQuery {
     /// Whether what its reader reads holds a triple term, decided by its run on that view
     /// ([`Self::announce_on`]); shared by its clones, so a transport that keeps one reads
     /// the run's decision.
-    holds_rdf12: std::sync::Arc<AtomicBool>,
+    holds_rdf12: std::sync::Arc<OnceLock<bool>>,
     /// Under `owl2-dl`: which answers this query asks for (`None`: `dl.answers`).
     dl_answers: Option<crate::DlAnswers>,
     /// Told when the query is handed to the executor ([`Self::on_evaluation`]).
@@ -264,14 +264,14 @@ impl PreparedQuery {
     pub(crate) fn announce_on(&self, view: &nrese_engine::Snapshot) {
         let access = self.access.as_deref();
         let read = |graph| access.is_none_or(|a| a.allows_id(view, graph));
-        let holds = view.holds_triple_terms(self.read_model, read);
-        self.holds_rdf12.store(holds, Relaxed);
+        let holds = || view.holds_triple_terms(self.read_model, read);
+        self.holds_rdf12.get_or_init(holds);
     }
 
     /// Whether the results announce RDF 1.2: the query uses it, or its run found a triple
     /// term in what its reader reads.
     fn announced(&self) -> bool {
-        self.rdf12 || self.holds_rdf12.load(Relaxed)
+        self.rdf12 || self.holds_rdf12.get() == Some(&true)
     }
 
     /// Pins the query's result in the result cache under `name` when it runs: kept while
