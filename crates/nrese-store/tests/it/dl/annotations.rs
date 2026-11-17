@@ -11,10 +11,11 @@ use std::sync::Arc;
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 use nrese_sparql::{Completeness, GraphAccess};
 use nrese_store::{
-    CancellationToken, MutationPipeline, ReadScope, SparqlQueryRequest, StoreConfig, StoreService,
+    CancellationToken, MutationPipeline, ReadScope, SparqlQueryRequest, StatementOp, StoreConfig,
+    StoreService,
 };
 
-use super::versions::in_transaction;
+use super::versions::{in_transaction, ntriples};
 use super::{PREFIXES, insert, pipeline, pipeline_of};
 
 /// `q` (with [`PREFIXES`]) on `store` for a reader of every graph: its answer as written
@@ -102,6 +103,11 @@ fn a_copied_annotation_read_is_unsound_on_every_owl2_dl_path() {
     };
     let token = CancellationToken::new();
     let implicit = "SELECT ?s ?o FROM <http://www.ontotext.com/implicit> { ?s :note ?o }";
+    // One pending addition the read doesn't touch: the read is pending, and nothing deleted.
+    let unrelated = StatementOp::Add {
+        data: ntriples("<http://example.com/z> <http://example.com/r> <http://example.com/w> ."),
+        contexts: Vec::new(),
+    };
     let paths = [
         (
             "explain",
@@ -121,7 +127,10 @@ fn a_copied_annotation_read_is_unsound_on_every_owl2_dl_path() {
             "the closure alone",
             store.status_without_dl(&prepare(implicit)),
         ),
-        ("in a transaction", in_transaction(&dl, Vec::new(), q).1),
+        (
+            "in a transaction",
+            in_transaction(&dl, vec![unrelated], q).1,
+        ),
     ];
     let mut wrong: Vec<String> = paths
         .into_iter()
@@ -139,29 +148,57 @@ fn a_copied_annotation_read_is_unsound_on_every_owl2_dl_path() {
 }
 
 /// Spec (docs/spec/reasoning-semantics.md:86, a restricted reader's status says nothing about
-/// graphs they can't read; the ruling of 19:39, condition 1): with the declaration of `:note` in
-/// a graph the reader can't read and the statement and the equality in the default graph, a
-/// read of `:note` is neither `complete` nor `sound-only`.
+/// graphs they can't read; the master's ruling of 20:49, point 3): under `owl2-dl` a reader of
+/// some graphs is told `not-certified` (the redaction), and the same with `:note`'s
+/// declaration in a graph it can't read as without the declaration: status and reasons alike.
 #[test]
-fn a_reader_who_cant_see_the_declaration_is_not_told_a_copy_is_sound() {
-    let dl = pipeline();
-    let data =
-        "GRAPH :hidden { :note a owl:AnnotationProperty } :x :note \"a\" . :x owl:sameAs :y .";
-    insert(&dl, data).expect("the data");
+fn a_reader_who_cant_see_the_declaration_is_told_as_without_it() {
     let reader = ReadScope::Graphs(Arc::new(GraphAccess {
         default_graph: true,
         inferred: true,
         ..GraphAccess::default()
     }));
-    let request =
-        SparqlQueryRequest::new(format!("{PREFIXES}SELECT ?s ?o {{ ?s :note ?o }}"), reader);
-    let result = dl.store().execute_query(&request).expect("query");
-    let rows = String::from_utf8(result.payload).expect("utf8");
-    assert!(
-        rows.contains("http://example.com/y"),
-        "setup: no copy seen: {rows}"
+    let told = |declaration: &str| {
+        let dl = pipeline();
+        let data = format!("{declaration} :x :note \"a\" . :x owl:sameAs :y .");
+        insert(&dl, &data).expect("the data");
+        let q = format!("{PREFIXES}SELECT ?s ?o {{ ?s :note ?o }}");
+        let request = SparqlQueryRequest::new(q, reader.clone());
+        let result = dl.store().execute_query(&request).expect("query");
+        let rows = String::from_utf8(result.payload).expect("utf8");
+        assert!(
+            rows.contains("http://example.com/y"),
+            "setup: no copy seen: {rows}"
+        );
+        result.completeness.expect("a status").header()
+    };
+    let hidden = told("GRAPH :hidden { :note a owl:AnnotationProperty }");
+    assert_eq!(hidden, "not-certified");
+    assert_eq!(
+        hidden,
+        told(""),
+        "told otherwise than without the declaration"
     );
-    let status = result.completeness.expect("a status");
+}
+
+/// Spec (OWL 2 Structural Specification §5.8.1: `rdf:type` is reserved vocabulary, no entity;
+/// Direct Semantics: a class assertion's copy through an equality is entailed; the master's
+/// ruling of 20:49, point 4): with `rdf:type` declared an annotation property beside an
+/// equality, the reader leaves the declaration out, and `?x a :C` isn't told `complete` or
+/// `sound-only` on the strength of the rules' route.
+#[test]
+fn rdf_type_declared_an_annotation_property_is_not_read_as_one() {
+    let dl = pipeline();
+    let data = format!(
+        "{PREFIXES}<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> a owl:AnnotationProperty . \
+         :x a :C . :x owl:sameAs :y ."
+    );
+    crate::support::load_past_the_pipeline(dl.store(), &data);
+    let program = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl).materialised_program();
+    dl.store()
+        .rematerialise(program.expect("the rules"))
+        .expect("rebuilt");
+    let (_, status) = told(dl.store(), "SELECT ?x { ?x a :C }");
     let class = status.as_str();
     assert!(
         class != "complete" && class != "sound-only",
