@@ -326,7 +326,7 @@ pub(crate) fn refused_or(error: StoreError, otherwise: fn(String) -> ApiError) -
 pub async fn execute_update(
     state: AppState,
     operation: UpdateOperation,
-    requester: nrese_store::Requester,
+    access: &crate::access::AccessView,
 ) -> Result<StatusCode, ApiError> {
     state
         .policy()
@@ -337,7 +337,7 @@ pub async fn execute_update(
     mutation::run(
         &state,
         MutationCommand::Update(request),
-        requester,
+        access,
         state.policy().timeouts.update,
         "update execution exceeded policy timeout",
     )

@@ -203,7 +203,10 @@ impl AppState {
     /// What `identity` may read and write in this state's repository.
     pub fn access_view(&self, identity: &crate::auth::Identity) -> crate::access::AccessView {
         let principal = crate::access::principal(identity);
-        let mut view = self.shared.access.view(&principal, &self.repository);
+        let mut view = self
+            .shared
+            .access
+            .view_checked(&principal, &self.repository);
         view.origin = Some(principal.display());
         view
     }

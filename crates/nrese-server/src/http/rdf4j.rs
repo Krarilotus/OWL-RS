@@ -187,7 +187,7 @@ pub(crate) async fn apply(
     mutation::run(
         state,
         MutationCommand::Statements(StatementsRequest::new(ops)),
-        access.requester(),
+        access,
         state.policy().timeouts.update,
         "statement operation exceeded policy timeout",
     )

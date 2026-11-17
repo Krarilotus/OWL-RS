@@ -86,6 +86,7 @@ pub async fn restore(
     state: AppState,
     headers: HeaderMap,
     body: Bytes,
+    rights: Option<nrese_store::access::RightsCheck>,
 ) -> Result<Response, ApiError> {
     state.ensure_serving()?;
     let format = parse_restore_format(headers.get(header::CONTENT_TYPE))?;
@@ -98,8 +99,12 @@ pub async fn restore(
     let result = mutation::run(
         &state,
         MutationCommand::Restore(request),
-        // Administrators only (the caller's guard): every graph.
-        nrese_store::Requester::all(),
+        // Administrators only (the caller's guard, checked again where it publishes): every
+        // graph.
+        &crate::access::AccessView {
+            rights,
+            ..crate::access::AccessView::unrestricted()
+        },
         state.policy().timeouts.update,
         "dataset restore exceeded policy timeout",
     )

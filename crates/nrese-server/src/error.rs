@@ -54,6 +54,10 @@ pub enum ApiError {
     /// Busy for now: 503 with `Retry-After`, to be tried again shortly.
     #[error("busy: {0}")]
     Busy(String),
+    /// The requester's rights changed while its write waited: 503 with `Retry-After`, type
+    /// `rights-changed`; sent again, it is judged under the new rights.
+    #[error("rights changed: {0}")]
+    RightsChanged(String),
     #[error("internal server error: {0}")]
     Internal(String),
 }
@@ -172,8 +176,21 @@ impl IntoResponse for ApiError {
                 }),
             );
         }
-        if let Self::Busy(detail) = self {
-            let mut response = Self::ServiceUnavailable(detail).into_response();
+        let rights_changed = matches!(self, Self::RightsChanged(_));
+        if let Self::Busy(detail) | Self::RightsChanged(detail) = self {
+            let mut response = match rights_changed {
+                false => Self::ServiceUnavailable(detail).into_response(),
+                true => problem(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    &ProblemJson {
+                        r#type: Cow::Borrowed("https://nrese.dev/problems/rights-changed"),
+                        title: Cow::Borrowed("Rights Changed"),
+                        status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                        detail,
+                        reasoner_reject: None,
+                    },
+                ),
+            };
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -198,7 +215,10 @@ impl IntoResponse for ApiError {
             Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
             Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
             Self::Conflict(detail) => (StatusCode::CONFLICT, detail, None),
-            Self::IncompleteAnswer(_) | Self::Busy(_) | Self::NotImplemented(..) => {
+            Self::IncompleteAnswer(_)
+            | Self::Busy(_)
+            | Self::NotImplemented(..)
+            | Self::RightsChanged(_) => {
                 unreachable!("answered above")
             }
             Self::Gone(detail) => (StatusCode::GONE, detail, None),

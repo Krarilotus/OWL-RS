@@ -32,6 +32,10 @@ pub enum MutationError {
     /// sent again.
     #[error("the repository was reconfigured while the write waited; send it again")]
     Retired,
+    /// The requester's rights changed while the write waited or ran: nothing was published.
+    /// Sent again, it is judged under the new rights.
+    #[error("the requester's rights changed while the write waited; send it again")]
+    RightsChanged,
 }
 
 // Every write's result carries this error. Clippy's `result_large_err` stops the gate at 128

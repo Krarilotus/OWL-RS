@@ -456,6 +456,8 @@ impl MutationPipeline {
             if let Some(certificate) = tx.base().certificate().cloned() {
                 tx.vouch(certificate);
             }
+            // Its rights hold through the publication only (contracts.md, lock order).
+            let rights = ticket.hold_rights()?;
             let summary = match ql {
                 Some(ql) => ql.commit(tx),
                 None => tx.commit(),
@@ -464,6 +466,7 @@ impl MutationPipeline {
                 kind,
                 source: StoreError::Engine(error),
             })?;
+            drop(rights);
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
             }
@@ -526,10 +529,12 @@ impl MutationPipeline {
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
         }
+        let rights = ticket.hold_rights()?;
         let summary = tx.commit().map_err(|error| MutationError::Store {
             kind,
             source: StoreError::Engine(error),
         })?;
+        drop(rights);
         Ok(report.committed(summary.revision))
     }
 

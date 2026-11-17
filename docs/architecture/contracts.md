@@ -109,6 +109,13 @@ commit converts the stack, the compaction slot held: it takes no lock and calls 
 compaction, checkpoints and the served log for its length (quarantine readmissions only). State that changes only between commits takes a
 `WriterHeld` proof (the store's reasoning certificate: `StoreService::invalidate_held`, `record_reasoning` under `Rematerialisation::finish_held`).
 
+A write publishes only with the rights it was evaluated with. Its read guard on the access state (`AccessControl`'s `state`, `RightsCheck::hold` in
+`crates/nrese-store/src/access/control.rs`) is taken just before the engine's `commit()` and dropped when it returns (`MutationPipeline::apply`): the dataset's
+writer slot and the pipeline's ground cache → the access state's read guard → the engine's commit locks. `AccessControl::apply` waits for the write
+side holding only its `writer` mutex, its system-store commit (another engine) done, so it and the guard's holder never wait on each other; the holder
+takes nothing of access control's and never reads the state again (a read queued behind `apply` would wait for itself), and no Rayon task reads it.
+`apply` waits for one publication step at most: MEASURED behind a commit that merges the largest inline window (32 Ki entries).
+
 A version's own slots (`OwnSlots`, `crates/nrese-engine/src/engine/snapshot/own_state.rs:92`) have a leaf lock: held only to look a
 value up or store one (:102), never while a value is made or dropped, and nothing is taken while it is held. `make` runs unlocked, so it may read
 the snapshot and its other slots. The engine takes it under none of its own locks: an installed version is a value no snapshot held

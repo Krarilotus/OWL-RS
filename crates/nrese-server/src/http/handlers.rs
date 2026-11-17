@@ -157,8 +157,9 @@ pub async fn admin_restore_dataset(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    guard::enforce_admin_write(&state, &authenticated).await?;
-    admin_dataset::restore(state, headers, body).await
+    let identity = guard::enforce_admin_write(&state, &authenticated).await?;
+    let rights = guard::view(&state, &identity).rights;
+    admin_dataset::restore(state, headers, body, rights).await
 }
 
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
@@ -256,7 +257,7 @@ pub async fn update_post(
         headers.get(header::CONTENT_TYPE),
         &body,
     )?;
-    sparql::execute_update(state, operation, access.requester()).await
+    sparql::execute_update(state, operation, &access).await
 }
 
 /// `GET` on the combined SPARQL endpoint: a query, or without one the service description
@@ -300,7 +301,7 @@ pub async fn sparql_post(
         }
         SparqlOperation::Update(operation) => {
             let access = guard::update_access(&state, &authenticated).await?;
-            sparql::execute_update(state, operation, access.requester())
+            sparql::execute_update(state, operation, &access)
                 .await
                 .map(IntoResponse::into_response)
         }

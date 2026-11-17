@@ -37,7 +37,7 @@ use nrese_rdf::GraphName;
 use nrese_sparql::GraphAccess;
 use serde::{Deserialize, Serialize};
 
-pub use control::{AccessControl, ChangeRecord, HISTORY_GRAPH, STATE_GRAPH};
+pub use control::{AccessControl, ChangeRecord, HISTORY_GRAPH, RightsCheck, STATE_GRAPH};
 pub use login::{LoginLimits, SESSION_PREFIX, hash_password, verify_password};
 pub use queries::{QUERIES_GRAPH, QueryDraft, SavedQuery};
 
@@ -269,6 +269,8 @@ pub struct AccessView {
     pub write: Option<Arc<GraphAccess>>,
     /// Who the view is for (a user name, else roles), for logs and running queries.
     pub origin: Option<String>,
+    /// What checks its rights again where a write publishes, if anything does.
+    pub rights: Option<RightsCheck>,
 }
 
 impl AccessView {
@@ -680,6 +682,7 @@ impl AccessState {
             read: Some(Arc::new(read)),
             write: Some(Arc::new(write)),
             origin: None,
+            rights: None,
         }
     }
 
