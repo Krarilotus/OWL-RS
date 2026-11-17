@@ -976,10 +976,11 @@ const IN_H: &str = "SELECT ?x { ?x a :H }";
 /// Under `owl2-dl` a store leaves quarantine at the revision its repair published: the
 /// revalidation after the repair changes no rows, so it keeps the revision, and the bounds
 /// keep a view per revision. A read between the publication and the revalidation (the store
-/// still in quarantine) builds and keeps that revision's view; it and the read after the
-/// revalidation are told what the same data, loaded clean, are told.
+/// still in quarantine) builds and keeps that revision's view and is told the store is in
+/// quarantine; the read after the revalidation is told what the same data, loaded clean, are
+/// told.
 #[test]
-fn a_store_leaving_quarantine_at_a_kept_views_revision_is_told_what_clean_data_are() {
+fn a_store_leaving_quarantine_is_not_complete_until_revalidated_then_as_clean_data() {
     let rules = || {
         ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
             .materialised_program()
@@ -1016,7 +1017,12 @@ fn a_store_leaving_quarantine_at_a_kept_views_revision_is_told_what_clean_data_a
     clean.rematerialise(rules()).expect("rebuilt");
     let clean = status(&clean, IN_H);
     let (revision, quarantined, during) = kept.lock().unwrap().take().expect("the hook ran");
-    assert_eq!((&during, &after), (&clean, &clean));
+    let told = "sound-only; regime=owl2-dl; reasons=\"dl: the store is in quarantine (the \
+                consistency rules found violations and have not found the data clean since); \
+                inconsistent data entail every answer, so no read is certified complete until \
+                it leaves\"";
+    assert_eq!(during, told, "the window");
+    assert_eq!(after, clean);
     assert!(
         quarantined,
         "the setup: the read in between saw no quarantine"
