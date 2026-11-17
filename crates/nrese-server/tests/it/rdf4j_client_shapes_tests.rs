@@ -508,18 +508,18 @@ async fn wrong_basic_challenge(
         body,
     )
     .await;
-    assert!(
-        headers
-            .get_all("www-authenticate")
-            .iter()
-            .any(|v| v.to_str().unwrap().split(',').any(|s| s
-                .trim()
-                .split_whitespace()
+    let basic = headers.get_all("www-authenticate").iter().any(|v| {
+        v.to_str().unwrap().split(',').any(|s| {
+            s.split_whitespace()
                 .next()
-                .is_some_and(|s| s.eq_ignore_ascii_case("Basic")))),
-        "RFC 9110 requires a Basic challenge for a refused local login; got {headers:?}"
+                .is_some_and(|s| s.eq_ignore_ascii_case("Basic"))
+        })
+    });
+    assert_eq!(
+        (status, basic),
+        (StatusCode::UNAUTHORIZED, true),
+        "RFC 9110 requires 401 with a Basic challenge for a refused local login; got {headers:?}: {text}"
     );
-    assert_eq!(status, StatusCode::UNAUTHORIZED, "{text}");
 }
 
 macro_rules! refused_basic {
@@ -784,6 +784,20 @@ async fn export_clear_import_asserts_former_inferences_and_preserves_blank_nodes
         );
         let exported = export(&app, true).await;
         let visible = dataset(&exported, RdfFormat::TriG);
+        let mut structure: Dataset = visible
+            .iter()
+            .filter(|q| {
+                matches!(
+                    q.predicate.as_str(),
+                    "urn:list"
+                        | "urn:p"
+                        | "http://www.w3.org/1999/02/22-rdf-syntax-ns#first"
+                        | "http://www.w3.org/1999/02/22-rdf-syntax-ns#rest"
+                )
+            })
+            .collect();
+        structure.canonicalize();
+        assert_eq!(structure, dataset(MIXED, RdfFormat::TriG));
         for q in dataset("<urn:entity> a <urn:D> .", RdfFormat::TriG).iter() {
             assert!(visible.contains(q));
         }
@@ -816,6 +830,17 @@ async fn transaction_query_applies_infer_false_and_the_protocol_default_graph() 
         let before = dataset(&export(&app, false).await, RdfFormat::TriG);
         let location = begin(&app).await;
         update(&app, &format!("{location}?action=UPDATE"), "DELETE DATA { GRAPH <urn:g1> { <urn:old> <urn:p> 1 } }; INSERT DATA { GRAPH <urn:g1> { <urn:new> <urn:p> 3 } }").await;
+        for (suffix, expected) in [("", true), ("&infer=false", false)] {
+            assert_eq!(
+                query(
+                    &app,
+                    &format!("{location}?action=QUERY{suffix}"),
+                    "ASK { <urn:entity> a <urn:D> }"
+                )
+                .await["boolean"],
+                expected
+            );
+        }
         let result = query(
             &app,
             &format!("{location}?action=QUERY&infer=false&default-graph-uri=urn%3Ag1"),
