@@ -11,6 +11,9 @@ come with. What is in is on
 - You need automatic failover, or data spread over several machines. Read replicas
   follow a primary's log, but nothing promotes a replica or partitions the data
   ([replication](ops/replication.md)).
+- You need reasoned answers on a replica that say whether rows may be missing. A replica's
+  reasoned reads say `not-certified`, and a primary under `reasoner.equality = "compact"`
+  serves no replica ([replication](ops/replication.md#limits-of-this-first-step)).
 - You need named graphs as separate reasoning contexts. Rules read every graph, and
   inferences go to the default graph ([graph scope](spec/reasoning-semantics.md#graph-scope)).
 - You need every OWL 2 DL answer proven complete. Some answers are `sound-only`, which

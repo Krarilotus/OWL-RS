@@ -68,6 +68,21 @@ primary, only bulk loads and rematerialisations send replicas back to an image.
 
 ## Limits of this first step
 
+- A replica serves its primary's statements without its primary's reasoning certificate:
+  its reasoned reads say `not-certified`, under `dl.answers = "exact"` they are refused,
+  and its consistency reads `unknown`. This holds from its start on, also after a rebuild of
+  its inferences or a change of its settings.
+- A primary under `reasoner.equality = "compact"`, with a ruleset that reasons with
+  `owl:sameAs`, serves no replica in this release. It answers the log and the image with
+  `409` and a sentence that says so, also where the log no longer holds the records. A
+  replica shows the refusal as `last_error` in its status and asks again, about once a
+  minute; one with an empty data directory doesn't start. A primary for replicas keeps the
+  default, `representatives`.
+- A replica started over a data directory restored from such a primary's backup takes no
+  image: its reasoned reads say `not-certified` and may miss rows, and the primary's refusal
+  shows only in its status. Don't start a replica over such a backup.
+- On a replica, a reader of only some graphs is refused a read of the stored statements
+  alone, though it could be answered.
 - A replica isn't promoted automatically. To promote one, stop it, set
   `replication.mode = "primary"` (or `"off"`), and point the writers and the other replicas
   at it.
@@ -75,6 +90,6 @@ primary, only bulk loads and rematerialisations send replicas back to an image.
   the records it applies, not incrementally.
 - A replica doesn't yet take a new image by itself when the log no longer
   serves it.
-- A replica computes no inferences, so it keeps a closure an older
-  build's maintenance wrote; after upgrading to reasoning semantics 3, start it again from an
-  empty data directory.
+- A replica computes no inferences, so it keeps a closure an older build wrote: after an
+  upgrade that changes the reasoning semantics (`reasoning_semantics` on `/version`), start
+  it again from an empty data directory.
