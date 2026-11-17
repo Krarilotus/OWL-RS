@@ -9,11 +9,12 @@ use std::sync::Arc;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_sparql::Completeness;
 use nrese_store::{
-    MutationError, MutationPipeline, RejectKind, StatementOp, StoreConfig, StoreService,
+    DlAnswers, MutationError, MutationPipeline, RejectKind, StatementOp, StoreConfig, StoreError,
+    StoreService,
 };
 
-use super::queries::query;
-use super::versions::{in_transaction, ntriples};
+use super::queries::{query, query_with};
+use super::versions::{in_transaction, ntriples, on_disk};
 use super::{insert, pipeline};
 
 #[test]
@@ -1423,6 +1424,354 @@ fn a_pending_annotation_declaration_marks_the_read_inside_the_transaction() {
                 "{extra:?} the pending read changed the committed one: {after}"
             ));
         }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+/// `( :{prefix}1 … :{prefix}n )`.
+fn properties(prefix: &str, n: usize) -> String {
+    let members: Vec<String> = (1..=n).map(|i| format!(":{prefix}{i}")).collect();
+    format!("( {} )", members.join(" "))
+}
+
+/// `:p` the chain of `n` properties, and a path `:a0 :p1 :a1 … :a{n-1} :pn :an`.
+fn chain(n: usize) -> String {
+    let mut data = format!(":p owl:propertyChainAxiom {} .", properties("p", n));
+    for i in 1..=n {
+        data.push_str(&format!(" :a{} :p{i} :a{i} .", i - 1));
+    }
+    data
+}
+
+/// Two `:K` with the same value on each of `n` key properties.
+fn key_of(n: usize) -> String {
+    let mut data = format!(":K owl:hasKey {} .", properties("k", n));
+    for x in ["x", "y"] {
+        data.push_str(&format!(" :{x} a :K"));
+        for i in 1..=n {
+            data.push_str(&format!(" ; :k{i} :v{i}"));
+        }
+        data.push_str(" .");
+    }
+    data
+}
+
+/// `:C` the intersection of `n` classes, and `:x` in each of them.
+fn intersection(n: usize) -> String {
+    let mut data = format!(
+        ":C owl:equivalentClass [ owl:intersectionOf {} ] . :x",
+        properties("A", n)
+    );
+    let types: Vec<String> = (1..=n).map(|i| format!(" a :A{i}")).collect();
+    data.push_str(&types.join(" ;"));
+    data.push_str(" .");
+    data
+}
+
+/// The chain of seven properties `:q1 … :q7` written node by node (`_:l1 … _:l7`), with a
+/// path `:a0 :q1 :a1 … :q7 :a7`; and a second list `_:m1 … _:m7` of `:r1 … :r7`, each node
+/// the same as the first list's. The closure gives each of the chain's nodes two members
+/// and two rests: 2^7 member sequences, more than the reasoner reads (`MAX_VARIANTS`, 64).
+/// With `cycle`, the last node is instead the same as the first: the chain's list returns
+/// to its head through `owl:sameAs`, which the reader, reading the statements as written,
+/// doesn't see.
+fn aliased_chain(cycle: bool) -> String {
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let node = |list: &str, i: usize, member: &str| {
+        let rest = match i {
+            7 => format!("<{RDF}nil>"),
+            _ => format!("_:{list}{}", i + 1),
+        };
+        format!(" _:{list}{i} <{RDF}first> :{member}{i} ; <{RDF}rest> {rest} .")
+    };
+    let mut data = String::from(":p owl:propertyChainAxiom _:l1 .");
+    for i in 1..=7 {
+        data.push_str(&node("l", i, "q"));
+        data.push_str(&format!(" :a{} :q{i} :a{i} .", i - 1));
+        if !cycle {
+            data.push_str(&node("m", i, "r"));
+            data.push_str(&format!(" _:m{i} owl:sameAs _:l{i} ."));
+        }
+    }
+    if cycle {
+        data.push_str(" _:l7 owl:sameAs _:l1 .");
+    }
+    data
+}
+
+/// The OWL 2 RL closure the store under `owl2-dl` keeps.
+fn rl_rules() -> nrese_reasoner::RuleProgram {
+    ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+        .materialised_program()
+        .expect("owl2-dl keeps the OWL 2 RL closure")
+}
+
+/// A list axiom of OWL 2 RL that the rules build (the control rows), or leave out: a
+/// chain past [`nrese_reasoner::lists::MAX_RULE_MEMBERS`] (250), a key past
+/// `MAX_KEY_MEMBERS` (127), an intersection past 256 classes (cls-int1's atoms), a list
+/// with more member sequences than `MAX_VARIANTS`, and one that returns to its head through
+/// `owl:sameAs`. Each with the query its rule (prp-spo2, prp-key, cls-int1; OWL 2 Profiles
+/// §4.3) entails `true`, on both ways a route is taken: a commit (`prepare`) and a read of
+/// data that came past the gates (`afresh`). A control stays on the rules' route and
+/// answers `true`. A row the rules leave out leaves the route, and answers `true`, or
+/// `false` with `complete: false`: an ASK that misses an entailed `true` says it may be
+/// incomplete. (Every query here entails `true`, so no answer is a row the entailment
+/// doesn't hold, which would need `sound: false`.) A malformed list, or one with a cycle as
+/// written, is the reader's fatal `BrokenList`: off the route whatever the record says, so
+/// not here.
+#[test]
+fn a_list_axiom_the_rules_leave_out_leaves_the_rl_route() {
+    let rows: [(&str, String, &str, bool); 9] = [
+        ("chain 250", chain(250), "ASK { :a0 :p :a250 }", true),
+        ("chain 251", chain(251), "ASK { :a0 :p :a251 }", false),
+        ("key 127", key_of(127), "ASK { :x owl:sameAs :y }", true),
+        ("key 128", key_of(128), "ASK { :x owl:sameAs :y }", false),
+        (
+            "intersection 256",
+            intersection(256),
+            "ASK { :x a :C }",
+            true,
+        ),
+        (
+            "intersection 257",
+            intersection(257),
+            "ASK { :x a :C }",
+            false,
+        ),
+        (
+            "variants",
+            aliased_chain(false),
+            "ASK { :a0 :p :a7 }",
+            false,
+        ),
+        (
+            "sameAs cycle",
+            aliased_chain(true),
+            "ASK { :a0 :p :a7 }",
+            false,
+        ),
+        (
+            "chain 7",
+            aliased_chain(false).replace("owl:sameAs", ":alias"),
+            "ASK { :a0 :p :a7 }",
+            true,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, data, read, built) in rows {
+        for path in ["commit", "read"] {
+            let dl = pipeline();
+            if path == "commit" {
+                insert(&dl, &data).expect("an RL ontology");
+            } else {
+                let turtle = format!("{}{data}", super::PREFIXES);
+                crate::support::load_past_the_pipeline(dl.store(), &turtle);
+                dl.store().rematerialise(rl_rules()).expect("rebuilt");
+            }
+            let (rows, status) = query(&dl, read);
+            let route = dl.store().dl_bounds().last;
+            let line = format!("{what}, {path}: route {route}, {rows:?}, {status:?}");
+            eprintln!("{line}");
+            let entailed = rows == ["true"];
+            let honest = if built {
+                route == "rules" && entailed
+            } else {
+                route != "rules" && (entailed || !status.shared.complete)
+            };
+            if !honest {
+                wrong.push(line);
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// prp-spo2, prp-rng and cax-dw: `:a0 :p :an` through the chain puts `:an` in `:p`'s
+/// range `:R`, which is disjoint from `:S`; with `:an a :S` the data has no model, and the
+/// commit that adds the clash is rejected. (A range on a chain's super-property is OWL 2 DL
+/// and RL; disjoint properties would need a simple property, which `:p` isn't.)
+#[test]
+fn a_clash_through_a_long_property_chain_is_rejected() {
+    let mut wrong = Vec::new();
+    for n in [250, 251] {
+        let dl = pipeline();
+        insert(&dl, &chain(n)).expect("an RL ontology");
+        let clash = insert(
+            &dl,
+            &format!(":p rdfs:range :R . :R owl:disjointWith :S . :a{n} a :S ."),
+        );
+        if clash.is_ok() {
+            wrong.push(format!(
+                "{n} properties: accepted, route {}, consistency {:?}",
+                dl.store().dl_bounds().last,
+                dl.store().dl().status().map(|s| s.consistency)
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// `:K`'s key of `n` object properties `:k1 … :kn`, `:x` and `:y` named members of `:K` with
+/// the same value on each, and `:y :tag :z`.
+fn tagged_key(n: usize) -> String {
+    let mut data = format!(
+        ":K a owl:Class ; owl:hasKey {} . :tag a owl:ObjectProperty . \
+         :x a owl:NamedIndividual, :K . :y a owl:NamedIndividual, :K ; :tag :z .",
+        properties("k", n)
+    );
+    for i in 1..=n {
+        data.push_str(&format!(
+            " :k{i} a owl:ObjectProperty . :x :k{i} :v{i} . :y :k{i} :v{i} ."
+        ));
+    }
+    data
+}
+
+/// prp-key (OWL 2 Profiles §4.3; `HasKey` in the Direct Semantics): the key equates the two
+/// named members of `:K`, so `:x :tag :z` is entailed and no member of `:K` lacks a `:tag`
+/// of `:z`. With 127 key properties the rules build the key and the read stays on the RL
+/// route; with 128 they leave it out, and the read leaves the route, whatever update came
+/// last before it: the key's commit; none (a load past the pipeline, then a rebuild); after
+/// that load, an empty one, one that writes a known statement into another graph (no
+/// reasoning delta) or one that only deletes; or an empty one after a reopen. Each update
+/// but the commit meets a pipeline that holds no program of the closure; on `warmed`, one
+/// that holds an older state's ([`WARM_UP`] committed before the load), and two updates
+/// follow it: an empty one, then the warm-up's schema statement written into another graph.
+/// Each read is judged answer first: the entailed answer, or a status that withholds what
+/// the answer gets wrong (`complete: false` for a missing `true`, `sound: false` for a row
+/// the entailment doesn't hold); an exact read answers `true` or is refused.
+#[test]
+fn a_key_the_rules_leave_out_leaves_no_wrong_answer_told_right() {
+    let ask = "ASK { :x :tag :z }";
+    let negated = "SELECT ?x { ?x a :K FILTER NOT EXISTS { ?x :tag :z } }";
+    let mut wrong = Vec::new();
+    for n in [127, 128] {
+        for path in [
+            "commit", "read", "empty", "known", "deletion", "reopen", "warmed",
+        ] {
+            let dir = tempfile::tempdir().expect("dir");
+            let dl = match path {
+                "commit" => pipeline(),
+                "reopen" => {
+                    insert(&on_disk(dir.path()), &tagged_key(n)).expect("an RL ontology");
+                    on_disk(dir.path())
+                }
+                _ => {
+                    let dl = pipeline();
+                    if path == "warmed" {
+                        insert(&dl, WARM_UP).expect("a clean warm-up");
+                    }
+                    let extra = if path == "deletion" {
+                        " :w a owl:NamedIndividual ."
+                    } else {
+                        ""
+                    };
+                    let turtle = format!("{}{}{extra}", super::PREFIXES, tagged_key(n));
+                    crate::support::load_past_the_pipeline(dl.store(), &turtle);
+                    dl.store().rematerialise(rl_rules()).expect("rebuilt");
+                    dl
+                }
+            };
+            let updates = match path {
+                "commit" => vec![format!("INSERT DATA {{ {} }}", tagged_key(n))],
+                "known" => vec!["INSERT DATA { GRAPH :g { :y :tag :z } }".to_owned()],
+                "deletion" => vec!["DELETE DATA { :w a owl:NamedIndividual . }".to_owned()],
+                "read" => vec![],
+                "warmed" => vec![
+                    "INSERT DATA {}".to_owned(),
+                    "INSERT DATA { GRAPH :g { :warmP rdfs:subPropertyOf :warmP } }".to_owned(),
+                ],
+                _ => vec!["INSERT DATA {}".to_owned()],
+            };
+            for update in &updates {
+                super::update(&dl, update).expect("an update of an RL ontology");
+            }
+            let (answer, asked) = query(&dl, ask);
+            let route = dl.store().dl_bounds().last;
+            let exact = match query_with(&dl, ask, Some(DlAnswers::Exact)) {
+                Ok((rows, _)) => rows.join(","),
+                Err(StoreError::Incomplete(_)) => "refused".to_owned(),
+                Err(e) => format!("{e:?}"),
+            };
+            let (rows, read) = query(&dl, negated);
+            let line = format!(
+                "key {n}, {path}: route {route}; ask {answer:?} sound {} complete {}; \
+                 exact {exact}; negated {rows:?} sound {} complete {}",
+                asked.shared.sound, asked.shared.complete, read.shared.sound, read.shared.complete
+            );
+            eprintln!("{line}");
+            eprintln!(
+                "  reasons: ask {:?}; negated {:?}",
+                asked.reasons(),
+                read.reasons()
+            );
+            let entailed = answer == ["true"];
+            let honest = if n <= 127 {
+                route == "rules" && entailed && exact == "true" && rows.is_empty()
+            } else {
+                route != "rules"
+                    && (entailed || !asked.shared.complete)
+                    && (exact == "true" || exact == "refused")
+                    && (rows.is_empty() || !read.shared.sound)
+            };
+            if !honest {
+                wrong.push(line);
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A clean ontology a pipeline commits first, so that it holds a ground program of the
+/// closure when data is loaded past it.
+const WARM_UP: &str = ":warmP a owl:ObjectProperty ; rdfs:subPropertyOf :warmP .";
+
+/// prp-spo2 (OWL 2 Profiles §4.3): a commit of a path along a chain derives the chain's
+/// property, though the chain came past the pipeline (loaded, then rebuilt) after the
+/// pipeline grounded the rules over an older state ([`WARM_UP`]), and whether or not an
+/// update that changes no inference came between. After that sequence, a deletion of a
+/// loaded premise takes its prp-spo1 conclusion with it.
+#[test]
+fn a_chain_loaded_past_a_warm_pipeline_is_reasoned_with_after_an_update() {
+    let mut wrong = Vec::new();
+    for between in [false, true] {
+        let dl = pipeline();
+        insert(&dl, WARM_UP).expect("a clean warm-up");
+        let turtle = format!("{}:p owl:propertyChainAxiom ( :p1 :p2 ) .", super::PREFIXES);
+        crate::support::load_past_the_pipeline(dl.store(), &turtle);
+        dl.store().rematerialise(rl_rules()).expect("rebuilt");
+        if between {
+            super::update(&dl, "INSERT DATA {}").expect("an empty update");
+        }
+        insert(&dl, ":a0 :p1 :a1 . :a1 :p2 :a2 .").expect("the chain's path");
+        let inferred = crate::support::inferred_statements(dl.store()).expect("inferred");
+        let ex = |name: &str| format!("http://example.com/{name}");
+        let derived = inferred.contains(&(ex("a0"), ex("p"), ex("a2")));
+        let (answer, asked) = query(&dl, "ASK { :a0 :p :a2 }");
+        let line = format!(
+            "chain, empty update between {between}: derived {derived}; ask {answer:?} sound {} \
+             complete {}",
+            asked.shared.sound, asked.shared.complete
+        );
+        eprintln!("{line}");
+        if !(derived && answer == ["true"]) {
+            wrong.push(line);
+        }
+    }
+    let dl = pipeline();
+    insert(&dl, WARM_UP).expect("a clean warm-up");
+    let turtle = format!("{}:q rdfs:subPropertyOf :p . :b0 :q :b1 .", super::PREFIXES);
+    crate::support::load_past_the_pipeline(dl.store(), &turtle);
+    dl.store().rematerialise(rl_rules()).expect("rebuilt");
+    super::update(&dl, "INSERT DATA {}").expect("an empty update");
+    super::update(&dl, "DELETE DATA { :b0 :q :b1 }").expect("the premise deleted");
+    let (answer, asked) = query(&dl, "ASK { :b0 :p :b1 }");
+    let line = format!(
+        "kept, the premise deleted: ask {answer:?} sound {} complete {}",
+        asked.shared.sound, asked.shared.complete
+    );
+    eprintln!("{line}");
+    if answer != ["false"] {
+        wrong.push(line);
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
