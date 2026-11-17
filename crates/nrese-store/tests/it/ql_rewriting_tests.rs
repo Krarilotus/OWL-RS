@@ -2877,8 +2877,8 @@ fn a_reader_of_some_graphs_over_a_store_in_quarantine_under_owl2_ql_is_not_compl
     let (status, reasons) = rewritten_read(&store, "SELECT ?x { ?x a :A }", reader);
     assert_ne!(status_class(&status), "complete", "status: {status}");
     let fixed = "the store is in quarantine (the consistency rules found violations and have \
-                 not found the data clean since); inconsistent data entail every answer, so no \
-                 read is certified complete until it leaves";
+                 not found the data clean since), and as inconsistent data entail every answer, \
+                 no read is certified complete until it leaves";
     let told = reasons.iter().any(|r| r == fixed);
     assert!(told, "status: no reason {fixed:?} in {reasons:?}");
 }
