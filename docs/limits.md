@@ -150,11 +150,11 @@ leave something out.
   `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
   annotation property's domain, range, super-property or sub-property, or give the individual its own
   IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
-- Under `owl2-dl`, an ontology with a part the reader leaves out (such as a reserved name
-  used as a class or individual, OWL's vocabulary outside the mapping's forms, a malformed
-  structure or list) is never told consistent: every verdict but an inconsistency is
-  `unknown`, and every answer is `unsound`, since the OWL 2 RL rules may still read those
-  statements. The reason gives how many parts were left out and the kind of the first, not
+- Under `owl2-dl`, an ontology with a part the reader leaves out is never told consistent:
+  every verdict but an inconsistency is `unknown`. Where that part is one the OWL 2 RL rules
+  may still read (a reserved name used as a class or individual, OWL's vocabulary outside the
+  mapping's forms, a malformed structure or list, syntax not read yet), every answer is
+  `unsound` too. The reason gives how many parts were left out and the kind of the first, not
   which axiom it is; no log or endpoint names it yet. A read inside a transaction is told what
   was left out of the revision it began on, so an addition still pending that would be left
   out may be told `sound-only` until it is committed
