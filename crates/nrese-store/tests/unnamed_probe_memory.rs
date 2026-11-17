@@ -1,9 +1,9 @@
-//! The process's memory limit refuses reasoning under `reasoner.unnamed_classes = "skip"` with
-//! the store's typed refusal, the check of whether the rules make a declared class's members
-//! things (`nrese_reasoner::unnamed::members_are_things`) included: over the limit that check
-//! panicked (Sol's review of D16-773 row 1, r1 S2). A rematerialisation, an entailment
-//! question, whose refutation compiles the program, and a commit, whose pipeline keeps the
-//! program it compiled. A test binary of its own: the limit is process-wide.
+//! The process's memory limit refuses reasoning under `reasoner.unnamed_classes = "skip"` with the
+//! store's typed refusal, the check of whether the rules make a declared class's members things
+//! (`nrese_reasoner::unnamed::members_are_things`) included: over the limit that check panicked. A
+//! rematerialisation, an entailment question, whose refutation compiles the program, and a commit,
+//! whose pipeline keeps the program it compiled. A test binary of its own: the limit is
+//! process-wide.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
