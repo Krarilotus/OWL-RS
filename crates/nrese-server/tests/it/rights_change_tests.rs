@@ -22,8 +22,8 @@ type Fallible<T> = Result<T, Box<dyn std::error::Error>>;
 
 const TARGET: &str = "urn:x:target";
 const SOURCE: &str = "urn:x:source";
-const WRITER: &[&str] = &["writer"];
-const ADMIN: &[&str] = &["nrese.admin"];
+const WRITER: Who = Who::Roles(&["writer"]);
+const ADMIN: Who = Who::Roles(&["nrese.admin"]);
 const SPARQL_UPDATE: Option<&str> = Some("application/sparql-update");
 
 const POLICY: &str = r#"
@@ -49,6 +49,45 @@ enum Entry {
     Session,
 }
 
+/// Who sends a request: a token's roles, a token's user (no roles), or a local login.
+#[derive(Clone, Copy, Debug)]
+enum Who {
+    Roles(&'static [&'static str]),
+    User(&'static str),
+    Login(&'static str, &'static str),
+}
+
+impl Who {
+    fn authorization(self) -> String {
+        #[derive(serde::Serialize)]
+        struct Claims {
+            exp: usize,
+            sub: &'static str,
+            roles: [&'static str; 0],
+        }
+        let secret = jsonwebtoken::EncodingKey::from_secret(b"test-secret");
+        let header = jsonwebtoken::Header::default();
+        match self {
+            Self::Roles(roles) => format!("Bearer {}", token(roles)),
+            Self::User(sub) => {
+                let claims = Claims {
+                    exp: 4_102_444_800,
+                    sub,
+                    roles: [],
+                };
+                let token = jsonwebtoken::encode(&header, &claims, &secret).expect("jwt");
+                format!("Bearer {token}")
+            }
+            Self::Login(user, password) => {
+                use base64::Engine;
+                let pair =
+                    base64::engine::general_purpose::STANDARD.encode(format!("{user}:{password}"));
+                format!("Basic {pair}")
+            }
+        }
+    }
+}
+
 /// What the server answered.
 #[derive(Debug)]
 struct Answer {
@@ -60,7 +99,7 @@ struct Answer {
 
 async fn send(
     app: &axum::Router,
-    roles: &[&str],
+    who: Who,
     method: Method,
     uri: &str,
     content_type: Option<&str>,
@@ -69,7 +108,7 @@ async fn send(
     let mut request = Request::builder()
         .uri(uri)
         .method(method)
-        .header("authorization", format!("Bearer {}", token(roles)))
+        .header("authorization", who.authorization())
         .header("accept", "application/sparql-results+json, */*;q=0.1");
     if let Some(content_type) = content_type {
         request = request.header("content-type", content_type);
@@ -111,7 +150,7 @@ fn expect(answer: Answer, status: StatusCode) -> Result<Answer, String> {
 /// `update` sent by `roles` through `entry`: the answer of the request that commits it.
 async fn write(
     app: axum::Router,
-    roles: &[&str],
+    roles: Who,
     entry: Entry,
     update: String,
 ) -> Result<Answer, String> {
@@ -166,9 +205,14 @@ async fn write(
 
 /// A server under [`POLICY`] whose `SERVICE` calls go to `endpoint`.
 fn app(endpoint: &HeldEndpoint, mode: ReasoningMode) -> Fallible<axum::Router> {
+    app_under(POLICY, endpoint, mode)
+}
+
+/// [`app`] under the access policy `policy`.
+fn app_under(policy: &str, endpoint: &HeldEndpoint, mode: ReasoningMode) -> Fallible<axum::Router> {
     let store = StoreService::new(StoreConfig::in_memory())?;
     store.set_service_client(endpoint.client()?);
-    test_app_with_store(store, policy_of(POLICY)?, ReasonerConfig::for_mode(mode))
+    test_app_with_store(store, policy_of(policy)?, ReasonerConfig::for_mode(mode))
 }
 
 /// An update that writes `<urn:x:a> <urn:x:p> <urn:x:o>` into the target, held in its
@@ -226,19 +270,21 @@ fn writer_role(write: &[&str]) -> (&'static str, Value) {
 async fn raced(
     app: &axum::Router,
     endpoint: &HeldEndpoint,
+    who: Who,
     entry: Entry,
     update: String,
     during: (&str, Value),
 ) -> Fallible<Answer> {
-    let mut running = tokio::spawn(write(app.clone(), WRITER, entry, update));
+    let mut running = tokio::spawn(write(app.clone(), who, entry, update));
     let call = endpoint.call(&mut running).await?;
     change(app, &during).await?;
     call.answer().await?;
     Ok(running.await??)
 }
 
-/// The writer's write right ends while its write through `entry` runs: nothing is published,
-/// and the client is told to send it again.
+/// The writer's write right ends while its write through `entry` runs: nothing is published.
+/// A single write may be sent again (503, `Retry-After: 1`); a client transaction's commit has
+/// ended it, so the client begins a new one (409).
 async fn a_write_whose_right_ends_publishes_nothing(
     entry: Entry,
     mode: ReasoningMode,
@@ -246,13 +292,26 @@ async fn a_write_whose_right_ends_publishes_nothing(
     let endpoint = HeldEndpoint::bind().await?;
     let app = app(&endpoint, mode)?;
     let update = held_insert(&endpoint, false);
-    let answer = raced(&app, &endpoint, entry, update, writer_role(&[])).await?;
+    let answer = raced(&app, &endpoint, WRITER, entry, update, writer_role(&[])).await?;
+    let transaction = matches!(entry, Entry::Rdf4jTransaction | Entry::Session);
+    let refused = match transaction {
+        true => StatusCode::CONFLICT,
+        false => StatusCode::SERVICE_UNAVAILABLE,
+    };
     assert_eq!(
         (answer.status, written(&app).await?),
-        (StatusCode::SERVICE_UNAVAILABLE, false),
+        (refused, false),
         "{entry:?} under {mode:?}: refused, nothing written ({})",
         answer.body
     );
+    if transaction {
+        assert!(
+            answer.body.contains("begin a new transaction"),
+            "{}",
+            answer.body
+        );
+        return Ok(());
+    }
     assert_eq!(answer.retry_after.as_deref(), Some("1"), "{entry:?}");
     let problem: Value = serde_json::from_str(&answer.body)?;
     assert_eq!(
@@ -316,7 +375,7 @@ async fn a_write_whose_read_right_ends_while_it_runs_publishes_nothing() -> Fall
     });
     let during = ("/api/v1/access/roles/writer", read_revoked);
     let update = held_insert(&endpoint, true);
-    let answer = raced(&app, &endpoint, Entry::SparqlUpdate, update, during).await?;
+    let answer = raced(&app, &endpoint, WRITER, Entry::SparqlUpdate, update, during).await?;
     assert_eq!(
         (answer.status, written(&app).await?),
         (StatusCode::SERVICE_UNAVAILABLE, false),
@@ -340,7 +399,7 @@ async fn a_change_that_leaves_the_writers_rights_refuses_nothing() -> Fallible<(
         let app = app(&endpoint, ReasoningMode::Disabled)?;
         let update = held_insert(&endpoint, false);
         let uri = during.0;
-        let answer = raced(&app, &endpoint, Entry::SparqlUpdate, update, during).await?;
+        let answer = raced(&app, &endpoint, WRITER, Entry::SparqlUpdate, update, during).await?;
         assert_eq!(
             (answer.status, written(&app).await?),
             (StatusCode::NO_CONTENT, true),
@@ -361,6 +420,7 @@ async fn a_write_refused_for_changed_rights_is_judged_anew_when_sent_again() -> 
     let answer = raced(
         &app,
         &endpoint,
+        WRITER,
         Entry::SparqlUpdate,
         update.clone(),
         writer_role(&[]),
@@ -377,6 +437,117 @@ async fn a_write_refused_for_changed_rights_is_judged_anew_when_sent_again() -> 
         (answer.status, written(&app).await?),
         (StatusCode::NO_CONTENT, true),
         "{}",
+        answer.body
+    );
+    Ok(())
+}
+
+const PASSWORD: &str = "correct horse battery";
+
+/// An access policy that lets every named user write what no rule names.
+const OPEN: &str = r#"
+default = "allow"
+
+[[role]]
+name = "other"
+read = ["urn:x:source"]
+"#;
+
+/// The right of a user record to administer is the access state's where a write publishes,
+/// a local login's too: an administrator demoted while its write runs publishes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_administrator_demoted_while_its_write_runs_publishes_nothing() -> Fallible<()> {
+    let endpoint = HeldEndpoint::bind().await?;
+    let app = app(&endpoint, ReasoningMode::Disabled)?;
+    let alice = json!({ "admin": true, "password": PASSWORD, "reason": "test" });
+    change(&app, &("/api/v1/access/users/alice", alice)).await?;
+    let demoted = (
+        "/api/v1/access/users/alice",
+        json!({ "admin": false, "reason": "test" }),
+    );
+    let (who, update) = (Who::Login("alice", PASSWORD), held_insert(&endpoint, false));
+    let answer = raced(&app, &endpoint, who, Entry::SparqlUpdate, update, demoted).await?;
+    assert_eq!(
+        (answer.status, written(&app).await?),
+        (StatusCode::SERVICE_UNAVAILABLE, false),
+        "refused, nothing written ({})",
+        answer.body
+    );
+    Ok(())
+}
+
+/// A write the access state admitted (an open policy's grant to a named user) publishes only
+/// while the state still admits it: the grant ends with enforcement, and the user's graph
+/// rights (every graph, before and after) don't show it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_whose_admitting_grant_ends_while_it_runs_publishes_nothing() -> Fallible<()> {
+    let endpoint = HeldEndpoint::bind().await?;
+    let app = app_under(OPEN, &endpoint, ReasoningMode::Disabled)?;
+    let off = (
+        "/api/v1/access/settings",
+        json!({ "enforced": false, "reason": "test" }),
+    );
+    let update = held_insert(&endpoint, false);
+    let answer = raced(
+        &app,
+        &endpoint,
+        Who::User("bob"),
+        Entry::SparqlUpdate,
+        update,
+        off,
+    )
+    .await?;
+    assert_eq!(
+        (answer.status, written(&app).await?),
+        (StatusCode::SERVICE_UNAVAILABLE, false),
+        "refused, nothing written ({})",
+        answer.body
+    );
+    Ok(())
+}
+
+/// A restore is an administrator's: one whose user record stops administering while it waits
+/// for the writer slot (held by an administrator's update in its `SERVICE` call) restores
+/// nothing. The restore's handler waits on nothing before it asks for the slot, so the half
+/// second it is given to get there is a bound, not a race: earlier, it would be refused 403.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_restore_whose_administrator_is_demoted_while_it_waits_restores_nothing() -> Fallible<()>
+{
+    let endpoint = HeldEndpoint::bind().await?;
+    let app = app(&endpoint, ReasoningMode::Disabled)?;
+    let bob = "/api/v1/access/users/bob";
+    change(&app, &(bob, json!({ "admin": true, "reason": "test" }))).await?;
+    let update = held_insert(&endpoint, false);
+    let mut holding = tokio::spawn(write(app.clone(), ADMIN, Entry::SparqlUpdate, update));
+    let call = endpoint.call(&mut holding).await?;
+    let restoring = tokio::spawn({
+        let (app, dump) = (app.clone(), "<urn:x:r> <urn:x:p> <urn:x:o> .\n".to_owned());
+        let uri = "/ops/api/admin/dataset/restore";
+        async move {
+            send(
+                &app,
+                Who::User("bob"),
+                Method::POST,
+                uri,
+                Some("application/n-quads"),
+                dump,
+            )
+            .await
+        }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    change(&app, &(bob, json!({ "admin": false, "reason": "test" }))).await?;
+    call.answer().await?;
+    expect(holding.await??, StatusCode::NO_CONTENT)?;
+    let answer = restoring.await??;
+    let ask = "ASK { <urn:x:r> <urn:x:p> <urn:x:o> }".to_owned();
+    let query = Some("application/sparql-query");
+    let restored = send(&app, ADMIN, Method::POST, "/dataset/query", query, ask).await?;
+    let restored: Value = serde_json::from_str(&expect(restored, StatusCode::OK)?.body)?;
+    assert_eq!(
+        (answer.status, restored["boolean"].as_bool()),
+        (StatusCode::SERVICE_UNAVAILABLE, Some(false)),
+        "refused, nothing restored ({})",
         answer.body
     );
     Ok(())
