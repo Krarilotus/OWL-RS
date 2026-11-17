@@ -487,6 +487,131 @@ async fn repository_create_list_and_size_are_the_rdf4j_fixture_mapping() {
     }
 }
 
+// Spec: RFC 9110 12.5.1: each accepted RDF alias is answered in that spelling.
+#[tokio::test]
+async fn each_graph_alias_is_answered_in_its_accepted_spelling() {
+    let app = app(false, false);
+    upload(&app, "<urn:s> <urn:p> <urn:o> .").await;
+    let mut mismatches = Vec::new();
+    for alias in [
+        "application/x-turtle",
+        "text/x-nquads",
+        "text/nquads",
+        "application/x-trig",
+        "text/plain",
+    ] {
+        for (method, uri, content, body) in [
+            (Method::GET, STATEMENTS, "", ""),
+            (Method::GET, "/dataset/data?default", "", ""),
+            (
+                Method::POST,
+                REPO,
+                QUERY,
+                "CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }",
+            ),
+        ] {
+            let (status, headers, text) = send(
+                &app,
+                method,
+                uri,
+                &[("accept", alias), ("content-type", content)],
+                body,
+            )
+            .await;
+            if status != StatusCode::OK
+                || headers.get("content-type").and_then(|h| h.to_str().ok()) != Some(alias)
+            {
+                mismatches.push(format!("{uri}: {alias} -> {status}, {headers:?}: {text}"));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
+// Spec: approved protocol proposal: 401 advertises only fixed schemes, with a
+// fixed realm; a browser fetch without credentials must never receive Basic.
+#[tokio::test]
+async fn challenges_depend_only_on_credential_scheme_and_enabled_schemes() {
+    use base64::Engine;
+    use nrese_server::auth::{AuthConfig, StaticBearerConfig};
+    const BASIC: &str = "Basic realm=\"nrese\", charset=\"UTF-8\"";
+    let mut mismatches = Vec::new();
+    for local_logins in [true, false] {
+        let app = crate::support::test_app_with_policy(PolicyConfig {
+            local_logins,
+            auth: AuthConfig::BearerStatic(StaticBearerConfig {
+                read_token: None,
+                admin_token: "test-admin".to_owned(),
+            }),
+            ..PolicyConfig::default()
+        })
+        .unwrap();
+        if local_logins {
+            let (status, _, body) = send(
+                &app,
+                Method::PUT,
+                "/api/v1/access/users/known",
+                &[
+                    ("authorization", "Bearer test-admin"),
+                    ("content-type", "application/json"),
+                ],
+                r#"{"password":"a sufficiently long password","reason":"protocol test"}"#,
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let existing = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("known:wrong")
+        );
+        let absent = format!(
+            "Basic {}",
+            base64::engine::general_purpose::STANDARD.encode("absent:wrong")
+        );
+        for (authorization, fetch, expected) in [
+            ("Basic invalid", "", BASIC),
+            (existing.as_str(), "", BASIC),
+            (absent.as_str(), "", BASIC),
+            ("Bearer", "", "Bearer"),
+            (
+                "",
+                "",
+                if local_logins {
+                    "Basic realm=\"nrese\", charset=\"UTF-8\", Bearer"
+                } else {
+                    "Bearer"
+                },
+            ),
+            ("", "cors", "Bearer"),
+            (
+                "",
+                "navigate",
+                if local_logins {
+                    "Basic realm=\"nrese\", charset=\"UTF-8\", Bearer"
+                } else {
+                    "Bearer"
+                },
+            ),
+        ] {
+            let mut headers = vec![("host", "deployment.invalid")];
+            if !authorization.is_empty() {
+                headers.push(("authorization", authorization));
+            }
+            if !fetch.is_empty() {
+                headers.push(("sec-fetch-mode", fetch));
+            }
+            let (status, headers, text) = send(&app, Method::GET, STATEMENTS, &headers, "").await;
+            let challenge = headers
+                .get("www-authenticate")
+                .and_then(|h| h.to_str().ok());
+            if (status, challenge) != (StatusCode::UNAUTHORIZED, Some(expected)) {
+                mismatches.push(format!("local={local_logins}, credentials={authorization:?}, fetch={fetch:?}: {status}, {headers:?}: {text}"));
+            }
+        }
+    }
+    assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+}
+
 async fn wrong_basic_challenge(
     union: bool,
     method: Method,
