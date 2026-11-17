@@ -4,7 +4,7 @@ use std::sync::Arc;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_store::{
     ConsistencyStatus, InvalidStatements, MutationCommand, MutationCommitReport, MutationError,
-    MutationPipeline, MutationTicket, ReadModel, Requester, SparqlQueryRequest,
+    MutationPipeline, MutationTicket, QlRewritingMode, ReadModel, Requester, SparqlQueryRequest,
     SparqlUpdateRequest, StoreConfig, StoreError, StoreService,
 };
 use serde_json::Value;
@@ -380,7 +380,7 @@ fn short_lists_mean_what_the_mapping_says() {
     use Expect::*;
     let declared = ":C a owl:Class . :D a owl:Class .";
     // (name, data, list statements, the question, under owl2-dl, under owl2-rl)
-    let cases: [(&str, &str, u64, &str, Expect, Expect); 9] = [
+    let cases: [(&str, &str, u64, &str, Expect, Expect); 10] = [
         (
             "empty intersection",
             ":C owl:intersectionOf rdf:nil . :x a :D .",
@@ -459,6 +459,17 @@ fn short_lists_mean_what_the_mapping_says() {
             Inconsistent,
             NotTold,
         ),
+        // `≤ 1 :p.⊤`: the two successors are one.
+        (
+            "empty intersection as a qualified maximum of one's class",
+            ":x a [ a owl:Restriction ; owl:onProperty :p ; owl:maxQualifiedCardinality \
+             \"1\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ; owl:onClass \
+             [ a owl:Class ; owl:intersectionOf rdf:nil ] ] ; :p :y, :z . :y a :D .",
+            1,
+            ":z a :D",
+            Holds,
+            NotTold,
+        ),
     ];
     let lists = "VALUES ?p { owl:intersectionOf owl:unionOf owl:oneOf owl:sameAs } ?s ?p ?o";
     check_cells(|equality, mode, failures| {
@@ -469,12 +480,29 @@ fn short_lists_mean_what_the_mapping_says() {
                 rl
             };
             let data = format!("{declared} {list}");
-            for rebuilt in [false, true] {
+            // Under owl2-rl, also with the OWL 2 QL rewriting over its closure.
+            let rewritings: &[bool] = if mode == ReasoningMode::Owl2Rl {
+                &[false, true]
+            } else {
+                &[false]
+            };
+            for (rebuilt, &ql) in [false, true]
+                .into_iter()
+                .flat_map(|r| rewritings.iter().map(move |q| (r, q)))
+            {
                 let path = if rebuilt { "rebuild" } else { "commit" };
-                let label = format!("{path}, {mode:?}, {equality}, {name}");
+                let label = format!("{path}, {mode:?}, {equality}, ql {ql}, {name}");
                 cell(failures, &label, || {
-                    let store = StoreService::new(config(equality, in_memory_store_config()))
-                        .expect("store");
+                    let ql_rewriting = if ql {
+                        QlRewritingMode::On
+                    } else {
+                        QlRewritingMode::Auto
+                    };
+                    let store = StoreService::new(StoreConfig {
+                        ql_rewriting,
+                        ..config(equality, in_memory_store_config())
+                    })
+                    .expect("store");
                     let outcome = if rebuilt {
                         let off = pipeline(store.clone(), ReasoningMode::Disabled);
                         insert(&off, &data).expect("written with reasoning off");
