@@ -296,8 +296,13 @@ leave something out.
 - A commit holds at most 4 GiB of log payload, about 130 M quads.
   Larger loads go through the bulk loader
   ([storage](spec/02-storage-and-transactions.md#limits)).
-- Client transactions read the latest commit, and `SNAPSHOT` and `SERIALIZABLE` isolation are
-  refused ([RDF4J protocol](ops/http-api.md#rdf4j-protocol)). A read, then a write
+- A client transaction keeps its operations, not their effects, and runs them again at its
+  commit ([RDF4J protocol](ops/http-api.md#rdf4j-protocol)). An update with a `WHERE`, a
+  `CLEAR` or `DROP`, or a removal by pattern matches what another client committed meanwhile; a
+  value an update generates (`UUID()`, `RAND()`, `NOW()`, `BNODE()`, blank nodes) and read inside
+  the transaction isn't the one committed; a malformed update fails only at the next read or at
+  the commit; and a failed commit ends the transaction. Reads take the latest commit, and
+  `SNAPSHOT` and `SERIALIZABLE` isolation are refused. A read, then a write
   that depends on it, fits in one SPARQL update (`DELETE … INSERT … WHERE`), which is one
   commit.
 - A stop signal during start-up acts as a kill, and on Windows a service stop or

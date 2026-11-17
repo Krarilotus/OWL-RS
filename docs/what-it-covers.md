@@ -134,7 +134,7 @@ can't be proven complete is then a 422 error naming the undecided candidates.
 | Its own storage engine: dictionary-encoded terms, sorted index orders (seven; four while all data is in the default graph), log-structured runs, snapshots that readers never wait for ([architecture](ARCHITECTURE.md#4-engine-design-l1)) | |
 | In memory or on disk: a checksummed write-ahead log and checkpoints; recovery cuts a torn tail and, unless configured otherwise, refuses to open on other damage | |
 | Atomic commits: a write is planned, validated (reasoning, consistency, SHACL) and committed as one revision; a request that times out commits nothing ([data flow](ARCHITECTURE.md#22-data-flow)) | One writer at a time |
-| Client transactions, over the RDF4J protocol or the engine API: reads see the transaction's own changes | Each read takes the latest commit; `SNAPSHOT` and `SERIALIZABLE` isolation are refused |
+| Client transactions, over the RDF4J protocol or the engine API: nothing is visible to others before the commit, which is all or nothing; a read applies the transaction's operations to the latest commit | The operations run again at the commit, on the data as it is then ([limits](limits.md#storage-and-transactions)); `SNAPSHOT` and `SERIALIZABLE` isolation are refused |
 | Backups: N-Quads exports with a checksum, image backups, point-in-time restore from the archived log ([backups](ops/backups.md)) | |
 | Read replicas that follow a primary's log ([replication](ops/replication.md)) | No automatic failover; no partitioning across machines |
 | Several repositories per server, each with its own reasoning and rules | |
