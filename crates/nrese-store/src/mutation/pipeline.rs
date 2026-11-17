@@ -425,12 +425,12 @@ impl MutationPipeline {
             // commit publishes.
             let ql = crate::service::Certificate::of(tx.base()).and_then(|c| c.ql.clone());
             // In quarantine the commit checks only its own facts: its version keeps no
-            // assessment of its consistency. The store is marked unassessed first, then the old
-            // assessment and its marker go, before the commit publishes: a removal that fails
-            // fails the write and leaves the store in quarantine.
+            // assessment of its consistency. The mark rises first (odd: unassessed), then the
+            // old assessment and its marker go, before the commit publishes: a removal that
+            // fails fails the write and leaves the store in quarantine.
             let quarantined = self.store.is_quarantined();
             if quarantined {
-                (self.store.unassessed).store(true, std::sync::atomic::Ordering::Release);
+                (self.store.unassessed).fetch_or(1, std::sync::atomic::Ordering::Release);
                 let writer = tx.writer().expect("a transaction holds the writer slot");
                 self.store.invalidate_held(writer).map_err(store_error)?;
             }
