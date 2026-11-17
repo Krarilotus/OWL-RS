@@ -99,6 +99,11 @@ pub enum StoreError {
     /// answer that rests on the data's consistency.
     #[error("{0}")]
     Undecided(String),
+    /// A read replica's log or image from a primary whose served version is stored over
+    /// representatives: the replica would read those rows as the only identities, with no
+    /// reading ([`crate::StoreService::replication_log`]).
+    #[error("a primary under `reasoner.equality = \"compact\"` serves no replica in this release")]
+    CompactPrimary,
     /// Under `owl2-dl` with exact answers asked for (`dl.answers = exact`), or for an OWL 2
     /// DL explanation that wasn't decided: the store can't prove the answers complete, for
     /// the reasons given.
@@ -256,6 +261,7 @@ impl StoreError {
             | Self::LoadCancelled
             | Self::Undecided(_)
             | Self::ClassificationCancelled
+            | Self::CompactPrimary
             // Answered by the transport as what it is (the query is fine; its answers
             // can't be proven complete).
             | Self::Incomplete(_) => false,

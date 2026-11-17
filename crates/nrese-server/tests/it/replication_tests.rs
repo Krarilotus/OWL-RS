@@ -102,7 +102,10 @@ async fn a_replica_follows_its_primary() -> Result<(), Box<dyn std::error::Error
         None
     );
     let replica_state = state(
-        StoreService::new(StoreConfig::on_disk(replica_dir.path()))?,
+        StoreService::new(StoreConfig {
+            replica: true,
+            ..StoreConfig::on_disk(replica_dir.path())
+        })?,
         config,
     );
     let replica_app = build_app(replica_state.clone());
@@ -261,7 +264,10 @@ async fn a_replica_gives_its_primarys_dl_answers() -> Result<(), Box<dyn std::er
     };
     replication::bootstrap(&config, replica_dir.path()).await?;
     let replica_state = AppState::new(
-        StoreService::new(StoreConfig::on_disk(replica_dir.path()))?,
+        StoreService::new(StoreConfig {
+            replica: true,
+            ..StoreConfig::on_disk(replica_dir.path())
+        })?,
         dl(),
         PolicyConfig::default(),
         AiSuggestionService::disabled(),
