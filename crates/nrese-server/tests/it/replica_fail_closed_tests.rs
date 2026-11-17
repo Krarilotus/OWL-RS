@@ -914,3 +914,147 @@ async fn a_primary_cleared_of_its_inferences_and_rules_says_not_certified() -> T
     );
     Ok(())
 }
+
+/// Spec (the replica's fail-closed form): a reader of some graphs who sees inferences, on a
+/// read replica, is refused its reasoned reads for as long as the store is a replica: nothing
+/// vouches that the inferred statements it holds are the closure of the rules in place. The
+/// answer is 503 with the replica's own sentence, without the administrator's route (a
+/// replica refuses it), naming the replica; no fault of the server's (no 500). The replica's
+/// administrator, who reads every graph through no view, is answered. The replica is
+/// bootstrapped from its primary and caught up after a commit, under `rdfs`, as a server
+/// starts one (its store opened with the role). A repository beside the default (`pub`, left
+/// under the replica's data directory by a primary's store) is a replica's store as well:
+/// on it the same reader and administrator are answered the same.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restricted_reader_on_a_replica_is_answered_503_with_the_sentence() -> TestResult<()> {
+    const READER: &str = r#"
+default = "deny"
+inferred = "visible"
+
+[[role]]
+name = "reader"
+read = ["http://example.com/g/pub/*"]
+default_graph = "read"
+"#;
+    let mode = ReasoningMode::Rdfs;
+    let dirs = [tempfile::tempdir()?, tempfile::tempdir()?];
+    let store = StoreService::new(StoreConfig::on_disk(dirs[0].path()))?;
+    let base = serve(&server(store, mode, primary())).await?;
+    let graph = "GRAPH <http://example.com/g/pub/1>";
+    update(
+        &base,
+        &format!(
+            "INSERT DATA {{ {graph} {{ ex:Dog rdfs:subClassOf ex:Animal . ex:rex a ex:Dog }} }}"
+        ),
+    )
+    .await;
+    let following = replica_of(&base);
+    replication::bootstrap(&following, dirs[1].path()).await?;
+    let other = StoreService::new(StoreConfig::on_disk(
+        dirs[1].path().join("repositories/pub"),
+    ))?;
+    nrese_store::MutationPipeline::new(
+        std::sync::Arc::new(other),
+        std::sync::Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
+    )
+    .execute_update_str(&format!(
+        "{PREFIXES}INSERT DATA {{ {graph} {{ ex:Dog rdfs:subClassOf ex:Animal . ex:rex a ex:Dog }} }}"
+    ))?;
+    let store = StoreService::new(as_replica(StoreConfig::on_disk(dirs[1].path())))?;
+    let reasoner = ReasonerService::new(ReasonerConfig::for_mode(mode));
+    let policy = super::access_control_tests::policy_of(READER)?;
+    let posture = DeploymentPosture::OpenWorkbench;
+    let replica = AppState::new(
+        store,
+        reasoner,
+        policy,
+        AiSuggestionService::disabled(),
+        posture,
+    )
+    .with_replication(following);
+    replica.mark_ready();
+    update(
+        &base,
+        &format!("INSERT DATA {{ {graph} {{ ex:tom a ex:Dog }} }}"),
+    )
+    .await;
+    let client = reqwest::Client::new();
+    while replication::pull_once(&client, &base, &replica).await? > 0 {}
+    let app = build_app(replica.clone());
+    let sentence = "the inferred statements aren't known to be the rules' closure, and this store \
+                    is a read replica: it doesn't serve this read";
+    const ASK: &str = "ASK { ?s ?p ?o }";
+    // The default through the engine API's alias, `pub` through RDF4J's route.
+    let places = [
+        (
+            "the default",
+            Method::POST,
+            "/dataset/query".to_owned(),
+            ASK,
+        ),
+        (
+            "the repository pub",
+            Method::GET,
+            format!(
+                "/repositories/pub?{}",
+                serde_urlencoded::to_string([("query", ASK)])?
+            ),
+            "",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (place, method, uri, query) in places {
+        for (who, role, want) in [
+            (
+                "a reader of some graphs who sees inferences",
+                "reader",
+                "503 with the replica's sentence, without the route, naming the replica",
+            ),
+            ("the replica's administrator", "nrese.admin", "200"),
+        ] {
+            let who = format!("{who}, of {place}");
+            let token = super::access_control_tests::token(&[role]);
+            let request = Request::builder()
+                .uri(&uri)
+                .method(method.clone())
+                .header("authorization", format!("Bearer {token}"))
+                .header("content-type", "application/sparql-query")
+                .header("accept", "application/sparql-results+json")
+                .body(Body::from(query))?;
+            let response = app.clone().oneshot(request).await?;
+            let status = response.status().as_u16();
+            let body = body_text(response).await?;
+            let got = match status {
+                503 => format!(
+                    "503 {}, {}, {}",
+                    match body.contains(sentence) {
+                        true => "with the replica's sentence",
+                        false => "without the replica's sentence",
+                    },
+                    match body.contains("(an administrator: POST") {
+                        true => "with the route",
+                        false => "without the route",
+                    },
+                    match body.contains("replica") {
+                        true => "naming the replica",
+                        false => "naming no replica",
+                    },
+                ),
+                other => other.to_string(),
+            };
+            match got == want {
+                true => println!("CASE {who}, on a replica: right {got}"),
+                false => {
+                    println!("CASE {who}, on a replica: WRONG {got}, want {want}");
+                    println!("  its body: {body}");
+                    wrong.push(who);
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "answered otherwise on a replica: {wrong:?}"
+    );
+    Ok(())
+}

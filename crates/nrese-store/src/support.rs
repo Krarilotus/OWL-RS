@@ -60,6 +60,7 @@ use nrese_reasoner::ir::Triple;
 use nrese_sparql::{CancellationToken, GraphAccess, PendingRead, ReadView};
 
 use crate::reasoning::Program;
+use crate::reasoning_state::fingerprint;
 
 #[cfg(test)]
 #[path = "support_tests.rs"]
@@ -146,6 +147,10 @@ pub enum Unavailable {
     MemoryUnreadable,
     /// The reading query was cancelled, or its time ran out, while the view was computed.
     Cancelled,
+    /// The rules in place aren't the ones the snapshot's certificate was made with (they
+    /// were changed or removed, the store not rematerialised), or nothing vouches for its
+    /// inferred statements; true: the store is a read replica ([`Compilation::replica`]).
+    OtherProgram(bool),
 }
 
 impl From<BudgetExceeded> for Unavailable {
@@ -165,6 +170,7 @@ impl From<Unavailable> for crate::StoreError {
                 limit: nrese_exec::memory::process_limit().unwrap_or(0),
             },
             Unavailable::Cancelled => nrese_sparql::QueryEvaluationError::Cancelled.into(),
+            Unavailable::OtherProgram(replica) => crate::StoreError::NotRematerialised { replica },
         }
     }
 }
@@ -1797,6 +1803,20 @@ struct Generation {
     ever: bool,
 }
 
+/// Whether `snapshot`'s certificate was made with other rules than `generation`'s (they were
+/// changed or removed, the store not rematerialised), or it has none and isn't bare (its stack
+/// kept, its certificate gone: nothing vouches for it); `hide`: unnamed classes' memberships
+/// left out ([`Compilation::hide_unnamed_classes`]).
+fn made_with_other_rules(generation: &Generation, snapshot: &Snapshot, hide: bool) -> bool {
+    let rules = generation.rules.as_ref();
+    match crate::service::Certificate::of(snapshot) {
+        Some(made) => rules.is_none_or(|rules| {
+            fingerprint(rules, hide, made.state.compact_equality) != made.state.fingerprint
+        }),
+        None => !crate::service::Certificate::bare(snapshot, rules.is_some()),
+    }
+}
+
 #[derive(Debug)]
 struct State {
     generation: Generation,
@@ -1892,6 +1912,8 @@ pub(crate) struct Compilation {
     pub(crate) by_representatives: bool,
     pub(crate) compact: bool,
     pub(crate) cap: usize,
+    /// The store is a read replica ([`crate::dl::Dl::replica`]): a refusal says so.
+    pub(crate) replica: bool,
 }
 
 /// What one read sees of the store, the one decision of it ([`Reading::of`]): of a committed
@@ -1945,8 +1967,14 @@ impl Reading {
                 .any(|graph| !self.access.allows_id(snapshot, graph))
     }
 
-    /// `snapshot`, a committed revision, as this reader reads it.
+    /// `snapshot`, a committed revision, as this reader reads it. Refused while the rules in
+    /// place aren't its certificate's, with a view or without one: a refusal only where a
+    /// graph is out of the reader's reach would tell it that one is.
     pub(crate) fn committed(&self, snapshot: &Snapshot) -> Result<Snapshot, Unavailable> {
+        let generation = self.supports.state().generation.clone();
+        if made_with_other_rules(&generation, snapshot, self.compilation.hide_unnamed_classes) {
+            return Err(Unavailable::OtherProgram(self.compilation.replica));
+        }
         match self.through_view(snapshot) {
             true => self.supports.view(
                 snapshot,
@@ -1976,10 +2004,11 @@ impl Reading {
         if tx.pending() == (0, 0) && tx.inferred_pending() == (0, 0) {
             return Ok(self.committed(tx.base())?);
         }
+        // Its base as the reader reads it, refused as [`Self::committed`] is.
+        let view = self.committed(tx.base())?;
         if !self.through_view(tx.base()) {
             return Ok(tx.pending_snapshot_within(budget)?);
         }
-        let view = self.committed(tx.base())?;
         // A view made before isn't made again: the read's cancellation still stops it here.
         let working = Work {
             budget: Arc::new(self.memory.part()),
@@ -2243,6 +2272,12 @@ impl Supports {
         let (cell, rederiving, view, generation) = {
             let mut state = self.state();
             let generation = state.generation.clone();
+            // A view under other rules than its certificate's would show what they derive,
+            // which a graph the reader can't read may decide: refused, nothing kept. Asked
+            // again here, of the rules the view is made with.
+            if made_with_other_rules(&generation, snapshot, compilation.hide_unnamed_classes) {
+                return Err(Unavailable::OtherProgram(compilation.replica));
+            }
             let (_, cell, rederiving, views) = state.latest_for(snapshot, &self.kept)?;
             let view = match views.iter().find(|(seen, _)| **seen == **access) {
                 Some((_, view)) => view.clone(),

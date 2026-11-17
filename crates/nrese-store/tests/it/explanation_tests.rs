@@ -116,6 +116,7 @@ fn explanations_stay_within_the_readers_graphs() {
         )))
         .unwrap();
     store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
     let scope = |inferred: bool| {
         nrese_store::ReadScope::Graphs(Arc::new(nrese_sparql::GraphAccess {
             graphs: vec![format!("{EX}open")],

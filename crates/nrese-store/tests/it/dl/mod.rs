@@ -40,10 +40,14 @@ pub const PREFIXES: &str = "PREFIX : <http://example.com/> \
 
 /// A store running the `owl2-dl` mode with `dl`.
 pub fn pipeline_with(dl: DlConfig) -> MutationPipeline {
-    let config = StoreConfig {
+    pipeline_of(StoreConfig {
         dl,
         ..crate::support::in_memory_store_config()
-    };
+    })
+}
+
+/// A store opened with `config`, running the `owl2-dl` mode.
+pub fn pipeline_of(config: StoreConfig) -> MutationPipeline {
     let store = StoreService::new(config).expect("store");
     MutationPipeline::new(
         Arc::new(store),
