@@ -1,4 +1,4 @@
-//! A rule's name is only its name (D16-773): what the reasoner makes of a user's rules follows
+//! A rule's name is only its name: what the reasoner makes of a user's rules follows
 //! from what they say, whatever they are called. The expected answers are written by hand from
 //! the PIE dialect's meaning (a rule's premises entail its conclusions; its `Id` is only its
 //! name).

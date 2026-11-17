@@ -101,7 +101,7 @@ impl WhyUndecided {
 
 /// The fingerprint of `program` as the store runs it: leaving out unnamed classes'
 /// memberships is another closure. Its value changed when the program, not a rule's name,
-/// came to say whether those classes' members are things (D16-773): every closure an older
+/// came to say whether those classes' members are things: every closure an older
 /// build left out memberships in is rebuilt once.
 pub(crate) fn fingerprint(
     program: &RuleProgram,

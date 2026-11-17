@@ -732,19 +732,18 @@ fn query_brings_a_closure_an_older_semantics_wrote_up_to_date()
     Ok(())
 }
 
-/// A store under `reasoner.unnamed_classes = "skip"` whose closure the build before D16-773
-/// row 1 wrote: that build made a hidden union class's members things because a rule was named
-/// `scm-cls`, here a symmetry rule that makes nothing a thing (Sol's review r1, S1). Opened by
-/// `nrese-server query` and by the server's start, the closure is rebuilt under this build's
-/// rules, where `ex:x` is no `owl:Thing`. Opened by `nrese-server query` configured as a read
-/// replica, which reasons nothing, the query is refused with the way out (rebuild the primary
-/// and re-bootstrap the replica), not answered from that closure. Opened by the server's start
-/// as a read replica, whose reads follow its primary's log, a reasoned read of that closure is
-/// told `not-certified`: nothing on a replica vouches for it. Run by `nrese-server query` while
-/// its directory is locked, the query is refused at the open and answers nothing. The older
-/// closure is written by this build under the same rules and one more that makes things; its
-/// marker is the older build's for these rules: their fingerprint with the value `skip` had
-/// then, written down here.
+/// A store under `reasoner.unnamed_classes = "skip"` whose closure an earlier build wrote: that
+/// build made a hidden union class's members things because a rule was named `scm-cls`, here a
+/// symmetry rule that makes nothing a thing. Opened by `nrese-server query` and by the server's
+/// start, the closure is rebuilt under this build's rules, where `ex:x` is no `owl:Thing`. Opened
+/// by `nrese-server query` configured as a read replica, which reasons nothing, the query is
+/// refused with the way out (rebuild the primary and re-bootstrap the replica), not answered from
+/// that closure. Opened by the server's start as a read replica, whose reads follow its primary's
+/// log, a reasoned read of that closure is told `not-certified`: nothing on a replica vouches for
+/// it. Run by `nrese-server query` while its directory is locked, the query is refused at the open
+/// and answers nothing. The older closure is written by this build under the same rules and one
+/// more that makes things; its marker is the older build's for these rules: their fingerprint with
+/// the value `skip` had then, written down here.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
 -> Result<(), Box<dyn std::error::Error>> {
