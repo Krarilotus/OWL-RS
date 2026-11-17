@@ -153,7 +153,7 @@ fn literals_a_change_reads_by_value_are_kept_only_once_its_commit_happens() {
     // Prepared, never installed: the commit didn't happen.
     let mut tx = store.engine().transaction();
     tx.insert(key_value("urn:test:d2").as_ref());
-    let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER);
+    let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER, false);
     assert!(
         matches!(prepared.prepared, Prepared::Delta(_)),
         "the change's path"

@@ -608,7 +608,7 @@ mod tests {
         );
         let check = |memory: &nrese_exec::Envelope| {
             let mut prepared =
-                super::super::bounds::prepare(&store, &tx, nrese_reasoner::eval::NEVER);
+                super::super::bounds::prepare(&store, &tx, nrese_reasoner::eval::NEVER, false);
             assert!(!prepared.proves_consistency, "U1 clashes: the gate decides");
             assert!(prepared.ontology.is_none(), "the gate reads the ontology");
             let reader = crate::ReadScope::All;
