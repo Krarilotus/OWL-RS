@@ -25,6 +25,10 @@ const HORN: &str = ":A a owl:Class . :B a owl:Class . :p a owl:ObjectProperty . 
 const TWO_DATES: &str = r#":a :born "2020-01-01"^^xsd:date , "2021-06-30"^^xsd:date ."#;
 const MAX_ONE: &str = ":A a owl:Class . :A rdfs:subClassOf [ a owl:Restriction ; \
      owl:onProperty :born ; owl:maxCardinality \"1\"^^xsd:nonNegativeInteger ] . :a a :A .";
+/// A class whose members' `:born` has the value 5: OWL 2 RL's rules would type or compare data
+/// values for it, so the store leaves their route.
+const HAS_VALUE: &str = ":C a owl:Class ; owl:equivalentClass [ a owl:Restriction ; \
+     owl:onProperty :born ; owl:hasValue 5 ] .";
 
 /// The route and the verdict the store is told after its last commit, and whether a read of
 /// `:born` is told complete; its reason as a `REASON` line.
@@ -279,8 +283,6 @@ const NOTHING_READS: &[&str] = &[
 #[test]
 fn an_ill_typed_literal_of_the_maps_datatypes_is_told_as_the_rules_tell_it() {
     const ILL: &str = r#":a :born "abc"^^xsd:integer ."#;
-    const HAS_VALUE: &str = ":C a owl:Class ; owl:equivalentClass [ a owl:Restriction ; \
-         owl:onProperty :born ; owl:hasValue 5 ] .";
     let range = ":born rdfs:range xsd:integer .";
     let cells: Vec<(&str, Vec<&str>, &[&str])> = vec![
         ("an ill-typed integer nothing reads", vec![DATA, ILL], RULES),
@@ -292,6 +294,42 @@ fn an_ill_typed_literal_of_the_maps_datatypes_is_told_as_the_rules_tell_it() {
         (
             "an ill-typed integer beside a hasValue",
             vec![DATA, HAS_VALUE, ILL],
+            NOT_TOLD,
+        ),
+    ];
+    judge(
+        cells
+            .into_iter()
+            .map(|(name, parts, want)| (name, told_after(name, &parts), want))
+            .collect(),
+    );
+}
+
+/// A literal of a datatype the ontology names itself, outside the standard vocabularies
+/// (`"x"^^:T`), isn't OWL 2 DL unless a datatype definition defines `:T` (Structural
+/// Specification §11.2): the OWL 2 datatype map doesn't hold it. OWL 2 RL's rules judge only the
+/// map's datatypes (OWL 2 Profiles §4.3, table 8), so on their route its literals are kept as
+/// written and never compared by value: two of them under a functional property are no clash.
+/// Where a value is read (`hasValue`), the store leaves the rules' route, and the full check,
+/// which has no value for the literal, tells `unknown`.
+#[test]
+fn a_literal_of_the_ontologys_own_datatype_is_kept_as_written() {
+    const OWN: &str = r#":a :born "x"^^:T ."#;
+    let functional = ":born a owl:FunctionalProperty .";
+    let cells: Vec<(&str, Vec<&str>, &[&str])> = vec![
+        (
+            "a literal of the ontology's own datatype",
+            vec![DATA, OWN],
+            RULES,
+        ),
+        (
+            "two literals of the ontology's own datatype under a functional property",
+            vec![DATA, functional, r#":a :born "x"^^:T , "y"^^:T ."#],
+            RULES,
+        ),
+        (
+            "a literal of the ontology's own datatype beside a hasValue",
+            vec![DATA, HAS_VALUE, OWN],
             NOT_TOLD,
         ),
     ];
