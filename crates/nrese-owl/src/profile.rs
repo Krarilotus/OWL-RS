@@ -478,8 +478,10 @@ fn grammar(o: &Ontology, axiom: &Axiom) -> Profiles {
             rl: rl_super(o, *c),
         },
         Axiom::ObjectPropertyAssertion(..) | Axiom::DifferentIndividuals(_) => Profiles::ALL,
-        // RL's rules judge only RL's datatypes; a literal the source didn't give isn't known
-        // to have one.
+        // RL's rules judge only RL's datatypes. A literal the source didn't give is outside RL;
+        // one whose datatype the source doesn't know (`Terms::datatype`'s `None`) is admitted:
+        // a source that keeps no datatypes, as the W3C runner's, would otherwise put every
+        // data assertion outside RL. The store's and the query compiler's sources give one.
         Axiom::DataPropertyAssertion(_, _, v) => Profiles {
             rl: o
                 .data

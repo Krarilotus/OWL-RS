@@ -35,11 +35,11 @@ pub trait Terms {
     /// The id of an IRI, if the source has it.
     fn iri(&self, iri: &str) -> Option<Term>;
 
-    /// A literal's datatype IRI (`rdf:langString` for a language-tagged one), if the
-    /// source gives it: the datatype theory needs it for the literal's value.
-    fn datatype(&self, _term: Term) -> Option<String> {
-        None
-    }
+    /// A literal's datatype IRI (`rdf:langString` for a language-tagged one), or `None`
+    /// where the source doesn't know it (every RDF literal has one). The datatype theory
+    /// needs it for the literal's value; the profile check admits to OWL 2 RL a literal whose
+    /// datatype isn't known (`crate::profile`), so each source says which it is.
+    fn datatype(&self, term: Term) -> Option<String>;
 
     /// A literal's language tag, if it has one and the source gives it.
     fn language(&self, _term: Term) -> Option<String> {

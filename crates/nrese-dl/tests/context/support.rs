@@ -97,6 +97,11 @@ impl Terms for Table {
     fn iri(&self, iri: &str) -> Option<Term> {
         self.ids.get(&format!("<{iri}>")).copied()
     }
+
+    // Not read from the literal's text: these tests ask nothing of literals' datatypes.
+    fn datatype(&self, _: Term) -> Option<String> {
+        None
+    }
 }
 
 impl Make for Table {
