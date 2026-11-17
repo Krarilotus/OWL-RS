@@ -645,8 +645,8 @@ const COMPARED: &str = "two spellings of one value are two terms to the store, w
 /// Why a read of a store in quarantine (its certificate's violations) may miss rows: fixed
 /// words, nothing of the clash, for a reader of some graphs too (`/readyz` tells anyone).
 const QUARANTINE: &str = "the store is in quarantine (the consistency rules found violations and \
-                          have not found the data clean since); inconsistent data entail every \
-                          answer, so no read is certified complete until it leaves";
+                          have not found the data clean since), and as inconsistent data entail \
+                          every answer, no read is certified complete until it leaves";
 
 /// The one rule of every path's status under an OWL 2 regime, composed last onto it (by
 /// both DL entry points, [`plan_status`] and [`answer`], after the bounds; over a ruleset's
@@ -656,7 +656,7 @@ const QUARANTINE: &str = "the store is in quarantine (the consistency rules foun
 /// a typed constant ([`typed_constant`]); a data value compared by term ([`compared_values`])
 /// through a property that holds a literal other than a string, in `snapshot` (the data
 /// read; unknown, or read for a restricted reader: every property), can give wrong rows;
-/// a store in quarantine misses rows ([`QUARANTINE`]), whoever reads it;
+/// a store in quarantine may miss rows ([`QUARANTINE`]), whoever reads it;
 /// and where rows may be missing, an operator
 /// under which a missing row can make a returned one wrong ([`negation`]) makes the answers
 /// unsound. Each from `source`.

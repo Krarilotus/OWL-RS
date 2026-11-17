@@ -1018,9 +1018,9 @@ fn a_store_leaving_quarantine_is_not_complete_until_revalidated_then_as_clean_da
     let clean = status(&clean, IN_H);
     let (revision, quarantined, during) = kept.lock().unwrap().take().expect("the hook ran");
     let told = "sound-only; regime=owl2-dl; reasons=\"dl: the store is in quarantine (the \
-                consistency rules found violations and have not found the data clean since); \
-                inconsistent data entail every answer, so no read is certified complete until \
-                it leaves\"";
+                consistency rules found violations and have not found the data clean since), and \
+                as inconsistent data entail every answer, no read is certified complete until it \
+                leaves\"";
     assert_eq!(during, told, "the window");
     assert_eq!(after, clean);
     assert!(
