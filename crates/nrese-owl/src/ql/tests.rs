@@ -42,6 +42,11 @@ impl Terms for Table {
     fn iri(&self, iri: &str) -> Option<Term> {
         self.ids.get(iri).copied()
     }
+
+    // The table keys a literal by its lexical form alone: it keeps no datatype.
+    fn datatype(&self, _: Term) -> Option<String> {
+        None
+    }
 }
 
 impl Intern for Table {
