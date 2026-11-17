@@ -176,20 +176,8 @@ impl IntoResponse for ApiError {
             );
         }
         let rights_changed = matches!(self, Self::RightsChanged(_));
-        if let Self::Busy(detail) | Self::RightsChanged(detail) = self {
-            let mut response = match rights_changed {
-                false => Self::ServiceUnavailable(detail).into_response(),
-                true => problem(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    &ProblemJson {
-                        r#type: Cow::Borrowed("https://nrese.dev/problems/rights-changed"),
-                        title: Cow::Borrowed("Rights Changed"),
-                        status: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-                        detail,
-                        reasoner_reject: None,
-                    },
-                ),
-            };
+        if let Self::Busy(detail) = self {
+            let mut response = Self::ServiceUnavailable(detail).into_response();
             response
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
@@ -214,10 +202,7 @@ impl IntoResponse for ApiError {
             Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
             Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
             Self::Conflict(detail) => (StatusCode::CONFLICT, detail, None),
-            Self::IncompleteAnswer(_)
-            | Self::Busy(_)
-            | Self::NotImplemented(..)
-            | Self::RightsChanged(_) => {
+            Self::IncompleteAnswer(_) | Self::Busy(_) | Self::NotImplemented(..) => {
                 unreachable!("answered above")
             }
             Self::Gone(detail) => (StatusCode::GONE, detail, None),
@@ -228,7 +213,9 @@ impl IntoResponse for ApiError {
             Self::PayloadTooLarge(detail) => (StatusCode::PAYLOAD_TOO_LARGE, detail, None),
             Self::TooManyRequests(detail) => (StatusCode::TOO_MANY_REQUESTS, detail, None),
             Self::Timeout(detail) => (StatusCode::REQUEST_TIMEOUT, detail, None),
-            Self::ServiceUnavailable(detail) => (StatusCode::SERVICE_UNAVAILABLE, detail, None),
+            Self::ServiceUnavailable(detail) | Self::RightsChanged(detail) => {
+                (StatusCode::SERVICE_UNAVAILABLE, detail, None)
+            }
             Self::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail, None),
         };
         let (problem_type, title) = match rejected {
@@ -239,6 +226,10 @@ impl IntoResponse for ApiError {
                     Cow::Borrowed(title),
                 )
             }
+            None if rights_changed => (
+                Cow::Borrowed("https://nrese.dev/problems/rights-changed"),
+                Cow::Borrowed("Rights Changed"),
+            ),
             None => kind(status),
         };
         let mut response = problem(
@@ -256,6 +247,10 @@ impl IntoResponse for ApiError {
                 header::WWW_AUTHENTICATE,
                 HeaderValue::from_static(challenge),
             );
+        }
+        if rights_changed {
+            let retry = HeaderValue::from_static("1");
+            response.headers_mut().insert(header::RETRY_AFTER, retry);
         }
         response
     }

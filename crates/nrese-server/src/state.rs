@@ -143,9 +143,9 @@ impl AppState {
             return Ok(None);
         };
         let identity = |user: String| crate::auth::Identity {
-            admin: false,
-            roles: std::collections::BTreeSet::new(),
             user: Some(user),
+            local: true,
+            ..Default::default()
         };
         if let Some(token) = value
             .strip_prefix("Bearer ")
@@ -203,9 +203,11 @@ impl AppState {
     /// What `identity` may read and write in this state's repository.
     pub fn access_view(&self, identity: &crate::auth::Identity) -> crate::access::AccessView {
         let principal = crate::access::principal(identity);
-        // The state's grant admits a write unless its credentials (an administrator's, none) do.
+        // The state admits local logins' writes, and others' unless credentials (admin, none) do.
+        use nrese_store::access::Grant::{Login, Write};
         let credentials = identity.admin || self.policy.auth == crate::auth::AuthConfig::None;
-        let grant = (!credentials).then_some(nrese_store::access::Grant::Write);
+        let by_state = identity.local || !credentials;
+        let grant = by_state.then_some(if identity.local { Login } else { Write });
         let mut view = (self.shared.access).view_checked(&principal, &self.repository, grant);
         view.origin = Some(principal.display());
         view
@@ -451,7 +453,6 @@ impl AppState {
             .map_err(challenged)?
         {
             Some(identity) => {
-                // `admin` stays a credential's: the record's is the state's, read where it counts.
                 let principal = crate::access::principal(&identity);
                 let admin = self.shared.access.state().is_admin(&principal);
                 let mut grants = std::collections::BTreeSet::from([crate::auth::AccessGrant::Read]);

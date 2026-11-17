@@ -195,8 +195,7 @@ pub(crate) async fn apply(
     .map(|_| ())
 }
 
-/// [`apply`] of a client transaction's commit: one refused for changed rights ended it unwritten,
-/// and retrying can't help (409).
+/// [`apply`] of a client transaction's commit, which ends it: so changed rights answer 409.
 pub(crate) async fn commit(state: &AppState, ops: StatementOps, access: &AccessView) -> Ended {
     match apply(state, ops, access).await {
         Err(ApiError::RightsChanged(_)) => Err(ApiError::conflict(

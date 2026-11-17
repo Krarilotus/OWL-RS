@@ -95,13 +95,14 @@ impl Authenticated {
 /// Who a request is, as its credentials say: an administrator, its role names (claims of
 /// a token, `reader` for a static read token, the subject of a client certificate;
 /// `anonymous` without authentication) and its user name (a token's subject, a client
-/// certificate's subject when it is a valid name). Graph access ([`crate::access`]) is
-/// decided by them.
+/// certificate's subject when it is a valid name); `local`: a local login's, whose administrator
+/// status is the access state's. Graph access ([`crate::access`]) is decided by them.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Identity {
     pub admin: bool,
     pub roles: BTreeSet<String>,
     pub user: Option<String>,
+    pub local: bool,
 }
 
 impl Identity {
@@ -110,7 +111,7 @@ impl Identity {
         Self {
             admin: false,
             roles: BTreeSet::from(["anonymous".to_owned()]),
-            user: None,
+            ..Self::default()
         }
     }
 
@@ -119,7 +120,7 @@ impl Identity {
         Self {
             admin: grants.contains(&AccessGrant::Admin),
             roles,
-            user: None,
+            ..Self::default()
         }
     }
 

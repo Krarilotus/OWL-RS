@@ -453,12 +453,13 @@ pub struct RightsCheck {
     grant: Option<Grant>,
 }
 
-/// The state's right that admitted a write where its credentials (which give writes only to
-/// administrators) didn't: [`AccessState::grants_write`] or [`AccessState::is_admin`].
+/// The state's right that admitted a write where credentials didn't: [`AccessState::grants_write`]
+/// (`Write`), [`AccessState::is_admin`] (`Admin`), or either (a local login's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Grant {
     Write,
     Admin,
+    Login,
 }
 
 impl RightsCheck {
@@ -474,8 +475,9 @@ impl RightsCheck {
         let (principal, admin) = (&self.principal, now.is_admin(&self.principal));
         let granted = match self.grant {
             None => true,
-            Some(Grant::Write) => admin || now.grants_write(principal),
+            Some(Grant::Write) => now.grants_write(principal),
             Some(Grant::Admin) => admin,
+            Some(Grant::Login) => admin || now.grants_write(principal),
         };
         let rights = || now.view(principal, &self.repository).requester();
         let same = Arc::ptr_eq(&*now, &self.state) || rights() == self.rights;
