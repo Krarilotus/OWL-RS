@@ -1279,12 +1279,12 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
 }
 
 /// True if `GRAPH ?graph { pattern }` can be evaluated once for all graphs, every triple
-/// pattern binding `?graph` from its scan: every solution then comes from triple patterns
-/// in every branch, and the pattern holds nothing but triple patterns and the operators
-/// that join them on `?graph` like on any variable.
+/// pattern binding `?graph` from its scan: every row of every part then comes from triple
+/// patterns, so rows of different graphs never meet, and the pattern holds nothing but
+/// triple patterns and the operators that join them on `?graph` like on any variable.
 ///
-/// Anything else is evaluated graph by graph: a row without a scan (VALUES, an empty
-/// group, BIND alone), a property path (followed within one graph), a GeoSPARQL relation
+/// Anything else is evaluated graph by graph: a part whose row comes from no scan (VALUES,
+/// an empty group, BIND alone, at any depth: one row for all graphs), a property path (followed within one graph), a GeoSPARQL relation
 /// computed from geometries (`spatial`: within one graph's geometries), a subquery or a
 /// nested GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make
 /// rows with no other common variable remove each other), a BIND to `?graph` itself, and
@@ -1292,7 +1292,9 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
 fn scans_everywhere(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
     fn only_scans(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
         match pattern {
-            GraphPattern::Bgp { patterns } => !spatial || !patterns.iter().any(spatial::is_spatial),
+            GraphPattern::Bgp { patterns } => {
+                !patterns.is_empty() && (!spatial || !patterns.iter().any(spatial::is_spatial))
+            }
             GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
                 inputs.iter().all(|input| only_scans(input, graph, spatial))
             }
@@ -1342,20 +1344,6 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> 
             other => !pushdown::per_solution(other) || !contains_any_exists(other),
         }
     }
-    fn rows_from_scans(pattern: &GraphPattern) -> bool {
-        match pattern {
-            GraphPattern::Bgp { patterns } => !patterns.is_empty(),
-            GraphPattern::Join { inputs } => inputs.iter().any(rows_from_scans),
-            GraphPattern::Union { inputs } => inputs.iter().all(rows_from_scans),
-            GraphPattern::LeftJoin { left, .. } | GraphPattern::Minus { left, .. } => {
-                rows_from_scans(left)
-            }
-            GraphPattern::Filter { inner, .. } | GraphPattern::Extend { inner, .. } => {
-                rows_from_scans(inner)
-            }
-            _ => false,
-        }
-    }
     // Whether every row of `pattern` binds `?graph` from data.
     fn binds(pattern: &GraphPattern, graph: &Variable) -> bool {
         pushdown::certain(pattern).contains(graph)
@@ -1363,7 +1351,7 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> 
     fn reads(expression: &Expression, graph: &Variable) -> bool {
         exists::deep_variables(expression).contains(graph)
     }
-    only_scans(pattern, graph, spatial) && rows_from_scans(pattern)
+    only_scans(pattern, graph, spatial)
 }
 
 /// True if `expression` holds an `EXISTS` at any depth.
