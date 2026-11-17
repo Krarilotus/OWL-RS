@@ -1,6 +1,6 @@
 # Reasoning: supported semantics
 
-This is the contract for what NRESE's reasoning computes, for the code of the commit this page is in (`SEMANTICS_VERSION` 4 since 7 November 2026: the datatype checks read literals as OWL 2's datatype map does, so a consistency verdict version 3 recorded is rechecked once; 3 since 28 October 2026: closures version 2's maintenance wrote are rebuilt once). A mode name alone doesn't state it; this page does. The source of truth is `crates/nrese-reasoner/src/rulesets.rs` (the rule text) and `lists.rs` (list axioms).
+This is the contract for what NRESE's reasoning computes, for the code of the commit this page is in (`SEMANTICS_VERSION` 5 since 17 November 2026: under `reasoner.equality = "compact"` the datatype checks read every literal of an `owl:sameAs` class, so a store written by an earlier engine-v2 build rebuilds its inferences once at its first start; 4 since 7 November 2026: the datatype checks read literals as OWL 2's datatype map does, so a consistency verdict version 3 recorded is rechecked once; 3 since 28 October 2026: closures version 2's maintenance wrote are rebuilt once). A mode name alone doesn't state it; this page does. The source of truth is `crates/nrese-reasoner/src/rulesets.rs` (the rule text) and `lists.rs` (list axioms).
 
 ## Modes
 
