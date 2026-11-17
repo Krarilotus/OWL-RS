@@ -601,7 +601,10 @@ impl StoreService {
     /// inconsistent, or its rules' violations undecided, under the recorded reasoning; or,
     /// since a commit on a store in quarantine, its consistency not assessed again.
     pub fn is_quarantined(&self) -> bool {
-        self.unassessed.load(std::sync::atomic::Ordering::Acquire)
+        let unassessed = self.unassessed.load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(test)]
+        hooks::run(&hooks::BETWEEN_QUARANTINE_READS);
+        unassessed
             || matches!(
                 self.consistency(),
                 crate::ConsistencyStatus::Inconsistent { .. }
@@ -2693,6 +2696,8 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_CLEAR_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A reasoning commit in quarantine has published and is about to revalidate.
         pub(crate) static BEFORE_REVALIDATION: Hook = const { RefCell::new(None) };
+        /// A quarantine reading has read the mark and is about to read the assessment.
+        pub(crate) static BETWEEN_QUARANTINE_READS: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {
