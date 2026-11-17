@@ -261,10 +261,7 @@ class Admission(unittest.TestCase):
         # deadline, then admitted on a disk reading taken before the wait. Another live process holds
         # the lock for 8 s while C: falls from 110 GB to 99; the run (1 s limit) must end before then.
         self.disk(110)
-        holder = subprocess.Popen([BASH, "-c", 'read -r -a s < /proc/$$/stat; echo "$$@${s[21]}"; for i in $(seq 60); do sleep 1; done'],
-                                  stdout=subprocess.PIPE, text=True)
-        self.addCleanup(lambda: (holder.kill(), holder.wait()))
-        identity = holder.stdout.readline().strip()
+        identity = self.live_identity()
         lock = self.root / "slots" / ".lock"
         lock.mkdir(parents=True)
         (lock / "holder").write_text(identity + "\n")
@@ -372,6 +369,38 @@ class Admission(unittest.TestCase):
         self.assertIsNotNone(self.started("a", within=60))
         self.assertEqual(build.wait(timeout=120), 0)
         self.assertEqual(list((self.root / "slots" / "run").iterdir()), [])
+
+    def live_identity(self):
+        # A live process's identity (pid and start time, as the script names holders), ended with all it
+        # started (Git's bash launcher leaves its shell running when only the launcher is killed).
+        holder, end = owned([BASH, "-c", 'read -r -a s < /proc/$$/stat; echo "$$@${s[21]}"; for i in $(seq 60); do sleep 1; done'],
+                            stdout=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (end(), holder.stdout.close()))
+        return holder.stdout.readline().strip()
+
+    def test_a_run_whose_peak_is_gone_when_read_holds_nothing_and_the_build_goes_on(self):
+        # A run that ends removes its slot without the admission lock (cleanup), so another
+        # build can find its peak file and then fail to read it; under `set -e` that build died with
+        # exit 1 and its cargo never ran (a Windows gate on 17 Nov: 13 test binaries). A live holder
+        # whose peak exists but can't be read (a directory) stands for the one removed in between.
+        slot = self.root / "slots" / "run" / self.live_identity()
+        (slot / "peak").mkdir(parents=True)
+        build = self.start("a", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="1")
+        _, err = build.communicate(timeout=120)
+        self.assertIsNotNone(self.started("a", within=1), err)
+        self.assertEqual(build.returncode, 0, err)
+
+    def test_a_run_that_dies_before_cargo_says_which_call_and_where(self):
+        # The script ended with exit 1 and only bash's own line; a gate step then read like a
+        # failed cargo run. A slot directory under a file can't be made: the script names its call
+        # and the command that failed.
+        (self.root / "a-file").write_text("")
+        build = self.start("a", stderr=subprocess.PIPE, NRESE_BUILD_SLOT_DIR=str(self.root / "a-file" / "slots"))
+        _, err = build.communicate(timeout=120)
+        self.assertIn("cargo-guarded.sh (cargo build): stopped at line", err)
+        self.assertIn("mkdir -p", err)
+        self.assertNotEqual(build.returncode, 0, err)
+        self.assertFalse((self.out / "a.started").exists())
 
     def test_only_a_completed_stop_of_its_own_build_counts_and_a_late_one_is_waited_for(self):
         for notice, code in (("late", 75), ("other", 127), ("failed", 127), ("intent", 127)):
