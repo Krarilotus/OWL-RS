@@ -11,6 +11,7 @@ mod catalog_ontology_store_tests;
 mod certificate_read_tests;
 mod closure_status_tests;
 mod convert_tests;
+mod datatype_clash_tests;
 mod dl;
 mod dl_oracle_tests;
 mod document_end_tests;
