@@ -147,6 +147,8 @@ leave something out.
   cardinality, or compared), the consistency is `unknown` and no read is `complete`; a date
   nothing reads changes nothing. Use `xsd:dateTime`, which is in the map, where you can
   ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
+- A value the store can't represent (an `xsd:dateTime` with a year beyond 10¹¹, say) is checked
+  neither for a clash nor for being in its datatype, so a store that holds one is told consistent.
 - Under `owl2-dl`, a key or a negative property assertion over a value the store's quick
   proof of consistency can't read (an `xsd:date` written two ways; also, stricter than needed,
   an integer beyond 128 bits or a string with a base direction) leaves the consistency
