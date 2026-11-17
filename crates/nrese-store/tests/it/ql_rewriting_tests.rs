@@ -3015,30 +3015,31 @@ fn reader_by_support() -> nrese_store::ReadScope {
 const HIDDEN: &str = ":hidden { :note a owl:AnnotationProperty . }\n\
                       :open { :x :note \"a\" . :x owl:sameAs :y . :x a :A . }";
 
+/// [`HIDDEN`] without the declaration.
+const UNDECLARED: &str = ":open { :x :note \"a\" . :x owl:sameAs :y . :x a :A . }";
+
 /// Spec (docs/spec/reasoning-semantics.md:86, a restricted reader's status says nothing about
-/// graphs they can't read; the ruling of 19:39, condition 1, and the lead's of 19:53, its
-/// conservative form): with `:note`'s declaration in a graph the reader can't read, and the
-/// note and the equality in one it can, a read of `:note` the rewriting answers, whose rows
-/// hold the copy, is neither `complete` nor `sound-only`.
+/// graphs they can't read; the master's ruling of 20:49, point 3: in its graphs a predicate
+/// without a declaration is no annotation property): with `:note`'s declaration in a graph the
+/// reader can't read, and the note and the equality in one it can, a read of `:note` the
+/// rewriting answers, whose rows hold the copy, is told as on the same data without the
+/// declaration: status and reasons alike.
 #[test]
-fn a_reader_who_cant_see_the_declaration_is_not_told_a_copied_annotation_is_sound() {
-    let store = annotation_store(Ruleset::Owl2Rl, QlRewritingMode::On, HIDDEN);
+fn a_reader_who_cant_see_the_declaration_is_told_as_without_it() {
     let query = "SELECT ?s ?o { ?s :note ?o }";
-    let rows = rows_of(&store, query, reader_by_support());
-    let copied = rows.iter().any(|r| r.contains(&format!("<{E}y>")));
-    assert!(copied, "setup: the reader sees no copy: {rows:?}");
-    let (status, _) = rewritten_read(&store, query, reader_by_support());
-    let class = status_class(&status);
-    assert!(
-        class != "complete" && class != "sound-only",
-        "status: {status}"
-    );
+    let told = |data: &str| {
+        let store = annotation_store(Ruleset::Owl2Rl, QlRewritingMode::On, data);
+        let rows = rows_of(&store, query, reader_by_support());
+        let copied = rows.iter().any(|r| r.contains(&format!("<{E}y>")));
+        assert!(copied, "setup: the reader sees no copy: {rows:?}");
+        rewritten_read(&store, query, reader_by_support())
+    };
+    assert_eq!(told(HIDDEN), told(UNDECLARED));
 }
 
 /// Spec (docs/spec/reasoning-semantics.md, "What may be `complete`": `rdf:type` with a named
-/// class of your own; the lead's ruling of 19:53: the conservative form leaves `rdf:type`
-/// reads as they are): the same reader's read of a class the rewriting answers stays
-/// `complete`. The control of the cell above.
+/// class of your own; no annotation is a class assertion): the same reader's read of a class
+/// the rewriting answers stays `complete`. The control of the cell above.
 #[test]
 fn the_same_readers_class_read_stays_complete() {
     let store = annotation_store(Ruleset::Owl2Rl, QlRewritingMode::On, HIDDEN);
