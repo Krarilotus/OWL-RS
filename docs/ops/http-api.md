@@ -107,7 +107,7 @@ A requester who may not read every graph gets `steps` and `rewrites` empty in bo
 
 Other parameters are ignored, so clients that send their own (`queryLn`, `timeout`) work.
 
-Results that may use RDF 1.2 announce it (RDF 1.2 Concepts §2.1, SPARQL 1.2 Query Results JSON §3.1.3): when the query makes or matches triple terms or directional strings, or the store holds triple terms, JSON results carry `"version": "1.2"` in their head and the media type `; version=1.2`, and CONSTRUCT and DESCRIBE results in Turtle, TriG, N-Triples and N-Quads start with `VERSION "1.2"` and announce it in the media type. Other results announce nothing. Directional strings in the data alone don't count yet (that needs a dictionary statistic).
+Results that may use RDF 1.2 announce it (RDF 1.2 Concepts §2.1, SPARQL 1.2 Query Results JSON §3.1.3): when the query makes or matches triple terms or directional strings, or a graph the reader may read holds a triple term (inside a transaction, of the committed graphs, not what the transaction adds), JSON results carry `"version": "1.2"` in their head and the media type `; version=1.2`, and CONSTRUCT and DESCRIBE results in Turtle, TriG, N-Triples and N-Quads start with `VERSION "1.2"` and announce it in the media type. Other results announce nothing. Directional strings in the data alone don't count yet (that needs a dictionary statistic).
 
 One extension to the query language, as Jena and QLever have it: `HAVING` may name a `SELECT` alias (`SELECT (COUNT(?x) AS ?n) … HAVING (?n > 1)`), which then means the alias's expression. Read by the standard, the alias is unbound in `HAVING` and no group passes.
 
