@@ -92,7 +92,12 @@ pub(crate) fn violations(
             {
                 out.record(group, [s, o]);
             }
-        } else if Some(p) == same_as && TermId::from_raw(o).kind().is_literal() && s < o {
+        } else if Some(p) == same_as && TermId::from_raw(o).kind().is_literal() && s != o {
+            // Either direction: a closure that keeps representatives lists only `member
+            // sameAs representative`, the representative the smallest id. Value equality
+            // is transitive, so a class with two values has a member whose value differs
+            // from its representative's. The pair is recorded smaller id first, and the
+            // list drops it where the other direction is listed too.
             let (Some(a), Some(b)) = (literal(s), literal(o)) else {
                 continue;
             };
@@ -100,7 +105,7 @@ pub(crate) fn violations(
                 && x != y
                 && let Some(group) = *diff.get_or_insert_with(|| out.group("dt-diff", 2))
             {
-                out.record(group, [s, o]);
+                out.record(group, [s.min(o), s.max(o)]);
             }
         }
     }
