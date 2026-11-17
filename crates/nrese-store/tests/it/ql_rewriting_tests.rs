@@ -3018,12 +3018,24 @@ const HIDDEN: &str = ":hidden { :note a owl:AnnotationProperty . }\n\
 /// [`HIDDEN`] without the declaration.
 const UNDECLARED: &str = ":open { :x :note \"a\" . :x owl:sameAs :y . :x a :A . }";
 
+/// [`HIDDEN`] with the declaration in `:open`, which the reader reads.
+const READABLE: &str = ":open { :note a owl:AnnotationProperty . \
+                        :x :note \"a\" . :x owl:sameAs :y . :x a :A . }";
+
+/// Whether `reasons` hold the annotation rule's: the closure may hold the rules' copies.
+fn names_copies(reasons: &[String]) -> bool {
+    reasons
+        .iter()
+        .any(|r| r.contains("the rules' copies of annotation statements"))
+}
+
 /// Spec (docs/spec/reasoning-semantics.md:86, a restricted reader's status says nothing about
 /// graphs they can't read; the master's ruling of 20:49, point 3: in its graphs a predicate
 /// without a declaration is no annotation property): with `:note`'s declaration in a graph the
 /// reader can't read, and the note and the equality in one it can, a read of `:note` the
 /// rewriting answers, whose rows hold the copy, is told as on the same data without the
-/// declaration: status and reasons alike.
+/// declaration: status and reasons alike, neither naming the copies. With the declaration in
+/// a graph the reader reads, the same read is told of them.
 #[test]
 fn a_reader_who_cant_see_the_declaration_is_told_as_without_it() {
     let query = "SELECT ?s ?o { ?s :note ?o }";
@@ -3034,7 +3046,49 @@ fn a_reader_who_cant_see_the_declaration_is_told_as_without_it() {
         assert!(copied, "setup: the reader sees no copy: {rows:?}");
         rewritten_read(&store, query, reader_by_support())
     };
-    assert_eq!(told(HIDDEN), told(UNDECLARED));
+    let (hidden, undeclared, readable) = (told(HIDDEN), told(UNDECLARED), told(READABLE));
+    assert!(!names_copies(&hidden.1), "hidden: {}", hidden.0);
+    assert!(!names_copies(&undeclared.1), "undeclared: {}", undeclared.0);
+    assert!(names_copies(&readable.1), "readable: {}", readable.0);
+    assert_eq!(hidden, undeclared);
+}
+
+/// Spec (docs/spec/reasoning-semantics.md:86; the master's ruling of 21:29: a reader told of
+/// a statement in a graph it can't read learns that it exists): a reader by support of the
+/// default graph, which holds an equality, reading an annotation property (built in, or
+/// declared in a graph it reads) whose only statement is in a graph it can't read, is told
+/// as on the same store without that statement: status and reasons alike.
+#[test]
+fn a_reader_by_support_isnt_told_of_a_hidden_annotation_statement() {
+    let told = |data: &str, query: &str| {
+        let store = annotation_store(Ruleset::Owl2Rl, QlRewritingMode::On, data);
+        rewritten_read(&store, query, reader_by_support())
+    };
+    let declared = ":open { :note a owl:AnnotationProperty . }";
+    let mut wrong = Vec::new();
+    for (case, without, hidden, query) in [
+        (
+            "built in",
+            ":a owl:sameAs :b .".to_owned(),
+            ":hidden { :c rdfs:label \"private\" . }",
+            "SELECT ?s ?o { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o }",
+        ),
+        (
+            "declared",
+            format!(":a owl:sameAs :b . {declared}"),
+            ":hidden { :c :note \"private\" . }",
+            "SELECT ?s ?o { ?s :note ?o }",
+        ),
+    ] {
+        let (with, alone) = (
+            told(&format!("{without}\n{hidden}"), query),
+            told(&without, query),
+        );
+        if with != alone {
+            wrong.push(format!("{case}: {} against {}", with.0, alone.0));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// Spec (docs/spec/reasoning-semantics.md, "What may be `complete`": `rdf:type` with a named

@@ -189,18 +189,41 @@ fn a_reader_who_cant_see_the_declaration_is_told_as_without_it() {
 /// as on the same data without `rdf:type a owl:AnnotationProperty`, status and reasons alike.
 #[test]
 fn rdf_type_declared_an_annotation_property_is_not_read_as_one() {
-    let told_on = |declaration: &str| {
-        let dl = pipeline();
-        let data = format!("{PREFIXES}{declaration} :x a :C . :x owl:sameAs :y .");
-        crate::support::load_past_the_pipeline(dl.store(), &data);
-        let program = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl).materialised_program();
-        dl.store()
-            .rematerialise(program.expect("the rules"))
-            .expect("rebuilt");
-        told(dl.store(), "SELECT ?x { ?x a :C }").1.header()
-    };
-    let declared = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> a owl:AnnotationProperty .";
-    assert_eq!(told_on(declared), told_on(""));
+    let q = "SELECT ?x { ?x a :C }";
+    assert_eq!(
+        beside_rdf_type(RDF_TYPE_DECLARED, q),
+        beside_rdf_type("", q)
+    );
+}
+
+/// `rdf:type` declared an annotation property.
+const RDF_TYPE_DECLARED: &str =
+    "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> a owl:AnnotationProperty .";
+
+/// The header `q` is told on `declaration` beside `:x a :C . :x owl:sameAs :y`, loaded past
+/// the pipeline and rebuilt under `owl2-dl`.
+fn beside_rdf_type(declaration: &str, q: &str) -> String {
+    let dl = pipeline();
+    let data = format!("{PREFIXES}{declaration} :x a :C . :x owl:sameAs :y .");
+    crate::support::load_past_the_pipeline(dl.store(), &data);
+    let program = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl).materialised_program();
+    dl.store()
+        .rematerialise(program.expect("the rules"))
+        .expect("rebuilt");
+    told(dl.store(), q).1.header()
+}
+
+/// Spec (as [`rdf_type_declared_an_annotation_property_is_not_read_as_one`]: in the ontology
+/// as read `rdf:type` is no annotation property): a read of any predicate beside that
+/// declaration and an equality is told as on the same data without the declaration, status
+/// and reasons alike; no copy of an annotation statement is among its rows.
+#[test]
+fn rdf_type_declared_an_annotation_property_gives_a_read_of_any_predicate_no_copies() {
+    let q = "SELECT ?s ?p ?o { ?s ?p ?o }";
+    assert_eq!(
+        beside_rdf_type(RDF_TYPE_DECLARED, q),
+        beside_rdf_type("", q)
+    );
 }
 
 /// One case of the outside check's grid: the data, the equality (empty: none), and the reads.
