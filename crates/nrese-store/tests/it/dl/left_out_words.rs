@@ -22,9 +22,13 @@ const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
 const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
 
-/// The left-out sentence among `reasons`, if one is.
-fn sentence(reasons: impl IntoIterator<Item = String>) -> Option<String> {
-    reasons.into_iter().find(|r| r.contains("were left out"))
+/// What each left-out sentence among `texts` says of the part it gives first: the verdict's
+/// and the mark's are separate reasons, and each is told.
+fn firsts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
+    let parts = texts
+        .into_iter()
+        .flat_map(|t| t.split("left out; first: ").skip(1));
+    parts.collect()
 }
 
 /// Whether `text` holds neither a debug form nor a term's id.
@@ -103,18 +107,24 @@ fn cases() -> Vec<(&'static str, String, bool, Vec<String>)> {
 }
 
 /// Each case, committed by a writer of every graph: the verdict's reason, and where the
-/// part marks reads, a read's reason and an exact read's refusal, say in words what was
-/// left out and name it as the data writes it.
+/// part marks reads, a read's reasons and an exact read's refusal (the verdict's sentence
+/// and the mark's, from the commit's record), say in words what was left out and name it as
+/// the data writes it.
 #[test]
 fn a_left_out_part_is_named_as_the_data_writes_it() {
     let mut wrong = Vec::new();
     for (case, data, marks, names) in cases() {
         let dl = pipeline();
         insert(&dl, &format!(":C a owl:Class . :D a owl:Class . {data}")).expect("committed");
-        let named = |text: &str| in_words(text) && names.iter().any(|n| text.contains(n));
+        let named = |text: &&str| in_words(text) && names.iter().any(|n| text.contains(n));
+        // At least `n` left-out sentences, each naming the part.
+        let all = |texts: Vec<&str>, n| {
+            let told = firsts(texts);
+            told.len() >= n && told.iter().all(named)
+        };
         let status = dl.store().dl().status().expect("a verdict");
         let verdict = status.consistency.verdict.reason().map(str::to_owned);
-        if !sentence(verdict.clone()).is_some_and(|s| named(&s)) {
+        if !all(verdict.iter().map(String::as_str).collect(), 1) {
             wrong.push(format!("{case}, the verdict: {verdict:?}"));
         }
         if !marks {
@@ -122,11 +132,20 @@ fn a_left_out_part_is_named_as_the_data_writes_it() {
         }
         let read = query_with(&dl, "ASK { :x a :C }", None).expect("read");
         let reasons = read.1.reasons();
-        if !sentence(reasons.clone()).is_some_and(|s| named(&s)) {
+        if !all(reasons.iter().map(String::as_str).collect(), 2) {
             wrong.push(format!("{case}, the read: {reasons:?}"));
         }
         match query_with(&dl, "ASK { :x a :C }", Some(DlAnswers::Exact)) {
-            Err(StoreError::Incomplete(answer)) if named(&answer.to_string()) => {}
+            Err(StoreError::Incomplete(answer))
+                if all(
+                    answer
+                        .status
+                        .reasons
+                        .iter()
+                        .map(|r| r.text.as_str())
+                        .collect(),
+                    2,
+                ) => {}
             other => wrong.push(format!("{case}, the exact read: {other:?}")),
         }
     }
@@ -206,12 +225,14 @@ fn a_reader_of_some_graphs_is_told_no_name_from_the_left_out_sentence() {
         .expect("read")
         .1
         .reasons();
-    let all = sentence(all.clone()).filter(|s| in_words(s) && s.contains('<'));
-    assert!(all.is_some(), "a reader of every graph: {all:?}");
+    let told = firsts(all.iter().map(String::as_str));
+    let named = told.len() >= 2 && told.iter().all(|s| in_words(s) && s.contains('<'));
+    assert!(named, "a reader of every graph: {all:?}");
 }
 
 /// A read that makes the sentence itself (a revision no commit here recorded: the store
-/// reopened) says what was left out in words and names nothing: it decodes no term.
+/// reopened) says what was left out in words and names nothing, in the verdict's sentence
+/// and the mark's: it decodes no term.
 #[test]
 fn a_read_without_the_commits_record_names_nothing() {
     let on_disk = |dir: &std::path::Path| {
@@ -228,9 +249,7 @@ fn a_read_without_the_commits_record_names_nothing() {
         .expect("read")
         .1
         .reasons();
-    let told = sentence(reasons.clone());
-    let nameless = told
-        .as_ref()
-        .is_some_and(|s| in_words(s) && !s.contains('<'));
+    let told = firsts(reasons.iter().map(String::as_str));
+    let nameless = told.len() >= 2 && told.iter().all(|s| in_words(s) && !s.contains('<'));
     assert!(nameless, "{reasons:?}");
 }
