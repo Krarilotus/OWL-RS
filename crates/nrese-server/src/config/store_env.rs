@@ -169,6 +169,8 @@ pub(super) fn parse_store_config(
             source.get(names::SHACL_GATE_SEVERITY).as_deref(),
         )?,
         dl: parse_dl(source)?,
+        // The role is `replication.mode`'s, set at the open (`main.rs`).
+        replica: false,
     })
 }
 

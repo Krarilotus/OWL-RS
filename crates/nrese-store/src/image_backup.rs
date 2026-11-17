@@ -58,10 +58,12 @@ fn sha256(path: &Path) -> StoreResult<(String, u64)> {
 }
 
 /// Writes an image of `engine`'s latest snapshot and its manifest into `dir`, which must
-/// not hold a backup yet.
+/// not hold a backup yet. `for_replica`: refused, the image removed, where the version
+/// written is stored over representatives ([`StoreError::CompactPrimary`]).
 pub(crate) fn backup_image(
     engine: &nrese_engine::Engine,
     dir: &Path,
+    for_replica: bool,
 ) -> StoreResult<ImageManifest> {
     if dir.join(MANIFEST).exists() {
         return Err(StoreError::Configuration(format!(
@@ -71,6 +73,10 @@ pub(crate) fn backup_image(
     }
     nrese_engine::place::create_dir_all(dir).map_err(|e| io(e, dir))?;
     let image = engine.write_image(dir)?;
+    if for_replica && image.equality.is_some() {
+        let _ = fs::remove_file(&image.path);
+        return Err(StoreError::CompactPrimary);
+    }
     let (sha256, bytes) = sha256(&image.path)?;
     let manifest = ImageManifest {
         format: "nrese-checkpoint".to_owned(),
