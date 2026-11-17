@@ -191,7 +191,8 @@ impl Tbox {
                 .map(Hazard::DataValues)
                 .or(ontology
                     .noncanonical_cardinality
-                    .map(Hazard::CardinalitySpelling));
+                    .or(ontology.empty_intersection)
+                    .map(Hazard::Unread));
         }
         tbox.rewritable = tbox.rewritable_terms();
         tbox
