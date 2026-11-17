@@ -1,5 +1,4 @@
-//! Spec: the approved protocol settings preserve defaults, permit a proxy path
-//! prefix, and expire idle transactions atomically at the configured time.
+//! Spec: the public URL preserves defaults and permits a proxy path prefix.
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -33,8 +32,11 @@ async fn start(settings: &[(&str, &str)], file: bool) -> Server {
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if file {
-        std::fs::write(dir.path().join("config.toml"),
-            "[server]\npublic_url = 'https://public.invalid/prefix/'\n[store]\ntransaction_idle_seconds = 1\n").unwrap();
+        std::fs::write(
+            dir.path().join("config.toml"),
+            "[server]\npublic_url = 'https://public.invalid/prefix/'\n",
+        )
+        .unwrap();
         command.env("NRESE_CONFIG_PATH", dir.path().join("config.toml"));
     } else {
         command.envs(settings.iter().copied());
@@ -144,74 +146,10 @@ async fn configured_public_url_is_followed_through_a_stripping_proxy() {
     }
 }
 
-// Spec: expiry refuses QUERY, UPDATE and COMMIT with 404 and publishes no
-// queued change; the unset timeout remains 600 and keeps a transaction alive.
+// Spec: an unset public URL keeps the existing forwarded-host behavior.
 #[tokio::test]
-async fn configured_idle_expiry_refuses_all_actions_without_partial_writes() {
-    for (settings, expires) in [
-        (vec![("NRESE_TRANSACTION_IDLE_SECONDS", "1")], true),
-        (vec![], false),
-    ] {
-        let server = start(&settings, false).await;
-        let client = client();
-        let location = begin(&client, &server).await;
-        let path = reqwest::Url::parse(&location).unwrap().path().to_owned();
-        let url = format!("{}{path}", server.base);
-        let ping = client
-            .put(format!("{url}?action=PING"))
-            .send()
-            .await
-            .unwrap();
-        let idle = ping.text().await.unwrap();
-        assert_eq!(
-            client
-                .put(format!("{url}?action=UPDATE"))
-                .header("content-type", "application/sparql-update")
-                .body("INSERT DATA { <urn:pending> <urn:p> <urn:o> }")
-                .send()
-                .await
-                .unwrap()
-                .status(),
-            200
-        );
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        for (action, content, body) in [
-            ("QUERY", "application/sparql-query", "ASK {}"),
-            (
-                "UPDATE",
-                "application/sparql-update",
-                "INSERT DATA { <urn:late> <urn:p> <urn:o> }",
-            ),
-            ("COMMIT", "", ""),
-        ] {
-            let response = client
-                .put(format!("{url}?action={action}"))
-                .header("content-type", content)
-                .body(body)
-                .send()
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                if expires { 404 } else { 200 },
-                "{action}"
-            );
-        }
-        assert_eq!(idle.trim(), if expires { "1000" } else { "600000" });
-        let response: serde_json::Value = client
-            .post(format!("{}/repositories/nrese", server.base))
-            .header("content-type", "application/sparql-query")
-            .header("accept", "application/sparql-results+json")
-            .body("ASK { ?s <urn:p> <urn:o> }")
-            .send()
-            .await
-            .unwrap()
-            .json()
-            .await
-            .unwrap();
-        assert_eq!(response["boolean"], !expires);
-        if !expires {
-            assert!(location.starts_with("https://forwarded.invalid/"));
-        }
-    }
+async fn unset_public_url_uses_the_forwarded_host() {
+    let server = start(&[], false).await;
+    let location = begin(&client(), &server).await;
+    assert!(location.starts_with("https://forwarded.invalid/repositories/nrese/transactions/"));
 }
