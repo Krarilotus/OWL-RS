@@ -183,6 +183,15 @@ leave something out.
   `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
   annotation property's domain, range, super-property or sub-property, or give the individual its own
   IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
+- Labels and notes on a store with `owl:sameAs` read as `unsound`. Under `owl2-dl`, and under `owl2-ql`
+  and `owl2-rl` where the QL rewriting answers, a query that reads an annotation property
+  (`rdfs:label`, `rdfs:comment`, or one the data declares) or any predicate (a variable
+  predicate, `DESCRIBE`) is `unsound` where the store holds `owl:sameAs` between two different
+  terms, or an inferred annotation statement: the rules copy annotations across equal names, and
+  OWL 2 DL doesn't. The copies are still among the rows. Read the annotations as stated with
+  `infer=false`; under a ruleset's own closure without the rewriting the same reads stay
+  `sound-only`, since there the copies are right
+  ([the rule](spec/reasoning-semantics.md#annotation-copies)).
 - Under `owl2-dl`, an ontology with a part the reader leaves out is never told consistent:
   every verdict but an inconsistency is `unknown`. Where that part is one the OWL 2 RL rules
   may still read (a reserved name used as a class or individual, OWL's vocabulary outside the
@@ -329,5 +338,9 @@ leave something out.
 - Endpoints over the whole dataset (classification, SHACL validation, autocomplete) are
   only for readers of every graph
   ([access control](ops/http-api.md#graph-level-access-control)).
+- A reader of some graphs who sees inferred statements by support (`inferred = "supported"`) is
+  told `not-certified` for every read at a revision where a statement it can derive is also
+  asserted in a graph it can't read. Its answers are right, and so is the status, but the status
+  tells that reader that such an assertion exists.
 - A refusal for memory or work can hint at how much data a reader of only some graphs may not see. v2.0 admits
   requests by what the reader sees.
