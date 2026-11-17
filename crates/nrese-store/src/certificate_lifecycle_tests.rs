@@ -621,3 +621,120 @@ fn an_entailment_check_reads_one_snapshot_while_a_clear_publishes() {
     }
     cells.finish();
 }
+
+/// A repair commit on a store in quarantine: its data holds `:a a owl:Nothing`, inconsistent
+/// under OWL 2 RL, and a commit through OWL 2 RL's pipeline removes it. The commit inherits
+/// the closure's facts, not the old version's assessment of its consistency: until a
+/// revalidation writes one, the new version's consistency isn't established. `consistency()`
+/// doesn't say `Inconsistent`, and `entails` refuses rather than answer `InconsistentPremise`:
+/// - after the commit's publication, before its revalidation;
+/// - after a revalidation that failed (where its new log segment's directory syncs);
+/// - opened from a copy of the directory taken before the revalidation: the marker's old
+///   inconsistency isn't claimed of the repaired data.
+#[test]
+fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
+    let mut cells = Cells::default();
+    let dir = tempfile::tempdir().expect("dir");
+    let data = dir.path().join("store");
+    let store = StoreService::new(StoreConfig::on_disk(&data)).expect("store");
+    load(&store, &format!("{DATA} :a a owl:Nothing ."));
+    store.rematerialise(Ruleset::Owl2Rl).expect("reasoned");
+    let store = Arc::new(store);
+    let quarantined = store.consistency();
+    if !matches!(quarantined, crate::ConsistencyStatus::Inconsistent { .. }) {
+        cells.unmet(
+            "a repair commit",
+            &format!("not in quarantine: {quarantined:?}"),
+        );
+        cells.finish();
+        return;
+    }
+    let rl = pipeline(&store, ReasoningMode::Owl2Rl);
+    let seen = Arc::new(Mutex::new(None));
+    let copy = dir.path().join("before the revalidation");
+    let (reader, kept, from, to) = (
+        Arc::clone(&store),
+        Arc::clone(&seen),
+        data.clone(),
+        copy.clone(),
+    );
+    hooks::BEFORE_REVALIDATION.set(Some(Box::new(move || {
+        let consistency = format!("{:?}", reader.consistency());
+        let entailed = told(reader.entails(Ruleset::Owl2Rl, &rex_an_animal()));
+        let copied = copy_dir(&from, &to);
+        nrese_engine::fault_points::fail_dir_sync_of(Some((
+            &from.join("wal"),
+            std::io::ErrorKind::Other,
+        )));
+        *kept.lock().unwrap() = Some((consistency, entailed, copied));
+    })));
+    let repaired = rl.apply(
+        MutationCommand::Update(SparqlUpdateRequest::new(format!(
+            "{PREFIXES}DELETE DATA {{ :a a owl:Nothing }}"
+        ))),
+        &Requester::all(),
+        &MutationTicket::new(),
+    );
+    nrese_engine::fault_points::fail_dir_sync_of(None);
+    hooks::BEFORE_REVALIDATION.set(None);
+    let not_inconsistent = |h: &str| !h.starts_with("Inconsistent");
+    let refused = |h: &str| h.starts_with("refused");
+    let seen = seen.lock().unwrap().take();
+    match (repaired, seen) {
+        (Ok(_), Some((consistency, entailed, copied))) => {
+            cells.check(
+                "a repair commit before its revalidation | consistency()",
+                &consistency,
+                not_inconsistent,
+                "not Inconsistent",
+            );
+            cells.check(
+                "a repair commit before its revalidation | entails",
+                &entailed,
+                refused,
+                "a refusal",
+            );
+            // The repaired data is consistent: only a revalidation that succeeded says so.
+            let after = format!("{:?}", store.consistency());
+            if after == "Consistent" {
+                cells.unmet(
+                    "a repair commit after a failed revalidation",
+                    "the revalidation didn't fail",
+                );
+            } else {
+                cells.check(
+                    "a repair commit after a failed revalidation | consistency()",
+                    &after,
+                    not_inconsistent,
+                    "not Inconsistent",
+                );
+                cells.check(
+                    "a repair commit after a failed revalidation | entails",
+                    &told(store.entails(Ruleset::Owl2Rl, &rex_an_animal())),
+                    refused,
+                    "a refusal",
+                );
+            }
+            match copied {
+                Ok(()) => {
+                    let opened = StoreService::new(StoreConfig::on_disk(&copy)).expect("opened");
+                    cells.check(
+                        "a repair commit reopened from before its revalidation | consistency()",
+                        &format!("{:?}", opened.consistency()),
+                        not_inconsistent,
+                        "not Inconsistent",
+                    );
+                }
+                Err(error) => {
+                    cells.unmet("a repair commit reopened", &format!("not copied: {error}"))
+                }
+            }
+        }
+        (Ok(_), None) => cells.unmet(
+            "a repair commit",
+            "the commit didn't reach its revalidation",
+        ),
+        (Err(error), _) => cells.unmet("a repair commit", &format!("the commit failed: {error}")),
+    }
+    cells.finish();
+}
