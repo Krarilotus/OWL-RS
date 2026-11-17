@@ -305,8 +305,19 @@ fn rematerialise_installs_the_closure_of_existing_data() {
 /// Reasoner v2's commit path (the delta executor over the engine) against rematerialisation:
 /// after every random commit, recomputing the closure changes nothing. Includes named
 /// graphs: a triple deleted from one graph but asserted in another stays a fact.
+/// NRESE_FUZZ_SEED (a number) varies the loads past the pipeline; without it, seeds 15 and 0
+/// run, 15 first: of 0 to 15, the one whose commits reach a loaded statement soonest.
 #[test]
 fn owl2_rl_commits_keep_the_inferred_stack_exact() {
+    let fuzz: Option<u64> = std::env::var("NRESE_FUZZ_SEED")
+        .ok()
+        .and_then(|value| value.trim().parse().ok());
+    for fuzz in fuzz.map_or(vec![15, 0], |fuzz| vec![fuzz]) {
+        commits_keep_the_inferred_stack_exact(fuzz);
+    }
+}
+
+fn commits_keep_the_inferred_stack_exact(fuzz: u64) {
     let pipeline = pipeline(ReasoningMode::Owl2Rl);
     let mut state = 0x5DEE_CE66_D1CE_4E5Du64;
     let mut next = move |n: u64| {
@@ -341,7 +352,27 @@ fn owl2_rl_commits_keep_the_inferred_stack_exact() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(150);
+    // Now and then, before a round's commit, a statement loaded past the pipeline (the
+    // closure rebuilt) and an empty update: from draws of their own, so the commits'
+    // draws stay as they were.
+    let mut seed = 0x2026_1117_0148u64 ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut aside = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
     for _ in 0..rounds {
+        if aside(8) == 0 {
+            let loaded = format!("{} .", random_triple(&mut aside));
+            crate::support::load_past_the_pipeline(pipeline.store(), &loaded);
+            let rules = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
+            pipeline.store().rematerialise(rules).expect("rebuilt");
+            let all = nrese_store::Requester::all();
+            pipeline
+                .apply(insert(""), &all, &MutationTicket::new())
+                .expect("empty update");
+        }
         let deleting = !asserted.is_empty() && next(3) == 0;
         let (triple, graph) = if deleting {
             asserted.swap_remove(next(asserted.len() as u64) as usize)
@@ -381,14 +412,14 @@ fn owl2_rl_commits_keep_the_inferred_stack_exact() {
             (check.inferred_inserted, check.inferred_deleted),
             (0, 0),
             "after {commits} commits the inferred stack differs from the closure; last: {} {data}
-asserted: {asserted:#?}",
+seed {fuzz}; asserted: {asserted:#?}",
             if deleting { "DELETE" } else { "INSERT" }
         );
         changed += usize::from(check.inferred > 0);
     }
     assert!(
         commits > 100 && changed > 50,
-        "{commits} commits, {changed} with inferences"
+        "seed {fuzz}: {commits} commits, {changed} with inferences"
     );
 }
 
