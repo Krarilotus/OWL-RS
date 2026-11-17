@@ -67,6 +67,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rules: &rules,
         lists: Some(&lists),
         schema: &schema,
+        equality: nrese_reasoner::representatives::same_as(&rules, schema.same_as()),
     };
     let started = Instant::now();
     let mut inferred = batch::materialise(&asserted, &rules, Some(&lists), &schema).derived;

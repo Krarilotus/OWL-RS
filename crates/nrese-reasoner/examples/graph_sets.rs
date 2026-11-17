@@ -59,6 +59,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         rules: &rules,
         lists: Some(&lists),
         schema: &schema,
+        equality: nrese_reasoner::representatives::same_as(&rules, schema.same_as()),
     };
     let ground = program(&MemoryBase::new(&asserted, &inferred), compiled);
     let mut all = asserted.clone();
