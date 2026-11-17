@@ -349,7 +349,10 @@ fn a_literal_of_the_ontologys_own_datatype_is_kept_as_written() {
 /// store isn't told `consistent`, the full check tells `unknown`, at the first commit and at a
 /// later one. The map's `xsd:dateTime` is read: one instant at one offset written two ways is one
 /// value (OWL 2 Structural Specification §4.7), so the key equates two different individuals
-/// and the commit is refused.
+/// and the commit is refused. So are strings, the values keys are mostly on (names, codes): one
+/// string, or one tagged string, under a key is refused; two different ones stay proved
+/// consistent. Tags that differ only in case are one term already, as the parser puts a tag in
+/// lower case (RDF 1.1 Concepts §3.3): the key equates the two by the term, not by its value.
 #[test]
 fn a_value_the_upper_bound_cant_read_proves_no_consistency() {
     const KEY: &str = ":C a owl:Class ; owl:hasKey ( :born ) . :born a owl:DatatypeProperty . \
@@ -377,6 +380,33 @@ fn a_value_the_upper_bound_cant_read_proves_no_consistency() {
             REFUSED,
         ),
     ];
+    // A key on a data property takes the store off the rules' route, onto the upper bound's.
+    const PROVED: &[&str] = &["upper-bound consistent; read complete"];
+    for (name, a, b, want) in [
+        ("one string under a key", r#""x""#, r#""x""#, REFUSED),
+        ("two strings under a key", r#""x""#, r#""y""#, PROVED),
+        (
+            "one tagged string under a key",
+            r#""x"@en"#,
+            r#""x"@en"#,
+            REFUSED,
+        ),
+        (
+            "one tagged string under a key, its tags differing in case",
+            r#""x"@en"#,
+            r#""x"@EN"#,
+            REFUSED,
+        ),
+        (
+            "two tagged strings under a key",
+            r#""x"@en"#,
+            r#""y"@en"#,
+            PROVED,
+        ),
+    ] {
+        let values = format!(":a :born {a} . :b :born {b} .");
+        cells.push((name.into(), told_after(name, &[KEY, &values]), want));
+    }
     // A later commit: values the change reads first (the first commit's only value is 5), and
     // a change over a first commit that holds a date already.
     let first_key = format!("{KEY} :c a owl:NamedIndividual ; :born 5 .");
