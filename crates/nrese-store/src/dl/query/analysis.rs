@@ -658,6 +658,22 @@ fn denied_path(path: &PropertyPathExpression) -> Option<String> {
     }
 }
 
+/// The predicates `query` reads ([`analyse`]'s), each once, `None` for any (a variable
+/// predicate, a negated property set, DESCRIBE), `rdf:type` aside: no annotation is a class
+/// assertion.
+pub(super) fn predicates(query: &Query) -> Vec<Option<String>> {
+    let describe = matches!(query, Query::Describe { .. }).then_some(None);
+    let reads = analyse(query)
+        .reads
+        .into_iter()
+        .map(|(p, _)| p)
+        .chain(describe);
+    let mut reads: Vec<_> = reads.filter(|p| p.as_deref() != Some(RDF_TYPE)).collect();
+    reads.sort();
+    reads.dedup();
+    reads
+}
+
 /// [`denied`] for a read of `predicate` between `ends` (`None`: a path step's, which the
 /// query doesn't name). What may be complete, each by its argument:
 /// - a predicate outside the [`reserved`] namespaces, and `rdf:type` with a class constant
