@@ -741,7 +741,7 @@ pub async fn graph_store_delete(
 /// specified"). Without a host, the path alone.
 fn absolute(state: &AppState, headers: &HeaderMap, path: &str) -> String {
     if let Some(url) = state.public_url() {
-        return format!("{}{path}", url.trim_end_matches('/'));
+        return format!("{}{path}", url.strip_suffix('/').unwrap_or(url));
     }
     let value = |name: &str| {
         headers
