@@ -46,6 +46,11 @@ pub struct StoreService {
     /// The reasoning state recorded this process (also for in-memory stores, which have no
     /// file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
+    /// Odd from a commit on a store in quarantine, which keeps no assessment of its
+    /// consistency, until a rematerialisation records one ([`Self::is_quarantined`]); it only
+    /// rises, so two equal readings saw no such commit or recording between them. In memory
+    /// only: that commit removes the marker first, so a reopen rebuilds.
+    pub(crate) unassessed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Shared by the store's clones: a clone with its own record would never see a commit's mark.
     pub(crate) lists: std::sync::Arc<crate::reasoning::ListsKept>,
     /// The certificate's epoch, a sequence lock over its changes ([`Self::certificate_epoch`]):
@@ -343,6 +348,7 @@ impl StoreService {
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             unavailable,
             materialised: std::sync::Arc::default(),
+            unassessed: std::sync::Arc::default(),
             lists: Default::default(),
             certificate_epoch: std::sync::Arc::default(),
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
@@ -614,6 +620,28 @@ impl StoreService {
             .map_or(crate::ConsistencyStatus::Unknown, |state| {
                 state.consistency()
             })
+    }
+
+    /// Whether the store is in quarantine, readable and repairable but not ready: its data
+    /// inconsistent, or its rules' violations undecided, under the recorded reasoning; or,
+    /// since a commit on a store in quarantine, its consistency not assessed again.
+    ///
+    /// The mark, the assessment, the mark again, in that order. A commit in quarantine
+    /// raises the mark before it removes the assessment, so an assessment read as removed
+    /// comes with a mark read as raised; a recording clears the mark after it records, so a
+    /// mark read as cleared comes with the assessment recorded. A mark that moved between the
+    /// two readings is answered as quarantine, as the reading may have straddled the start or
+    /// the end of one; it may also have seen one already finished, and answers quarantine
+    /// then too.
+    pub fn is_quarantined(&self) -> bool {
+        use crate::ConsistencyStatus::{Inconsistent, Undecided};
+        let mark = self.unassessed.load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(test)]
+        hooks::run(&hooks::BETWEEN_QUARANTINE_READS);
+        let assessed = matches!(self.consistency(), Inconsistent { .. } | Undecided { .. });
+        assessed
+            || mark % 2 == 1
+            || mark != self.unassessed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether the certificate covers `program` for a holder of the writer slot: no write can
@@ -2500,6 +2528,9 @@ impl StoreService {
         // From here the new inferences are published: a failure says so.
         self.record_reasoning(finished.writer(), state)
             .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
+        // Under the writer slot: no commit raises the mark between the reading and the rise.
+        let mark = self.unassessed.load(std::sync::atomic::Ordering::Relaxed);
+        (self.unassessed).fetch_add(mark % 2, std::sync::atomic::Ordering::Release);
         drop(finished);
         if let Some(why) = undecided {
             let text = why.text(violations);
@@ -2738,6 +2769,8 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_CLEAR_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A reasoning commit in quarantine has published and is about to revalidate.
         pub(crate) static BEFORE_REVALIDATION: Hook = const { RefCell::new(None) };
+        /// A quarantine reading has read the mark and is about to read the assessment.
+        pub(crate) static BETWEEN_QUARANTINE_READS: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {
