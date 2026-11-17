@@ -479,32 +479,25 @@ fn a_filtered_read_is_never_told_every_name_answers_it() {
     }
 }
 
-/// An `ASK` returns no variable, so where it holds, no name the store has no individual for
-/// can add an answer: off the rules route, where every element is in C0 and the data puts a0
-/// there, `ASK { ?y a :C0 }` holds and is `complete`.
+/// An `ASK` the store answers `true` misses nothing, so no name the store has no individual
+/// for can change it: off the rules route, where every element is in C0 and the data puts a0
+/// there, `ASK { ?y a :C0 }` holds and is `complete`; so with its variable under a filter,
+/// where the variable may reach the answer. (A `false` one stays open to every name:
+/// [`a_ground_type_of_a_name_with_no_individual_view_is_never_complete_false`].)
 #[test]
 fn a_true_ask_is_complete_where_every_element_is_what_it_asks() {
     let dl = pipeline();
     insert(&dl, &format!("{THING} :a0 a :C0 . {OUTSIDE_RL}")).expect("committed");
     assert_eq!(dl.store().dl_bounds().last, "rebuilt");
-    let (rows, status) = query_with(&dl, "ASK { ?y a :C0 }", None).expect("answers");
-    assert!(status.is_complete(), "{rows:?}, {:?}", status.reasons());
-    assert_eq!(rows, ["true"]);
-    // What is told today, not what is right: under a filter the variable still reaches the
-    // answer, and the read itself, posed with no element in it, is said to "may hold of every
-    // element". The answer is right; the status is lower than it need be.
-    let read = "ASK { ?y a :C0 FILTER(?y = :a0) }";
-    let (rows, status) = query_with(&dl, read, None).expect("answers");
-    let every = status
-        .reasons()
-        .iter()
-        .any(|r| r.contains("may hold of every element"));
-    assert!(
-        every && !status.is_complete(),
-        "{rows:?}, {:?}",
-        status.reasons()
-    );
-    assert_eq!(rows, ["true"]);
+    for read in ["ASK { ?y a :C0 }", "ASK { ?y a :C0 FILTER(?y = :a0) }"] {
+        let (rows, status) = query_with(&dl, read, None).expect("answers");
+        assert!(
+            status.is_complete(),
+            "{read}: {rows:?}, {:?}",
+            status.reasons()
+        );
+        assert_eq!(rows, ["true"], "{read}");
+    }
 }
 
 /// Reads where no fact holds of every element stay `complete` with the regime's answers: a
