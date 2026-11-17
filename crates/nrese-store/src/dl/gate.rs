@@ -134,10 +134,17 @@ pub(crate) fn check_commit(
             reject: None,
         };
     }
-    if preparation.proves_consistency {
+    // On the RL route in quarantine the rules prove nothing, and their gate has admitted the
+    // commit on its own facts, as off the route the quarantine would: no DL check runs.
+    let rules = matches!(preparation.prepared, super::bounds::Prepared::Rules(_));
+    if preparation.proves_consistency || rules {
+        let verdict = match preparation.proves_consistency {
+            true => Verdict::Consistent,
+            false => Verdict::Unknown("the store is in quarantine".to_owned()),
+        };
         return Gate {
             checked: Checked {
-                verdict: Verdict::Consistent,
+                verdict,
                 engine: preparation.decided_by,
                 elapsed: Duration::ZERO,
             },

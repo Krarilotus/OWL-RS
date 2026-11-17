@@ -469,12 +469,17 @@ impl MutationPipeline {
             }
             (self.store.lists).commit(before, summary.revision, lists_left_out);
             if let Some((gate, bounds, left_out)) = dl {
+                // On the RL route in quarantine nothing decided the revision's consistency: no
+                // verdict is recorded for it, and its reads check it (`dl::query::consistency_at`).
+                let rules = matches!(bounds.prepared, crate::dl::bounds::Prepared::Rules(_));
                 crate::dl::bounds::install(&self.store, bounds, summary.revision);
-                self.store.dl().record(crate::dl::DlStatus {
-                    revision: summary.revision,
-                    consistency: gate.checked,
-                    left_out,
-                });
+                if !(quarantined && rules) {
+                    self.store.dl().record(crate::dl::DlStatus {
+                        revision: summary.revision,
+                        consistency: gate.checked,
+                        left_out,
+                    });
+                }
             }
             // The program now describes the committed state; a kept one only if it described
             // the commit's base (one of an older state, left out of `cached`, stays stale).

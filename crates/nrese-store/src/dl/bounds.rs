@@ -379,7 +379,9 @@ pub(crate) struct Preparation {
     base: u64,
     pub prepared: Prepared,
     /// U1 after the commit proves the data consistent (or, on the RL route, the RL
-    /// rules do: [`Preparation::decided_by`]).
+    /// rules do: [`Preparation::decided_by`]; only for a store not in quarantine,
+    /// [`StoreService::is_quarantined`], since in it their gate checks the commit's own
+    /// facts only).
     pub proves_consistency: bool,
     /// `upper-bound`, or `rules` on the RL route.
     pub decided_by: &'static str,
@@ -431,7 +433,7 @@ pub(crate) fn prepare(
         return Preparation {
             base,
             prepared: Prepared::Rules(Arc::clone(kinds)),
-            proves_consistency: true,
+            proves_consistency: !store.is_quarantined(),
             decided_by: "rules",
             ontology: None,
         };
@@ -520,7 +522,7 @@ pub(crate) fn prepare(
         return Preparation {
             base,
             prepared: Prepared::Rules(Kinds::of(&ontology, &lookup)),
-            proves_consistency: true,
+            proves_consistency: !store.is_quarantined(),
             decided_by: "rules",
             ontology: None,
         };
@@ -792,6 +794,12 @@ pub(crate) fn view_until(
 fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
     let bounds = &store.dl().bounds;
     let revision = snapshot.revision();
+    // On the RL route the view proves consistency only outside quarantine. Read before the
+    // bounds' state: a quarantine ends at a revision a commit installed first, so a view of
+    // an older revision read as out of quarantine finds the bounds past it (`None`); one
+    // begins, at a rebuild that finds violations, with the mark raised before it publishes
+    // (`StoreService::unassessed`), so no view of its revision is read as out of it.
+    let quarantined = store.is_quarantined();
     // An older revision's view the cache keeps holds its charges: let it go before building
     // this one, so the budget isn't held by a view no read of the latest wants (SYN-61).
     // Readers keep their own.
@@ -901,9 +909,10 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
             parts
         }
     };
-    let Some(parts) = parts else {
+    let Some(mut parts) = parts else {
         return Some(Arc::new(refused(snapshot, revision)));
     };
+    parts.view.proves_consistency &= !(parts.view.rules && quarantined);
     #[cfg(test)]
     seam::at(bounds, seam::Point::View);
     let (view, charged) = assemble(snapshot, parts, kept);
