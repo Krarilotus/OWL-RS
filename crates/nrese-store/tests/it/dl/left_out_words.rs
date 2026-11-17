@@ -253,3 +253,37 @@ fn a_read_without_the_commits_record_names_nothing() {
     let nameless = told.len() >= 2 && told.iter().all(|s| in_words(s) && !s.contains('<'));
     assert!(nameless, "{reasons:?}");
 }
+
+/// A blank node's label is the store's, not the user's, and reaches no sentence: neither a
+/// conclusion's, which the store relabels when it reads the conclusion, nor one inside a
+/// triple term of the data.
+#[test]
+fn no_sentence_gives_a_blank_nodes_label() {
+    let premise = ":C a owl:Class . :D a owl:Class . :E a owl:Class .";
+    let conclusion = ":C rdfs:subClassOf _:r . _:r owl:onProperty :p ; \
+                      owl:someValuesFrom :D, :E . :p a owl:ObjectProperty .";
+    let refused = match super::entailment::entailed(premise, conclusion) {
+        nrese_store::dl::entailment::Entailed::Unknown(why) => why,
+        other => format!("{other:?}"),
+    };
+    let dl = pipeline();
+    let data = ":C a owl:Class . :D a owl:Class . :R owl:onProperty <<( _:b :p :o )>> ; \
+                owl:someValuesFrom :D . :R rdfs:subClassOf :C .";
+    insert(&dl, data).expect("committed");
+    let status = dl.store().dl().status().expect("a verdict");
+    let verdict = status
+        .consistency
+        .verdict
+        .reason()
+        .unwrap_or_default()
+        .to_owned();
+    let told = [
+        ("the conclusion", refused, "isn't well-formed OWL 2 DL"),
+        ("the verdict", verdict, "left out; first: "),
+    ];
+    let wrong: Vec<_> = told
+        .iter()
+        .filter(|(_, text, what)| !text.contains(what) || text.contains("_:"))
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
