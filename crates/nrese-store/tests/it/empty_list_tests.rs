@@ -377,11 +377,13 @@ enum Expect {
 fn short_lists_mean_what_the_mapping_says() {
     use Expect::*;
     let declared = ":C a owl:Class . :D a owl:Class .";
-    let cases: [(&str, &str, u64, Expect, Expect); 6] = [
+    // (name, data, list statements, the question, under owl2-dl, under owl2-rl)
+    let cases: [(&str, &str, u64, &str, Expect, Expect); 7] = [
         (
             "empty intersection",
             ":C owl:intersectionOf rdf:nil . :x a :D .",
             1,
+            ":x a :C",
             Holds,
             NotTold,
         ),
@@ -389,6 +391,7 @@ fn short_lists_mean_what_the_mapping_says() {
             "empty union",
             ":C owl:unionOf rdf:nil . :x a :C .",
             1,
+            ":x a owl:Nothing",
             Inconsistent,
             NotTold,
         ),
@@ -396,6 +399,7 @@ fn short_lists_mean_what_the_mapping_says() {
             "empty enumeration",
             ":C owl:oneOf rdf:nil . :x a :C .",
             1,
+            ":x a owl:Nothing",
             Inconsistent,
             NotTold,
         ),
@@ -403,6 +407,7 @@ fn short_lists_mean_what_the_mapping_says() {
             "one-member intersection",
             ":C owl:intersectionOf ( :D ) . :x a :D .",
             1,
+            ":x a :C",
             Holds,
             Holds,
         ),
@@ -410,30 +415,35 @@ fn short_lists_mean_what_the_mapping_says() {
             "one-member union",
             ":C owl:unionOf ( :D ) . :x a :D .",
             1,
+            ":x a :C",
             Holds,
             Holds,
+        ),
+        // The other direction: the rules (cls-uni) give a union's members' instances only.
+        (
+            "one-member union, its member",
+            ":C owl:unionOf ( :D ) . :x a :C .",
+            1,
+            ":x a :D",
+            Holds,
+            NotTold,
         ),
         (
             "empty intersection through an alias",
             ":C owl:intersectionOf :l . :l owl:sameAs rdf:nil . :x a :D .",
             2,
+            ":x a :C",
             NotTold,
             NotTold,
         ),
     ];
     let lists = "VALUES ?p { owl:intersectionOf owl:unionOf owl:oneOf owl:sameAs } ?s ?p ?o";
     check_cells(|equality, mode, failures| {
-        for (name, list, count, dl, rl) in cases {
+        for (name, list, count, question, dl, rl) in cases {
             let expect = if mode == ReasoningMode::Owl2Dl {
                 dl
             } else {
                 rl
-            };
-            // Where `:x a :C` is written, the question is what a contradiction entails.
-            let question = if list.contains(":x a :C .") {
-                ":x a owl:Nothing"
-            } else {
-                ":x a :C"
             };
             let data = format!("{declared} {list}");
             for rebuilt in [false, true] {
