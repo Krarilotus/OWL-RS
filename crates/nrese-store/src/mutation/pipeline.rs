@@ -468,6 +468,8 @@ impl MutationPipeline {
                 supports.note_commit(before, summary.revision, touched);
             }
             (self.store.lists).commit(before, summary.revision, lists_left_out);
+            #[cfg(test)]
+            crate::service::hooks::run(&crate::service::hooks::AFTER_COMMIT);
             if let Some((gate, bounds, left_out)) = dl {
                 // On the RL route in quarantine nothing decided the revision's consistency: no
                 // verdict is recorded for it, and its reads check it (`dl::query::consistency_at`).
