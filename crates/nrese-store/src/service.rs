@@ -822,17 +822,17 @@ impl StoreService {
 
     /// `request` parsed for this store: a prefix it uses without declaring it means what the
     /// store's namespaces bind it to ([`PreparedQuery::parse_with`]).
-    /// Results that may hold RDF 1.2 terms (the query makes or matches them, or the store
-    /// holds triple terms) announce it ([`PreparedQuery::announce_rdf12`]).
+    /// Results that may hold RDF 1.2 terms announce it: the query makes or matches them
+    /// ([`PreparedQuery::announce_rdf12`]), or a graph the reader reads holds a triple term.
+    /// For a reader of every graph that is decided here, on the latest snapshot; for a reader
+    /// of some graphs, by its first run on what it reads.
     pub fn prepare_query(&self, request: &SparqlQueryRequest) -> StoreResult<PreparedQuery> {
         let mut prepared = PreparedQuery::parse_with(request, Some(&self.namespaces.all()))?;
-        if PreparedQuery::uses_rdf12(prepared.query())
-            || self
-                .engine
-                .snapshot()
-                .holds_triple_terms(prepared.read_model(), |_| true)
-        {
+        if PreparedQuery::uses_rdf12(prepared.query()) {
             prepared.announce_rdf12();
+        }
+        if prepared.access().is_none() {
+            prepared.announce_on(&self.engine.snapshot());
         }
         Ok(prepared)
     }
@@ -1209,6 +1209,7 @@ impl StoreService {
         // One snapshot the route, the answers and their status are all of (T3, N5).
         let latest = &self.engine.snapshot();
         let snapshot = self.view_of(latest, prepared.access(), &memory, Some(cancellation))?;
+        prepared.announce_on(&snapshot);
         if let Some(mode) = self.dl_mode(prepared, &snapshot) {
             use crate::dl::query::{Outcome, Read};
             let detail = match answer(self, &snapshot, prepared, cancellation, &memory, mode)? {
@@ -1732,6 +1733,14 @@ impl StoreService {
         let scope = crate::ReadScope::of(prepared.access().cloned());
         let deletes = !pending.ops.iter().all(adds_only);
         let memory = self.settings.query_envelope(prepared);
+        // Announced on the committed view, as outside a transaction: what the transaction
+        // asserts itself isn't (a refused view is told as the run's refusal is).
+        let latest = &self.engine.snapshot();
+        let committed = self.view_of(latest, prepared.access(), &memory, Some(cancellation));
+        if let Err(error) = committed.map(|view| prepared.announce_on(&view)) {
+            let run = Err(refusal_for_its_reader(prepared, error));
+            return for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {});
+        }
         let run = self.with_pending(pending, &scope, &memory, cancellation, |snapshot| {
             // The status the answers carry, of the pending state `at` they are read from.
             // Under `owl2-dl` the QL rewriting doesn't run: the status needs no report.
