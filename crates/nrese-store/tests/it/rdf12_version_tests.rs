@@ -4,7 +4,8 @@
 
 use crate::support::Writes;
 use nrese_store::{
-    GraphResultFormat, SerializedQueryResult, SparqlQueryRequest, StoreConfig, StoreService,
+    CancellationToken, GraphResultFormat, SerializedQueryResult, SparqlQueryRequest, StoreConfig,
+    StoreService,
 };
 
 fn run(store: &StoreService, query: &str, graph: GraphResultFormat) -> SerializedQueryResult {
@@ -85,4 +86,91 @@ fn results_announce_rdf12_when_they_may_use_it() {
         )
         .expect("parses");
     }
+}
+
+/// What one run of a prepared query told, `header` the media type its report saw before
+/// its first byte, `body` its answer: the announcement of each, and whether a triple term
+/// was answered.
+fn told(header: &str, body: &[u8]) -> String {
+    let body = String::from_utf8_lossy(body);
+    let version = |announced: bool| if announced { "1.2" } else { "none" };
+    let header = version(header.contains("version=1.2"));
+    let row = match body.contains("{\"type\":\"triple\"") {
+        true => "the term's row",
+        false => "no term",
+    };
+    let body = version(body.contains("\"version\":\"1.2\""));
+    format!("header {header} body {body}, {row}")
+}
+
+/// Another run of a prepared query changes nothing of a run's announcement: run again (a
+/// clone of it, inside the first run's report, after the data's only triple term was
+/// deleted), the first run still announces the term it read, its header and its body
+/// alike, and the second's header and body agree. With the result cache off and on.
+#[test]
+fn a_run_announces_what_it_read_whatever_another_run_of_its_query_reads() {
+    let term = "<urn:s> <urn:p> <<( <urn:a> <urn:b> <urn:c> )>>";
+    let mut wrong = Vec::new();
+    for (cache, bytes) in [("no cache", 0), ("a cache", 64 << 20)] {
+        let config = StoreConfig {
+            query_cache_bytes: bytes,
+            ..StoreConfig::in_memory()
+        };
+        let store = StoreService::new(config).expect("store");
+        store
+            .execute_update_str(&format!("INSERT DATA {{ {term} }}"))
+            .expect("the term");
+        let request = SparqlQueryRequest::all("SELECT * WHERE { ?s ?p ?o }");
+        let first = store.prepare_query(&request).expect("prepared");
+        let again = first.clone();
+        let token = CancellationToken::new();
+        let (mut header, mut body, mut header2, mut body2) = ("", Vec::new(), "", Vec::new());
+        // The second run whole, inside the first's report: after the first decided its
+        // announcement, before its first byte.
+        let run = store.run_query_reporting(&first, &token, &mut body, |_, _| {
+            header = first.media_type();
+            let delete = format!("DELETE DATA {{ {term} }}");
+            store.execute_update_str(&delete).expect("deleted");
+            let second = store.run_query_reporting(&again, &token, &mut body2, |_, _| {
+                header2 = again.media_type();
+                None
+            });
+            second.expect("the second run");
+            None
+        });
+        run.expect("the first run");
+        // The first read a triple term: it announces it, both ways. The second read none,
+        // and may announce either (as a query prepared before a delete always did), its
+        // header and its body alike.
+        let alike = [
+            "header 1.2 body 1.2, no term",
+            "header none body none, no term",
+        ];
+        for (run, got, want) in [
+            (
+                "the first run, the term read",
+                told(header, &body),
+                &["header 1.2 body 1.2, the term's row"][..],
+            ),
+            (
+                "the second run, the term deleted",
+                told(header2, &body2),
+                &alike[..],
+            ),
+        ] {
+            let cell = format!("{run}, {cache}");
+            let want = want.join(" or ");
+            match want.split(" or ").any(|w| w == got) {
+                true => println!("CASE {cell}: right {got}"),
+                false => {
+                    println!("CASE {cell}: WRONG {got}, want {want}");
+                    wrong.push(cell);
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a run announced what another read: {wrong:?}"
+    );
 }
