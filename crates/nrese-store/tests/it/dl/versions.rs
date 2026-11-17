@@ -173,7 +173,7 @@ fn a_transaction_reads_u1_at_its_revision_and_says_what_its_pending_operations_d
     assert!(status.reasons.iter().any(|r| r.source == "transaction"));
 }
 
-fn on_disk(dir: &std::path::Path) -> MutationPipeline {
+pub(super) fn on_disk(dir: &std::path::Path) -> MutationPipeline {
     let store = StoreService::new(StoreConfig::on_disk(dir)).expect("store");
     MutationPipeline::new(
         Arc::new(store),

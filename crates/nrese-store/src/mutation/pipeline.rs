@@ -288,9 +288,13 @@ impl MutationPipeline {
                     })?;
             tracing::debug!(?materialisation, "commit-path materialisation");
             // Whether the closure the commit leaves leaves out a list axiom: its program's
-            // whole list diagnostics (the report's are only the new ones).
-            let lists_left_out =
-                (changed.as_ref().or(cached)).is_some_and(|p| !p.list_diagnostics.is_empty());
+            // whole list diagnostics (the report's are only the new ones). With no program at
+            // hand (an update with no reasoning delta, on a pipeline that caches none: a
+            // fresh one, a reopened store's), the store's record of the pending version.
+            let lists_left_out = match changed.as_ref().or(cached) {
+                Some(p) => !p.list_diagnostics.is_empty(),
+                None => self.store.lists_left_out(&tx.pending_snapshot()),
+            };
             crate::reasoning::log_diagnostics(
                 &materialisation.diagnostics,
                 materialisation.diagnostics_total,
@@ -372,7 +376,8 @@ impl MutationPipeline {
             ));
             // The owl2-dl mode: the state the commit leaves, under OWL 2 DL.
             let mut dl = self.store.dl().active().then(|| {
-                let mut bounds = crate::dl::bounds::prepare(&self.store, &tx, &stop);
+                let mut bounds =
+                    crate::dl::bounds::prepare(&self.store, &tx, &stop, lists_left_out);
                 let gate = crate::dl::gate::check_commit(
                     &self.store,
                     &tx,
@@ -449,11 +454,12 @@ impl MutationPipeline {
                     left_out,
                 });
             }
-            // The program now describes the committed state.
+            // The program now describes the committed state; a kept one only if it described
+            // the commit's base (one of an older state, left out of `cached`, stays stale).
             match changed {
                 Some(program) => *ground = Some((summary.revision, program)),
                 None => {
-                    if let Some((at, _)) = ground.as_mut() {
+                    if let Some((at, _)) = ground.as_mut().filter(|(at, _)| *at == revision) {
                         *at = summary.revision;
                     }
                 }
