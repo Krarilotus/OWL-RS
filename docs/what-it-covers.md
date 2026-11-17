@@ -157,7 +157,8 @@ The two checks:
    they don't decide lets the commit through, with the status `unknown`.
 2. With the SHACL gate on, the shapes validate the focus nodes the change can affect, inferred
    statements included (through a recursive shape, one step back: [limits](limits.md#shacl)). Only what the commit introduces counts, so data that was invalid before
-   doesn't block it. Shapes that can't be used can refuse a write under any setting
+   doesn't block it, but for a result a new focus node reaches through a nested shape
+   ([limits](limits.md#shacl)). Shapes that can't be used can refuse a write under any setting
    ([`shacl.gate`](ops/config-reference.md#shacl.gate) says when).
 
 If a check refuses the write, or the request times out before publishing starts, nothing

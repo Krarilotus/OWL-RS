@@ -147,7 +147,7 @@ leave something out.
   cardinality, or compared), the consistency is `unknown` and no read is `complete`; a date
   nothing reads changes nothing. Use `xsd:dateTime`, which is in the map, where you can
   ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
-- Under `reasoner.equality = "compact"`, three cases are checked less than under the default
+- Under `reasoner.equality = "compact"`, four cases are checked less than under the default
   (`representatives`) and `replicate`. Where they matter, use the default
   ([`reasoner.equality`](ops/config-reference.md#reasoner.equality)).
   - A commit that makes two different data values the same can be accepted where one value
@@ -160,6 +160,11 @@ leave something out.
   - After a full rebuild, a key whose list is reached through `owl:sameAs rdf:nil`
     (`:C owl:hasKey :l . :l owl:sameAs rdf:nil`) doesn't make two instances of `:C` the same,
     where a commit, and `owl:hasKey rdf:nil` written directly, do in every setting.
+  - A write of an `owl:sameAs` statement, between two properties or two individuals, can pass a
+    SHACL gate set to `enforce` though it brings a result: the equality is expanded when the data
+    are read, so the gate starts from that statement alone. An insert of the statement that
+    breaks the shape is refused in every setting. After such writes, validate in full
+    (`GET /dataset/shacl`).
 - A value the store can't represent (an `xsd:dateTime` with a year beyond 10¹¹, say) is checked
   neither for a clash nor for being in its datatype, so a store that holds one is told consistent.
 - Under `owl2-dl`, a key or a negative property assertion over a value the store's quick
@@ -297,6 +302,12 @@ leave something out.
   or more such steps from the target node is accepted, and a full validation
   (`GET /dataset/shacl`) reports it afterwards. Where recursive shapes matter, run one after
   writes.
+- Under `reasoner.equality = "compact"`, a write of `owl:sameAs` can pass the gate though it
+  brings a result ([reasoning](#reasoning)).
+- A write can be refused for a result that was already there: a result reached through a nested
+  shape (a `sh:property` inside a `sh:property`) counts as introduced when a new focus node
+  reaches it, though another focus node reached it before. Repair that result first
+  (`GET /dataset/shacl` lists it).
 - Shapes that don't compile refuse every write, and a validation stopped by its budget fails
   the write, with the gate set to `report` as to `enforce`.
 
