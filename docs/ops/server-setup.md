@@ -388,7 +388,7 @@ one's slope.
 
 ## Upgrading
 
-A data directory written by an earlier NRESE, `main` included, opens as it is, with no
+A data directory written by an earlier NRESE, [the earlier `main`](../releases/v1.5.md) included, opens as it is, with no
 migration step. Checkpoints of formats 4 to 11 are read, and the log is replayed (also after a
 crash or a kill). The repositories, their settings and rules, the namespaces, the access state
 (users, local logins, roles, workspaces, saved queries) and the image backups carry over. Sessions
@@ -399,7 +399,7 @@ and the result cache start empty, as at every start.
 2. Start the new binary with the same configuration. The first start brings each repository's
    inferred statements in line with the new rules: they are kept where the rules didn't change
    (the fingerprint in `reasoning.state`), and derived again before the server reports ready
-   where they did, which takes about as long as reasoning after a bulk load. From `main`, every
+   where they did, which takes about as long as reasoning after a bulk load. From the earlier `main`, every
    repository with reasoning on is derived again: the version of the rules' semantics is part of
    every fingerprint, and it changed.
 3. Check `/readyz`, read `revision` and `quad_count` from `GET /api/v1/repositories/{id}/info`,
@@ -409,8 +409,8 @@ What changes on purpose:
 
 - Under `owl2-rl` and `owl2-dl`, a literal outside its datatype under a range is an
   inconsistency: `"abc"^^xsd:integer` where the range is `xsd:integer`, or any literal
-  typed `rdfs:Literal`. `main` accepted
-  them. A commit that adds one is now refused, and a store from `main` that holds one starts
+  typed `rdfs:Literal`. The earlier `main` accepted
+  them. A commit that adds one is now refused, and a store from the earlier `main` that holds one starts
   in quarantine: `/readyz` answers 503 `quarantined`, and
   `GET /api/v1/repositories/{id}/info` says `inconsistent` with the number of violations.
   Reads are still answered, `sound-only`, and so are writes. Nothing names the statement,
@@ -444,7 +444,7 @@ it lacks (`owl2-dl`), so switch that back first. It ignores settings it doesn't 
 (`ql_rewriting`, `query_timeout_ms`), and reads `inferred = "supported"` as `hidden`.
 
 The upgrade is tested: `crates/nrese-server/tests/it/upgrade_tests.rs` opens a data directory
-written by `main`'s server (`crates/nrese-server/tests/fixtures/main-store`, with the script that
+written by the earlier `main`'s server (`crates/nrese-server/tests/fixtures/main-store`, with the script that
 writes it) and finds the same data and answers in every repository (but the QL rewriting's one),
-every setting, the local logins, current inferences, writes surviving a restart, and `main`'s
+every setting, the local logins, current inferences, writes surviving a restart, and the earlier `main`'s
 image backup restoring.
