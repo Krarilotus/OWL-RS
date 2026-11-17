@@ -14,8 +14,8 @@ use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_store::{
-    ConsistencyStatus, MutationCommand, MutationPipeline, MutationTicket, SparqlUpdateRequest,
-    StoreConfig, StoreService,
+    ConsistencyStatus, MutationCommand, MutationError, MutationPipeline, MutationTicket,
+    RejectKind, SparqlUpdateRequest, StoreConfig, StoreService,
 };
 
 const PREFIXES: &str = "PREFIX : <http://example.com/> \
@@ -114,16 +114,22 @@ fn pipeline(store: &Arc<StoreService>, mode: ReasoningMode) -> MutationPipeline 
     )
 }
 
-fn commit(pipeline: &MutationPipeline, data: &str) -> bool {
-    pipeline
-        .apply(
-            MutationCommand::Update(SparqlUpdateRequest::new(format!(
-                "{PREFIXES}INSERT DATA {{ {data} }}"
-            ))),
-            &nrese_store::Requester::all(),
-            &MutationTicket::new(),
-        )
-        .is_ok()
+/// A commit's outcome: `applied`, `refused` as inconsistent, or `failed` with any other error.
+fn commit(pipeline: &MutationPipeline, data: &str) -> String {
+    let result = pipeline.apply(
+        MutationCommand::Update(SparqlUpdateRequest::new(format!(
+            "{PREFIXES}INSERT DATA {{ {data} }}"
+        ))),
+        &nrese_store::Requester::all(),
+        &MutationTicket::new(),
+    );
+    match result {
+        Ok(_) => "applied".to_owned(),
+        Err(MutationError::Rejected(r)) if r.kind == RejectKind::Inconsistent => {
+            "refused".to_owned()
+        }
+        Err(e) => format!("failed: {e:?}"),
+    }
 }
 
 fn holds(store: &StoreService, data: &str) -> bool {
@@ -145,16 +151,24 @@ fn data(values: &[&str]) -> String {
 /// the store's verdict.
 fn rebuilt(setting: &str, mode: ReasoningMode, way: &str, writes: &[String]) -> String {
     let store = store(setting);
-    let _reasoning = pipeline(&store, mode);
-    let off = pipeline(&store, ReasoningMode::Disabled);
-    for written in writes {
-        match way {
-            "loaded" => {
-                crate::support::load_past_the_pipeline(&store, &format!("{PREFIXES}{written}"))
+    // Reasoning on is set before a load, as a server's is, and after writes with reasoning
+    // off: either way the store reasons in `mode` at the rebuild, an owl2-dl verdict included.
+    let _reasoning = match way {
+        "loaded" => {
+            let reasoning = pipeline(&store, mode);
+            for written in writes {
+                crate::support::load_past_the_pipeline(&store, &format!("{PREFIXES}{written}"));
             }
-            _ => assert!(commit(&off, written)),
+            reasoning
         }
-    }
+        _ => {
+            let off = pipeline(&store, ReasoningMode::Disabled);
+            for written in writes {
+                assert_eq!(commit(&off, written), "applied", "{written}");
+            }
+            pipeline(&store, mode)
+        }
+    };
     if let Some(missing) = writes.iter().find(|w| !holds(&store, w)) {
         return format!("not in the store: {missing}");
     }
@@ -238,25 +252,31 @@ fn a_commit_making_a_datatype_clash_is_refused() {
         for mode in MODES {
             for clash in clashes() {
                 let one = store(setting);
-                if commit(&pipeline(&one, mode), &clash.writes.join(" ")) {
+                let outcome = commit(&pipeline(&one, mode), &clash.writes.join(" "));
+                if outcome != "refused" {
                     wrong.push(format!(
-                        "{setting}, {mode:?}, {}: one commit accepted",
+                        "{setting}, {mode:?}, {}: one commit {outcome}",
                         clash.name
                     ));
                 }
+                // One after another: each write is applied until one is refused, and none
+                // fails for another reason.
                 let each = store(setting);
                 let writer = pipeline(&each, mode);
-                if clash.writes.iter().all(|w| commit(&writer, w)) {
-                    wrong.push(format!(
-                        "{setting}, {mode:?}, {}: every commit accepted",
-                        clash.name
-                    ));
+                let outcomes: Vec<String> =
+                    clash.writes.iter().map(|w| commit(&writer, w)).collect();
+                let first = outcomes.iter().position(|o| o == "refused");
+                if first.is_none_or(|n| outcomes[..n].iter().any(|o| o != "applied"))
+                    || outcomes.iter().any(|o| o.starts_with("failed"))
+                {
+                    wrong.push(format!("{setting}, {mode:?}, {}: {outcomes:?}", clash.name));
                 }
             }
             let equal = store(setting);
-            if !commit(&pipeline(&equal, mode), &data(EQUAL)) {
+            let outcome = commit(&pipeline(&equal, mode), &data(EQUAL));
+            if outcome != "applied" {
                 wrong.push(format!(
-                    "{setting}, {mode:?}: one value in two forms refused"
+                    "{setting}, {mode:?}: one value in two forms {outcome}"
                 ));
             }
         }
