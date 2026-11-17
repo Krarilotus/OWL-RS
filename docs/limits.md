@@ -100,10 +100,16 @@ leave something out.
   ruleset's closure is `sound-only`. The rewriting runs by default under `owl2-ql` only;
   under `owl2-rl`, `reasoner.ql_rewriting = "on"` checks each query as under `owl2-ql`.
   Under `owl2-dl`, budgets and undecided candidates give `sound-only` (raise the `dl.*`
-  budgets, or ask `dl-answers=exact` to get an error instead), and an operator that isn't
+  budgets, or ask `dl-answers=exact` to get an error instead); candidates are decided only
+  in a query that is one basic graph pattern with filters, so under a `UNION`, for one, they
+  stay undecided. An operator that isn't
   monotone over answers that may be missing gives `unsound`
   ([what an answer promises](what-it-covers.md#what-an-answer-promises)). Under `owl2-dl`
-  and `owl2-ql`, and under `owl2-rl` with the rewriting on, a query that matches a number
+  and `owl2-ql`, and under `owl2-rl` with the rewriting on, a read of the RDF, RDFS or OWL
+  vocabulary (`?s rdfs:label ?l`), a variable predicate or class (`?x a ?class`) and
+  `DESCRIBE` give `sound-only` at best
+  ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)). In those
+  modes, a query that matches a number
   or a date it names or computes against the data gives `sound-only` at best: the store
   matches it as written, so `"01"^^xsd:integer` doesn't find a stored `"1"`. Compare values
   in a `FILTER` instead
@@ -134,7 +140,9 @@ leave something out.
   super-property of an annotation property, or another kind of property made its
   sub-property; `rdfs:label`, `rdfs:comment` and the other built-in ones count without a
   declaration) or a punned name (one IRI as a class or
-  property and as an individual) leaves the rules-only route. With annotation-property
+  property and as an individual) leaves the rules-only route. The SHACL shapes graph is a
+  graph of the store and is read too: a shape's `sh:targetClass ex:Animal` makes `ex:Animal`
+  an individual as well as a class, a punned name. With annotation-property
   axioms every answer is `unsound`; with punning, every answer is `unsound` where an
   `owl:sameAs` reaches a punned name. Both are the whole ontology's, not the query's
   ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
@@ -154,8 +162,10 @@ leave something out.
   every verdict but an inconsistency is `unknown`. Where that part is one the OWL 2 RL rules
   may still read (a reserved name used as a class or individual, OWL's vocabulary outside the
   mapping's forms, a malformed structure or list, syntax not read yet), every answer is
-  `unsound` too. The reason gives how many parts were left out and the kind of the first, not
-  which axiom it is; no log or endpoint names it yet. A read inside a transaction is told what
+  `unsound` too. The reason gives how many parts were left out and names the first in words,
+  with its terms as the data writes them (a blank node by a statement next to it, a triple
+  term as `_`; a read that finds the part itself names no term). Only the first is named, and
+  no log or endpoint lists the others. A read inside a transaction is told what
   was left out of the revision it began on, so an addition still pending that would be left
   out may be told `sound-only` until it is committed
   ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
