@@ -67,26 +67,30 @@ impl Budget {
 /// Why a model of `ontology` says nothing for the source: parts of the source weren't
 /// read (fatal diagnostics), so they may have no model. An inconsistency found stands.
 pub fn left_out(ontology: &Ontology) -> Option<String> {
-    let fatal: Vec<_> = ontology
-        .diagnostics
-        .iter()
-        .filter(|d| d.is_fatal())
-        .collect();
-    let first = fatal.first()?;
+    left_out_by(ontology, nrese_owl::Diagnostic::is_fatal)
+}
+
+/// [`left_out`]'s sentence, of the diagnostics `which` picks.
+pub(crate) fn left_out_by(
+    ontology: &Ontology,
+    which: fn(&nrese_owl::Diagnostic) -> bool,
+) -> Option<String> {
+    let found: Vec<_> = ontology.diagnostics.iter().filter(|d| which(d)).collect();
+    let first = found.first()?;
     Some(format!(
         "{} part(s) of the data aren't OWL 2 DL and were left out; first: {first:?}",
-        fatal.len()
+        found.len()
     ))
 }
 
 /// Whether `ontology` is consistent: the context core's Horn stage where it takes the
 /// ontology, else the hypertableau within `budget`. `Consistent` only if nothing of the
-/// source was left out ([`left_out`]).
+/// source was left out ([`left_out`]), else `Unknown` says so; an inconsistency stands.
 pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
     let started = Instant::now();
     let mut checked = check_read(ontology, budget);
     checked.elapsed = started.elapsed();
-    if checked.verdict == Verdict::Consistent
+    if checked.verdict != Verdict::Inconsistent
         && let Some(why) = left_out(ontology)
     {
         checked.verdict = Verdict::Unknown(why);
@@ -330,6 +334,37 @@ mod tests {
             }
         }
         assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    }
+
+    /// Where the reader left a part out, no verdict but an inconsistency stands: one that
+    /// ran out of time is unknown for what was left out, not for the time, since no time
+    /// would decide it; an inconsistency found in what was read is one of the whole.
+    #[test]
+    fn a_left_out_part_makes_every_verdict_but_an_inconsistency_unknown_for_it() {
+        let left_out = |mut ontology: Ontology| {
+            let term = 7;
+            ontology
+                .diagnostics
+                .push(nrese_owl::Diagnostic::Reserved { term });
+            ontology
+        };
+        let expired = Budget {
+            timeout: Some(Duration::ZERO),
+            ..budget()
+        };
+        let out_of_time = check(&left_out(shared_name()), &expired).verdict;
+        assert!(
+            matches!(&out_of_time, Verdict::Unknown(why) if why.contains("were left out")),
+            "{out_of_time:?}"
+        );
+        let mut inconsistent = shared_name();
+        let nothing = ExprId(inconsistent.classes.intern(ClassExpr::Nothing));
+        inconsistent
+            .axioms
+            .push(Axiom::ClassAssertion(nothing, 100));
+        inconsistent.sources.push(Vec::new());
+        let found = check(&left_out(inconsistent), &budget()).verdict;
+        assert_eq!(found, Verdict::Inconsistent);
     }
 
     #[test]
