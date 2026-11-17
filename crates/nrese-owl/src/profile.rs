@@ -860,9 +860,11 @@ pub fn signature(o: &Ontology) -> Signature {
             }
         };
     }
-    // A property declared and never used is a name too.
+    // A property declared and never used is a name too, and so is a SHACL term read as SHACL
+    // content: its use as an individual puns.
     let declared = [&s.classes, &s.annotations, &s.objects, &s.data];
-    s.names.extend(declared.into_iter().flatten());
+    s.names
+        .extend(declared.into_iter().flatten().chain(&o.shacl));
     s
 }
 

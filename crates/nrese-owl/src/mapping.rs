@@ -86,6 +86,9 @@ pub struct Ontology {
     /// among [`Self::annotations`]: OWL 2 DL gives these axioms no meaning, while the OWL 2
     /// RL rules over the triples (prp-dom, prp-rng, prp-spo1) read them. Sorted, each once.
     pub annotation_schema: Vec<Term>,
+    /// The terms read as SHACL content, which has no OWL meaning (read past as an annotation
+    /// is): the predicates in SHACL's namespace and its classes in `rdf:type` statements.
+    pub shacl: BTreeSet<Term>,
     /// The source's ids of the properties with a fixed meaning.
     pub builtin: BuiltinProperties,
     /// The literals, datatypes and facets of the data axioms, as the source gives them.
@@ -175,6 +178,7 @@ pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
     let vocabulary = Vocabulary::new(&|iri| terms.iri(iri));
     let mut reader = Reader::new(statements, terms, vocabulary);
     reader.declarations();
+    reader.shacl();
     reader.axioms();
     reader.finish()
 }
@@ -410,6 +414,7 @@ struct Reader<'a> {
     noncanonical_cardinality: Option<Term>,
     empty_list: Option<Term>,
     annotation_schema: Vec<Term>,
+    shacl: BTreeSet<Term>,
 }
 
 /// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
@@ -457,6 +462,9 @@ pub const BUILTIN_ANNOTATIONS: [&str; 9] = [
     "http://www.w3.org/2002/07/owl#backwardCompatibleWith",
     "http://www.w3.org/2002/07/owl#incompatibleWith",
 ];
+
+/// SHACL's namespace: its content has no OWL meaning ([`Ontology::shacl`]).
+const SHACL: &str = "http://www.w3.org/ns/shacl#";
 
 /// The annotation properties as [`read`] reads them (§5.8), for every reader of the RDF: the
 /// built-in ones, and each IRI declared one by [`DECLARATION_KINDS`] (no blank node). Holds
@@ -538,6 +546,7 @@ impl<'a> Reader<'a> {
             noncanonical_cardinality: None,
             empty_list: None,
             annotation_schema: Vec::new(),
+            shacl: BTreeSet::new(),
         }
     }
 
@@ -653,6 +662,34 @@ impl<'a> Reader<'a> {
                 self.diagnostics
                     .push(Diagnostic::AmbiguousProperty { property: term });
             }
+        }
+    }
+
+    /// The terms of the SHACL content ([`Ontology::shacl`]): none where a statement that is
+    /// neither SHACL content nor an annotation names one, which gives it an OWL meaning, so
+    /// the source reads as any other.
+    fn shacl(&mut self) {
+        let (terms, ty, statements) = (self.terms, self.v.rdf_type, self.statements);
+        let mut memo: HashMap<Term, bool> = HashMap::new();
+        let mut content = |[_, p, o]: [Term; 3]| {
+            let t = if is(p, ty) { o } else { p };
+            let iri = |t| terms.iri_text(t).is_some_and(|i| i.starts_with(SHACL));
+            memo.entry(t).or_insert_with(|| iri(t)).then_some(t)
+        };
+        let found: BTreeSet<Term> = statements
+            .iter()
+            .filter_map(|s| content(s.triple))
+            .collect();
+        let named = !found.is_empty()
+            && statements.iter().any(|s| {
+                let [subject, p, o] = s.triple;
+                content(s.triple).is_none()
+                    && !self.declared_as(p, EntityKind::AnnotationProperty)
+                    && !self.is_builtin_annotation(p)
+                    && (found.contains(&subject) || found.contains(&o))
+            });
+        if !named {
+            self.shacl = found;
         }
     }
 
@@ -1468,10 +1505,11 @@ impl<'a> Reader<'a> {
             }
         } else if self.declared_as(p, EntityKind::AnnotationProperty)
             || self.is_builtin_annotation(p)
+            || self.shacl.contains(&p)
             || self.has_type(s, v.owl_ontology)
         {
-            // An annotation, or a statement about the ontology: its header's annotations
-            // (an anonymous ontology's too: its node is a blank node).
+            // An annotation, SHACL content, or a statement about the ontology: its header's
+            // annotations (an anonymous ontology's too: its node is a blank node).
             self.annotations += 1;
         } else if self.kind(o) == TermKind::Literal || self.is_data_property(p) {
             self.add(Axiom::DataPropertyAssertion(p, s, o), triple);
@@ -1533,7 +1571,7 @@ impl<'a> Reader<'a> {
             v.rdf_property,
             v.rdf_list,
         ];
-        if header.iter().any(|&c| is(o, c)) {
+        if header.iter().any(|&c| is(o, c)) || self.shacl.contains(&o) {
             self.annotations += 1;
             return;
         }
@@ -1610,6 +1648,7 @@ impl<'a> Reader<'a> {
             diagnostics: self.diagnostics,
             annotations: self.annotations,
             annotation_schema: self.annotation_schema,
+            shacl: self.shacl,
             builtin: BuiltinProperties::of(&self.v),
             data: DataTerms::default(),
             anonymous: BTreeSet::new(),
