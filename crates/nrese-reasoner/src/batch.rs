@@ -2190,29 +2190,31 @@ pub(crate) struct Equality {
     partners: Option<TermSet>,
 }
 
-/// The `owl:sameAs` id of `rules`, if they reason with equality (`eq-rep-s`).
-pub(crate) fn same_as_of(rules: &[Rule]) -> Option<u64> {
-    Equality::for_rules(rules).map(|equality| equality.same_as)
+/// The rules the equality module replaces, over `same_as`: `eq-rep-s`, `eq-rep-p` and
+/// `eq-rep-o` by what they say ([`super::equality_rules`]).
+pub(crate) fn is_replacement_rule(rule: &Rule, same_as: u64) -> bool {
+    is_replacement(super::equality_rules::equality_rule(rule, same_as))
 }
 
-/// The rules the equality module replaces.
-pub(crate) fn is_replacement_rule(rule: &Rule) -> bool {
-    matches!(rule.name.as_str(), "eq-rep-s" | "eq-rep-p" | "eq-rep-o")
+/// Whether the built-in equality rule `rule` is one the module replaces.
+pub(crate) fn is_replacement(rule: Option<&str>) -> bool {
+    matches!(rule, Some("eq-rep-s" | "eq-rep-p" | "eq-rep-o"))
 }
 
 impl Equality {
-    /// The module for `rules`, if they include `eq-rep-s` (whose first atom names
-    /// `owl:sameAs`).
-    pub(crate) fn for_rules(rules: &[Rule]) -> Option<Self> {
-        let rule = rules.iter().find(|r| r.name == "eq-rep-s")?;
-        match rule.body.first()?.0[1] {
-            super::ir::Term::Const(same_as) => Some(Self {
-                same_as,
-                produced: HashSet::new(),
-                member_scans: 0,
-                partners: None,
-            }),
-            super::ir::Term::Var(_) => None,
+    /// The module for `rules`, if they hold the equality rules over `same_as`
+    /// ([`super::equality_rules::of`]).
+    pub(crate) fn for_rules(rules: &[Rule], same_as: u64) -> Option<Self> {
+        super::equality_rules::of(rules, same_as).map(Self::over)
+    }
+
+    /// The module over `same_as`.
+    pub(crate) fn over(same_as: u64) -> Self {
+        Self {
+            same_as,
+            produced: HashSet::new(),
+            member_scans: 0,
+            partners: None,
         }
     }
 
@@ -3001,7 +3003,8 @@ pub fn materialise_representatives_with(
         Input::Facts(facts) => Store::new(facts),
         Input::Grouped(groups) => Store::from_groups(groups),
     };
-    let representatives = super::representatives::same_as(rules).map(|same_as| Representatives {
+    let same_as = super::representatives::same_as(rules, schema.same_as());
+    let representatives = same_as.map(|same_as| Representatives {
         same_as,
         classes: EqualityClasses::default(),
         stale: TermSet::default(),
@@ -3040,10 +3043,10 @@ pub fn materialise_representatives_with(
 }
 
 /// The rules equality by representatives runs: without the ones the classes stand for.
-fn under_representatives(rules: &[Rule]) -> Vec<Rule> {
+fn under_representatives(rules: &[Rule], same_as: u64) -> Vec<Rule> {
     rules
         .iter()
-        .filter(|r| !is_replacement_rule(r) && !matches!(r.name.as_str(), "eq-sym" | "eq-trans"))
+        .filter(|r| super::equality_rules::equality_rule(r, same_as).is_none())
         .cloned()
         .collect()
 }
@@ -3152,9 +3155,10 @@ fn run_body(
     let mut program = GroundProgram::default();
     let mut transitive = Transitive::default();
     // Equality by copying (the module), unless it is by representatives.
-    let mut equality = Equality::for_rules(rules).filter(|_| representatives.is_none());
+    let mut equality =
+        Equality::for_rules(rules, schema.same_as()).filter(|_| representatives.is_none());
     let mut rules: std::borrow::Cow<'_, [Rule]> = match &representatives {
-        Some(_) => under_representatives(rules).into(),
+        Some(reps) => under_representatives(rules, reps.same_as).into(),
         None => rules.into(),
     };
     let mut regrounding = true;
@@ -3224,8 +3228,8 @@ fn run_body(
                 stale,
             };
             let mut source = fact_rules(&current, &rules, lists, &mut result.diagnostics);
-            if equality.is_some() {
-                source.retain(|r| !is_replacement_rule(r));
+            if let Some(equality) = &equality {
+                source.retain(|r| !is_replacement_rule(r, equality.same_as));
             }
             if let Some(reps) = &representatives {
                 give_classes(&mut source, reps, &mut guard_classes, &mut guarded);
