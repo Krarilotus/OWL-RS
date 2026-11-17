@@ -659,15 +659,17 @@ fn query(
 /// Settings, each refused before any work where invalid ([`setting`]):
 /// - `NRESE_FUZZ_SEED` (default 0) varies the seeds;
 /// - `NRESE_FUZZ_CASES` (default 100, at least 1) sets their number;
-/// - `NRESE_FUZZ_DEADLINE_S` (default 240) bounds the whole test. Past it, the run stops
-///   and is inconclusive (review G1 r1, F4).
+/// - `NRESE_FUZZ_DEADLINE_S` (default 1800) bounds the whole test. Past it, the run stops
+///   and is inconclusive (review G1 r1, F4). The bound stops a hung run; it is not a speed
+///   check: a slow shared host has taken about 320 s for the 100 cases beside the rest of
+///   the suite, and the default leaves room for one five times slower than that.
 #[test]
 fn generated_cases_answer_as_the_dl_oracle() {
     let base = env_setting("NRESE_FUZZ_SEED", 0, 0);
     // 100 cases, about 20 s on one test thread (`dlorc-g1-measure5-51a049c1`: 120 cases in
     // 24 s, redraws included).
     let cases = env_setting("NRESE_FUZZ_CASES", 100, 1);
-    let deadline_s = env_setting("NRESE_FUZZ_DEADLINE_S", 240, 1);
+    let deadline_s = env_setting("NRESE_FUZZ_DEADLINE_S", 1800, 1);
     let expiry = Expiry::at(std::time::Instant::now() + std::time::Duration::from_secs(deadline_s));
     let deadline = expiry.deadline;
     // Every setting, so a custom deadline replays too (review G1 r2, F5).
