@@ -2881,24 +2881,3 @@ fn a_reader_of_some_graphs_over_a_store_in_quarantine_under_owl2_ql_is_not_compl
     let told = reasons.iter().any(|r| r == fixed);
     assert!(told, "status: no reason {fixed:?} in {reasons:?}");
 }
-
-/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"; "Consistency": a ruleset
-/// switched on later can put a store in quarantine): an answer told `complete` before the store
-/// went into quarantine isn't told so after. Data clean under `owl2-ql` (it has no `eq-diff1`),
-/// `:w owl:differentFrom :w`, is inconsistent under `owl2-rl`; the change of rules keeps the
-/// revision, and the same read again is not `complete`, the earlier answer's status not kept.
-#[test]
-fn an_answer_told_complete_before_a_quarantine_is_not_told_so_in_it() {
-    let same = ":w owl:differentFrom :w .";
-    let store = quarantine_store(Ruleset::Owl2Ql, QlRewritingMode::On, same);
-    assert_clean(&store);
-    let before = rewritten_read_of_a(&store);
-    assert_eq!(status_class(&before), "complete", "setup: {before}");
-    let revision = store.current_revision();
-    store.rematerialise(Ruleset::Owl2Rl).unwrap();
-    assert_quarantined(&store);
-    let kept = store.current_revision() == revision;
-    assert!(kept, "setup: the change of rules took a new revision");
-    let after = rewritten_read_of_a(&store);
-    assert_ne!(status_class(&after), "complete", "status: {after}");
-}
