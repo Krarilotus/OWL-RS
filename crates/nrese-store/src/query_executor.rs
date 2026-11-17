@@ -9,6 +9,7 @@
 //! in its chunked join and grouping loops, and here on every result row.
 
 use std::io::Write;
+use std::sync::OnceLock;
 
 use nrese_engine::ReadModel;
 
@@ -109,6 +110,11 @@ pub struct PreparedQuery {
     /// Whether the results may use RDF 1.2 (triple terms): then they announce
     /// `version=1.2` ([`Self::announce_rdf12`]).
     rdf12: bool,
+    /// Whether what its reader reads holds a triple term ([`Self::announce_on`]): for a
+    /// reader of every graph decided at preparation, for a reader of some graphs by the first
+    /// run of the query or any of its clones, on that run's reader's view; later runs read
+    /// that decision.
+    holds_rdf12: std::sync::Arc<OnceLock<bool>>,
     /// Under `owl2-dl`: which answers this query asks for (`None`: `dl.answers`).
     dl_answers: Option<crate::DlAnswers>,
     /// Told when the query is handed to the executor ([`Self::on_evaluation`]).
@@ -189,6 +195,7 @@ impl PreparedQuery {
             origin: None,
             pin: None,
             rdf12: false,
+            holds_rdf12: Default::default(),
             dl_answers: request.dl_answers,
             on_evaluation: None,
             reads: crate::dl::query::Reads::new(request.scope.access().cloned()),
@@ -251,6 +258,23 @@ impl PreparedQuery {
     /// N-Quads (RDF 1.2 Concepts §2.1; SPARQL 1.2 Query Results JSON §3.1.3).
     pub fn announce_rdf12(&mut self) {
         self.rdf12 = true;
+    }
+
+    /// Decides the data's half of the announcement on `view`, the snapshot the run reads
+    /// as its reader reads it: a triple term in a graph the reader reads. Only the first call
+    /// decides (the preparation's for a reader of every graph, else the first run's of the
+    /// query or any of its clones); later ones keep that decision.
+    pub(crate) fn announce_on(&self, view: &nrese_engine::Snapshot) {
+        let access = self.access.as_deref();
+        let read = |graph| access.is_none_or(|a| a.allows_id(view, graph));
+        let holds = || view.holds_triple_terms(self.read_model, read);
+        self.holds_rdf12.get_or_init(holds);
+    }
+
+    /// Whether the results announce RDF 1.2: the query uses it, or what its reader reads
+    /// holds a triple term, as [`Self::announce_on`] decided it.
+    fn announced(&self) -> bool {
+        self.rdf12 || self.holds_rdf12.get() == Some(&true)
     }
 
     /// Pins the query's result in the result cache under `name` when it runs: kept while
@@ -323,8 +347,11 @@ impl PreparedQuery {
         }
     }
 
+    /// The results' media type, its `version` parameter the announcement's. For a reader of
+    /// every graph it is final from preparation on; for a reader of some graphs only from its
+    /// run's report on (before that it says only whether the query itself uses RDF 1.2).
     pub fn media_type(&self) -> &'static str {
-        match (self.kind(), self.rdf12) {
+        match (self.kind(), self.announced()) {
             (QueryResultKind::Solutions | QueryResultKind::Boolean, false) => {
                 self.solutions_format.media_type()
             }
@@ -520,7 +547,7 @@ fn serialize(
         entered();
     }
     let mut out = out;
-    let version = prepared.rdf12.then_some("1.2");
+    let version = prepared.announced().then_some("1.2");
     let format = match prepared.solutions_format {
         SolutionsResultFormat::Json => Some(ResultsFormat::Json),
         SolutionsResultFormat::Tsv => Some(ResultsFormat::Tsv),
@@ -551,7 +578,7 @@ fn serialize_answers(
     cancellation: &CancellationToken,
 ) -> StoreResult<()> {
     cancellation.check()?;
-    let version = prepared.rdf12.then_some("1.2");
+    let version = prepared.announced().then_some("1.2");
     match answers {
         QueryResults::Boolean(value) => {
             results_serializer(prepared, version).serialize_boolean_to_writer(out, value)?;
