@@ -114,6 +114,7 @@ api_key = "replace-me"
 |---|---|---|---|---|---|
 | <a id="server.bind_address"></a>`server.bind_address` (older `server.bind_addr`) | `NRESE_BIND_ADDR` | text: `IP:PORT` | `127.0.0.1:8080` | start | The address and port the server listens on. Port `0`: the system picks one, and the start log names it. `0.0.0.0:8080` listens on every interface (put a TLS proxy in front: [server-setup.md](server-setup.md)) |
 | <a id="server.deployment_posture"></a>`server.deployment_posture` | `NRESE_DEPLOYMENT_POSTURE` | choice: `open-workbench`, `read-only-demo`, `internal-authenticated`, `replacement-grade` | `open-workbench` | start | What the deployment is for (below) |
+| <a id="server.public_url"></a>`server.public_url` | `NRESE_PUBLIC_URL` | text: a base URL | none | start | The URL clients reach this server at, a reverse proxy's path prefix included (`https://example.org/rdf`). Where the server gives an absolute URL (a new RDF4J transaction's `Location`), it starts with this one and ignores `Host`, `X-Forwarded-Host` and `X-Forwarded-Proto`. Unset, it is built from those headers |
 
 The deployment posture has these effects.
 - `read-only-demo` disables SPARQL Update, `TELL`, Graph Store writes, and admin mutation surfaces (they answer 404)
