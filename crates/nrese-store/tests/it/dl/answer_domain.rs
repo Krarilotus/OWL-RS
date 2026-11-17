@@ -437,7 +437,10 @@ fn a_reserved_name_is_never_an_answer_in_an_individuals_place() {
         }
     }
     // A reserved IRI the data itself states in such a place belongs to a part the reader
-    // leaves out, and a read that returns it is told `unsound` with the left-out reason.
+    // leaves out, and a read that returns it is told `unsound` with the left-out reason. Not
+    // yet for the six names OWL 2 gives a class's or a property's role (`owl:Thing`,
+    // `owl:Nothing`, the top and bottom properties): the reader allows them in every role, so
+    // data that states one as an individual isn't left out, and a read can be `complete`.
     let dl = pipeline();
     insert(
         &dl,
