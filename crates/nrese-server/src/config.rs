@@ -307,21 +307,17 @@ impl ServerConfig {
 
 /// Validates the external base before it can enter logs or response headers.
 fn parse_public_url(value: String) -> Result<String> {
-    let invalid = || {
-        anyhow::anyhow!(
-            "server.public_url must be an absolute HTTP(S) base URL without userinfo, controls, query or fragment"
-        )
-    };
-    let url = reqwest::Url::parse(&value).map_err(|_| invalid())?;
-    if !matches!(url.scheme(), "http" | "https")
-        || !url.username().is_empty()
-        || url.password().is_some()
-        || value.chars().any(char::is_control)
-        || url.query().is_some()
-        || url.fragment().is_some()
-    {
-        return Err(invalid());
-    }
+    let invalid = "server.public_url must be an absolute HTTP(S) base URL without userinfo, controls, query or fragment";
+    let url = reqwest::Url::parse(&value).map_err(|_| anyhow::anyhow!(invalid))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && !value.chars().any(char::is_control)
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        invalid
+    );
     Ok(url.to_string())
 }
 

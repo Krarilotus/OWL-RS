@@ -250,7 +250,7 @@ fn rejected_file_values_are_never_echoed_in_configuration_errors() {
         ),
         (
             "config.toml",
-            "parse",
+            "line 2, column",
             "[server]\npublic_url = https://wire-marker:unused@public.invalid/prefix\n",
         ),
     ] {
