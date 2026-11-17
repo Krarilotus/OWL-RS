@@ -12,6 +12,7 @@ mod identity;
 mod islands;
 mod keys;
 mod left_out;
+mod left_out_words;
 mod mode;
 mod outside;
 mod plans;
