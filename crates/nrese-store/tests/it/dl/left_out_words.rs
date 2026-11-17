@@ -254,9 +254,9 @@ fn a_read_without_the_commits_record_names_nothing() {
     assert!(nameless, "{reasons:?}");
 }
 
-/// A blank node's label is the store's, not the user's, and reaches no sentence: neither a
-/// conclusion's, which the store relabels when it reads the conclusion, nor one inside a
-/// triple term of the data.
+/// A blank node's label is the store's, not the user's, and reaches no sentence. Here a
+/// conclusion's, which the store relabels when it reads the conclusion: the refusal of a
+/// conclusion that isn't OWL 2 DL shows none.
 #[test]
 fn no_sentence_gives_a_blank_nodes_label() {
     let premise = ":C a owl:Class . :D a owl:Class . :E a owl:Class .";
@@ -266,24 +266,20 @@ fn no_sentence_gives_a_blank_nodes_label() {
         nrese_store::dl::entailment::Entailed::Unknown(why) => why,
         other => format!("{other:?}"),
     };
+    let told = refused.contains("isn't well-formed OWL 2 DL") && !refused.contains("_:");
+    assert!(told, "the conclusion's refusal: {refused}");
+}
+
+/// A blank node's label inside a triple term of the data reaches no sentence: the verdict
+/// over a statement outside the mapping whose object is such a term shows none.
+#[test]
+fn no_sentence_gives_a_blank_nodes_label_inside_a_triple_term() {
     let dl = pipeline();
     let data = ":C a owl:Class . :D a owl:Class . :R owl:onProperty <<( _:b :p :o )>> ; \
                 owl:someValuesFrom :D . :R rdfs:subClassOf :C .";
     insert(&dl, data).expect("committed");
     let status = dl.store().dl().status().expect("a verdict");
-    let verdict = status
-        .consistency
-        .verdict
-        .reason()
-        .unwrap_or_default()
-        .to_owned();
-    let told = [
-        ("the conclusion", refused, "isn't well-formed OWL 2 DL"),
-        ("the verdict", verdict, "left out; first: "),
-    ];
-    let wrong: Vec<_> = told
-        .iter()
-        .filter(|(_, text, what)| !text.contains(what) || text.contains("_:"))
-        .collect();
-    assert!(wrong.is_empty(), "{wrong:#?}");
+    let verdict = status.consistency.verdict.reason().unwrap_or_default();
+    let told = verdict.contains("left out; first: ") && !verdict.contains("_:");
+    assert!(told, "the verdict: {verdict}");
 }
