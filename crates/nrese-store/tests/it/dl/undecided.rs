@@ -1,16 +1,19 @@
 //! The OWL 2 RL rules' clashes in data that reached the store past the commit gates (a
 //! bulk load, a start-up rebuild), under `owl2-dl`: undecided where OWL 2 DL reads the
 //! ontology differently, so that nothing states an unproven inconsistency, and in
-//! quarantine all the same.
+//! quarantine all the same. And a commit the rules refuse on their route: decided by the
+//! route's proof where its statements keep the kinds the route was decided on, else read.
 
 use std::sync::Arc;
 
 use nrese_rdf::Triple;
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, RuleProgram};
+use nrese_sparql::GraphAccess;
 use nrese_store::{
-    ConsistencyStatus, DlAnswers, MutationPipeline, StoreConfig, StoreError, StoreService,
-    WhyUndecided,
+    ConsistencyStatus, DlAnswers, MutationCommand, MutationError, MutationPipeline, MutationTicket,
+    ReadScope, RejectKind, Requester, SparqlUpdateRequest, StoreConfig, StoreError, StoreService,
+    WhyUndecided, WriteScope,
 };
 
 use super::{PREFIXES, insert, update};
@@ -389,4 +392,214 @@ fn a_read_after_a_load_and_before_its_rebuild_is_told_not_certified() {
         "{answer:?}"
     );
     assert!(dl.store().dl().status().is_none());
+}
+
+// A write the rules refuse, on a store on their route (design note
+// `2026-11-17-v15-design-record-dl-commit-follows-the-change.md` §8, §8.1): where every
+// statement it changes keeps the kinds the route was decided on (`Kinds::keep`), the route's
+// proof says OWL 2 DL reads the data as the rules do, so the refusal is told as a full read of
+// the ontology would tell it, and where that read is refused by its budget, the proof decides:
+// inconsistent, with the rules' reason. Otherwise the refusal reads as before.
+
+/// A store on the rules' route: `:A` and `:B` disjoint classes, in OWL 2 RL's profile.
+const ROUTED: &str = ":A a owl:Class ; owl:disjointWith :B . :B a owl:Class .";
+
+/// The statements the grown store holds beside [`ROUTED`], committed `BATCH` at a time, and the
+/// memory its requests share.
+/// - A full read of the ontology holds one 32-byte `nrese_owl::Statement` (four term ids) per
+///   asserted statement, so reading `GROWN` needs at least ten times `SHARED`: it is refused.
+/// - A commit holds one encoded quad of 32 bytes at least per statement it writes in its
+///   pending changes (`update_memory_tests`): a batch takes at most a tenth of `SHARED`. The
+///   first commit reads [`ROUTED`]'s three statements, a few hundred bytes. The commits fit.
+const GROWN: usize = 24_000;
+const BATCH: usize = 200;
+const SHARED: usize = 64 << 10;
+const _: () = assert!(GROWN * 32 >= 10 * SHARED && BATCH * 32 * 10 <= SHARED);
+
+/// `:iN a :A` for `N` in `range`: each keeps every term's kind (a known class's member).
+fn members(range: std::ops::Range<usize>) -> String {
+    range.map(|i| format!(":i{i} a :A . ")).collect()
+}
+
+/// A store whose requests share `SHARED` bytes.
+fn tight() -> MutationPipeline {
+    let config = StoreConfig {
+        total_query_memory_bytes: SHARED,
+        ..StoreConfig::in_memory()
+    };
+    store(config, ReasoningMode::Owl2Dl)
+}
+
+/// [`ROUTED`], then `GROWN` members of `:A`, committed through the pipeline: every commit after
+/// the first keeps the kinds, so the store stays on the rules' route with the kinds kept.
+fn grown() -> MutationPipeline {
+    let dl = tight();
+    insert(&dl, ROUTED).expect("the schema commits");
+    for batch in 0..GROWN / BATCH {
+        let data = members(batch * BATCH..(batch + 1) * BATCH);
+        insert(&dl, &data).expect("a kind-keeping commit fits the shared memory");
+    }
+    dl
+}
+
+/// `data` committed through the pipeline on a store with no memory limit: the commit
+/// prepares the route, which keeps the kinds it was decided on.
+fn kept(data: &str) -> MutationPipeline {
+    let dl = store(StoreConfig::in_memory(), ReasoningMode::Owl2Dl);
+    insert(&dl, data).expect("the base commits");
+    assert_eq!(dl.store().dl_bounds().last, "rules", "the base's route");
+    dl
+}
+
+/// `data` loaded past the pipeline and rebuilt, as at a start, on a store with no memory
+/// limit: no commit prepared it, so no kinds are kept, and a refusal reads the ontology in
+/// full. (No read of the bounds here: a read would keep the kinds.)
+fn read_in_full(data: &str) -> MutationPipeline {
+    let dl = store(StoreConfig::in_memory(), ReasoningMode::Owl2Dl);
+    assert_eq!(loaded(&dl, data), ConsistencyStatus::Consistent);
+    dl
+}
+
+/// `update` (with [`PREFIXES`]) committed by `committer` and refused: the kind and the
+/// detail the committer is told.
+fn refused(dl: &MutationPipeline, committer: &Requester, update: &str) -> (RejectKind, String) {
+    let result = dl.apply(
+        MutationCommand::Update(SparqlUpdateRequest::new(format!("{PREFIXES}{update}"))),
+        committer,
+        &MutationTicket::new(),
+    );
+    match result {
+        Err(MutationError::Rejected(reject)) => {
+            let reject = *reject;
+            (reject.kind, reject.detail)
+        }
+        other => panic!("expected the refusal of {update}, got {other:?}"),
+    }
+}
+
+/// The rules' clash (cax-dw): `:x` in two disjoint classes.
+const REFUSED: &str = "INSERT DATA { :x a :A , :B }";
+
+/// - Input: [`grown`], whose read [`SHARED`] refuses; then [`REFUSED`], whose statements keep
+///   the kinds; and, as the control, the clash with a class declared (`:N a owl:Class`), which
+///   doesn't keep them.
+/// - Expected: the clash is inconsistent, with the detail a full read gives
+///   ([`read_in_full`] of [`ROUTED`]: no kinds kept, the read completes). The control is read,
+///   and its read refused: undecided, unchecked. The store is on the rules' route.
+#[test]
+fn a_kind_keeping_refusal_on_the_rules_route_is_decided_past_the_reads_budget() {
+    let dl = grown();
+    let (kind, detail) = refused(&dl, &Requester::all(), REFUSED);
+    let control = refused(
+        &dl,
+        &Requester::all(),
+        "INSERT DATA { :x a :A , :B . :N a owl:Class }",
+    );
+    assert_eq!(dl.store().dl_bounds().last, "rules", "the store's route");
+    assert_eq!(
+        control.0,
+        RejectKind::Undecided,
+        "the control: {}",
+        control.1
+    );
+    assert!(
+        control.1.contains("did not finish within its budget"),
+        "the control: {}",
+        control.1
+    );
+    let full = refused(&read_in_full(ROUTED), &Requester::all(), REFUSED);
+    assert_eq!(
+        full.0,
+        RejectKind::Inconsistent,
+        "the full read: {}",
+        full.1
+    );
+    assert_eq!(kind, RejectKind::Inconsistent, "{detail}");
+    assert_eq!(detail, full.1);
+}
+
+/// [`ROUTED`] with three members of `:A` in `:open`, a graph [`restricted`] may read and write.
+const BASE: &str = ":A a owl:Class ; owl:disjointWith :B . :B a owl:Class . \
+     GRAPH :open { :i1 a :A . :i2 a :A . :i3 a :A }";
+
+/// A committer that may read and write the default graph and `:open` only.
+fn restricted() -> Requester {
+    let open = || {
+        Arc::new(GraphAccess {
+            graphs: vec!["http://example.com/open".to_owned()],
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: true,
+            ..GraphAccess::default()
+        })
+    };
+    Requester::new(ReadScope::Graphs(open()), WriteScope::Graphs(open()))
+}
+
+/// - Input: refused writes whose every statement keeps the kinds of [`BASE`] (a new member of
+///   both classes; a member of `:A` made one of `:B`; that with a member of `:A` deleted), by a
+///   committer of every graph and by [`restricted`], on [`BASE`] with the kinds kept
+///   ([`kept`]) and without ([`read_in_full`]).
+/// - Expected: each committer is told the same kind and detail on both.
+#[test]
+fn a_kind_keeping_refusal_is_told_as_the_full_read_tells_it() {
+    let writes = [
+        "INSERT DATA { GRAPH :open { :x a :A , :B } }",
+        "INSERT DATA { GRAPH :open { :i1 a :B } }",
+        "DELETE DATA { GRAPH :open { :i2 a :A } } ; INSERT DATA { GRAPH :open { :i3 a :B } }",
+    ];
+    let (with, without) = (kept(BASE), read_in_full(BASE));
+    let mut differ = Vec::new();
+    for (who, committer) in [
+        ("every graph", Requester::all()),
+        ("restricted", restricted()),
+    ] {
+        for write in writes {
+            let (a, b) = (
+                refused(&with, &committer, write),
+                refused(&without, &committer, write),
+            );
+            if a != b {
+                differ.push(format!("{who}, {write}: kept {a:?}; read {b:?}"));
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{differ:#?}");
+}
+
+/// - Input: [`BASE`], with the kinds kept and without; a refused write that also uses the
+///   class `:A` as an individual (`:y :p :A`, punning), so its statements don't keep the kinds.
+/// - Expected: on both, it is read, and OWL 2 DL reads it differently: undecided, with the
+///   words that say so (`WhyUndecided::ReadsDifferently`).
+#[test]
+fn a_refusal_that_puns_a_name_stays_undecided() {
+    let write = "INSERT DATA { GRAPH :open { :x a :A , :B . :y :p :A } }";
+    let with = refused(&kept(BASE), &Requester::all(), write);
+    let without = refused(&read_in_full(BASE), &Requester::all(), write);
+    assert_eq!(with.0, RejectKind::Undecided, "{}", with.1);
+    assert!(
+        with.1
+            .contains("annotation-property axioms or a punned name")
+            && with.1.contains("doesn't decide"),
+        "{}",
+        with.1
+    );
+    assert_eq!(with, without);
+}
+
+/// - Input: [`grown`]'s data loaded past the pipeline, as at a start, on a store whose
+///   requests share `SHARED` bytes: no commit prepared it, so no kinds are kept; then
+///   [`REFUSED`].
+/// - Expected: the refusal reads, and its read is refused: undecided, unchecked.
+#[test]
+fn a_refusal_with_no_kinds_kept_reads_as_before() {
+    let dl = tight();
+    let data = format!("{ROUTED} {}", members(0..GROWN));
+    assert_eq!(loaded(&dl, &data), ConsistencyStatus::Consistent);
+    let (kind, detail) = refused(&dl, &Requester::all(), REFUSED);
+    assert_eq!(kind, RejectKind::Undecided, "{detail}");
+    assert!(
+        detail.contains("did not finish within its budget"),
+        "{detail}"
+    );
 }
