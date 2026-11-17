@@ -2764,6 +2764,8 @@ pub(crate) mod hooks {
         /// What a read reads is fixed and its status is still to come: an `owl2-dl` query has
         /// decided its answers, or another read has taken its snapshot.
         pub(crate) static AFTER_DECIDED: Hook = const { RefCell::new(None) };
+        /// An `owl2-dl` query told `complete` is about to pose U1's element for every element.
+        pub(crate) static BEFORE_STAND_IN: Hook = const { RefCell::new(None) };
         /// A clear of the inferred stack has invalidated the certificate and is about to
         /// publish the empty stack.
         pub(crate) static BEFORE_CLEAR_PUBLICATION: Hook = const { RefCell::new(None) };

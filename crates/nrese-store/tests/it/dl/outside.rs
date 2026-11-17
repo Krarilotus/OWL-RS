@@ -4,12 +4,14 @@
 //! (`nrese_owl::fuzz`, whole or kept to OWL 2 RL or EL, with [`TEMPLATES`]) are answered by
 //! the store and by HermiT, a question per candidate row (the DL kit's `nrese.dl.Entail`), and
 //! by Openllet where those two differ. Neither reference is an oracle, so a failure is a
-//! difference both share; one they split on is set aside. Each failure is shrunk, group of
-//! triples by group, and written out.
+//! difference both share; one they split on is set aside, except a row missing from a
+//! `complete` answer, which fails to be judged by the specification by hand (`FAIL-by-hand`).
+//! Each failure is shrunk, group of triples by group, and written out.
 //!
 //! Run with `--ignored` through benches/reasoning/dl/outside.sh, with `NRESE_DL_REFERENCE`
 //! (the command starting `Entail`), `NRESE_FUZZ_SEED`, `NRESE_FUZZ_CASES`, `NRESE_DL_WORKERS`,
-//! `NRESE_DL_WAIT` (seconds before a reference is given up) and `NRESE_DL_OUT`.
+//! `NRESE_DL_WAIT` (seconds before a reference is given up), `NRESE_DL_OUT` and
+//! `NRESE_DL_RANGE` (`all`: a variable ranges over every name of the state; else [`range`]'s sample).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Write};
@@ -648,7 +650,9 @@ fn fails(class: &str) -> bool {
 type Verdict = (usize, String, String, BTreeSet<String>);
 
 /// A row's outcome from HermiT's verdict and Openllet's, if asked. A failure needs both to fail
-/// it on the same answer: the same expected rows, or a counterexample in common.
+/// it on the same answer: the same expected rows, or a counterexample in common. A row HermiT
+/// finds missing from a `complete` answer that Openllet doesn't is a failure to be judged by the
+/// specification by hand: a reference's answer is an indicator, never the verdict.
 fn outcome(hermit: &Verdict, openllet: Option<&Verdict>, alone: Option<bool>) -> String {
     let (_, class, _, keys) = hermit;
     let alike = |(_, c, _, k): &Verdict| fails(c) && !k.is_disjoint(keys);
@@ -671,9 +675,61 @@ fn outcome(hermit: &Verdict, openllet: Option<&Verdict>, alone: Option<bool>) ->
         // node as a named individual.
         (true, _) if alone == Some(true) => "FAIL-one",
         (true, Some(o)) if alike(o) => "FAIL",
+        (true, _) if class == "missing" => "FAIL-by-hand",
         (true, _) => "set-aside",
     };
     out.to_owned()
+}
+
+/// The names a variable in an individual's place ranges over, beside the groups' (`known`).
+/// The regime's range is every name of the state's ontology (SPARQL 1.1 Entailment Regimes
+/// §7.2, (C2) read as "occurs in O(SG)"): `all` takes every other name of `state`; else, the
+/// sample, the first other class, object property and data property.
+fn range(known: BTreeSet<String>, state: &str, all: bool) -> BTreeSet<String> {
+    let iris = state
+        .split_whitespace()
+        .filter_map(|t| t.strip_prefix('<')?.strip_suffix('>'));
+    let other: BTreeSet<&str> = iris
+        .filter(|t| t.starts_with(F) && !known.contains(*t))
+        .collect();
+    let first = |kind: &str| {
+        other
+            .iter()
+            .find(|n| n[F.len()..].starts_with(kind))
+            .copied()
+    };
+    let picked: Vec<&str> = match all {
+        true => other.iter().copied().collect(),
+        false => ["C", "p", "d"].into_iter().filter_map(first).collect(),
+    };
+    let picked: Vec<String> = picked.into_iter().map(str::to_owned).collect();
+    known.into_iter().chain(picked).collect()
+}
+
+/// A variable ranges over the state's names, not only the groups' left: a class kept only in
+/// the state (`C2`, its group deleted) is in the sample, and every name is in the whole range.
+#[test]
+fn the_range_is_the_state_s_names() {
+    let f = |name: &str| format!("<{F}{name}>");
+    let ty = format!("<{RDF}type>");
+    let state = [
+        format!("{} {ty} {} .", f("a0"), f("C2")),
+        format!("{} <{RDFS}subClassOf> {} .", f("C4"), f("C2")),
+        format!("{} {} {} .", f("a0"), f("p1"), f("a3")),
+        format!("{} {} \"1\" .", f("a0"), f("d0")),
+    ];
+    let state = state.join("\n");
+    let known = || BTreeSet::from([format!("{F}a0")]);
+    let names =
+        |ns: &[&str]| -> BTreeSet<String> { ns.iter().map(|n| format!("{F}{n}")).collect() };
+    assert_eq!(
+        range(known(), &state, false),
+        names(&["a0", "C2", "p1", "d0"])
+    );
+    assert_eq!(
+        range(known(), &state, true),
+        names(&["a0", "a3", "C2", "C4", "p1", "d0"])
+    );
 }
 
 /// Per candidate row of a query: the row, its positive questions and its negated ones.
@@ -850,7 +906,12 @@ impl Case {
             Ok((answers, state)) => (answers, state),
         };
         let names = self.kept(skip).flat_map(|g| g.names.clone());
-        let known: BTreeSet<String> = names.collect();
+        let all = match std::env::var("NRESE_DL_RANGE").as_deref() {
+            Ok("all") => true,
+            Ok("sample") | Err(_) => false,
+            Ok(other) => panic!("NRESE_DL_RANGE is `all` or `sample`, not `{other}`"),
+        };
+        let known = range(names.collect(), turtle, all);
         let (mut asked, mut per) = (BTreeSet::new(), Vec::new());
         for (&i, a) in picked.iter().zip(answers) {
             let rows = a.as_ref().map_or(Vec::new(), |a| self.rows(i, a, &known));
@@ -1172,11 +1233,12 @@ fn planted_answers_are_judged_by_kind_and_label() {
     // Two references fail an answer together only on a row in common, whatever their classes.
     let missed = |yes: &[String]| judge(&[a(0)], yes);
     let (one, two) = (missed(&[a(0), a(1)]), missed(&[a(0), a(2)]));
-    assert_eq!(outcome(&one, Some(&two), None), "set-aside");
+    assert_eq!(outcome(&one, Some(&two), None), "FAIL-by-hand");
     let three = missed(&[a(0), a(1), a(2)]);
     assert_eq!(outcome(&one, Some(&three), None), "FAIL");
     let wrong = judge(&[a(0)], &[a(1)]); // wrong a0, missing a1, as `one` misses it
     assert_eq!(outcome(&wrong, Some(&one), None), "FAIL");
+    assert_eq!(outcome(&wrong, Some(&two), None), "set-aside");
     let unjudged = (0, "not-judged".to_owned(), String::new(), BTreeSet::new());
     assert_eq!(outcome(&unjudged, None, None), "not-judged");
 }

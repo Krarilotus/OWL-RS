@@ -19,6 +19,9 @@ pub(crate) struct Analysis {
     /// Variables an expression computes from (`BIND`, `SELECT (… AS ?v)`): a value
     /// derived from one may be no term of its own.
     computed: HashSet<String>,
+    /// The variables at which a name may reach the answer or decide a row though no
+    /// answer variable stands there ([`reaching`]).
+    reaching: HashSet<String>,
     /// An `owl:sameAs` read whose two ends can be one term: a triple pattern with a
     /// variable or blank node at an end or one constant at both, or any path step. A
     /// variable predicate and a negated property set count as possible `owl:sameAs` reads.
@@ -48,17 +51,22 @@ struct Atom {
 /// One end of an [`Atom`], as the gap's Skolem constants see it.
 #[derive(Debug, Clone)]
 enum End {
-    /// A term the query names: never a Skolem constant.
-    Term,
+    /// A term the query names, with its IRI (`None`: a literal): never a Skolem constant.
+    Term(Option<String>),
     Var(String),
-    /// A blank node, a path's inner node, a quoted triple, or one of U1's own terms.
+    /// A blank node, a quoted triple, or one of U1's own terms.
     Hidden,
+    /// A path step's: an inner node, or the path's own end, which a step of a sequence, a
+    /// reverse or a repetition may meet either way round. [`every_name`] takes it as a
+    /// name's: a path never stands for the exact services' basic graph pattern.
+    Step,
 }
 
 fn end_of(term: &TermPattern) -> End {
     match term {
         TermPattern::NamedNode(n) if nrese_dl::internal::is_made(n.as_str()) => End::Hidden,
-        TermPattern::NamedNode(_) | TermPattern::Literal(_) => End::Term,
+        TermPattern::NamedNode(n) => End::Term(Some(n.as_str().to_owned())),
+        TermPattern::Literal(_) => End::Term(None),
         TermPattern::Variable(v) => End::Var(v.as_str().to_owned()),
         _ => End::Hidden,
     }
@@ -100,6 +108,8 @@ pub(super) struct Shape {
     pub(super) filtered: HashSet<String>,
     /// The answer variables (all of the pattern's for `SELECT *`; none for `ASK`).
     pub(super) projected: Vec<Variable>,
+    /// Whether a filter stands over the pattern, which the exact services don't evaluate.
+    pub(super) filter: bool,
 }
 
 fn path_reads(path: &PropertyPathExpression, out: &mut Vec<(Option<String>, Option<String>)>) {
@@ -191,6 +201,7 @@ fn shape_of(query: &Query) -> Option<Shape> {
         patterns,
         filtered,
         projected,
+        filter: matches!(p, GraphPattern::Filter { .. }),
     })
 }
 
@@ -213,6 +224,14 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
     };
     if matches!(query, Query::Describe { .. }) {
         analysis.not_monotone = Some("DESCRIBE");
+    }
+    // An ASK's projection, the parser's `SELECT *` under a `LIMIT` or `OFFSET` if any (an ASK
+    // has no `DISTINCT`), returns no variable ([`answer_variables`]): the walk passes it to
+    // `reaching` by no other name than its address, as one starting under it would skip the
+    // slice above it.
+    let mut ask = matches!(query, Query::Ask { .. }).then_some(pattern);
+    while let Some(GraphPattern::Slice { inner, .. }) = ask {
+        ask = Some(inner);
     }
     pattern.find(&mut |node| {
         match node {
@@ -245,7 +264,7 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
                             .map(|(predicate, class)| Atom {
                                 predicate: predicate.clone(),
                                 class: class.clone(),
-                                ends: [End::Hidden, End::Hidden],
+                                ends: [End::Step, End::Step],
                             });
                         let steps: Vec<Atom> = steps.collect();
                         analysis.atoms.extend(steps);
@@ -259,6 +278,9 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
                     }
                     _ => not_monotone(p),
                 };
+                if !ask.is_some_and(|a| std::ptr::eq(a, p)) {
+                    reaching(p, &mut analysis.reaching);
+                }
                 if analysis.not_monotone.is_none() {
                     analysis.not_monotone = op;
                 }
@@ -273,6 +295,30 @@ pub(crate) fn analyse(query: &Query) -> Analysis {
         false
     });
     analysis
+}
+
+/// The variables at which the node `p` may take a name to the answer or let one decide a
+/// row, beside the answer variables ([`every_name`]): every one in its scope, or its
+/// group's, wherever a solution's bindings count and not only that one exists, which is
+/// under any node but a join, a union, a slice, `DISTINCT` and `REDUCED`. That is more than
+/// the variables an expression reads, which keeps it a bound. (A subquery's and `VALUES`'
+/// scope is the variables they give.) So a variable is existential, as in a conjunctive
+/// query, only where it stands at the ends of triple patterns and path steps under those
+/// nodes alone. Every node kind is decided here, with no default: a new one doesn't
+/// compile until it is.
+fn reaching(p: &GraphPattern, out: &mut HashSet<String>) {
+    use GraphPattern as G;
+    let scope: &GraphPattern = match p {
+        G::Bgp { .. } | G::Path { .. } | G::Join { .. } | G::Union { .. } => return,
+        G::Distinct { .. } | G::Reduced { .. } | G::Slice { .. } => return,
+        G::Project { .. } | G::Values { .. } | G::Filter { .. } | G::Extend { .. } => p,
+        G::OrderBy { .. } | G::LeftJoin { .. } | G::Minus { .. } | G::Lateral { .. } => p,
+        G::Graph { .. } | G::Service { .. } => p,
+        G::Group { inner, .. } => inner,
+    };
+    scope.on_in_scope_variable(|v| {
+        out.insert(v.as_str().to_owned());
+    });
 }
 
 /// The operator `p` is, where it isn't monotone (or isn't under entailment).
@@ -688,6 +734,48 @@ pub(super) fn untyped_same_as(query: &Query, view: &View) -> Option<String> {
     found
 }
 
+/// The class or property of the first atom that may hold of every element, so that every name
+/// of the ontology may answer it in an individual's place (SPARQL 1.1 Entailment Regimes §7.2,
+/// (C2)), where the store answers only for the individuals it reasons about: U1's own element
+/// for every element (`u1:domain`) has the atom's fact at an end that is an answer variable or
+/// a name U1 doesn't type as `owl:Thing` (a class or property name, or one the data hasn't;
+/// U1 so types every individual it reasons about, as [`untyped_same_as`] reads it). With it,
+/// whether an atom does so at a name: then a row of the answer variables can't pose it.
+pub(super) fn every_name(q: &Analysis, view: &View) -> Option<(String, bool)> {
+    let upper = view.upper.as_ref()?;
+    let id = |iri: &str| upper.lookup(NamedNodeRef::new_unchecked(iri).into());
+    let domain = id(&nrese_dl::internal::u1("domain"))?;
+    let any = |s, p, o| {
+        let mut pattern = QuadPattern::all();
+        (pattern.subject, pattern.predicate, pattern.object) = (s, Some(p), o);
+        upper.exists_in(ReadModel::Materialised, &pattern)
+    };
+    let typed = |n: &str| match (id(n), id(RDF_TYPE), id(OWL_THING)) {
+        (Some(s), Some(p), Some(o)) => any(Some(s), p, Some(o)),
+        _ => false,
+    };
+    // An open end: `Some(true)` at a name, or at a variable that reaches the answer only
+    // through an expression (one row of the answer variables can't pose either).
+    let open = |end: &End, fact: bool| match end {
+        End::Var(v) if fact && q.answers.as_ref().is_some_and(|a| a.contains(v)) => Some(false),
+        End::Var(v) => (fact && q.reaching.contains(v)).then_some(true),
+        End::Term(Some(n)) => (fact && !typed(n)).then_some(true),
+        End::Step => fact.then_some(true),
+        End::Term(None) | End::Hidden => None,
+    };
+    let fired = q.atoms.iter().filter_map(|atom| {
+        let (predicate, class) = (atom.predicate.as_deref()?, atom.class.as_deref());
+        let p = id(predicate)?;
+        // A class the store has no id for has no fact.
+        let c = class.map(|class| id(class).ok_or(())).transpose().ok()?;
+        let subject = open(&atom.ends[0], any(Some(domain), p, c));
+        let object = open(&atom.ends[1], class.is_none() && any(None, p, Some(domain)));
+        Some((class.unwrap_or(predicate), subject.max(object)?))
+    });
+    let (what, named) = fired.reduce(|(what, a), (_, b)| (what, a || b))?;
+    Some((what.to_owned(), named))
+}
+
 /// Whether `pattern`, under its projection, is ordered: then a slice of it keeps the
 /// first rows, which a missing row can change.
 fn ordered(mut pattern: &GraphPattern) -> bool {
@@ -758,9 +846,9 @@ pub(super) fn closed_for_answers(analysis: &Analysis, view: &View, snapshot: &Sn
         return false;
     };
     let safe = |end: &End| match end {
-        End::Term => true,
+        End::Term(_) => true,
         End::Var(v) => answers.contains(v) && !analysis.computed.contains(v),
-        End::Hidden => false,
+        End::Hidden | End::Step => false,
     };
     let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
     analysis.atoms.iter().all(|atom| {
