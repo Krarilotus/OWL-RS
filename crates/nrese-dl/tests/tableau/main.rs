@@ -8,6 +8,7 @@ mod ni;
 mod probes;
 mod resources;
 mod sat;
+mod symmetric_chains;
 
 use build::Build;
 use nrese_dl::tableau::{Answer, Config, consistency, satisfiable};
