@@ -741,9 +741,12 @@ fn query_brings_a_closure_an_older_semantics_wrote_up_to_date()
 /// that closure. Opened by the server's start as a read replica, whose reads follow its primary's
 /// log, a reasoned read of that closure is told `not-certified`: nothing on a replica vouches for
 /// it. Run by `nrese-server query` while its directory is locked, the query is refused at the open
-/// and answers nothing. The older closure is written by this build under the same rules and one
-/// more that makes things; its marker is the older build's for these rules: their fingerprint with
-/// the value `skip` had then, written down here.
+/// and answers nothing. Opened as a library opens it (`StoreService::new`, no server) with this
+/// build's rules registered, alone or by a write path, a read of that closure is told
+/// `not-certified`; a reader of some graphs who sees inferences is refused. The older closure is
+/// written by this build under the same rules and one more that makes things; its marker is the
+/// older build's for these rules: their fingerprint with the value `skip` had then, written down
+/// here.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -769,6 +772,9 @@ async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
         "replica query",
         "replica start",
         "locked query",
+        "library rules",
+        "library pipeline",
+        "library restricted",
     ];
     for way in ways {
         let dir = tempfile::tempdir()?;
@@ -846,7 +852,55 @@ async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
         };
         // The marker as the query meets it, after that open.
         let marker = std::fs::read_to_string(&state)?;
-        let (got, must, right) = if way.ends_with("start") {
+        let (got, must, right) = if let Some(how) = way.strip_prefix("library ") {
+            // Opened as a library opens it: this build's rules registered, nothing written,
+            // nothing rebuilt.
+            let store = nrese_store::StoreService::new(nrese_store::StoreConfig {
+                hide_unnamed_classes: true,
+                ..nrese_store::StoreConfig::on_disk(&data)
+            })?;
+            let rules = UserRules::pie("user.pie", pie("")).expect("the rules compile");
+            let reasoner =
+                nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Custom)
+                    .with_rules(Some(Arc::new(rules)))
+                    .expect("a mode for the rules");
+            let _pipeline = match how {
+                "pipeline" => Some(nrese_store::MutationPipeline::new(
+                    Arc::new(store.clone()),
+                    Arc::new(nrese_reasoner::ReasonerService::new(reasoner)),
+                )),
+                _ => {
+                    store.use_reasoning_rules(Some(program(pie(""))));
+                    None
+                }
+            };
+            let scope = match how {
+                "restricted" => {
+                    nrese_store::ReadScope::Graphs(Arc::new(nrese_sparql::GraphAccess {
+                        default_graph: true,
+                        inferred: true,
+                        ..Default::default()
+                    }))
+                }
+                _ => nrese_store::ReadScope::All,
+            };
+            match store.execute_query(&nrese_store::SparqlQueryRequest::new(ASK, scope)) {
+                Ok(answer) => {
+                    let thing = String::from_utf8(answer.payload)?.contains("true");
+                    let told = answer.completeness.map(|c| c.header());
+                    let not_certified = told.as_deref() == Some("not-certified");
+                    let got = format!("answered, ex:x a owl:Thing: {thing}, told {told:?}");
+                    let right = how != "restricted" && (!thing || not_certified);
+                    let must = "false, or told Some(\"not-certified\"); restricted: refused";
+                    (got, must, right)
+                }
+                Err(error) => {
+                    let got = format!("refused: {error}");
+                    let right = how == "restricted" && got.contains("rematerialis");
+                    (got, "answered, not-certified; restricted: refused", right)
+                }
+            }
+        } else if way.ends_with("start") {
             let server = Server::start(&config).await?;
             let (things, told) = server
                 .query_status(

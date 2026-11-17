@@ -195,6 +195,15 @@ impl ReasoningState {
             && (compact_equality || self.nil_lists || !nil_equated())
     }
 
+    /// Whether `program` made the stack this state records, unnamed classes' memberships left
+    /// out or not (`hide_unnamed_classes`), in the state's own form of equality: the one
+    /// comparison by which the store vouches for a stack under the rules registered
+    /// (`StoreService::vouches`) and refuses a reader of some graphs who sees inferences a
+    /// stack other rules made (`support::made_with_other_rules`).
+    pub(crate) fn made_by(&self, program: &RuleProgram, hide_unnamed_classes: bool) -> bool {
+        self.fingerprint == fingerprint(program, hide_unnamed_classes, self.compact_equality)
+    }
+
     pub fn consistency(&self) -> ConsistencyStatus {
         match (self.violations, self.undecided) {
             (0, _) => ConsistencyStatus::Consistent,
