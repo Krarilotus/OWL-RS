@@ -806,12 +806,16 @@ impl StoreService {
     /// `request` parsed for this store: a prefix it uses without declaring it means what the
     /// store's namespaces bind it to ([`PreparedQuery::parse_with`]).
     /// Results that may hold RDF 1.2 terms announce it: the query makes or matches them
-    /// ([`PreparedQuery::announce_rdf12`]), or, decided by its run on what its reader reads,
-    /// a graph the reader reads holds a triple term.
+    /// ([`PreparedQuery::announce_rdf12`]), or a graph the reader reads holds a triple term.
+    /// For a reader of every graph that is decided here, on the latest snapshot; for a reader
+    /// of some graphs, by its first run on what it reads.
     pub fn prepare_query(&self, request: &SparqlQueryRequest) -> StoreResult<PreparedQuery> {
         let mut prepared = PreparedQuery::parse_with(request, Some(&self.namespaces.all()))?;
         if PreparedQuery::uses_rdf12(prepared.query()) {
             prepared.announce_rdf12();
+        }
+        if prepared.access().is_none() {
+            prepared.announce_on(&self.engine.snapshot());
         }
         Ok(prepared)
     }
