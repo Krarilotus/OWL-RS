@@ -15,6 +15,7 @@ mod datatype_clash_tests;
 mod dl;
 mod dl_oracle_tests;
 mod document_end_tests;
+mod empty_list_tests;
 mod entailment_tests;
 mod equality_compact_tests;
 mod equality_pending_tests;

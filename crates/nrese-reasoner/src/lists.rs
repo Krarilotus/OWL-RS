@@ -422,6 +422,10 @@ pub fn instantiate_with_premises(
         "cls-int",
         &mut rules,
         &mut |class, members, rules| {
+            // With no members, cls-int1 has no atom to bind the instance.
+            if members.is_empty() {
+                return;
+            }
             let body = members
                 .iter()
                 .map(|&ci| Atom([v(0), c(ty), c(ci)]))
