@@ -294,6 +294,19 @@ async fn run() -> Result<()> {
     let program = default_reasoner.materialised_program();
     if let CliCommand::Query(query) = cli.command {
         bring_inferences_up_to_date(&store, program.as_ref(), replica)?;
+        // A replica's marker is left from a start as a primary: one not for the configured
+        // rules vouches for a closure they don't make. Here, not in the shared arm: the
+        // server's start goes on to apply the primary's rebuild.
+        let stale = replica
+            && store.reasoning_state().is_some()
+            && program
+                .as_ref()
+                .is_none_or(|p| !store.reasoning_is_current(p));
+        anyhow::ensure!(
+            !stale,
+            "this replica's inferences were reasoned under other rules or semantics: rebuild \
+             its primary and re-bootstrap it into an empty data directory, or query its server"
+        );
         return query_once(&store, query);
     }
     if let CliCommand::PrintQuery(print) = cli.command {

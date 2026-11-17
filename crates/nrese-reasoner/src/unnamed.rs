@@ -51,10 +51,36 @@ impl UnnamedVocabulary {
     }
 }
 
+/// Whether `program` makes every member of a declared class an `owl:Thing`, as the rewrite of
+/// hidden memberships assumes: asked of its rules with no guard of any kind, on a declared
+/// class and a member, two blank nodes no rule can name. A rule with no guard carries over to
+/// any store under any mapping of those two terms, and the whole program derives at least what
+/// its guard-free part does; a program that makes things only through a guarded rule answers
+/// false, and the memberships it hides are left out with nothing in their place. A process
+/// past its memory limit interrupts the question: the interruption, never an answer.
+pub fn members_are_things(program: &crate::RuleProgram) -> Result<bool, crate::delta::Interrupted> {
+    let vocabulary = &mut crate::vocabulary::LocalVocabulary::default();
+    let mut rules = program.rules(vocabulary).expect("checked at startup");
+    rules.retain(|rule| rule.guards.is_empty());
+    let mut input = program
+        .axiom_triples(vocabulary)
+        .expect("checked at startup");
+    let terms = UnnamedVocabulary::new(vocabulary);
+    let thing = vocabulary.iri(&format!("{OWL}Thing"));
+    // Blank nodes: the top half of a local vocabulary's ids, where no constant is.
+    let (class, member) = (1 << 63, (1 << 63) + 1);
+    input.push([class, terms.rdf_type, terms.owl_class]);
+    input.push([member, terms.rdf_type, class]);
+    let schema = crate::eval::Schema::owl(vocabulary);
+    let never = crate::eval::NEVER;
+    let closure = crate::batch::materialise_owned_until(input, &rules, None, &schema, never)?;
+    Ok(closure.derived.contains(&[member, terms.rdf_type, thing]))
+}
+
 /// The unnamed classes among `candidates` (subjects of `owl:unionOf` that are blank
 /// nodes) whose memberships nothing consumes, each with whether its members are things:
-/// it is declared `owl:Class` and the rules make such a class a subclass of `owl:Thing`
-/// (`things`, the ruleset has scm-cls). `mentions(c)` gives every fact `c` occurs in.
+/// it is declared `owl:Class` and the rules make its members things (`things`,
+/// [`members_are_things`]). `mentions(c)` gives every fact `c` occurs in.
 pub fn hidden_classes(
     candidates: impl IntoIterator<Item = u64>,
     mentions: &dyn Fn(u64) -> Vec<Triple>,
