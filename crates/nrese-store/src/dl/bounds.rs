@@ -173,15 +173,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The route the ontology's profile gives (`nrese_owl::profile`): an OWL 2 RL ontology
-/// to the RL rules alone, unless an axiom's rules would compare or type data values: the
-/// rule set leaves out dt-eq and dt-type2 (`nrese_owl::ql::reads_data_values`), so the DL
-/// path decides it by value; or where theorem PR1 doesn't hold, which needs no punning and
-/// no annotation-property axioms (`query::reads_differently` says what that costs); or
-/// unless a cardinality is spelled otherwise than the rules name it
-/// (`Ontology::noncanonical_cardinality`), so they wouldn't read it. Its callers also leave
-/// the route where the closure leaves out a list axiom (`StoreService::lists_left_out`): the
-/// rules lack that axiom's conclusions, and PR1's premise doesn't hold.
+/// The route the ontology's profile gives (`nrese_owl::profile`): an OWL 2 RL ontology (its
+/// data's literals of RL's datatypes too) to the RL rules alone, unless an axiom's rules
+/// would compare or type data values: the rule set leaves out dt-eq and dt-type2
+/// (`nrese_owl::ql::reads_data_values`), so the DL path decides it by value; or where theorem
+/// PR1 doesn't hold, which needs no punning and no annotation-property axioms
+/// (`query::reads_differently` says what that costs); or unless a cardinality is spelled
+/// otherwise than the rules name it (`Ontology::noncanonical_cardinality`), so they
+/// wouldn't read it. Its callers also leave the route where the closure leaves out a list
+/// axiom (`StoreService::lists_left_out`): the rules lack that axiom's conclusions, and PR1's
+/// premise doesn't hold.
 fn routed_to_rules(ontology: &Ontology) -> bool {
     nrese_owl::profile::of_ontology(ontology).rl
         && nrese_owl::ql::reads_data_values(ontology).is_none()
@@ -239,10 +240,26 @@ impl Kinds {
             k.data.contains(&p)
                 && !k.objects.contains(&p)
                 && (!deleted || k.declared_data.contains(&p))
+                && (deleted || rl_literal(tx, o))
         } else {
             let property = k.objects.contains(&p) && !k.data.contains(&p);
             !k.names.contains(&o) && (Some(p) == self.same_as || property)
         }
+    }
+}
+
+/// Whether OWL 2 RL admits the literal `o`'s datatype (`nrese_owl::profile::rl_datatype`):
+/// every inline kind's is the map's but `xsd:date`'s; any other literal is read.
+fn rl_literal(tx: &Transaction<'_>, o: u64) -> bool {
+    match TermId::from_raw(o).kind() {
+        nrese_engine::TermKind::Date => false,
+        nrese_engine::TermKind::TypedLiteral => match tx.decode(TermId::from_raw(o)) {
+            Some(nrese_rdf::Term::Literal(l)) => {
+                nrese_owl::profile::rl_datatype(l.datatype().as_str())
+            }
+            _ => false,
+        },
+        _ => true,
     }
 }
 
