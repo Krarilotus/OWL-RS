@@ -25,8 +25,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use nrese_reasoner::rulesets::Ruleset;
 use nrese_sparql::Completeness;
 use nrese_store::{
-    BulkLoadRequest, GraphTarget, SolutionsResultFormat, SparqlQueryRequest, StoreConfig,
-    StoreService,
+    BulkLoadRequest, ConsistencyStatus, GraphTarget, QlRewritingMode, SolutionsResultFormat,
+    SparqlQueryRequest, StoreConfig, StoreService,
 };
 
 const E: &str = "http://e/";
@@ -2722,4 +2722,183 @@ fn restricted_readers_get_nothing_from_graphs_they_cant_read() {
         "SELECT ?x WHERE { ?x a <http://e/Person> FILTER NOT EXISTS { ?x <http://e/helps> [] } }";
     assert_eq!(ask(idle, ReadScope::All), Vec::<String>::new());
     assert_eq!(ask(idle, supported), ["<bob>"]);
+}
+
+/// The quarantine cells' store: `:A` and `:B` disjoint, `:y` an `:A`, and, unless `clean`, `:x`
+/// both an `:A` and a `:B` (a clash the ruleset's `cax-dw` finds), loaded past the pipeline as a
+/// bulk load does, then reasoned under `ruleset` with the QL rewriting set to `ql`.
+fn quarantine_case(ruleset: Ruleset, ql: QlRewritingMode, clean: bool) -> StoreService {
+    let clash = if clean { "" } else { ":x a :A , :B ." };
+    quarantine_store(ruleset, ql, clash)
+}
+
+/// [`quarantine_case`]'s store with `more` in place of the clash.
+fn quarantine_store(ruleset: Ruleset, ql: QlRewritingMode, more: &str) -> StoreService {
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: ql,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    crate::support::load_past_the_pipeline(
+        &store,
+        &format!(
+            "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+             :A owl:disjointWith :B . :y a :A . {more}"
+        ),
+    );
+    store.rematerialise(ruleset).unwrap();
+    store
+}
+
+/// `query` (prefix `:` declared) on `store` for a reader of `scope`, which the QL rewriting must
+/// answer (setup: its report present): the read's status header (`none` without a status) and
+/// the status's reasons' texts.
+fn rewritten_read(
+    store: &StoreService,
+    query: &str,
+    scope: nrese_store::ReadScope,
+) -> (String, Vec<String>) {
+    let mut request = SparqlQueryRequest::new(format!("PREFIX : <{E}> {query}"), scope);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    let result = store.execute_query(&request).unwrap();
+    let status = (result.completeness.as_ref()).map_or_else(|| "none".to_owned(), |s| s.header());
+    assert!(
+        result.ql.is_some(),
+        "setup: the QL rewriting didn't answer ({status})"
+    );
+    let reasons = (result.completeness.into_iter())
+        .flat_map(|s| s.reasons.into_iter().map(|r| r.text))
+        .collect();
+    (status, reasons)
+}
+
+/// `SELECT ?x { ?x a :A }` on `store` by a reader of every graph: [`rewritten_read`]'s header.
+fn rewritten_read_of_a(store: &StoreService) -> String {
+    rewritten_read(store, "SELECT ?x { ?x a :A }", nrese_store::ReadScope::All).0
+}
+
+/// The status's first word: `complete`, `sound-only`, `unsound`, `not-certified` or `none`.
+fn status_class(header: &str) -> &str {
+    header.split(';').next().unwrap_or(header)
+}
+
+/// Setup of a quarantine cell: the rematerialisation found the clash, so the store is in
+/// quarantine, its data inconsistent under the recorded reasoning.
+fn assert_quarantined(store: &StoreService) {
+    let consistency = store.consistency();
+    let inconsistent = matches!(consistency, ConsistencyStatus::Inconsistent { .. });
+    assert!(
+        store.is_quarantined() && inconsistent,
+        "setup: the store isn't in quarantine: {consistency:?}"
+    );
+}
+
+/// Setup of a control: the data is consistent, the store not in quarantine.
+fn assert_clean(store: &StoreService) {
+    let consistency = store.consistency();
+    let consistent = matches!(consistency, ConsistencyStatus::Consistent);
+    assert!(
+        !store.is_quarantined() && consistent,
+        "setup: the store isn't clean: {consistency:?}"
+    );
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"): `complete` means no
+/// certain answer under the OWL 2 Direct Semantics is missing; inconsistent data entail every
+/// answer, so a read of a store in quarantine under `owl2-ql` that the QL rewriting answers is
+/// never told `complete`.
+#[test]
+fn a_rewritten_read_over_a_store_in_quarantine_under_owl2_ql_is_not_complete() {
+    let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, false);
+    assert_quarantined(&store);
+    let status = rewritten_read_of_a(&store);
+    assert_ne!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec: as under `owl2-ql`, under `owl2-rl` with the QL rewriting on: a read of a store in
+/// quarantine that the rewriting answers is never told `complete`.
+#[test]
+fn a_rewritten_read_over_a_store_in_quarantine_under_owl2_rl_is_not_complete() {
+    let store = quarantine_case(Ruleset::Owl2Rl, QlRewritingMode::On, false);
+    assert_quarantined(&store);
+    let status = rewritten_read_of_a(&store);
+    assert_ne!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"): on clean data under
+/// `owl2-ql`, a read the QL rewriting ran on, of a named class of the data's own, is `complete`.
+/// The control of the `owl2-ql` quarantine cell.
+#[test]
+fn a_rewritten_read_over_clean_data_under_owl2_ql_is_complete() {
+    let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, true);
+    assert_clean(&store);
+    let status = rewritten_read_of_a(&store);
+    assert_eq!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec: as under `owl2-ql`, under `owl2-rl` with the rewriting on. The control of the `owl2-rl`
+/// quarantine cell.
+#[test]
+fn a_rewritten_read_over_clean_data_under_owl2_rl_is_complete() {
+    let store = quarantine_case(Ruleset::Owl2Rl, QlRewritingMode::On, true);
+    assert_clean(&store);
+    let status = rewritten_read_of_a(&store);
+    assert_eq!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to", its operators: "where
+/// answers may be missing, … `MINUS` … make them `unsound`"): over a store in quarantine under
+/// `owl2-ql`, answers may be missing, so a `MINUS` read the QL rewriting answers is `unsound`.
+#[test]
+fn a_negated_read_over_a_store_in_quarantine_under_owl2_ql_is_unsound() {
+    let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, false);
+    assert_quarantined(&store);
+    let query = "SELECT ?x { ?x a :A MINUS { ?x a :B } }";
+    let (status, _) = rewritten_read(&store, query, nrese_store::ReadScope::All);
+    assert_eq!(status_class(&status), "unsound", "status: {status}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"; "Consistency": `/readyz`
+/// tells anyone `quarantined`): a reader of some graphs whose read the QL rewriting answers over
+/// a store in quarantine under `owl2-ql` is never told `complete` either, and is told why in
+/// fixed words: the store is in quarantine, and nothing of the clash.
+#[test]
+fn a_reader_of_some_graphs_over_a_store_in_quarantine_under_owl2_ql_is_not_complete() {
+    let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, false);
+    assert_quarantined(&store);
+    store.use_reasoning_rules(Some(Ruleset::Owl2Ql.into()));
+    let reader = nrese_store::ReadScope::Graphs(std::sync::Arc::new(nrese_sparql::GraphAccess {
+        graphs: vec![format!("{E}open")],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..nrese_sparql::GraphAccess::default()
+    }));
+    let (status, reasons) = rewritten_read(&store, "SELECT ?x { ?x a :A }", reader);
+    assert_ne!(status_class(&status), "complete", "status: {status}");
+    let fixed = "the consistency rules find violations in the stored data (the store is in \
+                 quarantine), and inconsistent data entail every answer";
+    let told = reasons.iter().any(|r| r == fixed);
+    assert!(told, "status: no reason {fixed:?} in {reasons:?}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"; "Consistency": a ruleset
+/// switched on later can put a store in quarantine): an answer told `complete` before the store
+/// went into quarantine isn't told so after. Data clean under `owl2-ql` (it has no `eq-diff1`),
+/// `:w owl:differentFrom :w`, is inconsistent under `owl2-rl`; the change of rules keeps the
+/// revision, and the same read again is not `complete`, the earlier answer's status not kept.
+#[test]
+fn an_answer_told_complete_before_a_quarantine_is_not_told_so_in_it() {
+    let same = ":w owl:differentFrom :w .";
+    let store = quarantine_store(Ruleset::Owl2Ql, QlRewritingMode::On, same);
+    assert_clean(&store);
+    let before = rewritten_read_of_a(&store);
+    assert_eq!(status_class(&before), "complete", "setup: {before}");
+    let revision = store.current_revision();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    assert_quarantined(&store);
+    let kept = store.current_revision() == revision;
+    assert!(kept, "setup: the change of rules took a new revision");
+    let after = rewritten_read_of_a(&store);
+    assert_ne!(status_class(&after), "complete", "status: {after}");
 }
