@@ -674,6 +674,9 @@ pub struct Upper {
     pub program: bounds::Program,
     rules: Vec<ir::Rule>,
     schema: Schema,
+    /// The `owl:sameAs` id `rules` hold the equality rules over, if they do, asked once with
+    /// them ([`nrese_reasoner::delta::Rules::equality`]).
+    equality: Option<u64>,
     /// The program's facts.
     facts: HashSet<Triple>,
     pub stack: Stack,
@@ -888,6 +891,7 @@ impl Upper {
             rdf_type: program.names.rdf_type,
             same_as: program.names.same_as,
             program,
+            equality: nrese_reasoner::representatives::same_as(&rules, schema.same_as()),
             rules,
             schema,
             facts,
@@ -1000,6 +1004,7 @@ impl Upper {
             rules: &self.rules,
             lists: None,
             schema: &self.schema,
+            equality: self.equality,
         };
         let update = delta::update_until(
             &base,

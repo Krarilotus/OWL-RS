@@ -12,6 +12,7 @@ use super::vocabulary::LocalVocabulary;
 
 mod attempted;
 mod boundaries;
+mod equality_shapes;
 mod sources;
 mod stops;
 mod support_refusal;
@@ -825,6 +826,7 @@ fn stopped_updates_are_interrupted() {
         rules: &rules,
         lists: Some(&lists),
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let mut text: Vec<String> = (0..30)
         .map(|i| format!("ex:C{i} rdfs:subClassOf ex:C{}", i + 1))
@@ -1094,6 +1096,7 @@ fn commits_report_the_list_problems_they_introduce() {
         rules: &rules,
         lists: Some(&lists),
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let mut asserted = load(
         &mut vocabulary,
@@ -1903,6 +1906,7 @@ fn maintenance_keeps_what_schema_facts_alone_derive() {
         rules: &rules,
         lists: Some(&lists),
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let closure =
         |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema).derived;
@@ -2014,6 +2018,7 @@ fn guarded_maintenance_equals_rematerialisation_over_representatives() {
         rules: &rules,
         lists: Some(&lists),
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let replicated =
         |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema).derived;
@@ -2176,6 +2181,7 @@ fn delta_equality_equals_rematerialisation() {
         rules: &rules,
         lists: Some(&lists),
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let closure =
         |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema).derived;
@@ -2338,6 +2344,7 @@ fn list_rules_follow_list_edits_under_the_delta_executor() {
             rules: &rules,
             lists: Some(&lists),
             schema: &schema,
+            equality: crate::representatives::same_as(&rules, schema.same_as()),
         };
         let closure =
             |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema);
@@ -2476,6 +2483,7 @@ fn check_supports(
         rules,
         lists: Some(lists),
         schema,
+        equality: crate::representatives::same_as(rules, schema.same_as()),
     };
     let closure = |facts: &[Triple]| {
         let mut all = batch::materialise(facts, rules, Some(lists), schema).derived;
@@ -2733,6 +2741,7 @@ pub(super) fn support_set_updates_against_recomputation() {
             rules: &rules,
             lists: Some(&lists),
             schema: &schema,
+            equality: crate::representatives::same_as(&rules, schema.same_as()),
         };
         let closure = |facts: &[Triple]| {
             let mut all = batch::materialise(facts, &rules, Some(&lists), &schema).derived;
@@ -3019,6 +3028,7 @@ fn delta_equals_rematerialisation_under_random_changes() {
             rules: &rules,
             lists,
             schema: &schema,
+            equality: crate::representatives::same_as(&rules, schema.same_as()),
         };
         for step in 0..4 {
             // Insert some facts of the pool, delete some asserted ones.
@@ -3286,6 +3296,7 @@ _:l33a rdf:rest _:l33b"#,
         rules: &rules,
         lists: Some(&lists),
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let closure = |a: &[Triple]| batch::materialise(a, &rules, Some(&lists), &schema).derived;
     let mut asserted = before.clone();

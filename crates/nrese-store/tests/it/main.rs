@@ -17,6 +17,7 @@ mod document_end_tests;
 mod entailment_tests;
 mod equality_compact_tests;
 mod equality_pending_tests;
+mod equality_rule_names_tests;
 mod explanation_tests;
 mod graph_alias_input_tests;
 mod image_backup_tests;

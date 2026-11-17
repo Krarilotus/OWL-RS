@@ -18,6 +18,7 @@ use std::collections::{BTreeSet, HashMap};
 
 use nrese_dl::bounds::{Answer, AtomicQuery, Bounds, Origin};
 use nrese_rdf_io::RdfFormat;
+use nrese_reasoner::{ir, rulesets::Ruleset};
 use support::{Table, Triple};
 
 const EX: &str = "http://example.org/kex#";
@@ -643,4 +644,16 @@ fn a_proof_of_consistency_needs_a_model() {
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// U1's equality rules are OWL 2 RL's that conclude facts, as the reasoner's ruleset states
+/// them, rule for rule: `bounds::upper` writes the five out a second time, and the
+/// reasoner's equality module stands in for exactly those.
+#[test]
+fn the_equality_rules_are_owl_2_rls() {
+    let mut e = example(KEX);
+    let rl = Ruleset::Owl2Rl.rules(&mut e.table).expect("it parses");
+    let facts = |r: &ir::Rule| r.name.starts_with("eq-") && r.head != ir::Head::Inconsistent;
+    let five = |rules: Vec<ir::Rule>| rules.into_iter().filter(facts).collect::<Vec<_>>();
+    assert_eq!(five(support::reasoner_rules(&e.program)), five(rl));
 }
