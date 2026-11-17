@@ -13,22 +13,26 @@ impl Drop for Server {
         let _ = self.child.wait();
     }
 }
-async fn start(settings: &[(&str, &str)], file: bool) -> Server {
-    let dir = tempfile::tempdir().unwrap();
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    drop(listener);
+fn isolated_command(dir: &std::path::Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_nrese-server"));
-    command.current_dir(dir.path()).env_clear();
+    command.current_dir(dir).env_clear();
     // Keep platform runtime paths, but isolate all server settings.
     for name in ["PATH", "SystemRoot", "TEMP", "TMP", "HOME"] {
         if let Some(value) = std::env::var_os(name) {
             command.env(name, value);
         }
     }
+    command.env("NRESE_REASONING_MODE", "disabled");
+    command
+}
+async fn start(settings: &[(&str, &str)], file: bool) -> Server {
+    let dir = tempfile::tempdir().unwrap();
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let mut command = isolated_command(dir.path());
     command
         .env("NRESE_BIND_ADDR", address.to_string())
-        .env("NRESE_REASONING_MODE", "disabled")
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     if file {
@@ -87,12 +91,12 @@ async fn begin(client: &reqwest::Client, server: &Server) -> String {
 // while the client follows the returned Location through QUERY/UPDATE/COMMIT.
 #[tokio::test]
 async fn configured_public_url_is_followed_through_a_stripping_proxy() {
-    for file in [false, true] {
-        let server = start(
-            &[("NRESE_PUBLIC_URL", "https://public.invalid/prefix/")],
-            file,
-        )
-        .await;
+    for (file, configured) in [
+        (false, "https://public.invalid/prefix/"),
+        (true, "https://public.invalid/prefix/"),
+        (false, "HTTPS://PUBLIC.INVALID:443/prefix/"),
+    ] {
+        let server = start(&[("NRESE_PUBLIC_URL", configured)], file).await;
         let upstream = client();
         let base = server.base.clone();
         let proxy = axum::Router::new().fallback(move |request: axum::extract::Request| {
@@ -152,4 +156,119 @@ async fn unset_public_url_uses_the_forwarded_host() {
     let server = start(&[], false).await;
     let location = begin(&client(), &server).await;
     assert!(location.starts_with("https://forwarded.invalid/repositories/nrese/transactions/"));
+}
+
+// Spec: public_url is an absolute HTTP(S) base without userinfo, controls,
+// query or fragment; a refusal names the setting without echoing its value.
+#[test]
+fn invalid_public_urls_are_refused_without_echoing_configured_text() {
+    let mut wrong = Vec::new();
+    for (case, value) in [
+        (
+            "userinfo",
+            "https://wire-marker:unused@public.invalid/prefix",
+        ),
+        ("newline", "https://public.invalid/wire-marker\npath"),
+        ("control", "https://public.invalid/wire-marker\u{0085}"),
+        ("query", "https://public.invalid/prefix?wire-marker=1"),
+        ("fragment", "https://public.invalid/prefix#wire-marker"),
+        ("relative", "/wire-marker/path"),
+        ("scheme", "ftp://public.invalid/wire-marker"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let stdout = dir.path().join("stdout");
+        let stderr = dir.path().join("stderr");
+        let child = isolated_command(dir.path())
+            .arg("check-config")
+            .env("NRESE_PUBLIC_URL", value)
+            .stdout(std::fs::File::create(&stdout).unwrap())
+            .stderr(std::fs::File::create(&stderr).unwrap())
+            .spawn()
+            .unwrap();
+        let mut process = Server {
+            child,
+            base: String::new(),
+            _dir: dir,
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            if let Some(status) = process.child.try_wait().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "check-config deadline");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let summary = std::fs::read_to_string(stdout).unwrap();
+        let error = std::fs::read_to_string(stderr).unwrap();
+        let rejected = !status.success();
+        let named = error.contains("server.public_url");
+        let disclosed = summary.contains("wire-marker") || error.contains("wire-marker");
+        if !rejected || !named || disclosed {
+            wrong.push(format!(
+                "{case}: refused={rejected}, setting named={named}, disclosed={disclosed}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+// Spec: a refused URL is rejected before listening, so neither a startup log
+// nor an HTTP response can expose its distinctive configured text.
+#[tokio::test]
+async fn a_refused_public_url_cannot_start_an_http_response() {
+    let dir = tempfile::tempdir().unwrap();
+    let stdout = dir.path().join("stdout");
+    let stderr = dir.path().join("stderr");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    drop(listener);
+    let child = isolated_command(dir.path())
+        .env("NRESE_BIND_ADDR", address.to_string())
+        .env(
+            "NRESE_PUBLIC_URL",
+            "https://wire-marker:unused@public.invalid/prefix",
+        )
+        .stdout(std::fs::File::create(&stdout).unwrap())
+        .stderr(std::fs::File::create(&stderr).unwrap())
+        .spawn()
+        .unwrap();
+    let mut server = Server {
+        child,
+        base: format!("http://{address}"),
+        _dir: dir,
+    };
+    let client = client();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (refused, served, disclosed) = loop {
+        if let Some(status) = server.child.try_wait().unwrap() {
+            break (!status.success(), false, false);
+        }
+        if let Ok(response) = client
+            .post(format!("{}/repositories/nrese/transactions", server.base))
+            .send()
+            .await
+        {
+            let headers = response.headers().clone();
+            let body = response.text().await.unwrap();
+            let disclosed = headers
+                .values()
+                .any(|v| v.as_bytes().windows(11).any(|b| b == b"wire-marker"))
+                || body.contains("wire-marker");
+            break (false, true, disclosed);
+        }
+        assert!(Instant::now() < deadline, "startup deadline");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    let summary = std::fs::read_to_string(stdout).unwrap();
+    let error = std::fs::read_to_string(stderr).unwrap();
+    assert_eq!(
+        (
+            refused,
+            served,
+            disclosed,
+            summary.contains("wire-marker"),
+            error.contains("wire-marker")
+        ),
+        (true, false, false, false, false)
+    );
 }

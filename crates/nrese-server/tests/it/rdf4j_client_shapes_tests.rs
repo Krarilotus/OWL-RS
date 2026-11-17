@@ -610,6 +610,80 @@ async fn challenges_depend_only_on_credential_scheme_and_enabled_schemes() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
+// Spec: certificate-only authentication retains its 401 without an HTTP challenge.
+#[tokio::test]
+async fn certificate_only_refusals_name_no_http_scheme() {
+    use nrese_server::auth::{AuthConfig, MtlsConfig};
+    let app = crate::support::test_app_with_policy(PolicyConfig {
+        local_logins: false,
+        auth: AuthConfig::Mtls(MtlsConfig {
+            subject_header: "x-client-cert".to_owned(),
+            trusted_proxies: Vec::new(),
+            read_subjects: Default::default(),
+            admin_subjects: ["CN=test-admin".to_owned()].into(),
+        }),
+        ..PolicyConfig::default()
+    })
+    .unwrap();
+    for headers in [
+        vec![],
+        vec![("sec-fetch-mode", "cors")],
+        vec![("authorization", "Basic invalid")],
+    ] {
+        let (status, response, _) = send(
+            &app,
+            Method::GET,
+            "/dataset/query?query=ASK%20%7B%7D",
+            &headers,
+            "",
+        )
+        .await;
+        assert_eq!(
+            (status, response.contains_key("www-authenticate")),
+            (StatusCode::UNAUTHORIZED, false)
+        );
+    }
+}
+
+// Spec: a sent Basic scheme chooses Basic even when the payload is not ASCII.
+#[tokio::test]
+async fn malformed_credential_bytes_preserve_the_sent_scheme() {
+    use nrese_server::auth::{AuthConfig, StaticBearerConfig};
+    let app = crate::support::test_app_with_policy(PolicyConfig {
+        auth: AuthConfig::BearerStatic(StaticBearerConfig {
+            read_token: None,
+            admin_token: "test-admin".to_owned(),
+        }),
+        ..PolicyConfig::default()
+    })
+    .unwrap();
+    for fetch in ["navigate", "cors"] {
+        let request = Request::builder()
+            .uri(STATEMENTS)
+            .header(
+                "authorization",
+                axum::http::HeaderValue::from_bytes(b"Basic \x80").unwrap(),
+            )
+            .header("sec-fetch-mode", fetch)
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(
+            (
+                response.status(),
+                response
+                    .headers()
+                    .get("www-authenticate")
+                    .and_then(|h| h.to_str().ok())
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                Some("Basic realm=\"nrese\", charset=\"UTF-8\"")
+            ),
+        );
+    }
+}
+
 async fn wrong_basic_challenge(
     union: bool,
     method: Method,
