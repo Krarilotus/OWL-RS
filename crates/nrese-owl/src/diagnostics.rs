@@ -123,6 +123,34 @@ impl Diagnostic {
                 | Self::Unsupported { .. }
         )
     }
+
+    /// What it is, in words, its terms as `name` writes them (the reader has no dictionary).
+    pub fn describe(&self, name: &dyn Fn(Term) -> String) -> String {
+        let at = |what: &str, term| format!("{what}: {}", name(term));
+        match *self {
+            Self::Malformed { node, what } => at(what, node),
+            Self::SharedBlankNode { node } => at("a blank node two expressions use", node),
+            Self::BrokenList { head } => at("a list not ending in rdf:nil, or a bad cell", head),
+            Self::UndeclaredProperty { property } => at("a property used undeclared", property),
+            Self::AmbiguousProperty { property } => at("both object and data property", property),
+            Self::Unsupported { node, what } => at(&format!("{what}, not read yet"), node),
+            Self::NotOwl { triple } => {
+                let statement = triple.map(name).join(" ");
+                format!("OWL vocabulary outside the mapping: {statement}")
+            }
+            Self::Unused { node } => at("a structure no axiom uses", node),
+            Self::NonSimpleProperty { property, what, .. } => {
+                at(&format!("a non-simple property in {what}"), property)
+            }
+            Self::AnonymousIndividual { node } => at("a blank node in oneOf or hasValue", node),
+            Self::Syntax { line, column, what } => {
+                format!("text not read at line {line}, column {column}: {what}")
+            }
+            Self::RepeatedOperand => "a disjointness that repeats an operand".to_owned(),
+            Self::Reserved { term } => at("reserved vocabulary used as an entity", term),
+            Self::Rule { rule } => format!("rule {}, a DL-safe rule, not OWL 2", rule + 1),
+        }
+    }
 }
 
 /// Reports the axioms that use non-simple properties where OWL 2 DL requires simple

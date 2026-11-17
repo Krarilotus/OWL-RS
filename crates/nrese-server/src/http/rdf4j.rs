@@ -170,11 +170,12 @@ fn store_error(error: nrese_store::StoreError) -> ApiError {
     ApiError::internal(error.to_string())
 }
 
-/// A store error of a read: 403 for a forbidden one.
+/// A store error of a read: 403 for a forbidden one, 503 for one refused until the store is
+/// rematerialised.
 fn read_error(error: nrese_store::StoreError) -> ApiError {
     match error {
         error @ nrese_store::StoreError::Forbidden(_) => ApiError::forbidden(error.to_string()),
-        error => ApiError::internal(error.to_string()),
+        error => crate::http::sparql::refused_or(error, ApiError::internal),
     }
 }
 

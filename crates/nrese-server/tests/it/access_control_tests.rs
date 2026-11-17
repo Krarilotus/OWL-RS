@@ -13,7 +13,9 @@ use nrese_store::StoreConfig;
 use serde::Serialize;
 use tower::util::ServiceExt;
 
-use crate::support::{body_text, test_app_with_settings, test_app_with_store_config};
+use crate::support::{
+    body_text, test_app_with_settings, test_app_with_store_config, test_state_with_store_config,
+};
 
 const EX: &str = "http://example.com/";
 
@@ -38,7 +40,7 @@ struct Claims {
     roles: Vec<String>,
 }
 
-fn token(roles: &[&str]) -> String {
+pub(super) fn token(roles: &[&str]) -> String {
     encode(
         &Header::default(),
         &Claims {
@@ -59,7 +61,7 @@ fn app_with(policy: &str) -> Result<axum::Router, Box<dyn std::error::Error>> {
 }
 
 fn app_in(policy: &str, mode: ReasoningMode) -> Result<axum::Router, Box<dyn std::error::Error>> {
-    test_app_with_settings(policy_config(policy)?, ReasonerConfig::for_mode(mode))
+    test_app_with_settings(policy_of(policy)?, ReasonerConfig::for_mode(mode))
 }
 
 /// [`app_with`] over a store configured as `store`.
@@ -68,10 +70,11 @@ fn app_with_store(
     store: StoreConfig,
 ) -> Result<axum::Router, Box<dyn std::error::Error>> {
     let reasoner = ReasonerConfig::for_mode(ReasoningMode::Rdfs);
-    test_app_with_store_config(store, policy_config(policy)?, reasoner)
+    test_app_with_store_config(store, policy_of(policy)?, reasoner)
 }
 
-fn policy_config(policy: &str) -> Result<PolicyConfig, Box<dyn std::error::Error>> {
+/// The server's policy: test-secret bearer tokens and the access policy `policy`.
+pub(super) fn policy_of(policy: &str) -> Result<PolicyConfig, Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("access.toml");
     std::fs::write(&path, policy)?;
@@ -869,6 +872,166 @@ default_graph = "read"
         !ask(&app, &["nrese.admin"], &marked).await?,
         "the update's WHERE read an inferred statement the editor doesn't see"
     );
+    Ok(())
+}
+
+/// A reader of some graphs who sees inferences, refused its read while the inferred statements
+/// aren't the closure of the rules in place, is answered 503 with the refusal's sentence and,
+/// on a primary, the administrator's route: the read may succeed once the store is
+/// rematerialised (`POST /api/v1/repositories/{id}/reasoning/rematerialise`), and the refusal
+/// is no fault of the server's (no 500). A primary's answer names no replica. The stack is
+/// certified under rdfs and the rules in place are owl2-rl, as a change of a repository's
+/// reasoning leaves it for a moment.
+#[tokio::test]
+async fn a_read_refused_until_the_store_is_rematerialised_is_answered_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    const READER: &str = r#"
+default = "deny"
+inferred = "visible"
+
+[[role]]
+name = "reader"
+read = ["http://example.com/g/pub/*"]
+default_graph = "read"
+"#;
+    let rdfs = ReasonerConfig::for_mode(ReasoningMode::Rdfs);
+    let state = test_state_with_store_config(Default::default(), policy_of(READER)?, rdfs)?;
+    let app = nrese_server::build_app(state.clone());
+    let owl2_rl = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
+    state.store().use_reasoning_rules(Some(owl2_rl.into()));
+    let query = Some("application/sparql-query");
+    let (status, body) = send(
+        &app,
+        &["reader"],
+        Method::POST,
+        "/dataset/query",
+        query,
+        "ASK { ?s ?p ?o }",
+    )
+    .await?;
+    let sentence =
+        body.contains("the inferred statements aren't the rules' closure: rematerialise first");
+    let route =
+        body.contains("(an administrator: POST /api/v1/repositories/{id}/reasoning/rematerialise)");
+    let got = format!(
+        "{} {}, {}, {}",
+        status.as_u16(),
+        if sentence {
+            "with the sentence"
+        } else {
+            "without the sentence"
+        },
+        if route {
+            "with the route"
+        } else {
+            "without the route"
+        },
+        if body.contains("replica") {
+            "naming a replica"
+        } else {
+            "naming no replica"
+        }
+    );
+    let want = "503 with the sentence, with the route, naming no replica";
+    match got == want {
+        true => println!("CASE the refused read's status: right {got}"),
+        false => println!("CASE the refused read's status: WRONG {got}, want {want}"),
+    }
+    assert_eq!(got, want, "{body}");
+    Ok(())
+}
+
+/// A read inside an RDF4J transaction (`QUERY`, `GET`, `SIZE`) whose queued update has a
+/// `WHERE` is refused as the read outside it while the inferred statements aren't the
+/// closure of the rules in place: the update's `WHERE` reads as its requester may and meets
+/// the refusal there, and the read is answered 503 with the refusal's sentence and, on a
+/// primary, the administrator's route. The stack is certified under rdfs and the rules in
+/// place are owl2-rl, as a change of a repository's reasoning leaves it for a moment.
+#[tokio::test]
+async fn a_session_read_refused_until_the_store_is_rematerialised_is_answered_unavailable()
+-> Result<(), Box<dyn std::error::Error>> {
+    const EDITOR: &str = r#"
+default = "deny"
+inferred = "visible"
+
+[[role]]
+name = "editor"
+read = ["http://example.com/g/open"]
+write = ["http://example.com/g/open"]
+default_graph = "read"
+"#;
+    let editor = &["editor"];
+    let rdfs = ReasonerConfig::for_mode(ReasoningMode::Rdfs);
+    let state = test_state_with_store_config(Default::default(), policy_of(EDITOR)?, rdfs)?;
+    let app = nrese_server::build_app(state.clone());
+    let owl2_rl = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
+    state.store().use_reasoning_rules(Some(owl2_rl.into()));
+    let begin = Request::builder()
+        .method(Method::POST)
+        .uri("/repositories/nrese/transactions")
+        .header("authorization", format!("Bearer {}", token(editor)))
+        .body(Body::empty())?;
+    let response = app.clone().oneshot(begin).await?;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let tx = response.headers()[axum::http::header::LOCATION]
+        .to_str()?
+        .to_owned();
+    let queued = format!(
+        "INSERT {{ GRAPH <{EX}g/open> {{ ?s <{EX}copy> ?o }} }} \
+         WHERE {{ GRAPH <{EX}g/open> {{ ?s ?p ?o }} }}"
+    );
+    let (status, body) = send(
+        &app,
+        editor,
+        Method::PUT,
+        &format!("{tx}?action=UPDATE"),
+        Some("application/x-www-form-urlencoded"),
+        &serde_urlencoded::to_string([("update", queued)])?,
+    )
+    .await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ask = serde_urlencoded::to_string([("query", "ASK { ?s ?p ?o }")])?;
+    let want = "503 with the sentence, with the route, naming no replica";
+    let mut wrong = Vec::new();
+    for (action, query) in [
+        ("QUERY", format!("&{ask}")),
+        ("GET", String::new()),
+        ("SIZE", String::new()),
+    ] {
+        let uri = format!("{tx}?action={action}{query}");
+        let (status, body) = send(&app, editor, Method::PUT, &uri, None, "").await?;
+        let sentence =
+            body.contains("the inferred statements aren't the rules' closure: rematerialise first");
+        let route = body
+            .contains("(an administrator: POST /api/v1/repositories/{id}/reasoning/rematerialise)");
+        let got = format!(
+            "{} {}, {}, {}",
+            status.as_u16(),
+            if sentence {
+                "with the sentence"
+            } else {
+                "without the sentence"
+            },
+            if route {
+                "with the route"
+            } else {
+                "without the route"
+            },
+            if body.contains("replica") {
+                "naming a replica"
+            } else {
+                "naming no replica"
+            }
+        );
+        match got == want {
+            true => println!("CASE the session's {action}: right {got}"),
+            false => {
+                println!("CASE the session's {action}: WRONG {got}, want {want}");
+                wrong.push(format!("{action}: {body}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "wrong: {wrong:?}");
     Ok(())
 }
 
