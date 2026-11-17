@@ -325,3 +325,59 @@ async fn a_write_whose_read_right_ends_while_it_runs_publishes_nothing() -> Fall
     );
     Ok(())
 }
+/// A change of the access state that leaves the writer's rights as they were refuses nothing:
+/// another role's rule, another user, the writer's own rule written again unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_change_that_leaves_the_writers_rights_refuses_nothing() -> Fallible<()> {
+    let other_role = json!({ "read": [SOURCE, TARGET], "reason": "test" });
+    let other_user = json!({ "roles": ["other"], "reason": "test" });
+    for during in [
+        ("/api/v1/access/roles/other", other_role),
+        ("/api/v1/access/users/carol", other_user),
+        writer_role(&[TARGET]),
+    ] {
+        let endpoint = HeldEndpoint::bind().await?;
+        let app = app(&endpoint, ReasoningMode::Disabled)?;
+        let update = held_insert(&endpoint, false);
+        let uri = during.0;
+        let answer = raced(&app, &endpoint, Entry::SparqlUpdate, update, during).await?;
+        assert_eq!(
+            (answer.status, written(&app).await?),
+            (StatusCode::NO_CONTENT, true),
+            "{uri}: committed ({})",
+            answer.body
+        );
+    }
+    Ok(())
+}
+
+/// A write refused because its rights changed, sent again, is judged under the new rights:
+/// refused (403) without the right, committed once it is given back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_write_refused_for_changed_rights_is_judged_anew_when_sent_again() -> Fallible<()> {
+    let endpoint = HeldEndpoint::bind().await?;
+    let app = app(&endpoint, ReasoningMode::Disabled)?;
+    let update = held_insert(&endpoint, false);
+    let answer = raced(
+        &app,
+        &endpoint,
+        Entry::SparqlUpdate,
+        update.clone(),
+        writer_role(&[]),
+    )
+    .await?;
+    expect(answer, StatusCode::SERVICE_UNAVAILABLE)?;
+    let again = write(app.clone(), WRITER, Entry::SparqlUpdate, update.clone()).await?;
+    assert_eq!(again.status, StatusCode::FORBIDDEN, "{}", again.body);
+    change(&app, &writer_role(&[TARGET])).await?;
+    let mut running = tokio::spawn(write(app.clone(), WRITER, Entry::SparqlUpdate, update));
+    endpoint.call(&mut running).await?.answer().await?;
+    let answer = running.await??;
+    assert_eq!(
+        (answer.status, written(&app).await?),
+        (StatusCode::NO_CONTENT, true),
+        "{}",
+        answer.body
+    );
+    Ok(())
+}
