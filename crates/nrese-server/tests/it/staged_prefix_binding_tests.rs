@@ -77,7 +77,6 @@ async fn rdf4j_transaction_preserves_staged_prefix_binding() {
 }
 
 #[tokio::test]
-#[ignore = "Staged updates use the live search scope"]
 async fn staging_context_keeps_the_search_scope_from_staging() {
     // Spec: A staged WHERE uses the search scope in force at staging. Its first
     // transaction read and commit keep the global winner after switching to reader scope.

@@ -235,17 +235,9 @@ impl MutationPipeline {
         let envelope = self.store.envelope(None);
         tx.charge_pending_to(Arc::new(envelope.part()))
             .map_err(|error| store_error(error.into()))?;
-        let context = crate::mutation::command::UpdateContext {
-            memory: envelope.clone(),
-            cancellation: ticket.evaluation_token(),
-            union_default_graph: self.store.config().union_default_graph,
-            geosparql_stated_only: self.store.config().geosparql_stated_only,
-            search_scope: self.store.search_scope(),
-            services: self.store.services(),
-            namespaces: self.store.namespaces().all(),
-            supports: Arc::clone(self.store.supports()),
-            compilation: self.store.support_compilation(),
-        };
+        let context = self
+            .store
+            .update_context(envelope.clone(), ticket.evaluation_token());
         let report = command
             .apply(&mut tx, requester, &context)
             .map_err(store_error)?;

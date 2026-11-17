@@ -158,11 +158,10 @@ pub(crate) fn update(
 ) -> Result<SparqlUpdateRequest, ApiError> {
     let operation = update_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), body)?;
     policy.enforce_update_bytes(operation.update.len())?;
-    Ok(SparqlUpdateRequest {
-        update: operation.update,
-        using_graphs: operation.using_graphs,
-        using_named_graphs: operation.using_named_graphs,
-    })
+    let mut request = SparqlUpdateRequest::new(operation.update);
+    request.using_graphs = operation.using_graphs;
+    request.using_named_graphs = operation.using_named_graphs;
+    Ok(request)
 }
 
 /// A store error of a namespace change: the store's fault.

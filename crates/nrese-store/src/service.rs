@@ -316,27 +316,31 @@ impl StoreService {
             )),
         };
         let unavailable = std::sync::Arc::<std::sync::OnceLock<String>>::default();
-        let namespaces = crate::namespaces::Namespaces::open(
+        let namespaces = std::sync::Arc::new(crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
             std::sync::Arc::clone(&unavailable),
-        )?;
+        )?);
         // The support graph sets and restricted views draw on the memory the queries do,
         // as the canonical views.
         let supports = crate::support::Supports::new(std::sync::Arc::new(
             nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
         ));
         // So does what client transactions keep between requests.
-        let sessions = crate::sessions::Sessions::within(
+        let mut sessions = crate::sessions::Sessions::within(
             std::sync::Arc::new(
                 nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
             ),
             crate::sessions::SESSION_IDLE,
         );
+        sessions.update_settings = Some((
+            std::sync::Arc::clone(&namespaces),
+            std::sync::Arc::clone(&settings.search_scope),
+        ));
         let service = Self {
             process_memory,
             capacity: nrese_exec::memory::capacity,
             settings,
-            namespaces: std::sync::Arc::new(namespaces),
+            namespaces,
             quarantine: std::sync::Arc::new(quarantine),
             sessions: std::sync::Arc::new(sessions),
             running: std::sync::Arc::default(),
