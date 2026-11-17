@@ -1728,7 +1728,8 @@ const WARM_UP: &str = ":warmP a owl:ObjectProperty ; rdfs:subPropertyOf :warmP .
 /// prp-spo2 (OWL 2 Profiles §4.3): a commit of a path along a chain derives the chain's
 /// property, though the chain came past the pipeline (loaded, then rebuilt) after the
 /// pipeline grounded the rules over an older state ([`WARM_UP`]), and whether or not an
-/// update that changes no inference came between.
+/// update that changes no inference came between. After that sequence, a deletion of a
+/// loaded premise takes its prp-spo1 conclusion with it.
 #[test]
 fn a_chain_loaded_past_a_warm_pipeline_is_reasoned_with_after_an_update() {
     let mut wrong = Vec::new();
@@ -1755,6 +1756,22 @@ fn a_chain_loaded_past_a_warm_pipeline_is_reasoned_with_after_an_update() {
         if !(derived && answer == ["true"]) {
             wrong.push(line);
         }
+    }
+    let dl = pipeline();
+    insert(&dl, WARM_UP).expect("a clean warm-up");
+    let turtle = format!("{}:q rdfs:subPropertyOf :p . :b0 :q :b1 .", super::PREFIXES);
+    crate::support::load_past_the_pipeline(dl.store(), &turtle);
+    dl.store().rematerialise(rl_rules()).expect("rebuilt");
+    super::update(&dl, "INSERT DATA {}").expect("an empty update");
+    super::update(&dl, "DELETE DATA { :b0 :q :b1 }").expect("the premise deleted");
+    let (answer, asked) = query(&dl, "ASK { :b0 :p :b1 }");
+    let line = format!(
+        "kept, the premise deleted: ask {answer:?} sound {} complete {}",
+        asked.shared.sound, asked.shared.complete
+    );
+    eprintln!("{line}");
+    if answer != ["false"] {
+        wrong.push(line);
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
