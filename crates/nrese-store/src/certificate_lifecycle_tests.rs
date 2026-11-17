@@ -1027,3 +1027,53 @@ fn a_store_leaving_quarantine_at_a_kept_views_revision_is_told_what_clean_data_a
         "the setup: the revalidation took a new revision"
     );
 }
+
+/// What a read over data the full check finds inconsistent is told (`dl::query`).
+const INCONSISTENT: &str = "the data is inconsistent under OWL 2 DL, so it entails every answer";
+
+/// Under `owl2-dl` a rebuild that finds a clash publishes its revision before it records
+/// the clash (`StoreService::rematerialise`). A read between the two builds and keeps that
+/// revision's view; the read after the record is told what a store in quarantine is told:
+/// `sound-only`, the data inconsistent.
+#[test]
+fn a_store_entering_quarantine_at_a_rebuild_is_told_inconsistent_after_a_read_in_between() {
+    let rules = || {
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+            .materialised_program()
+            .expect("owl2-dl maintains the OWL 2 RL closure")
+    };
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let _dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    load(&store, &CLASH.replace(":w a :A , :B", ":w a :A"));
+    store.rematerialise(rules()).expect("rebuilt");
+    assert!(
+        !store.is_quarantined(),
+        "the setup: {:?}",
+        store.consistency()
+    );
+    load(&store, ":w a :B .");
+    let (reader, seen) = (Arc::clone(&store), Arc::new(Mutex::new(None)));
+    let kept = Arc::clone(&seen);
+    hooks::AFTER_PUBLICATION.set(Some(Box::new(move || {
+        *kept.lock().unwrap() = Some((reader.current_revision(), status(&reader, IN_H)));
+    })));
+    let rebuilt = store.rematerialise(rules());
+    hooks::AFTER_PUBLICATION.set(None);
+    rebuilt.expect("rebuilt");
+    let after = status(&store, IN_H);
+    assert!(
+        class(&after) == "sound-only" && after.contains(INCONSISTENT),
+        "{after}"
+    );
+    let (revision, _) = seen.lock().unwrap().take().expect("the hook ran");
+    assert!(
+        store.is_quarantined(),
+        "the setup: {:?}",
+        store.consistency()
+    );
+    assert_eq!(
+        store.current_revision(),
+        revision,
+        "the setup: the read in between read another revision"
+    );
+}
