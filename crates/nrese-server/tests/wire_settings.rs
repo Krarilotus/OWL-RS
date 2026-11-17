@@ -227,31 +227,41 @@ fn invalid_public_urls_are_refused_without_echoing_configured_text() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-// Spec: TOML errors name the file or key and kind without disclosing values,
-// including public URLs with userinfo and credential fields, before startup.
+// Spec: configuration-file refusals name the key/type or file/exact position
+// with our fixed reason, never parser text or rejected values, including i128.
 #[test]
 fn rejected_file_values_are_never_echoed_in_configuration_errors() {
     let mut wrong = Vec::new();
-    for (key, kind, contents) in [
+    for (key, kind, contents, forbidden) in [
         (
             "server.public_url",
             "text",
             "[server]\npublic_url = [\"https://wire-marker:unused@public.invalid/prefix\"]\n",
+            "wire-marker",
         ),
         (
             "server.public_url",
             "text",
             "[server]\npublic_url = { address = \"https://wire-marker:unused@public.invalid/prefix\" }\n",
+            "wire-marker",
         ),
         (
             "auth.bearer_static.admin_token",
             "text",
             "[auth.bearer_static]\nadmin_token = [\"wire-marker\"]\n",
+            "wire-marker",
         ),
         (
             "config.toml",
-            "line 2, column",
+            "invalid TOML at line 2, column 15",
+            "[auth.bearer_static]\nadmin_token = 18446744073709551617\n",
+            "18446744073709551617",
+        ),
+        (
+            "config.toml",
+            "invalid TOML at line 2, column 14",
             "[server]\npublic_url = https://wire-marker:unused@public.invalid/prefix\n",
+            "wire-marker",
         ),
     ] {
         for mode in ["check-config", "startup"] {
@@ -287,8 +297,12 @@ fn rejected_file_values_are_never_echoed_in_configuration_errors() {
             };
             let summary = std::fs::read_to_string(stdout).unwrap();
             let error = std::fs::read_to_string(stderr).unwrap();
-            let disclosed = summary.contains("wire-marker") || error.contains("wire-marker");
-            let named = error.contains(key) && error.contains(kind);
+            let disclosed = summary.contains(forbidden) || error.contains(forbidden);
+            let named = if key == "config.toml" {
+                error.trim() == format!("Error: {}: {kind}", config.display())
+            } else {
+                error.contains(key) && error.contains(kind)
+            };
             if disclosed || status.success() || !named {
                 wrong.push(format!(
                     "{key}/{mode}: disclosed={disclosed}, refused={}, named={named}",
