@@ -255,6 +255,23 @@ fn a_property_every_element_has_is_never_complete_without_every_name() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Where every element has a0 as a p0-successor, so does the class name C1, which has no
+/// individual view: `?x` in `:C1 :p0 ?x` answers a0, an individual. That no name stands for
+/// every element in that place says nothing of it, so the read is never `complete` without a0.
+#[test]
+fn a_property_of_a_name_with_no_individual_view_is_never_complete_without_its_values() {
+    let every_a0 = ":C1 a owl:Class . :p0 a owl:ObjectProperty . :a0 a owl:NamedIndividual . \
+        owl:Thing rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p0 ; owl:hasValue :a0 ] .";
+    let cases: Vec<Case> = vec![(
+        "has-value",
+        with(&[every_a0]),
+        "SELECT ?x { :C1 :p0 ?x }",
+        "a0",
+    )];
+    let wrong = wrong(&cases, false);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Every element is in `owl:Thing` and equal to itself, whatever the ontology: a read of either
 /// with an end answered or named answers every name, on the rules route and off it.
 #[test]
