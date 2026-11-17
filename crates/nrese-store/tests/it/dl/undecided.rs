@@ -394,12 +394,13 @@ fn a_read_after_a_load_and_before_its_rebuild_is_told_not_certified() {
     assert!(dl.store().dl().status().is_none());
 }
 
-// A write the rules refuse, on a store on their route (design note
-// `2026-11-17-v15-design-record-dl-commit-follows-the-change.md` §8, §8.1): where every
-// statement it changes keeps the kinds the route was decided on (`Kinds::keep`), the route's
-// proof says OWL 2 DL reads the data as the rules do, so the refusal is told as a full read of
-// the ontology would tell it, and where that read is refused by its budget, the proof decides:
-// inconsistent, with the rules' reason. Otherwise the refusal reads as before.
+// A write the rules refuse, on a store on their route (docs/spec/reasoning-semantics.md, the
+// routing by profile: an ontology in OWL 2 RL with no punning and no annotation-property axioms
+// is decided by the rules, theorem PR1 of OWL 2 Profiles): where every statement it changes
+// keeps the kinds the route was decided on (`Kinds::keep`), the data stays so, and OWL 2 DL
+// reads it as the rules do. The refusal is told as a full read of the ontology would tell it,
+// and where that read is refused by its budget, the route decides: inconsistent, with the
+// rules' reason. Otherwise the refusal reads as before.
 
 /// A store on the rules' route: `:A` and `:B` disjoint classes, in OWL 2 RL's profile.
 const ROUTED: &str = ":A a owl:Class ; owl:disjointWith :B . :B a owl:Class .";
