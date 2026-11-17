@@ -12,7 +12,9 @@ data must still fit one machine; partitioning across machines is a later step.
   - `GET /api/v1/replication/image` (an image of its latest revision, streamed, with its
     manifest).
 - **A replica** (`replication.mode = "replica"`) starts from the primary's image when its
-  data directory holds no store. It then follows the log: it asks for the records after its
+  data directory holds no store, so start one from an empty data directory. Over a directory
+  that holds a store (a copy of another server's, say) it takes no image and logs no warning,
+  and serves what that directory holds. It then follows the log: it asks for the records after its
   revision, applies them, and asks again at once while records come, and after
   `replication.poll` once it has caught up.
   - Each record becomes a commit with the primary's revision and term ids, in the replica's
