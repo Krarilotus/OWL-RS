@@ -243,8 +243,43 @@ const SETTINGS_FILE: &str = "repository.json";
 /// The default repository's id.
 pub const DEFAULT_REPOSITORY: &str = "nrese";
 
-/// A repository's write path, which a change of its reasoning replaces ([`Catalog::change`]).
-pub type PipelineSlot = Arc<RwLock<Arc<MutationPipeline>>>;
+/// A repository's write path. Only a change of its reasoning replaces it, here and over the
+/// same store ([`Catalog::change`]): from outside it is read, never written, so the store a
+/// server state was built over (and checked, `AppState::with_replication`) stays its store.
+///
+/// Read from outside, it compiles, as a view that hands out no lock:
+///
+/// ```no_run
+/// fn now(slot: &nrese_store::catalog::PipelineSlot) {
+///     let _now: parking_lot::MappedRwLockReadGuard<'_, _> = slot.read();
+/// }
+/// ```
+///
+/// Written from outside, it doesn't: neither through the field nor through the lock a read
+/// came from. On a stable toolchain a `compile_fail` passes on any error; their twin above,
+/// one line apart from each, is what shows the rest compiles:
+///
+/// ```compile_fail
+/// fn now(slot: &nrese_store::catalog::PipelineSlot) {
+///     let _now = slot.0.write();
+/// }
+/// ```
+///
+/// ```compile_fail
+/// fn now(slot: &nrese_store::catalog::PipelineSlot) {
+///     let _now = parking_lot::RwLockReadGuard::rwlock(&slot.read());
+/// }
+/// ```
+#[derive(Clone)]
+pub struct PipelineSlot(Arc<RwLock<Arc<MutationPipeline>>>);
+
+impl PipelineSlot {
+    /// The write path now. A mapped guard: a plain one would hand out its lock
+    /// (`RwLockReadGuard::rwlock`), and with it the write.
+    pub fn read(&self) -> parking_lot::MappedRwLockReadGuard<'_, Arc<MutationPipeline>> {
+        parking_lot::RwLockReadGuard::map(self.0.read(), |pipeline| pipeline)
+    }
+}
 
 /// One repository: its write path (and store) and its settings.
 #[derive(Clone)]
@@ -258,7 +293,7 @@ pub struct Repository {
 impl Repository {
     fn new(pipeline: MutationPipeline, settings: RepositorySettings) -> Self {
         Self {
-            pipeline: Arc::new(RwLock::new(Arc::new(pipeline))),
+            pipeline: PipelineSlot(Arc::new(RwLock::new(Arc::new(pipeline)))),
             settings: Arc::new(RwLock::new(settings)),
             lifecycle: Arc::default(),
         }
@@ -275,7 +310,7 @@ impl Repository {
 
     /// Publishes `settings`, and `pipeline` if it changes too, at once ([`Self::observe`]).
     fn publish(&self, pipeline: Option<Arc<MutationPipeline>>, settings: RepositorySettings) {
-        let mut slot = self.pipeline.write();
+        let mut slot = self.pipeline.0.write();
         let mut saved = self.settings.write();
         if let Some(pipeline) = pipeline {
             *slot = pipeline;
@@ -778,7 +813,7 @@ impl Catalog {
             // the new ones.
             previous.retire();
             let restore = || {
-                *repository.pipeline.write() = Arc::new(MutationPipeline::new(
+                *repository.pipeline.0.write() = Arc::new(MutationPipeline::new(
                     Arc::clone(&store),
                     Arc::clone(previous.reasoner()),
                 ));
