@@ -10,6 +10,8 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
+use nrese_server::auth::AuthConfig;
+use nrese_server::policy::PolicyConfig;
 use nrese_store::{StoreConfig, StoreService};
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
@@ -500,6 +502,90 @@ async fn a_write_whose_admitting_grant_ends_while_it_runs_publishes_nothing() ->
     assert_eq!(
         (answer.status, written(&app).await?),
         (StatusCode::SERVICE_UNAVAILABLE, false),
+        "refused, nothing written ({})",
+        answer.body
+    );
+    Ok(())
+}
+
+/// A token's user whose record administers is admitted to write by the access state's write
+/// grant, which ends with enforcement: its write publishes nothing then, though the user still
+/// administers and reads every graph, and a fresh write of it is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_token_users_write_admitted_by_its_record_ends_with_enforcement() -> Fallible<()> {
+    let endpoint = HeldEndpoint::bind().await?;
+    let app = app(&endpoint, ReasoningMode::Disabled)?;
+    let bob = json!({ "admin": true, "reason": "test" });
+    change(&app, &("/api/v1/access/users/bob", bob)).await?;
+    let off = (
+        "/api/v1/access/settings",
+        json!({ "enforced": false, "reason": "test" }),
+    );
+    let (who, update) = (Who::User("bob"), held_insert(&endpoint, false));
+    let answer = raced(
+        &app,
+        &endpoint,
+        who,
+        Entry::SparqlUpdate,
+        update.clone(),
+        off,
+    )
+    .await?;
+    let again = write(app.clone(), who, Entry::SparqlUpdate, update).await?;
+    assert_eq!(
+        (answer.status, written(&app).await?, again.status),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            false,
+            StatusCode::FORBIDDEN
+        ),
+        "refused, nothing written ({})",
+        answer.body
+    );
+    Ok(())
+}
+
+/// Without authentication a local login is still the access state's to admit: an administrator
+/// demoted while its write runs (enforcement off: every graph, before and after) publishes
+/// nothing, and a fresh write of that login is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_local_login_demoted_while_its_write_runs_publishes_nothing_without_authentication()
+-> Fallible<()> {
+    let endpoint = HeldEndpoint::bind().await?;
+    let store = StoreService::new(StoreConfig::in_memory())?;
+    store.set_service_client(endpoint.client()?);
+    let policy = PolicyConfig {
+        auth: AuthConfig::None,
+        ..policy_of(POLICY)?
+    };
+    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Disabled);
+    let app = test_app_with_store(store, policy, reasoner)?;
+    let off = json!({ "enforced": false, "reason": "test" });
+    change(&app, &("/api/v1/access/settings", off)).await?;
+    let alice = json!({ "admin": true, "password": PASSWORD, "reason": "test" });
+    change(&app, &("/api/v1/access/users/alice", alice)).await?;
+    let demoted = (
+        "/api/v1/access/users/alice",
+        json!({ "admin": false, "reason": "test" }),
+    );
+    let (who, update) = (Who::Login("alice", PASSWORD), held_insert(&endpoint, false));
+    let answer = raced(
+        &app,
+        &endpoint,
+        who,
+        Entry::SparqlUpdate,
+        update.clone(),
+        demoted,
+    )
+    .await?;
+    let again = write(app.clone(), who, Entry::SparqlUpdate, update).await?;
+    assert_eq!(
+        (answer.status, written(&app).await?, again.status),
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            false,
+            StatusCode::FORBIDDEN
+        ),
         "refused, nothing written ({})",
         answer.body
     );
