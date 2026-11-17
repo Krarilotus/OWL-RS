@@ -46,6 +46,10 @@ pub struct StoreService {
     /// The reasoning state recorded this process (also for in-memory stores, which have no
     /// file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
+    /// Set by a commit on a store in quarantine, which keeps no assessment of its consistency,
+    /// until a rematerialisation records one ([`Self::is_quarantined`]). In memory only: that
+    /// commit removes the marker first, so a reopen rebuilds.
+    pub(crate) unassessed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Shared by the store's clones: a clone with its own record would never see a commit's mark.
     pub(crate) lists: std::sync::Arc<crate::reasoning::ListsKept>,
     /// The certificate's epoch, a sequence lock over its changes ([`Self::certificate_epoch`]):
@@ -336,6 +340,7 @@ impl StoreService {
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             unavailable,
             materialised: std::sync::Arc::default(),
+            unassessed: std::sync::Arc::default(),
             lists: Default::default(),
             certificate_epoch: std::sync::Arc::default(),
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
@@ -590,6 +595,18 @@ impl StoreService {
             .map_or(crate::ConsistencyStatus::Unknown, |state| {
                 state.consistency()
             })
+    }
+
+    /// Whether the store is in quarantine, readable and repairable but not ready: its data
+    /// inconsistent, or its rules' violations undecided, under the recorded reasoning; or,
+    /// since a commit on a store in quarantine, its consistency not assessed again.
+    pub fn is_quarantined(&self) -> bool {
+        self.unassessed.load(std::sync::atomic::Ordering::Acquire)
+            || matches!(
+                self.consistency(),
+                crate::ConsistencyStatus::Inconsistent { .. }
+                    | crate::ConsistencyStatus::Undecided { .. }
+            )
     }
 
     /// Whether the certificate covers `program` for a holder of the writer slot: no write can
@@ -2436,6 +2453,8 @@ impl StoreService {
         // From here the new inferences are published: a failure says so.
         self.record_reasoning(finished.writer(), state)
             .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
+        self.unassessed
+            .store(false, std::sync::atomic::Ordering::Release);
         drop(finished);
         if let Some(why) = undecided {
             let text = why.text(violations);

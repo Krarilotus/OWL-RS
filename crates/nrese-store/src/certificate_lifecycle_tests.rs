@@ -633,6 +633,9 @@ fn an_entailment_check_reads_one_snapshot_while_a_clear_publishes() {
 ///   commit kept the closure, so the stack it computes is the one stored, and nothing is written;
 /// - opened from a copy of the directory taken before the revalidation: the marker's old
 ///   inconsistency isn't claimed of the repaired data.
+///
+/// In the first two the store is in quarantine (`is_quarantined`, which readiness reads): a
+/// consistency not established is no reason to call it ready.
 #[test]
 fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
     use std::cell::Cell;
@@ -681,8 +684,9 @@ fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
         let entailed = told(reader.entails(Ruleset::Owl2Rl, &rex_an_animal()));
         let copied = copy_dir(&from, &to);
         let committed = reader.current_revision();
+        let quarantined = reader.is_quarantined();
         UNREAD.set((true, false));
-        *kept.lock().unwrap() = Some((consistency, entailed, copied, committed));
+        *kept.lock().unwrap() = Some((consistency, entailed, copied, committed, quarantined));
     })));
     let repaired = rl.apply(
         MutationCommand::Update(SparqlUpdateRequest::new(format!(
@@ -698,6 +702,7 @@ fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
     let after = (
         format!("{:?}", store.consistency()),
         told(store.entails(Ruleset::Owl2Rl, &rex_an_animal())),
+        store.is_quarantined(),
     );
     // The stop was the switch's: the revalidation read the memory while it couldn't, the same
     // call under the switch stops as a memory stop, and nothing was published meanwhile.
@@ -706,9 +711,13 @@ fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
     UNREAD.set((false, false));
     let not_inconsistent = |h: &str| !h.starts_with("Inconsistent");
     let refused = |h: &str| h.starts_with("refused");
+    let readiness = |quarantined: bool| match quarantined {
+        true => "quarantined",
+        false => "ready",
+    };
     let seen = seen.lock().unwrap().take();
     match (repaired, seen) {
-        (Ok(_), Some((consistency, entailed, copied, committed))) => {
+        (Ok(_), Some((consistency, entailed, copied, committed, quarantined))) => {
             cells.check(
                 "a repair commit before its revalidation | consistency()",
                 &consistency,
@@ -720,6 +729,12 @@ fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
                 &entailed,
                 refused,
                 "a refusal",
+            );
+            cells.check(
+                "a repair commit before its revalidation | readiness",
+                readiness(quarantined),
+                |h| h == "quarantined",
+                "quarantined",
             );
             let stopped = tried
                 && matches!(again, Err(crate::StoreError::MemoryUnreadable { .. }))
@@ -745,6 +760,12 @@ fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
                     &after.1,
                     refused,
                     "a refusal",
+                );
+                cells.check(
+                    "a repair commit after a stopped revalidation | readiness",
+                    readiness(after.2),
+                    |h| h == "quarantined",
+                    "quarantined",
                 );
             }
             match copied {
