@@ -217,12 +217,55 @@ fn a_conclusion_of_shacl_statements_is_answered_as_one_of_annotations() {
 }
 
 /// Spec (OWL 2 Direct Semantics: an ontology entails a conclusion only if it entails each of
-/// its axioms): SHACL content in a conclusion takes nothing from the rest of it: with `:s a
-/// :C` not entailed, the conclusion isn't.
+/// its axioms): SHACL content in a conclusion adds no axiom to the rest of it: with `:a a :C`
+/// entailed, a conclusion of it and of `:s sh:path :q` is entailed. Read as a property
+/// assertion, `:s sh:path :q` wouldn't be.
 #[test]
 fn a_conclusion_mixing_shacl_content_with_an_axiom_is_decided_by_the_axiom() {
-    let conclusion = ":s <http://www.w3.org/ns/shacl#path> :q . :s a :C .";
-    assert_eq!(entailed(":a a :C .", conclusion), Entailed::No);
+    let conclusion = ":s <http://www.w3.org/ns/shacl#path> :q . :a a :C .";
+    assert_eq!(entailed(":a a :C .", conclusion), Entailed::Yes);
+}
+
+/// Spec (OWL 2 Direct Semantics: a premise entails a conclusion only if each of the
+/// conclusion's axioms holds in every model of it; SHACL content has no OWL meaning only where
+/// nothing gives its property one): a conclusion reads SHACL content as its premise does. Where
+/// the premise gives `sh:path` an OWL meaning (a declaration; a use as an individual; or its
+/// SHACL content read as any other, by an OWL axiom on `sh:class`, the content's other
+/// property), the conclusion `:s sh:path :q` is a property assertion the premise doesn't
+/// entail; where the premise reads `sh:path` as SHACL content too, the conclusion is entailed.
+#[test]
+fn a_conclusion_reads_shacl_content_as_its_premise_does() {
+    let (path, class) = (
+        "<http://www.w3.org/ns/shacl#path>",
+        "<http://www.w3.org/ns/shacl#class>",
+    );
+    let rows = [
+        (
+            "declaration",
+            format!("{path} a owl:ObjectProperty ."),
+            Entailed::No,
+        ),
+        (
+            "individual",
+            format!(":p a owl:ObjectProperty . :x :p {path} ."),
+            Entailed::No,
+        ),
+        (
+            "read as any other",
+            format!(":a {path} :b ; {class} :C . {class} a owl:ObjectProperty ."),
+            Entailed::No,
+        ),
+        ("SHACL content", format!(":a {path} :b ."), Entailed::Yes),
+    ];
+    let mut wrong = Vec::new();
+    for (what, premise, want) in rows {
+        let answer = entailed(&premise, &format!(":s {path} :q ."));
+        eprintln!("{what}: {answer:?}");
+        if answer != want {
+            wrong.push(format!("{what}: {answer:?}, not {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// Spec (OWL 2 Direct Semantics: SHACL content, like an annotation, has no meaning, so an
@@ -283,4 +326,83 @@ fn shacl_content_without_an_equality_keeps_its_status() {
     assert!(constant.is_complete(), "{line}");
     assert_ne!(variable.shared.as_str(), "unsound", "{line}");
     assert_eq!(route, "rules", "{line}");
+}
+
+/// The reads [`later_is_fresh`] compares: through `sh:path`, of `owl:Thing`, through any
+/// predicate.
+const READS: [&str; 3] = [
+    "SELECT ?x { ?x sh:path ?o }",
+    "SELECT ?x { ?x a owl:Thing }",
+    "SELECT ?x { ?x ?p :q }",
+];
+
+/// A store given `first`, then `then`, in two commits, against a store given both in one,
+/// each after `ontology`: the route before the later commit, and what differs: the route
+/// after it and, for each of [`READS`], the answers and their status (the reasons printed).
+fn later_is_fresh(ontology: &str, first: &str, then: &str) -> (&'static str, Vec<String>) {
+    let (later, fresh) = (pipeline(), pipeline());
+    insert(&later, ontology).expect("the ontology");
+    shapes_insert(&later, first).expect("the first commit");
+    let before = later.store().dl_bounds().last;
+    shapes_insert(&later, then).expect("the later commit");
+    insert(&fresh, ontology).expect("the ontology");
+    shapes_insert(&fresh, &format!("{first} {then}")).expect("one commit");
+    let routes = [
+        later.store().dl_bounds().last,
+        fresh.store().dl_bounds().last,
+    ];
+    eprintln!("route {before}, then {routes:?} (later, fresh)");
+    let mut wrong = Vec::new();
+    // On the rules' route or off it: off it, a bound changed and one rebuilt are one route.
+    if (routes[0] == "rules") != (routes[1] == "rules") {
+        wrong.push(format!("routes {routes:?}"));
+    }
+    for read in READS {
+        let [a, b] = [&later, &fresh].map(|dl| query(dl, &format!("{SH}{read}")));
+        let told = |(rows, status): &(Vec<String>, super::Status)| {
+            format!("{rows:?}, {}", status.shared.as_str())
+        };
+        eprintln!(
+            "{read}: later {}; fresh {} ({:?}; {:?})",
+            told(&a),
+            told(&b),
+            a.1.reasons(),
+            b.1.reasons()
+        );
+        if told(&a) != told(&b) {
+            wrong.push(format!("{read}: later {}; fresh {}", told(&a), told(&b)));
+        }
+    }
+    (before, wrong)
+}
+
+/// Spec (OWL 2 Structural Specification: a term an axiom uses has that axiom's kind; OWL 2
+/// Profiles §4.3, theorem PR1): on the rules' route, SHACL content `:s sh:path :q` and then a
+/// declaration of `sh:path` as an object property: `:s sh:path :q` is then a property
+/// assertion, with no name punned, as in a store given both at once: the same route, and each
+/// read the same answers with the same status.
+#[test]
+fn a_later_declaration_of_a_shacl_property_reads_as_one_commit_of_both() {
+    let (before, wrong) = later_is_fresh(
+        ONTOLOGY,
+        ":s sh:path :q .",
+        "sh:path a owl:ObjectProperty .",
+    );
+    assert_eq!(before, "rules", "SHACL content beside an RL ontology");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (OWL 2 Structural Specification §5.9: a SHACL term used as an individual is one, and
+/// its SHACL content is then read as any other; the upper bound holds every entailed
+/// assertion): off the rules' route, with SHACL content `:s sh:path :q`, a later `:x :p
+/// sh:path` through a known object property makes `:s sh:path :q` a property assertion, whose
+/// ends are individuals, as in a store given both at once: the same route, and each read the
+/// same answers with the same status.
+#[test]
+fn a_later_use_of_a_shacl_property_as_an_individual_reads_as_one_commit_of_both() {
+    let outside = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet . \
+         :p a owl:ObjectProperty . :a :p :b .";
+    let (before, wrong) = later_is_fresh(outside, ":s sh:path :q .", ":x :p sh:path .");
+    assert_ne!(before, "rules", "off the rules' route");
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
