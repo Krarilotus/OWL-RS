@@ -183,6 +183,8 @@ Startup skips rematerialisation only if the ruleset and the fingerprint match. A
 
 A rule with more than 256 atoms in its premises, or in its conclusion, is a parse error: the rule format numbers them by a byte.
 
+A program that holds rules saying what OWL 2 RL's five equality rules over `owl:sameAs` say (`eq-sym`, `eq-trans`, `eq-rep-s`, `eq-rep-p`, `eq-rep-o`), up to the names of their variables and the order of their premises, is reasoned with by the equality module, as under `owl2-rl` and with the same answers, whatever the rules are named. A rule is known by what it says, not by its name: one named like an equality rule that says something else is an ordinary rule, and so is one equality rule without the other four.
+
 Under `owl2-dl`, see "User rules with `owl2-dl`" above. The rules' name in the materialisation state and on `/version` is `custom:<file>` (`owl2-rl+custom:<file>` when added to a ruleset). Its fingerprint covers the file's text, so a changed file rebuilds the closure.
 
 Not supported, with a startup error naming the rule: other builtins (`math:`, `string:`, `list:`, `time:`, and the rest of `log:`), blank nodes in conclusions (existentials), formulas as terms and rules inside formulas. W3C N3 Community Group reasoner tests: all 13 within this scope pass (`crates/nrese-reasoner/tests/w3c_n3_reasoner`). Of the other 76, 49 use cwm options other than "rules to a fixpoint, then the data", 13 need builtins, and the rest need formulas or generalised triples.
