@@ -69,7 +69,8 @@ fn route(store: &StoreService) -> (&'static str, bool) {
     (last, super::afresh(store, &snapshot).1.is_some())
 }
 
-/// Spec (design record §7.2, G2; the D16-855 brief, s5): on an OWL 2 RL ontology, a first
+/// Spec (the route's kept kinds, `Kinds::keep`: a commit that gives no term a new kind keeps
+/// the route without reading the ontology again): on an OWL 2 RL ontology, a first
 /// shape write reads the ontology again and keeps the route; a second write of the same SHACL
 /// vocabulary, a shape without lists, keeps it without a read; so does a deletion of one of
 /// its statements; an OWL axiom on a SHACL term (`sh:path` declared an object property) reads
@@ -118,8 +119,9 @@ fn shape_writes_keep_the_route_and_an_axiom_on_a_shacl_term_leaves_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Spec (§7.1, F1; §7.2, G2: no blanket exemption of the namespace): with shapes on the
-/// route, a later commit that makes `sh:path` an individual (`sh:path owl:sameAs :alias`)
+/// Spec (OWL 2 Structural Specification §5.9, punning: a SHACL term used as an individual is
+/// punned; the kept kinds take SHACL terms as names, with no exemption of the namespace): with
+/// shapes on the route, a later commit that makes `sh:path` an individual (`sh:path owl:sameAs :alias`)
 /// reads the ontology again and leaves the route, as a fresh read of the revision does.
 #[test]
 fn a_later_equality_on_a_shacl_predicate_reads_again_and_leaves_the_route() {

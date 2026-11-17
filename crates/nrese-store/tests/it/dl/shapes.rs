@@ -37,11 +37,12 @@ fn shapes_insert(
     super::update(dl, &format!("{SH}INSERT DATA {{ {data} }}"))
 }
 
-/// Spec (design record §7, S2; review round 2, §7.2): explicit-target shapes (`sh:NodeShape`,
-/// `sh:targetClass`, `sh:property`, `sh:path`, `sh:class`) beside an OWL 2 RL ontology give
-/// no name an OWL kind, so the store stays on the rules' route, and a read of the ontology
-/// is answered as without them. Today `sh:targetClass :Person` and `sh:path :knows` are read
-/// as object property assertions, which pun `:Person` and `:knows`, and take it off.
+/// Spec (OWL 2 Profiles §4.3, theorem PR1; SHACL content, like an annotation, carries no OWL
+/// meaning): explicit-target shapes (`sh:NodeShape`, `sh:targetClass`, `sh:property`,
+/// `sh:path`, `sh:class`) beside an OWL 2 RL ontology give no name an OWL kind, so nothing is
+/// punned, the store stays on the rules' route, and a read of the ontology is answered as
+/// without them. Read as property assertions, `sh:targetClass :Person` and `sh:path :knows`
+/// would pun `:Person` and `:knows` and take it off.
 #[test]
 fn explicit_target_shapes_beside_an_rl_ontology_stay_on_the_rules_route() {
     let dl = pipeline();
@@ -59,10 +60,10 @@ fn explicit_target_shapes_beside_an_rl_ontology_stay_on_the_rules_route() {
     assert_eq!(route, "rules", "shapes took the store off the rules' route");
 }
 
-/// Spec (§7.1, C1, and S2b): an implicit class target, a class that is also a node shape
-/// (`:Person a sh:NodeShape, owl:Class`), is a type triple of SHACL's namespace: SHACL
-/// content, so `:Person` is no individual by it and the store stays on the rules' route.
-/// Today the type triple is a class assertion, which puns `:Person`.
+/// Spec (as above, for a type triple: SHACL's classes carry no OWL meaning either): an
+/// implicit class target, a class that is also a node shape (`:Person a sh:NodeShape,
+/// owl:Class`), is SHACL content, so `:Person` is no individual by it and the store stays on
+/// the rules' route. Read as a class assertion, the type triple would pun `:Person`.
 #[test]
 fn an_implicit_class_target_stays_on_the_rules_route() {
     let dl = pipeline();
@@ -80,8 +81,9 @@ fn an_implicit_class_target_stays_on_the_rules_route() {
     assert_eq!(route, "rules", "an implicit class target left the route");
 }
 
-/// Spec (§7, S2; §7.1, F1 and C3; the D16-855 brief, s4): a SHACL term given an OWL meaning
-/// keeps today's reading, so the store is off the rules' route as today. Each row adds one to
+/// Spec (OWL 2 Structural Specification: a term an axiom uses has that axiom's kind): a SHACL
+/// term given an OWL meaning is read as any other term, so its shapes' statements are property
+/// and class assertions that pun, and the store is off the rules' route. Each row adds one to
 /// the explicit-target shapes: a declaration of `sh:path` as an object property; a
 /// sub-property axiom on `sh:class`; a subclass of `sh:NodeShape`. (An equality on `sh:path`
 /// and the W3C vocabulary's content have tests of their own, below.)
@@ -106,8 +108,9 @@ fn a_shacl_term_given_an_owl_meaning_is_read_as_today_off_the_route() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Spec (§7.1, F1; OWL 2 Direct Semantics, punning: an equality of the individual `sh:path`
-/// with `:p` doesn't equate the properties): with `sh:path owl:sameAs :p`, the rules' eq-rep-p
+/// Spec (OWL 2 Structural Specification §5.9, punning; OWL 2 RL's eq-rep-p; under the OWL 2
+/// Direct Semantics an equality of the individual `sh:path` with `:p` doesn't equate the
+/// properties): with `sh:path owl:sameAs :p`, the rules' eq-rep-p
 /// derives `:knowsShape :p :knows` from `:knowsShape sh:path :knows`, which OWL 2 DL doesn't
 /// entail. A read of it may return that row only labelled `unsound`, as for any punned
 /// equality (`routing.rs`, `an_equality_of_punned_property_names_does_not_equate_their_properties`).
@@ -138,10 +141,11 @@ fn an_equality_on_a_shacl_predicate_gives_no_row_told_sound() {
     assert_ne!(route, "rules", "{line}");
 }
 
-/// Spec (§7.1, C3): the W3C vocabulary's own content (`shacl.ttl`: `sh:` properties typed
-/// `rdf:Property`, with domains and ranges, `rdfs:Class` among them) gives SHACL terms an OWL
-/// reading, so the store is read as today: off the rules' route, and told that parts of the
-/// data aren't OWL 2 DL and were left out (`dl::consistency`, `left_out_by`), today's wording.
+/// Spec (the W3C SHACL vocabulary, `shacl.ttl`, declares `sh:` properties `rdf:Property`, with
+/// domains and ranges, `rdfs:Class` among them): that content gives SHACL terms an OWL
+/// reading, so the store is read as any other: off the rules' route, and told that parts of
+/// the data aren't OWL 2 DL and were left out (`dl::consistency`, `left_out_by`), as for any
+/// reserved name used as an entity.
 #[test]
 fn the_shacl_vocabulary_loaded_is_read_as_today() {
     let dl = pipeline();
@@ -168,11 +172,12 @@ fn the_shacl_vocabulary_loaded_is_read_as_today() {
     assert_ne!(route, "rules");
 }
 
-/// Spec (§7.1, C2): the lists of SHACL (a sequence path, `sh:in`, `sh:or`) are structure no
-/// axiom uses, and an inverse path is SHACL content, so none of them makes a name an
-/// individual: the store stays on the rules' route. Today `sh:inversePath :knows` and
-/// `sh:class :Person` inside `sh:or` are object property assertions that pun `:knows` and
-/// `:Person`.
+/// Spec (OWL 2 Mapping to RDF Graphs: list triples no axiom reads are structure, not
+/// assertions; SHACL content carries no OWL meaning): the lists of SHACL (a sequence path,
+/// `sh:in`, `sh:or`) are structure no axiom uses, and an inverse path is SHACL content, so
+/// none of them makes a name an individual: the store stays on the rules' route. Read as
+/// property assertions, `sh:inversePath :knows` and `sh:class :Person` inside `sh:or` would
+/// pun `:knows` and `:Person`.
 #[test]
 fn shacl_paths_and_lists_make_no_pun() {
     let rows = [
@@ -200,9 +205,9 @@ fn shacl_paths_and_lists_make_no_pun() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Spec (the D16-051 lead, 17 Nov; OWL 2 Direct Semantics: SHACL content, like an annotation,
-/// carries no OWL meaning): a conclusion of SHACL statements only is answered as one of
-/// annotations, with a premise that entails neither.
+/// Spec (OWL 2 Direct Semantics: annotations carry no meaning, and SHACL content none
+/// either): a conclusion of SHACL statements only is answered as one of annotations, with a
+/// premise that entails neither.
 #[test]
 fn a_conclusion_of_shacl_statements_is_answered_as_one_of_annotations() {
     let premise = ":a a :C .";
@@ -211,21 +216,21 @@ fn a_conclusion_of_shacl_statements_is_answered_as_one_of_annotations() {
     assert_eq!(shacl, annotation, "annotation {annotation:?}");
 }
 
-/// Spec (the D16-051 lead, 17 Nov): SHACL content in a conclusion takes nothing from the rest
-/// of it: with `:s a :C` not entailed, the conclusion isn't.
+/// Spec (OWL 2 Direct Semantics: an ontology entails a conclusion only if it entails each of
+/// its axioms): SHACL content in a conclusion takes nothing from the rest of it: with `:s a
+/// :C` not entailed, the conclusion isn't.
 #[test]
 fn a_conclusion_mixing_shacl_content_with_an_axiom_is_decided_by_the_axiom() {
     let conclusion = ":s <http://www.w3.org/ns/shacl#path> :q . :s a :C .";
     assert_eq!(entailed(":a a :C .", conclusion), Entailed::No);
 }
 
-/// Spec (§7.2, G1, and the master's ruling of 19:30: one status rule for every read that may
-/// match content without OWL meaning): on the rules' route, `:s owl:sameAs :t` lets eq-rep-s
-/// copy `:s sh:path :q` to `:t`, which OWL 2 DL doesn't entail once SHACL content carries no
-/// OWL meaning. A read of `?x sh:path ?o` that returns `:t` may not be told `complete` or
-/// `sound-only`.
+/// Spec (OWL 2 Direct Semantics: SHACL content, like an annotation, has no meaning, so an
+/// equality entails no copy of it): on the rules' route, `:s owl:sameAs :t` lets eq-rep-s copy
+/// `:s sh:path :q` to `:t`, which OWL 2 DL doesn't entail. A read of `?x sh:path ?o` that
+/// returns `:t` may not be told `complete` or `sound-only`.
 #[test]
-#[ignore = "waits on D16-861: the status rule for reads that may match content without OWL meaning"]
+#[ignore = "until the status rule counts SHACL content among content without OWL meaning"]
 fn a_copied_shacl_row_is_not_told_sound() {
     let dl = pipeline();
     insert(&dl, ONTOLOGY).expect("an RL ontology");
