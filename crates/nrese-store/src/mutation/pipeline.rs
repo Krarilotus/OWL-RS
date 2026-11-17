@@ -471,11 +471,13 @@ impl MutationPipeline {
             #[cfg(test)]
             crate::service::hooks::run(&crate::service::hooks::AFTER_COMMIT);
             if let Some((gate, bounds, left_out)) = dl {
-                // On the RL route in quarantine nothing decided the revision's consistency: no
-                // verdict is recorded for it, and its reads check it (`dl::query::consistency_at`).
+                // On the RL route unproved (in quarantine) nothing decided the revision's
+                // consistency: no verdict is recorded for it, and its reads check it
+                // (`dl::query::consistency_at`).
                 let rules = matches!(bounds.prepared, crate::dl::bounds::Prepared::Rules(_));
+                let unproved = rules && !bounds.proves_consistency;
                 crate::dl::bounds::install(&self.store, bounds, summary.revision);
-                if !(quarantined && rules) {
+                if !unproved {
                     self.store.dl().record(crate::dl::DlStatus {
                         revision: summary.revision,
                         consistency: gate.checked,
