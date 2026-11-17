@@ -18,7 +18,7 @@ const OUTSIDE_RL: &str = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :
 
 /// The fingerprint of `owl2-rl`'s program, as its stores record it. Another value rebuilds
 /// every `owl2-rl` store's closure at its next start.
-const OWL2_RL_FINGERPRINT: &str = "e4d77523ded2917d";
+const OWL2_RL_FINGERPRINT: &str = "a9e8b8a1df61639c";
 
 /// An object key over `z`, `:a` and `:b` sharing it as value, and `more`.
 fn object_key(z: &str, more: &str) -> String {

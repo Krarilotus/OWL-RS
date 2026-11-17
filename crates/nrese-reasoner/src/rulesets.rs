@@ -78,7 +78,12 @@ pub const ALL: [Ruleset; 6] = [
 /// 4 (7 Nov 2026): the datatype checks (dt-not-type, dt-diff) read literals as OWL 2's
 /// datatype map does (`engine::datatypes`): an ill-typed literal under a range, and values
 /// version 3 didn't judge, can now be inconsistencies, so a version 3 verdict is rechecked.
-pub const SEMANTICS_VERSION: u32 = 4;
+///
+/// 5 (17 Nov 2026): under `reasoner.equality = "compact"` the datatype checks read every
+/// literal of an `owl:sameAs` class, not only the representative's statements: two
+/// different values in one class, or an ill-typed member under a range, are now
+/// inconsistencies there too, so a version 4 closure and verdict are rebuilt once.
+pub const SEMANTICS_VERSION: u32 = 5;
 
 /// A part of the evaluation semantics only some user rulesets use ([`SEMANTICS_VERSION`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
