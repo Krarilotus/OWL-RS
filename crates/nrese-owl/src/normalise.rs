@@ -1518,8 +1518,8 @@ impl<'a> Normaliser<'a> {
             end: 1,
             edges: vec![(0, Some(r), 1, Vec::new())],
         };
-        // A path for the role inclusion `axiom`: each of its edges needs that axiom.
-        let path = |nfa: &mut Nfa, from: u32, labels: &[ObjProp], to: u32, axiom: usize| {
+        // A path for a role inclusion: each of its edges needs `axioms`.
+        let path = |nfa: &mut Nfa, from: u32, labels: &[ObjProp], to: u32, axioms: &[usize]| {
             let mut at = from;
             for (i, &label) in labels.iter().enumerate() {
                 let next = if i + 1 == labels.len() {
@@ -1528,11 +1528,11 @@ impl<'a> Normaliser<'a> {
                     nfa.states += 1;
                     nfa.states - 1
                 };
-                nfa.edges.push((at, Some(label), next, vec![axiom]));
+                nfa.edges.push((at, Some(label), next, axioms.to_vec()));
                 at = next;
             }
             if labels.is_empty() {
-                nfa.edges.push((from, None, to, vec![axiom]));
+                nfa.edges.push((from, None, to, axioms.to_vec()));
             }
         };
         for (chain, sup, axiom) in &self.rias {
@@ -1540,34 +1540,39 @@ impl<'a> Normaliser<'a> {
             // `Inv(w) ⊑ sup⁻` (the role language of Kazakov, KR 2008; Horrocks, Kutz and
             // Sattler, KR 2006, Proposition 10): it enters as `w` where `sup` is one of the
             // class, as `Inv(w)` where `sup⁻` is, and as both where both are (`role`
-            // symmetric, or its own inverse).
-            let word: Option<Vec<ObjProp>> = class
-                .contains(&ObjProp::Named(*sup))
-                .then(|| chain.iter().map(|&x| canonical(x)).collect());
-            let inverse: Option<Vec<ObjProp>> = class
-                .contains(&ObjProp::Inverse(*sup))
-                .then(|| {
-                    chain
-                        .iter()
-                        .rev()
-                        .map(|&x| canonical(x.inverse()))
-                        .collect()
+            // symmetric, or its own inverse). Each needs the inclusion and those that make
+            // its superrole `role` (the member's own); equal words with other inclusions
+            // are two proofs, both kept.
+            let needed = |sup: ObjProp| {
+                members.iter().find(|(m, _)| *m == sup).map(|(_, via)| {
+                    let mut needed = via.clone();
+                    needed.push(*axiom);
+                    needed.sort_unstable();
+                    needed.dedup();
+                    needed
+                })
+            };
+            let word: Option<(Vec<ObjProp>, Vec<usize>)> = needed(ObjProp::Named(*sup))
+                .map(|needed| (chain.iter().map(|&x| canonical(x)).collect(), needed));
+            let inverse: Option<(Vec<ObjProp>, Vec<usize>)> = needed(ObjProp::Inverse(*sup))
+                .map(|needed| {
+                    let w = chain.iter().rev().map(|&x| canonical(x.inverse()));
+                    (w.collect(), needed)
                 })
                 .filter(|w| word.as_ref() != Some(w));
-            let axiom = *axiom;
-            for chain in word.into_iter().chain(inverse) {
+            for (chain, needed) in word.into_iter().chain(inverse) {
                 if chain[..] == [r] {
                     // Within the class: its members' edges are `role`'s (below).
                     continue;
                 }
                 if chain[..] == [r, r] {
-                    nfa.edges.push((1, None, 0, vec![axiom]));
+                    nfa.edges.push((1, None, 0, needed));
                 } else if chain.len() > 1 && chain[0] == r {
-                    path(&mut nfa, 1, &chain[1..], 1, axiom);
+                    path(&mut nfa, 1, &chain[1..], 1, &needed);
                 } else if chain.len() > 1 && chain[chain.len() - 1] == r {
-                    path(&mut nfa, 0, &chain[..chain.len() - 1], 0, axiom);
+                    path(&mut nfa, 0, &chain[..chain.len() - 1], 0, &needed);
                 } else {
-                    path(&mut nfa, 0, &chain, 1, axiom);
+                    path(&mut nfa, 0, &chain, 1, &needed);
                 }
             }
         }
