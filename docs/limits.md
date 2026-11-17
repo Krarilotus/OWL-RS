@@ -102,7 +102,12 @@ leave something out.
   Under `owl2-dl`, budgets and undecided candidates give `sound-only` (raise the `dl.*`
   budgets, or ask `dl-answers=exact` to get an error instead); candidates are decided only
   in a query that is one basic graph pattern with filters, so under a `UNION`, for one, they
-  stay undecided. An operator that isn't
+  stay undecided. Where the class or property a read asks about may hold of every element
+  (`owl:Thing` a subclass of it, a reflexive property), every name of the ontology may be an
+  answer, a class's or property's name too, and the store returns only its individuals: such
+  a read is `sound-only`, its reason naming the class or property. A query with two answer
+  variables or more, or a path, is `sound-only` there without the check that could keep it
+  `complete`. An operator that isn't
   monotone over answers that may be missing gives `unsound`
   ([what an answer promises](what-it-covers.md#what-an-answer-promises)). Under `owl2-dl`
   and `owl2-ql`, and under `owl2-rl` with the rewriting on, a read of the RDF, RDFS or OWL
@@ -170,6 +175,15 @@ leave something out.
   out may be told `sound-only` until it is committed
   ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
   Remove such statements, or use `owl2-rl`, whose promise is the rules' reading.
+- Under `owl2-dl`, `owl:Thing`, `owl:Nothing` and the four top and bottom properties where an
+  individual goes (`:a :p owl:Thing`) aren't noticed. OWL 2 DL allows no reserved name as an
+  individual, and any other one stated so is a part the reader leaves out, as above; these six
+  are not, so a read that returns one (with `:p rdfs:range :C`, `SELECT ?x { ?x a :C }`
+  returns `owl:Thing`) can be told `complete`. Don't state them as individuals.
+- Under `owl2-dl`, a variable the query doesn't return is read existentially: it may stand
+  for an element that has no name. The SPARQL entailment regime binds every variable of the
+  pattern to a name of the ontology, so the store may return a row the regime doesn't
+  ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
 - An undeclared property used with literal values is read as a data property. Declare
   annotation properties other than the built-in ones, such as `skos:prefLabel`
   (`skos:prefLabel a owl:AnnotationProperty`);
@@ -205,6 +219,10 @@ leave something out.
   the load with `GET /dataset/shacl`.
 - Under `owl2-dl`, a large `owl:sameAs` class is proven member by member, which can be slow. At a budget the answer
   is `sound-only` and partial. Proofs per class are planned for v1.6. Raise `dl.timeout` and the `dl.*` budgets.
+- Under `owl2-dl`, a read whose candidates the exact services must each refute (all members of
+  `:H` where `owl:Thing` is a subclass of `:H` or `:K`, say) grows steeply with the store:
+  measured on one machine, about 18 ms at 100 members, 0.3 s at 300 and 10 s at 1,000. The
+  query's timeout bounds it.
 
 ## SHACL
 
