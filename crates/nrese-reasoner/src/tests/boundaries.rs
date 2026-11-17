@@ -83,6 +83,7 @@ fn job_construction_ends_at_its_stop() {
         rules: &rules,
         lists: None,
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let mut asserted = input.clone();
     asserted.sort_unstable();
@@ -118,6 +119,7 @@ fn a_deletion_s_dependency_keys_end_at_its_stop() {
         rules: &rules,
         lists: None,
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let (axioms, members) = subclasses(n);
     let axioms = load(&mut vocabulary, &axioms.join("\n"));
@@ -212,6 +214,7 @@ fn two_ways(n: usize) -> TwoWays {
         rules: &rules,
         lists: None,
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let ground = crate::delta::program(&MemoryBase::new(&asserted, &derived), compiled);
     let mut closure: Vec<Triple> = asserted.iter().chain(&derived).copied().collect();

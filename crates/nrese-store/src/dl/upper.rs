@@ -674,6 +674,9 @@ pub struct Upper {
     pub program: bounds::Program,
     rules: Vec<ir::Rule>,
     schema: Schema,
+    /// The `owl:sameAs` id `rules` hold the equality rules over, if they do, asked once with
+    /// them ([`nrese_reasoner::delta::Rules::equality`]).
+    equality: Option<u64>,
     /// The program's facts.
     facts: HashSet<Triple>,
     pub stack: Stack,
@@ -797,7 +800,7 @@ impl Upper {
             resolve,
             missing: false,
         };
-        let program = bounds::compile(ontology, normalised, &mut |iri| {
+        let mut program = bounds::compile(ontology, normalised, &mut |iri| {
             ir::Vocabulary::iri(&mut vocabulary, iri)
         });
         let schema = Schema::owl(&mut vocabulary);
@@ -822,7 +825,17 @@ impl Upper {
                 }
             }
         }
-        let rules = reasoner_rules(&program, &values);
+        let mut rules = reasoner_rules(&program, &values);
+        // A rule longer than the reasoner numbers (`ir::Rule::fits`: a key of more than 127
+        // properties) can't be evaluated: it is left out, and U1 doesn't cover its axioms.
+        for (rule, ours) in program.rules.iter().zip(&rules) {
+            if !ours.fits() {
+                let axiom = rule.provenance.sources.iter().flatten().next().copied();
+                let why = "a rule longer than the reasoner holds";
+                program.incomplete.push((axiom.unwrap_or(usize::MAX), why));
+            }
+        }
+        rules.retain(ir::Rule::fits);
         let facts: HashSet<Triple> = program_facts.iter().map(|&f| values.map(f)).collect();
         for t in input.iter_mut() {
             *t = values.map(*t);
@@ -878,6 +891,7 @@ impl Upper {
             rdf_type: program.names.rdf_type,
             same_as: program.names.same_as,
             program,
+            equality: nrese_reasoner::representatives::same_as(&rules, schema.same_as()),
             rules,
             schema,
             facts,
@@ -897,7 +911,8 @@ impl Upper {
     /// in a known class, an object property U1 knows as one between named individuals, a
     /// data property it knows as one with a literal, or an equality. Anything else
     /// (schema, blank nodes, OWL's vocabulary, new vocabulary, a property used as the
-    /// other kind, which the reading of the ontology then gives it) means recompiling.
+    /// other kind or as both, whose kind the reading then gives by its uses) means
+    /// recompiling.
     pub fn is_assertion(&self, [s, p, o]: Triple) -> bool {
         let named = |t: u64| TermId::from_raw(t).kind() == nrese_engine::TermKind::Iri;
         if !named(s) {
@@ -909,8 +924,10 @@ impl Upper {
         if p == self.same_as {
             return named(o);
         }
-        (named(o) && self.object_properties.contains(&p))
-            || (TermId::from_raw(o).kind().is_literal() && self.data_properties.contains(&p))
+        let object = self.object_properties.contains(&p);
+        let data = self.data_properties.contains(&p);
+        (named(o) && object && !data)
+            || (TermId::from_raw(o).kind().is_literal() && data && !object)
     }
 
     /// The stack's change for a commit, computed before it and applied after it
@@ -987,6 +1004,7 @@ impl Upper {
             rules: &self.rules,
             lists: None,
             schema: &self.schema,
+            equality: self.equality,
         };
         let update = delta::update_until(
             &base,

@@ -600,12 +600,16 @@ fn compile_rule(
     if body.is_empty() {
         return Err("a rule without premises".into());
     }
-    Ok(Rule {
+    let rule = Rule {
         name: name.to_owned(),
         body,
         guards,
         head,
-    })
+    };
+    if !rule.fits() {
+        return Err(super::n3::too_many_atoms());
+    }
+    Ok(rule)
 }
 
 #[cfg(test)]
@@ -757,6 +761,21 @@ Consistency: self_friend
         for (text, expected) in cases {
             let error = compile("bad.pie", text, &mut vocabulary).unwrap_err();
             assert!(error.message.contains(expected), "{text}: {error}");
+        }
+    }
+
+    /// A rule's atoms are numbered by a byte: 256 premises are one rule, 257 a parse error.
+    #[test]
+    fn a_rule_past_256_premises_is_an_error() {
+        for n in [256, 257] {
+            let premises: String = (1..=n).map(|i| format!(" x <p:a{i}> y\n")).collect();
+            let text = format!("Rules {{ Id: r\n{premises} ---\n x <p:b> y\n }}");
+            let compiled = compile("long.pie", &text, &mut LocalVocabulary::default());
+            match (n, compiled) {
+                (256, Ok(program)) => assert_eq!(program.rules[0].body.len(), 256),
+                (257, Err(error)) => assert!(error.message.contains("atoms"), "{error}"),
+                (n, other) => panic!("{n} premises: {:?}", other.map(|p| p.rules.len())),
+            }
         }
     }
 }

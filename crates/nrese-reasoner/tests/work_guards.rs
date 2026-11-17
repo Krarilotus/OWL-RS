@@ -34,6 +34,7 @@ fn materialise() -> (Materialisation, GroundProgram) {
             rules: &rules,
             lists: Some(&lists),
             schema: &schema,
+            equality: nrese_reasoner::representatives::same_as(&rules, schema.same_as()),
         },
     );
     (result, program)
@@ -252,6 +253,7 @@ fn a_split_class_is_recomputed_not_copied_through() {
         rules: &rules,
         lists: Some(&lists),
         schema: &schema,
+        equality: nrese_reasoner::representatives::same_as(&rules, schema.same_as()),
     };
     let update = delta::update_with(
         &base,

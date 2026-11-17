@@ -101,7 +101,7 @@ fn equality_engine() -> Engine {
     };
     tx.insert_inferred(inferred);
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     engine
 }
 

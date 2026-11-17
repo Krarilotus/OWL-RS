@@ -227,13 +227,7 @@ impl Kinds {
         if k.annotations.contains(&p) {
             return true;
         }
-        let reserved = |t: u64| match tx.decode(TermId::from_raw(t)) {
-            Some(nrese_rdf::Term::NamedNode(n)) => {
-                nrese_owl::diagnostics::reserved_name(n.as_str())
-            }
-            _ => false,
-        };
-        if changes_schema(tx, triple) || k.names.contains(&s) || reserved(s) {
+        if changes_schema(tx, triple) || k.names.contains(&s) || reserved_named(tx, triple) {
             return false;
         }
         let iri = TermId::from_raw(o).kind() == nrese_engine::TermKind::Iri;
@@ -245,7 +239,7 @@ impl Kinds {
                 && (!deleted || k.declared_data.contains(&p))
         } else {
             let property = k.objects.contains(&p) && !k.data.contains(&p);
-            !k.names.contains(&o) && !reserved(o) && (Some(p) == self.same_as || property)
+            !k.names.contains(&o) && (Some(p) == self.same_as || property)
         }
     }
 }
@@ -364,7 +358,7 @@ pub(crate) enum Prepared {
 /// consistency.
 pub(crate) struct Preparation {
     base: u64,
-    prepared: Prepared,
+    pub prepared: Prepared,
     /// U1 after the commit proves the data consistent (or, on the RL route, the RL
     /// rules do: [`Preparation::decided_by`]).
     pub proves_consistency: bool,
@@ -422,7 +416,9 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         match upper.as_deref() {
             // A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
             Ok(upper)
-                if upper.classes().is_empty() && asserted().all(|t| upper.is_assertion(t)) =>
+                if upper.classes().is_empty()
+                    && asserted().all(|t| upper.is_assertion(t) && !reserved_named(tx, t))
+                    && !tx.deleted().any(|q| may_retype(tx, quad_triple(q))) =>
             {
                 let before = tx.base();
                 let inserted: Vec<Triple> = tx
@@ -518,6 +514,36 @@ pub(crate) fn prepare(store: &StoreService, tx: &Transaction<'_>, stop: Stop<'_>
         prepared: Prepared::Rebuilt(Box::new(upper)),
         ontology: Some(ontology),
     }
+}
+
+/// Whether a statement's subject or object is a reserved name, which the reader leaves out.
+fn reserved_named(tx: &Transaction<'_>, [s, _, o]: Triple) -> bool {
+    let reserved = |t| match tx.decode(TermId::from_raw(t)) {
+        Some(nrese_rdf::Term::NamedNode(n)) => nrese_owl::diagnostics::reserved_name(n.as_str()),
+        _ => false,
+    };
+    reserved(s) || reserved(o)
+}
+
+/// Whether deleting a statement may change its property's kind for the reader: a literal
+/// value of a property not declared a data property, which is one only while it has one
+/// (`nrese_owl::profile::Signature::declared_data`, as `Kinds::keep` reads it).
+pub(crate) fn may_retype(tx: &Transaction<'_>, [_, p, o]: Triple) -> bool {
+    let id = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
+    let mut pattern = nrese_engine::QuadPattern::all();
+    (pattern.subject, pattern.predicate, pattern.object) = (
+        Some(TermId::from_raw(p)),
+        id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        id("http://www.w3.org/2002/07/owl#DatatypeProperty"),
+    );
+    let declared = || {
+        let found = || {
+            tx.base()
+                .quads_for_pattern_in(ReadModel::Asserted, &pattern)
+        };
+        pattern.predicate.is_some() && pattern.object.is_some() && found().next().is_some()
+    };
+    TermId::from_raw(o).kind().is_literal() && !declared()
 }
 
 /// Whether a changed statement may change the ontology's schema (and so U1's rules),
@@ -681,53 +707,54 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
 /// a read off the pool waits for the build under way, one on a Rayon worker builds its
 /// own (U1-B).
 pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
-    view_until(store, None).expect("a read with no stop never gives up")
-}
-
-/// [`view`] for a request: given up (`None`) once `stop` fires, before it claims a build or
-/// while it waits for another read's, polled as `nrese_exec::cell::Build::wait_until` says.
-/// The build runs on and is kept; one this read claimed runs to its end whatever its stop
-/// says, as others may wait for it (a classification waiter's way, `classification::cached`).
-pub(crate) fn view_until(
-    store: &StoreService,
-    stop: Option<&dyn Fn() -> bool>,
-) -> Option<(Snapshot, Arc<View>)> {
-    let bounds = &store.dl().bounds;
     loop {
-        if stop.is_some_and(|stop| stop()) {
-            return None;
-        }
         let snapshot = store.engine().snapshot();
-        let revision = snapshot.revision();
-        let cached = || {
-            lock(&bounds.view)
-                .as_ref()
-                .filter(|view| view.revision == revision)
-                .map(Arc::clone)
-        };
-        if let Some(view) = cached() {
-            return Some((snapshot, view));
-        }
-        let built = match bounds
-            .views
-            .claim(revision, Kind::Opaque, || cached().map(Some))
-        {
-            Claim::Build(builder) => {
-                let built = read(store, &snapshot);
-                builder.finish(built.clone());
-                built
-            }
-            Claim::Wait(flight) => match flight.wait_until(stop)? {
-                Ok(built) => built,
-                Err(nrese_exec::cell::Busy) => read(store, &snapshot),
-            },
-        };
-        // None: the bounds describe a later revision than the snapshot now, or the build
-        // failed. Again, from the latest snapshot.
-        if let Some(view) = built {
-            return Some((snapshot, view));
+        if let Some(view) = view_until(store, &snapshot, None).expect("no stop never gives up") {
+            return (snapshot, view);
         }
     }
+}
+
+/// [`view`] of `snapshot` for a request, never another snapshot's (T3 (a)): given up
+/// (`None`) once `stop` fires, before it claims a build or while it waits for another
+/// read's, polled as `nrese_exec::cell::Build::wait_until` says; `Some(None)` where the
+/// bounds describe a later revision than `snapshot`, or the build failed. The build runs on
+/// and is kept; one this read claimed runs to its end whatever its stop says, as others may
+/// wait for it (a classification waiter's way, `classification::cached`).
+pub(crate) fn view_until(
+    store: &StoreService,
+    snapshot: &Snapshot,
+    stop: Option<&dyn Fn() -> bool>,
+) -> Option<Option<Arc<View>>> {
+    let bounds = &store.dl().bounds;
+    if stop.is_some_and(|stop| stop()) {
+        return None;
+    }
+    let revision = snapshot.revision();
+    let cached = || {
+        lock(&bounds.view)
+            .as_ref()
+            .filter(|view| view.revision == revision)
+            .map(Arc::clone)
+    };
+    if let Some(view) = cached() {
+        return Some(Some(view));
+    }
+    let built = match bounds
+        .views
+        .claim(revision, Kind::Opaque, || cached().map(Some))
+    {
+        Claim::Build(builder) => {
+            let built = read(store, snapshot);
+            builder.finish(built.clone());
+            built
+        }
+        Claim::Wait(flight) => match flight.wait_until(stop)? {
+            Ok(built) => built,
+            Err(nrese_exec::cell::Busy) => read(store, snapshot),
+        },
+    };
+    Some(built)
 }
 
 /// The view of `snapshot`'s revision, published; `None` if the bounds describe a later

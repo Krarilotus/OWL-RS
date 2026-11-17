@@ -4,7 +4,7 @@
 //! meaning (a rule's premises entail its conclusions; a rule's `Id` is only its name).
 //! Default settings throughout (the equality mode included).
 
-use std::sync::Arc;
+use std::{collections::BTreeSet, sync::Arc};
 
 use crate::support::in_memory_store_config;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
@@ -233,6 +233,65 @@ fn equality_rules_under_other_names_answer_as_ordinary_rules_through_a_restart()
         let case = format!("{equality}, after a restart");
         wrong.extend(ask_all(&case, &open(), &expected));
     }
+    assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
+}
+
+/// [`EQUALITY_N3`] without `eq-sym` and `eq-trans`: the subclass rule and the three rules that
+/// copy a fact to a `sameAs` partner of its subject, predicate or object, which are not all of
+/// the equality rules, so each runs as written. Over `a sameAs b`, `b sameAs c`, `a a Dog` and
+/// `d a Dog` they entail `b` and `c` Dogs, `b sameAs b`, `c sameAs c`, `c sameAs b` and
+/// `a sameAs c` (the object copy of `a sameAs b` to `c`); not `b sameAs a`, `a sameAs a` or
+/// `c sameAs a`, which [`EQUALITY_N3`] entails.
+const COPIES_N3: &str = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+{ ?x rdf:type ?c . ?c rdfs:subClassOf ?d } => { ?x rdf:type ?d } .
+{ ?s owl:sameAs ?t . ?s ?p ?o } => { ?t ?p ?o } .
+{ ?p owl:sameAs ?q . ?s ?p ?o } => { ?s ?q ?o } .
+{ ?o owl:sameAs ?t . ?s ?p ?o } => { ?s ?p ?t } .
+";
+
+/// After a store's rules change, its commits answer as the new rules entail: two commits under
+/// [`EQUALITY_N3`], then a pipeline with [`COPIES_N3`] takes the store over, and its second
+/// commit, maintained from the first, brings `b sameAs c`. Those rules copy `owl:sameAs` facts
+/// as they copy any other.
+#[test]
+fn a_commit_after_the_rules_change_answers_as_the_new_rules_entail() {
+    let store = Arc::new(StoreService::new(in_memory_store_config()).expect("store"));
+    let pipeline = |n3: &str| {
+        let rules = Arc::new(UserRules::n3("rules.n3", n3).expect("the rules parse"));
+        let config = ReasonerConfig::for_mode(ReasoningMode::Custom)
+            .with_rules(Some(rules))
+            .expect("custom rules");
+        MutationPipeline::new(store.clone(), Arc::new(ReasonerService::new(config)))
+    };
+    let same = format!("<{OWL}sameAs>");
+    let before = pipeline(EQUALITY_N3);
+    apply(
+        &before,
+        &format!("INSERT DATA {{ <{EX}a> {same} <{EX}b> }}"),
+    );
+    apply(&before, &format!("INSERT DATA {{ <{EX}a> a <{EX}Dog> }}"));
+    // As a repository's new rules take over its store.
+    before.retire();
+    let after = pipeline(COPIES_N3);
+    apply(&after, &format!("INSERT DATA {{ <{EX}d> a <{EX}Dog> }}"));
+    apply(&after, &format!("INSERT DATA {{ <{EX}b> {same} <{EX}c> }}"));
+    let expected: Vec<(String, bool)> = [
+        ("b", "a", "Dog", true),
+        ("c", "a", "Dog", true),
+        ("b", same.as_str(), "b", true),
+        ("c", same.as_str(), "c", true),
+        ("c", same.as_str(), "b", true),
+        ("a", same.as_str(), "c", true),
+        ("b", same.as_str(), "a", false),
+        ("a", same.as_str(), "a", false),
+        ("c", same.as_str(), "a", false),
+    ]
+    .iter()
+    .map(|&(s, p, o, holds)| (format!("<{EX}{s}> {p} <{EX}{o}>"), holds))
+    .collect();
+    let wrong = ask_all("after the rules change", &after, &expected);
     assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
 }
 
@@ -503,4 +562,123 @@ fn a_symmetry_rule_named_eq_rep_s_entails_what_it_says_under_each_equality_mode(
         ));
     }
     assert!(wrong.is_empty(), "wrong cells:\n{}", wrong.join("\n"));
+}
+
+/// OWL 2 RL's equality rules in PIE. With `padded`, `eq-rep-s` comes first a second time,
+/// with a second conclusion that repeats its premise `s p o`: that conclusion adds nothing,
+/// so both programs entail the same statements.
+fn five_equality_rules(padded: bool) -> String {
+    let rule = |id: &str, body: &str, head: &str| {
+        format!("Id: {id}\n{body}\n  ---------------\n{head}\n\n")
+    };
+    let padding = rule(
+        "padded-subject",
+        "  s <owl:sameAs> t\n  s p o",
+        "  t p o\n  s p o",
+    );
+    format!(
+        "Prefices\n{{\n  owl : http://www.w3.org/2002/07/owl#\n}}\n\nRules\n{{\n{}{}{}{}{}{}}}\n",
+        if padded { padding.as_str() } else { "" },
+        rule("same-sym", "  x <owl:sameAs> y", "  y <owl:sameAs> x"),
+        rule(
+            "same-trans",
+            "  x <owl:sameAs> y\n  y <owl:sameAs> z",
+            "  x <owl:sameAs> z"
+        ),
+        rule("same-subject", "  s <owl:sameAs> t\n  s p o", "  t p o"),
+        rule("same-predicate", "  p <owl:sameAs> q\n  s p o", "  s q o"),
+        rule("same-object", "  o <owl:sameAs> t\n  s p o", "  s p t"),
+    )
+}
+
+/// Every statement the store answers, `s p o` as strings.
+fn statements(pipeline: &MutationPipeline) -> BTreeSet<String> {
+    let query = r#"SELECT (CONCAT(STR(?s), " ", STR(?p), " ", STR(?o)) AS ?t) { ?s ?p ?o }"#;
+    let result = pipeline.store().execute_query_str(query).expect("select");
+    let json = String::from_utf8(result.payload).expect("utf8");
+    json.split(r#""value":""#)
+        .skip(1)
+        .map(|value| value.split('"').next().unwrap_or_default().to_owned())
+        .collect()
+}
+
+/// A program whose `eq-rep-s` also concludes its own premise stores, statement for
+/// statement, what the program without that conclusion stores, under each
+/// `reasoner.equality`, after each commit: insertions, a merge of classes and deletions
+/// maintained over them.
+#[test]
+fn an_equality_rule_concluding_its_premise_stores_what_the_rule_without_it_stores() {
+    let same = format!("<{OWL}sameAs>");
+    let fact = |s: &str, o: &str| format!("<{EX}{s}> <{EX}p> <{EX}{o}>");
+    let commits = [
+        format!(
+            "INSERT DATA {{ <{EX}a> {same} <{EX}b> . {} }}",
+            fact("a", "c")
+        ),
+        format!("INSERT DATA {{ {} }}", fact("a", "d")),
+        format!("INSERT DATA {{ <{EX}b> {same} <{EX}e> }}"),
+        format!("DELETE DATA {{ <{EX}a> {same} <{EX}b> }}"),
+        format!("DELETE DATA {{ {} }}", fact("a", "c")),
+    ];
+    let mut different = Vec::new();
+    for (equality, representatives, compact) in [
+        ("representatives", true, false),
+        ("compact", true, true),
+        ("replicate", false, false),
+    ] {
+        let open = |padded: bool| {
+            let rules =
+                UserRules::pie("user.pie", five_equality_rules(padded)).expect("it compiles");
+            let reasoner = ReasonerConfig::for_mode(ReasoningMode::Custom)
+                .with_rules(Some(Arc::new(rules)))
+                .expect("custom rules");
+            let config = nrese_store::StoreConfig {
+                equality_by_representatives: representatives,
+                equality_compact: compact,
+                ..in_memory_store_config()
+            };
+            MutationPipeline::new(
+                Arc::new(StoreService::new(config).expect("store")),
+                Arc::new(ReasonerService::new(reasoner)),
+            )
+        };
+        let (padded, plain) = (open(true), open(false));
+        let (mut verdict, mut sizes) = (None, Vec::new());
+        for (k, update) in commits.iter().enumerate() {
+            apply(&padded, update);
+            apply(&plain, update);
+            let (mine, theirs) = (statements(&padded), statements(&plain));
+            sizes.push(format!("{}/{}", mine.len(), theirs.len()));
+            // Not two closures equal for deriving nothing: the plain program copies `a p d`
+            // to `b`, the subject's partner.
+            if k == 1 {
+                let copy = format!("{EX}b {EX}p {EX}d");
+                assert!(
+                    theirs.contains(&copy),
+                    "{equality}: the plain program stores no `{copy}` after commit 2"
+                );
+            }
+            if mine != theirs && verdict.is_none() {
+                verdict = Some(format!(
+                    "DIFFERENT after commit {}: padded only {:?}; plain only {:?}",
+                    k + 1,
+                    mine.difference(&theirs).collect::<Vec<_>>(),
+                    theirs.difference(&mine).collect::<Vec<_>>()
+                ));
+            }
+        }
+        let verdict = verdict.unwrap_or_else(|| "equal".to_owned());
+        println!(
+            "CASE {equality}: {verdict} (statements, padded/plain, after each commit: {})",
+            sizes.join(" ")
+        );
+        if verdict != "equal" {
+            different.push(format!("{equality}: {verdict}"));
+        }
+    }
+    assert!(
+        different.is_empty(),
+        "different closures:\n{}",
+        different.join("\n")
+    );
 }

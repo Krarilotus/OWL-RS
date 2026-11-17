@@ -299,6 +299,10 @@ impl MutationPipeline {
                             .map_or(MutationError::Cancelled, &store_error)
                     })?;
             tracing::debug!(?materialisation, "commit-path materialisation");
+            // Whether the closure the commit leaves leaves out a list axiom: its program's
+            // whole list diagnostics (the report's are only the new ones).
+            let lists_left_out =
+                (changed.as_ref().or(cached)).is_some_and(|p| !p.list_diagnostics.is_empty());
             crate::reasoning::log_diagnostics(
                 &materialisation.diagnostics,
                 materialisation.diagnostics_total,
@@ -390,9 +394,15 @@ impl MutationPipeline {
                     &|view, dl_gate_budget| self.view_reason(view, dl_gate_budget, &resources),
                     &envelope,
                 );
-                (gate, bounds)
+                // What the reader left out: none where consistent (`consistency::check`).
+                let read = bounds
+                    .ontology
+                    .take()
+                    .map(|o| crate::dl::query::left_out(&o));
+                let consistent = gate.checked.verdict == crate::dl::Verdict::Consistent;
+                (gate, bounds, read.or(consistent.then_some(None)))
             });
-            if let Some((gate, _)) = &mut dl
+            if let Some((gate, _, _)) = &mut dl
                 && let Some(reject) = gate.reject.take()
             {
                 return Err(MutationError::Rejected(Box::new(reject)));
@@ -421,9 +431,15 @@ impl MutationPipeline {
             let supports = self.store.supports();
             let touched = supports.wants_commits().then(|| supports.touched(&tx));
             let before = tx.base().revision();
-            // With the rewriting on, the QL schema notes what the commit changes of
-            // individuals' memberships of class expressions, before the commit publishes.
-            let summary = match self.store.query_settings().ql() {
+            // The commit maintained the closure: its version carries its base's certificate,
+            // the same object. With the rewriting on, that certificate's QL schema notes what
+            // the commit changes of individuals' memberships of class expressions, before the
+            // commit publishes.
+            let ql = crate::service::Certificate::of(tx.base()).and_then(|c| c.ql.clone());
+            if let Some(certificate) = tx.base().certificate().cloned() {
+                tx.vouch(certificate);
+            }
+            let summary = match ql {
                 Some(ql) => ql.commit(tx),
                 None => tx.commit(),
             }
@@ -434,11 +450,13 @@ impl MutationPipeline {
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
             }
-            if let Some((gate, bounds)) = dl {
+            (self.store.lists).commit(before, summary.revision, lists_left_out);
+            if let Some((gate, bounds, left_out)) = dl {
                 crate::dl::bounds::install(&self.store, bounds, summary.revision);
                 self.store.dl().record(crate::dl::DlStatus {
                     revision: summary.revision,
                     consistency: gate.checked,
+                    left_out,
                 });
             }
             // The program now describes the committed state.
@@ -451,6 +469,8 @@ impl MutationPipeline {
                 }
             }
             drop(ground);
+            #[cfg(test)]
+            crate::service::hooks::run(&crate::service::hooks::BEFORE_REVALIDATION);
             // In quarantine the commit checked only its own facts: revalidate everything, so
             // the store leaves quarantine once the data is repaired. The commit itself stands.
             if matches!(

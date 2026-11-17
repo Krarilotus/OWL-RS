@@ -62,6 +62,7 @@ impl UserRules {
         };
         let mut vocabulary = LocalVocabulary::default();
         let compiled = rules.compile(&mut vocabulary)?;
+        super::ir::refuse_reserved_names(&compiled.rules)?;
         if format == RuleFormat::Pie {
             rules.context_relations = super::pie::context_relations(&compiled, &vocabulary);
         }
@@ -457,5 +458,52 @@ Id: eq-rep-s
         assert!(RuleProgram::closes_equality("rdfs-plus"));
         assert!(!RuleProgram::closes_equality("rdfs"));
         assert!(!RuleProgram::closes_equality("custom:x.n3"));
+    }
+
+    /// A rule may not carry the names a proof gives its own steps, `asserted` and `axiom`: a
+    /// program with one is refused where it is read, a user's rules and the rule syntax
+    /// (`parse_rules`) alike, and the error names the rule and says its name is reserved. A
+    /// rule of another name loads.
+    #[test]
+    fn rules_named_asserted_or_axiom_are_refused() {
+        let mut wrong = Vec::new();
+        for name in ["asserted", "axiom", "symmetry"] {
+            let pie = format!(
+                "Prefices {{ e : http://e/ }}\nRules\n{{\nId: {name}\n  x <e:knows> y\n  ---\n  \
+                 y <e:knows> x\n}}\n"
+            );
+            let rules = format!("{name}: (?x rdfs:p ?y) -> (?y rdfs:q ?x)");
+            let vocabulary = &mut LocalVocabulary::default();
+            let reads = [
+                ("pie", UserRules::pie("rules.pie", pie).map(|_| ())),
+                (
+                    "parse_rules",
+                    crate::ir::parse_rules(&rules, vocabulary).map(|_| ()),
+                ),
+            ];
+            for (reader, got) in reads {
+                let got = got.map_err(|error| error.to_string());
+                let refused = name != "symmetry";
+                let right = match &got {
+                    Ok(()) => !refused,
+                    Err(message) => {
+                        refused
+                            && message.contains(&format!("rule {name}"))
+                            && message.contains("reserved")
+                    }
+                };
+                let must = if refused {
+                    "refused, the rule named, its name reserved"
+                } else {
+                    "loaded"
+                };
+                let verdict = if right { "right" } else { "WRONG" };
+                println!("CASE {name} by {reader}: {verdict}: {got:?}, must be {must}");
+                if !right {
+                    wrong.push(format!("{name} by {reader}"));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "wrong: {wrong:?}");
     }
 }

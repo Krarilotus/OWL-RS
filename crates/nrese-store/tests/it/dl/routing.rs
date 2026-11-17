@@ -321,6 +321,30 @@ fn the_other_reads_of_an_individual_named_only_in_the_question_are_not_complete(
     assert!(!inside.complete && !alone.complete, "{lines:#?}");
 }
 
+/// A read of every statement outside a transaction, told without the DL bounds
+/// (`status_without_dl`): the rules' closure alone, which lacks an existential's certain
+/// answer here (`:a` has an `:r`), so it is not `complete`.
+#[test]
+fn a_read_of_every_statement_without_the_bounds_is_not_complete() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":r a owl:ObjectProperty . \
+         :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] . \
+         :a a :A .",
+    )
+    .expect("the existential");
+    let read = dl
+        .store()
+        .prepare_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "{}ASK {{ :a :r ?y }}",
+            super::PREFIXES
+        )))
+        .expect("prepared");
+    let status = dl.store().status_without_dl(&read).expect("a status");
+    assert!(!status.complete, "{} {:?}", status.as_str(), status.reasons);
+}
+
 /// The plan's status of a question about an individual the data doesn't name, under a key
 /// on the RL route, where nothing else keeps the plan from `complete`: the plan says why it
 /// isn't, that reason alone.
@@ -358,6 +382,96 @@ fn the_plan_of_an_individual_named_only_in_the_question_is_not_complete_under_a_
         reason.starts_with("the query names <") && reason.contains("example.com/b"),
         "{line}"
     );
+}
+
+/// The same question under the same key, with a triple term the query makes: two reasons
+/// it may not be `complete`, the individual named only in the question under keys and the
+/// RDF 1.2 term OWL 2 doesn't define. Spec: neither its plan nor its run says `complete`,
+/// and each gives both reasons; one doesn't stand in for the other.
+#[test]
+fn a_triple_term_beside_an_individual_named_only_in_the_question_keeps_both_reasons() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":r a owl:ObjectProperty . :A a owl:Class ; owl:hasKey ( :r ) . :a a :A ; :r :x .",
+    )
+    .expect("the key");
+    let read = "SELECT ?t { :b a :A . BIND(TRIPLE(:a, :r, :x) AS ?t) }";
+    let asked = dl
+        .store()
+        .prepare_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "{}{read}",
+            super::PREFIXES
+        )))
+        .expect("prepared");
+    let plan = dl
+        .store()
+        .plan_query(&asked, &nrese_store::CancellationToken::new())
+        .expect("planned")
+        .completeness
+        .expect("a status");
+    let (_, run) = query(&dl, read);
+    let mut wrong = Vec::new();
+    for (place, status) in [("plan", &plan), ("run", &run.shared)] {
+        let texts: Vec<_> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+        let keys = texts
+            .iter()
+            .any(|t| t.starts_with("the query names <") && t.contains("example.com/b"));
+        let rdf12 = texts
+            .iter()
+            .any(|t| t.starts_with("the query uses a triple term"));
+        let line = format!("{place}: {} {texts:?}", status.as_str());
+        eprintln!("{line}");
+        if status.complete || !keys || !rdf12 {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The same question under the same key, with a negation: the individual named only in the
+/// question may miss an answer, and under `NOT EXISTS` a missing answer can make a returned
+/// one wrong. Spec: neither its plan nor its run says `sound` (so neither `complete`), and
+/// each gives both reasons, the keys' and the negation's.
+#[test]
+fn a_negation_beside_an_individual_named_only_in_the_question_is_unsound_under_a_key() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":r a owl:ObjectProperty . :A a owl:Class ; owl:hasKey ( :r ) . :a a :A ; :r :x .",
+    )
+    .expect("the key");
+    let read = "SELECT * { :b a :A . FILTER NOT EXISTS { :b :r :x } }";
+    let asked = dl
+        .store()
+        .prepare_query(&nrese_store::SparqlQueryRequest::all(format!(
+            "{}{read}",
+            super::PREFIXES
+        )))
+        .expect("prepared");
+    let plan = dl
+        .store()
+        .plan_query(&asked, &nrese_store::CancellationToken::new())
+        .expect("planned")
+        .completeness
+        .expect("a status");
+    let (_, run) = query(&dl, read);
+    let mut wrong = Vec::new();
+    for (place, status) in [("plan", &plan), ("run", &run.shared)] {
+        let texts: Vec<_> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+        let keys = texts
+            .iter()
+            .any(|t| t.starts_with("the query names <") && t.contains("example.com/b"));
+        let negation = texts
+            .iter()
+            .any(|t| t.starts_with("the query uses EXISTS over answers that may be missing"));
+        let line = format!("{place}: {} {texts:?}", status.as_str());
+        eprintln!("{line}");
+        if status.sound || status.complete || !keys || !negation {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// One data value in two lexical forms: `"1"` and `"01"` as xsd:integer, and `"1"` as
@@ -836,6 +950,98 @@ fn annotation_property_axioms_entail_nothing_about_annotated_terms() {
         wrong.is_empty(),
         "wrong rows not labelled unsound: {wrong:#?}"
     );
+}
+
+/// OWL 2's nine built-in annotation properties (Structural Specification 5.5 and 5.8, Table
+/// 5) are declared implicitly (3.6: AllDecl holds them).
+const BUILTIN_ANNOTATIONS: [&str; 9] = [
+    "rdfs:label",
+    "rdfs:comment",
+    "rdfs:seeAlso",
+    "rdfs:isDefinedBy",
+    "owl:versionInfo",
+    "owl:deprecated",
+    "owl:priorVersion",
+    "owl:backwardCompatibleWith",
+    "owl:incompatibleWith",
+];
+
+/// An annotation property, built in (declared or not) or declared (`:note`, also by OWL 1's
+/// `owl:OntologyProperty`), as the
+/// subject of a domain, a range or a sub-property, and as the super-property of `:p`
+/// (undeclared, a data property or an object property). The Mapping to RDF (3.2.5, Table
+/// 16) reads the first three as annotation axioms, which the Direct Semantics give no
+/// meaning (1), and matches the fourth to no pattern, so its graph is no OWL 2 DL ontology.
+/// No read is entailed: an answer `true` is told `unsound` with the annotation reason, on
+/// the RL route and off it.
+#[test]
+fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
+    let common = ":C a owl:Class . :x a owl:NamedIndividual . :v a owl:NamedIndividual .";
+    let mut cases = Vec::new();
+    for a in BUILTIN_ANNOTATIONS.into_iter().chain([":note"]) {
+        let declared = format!("{a} a owl:AnnotationProperty . ");
+        // OWL 1's typing, which Table 6 of the Mapping to RDF (3.1.2) replaces with the one above.
+        let ontology = (a == ":note").then(|| format!("{a} a owl:OntologyProperty . "));
+        for decl in [String::new(), declared].into_iter().chain(ontology) {
+            if a == ":note" && decl.is_empty() {
+                continue;
+            }
+            let sub = ":sup a owl:AnnotationProperty .";
+            cases.extend([
+                (
+                    format!("{decl}{a} rdfs:domain :C . :x {a} \"x\" ."),
+                    "ASK { :x a :C }".into(),
+                ),
+                (
+                    format!("{decl}{a} rdfs:domain :C . :x {a} :v ."),
+                    "ASK { :x a :C }".into(),
+                ),
+                (
+                    format!("{decl}{a} rdfs:range :C . :x {a} :v ."),
+                    "ASK { :v a :C }".into(),
+                ),
+                (
+                    format!("{decl}{a} rdfs:subPropertyOf :sup . {sub} :x {a} :v ."),
+                    "ASK { :x :sup :v }".into(),
+                ),
+            ]);
+        }
+        let note = if a == ":note" {
+            ":note a owl:AnnotationProperty . "
+        } else {
+            ""
+        };
+        for (kind, value) in [
+            ("", "2"),
+            ("", ":v"),
+            (":p a owl:DatatypeProperty . ", "2"),
+            (":p a owl:ObjectProperty . ", ":v"),
+        ] {
+            let data = format!("{note}{kind}:p rdfs:subPropertyOf {a} . :x :p {value} .");
+            cases.push((data, format!("ASK {{ :x {a} {value} }}")));
+        }
+    }
+    let mut wrong = Vec::new();
+    for (data, read) in &cases {
+        for extra in ["", OUTSIDE_RL] {
+            let dl = pipeline();
+            insert(&dl, &format!("{data} {common} {extra}")).expect("committed");
+            let (rows, status) = query(&dl, read);
+            let (label, reasons) = (status.shared.as_str(), status.reasons());
+            let marked = reasons
+                .iter()
+                .any(|r| r.contains("annotation-property axioms"));
+            if rows == ["true"] && !(label == "unsound" && marked) {
+                wrong.push(format!("{data} {extra} / {read}: {label} {reasons:?}"));
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} reads told without the reason: {wrong:#?}",
+        wrong.len()
+    );
+    assert_eq!(cases.len(), 120, "the table's rows");
 }
 
 /// `data` (with `extra`) committed: the RL rules clash where OWL 2 DL is consistent, and

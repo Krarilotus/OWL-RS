@@ -74,8 +74,8 @@ planned.
   ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset), [modes](spec/reasoning-semantics.md#modes)).
 - `owl2-rl` doesn't infer `x owl:sameAs x` for every term (`?x owl:sameAs ?x` doesn't
   return one for each; an asserted one is returned), checks the datatype rules in part, and of the axiomatic triples holds only `dt-type1`'s 32 datatype statements, in every store ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
-  Lists past their limits (a property chain or key of more than 250 properties, more than
-  64 member sequences) aren't used at all, never truncated, and each is reported in the log
+  Lists past their limits (a property chain of more than 250 properties, a key of more
+  than 127, an intersection of more than 256 classes, more than 64 member sequences) aren't used at all, never truncated, and each is reported in the log
   and the reasoning diagnostics
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)); none known beyond
   keeping lists within those limits. Literals aren't
@@ -95,9 +95,17 @@ planned.
   ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)). Any value
   the query computes counts, so a computed string or IRI matched against the data
   (`BIND(CONCAT(…) AS ?n)`, `BIND(IRI(…) AS ?s)`) gives `sound-only` too, though nothing
-  is missed.
+  is missed. The same holds where a query joins, deduplicates, groups or counts the values of
+  a property that holds numbers or dates (`unsound` under an aggregate): `"7"` and `"07"`
+  are two terms to the store. A reader of only some graphs gets it wherever the query
+  compares values, so their status says nothing about graphs they can't read. Compare values
+  in a `FILTER` instead. A query with a triple term or a base-direction literal, or whose
+  reader's graphs hold a triple term, is never `complete`: OWL 2 doesn't define them. For
+  triple terms, none known
+  ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)).
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
-  `log:notEqualTo` and make no new blank nodes; with user rules no answer is claimed
+  `log:notEqualTo`, make no new blank nodes, and hold at most 256 atoms in a rule's
+  premises or conclusion (split a longer rule); with user rules no answer is claimed
   complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)). None known.
 - Under `owl2-dl`, a commit whose consistency check isn't decided
   (a budget or the timeout) goes through, and the status says `unknown`; no answer is then

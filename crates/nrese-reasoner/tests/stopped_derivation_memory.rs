@@ -51,6 +51,7 @@ fn a_stopped_derivation_check_allocates_nothing() {
             rules: &rules,
             lists: None,
             schema: &schema,
+            equality: nrese_reasoner::representatives::same_as(&rules, schema.same_as()),
         },
     );
     assert_eq!(

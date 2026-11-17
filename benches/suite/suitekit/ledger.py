@@ -22,7 +22,9 @@ predates manifests) are kept when a record is refreshed. Records of kits outside
 from __future__ import annotations
 
 import argparse
+import datetime
 import json
+import os
 import re
 import tomllib
 from pathlib import Path
@@ -76,7 +78,7 @@ def dump(record: dict) -> str:
 
 
 # The reset of 25 Oct 2026: refactor/engine-v2 started again from 59e5e24c and takes the earlier lines'
-# work package by package (Harness notes, Sol-line integration). A record started before it measured an
+# work package by package. A record started before it measured an
 # engine the current line doesn't continue as it was: its results stay, as history, marked wherever they
 # are shown, never read as the current engine's; the v1.6 baseline measures the current one whole.
 RESET_DATE, RESET_BASE = "2026-10-25", "59e5e24c"
@@ -88,6 +90,15 @@ PRE_RESET_NOTE = (f"{PRE_RESET} before the reset of 25 Oct 2026 (engine-v2 re-ba
 def pre_reset(record: dict) -> bool:
     """Whether the record was started before the reset (RESET_DATE); one without a start date is."""
     return str(record.get("started", ""))[:10] < RESET_DATE
+
+
+def page_date() -> str:
+    """The day a generated page says it was made: SOURCE_DATE_EPOCH's, in UTC, when it is set
+    (reproducible-builds.org), else today."""
+    epoch = os.environ.get("SOURCE_DATE_EPOCH")
+    if epoch:
+        return datetime.datetime.fromtimestamp(int(epoch), datetime.timezone.utc).date().isoformat()
+    return datetime.date.today().isoformat()
 
 
 def load_records(runs_dir: Path) -> list[dict]:
