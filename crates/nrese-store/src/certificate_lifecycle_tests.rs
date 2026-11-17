@@ -964,3 +964,66 @@ fn a_change_of_reasoning_is_not_certified_until_its_rules_are_registered() {
     }
     cells.finish();
 }
+
+/// A clash the rules find (cax-dw), on the rules' route under `owl2-dl`, and a class `:H`
+/// nothing is asserted in.
+const CLASH: &str = ":A a owl:Class . :B a owl:Class . :H a owl:Class . \
+     :A owl:disjointWith :B . :w a :A , :B .";
+
+/// A read [`CLASH`] decides: none over consistent data, every individual over inconsistent.
+const IN_H: &str = "SELECT ?x { ?x a :H }";
+
+/// Under `owl2-dl` a store leaves quarantine at the revision its repair published: the
+/// revalidation after the repair changes no rows, so it keeps the revision, and the bounds
+/// keep a view per revision. A read between the publication and the revalidation (the store
+/// still in quarantine) builds and keeps that revision's view; it and the read after the
+/// revalidation are told what the same data, loaded clean, are told.
+#[test]
+fn a_store_leaving_quarantine_at_a_kept_views_revision_is_told_what_clean_data_are() {
+    let rules = || {
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl)
+            .materialised_program()
+            .expect("owl2-dl maintains the OWL 2 RL closure")
+    };
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let dl = pipeline(&store, ReasoningMode::Owl2Dl);
+    load(&store, CLASH);
+    store.rematerialise(rules()).expect("rebuilt");
+    assert!(
+        store.is_quarantined(),
+        "the setup: {:?}",
+        store.consistency()
+    );
+    let (reader, kept) = (Arc::clone(&store), Arc::new(Mutex::new(None)));
+    let seen = Arc::clone(&kept);
+    hooks::BEFORE_REVALIDATION.set(Some(Box::new(move || {
+        let read = status(&reader, IN_H);
+        *seen.lock().unwrap() = Some((reader.current_revision(), reader.is_quarantined(), read));
+    })));
+    let repaired = dl.apply(
+        MutationCommand::Update(SparqlUpdateRequest::new(format!(
+            "{PREFIXES}DELETE DATA {{ :w a :B }}"
+        ))),
+        &Requester::all(),
+        &MutationTicket::new(),
+    );
+    hooks::BEFORE_REVALIDATION.set(None);
+    repaired.expect("the repair commits");
+    let after = status(&store, IN_H);
+    let clean = Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store"));
+    let _clean_dl = pipeline(&clean, ReasoningMode::Owl2Dl);
+    load(&clean, &CLASH.replace(":w a :A , :B", ":w a :A"));
+    clean.rematerialise(rules()).expect("rebuilt");
+    let clean = status(&clean, IN_H);
+    let (revision, quarantined, during) = kept.lock().unwrap().take().expect("the hook ran");
+    assert_eq!((&during, &after), (&clean, &clean));
+    assert!(
+        quarantined,
+        "the setup: the read in between saw no quarantine"
+    );
+    assert_eq!(
+        store.current_revision(),
+        revision,
+        "the setup: the revalidation took a new revision"
+    );
+}

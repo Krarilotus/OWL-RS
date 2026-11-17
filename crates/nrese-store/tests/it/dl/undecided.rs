@@ -8,9 +8,12 @@ use std::sync::Arc;
 use nrese_rdf::Triple;
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, RuleProgram};
-use nrese_store::{ConsistencyStatus, MutationPipeline, StoreConfig, StoreService, WhyUndecided};
+use nrese_store::{
+    ConsistencyStatus, DlAnswers, MutationPipeline, StoreConfig, StoreError, StoreService,
+    WhyUndecided,
+};
 
-use super::{PREFIXES, update};
+use super::{PREFIXES, insert, update};
 
 /// An annotation property's domain, disjoint with its subject's class: the rules clash
 /// (prp-dom on the annotation), while OWL 2 DL gives the axiom no meaning for annotations.
@@ -130,4 +133,209 @@ fn the_reason_is_derived_again_at_open_under_the_mode_opened_with() {
         matches!(consistency, ConsistencyStatus::Undecided { .. }),
         "{consistency:?}"
     );
+}
+
+/// A clash the rules find (cax-dw: `:w` in two disjoint classes), in OWL 2 RL's profile, so
+/// on the rules' route; `:H`, a class nothing is asserted in; `:u`, a plain fact.
+const CLASH: &str = ":A a owl:Class . :B a owl:Class . :H a owl:Class . \
+     :A owl:disjointWith :B . :w a :A , :B . :u a :Thing .";
+
+/// [`CLASH`] without the clash: `:w` in one of the classes.
+const CLEAN: &str = ":A a owl:Class . :B a owl:Class . :H a owl:Class . \
+     :A owl:disjointWith :B . :w a :A . :u a :Thing .";
+
+/// A read the clash decides: no `:H` is asserted, so over consistent data there is none,
+/// and over inconsistent data every individual is one (every answer is entailed).
+const IN_H: &str = "SELECT ?x { ?x a :H }";
+
+/// What a read over data the full check finds inconsistent is told (`dl::query`).
+const INCONSISTENT: &str = "the data is inconsistent under OWL 2 DL, so it entails every answer";
+
+/// A store under `owl2-dl` holding `data`, loaded past the gates and rebuilt: in quarantine.
+fn quarantined(data: &str) -> MutationPipeline {
+    let dl = store(StoreConfig::in_memory(), ReasoningMode::Owl2Dl);
+    let consistency = loaded(&dl, data);
+    assert!(
+        matches!(consistency, ConsistencyStatus::Inconsistent { .. }),
+        "the setup: {consistency:?}"
+    );
+    dl
+}
+
+/// [`IN_H`]'s rows and status under `mode`.
+fn in_h(
+    dl: &MutationPipeline,
+    mode: Option<DlAnswers>,
+) -> Result<(Vec<String>, super::Status), StoreError> {
+    super::queries::query_with(dl, IN_H, mode)
+}
+
+/// Spec: under `owl2-dl` a read over data the store itself calls inconsistent is told so:
+/// `sound-only`, with the full check's reason, and the rows the store holds (inconsistent
+/// data entail every answer, so they are sound, and not all). The words go to the
+/// documentation.
+fn assert_told_inconsistent(dl: &MutationPipeline, at: &str) {
+    let (rows, status) = in_h(dl, None).expect("answered");
+    let header = status.shared.header();
+    assert_eq!(
+        (header.split(';').next(), status.reasons()),
+        (Some("sound-only"), vec![INCONSISTENT.to_owned()]),
+        "{at}: {header}"
+    );
+    assert!(rows.is_empty(), "{at}: {rows:?}");
+}
+
+/// Spec: a store in quarantine proves nothing on the rules' route; at its start, before any
+/// commit, a read is told what the full check finds (the claim, sentence 1).
+#[test]
+fn a_quarantined_store_at_its_start_is_told_inconsistent() {
+    let dl = quarantined(CLASH);
+    assert_told_inconsistent(&dl, "the start");
+}
+
+/// Spec: `dl.answers = "exact"` refuses an answer that isn't complete (`dl::query::
+/// refuse_unless_complete`), so over a store in quarantine it refuses the read.
+#[test]
+fn exact_answers_refuse_a_read_over_a_quarantined_store() {
+    let dl = quarantined(CLASH);
+    let answer = in_h(&dl, Some(DlAnswers::Exact));
+    assert!(
+        matches!(answer, Err(StoreError::Incomplete(_))),
+        "{answer:?}"
+    );
+}
+
+/// Spec: a commit into a store in quarantine on the rules' route records no DL verdict for
+/// its revision (its version keeps no assessment); the reads after it are told what they
+/// were told before it (the claim, sentence 2, then 1).
+#[test]
+fn a_commit_in_quarantine_records_no_verdict_and_reads_stay_told_inconsistent() {
+    let dl = quarantined(CLASH);
+    let revision = insert(&dl, ":v a :Thing .").expect("an unrelated commit in quarantine");
+    let recorded = dl.store().dl().status();
+    assert!(
+        recorded.as_ref().is_none_or(|s| s.revision != revision),
+        "recorded for the commit's revision {revision}: {recorded:?}"
+    );
+    assert_told_inconsistent(&dl, "after the commit");
+    let answer = in_h(&dl, Some(DlAnswers::Exact));
+    assert!(
+        matches!(answer, Err(StoreError::Incomplete(_))),
+        "{answer:?}"
+    );
+}
+
+/// Spec: an ill-typed literal under a range is a clash the rules find (dt-not-type), and the
+/// full check has no value for it (`dl/datatypes.rs`): a read is told the consistency isn't
+/// known, never `complete` on the rules' claim.
+#[test]
+fn an_ill_typed_literal_in_quarantine_is_told_its_consistency_is_not_known() {
+    let dl = quarantined(
+        ":p a owl:DatatypeProperty ; rdfs:range xsd:integer . :s :p \"abc\"^^xsd:integer . \
+         :H a owl:Class . :u a :Thing .",
+    );
+    let (rows, status) = in_h(&dl, None).expect("answered");
+    let header = status.shared.header();
+    let reasons = status.reasons();
+    assert_eq!(header.split(';').next(), Some("sound-only"), "{header}");
+    assert!(
+        reasons.len() == 1
+            && reasons[0].starts_with("the data's consistency under OWL 2 DL isn't known ("),
+        "{header}"
+    );
+    assert!(rows.is_empty(), "{rows:?}");
+}
+
+/// Spec: a commit into a store in quarantine is admitted as long as the data were
+/// inconsistent before it (`dl::gate`; off the route,
+/// `inconsistent_data_loaded_past_the_gate_is_quarantined_not_locked`). An earlier commit on
+/// the rules' route must leave no record that makes the data look consistent before the
+/// next: here the next leaves the route (a union, which OWL 2 RL doesn't hold) and keeps
+/// the clash, so the full check runs.
+#[test]
+fn a_commit_leaving_the_rules_route_in_quarantine_is_admitted_after_an_earlier_commit() {
+    let dl = quarantined(CLASH);
+    insert(&dl, ":v a :Thing .").expect("an unrelated commit in quarantine");
+    let left = insert(&dl, ":E owl:equivalentClass [ owl:unionOf ( :F :G ) ] .");
+    assert!(left.is_ok(), "{left:?}");
+    let consistency = dl.store().consistency();
+    assert!(
+        matches!(consistency, ConsistencyStatus::Inconsistent { .. }),
+        "{consistency:?}"
+    );
+}
+
+/// Spec: a quarantine begins at a new revision (a rebuild that changes no rows keeps its
+/// revision, one that finds a new clash has changed them), so a view of the revision before,
+/// built while the data were consistent, isn't what the read after it is told.
+#[test]
+fn a_quarantine_beginning_after_a_read_is_told_by_its_own_revision() {
+    let dl = store(StoreConfig::in_memory(), ReasoningMode::Owl2Dl);
+    assert_eq!(loaded(&dl, CLEAN), ConsistencyStatus::Consistent);
+    let (_, before) = in_h(&dl, None).expect("answered");
+    assert!(
+        before.is_complete(),
+        "the setup: {}",
+        before.shared.header()
+    );
+    let revision = dl.store().current_revision();
+    let consistency = loaded(&dl, ":w a :B .");
+    assert!(
+        matches!(consistency, ConsistencyStatus::Inconsistent { .. }),
+        "the setup: {consistency:?}"
+    );
+    assert!(
+        dl.store().current_revision() > revision,
+        "the setup: the same revision"
+    );
+    assert_told_inconsistent(&dl, "after the clash loaded");
+}
+
+/// Spec (the control): a clean store on the rules' route is told `complete` with no rows at
+/// each point, and a commit into it is recorded `consistent`, decided by the rules.
+#[test]
+fn a_clean_store_on_the_rules_route_stays_complete_and_recorded() {
+    let dl = store(StoreConfig::in_memory(), ReasoningMode::Owl2Dl);
+    assert_eq!(loaded(&dl, CLEAN), ConsistencyStatus::Consistent);
+    let complete = |at: &str| {
+        let (rows, status) = in_h(&dl, None).expect("answered");
+        assert!(
+            status.is_complete() && rows.is_empty(),
+            "{at}: {} {rows:?}",
+            status.shared.header()
+        );
+    };
+    complete("the start");
+    let revision = insert(&dl, ":v a :Thing .").expect("committed");
+    let recorded = dl.store().dl().status().expect("a record");
+    assert_eq!(
+        (
+            recorded.revision,
+            recorded.consistency.verdict.as_str(),
+            recorded.consistency.engine
+        ),
+        (revision, "consistent", "rules")
+    );
+    complete("after the commit");
+    update(&dl, "DELETE DATA { :w a :B . }").expect("committed");
+    complete("after the delete");
+}
+
+/// Spec: once the repair takes a store out of quarantine, a read is told what a clean store
+/// is told (the claim, sentence 3).
+#[test]
+fn a_repaired_store_is_told_what_a_clean_store_is_told() {
+    let q = quarantined(CLASH);
+    insert(&q, ":v a :Thing .").expect("an unrelated commit in quarantine");
+    update(&q, "DELETE DATA { :w a :B . }").expect("the repair commits");
+    assert_eq!(q.store().consistency(), ConsistencyStatus::Consistent);
+    let clean = store(StoreConfig::in_memory(), ReasoningMode::Owl2Dl);
+    assert_eq!(loaded(&clean, CLEAN), ConsistencyStatus::Consistent);
+    insert(&clean, ":v a :Thing .").expect("committed");
+    update(&clean, "DELETE DATA { :w a :B . }").expect("committed");
+    let told = |dl: &MutationPipeline| {
+        let (rows, status) = in_h(dl, None).expect("answered");
+        (status.shared.header(), rows)
+    };
+    assert_eq!(told(&q), told(&clean));
 }
