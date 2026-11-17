@@ -81,8 +81,13 @@ primary, only bulk loads and rematerialisations send replicas back to an image.
 - A replica started over a data directory restored from such a primary's backup takes no
   image: its reasoned reads say `not-certified` and may miss rows, and the primary's refusal
   shows only in its status. Don't start a replica over such a backup.
-- On a replica, a reader of only some graphs is refused a read of the stored statements
-  alone, though it could be answered.
+- On a replica, a reader of only some graphs who sees inferred statements
+  (`inferred = "visible"` or `"supported"`) is refused every read with `503` and a sentence
+  that says the replica doesn't serve it, also a read of the stored statements alone, though
+  that one could be answered. Such a reader reads from the primary.
+- Only the default repository is replicated. Other repositories on a replica are served
+  read-only as its data directory holds them, reasoned at its start, and their reasoned
+  reads say `not-certified`.
 - A replica isn't promoted automatically. To promote one, stop it, set
   `replication.mode = "primary"` (or `"off"`), and point the writers and the other replicas
   at it.

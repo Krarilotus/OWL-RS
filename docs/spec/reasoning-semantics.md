@@ -151,7 +151,7 @@ OWL 2 DL with arbitrary rules is undecidable; rules whose variables bind to name
 - Commit-path checking examines what the commit adds, so it relies on a consistent baseline. When a full materialisation finds violations (data imported without reasoning, or a ruleset switched on later), the store is quarantined:
   - `/readyz` answers 503 with only status `quarantined`; `/api/v1/repositories/{id}/info` gives the violation count to whole-dataset readers or administrators;
   - reads work;
-  - consistent commits are accepted and each one revalidates the whole store, until the data is repaired.
+  - consistent commits are accepted and each one revalidates the whole store, until the data is repaired. From such a commit until its revalidation ends, the consistency is `unknown` (a copy of the store taken then rebuilds its inferences at its first start); a commit that fails after it began leaves the data as it was and the consistency `unknown` until the next commit with reasoning, a rebuild or a restart records it again. The store stays not ready throughout.
 - With reasoning on, `nrese-server load` recomputes the inferences after loading and fails when the ruleset's consistency rules find a violation (under `owl2-dl`, the OWL 2 RL rules: the DL engines' check doesn't run); the data stays loaded. With reasoning disabled it checks nothing.
 
 ## Freshness
