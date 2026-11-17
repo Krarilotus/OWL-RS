@@ -369,8 +369,10 @@ enum Expect {
 /// `owl:unionOf T(SEQ y)` give `EquivalentClasses(:C y)`. So under `owl2-dl` `:x a :C`
 /// follows from `owl:Thing` and from `:x a :D` with a one-member list `( :D )`, and an
 /// instance of an empty union or enumeration is a contradiction, from which
-/// `:x a owl:Nothing` follows. A list reached through `owl:sameAs` is no list the mapping
-/// reads, so nothing about it is certain. Under `owl2-rl` the rules of OWL 2 Profiles §4.3 table 6 (cls-int1, cls-uni) give `:x a :C`
+/// `:x a owl:Nothing` follows; the same holds where the empty intersection is a filler
+/// (`∃:p.owl:Thing ⊑ :C`, or `≤ 0 :p.owl:Thing`, which `:x :p :y` breaks). A list reached
+/// through `owl:sameAs` is no list the mapping reads, so nothing about it is certain. Under
+/// `owl2-rl` the rules of OWL 2 Profiles §4.3 table 6 (cls-int1, cls-uni) give `:x a :C`
 /// for one member and nothing for none; they are sound and incomplete, so where the data
 /// means more, the read must not be told complete.
 #[test]
@@ -378,7 +380,7 @@ fn short_lists_mean_what_the_mapping_says() {
     use Expect::*;
     let declared = ":C a owl:Class . :D a owl:Class .";
     // (name, data, list statements, the question, under owl2-dl, under owl2-rl)
-    let cases: [(&str, &str, u64, &str, Expect, Expect); 7] = [
+    let cases: [(&str, &str, u64, &str, Expect, Expect); 9] = [
         (
             "empty intersection",
             ":C owl:intersectionOf rdf:nil . :x a :D .",
@@ -391,7 +393,7 @@ fn short_lists_mean_what_the_mapping_says() {
             "empty union",
             ":C owl:unionOf rdf:nil . :x a :C .",
             1,
-            ":x a owl:Nothing",
+            ":x a :D",
             Inconsistent,
             NotTold,
         ),
@@ -399,7 +401,7 @@ fn short_lists_mean_what_the_mapping_says() {
             "empty enumeration",
             ":C owl:oneOf rdf:nil . :x a :C .",
             1,
-            ":x a owl:Nothing",
+            ":x a :D",
             Inconsistent,
             NotTold,
         ),
@@ -434,6 +436,27 @@ fn short_lists_mean_what_the_mapping_says() {
             2,
             ":x a :C",
             NotTold,
+            NotTold,
+        ),
+        // Inside another expression: `∃:p.⊤ ⊑ :C`, and `≤ 0 :p.⊤`, which `:x :p :y` breaks.
+        (
+            "empty intersection as a filler",
+            "[ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom \
+             [ a owl:Class ; owl:intersectionOf rdf:nil ] ] \
+             <http://www.w3.org/2000/01/rdf-schema#subClassOf> :C . :x :p :y .",
+            1,
+            ":x a :C",
+            Holds,
+            NotTold,
+        ),
+        (
+            "empty intersection as a qualified maximum's class",
+            ":x a [ a owl:Restriction ; owl:onProperty :p ; owl:maxQualifiedCardinality \
+             \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ; owl:onClass \
+             [ a owl:Class ; owl:intersectionOf rdf:nil ] ] ; :p :y .",
+            1,
+            ":x a :D",
+            Inconsistent,
             NotTold,
         ),
     ];
@@ -486,8 +509,7 @@ fn short_lists_mean_what_the_mapping_says() {
                     let complete = result.completeness.as_ref().is_some_and(|c| c.complete);
                     match expect {
                         Holds => assert!(holds, "told {:?}", result.completeness),
-                        // A rebuild of contradictory data: the verdict says so, or no read
-                        // that leaves out what the contradiction entails is told complete.
+                        // A rebuild of contradictory data: after a read, a verdict says so.
                         Inconsistent => {
                             let verdict = store.dl().status().map(|s| s.consistency.verdict);
                             let said = matches!(
@@ -497,7 +519,7 @@ fn short_lists_mean_what_the_mapping_says() {
                                 .as_ref()
                                 .is_some_and(|v| v.as_str() == "inconsistent");
                             assert!(
-                                said || holds || !complete,
+                                said,
                                 "{:?}, {verdict:?}, {holds}, told {:?}",
                                 store.consistency(),
                                 result.completeness
