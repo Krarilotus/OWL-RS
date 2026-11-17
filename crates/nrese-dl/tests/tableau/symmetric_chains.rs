@@ -23,6 +23,11 @@ const T: ObjProp = ObjProp::Named(204);
 /// `x : ∃p.{b}`, `q(b, z)` and `links`; `r`'s range the class `C`, `C` and `D` disjoint,
 /// and the individual `clash` a `D`; then `rbox`.
 fn ontology(clash: Term, rbox: &[Axiom], links: &[(ObjProp, Term, Term)]) -> Build {
+    premise(false, clash, rbox, links)
+}
+
+/// [`ontology`], with `x : ∀r.C` in place of `r`'s range where `universal`.
+fn premise(universal: bool, clash: Term, rbox: &[Axiom], links: &[(ObjProp, Term, Term)]) -> Build {
     let mut b = Build::default();
     let (c, d) = (b.class(1), b.class(2));
     let only_b = b.e(ClassExpr::OneOf(vec![B]));
@@ -32,7 +37,12 @@ fn ontology(clash: Term, rbox: &[Axiom], links: &[(ObjProp, Term, Term)]) -> Bui
     for &(role, from, to) in links {
         b.role_assertion(role.named(), from, to);
     }
-    b.axiom(Axiom::ObjectPropertyRange(R, c));
+    if universal {
+        let all = b.all(R, c);
+        b.assert(all, X);
+    } else {
+        b.axiom(Axiom::ObjectPropertyRange(R, c));
+    }
     b.disjoint(c, d);
     b.assert(d, clash);
     for axiom in rbox {
@@ -100,10 +110,12 @@ fn a_chain_into_a_role_that_holds_its_pairs_both_ways_gives_both_ends_its_range(
             ),
             Answer::Inconsistent,
         ),
-        // r transitive and symmetric: r(x, z), r(z, x): C(x).
+        // r transitive and symmetric, x : ∀r.C in place of the range: r(x, z), r(z, x), so
+        // r(x, x), which needs both: C(x).
         (
             "transitive and symmetric",
-            ontology(
+            premise(
+                true,
                 X,
                 &[
                     symmetric(R),
