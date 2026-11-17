@@ -174,3 +174,80 @@ fn a_run_announces_what_it_read_whatever_another_run_of_its_query_reads() {
         "a run announced what another read: {wrong:?}"
     );
 }
+
+/// A result's media type, read when its documentation says it is final, announces what
+/// its body announces: for a reader of every graph, from its preparation on; for a reader
+/// of some graphs, from its run's report on (read after preparation it tells nothing of
+/// the store, with a triple term in a graph that reader can't read or in one it can).
+#[test]
+fn a_media_type_read_when_it_is_final_announces_what_the_body_announces() {
+    let term = "<urn:s> <urn:p> <<( <urn:a> <urn:b> <urn:c> )>>";
+    let token = CancellationToken::new();
+    let mut cells = Vec::new();
+    let store = StoreService::new(StoreConfig::in_memory()).expect("store");
+    store
+        .execute_update_str(&format!("INSERT DATA {{ {term} }}"))
+        .expect("the term");
+    let every = SparqlQueryRequest::all("SELECT * WHERE { ?s ?p ?o }");
+    let prepared = store.prepare_query(&every).expect("prepared");
+    let header = prepared.media_type();
+    let mut body = Vec::new();
+    store.run_query(&prepared, &token, &mut body).expect("run");
+    let want = "header 1.2 body 1.2, the term's row";
+    let cell = "a reader of every graph, the media type read after prepare";
+    cells.push((cell.to_owned(), told(header, &body), want));
+    for (graph, where_term, at_report) in [
+        (
+            "urn:g/closed",
+            "only in a graph it can't read",
+            "header none body none, no term",
+        ),
+        (
+            "urn:g/open",
+            "in a graph it reads",
+            "header 1.2 body 1.2, the term's row",
+        ),
+    ] {
+        let store = StoreService::new(StoreConfig::in_memory()).expect("store");
+        let insert = format!("INSERT DATA {{ GRAPH <{graph}> {{ {term} }} }}");
+        store.execute_update_str(&insert).expect("the term");
+        let access = nrese_sparql::GraphAccess {
+            graphs: vec!["urn:g/open".to_owned()],
+            ..nrese_sparql::GraphAccess::default()
+        };
+        let scope = nrese_store::ReadScope::Graphs(std::sync::Arc::new(access));
+        let some = SparqlQueryRequest::new("SELECT * WHERE { GRAPH ?g { ?s ?p ?o } }", scope);
+        let prepared = store.prepare_query(&some).expect("prepared");
+        let after_prepare = prepared.media_type();
+        let (mut header, mut body) = ("", Vec::new());
+        let run = store.run_query_reporting(&prepared, &token, &mut body, |_, _| {
+            header = prepared.media_type();
+            None
+        });
+        run.expect("run");
+        let reader = format!("a reader of some graphs, the term {where_term}");
+        let told_at_report = told(header, &body);
+        let cell = format!("{reader}, the media type read at the report");
+        cells.push((cell, told_at_report, at_report));
+        let after = match after_prepare.contains("version=1.2") {
+            true => "header 1.2",
+            false => "header none",
+        };
+        let cell = format!("{reader}, the media type read after prepare");
+        cells.push((cell, after.to_owned(), "header none"));
+    }
+    let mut wrong = Vec::new();
+    for (cell, got, want) in cells {
+        match got == want {
+            true => println!("CASE {cell}: right {got}"),
+            false => {
+                println!("CASE {cell}: WRONG {got}, want {want}");
+                wrong.push(cell);
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "a media type read when final told otherwise: {wrong:?}"
+    );
+}
