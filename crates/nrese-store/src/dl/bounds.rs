@@ -321,6 +321,25 @@ impl Bounds {
         self.kept
             .get_or_init(|| Arc::new(nrese_exec::Budget::unlimited()))
     }
+
+    /// Whether the commit `tx` keeps the RL route its base is on ([`route_kept`]), by the kinds
+    /// kept at the base's revision; taken under the state, checked without it.
+    pub(crate) fn keeps_route(&self, tx: &Transaction<'_>, lists_left_out: bool) -> bool {
+        let base = tx.base().revision();
+        let kinds = lock(&self.state)
+            .as_ref()
+            .filter(|s| s.revision == base)
+            .and_then(|s| s.kinds.clone());
+        kinds.is_some_and(|kinds| route_kept(&kinds, tx, lists_left_out))
+    }
+}
+
+/// Whether the commit `tx` keeps the RL route `kinds` was decided on: the closure it leaves
+/// leaves out no list axiom, and no asserted change gives a term a new kind ([`Kinds::keep`]).
+fn route_kept(kinds: &Kinds, tx: &Transaction<'_>, lists_left_out: bool) -> bool {
+    !lists_left_out
+        && tx.inserted().all(|q| kinds.keep(tx, quad_triple(q), false))
+        && tx.deleted().all(|q| kinds.keep(tx, quad_triple(q), true))
 }
 
 impl std::fmt::Debug for Bounds {
@@ -437,9 +456,7 @@ pub(crate) fn prepare(
     // On the RL route, a commit that gives no term a new kind leaves what the reader reads,
     // and so the route, as they were; any other is read again below.
     if let Some((Some(kinds), _)) = &current
-        && !lists_left_out
-        && tx.inserted().all(|q| kinds.keep(tx, quad_triple(q), false))
-        && tx.deleted().all(|q| kinds.keep(tx, quad_triple(q), true))
+        && route_kept(kinds, tx, lists_left_out)
     {
         return Preparation {
             base,

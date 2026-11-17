@@ -343,7 +343,10 @@ impl MutationPipeline {
                 // Under `owl2-dl`, where OWL 2 DL may read the data otherwise, the rules'
                 // clash isn't stated as an inconsistency (`WhyUndecided`).
                 let dl = self.store.dl();
-                let undecided = dl.active().then(|| dl.undecided_after(&tx)).flatten();
+                let undecided = dl
+                    .active()
+                    .then(|| dl.undecided_after(&tx, lists_left_out))
+                    .flatten();
                 let full = || {
                     let count = match violations.complete() {
                         true => violations.at_least().to_string(),

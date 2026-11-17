@@ -135,11 +135,17 @@ impl Dl {
         ))
     }
 
-    /// [`Self::undecided`] for the data a commit `tx` leaves.
+    /// [`Self::undecided`] for the data a commit `tx` leaves (`lists_left_out`: whether its
+    /// closure leaves out a list axiom). Where `tx` keeps its base's RL route, no read: the
+    /// kinds the route was decided on prove the rules read the data as OWL 2 DL does.
     pub(crate) fn undecided_after(
         &self,
         tx: &nrese_engine::Transaction<'_>,
+        lists_left_out: bool,
     ) -> Option<WhyUndecided> {
+        if self.bounds.keeps_route(tx, lists_left_out) {
+            return None;
+        }
         why(source::read_pending(
             tx,
             std::sync::Arc::clone(self.bounds.kept()),
