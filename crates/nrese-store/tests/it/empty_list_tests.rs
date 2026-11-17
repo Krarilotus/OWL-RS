@@ -15,8 +15,13 @@ const PREFIXES: &str = "PREFIX : <http://example.com/> \
     PREFIX owl: <http://www.w3.org/2002/07/owl#> \
     PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 
-const INTERSECTIONS: [(&str, &str, u64); 3] = [
+const INTERSECTIONS: [(&str, &str, u64); 4] = [
     ("rdf:nil", ":C owl:intersectionOf rdf:nil . :x a :D .", 1),
+    (
+        "rdf:nil, classes declared",
+        ":C a owl:Class ; owl:intersectionOf rdf:nil . :D a owl:Class . :x a :D .",
+        1,
+    ),
     (
         "sameAs rdf:nil",
         ":C owl:intersectionOf :l . :l owl:sameAs rdf:nil . :x a :D .",
@@ -132,16 +137,29 @@ fn assert_intersection_input(store: &StoreService, data: &str, count: u64) {
     );
 }
 
-fn assert_intersection_answers(store: &StoreService, asserted_type: &str) {
-    assert!(
-        !ask(store, ":x a :C", None),
+/// The answers about `:x a :C`. Under `owl2-dl` an empty intersection written as
+/// `rdf:nil` is `owl:Thing` (OWL 2 Mapping to RDF, Tables 15 and 18), so `:x` is a `:C`;
+/// the reader takes an undeclared `:C` as a class by its use, as it does elsewhere. Reached
+/// through `owl:sameAs` it is no list the mapping reads, and nothing follows. The partial
+/// rules (`owl2-rl`) derive no such type.
+fn assert_intersection_answers(
+    store: &StoreService,
+    mode: ReasoningMode,
+    data: &str,
+    asserted_type: &str,
+) {
+    let thing = mode == ReasoningMode::Owl2Dl && data.contains("owl:intersectionOf rdf:nil");
+    assert_eq!(
+        ask(store, ":x a :C", None),
+        thing,
         "ASK over the empty intersection"
     );
     let result = answer(store, "SELECT ?c { :x a ?c }", None);
     let rows = result["results"]["bindings"].as_array().expect("types");
-    assert!(
+    assert_eq!(
         rows.iter()
-            .all(|row| row["c"]["value"] != "http://example.com/C"),
+            .any(|row| row["c"]["value"] == "http://example.com/C"),
+        thing,
         "{rows:?}"
     );
     assert!(
@@ -152,8 +170,10 @@ fn assert_intersection_answers(store: &StoreService, asserted_type: &str) {
 
 /// Spec: OWL 2 Profiles §4.3 tables 6 and 9 give no grounded `cls-int1` conclusion
 /// for a list with no members. Its partial rules leave the asserted type readable.
-/// OWL 2 Structural Specification §8.1.1 requires at least two intersection operands.
-/// A commit and the following ordinary commit leave the store usable.
+/// OWL 2 Structural Specification §8.1.1 requires at least two intersection operands, and
+/// OWL 2 Mapping to RDF Tables 15 and 18 read an empty intersection list as `owl:Thing`, so
+/// under `owl2-dl` `:x` is a `:C`. A commit and the following ordinary commit leave the
+/// store usable.
 #[test]
 fn an_empty_intersection_can_be_committed() {
     check_cells(|equality, mode, failures| {
@@ -165,7 +185,7 @@ fn an_empty_intersection_can_be_committed() {
                 let writer = pipeline(store, mode);
                 let outcome = insert(&writer, data);
                 assert_intersection_input(writer.store(), data, count);
-                assert_intersection_answers(writer.store(), "http://example.com/D");
+                assert_intersection_answers(writer.store(), mode, data, "http://example.com/D");
                 assert!(
                     matches!(
                         insert(&writer, ":z a :D ."),
@@ -192,14 +212,21 @@ fn an_empty_intersection_can_be_committed() {
             );
             update(&writer, &edit).expect("empty the intersection");
             assert_intersection_input(writer.store(), EMPTY_AFTER_EDIT, 1);
-            assert_intersection_answers(writer.store(), "http://example.com/A");
+            assert_intersection_answers(
+                writer.store(),
+                mode,
+                EMPTY_AFTER_EDIT,
+                "http://example.com/A",
+            );
         });
     });
 }
 
 /// Spec: OWL 2 Profiles §4.3 tables 6 and 9 leave `cls-int1` without a binding
 /// for its subject at zero members, so the partial rules derive no such type on rebuild.
-/// OWL 2 Structural Specification §8.1.1 requires at least two intersection operands.
+/// OWL 2 Structural Specification §8.1.1 requires at least two intersection operands, and
+/// OWL 2 Mapping to RDF Tables 15 and 18 read an empty intersection list as `owl:Thing`, so
+/// under `owl2-dl` `:x` is a `:C`.
 #[test]
 fn an_empty_intersection_can_be_rebuilt_after_reopening() {
     check_cells(|equality, mode, failures| {
@@ -217,13 +244,13 @@ fn an_empty_intersection_can_be_rebuilt_after_reopening() {
                 drop(store);
                 let writer = pipeline(StoreService::new(config()).expect("reopen"), mode);
                 assert_intersection_input(writer.store(), data, count);
-                let _outcome = rebuild(writer.store(), mode);
+                rebuild(writer.store(), mode).expect("rebuilt");
                 let asserted_type = if data == EMPTY_AFTER_EDIT {
                     "http://example.com/A"
                 } else {
                     "http://example.com/D"
                 };
-                assert_intersection_answers(writer.store(), asserted_type);
+                assert_intersection_answers(writer.store(), mode, data, asserted_type);
             });
         }
     });
@@ -317,6 +344,153 @@ fn other_empty_list_rules_keep_their_answers() {
                         assert_eq!(store.consistency(), ConsistencyStatus::Consistent);
                     });
                 }
+            }
+        }
+    });
+}
+
+/// What a short list's question is, under `owl2-dl` by the OWL 2 Mapping to RDF, under
+/// `owl2-rl` by its partial rules.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Expect {
+    /// It holds.
+    Holds,
+    /// The data is inconsistent: a commit is refused, a rebuild reports it.
+    Inconsistent,
+    /// It is not derived, and the read must not be told complete: the data's meaning
+    /// entails it.
+    NotTold,
+}
+
+/// Spec: OWL 2 Mapping to RDF, Section 3.2.4 Table 15 and Section 3.2.5 Table 18, the rows
+/// for OWL 1 DL compatibility: for a class `:C`, `owl:intersectionOf T(SEQ)` gives
+/// `EquivalentClasses(:C owl:Thing)`, `owl:unionOf T(SEQ)` and `owl:oneOf T(SEQ)` give
+/// `EquivalentClasses(:C owl:Nothing)`, and `owl:intersectionOf T(SEQ y)` and
+/// `owl:unionOf T(SEQ y)` give `EquivalentClasses(:C y)`. So under `owl2-dl` `:x a :C`
+/// follows from `owl:Thing` and from `:x a :D` with a one-member list `( :D )`, and an
+/// instance of an empty union or enumeration is a contradiction, from which
+/// `:x a owl:Nothing` follows. A list reached through `owl:sameAs` is no list the mapping
+/// reads, so nothing about it is certain. Under `owl2-rl` the rules of OWL 2 Profiles §4.3 table 6 (cls-int1, cls-uni) give `:x a :C`
+/// for one member and nothing for none; they are sound and incomplete, so where the data
+/// means more, the read must not be told complete.
+#[test]
+fn short_lists_mean_what_the_mapping_says() {
+    use Expect::*;
+    let declared = ":C a owl:Class . :D a owl:Class .";
+    let cases: [(&str, &str, u64, Expect, Expect); 6] = [
+        (
+            "empty intersection",
+            ":C owl:intersectionOf rdf:nil . :x a :D .",
+            1,
+            Holds,
+            NotTold,
+        ),
+        (
+            "empty union",
+            ":C owl:unionOf rdf:nil . :x a :C .",
+            1,
+            Inconsistent,
+            NotTold,
+        ),
+        (
+            "empty enumeration",
+            ":C owl:oneOf rdf:nil . :x a :C .",
+            1,
+            Inconsistent,
+            NotTold,
+        ),
+        (
+            "one-member intersection",
+            ":C owl:intersectionOf ( :D ) . :x a :D .",
+            1,
+            Holds,
+            Holds,
+        ),
+        (
+            "one-member union",
+            ":C owl:unionOf ( :D ) . :x a :D .",
+            1,
+            Holds,
+            Holds,
+        ),
+        (
+            "empty intersection through an alias",
+            ":C owl:intersectionOf :l . :l owl:sameAs rdf:nil . :x a :D .",
+            2,
+            NotTold,
+            NotTold,
+        ),
+    ];
+    let lists = "VALUES ?p { owl:intersectionOf owl:unionOf owl:oneOf owl:sameAs } ?s ?p ?o";
+    check_cells(|equality, mode, failures| {
+        for (name, list, count, dl, rl) in cases {
+            let expect = if mode == ReasoningMode::Owl2Dl {
+                dl
+            } else {
+                rl
+            };
+            // Where `:x a :C` is written, the question is what a contradiction entails.
+            let question = if list.contains(":x a :C .") {
+                ":x a owl:Nothing"
+            } else {
+                ":x a :C"
+            };
+            let data = format!("{declared} {list}");
+            for rebuilt in [false, true] {
+                let path = if rebuilt { "rebuild" } else { "commit" };
+                let label = format!("{path}, {mode:?}, {equality}, {name}");
+                cell(failures, &label, || {
+                    let store = StoreService::new(config(equality, in_memory_store_config()))
+                        .expect("store");
+                    let outcome = if rebuilt {
+                        let off = pipeline(store.clone(), ReasoningMode::Disabled);
+                        insert(&off, &data).expect("written with reasoning off");
+                        let _on = pipeline(store.clone(), mode);
+                        assert_list_input(&store, &data, lists, count);
+                        rebuild(&store, mode)
+                            .map(|_| ())
+                            .map_err(|e| format!("{e:?}"))
+                    } else {
+                        let writer = pipeline(store.clone(), mode);
+                        let outcome = insert(&writer, &data).map(|_| ());
+                        if outcome.is_ok() {
+                            assert_list_input(&store, &data, lists, count);
+                        }
+                        outcome.map_err(|e| format!("{e:?}"))
+                    };
+                    if expect == Inconsistent {
+                        let refused =
+                            !rebuilt && outcome.as_ref().is_err_and(|e| e.contains("Inconsistent"));
+                        let reported = rebuilt
+                            && matches!(
+                                store.consistency(),
+                                ConsistencyStatus::Inconsistent { .. }
+                            );
+                        assert!(
+                            refused || reported,
+                            "{outcome:?}, {:?}",
+                            store.consistency()
+                        );
+                        return;
+                    }
+                    outcome.expect("applied");
+                    let request =
+                        SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ {question} }}"));
+                    let result = store.execute_query(&request).expect("query");
+                    let holds =
+                        serde_json::from_slice::<Value>(&result.payload).expect("JSON")["boolean"]
+                            .as_bool()
+                            .expect("ASK");
+                    let complete = result.completeness.as_ref().is_some_and(|c| c.complete);
+                    match expect {
+                        Holds => assert!(holds, "told {:?}", result.completeness),
+                        _ => assert!(
+                            !holds && !complete,
+                            "{holds}, told {:?}",
+                            result.completeness
+                        ),
+                    }
+                });
             }
         }
     });
