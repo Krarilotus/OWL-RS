@@ -220,9 +220,16 @@ leave something out.
 - Under `owl2-dl`, a large `owl:sameAs` class is proven member by member, which can be slow. At a budget the answer
   is `sound-only` and partial. Proofs per class are planned for v1.6. Raise `dl.timeout` and the `dl.*` budgets.
 - Under `owl2-dl`, a read whose candidates the exact services must each refute (all members of
-  `:H` where `owl:Thing` is a subclass of `:H` or `:K`, say) grows steeply with the store:
-  measured on one machine, about 18 ms at 100 members, 0.3 s at 300 and 10 s at 1,000. The
-  query's timeout bounds it.
+  `:H` where `owl:Thing` is a subclass of `:H` or `:K`, say) grows steeply with the store, as
+  each candidate's test reads every individual: measured on one machine, about 18 ms at 100
+  members, 0.3 s at 300 and 10 s at 1,000. [`dl.max_candidates`](ops/config-reference.md#dl.max_candidates)
+  (1,000) bounds how many are tested, not what each test costs; the rest are left out of the
+  answer, which is `sound-only` and names the setting, as it does at
+  [`dl.timeout`](ops/config-reference.md#dl.timeout) (30 min). On a server the query's timeout
+  ([`budgets.query_timeout`](ops/config-reference.md#budgets.query_timeout), 30 s) comes first:
+  the answer is a `408` with no rows and no status, and nothing in it says that the OWL 2 DL
+  checks took the time or which setting to raise. Raise the query timeout for such a read, or
+  ask `dl-answers=sound`, whose answers skip those checks and are `sound-only`.
 
 ## SHACL
 
