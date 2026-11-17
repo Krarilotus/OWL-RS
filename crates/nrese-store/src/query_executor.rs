@@ -110,9 +110,9 @@ pub struct PreparedQuery {
     /// Whether the results may use RDF 1.2 (triple terms): then they announce
     /// `version=1.2` ([`Self::announce_rdf12`]).
     rdf12: bool,
-    /// Whether what its reader reads holds a triple term, decided by its run on that view
-    /// ([`Self::announce_on`]); shared by its clones, so a transport that keeps one reads
-    /// the run's decision.
+    /// Whether what its reader reads holds a triple term, decided by the first run of the
+    /// query or any of its clones, on that run's reader's view ([`Self::announce_on`]);
+    /// later runs read that decision.
     holds_rdf12: std::sync::Arc<OnceLock<bool>>,
     /// Under `owl2-dl`: which answers this query asks for (`None`: `dl.answers`).
     dl_answers: Option<crate::DlAnswers>,
@@ -260,7 +260,8 @@ impl PreparedQuery {
     }
 
     /// Decides the data's half of the announcement on `view`, the snapshot the run reads
-    /// as its reader reads it: a triple term in a graph the reader reads.
+    /// as its reader reads it: a triple term in a graph the reader reads. Only the first
+    /// run of the query or any of its clones decides; later runs keep that decision.
     pub(crate) fn announce_on(&self, view: &nrese_engine::Snapshot) {
         let access = self.access.as_deref();
         let read = |graph| access.is_none_or(|a| a.allows_id(view, graph));
@@ -268,8 +269,8 @@ impl PreparedQuery {
         self.holds_rdf12.get_or_init(holds);
     }
 
-    /// Whether the results announce RDF 1.2: the query uses it, or its run found a triple
-    /// term in what its reader reads.
+    /// Whether the results announce RDF 1.2: the query uses it, or the first run of the
+    /// query or any of its clones found a triple term in what its reader reads.
     fn announced(&self) -> bool {
         self.rdf12 || self.holds_rdf12.get() == Some(&true)
     }
