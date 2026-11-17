@@ -413,7 +413,7 @@ What changes on purpose:
   them. A commit that adds one is now refused, and a store from the earlier `main` that holds one starts
   in quarantine: `/readyz` answers 503 `quarantined`, and
   `GET /api/v1/repositories/{id}/info` says `inconsistent` with the number of violations.
-  Reads are still answered, `sound-only`, and so are writes. Nothing names the statement,
+  Reads are still answered, never `complete`, and so are writes. Nothing names the statement,
   so look for such
   literals before you upgrade, or after, among the values of properties that have a range,
   and delete them: the store is ready again at once, and stays so across restarts.
