@@ -61,11 +61,12 @@ pub struct DlDetail {
 pub const UNRESOLVED_SHOWN: usize = 20;
 
 /// The DL status of a revision: whether its data is consistent under OWL 2 DL, by which
-/// engine.
+/// engine, and what the reader left out of it (`query::left_out`; `None`: not read).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DlStatus {
     pub revision: u64,
     pub consistency: Checked,
+    pub left_out: Option<Option<String>>,
 }
 
 /// The store's DL state: whether the mode is on, and the latest revision's status.
