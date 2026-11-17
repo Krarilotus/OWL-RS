@@ -271,15 +271,16 @@ fn no_sentence_gives_a_blank_nodes_label() {
 }
 
 /// A blank node's label inside a triple term of the data reaches no sentence: the verdict
-/// over a statement outside the mapping whose object is such a term shows none.
+/// over a statement outside the mapping whose object is such a term, the one part left out,
+/// names the statement and shows no label.
 #[test]
 fn no_sentence_gives_a_blank_nodes_label_inside_a_triple_term() {
     let dl = pipeline();
-    let data = ":C a owl:Class . :D a owl:Class . :R owl:onProperty <<( _:b :p :o )>> ; \
-                owl:someValuesFrom :D . :R rdfs:subClassOf :C .";
+    let data = ":C a owl:Class . :R owl:onProperty <<( _:b :p :o )>> . :R rdfs:subClassOf :C .";
     insert(&dl, data).expect("committed");
     let status = dl.store().dl().status().expect("a verdict");
     let verdict = status.consistency.verdict.reason().unwrap_or_default();
-    let told = verdict.contains("left out; first: ") && !verdict.contains("_:");
+    let named = format!("first: OWL vocabulary outside the mapping: <{EX}R> <{OWL}onProperty> ");
+    let told = verdict.contains(&named) && !verdict.contains("_:");
     assert!(told, "the verdict: {verdict}");
 }
