@@ -571,3 +571,63 @@ fn short_lists_mean_what_the_mapping_says() {
         }
     });
 }
+
+/// Spec: as for [`short_lists_mean_what_the_mapping_says`], an empty intersection is
+/// `owl:Thing` (OWL 2 Mapping to RDF, Tables 15 and 18), so `:x a :C` follows from
+/// `:C owl:intersectionOf rdf:nil`, and from `∃:p.owl:Thing ⊑ :C` with `:x :p :y`. Under
+/// `owl2-ql` the closure's rules name `owl:Thing` itself (OWL 2 Profiles §4.3 table 6,
+/// cls-svf2) and the OWL 2 QL rewriting reads over it: a read that doesn't give it must not
+/// be told complete.
+#[test]
+fn under_owl2_ql_an_empty_intersection_is_not_told_complete() {
+    let declared = ":C a owl:Class . :D a owl:Class .";
+    let cases = [
+        (
+            "empty intersection",
+            ":C owl:intersectionOf rdf:nil . :x a :D .",
+        ),
+        (
+            "empty intersection as a filler",
+            "[ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom \
+             [ a owl:Class ; owl:intersectionOf rdf:nil ] ] \
+             <http://www.w3.org/2000/01/rdf-schema#subClassOf> :C . :x :p :y .",
+        ),
+    ];
+    let mode = ReasoningMode::Owl2Ql;
+    let mut failures = Vec::new();
+    for equality in ["representatives", "replicate", "compact"] {
+        for (name, list) in cases {
+            let data = format!("{declared} {list}");
+            for rebuilt in [false, true] {
+                let path = if rebuilt { "rebuild" } else { "commit" };
+                cell(
+                    &mut failures,
+                    &format!("{path}, {equality}, {name}"),
+                    || {
+                        let store = StoreService::new(config(equality, in_memory_store_config()))
+                            .expect("store");
+                        if rebuilt {
+                            insert(&pipeline(store.clone(), ReasoningMode::Disabled), &data)
+                                .expect("written with reasoning off");
+                            let _on = pipeline(store.clone(), mode);
+                            rebuild(&store, mode).expect("rebuilt");
+                        } else {
+                            insert(&pipeline(store.clone(), mode), &data).expect("applied");
+                        }
+                        assert_list_input(&store, &data, "?s owl:intersectionOf ?o", 1);
+                        let request =
+                            SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ :x a :C }}"));
+                        let result = store.execute_query(&request).expect("query");
+                        let holds = serde_json::from_slice::<Value>(&result.payload).expect("JSON")
+                            ["boolean"]
+                            .as_bool()
+                            .expect("ASK");
+                        let complete = result.completeness.as_ref().is_some_and(|c| c.complete);
+                        assert!(holds || !complete, "told {:?}", result.completeness);
+                    },
+                );
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
