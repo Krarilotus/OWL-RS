@@ -383,3 +383,48 @@ async fn a_repository_answers_within_its_own_query_timeout()
     assert_eq!(response.status(), StatusCode::OK);
     Ok(())
 }
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"; "Consistency": reads work
+/// in quarantine): over a store in quarantine under `owl2-ql`, the QL report EXPLAIN shows for a
+/// read the rewriting answered is never `complete`: inconsistent data entail every answer.
+#[tokio::test]
+async fn explains_ql_report_over_a_store_in_quarantine_is_not_complete()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nrese_reasoner::ReasoningMode;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("data.ttl");
+    std::fs::write(
+        &path,
+        "@prefix : <http://example.com/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+         :A owl:disjointWith :B . :y a :A . :x a :A , :B .\n",
+    )?;
+    // Loaded past the pipeline, as a bulk load does, then reasoned: the clash quarantines it.
+    let store = StoreService::new(StoreConfig::in_memory())?;
+    store.bulk_load(&nrese_store::BulkLoadRequest {
+        files: vec![path],
+        replace: false,
+        graph: nrese_store::GraphTarget::DefaultGraph,
+        invalid: None,
+    })?;
+    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Owl2Ql);
+    store.rematerialise(reasoner.materialised_program().ok_or("setup: no program")?)?;
+    assert!(
+        store.is_quarantined(),
+        "setup: the store isn't in quarantine"
+    );
+    let app = test_app_with_store(store, PolicyConfig::default(), reasoner)?;
+    let query = "PREFIX : <http://example.com/> SELECT ?x { ?x a :A }";
+    let response = app
+        .oneshot(get(&format!(
+            "/dataset/query?query={}&explain=true",
+            encode(query)
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK, "setup: EXPLAIN refused");
+    let explanation: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    let ql = &explanation["ql"];
+    assert!(!ql.is_null(), "setup: no QL report: {explanation}");
+    assert_ne!(ql["completeness"], "complete", "status: {ql}");
+    Ok(())
+}
