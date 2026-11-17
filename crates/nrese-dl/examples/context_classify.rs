@@ -73,6 +73,11 @@ impl Terms for Table {
     fn iri(&self, iri: &str) -> Option<Term> {
         self.ids.get(&format!("<{iri}>")).copied()
     }
+
+    // Not read from the literal's text: the example classifies, it reads no data values.
+    fn datatype(&self, _: Term) -> Option<String> {
+        None
+    }
 }
 
 impl nrese_reasoner::ir::Vocabulary for Table {
