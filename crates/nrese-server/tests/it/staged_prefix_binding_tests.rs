@@ -1,7 +1,12 @@
-use super::{REPO, app, begin, commit, query, send, update};
+use super::{REPO, STATEMENTS, app, begin, commit, query, send, update, upload};
 use axum::Router;
 use axum::http::{Method, StatusCode};
+use nrese_reasoner::ReasonerConfig;
+use nrese_server::{build_app, policy::PolicyConfig};
+use nrese_store::{SearchScope, StoreConfig};
 use serde_json::{Value, json};
+
+use crate::support::test_state_with_store_config;
 
 const NATIVE_REPO: &str = "/api/v1/repositories/nrese";
 const ORIGINAL_NAMESPACE: &str = "http://example.com/a/";
@@ -69,6 +74,88 @@ async fn rdf4j_transaction_preserves_staged_prefix_binding() {
     commit(&app, &location).await;
     let committed = read_predicates(&app, REPO).await;
     assert_staged_binding(&before_rebind, &after_rebind, &committed);
+}
+
+#[tokio::test]
+#[ignore = "Staged updates use the live search scope"]
+async fn staging_context_keeps_the_search_scope_from_staging() {
+    // Spec: A staged WHERE uses the search scope in force at staging. Its first
+    // transaction read and commit keep the global winner after switching to reader scope.
+    let state = test_state_with_store_config(
+        StoreConfig {
+            search_scope: SearchScope::Global,
+            ..StoreConfig::default()
+        },
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let app = build_app(state.clone());
+    // Among the default graph's two matches, the shorter "beta" wins. The named graph
+    // makes beta common in the global corpus, so the rarer "alpha" wins there.
+    let mut data =
+        String::from("<urn:a> <urn:label> \"alpha one two\" . <urn:b> <urn:label> \"beta\" . ");
+    for n in 0..8 {
+        data.push_str(&format!("<urn:f{n}> <urn:label> \"filler {n}\" . "));
+    }
+    data.push_str("<urn:g> { ");
+    for n in 0..60 {
+        data.push_str(&format!("<urn:x{n}> <urn:label> \"beta extra {n}\" . "));
+    }
+    data.push('}');
+    upload(&app, &data).await;
+
+    let prefix = "PREFIX bds: <http://www.bigdata.com/rdf/search#>";
+    let selection = r#"SELECT ?o WHERE { ?o bds:search "alpha beta"; bds:relevance ?score }
+                       ORDER BY DESC(?score) ?o LIMIT 1"#;
+    let control = format!("{prefix} {selection}");
+    let global = json!([{"o":{"type":"literal","value":"alpha one two"}}]);
+    let reader = json!([{"o":{"type":"literal","value":"beta"}}]);
+    assert_eq!(
+        query(&app, REPO, &control).await["results"]["bindings"],
+        global,
+        "global ranking must select the rarer word"
+    );
+    let location = begin(&app).await;
+    update(
+        &app,
+        &format!("{location}?action=UPDATE"),
+        &format!("{prefix} INSERT {{ <urn:winner> <urn:label> ?o }} WHERE {{ {{ {selection} }} }}"),
+    )
+    .await;
+    state.store().set_search_scope(SearchScope::Reader);
+    assert_eq!(
+        query(&app, REPO, &control).await["results"]["bindings"],
+        reader,
+        "reader ranking must select the shorter visible match"
+    );
+
+    let result = "SELECT ?o WHERE { <urn:winner> <urn:label> ?o }";
+    let pending = query(&app, &format!("{location}?action=QUERY"), result).await;
+    commit(&app, &location).await;
+    let committed = query(&app, REPO, result).await;
+    assert_eq!(
+        [
+            &pending["results"]["bindings"],
+            &committed["results"]["bindings"]
+        ],
+        [&global, &global],
+        "first read after the scope change and committed data, in that order"
+    );
+}
+
+#[tokio::test]
+async fn staging_context_one_shot_uses_the_live_namespace() {
+    // Spec: A one-shot update uses the namespace binding in force when it runs.
+    let app = app(false, false);
+    bind_ex(&app, REPO, ORIGINAL_NAMESPACE).await;
+    bind_ex(&app, REPO, REBOUND_NAMESPACE).await;
+    update(&app, STATEMENTS, INSERT).await;
+    assert_eq!(
+        read_predicates(&app, REPO).await,
+        json!([{"p":{"type":"uri","value":"http://example.com/b/p"}}]),
+        "one-shot update after the rebind"
+    );
 }
 
 #[tokio::test]
