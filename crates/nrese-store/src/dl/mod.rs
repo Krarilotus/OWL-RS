@@ -61,7 +61,9 @@ pub struct DlDetail {
 pub const UNRESOLVED_SHOWN: usize = 20;
 
 /// The DL status of a revision: whether its data is consistent under OWL 2 DL, by which
-/// engine, and what the reader left out of it (`query::left_out`; `None`: not read).
+/// engine, and what the reader left out of it (`query::left_out`; `None`: not read). Both
+/// reasons name terms where its commit wrote them, for readers of every graph only; where a
+/// read did, they name none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DlStatus {
     pub revision: u64,
