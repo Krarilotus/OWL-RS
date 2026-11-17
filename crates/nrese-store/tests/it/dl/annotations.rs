@@ -181,30 +181,26 @@ fn a_reader_who_cant_see_the_declaration_is_told_as_without_it() {
     );
 }
 
-/// Spec (OWL 2 Structural Specification §5.8.1: `rdf:type` is reserved vocabulary, no entity;
+/// Spec (OWL 2 Structural Specification §2.4: `rdf:type` is reserved vocabulary, no entity;
 /// Direct Semantics: a class assertion's copy through an equality is entailed; the master's
-/// ruling of 20:49, point 4): with `rdf:type` declared an annotation property beside an
-/// equality, the reader leaves the declaration out, and `?x a :C` isn't told `complete` or
-/// `sound-only` on the strength of the rules' route.
+/// ruling of 21:20): the reader leaves a declaration of a reserved name out
+/// (`leave_out_reserved`), so in the ontology as read `rdf:type` is no annotation property,
+/// and nothing derives from the left-out declaration. Beside an equality, `?x a :C` is told
+/// as on the same data without `rdf:type a owl:AnnotationProperty`, status and reasons alike.
 #[test]
 fn rdf_type_declared_an_annotation_property_is_not_read_as_one() {
-    let dl = pipeline();
-    let data = format!(
-        "{PREFIXES}<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> a owl:AnnotationProperty . \
-         :x a :C . :x owl:sameAs :y ."
-    );
-    crate::support::load_past_the_pipeline(dl.store(), &data);
-    let program = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl).materialised_program();
-    dl.store()
-        .rematerialise(program.expect("the rules"))
-        .expect("rebuilt");
-    let (_, status) = told(dl.store(), "SELECT ?x { ?x a :C }");
-    let class = status.as_str();
-    assert!(
-        class != "complete" && class != "sound-only",
-        "{}",
-        status.header()
-    );
+    let told_on = |declaration: &str| {
+        let dl = pipeline();
+        let data = format!("{PREFIXES}{declaration} :x a :C . :x owl:sameAs :y .");
+        crate::support::load_past_the_pipeline(dl.store(), &data);
+        let program = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl).materialised_program();
+        dl.store()
+            .rematerialise(program.expect("the rules"))
+            .expect("rebuilt");
+        told(dl.store(), "SELECT ?x { ?x a :C }").1.header()
+    };
+    let declared = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> a owl:AnnotationProperty .";
+    assert_eq!(told_on(declared), told_on(""));
 }
 
 /// One case of the outside check's grid: the data, the equality (empty: none), and the reads.
