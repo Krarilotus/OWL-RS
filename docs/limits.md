@@ -186,7 +186,8 @@ leave something out.
 - Under `owl2-dl`, an ontology with a part the reader leaves out is never told consistent:
   every verdict but an inconsistency is `unknown`. Where that part is one the OWL 2 RL rules
   may still read (a reserved name used as a class or individual, OWL's vocabulary outside the
-  mapping's forms, a malformed structure or list, syntax not read yet), every answer is
+  mapping's forms, a malformed structure or list such as `owl:hasKey ()`, a key without a
+  property, syntax not read yet), every answer is
   `unsound` too. The reason gives how many parts were left out and names the first in words,
   with its terms as the data writes them (a blank node by a statement next to it, a triple
   term as `_`; a read that finds the part itself names no term). Only the first is named, and
