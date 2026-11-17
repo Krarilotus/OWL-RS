@@ -268,6 +268,60 @@ fn a_conclusion_reads_shacl_content_as_its_premise_does() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Spec (OWL 2 Direct Semantics: a premise entails a conclusion only if each of the
+/// conclusion's axioms holds in every model of it; SHACL content has no OWL meaning only where
+/// no statement that is neither SHACL content nor an annotation names a SHACL property of the
+/// content, else every statement is read as any other): premise and conclusion read SHACL
+/// content as one store of both would. Where the premise names `sh:path` (a declaration) and
+/// the conclusion states `sh:path`, all of the conclusion's SHACL content is read as any
+/// other, so `:s sh:class :q`, a property assertion the premise doesn't entail, leaves it
+/// unentailed, with the declaration in the conclusion or not; so where the premise reads its
+/// own SHACL content as any other and the conclusion states another SHACL property
+/// (`sh:datatype`). Where the premise names `sh:path` and the conclusion states only
+/// `sh:class`, nothing names `sh:class`: its statement is SHACL content and the conclusion is
+/// entailed.
+#[test]
+fn a_conclusion_reads_shacl_content_as_one_store_with_its_premise() {
+    let sh = |name: &str| format!("<http://www.w3.org/ns/shacl#{name}>");
+    let (path, class, datatype) = (sh("path"), sh("class"), sh("datatype"));
+    let declared = format!("{path} a owl:ObjectProperty .");
+    let rows = [
+        (
+            "declared, the conclusion declaring it too",
+            format!("{declared} :s {path} :q ."),
+            format!("{declared} :s {path} :q . :s {class} :q ."),
+            Entailed::No,
+        ),
+        (
+            "declared",
+            format!("{declared} :s {path} :q ."),
+            format!(":s {path} :q . :s {class} :q ."),
+            Entailed::No,
+        ),
+        (
+            "the premise's content read as any other",
+            format!("{declared} :a {path} :b ."),
+            format!(":s {datatype} :q ."),
+            Entailed::No,
+        ),
+        (
+            "another property declared",
+            declared.clone(),
+            format!(":s {class} :q ."),
+            Entailed::Yes,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, premise, conclusion, want) in rows {
+        let answer = entailed(&premise, &conclusion);
+        eprintln!("{what}: {answer:?}");
+        if answer != want {
+            wrong.push(format!("{what}: {answer:?}, not {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// Spec (OWL 2 Direct Semantics: SHACL content, like an annotation, has no meaning, so an
 /// equality entails no copy of it): on the rules' route, `:s owl:sameAs :t` lets eq-rep-s copy
 /// `:s sh:path :q` to `:t`, which OWL 2 DL doesn't entail. A read that returns `:t`, through the
