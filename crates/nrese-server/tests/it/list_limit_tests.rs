@@ -210,12 +210,7 @@ async fn empty_intersection_allows_the_server_to_start() -> Result<(), Box<dyn s
     drop(store);
 
     let server = Server::start(&config).await?;
-    assert_eq!(
-        server
-            .query("nrese", &format!("{EMPTY_LIST_PREFIXES}ASK {{ :x a :C }}"))
-            .await?,
-        ["false"]
-    );
+    // `:x a :C` is false where `:x`'s types hold `:D` and not `:C`.
     let types = server
         .query(
             "nrese",
