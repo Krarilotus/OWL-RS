@@ -628,15 +628,33 @@ fn an_entailment_check_reads_one_snapshot_while_a_clear_publishes() {
 /// revalidation writes one, the new version's consistency isn't established. `consistency()`
 /// doesn't say `Inconsistent`, and `entails` refuses rather than answer `InconsistentPremise`:
 /// - after the commit's publication, before its revalidation;
-/// - after a revalidation that failed (where its new log segment's directory syncs);
+/// - after a revalidation stopped before its publication (the store's memory can't be read:
+///   it stops, failing closed). A directory-sync fault doesn't reach this revalidation: the
+///   commit kept the closure, so the stack it computes is the one stored, and nothing is written;
 /// - opened from a copy of the directory taken before the revalidation: the marker's old
 ///   inconsistency isn't claimed of the repaired data.
 #[test]
 fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
+    use std::cell::Cell;
+    thread_local! {
+        /// Whether this thread's store can't read its memory, and whether it tried meanwhile.
+        static UNREAD: Cell<(bool, bool)> = const { Cell::new((false, false)) };
+    }
+    fn capacity() -> nrese_exec::memory::Reading {
+        match UNREAD.get() {
+            (true, _) => {
+                UNREAD.set((true, true));
+                Err(nrese_exec::memory::Unread::Failed)
+            }
+            _ => nrese_exec::memory::capacity(),
+        }
+    }
     let mut cells = Cells::default();
     let dir = tempfile::tempdir().expect("dir");
     let data = dir.path().join("store");
-    let store = StoreService::new(StoreConfig::on_disk(&data)).expect("store");
+    let store = StoreService::new(StoreConfig::on_disk(&data))
+        .expect("store")
+        .with_capacity(capacity);
     load(&store, &format!("{DATA} :a a owl:Nothing ."));
     store.rematerialise(Ruleset::Owl2Rl).expect("reasoned");
     let store = Arc::new(store);
@@ -662,11 +680,9 @@ fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
         let consistency = format!("{:?}", reader.consistency());
         let entailed = told(reader.entails(Ruleset::Owl2Rl, &rex_an_animal()));
         let copied = copy_dir(&from, &to);
-        nrese_engine::fault_points::fail_dir_sync_of(Some((
-            &from.join("wal"),
-            std::io::ErrorKind::Other,
-        )));
-        *kept.lock().unwrap() = Some((consistency, entailed, copied));
+        let committed = reader.current_revision();
+        UNREAD.set((true, false));
+        *kept.lock().unwrap() = Some((consistency, entailed, copied, committed));
     })));
     let repaired = rl.apply(
         MutationCommand::Update(SparqlUpdateRequest::new(format!(
@@ -675,13 +691,24 @@ fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
         &Requester::all(),
         &MutationTicket::new(),
     );
-    nrese_engine::fault_points::fail_dir_sync_of(None);
     hooks::BEFORE_REVALIDATION.set(None);
+    // What the store says after the revalidation, read first, with its memory readable.
+    let (_, tried) = UNREAD.get();
+    UNREAD.set((false, false));
+    let after = (
+        format!("{:?}", store.consistency()),
+        told(store.entails(Ruleset::Owl2Rl, &rex_an_animal())),
+    );
+    // The stop was the switch's: the revalidation read the memory while it couldn't, the same
+    // call under the switch stops as a memory stop, and nothing was published meanwhile.
+    UNREAD.set((true, false));
+    let again = store.rematerialise(Ruleset::Owl2Rl);
+    UNREAD.set((false, false));
     let not_inconsistent = |h: &str| !h.starts_with("Inconsistent");
     let refused = |h: &str| h.starts_with("refused");
     let seen = seen.lock().unwrap().take();
     match (repaired, seen) {
-        (Ok(_), Some((consistency, entailed, copied))) => {
+        (Ok(_), Some((consistency, entailed, copied, committed))) => {
             cells.check(
                 "a repair commit before its revalidation | consistency()",
                 &consistency,
@@ -694,23 +721,28 @@ fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
                 refused,
                 "a refusal",
             );
-            // The repaired data is consistent: only a revalidation that succeeded says so.
-            let after = format!("{:?}", store.consistency());
-            if after == "Consistent" {
+            let stopped = tried
+                && matches!(again, Err(crate::StoreError::MemoryUnreadable { .. }))
+                && store.current_revision() == committed;
+            if !stopped {
                 cells.unmet(
-                    "a repair commit after a failed revalidation",
-                    "the revalidation didn't fail",
+                    "a repair commit after a stopped revalidation",
+                    &format!(
+                        "not the switch's stop: read {tried}, again {:?}, at {} after {committed}",
+                        again.map(|_| ()),
+                        store.current_revision()
+                    ),
                 );
             } else {
                 cells.check(
-                    "a repair commit after a failed revalidation | consistency()",
-                    &after,
+                    "a repair commit after a stopped revalidation | consistency()",
+                    &after.0,
                     not_inconsistent,
                     "not Inconsistent",
                 );
                 cells.check(
-                    "a repair commit after a failed revalidation | entails",
-                    &told(store.entails(Ruleset::Owl2Rl, &rex_an_animal())),
+                    "a repair commit after a stopped revalidation | entails",
+                    &after.1,
                     refused,
                     "a refusal",
                 );
