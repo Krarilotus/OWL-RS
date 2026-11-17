@@ -268,6 +268,19 @@ leave something out.
 - The commit gate is off by default, and when it is on, it checks only what a commit introduces
   ([configuration](ops/config-reference.md)). To check data already stored, validate it
   with `GET /dataset/shacl`.
+- A rebuild of the inferences passes no gate: a change of the rules, the rebuild at a start, the
+  one after a load or an import, and one asked for (`POST …/reasoning/rematerialise`) store
+  their inferences without checking them against the shapes, and
+  later commits are checked only for what they introduce. Validate with `GET /dataset/shacl`
+  after one.
+- With no shapes stored, a gate set to `enforce` accepts every write. An upload of shapes that
+  fails (one that runs past its timeout, say) stores none, so check its status and read the
+  shapes graph back.
+- A commit that changes the shapes is checked against the shapes as they are after it: one
+  update that removes the shapes and adds data is checked against none. It needs the right to
+  write the shapes graph.
+- Shapes that don't compile refuse every write, and a validation stopped by its budget fails
+  the write, with the gate set to `report` as to `enforce`.
 
 ## Memory and stopping
 
