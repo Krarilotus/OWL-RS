@@ -47,9 +47,11 @@ pub struct StoreService {
     /// file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
     /// Odd from a commit on a store in quarantine, which keeps no assessment of its
-    /// consistency, until a rematerialisation records one ([`Self::is_quarantined`]); it only
-    /// rises, so two equal readings saw no such commit or recording between them. In memory
-    /// only: that commit removes the marker first, so a reopen rebuilds.
+    /// consistency, until a rematerialisation records one ([`Self::is_quarantined`]); odd
+    /// too from a rematerialisation that finds violations, before it publishes, until it
+    /// records them. It only rises, so two equal readings saw no such commit or recording
+    /// between them. In memory only: that commit removes the marker first, so a reopen
+    /// rebuilds.
     pub(crate) unassessed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Shared by the store's clones: a clone with its own record would never see a commit's mark.
     pub(crate) lists: std::sync::Arc<crate::reasoning::ListsKept>,
@@ -2491,6 +2493,13 @@ impl StoreService {
         // retired pipeline, a cancelled request) changes nothing.
         if stop() {
             return Err(stopped(nrese_reasoner::delta::Interrupted::default()));
+        }
+        // A closure with violations puts the store in quarantine at its publication, before
+        // the state records it: the mark rises first (odd: unassessed), as a commit's in
+        // quarantine does, and the recording below lowers it. A rebuild that fails after this
+        // leaves the store read as in quarantine until the next one records.
+        if violations > 0 {
+            (self.unassessed).fetch_or(1, std::sync::atomic::Ordering::Release);
         }
         // The certificate of the closure about to be replaced goes first, durably: a stop or
         // a failed certificate between the publication and the new certificate must not leave
