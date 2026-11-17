@@ -26,7 +26,11 @@ const SETTLE: Duration = Duration::from_millis(300);
 const PAST_IDLE: Duration = Duration::from_secs(31);
 
 fn replica_with(config: ReplicationConfig) -> AppState {
-    let store = StoreService::new(StoreConfig::in_memory()).expect("store");
+    let store = StoreService::new(StoreConfig {
+        replica: true,
+        ..StoreConfig::in_memory()
+    })
+    .expect("store");
     let state = AppState::new(
         store,
         ReasonerService::new(ReasonerConfig::default()),
