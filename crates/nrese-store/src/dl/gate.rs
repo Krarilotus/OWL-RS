@@ -166,6 +166,7 @@ fn assertion_change(store: &StoreService, tx: &Transaction<'_>) -> Option<HashSe
         Some(DlStatus {
             revision,
             consistency,
+            ..
         }) if revision == before && consistency.verdict == Verdict::Consistent => {}
         _ => return None,
     }
@@ -199,7 +200,10 @@ fn check_with_budget(
     deadline: Deadline,
 ) -> Gate {
     let started = Instant::now();
-    let change = assertion_change(store, tx);
+    // Only where U1's delta found every property's kind kept is the schema the reading gives
+    // as it was, which both of `assertion_change`'s uses assume.
+    let delta = matches!(preparation.prepared, super::bounds::Prepared::Delta(_));
+    let change = delta.then(|| assertion_change(store, tx)).flatten();
     if change.as_ref().is_some_and(HashSet::is_empty) {
         return Gate {
             checked: Checked {
@@ -232,10 +236,11 @@ fn check_with_budget(
             }
         }
     };
+    let ontology = &*preparation.ontology.insert(ontology);
     let budget = operation.remaining(deadline);
     let checked = change
-        .and_then(|touched| consistency::check_after_assertions(&ontology, &touched, &budget))
-        .unwrap_or_else(|| consistency::check(&ontology, &budget));
+        .and_then(|touched| consistency::check_after_assertions(ontology, &touched, &budget))
+        .unwrap_or_else(|| consistency::check(ontology, &budget));
     if checked.verdict != Verdict::Inconsistent {
         return Gate {
             checked,
@@ -248,6 +253,7 @@ fn check_with_budget(
         Some(DlStatus {
             revision,
             consistency,
+            ..
         }) if revision == before => consistency.verdict == Verdict::Inconsistent,
         // Unread, as undecided: not known to have been inconsistent, so rejected.
         _ => source::read_snapshot(tx.base(), memory).is_ok_and(|ontology| {
@@ -261,7 +267,7 @@ fn check_with_budget(
             reject: None,
         };
     }
-    rejection(&ontology, view, then, checked, operation, deadline)
+    rejection(ontology, view, then, checked, operation, deadline)
 }
 
 /// What a restricted committer is told of a rejection ([`crate::mutation::evidence`]),

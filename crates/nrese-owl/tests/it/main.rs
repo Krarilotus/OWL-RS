@@ -187,6 +187,40 @@ fn rendered(ontology: &Ontology, table: &Table) -> Vec<String> {
     lines
 }
 
+/// The ontology of statements in several graphs is that of their union ([`read`]): every
+/// statement of a restriction, a list and a datatype restriction also in a second graph,
+/// the same statement twice, is read as from one graph: the same axioms, no diagnostic.
+#[test]
+fn a_structure_repeated_in_a_second_graph_is_read_as_in_one() {
+    let mut table = Table::default();
+    let once = load(
+        &mut table,
+        "ex:C a owl:Class . ex:D a owl:Class . ex:A a owl:Class . ex:p a owl:ObjectProperty .
+         ex:d a owl:DatatypeProperty .
+         [ a owl:Restriction ; owl:onProperty ex:p ; owl:someValuesFrom ex:D ] rdfs:subClassOf ex:C .
+         ex:A owl:equivalentClass [ a owl:Class ; owl:intersectionOf ( ex:C ex:D ) ] .
+         ex:d rdfs:range [ a rdfs:Datatype ; owl:onDatatype xsd:integer ;
+             owl:withRestrictions ( [ xsd:minInclusive 1 ] ) ] .",
+    );
+    let twice: Vec<Statement> = once
+        .iter()
+        .flat_map(|s| {
+            [0, 1].map(|graph| Statement {
+                triple: s.triple,
+                graph,
+            })
+        })
+        .collect();
+    let (one, two) = (read(&once, &table), read(&twice, &table));
+    let fatal = |o: &Ontology| -> Vec<String> {
+        let fatal = o.diagnostics.iter().filter(|d| d.is_fatal());
+        fatal.map(|d| format!("{d:?}")).collect()
+    };
+    assert!(fatal(&one).is_empty(), "{:?}", one.diagnostics);
+    assert_eq!(rendered(&two, &table), rendered(&one, &table));
+    assert_eq!(fatal(&two), fatal(&one), "{:?}", two.diagnostics);
+}
+
 const SAMPLE: &str = r#"
 ex:Person a owl:Class . ex:Student a owl:Class . ex:Course a owl:Class .
 ex:takes a owl:ObjectProperty . ex:knows a owl:ObjectProperty .

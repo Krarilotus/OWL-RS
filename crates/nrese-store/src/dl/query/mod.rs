@@ -55,9 +55,13 @@ use analysis::*;
 pub(crate) use exact::{Ids, ground_axiom};
 
 /// The ontology of a revision, kept for the exact services of its queries, charged to the
-/// bounds' budget while kept (SYN-61).
+/// bounds' budget while kept (SYN-61); and the mark it gave a committed revision
+/// ([`reads_differently`]), so reads at that revision one after another pass over it once.
 #[derive(Debug, Default)]
-pub(crate) struct OntologyCache(std::sync::Mutex<Option<(u64, KeptOntology)>>);
+pub(crate) struct OntologyCache(
+    std::sync::Mutex<Option<(u64, KeptOntology)>>,
+    std::sync::Mutex<Option<(u64, Option<String>)>>,
+);
 
 impl OntologyCache {
     /// Lets the cache's entry go if it is of a revision below `revision`, so that its charge
@@ -176,6 +180,7 @@ fn consistency_at(
     store.dl().record(DlStatus {
         revision: snapshot.revision(),
         consistency: checked.clone(),
+        left_out: Some(left_out(ontology.value())),
     });
     checked.verdict
 }
@@ -187,6 +192,7 @@ fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> 
         Some(DlStatus {
             revision,
             consistency,
+            ..
         }) if revision == snapshot.revision() => Some(consistency.verdict),
         _ => view.proves_consistency.then_some(Verdict::Consistent),
     }
@@ -434,16 +440,38 @@ const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, 
 /// (OWL 2 DL equates the individuals only; the rules the names too). Off the RL route only,
 /// which both leave (`routed_to_rules` needs neither): what the store's indexes decide
 /// ([`by_index`]), else one read of the ontology `at` ([`ontology_at`], a pending one's of
-/// its own), whose refusal leaves it unknown.
+/// its own), whose refusal leaves it unknown. First [`left_out`], as recorded (pending: the
+/// base's).
 fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
-    let (snapshot, pending) = match at {
+    let (snapshot, pending, proved) = match at {
         Revision::Decided((_, view)) if view.rules => return None,
-        Revision::Decided((snapshot, _)) => (snapshot, false),
-        Revision::Committed(snapshot) => (snapshot, false),
-        Revision::Pending(snapshot, _) => (snapshot, true),
+        Revision::Decided((snapshot, view)) => (snapshot, false, view.proves_consistency),
+        Revision::Committed(snapshot) => (snapshot, false, false),
+        Revision::Pending(snapshot, _) => (snapshot, true, false),
     };
-    if let Some(decided) = by_index(snapshot) {
-        return decided;
+    let status = || {
+        store
+            .dl()
+            .status()
+            .filter(|s| s.revision == snapshot.revision())
+    };
+    let left_out = if proved {
+        Some(None)
+    } else {
+        status().and_then(|s| s.left_out)
+    };
+    match (left_out, by_index(snapshot)) {
+        (Some(Some(why)), _) | (_, Some(Some(why))) => return Some(why),
+        (Some(None), Some(None)) => return None,
+        _ => {}
+    }
+    let marked = &store.dl().query_ontology.1;
+    let marked = || marked.lock().unwrap_or_else(|p| p.into_inner());
+    if !pending
+        && let Some((revision, why)) = &*marked()
+        && *revision == snapshot.revision()
+    {
+        return why.clone();
     }
     #[cfg(test)]
     cancellation_tests::ONTOLOGY_PASSES.set(cancellation_tests::ONTOLOGY_PASSES.get() + 1);
@@ -455,7 +483,11 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
             source::refused("the revision")
         ));
     };
-    by_ontology(snapshot, ontology.value())
+    let why = by_ontology(snapshot, ontology.value());
+    if !pending {
+        *marked() = Some((snapshot.revision(), why.clone()));
+    }
+    why
 }
 
 /// What the store's indexes decide of [`reads_differently`] without the ontology: `Some`
@@ -512,12 +544,23 @@ fn annotation_reason(snapshot: &Snapshot, property: u64) -> String {
     )
 }
 
+/// [`reads_differently`]'s reason where the reader left out what the rules may read.
+pub(crate) fn left_out(ontology: &Ontology) -> Option<String> {
+    let why = consistency::left_out_by(ontology, nrese_owl::Diagnostic::leaves_out)?;
+    Some(format!(
+        "{why}, whose statements the OWL 2 RL rules may still read: {ONLY}, or remove them"
+    ))
+}
+
 /// [`reads_differently`] of `snapshot`'s whole `ontology`.
 fn by_ontology(snapshot: &Snapshot, ontology: &Ontology) -> Option<String> {
     let name = |t: u64| {
         let term = snapshot.decode(TermId::from_raw(t));
         term.map_or_else(|| format!("term {t}"), |term| term.to_string())
     };
+    if let Some(why) = left_out(ontology) {
+        return Some(why);
+    }
     if let Some(&property) = ontology.annotation_schema.first() {
         return Some(annotation_reason(snapshot, property));
     }
