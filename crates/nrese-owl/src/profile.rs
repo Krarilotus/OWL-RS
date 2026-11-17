@@ -879,10 +879,11 @@ pub fn punned(o: &Ontology) -> Vec<Term> {
 
 /// Whether the OWL 2 RL rules may read `o` otherwise than OWL 2 DL does: `o` has
 /// annotation-property axioms ([`Ontology::annotation_schema`]) or puns ([`punned`]), which
-/// theorem PR1 (OWL 2 Profiles §4.3) excludes. The one detection the route, the answers'
-/// status and the consistency verdicts take.
+/// theorem PR1 (OWL 2 Profiles §4.3) excludes, or an empty intersection
+/// ([`Ontology::empty_intersection`]), which they don't read. The one detection the route,
+/// the answers' status and the consistency verdicts take.
 pub fn rules_read_differently(o: &Ontology) -> bool {
-    !o.annotation_schema.is_empty() || !punned(o).is_empty()
+    !o.annotation_schema.is_empty() || !punned(o).is_empty() || o.empty_intersection.is_some()
 }
 
 /// The profiles every axiom of `o` is in.
