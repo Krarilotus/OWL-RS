@@ -269,3 +269,36 @@ const NOTHING_READS: &[&str] = &[
     "rules consistent; read complete",
     "upper-bound consistent; read complete",
 ];
+
+/// An ill-typed literal of a datatype of the map ("abc" isn't in `xsd:integer`'s lexical
+/// space) makes the input not OWL 2 DL (Structural Specification §5.7). OWL 2 RL's rules make
+/// it a clash only where a rule types it (dt-not-type, OWL 2 Profiles §4.3, table 8): alone it
+/// is told `consistent`, under a range the commit is refused. Where a value is read
+/// (`hasValue`), the store leaves the rules' route, and the full check, which has no value for
+/// the literal, tells `unknown`.
+#[test]
+fn an_ill_typed_literal_of_the_maps_datatypes_is_told_as_the_rules_tell_it() {
+    const ILL: &str = r#":a :born "abc"^^xsd:integer ."#;
+    const HAS_VALUE: &str = ":C a owl:Class ; owl:equivalentClass [ a owl:Restriction ; \
+         owl:onProperty :born ; owl:hasValue 5 ] .";
+    let range = ":born rdfs:range xsd:integer .";
+    let cells: Vec<(&str, Vec<&str>, &[&str])> = vec![
+        ("an ill-typed integer nothing reads", vec![DATA, ILL], RULES),
+        (
+            "an ill-typed integer under an integer range",
+            vec![DATA, range, ILL],
+            REFUSED,
+        ),
+        (
+            "an ill-typed integer beside a hasValue",
+            vec![DATA, HAS_VALUE, ILL],
+            NOT_TOLD,
+        ),
+    ];
+    judge(
+        cells
+            .into_iter()
+            .map(|(name, parts, want)| (name, told_after(name, &parts), want))
+            .collect(),
+    );
+}
