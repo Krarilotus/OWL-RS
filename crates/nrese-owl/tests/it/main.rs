@@ -187,6 +187,40 @@ fn rendered(ontology: &Ontology, table: &Table) -> Vec<String> {
     lines
 }
 
+/// The ontology of statements in several graphs is that of their union ([`read`]): every
+/// statement of a restriction, a list and a datatype restriction also in a second graph,
+/// the same statement twice, is read as from one graph: the same axioms, no diagnostic.
+#[test]
+fn a_structure_repeated_in_a_second_graph_is_read_as_in_one() {
+    let mut table = Table::default();
+    let once = load(
+        &mut table,
+        "ex:C a owl:Class . ex:D a owl:Class . ex:A a owl:Class . ex:p a owl:ObjectProperty .
+         ex:d a owl:DatatypeProperty .
+         [ a owl:Restriction ; owl:onProperty ex:p ; owl:someValuesFrom ex:D ] rdfs:subClassOf ex:C .
+         ex:A owl:equivalentClass [ a owl:Class ; owl:intersectionOf ( ex:C ex:D ) ] .
+         ex:d rdfs:range [ a rdfs:Datatype ; owl:onDatatype xsd:integer ;
+             owl:withRestrictions ( [ xsd:minInclusive 1 ] ) ] .",
+    );
+    let twice: Vec<Statement> = once
+        .iter()
+        .flat_map(|s| {
+            [0, 1].map(|graph| Statement {
+                triple: s.triple,
+                graph,
+            })
+        })
+        .collect();
+    let (one, two) = (read(&once, &table), read(&twice, &table));
+    let fatal = |o: &Ontology| -> Vec<String> {
+        let fatal = o.diagnostics.iter().filter(|d| d.is_fatal());
+        fatal.map(|d| format!("{d:?}")).collect()
+    };
+    assert!(fatal(&one).is_empty(), "{:?}", one.diagnostics);
+    assert_eq!(rendered(&two, &table), rendered(&one, &table));
+    assert_eq!(fatal(&two), fatal(&one), "{:?}", two.diagnostics);
+}
+
 const SAMPLE: &str = r#"
 ex:Person a owl:Class . ex:Student a owl:Class . ex:Course a owl:Class .
 ex:takes a owl:ObjectProperty . ex:knows a owl:ObjectProperty .
@@ -664,6 +698,91 @@ fn statements_about_the_ontology_are_annotations() {
         "{:?}",
         ontology.diagnostics
     );
+}
+
+/// OWL 2's built-in annotation properties are declared implicitly (Structural Specification
+/// 5.5 and 5.8, Table 5; 3.6): undeclared, a domain, a range and a super-property of one
+/// are annotation axioms (Mapping to RDF 3.2.5, Table 16), and a property under one matches
+/// no pattern there. Each is read as the property's annotation-property axiom, and no
+/// logical axiom names it.
+#[test]
+fn the_built_in_annotation_properties_schema_is_annotations() {
+    let builtins = [
+        "rdfs:label",
+        "rdfs:comment",
+        "rdfs:seeAlso",
+        "rdfs:isDefinedBy",
+        "owl:versionInfo",
+        "owl:deprecated",
+        "owl:priorVersion",
+        "owl:backwardCompatibleWith",
+        "owl:incompatibleWith",
+    ];
+    let mut wrong = Vec::new();
+    for a in builtins {
+        let iri = a
+            .replace("rdfs:", "http://www.w3.org/2000/01/rdf-schema#")
+            .replace("owl:", "http://www.w3.org/2002/07/owl#");
+        for form in [
+            format!("{a} rdfs:domain ex:C . ex:x {a} ex:v ."),
+            format!("{a} rdfs:range ex:C . ex:x {a} ex:v ."),
+            format!("{a} rdfs:subPropertyOf ex:sup . ex:sup a owl:AnnotationProperty ."),
+            format!("ex:p rdfs:subPropertyOf {a} . ex:x ex:p ex:v ."),
+        ] {
+            let mut table = Table::default();
+            let statements = load(&mut table, &form);
+            let ontology = read(&statements, &table);
+            let lines = rendered(&ontology, &table);
+            let named = lines.iter().any(|l| l.contains(&iri));
+            if ontology.annotation_schema != [table.iri(&iri).unwrap()] || named {
+                wrong.push(format!(
+                    "{form}: {:?}, {lines:?}",
+                    ontology.annotation_schema
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// OWL 1's `owl:OntologyProperty` typing declares an annotation property (*Mapping to RDF
+/// Graphs* §3.1.2, Table 6, which replaces it with `owl:AnnotationProperty`): its domain,
+/// range and sub-properties are annotation axioms (Table 16), as a declared annotation
+/// property's are, also where the name is typed an object property too: no axiom names it
+/// but its declarations.
+#[test]
+fn an_ontology_property_typing_declares_an_annotation_property() {
+    let note = "http://example.com/note";
+    let mut wrong = Vec::new();
+    for typing in [
+        "owl:OntologyProperty",
+        "owl:OntologyProperty, owl:ObjectProperty",
+    ] {
+        for form in [
+            "ex:note rdfs:domain ex:C . ex:x ex:note ex:v .",
+            "ex:note rdfs:range ex:C . ex:x ex:note ex:v .",
+            "ex:note rdfs:subPropertyOf ex:sup . ex:sup a owl:AnnotationProperty .",
+            "ex:p rdfs:subPropertyOf ex:note . ex:x ex:p ex:v .",
+        ] {
+            let data = format!("ex:note a {typing} . {form}");
+            let mut table = Table::default();
+            let statements = load(&mut table, &data);
+            let ontology = read(&statements, &table);
+            let lines = rendered(&ontology, &table);
+            // As the lines name it (`Table::name`).
+            let named = lines
+                .iter()
+                .filter(|l| l.contains("ex:note"))
+                .any(|l| !l.starts_with("Declaration("));
+            if ontology.annotation_schema != [table.iri(note).unwrap()] || named {
+                wrong.push(format!(
+                    "{data}: {:?}, {lines:?}",
+                    ontology.annotation_schema
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// The built-in annotation properties are known to each read by the terms it reads with:

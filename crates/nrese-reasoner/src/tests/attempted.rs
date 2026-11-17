@@ -94,6 +94,7 @@ fn empty_producers(
         rules: &rules,
         lists: None,
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let inferred = batch::materialise(&facts, &rules, None, &schema).derived;
     let ground = crate::delta::program(&MemoryBase::new(&facts, &inferred), compiled);
@@ -316,6 +317,7 @@ fn each_premise_alternative_counts_towards_the_stop() {
         rules: &rules,
         lists: None,
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let inferred = batch::materialise(&facts, &rules, None, &schema).derived;
     let ground = crate::delta::program(&MemoryBase::new(&facts, &inferred), compiled);
@@ -390,6 +392,7 @@ fn a_support_update_s_first_pass_counts_each_fact() {
         rules: &rules,
         lists: None,
         schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let inferred = batch::materialise(&facts, &rules, None, &schema).derived;
     assert_eq!(inferred.len(), n, "a bodiless fact per subclass axiom");

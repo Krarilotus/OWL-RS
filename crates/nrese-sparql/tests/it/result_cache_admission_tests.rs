@@ -114,10 +114,10 @@ fn tsv(view: &impl ReadView, text: &str, options: &QueryOptions) -> Vec<u8> {
 /// written and offered to it.
 fn tsv_through_the_cache(view: &impl ReadView, text: &str, options: &QueryOptions) -> Vec<u8> {
     match cached_output(view, &parse(text), options, TSV, b"") {
-        CachedOutput::Hit(bytes) => bytes.to_vec(),
+        CachedOutput::Hit(bytes, _) => bytes.to_vec(),
         CachedOutput::Miss(slot) => {
             let written = tsv(view, text, options);
-            slot.offer(written.clone(), std::time::Duration::from_millis(1));
+            slot.offer(written.clone(), None, std::time::Duration::from_millis(1));
             written
         }
         CachedOutput::Off => tsv(view, text, options),
@@ -430,7 +430,7 @@ fn an_output_slot_offered_after_a_commit_answers_no_other_revision() {
     let new_bytes = tsv(&new, text, &QueryOptions::default());
     assert_ne!(old_bytes, new_bytes);
     assert_eq!(tsv_through_the_cache(&new, text, &options), new_bytes);
-    old_slot.offer(old_bytes.clone(), std::time::Duration::from_millis(1));
+    old_slot.offer(old_bytes.clone(), None, std::time::Duration::from_millis(1));
     assert_eq!(tsv_through_the_cache(&new, text, &options), new_bytes);
     assert!(matches!(
         cached_output(&old, &parse(text), &options, TSV, b""),
@@ -531,7 +531,7 @@ fn canonical_and_expanded_answers_keep_their_own_bytes_in_both_orders() {
     tx.insert(quad("Rep", "p", "o").as_ref());
     tx.insert_inferred(EncodedTriple::new(alias, same_as, rep));
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     let snapshot = engine.snapshot();
     let text = format!("SELECT ?x WHERE {{ ?x <{EX}p> <{EX}o> }}");
     let reading = |canonical: bool, cache: Option<&Arc<ResultCache>>| QueryOptions {
@@ -591,7 +591,7 @@ fn a_refused_canonical_view_is_never_answered_from_the_expanded_bytes() {
     tx.insert(named.as_ref());
     tx.insert_inferred(EncodedTriple::new(alias, same_as, rep));
     tx.commit().unwrap();
-    engine.transaction().install_reading(Some(same_as));
+    engine.transaction().install(Some(same_as), None);
     engine.set_canonical_view_budget(Arc::new(nrese_exec::Budget::new(1)));
     let snapshot = engine.snapshot();
     let text = format!("SELECT ?x WHERE {{ ?x <{EX}p> <{EX}o> }}");
@@ -604,7 +604,7 @@ fn a_refused_canonical_view_is_never_answered_from_the_expanded_bytes() {
     tsv_through_the_cache(&snapshot, &text, &expanded);
     assert!(matches!(
         cached_output(&snapshot, &parse(&text), &expanded, TSV, b""),
-        CachedOutput::Hit(_)
+        CachedOutput::Hit(..)
     ));
     let canonical = QueryOptions {
         equality_canonical: true,
@@ -617,7 +617,7 @@ fn a_refused_canonical_view_is_never_answered_from_the_expanded_bytes() {
     assert!(
         !matches!(
             cached_output(&snapshot, &parse(&text), &canonical, TSV, b""),
-            CachedOutput::Hit(_)
+            CachedOutput::Hit(..)
         ),
         "a canonical request read the expanded answer's bytes"
     );

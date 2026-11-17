@@ -40,6 +40,7 @@ fn lower_true_ask_evaluates_once_and_delivers_that_result() {
     crate::query_executor::BOUND_EVALUATIONS.with(|n| n.set(0));
     let outcome = answer(
         &store,
+        &store.engine().snapshot(),
         &prepared,
         &CancellationToken::new(),
         &nrese_exec::Envelope::unlimited(),
@@ -68,10 +69,11 @@ fn retained_dl_answers_honor_reporting_cancellation_before_writing() {
     let token = CancellationToken::new();
     let mut reported = false;
     let mut bytes = Vec::new();
-    let result = store.run_query_reporting(&prepared, &token, &mut bytes, |status| {
+    let result = store.run_query_reporting(&prepared, &token, &mut bytes, |status, _| {
         assert!(status.unwrap().complete);
         reported = true;
         token.cancel();
+        None
     });
     assert!(reported);
     assert!(matches!(
@@ -300,6 +302,7 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
         assert!(matches!(
             answer(
                 &store,
+                &store.engine().snapshot(),
                 &prepared,
                 &token,
                 &nrese_exec::Envelope::unlimited(),
@@ -448,8 +451,9 @@ fn decided_then(
         .unwrap();
     let (mut out, mut status) = (Vec::new(), None);
     store
-        .run_query_reporting(&prepared, &CancellationToken::new(), &mut out, |s| {
-            status = s
+        .run_query_reporting(&prepared, &CancellationToken::new(), &mut out, |s, _| {
+            status = s;
+            None
         })
         .unwrap();
     assert!(
@@ -536,7 +540,10 @@ fn a_read_of_the_inferred_statements_alone_keeps_the_mark_of_its_revision() {
         let (mut answer, mut status) = (Vec::new(), None);
         match path {
             "run" => store
-                .run_query_reporting(&prepared, &cancel, &mut answer, |s| status = s)
+                .run_query_reporting(&prepared, &cancel, &mut answer, |s, _| {
+                    status = s;
+                    None
+                })
                 .unwrap(),
             "explain" => {
                 status = store
@@ -560,7 +567,8 @@ fn a_read_of_the_inferred_statements_alone_keeps_the_mark_of_its_revision() {
 }
 
 /// R1-F5: the ontology read the status needs, refused at its budget (nothing cached for the
-/// revision and the bounds' memory spent, between the decision and the status): whether
+/// revision, neither its ontology nor its mark, and the bounds' memory spent, between the
+/// decision and the status): whether
 /// OWL 2 DL reads the data otherwise than the rules isn't known, so the answers are
 /// `unsound` with that reason, and an exact read is refused. The control: the same exact
 /// read with the memory free is answered. The store holds a term equal to another, so the
@@ -582,7 +590,7 @@ fn an_ontology_read_refused_at_its_budget_leaves_the_answers_unsound() {
             &prepared,
             &CancellationToken::new(),
             &mut Vec::new(),
-            |_| (),
+            |_, _| None,
         )
     };
     assert!(run().is_ok(), "the control: {:?}", run().map(|_| ()));
@@ -595,6 +603,8 @@ fn an_ontology_read_refused_at_its_budget_leaves_the_answers_unsound() {
     );
     crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || {
         drop(cache.dl().query_ontology.0.lock().unwrap().take());
+        // Nor the mark the control's read kept for the revision.
+        drop(cache.dl().query_ontology.1.lock().unwrap().take());
         let rest = budget.remaining();
         budget.charge(rest).unwrap();
         held.set(rest);
@@ -662,7 +672,10 @@ fn marks_and_passes(
         let (mut status, cancel) = (None, CancellationToken::new());
         let out = Vec::<u8>::new();
         match inside {
-            false => store.run_query_reporting(&prepared, &cancel, out, |s| status = s),
+            false => store.run_query_reporting(&prepared, &cancel, out, |s, _| {
+                status = s;
+                None
+            }),
             true => store.run_query_pending_reporting(
                 &StatementsRequest::new(vec![StatementOp::Update(SparqlUpdateRequest::new(
                     update.clone(),
@@ -670,7 +683,10 @@ fn marks_and_passes(
                 &prepared,
                 &cancel,
                 out,
-                |s| status = s,
+                |s, _| {
+                    status = s;
+                    None
+                },
             ),
         }
         .unwrap();
@@ -705,6 +721,56 @@ fn a_store_without_annotation_axioms_or_equality_is_marked_without_the_ontology(
     );
 }
 
+/// With the consistency check off, a commit reads no ontology, so its revision has no
+/// record of what the reader left out. Committed reads at that revision (a plan, EXPLAIN,
+/// the inferred statements alone), one after another, are each told the same mark, the
+/// reader's, and their marks pass over the whole ontology at most once between them, not
+/// once per read. (Two that miss at once may each pass; both publish the same mark.)
+#[test]
+fn committed_reads_without_a_record_pass_over_the_ontology_at_most_once() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let value = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#value>";
+    let stores = [
+        ("nothing left out", ":tib :owner :ann .".to_owned(), false),
+        (
+            "a reserved name",
+            format!("{value} rdfs:domain :Pet . :ann {value} :tib ."),
+            true,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, data, left_out) in stores {
+        let config = crate::StoreConfig {
+            dl: crate::DlConfig {
+                consistency: crate::DlConsistency::Off,
+                ..crate::DlConfig::default()
+            },
+            ..crate::StoreConfig::in_memory()
+        };
+        let store = Arc::new(StoreService::new(config).unwrap());
+        let reasoner = ReasonerConfig::for_mode(ReasoningMode::Owl2Dl);
+        let pipeline = crate::MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(reasoner)),
+        );
+        commit(&pipeline, &format!("INSERT DATA {{ {OFF_ROUTE}{data} }}"));
+        commit(&pipeline, "INSERT DATA { :rex a :Pet . }");
+        let snapshot = store.engine().snapshot();
+        let reads: Vec<(bool, usize)> = (0..3)
+            .map(|_| {
+                ONTOLOGY_PASSES.set(0);
+                let told = reads_differently(&store, Revision::Committed(&snapshot));
+                (told.is_some(), ONTOLOGY_PASSES.get())
+            })
+            .collect();
+        let passes: usize = reads.iter().map(|&(_, p)| p).sum();
+        if passes > 1 || reads.iter().any(|&(told, _)| told != left_out) {
+            wrong.push(format!("{name}: (told, passes) {reads:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 const PREF_LABEL: &str = "<http://www.w3.org/2004/02/skos/core#prefLabel>";
 
 /// A store with an annotation-property axiom of each kind (a domain, a range, a
@@ -712,8 +778,8 @@ const PREF_LABEL: &str = "<http://www.w3.org/2004/02/skos/core#prefLabel>";
 /// with two annotation properties that have axioms, and no term equal to another. A read off
 /// the rules route is told the mark the whole ontology gives, naming the property, committed
 /// and inside a transaction, and its mark takes it from the store's indexes, without going
-/// to the whole ontology. A blank node declared an annotation property names none: the store
-/// is told no mark.
+/// to the whole ontology. A blank node declared an annotation property names none: the reader
+/// leaves its axiom out, and the store is told that part left out (the commit's record).
 #[test]
 fn an_annotation_property_axiom_marks_the_read_without_the_ontology() {
     let property = |p: &str| format!("{p} a owl:AnnotationProperty ; ");
@@ -748,10 +814,11 @@ fn an_annotation_property_axiom_marks_the_read_without_the_ontology() {
         eprintln!("{store}: [committed, pending] {reads:?}, the whole ontology {whole:?}");
         let named = |w: &String| {
             let name = |n: &&str| w.starts_with(&format!("{n} has annotation-property axioms"));
-            names.iter().any(name)
+            let left_out = "1 part(s) of the data aren't OWL 2 DL and were left out";
+            names.iter().any(name) || names.is_empty() && w.starts_with(left_out)
         };
         let told: Vec<String> = whole.iter().cloned().collect();
-        let right = whole.as_ref().map_or(names.is_empty(), named)
+        let right = whole.as_ref().is_some_and(named)
             && reads.len() == 2
             && reads.iter().all(|read| *read == (told.clone(), 0));
         if !right {
@@ -807,15 +874,34 @@ impl Draw {
     }
 }
 
+/// A reason without the part left out it names first (`left_out`): the commit's read and a
+/// later one may meet the parts in another order.
+fn first_named(reason: &Option<String>) -> Option<String> {
+    let reason = reason.as_ref()?;
+    Some(
+        match (reason.find("; first: "), reason.find(", whose statements")) {
+            (Some(a), Some(b)) if a < b => format!("{}{}", &reason[..a], &reason[b..]),
+            _ => reason.clone(),
+        },
+    )
+}
+
 /// What the store's indexes decide of the mark is what the whole ontology decides. Random
-/// stores under `owl2-dl`, with and without compact equality: declarations, schema
+/// stores under `owl2-dl`, with and without compact equality: declarations (OWL 1's
+/// `owl:OntologyProperty` among them), schema
 /// statements and blank-node class expressions (whole or broken) on names, on blank nodes and
-/// on the built-in annotation property `rdfs:label`; property assertions with names and
+/// on the nine built-in annotation properties, as subjects and as super-properties; property
+/// assertions with names and
 /// literals (a property's kind flips with its use); `owl:sameAs`, asserted and through
 /// functional properties; over the default and two named graphs. Each is read committed and
 /// with random pending additions and deletions: the mark equals the whole ontology's, reason
-/// for reason. `NRESE_FUZZ_SEED` (default 0) varies the stores; each run prints how often the
-/// indexes decided and how often the whole ontology found each reason.
+/// for reason, but for the parts left out: a committed read is told what the commit recorded
+/// (which must be the whole's), a pending one the base's record; a part left out that no
+/// record tells comes after the indexes' decision. Which part left out a reason names first
+/// follows the read's order, so it isn't compared. And wherever the indexes decide, their
+/// answer is the whole ontology's past what it left out (most random stores leave a part out,
+/// whose reason comes first). `NRESE_FUZZ_SEED` (default 0) varies the stores; each run prints
+/// how often the indexes decided and how often the whole ontology found each reason.
 #[test]
 fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() {
     use crate::{MutationCommand, MutationTicket, Requester, SparqlUpdateRequest};
@@ -834,6 +920,12 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         iri("http://www.w3.org/2004/02/skos/core#", "prefLabel"),
         rdfs("label"),
     ]);
+    // The other eight built-in annotation properties (rdfs:label is a name), as subjects and
+    // as objects (a property's super-property), never declared.
+    let builtins: Vec<NamedNode> = nrese_owl::BUILTIN_ANNOTATIONS[1..]
+        .iter()
+        .map(|i| NamedNode::new_unchecked(*i))
+        .collect();
     let blanks: Vec<BlankNode> = (0..4)
         .map(|i| BlankNode::new_unchecked(format!("x{i}")))
         .collect();
@@ -842,6 +934,7 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         "ObjectProperty",
         "DatatypeProperty",
         "AnnotationProperty",
+        "OntologyProperty",
         "NamedIndividual",
         "Restriction",
         "FunctionalProperty",
@@ -868,6 +961,7 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
     ];
     let mut objects: Vec<Term> = names.iter().cloned().map(Term::from).collect();
     objects.extend(blanks.iter().cloned().map(Term::from));
+    objects.extend(builtins.iter().cloned().map(Term::from));
     objects.extend([
         Literal::new_simple_literal("l").into(),
         rdf("nil").into(),
@@ -880,8 +974,9 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         iri("urn:test:", "g2").into(),
     ];
     let statement = |r: &mut Draw| {
-        let subject: NamedOrBlankNode = match r.below(4) {
+        let subject: NamedOrBlankNode = match r.below(5) {
             0 => r.pick(&blanks).into(),
+            1 => r.pick(&builtins).into(),
             _ => r.pick(&names).into(),
         };
         let (predicate, object): (NamedNode, Term) = match r.below(6) {
@@ -906,8 +1001,10 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
     let mut r = Draw(fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x6d61_726b);
     let (mut wrong, mut refused) = (Vec::new(), 0);
     // By the indexes: a reason, none, the ontology's to decide; by the whole ontology: an
-    // annotation reason, a punning one.
-    let (mut by_indexes, mut found) = ([0usize; 3], [0usize; 2]);
+    // annotation reason, a part left out, a punning one.
+    let (mut by_indexes, mut found) = ([0usize; 3], [0usize; 3]);
+    // Past what the whole ontology left out: an annotation reason, a punning one.
+    let mut past_found = [0usize; 2];
     for case in 0..CASES {
         let compact = r.below(2) == 0;
         let config = crate::StoreConfig {
@@ -960,37 +1057,87 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         let pending = tx.pending_snapshot().unwrap();
         let reads = [
             ("committed", Revision::Committed(&snapshot), &snapshot),
-            ("pending", Revision::Pending(&pending), &pending),
+            ("pending", Revision::Pending(&pending, true), &pending),
         ];
+        // What the commit recorded left out; a committed read checks it against the whole.
+        let record = store
+            .dl()
+            .status()
+            .filter(|s| s.revision == snapshot.revision())
+            .and_then(|s| s.left_out);
         for (of, at, read) in reads {
             let Ok(whole) = read_ontology(&store, read) else {
                 refused += 1;
                 continue;
             };
             let full = by_ontology(read, whole.value());
+            let left = full.as_ref().is_some_and(|f| f.contains("were left out"));
+            let expected = match (of, &record) {
+                // Pending: the base's record, where it has one.
+                ("pending", Some(Some(why))) => Some(why.clone()),
+                ("committed", Some(_)) => full.clone(),
+                // The limit: a part left out that no record tells (a pending addition, a
+                // revision the store didn't check) comes after the indexes' decision.
+                _ if left => match (by_index(read), &record) {
+                    (Some(Some(why)), _) => Some(why),
+                    (Some(None), Some(None)) => None,
+                    _ => full.clone(),
+                },
+                _ => full.clone(),
+            };
             let mark = reads_differently(&store, at);
             by_indexes[match by_index(read) {
                 Some(Some(_)) => 0,
                 Some(None) => 1,
                 None => 2,
             }] += 1;
-            if let Some(reason) = &full {
-                found[usize::from(!reason.contains("annotation-property axioms"))] += 1;
+            // The indexes decide annotation-property axioms and punning, which the whole
+            // ontology tells after what it left out.
+            let mut kept = nrese_owl::Ontology::clone(whole.value());
+            kept.diagnostics.retain(|d| !d.leaves_out());
+            let past = by_ontology(read, &kept);
+            if let Some(reason) = &past {
+                past_found[usize::from(!reason.contains("annotation-property axioms"))] += 1;
             }
-            if mark != full {
+            if let Some(decided) = by_index(read)
+                && decided != past
+            {
                 wrong.push(format!(
-                    "case {case} ({of}, compact equality {compact}): the mark {mark:?}, the \
-                     whole ontology {full:?}\n  committed: {data}\n  pending: + {added:?} \
-                     - {removed:?}"
+                    "case {case} ({of}, compact equality {compact}): the indexes {decided:?}, \
+                     the whole ontology past what it left out {past:?}\n  committed: {data}\n  \
+                     pending: + {added:?} - {removed:?}"
+                ));
+            }
+            if let Some(reason) = &full {
+                found[if reason.contains("annotation-property axioms") {
+                    0
+                } else if left {
+                    1
+                } else {
+                    2
+                }] += 1;
+            }
+            if first_named(&mark) != first_named(&expected) {
+                wrong.push(format!(
+                    "case {case} ({of}, compact equality {compact}): the mark {mark:?}, \
+                     expected {expected:?}, the whole ontology {full:?}\n  committed: \
+                     {data}\n  pending: + {added:?} - {removed:?}"
                 ));
             }
         }
     }
     eprintln!(
         "NRESE_FUZZ_SEED={fuzz}: {CASES} stores, {refused} refused; by the indexes: {} \
-         reasons, {} none, {} to the ontology; by the whole ontology: {} annotation and {} \
-         punning reasons",
-        by_indexes[0], by_indexes[1], by_indexes[2], found[0], found[1]
+         reasons, {} none, {} to the ontology; by the whole ontology: {} annotation, {} \
+         left-out and {} punning reasons; past what it left out: {} annotation and {} punning",
+        by_indexes[0],
+        by_indexes[1],
+        by_indexes[2],
+        found[0],
+        found[1],
+        found[2],
+        past_found[0],
+        past_found[1]
     );
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     assert!(
@@ -1038,9 +1185,10 @@ fn a_question_naming_an_individual_the_data_doesnt_is_not_complete_when_the_onto
     let run = |told: &dyn Fn()| {
         let (mut status, mut out) = (None, Vec::new());
         store
-            .run_query_reporting(&prepared, &CancellationToken::new(), &mut out, |s| {
+            .run_query_reporting(&prepared, &CancellationToken::new(), &mut out, |s, _| {
                 status = s;
                 told();
+                None
             })
             .unwrap();
         (String::from_utf8(out).unwrap(), status.expect("a status"))

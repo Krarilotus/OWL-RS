@@ -2089,6 +2089,10 @@ pub(crate) mod references_read {
     }
 }
 
+/// The most atoms a rule's body, and its conclusion beside a body, may hold: [`Dispatch`]
+/// numbers them by a byte. Longer rules are refused where they are made ([`Rule::fits`]).
+pub const MAX_RULE_ATOMS: usize = 256;
+
 /// Ground rules' atoms indexed by what they can match, so a round only visits the rules
 /// with an atom that can match a fact of the delta (the "dispatch tables" of design §3.2):
 /// `(?x type C)` atoms by `(type, C)`, other constant-predicate atoms by predicate.
@@ -2335,6 +2339,9 @@ pub struct GroundProgram {
     pub rules: Vec<Rule>,
     /// Per rule: the closed family it is an instance of, if any ([`closed_family`]).
     families: Vec<Option<u64>>,
+    /// Per rule: the built-in equality rule it is over `owl:sameAs`, if any, asked once as
+    /// it is filed ([`super::equality_rules`]); one filed by [`Self::add`] is none.
+    pub equality: Vec<Option<&'static str>>,
     /// The relations closed families read and produce by name (`cax-sco`'s `rdf:type`),
     /// each with its family: the family claims the relation's closed part.
     pub family_relations: std::collections::BTreeMap<u64, u64>,
@@ -2378,16 +2385,18 @@ impl std::fmt::Debug for GroundProgram {
 impl GroundProgram {
     /// Files one ground fact rule; returns its index if it is new and has a body.
     pub fn add(&mut self, rule: Rule) -> Option<usize> {
-        self.add_with(rule, Vec::new(), None)
+        self.add_with(rule, Vec::new(), None, None)
     }
 
-    /// [`Self::add`], with the schema facts the instance was grounded on, and the closed
-    /// family it is an instance of, if any ([`closed_family`]).
+    /// [`Self::add`], with the schema facts the instance was grounded on, the closed
+    /// family it is an instance of, if any ([`closed_family`]), and the `owl:sameAs` id its
+    /// equality rule is known by: the rule filed, its tautological heads removed, is asked.
     fn add_with(
         &mut self,
         rule: Rule,
         premises: Vec<Triple>,
         family: Option<u64>,
+        same_as: Option<u64>,
     ) -> Option<usize> {
         if let Some(p) = transitive_predicate(&rule) {
             self.transitive_with(p, premises);
@@ -2419,9 +2428,11 @@ impl GroundProgram {
             if let Head::Facts(heads) = &rule.head {
                 self.heads.push_atoms(self.rules.len(), heads);
             }
+            let equality = same_as.and_then(|id| super::equality_rules::equality_rule(&rule, id));
             self.rules.push(rule);
             self.premises.push(premises);
             self.families.push(family);
+            self.equality.push(equality);
             Some(self.rules.len() - 1)
         }
     }
@@ -2645,7 +2656,7 @@ impl GroundProgram {
                     .chain(extra.iter().copied())
                     .collect();
                 if let Some(rule) = schema.rewrite_heads(g.rule) {
-                    facts.extend(self.add_with(rule, premises, family));
+                    facts.extend(self.add_with(rule, premises, family, Some(schema.same_as())));
                 }
             }
         }

@@ -184,7 +184,7 @@ class DockerStats:
         return self.peak
 
 
-# Memory in use, never cache (the owner's decision, 13 Oct 2026; suitekit/compare.py): a cgroup's
+# Memory in use, never cache (suitekit/compare.py): a cgroup's
 # anonymous and kernel memory. One definition, read by fast.py's scope sampler and by the Docker
 # runtime's container sampler (ContainerMemory).
 KERNEL_PARTS = ("kernel_stack", "pagetables", "sec_pagetables", "percpu", "sock", "vmalloc", "slab")
@@ -365,7 +365,7 @@ def scope_argv(unit: str, memory: str, environ=os.environ, *, interval_s=None, s
     (exit 137, as in a container), not systemd the whole scope, so what runs after it in the
     scope (fast's wrapper) can still read the peak. Under fleet the scope goes into the step's
     slice (FLEET_SLICE), so it counts against what the job declared (14 Oct 2026: a scope beside
-    them, counted nowhere, took Office into a whole-host OOM). The rootfs runtime and fast's
+    them, counted nowhere, took the shared host into a whole-host OOM). The rootfs runtime and fast's
     native runtime share it."""
     # An explicit interval includes both TERM/KILL waits of parent and bound workers.
     parent = environ.get("SUITE_SCOPE_PARENT", "")
@@ -952,7 +952,7 @@ def inside(rootfs: Path, target: str) -> str:
 
 class RootfsRuntime(ProcessRuntime):
     """The systems' Docker images unpacked into directories and run with bubblewrap, for a
-    measure host without Docker (phuoc-yu): every system from the same image as under Docker,
+    measure host without Docker (the timed host): every system from the same image as under Docker,
     on the host's network and kernel, under a systemd scope with the container's memory cap.
     `<rootfs_dir>/<image with / and : as _>/` holds the image's filesystem in `rootfs/` and its
     `docker image inspect` in `config.json` (benches/sparql/images.sh export). The image is

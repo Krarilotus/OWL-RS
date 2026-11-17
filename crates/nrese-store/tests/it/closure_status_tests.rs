@@ -389,7 +389,10 @@ fn owl2_dl_reading_inside_a_transaction_labels_it_unsound() {
             &prepared,
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         )
         .expect("answered");
     assert!(String::from_utf8(out).unwrap().contains("example.com/rex"));
@@ -417,7 +420,10 @@ fn a_read_inside_a_transaction_gives_its_reasons_as_written() {
             &prepared,
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         )
         .expect("answered");
     let reasons: Vec<_> = status
@@ -1620,4 +1626,810 @@ fn owl2_rl_reads_only_the_mappings_spelling_of_a_max_cardinality() {
         }
     }
     assert!(wrong.is_empty(), "spellings read otherwise: {wrong:#?}");
+}
+
+/// The rule sets read a property's domain, range and super-property whatever its typing
+/// (prp-dom, prp-rng, prp-spo1; rdfs2, rdfs3, rdfs7): one typed OWL 1's
+/// `owl:OntologyProperty`, which the OWL 2 mapping reads as an annotation property, has
+/// them in the `owl2-rl`, `owl2-ql` and `rdfs` closures, the rewriting on or off.
+#[test]
+fn the_rule_sets_read_an_ontology_propertys_schema() {
+    let data = ":note a owl:OntologyProperty ; rdfs:domain :C ; rdfs:range :D ; \
+                rdfs:subPropertyOf :q . :x :note :v .";
+    let mut wrong = Vec::new();
+    for (ruleset, ql) in [
+        (Ruleset::Owl2Rl, QlRewritingMode::Auto),
+        (Ruleset::Owl2Rl, QlRewritingMode::On),
+        (Ruleset::Owl2Ql, QlRewritingMode::Auto),
+        (Ruleset::Owl2Ql, QlRewritingMode::Off),
+        (Ruleset::Rdfs, QlRewritingMode::Auto),
+    ] {
+        let store = closure(data, ruleset, ql);
+        let (text, status) = answer(&store, "ASK { :x a :C . :v a :D . :x :q :v }");
+        if !text.contains("true") {
+            wrong.push(format!("{} {ql:?}: {text} {status:?}", ruleset.name()));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// An `owl2-dl` store loaded with `data` and an existential superclass, which is outside
+/// OWL 2 RL: off the RL route.
+fn owl2_dl_off_route(data: &str) -> StoreService {
+    owl2_dl(&format!(
+        "{data} :r a owl:ObjectProperty . :E rdfs:subClassOf \
+         [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :E ] ."
+    ))
+}
+
+/// The stores whose `complete` promises that no certain answer under the OWL 2 Direct
+/// Semantics is missing: `owl2-dl` on and off the RL route, `owl2-ql`, and `owl2-rl` with
+/// the QL rewriting on.
+type Promising = [(&'static str, fn(&str) -> StoreService); 4];
+const PROMISING: Promising = [
+    ("owl2-dl", owl2_dl),
+    ("owl2-dl off the RL route", owl2_dl_off_route),
+    ("owl2-ql", |d| {
+        closure(d, Ruleset::Owl2Ql, QlRewritingMode::Auto)
+    }),
+    ("owl2-rl rewriting on", |d| {
+        closure(d, Ruleset::Owl2Rl, QlRewritingMode::On)
+    }),
+];
+
+/// `:a`'s and `:b`'s value of `:age` is the integer 7, written `"07"` and `7`.
+const SEVEN: &str = ":age a owl:DatatypeProperty . :a :age \"07\"^^xsd:integer . :b :age 7 .";
+
+/// Whether rows (SPARQL JSON results) are the ones OWL 2 gives.
+type Right = fn(&str) -> bool;
+
+/// How many rows `rows` (SPARQL JSON results) binds `var` in.
+fn bound(rows: &str, var: &str) -> usize {
+    rows.matches(&format!("\"{var}\":{{")).count()
+}
+
+/// The shapes that compare data values by term: a join on one (over a declared and an
+/// undeclared property, on a blank node, written or made by a path's sequence, and at the
+/// start of a path with a reversed step, under `+` or in an alternative), and `DISTINCT`,
+/// `GROUP BY` and `COUNT(DISTINCT)` over one (and `DISTINCT` and `GROUP BY` over an alias of
+/// one). Each `(shape, data, read, right)`, `right` holding of the rows OWL 2 gives by value
+/// over [`SEVEN`]: `:a` and `:b` share their value, which is one value.
+const SHAPES: [(&str, &str, &str, Right); 11] = [
+    (
+        "a join",
+        SEVEN,
+        "SELECT ?x ?y { ?x :age ?n . ?y :age ?n FILTER(?x != ?y) }",
+        |rows| rows.contains("example.com/a\""),
+    ),
+    (
+        "a join over an undeclared property",
+        ":a :size \"07\"^^xsd:integer . :b :size 7 .",
+        "SELECT ?x ?y { ?x :size ?n . ?y :size ?n FILTER(?x != ?y) }",
+        |rows| rows.contains("example.com/a\""),
+    ),
+    (
+        "a join on a blank node",
+        SEVEN,
+        "SELECT ?x ?y { ?x :age/^:age ?y FILTER(?x != ?y) }",
+        |rows| rows.contains("example.com/a\""),
+    ),
+    (
+        "a join on a written blank node",
+        SEVEN,
+        "SELECT ?x ?y { ?x :age _:v . ?y :age _:v FILTER(?x != ?y) }",
+        |rows| rows.contains("example.com/a\""),
+    ),
+    (
+        "a join at a reversed path's start",
+        SEVEN,
+        "SELECT ?x ?y { ?n (^:age)+ ?x . ?n (^:age)+ ?y FILTER(?x != ?y) }",
+        |rows| rows.contains("example.com/a\""),
+    ),
+    (
+        "a join at an alternative's reversed start",
+        SEVEN,
+        "SELECT ?x ?y { ?n (^:age|:p) ?x . ?n (^:age|:p) ?y FILTER(?x != ?y) }",
+        |rows| rows.contains("example.com/a\""),
+    ),
+    (
+        "DISTINCT",
+        SEVEN,
+        "SELECT DISTINCT ?n { ?x :age ?n }",
+        |rows| bound(rows, "n") == 1,
+    ),
+    (
+        "GROUP BY",
+        SEVEN,
+        "SELECT ?n (COUNT(?x) AS ?c) { ?x :age ?n } GROUP BY ?n",
+        |rows| bound(rows, "n") == 1,
+    ),
+    (
+        "COUNT(DISTINCT)",
+        SEVEN,
+        "SELECT (COUNT(DISTINCT ?n) AS ?c) { ?x :age ?n }",
+        |rows| rows.contains("\"value\":\"1\""),
+    ),
+    (
+        "DISTINCT over an alias",
+        SEVEN,
+        "SELECT DISTINCT (?n AS ?m) { ?x :age ?n }",
+        |rows| bound(rows, "m") == 1,
+    ),
+    (
+        "GROUP BY an alias",
+        SEVEN,
+        "SELECT ?g (COUNT(?x) AS ?c) { ?x :age ?n } GROUP BY (?n AS ?g)",
+        |rows| bound(rows, "g") == 1,
+    ),
+];
+
+/// Under the OWL 2 Direct Semantics a literal denotes its value, so `"07"` and `7` (one
+/// `xsd:integer`) are one value; the store compares the terms as written. Spec: a join on a
+/// data value, and `DISTINCT`, `GROUP BY` or `COUNT(DISTINCT)` over one, read through a
+/// property that holds a value other than a plain or language-tagged string, isn't
+/// `complete` unless its rows are the ones OWL 2 gives by value, under each regime that
+/// promises `complete`, run and planned.
+#[test]
+fn no_answer_that_compares_data_values_by_term_is_complete_and_wrong() {
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        for (shape, data, read, right) in SHAPES {
+            let (rows, status) = answer(&store(data), read);
+            eprintln!("{regime}, {shape}: {rows} {status:?}");
+            if !right(&rows) && status.contains(&"complete") {
+                wrong.push(format!("{regime}, {shape}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The controls: a property that holds only IRIs, or only strings (one spelling per value),
+/// compares values by term as OWL 2 does, and so does a property beside another that holds a
+/// number. Spec: such a join, `DISTINCT` or `GROUP BY` keeps its rows and `complete`, run
+/// and planned, under each regime that promises it.
+#[test]
+fn comparing_iris_or_strings_by_term_leaves_an_answer_complete() {
+    let knows = ":knows a owl:ObjectProperty . :a :knows :c . :b :knows :c .";
+    let names = ":name a owl:DatatypeProperty . :a :name \"Rex\" . :b :name \"Rex\" , \"Max\"@en .";
+    let beside = ":name a owl:DatatypeProperty . :a :name \"Rex\" ; :age 7 . :b :name \"Rex\" .";
+    let pair = |rows: &str| rows.contains("example.com/a\"") && rows.contains("example.com/b\"");
+    let cases: [(&str, &str, Right); 7] = [
+        (
+            knows,
+            "SELECT ?x ?y { ?x :knows ?z . ?y :knows ?z FILTER(?x != ?y) }",
+            pair,
+        ),
+        (knows, "SELECT DISTINCT ?z { ?x :knows ?z }", |r| {
+            bound(r, "z") == 1
+        }),
+        (
+            knows,
+            "SELECT ?z (COUNT(?x) AS ?c) { ?x :knows ?z } GROUP BY ?z",
+            |r| bound(r, "z") == 1,
+        ),
+        (
+            names,
+            "SELECT ?x ?y { ?x :name ?n . ?y :name ?n FILTER(?x != ?y) }",
+            pair,
+        ),
+        (names, "SELECT DISTINCT ?n { ?x :name ?n }", |r| {
+            bound(r, "n") == 2
+        }),
+        (
+            names,
+            "SELECT ?n (COUNT(?x) AS ?c) { ?x :name ?n } GROUP BY ?n",
+            |r| bound(r, "n") == 2,
+        ),
+        (beside, "SELECT DISTINCT ?n { ?x :name ?n }", |r| {
+            bound(r, "n") == 1
+        }),
+    ];
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        for (data, read, right) in cases {
+            let (rows, status) = answer(&store(data), read);
+            eprintln!("{regime}, {read}: {rows} {status:?}");
+            if !right(&rows) || status != ["complete"; 2] {
+                wrong.push(format!("{regime}, {read}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The controls under `owl2-ql` for properties no ontology declares: one that holds only
+/// IRIs and one that holds only strings. Spec: a join and a `DISTINCT` over either keep
+/// their rows and `complete`, run and planned.
+#[test]
+fn owl2_ql_keeps_complete_over_undeclared_properties_of_iris_or_strings() {
+    let store = |data: &str| closure(data, Ruleset::Owl2Ql, QlRewritingMode::Auto);
+    let pair = |rows: &str| rows.contains("example.com/a\"") && rows.contains("example.com/b\"");
+    let cases: [(&str, &str, Right); 4] = [
+        (
+            ":a :q :c . :b :q :c .",
+            "SELECT ?x ?y { ?x :q ?z . ?y :q ?z FILTER(?x != ?y) }",
+            pair,
+        ),
+        (
+            ":a :q :c . :b :q :c .",
+            "SELECT DISTINCT ?z { ?x :q ?z }",
+            |r| bound(r, "z") == 1,
+        ),
+        (
+            ":a :s \"Rex\" . :b :s \"Rex\" .",
+            "SELECT ?x ?y { ?x :s ?n . ?y :s ?n FILTER(?x != ?y) }",
+            pair,
+        ),
+        (
+            ":a :s \"Rex\" . :b :s \"Rex\" .",
+            "SELECT DISTINCT ?n { ?x :s ?n }",
+            |r| bound(r, "n") == 1,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (data, read, right) in cases {
+        let (rows, status) = answer(&store(data), read);
+        eprintln!("{read}: {rows} {status:?}");
+        if !right(&rows) || status != ["complete"; 2] {
+            wrong.push(format!("{read}: {rows} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A query prepared once and run after each commit: the property it reads holds only
+/// strings, then also `"07"` and `7` (the first values other than strings), then `7` alone,
+/// then strings again. Spec: its `DISTINCT` is `complete` exactly while the property holds
+/// only strings, run and planned: the status follows the snapshot read, not the one the
+/// query was prepared on.
+#[test]
+fn a_prepared_query_is_marked_by_what_its_property_holds_at_each_run() {
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":v a owl:DatatypeProperty . :x :v \"a\" . :y :v \"b\" .",
+    )
+    .expect("data");
+    let store = dl.store();
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}SELECT DISTINCT ?n {{ ?s :v ?n }}"));
+    let prepared = store.prepare_query(&request).expect("prepared");
+    let status = |label: &str| -> [&'static str; 2] {
+        let mut run = None;
+        store
+            .run_query_reporting(&prepared, &CancellationToken::new(), Vec::new(), |s, _| {
+                run = s;
+                None
+            })
+            .expect("ran");
+        let plan = store
+            .plan_query(&prepared, &CancellationToken::new())
+            .expect("planned")
+            .completeness;
+        let name = |c: Option<nrese_sparql::Completeness>| c.map_or("none", |c| c.as_str());
+        let status = [name(run), name(plan)];
+        eprintln!("{label}: {status:?}");
+        status
+    };
+    let mut seen = vec![("strings", status("strings"))];
+    crate::dl::update(&dl, "INSERT DATA { :z :v \"07\"^^xsd:integer . :w :v 7 }").expect("typed");
+    seen.push(("\"07\" and 7", status("\"07\" and 7")));
+    crate::dl::update(&dl, "DELETE DATA { :z :v \"07\"^^xsd:integer }").expect("one left");
+    seen.push(("7", status("7")));
+    crate::dl::update(&dl, "DELETE DATA { :w :v 7 }").expect("strings again");
+    seen.push(("strings again", status("strings again")));
+    let expected = ["complete", "sound-only", "sound-only", "complete"];
+    let wrong: Vec<_> = seen
+        .iter()
+        .zip(expected)
+        .filter(|((_, got), want)| got != &[*want; 2])
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:?}");
+}
+
+/// `"Rex"` stored as a type derived from `xsd:string` and as a plain string: the types share
+/// xsd:string's value space, so OWL 2 takes `"Rex"^^xsd:token` and `"Rex"` as one value.
+const DERIVED: [&str; 2] = [
+    ":s a owl:DatatypeProperty . :a :s \"Rex\"^^xsd:token .",
+    ":s a owl:DatatypeProperty . :a :s \"Rex\"^^xsd:normalizedString .",
+];
+
+/// The reads that match `"Rex"` against `:s`: as a pattern's object, and bound by `VALUES`
+/// or `BIND`.
+const NAMES_REX: [&str; 3] = [
+    "SELECT ?x { ?x :s \"Rex\" }",
+    "SELECT ?x { VALUES ?n { \"Rex\" } ?x :s ?n }",
+    "SELECT ?x { BIND(\"Rex\" AS ?n) ?x :s ?n }",
+];
+
+/// The store matches the plain string as written and misses `:a`'s value spelled with a
+/// derived string type. Spec: each of [`NAMES_REX`] over [`DERIVED`] finds `:a` or isn't
+/// `complete`, run and planned, under each regime that promises `complete`.
+#[test]
+fn a_plain_string_misses_no_derived_string_type_and_says_complete() {
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        let cases: Vec<_> = DERIVED
+            .iter()
+            .flat_map(|data| NAMES_REX.map(|read| (*data, read, &["a"][..])))
+            .collect();
+        for missed in misses_and_says_complete(store, &cases) {
+            wrong.push(format!("{regime}: {missed}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The control: a plain string stored and asked is one term. Spec: each of [`NAMES_REX`]
+/// finds `:a` and stays `complete`, run and planned, under each regime that promises it.
+#[test]
+fn a_plain_string_asked_where_one_is_stored_stays_complete() {
+    let data = ":s a owl:DatatypeProperty . :a :s \"Rex\" .";
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        for read in NAMES_REX {
+            let (rows, status) = answer(&store(data), read);
+            eprintln!("{regime}, {read}: {rows} {status:?}");
+            if !rows.contains("example.com/a\"") || status != ["complete"; 2] {
+                wrong.push(format!("{regime}, {read}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// An aggregate over a data value compared by term gives a wrong number or wrong groups
+/// (`COUNT(DISTINCT)` counts `"07"` and `7` as two values; OWL 2 as one), not only missing
+/// rows. Spec: the `GROUP BY` (of a variable or an alias) and `COUNT(DISTINCT)` shapes of
+/// [`SHAPES`] are `unsound`, run and planned, under each regime that promises `complete`.
+#[test]
+fn an_aggregate_over_data_values_compared_by_term_is_unsound() {
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        for (shape, data, read, _) in SHAPES {
+            if !matches!(shape, "GROUP BY" | "COUNT(DISTINCT)" | "GROUP BY an alias") {
+                continue;
+            }
+            let (rows, status) = answer(&store(data), read);
+            eprintln!("{regime}, {shape}: {rows} {status:?}");
+            if status != ["unsound"; 2] {
+                wrong.push(format!("{regime}, {shape}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Two marks the check makes where no row is wrong, kept as they are: a join of a property
+/// that holds only strings with one that holds a number (no string equals a number), and a
+/// string constant against a property that holds strings and numbers. The check asks per
+/// property whether it holds a value other than a string, not which value meets which.
+/// Spec: under `owl2-dl`, each keeps its rows and is `sound-only`, run and planned.
+#[test]
+fn a_string_beside_a_number_is_sound_only_though_no_row_is_missed() {
+    let cases: [(&str, &str, Right); 2] = [
+        (
+            ":name a owl:DatatypeProperty . :age a owl:DatatypeProperty . \
+             :a :name \"7\" . :b :age 7 .",
+            "SELECT ?x ?y { ?x :name ?v . ?y :age ?v }",
+            |rows| !rows.contains("example.com/"),
+        ),
+        (
+            ":p a owl:DatatypeProperty . :a :p \"Rex\" . :b :p 7 .",
+            "SELECT ?x { ?x :p \"Rex\" }",
+            |rows| rows.contains("example.com/a\"") && !rows.contains("example.com/b\""),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (data, read, right) in cases {
+        let (rows, status) = answer(&owl2_dl(data), read);
+        eprintln!("{read}: {rows} {status:?}");
+        if !right(&rows) || status != ["sound-only"; 2] {
+            wrong.push(format!("{read}: {rows} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The control for a path's start: a path with no reversed step starts at a subject (an IRI
+/// or a blank node, never a data value), so a join there compares no value, though the
+/// store holds a number. Spec: the join keeps its rows and `complete`, run and planned,
+/// under each regime that promises it.
+#[test]
+fn a_join_at_the_start_of_a_path_without_a_reversed_step_stays_complete() {
+    let data = ":knows a owl:ObjectProperty . :c :knows :a , :b . :a :age 7 .";
+    let read = "SELECT ?x ?y { ?z :knows+ ?x . ?z :knows+ ?y FILTER(?x != ?y) }";
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        let (rows, status) = answer(&store(data), read);
+        eprintln!("{regime}: {rows} {status:?}");
+        let pair = rows.contains("example.com/a\"") && rows.contains("example.com/b\"");
+        if !pair || status != ["complete"; 2] {
+            wrong.push(format!("{regime}: {rows} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The control for a negated set with a reversed member: a join at its start compares a data
+/// value, and every route already says no more than `sound-only` there (a negated set reads
+/// the vocabulary OWL 2 entails, and the parser turns `!(^:p)` into a path ending at `?n`).
+/// Spec: the join over [`SEVEN`] isn't `complete`, run and planned, under each regime that
+/// promises `complete`.
+#[test]
+fn a_join_at_a_negated_reversed_sets_start_is_not_complete() {
+    let read = "SELECT ?x ?y { ?n !(^:p) ?x . ?n !(^:p) ?y FILTER(?x != ?y) }";
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        let (rows, status) = answer(&store(SEVEN), read);
+        eprintln!("{regime}: {status:?}");
+        if status.contains(&"complete") {
+            wrong.push(format!("{regime}: {rows} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A sequence inside `+`, `?` or an alternative stays a path, and the path meets two `:age`
+/// edges inside it: `:a (:age/^:age)+ ?y` reaches `:b` through the value `:a` and `:b`
+/// share, written `"07"` and `7` ([`SEVEN`]), or `7.0` and `7` (a decimal and an integer of
+/// one value); the store follows terms. Spec: each read finds `:b` or isn't `complete`, and
+/// its count is 1 or `unsound`, run and planned, under each regime that promises `complete`.
+#[test]
+fn a_join_inside_a_path_compares_data_values() {
+    let data = [
+        ("\"07\" and 7", SEVEN),
+        (
+            "7.0 and 7",
+            ":age a owl:DatatypeProperty . :a :age 7.0 . :b :age 7 .",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        for (values, data) in data {
+            let store = store(data);
+            for path in ["(:age/^:age)+", "(:age/^:age)?", "(:age/^:age|:p)"] {
+                let rows = format!("SELECT ?y {{ :a {path} ?y FILTER(?y != :a) }}");
+                let (rows, status) = answer(&store, &rows);
+                eprintln!("{regime}, {path} over {values}: {rows} {status:?}");
+                if !rows.contains("example.com/b\"") && status.contains(&"complete") {
+                    wrong.push(format!("{regime}, {path} over {values}: {rows} {status:?}"));
+                }
+                let count = format!("SELECT (COUNT(?y) AS ?c) {{ :a {path} ?y FILTER(?y != :a) }}");
+                let (rows, status) = answer(&store, &count);
+                eprintln!("{regime}, its count over {values}: {rows} {status:?}");
+                if !rows.contains("\"value\":\"1\"") && status != ["unsound"; 2] {
+                    wrong.push(format!(
+                        "{regime}, {path}'s count over {values}: {rows} {status:?}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A `DISTINCT` in a subquery whose variable the outer query projects away: over [`SEVEN`]
+/// it keeps `"07"` and `7`, one value to OWL 2, as two rows. Spec: an outer `COUNT(*)` over
+/// it is 1 or `unsound`, and an outer join with it returns `:a` and `:b` once each or isn't
+/// `complete`, run and planned, under each regime that promises `complete`.
+#[test]
+fn a_subquerys_distinct_over_data_values_is_judged_by_its_own_projection() {
+    let count = "SELECT (COUNT(*) AS ?c) { { SELECT DISTINCT ?n { ?x :age ?n } } }";
+    let join = "SELECT ?x { { SELECT DISTINCT ?n { ?y :age ?n } } ?x :age ?m }";
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        let store = store(SEVEN);
+        let (rows, status) = answer(&store, count);
+        eprintln!("{regime}, the count: {rows} {status:?}");
+        if !rows.contains("\"value\":\"1\"") && status != ["unsound"; 2] {
+            wrong.push(format!("{regime}, the count: {rows} {status:?}"));
+        }
+        let (rows, status) = answer(&store, join);
+        eprintln!("{regime}, the join: {rows} {status:?}");
+        if bound(&rows, "x") != 2 && status.contains(&"complete") {
+            wrong.push(format!("{regime}, the join: {rows} {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A path over a property that holds only IRIs ends at an IRI, though another property
+/// holds a number: no data value is compared. Spec: a `DISTINCT` and a `COUNT(DISTINCT)`
+/// over its end keep their rows and `complete`, run and planned, under each regime that
+/// promises it.
+#[test]
+fn a_paths_end_over_iris_stays_complete_beside_a_number() {
+    let data = ":knows a owl:ObjectProperty . :a :knows :b . :b :knows :c . :z :age 7 .";
+    let cases: [(&str, Right); 2] = [
+        ("SELECT DISTINCT ?y { ?x :knows+ ?y }", |r| {
+            bound(r, "y") == 2
+        }),
+        ("SELECT (COUNT(DISTINCT ?y) AS ?c) { :a :knows+ ?y }", |r| {
+            r.contains("\"value\":\"2\"")
+        }),
+    ];
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        let store = store(data);
+        for (read, right) in cases {
+            let (rows, status) = answer(&store, read);
+            eprintln!("{regime}, {read}: {rows} {status:?}");
+            if !right(&rows) || status != ["complete"; 2] {
+                wrong.push(format!("{regime}, {read}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A path that can match zero steps (`*`, `?`, or an alternative with one) pairs every term
+/// of the graph with itself, data values included, whatever its predicates hold: over
+/// [`SEVEN`], `?x :knows* ?y` binds `?x` and `?y` to `"07"` and to `7`, one value to OWL 2.
+/// Spec: a `DISTINCT` over either end doesn't return both or isn't `complete`, run and
+/// planned, under each regime that promises `complete`.
+#[test]
+fn a_zero_length_paths_ends_can_be_data_values() {
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        let store = store(SEVEN);
+        for read in [
+            "SELECT DISTINCT ?x { ?x :knows* ?y }",
+            "SELECT DISTINCT ?x { ?x (:knows|:p?) ?y }",
+            "SELECT DISTINCT ?y { ?x :knows* ?y }",
+        ] {
+            let (rows, status) = answer(&store, read);
+            eprintln!("{regime}, {read}: {rows} {status:?}");
+            let both = rows.contains("\"value\":\"07\"") && rows.contains("\"value\":\"7\"");
+            if both && status.contains(&"complete") {
+                wrong.push(format!("{regime}, {read}: {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A reader of the default graph and `:open`, with the inferences their graphs support, and
+/// not of `:secret`, under `owl2-ql` and `owl2-rl` with the rewriting on: whether `:p` holds
+/// a number in `:secret` is hidden from them. Spec: their rows and their entire assessment
+/// (status and every reason, of the run, its header, its QL report and the plan, a prepared
+/// query run twice included) are the same with and without `:z :p 7` in `:secret`.
+#[test]
+fn a_readers_status_doesnt_follow_what_they_cant_read() {
+    use std::sync::Arc;
+
+    use nrese_sparql::{Completeness, GraphAccess};
+    use nrese_store::{ReadScope, SparqlUpdateRequest};
+
+    use crate::support::Writes;
+
+    let said = |c: Option<&Completeness>| {
+        c.map_or("none".to_owned(), |c| {
+            let reasons: Vec<_> = c.reasons.iter().map(ToString::to_string).collect();
+            format!("{} {reasons:?}", c.header())
+        })
+    };
+    let seen = |ruleset: Ruleset, ql: QlRewritingMode, secret: &str| {
+        let store = StoreService::new(StoreConfig {
+            ql_rewriting: ql,
+            ..StoreConfig::in_memory()
+        })
+        .unwrap();
+        let update = format!(
+            "{PREFIXES}INSERT DATA {{ :p a owl:DatatypeProperty . GRAPH :open {{ :a :p \"Rex\" }} \
+             GRAPH :secret {{ :y :p \"Max\" {secret} }} }}"
+        );
+        store
+            .execute_update(&SparqlUpdateRequest::new(update))
+            .unwrap();
+        store.rematerialise(ruleset).unwrap();
+        store.use_reasoning_rules(Some(ruleset.into()));
+        let scope = ReadScope::Graphs(Arc::new(GraphAccess {
+            graphs: vec!["http://example.com/open".to_owned()],
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: true,
+            ..GraphAccess::default()
+        }));
+        let read = format!("{PREFIXES}SELECT DISTINCT ?n {{ GRAPH :open {{ ?s :p ?n }} }}");
+        let request = SparqlQueryRequest::new(read, scope);
+        let result = store.execute_query(&request).expect("answered");
+        let mut seen = vec![
+            String::from_utf8(result.payload).unwrap(),
+            said(result.completeness.as_ref()),
+            said(result.ql.as_ref().map(|r| &r.completeness)),
+        ];
+        let prepared = store.prepare_query(&request).expect("prepared");
+        for _ in 0..2 {
+            let (mut run, mut rows) = (None, Vec::new());
+            store
+                .run_query_reporting(&prepared, &CancellationToken::new(), &mut rows, |s, _| {
+                    run = s;
+                    None
+                })
+                .expect("ran");
+            let plan = store
+                .plan_query(&prepared, &CancellationToken::new())
+                .expect("planned");
+            seen.push(String::from_utf8(rows).unwrap());
+            seen.push(said(run.as_ref()));
+            seen.push(said(plan.completeness.as_ref()));
+        }
+        seen
+    };
+    let mut wrong = Vec::new();
+    for (regime, ruleset, ql) in [
+        ("owl2-ql", Ruleset::Owl2Ql, QlRewritingMode::Auto),
+        ("owl2-rl rewriting on", Ruleset::Owl2Rl, QlRewritingMode::On),
+    ] {
+        let (hidden, without) = (seen(ruleset, ql, ". :z :p 7"), seen(ruleset, ql, ""));
+        eprintln!("{regime}, without: {without:#?}\n{regime}, with: {hidden:#?}");
+        if hidden != without {
+            wrong.push(format!("{regime}: without {without:#?}, with {hidden:#?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// OWL 2 defines neither triple terms nor base directions (RDF 1.2), so its regimes can't say
+/// what a complete answer that uses one is: `<<( :s :age "07"^^xsd:integer )>>` is the stored
+/// `<<( :s :age 7 )>>` if the value counts and isn't if the spelling does (RDF 1.2 Semantics
+/// §5, §7.1), and a variable inside one joins by either. Spec: under each regime that promises
+/// `complete`, run and planned, no answer is `complete` to a query with a triple term (a typed
+/// or plain constant inside it, bound by `VALUES`, or a variable inside it joined outside) or
+/// a base-direction literal, over a store with no triple term; or to a reader of everything
+/// over a store that holds one, reached only through a variable.
+#[test]
+fn no_query_with_a_triple_term_is_complete_under_owl_2() {
+    let plain = ":age a owl:DatatypeProperty . :y :age \"07\"^^xsd:integer . :a :name \"Rex\" .";
+    let holds = ":a :says <<( :s :age 7 )>> . :b :says <<( :s :age \"07\"^^xsd:integer )>> .";
+    let typed = "<<( :s :age \"07\"^^xsd:integer )>>";
+    let cases = [
+        (
+            plain,
+            "a typed constant",
+            format!("SELECT ?x {{ ?x :says {typed} }}"),
+        ),
+        (
+            plain,
+            "a typed constant bound by VALUES",
+            format!("SELECT ?x {{ VALUES ?t {{ {typed} }} ?x :says ?t }}"),
+        ),
+        (
+            plain,
+            "a variable joined outside",
+            "SELECT ?x ?y { ?x :says <<( :s :age ?n )>> . ?y :age ?n }".to_owned(),
+        ),
+        (
+            plain,
+            "a plain string, which OWL 2 doesn't define inside a triple term either",
+            "SELECT ?x { ?x :says <<( :s :name \"Rex\" )>> }".to_owned(),
+        ),
+        (
+            plain,
+            "a base-direction literal",
+            "SELECT ?x { ?x :name \"Rex\"@ar--rtl }".to_owned(),
+        ),
+        (
+            holds,
+            "a triple term reached through a variable",
+            "SELECT DISTINCT ?t { ?x :says ?t }".to_owned(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (regime, store) in PROMISING {
+        for (data, case, read) in &cases {
+            let (rows, status) = answer(&store(data), read);
+            eprintln!("{regime}, {case}: {rows} {status:?}");
+            if status.contains(&"complete") {
+                wrong.push(format!("{regime}, {case}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A reader of `:open` (and of the default graph, or not), with the inferences their graphs
+/// support, under `owl2-ql` and `owl2-rl` with the rewriting on. A triple term in a graph
+/// the reader can't read takes no part in their answers, so it has no say in their status.
+/// Spec: the status is `complete` (run and planned, rows kept) where no graph they read holds
+/// a triple term: none in the store, one only in a hidden named graph, one only in the
+/// default graph when they can't read it; and not `complete` where one they read does: in
+/// `:open`, in the default graph they read, or inferred where they see it (`rdfs:subPropertyOf`
+/// copies the object, so `:claims` holds the triple term).
+#[test]
+fn a_readers_status_follows_the_triple_terms_they_may_read() {
+    use std::sync::Arc;
+
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, SparqlUpdateRequest};
+
+    use crate::support::Writes;
+
+    let fact = "GRAPH :open { :a :p \"Rex\" }";
+    let term = ":b :says <<( :s :age 7 )>>";
+    let read = "SELECT ?x ?n { GRAPH :open { ?x :p ?n } }";
+    let cases = [
+        (true, "no triple term anywhere", fact.to_owned(), read, true),
+        (
+            true,
+            "a triple term only in a graph they can't read",
+            format!("{fact} GRAPH :secret {{ {term} }}"),
+            read,
+            true,
+        ),
+        (
+            false,
+            "a triple term only in the default graph, which they can't read",
+            format!("{fact} {term}"),
+            read,
+            true,
+        ),
+        (
+            true,
+            "a triple term in a graph they read",
+            format!("GRAPH :open {{ :a :p \"Rex\" . {term} }}"),
+            read,
+            false,
+        ),
+        (
+            true,
+            "a triple term in the default graph they read",
+            format!("{fact} {term}"),
+            read,
+            false,
+        ),
+        (
+            true,
+            "an inferred triple term they see",
+            format!("GRAPH :open {{ :says rdfs:subPropertyOf :claims . {term} }}"),
+            "SELECT ?x ?t { ?x :claims ?t }",
+            false,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (regime, ruleset, ql) in [
+        ("owl2-ql", Ruleset::Owl2Ql, QlRewritingMode::Auto),
+        ("owl2-rl rewriting on", Ruleset::Owl2Rl, QlRewritingMode::On),
+    ] {
+        for (default_graph, case, data, read, complete) in &cases {
+            let store = StoreService::new(StoreConfig {
+                ql_rewriting: ql,
+                ..StoreConfig::in_memory()
+            })
+            .unwrap();
+            let update = format!("{PREFIXES}INSERT DATA {{ :p a owl:DatatypeProperty . {data} }}");
+            store
+                .execute_update(&SparqlUpdateRequest::new(update))
+                .unwrap();
+            store.rematerialise(ruleset).unwrap();
+            store.use_reasoning_rules(Some(ruleset.into()));
+            let scope = ReadScope::Graphs(Arc::new(GraphAccess {
+                graphs: vec!["http://example.com/open".to_owned()],
+                default_graph: *default_graph,
+                inferred: true,
+                inferred_by_support: true,
+                ..GraphAccess::default()
+            }));
+            let request = SparqlQueryRequest::new(format!("{PREFIXES}{read}"), scope);
+            let result = store.execute_query(&request).expect("answered");
+            let prepared = store.prepare_query(&request).expect("prepared");
+            let planned = store
+                .plan_query(&prepared, &CancellationToken::new())
+                .expect("planned");
+            let status = [result.completeness, planned.completeness]
+                .map(|c| c.map_or("none", |c| c.as_str()));
+            let rows = String::from_utf8(result.payload).unwrap();
+            eprintln!("{regime}, {case}: {rows} {status:?}");
+            let kept = rows.contains("example.com/a\"") || rows.contains("example.com/b\"");
+            let right = match complete {
+                true => status == ["complete"; 2],
+                false => !status.contains(&"complete"),
+            };
+            if !kept || !right {
+                wrong.push(format!("{regime}, {case}: {rows} {status:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

@@ -1,5 +1,5 @@
 # The release gate's measurement per case (fast.py --measure; benches/PROTOCOL.md §5, "Noise").
-# Written by `release_gate.py calibrate`, not by hand: 5 passes on Phuoc-Yu (pass-1-base.json, pass-2-main.json ...).
+# Written by `release_gate.py calibrate`, not by hand: 5 passes on the timed host (pass-1-base.json, pass-2-main.json ...).
 # runs, warmup, batch: the perf lab's a process; repeat: the DL tool's files a process; passes: a side
 # (round 0), for 90% power against a 2% loss at the case's noise (the largest
 # sd of log pass medians of its series where that loss exceeds the resolution); power: at those passes;

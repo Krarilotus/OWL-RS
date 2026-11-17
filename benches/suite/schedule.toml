@@ -1,4 +1,4 @@
-# The order the benchmark families are measured in (the owner, 12 Oct 2026): what completes
+# The order the benchmark families are measured in: what completes
 # the suite this week first, in this order; then the backlog; last the families not
 # expected to give data for polishing or optimisation. Every workload of workloads.toml is
 # in exactly one list, and so is every catalogued benchmark without a workload yet
@@ -59,7 +59,7 @@ backlog = [
   "sspe",
   "doop",
   "galen",
-  # reasoning, the owner's backlog of 12 Oct 2026
+  # reasoning, the backlog of 12 Oct 2026
   "reactome-uniprot",
   "chasebench",
   "uobm",

@@ -258,12 +258,15 @@ fn an_upper_bound_with_classes_derives_nothing_from_graphs_the_reader_cannot_rea
 
 /// The reader's own graph `open` and what a graph it can't read, `secret`, may hold: an
 /// annotation property's domain (a reason to mark L's answers under `owl2-dl`), another one
-/// by another name, or nothing.
+/// by another name, nothing, or an axiom the ontology reader leaves out (the reserved
+/// `rdf:value` with a domain, another reason, naming its term).
 const OPEN: &str = "GRAPH :open { :x a :Public . :Public rdfs:subClassOf :Known }";
-const HIDDEN: [&str; 3] = [
+const HIDDEN: [&str; 4] = [
     "GRAPH :secret { :privateNote a owl:AnnotationProperty ; rdfs:domain :PrivateClass }",
     "GRAPH :secret { :otherNote a owl:AnnotationProperty ; rdfs:domain :OtherClass }",
     "",
+    "GRAPH :secret { <http://www.w3.org/1999/02/22-rdf-syntax-ns#value> rdfs:domain \
+     :PrivateClass . :privateItem <http://www.w3.org/1999/02/22-rdf-syntax-ns#value> :v }",
 ];
 
 /// What `reader` is told of `q`, one line per path: the run, the exact run, EXPLAIN, the
@@ -286,7 +289,10 @@ fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<
             &prepare(q, mode),
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         );
         format!("{} {status:?} {:?}", rows(out), result.err())
     };
@@ -303,7 +309,10 @@ fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<
             &prepare(q, mode),
             &CancellationToken::new(),
             &mut out,
-            |s| status = s,
+            |s, _| {
+                status = s;
+                None
+            },
         );
         format!("{} {status:?} {:?}", rows(out), result.err())
     };
@@ -328,8 +337,9 @@ fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<
 }
 
 /// R1-F1: what a reader of some graphs is told doesn't depend on a graph it can't read.
-/// Three stores alike in `open`: the hidden graph holds an annotation property's domain,
-/// another under another name, or nothing. The reader of `open` is told the same rows, the
+/// Four stores alike in `open`: the hidden graph holds an annotation property's domain,
+/// another under another name, nothing, or an axiom the reader leaves out. The reader of
+/// `open` is told the same rows, the
 /// same status and the same refusal on every path, whatever the hidden graph holds.
 #[test]
 fn a_hidden_graph_changes_nothing_a_reader_of_some_graphs_is_told() {
@@ -351,6 +361,10 @@ fn a_hidden_graph_changes_nothing_a_reader_of_some_graphs_is_told() {
     assert_eq!(
         told[0], told[2],
         "the hidden graph's hazard reaches the reader"
+    );
+    assert_eq!(
+        told[0], told[3],
+        "the hidden graph's left-out axiom reaches the reader"
     );
 }
 

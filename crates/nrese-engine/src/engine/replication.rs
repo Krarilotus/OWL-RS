@@ -76,6 +76,9 @@ pub struct LogBatch {
     pub last: u64,
     /// The primary's latest revision when the batch was read.
     pub latest: u64,
+    /// That version's reading ([`Engine::equality`]): `Some` where its rows are stored over
+    /// representatives. For the server to read; no frame or header carries it.
+    pub equality: Option<crate::TermId>,
 }
 
 impl LogBatch {
@@ -120,10 +123,13 @@ impl Engine {
     /// that the log releasing or archiving one meanwhile doesn't take it away.
     pub fn log_since(&self, after: u64, max_bytes: usize) -> EngineResult<LogBatch> {
         let shared = &self.inner.shared;
-        let latest = shared.versions.load().revision;
+        // The reading from the same load: the version the batch stops at.
+        let version = shared.versions.load();
+        let latest = version.revision;
         let mut batch = LogBatch {
             last: after,
             latest,
+            equality: version.reading,
             ..LogBatch::default()
         };
         if after >= latest {
@@ -351,7 +357,16 @@ impl Engine {
                     .any(|t| t.predicate == same_as)
         });
         self.inner
-            .publish_record(record, false, None, dictionary_len, regroup, same_as, None)
+            .publish_record(
+                record,
+                false,
+                None,
+                dictionary_len,
+                regroup,
+                same_as,
+                None,
+                None,
+            )
             .map(|_| ())
     }
 }
@@ -809,6 +824,7 @@ mod tests {
                 asserted_content: current.asserted_content,
                 canonical: Default::default(),
                 own: Default::default(),
+                certificate: None,
             });
         let mut records = decoded(&batch.frames);
         records.truncate(2);

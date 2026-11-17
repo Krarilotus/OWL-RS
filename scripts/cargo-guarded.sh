@@ -124,7 +124,7 @@ export_target_cpu_rustflags
 # script's own process joins a job object with that limit before cargo starts, so every
 # child inherits it and a runaway test fails its allocation instead of taking the machine
 # (one committed 128 GB on a 64 GB PC on 3 October 2026). Elsewhere it isn't enforced
-# yet: the office runs go through containers with their own limits.
+# yet: the shared host's runs go through containers with their own limits.
 #
 # The job is named after this process (memory-cap.ps1), capped or not, and listed for the main
 # PC's guard (~/owlrs-guard/jobs): a process of this build the guard stops is named with the job,
@@ -143,14 +143,14 @@ if [ -r "/proc/$$/winpid" ] && command -v powershell >/dev/null 2>&1; then
   registry=""
   [ -d "$GUARD_DIR" ] && registry=$(cygpath -w "$GUARD_DIR/jobs")
   # memory-cap.ps1's program, compiled once per version of it into Windows' temporary directory,
-  # Git Bash's /tmp: no PowerShell at every build (Sol, 20 Oct 2026: seconds per call).
+  # Git Bash's /tmp: no PowerShell at every build (seconds per call).
   read -r winpid < "/proc/$$/winpid"
   read -r sum _ < <(sha256sum "$ROOT/scripts/lib/memory-cap.ps1")
   cap_exe="/tmp/nrese-memory-cap/memory-cap-${sum:0:12}.exe"
   by_powershell=(powershell -NoProfile -ExecutionPolicy Bypass -File "$(cygpath -w "$ROOT/scripts/lib/memory-cap.ps1")"
     -ProcessId "$winpid" -LimitGB "${NRESE_MEMORY_CAP_GB:-0}" ${registry:+-Registry "$registry"})
   # The cached program, else memory-cap.ps1 (which builds it); a cached one that fails is built
-  # again, once (Sol, 20 Oct 2026: a corrupt one would otherwise be trusted at every build).
+  # again, once (a corrupt one would otherwise be trusted at every build).
   again=()
   [ -x "$cap_exe" ] && again=(-Rebuild)
   if { [ -x "$cap_exe" ] && JOB=$("$cap_exe" "$winpid" "${NRESE_MEMORY_CAP_GB:-0}" ${registry:+"$registry"}); } \
@@ -178,7 +178,7 @@ if [ -z "$jobs_given" ]; then
   export CARGO_BUILD_JOBS=$(( jobs > 2 ? jobs : 2 ))
 fi
 
-# Admission, one queue per machine (the main PC's guard stopped 47 of our processes at its hard
+# Admission, one queue per machine (the development machine's guard stopped 47 of our processes at its hard
 # line between 12:17 and 12:33 on 20 Oct 2026: builds started whatever the memory). A cargo run
 # starts only when
 # - no run that came before it could start now (first come, first served, across every worktree
@@ -193,7 +193,7 @@ fi
 #   disk), and the wait says so. Never its PowerShell: a text match can't tell which assignment
 #   runs (Sol, review-build-admission-r5..r7; the orchestrator, IB0612-8d33).
 #   (Its soft line, 16 GB, was the floor before: the agents' own load
-#   keeps the main PC at 12-16 GB free, so no hook on a merged base could start, 20 Oct 2026.)
+#   keeps the development machine at 12-16 GB free, so no hook on a merged base could start, 20 Oct 2026.)
 # The guard's BUSY (~/owlrs-guard/BUSY, NRESE_GUARD_BUSY: below its soft line) holds no run whose
 # peak fits above the floor; the agents' own load keeps it set for hours. The guard's other kill
 # line, free disk on C:, holds every run: none starts below that line plus 10 GB
@@ -423,7 +423,7 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
   fi
 fi
 
-# The main PC's guard stops our processes below its hard line, and tells it in
+# The development machine's guard stops our processes below its hard line, and tells it in
 # ~/owlrs-guard/killed.log (NRESE_GUARD_KILLED): before a stop, its intent, `<unix s>
 # KILLED-BY-GUARD <pid> <name> <pid>@<created> jobs=<job>,...` (the listed build jobs the process
 # is in); after it, `<unix s> GUARD-STOPPED <pid>@<created>`, or `GUARD-STOP-FAILED` when it
@@ -462,7 +462,7 @@ killed="${NRESE_GUARD_KILLED:-$HOME/owlrs-guard/killed.log}"
 if [ "$code" -ne 0 ] && { [ -f "$killed" ] || [ -f "$BUSY" ]; }; then
   # A deadline by a clock that only moves forward (/proc/uptime, in hundredths of a second: Linux's
   # and Git Bash's alike), checked after every look at the notices, the first included: what is
-  # first seen after it doesn't count, however late a look ran (Sol, 20 Oct 2026).
+  # first seen after it doesn't count, however late a look ran.
   uptime_cs() {
     local up
     read -r up _ < /proc/uptime

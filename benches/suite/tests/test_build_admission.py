@@ -2,7 +2,7 @@
 memory peak fits above the floor, never building anyway, and for no earlier run that can't start
 itself; its wait is bounded, terminal or not; a request that can never fit is refused at once; a
 dead holder is reclaimed by its identity; and a run says
-it was stopped by the main PC's guard only when the guard stopped a process of its own build.
+it was stopped by the development machine's guard only when the guard stopped a process of its own build.
 Sol's round-1 probes (Harness/notes/review-build-admission-r1-20261020/probe.py) are here with
 the behaviour they asked for.
 
@@ -155,7 +155,7 @@ class Admission(unittest.TestCase):
         return int((self.out / f"{run}.ended").read_text())
 
     def test_a_build_that_fits_above_the_floor_runs_though_the_machine_is_busy(self):
-        # The orchestrator, 20 Oct 2026: BUSY stayed set for hours under the agents' own load. 12 GB
+        # BUSY stayed set for hours under the agents' own load. 12 GB
         # free, the default 8 GB floor: room for a 3 GB peak, not for a 5 GB one.
         (self.guard / "BUSY").write_text("12.0 GB RAM, 394 GB disk free")
         self.free(12)

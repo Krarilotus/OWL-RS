@@ -876,6 +876,11 @@ impl Snapshot {
             reading: self.version.reading,
             canonical: Default::default(),
             own: Default::default(),
+            // A restriction or a derivation: the source's, as it is published as its source
+            // is. An addition: statements no one vouched for.
+            certificate: (!matches!(of, ViewOf::Addition))
+                .then(|| self.version.certificate.clone())
+                .flatten(),
         });
         let canonical_data = self.canonical_view(&version);
         Snapshot {
@@ -1359,6 +1364,12 @@ impl Snapshot {
         self.version.revision
     }
 
+    /// What was vouched for its version ([`super::Certificate`]). A pending or private
+    /// snapshot carries its base's: it is unpublished ([`Self::shared_state`]).
+    pub fn certificate(&self) -> Option<&super::Certificate> {
+        self.version.certificate.as_ref()
+    }
+
     /// What its asserted statements are ([`super::AssertedIdentity`]): shared across the
     /// views of one asserted stack, so a cache keyed by it must not depend on the view's
     /// scope or equality mode; a transaction's pending state has its own.
@@ -1739,9 +1750,14 @@ impl Snapshot {
         self.columns_of_stacks(model, &plan, permutation, components, budget)
     }
 
-    /// Whether a statement read in `model` has a triple term (RDF 1.2): triple terms are
-    /// objects only and their ids one range, so this is one seek in the object-first index.
-    pub fn holds_triple_terms(&self, model: ReadModel) -> bool {
+    /// Whether a statement read in `model` in a graph `graph` admits has a triple term (RDF
+    /// 1.2): triple terms are objects only and their ids one range, so this is one seek in
+    /// the object-first index, and a walk over the triple terms of the graphs it doesn't admit.
+    pub fn holds_triple_terms(
+        &self,
+        model: ReadModel,
+        mut graph: impl FnMut(TermId) -> bool,
+    ) -> bool {
         let (low, high) = TermId::kind_range(crate::TermKind::Triple);
         self.scan_range_in(
             model,
@@ -1750,7 +1766,33 @@ impl Snapshot {
             low,
             high,
         )
-        .is_some_and(|mut quads| quads.next().is_some())
+        .is_some_and(|mut quads| quads.any(|quad| graph(quad.graph)))
+    }
+
+    /// Whether a statement read in `model` with `predicate` (any, where `None`) has an object
+    /// literal other than a plain or language-tagged string: an inline number, boolean, date
+    /// or dateTime, or one in the dictionary (any other datatype, and every non-canonical
+    /// spelling). Those kinds' ids are three ranges, so this is up to three seeks in the
+    /// predicate-first index (object-first without a predicate); `true` where the index can't
+    /// answer by range. Canonical numbers count though each has one spelling: an integer `7`
+    /// and a decimal `7.0` are one value with two ids, so no finer test (non-canonical
+    /// spellings only) would do.
+    pub fn holds_typed_literals(&self, model: ReadModel, predicate: Option<TermId>) -> bool {
+        use crate::TermKind::{DateTime, DerivedInteger, Integer, TypedLiteral};
+        let mut pattern = QuadPattern::all();
+        pattern.predicate = predicate;
+        let index = predicate.map_or(Permutation::Ospg, |_| Permutation::Posg);
+        [
+            (Integer, DateTime),
+            (TypedLiteral, TypedLiteral),
+            (DerivedInteger, DerivedInteger),
+        ]
+        .into_iter()
+        .any(|(first, last)| {
+            let (low, high) = (TermId::kind_range(first).0, TermId::kind_range(last).1);
+            let quads = self.scan_range_in(model, &pattern, index, low, high);
+            quads.is_none_or(|mut quads| quads.next().is_some())
+        })
     }
 
     /// Exact number of quads [`scan_range_in`](Self::scan_range_in) yields.
@@ -2943,7 +2985,7 @@ mod canonical_lifetime_tests {
                 object: rep,
             });
             tx.commit().unwrap();
-            engine.transaction().install_reading(Some(same_as));
+            engine.transaction().install(Some(same_as), None);
             let snapshot = engine.snapshot();
             let canonical = snapshot.with_canonical_equality();
             assert!(!canonical.triple_terms_name_aliases());
@@ -3039,7 +3081,7 @@ mod count_visiting_tests {
             tx.remove(statement(i).as_ref());
         }
         tx.commit().unwrap();
-        engine.transaction().install_reading(Some(same_as));
+        engine.transaction().install(Some(same_as), None);
         let snapshot = engine.snapshot();
         let p = snapshot.lookup(ex("p").as_ref().into()).unwrap();
         let pattern = QuadPattern {

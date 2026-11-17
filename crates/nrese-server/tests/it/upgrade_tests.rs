@@ -319,6 +319,38 @@ impl Server {
         Ok(sorted(&text))
     }
 
+    /// [`Self::query`]'s TSV results, and the status header its answer carries
+    /// (`nrese-completeness`; `None` without one).
+    pub(super) async fn query_status(
+        &self,
+        repo: &str,
+        query: &str,
+    ) -> Result<(Vec<String>, Option<String>), Box<dyn std::error::Error>> {
+        let response = self
+            .http
+            .post(format!("{}/api/v1/repositories/{repo}/query", self.url))
+            .bearer_auth(TOKEN)
+            .header("Accept", "text/tab-separated-values")
+            .form(&[("query", query)])
+            .send()
+            .await
+            .map_err(|error| self.failed(&format!("{repo}: {query}: {error}")))?;
+        let status = response.status();
+        let header = response
+            .headers()
+            .get("nrese-completeness")
+            .and_then(|value| value.to_str().ok())
+            .map(str::to_owned);
+        let text = response
+            .text()
+            .await
+            .map_err(|error| self.failed(&format!("{repo}: {query}: {error}")))?;
+        if !status.is_success() {
+            return Err(self.failed(&format!("{repo}: {query}: {status} {text}")));
+        }
+        Ok((sorted(&text), header))
+    }
+
     /// `PUT`s or `PATCH`es (`method`) the JSON `body` to `path`: fails unless it succeeds.
     pub(super) async fn send(
         &self,
