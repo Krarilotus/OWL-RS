@@ -3,14 +3,16 @@
 //! one (loaded with reasoning off, as a store main wrote may) started with reasoning on.
 
 use std::process::Command;
+use std::sync::Arc;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use nrese_reasoner::{ReasonerConfig, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_server::policy::PolicyConfig;
+use nrese_store::{MutationPipeline, ReadModel, SparqlQueryRequest, StoreConfig, StoreService};
 use tower::util::ServiceExt;
 
-use crate::support::{body_text, test_app_with_settings};
+use crate::support::{body_text, test_app_with_settings, test_app_with_store};
 use crate::upgrade_tests::{Server, configure};
 
 const EX: &str = "http://example.com/";
@@ -149,6 +151,138 @@ async fn a_store_holding_such_a_key_starts_with_reasoning_on()
     // `configure` runs `owl2-rl`; `start` waits for /readyz to answer 200.
     let server = Server::start(&config).await?;
     drop(server);
+    Ok(())
+}
+
+const EMPTY_LIST_PREFIXES: &str = "PREFIX : <http://example.com/> \
+    PREFIX owl: <http://www.w3.org/2002/07/owl#> \
+    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
+
+fn assert_empty_list_input(
+    store: &StoreService,
+    data: &str,
+    count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let asserted = |query: &str| {
+        let mut request = SparqlQueryRequest::all(format!("{EMPTY_LIST_PREFIXES}{query}"));
+        request.read_model = Some(ReadModel::Asserted);
+        store.execute_query(&request)
+    };
+    let rows = asserted("SELECT ?o { { :C owl:intersectionOf ?o } UNION { :l owl:sameAs ?o } }")?;
+    let response: serde_json::Value = serde_json::from_slice(&rows.payload)?;
+    assert_eq!(
+        response["results"]["bindings"]
+            .as_array()
+            .expect("rows")
+            .len(),
+        count,
+        "asserted list statements"
+    );
+    let held = asserted(&format!("ASK {{ {data} }}"))?;
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&held.payload)?["boolean"],
+        true
+    );
+    Ok(())
+}
+
+/// Spec: the partial rules of OWL 2 Profiles §4.3 tables 6 and 9 derive no
+/// `cls-int1` membership at zero members, where its subject has no binding.
+/// OWL 2 Structural Specification §8.1.1 requires at least two operands.
+/// A server rebuilding the closure starts and serves those answers.
+#[tokio::test]
+async fn empty_intersection_allows_the_server_to_start() -> Result<(), Box<dyn std::error::Error>> {
+    const DATA: &str = ":C owl:intersectionOf rdf:nil . :x a :D .";
+    let dir = tempfile::tempdir()?;
+    let data_dir = dir.path().join("data");
+    let config = configure(dir.path(), &data_dir)?;
+    let file = dir.path().join("intersection.ttl");
+    std::fs::write(&file, format!("{EMPTY_LIST_PREFIXES}{DATA}"))?;
+    let output = load(&config, &["--set", "reasoner.mode=disabled"], &file)?;
+    assert!(
+        output.status.success(),
+        "unreasoned load: {}:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let store = StoreService::new(StoreConfig::on_disk(&data_dir))?;
+    assert_empty_list_input(&store, DATA, 1)?;
+    drop(store);
+
+    let server = Server::start(&config).await?;
+    assert_eq!(
+        server
+            .query("nrese", &format!("{EMPTY_LIST_PREFIXES}ASK {{ :x a :C }}"))
+            .await?,
+        ["false"]
+    );
+    let types = server
+        .query(
+            "nrese",
+            &format!("{EMPTY_LIST_PREFIXES}SELECT ?c {{ :x a ?c }}"),
+        )
+        .await?;
+    assert!(
+        types.iter().any(|row| row == "<http://example.com/D>"),
+        "{types:?}"
+    );
+    assert!(
+        types.iter().all(|row| row != "<http://example.com/C>"),
+        "{types:?}"
+    );
+    Ok(())
+}
+
+/// Spec: OWL 2 Profiles §4.3 tables 6 and 9 supply no subject binding for
+/// `cls-int1` on an empty list, including one reached by equality. These partial
+/// rules derive no membership, and OWL 2 Structural Specification §8.1.1
+/// requires at least two operands. The admin rebuild succeeds with those answers.
+#[tokio::test]
+async fn empty_intersection_allows_admin_rematerialisation()
+-> Result<(), Box<dyn std::error::Error>> {
+    const DATA: &str = ":C owl:intersectionOf :l . :l owl:sameAs rdf:nil . :x a :D .";
+    let store = StoreService::new(StoreConfig::in_memory())?;
+    let writer = MutationPipeline::new(
+        Arc::new(store.clone()),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Disabled,
+        ))),
+    );
+    writer.execute_update_str(&format!("{EMPTY_LIST_PREFIXES}INSERT DATA {{ {DATA} }}"))?;
+    assert_empty_list_input(&store, DATA, 2)?;
+    let app = test_app_with_store(
+        store.clone(),
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+    )?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/repositories/nrese/reasoning/rematerialise")
+                .method(Method::POST)
+                .body(Body::empty())?,
+        )
+        .await?;
+    let status = response.status();
+    let body = body_text(response).await?;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    let answer = |query| store.execute_query_str(&format!("{EMPTY_LIST_PREFIXES}{query}"));
+    let ask: serde_json::Value = serde_json::from_slice(&answer("ASK { :x a :C }")?.payload)?;
+    assert_eq!(ask["boolean"], false);
+    let select: serde_json::Value =
+        serde_json::from_slice(&answer("SELECT ?c { :x a ?c }")?.payload)?;
+    let rows = select["results"]["bindings"].as_array().expect("types");
+    assert!(
+        rows.iter()
+            .any(|row| row["c"]["value"] == "http://example.com/D"),
+        "{rows:?}"
+    );
+    assert!(
+        rows.iter()
+            .all(|row| row["c"]["value"] != "http://example.com/C"),
+        "{rows:?}"
+    );
     Ok(())
 }
 
