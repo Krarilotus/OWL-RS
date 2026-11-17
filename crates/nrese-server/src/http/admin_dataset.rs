@@ -99,10 +99,9 @@ pub async fn restore(
     let result = mutation::run(
         &state,
         MutationCommand::Restore(request),
-        // Administrators only (the caller's guard, checked again where it publishes): every
-        // graph.
+        // Administrators only (the caller's guard, checked where it publishes): every graph.
         &crate::access::AccessView {
-            rights,
+            rights: rights.map(nrese_store::access::RightsCheck::administering),
             ..crate::access::AccessView::unrestricted()
         },
         state.policy().timeouts.update,

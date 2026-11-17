@@ -398,7 +398,7 @@ pub async fn session_commit(
         .sessions()
         .take(&session, access.origin.as_deref())
         .ok_or_else(|| no_session(&session))?;
-    super::rdf4j::apply(&state, request.ops, &access).await?;
+    super::rdf4j::commit(&state, request.ops, &access).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

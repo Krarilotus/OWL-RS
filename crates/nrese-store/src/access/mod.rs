@@ -37,7 +37,7 @@ use nrese_rdf::GraphName;
 use nrese_sparql::GraphAccess;
 use serde::{Deserialize, Serialize};
 
-pub use control::{AccessControl, ChangeRecord, HISTORY_GRAPH, RightsCheck, STATE_GRAPH};
+pub use control::{AccessControl, ChangeRecord, Grant, HISTORY_GRAPH, RightsCheck, STATE_GRAPH};
 pub use login::{LoginLimits, SESSION_PREFIX, hash_password, verify_password};
 pub use queries::{QUERIES_GRAPH, QueryDraft, SavedQuery};
 

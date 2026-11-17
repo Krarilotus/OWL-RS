@@ -3,8 +3,6 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use nrese_sparql::CancellationToken;
 
-use super::error::MutationError;
-
 type RightsHeld<'a> = std::sync::RwLockReadGuard<'a, Arc<crate::access::AccessState>>;
 
 const PENDING: u8 = 0;
@@ -50,12 +48,11 @@ impl MutationTicket {
         }
     }
 
-    /// Held from just before the commit until it returns: the access state's read guard,
-    /// if the write's rights still hold ([`MutationError::RightsChanged`] if not).
-    pub(crate) fn hold_rights(&self) -> Result<Option<RightsHeld<'_>>, MutationError> {
+    /// The access state's read guard while the write's rights hold, for its publication.
+    pub(crate) fn hold_rights(&self) -> Result<Option<RightsHeld<'_>>, super::MutationError> {
         self.rights
             .as_ref()
-            .map(|rights| rights.hold().ok_or(MutationError::RightsChanged))
+            .map(|rights| rights.hold().ok_or(super::MutationError::RightsChanged))
             .transpose()
     }
 

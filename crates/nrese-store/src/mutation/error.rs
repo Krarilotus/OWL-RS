@@ -32,8 +32,7 @@ pub enum MutationError {
     /// sent again.
     #[error("the repository was reconfigured while the write waited; send it again")]
     Retired,
-    /// The requester's rights changed while the write waited or ran: nothing was published.
-    /// Sent again, it is judged under the new rights.
+    /// The requester's rights changed while the write waited: nothing was published.
     #[error("the requester's rights changed while the write waited; send it again")]
     RightsChanged,
 }

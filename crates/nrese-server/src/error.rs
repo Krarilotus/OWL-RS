@@ -54,8 +54,7 @@ pub enum ApiError {
     /// Busy for now: 503 with `Retry-After`, to be tried again shortly.
     #[error("busy: {0}")]
     Busy(String),
-    /// The requester's rights changed while its write waited: 503 with `Retry-After`, type
-    /// `rights-changed`; sent again, it is judged under the new rights.
+    /// The requester's rights changed while its write waited: 503, `Retry-After`, `rights-changed`.
     #[error("rights changed: {0}")]
     RightsChanged(String),
     #[error("internal server error: {0}")]

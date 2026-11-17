@@ -443,6 +443,8 @@ impl MutationPipeline {
             // the commit changes of individuals' memberships of class expressions, before the
             // commit publishes.
             let ql = crate::service::Certificate::of(tx.base()).and_then(|c| c.ql.clone());
+            // Its rights hold from here through the publication (contracts.md, lock order).
+            let rights = ticket.hold_rights()?;
             // In quarantine the commit checks only its own facts: its version keeps no
             // assessment of its consistency. The mark rises first (odd: unassessed), then the
             // old assessment and its marker go, before the commit publishes: a removal that
@@ -456,8 +458,6 @@ impl MutationPipeline {
             if let Some(certificate) = tx.base().certificate().cloned() {
                 tx.vouch(certificate);
             }
-            // Its rights hold through the publication only (contracts.md, lock order).
-            let rights = ticket.hold_rights()?;
             let summary = match ql {
                 Some(ql) => ql.commit(tx),
                 None => tx.commit(),

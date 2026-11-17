@@ -46,7 +46,7 @@ fn a_change_of_rights_publishes_after_a_write_publishing_under_them() {
     for quad in statements(HALF) {
         tx.insert(quad.as_ref());
     }
-    let view = access.view_checked(&roles(&["analyst"]), "nrese");
+    let view = access.view_checked(&roles(&["analyst"]), "nrese", None);
     let rights = view.rights.expect("a checked view carries its rights");
     let held = rights.hold().expect("rights nothing changed hold");
     let published = Arc::new(AtomicBool::new(false));
@@ -75,5 +75,87 @@ fn a_change_of_rights_publishes_after_a_write_publishing_under_them() {
          {:?} of it after the step began",
         2 * HALF,
         applied.saturating_sub(lead)
+    );
+}
+
+/// A check requires the access state's grant that admitted its write (an open policy's grant
+/// to a named user), also where the view it carries was read after that grant ended:
+/// admission and view are two readings of the state. A write the credentials admitted needs
+/// no grant of the state's.
+#[test]
+fn a_check_requires_the_grant_that_admitted_its_write() {
+    let system = StoreService::new(StoreConfig::in_memory()).unwrap();
+    let access = Arc::new(AccessControl::open(system, "urn:nrese:").unwrap());
+    let open = AccessPolicy {
+        default: Fallback::Allow,
+        ..policy()
+    };
+    access
+        .apply(&admin(), Change::Import(open), "test")
+        .unwrap();
+    let bob = user("bob");
+    assert!(
+        access.state().grants_write(&bob),
+        "the open policy admits bob's writes"
+    );
+    let off = SettingsPatch {
+        enforced: Some(false),
+        ..SettingsPatch::default()
+    };
+    access
+        .apply(&admin(), Change::Settings(off), "test")
+        .unwrap();
+    let granted = |grant| access.view_checked(&bob, "nrese", grant).rights.unwrap();
+    let (by_state, by_credentials) = (granted(Some(Grant::Write)), granted(None));
+    assert_eq!(
+        (by_state.hold().is_some(), by_credentials.hold().is_some()),
+        (false, true)
+    );
+}
+
+/// A write refused for changed rights in quarantine leaves the store's assessment of its
+/// consistency as it was: the check comes before the commit clears it.
+#[test]
+fn a_write_refused_for_its_rights_in_quarantine_keeps_the_assessment() {
+    use crate::{MutationCommand, MutationError, MutationPipeline, MutationTicket};
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, rulesets::Ruleset};
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+    let mut clash = store.engine().transaction();
+    let nothing = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#Nothing");
+    let a = NamedNode::new_unchecked("urn:x:a");
+    let quad = Quad::new(
+        a,
+        nrese_rdf::vocab::rdf::TYPE,
+        nothing,
+        GraphName::DefaultGraph,
+    );
+    clash.insert(quad.as_ref());
+    clash.commit().unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    let before = format!("{:?}", store.consistency());
+    assert!(store.is_quarantined(), "in quarantine: {before}");
+    let system = StoreService::new(StoreConfig::in_memory()).unwrap();
+    let access = Arc::new(AccessControl::open(system, "urn:nrese:").unwrap());
+    access
+        .apply(&admin(), Change::Import(policy()), "test")
+        .unwrap();
+    let view = access.view_checked(&roles(&["analyst"]), "nrese", Some(Grant::Write));
+    let removed = Change::RemoveRole("analyst".to_owned());
+    access.apply(&admin(), removed, "test").unwrap();
+    let reasoner = ReasonerService::new(ReasonerConfig::for_mode(ReasoningMode::Owl2Rl));
+    let pipeline = MutationPipeline::new(Arc::clone(&store), Arc::new(reasoner));
+    let insert = "INSERT DATA { GRAPH <https://kg.example/analyst/x> { <urn:x:b> <urn:x:p> 1 } }";
+    let refused = pipeline.apply(
+        MutationCommand::Update(crate::SparqlUpdateRequest::new(insert)),
+        &view.requester(),
+        &MutationTicket::checking(view.rights),
+    );
+    assert_eq!(
+        (
+            matches!(refused, Err(MutationError::RightsChanged)),
+            format!("{:?}", store.consistency())
+        ),
+        (true, before),
+        "{refused:?}"
     );
 }

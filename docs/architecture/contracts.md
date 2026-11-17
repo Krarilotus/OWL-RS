@@ -109,13 +109,12 @@ commit converts the stack, the compaction slot held: it takes no lock and calls 
 compaction, checkpoints and the served log for its length (quarantine readmissions only). State that changes only between commits takes a
 `WriterHeld` proof (the store's reasoning certificate: `StoreService::invalidate_held`, `record_reasoning` under `Rematerialisation::finish_held`).
 
-A write publishes only with the rights it was evaluated with. Its read guard on the access state (`AccessControl`'s `state`, `RightsCheck::hold` in
-`crates/nrese-store/src/access/control.rs`) is taken just before the engine's `commit()` and dropped when it returns (`MutationPipeline::apply`): the dataset's
-writer slot and the pipeline's ground cache → the access state's read guard → the engine's commit locks. `AccessControl::apply` waits for the write
-side holding only its `writer` mutex, its system-store commit (another engine) done, so it and the guard's holder never wait on each other; the holder
-takes nothing of access control's and never reads the state again (a read queued behind `apply` would wait for itself), and no Rayon task reads it.
-`apply` waits for one publication step at most: 39 ms behind a commit that merges the largest inline window (32 Ki entries; in-memory test store,
-debug build, `access::tests::publication`, 17 Nov 2026), plus the WAL's sync on a durable store.
+A write publishes only with the rights it was evaluated with (`RightsCheck::hold`, `crates/nrese-store/src/access/control.rs`): the pipeline holds the access
+state's read lock from before quarantine clears its assessment until `commit()` returns. Order: dataset writer slot, ground cache → access state → engine
+commit locks. `AccessControl::apply` waits for the write lock holding only its `writer` mutex, its system-store commit done; the holder takes nothing of
+access control's and never reads the state again (a read queued behind `apply` would wait for itself), and no Rayon task reads it. One measured wait:
+39 ms behind a commit merging the full inline window (32 Ki entries; in-memory, debug build, `access::tests::publication`); a larger delta, a layout
+conversion and a durable store's WAL sync add to it.
 
 A version's own slots (`OwnSlots`, `crates/nrese-engine/src/engine/snapshot/own_state.rs:92`) have a leaf lock: held only to look a
 value up or store one (:102), never while a value is made or dropped, and nothing is taken while it is held. `make` runs unlocked, so it may read
