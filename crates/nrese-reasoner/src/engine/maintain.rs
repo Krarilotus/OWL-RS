@@ -432,6 +432,7 @@ pub fn maintain_with(
             &update.insert,
             program.rdf_type,
             program.same_as,
+            None,
             &|id| tx.decode(TermId::from_raw(id)),
             memory,
         );
