@@ -195,9 +195,9 @@ fn routed_to_rules(ontology: &Ontology) -> bool {
 }
 
 /// What the RL route was decided on: the TBox signature as the reader typed it, the
-/// built-in annotation properties among its annotation properties, the terms read as SHACL
-/// content (`Ontology::shacl`), and the ids of `rdf:type` and `owl:sameAs` (`None`: not in
-/// the dictionary then).
+/// built-in annotation properties among its annotation properties, the SHACL properties
+/// whose statements were read as SHACL content (`Ontology::shacl`), and the ids of
+/// `rdf:type` and `owl:sameAs` (`None`: not in the dictionary then).
 pub(crate) struct Kinds {
     signature: nrese_owl::profile::Signature,
     shacl: std::collections::BTreeSet<u64>,
@@ -224,8 +224,8 @@ impl Kinds {
 
     /// Whether an asserted triple, inserted or deleted, leaves every term the kinds the
     /// reader gave it, which it gives by use (`nrese_owl::profile::Signature`): a known
-    /// annotation property's statement gives none, nor SHACL content of the known SHACL
-    /// terms (a predicate, or `rdf:type` with a class); any other leaves the schema as it is,
+    /// annotation property's statement gives none, nor a statement of a known SHACL property
+    /// (read as SHACL content, which has no OWL meaning); any other leaves the schema as it is,
     /// names no class or property, and no name of the reserved vocabulary, which the reader
     /// leaves out (`nrese_owl::diagnostics::reserved_name`), as subject or IRI object, and
     /// its predicate is `rdf:type` with a known class, `owl:sameAs`, or a property known
@@ -235,9 +235,7 @@ impl Kinds {
     /// object property.
     fn keep(&self, tx: &Transaction<'_>, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
         let k = &self.signature;
-        let shacl =
-            self.shacl.contains(&p) || (Some(p) == self.rdf_type && self.shacl.contains(&o));
-        if k.annotations.contains(&p) || shacl {
+        if k.annotations.contains(&p) || self.shacl.contains(&p) {
             return true;
         }
         if changes_schema(tx, triple) || k.names.contains(&s) || reserved_named(tx, triple) {

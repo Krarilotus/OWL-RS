@@ -86,8 +86,8 @@ pub struct Ontology {
     /// among [`Self::annotations`]: OWL 2 DL gives these axioms no meaning, while the OWL 2
     /// RL rules over the triples (prp-dom, prp-rng, prp-spo1) read them. Sorted, each once.
     pub annotation_schema: Vec<Term>,
-    /// The terms read as SHACL content, which has no OWL meaning (read past as an annotation
-    /// is): the predicates in SHACL's namespace and its classes in `rdf:type` statements.
+    /// The properties of the SHACL vocabulary ([`shacl_properties`]) whose statements were read
+    /// as SHACL content, which has no OWL meaning (read past as an annotation is).
     pub shacl: BTreeSet<Term>,
     /// The source's ids of the properties with a fixed meaning.
     pub builtin: BuiltinProperties,
@@ -463,8 +463,50 @@ pub const BUILTIN_ANNOTATIONS: [&str; 9] = [
     "http://www.w3.org/2002/07/owl#incompatibleWith",
 ];
 
-/// SHACL's namespace: its content has no OWL meaning ([`Ontology::shacl`]).
+/// SHACL's namespace.
 const SHACL: &str = "http://www.w3.org/ns/shacl#";
+
+/// The properties of the SHACL vocabulary, by local name in [`SHACL`]'s namespace: a statement
+/// of one is SHACL content, with no OWL meaning ([`Ontology::shacl`]). From W3C, *Shapes
+/// Constraint Language (SHACL)*, 2017: §2 (targets, severity, messages, deactivation, property
+/// shapes and their paths, the non-validating characteristics), §1.5 and §3 (shapes graphs,
+/// entailment, the validation report), §4 (the core constraint components' parameters), §5 and
+/// §6 (SPARQL-based constraints and constraint components). A term of the namespace not listed
+/// is read as any other term, by its use: conservative, as it keeps the kind OWL 2 gives it.
+#[rustfmt::skip]
+const SHACL_PROPERTIES: [&str; 78] = [
+    // §2
+    "targetNode", "targetClass", "targetSubjectsOf", "targetObjectsOf",
+    "property", "path", "severity", "message", "deactivated",
+    "inversePath", "alternativePath", "zeroOrMorePath", "oneOrMorePath", "zeroOrOnePath",
+    "name", "description", "order", "group", "defaultValue",
+    // §1.5 and §3
+    "shapesGraph", "suggestedShapesGraph", "entailment",
+    "conforms", "result", "focusNode", "resultPath", "value", "sourceShape",
+    "sourceConstraintComponent", "sourceConstraint", "detail", "resultMessage", "resultSeverity",
+    // §4
+    "class", "datatype", "nodeKind", "minCount", "maxCount",
+    "minExclusive", "minInclusive", "maxExclusive", "maxInclusive",
+    "minLength", "maxLength", "pattern", "flags", "languageIn", "uniqueLang",
+    "equals", "disjoint", "lessThan", "lessThanOrEquals",
+    "not", "and", "or", "xone", "node",
+    "qualifiedValueShape", "qualifiedMinCount", "qualifiedMaxCount", "qualifiedValueShapesDisjoint",
+    "closed", "ignoredProperties", "hasValue", "in",
+    // §5 and §6
+    "sparql", "select", "ask", "prefixes", "declare", "prefix", "namespace",
+    "parameter", "optional", "labelTemplate", "validator", "nodeValidator", "propertyValidator",
+];
+
+/// [`SHACL_PROPERTIES`]' IRIs.
+pub fn shacl_properties() -> impl Iterator<Item = String> {
+    SHACL_PROPERTIES.iter().map(|name| format!("{SHACL}{name}"))
+}
+
+/// Whether `iri` is one of [`shacl_properties`].
+pub fn is_shacl_property(iri: &str) -> bool {
+    iri.strip_prefix(SHACL)
+        .is_some_and(|name| SHACL_PROPERTIES.contains(&name))
+}
 
 /// The annotation properties as [`read`] reads them (§5.8), for every reader of the RDF: the
 /// built-in ones, and each IRI declared one by [`DECLARATION_KINDS`] (no blank node). Holds
@@ -669,13 +711,9 @@ impl<'a> Reader<'a> {
     /// neither SHACL content nor an annotation names one, which gives it an OWL meaning, so
     /// the source reads as any other.
     fn shacl(&mut self) {
-        let (terms, ty, statements) = (self.terms, self.v.rdf_type, self.statements);
-        let mut memo: HashMap<Term, bool> = HashMap::new();
-        let mut content = |[_, p, o]: [Term; 3]| {
-            let t = if is(p, ty) { o } else { p };
-            let iri = |t| terms.iri_text(t).is_some_and(|i| i.starts_with(SHACL));
-            memo.entry(t).or_insert_with(|| iri(t)).then_some(t)
-        };
+        let (terms, statements) = (self.terms, self.statements);
+        let vocabulary: HashSet<Term> = shacl_properties().filter_map(|i| terms.iri(&i)).collect();
+        let content = |[_, p, _]: [Term; 3]| vocabulary.contains(&p).then_some(p);
         let found: BTreeSet<Term> = statements
             .iter()
             .filter_map(|s| content(s.triple))
@@ -1571,7 +1609,7 @@ impl<'a> Reader<'a> {
             v.rdf_property,
             v.rdf_list,
         ];
-        if header.iter().any(|&c| is(o, c)) || self.shacl.contains(&o) {
+        if header.iter().any(|&c| is(o, c)) {
             self.annotations += 1;
             return;
         }

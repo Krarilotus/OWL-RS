@@ -836,9 +836,10 @@ const COPIES: &str = "and the closure may hold the rules' copies of annotation s
 
 /// The first of `read` that may return a copy in `snapshot`: an annotation property (one of
 /// [`annotation_properties`], for `None`; a constant by its own declarations or as built in,
-/// none where the store doesn't know the IRI) with statements held where an equality between
-/// two different terms is, or inferred ones. For a reader by support (`access`), held only in
-/// the graphs it reads: a copy it sees has its support there, or copies an inferred statement.
+/// none where the store doesn't know the IRI), or, under an equality, a SHACL property, with
+/// statements held where an equality between two different terms is, or inferred ones. For a
+/// reader by support (`access`), held only in the graphs it reads: a copy it sees has its
+/// support there, or copies an inferred statement.
 fn copied<'a>(
     snapshot: &Snapshot,
     access: Option<&nrese_sparql::GraphAccess>,
@@ -851,9 +852,10 @@ fn copied<'a>(
     let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
     let asserted = |pattern| snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern);
     let equal = std::cell::OnceCell::new();
+    let equal = || *equal.get_or_init(|| equal_terms(snapshot));
     // A reader by support sees the copy of a statement in its own graphs, or of an inferred one.
     let copies = |p| {
-        let equal = *equal.get_or_init(|| equal_terms(snapshot));
+        let equal = equal();
         let (of, held) = (any_graph(None, Some(p), None), equal && !by_support);
         let model = if held { Materialised } else { Inferred };
         let seen = equal && by_support && asserted(of).any(|q| readable(q.graph));
@@ -864,11 +866,23 @@ fn copied<'a>(
         let object = snapshot.decode(q.object);
         readable(q.graph) && matches!(object, Some(Term::NamedNode(k)) if kind(k.as_str()))
     };
+    // SHACL content (`nrese_owl::shacl_properties`) is copied only through an equality of two
+    // different terms (OWL 2 Profiles §4.3, Table 4: eq-rep-s, eq-rep-p, eq-rep-o): an OWL axiom
+    // on a SHACL term makes the reader read the store as any other, and a copy is then entailed.
+    // So with no equality its properties aren't probed.
     read.iter().find(|p| match p.as_deref() {
-        None => annotation_properties(snapshot, readable).any(copies),
+        None => {
+            annotation_properties(snapshot, readable).any(copies)
+                || (equal()
+                    && nrese_owl::shacl_properties()
+                        .filter_map(|i| id(&i))
+                        .any(copies))
+        }
         Some(iri) => id(iri).is_some_and(|p| {
             let typed = id(RDF_TYPE).map(|ty| asserted(any_graph(Some(p), Some(ty), None)));
-            (BUILTIN.contains(&iri) || typed.into_iter().flatten().any(declares)) && copies(p)
+            let shacl = nrese_owl::is_shacl_property(iri) && equal();
+            (BUILTIN.contains(&iri) || shacl || typed.into_iter().flatten().any(declares))
+                && copies(p)
         }),
     })
 }
