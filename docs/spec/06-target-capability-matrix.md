@@ -5,7 +5,7 @@ the evidence behind it: the developers' status per capability; what is in, left 
 planned, for a reader, is the [scope](../what-it-covers.md#scope).
 
 The status values were defined on 30 September 2026. Every row was checked against the code on
-14 November 2026 (commit `5009ce9bd`): what it says the code does, and that the tests and
+14 November 2026 (commit `661e414ed`): what it says the code does, and that the tests and
 benchmarks it names exist. Counts, timings and suite results are as recorded on the dates
 given, not re-run.
 - `done`: implemented, serving, and its evidence gate passed

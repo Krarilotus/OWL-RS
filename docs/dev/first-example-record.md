@@ -8,7 +8,7 @@ checks the answer. This page records what it sends, what it expects, and what th
 ## The last run
 
 - The run was on 16 November 2026, 16:03 (CET).
-- The code was commit `617d4665ecbe75bb9e799d55d953c0d7569d65df`; the server reported version 1.5.0.
+- The code was commit `e19add29d6674dc08a985f7cb11fa2eb6e36901c`; the server reported version 1.5.0.
 - The server was a debug build of `nrese-server` from that commit (built with `--locked`, Rust
   1.98.1) on a Linux x86-64 machine. The runner started it with the scenario's settings,
   `reasoner.mode = owl2-dl` and `shacl.gate = enforce`, on an on-disk store, and stopped it at the

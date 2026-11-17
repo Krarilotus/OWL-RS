@@ -1,6 +1,6 @@
 # Cross-cutting contracts
 
-This page is an inventory of the source at engine-v2 `a3453435` (7 November 2026), not the contract of a release. [ARCHITECTURE.md](../ARCHITECTURE.md) owns the layer model and crate
+This page is an inventory of the source at engine-v2 `2f0d2c9e` (7 November 2026), not the contract of a release. [ARCHITECTURE.md](../ARCHITECTURE.md) owns the layer model and crate
 boundaries; [ADRs](../adr/README.md) own design decisions. Change a shared contract at its owner, then migrate callers. This inventory does not approve
 API changes or classify the listed bypasses as defects.
 
@@ -122,7 +122,7 @@ check its `kept` closure makes. No path that holds a bounds guard enters the Ray
 builds, the taxonomy and a view's runs hold none, and a revision's builds go through the `BuildCell` under the bounded rule (a Rayon worker
 builds its own instead of waiting). "Before the dictionary" is the guards' place in the hierarchy, not permission to call the dictionary or a
 dictionary callback under one. Until it was changed, `state` was held across that parallel work. At pool widths 1 and 2 the cycle with pool readers
-was reproduced on `a3453435`.
+was reproduced on `2f0d2c9e`.
 
 Known bypasses and gaps:
 
