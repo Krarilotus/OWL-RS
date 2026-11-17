@@ -1396,6 +1396,15 @@ impl<'a> Reader<'a> {
             }
         } else if is(p, v.owl_has_key) {
             if let (Some(class), Some(members)) = (self.class(s), self.list(o)) {
+                // A key has a property (*Structural Specification* §9.5). The empty key the
+                // universal-property rewriting makes of one on the top property comes later.
+                if members.is_empty() {
+                    self.report(Diagnostic::Malformed {
+                        node: s,
+                        what: "a key without a property",
+                    });
+                    return;
+                }
                 let (mut objects, mut datas) = (Vec::new(), Vec::new());
                 for member in members {
                     if self.kind(member) == TermKind::Iri && self.is_data_property(member) {

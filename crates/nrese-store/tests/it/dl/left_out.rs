@@ -149,6 +149,66 @@ fn every_read_over_an_axiom_the_reader_leaves_out_is_unsound() {
     assert_eq!(cases.len(), 13, "the table's rows");
 }
 
+/// A key with no property, `owl:hasKey ()`, is outside OWL 2 DL (*Structural Specification*
+/// §9.5: "m or n (or both) MUST be larger than zero"): the reader leaves it out and names it,
+/// so no read over it is `complete` and the store isn't told consistent, on the rules route
+/// and off it. Read as making every named member one, `:b :p :x` would follow; read as no
+/// key, it wouldn't. A key on `owl:topObjectProperty` alone is OWL 2 DL, though the
+/// universal-property rewriting empties it inside: it is kept, and its reads are `complete`
+/// and right, since any two named members share a value of the top property.
+#[test]
+fn a_key_with_no_property_is_left_out_and_named_and_one_on_the_top_property_is_not() {
+    let union = ":A a owl:Class ; rdfs:subClassOf [ owl:unionOf ( :B :C ) ] . \
+                 :B a owl:Class ; rdfs:subClassOf :K . :C a owl:Class ; rdfs:subClassOf :K . \
+                 :a a owl:NamedIndividual , :A . :b a owl:NamedIndividual , :A .";
+    let asserted = ":a a owl:NamedIndividual , :K . :b a owl:NamedIndividual , :K .";
+    let data = |key: &str, members: &str| {
+        format!(
+            ":K a owl:Class ; owl:hasKey ( {key} ) . {members} :p a owl:ObjectProperty . :a :p :x ."
+        )
+    };
+    let reads = [
+        ("SELECT ?x { ?x :p :x }", vec!["a", "b"]),
+        ("ASK { :b :p :x }", vec!["true"]),
+    ];
+    // (case, the store, whether the reader leaves the key out)
+    let cases = [
+        ("no property, off the rules route", data("", union), true),
+        ("no property, on the rules route", data("", asserted), true),
+        (
+            "the top property",
+            data("owl:topObjectProperty", union),
+            false,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (name, store, left_out) in &cases {
+        let dl = pipeline();
+        insert(&dl, store).expect("committed");
+        let verdict = dl.store().dl().status().map(|s| s.consistency.verdict);
+        let consistent = verdict.as_ref().map(|v| v.as_str()) == Some("consistent");
+        for (read, expected) in &reads {
+            let (mut rows, status) = query(&dl, read);
+            rows.sort();
+            let (label, reasons) = (status.shared.as_str(), status.reasons());
+            let named = reasons
+                .iter()
+                .any(|r| r.contains("a key without a property"));
+            let ok = if *left_out {
+                label == "unsound" && says_left_out(&reasons) && named && !consistent
+            } else {
+                status.is_complete() && rows == *expected && !says_left_out(&reasons)
+            };
+            if !ok {
+                wrong.push(format!(
+                    "{name}: {read}: {rows:?} {label} {reasons:?} {verdict:?}"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The store's consistency verdict over each case: `unknown`, never `consistent`, though U1,
 /// built from what the reader kept, may prove that part consistent: consistent only if
 /// nothing of the source was left out (`dl::consistency::check`).
