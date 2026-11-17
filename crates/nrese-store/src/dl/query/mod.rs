@@ -644,8 +644,9 @@ const COMPARED: &str = "two spellings of one value are two terms to the store, w
 
 /// Why a read of a store in quarantine (its certificate's violations) may miss rows: fixed
 /// words, nothing of the clash, for a reader of some graphs too (`/readyz` tells anyone).
-const QUARANTINE: &str = "the consistency rules find violations in the stored data (the store \
-                          is in quarantine), and inconsistent data entail every answer";
+const QUARANTINE: &str = "the store is in quarantine (the consistency rules found violations and \
+                          have not found the data clean since); inconsistent data entail every \
+                          answer, so no read is certified complete until it leaves";
 
 /// The one rule of every path's status under an OWL 2 regime, composed last onto it (by
 /// both DL entry points, [`plan_status`] and [`answer`], after the bounds; over a ruleset's
