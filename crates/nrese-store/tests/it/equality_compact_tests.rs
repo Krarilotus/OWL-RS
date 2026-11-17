@@ -810,6 +810,15 @@ fn equality_store(
     disk: Option<&std::path::Path>,
 ) -> MutationPipeline {
     let storage = disk.map_or_else(in_memory_store_config, StoreConfig::on_disk);
+    equality_store_over(reasoner, compact, storage)
+}
+
+/// [`equality_store`] over `storage`'s other settings.
+fn equality_store_over(
+    reasoner: &ReasonerConfig,
+    compact: bool,
+    storage: StoreConfig,
+) -> MutationPipeline {
     let config = StoreConfig {
         equality_by_representatives: true,
         equality_compact: compact,
@@ -1143,8 +1152,11 @@ fn a_compact_primary_sends_no_replica_its_log() {
             let primary = equality_store(&reasoner, true, Some(at.path()));
             let case = format!("{program} {way}");
             update(&primary, TYPE);
-            let replica = equality_store(&reasoner, true, Some(follows.path()));
-            replica.store().mark_replica();
+            let as_replica = StoreConfig {
+                replica: true,
+                ..StoreConfig::on_disk(follows.path())
+            };
+            let replica = equality_store_over(&reasoner, true, as_replica);
             let pull = || -> Result<(), String> {
                 let after = replica.store().current_revision();
                 let batch = primary
