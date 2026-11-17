@@ -2773,9 +2773,6 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_REVALIDATION: Hook = const { RefCell::new(None) };
         /// A quarantine reading has read the mark and is about to read the assessment.
         pub(crate) static BETWEEN_QUARANTINE_READS: Hook = const { RefCell::new(None) };
-        /// A reasoning commit has published and given up the writer slot, and is about to
-        /// install its bounds.
-        pub(crate) static AFTER_COMMIT: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {
