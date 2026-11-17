@@ -451,10 +451,16 @@ impl StoreService {
         );
         // A structure no axiom uses says nothing under the Direct Semantics (OWL 1
         // conclusions state expressions so); anything else unread leaves it undecided.
+        // Named by the conclusion's own terms, which the requester wrote.
         if let Some(diagnostic) = read.diagnostics.iter().find(|d| d.is_fatal()) {
+            let name = |t| {
+                decode(nrese_engine::TermId::from_raw(t))
+                    .map_or_else(|| "_".into(), |t| t.to_string())
+            };
             return Ok(DlEntailment {
                 answer: Entailed::Unknown(format!(
-                    "the conclusion isn't well-formed OWL 2 DL: {diagnostic:?}"
+                    "the conclusion isn't well-formed OWL 2 DL: {}",
+                    diagnostic.describe(&name)
                 )),
                 premise: checked.verdict,
             });
