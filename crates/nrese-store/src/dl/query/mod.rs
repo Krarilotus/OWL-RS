@@ -857,9 +857,13 @@ pub(crate) fn answer(
     #[cfg(test)]
     crate::service::hooks::run(&crate::service::hooks::AFTER_DECIDED);
     cancellation.check()?;
+    // An ASK the store answered `true` misses nothing, so nothing every name could add changes
+    // it: it isn't put to the element. One answered `false` is, as is one streamed.
+    let held = matches!(&outcome, Outcome::Answers(Answers::Boolean(true), ..));
     let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &mut outcome;
     *status = composed(store, prepared, snapshot, &decided, status.clone());
     if status.complete
+        && !held
         && let Ok((_, view)) = &decided
         && let Some(what) = every_name(&analysis, view)
         && let Some(why) = stand_in(store, view, &analysis, what, read, memory)
