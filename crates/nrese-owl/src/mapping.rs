@@ -827,26 +827,19 @@ impl<'a> Reader<'a> {
             return Some(self.intern_class(ClassExpr::Not(operand)));
         }
         let members = self.list(operand)?;
-        // Short lists, as OWL 2 Mapping to RDF Tables 15 and 18 read them: an empty union or
-        // enumeration is `owl:Nothing`, an empty intersection `owl:Thing`, and a union or an
-        // intersection of one member that member.
-        if members.is_empty() {
-            let expr = if is(operator, v.owl_union_of) || is(operator, v.owl_one_of) {
-                ClassExpr::Nothing
-            } else {
-                ClassExpr::Thing
-            };
-            return Some(self.intern_class(expr));
-        }
         if is(operator, v.owl_one_of) {
             return Some(self.intern_class(ClassExpr::OneOf(canonical(members))));
         }
         let operands = canonical(self.classes(&members)?);
-        if let [one] = operands[..] {
-            return Some(one);
-        }
         Some(self.intern_class(if is(operator, v.owl_union_of) {
             ClassExpr::Or(operands)
+        } else if operands.is_empty() {
+            // An empty intersection is `owl:Thing` (OWL 2 Mapping to RDF, Tables 15 and 18).
+            // The other short lists keep their form: an empty union or enumeration, or a
+            // one-member union, is no OWL 2 RL, so the rules, which read the statements, don't
+            // answer for it alone; an empty intersection read as an intersection of nothing
+            // would be, and they build no rule for it.
+            ClassExpr::Thing
         } else {
             ClassExpr::And(operands)
         }))
