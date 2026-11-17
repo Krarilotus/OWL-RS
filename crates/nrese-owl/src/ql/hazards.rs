@@ -64,9 +64,9 @@ pub enum Hazard {
     /// ([`reads_data_values`]), or a property not declared an object property in a key or
     /// a disjointness, which may be one: global.
     DataValues(Term),
-    /// What OWL 2 RL's rules don't read as the RDF mapping does: a restriction whose
-    /// cardinality isn't spelled as the mapping writes it
-    /// ([`Ontology::noncanonical_cardinality`]), or an empty intersection or union
+    /// What the closure's rules don't read as the RDF mapping does: under OWL 2 RL's, a
+    /// restriction whose cardinality isn't spelled as the mapping writes it
+    /// ([`Ontology::noncanonical_cardinality`]); under either, an empty intersection or union
     /// ([`Ontology::empty_list`]): global.
     Unread(Term),
 }
