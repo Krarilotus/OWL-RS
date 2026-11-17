@@ -48,8 +48,8 @@ struct Atom {
 /// One end of an [`Atom`], as the gap's Skolem constants see it.
 #[derive(Debug, Clone)]
 enum End {
-    /// A term the query names: never a Skolem constant.
-    Term,
+    /// A term the query names, with its IRI (`None`: a literal): never a Skolem constant.
+    Term(Option<String>),
     Var(String),
     /// A blank node, a path's inner node, a quoted triple, or one of U1's own terms.
     Hidden,
@@ -58,7 +58,8 @@ enum End {
 fn end_of(term: &TermPattern) -> End {
     match term {
         TermPattern::NamedNode(n) if nrese_dl::internal::is_made(n.as_str()) => End::Hidden,
-        TermPattern::NamedNode(_) | TermPattern::Literal(_) => End::Term,
+        TermPattern::NamedNode(n) => End::Term(Some(n.as_str().to_owned())),
+        TermPattern::Literal(_) => End::Term(None),
         TermPattern::Variable(v) => End::Var(v.as_str().to_owned()),
         _ => End::Hidden,
     }
@@ -688,6 +689,45 @@ pub(super) fn untyped_same_as(query: &Query, view: &View) -> Option<String> {
     found
 }
 
+/// The class or property of the first atom that may hold of every element, so that every name
+/// of the ontology may answer it in an individual's place (SPARQL 1.1 Entailment Regimes §7.2,
+/// (C2)), where the store answers only for the individuals it reasons about: U1's own element
+/// for every element (`u1:domain`) has the atom's fact at an end that is an answer variable or
+/// a name U1 doesn't type as `owl:Thing` (a class or property name, or one the data hasn't;
+/// U1 so types every individual it reasons about, as [`untyped_same_as`] reads it). With it,
+/// whether an atom does so at a name: then a row of the answer variables can't pose it.
+pub(super) fn every_name(q: &Analysis, view: &View) -> Option<(String, bool)> {
+    let upper = view.upper.as_ref()?;
+    let id = |iri: &str| upper.lookup(NamedNodeRef::new_unchecked(iri).into());
+    let domain = id(&nrese_dl::internal::u1("domain"))?;
+    let any = |s, p, o| {
+        let mut pattern = QuadPattern::all();
+        (pattern.subject, pattern.predicate, pattern.object) = (s, Some(p), o);
+        upper.exists_in(ReadModel::Materialised, &pattern)
+    };
+    let typed = |n: &str| match (id(n), id(RDF_TYPE), id(OWL_THING)) {
+        (Some(s), Some(p), Some(o)) => any(Some(s), p, Some(o)),
+        _ => false,
+    };
+    // An open end: `Some(true)` at a name.
+    let open = |end: &End, fact: bool| match end {
+        End::Var(v) => (fact && q.answers.as_ref().is_some_and(|a| a.contains(v))).then_some(false),
+        End::Term(Some(n)) => (fact && !typed(n)).then_some(true),
+        End::Term(None) | End::Hidden => None,
+    };
+    let fired = q.atoms.iter().filter_map(|atom| {
+        let (predicate, class) = (atom.predicate.as_deref()?, atom.class.as_deref());
+        let p = id(predicate)?;
+        // A class the store has no id for has no fact.
+        let c = class.map(|class| id(class).ok_or(())).transpose().ok()?;
+        let subject = open(&atom.ends[0], any(Some(domain), p, c));
+        let object = open(&atom.ends[1], class.is_none() && any(None, p, Some(domain)));
+        Some((class.unwrap_or(predicate), subject.max(object)?))
+    });
+    let (what, named) = fired.reduce(|(what, a), (_, b)| (what, a || b))?;
+    Some((what.to_owned(), named))
+}
+
 /// Whether `pattern`, under its projection, is ordered: then a slice of it keeps the
 /// first rows, which a missing row can change.
 fn ordered(mut pattern: &GraphPattern) -> bool {
@@ -758,7 +798,7 @@ pub(super) fn closed_for_answers(analysis: &Analysis, view: &View, snapshot: &Sn
         return false;
     };
     let safe = |end: &End| match end {
-        End::Term => true,
+        End::Term(_) => true,
         End::Var(v) => answers.contains(v) && !analysis.computed.contains(v),
         End::Hidden => false,
     };

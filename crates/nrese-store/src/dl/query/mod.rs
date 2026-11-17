@@ -429,6 +429,42 @@ pub(crate) fn mark(
     }
 }
 
+/// Why a `complete` read [`every_name`] finds may miss answers, as the exact services decide
+/// it for U1's element for every element, within the read's deadline, cancellation and
+/// memory: its one answer variable bound to the element (an `ASK`: its ground atoms as they
+/// stand). The element is a name in no axiom, and OWL 2 has no unique-name assumption, so it
+/// may denote any element: `O ⊨ Q(fresh)` iff `O ⊨ ⊤ ⊑ Q`. `None`: refuted, so no name
+/// answers the query that the store's individuals don't. Undecided: two answer variables or
+/// more, one beside a name the atom holds of the element, or a query the exact services
+/// don't take. The reasons hold of either name the store has no individual for.
+fn stand_in(
+    store: &StoreService,
+    view: &View,
+    analysis: &Analysis,
+    (what, named): (String, bool),
+    (cancel, by): (&CancellationToken, Deadline),
+    memory: &nrese_exec::Envelope,
+) -> Option<String> {
+    let domain = NamedNodeRef::new_unchecked(&nrese_dl::internal::u1("domain")).into_owned();
+    let posed = |s: &&Shape| s.projected.is_empty() || (s.projected.len() == 1 && !named);
+    let verdict = analysis.shape.as_ref().filter(posed).and_then(|s| {
+        let (v, lower) = (&s.projected, &view.lower);
+        let rows = [vec![Some(Term::NamedNode(domain)); v.len()]];
+        let mut decided = exact::decide_until(store, lower, analysis, v, &rows, cancel, by, memory);
+        decided.verdicts.pop()
+    });
+    let (how, is) = match verdict {
+        Some(Entailed::No) => return None,
+        Some(Entailed::Yes) => ("holds of every element", "is"),
+        _ => ("may hold of every element (undecided)", "may be"),
+    };
+    Some(format!(
+        "<{what}> {how}: every name the store has no individual for (a class's or property's \
+         name, or one the data names only in an equality to itself) {is} an answer, and the \
+         store returns none"
+    ))
+}
+
 const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, and the \
                     answers are read from their closure; use the owl2-rl mode, whose \
                     promise is the rules' reading";
@@ -777,6 +813,10 @@ fn plan_status_built(
     if analysis.reflexive_same_as {
         return status;
     }
+    if let Some((what, _)) = every_name(analysis, view) {
+        let every = "may hold of every element: decided when it runs";
+        status.add(format!("<{what}> {every}"));
+    }
     if closed(analysis, view, snapshot) {
         status.path("closed-predicates");
         return status;
@@ -803,8 +843,10 @@ pub(crate) fn answer(
     let analysis = analyse(prepared.query());
     // One view for the answers and their status: a commit in between changes neither (R1-F2).
     let decided = decided(store, snapshot, prepared, cancellation)?;
+    // The exact services' one deadline, the every-name question's included.
+    let read = (cancellation, Deadline::after(store.config().dl.timeout));
     let mut outcome = match decided.as_ref() {
-        Ok(at) => decide_answers(store, prepared, &analysis, at, cancellation, memory, mode)?,
+        Ok(at) => decide_answers(store, prepared, &analysis, at, read, memory, mode)?,
         Err(why) => Status::sound_only(*why).stream(Read::At(snapshot.clone())),
     };
     #[cfg(test)]
@@ -812,6 +854,13 @@ pub(crate) fn answer(
     cancellation.check()?;
     let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = &mut outcome;
     *status = composed(store, prepared, snapshot, &decided, status.clone());
+    if status.complete
+        && let Ok((_, view)) = &decided
+        && let Some(what) = every_name(&analysis, view)
+        && let Some(why) = stand_in(store, view, &analysis, what, read, memory)
+    {
+        status.incomplete("dl", why);
+    }
     refuse_unless_complete(mode, status, || detail.unresolved.clone())?;
     Ok(outcome)
 }
@@ -866,11 +915,10 @@ fn decide_answers(
     prepared: &PreparedQuery,
     analysis: &Analysis,
     (snapshot, view): &(Snapshot, Arc<View>),
-    cancellation: &CancellationToken,
+    (cancellation, deadline): (&CancellationToken, Deadline),
     memory: &nrese_exec::Envelope,
     mode: DlAnswers,
 ) -> StoreResult<Outcome> {
-    let deadline = Deadline::after(store.config().dl.timeout);
     let settings = store.query_settings();
     if prepared.has_dataset() {
         // Over the decided snapshot, every graph's for this reader: the status's (R1-F2).
