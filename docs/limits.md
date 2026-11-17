@@ -147,6 +147,19 @@ leave something out.
   cardinality, or compared), the consistency is `unknown` and no read is `complete`; a date
   nothing reads changes nothing. Use `xsd:dateTime`, which is in the map, where you can
   ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
+- Under `reasoner.equality = "compact"`, three cases are checked less than under the default
+  (`representatives`) and `replicate`. Where they matter, use the default
+  ([`reasoner.equality`](ops/config-reference.md#reasoner.equality)).
+  - A commit that makes two different data values the same can be accepted where one value
+    reached its `owl:sameAs` class through an earlier commit that merged two individuals (one of
+    them declared `owl:sameAs` a literal). The other settings refuse that commit, and a full
+    rebuild of the inferences finds the clash in every setting.
+  - A full rebuild doesn't check a literal against a datatype it reaches only through an
+    `owl:sameAs` alias of the datatype's IRI, so it finds such data consistent. Commits refuse
+    that data in every setting, and the other settings' rebuilds find it.
+  - After a full rebuild, a key whose list is reached through `owl:sameAs rdf:nil`
+    (`:C owl:hasKey :l . :l owl:sameAs rdf:nil`) doesn't make two instances of `:C` the same,
+    where a commit, and `owl:hasKey rdf:nil` written directly, do in every setting.
 - A value the store can't represent (an `xsd:dateTime` with a year beyond 10¹¹, say) is checked
   neither for a clash nor for being in its datatype, so a store that holds one is told consistent.
 - Under `owl2-dl`, a key or a negative property assertion over a value the store's quick
