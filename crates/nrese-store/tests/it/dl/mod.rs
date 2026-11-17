@@ -26,6 +26,7 @@ mod review;
 mod routing;
 mod safety;
 mod speculative;
+mod symmetric_chains;
 mod u1_limits;
 mod undecided;
 mod versions;
