@@ -1581,6 +1581,50 @@ fn a_key_past_the_rule_format_is_reported_and_not_built() {
     }
 }
 
+/// A store holding a key of 128 properties, written with reasoning off, is rebuilt with
+/// reasoning on (as the server's start and `nrese-server load` rebuild it): the rebuild
+/// completes with no violation and the key reported (`list-too-long`, prp-key).
+#[test]
+fn a_store_holding_a_key_past_the_rule_format_is_rebuilt_with_reasoning_on() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = nrese_store::StoreConfig {
+        mode: nrese_store::StoreMode::OnDisk,
+        data_dir: dir.path().to_path_buf(),
+        query_cache_bytes: 0,
+        ..nrese_store::StoreConfig::default()
+    };
+    {
+        let plain = MutationPipeline::new(
+            Arc::new(StoreService::new(config.clone()).expect("store")),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Disabled,
+            ))),
+        );
+        plain
+            .apply(
+                insert(&long_key(128)),
+                &nrese_store::Requester::all(),
+                &MutationTicket::new(),
+            )
+            .expect("written with reasoning off");
+    }
+    let store = StoreService::new(config).expect("reopen");
+    let program = ReasonerConfig::for_mode(ReasoningMode::Owl2Rl)
+        .materialised_program()
+        .expect("owl2-rl materialises");
+    assert!(!store.reasoning_is_current(&program));
+    let report = store.rematerialise(&program).expect("rebuilt");
+    assert_eq!(report.violations, 0);
+    assert!(
+        report
+            .diagnostics
+            .iter()
+            .any(|d| d.kind == "list-too-long" && d.rules == "prp-key"),
+        "{:?}",
+        report.diagnostics
+    );
+}
+
 /// A list axiom the rules leave out (reported, not built) is a missing rule: an answer it
 /// would change isn't `complete` because of it. Under `owl2-rl`, where the QL rewriting can
 /// certify an answer (`ql_rewriting = "on"`), each in a store of its own: a key past 127
@@ -2380,6 +2424,42 @@ fn a_long_intersection_is_built_or_reported() {
                 Ok(outcome) => wrong.push(format!("{mode}, {n} members: {outcome:?}")),
                 Err(_) => wrong.push(format!("{mode}, {n} members: panicked")),
             }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A store holding an intersection of 256 or 257 members, written with reasoning off, is
+/// rebuilt with reasoning on: 256 members are built (`:x` is a `:C`), 257 are built too or
+/// reported and not built, and the rebuild never panics or fails.
+#[test]
+fn a_store_holding_a_long_intersection_is_rebuilt_with_reasoning_on() {
+    let mut wrong = Vec::new();
+    for n in [256, 257] {
+        let rebuilt = std::panic::catch_unwind(|| {
+            let plain = pipeline(ReasoningMode::Disabled);
+            plain
+                .apply(
+                    insert(&long_intersection(n)),
+                    &nrese_store::Requester::all(),
+                    &MutationTicket::new(),
+                )
+                .map_err(|error| error.to_string())?;
+            let program = ReasonerConfig::for_mode(ReasoningMode::Owl2Rl)
+                .materialised_program()
+                .expect("owl2-rl materialises");
+            let report = (plain.store())
+                .rematerialise(&program)
+                .map_err(|error| error.to_string())?;
+            let entailed = contains(&plain, &format!("<{EX}x> a <{EX}C>"));
+            let reported = (report.diagnostics.iter()).any(|d| d.rules.starts_with("cls-int"));
+            Ok::<_, String>((entailed, reported))
+        });
+        match rebuilt {
+            Ok(Ok((true, _))) => {}
+            Ok(Ok((false, reported))) if n == 257 && reported => {}
+            Ok(outcome) => wrong.push(format!("{n} members: {outcome:?}")),
+            Err(_) => wrong.push(format!("{n} members: panicked")),
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
