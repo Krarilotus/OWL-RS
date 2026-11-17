@@ -27,6 +27,7 @@ mod packaging_tests;
 mod policy_api_tests;
 mod query_protocol_tests;
 mod rdf4j_admission_tests;
+mod rdf4j_client_shapes_tests;
 mod rdf4j_protocol_tests;
 mod read_ahead_tests;
 mod reasoning_certificate_tests;
