@@ -738,9 +738,13 @@ fn query_brings_a_closure_an_older_semantics_wrote_up_to_date()
 /// `nrese-server query` and by the server's start, the closure is rebuilt under this build's
 /// rules, where `ex:x` is no `owl:Thing`. Opened by `nrese-server query` configured as a read
 /// replica, which reasons nothing, the query is refused with the way out (rebuild the primary
-/// and re-bootstrap the replica), not answered from that closure. The older closure is written
-/// by this build under the same rules and one more that makes things; its marker is the older
-/// build's for these rules: their fingerprint with the value `skip` had then, written down here.
+/// and re-bootstrap the replica), not answered from that closure. Opened by the server's start
+/// as a read replica, whose reads follow its primary's log, a reasoned read of that closure is
+/// told `not-certified`: nothing on a replica vouches for it. Run by `nrese-server query` while
+/// its directory is locked, the query is refused at the open and answers nothing. The older
+/// closure is written by this build under the same rules and one more that makes things; its
+/// marker is the older build's for these rules: their fingerprint with the value `skip` had
+/// then, written down here.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -760,7 +764,14 @@ async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
         RuleProgram::new(None, Some(Arc::new(rules))).expect("a program")
     };
     let mut wrong = Vec::new();
-    for way in ["query", "start", "replica query"] {
+    let ways = [
+        "query",
+        "start",
+        "replica query",
+        "replica start",
+        "locked query",
+    ];
+    for way in ways {
         let dir = tempfile::tempdir()?;
         let data = dir.path().join("data");
         {
@@ -814,22 +825,44 @@ async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
         );
         // A replica's directory that holds this marker, from its time as a primary: the
         // closure isn't the configured rules', and nothing reasons on a replica to rebuild
-        // it. Its primary is never asked: `query` doesn't follow one.
+        // it. Its primary is never reached: `query` doesn't follow one, and the server's start
+        // finds none at this address.
         let replica = "[replication]\nmode = \"replica\"\nprimary = \"http://127.0.0.1:9\"\n";
         std::fs::write(
             &config,
-            text + if way == "replica query" { replica } else { "" },
+            text + if way.starts_with("replica") {
+                replica
+            } else {
+                ""
+            },
         )?;
-        let (got, must, right) = if way == "start" {
+        // The directory's lock as a running server holds it, the store's own: here a store
+        // open in this process, its older closure as it was.
+        let held = match way {
+            "locked query" => Some(nrese_store::StoreService::new(nrese_store::StoreConfig {
+                hide_unnamed_classes: true,
+                ..nrese_store::StoreConfig::on_disk(&data)
+            })?),
+            _ => None,
+        };
+        // The marker as the query meets it, after that open.
+        let marker = std::fs::read_to_string(&state)?;
+        let (got, must, right) = if way.ends_with("start") {
             let server = Server::start(&config).await?;
-            let things = server
-                .query(
+            let (things, told) = server
+                .query_status(
                     "nrese",
                     "SELECT ?x { ?x a <http://www.w3.org/2002/07/owl#Thing> }",
                 )
                 .await?;
             let thing = things.contains(&"<http://example.com/x>".to_owned());
-            (format!("ex:x a owl:Thing: {thing}"), "false", !thing)
+            if way == "start" {
+                (format!("ex:x a owl:Thing: {thing}"), "false", !thing)
+            } else {
+                let got = format!("ex:x a owl:Thing: {thing}, told {told:?}");
+                let right = told.as_deref() == Some("not-certified");
+                (got, "told Some(\"not-certified\")", right)
+            }
         } else {
             let (status, output) = Process::spawn(
                 Command::new(env!("CARGO_BIN_EXE_nrese-server"))
@@ -844,6 +877,19 @@ async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
                 assert!(status.success(), "{status}:\n{output}");
                 let thing = output.contains("true");
                 (format!("ex:x a owl:Thing: {thing}"), "false", !thing)
+            } else if way == "locked query" {
+                // Refused at the open: nothing of that closure is answered. The closure met is
+                // the older one: its marker still the older build's.
+                let answered = output.contains("true");
+                let first = output.lines().find(|line| !line.trim().is_empty());
+                let fingerprint = marker.lines().find(|line| line.starts_with("fingerprint "));
+                let older = fingerprint == Some(old.as_str());
+                let got = format!(
+                    "{status}, answered true: {answered}, first line {first:?}, \
+                     marker {fingerprint:?}, the older build's: {older}"
+                );
+                let right = !status.success() && !answered && older;
+                (got, "refused, nothing answered, the older marker", right)
             } else {
                 // Refused, with the way out: not an answer from that closure.
                 let refused = !status.success() && output.contains("re-bootstrap");
@@ -852,6 +898,7 @@ async fn a_skip_closure_a_rule_named_scm_cls_made_is_rebuilt_where_it_opens()
                 (got, "refused with the way out", refused)
             }
         };
+        drop(held);
         let verdict = if right { "right" } else { "WRONG" };
         println!("CASE {way}: {verdict}: {got}, must be {must}");
         if !right {
