@@ -292,7 +292,7 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
             &prepared,
             &analyse(prepared.query()),
             &crate::dl::bounds::view(&store),
-            &token,
+            (&token, Deadline::after(store.config().dl.timeout)),
             &nrese_exec::Envelope::unlimited(),
             mode,
         )
@@ -312,6 +312,49 @@ fn cancellation_takes_precedence_over_partial_answers_and_incompleteness() {
                 nrese_sparql::QueryEvaluationError::Cancelled
             ))
         ));
+    }
+}
+
+/// A read cancelled while U1's element for every element is posed (`owl:Thing ⊑ C`, every name
+/// in C) ends as the cancellation it is, in each answer mode that poses it (`sound` reads L
+/// alone, never `complete`): never an answer whose status the cut short question made
+/// incomplete, nor an exact read refused for it.
+#[test]
+fn a_cancellation_while_the_element_is_posed_is_the_reads() {
+    let store = lower_true_store_with(
+        crate::StoreConfig::in_memory(),
+        "owl:Thing <http://www.w3.org/2000/01/rdf-schema#subClassOf> :C .",
+    );
+    let prepared = PreparedQuery::parse(&crate::SparqlQueryRequest::all(
+        "SELECT ?x { ?x a <urn:test:C> }",
+    ))
+    .unwrap();
+    for mode in [DlAnswers::CertainWhereComplete, DlAnswers::Exact] {
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        crate::service::hooks::BEFORE_STAND_IN.set(Some(Box::new(move || cancel.cancel())));
+        let outcome = answer(
+            &store,
+            &store.engine().snapshot(),
+            &prepared,
+            &token,
+            &nrese_exec::Envelope::unlimited(),
+            mode,
+        )
+        .err();
+        assert!(
+            matches!(
+                outcome,
+                Some(StoreError::SparqlEvaluation(
+                    nrese_sparql::QueryEvaluationError::Cancelled
+                ))
+            ),
+            "{mode:?}: {outcome:?}"
+        );
+        assert!(
+            token.is_cancelled(),
+            "{mode:?}: the element was never posed"
+        );
     }
 }
 
