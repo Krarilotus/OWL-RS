@@ -447,6 +447,8 @@ fn stand_in(
 ) -> Option<String> {
     let domain = NamedNodeRef::new_unchecked(&nrese_dl::internal::u1("domain")).into_owned();
     let posed = |s: &&Shape| s.projected.is_empty() || (s.projected.len() == 1 && !named);
+    #[cfg(test)]
+    crate::service::hooks::run(&crate::service::hooks::BEFORE_STAND_IN);
     let verdict = analysis.shape.as_ref().filter(posed).and_then(|s| {
         let (v, lower) = (&s.projected, &view.lower);
         let rows = [vec![Some(Term::NamedNode(domain)); v.len()]];

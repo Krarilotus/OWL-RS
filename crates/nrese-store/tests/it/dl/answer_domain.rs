@@ -319,6 +319,98 @@ fn what_every_element_is_is_never_complete_without_every_name() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// The answer reaches a name through a path's end, an alias or a filter, not a triple pattern's
+/// answer variable: where every element is r-related to itself (r reflexive), `:C0 :r+ ?x`
+/// answers C0 and `ASK { :C0 :r+ :C0 }` holds; where every element is in C0, `?s` renamed to
+/// `?x` answers every name; and where every element is a0's p0-successor, so is the class name
+/// C1, which a filter on the successor asks for. None is `complete` without those answers.
+#[test]
+fn a_read_whose_answer_comes_through_a_path_an_alias_or_a_filter_is_never_complete_without_it() {
+    let reflexive = ":r a owl:ObjectProperty , owl:ReflexiveProperty . :C0 a owl:Class . \
+        :a0 a :C0 . :x a [ owl:unionOf ( :C0 :C1 ) ] .";
+    let successors = ":C1 a owl:Class . :p0 a owl:ObjectProperty . :a0 a owl:NamedIndividual . \
+        owl:Thing rdfs:subClassOf [ a owl:Restriction ; \
+        owl:onProperty [ owl:inverseOf :p0 ] ; owl:hasValue :a0 ] .";
+    let plain = with(&[THING, ":a0 a :C2 ."]);
+    let cases: Vec<Case> = vec![
+        (
+            "path-ask",
+            with(&[reflexive]),
+            "ASK { :C0 :r+ :C0 }",
+            "true",
+        ),
+        ("path", with(&[reflexive]), "SELECT ?x { :C0 :r+ ?x }", "C0"),
+        (
+            "alias",
+            plain.clone(),
+            "SELECT (?s AS ?x) { ?s a :C0 }",
+            "C0 C2 a0",
+        ),
+        (
+            "bind",
+            plain,
+            "SELECT ?x { ?s a :C0 BIND(?s AS ?x) }",
+            "C0 C2 a0",
+        ),
+        (
+            "filter",
+            with(&[successors]),
+            "SELECT ?x { ?x :p0 ?y FILTER(?y = :C1) }",
+            "a0",
+        ),
+    ];
+    let wrong = wrong(&cases, false);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A negation over an answer every name has keeps a row only where that answer is missing:
+/// where every element is in C0, so is the class name C2, so `FILTER NOT EXISTS { ?c a :C0 }`
+/// and `MINUS { ?c a :C0 }` drop `?c` = C2, and `FILTER NOT EXISTS { :C2 a :C0 }` drops a0's
+/// row. By the regime none has a row; a read that returns one is never told it is sound. Both
+/// where the data leaves a0 out of C0 and where it states it, so that C0's bounds differ only
+/// at U1's element for every element.
+#[test]
+fn a_row_a_negation_keeps_over_a_missing_answer_is_never_told_sound() {
+    let mut wrong = Vec::new();
+    for data in [":a0 a :C2 .", ":a0 a :C0 , :C2 ."] {
+        let dl = pipeline();
+        insert(&dl, &format!("{THING} {data}")).expect("committed");
+        for read in [
+            "SELECT ?x { VALUES ?x { :C2 } FILTER NOT EXISTS { ?x a :C0 } }",
+            "SELECT ?x { VALUES ?x { :C2 } MINUS { ?x a :C0 } }",
+            "SELECT ?x { ?x a :C2 FILTER NOT EXISTS { :C2 a :C0 } }",
+        ] {
+            let (rows, status) = query_with(&dl, read, None).expect("answers");
+            let told = status.shared.as_str();
+            if !rows.is_empty() && status.shared.sound {
+                wrong.push(format!(
+                    "{data} {read}: {rows:?}, {told}, {:?}",
+                    status.reasons()
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The exact services don't evaluate filters, so that U1's element for every element is
+/// entailed in C0 says nothing of `?x a :C0` under a filter: such a read, `FILTER(false)`
+/// (no answers) or `FILTER(?x = :C2)` (C2 alone), is never told that every name is an answer.
+#[test]
+fn a_filtered_read_is_never_told_every_name_answers_it() {
+    let dl = pipeline();
+    insert(&dl, &format!("{THING} :a0 a :C2 .")).expect("committed");
+    for read in [
+        "SELECT ?x { ?x a :C0 FILTER(false) }",
+        "SELECT ?x { ?x a :C0 FILTER(?x = :C2) }",
+    ] {
+        let (_, status) = query_with(&dl, read, None).expect("answers");
+        let told = status.reasons();
+        let every = told.iter().filter(|r| r.contains("holds of every element"));
+        assert_eq!(every.count(), 0, "{read}: {told:?}");
+    }
+}
+
 /// Reads where no fact holds of every element stay `complete` with the regime's answers: a
 /// union over all (no name is entailed in C0), a range, a domain of a stated edge, and an OWL
 /// 2 RL ontology on the rules route, where no element need be in any class but `owl:Thing`.
