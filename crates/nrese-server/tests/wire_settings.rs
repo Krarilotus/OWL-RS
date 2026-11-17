@@ -227,6 +227,79 @@ fn invalid_public_urls_are_refused_without_echoing_configured_text() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+// Spec: TOML errors name the file or key and kind without disclosing values,
+// including public URLs with userinfo and credential fields, before startup.
+#[test]
+fn rejected_file_values_are_never_echoed_in_configuration_errors() {
+    let mut wrong = Vec::new();
+    for (key, kind, contents) in [
+        (
+            "server.public_url",
+            "text",
+            "[server]\npublic_url = [\"https://wire-marker:unused@public.invalid/prefix\"]\n",
+        ),
+        (
+            "server.public_url",
+            "text",
+            "[server]\npublic_url = { address = \"https://wire-marker:unused@public.invalid/prefix\" }\n",
+        ),
+        (
+            "auth.bearer_static.admin_token",
+            "text",
+            "[auth.bearer_static]\nadmin_token = [\"wire-marker\"]\n",
+        ),
+        (
+            "config.toml",
+            "parse",
+            "[server]\npublic_url = https://wire-marker:unused@public.invalid/prefix\n",
+        ),
+    ] {
+        for mode in ["check-config", "startup"] {
+            let dir = tempfile::tempdir().unwrap();
+            let config = dir.path().join("config.toml");
+            let stdout = dir.path().join("stdout");
+            let stderr = dir.path().join("stderr");
+            std::fs::write(&config, contents).unwrap();
+            let mut command = isolated_command(dir.path());
+            command
+                .env("NRESE_CONFIG_PATH", &config)
+                .env("NRESE_BIND_ADDR", "127.0.0.1:0");
+            if mode == "check-config" {
+                command.arg("check-config");
+            }
+            let child = command
+                .stdout(std::fs::File::create(&stdout).unwrap())
+                .stderr(std::fs::File::create(&stderr).unwrap())
+                .spawn()
+                .unwrap();
+            let mut process = Server {
+                child,
+                base: String::new(),
+                _dir: dir,
+            };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = process.child.try_wait().unwrap() {
+                    break status;
+                }
+                assert!(Instant::now() < deadline, "configuration refusal deadline");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let summary = std::fs::read_to_string(stdout).unwrap();
+            let error = std::fs::read_to_string(stderr).unwrap();
+            let disclosed = summary.contains("wire-marker") || error.contains("wire-marker");
+            let named = error.contains(key) && error.contains(kind);
+            if disclosed || status.success() || !named {
+                wrong.push(format!(
+                    "{key}/{mode}: disclosed={disclosed}, refused={}, named={named}",
+                    !status.success()
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 // Spec: a refused URL is rejected before listening, so neither a startup log
 // nor an HTTP response can expose its distinctive configured text.
 #[tokio::test]
