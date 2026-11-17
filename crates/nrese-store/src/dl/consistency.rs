@@ -91,12 +91,18 @@ pub(crate) fn nameless(_: u64) -> String {
     "_".to_owned()
 }
 
+/// `term` as written where it is an IRI or a literal; a blank node's label, or a triple term's,
+/// which may hold one, is the store's, not the user's.
+pub(crate) fn as_written(term: nrese_rdf::Term) -> Option<String> {
+    use nrese_rdf::Term::{Literal, NamedNode};
+    matches!(term, NamedNode(_) | Literal(_)).then(|| term.to_string())
+}
+
 /// `term` as `tx`'s data writes it: an IRI or literal as itself, a blank node by a statement
 /// pointing to it from a named subject, else by one of its own to a named object. It reads
 /// every graph: for readers of every graph only.
 pub(crate) fn named(tx: &impl PendingView, term: u64) -> String {
-    let shown = |t: TermId| tx.decode(t).filter(|_| t.kind() != TermKind::BlankNode);
-    let shown = |t| shown(t).map(|t| t.to_string());
+    let shown = |t| tx.decode(t).and_then(as_written);
     let id = TermId::from_raw(term);
     if id.kind() != TermKind::BlankNode {
         return shown(id).unwrap_or_else(|| nameless(term));
