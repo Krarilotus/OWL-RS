@@ -291,7 +291,10 @@ impl ServerConfig {
 
         Ok(Self {
             bind_address,
-            public_url: source.get(names::PUBLIC_URL),
+            public_url: source
+                .get(names::PUBLIC_URL)
+                .map(parse_public_url)
+                .transpose()?,
             deployment_posture,
             store,
             reasoner,
@@ -300,6 +303,26 @@ impl ServerConfig {
             replication,
         })
     }
+}
+
+/// Validates the external base before it can enter logs or response headers.
+fn parse_public_url(value: String) -> Result<String> {
+    let invalid = || {
+        anyhow::anyhow!(
+            "server.public_url must be an absolute HTTP(S) base URL without userinfo, controls, query or fragment"
+        )
+    };
+    let url = reqwest::Url::parse(&value).map_err(|_| invalid())?;
+    if !matches!(url.scheme(), "http" | "https")
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || value.chars().any(char::is_control)
+        || url.query().is_some()
+        || url.fragment().is_some()
+    {
+        return Err(invalid());
+    }
+    Ok(url.to_string())
 }
 
 fn parse_deployment_posture(input: Option<&str>) -> Result<DeploymentPosture> {

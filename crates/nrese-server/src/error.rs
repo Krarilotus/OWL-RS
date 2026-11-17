@@ -24,7 +24,7 @@ pub enum ApiError {
         reject: Box<Option<RejectExplanationView>>,
     },
     #[error("unauthorized: {0}")]
-    Unauthorized(String, &'static str),
+    Unauthorized(String, Option<&'static str>),
     #[error("forbidden: {0}")]
     Forbidden(String),
     #[error("not found: {0}")]
@@ -68,10 +68,10 @@ impl ApiError {
     }
 
     pub fn unauthorized(message: impl Into<String>) -> Self {
-        Self::Unauthorized(message.into(), "Bearer")
+        Self::Unauthorized(message.into(), Some("Bearer"))
     }
 
-    pub fn with_challenge(mut self, challenge: &'static str) -> Self {
+    pub fn with_challenge(mut self, challenge: Option<&'static str>) -> Self {
         if let Self::Unauthorized(_, value) = &mut self {
             *value = challenge;
         }
@@ -180,7 +180,7 @@ impl IntoResponse for ApiError {
             return response;
         }
         let challenge = match &self {
-            Self::Unauthorized(_, challenge) => Some(*challenge),
+            Self::Unauthorized(_, challenge) => *challenge,
             _ => None,
         };
         let (status, detail, reasoner_reject) = match self {

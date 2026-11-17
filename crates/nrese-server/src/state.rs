@@ -308,6 +308,7 @@ impl AppState {
     }
 
     /// Sets the externally reachable URL once at server startup.
+    /// Startup passes ServerConfig's validated URL; in-process callers are trusted.
     pub fn with_public_url(mut self, public_url: Option<String>) -> Self {
         Arc::make_mut(&mut self.shared).public_url = public_url;
         self
