@@ -292,6 +292,11 @@ leave something out.
 - A commit that changes the shapes is checked against the shapes as they are after it: one
   update that removes the shapes and adds data is checked against none. It needs the right to
   write the shapes graph.
+- The gate follows a recursive shape (one that refers to itself through `sh:node`, inside
+  `sh:or` too) one step back from the changed statements. A write whose new violation lies two
+  or more such steps from the target node is accepted, and a full validation
+  (`GET /dataset/shacl`) reports it afterwards. Where recursive shapes matter, run one after
+  writes.
 - Shapes that don't compile refuse every write, and a validation stopped by its budget fails
   the write, with the gate set to `report` as to `enforce`.
 

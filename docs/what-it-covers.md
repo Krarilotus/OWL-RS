@@ -156,7 +156,7 @@ The two checks:
    transaction, and checks consistency. Under `owl2-dl` the DL engines check it too, and a check
    they don't decide lets the commit through, with the status `unknown`.
 2. With the SHACL gate on, the shapes validate the focus nodes the change can affect, inferred
-   statements included. Only what the commit introduces counts, so data that was invalid before
+   statements included (through a recursive shape, one step back: [limits](limits.md#shacl)). Only what the commit introduces counts, so data that was invalid before
    doesn't block it. Shapes that can't be used can refuse a write under any setting
    ([`shacl.gate`](ops/config-reference.md#shacl.gate) says when).
 
