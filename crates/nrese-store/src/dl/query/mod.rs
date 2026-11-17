@@ -547,7 +547,7 @@ fn by_index(snapshot: &Snapshot) -> Option<Option<String>> {
     let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
     let asserted =
         |s, p, o| snapshot.quads_for_pattern_in(ReadModel::Asserted, &any_graph(s, p, o));
-    let properties = annotation_properties(snapshot, None);
+    let properties: Vec<_> = annotation_properties(snapshot, |_| true).collect();
     let schema = ["domain", "range", "subPropertyOf"].map(|l| id(&format!("{RDFS}{l}")));
     let axioms = |s: TermId| {
         let of = |p| asserted(Some(s), Some(p), None).next().is_some();
@@ -561,29 +561,26 @@ fn by_index(snapshot: &Snapshot) -> Option<Option<String>> {
     (!equal_terms(snapshot)).then_some(None)
 }
 
-/// The annotation properties by the reader's rule (declared by its table, OWL 1's
-/// `owl:OntologyProperty` too, IRIs only, or built in); of `only`, whether it is one, a probe
-/// per declaring type, none where the store doesn't know the IRI.
-fn annotation_properties(snapshot: &Snapshot, only: Option<&str>) -> Vec<TermId> {
+/// The annotation properties by the reader's rule: declared by its table (OWL 1's
+/// `owl:OntologyProperty` too) in a graph `readable` takes, IRIs only, then the built-ins
+/// the store knows; lazily, a declaring type at a time.
+fn annotation_properties(
+    snapshot: &Snapshot,
+    readable: impl Fn(TermId) -> bool,
+) -> impl Iterator<Item = TermId> {
     use nrese_engine::TermKind;
     use nrese_owl::{BUILTIN_ANNOTATIONS as BUILTIN, EntityKind};
-    let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
-    let one = only.map(id);
-    if let Some(p) = one.filter(|p| p.is_none() || only.is_some_and(|i| BUILTIN.contains(&i))) {
-        return p.into_iter().collect();
-    }
-    let (ty, kinds, subject) = (id(RDF_TYPE), nrese_owl::DECLARATION_KINDS, one.flatten());
-    let quads = |pattern| snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern);
-    let typed = kinds
-        .into_iter()
-        .filter(|&(_, k)| k == EntityKind::AnnotationProperty);
-    let typed = typed.filter_map(|(iri, _)| ty.and(id(iri)));
-    let declared = typed.flat_map(|a| quads(any_graph(subject, ty, Some(a))));
-    let named = declared
+    let id = move |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+    let (ty, kinds) = (id(RDF_TYPE), nrese_owl::DECLARATION_KINDS.into_iter());
+    let typed = kinds.filter(|&(_, k)| k == EntityKind::AnnotationProperty);
+    let typed = typed.filter_map(move |(iri, _)| ty.and(id(iri)));
+    let quads =
+        move |a| snapshot.quads_for_pattern_in(ReadModel::Asserted, &any_graph(None, ty, Some(a)));
+    let named = typed.flat_map(quads).filter(move |q| readable(q.graph));
+    let named = named
         .map(|q| q.subject)
         .filter(|s| s.kind() == TermKind::Iri);
-    let builtin = BUILTIN.map(id).into_iter().flatten();
-    named.chain(builtin.filter(|_| only.is_none())).collect()
+    named.chain(BUILTIN.into_iter().filter_map(id))
 }
 
 /// Whether `snapshot` holds `owl:sameAs` between two different terms: the first found
@@ -783,6 +780,7 @@ pub(crate) fn certify(
     let quarantined = snapshot
         .and_then(crate::service::Certificate::of)
         .is_some_and(|c| c.state.violations > 0);
+    let given = snapshot;
     let snapshot = snapshot.filter(|_| access.is_none());
     let typed = |predicate: &Option<String>| {
         snapshot.is_none_or(|s| match predicate {
@@ -799,15 +797,15 @@ pub(crate) fn certify(
     if quarantined && completeness.complete {
         completeness.incomplete(source, QUARANTINE.to_owned());
     }
-    annotation_rule(completeness, (query, reads), source, snapshot);
+    annotation_rule(completeness, (query, reads), source, given);
     negation_rule(completeness, (query, reads), source);
 }
 
 /// Where the status speaks of the OWL 2 Direct Semantics (`owl2-dl`, or the QL rewriting's,
 /// not a ruleset's own closure), a read that may return the rules' copy of an annotation
 /// statement ([`copied`]) makes the answers unsound: OWL 2 DL gives annotations no meaning, so
-/// an equality or an annotation axiom entails no copy. From `snapshot` as given; for a reader
-/// of some graphs who sees inferences, from nothing hidden: every read but `rdf:type`.
+/// an equality or an annotation axiom entails no copy. From `snapshot` as given (with none,
+/// every read but `rdf:type`); for a reader of some graphs, membership from its own graphs.
 pub(crate) fn annotation_rule(
     completeness: &mut Completeness,
     (query, reads): (&Query, &Reads),
@@ -818,10 +816,11 @@ pub(crate) fn annotation_rule(
         return;
     }
     let read = reads.predicates.get_or_init(|| predicates(query));
-    let found = match (reads.access.as_deref(), snapshot) {
-        (Some(access), _) if !access.inferred => None,
-        (None, Some(snapshot)) => copied(snapshot, read),
-        _ => read.first(),
+    let access = reads.access.as_deref();
+    let found = match snapshot {
+        _ if access.is_some_and(|a| !a.inferred) => None,
+        Some(s) => copied(s, |g| access.is_none_or(|a| a.allows_id(s, g)), read),
+        None => read.first(),
     };
     let Some(p) = found else { return };
     let what = p.as_ref().map(|p| format!("reads <{p}>"));
@@ -833,17 +832,36 @@ pub(crate) fn annotation_rule(
 const COPIES: &str = "and the closure may hold the rules' copies of annotation statements (by \
                       an equality or an annotation axiom), which OWL 2 DL doesn't entail";
 
-/// The first of `read` that may return a copy in `snapshot`: an annotation property (any, for
-/// `None`; none, an IRI the store doesn't know), where an equality between two different terms
-/// or an inferred statement of one is.
-fn copied<'a>(snapshot: &Snapshot, read: &'a [Option<String>]) -> Option<&'a Option<String>> {
+/// The first of `read` that may return a copy in `snapshot`: an annotation property (one of
+/// [`annotation_properties`], for `None`; a constant by its own declarations or as built in,
+/// none where the store doesn't know the IRI) with statements held where an equality between
+/// two different terms is, or inferred ones.
+fn copied<'a>(
+    snapshot: &Snapshot,
+    readable: impl Fn(TermId) -> bool + Copy,
+    read: &'a [Option<String>],
+) -> Option<&'a Option<String>> {
+    use ReadModel::{Inferred, Materialised};
+    use nrese_owl::{BUILTIN_ANNOTATIONS as BUILTIN, DECLARATION_KINDS, EntityKind};
+    let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
     let equal = std::cell::OnceCell::new();
-    read.iter().find(|p| {
-        let members = annotation_properties(snapshot, p.as_deref());
-        let inferred =
-            |&p| snapshot.exists_in(ReadModel::Inferred, &any_graph(None, Some(p), None));
-        !members.is_empty()
-            && (*equal.get_or_init(|| equal_terms(snapshot)) || members.iter().any(inferred))
+    let copies = |p| {
+        let equal = *equal.get_or_init(|| equal_terms(snapshot));
+        let model = if equal { Materialised } else { Inferred };
+        snapshot.exists_in(model, &any_graph(None, Some(p), None))
+    };
+    let kind = |k: &str| DECLARATION_KINDS.contains(&(k, EntityKind::AnnotationProperty));
+    let declares = |q: nrese_engine::EncodedQuad| {
+        let object = snapshot.decode(q.object);
+        readable(q.graph) && matches!(object, Some(Term::NamedNode(k)) if kind(k.as_str()))
+    };
+    let asserted = |pattern| snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+    read.iter().find(|p| match p.as_deref() {
+        None => annotation_properties(snapshot, readable).any(copies),
+        Some(iri) => id(iri).is_some_and(|p| {
+            let typed = id(RDF_TYPE).map(|ty| asserted(any_graph(Some(p), Some(ty), None)));
+            (BUILTIN.contains(&iri) || typed.into_iter().flatten().any(declares)) && copies(p)
+        }),
     })
 }
 

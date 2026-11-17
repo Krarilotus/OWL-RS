@@ -658,16 +658,25 @@ fn denied_path(path: &PropertyPathExpression) -> Option<String> {
     }
 }
 
-/// The predicates `query` reads ([`analyse`]'s), each once, `None` for any (a variable
-/// predicate, a negated property set, DESCRIBE), `rdf:type` aside: no annotation is a class
-/// assertion.
+/// The predicates `query` reads, by [`analyse`]'s steps but its own walk (no shape built),
+/// each once, `None` for any (a variable predicate, a negated property set, DESCRIBE),
+/// `rdf:type` aside: no annotation is a class assertion.
 pub(super) fn predicates(query: &Query) -> Vec<Option<String>> {
-    let describe = matches!(query, Query::Describe { .. }).then_some(None);
-    let reads = analyse(query)
-        .reads
-        .into_iter()
-        .map(|(p, _)| p)
-        .chain(describe);
+    let mut reads = Vec::new();
+    if matches!(query, Query::Describe { .. }) {
+        reads.push((None, None));
+    }
+    pattern_of(query).find(&mut |node| {
+        match node {
+            Node::Pattern(GraphPattern::Bgp { patterns }) => {
+                reads.extend(patterns.iter().map(pattern_reads));
+            }
+            Node::Pattern(GraphPattern::Path { path, .. }) => path_reads(path, &mut reads),
+            _ => {}
+        }
+        false
+    });
+    let reads = reads.into_iter().map(|(p, _)| p);
     let mut reads: Vec<_> = reads.filter(|p| p.as_deref() != Some(RDF_TYPE)).collect();
     reads.sort();
     reads.dedup();
