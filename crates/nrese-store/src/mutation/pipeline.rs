@@ -387,11 +387,13 @@ impl MutationPipeline {
                     &|view, dl_gate_budget| self.view_reason(view, dl_gate_budget, &resources),
                     &envelope,
                 );
-                // What the reader left out: none where consistent (`consistency::check`).
+                // What the reader left out, named from the transaction once, here: none where
+                // consistent (`consistency::check`).
+                let name = |t| crate::dl::consistency::named(&tx, t);
                 let read = bounds
                     .ontology
                     .take()
-                    .map(|o| crate::dl::query::left_out(&o));
+                    .map(|o| crate::dl::query::left_out(&o, &name));
                 let consistent = gate.checked.verdict == crate::dl::Verdict::Consistent;
                 (gate, bounds, read.or(consistent.then_some(None)))
             });
@@ -429,6 +431,16 @@ impl MutationPipeline {
             // the commit changes of individuals' memberships of class expressions, before the
             // commit publishes.
             let ql = crate::service::Certificate::of(tx.base()).and_then(|c| c.ql.clone());
+            // In quarantine the commit checks only its own facts: its version keeps no
+            // assessment of its consistency. The mark rises first (odd: unassessed), then the
+            // old assessment and its marker go, before the commit publishes: a removal that
+            // fails fails the write and leaves the store in quarantine.
+            let quarantined = self.store.is_quarantined();
+            if quarantined {
+                (self.store.unassessed).fetch_or(1, std::sync::atomic::Ordering::Release);
+                let writer = tx.writer().expect("a transaction holds the writer slot");
+                self.store.invalidate_held(writer).map_err(store_error)?;
+            }
             if let Some(certificate) = tx.base().certificate().cloned() {
                 tx.vouch(certificate);
             }
@@ -467,12 +479,7 @@ impl MutationPipeline {
             crate::service::hooks::run(&crate::service::hooks::BEFORE_REVALIDATION);
             // In quarantine the commit checked only its own facts: revalidate everything, so
             // the store leaves quarantine once the data is repaired. The commit itself stands.
-            if matches!(
-                self.store.consistency(),
-                crate::ConsistencyStatus::Inconsistent { .. }
-                    | crate::ConsistencyStatus::Undecided { .. }
-            ) && let Err(error) = self.store.rematerialise(&rules)
-            {
+            if quarantined && let Err(error) = self.store.rematerialise(&rules) {
                 tracing::error!(%error, "revalidation after a commit in quarantine failed");
             }
             return Ok(report.committed(summary.revision));

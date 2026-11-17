@@ -46,6 +46,11 @@ pub struct StoreService {
     /// The reasoning state recorded this process (also for in-memory stores, which have no
     /// file).
     materialised: std::sync::Arc<std::sync::Mutex<Option<crate::ReasoningState>>>,
+    /// Odd from a commit on a store in quarantine, which keeps no assessment of its
+    /// consistency, until a rematerialisation records one ([`Self::is_quarantined`]); it only
+    /// rises, so two equal readings saw no such commit or recording between them. In memory
+    /// only: that commit removes the marker first, so a reopen rebuilds.
+    pub(crate) unassessed: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Shared by the store's clones: a clone with its own record would never see a commit's mark.
     pub(crate) lists: std::sync::Arc<crate::reasoning::ListsKept>,
     /// The certificate's epoch, a sequence lock over its changes ([`Self::certificate_epoch`]):
@@ -127,6 +132,13 @@ impl Certificate {
     /// `snapshot`'s, if it has one of this type; any other reads as none.
     pub(crate) fn of(snapshot: &Snapshot) -> Option<&Self> {
         snapshot.certificate()?.downcast_ref()
+    }
+
+    /// Whether `snapshot` was never reasoned over: no inferred statement, no certificate, and
+    /// no rules in place (`rules`). Anything else without a certificate is a stack nothing
+    /// vouches for.
+    pub(crate) fn bare(snapshot: &Snapshot, rules: bool) -> bool {
+        snapshot.len_in(ReadModel::Inferred) == 0 && !rules && Self::of(snapshot).is_none()
     }
 
     /// Whether `snapshot` reads under `owl2-dl`, and whether user rules run with it: as its
@@ -336,12 +348,19 @@ impl StoreService {
             marker: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
             unavailable,
             materialised: std::sync::Arc::default(),
+            unassessed: std::sync::Arc::default(),
             lists: Default::default(),
             certificate_epoch: std::sync::Arc::default(),
             ql_mode: std::sync::Arc::new(std::sync::RwLock::new(ql_mode)),
             outside_profile: std::sync::Arc::new(std::sync::RwLock::new(outside_profile)),
             last_materialisation: std::sync::Arc::default(),
         };
+        // Every store a replica server opens is a replica's from its open on, the default and
+        // the catalog's others alike: its `owl2-dl` mode interns no term (the default's
+        // dictionary continues the primary's), and its refusals say the replica's sentence.
+        if service.config.replica {
+            service.dl.set_replica();
+        }
         // The planner's statistics are the store's, shared by its requests: an envelope of
         // their own within the catalog's budget, exact (no request's credit: it lives as long
         // as the store).
@@ -590,6 +609,28 @@ impl StoreService {
             .map_or(crate::ConsistencyStatus::Unknown, |state| {
                 state.consistency()
             })
+    }
+
+    /// Whether the store is in quarantine, readable and repairable but not ready: its data
+    /// inconsistent, or its rules' violations undecided, under the recorded reasoning; or,
+    /// since a commit on a store in quarantine, its consistency not assessed again.
+    ///
+    /// The mark, the assessment, the mark again, in that order. A commit in quarantine
+    /// raises the mark before it removes the assessment, so an assessment read as removed
+    /// comes with a mark read as raised; a recording clears the mark after it records, so a
+    /// mark read as cleared comes with the assessment recorded. A mark that moved between the
+    /// two readings is answered as quarantine, as the reading may have straddled the start or
+    /// the end of one; it may also have seen one already finished, and answers quarantine
+    /// then too.
+    pub fn is_quarantined(&self) -> bool {
+        use crate::ConsistencyStatus::{Inconsistent, Undecided};
+        let mark = self.unassessed.load(std::sync::atomic::Ordering::Acquire);
+        #[cfg(test)]
+        hooks::run(&hooks::BETWEEN_QUARANTINE_READS);
+        let assessed = matches!(self.consistency(), Inconsistent { .. } | Undecided { .. });
+        assessed
+            || mark % 2 == 1
+            || mark != self.unassessed.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Whether the certificate covers `program` for a holder of the writer slot: no write can
@@ -909,6 +950,7 @@ impl StoreService {
             by_representatives: self.config.equality_by_representatives,
             compact: self.config.equality_compact,
             cap: self.config.support_sets,
+            replica: self.dl.replica(),
         }
     }
 
@@ -964,13 +1006,6 @@ impl StoreService {
         if let Some(state) = self.reasoning_state() {
             self.certify(&tx, state);
         }
-    }
-
-    /// Marks the store as a read replica: it follows a primary's log, whose dictionary
-    /// its own must continue, so the `owl2-dl` mode interns no term here (it reads the
-    /// terms the primary's records bring).
-    pub fn mark_replica(&self) {
-        self.dl.set_replica();
     }
 
     /// The `owl2-dl` mode's state.
@@ -1298,8 +1333,7 @@ impl StoreService {
         let snapshot = at.snapshot();
         let unpublished = matches!(at, Revision::Committed(_)) && snapshot.shared_state().is_none();
         let Some(certificate) = Certificate::of(snapshot).filter(|_| !unpublished) else {
-            let bare = snapshot.len_in(ReadModel::Inferred) == 0 && !self.supports.has_rules();
-            let bare = bare && Certificate::of(snapshot).is_none();
+            let bare = Certificate::bare(snapshot, self.supports.has_rules());
             return (!bare).then(nrese_sparql::Completeness::not_certified);
         };
         let mut status = route?;
@@ -1666,7 +1700,8 @@ impl StoreService {
             &mut |tx, request| {
                 crate::mutation::command::apply_sparql_update(tx, request, &requester, &context)
             },
-        )?;
+        )
+        .map_err(crate::StoreError::refusal_within)?;
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
             Some(reading) => reading.pending(&tx, &budget)?,
             // Operations that touch no input of the list scan (a list fact; under compact
@@ -2144,6 +2179,11 @@ impl StoreService {
         statement: [nrese_rdf::TermRef<'_>; 3],
     ) -> StoreResult<Option<Vec<crate::reasoning::InferenceStep>>> {
         let snapshot = self.engine.snapshot();
+        // Admitted as every read is ([`Self::view_of`]) before anything of the snapshot is
+        // read: a proof under rules nothing vouches its stack for would show a reader of
+        // some graphs what a premise it can't read decides.
+        let envelope = self.settings.envelope(None);
+        self.view_of(&snapshot, scope.access(), &envelope, None)?;
         let program = self.bound_program(&snapshot, program);
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
@@ -2194,6 +2234,9 @@ impl StoreService {
         mode: crate::reasoning::JustificationMode,
     ) -> StoreResult<Option<crate::reasoning::JustificationAnswer>> {
         let snapshot = self.engine.snapshot();
+        // Admitted before anything of it is read, as [`Self::explain_statement_whole`].
+        let envelope = self.settings.envelope(None);
+        self.view_of(&snapshot, scope.access(), &envelope, None)?;
         let program = self.bound_program(&snapshot, program);
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
@@ -2339,10 +2382,14 @@ impl StoreService {
 
     /// Replaces the inferred stack with `program`'s closure over the asserted data, as one
     /// revision (see [`crate::reasoning`]). For after bulk loads, at startup and after a
-    /// change of rules; commits keep it current afterwards. A store used as a library that
-    /// rematerialises with no reasoner registered (no pipeline) reads a later version
-    /// without inferred statements or certificate as one no reasoning can leave answers
-    /// out of: no status, not `not-certified`; a server registers its rules first.
+    /// change of rules; commits keep it current afterwards. Register `program` as well
+    /// ([`Self::use_reasoning_rules`]; the mutation pipeline registers its own): while the
+    /// rules in place aren't the ones the stack was made with, readers of some graphs who
+    /// see inferred statements are refused until the store is rematerialised. A store used
+    /// as a library that rematerialises with no reasoner registered (no pipeline) reads a
+    /// later version without inferred statements or certificate as one no reasoning can
+    /// leave answers out of: no status, not `not-certified`; a server registers its rules
+    /// first.
     pub fn rematerialise(
         &self,
         program: impl Into<nrese_reasoner::RuleProgram>,
@@ -2445,6 +2492,9 @@ impl StoreService {
         // From here the new inferences are published: a failure says so.
         self.record_reasoning(finished.writer(), state)
             .map_err(|error| crate::StoreError::InferencesNotRecorded(Box::new(error)))?;
+        // Under the writer slot: no commit raises the mark between the reading and the rise.
+        let mark = self.unassessed.load(std::sync::atomic::Ordering::Relaxed);
+        (self.unassessed).fetch_add(mark % 2, std::sync::atomic::Ordering::Release);
         drop(finished);
         if let Some(why) = undecided {
             let text = why.text(violations);
@@ -2683,6 +2733,8 @@ pub(crate) mod hooks {
         pub(crate) static BEFORE_CLEAR_PUBLICATION: Hook = const { RefCell::new(None) };
         /// A reasoning commit in quarantine has published and is about to revalidate.
         pub(crate) static BEFORE_REVALIDATION: Hook = const { RefCell::new(None) };
+        /// A quarantine reading has read the mark and is about to read the assessment.
+        pub(crate) static BETWEEN_QUARANTINE_READS: Hook = const { RefCell::new(None) };
     }
 
     pub(crate) fn run(hook: &'static LocalKey<Hook>) {

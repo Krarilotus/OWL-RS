@@ -120,6 +120,11 @@ pub enum StoreError {
         .limit >> 20
     )]
     MemoryLimitWithoutAmounts { limit: usize, shared: bool },
+    /// A reader of some graphs who sees inferences, refused while nothing vouches that the
+    /// inferred statements are the closure of the rules in place: until the store is
+    /// rematerialised, which a read replica isn't (`replica`).
+    #[error("{}", not_rematerialised(.replica))]
+    NotRematerialised { replica: bool },
 }
 
 /// Why graph-level access control refused a request.
@@ -189,6 +194,20 @@ impl StoreError {
             Some((limit, shared)) => Self::MemoryLimitWithoutAmounts { limit, shared },
             None => self,
         }
+    }
+
+    /// This error, or the refusal before rematerialisation ([`Self::NotRematerialised`]) an
+    /// update's `WHERE` met, which its evaluation carries as its dataset's failure: a read of
+    /// a session's pending operations is refused as any other read.
+    pub(crate) fn refusal_within(self) -> Self {
+        let replica = match self.evaluation() {
+            Some(QueryEvaluationError::Dataset(error)) => match error.downcast_ref::<Self>() {
+                Some(&Self::NotRematerialised { replica }) => Some(replica),
+                _ => None,
+            },
+            _ => None,
+        };
+        replica.map_or(self, |replica| Self::NotRematerialised { replica })
     }
 
     /// The evaluation error, of a query or of an update's pattern: both are classified
@@ -261,6 +280,7 @@ impl StoreError {
             | Self::LoadCancelled
             | Self::Undecided(_)
             | Self::ClassificationCancelled
+            | Self::NotRematerialised { .. }
             | Self::CompactPrimary
             // Answered by the transport as what it is (the query is fine; its answers
             // can't be proven complete).
@@ -275,6 +295,17 @@ fn memory_refusal(shared: &bool) -> &'static str {
     match shared {
         true => "the server's query memory is in use",
         false => "query memory budget exceeded",
+    }
+}
+
+/// What a refusal before rematerialisation says, on a primary and on a read replica.
+fn not_rematerialised(replica: &bool) -> &'static str {
+    match replica {
+        false => "the inferred statements aren't the rules' closure: rematerialise first",
+        true => {
+            "the inferred statements aren't known to be the rules' closure, and this store \
+             is a read replica: it doesn't serve this read"
+        }
     }
 }
 

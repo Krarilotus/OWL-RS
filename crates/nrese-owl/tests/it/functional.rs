@@ -237,6 +237,31 @@ fn every_functional_construct_is_read() {
 
 /// What can't be read is a diagnostic at its line and column; the axiom it is in is left
 /// out, and the rest is read.
+/// A diagnostic that names no term (text not read, a DL-safe rule) is told in words with
+/// where it is, the line and column or the rule's place among the rules (from 1), never in
+/// a debug form.
+#[test]
+fn a_diagnostic_without_terms_is_told_in_words_where_it_is() {
+    let text = "Prefix(:=<http://example.com/>)\nOntology(\nFrobnicate(:A)\n\
+                DLSafeRule(Body(ClassAtom(:A Variable(:x))) Head())\n)";
+    let (o, _) = read_functional(text, &mut Table::default());
+    let told = |kind: fn(&Diagnostic) -> bool| -> Vec<String> {
+        let found = o.diagnostics.iter().filter(|d| kind(d));
+        found.map(|d| d.describe(&|t| format!("#{t}"))).collect()
+    };
+    let syntax = told(|d| matches!(d, Diagnostic::Syntax { .. }));
+    let rules = told(|d| matches!(d, Diagnostic::Rule { .. }));
+    let in_words = |t: &String, at: &str| t.contains(at) && !t.contains('{') && !t.contains('#');
+    assert!(
+        matches!(&syntax[..], [t] if in_words(t, "line 3, column 1")),
+        "{syntax:?}"
+    );
+    assert!(
+        matches!(&rules[..], [t] if in_words(t, "rule 1,")),
+        "{rules:?}"
+    );
+}
+
 #[test]
 fn unreadable_functional_text_is_reported_where_it_is() {
     let text = "Prefix(:=<http://example.com/>)

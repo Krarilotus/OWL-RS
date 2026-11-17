@@ -10,13 +10,15 @@ use std::sync::Arc;
 
 use nrese_reasoner::rulesets::Ruleset;
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode, UserRules};
+use nrese_sparql::GraphAccess;
 use nrese_store::{
-    BulkLoadRequest, CancellationToken, GraphTarget, MutationPipeline, QlRewritingMode,
+    BulkLoadRequest, CancellationToken, GraphTarget, MutationPipeline, QlRewritingMode, ReadScope,
     SparqlQueryRequest, SparqlUpdateRequest, StatementOp, StatementsRequest, StoreConfig,
     StoreService,
 };
 
 use crate::dl::{PREFIXES, insert, pipeline};
+use crate::support::Writes;
 
 /// A subclass and an instance of it, and an instance of `:C` for the negated read.
 const DATA: &str = ":Dog rdfs:subClassOf :Animal . :rex a :Dog . :a a :C .";
@@ -502,6 +504,251 @@ fn a_publication_of_new_statements_is_certified_only_by_what_built_them() {
                 replace,
             );
             cells.class(name, &status(&store, READ), "not-certified");
+        }
+    }
+    cells.finish();
+}
+
+/// A reader who sees the inferences its graphs support reads a view built with the support
+/// program the store was told to use (`use_reasoning_rules`). Where that program isn't the
+/// one the certificate was made with, the view's inferred statements are no certified
+/// closure, and the view may show what a graph the reader can't read asserts: the read is
+/// refused until the store is rematerialised (R4), with no program and with another one.
+/// Under the matching program the status is the certified one, as `ql_rewriting_tests`'
+/// `rewritten_answers_follow_the_readers_graph_access` pins. A server reaches the mismatch
+/// while a repository's reasoning changes: the catalog's `settle` publishes the new
+/// certificate before the new write path sets the new program.
+#[test]
+fn a_supported_reader_whose_view_uses_another_program_is_refused() {
+    let mut cells = Cells::default();
+    let store = certified(
+        StoreConfig {
+            ql_rewriting: QlRewritingMode::On,
+            ..StoreConfig::in_memory()
+        },
+        Ruleset::Owl2Rl,
+    );
+    let supported = ReadScope::Graphs(Arc::new(GraphAccess {
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    }));
+    // The status header, or `refused: …`.
+    let read = || {
+        let request = SparqlQueryRequest::new(format!("{PREFIXES}{READ}"), supported.clone());
+        match store.execute_query(&request) {
+            Ok(result) => header(result.completeness),
+            Err(error) => format!("refused: {error}"),
+        }
+    };
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    let matching = read();
+    if matches!(class(&matching), "none" | "not-certified") || matching.starts_with("refused") {
+        cells.unmet(
+            "R4",
+            &format!("not certified under the matching program: {matching}"),
+        );
+    } else {
+        for (name, program) in [("no program", None), ("rdfs", Some(Ruleset::Rdfs.into()))] {
+            store.use_reasoning_rules(program);
+            cells.header(
+                &format!("R4 a supported reader's view, {name}"),
+                &read(),
+                |got| got.starts_with("refused") && got.contains("rematerialis"),
+                "a refusal naming rematerialisation",
+            );
+        }
+    }
+    cells.finish();
+}
+
+/// A reader of `open` who sees inferences, by support or every one, reads the same whether
+/// or not a graph it can't read asserts a statement, also while the program the store
+/// maintains its stack with isn't its certificate's: a stronger live program finds that
+/// `ex:b ex:q ex:a` follows from `open`, which the certified rdfs closure doesn't, and must
+/// not show the reader the copy only `secret` asserts: the read is refused until the store is
+/// rematerialised, with `secret` or without it. A server reaches the mismatch while a
+/// repository's reasoning changes: the catalog's `settle` publishes the new certificate
+/// before the new write path sets the new program. So, too, once the certificate is gone
+/// and the stack kept (`invalidate_reasoning`, as a bulk load leaves it until its
+/// rematerialisation): nothing then vouches for the stack, and the read is refused alike.
+#[test]
+fn a_reader_of_some_graphs_learns_nothing_from_a_hidden_graph_under_another_program() {
+    const EX: &str = "http://example.com/";
+    const OWL: &str = "PREFIX owl: <http://www.w3.org/2002/07/owl#>";
+    const OPEN: &str = "ex:p owl:inverseOf ex:q . ex:a ex:p ex:b";
+    const SECRET: &str = "ex:b ex:q ex:a";
+    let mut cells = Cells::default();
+    let reader = |by_support: bool| {
+        ReadScope::Graphs(Arc::new(GraphAccess {
+            graphs: vec![format!("{EX}open")],
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: by_support,
+            ..GraphAccess::default()
+        }))
+    };
+    // The ASK's answer to `scope` (`true`, `false`, or `refused` where the refusal names
+    // rematerialisation), `secret` asserting SECRET or not, the stack certified under rdfs and
+    // maintained under `live`, its certificate forgotten where `forgotten`.
+    let asked = |scope: &ReadScope, live: Ruleset, forgotten: bool, secret: bool| {
+        let store = StoreService::new(StoreConfig::in_memory()).expect("store");
+        let hidden = if secret {
+            format!("GRAPH ex:secret {{ {SECRET} }}")
+        } else {
+            String::new()
+        };
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "PREFIX ex: <{EX}> {OWL} INSERT DATA {{ GRAPH ex:open {{ {OPEN} }} {hidden} }}"
+            )))
+            .expect("data");
+        store.rematerialise(Ruleset::Rdfs).expect("reasoned");
+        store.use_reasoning_rules(Some(live.into()));
+        if forgotten {
+            store.invalidate_reasoning().expect("invalidated");
+        }
+        let request = SparqlQueryRequest::new(
+            format!("PREFIX ex: <{EX}> ASK {{ {SECRET} }}"),
+            scope.clone(),
+        );
+        match store.execute_query(&request) {
+            Ok(result) => {
+                let found = String::from_utf8(result.payload)
+                    .expect("utf-8")
+                    .contains("true");
+                found.to_string()
+            }
+            Err(error) if error.to_string().contains("rematerialis") => "refused".to_owned(),
+            Err(error) => format!("refused otherwise: {error}"),
+        }
+    };
+    for (kind, by_support) in [("visible", false), ("supported", true)] {
+        let scope = reader(by_support);
+        for (live_name, live, forgotten, want) in [
+            ("rdfs", Ruleset::Rdfs, false, "false / false"),
+            ("owl2-rl", Ruleset::Owl2Rl, false, "refused / refused"),
+            (
+                "owl2-rl, no certificate",
+                Ruleset::Owl2Rl,
+                true,
+                "refused / refused",
+            ),
+        ] {
+            let (without, with) = (
+                asked(&scope, live, forgotten, false),
+                asked(&scope, live, forgotten, true),
+            );
+            cells.header(
+                &format!("{kind}, {live_name}: the ASK without secret / with it"),
+                &format!("{without} / {with}"),
+                |got| got == want,
+                want,
+            );
+        }
+    }
+    cells.finish();
+}
+
+/// A reader of `open` who sees inferences, by support or every one, learns nothing from a
+/// graph it can't read through an explanation or a justification either, while nothing
+/// vouches that the stack is the closure of the rules in place: `ex:a ex:q ex:b` is in both
+/// stacks, made under P0 from `open`, and under P1 it follows only
+/// with the premise `secret` asserts. Explained or justified under P1 over P0's certificate,
+/// or once the certificate is gone (`invalidate_reasoning`), the request is refused, with
+/// `secret` or without it; under P0, its certificate's, it is answered alike.
+#[test]
+fn an_explanation_learns_nothing_from_a_hidden_premise_over_an_unvouched_stack() {
+    const EX: &str = "http://example.com/";
+    let program = |rule: &str| {
+        let text = format!("@prefix ex: <{EX}> .\n{rule}\n");
+        let rules = UserRules::n3("rules.n3", &text).expect("the rules compile");
+        nrese_reasoner::RuleProgram::new(None, Some(Arc::new(rules))).expect("a program")
+    };
+    let p0 = program("{ ?s ex:p ?o } => { ?s ex:q ?o } .");
+    let p1 = program("{ ?s ex:p ?o . ex:k ex:secret ex:v } => { ?s ex:q ?o } .");
+    let mut cells = Cells::default();
+    let reader = |by_support: bool| {
+        ReadScope::Graphs(Arc::new(GraphAccess {
+            graphs: vec![format!("{EX}open")],
+            default_graph: true,
+            inferred: true,
+            inferred_by_support: by_support,
+            ..GraphAccess::default()
+        }))
+    };
+    // What `scope` is told of `ex:a ex:q ex:b` under `live` (`explained` or `justified`,
+    // `none`, or `refused` where the refusal names rematerialisation), explained where
+    // `explain` and justified otherwise, `secret` asserting `ex:k ex:secret ex:v` or not, the
+    // stack certified under P0 and maintained under `live`, its certificate forgotten where
+    // `forgotten`.
+    let told = |scope: &ReadScope,
+                live: &nrese_reasoner::RuleProgram,
+                forgotten: bool,
+                secret: bool,
+                explain: bool| {
+        let store = StoreService::new(StoreConfig::in_memory()).expect("store");
+        let hidden = match secret {
+            true => "GRAPH ex:secret { ex:k ex:secret ex:v }",
+            false => "",
+        };
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ ex:a ex:p ex:b }} {hidden} }}"
+            )))
+            .expect("data");
+        store.rematerialise(&p0).expect("reasoned");
+        store.use_reasoning_rules(Some(live.clone()));
+        if forgotten {
+            store.invalidate_reasoning().expect("invalidated");
+        }
+        let term = |local: &str| nrese_rdf::NamedNode::new_unchecked(format!("{EX}{local}"));
+        let (s, p, o) = (term("a"), term("q"), term("b"));
+        let statement: [nrese_rdf::TermRef<'_>; 3] =
+            [s.as_ref().into(), p.as_ref().into(), o.as_ref().into()];
+        let answer = match explain {
+            true => store
+                .explain_statement(live, scope, statement[0], statement[1], statement[2])
+                .map(|found| found.map(|_| "explained")),
+            false => store
+                .justify_statement(
+                    live,
+                    scope,
+                    statement,
+                    nrese_store::reasoning::JustificationMode::One,
+                )
+                .map(|found| found.map(|_| "justified")),
+        };
+        match answer {
+            Ok(Some(found)) => found.to_owned(),
+            Ok(None) => "none".to_owned(),
+            Err(error) if error.to_string().contains("rematerialis") => "refused".to_owned(),
+            Err(error) => format!("refused otherwise: {error}"),
+        }
+    };
+    for (entry, explain, answered) in [
+        ("the explanation", true, "explained / explained"),
+        ("the justification", false, "justified / justified"),
+    ] {
+        for (kind, by_support) in [("visible", false), ("supported", true)] {
+            let scope = reader(by_support);
+            for (row, live, forgotten, want) in [
+                ("P0", &p0, false, answered),
+                ("P1 over P0's certificate", &p1, false, "refused / refused"),
+                ("P1, no certificate", &p1, true, "refused / refused"),
+            ] {
+                let (without, with) = (
+                    told(&scope, live, forgotten, false, explain),
+                    told(&scope, live, forgotten, true, explain),
+                );
+                cells.header(
+                    &format!("{entry}, {kind}, {row}: without secret / with it"),
+                    &format!("{without} / {with}"),
+                    |got| got == want,
+                    want,
+                );
+            }
         }
     }
     cells.finish();

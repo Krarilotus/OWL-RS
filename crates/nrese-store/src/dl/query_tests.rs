@@ -779,7 +779,8 @@ const PREF_LABEL: &str = "<http://www.w3.org/2004/02/skos/core#prefLabel>";
 /// the rules route is told the mark the whole ontology gives, naming the property, committed
 /// and inside a transaction, and its mark takes it from the store's indexes, without going
 /// to the whole ontology. A blank node declared an annotation property names none: the reader
-/// leaves its axiom out, and the store is told that part left out (the commit's record).
+/// leaves its axiom out, and the store is told that part left out (the commit's record, which
+/// names the part where the whole ontology alone doesn't: compared without it, [`first_named`]).
 #[test]
 fn an_annotation_property_axiom_marks_the_read_without_the_ontology() {
     let property = |p: &str| format!("{p} a owl:AnnotationProperty ; ");
@@ -817,10 +818,13 @@ fn an_annotation_property_axiom_marks_the_read_without_the_ontology() {
             let left_out = "1 part(s) of the data aren't OWL 2 DL and were left out";
             names.iter().any(name) || names.is_empty() && w.starts_with(left_out)
         };
-        let told: Vec<String> = whole.iter().cloned().collect();
+        let unnamed = |w: &String| first_named(&Some(w.clone()));
+        let told: Vec<_> = whole.iter().map(unnamed).collect();
         let right = whole.as_ref().is_some_and(named)
             && reads.len() == 2
-            && reads.iter().all(|read| *read == (told.clone(), 0));
+            && reads.iter().all(|(r, passes)| {
+                (r.iter().map(unnamed).collect::<Vec<_>>(), *passes) == (told.clone(), 0)
+            });
         if !right {
             wrong.push(store);
         }
