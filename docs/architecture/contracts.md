@@ -114,7 +114,8 @@ A write publishes only with the rights it was evaluated with. Its read guard on 
 writer slot and the pipeline's ground cache → the access state's read guard → the engine's commit locks. `AccessControl::apply` waits for the write
 side holding only its `writer` mutex, its system-store commit (another engine) done, so it and the guard's holder never wait on each other; the holder
 takes nothing of access control's and never reads the state again (a read queued behind `apply` would wait for itself), and no Rayon task reads it.
-`apply` waits for one publication step at most: MEASURED behind a commit that merges the largest inline window (32 Ki entries).
+`apply` waits for one publication step at most: 39 ms behind a commit that merges the largest inline window (32 Ki entries; in-memory test store,
+debug build, `access::tests::publication`, 17 Nov 2026), plus the WAL's sync on a durable store.
 
 A version's own slots (`OwnSlots`, `crates/nrese-engine/src/engine/snapshot/own_state.rs:92`) have a leaf lock: held only to look a
 value up or store one (:102), never while a value is made or dropped, and nothing is taken while it is held. `make` runs unlocked, so it may read
