@@ -1536,31 +1536,39 @@ impl<'a> Normaliser<'a> {
             }
         };
         for (chain, sup, axiom) in &self.rias {
-            // The inclusions into the class, as inclusions into `role`.
-            let chain: Vec<ObjProp> = if class.contains(&ObjProp::Named(*sup)) {
-                chain.iter().map(|&x| canonical(x)).collect()
-            } else if class.contains(&ObjProp::Inverse(*sup)) {
-                chain
-                    .iter()
-                    .rev()
-                    .map(|&x| canonical(x.inverse()))
-                    .collect()
-            } else {
-                continue;
-            };
+            // The inclusions into the class, as inclusions into `role`. `w ⊑ sup` also says
+            // `Inv(w) ⊑ sup⁻` (the role language of Kazakov, KR 2008; Horrocks, Kutz and
+            // Sattler, KR 2006, Proposition 10): it enters as `w` where `sup` is one of the
+            // class, as `Inv(w)` where `sup⁻` is, and as both where both are (`role`
+            // symmetric, or its own inverse).
+            let word: Option<Vec<ObjProp>> = class
+                .contains(&ObjProp::Named(*sup))
+                .then(|| chain.iter().map(|&x| canonical(x)).collect());
+            let inverse: Option<Vec<ObjProp>> = class
+                .contains(&ObjProp::Inverse(*sup))
+                .then(|| {
+                    chain
+                        .iter()
+                        .rev()
+                        .map(|&x| canonical(x.inverse()))
+                        .collect()
+                })
+                .filter(|w| word.as_ref() != Some(w));
             let axiom = *axiom;
-            if chain[..] == [r] {
-                // Within the class: its members' edges are `role`'s (below).
-                continue;
-            }
-            if chain[..] == [r, r] {
-                nfa.edges.push((1, None, 0, vec![axiom]));
-            } else if chain.len() > 1 && chain[0] == r {
-                path(&mut nfa, 1, &chain[1..], 1, axiom);
-            } else if chain.len() > 1 && chain[chain.len() - 1] == r {
-                path(&mut nfa, 0, &chain[..chain.len() - 1], 0, axiom);
-            } else {
-                path(&mut nfa, 0, &chain, 1, axiom);
+            for chain in word.into_iter().chain(inverse) {
+                if chain[..] == [r] {
+                    // Within the class: its members' edges are `role`'s (below).
+                    continue;
+                }
+                if chain[..] == [r, r] {
+                    nfa.edges.push((1, None, 0, vec![axiom]));
+                } else if chain.len() > 1 && chain[0] == r {
+                    path(&mut nfa, 1, &chain[1..], 1, axiom);
+                } else if chain.len() > 1 && chain[chain.len() - 1] == r {
+                    path(&mut nfa, 0, &chain[..chain.len() - 1], 0, axiom);
+                } else {
+                    path(&mut nfa, 0, &chain, 1, axiom);
+                }
             }
         }
         // An edge of `role` (or its inverse) matches each member of the class; the other
