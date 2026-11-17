@@ -196,15 +196,16 @@ fn a_chain_of_three_into_a_symmetric_role_gives_both_ends_its_range() {
     );
 }
 
-/// Spec: Table 6: the chain gives `r(x, z)`; `r` symmetric gives `r(z, x)` (and, `r` being
-/// transitive, `r(x, x)` and `r(z, z)`); the range gives `C(x)` and `C(z)`.
+/// Spec: Tables 4 and 6: the chain gives `r(x, z)`, so `C(z)` by `x : ∀r.C`; `r` symmetric
+/// gives `r(z, x)`, and `r` transitive then `r(x, x)`, so `C(x)`, which needs both: without
+/// either, `r = {(x, z)}` (or its closure) and `C = {z}` make a model.
 #[test]
-fn a_chain_into_a_transitive_symmetric_role_gives_both_ends_its_range() {
+fn a_chain_into_a_transitive_symmetric_role_takes_a_universal_back_to_its_start() {
     holds(
         &premise(&[
             ":r a owl:SymmetricProperty , owl:TransitiveProperty .",
             CHAIN,
-            RANGE,
+            ":x a [ a owl:Restriction ; owl:onProperty :r ; owl:allValuesFrom :C ] .",
             PATH,
         ]),
         &["x", "z"],
