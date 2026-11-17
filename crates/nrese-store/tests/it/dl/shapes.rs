@@ -322,6 +322,37 @@ fn a_conclusion_reads_shacl_content_as_one_store_with_its_premise() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Spec (OWL 2 Direct Semantics: a premise entails a conclusion only if each of the
+/// conclusion's axioms holds in every model of it; SHACL content has no OWL meaning only where
+/// no statement that is neither SHACL content nor an annotation names a SHACL property of the
+/// content): the premise holds `sh:path` only as SHACL content, and its axiom `owl:Thing ⊑
+/// ∃:r.{:x}` makes every individual `:r`-related to `:x`, so it entails `sh:path :r :x`
+/// without naming `sh:path`. In a conclusion `sh:path :r :x . :s sh:class :q`, read as one
+/// store with the premise, `sh:path :r :x` names `sh:path`, a property of the content, so every
+/// statement is read as any other: `:s sh:class :q` is a property assertion the premise doesn't
+/// entail, and the conclusion isn't entailed.
+#[test]
+#[ignore = "waits on a conclusion read by the SHACL rule over premise and conclusion together, \
+            its naming of the premise's SHACL content properties included"]
+fn a_conclusion_naming_a_property_of_the_premises_content_reads_its_content_as_any_other() {
+    let (path, class) = (
+        "<http://www.w3.org/ns/shacl#path>",
+        "<http://www.w3.org/ns/shacl#class>",
+    );
+    let premise = format!(
+        ":a {path} :b . :r a owl:ObjectProperty . \
+         owl:Thing rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:hasValue :x ] ."
+    );
+    let naming = entailed(&premise, &format!("{path} :r :x ."));
+    assert_eq!(naming, Entailed::Yes, "the premise entails `sh:path :r :x`");
+    let answer = entailed(&premise, &format!("{path} :r :x . :s {class} :q ."));
+    assert_eq!(
+        answer,
+        Entailed::No,
+        "`:s sh:class :q` is read as an assertion"
+    );
+}
+
 /// Spec (OWL 2 Direct Semantics: SHACL content, like an annotation, has no meaning, so an
 /// equality entails no copy of it): on the rules' route, `:s owl:sameAs :t` lets eq-rep-s copy
 /// `:s sh:path :q` to `:t`, which OWL 2 DL doesn't entail. A read that returns `:t`, through the
