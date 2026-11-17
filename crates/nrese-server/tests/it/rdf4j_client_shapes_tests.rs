@@ -283,14 +283,12 @@ async fn accepted_trig_export(union: bool) {
 }
 
 #[tokio::test]
-#[ignore = "RFC 9110 section 12.5.1 requires an accepted media type; x-trig is answered as application/trig"]
 async fn default_export_answers_in_the_only_accepted_trig_media_type() {
     // Spec: RFC 9110 12.5.1 and RDF4J GET statements say Accept x-trig -> x-trig with graphs and inference.
     accepted_trig_export(false).await;
 }
 
 #[tokio::test]
-#[ignore = "RFC 9110 section 12.5.1 requires an accepted media type; x-trig is answered as application/trig"]
 async fn union_export_answers_in_the_only_accepted_trig_media_type() {
     // Spec: RFC 9110 12.5.1 and RDF4J GET statements say Accept x-trig -> x-trig with graphs and inference.
     accepted_trig_export(true).await;
@@ -650,19 +648,18 @@ async fn wrong_basic_challenge(
 macro_rules! refused_basic {
     ($name:ident, $method:ident, $path:expr, $content:expr, $accept:expr, $body:expr) => {
         mod $name {
-        use super::*;
-        #[tokio::test]
-        #[ignore = "RFC 9110 section 15.5.2 requires WWW-Authenticate on 401; local-login refusals omit the Basic challenge"]
-        async fn defaults() {
-            // Spec: RFC 9110 15.5.2 says wrong Basic credentials -> 401 with a Basic challenge.
-            wrong_basic_challenge(false, Method::$method, $path, $content, $accept, $body).await;
-        }
-        #[tokio::test]
-        #[ignore = "RFC 9110 section 15.5.2 requires WWW-Authenticate on 401; local-login refusals omit the Basic challenge"]
-        async fn union() {
-            // Spec: RFC 9110 15.5.2 says wrong Basic credentials -> 401 with a Basic challenge.
-            wrong_basic_challenge(true, Method::$method, $path, $content, $accept, $body).await;
-        }
+            use super::*;
+            #[tokio::test]
+            async fn defaults() {
+                // Spec: RFC 9110 15.5.2 says wrong Basic credentials -> 401 with a Basic challenge.
+                wrong_basic_challenge(false, Method::$method, $path, $content, $accept, $body)
+                    .await;
+            }
+            #[tokio::test]
+            async fn union() {
+                // Spec: RFC 9110 15.5.2 says wrong Basic credentials -> 401 with a Basic challenge.
+                wrong_basic_challenge(true, Method::$method, $path, $content, $accept, $body).await;
+            }
         }
     };
 }

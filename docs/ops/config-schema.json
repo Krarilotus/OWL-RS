@@ -1142,6 +1142,11 @@
           ],
           "type": "string",
           "x-env": "NRESE_DEPLOYMENT_POSTURE"
+        },
+        "public_url": {
+          "description": "Externally reachable server URL, including a reverse proxy path prefix.",
+          "type": "string",
+          "x-env": "NRESE_PUBLIC_URL"
         }
       },
       "type": "object"
