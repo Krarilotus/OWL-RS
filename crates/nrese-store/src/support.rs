@@ -1798,6 +1798,9 @@ pub struct SupportStatistics {
 struct Generation {
     rules: Option<RuleProgram>,
     epoch: u64,
+    /// Whether rules were registered in this generation or any before it: clearing them
+    /// doesn't lower it ([`Supports::has_rules`]).
+    ever: bool,
 }
 
 /// Whether `snapshot`'s certificate was made with other rules than `generation`'s (they were
@@ -2084,12 +2087,15 @@ impl Supports {
         // them: the rules and their state change together.
         let mut state = self.state();
         let epoch = state.generation.epoch + 1;
-        *state = State::new(&self.kept, Generation { rules, epoch });
+        let ever = state.generation.ever || rules.is_some();
+        *state = State::new(&self.kept, Generation { rules, epoch, ever });
     }
 
-    /// Whether rules are registered ([`Self::use_rules`]): a reasoner maintains the stack.
+    /// Whether rules were ever registered here ([`Self::use_rules`]): a reasoner maintains,
+    /// or maintained, the stack. Clearing the rules doesn't lower it; a store opened again
+    /// starts without it.
     pub(crate) fn has_rules(&self) -> bool {
-        self.state().generation.rules.is_some()
+        self.state().generation.ever
     }
 
     /// How many times the rules were set ([`Self::use_rules`]): what a read decided under
