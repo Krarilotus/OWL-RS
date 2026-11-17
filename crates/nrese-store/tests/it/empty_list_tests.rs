@@ -458,18 +458,10 @@ fn short_lists_mean_what_the_mapping_says() {
                         }
                         outcome.map_err(|e| format!("{e:?}"))
                     };
-                    if expect == Inconsistent {
-                        let refused =
-                            !rebuilt && outcome.as_ref().is_err_and(|e| e.contains("Inconsistent"));
-                        let reported = rebuilt
-                            && matches!(
-                                store.consistency(),
-                                ConsistencyStatus::Inconsistent { .. }
-                            );
+                    if expect == Inconsistent && !rebuilt {
                         assert!(
-                            refused || reported,
-                            "{outcome:?}, {:?}",
-                            store.consistency()
+                            outcome.as_ref().is_err_and(|e| e.contains("Inconsistent")),
+                            "{outcome:?}"
                         );
                         return;
                     }
@@ -484,7 +476,24 @@ fn short_lists_mean_what_the_mapping_says() {
                     let complete = result.completeness.as_ref().is_some_and(|c| c.complete);
                     match expect {
                         Holds => assert!(holds, "told {:?}", result.completeness),
-                        _ => assert!(
+                        // A rebuild of contradictory data: the verdict says so, or no read
+                        // that leaves out what the contradiction entails is told complete.
+                        Inconsistent => {
+                            let verdict = store.dl().status().map(|s| s.consistency.verdict);
+                            let said = matches!(
+                                store.consistency(),
+                                ConsistencyStatus::Inconsistent { .. }
+                            ) || verdict
+                                .as_ref()
+                                .is_some_and(|v| v.as_str() == "inconsistent");
+                            assert!(
+                                said || holds || !complete,
+                                "{:?}, {verdict:?}, {holds}, told {:?}",
+                                store.consistency(),
+                                result.completeness
+                            );
+                        }
+                        NotTold => assert!(
                             !holds && !complete,
                             "{holds}, told {:?}",
                             result.completeness
