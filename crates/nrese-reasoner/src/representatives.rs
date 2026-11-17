@@ -49,22 +49,10 @@ pub struct RepresentativeClosure {
     pub phases: batch::Phases,
 }
 
-/// The `owl:sameAs` id of rules that do equality reasoning (`eq-rep-s`), if they do.
-pub fn same_as(rules: &[Rule]) -> Option<u64> {
-    let rule = rules.iter().find(|r| r.name == "eq-rep-s")?;
-    match rule.body.first()?.0[1] {
-        super::ir::Term::Const(id) => Some(id),
-        super::ir::Term::Var(_) => None,
-    }
-}
-
-/// The rules without the replacement rules, which rewriting stands in for.
-pub fn without_replacement(rules: &[Rule]) -> Vec<Rule> {
-    rules
-        .iter()
-        .filter(|r| !batch::is_replacement_rule(r))
-        .cloned()
-        .collect()
+/// `same_as`, the id of `owl:sameAs`, if `rules` do equality reasoning over it: they hold
+/// the equality rules by what they say ([`super::equality_rules::of`]).
+pub fn same_as(rules: &[Rule], same_as: u64) -> Option<u64> {
+    super::equality_rules::of(rules, same_as)
 }
 
 /// What [`over_classes`] changed: a rule that concludes facts. Whether it changed any is

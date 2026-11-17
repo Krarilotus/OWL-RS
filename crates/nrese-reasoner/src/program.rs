@@ -9,7 +9,8 @@
 
 use std::sync::Arc;
 
-use super::ir::{ParseError, Rule, Vocabulary};
+use super::equality_rules;
+use super::ir::{OWL, ParseError, Rule, Vocabulary};
 use super::n3::{self, N3Program};
 use super::rulesets::{Ruleset, SEMANTICS_VERSION, SemanticPart};
 use super::vocabulary::LocalVocabulary;
@@ -67,6 +68,15 @@ impl UserRules {
         }
         if compiled.rules.iter().any(|rule| !rule.guards.is_empty()) {
             rules.parts.push(SemanticPart::GuardsOverClasses);
+        }
+        // Where a build before the part read equality from the rules' names.
+        let same_as = vocabulary.iri(&format!("{OWL}sameAs"));
+        let named = compiled
+            .rules
+            .iter()
+            .any(|r| equality_rules::named(&r.name));
+        if named || equality_rules::of(&compiled.rules, same_as).is_some() {
+            rules.parts.push(SemanticPart::EqualityRules);
         }
         Ok(rules)
     }
@@ -325,6 +335,54 @@ Id: r
             let stored = stored_before(text);
             assert_eq!(program.fingerprint() != stored, rebuilds, "{text}");
         }
+    }
+
+    /// A user ruleset with a rule named like one of OWL 2 RL's equality rules, or holding the
+    /// five of them over `owl:sameAs` under other names, no longer matches the state a build
+    /// stored when those names decided where the equality module engaged: that build's closure
+    /// of the first may be wrong (a rule named `eq-rep-s` read its predicate as `owl:sameAs`),
+    /// and the second now engages the module, so the store rebuilds once; others keep theirs.
+    #[test]
+    fn user_rules_named_or_shaped_like_the_equality_rules_make_older_closures_stale() {
+        let named = "Prefices { e : http://e/ }
+Rules
+{
+Id: eq-rep-s
+  x <e:knows> y
+  ---
+  y <e:knows> x
+}
+";
+        let shaped = "@prefix owl: <http://www.w3.org/2002/07/owl#> .
+            { ?a owl:sameAs ?b } => { ?b owl:sameAs ?a } .
+            { ?a owl:sameAs ?b . ?b owl:sameAs ?c } => { ?a owl:sameAs ?c } .
+            { ?s owl:sameAs ?t . ?s ?p ?o } => { ?t ?p ?o } .
+            { ?p owl:sameAs ?q . ?s ?p ?o } => { ?s ?q ?o } .
+            { ?o owl:sameAs ?t . ?s ?p ?o } => { ?s ?p ?t } .";
+        let mut wrong = Vec::new();
+        for (case, user, text, rebuilds) in [
+            (
+                "a rule named eq-rep-s",
+                UserRules::pie("r.pie", named),
+                named,
+                true,
+            ),
+            (
+                "the five under other names",
+                UserRules::n3("r.n3", shaped),
+                shaped,
+                true,
+            ),
+            ("other rules", UserRules::n3("r.n3", RULES), RULES, false),
+        ] {
+            let program = RuleProgram::new(None, Some(Arc::new(user.unwrap()))).unwrap();
+            let stale = program.fingerprint() != stored_before(text);
+            println!("CASE {case}: rebuilds {stale}, must {rebuilds}");
+            if stale != rebuilds {
+                wrong.push(case);
+            }
+        }
+        assert!(wrong.is_empty(), "wrong: {wrong:?}");
     }
 
     /// The names the rules' context relations compile to are part of the fingerprint: a

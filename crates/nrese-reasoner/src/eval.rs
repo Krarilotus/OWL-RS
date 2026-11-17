@@ -537,6 +537,7 @@ impl<S: Source + ?Sized> Facts for AllFacts<'_, S> {
 #[derive(Clone)]
 pub struct Schema {
     rdf_type: u64,
+    same_as: u64,
     thing: u64,
     /// Unnamed classes whose memberships aren't derived (work package W7,
     /// [`super::unnamed`]): each with whether a membership stands for `owl:Thing`.
@@ -549,6 +550,11 @@ impl Schema {
     /// The id of `rdf:type`.
     pub fn rdf_type(&self) -> u64 {
         self.rdf_type
+    }
+
+    /// The id of `owl:sameAs`: what the equality rules are over ([`super::equality_rules`]).
+    pub fn same_as(&self) -> u64 {
+        self.same_as
     }
 
     /// The RDFS and OWL 2 schema vocabulary. It includes the list vocabulary, so a change
@@ -609,6 +615,7 @@ impl Schema {
         .collect();
         Self {
             rdf_type,
+            same_as: vocabulary.iri(&format!("{OWL}sameAs")),
             thing: vocabulary.iri(&format!("{OWL}Thing")),
             hidden: HashMap::new(),
             predicates,
@@ -2332,6 +2339,9 @@ pub struct GroundProgram {
     pub rules: Vec<Rule>,
     /// Per rule: the closed family it is an instance of, if any ([`closed_family`]).
     families: Vec<Option<u64>>,
+    /// Per rule: the built-in equality rule it is over `owl:sameAs`, if any, asked once as
+    /// it is filed ([`super::equality_rules`]); one filed by [`Self::add`] is none.
+    pub equality: Vec<Option<&'static str>>,
     /// The relations closed families read and produce by name (`cax-sco`'s `rdf:type`),
     /// each with its family: the family claims the relation's closed part.
     pub family_relations: std::collections::BTreeMap<u64, u64>,
@@ -2375,16 +2385,18 @@ impl std::fmt::Debug for GroundProgram {
 impl GroundProgram {
     /// Files one ground fact rule; returns its index if it is new and has a body.
     pub fn add(&mut self, rule: Rule) -> Option<usize> {
-        self.add_with(rule, Vec::new(), None)
+        self.add_with(rule, Vec::new(), None, None)
     }
 
-    /// [`Self::add`], with the schema facts the instance was grounded on, and the closed
-    /// family it is an instance of, if any ([`closed_family`]).
+    /// [`Self::add`], with the schema facts the instance was grounded on, the closed
+    /// family it is an instance of, if any ([`closed_family`]), and the `owl:sameAs` id its
+    /// equality rule is known by: the rule filed, its tautological heads removed, is asked.
     fn add_with(
         &mut self,
         rule: Rule,
         premises: Vec<Triple>,
         family: Option<u64>,
+        same_as: Option<u64>,
     ) -> Option<usize> {
         if let Some(p) = transitive_predicate(&rule) {
             self.transitive_with(p, premises);
@@ -2416,9 +2428,11 @@ impl GroundProgram {
             if let Head::Facts(heads) = &rule.head {
                 self.heads.push_atoms(self.rules.len(), heads);
             }
+            let equality = same_as.and_then(|id| super::equality_rules::equality_rule(&rule, id));
             self.rules.push(rule);
             self.premises.push(premises);
             self.families.push(family);
+            self.equality.push(equality);
             Some(self.rules.len() - 1)
         }
     }
@@ -2642,7 +2656,7 @@ impl GroundProgram {
                     .chain(extra.iter().copied())
                     .collect();
                 if let Some(rule) = schema.rewrite_heads(g.rule) {
-                    facts.extend(self.add_with(rule, premises, family));
+                    facts.extend(self.add_with(rule, premises, family, Some(schema.same_as())));
                 }
             }
         }
