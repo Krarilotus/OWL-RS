@@ -70,8 +70,8 @@ impl ConsistencyStatus {
 /// Why the OWL 2 RL rules' violations aren't decided under OWL 2 DL in this release.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhyUndecided {
-    /// The ontology has annotation-property axioms or a punned name
-    /// (`nrese_owl::profile::rules_read_differently`).
+    /// The ontology has annotation-property axioms or a punned name, or an empty
+    /// intersection (`nrese_owl::profile::rules_read_differently`).
     ReadsDifferently,
     /// The check whether it has didn't finish within its budget.
     Unchecked,
@@ -82,8 +82,8 @@ impl WhyUndecided {
     pub fn text(self, violations: usize) -> String {
         let why = match self {
             Self::ReadsDifferently => {
-                "the ontology has annotation-property axioms or a punned name, which OWL 2 DL \
-                 reads differently"
+                "the ontology has annotation-property axioms or a punned name, or an empty \
+                 intersection, which OWL 2 DL reads differently"
             }
             Self::Unchecked => {
                 "the check whether OWL 2 DL reads this ontology differently did not finish \
