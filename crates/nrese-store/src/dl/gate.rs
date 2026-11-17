@@ -134,10 +134,17 @@ pub(crate) fn check_commit(
             reject: None,
         };
     }
-    if preparation.proves_consistency {
+    // On the RL route in quarantine, or on a base nobody vouched for, the rules prove nothing,
+    // and their gate has admitted the commit on its own facts, as off the route: no DL check.
+    let rules = matches!(preparation.prepared, super::bounds::Prepared::Rules(_));
+    if preparation.proves_consistency || rules {
+        let verdict = match preparation.proves_consistency {
+            true => Verdict::Consistent,
+            false => Verdict::Unknown("the rules assessed no clean closure at the base".to_owned()),
+        };
         return Gate {
             checked: Checked {
-                verdict: Verdict::Consistent,
+                verdict,
                 engine: preparation.decided_by,
                 elapsed: Duration::ZERO,
             },

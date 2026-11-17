@@ -186,7 +186,7 @@ fn consistency_at(
 }
 
 /// The data's consistency at `snapshot`'s revision where it is known without a check:
-/// recorded by its commit, or proved by U1.
+/// recorded by its commit, or proved by U1, or by the rules for this snapshot's revision.
 fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> Option<Verdict> {
     match store.dl().status() {
         Some(DlStatus {
@@ -194,7 +194,8 @@ fn consistency_known(store: &StoreService, snapshot: &Snapshot, view: &View) -> 
             consistency,
             ..
         }) if revision == snapshot.revision() => Some(consistency.verdict),
-        _ => view.proves_consistency.then_some(Verdict::Consistent),
+        _ => (view.proves_consistency || view.rules && super::bounds::rules_prove(snapshot))
+            .then_some(Verdict::Consistent),
     }
 }
 
@@ -943,7 +944,12 @@ fn decide_answers(
         .stream(Read::At(snapshot.clone())));
     }
     let mut status = Status::complete();
-    let consistency = consistency_at(store, snapshot, view, cancellation, deadline, memory);
+    // A version no certificate vouches for is told `not-certified` whatever its consistency
+    // (`composed`): no check is spent on it.
+    let consistency = match crate::service::Certificate::of(snapshot) {
+        Some(_) => consistency_at(store, snapshot, view, cancellation, deadline, memory),
+        None => Verdict::Unknown("not certified".to_owned()),
+    };
     cancellation.check()?;
     if let Some(why) = consistency_reason(consistency) {
         status.add(why);
