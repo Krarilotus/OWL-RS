@@ -60,7 +60,6 @@ use nrese_reasoner::ir::Triple;
 use nrese_sparql::{CancellationToken, GraphAccess, PendingRead, ReadView};
 
 use crate::reasoning::Program;
-use crate::reasoning_state::fingerprint;
 
 #[cfg(test)]
 #[path = "support_tests.rs"]
@@ -1806,13 +1805,13 @@ struct Generation {
 /// Whether `snapshot`'s certificate was made with other rules than `generation`'s (they were
 /// changed or removed, the store not rematerialised), or it has none and isn't bare (its stack
 /// kept, its certificate gone: nothing vouches for it); `hide`: unnamed classes' memberships
-/// left out ([`Compilation::hide_unnamed_classes`]).
+/// left out ([`Compilation::hide_unnamed_classes`]). No rules registered count as other rules
+/// here: a view of the inferences a reader's graphs support needs rules to be made at all, so
+/// that reader is refused while the store's label goes by its marker ([`Supports::vouches_for`]).
 fn made_with_other_rules(generation: &Generation, snapshot: &Snapshot, hide: bool) -> bool {
     let rules = generation.rules.as_ref();
     match crate::service::Certificate::of(snapshot) {
-        Some(made) => rules.is_none_or(|rules| {
-            fingerprint(rules, hide, made.state.compact_equality) != made.state.fingerprint
-        }),
+        Some(made) => rules.is_none_or(|rules| !made.state.made_by(rules, hide)),
         None => !crate::service::Certificate::bare(snapshot, rules.is_some()),
     }
 }
@@ -2089,6 +2088,14 @@ impl Supports {
         let epoch = state.generation.epoch + 1;
         let ever = state.generation.ever || rules.is_some();
         *state = State::new(&self.kept, Generation { rules, epoch, ever });
+    }
+
+    /// Whether the store may vouch for the stack `state` records under the rules registered
+    /// here: they made it ([`crate::ReasoningState::made_by`]), or none are registered and its
+    /// label goes by its marker, naming the marker's rules. A reader of some graphs who sees
+    /// inferences is refused with none registered all the same ([`made_with_other_rules`]).
+    pub(crate) fn vouches_for(&self, state: &crate::ReasoningState, hide: bool) -> bool {
+        (self.state().generation.rules.as_ref()).is_none_or(|rules| state.made_by(rules, hide))
     }
 
     /// Whether rules were ever registered here ([`Self::use_rules`]): a reasoner maintains,
