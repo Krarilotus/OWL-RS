@@ -178,6 +178,16 @@ const CASES: &[Case] = &[
         access: None,
         expected: &[],
     },
+    // A graph named twice by FROM NAMED is one graph: a dataset's named graphs are a set
+    // (SPARQL 1.1 §13.2).
+    Case {
+        name: "a graph named twice by FROM NAMED gives its row once",
+        data: TWO_GRAPHS,
+        query: "SELECT ?s ?g FROM NAMED <urn:h> FROM NAMED <urn:h> WHERE { GRAPH ?g { \
+                ?s <urn:p> <urn:o> OPTIONAL { ?s <urn:q> ?g } } }",
+        access: None,
+        expected: &["?g=<urn:h> ?s=<urn:s>"],
+    },
     Case {
         name: "a reader restricted to the graph whose OPTIONAL binds another term",
         data: TWO_GRAPHS,
