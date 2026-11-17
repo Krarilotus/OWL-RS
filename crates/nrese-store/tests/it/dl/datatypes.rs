@@ -76,6 +76,10 @@ fn judge(cells: Vec<(&str, String, &[&str])>) {
 /// its datatype check has no values for a datatype outside the map, so a model it finds is no
 /// answer: `unknown`, and every read says why it isn't complete.
 const NOT_TOLD: &[&str] = &["hypertableau unknown; read not complete"];
+/// A later commit of assertions only, over a store proved consistent, is checked on the islands
+/// it touches alone (docs/design/owl2-dl.md §9), where a key value that can't be read is unread
+/// too, never kept apart: `unknown`, and every read says why it isn't complete.
+const ISLANDS_NOT_TOLD: &[&str] = &["touched-islands unknown; read not complete"];
 const RULES: &[&str] = &["rules consistent; read complete"];
 const REFUSED: &[&str] = &["refused"];
 const DECIDED: &[&str] = &["hypertableau consistent; read complete"];
@@ -346,13 +350,14 @@ fn a_literal_of_the_ontologys_own_datatype_is_kept_as_written() {
 /// read (`xsd:date`, outside the map) stands for itself: the same date written two ways (`Z`
 /// and `+00:00`, one time zone offset) is two values to it, and a key or a negative assertion
 /// over them derives no clash. A consistency proof would then rest on what it didn't read: the
-/// store isn't told `consistent`, the full check tells `unknown`, at the first commit and at a
-/// later one. The map's `xsd:dateTime` is read: one instant at one offset written two ways is one
-/// value (OWL 2 Structural Specification §4.7), so the key equates two different individuals
-/// and the commit is refused. So are strings, the values keys are mostly on (names, codes): one
-/// string, or one tagged string, under a key is refused; two different ones stay proved
-/// consistent. Tags that differ only in case are one term already, as the parser puts a tag in
-/// lower case (RDF 1.1 Concepts §3.3): the key equates the two by the term, not by its value.
+/// store isn't told `consistent`, at the first commit and at a later one; the full check, or for
+/// a later commit of assertions the check of the islands it touches, tells `unknown`. The map's
+/// `xsd:dateTime` is read: one instant at one offset written two ways is one value (OWL 2
+/// Structural Specification §4.7), so the key equates two different individuals and the commit
+/// is refused. So are strings, the values keys are mostly on (names, codes): one string, or one
+/// tagged string, under a key is refused; two different ones stay proved consistent. Tags that
+/// differ only in case are one term already, as the parser puts a tag in lower case (RDF 1.1
+/// Concepts §3.3): the key equates the two by the term, not by its value.
 #[test]
 fn a_value_the_upper_bound_cant_read_proves_no_consistency() {
     const KEY: &str = ":C a owl:Class ; owl:hasKey ( :born ) . :born a owl:DatatypeProperty . \
@@ -415,7 +420,7 @@ fn a_value_the_upper_bound_cant_read_proves_no_consistency() {
             "the same date written two ways under a key, in a later commit",
             first_key.clone(),
             format!("{Z} {OFFSET}"),
-            NOT_TOLD,
+            ISLANDS_NOT_TOLD,
         ),
         (
             "the same date written two ways in an assertion and a negative one, in a later commit",
