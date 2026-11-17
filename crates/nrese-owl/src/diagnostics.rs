@@ -110,6 +110,19 @@ impl Diagnostic {
                 | Self::AnonymousIndividual { .. }
         )
     }
+
+    /// Whether the reader left an axiom out whose statements the OWL 2 RL rules may still
+    /// read (a reserved name, OWL outside the mapping, a broken structure, syntax not read).
+    pub fn leaves_out(&self) -> bool {
+        matches!(
+            self,
+            Self::Reserved { .. }
+                | Self::NotOwl { .. }
+                | Self::Malformed { .. }
+                | Self::BrokenList { .. }
+                | Self::Unsupported { .. }
+        )
+    }
 }
 
 /// Reports the axioms that use non-simple properties where OWL 2 DL requires simple
