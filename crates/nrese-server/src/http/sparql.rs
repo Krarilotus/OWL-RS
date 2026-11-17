@@ -1,4 +1,5 @@
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
 use nrese_store::{
     CancellationToken, GraphResultFormat, MutationCommand, QueryResultKind, SolutionsResultFormat,
@@ -120,6 +121,7 @@ pub async fn execute_query_in(
         *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
         made
     };
+    let announced = prepared.clone();
     let mut response = stream_blocking(
         Pace::Total(deadline),
         cancellation,
@@ -136,6 +138,10 @@ pub async fn execute_query_in(
         },
     )
     .await?;
+    // The run decided the announcement on what its reader reads before its first byte, which
+    // `stream_blocking` waits for: the media type is the run's (its place among the headers kept).
+    let media_type = HeaderValue::from_static(announced.media_type());
+    response.headers_mut().insert(CONTENT_TYPE, media_type);
     let reported = status.lock().unwrap_or_else(|p| p.into_inner()).take();
     if let Some(value) = reported {
         let headers = response.headers_mut();
@@ -300,7 +306,21 @@ pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiEr
         }
         // Exact answers asked for under owl2-dl, and the store can't prove them complete.
         StoreError::Incomplete(answer) => ApiError::IncompleteAnswer(answer),
-        error => ApiError::internal(error.to_string()),
+        error => refused_or(error, ApiError::internal),
+    }
+}
+
+/// A store error of a read (query, RDF4J, Graph Store), `otherwise` unless it is a refusal
+/// until the store is rematerialised ([`StoreError::NotRematerialised`]): that is 503, with the
+/// store's sentence and, on a primary, the administrator's route. A replica refuses that route
+/// (`guard::enforce_admin_write`), so its answer adds nothing.
+pub(crate) fn refused_or(error: StoreError, otherwise: fn(String) -> ApiError) -> ApiError {
+    match error {
+        StoreError::NotRematerialised { replica: false } => ApiError::unavailable(format!(
+            "{error} (an administrator: POST /api/v1/repositories/{{id}}/reasoning/rematerialise)"
+        )),
+        error @ StoreError::NotRematerialised { .. } => ApiError::unavailable(error.to_string()),
+        error => otherwise(error.to_string()),
     }
 }
 

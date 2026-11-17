@@ -287,17 +287,13 @@ impl AppState {
     /// This state with `replication` as its part in replication (set once at start).
     ///
     /// Panics if `replication`'s role (a replica or not) isn't the one its store was opened
-    /// with (`StoreConfig::replica`): a replica's store takes no certificate from its open on,
-    /// so a replica's state over a store opened as a primary would serve that store's
-    /// certificate, and a primary's over a replica's store none. The server's start sets the
-    /// role before the open (`main.rs`).
+    /// with (`StoreConfig::replica`): a replica's store takes no certificate, and interns no
+    /// term, from its open on, so a replica's state over a store opened as a primary would
+    /// serve that store's certificate, and a primary's over a replica's store none. The
+    /// server's start sets the role before the open (`main.rs`).
     pub fn with_replication(mut self, replication: crate::replication::ReplicationConfig) -> Self {
         let replica = replication.mode == crate::replication::ReplicationMode::Replica;
         assert_eq!(replica, self.store().config().replica, "the store's role");
-        if replica {
-            // Its dictionary continues the primary's: nothing here may intern a term.
-            self.store().mark_replica();
-        }
         Arc::make_mut(&mut self.shared).replication =
             Arc::new(crate::replication::ReplicationState::new(replication));
         self

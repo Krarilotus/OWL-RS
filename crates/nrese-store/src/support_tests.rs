@@ -58,6 +58,7 @@ fn a_rule_change_during_a_read_leaves_it_its_rules_and_keeps_nothing_of_it() {
         by_representatives: false,
         compact: false,
         cap: 16,
+        replica: false,
     };
     let working = Work {
         budget: Arc::new(Budget::unlimited()),
@@ -472,6 +473,7 @@ fn a_restricted_view_s_changes_are_counted_as_they_are_read() {
         by_representatives: false,
         compact: false,
         cap: 16,
+        replica: false,
     };
     let working = Work {
         budget: Arc::new(Budget::unlimited()),
@@ -552,6 +554,7 @@ fn a_cached_rederived_fallback_ends_at_its_cancellation() {
         by_representatives: false,
         compact: false,
         cap: 16,
+        replica: false,
     };
     let unlimited = || Work {
         budget: Arc::new(Budget::unlimited()),
