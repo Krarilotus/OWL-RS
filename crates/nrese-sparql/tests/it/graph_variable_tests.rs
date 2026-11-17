@@ -44,6 +44,17 @@ const PREDICATES: &str = "\
 <urn:s> <urn:h> <urn:z> <urn:h> .
 ";
 
+/// `<urn:a>` and `<urn:b>` each name themselves; only `<urn:b>` holds `:t :q :hit`.
+const SPLIT: &str = "\
+<urn:s> <urn:p> <urn:a> <urn:a> .
+<urn:s> <urn:p> <urn:b> <urn:b> .
+<urn:t> <urn:q> <urn:hit> <urn:b> .
+";
+
+/// The graphs that hold a `:t :q` statement: `<urn:b>` only.
+const HOLDS_A_Q: &str = "SELECT ?g WHERE { GRAPH ?g { <urn:s> <urn:p> ?g \
+    FILTER NOT EXISTS { OPTIONAL { <urn:t> <urn:q> ?x } FILTER(!BOUND(?x)) } } }";
+
 const OPTIONAL_OBJECT: &str =
     "SELECT ?s ?g WHERE { GRAPH ?g { ?s <urn:p> <urn:o> OPTIONAL { ?s <urn:q> ?g } } }";
 
@@ -172,6 +183,79 @@ const CASES: &[Case] = &[
         data: TWO_GRAPHS,
         query: OPTIONAL_OBJECT,
         access: Some("urn:g"),
+        expected: &[],
+    },
+    // An OPTIONAL that does not name `?g`, under FROM NAMED and for a restricted reader:
+    // each sees its own graph's row only.
+    Case {
+        name: "FROM NAMED with an OPTIONAL that does not mention the graph variable",
+        data: TWO_GRAPHS,
+        query: "SELECT ?s ?g ?x FROM NAMED <urn:g> WHERE { GRAPH ?g { ?s <urn:p> <urn:o> \
+                OPTIONAL { ?s <urn:q> ?x } } }",
+        access: None,
+        expected: &["?g=<urn:g> ?s=<urn:s> ?x=<urn:other>"],
+    },
+    Case {
+        name: "a restricted reader with an OPTIONAL that does not mention the graph variable",
+        data: TWO_GRAPHS,
+        query: "SELECT ?s ?g ?x WHERE { GRAPH ?g { ?s <urn:p> <urn:o> OPTIONAL { ?s <urn:q> ?x } } }",
+        access: Some("urn:h"),
+        expected: &["?g=<urn:h> ?s=<urn:s> ?x=<urn:h>"],
+    },
+    // A part whose row comes from no scan is one row per graph: the union's BIND branch
+    // under the inner OPTIONAL extends `<urn:a>`'s row, though `<urn:b>` has `:t :q`.
+    Case {
+        name: "a nested OPTIONAL over a UNION with a BIND alone",
+        data: SPLIT,
+        query: "SELECT ?g ?tag ?x WHERE { GRAPH ?g { <urn:s> <urn:p> ?g OPTIONAL { \
+                { { BIND(<urn:tag> AS ?tag) } UNION { <urn:t> <urn:q> ?tag } } \
+                OPTIONAL { <urn:t> <urn:q> ?x } FILTER(BOUND(?g)) } } }",
+        access: None,
+        expected: &[
+            "?g=<urn:a> ?tag=<urn:tag>",
+            "?g=<urn:b> ?tag=<urn:hit> ?x=<urn:hit>",
+            "?g=<urn:b> ?tag=<urn:tag> ?x=<urn:hit>",
+        ],
+    },
+    // A BIND alone in each graph's OPTIONAL: one fresh blank node per graph (§17.4.2.9).
+    Case {
+        name: "an OPTIONAL holding a BIND alone",
+        data: SPLIT,
+        query: "SELECT (COUNT(DISTINCT ?b) AS ?n) WHERE { GRAPH ?g { <urn:s> <urn:p> ?g \
+                OPTIONAL { BIND(BNODE() AS ?b) } } }",
+        access: None,
+        expected: &["?n=\"2\"^^<http://www.w3.org/2001/XMLSchema#integer>"],
+    },
+    // An EXISTS whose pattern starts from an empty group sees only its own graph.
+    Case {
+        name: "an EXISTS over an OPTIONAL with an empty left side",
+        data: SPLIT,
+        query: "SELECT ?g WHERE { GRAPH ?g { <urn:s> <urn:p> ?g \
+                FILTER EXISTS { OPTIONAL { <urn:t> <urn:q> ?x } FILTER(!BOUND(?x)) } } }",
+        access: None,
+        expected: &["?g=<urn:a>"],
+    },
+    Case {
+        name: "a NOT EXISTS over an OPTIONAL with an empty left side",
+        data: SPLIT,
+        query: HOLDS_A_Q,
+        access: None,
+        expected: &["?g=<urn:b>"],
+    },
+    // A graph the query may not read changes nothing it may.
+    Case {
+        name: "the same NOT EXISTS under FROM NAMED",
+        data: SPLIT,
+        query: "SELECT ?g FROM NAMED <urn:a> WHERE { GRAPH ?g { <urn:s> <urn:p> ?g \
+                FILTER NOT EXISTS { OPTIONAL { <urn:t> <urn:q> ?x } FILTER(!BOUND(?x)) } } }",
+        access: None,
+        expected: &[],
+    },
+    Case {
+        name: "the same NOT EXISTS for a restricted reader",
+        data: SPLIT,
+        query: HOLDS_A_Q,
+        access: Some("urn:a"),
         expected: &[],
     },
 ];

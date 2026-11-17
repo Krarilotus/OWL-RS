@@ -23,10 +23,11 @@ fn under_graph(text: &str) -> (GraphPattern, Variable) {
     (*inner, variable)
 }
 
-/// Spec: SPARQL 1.1 §18.6. A pattern that never names `?g`, or names it only where the
-/// rows before it bind `?g` from data, gives the same rows either way and keeps the single
-/// evaluation; an OPTIONAL, FILTER or BIND that names `?g` where those rows may lack it
-/// must see it free, which only the graph-by-graph evaluation gives.
+/// Which route each shape takes; the route is the engine's choice, not the specification's,
+/// and the answers (SPARQL 1.1 §18.6) are held in `tests/it/graph_variable_tests.rs`. The
+/// single evaluation is kept where it gives the same rows as §18.6: every part's rows come
+/// from scans, and `?g` is named only where the rows before it bind `?g` from data. The
+/// common shapes on the `true` side keep the route they had before this test.
 #[test]
 fn a_pattern_under_graph_is_evaluated_once_only_where_that_gives_the_same_rows() {
     let mut wrong = Vec::new();
@@ -57,6 +58,15 @@ fn a_pattern_under_graph_is_evaluated_once_only_where_that_gives_the_same_rows()
         // One UNION branch binds `?g`; the other reads it free.
         (
             "{ { ?s <urn:q> ?g } UNION { ?s <urn:p> ?x FILTER(!BOUND(?g)) } }",
+            false,
+        ),
+        // A part whose row comes from no scan: one row for every graph at once.
+        (
+            "{ <urn:s> <urn:p> ?g OPTIONAL { BIND(BNODE() AS ?b) } }",
+            false,
+        ),
+        (
+            "{ ?s ?p ?o FILTER EXISTS { OPTIONAL { ?t <urn:q> ?x } } }",
             false,
         ),
         // MINUS: refused whatever it names.
