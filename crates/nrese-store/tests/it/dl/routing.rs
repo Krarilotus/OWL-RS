@@ -1633,17 +1633,21 @@ fn tagged_key(n: usize) -> String {
 /// last before it: the key's commit; none (a load past the pipeline, then a rebuild); after
 /// that load, an empty one, one that writes a known statement into another graph (no
 /// reasoning delta) or one that only deletes; or an empty one after a reopen. Each update
-/// but the commit meets a pipeline that holds no program of the closure. Each read is judged
-/// answer first: the entailed answer, or a status that withholds what the answer gets
-/// wrong (`complete: false` for a missing `true`, `sound: false` for a row the entailment
-/// doesn't hold); an exact read answers `true` or is refused.
+/// but the commit meets a pipeline that holds no program of the closure; on `warmed`, one
+/// that holds an older state's ([`WARM_UP`] committed before the load), and two updates
+/// follow it: an empty one, then the warm-up's schema statement written into another graph.
+/// Each read is judged answer first: the entailed answer, or a status that withholds what
+/// the answer gets wrong (`complete: false` for a missing `true`, `sound: false` for a row
+/// the entailment doesn't hold); an exact read answers `true` or is refused.
 #[test]
 fn a_key_the_rules_leave_out_leaves_no_wrong_answer_told_right() {
     let ask = "ASK { :x :tag :z }";
     let negated = "SELECT ?x { ?x a :K FILTER NOT EXISTS { ?x :tag :z } }";
     let mut wrong = Vec::new();
     for n in [127, 128] {
-        for path in ["commit", "read", "empty", "known", "deletion", "reopen"] {
+        for path in [
+            "commit", "read", "empty", "known", "deletion", "reopen", "warmed",
+        ] {
             let dir = tempfile::tempdir().expect("dir");
             let dl = match path {
                 "commit" => pipeline(),
@@ -1653,6 +1657,9 @@ fn a_key_the_rules_leave_out_leaves_no_wrong_answer_told_right() {
                 }
                 _ => {
                     let dl = pipeline();
+                    if path == "warmed" {
+                        insert(&dl, WARM_UP).expect("a clean warm-up");
+                    }
                     let extra = if path == "deletion" {
                         " :w a owl:NamedIndividual ."
                     } else {
@@ -1664,15 +1671,19 @@ fn a_key_the_rules_leave_out_leaves_no_wrong_answer_told_right() {
                     dl
                 }
             };
-            let update = match path {
-                "commit" => format!("INSERT DATA {{ {} }}", tagged_key(n)),
-                "known" => "INSERT DATA { GRAPH :g { :y :tag :z } }".to_owned(),
-                "deletion" => "DELETE DATA { :w a owl:NamedIndividual . }".to_owned(),
-                "read" => String::new(),
-                _ => "INSERT DATA {}".to_owned(),
+            let updates = match path {
+                "commit" => vec![format!("INSERT DATA {{ {} }}", tagged_key(n))],
+                "known" => vec!["INSERT DATA { GRAPH :g { :y :tag :z } }".to_owned()],
+                "deletion" => vec!["DELETE DATA { :w a owl:NamedIndividual . }".to_owned()],
+                "read" => vec![],
+                "warmed" => vec![
+                    "INSERT DATA {}".to_owned(),
+                    "INSERT DATA { GRAPH :g { :warmP rdfs:subPropertyOf :warmP } }".to_owned(),
+                ],
+                _ => vec!["INSERT DATA {}".to_owned()],
             };
-            if !update.is_empty() {
-                super::update(&dl, &update).expect("an update of an RL ontology");
+            for update in &updates {
+                super::update(&dl, update).expect("an update of an RL ontology");
             }
             let (answer, asked) = query(&dl, ask);
             let route = dl.store().dl_bounds().last;
@@ -1705,6 +1716,44 @@ fn a_key_the_rules_leave_out_leaves_no_wrong_answer_told_right() {
             if !honest {
                 wrong.push(line);
             }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A clean ontology a pipeline commits first, so that it holds a ground program of the
+/// closure when data is loaded past it.
+const WARM_UP: &str = ":warmP a owl:ObjectProperty ; rdfs:subPropertyOf :warmP .";
+
+/// prp-spo2 (OWL 2 Profiles §4.3): a commit of a path along a chain derives the chain's
+/// property, though the chain came past the pipeline (loaded, then rebuilt) after the
+/// pipeline grounded the rules over an older state ([`WARM_UP`]), and whether or not an
+/// update that changes no inference came between.
+#[test]
+fn a_chain_loaded_past_a_warm_pipeline_is_reasoned_with_after_an_update() {
+    let mut wrong = Vec::new();
+    for between in [false, true] {
+        let dl = pipeline();
+        insert(&dl, WARM_UP).expect("a clean warm-up");
+        let turtle = format!("{}:p owl:propertyChainAxiom ( :p1 :p2 ) .", super::PREFIXES);
+        crate::support::load_past_the_pipeline(dl.store(), &turtle);
+        dl.store().rematerialise(rl_rules()).expect("rebuilt");
+        if between {
+            super::update(&dl, "INSERT DATA {}").expect("an empty update");
+        }
+        insert(&dl, ":a0 :p1 :a1 . :a1 :p2 :a2 .").expect("the chain's path");
+        let inferred = crate::support::inferred_statements(dl.store()).expect("inferred");
+        let ex = |name: &str| format!("http://example.com/{name}");
+        let derived = inferred.contains(&(ex("a0"), ex("p"), ex("a2")));
+        let (answer, asked) = query(&dl, "ASK { :a0 :p :a2 }");
+        let line = format!(
+            "chain, empty update between {between}: derived {derived}; ask {answer:?} sound {} \
+             complete {}",
+            asked.shared.sound, asked.shared.complete
+        );
+        eprintln!("{line}");
+        if !(derived && answer == ["true"]) {
+            wrong.push(line);
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
