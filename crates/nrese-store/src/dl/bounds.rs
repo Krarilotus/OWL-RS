@@ -555,10 +555,16 @@ pub(crate) fn prepare(
     }
 }
 
-/// Whether a statement's subject or object is a reserved name, which the reader leaves out.
+/// Whether a statement's subject or object is a reserved name, which the reader leaves out,
+/// or a SHACL property (`nrese_owl::shacl_properties`), whose naming can make the reader read
+/// SHACL content as any other statement, or naming no more, read it as SHACL content again
+/// (`Ontology::shacl`).
 fn reserved_named(tx: &Transaction<'_>, [s, _, o]: Triple) -> bool {
     let reserved = |t| match tx.decode(TermId::from_raw(t)) {
-        Some(nrese_rdf::Term::NamedNode(n)) => nrese_owl::diagnostics::reserved_name(n.as_str()),
+        Some(nrese_rdf::Term::NamedNode(n)) => {
+            let iri = n.as_str();
+            nrese_owl::diagnostics::reserved_name(iri) || nrese_owl::is_shacl_property(iri)
+        }
         _ => false,
     };
     reserved(s) || reserved(o)

@@ -442,7 +442,20 @@ impl StoreService {
             });
         };
         let decode = |term| tx.decode(term);
-        let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
+        // The conclusion reads SHACL content as the premise does: a SHACL property it states
+        // that an axiom of the premise names has an OWL meaning, so its statements are read as
+        // any other's (the reader looks the SHACL vocabulary up only to find its content).
+        let id = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
+        let stated = |t: u64| statements.iter().any(|s| s.triple[1] == t);
+        let named = |t: u64| {
+            premise
+                .sources
+                .iter()
+                .flatten()
+                .any(|s| s.triples.iter().any(|x| x.contains(&t)))
+        };
+        let owl = |iri: &str, t: u64| nrese_owl::is_shacl_property(iri) && stated(t) && named(t);
+        let lookup = |iri: &str| id(iri).filter(|t| !owl(iri, t.raw()));
         let read = nrese_owl::read(
             &statements,
             &source::StoreTerms {
