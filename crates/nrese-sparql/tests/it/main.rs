@@ -13,6 +13,7 @@ mod geosparql_scope_tests;
 mod geosparql_tests;
 mod graph_alias_tests;
 mod graph_search_tests;
+mod graph_variable_tests;
 mod index_answer_tests;
 mod internal_identity_tests;
 mod lateral_tests;
