@@ -14,7 +14,7 @@ use nrese_store::{
 };
 
 use super::queries::{query, query_with};
-use super::versions::{in_transaction, ntriples};
+use super::versions::{in_transaction, ntriples, on_disk};
 use super::{insert, pipeline};
 
 #[test]
@@ -1629,7 +1629,11 @@ fn tagged_key(n: usize) -> String {
 /// prp-key (OWL 2 Profiles §4.3; `HasKey` in the Direct Semantics): the key equates the two
 /// named members of `:K`, so `:x :tag :z` is entailed and no member of `:K` lacks a `:tag`
 /// of `:z`. With 127 key properties the rules build the key and the read stays on the RL
-/// route; with 128 they leave it out, and the read leaves the route. Each read is judged
+/// route; with 128 they leave it out, and the read leaves the route, whatever update came
+/// last before it: the key's commit; none (a load past the pipeline, then a rebuild); after
+/// that load, an empty one, one that writes a known statement into another graph (no
+/// reasoning delta) or one that only deletes; or an empty one after a reopen. Each update
+/// but the commit meets a pipeline that holds no program of the closure. Each read is judged
 /// answer first: the entailed answer, or a status that withholds what the answer gets
 /// wrong (`complete: false` for a missing `true`, `sound: false` for a row the entailment
 /// doesn't hold); an exact read answers `true` or is refused.
@@ -1639,14 +1643,36 @@ fn a_key_the_rules_leave_out_leaves_no_wrong_answer_told_right() {
     let negated = "SELECT ?x { ?x a :K FILTER NOT EXISTS { ?x :tag :z } }";
     let mut wrong = Vec::new();
     for n in [127, 128] {
-        for path in ["commit", "read"] {
-            let dl = pipeline();
-            if path == "commit" {
-                insert(&dl, &tagged_key(n)).expect("an RL ontology");
-            } else {
-                let turtle = format!("{}{}", super::PREFIXES, tagged_key(n));
-                crate::support::load_past_the_pipeline(dl.store(), &turtle);
-                dl.store().rematerialise(rl_rules()).expect("rebuilt");
+        for path in ["commit", "read", "empty", "known", "deletion", "reopen"] {
+            let dir = tempfile::tempdir().expect("dir");
+            let dl = match path {
+                "commit" => pipeline(),
+                "reopen" => {
+                    insert(&on_disk(dir.path()), &tagged_key(n)).expect("an RL ontology");
+                    on_disk(dir.path())
+                }
+                _ => {
+                    let dl = pipeline();
+                    let extra = if path == "deletion" {
+                        " :w a owl:NamedIndividual ."
+                    } else {
+                        ""
+                    };
+                    let turtle = format!("{}{}{extra}", super::PREFIXES, tagged_key(n));
+                    crate::support::load_past_the_pipeline(dl.store(), &turtle);
+                    dl.store().rematerialise(rl_rules()).expect("rebuilt");
+                    dl
+                }
+            };
+            let update = match path {
+                "commit" => format!("INSERT DATA {{ {} }}", tagged_key(n)),
+                "known" => "INSERT DATA { GRAPH :g { :y :tag :z } }".to_owned(),
+                "deletion" => "DELETE DATA { :w a owl:NamedIndividual . }".to_owned(),
+                "read" => String::new(),
+                _ => "INSERT DATA {}".to_owned(),
+            };
+            if !update.is_empty() {
+                super::update(&dl, &update).expect("an update of an RL ontology");
             }
             let (answer, asked) = query(&dl, ask);
             let route = dl.store().dl_bounds().last;
