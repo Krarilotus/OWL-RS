@@ -2855,6 +2855,10 @@ mod tests {
             fn iri(&self, iri: &str) -> Option<u64> {
                 self.1.get(iri).copied()
             }
+            // No lexical form either: the reader keeps no literal of this source.
+            fn datatype(&self, _: u64) -> Option<String> {
+                None
+            }
         }
         let mut v = LocalVocabulary::default();
         let known = nrese_owl::Vocabulary::iris()
