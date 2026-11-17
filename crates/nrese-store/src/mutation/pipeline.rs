@@ -382,11 +382,13 @@ impl MutationPipeline {
                     &|view, dl_gate_budget| self.view_reason(view, dl_gate_budget, &resources),
                     &envelope,
                 );
-                // What the reader left out: none where consistent (`consistency::check`).
+                // What the reader left out, named from the transaction once, here: none where
+                // consistent (`consistency::check`).
+                let name = |t| crate::dl::consistency::named(&tx, t);
                 let read = bounds
                     .ontology
                     .take()
-                    .map(|o| crate::dl::query::left_out(&o));
+                    .map(|o| crate::dl::query::left_out(&o, &name));
                 let consistent = gate.checked.verdict == crate::dl::Verdict::Consistent;
                 (gate, bounds, read.or(consistent.then_some(None)))
             });

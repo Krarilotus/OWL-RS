@@ -180,7 +180,7 @@ fn consistency_at(
     store.dl().record(DlStatus {
         revision: snapshot.revision(),
         consistency: checked.clone(),
-        left_out: Some(left_out(ontology.value())),
+        left_out: Some(left_out(ontology.value(), &consistency::nameless)),
     });
     checked.verdict
 }
@@ -455,6 +455,8 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
             .status()
             .filter(|s| s.revision == snapshot.revision())
     };
+    // Named where its commit wrote it: only a reader of every graph is given the status this
+    // reason is in (`status_for_its_reader`, service.rs).
     let left_out = if proved {
         Some(None)
     } else {
@@ -544,9 +546,10 @@ fn annotation_reason(snapshot: &Snapshot, property: u64) -> String {
     )
 }
 
-/// [`reads_differently`]'s reason where the reader left out what the rules may read.
-pub(crate) fn left_out(ontology: &Ontology) -> Option<String> {
-    let why = consistency::left_out_by(ontology, nrese_owl::Diagnostic::leaves_out)?;
+/// [`reads_differently`]'s reason where the reader left out what the rules may read, its
+/// terms as `name` writes them.
+pub(crate) fn left_out(ontology: &Ontology, name: &dyn Fn(u64) -> String) -> Option<String> {
+    let why = consistency::left_out_by(ontology, nrese_owl::Diagnostic::leaves_out, name)?;
     Some(format!(
         "{why}, whose statements the OWL 2 RL rules may still read: {ONLY}, or remove them"
     ))
@@ -558,7 +561,7 @@ fn by_ontology(snapshot: &Snapshot, ontology: &Ontology) -> Option<String> {
         let term = snapshot.decode(TermId::from_raw(t));
         term.map_or_else(|| format!("term {t}"), |term| term.to_string())
     };
-    if let Some(why) = left_out(ontology) {
+    if let Some(why) = left_out(ontology, &consistency::nameless) {
         return Some(why);
     }
     if let Some(&property) = ontology.annotation_schema.first() {

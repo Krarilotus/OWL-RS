@@ -240,7 +240,9 @@ fn check_with_budget(
     let budget = operation.remaining(deadline);
     let checked = change
         .and_then(|touched| consistency::check_after_assertions(ontology, &touched, &budget))
-        .unwrap_or_else(|| consistency::check(ontology, &budget));
+        .unwrap_or_else(|| {
+            consistency::check_naming(ontology, &budget, &|t| consistency::named(tx, t))
+        });
     if checked.verdict != Verdict::Inconsistent {
         return Gate {
             checked,

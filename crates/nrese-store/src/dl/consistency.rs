@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use nrese_dl::limits::{Deadline, Limit};
 use nrese_dl::tableau;
+use nrese_engine::{EncodedQuad, PendingView, QuadPattern, ReadModel, TermId, TermKind};
 use nrese_exec::workers::Workers;
 use nrese_owl::Ontology;
 
@@ -66,32 +67,71 @@ impl Budget {
 
 /// Why a model of `ontology` says nothing for the source: parts of the source weren't
 /// read (fatal diagnostics), so they may have no model. An inconsistency found stands.
+/// Names nothing ([`nameless`]).
 pub fn left_out(ontology: &Ontology) -> Option<String> {
-    left_out_by(ontology, nrese_owl::Diagnostic::is_fatal)
+    left_out_by(ontology, nrese_owl::Diagnostic::is_fatal, &nameless)
 }
 
-/// [`left_out`]'s sentence, of the diagnostics `which` picks.
+/// [`left_out`]'s sentence, of the diagnostics `which` picks, its terms as `name` writes them.
 pub(crate) fn left_out_by(
     ontology: &Ontology,
     which: fn(&nrese_owl::Diagnostic) -> bool,
+    name: &dyn Fn(u64) -> String,
 ) -> Option<String> {
     let found: Vec<_> = ontology.diagnostics.iter().filter(|d| which(d)).collect();
-    let first = found.first()?;
+    let first = found.first()?.describe(name);
     Some(format!(
-        "{} part(s) of the data aren't OWL 2 DL and were left out; first: {first:?}",
+        "{} part(s) of the data aren't OWL 2 DL and were left out; first: {first}",
         found.len()
     ))
+}
+
+/// Names no term: what a read writes, which decodes none.
+pub(crate) fn nameless(_: u64) -> String {
+    "_".to_owned()
+}
+
+/// `term` as `tx`'s data writes it: an IRI or literal as itself, a blank node by a statement
+/// pointing to it from a named subject, else by one of its own to a named object. It reads
+/// every graph: for readers of every graph only.
+pub(crate) fn named(tx: &impl PendingView, term: u64) -> String {
+    let shown = |t: TermId| tx.decode(t).filter(|_| t.kind() != TermKind::BlankNode);
+    let shown = |t| shown(t).map(|t| t.to_string());
+    let id = TermId::from_raw(term);
+    if id.kind() != TermKind::BlankNode {
+        return shown(id).unwrap_or_else(|| nameless(term));
+    }
+    let first = |s, o, [a, b]: [fn(&EncodedQuad) -> TermId; 2]| {
+        let mut pattern = QuadPattern::all();
+        (pattern.subject, pattern.object) = (s, o);
+        let mut found = tx.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+        found.find_map(|q| Some(format!("{} {}", shown(a(&q))?, shown(b(&q))?)))
+    };
+    let to = first(None, Some(id), [|q| q.subject, |q| q.predicate]);
+    let to = to.map(|sp| format!("the blank node that {sp} points to"));
+    let from = || first(Some(id), None, [|q| q.predicate, |q| q.object]);
+    let from = || from().map(|po| format!("the blank node with {po}"));
+    to.or_else(from).unwrap_or_else(|| "a blank node".into())
 }
 
 /// Whether `ontology` is consistent: the context core's Horn stage where it takes the
 /// ontology, else the hypertableau within `budget`. `Consistent` only if nothing of the
 /// source was left out ([`left_out`]), else `Unknown` says so; an inconsistency stands.
 pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
+    check_naming(ontology, budget, &nameless)
+}
+
+/// [`check`], its reason naming what was left out as `name` writes it.
+pub(crate) fn check_naming(
+    ontology: &Ontology,
+    budget: &Budget,
+    name: &dyn Fn(u64) -> String,
+) -> Checked {
     let started = Instant::now();
     let mut checked = check_read(ontology, budget);
     checked.elapsed = started.elapsed();
     if checked.verdict != Verdict::Inconsistent
-        && let Some(why) = left_out(ontology)
+        && let Some(why) = left_out_by(ontology, nrese_owl::Diagnostic::is_fatal, name)
     {
         checked.verdict = Verdict::Unknown(why);
     }
