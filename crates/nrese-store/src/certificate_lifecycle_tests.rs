@@ -622,6 +622,23 @@ fn an_entailment_check_reads_one_snapshot_while_a_clear_publishes() {
     cells.finish();
 }
 
+thread_local! {
+    /// Whether this thread's stores can't read their memory, and whether one tried meanwhile.
+    static UNREAD: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((false, false)) };
+}
+
+/// The memory reading of a store given it by [`StoreService::with_capacity`]: unreadable
+/// while [`UNREAD`] says so.
+fn capacity() -> nrese_exec::memory::Reading {
+    match UNREAD.get() {
+        (true, _) => {
+            UNREAD.set((true, true));
+            Err(nrese_exec::memory::Unread::Failed)
+        }
+        _ => nrese_exec::memory::capacity(),
+    }
+}
+
 /// A repair commit on a store in quarantine: its data holds `:a a owl:Nothing`, inconsistent
 /// under OWL 2 RL, and a commit through OWL 2 RL's pipeline removes it. The commit inherits
 /// the closure's facts, not the old version's assessment of its consistency: until a
@@ -638,20 +655,6 @@ fn an_entailment_check_reads_one_snapshot_while_a_clear_publishes() {
 /// consistency not established is no reason to call it ready.
 #[test]
 fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
-    use std::cell::Cell;
-    thread_local! {
-        /// Whether this thread's store can't read its memory, and whether it tried meanwhile.
-        static UNREAD: Cell<(bool, bool)> = const { Cell::new((false, false)) };
-    }
-    fn capacity() -> nrese_exec::memory::Reading {
-        match UNREAD.get() {
-            (true, _) => {
-                UNREAD.set((true, true));
-                Err(nrese_exec::memory::Unread::Failed)
-            }
-            _ => nrese_exec::memory::capacity(),
-        }
-    }
     let mut cells = Cells::default();
     let dir = tempfile::tempdir().expect("dir");
     let data = dir.path().join("store");
@@ -788,6 +791,113 @@ fn a_repair_commit_in_quarantine_establishes_no_consistency_it_did_not_check() {
             "the commit didn't reach its revalidation",
         ),
         (Err(error), _) => cells.unmet("a repair commit", &format!("the commit failed: {error}")),
+    }
+    cells.finish();
+}
+
+/// A store in `dir` holding `data` (Turtle over [`PREFIXES`]'s names), reasoned under OWL 2
+/// RL, its memory read through [`capacity`].
+fn reasoned(dir: &Path, data: &str) -> Arc<StoreService> {
+    let store = StoreService::new(StoreConfig::on_disk(dir))
+        .expect("store")
+        .with_capacity(capacity);
+    load(&store, data);
+    store.rematerialise(Ruleset::Owl2Rl).expect("reasoned");
+    Arc::new(store)
+}
+
+/// Commits `DELETE DATA { data }` through `pipeline`, its revalidation stopped: the store's
+/// memory can't be read from the commit's publication on. Whether the commit succeeded, and
+/// whether the memory was read while it couldn't be.
+fn repaired_unrevalidated(pipeline: &MutationPipeline, data: &str) -> (Result<(), String>, bool) {
+    hooks::BEFORE_REVALIDATION.set(Some(Box::new(|| UNREAD.set((true, false)))));
+    let repaired = pipeline.apply(
+        MutationCommand::Update(SparqlUpdateRequest::new(format!(
+            "{PREFIXES}DELETE DATA {{ {data} }}"
+        ))),
+        &Requester::all(),
+        &MutationTicket::new(),
+    );
+    hooks::BEFORE_REVALIDATION.set(None);
+    let (_, tried) = UNREAD.get();
+    UNREAD.set((false, false));
+    (repaired.map(|_| ()).map_err(|e| e.to_string()), tried)
+}
+
+/// A readiness reading (`is_quarantined`) with a change of the store's assessment between
+/// its reads, where the store is in quarantine before the change and after it, says
+/// quarantined: whatever it read first and last, the store was never ready.
+/// - Across a repair commit whose revalidation stops: before it, the data is inconsistent;
+///   after it, the consistency isn't assessed again.
+/// - Across a rematerialisation that records the data inconsistent: before it, a repair
+///   commit's revalidation stopped and the consistency isn't assessed; after it, the data is
+///   inconsistent.
+#[test]
+fn a_readiness_reading_across_a_change_of_quarantine_says_quarantined() {
+    use crate::ConsistencyStatus::{Inconsistent, Unknown};
+    let mut cells = Cells::default();
+    let readiness = |quarantined: bool| match quarantined {
+        true => "quarantined",
+        false => "ready",
+    };
+    let quarantined = |h: &str| h == "quarantined";
+
+    let dir = tempfile::tempdir().expect("dir");
+    let store = reasoned(dir.path(), &format!("{DATA} :a a owl:Nothing ."));
+    let before = store.consistency();
+    let rl = pipeline(&store, ReasoningMode::Owl2Rl);
+    let kept = Arc::new(Mutex::new(None));
+    let into = Arc::clone(&kept);
+    hooks::BETWEEN_QUARANTINE_READS.set(Some(Box::new(move || {
+        *into.lock().unwrap() = Some(repaired_unrevalidated(&rl, ":a a owl:Nothing"));
+    })));
+    let read = store.is_quarantined();
+    hooks::BETWEEN_QUARANTINE_READS.set(None);
+    let after = store.consistency();
+    match (before, kept.lock().unwrap().take(), after) {
+        (Inconsistent { .. }, Some((Ok(()), true)), Unknown) => cells.check(
+            "a reading across a repair commit | readiness",
+            readiness(read),
+            quarantined,
+            "quarantined",
+        ),
+        (before, committed, after) => cells.unmet(
+            "a reading across a repair commit",
+            &format!("{before:?}, then {committed:?} (committed, the memory read), then {after:?}"),
+        ),
+    }
+
+    let dir = tempfile::tempdir().expect("dir");
+    let store = reasoned(
+        dir.path(),
+        &format!("{DATA} :a a owl:Nothing . :b a owl:Nothing ."),
+    );
+    let (repaired, tried) =
+        repaired_unrevalidated(&pipeline(&store, ReasoningMode::Owl2Rl), ":a a owl:Nothing");
+    let before = store.consistency();
+    let (recorder, kept) = (Arc::clone(&store), Arc::new(Mutex::new(None)));
+    let into = Arc::clone(&kept);
+    hooks::BETWEEN_QUARANTINE_READS.set(Some(Box::new(move || {
+        let recorded = recorder.rematerialise(Ruleset::Owl2Rl);
+        *into.lock().unwrap() = Some(recorded.map(|_| ()).map_err(|e| e.to_string()));
+    })));
+    let read = store.is_quarantined();
+    hooks::BETWEEN_QUARANTINE_READS.set(None);
+    let after = store.consistency();
+    match (repaired, tried, before, kept.lock().unwrap().take(), after) {
+        (Ok(()), true, Unknown, Some(Ok(())), Inconsistent { violations: 1 }) => cells.check(
+            "a reading across a recorded assessment | readiness",
+            readiness(read),
+            quarantined,
+            "quarantined",
+        ),
+        (repaired, tried, before, recorded, after) => cells.unmet(
+            "a reading across a recorded assessment",
+            &format!(
+                "repaired {repaired:?} (the memory read: {tried}), then {before:?}, \
+                 recorded {recorded:?}, then {after:?}"
+            ),
+        ),
     }
     cells.finish();
 }
