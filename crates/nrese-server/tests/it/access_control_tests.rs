@@ -37,7 +37,7 @@ struct Claims {
     roles: Vec<String>,
 }
 
-fn token(roles: &[&str]) -> String {
+pub(super) fn token(roles: &[&str]) -> String {
     encode(
         &Header::default(),
         &Claims {
@@ -62,7 +62,7 @@ fn app_in(policy: &str, mode: ReasoningMode) -> Result<axum::Router, Box<dyn std
 }
 
 /// The server's policy: test-secret bearer tokens and the access policy `policy`.
-fn policy_of(policy: &str) -> Result<PolicyConfig, Box<dyn std::error::Error>> {
+pub(super) fn policy_of(policy: &str) -> Result<PolicyConfig, Box<dyn std::error::Error>> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("access.toml");
     std::fs::write(&path, policy)?;
