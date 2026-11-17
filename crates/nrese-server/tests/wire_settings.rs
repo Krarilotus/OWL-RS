@@ -150,6 +150,21 @@ async fn configured_public_url_is_followed_through_a_stripping_proxy() {
     }
 }
 
+// Spec: appending the transaction path preserves significant slashes in a base path.
+#[tokio::test]
+async fn configured_public_url_preserves_trailing_path_segments() {
+    let server = start(
+        &[("NRESE_PUBLIC_URL", "https://public.invalid/prefix///")],
+        false,
+    )
+    .await;
+    let location = begin(&client(), &server).await;
+    assert!(
+        location.starts_with("https://public.invalid/prefix///repositories/nrese/transactions/"),
+        "{location}"
+    );
+}
+
 // Spec: an unset public URL keeps the existing forwarded-host behavior.
 #[tokio::test]
 async fn unset_public_url_uses_the_forwarded_host() {
