@@ -642,6 +642,11 @@ const SPELLING: &str = "a stored value written another way doesn't match it, tho
 const COMPARED: &str = "two spellings of one value are two terms to the store, which compares \
                         terms, though OWL 2 compares values";
 
+/// Why a read of a store in quarantine (its certificate's violations) may miss rows: fixed
+/// words, nothing of the clash, for a reader of some graphs too (`/readyz` tells anyone).
+const QUARANTINE: &str = "the consistency rules find violations in the stored data (the store \
+                          is in quarantine), and inconsistent data entail every answer";
+
 /// The one rule of every path's status under an OWL 2 regime, composed last onto it (by
 /// both DL entry points, [`plan_status`] and [`answer`], after the bounds; over a ruleset's
 /// closure, with or without the QL rewriting): each step only lowers what the status
@@ -650,6 +655,7 @@ const COMPARED: &str = "two spellings of one value are two terms to the store, w
 /// a typed constant ([`typed_constant`]); a data value compared by term ([`compared_values`])
 /// through a property that holds a literal other than a string, in `snapshot` (the data
 /// read; unknown, or read for a restricted reader: every property), can give wrong rows;
+/// a store in quarantine misses rows ([`QUARANTINE`]), whoever reads it;
 /// and where rows may be missing, an operator
 /// under which a missing row can make a returned one wrong ([`negation`]) makes the answers
 /// unsound. Each from `source`.
@@ -744,6 +750,10 @@ pub(crate) fn certify(
     if let Some(reason) = constant {
         completeness.incomplete(source, reason.clone());
     }
+    // From the snapshot as given: a restricted reader's is dropped below.
+    let quarantined = snapshot
+        .and_then(crate::service::Certificate::of)
+        .is_some_and(|c| c.state.violations > 0);
     let snapshot = snapshot.filter(|_| access.is_none());
     let typed = |predicate: &Option<String>| {
         snapshot.is_none_or(|s| match predicate {
@@ -756,6 +766,9 @@ pub(crate) fn certify(
     let compared = reads.compared.get_or_init(|| compared_values(query));
     if let Some((what, _)) = compared.iter().find(|(_, by)| by.iter().any(typed)) {
         completeness.incomplete(source, format!("the query compares {what}: {COMPARED}"));
+    }
+    if quarantined && completeness.complete {
+        completeness.incomplete(source, QUARANTINE.to_owned());
     }
     negation_rule(completeness, (query, reads), source);
 }
