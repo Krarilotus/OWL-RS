@@ -401,9 +401,20 @@ impl StoreService {
         let writer = tx.writer().expect("a transaction holds the writer slot");
         let kept = Certificate::of(tx.base()).and_then(|c| c.ql.clone());
         let reading = self.note_equality(writer, &state);
-        // A replica's reads are told `not-certified` ([`crate::StoreConfig::replica`]).
-        let certificate = (!self.config.replica).then(|| self.certificate(state, kept));
+        let certificate = self.vouches(&state).then(|| self.certificate(state, kept));
         tx.install(reading, certificate);
+    }
+
+    /// Whether the store vouches for the stack `state` records: never on a replica (its reads
+    /// are told `not-certified`, [`crate::StoreConfig::replica`]), and only where the rules
+    /// registered made it ([`Self::use_reasoning_rules`]); with none registered, as its marker
+    /// says, its label naming the marker's rules. Any other stack is read as stored and told
+    /// `not-certified` until it is rebuilt. A reader of some graphs who sees inferences is
+    /// refused with no rules registered all the same: the view of what its graphs support
+    /// needs rules to be made at all.
+    fn vouches(&self, state: &crate::ReasoningState) -> bool {
+        let hide = self.config.hide_unnamed_classes;
+        !self.config.replica && self.supports.vouches_for(state, hide)
     }
 
     /// `state`'s certificate under the store's settings now; `kept`, the QL schema to keep
@@ -979,9 +990,17 @@ impl StoreService {
 
     /// The rules the inferred stack is maintained with (reasoner v2; `None`: none), for
     /// the support graph sets of [`Self::read_snapshot`]. The mutation pipeline registers
-    /// its own.
+    /// its own. What the store vouches for follows them (`Self::vouches`): a stack other
+    /// rules made is read as stored and told `not-certified` until it is rebuilt; with `None`
+    /// after a registration it is told what its marker says again. Taken under the writer
+    /// slot, as every change of the certificate: it waits for a write, a bulk load or a
+    /// rematerialisation running meanwhile, and must not be called by a holder of the slot.
     pub fn use_reasoning_rules(&self, rules: Option<nrese_reasoner::RuleProgram>) {
+        let tx = self.engine.transaction();
         self.supports.use_rules(rules);
+        if let Some(state) = self.reasoning_state() {
+            self.certify(&tx, state);
+        }
     }
 
     /// Switches the `owl2-dl` mode's work on or off ([`crate::dl`]): the mutation
@@ -2398,8 +2417,9 @@ impl StoreService {
     /// revision (see [`crate::reasoning`]). For after bulk loads, at startup and after a
     /// change of rules; commits keep it current afterwards. Register `program` as well
     /// ([`Self::use_reasoning_rules`]; the mutation pipeline registers its own): while the
-    /// rules in place aren't the ones the stack was made with, readers of some graphs who
-    /// see inferred statements are refused until the store is rematerialised. A store used
+    /// rules in place aren't the ones the stack was made with, the new stack isn't certified
+    /// (`Self::vouches`) and readers of some graphs who see inferred statements are refused
+    /// until the store is rematerialised under the rules in place. A store used
     /// as a library that rematerialises with no reasoner registered (no pipeline) reads a
     /// later version without inferred statements or certificate as one no reasoning can
     /// leave answers out of: no status, not `not-certified`; a server registers its rules
@@ -2497,7 +2517,8 @@ impl StoreService {
             )
         };
         let reading = program.stored_equality();
-        let certificate = (!self.config.replica).then(|| self.certificate(state.clone(), None));
+        let vouched = self.vouches(&state);
+        let certificate = vouched.then(|| self.certificate(state.clone(), None));
         let finished = rematerialisation.finish_held(closure.inferred, reading, certificate)?;
         let summary = finished.summary();
         nrese_exec::heap::phase("store: done");
