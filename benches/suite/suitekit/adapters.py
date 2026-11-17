@@ -661,15 +661,19 @@ class Jena(Adapter):
   ja:baseModel <#asserted> .
 <#asserted> a ja:MemoryModel ; ja:content {content} .
 """, encoding="utf-8")
-        self.endpoint = self.serve_config(ctx, env)
+        self.endpoint = self.serve_config(ctx, env, store)
         return Step(Measured(self.endpoint.restart_ms or 0.0, None, 0),
                     note=f"in memory, {reasoner}; the rules run at the first query (count)")
 
-    def serve_config(self, ctx, env):
+    def serve_config(self, ctx, env, store):
         port = ctx.listen(3030)
+        # Fuseki's own state (FUSEKI_BASE, by default $PWD/run) goes into the run's store, which the runtime owns and
+        # removes on every runtime: written into /work as the container's user (root on Docker), the suite couldn't
+        # remove it and the run's cleanup failed.
         spec = Spec(ctx.name("serve"), self.image(ctx),
-                    ["fuseki-server", "--config=/work/fuseki.ttl", f"--port={port}"], env,
-                    ctx.mounts(), port=port, workdir="/work", memory=ctx.memory)
+                    ["fuseki-server", "--config=/work/fuseki.ttl", f"--port={port}"],
+                    {**env, "FUSEKI_BASE": "/store/fuseki"}, ctx.mounts(Mount(store, "/store", readonly=False)),
+                    port=port, workdir="/work", memory=ctx.memory)
         base = ctx.runtime.url(spec)
         return self.start(ctx, spec, Endpoint(f"{base}/ds/query", f"{base}/ds/update"))
 
