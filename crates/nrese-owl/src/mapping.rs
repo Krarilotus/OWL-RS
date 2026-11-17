@@ -100,10 +100,11 @@ pub struct Ontology {
     /// xsd:integer): read here by its value, but OWL 2 RL's rules (cls-maxc1/2,
     /// cls-maxqc1-4) name the mapping's literal, so they don't read it.
     pub noncanonical_cardinality: Option<Term>,
-    /// The first empty `owl:intersectionOf` list: `owl:Thing` here (OWL 2 Mapping to RDF,
-    /// Tables 15 and 18), which OWL 2 RL's rules don't read: they build no rule from it, and
+    /// The first empty `owl:intersectionOf` or `owl:unionOf` list, `owl:Thing` or
+    /// `owl:Nothing` (OWL 2 Mapping to RDF, Tables 15 and 18), which OWL 2 RL's rules don't
+    /// read: they build no rule from it, so no clash from an instance of the empty union, and
     /// where a rule names `owl:Thing` they see a blank node.
-    pub empty_intersection: Option<Term>,
+    pub empty_list: Option<Term>,
     /// The first data property with a maximum written with a data range (`owl:onDataRange`,
     /// `rdfs:Literal` too), which OWL 2 RL's rules don't read: its range can't tell it from
     /// an unqualified maximum.
@@ -407,7 +408,7 @@ struct Reader<'a> {
     reported: HashSet<(Term, &'static str)>,
     annotations: usize,
     noncanonical_cardinality: Option<Term>,
-    empty_intersection: Option<Term>,
+    empty_list: Option<Term>,
     annotation_schema: Vec<Term>,
 }
 
@@ -535,7 +536,7 @@ impl<'a> Reader<'a> {
             reported: HashSet::new(),
             annotations: 0,
             noncanonical_cardinality: None,
-            empty_intersection: None,
+            empty_list: None,
             annotation_schema: Vec::new(),
         }
     }
@@ -838,12 +839,15 @@ impl<'a> Reader<'a> {
         }
         let operands = canonical(self.classes(&members)?);
         let union = is(operator, v.owl_union_of);
-        if !union && operands.is_empty() {
-            // An empty intersection is `owl:Thing` (OWL 2 Mapping to RDF, Tables 15 and 18),
-            // which the rules don't read ([`Ontology::empty_intersection`]). The other short
-            // lists keep their form, which no OWL 2 RL check takes.
-            self.empty_intersection.get_or_insert(operand);
-            return Some(self.intern_class(ClassExpr::Thing));
+        if operands.is_empty() {
+            // An empty intersection is `owl:Thing`, an empty union `owl:Nothing` (OWL 2
+            // Mapping to RDF, Tables 15 and 18), which the rules don't read
+            // ([`Ontology::empty_list`]). The other short lists keep their form, which no
+            // OWL 2 RL check takes.
+            self.empty_list.get_or_insert(operand);
+            if !union {
+                return Some(self.intern_class(ClassExpr::Thing));
+            }
         }
         Some(self.intern_class(if union {
             ClassExpr::Or(operands)
@@ -1611,7 +1615,7 @@ impl<'a> Reader<'a> {
             anonymous: BTreeSet::new(),
             rules: Vec::new(),
             noncanonical_cardinality: self.noncanonical_cardinality,
-            empty_intersection: self.empty_intersection,
+            empty_list: self.empty_list,
             qualified_data_max: self.qualified_data_max,
         };
         complete(&mut ontology, self.terms);

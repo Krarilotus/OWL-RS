@@ -71,7 +71,7 @@ impl ConsistencyStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhyUndecided {
     /// The ontology has annotation-property axioms or a punned name, or an empty
-    /// intersection (`nrese_owl::profile::rules_read_differently`).
+    /// intersection or union (`nrese_owl::profile::rules_read_differently`).
     ReadsDifferently,
     /// The check whether it has didn't finish within its budget.
     Unchecked,
@@ -83,7 +83,7 @@ impl WhyUndecided {
         let why = match self {
             Self::ReadsDifferently => {
                 "the ontology has annotation-property axioms or a punned name, or an empty \
-                 intersection, which OWL 2 DL reads differently"
+                 intersection or union, which OWL 2 DL reads differently"
             }
             Self::Unchecked => {
                 "the check whether OWL 2 DL reads this ontology differently did not finish \

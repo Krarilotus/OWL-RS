@@ -66,8 +66,8 @@ pub enum Hazard {
     DataValues(Term),
     /// What OWL 2 RL's rules don't read as the RDF mapping does: a restriction whose
     /// cardinality isn't spelled as the mapping writes it
-    /// ([`Ontology::noncanonical_cardinality`]), or an empty intersection
-    /// ([`Ontology::empty_intersection`]): global.
+    /// ([`Ontology::noncanonical_cardinality`]), or an empty intersection or union
+    /// ([`Ontology::empty_list`]): global.
     Unread(Term),
 }
 
@@ -177,7 +177,7 @@ impl Hazard {
             Self::Unread(_) => format!(
                 "the rules don't read {t} as the RDF mapping does: a cardinality they read only \
                  in the mapping's spelling (\"0\" or \"1\"^^xsd:nonNegativeInteger), or an \
-                 empty intersection"
+                 empty intersection or union"
             ),
         }
     }
