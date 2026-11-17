@@ -413,7 +413,8 @@ What changes on purpose:
   them. A commit that adds one is now refused, and a store from `main` that holds one starts
   in quarantine: `/readyz` answers 503 `quarantined`, and
   `GET /api/v1/repositories/{id}/info` says `inconsistent` with the number of violations.
-  Reads and writes are still answered. Nothing names the statement, so look for such
+  Reads are still answered, `sound-only`, and so are writes. Nothing names the statement,
+  so look for such
   literals before you upgrade, or after, among the values of properties that have a range,
   and delete them: the store is ready again at once, and stays so across restarts.
 - Under `owl2-ql`, answers come through existentials. The QL rewriting is on by default there
