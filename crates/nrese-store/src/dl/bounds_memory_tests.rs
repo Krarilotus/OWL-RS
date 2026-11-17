@@ -353,7 +353,7 @@ fn embedded_low_memory_bounds_are_unavailable_on_every_build_path() {
     // A distinct store ensures prepare cannot just reuse an unavailable read result.
     let store = self::store(1);
     let tx = store.engine().transaction();
-    let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER);
+    let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER, false);
     assert!(!prepared.proves_consistency);
     assert!(matches!(prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()));
 }
@@ -384,7 +384,7 @@ fn an_upper_bound_the_process_memory_stopped_is_not_kept() {
     );
     let store = self::store(1);
     let tx = store.engine().transaction();
-    let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER);
+    let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER, false);
     assert!(
         matches!(&prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()),
         "the commit's U1 is stopped too"
@@ -409,7 +409,7 @@ fn embedded_zero_memory_policy_leaves_bounds_enabled() {
     assert!(report(&store).unavailable.is_none());
     assert_eq!(upper_facts(&store, false).unwrap(), fresh);
     let tx = store.engine().transaction();
-    assert!(prepare(&store, &tx, nrese_reasoner::eval::NEVER).proves_consistency);
+    assert!(prepare(&store, &tx, nrese_reasoner::eval::NEVER, false).proves_consistency);
 }
 
 #[test]
@@ -452,7 +452,7 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
         nrese_rdf::GraphName::DefaultGraph,
     );
     tx.insert(quad.as_ref());
-    let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER);
+    let prepared = prepare(&store, &tx, nrese_reasoner::eval::NEVER, false);
     assert!(!prepared.proves_consistency);
     assert!(matches!(prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()));
 }
