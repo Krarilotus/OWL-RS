@@ -131,8 +131,11 @@ pub async fn execute_query_in(
     .await?;
     // The run decided the announcement on what its reader reads before its first byte, which
     // `stream_blocking` waits for: the media type is the run's (its place among the headers kept).
-    let media_type = HeaderValue::from_static(announced.media_type());
     if explain == Explain::No {
+        let announcement = announced.media_type();
+        let parameters = announcement.find(';').map_or("", |i| &announcement[i..]);
+        let media_type = HeaderValue::from_str(&format!("{media_type}{parameters}"))
+            .map_err(|error| ApiError::internal(error.to_string()))?;
         response.headers_mut().insert(CONTENT_TYPE, media_type);
     }
     let reported = status.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -351,7 +354,7 @@ fn negotiate_formats(
     let (solutions, graph) = (SolutionsResultFormat::Json, GraphResultFormat::NTriples);
     Ok(match kind {
         QueryResultKind::Solutions | QueryResultKind::Boolean => {
-            let (media_type, format) = negotiated(
+            let (_, format) = negotiated(
                 accept,
                 if kind == QueryResultKind::Boolean {
                     BOOLEAN
@@ -359,7 +362,7 @@ fn negotiate_formats(
                     SOLUTIONS
                 },
             )?;
-            (format, graph, media_type)
+            (format, graph, format.media_type())
         }
         QueryResultKind::Graph => {
             let (media_type, format) = negotiated(accept, GRAPHS)?;

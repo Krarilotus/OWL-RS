@@ -131,11 +131,7 @@ impl<'a> Range<'a> {
 /// What to send: the offer the client weights highest, where the most specific range
 /// that names an offer decides its weight. Ties go to the earlier offer. Without an
 /// `Accept` header the first offer is sent. `None`: the client accepts none of them.
-pub fn negotiate<T: Copy>(accept: Option<&str>, offers: Offers<T>) -> Option<T> {
-    negotiate_offer(accept, offers).map(|(_, format)| format)
-}
-
-fn negotiate_offer<T: Copy>(accept: Option<&str>, offers: Offers<T>) -> Option<(&'static str, T)> {
+pub fn negotiate<T: Copy>(accept: Option<&str>, offers: Offers<T>) -> Option<(&'static str, T)> {
     let ranges: Vec<Range<'_>> = accept
         .unwrap_or_default()
         .split(',')
@@ -164,7 +160,7 @@ pub fn negotiated<T: Copy>(
     accept: Option<&str>,
     offers: Offers<T>,
 ) -> Result<(&'static str, T), ApiError> {
-    negotiate_offer(accept, offers).ok_or_else(|| {
+    negotiate(accept, offers).ok_or_else(|| {
         let mut names: Vec<&str> = offers.iter().map(|(media_type, _)| *media_type).collect();
         names.dedup();
         ApiError::not_acceptable(format!(
@@ -179,9 +175,11 @@ mod tests {
     use axum::http::HeaderValue;
     use nrese_store::{GraphResultFormat, SolutionsResultFormat};
 
-    use super::{
-        BOOLEAN, GRAPHS, SOLUTIONS, content_format, header_value_str, media_type_matches, negotiate,
-    };
+    use super::{BOOLEAN, GRAPHS, SOLUTIONS, content_format, header_value_str, media_type_matches};
+
+    fn negotiate<T: Copy>(accept: Option<&str>, offers: super::Offers<T>) -> Option<T> {
+        super::negotiate(accept, offers).map(|(_, format)| format)
+    }
 
     #[test]
     fn media_type_match_ignores_parameters() {
