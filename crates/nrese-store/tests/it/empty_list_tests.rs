@@ -357,8 +357,9 @@ enum Expect {
     Holds,
     /// The data is inconsistent: a commit is refused, a rebuild reports it.
     Inconsistent,
-    /// It is not derived, and the read must not be told complete: the data's meaning
-    /// entails it.
+    /// The data's meaning entails it: the read gives it, or is not told complete.
+    Follows,
+    /// It is not derived, and the read is not told complete: the meaning is left open.
     NotTold,
 }
 
@@ -373,8 +374,9 @@ enum Expect {
 /// (`∃:p.owl:Thing ⊑ :C`, or `≤ 0 :p.owl:Thing`, which `:x :p :y` breaks). A list reached
 /// through `owl:sameAs` is no list the mapping reads, so nothing about it is certain. Under
 /// `owl2-rl` the rules of OWL 2 Profiles §4.3 table 6 (cls-int1, cls-uni) give `:x a :C`
-/// for one member and nothing for none; they are sound and incomplete, so where the data
-/// means more, the read must not be told complete.
+/// for one member and nothing for none; they are sound and incomplete, and so is the OWL 2
+/// QL rewriting over their closure, so where the data means more, a read that doesn't
+/// give it must not be told complete.
 #[test]
 fn short_lists_mean_what_the_mapping_says() {
     use Expect::*;
@@ -387,7 +389,7 @@ fn short_lists_mean_what_the_mapping_says() {
             1,
             ":x a :C",
             Holds,
-            NotTold,
+            Follows,
         ),
         (
             "empty union",
@@ -395,7 +397,7 @@ fn short_lists_mean_what_the_mapping_says() {
             1,
             ":x a :D",
             Inconsistent,
-            NotTold,
+            Follows,
         ),
         (
             "empty enumeration",
@@ -403,7 +405,7 @@ fn short_lists_mean_what_the_mapping_says() {
             1,
             ":x a :D",
             Inconsistent,
-            NotTold,
+            Follows,
         ),
         (
             "one-member intersection",
@@ -428,7 +430,7 @@ fn short_lists_mean_what_the_mapping_says() {
             1,
             ":x a :D",
             Holds,
-            NotTold,
+            Follows,
         ),
         (
             "empty intersection through an alias",
@@ -447,7 +449,7 @@ fn short_lists_mean_what_the_mapping_says() {
             1,
             ":x a :C",
             Holds,
-            NotTold,
+            Follows,
         ),
         (
             "empty intersection as a qualified maximum's class",
@@ -457,7 +459,7 @@ fn short_lists_mean_what_the_mapping_says() {
             1,
             ":x a :D",
             Inconsistent,
-            NotTold,
+            Follows,
         ),
         // `≤ 1 :p.⊤`: the two successors are one.
         (
@@ -468,7 +470,7 @@ fn short_lists_mean_what_the_mapping_says() {
             1,
             ":z a :D",
             Holds,
-            NotTold,
+            Follows,
         ),
     ];
     let lists = "VALUES ?p { owl:intersectionOf owl:unionOf owl:oneOf owl:sameAs } ?s ?p ?o";
@@ -553,6 +555,11 @@ fn short_lists_mean_what_the_mapping_says() {
                                 result.completeness
                             );
                         }
+                        Follows => assert!(
+                            holds || !complete,
+                            "{holds}, told {:?}",
+                            result.completeness
+                        ),
                         NotTold => assert!(
                             !holds && !complete,
                             "{holds}, told {:?}",
