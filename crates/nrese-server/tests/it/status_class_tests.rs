@@ -2,10 +2,12 @@
 //! is read, answers as a freshly loaded store does: the same rows for a fixed set of reads,
 //! the same completeness status for each, the same consistency and readiness. Reader state
 //! that derives from the reasoning state (the equality reading, the QL rewriting, the status,
-//! consistency) must follow the data however it arrived, a read replica's included.
+//! consistency) must follow the data however it arrived. A read replica is no loaded store:
+//! it reads its primary's rows and says `not-certified` (the replica's fail-closed form).
 //!
-//! One test walks the whole table and lists every wrong cell, one line each
-//! (`WRONG way | column | aspect`), so a run shows which cells are wrong and no other.
+//! One test walks the whole table, one the replicas, and each lists every wrong cell, one
+//! line each (`WRONG way | column | aspect`), so a run shows which cells are wrong and no
+//! other.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -61,6 +63,40 @@ const WAYS: [&str; 9] = [
     "restore by time",
     "replica opened as primary",
 ];
+
+/// The ways to a read replica: from its primary's image, following its log, and across a
+/// change of its primary's rules. A replica is no loaded store
+/// ([`a_replica_reads_its_primarys_rows_and_says_not_certified`]).
+const REPLICA_WAYS: [&str; 3] = [
+    "bootstrapped replica",
+    "replica applying the log",
+    "replica across a change of rules",
+];
+
+/// What a refusal says, in part.
+const REFUSED: &str = "serves no replica";
+
+/// What a replica is told across a change of its primary's rules, in part: the primary's
+/// restart reasons again, which writes a checkpoint and no record, so its log no longer holds
+/// the replica's next revision (410 Gone). The replica fails closed.
+const START_AGAIN: &str = "start this replica again";
+
+/// The columns whose replica follows across a change of its primary's rules: there the
+/// restart's reasoning changes no inferred statement, so it installs without a new revision
+/// or a checkpoint (`nrese-engine/src/engine/bulk.rs:943-949`), and the replica reads on.
+const FOLLOWED: [&str; 3] = [
+    "custom representatives ql=auto",
+    "owl2-ql representatives ql=auto",
+    "owl2-ql representatives ql=off",
+];
+
+/// Whether `way` reaches a store through a replica of a primary under `column` whose rows are
+/// stored over representatives: `reasoner.equality = "compact"`, whose every column's rules
+/// close equality (`rdfs-plus`, `owl-horst`, `owl2-rl`, and `owl2-dl`, whose certified
+/// program is OWL 2 RL's). Such a primary serves no replica in this release.
+fn refused(way: &str, column: &Column) -> bool {
+    way.contains("replica") && matches!(column.equality, Equality::Compact)
+}
 
 #[derive(Clone, Copy)]
 enum Equality {
@@ -123,7 +159,8 @@ impl Column {
         self.state_with(dir, mode, replication, None)
     }
 
-    /// [`Self::state`], with `ontology` as the store's `ontology_path`.
+    /// [`Self::state`], with `ontology` as the store's `ontology_path`; a replica's store
+    /// opened with the role.
     fn state_with(
         &self,
         dir: &Path,
@@ -132,6 +169,9 @@ impl Column {
         ontology: Option<&Path>,
     ) -> TestResult<AppState> {
         let config = StoreConfig {
+            replica: replication
+                .as_ref()
+                .is_some_and(|r| r.mode == ReplicationMode::Replica),
             ontology_path: ontology.map(Path::to_path_buf),
             ..self.config(dir)
         };
@@ -233,6 +273,8 @@ fn both() -> String {
 struct Keep {
     dirs: Vec<tempfile::TempDir>,
     served: Vec<Served>,
+    /// Across a change of rules, the primary's revision before and after its restart.
+    restarted: Option<(u64, u64)>,
 }
 
 impl Keep {
@@ -255,6 +297,8 @@ struct Served {
     base: String,
     stop: tokio::sync::oneshot::Sender<()>,
     task: tokio::task::JoinHandle<()>,
+    /// The served store, released by [`Served::end`] once no other handle holds it.
+    store: std::sync::Arc<StoreService>,
 }
 
 impl Served {
@@ -271,18 +315,46 @@ impl Served {
                 .await
                 .expect("serve");
         });
-        Ok(Self { base, stop, task })
+        Ok(Self {
+            base,
+            stop,
+            task,
+            store: state.store(),
+        })
     }
 
+    /// Ends the server, and waits until its task has stopped and the store it serves is
+    /// released, so its directory can be opened again. A connection's task of axum's lets
+    /// the server's end go on before it drops its clone of the app, and with it the store
+    /// (axum 0.8.8, `serve/mod.rs:389-415`: `close_rx` goes first, the connection after):
+    /// the store is dropped here once this is its only handle, its lock released before
+    /// this returns. A wait is printed (`DETAIL`); after 10 s it goes on (`ERROR`), the
+    /// reopen's error then shown as it is.
     async fn end(self) {
         let _ = self.stop.send(());
-        let task = self.task;
-        let abort = task.abort_handle();
-        if tokio::time::timeout(Duration::from_secs(10), task)
+        let mut task = self.task;
+        if tokio::time::timeout(Duration::from_secs(10), &mut task)
             .await
             .is_err()
         {
-            abort.abort();
+            task.abort();
+            let _ = task.await;
+        }
+        let (started, others) = (
+            std::time::Instant::now(),
+            std::sync::Arc::strong_count(&self.store) - 1,
+        );
+        while std::sync::Arc::strong_count(&self.store) > 1 {
+            if started.elapsed() > Duration::from_secs(10) {
+                let handles = std::sync::Arc::strong_count(&self.store) - 1;
+                eprintln!("ERROR served end: {handles} handles after 10 s");
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        if others > 0 {
+            let waited = started.elapsed().as_millis();
+            eprintln!("DETAIL served end: waited {waited} ms, {others} other handles at the start");
         }
     }
 }
@@ -444,7 +516,16 @@ async fn reach(way: &str, column: &Column, keep: &mut Keep) -> TestResult<AppSta
             nrese_store::restore_until(&image, &target, &logs, None, None)?;
             reopened(column, &target)
         }
-        "replica opened as primary" => {
+        "bootstrapped replica" => {
+            let primary_state = column.state(&dir, column.mode, Some(primary()))?;
+            update(&primary_state, &both()).await?;
+            let served = Served::start(&primary_state).await?;
+            let (state, _) = replica(column, &served.base, keep).await?;
+            catch_up(&served.base, &state).await?;
+            keep.served.push(served);
+            Ok(state)
+        }
+        "replica applying the log" | "replica opened as primary" => {
             let primary_state = column.state(&dir, column.mode, Some(primary()))?;
             update(&primary_state, FIRST).await?;
             let served = Served::start(&primary_state).await?;
@@ -452,9 +533,32 @@ async fn reach(way: &str, column: &Column, keep: &mut Keep) -> TestResult<AppSta
             update(&primary_state, SECOND).await?;
             catch_up(&served.base, &state).await?;
             keep.served.push(served);
+            if way == "replica applying the log" {
+                return Ok(state);
+            }
             // There is no promotion: the replica's directory is started as a primary.
             drop(state);
             reopened(column, &replica_dir)
+        }
+        "replica across a change of rules" => {
+            let (state, served, before) = {
+                let primary_state = column.state(&dir, other(column.mode), Some(primary()))?;
+                update(&primary_state, &both()).await?;
+                let served = Served::start(&primary_state).await?;
+                let (state, _) = replica(column, &served.base, keep).await?;
+                catch_up(&served.base, &state).await?;
+                (state, served, primary_state.store().current_revision())
+            };
+            served.end().await;
+            // The primary restarts under the column's rules: its start reasons again, and
+            // the replica asks for its log ([`START_AGAIN`], [`FOLLOWED`]).
+            let primary_state = column.state(&dir, column.mode, Some(primary()))?;
+            start(&primary_state)?;
+            keep.restarted = Some((before, primary_state.store().current_revision()));
+            let served = Served::start(&primary_state).await?;
+            catch_up(&served.base, &state).await?;
+            keep.served.push(served);
+            Ok(state)
         }
         _ => Err(format!("no way {way}").into()),
     }
@@ -526,6 +630,100 @@ fn compare(cell: &str, got: &Seen, want: &Seen, wrong: &mut Vec<String>) {
         );
         wrong.push(format!("{cell} | readiness"));
     }
+}
+
+/// The values a result's rows bind `?x` to.
+fn bound(rows: &str) -> Vec<String> {
+    let rows: serde_json::Value = serde_json::from_str(rows).unwrap_or_default();
+    rows["results"]["bindings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row["x"]["value"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// Lists each aspect of a replica's `got` that isn't a replica's: each
+/// read's rows are `want`'s, a loaded store's, but, where the column's QL rewriting applies,
+/// the existential's, which only the rewriting answers and which rides on the certificate a
+/// replica doesn't carry: no row `want` lacks; its status `not-certified` where the column
+/// reasons, `want`'s where it doesn't; consistency `Unknown`; not quarantined.
+fn replica_compare(cell: &str, column: &Column, got: &Seen, want: &Seen, wrong: &mut Vec<String>) {
+    let reasons = !matches!(column.mode, ReasoningMode::Disabled);
+    let rewrites = column.ql.applies_to(column.mode.as_str());
+    for (i, (name, _)) in READS.iter().enumerate() {
+        let ((rows, status), (want_rows, want_status)) = (&got.reads[i], &want.reads[i]);
+        let rows_right = if rewrites && *name == "existential" {
+            bound(rows).iter().all(|x| bound(want_rows).contains(x))
+        } else {
+            rows == want_rows
+        };
+        if !rows_right {
+            eprintln!("DETAIL {cell} | {name}: rows {rows}, want {want_rows}");
+            wrong.push(format!("{cell} | {name}: rows"));
+        }
+        let status_right = if reasons {
+            status
+                .as_deref()
+                .is_some_and(|s| s.starts_with("not-certified"))
+        } else {
+            status == want_status
+        };
+        if !status_right {
+            eprintln!("DETAIL {cell} | {name}: status {status:?}");
+            wrong.push(format!("{cell} | {name}: status"));
+        }
+    }
+    if got.consistency != nrese_store::ConsistencyStatus::Unknown || got.quarantined {
+        eprintln!(
+            "DETAIL {cell} | consistency {:?}, quarantined {}",
+            got.consistency, got.quarantined
+        );
+        wrong.push(format!("{cell} | consistency"));
+    }
+}
+
+/// Spec: the replica of an inconsistent primary. The
+/// primary is quarantined (readable, not ready); its replica carries no consistency of its
+/// own (`Unknown`) and so is ready.
+async fn quarantine_cell(wrong: &mut Vec<String>, unmet: &mut Vec<String>) -> TestResult<()> {
+    let column = Column::new(
+        ReasoningMode::Owl2Rl,
+        Equality::Representatives,
+        QlRewritingMode::Auto,
+    );
+    let mut keep = Keep::default();
+    let dir = keep.dir()?;
+    let primary_state = column.state(&dir, column.mode, Some(primary()))?;
+    update(&primary_state, &both()).await?;
+    bulk_load(
+        &primary_state,
+        &keep.dir()?,
+        "ex:C owl:disjointWith ex:D . ex:x a ex:C , ex:D .",
+    )?;
+    reason(&primary_state)?;
+    if !primary_state.is_quarantined() {
+        unmet.push(format!(
+            "quarantine: the primary isn't quarantined ({:?})",
+            primary_state.store().consistency()
+        ));
+    }
+    let served = Served::start(&primary_state).await?;
+    let (state, _) = replica(&column, &served.base, &mut keep).await?;
+    catch_up(&served.base, &state).await?;
+    keep.served.push(served);
+    let cell = format!("quarantine | {}", column.name);
+    let consistency = state.store().consistency();
+    if consistency != nrese_store::ConsistencyStatus::Unknown || state.is_quarantined() {
+        eprintln!(
+            "DETAIL {cell} | consistency {consistency:?}, quarantined {}",
+            state.is_quarantined()
+        );
+        wrong.push(format!("{cell} | consistency"));
+    }
+    drop((state, primary_state));
+    keep.finish().await;
+    Ok(())
 }
 
 /// An import's window: between a bulk load's commit and its reasoning, a store with
@@ -647,9 +845,10 @@ async fn explain_cells(wrong: &mut Vec<String>) -> TestResult<()> {
     Ok(())
 }
 
-/// The table: every way × every column against a freshly loaded store of that column, the
-/// import window and EXPLAIN's two narrow cases. Every wrong cell is
-/// printed (`WRONG …`), every cell that couldn't run too (`ERROR …`).
+/// The table: every way × every column against a freshly loaded store of that column (a
+/// replica's directory started as a primary, under a compact column: refused with the
+/// sentence, as [`refused`] says), the import window and EXPLAIN's two narrow cases. Every
+/// wrong cell is printed (`WRONG …`), every cell that couldn't run too (`ERROR …`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn every_way_to_a_store_reads_as_a_loaded_store() -> TestResult<()> {
     let limit = Duration::from_secs(120);
@@ -682,7 +881,12 @@ async fn every_way_to_a_store_reads_as_a_loaded_store() -> TestResult<()> {
             })
             .await;
             match got {
+                Ok(Ok(_)) if refused(way, &column) => {
+                    eprintln!("DETAIL {cell}: served");
+                    wrong.push(format!("{cell} | served"));
+                }
                 Ok(Ok(got)) => compare(&cell, &got, &want, &mut wrong),
+                Ok(Err(error)) if refused(way, &column) && error.to_string().contains(REFUSED) => {}
                 Ok(Err(error)) => errors.push(format!("{cell} | {error}")),
                 Err(_) => errors.push(format!("{cell} | timed out")),
             }
@@ -708,6 +912,311 @@ async fn every_way_to_a_store_reads_as_a_loaded_store() -> TestResult<()> {
         "{} wrong cells, {} errors (the lines above)",
         wrong.len(),
         errors.len()
+    );
+    Ok(())
+}
+
+/// Spec (the replica's fail-closed form):
+/// a read replica reached by each of [`REPLICA_WAYS`] under each column reads as
+/// [`replica_compare`] says, against a freshly loaded store of that column. Under a compact
+/// column ([`refused`]) the way is refused with the sentence, at its image. Across a change
+/// of its primary's rules a replica is told to start again ([`START_AGAIN`]), except under
+/// [`FOLLOWED`], where it reads on, and under a compact column, whose restarted primary
+/// refuses it with the sentence ([`REFUSED`]: its log, as its image, serves no replica);
+/// the primary's revision moves across its restart exactly
+/// where the replica is told to start again. Then the replica of a quarantined primary
+/// ([`quarantine_cell`]). Every wrong cell is printed (`WRONG …`), every cell that couldn't
+/// run too (`ERROR …`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_reads_its_primarys_rows_and_says_not_certified() -> TestResult<()> {
+    let limit = Duration::from_secs(120);
+    let (mut wrong, mut errors, mut unmet) = (Vec::new(), Vec::new(), Vec::new());
+    for column in columns() {
+        let mut keep = Keep::default();
+        let want = match tokio::time::timeout(limit, async {
+            let state = reach("load", &column, &mut keep).await?;
+            seen(&state).await
+        })
+        .await
+        {
+            Ok(Ok(want)) => want,
+            Ok(Err(error)) => {
+                errors.push(format!("load | {} | {error}", column.name));
+                continue;
+            }
+            Err(_) => {
+                errors.push(format!("load | {} | timed out", column.name));
+                continue;
+            }
+        };
+        keep.finish().await;
+        for way in REPLICA_WAYS {
+            let mut keep = Keep::default();
+            let cell = format!("{way} | {}", column.name);
+            let got = tokio::time::timeout(limit, async {
+                let state = reach(way, &column, &mut keep).await?;
+                seen(&state).await
+            })
+            .await;
+            let across = way == "replica across a change of rules";
+            let gone = across && !FOLLOWED.contains(&column.name.as_str());
+            let told = if refused(way, &column) {
+                REFUSED
+            } else {
+                START_AGAIN
+            };
+            match keep.restarted {
+                Some((before, after)) if across && (before == after) == gone => {
+                    wrong.push(format!("{cell} | revision {before} -> {after}"));
+                }
+                None if across => wrong.push(format!("{cell} | no revision read")),
+                _ => {}
+            }
+            match got {
+                Ok(Err(error)) if gone && error.to_string().contains(told) => {}
+                Ok(Err(error)) if across && error.to_string().contains(START_AGAIN) => {
+                    wrong.push(format!("{cell} | told to start again"));
+                }
+                Ok(Ok(_)) if gone || refused(way, &column) => {
+                    eprintln!("DETAIL {cell}: served");
+                    wrong.push(format!("{cell} | served"));
+                }
+                Ok(Ok(got)) => replica_compare(&cell, &column, &got, &want, &mut wrong),
+                Ok(Err(error))
+                    if !gone && refused(way, &column) && error.to_string().contains(REFUSED) => {}
+                Ok(Err(error)) => errors.push(format!("{cell} | {error}")),
+                Err(_) => errors.push(format!("{cell} | timed out")),
+            }
+            keep.finish().await;
+        }
+    }
+    if let Err(error) = quarantine_cell(&mut wrong, &mut unmet).await {
+        errors.push(format!("quarantine | {error}"));
+    }
+    for line in &wrong {
+        eprintln!("WRONG {line}");
+    }
+    for line in &errors {
+        eprintln!("ERROR {line}");
+    }
+    for line in &unmet {
+        eprintln!("UNMET {line}");
+    }
+    assert!(
+        wrong.is_empty() && errors.is_empty() && unmet.is_empty(),
+        "{} wrong cells, {} errors, {} unmet preconditions (the lines above)",
+        wrong.len(),
+        errors.len(),
+        unmet.len()
+    );
+    Ok(())
+}
+
+/// The two commits made without reasoning that a primary's log can carry: the ontology file
+/// its open preloads, and a commit with reasoning off. The second is a guard: a primary
+/// turned to reasoning off clears its inferred statements at its start, which writes a
+/// checkpoint and no record, so the replica's next request gets 410 Gone before the commit
+/// made without reasoning reaches it.
+const UNREASONED: [&str; 2] = ["ontology preload", "reasoning off"];
+
+/// What `place_image` says, in part, of a removed store's certificate in the directory.
+const LEFTOVER: &str = "is a removed store's reasoning certificate";
+
+/// Applies what the primary at `base` serves until it has no more or refuses (a 410 once
+/// the log no longer holds the next record); the refusal, if any.
+async fn follow_until_refused(base: &str, replica: &AppState) -> Option<String> {
+    let client = reqwest::Client::new();
+    loop {
+        match replication::pull_once(&client, base, replica).await {
+            Ok(0) => return None,
+            Ok(_) => {}
+            Err(error) => return Some(error.to_string()),
+        }
+    }
+}
+
+/// What a store answers about `ex:x`, which the unreasoned commit gave `ex:C`: whether it
+/// holds that statement, and whether `ex:x a ex:D`, which `ex:C rdfs:subClassOf ex:D`
+/// entails, is answered and entailed as the reasoning certifies.
+async fn certified_answer(cell: &str, state: &AppState, wrong: &mut Vec<String>) -> TestResult<()> {
+    let (holds, _) = answered(state, "ASK { ex:x a ex:C }").await?;
+    if !holds.contains("\"boolean\":true") {
+        // Nothing to answer from: the store never got the statement.
+        eprintln!("DETAIL {cell}: the store doesn't hold ex:x a ex:C");
+        return Ok(());
+    }
+    let (rows, status) = answered(state, "ASK { ex:x a ex:D }").await?;
+    let complete = status.as_deref().is_some_and(|s| s.starts_with("complete"));
+    if !rows.contains("\"boolean\":true") && complete {
+        eprintln!("DETAIL {cell} | ask: {rows}, status {status:?}");
+        wrong.push(format!("{cell} | ask"));
+    }
+    let Some(program) = state.pipeline().reasoner().config().materialised_program() else {
+        return Ok(());
+    };
+    let ex = |name: &str| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{name}"));
+    let conclusion = nrese_rdf::Triple::new(ex("x"), nrese_rdf::vocab::rdf::TYPE, ex("D"));
+    // Entailed, or refused (the inferred statements aren't certified), is right.
+    let entailed = state.store().entails(program, &[conclusion]);
+    if let Ok(nrese_store::Entailment::NotEntailed) = entailed {
+        eprintln!("DETAIL {cell} | entails: not entailed, status {status:?}");
+        wrong.push(format!("{cell} | entails"));
+    }
+    Ok(())
+}
+
+/// A replica's certificate across a commit made without reasoning. The replica holds a
+/// certificate of its own, by `route`: its directory was started as a primary once, over
+/// the closure the records brought, and then as a replica again; an image placed beside a
+/// `reasoning.state` left in an otherwise empty directory is refused instead (`leftover
+/// certificate`). The primary then commits without reasoning (its ontology file preloaded at its open, or a commit with reasoning off), and
+/// the replica applies what its log serves. It must not answer `ex:x a ex:D`, which the
+/// commit's `ex:x a ex:C` entails, with `false` and `complete`, nor `entails` say no, while
+/// it runs and once its directory is reopened as a store.
+async fn certificate_cell(
+    kind: &str,
+    route: &str,
+    column: &Column,
+    wrong: &mut Vec<String>,
+    unmet: &mut Vec<String>,
+) -> TestResult<()> {
+    let mut keep = Keep::default();
+    let dir = keep.dir()?;
+    let base = format!("{kind} | {route} | {}", column.name);
+    let (replica_dir, served, revision) = {
+        let primary_state = column.state(&dir, column.mode, Some(primary()))?;
+        update(&primary_state, "ex:C rdfs:subClassOf ex:D .").await?;
+        let served = Served::start(&primary_state).await?;
+        let replica_dir = keep.dir()?;
+        if route == "leftover certificate" {
+            // A directory with no store but the primary's `reasoning.state`.
+            std::fs::copy(
+                dir.join("reasoning.state"),
+                replica_dir.join("reasoning.state"),
+            )?;
+        }
+        let config = following(&served.base);
+        let placed = replication::bootstrap(&config, &replica_dir).await;
+        if route == "leftover certificate" {
+            // A removed store's certificate beside an empty directory: the image isn't placed
+            // there (`place_image`).
+            // This test pins that refusal; the replica's fail-closed form doesn't make it.
+            let right = placed
+                .as_ref()
+                .is_err_and(|error| error.to_string().contains(LEFTOVER));
+            if !right {
+                eprintln!("DETAIL certificate | {base}: placed {placed:?}");
+                wrong.push(format!("certificate | {base} | leftover placed"));
+            }
+            drop(primary_state);
+            served.end().await;
+            keep.finish().await;
+            return Ok(());
+        }
+        placed?;
+        let state = column.state(&replica_dir, column.mode, Some(config))?;
+        catch_up(&served.base, &state).await?;
+        let revision = state.store().current_revision();
+        (replica_dir, served, revision)
+    };
+    if route == "opened as a primary" {
+        // The replica's directory started once as a primary: its reasoning finds the
+        // closure the records brought, and certifies it.
+        drop(reopened(column, &replica_dir)?);
+    }
+    let state = column.state(&replica_dir, column.mode, Some(following(&served.base)))?;
+    let program = state.pipeline().reasoner().config().materialised_program();
+    if !program.is_some_and(|p| state.store().reasoning_is_current(p)) {
+        unmet.push(format!(
+            "certificate | {base}: the replica holds no certificate"
+        ));
+    }
+    if state.store().current_revision() != revision {
+        unmet.push(format!(
+            "certificate | {base}: the directory's start as a primary published a revision"
+        ));
+    }
+    served.end().await;
+    let primary_state = match kind {
+        "ontology preload" => {
+            let ontology = keep.dir()?.join("ontology.ttl");
+            std::fs::write(
+                &ontology,
+                "@prefix ex: <http://example.com/> .\nex:x a ex:C .\n",
+            )?;
+            let state = column.state_with(&dir, column.mode, Some(primary()), Some(&ontology))?;
+            start(&state)?;
+            state
+        }
+        "reasoning off" => {
+            let state = column.state(&dir, ReasoningMode::Disabled, Some(primary()))?;
+            start(&state)?;
+            update(&state, "ex:x a ex:C .").await?;
+            state
+        }
+        _ => return Err(format!("no kind {kind}").into()),
+    };
+    let served = Served::start(&primary_state).await?;
+    let refused = follow_until_refused(&served.base, &state).await;
+    eprintln!(
+        "DETAIL certificate | {base}: replica at {}, primary at {}, refused: {refused:?}",
+        state.store().current_revision(),
+        primary_state.store().current_revision()
+    );
+    keep.served.push(served);
+    certified_answer(
+        &format!("certificate | {base} | running replica"),
+        &state,
+        wrong,
+    )
+    .await?;
+    drop(state);
+    let state = reopened(column, &replica_dir)?;
+    certified_answer(
+        &format!("certificate | {base} | reopened as a store"),
+        &state,
+        wrong,
+    )
+    .await?;
+    drop((state, primary_state));
+    keep.finish().await;
+    Ok(())
+}
+
+/// [`certificate_cell`] for each unreasoned commit, under the regimes a certificate decides
+/// for: `owl2-rl`, and `owl2-dl`, whose certified program is OWL 2 RL's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replica_s_certificate_follows_the_records_it_applies() -> TestResult<()> {
+    let (mut wrong, mut errors, mut unmet) = (Vec::new(), Vec::new(), Vec::new());
+    for mode in [ReasoningMode::Owl2Rl, ReasoningMode::Owl2Dl] {
+        let column = Column::new(mode, Equality::Representatives, QlRewritingMode::Auto);
+        for kind in UNREASONED {
+            for route in ["opened as a primary", "leftover certificate"] {
+                let cell = certificate_cell(kind, route, &column, &mut wrong, &mut unmet);
+                let name = format!("certificate | {kind} | {route} | {}", column.name);
+                match tokio::time::timeout(Duration::from_secs(120), cell).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => errors.push(format!("{name} | {error}")),
+                    Err(_) => errors.push(format!("{name} | timed out")),
+                }
+            }
+        }
+    }
+    for line in &wrong {
+        eprintln!("WRONG {line}");
+    }
+    for line in &errors {
+        eprintln!("ERROR {line}");
+    }
+    for line in &unmet {
+        eprintln!("UNMET {line}");
+    }
+    assert!(
+        wrong.is_empty() && errors.is_empty() && unmet.is_empty(),
+        "{} wrong cells, {} errors, {} unmet preconditions (the lines above)",
+        wrong.len(),
+        errors.len(),
+        unmet.len()
     );
     Ok(())
 }
