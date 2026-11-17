@@ -49,6 +49,10 @@ mod lock_tests;
 #[path = "bounds_kinds_tests.rs"]
 mod kinds_tests;
 
+#[cfg(test)]
+#[path = "bounds_shapes_tests.rs"]
+mod shapes_tests;
+
 /// Where the lock tests hold U1's work mid-way: a hook run once, on the thread doing that
 /// work, for the store whose bounds it names.
 #[cfg(test)]
