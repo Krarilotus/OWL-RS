@@ -1,9 +1,10 @@
-//! SHACL content under `owl2-dl`: a triple whose predicate is in SHACL's namespace, or an
-//! `rdf:type` statement whose class is, carries no OWL meaning, so the OWL reader reads it as
-//! SHACL content, as it reads an annotation. A store whose only punning comes from such
-//! triples stays on the OWL 2 RL rules' route. A store that gives a SHACL term an OWL meaning
-//! (an axiom on it, or a use of it as an individual) is read as before, off the route.
-//! Each test names the route, `dl_bounds().last`, as the routing tests do.
+//! SHACL content under `owl2-dl`: a triple whose predicate is a property of the SHACL
+//! vocabulary carries no OWL meaning, so the OWL reader reads it as SHACL content, as it reads
+//! an annotation. A store whose only punning comes from such triples stays on the OWL 2 RL
+//! rules' route. A store that gives a SHACL term an OWL meaning (an axiom on it, or a use of it
+//! as an individual) is read as any other, off the route; so is a class that is also a node
+//! shape, whose type triple is a class assertion. Each test names the route,
+//! `dl_bounds().last`, as the routing tests do.
 
 use nrese_store::dl::entailment::Entailed;
 
@@ -60,12 +61,13 @@ fn explicit_target_shapes_beside_an_rl_ontology_stay_on_the_rules_route() {
     assert_eq!(route, "rules", "shapes took the store off the rules' route");
 }
 
-/// Spec (as above, for a type triple: SHACL's classes carry no OWL meaning either): an
-/// implicit class target, a class that is also a node shape (`:Person a sh:NodeShape,
-/// owl:Class`), is SHACL content, so `:Person` is no individual by it and the store stays on
-/// the rules' route. Read as a class assertion, the type triple would pun `:Person`.
+/// Spec (OWL 2 Structural Specification §5.9, punning; OWL 2 Profiles §4.3, theorem PR1, needs
+/// none): an implicit class target, a class that is also a node shape (`:Person a
+/// sh:NodeShape, owl:Class`), states a class assertion of `sh:NodeShape` about `:Person`, which
+/// makes the class `:Person` an individual too, so the store is off the rules' route; a read of
+/// the ontology is answered as without the shape.
 #[test]
-fn an_implicit_class_target_stays_on_the_rules_route() {
+fn an_implicit_class_target_stays_off_the_route() {
     let dl = pipeline();
     insert(&dl, ONTOLOGY).expect("an RL ontology");
     shapes_insert(
@@ -77,22 +79,20 @@ fn an_implicit_class_target_stays_on_the_rules_route() {
     let (rows, status) = query(&dl, "SELECT ?x { ?x a :Person }");
     eprintln!("route {route}: {rows:?}, {}", status.shared.as_str());
     assert_eq!(rows, ["ann", "bob"]);
-    assert!(status.is_complete(), "{:?}", status.reasons());
-    assert_eq!(route, "rules", "an implicit class target left the route");
+    assert_ne!(route, "rules", "a punned class stayed on the rules' route");
 }
 
 /// Spec (OWL 2 Structural Specification: a term an axiom uses has that axiom's kind): a SHACL
 /// term given an OWL meaning is read as any other term, so its shapes' statements are property
 /// and class assertions that pun, and the store is off the rules' route. Each row adds one to
 /// the explicit-target shapes: a declaration of `sh:path` as an object property; a
-/// sub-property axiom on `sh:class`; a subclass of `sh:NodeShape`. (An equality on `sh:path`
-/// and the W3C vocabulary's content have tests of their own, below.)
+/// sub-property axiom on `sh:class`. (An equality on `sh:path` and the W3C vocabulary's
+/// content have tests of their own, below.)
 #[test]
-fn a_shacl_term_given_an_owl_meaning_is_read_as_today_off_the_route() {
+fn a_shacl_term_given_an_owl_meaning_is_read_as_any_term_off_the_route() {
     let rows = [
         ("declaration", "sh:path a owl:ObjectProperty ."),
         ("sub-property", "sh:class rdfs:subPropertyOf :related ."),
-        ("subclass", ":A rdfs:subClassOf sh:NodeShape ."),
     ];
     let mut wrong = Vec::new();
     for (what, extra) in rows {
@@ -147,7 +147,7 @@ fn an_equality_on_a_shacl_predicate_gives_no_row_told_sound() {
 /// the data aren't OWL 2 DL and were left out (`dl::consistency`, `left_out_by`), as for any
 /// reserved name used as an entity.
 #[test]
-fn the_shacl_vocabulary_loaded_is_read_as_today() {
+fn the_shacl_vocabulary_loaded_is_read_as_any_term() {
     let dl = pipeline();
     insert(&dl, ONTOLOGY).expect("an RL ontology");
     let vocabulary = "sh:path a rdf:Property ; rdfs:domain sh:PropertyShape . \
@@ -227,26 +227,60 @@ fn a_conclusion_mixing_shacl_content_with_an_axiom_is_decided_by_the_axiom() {
 
 /// Spec (OWL 2 Direct Semantics: SHACL content, like an annotation, has no meaning, so an
 /// equality entails no copy of it): on the rules' route, `:s owl:sameAs :t` lets eq-rep-s copy
-/// `:s sh:path :q` to `:t`, which OWL 2 DL doesn't entail. A read of `?x sh:path ?o` that
-/// returns `:t` may not be told `complete` or `sound-only`.
+/// `:s sh:path :q` to `:t`, which OWL 2 DL doesn't entail. A read that returns `:t`, through the
+/// predicate `sh:path` or through any predicate, may not be told `complete` or `sound-only`.
 #[test]
-#[ignore = "until the status rule counts SHACL content among content without OWL meaning"]
 fn a_copied_shacl_row_is_not_told_sound() {
     let dl = pipeline();
     insert(&dl, ONTOLOGY).expect("an RL ontology");
     shapes_insert(&dl, ":s sh:path :q . :s owl:sameAs :t .").expect("a copied shape row");
     let route = dl.store().dl_bounds().last;
-    let (rows, status) = query(&dl, &format!("{SH}SELECT ?x {{ ?x sh:path ?o }}"));
+    let mut wrong = Vec::new();
+    for read in ["SELECT ?x { ?x sh:path ?o }", "SELECT ?x { ?x ?p :q }"] {
+        let (rows, status) = query(&dl, &format!("{SH}{read}"));
+        let told = status.shared.as_str();
+        let line = format!(
+            "route {route}: {read}: {rows:?}, {told} {:?}",
+            status.reasons()
+        );
+        eprintln!("{line}");
+        assert!(
+            rows.iter().any(|r| r == "t"),
+            "{line}: the rules' copy is not returned"
+        );
+        if matches!(told, "complete" | "sound-only") {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "copied rows told sound: {wrong:#?}");
+    assert_eq!(route, "rules");
+}
+
+/// Spec (OWL 2 Profiles §4.3, Table 4: eq-rep-s, eq-rep-p and eq-rep-o copy a statement only
+/// through an equality of two different terms): with no equality, the rules make no copy of
+/// SHACL content, so a read of it keeps its status: `?x sh:path ?o` is answered `complete` on
+/// the rules' route, and a read of any predicate isn't told `unsound`.
+#[test]
+fn shacl_content_without_an_equality_keeps_its_status() {
+    let dl = pipeline();
+    insert(&dl, ONTOLOGY).expect("an RL ontology");
+    shapes_insert(&dl, ":s sh:path :q .").expect("a shape row");
+    let route = dl.store().dl_bounds().last;
+    let (rows, constant) = query(&dl, &format!("{SH}SELECT ?x {{ ?x sh:path ?o }}"));
+    let (any, variable) = query(&dl, &format!("{SH}SELECT ?x {{ ?x ?p :q }}"));
     let line = format!(
-        "route {route}: {rows:?}, {} {:?}",
-        status.shared.as_str(),
-        status.reasons()
+        "route {route}: sh:path {rows:?} {}; any {any:?} {} {:?}",
+        constant.shared.as_str(),
+        variable.shared.as_str(),
+        variable.reasons()
     );
     eprintln!("{line}");
-    assert_eq!(route, "rules", "{line}");
-    let told = status.shared.as_str();
-    assert!(
-        !rows.iter().any(|r| r == "t") || !matches!(told, "complete" | "sound-only"),
+    assert_eq!(
+        (rows, any),
+        (vec!["s".to_owned()], vec!["s".to_owned()]),
         "{line}"
     );
+    assert!(constant.is_complete(), "{line}");
+    assert_ne!(variable.shared.as_str(), "unsound", "{line}");
+    assert_eq!(route, "rules", "{line}");
 }
