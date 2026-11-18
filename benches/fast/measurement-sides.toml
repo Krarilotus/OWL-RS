@@ -3,14 +3,15 @@
 # lab (crates/nrese-store/examples/) and has the revision as its only parent. release-gate.sh build
 # builds and times that commit for the side and refuses any other (release_gate.py measured_at); the
 # jobs take it as an input (measurement_inputs). Each commit is pushed as its ref, named for the
-# side it carries and what it adds (main3sus, v15cus: main3s and v15c with the open printed in
-# microseconds; v15cus's parse-only queries also give no rows, as the candidate's do; main3sfirst:
-# main3sus with each query's first execution reported, as the candidate's and v1.5's are).
+# side it carries and what it adds (main3sfirst: the open printed in microseconds and each query's
+# first execution reported, as the candidate's and v1.5's are; v15cus: a timing loop that starts no
+# thread in the timed window, the consistency answer and SHACL report the release cases check, the
+# open printed in microseconds, and parse-only queries that give no rows, as the candidate's do).
 
-[side.a0020134c20a33eabe8ead0402f814585b9c7fd0]  # main
-commit = "e7eaee4e7a9dd0f99afcb8bec742ea24471ce0d3"
-ref = "refs/measure/main3sfirst-a0020134"
+[side.e7a479a33f0bc7879b7b647e1d3373edfd61c0a9]  # main
+commit = "a6a2738fbc2d590195eeaf3ecb3fd955c2a0e69e"
+ref = "refs/measure/main3sfirst-e7a479a3"
 
-[side.d348a8a1a9e40cd23381df1faa726d3ffa44948c]  # v1.5, the release gate's base
-commit = "147f5c724ef5dc5263700ee34bf3cd1f187805bd"
-ref = "refs/measure/v15cus-d348a8a1"
+[side.21f41249892e0b15635b522e52f284157685b4c7]  # v1.5, the release gate's base
+commit = "25bd9c268515a7ad109fa5f6b186207da2ae09d2"
+ref = "refs/measure/v15cus-21f41249"

@@ -1901,10 +1901,11 @@ def read_measure(text: str | None) -> dict:
 
 # --- the fleet jobs ----------------------------------------------------------------------------
 
-# Runs and notes from before 26 Oct 2026 name these sides by their ids before that day's history
-# rewrite, 0f465633 and f9b515e8: the same trees.
-BASE = "d348a8a1a9e40cd23381df1faa726d3ffa44948c"  # v1.5, the last recorded run's base
-MAIN = "a0020134c20a33eabe8ead0402f814585b9c7fd0"  # main
+# Runs and notes from before the history rewrites of 26 Oct 2026 and of November 2026 name these
+# sides by their earlier ids, the same trees: v1.5 as 0f465633, then d348a8a1; main as 64a2711b
+# (earlier runs measured an older main, a0020134, before 26 Oct f9b515e8).
+BASE = "21f41249892e0b15635b522e52f284157685b4c7"  # v1.5, the last recorded run's base
+MAIN = "e7a479a33f0bc7879b7b647e1d3373edfd61c0a9"  # main
 
 # The sides measured at a reviewed commit on top of them (benches/PROTOCOL.md §5, "No thread
 # started in a timed window"): a side's revision → that commit.
