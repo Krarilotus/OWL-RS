@@ -386,7 +386,7 @@ fn data_terms(o: &Ontology, terms: &dyn Terms) -> DataTerms {
 
 /// The facets of the OWL 2 datatype map (*Structural Specification* §4): what a facet
 /// restriction's one statement may say.
-const FACETS: [&str; 9] = [
+pub const FACETS: [&str; 9] = [
     "http://www.w3.org/2001/XMLSchema#minInclusive",
     "http://www.w3.org/2001/XMLSchema#maxInclusive",
     "http://www.w3.org/2001/XMLSchema#minExclusive",
