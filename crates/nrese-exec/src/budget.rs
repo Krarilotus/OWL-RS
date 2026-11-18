@@ -444,6 +444,11 @@ impl Envelope {
         part.optional = true;
         part
     }
+
+    /// [`Self::optional_part`] as an envelope, for a call that takes one, on the same terms.
+    pub fn optional(&self) -> Self {
+        Self(Arc::new(self.optional_part()))
+    }
 }
 
 impl Default for Envelope {
