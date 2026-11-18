@@ -18,6 +18,7 @@ mod left_out;
 mod left_out_words;
 mod long_chain;
 mod mode;
+mod model_labels;
 mod outside;
 mod plans;
 mod queries;

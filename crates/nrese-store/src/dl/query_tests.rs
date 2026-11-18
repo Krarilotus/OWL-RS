@@ -1273,3 +1273,107 @@ fn a_question_naming_an_individual_the_data_doesnt_is_not_complete_when_the_onto
         "the answer, evaluated afresh: {answer}"
     );
 }
+
+/// The unions store of `tests/it/dl/model_labels.rs` with `n` individuals, the `k`-th with
+/// the value `v(k mod 4)`, a candidate limit of 4, and the model's refutations on or off.
+fn unions_store(model_labels: bool, n: usize) -> Arc<StoreService> {
+    let mut data = include_str!("../../tests/it/dl/model_labels_unions.ttl").to_owned();
+    for k in 0..n {
+        data.push_str(&format!(":i{k} :val :v{} .\n", k % 4));
+    }
+    let dl = crate::DlConfig {
+        max_candidates: Some(4),
+        model_labels,
+        ..crate::DlConfig::default()
+    };
+    let config = crate::StoreConfig {
+        dl,
+        ..crate::StoreConfig::in_memory()
+    };
+    lower_true_store_with(config, &data)
+}
+
+/// `SELECT ?x { ?x a :U0 }` over `store` within `memory` bytes: the answers' bytes and the
+/// status with what decided it.
+fn unions_read(
+    store: &StoreService,
+    memory: Option<usize>,
+) -> crate::StoreResult<(
+    Vec<u8>,
+    Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>,
+)> {
+    let mut request = crate::SparqlQueryRequest::all("SELECT ?x { ?x a <urn:test:U0> }");
+    request.memory_limit = memory;
+    let prepared = store.prepare_query(&request)?;
+    let mut out = Vec::new();
+    let status = store.run_query_dl(&prepared, &CancellationToken::new(), &mut out)?;
+    Ok((out, status))
+}
+
+/// Spec: a setting turns the model's refutations off, and off a read is decided by each
+/// candidate's own test as before: over the 24 individuals with a candidate limit of 4, the
+/// 4 admitted refuted, 8 unresolved, the read not `complete`, none refuted by labels. On,
+/// the model refutes all 12 (*Direct Semantics* §2.5: one model with the candidate outside
+/// the class), the read is `complete`, and its rows are the same 12.
+#[test]
+fn without_model_labels_a_read_is_decided_by_its_tests_alone() {
+    let (off, on) = (unions_store(false, 24), unions_store(true, 24));
+    let (off_rows, off_status) = unions_read(&off, None).unwrap();
+    let (on_rows, on_status) = unions_read(&on, None).unwrap();
+    let ((off_status, off_detail), (on_status, on_detail)) =
+        (off_status.unwrap(), on_status.unwrap());
+    println!("off {off_status:?} {off_detail:?}; on {on_status:?} {on_detail:?}");
+    let bounds =
+        |s: &nrese_sparql::Completeness| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
+    assert_eq!(bounds(&off_status), Some((12, 24, 8)));
+    assert_eq!(
+        (
+            off_detail.proved,
+            off_detail.refuted,
+            off_detail.refuted_by_labels
+        ),
+        (0, 4, 0)
+    );
+    assert!(!off_status.complete);
+    assert_eq!(off_rows, on_rows, "the same rows");
+    assert_eq!(bounds(&on_status), Some((12, 24, 0)));
+    assert_eq!(
+        (
+            on_detail.proved,
+            on_detail.refuted,
+            on_detail.refuted_by_labels
+        ),
+        (0, 12, 12)
+    );
+    assert!(on_status.complete, "{:?}", on_status.reasons);
+}
+
+/// Spec: the model's refutations need the whole gap selected, but never fail a read: under
+/// each request memory limit from 16 KiB to 64 MiB (steps of a tenth), over 400 individuals,
+/// a read answered with the refutations off is answered with them on. This can't show the
+/// selection's own fallback taken; it holds the read to the outcome either way.
+#[test]
+fn a_read_answered_without_model_labels_is_answered_with_them_under_every_memory_limit() {
+    let (off, on) = (unions_store(false, 400), unions_store(true, 400));
+    let (mut limit, mut answered, mut failed) = (16usize << 10, 0, 0);
+    while limit <= 64 << 20 {
+        match unions_read(&off, Some(limit)) {
+            Ok(_) => {
+                answered += 1;
+                let with = unions_read(&on, Some(limit));
+                assert!(
+                    with.is_ok(),
+                    "{limit} bytes: off answered, on {:?}",
+                    with.err()
+                );
+            }
+            Err(_) => failed += 1,
+        }
+        limit += limit / 10;
+    }
+    println!("off answered under {answered} limits and failed under {failed}");
+    assert!(
+        answered > 0 && failed > 0,
+        "the limits cross the read's need"
+    );
+}

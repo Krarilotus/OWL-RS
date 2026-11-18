@@ -538,3 +538,40 @@ async fn exact_refuses_an_inferred_only_read() -> Result<(), Box<dyn std::error:
     )
     .await
 }
+
+/// Spec: EXPLAIN's `candidates.refuted` counts every candidate refuted, and
+/// `refuted_by_labels` those of them one model of the premise refuted without a test of its
+/// own (*Direct Semantics* §2.5: a model with the candidate outside the class). Over the
+/// unions of `nrese-store/tests/it/dl/model_labels_unions.ttl` and 24 individuals, the 12
+/// with `v2` or `v3` are no `U0` and the model refutes each, so both counts are 12.
+#[tokio::test]
+async fn explain_counts_the_candidates_refuted_by_the_models_labels()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("unions.ttl");
+    let mut text = "@prefix : <http://example.com/> .\n\
+                    @prefix owl: <http://www.w3.org/2002/07/owl#> .\n"
+        .to_owned();
+    text.push_str(include_str!(
+        "../../../nrese-store/tests/it/dl/model_labels_unions.ttl"
+    ));
+    for k in 0..24 {
+        text.push_str(&format!(":i{k} :val :v{} .\n", k % 4));
+    }
+    std::fs::write(&path, text)?;
+    let mut config = StoreConfig::in_memory().with_ontology(path);
+    config.dl.model_labels = true;
+    let app = test_app_with_store_config(
+        config,
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
+    )?;
+    let query = "SELECT ?x { ?x a <http://example.com/U0> }";
+    let response = app.clone().oneshot(get(query, "&explain=true")?).await?;
+    let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    println!("{}", json["candidates"]);
+    assert_eq!(json["completeness"]["status"], "complete");
+    assert_eq!(json["candidates"]["refuted"], 12);
+    assert_eq!(json["candidates"]["refuted_by_labels"], 12);
+    Ok(())
+}

@@ -1,0 +1,8 @@
+:val a owl:ObjectProperty , owl:FunctionalProperty .
+:Cv0 a owl:Class ; owl:equivalentClass [ a owl:Restriction ; owl:onProperty :val ; owl:hasValue :v0 ] .
+:Cv1 a owl:Class ; owl:equivalentClass [ a owl:Restriction ; owl:onProperty :val ; owl:hasValue :v1 ] .
+:Cv2 a owl:Class ; owl:equivalentClass [ a owl:Restriction ; owl:onProperty :val ; owl:hasValue :v2 ] .
+:Cv3 a owl:Class ; owl:equivalentClass [ a owl:Restriction ; owl:onProperty :val ; owl:hasValue :v3 ] .
+:U0 a owl:Class ; owl:equivalentClass [ a owl:Class ; owl:unionOf ( :Cv0 :Cv1 ) ] .
+:U1 a owl:Class ; owl:equivalentClass [ a owl:Class ; owl:unionOf ( :Cv1 :Cv2 ) ] .
+:U2 a owl:Class ; owl:equivalentClass [ a owl:Class ; owl:unionOf ( :Cv2 :Cv3 ) ] .
