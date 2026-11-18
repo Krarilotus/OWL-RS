@@ -1,6 +1,6 @@
 """The tests hand git no fixed revision id: they take revisions from a repository of their own
 (isolation.repo) or by name (HEAD), never as a literal id. T0, 28 Oct 2026: test_abba's dcb3b0e2
-and 0251a486, ids from before the 26 Oct rewrite, failed every push gate on the hosts whose job
+and 0251a486, fixed ids, failed every push gate on the hosts whose job
 repositories no longer held them.
 
 The check reads the tests' code and never asks git: an id is refused whether or not its commit
@@ -122,7 +122,7 @@ def fixed_ids(source: str) -> list[tuple[int, str]]:
 
 # Ids to refuse, each a different case of "is its commit here?": one of this repository's own
 # (engine-v2's merge of PR #60), one no repository holds, and one of a test's own repository.
-PRESENT = "14d7b6ff"
+PRESENT = "7ee085a6"
 ABSENT = "0123456789abcdef0123456789abcdef01234567"
 # Each hands git REV one way the check reads.
 HANDED = ('subprocess.run(["git", "-C", d, "rev-parse", "--verify", "REV^{commit}"])',

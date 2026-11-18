@@ -1322,7 +1322,7 @@ def timed_metric(case: dict) -> str:
 # the planner statistics the load command builds before it returns (perf_lab's `statistics_ms`,
 # timed apart from `load_s`, which stays as it is), where the side reports such a build; a side
 # without one (main's has no such step) is ready when loaded. Compared against main only: base's
-# perf_lab never builds them while base's server does (a7ef46649), so its `ready` through perf_lab
+# perf_lab never builds them while base's server does (0dcc8e70f), so its `ready` through perf_lab
 # would leave out a step its product runs (release_gate.py family_of, compare_case).
 READY = "ready"
 READY_SIDES = ("main",)

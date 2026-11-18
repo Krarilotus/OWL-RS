@@ -266,7 +266,7 @@ class Abba(unittest.TestCase):
     def test_a_family_may_name_its_sides_by_short_ids(self):
         """lcp-passes (21 Oct 2026): sides named by 8 digits got "no verdict" on every pass of a
         complete run, the passes recording the full revisions. The sides are commits of the tests'
-        own repository: fixed ids from before the 26 Oct rewrite were gone from pruned hosts, and a
+        own repository: fixed ids were gone from pruned hosts, and a
         shallow checkout has no HEAD^."""
         a, b = self.commits
         self.path.write_text(FAMILY.replace(A, a[:8]).replace(B, b[:8]), encoding="utf-8")
@@ -393,7 +393,7 @@ systems = []
     def test_a_harness_that_can_t_make_its_family_s_data_is_refused_before_planning(self):
         """8 Nov 2026: REAS's and C5's sets (abba-run-055fe886-f3da61f9) were planned by a
         submitter that makes support-stress data, so asked for no assets, but prepared by a harness
-        from before the dataset makers (838cd7eb, PR #129), which didn't make them: "7 not as pinned"
+        from before the dataset makers (73281252, PR #129), which didn't make them: "7 not as pinned"
         on a host without them, after the builds. Refused at the plan, saying why.
         A harness's makers are its catalogue's
         [makers], so one without them is refused as such, whichever of the cases' files it would make."""
@@ -543,10 +543,10 @@ systems = []
 
     def test_a_job_resolves_its_family_at_the_declared_harness(self):
         """A job's check, run in B's checkout, took a case from B's registry that
-        the declared harness doesn't have (dl-number-fragment, absent at 313e5a64), and wrote a
+        the declared harness doesn't have (dl-number-fragment, absent at b1bc0ca8), and wrote a
         manifest claiming that harness. Check, jobs and report resolve the family's cases at the
         declared harness; a case absent there is refused before anything is timed."""
-        old = "313e5a640639bdc81a25dcbdc1b39f68fef352ef"  # engine-v2 before the registry's additions
+        old = "b1bc0ca8d510f06626ee167fcdeb8ebed0d644d2"  # engine-v2 before the registry's additions
         known = abba.subprocess.run(["git", "-C", str(ROOT), "cat-file", "-e", f"{old}^{{commit}}"]).returncode == 0
         if not known:
             self.skipTest(f"{old[:8]} isn't in this checkout's history")

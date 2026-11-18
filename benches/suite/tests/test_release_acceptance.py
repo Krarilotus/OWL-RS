@@ -3,7 +3,7 @@ the gate passes only the exact candidate, with every required outcome present an
 exceptions.
 
 The audit of 8 Nov 2026 (tests-tooling T01-T03; catalogue D16-130, D16-126, D16-125) found the
-final join pass a candidate it must refuse, each reproduced on engine-v2 3a4e0a21e:
+final join pass a candidate it must refuse, each reproduced on engine-v2 03e17fb96:
 - checks of another candidate, or naming none, joined to a candidate's timed parts (D16-130);
 - a launched W3C kit that died without a libtest summary left no trace in the verdict (D16-126);
 - a wrong answer the case catalogue declares as known passed without any owner exception, and the

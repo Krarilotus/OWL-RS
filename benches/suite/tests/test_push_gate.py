@@ -665,8 +665,8 @@ class MeasurementRefs(Repo):
         self.assertEqual(self.jobs(), [])
 
     def test_a_measurement_ref_whose_side_is_on_no_remote_is_refused(self):
-        """T0, 28 Oct 2026: main's and v1.5's sides were ids from before the history rewrite, on no
-        remote ref; the ref's push would have published them with it."""
+        """T0, 28 Oct 2026: a side whose commit is on no remote ref is refused; the ref's push would
+        have published it with it."""
         unpublished = self.add({"a.txt": "only here\n"}, "a side no remote has", self.side)
         commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", unpublished)
         ref = f"refs/measure/old-{unpublished[:8]}"

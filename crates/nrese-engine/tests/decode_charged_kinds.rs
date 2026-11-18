@@ -5,7 +5,7 @@
 //! (its overlay's own entries). Measured against the charging budget (`nrese_exec::measure`), so
 //! this file is a test binary of its own.
 //!
-//! On the parent (engine-v2 `ab99d53e`) each charged decode of these ids answers `Ok(None)` with
+//! On the parent (engine-v2 `c807e3b0`) each charged decode of these ids answers `Ok(None)` with
 //! no charge: every guard here fails there on its first assertion.
 
 use std::cell::Cell;

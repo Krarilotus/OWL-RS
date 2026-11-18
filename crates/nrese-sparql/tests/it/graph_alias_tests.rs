@@ -5,7 +5,7 @@
 //! iff it holds a quad), and so do the `DROP` steps of `COPY` and `MOVE`.
 //!
 //! Each row checks the asserted statements of every graph afterwards. Rows marked `guard` held
-//! before the fix; the others failed at their answer on engine-v2 58af963dc.
+//! before the fix; the others failed at their answer on engine-v2 fa4fe73d3.
 
 use std::sync::Arc;
 
@@ -108,7 +108,7 @@ writes-alias-iri | CLEAR GRAPH <urn:x-arq:DefaultGraph> | forbidden
 guard plain | INSERT DATA { GRAPH <urn:x-arq:DefaultGraph> { <ex:x> <ex:p> 1 } } | DEFAULT:d DEFAULT:x a:a
 guard plain | DELETE WHERE { GRAPH <urn:x-rdflib:default> { ?s ?p ?o } } | a:a
 guard plain | INSERT { GRAPH <ex:dest> { ?s ?p ?o } } USING <urn:x-arq:DefaultGraph> WHERE { ?s ?p ?o } | DEFAULT:d a:a dest:d
-# Review r1, S2-F1 (rows failed on slice 2's 10e51e7e): a transfer between two names of the
+# Review r1, S2-F1 (rows failed on slice 2's 441a0c56): a transfer between two names of the
 # default graph is a transfer of a graph to itself, which changes nothing.
 plain | COPY DEFAULT TO <urn:x-arq:DefaultGraph> | DEFAULT:d a:a
 plain | COPY <urn:x-arq:DefaultGraph> TO DEFAULT | DEFAULT:d a:a
