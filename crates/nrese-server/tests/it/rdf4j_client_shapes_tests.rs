@@ -526,6 +526,40 @@ async fn each_graph_alias_is_answered_in_its_accepted_spelling() {
     assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
 }
 
+// Spec: dataset-scoped inference and RFC 9110 12.5.1: CONSTRUCT returns only
+// conclusions supported inside the selected graph, in the accepted RDF spelling.
+#[tokio::test]
+async fn dataset_scoped_construct_preserves_accepted_graph_alias() {
+    let app = app(false, true);
+    upload(
+        &app,
+        "<urn:g1> { <urn:a> <urn:p> <urn:b> .
+            <urn:p> <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <urn:q> . }
+         <urn:g2> { <urn:z> <urn:p> <urn:b> . }",
+    )
+    .await;
+    let (status, headers, body) = send(
+        &app,
+        Method::POST,
+        "/dataset/query?inference-scope=dataset",
+        &[("content-type", QUERY), ("accept", "application/x-trig")],
+        "CONSTRUCT { ?s <urn:q> <urn:b> } FROM <urn:g1>
+         WHERE { ?s <urn:q> <urn:b> }",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        dataset(&body, RdfFormat::TriG),
+        dataset("<urn:a> <urn:q> <urn:b> .", RdfFormat::NTriples)
+    );
+    assert_eq!(
+        headers
+            .get("content-type")
+            .and_then(|value| value.to_str().ok()),
+        Some("application/x-trig")
+    );
+}
+
 // Spec: approved protocol proposal: 401 advertises only fixed schemes, with a
 // fixed realm; a browser fetch without credentials must never receive Basic.
 #[tokio::test]
