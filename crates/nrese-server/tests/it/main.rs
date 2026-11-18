@@ -35,6 +35,7 @@ mod replication_apply_tests;
 mod replication_rounds_tests;
 mod replication_tests;
 mod restart_tests;
+mod scoped_reads_tests;
 mod service_description_tests;
 mod session_lease_tests;
 mod shacl_api_tests;
