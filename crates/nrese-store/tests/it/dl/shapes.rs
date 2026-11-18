@@ -333,7 +333,7 @@ fn from_an_inconsistent_premise_a_conclusion_stating_shacl_content_follows() {
         consistency: nrese_store::DlConsistency::Off,
         ..nrese_store::DlConfig::default()
     });
-    insert(&dl, ":C owl:disjointWith :D . :x a :C , :D .").expect("premise, unchecked");
+    insert(&dl, super::entailment::INCONSISTENT).expect("premise, unchecked");
     let conclusion = super::entailment::turtle(":s <http://www.w3.org/ns/shacl#path> :q .");
     let answer = dl.store().entails_dl(&conclusion).expect("entailment");
     assert_eq!(answer.premise.as_str(), "inconsistent");

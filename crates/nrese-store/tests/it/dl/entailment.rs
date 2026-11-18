@@ -80,18 +80,18 @@ fn a_subsumption_through_a_union_and_an_instance_of_a_restriction() {
     );
 }
 
+/// A premise only the DL check finds inconsistent: the OWL 2 RL rules don't reach `:x`'s
+/// disjointness through the union, so a store with that check off commits it.
+pub(super) const INCONSISTENT: &str = ":A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . \
+     :B owl:disjointWith :D . :C owl:disjointWith :D . :x a :A , :D .";
+
 #[test]
 fn an_inconsistent_premise_entails_everything() {
     let dl = super::pipeline_with(nrese_store::DlConfig {
         consistency: nrese_store::DlConsistency::Off,
         ..nrese_store::DlConfig::default()
     });
-    super::insert(
-        &dl,
-        ":A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . :B owl:disjointWith :D . \
-         :C owl:disjointWith :D . :x a :A , :D .",
-    )
-    .expect("premise, unchecked");
+    super::insert(&dl, INCONSISTENT).expect("premise, unchecked");
     let answer = dl
         .store()
         .entails_dl(&turtle(":y a :Q ."))
