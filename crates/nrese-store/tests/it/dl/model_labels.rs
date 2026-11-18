@@ -250,11 +250,13 @@ fn a_premise_the_reader_left_part_of_refutes_no_candidate_by_its_model() {
     assert!(!status.is_complete());
 }
 
-/// Spec: the argument of the module: a model's label speaks for one class assertion. A
-/// candidate of `?x a :U0 . ?x a :U1` is two, so no label decides it, and the candidate limit
-/// meets the gap as it is: of the 24, the 6 with `v1` are both (the lower bound), 4 of the
-/// 18 others are tested (each refuted: a model with `x`'s value apart from `v1` keeps it out
-/// of one of the two) and 14 are unresolved, the read not `complete`.
+/// Spec: the argument of the module: a model's label speaks for one class assertion, and a
+/// row's test is what the lower bound leaves of the query's. Of the 24 under
+/// `?x a :U0 . ?x a :U1`, the 6 with `v1` are both (the lower bound). A row with `v0` holds
+/// `U0` and one with `v2` holds `U1`, so each of those 12 keeps one class assertion, and the
+/// labels refute it (a model with `x`'s value apart from `v1` keeps it out of the other). A row
+/// with `v3` keeps both, so no label decides it: of those 6, the candidate limit admits 4 to
+/// their tests (each refuted) and leaves 2 unresolved, the read not `complete`.
 #[test]
 fn a_candidate_of_two_class_atoms_is_left_to_its_tests() {
     let dl = pipeline_with(DlConfig {
@@ -277,8 +279,25 @@ fn a_candidate_of_two_class_atoms_is_left_to_its_tests() {
     );
     assert_eq!(
         counts(&status),
-        (6, Some(24), 0, 4, 14),
+        (6, Some(24), 0, 16, 2),
         "lower, upper, proved, refuted, unresolved"
+    );
+    assert_eq!(
+        status.by_labels, 12,
+        "the rows with v0 and v2, no row with v3"
+    );
+    let v3 = names("i", (0..24).filter(|k| k % 4 == 3));
+    let unresolved: Vec<_> = status
+        .unresolved
+        .iter()
+        .map(|r| {
+            r.trim_start_matches("?x=<http://example.com/")
+                .trim_end_matches('>')
+        })
+        .collect();
+    assert!(
+        unresolved.len() == 2 && unresolved.iter().all(|r| v3.iter().any(|n| n == r)),
+        "the unresolved have v3: {unresolved:?}"
     );
     assert!(!status.is_complete());
 }

@@ -1293,15 +1293,14 @@ fn unions_store(model_labels: bool, n: usize) -> Arc<StoreService> {
     lower_true_store_with(config, &data)
 }
 
-/// `SELECT ?x { ?x a :U0 }` over `store` within `memory` bytes: the answers' bytes and the
-/// status with what decided it.
-fn unions_read(
-    store: &StoreService,
-    memory: Option<usize>,
-) -> crate::StoreResult<(
+/// A read's answers' bytes and its status with what decided it.
+type Read = (
     Vec<u8>,
     Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>,
-)> {
+);
+
+/// `SELECT ?x { ?x a :U0 }` over `store` within `memory` bytes.
+fn unions_read(store: &StoreService, memory: Option<usize>) -> crate::StoreResult<Read> {
     let mut request = crate::SparqlQueryRequest::all("SELECT ?x { ?x a <urn:test:U0> }");
     request.memory_limit = memory;
     let prepared = store.prepare_query(&request)?;
@@ -1355,16 +1354,18 @@ fn without_model_labels_a_read_is_decided_by_its_tests_alone() {
 /// a read answered with the refutations off is answered with them on. And the fallback is
 /// reached: at the least limit the read is answered under with them off (found to 256 bytes),
 /// or within 16 KiB above it, the whole gap (400 rows) has no room beside what the capped
-/// selection needs, and the read with them on says so (`capped-gap`) and is answered.
+/// selection needs, and the read with them on says so (`capped-gap`) and is answered. Every
+/// read, on both sides, is the first of a store just committed: a store's first read holds
+/// more than its later ones, so only first reads compare like with like.
 #[test]
 fn a_read_answered_without_model_labels_is_answered_with_them_under_every_memory_limit() {
-    let (off, on) = (unions_store(false, 400), unions_store(true, 400));
+    let first = |labels: bool, limit: usize| unions_read(&unions_store(labels, 400), Some(limit));
     let (mut limit, mut answered, mut failed) = (16usize << 10, 0, 0);
     while limit <= 64 << 20 {
-        match unions_read(&off, Some(limit)) {
+        match first(false, limit) {
             Ok(_) => {
                 answered += 1;
-                let with = unions_read(&on, Some(limit));
+                let with = first(true, limit);
                 assert!(
                     with.is_ok(),
                     "{limit} bytes: off answered, on {:?}",
@@ -1383,12 +1384,12 @@ fn a_read_answered_without_model_labels_is_answered_with_them_under_every_memory
     let (mut low, mut high) = (16usize << 10, 64usize << 20);
     while high - low > 256 {
         let middle = low + (high - low) / 2;
-        match unions_read(&off, Some(middle)) {
+        match first(false, middle) {
             Ok(_) => high = middle,
             Err(_) => low = middle,
         }
     }
-    let capped = |limit: usize| match unions_read(&on, Some(limit)) {
+    let capped = |limit: usize| match first(true, limit) {
         Ok((_, Some((_, detail)))) => detail.paths.contains(&"capped-gap"),
         _ => false,
     };
