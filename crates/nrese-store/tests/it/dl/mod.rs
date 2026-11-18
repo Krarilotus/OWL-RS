@@ -22,6 +22,7 @@ mod outside;
 mod plans;
 mod queries;
 mod representatives;
+mod reserved_names;
 mod review;
 mod routing;
 mod safety;
