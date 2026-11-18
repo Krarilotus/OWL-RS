@@ -1319,59 +1319,117 @@ fn a_reified_axiom_without_its_main_triple_is_malformed() {
 /// class with two forms (OWL 1's two axioms on it, or two equivalences); a restriction with a
 /// qualified cardinality and its `owl:onClass`; a datatype restriction with its facets; a class
 /// `owl:oneOf` of individuals; a data `owl:hasValue` with a literal; a data `owl:oneOf` of
-/// literals; a disjoint union of two; an annotated axiom and an annotated annotation whose
-/// main triples are present. Each case's reading printed.
+/// literals; a literal on a declared data property, and on an undeclared one (read as data); a
+/// disjoint union of two; an annotated axiom and an annotated annotation whose main triples are
+/// present. Each case's reading printed.
 #[test]
 fn the_valid_neighbours_of_the_unchecked_forms_get_no_report() {
     let mut wrong = Vec::new();
     for (turtle, axioms) in [
         (
             "ex:E owl:intersectionOf ( ex:A ex:B ) . ex:E owl:unionOf ( ex:C ex:D ) .",
-            2,
+            &[
+                "EquivalentClasses(ObjectIntersectionOf(ex:A ex:B) ex:E)",
+                "EquivalentClasses(ObjectUnionOf(ex:C ex:D) ex:E)",
+            ][..],
         ),
         (
             "ex:E owl:equivalentClass [ owl:intersectionOf ( ex:A ex:B ) ] , \
              [ owl:unionOf ( ex:C ex:D ) ] .",
-            2,
+            &[
+                "EquivalentClasses(ObjectIntersectionOf(ex:A ex:B) ex:E)",
+                "EquivalentClasses(ObjectUnionOf(ex:C ex:D) ex:E)",
+            ],
         ),
         (
             "ex:p a owl:ObjectProperty . ex:E rdfs:subClassOf [ a owl:Restriction ; \
              owl:onProperty ex:p ; owl:maxQualifiedCardinality \"1\"^^xsd:nonNegativeInteger ; \
              owl:onClass ex:A ] .",
-            1,
+            &["SubClassOf(ex:E ObjectMaxCardinality(1 ex:p ex:A))"],
         ),
         (
             "ex:d a owl:DatatypeProperty . ex:d rdfs:range [ a rdfs:Datatype ; \
              owl:onDatatype xsd:integer ; \
              owl:withRestrictions ( [ xsd:minInclusive \"1\"^^xsd:integer ] ) ] .",
-            1,
+            &[
+                "DataPropertyRange(ex:d DatatypeRestriction(xsd:integer xsd:minInclusive \"1\"^^xsd:integer))",
+            ],
         ),
-        ("ex:C owl:equivalentClass [ owl:oneOf ( ex:a ex:b ) ] .", 1),
+        (
+            "ex:C owl:equivalentClass [ owl:oneOf ( ex:a ex:b ) ] .",
+            &["EquivalentClasses(ObjectOneOf(ex:a ex:b) ex:C)"],
+        ),
         (
             "ex:d a owl:DatatypeProperty . ex:C rdfs:subClassOf [ a owl:Restriction ; \
              owl:onProperty ex:d ; owl:hasValue \"1\" ] .",
-            1,
+            &["SubClassOf(ex:C DataHasValue(ex:d \"1\"^^xsd:string))"],
         ),
         (
             "ex:d a owl:DatatypeProperty . ex:d rdfs:range [ a rdfs:Datatype ; \
              owl:oneOf ( \"1\" \"2\" ) ] .",
-            1,
+            &["DataPropertyRange(ex:d DataOneOf(\"1\"^^xsd:string \"2\"^^xsd:string))"],
         ),
-        ("ex:C owl:disjointUnionOf ( ex:A ex:B ) .", 1),
+        (
+            "ex:d a owl:DatatypeProperty . ex:a ex:d \"1\" .",
+            &["DataPropertyAssertion(ex:d ex:a \"1\"^^xsd:string)"],
+        ),
+        (
+            "ex:a ex:q \"1\" .",
+            &["DataPropertyAssertion(ex:q ex:a \"1\"^^xsd:string)"],
+        ),
+        (
+            "ex:C owl:disjointUnionOf ( ex:A ex:B ) .",
+            &["DisjointUnion(ex:C ex:A ex:B)"],
+        ),
         (
             "ex:A rdfs:subClassOf ex:B . _:x a owl:Axiom ; owl:annotatedSource ex:A ; \
              owl:annotatedProperty rdfs:subClassOf ; owl:annotatedTarget ex:B ; \
              rdfs:comment \"why\" . _:x rdfs:comment \"given\" . [] a owl:Annotation ; \
              owl:annotatedSource _:x ; owl:annotatedProperty rdfs:comment ; \
              owl:annotatedTarget \"given\" ; rdfs:comment \"how\" .",
-            1,
+            &["SubClassOf(ex:A ex:B)"],
         ),
     ] {
         let (kept, _, diagnostics) = kept_and_malformed(turtle);
         eprintln!("NEIGHBOUR {turtle:?}: kept {kept:?}; {diagnostics:?}");
-        if kept.len() != axioms || !diagnostics.is_empty() {
+        if kept != axioms || !diagnostics.is_empty() {
             wrong.push(format!("{turtle}: kept {kept:?}; {diagnostics:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (*Mapping to RDF* Tables 12 and 13: a blank node is one class expression or one data
+/// range, by one form): a node that is both, `owl:complementOf` and `owl:datatypeComplementOf`
+/// on one node typed `owl:Class` and `rdfs:Datatype`, is no structure: malformed, and no axiom is
+/// read from it, whether a class axiom, a data axiom or both use it.
+#[test]
+fn a_node_with_a_class_and_a_data_range_form_is_no_structure() {
+    let node = "_:n a owl:Class , rdfs:Datatype ; owl:complementOf ex:A ; \
+                owl:datatypeComplementOf xsd:integer . ex:d a owl:DatatypeProperty . ";
+    let (class, range) = ("ex:E rdfs:subClassOf _:n .", "ex:d rdfs:range _:n .");
+    assert_malformed(
+        "CLASS AND RANGE",
+        &[
+            (&format!("{node}{class} {range}"), None, 0),
+            (&format!("{node}{class}"), None, 0),
+            (&format!("{node}{range}"), None, 0),
+        ],
+    );
+}
+
+/// Spec (*Mapping to RDF* Table 16: `*:x op:y *:z`, an object property assertion, takes an
+/// individual `*:z`): a literal object on a declared object property is malformed on the literal,
+/// and no assertion is read; its neighbours, a declared data property and an undeclared one with a
+/// literal, are data assertions (above).
+#[test]
+fn a_literal_on_a_declared_object_property_is_malformed() {
+    assert_malformed(
+        "LITERAL ON AN OBJECT PROPERTY",
+        &[(
+            "ex:p a owl:ObjectProperty . ex:a ex:p \"1\" .",
+            Some("\"1\"^^xsd:string"),
+            0,
+        )],
+    );
 }

@@ -641,6 +641,34 @@ fn the_certificate_reads_a_disjoint_union_on_the_top_or_bottom_class_as_that_cla
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Spec (*OWL 2 Direct Semantics* Table 6: `DisjointUnion(C C1 … Cn)` makes the `Ci` pairwise
+/// disjoint; *Structural Specification* §9.1.4 gives no rule against two operands that read as
+/// one): a disjoint union on `:C` repeating `:A`, or of `≥ 1 :p` and `≥ 1 :p.⊤` (one expression
+/// twice), empties that operand and so `:C`: an individual in `:C` has no model. Read by the
+/// functional-syntax reader, decided as the store decides an ontology that isn't Horn; each
+/// case's answer printed.
+#[test]
+fn a_disjoint_union_whose_operands_read_as_one_empties_its_class() {
+    let mut wrong = Vec::new();
+    for axioms in [
+        "DisjointUnion(ex:C ex:A ex:A) ClassAssertion(ex:C ex:c)",
+        "Declaration(ObjectProperty(ex:p)) DisjointUnion(ex:C ObjectMinCardinality(1 ex:p) \
+         ObjectMinCardinality(1 ex:p owl:Thing)) ClassAssertion(ex:C ex:c)",
+    ] {
+        let mut table = Table::default();
+        let o = (table.functional(&format!(
+            "Prefix(ex:=<http://example.org/>) Ontology({axioms})"
+        )))
+        .expect("OWL 2 DL, no fatal diagnostic");
+        let answer = nrese_dl::islands::consistency(&o, &Config::default()).answer;
+        eprintln!("REPEATED DISJOINT UNION {axioms}: {answer:?}");
+        if answer != Answer::Inconsistent {
+            wrong.push(format!("{axioms}: {answer:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The witness of every disputed test is a model of its premise.
 #[test]
 fn disputed_witnesses_are_models() {

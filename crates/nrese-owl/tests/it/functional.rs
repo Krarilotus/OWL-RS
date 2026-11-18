@@ -387,6 +387,73 @@ fn a_functional_disjoint_union_of_fewer_than_two_classes_is_a_syntax_error() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Spec (*Structural Specification* §9.1.4 gives no rule against two operands that read as one;
+/// *Mapping to RDF* Table 16): a disjoint union repeating `:A`, or of `≥ 1 :p` and `≥ 1 :p.⊤`,
+/// read from RDF and written back as RDF, or from the functional syntax and written back so,
+/// reads back as the same axioms, with no fatal report on either reading. Each case's readings
+/// printed.
+#[test]
+fn a_disjoint_union_whose_operands_read_as_one_round_trips() {
+    let min = |q: &str| {
+        format!(
+            "[ a owl:Restriction ; owl:onProperty ex:p ; owl:{q}Cardinality \
+             \"1\"^^xsd:nonNegativeInteger {} ]",
+            if q == "min" {
+                ""
+            } else {
+                "; owl:onClass owl:Thing"
+            }
+        )
+    };
+    let mut wrong = Vec::new();
+    for (functional, turtle) in [
+        (
+            "DisjointUnion(ex:C ex:A ex:A)".to_owned(),
+            "ex:C owl:disjointUnionOf ( ex:A ex:A ) .".to_owned(),
+        ),
+        (
+            "Declaration(ObjectProperty(ex:p)) DisjointUnion(ex:C ObjectMinCardinality(1 ex:p) \
+             ObjectMinCardinality(1 ex:p owl:Thing))"
+                .to_owned(),
+            format!(
+                "ex:p a owl:ObjectProperty . ex:C owl:disjointUnionOf ( {} {} ) .",
+                min("min"),
+                min("minQualified")
+            ),
+        ),
+    ] {
+        let fatal = |o: &Ontology| o.diagnostics.iter().any(Diagnostic::is_fatal);
+        let mut table = Table::default();
+        let (o, _) = read_functional(
+            &format!("Prefix(ex:=<http://example.com/>) Ontology({functional})"),
+            &mut table,
+        );
+        let text = o.functional_document(None, &|t| ofn_name(&table, t));
+        let (back, _) = read_functional(&text, &mut table);
+        let (before, after) = (rendered(&o, &table), rendered(&back, &table));
+        eprintln!("REPEATED DISJOINT UNION functional {functional}: {before:?}, back {after:?}");
+        if before != after || fatal(&o) || fatal(&back) {
+            wrong.push(format!(
+                "functional {functional}: {after:?}; {:?}",
+                back.diagnostics
+            ));
+        }
+        let mut table = Table::default();
+        let o = read(&load(&mut table, &turtle), &table);
+        let vocabulary = table.vocabulary();
+        let statements: Vec<Statement> = (write(&o, &vocabulary, &mut table).into_iter())
+            .map(|triple| Statement { triple, graph: 0 })
+            .collect();
+        let back = read(&statements, &table);
+        let (before, after) = (rendered(&o, &table), rendered(&back, &table));
+        eprintln!("REPEATED DISJOINT UNION RDF {turtle}: {before:?}, back {after:?}");
+        if before != after || fatal(&o) || fatal(&back) {
+            wrong.push(format!("RDF {turtle}: {after:?}; {:?}", back.diagnostics));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// An anonymous individual only in a nominal or a `hasValue` (review A-1102) stays
 /// anonymous: not among the named individuals (so no key or rule binds it), and reported,
 /// since OWL 2 DL takes named individuals there (*OWL 2 Structural Specification* §11.2).

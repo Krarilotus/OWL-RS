@@ -253,3 +253,31 @@ fn a_disjoint_union_on_the_top_or_bottom_class_is_read_as_that_class() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Spec (*OWL 2 Direct Semantics* Table 6: a disjoint union's operands are pairwise disjoint;
+/// *Mapping to RDF* Table 16 reads each list member): `owl:disjointUnionOf ( :A :A )`, or of
+/// `≥ 1 :p` and `≥ 1 :p.⊤` (one expression twice), empties that operand and so `:C`; an
+/// individual in `:C` has no model, and the commit is rejected. Each case's outcome printed.
+#[test]
+fn a_disjoint_union_whose_operands_read_as_one_empties_its_class() {
+    let mut wrong = Vec::new();
+    for schema in [
+        ":C owl:disjointUnionOf ( :A :A ) .",
+        ":p a owl:ObjectProperty . :C owl:disjointUnionOf ( \
+         [ a owl:Restriction ; owl:onProperty :p ; owl:minCardinality \"1\"^^xsd:nonNegativeInteger ] \
+         [ a owl:Restriction ; owl:onProperty :p ; \
+           owl:minQualifiedCardinality \"1\"^^xsd:nonNegativeInteger ; owl:onClass owl:Thing ] ) .",
+    ] {
+        let dl = pipeline();
+        insert(&dl, schema).expect("schema");
+        let outcome = match insert(&dl, ":c a :C .") {
+            Err(MutationError::Rejected(reject)) => format!("rejected: {}", reject.detail),
+            other => format!("not rejected: {other:?}"),
+        };
+        eprintln!("REPEATED DISJOINT UNION {schema}: {outcome}");
+        if !outcome.starts_with("rejected") || !outcome.contains("OWL 2 DL") {
+            wrong.push(format!("{schema}: {outcome}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
