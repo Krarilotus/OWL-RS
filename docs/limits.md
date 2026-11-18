@@ -143,6 +143,21 @@ leave something out.
   one, which the rules apply. An inclusion into an intersection
   (`:C rdfs:subClassOf [ owl:intersectionOf ( :A :B ) ]`), which OWL 2 QL allows, is answered
   and `complete`.
+- Under `owl2-rl` with `reasoner.ql_rewriting = "on"`, a universal restriction on
+  `owl:topObjectProperty` puts every individual into its filler, which the rules don't derive:
+  the read answers `false` and is told `complete`. For one:
+  `:x a [ owl:onProperty owl:topObjectProperty ; owl:allValuesFrom :D ] . :y a :Y`, asked
+  `:y a :D`. At the defaults it isn't told `complete`.
+- Under `owl2-ql`, and under `owl2-rl` with the rewriting on, a store inconsistent only through
+  an existential the rewriting gives isn't found inconsistent: a read every inconsistent store
+  entails answers `false` and is told `complete`. For one: `:A ⊑ ∃:p.:B`, `:N ⊑ ¬∃:p.:B`,
+  `:x a :A, :N`, asked `:x a :D`.
+- Under `owl2-ql`, a contradiction over data values by axioms outside OWL 2 QL is accepted, and
+  the store reports itself consistent, with reads of unrelated terms told `complete`:
+  `:C rdfs:subClassOf [ owl:onProperty :p ; owl:allValuesFrom xsd:integer ]` and `:a :p "x"`,
+  then `:a a :C`; or a `hasValue` of a literal outside the property's datatype range. `owl2-rl`
+  and `owl2-dl` refuse both. A plain datatype range with a literal outside it is refused in
+  every mode.
 - A rebuild of the inferences (`POST …/reasoning/rematerialise`) that fails while it replaces
   them leaves them uncertified: answers are `not-certified` until a rebuild succeeds. A change of
   a repository's QL rewriting made in between takes effect with that rebuild, not at once. Run
@@ -179,6 +194,33 @@ leave something out.
     are read, so the gate starts from that statement alone. An insert of the statement that
     breaks the shape is refused in every setting. After such writes, validate in full
     (`GET /dataset/shacl`).
+- A store whose ontology uses an inverse property expression (`ObjectInverseOf`, written
+  `_:x owl:inverseOf :p`) rebuilds its inferences at every commit that changes its data, so a
+  commit's time grows with the store: at 100,000 individuals, a one-fact commit takes about 40
+  to 55 ms instead of 0.3 to 0.4 ms. Stores with named inverses only (`:q owl:inverseOf :p`)
+  are unchanged.
+- Such a store decides a commit's consistency without the facts the inverse gave in earlier
+  commits. A clash only they reach is not refused, and a clash only they held is refused, until
+  the next commit. After an accepted clash of that kind the store still reports itself
+  consistent; a rebuild of the inferences finds it.
+- A blank node used as a property otherwise than as an inverse expression
+  (`_:b a owl:ReflexiveProperty`, `:p rdfs:subPropertyOf _:b`, an equality that copies a
+  predicate onto a blank node) gives facts no store holds; a read after a later commit may miss
+  them. Such input is outside OWL 2 DL.
+- A literal value under an inverse, symmetric or functional object property gives a fact no
+  store holds, with the literal as its subject. A read after a later commit may miss what
+  follows from it, and `owl2-ql` and `owl2-dl` still tell it `complete`; `owl2-rl` doesn't. For
+  one: `:p owl:inverseOf :q . :a :p "v"`, then `:q rdfs:range :D`, asked `:a a :D`. Such input
+  is outside OWL 2 DL.
+- <a id="two-spellings-across-commits"></a>Under `owl2-dl`, a functional data property (or an
+  at-most-one restriction) that holds one value written two ways (`"1"^^xsd:int`,
+  `"01"^^xsd:int`) equates the two literals within a commit, but not across commits: after a
+  later commit, a read of another property's values may return one spelling where the same data
+  in one commit return both, and it is still told `complete`. The data are valid, consistent
+  OWL 2 DL, so here a `complete` answer can be wrong. The missing row is the same value in its
+  other spelling: a count is off by such duplicates, and a `FILTER` on the spelling (`STR`) can
+  differ, while a `FILTER` on the value (`?v = 1`) finds it either way. A rebuild of the
+  inferences (`POST …/reasoning/rematerialise`) restores it.
 - A value the store can't represent (an `xsd:dateTime` with a year beyond 10¹¹, say) is checked
   neither for a clash nor for being in its datatype, so a store that holds one is told consistent.
 - Under `owl2-dl`, a key or a negative property assertion over a value the store's quick

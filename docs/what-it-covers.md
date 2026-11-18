@@ -96,7 +96,9 @@ Beside the modes:
 - The DL engines classify and realise the ontology in any mode
   ([HTTP interface](ops/http-api.md#classification)).
 - The inferences are maintained incrementally, and this is tested against full recomputation on
-  random changes ([maintenance](spec/reasoning-semantics.md#maintenance)).
+  random changes ([maintenance](spec/reasoning-semantics.md#maintenance)). A store with an inverse
+  property expression rebuilds them at every commit; where a commit can still differ from a
+  rebuild is in [limits](limits.md#reasoning).
 - Stored inferences carry a fingerprint of the rules that made them, so after an upgrade a build
   that changes what a ruleset derives recomputes them once at start
   ([freshness](spec/reasoning-semantics.md#freshness)).
