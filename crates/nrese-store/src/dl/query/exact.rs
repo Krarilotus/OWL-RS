@@ -208,10 +208,9 @@ fn row_tests(
 
 /// Of the gap's `n` rows (`row(i)` decodes one), those one finished model of the premise
 /// refutes: a row whose one test is `C(a)`, `C` a named class, with `C` not in `a`'s label (a
-/// model with `a` outside `C` is a countermodel of `C(a)`, *Direct Semantics* §2.5). The
-/// model is the consistency test's over the premise the tests read, within the store's DL
-/// limits and `deadline`, the labels' own, fixed before their work began; it refutes nothing
-/// unless it ended in a model, `Consistent`, nothing left out. Nothing refuted: no mask.
+/// countermodel of `C(a)`, *Direct Semantics* §2.5). The model is the consistency test's over
+/// the tests' premise, within the DL limits and the labels' own `deadline`; nothing refuted
+/// (no model, not `Consistent`, something left out): no mask.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request's limits travel with the rows"
@@ -231,6 +230,9 @@ pub(super) fn refuted_by_labels(
     let config = &store.config().dl;
     let stop = || cancellation.is_cancelled() || deadline.passed();
     let none = Vec::new;
+    if stop() {
+        return none();
+    }
     let (Some(shape), Ok(base)) = (&analysis.shape, ontology_at(store, snapshot)) else {
         return none();
     };
@@ -265,8 +267,9 @@ pub(super) fn refuted_by_labels(
             _ => None,
         });
     }
-    let (mut classes, mut individuals): (Vec<u64>, Vec<u64>) =
-        atoms.iter().flatten().copied().unzip();
+    let mut both = (Vec::with_capacity(n), Vec::with_capacity(n));
+    both.extend(atoms.iter().flatten().copied());
+    let (mut classes, mut individuals): (Vec<u64>, Vec<u64>) = both;
     classes.sort_unstable();
     classes.dedup();
     individuals.sort_unstable();
@@ -277,9 +280,8 @@ pub(super) fn refuted_by_labels(
     let Some(program) = entailment::compile(&ontology, &classes, &individuals, &mut scratch) else {
         return none();
     };
-    // The labels while they are held. A label's two `Vec<u32>`s each hold a class at most once
-    // (a node's label holds a concept once), so each allocates at most the next power of two
-    // of the classes, and at least 4 of them: a vector's least allocation.
+    // The labels: each of a label's two `Vec<u32>`s holds a class at most once (a node holds a
+    // concept once), so allocates at most the classes' next power of two, and at least 4.
     let vector = 4 * classes.len().next_power_of_two().max(4);
     let labels = individuals.len() * (size_of::<Option<Label>>() + 2 * vector);
     if stop() || scratch.charge(|| labels).is_err() {

@@ -1209,11 +1209,9 @@ fn decide_answers(
             // A query's candidate budget, unlimited where none is set.
             let config = &store.config().dl;
             let limit = config.max_candidates.unwrap_or(usize::MAX);
-            // The labels' one deadline, a quarter of what the read has left, fixed before their
-            // own work, the whole selection included.
+            // The labels' one deadline: a quarter of what the read has left, the selection included.
             let labels_deadline = Deadline::after(deadline.within(config.timeout).map(|t| t / 4));
-            // The model's labels decide every gap row before the limit, so they read the whole
-            // gap; where it has no room, the capped selection, with no labels.
+            // The labels read the whole gap; where it has no room, the capped one, with no labels.
             let whole = match config.model_labels {
                 true => match gap::select(&mut pair, usize::MAX, &budget, cancellation) {
                     Err(e) if e.is_memory_limit() || e.is_server_memory_limit() => None,
@@ -1249,7 +1247,10 @@ fn decide_answers(
                 ),
                 false => Vec::new(),
             };
-            // A row the model refutes is decided `No`; the others meet the limit as before.
+            // No row past the capped read's first ones is admitted where its batches cost more.
+            let most = |b: &[usize]| b.chunks(64).map(|c| c.iter().sum::<usize>()).max();
+            let prefix = most(&gap.bytes[..limit.min(gap.bytes.len())]);
+            let own = refuted.iter().take(limit).filter(|&&r| !r).count();
             let (mut rows, mut bytes) = (refuted.iter(), refuted.iter());
             gap.rows.retain(|_| rows.next() != Some(&true));
             gap.bytes.retain(|_| bytes.next() != Some(&true));
@@ -1258,16 +1259,19 @@ fn decide_answers(
             drop(refuted);
             gap.keep(limit.saturating_add(super::UNRESOLVED_SHOWN));
             let left = gap.total - by_labels;
+            let mut admitted = limit.min(gap.rows.len());
+            if most(&gap.bytes[..admitted]) > prefix {
+                admitted = own;
+            }
             let mut counts = Counts {
                 lower: gap.lower,
                 upper: Some(gap.lower + gap.total),
                 refuted: by_labels,
                 by_labels,
-                unresolved: left.saturating_sub(limit as u64),
+                unresolved: left.saturating_sub(admitted as u64),
                 ..Counts::default()
             };
             let mut why = None;
-            let admitted = limit.min(gap.rows.len());
             pair.reserve_appends(admitted)?;
             // Bounds, candidate production and all batches share the entry deadline.
             for start in (0..admitted).step_by(64) {
@@ -1308,7 +1312,7 @@ fn decide_answers(
                     }
                 }
             }
-            if left > limit as u64 {
+            if left > admitted as u64 {
                 why.get_or_insert_with(|| Limit::Candidates.reached(limit));
                 for &index in &gap.rows[admitted..] {
                     if status.detail.unresolved.len() == super::UNRESOLVED_SHOWN {
