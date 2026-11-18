@@ -4,13 +4,42 @@
 #[path = "preparation_tests.rs"]
 mod tests;
 
+use nrese_sparql_syntax::visit::Node;
+
+use crate::dataset::GraphSet;
+
 use super::{
-    Cow, Form, GraphPattern, Query, QueryEvaluationError, QueryOptions, ReadModel, Snapshot,
-    pattern_and_form, ql, query_dataset, triple_terms,
+    Context, Cow, Form, GraphPattern, NativeResult, Query, QueryEvaluationError, QueryOptions,
+    ReadModel, Snapshot, pattern_and_form, ql, query_dataset, search, triple_terms, vectors,
 };
 
 #[cfg(test)]
 thread_local! { static QL_STAGES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+
+impl Context<'_> {
+    pub(super) fn check_scoped_operators(&self, pattern: &GraphPattern) -> NativeResult<()> {
+        if matches!(self.merge_set, Some(GraphSet::Scoped(_)))
+            && let Some(setting) = pattern.find_local(|node| match node {
+                Node::Pattern(GraphPattern::Bgp { patterns }) => {
+                    if patterns.iter().any(|triple| self.is_spatial(triple)) {
+                        return Some("computed-spatial-relation");
+                    }
+                    patterns
+                        .iter()
+                        .any(search::invokes_search)
+                        .then_some("store.search_scope")
+                }
+                Node::Pattern(GraphPattern::Service { name, .. }) if vectors::is_search(name) => {
+                    Some("store.search_scope")
+                }
+                _ => None,
+            })
+        {
+            return Err(QueryEvaluationError::ScopedInferenceUnavailable(setting).into());
+        }
+        Ok(())
+    }
+}
 
 /// The QL algebra and the report that goes with it, without planning or evaluating.
 pub(crate) fn prepare_ql_query<'q>(

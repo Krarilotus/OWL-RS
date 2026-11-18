@@ -1553,15 +1553,9 @@ impl Context<'_> {
     /// evaluated for all graphs at once.
     fn spatial_scope(&self) -> NativeResult<Option<Scope>> {
         Ok(Some(match (&*self.graph.borrow(), &self.merge_set) {
-            (_, Some(GraphSet::Scoped(_))) => {
-                return Err(QueryEvaluationError::ScopedInferenceUnavailable(
-                    "computed-spatial-relation",
-                )
-                .into());
-            }
             (GraphScope::Default, _) => Scope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
             (GraphScope::Named(graph), _) => Scope::Graphs(GraphSelector::Exact(*graph)),
-            (GraphScope::Union, Some(GraphSet::Only(graphs))) => {
+            (GraphScope::Union, Some(GraphSet::Only(graphs) | GraphSet::Scoped(graphs))) => {
                 Scope::merge(graphs, &self.budget).map_err(QueryEvaluationError::MemoryLimit)?
             }
             (GraphScope::Union, Some(GraphSet::AllBut(left_out))) => {

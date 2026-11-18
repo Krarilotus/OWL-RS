@@ -149,6 +149,14 @@ fn is_jena(triple: &TriplePattern) -> bool {
             && matches!(triple.object, TermPattern::Literal(_)))
 }
 
+pub(super) fn invokes_search(triple: &TriplePattern) -> bool {
+    use TermPattern::{BlankNode, Literal};
+    (is_jena(triple) && matches!(triple.object, Literal(_) | BlankNode(_)))
+        || (bds(triple) == Some("search")
+            && matches!(triple.object, Literal(_))
+            && subject_variable(&triple.subject).is_some())
+}
+
 /// The local name of a `luc:` predicate.
 fn luc(triple: &TriplePattern) -> Option<&str> {
     match &triple.predicate {
@@ -398,7 +406,7 @@ impl Context<'_> {
     /// once per search, before its scan; both [`Self::search`] and the per-graph search read
     /// it.
     fn found(&self, search: &Search, known: bool) -> NativeResult<Vec<nrese_engine::TextMatch>> {
-        if !known && !matches!(self.merge_set, Some(GraphSet::Scoped(_))) {
+        if !known {
             return Ok(Vec::new());
         }
         Ok(match self.search_in()? {
@@ -417,12 +425,6 @@ impl Context<'_> {
     /// What this context's searches rank and select among: decided once per search, before
     /// its scan, from the query's [`crate::SearchScope`].
     pub(super) fn search_in(&self) -> NativeResult<SearchIn> {
-        if matches!(self.merge_set, Some(GraphSet::Scoped(_))) {
-            return Err(crate::QueryEvaluationError::ScopedInferenceUnavailable(
-                "store.search_scope",
-            )
-            .into());
-        }
         match self.search_scope {
             crate::SearchScope::Global => Ok(SearchIn::Global),
             crate::SearchScope::Reader => self.text_scope().map(SearchIn::Reader),
@@ -462,7 +464,6 @@ impl Context<'_> {
         };
         let plain = |scope| Ok(Some((None, scope)));
         match (&*self.graph.borrow(), &self.merge_set) {
-            (_, Some(GraphSet::Scoped(_))) => unreachable!("search_in refuses scoped searches"),
             (GraphScope::Default, _) => plain(TextScope::Graphs(GraphSelector::Exact(
                 TermId::DEFAULT_GRAPH,
             ))),
@@ -471,7 +472,9 @@ impl Context<'_> {
                 Some(named) => copy(named).map(Some),
                 None => plain(TextScope::Graphs(GraphSelector::AnyNamed)),
             },
-            (GraphScope::Union, Some(GraphSet::Only(graphs))) => copy(graphs).map(Some),
+            (GraphScope::Union, Some(GraphSet::Only(graphs) | GraphSet::Scoped(graphs))) => {
+                copy(graphs).map(Some)
+            }
             (GraphScope::Union, Some(GraphSet::AllBut(left_out))) => all_but(left_out).map(Some),
             (GraphScope::Union, None) => plain(TextScope::Graphs(GraphSelector::Any)),
             (GraphScope::Missing, _) => Ok(None),

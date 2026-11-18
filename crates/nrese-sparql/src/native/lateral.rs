@@ -83,6 +83,7 @@ impl Context<'_> {
                 }
             }
             let substituted = super::substitute::Values::new(self, &terms)?.pattern(right);
+            self.check_scoped_operators(&substituted)?;
             let graph = key.last().copied().filter(|&id| id != UNDEF);
             let found = match graph {
                 Some(id) => self.in_graph(

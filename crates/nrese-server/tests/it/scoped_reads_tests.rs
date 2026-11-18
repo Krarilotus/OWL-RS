@@ -995,7 +995,6 @@ async fn scoped_reads_refuse_text_search_before_shortcuts() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "Preparation does not yet refuse search in an empty optional"]
 async fn scoped_preparation_refuses_search_in_an_empty_optional() -> TestResult {
     // Spec: An empty OPTIONAL seed does not exempt its local text search from 501.
     scoped_preparation_refusal(
@@ -1009,7 +1008,6 @@ async fn scoped_preparation_refuses_search_in_an_empty_optional() -> TestResult 
 }
 
 #[tokio::test]
-#[ignore = "Preparation does not yet refuse search inside an unselected graph"]
 async fn scoped_preparation_refuses_search_in_an_unselected_graph() -> TestResult {
     // Spec: A local vector search returns 501 even when its GRAPH IRI is
     // absent from FROM NAMED.
@@ -1024,7 +1022,6 @@ async fn scoped_preparation_refuses_search_in_an_unselected_graph() -> TestResul
 }
 
 #[tokio::test]
-#[ignore = "Preparation does not yet refuse spatial relations over an empty named list"]
 async fn scoped_preparation_refuses_computed_spatial_over_no_named_graphs() -> TestResult {
     // Spec: A computed spatial relation returns 501 even when GRAPH ?g has
     // no named graphs to visit.
@@ -1037,7 +1034,6 @@ async fn scoped_preparation_refuses_computed_spatial_over_no_named_graphs() -> T
 }
 
 #[tokio::test]
-#[ignore = "Preparation does not yet refuse search in an empty minus operand"]
 async fn scoped_preparation_refuses_search_in_an_empty_minus_operand() -> TestResult {
     // Spec: MINUS with empty operands still refuses a local text search in its
     // right operand, even though BIND has no rows on which to run it.
@@ -1052,7 +1048,6 @@ async fn scoped_preparation_refuses_search_in_an_empty_minus_operand() -> TestRe
 }
 
 #[tokio::test]
-#[ignore = "Preparation does not yet refuse search inside exists over empty input"]
 async fn scoped_preparation_refuses_search_in_exists_over_empty_input() -> TestResult {
     // Spec: A correlated EXISTS filter with no incoming rows still refuses its
     // local text search.
@@ -1068,7 +1063,6 @@ async fn scoped_preparation_refuses_search_in_exists_over_empty_input() -> TestR
 }
 
 #[tokio::test]
-#[ignore = "Preparation does not yet refuse search in a subquery joined to empty input"]
 async fn scoped_preparation_refuses_search_in_a_subquery_joined_to_empty_input() -> TestResult {
     // Spec: A subquery's local text search returns 501 even when the other join
     // operand has no rows.
@@ -1083,7 +1077,6 @@ async fn scoped_preparation_refuses_search_in_a_subquery_joined_to_empty_input()
 }
 
 #[tokio::test]
-#[ignore = "Preparation does not yet refuse search in a plan request"]
 async fn scoped_preparation_refuses_search_in_a_plan_request() -> TestResult {
     // Spec: A plan request refuses a local search before evaluating it.
     scoped_preparation_refusal(
@@ -1130,6 +1123,80 @@ async fn scoped_preparation_leaves_remote_service_bodies_to_the_endpoint() -> Te
     .await?;
     assert_eq!(reply.code, StatusCode::OK, "{reply:?}");
     Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_preparation_leaves_self_service_to_the_http_endpoint() -> TestResult {
+    // Spec: An allowed SERVICE to this server's own HTTP endpoint delegates
+    // search in its body. The outbound query has its endpoint's dataset.
+    use nrese_server::federation::HttpServiceClient;
+    use nrese_store::FederationConfig;
+    use std::sync::Arc;
+
+    let state = test_state_with_store_config(
+        StoreConfig::default(),
+        Default::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+    )?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}/dataset/query", listener.local_addr()?);
+    state
+        .store()
+        .set_service_client(Arc::new(HttpServiceClient::new(
+            FederationConfig {
+                allow: vec![endpoint.clone()],
+                ..FederationConfig::default()
+            },
+            tokio::runtime::Handle::current(),
+        )?));
+    let app = build_app(state);
+    insert(&app, &format!("{G1_FACT} ex:c ex:p \"alpha\" .")).await?;
+    let server = tokio::spawn(axum::serve(listener, app.clone()).into_future());
+    let pattern = format!(
+        "{{ SERVICE <{endpoint}> {{ ?text <http://www.bigdata.com/rdf/search#search> \"alpha\" }} }}"
+    );
+    let result = select(&app, &[], SCOPED, "?text", G1, &pattern).await;
+    server.abort();
+    let reply = result?;
+    assert_eq!(reply.rows(), bindings(&["\"alpha\""]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_a_spatial_relation_after_lateral_binding() -> TestResult {
+    // Spec: A spatial relation specialised by LATERAL still returns the same 501.
+    scoped_preparation_refusal(
+        SCOPED,
+        "{ VALUES ?p { <http://www.opengis.net/ont/geosparql#sfWithin> }
+           LATERAL { ?s ?p ex:box } }",
+        "computed-spatial-relation",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_search_after_exists_binding() -> TestResult {
+    // Spec: Search specialised by correlated EXISTS still returns the same 501.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ VALUES ?p { <http://www.bigdata.com/rdf/search#search> }
+            FILTER EXISTS { SELECT ?p ?s WHERE { ?s ?p "alpha" } LIMIT 1 } }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_search_before_explain_analyze() -> TestResult {
+    // Spec: EXPLAIN ANALYZE refuses local search even behind an empty OPTIONAL.
+    scoped_preparation_refusal(
+        "?inference-scope=dataset&explain=true",
+        r#"{ VALUES ?s {} OPTIONAL {
+            ?s <http://www.bigdata.com/rdf/search#search> "alpha"
+        } }"#,
+        "store.search_scope",
+    )
+    .await
 }
 
 #[tokio::test]
