@@ -1409,24 +1409,24 @@ impl StoreService {
         Some(status)
     }
 
-    /// The status of answers that don't go through the DL bounds, of the committed closure: before
-    /// the QL rewriting and before a transaction's pending operations. `None` only where no
-    /// reasoning path can leave answers out: asserted statements alone, or no reasoning. Over a
-    /// ruleset's closure: sound, and complete only for what the ruleset derives, never certain
-    /// answers under OWL 2 DL. Under `owl2-dl`, the rules' closure without the bounds: the inferred
-    /// statements alone (`onto:implicit`, `Self::dl_mode`) or every statement; sound only, never
-    /// complete, and unsound where a missing row can make a returned one wrong (`NOT EXISTS`,
-    /// `MINUS`, …: [`crate::dl::query::certify_closure`]). As `prepared`'s reader is told it
-    /// (`status_for_its_reader`); a reader by support is told `not-certified` whatever its read
-    /// will tell, as its status is its view's, known only when its read runs. The read's own status
-    /// is the authority: `not-certified` here says nothing of the data.
+    /// The status of answers that don't go through the DL bounds, of the committed closure before
+    /// the QL rewriting and a transaction's pending operations. `None` only where no reasoning path
+    /// can leave answers out: asserted statements alone, or no reasoning. Over a ruleset's closure:
+    /// sound, complete only for what it derives, never certain answers under OWL 2 DL. Under
+    /// `owl2-dl`, the rules' closure without the bounds, the inferred statements alone or every
+    /// statement (`Self::dl_mode`): sound only, unsound where a missing row can make a returned one
+    /// wrong (`NOT EXISTS`, …: [`crate::dl::query::certify_closure`]). As `prepared`'s reader is
+    /// told it (`status_for_its_reader`), but where reasoning is on a reader by support is told
+    /// `not-certified` whatever its read tells: its status is its view's, known only as the read
+    /// runs. The read's status is the authority; `not-certified` here says nothing of the data.
     pub fn status_without_dl(
         &self,
         prepared: &PreparedQuery,
     ) -> Option<nrese_sparql::Completeness> {
-        let status =
-            self.status_outside_dl(prepared, None, Revision::Committed(&self.engine.snapshot()));
-        if status.is_some() && prepared.access().is_some_and(|a| a.inferred_by_support) {
+        let snapshot = self.engine.snapshot();
+        let status = self.status_outside_dl(prepared, None, Revision::Committed(&snapshot));
+        let reasoned = !Certificate::bare(&snapshot, self.supports.has_rules());
+        if reasoned && prepared.access().is_some_and(|a| a.inferred_by_support) {
             return Some(nrese_sparql::Completeness::not_certified());
         }
         self.told(prepared, status, false)

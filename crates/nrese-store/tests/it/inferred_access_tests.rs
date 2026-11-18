@@ -1144,41 +1144,85 @@ fn a_typed_answer_from_the_cache_carries_its_own_readers_status() {
 }
 
 /// Spec: crates/nrese-store/src/service.rs (`status_without_dl`): before a read, a reader by
-/// support is told `not-certified`, as its read's status is its view's: under compact
-/// equality what its read is told too, and under the default equality as well. The reader of
-/// `ex:open` who sees every inference without support is told the closure's status
-/// unchanged, the reader of every graph's: the fixture's `sound-only` under `owl2-rl`. Asking
-/// builds nothing: the support state is as cold after it as before.
+/// support on a store with reasoning on is told `not-certified`, as its read's status is its
+/// view's: under compact equality what its read is told too; under the default equality as
+/// well, and so on a publication with the rules registered and not rematerialised (bare), for
+/// a scoped read (`inference-scope=dataset`) whose own status and answer are printed
+/// (`SEEN`). On a store never reasoned over (no rules, nothing inferred) it is told no status:
+/// nothing can be left out there. The reader of `ex:open` who sees every inference without
+/// support is told the closure's status unchanged, the reader of every graph's: the fixture's
+/// `sound-only` under `owl2-rl`. Asking does no support work: the support statistics are the
+/// same after the status calls as before.
 #[test]
-fn a_status_before_a_read_withholds_only_a_supported_readers_and_builds_nothing() {
+fn a_status_before_a_read_withholds_only_a_supported_readers_and_does_no_support_work() {
     let select = format!("PREFIX ex: <{EX}> SELECT ?o WHERE {{ ex:a ex:p ?o }}");
     let data = "GRAPH ex:open { ex:a ex:p ex:b }";
-    let before = |store: &StoreService, scope: ReadScope| {
-        let request = SparqlQueryRequest::new(select.clone(), scope);
-        let prepared = store.prepare_query(&request).unwrap();
+    let before = |store: &StoreService, request: &SparqlQueryRequest| {
+        let prepared = store.prepare_query(request).unwrap();
         store.status_without_dl(&prepared).map(|c| c.header())
     };
+    let ask = |scope| SparqlQueryRequest::new(select.clone(), scope);
+    // A store holding `data`, its default graph the union of every graph, never reasoned over.
+    let fresh = |data: &str| {
+        let config = nrese_store::StoreConfig {
+            union_default_graph: true,
+            ..in_memory_store_config()
+        };
+        let store = StoreService::new(config).unwrap();
+        let rdfs = "PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>";
+        let update = format!("PREFIX ex: <{EX}> {rdfs} INSERT DATA {{ {data} }}");
+        store
+            .execute_update(&SparqlUpdateRequest::new(update))
+            .unwrap();
+        store
+    };
+    let mut work = Vec::new();
     let compact = reasoned_store(true, data);
-    let request = SparqlQueryRequest::new(select.clone(), reader(true));
-    let read = compact.execute_query(&request).unwrap().completeness;
-    let compact = (before(&compact, reader(true)), read.map(|c| c.header()));
+    let cold = compact.support_statistics();
+    let compact_before = before(&compact, &ask(reader(true)));
+    work.push(compact.support_statistics() != cold);
+    let read = compact.execute_query(&ask(reader(true))).unwrap();
+    let compact = (compact_before, read.completeness.map(|c| c.header()));
     let store = reasoned_store(false, data);
     let cold = store.support_statistics();
-    let (supported, visible) = (before(&store, reader(true)), before(&store, reader(false)));
-    let warmed = store.support_statistics() != cold;
-    let every = before(&store, ReadScope::All);
+    let supported = before(&store, &ask(reader(true)));
+    let visible = before(&store, &ask(reader(false)));
+    let every = before(&store, &ask(ReadScope::All));
+    work.push(store.support_statistics() != cold);
+    let plain = fresh(data);
+    let cold = plain.support_statistics();
+    let unreasoned = before(&plain, &ask(reader(true)));
+    work.push(plain.support_statistics() != cold);
+    let bare = fresh("GRAPH ex:open { ex:C rdfs:subClassOf ex:D . ex:a a ex:C }");
+    bare.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    let ask_d = format!("PREFIX ex: <{EX}> ASK FROM ex:open {{ ex:a a ex:D }}");
+    let mut scoped = SparqlQueryRequest::new(ask_d, reader(true));
+    scoped.inference_scope_dataset = true;
+    let cold = bare.support_statistics();
+    let scoped_before = before(&bare, &scoped);
+    work.push(bare.support_statistics() != cold);
+    let read = bare.execute_query(&scoped).map(|r| {
+        let answer = String::from_utf8_lossy(&r.payload).into_owned();
+        (r.completeness.map(|c| c.header()), answer)
+    });
+    let read = read.map_err(|e| e.to_string());
+    println!("SEEN scoped on a bare publication: {read:?}");
     let rl = every
         .as_deref()
         .is_some_and(|s| s.split("; ").take(2).eq(["sound-only", "regime=owl2-rl"]));
     let withheld = Some("not-certified".to_owned());
     let right = compact == (withheld.clone(), withheld.clone())
         && supported == withheld
+        && unreasoned.is_none()
+        && scoped_before == withheld
         && rl
         && visible == every
-        && !warmed;
+        && work == [false; 4];
     assert!(
         right,
-        "compact {compact:?}; supported {supported:?}; visible {visible:?}; every {every:?};          warmed {warmed}"
+        "compact {compact:?}; supported {supported:?}; unreasoned {unreasoned:?}; \
+         scoped {scoped_before:?}; visible {visible:?}; every {every:?}; \
+         support work {work:?}"
     );
 }
 
