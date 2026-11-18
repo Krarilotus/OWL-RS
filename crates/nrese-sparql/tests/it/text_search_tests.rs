@@ -803,3 +803,47 @@ fn a_search_whose_predicates_a_values_binds_keeps_its_groups() {
     let want: &[&[&str]] = &[&["a", "t"], &["b", "t"]];
     answers_as_written(&engine, "a Jena call apart", jena, want);
 }
+
+/// Two labels with "alpha", one statement stored under `text:query`, and statements that
+/// name the search predicates as data.
+fn named_in_data_engine() -> Engine {
+    engine_of(
+        "@prefix ex: <http://example.com/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         @prefix bds: <http://www.bigdata.com/rdf/search#> .
+         ex:a rdfs:label \"alpha one\" . ex:b rdfs:label \"alpha two\" .
+         ex:t <http://jena.apache.org/text#query> ex:o .
+         ex:cfg ex:search bds:search ; ex:option bds:relevance .
+         ex:jena ex:search <http://jena.apache.org/text#query> .",
+    )
+}
+
+/// Spec: a search whose predicates are read from the data before a `LATERAL` is read within
+/// its group as a written one is: the `bds:` option in the other group matches nothing.
+#[test]
+fn a_search_whose_predicates_the_data_names_keeps_its_groups() {
+    let query = "SELECT ?o ?r { ex:cfg ex:search ?p ; ex:option ?q . \
+                 LATERAL { { ?o ?p \"alpha\" } VALUES ?x { 1 } { ?o ?q ?r } } }";
+    answers_as_written(&named_in_data_engine(), "an option apart", query, &[]);
+}
+
+/// Spec: a Jena search whose predicate is read from the data before a `LATERAL` is read
+/// within its group: the call without a literal in the other group is the stored statement.
+#[test]
+fn a_jena_search_whose_predicate_the_data_names_keeps_its_groups() {
+    let query = "SELECT ?s ?t { ex:jena ex:search ?p . \
+                 LATERAL { { ?s ?p \"alpha\" } VALUES ?x { 1 } { ?t ?p [] } } }";
+    let want: &[&[&str]] = &[&["a", "t"], &["b", "t"]];
+    answers_as_written(&named_in_data_engine(), "a Jena call apart", query, want);
+}
+
+/// Spec: a search whose predicates are built by an expression before a `LATERAL`, with no
+/// search IRI written anywhere, is read within its group: the option apart matches nothing.
+#[test]
+fn a_search_whose_predicates_an_expression_builds_keeps_its_groups() {
+    let query = "SELECT ?o ?r { \
+                 BIND(IRI(CONCAT(\"http://www.bigdata.com/rdf/search\", \"#search\")) AS ?p) \
+                 BIND(IRI(CONCAT(\"http://www.bigdata.com/rdf/search\", \"#relevance\")) AS ?q) \
+                 LATERAL { { ?o ?p \"alpha\" } VALUES ?x { 1 } { ?o ?q ?r } } }";
+    answers_as_written(&named_in_data_engine(), "an option apart", query, &[]);
+}
