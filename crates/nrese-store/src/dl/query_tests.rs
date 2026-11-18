@@ -1675,3 +1675,87 @@ fn rows_the_labels_leave_are_batched_no_costlier_than_the_capped_read() {
     );
     assert!(!reached.is_empty(), "no limit reaches the case");
 }
+
+/// Four individuals `:m0`..`:m3`, each in `:C` and with `:p` to the literal `"v{k}"`, and the
+/// rows of `?x :p ?l` (`?x`, `?l`) over them.
+fn labels_store() -> (Arc<StoreService>, Vec<Vec<Option<Term>>>) {
+    use nrese_rdf::{Literal, NamedNode};
+    let mut data = String::new();
+    let mut rows = Vec::new();
+    for k in 0..4 {
+        data.push_str(&format!(":m{k} a :C ; :p \"v{k}\" .\n"));
+        rows.push(vec![
+            Some(NamedNode::new_unchecked(format!("urn:test:m{k}")).into()),
+            Some(Literal::new_simple_literal(format!("v{k}")).into()),
+        ]);
+    }
+    let store = lower_true_store_with(crate::StoreConfig::in_memory(), &data);
+    (store, rows)
+}
+
+/// The model's refutations over `rows` of `SELECT * { pattern }` in `store`, under `token` and
+/// `deadline`, with a fresh envelope: the mask, and the most the envelope held.
+fn labels_of(
+    store: &StoreService,
+    pattern: &str,
+    rows: &[Vec<Option<Term>>],
+    token: &CancellationToken,
+    deadline: Deadline,
+) -> (Vec<bool>, usize) {
+    let request = crate::SparqlQueryRequest::all(format!("SELECT * {{ {pattern} }}"));
+    let analysis = analyse(PreparedQuery::parse(&request).unwrap().query());
+    let variables = analysis.shape.as_ref().unwrap().projected.clone();
+    let memory = nrese_exec::Envelope::new(Some(1 << 30), None);
+    let mask = super::exact::refuted_by_labels(
+        store,
+        &store.engine().snapshot(),
+        &analysis,
+        &variables,
+        rows.len(),
+        &|i| rows[i].clone(),
+        token,
+        deadline,
+        &memory,
+    );
+    (mask, memory.peak())
+}
+
+/// Spec: the model refutes only rows whose one test is `C(a)`, so a query whose atoms aren't all
+/// `?x a C` (an answer variable, a named class) gets no mask, and the premise is neither loaded
+/// nor charged for it: its rows' tests could otherwise add to the premise's copy, uncharged
+/// (a literal's text, an existential's expression). Over four rows of `?x :p ?l`, a fresh
+/// envelope holds nothing at any time. And the measure is live: over the same store, `?x a :C`
+/// charges the premise.
+#[test]
+fn a_query_the_labels_cant_read_loads_and_charges_nothing() {
+    let (store, rows) = labels_store();
+    let (token, deadline) = (CancellationToken::new(), Deadline::after(None));
+    let (mask, peak) = labels_of(&store, "?x <urn:test:p> ?l", &rows, &token, deadline);
+    println!("?x :p ?l: mask {mask:?}, the envelope's peak {peak}");
+    assert!(mask.is_empty(), "no mask");
+    assert_eq!(peak, 0, "nothing charged");
+    let typed: Vec<_> = rows.iter().map(|r| r[..1].to_vec()).collect();
+    let (_, peak) = labels_of(&store, "?x a <urn:test:C>", &typed, &token, deadline);
+    println!("?x a :C: the envelope's peak {peak}");
+    assert!(peak > 0, "the premise charged");
+}
+
+/// Spec: labels whose deadline has passed, or whose read is cancelled, load and charge nothing:
+/// no mask, and a fresh envelope holds nothing at any time, over four rows of `?x a :C` (a shape
+/// the labels read, which charges the premise when neither has happened).
+#[test]
+fn labels_past_their_deadline_or_cancelled_load_and_charge_nothing() {
+    let (store, rows) = labels_store();
+    let rows: Vec<_> = rows.iter().map(|r| r[..1].to_vec()).collect();
+    let expired = Deadline::at(std::time::Instant::now());
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    for (token, deadline) in [
+        (CancellationToken::new(), expired),
+        (cancelled, Deadline::after(None)),
+    ] {
+        let (mask, peak) = labels_of(&store, "?x a <urn:test:C>", &rows, &token, deadline);
+        assert!(mask.is_empty(), "no mask");
+        assert_eq!(peak, 0, "nothing charged");
+    }
+}
