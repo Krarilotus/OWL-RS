@@ -511,9 +511,11 @@ pub(crate) fn hazards(
                 // OWL 2 QL asserts named classes only (OWL 2 Profiles §3.2.5), and the
                 // rewriting answers a class through its named subclasses: where the
                 // closure's rules don't apply the expression, any read may miss what it
-                // entails, a contradiction included.
+                // entails, a contradiction included. Named by the expression's first term,
+                // which no change of its members alone changes.
                 if !(rl && crate::profile::rl_super(o, *c)) {
-                    asserted_outside.get_or_insert(Hazard::OutsideProfile(*a));
+                    let named = expr_terms(*c).first().copied().unwrap_or(*a);
+                    asserted_outside.get_or_insert(Hazard::OutsideProfile(named));
                 }
                 let mut roles = Vec::new();
                 existential_roles(o, *c, &mut roles);
