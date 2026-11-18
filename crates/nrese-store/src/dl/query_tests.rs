@@ -1597,3 +1597,81 @@ fn rows_the_labels_promote_past_the_capped_prefix_cost_no_more_memory() {
     );
     assert!(!reached.is_empty(), "no limit reaches the case");
 }
+
+/// Spec: where the labels refute rows the capped read would admit and its batches would mix
+/// with others, the read with them on puts the rows they leave in no batch that costs more than
+/// the capped read's did. Under `?x a :U0 . ?x a :U1`, the default candidate limit: twice 32
+/// short-named individuals with `v0`, which the labels refute, each followed by 32 with `v3`,
+/// named by IRIs longer by 8000 bytes, committed in that order (term-id order is the admission
+/// order). With them off each batch of 64 holds 32 of each; with them on the 64 long rows are
+/// left. Under each request memory limit from 16 KiB to 4 MiB (steps of a tenth), and in
+/// steps of 256 bytes over the 16 KiB from the least limit the read is answered under with them
+/// off, every read the first of a store just committed, a read answered with them off is
+/// answered with them on. And the case is reached: under some limit below the least one a read
+/// of the 64 long rows alone (with them off: one batch) is answered under, the read with them on
+/// refutes the 64 short rows by labels and is answered.
+#[test]
+fn rows_the_labels_leave_are_batched_no_costlier_than_the_capped_read() {
+    let pad = "x".repeat(8000);
+    let (mut data, mut long) = (String::new(), String::new());
+    for g in 0..2 {
+        for k in g * 32..(g + 1) * 32 {
+            data.push_str(&format!(":a{k} :val :v0 .\n"));
+        }
+        for k in g * 32..(g + 1) * 32 {
+            long.push_str(&format!(":b{k}{pad} :val :v3 .\n"));
+            data.push_str(&format!(":b{k}{pad} :val :v3 .\n"));
+        }
+    }
+    let first = |model_labels: bool, data: &str, limit: usize| {
+        let dl = crate::DlConfig {
+            model_labels,
+            ..crate::DlConfig::default()
+        };
+        let store = unions_store_of(dl, data);
+        unions_read_of(
+            &store,
+            "?x a <urn:test:U0> . ?x a <urn:test:U1>",
+            Some(limit),
+        )
+    };
+    let least = |data: &str| {
+        let (mut low, mut high) = (16usize << 10, 4usize << 20);
+        while high - low > 256 {
+            let middle = low + (high - low) / 2;
+            match first(false, data, middle) {
+                Ok(_) => high = middle,
+                Err(_) => low = middle,
+            }
+        }
+        high
+    };
+    let (high, one_batch) = (least(&data), least(&long));
+    let mut limits: Vec<usize> = (0..64).map(|k| high + k * 256).collect();
+    let mut limit = 16usize << 10;
+    while limit <= 4 << 20 {
+        limits.push(limit);
+        limit += limit / 10;
+    }
+    let mut reached = Vec::new();
+    for limit in limits {
+        if first(false, &data, limit).is_ok() {
+            let with = first(true, &data, limit);
+            assert!(
+                with.is_ok(),
+                "{limit} bytes: off answered, on {:?}",
+                with.err()
+            );
+            if let Ok((_, Some((_, detail)))) = &with
+                && detail.refuted_by_labels == 64
+                && limit < one_batch
+            {
+                reached.push(limit);
+            }
+        }
+    }
+    println!(
+        "off answered from {high} bytes, the 64 long rows alone from {one_batch}; all 64 short refuted by labels, answered under {reached:?}"
+    );
+    assert!(!reached.is_empty(), "no limit reaches the case");
+}
