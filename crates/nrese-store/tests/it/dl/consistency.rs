@@ -223,3 +223,33 @@ fn a_left_out_part_leaves_consistency_unknown_whoever_decides() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Spec (*OWL 2 Structural Specification* §5.1 and §9.1.4: `owl:Thing` and `owl:Nothing` are
+/// classes, and a disjoint union's first argument is a class): a disjoint union of `:A` and
+/// `:B` on `owl:Thing`, with both under `:C`, makes everything a `:C`, so an individual
+/// outside `:C` has no model; one on `owl:Nothing` makes `:A` empty, so an `:A` has none. Each
+/// such commit is rejected; each case's outcome printed.
+#[test]
+fn a_disjoint_union_on_the_top_or_bottom_class_is_read_as_that_class() {
+    let mut wrong = Vec::new();
+    for (schema, data) in [
+        (
+            "owl:Thing owl:disjointUnionOf ( :A :B ) . :A rdfs:subClassOf :C . \
+             :B rdfs:subClassOf :C .",
+            ":x a [ owl:complementOf :C ] .",
+        ),
+        ("owl:Nothing owl:disjointUnionOf ( :A :B ) .", ":a a :A ."),
+    ] {
+        let dl = pipeline();
+        insert(&dl, schema).expect("schema");
+        let outcome = match insert(&dl, data) {
+            Err(MutationError::Rejected(reject)) => format!("rejected: {}", reject.detail),
+            other => format!("not rejected: {other:?}"),
+        };
+        eprintln!("DISJOINT UNION {schema} then {data}: {outcome}");
+        if !outcome.starts_with("rejected") || !outcome.contains("OWL 2 DL") {
+            wrong.push(format!("{schema} then {data}: {outcome}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

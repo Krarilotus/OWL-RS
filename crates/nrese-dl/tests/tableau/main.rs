@@ -1340,3 +1340,27 @@ fn a_key_over_two_transitive_properties_needs_a_value_of_each() {
     b.role_assertion(201, 105, 104);
     assert_eq!(answer(&b.o), Answer::Inconsistent);
 }
+
+/// Spec (*OWL 2 Structural Specification* §5.1 and §9.1.4): `DisjointUnion(owl:Thing :A :B)`
+/// with `:A` and `:B` under `:C` leaves no model for an individual outside `:C`, and
+/// `DisjointUnion(owl:Nothing :A :B)` none for an `:A`. Read by the functional-syntax reader,
+/// decided as the store decides an ontology that isn't Horn (`nrese_dl::islands::consistency`);
+/// each case's answer printed.
+#[test]
+fn a_disjoint_union_on_the_top_or_bottom_class_is_read_as_that_class() {
+    let mut wrong = Vec::new();
+    for axioms in [
+        "DisjointUnion(owl:Thing :A :B) SubClassOf(:A :C) SubClassOf(:B :C) \
+         ClassAssertion(ObjectComplementOf(:C) :x)",
+        "DisjointUnion(owl:Nothing :A :B) ClassAssertion(:A :a)",
+    ] {
+        let document = format!("Prefix(:=<{}>) Ontology({axioms})", nrese_owl::scope::SCOPE);
+        let (o, _) = nrese_dl::scope::read(&document).expect("OWL 2 DL, no diagnostic");
+        let answer = nrese_dl::islands::consistency(&o, &Config::default()).answer;
+        eprintln!("DISJOINT UNION {axioms}: {answer:?}");
+        if answer != Answer::Inconsistent {
+            wrong.push(format!("{axioms}: {answer:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
