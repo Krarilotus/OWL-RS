@@ -481,6 +481,23 @@ pub struct BudgetExceeded {
     /// unread, [`SharedBudget::lazy`]): refused because the limit can't be enforced, not
     /// because memory is in use.
     pub unread: bool,
+    pub rows: Option<RowsPast>,
+}
+
+/// A table past the rows its memory has room for (`rows`: `room + 1` where not counted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RowsPast {
+    pub rows: usize,
+    pub width: usize,
+    pub room: usize,
+}
+
+/// A limit as a refusal writes it: `usize::MAX` is none.
+pub fn limit_text(limit: usize) -> String {
+    match limit {
+        usize::MAX => "unlimited".to_owned(),
+        bytes => format!("{} MiB", bytes >> 20),
+    }
 }
 
 impl std::fmt::Display for BudgetExceeded {
@@ -496,12 +513,22 @@ impl std::fmt::Display for BudgetExceeded {
         } else {
             "query memory budget exceeded"
         };
+        let (used, limit) = (self.used >> 20, limit_text(self.limit));
+        let Some(RowsPast { rows, width, room }) = self.rows else {
+            let requested = match self.requested {
+                usize::MAX => "more requested than memory can address".to_owned(),
+                bytes => format!("{} MiB more requested", bytes >> 20),
+            };
+            return write!(f, "{what}: {used} MiB in use, {requested}, limit {limit}");
+        };
+        let rows = match rows > room.saturating_add(1) {
+            true => rows.to_string(),
+            false => format!("more than {room}"),
+        };
         write!(
             f,
-            "{what}: {} MiB in use, {} MiB more requested, limit {} MiB",
-            self.used >> 20,
-            self.requested >> 20,
-            self.limit >> 20
+            "{what}: {rows} rows of {width} columns asked for, room for {room} rows \
+             ({used} MiB in use, limit {limit})"
         )
     }
 }
@@ -614,6 +641,7 @@ impl Budget {
                         used: refused.used,
                         shared: true,
                         unread: refused.unread,
+                        rows: None,
                     })
             }
             Some(Parent::Envelope(envelope)) => envelope.take_as(bytes, record && !self.optional),
@@ -727,6 +755,7 @@ impl Budget {
             used,
             shared: false,
             unread: false,
+            rows: None,
         }
     }
 
