@@ -1616,6 +1616,12 @@ impl<'a> Reader<'a> {
                         datas.push(member);
                     } else if let Some(property) = self.object_property(member) {
                         objects.push(property);
+                    } else {
+                        // On its other members it would be a stronger key than stated.
+                        return self.report(Diagnostic::Malformed {
+                            node: s,
+                            what: "a key with a member that can't be read",
+                        });
                     }
                 }
                 self.add(
