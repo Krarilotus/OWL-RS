@@ -493,13 +493,28 @@ const READS: [&str; 3] = [
 /// each after `ontology`: the route before the later commit, and what differs: the route
 /// after it and, for each of [`READS`], the answers and their status (the reasons printed).
 fn later_is_fresh(ontology: &str, first: &str, then: &str) -> (&'static str, Vec<String>) {
+    let then_update = format!("INSERT DATA {{ {then} }}");
+    let (before, _, wrong) =
+        after_is_fresh(ontology, first, &then_update, &format!("{first} {then}"));
+    (before, wrong)
+}
+
+/// [`later_is_fresh`] for any later update `then` (an insert or a deletion), against a store
+/// given `ontology` and `statements`, its result, in one commit: the route before `then`, the
+/// fresh store's route, and what differs.
+fn after_is_fresh(
+    ontology: &str,
+    first: &str,
+    then: &str,
+    statements: &str,
+) -> (&'static str, &'static str, Vec<String>) {
     let (later, fresh) = (pipeline(), pipeline());
     insert(&later, ontology).expect("the ontology");
     shapes_insert(&later, first).expect("the first commit");
     let before = later.store().dl_bounds().last;
-    shapes_insert(&later, then).expect("the later commit");
+    super::update(&later, &format!("{SH}{then}")).expect("the later commit");
     insert(&fresh, ontology).expect("the ontology");
-    shapes_insert(&fresh, &format!("{first} {then}")).expect("one commit");
+    shapes_insert(&fresh, statements).expect("one commit");
     let routes = [
         later.store().dl_bounds().last,
         fresh.store().dl_bounds().last,
@@ -526,7 +541,111 @@ fn later_is_fresh(ontology: &str, first: &str, then: &str) -> (&'static str, Vec
             wrong.push(format!("{read}: later {}; fresh {}", told(&a), told(&b)));
         }
     }
-    (before, wrong)
+    (before, routes[1], wrong)
+}
+
+/// The SHACL property a prior state already names before its first content, and that first
+/// content, for the family below: (a) declared an annotation property, beside other SHACL
+/// content (`:s sh:path :knows`); (b) declared another kind; (c) used as an individual; (d)
+/// named in a SHACL list; (e) named by an axiom. Each statement names `:knows`, an object
+/// property. The last field is the route the reading rule gives a fresh read of the store
+/// after the content (`true`: the rules'): the content's property, or in (a) `sh:message`,
+/// is then named, so every SHACL statement is read as any other, which puns `:knows`: off the
+/// route in each case.
+const NAMED_BEFORE: [(&str, &str, &str, bool); 5] = [
+    (
+        "(a) declared an annotation property",
+        "sh:message a owl:AnnotationProperty . :s sh:path :knows .",
+        ":s sh:message \"hint\" .",
+        false,
+    ),
+    (
+        "(b) declared another kind",
+        "sh:path a owl:ObjectProperty .",
+        ":s sh:path :knows .",
+        false,
+    ),
+    (
+        "(c) used as an individual",
+        ":x :knows sh:path .",
+        ":s sh:path :knows .",
+        false,
+    ),
+    (
+        "(d) named in a list",
+        ":s sh:in ( sh:path ) .",
+        ":s sh:path :knows .",
+        false,
+    ),
+    (
+        "(e) named by an axiom",
+        "sh:path rdfs:subPropertyOf :knows .",
+        ":s sh:path :knows .",
+        false,
+    ),
+];
+
+/// Runs [`NAMED_BEFORE`] after `ontology` on the route `route`: each case's route before its
+/// content commit (`rules` or off it, as `before`), a fresh read's route as its case gives
+/// it, and the commit's route and reads against a fresh read of the same statements.
+fn named_before_is_fresh(ontology: &str, route: &str, before: bool) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (what, prior, content, fresh) in NAMED_BEFORE {
+        let then = format!("INSERT DATA {{ {content} }}");
+        let (was, after, differs) =
+            after_is_fresh(ontology, prior, &then, &format!("{prior} {content}"));
+        let case = format!("{what}, {route}");
+        if (was == "rules") != before {
+            wrong.push(format!("{case}: before the content, route {was}"));
+        }
+        if (after == "rules") != fresh {
+            wrong.push(format!(
+                "{case}: a fresh read's route {after}, not as the rule gives"
+            ));
+        }
+        wrong.extend(differs.into_iter().map(|d| format!("{case}: {d}")));
+    }
+    wrong
+}
+
+/// Spec (a store's reading after any history equals a fresh read of its statements: one
+/// source, one reading, by the SHACL rule over the whole store): on the rules' route, a commit
+/// giving a SHACL property its first content, where the store already names that property
+/// ([`NAMED_BEFORE`]), takes the route and the reading a fresh read of the same statements
+/// takes: off the route, each read the same answers with the same status.
+#[test]
+fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_on_the_route() {
+    let wrong = named_before_is_fresh(ONTOLOGY, "on the rules' route", true);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (a store's reading after any history equals a fresh read of its statements): off
+/// the rules' route with the upper bound built, a commit giving a SHACL property its first
+/// content, where the store already names it ([`NAMED_BEFORE`]), takes the route and the
+/// reading a fresh read of the same statements takes.
+#[test]
+fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_off_the_route() {
+    let ontology = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet . \
+         :knows a owl:ObjectProperty . :a :knows :b .";
+    let wrong = named_before_is_fresh(ontology, "off the route, the upper bound built", false);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (a store's reading after any history equals a fresh read of its statements): off
+/// the rules' route with the upper bound built and SHACL content read as any other (`:x
+/// :knows sh:path` names `sh:path`), deleting the last statement with `sh:path` as predicate
+/// leaves `sh:path` named but no longer found, so `:t sh:class :q` is SHACL content again: the
+/// route and the reading are a fresh read's of the same statements. Its ends are IRIs.
+#[test]
+fn deleting_the_last_content_of_a_named_property_reads_as_a_fresh_store() {
+    let ontology = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet . \
+         :knows a owl:ObjectProperty . :a :knows :b .";
+    let named = ":x :knows sh:path . :t sh:class :q .";
+    let first = format!("{named} :s sh:path :q .");
+    let then = "DELETE DATA { :s sh:path :q . }";
+    let (before, _, wrong) = after_is_fresh(ontology, &first, then, named);
+    assert_ne!(before, "rules", "off the rules' route");
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// Spec (OWL 2 Structural Specification: a term an axiom uses has that axiom's kind; OWL 2

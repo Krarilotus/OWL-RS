@@ -143,3 +143,102 @@ fn a_later_equality_on_a_shacl_predicate_reads_again_and_leaves_the_route() {
     assert!(!fresh, "a fresh read took the rules' route");
     assert!(read, "the commit read the ontology again");
 }
+
+/// An ontology off the rules' route (an existential), with `:knows` an object property.
+const OFF_THE_ROUTE: &str = ":A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+     owl:someValuesFrom :B ] . :a a :A . :knows a owl:ObjectProperty . :ann :knows :bob .";
+
+/// The SHACL property a prior state already names before its first content, and that first
+/// content, as the integration tests' family has them (`tests/it/dl/shapes.rs`): (a) declared
+/// an annotation property, beside other SHACL content; (b) declared another kind; (c) used as
+/// an individual; (d) named in a SHACL list; (e) named by an axiom. The last field is the route
+/// the reading rule gives a fresh read after the content (`true`: the rules'): off it in each
+/// case, a SHACL statement then read as any other punning `:knows`.
+const NAMED_BEFORE: [(&str, &str, &str, bool); 5] = [
+    (
+        "(a) declared an annotation property",
+        "sh:message a owl:AnnotationProperty . :s sh:path :knows .",
+        ":s sh:message \"hint\" .",
+        false,
+    ),
+    (
+        "(b) declared another kind",
+        "sh:path a owl:ObjectProperty .",
+        ":s sh:path :knows .",
+        false,
+    ),
+    (
+        "(c) used as an individual",
+        ":x :knows sh:path .",
+        ":s sh:path :knows .",
+        false,
+    ),
+    (
+        "(d) named in a list",
+        ":s sh:in ( sh:path ) .",
+        ":s sh:path :knows .",
+        false,
+    ),
+    (
+        "(e) named by an axiom",
+        "sh:path rdfs:subPropertyOf :knows .",
+        ":s sh:path :knows .",
+        false,
+    ),
+];
+
+/// Spec (a store's reading after any history equals a fresh read of its statements): off the
+/// rules' route with the upper bound unavailable (its build gave up at its deadline, the build
+/// seam holding it past it), a commit giving a SHACL property its first content, where the
+/// store already names it ([`NAMED_BEFORE`]), takes the route a fresh read of the revision
+/// takes, and its upper bound is the one a store given the same statements at once builds.
+#[test]
+fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_with_the_bound_unavailable() {
+    let timeout = std::time::Duration::from_millis(500);
+    let config = || StoreConfig {
+        dl: crate::dl::DlConfig {
+            timeout: Some(timeout),
+            ..crate::dl::DlConfig::default()
+        },
+        ..StoreConfig::in_memory()
+    };
+    let mut wrong = Vec::new();
+    for (what, prior, content, routed) in NAMED_BEFORE {
+        let store = Arc::new(StoreService::new(config()).unwrap());
+        let pipeline = MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Dl,
+            ))),
+        );
+        let data = format!("{PREFIXES} INSERT DATA {{ {OFF_THE_ROUTE} {prior} }}");
+        store.update_str_ungated(&data).unwrap();
+        // The revision's upper bound gives up: its build begins past its deadline.
+        seam::set(&store.dl().bounds, Point::Build, move || {
+            std::thread::sleep(timeout * 2)
+        });
+        let unavailable = super::report(&store).unavailable;
+        update(&store, &pipeline, &format!("INSERT DATA {{ {content} }}"));
+        let (last, fresh_routed) = route(&store);
+        let later = super::report(&store);
+        let fresh = StoreService::new(config()).unwrap();
+        let all = format!("{PREFIXES} INSERT DATA {{ {OFF_THE_ROUTE} {prior} {content} }}");
+        fresh.update_str_ungated(&all).unwrap();
+        let once = super::report(&fresh);
+        let line = format!(
+            "{what}, off the route, the upper bound unavailable ({unavailable:?}): route {last}, \
+             a fresh read routed {fresh_routed}; the bound {:?} with {} facts, at once {:?} with {}",
+            later.unavailable, later.upper_facts, once.unavailable, once.upper_facts
+        );
+        eprintln!("{line}");
+        if unavailable.is_none()
+            || (last == "rules") != routed
+            || fresh_routed != routed
+            || later.unavailable != once.unavailable
+            || later.upper_facts != once.upper_facts
+        {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
