@@ -1706,19 +1706,21 @@ fn labels_store() -> (Arc<StoreService>, Vec<Vec<Option<Term>>>) {
 }
 
 /// The model's refutations over `rows` of `SELECT * { pattern }` in `store`, under `token` and
-/// `deadline`, with a fresh envelope: the mask; what the envelope held while the mask the call
-/// returned lived, then once it was dropped; and the most it held.
+/// `deadline`, with a fresh envelope of `limit` bytes: the mask; what the envelope held while the
+/// mask the call returned lived, then once it was dropped; the most it held; and whether it was
+/// marked refused.
 fn labels_of(
     store: &StoreService,
     pattern: &str,
     rows: &[Vec<Option<Term>>],
     token: &CancellationToken,
     deadline: Deadline,
-) -> (Vec<bool>, (usize, usize), usize) {
+    limit: usize,
+) -> (Vec<bool>, (usize, usize), usize, bool) {
     let request = crate::SparqlQueryRequest::all(format!("SELECT * {{ {pattern} }}"));
     let analysis = analyse(PreparedQuery::parse(&request).unwrap().query());
     let variables = analysis.shape.as_ref().unwrap().projected.clone();
-    let memory = nrese_exec::Envelope::new(Some(1 << 30), None);
+    let memory = nrese_exec::Envelope::new(Some(limit), None);
     let mask = super::exact::refuted_by_labels(
         store,
         &store.engine().snapshot(),
@@ -1732,7 +1734,12 @@ fn labels_of(
     );
     let (alive, copy) = (memory.used(), mask.to_vec());
     drop(mask);
-    (copy, (alive, memory.used()), memory.peak())
+    (
+        copy,
+        (alive, memory.used()),
+        memory.peak(),
+        memory.refused(),
+    )
 }
 
 /// Spec: the model refutes only rows whose one test is `C(a)`, so a query whose atoms aren't all
@@ -1745,12 +1752,26 @@ fn labels_of(
 fn a_query_the_labels_cant_read_loads_and_charges_nothing() {
     let (store, rows) = labels_store();
     let (token, deadline) = (CancellationToken::new(), Deadline::after(None));
-    let (mask, _, peak) = labels_of(&store, "?x <urn:test:p> ?l", &rows, &token, deadline);
+    let (mask, _, peak, _) = labels_of(
+        &store,
+        "?x <urn:test:p> ?l",
+        &rows,
+        &token,
+        deadline,
+        1 << 30,
+    );
     println!("?x :p ?l: mask {mask:?}, the envelope's peak {peak}");
     assert!(mask.is_empty(), "no mask");
     assert_eq!(peak, 0, "nothing charged");
     let typed: Vec<_> = rows.iter().map(|r| r[..1].to_vec()).collect();
-    let (_, _, peak) = labels_of(&store, "?x a <urn:test:C>", &typed, &token, deadline);
+    let (_, _, peak, _) = labels_of(
+        &store,
+        "?x a <urn:test:C>",
+        &typed,
+        &token,
+        deadline,
+        1 << 30,
+    );
     println!("?x a :C: the envelope's peak {peak}");
     assert!(peak > 0, "the premise charged");
 }
@@ -1769,7 +1790,14 @@ fn labels_past_their_deadline_or_cancelled_load_and_charge_nothing() {
         (CancellationToken::new(), expired),
         (cancelled, Deadline::after(None)),
     ] {
-        let (mask, _, peak) = labels_of(&store, "?x a <urn:test:C>", &rows, &token, deadline);
+        let (mask, _, peak, _) = labels_of(
+            &store,
+            "?x a <urn:test:C>",
+            &rows,
+            &token,
+            deadline,
+            1 << 30,
+        );
         assert!(mask.is_empty(), "no mask");
         assert_eq!(peak, 0, "nothing charged");
     }
@@ -1789,66 +1817,53 @@ fn the_labels_mask_is_charged_while_it_lives() {
         .map(|k| vec![Some(iri(k))])
         .collect();
     let (token, deadline) = (CancellationToken::new(), Deadline::after(None));
-    let (mask, (alive, dropped), _) =
-        labels_of(&store, "?x a <urn:test:U0>", &rows, &token, deadline);
+    let (mask, (alive, dropped), _, _) = labels_of(
+        &store,
+        "?x a <urn:test:U0>",
+        &rows,
+        &token,
+        deadline,
+        1 << 30,
+    );
     println!("mask {mask:?}; the envelope held {alive} bytes with it, {dropped} without");
     assert_eq!(mask, vec![true; 12], "all 12 refuted by the model");
     assert!(alive >= 12, "the mask's 12 bytes charged while it lives");
     assert_eq!(dropped, 0, "nothing once it is dropped");
 }
 
-/// Spec: the labels' work is work the read can do without, so a charge it is refused is no
-/// limit on the read: where the labels have no room, the request is marked as limited by its
-/// memory (`refused`, which keeps a result from being published beyond it) only as the read
-/// without them is. Over S1's store (the gap's 200 candidates named by 8000-byte IRIs), under
-/// each request memory limit from 64 KiB to 512 KiB (steps of a fiftieth), every read the first
-/// of a store just committed: where the read with the labels off answers, the read with them on
-/// answers; and where it also selects the whole gap and refutes none by labels (they had no
-/// room), its envelope is marked refused exactly where the read's with them off is. And the
-/// case is reached.
+/// Spec: the labels' work is work the read can do without, so a charge they are refused inside
+/// it marks only their own part: the envelope the caller passed is never marked refused (which
+/// would keep the request's result from being published beyond it), whether the labels had
+/// room or not. Over the unions store's 12 gap rows of `?x a :U0`, all refuted by one model,
+/// under each limit from 64 bytes up (steps of a tenth) to the least that gives the whole mask:
+/// the envelope isn't marked refused. And the case is reached: some limit gives no mask (the
+/// labels refused), and the last gives all 12 refuted.
 #[test]
 fn labels_refused_their_memory_leave_the_request_unmarked() {
-    let read = |labels: bool, limit: usize| {
-        let store = padded_unions_store(labels, 400, 8000);
-        let request = crate::SparqlQueryRequest::all("SELECT ?x { ?x a <urn:test:U0> }");
-        let prepared = PreparedQuery::parse(&request).unwrap();
-        let memory = nrese_exec::Envelope::new(Some(limit), None);
-        let outcome = decide_answers(
-            &store,
-            &prepared,
-            &analyse(prepared.query()),
-            &crate::dl::bounds::view(&store),
-            (&CancellationToken::new(), Deadline::after(None)),
-            &memory,
-            DlAnswers::default(),
+    use nrese_rdf::NamedNode;
+    let store = unions_store_with(crate::DlConfig::default(), 24, 0);
+    let iri = |k: usize| -> Term { NamedNode::new_unchecked(format!("urn:test:i{k}")).into() };
+    let rows: Vec<_> = (0..24)
+        .filter(|k| k % 4 >= 2)
+        .map(|k| vec![Some(iri(k))])
+        .collect();
+    let (token, deadline) = (CancellationToken::new(), Deadline::after(None));
+    let (mut limit, mut empty) = (64usize, 0);
+    let mask = loop {
+        let (mask, _, _, refused) =
+            labels_of(&store, "?x a <urn:test:U0>", &rows, &token, deadline, limit);
+        println!("{limit}: mask of {} rows, refused {refused}", mask.len());
+        assert!(
+            !refused,
+            "{limit} bytes: the labels' refusal marked the caller's envelope"
         );
-        let detail = outcome.ok().map(|outcome| match outcome {
-            Outcome::Stream(_, _, detail) | Outcome::Answers(_, _, detail) => detail,
-        });
-        (detail, memory.refused())
-    };
-    let (mut limit, mut reached) = (64usize << 10, Vec::new());
-    while limit <= 512 << 10 {
-        let (off, off_refused) = read(false, limit);
-        if off.is_some() {
-            let (on, refused) = read(true, limit);
-            // The switch-on read's paths and refutations by labels.
-            let seen = on.as_ref().map(|d| (&d.paths, d.refuted_by_labels));
-            println!("{limit}: off refused {off_refused}; on {seen:?}, refused {refused}");
-            assert!(on.is_some(), "{limit} bytes: off answered, on failed");
-            if let Some(detail) = on
-                && !detail.paths.contains(&"capped-gap")
-                && detail.refuted_by_labels == 0
-            {
-                assert_eq!(
-                    refused, off_refused,
-                    "{limit} bytes: labels without room, the request's mark differs"
-                );
-                reached.push(limit);
-            }
+        if mask.len() == rows.len() || limit > 1 << 30 {
+            break mask;
         }
-        limit += limit / 50;
-    }
-    println!("the labels had no room, the request unmarked, under {reached:?}");
-    assert!(!reached.is_empty(), "no limit reaches the case");
+        empty += usize::from(mask.is_empty());
+        limit += limit / 10;
+    };
+    println!("the whole mask from {limit} bytes; {empty} limits gave none");
+    assert!(empty > 0, "no limit refuses the labels");
+    assert_eq!(mask, vec![true; 12], "all 12 refuted under the last limit");
 }
