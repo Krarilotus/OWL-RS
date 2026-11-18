@@ -562,14 +562,13 @@ fn by_index(snapshot: &Snapshot) -> Option<Option<String>> {
 }
 
 /// The annotation properties by the reader's rule: declared by its table (OWL 1's
-/// `owl:OntologyProperty` too) in a graph `readable` takes, IRIs only and not `rdf:type`,
-/// whose declaration the reader leaves out as reserved, then the built-ins the store knows;
-/// lazily, a declaring type at a time.
+/// `owl:OntologyProperty` too) in a graph `readable` takes, IRIs that may name one only
+/// ([`may_name_annotation`]), then the built-ins the store knows; lazily, a declaring type at
+/// a time.
 fn annotation_properties(
     snapshot: &Snapshot,
     readable: impl Fn(TermId) -> bool,
 ) -> impl Iterator<Item = TermId> {
-    use nrese_engine::TermKind;
     use nrese_owl::{BUILTIN_ANNOTATIONS as BUILTIN, EntityKind};
     let id = move |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
     let (ty, kinds) = (id(RDF_TYPE), nrese_owl::DECLARATION_KINDS.into_iter());
@@ -580,8 +579,15 @@ fn annotation_properties(
     let named = typed.flat_map(quads).filter(move |q| readable(q.graph));
     let named = named
         .map(|q| q.subject)
-        .filter(move |&s| s.kind() == TermKind::Iri && Some(s) != ty);
+        .filter(move |&s| may_name_annotation(snapshot, s));
     named.chain(BUILTIN.into_iter().filter_map(id))
+}
+
+/// Whether `term` is an IRI that may name an annotation property, by the reader's rule
+/// ([`nrese_owl::may_name_annotation`]).
+pub(crate) fn may_name_annotation(snapshot: &Snapshot, term: TermId) -> bool {
+    let iri = snapshot.decode(term);
+    matches!(iri, Some(Term::NamedNode(n)) if nrese_owl::may_name_annotation(n.as_str()))
 }
 
 /// Whether `snapshot` holds `owl:sameAs` between two different terms: the first found
@@ -835,10 +841,12 @@ const COPIES: &str = "and the closure may hold the rules' copies of annotation s
                       an equality or an annotation axiom), which OWL 2 DL doesn't entail";
 
 /// The first of `read` that may return a copy in `snapshot`: an annotation property (one of
-/// [`annotation_properties`], for `None`; a constant by its own declarations or as built in,
-/// none where the store doesn't know the IRI) with statements held where an equality between
-/// two different terms is, or inferred ones. For a reader by support (`access`), held only in
-/// the graphs it reads: a copy it sees has its support there, or copies an inferred statement.
+/// [`annotation_properties`], for `None`; a constant by its own declarations where it may name
+/// one, or as built in,
+/// none where the store doesn't know the IRI), or, under an equality, a SHACL property, with
+/// statements held where an equality between two different terms is, or inferred ones. For a
+/// reader by support (`access`), held only in the graphs it reads: a copy it sees has its
+/// support there, or copies an inferred statement.
 fn copied<'a>(
     snapshot: &Snapshot,
     access: Option<&nrese_sparql::GraphAccess>,
@@ -851,9 +859,10 @@ fn copied<'a>(
     let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
     let asserted = |pattern| snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern);
     let equal = std::cell::OnceCell::new();
+    let equal = || *equal.get_or_init(|| equal_terms(snapshot));
     // A reader by support sees the copy of a statement in its own graphs, or of an inferred one.
     let copies = |p| {
-        let equal = *equal.get_or_init(|| equal_terms(snapshot));
+        let equal = equal();
         let (of, held) = (any_graph(None, Some(p), None), equal && !by_support);
         let model = if held { Materialised } else { Inferred };
         let seen = equal && by_support && asserted(of).any(|q| readable(q.graph));
@@ -864,11 +873,24 @@ fn copied<'a>(
         let object = snapshot.decode(q.object);
         readable(q.graph) && matches!(object, Some(Term::NamedNode(k)) if kind(k.as_str()))
     };
+    // SHACL content (`nrese_owl::shacl_properties`) is copied only through an equality of two
+    // different terms (OWL 2 Profiles §4.3, Table 4: eq-rep-s, eq-rep-p, eq-rep-o): an OWL axiom
+    // on a SHACL term makes the reader read the store as any other, and a copy is then entailed.
+    // So with no equality its properties aren't probed.
     read.iter().find(|p| match p.as_deref() {
-        None => annotation_properties(snapshot, readable).any(copies),
+        None => {
+            annotation_properties(snapshot, readable).any(copies)
+                || (equal()
+                    && nrese_owl::shacl_properties()
+                        .filter_map(|i| id(&i))
+                        .any(copies))
+        }
         Some(iri) => id(iri).is_some_and(|p| {
             let typed = id(RDF_TYPE).map(|ty| asserted(any_graph(Some(p), Some(ty), None)));
-            (BUILTIN.contains(&iri) || typed.into_iter().flatten().any(declares)) && copies(p)
+            let shacl = nrese_owl::is_shacl_property(iri) && equal();
+            let declared = || typed.into_iter().flatten().any(declares);
+            (BUILTIN.contains(&iri) || shacl || (nrese_owl::may_name_annotation(iri) && declared()))
+                && copies(p)
         }),
     })
 }

@@ -644,6 +644,79 @@ fn reserved_vocabulary_as_an_entity_is_left_out() {
     );
 }
 
+/// Spec (Structural Specification §5.8, declarations; §5.5: of the reserved vocabulary only
+/// names other than the nine built-in annotation properties are no annotation properties): a
+/// declaration of each kind of entity is read as one, through its `rdf:type` statement, and so
+/// is `rdfs:label` declared an annotation property.
+#[test]
+fn a_declaration_of_each_kind_is_read_through_its_typing() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        r#"
+        ex:C a owl:Class . ex:K a rdfs:Class . ex:o a owl:ObjectProperty .
+        ex:d a owl:DatatypeProperty . ex:n a owl:AnnotationProperty . ex:t a rdfs:Datatype .
+        ex:i a owl:NamedIndividual . rdfs:label a owl:AnnotationProperty .
+        "#,
+    );
+    let lines = rendered(&read(&statements, &table), &table);
+    let missing: Vec<&str> = [
+        "Declaration(Class(ex:C))",
+        "Declaration(Class(ex:K))",
+        "Declaration(ObjectProperty(ex:o))",
+        "Declaration(DataProperty(ex:d))",
+        "Declaration(AnnotationProperty(ex:n))",
+        "Declaration(Datatype(ex:t))",
+        "Declaration(NamedIndividual(ex:i))",
+        "Declaration(AnnotationProperty(<http://www.w3.org/2000/01/rdf-schema#label>))",
+    ]
+    .into_iter()
+    .filter(|d| !lines.contains(&(*d).to_owned()))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "missing {missing:?}\nread:\n{}",
+        lines.join("\n")
+    );
+}
+
+/// Spec (Structural Specification §2.4 allows `owl:Thing`, `owl:Nothing` and the four top and
+/// bottom properties as entities; §5.5 lets of the reserved vocabulary only the nine built-in
+/// annotation properties be annotation properties; the RDF mapping's Table 6 declares one by
+/// `owl:AnnotationProperty` or `owl:OntologyProperty`): each of the six, declared an
+/// annotation property in either spelling, is read as no annotation property, where `ex:n`
+/// so declared is one.
+#[test]
+fn the_six_entities_of_the_reserved_vocabulary_declared_annotation_properties_are_none() {
+    let six = [
+        "Thing",
+        "Nothing",
+        "topObjectProperty",
+        "bottomObjectProperty",
+        "topDataProperty",
+        "bottomDataProperty",
+    ];
+    let declared = |text: &str, name: &str| {
+        let mut table = Table::default();
+        let lines = rendered(&read(&load(&mut table, text), &table), &table);
+        lines.contains(&format!("Declaration(AnnotationProperty({name}))"))
+    };
+    let mut kept = Vec::new();
+    for spelling in ["owl:AnnotationProperty", "owl:OntologyProperty"] {
+        assert!(
+            declared(&format!("ex:n a {spelling} ."), "ex:n"),
+            "setup: {spelling}"
+        );
+        for name in six {
+            let iri = format!("<http://www.w3.org/2002/07/owl#{name}>");
+            if declared(&format!("owl:{name} a {spelling} ."), &iri) {
+                kept.push(format!("{spelling}: {iri}"));
+            }
+        }
+    }
+    assert!(kept.is_empty(), "{kept:#?}");
+}
+
 /// A disjointness that repeats an operand says that operand is empty (an individual
 /// different from itself: a contradiction), as OWL 2's RDF-Based Semantics reads it; the
 /// operands were deduplicated and the axiom said nothing (WebOnt-disjointWith-010,

@@ -260,6 +260,9 @@ fn no_public_method_commits_outside_the_pipeline() {
         "nrese-store/src/dl/lower_tests.rs",
         // Data no pipeline commit wrote: U1's first build is a read's (its lock tests).
         "nrese-store/src/dl/bounds_lock_tests.rs",
+        // ... and a prior state written without a commit, so that U1 gives up on a read, as
+        // the lock tests' first build does, before a commit gives a SHACL property content.
+        "nrese-store/src/dl/bounds_shapes_tests.rs",
         // ... and its cold build beside the query-ontology cache (N1).
         "nrese-store/src/dl/query_tests.rs",
         // ... and the U1 a cold read keeps, before any commit (dictionary lifecycle V1, item 5).

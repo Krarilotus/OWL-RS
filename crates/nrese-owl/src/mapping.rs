@@ -46,11 +46,10 @@ pub trait Terms {
         None
     }
 
-    /// The text of an IRI, if the source gives it (datatypes and facets beyond those the
-    /// vocabulary knows).
-    fn iri_text(&self, _term: Term) -> Option<String> {
-        None
-    }
+    /// The text of an IRI, `None` for any other term: datatypes and facets beyond those the
+    /// vocabulary knows, and the reserved vocabulary's names, which the reader tells by it.
+    /// Required, with no default: a source that gave none would pass every reserved name.
+    fn iri_text(&self, term: Term) -> Option<String>;
 }
 
 /// A statement of the source: a triple and its graph.
@@ -86,6 +85,9 @@ pub struct Ontology {
     /// among [`Self::annotations`]: OWL 2 DL gives these axioms no meaning, while the OWL 2
     /// RL rules over the triples (prp-dom, prp-rng, prp-spo1) read them. Sorted, each once.
     pub annotation_schema: Vec<Term>,
+    /// The properties of the SHACL vocabulary ([`shacl_properties`]) whose statements were read
+    /// as SHACL content, which has no OWL meaning (read past as an annotation is).
+    pub shacl: BTreeSet<Term>,
     /// The source's ids of the properties with a fixed meaning.
     pub builtin: BuiltinProperties,
     /// The literals, datatypes and facets of the data axioms, as the source gives them.
@@ -172,9 +174,16 @@ impl Ontology {
 
 /// Reads the ontology of `statements` (any graphs, the union of them).
 pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
+    read_beside(statements, &[], terms)
+}
+
+/// [`read`], its SHACL rule ([`Ontology::shacl`]) over `beside` and `statements` as one source:
+/// a conclusion's read beside its premise's statements, which are read for nothing else.
+pub fn read_beside(statements: &[Statement], beside: &[Statement], terms: &dyn Terms) -> Ontology {
     let vocabulary = Vocabulary::new(&|iri| terms.iri(iri));
     let mut reader = Reader::new(statements, terms, vocabulary);
     reader.declarations();
+    reader.shacl(beside);
     reader.axioms();
     reader.finish()
 }
@@ -410,6 +419,7 @@ struct Reader<'a> {
     noncanonical_cardinality: Option<Term>,
     empty_list: Option<Term>,
     annotation_schema: Vec<Term>,
+    shacl: BTreeSet<Term>,
 }
 
 /// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
@@ -458,6 +468,57 @@ pub const BUILTIN_ANNOTATIONS: [&str; 9] = [
     "http://www.w3.org/2002/07/owl#incompatibleWith",
 ];
 
+/// SHACL's namespace.
+const SHACL: &str = "http://www.w3.org/ns/shacl#";
+
+/// The properties of the SHACL vocabulary, by local name in [`SHACL`]'s namespace: a statement
+/// of one is SHACL content, with no OWL meaning ([`Ontology::shacl`]). From W3C, *Shapes
+/// Constraint Language (SHACL)*, 2017: §2 (targets, severity, messages, deactivation, property
+/// shapes and their paths, the non-validating characteristics), §1.5 and §3 (shapes graphs,
+/// entailment, the validation report), §4 (the core constraint components' parameters), §5 and
+/// §6 (SPARQL-based constraints and constraint components). A term of the namespace not listed
+/// is read as any other term, by its use: conservative, as it keeps the kind OWL 2 gives it.
+#[rustfmt::skip]
+const SHACL_PROPERTIES: [&str; 78] = [
+    // §2
+    "targetNode", "targetClass", "targetSubjectsOf", "targetObjectsOf",
+    "property", "path", "severity", "message", "deactivated",
+    "inversePath", "alternativePath", "zeroOrMorePath", "oneOrMorePath", "zeroOrOnePath",
+    "name", "description", "order", "group", "defaultValue",
+    // §1.5 and §3
+    "shapesGraph", "suggestedShapesGraph", "entailment",
+    "conforms", "result", "focusNode", "resultPath", "value", "sourceShape",
+    "sourceConstraintComponent", "sourceConstraint", "detail", "resultMessage", "resultSeverity",
+    // §4
+    "class", "datatype", "nodeKind", "minCount", "maxCount",
+    "minExclusive", "minInclusive", "maxExclusive", "maxInclusive",
+    "minLength", "maxLength", "pattern", "flags", "languageIn", "uniqueLang",
+    "equals", "disjoint", "lessThan", "lessThanOrEquals",
+    "not", "and", "or", "xone", "node",
+    "qualifiedValueShape", "qualifiedMinCount", "qualifiedMaxCount", "qualifiedValueShapesDisjoint",
+    "closed", "ignoredProperties", "hasValue", "in",
+    // §5 and §6
+    "sparql", "select", "ask", "prefixes", "declare", "prefix", "namespace",
+    "parameter", "optional", "labelTemplate", "validator", "nodeValidator", "propertyValidator",
+];
+
+/// [`SHACL_PROPERTIES`]' IRIs.
+pub fn shacl_properties() -> impl Iterator<Item = String> {
+    SHACL_PROPERTIES.iter().map(|name| format!("{SHACL}{name}"))
+}
+
+/// Whether `iri` is one of [`shacl_properties`].
+pub fn is_shacl_property(iri: &str) -> bool {
+    iri.strip_prefix(SHACL)
+        .is_some_and(|name| SHACL_PROPERTIES.contains(&name))
+}
+
+/// Whether `iri` may name an annotation property (Structural Specification §5.5): of the
+/// reserved vocabulary only the nine built-in ones, [`BUILTIN_ANNOTATIONS`].
+pub fn may_name_annotation(iri: &str) -> bool {
+    BUILTIN_ANNOTATIONS.contains(&iri) || !crate::diagnostics::reserved_vocabulary(iri)
+}
+
 /// The annotation properties as [`read`] reads them (§5.8), for every reader of the RDF: the
 /// built-in ones, and each IRI declared one by [`DECLARATION_KINDS`] (no blank node). Holds
 /// the declarations' `rdf:type` and class, and the properties.
@@ -477,9 +538,14 @@ impl AnnotationProperties {
 
     /// Reads a statement, whose subject is an IRI where `named`.
     pub fn read(&mut self, [s, p, o]: [Term; 3], named: bool) {
-        if named && self.0.contains(&[Some(p), Some(o)]) {
+        if named && self.declares([s, p, o]) {
             self.1.insert(s);
         }
+    }
+
+    /// Whether a statement declares its subject an annotation property, in either spelling.
+    pub fn declares(&self, [_, p, o]: [Term; 3]) -> bool {
+        self.0.contains(&[Some(p), Some(o)])
     }
 
     pub fn contains(&self, term: Term) -> bool {
@@ -538,6 +604,7 @@ impl<'a> Reader<'a> {
             noncanonical_cardinality: None,
             empty_list: None,
             annotation_schema: Vec::new(),
+            shacl: BTreeSet::new(),
         }
     }
 
@@ -616,6 +683,11 @@ impl<'a> Reader<'a> {
             if !is(p, v.rdf_type) || self.kind(s) != TermKind::Iri {
                 continue;
             }
+            // Either spelling of an annotation property's declaration (Table 6).
+            let annotation = kinds.contains(&(Some(o), EntityKind::AnnotationProperty));
+            if annotation && self.reserved_annotation(s) {
+                continue;
+            }
             self.annotation_properties.read(statement.triple, true);
             for &(class, kind) in &kinds {
                 if is(o, class) {
@@ -653,6 +725,40 @@ impl<'a> Reader<'a> {
                 self.diagnostics
                     .push(Diagnostic::AmbiguousProperty { property: term });
             }
+        }
+    }
+
+    /// The terms of the SHACL content ([`Ontology::shacl`]): none where a statement that is
+    /// neither SHACL content nor an annotation names one, which gives it an OWL meaning, so
+    /// the source reads as any other. The rule is over `beside` and the source as one: the
+    /// properties either uses as content, and either's annotation declarations (of an IRI, as
+    /// [`Self::declarations`] reads them).
+    fn shacl(&mut self, beside: &[Statement]) {
+        let (terms, statements) = (self.terms, self.statements);
+        let vocabulary: HashSet<Term> = shacl_properties().filter_map(|i| terms.iri(&i)).collect();
+        let content = |[_, p, _]: [Term; 3]| vocabulary.contains(&p).then_some(p);
+        let all = || statements.iter().chain(beside);
+        let found: BTreeSet<Term> = all().filter_map(|s| content(s.triple)).collect();
+        let mut declared = AnnotationProperties::new(&mut |i| terms.iri(i));
+        for s in beside {
+            let [subject, ..] = s.triple;
+            let declares = self.kind(subject) == TermKind::Iri && declared.declares(s.triple);
+            declared.read(s.triple, declares && !self.reserved_annotation(subject));
+        }
+        let named = !found.is_empty()
+            && all().any(|s| {
+                let [subject, p, o] = s.triple;
+                content(s.triple).is_none()
+                    && !self.declared_as(p, EntityKind::AnnotationProperty)
+                    && !declared.contains(p)
+                    && !self.is_builtin_annotation(p)
+                    && (found.contains(&subject) || found.contains(&o))
+            });
+        if !named {
+            self.shacl = statements
+                .iter()
+                .filter_map(|s| content(s.triple))
+                .collect();
         }
     }
 
@@ -1468,10 +1574,11 @@ impl<'a> Reader<'a> {
             }
         } else if self.declared_as(p, EntityKind::AnnotationProperty)
             || self.is_builtin_annotation(p)
+            || self.shacl.contains(&p)
             || self.has_type(s, v.owl_ontology)
         {
-            // An annotation, or a statement about the ontology: its header's annotations
-            // (an anonymous ontology's too: its node is a blank node).
+            // An annotation, SHACL content, or a statement about the ontology: its header's
+            // annotations (an anonymous ontology's too: its node is a blank node).
             self.annotations += 1;
         } else if self.kind(o) == TermKind::Literal || self.is_data_property(p) {
             self.add(Axiom::DataPropertyAssertion(p, s, o), triple);
@@ -1484,7 +1591,7 @@ impl<'a> Reader<'a> {
     fn typing(&mut self, s: Term, o: Term, triple: [Term; 3]) {
         let v = self.v;
         if let Some(&(_, kind)) = self.declaration_kinds.iter().find(|(c, _)| is(o, *c)) {
-            if self.kind(s) == TermKind::Iri {
+            if self.declared_as(s, kind) {
                 self.add(Axiom::Declaration(kind, s), triple);
             }
             return;
@@ -1587,6 +1694,15 @@ impl<'a> Reader<'a> {
         self.annotation_properties.contains(term)
     }
 
+    /// Whether `term` is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`) and not
+    /// one of the nine annotation properties OWL 2 builds in: no declaration makes it one
+    /// (§5.5), `rdf:type`, `owl:sameAs`, `owl:Thing` and the top and bottom properties alike.
+    fn reserved_annotation(&self, term: Term) -> bool {
+        self.terms
+            .iri_text(term)
+            .is_some_and(|i| !may_name_annotation(&i))
+    }
+
     /// `rdfs:label` and the other annotation properties OWL 2 builds in.
     fn is_builtin_annotation(&self, predicate: Term) -> bool {
         let (builtin, version_iri) = &self.builtin_annotations;
@@ -1610,6 +1726,7 @@ impl<'a> Reader<'a> {
             diagnostics: self.diagnostics,
             annotations: self.annotations,
             annotation_schema: self.annotation_schema,
+            shacl: self.shacl,
             builtin: BuiltinProperties::of(&self.v),
             data: DataTerms::default(),
             anonymous: BTreeSet::new(),

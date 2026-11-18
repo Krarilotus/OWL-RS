@@ -120,6 +120,7 @@ impl<'a> FunctionalReader<'a> {
         model.annotation_schema.dedup();
         let mut ontology = Ontology {
             annotation_schema: model.annotation_schema,
+            shacl: BTreeSet::new(),
             classes: model.classes,
             ranges: model.ranges,
             sources: vec![Vec::new(); axioms.len()],

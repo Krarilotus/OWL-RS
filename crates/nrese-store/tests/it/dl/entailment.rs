@@ -7,7 +7,7 @@ use nrese_store::dl::entailment::Entailed;
 
 use super::{PREFIXES, pipeline};
 
-fn turtle(text: &str) -> Vec<Triple> {
+pub(super) fn turtle(text: &str) -> Vec<Triple> {
     let prefixes = PREFIXES
         .split("PREFIX ")
         .filter(|p| !p.trim().is_empty())
@@ -80,18 +80,18 @@ fn a_subsumption_through_a_union_and_an_instance_of_a_restriction() {
     );
 }
 
+/// A premise only the DL check finds inconsistent: the OWL 2 RL rules don't reach `:x`'s
+/// disjointness through the union, so a store with that check off commits it.
+pub(super) const INCONSISTENT: &str = ":A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . \
+     :B owl:disjointWith :D . :C owl:disjointWith :D . :x a :A , :D .";
+
 #[test]
 fn an_inconsistent_premise_entails_everything() {
     let dl = super::pipeline_with(nrese_store::DlConfig {
         consistency: nrese_store::DlConsistency::Off,
         ..nrese_store::DlConfig::default()
     });
-    super::insert(
-        &dl,
-        ":A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . :B owl:disjointWith :D . \
-         :C owl:disjointWith :D . :x a :A , :D .",
-    )
-    .expect("premise, unchecked");
+    super::insert(&dl, INCONSISTENT).expect("premise, unchecked");
     let answer = dl
         .store()
         .entails_dl(&turtle(":y a :Q ."))
@@ -149,5 +149,24 @@ fn a_conclusions_anonymous_individual_is_some_individual() {
     assert_eq!(
         entailed("owl:Thing rdfs:subClassOf :B .", conclusion),
         Entailed::Yes
+    );
+}
+
+/// Spec (OWL 2 Direct Semantics: a declaration carries no meaning, an annotation property's
+/// none either; premise and conclusion are each read on their own): a conclusion declaring
+/// `:note` an annotation property, which the premise uses as an object property, is decided by
+/// its other statement: `:x a :A`, which holds in every model of the premise, is entailed;
+/// `:x a :B` is not.
+#[test]
+fn a_conclusions_annotation_declaration_of_a_premises_property_carries_no_meaning() {
+    let premise = ":x :note :y . :x a :A .";
+    let declared = ":note a owl:AnnotationProperty .";
+    assert_eq!(
+        entailed(premise, &format!("{declared} :x a :A .")),
+        Entailed::Yes
+    );
+    assert_eq!(
+        entailed(premise, &format!("{declared} :x a :B .")),
+        Entailed::No
     );
 }
