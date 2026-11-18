@@ -1277,9 +1277,16 @@ fn a_question_naming_an_individual_the_data_doesnt_is_not_complete_when_the_onto
 /// The unions store of `tests/it/dl/model_labels.rs` with `n` individuals, the `k`-th with
 /// the value `v(k mod 4)`, a candidate limit of 4, and the model's refutations on or off.
 fn unions_store(model_labels: bool, n: usize) -> Arc<StoreService> {
+    padded_unions_store(model_labels, n, 0)
+}
+
+/// [`unions_store`], the names of the individuals with `v2` and `v3` (the gap of `?x a :U0`)
+/// longer by `pad` bytes.
+fn padded_unions_store(model_labels: bool, n: usize, pad: usize) -> Arc<StoreService> {
     let mut data = include_str!("../../tests/it/dl/model_labels_unions.ttl").to_owned();
     for k in 0..n {
-        data.push_str(&format!(":i{k} :val :v{} .\n", k % 4));
+        let pad = "x".repeat(if k % 4 < 2 { 0 } else { pad });
+        data.push_str(&format!(":i{k}{pad} :val :v{} .\n", k % 4));
     }
     let dl = crate::DlConfig {
         max_candidates: Some(4),
@@ -1399,4 +1406,55 @@ fn a_read_answered_without_model_labels_is_answered_with_them_under_every_memory
         fallback.is_some(),
         "no fallback within 16 KiB of {high} bytes"
     );
+}
+
+/// Spec: where the whole gap's selection fits but the labels' own run has no room, the read
+/// with them on refutes none by labels, and it needs no more than the read with them off. With
+/// the gap's 200 candidates named by 8000-byte IRIs, the decoded rows of a batch, not the
+/// selection's fixed size per term, set a read's need. Under each request memory limit from
+/// 16 KiB to 4 MiB (steps of a fiftieth), and in steps of 256 bytes over the 16 KiB from the
+/// least limit the read is answered under with them off (found to 256 bytes), every read the
+/// first of a store just committed, a read answered with the refutations off is answered with
+/// them on. And the case is reached: under some limit the read with them on selects the whole
+/// gap (no `capped-gap`), refutes none by labels, and is answered.
+#[test]
+fn a_read_whose_labels_have_no_room_needs_no_more_memory_than_without_them() {
+    let first = |labels: bool, limit: usize| {
+        unions_read(&padded_unions_store(labels, 400, 8000), Some(limit))
+    };
+    let (mut low, mut high) = (16usize << 10, 4usize << 20);
+    while high - low > 256 {
+        let middle = low + (high - low) / 2;
+        match first(false, middle) {
+            Ok(_) => high = middle,
+            Err(_) => low = middle,
+        }
+    }
+    let mut limits: Vec<usize> = (0..64).map(|k| high + k * 256).collect();
+    let mut limit = 16usize << 10;
+    while limit <= 4 << 20 {
+        limits.push(limit);
+        limit += limit / 50;
+    }
+    let mut reached = Vec::new();
+    for limit in limits {
+        if first(false, limit).is_ok() {
+            let with = first(true, limit);
+            assert!(
+                with.is_ok(),
+                "{limit} bytes: off answered, on {:?}",
+                with.err()
+            );
+            if let Ok((_, Some((_, detail)))) = &with
+                && !detail.paths.contains(&"capped-gap")
+                && detail.refuted_by_labels == 0
+            {
+                reached.push(limit);
+            }
+        }
+    }
+    println!(
+        "off answered from {high} bytes; the whole gap selected, none refuted by labels, answered under {reached:?}"
+    );
+    assert!(!reached.is_empty(), "no limit reaches the case");
 }
