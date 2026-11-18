@@ -1732,7 +1732,7 @@ class BelowResolution(unittest.TestCase):
         def entry(limit):
             return gate_module.load_policy(
                 f'[[emerged]]\ncase = "lab-olympics"\ndimension = "time/prepare"\nmax = {limit}\n'
-                'approved = "2026-11-14"\nby = "Johannes"\nreason = "r"\nquote = "q"\nsource = "s"\n')
+                'approved = "2026-11-14"\nby = "the maintainer"\nreason = "r"\nquote = "q"\nsource = "s"\n')
         # TOML `true` is Python's 1: no limit the owner wrote.
         for bad in ("true", "0", "-1.0", "nan", "inf"):
             with self.subTest(max=bad):
@@ -3556,7 +3556,7 @@ class AbsentSides(unittest.TestCase):
             (tree / "benches").mkdir(parents=True)
             (tree / "benches/release-tradeoffs.toml").write_text(
                 '[[absence]]\npattern = "lab-*"\nside = "base"\nreason = "its perf lab has no such mode"\n'
-                'port = "after v1.5"\napproved = "2026-11-11"\nby = "Johannes"\nquote = "q"\nsource = "s"\n',
+                'port = "after v1.5"\napproved = "2026-11-11"\nby = "the maintainer"\nquote = "q"\nsource = "s"\n',
                 encoding="utf-8")
             args = argparse.Namespace(side=[f"{s}:bin-{s}:{REVS[s]}" for s in SIDES], block=1, layout=1,
                                       seed=None, measure=None, fresh_copies=None, out=Path(tmp) / "out", batch=False)

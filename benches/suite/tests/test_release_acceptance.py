@@ -883,7 +883,11 @@ def wrong_everywhere(side, n):
     return [fixtures.record(status="wrong", expected="wrong")]
 
 
-def exception(case: str = "lab-olympics", outcome: str = "wrong", by: str = "Johannes", extra: str = QUOTE) -> str:
+# The policy file names its approver, and an entry by another name is refused.
+APPROVER = 'approver = "the maintainer"\n'
+
+
+def exception(case: str = "lab-olympics", outcome: str = "wrong", by: str = "the maintainer", extra: str = QUOTE) -> str:
     return (f'[[exception]]\ncase = "{case}"\noutcome = "{outcome}"\napproved = "2026-11-09"\nby = "{by}"\n'
             f'reason = "the fixture\'s inherited answer"\n{extra}')
 
@@ -906,7 +910,7 @@ class Authority(Scratch):
         a = self.repo.commit(policy=exception())
         done = verdict(self.repo.path, a, rounds(a, wrong_everywhere), *checks(a, self.repo.tree(a)))
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertIn("owner exception: lab-olympics wrong, approved 2026-11-09 by Johannes", done.stdout)
+        self.assertIn("owner exception: lab-olympics wrong, approved 2026-11-09 by the maintainer", done.stdout)
         for policy in (exception(case="kernel-intersect"), exception(outcome="memory-limit")):
             b = self.repo.commit(policy=policy)
             done = verdict(self.repo.path, b, rounds(b, wrong_everywhere), *checks(b, self.repo.tree(b)))
@@ -928,14 +932,24 @@ class Authority(Scratch):
         done = verdict(self.repo.path, b, rounds(b, records_of), *checks(b, self.repo.tree(b)))
         self.assertEqual(done.returncode, 0, f"SPEC the exception governs its wrong answer\n{done.stdout}")
 
-    def test_an_entry_without_johannes_s_word_is_refused(self):
+    def test_an_entry_without_the_maintainers_word_is_refused(self):
         # Spec: bar exceptions are the owner's, in the owner's recorded words: an entry
         # by anyone else, or without the quote and its source, is a policy error: NOT PASSED.
-        for policy in (exception(by="the owner"), exception(extra="")):
+        for policy in (APPROVER + exception(by="the owner"), exception(extra="")):
             a = self.repo.commit(policy=policy)
             done = verdict(self.repo.path, a, rounds(a, wrong_everywhere), *checks(a, self.repo.tree(a)))
             self.assertEqual(done.returncode, 1, f"SPEC {policy}\n{done.stdout}")
             self.assertIn("release-tradeoffs.toml", done.stdout)
+
+    def test_the_approver_is_the_policy_files_own_so_an_older_candidate_keeps_its_policy(self):
+        # Spec (18 Nov 2026): the approver's name is read with the policy at the candidate's commit and
+        # the code names nobody, so a re-verdict of a candidate from before `approver` keeps its entries.
+        old = exception(by="the owner")
+        kept = gate_module.load_policy(old)
+        self.assertEqual((len(kept.exceptions), kept.errors), (1, []), "SPEC an older file: its entries' one name")
+        self.assertTrue(gate_module.load_policy(APPROVER + old).errors, "SPEC a name other than the approver's")
+        two = gate_module.load_policy(old + exception(case="lab-x", by="the maintainer"))
+        self.assertEqual((two.exceptions, len(two.errors)), ([], 1), "SPEC two names and no approver")
 
     def test_the_policy_is_the_candidate_tree_s_never_a_report_s_or_another_tree_s(self):
         # Spec: the design's attack 4: a timed report carries what its harness tree held; the verdict reads
@@ -944,7 +958,7 @@ class Authority(Scratch):
         a = self.repo.commit(message="the candidate, without it")
         timed = rounds(a, wrong_everywhere)
         for summary in timed:
-            summary["exceptions"] = [{"case": "lab-olympics", "outcome": "wrong", "by": "Johannes"}]
+            summary["exceptions"] = [{"case": "lab-olympics", "outcome": "wrong", "by": "the maintainer"}]
         done = verdict(self.repo.path, a, timed, *checks(a, self.repo.tree(a)))
         self.assertEqual(done.returncode, 1, f"SPEC {other[:8]}'s exception doesn't cover {a[:8]}\n{done.stdout}")
 
@@ -978,7 +992,7 @@ def refused(*sides):
     return records_of
 
 
-def absence(side: str = "main", scope: str = 'cases = ["lab-olympics"]', by: str = "Johannes",
+def absence(side: str = "main", scope: str = 'cases = ["lab-olympics"]', by: str = "the maintainer",
             extra: str = QUOTE, side_toml: str | None = None) -> str:
     """An [[absence]] entry; `side_toml`: its side's TOML value as written (a malformed one)."""
     side_toml = side_toml if side_toml is not None else f'"{side}"'
@@ -1015,7 +1029,7 @@ class DeclaredAbsence(Scratch):
         self.assertIn("base: 1 compared, 0 absent by product, 0 absent by the owner's decision", done.stdout)
         self.assertIn("main: 0 compared, 1 absent by product, 0 absent by the owner's decision", done.stdout)
 
-    def test_a_harness_gap_blocks_unless_johannes_s_entry_names_its_case_and_side(self):
+    def test_a_harness_gap_blocks_unless_the_maintainers_entry_names_its_case_and_side(self):
         # Spec: decisions 1b and 2: main refuses the case's arguments; with no entry the hypothesis stays
         # not compared and blocks, as before; the owner's [[absence]] entry naming the case (or a pattern
         # matching it) and main lists it "not compared by the owner's decision" and passes; an entry for
@@ -1030,7 +1044,7 @@ class DeclaredAbsence(Scratch):
             done = verdict(self.repo.path, b, self.rounds(b, refused("main"), catalog), *checks(b, self.repo.tree(b)))
             self.assertEqual(done.returncode, 0, f"SPEC {scope}: the owner's decision\n{done.stdout}{done.stderr}")
             self.assertIn("- not compared by the owner's decision: lab-olympics against main: its perf lab has no "
-                          "commits mode (port: the commits port, after v1.5; approved 2026-11-11 by Johannes",
+                          "commits mode (port: the commits port, after v1.5; approved 2026-11-11 by the maintainer",
                           done.stdout)
             self.assertNotIn("**not compared**", done.stdout)
             self.assertIn("main: 0 compared, 0 absent by product, 1 absent by the owner's decision", done.stdout)
@@ -1049,7 +1063,7 @@ class DeclaredAbsence(Scratch):
         a = self.repo.commit()
         done = verdict(self.repo.path, a, self.rounds(a, refused(), catalog), *checks(a, self.repo.tree(a)))
         self.assertEqual(done.returncode, 0, f"the rounds pass without a policy\n{done.stdout}{done.stderr}")
-        for policy in (absence(by="the owner"), absence(extra=""), absence().replace('port = "the commits port, '
+        for policy in (APPROVER + absence(by="the owner"), absence(extra=""), absence().replace('port = "the commits port, '
                                                                                      'after v1.5"\n', ""),
                        absence(scope='cases = ["lab-olympics"]\npattern = "lab-*"'),
                        *(absence(side_toml=v) for v in ("[]", "{}", "1", "true", '"cand"'))):
@@ -1111,7 +1125,7 @@ class Tradeoffs(Scratch):
 
     def entry(self, **changes) -> str:
         fields = {"case": "lab-olympics", "dimension": "time/q06", "max_ratio": 1.12, "approved": "2026-10-20",
-                  "by": "Johannes", "reason": "text index: 8 % slower filters for 2.8x faster triangles",
+                  "by": "the maintainer", "reason": "text index: 8 % slower filters for 2.8x faster triangles",
                   "quote": "accept the filters' loss for the triangles", "source": "OWL-RS master thread, 20 Oct 2026",
                   "pays_with": {"case": "kernel-intersect", "dimension": "time/triangles"}, **changes}
         lines = ["[[tradeoff]]"]
@@ -1174,8 +1188,16 @@ class Tradeoffs(Scratch):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("accepted trade-off", done.stdout)
         for entry in (self.entry(max_ratio=1.05), self.entry(pays_with={"case": "lab-olympics", "dimension": "time/q01"}),
-                      self.entry(dimension="time/q01"), self.entry(by="the owner")):
+                      self.entry(dimension="time/q01"), APPROVER + self.entry(by="the owner")):
             self.assertEqual(self.verdict(entry).returncode, 1, entry)
+
+    def test_the_verdict_names_the_approver_it_read_from_the_candidates_policy(self):
+        # Spec: a changed approver can't pass unseen: the verdict's report names the approver the
+        # candidate's policy file gives, whichever name that is.
+        for name in ("the maintainer", "a new approver"):
+            with self.subTest(name):
+                done = self.verdict(f'approver = "{name}"\n' + self.entry(by=name))
+                self.assertIn(f"approver {name!r};", done.stdout)
 
     def test_the_trees_policy_names_gated_rows_and_a_malformed_entry_is_refused(self):
         # A malformed file makes every verdict NOT PASSED; a trade-off whose loss or win names no

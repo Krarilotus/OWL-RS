@@ -412,8 +412,8 @@ arises, the same for every side:
   the checks host's powersave with energy preference balance_performance (a shared host).
 
 **Trade-offs and exceptions.** [release-tradeoffs.toml](release-tradeoffs.toml) is the only thing
-that accepts what the bar forbids, and only the project's owner adds to it. Each entry carries the approval:
-the date, `by` (the gate accepts the owner's name alone), the reason, the approval's words verbatim
+that accepts what the bar forbids, and only its `approver` adds to it. Each entry carries the approval:
+the date, `by` (the file's `approver`; in a file from before that key, its entries' one name), the reason, the approval's words verbatim
 and their source. A *trade-off*
 accepts a loss: it names a case, a dimension, optionally the baseline, the largest ratio the
 loss's interval may reach, and the win that pays for it, which must show as *better* in the same
