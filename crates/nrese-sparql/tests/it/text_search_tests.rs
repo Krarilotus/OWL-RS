@@ -783,3 +783,23 @@ fn a_service_beside_one_joined_input_keeps_its_groups() {
     let options = QueryOptions::default();
     assert_eq!(count(&alpha_engine(), &query, &options), 0, "{query:?}");
 }
+
+/// Spec: a search whose predicates a `VALUES` binds before a `LATERAL` is read within its
+/// group as a written one is: the `bds:` option in the other group matches nothing, and the
+/// Jena call without a literal is read as the one statement stored under `text:query`.
+#[test]
+fn a_search_whose_predicates_a_values_binds_keeps_its_groups() {
+    let engine = engine_of(
+        "@prefix ex: <http://example.com/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:a rdfs:label \"alpha one\" . ex:b rdfs:label \"alpha two\" .
+         ex:t <http://jena.apache.org/text#query> ex:o .",
+    );
+    let option = "SELECT ?o ?r { VALUES (?p ?q) { (bds:search bds:relevance) } \
+                  LATERAL { { ?o ?p \"alpha\" } VALUES ?x { 1 } { ?o ?q ?r } } }";
+    answers_as_written(&engine, "an option apart", option, &[]);
+    let jena = "SELECT ?s ?t { VALUES ?p { text:query } \
+                LATERAL { { ?s ?p \"alpha\" } VALUES ?x { 1 } { ?t ?p [] } } }";
+    let want: &[&[&str]] = &[&["a", "t"], &["b", "t"]];
+    answers_as_written(&engine, "a Jena call apart", jena, want);
+}
