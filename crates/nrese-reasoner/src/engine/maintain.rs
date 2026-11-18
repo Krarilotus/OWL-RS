@@ -332,7 +332,7 @@ pub fn maintain_with(
             &mut unstorable,
         )?);
     }
-    let mut unkept = false;
+    let unkept: bool;
     let update = {
         let base = EngineBase::new(tx, &program.axioms);
         // The change's own probes of the base (a deleted fact still asserted elsewhere, a
