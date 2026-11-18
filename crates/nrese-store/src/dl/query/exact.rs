@@ -305,7 +305,7 @@ pub(super) fn refuted_by_labels(
         return none();
     };
     let mut refuted = nrese_exec::ChargedVec::new(memory.clone());
-    if refuted.resize(n, false).is_err() {
+    if memory.refused() || refuted.resize(n, false).is_err() {
         return none();
     }
     for (r, atom) in atoms.iter().enumerate() {
