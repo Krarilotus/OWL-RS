@@ -61,11 +61,13 @@ pub async fn execute_query_in(
         prepared.set_origin(origin);
     }
     // The query form decides which formats exist; an EXPLAIN is always JSON.
-    if explain == Explain::No {
-        let (solutions, graph) = negotiate_formats(prepared.kind(), accept)?;
+    let media_type = if explain == Explain::No {
+        let (solutions, graph, media_type) = negotiate_formats(prepared.kind(), accept)?;
         prepared.set_formats(solutions, graph);
-    }
-    let media_type = prepared.media_type();
+        media_type
+    } else {
+        prepared.media_type()
+    };
     let store = state.store();
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
@@ -129,8 +131,11 @@ pub async fn execute_query_in(
     .await?;
     // The run decided the announcement on what its reader reads before its first byte, which
     // `stream_blocking` waits for: the media type is the run's (its place among the headers kept).
-    let media_type = HeaderValue::from_static(announced.media_type());
     if explain == Explain::No {
+        let announcement = announced.media_type();
+        let parameters = announcement.find(';').map_or("", |i| &announcement[i..]);
+        let media_type = HeaderValue::from_str(&format!("{media_type}{parameters}"))
+            .map_err(|error| ApiError::internal(error.to_string()))?;
         response.headers_mut().insert(CONTENT_TYPE, media_type);
     }
     let reported = status.lock().unwrap_or_else(|p| p.into_inner()).take();
@@ -345,12 +350,24 @@ pub async fn execute_update(
 fn negotiate_formats(
     kind: QueryResultKind,
     accept: Option<&str>,
-) -> Result<(SolutionsResultFormat, GraphResultFormat), ApiError> {
+) -> Result<(SolutionsResultFormat, GraphResultFormat, &'static str), ApiError> {
     let (solutions, graph) = (SolutionsResultFormat::Json, GraphResultFormat::NTriples);
     Ok(match kind {
-        QueryResultKind::Solutions => (negotiated(accept, SOLUTIONS)?, graph),
-        QueryResultKind::Boolean => (negotiated(accept, BOOLEAN)?, graph),
-        QueryResultKind::Graph => (solutions, negotiated(accept, GRAPHS)?),
+        QueryResultKind::Solutions | QueryResultKind::Boolean => {
+            let (_, format) = negotiated(
+                accept,
+                if kind == QueryResultKind::Boolean {
+                    BOOLEAN
+                } else {
+                    SOLUTIONS
+                },
+            )?;
+            (format, graph, format.media_type())
+        }
+        QueryResultKind::Graph => {
+            let (media_type, format) = negotiated(accept, GRAPHS)?;
+            (solutions, format, media_type)
+        }
     })
 }
 
@@ -378,7 +395,7 @@ mod tests {
 
     #[test]
     fn the_query_form_decides_which_formats_are_negotiated() {
-        let formats = |kind, accept| negotiate_formats(kind, accept).ok();
+        let formats = |kind, accept| negotiate_formats(kind, accept).ok().map(|(s, g, _)| (s, g));
         assert_eq!(
             formats(
                 QueryResultKind::Solutions,

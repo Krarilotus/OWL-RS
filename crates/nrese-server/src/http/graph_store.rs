@@ -25,7 +25,7 @@ pub async fn get_graph(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let access = guard::graph_read_access(&state, &authenticated).await?;
-    let request = graph_request(&state, &raw_query, &headers, &access)?;
+    let (media_type, request) = graph_request(&state, &raw_query, &headers, &access)?;
     let store = state.store();
     let scope = access.read_scope();
     let cancellation = nrese_store::CancellationToken::new();
@@ -33,7 +33,7 @@ pub async fn get_graph(
     stream_blocking(
         Pace::stalled_after(state.policy().timeouts.graph_read),
         cancellation,
-        request.format.media_type(),
+        media_type,
         "graph read exceeded policy timeout",
         move |out| {
             let read = nrese_store::ReadContext::new(scope).cancelled_by(token);
@@ -58,7 +58,7 @@ pub async fn head_graph(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let access = guard::graph_read_access(&state, &authenticated).await?;
-    let request = graph_request(&state, &raw_query, &headers, &access)?;
+    let (media_type, request) = graph_request(&state, &raw_query, &headers, &access)?;
     let store = state.store();
     let read = nrese_store::ReadContext::new(access.read_scope());
     let target = request.target;
@@ -74,10 +74,9 @@ pub async fn head_graph(
         return Err(ApiError::not_found("the graph does not exist"));
     }
     let mut response = StatusCode::OK.into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static(request.format.media_type()),
-    );
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(media_type));
     Ok(response)
 }
 
@@ -87,15 +86,15 @@ fn graph_request(
     raw_query: &RawQuery,
     headers: &HeaderMap,
     access: &AccessView,
-) -> Result<GraphReadRequest, ApiError> {
+) -> Result<(&'static str, GraphReadRequest), ApiError> {
     state.ensure_serving()?;
     let target = parse_graph_target(raw_query)?;
     // A graph the requester may not read is absent.
     if !access.can_read(&guard::target_graph(&target)?) {
         return Err(ApiError::not_found("the graph does not exist"));
     }
-    let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
-    Ok(GraphReadRequest { target, format })
+    let (media_type, format) = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
+    Ok((media_type, GraphReadRequest { target, format }))
 }
 
 pub async fn put_graph(

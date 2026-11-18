@@ -187,6 +187,7 @@ fn absences() -> Vec<(&'static str, Mode, Absent)> {
         (names::AI_OPENROUTER_API_KEY, "k"),
     ];
     vec![
+        ("server.public_url", ANY, Holds(|c| c.public_url.is_none())),
         (
             "store.import_directory",
             ANY,

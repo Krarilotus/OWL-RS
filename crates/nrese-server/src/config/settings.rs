@@ -150,6 +150,13 @@ pub const SETTINGS: &[Setting] = &[
          needs authentication, replacement-grade also on-disk storage and problem+json parse \
          errors.",
     ),
+    setting(
+        "server.public_url",
+        names::PUBLIC_URL,
+        Text,
+        Unset::Nothing("unset, use the request host and forwarded headers"),
+        "Externally reachable server URL, including a reverse proxy path prefix.",
+    ),
     // [store]
     setting(
         "store.mode",
@@ -1089,7 +1096,7 @@ fn walk(
 /// A file value as the environment would hold it.
 fn file_value(setting: &Setting, key: &str, value: &toml::Value) -> Result<String> {
     use toml::Value as V;
-    let wrong = |expected: &str| anyhow::anyhow!("'{key}' must be {expected}, not {value}");
+    let wrong = |expected: &str| anyhow::anyhow!("'{key}' must be {expected}");
     Ok(match (setting.kind, value) {
         (Text | Choice(_), V::String(text)) => text.clone(),
         (Text | Choice(_), _) => return Err(wrong("text")),

@@ -31,6 +31,7 @@ fn opening_repositories_and_system_stores_preserves_the_startup_policy() {
     let _restore = Restore(process_limit());
     let mut config = ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
+        public_url: None,
         deployment_posture: DeploymentPosture::OpenWorkbench,
         store: StoreConfig::in_memory(),
         reasoner: Default::default(),

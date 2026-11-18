@@ -375,7 +375,9 @@ async fn run() -> Result<()> {
         ai,
         config.deployment_posture,
     )?;
-    let state = state.with_replication(config.replication.clone());
+    let state = state
+        .with_replication(config.replication.clone())
+        .with_public_url(config.public_url.clone());
     // Held for as long as the server serves; stopped when it ends.
     let follower = if replica {
         let follower = nrese_server::replication::follow(state.clone())?;
