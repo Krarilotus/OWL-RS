@@ -268,10 +268,12 @@ leave something out.
   `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
   annotation property's domain, range, super-property or sub-property or the empty list, or give
   the individual its own IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
-- On a store in quarantine, a delete of a schema statement that the remaining statements derive
-  again can be refused as introducing the violation that was already there, though a full
-  rebuild finds the same violation after it (under `owl2-rl`, for one). The delete changes
-  nothing, and the store stays as it was. Repair the existing violation first.
+- On a store in quarantine, a commit can be refused as introducing a violation that was
+  already there, though a full rebuild finds the same violation after it (under `owl2-rl`, for
+  one): a commit that deletes a statement the remaining statements still entail, that deletes a
+  schema statement they derive again, or that edits the list of an axiom together with other
+  statements. The commit changes nothing, and the store stays as it was. Repair the existing
+  violation first; the commit is then accepted.
 - Labels and notes on a store with `owl:sameAs` read as `unsound`. Under `owl2-dl`, and under `owl2-ql`
   and `owl2-rl` where the QL rewriting answers, a query that reads an annotation property
   (`rdfs:label`, `rdfs:comment`, or one the data declares) or any predicate (a variable
