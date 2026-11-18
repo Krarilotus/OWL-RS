@@ -13,9 +13,10 @@ use crate::delta::{MemoryBase, Rules, update_until};
 use crate::eval::{OperationStop, Poller, Stopped as ReadStopped};
 use crate::graph_sets::{Change, Limits, Previous, Sets, UNWATCHED};
 use crate::ir::{Triple, parse_rules};
+use crate::lists::ListVocabulary;
 use crate::rulesets::Ruleset;
 use crate::vocabulary::LocalVocabulary;
-use crate::witness::{FirstWork, Site};
+use crate::witness::{FirstWork, Site, get};
 
 /// Four poll intervals of units: a pass that goes on after its stop passes over about three.
 fn n() -> usize {
@@ -148,6 +149,62 @@ fn a_deletion_s_dependency_keys_end_at_its_stop() {
         after <= 1,
         "{after} partner reads started after the stop, of about {}",
         2 * n
+    );
+    assert!(interrupted, "a stopped update is interrupted");
+}
+
+/// Spec: an overdelete pass that meets a list fact extracts the list rules of the state now
+/// and, once, of the state it started from; a stop asked during the first extraction ends the
+/// update before the second. A deleted fact of a property chain's list under OWL 2 RL, the stop
+/// firing at its first ask after an extraction started: one extraction starts in all. Without a
+/// stop check between them, the second whole extraction ran before the stop was seen.
+#[test]
+fn a_deletion_s_list_rules_end_at_its_stop() {
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let compiled = Rules {
+        rules: &rules,
+        lists: Some(&lists),
+        schema: &schema,
+        equality: crate::representatives::same_as(&rules, schema.same_as()),
+    };
+    let mut before = load(
+        &mut vocabulary,
+        "ex:uncle owl:propertyChainAxiom ex:l1
+         ex:l1 rdf:first ex:parent
+         ex:l1 rdf:rest ex:l2
+         ex:l2 rdf:first ex:brother
+         ex:l2 rdf:rest rdf:nil
+         ex:x ex:parent ex:y
+         ex:y ex:brother ex:z",
+    );
+    before.sort_unstable();
+    let deleted = load(&mut vocabulary, "ex:l2 rdf:first ex:brother");
+    let mut asserted: Vec<Triple> = before
+        .iter()
+        .copied()
+        .filter(|t| !deleted.contains(t))
+        .collect();
+    asserted.sort_unstable();
+    let mut stack: Vec<Triple> = batch::materialise(&before, &rules, Some(&lists), &schema)
+        .derived
+        .into_iter()
+        .filter(|t| asserted.binary_search(t).is_err())
+        .collect();
+    stack.sort_unstable();
+    let base = MemoryBase::new(&asserted, &stack);
+    let (started, interrupted) = one_thread().install(|| {
+        let first = FirstWork::new(Site::ListRules);
+        let stop = || first.ask();
+        let start = get(Site::ListRules);
+        let result = update_until(&base, &[], &deleted, compiled, None, &stop);
+        (get(Site::ListRules) - start, result.is_err())
+    });
+    assert_eq!(
+        started, 1,
+        "list-rule extractions started, the stop asked during the first"
     );
     assert!(interrupted, "a stopped update is interrupted");
 }

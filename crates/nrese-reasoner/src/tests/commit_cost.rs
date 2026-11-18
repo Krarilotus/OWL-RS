@@ -16,20 +16,37 @@ use crate::rulesets::Ruleset;
 use crate::vocabulary::LocalVocabulary;
 use crate::witness::{Site, get};
 
+/// The `owl:sameAs` facts of a [`chain`].
+#[derive(Clone, Copy, Debug)]
+enum Equal {
+    /// None.
+    Nothing,
+    /// Two individuals, one of them a member of the chain's first class.
+    Individuals,
+    /// `ex:D` and `ex:E`, the class under the chain's second in `ex:D`'s place.
+    Classes,
+}
+
 /// A subclass chain of `classes` classes under OWL 2 RL, with `ex:a` typed by the first
-/// class and by `ex:D`, whose superclass is the chain's second: deleting `ex:a`'s first
-/// type leaves its type of the second class derived without the first.
-fn chain(vocabulary: &mut LocalVocabulary, classes: usize, same_as: bool) -> Vec<Triple> {
+/// class and by `ex:D`, under the chain's second class (by its own superclass, or with
+/// [`Equal::Classes`] through its equality with `ex:E` and `ex:E`'s): deleting `ex:a`'s
+/// first type leaves its type of the second class derived without the first.
+fn chain(vocabulary: &mut LocalVocabulary, classes: usize, equal: Equal) -> Vec<Triple> {
     let mut text: Vec<String> = (0..classes)
         .map(|i| format!("ex:C{i} rdfs:subClassOf ex:C{}", i + 1))
         .collect();
-    text.push("ex:D rdfs:subClassOf ex:C1".to_owned());
     text.push("ex:a rdf:type ex:C0".to_owned());
     text.push("ex:a rdf:type ex:D".to_owned());
-    if same_as {
-        text.push("ex:b owl:sameAs ex:c".to_owned());
-        text.push("ex:b rdf:type ex:C0".to_owned());
-    }
+    let place: &[&str] = match equal {
+        Equal::Nothing => &["ex:D rdfs:subClassOf ex:C1"],
+        Equal::Individuals => &[
+            "ex:D rdfs:subClassOf ex:C1",
+            "ex:b owl:sameAs ex:c",
+            "ex:b rdf:type ex:C0",
+        ],
+        Equal::Classes => &["ex:D owl:sameAs ex:E", "ex:E rdfs:subClassOf ex:C1"],
+    };
+    text.extend(place.iter().map(|line| (*line).to_owned()));
     let mut asserted = load(vocabulary, &text.join("\n"));
     asserted.sort_unstable();
     asserted
@@ -104,7 +121,7 @@ fn commit(
 fn an_insert_reads_nothing_that_grows_with_the_schema() {
     for classes in [10, 1000] {
         let mut vocabulary = LocalVocabulary::default();
-        let asserted = chain(&mut vocabulary, classes, false);
+        let asserted = chain(&mut vocabulary, classes, Equal::Nothing);
         let inserted = load(&mut vocabulary, "ex:w ex:value ex:v");
         let (maintained, expected, reads) = commit(&mut vocabulary, &asserted, &inserted, &[]);
         assert_eq!(maintained, expected, "{classes} classes: rematerialised");
@@ -118,7 +135,7 @@ fn an_insert_reads_nothing_that_grows_with_the_schema() {
 fn a_delete_without_candidates_reads_nothing_that_grows_with_the_schema() {
     for classes in [10, 1000] {
         let mut vocabulary = LocalVocabulary::default();
-        let mut asserted = chain(&mut vocabulary, classes, false);
+        let mut asserted = chain(&mut vocabulary, classes, Equal::Nothing);
         let deleted = load(&mut vocabulary, "ex:w ex:value ex:v");
         asserted.extend(deleted.iter().copied());
         asserted.sort_unstable();
@@ -132,21 +149,19 @@ fn a_delete_without_candidates_reads_nothing_that_grows_with_the_schema() {
 }
 
 /// A delete with a candidate that a non-recursive rule still derives keeps it, with or
-/// without `owl:sameAs` facts in the store: the answer is a rematerialisation's, and the
-/// recursion analysis was built for it.
+/// without `owl:sameAs` facts in the store, between individuals or between classes (where
+/// the kept derivation runs through the equality): the answer is a rematerialisation's, and
+/// the recursion analysis was built for it.
 #[test]
 fn a_delete_with_a_candidate_keeps_what_remains_derived() {
-    for same_as in [false, true] {
+    for equal in [Equal::Nothing, Equal::Individuals, Equal::Classes] {
         let mut vocabulary = LocalVocabulary::default();
-        let asserted = chain(&mut vocabulary, 10, same_as);
+        let asserted = chain(&mut vocabulary, 10, equal);
         let deleted = load(&mut vocabulary, "ex:a rdf:type ex:C0");
         let kept = load(&mut vocabulary, "ex:a rdf:type ex:C1")[0];
         let (maintained, expected, reads) = commit(&mut vocabulary, &asserted, &[], &deleted);
         assert!(expected.binary_search(&kept).is_ok(), "rematerialised");
-        assert_eq!(maintained, expected, "with owl:sameAs: {same_as}");
-        assert!(
-            reads > 0,
-            "with owl:sameAs: {same_as}: the analysis a candidate asks for"
-        );
+        assert_eq!(maintained, expected, "{equal:?}");
+        assert!(reads > 0, "{equal:?}: the analysis a candidate asks for");
     }
 }

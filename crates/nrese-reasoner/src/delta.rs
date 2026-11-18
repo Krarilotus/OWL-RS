@@ -226,6 +226,8 @@ impl Rules<'_> {
 
     /// The list rules (both kinds) instantiated over `source`.
     fn list_rules<S: Source + ?Sized>(&self, source: &S) -> Vec<Rule> {
+        #[cfg(test)]
+        crate::witness::add(crate::witness::Site::ListRules, 1);
         self.lists
             .map(|vocabulary| instantiate(vocabulary, &AllFacts(source)).0)
             .unwrap_or_default()

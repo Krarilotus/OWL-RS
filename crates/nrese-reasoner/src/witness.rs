@@ -18,6 +18,8 @@ pub(crate) enum Site {
     JobConstruction,
     /// `owl:sameAs` partner reads started for a dependency key (`same_as_partners`).
     PartnerRead,
+    /// List-rule extractions started for an overdelete pass (`Rules::list_rules`).
+    ListRules,
     /// Morsel tasks started (`run_morsels`).
     MorselTask,
     /// Facts an expanded listing's fold takes (`batch::list`).
@@ -31,7 +33,7 @@ pub(crate) enum Site {
 }
 
 thread_local! {
-    static COUNTS: [Cell<u64>; 9] = const { [const { Cell::new(0) }; 9] };
+    static COUNTS: [Cell<u64>; 10] = const { [const { Cell::new(0) }; 10] };
 }
 
 /// Counts `n` units at `site` on this thread.
