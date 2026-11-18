@@ -411,6 +411,12 @@ impl Context<'_> {
     /// What this context's searches rank and select among: decided once per search, before
     /// its scan, from the query's [`crate::SearchScope`].
     pub(super) fn search_in(&self) -> NativeResult<SearchIn> {
+        if matches!(self.merge_set, Some(GraphSet::Scoped(_))) {
+            return Err(crate::QueryEvaluationError::ScopedInferenceUnavailable(
+                "store.search_scope",
+            )
+            .into());
+        }
         match self.search_scope {
             crate::SearchScope::Global => Ok(SearchIn::Global),
             crate::SearchScope::Reader => self.text_scope().map(SearchIn::Reader),
@@ -450,6 +456,10 @@ impl Context<'_> {
         };
         let plain = |scope| Ok(Some((None, scope)));
         match (&*self.graph.borrow(), &self.merge_set) {
+            (_, Some(GraphSet::Scoped(_))) => Err(
+                crate::QueryEvaluationError::ScopedInferenceUnavailable("store.search_scope")
+                    .into(),
+            ),
             (GraphScope::Default, _) => plain(TextScope::Graphs(GraphSelector::Exact(
                 TermId::DEFAULT_GRAPH,
             ))),
@@ -458,9 +468,7 @@ impl Context<'_> {
                 Some(named) => copy(named).map(Some),
                 None => plain(TextScope::Graphs(GraphSelector::AnyNamed)),
             },
-            (GraphScope::Union, Some(GraphSet::Only(graphs) | GraphSet::Scoped(graphs))) => {
-                copy(graphs).map(Some)
-            }
+            (GraphScope::Union, Some(GraphSet::Only(graphs))) => copy(graphs).map(Some),
             (GraphScope::Union, Some(GraphSet::AllBut(left_out))) => all_but(left_out).map(Some),
             (GraphScope::Union, None) => plain(TextScope::Graphs(GraphSelector::Any)),
             (GraphScope::Missing, _) => Ok(None),

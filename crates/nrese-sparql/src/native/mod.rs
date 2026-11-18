@@ -750,8 +750,7 @@ fn native_pattern<'q>(
     options: &QueryOptions,
     ctx: &Context<'_>,
 ) -> Result<NativePattern<'q>, QueryEvaluationError> {
-    let (written, form) = pattern_and_form(query);
-    ctx.check_scoped_operators(written)?;
+    let (_, form) = pattern_and_form(query);
     let mut rewrites = Vec::new();
     let (pattern, ql_report) = semantic_pattern(&ctx.snapshot, query, options, &mut rewrites)?;
     let template_supported = match &form {
@@ -813,9 +812,7 @@ fn native_pattern<'q>(
     if let Some(refused) = ctx.aliases_refused.get() {
         return Err(QueryEvaluationError::MemoryLimit(refused));
     }
-    if matches!(pattern, Cow::Owned(_)) {
-        ctx.check_scoped_operators(&pattern)?;
-    }
+    ctx.check_scoped_operators(&pattern)?;
     Ok((pattern, form, rewrites, ql_report))
 }
 
