@@ -697,6 +697,42 @@ impl<'a> Reader<'a> {
         !given_twice.is_empty()
     }
 
+    /// Whether the blank node `node` gives more than one of `forms`, the properties that each
+    /// make it one structure (*Mapping to RDF* Tables 12 and 13: a node has one form): then it
+    /// is no structure, as with a structure property given twice ([`Self::twice`]). Reported,
+    /// and every statement of those properties taken.
+    fn forms(&mut self, node: Term, forms: &[Option<Term>]) -> bool {
+        let given: Vec<Term> = (forms.iter().flatten().copied())
+            .filter(|&p| !self.objects(node, Some(p)).is_empty())
+            .collect();
+        if given.len() < 2 {
+            return false;
+        }
+        for p in given {
+            for o in self.objects(node, Some(p)) {
+                self.collect([node, p, o]);
+            }
+        }
+        self.report(Diagnostic::Malformed {
+            node,
+            what: "a node with more than one form",
+        });
+        true
+    }
+
+    /// `term` as an individual (*Mapping to RDF* Tables 13 and 16: `*:x` or `_:x`); a literal
+    /// there is malformed. Every place an individual is read takes it here.
+    fn individual(&mut self, term: Term) -> Option<Term> {
+        if self.kind(term) == TermKind::Literal {
+            self.report(Diagnostic::Malformed {
+                node: term,
+                what: "a literal where an individual belongs",
+            });
+            return None;
+        }
+        Some(term)
+    }
+
     fn has_type(&self, subject: Term, class: Option<Term>) -> bool {
         class.is_some_and(|class| self.objects(subject, self.v.rdf_type).contains(&class))
     }
@@ -967,6 +1003,11 @@ impl<'a> Reader<'a> {
         if self.twice(node) {
             return None;
         }
+        let mut forms = set_operators.to_vec();
+        forms.extend([on_properties, on_property]);
+        if self.forms(node, &forms) {
+            return None;
+        }
         for operator in set_operators {
             if let Some(operand) = self.one(node, operator) {
                 return self.set_operator(operator?, operand);
@@ -999,7 +1040,10 @@ impl<'a> Reader<'a> {
         }
         let members = self.list(operand)?;
         if is(operator, v.owl_one_of) {
-            return Some(self.intern_class(ClassExpr::OneOf(canonical(members))));
+            let individuals = (members.iter())
+                .map(|&m| self.individual(m))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(self.intern_class(ClassExpr::OneOf(canonical(individuals))));
         }
         let operands = canonical(self.classes(&members)?);
         let union = is(operator, v.owl_union_of);
@@ -1085,6 +1129,21 @@ impl<'a> Reader<'a> {
     /// A restriction on `property`.
     fn restriction(&mut self, node: Term, property: Term) -> Option<ExprId> {
         let v = self.v;
+        let fillers = [
+            v.owl_some_values_from,
+            v.owl_all_values_from,
+            v.owl_has_value,
+            v.owl_has_self,
+            v.owl_min_cardinality,
+            v.owl_min_qualified,
+            v.owl_max_cardinality,
+            v.owl_max_qualified,
+            v.owl_cardinality,
+            v.owl_qualified,
+        ];
+        if self.forms(node, &fillers) {
+            return None;
+        }
         let data = self.kind(property) == TermKind::Iri
             && (self.is_data_property(property)
                 || (!self.declared_as(property, EntityKind::ObjectProperty)
@@ -1166,6 +1225,7 @@ impl<'a> Reader<'a> {
                 return Some(self.intern_class(ClassExpr::All(property, class)));
             }
             if let Some(value) = self.one(node, v.owl_has_value) {
+                let value = self.individual(value)?;
                 return Some(self.intern_class(ClassExpr::HasValue(property, value)));
             }
             if let Some(flag) = self.one(node, v.owl_has_self) {
@@ -1250,6 +1310,16 @@ impl<'a> Reader<'a> {
             }
         }
         if self.twice(node) {
+            return None;
+        }
+        let forms = [
+            v.owl_intersection_of,
+            v.owl_union_of,
+            v.owl_datatype_complement_of,
+            v.owl_one_of,
+            v.owl_on_datatype,
+        ];
+        if self.forms(node, &forms) {
             return None;
         }
         let ranges = |reader: &mut Self, list: Term| -> Option<Vec<RangeId>> {
@@ -1457,8 +1527,12 @@ impl<'a> Reader<'a> {
             let Some(list) = list else {
                 return self.report(without("an n-ary axiom without its members"));
             };
-            if let Some(members) = self.list(list) {
-                self.disjoint(Disjoint::Individuals(members), triple);
+            if let Some(members) = self.list(list)
+                && let Some(individuals) = (members.iter())
+                    .map(|&m| self.individual(m))
+                    .collect::<Option<Vec<_>>>()
+            {
+                self.disjoint(Disjoint::Individuals(individuals), triple);
             }
         } else if is(class, v.owl_negative_property_assertion) {
             self.collect(triple);
@@ -1472,12 +1546,18 @@ impl<'a> Reader<'a> {
                 });
                 return;
             };
+            let Some(source) = self.individual(source) else {
+                return;
+            };
             if let Some(value) = self.one(node, v.owl_target_value) {
                 self.add(
                     Axiom::NegativeDataPropertyAssertion(property, source, value),
                     triple,
                 );
             } else if let Some(target) = self.one(node, v.owl_target_individual) {
+                let Some(target) = self.individual(target) else {
+                    return;
+                };
                 let axiom = match self.object_property(property) {
                     Some(ObjProp::Named(p)) => {
                         Axiom::NegativeObjectPropertyAssertion(p, source, target)
@@ -1492,8 +1572,25 @@ impl<'a> Reader<'a> {
                 self.report(without("a negative property assertion without its target"));
             }
         } else if is(class, v.owl_axiom) || is(class, v.owl_annotation) {
-            // An annotated axiom's reification (the axiom itself is stated as well), or an
-            // annotation's annotation: no logical meaning.
+            // An annotated axiom's reification, or an annotation's annotation: no logical
+            // meaning. It annotates its main triple, which the graph states (Table 17); one
+            // whose main triple is absent annotates nothing.
+            let main = [
+                self.single(node, v.owl_annotated_source),
+                self.single(node, v.owl_annotated_property),
+                self.single(node, v.owl_annotated_target),
+            ];
+            let stated = match main {
+                [Some(s), Some(p), Some(o)] => (self.by_subject.get(&s))
+                    .is_some_and(|pairs| pairs.iter().any(|&(q, x, _)| q == p && x == o)),
+                _ => false,
+            };
+            if !stated {
+                self.report(Diagnostic::Malformed {
+                    node,
+                    what: "a reified axiom or annotation whose main triple is absent",
+                });
+            }
             for (p, o, _) in self.by_subject.get(&node).cloned().unwrap_or_default() {
                 self.structural.insert([node, p, o]);
                 self.annotations += 1;
@@ -1539,7 +1636,16 @@ impl<'a> Reader<'a> {
                 && let Some(classes) = self.classes(&members)
                 && let Some(class) = class
             {
-                self.add(Axiom::DisjointUnion(class, canonical(classes)), triple);
+                // Two members at least (Table 16, `n ≥ 2`): of none the class would be read
+                // empty, of one equal to it.
+                if members.len() < 2 {
+                    self.report(Diagnostic::Malformed {
+                        node: s,
+                        what: "a disjoint union of fewer than two classes",
+                    });
+                } else {
+                    self.add(Axiom::DisjointUnion(class, canonical(classes)), triple);
+                }
             }
         } else if is(p, v.rdfs_sub_property_of) {
             let subject = self.annotation_property(s);
@@ -1650,9 +1756,13 @@ impl<'a> Reader<'a> {
                 );
             }
         } else if is(p, v.owl_same_as) {
-            self.add(Axiom::SameIndividual(canonical(vec![s, o])), triple);
+            if let Some(o) = self.individual(o) {
+                self.add(Axiom::SameIndividual(canonical(vec![s, o])), triple);
+            }
         } else if is(p, v.owl_different_from) {
-            self.disjoint(Disjoint::Individuals(vec![s, o]), triple);
+            if let Some(o) = self.individual(o) {
+                self.disjoint(Disjoint::Individuals(vec![s, o]), triple);
+            }
         } else if self.kind(s) == TermKind::Iri
             && [
                 v.owl_intersection_of,
