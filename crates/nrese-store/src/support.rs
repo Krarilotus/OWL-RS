@@ -2013,6 +2013,9 @@ impl Reading {
         if self.compilation.compact {
             return Err(ScopedInferenceUnavailable("reasoner.equality").into());
         }
+        if self.compilation.hide_unnamed_classes {
+            return Err(ScopedInferenceUnavailable("reasoner.unnamed_classes").into());
+        }
         if generation.rules.is_none() {
             return Err(ScopedInferenceUnavailable("reasoner.mode").into());
         }

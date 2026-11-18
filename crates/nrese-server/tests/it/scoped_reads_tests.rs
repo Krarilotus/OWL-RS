@@ -722,6 +722,29 @@ async fn compact_equality_names_the_unsupported_setting() -> TestResult {
 }
 
 #[tokio::test]
+async fn unnamed_class_skipping_refuses_dataset_scoped_inference() -> TestResult {
+    // Spec: With reasoner.unnamed_classes set to "skip", a scoped read returns
+    // 501 with a problem type naming that setting.
+    let app = app(
+        StoreConfig {
+            hide_unnamed_classes: true,
+            ..StoreConfig::default()
+        },
+        false,
+    )?;
+    insert(&app, INSIDE).await?;
+    let reply = select(&app, &[], SCOPED, "?s", G1, CONCLUSION).await?;
+    assert_eq!(reply.code, StatusCode::NOT_IMPLEMENTED, "{reply:?}");
+    assert!(
+        reply.json()["type"]
+            .as_str()
+            .is_some_and(|kind| kind.ends_with("/reasoner.unnamed_classes")),
+        "{reply:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn scoped_reads_with_reasoning_disabled_use_the_asserted_merge() -> TestResult {
     // Spec: With reasoning off, a scoped read merges the selected assertions and reports
     // complete without a regime.
