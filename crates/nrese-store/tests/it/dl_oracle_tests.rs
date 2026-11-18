@@ -11,7 +11,8 @@
 //! - one that goes away is a named individual's (the I24c classification).
 //!
 //! When owl2-dl can't decide (an error under `Exact`, a fact it can't settle, a deadline),
-//! the case has no verdict. That is never agreement.
+//! the case has no verdict. That is never agreement. Where it proves it can't answer
+//! exactly, the case is declined, and says nothing of `complete`.
 
 use std::collections::BTreeSet;
 
@@ -50,7 +51,16 @@ pub(crate) enum Verdict {
     Undecided(String),
     /// owl2-dl finds the case inconsistent.
     Inconsistent,
+    /// owl2-dl proves it can't answer exactly, for this reason: a class or property of the
+    /// query holds of every element, so every name is an answer. Like an inconsistent case,
+    /// it says nothing of `complete`.
+    Declined(String),
 }
+
+/// The store's proven refusal of a read every element answers, as its reason words it.
+/// Until the refusal carries its cause as a type, the test reads it here and nowhere else;
+/// [`a_read_every_element_answers_is_declined`] fails first if the wording changes.
+const EVERY_ELEMENT: &str = "> holds of every element: ";
 
 /// The terms of a Turtle document as N-Triples lines, with the case's signature: its IRIs
 /// outside the RDF, RDFS, OWL and XSD vocabularies, sorted into classes, properties and
@@ -261,11 +271,10 @@ pub(crate) fn verdicts(
         return both(Verdict::Undecided("the deadline passed".to_owned()));
     };
     let parsed = parse(case.turtle);
-    // Each owl2-dl task within 5 s, or what is left of the deadline, and the tableau's node
-    // and branch budgets: past them it can't decide, never
-    // agrees.
+    // The tableau's node and branch budgets decide: past them it can't decide, never agrees.
+    // What is left of the deadline only stops a hung task.
     let dl = crate::dl::pipeline_with(nrese_store::DlConfig {
-        timeout: Some(time.min(std::time::Duration::from_secs(5))),
+        timeout: Some(time),
         max_nodes: Some(100_000),
         max_branch_points: Some(100_000),
         ..nrese_store::DlConfig::default()
@@ -281,6 +290,7 @@ pub(crate) fn verdicts(
     }
     let expected = match certain(&dl, case.query, expiry) {
         Ok(rows) => rows,
+        Err(e) if e.contains(EVERY_ELEMENT) => return both(Verdict::Declined(e)),
         Err(e) => return both(Verdict::Undecided(format!("query: {e}"))),
     };
     let facts = match relation {
@@ -651,9 +661,10 @@ fn query(
 /// answer of owl2-dl, and none claimed `sound` holds an uncertain one. Each failure names
 /// its attribution, the saturated relation's verdict: missed there too, through anonymous
 /// individuals (the I24b ledger); agreed there, a named individual's (the I24c
-/// classification). Undecided verdicts are at most a fifth, in total and in each family
-/// with ten verdicts or more, and at least one verdict is decided. A case
-/// still inconsistent after its redraws was never compared, so it counts as undecided.
+/// classification). Undecided verdicts are at most a fifth of the compared and undecided
+/// ones, in total and in each family with ten verdicts or more; such a family compares at
+/// least half its verdicts, and at least one verdict is compared. A case still inconsistent
+/// or declined after its redraws is counted so, never compared.
 /// Every family's counts are printed (`FAMILY` lines), and each failure its replay.
 ///
 /// Settings, each refused before any work where invalid ([`setting`]):
@@ -711,9 +722,13 @@ fn generated_cases_answer_as_the_dl_oracle() {
                 _ => verdicts(&case, Relation::Direct, &expiry),
             };
             for (ruleset, verdict) in found {
-                if let Verdict::Undecided(why) = &verdict {
+                if let Verdict::Undecided(why) | Verdict::Declined(why) = &verdict {
                     let why: String = why.chars().take(120).collect();
-                    eprintln!("UNDECIDED {at}, {}: {why}", ruleset.name());
+                    let kind = match verdict {
+                        Verdict::Declined(_) => "DECLINED",
+                        _ => "UNDECIDED",
+                    };
+                    eprintln!("{kind} {at}, {}: {why}", ruleset.name());
                 }
                 let class = match verdict {
                     Verdict::Agree => 0,
@@ -722,6 +737,7 @@ fn generated_cases_answer_as_the_dl_oracle() {
                     Verdict::Extra(_) => 3,
                     Verdict::Undecided(_) => 4,
                     Verdict::Inconsistent => 5,
+                    Verdict::Declined(_) => 6,
                 };
                 counts.entry(family).or_default()[class] += 1;
                 if matches!(class, 2 | 3) {
@@ -740,17 +756,17 @@ fn generated_cases_answer_as_the_dl_oracle() {
             }
         }
     }
-    eprintln!("REDRAWN {redrawn} inconsistent cases");
+    eprintln!("REDRAWN {redrawn} inconsistent or declined cases");
     inconclusive.extend(judge(&counts, deadline));
     assert!(failures.is_empty(), "{}", failures.join("\n\n"));
     assert!(inconclusive.is_empty(), "{}", inconclusive.join("\n"));
 }
 
-/// How often a case is drawn again while owl2-dl finds it inconsistent. About one draw in
-/// six is (`NRESE_FUZZ_SEED=158`: 19 redraws for 100 cases). With three, a case still
-/// inconsistent came about once in fifteen runs, and in a family of a few cases it was over
-/// the family's fifth, a run inconclusive on a draw (D16-460); with ten, about once in
-/// three million runs, where the family's draws are as often inconsistent.
+/// How often a case is drawn again while owl2-dl finds it inconsistent or declines it. About
+/// one draw in six is inconsistent (`NRESE_FUZZ_SEED=158`: 19 redraws for 100 cases). With
+/// three, a case still inconsistent came about once in fifteen runs, and in a family of a
+/// few cases it was over the family's fifth, a run inconclusive on a draw (D16-460); with
+/// ten, about once in three million runs, where the family's draws are as often inconsistent.
 const REDRAWS: u64 = 10;
 
 /// A case of the generated run as drawn: its seed, how often it was drawn again, its
@@ -764,11 +780,11 @@ struct Drawn {
     first: Vec<(Ruleset, Verdict)>,
 }
 
-/// Case `i` of the generated run with seed `base`. An inconsistent case says nothing of
-/// `complete` here, so it is drawn again, up to [`REDRAWS`] times, in the family of its
-/// first draw: the families keep their share (nearly half the verdicts of
+/// Case `i` of the generated run with seed `base`. An inconsistent or declined case says
+/// nothing of `complete` here, so it is drawn again, up to [`REDRAWS`] times, in the family
+/// of its first draw: the families keep their share (nearly half the verdicts of
 /// `dlorc-g1-measure2-6cc10f32` were inconsistent), and a family owl2-dl finds inconsistent
-/// throughout stays counted, over its fifth (D16-460).
+/// or declines throughout stays counted, under its half compared (D16-460).
 fn drawn(i: u64, base: u64, expiry: &Expiry) -> Drawn {
     let (mut k, mut tries) = (0u64, 0u64);
     let mut first_family = None;
@@ -785,7 +801,8 @@ fn drawn(i: u64, base: u64, expiry: &Expiry) -> Drawn {
             query: &queries[0],
         };
         let first = verdicts(&case, Relation::Direct, expiry);
-        if tries == REDRAWS || !first.iter().any(|(_, v)| *v == Verdict::Inconsistent) {
+        let uncompared = |v: &Verdict| matches!(v, Verdict::Inconsistent | Verdict::Declined(_));
+        if tries == REDRAWS || !first.iter().any(|(_, v)| uncompared(v)) {
             return Drawn {
                 seed,
                 tries,
@@ -805,37 +822,42 @@ fn seed(i: u64, base: u64, k: u64) -> u64 {
 }
 
 /// Verdicts per family, as the generated test counts them: agree, reported, missed,
-/// extra, undecided, inconsistent.
-type Counts<'a> = std::collections::BTreeMap<&'a str, [usize; 6]>;
+/// extra, undecided, inconsistent, declined.
+type Counts<'a> = std::collections::BTreeMap<&'a str, [usize; 7]>;
 
 /// Why a generated run that ended by `deadline` is inconclusive, printing each family's
-/// counts (`FAMILY` lines). Undecided verdicts are at most a fifth, in total and in each
-/// family with ten verdicts or more, an inconsistent case never compared among them, and at
-/// least one verdict is decided.
+/// counts (`FAMILY` lines). Undecided verdicts are at most a fifth of the compared and
+/// undecided ones, in total and in each family with ten verdicts or more; such a family
+/// compares at least half its verdicts, so one owl2-dl finds inconsistent or declines
+/// throughout doesn't pass by vanishing; and at least one verdict is compared.
 fn judge(counts: &Counts, deadline: std::time::Instant) -> Vec<String> {
     let mut inconclusive = Vec::new();
-    let undecided = |c: &[usize; 6]| (c[4] + c[5], c.iter().sum::<usize>());
-    let mut total = [0usize; 6];
+    // Compared (agree, reported, missed, extra), undecided, all.
+    let split = |c: &[usize; 7]| (c[..4].iter().sum::<usize>(), c[4], c.iter().sum::<usize>());
+    let mut total = [0usize; 7];
     for (family, c) in counts {
         eprintln!(
             "FAMILY {family}: agree {}, reported {}, missed {}, extra {}, undecided {}, \
-             inconsistent {}",
-            c[0], c[1], c[2], c[3], c[4], c[5]
+             inconsistent {}, declined {}",
+            c[0], c[1], c[2], c[3], c[4], c[5], c[6]
         );
-        let (u, n) = undecided(c);
-        if n >= 10 && 5 * u > n {
-            inconclusive.push(format!("{family}: {u} of {n} undecided"));
+        let (compared, u, n) = split(c);
+        if n >= 10 && 5 * u > compared + u {
+            inconclusive.push(format!("{family}: {u} of {} undecided", compared + u));
+        }
+        if n >= 10 && 2 * compared < n {
+            inconclusive.push(format!("{family}: {compared} of {n} compared"));
         }
         for (t, x) in total.iter_mut().zip(c) {
             *t += x;
         }
     }
-    let (u, n) = undecided(&total);
-    if 5 * u > n {
-        inconclusive.push(format!("total: {u} of {n} undecided"));
+    let (compared, u, n) = split(&total);
+    if 5 * u > compared + u {
+        inconclusive.push(format!("total: {u} of {} undecided", compared + u));
     }
-    if u == n {
-        inconclusive.push(format!("no decided verdict of {n}"));
+    if compared == 0 {
+        inconclusive.push(format!("no compared verdict of {n}"));
     }
     // Time only moves on: a deadline that passed at any point in the run has passed now.
     if left(deadline).is_none() {
@@ -850,7 +872,7 @@ fn judge(counts: &Counts, deadline: std::time::Instant) -> Vec<String> {
 /// undecided, under a deadline already past.
 #[test]
 fn a_run_past_its_deadline_is_inconclusive() {
-    let counts: Counts = [("uniform", [9, 0, 0, 0, 1, 0])].into_iter().collect();
+    let counts: Counts = [("uniform", [9, 0, 0, 0, 1, 0, 0])].into_iter().collect();
     let now = std::time::Instant::now();
     assert!(judge(&counts, now + std::time::Duration::from_secs(60)).is_empty());
     let past = now.checked_sub(std::time::Duration::from_secs(1)).unwrap();
@@ -862,9 +884,52 @@ fn a_run_past_its_deadline_is_inconclusive() {
 /// compares enough to be judged, and passes.
 #[test]
 fn inconsistent_cases_are_not_counted_as_undecided() {
-    let counts: Counts = [("disjoint", [7, 0, 0, 0, 0, 3])].into_iter().collect();
+    let counts: Counts = [("disjoint", [7, 0, 0, 0, 0, 3, 0])].into_iter().collect();
     let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
     assert_eq!(judge(&counts, later), Vec::<String>::new());
+}
+
+/// A declined case is no undecided verdict either, but a family must compare at least half
+/// its verdicts: a family of ten verdicts, four of them declined, passes; one of ten, six of
+/// them declined, beside a family that agrees, is inconclusive on that family alone.
+#[test]
+fn declined_cases_are_not_undecided_but_a_family_compares_half() {
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let counts: Counts = [("disjoint", [6, 0, 0, 0, 0, 0, 4])].into_iter().collect();
+    assert_eq!(judge(&counts, later), Vec::<String>::new());
+    let counts = [
+        ("disjoint", [4, 0, 0, 0, 0, 0, 6]),
+        ("uniform", [90, 0, 0, 0, 0, 0, 0]),
+    ];
+    let counts: Counts = counts.into_iter().collect();
+    assert_eq!(judge(&counts, later), ["disjoint: 4 of 10 compared"]);
+}
+
+/// - Input: every element is in C0 (`owl:Thing ⊑ C0`), the classes are names with no
+///   individual, and a union takes the data off the rules route; the read is `?x a C0`.
+/// - Expected: owl2-dl proves C0 holds of every element and refuses an exact answer, so
+///   the case is declined under both regimes, not undecided. It fails first if the store's
+///   reason no longer reads as [`EVERY_ELEMENT`].
+#[test]
+fn a_read_every_element_answers_is_declined() {
+    let turtle = format!(
+        "{HEAD}:C0 a owl:Class . :C2 a owl:Class . :a0 a owl:NamedIndividual . \
+         owl:Thing rdfs:subClassOf :C0 . :a0 a :C2 . \
+         :Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet ."
+    );
+    let case = Case {
+        name: "every-element",
+        turtle: &turtle,
+        query: "SELECT ?x { ?x a <http://e/C0> }",
+    };
+    let expiry = Expiry::at(std::time::Instant::now() + std::time::Duration::from_secs(120));
+    for (ruleset, verdict) in verdicts(&case, Relation::Direct, &expiry) {
+        assert!(
+            matches!(verdict, Verdict::Declined(_)),
+            "{}: {verdict:?}",
+            ruleset.name()
+        );
+    }
 }
 
 /// - Input: case 95 of the generated run with `NRESE_FUZZ_SEED=158`, inconsistent in
@@ -873,22 +938,26 @@ fn inconsistent_cases_are_not_counted_as_undecided() {
 ///   verdict is inconsistent, beside a family that agrees.
 /// - Expected: the case drawn again, in the family of its first draw, until its first
 ///   query's verdicts are compared (neither inconsistent nor undecided). A family owl2-dl
-///   finds inconsistent throughout, which redraws in it keep counted, is over its fifth.
+///   finds inconsistent throughout, which redraws in it keep counted, compares under half.
 #[test]
 fn seed_158s_inconsistent_case_is_drawn_again_in_its_family_until_compared() {
     let expiry = Expiry::at(std::time::Instant::now() + std::time::Duration::from_secs(120));
     let case = drawn(95, 158, &expiry);
-    let compared = (case.first.iter())
-        .all(|(_, v)| !matches!(v, Verdict::Inconsistent | Verdict::Undecided(_)));
+    let compared = (case.first.iter()).all(|(_, v)| {
+        !matches!(
+            v,
+            Verdict::Inconsistent | Verdict::Undecided(_) | Verdict::Declined(_)
+        )
+    });
     assert!(compared, "{:?} after {} redraws", case.first, case.tries);
     let family = generated(seed(95, 158, 0)).1;
     assert_eq!(case.family, family, "redrawn in another family");
     assert!(case.tries > 0, "its first draw is consistent");
     let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let rejected = [
-        ("asserted", [0, 0, 0, 0, 0, 10]),
-        ("uniform", [90, 0, 0, 0, 0, 0]),
+        ("asserted", [0, 0, 0, 0, 0, 10, 0]),
+        ("uniform", [90, 0, 0, 0, 0, 0, 0]),
     ];
     let rejected: Counts = rejected.into_iter().collect();
-    assert_eq!(judge(&rejected, later), ["asserted: 10 of 10 undecided"]);
+    assert_eq!(judge(&rejected, later), ["asserted: 0 of 10 compared"]);
 }
