@@ -94,45 +94,10 @@ impl Batch {
                 Some((index, at))
             })
             .collect();
-        let mut compile = || {
-            use nrese_dl::memory::{normalised_bytes, ontology_bytes};
-            #[cfg(test)]
-            COMPILATIONS.set(COMPILATIONS.get() + 1);
-            let prepared = tableau::prepared(ontology);
-            let mut copied = 0;
-            scratch
-                .charge(|| {
-                    copied = match &prepared {
-                        std::borrow::Cow::Owned(copy) => ontology_bytes(copy),
-                        std::borrow::Cow::Borrowed(_) => 0,
-                    };
-                    copied
-                })
-                .ok()?;
-            let normalised = nrese_owl::normalise_with(
-                &prepared,
-                nrese_owl::Options {
-                    exact_provenance: false,
-                    ..nrese_owl::Options::default()
-                },
-            );
-            let mut clauses = 0;
-            scratch
-                .charge(|| {
-                    clauses = normalised_bytes(&normalised);
-                    clauses
-                })
-                .ok()?;
-            let program = Prepared::new(&prepared, &normalised, &classes, &individuals);
-            scratch.charge(|| program.bytes()).ok()?;
-            // The copy and the clauses go; the program stays for the probes.
-            scratch.release(copied + clauses);
-            Some(program)
-        };
         let (prepared, exhausted) = match classes.is_empty() {
             true => (None, false),
             false => {
-                let program = compile();
+                let program = compile(ontology, &classes, &individuals, &mut scratch);
                 let exhausted = program.is_none();
                 (program, exhausted)
             }
@@ -214,6 +179,50 @@ impl Batch {
             tableau::Answer::GaveUp(why) => Entailed::Unknown(format!("gave up: {why}")),
         }
     }
+}
+
+/// Compiles `ontology` for probes over `classes` and `individuals`, reserving what compiling
+/// holds from `scratch` as each stage's output exists; the program stays reserved (`None`: no
+/// room).
+pub(crate) fn compile(
+    ontology: &Ontology,
+    classes: &[u64],
+    individuals: &[u64],
+    scratch: &mut nrese_dl::memory::Scratch,
+) -> Option<Prepared> {
+    use nrese_dl::memory::{normalised_bytes, ontology_bytes};
+    #[cfg(test)]
+    COMPILATIONS.set(COMPILATIONS.get() + 1);
+    let prepared = tableau::prepared(ontology);
+    let mut copied = 0;
+    scratch
+        .charge(|| {
+            copied = match &prepared {
+                std::borrow::Cow::Owned(copy) => ontology_bytes(copy),
+                std::borrow::Cow::Borrowed(_) => 0,
+            };
+            copied
+        })
+        .ok()?;
+    let normalised = nrese_owl::normalise_with(
+        &prepared,
+        nrese_owl::Options {
+            exact_provenance: false,
+            ..nrese_owl::Options::default()
+        },
+    );
+    let mut clauses = 0;
+    scratch
+        .charge(|| {
+            clauses = normalised_bytes(&normalised);
+            clauses
+        })
+        .ok()?;
+    let program = Prepared::new(&prepared, &normalised, classes, individuals);
+    scratch.charge(|| program.bytes()).ok()?;
+    // The copy and the clauses go; the program stays for the probes.
+    scratch.release(copied + clauses);
+    Some(program)
 }
 
 /// Ground entailment as a negative class probe. Role values use nominals, including
