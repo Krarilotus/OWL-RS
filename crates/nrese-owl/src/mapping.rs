@@ -643,24 +643,41 @@ impl<'a> Reader<'a> {
         }
     }
 
-    /// The single object of `subject`'s `predicate`, collected as structural. None where it
-    /// has two (reported, every one collected): which one a reading took would follow the
-    /// order the statements come in.
+    /// The single object of `subject`'s `predicate`, collected as structural; none where it
+    /// has two ([`Self::twice`]).
     fn one(&mut self, subject: Term, predicate: Option<Term>) -> Option<Term> {
         let objects = self.objects(subject, predicate);
         if objects.len() > 1 {
-            self.report(Diagnostic::Malformed {
-                node: subject,
-                what: "a structure property given twice",
-            });
-            for &object in &objects {
-                self.collect([subject, predicate?, object]);
-            }
+            self.twice(subject);
             return None;
         }
         let &object = objects.first()?;
         self.collect([subject, predicate?, object]);
         Some(object)
+    }
+
+    /// Whether `node` gives a structure property ([`Self::is_vocabulary`], `owl:inverseOf`)
+    /// two objects: then it is no structure, since which one a reading took would follow the
+    /// order the statements come in. Reported, and every statement of such a property taken.
+    fn twice(&mut self, node: Term) -> bool {
+        let pairs = self.by_subject.get(&node).cloned().unwrap_or_default();
+        let structure = |p| {
+            (self.is_vocabulary(p) || is(p, self.v.owl_inverse_of)) && !is(p, self.v.owl_imports)
+        };
+        let given_twice: Vec<[Term; 3]> = (pairs.iter())
+            .filter(|&&(p, o, _)| structure(p) && pairs.iter().any(|&(q, x, _)| q == p && x != o))
+            .map(|&(p, o, _)| [node, p, o])
+            .collect();
+        for &triple in &given_twice {
+            self.collect(triple);
+        }
+        if !given_twice.is_empty() {
+            self.report(Diagnostic::Malformed {
+                node,
+                what: "a structure property given twice",
+            });
+        }
+        !given_twice.is_empty()
     }
 
     fn has_type(&self, subject: Term, class: Option<Term>) -> bool {
@@ -807,6 +824,9 @@ impl<'a> Reader<'a> {
                 self.report(Diagnostic::BrokenList { head });
                 return None;
             }
+            if self.twice(cell) {
+                return None;
+            }
             let (Some(first), Some(rest)) =
                 (self.one(cell, self.v.first), self.one(cell, self.v.rest))
             else {
@@ -841,6 +861,9 @@ impl<'a> Reader<'a> {
         match self.kind(term) {
             TermKind::Iri => Some(ObjProp::Named(term)),
             TermKind::Blank => {
+                if self.twice(term) {
+                    return None;
+                }
                 let Some(inverse) = self.one(term, self.v.owl_inverse_of) else {
                     self.report(Diagnostic::Malformed {
                         node: term,
@@ -923,6 +946,9 @@ impl<'a> Reader<'a> {
             if self.has_type(node, class_type) {
                 self.collect([node, v.rdf_type?, class_type?]);
             }
+        }
+        if self.twice(node) {
+            return None;
         }
         for operator in set_operators {
             if let Some(operand) = self.one(node, operator) {
@@ -1206,6 +1232,9 @@ impl<'a> Reader<'a> {
                 self.collect([node, v.rdf_type?, range_type?]);
             }
         }
+        if self.twice(node) {
+            return None;
+        }
         let ranges = |reader: &mut Self, list: Term| -> Option<Vec<RangeId>> {
             let members = reader.list(list)?;
             members.iter().map(|&m| reader.range(m)).collect()
@@ -1347,6 +1376,15 @@ impl<'a> Reader<'a> {
         let v = self.v;
         self.collected.clear();
         let without = |what| Diagnostic::Malformed { node, what };
+        let forms = [
+            v.owl_all_disjoint_classes,
+            v.owl_all_disjoint_properties,
+            v.owl_all_different,
+            v.owl_negative_property_assertion,
+        ];
+        if forms.contains(&Some(class)) && self.twice(node) {
+            return self.collect(triple);
+        }
         if is(class, v.owl_all_disjoint_classes) {
             self.collect(triple);
             let Some(list) = self.one(node, v.owl_members) else {
