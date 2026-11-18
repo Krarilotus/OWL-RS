@@ -5349,8 +5349,7 @@ impl<'a> Context<'a> {
             let mut previous: Option<[u64; 3]> = None;
             let graphs = self.merge_set.as_ref();
             sorted.filter(move |quad| {
-                if graphs.is_some_and(|graphs| !graphs.contains(&self.snapshot, self.model, &quad))
-                {
+                if graphs.is_some_and(|graphs| !graphs.contains(&self.snapshot, self.model, quad)) {
                     return false;
                 }
                 let components = quad.components();

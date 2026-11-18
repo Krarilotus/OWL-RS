@@ -751,7 +751,7 @@ impl PathEvaluator<'_> {
                         .expect("the bound positions are a prefix of the order")
                         .filter(move |quad| {
                             graphs.is_none_or(|graphs| {
-                                graphs.contains(self.snapshot, self.model, &quad)
+                                graphs.contains(self.snapshot, self.model, quad)
                             })
                         })
                         .filter(move |quad| {
