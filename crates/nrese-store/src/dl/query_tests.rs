@@ -1540,12 +1540,12 @@ fn a_read_whose_deadline_has_passed_gives_the_labels_no_time() {
     assert_eq!(counts(&read(true, hour).1).2, 12, "under the hour, all 12");
 }
 
-/// The unions' store of 24 individuals with a candidate limit of 4 and `dl.timeout` an hour,
-/// its view built.
+/// The unions' store of 24 individuals with a candidate limit of 4 and no `dl.timeout`, its
+/// view built.
 fn capped_unions_store() -> Arc<StoreService> {
     let dl = crate::DlConfig {
         max_candidates: Some(4),
-        timeout: Some(std::time::Duration::from_secs(3600)),
+        timeout: None,
         ..crate::DlConfig::default()
     };
     let store = unions_store_with(dl, 24, 0);
@@ -1562,8 +1562,8 @@ fn request_until(deadline: Option<std::time::Instant>) -> crate::SparqlQueryRequ
 
 /// Spec: at the request's deadline a read is told incomplete with the rows it has, never an
 /// error. Over [`capped_unions_store`], a read whose request's deadline has passed returns
-/// the rows the read under the hour returns (L's), decides none of its candidates (none
-/// refuted, 12 unresolved) and is not `complete`; under the hour, 4 are refuted. Nothing
+/// the rows the read with no deadline returns (L's), decides none of its candidates (none
+/// refuted, 12 unresolved) and is not `complete`; with no deadline, 4 are refuted. Nothing
 /// waits; no time is measured.
 #[test]
 fn a_read_past_its_requests_deadline_is_told_incomplete_with_its_rows() {
@@ -1576,8 +1576,8 @@ fn a_read_past_its_requests_deadline_is_told_incomplete_with_its_rows() {
         (out, status.expect("a DL status"))
     };
     let (rows, (status, detail)) = read(Some(std::time::Instant::now()));
-    let (hour_rows, (hour, hour_detail)) = read(None);
-    println!("passed {status:?} {detail:?}; the hour {hour:?} {hour_detail:?}");
+    let (free_rows, (free, free_detail)) = read(None);
+    println!("passed {status:?} {detail:?}; no deadline {free:?} {free_detail:?}");
     let bounds =
         |s: &nrese_sparql::Completeness| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
     let counts = |d: &crate::dl::DlDetail| (d.proved, d.refuted);
@@ -1586,11 +1586,11 @@ fn a_read_past_its_requests_deadline_is_told_incomplete_with_its_rows() {
         (Some((12, 24, 12)), (0, 0), false)
     );
     assert_eq!(
-        (bounds(&hour), counts(&hour_detail)),
+        (bounds(&free), counts(&free_detail)),
         (Some((12, 24, 8)), (0, 4)),
-        "under the hour"
+        "with no deadline"
     );
-    assert_eq!(rows, hour_rows, "the rows in hand");
+    assert_eq!(rows, free_rows, "the rows in hand");
 }
 
 /// Spec: the cancellation stays the operator's stop and an error, whether the request's

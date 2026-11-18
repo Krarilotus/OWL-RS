@@ -481,9 +481,9 @@ fn a_stopped_read_starts_no_view_build() {
 }
 
 /// Spec: a read whose request's time is up before the view of its revision is built neither
-/// waits for a build nor begins one: it answers over the RL closure, told incomplete and why,
-/// never `Cancelled`. Counted by builds: none reaches `Point::View`, none is under way, none
-/// is kept. Nothing waits; no time is measured.
+/// waits for a build nor begins one: it answers over the RL closure (`:a1 a :A` is asserted,
+/// so `true`), told incomplete and why, never `Cancelled`. Counted by builds: none reaches
+/// `Point::View`, none is under way, none is kept. Nothing waits; no time is measured.
 #[test]
 fn a_read_whose_time_is_up_before_the_view_answers_without_it() {
     let (store, _pipeline) = pipeline();
@@ -500,10 +500,16 @@ fn a_read_whose_time_is_up_before_the_view_answers_without_it() {
     request.deadline = Some(Instant::now());
     let prepared = store.prepare_query(&request).unwrap();
     let token = crate::CancellationToken::new();
-    let status = store.run_query_dl(&prepared, &token, std::io::sink());
+    let mut out = Vec::new();
+    let status = store.run_query_dl(&prepared, &token, &mut out);
     let (status, _) = status
         .expect("an answer, not an error")
         .expect("a DL status");
+    let answer = String::from_utf8(out).unwrap();
+    assert!(
+        answer.contains("true") && !answer.contains("false"),
+        "{answer}"
+    );
     assert_eq!(builds.load(Ordering::SeqCst), 0, "views built");
     assert!(store.dl().bounds.views.is_idle(), "a view build under way");
     assert!(lock(&store.dl().bounds.view).is_none(), "a view kept");
