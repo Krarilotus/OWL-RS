@@ -181,6 +181,75 @@ fn a_first_loads_report_fits_the_budget_the_deltas_fits() {
     assert_eq!(first_load, delta, "the same violations, bindings included");
 }
 
+/// A first load whose caller uses the rebuild's report (`maintain_with`'s
+/// `uses_rebuilt_report`, as a store assessed consistent does) holds that one report: it lists
+/// the delta executor's violations, the rules' and the datatype checks', bindings included,
+/// and the operation's peak is no higher than the delta's own on the same load. Holding an
+/// introduced-only report, or a second datatype section, beside it raised the peak.
+#[test]
+fn a_first_load_judged_by_its_rebuild_holds_one_report() {
+    use nrese_exec::Budget;
+    use nrese_reasoner::engine::maintain_with;
+    use nrese_reasoner::eval::OperationStop;
+    let load: String = (0..200)
+        .map(|i| format!("ex:i{i} a owl:Nothing . ex:i{i} ex:age -{} . ", i + 1))
+        .chain(["ex:age rdfs:range xsd:nonNegativeInteger . ".to_owned()])
+        .collect();
+    let run = |plan: Option<Plan>, uses_rebuilt_report: bool, budget: &std::sync::Arc<Budget>| {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let program =
+            Program::compile(&Ruleset::Owl2Rl.into(), &|t| tx.intern(t)).maintaining_by(plan);
+        let text = format!("{PREFIX}{load}");
+        for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+            tx.insert(quad.unwrap().as_ref());
+        }
+        let stop = OperationStop::new(&|| false);
+        let mut done =
+            maintain_with(&program, None, &mut tx, &stop, budget, uses_rebuilt_report).unwrap();
+        let report = match uses_rebuilt_report {
+            true => done
+                .rebuilt_violations
+                .take()
+                .expect("the rebuild's report"),
+            false => std::mem::take(&mut done.violations),
+        };
+        let listed: Vec<String> = report
+            .iter()
+            .map(|(rule, bindings)| format!("{rule}:{bindings:?}"))
+            .collect();
+        (done.work.plan, report.complete(), listed)
+    };
+    let delta_peak = std::sync::Arc::new(Budget::new(usize::MAX));
+    let (plan, complete, delta) = run(Some(Plan::Dred), false, &delta_peak);
+    assert_ne!(plan, Plan::Rebuild, "the control takes the delta executor");
+    let datatype = delta.iter().filter(|v| v.starts_with("dt-")).count();
+    assert!(
+        complete && datatype >= 200 && delta.len() - datatype >= 200,
+        "the delta's report, the rules' and the datatype checks': {delta:?}"
+    );
+    let judged_peak = std::sync::Arc::new(Budget::new(usize::MAX));
+    let (plan, complete, judged) = run(None, true, &judged_peak);
+    assert_eq!(plan, Plan::Rebuild, "the first load is materialised once");
+    assert!(complete);
+    assert_eq!(judged, delta, "the same violations, bindings included");
+    println!(
+        "peaks: {} bytes judged by the rebuild, {} the delta's",
+        judged_peak.peak(),
+        delta_peak.peak()
+    );
+    assert!(
+        judged_peak.peak() <= delta_peak.peak(),
+        "one report held: {} bytes at the peak, the delta's {}",
+        judged_peak.peak(),
+        delta_peak.peak()
+    );
+}
+
 /// A user rule's fact makes the empty state inconsistent; an unrelated insert introduces
 /// nothing and is reported as the delta reports it.
 #[test]

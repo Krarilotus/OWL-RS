@@ -207,7 +207,9 @@ impl VisitsBase for EngineBase<'_> {
 /// What [`maintain`] did to a transaction's inferred stack.
 #[derive(Debug, Default)]
 pub struct Maintenance {
-    /// The consistency violations the change introduced, charged to its budget.
+    /// The consistency violations the change introduced, charged to its budget. A first load
+    /// whose caller uses the rebuild's report has its verdict in
+    /// [`Self::rebuilt_violations`] alone, and this is empty.
     pub violations: Violations,
     pub inserted: u64,
     pub removed: u64,
@@ -218,6 +220,10 @@ pub struct Maintenance {
     pub program: Option<GroundProgram>,
     /// What the maintenance policy weighed and did ([`delta::policy`]).
     pub work: delta::policy::Counts,
+    /// Where the change installed a rebuilt closure and the caller uses its report
+    /// ([`maintain_with`]'s `uses_rebuilt_report`): the rebuild's own violations, charged to
+    /// the same budget. Over a state that had none, they are the change's new ones.
+    pub rebuilt_violations: Option<Violations>,
 }
 
 /// Whether `base` holds an inverse property expression (`_:x owl:inverseOf :p`), OWL 2's
@@ -264,18 +270,29 @@ pub fn maintain_within(
     stop: crate::eval::Stop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Maintenance, delta::Interrupted> {
-    maintain_with(program, ground, tx, &OperationStop::new(stop), memory)
+    maintain_with(
+        program,
+        ground,
+        tx,
+        &OperationStop::new(stop),
+        memory,
+        false,
+    )
 }
 
 /// [`maintain_within`] as one operation under `operation`, whose memory limit and room its
 /// caller chose ([`OperationStop::within`]): the equality copies are admitted by its room,
 /// and once it fires, every part of the maintenance stops.
+///
+/// `uses_rebuilt_report`: the caller judges a rebuilt change by the rebuild's own report
+/// ([`Maintenance::rebuilt_violations`]), so a first load makes no other.
 pub fn maintain_with(
     program: &Program,
     ground: Option<&GroundProgram>,
     tx: &mut Transaction<'_>,
     operation: &OperationStop<'_>,
     memory: &Arc<Budget>,
+    uses_rebuilt_report: bool,
 ) -> Result<Maintenance, delta::Interrupted> {
     // Axioms the state lacks (a store that never rematerialised): added with this commit.
     let mut missing_axioms: Vec<Triple> = Vec::new();
@@ -410,10 +427,12 @@ pub fn maintain_with(
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
         } else if let Some(closure) = rebuilt.as_mut().filter(|_| first_load) {
-            // The batch's own report isn't the one given (it holds an axiom's old violations
-            // too): let go of its charge before the introduced-only report takes the same
-            // budget, which then holds what the delta executor's single report would.
-            drop(std::mem::take(&mut closure.violations));
+            // One report is held: the batch's, where the caller uses it (the rebuild below
+            // gives it); else the introduced-only one, the batch's let go first (it holds an
+            // axiom's old violations too): it fits where the delta executor's single one would.
+            if !uses_rebuilt_report {
+                drop(std::mem::take(&mut closure.violations));
+            }
             // The new inferred facts, as the delta executor reports them (its `insert`): the
             // state tells which storable ones it held before, and none it can't hold (above).
             let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
@@ -433,9 +452,12 @@ pub fn maintain_with(
             }
             derived.append(&mut unstorable);
             delta::Update {
-                violations: delta::introduced_violations(
-                    &base, &inserted, &derived, rules, ground, operation, memory,
-                )?,
+                violations: match uses_rebuilt_report {
+                    true => Violations::default(),
+                    false => delta::introduced_violations(
+                        &base, &inserted, &derived, rules, ground, operation, memory,
+                    )?,
+                },
                 insert: derived,
                 policy: delta::policy::Counts {
                     plan: delta::policy::Plan::Rebuild,
@@ -451,8 +473,9 @@ pub fn maintain_with(
     };
     let mut update = update;
     // A list that already stopped at its budget makes the change inconsistent: the
-    // datatype checks would add nothing to that.
-    if update.violations.complete() {
+    // datatype checks would add nothing to that. A first load judged by its rebuild has
+    // them in the batch's report already.
+    if update.violations.complete() && !(first_load && uses_rebuilt_report) {
         let datatypes = super::datatypes::violations(
             &update.insert,
             program.rdf_type,
@@ -492,6 +515,7 @@ pub fn maintain_with(
             }
         }
     }
+    let mut rebuilt_violations = None;
     if rebuild {
         let mut closure = match rebuilt.take() {
             Some(closure) => closure,
@@ -501,6 +525,7 @@ pub fn maintain_with(
         if operation.fired() {
             return Err(operation.interrupted());
         }
+        rebuilt_violations = uses_rebuilt_report.then(|| std::mem::take(&mut closure.violations));
         // Only the difference is applied: O(stored + rebuilt closure) to sort and walk,
         // and a transaction update per fact that changed. A stored snapshot shares the old
         // runs and avoids expanding compact equality.
@@ -564,6 +589,7 @@ pub fn maintain_with(
         diagnostics: update.diagnostics,
         program: update.program,
         work: update.policy,
+        rebuilt_violations,
     })
 }
 

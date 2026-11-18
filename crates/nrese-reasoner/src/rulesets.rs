@@ -83,7 +83,12 @@ pub const ALL: [Ruleset; 6] = [
 /// literal of an `owl:sameAs` class, not only the representative's statements: two
 /// different values in one class, or an ill-typed member under a range, are now
 /// inconsistencies there too, so a version 4 closure and verdict are rebuilt once.
-pub const SEMANTICS_VERSION: u32 = 5;
+///
+/// 6 (18 Nov 2026): a commit maintained by a rebuild (a split over a compact stack, a
+/// store with an inverse property expression, a policy rebuild, a first write) is judged by
+/// the rebuild's own violations. Version 5 could accept such a commit and record the store
+/// consistent over a clash, so a version 5 verdict is rechecked once.
+pub const SEMANTICS_VERSION: u32 = 6;
 
 /// A part of the evaluation semantics only some user rulesets use ([`SEMANTICS_VERSION`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
