@@ -1726,7 +1726,7 @@ fn promoted_read() -> (crate::dl::DlDetail, nrese_sparql::Completeness) {
 
 /// Spec: a read says the candidate limit stopped it only where that many candidates went to
 /// their tests. In [`promoted_read`] the labels refute 60 of the capped read's first 64 rows,
-/// and 104 candidates survive them: where a reason names `dl.max_candidates` (64), 64 of the
+/// and 104 candidates survive them: a reason names `dl.max_candidates` (64), and 64 of the
 /// survivors were tested (here each refuted by its test, so refuted less refuted by labels).
 #[test]
 fn the_candidate_limit_is_named_only_where_that_many_were_tested() {
@@ -1738,6 +1738,12 @@ fn the_candidate_limit_is_named_only_where_that_many_were_tested() {
             assert_eq!(tested, 64, "{reason}, with {tested} tested");
         }
     }
+    let named = |r: &String| r.contains("dl.max_candidates reached (64)");
+    assert!(
+        status.reasons.iter().map(|r| &r.text).any(named),
+        "the limit named: {:?}",
+        status.reasons
+    );
 }
 
 /// Spec: the survivors of the labels past the capped read's first rows are tested, in batches
@@ -1887,6 +1893,41 @@ fn a_row_costlier_than_the_capped_batches_is_left_unresolved_and_named() {
         reasons.iter().any(named),
         "the reason by name, in {reasons:?}"
     );
+}
+
+/// Spec: where the tests past the capped read's first rows end, the read says why, beside what
+/// an earlier batch said: a stop is named even where a batch before it was left unresolved for
+/// a reason of its own. Over [`past_prefix_store`] with short-named `a`s and one `c` named by an
+/// IRI longer by 100000 bytes, under each request memory limit from 4 KiB to 2 MiB (steps of a
+/// fiftieth), every read the first of a store just committed: where the read is answered with
+/// the 3 `a`s refuted by the labels and both `:b0` and `:c0` unresolved (`:b0`'s batch without
+/// room for its run), its reasons name the request's memory envelope and "the next candidate's
+/// row costs more than". And the case is reached.
+#[test]
+fn a_stop_past_the_capped_rows_is_named_beside_an_earlier_reason() {
+    let (mut limit, mut reached) = (4usize << 10, Vec::new());
+    while limit <= 2 << 20 {
+        let store = past_prefix_store((0, 100_000), 1);
+        if let Ok((_, Some((status, detail)))) = unions_read_of(&store, PROMOTED, Some(limit)) {
+            let reasons: Vec<_> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+            let counts = (detail.refuted_by_labels, detail.refuted, detail.proved);
+            println!(
+                "{limit}: {counts:?}, {} unresolved, {reasons:?}",
+                detail.unresolved.len()
+            );
+            if counts == (3, 3, 0) && detail.unresolved.len() == 2 {
+                let both = |r: &&str| {
+                    r.contains("budgets.query_memory")
+                        && r.contains("the next candidate's row costs more than")
+                };
+                assert!(reasons.iter().any(both), "{limit} bytes: {reasons:?}");
+                reached.push(limit);
+            }
+        }
+        limit += limit / 50;
+    }
+    println!("`:b0` unresolved, then `:c0` stopped, both named, under {reached:?}");
+    assert!(!reached.is_empty(), "no limit reaches the case");
 }
 
 /// Four individuals `:m0`..`:m3`, each in `:C` and with `:p` to the literal `"v{k}"`, and the
