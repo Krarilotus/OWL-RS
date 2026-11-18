@@ -59,7 +59,7 @@ def side(record: dict) -> dict:
 
 class NotAnswered(unittest.TestCase):
     def test_an_answer_marked_incomplete_is_not_answered_with_status_200(self):
-        # Spec (master 18:24, point 2): engine-v2's sound-only answer, status 200, is refused.
+        # Spec: engine-v2's sound-only answer, status 200, is refused.
         record = measured(REFUSED)
         self.assertEqual(record["status"], fast.NOT_ANSWERED)
         self.assertEqual([c["ok"] for c in record["checks"]], [None])
@@ -77,7 +77,7 @@ class NotAnswered(unittest.TestCase):
                 self.assertEqual(measured(answer, http)["status"], fast.NOT_ANSWERED)
 
     def test_a_failed_request_or_a_payload_that_is_no_answer_is_never_called_wrong(self):
-        # Spec (review r1 F2): curl's own failure (a timeout: exit 28, HTTP 000; a partial transfer
+        # Spec: curl's own failure (a timeout: exit 28, HTTP 000; a partial transfer
         # after a 200: exit 18), the case's limit (exit 124) and readable JSON that is no
         # classification ({} or null) give no answer to judge.
         good = {"subsumptions": [[f"{E}A", f"{E}B"]]}
@@ -103,14 +103,14 @@ class Answered(unittest.TestCase):
         self.assertEqual(measured({"subsumptions": [[f"{E}B", f"{E}A"]], "complete": True})["status"], "wrong")
 
     def test_every_process_is_judged(self):
-        # Spec (review r1 F1): a wrong first answer isn't hidden by a right last one.
+        # Spec: a wrong first answer isn't hidden by a right last one.
         right, wrong = {"subsumptions": [[f"{E}A", f"{E}B"]]}, {"subsumptions": [[f"{E}B", f"{E}A"]]}
         record = measured(None, runs=[(wrong, 200, 0, 1), (right, 200, 0, 1)])
         self.assertEqual(record["status"], "wrong")
         self.assertEqual(rg.state(side(record)), "failed")
 
     def test_every_process_keeps_its_peak_and_its_request(self):
-        # Spec (review r1 F3): each process's peak reaches the gate, the larger first one included;
+        # Spec: each process's peak reaches the gate, the larger first one included;
         # one sample per request, none twice.
         right = {"subsumptions": [[f"{E}A", f"{E}B"]]}
         both = measured(None, runs=[(right, 200, 0, 900), (right, 200, 0, 100)])

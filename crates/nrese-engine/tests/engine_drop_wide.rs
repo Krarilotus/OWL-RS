@@ -1,7 +1,7 @@
 //! IB0024 review C1 on the global pool at width 2: the last Engine dropped on a global worker,
 //! with maintenance requested, while that worker holds a mutex that a job it queued wants. The
 //! drop runs no job of its pool, so it returns, and the queued job runs once the mutex is let
-//! go. A hang blocks (brief v3 §2).
+//! go. A hang blocks.
 //!
 //! Its own binary: a global pool of two threads. This guards the repaired drop; it is red on
 //! the previous design only when the dropping worker takes its queued job before the other

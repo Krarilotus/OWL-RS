@@ -599,7 +599,7 @@ async fn graph_store_and_rdf4j_follow_the_policy() -> Result<(), Box<dyn std::er
 /// A reader of some graphs who sees every inference is told the same over HTTP whether or
 /// not a graph it can't read holds schema the OWL 2 QL rewriting would use: the same
 /// answer, and the completeness `not-certified`, which other origins may read; and from
-/// an EXPLAIN, run or plan only, the same completeness and no QL report (R13-diag).
+/// an EXPLAIN, run or plan only, the same completeness and no QL report.
 #[tokio::test]
 async fn query_certification_tells_nothing_of_a_hidden_schema()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -724,8 +724,8 @@ async fn ask(
     boolean(&body)
 }
 
-/// An update's WHERE reads what its requester reads, as its queries do (review r1 of PR #50,
-/// F1). For a reader of what its graphs support (`inferred = "supported"`), `open` derives
+/// An update's WHERE reads what its requester reads, as its queries do (PR #50).
+/// For a reader of what its graphs support (`inferred = "supported"`), `open` derives
 /// `alice a Patient` whether or not `secret`, which it can't read, asserts it; so a marker its
 /// update inserts where that holds lands either way: through SPARQL UPDATE, and through an
 /// RDF4J transaction's UPDATE, read inside the transaction before any commit.
@@ -819,8 +819,8 @@ default_graph = "read"
     Ok(())
 }
 
-/// An update's WHERE reads no inferred statement its requester's queries don't show (review r1
-/// of PR #50, D7): with `inferred = "hidden"`, `open` derives `alice a Patient`, which the
+/// An update's WHERE reads no inferred statement its requester's queries don't show (PR #50):
+/// with `inferred = "hidden"`, `open` derives `alice a Patient`, which the
 /// editor's ASK doesn't see, and its update inserts no marker where it holds.
 #[tokio::test]
 async fn an_updates_where_reads_no_inferred_statement_its_requester_doesnt_see()

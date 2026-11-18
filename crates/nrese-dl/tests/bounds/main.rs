@@ -578,10 +578,10 @@ fn u1_proves_no_consistency_over_a_key_it_did_not_compile() {
 ///   on a property the value reaches through inverses, which the reader accepts on data
 ///   properties outside OWL 2 DL (`d⁻ = r`, `r⁻ = q`: `q` = `d`; F1's review, W1).
 ///
-/// With one, the proof stands: a defined datatype with values (`xsd:integer[≥ 0]`, PR #30
-/// review), a datatype outside the map, whose values a model may choose (§4), and the
-/// forced value where the negative assertion or the key is on another property (PR #30
-/// fix check, F1).
+/// With one, the proof stands: a defined datatype with values (`xsd:integer[≥ 0]`, PR #30),
+/// a datatype outside the map, whose values a model may choose (§4), and the
+/// forced value where the negative assertion or the key is on another property
+/// (PR #30).
 #[test]
 fn a_proof_of_consistency_needs_a_model() {
     let data = ":A a owl:Class . :d a owl:DatatypeProperty . :q a owl:DatatypeProperty . \

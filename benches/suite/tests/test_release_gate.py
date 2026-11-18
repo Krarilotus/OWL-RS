@@ -136,7 +136,7 @@ def remove_checkouts_under(root, repo=ROOT) -> list[str]:
     """Every checkout registered under `root`, a test's own temporary directory, removed by its path
     (remove_checkout()); those that stayed, with git's reason. Never a `git worktree prune`: in the
     repository the suite runs in it drops any registration whose directory this process can't see,
-    other agents' live checkouts among them (rule.delete-only-what-you-created; 2 Nov 2026)."""
+    other live checkouts among them (2 Nov 2026)."""
     listed = subprocess.run(["git", "worktree", "list", "--porcelain"], cwd=repo, capture_output=True, text=True)
     base = Path(root).resolve()
     left = []
@@ -378,7 +378,7 @@ class NothingTimed(unittest.TestCase):
             self.assert_not_passed(*self.report(Path(tmp), family))
 
     def test_the_verdict_refuses_a_report_that_timed_nothing_written_before_the_fix(self):
-        """Review release-gate-zero-passes r1 R1: a report written by the earlier `report` over no
+        """A report written by the earlier `report` over no
         passes (no planned case, no error, passed) passed the verdict; the verdict reads such reports
         too. Its shape: every report since 18 Oct carries `planned`, here empty."""
         earlier = run_gate([])
@@ -427,7 +427,7 @@ class Layouts(unittest.TestCase):
         self.assertGreater(rows["bbbbbbbb"], 0.3)
 
     def test_the_a_a_probe_counts_what_the_readings_block(self):
-        """Sol, below-resolution r1: gate-power.py aa kept only p-values, so a series the gate blocks
+        """Gate-power.py aa kept only p-values, so a series the gate blocks
         on by its readings (below resolution without a measured whole run, or emerged) counted as no
         false block. Six passes of one build, one round: q06 at 0.0 in all, and no wall, blocks every
         split; q06 at 0.0 in three and 5.0 in three has emerged where every block's baseline is a 0.0
@@ -506,7 +506,7 @@ class Rounds(unittest.TestCase):
         self.assertAlmostEqual(gatestats.combine_rounds([0.5, 0.001, 0.001]), 0.01)
 
     def test_a_confirmation_runs_whole_squares_of_its_timed_sides(self):
-        """Sol r2: the candidate is timed whatever revision it shares; only a main that is base's
+        """The candidate is timed whatever revision it shares; only a main that is base's
         build isn't. Counting revisions gave three timed sides 2 blocks."""
         for cand, main, sides in (("b", "m", 3), ("m", "m", 3), ("b", "b", 2), ("c", "m", 3), ("c", "b", 2)):
             with self.subTest(cand=cand, main=main), patch.dict(REVS, {"cand": cand * 40, "base": "b" * 40, "main": main * 40}):
@@ -520,7 +520,7 @@ class Rounds(unittest.TestCase):
                     self.assertGreaterEqual(n, calibrated or gate_module.CONFIRM_BLOCKS[0])
 
     def test_a_hypothesis_no_round_compared_is_never_a_pass(self):
-        """Review abba-not-compared r1 W-OUT1 (8 Nov 2026): a baseline that reports no memory leaves
+        """A baseline that reports no memory leaves
         the family's memory hypotheses not compared (compare_case, "unsupported by this baseline"),
         out of the p-values; decide() saw none and verdict() said PASSED over no test. The shared
         decision result carries each untested hypothesis with its reason, and the verdict names it
@@ -542,7 +542,7 @@ class Rounds(unittest.TestCase):
                 self.assertEqual(sorted(gate_module.decide([[s]])["not_compared"]), sorted(memory))
 
     def test_a_round_beyond_the_statistical_slots_that_compared_nothing_is_never_a_pass(self):
-        """Review release-not-compared r1 W1: decide() took not-compared reasons from the three
+        """Decide() took not-compared reasons from the three
         statistical slots only, so a fourth round that tested nothing was dropped and the verdict
         PASSED. Three rounds compare the memory hypotheses; the fourth's baseline reports none."""
         def records_of(base_anon):
@@ -559,7 +559,7 @@ class Rounds(unittest.TestCase):
         self.assertTrue(gate_module.verdict(rounds[:3], self.W3C, self.GUARDS)[0])  # the three alone pass
 
     def test_a_refused_plan_of_the_gate_s_jobs_exits_as_refused(self):
-        """Review release-not-compared r1 OUT1: `release_gate.py jobs --plan` returned 0 when the
+        """`release_gate.py jobs --plan` returned 0 when the
         fleet check refused the set, as abba.py run --plan did. It exits 1; a taken plan 0."""
         with tempfile.TemporaryDirectory() as tmp:
             subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
@@ -606,7 +606,7 @@ class Rounds(unittest.TestCase):
                 gate_module.confirm_job([hostless], "C:/repo")
 
     def test_a_part_s_passes_must_come_from_the_host_its_report_names(self):
-        """Review r1 R1-F1: a timed part judged its passes by its report's host (its floor) without
+        """A timed part judged its passes by its report's host (its floor) without
         checking that they ran there; the fleet may move a timed job between steps."""
         def ran_on(host):
             out = passes(slower(1.0))
@@ -651,7 +651,7 @@ class Rounds(unittest.TestCase):
         self.assertEqual(need([{"data": "volume:lubm-10.nt", "extra": ["volume:univ-bench.nt"]}]), ["docker"])
         self.assertEqual(need([{"data": "concat:volume:lubm-1.nt+social people=10"}]), ["docker"])
         self.assertEqual(need([{"data": "volume:owl2bench-rl-1.nt"}]), ["docker"])
-        # Sol-loop r1 S1: riot labels an OWL2Bench file's blank nodes afresh, so a made copy can meet
+        # Riot labels an OWL2Bench file's blank nodes afresh, so a made copy can meet
         # only a form pin; one without it (owl2bench-ql-1.nt) still needs the assets.
         self.assertEqual(need([{"data": "volume:owl2bench-ql-1.nt"}]), ["owlrs-bench-assets"])
         self.assertEqual(need([{"data": "volume:support-stress/copies-8.nq"}]), [])
@@ -660,7 +660,7 @@ class Rounds(unittest.TestCase):
                          ["docker", "owlrs-bench-assets"])
 
     def test_a_job_whose_makers_start_containers_declares_them(self):
-        """The master, 8 Nov 2026 (#129's regression): a timing job making LUBM data asked the fleet
+        """On 8 Nov 2026 (#129's regression), a timing job making LUBM data asked the fleet
         for Docker, and the fleet refused it, since a shared host's envelope can't hold containers a
         script starts unseen. The fleet's contract (F61, job spec 9): the job declares them (`spec = 9`,
         `containers`, Linux), each within every step's ask; their memory comes out of every step's
@@ -692,7 +692,7 @@ class Rounds(unittest.TestCase):
                          gate_module.MAKER_CONTAINERS["bash benches/reasoning/prepare-lubm.sh"])
 
     def test_a_job_declaring_containers_of_its_own_declares_every_maker_that_can_start_one(self):
-        """#132's second lead, approved by the bench lead (8 Nov 2026): a SPARQL file's maker asks the host nothing
+        """#132 (8 Nov 2026): a SPARQL file's maker asks the host nothing
         (no Docker in `has`), yet benches/sparql/prepare.sh starts its container wherever Docker is. A job that is
         spec 9 anyway (a suite cell, its measured container declared) is watched, so that maker must be declared too;
         a job declaring nothing of its own still declares nothing for it (abba: no watcher switched on)."""
@@ -708,7 +708,7 @@ class Rounds(unittest.TestCase):
         self.assertEqual(gate_module.data_job(assets, dict(base), harness=None, containers_declared=True)[1:], ({}, {}))
 
     def test_a_release_gate_part_asks_what_its_harness_makes_and_how(self):
-        """Review r1 R1 of pkg/maker-containers (8 Nov 2026): a part's data is made by its harness's own
+        """A part's data is made by its harness's own
         prepare (release-gate.sh prepare runs the harness worktree's release_gate.py and catalogue), so
         its declaration, its makers' env and its memory are the harness's (its MAKER_CONTAINERS and
         catalogue), not the planning tree's. A harness whose LUBM maker takes 6 GB and 4 CPUs is
@@ -719,7 +719,7 @@ class Rounds(unittest.TestCase):
                                      checks=False)["rg-test-timed"]
             self.assertEqual(timed["containers"], [{"name": "maker", "memory_gb": 6, "cpus": 4}])
             self.assertEqual((timed["env"]["NRESE_MAKER_MEMORY_GB"], timed["env"]["NRESE_MAKER_CPUS"]), ("6", "4"))
-            # Review r2 R2-W1: the sizes are the catalogue's [makers], declared data; nothing in the
+            # The sizes are the catalogue's [makers], declared data; nothing in the
             # harness's code, a table of the same name written or changed there, alters what the job is told.
             coded = harness_commit(Path(tmp) / "coded", lubm_size=(6, 4), after=(
                 f'MAKER_CONTAINERS = {{"{LUBM_MAKER}": (9, 9)}}\nMAKER_CONTAINERS["{LUBM_MAKER}"] = (9, 9)\n'))
@@ -736,11 +736,11 @@ class Rounds(unittest.TestCase):
             self.assertEqual(sized_ram, timed["requires"]["ram_gb"] + 6)  # its blocks' ask, plus the harness's maker
 
     def test_a_harness_whose_makers_it_can_t_declare_is_refused(self):
-        """Review r1 R1 and sol-loop r1 S1 of pkg/maker-containers: a harness whose makers start
+        """A harness whose makers start
         containers it declares no size for (between engine-v2 838cd7eb and this package: unlabelled,
         unlimited), or whose tables are code, or whose catalogue can't be read, would have its data
-        step stopped or its data unknown: refused at the plan, saying why. Fix check r3 R3-W1 (the
-        master, 8 Nov 2026): a harness's tables are its catalogue's [makers] alone, so every harness
+        step stopped or its data unknown: refused at the plan, saying why.
+        A harness's tables are its catalogue's [makers] alone, so every harness
         whose tables are code is refused for having no [makers], whatever the code says."""
         with tempfile.TemporaryDirectory() as tmp:
             for name, kw, cases, why in (
@@ -748,16 +748,16 @@ class Rounds(unittest.TestCase):
                     ("computed", {"tables": 'MAKER_CONTAINERS = {"bash " + "x": (1, 1)}\n'}, "shacl-lubm",
                      "[makers]"),
                     ("uncatalogued", {"catalogue": False, "lubm_size": None}, "shacl-lubm", "datasets.toml"),
-                    # Review r2 R2-W1: a harness from before [makers] whose sizes are code (this package's
+                    # A harness from before [makers] whose sizes are code (this package's
                     # commits before it; bafc5741 declared 4/8 where H's code made 6/4): refused, never run.
                     ("sizes as code", {"legacy": True}, "shacl-lubm", "[makers]"),
-                    # Sol-loop r3 S1: sized makers whose scripts don't take the declaration.
+                    # Sized makers whose scripts don't take the declaration.
                     ("unheld", {"helper": False}, "shacl-lubm", "ns_maker_args"),
-                    # S3: SPARQL's maker shares the declared container, so its size counts too.
+                    # SPARQL's maker shares the declared container, so its size counts too.
                     ("no SPARQL size", {"sparql_size": False}, "shacl-lubm,watdiv-10m", "prepare.sh"),
-                    # S4: a file the harness's catalogue doesn't name: its data step can't make or check it.
+                    # A file the harness's catalogue doesn't name: its data step can't make or check it.
                     ("unnamed file", {"drop": ("lubm-10.nt",)}, "shacl-lubm", "lubm-10.nt"),
-                    # Review r2 R2-W1, its witnesses: a write after the literal of a harness whose tables are
+                    # The witnesses: a write after the literal of a harness whose tables are
                     # code (the builder declared 4/8 where H says 6/4): refused, never run.
                     *((f"changed by {how}", {"legacy": True, "after": text}, "shacl-lubm", "[makers]")
                       for how, text in (
@@ -781,10 +781,10 @@ class Rounds(unittest.TestCase):
                     self.assertIn(why, str(refused.exception))
 
     def test_a_harness_s_makers_are_its_catalogue_s_and_its_code_is_never_read(self):
-        """Fix check r3 R3-W1 of pkg/maker-containers (8 Nov 2026): a harness without [makers] whose
-        release_gate.py gives LUBM's maker Docker through an alias (r3's witness: its literal says [],
+        """A harness without [makers] whose
+        release_gate.py gives LUBM's maker Docker through an alias (the witness: its literal says [],
         `x = DATASET_MAKERS[LUBM]; x.append("docker")` after it) was planned with no container, no Docker
-        and its blocks' memory alone, while its data step starts LUBM's containers. The master's boundary
+        and its blocks' memory alone, while its data step starts LUBM's containers. The boundary
         (8 Nov 2026): a harness's maker tables come only from its catalogue's [makers]; one without is
         refused before admission, naming the remedy, and no Python of the harness is read. Each row on
         its own: the witness (refused), and two guards that pass before and after: [makers] 6/4 declared
@@ -831,7 +831,7 @@ class Rounds(unittest.TestCase):
                 self.assertNotIn("benches/fast/release_gate.py", shown)
 
     def test_a_catalogue_s_makers_are_refused_where_a_file_s_maker_would_be_ambiguous_or_unbounded(self):
-        """Sol-loop r6 S6/S7 of pkg/maker-containers: a file's maker is the [makers] start its made_by
+        """A file's maker is the [makers] start its made_by
         begins with, so two starts one of which begins the other would depend on their order (which a
         save re-sorts); a container must be finite and positive; an entry must be a table."""
         for label, makers in (
@@ -844,7 +844,7 @@ class Rounds(unittest.TestCase):
                 gate_module.catalogue_makers(makers)
 
     def test_saving_the_catalogue_keeps_its_makers_as_they_are(self):
-        """Sol-loop r6 S5: `suite.py data freeze` rewrites benches/datasets.toml (datasets.save()); its
+        """`suite.py data freeze` rewrites benches/datasets.toml (datasets.save()); its
         [makers] come back as they were, an empty section too (its presence says the catalogue holds them,
         so a harness with it isn't read as one from before them)."""
         from suitekit import datasets
@@ -860,7 +860,7 @@ class Rounds(unittest.TestCase):
         """harness_tables() reads a harness's makers from its catalogue's [makers], never running its
         code: this tree, read so from a commit, gives the tables its own data step uses (one source:
         catalogue_makers()), and its SPARQL data step is SPARQL_PREPARE: the one path planning and
-        preparation both use (sol-loop r6 S4), the catalogue's own."""
+        preparation both use, the catalogue's own."""
         import tomllib
         makers = tomllib.loads((ROOT / "benches/datasets.toml").read_text(encoding="utf-8"))["makers"]
         [sparql] = [s for s, m in makers.items() if m.get("sparql")]
@@ -877,7 +877,7 @@ class Rounds(unittest.TestCase):
                          (own.makers, own.form_only, own.sparql, own.containers, own.catalogue))
 
     def test_a_job_whose_makers_start_no_container_asks_as_before(self):
-        """Design note 2026-11-08-maker-containers, invariant 3: no maker that starts containers, no
+        """No maker that starts containers, no
         declaration: the job's spec, memory and capabilities as data_needs() and data_disk_gb() say."""
         base = {"roles": ["measure", "build"], "os": "linux", "cores": 16, "ram_gb": 12}
         for cases in ([{"data": "social people=1000"}], [{"data": "ore:ore_ont_9724"}],
@@ -959,7 +959,7 @@ class Rounds(unittest.TestCase):
             self.assertIn("bytes", problem)
 
     def test_a_record_says_which_frozen_bytes_its_case_loaded(self):
-        """Review r1 of pkg/stage-data, R1-W1: a comparison can hold a verdict to the same input only
+        """A comparison can hold a verdict to the same input only
         if each record says which bytes its case loaded. The prepared manifest's hash where it holds
         the file unchanged, else the file's own; None where the file isn't there, or the run can't
         read it (the Docker runtime's volume)."""
@@ -982,7 +982,7 @@ class Rounds(unittest.TestCase):
                 self.assertEqual(fast.case_inputs(case)["lubm-10.nt"], "p" * 64)  # the prepared manifest's
             with patch.object(fast, "RUNTIME", "docker"), patch.dict(fast._DIGESTS, clear=True):
                 self.assertEqual(fast.case_inputs(case), {"lubm-10.nt": None, "univ-bench.nt": None})
-            # Sol-loop r3 V2: a concatenation's order is part of what was loaded.
+            # A concatenation's order is part of what was loaded.
             (data / "univ-bench.nt").write_bytes(b"<u> <v> <w> .\n")
             ab = {"name": "t", "data": "concat:volume:lubm-10.nt+volume:univ-bench.nt"}
             ba = {"name": "t", "data": "concat:volume:univ-bench.nt+volume:lubm-10.nt"}
@@ -990,10 +990,10 @@ class Rounds(unittest.TestCase):
                     patch.object(fast.hosts, "input_path", return_value=data), \
                     patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
                 self.assertNotEqual(fast.case_inputs(ab), fast.case_inputs(ba))
-                # Sol-loop r4 W1: the same concatenations listed in another order are the same input.
+                # The same concatenations listed in another order are the same input.
                 both = {"name": "t", "data": "volume:lubm-10.nt", "extra": [ab["data"], ba["data"]]}
                 self.assertEqual(fast.case_inputs(both), fast.case_inputs({**both, "extra": both["extra"][::-1]}))
-            # Fix check r2, R2-W2: an ORE case's converted ontology is a loaded external file, hashed.
+            # An ORE case's converted ontology is a loaded external file, hashed.
             (fast_data / "ore").mkdir()
             (fast_data / "ore" / "ore_ont_9724.nt").write_bytes(b"<o> <p> <q> .\n")
             with patch.object(fast, "RUNTIME", "native"), patch.object(fast, "FAST_DATA", fast_data), \
@@ -1001,7 +1001,7 @@ class Rounds(unittest.TestCase):
                     patch.dict(os.environ, {"NRESE_FAST_BIN": str(fast_data)}), patch.dict(fast._DIGESTS, clear=True):
                 self.assertEqual(fast.case_inputs({"name": "o", "data": "ore:ore_ont_9724"}),
                                  {"ore:ore_ont_9724": hashlib.sha256(b"<o> <p> <q> .\n").hexdigest()})
-                # Sol-loop r5 X2: a file there but unreadable is unknown, and the run goes on.
+                # A file there but unreadable is unknown, and the run goes on.
                 with patch.object(fast, "file_digest", side_effect=PermissionError("denied")), \
                         patch.dict(fast._DIGESTS, clear=True):
                     self.assertEqual(fast.case_inputs({"name": "o", "data": "ore:ore_ont_9724"}), {"ore:ore_ont_9724": None})
@@ -1036,7 +1036,7 @@ class Rounds(unittest.TestCase):
             (Path(root) / "benches").mkdir()
             datasets.save(Path(root), {"budget_gb": 300, "dataset": [entry]})
             self.assertEqual(datasets.load(Path(root))["dataset"], [entry])
-        # Sol-loop r1 S3: a freeze that changes the bytes drops the form pin, which was the old graph's
+        # A freeze that changes the bytes drops the form pin, which was the old graph's
         # (it accepted the old graph after a re-freeze); the same bytes keep it.
         same = datasets.refreeze(dict(entry), 47781, "2" * 64, "2026-11-08")
         self.assertEqual((same["rdfc_sha256"], same.get("frozen")), ("7" * 64, None))
@@ -1094,7 +1094,7 @@ class Rounds(unittest.TestCase):
         self.assertIn("MISSING bsbm-100m.nt: made by `bash benches/sparql/prepare.sh bsbm-100m`", text)
         self.assertIn("MISSING query set watdiv-10m", text)
         self.assertIn("can't be made again", text)
-        # A concatenation's parts are inputs too (Sol r2 T2: "no frozen inputs" where both were absent).
+        # A concatenation's parts are inputs too ("no frozen inputs" where both were absent).
         with tempfile.TemporaryDirectory() as cache, patch.dict(os.environ, {"SPARQL_DATA": cache}), \
                 patch.object(gate_module.hosts_registry, "input_path", return_value=None):
             lines, ok = gate_module.data_state([{"data": "concat:volume:univ-bench.nt+volume:lubm-1.nt"}])
@@ -1102,11 +1102,11 @@ class Rounds(unittest.TestCase):
         self.assertEqual(sorted(line.split(":")[0] for line in lines), ["MISSING lubm-1.nt", "MISSING univ-bench.nt"])
 
     def test_a_query_set_is_held_only_as_pinned_by_name_and_digest(self):
-        """Review r1 R1-F2 (DATA_PINS): `data --make` said "held" for 56 files of the right count and
+        """Data pins: `data --make` said "held" for 56 files of the right count and
         wrong contents. A set is held only with exactly its pinned names, each with its SHA-256
         (benches/sparql/queries.sha256): wrong contents, other names, and a bench-inputs revision
         that delivers another set all fail, and the cache keeps what it had; the right revision's
-        set is taken (the orchestrator's decision (b), 2 Nov 2026: a git input of the job, read by
+        set is taken (a git input of the job, read by
         `git archive`). The CLI exits nonzero on a failure, and release-gate.sh prepare stops on it."""
         right = {"C1-1.rq": b"SELECT * { ?s ?p ?o }\n", "L1-1.rq": b"SELECT ?s { ?s ?p 1 }\n",
                  "S1-1.rq": b"ASK { ?s ?p ?o }\n"}
@@ -1338,7 +1338,7 @@ class MainAdapter(unittest.TestCase):
         self.assertIn("time/cold/q01/first: lost (on base, not on every pass of the candidate)", row["blocks"])
 
     def test_a_null_in_one_of_a_pass_s_processes_loses_the_series_on_that_pass(self):
-        """Sol, gate-missing-series r1 R1: with one p50 per process (main's estimator on either side),
+        """With one p50 per process (main's estimator on either side),
         a candidate pass whose first process reported the series as null and whose second reported
         it was compared on the second alone, and passed. The series isn't read on that pass: lost."""
         def records_of(side, n):
@@ -1366,10 +1366,10 @@ class MainAdapter(unittest.TestCase):
 
     @unittest.skipIf(os.name == "nt", "the gate prepares on a Linux host (shared data: hardlinks to read-only blobs)")
     def test_a_concatenation_is_its_parts_as_they_are(self):
-        """Sol, PR #64 r1 F1: a concatenation made while a part wasn't its freeze outlived the part's
+        """PR #64: a concatenation made while a part wasn't its freeze outlived the part's
         repair, and the shared index handed it to the next gate; prepare recorded bytes of no frozen
         input as prepared. Witness: dl-abox-lubm1's `concat:volume:univ-bench.nt+volume:lubm-1.nt`.
-        Sol, gate-input-provenance r1: a making stopped between the file and its sums left the old
+        A making stopped between the file and its sums left the old
         sums beside the new file, and they matched once the part was restored."""
         case = {"name": "c", "data": "concat:volume:a.nt+volume:b.nt"}
         with tempfile.TemporaryDirectory() as tmp:
@@ -1436,7 +1436,7 @@ class MainAdapter(unittest.TestCase):
 
 
 class DeclaredMetric(unittest.TestCase):
-    """The orchestrator, 7 Nov 2026 (18:05): C1's A-B-B-A abba-run-2102481f-fbbc9ee1 timed
+    """On 7 Nov 2026, C1's A-B-B-A abba-run-2102481f-fbbc9ee1 timed
     ql-memberships-type-commits-wide, which declares `commits.read_p50_ms`, by the commit latency
     (`time/_`, ratio 0.98), while B's reader read in ~10 ms against A's 0.004 ms: a loss in no
     hypothesis. fast.samples() took a section's `samples_ms` (the commits') for any metric of that
@@ -1457,7 +1457,7 @@ class DeclaredMetric(unittest.TestCase):
         self.assertEqual(fast.samples({**self.CASE, "metric": "commits.p99_ms"}, self.result(0.004)), {"_": [0.9461]})
 
     def test_a_metric_in_seconds_is_a_series_in_milliseconds(self):
-        """Review r1 R1-F1: `commits.whole_s` reached the series in seconds, where the comparison's
+        """`commits.whole_s` reached the series in seconds, where the comparison's
         floors are milliseconds. A metric declared in seconds (`*_s`) is milliseconds in the series,
         per process and over repeated processes alike; a p50 sample series is as it was."""
         case = {"name": "rule-delta-sweep", "metric": "commits.whole_s", "tool": "perf_lab"}
@@ -1468,7 +1468,7 @@ class DeclaredMetric(unittest.TestCase):
         self.assertEqual(fast.samples({**case, "metric": "commits.p50_ms"}, whole(3.0)), {"_": [0.2] * 4})
 
     def test_a_600_ms_whole_run_loss_is_a_regression_in_compare(self):
-        """Review r1 R1-F1, the real caller: `fast.py compare` (compare_reports) with its 2 ms floor
+        """The real caller: `fast.py compare` (compare_reports) with its 2 ms floor
         called 3.0 s -> 3.6 s "slower, below absolute floor" and exited 0. Specified independently: a
         whole run 600 ms slower, 20 % and far above 2 ms, is a regression."""
         from suitekit import compare
@@ -1508,7 +1508,7 @@ class DeclaredMetric(unittest.TestCase):
         return code, out.getvalue()
 
     def test_reports_of_two_timing_unit_generations_are_normalised_or_refused(self):
-        """Fix check r2, R2-F1: reports before 8 Nov 2026 saved `commits.whole_s` in seconds and
+        """Reports before 8 Nov 2026 saved `commits.whole_s` in seconds and
         timed it by its section's commit latencies; new ones save milliseconds of the whole run. A
         record says its generation (`series_units`; none: 1); compare normalises what that generation
         fixes exactly and refuses what it can't, before any verdict."""
@@ -1555,7 +1555,7 @@ class DeclaredMetric(unittest.TestCase):
 
     @classmethod
     def two_cases(cls, units, sweep_status="ok", sweep_peak=1000):
-        """r3's reports: rule-delta-sweep of one generation (1: seconds and its commit latencies;
+        """Two reports: rule-delta-sweep of one generation (1: seconds and its commit latencies;
         2: milliseconds of the whole run) beside an unchanged rl-hierarchy."""
         records = []
         for rep in (1, 2):
@@ -1575,9 +1575,9 @@ class DeclaredMetric(unittest.TestCase):
                 "started": "2026-11-08T02:00:00", "records": records}
 
     def test_refused_timing_keeps_the_case_s_status_checks_and_memory(self):
-        """Fix check r3, R3-F1: refusing a case's timing (units of two generations) dropped its whole
-        record, so a case gone from ok to wrong beside an unchanged one exited 0. Specified (r3's
-        required revision; compare.py's order, "nothing lost hides behind a time"): only the refused
+        """Refusing a case's timing (units of two generations) dropped its whole
+        record, so a case gone from ok to wrong beside an unchanged one exited 0. Specified
+        (compare.py's order, "nothing lost hides behind a time"): only the refused
         case's time is not compared; its status, checks and memory are, and their failure is nonzero."""
         no_ratio = lambda text: self.assertIsNone(re.search(r"^rule-delta-sweep +\d", text, re.M), text)  # noqa: E731
         with self.subTest("ok -> wrong beside an unchanged case: an acceptance failure, the status named"):
@@ -1603,7 +1603,7 @@ class DeclaredMetric(unittest.TestCase):
             no_ratio(text)
 
     def test_refused_timing_keeps_the_wrong_status_in_compact_reports(self):
-        """R3-F1 through `fast.py compare` on compact records alone (their full reports not here):
+        """The same through `fast.py compare` on compact records alone (their full reports not here):
         they keep status, checks and `series_units`, so the verdict is the full reports'."""
         with tempfile.TemporaryDirectory() as tmp:
             paths = []
@@ -1688,7 +1688,7 @@ class BelowResolution(unittest.TestCase):
     def test_a_block_without_readings_makes_the_series_incomplete(self):
         # Spec (fail closed: a missing reading never passes). The baseline at 5.0 in three blocks,
         # the candidate at 0.0 where it has readings: one block left made it `vanished`, two left it
-        # `unresolved` (Sol, below-resolution r1 and r2), both passing.
+        # `unresolved`, both passing.
         base = [[5.0]] * 3
         for case, new, new_blocks in (("two empty", [[0.0], [], []], [1, 2, 3]), ("two absent", [[0.0]], [1]),
                                       ("one empty", [[0.0], [0.0], []], [1, 2, 3])):
@@ -1733,7 +1733,7 @@ class BelowResolution(unittest.TestCase):
             return gate_module.load_policy(
                 f'[[emerged]]\ncase = "lab-olympics"\ndimension = "time/prepare"\nmax = {limit}\n'
                 'approved = "2026-11-14"\nby = "Johannes"\nreason = "r"\nquote = "q"\nsource = "s"\n')
-        # TOML `true` is Python's 1: no limit the owner wrote (Sol, below-resolution r1).
+        # TOML `true` is Python's 1: no limit the owner wrote.
         for bad in ("true", "0", "-1.0", "nan", "inf"):
             with self.subTest(max=bad):
                 self.assertEqual(entry(bad).errors, ["emerged 1: max must be a finite number above 0"])
@@ -1893,7 +1893,7 @@ class Parts(unittest.TestCase):
             self.assertIn("OWL 2 RL: 89 skipped, at most 3 known", gate_module.w3c_check(counts, expected))
 
     def test_the_jobs_run_the_whole_gate_in_blocks_asking_by_capability_one_set(self):
-        """The brief of 2 Nov 2026: the gate asks by capability, never a host, and goes as one set.
+        """The gate asks by capability, never a host, and goes as one set.
         Each timed part builds every side where it times them (its own first step: no binaries
         staged between hosts, which WSL hosts refuse), holding that host alone from there."""
         found = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, None)
@@ -1905,14 +1905,14 @@ class Parts(unittest.TestCase):
         self.assertEqual((timed["requires"]["roles"], timed["requires"]["os"]), (["measure", "build"], "linux"))
         self.assertEqual(checks["requires"]["roles"], ["test"])
         # The first step builds every side and prepares the data; no step is untimed, so a part starts
-        # only where it can time and keeps that host (planner held_between_steps; Sol r1 S1).
+        # only where it can time and keeps that host (planner held_between_steps).
         self.assertNotIn("untimed_steps", timed)
         self.assertIn("release-gate.sh build", timed["steps"][0][2])
         self.assertIn("release-gate.sh prepare", timed["steps"][0][2])
         self.assertEqual(timed["steps"][0][4], "c" * 40)  # the harness, then the revisions
         self.assertEqual([s[2] for s in timed["steps"][1:]], ["block"] * 3 + ["report", "clean"])
         # No step asks less memory than the blocks: placed by a smaller ask, the builds could land on
-        # a host the blocks don't fit, whose hold then ends without them (Sol r2 S1).
+        # a host the blocks don't fit, whose hold then ends without them.
         for job in (timed, found["rg-test-big"]):
             asks = [n.get("ram_gb", job["requires"]["ram_gb"]) for n in job.get("step_needs", [])]
             self.assertTrue(all(a >= job["requires"]["ram_gb"] for a in asks), job["id"])
@@ -1940,12 +1940,12 @@ class Parts(unittest.TestCase):
         self.assertEqual((big["requires"]["os"], big["requires"]["ram_gb"]), ("linux", 32))
         self.assertIn("release-gate.sh build", big["steps"][0][2])
         self.assertNotIn("untimed_steps", big)
-        # Its own gate directory: on the timed part's host it would overwrite that part's plan (Sol r1 S3).
+        # Its own gate directory: on the timed part's host it would overwrite that part's plan.
         self.assertNotEqual(big["env"]["GATE_NAME"], found["rg-test-timed"]["env"]["GATE_NAME"])
         self.assertFalse([i for i in big["inputs"] if "artifact" in i["source"]])
         self.assertEqual(big["env"]["GATE_MIN_GB"], "24")
         # The private input repository is a git input of a part whose cases read a WatDiv query set,
-        # and of no other (the orchestrator's decision (b), 2 Nov 2026).
+        # and of no other (decided on 2 Nov 2026).
         with tempfile.TemporaryDirectory() as repo:
             run = lambda *a: __import__("subprocess").run(["git", "-C", repo, *a], capture_output=True,  # noqa: E731
                                                           text=True, check=True)
@@ -1961,7 +1961,7 @@ class Parts(unittest.TestCase):
         # Only the first git input is checked out: the job is told the commit to take the sets from.
         self.assertEqual(watdiv["rg-test-timed"]["env"]["BENCH_INPUTS_REV"], head)
         self.assertNotIn("BENCH_INPUTS_REV", other["rg-test-timed"]["env"])
-        # Review r1 R1-F3 (GATE_DIRECTORIES): two requests at one candidate, and the timed part and
+        # Gate directories: two requests at one candidate, and the timed part and
         # the checks, all named gate-v2-CAND8, one mutable gate directory on a shared host. Each
         # request's each part has its own; the same request gives the same names (its resume).
         with patch.dict(os.environ, {"BENCH_INPUTS_GIT": str(ROOT / "no-such-inputs")}):
@@ -2054,7 +2054,7 @@ echo '{{"run": ["lab-olympics"]}}' > "$GATE/plan.json"
         self.assertNotIn("same build", aa.stdout)
 
     def test_prepare_refuses_an_input_that_isnt_its_freeze(self):
-        """Sol, #50's D6 harness review r1 H3 (IB0556-0730): prepare linked an input whose hash
+        """#50's D6 harness (IB0556-0730): prepare linked an input whose hash
         isn't its freeze (benches/datasets.toml) into the data view, recorded "NOT the freeze" and
         went on, and the passes read it. Witness: copies-17's update script altered."""
         import shutil
@@ -2113,7 +2113,7 @@ point {head} "$b"
             prepared = (Path(tmp) / "prepared").exists()
             # The harness's checkout this run made, removed by its path alone: never a `prune`, which
             # takes any registration whose directory this process space can't see, another space's
-            # live checkout among them (release-gate.sh's drop_checkout; Sol, PR #64 r1 F2).
+            # live checkout among them (release-gate.sh's drop_checkout; PR #64).
             left = remove_checkouts_under(tmp)
         self.assertNotEqual(done.returncode, 0, f"SPEC frozen inputs: prepare went on\n{done.stdout}{done.stderr}")
         self.assertIn("NOT the freeze support-stress/copies-17.nq.commits.ru", done.stdout + done.stderr)
@@ -2161,10 +2161,10 @@ point {head} "$b"
                                          checks=False, big_gb=None)
                 return found["rg-test-timed"]["inputs"][0]["source"]["rev"]
             self.assertEqual((checkout_of(rebased), checkout_of(root)), (rebased, harness))
-            # A side the checkout's history doesn't hold is a git input of its own (Sol r1 S4);
+            # A side the checkout's history doesn't hold is a git input of its own;
             # one it holds isn't. The bench-inputs repository is the job's input where it exists and
-            # a case reads a WatDiv set (the full catalogue does), absent otherwise (review r1 N1:
-            # the test found this PC's repository and failed elsewhere's contract).
+            # a case reads a WatDiv set (the full catalogue does), absent otherwise (the test found this PC's repository and failed elsewhere's
+            # contract).
             for inputs_repo, extra in ((str(Path(tmp) / "no-such-inputs"), []), (tmp, ["BENCH_INPUTS"])):
                 with patch.dict(os.environ, {"BENCH_INPUTS_GIT": inputs_repo}):
                     found = gate_module.jobs(rebased, harness, tmp, "rg-test", 2, None, base=diverged, main=root,
@@ -2240,7 +2240,7 @@ printf "no linker" > "$d/release/other"; lld_of "$d" 2>/dev/null || echo not-lld
     @unittest.skipUnless(sys.platform.startswith("linux"), "the watcher watches /proc (Linux)")
     def test_a_blocks_attempts_from_every_crash_point_one_repeat_at_most_a_verdict_before_acceptance(self):
         """A disturbed block is left out of the statistics, both
-        sides, and repeated once; a disturbed repeat is kept and listed. Sol, 20 Oct 2026: a restart
+        sides, and repeated once; a disturbed repeat is kept and listed. A restart
         accepted a disturbed block, or ran a third attempt. One table over the states a crash leaves
         a block in: what the restarted step runs and keeps. git, the watcher and fast.py are faked
         (the watcher's --resume is the real one); no repository is touched."""
@@ -2407,9 +2407,9 @@ class Measurement(unittest.TestCase):
         measure = {"a": {"blocks": 2}, "b": {"blocks": 4}, "c": {"blocks": 3}}
         self.assertEqual(gate_module.blocks(["a", "b", "c"], measure, square=1),  # one side: no squares
                          [["a", "b", "c"], ["a", "b", "c"], ["b", "c"], ["b"]])
-        with self.assertRaises(TypeError):  # Sol r1: no square given planned 2 and 8 blocks for three sides
+        with self.assertRaises(TypeError):  # No square given planned 2 and 8 blocks for three sides
             gate_module.blocks(["a"], measure)
-        # Sol r2: the plan files follow the job's minimum (jobs() with 4 blocks a round and a case
+        # The plan files follow the job's minimum (jobs() with 4 blocks a round and a case
         # needing 2: 6 block steps, the plan 3), and a declared outcome's case keeps its one block.
         plan = gate_module.blocks(["a", "b", "c"], measure, 6, square=3, checked={"c"})
         self.assertEqual([sorted(cases) for cases in plan], [["a", "b", "c"]] + [["a", "b"]] * 5)
@@ -2481,7 +2481,7 @@ class Measurement(unittest.TestCase):
 
     def test_calibrate_sizes_a_horn_case_by_one_classification_not_by_its_whole_process(self):
         # Spec (calibrate: a context classifier's process repeats its classification `repeat` times,
-        # its time DL_MS = 3000 ms at most; Sol, classifier-wall r1): its largest phase, 300 ms, is
+        # its time DL_MS = 3000 ms at most): its largest phase, 300 ms, is
         # one classification, so 3000 ms buys ten; the process's whole run (910 ms for three
         # classifications and the process around them) is no classification.
         def records_of(side, n):
@@ -2494,7 +2494,7 @@ class Measurement(unittest.TestCase):
         self.assertEqual(plan["cases"]["horn-x"].get("repeat"), 10)
 
     def test_compare_keeps_a_classifier_s_whole_process_out_of_its_phases_sum(self):
-        # Spec (Sol, classifier-wall r1): the whole process holds its phases. A case whose phases
+        # Spec: the whole process holds its phases. A case whose phases
         # fell from 100 to 50 ms while its process grew from 300 to 350 ms (+17 %, above the 10 %
         # floor and 2 ms) is timed 100 -> 50 by its phases, and its whole process is a slowdown
         # (exit 1); summed, both sides were 400 ms and nothing showed.
@@ -2513,7 +2513,7 @@ class Measurement(unittest.TestCase):
 
     def test_compare_refuses_a_whole_process_line_from_part_of_its_evidence(self):
         # Spec (compare.py's order, 1. Missing: series and repetitions one side has and the other
-        # doesn't; Sol, classifier-wall r2): a repetition of either side without a valid wall reading,
+        # doesn't): a repetition of either side without a valid wall reading,
         # while the other side has it, makes the whole process not comparable (exit 1), never a line
         # from the rest and never silence. Neither side with it: an older report, phases only.
         def report(*walls):
@@ -2709,7 +2709,7 @@ class MeasurementSides(unittest.TestCase):
                                     "nothing outside the perf lab's sources")
 
     def test_a_change_outside_the_perf_lab_is_seen_whatever_the_diff_configuration(self):
-        """Sol, PR #54 r1 R1: under a user's diff.ignoreSubmodules=all, `git diff` left a gitlink
+        """PR #54: under a user's diff.ignoreSubmodules=all, `git diff` left a gitlink
         added outside the perf lab out of its paths, and the commit was built for the side."""
         self.git("config", "diff.ignoreSubmodules", "all")
         self.git("checkout", "-q", "--detach", self.side)
@@ -2723,8 +2723,8 @@ class MeasurementSides(unittest.TestCase):
                          "SPEC measurement side: its perf lab alone is still built for it")
 
     def test_a_replace_ref_changes_nothing_the_check_reads(self):
-        """Sol, PR #54 R1 fix review D1 and D2: a replace ref stands other objects in for the
-        stored ones; standing the side's tree in for an engine change hid the change (D1). The
+        """PR #54: a replace ref stands other objects in for the
+        stored ones; standing the side's tree in for an engine change hid the change. The
         check reads the objects as stored (STORED_OBJECTS): the change is refused, and a valid
         commit is admitted whatever stands in for its tree, which the gate's checkout doesn't read
         either (test_the_build_compiles_the_commit_checked)."""
@@ -2757,7 +2757,7 @@ class MeasurementSides(unittest.TestCase):
         return tmp
 
     def test_the_build_compiles_the_revisions_bytes(self):
-        """Sol, PR #54 fix check 1 S1: worktree() took HEAD and a clean status for the revision's
+        """PR #54: worktree() took HEAD and a clean status for the revision's
         source, and both trust the index and the attributes. A smudge filter (info/attributes) made
         the checkout other bytes, and a reused checkout changed under core.checkStat=minimal with its
         size and mtime kept stayed clean: the build went on with either. Now it refuses both, and a
@@ -2802,8 +2802,8 @@ class MeasurementSides(unittest.TestCase):
         self.git("config", "--unset", "core.checkStat")
         self.git("config", "--unset", "core.trustctime")
         # A checkout as stored, plus a file the repository ignores, which status doesn't show and
-        # a build may read (nrese-server's build.rs embeds apps/nrese-console/dist/; Sol, S1 r1):
-        # it builds without it (Sol, S1 r2: the gate's own leftovers go the same way).
+        # a build may read (nrese-server's build.rs embeds apps/nrese-console/dist/):
+        # it builds without it (the gate's own leftovers go the same way).
         clean = build("ignored")
         (git_dir / "info" / "exclude").write_text("dist/\n", encoding="utf-8")
         extra = self.space(tmp / "ignored" / "gate") / "build" / f"src-{loop[:8]}" / "dist" / "index.html"
@@ -2817,7 +2817,7 @@ class MeasurementSides(unittest.TestCase):
         self.assertIn("doesn't hold", smudged + changed)
 
     def test_the_gates_own_checkout_may_hold_its_scratch_a_built_one_not(self):
-        """Sol, S1 r2: the gate writes ignored scratch into its own harness checkout (fast.py's
+        """The gate writes ignored scratch into its own harness checkout (fast.py's
         tmp/fast/queries, the watcher's __pycache__, cargo-guarded's tmp logs) and checks that
         checkout again before each block: only a checkout to be built must hold nothing else."""
         self.git("checkout", "-q", "--detach", self.side)
@@ -2829,7 +2829,7 @@ class MeasurementSides(unittest.TestCase):
         self.assertIn("tmp/fast/queries/q.rq (not in the revision)",
                       gate_module.checkout_differs(self.repo, self.side, nothing_else=True),
                       "SPEC a checkout to be built: nothing else")
-        # Sol, S1 r3: code the harness would import isn't scratch: a sourceless benches/suite/csv.pyc
+        # Code the harness would import isn't scratch: a sourceless benches/suite/csv.pyc
         # (ignored as *.py[cod]) loads before the standard library's csv.
         planted = Path(self.repo, "benches", "suite", "csv.pyc")
         planted.parent.mkdir(parents=True, exist_ok=True)
@@ -2839,7 +2839,7 @@ class MeasurementSides(unittest.TestCase):
                          "SPEC the harness's checkout: no code but the revision's")
 
     def test_the_gates_own_checkout_holds_nothing_else_outside_its_scratch(self):
-        """Sol, PR #60 r1 R1: the harness's checkout refused only names that looked like code, by a
+        """PR #60: the harness's checkout refused only names that looked like code, by a
         case-sensitive suffix. An ignored benches/cases/private.toml put an unreviewed case in the
         plan (the catalogue reads every *.toml), and Windows imports benches/suite/csv.PYC as
         csv.pyc. A scratch root that was a link was left out before links were looked at."""
@@ -2861,7 +2861,7 @@ class MeasurementSides(unittest.TestCase):
         self.assertEqual(named(), ["tmp"], "SPEC the scratch is the checkout's own directory")
 
     def test_no_bytecode_from_before_the_run_is_executed(self):
-        """Sol, PR #60 r1 R2: the gate kept Python's caches in $GATE/pycache, where they outlive a
+        """PR #60: the gate kept Python's caches in $GATE/pycache, where they outlive a
         run and no check reads them: an unchecked-hash .pyc planted there for suitekit/cases.py ran
         in place of the source the gate had checked. No cache older than a run runs in it: an
         earlier run's go with it, and one planted where they were kept, or beside the source, isn't
@@ -2895,7 +2895,7 @@ class MeasurementSides(unittest.TestCase):
         self.assertIn(went, output)
 
     def test_nothing_the_launching_checkout_holds_beside_its_commit_runs(self):
-        """Sol, PR #60 fix checks 1 and 2: files in the checkout the gate was launched from, beside
+        """PR #60: files in the checkout the gate was launched from, beside
         its commit's, ran in the validator before anything was checked: a sourceless
         suitekit/cases/__init__.pyc (git clean -fd keeps it), an untracked suitekit/cases/__init__.py
         or benches/suite/csv.py (no rule of what may lie there tells one from a commit hook's new
@@ -2923,7 +2923,7 @@ class MeasurementSides(unittest.TestCase):
         output = self.run_gate(tmp, "sources", "build", self.side)
         self.assertNotIn(ran, output, "SPEC nothing beside the launching commit's files runs")
         self.assertIn(went, output, "SPEC nor stops the gate")
-        # Sol, fix check 1: the sourceless package, also in a directory no walk can list (0111).
+        # The sourceless package, also in a directory no walk can list (0111).
         planted[0].unlink()
         py_compile.compile(str(body), cfile=str(planted[0].with_suffix(".pyc")), doraise=True)
         output = self.run_gate(tmp, "sourceless", "build", self.side)
@@ -2953,7 +2953,7 @@ class MeasurementSides(unittest.TestCase):
         return farm.as_posix()
 
     def test_no_python_of_the_launching_checkout_runs_in_the_libraries(self):
-        """Sol, PR #60 fix 3's sol-loop S1: scripts/lib/ns.sh, sourced from the launching checkout,
+        """PR #60: scripts/lib/ns.sh, sourced from the launching checkout,
         named that checkout's suite for the Python it starts: where there is no flock it locks with
         suitekit/lock.py, and a changed one there ran in `clean --patch-keyed --remove`. The
         libraries' Python is the launching commit's: the checked checkout's, or for `clean`, which
@@ -2985,7 +2985,7 @@ find "$b" -maxdepth 2 -exec touch -d "$4" {} +'''
         self.assertEqual(list((tmp / "clean" / "gate" / "run").glob("*/[0-9]*-*")), [], "SPEC and leaves no run of its own")
 
     def test_a_callers_paths_are_the_launching_checkouts(self):
-        """Sol, PR #60 fix 3's sol-loop S2: the gate runs its code from a checkout of its own, and
+        """PR #60: the gate runs its code from a checkout of its own, and
         `jobs HEAD --out jobs` wrote its jobs into that checkout, named it their repository, and
         left it unclean, so the gate's next start refused it. A caller's paths, and the jobs'
         repository, are the launching checkout's."""
@@ -3009,7 +3009,7 @@ find "$b" -maxdepth 2 -exec touch -d "$4" {} +'''
                                  f"SPEC the jobs' repository is the launching checkout: {file.name}")
 
     def test_the_report_reads_its_own_jobs_plan_not_the_gate_directory_s(self):
-        """Review r1 R1-F3: `release-gate.sh report` read $GATE/plan.json and inputs.txt, which another
+        """`release-gate.sh report` read $GATE/plan.json and inputs.txt, which another
         request's preparation on the same host could have replaced; the report then judged its passes
         against another family. It reads the copies its own job's prepare left in its results ($OUT);
         a confirmation, which prepares nothing (GATE_PLAN), reads its part's."""
@@ -3061,7 +3061,7 @@ exec "{Path(sys.executable).as_posix()}" "$@"
         self.assertIn("confirm-not=why", confirm)
 
     def test_a_report_that_fails_leaves_no_earlier_report_standing(self):
-        """Review release-gate-zero-passes r1 R2: a part rerun in its results directory whose report
+        """A part rerun in its results directory whose report
         fails before writing (a pass file truncated: load_passes() raises) left the earlier run's
         PASSED release-gate.json in place; the step took its existence for a report and the verdict
         passed it. The earlier report goes before the new one is made: none stands, the step fails."""
@@ -3092,7 +3092,7 @@ exec "{Path(sys.executable).as_posix()}" "$@"
         self.assertIn("JSONDecodeError", (out / "report.log").read_text(encoding="utf-8"))
 
     def test_callers_at_once_share_no_code_checkout(self):
-        """Sol, PR #60 fix check 3 (R3): the code checkout, shared under the launching commit's name,
+        """PR #60: the code checkout, shared under the launching commit's name,
         had no owner: of two `jobs` started at once on one gate directory, one met the other's
         checkout half made (a directory, not yet a checkout) and both failed. Each invocation makes,
         checks and removes its own: one paused while making it stops no other, neither leaves
@@ -3151,7 +3151,7 @@ exec "{Path(shutil.which("git")).as_posix()}" "$@"
         self.assertEqual(listed.count("worktree "), 1, f"SPEC no checkout stays registered:\n{listed}")
 
     def test_what_a_dead_run_left_stops_neither_clean_nor_build(self):
-        """Sol, PR #60 fix check 3 (R3): a code checkout left half made (a directory, not a checkout)
+        """PR #60: a code checkout left half made (a directory, not a checkout)
         stopped `build` and `clean` alike, clean behind the bootstrap that refused it. `clean` makes
         no code checkout: it removes what dead invocations left, keeps a live one's, and the build
         runs after it."""
@@ -3173,7 +3173,7 @@ exec "{Path(shutil.which("git")).as_posix()}" "$@"
         space, = (gate / "run").iterdir()
         for pid in (dead, alive):
             (space / f"{pid}-abcdef" / f"src-{head}").mkdir(parents=True)
-        (gate / f"src-{head}").mkdir()  # 47e5cee7's shared code checkout, half made (Sol's case)
+        (gate / f"src-{head}").mkdir()  # 47e5cee7's shared code checkout, half made
         output = self.run_gate(tmp, "stale", "clean")
         self.assertIn("MiB reclaimed", output, f"SPEC clean runs:\n{output}")
         self.assertFalse((space / f"{dead}-abcdef").exists(), "SPEC what a dead invocation left goes")
@@ -3182,7 +3182,7 @@ exec "{Path(shutil.which("git")).as_posix()}" "$@"
         self.assertIn(f"build {self.side} at {loop}", output, f"SPEC and the build runs:\n{output}")
 
     def test_clean_asks_only_its_own_process_space(self):
-        """Sol, PR #60 fix check 4 (R4): clean took a pid it couldn't find for a dead run's, and a
+        """PR #60: clean took a pid it couldn't find for a dead run's, and a
         live WSL caller's, asked from Git Bash on the same host and gate directory, lost its code
         checkout under it. Clean asks only its own process space: another space's run stays and is
         reported; what a killed run of its own left goes, its checkout's registration with it."""
@@ -3243,7 +3243,7 @@ exec "{git}" "$@"
                          f"SPEC the killed run's registration goes, the main's and the other space's stay:\n{listed}")
 
     def test_a_registration_left_without_its_checkout_stops_no_build(self):
-        """Sol, PR #60 R4 sol-loop S5 (rounds 2 and 4): clean prunes no repository-wide
+        """PR #60: clean prunes no repository-wide
         registrations (another process space's live checkouts are among them), and a build
         checkout of this space's left registered without its directory (a removal killed after its
         .git went, or a clean killed between removing and deregistering) stopped the next build of
@@ -3270,7 +3270,7 @@ exec "{git}" "$@"
         self.assertIn(f"build {self.side} at {loop}", output, f"SPEC the next build makes its checkout:\n{output}")
 
     def test_a_registration_missing_here_is_never_taken_over(self):
-        """Sol, PR #60 R4 sol-loop S6: `worktree add -f` at a path shared by revision took over a
+        """PR #60: `worktree add -f` at a path shared by revision took over a
         registration whose directory was missing here, which may be another process space's live
         checkout under the same path (another mount namespace sharing the repository). The build
         makes its checkout under its own space's path: the other checkout stays registered and
@@ -3291,7 +3291,7 @@ exec "{git}" "$@"
         self.assertEqual(back.stdout.strip(), loop, f"SPEC the other checkout stays registered:\n{back.stderr}")
 
     def test_clean_never_deletes_a_checkout_it_cannot_remove(self):
-        """Sol, PR #60 R4 sol-loop S1 (round 4): where git couldn't remove a checkout, clean's
+        """PR #60: where git couldn't remove a checkout, clean's
         fallback deleted it: on shared storage another process space's live harness checkout,
         whose .git names that space's repository mount. Clean deletes only its own space's
         checkouts so; any other it removes by git, or leaves."""
@@ -3364,7 +3364,7 @@ exec "{git}" "$@"
         return done.stdout + done.stderr
 
     def test_the_build_compiles_the_commit_checked(self):
-        """PR #54 fix check 1 (D2's other half): a replace ref made after the check returned stood
+        """PR #54: a replace ref made after the check returned stood
         another engine in for the checked commit's in the checkout the build compiles, and HEAD
         and a clean status didn't show it. release-gate.sh build, from the check to the checkout,
         reads the objects as stored: with no replace ref (the control) and with one made right
@@ -3401,7 +3401,7 @@ printf '%s\\n' "$out"; exit $code
                          "SPEC measurement side: the gate compiles the commit it checked")
 
     def test_a_message_in_another_encoding_is_no_error(self):
-        """Sol, PR #54 R1 fix review r3 D4: the commit object was decoded in the locale's encoding, so
+        """PR #54: the commit object was decoded in the locale's encoding, so
         a measurement commit whose message is ISO-8859-1 stopped the check with UnicodeDecodeError."""
         message = Path(tempfile.mkdtemp(prefix="measurement-message-"), "message")
         self.addCleanup(shutil.rmtree, message.parent, True)
@@ -3415,7 +3415,7 @@ printf '%s\\n' "$out"; exit $code
         self.assertEqual(gate_module.measured_at(self.repo, self.side, {self.side: commit}), commit)
 
     def test_a_graft_or_a_shallow_boundary_moves_no_parent(self):
-        """Sol, PR #54 R1 fix review D3: the parent query walked history, so a graft or a shallow
+        """PR #54: the parent query walked history, so a graft or a shallow
         boundary refused a valid measurement commit; its parent is the one its object names."""
         commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
         git_dir = Path(self.git("rev-parse", "--absolute-git-dir"))
@@ -3432,7 +3432,7 @@ printf '%s\\n' "$out"; exit $code
         self.assertEqual(gate_module.measured_at(self.repo, self.later, {}), self.later)
 
     def test_a_measurement_commit_is_built_only_as_its_side(self):
-        """Sol r1 S1: built as a side of its own, it would share its side's build directory under
+        """Built as a side of its own, it would share its side's build directory under
         another REVISION, and the second of the two builds would be refused."""
         commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
         with self.assertRaisesRegex(SystemExit, f"is the measurement commit of {self.side[:12]}"):
@@ -3445,7 +3445,7 @@ printf '%s\\n' "$out"; exit $code
         self.assertEqual(inputs, [{"name": f"measure-{self.side[:8]}", "source": {"git": self.repo, "rev": commit}}])
 
     def test_a_job_takes_no_measurement_commit_its_checkout_already_reaches(self):
-        """Master, 10 Nov (IB0343-654a): the fleet stages a job's checkout with its history and takes one git
+        """IB0343-654a: the fleet stages a job's checkout with its history and takes one git
         input (F150), so a measurement commit the checkout reaches is no input of its own; one it doesn't
         reach still is. Both checkouts hold the side itself, so neither takes it as an input."""
         commit = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
@@ -3454,7 +3454,7 @@ printf '%s\\n' "$out"; exit $code
         with patch.object(gate_module, "measurement_sides", return_value={self.side: commit}):
             self.assertEqual(gate_module.side_inputs(self.repo, holding, [self.side]), [])
             self.assertEqual(gate_module.side_inputs(self.repo, self.later, [self.side]), kept)
-            # Review r1 R1: a replace ref here that gives `later` the commit as a parent reaches it
+            # A replace ref here that gives `later` the commit as a parent reaches it
             # only in this repository, not in the history a job's checkout is staged with.
             self.git("replace", "--graft", self.later, self.side, commit)
             self.assertEqual(gate_module.side_inputs(self.repo, self.later, [self.side]), kept)
@@ -3514,7 +3514,7 @@ make bin-after 'profile release --locked' '3 days ago'
             self.assertEqual(remove_checkouts_under(tmp), [], "a checkout this test made stayed registered")
 
     def test_a_patch_keyed_build_is_never_a_verified_build(self):
-        """Sol r1 S2: a gate's pointer or an archive from before T0 could hand a block a build of
+        """A gate's pointer or an archive from before T0 could hand a block a build of
         patched source; build_verified, which block, reuse and pack go through, refuses it."""
         bash = shutil.which("bash")
         if not bash:
@@ -3535,7 +3535,7 @@ done
 
 
 class AbsentSides(unittest.TestCase):
-    """The master's decision of 11 Nov on IB1347, 2: a side declared absent for a case (the
+    """Decided on 11 Nov (IB1347, 2): a side declared absent for a case (the
     catalogue's product gap, or the owner's [[absence]] entry in the policy file of the tree the block
     runs) is never run in the timed blocks."""
 

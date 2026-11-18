@@ -55,7 +55,7 @@ pub struct Snapshot {
     vocabulary: Vocabulary,
     /// Whether its statements are a published version's, or a restriction of them: what
     /// [`Self::shared_state`] grants. Set at construction, copied by the constructors that
-    /// only restrict or reinterpret (the design note's matrix), cleared by those that add
+    /// only restrict or reinterpret (3.0's matrix), cleared by those that add
     /// unpublished statements, never set on an existing snapshot.
     published: bool,
     statistics: Arc<Statistics>,
@@ -368,7 +368,7 @@ pub struct SnapshotIdentity {
 /// How many quads a count found ([`Snapshot::count_in`]): all of them, or, where equality
 /// expansion stands for more than a `u64` holds, at least this many. Planning and existence
 /// take [`Self::at_least`]; an answer that must be exact takes [`Self::exact`] and says so
-/// where there is none (PR #70 fix check 2 F3: a capped count was published as an exact
+/// where there is none (PR #70: a capped count was published as an exact
 /// SPARQL `COUNT`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
@@ -454,7 +454,7 @@ impl Snapshot {
         }
     }
 
-    /// Where what this snapshot derives may be kept (the lifecycle contract's S3): in state
+    /// Where what this snapshot derives may be kept (published-only admission): in state
     /// other operations reach for a published snapshot ([`SharedState`]), in its own
     /// version's slots for a pending, private, staged or added-to one ([`OwnState`]).
     pub fn admission(&self) -> Admission<'_> {
@@ -781,7 +781,7 @@ impl Snapshot {
     /// [`Self::with_inferred_added_within`] for statements this snapshot's own DL bounds
     /// derive from it alone: the view keeps this snapshot's publication (a published
     /// snapshot's gets a token, an unpublished one's none). F2's contract revision for the
-    /// store's DL bounds (the master, 8 Nov): they are its only caller. The workspace's
+    /// store's DL bounds (8 Nov): they are its only caller. The workspace's
     /// `clippy.toml` disallows it everywhere else, a source policy, not a capability.
     pub fn with_inferred_derived_within(
         &self,
@@ -932,7 +932,7 @@ impl Snapshot {
 
     /// [`Self::expanding`], a build of the classes counted on `meter`: `Err` where it stopped
     /// (REAS-3, sweep SW012). A canonical snapshot's alias view is made as `expanding` makes
-    /// it: no counted reader reads canonically (REAS-3 design note, residuals).
+    /// it: no counted reader reads canonically.
     fn expanding_with<M: super::equality::Metering>(
         &self,
         model: ReadModel,
@@ -1051,13 +1051,13 @@ impl Snapshot {
 
     /// The number of quads matching `pattern` in `model`, expanded, counted up to `limit`:
     /// the stored matches over representatives weighted by how many quads each stands for,
-    /// without making the copies. With `limit` 1, whether a read finds one (PR #70 r1 S1).
+    /// without making the copies. With `limit` 1, whether a read finds one (PR #70).
     /// [`Count::AtLeast`] where it stopped at `limit`, or where the copies pass what a `u64`
-    /// holds (its maximum then; PR #70 fix check 2 F3). A counted count ([`Metering`]) counts
-    /// each stored position its scans pass, deleted ones included (REAS-2 fix check r1,
-    /// R2-F1), each copy it expands and each visibility probe; `None` once its meter has
+    /// holds (its maximum then; PR #70). A counted count ([`Metering`]) counts
+    /// each stored position its scans pass, deleted ones included,
+    /// each copy it expands and each visibility probe; `None` once its meter has
     /// stopped, nothing more read ([`Self::count_in_visiting`]). [`Self::count_in`]'s is
-    /// unmetered: the plain scans and probes (REAS-3, the master's 01:37 condition (b)).
+    /// unmetered: the plain scans and probes (REAS-3).
     fn expanded_count<M: Metering>(
         &self,
         classes: &EqualityClasses,
@@ -1071,7 +1071,7 @@ impl Snapshot {
         let visibility = CopyVisibility::new(data, model);
         let mut count: u64 = 0;
         // One account for the count's scans, copies and visibility probes, so at most
-        // `POLL_UNITS` units of them follow any yes (fix check r2 G1's sibling: a scan's
+        // `POLL_UNITS` units of them follow any yes (with an account each, a scan's
         // ledger, the copies' credit and each probe's own allowed one each).
         let mut account = OnMeter::new(meter);
         for stack in Stack::ALL {
@@ -1104,7 +1104,7 @@ impl Snapshot {
                         let mut stopped = false;
                         classes.expand(&quad, pattern, &mut |copy| {
                             // Its probe, counting its own work, then the copy, a unit counted
-                            // before it is counted in (fix check r3 H1).
+                            // before it is counted in.
                             let shown = visibility
                                 .shows_with(&copy, touching, &mut account)
                                 .and_then(|shown| {
@@ -1235,7 +1235,7 @@ impl Snapshot {
         let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
         // Bounded only where every delta has a bound: one at or above the parallel threshold
         // charges exactly as it builds, beside the other's bound, a peak the room read doesn't
-        // cover (review r1, DUR6B-R1-01). Such a pair is built exactly throughout.
+        // cover. Such a pair is built exactly throughout.
         let (bounded, bounds) = match bounds {
             [Some(a), Some(i)]
                 if a + i > 0
@@ -1268,7 +1268,7 @@ impl Snapshot {
         ) {
             Ok(built) => built,
             Err(refused) => {
-                // The asserted stack made is freed before its charge goes (sol-loop r1, S3).
+                // The asserted stack made is freed before its charge goes.
                 drop(asserted);
                 drop(held);
                 return Err(refused);
@@ -1278,7 +1278,7 @@ impl Snapshot {
         // Sound because a run never keeps more than its bound: `Run::delta_bound` is derived as
         // an upper bound of what `Run::from_delta` allocates (`with_change_within` asserts it in
         // debug builds only). The subtraction saturates, but that doesn't make an underestimated
-        // bound safe: the part kept beyond it would go uncharged (review r1, DUR6B-R1-02).
+        // bound safe: the part kept beyond it would go uncharged.
         held.release(
             bounds[0].saturating_sub(asserted_kept) + bounds[1].saturating_sub(inferred_kept),
         );
@@ -1348,7 +1348,7 @@ impl Snapshot {
         self.vocabulary.is_private()
     }
 
-    /// The dictionary lifecycle contract's b(V) (§4.1): a published or shared snapshot's
+    /// The shared bound: a published or shared snapshot's
     /// dictionary end, a private one's overlay start. Every id below it means the same term
     /// in every snapshot of this engine whose bound is it or more.
     pub fn shared_bound(&self) -> u64 {
@@ -1411,7 +1411,7 @@ impl Snapshot {
 
     /// Whether reads see no quad. O(1) where reads take the stacks as they are; under
     /// equality, which can hide every quad the stacks hold, whether a read finds a first one
-    /// ([`Self::exists_in`]: a scan up to it, making no copies) (PR #70 r1 F1, S1).
+    /// ([`Self::exists_in`]: a scan up to it, making no copies) (PR #70).
     pub fn is_empty(&self) -> bool {
         self.len() == 0
             || (self.equality.is_some()
@@ -1541,8 +1541,8 @@ impl Snapshot {
     /// and each copy it expands (1 each); each run's range search a held count makes (1),
     /// and its tombstone words, a run of at most `POLL_UNITS` at a time as they are read.
     /// `None` as soon as `visit` returns false, nothing more read: the count is abandoned,
-    /// nothing is cached. A reader whose stop must see a long count counts with it (REAS-2
-    /// review r1 F2; fix check r1 R2-F1: the count lives in the reader).
+    /// nothing is cached. A reader whose stop must see a long count counts with it (the count lives in the
+    /// reader).
     pub fn count_in_visiting(
         &self,
         model: ReadModel,
@@ -1602,7 +1602,7 @@ impl Snapshot {
         if pattern.graph == GraphSelector::AnyNamed {
             // Every graph minus the default graph: two range counts instead of a scan, both
             // as held. Named graphs are read as held, never expanded, so neither count is an
-            // expanded one, which can read as `u64::MAX` (PR #70 F2 round, sol-loop r1 S1).
+            // expanded one, which can read as `u64::MAX` (PR #70).
             let every = QuadPattern {
                 graph: GraphSelector::Any,
                 ..*pattern
@@ -2272,7 +2272,7 @@ impl Snapshot {
                     None
                 }
             };
-            // One decision for both walks (package fix checks r3, r4): at once, each in
+            // One decision for both walks: at once, each in
             // parts, where the room, read once, covers both whole walks' peaks; otherwise
             // both serially, one after the other, the reference. Against a budget no one
             // else draws from meanwhile, a count is refused only where that would be.
@@ -2575,7 +2575,7 @@ impl Snapshot {
     /// (whether statements still use them is the caller's to check). A private snapshot's
     /// shared indexes don't cover its own terms, and extending them would change state every
     /// snapshot shares: it searches what it can see instead, as a reader of every graph in the
-    /// materialised model ([`Self::text_search_in`]; V3, DICT2 9 Nov 04:02 Q2).
+    /// materialised model ([`Self::text_search_in`]; V3).
     pub fn text_search(
         &self,
         query: &crate::TextQuery,
@@ -2604,7 +2604,7 @@ impl Snapshot {
     ) -> Result<VectorHits<'b>, SearchRefused> {
         if self.is_private() {
             // A snapshot reading within this very budget (a query's envelope): the reader
-            // path charges it through its own `Arc`, as its reads do (sol-loop r1 B3: a
+            // path charges it through its own `Arc`, as its reads do (a
             // bridge holding the budget's room would refuse those reads).
             let reading = self.reads.as_ref().and_then(|reads| reads.0.as_ref());
             if let Some(reads) = reading.filter(|reads| std::ptr::eq(&*reads.budget, budget)) {
@@ -2644,7 +2644,7 @@ impl Snapshot {
                 &inner,
             )?;
             // Of the held room, what the copy takes is let go for it, the rest held until the
-            // inner hits are freed (sol-loop r2 B3: no gap where neither is counted).
+            // inner hits are freed (no gap where neither is counted).
             let held = held.map(|mut held| {
                 held.release(hits.len() * std::mem::size_of::<(TermId, f32)>());
                 held
@@ -2696,7 +2696,7 @@ impl Snapshot {
     }
 }
 
-/// The capability to admit into state other operations reach (the lifecycle contract's S3):
+/// The capability to admit into state other operations reach (published-only admission):
 /// held only for a published snapshot ([`Snapshot::shared_state`]), and carrying it, so an
 /// owner that takes one works on its snapshot and no other. Proves eligibility only: it
 /// replaces none of a cache's key dimensions or reader filters.
@@ -3026,7 +3026,7 @@ mod count_visiting_tests {
     use crate::witness::{self, Site};
     use nrese_rdf::{GraphName, NamedNode};
 
-    /// REAS-2 fix check r1 (R2-F1, compact counts). Spec (`Snapshot::count_in_visiting`'s
+    /// REAS-2, compact counts. Spec (`Snapshot::count_in_visiting`'s
     /// contract): `visit` is called before the work it counts, and nothing more is read once
     /// it returns false; a count's work is every stored position its scan passes, deleted
     /// ones included. Under equality (one class, `a sameAs b`, unrelated to the data), 4 ×
@@ -3112,7 +3112,7 @@ mod node_count_tests {
     use nrese_rdf::NamedNode;
 
     /// A node count is refused only where both walks, serially and one after the other, would
-    /// be (package fix check r4). Two runs of one predicate in the default graph under
+    /// be. Two runs of one predicate in the default graph under
     /// 6,291,584 bytes: the first, 131,072 statements of 65,538 subjects (two parts of 32,769
     /// disjoint groups) and two objects; the second, 131,075 fresh subjects and one of those
     /// objects. The subject walk's first run fits its parts' peak; walked in parts, its merge

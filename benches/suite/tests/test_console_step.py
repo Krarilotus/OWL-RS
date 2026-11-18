@@ -136,7 +136,7 @@ class ConsoleStep(unittest.TestCase):
         self.assertEqual(done.returncode, 0, out)
 
     def test_dependencies_left_by_an_earlier_tree_are_installed_again(self):
-        # sol-loop r1 S1: the Linux gate's worktree stays from one gate to the next, and `git clean -fd`
+        # The Linux gate's worktree stays from one gate to the next, and `git clean -fd`
         # keeps the ignored node_modules: an earlier tree's dependencies would stand in for this one's
         # lockfile.
         (self.repo / "apps/nrese-console/node_modules").mkdir()

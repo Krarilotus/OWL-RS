@@ -254,7 +254,7 @@ cap_gb = 4
 systems = ["graphdb:owl2-ql", "stardog:owl2-ql", "qlever:rewritten", "oxigraph:rewritten", "virtuoso:rewritten"]
 rewrite = "expressible"
 
-# --- the QL schema reader's work per blank class expression (P2-C1 review r1) ------------
+# --- the QL schema reader's work per blank class expression ------------
 
 [[case]]
 name = "ql-memberships-reuse"
@@ -2587,7 +2587,7 @@ cap_gb = 4
 systems = []
 est_min = 1
 
-# Background checkpoints overlapping reads and commits (IB0024 fix check F1): a checkpoint
+# Background checkpoints overlapping reads and commits: a checkpoint
 # runs as a job of the global pool, its file writing on one of its threads. A durable store,
 # 5,000 commits under 8 readers, a checkpoint asked for every 128 KiB of log (a count at
 # 10,000 commits and 1 MiB wrote 2: about 1.2 MiB of log here, 8 to 10 asked); the check makes

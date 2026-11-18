@@ -27,8 +27,8 @@ QUIET_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 def stop(process: subprocess.Popen, grace_s: float = 30):
     """Stops a process and its group: SIGTERM to its process group, SIGKILL after `grace_s` to
     whatever of the group is left (Windows: taskkill /T /F). The grace ends when the group is
-    gone, not the process: a launcher that SIGTERM ends leaves its child, which may ignore it
-    (Sol, windows-job-python r3)."""
+    gone, not the process: a launcher that SIGTERM ends leaves its child, which may ignore
+    it."""
     if os.name == "nt":
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(process.pid)], capture_output=True,
                        creationflags=QUIET_WINDOW)

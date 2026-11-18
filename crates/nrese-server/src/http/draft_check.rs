@@ -1,5 +1,5 @@
 //! Draft checks over HTTP: the Datamodel Workflow's backend-agnostic store-check
-//! protocol (`dmw-store-check/1`, see `docs/integration/datamodel-workflow.md`).
+//! protocol (`dmw-store-check/1`, see `docs/ops/http-api.md`, "Draft checks").
 //!
 //! `GET /api/v1/draft-check/capabilities` declares what this server checks;
 //! `POST /api/v1/draft-check` runs one SHACL, query or reasoning check over the inputs in

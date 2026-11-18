@@ -60,7 +60,7 @@ fn node(atom: &Atom, rdf_type: u64, head: bool) -> Node {
 /// `partners` gives the `owl:sameAs` partners of a term (other than itself): classes and
 /// properties with partners are linked to them (see the module docs). Its error ends the
 /// answer: the keys it is asked about come from the grounded rules, one class pair per
-/// subclass edge, so they grow with the schema (fix check r2, R3-F1: a stopped read as "no
+/// subclass edge, so they grow with the schema (a stopped read as "no
 /// partners" let it read every later key's).
 pub fn non_recursive<E>(
     rules: &[Rule],
@@ -201,7 +201,7 @@ pub fn same_as_partners<S: Source + ?Sized>(
 ) -> Result<Vec<u64>, super::eval::Stopped> {
     #[cfg(test)]
     crate::witness::add(crate::witness::Site::PartnerRead, 1);
-    // `Err` where its poller stopped the read, never a part of the class (fix check r1, B9).
+    // `Err` where its poller stopped the read, never a part of the class.
     let mut out = Vec::new();
     if let Some(same_as) = same_as {
         source.scan(

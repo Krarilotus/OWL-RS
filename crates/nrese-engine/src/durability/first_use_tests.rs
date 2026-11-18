@@ -1,7 +1,7 @@
 //! A store's durable names resolved at their first use (D16-548): an open that finds its root
 //! and changes nothing reads none of them; the first durable write that relies on them, or the
 //! log served to a follower, resolves and syncs them before anything is acknowledged or leaves
-//! the process (DUR-4, deferred-sync design note of 8 Nov).
+//! the process (DUR-4, the deferred sync of 8 Nov).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};

@@ -80,13 +80,13 @@ fn chunks(format: RdfFormat, document: &str) -> Result<usize, String> {
 const AFTER: &str = " <urn:after> <urn:p> <urn:o> .";
 
 /// The witnesses of where a cut fell inside a failed statement, or a header made a load
-/// fail (design note 2026-11-08-split-recovery, W1–W4, W6), and the parser's recovery
+/// fail (W1–W4, W6), and the parser's recovery
 /// rows they come from (P2-A1b). Guards held before.
 #[test]
 fn a_chunked_recovering_parse_is_the_sequential_one() {
     let mut table = Table::default();
     let rows: Vec<(bool, RdfFormat, String)> = vec![
-        // W1: a closer of another kind closes nothing (the parser's R2-11 and A1B-R3-F1).
+        // W1: a closer of another kind closes nothing.
         (
             false,
             RdfFormat::Turtle,
@@ -153,7 +153,7 @@ fn a_chunked_recovering_parse_is_the_sequential_one() {
             RdfFormat::Turtle,
             format!("@version 12 .\n<urn:a> <urn:b> <urn:c> .{AFTER}"),
         ),
-        // The parser's rows: a failing brace counts like a skipped one (R4-1, R4-3).
+        // The parser's rows: a failing brace counts like a skipped one.
         (
             true,
             RdfFormat::TriG,
@@ -162,22 +162,22 @@ fn a_chunked_recovering_parse_is_the_sequential_one() {
             ),
         ),
         // A VERSION whose short string has a raw line break: recovery skips the string as a
-        // malformed token and the directive ends at its `.`, so no cut after the string
-        // (sol-loop r1 S2).
+        // malformed token and the directive ends at its `.`, so no cut after the
+        // string.
         (
             false,
             RdfFormat::Turtle,
             format!("VERSION 12 \"a\nb\"\n<urn:s> <urn:p> <urn:o> .{AFTER}"),
         ),
-        // An escaped line break is part of a valid short string: that VERSION ends with it
-        // (sol-loop r2 S5).
+        // An escaped line break is part of a valid short string: that VERSION ends with
+        // it.
         (
             false,
             RdfFormat::Turtle,
             format!("VERSION \"a\\\nb\"\n<urn:s> <urn:p> \"o\" .{AFTER}"),
         ),
         // A failed VERSION that ends with its string leaves no string behind: an `@` after it
-        // starts a directive, as after one that parses (sol-loop r3 S6).
+        // starts a directive, as after one that parses.
         (
             false,
             RdfFormat::Turtle,
@@ -185,7 +185,7 @@ fn a_chunked_recovering_parse_is_the_sequential_one() {
                 .to_owned(),
         ),
         // A byte order mark before the first directive: the parser reads past it, so the
-        // directive is in force in every chunk (sol-loop r1 S4; before this package too).
+        // directive is in force in every chunk (before this package too).
         (
             false,
             RdfFormat::Turtle,
@@ -193,7 +193,7 @@ fn a_chunked_recovering_parse_is_the_sequential_one() {
         ),
         // A form feed is no whitespace to the lexer (Turtle's WS is space, tab, CR, LF): the
         // statement starting there fails, the `@prefix` with it, and no chunk has `ex:` in
-        // force (package review r1, R1-F1).
+        // force.
         (
             false,
             RdfFormat::Turtle,
@@ -208,7 +208,7 @@ fn a_chunked_recovering_parse_is_the_sequential_one() {
             format!("PREFIX\u{D7} <urn:a> @prefix ex: <urn:> .\nex:s ex:p ex:o .{AFTER}"),
         ),
         // A cut in a line after a character of two bytes: errors later in that line have the
-        // same column, in characters (R1-F3).
+        // same column, in characters.
         (
             false,
             RdfFormat::Turtle,
@@ -234,7 +234,7 @@ fn a_chunked_recovering_parse_is_the_sequential_one() {
     table.done();
 }
 
-/// The outcomes of R1-F1's and R1-F3's witnesses, stated, beside their agreement above:
+/// The outcomes of the witnesses below, stated, beside their agreement above:
 /// - a form feed before a `@prefix` is a byte the lexer can't read (Turtle's WS: space,
 ///   tab, CR, LF; RDF 1.1 Turtle §6.5), so that statement fails with its directive, and
 ///   `ex:s ex:p ex:o` fails on its undeclared prefix: no quad, chunked or not;
@@ -299,8 +299,8 @@ fn every_cut_of_the_recovery_sweep_is_a_statement_start() {
 }
 
 /// Where recovery ends a failed statement, the skimmer cuts again (no parallelism lost for
-/// the rest of the file): a TriG `}` ends its block, open brackets or not (the parser's
-/// R4-4), and a stray closer opens nothing. Valid documents keep their cuts (guards): one
+/// the rest of the file): a TriG `}` ends its block, open brackets or not,
+/// and a stray closer opens nothing. Valid documents keep their cuts (guards): one
 /// at each statement's end, the last chunk the final line break.
 #[test]
 fn the_skimmer_cuts_where_recovery_resumes() {
@@ -331,7 +331,7 @@ fn the_skimmer_cuts_where_recovery_resumes() {
             format!("<urn:g> {{ <urn:s> <urn:p> [ <urn:q> <urn:o> ] }}\n{three}"),
             5,
         ),
-        // A byte order mark before a TriG block's head: still a block (sol-loop r1 S4).
+        // A byte order mark before a TriG block's head: still a block.
         (
             false,
             RdfFormat::TriG,

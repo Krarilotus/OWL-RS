@@ -3,8 +3,8 @@
 //! without the sets, and EXPLAIN says so; a cancelled one fails and isn't planned again. Each
 //! case sets its budget ([`plan::BUDGET`]) from the work its planning does without one, so the
 //! cases hold whatever the constant's value. Red on the orderer without the budget (the
-//! parent commit), but for the guard that says so; the code review's round 3 cases on the
-//! commit before them, and the chain's count on an orderer that doesn't count links.
+//! parent commit), but for the guard that says so; the cancellation-first and EXPLAIN cases
+//! on the commit before them, and the chain's count on an orderer that doesn't count links.
 
 use super::join_order_tests::{Steps, people, scan, steps};
 use super::plan::{self, BUDGET, STAR_STATE, STATISTICS, STEP};
@@ -105,8 +105,8 @@ fn noted_work(detail: &str, patterns: usize, budget: usize) -> usize {
         .unwrap_or_else(|| panic!("{detail}"))
 }
 
-/// Spec: the budget brief (12 Nov 2026), "the check, before every read" and "the fallback",
-/// as its design review reconciled them: a planning whose work without a budget is W plans
+/// Spec: the budget is checked before every read, and past it the planning falls back:
+/// a planning whose work without a budget is W plans
 /// with a budget of W as without one, to the bit, and isn't planned again. With W - 1, or
 /// with less than its first read (`p0`'s sets: a predicate in more sets than the budget), it
 /// is planned again once and gets the plan without the sets, its order and rows to the bit;
@@ -144,7 +144,7 @@ fn past_the_budget_a_bgp_gets_the_plan_without_the_sets() {
 }
 
 /// Spec: as [`past_the_budget_a_bgp_gets_the_plan_without_the_sets`], for a BGP ordered
-/// greedily (13 patterns, more than the exhaustive search takes; the design review's round 2).
+/// greedily (13 patterns, more than the exhaustive search takes).
 #[test]
 fn past_the_budget_a_greedy_bgp_gets_the_plan_without_the_sets() {
     let engine = people();
@@ -164,7 +164,7 @@ fn past_the_budget_a_greedy_bgp_gets_the_plan_without_the_sets() {
     assert!(past.work < all, "{} of {all}", past.work);
 }
 
-/// Spec: the budget brief (12 Nov 2026), "what the count includes": the sets the exhaustive
+/// Spec: what the count includes: the sets the exhaustive
 /// search copies with its states count as their reads do. A budget of this star's reads
 /// alone ([`STATISTICS`]; it reads no characteristic pairs), less than its reads and copies,
 /// gets the plan without the sets.
@@ -183,7 +183,7 @@ fn copies_of_the_sets_count_against_the_budget() {
     assert!(reads < with.work, "{reads} reads, {} in all", with.work);
 }
 
-/// Spec: the budget brief's addendum 2, "what the count includes", counted by hand. Over the
+/// Spec: what the count includes, counted by hand. Over the
 /// graph below, `?x p ?y . ?y q ?z` is planned `q` first (2 matches against 4), and its
 /// planning reads `q`'s sets (one, {q}), then `p`'s links (two: from {p} into {q}, and into
 /// an object that is no subject), each looking up `q`: 1 + 2 · 1 = 3. A budget of 3 keeps
@@ -222,7 +222,7 @@ fn a_chain_counts_the_links_it_reads() {
     assert_eq!((steps(&past), replans), (none, 1), "a budget of 2");
 }
 
-/// Spec: the design review's round 1 (P1a), why the check comes before each read and not
+/// Spec, why the check comes before each read and not
 /// before the search: `?s q ?a . ?s p ?b` with `p` in more sets than the budget and `q` in
 /// one, without `p`. Its planning reads `q`'s set and then the star's one set, never `p`'s
 /// list: with a budget of those two reads it keeps its plan with the sets (no subject has
@@ -255,7 +255,7 @@ fn a_long_list_the_planning_does_not_read_does_not_count() {
     assert_eq!((steps(&past), replans), (none, 1), "a budget of 1");
 }
 
-/// Spec: the design review's round 2 (R2-P1), as the budget brief words it: a cancelled
+/// Spec: a cancelled
 /// planning fails the query as cancelled and isn't planned again, also one that would pass
 /// the budget had it gone on. Guard: green without the budget too, as it is today.
 #[test]
@@ -286,7 +286,7 @@ fn a_cancelled_planning_is_not_planned_again() {
     assert_eq!(REPLANS.get(), 0, "planned again");
 }
 
-/// Spec: the code review's round 3 (cancellation first): a query cancelled before its
+/// Spec (cancellation first): a query cancelled before its
 /// planning fails as cancelled and isn't planned again, also where a greedy search (13
 /// patterns) passes the budget with its starts, before the first step that asks. Not
 /// cancelled, the same planning is planned again.
@@ -319,7 +319,7 @@ fn a_query_cancelled_before_its_planning_is_not_planned_again() {
     assert_eq!(REPLANS.get(), 0, "planned again");
 }
 
-/// Spec: the design review's round 2 (R2-P1): the planning without the sets still asks for
+/// Spec: the planning without the sets still asks for
 /// the query's cancellation at every step. It comes first, before a set search that would
 /// pass its budget at its starts: cancelled at the plain planning's first step, the query
 /// fails as cancelled, and nothing falls back.
@@ -354,8 +354,8 @@ fn the_planning_without_the_sets_stops_when_cancelled() {
     assert_eq!((REPLANS.get(), asked.get()), (0, 1), "fallbacks, steps");
 }
 
-/// Spec: the design (12 Nov 2026), "the fallback is visible", as the budget brief words
-/// it: EXPLAIN shows a BGP planned without the sets because the budget was passed,
+/// Spec: the fallback is visible:
+/// EXPLAIN shows a BGP planned without the sets because the budget was passed,
 /// once, as the first step under the BGP, with the budget and the work done before it; and
 /// nothing of the kind for a BGP planned within the budget (the constant's, which this star
 /// reads far less than).
@@ -399,7 +399,7 @@ fn explain_shows_a_bgp_planned_without_the_sets() {
     );
 }
 
-/// Spec: the code review's round 3 (EXPLAIN provenance): the plan without running
+/// Spec (EXPLAIN provenance): the plan without running
 /// (`plan_query`) shows a BGP planned without the sets too, once, after the plan's nodes
 /// (the order planned); and nothing of the kind within the budget.
 #[test]
@@ -438,7 +438,7 @@ fn the_plan_without_running_shows_a_bgp_planned_without_the_sets() {
     );
 }
 
-/// Spec: the code review's round 3 (EXPLAIN provenance): a cyclic BGP, which runs as a
+/// Spec (EXPLAIN provenance): a cyclic BGP, which runs as a
 /// worst-case-optimal join and isn't planned again, shows its planning without the sets in
 /// executed EXPLAIN once, as the first step under the BGP; nothing of the kind within the
 /// budget.
@@ -485,7 +485,7 @@ fn explain_shows_a_cyclic_bgp_planned_without_the_sets() {
     );
 }
 
-/// Spec: the code review's round 3 re-check (a note per BGP, once): a cyclic BGP joined with
+/// Spec (a note per BGP, once): a cyclic BGP joined with
 /// a property path it shares no variable with is planned with the path (3 patterns and 1
 /// path), which notes that planning; its patterns then run as a worst-case-optimal join.
 /// Past the budget, executed EXPLAIN shows that planning once, not also the estimate's.
@@ -539,8 +539,8 @@ fn start_reads(snapshot: &Snapshot, sets: &CharacteristicSets, predicates: &[&st
         .collect()
 }
 
-/// Spec: the master's order of 12 November (A), "give up before spending", and its doubt
-/// review: every start of a star reads its predicate's sets before the search first checks
+/// Spec (12 November): give up before spending:
+/// every start of a star reads its predicate's sets before the search first checks
 /// its work. Where the first two starts' reads would pass the budget, the planning reads none
 /// of them, is planned again once without the sets, and says it passed after the first
 /// start's reads, as it said when it made them. For the exhaustive search (4 patterns) and
@@ -626,13 +626,13 @@ fn plannings(
     (planned, asked.into_inner())
 }
 
-/// Spec: the master's decision of 13 November 23:58, "a group is refined by the sets only when
-/// the expected work admits it" ([`plan::admits`]), with his order of 12 November 13:53, "plan
-/// with the plain counts first": every BGP is planned without the sets first. One whose plain
+/// Spec (13 November): a group is refined by the sets only when
+/// the expected work admits it ([`plan::admits`]); and (12 November) every BGP is planned
+/// with the plain counts first, without the sets. One whose plain
 /// plan expects too little, as every BGP on this small graph does under the planner's own gate
 /// (its predicates in few sets and its set plan another: there was an allowance for short lists
 /// until then), keeps that plan, reads no set and plans once, and EXPLAIN shows no note for it:
-/// that is the normal case (the master's decision of 14 November 03:26; a BGP admitted and past
+/// that is the normal case (decided on 14 November; a BGP admitted and past
 /// its budget is noted). Admitted, it is planned with the sets after, and gets their plan; past
 /// its budget there, the plain plan, planned once again. Red with an allowance that admits a BGP
 /// whose starts read few sets, and with a note for a BGP the gate keeps.
@@ -810,7 +810,7 @@ fn a_query_cancelled_in_its_set_search_gets_no_plan() {
     );
 }
 
-/// Spec: the budget's cancellation rule and the code review of 14 November (R2-F1): a query
+/// Spec: the budget's cancellation rule and the code review of 14 November: a query
 /// cancelled while its admitted BGP asks for the statistics fails as cancelled, whether they
 /// come back or not (a build that failed or wasn't kept answers none), and plans nothing more.
 /// Red with the plain plan returned for no statistics before the check.
@@ -891,8 +891,8 @@ fn a_query_cancelled_while_it_estimates_visits_nothing_more() {
     assert!(asks > 0, "no estimate asked for after the cancel");
 }
 
-/// Spec: the master's order of 13 November, "plain planning pays only for what it uses: no
-/// search state built when the gate keeps a group from the sets": a search without the
+/// Spec (13 November): plain planning pays only for what it uses, no
+/// search state built when the gate keeps a group from the sets: a search without the
 /// characteristic sets keeps no star predicates or edges in its states (only the estimates
 /// from the sets read them); the same patterns searched with the sets keep them. Red with
 /// that state built whatever the search.
@@ -957,7 +957,7 @@ fn a_bgp_without_an_open_star_is_planned_once() {
     );
 }
 
-/// Spec: the master's order of 12 November 13:53, "effort follows expected work", and the
+/// Spec (12 November): effort follows expected work; and the
 /// gate's code review (F3, catalogue D16-559): a BGP's set search may do
 /// [`plan::SET_ENTRIES_PER_ROW`] per row its plain plan expects where that is more than the
 /// least budget. With the least budget ([`plan::FLOOR`]) below the work its set plan takes, a

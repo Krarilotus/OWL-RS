@@ -787,7 +787,7 @@ impl<'a> Query<'a> {
             // Counting per parent is decided once per gather: when what it has read passes the
             // budget, or before a value whose matches alone would. It is taken only where it
             // reads fewer entries than the gather has yet to read, shown by counting what is
-            // left: what is read is spent (notes/2026-11-02-pm-p2-direction-invariant.md). A
+            // left: what is read is spent. A
             // value's matches are known before they are read for the pattern's heavy values,
             // found once per query (a count per value made uniform triangles 29 % more
             // instructions, 19 Oct 2026).
@@ -1373,7 +1373,7 @@ mod tests {
     /// K triangles A_i -> B -> C -> A_i, 64 more predecessors of C (so C is heavy) and M
     /// more successors of B. Per prefix A_i the gather reads C's 65 predecessors; reading
     /// B's M + 1 successors for every A_i instead turned 66,560 entries into 67,109,888 at
-    /// K = 1,024, M = 65,536 (PR #81 review r1, F1). The count is exact (3K, three
+    /// K = 1,024, M = 65,536 (PR #81). The count is exact (3K, three
     /// rotations each), and the entries read in either direction grow with K + M, not K M.
     #[test]
     fn a_message_counted_per_parent_reads_no_more_than_gathering_it() {
@@ -1436,7 +1436,7 @@ mod tests {
     /// A B_j D_i (P T) and 2 P T statements Z_k q C_0: `?a p ?b . ?a ?b ?c . ?c p ?a` has
     /// one solution, (A, B_0, C_0), and under a = A the gather reads one entry, C_0's
     /// 2 P T + 1 matches being one there. Taking the heavy count for the gather's cost
-    /// counted per B_j instead: P T entries (PR #81 fix check r1). Numbered and read as
+    /// counted per B_j instead: P T entries (PR #81). Numbered and read as
     /// the COUNT caller does (`cyclic_count`: variables in subject, predicate, object order).
     #[test]
     fn a_message_counted_per_parent_reads_no_more_than_the_gather_under_a_bound_prefix() {
@@ -1625,8 +1625,8 @@ mod tests {
     /// probed, never the parent's matches read. K triangles A_i -> B -> C1 -> A_i, C2 -> A_i,
     /// 65 more predecessors of C1, and B -> D0 with D0 standing for M aliases: B's
     /// matches estimate as 2 (C1, D0) against two child values, while the read gives
-    /// M + 2. Reading them per A_i made K (M + 2) entries (sol-loop r1 S1 on PR #81's
-    /// R1-F1 repair); the count is exact (3K) and the entries grow with K + M.
+    /// M + 2. Reading them per A_i made K (M + 2) entries (PR #81's repair); the count is
+    /// exact (3K) and the entries grow with K + M.
     #[test]
     fn a_parent_counted_per_value_reads_no_expanded_matches() {
         use super::{Pos, Query, Stats};

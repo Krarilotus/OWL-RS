@@ -257,7 +257,7 @@ fn stopped_island_requests_do_not_split_or_start_search() {
 /// down, or one a class gives. Under `HasKey(⊤ () (d))` two individuals with the value 0
 /// so are one, which `A(a)`, `B(b)` with `A`, `B` disjoint contradicts: inconsistent,
 /// though each alone is consistent and fills a batch of its own. The same holds for a key
-/// over a transitive `R` (PR #33 review, R1) with `R(a, a)`, `R(b, a)`: `a` is a named
+/// over a transitive `R` (PR #33) with `R(a, a)`, `R(b, a)`: `a` is a named
 /// `R`-value of both, alone or with `d`; and for a key of no property, which makes every
 /// named member of its class one (`C(a)`, `C(b)`). Without `b`'s last assertion the ontology is
 /// consistent (`b` has no value), so the touched islands of adding it say inconsistent or

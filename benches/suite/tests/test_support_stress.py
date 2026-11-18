@@ -40,7 +40,7 @@ def report(probe, count, members: int, zero: str = "") -> dict:
 
 class FromTheCatalogue(unittest.TestCase):
     """Spec: the owner's bench intent (run at any level, pruned by capability, the systems
-    that can't express it reported, never dropped); review r1 R1."""
+    that can't express it reported, never dropped)."""
 
     def test_the_suite_runs_its_cases_and_reports_who_cant(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -113,7 +113,7 @@ class Series(unittest.TestCase):
 class Qualification(unittest.TestCase):
     """Spec: StoreConfig::support_sets keeps that many sets per statement, so at a cap of at
     least an input's sets per target nothing is hidden and a reader's answers are the oracle's
-    exactly (review r1 R2); below it the cap only hides."""
+    exactly; below it the cap only hides."""
 
     def test_an_arm_whose_cap_keeps_every_set_rejects_a_wrong_answer(self):
         sets = {}
@@ -143,8 +143,8 @@ class Qualification(unittest.TestCase):
 
 
 class Updates(unittest.TestCase):
-    """Spec: a case timing the reader's updates checks what its timed step did (Sol's review r1
-    of the D6 harness, H1 and H2): the markers the update leaves, one per member of ex:D, and
+    """Spec: a case timing the reader's updates checks what its timed step did:
+    the markers the update leaves, one per member of ex:D, and
     for the pending read its own answer, where u2's `seen` markers exist only if its operations
     ran in order. An update that matches nothing, or a pending read that ignores its operations
     or answers 0, fails its case's check."""

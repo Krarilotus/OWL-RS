@@ -580,8 +580,8 @@ struct Shared {
     /// The store's commit clock, microseconds since 1970: the latest time a commit of it was
     /// stamped or logged with, so no commit is stamped before it
     /// ([`crate::durability::commit_time`]). Apart from a version's time, which is unknown
-    /// while it holds commits of unknown time: the clock stays known through them (review r1,
-    /// R1-F2). Recovered from the checkpoint and the log; changed by writers only.
+    /// while it holds commits of unknown time: the clock stays known through them.
+    /// Recovered from the checkpoint and the log; changed by writers only.
     clock: AtomicU64,
     /// The quad-layout forms of default-graph runs alive, shared by the pending versions (and
     /// a commit) that read a base in the quad layout: their bytes, counted in the index memory
@@ -663,8 +663,8 @@ impl Shared {
                     self.dictionary.save_derived();
                     return Ok(snapshot.revision());
                 }
-                // The names a reopen left pending, before anything is written (deferred-sync
-                // design note of 8 Nov): a failure leaves the log as it was.
+                // The names a reopen left pending, before anything is written (the deferred
+                // sync of 8 Nov): a failure leaves the log as it was.
                 wal.settle_names()?;
                 wal.rotate(snapshot.revision() + 1)?;
                 (snapshot, clock)
@@ -1211,7 +1211,7 @@ impl Engine {
 
     /// The ids of `terms`, each added to the dictionary if it has none, without the writer
     /// slot: the one way to append to the dictionary outside a writer. Only for system
-    /// vocabulary, names never statements (the lifecycle contract's limit L2): DL and OWL
+    /// vocabulary, names never statements: DL and OWL
     /// vocabulary, fresh entailment names and the DL bounds' generated names, which derive only
     /// from fixed names, the configuration and the published ontology, never from a request.
     /// Those names must keep their ids for every later reader (state other operations reach

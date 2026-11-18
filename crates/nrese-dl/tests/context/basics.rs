@@ -142,7 +142,7 @@ fn conjunctive_fillers_and_bottom_propagation() {
 }
 
 /// An axiom the reader left out (a fatal diagnostic): a model of the rest says nothing of
-/// the whole, so the verdict is undecided; a clash in the rest still stands (sol-loop S2).
+/// the whole, so the verdict is undecided; a clash in the rest still stands.
 #[test]
 fn a_left_out_axiom_leaves_consistency_undecided() {
     use nrese_dl::verdict::Verdict;
@@ -404,7 +404,7 @@ fn a_wide_clause_body_is_never_misread() {
     }
 }
 
-/// A clause body with more neighbours than a slot's variables name (review r1, R1-C1):
+/// A clause body with more neighbours than a slot's variables name:
 /// `A ⊑ ∃rᵢ.⊤` and `⊤ ⊑ ∀r₀.⊥ ⊔ … ⊔ ∀rₙ₋₁.⊥` make `A` unsatisfiable. It is found, or the
 /// Horn stage refuses: never a crash, never left out.
 #[test]

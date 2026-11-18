@@ -1,5 +1,5 @@
-//! Guard of DRed's one-step derivation checks after their operation stopped (REAS review r1,
-//! F2): asked once the stop has fired, `derivable_by` and `derivable_with` do no work at
+//! Guard of DRed's one-step derivation checks after their operation stopped:
+//! asked once the stop has fired, `derivable_by` and `derivable_with` do no work at
 //! all, not even enumerating the producers of the fact, which copies and sorts a reference
 //! per producer. Counted as the bytes they hold (`nrese_exec::measure`), so this file is a
 //! test binary of its own.
@@ -70,7 +70,7 @@ fn a_stopped_derivation_check_allocates_nothing() {
         "the operation has stopped before the checks are asked"
     );
     let fired = || stopped.fired();
-    // Stopped, the checks answer that (REAS-2 fix check r1, rule 2: once a "false").
+    // Stopped, the checks answer that (once a "false").
     let (by, held) = measure::measure(|| ground.derivable_by(&source, fact, &all, true, &fired));
     assert_eq!(
         (by, held),

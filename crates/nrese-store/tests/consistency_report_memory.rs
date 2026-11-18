@@ -94,7 +94,7 @@ fn a_commit_records_its_violations_within_the_request_budget() {
 
 /// The most the requests' shared memory held for `command` with no consistency check at all
 /// (reasoning off), with memory to spare: what the commit itself needs, nothing of a check or
-/// its report (sol-loop r2 T1). Its pending changes draw on the same memory as the report
+/// its report. Its pending changes draw on the same memory as the report
 /// (D16-039), so a pool smaller than this refuses the commit before any check.
 fn own_peak(command: MutationCommand) -> usize {
     let mut config = StoreConfig::in_memory();
@@ -124,7 +124,7 @@ fn a_commit_is_rejected_when_not_one_violation_can_be_listed() {
 }
 
 /// A pool with no room beyond what the commit needs without any check (as above), and a
-/// rule whose atoms both have facts that never join (sol-loop r1 S1): nothing fires, so
+/// rule whose atoms both have facts that never join: nothing fires, so
 /// nothing is charged and the consistent commit is accepted; a budget without room for a list
 /// that stays empty is no inconsistency.
 #[test]

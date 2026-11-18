@@ -3,8 +3,8 @@
 //! path). The tests and benchmarks that count on the suites, here and in nrese-fuzz, take
 //! their files from here: every file of the asked kinds the pinned commit's tree holds under
 //! the asked paths, read from that tree's objects. The checkout's index and working files
-//! decide nothing: they can drop, repeat or change a file, the pinned tree can't (Sol, PR #61
-//! F1). A corpus that is missing, or whose pinned objects can't be read in full, qualifies
+//! decide nothing: they can drop, repeat or change a file, the pinned tree can't (PR #61).
+//! A corpus that is missing, or whose pinned objects can't be read in full, qualifies
 //! nothing. The script's other pins, the GeoSPARQL benchmark's checkout and the OWL 2 test
 //! cases' file (pinned by its SHA-256), are admitted alike ([`pins`]).
 
@@ -374,7 +374,7 @@ pub fn pinned(
     let broken = |reason: String| Unqualified::Broken(vec![reason]);
     let at = format!("{} at {}", checkout.repository, checkout.commit);
     // Only objects already here are read: in a partial clone, ls-tree and cat-file fetch a
-    // missing one over the network, with no deadline (Sol, PR #61 fix check 1). rev-list with
+    // missing one over the network, with no deadline (PR #61). rev-list with
     // --missing=print fetches nothing (Git 2.16 on) and marks each object under the paths
     // that isn't here; one such is a pin not fetched in full, and fetching is the script's.
     let tree = format!("{}^{{tree}}", checkout.commit);
@@ -449,8 +449,8 @@ pub fn pinned(
 /// The objects `wanted` names, read in one `git cat-file --batch`, each checked to be the
 /// blob asked for.
 fn read(root: &Path, wanted: &[(String, String)]) -> Result<Vec<Blob>, String> {
-    // Its diagnostics go to the caller's: a pipe nobody reads would stop it once full (Sol,
-    // PR #61 r1 sol-loop S2: GIT_TRACE_PACK_ACCESS writes 140,000 characters on the suites).
+    // Its diagnostics go to the caller's: a pipe nobody reads would stop it once full (PR #61: GIT_TRACE_PACK_ACCESS writes 140,000 characters on the
+    // suites).
     let mut child = git(root, &["cat-file", "--batch"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -509,8 +509,8 @@ pub fn sparql(extensions: &[&str]) -> Result<Vec<File>, Unqualified> {
     let dirs = SUITES.map(|suite| format!("sparql/{suite}"));
     let dirs: Vec<&str> = dirs.iter().map(String::as_str).collect();
     let blobs = pinned(&checkout, &dirs, extensions)?;
-    // Each file's place from the checkout's, never from the file, which may be gone (Sol, PR
-    // #61 r1 sol-loop S1): the pinned bytes are the file.
+    // Each file's place from the checkout's, never from the file, which may be gone (PR #61):
+    // the pinned bytes are the file.
     let root = checkout.root.canonicalize().map_err(|e| {
         let at = checkout.root.display();
         Unqualified::Broken(vec![format!("{at}: {e}")])

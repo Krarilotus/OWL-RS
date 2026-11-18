@@ -103,13 +103,13 @@ struct Slot {
     graph: Option<Arc<Hnsw>>,
     /// The background build building or extending it, by its reservation: only that
     /// build's end (installed, or dropped unrun) ends it, so a warm-up's install or another
-    /// build's end can't release a build still holding it (PR #79 review, R79-01).
+    /// build's end can't release a build still holding it (PR #79).
     reserved: Option<Claim>,
 }
 
 /// A background build's reservation of its slot: an allocation of its own, held by the
 /// slot and the build and compared by address, so it equals no other build's, in this
-/// index or in one loaded in its place, and no count can wrap (PR #79 fix check r1).
+/// index or in one loaded in its place, and no count can wrap (PR #79).
 #[derive(Debug, Clone)]
 pub(crate) struct Claim(Arc<()>);
 
@@ -181,7 +181,7 @@ impl VectorIndex {
 
     /// Takes `loaded` (read from its file) in place of this index, if it covers more and no
     /// build holds a reservation in this one: replacing a reservation would let a second
-    /// build start beside its holder (PR #79 fix check r1). Whether it took it.
+    /// build start beside its holder (PR #79). Whether it took it.
     pub(crate) fn adopt(&mut self, loaded: VectorIndex) -> bool {
         let reserved = self
             .spaces
@@ -562,7 +562,7 @@ pub(crate) fn search<'b>(
 /// `SearchScope::Reader`). The report's space and scan are the eligible vectors, counted in
 /// a pass of their own: the scan is the global one ([`nrese_vector::exact`], charged to
 /// `budget` as [`search`]'s is), `eligible` asked first and `accept` only of what it took
-/// (the separate kernel was dropped by the instruction count, master 7 Nov 17:08;
+/// (the separate kernel was dropped by the instruction count;
 /// `syn24-count-4-8faacb59`). No lock of the index is held, as in [`search`]: the same
 /// snapshot, scoped.
 pub(crate) fn search_eligible<'b>(
@@ -724,13 +724,13 @@ mod tests {
     }
 
     /// A background build holds its space's reservation until it ends, and only its own
-    /// end releases it (PR #79 review, R79-01). The schedule of the public calls: a
+    /// end releases it (PR #79). The schedule of the public calls: a
     /// search starts background build A; a warm-up builds the graph meanwhile; more
     /// vectors arrive, and a search finds the graph behind again; A is cancelled. No
     /// second build starts while A holds the reservation (the warm-up's install doesn't
     /// end it), and after A's cancellation exactly one does, B, beside which no third
     /// starts until B ends. B installs its graph; more vectors arrive and a search starts
-    /// C before B's end (its drop) runs, which leaves C's reservation standing (Sol r1).
+    /// C before B's end (its drop) runs, which leaves C's reservation standing.
     #[test]
     fn a_build_s_reservation_is_ended_by_that_build_alone() {
         let (index, query) = large_space();

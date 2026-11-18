@@ -25,7 +25,7 @@ pub const XSD: &str = namespace!(XSD);
 /// The IRIs of the OWL 2 datatype map's datatypes and facets, `rdfs:Literal` and
 /// `rdf:langString`: those a source's ids are looked up by when it can't give an IRI's
 /// text. Joined at compile time, so a caller that looks them up pays no allocation for
-/// them (I24c-2; orchestrator, 8 Nov 17:28: "fixed IRIs cost nothing at run time").
+/// them (I24c-2: "fixed IRIs cost nothing at run time").
 pub const DATA_IRIS: &[&str] = &[
     concat!(namespace!(XSD), "decimal"),
     concat!(namespace!(XSD), "integer"),
@@ -104,13 +104,13 @@ macro_rules! vocabulary {
 
         impl Vocabulary {
             /// Every term, by its field's name, with its IRI, joined at compile time: what a
-            /// caller choosing input for the mapping reads by, at no run-time cost (I24c-2;
-            /// orchestrator, 8 Nov 17:28).
+            /// caller choosing input for the mapping reads by, at no run-time cost
+            /// (I24c-2).
             pub const IRIS: &'static [(&'static str, &'static str)] =
                 &[$((stringify!($field), concat!(namespace!($ns), $local)),)*];
 
             /// Looks every term up through `id_of`, by IRIs joined at compile time: no
-            /// allocation per term (orchestrator, 8 Nov 17:28; the QL reader builds one per
+            /// allocation per term (the QL reader builds one per
             /// fresh read, the mapping one per read).
             pub fn new(id_of: &dyn Fn(&str) -> Option<u64>) -> Self {
                 Self {

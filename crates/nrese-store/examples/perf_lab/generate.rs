@@ -616,8 +616,8 @@ fn entities(p: &Params, rng: &mut Rng, nt: &mut Nt, turtle: bool) -> std::io::Re
     Ok(e)
 }
 
-/// What the OWL 2 QL schema reader reads per blank class expression (P2-C1 review r1's cost
-/// question): `expressions` restrictions `_:eE` (`owl:onProperty :S{E mod 10}`,
+/// What the OWL 2 QL schema reader reads per blank class expression:
+/// `expressions` restrictions `_:eE` (`owl:onProperty :S{E mod 10}`,
 /// `owl:someValuesFrom :A{E mod 10}`), each with `members` individuals asserted to be in it
 /// (`:mE_K a _:eE`), a generating axiom `:P ⊑ ∃worksFor.Org`, 1,000 people in `P` linked by
 /// `knows`. `commits` commits each add a statement and as many later remove it again:
@@ -1508,7 +1508,7 @@ fn sameas_giant(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expec
 /// subclass chain, 21 Oct 2026): `classes` classes in a `rdfs:subClassOf` chain and
 /// `individuals` members of the last, as one INSERT DATA; with `ranged=1`, also a property
 /// with a range and one literal value, whose conclusion (the literal's type) no store holds
-/// (PR #46 review r1 F1). The data file stays empty.
+/// (PR #46). The data file stays empty.
 fn first_load(p: &Params, commits: &str) -> std::io::Result<Expect> {
     let (classes, individuals) = (p.get("classes", 250), p.get("individuals", 400));
     let t = |s: &str, p: &str, o: &str| format!("{s} {p} {o} .");

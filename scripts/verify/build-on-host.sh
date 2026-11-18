@@ -3,8 +3,8 @@
 # sends this file inline, so the commit under test needn't have it). Never run it by hand on a
 # fleet host; only the fleet starts it. It runs in the job's checkout of the commit to build.
 #
-# The cache is the host's one cache, shared with the gates (scripts/lib/gate-job.sh;
-# Harness/notes/2026-10-20-host-cache-contract.md): ~/fleet/cache/owlrs-gate, one build or gate at a
+# The cache is the host's one cache, shared with the gates (scripts/lib/gate-job.sh):
+# ~/fleet/cache/owlrs-gate, one build or gate at a
 # time (its lock). The binary goes to <cache>/bin-<sha12>/ (nrese-server, REVISION, SHA256SUMS,
 # PROVENANCE) for the run jobs on this host. A binary already there is reused, not rebuilt, only with
 # the PROVENANCE an isolated build of this tree writes (verify.py runs it only with that, too).
@@ -78,7 +78,7 @@ fi
 # demand), taken under its own lock, unless a build of the old kind holds it now; then a later build
 # removes them. The lock file itself stays (0 bytes): a build of the old kind waiting on it would
 # otherwise take a lock no later migration sees, and a second migration could remove the target it
-# builds in (Sol r3, finding 1). Builds of the old kind come from harness commits before 7fdb5b58.
+# builds in. Builds of the old kind come from harness commits before 7fdb5b58.
 migrated=0
 if [ "$old" != "$cache" ] && [ -d "$old" ]; then
   exec 8> "$old/lock"
@@ -86,7 +86,7 @@ if [ "$old" != "$cache" ] && [ -d "$old" ]; then
     while IFS= read -r -d '' entry; do
       # Its size, the number before du's first tab (a name may hold anything, newlines too); an
       # entry gone meanwhile has none and nothing to remove, one that can't be measured stops
-      # the build (Sol r4, finding 1).
+      # the build.
       entry_bytes=0
       if du_line=$(du -s --block-size=1 -- "$entry" 2> /dev/null); then
         entry_bytes=${du_line%%$'\t'*}
@@ -120,7 +120,7 @@ tree=$(git rev-parse 'HEAD^{tree}')
 # What only an isolated build of this tree writes beside its binary ($1: the binary's SHA-256). A
 # bin-<sha12> without it is from before the builds were isolated (26 Oct 2026), when a shared cargo
 # target could leave another commit's code under this one's name with a valid checksum and REVISION
-# (PR #47, Sol r1 F1): it is built again.
+# (PR #47): it is built again.
 provenance() {
   printf 'contract isolated-build/1\nrevision %s\ntree %s\nrustc %s\nsha256 %s\n' "$sha" "$tree" "$release" "$1"
 }
@@ -188,7 +188,7 @@ def mib(path):
         return None
 
 
-# The contract's sweep (Harness/notes/2026-10-20-host-cache-contract.md §6), as gate-job.sh runs it:
+# The contract's sweep, as gate-job.sh runs it:
 # never what this build uses (its binary; it builds outside the cache); wt, bin, rustup and cargo
 # match none of the patterns. The gates' legacy wt/target (an older gate tree's Miri build in the
 # worktree) is an entry too, as they sweep it.

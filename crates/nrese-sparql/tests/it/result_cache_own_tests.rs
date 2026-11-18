@@ -1,5 +1,5 @@
-//! An unpublished version's own result cache (the lifecycle contract's S3, "state owned by its
-//! own version"; package 3.0c's slot; 3.6's design note §11, items O1–O3). A pending view a
+//! An unpublished version's own result cache (state owned by its
+//! own version; package 3.0c's slot). A pending view a
 //! session keeps is read again and again: its parts and its answer's bytes are kept in its
 //! version, never in the store's cache, and every answer is the one an evaluation without a
 //! cache gives. The oracle is the version's cache (`OwnState::get`), the store's cache's
@@ -128,7 +128,7 @@ fn store_cache() -> (Arc<ResultCache>, QueryOptions) {
     (cache, options)
 }
 
-/// O1: a kept pending view read again and again.
+/// A kept pending view read again and again.
 ///
 /// - Input: the store's cache; one writer's pending snapshot, kept; the join and the group,
 ///   their rows and their bytes, three times.
@@ -165,7 +165,7 @@ fn a_kept_pending_view_is_answered_from_its_own_versions_cache() {
     assert_eq!(cache.stats(), before, "the store's cache is untouched");
 }
 
-/// O2: equality modes of one version (3.0c: every view of one version reaches its slot).
+/// Equality modes of one version (3.0c: every view of one version reaches its slot).
 ///
 /// - Input: one pending version read with `owl:sameAs` expansion and read as stored, in both
 ///   orders, twice each; `a sameAs a2`, so the expanded answer has `a2`'s rows too.
@@ -216,7 +216,7 @@ fn equality_modes_of_one_version_keep_their_own_answers() {
     }
 }
 
-/// O3: two pending versions of one transaction keep caches of their own.
+/// Two pending versions of one transaction keep caches of their own.
 ///
 /// - Input: one transaction's pending state taken twice (each call makes a version); the join
 ///   on the first, then on the second.

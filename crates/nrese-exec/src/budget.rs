@@ -1067,7 +1067,7 @@ impl<B: Deref<Target = Budget>> Reservation<B> {
             "absorb: a reservation on another budget"
         );
         let bytes = std::mem::take(&mut other.bytes);
-        // To a measurement the bytes stay covered throughout (sol-loop r5 G1): nothing moves
+        // To a measurement the bytes stay covered throughout: nothing moves
         // between equal tags, and otherwise the new cover comes before the old one goes.
         #[cfg(any(test, feature = "measure"))]
         {
@@ -1319,8 +1319,8 @@ impl<B: Deref<Target = Budget>> Drop for Grant<B> {
 /// [`Reservation`] on a budget, or a [`Share`] of a [`Pool`]. Its methods are the buffers'
 /// own: each takes a token only this crate makes, so nothing but a buffer's growth, its
 /// drop and its hand-over ([`Reservation::transfer`], [`Share::transfer`]) changes what a
-/// buffer is charged (the executor memory stack's second lead, 8 Nov: a path bag's charge
-/// kept beside its vector by hand disagreed with it at a new site in each of six rounds).
+/// buffer is charged (8 Nov: a path bag's charge
+/// kept beside its vector by hand disagreed with it at a new site six times over).
 pub trait Hold: hold::Charge {}
 
 impl<B: Deref<Target = Budget>> Hold for Reservation<B> {}
@@ -1375,8 +1375,8 @@ pub mod hold {
 }
 
 /// Test-only: a pause on one thread between a growing vector's exact charge and its
-/// optional one, where a sibling's growth can come between them (the budget types' owner's
-/// race, 8 Nov).
+/// optional one, where a sibling's growth can come
+/// between them.
 #[cfg(test)]
 pub(crate) mod growing {
     use std::cell::RefCell;
@@ -1664,13 +1664,13 @@ impl<T, H: Hold> Charged<T, H> {
     ///
     /// Grown by only what is asked, a vector near its limit reallocated at every push,
     /// copying all its items each time, until it was refused: pushes there cost copies
-    /// quadratic in the vector's length (the executor memory stack's second lead, 8 Nov). And
+    /// quadratic in the vector's length. And
     /// a capacity chosen from a reading of the room, then charged exactly, was refused, and
     /// its budget recorded as refused, where a sibling's growth came between the reading and
-    /// the charge although what was asked still fitted (the budget types' owner, 8 Nov). Grown
+    /// the charge although what was asked still fitted. Grown
     /// by what is asked, then doubled where that fits whole, else by no more than half of the
     /// room beyond (not half of the room alone: a vector that could double stopped short and
-    /// was refused at its next growth, r5's 65,536 ends under 900 KiB), near the limit it grows
+    /// was refused at its next growth, a column of 65,536 ending under 900 KiB), near the limit it grows
     /// a logarithmic number of times before it is refused, and it is refused only where what is
     /// asked has no room.
     pub fn reserve(&mut self, additional: usize) -> Result<(), BudgetExceeded> {
@@ -1680,8 +1680,8 @@ impl<T, H: Hold> Charged<T, H> {
         }
         let size = std::mem::size_of::<T>();
         // At least std's first capacity (`Vec`'s: 8 items of a byte, 4 up to 1 KiB, else 1),
-        // so a small bag grows once, not three times (the executor memory stack's second
-        // lead's counts: a path from 2.7 million bound values makes a bag at each).
+        // so a small bag grows once, not three times (the executor memory stack's
+        // counts: a path from 2.7 million bound values makes a bag at each).
         let first = match size {
             1 => 8,
             2..=1024 => 4,
@@ -2393,7 +2393,7 @@ mod tests {
     /// workers (each half of the fill on its own), each waiting until the other has started,
     /// for at most 5 seconds, so that neither stops the other first. And a worker that panics
     /// while another fails unwinds out of the fill with every item made dropped once, the
-    /// vector as it was and the items' memory released (Sol, w1-step1 r1, F1).
+    /// vector as it was and the items' memory released.
     #[test]
     fn a_parallel_fill_returns_its_lowest_failure_and_unwinds_past_one() {
         use std::time::{Duration, Instant};
@@ -2587,7 +2587,7 @@ mod tests {
         assert!(vec.iter().copied().eq(0..pushed as u64));
     }
 
-    /// Spec (the budget types' owner, 8 Nov): two vectors on one budget, growing at once near
+    /// Spec: two vectors on one budget, growing at once near
     /// its limit, both grow where what each asks fits, and the budget isn't recorded as
     /// refused. The limit leaves room beside their 1,000 items each for both to ask 1,001 more,
     /// and for either alone to double, but not for both to double. The first to grow pauses
@@ -2633,7 +2633,7 @@ mod tests {
     /// A vector whose doubling fits doubles, however near the limit: 32,768 items under a
     /// limit of three times their bytes (32,768 beside 65,536 while it moves) grow to 65,536
     /// and take them all. Grown by half of the room beyond what is asked alone, it stopped at
-    /// 49,152 and its next growth was refused (r5's path column of 65,536 ends under 900 KiB,
+    /// 49,152 and its next growth was refused (a path column of 65,536 ends under 900 KiB,
     /// ems-r4-c6-bf3699b9).
     #[test]
     fn a_vector_whose_doubling_fits_doubles() {
@@ -2986,8 +2986,8 @@ mod tests {
         assert_eq!(request.used(), 0);
     }
 
-    /// Guard (the executor memory stack's timing, Harness notes/2026-11-02-exec-memory-stack.md
-    /// EMS-13: a shared atomic per item cost GROUP_CONCAT x1.94 in parallel workers): an item
+    /// Guard (the executor memory stack's timing, EMS-13: a shared atomic per item cost GROUP_CONCAT
+    /// x1.94 in parallel workers): an item
     /// within a grant's spare makes no budget call at all, so 10^4 items of 6 bytes after the
     /// first make none; every level is exact again once the grant ends, the server's holding
     /// the request's credit until the request ends.
@@ -3014,7 +3014,7 @@ mod tests {
         assert_eq!(server.used(), 0);
     }
 
-    /// Spec (the budget types' owner's ruling, 3 Nov): a grant's refill is never refused and
+    /// Spec: a grant's refill is never refused and
     /// never recorded as a refusal; an item that fits is never refused for the spare; where
     /// an item's rest doesn't fit, nothing is charged and the refusal is the real one; a
     /// give-back keeps spare up to the cap; no spare below 64 KiB of envelope, nor directly
@@ -3060,7 +3060,7 @@ mod tests {
         assert_eq!(server.used(), 10, "none directly below the server");
     }
 
-    /// Spec (the budget types' owner's ruling): grants of parallel workers over one part,
+    /// Spec: grants of parallel workers over one part,
     /// taking and giving back, are never refused while what they hold fits, record no
     /// refusal, and leave every level as it was.
     #[test]
@@ -3086,7 +3086,7 @@ mod tests {
         assert_eq!((part.used(), request.used(), part.ahead()), (0, 0, 0));
     }
 
-    /// Spec (the budget types' owner, 3 Nov: the spare per part is one cap): 16 workers'
+    /// Spec (the spare per part is one cap): 16 workers'
     /// grants on one part below a 1 MiB envelope, each sized for 16 workers, never hold more
     /// spare together than one cap, and are never refused while what they hold fits.
     #[test]
@@ -3115,7 +3115,7 @@ mod tests {
         assert_eq!((part.used(), request.used(), part.ahead()), (0, 0, 0));
     }
 
-    /// Spec (the budget types' owner): a grant hands exactly its items' charge over as a
+    /// Spec: a grant hands exactly its items' charge over as a
     /// reservation on the same budget, its spare released: the envelope then holds exactly
     /// that, and nothing once the reservation ends.
     #[test]
@@ -3138,7 +3138,7 @@ mod tests {
         assert_eq!((part.used(), request.used()), (0, 0));
     }
 
-    /// Spec (sol-loop r5 G1): a reservation that absorbs another's bytes, while what they
+    /// Spec: a reservation that absorbs another's bytes, while what they
     /// cover is live, leaves a measurement no excess: the bytes stay covered throughout
     /// (ORDER BY's computed keys, a grant's items absorbed into the keys' reservation).
     #[test]
@@ -3163,7 +3163,7 @@ mod tests {
         assert_eq!(request.used(), 0);
     }
 
-    /// Guard (sol-loop r4 N1, N2, ported): no grant draws another's spare. Two grants on one
+    /// Guard (ported): no grant draws another's spare. Two grants on one
     /// part, each for two workers, hold half a cap each; one's refill moves nothing of the
     /// other's, whose next item still makes no budget call.
     #[test]
@@ -3183,7 +3183,7 @@ mod tests {
         assert_eq!((request.used(), part.ahead()), (0, 0));
     }
 
-    /// Spec (the budget types' owner, 3 Nov: S2 is the declared slack): below a 4 KiB envelope
+    /// Spec (the declared slack): below a 4 KiB envelope
     /// no grant holds spare, so two grants charging every item exactly fill the envelope to
     /// the byte without a false refusal.
     #[test]
@@ -3200,7 +3200,7 @@ mod tests {
         assert!(first.take(1).is_err());
     }
 
-    /// Spec (the budget types' owner's ruling, `measure`): a grant's items are a
+    /// Spec (`measure`): a grant's items are a
     /// reservation's to a measurement, and its refills above are no one's: memory allocated
     /// for items it charged, inside a measurement, holds no more than they reserve.
     #[test]

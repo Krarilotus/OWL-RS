@@ -425,7 +425,7 @@ fn service_is_a_privilege_of_its_own() {
 /// EXPLAIN and EXPLAIN ANALYZE tell a restricted reader nothing of the graphs it may not
 /// read: two stores that differ only in a secret graph answer its plan and its run alike
 /// (times aside). The planner's estimates, the order they choose and the operators' rows
-/// read every graph (round 13, R13-diag), so a restricted reader gets no operators; a reader
+/// read every graph, so a restricted reader gets no operators; a reader
 /// of every graph still gets them all.
 #[test]
 fn explain_tells_a_restricted_reader_nothing_of_hidden_graphs() {
@@ -463,7 +463,7 @@ fn explain_tells_a_restricted_reader_nothing_of_hidden_graphs() {
 }
 
 /// Nor do the rewrites: eager aggregation is chosen by an estimate, and a restricted reader's
-/// merged default graph is estimated over every graph (Sol's review of R13, r1 B-F1). Hidden
+/// merged default graph is estimated over every graph. Hidden
 /// prices make it pay in one store and not in the other; the answer, the plan and the run the
 /// reader is told are the same.
 #[test]
@@ -512,11 +512,11 @@ fn restricted_rewrites_tell_nothing_of_hidden_statistics() {
 /// keeps its kind and limit, not the bytes held and asked for. A requester of every graph is
 /// told the bytes where it is refused (it makes no view). One row per entry point of the
 /// boundary (`EntryPoint`, `ReadScope::told`), chosen by a match over them, so that a new one
-/// without a row doesn't compile (Sol's review of R13: r1 B-F2, an EXPLAIN's; r2 S1, a run's;
-/// r3 S1, an update's WHERE; review of PR #39: F2, a run with operations pending, F1, the
-/// Graph Store's and RDF4J's reads; review of PR #45, I30: EXPLAIN without running, and each
-/// row's kind and limit; review of PR #50, F1: an update's WHERE reads a supported reader's
-/// view, refused while it is made).
+/// without a row doesn't compile. The rows: an EXPLAIN's, a run's and an update's WHERE;
+/// PR #39: a run with operations pending, and the
+/// Graph Store's and RDF4J's reads; PR #45: EXPLAIN without running, and each
+/// row's kind and limit; PR #50: an update's WHERE reads a supported reader's
+/// view, refused while it is made.
 #[test]
 fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
     use nrese_reasoner::rulesets::Ruleset;
@@ -565,7 +565,7 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
         pipeline.store().plan_query(&prepared, &token()).map(|_| ())
     };
     // A reader of what its graphs support asks for a statement they derive: its WHERE reads
-    // its view of them, which the secret graph sizes (review r1 of PR #50, F1). Another copies
+    // its view of them, which the secret graph sizes (PR #50). Another copies
     // what it scans.
     let update_where = |pipeline: &MutationPipeline, scope: &ReadScope| {
         let scan = "INSERT { GRAPH <urn:g:public> { ?s <urn:copy> ?o } }

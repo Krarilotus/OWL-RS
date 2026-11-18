@@ -93,7 +93,7 @@ fn check(rows: Vec<Row<'_>>) {
     assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
 }
 
-/// A path through a mount isn't proof of which cgroup it reaches (SYN-45 review r1 R1-C1a): a
+/// A path through a mount isn't proof of which cgroup it reaches: a
 /// launcher keeps the real `limited` subtree bound at /cg-safe, then binds the sibling `loose`
 /// subtree over /sys/fs/cgroup/limited. The process stays in /limited/worker (4 GiB); the kernel
 /// enforces `limited`'s 1 GiB, visible at /cg-safe, while /sys/fs/cgroup/limited/worker now shows
@@ -101,7 +101,7 @@ fn check(rows: Vec<Row<'_>>) {
 /// uses 512 MiB. A value is read only where its path resolves to the group (mount(2) bind
 /// semantics, proc_pid_mountinfo(5)) and the own group's `cgroup.procs` lists the process; an
 /// ancestor no path reaches is invisible, as one above a namespace is, and the walk stops there
-/// (the orchestrator, 8 Nov: option 1 of IB2001-2a56).
+/// (option 1 of IB2001-2a56).
 #[test]
 fn a_value_is_read_only_where_the_path_reaches_the_group() {
     const WITNESS: &str = concat!(
@@ -256,12 +256,12 @@ fn a_value_is_read_only_where_the_path_reaches_the_group() {
     ]);
 }
 
-/// A file is read for a group only where its own path resolves to the group's file (sol-loop
-/// r6 S1: mount(2) binds single files too): a launcher binds `/loose/memory.max` (8 GiB) over
+/// A file is read for a group only where its own path resolves to the group's file (mount(2) binds single files too):
+/// a launcher binds `/loose/memory.max` (8 GiB) over
 /// a group's `memory.max`, or loose/worker's `memory.stat` over the process's. Over the own
 /// group's or a reachable ancestor's file it claims that group's value and isn't it: unknown.
 /// And the process is named as `cgroup.procs` names it, in the pid namespace it runs in, not
-/// as a /proc mounted from another namespace shows it (sol-loop r6 S2: `unshare --pid --fork`
+/// as a /proc mounted from another namespace shows it (`unshare --pid --fork`
 /// keeping the old /proc).
 #[test]
 fn a_file_is_read_only_where_its_own_path_reaches_the_group() {
@@ -374,8 +374,8 @@ fn a_file_is_read_only_where_its_own_path_reaches_the_group() {
     ]);
 }
 
-/// A group's coordinates in the cgroup namespace aren't a path (SYN-45 fix check r2;
-/// cgroup_namespaces(7), path_resolution(7)): a launcher makes the namespace in /limited/scope
+/// A group's coordinates in the cgroup namespace aren't a path (cgroup_namespaces(7), path_resolution(7)):
+/// a launcher makes the namespace in /limited/scope
 /// and then moves the process to the sibling /limited/worker, so /proc/self/cgroup names
 /// `/../worker`. Its mounts: the namespace's root (scope, 8 GiB) at /a/cg, the worker (4 GiB,
 /// the process) at /a/worker, the real parent /limited (1 GiB) at /cg-safe, and loose's single
@@ -457,7 +457,7 @@ fn a_group_above_the_namespace_is_read_where_a_view_shows_it() {
     ]);
 }
 
-/// A group is read wherever the kernel shows it to the process (fix check r2, F1 and F2): in a
+/// A group is read wherever the kernel shows it to the process: in a
 /// chroot whose root isn't a mount, mountinfo has no `/` line (the kernel leaves out mounts
 /// outside the root; fs/proc_namespace.c), and the cgroup mount's parent isn't listed; the
 /// process's group /app (2 GiB) is read there. In a threaded v2 group (cgroup-v2.rst, "Threads")
@@ -519,9 +519,9 @@ fn a_group_is_read_wherever_the_kernel_shows_it() {
 }
 
 /// An ancestor reached on a view's own mount is read, whatever is bound over the group's entry
-/// in it (sol-loop r7 S1): a launcher binds the process's group /limited/worker (4 GiB) over
+/// in it: a launcher binds the process's group /limited/worker (4 GiB) over
 /// itself, and /limited (1 GiB) is reached through the full tree. And a view whose way the
-/// kernel refuses may show a limit that applies (r7 S2): the full tree at /x/cg behind a
+/// kernel refuses may show a limit that applies: the full tree at /x/cg behind a
 /// refused /x, the group bound at /cg-local, is unknown, never the group's 4 GiB alone. Each
 /// group uses 512 MiB.
 #[test]
@@ -582,8 +582,8 @@ fn a_reached_ancestor_is_read_and_a_refused_view_is_unknown() {
     ]);
 }
 
-/// The kernel lets the reader pass a directory it may search but not list (mode 0111; sol-loop
-/// r7 S2): a file below it is opened and read. As root, whom no mode refuses, the directory
+/// The kernel lets the reader pass a directory it may search but not list (mode 0111):
+/// a file below it is opened and read. As root, whom no mode refuses, the directory
 /// doesn't refuse a listing either, and the test says so.
 #[cfg(target_os = "linux")]
 #[test]
@@ -860,12 +860,12 @@ fn the_kernel_shows_the_process_its_own_group() {
     }
 }
 
-/// A mount another one covers isn't a view (sol-loop r3 S1; proc_pid_mountinfo(5) lists covered
+/// A mount another one covers isn't a view (proc_pid_mountinfo(5) lists covered
 /// mounts too): a launcher bind-mounts the process's group `worker` (4 GiB, 1 GiB used) over the
 /// full v2 tree at /sys/fs/cgroup, or covers /sys/fs with a tmpfs and leaves the group bind-mounted
 /// at /cg-local. Only the group is reachable then, at the covering mount, and its limit is read
 /// there; its parent, hidden by the cover, is invisible as one above a namespace is (option 1 of
-/// IB2001-2a56, the orchestrator 8 Nov). Under a self-parented root (sol-loop r5 S3) nothing is
+/// IB2001-2a56). Under a self-parented root nothing is
 /// covered and the group's limit is read.
 #[test]
 fn a_covered_mount_isnt_a_view() {
@@ -881,14 +881,14 @@ fn a_covered_mount_isnt_a_view() {
         "50 23 0:40 / /sys/fs rw - tmpfs tmpfs rw\n"
     );
     // An older bind mount moved (MS_MOVE) over a newer full tree: mountinfo lists mounts by
-    // when they were made, so the covering mount comes first (sol-loop r4 S2).
+    // when they were made, so the covering mount comes first.
     const MOVED: &str = concat!(
         "40 30 0:26 /limited/worker /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n",
         root!(),
         "30 23 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n"
     );
     // A namespace's root is its own parent (proc_pid_mountinfo(5)), as an initramfs lists its
-    // rootfs; it covers nothing below it (sol-loop r5 S3).
+    // rootfs; it covers nothing below it.
     const ROOTED: &str = "1 1 0:2 / / rw - rootfs rootfs rw\n\
                           20 1 0:26 / /sys/fs/cgroup rw - cgroup2 cgroup2 rw\n";
     let (four, used) = ((4 * G).to_string(), G.to_string());
@@ -957,8 +957,8 @@ fn a_covered_mount_isnt_a_view() {
     ]);
 }
 
-/// A deeper mount of the same hierarchy doesn't hide an ancestor another mount shows (review
-/// r1 R1-C1): the full v2 tree at /sys/fs/cgroup, and the process's own group bind-mounted at
+/// A deeper mount of the same hierarchy doesn't hide an ancestor another mount shows:
+/// the full v2 tree at /sys/fs/cgroup, and the process's own group bind-mounted at
 /// /cg-local. The kernel enforces the 1 GiB parent `limited` over the 4 GiB `worker`
 /// (cgroup-v2.rst: a limit applies to the whole subtree), whichever line mountinfo lists
 /// first; the parent's limit refused through the full mount is unknown, not the bind mount's
@@ -1177,7 +1177,7 @@ fn a_limit_that_may_apply_but_wasnt_read_is_unknown_never_none() {
             Some(3 * G),
         ),
         // The same container under a parent group capped at 2 GiB, which its namespace hides
-        // (`--cgroup-parent`; Sol, P2-A4 r1 S1): v1's statistics show the hierarchy's least
+        // (`--cgroup-parent`): v1's statistics show the hierarchy's least
         // limit, and what is left of it is at most that less the group's own use.
         (
             "v1 limit above the namespace",
@@ -1304,8 +1304,8 @@ fn statm_counts_pages_of_the_given_size() {
 /// The process's memory as statm reads it agrees with `/proc/self/status`, which counts in
 /// kB whatever the page size: off by a factor of the page size's ratio to 4 KiB where the
 /// page size is assumed. The readings are moments apart, so within a factor of two, and in a
-/// process of its own ([`alone`]), where no other test allocates between them (Sol, P2-A4 r1
-/// S2).
+/// process of its own ([`alone`]), where no other test allocates between
+/// them.
 ///
 /// [`alone`]: crate::measure::alone
 #[cfg(target_os = "linux")]

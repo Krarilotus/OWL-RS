@@ -82,7 +82,7 @@ pub(crate) const BLOCK: usize = 128;
 const BLOCK_PROBES: u64 = (usize::BITS - BLOCK.leading_zeros()) as u64;
 
 /// A search's key comparison, `outcome`, counted where it is made in a build with the work
-/// counters ([`crate::witness`]; REAS-3a fix check r1 F1); nothing elsewhere.
+/// counters ([`crate::witness`]); nothing elsewhere.
 #[inline(always)]
 fn compared(outcome: bool) -> bool {
     #[cfg(any(test, all(feature = "witness", debug_assertions)))]
@@ -1074,7 +1074,7 @@ impl PackedKeys {
     }
 
     /// [`Self::range`], each of its two searches counted on `account` before it is made:
-    /// `None` once the account has stopped (REAS-3a fix check r1 F1, design attack r2 E2: a
+    /// `None` once the account has stopped (a
     /// search finding nothing is counted too).
     pub(crate) fn range_counted(
         &self,

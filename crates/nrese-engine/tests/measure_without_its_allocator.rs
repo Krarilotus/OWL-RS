@@ -9,8 +9,8 @@ use nrese_exec::Budget;
 use nrese_exec::measure::{Measured, alone, measure, measure_within};
 
 /// Every way into a measurement panics, naming the allocator to install; also after a
-/// `Measured` of the test's own was used directly, which is no global allocator (Sol,
-/// measure-pool r1: that passed a held 4 KiB as 0 bytes).
+/// `Measured` of the test's own was used directly, which is no global allocator (that passed a held 4 KiB as 0
+/// bytes).
 #[test]
 fn measuring_without_the_allocator_panics() {
     let own = Measured(System);

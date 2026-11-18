@@ -1,10 +1,10 @@
-//! The shapes the QL/RL completeness reviews found by hand, as templates for the DL-oracle
-//! differential (Harness note `2026-11-08-dl-oracle-differential-design.md`, "The
-//! generator"). A [`case`] is a random ontology of the generator, an ABox over every
-//! individual, and for half the seeds one template family's axioms, filled with random
-//! terms of the signature and nested under a random `∀`, `≤ 0` or `¬≥ 1` for depth.
-//! Counting restrictions and `Self` take simple properties only, so every case stays
-//! within OWL 2 DL's global restrictions.
+//! The shapes the QL/RL completeness reviews found by hand, as templates for
+//! the DL-oracle differential. A [`case`] is a random ontology of the
+//! generator, an ABox over every individual, and for half the seeds one
+//! template family's axioms, filled with random terms of the signature and
+//! nested under a random `∀`, `≤ 0` or `¬≥ 1` for depth. Counting restrictions
+//! and `Self` take simple properties only, so every case stays within OWL 2
+//! DL's global restrictions.
 
 use super::{Gen, Profile, Rng, Signature, ontology};
 use crate::mapping::Ontology;
@@ -19,13 +19,13 @@ pub const FAMILIES: [&str; 8] = [
     "left",
     // F2, F3: a disjoint union, a restriction in a disjointness.
     "disjoint",
-    // F4 and the I24b second lead's bounded forms, in their settings.
+    // F4 and I24b's bounded forms, in their settings.
     "bounded",
     // W-N1 `∀R.Self(S)`, W-N2 `∀R.{a}`.
     "self-nominal",
-    // I24c review r1: `{a}`, `¬¬D`, `¬≥2 R`, `∀R.D` after a left side, `∀R.¬{a}`.
+    // `{a}`, `¬¬D`, `¬≥2 R`, `∀R.D` after a left side, `∀R.¬{a}`.
     "review",
-    // I24c sol-loop S1–S4: zero bounds around a nominal or a complement.
+    // Zero bounds around a nominal or a complement.
     "sol",
 ];
 
@@ -43,7 +43,7 @@ pub struct Case {
 /// and RL: EL's constructors without chains, keeping the axioms both profiles' grammars
 /// admit (`crate::profile::of`). The template then supplies the axiom outside them, and a
 /// `complete` claim stays common. One in ten is all of `profile`, so the fail-closed path
-/// stays covered. (Master, 8 Nov 13:33: on a fail-closed head, random SROIQ bases left 76
+/// stays covered. (Measured on 8 Nov: on a fail-closed head, random SROIQ bases left 76
 /// claims in 636; EL bases, 101.)
 pub fn case(rng: &mut Rng, sig: &Signature, profile: Profile) -> Case {
     let sroiq = rng.one_in(10);
@@ -395,7 +395,7 @@ impl T<'_> {
         }
     }
 
-    /// The bounded forms around `¬∃S.D` (F4 and the second lead's): `≤n R`, `=n R` for
+    /// The bounded forms around `¬∃S.D` (F4 and I24b's): `≤n R`, `=n R` for
     /// n ∈ {0, 1}, `¬≥n R` for n ∈ {1, 2}, and `≤0 R.∀S.¬D`; `R` an inverse one time in
     /// four.
     fn bounded_body(&mut self, pick: u64) -> ExprId {
@@ -529,7 +529,7 @@ mod tests {
         out
     }
 
-    /// Every role chain the generator emits is regular (review G1 r1, F1: a chain with its
+    /// Every role chain the generator emits is regular (a chain with its
     /// superproperty at both ends, `p2 ∘ p1 ∘ p2 ⊑ p2`, is not), for the base generator
     /// and the templated cases, over the default signature and the differential's.
     #[test]

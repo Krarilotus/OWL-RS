@@ -596,7 +596,7 @@ impl Context<'_> {
         // The rows, and each row's graph, charged to the query's budget before they grow:
         // the rows a literal in many graphs fans out to are refused before they outgrow it.
         // Each charge declared before what it covers: on an error the buffer is freed first,
-        // then its charge released (brief v3 §3).
+        // then its charge released.
         let mut held = nrese_exec::Reservation::new(&*self.budget);
         let mut table = IdTable::new(vars.len());
         let mut graph_of_row = nrese_exec::ChargedVec::new(std::sync::Arc::clone(&self.budget));

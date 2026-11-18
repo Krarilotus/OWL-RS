@@ -1,6 +1,6 @@
 //! A transfer (`ADD`, and the copy step of `COPY` and `MOVE`) draws what it adds to the
 //! transaction's pending changes from the request's memory envelope before it allocates, and
-//! that charge lasts as long as the pending changes do (SYN-54 review r1, F1): an envelope
+//! that charge lasts as long as the pending changes do: an envelope
 //! smaller than the copy refuses the update with the typed memory error, nothing is committed,
 //! and the charge is gone once the transaction is.
 //!

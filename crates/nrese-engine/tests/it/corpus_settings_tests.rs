@@ -1,5 +1,5 @@
-//! How reader-scoped searches build their corpora is set, not fixed (lead card §5a; master
-//! 7 Nov 17:28 and 17:34): `CorpusTuning::documents_per_probe` decides between deriving a
+//! How reader-scoped searches build their corpora is set, not fixed (decided on
+//! 7 Nov): `CorpusTuning::documents_per_probe` decides between deriving a
 //! corpus after commits and walking it again, `CorpusTuning::walk_slice_words` how a walk is
 //! split. Neither changes an answer: oracle, a fresh engine with the same statements and the
 //! defaults.

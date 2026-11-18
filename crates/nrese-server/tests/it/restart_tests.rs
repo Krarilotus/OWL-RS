@@ -1,6 +1,6 @@
 //! A repository answers after a restart what it answered before, on the same configuration
-//! and data (P2-B5 catalog slice, design note `2026-11-08-p2-b5-r1o1-design.md`: invariant 2,
-//! restart equivalence). This build's server binary, started twice on one data directory
+//! and data (P2-B5 catalog slice: restart equivalence). This build's server binary,
+//! started twice on one data directory
 //! ([`super::upgrade_tests::Server`]), so the start path is the one an operator runs.
 
 use reqwest::Method;
@@ -90,7 +90,7 @@ const INVERSE: &str = "PREFIX owl: <http://www.w3.org/2002/07/owl#>
     INSERT DATA { <urn:p> owl:inverseOf <urn:q> . <urn:a> <urn:p> <urn:b> . }";
 const INVERTED: &str = "SELECT ?s WHERE { ?s <urn:q> <urn:a> }";
 
-/// Mechanism 5 of the design note, red first if it is reachable: the server's
+/// Red first if it is reachable: the server's
 /// configuration reasons with `owl2-rl`; a named repository without a reasoning of its own
 /// takes the server's; the default repository's settings choose `rdfs`. Specified: the named
 /// repository reasons with the server's `owl2-rl` before and after a restart (its answer

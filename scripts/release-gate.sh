@@ -77,7 +77,7 @@ MAX_GB=${GATE_MAX_GB:-24}
 # The host a timed part runs on: a pinned job's (GATE_HOST), else the one the fleet placed it on.
 GATE_HOST=${GATE_HOST:-${FLEET_HOST:-}}
 # A directory the caller names relative to the launching checkout stays there: the gate runs its
-# code from a checkout of its own (below; Sol, PR #60 fix 3's sol-loop S2).
+# code from a checkout of its own (below; PR #60).
 anchored() { case $1 in /* | [A-Za-z]:[/\\]*) printf '%s' "$1" ;; *) printf '%s/%s' "$PWD" "$1" ;; esac; }
 GATE=$(anchored "$GATE") GATE_BIN=$(anchored "$GATE_BIN") OUT=$(anchored "$OUT")
 SPARQL_DATA=$(anchored "$SPARQL_DATA") SHARED=$(anchored "$SHARED")
@@ -91,11 +91,11 @@ short() { git rev-parse --short=8 "$1"; }
 py() { PYTHONIOENCODING=utf-8 python3 "$@"; }
 # Each invocation's own directory, made empty here and removed when it exits, by it alone: its
 # bytecode cache and its code checkout (below). No other invocation makes or reads what is in it
-# (Sol, PR #60 fix check 3: a code checkout shared by revision had no owner, and two callers met
+# (PR #60: a code checkout shared by revision had no owner, and two callers met
 # in its making). It lies in its process space's directory under its pid, which `clean` asks only
-# there: a pid means nothing in another space, as WSL's in Git Bash on one host (Sol, PR #60 fix
-# check 4). So does every checkout the gate makes (the harness's, a build's): a path another space
-# uses is never one of its (Sol, R4 sol-loop S1, S5, S6). The space: the kernel's boot, pid and
+# there: a pid means nothing in another space, as WSL's in Git Bash on one host (PR #60).
+# So does every checkout the gate makes (the harness's, a build's): a path another space
+# uses is never one of its. The space: the kernel's boot, pid and
 # mount namespaces where Linux names them, else the system, host and runtime (Git Bash's MSYS,
 # whose pids no other runtime knows).
 launch=$PWD
@@ -109,7 +109,7 @@ mkdir -p "$SPACE" && RUN=$(mktemp -d "$SPACE/$$-XXXXXX") || exit 2
 # DIR, a checkout of this space's, removed with its registration: by git, else (its .git gone: a
 # removal killed halfway) its directory, then its registration by the path, which git drops for
 # a missing directory. Never `prune`: a registration git finds missing here may be another
-# process space's live checkout (Sol, PR #60 R4 sol-loop S1).
+# process space's live checkout (PR #60).
 drop_checkout() {
   git worktree remove --force "$1" 2>/dev/null && return
   rm -rf "$1" && git worktree remove --force "$1" 2>/dev/null
@@ -123,7 +123,7 @@ finish() {
 }
 trap finish EXIT
 # Every Python the gate starts reads and writes bytecode only there: no cache older than the run,
-# in a checkout (Sol, S1 r3), beside one or in an earlier run's directory (PR #60 r1 R2), stands in
+# in a checkout, beside one or in an earlier run's directory (PR #60), stands in
 # for a source the gate checked. A prefix holds every cache, the standard library's too, so the run
 # compiles that once (0.3 s; then 0.08 s a start, against 0.1 s with the installed caches and the
 # tree compiled each time: job lane-d-pr60-r1-startup2-c600217b).
@@ -142,7 +142,7 @@ worktree() {  # REV [DIR [built]]: a clean worktree of the revision, made once, 
   if [ ! -d "$dir" ]; then
     # Line ends as stored: a host's settings convert none (only .gitattributes does). -f: a
     # registration of this space's path whose directory went without git (a clean killed between
-    # the two) stops nothing; no other space has this path (Sol, PR #60 R4 sol-loop S5).
+    # the two) stops nothing; no other space has this path (PR #60).
     git -c core.autocrlf=false -c core.eol=lf worktree add -f -q --detach "$dir" "$rev" \
       || { echo "no worktree of $rev" >&2; return 2; }
   fi
@@ -245,8 +245,8 @@ fi
 # The gate's own code runs from a checkout of the commit it is launched from, made from the
 # repository's objects into this run's directory and checked as every checkout of the gate is
 # (worktree), never from the launching checkout: files there beside the commit's, an untracked
-# suitekit/cases/__init__.py or a csv.py before the standard library's, ran in the validator (Sol,
-# PR #60 fix checks 1 and 2), and no rule of what may lie there holds for every caller. From here
+# suitekit/cases/__init__.py or a csv.py before the standard library's, ran in the validator (PR #60),
+# and no rule of what may lie there holds for every caller. From here
 # every relative path, and every Python the gate starts, is that checkout's or a harness
 # checkout's; only the launching checkout's shell scripts (this one, scripts/lib), the checker and
 # objects are read. Launched from a checkout with changes not committed (a commit hook's), the gate
@@ -255,7 +255,7 @@ fi
 CODE=$(worktree HEAD "$RUN") || { echo "release gate: no checked checkout of the launching commit" >&2; exit 2; }
 cd "$CODE" || exit 2
 # The libraries' Python too (ns.sh's suitekit/lock.py where there is no flock): ns.sh, sourced
-# above, named the launching checkout's (Sol, PR #60 fix 3's sol-loop S1).
+# above, named the launching checkout's (PR #60).
 NS_SUITE=$CODE/benches/suite
 
 case ${1:-} in
@@ -378,17 +378,17 @@ from suitekit import hosts; print(hosts.input_path("general") or "")')
   # The cases' SPARQL data is this job's to make, into the host's cache
   # (SPARQL_DATA, benches/hosts.toml [caches]): what benches/sparql/prepare.sh makes and the host
   # lacks is made now, and the query sets are checked by name and SHA-256 (release_gate.py
-  # data_state(), their one validator; review r1 R1-F2); anything not as pinned stops preparation.
+  # data_state(), their one validator); anything not as pinned stops preparation.
   # It reads the host's own inputs ($general, as resolved above), never the gate's data view that
   # fast_env points BENCH_GENERAL_DATA at for fast.py: the view holds only what an earlier
-  # preparation linked (trail pkg-bench-registry, hypothesis 4).
-  # The datasets the job makes where the host lacks them (release_gate.py DATASET_MAKERS; orchestrator,
+  # preparation linked.
+  # The datasets the job makes where the host lacks them (release_gate.py DATASET_MAKERS,
   # 7 Nov 2026): support-stress's generator is the harness's verified perf_lab; a file pinned by form
   # (datasets.toml rdfc_sha256) is checked by the harness's `rdfc`, built here where its source is
   # (a harness without it leaves such a file unchecked, so refused).
   export NRESE_PERF_LAB=$bin/release/examples/perf_lab
   unset NRESE_RDFC
-  # Built only where a planned case reads a file pinned by form (sol-loop r1 S4).
+  # Built only where a planned case reads a file pinned by form.
   form=$(cd "$tree" && py -c 'import sys, tomllib; sys.path[:0] = ["benches/suite", "benches/fast"]
 import release_gate as rg; from suitekit import cases as r
 want = set(sys.argv[1].split(",")); pins = {d["file"]: d for d in tomllib.load(open("benches/datasets.toml", "rb"))["dataset"]}
@@ -536,8 +536,8 @@ block)
   # The block's state: its attempt (1, or 2 after a disturbed first) and the attempt's stage,
   # replaced whole (written aside, renamed) before what it records is started, signalled or
   # moved. A crash at any point resumes the attempt it was in (not a new one), an attempt above 2
-  # never starts, and reports count only once their attempt's verdict is recorded (Sol, 20 Oct
-  # 2026: a restart accepted a disturbed block, or ran a third attempt).
+  # never starts, and reports count only once their attempt's verdict is recorded (a restart accepted a disturbed block, or ran a third
+  # attempt).
   state=$OUT/passes/block-$n.state
   # Each state is a prerequisite of what follows it: written aside, synced, renamed over the old
   # one, the directory synced; if any of it fails the step ends there (a failed
@@ -719,7 +719,7 @@ report)
   done
   required=$(printf '%s\n' "$@" | sed 1d | cut -d= -f1 | paste -sd, -)
   # The plan and inputs this job's own prepare step recorded in its results ($OUT), not whatever
-  # the gate directory holds by now (review r1 R1-F3); a confirmation prepares nothing and reads
+  # the gate directory holds by now; a confirmation prepares nothing and reads
   # its part's (GATE_PLAN, the part's plan.json and inputs.txt).
   own_plan=$PLAN own_family=$GATE/plan.json own_inputs=$GATE/inputs.txt
   if [ -z "${GATE_PLAN:-}" ] && [ -f "$OUT/plan.json" ] && [ -f "$OUT/inputs.txt" ]; then
@@ -750,10 +750,10 @@ report)
 w3c)
   export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$GATE/target-checks} NRESE_W3C_REQUIRED=1
   # This attempt's record first, before the earlier result is touched: the verdict takes only a result
-  # of the latest attempt, so an earlier one that can't be removed stands for nothing (fix check r2).
+  # of the latest attempt, so an earlier one that can't be removed stands for nothing.
   attempt=$(py benches/fast/release_gate.py attempt w3c "$OUT") || { log "w3c: no attempt record: no run"; exit 1; }
-  # An earlier run's result goes first: this run's stands, or none (review r1 R2). One that can't be
-  # removed (a Windows reader holding it) stops the step before anything runs (fix check r1).
+  # An earlier run's result goes first: this run's stands, or none. One that can't be
+  # removed (a Windows reader holding it) stops the step before anything runs.
   { rm -f "$OUT/w3c.json" && [ ! -e "$OUT/w3c.json" ]; } \
     || { log "w3c: the earlier result $OUT/w3c.json can't be removed: no run"; exit 1; }
   mkdir -p "$OUT/w3c"
@@ -781,10 +781,10 @@ w3c)
 
 guards)
   export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$GATE/target-checks}
-  # This attempt's record first, before the earlier result is touched (as w3c's, fix check r2).
+  # This attempt's record first, before the earlier result is touched (as w3c's).
   attempt=$(py benches/fast/release_gate.py attempt guards "$OUT") || { log "guards: no attempt record: no run"; exit 1; }
-  # An earlier run's result goes first: this run's stands, or none (review r1 R2). One that can't be
-  # removed (a Windows reader holding it) stops the step before anything runs (fix check r1).
+  # An earlier run's result goes first: this run's stands, or none. One that can't be
+  # removed (a Windows reader holding it) stops the step before anything runs.
   { rm -f "$OUT/guards.json" && [ ! -e "$OUT/guards.json" ]; } \
     || { log "guards: the earlier result $OUT/guards.json can't be removed: no run"; exit 1; }
   mkdir -p "$OUT/guards"

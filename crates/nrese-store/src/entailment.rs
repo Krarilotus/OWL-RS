@@ -69,7 +69,7 @@ impl StoreService {
         conclusion: &[Triple],
     ) -> StoreResult<Entailment> {
         let program = program.into();
-        // One certified closure (review r1, F1): reads start only on a settled certificate (an
+        // One certified closure: reads start only on a settled certificate (an
         // even epoch; odd, a change is in progress and the old certificate may still be
         // visible), and an answer stands only if no change began while they took their
         // snapshots. An open or changed certificate refuses without waiting or retrying.

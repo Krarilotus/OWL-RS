@@ -65,12 +65,12 @@ pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Creates the directory `dir` and every missing directory above it, each durably named (review
-/// r1, R1-F2): for every level of the path, made now or found, the directory holding it is
+/// Creates the directory `dir` and every missing directory above it, each durably named:
+/// for every level of the path, made now or found, the directory holding it is
 /// synced (`.` for a relative name with no parent), as a sync makes the entries in a directory
 /// durable, not its own name. A level found can't be taken as durably named: another attempt
-/// whose sync failed, or another process still on its way to the sync, may have just made it
-/// (sol-loop on review r1, S1).
+/// whose sync failed, or another process still on its way to the sync, may have just made
+/// it.
 /// - A sync that fails fails the call, and the levels this call made are removed again (they
 ///   are empty), so a retry makes and syncs them anew.
 /// - A level is made only under a holder whose sync works, checked before it is made, so no
@@ -94,7 +94,7 @@ pub fn create_dir_all(dir: &Path) -> std::io::Result<()> {
 /// Creates the new directory `dir`, claiming it: an `AlreadyExists` error if it exists. Its name
 /// is made durable as [`create_dir_all`] does for each level (the directories above it made or
 /// found through it, its holder's sync checked before `dir` is made and done after); a failed
-/// sync after removes `dir` again (sol-loop round 4 on review r1, S1: a backup's directory).
+/// sync after removes `dir` again (a backup's directory).
 pub fn create_dir(dir: &Path) -> std::io::Result<()> {
     let holder = match dir.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => {
@@ -117,7 +117,7 @@ pub fn create_dir(dir: &Path) -> std::io::Result<()> {
 /// syncs for the levels it finds, the directory holding each entry the resolution reads
 /// (through links, the link's own entry and its target's chain). A store's open that finds its
 /// root defers these syncs to the first durable write that relies on them (`Wal::settle_names`,
-/// deferred-sync design note of 8 Nov). Kept so that a directory inside the root is resolved
+/// the deferred sync of 8 Nov). Kept so that a directory inside the root is resolved
 /// from where the root's resolution ended ([`Self::beyond`]): the root's chain is walked once,
 /// and a holder canonicalised only where its spelling may not name it uniquely
 /// ([`Resolution::exact`]; timing of DUR-4, 9 Nov).
@@ -144,7 +144,7 @@ impl Named {
 
     /// Adds the holders that the resolution of `name`, an existing directory in the root, reads
     /// past the root's: the root (the holder of `name`'s entry) and, if `name` is a link, its
-    /// target's chain (package review r1, R1-L1).
+    /// target's chain.
     pub(crate) fn beyond(&mut self, name: &std::ffi::OsStr) -> std::io::Result<()> {
         let path = self.root.join(name);
         let start = Resolution {
@@ -233,8 +233,8 @@ fn steps(path: &Path, from_link: bool) -> Vec<(Step, bool)> {
     steps
 }
 
-/// Resolves `path`'s names as the kernel does when the path is used (DUR-4, fix check
-/// DEFER-F1-SYM): component by component from its start (`.` for a relative path), each entry
+/// Resolves `path`'s names as the kernel does when the path is used:
+/// component by component from its start (`.` for a relative path), each entry
 /// read in the physical directory reached so far, which is that entry's holder. A link (a
 /// symbolic link; on Windows a junction too) is followed: its own entry's holder counted, then
 /// its target walked the same way (an absolute target from its start, a relative one from the
@@ -312,7 +312,7 @@ fn walk(
                         // Windows resolves a relative target against the link's directory, `..`
                         // taken lexically; Unix walks it from there physically. The joined
                         // target holds the link's directory already: a relative one (from a
-                        // relative root) is walked from the start again (sol-loop round 2, S2).
+                        // relative root) is walked from the start again.
                         #[cfg(windows)]
                         let target = as_walked(&current.join(&target));
                         #[cfg(windows)]
@@ -360,7 +360,7 @@ fn walk(
 /// The path the file system walks for `path`. Unix: `path` as it is (its `..` taken physically
 /// as the walk reaches it). Windows: a path that isn't verbatim (`\\?\…`) has its `.` and `..`
 /// taken lexically first, as Windows normalises a path before the file system sees it, so
-/// `alias\..\x` is `x` whatever `alias` points to (sol-loop round 1, S1); a relative path keeps
+/// `alias\..\x` is `x` whatever `alias` points to; a relative path keeps
 /// its leading `..`, and a root's `..` is the root.
 pub(super) fn as_walked(path: &Path) -> PathBuf {
     #[cfg(windows)]
@@ -391,7 +391,7 @@ pub(super) fn as_walked(path: &Path) -> PathBuf {
 /// `path`'s parent, in place: its last name dropped; a root (`/`, `C:\`, `\\server\share\`) its
 /// own parent; and where neither is there to drop (an empty or relative start, a drive-relative
 /// `C:`, a `..` already) a `..` kept, which the file system resolves from the working directory
-/// (sol-loop round 2, S3: a drive-relative prefix doesn't absorb a `..` as a root does).
+/// (a drive-relative prefix doesn't absorb a `..` as a root does).
 fn step_up(path: &mut PathBuf) {
     use std::path::Component;
     match path.components().next_back() {
@@ -448,7 +448,7 @@ fn make_exact(holders: &mut Vec<PathBuf>, keys: &mut Vec<PathBuf>, exact: &mut b
 /// first (a holder this process may not open for the sync, `PermissionDenied`, is left as it
 /// is). `NotFound` if `dir` isn't there (or a link on its way is dangling): a write into a
 /// directory gone meanwhile must not make it again. For writes under a store's directory that
-/// don't go through the engine (the store's metadata, DUR-3 fix check DEFER-F1): its open
+/// don't go through the engine (the store's metadata): its open
 /// leaves these names to the first durable write.
 pub fn name_existing(dir: &Path) -> std::io::Result<()> {
     let resolution = resolve(dir)?;
@@ -487,8 +487,8 @@ pub fn name_existing_file(path: &Path) -> std::io::Result<()> {
 }
 
 /// The directories, each with its key (its canonical path: a link was followed), holding the
-/// entries the existing file `path` is reached through beyond its own directory's (DUR-5, fix
-/// check r2 on DUR-4, R2-F1): none for a regular file. For a file that is a link, its target
+/// entries the existing file `path` is reached through beyond its own directory's:
+/// none for a regular file. For a file that is a link, its target
 /// resolved as a directory link's is (relative to the link's directory as reached; on Windows
 /// normalised then, [`as_walked`]): the holders of every level of the target's directory,
 /// links in its chain included ([`resolve`]), and that directory, which holds the target's
@@ -531,8 +531,8 @@ pub(crate) fn file_holders(path: &Path) -> std::io::Result<Vec<(PathBuf, PathBuf
         }
         let target = fs::read_link(&current)?;
         // A relative target is taken from the link's directory as reached, not as spelled:
-        // Windows joins it to the path reparsed so far and only then takes `..` lexically
-        // (sol-loop r1 on DUR-5, S1); Unix walks it from there physically.
+        // Windows joins it to the path reparsed so far and only then takes `..` lexically;
+        // Unix walks it from there physically.
         let from = resolve(current.parent().unwrap_or(Path::new("")))?;
         let joined = from.reached.join(&target);
         #[cfg(windows)]
@@ -561,11 +561,11 @@ pub(crate) fn file_holders(path: &Path) -> std::io::Result<Vec<(PathBuf, PathBuf
 
 /// Names `dir`, a directory in the store's root, and returns whether it made it, so that a
 /// reopen of a store at an absolute path syncs each directory once (timing of 8 Nov; a
-/// relative or `.` root still syncs `.` twice: fix check ONCE-N1):
+/// relative or `.` root still syncs `.` twice):
 /// - missing, it is made as [`create_dir_all`] makes a level: the root's sync checked before,
 ///   done after, `dir` removed again if that fails;
 /// - found (or made meanwhile by someone else), the root isn't synced here: its sync after
-///   replay, at the open or before the first durable write (deferred-sync design note), names
+///   replay, at the open or before the first durable write, names
 ///   every directory found in it at once.
 pub(crate) fn create_store_dir(dir: &Path) -> std::io::Result<bool> {
     if dir.is_dir() {
@@ -617,8 +617,8 @@ fn name_levels(dir: &Path, made: &mut Vec<PathBuf>) -> std::io::Result<()> {
             false => at.clone(),
         };
         let level = at.join(&name);
-        // A level is made only once its holder's sync is known to work (sol-loop round 2 on
-        // review r1, S1): a level made under a holder no sync reaches would be in sight of
+        // A level is made only once its holder's sync is known to work:
+        // a level made under a holder no sync reaches would be in sight of
         // another process, which couldn't sync it either and would take it for one provisioned
         // beforehand (the exception above).
         sync_dir(&holder)?;
@@ -657,13 +657,13 @@ pub fn sync_file(path: &Path) -> std::io::Result<()> {
 /// Copies `from` to `to` durably: to a temporary name beside `to`, synced, [`rename`]d into
 /// place and the directory synced. A failure before the rename leaves `to` as it was (and no
 /// temporary); one of the directory's sync after it leaves `to` replaced but not known to be
-/// durable (review r1, N3).
+/// durable.
 pub fn copy(from: &Path, to: &Path) -> std::io::Result<()> {
     let mut temporary = to.as_os_str().to_owned();
     temporary.push(".placing");
     let temporary = PathBuf::from(temporary);
     // `fs::copy` keeps the source's permissions: a read-only one (an image kept read-only)
-    // is made writable for its sync, which needs a writable handle (sol-loop S2).
+    // is made writable for its sync, which needs a writable handle.
     let placed = fs::copy(from, &temporary)
         .and_then(|_| writable(&temporary))
         .and_then(|()| sync_file(&temporary))
@@ -779,7 +779,7 @@ mod tests {
     }
 
     /// A read-only file (an image backup kept read-only) is copied into place and readable
-    /// under the name (sol-loop S2). Before the fix the temporary kept the source's read-only
+    /// under the name. Before the fix the temporary kept the source's read-only
     /// permission, and its sync through a writable handle was refused, so the restore failed.
     #[test]
     fn a_read_only_file_is_placed() {

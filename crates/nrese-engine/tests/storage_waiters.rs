@@ -1,13 +1,13 @@
 //! SYN-22 (O11 storage progress): a Rayon pool thread never waits for the engine's writer
 //! slot, so a holder's parallel work always has its pool. The cycle this guards, reproduced
-//! on 74ea9101 at pool widths 1 and 2 (review-locksweep-r1): an ordinary thread holds a
+//! on 74ea9101 at pool widths 1 and 2: an ordinary thread holds a
 //! transaction, every pool thread waits for the writer slot, and the commit's parallel run
 //! build waits for those threads for good.
 //!
 //! Specified behaviour (approved 19 Oct; `Engine::transaction`'s docs): a pool thread that
 //! asks for a held writer slot is refused at once, through a panic naming
-//! `Engine::try_transaction`, and the holder's commit completes. A deadlock blocks
-//! (brief v3 §2).
+//! `Engine::try_transaction`, and the holder's commit completes.
+//! A deadlock blocks.
 //!
 //! Its own binary: it sizes the global pool (`NRESE_TEST_POOL_WIDTH`, default 2).
 

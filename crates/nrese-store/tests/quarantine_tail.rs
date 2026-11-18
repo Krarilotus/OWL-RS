@@ -75,21 +75,21 @@ fn recover_tail(tail: Option<&[u8]>) {
     }
 }
 
-// Spec: SYN-67 / Q06 r1 F1: an acknowledged readmission after a torn JSON tail
+// Spec: SYN-67 / Q06: an acknowledged readmission after a torn JSON tail
 // survives reopen, together with the earlier acknowledged discard.
 #[test]
 fn q06_quarantine_repairs_torn_tail_before_append() {
     recover_tail(Some(b"{\"id\":"));
 }
 
-// Spec: Q06 r1 F1: torn UTF-8 must not refuse startup; subsequent acknowledged
+// Spec: torn UTF-8 must not refuse startup; subsequent acknowledged
 // readmission and the prior discard both survive reopen.
 #[test]
 fn q06_quarantine_repairs_torn_utf8_before_append() {
     recover_tail(Some(b"{\"id\":\"\xf0\x9f"));
 }
 
-// Spec: Q06 r1 F1: a complete last record missing its newline keeps the earlier
+// Spec: a complete last record missing its newline keeps the earlier
 // acknowledged discard when the next readmission appends, and both survive reopen.
 #[test]
 fn q06_quarantine_frames_complete_tail_before_append() {

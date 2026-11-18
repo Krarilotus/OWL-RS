@@ -24,7 +24,7 @@ describe("parseCliArgs", () => {
 });
 
 // SYN-72 C-1107: a graph command acts on exactly the graph the user named, or refuses
-// before any request (design note 2026-11-08-p2-b8-design.md, invariant 1–5).
+// before any request.
 describe("graph targets", () => {
   const iri = "https://example.org/g";
   const named = { kind: "named", iri };

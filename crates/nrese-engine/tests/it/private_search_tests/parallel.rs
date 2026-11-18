@@ -2,7 +2,7 @@
 
 use super::*;
 
-/// The own-slot corpora under parallel readers (DICT2 9 Nov 06:35: no lock held across a
+/// The own-slot corpora under parallel readers (no lock held across a
 /// build that runs on the pool). Sixteen tasks on a pool of four threads search one retained
 /// pending snapshot (a writer's, then a private one), cold, text and IRI in every scope,
 /// each building or finding its corpora and `Local` while the others do; the walks run on

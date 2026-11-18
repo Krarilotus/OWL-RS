@@ -162,13 +162,13 @@ def from_results(directory: Path, root: Path) -> dict:
     # Each cell's newest attempt, from its directory's journal (on disk before its work; its order,
     # not the clock), finished or not; its receipt only the one under that attempt: never an older
     # receipt in an unfinished one's place, nor one the journal doesn't hold, never the directory's
-    # commit, outcome or answers (reviews cell-receipts r1 R2, R3; r3).
+    # commit, outcome or answers.
     newest: dict[str, dict] = {}
     lost = []
     for run in runs:
         journal = read_journal(run)
         # A journal lacking an invocation its manifest names has lost records, of cells nobody can
-        # name: then no receipt of this record stands, another directory's included (review r4 R2b).
+        # name: then no receipt of this record stands, another directory's included.
         if named.get(run, set()) - {r.get("invocation") for r in journal}:
             lost.append(run.name)
         for cell, attempt in {a["cell"]: a for a in journal if a.get("cell")}.items():

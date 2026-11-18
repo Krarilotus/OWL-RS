@@ -646,7 +646,7 @@ impl StoreService {
 
     /// Whether the certificate covers `program` for a holder of the writer slot: no write can
     /// change it, or the data it covers, until the holder lets the slot go. A writer that maintains
-    /// the closure checks it here, under its own transaction (review r1, F1).
+    /// the closure checks it here, under its own transaction.
     pub(crate) fn reasoning_is_current_held(
         &self,
         _writer: nrese_engine::WriterHeld<'_>,
@@ -702,7 +702,7 @@ impl StoreService {
     pub(crate) fn invalidate_held(&self, writer: nrese_engine::WriterHeld<'_>) -> StoreResult<()> {
         use std::sync::atomic::Ordering;
         // Before the commit it precedes, until the marker is settled: no reader takes the old
-        // certificate for the data this write changes (fix check r1 on review r1, F1).
+        // certificate for the data this write changes.
         let _transition = self.certificate_transition(writer);
         #[cfg(test)]
         hooks::run(&hooks::INSIDE_INVALIDATION);
@@ -738,12 +738,12 @@ impl StoreService {
         let Some(path) = self.marker_path() else {
             return Ok(());
         };
-        // "A marker may be in place", before anything is written (fix check r1, R2-F2): a
+        // "A marker may be in place", before anything is written: a
         // publication that fails after its rename leaves the marker under its name, and the
         // next invalidation must remove it, or refuse, not skip it.
         self.marker
             .store(true, std::sync::atomic::Ordering::Release);
-        // Synced and durably named, the store's path included (DUR-3; fix check DEFER-F1): read
+        // Synced and durably named, the store's path included (DUR-3): read
         // at open, a marker lost or short after a power loss would misstate what the inferred
         // stack is exact for.
         crate::metadata::write(&path, text.as_bytes())?;
@@ -1381,7 +1381,7 @@ impl StoreService {
     /// alone, or no reasoning. Over a ruleset's closure: sound, and complete only for what
     /// the ruleset derives, never certain answers under OWL 2 DL. Under `owl2-dl`, a read
     /// told its status here reads the rules' closure without the bounds: the inferred
-    /// statements alone (`onto:implicit`, `Self::dl_mode`; SYN-72 slice 2 r1 F1), or every
+    /// statements alone (`onto:implicit`, `Self::dl_mode`), or every
     /// statement outside a transaction; sound only, never complete. A read of every
     /// statement inside one lacks only its pending operations' reasoning (`Self::assess`).
     /// Either is unsound where a missing row can make a returned one wrong (`NOT EXISTS`,
@@ -1396,7 +1396,7 @@ impl StoreService {
         status_for_its_reader(prepared, status, false)
     }
 
-    /// [`Self::status_without_dl`] of a read of the data `at` (R1-F2, F3).
+    /// [`Self::status_without_dl`] of a read of the data `at`.
     fn status_without_dl_at(
         &self,
         prepared: &PreparedQuery,
@@ -1830,7 +1830,7 @@ impl StoreService {
         use nrese_engine::{GraphSelector, QuadPattern};
         let snapshot = self.engine.snapshot();
         // A group a graph: as many as the store has graphs, bounded by them, not by a
-        // request (uncharged as before; the store owner's follow-up, D16-039 F7).
+        // request (uncharged as before; the follow-up is D16-039 F7).
         let unlimited = nrese_exec::Budget::unlimited();
         let counts: Vec<(TermId, u64)> = snapshot
             .group_counts_in(
@@ -2494,7 +2494,7 @@ impl StoreService {
         }
         // The certificate of the closure about to be replaced goes first, durably: a stop or
         // a failed certificate between the publication and the new certificate must not leave
-        // the old one describing the new closure after a start (review r1, F3).
+        // the old one describing the new closure after a start.
         self.invalidate_held(rematerialisation.writer())?;
         // Where asked, what the reasoner freed goes back before the inferred stack, the
         // heap's peak, is built (as between the reasoner's rounds).
@@ -2613,12 +2613,12 @@ fn read_model(infer: bool) -> crate::ReadModel {
     }
 }
 
-/// The status of its answers that `prepared`'s reader is told (round 13, R13-diag). A
+/// The status of its answers that `prepared`'s reader is told. A
 /// reader of some graphs who sees every inference (`inferred = "visible"`) is told
 /// `not-certified` wherever the OWL 2 QL rewriting ran: its assessment reads the schema of
 /// every graph. Whether the rewriting runs depends on the query and the configuration, not
 /// on the schema, so the token tells nothing of hidden data. So is every reader of some
-/// graphs told it for a status under `owl2-dl` (R1-F1): whether OWL 2 DL reads the data
+/// graphs told it for a status under `owl2-dl`: whether OWL 2 DL reads the data
 /// otherwise than the rules is a question of every graph's axioms
 /// ([`crate::dl::query::mark`]), and the regime is the configuration's.
 fn status_for_its_reader(
@@ -2708,7 +2708,7 @@ fn context_outside_dl(status: Option<&nrese_sparql::Completeness>, rewritten: bo
     context
 }
 
-/// A run or an EXPLAIN of `prepared` as its reader may be told it (round 13, R13-diag). A
+/// A run or an EXPLAIN of `prepared` as its reader may be told it. A
 /// reader of every graph is told everything. Another is told only what comes from its query
 /// and its answer: `redact` takes an EXPLAIN's operators (their estimates, the order and the
 /// operators those chose, their rows, the dictionary work they report, their times) and its
@@ -2976,7 +2976,7 @@ mod certificate_tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// The QL schema is part of the certificate (sol-loop r1, S3): a bulk load between a QL
+    /// The QL schema is part of the certificate: a bulk load between a QL
     /// setting's read of the certificate and its installing the rewriting. The rewriting
     /// relies on the `owl2-rl` closure; once the load leaves no certificate, none may be
     /// installed. Before the fix the setter read the certificate without the writer slot,
@@ -3018,7 +3018,7 @@ mod certificate_tests {
         String::from_utf8_lossy(&answer.payload).contains("true")
     }
 
-    /// A reasoning write leaves the closure of the data it commits over (review r1, F1): a bulk
+    /// A reasoning write leaves the closure of the data it commits over: a bulk
     /// load between a write's preflight check of the certificate and its transaction commits
     /// `C subClassOf D` and clears the certificate. The write (`a a C` again, which adds
     /// nothing) must not maintain from the stale closure: afterwards `a a D` holds. Before the
@@ -3052,7 +3052,7 @@ mod certificate_tests {
         );
     }
 
-    /// An entailment answers from one certified closure (review r1, F1, the read side): a bulk
+    /// An entailment answers from one certified closure (the read side): a bulk
     /// replace with the same statements (it clears the inferred stack and the certificate)
     /// between the check of the certificate and the read of the closure. The data entails
     /// `a a D` before and after; the answer must not be `NotEntailed` (refusing as not current
@@ -3092,8 +3092,8 @@ mod certificate_tests {
         );
     }
 
-    /// An entailment that starts inside an invalidation answers from a certified closure
-    /// (fix check r1 on review r1, F1's read side): a bulk replace with the same statements has
+    /// An entailment that starts inside an invalidation answers from a certified closure:
+    /// a bulk replace with the same statements has
     /// begun clearing the certificate, the old one still in place, when an entailment starts
     /// and finds it current; the replace then clears it, commits an empty inferred stack, and
     /// only then does the entailment read the closure. The data entails `a a D` before and
@@ -3159,7 +3159,7 @@ mod certificate_tests {
         );
     }
 
-    /// Spec (Q06 fix check r2): an open certificate transition refuses without waiting;
+    /// Spec: an open certificate transition refuses without waiting;
     /// once settled and certified, the RDFS subclass conclusion still holds.
     #[test]
     fn an_entailment_refuses_an_open_certificate_transition_without_waiting() {
@@ -3193,7 +3193,7 @@ mod certificate_tests {
         );
     }
 
-    /// Spec (Q06 fix check r2): a certificate changed during reads refuses even when
+    /// Spec: a certificate changed during reads refuses even when
     /// the replacement is certified, instead of retrying to an answer.
     #[test]
     fn an_entailment_refuses_a_certificate_changed_during_its_reads() {
@@ -3255,8 +3255,8 @@ mod certificate_tests {
 
     const F3_CHILD: &str = "NRESE_Q06_F3_CHILD";
 
-    /// A replacement closure never reopens under the certificate of the one it replaced
-    /// (review r1, F3): over an OWL 2 RL closure and certificate, an RDFS rematerialisation
+    /// A replacement closure never reopens under the certificate of the one it replaced:
+    /// over an OWL 2 RL closure and certificate, an RDFS rematerialisation
     /// publishes and the process stops before its certificate (a child process of this test
     /// binary exits at the seam, unwinding nothing); in the other row the new certificate's
     /// write fails before its rename. After a start the store must not certify OWL 2 RL over
@@ -3340,7 +3340,7 @@ mod marker_tests {
     use crate::metadata::tests::FAIL_DIR_SYNC as FAIL_MARKER_SYNC;
 
     /// A reasoning marker whose publication failed after its rename is still cleared by the
-    /// next clear of the inferences (DUR-3 fix check r1, R2-F2). A rematerialisation under RDFS
+    /// next clear of the inferences. A rematerialisation under RDFS
     /// of `a a C . C subClassOf D` publishes its inferences, renames its marker into place, and
     /// the marker's directory sync then fails: `InferencesNotRecorded`. The inferences are
     /// cleared; the store must no longer claim them current, then or after a reopen, and a later
@@ -3423,7 +3423,7 @@ mod memory_stop_tests {
         ));
     }
 
-    /// DC-07 S2 (Sol, round 1): an operation the process limit stopped is named by the cause
+    /// DC-07: an operation the process limit stopped is named by the cause
     /// it kept when it stopped, not by a later reading: unread, or past the limit; one its
     /// caller stopped is no memory error.
     #[test]

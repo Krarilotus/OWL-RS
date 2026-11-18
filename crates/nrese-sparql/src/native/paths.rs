@@ -31,15 +31,15 @@
 //!
 //! Every buffer a path's evaluation makes (its bags, an alternative's union, a sequence
 //! step's ends and their tally, the pairs from bound values, the answer's columns) is a
-//! [`Buf`] or a [`Map`]: its memory is charged to the query's budget, through the evaluator's
-//! [`Pool`], before it is allocated, the charge moves with it, and it is freed before its
-//! charge is released. No code here counts bytes: the charge is the buffer's (the executor
-//! memory stack's second lead, 8 Nov: a charge kept beside its vector by hand disagreed with
-//! it at one more site in each of six review rounds). What the path's text multiplies is
-//! held down by the algorithm: an alternative takes its arms one at a time, under a
+//! [`Buf`] or a [`Map`]: its memory is charged to the query's budget, through the
+//! evaluator's [`Pool`], before it is allocated, the charge moves with it, and it is freed
+//! before its charge is released. No code here counts bytes: the charge is the buffer's (a
+//! charge kept beside its vector by hand disagreed with it). What the path's text multiplies
+//! is held down by the algorithm: an alternative takes its arms one at a time, under a
 //! set-valued path only their support (EMS-R1), and a sequence step counts its ends once
 //! they would outnumber its entries (EMS-16). A refused charge stops the evaluator as a
-//! cancellation does, and its entry points report it ([`PathEvaluator::ends`] and the others).
+//! cancellation does, and its entry points report it ([`PathEvaluator::ends`] and the
+//! others).
 
 use std::cell::Cell;
 use std::sync::Arc;
@@ -96,7 +96,7 @@ impl Path {
                 Self::Sequence(steps.iter().map(|p| Self::resolve(p, snapshot)).collect())
             }
             // Each arm once, in the order it first comes, found by hash: matching pairwise
-            // made 65,536 distinct arms 2.1 billion comparisons (sol-loop r3 S1 of EMS-R1).
+            // made 65,536 distinct arms 2.1 billion comparisons.
             PropertyPathExpression::Alternative(paths) => {
                 let mut arms: Vec<(Self, usize)> = Vec::with_capacity(paths.len());
                 let mut at: std::collections::HashMap<Self, usize> =
@@ -348,8 +348,8 @@ fn dedup_sorted<T: PartialEq + Copy>(values: &mut Buf<'_, T>) {
 /// ones that compound over the next steps (`(p?/…/p?)+` over a cycle: 2^n copies), and a
 /// step that doesn't grow never gives more copies than it got. So a step holds at most its
 /// entries' copies before it counts: `p/(64 distinct arms)` over n pairs holds n copies and
-/// then each end once, never 64·n (the package fix check r2 of the executor memory stack,
-/// EMS-R1). Counting hashes every end: a sequence whose steps give one end an entry
+/// then each end once, never 64·n.
+/// Counting hashes every end: a sequence whose steps give one end an entry
 /// (`author/city`) needs none of it (the executor memory stack's timing: counting every step
 /// cost path alternatives x1.56).
 enum Ends<'e, T> {
@@ -456,7 +456,7 @@ pub(crate) struct PathEvaluator<'a> {
     pub(crate) closures: Cell<usize>,
     /// What every buffer of the evaluation draws from: a grant on the query's budget whose
     /// spare makes the small bags of a traversal's nodes cost no budget call. Its spare is
-    /// the budget owner's rule ([`nrese_exec::Grant::new`]: the part's cap over the pool's
+    /// [`nrese_exec::Grant::new`]'s (the part's cap over the pool's
     /// workers, none under an envelope's 1 KiB floor), so evaluators in parallel workers
     /// (EXISTS) hold one cap between them.
     pool: Pool,
@@ -607,8 +607,8 @@ impl PathEvaluator<'_> {
     }
 
     /// [`transitive_closure_within`] of `edges` on the evaluator's pool, stopped with the
-    /// query: then empty. None of edges a refused charge cut short (sol-loop r1 S2 of
-    /// EMS-R1): they are no path's, and their closure would be built for nothing.
+    /// query: then empty. None of edges a refused charge cut short:
+    /// they are no path's, and their closure would be built for nothing.
     fn closure_of(&self, edges: &[(u64, u64)]) -> Buf<'_, (u64, u64)> {
         if self.stopped() {
             return self.buf();
@@ -649,7 +649,7 @@ impl PathEvaluator<'_> {
     /// The closure of `step` from `node` (`forward`) or into it: the nodes it reaches in one
     /// or more steps, or zero or more with `include`, each once, in breadth-first order. The
     /// search's buffers are charged to the evaluator's pool while it searches
-    /// ([`reachable_within`]; review r1 of the graph closure package, R1-F1): refused, the
+    /// ([`reachable_within`]): refused, the
     /// evaluator's refusal; stopped, empty.
     fn search(&self, step: &Path, node: u64, include: bool, forward: bool) -> Buf<'_, u64> {
         self.closed(self.searched(node, include, |node| self.ends_of(step, node, forward)))
@@ -1100,8 +1100,8 @@ impl PathEvaluator<'_> {
     /// run). Any other arm arrives as its bag, the union grown beside it, then the arm freed
     /// (the first arm of copies becomes the union, not a copy). Distinct arms with
     /// overlapping bags (`!(q)|!(q|q)|…`) so hold the union and one arm, and under a
-    /// set-valued path the union at most twice their support (the package review r1 of the
-    /// executor memory stack, EMS-R1). A refused charge stops here with what was put
+    /// set-valued path the union at most twice their support.
+    /// A refused charge stops here with what was put
     /// together, which the entry points never answer ([`Self::answer`]).
     fn either<'e, T: Copy + Eq + std::hash::Hash + Ord>(
         &'e self,
@@ -1348,7 +1348,7 @@ impl PathEvaluator<'_> {
     /// The pairs of each of `nodes` (distinct) with each value of its bag, `pair` making a
     /// `(start, end)` pair of the node and the value: copies while every bag is copies.
     /// The pairs grow beside each node's bag, which is freed once it is in (the bags of 64
-    /// distinct arms from 4,096 bound values are 64 pairs a node: sol-loop r1 S1 of EMS-R1).
+    /// distinct arms from 4,096 bound values are 64 pairs a node).
     fn pairs_at<'e>(
         &'e self,
         nodes: &[u64],
@@ -1639,8 +1639,8 @@ mod tests {
         sorted(evaluator, bag)
     }
 
-    /// Guard (the executor memory stack's timing, notes/2026-11-02-exec-memory-stack.md
-    /// EMS-11: counting every sequence's ends cost path alternatives x1.56): a sequence counts
+    /// Guard (the executor memory stack's timing, EMS-11: counting every sequence's ends
+    /// cost path alternatives x1.56): a sequence counts
     /// the ways through a node only where they can add up: a step with an alternative, a
     /// counted input, or a step that gives more ends than it was given. A sequence whose steps
     /// give each entry one end keeps copies, from a node and for every pair, and so does an
@@ -1686,7 +1686,7 @@ mod tests {
         assert!(matches!(evaluator.from(&stepped, a), Bag::Counted(_)));
     }
 
-    /// Spec (PR #85 N2; sol-loop r3 S1 of the executor memory stack): a sequence's bag holds
+    /// Spec (PR #85): a sequence's bag holds
     /// each end once with how many ways lead there, whatever multiplies the ways: the path's
     /// text or the data. Over a two-node cycle (`a p b`, `b p a`), 20 `p?` steps from `a` reach
     /// `a` and `b` 2^19 ways each: two entries, never 2^20 copies; the closure of such a
@@ -1742,7 +1742,7 @@ mod tests {
         );
     }
 
-    /// Spec (sol-loop r1 S2 of EMS-R1): a charge the budget refused stops the evaluator, and
+    /// Spec: a charge the budget refused stops the evaluator, and
     /// what it found so far is no answer, so no closure is built of it. Over 1,000 self-loops
     /// and `m q m`, the arms `!(q)`, `!(q|q)`, `!(q|q|q)` under `+` under a 24 KiB budget: the
     /// union's room for the arms' 2,000 and more pairs (16 KB each arm) doesn't fit, so the

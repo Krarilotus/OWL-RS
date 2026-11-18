@@ -1,7 +1,7 @@
-//! Package 3.4's guards for the static equality representatives
-//! (`notes/2026-11-08-dict3-4-equality-design.md` §5; the design check `review-dict3-token-r0`
-//! §5 items 1, 2, 3 and 8 in 3.4's share). Only a published snapshot's classes enter the
-//! process-wide entry; an unpublished one's are built for its request and kept nowhere else.
+//! Package 3.4's guards for the static equality representatives.
+//! Only a published snapshot's classes enter the process-wide entry.
+//! An unpublished snapshot's classes are built for its request
+//! and kept nowhere else.
 //!
 //! The oracle for every answer is the same query evaluated as written (`as_written`), which
 //! reads no representatives: the representatives only let a join run on one identity per
@@ -216,7 +216,7 @@ fn budget() -> Arc<Budget> {
     Arc::new(Budget::unlimited())
 }
 
-/// Review §5 item 1, 3.4's share: pending state of both kinds, no private ids, through explicit
+/// Pending state of both kinds, no private ids, through explicit
 /// snapshots (route A) and transactions read as views (route B).
 ///
 /// - Input: closed ordinary data, its published answer warmed; a writer's change of existing
@@ -309,7 +309,7 @@ fn pending_state_of_both_kinds_keeps_no_classes() {
     );
 }
 
-/// Review §5 item 2, 3.4's share: no laundering through views.
+/// No laundering through views.
 ///
 /// - Input: a writer's pending snapshot through every derived view (stored, equality,
 ///   canonical, a reader's budget, an inferred subset, a mask, a chain of them); the published
@@ -420,7 +420,7 @@ fn compact() -> Engine {
     engine
 }
 
-/// Review §5 item 3, 3.4's share: one version read in each interpretation, each first on a
+/// One version read in each interpretation, each first on a
 /// version of its own, and a restriction against its source, warmed in both orders.
 ///
 /// - Input: [`compact`] read with equality (the classes), stored (a scan of `sameAs`) and with
@@ -504,7 +504,7 @@ fn colliding() -> Engine {
     engine
 }
 
-/// Review §5 item 8, 3.4's share: classes kept for one engine's version are never another's.
+/// Classes kept for one engine's version are never another's.
 ///
 /// - Input: the first engine's classes kept (`a` and `b` one identity), the engine then
 ///   dropped, its snapshot living on in the entry alone; a second engine at the same revision,
@@ -542,7 +542,7 @@ fn classes_kept_for_one_engine_are_not_anothers() {
     }
 }
 
-/// The design note's D1: an unpublished request's classes are charged to its query's budget,
+/// An unpublished request's classes are charged to its query's budget,
 /// and where it has no room for them, the query is answered without them.
 ///
 /// - Input: compact equality, one class of 20,000 identities read canonically (the query reads

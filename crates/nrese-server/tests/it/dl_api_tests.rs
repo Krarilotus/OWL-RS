@@ -135,7 +135,7 @@ async fn answer(
     Ok((status, body_text(response).await?))
 }
 
-/// SYN-72 slice 2 review r1 F1: under `owl2-dl`, an inferred-only read (GraphDB's
+/// Under `owl2-dl`, an inferred-only read (GraphDB's
 /// `onto:implicit`, in `FROM` or as `default-graph-uri`) reads the rules' closure without
 /// the DL bounds: x, a D only through the union, is missing, so the answers are never
 /// certified complete. The same from the result cache and inside a transaction (nothing

@@ -47,8 +47,8 @@ impl<'a> EngineBase<'a> {
     }
 
     /// Whether `fact` was in the state before the transaction (any graph, either stack): one
-    /// lookup, counted on `poll` before it is made (review r1 F5); [`Stopped`] once `poll`
-    /// has stopped, never a "not known" that would keep the fact (fix check r1, rule 2).
+    /// lookup, counted on `poll` before it is made; [`Stopped`] once `poll`
+    /// has stopped, never a "not known" that would keep the fact.
     fn known_before(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
         #[cfg(test)]
         crate::witness::add(crate::witness::Site::KnownBefore, 1);
@@ -66,8 +66,8 @@ impl<'a> EngineBase<'a> {
     }
 
     /// Whether `fact` is committed in `model` and not deleted by the change: each graph's
-    /// copy it visits counted on `probe`, the deleted ones included (REAS-2, sol-loop r1
-    /// S2); [`Stopped`] once that has stopped before a copy was found.
+    /// copy it visits counted on `probe`, the deleted ones included;
+    /// [`Stopped`] once that has stopped before a copy was found.
     fn committed(
         &self,
         model: ReadModel,
@@ -126,7 +126,7 @@ impl VisitsBase for EngineBase<'_> {
         self.inserts.visit(bound, visit);
     }
 
-    /// The engine's count's work counted on `probe` as it goes (review r1 F2: under compact
+    /// The engine's count's work counted on `probe` as it goes (under compact
     /// equality it scans the stored matches); [`Stopped`] where the count stopped.
     fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped> {
         self.size_up_to(bound, usize::MAX, probe)
@@ -314,12 +314,12 @@ pub fn maintain_with(
     // a round that derived nothing, where a materialisation holds about 140 (DMW's A/B,
     // fleet pm-dmwab-3, 21 Oct 2026). Not over a compact stack: its closure lists
     // equalities over representatives, which the datatype checks don't read as the delta's
-    // expanded ones (Sol r1 F1). A fact no store holds (a literal subject) is new to the
+    // expanded ones. A fact no store holds (a literal subject) is new to the
     // state where the axioms' own closure concludes none, as the state before held only
     // that closure: such facts of the load's closure are reported with its others. Where
     // the axioms conclude one, whether the change derives it anew can't be told from a
     // state that can't hold it, so the delta executor, which follows the derivations,
-    // takes the change; either is decided before any run (Sol r2 F1, r3 F1; review r1 F1).
+    // takes the change; either is decided before any run.
     let first_load = !revived
         && !program.stores_representatives()
         && program
@@ -347,9 +347,9 @@ pub fn maintain_with(
         let stop: crate::eval::Stop<'_> = &|| operation.fired();
         let prep = Poller::new(stop).ok_or_else(|| operation.interrupted())?;
         // Facts new to the state: in no graph and not inferred before the transaction. Each
-        // lookup in the state before counts on `prep` (review r1 F5); the first that finds
-        // `prep` stopped ends the maintenance there, its partial lists dropped (fix check
-        // r1, R2-F3: a stopped lookup read as "not known" kept every fact after it).
+        // lookup in the state before counts on `prep`; the first that finds
+        // `prep` stopped ends the maintenance there, its partial lists dropped (a stopped lookup read as "not known" kept every fact after
+        // it).
         let interrupted = |_: Stopped| operation.interrupted();
         let mut inserted: Vec<Triple> = Vec::new();
         for fact in tx.inserted().map(triple) {
@@ -382,7 +382,7 @@ pub fn maintain_with(
         inserted.sort_unstable();
         inserted.dedup();
         // A triple deleted from one graph but still asserted in another stays a fact. The
-        // first probe that finds `prep` stopped ends the maintenance (fix check r1, rule 2).
+        // first probe that finds `prep` stopped ends the maintenance.
         let mut deleted: Vec<Triple> = Vec::new();
         for fact in tx.deleted().map(triple) {
             let asserted = base.is_asserted(fact, &prep);
@@ -731,7 +731,7 @@ mod tests {
     use nrese_rdf::{BlankNodeRef, NamedNodeRef};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// REAS-2 (master, 8 Nov 05:29: a counted test per leaf that filters): an engine base's
+    /// REAS-2 (a counted test per leaf that filters): an engine base's
     /// scan counts the quads it passes over (deleted by the change), not only those it
     /// delivers. Over three poll intervals of deleted quads, a poller whose stop has fired
     /// polls within the scan and is stopped by it; uncounted, it would never poll.
@@ -772,7 +772,7 @@ mod tests {
         );
     }
 
-    /// The same for a membership probe (sol-loop r1 S2): whether a fact asserted in three
+    /// The same for a membership probe: whether a fact asserted in three
     /// poll intervals of graphs, every copy deleted by the change, is still asserted reads
     /// each copy; a poller whose stop has fired polls within that one probe.
     #[test]
@@ -807,8 +807,8 @@ mod tests {
         let poll = Poller::new(&stop).expect("not stopped yet");
         fired.store(true, Ordering::Relaxed);
         let asserted = base.is_asserted([s.raw(), p.raw(), o.raw()], &poll);
-        // Stopped while it reads the deleted copies, the probe says so (fix check r1, rule 2:
-        // once "not asserted").
+        // Stopped while it reads the deleted copies, the probe says so (once "not
+        // asserted").
         assert_eq!(asserted, Err(Stopped), "every copy is deleted");
         assert!(
             poll.stopped(),
@@ -817,12 +817,12 @@ mod tests {
     }
 
     /// The most work a read may do in the engine between two asks of its stop: `POLL_UNITS`
-    /// counted units plus one run of at most `POLL_UNITS` in progress (REAS-2's invariant;
-    /// REAS-3 design note, "Red witnesses first").
+    /// counted units plus one run of at most `POLL_UNITS` in progress (REAS-2's
+    /// invariant).
     #[cfg(debug_assertions)]
     const LARGEST_GAP: u64 = 2 * nrese_exec::POLL_UNITS as u64;
 
-    /// REAS-3, group E (sweep SW013). Spec (design note's invariant: a unit is each copy an
+    /// REAS-3, group E (sweep SW013). Spec (a unit is each copy an
     /// equality read makes): an engine base's scan under expanded equality makes a stored
     /// quad's copies within its poll interval. One stored quad whose subject and object each
     /// have 128 identities stands for 128 × 128 copies; between two asks of the scan's stop
@@ -878,7 +878,7 @@ mod tests {
         );
     }
 
-    /// REAS-3, group E (sweep SW012). Spec (design note's invariant: a unit is each `sameAs`
+    /// REAS-3, group E (sweep SW012). Spec (a unit is each `sameAs`
     /// statement an equality class build reads): an engine base's first read under expanded
     /// equality builds the version's classes within its poll interval. Three poll intervals
     /// of `sameAs` statements (classes of two), committed, then one scan: between two asks of
@@ -935,7 +935,7 @@ mod tests {
         );
     }
 
-    /// REAS-3, group A (sweep SW017). Spec (design note's invariant: a unit is each stored
+    /// REAS-3, group A (sweep SW017). Spec (a unit is each stored
     /// position a read passes, deleted ones too): an engine base's membership probe passes the
     /// committed deletions of a fact's graph copies within its poll interval. A fact asserted in
     /// three poll intervals of graphs plus one, all but the last copy deleted by a later
@@ -1028,7 +1028,7 @@ mod tests {
         }
     }
 
-    /// REAS-3, group E (sweep SW006, SW007, SW009). Spec (design note's invariant: a unit is
+    /// REAS-3, group E (sweep SW006, SW007, SW009). Spec (a unit is
     /// each run a read searches or probes): an engine base's membership probe searches a
     /// stack's runs within its poll interval. While a background merge holds the compaction
     /// claim, each commit's own compaction is deferred and appends a run (engine/mod.rs, the
@@ -1309,7 +1309,7 @@ mod tests {
     /// materialisation by representatives reads every list through the class of `rdf:nil` as
     /// empty, so it found the state consistent. It reports what the replacement rules
     /// report: maintenance equals full rematerialisation (reasoning-semantics.md,
-    /// "Maintenance"; Sol's review of DMW-AB-mem, r2 S2).
+    /// "Maintenance").
     #[test]
     fn a_list_cell_equated_with_nil_keeps_its_members() {
         for representatives in [false, true] {
@@ -1355,7 +1355,7 @@ mod tests {
     /// commit, onto a loaded state, takes the delta.
     #[test]
     fn an_engine_base_estimate_counts_the_engine_s_count() {
-        // REAS-2 review r1 F2: maintenance's estimates (the policy's, job planning's) ask the
+        // Maintenance's estimates (the policy's, job planning's) ask the
         // engine for a count, which under compact equality scans the stored matches and
         // weighs each by its copies. A representative with 50 identities and 8 × `POLL_UNITS`
         // statements `rep p o`: the estimate of `? p ?` asks its stop at least once every
@@ -1416,7 +1416,7 @@ mod tests {
 
     #[test]
     fn known_before_probes_ask_their_stop_within_a_run() {
-        // REAS-2 review r1 F5: a commit's new assertions are each looked up in the state
+        // A commit's new assertions are each looked up in the state
         // before it (`EngineBase::known_before`), each lookup counted on the preparation's
         // poller. A loaded state that infers `i a C0` for 16 × `POLL_UNITS` individuals (each
         // asserted `i a C1`, `C1 ⊑ C0`), then a commit asserting every `i a C0`: all known
@@ -1465,7 +1465,7 @@ mod tests {
         );
     }
 
-    /// REAS-2 fix check r1 (R2-F3, F5). Spec (design note, rule 2: a stop is an error the
+    /// REAS-2. Spec (a stop is an error the
     /// consumer has to handle, never an answer): a commit's maintenance ends at its stop. A
     /// loaded state with its ground program, then a commit asserting 16 × `POLL_UNITS`
     /// memberships new to the state, the stop firing at its first ask after the first

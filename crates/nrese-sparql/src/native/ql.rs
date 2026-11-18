@@ -852,7 +852,7 @@ impl Rewriter<'_> {
             let s = term(&triple.subject, &mut terms);
             let o = term(&triple.object, &mut terms);
             // `rdf:type` by its IRI: a store with no type statement has no id for it, and its
-            // class atoms still read the schema (P2-C1 review r1 F1: `⊤ ⊑ A`, no data).
+            // class atoms still read the schema (`⊤ ⊑ A`, no data).
             let typed = matches!(&triple.predicate,
                 NamedNodePattern::NamedNode(p) if p.as_str() == RDF_TYPE);
             let predicate = match &triple.predicate {

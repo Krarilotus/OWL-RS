@@ -1,5 +1,5 @@
-//! U1's locks never wait for Rayon work (design: Harness notes `2026-11-02-p2-c6b-u1-design.md`,
-//! invariants U1-I, U1-B, U1-S). A lock held across a commit's change or a read's build, which
+//! U1's locks never wait for Rayon work (invariants U1-I, U1-B, U1-S).
+//! A lock held across a commit's change or a read's build, which
 //! run on the global pool, closes a cycle with every pool worker that waits for it; a read of a
 //! built revision never waits for either.
 

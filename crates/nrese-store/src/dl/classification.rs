@@ -997,9 +997,9 @@ mod tests {
     /// Several requests asleep on a computation give up (their policy timeouts: each client
     /// has its 408), and the computation then ends with nothing to share, incomplete or by a
     /// panic, before they look at their stops again: each returns with no result, and none
-    /// starts a computation of its own (review r1, R1: a request that had its 408 started a
+    /// starts a computation of its own (a request that had its 408 started a
     /// fresh computation nobody could stop). Counted by computations, not timed.
-    /// Not a strict witness (review r2, F2; D16-709): if every waiter's 50 ms poll sees its
+    /// Not a strict witness: if every waiter's 50 ms poll sees its
     /// stop before the computation's end reaches it, none takes the terminal path, and the
     /// test can, rarely, pass on a build that is wrong there. The mutant that computes on
     /// that path (`tr`) still turns it red.
@@ -1075,7 +1075,7 @@ mod tests {
     }
 
     /// Several requests that never give up, asleep on a computation that ends incomplete: at
-    /// most one replacement computation runs at a time (review r1, R1: each ran its own,
+    /// most one replacement computation runs at a time (each ran its own,
     /// unclaimed, all at once). If a replacement completes, every request gets its result;
     /// if each ends incomplete too (a budget that runs out every time), every request still
     /// returns, having computed at most once. Counted, not timed: a computation holds until

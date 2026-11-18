@@ -6,7 +6,7 @@
 #
 # A pin is the registry digest of the tag as pulled: on a host that has pulled the systems'
 # images, `python benches/suite/suite.py images --digests [systems]` prints this table's lines.
-# Each system at its current stable release (rule.mem-owl-rs-fair-benchmarks; the standings owner,
+# Each system at its current stable release (since
 # 8 Nov 2026), its version and the day pinned beside it. Pulled and checked against the registry's
 # digest on 8 Nov 2026 (fleet jobs image-tags-1, image-digests-1). Licensed systems' pins name an
 # image, never a result.

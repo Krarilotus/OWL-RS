@@ -87,8 +87,8 @@ pub(crate) fn built(snapshot: &Snapshot) -> (u64, u64) {
 }
 
 /// Global searches only (the default `SearchScope::Global`): the engine never makes its
-/// store of corpora, and commits, pending states and views record no lineage (design note
-/// I1: no corpus work on a global-only store). A first reader search makes it.
+/// store of corpora, and commits, pending states and views record no lineage (no corpus
+/// work on a global-only store). A first reader search makes it.
 #[test]
 fn a_global_engine_keeps_no_corpora() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -124,7 +124,7 @@ fn a_global_engine_keeps_no_corpora() {
 /// after a commit the corpus is derived from the last one (a probe per term the commit
 /// touched), not walked again. 1,300 labels that match no query make the corpora large
 /// enough to be worth deriving over the 60-label commit (120 terms) under the default 10
-/// documents a probe (master 7 Nov 18:16).
+/// documents a probe.
 #[test]
 fn corpora_are_walked_once_then_derived_across_commits() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -197,7 +197,7 @@ fn corpora_are_walked_once_then_derived_across_commits() {
 }
 
 /// The kept corpora stay within the engine's budget, least recently used out, and the
-/// budget is their only bound (no count: master 7 Nov 17:28, IB1727-3bc5); scopes of equal
+/// budget is their only bound (no count: IB1727-3bc5); scopes of equal
 /// graph sets share one.
 #[test]
 fn kept_corpora_are_bounded_and_shared_by_equal_graph_sets() {
@@ -419,7 +419,7 @@ fn check(
     }
 }
 
-/// Differential (design note I3): after random commits (inserts, deletes, a literal moved
+/// Differential: after random commits (inserts, deletes, a literal moved
 /// between graphs, inferred statements and `owl:sameAs` links added and retracted; searches
 /// after some commits, none after others), every corpus a search uses holds exactly what
 /// the reader's scans show (walked or derived), in every scope and model, read as stored,
@@ -978,14 +978,14 @@ fn a_reader_vector_search_selects_and_counts_the_visible_vectors() {
 
 /// Where equality relates an IRI and a literal (`r owl:sameAs "alpha"`), a statement
 /// committed about the IRI shows the literal to a reader of equality classes: the corpus
-/// after that commit holds `alpha`, as a walk finds it (sol-loop r1 S1: the corpus derived
+/// after that commit holds `alpha`, as a walk finds it (the corpus derived
 /// from the kept one probed only the commit's literal objects, and left it out). Oracle:
 /// [`visible`], the statements the reader's scans show.
 #[test]
 fn a_literal_related_by_equality_is_in_the_corpus_after_a_commit() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     // A corpus of two documents and a commit touching one term: worth deriving at one
-    // document a probe, so the derivation is what this checks (sol-loop r2 R2-S4).
+    // document a probe, so the derivation is what this checks.
     engine.set_corpus_tuning(nrese_engine::CorpusTuning {
         documents_per_probe: 1,
         ..nrese_engine::CorpusTuning::DEFAULT
@@ -1029,7 +1029,7 @@ fn a_literal_related_by_equality_is_in_the_corpus_after_a_commit() {
 }
 
 /// What a corpus walk reads under equality expansion is charged to the search's budget,
-/// where the snapshot brought no reader's budget of its own (sol-loop r1 S2: a store's
+/// where the snapshot brought no reader's budget of its own (a store's
 /// autocompletion searches a plain snapshot): a class of 2,001 identities whose
 /// representative has 50 labels, searched within 16 KiB, is refused; within 1 GiB it finds
 /// the labels (guard). The budget's peak is printed: the measured limit.
@@ -1084,7 +1084,7 @@ fn a_corpus_walk_under_expansion_reads_within_the_search_budget() {
 }
 
 /// A vector search of a dimension no vector has finds nothing and reports nothing, before it
-/// builds a corpus (sol-loop r1 S3; attack list item 7): within an 8-byte budget, on an empty
+/// builds a corpus: within an 8-byte budget, on an empty
 /// engine, no refusal.
 #[test]
 fn a_vector_search_of_an_absent_dimension_builds_no_corpus() {
@@ -1101,7 +1101,7 @@ fn a_vector_search_of_an_absent_dimension_builds_no_corpus() {
 /// A statement about a non-IRI identity of a class (`_:b owl:sameAs ex:needle`, or
 /// `"needle" owl:sameAs ex:needle`) shows its IRI identities as subjects to a reader of
 /// equality classes: inserting `_:b ex:p ex:o` into `ex:g` puts `ex:needle` in the IRI
-/// corpus of `ex:g`, deleting it takes `ex:needle` out (3.2 sol-loop r1 R1-S1: the touched
+/// corpus of `ex:g`, deleting it takes `ex:needle` out (the touched
 /// terms left non-IRI subjects out before the class expansion, so the derived corpus missed
 /// the change). Both derivations: a writer's pending state over the base's kept corpus, and
 /// a commit's lineage step. Expanded and canonical readers, the identities interned in
@@ -1229,7 +1229,7 @@ fn a_statement_about_a_non_iri_identity_changes_its_class_in_the_iri_corpus() {
 }
 
 /// A lineage step recorded while no corpus read equality classes holds only IRI subjects
-/// (sol-loop r2 P1: holding every subject always cost commits of blank-node statements 5 %,
+/// (holding every subject always cost commits of blank-node statements 5 %,
 /// `dictlc-p32-count4`). A reader of classes whose corpus is kept only afterwards, for the
 /// step's parent, walks past it instead of deriving with the subjects missing.
 /// - Input: `_:b owl:sameAs ex:needle` (inferred) and `ex:filler ex:p ex:o` in `ex:g`; only

@@ -1228,7 +1228,7 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/RepositorySettings",
-                "description": "The settings it was created with (none for the default repository: the server's)."
+                "description": "Its settings as created or since changed; none while they are the defaults (the server's)."
               },
               {
                 "type": "null"
@@ -2815,7 +2815,7 @@
                 "schema": {}
               }
             },
-            "description": "How the server runs: memory, caches, query budget, requests"
+            "description": "How the server runs: version, deployment posture, readiness, revision, quad and graph counts, store mode, durability, reasoning mode, profile and read model, and which surfaces are enabled"
           }
         },
         "tags": [

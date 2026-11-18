@@ -2,24 +2,24 @@
 //! `0::/path` line) reads `memory.max` in the process's group and every ancestor's, v1 (a
 //! line naming the `memory` controller) `memory.limit_in_bytes`; the smallest counts.
 //!
-//! The kernel resolves every path, and each answer is verified; nothing here interprets a path
-//! (SYN-45 review r1 R1-C1a, r2: three rounds of modelling the kernel's walk each left a corner
-//! open). `/proc/self/mountinfo` only lists the views of the hierarchy: each mount's id, the
-//! group it shows at its point, and where. A view of a group opens its point from the root and
-//! then the group's names below the view's group, one name at a time (never `..`, never a path
-//! with a `/` in it, no symbolic link followed, needing only search permission on the way), and
-//! the handles from the point on must carry the view's mount id, so a mount over the point,
-//! over part of the way or over a single file is seen as another mount and refused. Reached so,
-//! within one mount of the hierarchy, the directory is that group, an ancestor too. A way the
-//! kernel refuses or fails to open leaves the limit unknown. The process's own group must list
-//! the process (`getpid`, the pid namespace `cgroup.procs` lists ids in) in its `cgroup.procs`,
-//! or in a threaded v2 group its `cgroup.threads`. Each value file is read through its
-//! verified directory, on the same mount. Mount ids come from `/proc/self/fdinfo` (Linux 3.15);
-//! a kernel that doesn't show them leaves every limit unknown.
+//! The kernel resolves every path, and each answer is verified; nothing here interprets a
+//! path. `/proc/self/mountinfo` only lists the views of the hierarchy: each mount's id, the
+//! group it shows at its point, and where. A view of a group opens its point from the root
+//! and then the group's names below the view's group, one name at a time (never `..`, never a
+//! path with a `/` in it, no symbolic link followed, needing only search permission on the
+//! way), and the handles from the point on must carry the view's mount id, so a mount over
+//! the point, over part of the way or over a single file is seen as another mount and
+//! refused. Reached so, within one mount of the hierarchy, the directory is that group, an
+//! ancestor too. A way the kernel refuses or fails to open leaves the limit unknown. The
+//! process's own group must list the process (`getpid`, the pid namespace `cgroup.procs`
+//! lists ids in) in its `cgroup.procs`, or in a threaded v2 group its `cgroup.threads`. Each
+//! value file is read through its verified directory, on the same mount. Mount ids come from
+//! `/proc/self/fdinfo` (Linux 3.15); a kernel that doesn't show them leaves every limit
+//! unknown.
 //!
 //! An ancestor no view reaches, above every mount's root or hidden by a mount, is invisible to
-//! the process as one above its cgroup namespace is, and the walk stops there (the
-//! orchestrator's decision, 3 and 8 Nov, P2-A4 IB2001-2a56). On v1 the own group's
+//! the process as one above its cgroup namespace is, and the walk stops there (decided
+//! on 3 and 8 Nov, P2-A4 IB2001-2a56). On v1 the own group's
 //! `hierarchical_memory_limit` (`memory.stat`) still includes them; v2 has no such file, so a
 //! process under a limit above what it sees sets its memory limit by hand.
 //!
@@ -239,8 +239,8 @@ impl<F: Fs> Walk<'_, F> {
     /// without a step above (its names below the view's), its point opened and then each name,
     /// every handle on the view's own mount. A view the kernel answers otherwise doesn't reach
     /// it (another mount over the point or the way, or a name not there). A way the kernel
-    /// refuses or fails to open is a view that may show the group and wasn't read: `Unknown`
-    /// (sol-loop r7 S2).
+    /// refuses or fails to open is a view that may show the group and wasn't read:
+    /// `Unknown`.
     fn places(&self, group: &Path) -> Result<Vec<Place<F::Handle>>, Unknown> {
         let mut found = Vec::new();
         for view in &self.views {
@@ -443,7 +443,7 @@ fn limited<F: Fs>(
         }
         // The parent, reached on a view's own mount by its names below the view's group, is
         // that group: within one mount of the hierarchy a name is the group's child. Whatever
-        // is bound over the child's entry there (the child itself, sol-loop r7 S1, or another
+        // is bound over the child's entry there (the child itself, or another
         // group) doesn't change which group the parent is.
         let up = parent(&group);
         // None reaches it (above every view's group, or hidden by a mount): not visible to
@@ -530,7 +530,7 @@ pub(super) fn left(fs: &impl Fs) -> Result<Option<u64>, Unknown> {
 
 /// The kernel's own answers: every handle a path-only descriptor (`O_PATH`, which needs search
 /// permission on the way and none on the entry, so a directory the process may pass but not
-/// list is passed, sol-loop r7 S2), opened one name at a time by `openat` on the directory's
+/// list is passed), opened one name at a time by `openat` on the directory's
 /// descriptor, no symbolic link followed (the name alone is resolved, in the directory the
 /// descriptor holds, which no rename or mount elsewhere changes); mount ids from `statx`'s
 /// `STATX_MNT_ID` (Linux 5.8), else `/proc/self/fdinfo/N` ([`Kernel::mount_in_fdinfo`]); a file
@@ -687,7 +687,7 @@ pub(super) mod declared {
         /// `files` by absolute path (`/proc/self/mountinfo` among them), `denied` (if not
         /// empty) refused. A file whose text is `EOPNOTSUPP` answers that error. A path with a
         /// `.` or `..` in it is a spelling a reader of paths asked the kernel for (the rows keep
-        /// what the kernel answered it, for the reader before SYN-45 r2); no directory holds
+        /// what the kernel answered it, for SYN-45's earlier reader); no directory holds
         /// such an entry, so it isn't a file here.
         pub fn new(mut files: HashMap<String, String>, denied: &str) -> Self {
             files.retain(|path, _| !path.split('/').any(|name| name == "." || name == ".."));

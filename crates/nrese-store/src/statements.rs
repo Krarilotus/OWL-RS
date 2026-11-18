@@ -440,8 +440,8 @@ pub(crate) fn apply_statements<T: nrese_sparql::UpdateTarget>(
     for op in request.ops.iter() {
         // Each statement of a payload as it is read; one that fails part-way fails the
         // request, whose transaction is then discarded with all it changed. The new terms a
-        // writer's inserts interned stay in the shared dictionary (stated limit L3 for v1.5,
-        // dictionary lifecycle contract); a private transaction's are its own. The pending
+        // writer's inserts interned stay in the shared dictionary
+        // (a known limit of v1.5); a private transaction's are its own. The pending
         // changes' growth is charged before it happens (D16-039).
         match op {
             StatementOp::Add { data, contexts } => {

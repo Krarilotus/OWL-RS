@@ -141,7 +141,7 @@ pub(crate) fn local_name_text(iri: &str) -> Option<String> {
         return None;
     }
     // Measured first, so the text is made in one allocation of exactly its length
-    // ([`local_name_text_bytes`] bounds it; sol-loop r2 B4).
+    // ([`local_name_text_bytes`] bounds it).
     let split = |previous: Option<char>, c: char| {
         previous.is_some_and(|p| p.is_lowercase() && c.is_uppercase())
     };
@@ -348,7 +348,7 @@ fn tokens(text: &str) -> (HashMap<String, u16>, u16) {
 }
 
 /// How many words a document holding `text` has, as [`TextIndex::add`] counts them (0: it
-/// is not a document), counted in place: nothing is allocated (sol-loop r1 B4).
+/// is not a document), counted in place: nothing is allocated.
 pub(crate) fn word_length(text: &str) -> u16 {
     u16::try_from(word_count(text)).unwrap_or(u16::MAX)
 }
@@ -655,7 +655,7 @@ impl TextIndex {
 /// Where a search reads its documents' statistics, a word's postings among them and a
 /// document's length from ([`search_with`]): one index and a scope of it ([`Indexed`]), or
 /// a private snapshot's shared index below its own terms and the index of its own documents
-/// ([`Private`]; the lifecycle contract's §7, one search body over one document domain).
+/// ([`Private`]; one search body over one document domain).
 pub(crate) trait Source {
     fn documents(&self) -> u64;
     fn total_words(&self) -> u64;
@@ -1024,8 +1024,8 @@ mod tests {
         assert_eq!(local_name_text("http://example.com/"), None);
     }
 
-    /// V3's sol-loop r2 B4: `local_name_text` makes its text in one allocation of its
-    /// length, within `local_name_text_bytes` of the IRI. The IRIs: sol's witness (`urn:`
+    /// `local_name_text` makes its text in one allocation of its
+    /// length, within `local_name_text_bytes` of the IRI. The IRIs: a long one (`urn:`
     /// and 1,025 `a`s), camel case at every letter, non-ASCII letters, a local name of
     /// separators only.
     #[test]

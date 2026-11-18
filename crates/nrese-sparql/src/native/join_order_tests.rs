@@ -111,7 +111,7 @@ const HAND_BUILT: &Table = &[
     ("greedy-13", &[6, 0, 12, 7, 2, 4, 8, 9, 10, 11, 1, 3, 5], &[0x40a4080000000000, 0x4062c3bf40265eba, 0x407c259ee0398e17, 0x40653582192e29f8, 0x407fd04325c53ef4, 0x4097dfbcda3ac10d, 0x40b1e7cda3ac10c9, 0x40abcf94e23927c4, 0x40c4dcf2228d12c8, 0x40c53f32f779354d, 0x40ea982bd3fa777e, 0x4110a157f575cfda, 0x4134c9adf2d343d1]),
 ];
 
-/// Spec: the q02 planner design (12 Nov 2026) as the lead reconciled it: the orderer keeps
+/// Spec: the orderer keeps
 /// every comparison, in the same order, on the same values, so each planning problem gets
 /// the same order and the same rows per step, the last step's included. Stars, a chain, a
 /// cycle, a cross product, an empty pattern, equal-cost ties with equal and with different
@@ -399,7 +399,7 @@ const FROM_THE_STORE: &Table = &[
 
 /// Spec: as for [`hand_built_inputs_plan_as_before`], through the planner's inputs from a
 /// store (counts, distinct values, stars, edges, counted common values, a link's
-/// variable), under the planner's own gate (the master's decision of 13 November 23:58:
+/// variable), under the planner's own gate (decided on 13 November:
 /// these small BGPs expect too few rows for the sets, so each gets its plain plan) and
 /// admitted to the store's characteristic sets and pairs: q02's shape, one and two
 /// patterns, a star, a chain, an edge after a star on its object, two small patterns on
@@ -638,7 +638,7 @@ fn a_query_keeps_its_distinct_counts() {
     assert!(ctx.budget.used() >= kept.charged(), "to the query's budget");
 }
 
-/// Spec: the q02 design review (12 Nov 2026, BLOCK 1) and the lead's reconciliation:
+/// Spec: the q02 design review (12 Nov 2026, BLOCK 1):
 /// planning looks up the distinct values of every pattern's variables, also of one that
 /// no other pattern has, whose value no estimate reads: a lookup fills the engine's
 /// statistics cache, which later revisions read while a pattern's matches drift by at most

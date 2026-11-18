@@ -5,9 +5,9 @@
 //! still bring the earlier one back.
 //!
 //! Each write, removal and sync here first names its directory's path durably ([`name`]): a
-//! store's open leaves those names to the first durable write that relies on them (DUR-3,
-//! deferred-sync design note of 8 Nov), and a metadata file acknowledged under a name a power
-//! loss can undo would be lost with it (fix check, DEFER-F1). Every durable write a store makes
+//! store's open leaves those names to the first durable write that relies on them (DUR-3),
+//! and a metadata file acknowledged under a name a power loss can undo would be lost with
+//! it. Every durable write a store makes
 //! under its directory outside the engine passes through here, or names its directory itself
 //! with the same placement-owner operation (the quarantine's log).
 
@@ -139,16 +139,16 @@ pub(crate) mod tests {
     }
 
     /// A store's metadata is acknowledged only once the names leading to its directory are
-    /// durable (DUR-3 fix check, DEFER-F1). A reopen of a store that changes nothing leaves
+    /// durable. A reopen of a store that changes nothing leaves
     /// those names to the first durable write; a metadata write is one. Here naming the store's
     /// directory fails (`FAIL_NAMING_OF`), as when a directory above it can't be synced.
     /// Expected, judged apart:
     /// - the reopen and its reads work (guard: a reopen changes nothing on disk);
     /// - a namespace change is refused, not published, and leaves the store available;
     /// - a rematerialisation is refused before it publishes anything: the removal of the
-    ///   certificate of the closure it would replace can't be made durable (Q06 remainder,
-    ///   review r1 F3; before it, the marker was refused after the publication,
-    ///   `InferencesNotRecorded`), and the inferences aren't there;
+    ///   certificate of the closure it would replace can't be made durable (Q06 remainder; before it, the marker was refused after the publication,
+    ///   `InferencesNotRecorded`),
+    ///   and the inferences aren't there;
     /// - reopened, neither the binding nor the reasoning is there;
     /// - once naming works, the same change and rematerialisation are acknowledged (a retry
     ///   after a refusal), and the binding and the reasoning are there after a reopen;
@@ -296,7 +296,7 @@ pub(crate) mod tests {
     }
 
     /// A store reached through a link has its metadata acknowledged only once every name the
-    /// link's resolution reads is durable (DUR-4, fix check DEFER-F1-SYM): the link's own entry
+    /// link's resolution reads is durable: the link's own entry
     /// and the target's chain. A copied store at `data/new/store`, reached as `stable/store`
     /// (the store's own level a link) or `a/b/store` with `a` → `real/a` (an intermediate
     /// link); a sync of one directory failing with a non-permission error
@@ -346,7 +346,7 @@ pub(crate) mod tests {
                 extra: &[],
             },
         ];
-        // Windows takes `..` lexically (sol-loop round 1, S1): `b\alias\..\tenant\store` is
+        // Windows takes `..` lexically: `b\alias\..\tenant\store` is
         // `b\tenant\store`, though `alias` → `t\deep` and a `t\tenant\store` is there too; the
         // actual holder `b\tenant` failing must refuse.
         #[cfg(windows)]

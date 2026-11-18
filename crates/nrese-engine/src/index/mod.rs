@@ -389,7 +389,7 @@ impl IndexVersion {
     /// `deletes` (DUR-6 slice 2): below the parallel threshold, the bound of its run's build
     /// ([`Run::delta_bound`]), working memory included; nothing for an empty delta (nothing is
     /// built). None at or above the threshold: that build charges exactly as it goes, and no
-    /// bound charged beside it covers its peak (review r1 on slice 2, DUR6B-R1-01).
+    /// bound charged beside it covers its peak.
     pub(crate) fn change_bound(
         &self,
         inserts: &[EncodedQuad],
@@ -512,7 +512,7 @@ impl IndexVersion {
     }
 
     /// [`Self::contains`], each run's probe and its search's comparisons counted on `visit`
-    /// before they are made ([`crate::visit`]; REAS-3, sweep SW009; fix check r1 F1).
+    /// before they are made ([`crate::visit`]; REAS-3, sweep SW009).
     pub(crate) fn contains_counted(
         &self,
         quad: &EncodedQuad,
@@ -526,7 +526,7 @@ impl IndexVersion {
     }
 
     /// [`Self::contains_counted`] on a caller's `account`: a probe inside a read that counts all
-    /// its work on one account (an equality read's visibility probes, fix check r2 G1).
+    /// its work on one account (an equality read's visibility probes).
     pub(crate) fn contains_with(
         &self,
         quad: &EncodedQuad,
@@ -544,7 +544,7 @@ impl IndexVersion {
 
     /// [`Self::any_plan`], each run it looks at a unit on `visit`, each search's comparisons
     /// counted before it is made and, where it counts, the count's work
-    /// ([`Self::count_plan_visiting`]) (REAS-3, sweep SW010; fix check r1 F1).
+    /// ([`Self::count_plan_visiting`]) (REAS-3, sweep SW010).
     pub(crate) fn any_plan_counted(
         &self,
         plan: &AccessPlan,
@@ -558,7 +558,7 @@ impl IndexVersion {
             };
         };
         // Whether a run holds tombstones (then the exact count decides): each run looked at a
-        // unit, counted a chunk at a time before it is looked at (REAS-3a sol-loop r1 S2).
+        // unit, counted a chunk at a time before it is looked at.
         let mut has_tombstones = false;
         for runs in self.runs.chunks(nrese_exec::POLL_UNITS as usize) {
             if has_tombstones {
@@ -577,8 +577,8 @@ impl IndexVersion {
             let count = self.count_plan_visiting(plan, visit);
             return count.map(|count| count > 0).ok_or(Stopped);
         }
-        // Each run's bound search counted before it is made, its comparisons too (fix check
-        // r1 F1, design attack r2 E2).
+        // Each run's bound search counted before it is made, its comparisons
+        // too.
         let mut ledger = Ledger::new(visit);
         for run in self.runs.iter() {
             let keys = &run.permutation(adapted.permutation).keys;
@@ -596,7 +596,7 @@ impl IndexVersion {
 
     /// [`Self::scan_plan`] for a counted read. As the scan is made, each run's range search
     /// and the cursor it adds are counted on `visit` before they are done, the searches'
-    /// comparisons too (REAS-3, sweep SW006; fix check r1 F1, design attack r2 E2). Its steps
+    /// comparisons too (REAS-3, sweep SW006). Its steps
     /// are counted by [`QuadScan::next_counted`] or [`CountedScan`] on the same ledger.
     pub(crate) fn scan_plan_counted(
         &self,
@@ -611,7 +611,7 @@ impl IndexVersion {
 
     /// [`Self::scan_plan_counted`] on a caller's `account`, which then steps it
     /// ([`QuadScan::step_with`]): one account for a read that does other work between the
-    /// scan's steps (an equality read's unions, copies and probes; fix check r2 G1). The plain
+    /// scan's steps (an equality read's unions, copies and probes). The plain
     /// scan where the account counts nothing.
     pub(crate) fn scan_plan_with<A: Account>(
         &self,
@@ -750,8 +750,8 @@ impl IndexVersion {
     /// counts. That is each run's range search, with its comparisons (`PackedKeys::range_counted`),
     /// its tombstone words as they are read (`PermutationRun::tombstones_in_visiting`), and
     /// the merge work of a default-graph post-filter scan ([`QuadScan::next_counted`]).
-    /// `None` as soon as `visit` returns false, nothing more read (REAS-2 fix check r1,
-    /// R2-F1: the count lives in the reader).
+    /// `None` as soon as `visit` returns false, nothing more read (the count lives in the
+    /// reader).
     pub(crate) fn count_plan_visiting(&self, plan: &AccessPlan, visit: Visitor<'_>) -> Option<u64> {
         let Some(adapted) = self.layout.adapt(plan) else {
             return Some(0);
@@ -915,7 +915,7 @@ impl IndexVersion {
                 });
                 refused.map_or(Ok(()), Err)
             };
-            // The path is the whole walk's (package fix checks r3, r4): a run walked serially
+            // The path is the whole walk's: a run walked serially
             // after a merged one would grow from the merge's capacity, not the reference's.
             if !in_parts || end - start < 2 * GROUP_PART {
                 walk(start, end, out)?;
@@ -982,7 +982,7 @@ impl IndexVersion {
                     })
             };
             // The merge's room at once, for exactly the groups it appends: a group spanning
-            // a cut is added to the one before it, not appended (sol-loop S2-2).
+            // a cut is added to the one before it, not appended.
             let mut last = None;
             let mut appended = 0;
             for part in each_part() {
@@ -1349,7 +1349,7 @@ impl<'a> QuadScan<'a> {
 
     /// The next visible quad, its merge's work counted on `account` ([`SignedMerge::step`]).
     /// The keys passed over (deleted ones, or the default graph's where it is left out) count
-    /// as much as the one handed on (REAS-2 fix check r1, R2-F1: a long deleted run can't be
+    /// as much as the one handed on (a long deleted run can't be
     /// drained unseen). The plain scan, the counted scan and a count all use it.
     #[inline]
     pub(crate) fn step_with(
@@ -1400,7 +1400,7 @@ impl<'a> QuadScan<'a> {
     }
 
     /// [`Iterator::next`], its work counted on `visit` before it is done, from the ledger
-    /// the scan's making started (REAS-3, sweeps SW005, SW007; fix check r1 F1). `Err` once
+    /// the scan's making started (REAS-3, sweeps SW005, SW007). `Err` once
     /// `visit` has stopped, and on every call after: nothing more is read. Readers that count
     /// nothing use `next`.
     #[inline]

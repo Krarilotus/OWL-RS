@@ -1,4 +1,4 @@
-//! Test-only counters of the work producers do (REAS-2 fix check r1, attack list B10). A
+//! Test-only counters of the work producers do. A
 //! stopped poller doesn't ask its stop again, so the work a read does after a stop can't be
 //! seen from the stop; each counter counts it at the producer that does it, on the thread
 //! that does it. The module and every use of it are compiled only for this crate's tests or,
@@ -34,17 +34,17 @@ pub enum Site {
     /// `nrese_exec::classes::witness`).
     ClassFinish,
     /// Merge cursors read outside a merge step. The remaining-entries hint
-    /// (`SignedMerge::remaining`) read every cursor until REAS-3a review r1 R2; it now keeps
+    /// (`SignedMerge::remaining`) read every cursor until REAS-3a; it now keeps
     /// its count as the cursors advance and reads none, so nothing counts here.
     CursorReads,
     /// A class build's sort work: each comparison of a run's sort and each identity a merge
-    /// of sorted runs moves (`Classes::of_with`; REAS-3a fix check r1 F3).
+    /// of sorted runs moves (`Classes::of_with`).
     SortWork,
     /// Key comparisons a run's range or bound search makes (`PackedKeys::bound_in` and its
-    /// callers; REAS-3a fix check r1 F1).
+    /// callers).
     SearchWork,
     /// A merge's work: each key comparison its selection makes, each cursor it advances and
-    /// each key a cursor decodes (`index::merge`; REAS-3a fix check r1 F1).
+    /// each key a cursor decodes (`index::merge`).
     MergeWork,
     /// Reads that took a point read's own path (`CountedSnapshot::point_graphs`), not the
     /// expanded read of equality classes.

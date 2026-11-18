@@ -542,7 +542,7 @@ fn current_s_scan_keeps_the_stop_contract() {
 /// has refused, its scan and its range reads neither filter nor deliver another fact,
 /// though the store still visits the rest of its run counted ahead. The stop refuses at each
 /// of the lookups' asks in turn. This checks only what follows the refusal: that run's
-/// credit, which the lookups' asks void, is the store's to give up (design r3).
+/// credit, which the lookups' asks void, is the store's to give up.
 #[test]
 fn current_s_filter_ends_at_a_nested_refusal() {
     let store = oracle_store();
@@ -600,7 +600,7 @@ fn charges(read: impl FnOnce(&Poller<'_>, &mut dyn FnMut(Triple))) -> (Vec<usize
     (charged, delivered)
 }
 
-/// REAS-2 (master, 8 Nov 05:29: a wrapper's filtered positions are counted once, by the
+/// REAS-2 (a wrapper's filtered positions are counted once, by the
 /// source it wraps): `Current`'s scan and range read charge what the store's charge, in the
 /// same order, the stale facts they filter out included. With every fact of subject 7's key
 /// stale, `Current` delivers none, and a poller whose stop has fired since it was made still
@@ -828,7 +828,7 @@ impl Random {
 /// is traced where a run is read in counted runs (`in_runs`) and by the range read; a scan's
 /// point lookups and marked runs trace none yet. What a read charges is at least what it was
 /// seen to visit; the totals are printed. A recharge after a nested ask may charge more than
-/// today's reads: design r3 states the excess allowed.
+/// today's reads: the design's revision 3 states the excess allowed.
 #[test]
 fn reads_match_a_plain_model() {
     let segs = [

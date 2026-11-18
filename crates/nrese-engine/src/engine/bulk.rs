@@ -528,7 +528,7 @@ struct Stamp {
     /// The time of the version it follows, which a replacement takes too, though it keeps
     /// nothing of it: while that time is unknown, a commit may have been made after any time
     /// the store's clock gives (a legacy store's version 4 log keeps no times, so a reopen
-    /// loses them: review r2, R1-F2), and no later time is certified.
+    /// loses them), and no later time is certified.
     previous: Option<u64>,
 }
 

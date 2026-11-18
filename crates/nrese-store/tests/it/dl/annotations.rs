@@ -50,8 +50,8 @@ fn not_unsound<'a>(told: impl IntoIterator<Item = (&'a str, Completeness)>) -> V
         .collect()
 }
 
-/// Spec (Direct Semantics §2; Structural Specification §10.2.1; the master's ruling of 17 Nov
-/// 19:39): under `owl2-dl`, on the rules' route, every read that may return the rules' copy of
+/// Spec (Direct Semantics §2; Structural Specification §10.2.1; decided on 17 Nov):
+/// under `owl2-dl`, on the rules' route, every read that may return the rules' copy of
 /// an annotation statement is `unsound`: a constant annotation predicate, declared or built in,
 /// as `SELECT` and in a path; a variable predicate; a negated property set; `DESCRIBE`; and a
 /// pattern under `NOT EXISTS`, where a copy removes a right answer.
@@ -88,7 +88,7 @@ fn an_object_property_read_beside_a_copied_annotation_stays_complete() {
     assert_eq!(status.as_str(), "complete", "{}", status.header());
 }
 
-/// Spec (the ruling of 19:39: every status under `owl2-dl`, on every path): a constant
+/// Spec (every status under `owl2-dl`, on every path): a constant
 /// annotation read is `unsound` off the rules' route too (the bounds, after one axiom outside
 /// OWL 2 RL), in EXPLAIN and in a plan, as a read of the closure alone without the bounds, and
 /// inside a transaction.
@@ -148,7 +148,7 @@ fn a_copied_annotation_read_is_unsound_on_every_owl2_dl_path() {
 }
 
 /// Spec (docs/spec/reasoning-semantics.md:86, a restricted reader's status says nothing about
-/// graphs they can't read; the master's ruling of 20:49, point 3): under `owl2-dl` a reader of
+/// graphs they can't read): under `owl2-dl` a reader of
 /// some graphs is told `not-certified` (the redaction), and the same with `:note`'s
 /// declaration in a graph it can't read as without the declaration: status and reasons alike.
 #[test]
@@ -182,8 +182,8 @@ fn a_reader_who_cant_see_the_declaration_is_told_as_without_it() {
 }
 
 /// Spec (OWL 2 Structural Specification §2.4: `rdf:type` is reserved vocabulary, no entity;
-/// Direct Semantics: a class assertion's copy through an equality is entailed; the master's
-/// ruling of 21:20): the reader leaves a declaration of a reserved name out
+/// Direct Semantics: a class assertion's copy through an equality is entailed):
+/// the reader leaves a declaration of a reserved name out
 /// (`leave_out_reserved`), so in the ontology as read `rdf:type` is no annotation property,
 /// and nothing derives from the left-out declaration. Beside an equality, `?x a :C` is told
 /// as on the same data without `rdf:type a owl:AnnotationProperty`, status and reasons alike.
@@ -226,7 +226,7 @@ fn rdf_type_declared_an_annotation_property_gives_a_read_of_any_predicate_no_cop
     );
 }
 
-/// One case of the outside check's grid: the data, the equality (empty: none), and the reads.
+/// One case of the grid: the data, the equality (empty: none), and the reads.
 struct Case {
     name: String,
     facts: String,
@@ -282,10 +282,10 @@ fn cases(ann: &str, decl: &str, own: bool) -> [Case; 3] {
     ]
 }
 
-/// Spec (as above, and the outside check's run of 17 Nov, its cases A, B and D): under every
+/// Spec (as above): under every
 /// equality setting, written in one commit, in two (the equality last) or loaded and rebuilt,
 /// a read that may return a copy (A, B; a declared `:note` and the built-in `rdfs:label`) is
-/// `unsound`, `compact`'s `ASK` included, which today is `sound-only` for a literal's reason. A
+/// `unsound`, `compact`'s `ASK` included. A
 /// read of the same data without an equality (D) keeps its status: a declared `:note` read
 /// `complete`, the rest `sound-only`.
 #[test]

@@ -300,8 +300,8 @@ Id: r
 
     /// A GraphDB ruleset with contexts no longer matches the state a build with the old
     /// context names stored, so the store rebuilds its closure; other rulesets keep theirs.
-    /// `[ Context` is an accepted spelling (fix check 1 of R1-F1), and a declared `urn` prefix
-    /// hides no relation (Sol's review of R1-OL1's fix, S1).
+    /// `[ Context` is an accepted spelling, and a declared `urn` prefix
+    /// hides no relation.
     #[test]
     fn changed_context_names_make_older_closures_stale() {
         let without = IN_A_CONTEXT.replace(" [Context <e:g#x>]", "");
@@ -323,7 +323,7 @@ Id: r
     /// A user ruleset with a guard no longer matches the state a build stored before guards
     /// read the classes over representatives, so the store rebuilds its closure; others keep
     /// theirs (reasoning-semantics.md, "Freshness": a build that changes what a ruleset
-    /// derives rebuilds once; Sol's review of the guard fix, r1 S3).
+    /// derives rebuilds once).
     #[test]
     fn guarded_user_rules_make_older_closures_stale() {
         let guarded = "@prefix : <http://e/> .
@@ -387,8 +387,8 @@ Id: eq-rep-s
 
     /// The names the rules' context relations compile to are part of the fingerprint: a
     /// build that names them otherwise, as the plain concatenation before 20 Oct did,
-    /// rebuilds what this one stored, with no version to change by hand (review of PR #29,
-    /// R1-OL1).
+    /// rebuilds what this one stored, with no version to change by hand
+    /// (PR #29).
     #[test]
     fn renamed_context_relations_change_the_fingerprint() {
         for text in [IN_A_CONTEXT, &with_urn_prefix()] {

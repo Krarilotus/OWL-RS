@@ -1,10 +1,10 @@
-//! A pending snapshot's one decision (DUR-6 slice 2; F1 of the dictionary's charged-build
-//! review): its deltas' bounds are charged before the build only where the budget's room
+//! A pending snapshot's one decision (DUR-6 slice 2):
+//! its deltas' bounds are charged before the build only where the budget's room
 //! covers them; elsewhere every delta is charged exactly as it is built, the reference. A
 //! budget the reference fits is answered, and not recorded as refused, though the bounds don't
 //! fit it. Red on the bounds charged unconditionally (2f91a6d3's rule): that budget refused.
-//! A delta at or above the parallel threshold beside one below it is built exactly throughout
-//! (review r1, DUR6B-R1-01): red on fe517a03, whose bounded path held the small delta's slack
+//! A delta at or above the parallel threshold beside one below it is built exactly throughout:
+//! red on fe517a03, whose bounded path held the small delta's slack
 //! beside the large one's exact charges.
 
 use std::sync::Arc;
@@ -91,7 +91,7 @@ fn a_budget_the_reference_fits_is_answered() {
     }
     tx.commit().unwrap();
     let rows: [Row; 6] = [
-        // F1's shape: two default-graph triples, one predicate shared.
+        // Two default-graph triples, one predicate shared.
         (
             "two triples",
             |tx| {
@@ -129,7 +129,7 @@ fn a_budget_the_reference_fits_is_answered() {
             },
             true,
         ),
-        // DUR6B-R1-01's construction, both ways round.
+        // One small delta beside a large one, both ways round.
         (
             "one asserted beside a large inferred delta",
             |tx| {

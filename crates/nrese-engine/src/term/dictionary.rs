@@ -488,7 +488,7 @@ impl Dictionary {
             return;
         };
         // Not in place of an index a search started a build in meanwhile (a search that
-        // didn't wait for this load; PR #79 fix check r1).
+        // didn't wait for this load; PR #79).
         let graphs = index.graph_coverage();
         if self.vectors.write().adopt(index) {
             *self.derived.saved_graphs.lock() = graphs;
@@ -728,7 +728,7 @@ impl Dictionary {
     /// compressed, [`key_lookup_bytes`]'s bound for a key of its length (the compressor's
     /// output and the stored key it is copied into). The bound and the probe read one state of
     /// the dictionary, under one read guard: a checkpoint can't publish a compressed base
-    /// between them (sol-loop e1 S1: a compressed base's bound charged on a plain one refused
+    /// between them (a compressed base's bound charged on a plain one refused
     /// interns the parent made).
     pub(crate) fn lookup_key_charged<E>(
         &self,
@@ -1092,7 +1092,7 @@ impl Dictionary {
         matches
     }
 
-    /// A private snapshot's search ([`super::text::Private`]; the lifecycle contract's §7):
+    /// A private snapshot's search ([`super::text::Private`]):
     /// literals (`iris` false) or IRI names matching `query` among `corpus`'s documents, the
     /// shared ones below `start` through this dictionary's index (first taking in the terms
     /// interned since the last search, as [`Self::text_search_in`] does), the overlay's own
@@ -2796,7 +2796,7 @@ mod tests {
         }
     }
 
-    /// P2-01, Sol r1 S1. A scan copies no key of a heap's tail, a frozen heap's included: its
+    /// A scan copies no key of a heap's tail, a frozen heap's included: its
     /// peak stays below half the tail's bytes, where any copy of the tail holds all of them.
     /// Here 64 keys of 256 KiB in a heap frozen by a bulk load, and a needle matching none.
     #[test]
@@ -3095,7 +3095,7 @@ mod tests {
     }
 
     /// Loading the vector index from its file takes no background build's reservation
-    /// (PR #79 fix check r1, R79-01; notes/2026-11-02-pr79-vector-reservation-design.md).
+    /// (PR #79).
     /// The file covers M entries: a build was refused, then the vectors were saved. The
     /// dictionary reopens with the first N. Two first searches race: the one that looks for
     /// the file waits before its fingerprint (the derived dir is locked), the other covers
@@ -3226,10 +3226,10 @@ mod tests {
             }
             term
         };
-        // Past the 64 levels the N-Triples parser took (review r1 R1: the first RDF 1.2 version
+        // Past the 64 levels the N-Triples parser took (the first RDF 1.2 version
         // wrote any depth), the text still reads back as the term.
         let past = "nested 65, past the parser";
-        // A private-use tag of 32,768 subtags (sol-loop r1 S1: the parser's tag check held 16
+        // A private-use tag of 32,768 subtags (the parser's tag check held 16
         // bytes for each).
         let long_tag = format!("x{}", "-a".repeat(32_768));
         let shapes: Vec<(&str, Term)> = vec![
@@ -3376,7 +3376,7 @@ mod tests {
         }
     }
 
-    /// Package C3, review r1 R1: a triple term 65 levels deep, keyed by its text as the first
+    /// A triple term 65 levels deep, keyed by its text as the first
     /// RDF 1.2 version wrote it (that version set no depth limit), restored as its checkpoint
     /// holds it, under a triple term keyed by ids: the decode, plain and charged, gives the
     /// term built apart, not its text as a literal.

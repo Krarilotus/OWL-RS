@@ -236,7 +236,7 @@ fn load_shapes(pipeline: &MutationPipeline, ntriples: &str) {
 }
 
 /// SHACL §1.5: a shapes graph with `sh:entailment E` the processor doesn't support makes
-/// every validation fail, a shapes graph with nothing else included (SYN-56 r1 S2): the
+/// every validation fail, a shapes graph with nothing else included: the
 /// enforcing gate rejects a write, though no shape constrains anything.
 #[test]
 fn a_shapes_graph_asking_for_an_unsupported_entailment_fails_the_gate() {
@@ -253,7 +253,7 @@ fn a_shapes_graph_asking_for_an_unsupported_entailment_fails_the_gate() {
     assert!(!holds(&pipeline, "ex:a ex:name \"A\""));
 }
 
-/// SYN-56 review r1 F3, the gate's side: a shapes graph that asks for an unsupported
+/// On the gate's side: a shapes graph that asks for an unsupported
 /// entailment, and holds nothing else, can be removed under the enforcing gate: the commit
 /// that clears it leaves no failure, and the state before's failures aren't the commit's.
 #[test]
@@ -268,7 +268,7 @@ fn a_shapes_graph_asking_for_an_unsupported_entailment_can_be_removed() {
     update(&pipeline, "INSERT DATA { ex:a ex:name \"A\" }").expect("then writes are accepted");
 }
 
-/// SYN-56 review r1 F5, through the gate: a constraint whose query computes its result's path
+/// Through the gate: a constraint whose query computes its result's path
 /// (`urn:computed-path`, which no statement uses) has that result before and after a write
 /// that stores the very IRI as an unrelated statement's predicate. The write introduces no
 /// result, so the enforcing gate accepts it.

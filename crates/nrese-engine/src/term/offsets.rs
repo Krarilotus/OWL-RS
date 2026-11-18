@@ -290,7 +290,7 @@ mod tests {
 
     /// [`encoded_bytes`] is what [`encode`] charges and allocates, its vectors filled, at
     /// every width boundary: empty, partial, full and several blocks, of keys around 65,536
-    /// bytes and up to `u32::MAX` (Sol's review, 20 Oct).
+    /// bytes and up to `u32::MAX`.
     #[test]
     fn encoded_bytes_are_what_encode_allocates() {
         let budget = Budget::unlimited();

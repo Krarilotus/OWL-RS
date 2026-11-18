@@ -78,7 +78,7 @@ class Standings(unittest.TestCase):
         self.assertIn("| jena | - | - | - | not measured yet |", text)
 
     def test_a_result_from_before_the_reset_is_marked_never_shown_as_current(self):
-        """The brief of 2 Nov 2026: STATUS and STANDINGS showed 12 Oct's results with nothing saying
+        """STATUS and STANDINGS once showed 12 Oct's results with nothing saying
         they measured an engine engine-v2 no longer continues (the reset of 25 Oct 2026)."""
         entry = {"case": "c", "semantics": "plain", "system": "qlever", "answers": "ok", "timed": "2/2",
                  "verdict": "win", "time": {"ratio": 0.25, "ci": [0.2, 0.3]}}

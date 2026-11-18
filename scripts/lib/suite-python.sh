@@ -1,7 +1,7 @@
 # The suite contracts' Python packages (benches/suite/requirements.txt), in an environment of their
 # own, never the host's Python (whose packages we don't install into): one per version of that file
 # (and of the runtime declared for it) under the host's cache
-# (Harness/notes/2026-10-20-host-cache-contract.md, `py-<hash>`). Sourced by the gate jobs,
+# (`py-<hash>`). Sourced by the gate jobs,
 # scripts/lib/gate-job.sh on Linux and scripts/lib/windows-job.sh on Windows; each says which Python
 # to start from.
 #
@@ -23,8 +23,8 @@
 # by NRESE_PYTHON, never Windows' `python3`, which may be the Store's stub), aside, and moved into
 # place whole (suite_python_entry): a job that finds one there as it must be uses it without the
 # lock, and under the lock no other job's build is live, so what a killed job left (a
-# `.partial-*`, or one not as it must be) goes there, and one as it must be is never removed (Sol,
-# windows-job-python r1). Without the host's venv module's pip (Debian's python3-venv), pip comes
+# `.partial-*`, or one not as it must be) goes there, and one as it must be is never removed.
+# Without the host's venv module's pip (Debian's python3-venv), pip comes
 # from its own bootstrap, into that environment only.
 
 # shellcheck source=ns.sh

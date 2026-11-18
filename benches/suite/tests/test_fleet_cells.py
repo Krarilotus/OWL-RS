@@ -164,7 +164,7 @@ class FleetCells(unittest.TestCase):
                 self.assertIn(reason, output.getvalue())
 
     def test_a_member_whose_every_measured_row_failed_does_not_pass(self):
-        # Master 16:31 (#132 B2): a refused container leaves failed rows; the cell mustn't exit 0 as if it had measured, one ok
+        # A refused container leaves failed rows (#132 B2); the cell mustn't exit 0 as if it had measured, one ok
         # row is a measurement. Its own checkout: the landing lies outside it, and a gate's temp may be inside this one.
         import csv
         import subprocess
@@ -207,7 +207,7 @@ class FleetCells(unittest.TestCase):
                     self.assertIn(refused, (landing / "stderr.log").read_text(encoding="utf-8"))
 
     def test_cells_have_separate_jobs_and_adapter_capabilities(self):
-        # Master 21:24: one job per cell; resource basis and workload needs remain explicit.
+        # One job per cell; resource basis and workload needs remain explicit.
         code, text = self.run_plan("--systems", "qlever,jena", "--budget-hours", "80")
         self.assertEqual(code, 0, text)
         jobs = self.document()["job"]
@@ -224,7 +224,7 @@ class FleetCells(unittest.TestCase):
         self.assertIn("resource basis", text)
 
     def test_permanently_unplaceable_cell_is_omitted_from_the_set(self):
-        # Master 21:24: one impossible member cannot sink the placeable cells' set.
+        # One impossible member cannot sink the placeable cells' set.
         def checked(*args):
             if "--json" in args and "qlever" in args[1]:
                 return 1, json.dumps({"jobs": [{"fleet": {"verdict": "never"},
@@ -238,7 +238,7 @@ class FleetCells(unittest.TestCase):
         self.assertIn("needs more RAM", text)
 
     def test_bsbm_java_is_a_workload_dependency_for_qlever_too(self):
-        # Master's clarification: keep BIBM's actual Java need, separately from adapter needs.
+        # BIBM's actual Java need is kept separately from adapter needs.
         code, text = self.run_plan("--workloads", "bsbm", "--tiers", "bsbm=bsbm-bi-100m", "--budget-hours", "20")
         self.assertEqual(code, 0, text)
         self.assertIn("java", self.document()["job"][0]["requires"]["has"])
@@ -246,7 +246,7 @@ class FleetCells(unittest.TestCase):
         self.assertIn("workload/driver needs ['java']", text)
 
     def test_fleet_asks_do_not_cap_native_measurement_cpus(self):
-        # Opus B1: native suite.py run has no cap, even with a per-system historical core ask.
+        # Native suite.py run has no cap, even with a per-system historical core ask.
         from suitekit import fleet_cells
         make = fleet_cells.jobs
         def measured(groups, args):
@@ -261,7 +261,7 @@ class FleetCells(unittest.TestCase):
             self.asks(job)
 
     def test_identity_excludes_budget_owner_and_checkout(self):
-        # Opus N1: same measured cells/trees/inputs retain identity across administration changes.
+        # Same measured cells/trees/inputs retain identity across administration changes.
         from suitekit import fleet_cells
         self.assertEqual(self.run_plan("--budget-hours", "50", "--submit")[0], 0)
         first, make = self.document()["set"], fleet_cells.jobs
@@ -275,7 +275,7 @@ class FleetCells(unittest.TestCase):
         self.assertEqual(sum(c[0] == "submit" for c in self.calls), 1)
 
     def test_existing_set_is_reused_before_check_or_submit(self):
-        # Opus N1: a repeat returns the existing set/member ids, including after capacity closes.
+        # A repeat returns the existing set/member ids, including after capacity closes.
         self.assertEqual(self.run_plan("--budget-hours", "50", "--submit")[0], 0)
         existing = self.sets["set:" + self.document()["set"]["id"]]
         with patch.object(abba.rg, "fleet_call", side_effect=lambda *a: (0, json.dumps(existing)) if a[0] == "status" else (1, "must not recheck/submit")) as call:

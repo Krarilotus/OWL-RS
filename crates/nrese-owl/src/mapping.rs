@@ -184,8 +184,8 @@ pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
 /// reported when it can't be (malformed, unsupported).
 ///
 /// `Reader::blank_class` reads exactly these, and a caller choosing input (the store's QL
-/// reader, by memberships) finds class expressions by the same definition (I24c-2 review
-/// r1 F2, r2 F5). Both take it apart field by field, so a marker added here doesn't compile
+/// reader, by memberships) finds class expressions by the same definition.
+/// Both take it apart field by field, so a marker added here doesn't compile
 /// until each of them handles it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClassExpressionMarkers {

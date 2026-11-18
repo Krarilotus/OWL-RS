@@ -1,8 +1,8 @@
-//! The result cache admits only published state (the lifecycle contract's S3; package 3.6,
-//! `notes/2026-11-08-dict3-6-result-cache-design.md` §4, the token design check's §5 items 1,
-//! 2, 3, 7, 8 and 9). The oracle is the cache's own state (its counters, its pins, whether it
-//! offers a slot) and answers compared with an evaluation without the cache. Whether a
-//! snapshot is published is the engine's `Snapshot::shared_state` (package 3.0's guards).
+//! The result cache admits only published state (package 3.6).
+//! The oracle is the cache's own state (its counters, its pins, whether it offers a slot)
+//! and answers compared with an evaluation without the cache.
+//! Whether a snapshot is published is the engine's `Snapshot::shared_state`
+//! (package 3.0's guards).
 
 use std::sync::Arc;
 
@@ -193,7 +193,7 @@ fn inferred(snapshot: &Snapshot) -> Vec<EncodedQuad> {
         .collect()
 }
 
-/// Item 1: pending state of every kind, with no private id, read through a detached
+/// Pending state of every kind, read through a detached
 /// `Snapshot` (the explicit gap: `ReadView for Snapshot` answers itself).
 ///
 /// - Input: the cache warmed on a published snapshot; writer pending snapshots
@@ -266,7 +266,7 @@ fn unpublished_snapshots_are_answered_and_leave_the_cache_as_it_was() {
     assert!(cache.stats().hits > hits, "the published reads hit");
 }
 
-/// Item 2: no laundering through views; a published mask admits under its own identity.
+/// No laundering through views; a published mask admits under its own identity.
 ///
 /// - Input: a writer's pending snapshot through stored, equality, canonical, read-budget,
 ///   subset and `Only` views and a chain of them; then, from the published snapshot, a mask
@@ -348,13 +348,13 @@ fn views_admit_by_their_own_publication_under_their_own_identity() {
     }
 }
 
-/// Item 3: two readers' access over one snapshot, warmed in both orders.
+/// Two readers' access over one snapshot, warmed in both orders.
 ///
 /// - Input: one published snapshot; a reader who may read the graphs under `g/a/` and an
 ///   unrestricted one; the named-graph query and the join, twice each, restricted first and
 ///   unrestricted first.
-/// - Expected: every answer, rows and bytes, is the reader's own as without the cache (`one`
-///   alone for the restricted reader; `one` and `two` for the other).
+/// - Expected: every answer, rows and bytes, is the reader's own as without the cache (the
+///   named-graph query: `one` alone for the restricted reader, `one` and `two` for the other).
 #[test]
 fn two_readers_access_over_one_snapshot_keep_their_own_answers_in_both_orders() {
     let engine = engine();
@@ -406,7 +406,7 @@ fn two_readers_access_over_one_snapshot_keep_their_own_answers_in_both_orders() 
     }
 }
 
-/// Item 7: an output slot taken before a commit and offered after it.
+/// An output slot taken before a commit and offered after it.
 ///
 /// - Input: a slot for the join's bytes on revision 1; a commit changing the answer; the
 ///   newer snapshot's bytes written and offered; then the old slot's.
@@ -438,7 +438,7 @@ fn an_output_slot_offered_after_a_commit_answers_no_other_revision() {
     ));
 }
 
-/// Item 8: two independent engines with equal revisions and ids share one cache.
+/// Two independent engines with equal revisions and ids share one cache.
 ///
 /// - Input: two engines whose statements have the same shape and ids but different terms;
 ///   the join and the group on each, twice, through one cache.
@@ -476,7 +476,7 @@ fn independent_engines_sharing_a_cache_keep_their_own_answers() {
     assert!(cache.stats().hits > 0);
 }
 
-/// Item 9: a pin asked for on unpublished state.
+/// A pin asked for on unpublished state.
 ///
 /// - Input: the join pinned as `n` on the published snapshot; then the group, pinned as `n`,
 ///   on a writer's pending snapshot.
@@ -512,7 +512,7 @@ fn a_pin_on_unpublished_state_fails_and_leaves_the_pins_as_they_were() {
     assert_eq!(cache.pins(), pins, "the published pin stays");
 }
 
-/// Sol-loop round 1, S1: canonical answers read a view of the snapshot with an identity of
+/// Canonical answers read a view of the snapshot with an identity of
 /// its own; their bytes are never another reading's.
 ///
 /// - Input: `Alias owl:sameAs Rep` inferred, the store reading equality classes, and
@@ -564,7 +564,7 @@ fn canonical_and_expanded_answers_keep_their_own_bytes_in_both_orders() {
     }
 }
 
-/// Sol-loop round 2, S2: a canonical answer whose view the budgets refuse is never another
+/// A canonical answer whose view the budgets refuse is never another
 /// reading's cached bytes.
 ///
 /// - Input: `Alias owl:sameAs Rep` inferred, the store reading equality classes, `Rep p o`

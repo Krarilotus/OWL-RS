@@ -1,8 +1,8 @@
 //! A snapshot's counted reads ([`CountedSnapshot`]; their contract: [`crate::visit`]).
 //!
 //! Each read here is the twin of a [`Snapshot`] read, its scans, probes, equality copies and
-//! class builds counted on the reader's visitor where the work is done (REAS-3, design note
-//! `2026-11-09-p2-reas3-design.md` §1). The uncounted reads are left as they were: what an
+//! class builds counted on the reader's visitor where the work is done (REAS-3). The
+//! uncounted reads are left as they were: what an
 //! uncounted reader runs is not this code.
 
 use std::ops::ControlFlow;
@@ -21,7 +21,7 @@ use crate::{Count, SnapshotIdentity, TermId};
 /// visitor has stopped. Readers whose stop must see their reads (the reasoner's and the
 /// store's adapters) hold one instead of a [`Snapshot`], so an uncounted read of its data
 /// doesn't compile there; [`Self::uncounted`] is the one way back, for the callers
-/// `clippy.toml` names (REAS-3, master 9 Nov 01:37).
+/// `clippy.toml` names (REAS-3).
 #[derive(Clone)]
 pub struct CountedSnapshot {
     snapshot: Snapshot,
@@ -95,7 +95,7 @@ impl CountedSnapshot {
     }
 
     /// The graphs of the quads of `[s, p, o]`, as [`Self::quads`] answers them, each handed to
-    /// `each` in that order (design note `2026-11-14-d16-574-lever2-point-loop-design.md` r3).
+    /// `each` in that order.
     /// One ask of whether the read expands equality classes chooses its path:
     /// - where it does, the graphs of [`Self::quads`]'s expanded read of those classes
     ///   (Asserted reads never expand);
@@ -235,7 +235,7 @@ impl CountedSnapshot {
 }
 
 /// A counted read's quads: [`Stopped`] where its producers ended because the visitor had
-/// stopped, never the end of the data (REAS-2 attack list B9).
+/// stopped, never the end of the data.
 struct Ended<'v, I> {
     quads: I,
     visit: Visitor<'v>,
@@ -334,8 +334,8 @@ impl Snapshot {
         if !supported {
             return None;
         }
-        // One account for both stacks' scans, which the merge interleaves (fix check r2 G1's
-        // sibling: a ledger each allowed a run each after the same yes).
+        // One account for both stacks' scans, which the merge interleaves (with a ledger
+        // each, each allowed a run after the same yes).
         let mut account = Ledger::new(visit);
         let mut scan = |stack: Stack| {
             model
@@ -348,8 +348,8 @@ impl Snapshot {
 
     /// `Snapshot::expanded_sorted`'s work, counted: its stored scans, their merge, its copies,
     /// its visibility probes and its named graphs' scan on the read's one account (REAS-3,
-    /// sweeps SW013–SW015; fix check r2 G1's sibling: the scans' ledgers and the expansion's
-    /// credit allowed a run each after the same yes).
+    /// sweeps SW013–SW015; with a ledger each and a credit for the expansion, each
+    /// allowed a run after the same yes).
     fn expanded_sorted_visited<'a>(
         &'a self,
         classes: Arc<EqualityClasses>,
@@ -529,7 +529,7 @@ impl Snapshot {
 
 /// A scan of `index` for `plan` on a read's one account: nothing where the read stopped while it
 /// was being made. The account's refusal is final, so the read's next step answers [`Stopped`]
-/// too, whatever the account had left (fix check r3 H2).
+/// too, whatever the account had left.
 fn scan_on<'a>(
     index: &'a IndexVersion,
     plan: &AccessPlan,

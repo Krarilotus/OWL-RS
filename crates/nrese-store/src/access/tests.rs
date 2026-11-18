@@ -484,8 +484,8 @@ fn local_logins_check_passwords_open_sessions_and_throttle_failures() {
     ));
 }
 
-/// Failed logins are counted per user name and client address (the milestone review's
-/// R2-R4): guesses from one address don't lock the user out elsewhere; an address that
+/// Failed logins are counted per user name and client address:
+/// guesses from one address don't lock the user out elsewhere; an address that
 /// guesses many names waits too; and the counts are bounded, names without a login counted
 /// like the others. That refusing a name without a login does a wrong password's work is
 /// `login::tests::unknown_names_are_refused_like_wrong_passwords`.

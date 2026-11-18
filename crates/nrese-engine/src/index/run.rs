@@ -70,7 +70,7 @@ impl PermutationRun {
     }
 
     /// [`Self::tombstones_in`], its bitmap read a run of at most `POLL_UNITS` words at a
-    /// time, `visit(k)` called before each run of `k` words (REAS-2 fix check r1, R2-F1: the
+    /// time, `visit(k)` called before each run of `k` words (the
     /// count lives in the reader). `None` once `visit` returns false, nothing more read.
     /// Without tombstones, nothing is read and nothing visited.
     pub(crate) fn tombstones_in_visiting(
@@ -429,7 +429,7 @@ impl Run {
     /// of each of its runs, not N. A run of the quad layout is itself. Made without the slot's
     /// lock (the build is parallel on the caller's pool; no lock is held across pool work), so
     /// K callers that miss the slot at once make K conversions: the peak while they build grows
-    /// with concurrent misses, it isn't bounded at one or two forms (review r1 on DUR-6a). Each
+    /// with concurrent misses, it isn't bounded at one or two forms. Each
     /// that installs second takes the installed one and frees its own before returning, so
     /// once they return, all share one form. A form counts in `forms` from when it is made
     /// (its arrays exist a moment before) until it is freed. The slot's `Weak` keeps the
@@ -491,7 +491,7 @@ impl Run {
     }
 
     /// [`Self::sign_of`], its searches counted on `account` before they are made: `None`
-    /// once the account has stopped (REAS-3a fix check r1 F1).
+    /// once the account has stopped.
     pub(crate) fn sign_of_counted(
         &self,
         quad: &EncodedQuad,

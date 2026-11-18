@@ -82,7 +82,7 @@ struct RepositoryView {
     default: bool,
     /// The reasoning mode in effect.
     reasoning: &'static str,
-    /// The settings it was created with (none for the default repository: the server's).
+    /// Its settings as created or since changed; none while they are the defaults (the server's).
     #[serde(skip_serializing_if = "Option::is_none")]
     settings: Option<crate::repository_config::RepositorySettings>,
 }

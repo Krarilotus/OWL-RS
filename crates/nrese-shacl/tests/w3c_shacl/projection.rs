@@ -139,7 +139,7 @@ fn project(
         iri(SH, "resultMessage"),
     );
     // The report and each result become one fresh blank node, wherever they appear: a result
-    // that is also a focus node or value stays that (Sol, B-1408 r1 S1).
+    // that is also a focus node or value stays that.
     let results: Vec<NamedOrBlankNodeRef<'_>> = graph
         .objects_for_subject_predicate(root, &result)
         .map(|found| node(found).ok_or("a literal as sh:result"))
@@ -210,7 +210,7 @@ fn single<'a>(
 
 /// The path `term` denotes (SHACL §2.3.1): an IRI, a blank node with exactly one of the
 /// path predicates, or a list (a sequence). Anything else is refused, not guessed, a path
-/// within itself too (`within`: the nodes being read; Sol, B-1408 r1 S2).
+/// within itself too (`within`: the nodes being read).
 fn read_path(
     graph: &Graph,
     term: TermRef<'_>,

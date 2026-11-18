@@ -269,8 +269,8 @@ the timed host and the big host); a declared hypothesis a round doesn't test cou
   instances): per case and dimension, the sd of one block's contrast. Each test takes its units'
   spread as at least that (floor / sqrt(k) for a unit of k blocks), so a loss must be clear
   against the noise measured between instances and sessions, not only against the few blocks'
-  own spread. The report names the floor it used, or says the host has none. Open (Sol,
-  20 Oct 2026; none blocks): the floor file records no host identity, source hashes or freeze
+  own spread. The report names the floor it used, or says the host has none. Open (none blocks):
+  the floor file records no host identity, source hashes or freeze
   time, and `read_floor()` checks none; `rounds_of()` doesn't check that rounds are distinct
   campaigns; with layouts timed unevenly often the floor takes their mean replication, exact only
   for equal counts; the copies' file system device isn't recorded; the instance directories are
@@ -288,7 +288,7 @@ the timed host and the big host); a declared hypothesis a round doesn't test cou
   used more than a core in more than a tenth of the samples is disturbed. It is left out of the
   statistics, both sides (the disturbance is the host's, not a side's: leaving it out is
   unbiased), its reports kept aside, and run once more; a repeat disturbed again is kept, and
-  the report lists it (the orchestrator's policy, 20 Oct 2026).
+  the report lists it (since 20 Oct 2026).
 - *The test* is one-sided for a loss (a better head is never a loss), a t-test on the units'
   mean log contrast (Student's t computed in the kit; it matches SciPy). Its calibration on
   identical binaries is checked below; an exact sign-flip p is reported beside it where the

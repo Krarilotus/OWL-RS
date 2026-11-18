@@ -76,12 +76,12 @@ def run_all(root: Path, binaries: Path, state: str, version: str, seen: Path,
 
 class FullGate(unittest.TestCase):
     def test_deny_is_required_and_both_workspaces_are_checked(self):
-        # Spec: D16-109 / the release-route brief: absent or failing cargo-deny
+        # Spec: D16-109: absent or failing cargo-deny
         # cannot produce a full-tier pass; success checks both workspaces.
         with tempfile.TemporaryDirectory(prefix="nrese-full-gate-") as directory:
             root = Path(directory)
             binaries = full_gate_root(root)
-            # Spec: master's r1 F2: a version other than the checked-in pin fails
+            # Spec: a version other than the checked-in pin fails
             # all, with both installed and required versions in its diagnostic.
             for state in ("missing", "workspace", "harness", "older", "newer", "ok"):
                 with self.subTest(state=state):

@@ -38,7 +38,7 @@ A group's verdict is its worst system's, in that order of precedence (PRECEDENCE
 every report reads): `wrong` (naming whose), `unqualified`, `deviates`, `incomplete`,
 `unchecked`, `unsupported`, then `ok`. One deviating system never disqualifies the others.
 
-**The levels** (rule.owl-rs-answer-comparison: the same datatype and value counts as the same
+**The levels** (the same datatype and value counts as the same
 answer for timing; a numeric match across types is diagnostic only; only wrong answers
 disqualify), each binding at the first that holds and the answer at its worst:
 
@@ -100,7 +100,7 @@ TIMED = PRECEDENCE[len(FAULTS):]
 # What capped_post's refusal says; a capture failed with it was answered, not compared.
 OVER_CAP = "past the recorder's cap"
 # A query its run recorded no verdict for, though it recorded some for the query's workload,
-# tier, regime and system: the join failed, and nothing shows its answer (T8 PR #56 R3).
+# tier, regime and system: the join failed, and nothing shows its answer (PR #56).
 MISSING = "missing"
 
 
@@ -108,7 +108,7 @@ def query_id(query: str) -> str:
     """The results' item for a query file answers.json records (`query`): the file's stem, as
     the driver names its items, without a directory. Only a file goes through here; an item is
     its id already, so `q1.rq.rq` is `q1.rq`, and a dotted one keeps its dots (geographica2's
-    `…_1_1.0`; Sol, PR #56 compare r1 and fix check 1)."""
+    `…_1_1.0`; PR #56)."""
     name = query.replace("\\", "/").rsplit("/", 1)[-1]
     return name[:-3] if name.endswith(".rq") else name
 
@@ -127,7 +127,7 @@ def worst_verdict(entries) -> dict:
     captures (Recorder.verdict), a query's over its records (TimingVerdicts). PRECEDENCE first;
     of two incomplete ones, a fault before one no reference checked; a name PRECEDENCE doesn't
     know (answers.json before 12 Oct: match, mismatch) right after the faults: untimed, so an ok
-    beside it doesn't hide it, and no fault it knows hides behind it (PR #56 fix round 2)."""
+    beside it doesn't hide it, and no fault it knows hides behind it (PR #56)."""
     def rank(entry: dict) -> tuple[int, int, bool]:
         verdict = entry["verdict"]
         place = (PRECEDENCE.index(verdict), 0) if verdict in PRECEDENCE else (len(FAULTS), -1)
@@ -138,7 +138,7 @@ def worst_verdict(entries) -> dict:
 def timed(verdict: str | None) -> bool:
     """Whether a query's time may count with this answer verdict (TimingVerdicts.of): only one
     of TIMED. A fault, unchecked (an answer nobody checked), missing and a name this module
-    doesn't know earn none: it fails closed (T8 PR #56 R3). The reports that time (compare,
+    doesn't know earn none: it fails closed (PR #56). The reports that time (compare,
     versus, compete) decide it here. No verdict at all (answers not captured) leaves it to the
     answer counts, as before."""
     return verdict is None or verdict in TIMED
@@ -147,7 +147,7 @@ def timed(verdict: str | None) -> bool:
 class TimingVerdicts:
     """Answer verdicts (answers.json's records, of one run or several) as the reports that time
     read them: per query, by workload, tier, regime, result id and system, the worst of every
-    record of it, so no order of records or runs decides (T8 PR #56 R3)."""
+    record of it, so no order of records or runs decides (PR #56)."""
 
     def __init__(self, records=()):
         found: dict[tuple, list[dict]] = {}
@@ -195,7 +195,7 @@ FLOATING = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?")
 def number(term: dict) -> Fraction | float | None:
     """A numeric literal's exact value (a double's binary64 one, a float's binary32 one), or a
     float's or double's infinity of either sign: INF, +INF, -INF, or a numeral beyond the type's
-    range, which XSD 1.1 maps to the infinity of its sign (T8 PR #56 R2). None for anything else,
+    range, which XSD 1.1 maps to the infinity of its sign (PR #56). None for anything else,
     NaN or an ill-typed literal."""
     if term.get("type") not in ("literal", "typed-literal") or "xml:lang" in term:
         return None

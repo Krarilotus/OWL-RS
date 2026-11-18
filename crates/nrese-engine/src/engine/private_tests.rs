@@ -1,6 +1,6 @@
-//! Package 2b's guards for private transactions (`notes/2026-11-08-p2b-snapshot-switch-design.md`
-//! §3: B7, B8, B9, B14, B15, B18 and the boundary inputs). Each states its input and what the
-//! design's invariant (§2) says it must give.
+//! Package 2b's guards for private transactions:
+//! B7, B8, B9, B14, B15, B18 and the boundary inputs.
+//! Each states its input and what a private transaction must give.
 
 use std::sync::Arc;
 
@@ -49,7 +49,7 @@ fn budget() -> Arc<Budget> {
     Arc::new(Budget::unlimited())
 }
 
-/// B7 and B9 (§3); the boundary inputs "interns nothing" and "an empty pending snapshot".
+/// B7 and B9; the boundary inputs "interns nothing" and "an empty pending snapshot".
 ///
 /// - Input: a private transaction over a committed snapshot. First its pending snapshot with no
 ///   change, then after it interns a term and a triple term of its own and asserts a statement
@@ -156,7 +156,7 @@ fn a_private_pending_snapshot_and_its_views_read_the_transactions_terms() {
     assert_eq!(tx.lookup(term.as_ref()), Some(own));
 }
 
-/// B8 (§3): two private transactions over one snapshot, each interning a different term.
+/// B8: two private transactions over one snapshot, each interning a different term.
 ///
 /// - Expected: both terms get the same number. Their snapshots don't share a dictionary either
 ///   way, and each decodes its own term at that number.
@@ -181,7 +181,7 @@ fn two_private_transactions_give_their_own_terms_the_same_number() {
     assert_eq!(b.decode(other), Some(literal("second's")));
 }
 
-/// B9 at the edge (§3): a term the dictionary gets after the base was taken.
+/// B9 at the edge: a term the dictionary gets after the base was taken.
 ///
 /// - Input: a snapshot; then a writer commits `ex:b ex:p "published later"` (two new terms);
 ///   then a private transaction over the earlier snapshot interns `"published later"`.
@@ -216,7 +216,7 @@ fn a_term_published_after_the_base_is_the_private_transactions_own() {
     );
 }
 
-/// B14 (§3): what reads a snapshot's published state, given a private one.
+/// B14: what reads a snapshot's published state, given a private one.
 ///
 /// - Input: a durable engine and a private transaction's pending snapshot.
 /// - Expected: it has no shared dictionary; a checkpoint of it is refused and writes no file;
@@ -265,8 +265,8 @@ fn files(dir: &std::path::Path) -> Vec<String> {
     names
 }
 
-/// B15 (§3; the search owner's one test), re-specified by V3 (decision of 10:23 item 1, ADR
-/// V3; DICT2 9 Nov 04:02): searches on a private snapshot answer over what it can see, and
+/// B15, re-specified by V3:
+/// searches on a private snapshot answer over what it can see, and
 /// leave the shared indexes as they were.
 ///
 /// - Input: an engine with a label and a vector literal, searched once published (its text,
@@ -401,8 +401,8 @@ fn a_private_snapshot_searches_what_it_sees_and_leaves_the_shared_indexes() {
     );
 }
 
-/// B18 (§3): corpus lineage, re-specified by dictionary 3.2 against the contract's S3 and §5
-/// row 24 (lineage only at publication; DUR's condition 2).
+/// B18: corpus lineage, re-specified by dictionary 3.2 against published-only admission
+/// (lineage only at publication).
 ///
 /// - Input: an engine whose reader-scoped search keeps a corpus. A write transaction's
 ///   commit (the control), then a speculative writer's pending snapshot (private, over the
@@ -462,7 +462,7 @@ fn a_private_transaction_records_no_corpus_lineage() {
     );
 }
 
-/// Boundary inputs (§3): a snapshot at dictionary length 0, and a term only the overlay has
+/// Boundary inputs: a snapshot at dictionary length 0, and a term only the overlay has
 /// removed.
 ///
 /// - Expected: over an empty engine's snapshot the first own id is 0. Removing a quad of a
@@ -485,7 +485,7 @@ fn private_transactions_at_the_edges() {
     assert_eq!(tx.len(), 0);
 }
 
-/// `speculative_over`'s refusals (the master, 17:50: the accepted change to its signature).
+/// `speculative_over`'s refusals (the accepted change to its signature).
 /// A private transaction over a private snapshot would read that snapshot's own ids, past its
 /// start, as dictionary ids; one over another engine's snapshot would read another dictionary.
 ///
@@ -522,7 +522,7 @@ fn speculative_over_refuses_a_private_snapshot_and_another_engines() {
     );
 }
 
-/// The private transaction's charges (§2 point 5): what its vocabulary holds is charged to
+/// The private transaction's charges: what its vocabulary holds is charged to
 /// its budget for as long as a pending snapshot holds a view of it, and released after.
 ///
 /// - Input: a private transaction interning 100 terms, two pending snapshots, a term decoded
@@ -571,7 +571,7 @@ fn engine_with_a_class() -> (Engine, TermId, TermId) {
     (engine, same_as, b)
 }
 
-/// Sol-loop r1 S1 (8 Nov): a private snapshot's equality classes are its own (§2 point 3: no
+/// A private snapshot's equality classes are its own (no
 /// private id reaches shared state), whichever is read first.
 ///
 /// - Input: an engine with equality off and a published class {`ex:b`, `ex:c`}; a private
@@ -781,7 +781,7 @@ fn a_pending_view_hiding_an_equality_edge_keeps_its_classes_apart() {
     }
 }
 
-/// The kept pending snapshot after a refused write (V1-engine review r1, F1). A matching
+/// The kept pending snapshot after a refused write. A matching
 /// removal refused part way keeps the removals before the refusal (`remove_matching`'s
 /// contract), so they are pending changes, and a pending snapshot must hold them.
 ///
@@ -812,9 +812,9 @@ fn a_pending_snapshot_after_a_removal_refused_part_way_holds_its_removals() {
     assert_eq!(tx.pending_snapshot_within(&reader).unwrap().len(), tx.len());
 }
 
-/// The kept pending snapshot after a write refused before its first change (V1-engine review
-/// r1, R3; the master's decision of 18:12). A matching removal refused before it removed
-/// anything changed nothing, so the kept snapshot still holds.
+/// The kept pending snapshot after a write refused before its first change.
+/// A matching removal refused before it removed anything changed nothing,
+/// so the kept snapshot still holds.
 ///
 /// - Input: ten committed statements; a private transaction over them, its pending snapshot
 ///   taken (so kept); its budget then filled, the removal of all of them refused before the

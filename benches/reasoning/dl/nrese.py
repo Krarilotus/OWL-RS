@@ -103,9 +103,9 @@ def nothing_ran(kind, cases):
 
 def unseen(cases, tasks):
     """What of CASES the conversion's container cannot read for `tasks`: it mounts CASES alone, so a
-    folder or file reached through a link names a path it does not have (D16-642: ore80-nrese r2 on
-    14 Nov and fc-dlnrese-4e0ff30f-1115b linked CASES/files to a host folder, and every conversion
-    found no input). Hard links and copies are files of their own."""
+    folder or file reached through a link names a path it does not have (fc-dlnrese-4e0ff30f-1115b linked CASES/files to a host folder, and every conversion
+    found no input).
+    Hard links and copies are files of their own."""
     links = [d for d in (cases / "files", cases / "tax") if d.is_symlink()]
     if not links:
         links = [p for p in (cases / "files" / f"{t.split('-el-')[0]}.owl" for t in tasks) if p.is_symlink()]

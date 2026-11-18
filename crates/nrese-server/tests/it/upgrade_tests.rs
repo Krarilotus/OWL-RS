@@ -687,7 +687,7 @@ async fn an_image_backup_written_by_main_restores() -> Result<(), Box<dyn std::e
 
 /// `nrese-server query` reads inferences, so on a store whose closure an older semantics
 /// version wrote it brings them up to date first, as the server's start does (it answered
-/// from that closure: PR #58, lane M's sol-loop). The store: `C rdfs:subClassOf C` and a
+/// from that closure: PR #58). The store: `C rdfs:subClassOf C` and a
 /// closure without `C owl:equivalentClass C` (materialised first, the axiom bulk-loaded
 /// after, which doesn't maintain the inferred stack), and the marker version 2 wrote,
 /// pinned as written (nrese-store's `reasoning_state` test, tests audit DC-09).

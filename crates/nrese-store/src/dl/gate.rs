@@ -380,8 +380,8 @@ fn axiom_evidence(
 /// The axioms of `ontology` but its declarations, in the order of what they say: each by
 /// its source triples' decoded terms, then (between axioms of the same statements) by its
 /// functional-syntax form. Never the ontology's own
-/// order, which follows term ids, so what was interned first in any graph (package review
-/// r1-D1): the justification [`super::explain::justify_among`] finds in this order depends
+/// order, which follows term ids, so what was interned first in any graph:
+/// the justification [`super::explain::justify_among`] finds in this order depends
 /// on the view's statements alone. The keys are charged to `memory`; `None` past it or the
 /// deadline.
 fn canonical_candidates(

@@ -252,8 +252,8 @@ fn a_repository_switches_the_ql_rewriting() {
 /// [`a_repository_switches_the_ql_rewriting`]'s `on`; with it `off`, no bob (the control:
 /// the answer comes from the rewriting, not from stored inferences). The data is written
 /// through the repository's own write path, so `owl2-dl` stays active up to the change (a
-/// write path of other reasoning, as the test support's, switches it off). Catalogue slice
-/// sol-loop r1–r2, S1.
+/// write path of other reasoning, as the test support's,
+/// switches it off).
 #[test]
 fn a_change_from_owl2_dl_to_owl2_rl_keeps_the_ql_rewriting() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -452,7 +452,7 @@ fn settings_that_would_be_ignored_are_refused() {
 
 /// A removal whose files are held (Windows: its directory open without delete sharing, so
 /// that neither the rename nor the deletion succeeds) stays removed across a restart: the
-/// decision is kept outside the directory it reclaims (Sol, r1 of the store lifecycle).
+/// decision is kept outside the directory it reclaims.
 #[cfg(windows)]
 #[test]
 fn a_removal_whose_files_are_held_stays_removed_after_a_restart() {

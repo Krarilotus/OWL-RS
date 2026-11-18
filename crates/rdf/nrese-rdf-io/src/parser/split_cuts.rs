@@ -1,4 +1,4 @@
-//! Each cut the skimmer offers, alone (design note 2026-11-08-split-recovery §4): a Turtle
+//! Each cut the skimmer offers, alone: a Turtle
 //! or TriG document in two chunks, cut there, parsed recovering, gives what the sequential
 //! recovering parse gives, field by field (`oracle`). The integration tests check every cut
 //! together and two or three parts through the public API (`split_contract_tests`); a cut
@@ -35,9 +35,9 @@ fn each_cut_agrees(format: RdfFormat, document: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Every document of the recovery sweep, and the package review's witnesses (R1-F1: a form
-/// feed, and a name the lexer ends where a byte-wise run goes on; R1-F3: a column after a
-/// character of two bytes).
+/// Every document of the recovery sweep, and the witnesses: a form feed, and a name the
+/// lexer ends where a byte-wise run goes on; a column after a
+/// character of two bytes.
 #[test]
 fn each_cut_alone_is_where_the_sequential_parse_starts_a_statement() {
     let witnesses = [

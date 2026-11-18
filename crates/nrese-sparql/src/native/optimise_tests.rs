@@ -1,5 +1,5 @@
-//! [`optimise`]'s rewrite passes, by the shapes they can change
-//! (Harness note 2026-11-10-small-query-fastpath-design.md, change 1).
+//! [`optimise`]'s rewrite passes,
+//! by the shapes they can change.
 
 use super::*;
 use nrese_engine::{Engine, EngineConfig};
@@ -43,7 +43,7 @@ fn optimised(
     (fired, PASSES_RUN.get())
 }
 
-/// Spec (design note, change 1): a query whose algebra has no node a pass can change runs
+/// Spec: a query whose algebra has no node a pass can change runs
 /// none of the passes. These are the entities benchmark's one-pattern COUNTs, its point
 /// lookup and its GROUP BY of one pattern: 1 µs on main, 3–4 µs on engine-v2, most of the
 /// difference these passes (profile smallq-attrib3-d212e607-1110).
@@ -61,12 +61,12 @@ fn a_query_no_rewrite_can_change_runs_no_pass() {
     }
 }
 
-/// Guard (passes before and after change 1): each pass still changes the smallest shape it
-/// applies to, in the order [`optimise`] gives them, including a shape one pass exposes to
-/// the next (a one-input UNION that join-groups unwraps around a join the group then
-/// pre-aggregates: Sol design review, 10 Nov). Expected rewrites worked by hand from each
-/// pass's rule (`plan::rewrite`, `pushdown`); a filter over one pattern, which no pass can
-/// move, fires none.
+/// Guard: each pass still changes the smallest shape it applies to, in the order
+/// [`optimise`] gives them, including a shape one pass exposes to the next (a
+/// one-input UNION that join-groups unwraps around a join the group then
+/// pre-aggregates). Expected rewrites worked by hand from each pass's rule
+/// (`plan::rewrite`, `pushdown`); a filter over one pattern, which no pass can move,
+/// fires none.
 #[test]
 fn each_pass_still_changes_the_shapes_it_applies_to() {
     let engine = engine();

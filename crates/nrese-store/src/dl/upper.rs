@@ -152,7 +152,7 @@ impl Stack {
 
     /// [`Self::estimate`], each fact its search for a match passes over counted with
     /// `visited` (false once the reader's poller has stopped: then 0, an answer that means
-    /// nothing; REAS-2, sol-loop r1 S3).
+    /// nothing).
     pub fn estimate_counted(&self, pattern: [Option<u64>; 3], visited: &dyn Fn() -> bool) -> usize {
         let bound = match pattern[1] {
             Some(p) => self.per_predicate.get(&p).copied().unwrap_or(0),
@@ -208,7 +208,7 @@ impl Stack {
 
     /// Hands each fact of the index range `pattern` binds to `f` as it reads it: `Some` for
     /// a match, `None` for one it passes over; ends once `f` returns false (the reader's
-    /// poller stopped: REAS-2, sol-loop r1 S3).
+    /// poller stopped).
     pub fn visit(&self, pattern: [Option<u64>; 3], f: &mut dyn FnMut(Option<Triple>) -> bool) {
         fn range<'s>(
             set: &'s BTreeSet<[u64; 3]>,
@@ -441,9 +441,9 @@ struct UpperBase<'a> {
 impl UpperBase<'_> {
     /// Whether the view has `s p o`, `o` standing for every literal of its value: the call
     /// counted before its value's members are looked up (one probe), each member's lookup
-    /// counted before it is made (review r1 F3: a value can be written in many ways).
+    /// counted before it is made (a value can be written in many ways).
     /// [`Stopped`] once `poll` has stopped before a member was found, never a "not in the
-    /// view" that would keep the fact (fix check r1, rule 2).
+    /// view" that would keep the fact.
     fn in_view(&self, [s, p, o]: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
         #[cfg(test)]
         crate::witness::add(crate::witness::Site::InView, 1);
@@ -476,8 +476,8 @@ impl UpperBase<'_> {
 impl VisitsBase for UpperBase<'_> {
     fn visit(&self, bound: [Option<u64>; 3], visit: &mut Visit<'_, '_>) {
         let [s, p, o] = bound;
-        // A bound object's members read as they are visited, never copied first (review r1
-        // F3: a value can be written in many ways).
+        // A bound object's members read as they are visited, never copied first (a value can be written in many
+        // ways).
         let objects = o
             .map(|o| self.values.members(o))
             .into_iter()
@@ -523,7 +523,7 @@ impl VisitsBase for UpperBase<'_> {
         });
     }
 
-    /// The view's count's work counted on `probe` as it goes (review r1 F2); [`Stopped`]
+    /// The view's count's work counted on `probe` as it goes; [`Stopped`]
     /// where that, or the stack's estimate, stopped.
     fn size(&self, bound: [Option<u64>; 3], probe: Probe<'_, '_>) -> Result<usize, Stopped> {
         let view = self
@@ -653,7 +653,7 @@ impl GaveUp {
 
 /// U1's give-up for an evaluation the reasoner interrupted: refused where the process's
 /// memory stopped it (`Interrupted::memory`, the reasoner's own memory fallback), never kept;
-/// otherwise as `why` says (REAS-3a sol-loop r1 S3).
+/// otherwise as `why` says.
 fn gave_up(interrupted: &delta::Interrupted, why: &str) -> GaveUp {
     match interrupted.memory {
         Some(_) => GaveUp::refused(format!("{why}: the process's memory is past its limit")),
@@ -985,8 +985,8 @@ impl Upper {
             stack: &self.stack,
             values: &values,
         };
-        // Each deleted fact's lookups in the view, counted on the commit's stop (review r1 F3);
-        // the first that finds it stopped ends the change (fix check r1, R2-F3: read as "not
+        // Each deleted fact's lookups in the view, counted on the commit's stop;
+        // the first that finds it stopped ends the change (read as "not
         // in the view", a stopped lookup kept every fact after it, each looked up).
         let stopped = || GaveUp::new("the upper bound's maintenance was stopped");
         let prep = Poller::new(stop).ok_or_else(stopped)?;
@@ -1030,7 +1030,7 @@ impl Upper {
         change.merges = inserted.iter().any(equates) || update.insert.iter().any(equates);
         change.remove = update.remove;
         // A probe per inserted fact, on the commit's stop as the update's reads are; the first
-        // that finds it stopped ends the change (fix check r1, rule 2).
+        // that finds it stopped ends the change.
         let poll = Poller::new(stop).ok_or_else(stopped)?;
         for t in update.insert {
             if !base.is_asserted(t, &poll).map_err(|Stopped| stopped())? {
@@ -1127,7 +1127,7 @@ impl Upper {
 mod tests {
     use super::Stack;
 
-    /// REAS-2 (master, 8 Nov 05:29: a counted test per leaf that filters): U1's base counts
+    /// REAS-2 (a counted test per leaf that filters): U1's base counts
     /// the program facts its scan passes over, not only those it delivers. Over three poll
     /// intervals of facts, none matching, a poller whose stop has fired polls within the scan
     /// and is stopped by it; uncounted, it would never poll.
@@ -1168,7 +1168,7 @@ mod tests {
         );
     }
 
-    /// The same for U1's stack (sol-loop r1 S3): a scan of `x type B` reads the index range
+    /// The same for U1's stack: a scan of `x type B` reads the index range
     /// of `x type`, three poll intervals of other types, and passes over each; uncounted,
     /// the poller would never poll.
     #[test]
@@ -1226,7 +1226,7 @@ mod tests {
         (engine, values, rep)
     }
 
-    /// REAS-2 review r1 F3: U1's base reads a value's lexical members as it visits them, each
+    /// U1's base reads a value's lexical members as it visits them, each
     /// counted: a scan bound to a value written 64 × `POLL_UNITS` ways, its stop fired since
     /// its poller was made, stops within a poll interval of members and holds no copy of the
     /// member list (at most a quarter of its bytes at any time). Copied first, the whole list
@@ -1274,7 +1274,7 @@ mod tests {
         );
     }
 
-    /// REAS-2 review r1 F3: a negative lookup of a fact whose object is a value written
+    /// A negative lookup of a fact whose object is a value written
     /// 8 × `POLL_UNITS` ways asks the view about each member, each counted as it is asked:
     /// the stop at least once every `POLL_UNITS` plus one run (the longest run counted at
     /// once, `POLL_UNITS`) of members. Counted all at once, the whole list was one ask.

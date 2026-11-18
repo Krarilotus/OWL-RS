@@ -970,7 +970,7 @@ fn an_inverse_pair_with_a_transitive_role_is_regular() {
 /// datatype the data one has no model; wrapped to `≥ 0` it would hold everywhere. The
 /// normalisation leaves those axioms out; one below, their negation `≥ 4294967295` stays.
 /// Unnegated, `≤ 4294967295` and `= 4294967295` need no `+ 1`: they stay, their at-most
-/// atoms counting 4294967295 exactly (PR #40 review, R1).
+/// atoms counting 4294967295 exactly (PR #40).
 #[test]
 fn only_a_negation_past_u32_is_left_out() {
     let mut wrong = Vec::new();
@@ -1012,11 +1012,11 @@ fn only_a_negation_past_u32_is_left_out() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// The count is refused exactly where the negation normal form needs it (PR #40's sol-loop,
-/// S1 and S2): `a : ≤ 1 r.¬(≤ 4294967295 s)` puts the filler in negation normal form, which
+/// The count is refused exactly where the negation normal form needs it (PR #40):
+/// `a : ≤ 1 r.¬(≤ 4294967295 s)` puts the filler in negation normal form, which
 /// is `≥ 4294967296 s`: left out; `b : ¬(≥ 0 r.(≤ 4294967295 s))` is `b : ⊥` whatever the
 /// filler, which is never negated: kept; `¬(≤ 4294967295 s) ⊑ A` goes in as
-/// `⊤ ⊑ (≤ 4294967295 s) ⊔ A`, its subclass negated (the second round, S1): kept.
+/// `⊤ ⊑ (≤ 4294967295 s) ⊔ A`, its subclass negated: kept.
 #[test]
 fn a_nested_negation_past_u32_is_left_out() {
     let mut o = Ontology::default();
@@ -1039,8 +1039,8 @@ fn a_nested_negation_past_u32_is_left_out() {
     assert_eq!(left_out, [0], "{unsupported:?}");
 }
 
-/// A fresh name's definition that needs a count past `u32` (PR #40's sol-loop, second
-/// round, S2): `a : ≤ 1 r.(≤ 4294967295 s)` and `b : ≤ 1 r.(≤ 4294967295 s)` share the name
+/// A fresh name's definition that needs a count past `u32` (PR #40):
+/// `a : ≤ 1 r.(≤ 4294967295 s)` and `b : ≤ 1 r.(≤ 4294967295 s)` share the name
 /// of the restriction, whose definition negates the filler only when it is clausified, after
 /// both took the name. Neither assertion is complete without it: both are left out.
 #[test]
@@ -1123,7 +1123,7 @@ fn a_shared_definition_that_fails_leaves_out_every_user() {
         wrong.push(format!("irregular: {unsupported:?}"));
     }
     // `A ⊑ ∀R.C ⊔ ∀T.⊤` is a tautology: it takes nothing and stays, whatever is read first
-    // (Sol r1 S1 of the fix: the automaton `B` failed was taken before `∀T.⊤` was seen).
+    // (the automaton `B` failed was taken before `∀T.⊤` was seen).
     let mut o = Ontology::default();
     let mut e = |x| ExprId(o.classes.intern(x));
     let (r, s) = (ObjProp::Named(10), ObjProp::Named(11));
@@ -1149,8 +1149,8 @@ fn a_shared_definition_that_fails_leaves_out_every_user() {
         wrong.push(format!("tautology: {unsupported:?}"));
     }
     // `A ⊑ ≤ 0 T.(∃R.⊥)` and `B ⊑ ≤ 0 U.(∃R.⊥)` are tautologies too: the name of `∃R.⊥`
-    // needs no definition, so takes no automaton (Sol r2 S2). And a key over `R` with no
-    // named individual has no rule and takes nothing: only the keys' own mark (S3).
+    // needs no definition, so takes no automaton. And a key over `R` with no
+    // named individual has no rule and takes nothing: only the keys' own mark.
     let mut o = Ontology::default();
     let mut e = |x| ExprId(o.classes.intern(x));
     let (a, b, c) = (

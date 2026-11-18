@@ -246,8 +246,8 @@ fn triple(tx: &nrese_engine::Transaction<'_>, i: usize) -> nrese_engine::Encoded
     }
 }
 
-/// A transaction whose statements were retracted, inferred, then asserted again (sol-loop r1 on
-/// DUR-6, S1) shadows inferred inserts that aren't asserted inserts: a pending snapshot charges
+/// A transaction whose statements were retracted, inferred, then asserted again
+/// shadows inferred inserts that aren't asserted inserts: a pending snapshot charges
 /// its scratch for them too, holding nothing beyond its charge. Before the fix the bound counted
 /// only the asserted inserts.
 #[test]
@@ -278,7 +278,7 @@ fn a_pending_version_is_charged_for_inferred_statements_asserted_again() {
     drop((snapshot, tx, other));
 }
 
-/// A term the transaction interns after a pending snapshot is kept (sol-loop r1 on DUR-6, S2):
+/// A term the transaction interns after a pending snapshot is kept:
 /// the next pending snapshot under the same budget knows it. Before the fix the kept snapshot
 /// came back with the old dictionary length, and its lookup of the new term answered nothing.
 #[test]
@@ -299,7 +299,7 @@ fn a_kept_pending_snapshot_is_not_returned_after_an_intern() {
 }
 
 /// A kept pending snapshot no longer current (a term interned since) is let go before its
-/// replacement is charged (sol-loop r2 on DUR-6, S4): a budget just enough for one pending
+/// replacement is charged: a budget just enough for one pending
 /// snapshot (the highest a first one used) makes the replacement too, once the caller has dropped
 /// its own. Before the fix the stale snapshot kept its charge through the replacement's build,
 /// which the budget then refused.
@@ -320,7 +320,7 @@ fn a_stale_kept_pending_snapshot_is_let_go_before_its_replacement_is_charged() {
     assert_eq!(snapshot.lookup(fresh.as_ref().into()), Some(id));
 }
 
-/// A pending snapshot refused at any point of what it makes (sol-loop r1 on DUR-6, S3: the
+/// A pending snapshot refused at any point of what it makes (the
 /// inferred stack's run refused after the asserted one was made) holds nothing beyond its charge
 /// at any moment, and keeps nothing: budgets from nothing up, each a fiftieth of what the made
 /// snapshot keeps larger than the last, until one is enough (the scratch, charged first, needs
@@ -385,8 +385,8 @@ fn a_refused_pending_snapshot_releases_nothing_before_it_frees_it() {
     drop(other);
 }
 
-/// A pending version as a reader of a restricted view reads it (`pending_over_within`, review r1
-/// on DUR-6a, N2): what it makes is charged to its reader's budget before it is made and held by
+/// A pending version as a reader of a restricted view reads it (`pending_over_within`):
+/// what it makes is charged to its reader's budget before it is made and held by
 /// the snapshot, with its own scratch (the inferred statements gone: the pending deletes, the
 /// pending asserts and `hidden`), over a view of a base with inferred statements, a named-graph
 /// insert pending; the charge goes with the snapshot (nothing is kept: it is a new one each call).

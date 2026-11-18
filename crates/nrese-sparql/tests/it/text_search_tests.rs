@@ -484,13 +484,13 @@ fn a_graph_search_matches_only_the_datasets_named_graphs() {
 }
 
 /// Another store's name for the default graph (`urn:x-arq:DefaultGraph`, rdflib's
-/// `urn:x-rdflib:default`; `compat`) reads the store's default graph only for a reader who
-/// may read it: for one who may not, the graph is absent from its dataset (SPARQL 1.1
-/// §13.3), as an unreadable named graph is, whatever reads it (a search, `text:query`, a
-/// sub-select, nested under `GRAPH ?g`, a vector search). The fixture's default graph
-/// alone holds `British Museum`; the review's witness (graph-search-scope r1, R1-D1).
-/// Rows: two guards (every graph; a reader of the default graph), then a reader of `g`
-/// alone through each path. Every row reported.
+/// `urn:x-rdflib:default`; `compat`) reads the store's default graph only for a reader
+/// who may read it: for one who may not, the graph is absent from its dataset
+/// (SPARQL 1.1 §13.3), as an unreadable named graph is, whatever reads it (a search,
+/// `text:query`, a sub-select, nested under `GRAPH ?g`, a vector search). The fixture's
+/// default graph alone holds `British Museum`. Rows: two guards (every graph; a reader
+/// of the default graph), then a reader of `g` alone through each path. Every row
+/// reported.
 #[test]
 fn default_graph_aliases_respect_reader_scope() {
     let engine = engine();

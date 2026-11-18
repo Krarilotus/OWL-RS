@@ -361,7 +361,7 @@ fn the_global_pool_has_started_before_a_measurement_on_another() {
 }
 
 /// A first measurement made on a thread of the global pool returns: preparing it waits for
-/// a broadcast to every thread of that pool, its own included (Sol, measure-pool r1: with
+/// a broadcast to every thread of that pool, its own included (with
 /// one thread, it waited for ever).
 #[test]
 fn a_first_measurement_on_a_global_thread_returns() {
@@ -379,7 +379,7 @@ fn a_first_measurement_on_a_global_thread_returns() {
 }
 
 /// Preparing a first measurement on a thread of the global pool runs none of the jobs that
-/// wait there (Sol, measure-pool r2): not one that measures too, which would enter the
+/// wait there: not one that measures too, which would enter the
 /// preparation still under way, nor one that takes a lock the measuring thread holds. Both
 /// measurements return, and the lock is taken after it is let go.
 #[test]

@@ -181,7 +181,7 @@ class FastComparison(unittest.TestCase):
                          {"shacl.values": 3, "shacl.paths": 2})  # a triple term's sh:value isn't one
 
     def test_only_a_record_s_own_subject_and_predicate_are_counted(self):
-        """Fix check r1 W (review-shacl-report-counts-r1): the writer escapes a literal's control
+        """The writer escapes a literal's control
         characters but not U+2028, U+2029 or U+0085, where str.splitlines() also splits, so text
         inside a literal counted as a record of its own. Records end at a physical newline only;
         only their subject and predicate terms are read; a record that isn't N-Triples counts nothing."""
@@ -200,7 +200,7 @@ class FastComparison(unittest.TestCase):
                 self.assertIsNone(fast.shacl_report_counts(report + broken + "\n"))
 
     def test_counts_its_report_couldn_t_give_fail_their_checks_with_or_without_routes(self):
-        """Fix check r2 (review-shacl-report-counts-r2): without --routes check() leaves an absent
+        """Without --routes check() leaves an absent
         value unchecked (ok None), and measure() fails a case only on ok False, so a report that
         couldn't be parsed, with its values and paths pinned, ended ok. Couldn't be read isn't
         "not reported": the verdict is wrong, whatever --routes, and the note says why. A report
@@ -228,7 +228,7 @@ class FastComparison(unittest.TestCase):
                     self.assertTrue(all(c["ok"] is False and "not counted" in c["note"] for c in failed.values()))
 
     def test_a_report_that_can_t_be_read_or_decoded_fails_its_counts_and_aborts_nothing(self):
-        """Fix check r3 (review-shacl-report-counts-r3): a report that isn't UTF-8, or whose read
+        """A report that isn't UTF-8, or whose read
         fails, raised out of measure() before its counts were marked unreadable. Every way of not
         getting the report is one state: with values and paths pinned the verdict is wrong whatever
         --routes, each count's check fails with the reason; a case that pins neither is unaffected,
@@ -272,7 +272,7 @@ class FastComparison(unittest.TestCase):
                         self.assertTrue(any(reason in note for note in record["notes"]))
 
     def test_a_report_is_removed_however_its_invocation_ends_and_a_stale_one_refused(self):
-        """Fix check r1 (lifecycle): the report's path was one per checkout and stayed behind when an
+        """Lifecycle: the report's path was one per checkout and stayed behind when an
         invocation wrote no JSON or a broken one; it is the invocation's own, removed in every case,
         and one already there is refused, never counted or removed."""
         for ending in ("no json", "broken json"):

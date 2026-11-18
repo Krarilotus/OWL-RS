@@ -342,7 +342,7 @@ impl VisitsBase for SnapshotBase<'_> {
         }
     }
 
-    // Explanations read to their end (`Poller::never()`, fix check r1 triage: NEVER).
+    // Explanations read to their end (`Poller::never()`).
     fn size(&self, bound: [Option<u64>; 3], _: Probe<'_, '_>) -> Result<usize, Stopped> {
         let count = self
             .snapshot

@@ -199,7 +199,7 @@ fn unsupported<T>(what: impl Into<String>) -> NativeResult<T> {
 }
 
 /// `count` where it is exact, as an answer needs it; else the engine's range limit as the
-/// query's error, never a capped number (PR #70 fix check 2 F3).
+/// query's error, never a capped number (PR #70).
 fn exact_count(count: nrese_engine::Count) -> NativeResult<u64> {
     count.exact().ok_or_else(|| {
         QueryEvaluationError::CountBeyondRange {
@@ -601,8 +601,8 @@ pub(crate) fn delete_insert(
         let graph = |g: &GraphNamePattern| match g {
             GraphNamePattern::NamedNode(n) => Some(crate::compat::graph_named(n).into_owned()),
             GraphNamePattern::DefaultGraph => Some(nrese_rdf::GraphName::DefaultGraph),
-            // A value bound to the graph slot names a store graph as a constant does
-            // (review r1, S2-F2), whatever bound it: VALUES, BIND, SERVICE or GRAPH ?g.
+            // A value bound to the graph slot names a store graph as a constant does,
+            // whatever bound it: VALUES, BIND, SERVICE or GRAPH ?g.
             GraphNamePattern::Variable(v) => match value(v)? {
                 Term::NamedNode(n) => Some(crate::compat::graph_named(&n).into_owned()),
                 Term::BlankNode(b) => Some(b.into()),
@@ -2832,9 +2832,9 @@ impl<'a> Context<'a> {
 
     /// A path's table of `columns`, each charged to the path's pool since before it was
     /// made: their charge is handed to the table whole ([`nrese_exec::Share::transfer`]),
-    /// never released and charged again, exactly the table's bytes (the executor memory
-    /// stack's package fix check r3, EMS-R3-C1: a column's capacity released down to its
-    /// length while it lived). Cancelled or refused before, the columns are dropped: freed,
+    /// never released and charged again, exactly the table's bytes (not, as before, a
+    /// column's capacity released down to its length while it lived). Cancelled or
+    /// refused before, the columns are dropped: freed,
     /// then released.
     fn path_table(
         &self,
@@ -2932,8 +2932,8 @@ impl<'a> Context<'a> {
             // without columns, which holds no buffer, charged its rows ([`Self::produced`]).
             // As many solutions without bindings as the path connects the two ways: a table
             // without columns, which holds no buffer but counts its rows, charged before they
-            // are made (sol-loop r1 S1 of the executor memory stack's second lead: 64 `(p|p)`
-            // steps over `a p a` count `usize::MAX` ways, made one by one before the charge).
+            // are made (64 `(p|p)` steps over `a p a` count `usize::MAX` ways, once made one by
+            // one before the charge).
             (Err(start), Err(finish)) => {
                 let rows = evaluator
                     .solutions(&resolved, start, finish)
@@ -4059,7 +4059,7 @@ impl<'a> Context<'a> {
         // The pairs are kept in a vector charged to the optional part, each growth charged
         // beside the storage it replaces (a reallocation holds both), and freed before its
         // charge is released: n patterns on one variable make n²/2 pairs, more than any
-        // request's room (review r1, F1, and its fix check). Refused, the BGP plans with its
+        // request's room. Refused, the BGP plans with its
         // counts alone, as for a pair the allowance leaves out. Made at the first pair: most
         // BGPs have none.
         let mut optional: Option<Arc<Budget>> = None;
@@ -4147,8 +4147,8 @@ impl<'a> Context<'a> {
             }
         }
         // A read the optional part refused: no list of this building counts, so no overlap
-        // comes of a callee that went on past a refusal (the rule of use is a document; its
-        // owner's review, R2). The buffer's refusal comes later and leaves the counts.
+        // comes of a callee that went on past a refusal (a documented rule of use).
+        // The buffer's refusal comes later and leaves the counts.
         if optional.refused() {
             return (out, Reads::default());
         }
@@ -4176,7 +4176,7 @@ impl<'a> Context<'a> {
     /// Pattern `pattern`'s list (`scan`'s column of its one variable `v`, at `position`):
     /// the read the execution's [`Self::scan`] makes on the column path, sorted on `v`. The
     /// one place planning reads a list. It reads on `optional`, the optional part
-    /// ([`nrese_exec::Envelope::optional_part`]; the budget types' owner, 14 November): a
+    /// ([`nrese_exec::Envelope::optional_part`]): a
     /// refusal ends the read with its error and marks only that part, never the request
     /// ([`Budget::refused`]). The read qualifies: it ends complete or with the error.
     fn read_list(

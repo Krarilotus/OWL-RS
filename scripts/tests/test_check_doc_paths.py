@@ -3,9 +3,9 @@
     python3 -B scripts/tests/test_check_doc_paths.py
 
 Spec: the checker's docstring; what is a link is what CommonMark makes one (markdown-it-py in
-CommonMark mode, the oracle of PR #92's fix check). The documents below are review PR #92 r1's and
-its fix check's fixtures and witnesses (Harness notes review-pr92-r1: fixtures/*.md, P09, P18;
-fixcheck-r1-evidence P05, P06), each beside a control whose target exists. Needs markdown-it-py
+CommonMark mode, the oracle of PR #92). The documents below are PR #92's fixtures and
+witnesses, each beside a control whose target exists.
+Needs markdown-it-py
 (benches/suite/requirements.txt); every document is written to a temporary directory, nothing in
 the checkout changes.
 """
@@ -69,7 +69,7 @@ class CheckDocPaths(unittest.TestCase):
         self.assertEqual(self.check("[exists][guide]\n\n[guide]: guide.md\n"), 0)
         self.assertEqual(self.check("[exists][g]\n\n  [g]: <sub dir/guide.md> \"Title\"\n"), 0)
 
-    # Fix-round sol-loop F1: a fence's end can't hide the links after it (CommonMark 4.5). Text in
+    # A fence's end can't hide the links after it (CommonMark 4.5). Text in
     # a fence is code, not a link (CommonMark renders `<pre><code>`), so it isn't checked.
     def test_a_link_after_a_closed_fence_is_checked(self):
         fenced = "````\n```\n````\n"
@@ -87,7 +87,7 @@ class CheckDocPaths(unittest.TestCase):
         self.assertEqual(self.check("[x](`missing.md`)\n"), 1)
         self.assertEqual(self.check("`[x](missing.md)` is code\n"), 0)
 
-    # Fix-round sol-loop r2 F5: a fence inside a blockquote ends with the quote (GFM example 98).
+    # A fence inside a blockquote ends with the quote (GFM example 98).
     def test_a_link_after_a_quoted_fence_is_checked(self):
         self.assertEqual(self.check("> ```\n> sample\n\n[x](missing.md)\n"), 1)
         self.assertEqual(self.check("> ```\n> sample\n\n[x](guide.md)\n"), 0)
@@ -97,7 +97,7 @@ class CheckDocPaths(unittest.TestCase):
         self.assertEqual(self.check('[a](guide.md "a ` title") [b](missing.md) tail `\n'), 1)
         self.assertEqual(self.check('[a](guide.md "a ` title") [b](guide.md) tail `\n'), 0)
 
-    # Fix check r1 B1 (P05, P06): a reference definition wherever CommonMark finds one, in a list
+    # A reference definition wherever CommonMark finds one, in a list
     # item, an ordered one, a list item's blockquote, and with an escaped `]` in its label.
     def test_a_reference_definition_in_a_container_or_with_an_escape_is_checked(self):
         for label, missing, existing in [
@@ -110,12 +110,12 @@ class CheckDocPaths(unittest.TestCase):
                 self.assertEqual(self.check(missing), 1)
                 self.assertEqual(self.check(existing), 0)
 
-    # Fix check r1 (P05, a limitation it named): a raw HTML link is a link too.
+    # A raw HTML link is a link too.
     def test_a_raw_html_link_is_checked(self):
         self.assertEqual(self.check('<a href="definitely-missing-pr92.md">x</a>\n'), 1)
         self.assertEqual(self.check('<a href="guide.md">x</a>\n'), 0)
 
-    # Parser round sol-loop G2: an HTML attribute as HTML reads it: unquoted too, entities decoded;
+    # An HTML attribute as HTML reads it: unquoted too, entities decoded;
     # an attribute that only ends in "href" or a comment isn't a link.
     def test_an_html_attribute_is_read_as_html_reads_it(self):
         self.assertEqual(self.check("<a href=definitely-missing-pr92.md>x</a>\n"), 1)
@@ -124,7 +124,7 @@ class CheckDocPaths(unittest.TestCase):
         self.assertEqual(self.check('<span data-href="definitely-missing-pr92.md">x</span>\n'), 0)
         self.assertEqual(self.check('<!-- <a href="definitely-missing-pr92.md">x</a> -->\n'), 0)
 
-    # Parser round sol-loop G1: a repeated definition is a definition in the doc too.
+    # A repeated definition is a definition in the doc too.
     def test_a_duplicate_reference_definition_is_checked(self):
         self.assertEqual(self.check("[x][g]\n\n[g]: guide.md\n[g]: definitely-missing-pr92.md\n"), 1)
         self.assertEqual(self.check("[x][g]\n\n[g]: guide.md\n[g]: guide.md\n"), 0)

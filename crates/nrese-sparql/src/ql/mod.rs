@@ -71,7 +71,7 @@ const NOT_READ: &[&str] = &[
 
 // What the reader reads, chosen at compile time from the mapping's vocabulary
 // (`nrese_owl::Vocabulary::IRIS`, `vocab::DATA_IRIS`): fixed IRIs cost nothing at run time
-// (orchestrator, 8 Nov 17:28; #155's count found a `LazyLock` table's 4.6 KB of peak live
+// (#155's count found a `LazyLock` table's 4.6 KB of peak live
 // bytes in every process).
 
 /// Whether `a` and `b` are the same text (in a `const`).
@@ -381,7 +381,7 @@ impl QlRewriting {
     /// Whether the data `snapshot` reads, as a query in `mode` reads it, has the tree of
     /// probe `key` wherever it folds, memoised per view, mode and probe (`None`: not asked,
     /// the query's questions spent; `false` then, and nothing kept). Only a published
-    /// snapshot's answer is kept by the store (contract S3); any other's by its own version
+    /// snapshot's answer is kept by the store (published-only admission); any other's by its own version
     /// alone (dictionary 3.0c). Concurrent misses may compute independently; the query
     /// itself runs outside the lock.
     pub(crate) fn realised(
@@ -491,8 +491,8 @@ impl QlRewriting {
     /// schema of those graphs only; one who sees every inference (`"visible"`) the whole
     /// schema, as the closure it reads was computed with it.
     ///
-    /// Only a published snapshot changes what the store keeps (contract S3). Any other keeps
-    /// what it reads in its own version (dictionary 3.0c; review r1 F1), so a pending
+    /// Only a published snapshot changes what the store keeps (published-only admission). Any other keeps
+    /// what it reads in its own version (dictionary 3.0c), so a pending
     /// snapshot read again reads its schema once, and the store's entries stay as they were.
     pub(crate) fn tbox(&self, snapshot: &Snapshot, access: Option<&GraphAccess>) -> Arc<Tbox> {
         let access = access.filter(|a| a.inferred_by_support);
@@ -576,7 +576,7 @@ impl QlRewriting {
     /// a TBox its schema matches, the version's or the store's (read only), or compiles. A
     /// private snapshot reads only the store's entries compiled at or below its overlay's
     /// start ([`Snapshot::shared_bound`]): above it, a publication after the overlay opened
-    /// gives its new terms the overlay's own numbers (review dict-v1c r2, R2).
+    /// gives its new terms the overlay's own numbers.
     ///
     /// The version's entries are locked only to look up and to install: the schema is read
     /// and compiled outside the lock (DICT2, 9 Nov), and a read of the same view installed
@@ -714,7 +714,7 @@ impl QlRewriting {
 }
 
 /// What an unpublished version keeps of the QL rewriting for its own readers (dictionary
-/// 3.0c; review r1 F1), dropped with the version: the schema entries of every rewriting
+/// 3.0c), dropped with the version: the schema entries of every rewriting
 /// (by its closure) that read it, at most [`READERS`], and each view's probes.
 #[derive(Debug, Default)]
 struct QlOwn {
@@ -723,7 +723,7 @@ struct QlOwn {
 }
 
 /// What, besides the view and its text, decides a probe's answer: the query options that
-/// change what an ASK means (sol-loop r1 S1, r2 S2). Neither the view's identity nor the
+/// change what an ASK means. Neither the view's identity nor the
 /// probe's text says them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct ProbeMode {
@@ -951,8 +951,8 @@ fn reader_core(
 
 /// Whether the snapshot asserts an equality of individuals (`owl:sameAs`), in any graph:
 /// one probe. The TBox learns only that ([`Tbox::with_equality`]), never which statement:
-/// no name reaches a reader who can't read its graph (I24c-2 review r1, F1), and no sampled
-/// statement the mapping may leave out stands for the rest (F3). Fail-closed for readers
+/// no name reaches a reader who can't read its graph, and no sampled
+/// statement the mapping may leave out stands for the rest. Fail-closed for readers
 /// who see only some graphs.
 fn has_equality(snapshot: &Snapshot) -> bool {
     iri(snapshot, OWL, "sameAs").is_some_and(|same_as| {
@@ -1149,7 +1149,7 @@ fn expressions_of(snapshot: &Snapshot, core: &[nrese_owl::Statement]) -> Vec<u64
     debug_assert!(core.is_sorted());
     // The mapping's own markers, those it can't read included (an n-ary or a malformed
     // restriction), so the memberships of every node it would read as a class expression
-    // reach it, and it reports what it can't read (I24c-2 review r1, F2; r2, F5).
+    // reach it, and it reports what it can't read.
     let id_of = |iri: &str| named(snapshot, iri).map(TermId::raw);
     let markers = nrese_owl::mapping::ClassExpressionMarkers::lookup(&id_of);
     let operators = markers.properties();
@@ -1172,7 +1172,7 @@ fn expressions_of(snapshot: &Snapshot, core: &[nrese_owl::Statement]) -> Vec<u64
 /// The membership the schema reads of class expression `node` (design §7: individuals
 /// asserted to be in it have anonymous individuals of their own): one `rdf:type`
 /// statement, the first in a graph `keep` admits whose individual the OWL reader keeps (it
-/// leaves out a reserved name, `rdf:type a _:e`: Sol r4 S1); `None` without one. What the
+/// leaves out a reserved name, `rdf:type a _:e`); `None` without one. What the
 /// hazards read of it is the expression, not who is in it.
 fn member_of(snapshot: &Snapshot, node: u64, keep: &dyn Fn(u64) -> bool) -> Member {
     #[cfg(test)]

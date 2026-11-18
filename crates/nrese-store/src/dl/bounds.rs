@@ -271,8 +271,8 @@ fn not_compiled() -> GaveUp {
 /// The store's bounds: U1 for the revision it describes, and the read view of the latest
 /// revision a query asked for.
 ///
-/// **No lock here is held across Rayon work, a wait, or a call into the engine** (design
-/// note `2026-11-02-p2-c6b-u1-design.md`, U1-I): under `state` and `view` runs only serial
+/// **No lock here is held across Rayon work, a wait, or a call into the engine**: under
+/// `state` and `view` runs only serial
 /// work over what is in memory. U1's change, its builds, its taxonomy and a view's runs
 /// all run with none held, so whoever waits for one of these locks waits for a holder
 /// that waits for nothing. A build several readers want is built once through a

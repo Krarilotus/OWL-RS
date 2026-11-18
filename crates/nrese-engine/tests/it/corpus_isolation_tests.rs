@@ -1,5 +1,5 @@
 //! A retained corpus stays exact across commits that touch only data the reader can't
-//! see (SYN-24 review r1 F2; design note I2, I3). A reader of the default graph keeps a
+//! see. A reader of the default graph keeps a
 //! text and an IRI corpus; then commits add, remove and repeat words and subjects in a
 //! hidden graph, some of them the same literal the reader sees. The searches after them
 //! derive their corpora from the kept ones. Every score must equal an independent

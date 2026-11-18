@@ -212,7 +212,7 @@ pub struct User {
     /// The PHC string of its local login's password, if it has one.
     pub password_hash: Option<String>,
     /// The change that created this record; `None` for one from before ids, a continuing
-    /// identity. A record isn't evidence of a person by its password (package review R1-D1):
+    /// identity. A record isn't evidence of a person by its password:
     /// this tells a new record from a continuing one.
     pub created: Option<u64>,
     /// The change that created this record, if a new person could be starting then: it was
@@ -519,8 +519,8 @@ impl AccessState {
     /// change creates one record at most) creates: each workspace this state has and `before`
     /// hadn't gets the id `number`; each user it has and `before` hadn't gets `created`, and
     /// the id `number` too if a new person can be starting: it is created with a local login,
-    /// or its name is in `local_past` (it had one before: R1-D1). Nothing else ever sets or
-    /// changes an id, so a password added or removed later moves no one's space (R2-L1).
+    /// or its name is in `local_past` (it had one before). Nothing else ever sets or
+    /// changes an id, so a password added or removed later moves no one's space.
     fn identify_new(&mut self, before: &AccessState, number: u64, local_past: &BTreeSet<String>) {
         // A personal space's record (its sharing) takes its user's id.
         for (name, workspace) in &mut self.workspaces {

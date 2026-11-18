@@ -56,7 +56,7 @@ MAKER_KEYS = ("needs", "form_only", "sparql", "container", "note")
 def save(root: Path, catalog: dict):
     lines = [HEADER, f"budget_gb = {catalog['budget_gb']}", ""]
     # The job-run makers (release_gate.py reads them, a harness's too: harness_tables()), kept as they are,
-    # an empty section too: its presence says the catalogue holds them (sol-loop r6 S5).
+    # an empty section too: its presence says the catalogue holds them.
     if "makers" in catalog and not catalog["makers"]:
         lines += ["[makers]", ""]
     for start, maker in sorted((catalog.get("makers") or {}).items()):
@@ -75,7 +75,7 @@ def save(root: Path, catalog: dict):
 
 def refreeze(entry: dict, size: int, sha256: str, today: str) -> dict:
     """`entry` frozen anew at `size` bytes and `sha256`: new bytes are a new release (dated today),
-    and its form pin (`rdfc_sha256`), the old graph's, goes with them (sol-loop r1 S3: kept, it
+    and its form pin (`rdfc_sha256`), the old graph's, goes with them (kept, it
     accepted the old graph). Same bytes: unchanged but for its size."""
     if entry.get("sha256") != sha256:
         entry["frozen"] = today

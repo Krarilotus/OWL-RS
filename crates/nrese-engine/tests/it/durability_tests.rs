@@ -351,7 +351,7 @@ fn keeping_the_prefix_opens_up_to_the_damage_and_keeps_the_rest() {
     assert_eq!(contents(&engine), again[0]);
 }
 
-/// A later cut at the same offset never replaces an earlier copy (sol-loop r1 S2): after a
+/// A later cut at the same offset never replaces an earlier copy: after a
 /// prefix kept at record 2, the next commit is written where record 2 was, and a crash
 /// tears it. Cutting that torn tail keeps it under another name; the copy of the damaged
 /// records 2 to 4, possibly the only one of acknowledged commits, stays as it was.
@@ -389,7 +389,7 @@ fn a_later_cut_at_the_same_offset_keeps_the_earlier_copy() {
 }
 
 /// A segment's name is a lower bound of its records only: bulk loads advance the revision
-/// by checkpoints alone, and an empty active segment keeps its name (sol-loop r1 S1). Here
+/// by checkpoints alone, and an empty active segment keeps its name. Here
 /// 30 replacements leave the store at revision 30 with its first segment, named 1, empty;
 /// two small commits (31 and 32, one quad of known terms each) follow in it, far more
 /// revisions past the name than frames fit. A garbage length over record 31 still finds
@@ -641,7 +641,7 @@ fn second_process_open(dir: &Path) -> Option<i32> {
 }
 
 /// A store stays locked against another process whatever else this process does with its
-/// lock file (review r1, R1-F1): here `LOCK` is read, so opened and closed, while the store is
+/// lock file: here `LOCK` is read, so opened and closed, while the store is
 /// open. Before the fix the store's lock was a record lock, which any close of the file by the
 /// process drops: a second process opened the store too, and both could commit the same
 /// revision, one of them lost at the next reopen. Once the first engine is dropped, the second

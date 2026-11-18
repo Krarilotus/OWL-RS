@@ -31,7 +31,7 @@ fn vector_answer(
     Ok((hits, report.space, report.scanned))
 }
 
-/// Attack item 10: vectors. The base holds `[1, 0]` and `[0.6, 0.8]`; the private delta
+/// Vectors. The base holds `[1, 0]` and `[0.6, 0.8]`; the private delta
 /// adds `[0, 1]` (its own, at the same distance from `[1, 1]` as the base's `[1, 0]`), a
 /// vector of a dimension no base vector has, and removes `[0.6, 0.8]`. Each search, exact,
 /// equals an engine holding the same statements: hits by distance then id across shared
@@ -126,7 +126,7 @@ fn a_private_snapshot_searches_its_vectors_and_the_bases() {
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
-/// Sol-loop r1 B3: a private snapshot that reads within a request's budget (as a SPARQL
+/// A private snapshot that reads within a request's budget (as a SPARQL
 /// query's does), with equality expansion and a cold vector corpus, searched by the global
 /// vector entry point within that same budget, answers: the search charges the budget
 /// through the snapshot's own reads, not through a bridge that holds all its room. Red

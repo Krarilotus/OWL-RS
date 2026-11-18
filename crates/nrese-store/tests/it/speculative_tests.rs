@@ -1,8 +1,8 @@
-//! Dictionary lifecycle V1 (`notes/2026-11-09-dict-v1-speculative-private-design.md` §4,
-//! item 1): a request's speculative work appends none of its own terms to the shared
+//! Dictionary lifecycle V1:
+//! a request's speculative work appends none of its own terms to the shared
 //! dictionary. The session read and the SHACL preview with the request's own shapes (the DL
-//! routes are in `dl::speculative`; the OWL 2 RL refutation's row comes with V1b, design note
-//! §8.3). Each is red on the parent, whose speculative transaction interns into the dictionary.
+//! routes are in `dl::speculative`; the OWL 2 RL refutation's row comes with V1b). Each is
+//! red on the parent, whose speculative transaction interns into the dictionary.
 
 use crate::support::Writes;
 use nrese_store::{
@@ -98,10 +98,10 @@ fn read_pending(store: &StoreService, pending: &[String], query: &str) -> String
     String::from_utf8(out).unwrap()
 }
 
-// Search inside the private routes (V3's "For V1" rows, notes/2026-11-09-dict-v3-handback.md;
-// design note §4 item 3; review dict-v1c r1, R1). V3's oracle: a store holding the same
-// statements, committed. The text rows' histories keep no literal the data has stopped using,
-// as on a private snapshot the global entry points answer through the reader path.
+// Search inside the private routes (V3's rows below). V3's oracle: a store holding the
+// same statements, committed. The text rows' histories keep no literal the data has
+// stopped using, as on a private snapshot the global entry points answer through the
+// reader path.
 
 const BDS: &str = "http://www.bigdata.com/rdf/search#";
 
@@ -246,11 +246,11 @@ fn vector(y: &str) -> String {
     format!("\"[1, {y}]\"^^<urn:nrese:vector:vector>")
 }
 
-/// V3 row 3 (SRCH's addition 1): a session's `nrv:search` whose `k` nearest, of the vectors
+/// V3 row 3: a session's `nrv:search` whose `k` nearest, of the vectors
 /// the query's graph uses, are reached only by widening, and are its own. Under `global`, a
 /// private snapshot searches the vectors of every graph and the query passes over those its
 /// graph doesn't use, widening `k` until it covers the space it is told: a space that left the
-/// own vectors out stops short (sol-loop r3 S1).
+/// own vectors out stops short.
 ///
 /// - Input: a store whose five vectors nearest to `[1, 0]` are used in another graph only, and
 ///   one far vector in `:g`; a session whose pending update adds two vectors of its own to

@@ -2,10 +2,10 @@
 //! before it is kept, on every route that writes it, whatever its transaction (D16-039 S1–S3):
 //! an upload is read as it goes, so what it keeps is its pending changes. A document refused for
 //! memory leaves the store's statements and revision as they were; the new terms it interned
-//! stay (stated limit L3 for v1.5, dictionary lifecycle contract). With memory to spare, each
+//! stay (a known limit of v1.5). With memory to spare, each
 //! document is written (guard rows).
 //!
-//! Design: notes/2026-11-09-upload-staging-design.md (Harness), rows R1 and G1.
+//! The rows below: R1, a write refused for memory; G1, contexts don't multiply what a document costs.
 
 use std::sync::Arc;
 

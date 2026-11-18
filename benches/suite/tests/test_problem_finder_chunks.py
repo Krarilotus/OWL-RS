@@ -197,7 +197,7 @@ class SweepResume(unittest.TestCase):
         self.assertIn("seed 3", out.getvalue())
 
     def test_a_run_in_which_no_test_ran_is_not_ok_and_each_run_keeps_its_result_line(self):
-        """D16-516 (DL lead's reading of a sweep, 11 Nov 2026): a test filter that matches nothing
+        """D16-516 (a sweep read on 11 Nov 2026): a test filter that matches nothing
         exits 0, so a renamed or mistyped test gave a pass with no test run. Seed 2 runs none: not
         ok. Every row keeps cargo's result line, so a pass shows the tests it ran."""
         nothing = "print('test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 99 filtered out; finished in 0.00s')"

@@ -1005,7 +1005,7 @@ async fn a_transaction_delete_that_isnt_rdf_is_refused_on_arrival() {
     assert_eq!(size(&app, None).await, 3);
 }
 
-/// SYN-54 slice 3 review r1, S3-F1: in a transaction's DELETE, a statement whose graph is
+/// In a transaction's DELETE, a statement whose graph is
 /// another store's name for the default graph (`urn:x-arq:DefaultGraph`, `urn:x-rdflib:default`)
 /// names the default graph, as `rdf4j:nil` does: its copy in another graph stays. A statement
 /// without a graph still means every graph (guard). With and without `preserveNodeId`.

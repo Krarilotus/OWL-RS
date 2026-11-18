@@ -1,5 +1,5 @@
 //! What a search under `GRAPH ?g` holds (native/search.rs, evaluated per named graph):
-//! charged to the query's envelope before it is allocated (brief v3 §3; review r1 R1-C1),
+//! charged to the query's envelope before it is allocated,
 //! so a query whose graphs or rows outgrow the envelope is refused before the heap grows
 //! past it, and every charge is released after. Two dimensions grow: the graphs a
 //! `bds:minRank` counts ranks in (no row passes), and the rows a literal in many graphs
@@ -188,8 +188,8 @@ fn fan_out_is_refused_before_the_rows_outgrow_the_envelope() {
 
 /// Graph by graph, the pattern binding the graph variable itself: its column is written in
 /// place, so what each graph's rows were charged is what is released, and an empty answer
-/// over many graphs isn't refused for charges nothing holds (sol-loop round 3 S1:
-/// replacing the column left each graph's charge behind). `VALUES ?g { UNDEF }` binds it,
+/// over many graphs isn't refused for charges nothing holds (replacing the column left each graph's charge behind).
+/// `VALUES ?g { UNDEF }` binds it,
 /// `FILTER(BOUND(?g))` drops the row; as written, so nothing is rewritten. Rows: 20,000
 /// graphs within 64 KiB, no rows and nothing held after; and 50 graphs (guard).
 #[test]

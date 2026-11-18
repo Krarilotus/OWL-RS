@@ -66,7 +66,7 @@ class Ready(unittest.TestCase):
         self.assertEqual(got["--threads 1"], [3000.0])
 
     def test_each_sweep_process_declares_its_own_ready(self):
-        # Spec (review r1 F1): a sweep's process reports its load (`_`) and its entry's ready, and
+        # Spec: a sweep's process reports its load (`_`) and its entry's ready, and
         # its invocation declares exactly those, not every entry's.
         case = CASES["load-threads"]
         plan, declared = fast.invocation_plan(case), fast.case_manifest([case])["invocation_series"]["load-threads"]

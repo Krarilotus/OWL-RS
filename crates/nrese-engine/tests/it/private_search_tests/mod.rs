@@ -1,6 +1,6 @@
-//! Search over a private snapshot (dictionary lifecycle V3; the contract's §7, decision of
-//! 10:23 item 1: "private views are scored over what they can see; committed global reads
-//! are unchanged"). A private transaction's pending snapshot searches, text and IRI names,
+//! Search over a private snapshot (dictionary lifecycle V3): private views are scored over
+//! what they can see, and committed global reads are unchanged.
+//! A private transaction's pending snapshot searches, text and IRI names,
 //! as an independent engine holding exactly its statements would: its own new terms
 //! (overlay ids) found, a base document it removes or hides not found or counted, a word
 //! only it has found, terms it interned but doesn't use not found. The shared store of
@@ -76,7 +76,7 @@ fn inserted() -> Vec<Quad> {
     ]
 }
 
-/// What a writer publishes after the private transaction opened (R3-F2): a literal the
+/// What a writer publishes after the private transaction opened: a literal the
 /// private delta then uses too (its own there, found once), and one it doesn't (not found).
 /// Their dictionary entries take numbers the overlay's own terms have.
 fn published_later() -> Vec<Quad> {

@@ -262,8 +262,8 @@ class Queue:
             timed = job.get("window", "quiet") == "quiet" and self.watch
             unquiet = ""
             # What an earlier watcher of the job left suspended is resumed before the timed
-            # command starts; anything it can't settle and the chunk doesn't run (Sol, 20 Oct 2026:
-            # it ran on, measured over frozen work).
+            # command starts; anything it can't settle and the chunk doesn't run (it ran on, measured over frozen
+            # work).
             if code == 0 and timed and not quiet_reconcile(results / "quiet"):
                 code, unquiet = 3, f"an earlier watcher's suspensions couldn't be resumed ({results / 'quiet' / 'frozen'})"
                 out.write(f"=== {now} chunk {index + 1} not started: {unquiet}\n")

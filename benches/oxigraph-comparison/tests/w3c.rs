@@ -1,6 +1,6 @@
 //! The corpus admission (`w3c.rs`) on a fixture repository: the corpus is what the pinned
-//! commit's tree holds, whatever the checkout's index or working files say (Sol, PR #61 F1:
-//! a pinned HEAD with three files left in the index admitted three of 505).
+//! commit's tree holds, whatever the checkout's index or working files say (PR #61: a pinned HEAD with three files left in the index admitted three of
+//! 505).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -143,7 +143,7 @@ fn the_pinned_tree_is_the_corpus_whatever_the_index_or_the_files_say() {
 }
 
 /// In a partial clone a pinned object not fetched yet breaks the corpus, and admission starts
-/// no fetch: one runs over the network with no deadline (Sol, PR #61 fix check 1).
+/// no fetch: one runs over the network with no deadline (PR #61).
 #[test]
 fn an_object_not_fetched_breaks_the_corpus_and_starts_no_fetch() {
     let base: PathBuf = std::env::temp_dir().join(format!("w3c-partial-{}", std::process::id()));

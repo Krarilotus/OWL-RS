@@ -156,7 +156,7 @@ protocol!(
     tag = "server",
     responses((
         status = 200,
-        description = "How the server runs: memory, caches, query budget, requests",
+        description = "How the server runs: version, deployment posture, readiness, revision, quad and graph counts, store mode, durability, reasoning mode, profile and read model, and which surfaces are enabled",
         body = serde_json::Value
     ))
 );

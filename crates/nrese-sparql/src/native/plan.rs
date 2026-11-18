@@ -778,11 +778,11 @@ mod tests {
         }
     }
 
-    /// Spec: the master's order of 12 November 13:53, "enter the set search only when that
-    /// plan's own estimate says the query is expensive enough", with "effort follows expected
-    /// work", and its doubt review: a plan's expected work is its steps' estimates summed, NaN
+    /// Spec (12 November): enter the set search only when that
+    /// plan's own estimate says the query is expensive enough, and effort follows expected
+    /// work: a plan's expected work is its steps' estimates summed, NaN
     /// left out and infinity kept; a BGP is planned with the sets where it expects at least
-    /// [`SET_GATE_ROWS`] rows, not else (the master's decision of 13 November 23:58: no
+    /// [`SET_GATE_ROWS`] rows, not else (decided on 13 November: no
     /// allowance for short lists); its budget is [`SET_BUDGET`], or [`SET_ENTRIES_PER_ROW`]
     /// per expected row where that is more, saturating (NaN to the floor); a test's budget and
     /// decision replace the planner's.

@@ -1,4 +1,4 @@
-//! Guards of package C3 (`notes/2026-11-09-d039-update-sweep.md`, row C3): a charged decode
+//! Guards of package C3 (row C3): a charged decode
 //! covers every kind of term, as the plain decode does. An inline literal's text and a triple
 //! term's components and boxes are charged before they are made; `Ok(None)` only for an id that
 //! isn't a term of the snapshot. Through a published snapshot (the dictionary) and a private one

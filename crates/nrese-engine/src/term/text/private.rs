@@ -1,4 +1,4 @@
-//! Search over a private snapshot (dictionary lifecycle V3; the contract's §7): its shared
+//! Search over a private snapshot (dictionary lifecycle V3): its shared
 //! documents through the shared index, its own (the overlay's terms its statements use)
 //! through an index of their own, under one search body ([`super::search_with`]).
 //!
@@ -35,7 +35,7 @@ pub(crate) struct Local {
     _charge: Reservation,
 }
 
-/// What [`Local::build`] charges before it allocates (sol-loop r1 B1), as upper bounds of
+/// What [`Local::build`] charges before it allocates, as upper bounds of
 /// what [`TextIndex`] and the build allocate, kept until `Local` drops (so transient and kept
 /// allocations both count):
 /// - before anything: the index's shard maps and stem tables (256 maps of 24 bytes, rounded
@@ -47,7 +47,7 @@ pub(crate) struct Local {
 ///   up to three bytes a byte, once while tokenised and once as keys, and their stem table
 ///   copies), and each word ([`PER_WORD`]): a tokenising map slot with its `String` (88); a
 ///   whole B-tree node, since a map of n words holds at most n nodes and a word alone in its
-///   shard is its own root (sol-loop r2 B1: an internal node of eleven 16-byte keys, eleven
+///   shard is its own root (an internal node of eleven 16-byte keys, eleven
 ///   40-byte postings, twelve edges and its header, 728); a posting buffer at its doubling
 ///   (34); a stem table slot with its `String` and vector (128). 978, rounded up.
 const UPFRONT: usize = 8 << 10;

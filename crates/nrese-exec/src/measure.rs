@@ -96,7 +96,7 @@
 //! within the preparation that runs once per process, and every measurement aligns rayon's
 //! queue with such joins (see [`prepare`]); each waits for a thread of the global pool to run
 //! its job. A global thread that waits for that preparation, or for a lock the measuring
-//! thread holds, never does, and neither returns (Sol, measure-pool r3; the base had the same
+//! thread holds, never does, and neither returns (the base had the same
 //! waits). So, the rule for a measured test: its first measurement is not made while a thread
 //! of a pool is entering one, and a measuring thread holds no lock a pool's job needs. In the
 //! suite's own runs it did not occur: 0 hangs in 91 runs of this module's tests recorded from
@@ -523,7 +523,7 @@ fn prepare() {
             // Every thread of the global pool started, and of the pool the caller is on (a
             // thread allocates as it starts: "Known limits"). The wait runs no job on the
             // caller: a job it ran could measure, entering this preparation again, or wait
-            // for a lock the caller holds (Sol, measure-pool r2). So each pool gets a
+            // for a lock the caller holds. So each pool gets a
             // broadcast that only counts, sent without waiting, and the caller waits for the
             // count (`started`). The global pool's is sent from outside any pool, as a
             // broadcast reaches the pool it is made on.

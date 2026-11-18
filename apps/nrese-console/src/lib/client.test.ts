@@ -105,7 +105,7 @@ describe("NreseClient", () => {
     ]);
   });
 
-  // SYN-72 R1-F1: the server reads these named graphs as the default graph
+  // SYN-72: the server reads these named graphs as the default graph
   // (nrese-sparql/src/compat.rs); a named target naming one is refused before any request.
   test.each(["urn:x-arq:DefaultGraph", "urn:x-rdflib:default"])(
     "refuses a named target %s, sending nothing",

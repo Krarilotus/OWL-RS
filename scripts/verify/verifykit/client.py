@@ -139,7 +139,7 @@ def connect(host: str, port: int, deadline: Deadline) -> socket.socket:
         sock = None
         try:
             # Inside the per-address handling: a family the host can't create (IPv6 off) is
-            # this address's failure, and the next address is tried (Sol r3, finding 2).
+            # this address's failure, and the next address is tried.
             sock = socket.socket(family, kind, protocol)
             sock.settimeout(deadline.left())
             sock.connect(address)

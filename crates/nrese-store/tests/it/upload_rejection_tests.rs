@@ -1,8 +1,8 @@
-//! A rejected upload changes no statement (review UPLOAD-R1-F1): a document whose last
+//! A rejected upload changes no statement: a document whose last
 //! statement isn't valid, after good statements with terms the store hasn't seen, changes
 //! neither the store's statements nor its revision, whatever route it takes, sent once or (with
-//! blank nodes) again. The new terms it interned stay in the shared dictionary (stated limit
-//! L3 for v1.5, dictionary lifecycle contract).
+//! blank nodes) again. The new terms it interned stay in the shared dictionary
+//! (a known limit of v1.5).
 
 use std::sync::Arc;
 

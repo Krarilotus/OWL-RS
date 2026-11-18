@@ -115,7 +115,7 @@ pub(crate) fn ontology_at(
 
 /// The asserted ontology of `snapshot`, read and charged as [`ontology_at`] reads it, and
 /// held by its reader alone: for a transaction's pending state, whose revision number is
-/// its base's and so names other data in the cache (R1-F3).
+/// its base's and so names other data in the cache.
 fn read_ontology(
     store: &StoreService,
     snapshot: &Snapshot,
@@ -311,7 +311,7 @@ pub(crate) fn plan_status(
     Ok(composed(store, prepared, snapshot, &decided, completeness))
 }
 
-/// The bounds' view of `snapshot` its answers and their status are decided on (R1-F2), or
+/// The bounds' view of `snapshot` its answers and their status are decided on, or
 /// why there is none ([`PART`], [`LATER`]). Never another snapshot's view.
 type Decided = Result<(Snapshot, Arc<View>), &'static str>;
 
@@ -374,8 +374,8 @@ impl Revision<'_> {
 }
 
 /// Every answer `unsound` where OWL 2 DL may not entail what the RL closure (L) holds
-/// ([`reads_differently`]) in the data `at` it was read from, never a later revision's (R1-F2,
-/// F3): composed before certification by the one composition of a read's status
+/// ([`reads_differently`]) in the data `at` it was read from, never a later revision's:
+/// composed before certification by the one composition of a read's status
 /// (`StoreService::assess`), for both DL entry points, a read without the bounds
 /// (`StoreService::status_without_dl`) and a read inside a transaction with operations
 /// pending (`StoreService::run_query_pending_reporting`). It reads every graph, and a reader
@@ -963,7 +963,7 @@ pub(crate) fn answer(
 ) -> StoreResult<Outcome> {
     cancellation.check()?;
     let analysis = analyse(prepared.query());
-    // One view for the answers and their status: a commit in between changes neither (R1-F2).
+    // One view for the answers and their status: a commit in between changes neither.
     let decided = decided(store, snapshot, prepared, cancellation)?;
     // The exact services' one deadline, the every-name question's included.
     let read = (cancellation, Deadline::after(store.config().dl.timeout));
@@ -1049,7 +1049,7 @@ fn decide_answers(
 ) -> StoreResult<Outcome> {
     let settings = store.query_settings();
     if prepared.has_dataset() {
-        // Over the decided snapshot, every graph's for this reader: the status's (R1-F2).
+        // Over the decided snapshot, every graph's for this reader: the status's.
         return Ok(Status::sound_only(
             "the query names its dataset: answers are over those graphs, not checked \
              against the bounds",

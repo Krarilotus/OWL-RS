@@ -519,8 +519,8 @@ fn super_covered(o: &Ontology, e: ExprId, rl: bool) -> bool {
             // where RL has it.
             ClassExpr::All(_, f) => rl && super_covered(o, *f, rl),
             // Nothing else: a form the grammar doesn't admit as written is answered by
-            // neither the TBox nor the rules, which see it as written (review r1, F2:
-            // `¬¬D`, `¬≥ 2 R`). What it may conclude decides whether it matters
+            // neither the TBox nor the rules, which see it as written (`¬¬D`, `¬≥ 2 R`).
+            // What it may conclude decides whether it matters
             // ([`concluded_terms`], [`concludes_equality`]).
             _ => false,
         }
@@ -528,8 +528,8 @@ fn super_covered(o: &Ontology, e: ExprId, rl: bool) -> bool {
 
 /// Whether what a rewriting over the closure of QL (`rl` false) or RL can miss of
 /// `axiom`'s conclusions is covered: the axiom is in that profile, apart from
-/// existentials on the right, which the rewriting covers (I24c, master's ruling of 8 Nov
-/// 10:31 and 10:39). Uncovered, an answer that reads the axiom's conclusions can't be
+/// existentials on the right, which the rewriting covers (I24c, decided on 8 Nov).
+/// Uncovered, an answer that reads the axiom's conclusions can't be
 /// claimed `complete` under that regime: the profile's rules are complete only for the
 /// ontologies of the profile (W3C OWL 2 Profiles, theorem PR1).
 ///
@@ -621,7 +621,7 @@ pub fn concluded_terms(o: &Ontology, axiom: &Axiom, rl: bool) -> Vec<Term> {
 /// The named classes and properties on which concluding `e` (`positive`), or its
 /// complement, can add a positive fact. It is read in negation normal form, so a
 /// complement flips the polarity, as the hazards' reading of existentials does:
-/// - `∀R.F` adds facts on `F` only, never an `R` edge (review r1, F3); `¬∀R.F` adds an
+/// - `∀R.F` adds facts on `F` only, never an `R` edge; `¬∀R.F` adds an
 ///   `R` edge.
 /// - `¬∃R.F` adds no `R` edge, only the negation of `F`.
 /// - `≤ n` adds none; `¬≤ n` is `≥ n+1`, which adds `R` and its filler.
@@ -649,7 +649,7 @@ pub(crate) fn positive_terms(o: &Ontology, e: ExprId, positive: bool, out: &mut 
             positive_terms(o, *f, true, out);
         }
         // `≤ 0 R.F` (also `= 0`, `¬≥ 1`) puts every successor outside `F`: facts of `¬F`,
-        // no `R` edge (Sol r1 S1). A larger bound equates ([`concludes_equality`]).
+        // no `R` edge. A larger bound equates ([`concludes_equality`]).
         (ClassExpr::Max(0, _, f) | ClassExpr::Exact(0, _, f), true)
         | (ClassExpr::Min(1, _, f), false) => positive_terms(o, *f, false, out),
         (ClassExpr::Max(_, r, f) | ClassExpr::Exact(_, r, f), false) => {
@@ -672,7 +672,7 @@ pub(crate) fn positive_terms(o: &Ontology, e: ExprId, positive: bool, out: &mut 
 }
 
 /// A term to name an axiom's hazard by: a property, else a class or an individual of its
-/// expressions (review r1, F1: `C ⊑ {a}` names no property).
+/// expressions (`C ⊑ {a}` names no property).
 pub(crate) fn label(o: &Ontology, axiom: &Axiom) -> Option<Term> {
     fn any(o: &Ontology, e: ExprId) -> Option<Term> {
         match o.class(e) {
@@ -703,8 +703,8 @@ pub(crate) fn label(o: &Ontology, axiom: &Axiom) -> Option<Term> {
 
 /// The properties whose edges can make individuals equal: functional, inverse functional,
 /// in a key, functional on data; and, closed downward, every property whose edges are
-/// theirs: sub-, equivalent and inverse properties, a chain's links (Harness note
-/// `2026-11-08-i24c1-equality-fail-closed.md`).
+/// theirs: sub-, equivalent and inverse properties, and a chain's
+/// links.
 pub fn equating_properties(o: &Ontology) -> std::collections::HashSet<Term> {
     let mut out = std::collections::HashSet::new();
     for axiom in &o.axioms {
@@ -754,13 +754,13 @@ pub fn equating_properties(o: &Ontology) -> std::collections::HashSet<Term> {
 }
 
 /// Whether an uncovered axiom's conclusion (of a subclass axiom, either side's, as for an
-/// equivalence) can make individuals equal, fail-closed by construction (fix check r1;
-/// master, 8 Nov 12:41): it can when it contains, in either
-/// polarity, a nominal (also `hasValue`), `Self`, a counting restriction that bounds from
-/// above in one of its polarities (`≤ n` and `= n` for n ≥ 1, `≥ n` for n ≥ 2), or a
-/// property of `equating` ([`equating_properties`]). No witness or polarity reading: a
-/// conjunction of nominals on one witness is as equating as one nominal (F1). `≥ 0` holds
-/// of everything and its complement of nothing, so it concludes nothing (F2).
+/// equivalence) can make individuals equal, fail-closed by construction: it can when it
+/// contains, in either polarity, a nominal (also `hasValue`), `Self`, a counting
+/// restriction that bounds from above in one of its polarities (`≤ n` and `= n` for
+/// n ≥ 1, `≥ n` for n ≥ 2), or a property of `equating` ([`equating_properties`]). No
+/// witness or polarity reading: a conjunction of nominals on one witness is as equating
+/// as one nominal. `≥ 0` holds of everything and its complement of nothing, so it
+/// concludes nothing.
 ///
 /// Then any fact may follow, and its hazard reaches every term.
 pub fn concludes_equality(
@@ -790,7 +790,7 @@ pub fn concludes_equality(
     }
     let any = |v: &[ExprId]| v.iter().any(|&e| contains(o, e, equating));
     match axiom {
-        // Both sides: `L ⊑ R` is `¬R ⊑ ¬L`, so `≥ 2 R ⊑ ⊥` is `⊤ ⊑ ≤ 1 R` (D16-492 r1, F1).
+        // Both sides: `L ⊑ R` is `¬R ⊑ ¬L`, so `≥ 2 R ⊑ ⊥` is `⊤ ⊑ ≤ 1 R`.
         Axiom::SubClassOf(a, b) => contains(o, *a, equating) || contains(o, *b, equating),
         Axiom::EquivalentClasses(v) | Axiom::DisjointClasses(v) | Axiom::DisjointUnion(_, v) => {
             any(v.as_slice())

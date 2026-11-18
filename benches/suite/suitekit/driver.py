@@ -245,7 +245,7 @@ class Suite:
     def writer(self) -> Writer:
         """The run's results.csv, created at its first row: in a run, after main took the results
         directory (Manifest's lock), never before, so a second starter, refused there, never opens
-        it (review cell-receipts r5 F1: Writer's exists check, then open "w")."""
+        it (Writer's exists check, then open "w")."""
         if getattr(self, "_writer", None) is None:
             self._writer = Writer(self.results / "results.csv", echo=print)
         return self._writer
@@ -312,7 +312,7 @@ class Suite:
     def ensure_images(self, needed: dict[str, str | None]) -> bool:
         """needed: image -> build context under benches/ (None: pulled). False, said why, when a pinned
         image's digest can't be pulled or tagged: the tag may still name other content, so the run
-        stops before anything is pinned or timed (P1c review r1 F1)."""
+        stops before anything is pinned or timed."""
         if self.args.runtime != "docker":
             return True
         pins = image_pins(self.root)
@@ -333,7 +333,7 @@ class Suite:
             elif context:
                 # What it is built from, on the image itself: its context's git tree id in this run's
                 # commit, when that is clean (P2 design review F5). The receipt reads it off the id
-                # that runs (image_source), never off this tag (P1b review r1 F1).
+                # that runs (image_source), never off this tag.
                 state = checkout_state(self.root)
                 tree = (receipts.object_ids(self.root, state["commit"] or "", [f"benches/{context}"])[f"benches/{context}"]
                         if state.get("dirty") == 0 else None)
@@ -350,11 +350,11 @@ class Suite:
 
     def image_source(self, image: str, image_id: str, compiles_source: bool = False):
         """Where the image with this id came from, read off that id (the one the run's containers
-        run, its pin), never off a tag that may name another by now (P1b review r1 F1): its build
+        run, its pin), never off a tag that may name another by now: its build
         label; or, for a tag with a digest pin (images.toml), "pulled, pinned DIGEST" when that id
         holds the pin (P1c); else unknown, with why. An image that `compiles_source` (its adapter's
-        script_builds) is known only with its source commit label too (review image-source-commit
-        r1 F2). Unreadable is unknown with its reason, never an exception: a receipt is written on
+        script_builds) is known only with its source commit label too.
+        Unreadable is unknown with its reason, never an exception: a receipt is written on
         a host without docker too (#161's Windows gate, gate-windows-59532fff57-1794140734)."""
         key = (image, image_id, compiles_source)
         if key not in self.image_sources:
@@ -398,7 +398,7 @@ class Suite:
         self.built[nrese.key] = built_from(source, "nrese")
         self.say(f"building {nrese.key} (release) from {source}")
         log = self.results / "logs" / f"{nrese.key}-build-{self.stamp}.log"
-        # From a clean export of its commit, never the worktree (P1e: r5 F17 and every file git
+        # From a clean export of its commit, never the worktree (every file git
         # doesn't hold); removed after the build, its binary in the build's own target.
         tree = self.export_build(source, nrese.key, self.built[nrese.key].get("commit"))
         if tree is None:
@@ -435,7 +435,7 @@ class Suite:
                 return False
             self.built[nrese.key].update(rust_image=tag, rust_image_id=image, rustflags=rustflags)
             # The image's toolchain, in its environment (its own and RUSTFLAGS); its config is the
-            # pinned image's, the source mount the export (r5 F16, F17).
+            # pinned image's, the source mount the export.
             toolchain = toolchain_in(image, tree) if not self.args.dry_run else receipts.unknown("a dry run")
             self.built[nrese.key].update(toolchain=toolchain,
                                          controlled=controlled(tree, None, toolchain, declared_toolchain(tree)))
@@ -448,7 +448,7 @@ class Suite:
                                     "cargo", "build", "--release", "--locked", "-j", jobs, "-p", "nrese-server",
                                     "--target-dir", "/target"], log)
         else:
-            # Its own toolchain, budget and target directory, in the controlled environment (r4 F15).
+            # Its own toolchain, budget and target directory, in the controlled environment.
             environment = {**controlled_environment(os.environ), "CARGO_TARGET_DIR": str(nrese.target_dir(ctx))}
             self.built[nrese.key].update(self.host_control(tree, environment))
             rc = self.host_command(["bash", "scripts/cargo-guarded.sh", "build", "--release", "--locked",
@@ -459,7 +459,7 @@ class Suite:
 
     def record_builds(self) -> None:
         """The build records so far into the manifest (`builds`, what the receipts copy), after each
-        build, a failed one too, whether or not a cell runs (P1e sol-loop r1 S2)."""
+        build, a failed one too, whether or not a cell runs."""
         if self.manifest and self.built:
             self.manifest.update(builds=dict(self.built))
 
@@ -467,7 +467,7 @@ class Suite:
         """A fresh export of `source`'s commit for a build of `program` (P1e), in a directory of this
         run's own, outside any checkout (cargo reads .cargo/config in every ancestor of the directory
         it builds in): build_export_base. Its commit is the one the build's record names (built_from's),
-        never HEAD read again (P1e review r1 F1). None, said why, where it can't be made; never the
+        never HEAD read again. None, said why, where it can't be made; never the
         worktree in its place. A dry run builds nothing: the source, for its echo."""
         if self.args.dry_run:
             return source
@@ -496,14 +496,14 @@ class Suite:
 
     def host_control(self, tree: Path, environment: dict) -> dict:
         """A host build's `toolchain` (rustc and cargo as they run in `tree` with `environment`) and
-        whether it is `controlled` (r5 F16-F18)."""
+        whether it is `controlled`."""
         toolchain = toolchain_here(tree, environment) if not self.args.dry_run else receipts.unknown("a dry run")
         return {"toolchain": toolchain,
                 "controlled": controlled(tree, environment, toolchain, declared_toolchain(tree))}
 
     def harness_target(self) -> Path:
         """The harness build's output directory; a relative CARGO_TARGET_DIR is the repository's, where
-        the build and the run both find it (it builds in an export, removed after it: P1e sol-loop r1 S1)."""
+        the build and the run both find it (it builds in an export, removed after it)."""
         target = Path(self.settings.get("CARGO_TARGET_DIR") or self.root / "target")
         return target if target.is_absolute() else self.root / target
 
@@ -1015,7 +1015,7 @@ class Suite:
             try:
                 built = self.build_nrese(adapter(key))
             finally:
-                self.record_builds()  # a builder that raises too (P1e review r1 F2)
+                self.record_builds()  # a builder that raises too
             if not built:
                 return 1
         if any(system is not None and plan.kind != "kit" for plan, _, system, _ in chosen):
@@ -1054,7 +1054,7 @@ class Suite:
                 else:
                     runnable.append((key, system, regime))
             # Each cell's attempt, before any of its work: a run stopped from here on leaves the
-            # cell incomplete, never an older attempt's receipt in its place (review r1 R2).
+            # cell incomplete, never an older attempt's receipt in its place.
             cells = [(key, None) for key in kits + drivers] + [(key, system) for key, system, _ in runnable]
             attempts = self.attempts(plan, cells)
             for key in kits:
@@ -1160,7 +1160,7 @@ class Suite:
         def of(cell: str):
             # Not one worst verdict: `deviates` ranks above `incomplete` (PRECEDENCE, the reports'), so it
             # could stand for a query never captured (P2 design review F2). Qualified: every query ok or
-            # deviating only across datatypes (rule.owl-rs-answer-comparison), none without its answer.
+            # deviating only across datatypes, none without its answer.
             found = counts.get(cell)
             if not found:
                 return "not captured"
@@ -1274,7 +1274,7 @@ def built_from(source: Path, program: str) -> dict:
             "inputs": build_inputs(source, program), **build_settings(os.environ)}
 
 
-# The environment a host build runs cargo in, and nothing else (P2 design check r4 F15; an allowlist,
+# The environment a host build runs cargo in, and nothing else (an allowlist,
 # as hermetic builds clear theirs): where the toolchain and outputs are, the recorded settings, the
 # launcher's own knobs (NRESE_*, FLEET_SLICE, NS_HELD_*), and the platform's base. Any other variable
 # (CARGO_ENCODED_RUSTFLAGS, CARGO_PROFILE_*, cc's CFLAGS or CRATE_CC_NO_DEFAULTS, ...) never reaches
@@ -1310,7 +1310,7 @@ def build_export_base(checkout: Path) -> Path:
     return checkout.resolve().parent
 
 
-# The names an export writes (P1e review r2 F1, attack 19): Windows reads a backslash as a directory,
+# The names an export writes: Windows reads a backslash as a directory,
 # a colon as a drive or an alternate stream, a device name as a device, and drops a trailing dot or
 # space, all of which git keeps as plain characters. A component is written only if it is one or more
 # of these characters, not . or .., not ending in a dot or a space, and not a device name before its
@@ -1329,13 +1329,13 @@ def portable_name(component: str) -> bool:
 def export_commit(checkout: Path, commit: str, dest: Path, timeout: float = 600) -> None:
     """`dest` <- the tree of `commit` in `checkout`, exactly: every entry of its tree (git ls-tree)
     written with its object's bytes (git cat-file --batch), so no attribute applies (export-ignore,
-    export-subst, a filter, from the commit or outside it: P1e review r1 F1), nor a replace ref
+    export-subst, a filter, from the commit or outside it), nor a replace ref
     (--no-replace-objects). A plain file or an executable only, under a portable name
     (portable_name) whose destination is inside `dest`: a symlink, a submodule, any other name, or two
     paths this filesystem can't tell apart refuse it, before anything is written. Its files have the time they're
     written, never the commit's (cargo decides freshness by mtimes: an older commit's would read as
     older than the last build's outputs, a stale binary). One deadline for the whole export, its git
-    children killed at it (r1 F4). Raises OSError where it can't be made exactly."""
+    children killed at it. Raises OSError where it can't be made exactly."""
     started = time.monotonic()
     git = ["git", "--no-replace-objects", "-C", str(checkout)]
 
@@ -1366,7 +1366,7 @@ def export_commit(checkout: Path, commit: str, dest: Path, timeout: float = 600)
         if not dest.joinpath(*parts).resolve().is_relative_to(root):
             raise OSError(f"{path}: outside the export")
         # Every directory on the way, and the file, as this filesystem names it: two spellings git keeps
-        # apart and it merges (case on Windows) refuse (sol-loop r3 S3).
+        # apart and it merges (case on Windows) refuse.
         for depth in range(1, len(parts) + 1):
             prefix = "/".join(parts[:depth])
             folded = os.path.normcase(prefix)
@@ -1385,7 +1385,7 @@ def export_commit(checkout: Path, commit: str, dest: Path, timeout: float = 600)
                 batch.stdin.flush()
                 header = batch.stdout.readline().split()
                 if len(header) != 3 or header[0] != oid or header[1] != b"blob":
-                    left()  # killed at the deadline: that, not a garbled answer (sol-loop r3 S4)
+                    left()  # killed at the deadline: that, not a garbled answer
                     said = b" ".join(header).decode(errors="replace") or "nothing"
                     raise OSError(f"{path}: git cat-file gave {said}")
                 size = int(header[2])
@@ -1426,7 +1426,7 @@ def parse_toolchain(text: str):
 
 
 def toolchain_here(directory: Path, env: Mapping[str, str]):
-    """The toolchain a host build in `directory` with `env` runs (r5 F16): rustc and cargo found on
+    """The toolchain a host build in `directory` with `env` runs: rustc and cargo found on
     its PATH and run there, as rustup's proxies or a toolchain's own bin would be for the build."""
     out = []
     for tool in ("rustc", "cargo"):
@@ -1462,7 +1462,7 @@ def toolchain_in(image: str, tree: Path):
 def cargo_configs(directory: Path, env: Mapping[str, str]) -> list[str]:
     """The cargo configuration files a build in `directory` reads that its export doesn't hold: a
     .cargo/config or .cargo/config.toml in any ancestor of it, and in its Cargo home (CARGO_HOME,
-    relative to `directory`, the build's own working directory, where it isn't absolute: r5 F18;
+    relative to `directory`, the build's own working directory, where it isn't absolute;
     else ~/.cargo). Its own .cargo is its commit's."""
     home = Path(env["CARGO_HOME"]) if env.get("CARGO_HOME") else Path.home() / ".cargo"
     if not home.is_absolute():
@@ -1479,7 +1479,7 @@ def cargo_configs(directory: Path, env: Mapping[str, str]) -> list[str]:
 def controlled(directory: Path, env: Mapping[str, str] | None, toolchain, declared: str | None):
     """True when a build in `directory` (an export) reads no cargo config outside it (`env`, a host
     build's; None in a container, whose config is its pinned image's) and runs the declared
-    toolchain; else unknown, every reason why (r4 F15, r5 F16-F18)."""
+    toolchain; else unknown, every reason why."""
     why = []
     configs = cargo_configs(directory, env) if env is not None else []
     if configs:
@@ -1524,7 +1524,7 @@ def build_inputs(source: Path, program: str) -> dict:
 
 def checkout_moved(root: Path, start: dict) -> str:
     """Why the checkout isn't the one a run started from (its manifest `git`), read again as a tier's
-    receipts are written, or "" (P2 design r4 R1): another commit, or changed since a clean start (a
+    receipts are written, or "": another commit, or changed since a clean start (a
     dirty start is unqualified already). One that moves and comes back between two reads isn't seen."""
     now = checkout_state(root)
     if now.get("commit") != start.get("commit"):
@@ -1563,7 +1563,7 @@ def receipt_code_paths(root: Path, commit: str, system, plan) -> tuple[str, ...]
 def build_settings(env: Mapping[str, str]) -> dict[str, str]:
     """A build's configuration from the environment `env` it runs in, and nothing else: the CPU it
     compiles for (NRESE_TARGET_CPU, scripts/lib/target-cpu.sh's; `native` unset) and the RUSTFLAGS it
-    inherits. build_settings({}) is the default build's (P2 design review r3 F14). The toolchain is the
+    inherits. build_settings({}) is the default build's. The toolchain is the
     checkout's (rust-toolchain.toml, in the build's sources)."""
     return {"target_cpu": env.get("NRESE_TARGET_CPU", "native"), "rustflags_env": env.get("RUSTFLAGS", "")}
 
