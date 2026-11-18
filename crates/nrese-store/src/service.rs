@@ -139,11 +139,11 @@ impl Certificate {
         snapshot.certificate_for_rows()?.downcast_ref()
     }
 
-    /// Whether `snapshot` was never reasoned over: no inferred statement, no certificate, and
-    /// no rules in place (`rules`). Anything else without a certificate is a stack nothing
-    /// vouches for.
+    /// Whether `snapshot` was never reasoned over: no inferred statement, no certificate (not
+    /// even one a withheld view keeps for its rows), and no rules in place (`rules`). Anything
+    /// else without a certificate is a stack nothing vouches for.
     pub(crate) fn bare(snapshot: &Snapshot, rules: bool) -> bool {
-        snapshot.len_in(ReadModel::Inferred) == 0 && !rules && Self::of(snapshot).is_none()
+        snapshot.len_in(ReadModel::Inferred) == 0 && !rules && Self::for_rows(snapshot).is_none()
     }
 
     /// Whether `snapshot` reads under `owl2-dl`, and whether user rules run with it: as its
@@ -1321,6 +1321,8 @@ impl StoreService {
         if prepared.inference_scope.is_none() {
             self.refuse_exact(prepared, &snapshot, status)?;
         }
+        // Set where the status is decided, before the answer, a cached one too.
+        let mut withheld = true;
         let ql = run_query(
             &snapshot,
             prepared,
@@ -1333,10 +1335,11 @@ impl StoreService {
                 // The cache's context is the whole assessment, not what the reader is told.
                 let context = context_outside_dl(status.as_ref(), ql.is_some());
                 let told = status_for_its_reader(prepared, status, ql.is_some());
+                withheld = withholds_report(prepared, told.as_ref());
                 (context, move |kept| report(told, kept))
             },
         )?;
-        Ok((None, ql.filter(|_| !withholds_certification(prepared))))
+        Ok((None, ql.filter(|_| !withheld)))
     }
 
     /// The status of answers outside the DL bounds: the QL rewriting's report where it ran,
@@ -2697,13 +2700,16 @@ fn certification_for_its_reader(
     ql: &mut Option<nrese_sparql::ql::QlReport>,
 ) {
     *completeness = status_for_its_reader(prepared, completeness.take(), ql.is_some());
-    // Rows a withheld view's rewriting gives stand; its report, a claim, doesn't.
-    let withheld = completeness
-        .as_ref()
-        .is_some_and(|c| c.certification_withheld);
-    if withholds_certification(prepared) || withheld {
+    if withholds_report(prepared, completeness.as_ref()) {
         *ql = None;
     }
+}
+
+/// Whether `prepared`'s reader, told `told`, is shown no report of the rewriting: where its
+/// assessment is withheld ([`withholds_certification`]), and where its status is. Rows a
+/// withheld view's rewriting gives stand; its report, a claim, doesn't.
+fn withholds_report(prepared: &PreparedQuery, told: Option<&nrese_sparql::Completeness>) -> bool {
+    withholds_certification(prepared) || told.is_some_and(|c| c.certification_withheld)
 }
 
 /// Whether `prepared`'s reader is told no assessment of the rewriting, neither its status

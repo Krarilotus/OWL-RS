@@ -989,6 +989,51 @@ fn a_planned_read_charges_its_view_to_the_query() {
     );
 }
 
+/// Under compact equality no view is a reader's closure, so a reader who sees every inference
+/// reads the publication's stacks with nothing of its own to charge: its `ASK {}` is answered
+/// within the smallest total query budget that answers a reader of every graph. Each read is
+/// on a fresh store, `ex:open` holding one fact.
+#[test]
+fn a_compact_visible_read_is_answered_within_a_budget_that_answers_every_graph() {
+    let answered = |scope: &ReadScope, total: usize| {
+        let mut config = nrese_store::StoreConfig {
+            equality_compact: true,
+            query_cache_bytes: 0,
+            total_query_memory_bytes: total,
+            ..in_memory_store_config()
+        };
+        config.process_memory_bytes = nrese_store::ProcessMemory::Bytes(0);
+        let store = StoreService::new(config).unwrap();
+        crate::support::load_past_the_pipeline(
+            &store,
+            &format!("<{EX}open> {{ <{EX}a> <{EX}p> <{EX}b> }}"),
+        );
+        store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+        store.rematerialise(Ruleset::Owl2Rl).is_ok()
+            && store
+                .execute_query(&SparqlQueryRequest::new("ASK {}", scope.clone()))
+                .is_ok()
+    };
+    // The smallest, by doubling and then halving the gap: below it the read is refused.
+    let mut high = 1;
+    while !answered(&ReadScope::All, high) {
+        assert!(high < 1 << 30, "a reader of every graph is never answered");
+        high *= 2;
+    }
+    let mut low = high / 2;
+    while high - low > 1 {
+        let mid = low + (high - low) / 2;
+        match answered(&ReadScope::All, mid) {
+            true => high = mid,
+            false => low = mid,
+        }
+    }
+    assert!(
+        answered(&reader(false), high),
+        "refused within {high} bytes"
+    );
+}
+
 /// With the rules switched off and the store not rematerialised, its stack is OWL 2 RL's
 /// closure while no program is in place: a reader of some graphs who sees inferred
 /// statements, by their support or every one, is refused until the store is rematerialised.

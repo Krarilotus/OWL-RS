@@ -73,14 +73,15 @@ async fn insert(app: &Router, data: &str) -> TestResult {
     Ok(())
 }
 
-/// What `roles` are told of `ask`: the answer, the whole header and EXPLAIN's `ql` (`null`
-/// where it has none), with EXPLAIN's `completeness` printed as `SEEN` under `label`.
+/// What `roles` are told of `ask`: the answer, the whole header, EXPLAIN's `ql` (`null`
+/// where it has none) and its `completeness`'s status, with EXPLAIN's `completeness` printed
+/// as `SEEN` under `label`.
 async fn told(
     app: &Router,
     roles: &[&str],
     ask: &str,
     label: &str,
-) -> TestResult<(bool, String, String)> {
+) -> TestResult<(bool, String, String, String)> {
     let (code, header, body) =
         send(app, roles, Method::POST, "/dataset/query", ask.to_owned()).await?;
     assert_eq!(code, StatusCode::OK, "{body}");
@@ -102,7 +103,11 @@ async fn told(
         member("completeness"),
         member("ql")
     );
-    Ok((answer, header, member("ql")))
+    let explained = explanation["completeness"]["status"]
+        .as_str()
+        .unwrap_or("absent")
+        .to_owned();
+    Ok((answer, header, member("ql"), explained))
 }
 
 /// `ex:q owl:propertyChainAxiom (ex:p1 … ex:p7)` on blank cells (as the OWL mapping reads a
@@ -129,11 +134,11 @@ fn chain() -> String {
 /// holds a seven-property chain axiom and a chain it closes. Revision B adds
 /// `ex:pi owl:sameAs ex:ai` (i = 1…7) in `:g2`, which the reader by support can't read; B is
 /// read after the commit and again after a rematerialisation. The reader of every graph
-/// answers `ASK { ex:x0 ex:q ex:x7 }` `true` throughout. Wherever the reader by support
-/// answers `false`, it isn't told `complete`. In B the support grounding leaves the chain's
-/// list out, so the reader's view isn't vouched for: it is told exactly `not-certified`, and
-/// EXPLAIN's `ql` is `null`. Each header and EXPLAIN's `completeness` and `ql` are printed
-/// (`SEEN …`).
+/// answers `ASK { ex:x0 ex:q ex:x7 }` `true` throughout; the reader by support, as it was
+/// answered before its claim was withheld, `true` in A and `false` in B. In B the support
+/// grounding leaves the chain's list out, so the reader's view isn't vouched for: it is told
+/// exactly `not-certified`, in the header and EXPLAIN's `completeness`, and EXPLAIN's `ql`
+/// is `null`. Each header and EXPLAIN's `completeness` and `ql` are printed (`SEEN …`).
 #[tokio::test]
 async fn a_reader_by_support_missing_a_chain_its_graphs_close_is_never_told_complete() -> TestResult
 {
@@ -172,9 +177,10 @@ async fn a_reader_by_support_missing_a_chain_its_graphs_close_is_never_told_comp
     ));
     let mut wrong = Vec::new();
     for (at, whole, reader) in &seen {
-        let first = reader.1.split(';').next().unwrap_or_default();
-        let withheld = reader.1 == "not-certified" && reader.2 == "null";
-        if !whole.0 || (!reader.0 && first == "complete") || (at.starts_with('B') && !withheld) {
+        let in_b = at.starts_with('B');
+        let withheld = (reader.1.as_str(), reader.2.as_str(), reader.3.as_str())
+            == ("not-certified", "null", "not-certified");
+        if !whole.0 || reader.0 == in_b || (in_b && !withheld) {
             wrong.push(format!("{at}: every graph {}, reader {reader:?}", whole.0));
         }
     }
@@ -216,7 +222,7 @@ async fn a_list_left_out_in_a_graph_the_reader_cant_read_changes_none_of_its_ans
         )?;
         insert(&app, &data).await?;
         let ask = "ASK { ex:x ex:p ?y }";
-        let (answer, header, _) = told(&app, READER, ask, &format!("{store} reader")).await?;
+        let (answer, header, ..) = told(&app, READER, ask, &format!("{store} reader")).await?;
         answers.push(format!("{store}: {answer}, {header}"));
     }
     let expected = [
@@ -243,7 +249,8 @@ default_graph = "read"
 /// QL rewriting off and the default graph the union of every graph, `:g1` holds
 /// `ex:a ex:p ex:b`; store 2 also holds it in `:g2`, which a reader of `:g1` who sees every
 /// inference can't read. That reader asking `ASK { ex:a ex:p ex:b }` is answered `true` and
-/// told the same status, with the same EXPLAIN `ql`, in both stores.
+/// told the same in both stores: `not-certified` (under compact no view is its closure), in
+/// the header and EXPLAIN's `completeness`, with the same EXPLAIN `ql`.
 #[tokio::test]
 async fn a_compact_visible_reader_is_told_the_same_whether_a_graph_it_cant_read_holds_anything()
 -> TestResult {
@@ -270,7 +277,14 @@ async fn a_compact_visible_reader_is_told_the_same_whether_a_graph_it_cant_read_
         let ask = "ASK { ex:a ex:p ex:b }";
         seen.push(told(&app, READER, ask, &format!("{store} visible reader")).await?);
     }
-    assert!(seen[0].0, "store 1 answered false");
+    for told in &seen {
+        let (answer, header, _, explained) = told;
+        assert_eq!(
+            (*answer, header.as_str(), explained.as_str()),
+            (true, "not-certified", "not-certified"),
+            "store 1, then store 2: {seen:?}"
+        );
+    }
     assert_eq!(seen[0], seen[1], "store 1, then store 2");
     Ok(())
 }
