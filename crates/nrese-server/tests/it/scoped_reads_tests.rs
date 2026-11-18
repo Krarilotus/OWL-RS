@@ -7,12 +7,13 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::response::Response;
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
+use nrese_server::build_app;
 use nrese_store::StoreConfig;
 use serde_json::Value;
 use tower::util::ServiceExt;
 
 use crate::access_control_tests::{policy_of, token};
-use crate::support::{body_text, test_app_with_store_config};
+use crate::support::{body_text, test_app_with_store_config, test_state_with_store_config};
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 type Rows = Result<Vec<String>, (StatusCode, String)>;
@@ -173,6 +174,119 @@ async fn derivation_uses_only_dataset_graphs() -> TestResult {
     let one = select(&app, &[], SCOPED, "?s", G1, CONCLUSION).await?;
     let both = select(&app, &[], SCOPED, "?s", BOTH, CONCLUSION).await?;
     assert_eq!((one.rows(), both.rows()), (bindings(&[]), bindings(&[A])));
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_default_omits_assertions_in_unselected_graphs() -> TestResult {
+    // Spec: An unrestricted reader's scoped default graph contains assertions from
+    // the selected graphs only.
+    let app = app(StoreConfig::default(), false)?;
+    insert(&app, &format!("{SPLIT} GRAPH :g3 {{ ex:z ex:p ex:b }}")).await?;
+    let reply = select(&app, &[], SCOPED, "?s", G1, "{ ?s ex:p ex:b }").await?;
+    assert_eq!(reply.rows(), bindings(&[A]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn protocol_dataset_overrides_from_for_scoped_inference() -> TestResult {
+    // Spec: Under dataset scoping, protocol graph parameters replace FROM both
+    // for premises and for the default scan.
+    let app = app(StoreConfig::default(), false)?;
+    insert(&app, SPLIT).await?;
+    let from = select(&app, &[], SCOPED, "?s", BOTH, CONCLUSION).await?;
+    let protocol = serde_urlencoded::to_string([
+        ("inference-scope", "dataset"),
+        ("default-graph-uri", "urn:graph:g1"),
+    ])?;
+    let overridden = select(&app, &[], &format!("?{protocol}"), "?s", BOTH, CONCLUSION).await?;
+    assert_eq!(
+        (from.rows(), overridden.rows()),
+        (bindings(&[A]), bindings(&[]))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn rdf4j_get_applies_dataset_scoped_inference() -> TestResult {
+    // Spec: RDF4J repository GET takes the option, returns the scoped conclusion
+    // and reports it as not-certified.
+    let app = app(StoreConfig::default(), false)?;
+    insert(&app, SPLIT).await?;
+    let query = format!("{PREFIXES} SELECT ?s {BOTH} WHERE {CONCLUSION}");
+    let parameters =
+        serde_urlencoded::to_string([("query", query.as_str()), ("inference-scope", "dataset")])?;
+    let reply = Reply::read(
+        send(
+            &app,
+            &[],
+            Method::GET,
+            &format!("/repositories/nrese?{parameters}"),
+            "",
+            String::new(),
+        )
+        .await?,
+    )
+    .await?;
+    assert_eq!(
+        (reply.rows(), reply.completeness.as_deref()),
+        (bindings(&[A]), Some("not-certified"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_support_past_the_cap_matches_the_independent_repository() -> TestResult {
+    // Spec: When the support-set cap omits the selected derivation, the scoped
+    // result still matches a repository holding only the selected graphs.
+    let config = StoreConfig {
+        support_sets: 1,
+        union_default_graph: true,
+        ..StoreConfig::default()
+    };
+    let state = test_state_with_store_config(
+        config.clone(),
+        Default::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+    )?;
+    let store = state.store();
+    let full = build_app(state);
+    let oracle = app(config, false)?;
+    // The smaller graph name comes first when the cap keeps just one of the two
+    // equally sized supports. Both derivations use the axiom in :g2.
+    insert(&full, &format!("GRAPH :g0 {{ ex:a ex:p ex:b }} {SPLIT}")).await?;
+    insert(&oracle, SPLIT).await?;
+    let before = store.support_statistics().closures;
+    let scoped = select(&full, &[], SCOPED, "?s", BOTH, CONCLUSION).await?;
+    let reference = select(&oracle, &[], "", "?s", "", CONCLUSION).await?;
+    assert_eq!(
+        (scoped.rows(), reference.rows()),
+        (bindings(&[A]), bindings(&[A]))
+    );
+    assert!(
+        store.support_statistics().closures > before,
+        "the capped fixture must exercise the closure fallback"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_support_counts_same_as_premises() -> TestResult {
+    // Spec: Expanded equality can substitute a term when its sameAs premise is
+    // in the effective dataset.
+    let app = app(StoreConfig::default(), false)?;
+    insert(
+        &app,
+        &format!("{G1_FACT} GRAPH :g2 {{ ex:a <http://www.w3.org/2002/07/owl#sameAs> ex:z }}"),
+    )
+    .await?;
+    let pattern = "{ ?s ex:p ex:b }";
+    let one = select(&app, &[], SCOPED, "?s", G1, pattern).await?;
+    let both = select(&app, &[], SCOPED, "?s", BOTH, pattern).await?;
+    assert_eq!(
+        (one.rows(), both.rows()),
+        (bindings(&[A]), bindings(&[A, "<urn:ex:z>"]))
+    );
     Ok(())
 }
 
@@ -660,7 +774,7 @@ async fn a_dataset_cannot_widen_a_readers_access() -> TestResult {
 }
 
 #[tokio::test]
-async fn result_cache_separates_both_read_orders() -> TestResult {
+async fn scoped_view_identity_keeps_cached_reads_separate_in_both_orders() -> TestResult {
     // Spec: Starting with either request, cached plain and scoped reads of the same
     // query keep their own rows, including for a supported reader of the selected graph.
     let mut compared = Vec::new();
@@ -722,6 +836,32 @@ async fn compact_equality_names_the_unsupported_setting() -> TestResult {
 }
 
 #[tokio::test]
+async fn hidden_reader_gets_scoped_assertions_under_compact_equality() -> TestResult {
+    // Spec: A reader whose policy hides inferences gets the scoped asserted merge
+    // even when compact equality would prevent a scoped inference view.
+    let app = test_app_with_store_config(
+        StoreConfig {
+            equality_compact: true,
+            ..StoreConfig::default()
+        },
+        policy_of(&POLICY.replace("inferred = \"supported\"", "inferred = \"hidden\""))?,
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+    )?;
+    insert(&app, INSIDE).await?;
+    let reply = select(
+        &app,
+        READER,
+        SCOPED,
+        "?p",
+        G1,
+        "{ ex:a ?p ex:b VALUES ?p { ex:p ex:q } }",
+    )
+    .await?;
+    assert_eq!(reply.rows(), bindings(&[P]));
+    Ok(())
+}
+
+#[tokio::test]
 async fn unnamed_class_skipping_refuses_dataset_scoped_inference() -> TestResult {
     // Spec: With reasoner.unnamed_classes set to "skip", a scoped read returns
     // 501 with a problem type naming that setting.
@@ -770,57 +910,42 @@ const GEO: &str = "GRAPH :g1 {
 }";
 
 #[tokio::test]
-async fn scoped_reads_refuse_reader_ranked_search() -> TestResult {
-    // Spec: A scoped read that uses reader-ranked search returns 501 and identifies
-    // the search_scope setting in its problem type.
-    let app = app(
-        StoreConfig {
-            search_scope: nrese_store::SearchScope::Reader,
-            ..StoreConfig::default()
-        },
-        false,
-    )?;
-    insert(&app, "GRAPH :g1 { ex:a ex:p \"alpha\" }").await?;
-    let reply = select(
-        &app,
-        &[],
-        SCOPED,
-        "?text",
-        G1,
-        "{ ?text <http://www.bigdata.com/rdf/search#search> \"alpha\" }",
-    )
-    .await?;
-    assert_eq!(reply.code, StatusCode::NOT_IMPLEMENTED, "{reply:?}");
-    assert!(
-        reply.json()["type"]
-            .as_str()
-            .is_some_and(|kind| kind.contains("search_scope")),
-        "{reply:?}"
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn scoped_reads_refuse_global_text_search() -> TestResult {
-    // Spec: A scoped text search in global mode returns 501 and names the search setting.
-    let app = app(StoreConfig::default(), false)?;
-    insert(&app, "GRAPH :g1 { ex:a ex:p \"alpha\" }").await?;
-    let reply = select(
-        &app,
-        &[],
-        SCOPED,
-        "?text",
-        G1,
-        "{ ?text <http://www.bigdata.com/rdf/search#search> \"alpha\" }",
-    )
-    .await?;
-    assert_eq!(reply.code, StatusCode::NOT_IMPLEMENTED, "{reply:?}");
-    assert!(
-        reply.json()["type"]
-            .as_str()
-            .is_some_and(|kind| kind.contains("search")),
-        "{reply:?}"
-    );
+async fn scoped_reads_refuse_text_search_in_either_ranking_mode() -> TestResult {
+    // Spec: A scoped text search returns 501 and names the search setting in both
+    // ranking modes.
+    for search_scope in [
+        nrese_store::SearchScope::Global,
+        nrese_store::SearchScope::Reader,
+    ] {
+        let app = app(
+            StoreConfig {
+                search_scope,
+                ..StoreConfig::default()
+            },
+            false,
+        )?;
+        insert(&app, "GRAPH :g1 { ex:a ex:p \"alpha\" }").await?;
+        let reply = select(
+            &app,
+            &[],
+            SCOPED,
+            "?text",
+            G1,
+            "{ ?text <http://www.bigdata.com/rdf/search#search> \"alpha\" }",
+        )
+        .await?;
+        assert_eq!(
+            reply.code,
+            StatusCode::NOT_IMPLEMENTED,
+            "{search_scope:?}: {reply:?}"
+        );
+        assert!(
+            reply.json()["type"]
+                .as_str()
+                .is_some_and(|kind| kind.contains("search_scope")),
+            "{search_scope:?}: {reply:?}"
+        );
+    }
     Ok(())
 }
 

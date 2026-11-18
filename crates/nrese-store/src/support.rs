@@ -2010,6 +2010,9 @@ impl Reading {
         {
             return Err(StoreError::NotRematerialised { replica });
         }
+        if model == ReadModel::Asserted {
+            return Ok(snapshot.clone());
+        }
         if self.compilation.compact {
             return Err(ScopedInferenceUnavailable("reasoner.equality").into());
         }
@@ -2018,9 +2021,6 @@ impl Reading {
         }
         if generation.rules.is_none() {
             return Err(ScopedInferenceUnavailable("reasoner.mode").into());
-        }
-        if model == ReadModel::Asserted {
-            return Ok(snapshot.clone());
         }
         Ok(self.committed(snapshot)?)
     }
