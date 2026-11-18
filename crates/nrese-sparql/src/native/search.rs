@@ -142,6 +142,17 @@ pub(super) fn is_search(triple: &TriplePattern, triples: &[TriplePattern]) -> bo
             }))
 }
 
+/// Whether `pattern` holds a search anywhere, in an `EXISTS` too. A search reads the group
+/// it is written in whole, which the rewrites and routes that move triple patterns between
+/// groups don't know: such a query is evaluated as written ([`Context::for_query`]).
+pub(super) fn anywhere(pattern: &nrese_sparql_syntax::algebra::GraphPattern) -> bool {
+    use nrese_sparql_syntax::{algebra::GraphPattern, visit::Node};
+    pattern.find(&mut |node| {
+        matches!(node, Node::Pattern(GraphPattern::Bgp { patterns })
+            if patterns.iter().any(|t| is_search(t, patterns)))
+    })
+}
+
 /// A `text:query`, or a GraphDB `luc:` search (`?x luc:index "query"`).
 fn is_jena(triple: &TriplePattern) -> bool {
     matches!(&triple.predicate, NamedNodePattern::NamedNode(n) if n.as_str() == JENA_QUERY)

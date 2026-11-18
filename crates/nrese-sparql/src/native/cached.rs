@@ -374,12 +374,7 @@ pub(crate) fn output_key(
     if options.pre_bound.is_some() {
         return None;
     }
-    let ctx = Context::new(
-        snapshot,
-        options,
-        super::query_dataset(query),
-        super::query_base(query),
-    );
+    let ctx = Context::for_query(snapshot, query, options);
     // A canonical view the budgets refused: the answer is that refusal, never a cached one
     // (the context reads the snapshot as given meanwhile).
     if ctx.canonical_refused.is_some() {

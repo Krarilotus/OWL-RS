@@ -254,7 +254,7 @@ fn run(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<(Outcome, Reservation), QueryEvaluationError> {
-    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let ctx = Context::for_query(snapshot, query, options);
     let (solutions, form) = match index_answer(&ctx, query, options) {
         Some(solutions) => (solutions?, Form::Select),
         None => {
@@ -336,7 +336,7 @@ pub(crate) fn explain(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<ExplainParts, QueryEvaluationError> {
-    let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let mut ctx = Context::for_query(snapshot, query, options);
     let begun = Instant::now();
     if let Some(solutions) = index_answer(&ctx, query, options) {
         let rows = solutions?.table.len();
@@ -380,7 +380,7 @@ pub(crate) fn plan(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<PlanParts, QueryEvaluationError> {
-    let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let mut ctx = Context::for_query(snapshot, query, options);
     let (pattern, _, rewrites, ql) = native_pattern(query, options, &ctx)?;
     // Traced for the BGPs planned without the characteristic sets ([`Context::with_sets`]):
     // their notes follow the plan's nodes, in the order planned.
@@ -452,7 +452,7 @@ pub(crate) fn write_results(
         Query::Ask { .. } if format != ResultsFormat::Json => return None,
         _ => {}
     }
-    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let ctx = Context::for_query(snapshot, query, options);
     let evaluated = match index_answer(&ctx, query, options) {
         Some(solutions) => solutions.map(|solutions| (solutions, Form::Select)),
         None => match native_pattern(query, options, &ctx) {
@@ -572,8 +572,13 @@ pub(crate) fn delete_insert(
     if let Some(what) = unsupported_part(pattern) {
         return Err(QueryEvaluationError::Unsupported(what));
     }
-    let ctx = Context::new(snapshot, options, using, base);
-    let pattern = optimise(pattern.clone(), &mut Vec::new(), &ctx);
+    let mut ctx = Context::new(snapshot, options, using, base);
+    let searched = search::anywhere(pattern);
+    ctx.as_written |= searched;
+    let pattern = match searched {
+        true => pattern.clone(),
+        false => optimise(pattern.clone(), &mut Vec::new(), &ctx),
+    };
     let solutions = ctx.eval(&pattern)?;
     let mut changes = QuadChanges::new(&ctx.budget);
     let memory = QueryEvaluationError::MemoryLimit;
@@ -770,14 +775,14 @@ fn native_pattern<'q>(
     } else {
         (pattern, form)
     };
-    let pattern = if options.as_written {
+    let pattern = if ctx.as_written {
         pattern
     } else {
         optimised(pattern, &mut rewrites, ctx)
     };
     // ASK needs one solution: LIMIT 1 lets the evaluation stop at it.
     let pattern = match form {
-        Form::Ask if !options.as_written => {
+        Form::Ask if !ctx.as_written => {
             rewrites.push("ask-limit");
             Cow::Owned(GraphPattern::Slice {
                 inner: Box::new(pattern.into_owned()),
@@ -1672,6 +1677,13 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// [`Self::new`] for `query`, as written where it holds a search ([`search::anywhere`]).
+    fn for_query(snapshot: &'a Snapshot, query: &Query, options: &QueryOptions) -> Self {
+        let mut ctx = Self::new(snapshot, options, query_dataset(query), query_base(query));
+        ctx.as_written |= search::anywhere(pattern_and_form(query).0);
+        ctx
+    }
+
     /// `dataset` is the query's own (`FROM`); the protocol's, in `options`, replaces it.
     fn new(
         snapshot: &'a Snapshot,
@@ -2310,7 +2322,11 @@ impl<'a> Context<'a> {
                     .filter(|&(i, _)| i != at)
                     .map(|(_, input)| input.clone())
                     .collect();
-                let local = GraphPattern::join_all(others);
+                // As written, the groups stay apart (`join_all` merges leading ones).
+                let local = match self.as_written && others.len() > 1 {
+                    true => GraphPattern::Join { inputs: others },
+                    false => GraphPattern::join_all(others),
+                };
                 if vectors::is_search(name) {
                     return self.vector_join(&local, inner);
                 }
