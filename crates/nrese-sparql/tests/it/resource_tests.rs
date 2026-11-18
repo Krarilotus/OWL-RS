@@ -491,3 +491,57 @@ fn a_late_expansion_past_memory_fails_the_query() {
         panic!("{limit:?} bytes: {rows} rows, past what memory holds");
     }
 }
+
+/// A query whose join would produce more rows than its memory holds is refused as before,
+/// and the refusal names what was asked: the rows the join would produce and the rows its
+/// memory has room for, not an amount computed from that room. 200 rows `?x <urn:q> ?p`
+/// joined with an arm that shares no variable with them, 100 rows `?t <urn:c> ?u`: 20,000
+/// rows of four columns, past what 1 MiB holds.
+#[test]
+fn a_join_past_memory_names_its_rows_and_the_room() {
+    use nrese_rdf::{GraphName, NamedNode, Quad};
+    use nrese_sparql::QueryEvaluationError;
+
+    let node = |name: String| NamedNode::new_unchecked(format!("urn:{name}"));
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..200 {
+        let (s, o) = (node(format!("x{i}")), node(format!("p{}", i % 50)));
+        tx.insert(Quad::new(s, node("q".into()), o, GraphName::DefaultGraph).as_ref());
+    }
+    for i in 0..100 {
+        let (s, o) = (node(format!("t{i}")), node(format!("u{i}")));
+        tx.insert(Quad::new(s, node("c".into()), o, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let mut wrong = Vec::new();
+    for query in [
+        "SELECT * WHERE { ?x <urn:q> ?p . { ?p <urn:n> ?n } UNION { ?t <urn:c> ?u } }",
+        "SELECT * WHERE { ?x <urn:q> ?p . OPTIONAL { ?t <urn:c> ?u } }",
+    ] {
+        let options = QueryOptions {
+            resources: Resources {
+                memory: nrese_exec::Envelope::new(Some(1 << 20), None),
+                ..Default::default()
+            },
+            ..QueryOptions::default()
+        };
+        let parsed = SparqlParser::new().parse_query(query).unwrap();
+        let message = match evaluate_query(&snapshot, &parsed, &options) {
+            Err(QueryEvaluationError::MemoryLimit(exceeded)) => exceeded.to_string(),
+            Err(other) => panic!("{query}: {other}"),
+            Ok(_) => panic!("{query}: answered within 1 MiB"),
+        };
+        // "… 20000 rows …, room for N …", N below 20,000.
+        let room = message
+            .split("room for ")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .and_then(|n| n.parse::<usize>().ok());
+        if !message.contains("20000 rows") || !room.is_some_and(|n| n < 20_000) {
+            wrong.push(format!("{query}: {message}"));
+        }
+    }
+    assert!(wrong.is_empty(), "\n{}", wrong.join("\n"));
+}
