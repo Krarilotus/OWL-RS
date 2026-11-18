@@ -1489,14 +1489,15 @@ fn a_read_whose_labels_have_no_room_needs_no_more_memory_than_without_them() {
     assert_eq!(detail.refuted_by_labels, 200, "with room, all 200");
 }
 
-/// Spec: the labels' quarter is taken from what the read has left, before their own work and
-/// the whole selection, never from a fresh clock: a read whose deadline has passed when it
-/// begins gives them no time, so no model is run. With `dl.timeout` an hour (a fresh quarter:
-/// 15 minutes) and a deadline passed before the read, over the 24 individuals with a candidate
-/// limit of 4: the read with the labels on is decided exactly as with them off, by its tests
-/// alone, which the deadline leaves undecided: none proved or refuted, none by labels, 12
-/// unresolved, not `complete`, the same status and detail. And the labels are live: the same
-/// read under the hour refutes all 12 by labels. Nothing waits; no time is measured.
+/// Spec: the labels' quarter is taken from what the read has left, never from a fresh clock: a
+/// read whose deadline has passed when it begins gives them no time, so no model is run. With
+/// `dl.timeout` an hour (a fresh quarter: 15 minutes) and a deadline passed before the read,
+/// over the 24 individuals with a candidate limit of 4: the read with the labels on is decided
+/// exactly as with them off, by its tests alone, which the deadline leaves undecided: none
+/// proved or refuted, none by labels, 12 unresolved, not `complete`, the same status and
+/// detail. And the labels are live: the same read under the hour refutes all 12 by labels.
+/// Nothing waits; no time is measured.
+// By reading only: the labels' deadline is fixed before `gap::select`, and `run.deadline` is set.
 #[test]
 fn a_read_whose_deadline_has_passed_gives_the_labels_no_time() {
     let read = |model_labels: bool, deadline: Deadline| {
