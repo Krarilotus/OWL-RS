@@ -427,7 +427,8 @@ stand, even where the case declares the outcome and every baseline is wrong too;
 losses as now, needs a named exception. A declared `memory-limit`, `gave-up`, `timeout`
 or `unsupported` blocks where a baseline completes. Where every side stops, it's listed in the
 verdict and doesn't block: only wrong answers disqualify, and the bar's time and memory loss
-rule. The verdict reads
+rule. An *accepted* entry waives nothing: it lists rows accepted for a release with the reading
+accepted (ratio and interval, on its tree), which the verdict prints beside the row's flag. The verdict reads
 the file at the candidate's commit, never from a report, and lists every entry it applied and
 every exception the candidate didn't need. The list starts empty.
 
