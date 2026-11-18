@@ -1706,14 +1706,15 @@ fn labels_store() -> (Arc<StoreService>, Vec<Vec<Option<Term>>>) {
 }
 
 /// The model's refutations over `rows` of `SELECT * { pattern }` in `store`, under `token` and
-/// `deadline`, with a fresh envelope: the mask, and the most the envelope held.
+/// `deadline`, with a fresh envelope: the mask; what the envelope held while the mask the call
+/// returned lived, then once it was dropped; and the most it held.
 fn labels_of(
     store: &StoreService,
     pattern: &str,
     rows: &[Vec<Option<Term>>],
     token: &CancellationToken,
     deadline: Deadline,
-) -> (Vec<bool>, usize) {
+) -> (Vec<bool>, (usize, usize), usize) {
     let request = crate::SparqlQueryRequest::all(format!("SELECT * {{ {pattern} }}"));
     let analysis = analyse(PreparedQuery::parse(&request).unwrap().query());
     let variables = analysis.shape.as_ref().unwrap().projected.clone();
@@ -1729,7 +1730,9 @@ fn labels_of(
         deadline,
         &memory,
     );
-    (mask, memory.peak())
+    let (alive, copy) = (memory.used(), mask.to_vec());
+    drop(mask);
+    (copy, (alive, memory.used()), memory.peak())
 }
 
 /// Spec: the model refutes only rows whose one test is `C(a)`, so a query whose atoms aren't all
@@ -1742,12 +1745,12 @@ fn labels_of(
 fn a_query_the_labels_cant_read_loads_and_charges_nothing() {
     let (store, rows) = labels_store();
     let (token, deadline) = (CancellationToken::new(), Deadline::after(None));
-    let (mask, peak) = labels_of(&store, "?x <urn:test:p> ?l", &rows, &token, deadline);
+    let (mask, _, peak) = labels_of(&store, "?x <urn:test:p> ?l", &rows, &token, deadline);
     println!("?x :p ?l: mask {mask:?}, the envelope's peak {peak}");
     assert!(mask.is_empty(), "no mask");
     assert_eq!(peak, 0, "nothing charged");
     let typed: Vec<_> = rows.iter().map(|r| r[..1].to_vec()).collect();
-    let (_, peak) = labels_of(&store, "?x a <urn:test:C>", &typed, &token, deadline);
+    let (_, _, peak) = labels_of(&store, "?x a <urn:test:C>", &typed, &token, deadline);
     println!("?x a :C: the envelope's peak {peak}");
     assert!(peak > 0, "the premise charged");
 }
@@ -1766,8 +1769,30 @@ fn labels_past_their_deadline_or_cancelled_load_and_charge_nothing() {
         (CancellationToken::new(), expired),
         (cancelled, Deadline::after(None)),
     ] {
-        let (mask, peak) = labels_of(&store, "?x a <urn:test:C>", &rows, &token, deadline);
+        let (mask, _, peak) = labels_of(&store, "?x a <urn:test:C>", &rows, &token, deadline);
         assert!(mask.is_empty(), "no mask");
         assert_eq!(peak, 0, "nothing charged");
     }
+}
+
+/// Spec: the mask the labels return is charged for as long as it lives, not only while it is
+/// built: over the unions store's 12 gap rows of `?x a :U0` (the individuals with `v2` and
+/// `v3`), all refuted by one model, the request's envelope holds at least the mask's 12 bytes
+/// while the caller holds it, and nothing once the caller drops it.
+#[test]
+fn the_labels_mask_is_charged_while_it_lives() {
+    use nrese_rdf::NamedNode;
+    let store = unions_store_with(crate::DlConfig::default(), 24, 0);
+    let iri = |k: usize| -> Term { NamedNode::new_unchecked(format!("urn:test:i{k}")).into() };
+    let rows: Vec<_> = (0..24)
+        .filter(|k| k % 4 >= 2)
+        .map(|k| vec![Some(iri(k))])
+        .collect();
+    let (token, deadline) = (CancellationToken::new(), Deadline::after(None));
+    let (mask, (alive, dropped), _) =
+        labels_of(&store, "?x a <urn:test:U0>", &rows, &token, deadline);
+    println!("mask {mask:?}; the envelope held {alive} bytes with it, {dropped} without");
+    assert_eq!(mask, vec![true; 12], "all 12 refuted by the model");
+    assert!(alive >= 12, "the mask's 12 bytes charged while it lives");
+    assert_eq!(dropped, 0, "nothing once it is dropped");
 }
