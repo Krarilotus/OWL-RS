@@ -58,6 +58,20 @@ def put(stat: Path, text: str):
     retrying(os.replace, new, stat)
 
 
+def readings(stat: Path, *texts: str):
+    """memory.stat as the sampler's reads find it, one text per read and the last from then on.
+    The kernel serves each read of it whole; a file replaced under a reader polling every
+    millisecond can't promise that on Windows, which refuses a read that meets the replacement."""
+    real, left = Path.read_text, list(texts)
+
+    def read_text(path, *args, **kwargs):
+        if Path(path) != stat:
+            return real(path, *args, **kwargs)
+        return left.pop(0) if len(left) > 1 else left[0]
+
+    return patch.object(Path, "read_text", read_text)
+
+
 class CgroupOfAProcess(unittest.TestCase):
     def test_the_v2_line_names_the_directory_and_nothing_else_does(self):
         """Linux's cgroup v2 (Documentation/admin-guide/cgroup-v2.rst, "/proc/$PID/cgroup"): one line
@@ -86,16 +100,13 @@ class ContainerMemoryPeak(unittest.TestCase):
         = 350, then 10 + 1 = 11. The peak is 350 bytes, though the file cache was largest first."""
         with tempfile.TemporaryDirectory() as tmp:
             stat = Path(tmp) / "memory.stat"
-            stat.write_text("anon 100\nfile 9000\nkernel 20\n", encoding="utf-8")
-            sampler = runtime.ContainerMemory("c", locate=lambda: Path(tmp), period_s=0.001)
-            try:
-                self.wait_for(sampler, 1)
-                put(stat, "anon 300\nfile 1\nkernel 50\n")
-                self.wait_for(sampler, sampler.reads + 2)
-                put(stat, "anon 10\nfile 1\nkernel 1\n")
-                self.wait_for(sampler, sampler.reads + 2)
-            finally:
-                peak = sampler.stop()
+            with readings(stat, "anon 100\nfile 9000\nkernel 20\n", "anon 300\nfile 1\nkernel 50\n",
+                          "anon 10\nfile 1\nkernel 1\n"):
+                sampler = runtime.ContainerMemory("c", locate=lambda: Path(tmp), period_s=0.001)
+                try:
+                    self.wait_for(sampler, 4)
+                finally:
+                    peak = sampler.stop()
         self.assertEqual(peak, 350)
 
     def test_a_container_without_a_readable_cgroup_has_no_peak_and_says_why(self):
@@ -113,14 +124,12 @@ class ContainerMemoryPeak(unittest.TestCase):
         first are missing, so 120 is no peak; there is none, and why names the fault."""
         with tempfile.TemporaryDirectory() as tmp:
             stat = Path(tmp) / "memory.stat"
-            stat.write_text("anon 100\nkernel 20\n", encoding="utf-8")
-            sampler = runtime.ContainerMemory("c", locate=lambda: Path(tmp), period_s=0.001)
-            try:
-                self.wait_for(sampler, 1)
-                put(stat, "anon 300\nkernel x\n")
-                sampler.thread.join(timeout=5)
-            finally:
-                peak = sampler.stop()
+            with readings(stat, "anon 100\nkernel 20\n", "anon 300\nkernel x\n"):
+                sampler = runtime.ContainerMemory("c", locate=lambda: Path(tmp), period_s=0.001)
+                try:
+                    sampler.thread.join(timeout=5)
+                finally:
+                    peak = sampler.stop()
         self.assertIsNone(peak)
         self.assertIn("ValueError", sampler.why)
 
