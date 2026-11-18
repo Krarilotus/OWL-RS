@@ -1143,44 +1143,42 @@ fn a_typed_answer_from_the_cache_carries_its_own_readers_status() {
     }
 }
 
-/// Spec: crates/nrese-store/src/service.rs (`status_without_dl`): what a prepared query's
-/// reader is told before it runs is what its read is told, of the view it reads. Under
-/// compact equality a reader by support reads a withheld view (no sets, so not its closure):
-/// both `not-certified`. Its scoped read (`inference-scope=dataset`) is refused there, and
-/// before it the reader is told `not-certified`, not no status. Without compact equality its
-/// scoped read is told a status, the one it is told before it.
+/// Spec: crates/nrese-store/src/service.rs (`status_without_dl`): before a read, a reader by
+/// support is told `not-certified`, as its read's status is its view's: under compact
+/// equality what its read is told too, and under the default equality as well. The reader of
+/// `ex:open` who sees every inference without support is told the closure's status
+/// unchanged, the reader of every graph's: the fixture's `sound-only` under `owl2-rl`. Asking
+/// builds nothing: the support state is as cold after it as before.
 #[test]
-fn a_supported_readers_status_before_its_read_is_its_reads() {
-    let unscoped = format!("PREFIX ex: <{EX}> SELECT ?o WHERE {{ ex:a ex:p ?o }}");
-    let scoped = format!("PREFIX ex: <{EX}> SELECT ?o FROM ex:open WHERE {{ ex:a ex:p ?o }}");
-    let told = |compact: bool, query: &str, in_scope: bool| {
-        let store = reasoned_store(compact, "GRAPH ex:open { ex:a ex:p ex:b }");
-        let mut request = SparqlQueryRequest::new(query.to_owned(), reader(true));
-        request.inference_scope_dataset = in_scope;
+fn a_status_before_a_read_withholds_only_a_supported_readers_and_builds_nothing() {
+    let select = format!("PREFIX ex: <{EX}> SELECT ?o WHERE {{ ex:a ex:p ?o }}");
+    let data = "GRAPH ex:open { ex:a ex:p ex:b }";
+    let before = |store: &StoreService, scope: ReadScope| {
+        let request = SparqlQueryRequest::new(select.clone(), scope);
         let prepared = store.prepare_query(&request).unwrap();
-        let before = store.status_without_dl(&prepared).map(|c| c.header());
-        let read = store.execute_query(&request);
-        (
-            before,
-            read.map(|r| r.completeness.map(|c| c.header()))
-                .map_err(|e| e.to_string()),
-        )
+        store.status_without_dl(&prepared).map(|c| c.header())
     };
+    let compact = reasoned_store(true, data);
+    let request = SparqlQueryRequest::new(select.clone(), reader(true));
+    let read = compact.execute_query(&request).unwrap().completeness;
+    let compact = (before(&compact, reader(true)), read.map(|c| c.header()));
+    let store = reasoned_store(false, data);
+    let cold = store.support_statistics();
+    let (supported, visible) = (before(&store, reader(true)), before(&store, reader(false)));
+    let warmed = store.support_statistics() != cold;
+    let every = before(&store, ReadScope::All);
+    let rl = every
+        .as_deref()
+        .is_some_and(|s| s.split("; ").take(2).eq(["sound-only", "regime=owl2-rl"]));
     let withheld = Some("not-certified".to_owned());
-    let (before, read) = told(true, &unscoped, false);
+    let right = compact == (withheld.clone(), withheld.clone())
+        && supported == withheld
+        && rl
+        && visible == every
+        && !warmed;
     assert!(
-        before == withheld && read == Ok(withheld.clone()),
-        "compact: {before:?}, {read:?}"
-    );
-    let (before, read) = told(true, &scoped, true);
-    assert!(
-        before == withheld && read.is_err(),
-        "compact, scoped: {before:?}, {read:?}"
-    );
-    let (before, read) = told(false, &scoped, true);
-    assert!(
-        before.is_some() && read == Ok(before.clone()),
-        "scoped: {before:?}, {read:?}"
+        right,
+        "compact {compact:?}; supported {supported:?}; visible {visible:?}; every {every:?};          warmed {warmed}"
     );
 }
 
