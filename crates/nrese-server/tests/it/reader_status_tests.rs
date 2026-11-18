@@ -61,6 +61,8 @@ fn told(answer: bool, status: &str, report: Option<bool>) -> Told {
     }
 }
 
+/// `body` sent by `roles`: an update to the update endpoint, a query in a POST to any other,
+/// and none in a PUT (an RDF4J transaction's action, its query in `uri`).
 async fn send(
     app: &Router,
     roles: &[&str],
@@ -68,14 +70,19 @@ async fn send(
     uri: &str,
     body: String,
 ) -> TestResult<axum::response::Response> {
-    let request = Request::builder()
-        .method(method)
+    let mut request = Request::builder()
+        .method(method.clone())
         .uri(uri)
-        .header(header::CONTENT_TYPE, "application/sparql-query")
         .header(header::ACCEPT, "application/sparql-results+json")
-        .header(header::AUTHORIZATION, format!("Bearer {}", token(roles)))
-        .body(Body::from(body))?;
-    Ok(app.clone().oneshot(request).await?)
+        .header(header::AUTHORIZATION, format!("Bearer {}", token(roles)));
+    if method == Method::POST {
+        let content_type = match uri {
+            "/dataset/update" => "application/sparql-update",
+            _ => "application/sparql-query",
+        };
+        request = request.header(header::CONTENT_TYPE, content_type);
+    }
+    Ok(app.clone().oneshot(request.body(Body::from(body))?).await?)
 }
 
 /// The JSON body of `response` (200 asserted) and its `NRESE-Completeness`'s first word.
