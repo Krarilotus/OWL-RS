@@ -146,6 +146,53 @@ impl HeldCall {
         }
     }
 
+    /// Answers the call as an endpoint would, with one solution that binds nothing, once its
+    /// request is read whole (its head, then a body of its `content-length`).
+    pub async fn answer(self) -> Result<(), Box<dyn Error>> {
+        tokio::time::timeout(HANG, self.answering())
+            .await
+            .map_err(|_| format!("the SERVICE call's request didn't end in {HANG:?}"))?
+    }
+
+    async fn answering(self) -> Result<(), Box<dyn Error>> {
+        let (mut request, mut buffer) = (Vec::new(), [0u8; 4096]);
+        loop {
+            if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                let head = String::from_utf8_lossy(&request[..end]).to_ascii_lowercase();
+                let length = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(Ok(0), |n| n.trim().parse::<usize>())?;
+                if request.len() >= end + 4 + length {
+                    break;
+                }
+            }
+            self.0.readable().await?;
+            match self.0.try_read(&mut buffer) {
+                Ok(0) => return Err("the call closed before its request ended".into()),
+                Ok(read) => request.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        let body = r#"{"head":{"vars":["x"]},"results":{"bindings":[{}]}}"#;
+        let response = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/sparql-results+json\r\n\
+             content-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut rest = response.as_bytes();
+        while !rest.is_empty() {
+            self.0.writable().await?;
+            match self.0.try_write(rest) {
+                Ok(written) => rest = &rest[written..],
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {}
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
     /// Waits until the caller closes the connection.
     pub async fn closed(self) -> Result<(), Box<dyn Error>> {
         tokio::time::timeout(HANG, self.closing())

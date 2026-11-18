@@ -54,6 +54,9 @@ pub enum ApiError {
     /// Busy for now: 503 with `Retry-After`, to be tried again shortly.
     #[error("busy: {0}")]
     Busy(String),
+    /// The requester's rights changed while its write waited: 503, `Retry-After`, `rights-changed`.
+    #[error("rights changed: {0}")]
+    RightsChanged(String),
     #[error("internal server error: {0}")]
     Internal(String),
 }
@@ -172,6 +175,7 @@ impl IntoResponse for ApiError {
                 }),
             );
         }
+        let rights_changed = matches!(self, Self::RightsChanged(_));
         if let Self::Busy(detail) = self {
             let mut response = Self::ServiceUnavailable(detail).into_response();
             response
@@ -209,7 +213,9 @@ impl IntoResponse for ApiError {
             Self::PayloadTooLarge(detail) => (StatusCode::PAYLOAD_TOO_LARGE, detail, None),
             Self::TooManyRequests(detail) => (StatusCode::TOO_MANY_REQUESTS, detail, None),
             Self::Timeout(detail) => (StatusCode::REQUEST_TIMEOUT, detail, None),
-            Self::ServiceUnavailable(detail) => (StatusCode::SERVICE_UNAVAILABLE, detail, None),
+            Self::ServiceUnavailable(detail) | Self::RightsChanged(detail) => {
+                (StatusCode::SERVICE_UNAVAILABLE, detail, None)
+            }
             Self::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail, None),
         };
         let (problem_type, title) = match rejected {
@@ -220,6 +226,10 @@ impl IntoResponse for ApiError {
                     Cow::Borrowed(title),
                 )
             }
+            None if rights_changed => (
+                Cow::Borrowed("https://nrese.dev/problems/rights-changed"),
+                Cow::Borrowed("Rights Changed"),
+            ),
             None => kind(status),
         };
         let mut response = problem(
@@ -237,6 +247,10 @@ impl IntoResponse for ApiError {
                 header::WWW_AUTHENTICATE,
                 HeaderValue::from_static(challenge),
             );
+        }
+        if rights_changed {
+            let retry = HeaderValue::from_static("1");
+            response.headers_mut().insert(header::RETRY_AFTER, retry);
         }
         response
     }

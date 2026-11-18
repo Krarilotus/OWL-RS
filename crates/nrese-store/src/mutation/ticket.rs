@@ -3,6 +3,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use nrese_sparql::CancellationToken;
 
+type RightsHeld<'a> = std::sync::RwLockReadGuard<'a, Arc<crate::access::AccessState>>;
+
 const PENDING: u8 = 0;
 const COMMITTING: u8 = 1;
 const CANCELLED: u8 = 2;
@@ -21,6 +23,8 @@ const CANCELLED: u8 = 2;
 pub struct MutationTicket {
     state: Arc<AtomicU8>,
     evaluation: CancellationToken,
+    /// The write's rights, checked again where it publishes (none: the store's owner's).
+    rights: Option<crate::access::RightsCheck>,
 }
 
 impl std::fmt::Debug for MutationTicket {
@@ -34,6 +38,22 @@ impl std::fmt::Debug for MutationTicket {
 impl MutationTicket {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The ticket of a write that publishes only while `rights` still hold.
+    pub fn checking(rights: Option<crate::access::RightsCheck>) -> Self {
+        Self {
+            rights,
+            ..Self::default()
+        }
+    }
+
+    /// The access state's read guard while the write's rights hold, for its publication.
+    pub(crate) fn hold_rights(&self) -> Result<Option<RightsHeld<'_>>, super::MutationError> {
+        self.rights
+            .as_ref()
+            .map(|rights| rights.hold().ok_or(super::MutationError::RightsChanged))
+            .transpose()
     }
 
     /// Cancels the mutation unless its commit has already started.

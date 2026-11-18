@@ -38,7 +38,7 @@ use nrese_rdf::{GraphName, Literal, Term};
 
 use crate::access::AccessView;
 use nrese_store::{
-    MutationCommand, RdfPayload, SparqlUpdateRequest, StatementOp, StatementPattern,
+    MutationCommand, RdfPayload, SparqlUpdateRequest, StatementOp, StatementOps, StatementPattern,
     StatementsRequest,
 };
 
@@ -187,13 +187,25 @@ pub(crate) async fn apply(
     mutation::run(
         state,
         MutationCommand::Statements(StatementsRequest::new(ops)),
-        access.requester(),
+        access,
         state.policy().timeouts.update,
         "statement operation exceeded policy timeout",
     )
     .await
     .map(|_| ())
 }
+
+/// [`apply`] of a client transaction's commit, which ends it: so changed rights answer 409.
+pub(crate) async fn commit(state: &AppState, ops: StatementOps, access: &AccessView) -> Ended {
+    match apply(state, ops, access).await {
+        Err(ApiError::RightsChanged(_)) => Err(ApiError::conflict(
+            "the requester's rights changed while the transaction committed, and nothing was written: begin a new transaction",
+        )),
+        other => other,
+    }
+}
+
+type Ended = Result<(), ApiError>;
 
 /// A table of terms as SPARQL results, JSON unless the client prefers XML.
 fn table(headers: &HeaderMap, vars: &[&str], rows: Vec<Vec<Option<Term>>>) -> Response {
@@ -904,7 +916,7 @@ pub async fn transaction_action(
             let pending = sessions
                 .take(&txid, owner)
                 .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
-            apply(&state, pending.ops, &access).await?;
+            commit(&state, pending.ops, &access).await?;
             Ok(StatusCode::OK.into_response())
         }
         "PING" => Ok(text(sessions.idle().as_millis().to_string())),

@@ -443,6 +443,8 @@ impl MutationPipeline {
             // the commit changes of individuals' memberships of class expressions, before the
             // commit publishes.
             let ql = crate::service::Certificate::of(tx.base()).and_then(|c| c.ql.clone());
+            // Its rights hold from here through the publication (contracts.md, lock order).
+            let rights = ticket.hold_rights()?;
             // In quarantine the commit checks only its own facts: its version keeps no
             // assessment of its consistency. The mark rises first (odd: unassessed), then the
             // old assessment and its marker go, before the commit publishes: a removal that
@@ -464,6 +466,7 @@ impl MutationPipeline {
                 kind,
                 source: StoreError::Engine(error),
             })?;
+            drop(rights);
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
             }
@@ -526,10 +529,12 @@ impl MutationPipeline {
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
         }
+        let rights = ticket.hold_rights()?;
         let summary = tx.commit().map_err(|error| MutationError::Store {
             kind,
             source: StoreError::Engine(error),
         })?;
+        drop(rights);
         Ok(report.committed(summary.revision))
     }
 
