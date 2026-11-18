@@ -104,6 +104,9 @@ pub struct SparqlQueryRequest {
     pub scope: crate::ReadScope,
     /// Under `owl2-dl`: which answers this query asks for, over `dl.answers`.
     pub dl_answers: Option<crate::DlAnswers>,
+    /// Under `owl2-dl`: when the request's time is up (`None`: `dl.timeout` alone). At it a
+    /// read is told incomplete with the rows it has, not stopped: a stop is the cancellation.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl SparqlQueryRequest {
@@ -124,6 +127,7 @@ impl SparqlQueryRequest {
             as_written: false,
             scope,
             dl_answers: None,
+            deadline: None,
         }
     }
 }
