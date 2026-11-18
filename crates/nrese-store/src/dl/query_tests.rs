@@ -1293,11 +1293,21 @@ fn padded_unions_store(model_labels: bool, n: usize, pad: usize) -> Arc<StoreSer
 
 /// [`padded_unions_store`] under the DL settings `dl`.
 fn unions_store_with(dl: crate::DlConfig, n: usize, pad: usize) -> Arc<StoreService> {
-    let mut data = include_str!("../../tests/it/dl/model_labels_unions.ttl").to_owned();
+    let mut data = String::new();
     for k in 0..n {
         let pad = "x".repeat(if k % 4 < 2 { 0 } else { pad });
         data.push_str(&format!(":i{k}{pad} :val :v{} .\n", k % 4));
     }
+    unions_store_of(dl, &data)
+}
+
+/// The unions of `tests/it/dl/model_labels_unions.ttl` with the individuals `data` states,
+/// committed in that order, under the DL settings `dl`.
+fn unions_store_of(dl: crate::DlConfig, data: &str) -> Arc<StoreService> {
+    let data = format!(
+        "{}{data}",
+        include_str!("../../tests/it/dl/model_labels_unions.ttl")
+    );
     let config = crate::StoreConfig {
         dl,
         ..crate::StoreConfig::in_memory()
@@ -1313,7 +1323,16 @@ type Read = (
 
 /// `SELECT ?x { ?x a :U0 }` over `store` within `memory` bytes.
 fn unions_read(store: &StoreService, memory: Option<usize>) -> crate::StoreResult<Read> {
-    let mut request = crate::SparqlQueryRequest::all("SELECT ?x { ?x a <urn:test:U0> }");
+    unions_read_of(store, "?x a <urn:test:U0>", memory)
+}
+
+/// `SELECT ?x { pattern }` over `store` within `memory` bytes.
+fn unions_read_of(
+    store: &StoreService,
+    pattern: &str,
+    memory: Option<usize>,
+) -> crate::StoreResult<Read> {
+    let mut request = crate::SparqlQueryRequest::all(format!("SELECT ?x {{ {pattern} }}"));
     request.memory_limit = memory;
     let prepared = store.prepare_query(&request)?;
     let mut out = Vec::new();
@@ -1507,4 +1526,74 @@ fn the_time_the_whole_selection_takes_is_the_labels_own() {
         off,
         "rows, bounds, counts and completeness as with them off"
     );
+}
+
+/// Spec: where the labels refute the rows the capped read would admit first, the read with
+/// them on admits no later row whose batch costs more, so it never needs more memory than the
+/// read with them off. Under `?x a :U0 . ?x a :U1`, the candidate limit 4: eight individuals
+/// each with `v0`, `v1` and `v2`, short-named and committed first, and six with `v3`, named by
+/// IRIs longer by 64000 bytes and committed last (term-id order is the admission order). The
+/// rows with `v0` and `v2` keep one class assertion, which the labels refute; the six with
+/// `v3` keep both. Under each request memory limit from 16 KiB to 8 MiB (steps of a fiftieth),
+/// and in steps of 256 bytes over the 16 KiB from the least limit the read is answered under
+/// with them off, every read the first of a store just committed, a read answered with them off
+/// is answered with them on. And the case is reached: under some limit the read with them on
+/// refutes all 16 by labels and is answered.
+#[test]
+fn rows_the_labels_promote_past_the_capped_prefix_cost_no_more_memory() {
+    let mut data = String::new();
+    for k in 0..24 {
+        data.push_str(&format!(":i{k} :val :v{} .\n", k % 3));
+    }
+    let pad = "x".repeat(64000);
+    for k in 0..6 {
+        data.push_str(&format!(":j{k}{pad} :val :v3 .\n"));
+    }
+    let first = |model_labels: bool, limit: usize| {
+        let dl = crate::DlConfig {
+            max_candidates: Some(4),
+            model_labels,
+            ..crate::DlConfig::default()
+        };
+        let store = unions_store_of(dl, &data);
+        unions_read_of(
+            &store,
+            "?x a <urn:test:U0> . ?x a <urn:test:U1>",
+            Some(limit),
+        )
+    };
+    let (mut low, mut high) = (16usize << 10, 8usize << 20);
+    while high - low > 256 {
+        let middle = low + (high - low) / 2;
+        match first(false, middle) {
+            Ok(_) => high = middle,
+            Err(_) => low = middle,
+        }
+    }
+    let mut limits: Vec<usize> = (0..64).map(|k| high + k * 256).collect();
+    let mut limit = 16usize << 10;
+    while limit <= 8 << 20 {
+        limits.push(limit);
+        limit += limit / 50;
+    }
+    let mut reached = Vec::new();
+    for limit in limits {
+        if first(false, limit).is_ok() {
+            let with = first(true, limit);
+            assert!(
+                with.is_ok(),
+                "{limit} bytes: off answered, on {:?}",
+                with.err()
+            );
+            if let Ok((_, Some((_, detail)))) = &with
+                && detail.refuted_by_labels == 16
+            {
+                reached.push(limit);
+            }
+        }
+    }
+    println!(
+        "off answered from {high} bytes; all 16 refuted by labels, answered under {reached:?}"
+    );
+    assert!(!reached.is_empty(), "no limit reaches the case");
 }
