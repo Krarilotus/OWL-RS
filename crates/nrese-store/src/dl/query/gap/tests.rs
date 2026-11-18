@@ -137,10 +137,15 @@ fn large_gap_keeps_only_the_admitted_prefix_and_its_reservation() {
     assert_eq!(budget.used(), before);
 }
 
-type Checkpoint = Box<dyn Fn(bool)>;
+pub(in crate::dl::query) type Checkpoint = Box<dyn Fn(bool)>;
 
 thread_local! {
     static CHECKPOINT: std::cell::RefCell<Option<Checkpoint>> = std::cell::RefCell::new(None);
+}
+
+/// Runs `hook` at each of the selection's checkpoints on this thread (`None`: no hook).
+pub(in crate::dl::query) fn on_checkpoint(hook: Option<Checkpoint>) {
+    CHECKPOINT.set(hook);
 }
 
 pub(super) fn checkpoint(finished: bool) {

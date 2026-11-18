@@ -1283,16 +1283,21 @@ fn unions_store(model_labels: bool, n: usize) -> Arc<StoreService> {
 /// [`unions_store`], the names of the individuals with `v2` and `v3` (the gap of `?x a :U0`)
 /// longer by `pad` bytes.
 fn padded_unions_store(model_labels: bool, n: usize, pad: usize) -> Arc<StoreService> {
-    let mut data = include_str!("../../tests/it/dl/model_labels_unions.ttl").to_owned();
-    for k in 0..n {
-        let pad = "x".repeat(if k % 4 < 2 { 0 } else { pad });
-        data.push_str(&format!(":i{k}{pad} :val :v{} .\n", k % 4));
-    }
     let dl = crate::DlConfig {
         max_candidates: Some(4),
         model_labels,
         ..crate::DlConfig::default()
     };
+    unions_store_with(dl, n, pad)
+}
+
+/// [`padded_unions_store`] under the DL settings `dl`.
+fn unions_store_with(dl: crate::DlConfig, n: usize, pad: usize) -> Arc<StoreService> {
+    let mut data = include_str!("../../tests/it/dl/model_labels_unions.ttl").to_owned();
+    for k in 0..n {
+        let pad = "x".repeat(if k % 4 < 2 { 0 } else { pad });
+        data.push_str(&format!(":i{k}{pad} :val :v{} .\n", k % 4));
+    }
     let config = crate::StoreConfig {
         dl,
         ..crate::StoreConfig::in_memory()
@@ -1457,4 +1462,49 @@ fn a_read_whose_labels_have_no_room_needs_no_more_memory_than_without_them() {
         "off answered from {high} bytes; the whole gap selected, none refuted by labels, answered under {reached:?}"
     );
     assert!(!reached.is_empty(), "no limit reaches the case");
+}
+
+/// Spec: the labels' one deadline is fixed before their own work, the whole selection
+/// included, so the time the selection takes is theirs, and the model's run takes that instant,
+/// not a fresh timeout. With `dl.timeout` 2 s the labels have a quarter, 500 ms, and the read's
+/// first selection takes 600 ms (a test hook at its end, the same for both reads): the labels'
+/// deadline has passed before their work, so no model is run, and the read with them on is
+/// decided as with them off, by its tests alone: over the 24 individuals with a candidate limit
+/// of 4, 4 refuted, 8 unresolved, not `complete`, none refuted by labels, the same rows.
+#[test]
+fn the_time_the_whole_selection_takes_is_the_labels_own() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let read = |model_labels: bool| {
+        let dl = crate::DlConfig {
+            max_candidates: Some(4),
+            model_labels,
+            timeout: Some(std::time::Duration::from_secs(2)),
+            ..crate::DlConfig::default()
+        };
+        let store = unions_store_with(dl, 24, 0);
+        let slept = Arc::new(AtomicBool::new(false));
+        let once = Arc::clone(&slept);
+        super::gap::tests::on_checkpoint(Some(Box::new(move |finished| {
+            if finished && !once.swap(true, Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(600));
+            }
+        })));
+        let read = unions_read(&store, None);
+        super::gap::tests::on_checkpoint(None);
+        assert!(slept.load(Ordering::Relaxed), "the selection's hook ran");
+        let (rows, status) = read.unwrap();
+        let (status, detail) = status.unwrap();
+        println!("labels {model_labels}: {status:?} {detail:?}");
+        let bounds = status.bounds.map(|b| (b.lower, b.upper, b.unresolved));
+        let counts = (detail.proved, detail.refuted, detail.refuted_by_labels);
+        (rows, bounds, counts, status.complete)
+    };
+    let off = read(false);
+    assert_eq!(off.1, Some((12, 24, 8)));
+    assert_eq!((off.2, off.3), ((0, 4, 0), false));
+    assert_eq!(
+        read(true),
+        off,
+        "rows, bounds, counts and completeness as with them off"
+    );
 }

@@ -1,7 +1,7 @@
 //! ID-level set difference, with bounded candidate admission. Lower bags stay untouched.
 
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
