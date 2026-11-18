@@ -62,6 +62,10 @@ impl Context<'_> {
         let (merged, left_out) = match &self.merge_set {
             None => (None, false),
             Some(crate::dataset::GraphSet::Only(graphs)) => (Some(graphs), false),
+            Some(crate::dataset::GraphSet::Scoped(graphs)) => {
+                encoder.number(u64::MAX - 2);
+                (Some(graphs), false)
+            }
             Some(crate::dataset::GraphSet::AllBut(graphs)) => (Some(graphs), true),
         };
         if left_out {
@@ -668,6 +672,35 @@ mod tests {
     use nrese_sparql_syntax::SparqlParser;
 
     use crate::{QueryOptions, QueryResults, ResultCache, evaluate_query};
+
+    #[test]
+    fn scoped_and_plain_merges_have_distinct_keys_on_the_same_snapshot() {
+        // Spec: With the same snapshot, query and FROM graphs, adding the inferred
+        // layer changes the cache key of the default graph merge.
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let iri = |name: &str| NamedNode::new_unchecked(format!("urn:{name}"));
+        let mut tx = engine.transaction();
+        let graphs = [GraphName::from(iri("g1")), GraphName::from(iri("g2"))];
+        for graph in &graphs {
+            tx.insert(Quad::new(iri("a"), iri("p"), iri("b"), graph.clone()).as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        let query = SparqlParser::new()
+            .parse_query("SELECT ?s WHERE { ?s <urn:p> <urn:b> }")
+            .unwrap();
+        let mut dataset = crate::QueryDatasetSpecification::new();
+        dataset.set_default_graph(graphs.to_vec());
+        let mut options = QueryOptions {
+            dataset: Some(dataset),
+            result_cache: Some(std::sync::Arc::new(ResultCache::new(1 << 20))),
+            ..QueryOptions::default()
+        };
+        let plain = super::output_key(&snapshot, &query, &options, "text/csv", b"").unwrap();
+        options.dataset.as_mut().unwrap().include_scoped_inference();
+        let scoped = super::output_key(&snapshot, &query, &options, "text/csv", b"").unwrap();
+        assert_ne!(plain, scoped);
+    }
 
     /// The key's bytes, which write the reading only where it differs: an answer read
     /// canonically, which reads a view of the snapshot with an identity of its own, and the

@@ -397,7 +397,10 @@ impl Context<'_> {
     /// the active graphs (under `GRAPH ?g`, the named graphs it may read, merged). Decided
     /// once per search, before its scan; both [`Self::search`] and the per-graph search read
     /// it.
-    fn found(&self, search: &Search) -> NativeResult<Vec<nrese_engine::TextMatch>> {
+    fn found(&self, search: &Search, known: bool) -> NativeResult<Vec<nrese_engine::TextMatch>> {
+        if !known && !matches!(self.merge_set, Some(GraphSet::Scoped(_))) {
+            return Ok(Vec::new());
+        }
         Ok(match self.search_in()? {
             SearchIn::Global => self
                 .snapshot
@@ -414,6 +417,12 @@ impl Context<'_> {
     /// What this context's searches rank and select among: decided once per search, before
     /// its scan, from the query's [`crate::SearchScope`].
     pub(super) fn search_in(&self) -> NativeResult<SearchIn> {
+        if matches!(self.merge_set, Some(GraphSet::Scoped(_))) {
+            return Err(crate::QueryEvaluationError::ScopedInferenceUnavailable(
+                "store.search_scope",
+            )
+            .into());
+        }
         match self.search_scope {
             crate::SearchScope::Global => Ok(SearchIn::Global),
             crate::SearchScope::Reader => self.text_scope().map(SearchIn::Reader),
@@ -452,21 +461,20 @@ impl Context<'_> {
             Ok(charged(graphs))
         };
         let plain = |scope| Ok(Some((None, scope)));
-        match &*self.graph.borrow() {
-            GraphScope::Default => plain(TextScope::Graphs(GraphSelector::Exact(
+        match (&*self.graph.borrow(), &self.merge_set) {
+            (_, Some(GraphSet::Scoped(_))) => unreachable!("search_in refuses scoped searches"),
+            (GraphScope::Default, _) => plain(TextScope::Graphs(GraphSelector::Exact(
                 TermId::DEFAULT_GRAPH,
             ))),
-            GraphScope::Named(g) => plain(TextScope::Graphs(GraphSelector::Exact(*g))),
-            GraphScope::Variable(_) => match &self.named {
+            (GraphScope::Named(g), _) => plain(TextScope::Graphs(GraphSelector::Exact(*g))),
+            (GraphScope::Variable(_), _) => match &self.named {
                 Some(named) => copy(named).map(Some),
                 None => plain(TextScope::Graphs(GraphSelector::AnyNamed)),
             },
-            GraphScope::Union => match &self.merge_set {
-                Some(GraphSet::Only(graphs)) => copy(graphs).map(Some),
-                Some(GraphSet::AllBut(left_out)) => all_but(left_out).map(Some),
-                None => plain(TextScope::Graphs(GraphSelector::Any)),
-            },
-            GraphScope::Missing => Ok(None),
+            (GraphScope::Union, Some(GraphSet::Only(graphs))) => copy(graphs).map(Some),
+            (GraphScope::Union, Some(GraphSet::AllBut(left_out))) => all_but(left_out).map(Some),
+            (GraphScope::Union, None) => plain(TextScope::Graphs(GraphSelector::Any)),
+            (GraphScope::Missing, _) => Ok(None),
         }
     }
 
@@ -504,7 +512,7 @@ impl Context<'_> {
         self.snapshot
             .quads_for_pattern_in(self.model, &pattern)
             .any(|quad| {
-                merge_set.is_none_or(|graphs| graphs.contains(&quad.graph))
+                merge_set.is_none_or(|graphs| graphs.contains(&self.snapshot, self.model, &quad))
                     && named.is_none_or(|graphs| graphs.contains(&quad.graph))
             })
     }
@@ -531,10 +539,7 @@ impl Context<'_> {
         vars.extend(search.rank.iter().cloned());
         let mut table = IdTable::new(vars.len());
         let mut rank = 0usize;
-        let found = match property {
-            Some(None) => Vec::new(),
-            _ => self.found(search)?,
-        };
+        let found = self.found(search, property != Some(None))?;
         for found in found {
             if search
                 .min_relevance
@@ -607,10 +612,7 @@ impl Context<'_> {
         let mut ranks_held = nrese_exec::Reservation::new(&*self.budget);
         let mut ranks: HashMap<TermId, usize> = HashMap::new();
         let mut graphs = nrese_exec::ChargedVec::new(std::sync::Arc::clone(&self.budget));
-        let found = match property {
-            Some(None) => Vec::new(),
-            _ => self.found(search)?,
-        };
+        let found = self.found(search, property != Some(None))?;
         for found in found {
             self.check()?;
             if search

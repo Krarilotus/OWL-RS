@@ -955,6 +955,26 @@ impl StoreService {
         .1
     }
 
+    fn query_view(
+        &self,
+        prepared: &PreparedQuery,
+        memory: &nrese_exec::Envelope,
+        cancel: &CancellationToken,
+    ) -> StoreResult<Snapshot> {
+        let snapshot = self.engine.snapshot();
+        let Some(scope) = &prepared.inference_scope else {
+            return self.view_of(&snapshot, prepared.access(), memory, Some(cancel));
+        };
+        let view = self
+            .reading(Some(scope), memory, Some(cancel))
+            .expect("the dataset's selector requests inferred statements")
+            .scoped(&snapshot, prepared.read_model())?;
+        self.refuse_exact(prepared, &snapshot, || {
+            self.status_outside_dl(prepared, None, Revision::Committed(&view))
+        })?;
+        Ok(view)
+    }
+
     pub(crate) fn support_compilation(&self) -> crate::support::Compilation {
         crate::support::Compilation {
             hide_unnamed_classes: self.config.hide_unnamed_classes,
@@ -1254,8 +1274,7 @@ impl StoreService {
         // the request draws from it.
         let memory = self.settings.query_envelope(prepared);
         // One snapshot the route, the answers and their status are all of (T3, N5).
-        let latest = &self.engine.snapshot();
-        let snapshot = self.view_of(latest, prepared.access(), &memory, Some(cancellation))?;
+        let snapshot = self.query_view(prepared, &memory, cancellation)?;
         prepared.announce_on(&snapshot);
         if let Some(mode) = self.dl_mode(prepared, &snapshot) {
             use crate::dl::query::{Outcome, Read};
@@ -1294,7 +1313,9 @@ impl StoreService {
         hooks::run(&hooks::AFTER_DECIDED);
         let at = Revision::Committed(&snapshot);
         let status = || self.status_outside_dl(prepared, None, at);
-        self.refuse_exact(prepared, &snapshot, status)?;
+        if prepared.inference_scope.is_none() {
+            self.refuse_exact(prepared, &snapshot, status)?;
+        }
         let ql = run_query(
             &snapshot,
             prepared,
@@ -1323,6 +1344,10 @@ impl StoreService {
         ql: Option<&nrese_sparql::ql::QlReport>,
         at: Revision<'_>,
     ) -> Option<nrese_sparql::Completeness> {
+        if prepared.inference_scope.is_some() {
+            return (!Certificate::bare(at.snapshot(), false))
+                .then(nrese_sparql::Completeness::not_certified);
+        }
         let route = match ql {
             Some(ql) => Some(self.ql_status(ql, at.snapshot())),
             None => self.status_without_dl_at(prepared, at),
@@ -1440,7 +1465,9 @@ impl StoreService {
     /// Under `owl2-dl`, the answers a query reading the inferred statements asks for;
     /// `None` for any other query (or mode).
     fn dl_mode(&self, prepared: &PreparedQuery, at: &Snapshot) -> Option<crate::DlAnswers> {
-        (Certificate::route(at, &self.dl).0 && prepared.read_model() == ReadModel::Materialised)
+        (prepared.inference_scope.is_none()
+            && Certificate::route(at, &self.dl).0
+            && prepared.read_model() == ReadModel::Materialised)
             .then(|| prepared.dl_answers().unwrap_or(self.config.dl.answers))
     }
 
@@ -1513,7 +1540,9 @@ impl StoreService {
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         let memory = self.settings.query_envelope(prepared);
-        let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
+        let snapshot = self.query_view(prepared, &memory, cancellation)?;
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_DECIDED);
         let mut explanation =
             explain_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         if let Some(mode) = self.dl_mode(prepared, &snapshot) {
@@ -1569,7 +1598,9 @@ impl StoreService {
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
         let memory = self.settings.query_envelope(prepared);
-        let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
+        let snapshot = self.query_view(prepared, &memory, cancellation)?;
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_DECIDED);
         let mut planned =
             plan_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         let at = Revision::Committed(&snapshot);
@@ -1773,6 +1804,12 @@ impl StoreService {
     ) -> StoreResult<()> {
         if pending.ops.is_empty() {
             return self.run_query_reporting(prepared, cancellation, out, report);
+        }
+        if prepared.inference_scope.is_some() {
+            return Err(nrese_sparql::QueryEvaluationError::Argument(
+                "inference-scope=dataset is unavailable with operations pending".into(),
+            )
+            .into());
         }
         let _running = self
             .running
@@ -2724,7 +2761,7 @@ fn for_its_reader<T>(
 ) -> StoreResult<T> {
     let scope = crate::ReadScope::of(prepared.access().cloned());
     let mut whole = scope.told(entry, whole)?;
-    if !scope.reads_everything() {
+    if !scope.reads_everything() || prepared.inference_scope.is_some() {
         redact(&mut whole);
     }
     Ok(whole)

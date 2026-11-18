@@ -55,6 +55,8 @@ use nrese_sparql_syntax::internal::blank_variable;
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use rayon::prelude::*;
 
+use crate::dataset::GraphSet;
+
 use super::geo::{
     RELATIONS, Shape, Size, holds_apart, parse_literal, relate_bound, relation, sized_bound,
 };
@@ -1418,7 +1420,7 @@ impl Context<'_> {
         conjuncts: &[&Expression],
         patterns: &[TriplePattern],
     ) -> NativeResult<Option<(Solutions, usize)>> {
-        if self.as_written {
+        if self.as_written || matches!(self.merge_set, Some(GraphSet::Scoped(_))) {
             return Ok(None);
         }
         for (at, conjunct) in conjuncts.iter().enumerate() {
@@ -1550,33 +1552,37 @@ impl Context<'_> {
     /// The scope of a spatial pattern in the active graph; `None` while `GRAPH ?g` is
     /// evaluated for all graphs at once.
     fn spatial_scope(&self) -> NativeResult<Option<Scope>> {
-        Ok(Some(match &*self.graph.borrow() {
-            GraphScope::Default => Scope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
-            GraphScope::Named(graph) => Scope::Graphs(GraphSelector::Exact(*graph)),
-            GraphScope::Union => match &self.merge_set {
-                Some(crate::dataset::GraphSet::Only(graphs)) => {
-                    Scope::merge(graphs, &self.budget).map_err(QueryEvaluationError::MemoryLimit)?
-                }
-                Some(crate::dataset::GraphSet::AllBut(left_out)) => {
-                    // Every graph the snapshot holds but those, listed (charged as it grows).
-                    let mut graphs = ChargedVec::new(Arc::clone(&self.budget));
-                    for graph in
-                        std::iter::once(TermId::DEFAULT_GRAPH).chain(self.snapshot.named_graphs())
-                    {
-                        if left_out.binary_search(&graph).is_err() {
-                            graphs
-                                .push(graph)
-                                .map_err(QueryEvaluationError::MemoryLimit)?;
-                        }
+        Ok(Some(match (&*self.graph.borrow(), &self.merge_set) {
+            (_, Some(GraphSet::Scoped(_))) => {
+                return Err(QueryEvaluationError::ScopedInferenceUnavailable(
+                    "computed-spatial-relation",
+                )
+                .into());
+            }
+            (GraphScope::Default, _) => Scope::Graphs(GraphSelector::Exact(TermId::DEFAULT_GRAPH)),
+            (GraphScope::Named(graph), _) => Scope::Graphs(GraphSelector::Exact(*graph)),
+            (GraphScope::Union, Some(GraphSet::Only(graphs))) => {
+                Scope::merge(graphs, &self.budget).map_err(QueryEvaluationError::MemoryLimit)?
+            }
+            (GraphScope::Union, Some(GraphSet::AllBut(left_out))) => {
+                // Every graph the snapshot holds but those, listed (charged as it grows).
+                let mut graphs = ChargedVec::new(Arc::clone(&self.budget));
+                for graph in
+                    std::iter::once(TermId::DEFAULT_GRAPH).chain(self.snapshot.named_graphs())
+                {
+                    if left_out.binary_search(&graph).is_err() {
+                        graphs
+                            .push(graph)
+                            .map_err(QueryEvaluationError::MemoryLimit)?;
                     }
-                    graphs.sort_unstable();
-                    dedup(&mut graphs);
-                    Scope::Merge(graphs)
                 }
-                None => Scope::Graphs(GraphSelector::Any),
-            },
-            GraphScope::Missing => Scope::Merge(ChargedVec::new(Arc::clone(&self.budget))),
-            GraphScope::Variable(_) => return Ok(None),
+                graphs.sort_unstable();
+                dedup(&mut graphs);
+                Scope::Merge(graphs)
+            }
+            (GraphScope::Union, None) => Scope::Graphs(GraphSelector::Any),
+            (GraphScope::Missing, _) => Scope::Merge(ChargedVec::new(Arc::clone(&self.budget))),
+            (GraphScope::Variable(_), _) => return Ok(None),
         }))
     }
 

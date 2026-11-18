@@ -69,40 +69,6 @@ pub async fn execute_query_in(
     let store = state.store();
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
-    if explain == Explain::Plan {
-        // Statistics only, nothing evaluated; under the deadline as evaluation is: planning
-        // a large pattern stops when the deadline cancels it.
-        return stream_blocking(
-            Pace::Total(deadline),
-            cancellation,
-            "application/json",
-            QUERY_TIMEOUT_MESSAGE,
-            move |out| {
-                let planned = store
-                    .plan_query(&prepared, &token)
-                    .map_err(|error| map_query_error(&policy, error))?;
-                serde_json::to_writer(out, &plan_json(&planned))
-                    .map_err(|error| ApiError::internal(error.to_string()))
-            },
-        )
-        .await;
-    }
-    if explain == Explain::Analyze {
-        return stream_blocking(
-            Pace::Total(deadline),
-            cancellation,
-            "application/json",
-            QUERY_TIMEOUT_MESSAGE,
-            move |out| {
-                let explanation = store
-                    .explain_query(&prepared, &token)
-                    .map_err(|error| map_query_error(&policy, error))?;
-                serde_json::to_writer(out, &explanation_json(&explanation))
-                    .map_err(|error| ApiError::internal(error.to_string()))
-            },
-        )
-        .await;
-    }
     // The completeness goes with the answers, in a header: the store reports it on the
     // snapshot it reads before writing any answer, and the response starts after that.
     // Every reported status is sent, `complete` where no reasoning path can leave answers
@@ -122,12 +88,35 @@ pub async fn execute_query_in(
         made
     };
     let announced = prepared.clone();
+    let scoped = request.inference_scope_dataset;
     let mut response = stream_blocking(
         Pace::Total(deadline),
         cancellation,
-        media_type,
+        if explain == Explain::No {
+            media_type
+        } else {
+            "application/json"
+        },
         QUERY_TIMEOUT_MESSAGE,
         move |out| {
+            if explain != Explain::No {
+                let (body, completeness) = if explain == Explain::Plan {
+                    let plan = store
+                        .plan_query(&prepared, &token)
+                        .map_err(|error| map_query_error(&policy, error))?;
+                    (plan_json(&plan), plan.completeness)
+                } else {
+                    let explanation = store
+                        .explain_query(&prepared, &token)
+                        .map_err(|error| map_query_error(&policy, error))?;
+                    (explanation_json(&explanation), explanation.completeness)
+                };
+                if scoped {
+                    report(completeness, None);
+                }
+                return serde_json::to_writer(out, &body)
+                    .map_err(|error| ApiError::internal(error.to_string()));
+            }
             match &pending {
                 None => store.run_query_reporting(&prepared, &token, out, report),
                 Some(pending) => {
@@ -141,7 +130,9 @@ pub async fn execute_query_in(
     // The run decided the announcement on what its reader reads before its first byte, which
     // `stream_blocking` waits for: the media type is the run's (its place among the headers kept).
     let media_type = HeaderValue::from_static(announced.media_type());
-    response.headers_mut().insert(CONTENT_TYPE, media_type);
+    if explain == Explain::No {
+        response.headers_mut().insert(CONTENT_TYPE, media_type);
+    }
     let reported = status.lock().unwrap_or_else(|p| p.into_inner()).take();
     if let Some(value) = reported {
         let headers = response.headers_mut();
@@ -306,6 +297,9 @@ pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiEr
         }
         // Exact answers asked for under owl2-dl, and the store can't prove them complete.
         StoreError::Incomplete(answer) => ApiError::IncompleteAnswer(answer),
+        error @ StoreError::SparqlEvaluation(
+            nrese_store::QueryEvaluationError::ScopedInferenceUnavailable(setting),
+        ) => ApiError::NotImplemented(setting, error.to_string()),
         error => refused_or(error, ApiError::internal),
     }
 }
@@ -367,6 +361,7 @@ fn build_query_request(operation: QueryOperation) -> SparqlQueryRequest {
     );
     request.default_graphs = operation.default_graphs;
     request.named_graphs = operation.named_graphs;
+    request.inference_scope_dataset = operation.inference_scope_dataset;
     // GraphDB's `infer=false`: explicit statements only.
     if operation.infer == Some(false) {
         request.read_model = Some(nrese_store::ReadModel::Asserted);

@@ -254,6 +254,7 @@ impl StoreError {
                 QueryEvaluationError::Dataset(_)
                     | QueryEvaluationError::MemoryLimit(_)
                     | QueryEvaluationError::Unexpected(_)
+                    | QueryEvaluationError::ScopedInferenceUnavailable(_)
                     | QueryEvaluationError::Cancelled
             );
         }
