@@ -134,9 +134,15 @@ leave something out.
   data that are inconsistent under OWL 2 DL in a way the rules don't read (a cardinality
   written in another spelling than the mapping's `"0"` or `"1"^^xsd:nonNegativeInteger`,
   say). On consistent data such a read is right: nothing entails a statement of a name that
-  appears nowhere. Under `owl2-ql`, such a cardinality asserted as an individual's type
-  (`:x a [ owl:maxCardinality "0"^^xsd:integer ; owl:onProperty :p ]`) isn't read as a
-  hazard at all, so reads of names the store holds can be told `complete` on those data too.
+  appears nowhere.
+- Under `owl2-ql`, a store that asserts an individual into a class expression
+  (`:x a [ owl:intersectionOf ( :A :B ) ]`, or a cardinality restriction) gets no `complete`
+  answer, since what follows from that assertion may be missing (`:x a :A` answers `false`):
+  OWL 2 QL allows only a named class there. Under `owl2-rl` with the QL rewriting on, the same
+  holds for every expression but an intersection, `allValuesFrom`, `hasValue` or an at-most of
+  one, which the rules apply. An inclusion into an intersection
+  (`:C rdfs:subClassOf [ owl:intersectionOf ( :A :B ) ]`), which OWL 2 QL allows, is answered
+  and `complete`.
 - A rebuild of the inferences (`POST …/reasoning/rematerialise`) that fails while it replaces
   them leaves them uncertified: answers are `not-certified` until a rebuild succeeds. A change of
   a repository's QL rewriting made in between takes effect with that rebuild, not at once. Run
