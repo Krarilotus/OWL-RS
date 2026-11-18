@@ -206,11 +206,9 @@ fn row_tests(
     tests_of(o, snapshot, &atoms, ids, data_properties, paths).map_err(Entailed::Unknown)
 }
 
-/// Of the gap's `n` rows (`row(i)` decodes one), those one finished model of the premise
-/// refutes: a row whose one test is `C(a)`, `C` a named class, with `C` not in `a`'s label (a
-/// countermodel of `C(a)`, *Direct Semantics* §2.5). The model is the consistency test's over
-/// the tests' premise, within the DL limits and the labels' own `deadline`; nothing refuted
-/// (no model, not `Consistent`, something left out): no mask.
+/// Of the gap's `n` rows, those one model of the premise refutes, for `?x a C` atoms alone (no
+/// row's test adds to the premise): one test `C(a)`, `C` not in `a`'s label (*Direct Semantics*
+/// §2.5). No model in the DL limits and `deadline`, not `Consistent`, or a part left out: none.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request's limits travel with the rows"
@@ -233,14 +231,20 @@ pub(super) fn refuted_by_labels(
     if stop() {
         return none();
     }
-    let (Some(shape), Ok(base)) = (&analysis.shape, ontology_at(store, snapshot)) else {
+    let shape = analysis.shape.as_ref().filter(|s| {
+        s.patterns.iter().all(|t| {
+            matches!(&t.predicate, NamedNodePattern::NamedNode(p) if p.as_str() == RDF_TYPE)
+                && matches!(&t.subject, TermPattern::Variable(x) if s.projected.contains(x))
+                && matches!(t.object, TermPattern::NamedNode(_))
+        })
+    });
+    let Some((shape, Ok(base))) = shape.map(|s| (s, ontology_at(store, snapshot))) else {
         return none();
     };
     let mut scratch = nrese_dl::memory::Scratch::new(Some(memory));
-    // Per row: its atom, its class and individual (unzipped below), and its place in the mask.
     let atoms_bytes = n * (size_of::<Option<(u64, u64)>>() + 2 * size_of::<u64>() + 1);
     let premise = || nrese_dl::memory::ontology_bytes(base.value()) + atoms_bytes;
-    if scratch.charge(premise).is_err() {
+    if consistency::left_out(base.value()).is_some() || scratch.charge(premise).is_err() {
         return none();
     }
     let mut ontology = (**base.value()).clone();
@@ -280,8 +284,7 @@ pub(super) fn refuted_by_labels(
     let Some(program) = entailment::compile(&ontology, &classes, &individuals, &mut scratch) else {
         return none();
     };
-    // The labels: each of a label's two `Vec<u32>`s holds a class at most once (a node holds a
-    // concept once), so allocates at most the classes' next power of two, and at least 4.
+    // A label's two `Vec<u32>`s hold each class once: the classes' next power of two, 4 at least.
     let vector = 4 * classes.len().next_power_of_two().max(4);
     let labels = individuals.len() * (size_of::<Option<Label>>() + 2 * vector);
     if stop() || scratch.charge(|| labels).is_err() {
@@ -300,9 +303,6 @@ pub(super) fn refuted_by_labels(
     let Some(labels) = out.labels.filter(|_| out.answer == Answer::Consistent) else {
         return none();
     };
-    if stop() || consistency::left_out(&ontology).is_some() {
-        return none();
-    }
     let mut refuted = vec![false; n];
     for (r, atom) in atoms.iter().enumerate() {
         if r % 1024 == 0 && stop() {

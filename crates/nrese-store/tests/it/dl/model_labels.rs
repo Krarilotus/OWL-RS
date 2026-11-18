@@ -259,6 +259,7 @@ fn a_premise_the_reader_left_part_of_refutes_no_candidate_by_its_model() {
 /// `i3`, `i4`) decode to 680 bytes; the 4 the labels leave (`i3`, `i7`, `i11`, `i15`, two
 /// names a byte longer) to 684, more, so only the first 4's one survivor, `i3`, is admitted to
 /// its test (refuted), and the other 5 with `v3` are unresolved, the read not `complete`.
+// The counts, not `by_labels` or the unresolved rows, rest on that 680/684-byte difference.
 #[test]
 fn a_candidate_of_two_class_atoms_is_left_to_its_tests() {
     let dl = pipeline_with(DlConfig {

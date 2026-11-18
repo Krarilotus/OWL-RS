@@ -1254,10 +1254,10 @@ fn decide_answers(
             let (mut rows, mut bytes) = (refuted.iter(), refuted.iter());
             gap.rows.retain(|_| rows.next() != Some(&true));
             gap.bytes.retain(|_| bytes.next() != Some(&true));
-            let by_labels = refuted.iter().filter(|&&r| r).count() as u64;
-            // From here the read holds what the capped selection would.
-            drop(refuted);
-            gap.keep(limit.saturating_add(super::UNRESOLVED_SHOWN));
+            let by_labels = refuted.into_iter().filter(|&r| r).count() as u64;
+            if labelled {
+                gap.keep(limit.saturating_add(super::UNRESOLVED_SHOWN));
+            }
             let left = gap.total - by_labels;
             let (admitted, width) = match limit.min(gap.rows.len()) {
                 n if most(&gap.bytes[..n]) > prefix => (own, 1),

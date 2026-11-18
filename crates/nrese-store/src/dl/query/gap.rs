@@ -1,7 +1,7 @@
 //! ID-level set difference, with bounded candidate admission. Lower bags stay untouched.
 
 #[cfg(test)]
-pub(super) mod tests;
+mod tests;
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap};
@@ -23,7 +23,7 @@ pub(super) struct Gap<'a> {
 }
 
 impl Gap<'_> {
-    /// Keeps the first `n` rows and gives back what the others held.
+    /// Keeps the first `n` rows and gives back what the others held: the capped selection's hold.
     pub fn keep(&mut self, n: usize) {
         self.rows.truncate(n);
         self.bytes.truncate(n);

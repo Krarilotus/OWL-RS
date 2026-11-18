@@ -1440,7 +1440,8 @@ fn a_read_answered_without_model_labels_is_answered_with_them_under_every_memory
 /// least limit the read is answered under with them off (found to 256 bytes), every read the
 /// first of a store just committed, a read answered with the refutations off is answered with
 /// them on. And the case is reached: under some limit the read with them on selects the whole
-/// gap (no `capped-gap`), refutes none by labels, and is answered.
+/// gap (no `capped-gap`), refutes none by labels, and is answered; and under the largest limit
+/// the same store's read refutes all 200 by labels, so no room is why none were.
 #[test]
 fn a_read_whose_labels_have_no_room_needs_no_more_memory_than_without_them() {
     let first = |labels: bool, limit: usize| {
@@ -1460,6 +1461,7 @@ fn a_read_whose_labels_have_no_room_needs_no_more_memory_than_without_them() {
         limits.push(limit);
         limit += limit / 50;
     }
+    let largest = *limits.iter().max().unwrap();
     let mut reached = Vec::new();
     for limit in limits {
         if first(false, limit).is_ok() {
@@ -1481,51 +1483,60 @@ fn a_read_whose_labels_have_no_room_needs_no_more_memory_than_without_them() {
         "off answered from {high} bytes; the whole gap selected, none refuted by labels, answered under {reached:?}"
     );
     assert!(!reached.is_empty(), "no limit reaches the case");
+    let (_, status) = first(true, largest).unwrap();
+    let detail = status.expect("a status").1;
+    println!("under {largest} bytes: {detail:?}");
+    assert_eq!(detail.refuted_by_labels, 200, "with room, all 200");
 }
 
-/// Spec: the labels' one deadline is fixed before their own work, the whole selection
-/// included, so the time the selection takes is theirs, and the model's run takes that instant,
-/// not a fresh timeout. With `dl.timeout` 2 s the labels have a quarter, 500 ms, and the read's
-/// first selection takes 600 ms (a test hook at its end, the same for both reads): the labels'
-/// deadline has passed before their work, so no model is run, and the read with them on is
-/// decided as with them off, by its tests alone: over the 24 individuals with a candidate limit
-/// of 4, 4 refuted, 8 unresolved, not `complete`, none refuted by labels, the same rows.
+/// Spec: the labels' quarter is taken from what the read has left, before their own work and
+/// the whole selection, never from a fresh clock: a read whose deadline has passed when it
+/// begins gives them no time, so no model is run. With `dl.timeout` an hour (a fresh quarter:
+/// 15 minutes) and a deadline passed before the read, over the 24 individuals with a candidate
+/// limit of 4: the read with the labels on is decided exactly as with them off, by its tests
+/// alone, which the deadline leaves undecided: none proved or refuted, none by labels, 12
+/// unresolved, not `complete`, the same status and detail. And the labels are live: the same
+/// read under the hour refutes all 12 by labels. Nothing waits; no time is measured.
 #[test]
-fn the_time_the_whole_selection_takes_is_the_labels_own() {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    let read = |model_labels: bool| {
+fn a_read_whose_deadline_has_passed_gives_the_labels_no_time() {
+    let read = |model_labels: bool, deadline: Deadline| {
         let dl = crate::DlConfig {
             max_candidates: Some(4),
             model_labels,
-            timeout: Some(std::time::Duration::from_secs(2)),
+            timeout: Some(std::time::Duration::from_secs(3600)),
             ..crate::DlConfig::default()
         };
         let store = unions_store_with(dl, 24, 0);
-        let slept = Arc::new(AtomicBool::new(false));
-        let once = Arc::clone(&slept);
-        super::gap::tests::on_checkpoint(Some(Box::new(move |finished| {
-            if finished && !once.swap(true, Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(600));
-            }
-        })));
-        let read = unions_read(&store, None);
-        super::gap::tests::on_checkpoint(None);
-        assert!(slept.load(Ordering::Relaxed), "the selection's hook ran");
-        let (rows, status) = read.unwrap();
-        let (status, detail) = status.unwrap();
+        let request = crate::SparqlQueryRequest::all("SELECT ?x { ?x a <urn:test:U0> }");
+        let prepared = PreparedQuery::parse(&request).unwrap();
+        let outcome = decide_answers(
+            &store,
+            &prepared,
+            &analyse(prepared.query()),
+            &crate::dl::bounds::view(&store),
+            (&CancellationToken::new(), deadline),
+            &nrese_exec::Envelope::unlimited(),
+            DlAnswers::default(),
+        )
+        .unwrap();
+        let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = outcome;
         println!("labels {model_labels}: {status:?} {detail:?}");
-        let bounds = status.bounds.map(|b| (b.lower, b.upper, b.unresolved));
-        let counts = (detail.proved, detail.refuted, detail.refuted_by_labels);
-        (rows, bounds, counts, status.complete)
+        (status, detail)
     };
-    let off = read(false);
-    assert_eq!(off.1, Some((12, 24, 8)));
-    assert_eq!((off.2, off.3), ((0, 4, 0), false));
+    let passed = Deadline::at(std::time::Instant::now());
+    let (off, off_detail) = read(false, passed);
+    let bounds = off.bounds.map(|b| (b.lower, b.upper, b.unresolved));
+    assert_eq!(bounds, Some((12, 24, 12)));
+    let counts = |d: &crate::dl::DlDetail| (d.proved, d.refuted, d.refuted_by_labels);
+    assert_eq!((counts(&off_detail), off.complete), ((0, 0, 0), false));
+    let (on, on_detail) = read(true, passed);
     assert_eq!(
-        read(true),
-        off,
-        "rows, bounds, counts and completeness as with them off"
+        format!("{on:?} {on_detail:?}"),
+        format!("{off:?} {off_detail:?}"),
+        "status and detail as with them off"
     );
+    let hour = Deadline::after(Some(std::time::Duration::from_secs(3600)));
+    assert_eq!(counts(&read(true, hour).1).2, 12, "under the hour, all 12");
 }
 
 /// Spec: where the labels refute the rows the capped read would admit first, the read with

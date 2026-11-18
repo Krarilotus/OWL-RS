@@ -45,9 +45,8 @@ pub use consistency::{Checked, Verdict};
 /// What decided a DL answer's status, beside the shared status
 /// ([`nrese_sparql::Completeness`]): the paths that decided (`closed-predicates`,
 /// `skolem-only-gap`, `bounds-equal`, `exact-ground-entailment`,
-/// `exact-internalisable-cq`; `capped-gap` where the gap had no room whole for the model's
-/// labels, so none were read), and the
-/// candidates of the gap the exact services proved and refuted.
+/// `exact-internalisable-cq`; `capped-gap` where the gap had no room for the model's labels),
+/// and the candidates of the gap the exact services proved and refuted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DlDetail {
     pub paths: Vec<&'static str>,
