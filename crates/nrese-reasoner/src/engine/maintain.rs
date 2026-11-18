@@ -443,9 +443,6 @@ pub fn maintain_with(
         }
     };
     let mut update = update;
-    if unkept {
-        update.policy.plan = delta::policy::Plan::Rebuild;
-    }
     // A list that already stopped at its budget makes the change inconsistent: the
     // datatype checks would add nothing to that.
     if update.violations.complete() {
@@ -462,7 +459,7 @@ pub fn maintain_with(
     let (mut inserted, mut removed) = (0, 0);
     // Over representatives, a change that may split a class is rebuilt (B3a: the
     // translation can't follow it; the representative view for the delta executor is B3b).
-    let mut rebuild = revived || update.policy.plan == delta::policy::Plan::Rebuild;
+    let mut rebuild = revived || unkept || update.policy.plan == delta::policy::Plan::Rebuild;
     if !rebuild && program.stores_representatives() {
         match store_over_representatives(program, &update, &missing_axioms, tx) {
             Some((added, dropped)) => (inserted, removed) = (added, dropped),
@@ -547,6 +544,10 @@ pub fn maintain_with(
         if operation.fired() {
             return Err(operation.interrupted());
         }
+    }
+    // The delta ran (its violations and diagnostics stand), and the closure is a rebuild's.
+    if unkept {
+        update.policy.plan = delta::policy::Plan::Rebuild;
     }
     Ok(Maintenance {
         violations: update.violations,
