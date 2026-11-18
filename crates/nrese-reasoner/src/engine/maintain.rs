@@ -222,14 +222,21 @@ pub struct Maintenance {
 
 /// Whether `base` holds an inverse property expression (`_:x owl:inverseOf :p`), OWL 2's
 /// one property that is no IRI: the rules conclude facts with it as their predicate, which
-/// no store holds ([`storable`]), whichever rule concludes them. `None`: no `owl:inverseOf`.
-fn has_inverse_expression(base: &Snapshot) -> Option<bool> {
+/// no store holds ([`storable`]), whichever rule concludes them. Its reads count on `poll`
+/// (REAS-3), as [`EngineBase`]'s do; [`Stopped`] once that has stopped.
+fn has_inverse_expression(base: &Snapshot, poll: &Poller<'_>) -> Result<bool, Stopped> {
     let iri = nrese_rdf::NamedNodeRef::new_unchecked("http://www.w3.org/2002/07/owl#inverseOf");
+    let Some(inverse_of) = base.lookup(iri.into()) else {
+        return Ok(false);
+    };
     let mut pattern = QuadPattern::all();
-    pattern.predicate = Some(base.lookup(iri.into())?);
+    pattern.predicate = Some(inverse_of);
     let blank = |t: TermId| t.kind() == TermKind::BlankNode;
-    let mut quads = base.quads_for_pattern_in(ReadModel::Materialised, &pattern);
-    Some(quads.any(|q| blank(q.subject) || blank(q.object)))
+    let (counted, reads) = (base.counted(), |n| poll.visit(n));
+    let mut quads = counted.quads(ReadModel::Materialised, &pattern, &reads);
+    quads.try_fold(false, |found, q| {
+        q.map(|q| found || blank(q.subject) || blank(q.object))
+    })
 }
 
 /// Keeps the transaction's inferred stack equal to the closure of its asserted state,
@@ -389,7 +396,7 @@ pub fn maintain_with(
         // base's, so a delta can't read them. Such a change runs its delta, whose consistency
         // check stands, and is then rebuilt: the closure after it is the one a rebuild gives.
         unkept = !(first_load || inserted.is_empty() && deleted.is_empty())
-            && has_inverse_expression(tx.base()) == Some(true);
+            && has_inverse_expression(tx.base(), &prep).map_err(interrupted)?;
         // A rebuild reads the asserted facts and writes the closure, both about the size
         // of the stored state; the policy offers it to a change that inserts nothing
         // ([`delta::policy::Plan::Rebuild`]).
