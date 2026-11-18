@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-use nrese_store::{DlConfig, DlConsistency, MutationError, MutationPipeline, StoreService};
+use nrese_store::{
+    DlConfig, DlConsistency, MutationError, MutationPipeline, RejectKind, StoreService,
+};
 
 use super::{ask, insert, pipeline, pipeline_with};
 
@@ -317,4 +319,24 @@ fn the_neighbours_of_a_repeated_disjoint_union_keep_their_refusal_and_their_rout
         wrong.push(format!("the RL ontology: route {route:?}; an :E {outcome}"));
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (*OWL 2 Direct Semantics* §2.3: `owl:Nothing` has no instance; *OWL 2 Profiles* §4.3,
+/// table 6's cls-nothing2): beside a disjoint union whose operands read as one, an individual
+/// of `owl:Nothing` is a clash the OWL 2 RL rules find and OWL 2 DL shares, so the commit is
+/// refused as an inconsistency, not as undecided. Its outcome printed.
+#[test]
+fn a_separate_clash_beside_a_read_as_one_union_is_refused_as_an_inconsistency() {
+    let dl = pipeline();
+    insert(&dl, ":C owl:disjointUnionOf ( :A :A ) .").expect("schema");
+    let result = insert(&dl, ":x a owl:Nothing .");
+    let outcome = match &result {
+        Err(MutationError::Rejected(reject)) => format!("{:?}: {}", reject.kind, reject.detail),
+        other => format!("not rejected: {other:?}"),
+    };
+    eprintln!("SEPARATE CLASH :x a owl:Nothing: {outcome}");
+    let Err(MutationError::Rejected(reject)) = &result else {
+        panic!("{outcome}");
+    };
+    assert_eq!(reject.kind, RejectKind::Inconsistent, "{outcome}");
 }

@@ -1433,3 +1433,38 @@ fn a_literal_on_a_declared_object_property_is_malformed() {
         )],
     );
 }
+
+/// Spec (*Mapping to RDF* Tables 16 and 17: an n-ary axiom's RDF form is its main triple and
+/// its list): each axiom a disjointness with a repeated operand is read as (the n-ary axiom
+/// over the rest, the class equal to a lone operand, the repeated operand empty:
+/// `Disjoint::axioms`) comes from that whole form, so its sources, which a refusal's
+/// justification names, include the list's `rdf:first` and `rdf:rest` statements. An
+/// `owl:AllDisjointClasses` and an `owl:disjointUnionOf`, each repeating `ex:A`. Each axiom's
+/// source predicates printed.
+#[test]
+fn each_axiom_of_a_repeated_disjointness_has_its_list_among_its_sources() {
+    let mut wrong = Vec::new();
+    for turtle in [
+        "[] a owl:AllDisjointClasses ; owl:members ( ex:A ex:A ex:B ) .",
+        "ex:C owl:disjointUnionOf ( ex:A ex:A ) .",
+    ] {
+        let mut table = Table::default();
+        let ontology = read(&load(&mut table, turtle), &table);
+        for (axiom, sources) in ontology.axioms.iter().zip(&ontology.sources) {
+            let line = ontology.functional(axiom, &|t| table.name(t));
+            let predicates: Vec<String> = (sources.iter().flat_map(|s| &s.triples))
+                .map(|t| table.name(t[1]))
+                .collect();
+            eprintln!("LIST SOURCES {turtle}: {line}: {predicates:?}");
+            let has = |local: &str| {
+                predicates
+                    .iter()
+                    .any(|p| p.ends_with(&format!("#{local}>")))
+            };
+            if !has("first") || !has("rest") {
+                wrong.push(format!("{turtle}: {line}: {predicates:?}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
