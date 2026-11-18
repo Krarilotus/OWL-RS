@@ -553,27 +553,38 @@ fn malformed_n_ary_structures_are_reported() {
 
 /// Spec (*Structural Specification* §9.5: a key is on all its property expressions): a key one
 /// of whose members can't be read is no key, and is reported malformed. Read on its other
-/// members it would be a stronger key than the input states, identifying more individuals.
+/// members it would be a stronger key than the input states, identifying more individuals; with
+/// none read, an empty key. The member an inverse given twice, a blank node without
+/// `owl:inverseOf`, and every member unreadable; each case's kept keys printed.
 #[test]
 fn a_key_with_a_member_that_cannot_be_read_is_no_key() {
-    let mut table = Table::default();
-    let statements = load(
-        &mut table,
-        "ex:p a owl:ObjectProperty . ex:q a owl:ObjectProperty . ex:r a owl:ObjectProperty .
-        ex:C a owl:Class ; owl:hasKey ( ex:p [ owl:inverseOf ex:q, ex:r ] ) .",
-    );
-    let ontology = read(&statements, &table);
-    let keys: Vec<String> = (rendered(&ontology, &table).into_iter())
-        .filter(|axiom| axiom.starts_with("HasKey("))
-        .collect();
-    assert!(keys.is_empty(), "{keys:?}");
     let what = "a key with a member that can't be read";
-    assert!(
-        (ontology.diagnostics.iter())
-            .any(|d| matches!(d, Diagnostic::Malformed { what: w, .. } if *w == what)),
-        "{:?}",
-        ontology.diagnostics
-    );
+    let mut wrong = Vec::new();
+    for members in [
+        "ex:p [ owl:inverseOf ex:q, ex:r ]",
+        "ex:p [ ]",
+        "[ owl:inverseOf ex:q, ex:r ]",
+    ] {
+        let mut table = Table::default();
+        let statements = load(
+            &mut table,
+            &format!(
+                "ex:p a owl:ObjectProperty . ex:q a owl:ObjectProperty . ex:r a owl:ObjectProperty .
+                ex:C a owl:Class ; owl:hasKey ( {members} ) ."
+            ),
+        );
+        let ontology = read(&statements, &table);
+        let keys: Vec<String> = (rendered(&ontology, &table).into_iter())
+            .filter(|axiom| axiom.starts_with("HasKey("))
+            .collect();
+        let reported = (ontology.diagnostics.iter())
+            .any(|d| matches!(d, Diagnostic::Malformed { what: w, .. } if *w == what));
+        eprintln!("KEY ( {members} ): kept {keys:?}; the key reported malformed: {reported}");
+        if !keys.is_empty() || !reported {
+            wrong.push(format!("( {members} ): kept {keys:?}, reported {reported}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// What the W3C OWL 2 DL tests showed read wrongly or dropped silently: a cardinality over
