@@ -1276,6 +1276,14 @@ impl<'a> Reader<'a> {
             let list = self.one(node, v.owl_with_restrictions)?;
             let mut facets = Vec::new();
             for restriction in self.list(list)? {
+                // Blank (Mapping to RDF, Table 12): a named node's statements are its own.
+                if self.kind(restriction) != TermKind::Blank {
+                    self.report(Diagnostic::Malformed {
+                        node: restriction,
+                        what: "a facet restriction not on a blank node",
+                    });
+                    return None;
+                }
                 let mut pairs = self
                     .by_subject
                     .get(&restriction)
