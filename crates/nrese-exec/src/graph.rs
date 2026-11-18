@@ -13,9 +13,9 @@
 //! output, quadratic in the relation's size where it is one strongly connected component (a
 //! 1,024-node cycle: 1,048,576 pairs),
 //! and their reach sets, quadratic in the components where they form a chain, are charged
-//! before they are allocated, and freed before they are released (the code-quality triage's
-//! S-03; the executor memory stack's fix check r4, R4-F1). They poll their stop once per
-//! [`crate::POLL_UNITS`] units of work per task, inside one component too ([`Ticker`]).
+//! before they are allocated, and freed before they are released. They poll their stop once
+//! per [`crate::POLL_UNITS`] units of work per task, inside one component too
+//! ([`Ticker`]).
 
 use std::ops::Deref;
 
@@ -140,8 +140,8 @@ where
 /// more (`include_start == true`), each once, in breadth-first order. Every buffer that grows
 /// with the nodes reached (the nodes seen, the order, the frontiers) is charged to `pool`
 /// before it grows, and `stop` polled once per [`crate::POLL_UNITS`] nodes expanded and
-/// successors walked: a bound start's closure over a long chain is as long as the chain
-/// (review r1 of the graph closure package, R1-F1). [`Stop::Memory`] where a charge was
+/// successors walked: a bound start's closure over a long chain is as long as the chain.
+/// [`Stop::Memory`] where a charge was
 /// refused, [`Stop::Cancelled`] where `stop` fired, or what `successors` returned; then
 /// everything it made is freed.
 pub fn reachable_within<'p, B: Deref<Target = Budget>>(
@@ -331,7 +331,7 @@ pub fn transitive_closure_within<'p, B: Deref<Target = Budget>>(
     let components = starts.len() - 1;
     let members_of = |c: usize| &members[starts[c]..starts[c + 1]];
     // Component `c`'s pairs: its members times the nodes it reaches (counted as its reach set
-    // was made: sizing is one step a component, sol-loop r1 S1).
+    // was made: sizing is one step a component).
     let pairs_of = |c: usize| members_of(c).len().checked_mul(rows[c] as usize);
     let mut total = Some(0usize);
     for c in 0..components {
@@ -598,7 +598,7 @@ pub fn components(n: usize, edges: &[(u32, u32)]) -> Components {
 /// so a stop is seen within [`crate::POLL_UNITS`] units of work, counted across passes, at one
 /// tick a run (a tick an element cost the count-only closure +5.5 % instructions: the graph
 /// closure package's counts; a run ticked before its work reset the allowance and let the
-/// next run go unpolled: sol-loop r4 S5).
+/// next run go unpolled).
 fn in_runs(
     ticker: &Ticker<StopFn<'_>>,
     len: usize,
@@ -615,7 +615,7 @@ fn in_runs(
 }
 
 /// `values`, sorted, with each value once, polled in runs ([`in_runs`]): a stop is seen within
-/// [`crate::POLL_UNITS`] comparisons (sol-loop r2 of the graph closure package). Stopped, it
+/// [`crate::POLL_UNITS`] comparisons. Stopped, it
 /// leaves `values` part-compacted: the kernels then drop them.
 fn dedup_sorted<T: PartialEq + Copy, B: Deref<Target = Budget>>(
     values: &mut Buf<'_, T, B>,
@@ -773,8 +773,8 @@ impl<'p, B: Deref<Target = Budget>> Condensation<'p, B> {
         let size = |starts: &[usize], d: u32| (starts[d as usize + 1] - starts[d as usize]) as u32;
         // Every tick follows its own work and comes before any work nested in it, as the
         // entries' runs count theirs: a tick before its work, or after a nested run, let a
-        // run of a whole allowance follow unticked work, 4,097 units between two polls
-        // (sol-loop r1 S1, r2). A component's own setup is its first member's unit.
+        // run of a whole allowance follow unticked work, 4,097 units between two polls.
+        // A component's own setup is its first member's unit.
         for c in 0..components {
             let mut cyclic = self.members_of(c).len() > 1;
             let mut row = 0u32;
@@ -1018,7 +1018,7 @@ mod tests {
         assert_eq!(small.used(), 0);
     }
 
-    /// Spec (stop.rs, W1; sol-loop r2 of the graph closure package): the kernels' dedup sees a
+    /// Spec (stop.rs, W1): the kernels' dedup sees a
     /// stop within `POLL_UNITS` comparisons. Over 100,000 distinct values whose comparisons
     /// are counted, a stop that fires once 10,000 have been made stops it no more than
     /// `POLL_UNITS` comparisons later; scanned without a tick, it made all 99,999.
@@ -1051,7 +1051,7 @@ mod tests {
         );
     }
 
-    /// Spec (stop.rs, W1; sol-loop r4 S5 of the graph closure package): linear passes in runs
+    /// Spec (stop.rs, W1): linear passes in runs
     /// see a stop within `POLL_UNITS` units of work, counted across passes. A pass of 4,096
     /// units then one of 4,095, with a stop that turns true once 4,096 are done: stopped, and
     /// no more than `POLL_UNITS` units after it turned. Ticked before its work, the first run
@@ -1074,7 +1074,7 @@ mod tests {
     }
 
     /// Spec (SPARQL 1.1 §9.3: `p+` and `p*` from a bound start are the nodes reached in one or
-    /// more, or zero or more, steps, each once; review r1 of the graph closure package, R1-F1):
+    /// more, or zero or more, steps, each once):
     /// a search from one start answers the fixpoint's ends of that start, over an
     /// [`Adjacency`] and over index probes alike, each node once, in the same order.
     #[test]
@@ -1121,7 +1121,7 @@ mod tests {
         Probes(move |node| Ok(if node < n { vec![node + 1] } else { Vec::new() }))
     }
 
-    /// Spec (stop.rs, W1; R1-F1): a search from one start polls its stop while it walks. Over
+    /// Spec (stop.rs, W1): a search from one start polls its stop while it walks. Over
     /// a 1,000,000-node chain, a stop that fires at its second poll ends it within
     /// 2 × `POLL_UNITS` nodes expanded (a node and its successor are a unit each). Searched
     /// without a stop, it walked the whole chain.
@@ -1146,7 +1146,7 @@ mod tests {
         );
     }
 
-    /// Spec (R1-F1): a search's buffers (the nodes seen, the order, the frontiers) are charged
+    /// Spec: a search's buffers (the nodes seen, the order, the frontiers) are charged
     /// before they grow: over a 100,000-node chain, 800 KB of order alone, under a 64 KiB
     /// budget, it is refused, and holds nothing once it is dropped.
     #[test]

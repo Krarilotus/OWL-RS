@@ -220,9 +220,9 @@ fn with_context(op: &str, writes: &str) -> String {
     }
 }
 
-/// Review r1, S3-F2 (rows failed on slice 3's 119f32bc): an explicit context naming another
-/// store's default graph (RDF4J `context=`, a quarantine replay's target) is the default graph,
-/// for writes, removals and reads, and so are its write rights.
+/// An explicit context naming another store's default graph (RDF4J `context=`, a
+/// quarantine replay's target) is the default graph, for writes, removals and reads, and so
+/// are its write rights (the rows failed on slice 3's 119f32bc).
 #[test]
 fn an_explicit_context_naming_the_default_graph_is_the_default_graph() {
     let rows = [
@@ -289,10 +289,10 @@ fn graph_target(target: &str) -> String {
     format!("created {created} | {written} | exists {exists} | read {read}")
 }
 
-/// Review r2, S3-F3 (rows failed on slice 3's 6794ab22): a graph target naming another store's
-/// default graph is the default graph for what a graph result says too: a write to it creates
-/// no graph, and it exists while empty. An ordinary named graph is created and is gone once
-/// empty (guard).
+/// A graph target naming another store's default graph is the default graph for what a
+/// graph result says too: a write to it creates no graph, and it exists while empty. An
+/// ordinary named graph is created and is gone once empty (guard). The rows failed on
+/// slice 3's 6794ab22.
 #[test]
 fn a_graph_target_naming_the_default_graph_answers_as_the_default_graph() {
     let rows = [

@@ -98,8 +98,8 @@ pub(crate) fn backup_image(
     };
     let json = serde_json::to_vec_pretty(&manifest)
         .map_err(|error| StoreError::Configuration(error.to_string()))?;
-    // Written under a temporary name, synced, then placed and its directory synced (fix check
-    // r1): a restore reads it, and a backup reported done must not lose it to a power loss.
+    // Written under a temporary name, synced, then placed and its directory synced:
+    // a restore reads it, and a backup reported done must not lose it to a power loss.
     let path = dir.join(MANIFEST);
     let temporary = path.with_extension("tmp");
     let placed = (|| {
@@ -264,7 +264,7 @@ pub fn place_image(
             marker.display()
         )));
     }
-    // Every new level durably named (review r1, R1-F2), as the placement owns it.
+    // Every new level durably named, as the placement owns it.
     nrese_engine::place::create_dir_all(data_dir).map_err(|e| io(e, data_dir))?;
     let target = data_dir.join(&name);
     // Synced and durably named (F3): a power loss after the restore returned must not

@@ -392,8 +392,8 @@ fn cached_as_a_build_begins(
     seen
 }
 
-/// A cold build of U1 begins with no older revision's ontology that only the cache keeps
-/// (SYN-61 review r1 N1): its charge would hold the room the build's own reading needs, and
+/// A cold build of U1 begins with no older revision's ontology that only the cache keeps:
+/// its charge would hold the room the build's own reading needs, and
 /// the cache lets it go only when the build's taxonomy reads the new one, after.
 #[test]
 fn a_cold_build_begins_with_no_older_cached_ontology() {
@@ -506,7 +506,7 @@ fn decided_then(
     (String::from_utf8(out).unwrap(), status.expect("a status"))
 }
 
-/// R1-F2, one way: at the decided revision an annotation property's domain puts `:x a :C`
+/// One way: at the decided revision an annotation property's domain puts `:x a :C`
 /// in L only (OWL 2 DL gives the domain no meaning for what it annotates); a commit then
 /// removes the domain. The answer `true`, read at the decided revision, may only come
 /// `unsound`: its status is that revision's, not the later one's.
@@ -526,7 +526,7 @@ fn an_answer_keeps_the_mark_of_its_revision_when_a_commit_repairs_the_ontology()
     assert_eq!(status.as_str(), "unsound", "{line}");
 }
 
-/// R1-F2, the other way: at the decided revision an ordinary property's domain entails
+/// The other way: at the decided revision an ordinary property's domain entails
 /// `:x a :C` (the rules' route); a commit then adds an annotation property's domain on other
 /// terms. The answer `true`, entailed at its revision, isn't marked by the later one.
 #[test]
@@ -545,7 +545,7 @@ fn an_answer_takes_no_mark_from_a_later_revision() {
     assert_ne!(status.as_str(), "unsound", "{line}");
 }
 
-/// R1-F2, a query naming its dataset: its rows are read at the revision its status was
+/// A query naming its dataset: its rows are read at the revision its status was
 /// decided on. A commit after the decision removes the statement it asks for; the answer
 /// is still `true`.
 #[test]
@@ -563,7 +563,7 @@ fn a_query_naming_its_dataset_reads_the_revision_it_was_decided_on() {
     );
 }
 
-/// R1-F2, a read of the inferred statements alone (`FROM onto:implicit`): run, EXPLAIN and
+/// A read of the inferred statements alone (`FROM onto:implicit`): run, EXPLAIN and
 /// the plan each give the status of the revision the read was on. There an annotation
 /// property's domain puts `:x a :C` in L only; a commit between the read and its status
 /// removes the domain. The status stays `unsound`.
@@ -609,7 +609,7 @@ fn a_read_of_the_inferred_statements_alone_keeps_the_mark_of_its_revision() {
     }
 }
 
-/// R1-F5: the ontology read the status needs, refused at its budget (nothing cached for the
+/// The ontology read the status needs, refused at its budget (nothing cached for the
 /// revision, neither its ontology nor its mark, and the bounds' memory spent, between the
 /// decision and the status): whether
 /// OWL 2 DL reads the data otherwise than the rules isn't known, so the answers are

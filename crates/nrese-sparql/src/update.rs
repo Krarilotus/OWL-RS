@@ -293,7 +293,7 @@ fn apply_operation<T: UpdateTarget>(
         }
         GraphUpdateOperation::Transfer { op, from, to, .. } => {
             // SPARQL 1.1 Update §3.2.3–3.2.5: a transfer between two names of one store graph
-            // changes nothing (review r1 of slice 2, S2-F1); the names are resolved first.
+            // changes nothing; the names are resolved first.
             if graph_name(from) == graph_name(to) {
                 return Ok(());
             }
@@ -319,7 +319,7 @@ fn apply_operation<T: UpdateTarget>(
 /// statement or protocol dataset. A graph the user may not read is absent, so nothing is
 /// copied from it; inserting into a graph the user may not write fails the request.
 ///
-/// Memory (SYN-54 review r1, F1): the source's statements are read into a buffer charged to
+/// Memory: the source's statements are read into a buffer charged to
 /// the request's envelope, and their room in the pending changes is reserved from the
 /// transaction's budget before it grows ([`PendingWrite::try_reserve_inserts`], where the
 /// transaction has one, [`PendingWrite::charges_pending`]: the mutation pipeline's, a pending

@@ -50,7 +50,7 @@ const PRODUCT: &str = "(?s rdfs:p ?o), (?x rdfs:q ?y), (?u rdfs:q ?v)";
 /// update is `Interrupted`. Each row's work is a product the base would scan in full:
 /// a round's join, the consistency check through the new fact (one that reports every
 /// binding, and one whose guard rejects them all), and DRed's search for a rederivation
-/// that fails (N10 review r1, F2).
+/// that fails.
 #[test]
 fn an_evaluation_stops_within_its_poll_interval() {
     struct Row {

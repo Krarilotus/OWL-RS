@@ -2,7 +2,7 @@
 //! background maintenance to end, so the store is released when it returns (its directory
 //! lock: a reopen succeeds at once). It must neither hang because that thread is the one
 //! maintenance's parallel work needs, nor run unrelated jobs of the pool while there is no
-//! such work (a caller may hold a lock one of them wants). A hang blocks (brief v3 §2).
+//! such work (a caller may hold a lock one of them wants). A hang blocks.
 //!
 //! Its own binary: a global pool of one thread, so the dropping thread is the only one that can
 //! run maintenance's parallel parts. The tests run one at a time.

@@ -173,7 +173,7 @@ fn transfers_read_the_stored_source_graph_whatever_the_read_options() {
 }
 
 /// Guard: COPY's `WHERE` binds `?s` to the stored blank node, and its template has none of its
-/// own: the copy holds the same blank node (store-wide blank node identity, brief §6).
+/// own: the copy holds the same blank node (store-wide blank node identity).
 #[test]
 fn guard_a_copy_keeps_its_blank_nodes() {
     let engine = store(false);

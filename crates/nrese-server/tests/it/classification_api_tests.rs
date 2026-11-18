@@ -139,7 +139,7 @@ ex:A a owl:Class .
 "#;
 
 /// A restriction with no property: the reader leaves the axiom out (a fatal diagnostic),
-/// so the rest's model says nothing of the whole (sol-loop r1 S1).
+/// so the rest's model says nothing of the whole.
 const MALFORMED: &str = r#"
 @prefix ex: <http://example.com/> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .

@@ -42,7 +42,7 @@
 //! evicted while its revision is current, and counts against the budget. After a commit it
 //! is pinned again the next time it is computed.
 //!
-//! **Published state only** (the lifecycle contract's S3). Everything that changes what
+//! **Published state only.** Everything that changes what
 //! other queries find (a claim, a pin, a revision's advance, an offer, an output slot, the
 //! insert and its evictions) takes the engine's [`Admission`] of the snapshot computed on,
 //! and the key it stores under has that snapshot's identity. The store's cache admits only
@@ -1171,7 +1171,7 @@ mod tests {
         ));
     }
 
-    /// Item 7 of the token design check (F3): a part claimed on a published snapshot and
+    /// A part claimed on a published snapshot and
     /// finished after a newer revision stored its own is kept for neither: not as the newer
     /// revision's (its key is its own snapshot's), nor under its old revision.
     #[test]
@@ -1194,7 +1194,7 @@ mod tests {
         assert!(cache.state().flights.is_empty());
     }
 
-    /// 3.6's design note §11, O4 and O5: a version's own cache keeps what its budget takes.
+    /// A version's own cache keeps what its budget takes.
     ///
     /// - Input: an own cache charged to a part of a 4,000-byte envelope (about two parts of
     ///   100 rows, 1,597 bytes each with their bookkeeping); four such parts computed on a
@@ -1224,7 +1224,7 @@ mod tests {
         assert_eq!(envelope.used(), 0, "dropped with its version, released");
     }
 
-    /// 3.6's design note §11, O7: the store's cache admits only published state, a version's
+    /// The store's cache admits only published state, a version's
     /// own cache only unpublished state; the other kind is refused (and asserts in debug
     /// builds; no caller passes one).
     #[test]

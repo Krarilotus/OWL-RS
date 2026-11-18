@@ -356,7 +356,7 @@ mod tests {
         assert!(validate(&o, &good).is_ok());
     }
 
-    /// The validator holds on its own, whatever built the candidate (PR #38 review, R1-2).
+    /// The validator holds on its own, whatever built the candidate (PR #38).
     /// Neither ontology has a model:
     /// - [`overlapping_inverses`], with a's q-edge to b: by `inverse(p, q)` it is b's p-edge
     ///   to a, which `B ⊑ ≤ 0 p` forbids;

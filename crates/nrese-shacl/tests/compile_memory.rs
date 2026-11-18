@@ -56,7 +56,7 @@ fn load(turtle: &str) -> Snapshot {
     engine.snapshot()
 }
 
-/// SHCL-AMP r1 R1: a validation that its envelope can't afford stops before it holds its
+/// A validation that its envelope can't afford stops before it holds its
 /// report. Four parameters with eight values each and an ASK that every combination fails
 /// give 8^4 = 4096 results, each decoding the shape's 4 KiB message: 16 MiB of message text
 /// alone. Under a 1 MiB envelope the validation is refused, and what it held at most stays
@@ -103,7 +103,7 @@ fn a_refused_validation_holds_less_than_its_report() {
     assert!(bytes < 8 << 20, "held {bytes} bytes");
 }
 
-/// SHCL-AMP R1 sol r1 S2: a SELECT constraint's solutions are made results as they are read,
+/// A SELECT constraint's solutions are made results as they are read,
 /// not kept decoded first. 16 × 16 solutions each bind ?value to one stored 64 KiB literal:
 /// 16 MiB of decoded values if they were kept. Under a 1 MiB envelope the validation is
 /// refused, and what it held at most stays below half of that.
@@ -150,7 +150,7 @@ fn a_refused_select_validation_holds_less_than_its_solutions() {
     assert!(bytes < 8 << 20, "held {bytes} bytes");
 }
 
-/// SYN-56 review r1 F1: comparing a change of the shapes copies nothing that a shape's
+/// Comparing a change of the shapes copies nothing that a shape's
 /// results share. 2048 subjects of ex:p each lack ex:required, against a property shape with
 /// 1024 messages: copied into each earlier result's comparison key, the messages' ids alone
 /// would take 2048 × 1024 × 8 bytes = 16 MiB (decoded into each result, far more). An

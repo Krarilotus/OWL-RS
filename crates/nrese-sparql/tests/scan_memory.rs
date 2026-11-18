@@ -1,5 +1,5 @@
-//! Guard of scans that decode, merge or grow a query's table before it is charged
-//! (notes/2026-11-09-d039-scan-charges.md): a scan's columns are decoded from the index, a
+//! Guard of scans that decode, merge or grow a query's table before it is charged:
+//! a scan's columns are decoded from the index, a
 //! scan over both stacks merges two column sets into a third, a scan the index can't answer
 //! a column at a time grows its table row by row, and a distinct walk makes a column of the
 //! groups it found. Each draws from the query's budget before it allocates, so a query whose

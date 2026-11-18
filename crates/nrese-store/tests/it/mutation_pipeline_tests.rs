@@ -1240,10 +1240,10 @@ fn a_commit_breaking_a_datatype_rule_is_rejected_with_the_rule_named() {
         .unwrap();
 }
 
-/// A ranged owl2-rl commit is judged by the datatype's whole lexical space (XSDVAL review
-/// r1): a dateTimeStamp needs its timezone whatever its precision (XML Schema 1.1 Part 2
-/// §3.4.28.1, R1-W1), and hexBinary is hex digit pairs without a sign (§3.3.15.2, R1-W3):
-/// both are rejected with dt-not-type. The review's controls commit: the long fraction with
+/// A ranged owl2-rl commit is judged by the datatype's whole lexical space:
+/// a dateTimeStamp needs its timezone whatever its precision (XML Schema 1.1 Part 2
+/// §3.4.28.1), and hexBinary is hex digit pairs without a sign (§3.3.15.2):
+/// both are rejected with dt-not-type. The controls commit: the long fraction with
 /// a timezone, the long fraction as a dateTime (beyond what is represented: not judged), and
 /// valid hexBinary in either case or empty; an ordinary dateTimeStamp without a timezone is
 /// rejected. Every row is reported.
@@ -1325,7 +1325,7 @@ const OLD_MARKER: &str =
 /// A store whose reasoning marker a build with older datatype semantics wrote (engine-v2
 /// 621bf318, which didn't judge an ill-typed literal under a range, so recorded this data
 /// consistent) isn't current once the semantics change (rulesets::SEMANTICS_VERSION): on
-/// reopen it is rechecked, and the inconsistency is reported (XSDVAL review r1, R1-W2).
+/// reopen it is rechecked, and the inconsistency is reported.
 #[test]
 fn a_marker_from_older_datatype_semantics_is_rechecked() {
     let dir = tempfile::tempdir().unwrap();

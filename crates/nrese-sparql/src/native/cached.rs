@@ -45,7 +45,7 @@ pub(super) struct CacheScope {
 impl Context<'_> {
     /// The cache scope of this context: `fixed` (the base IRI, the access) and the
     /// options that decide its results, in the cache the context's own snapshot admits into
-    /// beside the store's `shared` one (the lifecycle contract's S3): the store's for a
+    /// beside the store's `shared` one: the store's for a
     /// published snapshot, its version's own for an unpublished one.
     pub(super) fn cache_scope(
         &self,
@@ -336,7 +336,7 @@ impl Context<'_> {
         pin: Option<&PinRequest>,
     ) -> NativeResult<Solutions> {
         if let Some(pin) = pin {
-            // Pins live in the store's cache alone: unpublished state can't pin (S3), as a
+            // Pins live in the store's cache alone: unpublished state can't pin, as a
             // transaction view, whose cache is off, can't.
             let unpublished = matches!(self.snapshot.admission(), nrese_engine::Admission::Own(_));
             if self.cache.is_none() || unpublished {
@@ -377,7 +377,7 @@ pub(crate) fn output_key(
         super::query_base(query),
     );
     // A canonical view the budgets refused: the answer is that refusal, never a cached one
-    // (the context reads the snapshot as given meanwhile; sol-loop r2 S2).
+    // (the context reads the snapshot as given meanwhile).
     if ctx.canonical_refused.is_some() {
         return None;
     }
@@ -386,8 +386,8 @@ pub(crate) fn output_key(
     encoder.tag(b'S');
     // The answer is the context's reading of `snapshot`, which the cache keys it by: where
     // the context reads another view of it (canonical answers read a view with an identity
-    // of its own), that view's equality and canonical modes are part of these bytes too
-    // (sol-loop r1 S1). One presence byte first, in the same place in every key, so a key
+    // of its own), that view's equality and canonical modes are part of these bytes too.
+    // One presence byte first, in the same place in every key, so a key
     // with them and one without never meet.
     let read = ctx.snapshot.identity();
     if read == snapshot.identity() {
@@ -669,10 +669,10 @@ mod tests {
 
     use crate::{QueryOptions, QueryResults, ResultCache, evaluate_query};
 
-    /// Sol-loop r1 S1's key bytes (the lead's condition on writing the reading only where it
-    /// differs): an answer read canonically, which reads a view of the snapshot with an
-    /// identity of its own, and the same answer read as given never share a key, though the
-    /// cache keys both by the same snapshot.
+    /// The key's bytes, which write the reading only where it differs: an answer read
+    /// canonically, which reads a view of the snapshot with an identity of its own, and the
+    /// same answer read as given never share a key, though the cache keys both by the same
+    /// snapshot.
     ///
     /// - Input: `Alias owl:sameAs Rep` inferred and `Rep p o`, the store reading equality
     ///   classes; `?x p o` with early expansion, its output key read canonically and as given.

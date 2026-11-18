@@ -259,7 +259,7 @@ fn export_growth_accepts_the_bounded_channel_occupancy() {
 
 #[test]
 fn get_growth_accepts_a_channel_filled_by_an_unread_body() {
-    // Spec: SS-15 / master's controlled witness: scheduling alone may fill GET's channel.
+    // Spec: SS-15's controlled witness: scheduling alone may fill GET's channel.
     if !measure::alone() {
         return;
     }

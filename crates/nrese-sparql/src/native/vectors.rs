@@ -1004,7 +1004,7 @@ mod tests {
         // The six winners hold 64 rows of two ids each (6 KiB); a union of i of them makes
         // its i * 1 KiB table while they are held: the third fits, the fourth doesn't.
         // Beside them, the room the search keeps for its k candidates until the union has
-        // them (charged since SRCH r1): the limit leaves room for it too.
+        // them (it is charged): the limit leaves room for it too.
         let room = 6 * size_of::<(TermId, f32, Probed<'_>)>();
         let options = QueryOptions {
             resources: crate::Resources {

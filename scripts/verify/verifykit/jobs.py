@@ -3,10 +3,10 @@ against it, both on the checks host (WSL, cgroup v2: each step capped at its ram
 host.
 
 The build runs there too: fleet stages only git inputs onto a WSL host (fleet-hosts copy.rs
-refuses artifacts there), so a binary built elsewhere can't reach it (the orchestrator's choice,
+refuses artifacts there), so a binary built elsewhere can't reach it (chosen on
 20 Oct 2026). The build job's step is build-on-host.sh, sent inline, so the commit under test
 needn't have it; it builds in its own checkout and leaves the binary in the host's one cache,
-shared with the gates (~/fleet/cache/owlrs-gate; Harness/notes/2026-10-20-host-cache-contract.md),
+shared with the gates (~/fleet/cache/owlrs-gate),
 in bin-<sha12>/ for the run jobs (and returns it with build.json); a second build of the same
 commit only checks it.
 The run job takes the harness (runner and scenarios) from its own checkout, which may be another

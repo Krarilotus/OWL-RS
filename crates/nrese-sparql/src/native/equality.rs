@@ -12,7 +12,7 @@
 //! and kept, process-wide, while it is the latest published snapshot queried; any snapshot of
 //! the same version reads them. An unpublished snapshot's (a transaction's pending state, a
 //! private or an added-to view) are built for its query alone, charged to the query's
-//! budget, and kept nowhere else (the dictionary lifecycle contract's S3).
+//! budget, and kept nowhere else (published-only admission).
 
 use std::cell::OnceCell;
 use std::collections::HashMap;
@@ -189,11 +189,11 @@ impl Context<'_> {
             return Some((admit(&mut cache, &state), None));
         }
         drop(cache);
-        // Unpublished: built for this query alone and kept nowhere else (S3), what they hold
+        // Unpublished: built for this query alone and kept nowhere else, what they hold
         // charged to the query's budget before it is allocated. Where the budget has no room
         // for them, the query goes on without: they only let a join run on one identity per
         // class where its aggregates can't tell, and the join on every identity gives the same
-        // answer (`notes/2026-11-08-dict3-4-equality-design.md`, D1).
+        // answer.
         // One charge before anything is made: the most the map's tables hold while it grows to
         // its bound, its last table beside the one it replaces; trimmed to what it holds.
         let mut held = Reservation::new(Arc::clone(&self.budget));

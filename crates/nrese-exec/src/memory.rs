@@ -614,7 +614,7 @@ mod imp {
     /// (which has no limit), so a cap on an enclosing job is seen only by processes started
     /// directly, as a service or a container starts the server.
     ///
-    /// Decided (the orchestrator, 7 Nov 17:10, P2-A4 review r1 R1-C2, IB1709-5712): a limit on
+    /// Decided: a limit on
     /// an enclosing job is a documented limitation, as a cgroup v2 limit above the namespace is
     /// (IB2001-2a56). No supported call shows it: `QueryInformationJobObject` answers for the
     /// immediate job, and `GlobalMemoryStatusEx`'s commit fields ignore job limits (fleet
@@ -654,7 +654,7 @@ mod imp {
         /// Windows's answer for a process id that no longer names a process.
         const ERROR_INVALID_PARAMETER: i32 = 87;
         /// The words before the first id: the list's two u32 counts, one word on a 64-bit
-        /// host, two on a 32-bit one (Sol, measure-pool r2), as the structure lays them out.
+        /// host, two on a 32-bit one, as the structure lays them out.
         const HEADER: usize = std::mem::offset_of!(JOBOBJECT_BASIC_PROCESS_ID_LIST, ProcessIdList)
             / std::mem::size_of::<usize>();
         const _: () = assert!(
@@ -855,8 +855,8 @@ fn left(limits: impl IntoIterator<Item = Option<(u64, u64)>>) -> Option<u64> {
 /// job-wide and per-process limits (those set), and readings of what each counts: the job's
 /// committed memory and the process's own. `Some(None)`: no job, or no limit set; `None`: in a
 /// job whose limits can't be read, or with a limit whose use can't be read, or where whether
-/// it is in a job can't be asked, so what is left isn't known (Sol, measure-pool r2 and r3:
-/// not the machine's).
+/// it is in a job can't be asked, so what is left isn't known (not the
+/// machine's).
 #[cfg(any(windows, test))]
 fn job_left_from(
     in_job: Option<bool>,
@@ -1128,7 +1128,7 @@ mod tests {
                 "/sys/fs/cgroup/memory/docker/abc/memory.stat",
                 format!("inactive_file 0\ntotal_inactive_file {}", gib(1)),
             ),
-            // A limit of 0 (Sol, measure-pool r1), a limit without its use, and one that
+            // A limit of 0, a limit without its use, and one that
             // makes no sense.
             ("/sys/fs/cgroup/zero.scope/memory.max", "0".to_owned()),
             (
@@ -1244,8 +1244,8 @@ mod tests {
     }
 
     /// A job whose limit counts something that can't be read leaves what isn't known, and so
-    /// does the remaining memory, not the machine's (Sol, measure-pool r2), and so does a job
-    /// whose limits can't be read (r3); a job without a limit, or no job, leaves the machine's.
+    /// does the remaining memory, not the machine's, and so does a job
+    /// whose limits can't be read; a job without a limit, or no job, leaves the machine's.
     #[test]
     fn an_unreadable_job_leaves_what_isnt_known() {
         const G: u64 = 1 << 30;
@@ -1273,7 +1273,7 @@ mod tests {
             Some(None)
         );
         // In a job whose limits can't be read, or where membership can't be asked: unknown,
-        // not taken for no job (Sol, measure-pool r3); outside a job: no limit.
+        // not taken for no job; outside a job: no limit.
         let no_limits = || None;
         assert_eq!(job_left_from(Some(true), no_limits, refused, refused), None);
         assert_eq!(
@@ -1352,7 +1352,7 @@ mod tests {
         assert_eq!(available_bytes(), Ok(limit));
         // What it leaves is the limit less what the job commits now (this process alone is in
         // it): down by what is committed, and up again when that is freed, at each reading
-        // (Sol, measure-pool r1: a reading at a notification is not one now).
+        // (a reading at a notification is not one now).
         const COMMITTED: u64 = 256 << 20;
         const SLACK: u64 = 64 << 20;
         let left = || imp::job_left().flatten().expect("what the job leaves");

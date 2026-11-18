@@ -119,7 +119,7 @@ fn a_zero_instance_budget_certifies_no_model() {
 /// - `⊤ ⊑ {a}`, `⊤ ⊑ A ⊔ B` and `B(x) → ⊥`: every element is `a`, which the rule keeps out of
 ///   `B`, so `A` is `⊤`;
 /// - the same with `a : ∀U.{a}` (`U` the universal property) in place of `⊤ ⊑ {a}`, asserted
-///   or concluded by a rule (PR #32 review, R1): it reaches every element, so no model of the
+///   or concluded by a rule (PR #32): it reaches every element, so no model of the
 ///   TBox alone joins the input's.
 ///
 /// A classification that doesn't list it isn't exact.
@@ -196,8 +196,8 @@ fn an_exact_classification_settles_each_class() {
 /// `lessThanOrEqual(true, true) → a ≠ a` has no model (review A-1607); a strict one on equal
 /// values doesn't hold, so its rule never fires; `lessThan(false, true)` holds, so its rule
 /// has no model either, and where the order isn't evaluated nothing is certified. Floats and
-/// doubles compare as numbers, not by identity (XQuery's `op:numeric-equal`, PR #38 review,
-/// R1-1): NaN equals nothing, itself included, and `0` equals `-0`. Numbers of two types
+/// doubles compare as numbers, not by identity (XQuery's `op:numeric-equal`, PR #38):
+/// NaN equals nothing, itself included, and `0` equals `-0`. Numbers of two types
 /// compare as XPath promotes them: an integer or decimal to the nearest float (`0.1` is
 /// `0.1f`; `16777217` ties to even, `16777216f`), a float exactly to a double (`0.1f` is
 /// above `0.1d`); `1/3` (`owl:rational`) has no XPath type, so nothing is certified. One

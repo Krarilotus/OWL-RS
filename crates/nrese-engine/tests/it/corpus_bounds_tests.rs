@@ -1,5 +1,5 @@
 //! The corpora of reader-scoped searches and their lineage are bounded by their budget alone
-//! (master 7 Nov 17:28 and 17:34, IB1727-3bc5 and IB1728-d941): no count of corpora (see
+//! (IB1727-3bc5 and IB1728-d941): no count of corpora (see
 //! `kept_corpora_are_bounded_and_shared_by_equal_graph_sets`), no count of lineage steps,
 //! no count of the terms the steps hold. Within the budget a corpus is derived over as long a
 //! lineage as reaches a kept ancestor; past it the budget refuses what would grow, before it

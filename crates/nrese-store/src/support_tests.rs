@@ -46,7 +46,7 @@ fn w_a_d(snapshot: &Snapshot) -> EncodedQuad {
 /// fits is decided by the closure of its graphs, under the rules the sets come from. A
 /// repository's rules can change at any time (its reasoning switched off: `use_rules(None)`),
 /// also while a read runs; the read then answers by the rules its sets were computed with,
-/// and nothing it makes is kept for the rules now in place (review r1 of O4, C1). g16's
+/// and nothing it makes is kept for the rules now in place. g16's
 /// reader, past the cap: its sets, then the rules switched off, then its view.
 #[test]
 fn a_rule_change_during_a_read_leaves_it_its_rules_and_keeps_nothing_of_it() {
@@ -102,8 +102,8 @@ fn a_rule_change_during_a_read_leaves_it_its_rules_and_keeps_nothing_of_it() {
     );
 }
 
-/// Spec: an update's `WHERE` reads what its requester's queries read ([`Reading`], review r1 of
-/// PR #50, F1), under the update's cancellation (the orchestrator's case 3 of F1). Its read
+/// Spec: an update's `WHERE` reads what its requester's queries read ([`Reading`], PR #50),
+/// under the update's cancellation. Its read
 /// source, cancelled while it makes the requester's view, fails as cancelled and keeps
 /// nothing; a requester of every graph reads the data as stored, and has none.
 #[test]
@@ -200,7 +200,7 @@ fn statements(snapshot: &Snapshot) -> [Vec<EncodedQuad>; 2] {
     })
 }
 
-/// Spec (D5, review r1 of PR #50): a pending read costs its delta, and reads exactly what the
+/// Spec (PR #50): a pending read costs its delta, and reads exactly what the
 /// gathering read (`gathered`), by support and seeing every inference. Seeded stores of 10 to 90
 /// subjects typed in a class chain (`C0 ⊑ … ⊑ C4`, in the default graph) across five graphs,
 /// some memberships also asserted in a graph the reader can't read (its own graphs derive them:
@@ -293,7 +293,7 @@ fn a_pending_read_is_the_gathered_one() {
         .unwrap();
         let mut tx = store.engine().transaction();
         let view = reading.committed(tx.base()).unwrap();
-        // Dictionary 3.0, sol-loop r1 S1: a view showing facts its published base doesn't
+        // Dictionary 3.0: a view showing facts its published base doesn't
         // infer (asserted out of the reader's reach) is an addition and unpublished; one
         // that only hides its base's inferences keeps the base's publication.
         let adds = view
@@ -376,7 +376,7 @@ fn a_view_stopped_unread_fails_as_memory_unreadable() {
     ));
 }
 
-/// REAS-2 (master, 8 Nov 05:29: a counted test per leaf that filters): the closure after a
+/// REAS-2 (a counted test per leaf that filters): the closure after a
 /// change counts the removed facts its scan passes over (sweep M13), not only those it
 /// delivers. Over three poll intervals of removed facts, none matching, a poller whose stop
 /// has fired polls within the scan and is stopped by it; uncounted, it would never poll.
@@ -410,7 +410,7 @@ fn the_closure_after_a_change_counts_the_removed_facts_it_passes_over() {
     );
 }
 
-/// REAS-2 review r1 F1: the closure after a change estimates its matches (the update's job
+/// The closure after a change estimates its matches (the update's job
 /// planning) by reading the removed facts, each counted as it is read: 8 × `POLL_UNITS` of
 /// them ask the stop at least once every `POLL_UNITS` plus one run (the longest run counted
 /// at once, `POLL_UNITS`). Counted all at once, the whole list was one ask.
@@ -447,7 +447,7 @@ fn the_closure_after_a_change_estimates_within_a_run_of_the_stop() {
     );
 }
 
-/// REAS-2 review r1 F4: a restricted reader's view is brought to a commit from the changed
+/// A restricted reader's view is brought to a commit from the changed
 /// facts (`SupportSets::changes_since`), each counted before it is decided, and its store
 /// probes too. g16's reader, its sets computed, then a commit of 3,000 memberships of `C` in
 /// a graph it can't read: with their `x a D`, 6,000 changed facts that both versions hide,
@@ -528,7 +528,7 @@ fn a_restricted_view_s_changes_are_counted_as_they_are_read() {
     );
 }
 
-/// REAS-2 fix check r2 (R3-F3, SW109). Spec (design note, rule 2: a stop is an error the
+/// REAS-2, SW109. Spec (a stop is an error the
 /// consumer has to handle, never an answer): the re-derived facts of a snapshot, brought to it
 /// from the earlier ones through the commit's touched facts (`compute_rederived`'s fallback),
 /// end once the reading query is cancelled while their closure is asked about. The earlier

@@ -121,7 +121,7 @@ struct Builder {
     /// - a right side `superclass` reads as nothing;
     /// - the right side of a left side read only in part ([`Self::subclass`]);
     /// - a disjoint union's parts, as the class's covering;
-    /// - every part of a disjointness, negated (fix check r1, F3: `A ⊑ ¬≤0 S.D`).
+    /// - every part of a disjointness, negated (`A ⊑ ¬≤0 S.D`).
     ///
     /// This is the ledger the hazards classify, so what the TBox leaves out is never
     /// re-derived there.
@@ -202,7 +202,7 @@ impl Tbox {
     /// The source holds an equality of individuals (`owl:sameAs`) that isn't among the
     /// axioms compiled. The store's reader reads only whether one exists, in any graph, so no
     /// name of it reaches a reader who can't read it, and no sampled statement can be lost
-    /// to the mapping (I24c-2 review r1, F1, F3). Where `closure` applies no equality
+    /// to the mapping. Where `closure` applies no equality
     /// (owl2-ql), any fact may follow: the hazard is global, [`Hazard::Equating`], unless one
     /// already is.
     pub fn with_equality(mut self, closure: Closure) -> Self {
@@ -592,7 +592,7 @@ impl Builder {
                     for (left, _) in self.lefts(o, part, &mut true) {
                         self.include(left, class, false);
                     }
-                    // The direction from the class to the union isn't read (review r1, F2):
+                    // The direction from the class to the union isn't read:
                     // the union's existentials are each part's.
                     self.unread.insert((part, true));
                 }
@@ -665,7 +665,7 @@ impl Builder {
     /// `prp-inv1/2`, `prp-symp`, `prp-eqp1/2`): every one, through an inverse expression
     /// too, since its facts are generalised triples (`x [owl:inverseOf p] y`).
     /// Disjoint class expressions: each part's members are in every other part's
-    /// complement, which the TBox doesn't read (fix check r1, F3). So with two parts or
+    /// complement, which the TBox doesn't read. So with two parts or
     /// more, each part is recorded negated.
     fn disjoint(&mut self, parts: &[ExprId]) {
         if parts.len() >= 2 {
@@ -683,8 +683,8 @@ impl Builder {
         for (left, base) in self.lefts(o, sub, &mut whole) {
             self.superclass(o, left, sup, base);
         }
-        // Individuals in the part of `sub` that isn't read are in `sup` unread (review r1,
-        // F1: `A ⊓ B ⊑ ∃S.D`).
+        // Individuals in the part of `sub` that isn't read are in `sup` unread
+        // (`A ⊓ B ⊑ ∃S.D`).
         if !whole {
             self.unread.insert((sup, true));
             self.mark_partial();
@@ -909,7 +909,7 @@ impl Builder {
             }
         }
         // `⊤ ⊑ B` is a gap too: the closure states no individual to be a Thing, so it
-        // applies none of them (P2-C1 review r1 F1).
+        // applies none of them.
         tbox.gaps = tbox
             .up
             .iter()

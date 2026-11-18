@@ -1,10 +1,10 @@
-//! The DL-oracle differential (design note `2026-11-08-dl-oracle-differential-design.md`).
+//! The DL-oracle differential.
 //! What a `complete` status under `owl2-ql` or `owl2-rl` claims, since a regime may claim it
-//! only where it answers every axiom the query can meet (I24c; master, 8 Nov 10:31): every
+//! only where it answers every axiom the query can meet (I24c): every
 //! certain answer owl2-dl gives (`DlAnswers::Exact`). One that claims `sound` too must hold
 //! nothing else.
 //!
-//! The comparison is direct ([`Relation::Direct`], master 12:33). The saturated one
+//! The comparison is direct ([`Relation::Direct`]). The saturated one
 //! ([`Relation::Claim`]) only attributes a miss:
 //! - the case is loaded with owl2-dl's facts of its named individuals first;
 //! - a miss that remains comes through anonymous individuals (the I24b ledger);
@@ -120,7 +120,7 @@ fn parse(turtle: &str) -> Parsed {
     parsed
 }
 
-/// A run's deadline, and the token that stops owl2-dl's work at it (review G1 r2, F4): a
+/// A run's deadline, and the token that stops owl2-dl's work at it: a
 /// watcher fires it at the deadline, so a DL call begun before it stops there, whatever
 /// its own timeout left. The watcher ends with the run.
 pub(crate) struct Expiry {
@@ -194,8 +194,8 @@ fn rows(json: &[u8]) -> BTreeSet<String> {
         .collect()
 }
 
-/// What a QL/RL `complete` answer is compared with (design note, decision 1, as the master
-/// confirmed it on 8 Nov 12:33).
+/// What a QL/RL `complete` answer is compared with
+/// (confirmed on 8 Nov).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Relation {
     /// Attribution: the named individuals are saturated under owl2-dl first, so only answers
@@ -205,7 +205,7 @@ pub(crate) enum Relation {
     Direct,
 }
 
-/// The test's deadline (review G1 r1, F4): past it, owl2-dl gets no time, a store no query,
+/// The test's deadline: past it, owl2-dl gets no time, a store no query,
 /// and a case no verdict.
 fn left(deadline: std::time::Instant) -> Option<std::time::Duration> {
     deadline
@@ -262,7 +262,7 @@ pub(crate) fn verdicts(
     };
     let parsed = parse(case.turtle);
     // Each owl2-dl task within 5 s, or what is left of the deadline, and the tableau's node
-    // and branch budgets (design note, "The generator"): past them it can't decide, never
+    // and branch budgets: past them it can't decide, never
     // agrees.
     let dl = crate::dl::pipeline_with(nrese_store::DlConfig {
         timeout: Some(time.min(std::time::Duration::from_secs(5))),
@@ -333,10 +333,10 @@ const HEAD: &str = "@prefix : <http://e/> . @prefix owl: <http://www.w3.org/2002
     @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
     @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n";
 
-/// The review fixtures of I24b (review r1 F1, F2; fix checks F3, F4), each with an
+/// The fixtures of I24b, each with an
 /// entailed answer under the OWL 2 Direct Semantics that the rewriting missed on
-/// engine-v2 `7fa950ef`. Kept as the differential's fixed cases (design note, "First
-/// campaign").
+/// engine-v2 `7fa950ef`. Kept as the differential's fixed
+/// cases.
 fn review_fixtures() -> Vec<(&'static str, String, &'static str)> {
     let some = "[ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :D ]";
     let none = "[ a owl:Restriction ; owl:onProperty :S ; owl:onClass :D ;
@@ -410,8 +410,8 @@ fn review_fixtures() -> Vec<(&'static str, String, &'static str)> {
             ),
             x_succ,
         ),
-        // Two shapes that force a fact on an existing successor, no existential (the I24b
-        // second lead, master 10:22). Each comes with a named successor and with an
+        // Two shapes that force a fact on an existing successor, no existential (I24b).
+        // Each comes with a named successor and with an
         // anonymous one. Under (a) the named successor's forced fact is in the
         // saturation, so only the anonymous form tests the claim; (b) shows both.
         (
@@ -456,11 +456,11 @@ fn review_fixtures() -> Vec<(&'static str, String, &'static str)> {
 
 /// The fixed cases. No QL or RL answer labelled `complete` misses a certain answer, and
 /// none claimed `sound` holds an uncertain one, under the direct comparison (the contract)
-/// and the saturated one (review G1 r1, F6: the direct verdict was printed, never asserted).
+/// and the saturated one (the direct verdict was printed, never asserted).
 /// Every fixture is decidable, so a fixture without a verdict fails too.
 ///
 /// On engine-v2 `7fa950ef`, each of the I24b, F1–F4 fixtures should be `missed`: the
-/// harness's own check (design note, "First campaign").
+/// harness's own check.
 #[test]
 fn the_review_fixtures_answer_as_the_dl_oracle() {
     let expiry = Expiry::at(std::time::Instant::now() + std::time::Duration::from_secs(300));
@@ -491,9 +491,9 @@ fn the_review_fixtures_answer_as_the_dl_oracle() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// owl2-dl's work stops at the run's deadline, whatever its own timeout leaves (review G1
-/// r2, F4: each DL call had a fresh timeout, so one begun before the deadline could run
-/// past it). With the run's expiry fired and its deadline still ahead, a decidable fixture
+/// owl2-dl's work stops at the run's deadline, whatever its own timeout leaves (each DL call had a fresh timeout, so one begun before the deadline could run
+/// past it).
+/// With the run's expiry fired and its deadline still ahead, a decidable fixture
 /// gets no verdict under either relation: owl2-dl decides nothing, and nothing agrees.
 #[test]
 fn a_fired_expiry_stops_owl2_dl() {
@@ -517,9 +517,9 @@ fn a_fired_expiry_stops_owl2_dl() {
     }
 }
 
-/// A number setting of the generated test, from the environment's `value` (review G1 r1,
-/// F2: a malformed value fell back to its default, and `NRESE_FUZZ_CASES=0` passed while
-/// comparing nothing): `default` where it is unset; an error where it is set but isn't a
+/// A number setting of the generated test, from the environment's `value` (a malformed value fell back to its default, and `NRESE_FUZZ_CASES=0` passed while
+/// comparing nothing):
+/// `default` where it is unset; an error where it is set but isn't a
 /// whole number of at least `min` (overflow included).
 fn setting(value: Option<&str>, default: u64, min: u64) -> Result<u64, String> {
     match value {
@@ -543,7 +543,7 @@ fn env_setting(name: &str, default: u64, min: u64) -> u64 {
 }
 
 /// Unset settings take their defaults; zero cases and malformed or overflowing values are
-/// refused (review G1 r1, F2).
+/// refused.
 #[test]
 fn generated_test_settings_refuse_zero_and_invalid_values() {
     assert_eq!(setting(None, 100, 1), Ok(100));
@@ -576,7 +576,7 @@ fn generated(seed: u64) -> (String, &'static str, Vec<String>) {
         )),
     });
     let mut rng = Rng::new(seed);
-    // Depth 3 for a share of cases (design note, "Reuse"). The ABox is the case's own
+    // Depth 3 for a share of cases. The ABox is the case's own
     // (named types and edges): the generator's negative and equality assertions made
     // over a quarter of the first 40 cases inconsistent (`dlorc-g1-measure-442a326d`).
     let profile = Profile {
@@ -646,13 +646,13 @@ fn query(
     }
 }
 
-/// The generator's cases (design note, "The generator", confirmed by the master 12:33).
+/// The generator's cases.
 /// Under the direct relation, no QL or RL answer labelled `complete` misses a certain
 /// answer of owl2-dl, and none claimed `sound` holds an uncertain one. Each failure names
 /// its attribution, the saturated relation's verdict: missed there too, through anonymous
 /// individuals (the I24b ledger); agreed there, a named individual's (the I24c
 /// classification). Undecided verdicts are at most a fifth, in total and in each family
-/// with ten verdicts or more, and at least one verdict is decided (review G1 r1, F3). A case
+/// with ten verdicts or more, and at least one verdict is decided. A case
 /// still inconsistent after its redraws was never compared, so it counts as undecided.
 /// Every family's counts are printed (`FAMILY` lines), and each failure its replay.
 ///
@@ -660,7 +660,7 @@ fn query(
 /// - `NRESE_FUZZ_SEED` (default 0) varies the seeds;
 /// - `NRESE_FUZZ_CASES` (default 100, at least 1) sets their number;
 /// - `NRESE_FUZZ_DEADLINE_S` (default 1800) bounds the whole test. Past it, the run stops
-///   and is inconclusive (review G1 r1, F4). The bound stops a hung run; it is not a speed
+///   and is inconclusive. The bound stops a hung run; it is not a speed
 ///   check: a slow shared host has taken about 320 s for the 100 cases beside the rest of
 ///   the suite, and the default leaves room for one five times slower than that.
 #[test]
@@ -672,7 +672,7 @@ fn generated_cases_answer_as_the_dl_oracle() {
     let deadline_s = env_setting("NRESE_FUZZ_DEADLINE_S", 1800, 1);
     let expiry = Expiry::at(std::time::Instant::now() + std::time::Duration::from_secs(deadline_s));
     let deadline = expiry.deadline;
-    // Every setting, so a custom deadline replays too (review G1 r2, F5).
+    // Every setting, so a custom deadline replays too.
     let replay = |i: u64| {
         format!(
             "NRESE_FUZZ_SEED={base} NRESE_FUZZ_CASES={} NRESE_FUZZ_DEADLINE_S={deadline_s} \
@@ -845,7 +845,7 @@ fn judge(counts: &Counts, deadline: std::time::Instant) -> Vec<String> {
 }
 
 /// A run whose deadline passed at any point is inconclusive, even where its counts would
-/// pass: the case it was in ended undecided for want of time (review G1 r2, F4: a deadline
+/// pass: the case it was in ended undecided for want of time (a deadline
 /// in the last case passed the gate). Here one family of ten verdicts, one of them
 /// undecided, under a deadline already past.
 #[test]

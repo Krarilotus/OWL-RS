@@ -91,8 +91,8 @@ fn reflexive_same_as_reads_are_not_complete_on_the_rules_route() {
 /// owl:sameAs ?x` holds of `:rex` (eq-ref, OWL 2 Profiles table 4), so NOT EXISTS removes
 /// it (SPARQL 1.1 §17.4.1.4) and the certain answers are none. Answered over the lower
 /// bound, `:rex` is returned: never labelled sound, in the plan or any answer mode, and
-/// refused under `exact` (P2-06 review r1, F1). The label holds whatever decides first: a
-/// schema read beside it (review r2), or a negated property set, which reads `owl:sameAs`
+/// refused under `exact`. The label holds whatever decides first: a
+/// schema read beside it, or a negated property set, which reads `owl:sameAs`
 /// unless it excludes it.
 #[test]
 fn a_reflexive_same_as_read_under_negation_is_not_sound() {
@@ -1123,7 +1123,7 @@ fn a_plain_clash_is_rejected_as_inconsistent_on_both_routes() {
 }
 
 /// A class name that is also an individual (punning, OWL 2 Structural Specification §5.9)
-/// with no equality reaching it, or only its own (`:Dog owl:sameAs :Dog`, R1-F5): PR1
+/// with no equality reaching it, or only its own (`:Dog owl:sameAs :Dog`): PR1
 /// needs no punning, so the ontology leaves the RL route, and `:rex a :Dog`, entailed,
 /// keeps the status the DL path gives it.
 #[test]
@@ -1270,7 +1270,7 @@ const ENTAILED: &str = ":y a :F . :F rdfs:subClassOf :E .";
 
 /// Over an ontology with annotation-property axioms, and over one with an equality
 /// reaching a punned name, each with [`ENTAILED`] beside it: the line of each whose `read`
-/// of `?x a :E` doesn't answer `y` alone (the entailed row kept, R1-F5), or isn't `unsound`
+/// of `?x a :E` doesn't answer `y` alone (the entailed row kept), or isn't `unsound`
 /// with the reason.
 fn unmarked(read: impl Fn(&MutationPipeline) -> (Vec<String>, Completeness)) -> Vec<String> {
     let mut wrong = Vec::new();
@@ -1335,7 +1335,7 @@ fn a_read_inside_a_transaction_carries_the_marks() {
     assert!(wrong.is_empty(), "not marked: {wrong:#?}");
 }
 
-/// R1-F5: under compact equality the inferred statements keep one name per class of equal
+/// Under compact equality the inferred statements keep one name per class of equal
 /// terms, its representative (the smallest id, so the name met first), and reads expand
 /// it. A class name that is also an individual equal to another is found either way: as
 /// its class's representative (`:Dog` first) and as an alias (`:Canis` first). The answer
@@ -1377,7 +1377,7 @@ fn a_punned_name_equal_to_another_marks_the_answers_under_compact_equality() {
     assert!(wrong.is_empty(), "not marked: {wrong:#?}");
 }
 
-/// R1-F3: an addition alone can change how the committed statements read as OWL. Committed:
+/// An addition alone can change how the committed statements read as OWL. Committed:
 /// an ordinary property's domain, which entails `:x a :C` (in the committed closure). Pending:
 /// only `:note a owl:AnnotationProperty`, after which the domain and the assertion are
 /// annotations, which entail nothing about `:x`. The read inside the transaction still finds

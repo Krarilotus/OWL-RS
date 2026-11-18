@@ -1,6 +1,6 @@
 //! A replica refuses a log answer whose records don't match what it says it carries, and
-//! keeps nothing of it: not its revision, not its statements, not after a reopen (review
-//! p2-b7-syn69 r1, R1-F1). The records are real: a primary's log after ordinary commits.
+//! keeps nothing of it: not its revision, not its statements, not after a reopen.
+//! The records are real: a primary's log after ordinary commits.
 
 use std::path::Path;
 
@@ -134,7 +134,7 @@ const MANY: u64 = 3000;
 
 /// A follower stopped while it applies a batch: once `stop` returns, nothing more is
 /// published, the store's directory opens again (nothing holds its lock), at the revision
-/// reached, a whole-record prefix of the batch (review p2-b7-syn69 r1, R1-F2).
+/// reached, a whole-record prefix of the batch.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stopped_follower_publishes_nothing_more_and_lets_go_of_the_store()
 -> Result<(), Box<dyn std::error::Error>> {

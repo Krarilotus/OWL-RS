@@ -1,5 +1,5 @@
-//! A session is valid only for the credential it was verified against (SYN-63, C-201;
-//! design note `2026-11-08-p2-b5-syn63-design.md`, attacks A1–A5): a login whose
+//! A session is valid only for the credential it was verified against (SYN-63, C-201):
+//! a login whose
 //! verification a change of the user's credential overtakes opens no session, and no
 //! token it may have handed out is accepted afterwards.
 

@@ -511,8 +511,8 @@ fn asserted_existentials_are_answered_or_reported() {
             format!("{} {two} rdfs:subClassOf :A .", some(&two)),
         ),
         ("with a schema", format!("{} {elsewhere}", some(":A"))),
-        // Members with reserved names, which the OWL reader leaves out, before `:p`
-        // (P2-C1 merge Sol r4 S1): `:p`'s membership must still be read.
+        // Members with reserved names, which the OWL reader leaves out, before `:p`:
+        // `:p`'s membership must still be read.
         (
             "behind reserved names",
             "_:e a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :A .

@@ -228,7 +228,7 @@ mod tests {
     }
 
     /// A positive decimal too small for f64 (it parses as 0.0) is still positive: an error,
-    /// not 0, which a budget reads as none (review p2-b7-a r1 R1). Every row is checked.
+    /// not 0, which a budget reads as none. Every row is checked.
     #[test]
     fn positive_values_too_small_for_a_float_are_errors() {
         let tiny = format!("0.{}1", "0".repeat(400));

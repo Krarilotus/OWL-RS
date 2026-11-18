@@ -159,7 +159,7 @@ def schedule_errors(passes: list[dict], sides: list[str], min_blocks: int,
 def fleet_host_errors(passes: list[dict], host: str) -> list[str]:
     """Why the passes can't be judged as `host`'s, the fleet host the round names (an A-B-B-A's
     manifest, a timed part's report context), whose floor its verdict reads: a pass from another
-    fleet host, or one that doesn't say (manifest.machine() `fleet_host`). Review r1 R1-F1: the
+    fleet host, or one that doesn't say (manifest.machine() `fleet_host`). The
     fleet may move a timed job between steps when a host's timing window closes, and passes timed
     elsewhere were judged by the first host's floor, "no loss shown". No host named: nothing to
     hold them to (a run outside a fleet job)."""
@@ -746,7 +746,7 @@ def decide(parts: list[list[dict]]) -> dict:
                 resolution.setdefault(h, set()).add(status)
         # A declared hypothesis any round given didn't test, for the reason the gate gave
         # (compare_case), the statistical slots or not: not part of a pass however the rest comes
-        # out (review abba-not-compared r1 W-OUT1; release-not-compared r1 W1: a fourth round's).
+        # out (a fourth round's too).
         for report in rounds:
             for h, why in (report.get("not_compared") or {}).items():
                 if h in declared:
@@ -1473,8 +1473,8 @@ def checkout_receipt(kind: str, identity: str, attempt: str, outcomes: list[Outc
 # overlap; a taken name sends an attempt to the next), never replaced or removed: no reader holding an
 # older record or result can stop it. The record holds a fresh random id, which the result and its
 # receipt carry; `verdict` takes a result only of the newest record's id, and nothing at all from a
-# history it can't order (a sequence held twice, a name of another form, at any position). The
-# orchestrator's design, fix checks r2 and r3, 9 Nov 2026. The run directory is per job: old records stay.
+# history it can't order (a sequence held twice, a name of another form, at any position).
+# The run directory is per job: old records stay.
 # A timed part's run is an attempt too ("timed", its first step: release-gate.sh begin): its report
 # carries it, and `verdict` takes a part's report only of its newest attempt, whatever an earlier run
 # left beside it (a job submitted again under its id keeps its directory; a fetch copies over an
@@ -1887,7 +1887,7 @@ def blocks(plan_: list[str], measure: dict, min_blocks: int = CAMPAIGN_BLOCKS, *
     round's `min_blocks`) reach k, each case's count in whole squares of `square` blocks
     (whole_squares(): the timed sides); a declared outcome's case (`checked`) only the first, where
     it is checked, not timed. `square` has no default (a call without it
-    planned 2 and 8 blocks for three sides). Sol r2: the plan files are the job's block steps
+    planned 2 and 8 blocks for three sides). The plan files are the job's block steps
     (jobs() counts with the same minimum), and a declared outcome isn't rounded up to a square."""
     need = {c: 1 if c in checked else whole_squares(max(int(measure.get(c, {}).get("blocks", min_blocks)), min_blocks),
                                                     square) for c in plan_}
@@ -1901,10 +1901,11 @@ def read_measure(text: str | None) -> dict:
 
 # --- the fleet jobs ----------------------------------------------------------------------------
 
-# Runs and notes from before 26 Oct 2026 name these sides by their ids before that day's history
-# rewrite, 0f465633 and f9b515e8: the same trees.
-BASE = "d348a8a1a9e40cd23381df1faa726d3ffa44948c"  # v1.5, the last recorded run's base
-MAIN = "a0020134c20a33eabe8ead0402f814585b9c7fd0"  # main
+# Runs and notes from before the history rewrites of 26 Oct 2026 and of November 2026 name these
+# sides by their earlier ids, the same trees: v1.5 as 0f465633, then d348a8a1; main as 64a2711b
+# (earlier runs measured an older main, a0020134, before 26 Oct f9b515e8).
+BASE = "21f41249892e0b15635b522e52f284157685b4c7"  # v1.5, the last recorded run's base
+MAIN = "e7a479a33f0bc7879b7b647e1d3373edfd61c0a9"  # main
 
 # The sides measured at a reviewed commit on top of them (benches/PROTOCOL.md §5, "No thread
 # started in a timed window"): a side's revision → that commit.
@@ -1915,7 +1916,7 @@ PERF_LAB = "crates/nrese-store/examples/"
 
 def measurement_table(path: Path = MEASUREMENT_SIDES) -> dict[str, dict]:
     """The sides table, by side. Sides and commits are full revisions: an abbreviated side would
-    miss the lookup by full revision, and its side would be built as itself (Sol, T0 refs r1 S1)."""
+    miss the lookup by full revision, and its side would be built as itself."""
     table = tomllib.loads(path.read_text(encoding="utf-8"))["side"]
     full = re.compile(r"[0-9a-f]{40}")
     bad = [rev for rev, side in table.items() if not full.fullmatch(rev) or not full.fullmatch(str(side.get("commit")))]
@@ -1937,7 +1938,7 @@ def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str
 
     def git(*args: str) -> str:
         # Bytes git doesn't promise as UTF-8 (a commit message in another encoding, a path) stay
-        # readable (Sol, PR #54 R1 fix review r3 D4).
+        # readable (PR #54).
         done = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True, encoding="utf-8",
                               errors="surrogateescape", timeout=60, env={**os.environ, **STORED_OBJECTS})
         if done.returncode != 0:
@@ -1954,7 +1955,7 @@ def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str
         return rev
     try:
         # The parents its object names: a graft or a shallow boundary changes what a walk reports
-        # (Sol, PR #54 R1 fix review D3).
+        # (PR #54).
         header = git("cat-file", "commit", f"{commit}^{{commit}}").split("\n\n", 1)[0]
         parents = [line.split()[1] for line in header.splitlines() if line.startswith("parent ")]
     except SystemExit as e:
@@ -1964,7 +1965,7 @@ def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str
         raise SystemExit(f"the measurement commit {commit[:12]} isn't a commit on {rev[:12]} alone: its parents "
                          f"are {', '.join(p[:12] for p in parents) or 'none'}")
     # Every path the two trees differ in, by plumbing: no diff configuration of the user's may
-    # hide one (Sol, PR #54 r1 R1: diff.ignoreSubmodules=all dropped an added gitlink).
+    # hide one (PR #54: diff.ignoreSubmodules=all dropped an added gitlink).
     changed = git("diff-tree", "-r", "-z", "--no-renames", "--ignore-submodules=none", "--name-only", rev, commit)
     outside = [p for p in changed.split("\0") if p and not p.startswith(PERF_LAB)]
     if outside:
@@ -1976,7 +1977,7 @@ def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str
 def stop_tree(process) -> str | None:
     """Stops `process` and everything it started, at once (benches/suite/measurement_queue.py's stop, without its
     grace): on Windows taskkill /T, elsewhere its process group, which it must lead; then the
-    process itself, whatever the tree's stop did. What may still run, or None (Sol, S2 D2)."""
+    process itself, whatever the tree's stop did. What may still run, or None."""
     import subprocess
     left = None
     if os.name == "nt":
@@ -2008,16 +2009,16 @@ def stop_tree(process) -> str | None:
 def published(repo: str, rev: str, remote: str | None, deadline_s: float = 60) -> str | None:
     """The branch of `remote` whose head has `rev` in its history: the heads the remote names now
     (git ls-remote), read through this checkout's objects as stored. None if no head has it. Only
-    the remote's word counts: a refs/remotes/* ref is anyone's to write here (Sol, PR #54 fix check
-    1 S2). No remote, a failure or no answer within the deadline (its process tree stopped) is a
+    the remote's word counts: a refs/remotes/* ref is anyone's to write here (PR #54).
+    No remote, a failure or no answer within the deadline (its process tree stopped) is a
     SystemExit; a head this checkout hasn't fetched proves nothing."""
     import subprocess
     import tempfile
     if not remote:
         raise SystemExit("no remote to ask whether the side is published (.githooks/pre-push names it)")
     # Its output into files, not pipes: a transport helper's process left behind (an ssh master,
-    # say) may hold them open after git has answered, and only git's own exit is waited for (Sol,
-    # S2 r1 D1).
+    # say) may hold them open after git has answered, and only git's own exit is waited
+    # for.
     with tempfile.TemporaryFile() as out, tempfile.TemporaryFile() as err:
         asking = subprocess.Popen(["git", "-C", repo, "ls-remote", "--heads", remote], stdout=out, stderr=err,
                                   env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, start_new_session=os.name != "nt")
@@ -2113,7 +2114,7 @@ def toml_value(v) -> str:
 def side_inputs(checkout: str, rev: str, revs: list[str]) -> list[dict]:
     """The git inputs a job building `revs` from a checkout of `rev` needs: the sides' measurement
     commits (measurement_inputs()), and each side that `rev`'s history doesn't hold, so that its
-    build finds it (Sol r1 S4, 2 Nov 2026: a base off the change's history was built unstaged)."""
+    build finds it (a base off the change's history was built unstaged)."""
     import subprocess
     inputs = measurement_inputs(checkout, rev, revs)
     for side in dict.fromkeys(revs):
@@ -2173,14 +2174,14 @@ def checkout_rev(checkout: str, candidate: str, harness: str) -> str:
                      "--harness the candidate)")
 
 
-# What a timed part asks, never a host (rule.hosts-belong-to-the-fleet; the brief of 2 Nov 2026): a
+# What a timed part asks, never a host: a
 # timing host that also builds, since each part builds its sides where it times them (its first step,
 # the host held from there) and so needs no binaries staged from elsewhere.
 TIMING_ROLES = ["measure", "build"]
 BUILD_MIN = 25  # a revision's build, at most; one of the same identity on that host is reused
 ASSETS = "owlrs-bench-assets"
 # The SPARQL data step's maker: the catalogue's [makers] entry with `sparql` (SPARQL_PREPARE, below,
-# its one source for planning and preparation alike: sol-loop r6 S4); this where a catalogue names none.
+# its one source for planning and preparation alike); this where a catalogue names none.
 SPARQL_DEFAULT = "benches/sparql/prepare.sh"
 
 
@@ -2193,8 +2194,8 @@ def volume_files(case: dict) -> list[str]:
 
 def frozen(files: set[str], datasets: Path) -> dict[str, dict]:
     """benches/datasets.toml's entries, read only when there are frozen files to look up: a
-    checkout without the file (a test's own repository) plans its generated-data cases (Sol
-    loop proofs 1 and 3, 2 Nov 2026: read for every plan, it failed where no case reads one)."""
+    checkout without the file (a test's own repository) plans its generated-data cases (read for every plan, it failed where no case reads
+    one)."""
     if not files:
         return {}
     return {d["file"]: d for d in tomllib.loads(datasets.read_text(encoding="utf-8"))["dataset"]}
@@ -2203,12 +2204,12 @@ def frozen(files: set[str], datasets: Path) -> dict[str, dict]:
 def catalogue_makers(makers: dict) -> tuple[dict[str, list[str]], set[str], str, dict[str, tuple]]:
     """A catalogue's [makers] (benches/datasets.toml): (DATASET_MAKERS, FORM_ONLY, SPARQL_PREPARE,
     MAKER_CONTAINERS). Declared data, read as data: their one source, for this tree's data step and
-    for a harness's (harness_tables(); review r2 of pkg/maker-containers, R2-W1: tables in code can
+    for a harness's (harness_tables(): tables in code can
     be changed by code, which no reader can follow without running it). ValueError where it isn't
     their shape."""
     def valid(start, maker):
         if not (isinstance(start, str) and start.strip() == start and start and isinstance(maker, dict)):
-            return False  # sol-loop r6 S7: the entry's type before its fields
+            return False  # The entry's type before its fields
         container, needs = maker.get("container"), maker.get("needs", [])
         return (set(maker) <= set(MAKER_KEYS) and isinstance(needs, list) and all(isinstance(n, str) for n in needs)
                 and isinstance(maker.get("form_only", False), bool) and isinstance(maker.get("sparql", False), bool)
@@ -2219,7 +2220,7 @@ def catalogue_makers(makers: dict) -> tuple[dict[str, list[str]], set[str], str,
         raise ValueError("[makers] isn't a table of makers (needs, form_only, sparql, container [finite, positive]"
                          ", note)")
     # A file's maker is the start its made_by begins with (maker_of()); two starts one of which begins the
-    # other would make the answer the order they're listed in, which a save re-sorts (sol-loop r6 S6).
+    # other would make the answer the order they're listed in, which a save re-sorts.
     if overlap := sorted(f"{a} / {b}" for a in makers for b in makers if a != b and b.startswith(a + " ")):
         raise ValueError(f"[makers] has starts one of which begins another ({overlap[0]}): a file's maker is ambiguous")
     sparql = [s for s, m in makers.items() if m.get("sparql")]
@@ -2239,7 +2240,7 @@ MAKER_KEYS = ("needs", "form_only", "sparql", "container", "note")
 # checked against its pins before it enters the cache (data_state()). Every other maker's files
 # are the verified bench assets'. FORM_ONLY: makers whose output a copy can meet only by its form
 # (riot labels the blank nodes afresh on every make): their files count as makeable only with a form
-# pin (`rdfc_sha256`); one without keeps the assets (sol-loop r1 S1: owl2bench-ql-1.nt). Each in
+# pin (`rdfc_sha256`); one without keeps the assets (owl2bench-ql-1.nt). Each in
 # benches/datasets.toml [makers], with its reasons.
 _CATALOGUE = ROOT / "benches" / "datasets.toml"
 DATASET_MAKERS, FORM_ONLY, SPARQL_PREPARE, MAKER_CONTAINERS = catalogue_makers(
@@ -2261,7 +2262,7 @@ def maker_of(entry: dict, tables: "DataTables | None" = None) -> tuple[str, list
 
 # MAKER_CONTAINERS (above, from [makers] `container`): the container each maker that starts containers
 # runs them in, one at a time (memory GB, CPUs): what a job that may run it declares to the fleet and
-# holds the maker's containers to (data_job(); the master, 8 Nov 2026: the fleet refused #129's timing
+# holds the maker's containers to (data_job(); 8 Nov 2026: the fleet refused #129's timing
 # jobs, their makers' containers undeclared). Its figures' measured reasons are their [makers] notes;
 # benches/sparql/prepare.sh's is its own CAP (test_release_gate holds the two alike).
 
@@ -2309,16 +2310,16 @@ class HarnessRefused(ValueError):
 def harness_tables(checkout: str | Path, harness: str) -> DataTables:
     """The dataset metadata of the harness at commit `harness` of `checkout`: what its data step will
     make and how, since a job's data is made there (release-gate.sh prepare, in the harness's
-    worktree), not by the tree that plans it (review r1 R1 of pkg/maker-containers, 8 Nov 2026; PR
+    worktree), not by the tree that plans it (PR
     #139). Its catalogue by tomllib, its makers' tables from the catalogue's [makers]
-    (catalogue_makers(): declared data, nothing in its code can change what the job is told; review
-    r2 R2-W1), and which of its makers' scripts are held to a declaration (held_makers()).
+    (catalogue_makers(): declared data, nothing in its code can change what the job is told),
+    and which of its makers' scripts are held to a declaration (held_makers()).
 
     Refused (HarnessRefused), naming the remedy: no catalogue at that commit (none there, or no such
     commit in `checkout`), one that doesn't read, a malformed [makers], or none. A harness without
     [makers] (before pkg/maker-containers, PR #129's included) is refused whatever its code says, and
     nothing of its release_gate.py is read: a reader of tables kept as code sees what one literal
-    says, while the harness's code can change it (fix check r3 R3-W1 of pkg/maker-containers: an alias
+    says, while the harness's code can change it (an alias
     added Docker to LUBM's needs, planned with no container; "remove the legacy
     reader"). Merging engine-v2, which every timing plan does, gives a harness [makers]."""
     import subprocess
@@ -2376,7 +2377,7 @@ def data_job(cases: list[dict], requires: dict, *, harness: tuple[str, str] | No
     tables = local_tables() if harness is None or not files else harness_tables(*harness)
     if harness is not None and files:
         named = harness[1][:12]
-        if unknown := sorted(files - set(tables.catalogue)):  # sol-loop r3 S4
+        if unknown := sorted(files - set(tables.catalogue)):  # a case file the catalogue doesn't name
             raise HarnessRefused(f"the harness {named}'s catalogue has no {unknown[0]}"
                                  + (f" and {len(unknown) - 1} more" if len(unknown) > 1 else "")
                                  + ", so its data step can neither make nor check it: catalogue it in that "
@@ -2392,13 +2393,13 @@ def data_job(cases: list[dict], requires: dict, *, harness: tuple[str, str] | No
         return requires, {}, {}
     sizes = {start: tables.containers.get(start) for start in starts}
     named = harness[1][:12] if harness else "here"
-    # Every maker of a declared job runs in the one declared container, SPARQL's too (sol-loop r3 S3).
+    # Every maker of a declared job runs in the one declared container, SPARQL's too.
     if unsized := sorted(s for s, size in sizes.items() if size is None):
         raise HarnessRefused(
             f"the harness {named}'s makers start containers it declares no size for ({', '.join(unsized)}: no "
             "container in its benches/datasets.toml [makers]), so the fleet would stop its data step at them: "
             "merge engine-v2 into it, or give --harness at or after pkg/maker-containers")
-    # Their containers take the job's label and limits only where the harness's scripts do (sol-loop r3 S1).
+    # Their containers take the job's label and limits only where the harness's scripts do.
     if loose := sorted(s.split()[1] for s in starts if s.split()[1] not in tables.held):
         raise HarnessRefused(
             f"the harness {named}'s makers don't hold their containers to the job's declaration ({', '.join(loose)}, "
@@ -2508,7 +2509,7 @@ def data_disk_gb(cases: list[dict], tables: DataTables | None = None) -> float:
 
 def query_set_problems(directory: Path, pinned: dict[str, str]) -> list[str]:
     """Why the query set in `directory` isn't its pins (empty: it is): every pinned file, by exact
-    name, with its SHA-256, and no other .rq file (review r1 R1-F2: a count of files passed a set of
+    name, with its SHA-256, and no other .rq file (a count of files passed a set of
     wrong contents, or of other names)."""
     if not directory.is_dir():
         return [f"no {directory}"]
@@ -2533,7 +2534,7 @@ def data_state(cases: list[dict], make: bool = False, root: Path | None = None,
       with `make`, one benches/sparql/prepare.sh makes is made into the cache first, its failure
       failing the data. Their one gate is prepare's freeze check (their SHA-256), which links and
       converts them: here the probe reports a size other than the frozen one, and with `make` leaves
-      the verdict to that check (one validator each, not two; review r1).
+      the verdict to that check (one validator each, not two).
     - Query sets (@watdiv...): exact pinned names and SHA-256 (benches/sparql/queries.sha256), in the
       cache and as delivered. WatDiv's generator seeds from the clock, so a set that isn't its pins
       comes from the private bench-inputs repository's commit, a git input of the job
@@ -2542,7 +2543,7 @@ def data_state(cases: list[dict], make: bool = False, root: Path | None = None,
     Lines, and whether everything is there and as pinned."""
     root = root or ROOT
     general, cache = hosts_registry.input_path("general"), sparql_data()
-    files = sorted({f for c in cases for f in volume_files(c)})  # a concatenation's parts too (Sol r2 T2)
+    files = sorted({f for c in cases for f in volume_files(c)})  # a concatenation's parts too
     entries = frozen(set(files), root / "benches" / "datasets.toml")
     lines, ok = [], True
     asides: dict[str, Path] = {}
@@ -2708,7 +2709,7 @@ BENCH_INPUTS_INPUT = "BENCH_INPUTS"
 def bench_inputs(cases: list[dict]) -> list[dict]:
     """The private input repository as a git input (benches/hosts.toml [sources] bench-inputs, its
     variable overriding), where the cases read a pinned query set that can't be made again (WatDiv's):
-    the job fetches it, nothing a host must hold (the orchestrator's decision (b), 2 Nov 2026). None
+    the job fetches it, nothing a host must hold (decided on 2 Nov 2026). None
     where no case needs it, or the repository isn't there: the data probe then says what's missing."""
     import subprocess
     if not any(str(c.get("queries", "")).startswith("@watdiv") for c in cases):
@@ -2746,7 +2747,7 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     by_name = {c["name"]: c for c in catalog}
     # Each part's mutable gate state (release-gate.sh GATE: its plan, data view, passes) is the
     # request's and the part's own: placed by capability, two requests at one candidate, or a part and
-    # the checks, may meet on one host (review r1 R1-F3). The shared binaries and data caches stay
+    # the checks, may meet on one host. The shared binaries and data caches stay
     # shared (GATE_BIN, SPARQL_DATA).
     request = json.dumps([candidate, harness, base, main, cases, blocks_per_round, max_gb, big_gb, layouts, batch,
                           prefix])
@@ -2763,7 +2764,7 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
     # Every build and the data's preparation in one first step, exclusive like every step: the fleet
     # keeps an exclusive job's host only before an exclusive step and while the host takes exclusive
     # work, so the part starts only where it can time and every step runs where these binaries are
-    # (Sol r1 S1; 2 Nov 2026: an untimed first step built on a host outside its timing window).
+    # (an untimed first step built on a host outside its timing window).
     builds = [["bash", "-c", 'set -e; harness=$1; shift; bash scripts/release-gate.sh begin; '
                'for rev in "$@"; do bash scripts/release-gate.sh build "$rev"; '
                'done; bash scripts/release-gate.sh prepare "$harness"', "prepare", harness, *revisions]]
@@ -2799,7 +2800,7 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
                 "est_min": round(est["total_min"]), "_plan": est,
                 "steps": steps,
                 # Builds ask the part's whole memory: a host too small for its blocks would end the hold
-                # after them (Sol r2 S1).
+                # after them.
                 "step_deadline_min": BUILD_MIN * len(revisions) + 120,
                 "requires": requires, "inputs": inputs + fetched}
 
@@ -2814,7 +2815,7 @@ def jobs(candidate: str, harness: str, checkout: str, prefix: str, blocks_per_ro
                                    run, timed_steps, max_gb, block_cases)}
     if big_gb and elsewhere:
         # Its own gate directory (GATE_NAME): placed by capability it may share a host with the timed
-        # part, whose plan and passes would be overwritten (Sol r1 S3); a confirmation keeps it.
+        # part, whose plan and passes would be overwritten; a confirmation keeps it.
         big_env = {**env, "GATE_MIN_GB": str(max_gb), "GATE_MAX_GB": str(big_gb), "GATE_NAME": f"{gate_name}-big",
                    "GATE_PREFIX": f"{prefix}-big", "GATE_RAM_GB": str(big_gb + 4)}
         big_env.pop("GATE_BIG_GB")
@@ -2849,8 +2850,8 @@ FLEET_DEADLINE_S = 120  # a fleet call (check, submit): stopped past this, its r
 
 
 def fleet_call(*args: str) -> tuple[int, str]:
-    """The fleet CLI (`fleet` on PATH, else FLEET_BIN) under a deadline that stops it
-    (rule.remote-calls-have-deadlines): its exit and output; (-1, why) when it gave no answer, which
+    """The fleet CLI (`fleet` on PATH, else FLEET_BIN) under a deadline that stops it:
+    its exit and output; (-1, why) when it gave no answer, which
     a caller treats as "not checked", never as taken."""
     import shutil
     import subprocess
@@ -2931,8 +2932,8 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
     low, high = CONFIRM_BLOCKS
     revs = {"cand": first["candidate"]["revision"], **first["baselines"]}
     # In whole Latin squares of the timed sides: the candidate always, and each baseline that isn't
-    # an earlier one's build (gate()'s aliases; release-gate.sh skips only such a main). Sol r2, 20
-    # Oct 2026: counting revisions dropped a candidate that shares base's, so three timed sides got 2.
+    # an earlier one's build (gate()'s aliases; release-gate.sh skips only such a main).
+    # Counting revisions dropped a candidate that shares base's, so three timed sides got 2.
     timed = 1 + len(set(first["baselines"].values()))
     n = whole_squares(min(high, max([low, *(int((measure or {}).get(c, {}).get("blocks", low)) for c in cases)])), timed)
     harness = first["harness"]
@@ -3215,8 +3216,8 @@ def evidence_errors(timed: list[dict], checks: dict[str, dict | None], candidate
     step's latest attempt (ATTEMPTS: each kind's record, attempt_errors()); a timed part's report that
     isn't its part's latest attempt (TIMED_ATTEMPTS, one a part, timed_attempt_errors()); and a check that isn't
     the run the candidate's CONTRACT requires (its own `passed` decides nothing). A tree, not a
-    commit: the same tree under a merge commit is the same candidate
-    (rule.owl-rs-results-keyed-by-tree)."""
+    commit: the same tree under a merge commit is
+    the same candidate."""
     errors = [f"the candidate's contract: {e}" for e in contract.errors]
     for kind, result in checks.items():
         errors += attempt_errors(kind, result, attempts.get(kind, (None, None)), candidate)
@@ -3465,7 +3466,7 @@ def main() -> int:
                 earlier.unlink(missing_ok=True)
             except OSError as error:
                 # Not a judged result (0 passed, 1 not passed: the step keeps those): a crash, which no
-                # step reads as one (fix check r1: an exit 1 beside the earlier file passed it).
+                # step reads as one (an exit 1 beside the earlier file passed it).
                 print(f"{args.command}: the earlier result {earlier} can't be removed ({error}): no run",
                       file=sys.stderr)
                 return CANT_INVALIDATE
@@ -3603,8 +3604,8 @@ def main() -> int:
         code, said = fleet_call("check", str(path))
         print("  fleet check" + (f" (exit {code})" if code else "") + ":\n    " + "\n    ".join(said.splitlines() or ["-"]))
         if not args.submit:
-            # A plan the fleet refuses exits as refused (abba.py run --plan's sibling, review
-            # release-not-compared r1 OUT1).
+            # A plan the fleet refuses exits as refused (abba.py run --plan's
+            # sibling).
             print(f"not submitted (--plan): fleet submit {path}, or this command with --submit"
                   + ("; fleet check refuses it (above)" if code else ""))
             return 1 if code else 0

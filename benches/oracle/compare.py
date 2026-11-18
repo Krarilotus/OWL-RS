@@ -143,7 +143,7 @@ def classify(query: str, variables: list[str], our_rows: list[str], raw: list[li
     nodes (never an agreement here), decimal division results only an exact oracle decides
     (`division`), or a deviation (`cross-type`: numbers equal across datatypes, a COUNT not in
     xsd:integer). None for a difference, which the rules may explain. Equal rows agree only
-    where the contract says so (T8 PR #56 R1)."""
+    where the contract says so (PR #56)."""
     if any(t.startswith("_:") for rows in [our_rows, *raw] for line in rows for t in line.split("\t")):
         return "blank-nodes"
     mine, ops = answer_of(variables, our_rows), contract.operators(query)

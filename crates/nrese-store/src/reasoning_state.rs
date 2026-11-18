@@ -337,7 +337,7 @@ mod tests {
     }
 
     /// A closure semantics version 2 wrote is recomputed by a build of another version, at
-    /// the first write after opening (PR #58 review r1 W1): version 2's maintenance could
+    /// the first write after opening (PR #58): version 2's maintenance could
     /// recompute an `owl:sameAs` split without what schema statements alone derive, here
     /// `C owl:equivalentClass C` from `C rdfs:subClassOf C`. The marker is the one version 2
     /// wrote for this store, as it wrote it (tests audit DC-09: never recomputed from

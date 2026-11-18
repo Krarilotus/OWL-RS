@@ -95,7 +95,7 @@ impl Engine<'_> {
         // since reading walks them too: a group never costs more than about three times its
         // names. A group has a name per named individual, so asking made a key round cost
         // members × individuals; a key over many properties gives a member many labels, so
-        // reading them for each group would cost groups × labels (PR #48's review). The time is
+        // reading them for each group would cost groups × labels (PR #48). The time is
         // checked per member, here and below.
         let mut held: Vec<Vec<Vec<(ConceptId, DepSetId)>>> = Vec::with_capacity(members.len());
         for &(x, _) in &members {
@@ -130,11 +130,11 @@ impl Engine<'_> {
             }
         }
         // The scratch, charged before any pair is tried, every list by its capacity as allocated
-        // (a one-name list holds four: PR #48's fix check), the partners' list made after the
+        // (a one-name list holds four: PR #48), the partners' list made after the
         // charge with the most it can hold. It is linear in the members and their names, with
         // the partners of one member at a time (every later member, or the buckets of its
         // names), never one entry per pair: storing the pairs came to 3 GB for 20,000 members
-        // that share a name (PR #48's review, F1).
+        // that share a name (PR #48).
         let n = members.len();
         let most_partners = n.max(by_name.values().map(Vec::len).sum());
         let held_bytes = |groups: &Vec<Vec<(ConceptId, DepSetId)>>| {

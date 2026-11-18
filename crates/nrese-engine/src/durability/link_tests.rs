@@ -1,4 +1,4 @@
-//! Names reached through links (DUR-4; fix check DEFER-F1-SYM): every directory entry the
+//! Names reached through links (DUR-4): every directory entry the
 //! resolution of a store's path reads is made durable, the link's own entry and its target's
 //! chain alike, not only the path's lexical holders.
 //!
@@ -257,7 +257,7 @@ fn making_a_directory_reaches_through_links() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// `..` after a link on Windows (sol-loop round 1, S1): Windows takes a path's `..` lexically
+/// `..` after a link on Windows: Windows takes a path's `..` lexically
 /// before the file system sees it (a verbatim `\\?\` path aside), so `b\alias\..\tenant\store`
 /// is `b\tenant\store` whatever `alias` points to. Row, for each link kind: `b\alias` →
 /// `t\deep`, both `b\tenant\store` and `t\tenant\store` there; naming the path syncs `b` and
@@ -302,7 +302,7 @@ fn dot_dot_after_a_link_is_taken_as_windows_takes_it() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Windows' lexical normalisation, as `place::as_walked` applies it (sol-loop round 2, S3):
+/// Windows' lexical normalisation, as `place::as_walked` applies it:
 /// only a root absorbs a `..`. A drive-relative path (`C:x`, no root) keeps a `..` that goes
 /// above its start, as a relative path does. A verbatim path is left as it is. Rows of (path,
 /// what Windows walks), from Windows' path normalisation rules. Before the fix a drive-relative
@@ -331,7 +331,7 @@ fn windows_paths_are_walked_as_windows_normalises_them() {
 }
 
 /// A drive-relative path whose `..` goes above its start, and a relative link target from a
-/// relative root (sol-loop round 2, S2 and S3), on Windows. Both are relative to this test's
+/// relative root, on Windows. Both are relative to this test's
 /// working directory (never changed: a directory made inside it).
 /// - S3: `D:..\<cwd's name>\<made>\a\store` (D the working directory's drive) names the chain
 ///   through the working directory's parent, and succeeds; before the fix the prefix absorbed
@@ -538,8 +538,8 @@ fn holds(engine: &Engine, n: u64) -> bool {
 }
 
 /// A store whose own WAL directory (or WAL archive) is a link to a directory elsewhere has the
-/// names its target's resolution reads made durable before a commit is acknowledged (review
-/// r1, R1-L1): the store's internal directories are opened through such a link, so their
+/// names its target's resolution reads made durable before a commit is acknowledged:
+/// the store's internal directories are opened through such a link, so their
 /// target's chain holds every record. A store made and closed at `store`, its `wal` (or, with
 /// the WAL archive, `wal-archive`) then moved to `data/new-parent/` and linked back. With the
 /// sync of `data/new-parent` (a target ancestor) failing with a non-permission error, the
@@ -750,8 +750,8 @@ fn naming_a_file_reaches_through_links() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A file link with a relative target in a directory reached through a link (sol-loop r1 on
-/// DUR-5, S1): its target is taken from the directory the link is in, as reached, not as
+/// A file link with a relative target in a directory reached through a link:
+/// its target is taken from the directory the link is in, as reached, not as
 /// spelled. `p` links to `real/q`, and `real/q/f` links to `../data/new/h`: naming `p/f`
 /// syncs `real/data/new` and its holders, where the file is (`data/new/h`, which the spelling
 /// `p/../data/new/h` reads lexically on Windows, is a decoy there). Rows for each link kind.
@@ -809,8 +809,8 @@ fn newest_file(dir: &Path, prefix: &str, suffix: &str) -> PathBuf {
 }
 
 /// A store whose authoritative files are links to files elsewhere has the names their targets'
-/// resolution reads made durable before a commit is acknowledged (DUR-5, fix check r2 on
-/// DUR-4, R2-F1): the open reads the checkpoint it loads and the segments it replays through
+/// resolution reads made durable before a commit is acknowledged:
+/// the open reads the checkpoint it loads and the segments it replays through
 /// such a link, and appends to the active segment through it. A store made and closed, the
 /// file then moved to `data/new-parent/` and linked back. With the sync of `data/new-parent`
 /// (a target ancestor) failing with a non-permission error, the reopen or its first commit is
@@ -914,8 +914,8 @@ fn a_store_whose_files_are_links_names_their_targets_chain() {
 }
 
 /// The newest segment left after the open's replay is the one `Wal::open` appends to, and is
-/// named when it is a link, whatever the replay did to the segments (review r1 on DUR-5, N2:
-/// the open finds it without listing the log again). Rows, judged apart:
+/// named when it is a link, whatever the replay did to the segments (the open finds it without listing the log again).
+/// Rows, judged apart:
 /// - under a checkpoint: the only segment left holds commit 1, which the checkpoint holds too,
 ///   so none of its records is replayed; it is linked to `data/new-parent/`;
 /// - after a point-in-time cut: commits 1, 2 and 3 in segments of their own, the first linked;

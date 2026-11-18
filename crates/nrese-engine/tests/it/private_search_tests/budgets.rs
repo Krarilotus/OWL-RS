@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// Sol-loop r1 B1: a private search's own index is charged as an upper bound of what it
+/// A private search's own index is charged as an upper bound of what it
 /// allocates. One own literal of 10,000 distinct words (about 60 KB of text; its index
 /// holds 10,000 words with their postings, well past 256 KiB) within a 256 KiB request is
 /// refused; within 64 MiB it is found. Red before the fix: the old estimate (three bytes a
@@ -41,9 +41,9 @@ fn a_private_search_charges_its_own_index_before_it_builds_it() {
     );
 }
 
-/// Sol-loop r2 B1: a word alone in its shard costs its index a whole B-tree root. One own
+/// A word alone in its shard costs its index a whole B-tree root. One own
 /// literal of 36 one-character words (`0` to `9`, `a` to `z`: 36 shards) needs about 29 KB
-/// for its shard maps and roots alone; within 32 KiB it is refused (the r1 charge, about
+/// for its shard maps and roots alone; within 32 KiB it is refused (the earlier charge, about
 /// 27.7 KB, admitted it), within 64 MiB found.
 #[test]
 fn a_private_search_charges_a_root_for_each_sparse_shard() {
@@ -78,7 +78,7 @@ fn a_private_search_charges_a_root_for_each_sparse_shard() {
     );
 }
 
-/// Attack item 12: a private search within a budget too small for what it builds is
+/// A private search within a budget too small for what it builds is
 /// refused, never answered in part; within enough, it answers as the oracle does. Text, IRI
 /// and vectors, the corpora cold.
 #[test]
@@ -138,7 +138,7 @@ fn a_private_search_without_room_is_refused() {
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
-/// V3 package review r1 B1: the global text and IRI entry points of a private snapshot
+/// The global text and IRI entry points of a private snapshot
 /// charge what they build to the budget its caller's capability names: its reader's
 /// (attached with `reading_within`, as a SPARQL query attaches its own) where it has one,
 /// else its private transaction's. The own documents: a literal of 10,000 distinct words and

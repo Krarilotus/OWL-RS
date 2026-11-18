@@ -1,8 +1,8 @@
-//! Package 3.0's guards for the shared-state capability
-//! (`notes/2026-11-08-dict3-0-shared-state-design.md` §3; the design check `review-dict3-token-r0`
-//! §5 items 1, 2, 5, 6, 8 and 10 in 3.0's share). The oracle is the capability itself:
-//! `Snapshot::shared_state`, which every cache owner's admission will need. Its absence is what
-//! keeps an unpublished snapshot's state out of shared caches.
+//! Package 3.0's guards for the shared-state capability.
+//! The oracle is the capability itself:
+//! `Snapshot::shared_state`, which every cache owner's admission will need.
+//! Its absence is what keeps an unpublished snapshot's state out of shared
+//! caches.
 
 use std::sync::Arc;
 
@@ -64,8 +64,8 @@ fn inferred(snapshot: &Snapshot) -> Vec<EncodedQuad> {
         .collect()
 }
 
-/// Whether `snapshot` grants a token. Every row of the matrix also checks 3.0c's item 1
-/// (`notes/2026-11-09-dict3-0c-own-state-design.md` §3): `admission()` is `Own` exactly where
+/// Whether `snapshot` grants a token. Every row of the matrix also checks that
+/// `admission()` is `Own` exactly where
 /// `shared_state()` is `None`, and either capability gives back the snapshot itself.
 fn token(snapshot: &Snapshot) -> bool {
     let shared = snapshot.shared_state();
@@ -85,8 +85,8 @@ fn token(snapshot: &Snapshot) -> bool {
     shared.is_some()
 }
 
-/// Review §5 item 1, 3.0's share: pending state of both kinds grants no token, with no private
-/// id involved.
+/// Pending state of both kinds grants no token, whether its statements
+/// use only existing ids or new ones.
 ///
 /// - Input: a published snapshot; writer pending snapshots (`pending_snapshot` and `pending_over`,
 ///   and DUR-6a's charged `_within` forms of both, once changed) after inserting and deleting
@@ -168,7 +168,7 @@ fn derived(source: &Snapshot, added: EncodedQuad) -> Snapshot {
         .unwrap()
 }
 
-/// Review §5 item 2 and F2: views keep or clear eligibility by the design note's matrix, and
+/// Views keep or clear eligibility by 3.0's matrix, and
 /// never launder an ineligible snapshot.
 ///
 /// - Input: the published snapshot and a writer's pending one, each through every derived
@@ -269,7 +269,7 @@ fn views_keep_or_clear_eligibility_by_the_matrix() {
     }
 }
 
-/// Review §5 item 5 and F1: the staging constructor grants no token, the engine's acquisition
+/// The staging constructor grants no token, the engine's acquisition
 /// does.
 ///
 /// - Input: `Snapshot::new` over the installed version (the bulk path's checkpoint image is made
@@ -290,10 +290,10 @@ fn only_the_engines_acquisition_grants_a_token() {
     assert!(token(&shared.snapshot()), "the engine's acquisition");
 }
 
-/// Review §5 item 6: a pending clone never gains a token, whatever becomes of its transaction.
+/// A pending clone never gains a token, whatever becomes of its transaction.
 ///
 /// - Input: pending snapshots kept across a successful commit, an empty-delta commit, a dropped
-///   transaction, and a speculative transaction's refused commit.
+///   transaction, and a dropped speculative transaction (it has no commit, by type).
 /// - Expected: each kept clone has no token; a snapshot taken from the engine after the
 ///   successful commit has one.
 #[test]
@@ -329,7 +329,7 @@ fn a_pending_clone_never_gains_a_token() {
     assert!(!token(&kept), "after a speculative transaction dropped");
 }
 
-/// Review §5 item 8, 3.0's share: eligibility comes with the version acquired, across a reopen
+/// Eligibility comes with the version acquired, across a reopen
 /// and between engines.
 ///
 /// - Input: a durable engine's snapshot kept while the engine closes and the store reopens;
@@ -355,14 +355,14 @@ fn eligibility_comes_with_the_version_acquired() {
     assert!(token(&independent.snapshot()), "another engine's");
 }
 
-/// The master's 21:01 fix: an `Only` view keeps its source's publication only for statements
-/// among the source's inferred ones, which debug builds check (the design note's §3).
+/// An `Only` view keeps its source's publication only for statements
+/// among the source's inferred ones, which every build checks.
 ///
 /// - Input: the published snapshot, kept-only views of one of its inferred statements, and of
 ///   a statement it doesn't infer (an asserted one, then one it doesn't hold at all), through
 ///   both `InferredSubset::Only` and `with_inferred_only`.
 /// - Expected: the real subset keeps the token; each list naming a statement the snapshot
-///   doesn't infer has none. In every build (sol-loop r1 S1: the store's support views merge
+///   doesn't infer has none. In every build (the store's support views merge
 ///   such statements into their lists).
 #[test]
 fn a_kept_list_beyond_the_inferred_statements_loses_eligibility() {
@@ -391,9 +391,9 @@ fn a_kept_list_beyond_the_inferred_statements_loses_eligibility() {
     }
 }
 
-/// Sol-loop r1 S1 (8 Nov), the master's ruling (F2): a mask that shows a statement its stack
-/// doesn't hold adds it, so a view through it is unpublished; one that only hides, or shows
-/// again what it hid, is a restriction. An addition stays one through later changes.
+/// A mask that shows a statement its stack doesn't hold adds it, so a view through it is
+/// unpublished; one that only hides, or shows again what it hid, is a restriction. An
+/// addition stays one through later changes.
 ///
 /// - Input: the published snapshot's masks: hiding one inferred statement; that, then showing
 ///   it again; showing a statement the stack doesn't infer (an asserted one, as the store's

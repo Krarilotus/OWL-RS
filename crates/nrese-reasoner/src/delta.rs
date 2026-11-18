@@ -59,8 +59,8 @@ use super::violations::{Violations, unlimited};
 ///
 /// Every read takes the reading task's poller and counts on it as a [`Source`] read does
 /// (the call, then each position it visits, the ones it filters out included); on a
-/// stopped poller it does no more work and answers [`Stopped`], never a value (REAS-2 fix
-/// check r1, rule 2). As for [`Source`], the counting is the trait's: an implementation
+/// stopped poller it does no more work and answers [`Stopped`], never a value.
+/// As for [`Source`], the counting is the trait's: an implementation
 /// provides [`VisitsBase`], and `Base` is implemented for every one of those and nothing
 /// else.
 pub trait Base: Sync + sealed::Read {
@@ -510,7 +510,7 @@ fn update_body<B: Base + ?Sized>(
             Ok(())
         }
     };
-    // A read its poller stopped ends the update here (fix check r1, rule 2), as the stage's
+    // A read its poller stopped ends the update here, as the stage's
     // own check does.
     let stopped = |Stopped| Interrupted::default();
     let mut result = Update::default();
@@ -582,7 +582,7 @@ fn update_body<B: Base + ?Sized>(
             extra: &Store::new(deleted.to_vec()),
         };
         // A partner read a stop cut short ends the update: the keys asked about are the
-        // grounded rules', which grow with the schema (fix check r2, R3-F1).
+        // grounded rules', which grow with the schema.
         let ground = &old_program.rules;
         let equality = &old_program.equality;
         super::recursion::non_recursive(ground, equality, schema.rdf_type(), same_as, &|term| {
@@ -707,7 +707,7 @@ fn update_body<B: Base + ?Sized>(
                 region: &region,
             };
             let (mut jobs, mut equality_jobs) = (Vec::new(), Vec::new());
-            // A stopped read ends the job list (fix check r2, R3-F1).
+            // A stopped read ends the job list.
             for (r, i) in old_program.variants(&extra, &stage).map_err(stopped)? {
                 let rule = &old_program.rules[r];
                 // An equality rule, over the `same_as` the rules hold them over.
@@ -770,8 +770,8 @@ fn update_body<B: Base + ?Sized>(
                                 edges.push((t[0], t[2]));
                             }
                             // A fact's images grow with the grounded rules that match it: a
-                            // stopped probe ends them, and the scan at its next position (fix
-                            // check r2, sweep B2-051).
+                            // stopped probe ends them, and the scan at its next
+                            // position.
                             for image in old_program.one_step_images(t) {
                                 if image[1] != p {
                                     continue;
@@ -824,8 +824,8 @@ fn update_body<B: Base + ?Sized>(
                     .map_err(stopped)?,
             );
             check_stop()?;
-            // The first probe that finds the stage stopped ends the update (fix check r1,
-            // SW090: a stopped probe read as "keep" walked every candidate after it).
+            // The first probe that finds the stage stopped ends the update (a stopped probe read as "keep" walked every candidate after
+            // it).
             for f in bodiless.into_iter().chain(component) {
                 if overdeletable(f, &stage).map_err(stopped)? {
                     candidates.push(f);
@@ -913,7 +913,7 @@ fn update_body<B: Base + ?Sized>(
                     budget: PROOF_BUDGET,
                     poll: super::eval::Poller::new(stop),
                 };
-                // The first proof a stop ended ends them all (fix check r1, rule 2: a stopped
+                // The first proof a stop ended ends them all (a stopped
                 // candidate was kept unproved, and every one after it asked the stop again).
                 let kept: Vec<Option<Triple>> = candidates
                     .into_par_iter()
@@ -1078,7 +1078,7 @@ fn update_body<B: Base + ?Sized>(
         .collect();
     let settled: &GroundProgram = &program;
     // Each task's probe of a candidate counts on its own poller, before the search makes
-    // one of its own. The first answer a stop ended ends them all (fix check r1, rule 2).
+    // one of its own. The first answer a stop ended ends them all.
     let others: Vec<Option<Triple>> = candidates
         .par_iter()
         .copied()
@@ -1150,7 +1150,7 @@ fn update_body<B: Base + ?Sized>(
         };
         candidates = new_in(&state, candidates, &stage).map_err(stopped)?;
         let mut jobs = Vec::new();
-        // A stopped read ends the job list (fix check r2, R3-F1).
+        // A stopped read ends the job list.
         for (r, i) in program.variants(&extra, &stage).map_err(stopped)? {
             if r < evaluated && !replaced(program.equality[r]) {
                 jobs.extend(Job::variant(&state, &program.rules[r], i, &stage).map_err(stopped)?);
@@ -1219,7 +1219,7 @@ fn update_body<B: Base + ?Sized>(
     added.sort_unstable();
     added.dedup();
     // Two probes per added fact, on the stage's poller; the first that finds it stopped ends
-    // the update (fix check r1, rule 2).
+    // the update.
     let visible_before = |f: Triple| -> Result<bool, Stopped> {
         Ok(base.contains(f, &stage)? && !hidden.contains(&f) && !inserted_set.contains(&f))
     };
@@ -1450,7 +1450,7 @@ fn asserted_mentioning<B: Base + ?Sized>(
 }
 
 /// The facts of `facts` that `state` doesn't hold, in order; [`Stopped`] at the first probe
-/// its poller stopped, the partial list dropped (fix check r1, rule 2: a stopped probe read
+/// its poller stopped, the partial list dropped (a stopped probe read
 /// as "not held" kept every fact after it).
 fn new_in<S: Source + ?Sized>(
     state: &S,
@@ -1520,7 +1520,7 @@ struct Prover<'a, 'p, B: Base + ?Sized> {
     active: HashSet<Triple>,
     budget: usize,
     /// The update's stop, one poller per parallel task: each alternative, producer, search
-    /// and scanned fact of a proof is attempted work (sol sweep M09). `None`: stopped before
+    /// and scanned fact of a proof is attempted work. `None`: stopped before
     /// the task began.
     poll: Option<super::eval::Poller<'p>>,
 }
@@ -1536,7 +1536,7 @@ const PROOF_DEPTH: usize = 64;
 impl<B: Base + ?Sized> Prover<'_, '_, B> {
     /// Whether `fact` is provable over `state` without the facts in `gone`; the second
     /// value says whether a cycle (or the budget) cut the search. [`Stopped`] at the first
-    /// probe its poller stopped: nothing of that search is memoised (fix check r1, rule 2).
+    /// probe its poller stopped: nothing of that search is memoised.
     fn prove<S: Source + ?Sized>(
         &mut self,
         state: &S,
@@ -1621,8 +1621,8 @@ impl<B: Base + ?Sized> Prover<'_, '_, B> {
 /// of `b` (and `b`). Edges are processed one at a time over the relation including the
 /// pairs added so far, which keeps it closed. Returns the new pairs. Each scan, each pair
 /// visited and each probe counts on `poll`; once that has stopped it answers [`Stopped`],
-/// its pairs so far dropped (sweep M11: a predecessor × successor product per edge; fix
-/// check r1, rule 2).
+/// its pairs so far dropped (sweep M11: a predecessor × successor product per
+/// edge).
 fn close_edges<S: Source + ?Sized>(
     state: &S,
     p: u64,

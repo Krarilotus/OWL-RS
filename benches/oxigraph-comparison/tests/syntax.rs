@@ -21,7 +21,7 @@
 //! Every other difference is listed. Those explained (spargebra's right-associative
 //! `-` and `/`, and what each accepts or rejects) are checked to be exactly the expected
 //! ones. A query whose algebras are equal but hold an unresolved sign is listed and counted
-//! apart, never as the same (orchestrator, IB1350-71f7: an EARL report's cannot-tell).
+//! apart, never as the same (IB1350-71f7: an EARL report's cannot-tell).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -47,7 +47,7 @@ use spargebra::term as st;
 /// Renames spargebra's random names (and keeps the query's own): each its own alias, `__x:0`,
 /// `__x:1`, … in order of first appearance. An alias holds a `:`, which no variable name or
 /// blank-node label does (the grammar's VARNAME and BLANK_NODE_LABEL, SPARQL 1.1 rules 166 and
-/// 142), so it never meets a name of the query's (Sol, PR #73 r1, S1: the alias `__x0` merged
+/// 142), so it never meets a name of the query's (PR #73: the alias `__x0` merged
 /// an aggregate's variable with the query's own `?__x0`).
 #[derive(Default)]
 struct Names {
@@ -599,7 +599,7 @@ impl Names {
 /// nrese's (`__agg0`, `__b1`, …; a query using such a name of its own gets a longer prefix,
 /// parser/mod.rs) and spargebra's random ones as [`Names`] renames them (`__x:0`, …). A
 /// query's own name starting with `__` is renamed with them, alike on both sides. Variables
-/// and blank nodes alone: an IRI or a literal is no name (Sol, syntax-five r1: the literal
+/// and blank nodes alone: an IRI or a literal is no name (the literal
 /// `"__agg0"` was renamed with the aggregate's variable, and `"__a"` compared equal to `"__b"`).
 #[derive(Default)]
 struct Generated(HashMap<String, usize>);
@@ -747,10 +747,10 @@ const UNRESOLVED: &str = "unresolved sign ";
 /// literal the grammar's tokens make (`Literal("-2")`, nrese's). A minus over a canonical
 /// integer becomes the signed literal: `-(2)` evaluates to the term the token `-2` is. Any
 /// other becomes the marker `<unresolved sign ±>(unsigned literal)`, alike both ways: they are
-/// two terms, which spargebra's reading can't tell apart (Sol, PR #73 r1, sol-loop r3:
+/// two terms, which spargebra's reading can't tell apart (PR #73:
 /// `sameTerm(+(1), 1)` is true, `sameTerm(+1, 1)` false). An operand no unsigned token spells
-/// keeps its sign (W1: `-(-1)` became `"--1"`, no number). Over a literal alone (Sol,
-/// syntax-five r1: a base IRI spelling `UnaryMinus(Literal(…integer))` panicked, `Unary_` and
+/// keeps its sign (`-(-1)` became `"--1"`, no number). Over a literal alone (a
+/// base IRI spelling `UnaryMinus(Literal(…integer))` panicked, `Unary_` and
 /// `Unary` compared equal).
 fn fold_sign(expression: &mut E) {
     let Some((sign, number)) = signed_number(expression) else {
@@ -796,7 +796,7 @@ fn signed_number(expression: &E) -> Option<(char, Literal)> {
 /// Whether an integer literal is spelled canonically and isn't zero (digits, no leading zero,
 /// not `0`; XSD 1.1 part 2) and fits nrese's evaluator's 64 bits: a minus before it is then the
 /// spelling its negation has. Past them the operand is no number there, so `-(9223372036854775808)`
-/// is an error and the token `-9223372036854775808` a number (Sol, PR #73 sol-loop r4, R4-S1).
+/// is an error and the token `-9223372036854775808` a number (PR #73).
 fn canonical_integer(number: &Literal) -> bool {
     let value = number.value();
     number.datatype() == xsd::INTEGER
@@ -843,8 +843,8 @@ fn unsigned_number(number: &Literal) -> bool {
 /// literal folded ([`fold_sign`]). Both operators are associative in SPARQL's logic of true,
 /// false and error; nrese builds them as balanced trees (ADR-0012) where spargebra folds them
 /// left, and parentheses group them either way: the tree's shape is no difference. On the
-/// algebra itself, so nothing else (a base IRI's text) is taken for an operator (SYNTAX5-F1,
-/// Sol: two distinct bases compared equal as text).
+/// algebra itself, so nothing else (a base IRI's text) is taken for an operator (two distinct bases compared equal as
+/// text).
 fn associate(node: NodeMut<'_>) {
     match node {
         NodeMut::Pattern(pattern) => pattern.children_mut().into_iter().for_each(associate),
@@ -898,8 +898,8 @@ fn holds_unresolved(pattern: &P) -> bool {
 }
 
 /// How two canonical forms compare, the outcome the test counts: "different algebra" when they
-/// differ; equal, "unresolved" when a sign in them is, which is never the same (orchestrator,
-/// IB1350-71f7), else "same algebra".
+/// differ; equal, "unresolved" when a sign in them is, which is never the same
+/// (IB1350-71f7), else "same algebra".
 fn compare(ours: &Canonical, theirs: &Canonical) -> &'static str {
     if ours.algebra != theirs.algebra {
         "different algebra"
@@ -1312,7 +1312,7 @@ fn subtraction_associates_to_the_left_in_nrese_only() {
     );
 }
 
-/// SYNTAX5-F1 (Sol, PR #61 fix check 2): `&&` and `||` were reassociated in the algebra's
+/// PR #61: `&&` and `||` were reassociated in the algebra's
 /// text, a base IRI's included, so two distinct bases (which `IRI("leaf")` resolves against)
 /// compared equal, and a base spelling `And()` panicked. The nesting of one of them is no
 /// difference; bases, terms, mixed operators, negation, scope and operand order are.
@@ -1392,7 +1392,7 @@ fn and_and_or_differ_in_nothing_but_their_nesting() {
     }
 }
 
-/// Sol, syntax-five r1 (S1): signs were folded in the algebra's text, so a base IRI spelling
+/// Signs were folded in the algebra's text, so a base IRI spelling
 /// `UnaryMinus(Literal(…integer))` panicked and two bases apart by `Unary_` compared equal.
 /// A sign folds over a number literal and nothing else.
 #[test]
@@ -1423,7 +1423,7 @@ fn a_sign_folds_over_a_number_literal_alone() {
     );
 }
 
-/// Sol, syntax-five r1 (S2): generated names were renamed in the algebra's text, so a literal
+/// Generated names were renamed in the algebra's text, so a literal
 /// starting with `__` was renamed as one: `"__agg0"` beside an aggregate made a difference
 /// where there is none, and `"__a"` compared equal to `"__b"`. Names are variables and blank
 /// nodes.
@@ -1449,7 +1449,7 @@ fn generated_names_are_variables_and_blank_nodes_alone() {
     );
 }
 
-/// Sol, PR #73 r1 (W1): a sign was written before any number literal's text, so `-(-1)`, the
+/// PR #73: a sign was written before any number literal's text, so `-(-1)`, the
 /// number 1, became `"--1"^^xsd:integer`, which is no number and another query's own literal.
 /// A sign over a literal no unsigned token spells keeps its unary structure.
 #[test]
@@ -1496,12 +1496,12 @@ fn a_sign_never_folds_into_another_term() {
     }
 }
 
-/// Sol, PR #73 r1, sol-loop r3: a sign was folded into a number wherever the spelling allowed,
+/// PR #73: a sign was folded into a number wherever the spelling allowed,
 /// so `+(1)` and the token `+1` compared the same, though `sameTerm(+(1), 1)` is true and
 /// `sameTerm(+1, 1)` false: unary plus keeps its operand's term, the token is a term of its
 /// own. spargebra reads the two alike, so such a sign is unresolved, never the same; a minus
 /// over a canonical integer alone is one term both ways, and only one nrese's evaluator holds
-/// (sol-loop r4, R4-S1: `-(9223372036854775808)` is an error there, the token a number).
+/// (`-(9223372036854775808)` is an error there, the token a number).
 #[test]
 fn a_sign_over_a_number_is_the_same_only_as_one_term() {
     let query = |text: &str| canonical(SparqlParser::new().parse_query(text).unwrap());
@@ -1570,7 +1570,7 @@ fn a_sign_over_a_number_is_the_same_only_as_one_term() {
     );
 }
 
-/// Sol, PR #73 r1 (S1): spargebra's random names were given the aliases `__x0`, `__x1`, …,
+/// PR #73: spargebra's random names were given the aliases `__x0`, `__x1`, …,
 /// names a query may have itself, so an aggregate's variable merged with the query's own
 /// `?__x0`, and an anonymous blank node with its `_:__x0`. An alias is no name of the query's.
 #[test]
@@ -1610,7 +1610,7 @@ fn not_seen(outcome: &BTreeMap<&str, Vec<String>>, list: &[(&str, &str, &str)]) 
 
 #[test]
 fn an_explanation_holds_for_its_file_and_outcome_alone() {
-    // D-106 (Sol, PR #61 r1: a witness the existing differences don't mask): an explained file
+    // D-106 (PR #61: a witness the existing differences don't mask): an explained file
     // whose outcome changed is a difference again, and its entry stands unseen.
     let list = [("a.rq", "only nrese accepts", "why")];
     let changed = BTreeMap::from([("different algebra", vec!["a.rq".to_owned()])]);

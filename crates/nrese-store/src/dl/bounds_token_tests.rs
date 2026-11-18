@@ -1,5 +1,5 @@
 //! Dictionary 3.0b: the bounds' views, which they derive from a published snapshot alone,
-//! keep its publication. This is F2's contract revision for the DL bounds (the master, 8 Nov,
+//! keep its publication. This is F2's contract revision for the DL bounds (8 Nov,
 //! IB2250-153c): without it the result cache refuses them, and a pinned `owl2-dl` query
 //! fails, which fails a store's open.
 

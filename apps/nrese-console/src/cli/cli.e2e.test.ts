@@ -116,7 +116,7 @@ describe("the CLI's graph target, end to end", () => {
     expect(store.graphs.get(NAMED)).toBe(PAYLOAD);
   }, 30_000);
 
-  // R1-F1: a named target the server reads as the default graph.
+  // A named target the server reads as the default graph.
   test.each(
     SERVER_DEFAULT_ALIASES.flatMap((alias) => [
       ["graph-delete", "--graph", "named", "--graph-iri", alias],

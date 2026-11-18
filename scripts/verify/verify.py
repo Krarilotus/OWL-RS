@@ -59,7 +59,7 @@ from verifykit.server import LaunchError, Server, sha256_of  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCTOR = ("/healthz", "/readyz", "/version", "/api/v1/repositories")
-# The host's one cache, shared with the gates (Harness/notes/2026-10-20-host-cache-contract.md).
+# The host's one cache, shared with the gates.
 CACHE = Path(os.environ.get("NRESE_VERIFY_CACHE", "~/fleet/cache/owlrs-gate")).expanduser()
 
 
@@ -364,7 +364,7 @@ def target_of(args) -> dict:
     """Where the server comes from: --url (running), --server (a binary), --server-rev (a copy of
     a fleet host's build, its checksum and provenance checked). Runs take no lock on the host's
     cache, so a sweep may remove the build while it is chosen: any file error here is a launch
-    failure, with its failing summary, never an escape without one (Sol r3, finding 4)."""
+    failure, with its failing summary, never an escape without one."""
     try:
         return _target_of(args)
     except OSError as e:
@@ -383,7 +383,7 @@ def _target_of(args) -> dict:
                               "(submit its build job: verify.py jobs)")
         # The server runs from a copy of the run's own, and that copy is what is checked: a sweep
         # and an older harness's builder can replace the entry before the server starts or restarts
-        # (PR #47, fix check 1). The copy goes when the run ends.
+        # (PR #47). The copy goes when the run ends.
         (ROOT / "tmp").mkdir(exist_ok=True)
         own = Path(tempfile.mkdtemp(prefix="verify-server-", dir=ROOT / "tmp"))
         atexit.register(shutil.rmtree, own, True)
@@ -394,7 +394,7 @@ def _target_of(args) -> dict:
             raise LaunchError(f"{entry}: its checksum doesn't hold (SHA256SUMS): build it again")
         # Only an isolated build of the commit writes its PROVENANCE (build-on-host.sh). A build
         # without it is from before 26 Oct 2026, when a shared cargo target could leave another
-        # commit's code under this one's name with a valid checksum and REVISION (PR #47, Sol r1 F1).
+        # commit's code under this one's name with a valid checksum and REVISION (PR #47).
         record = entry / "PROVENANCE"
         fields = dict(line.split(" ", 1) for line in record.read_text(encoding="utf-8").splitlines()
                       if " " in line) if record.is_file() else {}
@@ -402,7 +402,7 @@ def _target_of(args) -> dict:
                 or not fields.get("revision", "").startswith(args.server_rev)):
             raise LaunchError(f"{entry}: not an isolated build of {args.server_rev[:12]} (its "
                               "PROVENANCE): build it again (verify.py jobs)")
-        # Its use, for the host cache's sweep (Harness/notes/2026-10-20-host-cache-contract.md §5).
+        # Its use, for the host cache's sweep.
         (entry / ".last-used").write_text(f"{int(time.time())}\n", encoding="utf-8")
         return {"command": [str(binary)],
                 "binary": {"path": str(binary), "sha256": digest, "revision": fields["revision"]}}

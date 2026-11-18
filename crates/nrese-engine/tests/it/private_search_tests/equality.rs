@@ -3,10 +3,10 @@
 
 use super::*;
 
-/// Attack item 9: a private delta that changes `owl:sameAs` statements (one class split,
+/// A private delta that changes `owl:sameAs` statements (one class split,
 /// one joined) under readers of equality classes, expanded and canonical, with the base's
 /// IRI corpus of `ex:g` warm: each IRI search equals an engine holding the same statements.
-/// The mutant that skips the `sameAs` check is to be red here (DICT2 9 Nov 04:02, Q1 b).
+/// The mutant that skips the `sameAs` check is to be red here.
 #[test]
 fn a_private_same_as_change_searches_its_own_classes() {
     let same_as_iri = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
@@ -93,7 +93,7 @@ fn a_private_same_as_change_searches_its_own_classes() {
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
-/// Attack item 9, DICT2's condition (b) (sol-loop r1 F1): a private removal of a `sameAs`
+/// A private removal of a `sameAs`
 /// statement written representative first (`ex:rep owl:sameAs ex:alias`, `ex:rep` the
 /// smaller id), asserted or inferred, under expanded and canonical readers, the base's IRI
 /// corpus of the default graph warm. Its only IRI subject is `ex:rep`, so a derivation
@@ -182,7 +182,7 @@ fn a_private_removal_of_a_same_as_written_representative_first_drops_the_alias()
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
-/// R32-N2's own-slot corpora (DICT2 9 Nov 06:00; 3.0c's per-family test): the views of one
+/// Own-slot corpora (3.0c's per-family test): the views of one
 /// unpublished version (as stored, expanded, canonical) share its own slot, and never an
 /// entry. A writer's pending snapshot and a private one, each over a base where
 /// `ex:alias owl:sameAs ex:rep` is inferred and only `ex:rep` is a subject in `ex:g`, are

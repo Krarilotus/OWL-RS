@@ -69,7 +69,7 @@ def output(main, argv) -> str:
 
 
 class LoadedInputs(unittest.TestCase):
-    """Review r1 of pkg/stage-data, R1-W1 (7 Nov 2026): lubm-10 and lubm-100 became a new release
+    """Lubm-10 and lubm-100 became a new release
     (their sorted distinct lines), and `compare` called a new LUBM result faster than an old one
     without saying the two had loaded other bytes. A case's code-change verdict needs the same
     frozen input files, byte for byte, on both sides; a form pin never stands in for them."""
@@ -197,7 +197,7 @@ class LoadedInputs(unittest.TestCase):
             self.assertIn("faster", text)
 
     def test_csv_different_inputs_refuse_before_correctness(self):
-        # Spec: master's r1 F1 direction: another dataset release -> Inputs/exit 2;
+        # Spec: another dataset release -> Inputs/exit 2;
         # statement counts and answers caused by the new input are not regressions.
         for host in ("fixture", "other-fixture"):
             with self.subTest(host=host), tempfile.TemporaryDirectory() as directory:
@@ -236,7 +236,7 @@ class LoadedInputs(unittest.TestCase):
         code, text = self.compare(self.report(100.0, case="rl-hierarchy"), self.report(50.0, case="rl-hierarchy"))
         self.assertIn("faster", text)
         self.assertEqual(code, 0, text)
-        # Sol-loop r3 V3: an older record without `inputs` against a new one saying {} (none read).
+        # An older record without `inputs` against a new one saying {} (none read).
         code, text = self.compare(self.report(100.0, case="rl-hierarchy"), self.report(50.0, {}, case="rl-hierarchy"))
         self.assertIn("faster", text)
         self.assertEqual(code, 0, text)
@@ -255,11 +255,11 @@ class LoadedInputs(unittest.TestCase):
                 "started": "2026-11-07T16:00:00", "records": records}
 
     def test_recorded_external_bytes_that_disagree_are_not_generated_data(self):
-        """Fix check r3, R3-W1 (7 Nov 2026): a case that once loaded a frozen file (`volume:history.nt`)
+        """7 Nov 2026: a case that once loaded a frozen file (`volume:history.nt`)
         and now generates its data under the same name (today's rl-hierarchy declares no input). A
         historical run without --prepared recorded other bytes of that file in its two repetitions; its
         records collapsed to "unknown", the generated-only exemption read that as "no input", and the
-        new run came out faster, exit 0. Specified (the review's required correction): the exemption
+        new run came out faster, exit 0. Specified: the exemption
         holds only where no record on either side names an external file; recorded external evidence
         that disagrees, or that only some records state, is unknown and refused before pooling."""
         a, b = {"history.nt": "a" * 64}, {"history.nt": "b" * 64}
@@ -286,7 +286,7 @@ class LoadedInputs(unittest.TestCase):
             self.assertIn("input unknown", text)
 
     def test_an_inputs_field_that_isn_t_a_mapping_is_not_none(self):
-        """Design note r3w1, invariant 1: a record that has `inputs` but not as a mapping of file to
+        """A record that has `inputs` but not as a mapping of file to
         hash says something was recorded, not that nothing was loaded; for a case of generated data
         today it is unknown, never the generated-only exemption."""
         for seen in (None, [], "lubm-10.nt", 0):
@@ -296,7 +296,7 @@ class LoadedInputs(unittest.TestCase):
                 self.assertNotIn("faster", text)
 
     def test_generated_data_alone_compares_whatever_mix_of_old_and_new_records(self):
-        """Sol-loop r3 V3, kept by R3-W1's correction: records that name no external file, older ones
+        """Records that name no external file, older ones
         without `inputs` and newer ones saying {} in any mix, on either side, compare."""
         for old, new in (([self.ABSENT, {}], [{}, {}]), ([{}, {}], [self.ABSENT, {}]),
                          ([self.ABSENT, self.ABSENT], [{}, self.ABSENT]), ([{}, {}], [{}, {}])):
@@ -323,7 +323,7 @@ class LoadedInputs(unittest.TestCase):
                 "started": "2026-11-07T16:00:00", "records": records}
 
     def test_an_input_refused_case_s_status_is_still_judged(self):
-        """The master, 8 Nov 2026 (declared-metrics r4's merge note, as R3-F1 in #135): refusing a
+        """Found in PR #135 (8 Nov 2026): refusing a
         case's verdict for its input dropped all its records, so a report from before 7 Nov (no
         `inputs`) against a new one hid the external-input case's status: ok -> failed, beside an
         unchanged generated-data case, came out exit 0. Specified: an input refusal withholds the
@@ -356,7 +356,7 @@ class LoadedInputs(unittest.TestCase):
         self.assertNotIn("faster", text)
 
     def test_an_input_refused_case_gets_no_measure_verdict(self):
-        """Review r1 of pkg/stage-data, R1-W1 (7 Nov 2026): time AND memory verdicts across other input
+        """Time AND memory verdicts across other input
         bytes are no evidence of a code change; work counters and throughput alike. A case refused for
         its input is judged in status, checks and answers only: a peak twice as high or more work over
         other bytes is no regression. (A guard: on the record filter's code these records never reached
@@ -372,7 +372,7 @@ class LoadedInputs(unittest.TestCase):
     def known_issue(self, ms, history, frontier_status, frontier_metric=50.0, frontier_peak=1000):
         """mem-load-20m-2g stopping at its declared memory limit on every repetition (a known issue), its
         run past the limit as given, its records loading `history.nt` as `history` (an older definition
-        of the case: stage-data r3/r4), beside an unchanged generated-data case (rl-hierarchy)."""
+        of the case), beside an unchanged generated-data case (rl-hierarchy)."""
         records = []
         for rep in (1, 2):
             frontier = {"status": frontier_status, "metric": frontier_metric, "peak_mib": frontier_peak,
@@ -406,7 +406,7 @@ class LoadedInputs(unittest.TestCase):
             return code, output(compare.main, paths)
 
     def test_an_input_refused_known_issue_s_run_past_its_limit_is_still_judged(self):
-        """Review r1 of pkg/compare-input-status, R1-W1 (8 Nov 2026): the frontier of a known issue
+        """The frontier of a known issue
         (its run past the declared limit) went ok -> wrong over other input bytes, and compare exited 0:
         the input refusal withheld the frontier's status with its metric and peak. Specified: its status
         is a finding about the new run whatever the input, 1; only its metric and peak go uncompared."""
@@ -432,7 +432,7 @@ class LoadedInputs(unittest.TestCase):
 
     def test_a_case_s_agreeing_records_compare_and_one_silent_record_doesn_t(self):
         """A case that loads frozen files: every record stating the same bytes on both sides compares;
-        one record that doesn't say makes its side unknown (R3-W1's correction: no record's
+        one record that doesn't say makes its side unknown (no record's
         observation is dropped on the way to the decision)."""
         same = {"lubm-10.nt": self.NEW, "univ-bench.nt": "u" * 64}
         code, text = self.compare(self.reps(100.0, [same, same], "rdfs-full-lubm10"),
@@ -446,7 +446,7 @@ class LoadedInputs(unittest.TestCase):
         self.assertIn("input unknown", text)
 
     def test_a_concatenation_s_order_is_part_of_its_input(self):
-        """Sol-loop r3 V2: the same parts concatenated in another order are other bytes loaded."""
+        """The same parts concatenated in another order are other bytes loaded."""
         a = {"lubm-1.nt": "l" * 64, "univ-bench.nt": "u" * 64, "concat 1": "a" * 64}
         b = {"lubm-1.nt": "l" * 64, "univ-bench.nt": "u" * 64, "concat 1": "b" * 64}
         code, text = self.compare(self.report(100.0, a, case="dl-abox-lubm1"), self.report(50.0, b, case="dl-abox-lubm1"))
@@ -454,7 +454,7 @@ class LoadedInputs(unittest.TestCase):
         self.assertEqual(code, 2, text)
 
     def test_an_ore_case_s_converted_ontology_is_its_input(self):
-        """Fix check r2, R2-W2: an `ore:` case loads a converted external ontology, not generated data;
+        """An `ore:` case loads a converted external ontology, not generated data;
         it was taken as input-free, and the registry's shortcut even dropped two different recorded
         hashes. Recorded identities come first; without them the input is unknown."""
         a, b = {"ore:ore_ont_9724": "a" * 64}, {"ore:ore_ont_9724": "b" * 64}
@@ -470,7 +470,7 @@ class LoadedInputs(unittest.TestCase):
         self.assertIn("faster", text)
 
     def test_suite_results_hashing_a_file_they_don_t_list_by_size_hold_to_it(self):
-        """Fix check r2, R2-W1: a hash in `dataset_sha256` for a file outside `datasets` was dropped,
+        """A hash in `dataset_sha256` for a file outside `datasets` was dropped,
         and two runs of other bytes compared (commit-latency loads LUBM its plan doesn't declare)."""
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
@@ -484,7 +484,7 @@ class LoadedInputs(unittest.TestCase):
             self.assertIn("faster", output(compare.main, [str(old), str(same)]))
 
     def test_invocations_agreeing_on_a_hash_hold_whatever_size_each_lists(self):
-        """Sol-loop r5 X1: two invocations hashing a file alike, one listing its size and one not, were
+        """Two invocations hashing a file alike, one listing its size and one not, were
         taken as disagreeing, and a same-bytes comparison was refused."""
         with tempfile.TemporaryDirectory() as d:
             d = Path(d)
@@ -513,7 +513,7 @@ class LoadedInputs(unittest.TestCase):
         self.assertIn("input unknown", text)
 
     def test_suite_results_that_don_t_list_their_inputs_hashes_are_unknown(self):
-        """Sol-loop r3 V1: `datasets: {}` doesn't prove a run read no frozen file (commit-latency
+        """`datasets: {}` doesn't prove a run read no frozen file (commit-latency
         loads LUBM outside its declared inputs, maintenance.py). Only a manifest that states its
         inputs' hashes (`dataset_sha256`, `{}` included) establishes them."""
         with tempfile.TemporaryDirectory() as d:
@@ -568,11 +568,11 @@ class Contracts(unittest.TestCase):
         self.assertNotIn("| 1.0 |", text)
 
     def test_an_answer_the_contract_doesnt_time_enters_no_speed_verdict(self):
-        """T8 PR #56 (Sol's fix review, P2): the run comparison took a query's time on its CSV
+        """T8 PR #56: the run comparison took a query's time on its CSV
         status alone and read answers.json only for a verdict that changed, so a query wrong in
         both runs, by the same row count, came out faster. answers.timed decides, as for versus
         and compete: a wrong or unchecked answer earns no time."""
-        # Sol, PR #56 compare r1: an item is its query's name already; a dotted one (geographica2's
+        # PR #56: an item is its query's name already; a dotted one (geographica2's
         # synthetic tier) keeps its dots, or no verdict is found and the time counts.
         for (verdict, note), item in itertools.product((("wrong", ""), ("incomplete", "no reference answered")),
                                                        ("q1", "00-Synthetic_Selection_Intersects_1_1.0")):
@@ -742,9 +742,9 @@ class CompetitorCompleteness(unittest.TestCase):
         self.assertEqual(verdict["publish"], "permission")
 
     def test_an_answer_the_contract_doesnt_time_excludes_winners(self):
-        """T8 Sol r1 S6: a COUNT in xsd:int for xsd:integer has the same row count, but its answer
-        deviates (answers.json): no time comes from it, nor from a wrong or undecided one. Sol r2
-        S7: nor from one whose answer capture failed after its timed runs (incomplete). PR #56 R3:
+        """A COUNT in xsd:int for xsd:integer has the same row count, but its answer
+        deviates (answers.json): no time comes from it, nor from a wrong or undecided one.
+        Nor from one whose answer capture failed after its timed runs (incomplete). PR #56:
         nor from one no reference checked (unchecked): one rule (answers.timed) for every report."""
         rows = [load(), load(system="other"), query("q1", 10), query("q1", 1, system="other")]
         for verdict, winner in (("ok", "other"), ("deviates", None), ("wrong", None), ("unqualified", None),
@@ -772,7 +772,7 @@ def recorded(path: Path, records: list[tuple[str, str]], systems=("nrese",)) -> 
 
 
 class OneVerdictPerQuery(unittest.TestCase):
-    """T8 PR #56 R3 (Sol's fix check 1): the reports that time (compare, versus, compete) read one
+    """PR #56: the reports that time (compare, versus, compete) read one
     verdict per query from the contract: the worst of every record of it, in any order; joined by
     the query's result id, its file's stem (the driver's: `q1.rq.rq` is `q1.rq`); and a query its
     run recorded no verdict for, where the run recorded others, isn't timed."""
@@ -811,7 +811,7 @@ class OneVerdictPerQuery(unittest.TestCase):
 
     def test_a_verdict_the_contract_doesnt_know_is_not_timed(self):
         # answers.json before 12 Oct named an answer match or mismatch (a wrong one): timing fails
-        # closed on a name it doesn't know, alone or beside an ok record (PR #56 fix round 2, F6).
+        # closed on a name it doesn't know, alone or beside an ok record (PR #56).
         mismatch, ok = ("mismatch", "queries/q1.rq"), ("ok", "queries/q1.rq")
         for name, runs in (("mismatch", [[mismatch]]), ("mismatch-then-ok", [[mismatch], [ok]]),
                            ("ok-then-mismatch", [[ok], [mismatch]]), ("match", [[("match", "queries/q1.rq")]])):

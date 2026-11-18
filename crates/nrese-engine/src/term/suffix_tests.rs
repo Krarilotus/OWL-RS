@@ -1,4 +1,4 @@
-//! Package 1's guards (`notes/2026-11-08-p1-prepared-install-design.md` §4): new-contract
+//! Package 1's guards: new-contract
 //! tests of an API the pin doesn't have, so none is red there. Rebase interleavings (T3–T5)
 //! are beside the rebase test in `durability/checkpoint.rs`, which builds the mapped bases.
 
@@ -356,7 +356,7 @@ fn a_push_onto_an_unsealed_tail_seals_every_full_block() {
     );
 }
 
-/// T16 (package review r1 F1). An install that has to wait for a reader allocates nothing, on
+/// T16. An install that has to wait for a reader allocates nothing, on
 /// threads whose first wait it is. A thread's first park registers it with `parking_lot_core`,
 /// which allocates when its table is made or has to grow: growth comes as the count of live
 /// parking threads passes thresholds (three per bucket, powers of two). So one fresh thread
@@ -447,7 +447,7 @@ fn an_install_that_waits_for_a_reader_allocates_nothing() {
     );
 }
 
-/// T17 (package review r1 F2: the handover). An installed key's allocation is the dictionary's
+/// T17 (the handover). An installed key's allocation is the dictionary's
 /// from the install on: the suffix and its charge gone, the key still lives in the dictionary's
 /// tail and is counted in its stats; once a seal blocks it, it is freed.
 #[test]

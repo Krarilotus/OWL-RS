@@ -220,7 +220,7 @@ impl Default for Argon2Gate {
 /// [`hash_password`]'s algorithm and parameters, so checking it is the work of a check,
 /// and a random salt and output, which no known password was hashed to. Fixed, so no
 /// login makes it first (that extra hash told a missing name from a wrong password,
-/// PR #80 review R80-1).
+/// PR #80).
 const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$8JmJzvxTKI3MtmVdVMLZEQ$raTfQ5S6+jmfK261pBbtAolYcPmAsCVPGL/guuFDyx8";
 
 #[cfg(test)]
@@ -601,7 +601,7 @@ mod tests {
     /// of this test binary, fails if it failed there (printing what it printed) and returns
     /// false: the caller returns. A child still running at [`OWN_PROCESS_DEADLINE`] is
     /// stopped, and the test fails. For a test of what a process does first: in the test
-    /// binary's own process, another test may have done it already (PR #86 review R86-N1).
+    /// binary's own process, another test may have done it already (PR #86).
     /// [`nrese_exec::measure::alone`] does the same for measurements, in binaries that measure.
     fn in_a_process_of_its_own() -> bool {
         use std::io::Read;
@@ -620,7 +620,7 @@ mod tests {
         let alone = [test, "--exact", "--test-threads=1", "--nocapture"];
         // The child this starts: the marker names this test, and the process was started with
         // exactly the arguments that run it alone. A marker inherited by a run of other
-        // arguments, a whole suite, is no such child (PR #86 fix check R86-FC1).
+        // arguments, a whole suite, is no such child (PR #86).
         if std::env::var(OWN_PROCESS).is_ok_and(|marked| marked == test)
             && std::env::args_os().skip(1).eq(alone)
         {
@@ -669,9 +669,9 @@ mod tests {
 
     /// A fresh service's first refusal of a name without a login does the work of a wrong
     /// password, and no more: no hash, and one check against a hash of the same algorithm,
-    /// parameters and lengths (R80-1: that first refusal made the dummy hash, a hash more).
+    /// parameters and lengths (that first refusal made the dummy hash, a hash more).
     /// Work, not time. In a process of its own: work done once per process, as that dummy
-    /// hash was, may have been done by another test in this one first (R86-N1).
+    /// hash was, may have been done by another test in this one first.
     #[test]
     fn a_missing_name_s_first_refusal_does_a_wrong_password_s_work() {
         if !in_a_process_of_its_own() {
@@ -730,7 +730,7 @@ mod tests {
     }
 
     /// A name without a login is refused after the work a wrong password takes, and in its
-    /// words (the milestone review's R4): no such credential is remembered, so each waits
+    /// words: no such credential is remembered, so each waits
     /// for an Argon2 turn and is checked in it, once, against the fixed hash, as a wrong
     /// password is against the user's; the fixed hash costs what a user's does; and the
     /// refusals read the same. A name without a login is one without a record (`nobody`)

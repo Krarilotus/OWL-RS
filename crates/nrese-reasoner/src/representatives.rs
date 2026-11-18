@@ -65,8 +65,8 @@ pub(crate) struct Guarded {
 /// `rules` as they run over representatives: their guards hold where members of the
 /// classes satisfy them ([`Guard::OverClasses`]). Over representatives a guard sees one
 /// term per class, so `?x != ?y` failed for two members of one class, and a rule needing
-/// them to differ missed what the replicated closure derives (Sol's review of DMW-AB-mem,
-/// r1 S1). Left as they are, so the built-in rulesets run as before:
+/// them to differ missed what the replicated closure derives.
+/// Left as they are, so the built-in rulesets run as before:
 /// - rules whose one guard is `?a != ?b` and whose every conclusion is `?a owl:sameAs ?b`
 ///   (`prp-fp`, `prp-ifp`, `cls-maxc2`, `cls-maxqc3/4`, `prp-key`): with `?a` and `?b` in
 ///   one class they would conclude what the class holds; `owl2-dl`'s `prp-key` too, whose

@@ -42,7 +42,7 @@ thread_local! {
     pub(crate) static ON_DIR_SYNC: std::cell::RefCell<Option<DirSyncHook>> =
         const { std::cell::RefCell::new(None) };
     /// Reads a durable bulk load's checkpoint image before the checkpoint is written, as a
-    /// reader of it would (the own-state slots' 3.0c item 5).
+    /// reader of it would.
     pub(crate) static IMAGE_READER: RefCell<Option<Reader>> = const { RefCell::new(None) };
     /// How many name resolutions `durability::place` began on this thread (a path's walk, or a
     /// file's links read).

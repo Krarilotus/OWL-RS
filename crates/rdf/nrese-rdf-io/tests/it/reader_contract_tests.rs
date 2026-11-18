@@ -116,7 +116,7 @@ fn a_failed_statement_gives_none_of_its_triples() {
 /// statement open is its end (Turtle 1.2 §6.5 `triples '.'`; `RdfParser::recovering`: the
 /// rest of the statement is skipped, up to the `.` ending it). What of the statement is
 /// open when it fails stays open while its rest is skipped, `[`, `(`, `<<(`, `<<` and `{|`
-/// alike (review p2-a1b r1, A1B-R1-F1). Read from a slice, a reader, and a reader giving
+/// alike. Read from a slice, a reader, and a reader giving
 /// one byte at a time. Guards held before the change too.
 #[test]
 fn recovery_resumes_after_the_failing_statements_own_end() {
@@ -208,14 +208,14 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             "<urn:s> <urn:p> [ <urn:q> \"open ; <urn:r> ( 1 2 ] .\n<urn:after> <urn:p> <urn:o> .",
             vec![None],
         ),
-        // The same when the quote comes while the rest is skipped (sol-loop A1B-R2-F1).
+        // The same when the quote comes while the rest is skipped.
         (
             true,
             RdfFormat::Turtle,
             "<urn:s> <urn:p> [ <urn:q> . \"open ; <urn:r> ( 1 2 ] .\n<urn:after> <urn:p> <urn:o> .",
             vec![None],
         ),
-        // And with a statement in the string's text: it isn't read as one (fix check r2).
+        // And with a statement in the string's text: it isn't read as one.
         (
             false,
             RdfFormat::Turtle,
@@ -223,7 +223,7 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             vec![None],
         ),
         // Bytes the lexer can't read keep what is open: a stray `%` in the failed
-        // statement, or met while its rest is skipped (fix check r2, A1B-R1-F1).
+        // statement, or met while its rest is skipped.
         (
             false,
             RdfFormat::Turtle,
@@ -249,8 +249,8 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             vec![None, Some(&after_in_g)],
         ),
         // A closer closes an open bracket of its own kind, or nothing: a `)` with only `[`
-        // open leaves them open, whether the `[` was the failed statement's or the skip's
-        // (fix check r3: A1B-R3-F1 and R2-11).
+        // open leaves them open, whether the `[` was the failed statement's or the
+        // skip's.
         (
             false,
             RdfFormat::Turtle,
@@ -428,7 +428,7 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             vec![None, Some(&abc), Some(&after)],
         ),
         // The string a failed VERSION ends with is its label, not a literal: an `@` after it
-        // starts a directive, as after a VERSION that parses (sol-loop r3 S6).
+        // starts a directive, as after a VERSION that parses.
         (
             false,
             RdfFormat::Turtle,
@@ -450,8 +450,8 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             vec![None, Some(&abc), Some(&after)],
         ),
         // A string with a line break in it, closed later: its end is known, so it is
-        // skipped whole and the `] .` and statement in it are text, not structure (fix
-        // check r2). LF and CR, both quotes, and in a TriG block.
+        // skipped whole and the `] .` and statement in it are text, not structure.
+        // LF and CR, both quotes, and in a TriG block.
         (
             false,
             RdfFormat::Turtle,
@@ -485,7 +485,7 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
         ),
         // A long string with no closing quotes: the document ends inside it, so the error
         // ends the document, whatever short string its text holds. Before, the long string's
-        // quote alone was skipped and the short one's closing quote found (sol-loop r2 S1).
+        // quote alone was skipped and the short one's closing quote found.
         (
             false,
             RdfFormat::Turtle,
@@ -499,8 +499,8 @@ fn recovery_resumes_after_the_failing_statements_own_end() {
             "<urn:s> <urn:p> [ <urn:q> \"a\n\\\" ] . <urn:u> <urn:v> <urn:w> .\" ] . <urn:after> <urn:p> <urn:o> .",
             vec![None, Some(&after)],
         ),
-        // Brackets the skip opened itself stay open past unreadable bytes (sol-loop
-        // A1B-R3-F1).
+        // Brackets the skip opened itself stay open past unreadable
+        // bytes.
         (
             true,
             RdfFormat::Turtle,
@@ -613,7 +613,7 @@ fn on_three_paths(
 
 /// An opener refused by the nesting limit is in the document all the same: it stays open
 /// while the failed statement's rest is skipped, so a `.` before its `]` ends nothing and the
-/// two `)` close nothing (fix check r3; `RdfParser::recovering`). Turtle and a TriG block, on
+/// two `)` close nothing (`RdfParser::recovering`). Turtle and a TriG block, on
 /// all three paths.
 #[test]
 fn an_opener_refused_by_the_nesting_limit_stays_open() {
@@ -660,7 +660,7 @@ fn an_opener_refused_by_the_nesting_limit_stays_open() {
 /// paths without a panic. In a debug build `resync` checks that the brackets noted open when
 /// a statement fails agree with those it took, and that it ended at its failing token exactly
 /// when that is a `.` taken with nothing open, so a grammar site that noted nothing fails
-/// here (fix check r3; P, r5). A guard: before, there was no such check.
+/// here. A guard: before, there was no such check.
 #[test]
 fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
     let mut table = Table::default();
@@ -668,8 +668,8 @@ fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
         let document: &'static str = Box::leak(document.into_boxed_str());
         let parser = || RdfParser::from_format(format).recovering();
         let bytes = || Pieces(document.as_bytes().chunks(1).map(Ok).collect());
-        // Every item to the end: the delimiter can come after the seed's own quads (fix
-        // check r3's sol-loop, S1). A parser that doesn't end fails the row.
+        // Every item to the end: the delimiter can come after the seed's own quads.
+        // A parser that doesn't end fails the row.
         const BOUND: usize = 1_000;
         let outcome = std::panic::catch_unwind(|| {
             [
@@ -694,9 +694,9 @@ fn recovery_knows_every_bracket_open_wherever_a_statement_fails() {
     table.done();
 }
 
-/// Recovery over large malformed input gives the expected output on every path (sol-loop r2
-/// S2–S4: unmatched closers, many escaped quotes after a missing one, one long malformed
-/// string from a reader giving a byte at a time). The work stays linear by construction (a
+/// Recovery over large malformed input gives the expected output on every path (unmatched closers, many escaped quotes after a missing one, one long malformed
+/// string from a reader giving a byte at a time).
+/// The work stays linear by construction (a
 /// count per bracket pair; no search after one has reached the end; reading at least as much
 /// again before searching again); these rows check the output. Guards: they held before.
 /// The escaped quotes are fewer: before, each was searched to the end again, so the parent's
@@ -762,8 +762,8 @@ fn recovery_over_large_malformed_input() {
 /// A read error met while recovery reads ahead for a malformed string's end loses nothing:
 /// the string's end and the statement after it were read before the error, so they come
 /// first, then the read error (`RdfParser::recovering`: a read error always stops). Where
-/// recovery itself can't read on, the read error comes right after the syntax error
-/// (sol-loop r2 S5).
+/// recovery itself can't read on, the read error comes right after the syntax
+/// error.
 #[test]
 fn a_read_error_during_recovery_comes_after_what_was_read() {
     let first: &'static [u8] = concat!(
@@ -810,7 +810,7 @@ fn a_read_error_during_recovery_comes_after_what_was_read() {
 
 /// A `[` that never closes: no later `.` can be shown to be outside it, so recovery
 /// reports everything after the statement's start as its skipped statement, one error, and
-/// emits nothing (fix check r2; bulk load quarantines that span). Slice, reader, and a
+/// emits nothing (bulk load quarantines that span). Slice, reader, and a
 /// reader giving one byte at a time. A guard: it held before.
 #[test]
 fn an_unclosed_bracket_reports_the_rest_as_its_statement() {

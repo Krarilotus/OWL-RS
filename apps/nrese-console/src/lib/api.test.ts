@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "vitest";
 
 // The console's API adapter (lib/api.ts, what App.tsx calls), with the browser's fetch.
-// SYN-72 R1-F1: a named target the server reads as the default graph is refused before
+// SYN-72: a named target the server reads as the default graph is refused before
 // any request; an ordinary named graph gets exactly one request to it.
 
 const ALIASES = ["urn:x-arq:DefaultGraph", "urn:x-rdflib:default"];

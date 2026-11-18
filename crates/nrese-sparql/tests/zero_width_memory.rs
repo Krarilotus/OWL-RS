@@ -1,4 +1,4 @@
-//! Guard of rows without columns (SW1, `notes/2026-11-01-late-budget-r2.md`): a table with
+//! Guard of rows without columns: a table with
 //! no columns holds only a count, so a UNION of products of `{ {} UNION {} }` makes rows
 //! that hold nothing, and an operator after it then makes a column per row (an unbound
 //! variable's UNDEF in a projection, a BIND of one). Those rows count against the query's

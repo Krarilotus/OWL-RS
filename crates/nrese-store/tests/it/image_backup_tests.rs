@@ -198,7 +198,7 @@ fn second_process_open(dir: &std::path::Path) -> Option<i32> {
 }
 
 /// A refused image placement whose image is a live store's `LOCK` (the image may have any
-/// name) leaves the store locked against another process (review r1, R1-F1). The placement
+/// name) leaves the store locked against another process. The placement
 /// hashes the file, so opens and closes it, and refuses: the hash doesn't match. Before the
 /// fix the store's lock was a record lock, which that close dropped: a second process opened
 /// the store beside the first. Once the first is dropped, the second opens with its commit.
@@ -255,8 +255,8 @@ fn a_refused_placement_of_a_lock_file_leaves_the_store_locked() {
 }
 
 /// A restore names every directory it creates durably, through the placement owner
-/// (`restore_image` → `place_image` → `nrese_engine::place::create_dir_all`; review r1,
-/// R1-F2): into `sealed/a/b`, where `sealed` exists but can't be opened (mode 0o311), so its
+/// (`restore_image` → `place_image` → `nrese_engine::place::create_dir_all`):
+/// into `sealed/a/b`, where `sealed` exists but can't be opened (mode 0o311), so its
 /// sync, which must name `a`, fails, and the restore must refuse before it returns. Before the
 /// fix only `a` and `b` were synced, so it returned. Guards: into `open/a/b` it restores, the
 /// store opens with its quad and takes a commit; into an existing empty directory too. Unix
@@ -281,7 +281,7 @@ fn a_restore_names_every_directory_it_creates() {
     if fs::read_dir(&sealed).is_ok() {
         eprintln!("row sealed: not checked (the directory opens: root?)");
     } else {
-        // Tried twice (sol-loop on review r1, S1): the first refusal mustn't leave `a` for the
+        // Tried twice: the first refusal mustn't leave `a` for the
         // second to take as durably named.
         for attempt in ["sealed", "sealed, tried again"] {
             let restored = restore_image(&backup, &sealed.join("a").join("b"));

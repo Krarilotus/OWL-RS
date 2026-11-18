@@ -1,7 +1,7 @@
 //! A first load is materialised once (`engine::maintain`), and its verdict and stack are the
 //! delta executor's: every equality mode and plan reports the same violations and keeps the
-//! recomputed stack, and a violation the axioms had before stays tolerated. Sol's round 1 on
-//! DMW-AB-mem (N-6), F1 and F2: both failed with the closure's own violations.
+//! recomputed stack, and a violation the axioms had before stays tolerated.
+//! Both failed with the closure's own violations.
 
 use nrese_engine::{Engine, EngineConfig, QuadPattern, ReadModel};
 use nrese_rdf_io::{RdfFormat, RdfParser};
@@ -15,8 +15,8 @@ const PREFIX: &str = "@prefix ex: <http://example.com/> . @prefix owl: <http://w
 
 /// Each fixture under every equality mode and plan: the same violations and diagnostics,
 /// and the recomputed stack where it commits. Where the stack holds every identity, the
-/// cheapest plan materialises the load once, a literal's conclusion included (review r1
-/// F1: it ran the batch, dropped it and ran the delta executor).
+/// cheapest plan materialises the load once, a literal's conclusion included (it ran the batch, dropped it and ran the delta
+/// executor).
 #[test]
 fn a_first_load_reports_what_every_plan_reports() {
     let fixtures = [
@@ -131,7 +131,7 @@ fn a_first_load_reports_what_every_plan_reports() {
 }
 
 /// A first load's report fits wherever the delta executor's own fits: the batch's report
-/// is let go before the introduced-only one takes the same budget (sol-loop r1 S1: both were
+/// is let go before the introduced-only one takes the same budget (both were
 /// held, and the report refused where the delta's was complete, losing its bindings). The
 /// limit is measured, not picked: the delta executor's peak on the same load.
 #[test]
@@ -231,7 +231,7 @@ fn a_first_load_tolerates_a_violation_the_axioms_had_before() {
 
 /// The same for a conclusion no store holds: an axiom's literal outside its range
 /// (`-1 a xsd:nonNegativeInteger`) is old, so an unrelated insert doesn't report its
-/// `dt-not-type`, cached grounding or not, in both non-compact equality modes (Sol r2 F1).
+/// `dt-not-type`, cached grounding or not, in both non-compact equality modes.
 #[test]
 fn a_first_load_tolerates_a_datatype_violation_the_axioms_had_before() {
     use nrese_reasoner::{RuleProgram, UserRules};
@@ -297,7 +297,7 @@ fn a_first_load_tolerates_a_datatype_violation_the_axioms_had_before() {
 /// A new assertion that derives again a conclusion no store holds (`ex:new ex:age -1` beside
 /// the axiom's `ex:old ex:age -1`): new to the delta, which reports its `dt-not-type`. Where
 /// the axioms' own closure concludes such a fact, the load takes the delta executor, and the
-/// verdicts agree (Sol r3 F1).
+/// verdicts agree.
 #[test]
 fn a_first_load_whose_axioms_conclude_an_unstorable_fact_takes_the_delta() {
     use nrese_reasoner::{RuleProgram, UserRules};

@@ -1,6 +1,6 @@
-//! Dictionary lifecycle V1 (`notes/2026-11-09-dict-v1-speculative-private-design.md` §4): a
-//! request's speculative work never appends its own terms to the shared dictionary. Items 1
-//! and 2 for the DL routes (entailment, explanation, the exact query services).
+//! Dictionary lifecycle V1: a
+//! request's speculative work never appends its own terms to the shared dictionary, here
+//! for the DL routes (entailment, explanation, the exact query services).
 //!
 //! The oracle is a store with the same history but without the speculative request: after a
 //! later commit and a reopen, the two must agree, in their dictionary's size and in the
@@ -62,7 +62,7 @@ fn own_conclusion(i: usize) -> Vec<Triple> {
     ]
 }
 
-/// Item 1, the DL entailment route (red on the parent, which interns the conclusion's terms).
+/// The DL entailment route (red on the parent, which interns the conclusion's terms).
 ///
 /// - Input: two stores on disk with the same premise and a warm-up entailment over its own
 ///   terms; one of them answers an entailment whose conclusion names a class, an individual
@@ -102,7 +102,7 @@ fn a_dl_entailment_appends_none_of_its_terms() {
     );
 }
 
-/// Item 1, the DL explanation route (red on the parent, which interns the tests' fresh names
+/// The DL explanation route (red on the parent, which interns the tests' fresh names
 /// into the dictionary on a store whose data came past the pipeline).
 ///
 /// - Input: a store whose premise was loaded past the pipeline (so no commit interned the
@@ -133,7 +133,7 @@ fn a_dl_explanation_appends_no_terms() {
     assert_eq!(terms(store), before, "the explanation appended terms");
 }
 
-/// Item 7, a store route: the explanation under a memory limit too small for it, measured
+/// A store route: the explanation under a memory limit too small for it, measured
 /// here rather than picked. Its private transaction's names are charged to the request's
 /// envelope; a refusal there is the route's memory error.
 ///
@@ -224,7 +224,7 @@ fn an_explanation_refused_for_memory_is_the_memory_limit() {
     assert!(failed.is_empty(), "need {high} bytes: {failed:#?}");
 }
 
-/// Item 1, the exact query services (a guard: their only speculative terms are the tests'
+/// The exact query services (a guard: their only speculative terms are the tests'
 /// fresh names, system vocabulary the bounds' first read appends on the parent and here
 /// alike).
 ///
@@ -282,7 +282,7 @@ fn canonical(facts: &[[String; 3]]) -> Vec<([String; 3], usize)> {
     out.into_iter().collect()
 }
 
-/// Caller 10's report decodes U1's names (a guard, DICT2 04:03): they are shared ids appended
+/// The upper-facts report (`dl_upper_facts`) decodes U1's names (a guard): they are shared ids appended
 /// past the published snapshot's length, with no commit since.
 ///
 /// - Input: the schema of the guard below, loaded past the pipeline (no commit interned U1's
@@ -304,7 +304,7 @@ fn a_cold_upper_facts_report_decodes_every_name() {
     assert!(undecoded.is_empty(), "undecoded: {undecoded:?}");
 }
 
-/// Item 5's commit path (a guard of the delta from shared names; the window before the first
+/// The commit path (a guard of the delta from shared names; the window before the first
 /// commit is `dl::source::tests::the_kept_cold_upper_bound_survives_an_aborted_writers_terms`).
 ///
 /// - Input: a schema U1 approximates with Skolem constants, loaded past the pipeline (no
@@ -371,7 +371,7 @@ fn top(store: &StoreService) -> &'static str {
     }
 }
 
-/// Item 2 (LC A12's shape; red on the parent, whose dictionary keeps the requests' literals,
+/// Speculative literals and global relevance (red on the parent, whose dictionary keeps the requests' literals,
 /// which global relevance counts).
 ///
 /// - Input: two stores on disk filled alike; one answers sixty DL entailments, each with a

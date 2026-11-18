@@ -3,8 +3,8 @@ memory peak fits above the floor, never building anyway, and for no earlier run 
 itself; its wait is bounded, terminal or not; a request that can never fit is refused at once; a
 dead holder is reclaimed by its identity; and a run says
 it was stopped by the development machine's guard only when the guard stopped a process of its own build.
-Sol's round-1 probes (Harness/notes/review-build-admission-r1-20261020/probe.py) are here with
-the behaviour they asked for.
+A review's probes are here, each with
+the behaviour it asked for.
 
 Run: python -m unittest discover -s benches/suite/tests -p test_build_admission.py
 """
@@ -168,7 +168,7 @@ class Admission(unittest.TestCase):
         self.assertFalse((self.out / "b.started").exists())
 
     def test_no_run_starts_below_the_guards_disk_line_busy_or_not(self):
-        # Sol, review-build-admission-r5 (r5-1): ignoring BUSY ignored the guard's disk kill line (100 GB
+        # Ignoring BUSY ignored the guard's disk kill line (100 GB
         # on C:). Memory fits; C: has 90 GB free: no build; at 400 GB the same run builds.
         (self.guard / "BUSY").write_text("24.0 GB RAM, 90 GB disk free")
         self.disk(90)
@@ -185,7 +185,7 @@ class Admission(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("mkfifo"), "a disk reading that never comes (a FIFO)")
     def test_a_disk_reading_that_never_comes_ends_at_the_deadline_and_holds_no_one(self):
-        # r6-2: the disk query ran unbounded inside the admission lock: a stalled one held its hook and
+        # The disk query ran unbounded inside the admission lock: a stalled one held its hook and
         # every hook behind it. A FIFO no one writes stands for it.
         fifo = self.root / "stalled"
         subprocess.run(["mkfifo", str(fifo)], check=True)
@@ -205,7 +205,7 @@ class Admission(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("mkfifo"), "disk readings that keep running out (a FIFO)")
     def test_disk_readings_slower_than_a_poll_end_at_the_deadline(self):
-        # Sol, review-build-admission-r8 (r8-1): a reading older than a poll was retried before the
+        # A reading older than a poll was retried before the
         # deadline was looked at, so readings that kept taking longer than a poll retried forever. Each
         # here takes its 3 s timeout (a FIFO no one writes), the poll is 1 s, the limit 2 s.
         fifo = self.root / "slow"
@@ -218,7 +218,7 @@ class Admission(unittest.TestCase):
 
     @unittest.skipUnless(shutil.which("mkfifo"), "a thresholds file that never answers (a FIFO)")
     def test_a_thresholds_file_that_never_answers_is_no_file(self):
-        # r8-2: the thresholds read had no bound; a stalled one held the run before it ever queued.
+        # The thresholds read had no bound; a stalled one held the run before it ever queued.
         fifo = self.root / "thresholds-stalled"
         subprocess.run(["mkfifo", str(fifo)], check=True)
         run = self.start("t", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="1", NRESE_BUILD_FLOOR_GB=None,
@@ -228,7 +228,7 @@ class Admission(unittest.TestCase):
         self.assertIsNotNone(self.started("t", within=1), "today's lines, so it fits")
 
     def test_the_floor_and_the_disk_line_come_from_the_guards_thresholds_file(self):
-        # The orchestrator, IB0612-8d33: the guard writes its lines; admission never reads its
+        # IB0612-8d33: the guard writes its lines; admission never reads its
         # PowerShell. A 6 GB kill line: a 10 GB floor, 13 GB free; a 200 GB disk line: 210 GB needed.
         self.free(13)
         floor = self.thresholds("ram_soft_gb=16 disk_soft_gb=150 ram_kill_gb=6 disk_kill_gb=200\n")
@@ -257,7 +257,7 @@ class Admission(unittest.TestCase):
         self.assertIn("missing or unreadable", err)
 
     def test_a_lock_held_past_the_deadline_admits_nothing_and_ends_at_the_deadline(self):
-        # Sol, review-build-admission-r7 (r7-2): the first acquisition waited for the lock without a
+        # The first acquisition waited for the lock without a
         # deadline, then admitted on a disk reading taken before the wait. Another live process holds
         # the lock for 8 s while C: falls from 110 GB to 99; the run (1 s limit) must end before then.
         self.disk(110)
@@ -285,7 +285,7 @@ class Admission(unittest.TestCase):
         self.assertFalse((self.out / "a.started").exists(), "admitted below the guard's disk line")
 
     def test_room_that_appears_after_the_deadline_admits_nothing(self):
-        # Sol, r5 follow-up: a sleep running past the deadline, then room: the run must end, not build.
+        # A sleep running past the deadline, then room: the run must end, not build.
         self.free(10)
         run = self.start("late", stderr=subprocess.PIPE, NRESE_BUILD_PEAK_GB="2", NRESE_BUILD_SLOT_WAIT_S="2",
                          NRESE_BUILD_SLOT_POLL_S="5")
@@ -415,7 +415,7 @@ class Admission(unittest.TestCase):
             self.assertEqual("stopped by the PC guard" in err, code == 75, (notice, err))
 
     def test_a_completion_seen_after_the_deadline_does_not_count(self):
-        # Sol, round 3: a turn of the wait that runs late (sleep 1 taking 4 s) must not stretch a
+        # A turn of the wait that runs late (sleep 1 taking 4 s) must not stretch a
         # 2 s deadline to take in a completion published at 3 s.
         self.stub("sleep", '[ "$1" = 1 ] && exec /usr/bin/sleep 4; exec /usr/bin/sleep "$@"')
         build = self.start("said-after", stderr=subprocess.PIPE, NOTICE="after", CODE="127",
@@ -426,7 +426,7 @@ class Admission(unittest.TestCase):
         self.late_writer_done()
 
     def test_even_the_first_look_at_the_notices_counts_only_before_the_deadline(self):
-        # Sol, round 4: the first scan of the guard's notices taking 4 s (an awk that is slow only
+        # The first scan of the guard's notices taking 4 s (an awk that is slow only
         # for them) must not take in a completion published at 3 s against a 2 s deadline.
         self.stub("awk", 'case "$*" in *"-v s="*) /bin/sleep 4 ;; esac\nexec /usr/bin/awk "$@"')
         build = self.start("said-after", stderr=subprocess.PIPE, NOTICE="after", CODE="127",

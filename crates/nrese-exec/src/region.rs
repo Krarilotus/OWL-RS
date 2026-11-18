@@ -1,5 +1,5 @@
-//! Growable arrays in memory they map themselves, charged to a budget before they grow
-//! (`Harness/notes/2026-10-19-pm-load-arena-design.md`): what a bulk load interns its
+//! Growable arrays in memory they map themselves, charged to a budget before they grow:
+//! what a bulk load interns its
 //! terms into, and what the dictionary keeps of them afterwards.
 //!
 //! A [`Region`] owns its pages' policy and their return to the system, which the global
@@ -258,7 +258,7 @@ impl<B: Deref<Target = Budget>> Region<u64, B> {
 /// let _ = settled.push(7);
 /// ```
 ///
-/// or to shrink, then grow again into pages its advice covered (Sol's review of eb6ca4fc):
+/// or to shrink, then grow again into pages its advice covered:
 ///
 /// ```compile_fail,E0599
 /// # use nrese_exec::{Budget, Region};
@@ -819,7 +819,7 @@ mod tests {
         assert!(settled.iter().all(|&b| b == 1));
     }
 
-    /// The boundaries (Sol's review of 6112f533): each row an edge a region must hold.
+    /// The boundaries: each row an edge a region must hold.
     #[test]
     fn a_region_holds_at_its_boundaries() {
         #[derive(Clone, Copy)]

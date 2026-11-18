@@ -312,8 +312,8 @@ mod tests {
         assert!(!short.ping(&gone, None));
     }
 
-    /// Spec: a session's kept view holds for the rules it was decided under (review of O4's
-    /// fix round, S1): it is served only while they are the store's, and a read that began
+    /// Spec: a session's kept view holds for the rules it was decided under:
+    /// it is served only while they are the store's, and a read that began
     /// under earlier rules and ends after a change of them keeps nothing.
     #[test]
     fn a_view_is_kept_and_served_for_its_rules_only() {
@@ -406,7 +406,7 @@ mod tests {
         sessions.lock().get_mut(id).expect("open").touched = past.expect("a clock past it");
     }
 
-    /// Spec (design note N3, I1–I4): what a session keeps is charged before it is kept, a
+    /// Spec (N3): what a session keeps is charged before it is kept, a
     /// refusal leaves it as it was, a read holds the operations with their charge (an add
     /// meanwhile copies them under a charge of its own), and the charge goes when the last
     /// holder lets them go, after a rollback too.
@@ -476,7 +476,7 @@ mod tests {
         assert_eq!(bytes_of(&sessions.pending(&id, None).unwrap()), b"#");
     }
 
-    /// Spec (design note N3, I5; triage N3's expiry control): a session idle past its
+    /// Spec (N3, with its expiry control): a session idle past its
     /// lifetime is gone for its owner's every call, which returns its charge; a stranger's
     /// call ends nothing; and an add refused room first drops expired sessions and tries
     /// once more.

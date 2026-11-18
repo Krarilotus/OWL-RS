@@ -207,8 +207,8 @@ def containers(token: str) -> list[tuple[str, str]]:
 
 def fsync_dir(directory: Path):
     """Makes a directory's entries durable (a file created, renamed or removed in it), and raises
-    when it can't: a suspension never follows a journal that wasn't committed (Sol, 20 Oct 2026:
-    the failure was swallowed and SIGSTOP sent). Windows can't open a directory to sync it and
+    when it can't: a suspension never follows a journal that wasn't committed (the failure was swallowed and SIGSTOP sent).
+    Windows can't open a directory to sync it and
     journals its entries itself: there, nothing to do."""
     if os.name == "nt":
         return
@@ -221,9 +221,9 @@ def fsync_dir(directory: Path):
 
 def journal(frozen: Path, line: str):
     """Records a suspension before it is made: appended, flushed, synced, and the directory synced
-    every time, so the journal's entry is durable before any suspension it records (Sol, 20 Oct
-    2026: synced only when the file was created, a failed first sync left the file there and the
-    next suspension went ahead unsynced). A failure raises: nothing is suspended."""
+    every time, so the journal's entry is durable before any suspension it records (synced only when the file was created, a failed first sync left the file there and the
+    next suspension went ahead unsynced).
+    A failure raises: nothing is suspended."""
     with open(frozen, "a", encoding="utf-8") as f:
         f.write(line + "\n")
         f.flush()

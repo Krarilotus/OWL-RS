@@ -1,6 +1,6 @@
-//! The writer slot's guard as the dictionary takes it: proof that its holder may add entries
-//! (the lifecycle contract's one appender, `notes/2026-11-08-dictionary-lifecycle-contract.md`
-//! P1). The engine holds the slot ([`crate::Engine::transaction`] and the bulk and replica
+//! The writer slot's guard as the dictionary takes it: proof that its holder may add
+//! entries.
+//! The engine holds the slot ([`crate::Engine::transaction`] and the bulk and replica
 //! paths); the dictionary, a layer below, only asks for the proof.
 //!
 //! It proves that a writer slot is held, not that it is this dictionary's engine's: one engine
@@ -34,7 +34,7 @@ std::thread_local! {
 
 /// Makes what parking needs on this thread, so that a later wait for a lock here allocates
 /// nothing: `parking_lot_core`'s per-thread state (its `ThreadData`, the table growth that
-/// registers it, a parker), made on the first park of a thread (package 1 review r1 F1). A wait
+/// registers it, a parker), made on the first park of a thread. A wait
 /// with a timeout already passed parks for real and returns at once. Once per thread; the state
 /// lasts until the thread ends.
 ///

@@ -1158,8 +1158,8 @@ mod tests {
         super::read_dictionary(&mut super::Reader::new(&map), &map, true, true, true).unwrap()
     }
 
-    /// Package 1's rebase interleavings (`notes/2026-11-08-p1-prepared-install-design.md`,
-    /// T3–T5): a dictionary of `n` literals and a suffix of `added` more at its end.
+    /// Package 1's rebase interleavings:
+    /// a dictionary of `n` literals and a suffix of `added` more at its end.
     fn with_suffix(n: u64, added: usize) -> (Dictionary, crate::term::suffix::Suffix, Vec<String>) {
         let dictionary = Dictionary::default();
         for i in 0..n {
@@ -1278,11 +1278,11 @@ mod tests {
         assert_added(&dictionary, n, &texts, "rebased");
     }
 
-    /// Package 2a (sol-loop r1 S3, S4). An overlay over a dictionary whose base is mapped and
+    /// Package 2a. An overlay over a dictionary whose base is mapped and
     /// compressed: its triple intern probes the base's compressed keys, and a view's charged
     /// lookup of a triple term and of a literal too; what they allocate is charged first, at
     /// the bound of either kind of base. The overlay's own block is the one allocation held
-    /// uncharged (design note §11). Measured, alone.
+    /// uncharged. Measured, alone.
     #[test]
     fn overlay_probes_of_a_compressed_base_hold_only_what_they_charged() {
         if !nrese_exec::measure::alone() {
@@ -1403,8 +1403,8 @@ mod tests {
     }
 
     /// A checkpoint's dictionary section takes nothing it didn't charge to its admission
-    /// first: the codec's sample and training, the keys of a compressed base decoded (Sol's
-    /// review: 176,020 bytes held beyond the charges), the hash table, homes, lengths and
+    /// first: the codec's sample and training, the keys of a compressed base decoded (176,020 bytes held beyond the charges),
+    /// the hash table, homes, lengths and
     /// offsets, the keys compressed, and the writer's buffer, which never grows (a key past
     /// it is written after it). All of it grows with the whole vocabulary, however small the
     /// change since the last checkpoint, and was charged nowhere (EEV-25). Rows after the
@@ -1451,7 +1451,7 @@ mod tests {
     /// writer's first write: the keys' first flush, before the long key's compression needs
     /// room), frees every buffer before it releases its charge, on the error
     /// path as on success: the offsets' reservation was released before their bytes, 60,100
-    /// bytes held uncharged (Sol's review r2, `review_dictionary_error_frees_before_releasing`).
+    /// bytes held uncharged (`review_dictionary_error_frees_before_releasing`).
     #[test]
     fn a_refused_section_frees_before_it_releases() {
         if !nrese_exec::measure::alone() {
@@ -1631,7 +1631,7 @@ mod tests {
     /// A checkpoint its admission root has no room for fails with a memory error, once its
     /// file is begun: it publishes nothing and holds nothing. The next start removes the
     /// file and recovers the revision from the log, and a checkpoint with room is written
-    /// (Sol's review: the refusal was only seen in a helper).
+    /// (the refusal was only seen in a helper).
     #[test]
     fn a_checkpoint_its_admission_refuses_publishes_nothing() {
         let dir = tempfile::tempdir().unwrap();

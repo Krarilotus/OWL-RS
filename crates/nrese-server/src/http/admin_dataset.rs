@@ -228,7 +228,7 @@ mod tests {
 
     use super::parse_restore_format;
 
-    /// A backup's directory is durably named (sol-loop round 4 on DUR-3 review r1, S1): in
+    /// A backup's directory is durably named: in
     /// `sealed/backups`, where `sealed/backups` exists but can't be opened (mode 0o311), so its
     /// sync, which must name the new directory, fails, the claim must refuse. Before the fix it
     /// made the directory, and the image backup's placement then took it for one provisioned

@@ -153,8 +153,8 @@ pub enum GraphUpdateOperation {
     /// empties `from`. Its input is that graph as stored, whatever a `WHERE` clause would read:
     /// not a union default graph, inferred statements or a protocol dataset (SYN-54). Kept
     /// whole until the names are resolved: a transfer between two names of one graph changes
-    /// nothing (§3.2.4–3.2.5), and only the store knows which names those are (review r1 of
-    /// SYN-54 slice 2, S2-F1).
+    /// nothing (§3.2.4–3.2.5), and only the store knows which names those
+    /// are.
     Transfer {
         op: TransferOp,
         silent: bool,

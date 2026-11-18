@@ -55,7 +55,7 @@ impl EqualityCell {
     }
 
     /// [`Self::classes`], a build's work counted on `meter`; `None` where it stopped, nothing
-    /// kept. Built outside the cell's lock (REAS-3, master 9 Nov 01:37 (d)): a reader that
+    /// kept. Built outside the cell's lock (REAS-3): a reader that
     /// finds no classes builds its own, the first build finished is kept and a later one
     /// takes it, so a reader never waits out another's build unseen by its own stop; under
     /// contention two builds may run at once (their charges are transient). The rule 3.0c's
@@ -90,7 +90,7 @@ impl EqualityCell {
 
     /// The classes of `version` read canonically: the same aliases, no members to expand
     /// to ([`Classes::canonical_view`]); made once per version. Made outside the cell's lock,
-    /// as the classes are (REAS-3a sol-loop r1 S5: a counted reader that only checks the cell
+    /// as the classes are (a counted reader that only checks the cell
     /// mustn't wait out a copy of every alias), the first view finished kept.
     pub(crate) fn canonical(&self, version: &Version, same_as: TermId) -> Arc<Classes> {
         let full = self.classes(version, same_as);
@@ -390,8 +390,8 @@ impl Classes {
         // The reasoner's union kernel (G7 of the investigation of 6 October 2026).
         let mut union = nrese_exec::classes::Classes::default();
         // One account for all of the build's work: its scans' searches and steps, its unions'
-        // moves and its finish, so at most `POLL_UNITS` units of it follow any yes (fix check
-        // r2 G1: a scan's ledger and the unions' credit apart allowed both).
+        // moves and its finish, so at most `POLL_UNITS` units of it follow any yes (a scan's ledger and the unions' credit apart allowed
+        // both).
         let mut account = OnMeter::new(meter);
         let plan = AccessPlan::for_pattern(&pattern);
         for stack in Stack::ALL {
@@ -403,19 +403,19 @@ impl Classes {
                     continue;
                 }
                 // A union moves the smaller side's members, each counted before it moves, a
-                // chunk at a time (REAS-3a sol-loop r1 S1, fix check r1 R1); a pair already in
-                // one class moves none (sol-loop r2 S6). A stopped union leaves the kernel half
+                // chunk at a time; a pair already in
+                // one class moves none. A stopped union leaves the kernel half
                 // made: dropped with this build.
                 union.union_asking(a, b, |n| account.take(n))?;
             }
         }
-        // Finishing the classes (REAS-3a review r1 R1, fix check r1 R1): each class the kernel
+        // Finishing the classes: each class the kernel
         // lists, and each identity copied out of it, sorted, checked for a literal and indexed,
         // is counted before it is handled, a chunk of at most `POLL_UNITS` units at a time, so
         // a stop is seen within a run of work however large a class is (a counted sort:
         // `sort_counted`). The maps are made at their final size before the first insert,
         // counted as the identities they will hold, so no insert grows them (their
-        // initialisation is held for the owner: fix check r1 F2).
+        // initialisation is held for the owner).
         let chunk = nrese_exec::POLL_UNITS as usize;
         let mut listed = union.classes();
         let mut copies: Vec<Vec<u64>> = Vec::with_capacity(listed.len());
@@ -589,7 +589,7 @@ impl Classes {
 
     /// How many quads a canonical stored quad stands for, given the pattern's constants
     /// (a constant stands for itself); `None` for more than a `u64` holds, never a wrapped
-    /// or capped number (PR #70 fix checks 1 F2 and 2 F3: a class of 2^22 identities).
+    /// or capped number (PR #70: a class of 2^22 identities).
     pub(crate) fn multiplicity(&self, quad: &EncodedQuad, pattern: &QuadPattern) -> Option<u64> {
         let size = |bound: Option<TermId>, id: TermId| match bound {
             Some(_) => 1,
@@ -687,7 +687,7 @@ pub(crate) trait Metering: Copy {
 }
 
 /// Sorts `ids` (distinct identities), `take(n)` called before each `n` units of its work, `n`
-/// at most `POLL_UNITS` (REAS-3a fix check r1 R1): runs of [`SORT_RUN`] ids each sorted alone,
+/// at most `POLL_UNITS`: runs of [`SORT_RUN`] ids each sorted alone,
 /// counted as `len · (⌊log2 len⌋ + 1)` comparisons before it, then merged pairwise into a
 /// second list, each id a merge moves a unit, counted a chunk at a time. False once `take`
 /// answers false: `ids` is then in no particular order.
@@ -749,13 +749,13 @@ fn sort_counted(ids: &mut Vec<u64>, mut take: impl FnMut(u64) -> bool) -> bool {
 const SORT_RUN: usize = 256;
 
 /// A meter as an [`Account`]: the one account of an equality read for all its work, its
-/// scans' steps, its probes and its own (fix check r2 G1 and its siblings: a class build, an
-/// expanded count, an expansion; [`Read`]). Portions are taken from a run asked of the meter:
+/// scans' steps, its probes and its own (also a class build's, an expanded count's, an
+/// expansion's; [`Read`]). Portions are taken from a run asked of the meter:
 /// `POLL_UNITS`, or a portion where that is more (a union's chunk, a sort's run), counted in
 /// runs of at most `POLL_UNITS` and then done whole. What a run has left when a portion doesn't
-/// fit is dropped, so between two asks there is at most one run of work (REAS-2's r8 form: a
-/// call per unit cost +0.6 % on replicate, the run form noise). A refusal is final (fix check
-/// r3 H2). Nothing for an unmetered read.
+/// fit is dropped, so between two asks there is at most one run of work (as in REAS-2: a
+/// call per unit cost +0.6 % on replicate, the run form noise). A refusal is final.
+/// Nothing for an unmetered read.
 pub(crate) struct OnMeter<M: Metering> {
     /// Units asked for and not yet taken.
     left: u64,
@@ -904,7 +904,7 @@ impl<'a> Visibility<'a> {
     }
 
     /// [`Self::shows`], its probes counted on `account`, the read's one account (REAS-3,
-    /// sweep SW015; fix check r2 G1's siblings): `Err` once it has stopped.
+    /// sweep SW015): `Err` once it has stopped.
     pub(crate) fn shows_with<A: Account>(
         &self,
         copy: &EncodedQuad,
@@ -931,7 +931,7 @@ impl<'a> Visibility<'a> {
 /// A read's quads one at a time, each step's work counted on the account it is given before it
 /// is done: `Err` once that account has stopped. The parts of a counted equality read (its
 /// stored scans, their merge, the expansion and its named scan) are steps, so the read's one
-/// account ([`Read`]) counts all of their work (fix check r2 G1's siblings: an account of each
+/// account ([`Read`]) counts all of their work (an account of each
 /// part's own let each allow a run after the same yes).
 pub(crate) trait Step {
     fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped>;
@@ -1033,8 +1033,8 @@ fn right_first(
 
 /// Two steps, each sorted by `permutation`, merged in that order, the left first where their
 /// keys are equal: the snapshot's one merge of two sorted streams ([`right_first`]). A counted
-/// read's parts share its one account; a plain read's are [`Plain`] iterators (fix check r3
-/// S1), read directly.
+/// read's parts share its one account; a plain read's are [`Plain`] iterators,
+/// read directly.
 pub(crate) struct Merged<L, R> {
     left: Ahead<L>,
     right: Ahead<R>,
@@ -1116,7 +1116,7 @@ impl<S: Step, A: Account> Iterator for Read<S, A> {
 ///
 /// A [`Step`]: a counted read's expansion counts each copy it makes before it makes it, each
 /// copy it hands on, its input's steps and its visibility probes on the read's one account
-/// (REAS-3, sweeps SW013, SW014; fix check r2 G1's siblings). The plain reads' is an iterator
+/// (REAS-3, sweeps SW013, SW014). The plain reads' is an iterator
 /// over a plain input, counting nothing.
 pub(crate) struct Expand<'a, S: Step> {
     input: Ahead<S>,
@@ -1255,7 +1255,7 @@ impl<'a, S: Step> Expand<'a, S> {
         let mut stopped = false;
         self.classes.expand(&raw, &self.pattern, &mut |quad| {
             // Its probe, counting its own work, then the copy, a unit counted before it is
-            // kept (SW013): each portion done before the next is taken (fix check r3 H1).
+            // kept (SW013): each portion done before the next is taken.
             let shown = match all {
                 true => Ok(true),
                 false => visibility.shows_with(&quad, touching, account),
@@ -1309,7 +1309,7 @@ impl<S: Step> Step for Expand<'_, S> {
         loop {
             // What the heap holds may go out once no later input can sort before it. The
             // input's peek counts its own work; the copy handed on is a unit, counted after
-            // it, just before it is done (fix check r3 H1).
+            // it, just before it is done.
             if let Some(Reverse(first)) = self.pending.peek() {
                 let (pattern, permutation) = (&self.pattern, self.permutation);
                 let safe = match self.input.peek(account)? {
@@ -1453,8 +1453,8 @@ mod tests {
 
     /// One class of 2^22 identities in all three places stands for 2^66 quads, more than a
     /// `u64` holds: the multiplicity says so, neither wrapped (it wrapped to 0, so a snapshot
-    /// holding such a class read as empty: PR #70 fix check 1 F2) nor capped (a capped count
-    /// was published as an exact `COUNT`: fix check 2 F3).
+    /// holding such a class read as empty; PR #70) nor capped (a capped count
+    /// was published as an exact `COUNT`).
     #[test]
     fn multiplicity_past_u64_is_none() {
         let r = 1;
@@ -1469,16 +1469,16 @@ mod tests {
         assert_eq!(classes.multiplicity(&quad(r, r, r), &bound), Some(1 << 44));
     }
 
-    /// REAS-3a review r1 R1. Spec (`crate::visit`: after its visitor's last yes a counted read
+    /// REAS-3a. Spec (`crate::visit`: after its visitor's last yes a counted read
     /// does at most the units that yes allowed, `POLL_UNITS`, plus a step that can't be split;
     /// finishing a class is split): a counted read's cold class build finishes its classes
     /// within its visitor's interval. One asserted chain of three intervals of identities, one
     /// class built one identity at a time, and one statement about its representative: between
     /// two asks of the visitor, and after the last, the read does at most an interval of work
-    /// (`work`: fix check r2 G2, the bound itself). Finishing the class after one count of it
+    /// (`work`: the bound itself). Finishing the class after one count of it
     /// (its members copied, checked for literals and indexed), it handled three times the class
     /// unseen; with its scan and its unions counted on two credits, each within its own run,
-    /// both runs' work followed a yes (fix check r2 G1).
+    /// both runs' work followed a yes.
     #[test]
     #[cfg(debug_assertions)]
     fn a_counted_class_build_finishes_its_class_within_its_visitor_s_interval() {
@@ -1547,8 +1547,8 @@ mod tests {
 
     /// The work a counted class build does, counted where it is done: scan steps and runs, their
     /// searches' comparisons and their merges' work, copies, finished identities, sort work, and
-    /// the union kernel's member moves and the slots its enumeration walks (fix check r1 F3, r2
-    /// G2: not what the build told its visitor). Debug builds only, as the union kernel's
+    /// the union kernel's member moves and the slots its enumeration walks (not what the build told its visitor).
+    /// Debug builds only, as the union kernel's
     /// counters are to this crate's tests (`nrese_exec::classes::witness`).
     #[cfg(debug_assertions)]
     fn work() -> u64 {
@@ -1640,12 +1640,12 @@ mod tests {
     }
 
     /// Spec (`crate::visit`: after its visitor's last yes a counted read does at most a run of
-    /// work, then stops at its next call; review r1 R1, fix check r1 F3): a counted read's cold
+    /// work, then stops at its next call): a counted read's cold
     /// class build, stopped after its visitor's k-th yes for every k until it finishes, answers
-    /// `Stopped` and does at most an interval of work after any yes (fix check r2 G2: the
+    /// `Stopped` and does at most an interval of work after any yes (the
     /// bound itself, `POLL_UNITS`). Then, not stopped, it
     /// answers every copy. Work is counted where it is done (`work`). Map initialisation, held
-    /// for the owner (fix check r1 F2), is not counted.
+    /// for the owner, is not counted.
     #[cfg(debug_assertions)]
     fn a_cold_class_build_stops_within_an_interval_of_any_yes(
         names: &[String],
@@ -1677,7 +1677,7 @@ mod tests {
         );
     }
 
-    /// REAS-3a fix check r1 R1 (the union and the sort) and F3. Two chains of three intervals
+    /// REAS-3a, the union and the sort. Two chains of three intervals
     /// of identities each, then one statement joining them, last in every order of the scan
     /// (its ends are interned last): that union moves a whole chain, three intervals of members,
     /// and the joined class's sort sorts six.
@@ -1704,11 +1704,11 @@ mod tests {
         );
     }
 
-    /// REAS-3a fix check r2, a class build whose classes are joined into one. Three intervals of
+    /// REAS-3a, a class build whose classes are joined into one. Three intervals of
     /// classes of two, then each joined to a hub interned last (so its statements come last in
     /// the scan): the build's scans, unions, listing and finish stay within an interval of any
-    /// yes. It covers the combined build and G1 (red at G1's 5,480); G3, listing the classes
-    /// from the kernel's dense list, has no red of its own (fix check r3 H3).
+    /// yes. It covers the combined build and the read's one account (red at 5,480 without it);
+    /// listing the classes from the kernel's dense list has no red of its own.
     #[test]
     #[cfg(debug_assertions)]
     fn classes_joined_into_one_enumerate_within_an_interval_of_any_yes() {
@@ -1729,7 +1729,7 @@ mod tests {
         );
     }
 
-    /// REAS-3a fix check r1 F3, the many-small-classes shape: three intervals of classes of two.
+    /// REAS-3a, the many-small-classes shape: three intervals of classes of two.
     #[test]
     #[cfg(debug_assertions)]
     fn many_small_classes_stop_within_an_interval_of_any_yes() {
@@ -1772,7 +1772,7 @@ mod tests {
         )
     }
 
-    /// REAS-3a fix check r2, G1's sibling in an expansion (`Expand`). Spec (`crate::visit`: at
+    /// REAS-3a, the read's one account in an expansion (`Expand`). Spec (`crate::visit`: at
     /// most an interval of work after any yes): a counted sorted read under equality does at most
     /// an interval of work between two asks of its visitor, its stored scan's steps and its
     /// copies together, and answers as the plain read does. Every quad, read by SPOG: a class of
@@ -1829,7 +1829,7 @@ mod tests {
         );
     }
 
-    /// REAS-3a fix check r2, G1's sibling in a sorted read without equality. Spec
+    /// REAS-3a, the read's one account in a sorted read without equality. Spec
     /// (`crate::visit`): a counted sorted read of both stacks does at most an interval of work
     /// between two asks of its visitor, and answers as the plain read does. Every quad, read by
     /// SPOG: three intervals of statements in each stack, their objects alternating, so the merge steps both scans in
@@ -1888,7 +1888,7 @@ mod tests {
         );
     }
 
-    /// REAS-3a fix check r3 H2. Spec (`crate::visit`: once `visit` answers false the read
+    /// Spec (`crate::visit`: once `visit` answers false the read
     /// does no more work and answers `Stopped`, never a value): a counted sorted read stopped
     /// while its scans are being made hands on no quad after the stop. Two asserted commits of
     /// 129 and 8,065 statements and one inferred statement, read by SPOG and stopped at each of

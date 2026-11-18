@@ -122,7 +122,7 @@ fn describe_charges_the_terms_it_keeps_decoded() {
     assert_eq!(envelope.used(), 0, "dropped, nothing stays charged");
 }
 
-// Spec (D16-039, sol-loop r1 S2): a decode cache gives way to what the answer must hold.
+// Spec: a decode cache gives way to what the answer must hold.
 // DESCRIBE of one statement with a 1 MiB literal under a 1.5 MiB envelope holds the literal
 // once in its output, which fits; a second copy kept for reuse would not, so it isn't kept.
 #[test]
@@ -143,7 +143,7 @@ fn a_cached_term_never_crowds_out_the_answer() {
     assert_eq!(rows.map(Result::unwrap).count(), 1);
 }
 
-// Spec (D16-039, sol-loop r2 S2): a term kept early gives way once the answer needs its room.
+// Spec: a term kept early gives way once the answer needs its room.
 // DESCRIBE of three statements with distinct 1 MiB literals under a 3.5 MiB envelope holds
 // the three in its output, which fits; the first literal, kept for reuse while there was
 // room, must not stay kept once the output needs that room.
@@ -165,7 +165,7 @@ fn a_term_kept_early_gives_way_to_the_answer() {
     assert_eq!(rows.map(Result::unwrap).count(), 3);
 }
 
-// Spec (D16-039, sol-loop r3 S2): a term that can't be kept makes the cache let go. DESCRIBE
+// Spec: a term that can't be kept makes the cache let go. DESCRIBE
 // of a 1 MiB literal and then a distinct 2 MiB one under 3.5 MiB holds both in its output,
 // 3 MiB, which fits; the first, kept for reuse, must not stay kept once the second needs
 // the room.

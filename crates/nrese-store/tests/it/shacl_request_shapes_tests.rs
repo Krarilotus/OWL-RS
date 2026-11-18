@@ -202,8 +202,8 @@ fn request_shapes_are_the_requests_alone_whatever_the_store_holds() {
 }
 
 /// S10: a graph validated by name holds its stored statements only, never the request's
-/// shapes, even when it has the name the shapes would otherwise go into (sol-loop SYN-58
-/// r1 S1). A shape that targets shapes (`sh:targetClass sh:NodeShape`) and fails on every
+/// shapes, even when it has the name the shapes would otherwise go into.
+/// A shape that targets shapes (`sh:targetClass sh:NodeShape`) and fails on every
 /// one would find itself if it were data.
 #[test]
 fn a_graph_validated_by_name_never_holds_the_request_shapes() {

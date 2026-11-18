@@ -348,7 +348,7 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
     `untimed` (case: why) is compared in everything but its time and its spread; one in `unmeasured`
     (its two sides loaded other or unknown input bytes: input_check()) in its answers, status and
     checks only, since none of its measures (time, throughput, memory, work, a known issue's peak) is
-    evidence of a code change over other input (review r1 of pkg/stage-data, R1-W1)."""
+    evidence of a code change over other input."""
     untimed, unmeasured = untimed or {}, unmeasured or {}
     spreads = []
     for case in sorted(set(base) | set(new)):
@@ -394,7 +394,7 @@ def compare_cases(base: dict[str, dict], new: dict[str, dict], min_ms: float, ou
                     return ({f["status"] for f in runs}, *(statistics.median(v) if v else None for v in numbers))
                 (sb, mb, pb), (sn, mn, pn) = past(b), past(n)
                 # Its status is a finding about the new run whatever the input; its metric and peak only
-                # over the same input bytes (review r1 of pkg/compare-input-status, R1-W1).
+                # over the same input bytes.
                 worse = "ok" in sb and sn != {"ok"}
                 why = unmeasured.get(case) or ("host change" if host_refused else None)
                 measures = (f"metric and peak not compared: {why}" if why
@@ -551,8 +551,8 @@ def host_check(base: list[dict | None], new: list[dict | None], allow: bool) -> 
 # The saved timing units' generation each fast.py record carries (`series_units`): 2 since 8 Nov
 # 2026, every series and metric in milliseconds of what the case declares. A record without it is
 # generation 1: a seconds field other than load_s/open_s was saved in seconds, and a non-p50 field
-# of a section that sampled its own latency was timed by that latency (fix check r2 of
-# pkg/declared-metrics, R2-F1). Raise it with any change of what a saved series means.
+# of a section that sampled its own latency was timed by that latency.
+# Raise it with any change of what a saved series means.
 SERIES_UNITS = 2
 GEN1_SAMPLED_SECTIONS = {"commits", "reason", "shacl", "kernel", "classification"}
 
@@ -583,7 +583,7 @@ def normalised(record: dict, metric: str | None) -> dict | None:
 def units_check(base_report: dict, new_report: dict) -> tuple[dict, dict, dict[str, str]]:
     """Both reports' records in one generation of timing units, and the cases whose timing can't be,
     with why: their records stay as saved, for every comparison but their time's (compare_cases
-    `untimed`; fix check r3, R3-F1: dropping them dropped a wrong status too). A case whose records are
+    `untimed`: dropping them dropped a wrong status too). A case whose records are
     all of one generation on both sides compares as it was saved."""
     from . import cases as registry
     declared = {c["name"]: c.get("metric") for c in registry.load()}
@@ -612,9 +612,9 @@ UNRECORDED = object()  # a record without `inputs`: a report before 7 Nov 2026
 
 
 class Observed:
-    """What one side's records say a case loaded, every record's observation kept (fix check r3 of
-    pkg/stage-data, R3-W1, 7 Nov 2026: one `dict | None` per case made "a record doesn't say" and
-    "the records disagree" the same None, which a falsy test then took for "no input"). Each record
+    """What one side's records say a case loaded, every record's observation kept (one `dict | None` per case made "a record doesn't say" and
+    "the records disagree" the same None, which a falsy test then took for "no input").
+    Each record
     is in one of three states: unrecorded (no `inputs`), explicitly none (`{}`), or recorded external
     (anything else: a mapping of file to SHA-256, or a value that isn't a mapping, its bytes unknown).
     It has no truth value, so that no test can project it back to one."""
@@ -659,11 +659,11 @@ def loaded_inputs(report: dict) -> dict[str, Observed]:
 
 def input_check(base_report: dict, new_report: dict) -> dict[str, str]:
     """The cases whose two sides didn't load the same external input bytes, or don't say which, with
-    why: no verdict of theirs is evidence of a code change (review r1 of pkg/stage-data, R1-W1, 7 Nov
-    2026: lubm-10/100's new release made an old result "slower" than a new one). What a case loads is
+    why: no verdict of theirs is evidence of a code change (lubm-10/100's new release made an old result "slower" than a new one).
+    What a case loads is
     suitekit.inputs.declared()'s one answer. Recorded identities come first: a case of generated data
     alone (it declares nothing today, and no record on either side names an external file) needs none
-    recorded; any record naming one makes it a case of external input (fix check r3, R3-W1)."""
+    recorded; any record naming one makes it a case of external input."""
     from . import cases as registry
     from . import inputs
     declares = {c["name"]: inputs.declared(c) for c in registry.load()}
@@ -672,7 +672,7 @@ def input_check(base_report: dict, new_report: dict) -> dict[str, str]:
     for case in sorted(set(base) & set(new)):
         b, n, want = base[case], new[case], declares.get(case)
         if want == set() and not b.external and not n.external:
-            continue  # generated data alone, on both sides (sol-loop r3 V3)
+            continue  # generated data alone, on both sides
         if why := (b.unknown("the base") or n.unknown("the new run")
                    or input_difference(b.recorded(), n.recorded(), declared=want)):
             out[case] = why
@@ -715,7 +715,7 @@ def suite_inputs(paths: list[Path]) -> tuple[dict | None, dict]:
     and `dataset_sha256`): file -> SHA-256 (None: not recorded, or two invocations disagree), and
     file -> size; (None, {}) where a manifest is missing. Only an invocation that states its inputs'
     hashes (`dataset_sha256`, `{}` included) establishes them: `datasets` alone may miss what a
-    workload loads itself (sol-loop r3 V1: commit-latency's LUBM), so its inputs stay unknown
+    workload loads itself (commit-latency's LUBM), so its inputs stay unknown
     (UNLISTED), its listed sizes still showing another release."""
     hashes: dict = {}
     sizes: dict = {}
@@ -729,7 +729,7 @@ def suite_inputs(paths: list[Path]) -> tuple[dict | None, dict]:
                 hashes[UNLISTED] = None
             digests = i.get("dataset_sha256") or {}
             listed = i.get("datasets") or {}
-            # Every file the run hashed or listed (fix check r2, R2-W1: a hash for a file the run loads
+            # Every file the run hashed or listed (a hash for a file the run loads
             # outside its declared plan, commit-latency's LUBM, was dropped with the size map's keys).
             for f in sorted(set(listed) | set(digests)):
                 sha, size = digests.get(f), listed.get(f)
@@ -737,7 +737,7 @@ def suite_inputs(paths: list[Path]) -> tuple[dict | None, dict]:
                     hashes[f], sizes[f] = sha, size
                     continue
                 # Disagreement: hashes that differ (or one missing), or two known sizes that differ; a
-                # size one invocation lists and another doesn't is no disagreement (sol-loop r5 X1).
+                # size one invocation lists and another doesn't is no disagreement.
                 if hashes[f] != sha or (size is not None and sizes.get(f) not in (None, size)):
                     hashes[f] = None
                 if sizes.get(f) is None:
@@ -765,7 +765,7 @@ def compare_reports(base_report: dict, new_report: dict, min_ms: float = 2.0, al
         print()
     # Its records stay: a case refused for its input is judged in status, checks and answers, and its
     # measures not at all (compare_cases `unmeasured`; the record filter here
-    # dropped a wrong status, as R3-F1 found for the units in #135).
+    # dropped a wrong status, as the unit filter did in #135).
     no_input = bool(other_input) and any(all(r["case"] in other_input for r in report.get("records", []))
                                          for report in (base_report, new_report))
     base_report, new_report, untimed = units_check(base_report, new_report)

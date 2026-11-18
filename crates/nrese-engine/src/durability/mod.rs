@@ -180,7 +180,7 @@ pub(crate) struct NamesToResolve {
 
 impl NamesToResolve {
     /// The names to sync, resolved now: a found root's holders (its chain walked once, each
-    /// found internal directory resolved from where it ended, review r1 R1-L1), each file's
+    /// found internal directory resolved from where it ended), each file's
     /// link chain (DUR-5: a regular file adds nothing), and the store's own directories keyed
     /// as the holders are (one directory, one key).
     pub(crate) fn resolve(&self) -> std::io::Result<wal::PendingNames> {
@@ -241,11 +241,11 @@ impl Durable {
         policy: &CompactionPolicy,
         config: DurabilityConfig,
     ) -> EngineResult<Recovered> {
-        // Durably named, every level of it (review r1, R1-F2): commits acknowledged in it must
+        // Durably named, every level of it: commits acknowledged in it must
         // not lose the directory that holds them. A root found: its holders' syncs are left to
         // the first durable write that relies on them (`Wal::settle_names`), as the first sync
-        // an open does costs it a journal commit and a device flush (timing of 8 Nov,
-        // deferred-sync design note), and so is their resolution where the open changes nothing
+        // an open does costs it a journal commit and a device flush, and so is their
+        // resolution where the open changes nothing
         // (D16-548: an open that never writes reads none of its names). A root made: every
         // level now, as a new store pays once.
         let found = root.is_dir();
@@ -327,8 +327,8 @@ impl Durable {
 
         let wal_dir = wal::wal_dir(root);
         // Named in the root: the root's sync after replay (or before the first durable write)
-        // names them. One found may itself be a link to a directory elsewhere (review r1,
-        // R1-L1): the names its resolution reads (the link's holder, its target's chain) join
+        // names them. One found may itself be a link to a directory elsewhere:
+        // the names its resolution reads (the link's holder, its target's chain) join
         // the holders, under the same found-level rule, as the store's records live there.
         // Resolved from where the root's resolution ended (one walk of their common chain).
         let mut found_inside = Vec::new();
@@ -389,8 +389,8 @@ impl Durable {
         // What the checkpoint holds, and the segments records were replayed from.
         let covered_through = version.revision;
         let mut replayed = Vec::new();
-        // The newest segment left in place, which `Wal::open` appends to (DUR-5; review r1, N2:
-        // known here, not by listing the log again): one covered by the checkpoint included,
+        // The newest segment left in place, which `Wal::open` appends to (known here, not by listing the log again):
+        // one covered by the checkpoint included,
         // one the replay removed (a point-in-time cut, a tail without even a header) not.
         let mut newest = None;
         for (position, (_, path)) in segments.iter().enumerate() {
@@ -564,7 +564,7 @@ impl Durable {
         for path in &replayed {
             place::sync_file(path)?;
         }
-        // The authoritative files reached through links (DUR-5, fix check r2 on DUR-4, R2-F1):
+        // The authoritative files reached through links:
         // the checkpoint loaded, each segment replayed, and the newest segment, which
         // `Wal::open` appends to (a covered one included), once: it is often the last replayed.
         let newest = newest.filter(|path| replayed.last() != Some(path));
@@ -671,8 +671,8 @@ fn replay(
 /// 292,277; only a replicated record or a damaged log can say otherwise.
 pub(crate) const MAX_COMMIT_TIME: u64 = (1 << 63) - 1;
 
-/// Refuses a logged record whose commit time is past [`MAX_COMMIT_TIME`] (sol-loop, review
-/// fix S2): its time couldn't be kept, and kept short it would read as earlier than it was.
+/// Refuses a logged record whose commit time is past [`MAX_COMMIT_TIME`]:
+/// its time couldn't be kept, and kept short it would read as earlier than it was.
 pub(crate) fn check_commit_time(record: &CommitRecord) -> EngineResult<()> {
     match record.committed_micros {
         Some(time) if time > MAX_COMMIT_TIME => Err(EngineError::Corruption(format!(

@@ -1,6 +1,6 @@
 //! A transfer through the mutation pipeline draws what it reads and what it adds to the
 //! request's pending changes from the memory the requests share (`total_query_memory_bytes`),
-//! before it allocates (SYN-54 review r1, F1): a copy larger than that memory is refused with
+//! before it allocates: a copy larger than that memory is refused with
 //! the memory error, and the store is as it was.
 //!
 //! The size comes from the data: `N` distinct statements take at least `N` encoded quads of 32

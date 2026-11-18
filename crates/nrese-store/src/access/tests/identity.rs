@@ -1,6 +1,6 @@
 //! Content is bound to the incarnation of a space that made it (SYN-64; owner decision
-//! C-204 (b), 26 Oct: "Content is bound to an internal id, so a reused name starts empty";
-//! design note `2026-11-08-p2-b5-syn64-design.md`, attacks C1–C7): a workspace or a local
+//! C-204 (b), 26 Oct: "Content is bound to an internal id, so a reused name starts empty"):
+//! a workspace or a local
 //! user removed and created again under its name inherits none of the old one's graphs or
 //! saved queries, and spaces from before ids keep what they have.
 
@@ -213,7 +213,7 @@ fn a_reused_name_starts_empty() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// C17 (package review R1-D1; red without its fix) and C18 (guard): a local user from before
+/// C17 (red without its fix) and C18 (guard): a local user from before
 /// ids, removed, created again without a password and given one in a second change, is a
 /// new person and inherits nothing; an unchanged account from before ids, its password
 /// reset, keeps its space. Both also after reopen. Specified (C-204 (b)): a reused name
@@ -271,12 +271,12 @@ fn keeps(control: &AccessControl, who: &Principal, space: &str, graph: &str) -> 
         && control.saved_query(who, space, "kept").is_ok()
 }
 
-/// A user's id is fixed when its record is created; nothing later moves its space
-/// (fix check r1, R2-L1; design note revision r2, its event table). Specified: the same
-/// person keeps its personal space through a password added and removed, and through a
-/// role record made for a token user; also after reopen. Red without the fix: R2-L1
-/// (dave) and R2-L1b (erin). The collision row is documented behaviour (master, 9 Nov
-/// 00:38): an administrator creating a local account under a token user's name gives the
+/// A user's id is fixed when its record is created;
+/// nothing later moves its space. Specified: the same person keeps its personal space
+/// through a password added and removed, and through a role record made for a token
+/// user; also after reopen. Red without the fix: the rows dave and erin. The collision
+/// row is documented behaviour: an administrator creating a local account under a
+/// token user's name gives the
 /// name a fresh space.
 #[test]
 fn a_user_s_own_space_never_moves() {
@@ -296,7 +296,7 @@ fn a_user_s_own_space_never_moves() {
         password_hash: Some(None),
     };
     let mut wrong = Vec::new();
-    // R2-L1: an external user's role record, then a password, then none.
+    // An external user's role record, then a password, then none.
     control.apply(&admin(), role("dave"), "an analyst").unwrap();
     let dave_graph = keep(&control, &dave, "~dave");
     for (change, step) in [
@@ -308,7 +308,7 @@ fn a_user_s_own_space_never_moves() {
             wrong.push(format!("R2-L1 {step}: dave lost his own space"));
         }
     }
-    // R2-L1b: a token user's content before any record; then a role record and a password.
+    // A token user's content before any record; then a role record and a password.
     let erin_graph = keep(&control, &erin, "~erin");
     for (change, step) in [
         (role("erin"), "role record created"),
@@ -335,9 +335,9 @@ fn a_user_s_own_space_never_moves() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// The history decides identities (design note revision r2), so an access state whose
+/// The history decides identities, so an access state whose
 /// history can't answer "did this name have a local login" refuses to open rather than
-/// guess (master, 9 Nov 00:38): H1 a state without history, H2 a gap, H4 an unreadable
+/// guess: H1 a state without history, H2 a gap, H4 an unreadable
 /// record, and a current local login the history never recorded. Control: the complete
 /// one opens. Red without the fix (each opens).
 #[test]

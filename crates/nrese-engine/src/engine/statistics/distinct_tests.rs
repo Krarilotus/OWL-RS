@@ -1,5 +1,5 @@
-//! The distinct-value statistic made safe inside a query (D16-576, the design note
-//! `2026-11-14-distinct-statistic-life-design.md` r6, row C): its walk and the count that gates
+//! The distinct-value statistic made safe inside a query (D16-576): its walk and the
+//! count that gates
 //! it stop with the query's stop, its cache is charged at its allocation and bounded, a view
 //! keeps nothing, and the runs' walks are merged to today's numbers.
 
@@ -382,7 +382,7 @@ fn several_runs_and_deletions_give_todays_numbers() {
 }
 
 /// - Spec: a merge step's comparisons are counted before they are done, however many runs
-///   merge (I1; review r1, S1): a step over more heads than a portion holds stops on the
+///   merge: a step over more heads than a portion holds stops on the
 ///   visitor's refusal, never compares uncounted.
 /// - Input: 300 walks holding the one value 7 (one group in each of 300 runs); a visitor that
 ///   refuses past 256 units, then one that never refuses.
@@ -461,7 +461,7 @@ fn snapshots_alive_at_once_each_get_their_own() {
 
 /// - Spec: a kept count is served by the asking snapshot's whole identity, not its revision: a
 ///   transaction's pending state at the published revision, with fewer matches, gets its own
-///   estimate, and its ask records nothing over the published snapshot's (review r1, F2).
+///   estimate, and its ask records nothing over the published snapshot's.
 /// - Input: 3000 subjects of `p`, published and asked once; a transaction removing subjects
 ///   `0..1000`, its pending snapshot (the same revision, 2000 matches) asked; the published
 ///   snapshot asked again.
@@ -495,7 +495,7 @@ fn a_pending_snapshot_at_the_same_revision_gets_its_own() {
 
 /// - Spec: published snapshots of one revision that read differently share no kept count: one
 ///   reading `owl:sameAs` classes gets its own estimate, not the one kept for the statements as
-///   stored (the identity serves a kept count, not the revision; review r1, F2).
+///   stored (the identity serves a kept count, not the revision).
 /// - Input: 3000 subjects of `p`; 1000 aliases, each inferred `owl:sameAs` one subject; the
 ///   published snapshot as stored asked, then the same snapshot reading equality classes.
 /// - Expected: 3000 as stored; no estimate for the expanding read (its 4000 matches are past a

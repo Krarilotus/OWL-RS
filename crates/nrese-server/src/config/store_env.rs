@@ -578,7 +578,7 @@ mod tests {
     }
 
     /// Through the DL configuration: a positive budget too small for a float (`0.000…1`) is
-    /// refused naming its setting, never loaded as no budget (review p2-b7-a r1 R1). Every
+    /// refused naming its setting, never loaded as no budget. Every
     /// row is checked.
     #[test]
     fn a_dl_budget_too_small_for_a_float_is_refused() {

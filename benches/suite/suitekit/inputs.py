@@ -1,9 +1,9 @@
 """Which external files a fast case loads: the one answer, for the runner that records their bytes
 (fast.py case_inputs()) and the comparison that holds verdicts to them (compare.input_check()).
 
-The orchestrator, 7 Nov 2026 (fix check r2 of pkg/stage-data): the recorder and the comparison had
+On 7 Nov 2026 the recorder and the comparison had
 each their own idea of an input (a `volume:` prefix, a size map, a generated-only exemption), and
-each review found another gap. Here, a data spec (`data`, `data_alt`, `extra`, a concatenation's
+each idea had its gaps. Here, a data spec (`data`, `data_alt`, `extra`, a concatenation's
 parts) is one of:
 
 - `none`: nothing;

@@ -47,8 +47,8 @@ false block is a gate whose decide() confirms at least one loss among identical 
 Calibration data (lks-aa-20) and simulated observations are separate; the floor in `new` is drawn
 from its own simulated A-A' run, never from the gate's observations.
 
-The run of 20 Oct 2026 (gate revision 9efb2314; inputs 96 files, sha256 601c17e4...; full output
-in Harness/notes/2026-10-20-gate-falseblock.md), false-block rate of complete A/A gates:
+The run of 20 Oct 2026 (gate revision 9efb2314; inputs 96 files, sha256 601c17e4...),
+false-block rate of complete A/A gates:
 
     blocks a round                       4                 6                 12
     old                                  0.002 (4/2000)    0.202             0.982

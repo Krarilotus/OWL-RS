@@ -252,10 +252,10 @@ fn repeats_are_answered_from_their_written_bytes() {
     assert_ne!(answer(&store, &per_city()), first);
 }
 
-/// A session's reads over its pending operations (the lifecycle contract's S3; package 3.6's
-/// design note §4 item 1, its real caller): unpublished state is never admitted into the
+/// A session's reads over its pending operations (package 3.6,
+/// its real caller): unpublished state is never admitted into the
 /// store's cache, however often the session reads its kept view (what it keeps, its own
-/// version keeps: §11).
+/// version keeps).
 ///
 /// - Input: the per-city query answered and cached; a session adding a person who knows `p0`;
 ///   the query three times on the session's pending operations.

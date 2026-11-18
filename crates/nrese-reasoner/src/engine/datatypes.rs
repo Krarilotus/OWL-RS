@@ -235,8 +235,8 @@ mod tests {
         // Guard (holds on the base too).
         assert_eq!(rules("ex:a ex:code \"a b\" ."), none, "a token");
         // rdf:PlainLiteral's strings hold XML's Char only (rdf:PlainLiteral §§2-3): a language
-        // string holding U+0001 is outside it; an ordinary one is inside (SHACL datatype-map
-        // review r2, R2-F1).
+        // string holding U+0001 is outside it;
+        // an ordinary one is inside.
         assert_eq!(
             rules("ex:plain rdfs:range rdf:PlainLiteral . ex:a ex:plain \"a\\u0001b\"@en ."),
             ["dt-not-type"],
@@ -300,7 +300,7 @@ mod tests {
                 "one instant at two offsets",
             ),
             // A year past what is represented doesn't excuse the rest of the form (XML
-            // Schema 1.1 Part 2 §3.3.7.2, §3.4.28.1): still ill-typed (XSDVAL sol-loop S2).
+            // Schema 1.1 Part 2 §3.3.7.2, §3.4.28.1): still ill-typed.
             (
                 "ex:a ex:when \"100000000001-13-01T00:00:00Z\"^^xsd:dateTime .",
                 dt_not_type,
@@ -339,7 +339,7 @@ mod tests {
                 "gYear is outside the map",
             ),
             // A year has no bound (XML Schema 1.1 Part 2 §3.3.7.2): one past what is
-            // represented is valid, not judged, never an inconsistency (XSDVAL sol-loop S1).
+            // represented is valid, not judged, never an inconsistency.
             (
                 "ex:a ex:when \"100000000001-01-01T00:00:00Z\"^^xsd:dateTime .",
                 &[],

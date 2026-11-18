@@ -96,9 +96,9 @@ fn table(rows: &[&[&str]]) -> Vec<Vec<String>> {
     rows
 }
 
-/// The seven cases of `notes/2026-11-07-graph-var-search-binding-sizing.md`, and an eighth
-/// from review r1 (the search binding the graph variable itself), one row each (some with
-/// several queries), every row reported.
+/// Eight cases, the eighth the search binding the graph variable itself,
+/// one row each (some with several queries),
+/// every row reported.
 #[test]
 fn a_search_under_graph_variable_is_evaluated_per_named_graph() {
     let engine = engine();
@@ -202,8 +202,8 @@ fn a_search_under_graph_variable_is_evaluated_per_named_graph() {
     );
     // 8: the search binding the graph variable itself (the matched literal, its rank or
     // relevance): §18.6 joins each graph's solutions with ?g bound to the graph, and a
-    // literal or a number is never a graph's name, so no solution survives (review r1
-    // R1-W1).
+    // literal or a number is never a graph's name, so no solution
+    // survives.
     for (name, extra) in [
         ("8 ?g the matched literal", ""),
         ("8 ?g the rank", "; bds:rank ?g"),

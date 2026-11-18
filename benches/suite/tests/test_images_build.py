@@ -1,9 +1,9 @@
 """The images benches/sparql/images.sh builds (MillenniumDB, G-CARE) say what they were built from:
 the context's git tree and the source commit, as labels on the image itself, which a cell's receipt
 reads off the id that ran (driver.Suite.image_source). Only from a
-clean checkout; a build at another source commit says so in its own label. Review
-image-source-commit r1 (orchestrator 18:26): a checkout whose cleanliness can't be read gets no
-label (F1), and the source commit its Dockerfile declares is one value, or the build refuses."""
+clean checkout; a build at another source commit says so in its own label.
+A checkout whose cleanliness can't be read gets no
+label, and the source commit its Dockerfile declares is one value, or the build refuses."""
 from __future__ import annotations
 
 import subprocess
@@ -84,7 +84,7 @@ class Labels(unittest.TestCase):
         self.assertNotIn("owlrs.", build)
 
     def test_a_checkout_whose_status_fails_labels_nothing(self):
-        """Review r1 F1: `git status` failing prints nothing; that is no evidence of a clean checkout,
+        """`git status` failing prints nothing; that is no evidence of a clean checkout,
         so a changed Dockerfile behind a broken index gets no label naming the committed tree."""
         for image in ("millenniumdb", "gcare"):
             with self.subTest(image):
@@ -93,7 +93,7 @@ class Labels(unittest.TestCase):
                 self.assertNotIn("owlrs.", build)
 
     def test_a_source_commit_its_dockerfile_doesn_t_declare_once_refuses_the_build(self):
-        """Review r1 follow-up (orchestrator 18:26): the declared source commit is every `ARG NAME=`
+        """The declared source commit is every `ARG NAME=`
         default of the context's Dockerfile, one non-empty value; absent, empty or two values: the
         build refuses, naming why, and asks docker nothing. Also with a commit given, whose build
         argument a Dockerfile without the ARG wouldn't use."""
@@ -119,7 +119,7 @@ class Labels(unittest.TestCase):
                 self.assertIn("-t nrese-bench/millenniumdb:1111111 ", build)
 
     def test_the_declared_commit_is_one_reader_s_for_images_sh_and_coverage(self):
-        """Design check r6 N1: images.sh's declared() is suitekit/dockerfile.py's, the reader suite.py
+        """Images.sh's declared() is suitekit/dockerfile.py's, the reader suite.py
         coverage judges an image's source commit against; its exact value, written here by hand."""
         sys.path.insert(0, str(ROOT / "benches/suite"))
         from suitekit.dockerfile import declared_source_commit

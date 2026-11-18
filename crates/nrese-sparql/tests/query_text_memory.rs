@@ -1,4 +1,4 @@
-//! Guard of allocations the query's text multiplies (notes/2026-11-02-column-budget.md): a
+//! Guard of allocations the query's text multiplies: a
 //! projection makes a column per unbound variable and a UNION one per variable a side
 //! lacks, so k variables in the text make k columns of a charged table's rows; and a
 //! sequence of alternatives multiplies the ways through a node, `(p|p)/(p|p)` reaching it
@@ -230,7 +230,7 @@ fn a_closure_over_a_sequence_holds_its_ends_once() {
 }
 
 /// Spec: as above, for the other places where the query's text multiplies what a query
-/// makes per row (notes/2026-11-02-column-budget.md CB-6, S1-S6). Over 4,096 rows, 256 of
+/// makes per row. Over 4,096 rows, 256 of
 /// each make 8 MiB or more (256 × 4,096 × 8 bytes) where each is a column or a term per
 /// row: a column per EXISTS (S1), per GROUP BY variable (S2), per LATERAL variable put in
 /// (S4), a sort key per
@@ -397,7 +397,7 @@ fn what_the_query_text_multiplies_draws_from_the_query_budget() {
 
 /// Spec: SPARQL 1.1 §11.2: grouping on `?s ?s` partitions as grouping on `?s`, so a key the
 /// query names 256 times is one key, and what the grouping holds per row grows with the
-/// distinct keys, not with the text (PR #89 review r1, R89-1). Two projected subqueries
+/// distinct keys, not with the text (PR #89). Two projected subqueries
 /// sharing no variable, `{ SELECT ?s … } { SELECT ?a … }`, over the 4,096 statements
 /// `ex:s<i> ex:p ex:o<i>`, grouped by 256 times `?s`, count their 16 M-row product: with
 /// no limit each subject once, with a count of 4,096 (default path; written as is, the
@@ -456,12 +456,12 @@ fn a_crossed_group_by_a_key_named_again_draws_from_the_query_budget() {
 /// `MemoryLimit`, either way within the bound; 64 arms make 128n rows, over 1 MiB for
 /// n = 1,024 and 4,096: `MemoryLimit`. Each way, the query's thread holds at most the
 /// limit and its bookkeeping (holding every arm's bag at once would be 64 × 2n × 16 bytes,
-/// 8 MiB for n = 4,096; the package review r1 of the executor memory stack, EMS-R1, and its
-/// sol-loop r1 S1: the bound values' pairs). The arms as a sequence's step, `ex:p/(…)`,
+/// 8 MiB for n = 4,096; the bound values' pairs likewise).
+/// The arms as a sequence's step, `ex:p/(…)`,
 /// reach the same ends k ways each, so under `+` they answer the same pairs once, from the
 /// hub each `ex:n<i>` once, and as an alternative's arm beside `ex:q` the pairs and
 /// `(ex:m, ex:m)` (2n + 1): a step that held every copy before counting them would hold
-/// k × 2n pairs, 8 MiB (the package fix check r2, EMS-R1). On the default path and as
+/// k × 2n pairs, 8 MiB. On the default path and as
 /// written alike.
 #[test]
 fn overlapping_alternative_arms_draw_from_the_query_budget() {
@@ -627,7 +627,7 @@ fn overlapping_alternative_arms_draw_from_the_query_budget() {
 /// put together in moves into the answer's column. Over 65,536 statements
 /// `ex:h ex:p ex:n<i>`, `ex:h (ex:p|ex:missing) ?y` answers each `ex:n<i>` once under
 /// 900 KiB: its union of 512 KiB is the column, so charging both would ask 1 MiB and
-/// refuse what fits (sol-loop r5 S1 of the executor memory stack's package fix check r2).
+/// refuse what fits.
 /// Within the bound under the 1 MiB limit too. On the default path and as written alike.
 #[test]
 fn a_paths_answer_moved_into_its_column_is_charged_once() {

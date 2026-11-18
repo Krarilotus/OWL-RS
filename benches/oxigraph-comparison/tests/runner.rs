@@ -1,4 +1,4 @@
-//! The syntax benchmark's receipt: a run proves it timed what it selected (Sol, PR #61 F3: a
+//! The syntax benchmark's receipt: a run proves it timed what it selected (PR #61: a
 //! filter matching no comparison timed nothing and exited successfully).
 
 use std::process::Command;

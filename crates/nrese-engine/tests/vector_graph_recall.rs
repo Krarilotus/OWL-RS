@@ -3,7 +3,7 @@
 //! The graph is built by parallel insertion on Rayon's global pool (the engine starts the build
 //! with `rayon::spawn`), and which inserts overlap changes the graph from run to run: its recall
 //! isn't a guarantee the product makes, so a test can't hold it (8 Nov: 9 of 10 in 31 of 660 runs,
-//! 7 of 10 once in a loaded gate; `notes/2026-11-08-p2-a4-vector-flake.md` in the harness). The
+//! 7 of 10 once in a loaded gate). The
 //! test runs alone in a process of its own ([`measure::alone`]), whose global pool it builds with
 //! one thread first, so the graph is built the same way every run (10 of 10 in 60 of 60 runs on
 //! one thread). This file is a test binary of its own, as `alone` needs the measured allocator.

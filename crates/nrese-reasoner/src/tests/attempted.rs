@@ -1,4 +1,4 @@
-//! The poller bounds attempted work, not delivered rows (REAS review r1, F1–F3): searches,
+//! The poller bounds attempted work, not delivered rows: searches,
 //! producers and driver positions that deliver nothing still count, and an entry that is
 //! asked after its operation stopped does no work at all. Every count here is of work a
 //! source was asked for, never of time.
@@ -106,7 +106,7 @@ fn empty_producers(
     (closure, ground, asserted)
 }
 
-/// F1: the support sets' one-step search for one asserted fact over more than `POLL_UNITS`
+/// The support sets' one-step search for one asserted fact over more than `POLL_UNITS`
 /// producers, every one an empty scan. Cancelled when the first scan opens, the search ends
 /// `Cancelled` within `POLL_UNITS` attempted units more, not after every producer.
 #[test]
@@ -148,9 +148,9 @@ fn empty_support_searches_count_towards_the_stop() {
     );
 }
 
-/// F2: DRed's one-step derivation checks, asked after their operation stopped, read nothing
-/// and answer that they were stopped (REAS-2 fix check r1, rule 2: once a "false"): not the
-/// bodiless shortcut (its schema facts), not a producer's search.
+/// DRed's one-step derivation checks, asked after their operation stopped, read nothing and
+/// answer that they were stopped (once a "false"): not the bodiless shortcut (its schema
+/// facts), not a producer's search.
 #[test]
 fn a_derivation_check_after_its_stop_reads_nothing() {
     let mut vocabulary = LocalVocabulary::default();
@@ -251,7 +251,7 @@ impl Visits for Stale {
     }
 }
 
-/// F3: the consistency check over driver ranges that deliver nothing (every position
+/// The consistency check over driver ranges that deliver nothing (every position
 /// filtered before the callback), more than `POLL_UNITS` positions in several morsels.
 /// Cancelled during the first range, it opens no further range and ends `Interrupted`.
 #[test]
@@ -290,10 +290,10 @@ fn filtered_driver_positions_count_towards_the_stop() {
     );
 }
 
-/// F1 (sol-loop r7, R7-1): one changed bodiless fact with more than `POLL_UNITS` premise
-/// alternatives (one per schema fact that grounds it). Each alternative is attempted work:
-/// cancelled at the first read of its earlier sets, the update reads at most `POLL_UNITS`
-/// more and ends `Cancelled`.
+/// One changed bodiless fact with more than `POLL_UNITS` premise alternatives (one per
+/// schema fact that grounds it). Each alternative is attempted work: cancelled at the
+/// first read of its earlier sets, the update reads at most `POLL_UNITS` more and ends
+/// `Cancelled`.
 #[test]
 fn each_premise_alternative_counts_towards_the_stop() {
     use crate::eval::Grounding;
@@ -365,11 +365,11 @@ fn each_premise_alternative_counts_towards_the_stop() {
     );
 }
 
-/// F1 (sol-loop r6, R6-1): a support-set update's first pass over more than `POLL_UNITS`
-/// changed facts. Each fact's prelude (its bodiless sets, which read the sets the facts
-/// had before, and its producers) is attempted work: cancelled during the first fact's,
-/// the pass reads the earlier sets of at most `POLL_UNITS` more facts, and the update ends
-/// `Cancelled`. One thread, so the bound is one task's.
+/// A support-set update's first pass over more than `POLL_UNITS` changed facts. Each
+/// fact's prelude (its bodiless sets, which read the sets the facts had before, and its
+/// producers) is attempted work: cancelled during the first fact's, the pass reads the
+/// earlier sets of at most `POLL_UNITS` more facts, and the update ends `Cancelled`. One
+/// thread, so the bound is one task's.
 #[test]
 fn a_support_update_s_first_pass_counts_each_fact() {
     use crate::graph_sets::{
@@ -439,11 +439,11 @@ fn a_support_update_s_first_pass_counts_each_fact() {
     );
 }
 
-/// R8-1 (fix check r2): producer discovery is attempted work while its references are
+/// Producer discovery is attempted work while its references are
 /// read. One task's poller over 32 candidates, each with 12,288 producers whose first
 /// succeeds at once (a single bound match); cancelled at the first candidate's first scan.
 /// The candidates after it read at most `POLL_UNITS` more producer references between
-/// them, not a whole producer list each (the reviewer's successful-prefix witness).
+/// them, not a whole producer list each.
 #[test]
 fn producer_discovery_counts_each_reference_read() {
     use crate::eval::references_read;

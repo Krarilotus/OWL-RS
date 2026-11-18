@@ -1,6 +1,6 @@
-//! Package 3.1's guards: the planner's statistics admit only from published snapshots (the
-//! lifecycle contract's S3 and A15; `notes/2026-11-08-dict3-1-statistics-design.md` §4, the design
-//! check `review-dict3-token-r0` §5 items 1, 2, 7, 8 and 9). An unpublished snapshot (a writer's
+//! Package 3.1's guards: the planner's statistics admit only from published snapshots
+//! (published-only admission).
+//! An unpublished snapshot (a writer's
 //! pending one, `Engine::speculative()`'s, a private one, any view of them) reads what published
 //! snapshots kept and computes the rest for itself: no kept set, claim, rebuild thread, load, save,
 //! distinct entry, node count or heavy group of the engine's statistics comes from it. And a closed
@@ -106,7 +106,7 @@ fn hold_next_build(statistics: &Statistics) -> (mpsc::Receiver<()>, mpsc::Sender
     (entered, release)
 }
 
-/// The unpublished snapshots of `engine` the review's §5 item 1 names, each made only of existing
+/// The unpublished snapshots of `engine`, each made only of existing
 /// ids: a writer's `pending_snapshot` and `pending_over` after an insert and a delete, with no
 /// change, and after an INSERT–DELETE of one statement; `Engine::speculative()`'s; a private
 /// transaction's, from both builders.
@@ -161,9 +161,9 @@ fn unpublished(engine: &Engine) -> Vec<(&'static str, Snapshot)> {
     out
 }
 
-/// T1 (§5 items 1, 9): an unpublished snapshot never loads the saved sets into the kept map.
+/// T1: an unpublished snapshot never loads the saved sets into the kept map.
 ///
-/// - Spec: S3 and A15; design note §2: without a token, "no claim, no wait, no load, no scan";
+/// - Spec: published-only admission; without a token, "no claim, no wait, no load, no scan";
 ///   with none kept, the planner plans without sets.
 /// - Input: a durable store loaded with 300 subjects, its sets prepared and saved, reopened (the
 ///   file there, nothing kept); every unpublished snapshot of [`unpublished`] asks for the sets.
@@ -196,7 +196,7 @@ fn an_unpublished_snapshot_loads_no_saved_sets() {
     assert_eq!(statistics.scans(), 0, "read, not scanned");
 }
 
-/// T2 (§5 item 1): an unpublished snapshot never claims or builds the sets.
+/// T2: an unpublished snapshot never claims or builds the sets.
 ///
 /// - Spec: as T1.
 /// - Input: an in-memory engine with 300 subjects and no sets kept; every unpublished snapshot of
@@ -223,9 +223,9 @@ fn an_unpublished_snapshot_builds_no_sets() {
     assert_eq!(statistics.scans(), 1);
 }
 
-/// T3 (§5 items 1, 7): an unpublished snapshot reads drifted kept sets and starts no rebuild.
+/// T3: an unpublished snapshot reads drifted kept sets and starts no rebuild.
 ///
-/// - Spec: design note §2: without a token, kept sets are read "whether they fit the size or
+/// - Spec: without a token, kept sets are read "whether they fit the size or
 ///   drifted, with no rebuild start".
 /// - Input: sets kept at 600 quads (300 subjects); a writer's pending state without 200 of them
 ///   (a drift by a third); a build claim held, so a rebuild thread, if one starts, waits.
@@ -273,10 +273,10 @@ fn an_unpublished_snapshot_starts_no_rebuild() {
     });
 }
 
-/// T4 (§5 item 1): an unpublished snapshot's distinct count is its own, and a published read
+/// T4: an unpublished snapshot's distinct count is its own, and a published read
 /// afterwards gets the published one.
 ///
-/// - Spec: S3; design note §2: without a token, distinct is computed "with no insert and no
+/// - Spec: published-only admission; without a token, distinct is computed "with no insert and no
 ///   clear"; a kept entry within its quarter answers later published reads.
 /// - Input: 300 subjects in 600 quads; a writer's pending state with 100 quads of 100 new
 ///   subjects `t{k} p0 "0"` (700 quads: within the quarter that keeps an entry, and fewer
@@ -319,12 +319,12 @@ fn an_unpublished_distinct_count_answers_no_published_read() {
     );
 }
 
-/// T5 (§5 item 1): an unpublished snapshot's node counts and heavy groups are computed for it and
+/// T5: an unpublished snapshot's node counts and heavy groups are computed for it and
 /// kept for no one.
 ///
-/// - Spec: S3; design note §2: without a token, node counts and heavy groups are computed and
+/// - Spec: published-only admission; without a token, node counts and heavy groups are computed and
 ///   returned with no push.
-/// - Input: the pending state of T4 (30 subjects, each with one quad, gone). Its node count over
+/// - Input: a writer's pending state, 30 subjects of one quad each removed. Its node count over
 ///   every graph, twice; its subjects with more than two quads, twice; then the published ones.
 /// - Expected: pending 540 nodes (270 subjects, 270 literals) and 100 heavy subjects (`i % 3 ==
 ///   2`), each walk its own, nothing kept; published 600 and 100, kept.
@@ -368,9 +368,9 @@ fn unpublished_node_counts_and_heavy_groups_are_kept_for_no_one() {
     assert_eq!(statistics.heavy_walks(), 3, "the published walk is kept");
 }
 
-/// T6 (§5 item 2): no view launders an unpublished snapshot into an admission.
+/// T6: no view launders an unpublished snapshot into an admission.
 ///
-/// - Spec: S3; 3.0's matrix (no view of an ineligible input has a token); design note §2.
+/// - Spec: published-only admission; 3.0's matrix (no view of an ineligible input has a token).
 /// - Input: 300 subjects and two inferred statements of `ex:c`; a writer's pending state, and each
 ///   view of it: stored, equality, canonical, a reader's budget, the two subsets, kept-only, a
 ///   mask, an addition, and a chain. Each asks for the sets; the pending state and the views that
@@ -481,10 +481,10 @@ fn no_view_of_an_unpublished_snapshot_admits() {
     }
 }
 
-/// T7 (§5 items 2, 8; design check §1's statistics rows): a published restriction admits into
+/// T7: a published restriction admits into
 /// its own statistics, which have no directory: it neither loads nor saves the engine's file.
 ///
-/// - Spec: design check §1, "A restricted view's fresh statistics has no derived directory, so
+/// - Spec: "A restricted view's fresh statistics has no derived directory, so
 ///   it neither saves nor loads the engine's sets files."
 /// - Input: a durable store with 300 asserted subjects and one subject `ex:c` with only an
 ///   inferred statement, its sets prepared and saved (301 subjects), reopened; a published mask
@@ -534,10 +534,10 @@ fn a_published_restriction_keeps_its_own_sets_and_no_file() {
     assert_eq!(statistics.scans(), 0);
 }
 
-/// T8 (§5 item 7; F3): a rebuild finishes for the snapshot that started it, whatever was
+/// T8: a rebuild finishes for the snapshot that started it, whatever was
 /// published meanwhile.
 ///
-/// - Spec: design check F3 and §5 item 7: deferred work "completes for the original authorised
+/// - Spec: deferred work "completes for the original authorised
 ///   snapshot/destination or is discarded", never rekeyed as latest.
 /// - Input: sets kept at 600 quads; 300 more subjects committed and a published read of that
 ///   version (1,200 quads, a drift) starts the rebuild, held at its first scan; that snapshot
@@ -571,11 +571,11 @@ fn a_rebuild_finishes_for_the_snapshot_that_started_it() {
     assert_eq!(sets.subjects(), 600);
 }
 
-/// T9 (§5 item 8): a rebuild that outlives its store saves nothing into the directory a later
+/// T9: a rebuild that outlives its store saves nothing into the directory a later
 /// open owns.
 ///
-/// - Spec: design check §2's last row and §5 item 8: "A delayed old save cannot write into a new
-///   destination generation"; design note §2.4.
+/// - Spec: "A delayed old save cannot write into a new
+///   destination generation".
 /// - Input: a durable store with sets saved at 600 quads; 300 more subjects committed and a
 ///   published read starts a rebuild, held at its first scan; the engine dropped (its `LOCK`
 ///   released); the store reopened, 100 more subjects committed and its sets prepared (the file
@@ -612,10 +612,10 @@ fn a_rebuild_that_outlives_its_store_saves_nothing_into_a_later_open() {
     );
 }
 
-/// T10 (§5 item 8): a snapshot that outlives its store neither loads from nor saves into the
+/// T10: a snapshot that outlives its store neither loads from nor saves into the
 /// directory a later open owns.
 ///
-/// - Spec: as T9; design note §2.4: no save or load starts after the close.
+/// - Spec: as T9; no save or load starts after the close.
 /// - Input: a durable store with 300 subjects and nothing kept; a published snapshot kept while
 ///   the engine drops; the store reopened, 100 more subjects committed and its sets prepared (the
 ///   file the reopened store's, 400 subjects); the kept snapshot asks for the sets.

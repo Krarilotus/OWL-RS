@@ -1890,7 +1890,7 @@ mod tests {
     /// shape or R-tree entry. Over one graph the literals are as unscoped and a scope that
     /// shows the graph checks nothing; over several, a placement's graph is its run's, one
     /// run per graph and kind, and features within one graph cross nothing.
-    /// Spec (sol-loop r1 S2 of `pkg/zero-width-budget`): a relation with both sides
+    /// Spec: a relation with both sides
     /// constant makes rows without columns, which count one id each
     /// ([`IdTable::memory_bytes`]); its result is charged as every table is, so consuming
     /// it leaves the query's other charges in place. 1,000 rows, each matching.
@@ -1959,7 +1959,7 @@ mod tests {
 
     /// A packed R-tree finds what a scan of its entries finds, at sizes around its levels'
     /// edges, and its inner nodes fill exactly the array charged for them. Its nodes cut
-    /// by both axes: a query in the gap between two bands of points (Sol's) checks the top
+    /// by both axes: a query in the gap between two bands of points checks the top
     /// level alone.
     #[test]
     fn a_packed_tree_finds_what_a_scan_finds() {
@@ -2062,10 +2062,10 @@ mod tests {
     }
 
     /// The guard of the spatial path's memory: a filter's seed and a relation pattern over
-    /// a cold index and a warm one, over sizes from a handful of shapes to 17,000 (Sol's),
+    /// a cold index and a warm one, over sizes from a handful of shapes to 17,000,
     /// in one graph and in several, with WKT, GeoJSON and GML literals, their keys plain and
-    /// compressed (a reopened checkpoint's); Sol's literal and filter constant of 10,000
-    /// points; and Sol's relation between two lines of 10,000 points under 256 bytes. None
+    /// compressed (a reopened checkpoint's); a literal and filter constant of 10,000
+    /// points; and a relation between two lines of 10,000 points under 256 bytes. None
     /// holds (counted on every thread by this test binary's allocator, at every allocation
     /// and release) a byte more than its request was charged since it started: geo's
     /// working memory for a relation is charged before geo computes it, and the engine's
@@ -2197,7 +2197,7 @@ mod tests {
                 }
             }
         }
-        // Sol's literal of 10,000 points, decoded from a plain key and a compressed one.
+        // A literal of 10,000 points, decoded from a plain key and a compressed one.
         for compressed in [false, true] {
             let statement = |_| ("asWKT", "wktLiteral", line(10_000));
             let (_dir, snapshot) = match compressed {
@@ -2257,7 +2257,7 @@ mod tests {
         if related == 0 || excess > 0 {
             failures.push(format!("a point among rings: {related} rows, {excess}"));
         }
-        // Sol's relation between two equal lines of 10,000 points, under 256 bytes.
+        // A relation between two equal lines of 10,000 points, under 256 bytes.
         let snapshot = pool.install(|| {
             snapshot_with(&vec![GraphName::DefaultGraph; 2], |_| {
                 ("asWKT", "wktLiteral", line(10_000))
@@ -2303,7 +2303,7 @@ mod tests {
         assert!(failures.is_empty(), "{failures:#?}");
     }
 
-    /// Sol's (round 2): a seed from a warm index under a 64 KiB envelope, room for its
+    /// A seed from a warm index under a 64 KiB envelope, room for its
     /// constant but not for its 17,000 candidates, is refused as its candidates grow past
     /// it, before they are allocated (it holds nothing uncharged), and leaves nothing
     /// charged.
@@ -2342,7 +2342,7 @@ mod tests {
         assert!(envelope.peak() > shape_bound(square.len()) && envelope.peak() <= limit);
     }
 
-    /// Package C3 (review r1): a charged decode charges in increments, more than one where a
+    /// Package C3: a charged decode charges in increments, more than one where a
     /// checkpoint came between its bound and its decode. Of a reservation holding 10 bytes of a
     /// 100-byte budget, one of 40 and one of 60 are asked: the second refused, the first is
     /// released and the reservation holds its 10 again; 40 and 50 fit, and their sum, 90, is the

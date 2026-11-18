@@ -1,8 +1,8 @@
 """The suite paths other tests replace wholesale, each run as it is down to what it launches: only
 the launch itself (subprocess.run) is a stand-in, and the test checks what was launched. A path
 replaced whole is never run by any test, so a fault inside one (an undefined `ROOT` after #132's
-merge, 11 Nov 2026) passed every test and failed only on a fleet host (D16-472; the toolchain-root
-fix's review r1 listed these paths).
+merge, 11 Nov 2026) passed every test and failed only on a fleet host
+(D16-472).
 
 Run: python benches/suite/tests/isolation.py discover -s benches/suite/tests -p test_real_launches.py
 An assertion tagged `SPEC <tag>` states the behaviour its test is for.

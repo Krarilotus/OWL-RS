@@ -589,7 +589,7 @@ impl Build<'_> {
         // constant, or a variable another part binds. An existential variable nothing else
         // has is some individual, and the domain is never empty. An answer variable nothing
         // else binds would be every individual: kept as written, and said.
-        // The terms the other parts bind, read once, a step per term (Sol r2 S1).
+        // The terms the other parts bind, read once, a step per term.
         let mut bound: HashSet<QTerm> = HashSet::new();
         if !everyone.is_empty() {
             for p in &parts {

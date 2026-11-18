@@ -1,6 +1,6 @@
-//! A point read's stops and paths (D16-543, design note `2026-11-14-d16-543-point-reads-design.md`
-//! r3, tests 2 and 3; D16-574, design note `2026-11-14-d16-574-lever2-point-loop-design.md` r3):
-//! the point read does no work its visits did not allow, on each of its paths, takes the
+//! A point read's stops and paths (D16-543, D16-574):
+//! the point read does no work its visits did not allow, on each of its paths,
+//! takes the
 //! expanded path where equality applies and its own elsewhere, sums each stack's signs by that
 //! stack's layout, and ends as its caller says.
 
@@ -57,7 +57,7 @@ fn read_work() -> u64 {
     .sum()
 }
 
-/// The design note's oracle (r3, E1; `index::count_tests`' `largest_gap`, per visit): `read`
+/// The oracle (`index::count_tests`' `largest_gap`, per visit): `read`
 /// run once for each refusal point, its visitor answering yes `yeses` times and then no, from
 /// `yeses` = 0 (stopped before it starts) until a run is not refused. In every run, the work
 /// witnessed in each gap, from the read's start to its first visit, between two visits and from
@@ -259,7 +259,7 @@ fn sweep_case(
     answer
 }
 
-/// Test 2 (r3, E1). Spec ([`crate::visit`]: work is counted before it is done, after a yes at
+/// Test 2. Spec ([`crate::visit`]: work is counted before it is done, after a yes at
 /// most the units it allowed follow, after a no none; the point read: every refusal answers
 /// [`Stopped`]): a point read, refused at each of its visits in turn, does no witnessed work a
 /// visit did not allow, its scans' making and its last steps included, and says it was stopped.
@@ -393,7 +393,7 @@ fn deleted_and_reinserted() -> (Engine, Terms, [Snapshot; 2]) {
     (engine, terms, [deleted, reinserted])
 }
 
-/// The default graph's sum (D16-574 r3: a default-graph stack sums its runs' signs for the
+/// The default graph's sum (a default-graph stack sums its runs' signs for the
 /// statement in one number, each run holding at most one key of it). Spec (`index::merge`: a
 /// quad is visible where its signs over the runs sum to 1): the statement asserted, deleted in a
 /// run of its own and asserted again, all in the default graph, is answered after the re-insert
@@ -484,7 +484,7 @@ fn mixed_layouts() -> (Engine, Terms) {
     (engine, terms)
 }
 
-/// Each stack by its own layout (D16-574 r3, M1: a Materialised read can span a quads asserted
+/// Each stack by its own layout (a Materialised read can span a quads asserted
 /// stack and a default-graph inferred one). Spec (the point read answers what the pattern read
 /// answers; every refusal answers [`Stopped`] after a prefix of the answer): over such stacks the
 /// read answers the asserted stack's live graph, then the inferred default graph, in each model
@@ -552,7 +552,7 @@ fn caller_end_states() -> [(&'static str, Engine, [TermId; 3]); 2] {
     ]
 }
 
-/// A decisive graph ends the read (D16-574 r2, L2). Spec (the point read: on `Break` it answers
+/// A decisive graph ends the read. Spec (the point read: on `Break` it answers
 /// at once, with no further charge or search): a caller that breaks at the first graph gets
 /// `Break`, though its visitor would refuse the next ask the read made going on (there is one),
 /// and the read asks nothing and does no witnessed work after that graph.
@@ -613,7 +613,7 @@ fn a_decisive_graph_answers_before_a_later_refusal() {
     }
 }
 
-/// A refusing caller stops the read (D16-574 r2, L2). Spec (the point read: on `Err` it returns
+/// A refusing caller stops the read. Spec (the point read: on `Err` it returns
 /// the error at once): a caller refusing the first graph gets [`Stopped`], and the read asks
 /// nothing and does no witnessed work after that graph.
 #[test]
@@ -644,7 +644,7 @@ fn a_refusing_caller_stops_the_read_at_once() {
     }
 }
 
-/// No credit across a caller's work (D16-574 r3, charging: the read's remainder is dropped at
+/// No credit across a caller's work (charging: the read's remainder is dropped at
 /// every graph it hands on, so no units one visit allowed reach past the caller's own asks).
 /// Spec: after each graph handed on, the read does no witnessed work before it asks its visitor
 /// again: not before its next ask, not before its next graph, not before its end. Over one
@@ -696,7 +696,7 @@ fn a_point_read_holds_no_credit_across_a_graph_it_hands_on() {
     }
 }
 
-/// Equality over a default-graph stack (D16-574 r3: the equality path is chosen once per read
+/// Equality over a default-graph stack (the equality path is chosen once per read
 /// and stays the expanded read). Spec ([`Snapshot::quads_for_pattern_in`]: in a model with
 /// inferred statements an alias's copy of a stored statement is answered; the asserted model
 /// reads as stored): with the statement and a `sameAs` to an alias of its subject in the default
@@ -755,7 +755,7 @@ fn a_point_read_over_nothing_tells_a_stopped_visitor() {
     }
 }
 
-/// The default-graph loop checks its layout (D16-574 r3: a debug assertion of the layout's
+/// The default-graph loop checks its layout (a debug assertion of the layout's
 /// invariant on each key it finds). Spec ([`Layout::DefaultGraph`]: such a run holds the
 /// default graph alone, so at most one key with a statement's subject, predicate and object):
 /// a quads run holding the statement in two graphs, forced through the default-graph loop,

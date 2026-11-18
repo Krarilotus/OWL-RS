@@ -1,5 +1,5 @@
 //! Reads its reader's stop sees: the contract of the engine's counted reads
-//! ([`crate::CountedSnapshot`]; REAS-3, design note `2026-11-09-p2-reas3-design.md` §1).
+//! ([`crate::CountedSnapshot`]; REAS-3).
 //!
 //! A counted read takes a **visitor**, `&dyn Fn(u64) -> bool`, and calls `visit(n)` before
 //! each `n` units of work it does, `n` at most [`nrese_exec::POLL_UNITS`]. A unit is O(1) work
@@ -10,8 +10,8 @@
 //! - a copy an equality read makes;
 //! - a `sameAs` statement or identity an equality class build reads, and a class it lists.
 //!
-//! Work is counted a portion at a time (`Account`), each portion at most `PORTION` units
-//! (fix check r1 F1). Once `visit` answers false
+//! Work is counted a portion at a time (`Account`), each portion at most `PORTION` units.
+//! Once `visit` answers false
 //! the read does no more work and answers [`Stopped`]: never a value, never the end of the
 //! data. `visit(0)` asks whether the reader has stopped without counting anything, and a
 //! visitor that answered false keeps answering false: a reader's poller does both
@@ -24,16 +24,16 @@
 //! sorted alone, then merged a chunk at a time) and its copies and indexing. A read that
 //! interleaves several kinds of work counts them all on one account: a class build's scans,
 //! unions and finish, an expanded read's scans, copies and probes, a sorted read's two stacks
-//! (fix check r2 G1 and its siblings).
+//! (its siblings).
 //!
-//! Held for the owner in REAS-3a (fix check r1 F2): allocating or releasing memory in bulk is
+//! Held for the owner in REAS-3a: allocating or releasing memory in bulk is
 //! one allocator call, or one pass over what is released, that is not counted. That covers a
 //! class build's maps at their final size, a union's list or map growing, a merge's heap or
-//! cursor list growing, and dropping the cursors of a scan stopped while it was being made
-//! (design attack r2 E1).
+//! cursor list growing, and dropping the cursors of a scan stopped while it was being
+//! made.
 
-/// A read its visitor stopped: an error its caller has to handle, never an answer (REAS-2
-/// fix check r1, rule 2; one type for the engine and the reasoner).
+/// A read its visitor stopped: an error its caller has to handle, never an answer (one type for the engine and the
+/// reasoner).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Stopped;
 
@@ -66,12 +66,12 @@ pub(crate) fn stopped(visit: Visitor<'_>) -> bool {
 }
 
 /// The most units one portion of a read's work counts: a search's bound, a cursor's advance
-/// with the block it decodes, a merge's heap repair (REAS-3a fix check r1 F1).
+/// with the block it decodes, a merge's heap repair.
 pub(crate) const PORTION: u64 = 256;
 
 /// Where a read counts its work, a portion at a time, each before it is done: the plain reads
 /// count nothing ([`Free`]), the counted ones on their visitor ([`Ledger`]). One body of a
-/// read serves both (REAS-3a fix check r1 F1, design attack D3).
+/// read serves both.
 pub(crate) trait Account {
     /// Whether it counts anything (resolved when compiled): where it doesn't, a read runs its
     /// plain probes and scans.
@@ -115,10 +115,10 @@ impl Account for Visitor<'_> {
 /// is twice the one before, at least the portion and at most `POLL_UNITS`, so a short read
 /// asks for little and a long one for full runs. A portion that doesn't fit what a run has
 /// left asks for a new run, and the rest is dropped: after a yes, at most `POLL_UNITS` units
-/// follow. A refusal is final: nothing is taken after it (fix check r3 H2).
+/// follow. A refusal is final: nothing is taken after it.
 ///
 /// Its users do each portion's work before they take the next portion, so no work counted
-/// before a yes is done after it (fix check r3 H1).
+/// before a yes is done after it.
 pub(crate) struct Ledger<'v> {
     visit: Visitor<'v>,
     /// Units asked for and not yet taken, and the last run asked for; `run` is `u64::MAX`

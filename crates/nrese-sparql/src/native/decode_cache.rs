@@ -4,12 +4,12 @@
 //! grows ([`ChargedMap`]) and each kept term's text ([`Grant`], [`Term::heap_bytes`]).
 //!
 //! A cache is never needed for an answer, so it gives way to what the query must hold:
-//! - It keeps a term only where, kept, it would hold no more than the room it leaves free
-//!   (sol-loop r1 S2), so what the query must hold later finds at least as much room as the
+//! - It keeps a term only where, kept, it would hold no more than the room it leaves free,
+//!   so what the query must hold later finds at least as much room as the
 //!   cache takes.
 //! - A term offered that doesn't fit so means what the query holds has outgrown the cache's
 //!   share: the cache lets go of everything it keeps and starts afresh, and that term is
-//!   decoded again as it is needed (sol-loop r2, r3 S2).
+//!   decoded again as it is needed.
 //! - Residual: a required charge made while only cached terms are read, with no term decoded
 //!   in between, still meets the cache as it was, holding at most what it left free when it
 //!   last kept a term.
@@ -88,7 +88,7 @@ impl DecodeCache {
             .is_some_and(|needed| needed <= remaining);
         if !fits {
             // What the query must hold has outgrown the cache's share: it lets everything go,
-            // so the room is the query's again (sol-loop r2/r3 S2), keeps this term uncached,
+            // so the room is the query's again, keeps this term uncached,
             // and starts afresh.
             if held > 0 {
                 let (budget, workers) = (Arc::clone(&kept.budget), kept.workers);

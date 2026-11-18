@@ -829,7 +829,7 @@ fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
     );
     // What canonical reads see: the named statement and `rep sameAs rep`, nothing expanded;
     // the inferred `alias sameAs rep` is held but not visible, so the length, which counts
-    // what the stacks hold, is one more (PR #65 r1 F1; PR #70 r1).
+    // what the stacks hold, is one more (PR #65; PR #70).
     let all = QuadPattern::all();
     assert_eq!(
         canonical.quads_for_pattern_in(model, &all).count(),
@@ -861,7 +861,7 @@ fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
 
 /// A snapshot is empty when reads see nothing, even where its stacks hold quads equality
 /// hides: a subset holding only an alias's marker reads as empty, expanded or canonical
-/// (PR #70 r1 F1: `is_empty` answered from the held length).
+/// (PR #70: `is_empty` answered from the held length).
 #[test]
 fn equality_subset_emptiness_agrees_with_reads() {
     let engine = engine();
@@ -890,7 +890,7 @@ fn equality_subset_emptiness_agrees_with_reads() {
 
 /// Whether a read under equality finds a first quad makes none of a class's copies: over a
 /// class of 301 identities, a snapshot reading within 256 KiB isn't empty and refused
-/// nothing (PR #70 r1 S1: existence reserved every copy of `rep sameAs rep` first, so the
+/// nothing (PR #70: existence reserved every copy of `rep sameAs rep` first, so the
 /// read was refused and the snapshot looked empty).
 #[test]
 fn emptiness_under_equality_makes_no_copies() {
@@ -915,7 +915,7 @@ fn emptiness_under_equality_makes_no_copies() {
         .expect("a reader's budget");
     assert!(view.exists_in(ReadModel::Materialised, &QuadPattern::all()));
     // Inferred reads show a copy only where it isn't asserted, so they look at the copies:
-    // the first shown one answers (r2 S2).
+    // the first shown one answers.
     assert!(view.exists_in(ReadModel::Inferred, &QuadPattern::all()));
     assert!(!view.is_empty());
     assert!(view.read_refused().is_none(), "nothing refused");

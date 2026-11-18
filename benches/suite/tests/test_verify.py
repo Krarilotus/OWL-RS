@@ -1,4 +1,4 @@
-"""/verify's runner (scripts/verify/verify.py; the brief, 20 Oct 2026: agents prove HTTP-level
+"""/verify's runner (scripts/verify/verify.py: agents prove HTTP-level
 behaviour by driving a real server, not by claiming it). A verification tool's worst defect is
 a false pass, so: every kind of check fails when it should and holds when it should, each failure
 with its message, and an incomplete exchange fails before its expectations are read (the self-
@@ -283,7 +283,7 @@ class SweptBuild(unittest.TestCase):
 
 
 class Provenance(unittest.TestCase):
-    """--server-rev runs only an isolated build of the commit it names (PR #47, Sol r1 F1). A
+    """--server-rev runs only an isolated build of the commit it names (PR #47). A
     bin-<sha12> from before the builds were isolated (26 Oct 2026) can hold another commit's code
     under this one's name, its REVISION and checksum valid: only the PROVENANCE build-on-host.sh
     writes after an isolated build tells them apart."""
@@ -325,8 +325,8 @@ class Provenance(unittest.TestCase):
 
 
 class AdmittedBytes(unittest.TestCase):
-    """What --server-rev runs is the build it admitted, whatever happens to bin-<sha12> after (PR
-    #47, fix check 1): a sweep can take the entry, and a builder from an older harness put another
+    """What --server-rev runs is the build it admitted, whatever happens to bin-<sha12> after (PR #47):
+    a sweep can take the entry, and a builder from an older harness put another
     commit's code there under this commit's REVISION with a valid checksum and no PROVENANCE, while
     the record is read or before the server starts (and restarts, from the same command)."""
 
@@ -384,7 +384,7 @@ class AdmittedBytes(unittest.TestCase):
 class Migration(unittest.TestCase):
     """build-on-host.sh's migration of /verify's old cache, the block as written: its lock file stays
     (the same inode), so a build of the old kind waiting on it and every later migration contend
-    on one lock, and while one holds it nothing of the old cache goes (Sol r3, finding 1)."""
+    on one lock, and while one holds it nothing of the old cache goes."""
 
     def migrate(self, old: Path) -> None:
         text = (ROOT / "scripts/verify/build-on-host.sh").read_text(encoding="utf-8")
@@ -474,7 +474,7 @@ class OwnTarget(unittest.TestCase):
 
     def test_a_build_from_before_isolated_builds_is_built_again(self):
         """A bin-<sha12> from the shared target can hold another commit's code under this one's
-        name, its REVISION and checksum valid (PR #47, Sol r1 F1): it is built again, and the
+        name, its REVISION and checksum valid (PR #47): it is built again, and the
         isolated build it leaves is reused."""
         repo = self.commit("a")
         sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=repo, env=self.env, check=True,
@@ -511,7 +511,7 @@ class Launch(unittest.TestCase):
         """The merge check's Windows part under the suite's own venv (lane-d-wjp-windows2-4fff13fc):
         the server's command was a launcher whose child held the port, and a stop ended the
         launcher alone. A stop ends the server with all it started, a child that ignores SIGTERM
-        too (Sol, windows-job-python r3: the grace ended with the launcher, not its group)."""
+        too (the grace ended with the launcher, not its group)."""
         for mode in ("behind-a-launcher", "behind-a-launcher-stubborn"):
             with self.subTest(mode=mode):
                 server = self.server(VERIFY_STAND_IN=mode)
@@ -527,7 +527,7 @@ class Launch(unittest.TestCase):
     @unittest.skipIf(os.name == "nt", "Windows finds a tree through its live parent (taskkill /T): what a gone "
                                       "parent left isn't found")
     def test_a_stop_ends_what_a_gone_launcher_left(self):
-        """Sol, windows-job-python r3: a stop passed over a server whose own process had gone, so a
+        """A stop passed over a server whose own process had gone, so a
         launcher that left its child left it serving. The stop takes the process group."""
         server = self.server(VERIFY_STAND_IN="behind-a-launcher-that-leaves")
         with self.assertRaisesRegex(LaunchError, "exited with code 0 before it was ready"):

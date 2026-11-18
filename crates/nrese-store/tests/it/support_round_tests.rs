@@ -180,7 +180,7 @@ fn a_restricted_read_of_a_complete_relation_fits_its_memory_limit() {
         "the closure adds the loops"
     );
     // Refused first, under a limit the read can't fit (probes: it needs 192 MiB): that
-    // refusal keeps no view, and the same reader's next read answers (review r1).
+    // refusal keeps no view, and the same reader's next read answers.
     assert!(
         read_within(&store, &scope, 16 << 20).is_err(),
         "refused at 16 MiB"

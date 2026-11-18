@@ -150,7 +150,7 @@ impl Vocabulary for Table {
 /// The ontology of `triples` and its clauses. The OWL vocabulary gets ids first, as a
 /// store's dictionary has them: the reader looks terms up, and a term the input
 /// doesn't name (`rdfs:Literal` for a data cardinality) would otherwise be missing, and
-/// the axiom with it (reported to `nrese-owl`'s owner: dropped without a diagnostic).
+/// the axiom with it (`nrese-owl` drops it without a diagnostic).
 pub fn read(table: &mut Table, triples: &[Triple]) -> (Ontology, Normalised) {
     for (_, iri) in nrese_owl::Vocabulary::iris() {
         table.named(&iri);

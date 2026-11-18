@@ -2090,16 +2090,16 @@ mod tests {
     }
 
     /// A class or property axiom the reader has no rule for is reported as omitted, never
-    /// dropped (review s15-el-omissions r1 F1). With `r` reflexive, an `A` is its own
+    /// dropped. With `r` reflexive, an `A` is its own
     /// `r`-successor, so `∃r.A ⊑ B` gives `A ⊑ B`; unread, `A ⊑ B` is missing and the
-    /// omission says so. So are the axioms the rules would misread (I26 Sol r1): a top or
+    /// omission says so. So are the axioms the rules would misread: a top or
     /// bottom property read as a role (`owl:topObjectProperty rdfs:domain B` gives `B ≡
     /// owl:Thing`; `A ⊑ ∃owl:bottomObjectProperty.C`, `A ⊑ ⊥`), and like an inverse wherever
     /// a property axiom names it (a chain's subject, an equivalent property's object), a
     /// datatype read as a class
     /// or a restriction on a data property (`A ⊑ ∃p.xsd:integer` with `p`'s range
     /// `xsd:string`: `A ⊑ ⊥`), and a node that states two things: a field given twice, or
-    /// two constructors, EL's or not (I26 Sol r2; PR #53 r1 F1, an existential beside a self
+    /// two constructors, EL's or not (PR #53, an existential beside a self
     /// restriction). Declarations, annotations, the ontology's header, a data property's
     /// domain and range (nothing about classes without a restriction; the top data
     /// property's domain makes its class `owl:Thing`, and is reported), and assertions about
@@ -2432,8 +2432,8 @@ mod tests {
             check(case, input, omitted, subsumptions);
         }
         // Each predicate of the mapping's class expressions and data ranges, given twice,
-        // makes its node malformed, whatever the node would otherwise be read as (I26 Sol r2
-        // S3; PR #53 r1 F1: the constructors EL doesn't read and their fields too).
+        // makes its node malformed, whatever the node would otherwise be read as (PR #53: the constructors EL doesn't read and their fields
+        // too).
         for field in [
             "intersectionOf",
             "someValuesFrom",
@@ -2524,7 +2524,7 @@ mod tests {
                 &[],
             );
         }
-        // A restriction many axioms share as their subject (PR #53 sol-loop S1): read for
+        // A restriction many axioms share as their subject (PR #53): read for
         // each, nothing to report, no subsumption between named classes. Its cost is the
         // counting probe's question, not this test's.
         let shared: String = (0..1_000)
@@ -2536,7 +2536,7 @@ mod tests {
             &[],
             &[],
         );
-        // The same triple many times is one value (PR #53 sol-loop S2): a shared restriction
+        // The same triple many times is one value (PR #53): a shared restriction
         // whose onProperty is repeated reads as the restriction; two different intersection
         // lists stay malformed for every axiom, however often the first is repeated.
         let referring: String = (0..200)

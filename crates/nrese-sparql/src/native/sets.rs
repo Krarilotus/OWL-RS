@@ -706,7 +706,7 @@ mod tests {
 
     /// A table remade from charged ones keeps their charge, and is charged only for what it
     /// allocates beyond their capacity: under an envelope of just their bytes, none is
-    /// refused (Sol's reviews of ff366fc5 and 85be2df0: charged again, they were).
+    /// refused (charged again, they were).
     #[test]
     fn a_table_remade_from_charged_ones_is_charged_once() {
         let engine = nrese_engine::Engine::new(Default::default()).unwrap();

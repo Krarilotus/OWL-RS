@@ -201,7 +201,7 @@ async fn query_endpoint_enforces_rate_limit_policy() -> Result<(), Box<dyn std::
     Ok(())
 }
 
-// Spec: master's D16-310 S1 fix check: an exhausted read bucket cannot block admin
+// Spec: an exhausted read bucket cannot block admin
 // health/summary, whose details cost one admin request; /info still costs a read.
 #[tokio::test]
 async fn readiness_diagnostics_use_only_their_own_rate_bucket()

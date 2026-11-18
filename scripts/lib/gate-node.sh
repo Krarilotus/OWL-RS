@@ -50,7 +50,7 @@ gate_node_manifest() {
 }
 
 # DIR PLATFORM VERSION SHA256: the record binding DIR's payload to the verified archive it was unpacked
-# from (review r2 F2): its manifest, and the provenance line naming the archive and the manifest's sha256.
+# from: its manifest, and the provenance line naming the archive and the manifest's sha256.
 gate_node_seal() {
   gate_node_manifest "$1" > "$1/.manifest" || return 1
   printf '%s manifest %s\n' "$(gate_node_provenance "$2" "$3" "$4")" "$(sha256sum -b < "$1/.manifest" | cut -c1-64)" \
@@ -62,9 +62,9 @@ gate_node_canon() { cygpath -u "$1" 2> /dev/null || printf '%s\n' "$1"; }
 
 # DIR VERSION PLATFORM SHA256: DIR's directory of node, npm and npx, if DIR is still the payload of the
 # verified archive of SHA256 (its provenance names that archive and its manifest; the payload as it is
-# now matches that manifest: review r1/r2 F2), and node, npm and npx, looked up as the console step
+# now matches that manifest), and node, npm and npx, looked up as the console step
 # looks them up (bare names, DIR's bin first on PATH), are DIR's own and run, node reporting VERSION:
-# else the host's would run, and on Windows the host's npm and npx run the host's node (review r1/r2 F1).
+# else the host's would run, and on Windows the host's npm and npx run the host's node.
 gate_node_is() {
   local bin=$1/bin found tool on
   [ "$3" != win-x64 ] || bin=$1

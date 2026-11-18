@@ -502,7 +502,7 @@ mod tests {
         busy.abort();
     }
 
-    /// Sol r1 F1: a client that stops reading until the producer has given up, then drains
+    /// A client that stops reading until the producer has given up, then drains
     /// what was buffered, gets a failed body, never a clean end, though the failure came
     /// while the channel was full. The producer's sender is watched (weakly) until it is
     /// gone, so no timing decides the assertion.
@@ -580,7 +580,7 @@ mod tests {
         assert_eq!(body.expect("a clean end").len(), 0);
     }
 
-    /// Sol r1 F2: the first chunk's start is decided once. In both orders exactly one side
+    /// The first chunk's start is decided once. In both orders exactly one side
     /// wins: a producer that claimed the start is never declared late, and a stream declared
     /// late never starts.
     #[test]

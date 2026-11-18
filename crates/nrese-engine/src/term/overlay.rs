@@ -1,6 +1,6 @@
-//! A transaction's private vocabulary: the lifecycle contract's overlay
-//! (`notes/2026-11-08-dictionary-lifecycle-contract.md` P2, §4.1, §4.3; package 2a's design note
-//! `notes/2026-11-08-p2-bounded-vocabulary-design.md`).
+//! A transaction's private vocabulary:
+//! an overlay over the shared dictionary
+//! (package 2a).
 //!
 //! An [`Overlay`] resolves terms through the dictionary below its `start` (the length of the
 //! snapshot it opened over: append-only, so those ids never change) and then through its own
@@ -386,14 +386,14 @@ impl OverlayView {
 
     /// The private transaction's budget, which its own terms are charged to: what a private
     /// snapshot's search is charged to where its caller brings no budget and attached no
-    /// reader's (V3 review r1 B1). The view holds it as long as it lives.
+    /// reader's. The view holds it as long as it lives.
     pub(crate) fn budget(&self) -> &Arc<Budget> {
         &self.overlay.budget
     }
 
     /// Its own entries (ids `start..end`, none of the dictionary's), in id order, each with
-    /// its key: what a private search indexes its own documents from (V3; DICT2 9 Nov
-    /// 04:02).
+    /// its key: what a private search indexes its own documents from
+    /// (V3).
     pub(crate) fn own_entries(&self) -> impl Iterator<Item = (TermId, &[u8])> + '_ {
         self.frozen.entries().map(|(payload, key)| {
             let kind = match view_key(key) {

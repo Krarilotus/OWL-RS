@@ -3,7 +3,7 @@
 
 use super::*;
 
-/// Attack items 1, 2, 3, 5, 6, 7, 8, 11: a private transaction's pending snapshot, the
+/// A private transaction's pending snapshot, the
 /// base's corpora warm (so it derives) and cold (so it walks), answers every text and IRI
 /// query in two models and three scopes as the oracle does. The store holds what it held,
 /// and the published snapshot answers as before. Red before V3: every search refused.
@@ -61,8 +61,8 @@ fn a_private_snapshot_searches_what_it_can_see() {
     );
 }
 
-/// Attack item 4: on a private snapshot, the global entry points answer as the reader path
-/// over every graph in the materialised model (DICT2 9 Nov 04:02, Q2). Red before V3:
+/// On a private snapshot, the global entry points answer as the reader path
+/// over every graph in the materialised model. Red before V3:
 /// refused.
 #[test]
 fn a_private_snapshots_global_search_is_its_reader_search() {
@@ -102,7 +102,7 @@ fn a_private_snapshots_global_search_is_its_reader_search() {
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
-/// Attack items 2 and 13: a private snapshot over a restricted view (`pending_over`, an
+/// A private snapshot over a restricted view (`pending_over`, an
 /// inferred label hidden) answers as an engine without the hidden statement and with the
 /// delta, whichever of the base and the view was searched first.
 #[test]

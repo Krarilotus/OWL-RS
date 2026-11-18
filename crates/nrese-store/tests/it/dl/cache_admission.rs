@@ -1,8 +1,8 @@
-//! The result cache under `owl2-dl` (package 3.6's design note §4, the DL bound views): a
+//! The result cache under `owl2-dl` (package 3.6, the DL bound views): a
 //! query whose answer the bounds decide evaluates the lower and the upper bound's views,
 //! which the store derives from a published snapshot alone and keeps per revision. They
-//! keep its publication (`Snapshot::with_inferred_derived_within`, package 3.0b; the
-//! master's revision of F2 of the token design check), so the result cache admits them,
+//! keep its publication (`Snapshot::with_inferred_derived_within`, package 3.0b, the
+//! revised contract for the DL bounds), so the result cache admits them,
 //! each under its own identity. Fail without 3.0b on 3.6's fix: pinning such a query
 //! fails and its repeats are computed again.
 

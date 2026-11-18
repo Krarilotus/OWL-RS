@@ -179,7 +179,7 @@ impl<'e> Transaction<'e> {
     /// returns no snapshot, keeps no charge and records no statistics. It isn't free of every
     /// effect: it may have let go of the kept snapshot (not current), and a quad-layout form
     /// built for the asserted stack before the refusal may stay installed in its source run's
-    /// slot (its arrays freed once nothing holds them; review r1 on DUR-6a). An unchanged
+    /// slot (its arrays freed once nothing holds them). An unchanged
     /// transaction asking under the same budget gets the same snapshot: the last one is kept,
     /// with its charge, until the next write, a term interned since, or the transaction's drop.
     pub fn pending_snapshot_within(
@@ -191,11 +191,11 @@ impl<'e> Transaction<'e> {
         // after this read leaves the kept snapshot as current as the read it answers.
         let dictionary_len = self.engine.shared.dictionary.len();
         // Kept only while nothing it shows changed: no write (the generation), no term interned
-        // since (its vocabulary ends at the dictionary's length then: sol-loop r1, S2), the
+        // since (its vocabulary ends at the dictionary's length then), the
         // same budget. Not current: taken out under the same guard (another reader may have
-        // made the current one meanwhile: sol-loop r3, S5) and let go, outside it, before its
+        // made the current one meanwhile) and let go, outside it, before its
         // replacement is charged. Held through the build, a stale one would count twice against
-        // the same budget (sol-loop r2, S4); a caller still holding it keeps its own share.
+        // the same budget; a caller still holding it keeps its own share.
         let stale = {
             let mut memo = self.pending.memo().lock();
             if let Some(kept) = memo.as_ref()
@@ -536,7 +536,7 @@ impl<'e> Transaction<'e> {
             let dictionary = &self.engine.shared.dictionary;
             match dictionary.lookup_quad_bounded(quad, u64::MAX) {
                 // Its terms are known: charged only where it is a new entry, not where it
-                // undoes a removal or is asserted already (sol-loop r1 S1).
+                // undoes a removal or is asserted already.
                 Some(encoded) => return self.try_insert_encoded(encoded),
                 // A term new to the dictionary: the quad is new, and needs the room, charged
                 // before its terms are interned.
@@ -776,7 +776,7 @@ impl Inner {
     ///
     /// A `local` commit is stamped by the store's clock ([`Shared::stamp`]) when its record
     /// goes to the log, its runs built and its layout converted, and the record and the
-    /// version take that one time (review r1, R1-F1). A replicated record keeps the
+    /// version take that one time. A replicated record keeps the
     /// primary's time, which the clock takes too.
     ///
     /// A local commit's `note` ([`Transaction::note_commit`]) is called at the point that

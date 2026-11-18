@@ -40,8 +40,8 @@ pub(crate) fn intern_vocabulary(tx: &Transaction<'_>) {
     }
 }
 
-/// [`intern_vocabulary`] outside a writer, for a read: system vocabulary (fixed names, the
-/// lifecycle contract's limit L2), appended to the dictionary so the ids are every later
+/// [`intern_vocabulary`] outside a writer, for a read: system vocabulary (fixed names),
+/// appended to the dictionary so the ids are every later
 /// reader's. A primary's only; a replica interns nothing.
 pub(crate) fn intern_system_vocabulary(engine: &nrese_engine::Engine) -> StoreResult<()> {
     let iris: Vec<String> = vocabulary().collect();

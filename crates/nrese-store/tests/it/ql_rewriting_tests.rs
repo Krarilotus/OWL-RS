@@ -1104,7 +1104,7 @@ fn hazard_kinds(completeness: &Completeness) -> Vec<&'static str> {
 
 /// `owl:Thing` on the left of an OWL 2 QL axiom (OWL 2 Profiles §3.2.3 allows any class
 /// there): every individual is in its right side (OWL 2 Direct Semantics §2.3.1), and the
-/// domain is never empty. P2-C1 review r1 F1: `⊤ ⊑ A` with no data must answer
+/// domain is never empty. `⊤ ⊑ A` with no data must answer
 /// `ASK { ?x a :A }` true.
 ///
 /// Rows (expected answer first, then the status):
@@ -1319,14 +1319,14 @@ fn existentials_under_a_universal_are_answered_or_reported() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// Existentials an axiom concludes where the TBox reads the axiom in part (I24b review r1,
-/// F1 and F2). Each case is entailed by the OWL 2 Direct Semantics (§2.2.3, §2.3.1). Each
+/// Existentials an axiom concludes where the TBox reads the axiom in part.
+/// Each case is entailed by the OWL 2 Direct Semantics (§2.2.3, §2.3.1). Each
 /// must be answered true, or reported as not `complete`, under owl2-rl and owl2-ql.
 /// - `(A ⊓ B) ⊑ ∃S.D` with `c : A, B`: `c` has an `S`-successor in `D`.
 /// - `(A ⊓ B) ⊑ ∀R.∃S.D` with `R(c, x)`: `x` has one.
 /// - `DisjointUnion(C, ∃R.A, ∃R.B)` with `c : C`: `c` has an `R`-successor, though neither
 ///   branch is certain.
-/// - Disjointness concludes a part's complement (fix check r1, F3): with `c : A` and `A`
+/// - Disjointness concludes a part's complement: with `c : A` and `A`
 ///   disjoint from `≤ 0 S.D`, `c` is in `≥ 1 S.D`, so it has an `S`-successor in `D`. The
 ///   disjointness can come from a disjoint union, `owl:disjointWith` or
 ///   `owl:AllDisjointClasses`. The same holds where `A` is disjoint from `∀S.¬D`.
@@ -1425,8 +1425,8 @@ fn existentials_of_axioms_the_tbox_reads_in_part_are_answered_or_reported() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// A bounded restriction forces an existential on a successor that exists (I24b fix check
-/// r2, F4; fixtures `review-i24b-r3/f4.ttl` and `f4-exact-zero.ttl`). `C ⊑ ¬(≥ 1 R.¬∃S.D)`
+/// A bounded restriction forces an existential on a successor that exists (I24b):
+/// `C ⊑ ¬(≥ 1 R.¬∃S.D)`
 /// and `C ⊑ (= 0 R.¬∃S.D)` are both `C ⊑ ∀R.∃S.D` (OWL 2 Direct Semantics §2.2.3): with
 /// `c : C` and `R(c, x)`, `x` has an `S`-successor in `D`, so both queries are entailed.
 /// Each must be answered true, or reported as not `complete`, under owl2-rl and owl2-ql.
@@ -1480,37 +1480,37 @@ fn existentials_bounded_restrictions_force_are_answered_or_reported() {
 }
 
 /// A `complete` status under a regime is claimed only where every axiom an answer's terms
-/// can meet is in that regime's profile, or covered by a hazard (I24c; master's ruling of
-/// 8 Nov 10:31). The profile's rules are complete only for its ontologies (W3C OWL 2
+/// can meet is in that regime's profile, or covered by a hazard (I24c; decided on
+/// 8 Nov). The profile's rules are complete only for its ontologies (W3C OWL 2
 /// Profiles, theorem PR1). Each `true` below is entailed under the OWL 2 Direct Semantics.
 ///
 /// Answered true, or not reported `complete`:
-/// - W-N1 (I24b r4 review): `C ⊑ ∀R.Self(S)` with `c : C`, `R(c, x)`: `S(x, x)`.
+/// - W-N1: `C ⊑ ∀R.Self(S)` with `c : C`, `R(c, x)`: `S(x, x)`.
 /// - W-N2: `C ⊑ ∀R.{a}` with `c : C`, `R(c, x)`, `a : D`: `x = a`, so `x : D`.
 /// - Under owl2-ql, `Person ⊓ Employed ⊑ Worker ⊑ Taxpayer` with `x : Person, Employed`:
 ///   `x : Taxpayer`, on a superclass of the uncovered conclusion.
 /// - `C ⊑ ∃R.Self`, `R` with domain `D`, `D ⊓ F ⊑ G`, with `x : C, F`: `x : G`. The chain
 ///   runs through two axioms in the RL profile, which RL's rules apply only to facts the
 ///   closure has.
-/// - Review r1 F1: `C ⊑ {a}` with `c : C`, `a : D`: `c = a`, so `c : D`.
+/// - `C ⊑ {a}` with `c : C`, `a : D`: `c = a`, so `c : D`.
 /// - F2: `C ⊑ ¬¬D` with `c : C`: `c : D`. Neither the TBox nor the closure removes the
 ///   double complement.
 /// - F2: `C ⊑ ¬(≥ 2 R)` with `c : C`, `R(c, x)`, `R(c, y)`, `x : D`: `x = y`, so `y : D`.
-/// - Sol r1 S1: `C ⊑ ≤ 0 R.¬D` with `R(c, x)`: `x : D`. With `≤ 0 R.¬{a}` and `a : D`:
+/// - `C ⊑ ≤ 0 R.¬D` with `R(c, x)`: `x : D`. With `≤ 0 R.¬{a}` and `a : D`:
 ///   `x = a`, so `x : D`.
-/// - Sol r3 S4: `C ⊑ ≤ 0 R.¬∃S.(∀S⁻.{a})` with `R(c, x)`, `a : D`: `x = a`, so `x : D`.
-/// - Fix check r1 F1: `C ⊑ ≤ 0 R.¬∃S.({a} ⊓ {b})` with `R(c, x)`, `a : D`: `x`'s
+/// - `C ⊑ ≤ 0 R.¬∃S.(∀S⁻.{a})` with `R(c, x)`, `a : D`: `x = a`, so `x : D`.
+/// - `C ⊑ ≤ 0 R.¬∃S.({a} ⊓ {b})` with `R(c, x)`, `a : D`: `x`'s
 ///   `S`-successor is `a` and `b`, so `b : D`.
 /// - DL44: a reflexive `p2` and a named `a0`: `p2(a0, a0)` (Direct Semantics §2.3.2,
 ///   Table 6). RL's rules make no such loop (it is outside RL, Profiles §4.2.5); QL's do.
 /// - The same with `p2` of domain `D`: `a0 : D`, a consequence of the missing loop.
 /// - D16-492 (seed 700169): `≥ 1 R.(≤ 0 R.D) ⊑ ⊥` with `R(a, a)`: `a` has an anonymous
-///   `R`-successor in `D`. Review r1 F1: `≥ 2 R ⊑ ⊥` with `R(a, b)`, `R(a, c)`, `b : C`:
+///   `R`-successor in `D`. `≥ 2 R ⊑ ⊥` with `R(a, b)`, `R(a, c)`, `b : C`:
 ///   `b = c`, so `c : C`; `¬{b} ⊑ ⊥` with `a : C`: `a = b`, so `b : C`.
-/// - D16-492 fix check r1 F1: a reflexive `R` and `A ⊑ ∀R.B` with `a : A`: `R(a, a)`, so
+/// - D16-492: a reflexive `R` and `A ⊑ ∀R.B` with `a : A`: `R(a, a)`, so
 ///   `a : B` (RL misses the loop). `D ⊑ ¬¬B` and `A ⊑ ≤ 1 R.B` with `a : A`, `R(a, b)`,
 ///   `R(a, c)`, `b : D`, `c : D`, `b : E`: `b = c`, so `c : E`.
-/// - D16-492 fix check r2 F1: `A ⊑ ∃R.C` and `A ⊑ ∀R.B` with `a : A`: `a`'s anonymous
+/// - D16-492: `A ⊑ ∃R.C` and `A ⊑ ∀R.B` with `a : A`: `a`'s anonymous
 ///   `R`-successor is a `B`, so some individual is.
 ///
 /// Answered false, or reported `unsound`: under DL44's schema, `NOT EXISTS` of the loop.
@@ -1518,12 +1518,12 @@ fn existentials_bounded_restrictions_force_are_answered_or_reported() {
 /// Guards, each with its specified answer, compared first:
 /// - `x : Person` and `x : Employed` of the third case, terms of the same axiom that no
 ///   uncovered conclusion reaches: `x`, complete (owl2-ql).
-/// - Review r1 F3: after `A ⊓ B ⊑ C` and `C ⊑ ∀R.D`, the edges of `R`, which the universal
+/// - After `A ⊓ B ⊑ C` and `C ⊑ ∀R.D`, the edges of `R`, which the universal
 ///   adds none of: `(c, z)`, complete (owl2-ql).
-/// - Fix check r1 F2: `C ⊑ ≥ 0 S.(∀T.{a})` concludes nothing: `Z` is `z`, complete (both).
-/// - R1-F4 `C ⊑ ∀R.¬{a}`, Sol r1 S2 `C ⊑ = 0 R.{a}`, Sol r2 S3 `C ⊑ ≤ 0 R.¬∃S.{a}`: `Z` is
-///   `z`. They equate nobody, but equality is fail-closed for any nominal (master, 8 Nov
-///   12:41), so their status isn't required.
+/// - `C ⊑ ≥ 0 S.(∀T.{a})` concludes nothing: `Z` is `z`, complete (both).
+/// - `C ⊑ ∀R.¬{a}`, `C ⊑ = 0 R.{a}` and `C ⊑ ≤ 0 R.¬∃S.{a}`: `Z` is
+///   `z`. They equate nobody, but equality is fail-closed for any nominal, so their
+///   status isn't required.
 /// - DL44 under owl2-ql, whose rules make the loop: the `p2` edge `(a0, a0)`, complete.
 /// - A reflexive `p2` beside an unrelated `r` edge: `(a0, a1)`, complete (both).
 #[test]
@@ -1588,7 +1588,7 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             ),
             format!("ASK {{ <{E}y> a <{E}D> }}"),
         ),
-        // Sol r1 S1: `≤ 0 R.F` puts every successor outside `F`.
+        // `≤ 0 R.F` puts every successor outside `F`.
         (
             format!(
                 "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
@@ -1607,7 +1607,7 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             ),
             format!("ASK {{ <{E}x> a <{E}D> }}"),
         ),
-        // Sol r3 S4: `≤ 0 R.¬∃S.(∀S⁻.{a})` gives `x` an `S`-successor whose every
+        // `≤ 0 R.¬∃S.(∀S⁻.{a})` gives `x` an `S`-successor whose every
         // `S`-predecessor, `x` among them, is `a`.
         (
             format!(
@@ -1620,7 +1620,7 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             ),
             format!("ASK {{ <{E}x> a <{E}D> }}"),
         ),
-        // Fix check r1 F1: `x`'s required `S`-successor is both `a` and `b`, so `a = b`
+        // `x`'s required `S`-successor is both `a` and `b`, so `a = b`
         // and `b : D`.
         (
             format!(
@@ -1657,7 +1657,7 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             ),
             format!("ASK {{ <{E}a> <{E}R> ?y . ?y a <{E}D> }}"),
         ),
-        // D16-492 review r1, F1: `≥ 2 R ⊑ ⊥` makes `R` functional, so `b = c`.
+        // `≥ 2 R ⊑ ⊥` makes `R` functional, so `b = c`.
         (
             format!(
                 "{head}[ a owl:Restriction ; owl:onProperty :R ; owl:minCardinality 2 ]
@@ -1666,7 +1666,7 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             ),
             format!("ASK {{ <{E}c> a <{E}C> }}"),
         ),
-        // D16-492 review r1, F1: `¬{b} ⊑ ⊥` is `⊤ ⊑ {b}`, so `a = b`.
+        // `¬{b} ⊑ ⊥` is `⊤ ⊑ {b}`, so `a = b`.
         (
             format!(
                 "{head}[ owl:complementOf [ a owl:Class ; owl:oneOf ( :b ) ] ]
@@ -1675,7 +1675,7 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             ),
             format!("ASK {{ <{E}b> a <{E}C> }}"),
         ),
-        // D16-492 fix check r1, F1: `R(a, a)` from reflexivity, so `a : B`.
+        // `R(a, a)` from reflexivity, so `a : B`.
         (
             format!(
                 "{head}:R a owl:ReflexiveProperty .
@@ -1684,7 +1684,7 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             ),
             format!("ASK {{ <{E}a> a <{E}B> }}"),
         ),
-        // D16-492 fix check r1, F1: `b` and `c` are `B`s, so `a`'s two `R`-successors are
+        // `b` and `c` are `B`s, so `a`'s two `R`-successors are
         // one: `b = c`, and `c : E`.
         (
             format!(
@@ -1696,7 +1696,7 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
             ),
             format!("ASK {{ <{E}c> a <{E}E> }}"),
         ),
-        // D16-492 fix check r2, F1: `a`'s anonymous `R`-successor is a `B`.
+        // `a`'s anonymous `R`-successor is a `B`.
         (
             format!(
                 "{head}:A rdfs:subClassOf
@@ -1748,14 +1748,14 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
              owl:allValuesFrom [ owl:complementOf [ a owl:Class ; owl:oneOf ( :a ) ] ] ] .
          :c a :C ; :R :b . :z a :Z ."
     );
-    // Sol r1 S2: `= 0 R.{a}` keeps successors away from `a`, equating nobody.
+    // `= 0 R.{a}` keeps successors away from `a`, equating nobody.
     let zero_a = format!(
         "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
              owl:qualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
              owl:onClass [ a owl:Class ; owl:oneOf ( :a ) ] ] .
          :c a :C . :z a :Z ."
     );
-    // Sol r2 S3: `≤ 0 R.¬∃S.{a}` is `∀R.∃S.{a}`, an edge to `a`, equating nobody.
+    // `≤ 0 R.¬∃S.{a}` is `∀R.∃S.{a}`, an edge to `a`, equating nobody.
     let edge_to_a = format!(
         "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
              owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
@@ -1763,7 +1763,7 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
                  owl:someValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] ] ] .
          :c a :C ; :R :x . :z a :Z ."
     );
-    // Fix check r1 F2: `≥ 0 S.F` holds of everything and requires no successor.
+    // `≥ 0 S.F` holds of everything and requires no successor.
     let at_least_zero = format!(
         "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :S ;
              owl:minQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
@@ -1777,9 +1777,9 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
     let ql = vec![Ruleset::Owl2Ql];
     let z_query = format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}");
     let z = vec![format!("x={E}z")];
-    // Each guard's specified rows, compared before its status (fix check r1, F3), and
-    // whether `complete` is required. The nominal guards of R1-F4, S2 and S3 keep their
-    // answers only: equality is fail-closed for any nominal (master, 12:41).
+    // Each guard's specified rows, compared before its status, and
+    // whether `complete` is required. The three nominal guards keep their
+    // answers only: equality is fail-closed for any nominal.
     let guards = [
         (
             &cases[2].0,
@@ -1863,7 +1863,7 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
 }
 
 /// What the store's reader passes to the mapping, and what the mapping drops, can't hide an
-/// answer behind a `complete` status (I24c-2; master, 09:39 and 09:41). Each case under
+/// answer behind a `complete` status (I24c-2). Each case under
 /// owl2-ql and owl2-rl, the QL rewriting on.
 ///
 /// Answered true, or not reported `complete`:
@@ -1871,13 +1871,13 @@ fn axioms_outside_the_profile_are_answered_or_reported() {
 ///   (`owl:onDatatype`, `owl:withRestrictions`, `xsd:minInclusive`) are vocabulary the
 ///   mapping reads.
 /// - `c owl:sameAs e`, `e : D`: `c : D`. The QL closure has no equality rules.
-/// - Review r1 F3 (owl2-ql): the same beside `rdf:type owl:sameAs :discarded`, which the
+/// - Under owl2-ql, the same beside `rdf:type owl:sameAs :discarded`, which the
 ///   mapping leaves out and which comes first in scan order.
 ///
-/// With their exact rows, not reported `complete` (review r1, F4: rows first). The mapping
+/// With their exact rows, not reported `complete` (rows first). The mapping
 /// drops each structure, and a dropped axiom can't support the claim either way:
 /// - a malformed schema statement, a restriction without its filler: `C` is `c`;
-/// - review r1 F2, restrictions asserted of `c` directly: an n-ary data restriction
+/// - restrictions asserted of `c` directly: an n-ary data restriction
 ///   (`owl:onProperties`), and one with no property: `Z` is `z`.
 ///
 /// With their exact rows, still `complete` (guards):
@@ -1925,10 +1925,10 @@ fn schema_the_reader_or_the_mapping_leaves_out_is_reported() {
             }
         }
     }
-    // Review r1 F3, under owl2-ql: the reader's equality may not rest on one sampled
+    // Under owl2-ql: the reader's equality may not rest on one sampled
     // statement. Here the first `owl:sameAs` in scan order is `rdf:type owl:sameAs
-    // :discarded`, which the mapping leaves out (a reserved name); `c = e` must still count.
-    // The red proof shows that this ordering holds on the parent.
+    // :discarded`, which the mapping leaves out (a reserved name);
+    // `c = e` must still count.
     let reserved_first = format!(
         "{head}<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> owl:sameAs :discarded .
          :c owl:sameAs :e . :e a :D ."
@@ -1936,7 +1936,7 @@ fn schema_the_reader_or_the_mapping_leaves_out_is_reported() {
     let query = format!("ASK {{ <{E}c> a <{E}D> }}");
     let dir = tempfile::tempdir().unwrap();
     let reserved_store = store(&reserved_first, dir.path(), Ruleset::Owl2Ql, true);
-    // Its precondition (review r2, F6): the first asserted `owl:sameAs` in the snapshot's
+    // Its precondition: the first asserted `owl:sameAs` in the snapshot's
     // scan, the one a reader sampling one statement took, is the reserved one.
     {
         use nrese_engine::{GraphSelector, QuadPattern, ReadModel};
@@ -1972,7 +1972,7 @@ fn schema_the_reader_or_the_mapping_leaves_out_is_reported() {
             "reserved sameAs first, owl2-ql, {query}: {answer}, {status}"
         ));
     }
-    // Each with its specified rows, compared before its status (review r1, F4), and whether
+    // Each with its specified rows, compared before its status, and whether
     // it must be `complete` (a guard) or must not be.
     let z = format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}");
     let rows_cases = [
@@ -1987,7 +1987,7 @@ fn schema_the_reader_or_the_mapping_leaves_out_is_reported() {
             vec![format!("x={E}c")],
             false,
         ),
-        // Review r1 F2: restrictions asserted of an individual directly, which the mapping
+        // Restrictions asserted of an individual directly, which the mapping
         // can't read: an n-ary data restriction, and one with no property.
         (
             "onProperties",
@@ -2075,7 +2075,7 @@ fn select_rows(payload: &[u8]) -> Vec<String> {
     rows
 }
 
-/// Review r1 F1 (I24c-2): an equality the reader may not read still keeps `complete` from
+/// An equality the reader may not read still keeps `complete` from
 /// being claimed under owl2-ql, but no name of it reaches the reader. `:privateA owl:sameAs
 /// :privateB` is in a graph the reader can't read; `:public a :C` in the default graph,
 /// which it can. The answer is exactly `:public`, and neither private name is in the
@@ -2137,7 +2137,7 @@ fn an_unreadable_equality_names_no_individual() {
 /// support (`inferred = "supported"`) gets the existentials of readable graphs only, one who
 /// sees every inference (`"visible"`) all of them, one who sees none no rewriting.
 /// The one who sees every inference is told `not-certified` and no QL report, since the
-/// assessment reads the schema of every graph (R13-diag).
+/// assessment reads the schema of every graph.
 #[test]
 fn rewritten_answers_follow_the_readers_graph_access() {
     use std::sync::Arc;
@@ -2926,7 +2926,7 @@ fn rows_of(store: &StoreService, query: &str, scope: nrese_store::ReadScope) -> 
 
 /// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to": under `owl2-ql` and
 /// `owl2-rl` with the QL rewriting, `complete` is the OWL 2 Direct Semantics'; Direct
-/// Semantics §2, annotations have no meaning; the ruling of 17 Nov 19:39): a read the
+/// Semantics §2, annotations have no meaning; decided on 17 Nov): a read the
 /// rewriting answers that may return the rules' copy of an annotation statement is `unsound`,
 /// in its run, its EXPLAIN and its plan: `eq-rep-s`'s under `owl2-rl`, `prp-spo1`'s under
 /// `owl2-ql`.
@@ -2975,7 +2975,7 @@ fn a_rewritten_read_that_may_return_a_copied_annotation_is_unsound() {
 }
 
 /// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to": without the rewriting
-/// the status is the closure's, `sound-only` at best; the ruling of 19:39: under the
+/// the status is the closure's, `sound-only` at best; under the
 /// RDF-Based Semantics the copies are right): a ruleset's own closure without the QL
 /// rewriting keeps its status for the same reads, `sound-only`.
 #[test]
@@ -3030,7 +3030,7 @@ fn names_copies(reasons: &[String]) -> bool {
 }
 
 /// Spec (docs/spec/reasoning-semantics.md:86, a restricted reader's status says nothing about
-/// graphs they can't read; the master's ruling of 20:49, point 3: in its graphs a predicate
+/// graphs they can't read; in its graphs a predicate
 /// without a declaration is no annotation property): with `:note`'s declaration in a graph the
 /// reader can't read, and the note and the equality in one it can, a read of `:note` the
 /// rewriting answers, whose rows hold the copy, is told as on the same data without the
@@ -3053,7 +3053,7 @@ fn a_reader_who_cant_see_the_declaration_is_told_as_without_it() {
     assert_eq!(hidden, undeclared);
 }
 
-/// Spec (docs/spec/reasoning-semantics.md:86; the master's ruling of 21:29: a reader told of
+/// Spec (docs/spec/reasoning-semantics.md:86; a reader told of
 /// a statement in a graph it can't read learns that it exists): a reader by support of the
 /// default graph, which holds an equality, reading an annotation property (built in, or
 /// declared in a graph it reads) whose only statement is in a graph it can't read, is told

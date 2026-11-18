@@ -348,8 +348,8 @@ class Adapter:
     def script_builds(self, ctx: Context) -> list[tuple[str, str, str]]:
         """(image, build context under benches/, the Dockerfile ARG naming its source commit) for
         images a script builds from a source chosen apart from their context (benches/sparql/images.sh):
-        their build label names that source commit, and a receipt without it is unknown (review
-        image-source-commit r1 F2)."""
+        their build label names that source commit, and a receipt without it is
+        unknown."""
         return []
 
     def supports(self, ctx: Context, inputs: list[str], regime: str) -> str | None:
@@ -432,7 +432,7 @@ class Nrese(Adapter):
 
     def target_dir(self, ctx: Context) -> Path:
         """The host build's output directory; a relative CARGO_TARGET_DIR is the repository's (the
-        build runs in an export, removed after it: P1e sol-loop r1 S1)."""
+        build runs in an export, removed after it)."""
         target = Path(ctx.setting("CARGO_TARGET_DIR", str(ctx.root / "target")))
         return target if target.is_absolute() else ctx.root / target
 

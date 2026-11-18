@@ -16,7 +16,7 @@ fn runner(op: &str, fault: &str) -> Command {
 }
 
 /// A reader of the parallel `with_views` that returns a wrong value of the right length fails
-/// the run (package review r1, finding 2): the first IRI one reader views is replaced by
+/// the run: the first IRI one reader views is replaced by
 /// another IRI of the same length.
 #[test]
 fn a_wrong_view_of_the_same_length_on_one_reader_fails_the_run() {
@@ -36,7 +36,7 @@ fn a_wrong_view_of_the_same_length_on_one_reader_fails_the_run() {
 }
 
 /// A reader that is late with its setup holds the window shut, and its setup isn't counted
-/// (fix check r2, R2-F1; r3: by the test's own schedule, no timing). The first of 16 readers
+/// (by the test's own schedule, no timing). The first of 16 readers
 /// is held before its warm-up until this test releases it on stdin. While it is held, the
 /// controller must stop short of the window: it says it waits for its readers, and must not
 /// say the window opens. Released, the reader must find the window not yet open, and noop's

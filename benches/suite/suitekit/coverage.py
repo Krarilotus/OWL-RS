@@ -1,5 +1,5 @@
-"""`suite.py coverage`: which catalogue cells have a current receipt (Harness notes
-2026-11-08-coverage-refresh/p2-design-r5.md, addenda r6 and r7).
+"""`suite.py coverage`: which catalogue cells have a current receipt,
+and why the others aren't current.
 
     suite.py coverage [--systems S,..] [--workloads W,..] [--engine REV] [--json]
 
@@ -168,7 +168,7 @@ def started_at(receipt) -> datetime.datetime | None:
 def evidence(pairs: list[tuple[str, dict]]):
     """(record id, receipt, verdict) of a cell's record pairs: its one newest receipt, verdict None;
     else no receipt and the verdict (class, reason). Evidence that can't be ordered stands for
-    nothing, and no older pass stands beside it (r3, F7)."""
+    nothing, and no older pass stands beside it."""
     if not pairs:
         return None, None, ("no-result", "never run")
     held = [(rid, pair["receipt"]) for rid, pair in pairs if "receipt" in pair]
@@ -305,7 +305,7 @@ def check_protocol(protocol: dict, system, bad: list):
 
 
 def check_images(owners, system, ctx, got, bad, stale) -> dict:
-    """Each image the cell's adapter declares for its runtime, by its provenance (r3): built here
+    """Each image the cell's adapter declares for its runtime, by its provenance: built here
     from its context, built by images.sh at its Dockerfile's declared commit, or pulled at its pin."""
     built = dict(owned(f"{system.key}.builds", system.builds))
     scripted = {tag: (context, arg) for tag, context, arg in owned(f"{system.key}.script_builds",

@@ -1,4 +1,4 @@
-//! `Snapshot::count_in_visiting` (REAS-2 review r1 F2): a count that tells its caller about
+//! `Snapshot::count_in_visiting`: a count that tells its caller about
 //! the work as it goes, so a reasoner's stop sees a long count; and `count_in`, which is its
 //! case that never stops, answering as before.
 
@@ -187,11 +187,11 @@ fn layered(facts: usize) -> Snapshot {
     engine.snapshot()
 }
 
-/// REAS-3 (design note, attack list C8, C4). Spec: a counted read answers exactly what its
+/// REAS-3. Spec: a counted read answers exactly what its
 /// uncounted twin answers, in the same order, on a compact snapshot (expanded reads: class
 /// build, copies, visibility) and on one of several runs with tombstones and a named graph;
 /// and once its visitor has stopped it answers `Stopped`, never a value or the end of the
-/// data (REAS-2's rule 2).
+/// data (REAS-2).
 #[test]
 fn counted_reads_answer_as_the_uncounted_ones() {
     let go = |_: u64| true;
@@ -258,14 +258,14 @@ fn counted_reads_answer_as_the_uncounted_ones() {
     }
 }
 
-/// REAS-3a, sol-loop r2 S6. Spec (`nrese_engine::visit`: a union is counted by the members
+/// Spec (`nrese_engine::visit`: a union is counted by the members
 /// it moves): a counted read's cold equality class build counts in proportion to its input.
 /// An asserted chain of `n` identities (`s_i sameAs s_i+1`, one class) and materialisation's
 /// inferred star over it (`s_i sameAs s_0`, each pair already in that class, which a union
 /// leaves as it is): doubling `n` at most triples the units a count's visitor is told of. A
 /// linear count doubles, and the class sort's `n log n` a little more; charging a union by the
 /// smaller side's size whatever it does, each star statement counted the whole class, about
-/// `n` squared: four times as many (fix check r1: the ratio, not a multiple of `n` that each
+/// `n` squared: four times as many (the ratio, not a multiple of `n` that each
 /// charging change would retune).
 #[test]
 fn a_counted_class_build_counts_in_proportion_to_its_statements() {

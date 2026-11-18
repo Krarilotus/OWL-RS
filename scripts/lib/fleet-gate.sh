@@ -22,7 +22,7 @@
 # config ranks): either tier's job when COMMIT is for refactor/engine-v2, i.e. NRESE_PUSH_REF, the
 # ref it goes to, is refs/heads/refactor/engine-v2: the pre-push hook's, or by hand the caller's
 # word (a merge check run before its push states it for both tiers). A package's push or Windows
-# check isn't one, a merge among its commits or not (Sol, merge-gate-class r1; PR #69 r1 R1), nor a
+# check isn't one, a merge among its commits or not (PR #69), nor a
 # check by hand that names no ref.
 #
 # A failure on a host whose failures don't count alone (NRESE_GATE_UNCONFIRMED_HOSTS, default
@@ -160,7 +160,7 @@ gate() {
   [ -n "$out" ] || no_verdict "its result is missing (it ended $fleet_state)"
   log="$(dirname "$out")/gate.log"
   # A verdict only from a whole, consistent record of this job's last attempt where the fleet says
-  # it ran (Sol, review-remote-gates-r1-20261020): a pass needs the job done, check.sh's exit 0 and
+  # it ran: a pass needs the job done, check.sh's exit 0 and
   # its summary with every step at 0; a failure needs the job failed, exit 1 and a step that
   # failed. Anything else, or a record of another job, host or attempt, or (windows) of a run under
   # another Python runtime than the declared one, is no verdict.
