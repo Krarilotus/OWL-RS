@@ -574,8 +574,11 @@ fn update_body<B: Base + ?Sized>(
     // that derivation (its premises are below it: if one goes later in the commit, its
     // loss brings the candidate back), without a proof search. Bodiless instances aren't
     // among them: their schema facts may come from the candidate (scm-eqc1 and scm-eqc2
-    // derive each other's).
-    let non_recursive = {
+    // derive each other's). Its size follows the schema, so it is built when a candidate
+    // first asks for it: a commit that deletes nothing never does. It reads the state
+    // before the commit, which nothing in the update changes.
+    let mut non_recursive: Option<Vec<bool>> = None;
+    let build_non_recursive = || {
         let before = Overlay {
             base,
             hidden: &inserted_set,
@@ -588,7 +591,7 @@ fn update_body<B: Base + ?Sized>(
         super::recursion::non_recursive(ground, equality, schema.rdf_type(), same_as, &|term| {
             super::recursion::same_as_partners(&before, same_as, term, &stage)
         })
-        .map_err(stopped)?
+        .map_err(stopped)
     };
 
     lap(0, &mut result);
@@ -617,25 +620,16 @@ fn update_body<B: Base + ?Sized>(
         overdeleted.extend(region_facts.iter().copied());
         let mut seed = deleted.to_vec();
         seed.extend(region_facts.iter().copied());
-        let mut extra = Store::new(seed);
-        let (fact_schema_rules, old_lists) = {
-            let old = Overlay {
-                base,
-                hidden: &inserted_set,
-                extra: &extra,
-            };
-            let lists: Vec<Rule> = rules
-                .list_rules(&old)
-                .into_iter()
-                .filter(|r| r.head != Head::Inconsistent)
-                .collect();
-            let schema_rules: Vec<Rule> = rules
-                .schema_rules()
-                .into_iter()
-                .filter(|r| r.head != Head::Inconsistent)
-                .collect();
-            (schema_rules, lists)
-        };
+        let mut extra = Store::new(seed.clone());
+        let fact_schema_rules: Vec<Rule> = rules
+            .schema_rules()
+            .into_iter()
+            .filter(|r| r.head != Head::Inconsistent)
+            .collect();
+        // The list rules of the pass's old state, read only when the delta holds a list
+        // fact: built then, over the state the pass started from (`seed`), as they follow
+        // the store's lists.
+        let mut old_lists: Option<Vec<Rule>> = None;
         let mut vanished_done: HashSet<RuleKey> = HashSet::new();
         loop {
             check_stop()?;
@@ -678,7 +672,20 @@ fn update_body<B: Base + ?Sized>(
                 };
                 let current: HashSet<RuleKey> =
                     rules.list_rules(&now).iter().map(rule_key).collect();
-                for rule in &old_lists {
+                let old_lists = old_lists.get_or_insert_with(|| {
+                    let at_start = Store::new(seed.clone());
+                    let old = Overlay {
+                        base,
+                        hidden: &inserted_set,
+                        extra: &at_start,
+                    };
+                    rules
+                        .list_rules(&old)
+                        .into_iter()
+                        .filter(|r| r.head != Head::Inconsistent)
+                        .collect()
+                });
+                for rule in old_lists.iter() {
                     let key = rule_key(rule);
                     if current.contains(&key) || !vanished_done.insert(key) {
                         continue;
@@ -870,6 +877,10 @@ fn update_body<B: Base + ?Sized>(
                 }
             }
             if backward {
+                if !candidates.is_empty() && non_recursive.is_none() {
+                    non_recursive = Some(build_non_recursive()?);
+                }
+                let non_recursive = non_recursive.as_deref().unwrap_or_default();
                 let mut gone: HashSet<Triple> = inserted_set.clone();
                 gone.extend(overdeleted.iter().copied());
                 let left = Overlay {
@@ -885,7 +896,7 @@ fn update_body<B: Base + ?Sized>(
                     .into_par_iter()
                     .map(|f| {
                         old_program
-                            .derivable_by(&left, f, &non_recursive, false, stop)
+                            .derivable_by(&left, f, non_recursive, false, stop)
                             .map(|derivable| (!derivable).then_some(f))
                     })
                     .collect::<Result<_, Stopped>>()
