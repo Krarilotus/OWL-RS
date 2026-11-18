@@ -12,12 +12,12 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::diagnostics::{Diagnostic, reserved_name};
+use crate::diagnostics::Diagnostic;
 use crate::model::{
     Axiom, Characteristic, ClassExpr, DataRange, DataTerms, Disjoint, EntityKind, ExprId, Interner,
     Literal, ObjProp, RangeId, Term, canonical,
 };
-use crate::vocab::Vocabulary;
+use crate::vocab::{OWL, RDF, RDFS, Vocabulary, XSD};
 
 /// What a term of the source is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -46,11 +46,10 @@ pub trait Terms {
         None
     }
 
-    /// The text of an IRI, if the source gives it (datatypes and facets beyond those the
-    /// vocabulary knows).
-    fn iri_text(&self, _term: Term) -> Option<String> {
-        None
-    }
+    /// The text of an IRI, `None` for any other term: datatypes and facets beyond those the
+    /// vocabulary knows, and the reserved vocabulary's names, which the reader tells by it.
+    /// Required, with no default: a source that gave none would pass every reserved name.
+    fn iri_text(&self, term: Term) -> Option<String>;
 }
 
 /// A statement of the source: a triple and its graph.
@@ -673,7 +672,9 @@ impl<'a> Reader<'a> {
             if !is(p, v.rdf_type) || self.kind(s) != TermKind::Iri {
                 continue;
             }
-            if is(o, v.owl_annotation_property) && self.reserved_annotation(s) {
+            // Either spelling of an annotation property's declaration (Table 6).
+            let annotation = kinds.contains(&(Some(o), EntityKind::AnnotationProperty));
+            if annotation && self.reserved_annotation(s) {
                 continue;
             }
             self.annotation_properties.read(statement.triple, true);
@@ -1682,11 +1683,13 @@ impl<'a> Reader<'a> {
         self.annotation_properties.contains(term)
     }
 
-    /// Whether `term` is a name of the reserved vocabulary (§2.4) other than the annotation
-    /// properties OWL 2 builds in: no declaration makes it one (`rdf:type`, `owl:sameAs`).
+    /// Whether `term` is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`) and not
+    /// one of the nine annotation properties OWL 2 builds in: no declaration makes it one
+    /// (§5.5), `rdf:type`, `owl:sameAs`, `owl:Thing` and the top and bottom properties alike.
     fn reserved_annotation(&self, term: Term) -> bool {
+        let reserved = |i: &str| [OWL, RDF, RDFS, XSD].iter().any(|ns| i.starts_with(ns));
         let iri = self.terms.iri_text(term);
-        iri.is_some_and(|i| reserved_name(&i) && !BUILTIN_ANNOTATIONS.contains(&i.as_str()))
+        iri.is_some_and(|i| reserved(&i) && !BUILTIN_ANNOTATIONS.contains(&i.as_str()))
     }
 
     /// `rdfs:label` and the other annotation properties OWL 2 builds in.

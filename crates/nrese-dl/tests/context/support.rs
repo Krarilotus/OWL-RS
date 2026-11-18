@@ -102,6 +102,11 @@ impl Terms for Table {
     fn datatype(&self, _: Term) -> Option<String> {
         None
     }
+
+    fn iri_text(&self, term: Term) -> Option<String> {
+        let text = self.text(term).strip_prefix('<')?;
+        Some(text.strip_suffix('>')?.to_owned())
+    }
 }
 
 impl Make for Table {
