@@ -1323,10 +1323,12 @@ impl<'a> Reader<'a> {
                 self.nary(s, o, statement.triple);
             }
         }
-        // Then: statements on IRIs; axioms on blank nodes (a complex left-hand side);
-        // the rest on blank nodes (anonymous individuals), once every structure has
+        // Then: statements on IRIs; axioms on blank nodes (a complex left-hand side); the
+        // blank nodes' other statements that read a structure (an anonymous individual's
+        // typing, a disjoint union); the rest on blank nodes, once every structure has
         // taken its statements.
         let v = self.v;
+        let reads_structure = [v.rdf_type, v.owl_disjoint_union_of];
         let axiom_predicates = [
             v.rdfs_sub_class_of,
             v.owl_equivalent_class,
@@ -1339,15 +1341,17 @@ impl<'a> Reader<'a> {
             v.rdfs_range,
             v.owl_has_key,
         ];
-        for pass in 0..3 {
+        for pass in 0..4 {
             for statement in statements {
                 let triple = statement.triple;
                 let blank = self.kind(triple[0]) == TermKind::Blank;
                 let axiom = axiom_predicates.contains(&Some(triple[1]));
+                let reads = reads_structure.contains(&Some(triple[1]));
                 let now = match pass {
                     0 => !blank,
                     1 => blank && axiom,
-                    _ => blank && !axiom,
+                    2 => blank && reads,
+                    _ => blank && !axiom && !reads,
                 };
                 if !now || self.structural.contains(&triple) {
                     continue;
