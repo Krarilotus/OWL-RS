@@ -5,8 +5,8 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use nrese_engine::{
-    CountedSnapshot, EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, TermId,
-    Transaction,
+    CountedSnapshot, EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, Snapshot,
+    TermId, TermKind, Transaction,
 };
 use nrese_exec::Budget;
 
@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use super::{Program, encode, pattern, storable, triple};
 use crate::delta::{self, Base, MemoryBase, VisitsBase};
 use crate::eval::{GroundProgram, OperationStop, Poller, Probe, Stopped, Visit};
-use crate::ir::{Head, Term, Triple, Violations};
+use crate::ir::{Triple, Violations};
 use crate::lists::ListDiagnostic;
 
 /// A transaction's state as the delta executor reads it: the committed indexes (asserted
@@ -220,16 +220,16 @@ pub struct Maintenance {
     pub work: delta::policy::Counts,
 }
 
-/// Whether a rule of `ground` concludes a fact whose predicate is no IRI, which no store
-/// holds ([`storable`]).
-fn concludes_unstorable(ground: &GroundProgram) -> bool {
-    // A predicate `p` is stored as a predicate only as an IRI, whatever the other terms.
-    ground.rules.iter().any(|rule| match &rule.head {
-        Head::Facts(atoms) => atoms
-            .iter()
-            .any(|atom| matches!(atom.0[1], Term::Const(p) if !storable([p, p, p]))),
-        Head::Inconsistent => false,
-    })
+/// Whether `base` holds an inverse property expression (`_:x owl:inverseOf :p`), OWL 2's
+/// one property that is no IRI: the rules conclude facts with it as their predicate, which
+/// no store holds ([`storable`]), whichever rule concludes them. `None`: no `owl:inverseOf`.
+fn has_inverse_expression(base: &Snapshot) -> Option<bool> {
+    let iri = nrese_rdf::NamedNodeRef::new_unchecked("http://www.w3.org/2002/07/owl#inverseOf");
+    let mut pattern = QuadPattern::all();
+    pattern.predicate = Some(base.lookup(iri.into())?);
+    let blank = |t: TermId| t.kind() == TermKind::BlankNode;
+    let mut quads = base.quads_for_pattern_in(ReadModel::Materialised, &pattern);
+    Some(quads.any(|q| blank(q.subject) || blank(q.object)))
 }
 
 /// Keeps the transaction's inferred stack equal to the closure of its asserted state,
@@ -332,6 +332,7 @@ pub fn maintain_with(
             &mut unstorable,
         )?);
     }
+    let mut unkept = false;
     let update = {
         let base = EngineBase::new(tx, &program.axioms);
         // The change's own probes of the base (a deleted fact still asserted elsewhere, a
@@ -384,23 +385,18 @@ pub fn maintain_with(
         }
         deleted.sort_unstable();
         deleted.dedup();
-        // A rule of the base's program that concludes a fact with a blank node as its
-        // predicate (an inverse property expression's): no store holds that fact, so the
-        // stored closure lacks it and a delta can't read it. Such a change is rebuilt: the
-        // closure after it is the one a rebuild gives.
-        let unkept = !(first_load || inserted.is_empty() && deleted.is_empty())
-            && match ground {
-                Some(ground) => concludes_unstorable(ground),
-                None => concludes_unstorable(&program.ground_program(tx.base())),
-            };
+        // Facts with an inverse expression as their predicate: the stored closure lacks the
+        // base's, so a delta can't read them. Such a change runs its delta, whose consistency
+        // check stands, and is then rebuilt: the closure after it is the one a rebuild gives.
+        unkept = !(first_load || inserted.is_empty() && deleted.is_empty())
+            && has_inverse_expression(tx.base()) == Some(true);
         // A rebuild reads the asserted facts and writes the closure, both about the size
         // of the stored state; the policy offers it to a change that inserts nothing
         // ([`delta::policy::Plan::Rebuild`]).
         let policy = delta::policy::Policy {
-            force: unkept
-                .then_some(delta::policy::Plan::Rebuild)
-                .or(program.plan),
-            rebuild: (inserted.is_empty() || unkept)
+            force: program.plan,
+            rebuild: inserted
+                .is_empty()
                 .then(|| tx.base().len_in(ReadModel::Materialised)),
             split_rebuilds: program.stores_representatives(),
         };
@@ -447,6 +443,9 @@ pub fn maintain_with(
         }
     };
     let mut update = update;
+    if unkept {
+        update.policy.plan = delta::policy::Plan::Rebuild;
+    }
     // A list that already stopped at its budget makes the change inconsistent: the
     // datatype checks would add nothing to that.
     if update.violations.complete() {
