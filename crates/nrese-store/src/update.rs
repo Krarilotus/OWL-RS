@@ -1,3 +1,12 @@
+use std::mem::{size_of, size_of_val};
+use std::sync::Arc;
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct StagedUpdate {
+    pub(crate) namespaces: Box<[(String, String)]>,
+    pub(crate) search_scope: crate::SearchScope,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SparqlUpdateRequest {
     pub update: String,
@@ -6,6 +15,7 @@ pub struct SparqlUpdateRequest {
     pub using_graphs: Vec<String>,
     /// Protocol `using-named-graph-uri` values.
     pub using_named_graphs: Vec<String>,
+    pub(crate) staged: Option<Arc<StagedUpdate>>,
 }
 
 impl SparqlUpdateRequest {
@@ -14,6 +24,7 @@ impl SparqlUpdateRequest {
             update: update.into(),
             using_graphs: Vec::new(),
             using_named_graphs: Vec::new(),
+            staged: None,
         }
     }
 
@@ -23,7 +34,17 @@ impl SparqlUpdateRequest {
             graphs.capacity() * std::mem::size_of::<String>()
                 + graphs.iter().map(String::capacity).sum::<usize>()
         };
-        self.update.capacity() + graphs(&self.using_graphs) + graphs(&self.using_named_graphs)
+        let staged = self.staged.as_ref().map_or(0, |staged| {
+            let entries = staged.namespaces.as_ref();
+            let header = size_of::<StagedUpdate>() + 2 * size_of::<usize>();
+            let mut bytes = header + size_of_val(entries);
+            for (prefix, iri) in entries {
+                bytes += prefix.capacity() + iri.capacity();
+            }
+            bytes
+        });
+        let graphs = graphs(&self.using_graphs) + graphs(&self.using_named_graphs);
+        self.update.capacity() + graphs + staged
     }
 }
 

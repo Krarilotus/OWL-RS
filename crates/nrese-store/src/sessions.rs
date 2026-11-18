@@ -21,7 +21,7 @@
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::{Arc, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant};
 
 use nrese_engine::Snapshot;
@@ -64,6 +64,7 @@ pub struct Sessions {
     idle: Duration,
     /// What the sessions keep is charged here.
     kept: Arc<Budget>,
+    pub(crate) update_settings: Option<(Arc<crate::Namespaces>, Arc<RwLock<crate::SearchScope>>)>,
 }
 
 impl std::fmt::Debug for Sessions {
@@ -92,6 +93,7 @@ impl Sessions {
             open: Mutex::default(),
             idle,
             kept,
+            update_settings: None,
         }
     }
 
@@ -166,8 +168,23 @@ impl Sessions {
         &self,
         id: &str,
         owner: Option<&str>,
-        ops: Vec<StatementOp>,
+        mut ops: Vec<StatementOp>,
     ) -> Result<bool, BudgetExceeded> {
+        if let Some((namespaces, search_scope)) = &self.update_settings {
+            let mut captured = None;
+            for op in &mut ops {
+                if let StatementOp::Update(update) = op {
+                    let staged = captured.get_or_insert_with(|| {
+                        let scope = search_scope.read().unwrap_or_else(PoisonError::into_inner);
+                        Arc::new(crate::update::StagedUpdate {
+                            namespaces: namespaces.all().into_iter().collect(),
+                            search_scope: *scope,
+                        })
+                    });
+                    update.staged = Some(Arc::clone(staged));
+                }
+            }
+        }
         let mut open = self.lock();
         let Some(session) = self.live(&mut open, id, owner) else {
             return Ok(false);

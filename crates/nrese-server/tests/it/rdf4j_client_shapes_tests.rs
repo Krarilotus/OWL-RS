@@ -17,6 +17,9 @@ use tower::util::ServiceExt;
 
 use crate::support::{body_text, test_app, test_app_with_store_config};
 
+#[path = "staged_prefix_binding_tests.rs"]
+mod staged_prefix_binding_tests;
+
 const REPO: &str = "/repositories/nrese";
 const STATEMENTS: &str = "/repositories/nrese/statements";
 const QUERY: &str = "application/sparql-query";
