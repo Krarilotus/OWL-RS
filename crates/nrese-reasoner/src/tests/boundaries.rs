@@ -105,10 +105,10 @@ fn job_construction_ends_at_its_stop() {
 
 /// Spec: a dependency key's `sameAs` partners that a stopped read cut short
 /// are an error, and the enumeration of the grounded rules' keys ends with it (its keys grow
-/// with the schema: one class pair per subclass edge). A deletion under OWL 2 RL (which
-/// reads `sameAs`) over `n` subclass edges, the stop firing at the first poll after a
-/// partner read started: at most one more starts. Read as "no partners", the stopped read
-/// let the loop read every later key's.
+/// with the schema: one class pair per subclass edge). A deletion with a candidate under
+/// OWL 2 RL (which reads `sameAs`) over `n` subclass edges, the stop firing at the first
+/// poll after a partner read started: at most one more starts. Read as "no partners", the
+/// stopped read let the loop read every later key's.
 #[test]
 fn a_deletion_s_dependency_keys_end_at_its_stop() {
     let n = n();
@@ -127,7 +127,17 @@ fn a_deletion_s_dependency_keys_end_at_its_stop() {
     let deleted = members[..1].to_vec();
     let mut asserted: Vec<Triple> = axioms.iter().chain(&members[1..]).copied().collect();
     asserted.sort_unstable();
-    let base = MemoryBase::new(&asserted, &[]);
+    // The closure before the deletion is stored, so `x₀`'s type `d₀` is a candidate: its
+    // check reads the keys (a deletion without a candidate reads none of them).
+    let mut before: Vec<Triple> = axioms.iter().chain(&members).copied().collect();
+    before.sort_unstable();
+    let mut stack: Vec<Triple> = batch::materialise(&before, &rules, None, &schema)
+        .derived
+        .into_iter()
+        .filter(|t| asserted.binary_search(t).is_err())
+        .collect();
+    stack.sort_unstable();
+    let base = MemoryBase::new(&asserted, &stack);
     let (after, interrupted) = one_thread().install(|| {
         let first = FirstWork::new(Site::PartnerRead);
         let stop = || first.ask();
