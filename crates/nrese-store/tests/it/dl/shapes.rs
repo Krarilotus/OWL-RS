@@ -350,7 +350,6 @@ fn from_an_inconsistent_premise_a_conclusion_stating_shacl_content_follows() {
 /// statement is read as any other: `:s sh:class :q` is a property assertion the premise doesn't
 /// entail, and the conclusion isn't entailed.
 #[test]
-#[ignore = "waits on the SHACL reading rule applied to premise and conclusion together"]
 fn a_conclusion_naming_a_property_of_the_premises_content_reads_its_content_as_any_other() {
     let (path, class) = (
         "<http://www.w3.org/ns/shacl#path>",
@@ -367,6 +366,57 @@ fn a_conclusion_naming_a_property_of_the_premises_content_reads_its_content_as_a
         answer,
         Entailed::No,
         "`:s sh:class :q` is read as an assertion"
+    );
+}
+
+/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
+/// conclusion together, the premise keeping its own reading; SHACL content has no OWL meaning
+/// only where no statement that is neither SHACL content nor an annotation names a SHACL property
+/// of the content; OWL 2 Direct Semantics: a premise entails a conclusion only if each of its
+/// axioms holds in every model of the premise): each premise names `sh:path` or another
+/// property the union holds as content, through `rdf:type`, so premise and conclusion together
+/// read every SHACL statement as any other, and `:s sh:path :q` is a property assertion the
+/// premise doesn't entail. The premise declares `sh:message` an annotation property and gives a
+/// message (an annotation, which no axiom keeps), or it types `sh:path` an RDF property (which
+/// the Direct Semantics reads as nothing).
+#[test]
+fn a_premise_typing_a_shacl_property_reads_the_conclusions_content_as_any_other() {
+    let sh = |name: &str| format!("<http://www.w3.org/ns/shacl#{name}>");
+    let (path, message) = (sh("path"), sh("message"));
+    let rows = [
+        (
+            "an annotation declaration",
+            format!("{message} a owl:AnnotationProperty . :shape {message} \"hint\" ."),
+        ),
+        (
+            "an RDF typing",
+            format!("{path} a <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> ."),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, premise) in rows {
+        let answer = entailed(&premise, &format!(":s {path} :q ."));
+        eprintln!("{what}: {answer:?}");
+        if answer != Entailed::No {
+            wrong.push(format!("{what}: {answer:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
+/// conclusion together; a statement whose predicate is an annotation property names nothing;
+/// OWL 2 Direct Semantics: declarations and SHACL content hold no axiom to entail): the premise's
+/// `:x :note sh:path` names `sh:path`, but the conclusion declares `:note` an annotation
+/// property, so premise and conclusion together hold `:s sh:path :q` as SHACL content and the
+/// conclusion, with nothing else, is entailed. The premise keeps its own reading.
+#[test]
+fn a_conclusion_declaring_an_annotation_property_holds_its_shacl_statements_as_content() {
+    let path = "<http://www.w3.org/ns/shacl#path>";
+    let conclusion = format!(":note a owl:AnnotationProperty . :s {path} :q .");
+    assert_eq!(
+        entailed(&format!(":x :note {path} ."), &conclusion),
+        Entailed::Yes
     );
 }
 
