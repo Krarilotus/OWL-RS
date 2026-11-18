@@ -184,14 +184,16 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// PR1 doesn't hold, which needs no punning and no annotation-property axioms
 /// (`query::reads_differently` says what that costs); or unless a cardinality is spelled
 /// otherwise than the rules name it (`Ontology::noncanonical_cardinality`), so they
-/// wouldn't read it. Its callers also leave the route where the closure leaves out a list
-/// axiom (`StoreService::lists_left_out`): the rules lack that axiom's conclusions, and PR1's
-/// premise doesn't hold.
+/// wouldn't read it, or a statement the rules don't read was read as axioms they would
+/// (`Ontology::rules_unread`). Its callers also leave the route where the closure leaves out
+/// a list axiom (`StoreService::lists_left_out`): the rules lack that axiom's conclusions,
+/// and PR1's premise doesn't hold.
 fn routed_to_rules(ontology: &Ontology) -> bool {
     nrese_owl::profile::of_ontology(ontology).rl
         && nrese_owl::ql::reads_data_values(ontology).is_none()
         && !nrese_owl::profile::rules_read_differently(ontology)
         && ontology.noncanonical_cardinality.is_none()
+        && ontology.rules_unread.is_none()
 }
 
 /// What the RL route was decided on: the TBox signature as the reader typed it, the

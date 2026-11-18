@@ -134,6 +134,8 @@ impl<'a> FunctionalReader<'a> {
             // Functional syntax writes a cardinality as a number: no spelling to mark.
             noncanonical_cardinality: None,
             empty_list: None,
+            // The route reads triples only, through the RDF reader.
+            rules_unread: None,
             qualified_data_max: model.qualified_data_max,
         };
         crate::mapping::complete(&mut ontology, terms);
