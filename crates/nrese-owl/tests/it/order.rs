@@ -2,7 +2,7 @@
 //! the order it meets them in.
 
 use nrese_owl::fuzz::Rng;
-use nrese_owl::{Diagnostic, Statement, read};
+use nrese_owl::{Diagnostic, Statement, Term, TermKind, Terms, read};
 use nrese_rdf::BlankNode;
 
 use super::{EX, Table};
@@ -76,9 +76,11 @@ fn shown(statements: &[Statement], table: &Table) -> String {
 /// A random small graph: one `owl:equivalentClass` between two reserved names, the second
 /// named again by a range, and one structure of each other kind left out (OWL vocabulary on a
 /// name, a restriction without its property, a list without its rest, `owl:onProperties`);
-/// then up to twelve statements over names, reserved names and blank nodes, with OWL's
-/// structure predicates.
-fn graph(rng: &mut Rng, table: &mut Table) -> Vec<Statement> {
+/// in about half, a structure property given twice, one value a reserved name met nowhere else
+/// and one a plain name (`owl:complementOf`, or a restriction's `owl:someValuesFrom`; `true`
+/// with them); then up to twelve statements over names, reserved names and blank nodes, with
+/// OWL's structure predicates.
+fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool) {
     let mut iri = |ns: &str, local: &str| table.iri_id(&format!("{ns}{local}"));
     let [a, b, c, d, h, p, q] = ["A", "B", "C", "D", "H", "p", "q"].map(|l| iri(EX, l));
     let reserved = [
@@ -97,7 +99,16 @@ fn graph(rng: &mut Rng, table: &mut Table) -> Vec<Statement> {
         iri(RDFS, "domain"),
         iri(RDFS, "range"),
     ];
-    let [on_property, some, union, first, rest, on_properties, same] = [
+    let [
+        on_property,
+        some,
+        union,
+        first,
+        rest,
+        on_properties,
+        same,
+        complement,
+    ] = [
         iri(OWL, "onProperty"),
         iri(OWL, "someValuesFrom"),
         iri(OWL, "unionOf"),
@@ -105,7 +116,9 @@ fn graph(rng: &mut Rng, table: &mut Table) -> Vec<Statement> {
         iri(RDF, "rest"),
         iri(OWL, "onProperties"),
         iri(OWL, "sameAs"),
+        iri(OWL, "complementOf"),
     ];
+    let [e, defined_by] = [iri(EX, "E"), iri(RDFS, "isDefinedBy")];
     let types = [
         iri(OWL, "Class"),
         iri(OWL, "Restriction"),
@@ -115,7 +128,7 @@ fn graph(rng: &mut Rng, table: &mut Table) -> Vec<Statement> {
         a,
     ];
     let blank = |table: &mut Table, l: &str| table.id(BlankNode::new_unchecked(l).into());
-    let [r, u, l, n, pl] = ["r", "u", "l", "n", "pl"].map(|x| blank(table, x));
+    let [r, u, l, n, pl, t] = ["r", "u", "l", "n", "pl", "t"].map(|x| blank(table, x));
     let blanks: Vec<u64> = (0..4).map(|i| blank(table, &format!("x{i}"))).collect();
     let mut triples = vec![
         [reserved[0], equivalent, reserved[1]],
@@ -151,6 +164,16 @@ fn graph(rng: &mut Rng, table: &mut Table) -> Vec<Statement> {
         p,
     ];
     let pick = |rng: &mut Rng, from: &[u64]| from[rng.below(from.len() as u64) as usize];
+    let twice = rng.one_in(2);
+    if twice {
+        let operator = if rng.one_in(2) {
+            complement
+        } else {
+            triples.extend([[t, ty, types[1]], [t, on_property, p]]);
+            some
+        };
+        triples.extend([[e, sub, t], [t, operator, defined_by], [t, operator, c]]);
+    }
     for _ in 0..rng.below(13) {
         let predicate = pick(rng, &predicates);
         let object = if predicate == ty {
@@ -160,9 +183,10 @@ fn graph(rng: &mut Rng, table: &mut Table) -> Vec<Statement> {
         };
         triples.push([pick(rng, &nodes), predicate, object]);
     }
-    (triples.into_iter())
+    let statements = (triples.into_iter())
         .map(|triple| Statement { triple, graph: 0 })
-        .collect()
+        .collect();
+    (statements, twice)
 }
 
 /// `statements` in a random order (Fisher-Yates).
@@ -179,9 +203,10 @@ fn shuffled(statements: &[Statement], rng: &mut Rng) -> Vec<Statement> {
 /// the mapping, a malformed structure, a broken list, syntax not read yet) are the same set
 /// in every order the statements come in. Random small graphs, each with an
 /// `owl:equivalentClass` between two reserved names, the second named by another axiom too,
-/// and one structure of each other kind, are each read in their order and in six seeded
-/// others. `NRESE_FUZZ_SEED` (default 0) varies the graphs. A kind the graphs never reach fails
-/// the test, which would state nothing of it; a kind whose set differs is shown by the
+/// one structure of each other kind, and in about half a structure property given twice (one
+/// value a reserved name, one a plain one), are each read in their order and in six seeded
+/// others. `NRESE_FUZZ_SEED` (default 0) varies the graphs. A kind or shape the graphs never
+/// reach fails the test, which would state nothing of it; a kind whose set differs is shown by the
 /// fewest statements that still show it, in both orders.
 #[test]
 fn what_the_reader_leaves_out_is_the_same_in_every_order() {
@@ -193,10 +218,11 @@ fn what_the_reader_leaves_out_is_the_same_in_every_order() {
         .unwrap_or(0);
     let mut rng = Rng::new(seed ^ 0x006f_7264_6572);
     let mut table = Table::default();
-    let mut reached = [0usize; KINDS.len()];
+    let (mut reached, mut twice) = ([0usize; KINDS.len()], 0);
     let mut moved: Vec<(&str, String)> = Vec::new();
     for case in 0..GRAPHS {
-        let statements = graph(&mut rng, &mut table);
+        let (statements, given_twice) = graph(&mut rng, &mut table);
+        twice += usize::from(given_twice);
         for (i, of) in KINDS.iter().enumerate() {
             reached[i] += usize::from(!left_out(&statements, &table, of).is_empty());
         }
@@ -223,11 +249,64 @@ fn what_the_reader_leaves_out_is_the_same_in_every_order() {
             }
         }
     }
-    eprintln!("NRESE_FUZZ_SEED={seed}: {GRAPHS} graphs; with each kind: {KINDS:?} {reached:?}");
+    eprintln!(
+        "NRESE_FUZZ_SEED={seed}: {GRAPHS} graphs; with each kind: {KINDS:?} {reached:?}; with \
+         a structure property given twice: {twice}"
+    );
     assert!(
-        reached.iter().all(|&n| n > 0),
-        "a kind no graph reached: {KINDS:?} {reached:?}"
+        reached.iter().all(|&n| n > 0) && twice > 0,
+        "a kind or shape no graph reached: {KINDS:?} {reached:?}, given twice {twice}"
     );
     let moved: Vec<String> = moved.into_iter().map(|(_, m)| m).collect();
     assert!(moved.is_empty(), "{}", moved.join("\n"));
+}
+
+/// Names by ids as a source's dictionary may give them, any ids at all: every term an IRI.
+struct Sparse(Vec<(Term, &'static str)>);
+
+impl Terms for Sparse {
+    fn kind(&self, _: Term) -> TermKind {
+        TermKind::Iri
+    }
+
+    fn lexical(&self, _: Term) -> Option<String> {
+        None
+    }
+
+    fn iri(&self, iri: &str) -> Option<Term> {
+        self.0.iter().find(|(_, i)| *i == iri).map(|&(t, _)| t)
+    }
+
+    fn datatype(&self, _: Term) -> Option<String> {
+        None
+    }
+
+    fn iri_text(&self, term: Term) -> Option<String> {
+        self.0
+            .iter()
+            .find(|&&(t, _)| t == term)
+            .map(|(_, i)| (*i).to_owned())
+    }
+}
+
+/// Spec ([`Diagnostic::NotOwl`]: each statement of OWL vocabulary outside the mapping's forms
+/// is a part left out): `ex:a owl:onProperty ex:c` and `ex:b owl:onProperty ex:d` are two,
+/// whatever ids the source gives their terms; here ids whose mix, as one number, is the same
+/// for both statements.
+#[test]
+fn two_statements_outside_the_mapping_are_two_parts_left_out() {
+    let b = 4_398_046_511_105; // 2^42 + 1
+    let terms = Sparse(vec![
+        (1, "http://example.com/a"),
+        (b, "http://example.com/b"),
+        (2, "http://example.com/c"),
+        (3, "http://example.com/d"),
+        (5, "http://www.w3.org/2002/07/owl#onProperty"),
+    ]);
+    let statements = [[1, 5, 2], [b, 5, 3]].map(|triple| Statement { triple, graph: 0 });
+    let diagnostics = read(&statements, &terms).diagnostics;
+    let not_owl = (diagnostics.iter())
+        .filter(|d| matches!(d, Diagnostic::NotOwl { .. }))
+        .count();
+    assert_eq!(not_owl, 2, "{diagnostics:?}");
 }
