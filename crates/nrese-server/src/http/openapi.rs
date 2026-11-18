@@ -79,6 +79,9 @@ struct QueryForm {
     #[schema(rename = "named-graph-uri")]
     named_graph_uri: Option<Vec<String>>,
     infer: Option<bool>,
+    /// See the query parameter `inference-scope`.
+    #[schema(rename = "inference-scope")]
+    inference_scope: Option<String>,
     explain: Option<String>,
     #[schema(rename = "dl-answers")]
     dl_answers: Option<String>,
@@ -313,7 +316,9 @@ protocol!(
 // of docs/ops/http-api.md, "Endpoint contracts".
 const RESULTS: &str = "SPARQL results (JSON, XML, CSV, TSV, binary) or RDF, as `Accept` asks";
 const QUERY_400: &str = "A syntax error; an empty or repeated query, or one in both the URL and \
-    the body; a parameter value it doesn't take";
+    the body; a parameter value it doesn't take; `inference-scope` with `infer=false`, a \
+    pseudo-graph or no graph in the dataset, a `FROM NAMED` graph that isn't also a `FROM` \
+    graph, or inside a transaction with operations pending";
 const UPDATE_400: &str = "A syntax error; an empty or repeated update, or one in both the URL \
     and the body; a commit a consistency check or the SHACL gate rejects";
 const DENIED: &str =
@@ -322,6 +327,12 @@ const QUERY_408: &str = "Timed out (`budgets.query_timeout`), or an operator can
 const QUERY_413: &str =
     "Past `budgets.query_text`, or the query's memory past `budgets.query_memory`";
 const QUERY_422: &str = "`dl-answers=exact`, and the answers can't be proven complete";
+const QUERY_501: &str = "`inference-scope=dataset` where this server can't serve it: \
+    `reasoner.equality = \"compact\"`, no support sets for the rules in force, a text or \
+    vector search, or a computed spatial relation";
+const SCOPE: &str = "`dataset`: the inferred statements are those that follow from the \
+    dataset's graphs alone (`FROM` and `FROM NAMED`, or `default-graph-uri` and \
+    `named-graph-uri`), without the store's default graph; answers are `not-certified`";
 const UNAVAILABLE: &str =
     "Not ready or unavailable, or `budgets.total_query_memory` taken; try again";
 const AFTER_BODY: &str = "With a SPARQL body; a form carries it in the body instead";
@@ -329,6 +340,7 @@ protocol!(query_get, get, path = "/api/v1/repositories/{id}/query", tag = "sparq
     params(("id" = String, Path, description = ID), ("query" = String, Query, description = "The query, once"),
         ("default-graph-uri" = Option<Vec<String>>, Query), ("named-graph-uri" = Option<Vec<String>>, Query),
         ("infer" = Option<bool>, Query, description = "Whether inferred statements are read (default true)"),
+        ("inference-scope" = Option<String>, Query, description = SCOPE),
         ("explain" = Option<String>, Query, description = "`true`, `false` or `plan`"),
         ("dl-answers" = Option<String>, Query, description = "`certain-where-complete`, `sound` or `exact`")),
     responses((status = 200, description = RESULTS), (status = 400, description = QUERY_400, body = Problem),
@@ -336,13 +348,15 @@ protocol!(query_get, get, path = "/api/v1/repositories/{id}/query", tag = "sparq
         (status = 404, description = "No such repository", body = Problem),
         (status = 406, description = "No format the `Accept` header takes", body = Problem),
         (status = 408, description = QUERY_408, body = Problem), (status = 413, description = QUERY_413, body = Problem),
-        (status = 422, description = QUERY_422, body = Problem), (status = 429, description = "Rate limited", body = Problem),
+        (status = 422, description = QUERY_422, body = Problem), (status = 501, description = QUERY_501, body = Problem),
+        (status = 429, description = "Rate limited", body = Problem),
         (status = 503, description = UNAVAILABLE, body = Problem)));
 protocol!(query_post, post, path = "/api/v1/repositories/{id}/query", tag = "sparql",
     params(("id" = String, Path, description = ID),
         ("default-graph-uri" = Option<Vec<String>>, Query, description = AFTER_BODY),
         ("named-graph-uri" = Option<Vec<String>>, Query, description = AFTER_BODY),
-        ("infer" = Option<bool>, Query, description = AFTER_BODY), ("explain" = Option<String>, Query, description = AFTER_BODY),
+        ("infer" = Option<bool>, Query, description = AFTER_BODY),
+        ("inference-scope" = Option<String>, Query, description = AFTER_BODY), ("explain" = Option<String>, Query, description = AFTER_BODY),
         ("dl-answers" = Option<String>, Query, description = AFTER_BODY)),
     request_body(description = "The query, as a form, or as the body (read as the query whatever its media type)",
         content((String = "application/sparql-query"), (QueryForm = "application/x-www-form-urlencoded"))),
@@ -351,7 +365,8 @@ protocol!(query_post, post, path = "/api/v1/repositories/{id}/query", tag = "spa
         (status = 404, description = "No such repository", body = Problem),
         (status = 406, description = "No format the `Accept` header takes", body = Problem),
         (status = 408, description = QUERY_408, body = Problem), (status = 413, description = QUERY_413, body = Problem),
-        (status = 422, description = QUERY_422, body = Problem), (status = 429, description = "Rate limited", body = Problem),
+        (status = 422, description = QUERY_422, body = Problem), (status = 501, description = QUERY_501, body = Problem),
+        (status = 429, description = "Rate limited", body = Problem),
         (status = 503, description = UNAVAILABLE, body = Problem)));
 protocol!(update, post, path = "/api/v1/repositories/{id}/update", tag = "sparql",
     params(("id" = String, Path, description = ID),
@@ -371,14 +386,16 @@ protocol!(sparql_get, get, path = "/api/v1/repositories/{id}/sparql", tag = "spa
     params(("id" = String, Path, description = ID),
         ("query" = Option<String>, Query, description = "The query, once; without it, the service description"),
         ("default-graph-uri" = Option<Vec<String>>, Query), ("named-graph-uri" = Option<Vec<String>>, Query),
-        ("infer" = Option<bool>, Query), ("explain" = Option<String>, Query), ("dl-answers" = Option<String>, Query)),
+        ("infer" = Option<bool>, Query), ("inference-scope" = Option<String>, Query),
+        ("explain" = Option<String>, Query), ("dl-answers" = Option<String>, Query)),
     responses((status = 200, description = "With `query`, as `GET …/query`; without, the service description (Turtle)"),
         (status = 400, description = QUERY_400, body = Problem),
         (status = 401, description = "Not authenticated", body = Problem), (status = 403, description = DENIED, body = Problem),
         (status = 404, description = "No such repository", body = Problem),
         (status = 406, description = "No format the `Accept` header takes", body = Problem),
         (status = 408, description = QUERY_408, body = Problem), (status = 413, description = QUERY_413, body = Problem),
-        (status = 422, description = QUERY_422, body = Problem), (status = 429, description = "Rate limited", body = Problem),
+        (status = 422, description = QUERY_422, body = Problem), (status = 501, description = QUERY_501, body = Problem),
+        (status = 429, description = "Rate limited", body = Problem),
         (status = 503, description = UNAVAILABLE, body = Problem)));
 protocol!(
     sparql_post,

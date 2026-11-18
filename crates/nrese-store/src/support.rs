@@ -1986,6 +1986,42 @@ impl Reading {
         }
     }
 
+    /// A dataset's view may use only a supported, certified closure.
+    pub(crate) fn scoped(
+        &self,
+        snapshot: &Snapshot,
+        model: ReadModel,
+    ) -> crate::StoreResult<Snapshot> {
+        use crate::{StoreError, service::Certificate};
+        use nrese_sparql::QueryEvaluationError::ScopedInferenceUnavailable;
+        let generation = self.supports.state().generation.clone();
+        let replica = self.compilation.replica;
+        if !replica && Certificate::bare(snapshot, generation.rules.is_some()) {
+            return Ok(snapshot.clone());
+        }
+        if replica
+            || Certificate::of(snapshot).is_none()
+            || (generation.ever
+                && made_with_other_rules(
+                    &generation,
+                    snapshot,
+                    self.compilation.hide_unnamed_classes,
+                ))
+        {
+            return Err(StoreError::NotRematerialised { replica });
+        }
+        if self.compilation.compact {
+            return Err(ScopedInferenceUnavailable("reasoner.equality").into());
+        }
+        if generation.rules.is_none() {
+            return Err(ScopedInferenceUnavailable("reasoner.mode").into());
+        }
+        if model == ReadModel::Asserted {
+            return Ok(snapshot.clone());
+        }
+        Ok(self.committed(snapshot)?)
+    }
+
     /// What `tx` holds, its base and its pending changes, as this reader reads it: with
     /// nothing pending, its base ([`Self::committed`]). The changes aren't reasoned over until
     /// the commit, so what they change of the reader's view is the statements they assert

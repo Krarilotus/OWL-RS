@@ -165,52 +165,78 @@ fn bindings(values: &[&str]) -> Rows {
 }
 
 #[tokio::test]
-#[ignore = "a dataset cannot yet select the premises of a derivation"]
 async fn derivation_uses_only_dataset_graphs() -> TestResult {
     // Spec: Dataset-scoped inference derives a conclusion only when both premises are in
-    // the dataset. FROM NAMED can supply a premise while keeping its assertion in GRAPH.
+    // the dataset.
     let app = app(StoreConfig::default(), false)?;
     insert(&app, SPLIT).await?;
-    let mut seen = Vec::new();
-    for dataset in [G1, BOTH, "FROM :g1 FROM NAMED :g2"] {
-        seen.push(
-            select(&app, &[], SCOPED, "?s", dataset, CONCLUSION)
-                .await?
-                .rows(),
-        );
-    }
+    let one = select(&app, &[], SCOPED, "?s", G1, CONCLUSION).await?;
+    let both = select(&app, &[], SCOPED, "?s", BOTH, CONCLUSION).await?;
+    assert_eq!((one.rows(), both.rows()), (bindings(&[]), bindings(&[A])));
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_support_counts_owl_list_premises() -> TestResult {
+    // Spec: A property-chain derivation needs the list axiom and its list triples
+    // in the dataset, as well as the data premises.
+    let app = app(StoreConfig::default(), false)?;
+    insert(
+        &app,
+        "GRAPH :g1 { ex:a ex:p ex:b . ex:b ex:r ex:c }
+         GRAPH :g2 { ex:q <http://www.w3.org/2002/07/owl#propertyChainAxiom> (ex:p ex:r) }",
+    )
+    .await?;
+    let pattern = "{ ?s ex:q ex:c }";
+    let one = select(&app, &[], SCOPED, "?s", G1, pattern).await?;
+    let both = select(&app, &[], SCOPED, "?s", BOTH, pattern).await?;
+    assert_eq!((one.rows(), both.rows()), (bindings(&[]), bindings(&[A])));
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_reads_refuse_a_named_graph_without_from() -> TestResult {
+    // Spec: Under dataset scoping, every FROM NAMED graph must also occur in FROM.
+    let app = app(StoreConfig::default(), false)?;
+    insert(&app, SPLIT).await?;
+    let reply = select(
+        &app,
+        &[],
+        SCOPED,
+        "?s",
+        "FROM :g1 FROM NAMED :g2",
+        CONCLUSION,
+    )
+    .await?;
+    assert_bad_request(reply, "FROM NAMED");
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_reads_include_assertions_from_graphs_named_in_both_clauses() -> TestResult {
+    // Spec: A graph named in both FROM and FROM NAMED contributes its assertions
+    // to the default scan and to GRAPH.
+    let app = app(StoreConfig::default(), false)?;
+    insert(&app, SUPPRESSED).await?;
+    let dataset = "FROM :g1 FROM :g2 FROM NAMED :g2";
+    let default = select(&app, &[], SCOPED, "?s", dataset, CONCLUSION).await?;
     let named = select(
         &app,
         &[],
         SCOPED,
-        "?g",
-        "FROM :g1 FROM NAMED :g2",
-        "{ GRAPH ?g { ex:p rdfs:subPropertyOf ex:q } }",
-    )
-    .await?;
-    let default = select(
-        &app,
-        &[],
-        SCOPED,
-        "?p",
-        "FROM :g1 FROM NAMED :g2",
-        "{ ?p rdfs:subPropertyOf ex:q FILTER(?p = ex:p) }",
+        "?s",
+        dataset,
+        "{ GRAPH :g2 { ?s ex:q ex:b } }",
     )
     .await?;
     assert_eq!(
-        (seen, named.rows(), default.rows()),
-        (
-            vec![bindings(&[]), bindings(&[A]), bindings(&[A])],
-            bindings(&["<urn:graph:g2>"]),
-            bindings(&[])
-        ),
-        "conclusion with one, both or a named premise, then the named assertion in GRAPH and in the default graph"
+        (default.rows(), named.rows()),
+        (bindings(&[A]), bindings(&[A]))
     );
     Ok(())
 }
 
 #[tokio::test]
-#[ignore = "an assertion in an unselected graph can still suppress a scoped inference"]
 async fn recovers_a_conclusion_asserted_outside_the_dataset() -> TestResult {
     // Spec: A statement asserted outside the dataset is returned when the selected
     // graph's assertions independently derive it.
@@ -227,7 +253,6 @@ async fn recovers_a_conclusion_asserted_outside_the_dataset() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "the default graph scan does not yet include the dataset's own inferences"]
 async fn physical_default_supplies_neither_rows_nor_premises() -> TestResult {
     // Spec: With dataset-scoped inference, a default-graph assertion and a conclusion
     // requiring a default-graph premise are absent while an in-scope derivation is present.
@@ -303,7 +328,6 @@ const SUPPRESSED_CASES: &[OracleCase] = &[
 ];
 
 #[tokio::test]
-#[ignore = "a scoped read does not yet match materialisation over its dataset"]
 async fn matches_an_independently_materialised_repository() -> TestResult {
     // Spec: Scoped solution multisets match a repository materialised from just the
     // selected graphs under the same rules, including for paths and aggregates.
@@ -363,7 +387,6 @@ fn assert_oracle(compared: Vec<(&str, Rows, Rows, Rows)>) {
 }
 
 #[tokio::test]
-#[ignore = "a warm scoped read does not yet return its locally derived rows"]
 async fn warm_reads_follow_a_commit() -> TestResult {
     // Spec: Alternating scoped and ordinary reads keep their own answers on a warm cache
     // and both see the facts added by a commit, including their scope's new inferences.
@@ -415,7 +438,6 @@ async fn warm_reads_follow_a_commit() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "rows and explanations do not yet carry dataset-scoped certification status"]
 async fn scoped_rows_and_explanations_are_not_certified() -> TestResult {
     // Spec: Dataset-scoped reads and their explanations carry the not-certified
     // completeness header.
@@ -523,7 +545,6 @@ async fn ordinary_datasets_keep_their_rows_and_completeness() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "dataset scoping does not yet match the supported-reader view"]
 async fn matches_a_supported_reader_of_the_selected_graphs() -> TestResult {
     // Spec: With the physical default empty, scoped solutions match the multiset seen
     // by a supported reader of exactly the selected graphs under a union default.
@@ -562,7 +583,6 @@ async fn matches_a_supported_reader_of_the_selected_graphs() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "a reader of selected graphs does not yet see its supported inferences through FROM"]
 async fn a_dataset_cannot_widen_a_readers_access() -> TestResult {
     // Spec: Adding an unreadable graph changes neither default rows, COUNT(*) nor the
     // named graph enumeration. Only the readable graph supports default inferences.
@@ -610,7 +630,10 @@ async fn a_dataset_cannot_widen_a_readers_access() -> TestResult {
         .await?
         .rows();
     let mut named = Vec::new();
-    for dataset in ["FROM NAMED :g1 FROM NAMED :g2", "FROM NAMED :g1"] {
+    for dataset in [
+        "FROM :g1 FROM :g2 FROM NAMED :g1 FROM NAMED :g2",
+        "FROM :g1 FROM NAMED :g1",
+    ] {
         named.push(
             select(
                 &app,
@@ -637,12 +660,11 @@ async fn a_dataset_cannot_widen_a_readers_access() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "ordinary and scoped reads do not yet produce distinct answers to cache"]
 async fn result_cache_separates_both_read_orders() -> TestResult {
     // Spec: Starting with either request, cached plain and scoped reads of the same
     // query keep their own rows, including for a supported reader of the selected graph.
     let mut compared = Vec::new();
-    for (restricted, roles) in [(false, &[][..]), (true, READER)] {
+    for (restricted, roles) in [(false, &[][..]), (true, BOTH_READER)] {
         for scoped_first in [false, true] {
             let app = app(
                 StoreConfig {
@@ -651,13 +673,13 @@ async fn result_cache_separates_both_read_orders() -> TestResult {
                 },
                 restricted,
             )?;
-            insert(&app, INSIDE).await?;
+            insert(&app, &format!("{INSIDE} GRAPH :g2 {{ ex:x ex:y ex:z }}")).await?;
             let mut seen = Vec::new();
             let mut expected = Vec::new();
             for scoped in [scoped_first, !scoped_first, scoped_first] {
                 let options = if scoped { SCOPED } else { "" };
                 seen.push(
-                    select(&app, roles, options, "?s", G1, CONCLUSION)
+                    select(&app, roles, options, "?s", BOTH, CONCLUSION)
                         .await?
                         .rows(),
                 );
@@ -676,7 +698,6 @@ async fn result_cache_separates_both_read_orders() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "compact equality does not yet refuse dataset-scoped inference"]
 async fn compact_equality_names_the_unsupported_setting() -> TestResult {
     // Spec: With compact equality, dataset-scoped inference returns 501 with a
     // problem type that identifies the equality setting.
@@ -700,6 +721,223 @@ async fn compact_equality_names_the_unsupported_setting() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn scoped_reads_with_reasoning_disabled_use_the_asserted_merge() -> TestResult {
+    // Spec: With reasoning off, a scoped read merges the selected assertions and reports
+    // complete without a regime.
+    let app = test_app_with_store_config(
+        StoreConfig::default(),
+        Default::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Disabled),
+    )?;
+    insert(&app, &format!("{SPLIT} ex:a ex:q ex:b .")).await?;
+    let reply = select(&app, &[], SCOPED, "?p", BOTH, "{ ex:a ?p ex:b }").await?;
+    assert_eq!(
+        (reply.rows(), reply.completeness.as_deref()),
+        (bindings(&[P]), Some("complete"))
+    );
+    Ok(())
+}
+
+const GEO: &str = "GRAPH :g1 {
+    ex:a ex:geometry \"POINT(1 1)\"^^<http://www.opengis.net/ont/geosparql#wktLiteral> .
+    ex:geometry rdfs:subPropertyOf <http://www.opengis.net/ont/geosparql#asWKT> .
+    ex:box <http://www.opengis.net/ont/geosparql#asWKT>
+        \"POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))\"^^<http://www.opengis.net/ont/geosparql#wktLiteral>
+}";
+
+#[tokio::test]
+async fn scoped_reads_refuse_reader_ranked_search() -> TestResult {
+    // Spec: A scoped read that uses reader-ranked search returns 501 and identifies
+    // the search_scope setting in its problem type.
+    let app = app(
+        StoreConfig {
+            search_scope: nrese_store::SearchScope::Reader,
+            ..StoreConfig::default()
+        },
+        false,
+    )?;
+    insert(&app, "GRAPH :g1 { ex:a ex:p \"alpha\" }").await?;
+    let reply = select(
+        &app,
+        &[],
+        SCOPED,
+        "?text",
+        G1,
+        "{ ?text <http://www.bigdata.com/rdf/search#search> \"alpha\" }",
+    )
+    .await?;
+    assert_eq!(reply.code, StatusCode::NOT_IMPLEMENTED, "{reply:?}");
+    assert!(
+        reply.json()["type"]
+            .as_str()
+            .is_some_and(|kind| kind.contains("search_scope")),
+        "{reply:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_reads_refuse_global_text_search() -> TestResult {
+    // Spec: A scoped text search in global mode returns 501 and names the search setting.
+    let app = app(StoreConfig::default(), false)?;
+    insert(&app, "GRAPH :g1 { ex:a ex:p \"alpha\" }").await?;
+    let reply = select(
+        &app,
+        &[],
+        SCOPED,
+        "?text",
+        G1,
+        "{ ?text <http://www.bigdata.com/rdf/search#search> \"alpha\" }",
+    )
+    .await?;
+    assert_eq!(reply.code, StatusCode::NOT_IMPLEMENTED, "{reply:?}");
+    assert!(
+        reply.json()["type"]
+            .as_str()
+            .is_some_and(|kind| kind.contains("search")),
+        "{reply:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_reads_refuse_text_search_before_shortcuts() -> TestResult {
+    // Spec: A scoped text search returns 501 even if its property is absent or
+    // its pattern is evaluated with a binding from an OPTIONAL's left side.
+    let app = app(StoreConfig::default(), false)?;
+    let facts = (0..64)
+        .map(|i| format!("<urn:item:{i}> ex:p \"alpha\" ."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    insert(&app, &format!("GRAPH :g1 {{ {facts} }}")).await?;
+    let mut replies = Vec::new();
+    for (dataset, pattern) in [
+        (
+            G1,
+            r#"{ ?s <http://jena.apache.org/text#query> (ex:absent "alpha") }"#,
+        ),
+        (
+            "FROM :g1 FROM NAMED :g1",
+            r#"{ GRAPH ?g { ?s <http://jena.apache.org/text#query> (ex:absent "alpha") } }"#,
+        ),
+        (
+            G1,
+            r#"{ VALUES ?s { <urn:item:0> } OPTIONAL {
+                ?s ex:p ?text . ?text <http://www.bigdata.com/rdf/search#search> "alpha"
+            } }"#,
+        ),
+    ] {
+        replies.push(select(&app, &[], SCOPED, "?s", dataset, pattern).await?);
+    }
+    assert_eq!(
+        replies.iter().map(|reply| reply.code).collect::<Vec<_>>(),
+        vec![StatusCode::NOT_IMPLEMENTED; 3],
+        "{replies:?}"
+    );
+    for reply in replies {
+        assert!(
+            reply.json()["type"]
+                .as_str()
+                .is_some_and(|kind| kind.contains("search")),
+            "{reply:?}"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_reads_refuse_global_vector_search() -> TestResult {
+    // Spec: A scoped vector search in global mode returns 501 and names the search setting.
+    let app = app(StoreConfig::default(), false)?;
+    insert(
+        &app,
+        "GRAPH :g1 { ex:a ex:p \"[1,0]\"^^<urn:nrese:vector:vector> }",
+    )
+    .await?;
+    let reply = select(
+        &app,
+        &[],
+        SCOPED,
+        "?v",
+        G1,
+        "{ SERVICE <urn:nrese:vector:search> {
+           ?v <urn:nrese:vector:near> \"[1,0]\"^^<urn:nrese:vector:vector> ;
+              <urn:nrese:vector:k> 1
+         } }",
+    )
+    .await?;
+    assert_eq!(reply.code, StatusCode::NOT_IMPLEMENTED, "{reply:?}");
+    assert!(
+        reply.json()["type"]
+            .as_str()
+            .is_some_and(|kind| kind.contains("search")),
+        "{reply:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_reads_refuse_computed_spatial_relations() -> TestResult {
+    // Spec: A scoped computed spatial relation returns 501 and identifies the
+    // computed spatial relation in its problem type.
+    let app = app(StoreConfig::default(), false)?;
+    insert(&app, GEO).await?;
+    let reply = select(
+        &app,
+        &[],
+        SCOPED,
+        "?s",
+        G1,
+        "{ ?s <http://www.opengis.net/ont/geosparql#sfWithin> ex:box }",
+    )
+    .await?;
+    assert_eq!(reply.code, StatusCode::NOT_IMPLEMENTED, "{reply:?}");
+    assert!(
+        reply.json()["type"]
+            .as_str()
+            .is_some_and(|kind| kind.contains("spatial") || kind.contains("sfWithin")),
+        "{reply:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_spatial_filter_matches_an_independently_materialised_repository() -> TestResult {
+    // Spec: A scoped spatial filter returns the same rows as evaluating the filter
+    // with just the selected graphs and their independently materialised closure.
+    let full = app(StoreConfig::default(), false)?;
+    insert(
+        &full,
+        &format!(
+            "{GEO} ex:outside <http://www.opengis.net/ont/geosparql#asWKT>
+        \"POINT(1 1)\"^^<http://www.opengis.net/ont/geosparql#wktLiteral> ."
+        ),
+    )
+    .await?;
+    let oracle = app(
+        StoreConfig {
+            union_default_graph: true,
+            ..StoreConfig::default()
+        },
+        false,
+    )?;
+    insert(&oracle, GEO).await?;
+    let pattern = "{ ?s <http://www.opengis.net/ont/geosparql#asWKT> ?w
+        FILTER(?s != ex:box)
+        FILTER(<http://www.opengis.net/def/function/geosparql/sfWithin>(?w,
+            \"POLYGON((0 0, 2 0, 2 2, 0 2, 0 0))\"^^<http://www.opengis.net/ont/geosparql#wktLiteral>)) }";
+    let reference = select(&oracle, &[], "", "?s", "", pattern).await?;
+    let observed = select(&full, &[], SCOPED, "?s", G1, pattern).await?;
+    assert_eq!(
+        reference.rows(),
+        bindings(&[A]),
+        "oracle over the selected graphs"
+    );
+    assert_eq!(observed.rows(), reference.rows(), "scoped spatial filter");
+    Ok(())
+}
+
 fn assert_bad_request(reply: Reply, reason: &str) {
     assert_eq!(reply.code, StatusCode::BAD_REQUEST, "{reply:?}");
     assert!(
@@ -709,7 +947,6 @@ fn assert_bad_request(reply: Reply, reason: &str) {
 }
 
 #[tokio::test]
-#[ignore = "a dataset-scoped read does not yet reject infer=false"]
 async fn refuses_conflicting_inference_options() -> TestResult {
     // Spec: Dataset-scoped inference together with infer=false returns 400.
     let app = app(StoreConfig::default(), false)?;
@@ -728,7 +965,6 @@ async fn refuses_conflicting_inference_options() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "a dataset-scoped read does not yet reject a pseudo-graph"]
 async fn refuses_a_pseudo_graph_in_the_dataset() -> TestResult {
     // Spec: Naming a pseudo-graph in a scoped dataset returns 400.
     let app = app(StoreConfig::default(), false)?;
@@ -747,7 +983,6 @@ async fn refuses_a_pseudo_graph_in_the_dataset() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "a dataset-scoped read does not yet require a named input graph"]
 async fn refuses_a_dataset_that_names_no_graphs() -> TestResult {
     // Spec: Scoped inference without a graph in either dataset source returns 400.
     let app = app(StoreConfig::default(), false)?;
@@ -757,7 +992,6 @@ async fn refuses_a_dataset_that_names_no_graphs() -> TestResult {
 }
 
 #[tokio::test]
-#[ignore = "a transaction with pending operations does not yet reject a dataset-scoped read"]
 async fn refuses_a_dataset_scope_inside_a_pending_transaction() -> TestResult {
     // Spec: A transaction QUERY with dataset-scoped inference returns 400 after it
     // stages an UPDATE.
@@ -809,5 +1043,40 @@ async fn refuses_a_dataset_scope_inside_a_pending_transaction() -> TestResult {
     )
     .await?;
     assert_bad_request(reply, "pending");
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_cache_separates_default_graph_alias_when_reasoning_is_off() -> TestResult {
+    // Spec: For equal snapshot and FROM graphs, alternating plain and scoped reads
+    // must retain their different visibility of the store default compatibility alias.
+    for scoped_first in [false, true] {
+        let app = test_app_with_store_config(
+            StoreConfig {
+                query_cache_bytes: 1024 * 1024,
+                ..StoreConfig::default()
+            },
+            Default::default(),
+            ReasonerConfig::for_mode(ReasoningMode::Disabled),
+        )?;
+        insert(&app, &format!("{SPLIT} ex:a ex:q ex:b .")).await?;
+        for scoped in [scoped_first, !scoped_first, scoped_first] {
+            let options = if scoped { SCOPED } else { "" };
+            let reply = select(
+                &app,
+                &[],
+                options,
+                "(COUNT(*) AS ?n)",
+                BOTH,
+                "{ GRAPH <urn:x-arq:DefaultGraph> { ?s ex:q ex:b } }",
+            )
+            .await?;
+            assert_eq!(
+                reply.rows(),
+                bindings(&[if scoped { "0" } else { "1" }]),
+                "scoped first: {scoped_first}, scoped now: {scoped}"
+            );
+        }
+    }
     Ok(())
 }

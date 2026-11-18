@@ -750,7 +750,9 @@ impl PathEvaluator<'_> {
                         .scan_sorted_in(self.model, &pattern, permutation)
                         .expect("the bound positions are a prefix of the order")
                         .filter(move |quad| {
-                            graphs.is_none_or(|graphs| graphs.contains(&quad.graph))
+                            graphs.is_none_or(|graphs| {
+                                graphs.contains(self.snapshot, self.model, &quad)
+                            })
                         })
                         .filter(move |quad| {
                             let statement = (quad.subject, quad.predicate, quad.object);

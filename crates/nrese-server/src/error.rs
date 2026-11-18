@@ -34,6 +34,8 @@ pub enum ApiError {
     /// Exact answers asked for (`dl-answers=exact`) that can't be proven complete (422).
     #[error("incomplete answer: {0}")]
     IncompleteAnswer(Box<nrese_store::IncompleteAnswer>),
+    #[error("{1}")]
+    NotImplemented(&'static str, String),
     /// What was asked for is gone for good (a replica's log a checkpoint covered).
     #[error("gone: {0}")]
     Gone(String),
@@ -152,6 +154,17 @@ impl IntoResponse for ApiError {
         if let Self::IncompleteAnswer(answer) = self {
             return incomplete_answer(&answer);
         }
+        if let Self::NotImplemented(setting, detail) = self {
+            return problem(
+                StatusCode::NOT_IMPLEMENTED,
+                &serde_json::json!({
+                    "type": format!("https://nrese.dev/problems/{setting}"),
+                    "title": "Not Implemented",
+                    "status": 501,
+                    "detail": detail,
+                }),
+            );
+        }
         if let Self::Busy(detail) = self {
             let mut response = Self::ServiceUnavailable(detail).into_response();
             response
@@ -174,7 +187,9 @@ impl IntoResponse for ApiError {
             Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
             Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
             Self::Conflict(detail) => (StatusCode::CONFLICT, detail, None),
-            Self::IncompleteAnswer(_) | Self::Busy(_) => unreachable!("answered above"),
+            Self::IncompleteAnswer(_) | Self::Busy(_) | Self::NotImplemented(..) => {
+                unreachable!("answered above")
+            }
             Self::Gone(detail) => (StatusCode::GONE, detail, None),
             Self::NotAcceptable(detail) => (StatusCode::NOT_ACCEPTABLE, detail, None),
             Self::UnsupportedMediaType(detail) => {

@@ -308,6 +308,32 @@ fn collected_response_keeps_the_first_preparation_report() {
 }
 
 #[test]
+fn scoped_query_refuses_a_closure_without_support_sets() {
+    // Spec: A materialised closure with no program registered for support sets
+    // refuses a scoped query and identifies reasoner.mode.
+    let store = crate::StoreService::new(crate::StoreConfig::in_memory()).unwrap();
+    store
+        .update_str_ungated("INSERT DATA { GRAPH <urn:g> { <urn:a> <urn:p> <urn:b> } }")
+        .unwrap();
+    store
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
+        .unwrap();
+    let mut request =
+        SparqlQueryRequest::all("SELECT ?p FROM <urn:g> WHERE { <urn:a> ?p <urn:b> }");
+    request.inference_scope_dataset = true;
+    let answer = store.execute_query(&request);
+    assert!(
+        matches!(
+            &answer,
+            Err(StoreError::SparqlEvaluation(
+                QueryEvaluationError::ScopedInferenceUnavailable("reasoner.mode")
+            ))
+        ),
+        "{answer:?}"
+    );
+}
+
+#[test]
 fn prepared_serializers_agree_with_standalone_execution_for_every_form_and_format() {
     // Written as a server writes, through the pipeline, so the version read carries the
     // certificate its QL rewriting comes with.

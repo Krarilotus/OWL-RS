@@ -3544,6 +3544,12 @@ impl<'a> Context<'a> {
         triples: &[TriplePattern],
         filters: &mut Vec<(&Expression, Vec<Variable>)>,
     ) -> NativeResult<Solutions> {
+        if matches!(self.merge_set, Some(crate::dataset::GraphSet::Scoped(_)))
+            && triples.iter().any(|t| search::is_search(t, triples))
+            && search::split(triples).is_some()
+        {
+            self.search_in()?;
+        }
         // GeoSPARQL relations (`spatial`) join after the other patterns.
         if let Some((first, later, rest)) = self.spatial_split(triples) {
             let mut result = if rest.is_empty() {
@@ -4755,7 +4761,7 @@ impl<'a> Context<'a> {
             let components = quad.components();
             if merged {
                 if let Some(graphs) = &self.merge_set
-                    && !graphs.contains(&quad.graph)
+                    && !graphs.contains(&self.snapshot, self.model, &quad)
                 {
                     continue;
                 }
@@ -4815,7 +4821,7 @@ impl<'a> Context<'a> {
             }
             if merged {
                 if let Some(graphs) = &self.merge_set
-                    && !graphs.contains(&quad.graph)
+                    && !graphs.contains(&self.snapshot, self.model, &quad)
                 {
                     continue;
                 }
@@ -5343,7 +5349,8 @@ impl<'a> Context<'a> {
             let mut previous: Option<[u64; 3]> = None;
             let graphs = self.merge_set.as_ref();
             sorted.filter(move |quad| {
-                if graphs.is_some_and(|graphs| !graphs.contains(&quad.graph)) {
+                if graphs.is_some_and(|graphs| !graphs.contains(&self.snapshot, self.model, &quad))
+                {
                     return false;
                 }
                 let components = quad.components();
@@ -7041,9 +7048,9 @@ impl<'b> Probe<'_, 'b> {
                 }
                 cursor.for_each(&bound.quad_pattern(), |quad| {
                     if refused.is_some()
-                        || self
-                            .graphs
-                            .is_some_and(|graphs| !graphs.contains(&quad.graph))
+                        || self.graphs.is_some_and(|graphs| {
+                            !graphs.contains(self.snapshot, self.model, &quad)
+                        })
                     {
                         return;
                     }
