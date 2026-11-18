@@ -728,13 +728,17 @@ impl Snapshot {
     /// [`Self::with_inferred_subset`] of [`InferredSubset::Only`] `kept` (sorted, each
     /// once), everything it makes charged to `budget` before it is made and held by the
     /// view until its last reader lets it go. O(k log k) for its k statements, on one
-    /// thread. A refusal leaves nothing made.
+    /// thread. A refusal leaves nothing made. Not `vouched`, a restriction is withheld.
     pub fn with_inferred_only(
         &self,
         kept: &[EncodedQuad],
+        vouched: bool,
         budget: &Arc<nrese_exec::Budget>,
     ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
-        let of = self.kept_among_inferred(kept);
+        let of = match self.kept_among_inferred(kept) {
+            ViewOf::Restriction if !vouched => ViewOf::Withheld,
+            of => of,
+        };
         let layout = self.version.inferred.layout();
         let empty = crate::index::IndexVersion::empty(layout);
         let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
@@ -822,10 +826,12 @@ impl Snapshot {
     /// This snapshot with the inferred statements `mask` hides removed, as
     /// [`Self::with_inferred_subset`] does, by stacking its runs: O(r) for its r runs.
     /// `Ok(None)` if the mask was built for another layout of the stack. What the view
-    /// makes is charged to `budget` first; it holds the mask's charges besides.
+    /// makes is charged to `budget` first; it holds the mask's charges besides. Not
+    /// `vouched`, a restriction is withheld.
     pub fn with_inferred_mask(
         &self,
         mask: &InferredMask,
+        vouched: bool,
         budget: &Arc<nrese_exec::Budget>,
     ) -> Result<Option<Snapshot>, nrese_exec::BudgetExceeded> {
         let stack = &self.version.inferred;
@@ -842,24 +848,12 @@ impl Snapshot {
         parts.push(mask.held.clone());
         let held = Held::new(parts, held);
         let inferred = stack.with_runs(&mask.runs);
-        let of = match mask.adds {
-            true => ViewOf::Addition,
-            false => ViewOf::Restriction,
+        let of = match (mask.adds, vouched) {
+            (true, _) => ViewOf::Addition,
+            (false, true) => ViewOf::Restriction,
+            (false, false) => ViewOf::Withheld,
         };
         Ok(Some(self.restricted(inferred, held, of)))
-    }
-
-    /// This snapshot with no certificate, never published, for a view its maker can't vouch
-    /// for (a reader's view that may not be its closure): the same stacks, a version of its
-    /// own. What it makes is charged to `budget` first and held by the view.
-    pub fn withheld_within(
-        &self,
-        budget: &Arc<nrese_exec::Budget>,
-    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
-        let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
-        held.charge(Self::restricted_bytes() + Held::overhead(self.held.count()))?;
-        let held = Held::new(self.held.with(0), held);
-        Ok(self.restricted(self.version.inferred.clone(), held, ViewOf::Withheld))
     }
 
     /// What [`Self::restricted`] allocates for a view: its version, equality cell and
@@ -890,10 +884,15 @@ impl Snapshot {
             canonical: Default::default(),
             own: Default::default(),
             // A restriction or a derivation: the source's, as it is published as its source
-            // is. An addition: statements no one vouched for. Withheld: its maker's word.
-            certificate: matches!(of, ViewOf::Restriction | ViewOf::Derived)
-                .then(|| self.version.certificate.clone())
-                .flatten(),
+            // is. An addition: statements no one vouched for. Withheld: the source's, kept
+            // for its rows only.
+            certificate: match of {
+                ViewOf::Restriction | ViewOf::Derived => self.version.certificate.clone(),
+                ViewOf::Addition => None,
+                ViewOf::Withheld => self
+                    .certificate_for_rows()
+                    .map(|c| Arc::new(Withheld(Arc::clone(c))) as super::Certificate),
+            },
         });
         let canonical_data = self.canonical_view(&version);
         Snapshot {
@@ -1381,6 +1380,14 @@ impl Snapshot {
     /// snapshot carries its base's: it is unpublished ([`Self::shared_state`]).
     pub fn certificate(&self) -> Option<&super::Certificate> {
         self.version.certificate.as_ref()
+    }
+
+    /// The certificate its rows are produced under (the QL rewriting, the equality closure):
+    /// [`Self::certificate`], or the source's a withheld view keeps without vouching for it.
+    /// What may be said of an answer and how its rows are produced are two facts.
+    pub fn certificate_for_rows(&self) -> Option<&super::Certificate> {
+        let c = self.version.certificate.as_ref()?;
+        Some(c.downcast_ref::<Withheld>().map_or(c, |w| &w.0))
     }
 
     /// What its asserted statements are ([`super::AssertedIdentity`]): shared across the
@@ -2754,10 +2761,13 @@ enum ViewOf {
     /// Statements the source's own DL bounds derive from it alone
     /// ([`Snapshot::with_inferred_derived_within`]).
     Derived,
-    /// The source's statements, which its maker doesn't vouch for
-    /// ([`Snapshot::withheld_within`]).
+    /// A restriction its maker doesn't vouch for, never published.
     Withheld,
 }
+
+/// A withheld view's certificate: its source's, which no one vouches for here (the store
+/// reads it as none); its rows are produced under it ([`Snapshot::certificate_for_rows`]).
+struct Withheld(super::Certificate);
 
 /// Why a [`Snapshot`]'s search gave no answer: a refusal, never an empty answer.
 #[derive(Debug, Clone, Copy)]

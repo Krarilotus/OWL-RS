@@ -748,8 +748,9 @@ pub(crate) fn plan_prepared(
 
 /// The options `prepared` runs with, for execution and explanation alike, drawing from
 /// the request's envelope `memory` ([`StoreSettings::envelope`]). The QL rewriting and
-/// whether the stack is closed under `owl:sameAs` are `view`'s certificate's: none without
-/// one, so a read never takes them from another version.
+/// whether the stack is closed under `owl:sameAs` are how `view`'s rows are produced: its
+/// certificate's for rows ([`crate::service::Certificate::for_rows`]), kept by a view whose
+/// claim is withheld; none without one, so a read never takes them from another version.
 fn query_options(
     view: &impl ReadView,
     prepared: &PreparedQuery,
@@ -757,7 +758,9 @@ fn query_options(
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
 ) -> QueryOptions {
-    let certificate = view.snapshot().and_then(crate::service::Certificate::of);
+    let certificate = view
+        .snapshot()
+        .and_then(crate::service::Certificate::for_rows);
     QueryOptions {
         dataset: prepared.dataset.clone(),
         resources: nrese_sparql::Resources {

@@ -42,6 +42,8 @@ enum Route {
     Pending,
     /// `explain=true`: its status and whether it shows the QL rewriting's report.
     Explain,
+    /// `explain=plan`: the same, of the plan it would run as.
+    Plan,
 }
 
 /// What a reader is told: the answer, the whole status (`NRESE-Completeness`; from EXPLAIN,
@@ -142,7 +144,9 @@ async fn ask(app: &Router, roles: &[&str], route: Route) -> TestResult<Told> {
         ))
     };
     let (uri, method, body) = match route {
-        Route::Query | Route::Explain => ("/dataset/query".to_owned(), Method::POST, query.clone()),
+        Route::Query | Route::Explain | Route::Plan => {
+            ("/dataset/query".to_owned(), Method::POST, query.clone())
+        }
         Route::Transaction => (
             in_transaction(transaction(app, roles, None).await?)?,
             Method::PUT,
@@ -156,17 +160,13 @@ async fn ask(app: &Router, roles: &[&str], route: Route) -> TestResult<Told> {
     };
     let (json, status) = read(send(app, roles, method, &uri, body).await?).await?;
     let answer = boolean(&json)?;
-    if !matches!(route, Route::Explain) {
-        return Ok(told(answer, &status, None));
-    }
-    let explain = send(
-        app,
-        roles,
-        Method::POST,
-        "/dataset/query?explain=true",
-        query,
-    )
-    .await?;
+    let explain = match route {
+        Route::Explain => "true",
+        Route::Plan => "plan",
+        _ => return Ok(told(answer, &status, None)),
+    };
+    let uri = format!("/dataset/query?explain={explain}");
+    let explain = send(app, roles, Method::POST, &uri, query).await?;
     let (explanation, _) = read(explain).await?;
     let c = &explanation["completeness"];
     let bare = c["regime"].is_null() && c["reasons"].as_array().is_some_and(Vec::is_empty);
@@ -232,13 +232,20 @@ async fn a_reader_by_support_is_never_told_complete_for_a_view_without_its_closu
             Route::Explain,
             told(true, "complete", Some(true)),
         ),
+        (
+            "plan",
+            Owl2Rl,
+            On,
+            Route::Plan,
+            told(true, "complete", Some(true)),
+        ),
     ];
     let mut wrong = Vec::new();
     for (name, mode, ql, route, control) in families {
         let without = told(
             false,
             "not-certified",
-            matches!(route, Route::Explain).then_some(false),
+            matches!(route, Route::Explain | Route::Plan).then_some(false),
         );
         for (compact, want) in [(false, control), (true, without)] {
             let app = test_app_with_store_config(

@@ -419,12 +419,14 @@ fn no_view_of_an_unpublished_snapshot_admits() {
         ),
         (
             "inferred only",
-            pending.with_inferred_only(&all[1..], &budget()).unwrap(),
+            pending
+                .with_inferred_only(&all[1..], true, &budget())
+                .unwrap(),
         ),
         (
             "mask",
             pending
-                .with_inferred_mask(&mask, &budget())
+                .with_inferred_mask(&mask, true, &budget())
                 .unwrap()
                 .unwrap(),
         ),
@@ -517,7 +519,7 @@ fn a_published_restriction_keeps_its_own_sets_and_no_file() {
     let budget = Arc::new(Budget::unlimited());
     let mask = InferredMask::hiding(&published, &inferred, &budget).unwrap();
     let view = published
-        .with_inferred_mask(&mask, &budget)
+        .with_inferred_mask(&mask, true, &budget)
         .unwrap()
         .unwrap();
     assert!(view.shared_state().is_some(), "a published restriction");

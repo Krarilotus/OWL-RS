@@ -1968,11 +1968,13 @@ impl Reading {
         (model, reading)
     }
 
-    /// Whether this reader reads `snapshot` through a view of its own: by support, or
-    /// seeing every inference while a named graph is out of its reach (a fact asserted only
-    /// there, and derived, is shown to it as inferred).
+    /// Whether this reader reads `snapshot` through a view of its own: by support; under
+    /// compact equality, where no view is its closure (so it is told so whatever the graphs
+    /// it can't read hold); or seeing every inference while a named graph is out of its
+    /// reach (a fact asserted only there, and derived, is shown to it as inferred).
     fn through_view(&self, snapshot: &Snapshot) -> bool {
         self.access.inferred_by_support
+            || self.compilation.compact
             || snapshot
                 .named_graphs()
                 .any(|graph| !self.access.allows_id(snapshot, graph))
@@ -2375,21 +2377,19 @@ impl Supports {
                             )
                         }
                         // No sets (compact equality, or no rules): not the reader's closure.
-                        (Ok(_), _) => Ok(snapshot
-                            .with_inferred_only(&[], &self.kept)?
-                            .withheld_within(&self.kept)?),
+                        (Ok(_), _) => Ok(snapshot.with_inferred_only(&[], false, &self.kept)?),
                         (Err(unavailable), _) => Err(*unavailable),
                     }
                 }
+                // Compact restores nothing a reader can't read: not its closure.
+                false if compilation.compact => Ok(snapshot
+                    .with_inferred_mask(&InferredMask::default(), false, &self.kept)?
+                    .expect("an empty mask")),
                 false => {
                     let found = rederiving.get_or_init(|| {
                         self.compute_rederived(snapshot, &generation, compilation, &working)
                     });
                     match found {
-                        // Compact restores nothing a reader can't read: not its closure.
-                        Ok(found) if compilation.compact => Ok(self
-                            .visible_view(snapshot, access, found, &working)?
-                            .withheld_within(&self.kept)?),
                         Ok(found) => self.visible_view(snapshot, access, found, &working),
                         Err(unavailable) => Err(*unavailable),
                     }
@@ -2436,7 +2436,7 @@ impl Supports {
             false => {
                 let mask = InferredMask::default().changed(snapshot, &[], &show, &self.kept)?;
                 snapshot
-                    .with_inferred_mask(&mask, &self.kept)?
+                    .with_inferred_mask(&mask, true, &self.kept)?
                     .expect("a mask built for this stack's layout")
             }
         };
@@ -2755,16 +2755,13 @@ impl Supports {
                 }
             }
         };
+        // Sets under a program that left out a list may lack what the publication holds.
+        let vouched = !sets.lists_left_out;
         let view = match &form {
             Form::Mask(mask) => snapshot
-                .with_inferred_mask(mask, &self.kept)?
+                .with_inferred_mask(mask, vouched, &self.kept)?
                 .expect("a mask built for this stack's layout"),
-            Form::Only(list) => snapshot.with_inferred_only(list, &self.kept)?,
-        };
-        // Sets under a program that left out a list may lack what the publication holds.
-        let view = match sets.lists_left_out {
-            true => view.withheld_within(&self.kept)?,
-            false => view,
+            Form::Only(list) => snapshot.with_inferred_only(list, vouched, &self.kept)?,
         };
         working.go_on()?;
         let reader = Shared::new(

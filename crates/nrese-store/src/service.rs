@@ -134,6 +134,11 @@ impl Certificate {
         snapshot.certificate()?.downcast_ref()
     }
 
+    /// The one `snapshot`'s rows are produced under ([`Snapshot::certificate_for_rows`]).
+    pub(crate) fn for_rows(snapshot: &Snapshot) -> Option<&Self> {
+        snapshot.certificate_for_rows()?.downcast_ref()
+    }
+
     /// Whether `snapshot` was never reasoned over: no inferred statement, no certificate, and
     /// no rules in place (`rules`). Anything else without a certificate is a stack nothing
     /// vouches for.
@@ -142,10 +147,10 @@ impl Certificate {
     }
 
     /// Whether `snapshot` reads under `owl2-dl`, and whether user rules run with it: as its
-    /// certificate says, else as the mode `dl` is now (a read without one is told
+    /// certificate for rows says, else as the mode `dl` is now (a read without one is told
     /// `not-certified` all the same).
     pub(crate) fn route(snapshot: &Snapshot, dl: &crate::dl::Dl) -> (bool, bool) {
-        Self::of(snapshot).map_or((dl.active(), dl.user_rules()), |c| (c.dl, c.user_rules))
+        Self::for_rows(snapshot).map_or((dl.active(), dl.user_rules()), |c| (c.dl, c.user_rules))
     }
 }
 
@@ -2692,7 +2697,11 @@ fn certification_for_its_reader(
     ql: &mut Option<nrese_sparql::ql::QlReport>,
 ) {
     *completeness = status_for_its_reader(prepared, completeness.take(), ql.is_some());
-    if withholds_certification(prepared) {
+    // Rows a withheld view's rewriting gives stand; its report, a claim, doesn't.
+    let withheld = completeness
+        .as_ref()
+        .is_some_and(|c| c.certification_withheld);
+    if withholds_certification(prepared) || withheld {
         *ql = None;
     }
 }
