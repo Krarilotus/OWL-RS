@@ -112,6 +112,25 @@ fn an_insert_reads_nothing_that_grows_with_the_schema() {
     }
 }
 
+/// A delete that leaves no overdelete candidate (a fact no rule derives anything from)
+/// reads no `owl:sameAs` partners either, whatever the schema's size.
+#[test]
+fn a_delete_without_candidates_reads_nothing_that_grows_with_the_schema() {
+    for classes in [10, 1000] {
+        let mut vocabulary = LocalVocabulary::default();
+        let mut asserted = chain(&mut vocabulary, classes, false);
+        let deleted = load(&mut vocabulary, "ex:w ex:value ex:v");
+        asserted.extend(deleted.iter().copied());
+        asserted.sort_unstable();
+        let (maintained, expected, reads) = commit(&mut vocabulary, &asserted, &[], &deleted);
+        assert_eq!(maintained, expected, "{classes} classes: rematerialised");
+        assert_eq!(
+            reads, 0,
+            "{classes} classes: partner reads of a delete without candidates"
+        );
+    }
+}
+
 /// A delete with a candidate that a non-recursive rule still derives keeps it, with or
 /// without `owl:sameAs` facts in the store: the answer is a rematerialisation's, and the
 /// recursion analysis was built for it.
