@@ -129,6 +129,14 @@ leave something out.
   reader's graphs hold a triple term, is never `complete`: OWL 2 doesn't define them. For
   triple terms, none known
   ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)).
+- Under `owl2-ql`, and under `owl2-rl` with the QL rewriting on, a read that asks only about a
+  predicate or class that appears nowhere in the store can be told `false` and `complete` on
+  data that are inconsistent under OWL 2 DL in a way the rules don't read (a cardinality
+  written in another spelling than the mapping's `"0"` or `"1"^^xsd:nonNegativeInteger`,
+  say). On consistent data such a read is right: nothing entails a statement of a name that
+  appears nowhere. Under `owl2-ql`, such a cardinality asserted as an individual's type
+  (`:x a [ owl:maxCardinality "0"^^xsd:integer ; owl:onProperty :p ]`) isn't read as a
+  hazard at all, so reads of names the store holds can be told `complete` on those data too.
 - A rebuild of the inferences (`POST …/reasoning/rematerialise`) that fails while it replaces
   them leaves them uncertified: answers are `not-certified` until a rebuild succeeds. A change of
   a repository's QL rewriting made in between takes effect with that rebuild, not at once. Run
@@ -205,6 +213,10 @@ leave something out.
   `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
   annotation property's domain, range, super-property or sub-property or the empty list, or give
   the individual its own IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
+- On a store in quarantine, a delete of a schema statement that the remaining statements derive
+  again can be refused as introducing the violation that was already there, though a full
+  rebuild finds the same violation after it (under `owl2-rl`, for one). The delete changes
+  nothing, and the store stays as it was. Repair the existing violation first.
 - Labels and notes on a store with `owl:sameAs` read as `unsound`. Under `owl2-dl`, and under `owl2-ql`
   and `owl2-rl` where the QL rewriting answers, a query that reads an annotation property
   (`rdfs:label`, `rdfs:comment`, or one the data declares) or any predicate (a variable
@@ -282,6 +294,20 @@ leave something out.
   the answer is a `408` with no rows and no status, and nothing in it says that the OWL 2 DL
   checks took the time or which setting to raise. Raise the query timeout for such a read, or
   ask `dl-answers=sound`, whose answers skip those checks and are `sound-only`.
+- Under `owl2-dl`, a query past the query timeout is answered `408`, but the reasoning its
+  answer needs first (the bounds over the data, which every `owl2-dl` read waits for) runs on
+  until it ends or until [`dl.timeout`](ops/config-reference.md#dl.timeout) (30 min), on the
+  server's shared workers. Meanwhile reads on other repositories of the same server can slow
+  down or time out, and further `owl2-dl` reads on that repository wait for the same work and
+  time out too. It is a wait, not a lock: when the work ends, the other reads are at their
+  usual speed at once. Measured on one machine (10 workers, bounds that take 59 s to build,
+  a query timeout of 5 s): for about 30 s after the `408` a read on another repository that
+  takes 8 ms idle timed out or took up to 4.3 s; with `dl.timeout` at 10 s the other reads
+  were normal again within 5 to 10 s. Set `dl.timeout` a little above the query timeout: a
+  store whose reasoning needs longer then never gets it, so its `owl2-dl` answers stay
+  `sound-only`, and each such read spends up to `dl.timeout` again.
+  [`dl.threads`](ops/config-reference.md#dl.threads) doesn't confine this work. A store with
+  heavy `owl2-dl` data on a server of its own avoids it.
 
 ## SHACL
 
