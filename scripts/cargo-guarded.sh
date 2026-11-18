@@ -194,11 +194,11 @@ fi
 #   ~/owlrs-guard/thresholds (NRESE_GUARD_THRESHOLDS: `ram_soft_gb=16 disk_soft_gb=150 ram_kill_gb=4
 #   disk_kill_gb=100`); without a readable one, today's lines are taken (an 8 GB floor, 110 GB of
 #   disk), and the wait says so. Never its PowerShell: a text match can't tell which assignment
-#   runs (Sol, review-build-admission-r5..r7; the orchestrator, IB0612-8d33).
-#   (Its soft line, 16 GB, was the floor before: the agents' own load
+#   runs (IB0612-8d33).
+#   (Its soft line, 16 GB, was the floor before: other work's load
 #   keeps the development machine at 12-16 GB free, so no hook on a merged base could start, 20 Oct 2026.)
 # The guard's BUSY (~/owlrs-guard/BUSY, NRESE_GUARD_BUSY: below its soft line) holds no run whose
-# peak fits above the floor; the agents' own load keeps it set for hours. The guard's other kill
+# peak fits above the floor; other work's load keeps it set for hours. The guard's other kill
 # line, free disk on C:, holds every run: none starts below that line plus 10 GB
 # (NRESE_GUARD_DISK_MARGIN_GB).
 # Its peak: NRESE_BUILD_PEAK_GB, else 0.6 GB per compiler job (1.2 GB for release code, fat LTO)
@@ -226,7 +226,7 @@ if [ -d "${busy_posix%/*}" ]; then
   kill_ram=4 kill_disk=100 thresholds_note=""
   thresholds="${NRESE_GUARD_THRESHOLDS:-${busy_posix%/*}/thresholds}"
   line=""
-  # Bounded (NRESE_GUARD_THRESHOLDS_TIMEOUT_S, default 5 s): a stalled file system is no file (r8-2).
+  # Bounded (NRESE_GUARD_THRESHOLDS_TIMEOUT_S, default 5 s): a stalled file system is no file.
   line=$(timeout --kill-after=2 "${NRESE_GUARD_THRESHOLDS_TIMEOUT_S:-5}" head -1 -- "$thresholds" 2> /dev/null) || line=""
   line=${line%$'\r'}
   if [[ "$line" =~ ^ram_soft_gb=([0-9]+)\ disk_soft_gb=([0-9]+)\ ram_kill_gb=([0-9]+)\ disk_kill_gb=([0-9]+)$ ]]; then
@@ -235,13 +235,13 @@ if [ -d "${busy_posix%/*}" ]; then
     thresholds_note=" (the guard's thresholds file $thresholds is missing or unreadable: today's lines taken)"
   fi
   floor_default=$(( kill_ram + 4 ))
-  # The guard also stops our processes below its disk line on C: (Sol, r5-1): a build waits for that
+  # The guard also stops our processes below its disk line on drive C: a build waits for that
   # line plus a margin, BUSY or not (NRESE_GUARD_VOLUME, default /c).
   disk_floor_gb=$(( kill_disk + ${NRESE_GUARD_DISK_MARGIN_GB:-10} ))
 fi
 # Free GB on the guard's volume (NRESE_GUARD_DISKFREE: a file with the number, for tests). Bounded
 # (NRESE_GUARD_DISK_TIMEOUT_S, default 10 s: a stalled file system must not hold a hook), read
-# outside the admission lock, and never failing: a reading it can't get is empty, a wait (r6-2).
+# outside the admission lock, and never failing: a reading it can't get is empty, a wait.
 guard_disk_gb() {
   local gb="" t=${NRESE_GUARD_DISK_TIMEOUT_S:-10}
   if [ -n "${NRESE_GUARD_DISKFREE:-}" ]; then
@@ -297,7 +297,7 @@ ME="$$@${stat[21]}"
 [ -n "$JOB" ] || JOB="nrese-build-${ME/@/-}"
 export NRESE_BUILD_JOB=$JOB
 # One admission at a time (a lock whose holder is gone, or never got to name itself, goes after a minute).
-# lock_admission [DEADLINE]: fails, without the lock, once SECONDS passes DEADLINE (r7-2).
+# lock_admission [DEADLINE]: fails, without the lock, once SECONDS passes DEADLINE.
 lock_admission() {
   local holder
   until mkdir "$ADMIT/.lock" 2>/dev/null; do
@@ -330,7 +330,7 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
   poll=${NRESE_BUILD_SLOT_POLL_S:-5}
   while :; do
     # The disk read before the lock (bounded, never failing): a stalled file system holds no one else.
-    # Taken under the lock only while it is fresh: no older than a poll (r7-2).
+    # Taken under the lock only while it is fresh: no older than a poll.
     disk="" read_at=$SECONDS
     [ "$disk_floor_gb" -eq 0 ] || disk=$(guard_disk_gb)
     if ! lock_admission $(( since + limit )); then
@@ -340,7 +340,7 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
       exit 75
     fi
     # The deadline after the reads and the lock, before anything else: nothing is admitted past it,
-    # and no retry for a stale reading outlives it (Sol, review-build-admission-r8, r8-1).
+    # and no retry for a stale reading outlives it.
     waited=$((SECONDS - since))
     if [ "$waited" -gt "$limit" ]; then
       unlock_admission
@@ -410,7 +410,7 @@ if [ "$SLOTS" != 0 ] && [ -z "${FLEET_SLICE:-}" ]; then
       said=$waited
     fi
     # The deadline before any later look at the room, and no sleep past it: room that appears after
-    # it doesn't admit (Sol, r5 follow-up).
+    # it doesn't admit.
     pause=$poll
     waited=$((SECONDS - since))
     [ $(( limit - waited )) -ge "$pause" ] || pause=$(( limit - waited ))

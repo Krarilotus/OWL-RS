@@ -57,7 +57,7 @@ impl Seg {
 /// enumeration must not multiply after the stop: REAS-2, sweep M01–M17). The rule-evaluation
 /// walk counts nothing itself: its source does. On a stopped poller a read does no more work
 /// and answers [`Stopped`], never a value: a scan that its poller stopped, an estimate, a
-/// membership and a length all end `Err` (REAS-2 fix check r1, rule 2: a stopped answer read
+/// membership and a length all end `Err` (a stopped answer read
 /// as "nothing" kept its caller's loop going), and the caller ends with `?`. A read that no
 /// stop bounds takes [`Poller::never`], by name.
 ///
@@ -82,10 +82,10 @@ impl Seg {
 /// The counting is the trait's, not each implementation's: an implementation provides
 /// [`Visits`], whose scans deliver each fact through a [`Visit`] (which counts it before the
 /// caller sees it) and whose probes get a [`Probe`] only after the call is counted. `Source`
-/// itself is implemented for every `Visits` and for nothing else (master, 8 Nov 05:29: the
+/// itself is implemented for every `Visits` and for nothing else (the
 /// tick at the owner, where a leaf can't skip it). What a leaf still counts by itself are
 /// the positions it filters out before delivering ([`Visit::skip`], [`Visit::ahead`]): those
-/// leaves each have a counted test (the design note lists them).
+/// leaves each have a counted test.
 pub trait Source: Sync + sealed::Read {
     /// Calls `f` with every fact of `seg` matching `pattern` (`None` = any term); `Err` if
     /// its poller stopped it, the facts handed on so far a part of them.
@@ -477,7 +477,7 @@ impl<'v, 'p> Probe<'v, 'p> {
 
     /// Counts `n` units of work another owner reports before it does it (an engine count's
     /// visitor, `Snapshot::count_in_visiting`, whose `n` is at most `POLL_UNITS`: the owner
-    /// counts in runs, fix check r1 R2-F1); false once the poller has stopped, which tells
+    /// counts in runs); false once the poller has stopped, which tells
     /// the owner to stop.
     pub fn visited(self, n: u64) -> bool {
         let n = usize::try_from(n).unwrap_or(usize::MAX);
@@ -874,7 +874,7 @@ fn plan_bound<S: Source + ?Sized>(
                     })
                     .count();
                 // A stopped estimate sorts last: it only orders a rule body's atoms (at most
-                // 256; fix check r1 triage, BOUNDED), and the stage's next read answers
+                // 256), and the stage's next read answers
                 // `Stopped`.
                 (
                     known,
@@ -1121,7 +1121,7 @@ enum Drivers {
 impl<'r> Job<'r> {
     /// The variant driven by `first` (read from `seg_of(first)`): `Ok(None)` if it can't
     /// match. Its reads (estimates, the drivers) count on `poll`; [`Stopped`] where one of
-    /// them stopped, never "no job" (sweep M01; fix check r2, R3-F1: a program's grounded
+    /// them stopped, never "no job" (a program's grounded
     /// rules grow with its schema, so the loop over them must end there too).
     pub fn new<S: Source + ?Sized>(
         source: &S,
@@ -1237,7 +1237,7 @@ impl<'r> Job<'r> {
     /// out before they reach the walk: [`Source::scan_range`] counts them; collected ones
     /// are counted here) and each read of the walk on `poll` ([`walk`]): once its stop has
     /// fired, the rest is passed over and the run answers [`Stopped`], what it emitted a
-    /// part (fix check r1, rule 2).
+    /// part.
     pub fn run<S: Source + ?Sized>(
         &self,
         source: &S,
@@ -1349,8 +1349,8 @@ impl<'r> Job<'r> {
 /// can run between two asks, and after a refusal, is [`Poller`]'s bound.
 pub type Stop<'a> = &'a (dyn Fn() -> bool + Sync);
 
-/// A read its poller stopped: an error its caller has to handle, never an answer (REAS-2
-/// fix check r1, rule 2). A leaf that answers a value (whether a fact holds, how many
+/// A read its poller stopped: an error its caller has to handle, never an answer.
+/// A leaf that answers a value (whether a fact holds, how many
 /// matches) answers this instead once its poller has stopped, and the loop around it ends
 /// with `?`, its partial temporaries dropped; each stage maps it to its own cancellation.
 /// The engine's counted reads answer the same type ([`nrese_engine::visit`]; REAS-3).
@@ -1402,7 +1402,7 @@ impl<'a> Poller<'a> {
 
     /// `Err` once the stop has fired: how a leaf whose counted work may have ended early (a
     /// [`Self::counted`] iterator that ran dry, a scan its visit ended) says so, instead of
-    /// handing on a partial answer as a complete one (REAS-2 fix check r1, B9).
+    /// handing on a partial answer as a complete one.
     #[inline]
     pub fn ended(&self) -> Result<(), Stopped> {
         match self.stopped() {
@@ -1414,8 +1414,8 @@ impl<'a> Poller<'a> {
     /// A parallel task's poller (made by `map_init` or a fold's init, `None` where its stop had
     /// fired already), if it can still work: [`Stopped`] where it couldn't be made or has
     /// stopped since. A task over several items asks it for each, so the pass fails at its
-    /// first stopped item instead of answering "nothing" for every later one (fix check r2,
-    /// R3-F2).
+    /// first stopped item instead of answering "nothing" for every later
+    /// one.
     #[inline]
     pub fn live(slot: &Option<Self>) -> Result<&Self, Stopped> {
         match slot {
@@ -1447,7 +1447,7 @@ impl<'a> Poller<'a> {
     /// `units` is at most `POLL_UNITS`: work counted at once runs to its end before the stop
     /// is asked again, so a longer run would do its length past a stop (REAS-2's bound:
     /// `POLL_UNITS` plus one run). A list of work of any length goes through
-    /// [`Self::counted`] (review r1 F1).
+    /// [`Self::counted`].
     #[inline]
     pub fn attempt(&self, units: usize) -> bool {
         debug_assert!(
@@ -1470,7 +1470,7 @@ impl<'a> Poller<'a> {
     /// of at most `POLL_UNITS` counted at once (as many as the items say are left, at least
     /// one), the stop asked at each run; no more once the poller has stopped. The way a leaf
     /// reads a list it holds (a slice, a map's entries, a member list): one count per run, a
-    /// decrement per item (review r1 F1).
+    /// decrement per item.
     pub fn counted<I: IntoIterator>(&self, items: I) -> Counted<'_, 'a, I::IntoIter> {
         Counted {
             poll: self,
@@ -1673,7 +1673,7 @@ impl<'a> OperationStop<'a> {
 pub type Keep<'k> = &'k (dyn Fn(Triple, &Poller<'_>) -> Result<bool, Stopped> + Sync);
 
 /// Keeps the facts `keep` accepts, in order, until it answers [`Stopped`]: then `facts` is
-/// emptied, no fact after it looked at, and the stop handed on (fix check r1, rule 2: a
+/// emptied, no fact after it looked at, and the stop handed on (a
 /// stopped filter read as "drop" still walked a morsel's whole output, which a morsel
 /// doesn't bound).
 fn keep_until_stopped(
@@ -1700,7 +1700,7 @@ fn keep_until_stopped(
 
 /// Every fact `jobs` derive that `keep` accepts (its reads count on the morsel's poller).
 /// [`Stopped`] once `stop` has fired in a morsel: the morsels under way end within their
-/// poll interval, and none starts after it (fix check r2, R3-F2).
+/// poll interval, and none starts after it.
 pub fn run_jobs<S: Source + ?Sized>(
     source: &S,
     jobs: &[Job<'_>],
@@ -1806,11 +1806,11 @@ fn run_jobs_with<S: Source + ?Sized>(
 /// meaning nothing.
 pub type MorselKeep<'k> = dyn Fn(&mut Vec<Triple>, &Poller<'_>) -> Result<(), Stopped> + Sync + 'k;
 
-/// The morsels of `jobs`, in parallel, each one's facts handed to `finish`, in the morsels'
-/// order. A morsel that stopped (its poller couldn't be made, its run or its `keep` was cut
-/// short) fails the pass: rayon's collect into `Result` starts no morsel after it (fix
-/// check r2, R3-F2: a stopped morsel finished as an ordinary empty one, and every later one
-/// started).
+/// The morsels of `jobs`, in parallel, each one's facts handed to `finish`,
+/// in the morsels' order. A morsel that stopped (its poller couldn't be
+/// made, its run or its `keep` was cut short) fails the pass: rayon's collect
+/// into `Result` starts no morsel after it (a stopped morsel finished as
+/// an ordinary empty one, and every later one started).
 #[allow(clippy::too_many_arguments)]
 fn run_morsels<S: Source + ?Sized, T: Send>(
     source: &S,
@@ -1901,7 +1901,7 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
 /// Calls `emit` with every binding of `rule`'s body under which its head derives `fact`,
 /// reading `seg` (a backward, one-step derivation check: DRed's rederivation, and
 /// explanations later). It polls `poll` as [`walk_until`] does: [`Stopped`] once that has
-/// stopped, the bindings emitted so far not all there are (fix check r2, B9: the leaf says
+/// stopped, the bindings emitted so far not all there are (the leaf says
 /// so, not each caller). `Ok` where it ran out, or `emit` stopped it.
 pub fn derivations<S: Source + ?Sized>(
     source: &S,
@@ -1916,7 +1916,7 @@ pub fn derivations<S: Source + ?Sized>(
     };
     // The search is a unit of attempted work, whether it finds anything or not; on a poller
     // that has stopped (one shared by several searches) it opens no scan at all, not even
-    // the first (sol-loop r4, R4-1; review r1, F1).
+    // the first.
     if poll.attempt(1) {
         return Err(Stopped);
     }
@@ -1963,7 +1963,7 @@ pub fn derivations<S: Source + ?Sized>(
 }
 
 /// Whether `source` holds every one of `facts`, each a probe on `poll`, the first that
-/// doesn't ending it; [`Stopped`] where a probe stopped, never "not held" (fix check r2).
+/// doesn't ending it; [`Stopped`] where a probe stopped, never "not held".
 fn all_hold<S: Source + ?Sized>(
     source: &S,
     facts: &[Triple],
@@ -2070,7 +2070,7 @@ pub fn rule_key(rule: &Rule) -> RuleKey {
 type AtomRef = (u32, u8);
 
 /// Test builds only: the dispatch references read on this thread, for tests that count
-/// enumeration work no source sees (sol-loop r8, R8-1).
+/// enumeration work no source sees.
 #[cfg(test)]
 pub(crate) mod references_read {
     use std::cell::Cell;
@@ -2179,7 +2179,7 @@ impl Dispatch {
     /// The (rule, atom) pairs whose atom can match a fact of `delta`'s delta, sorted. Each
     /// relation it opens, reference it copies and probe it makes of the delta counts on
     /// `poll` (sweep M04): [`Stopped`] once that has stopped, never the pairs found before
-    /// (fix check r2, B9: an empty list read as "no variant", and the rounds' job loops went
+    /// (an empty list read as "no variant", and the rounds' job loops went
     /// on).
     pub(crate) fn matching(
         &self,
@@ -2194,7 +2194,7 @@ impl Dispatch {
             }
             any_delta = true;
             // Each reference copied as it is counted; a stop ends the matching, whatever was
-            // copied before it (review r1 F1).
+            // copied before it.
             if let Some(entries) = self.by_predicate.get(&p) {
                 out.extend(poll.counted(entries).copied());
             }
@@ -2323,8 +2323,8 @@ impl<'a> Unpolled<'a> {
 /// instances, and the ground consistency rules.
 ///
 /// It offers no enumeration of premise alternatives or producers that no poller counts:
-/// during an operation that has a stop, each one read is attempted work (REAS review r1,
-/// sol-loop r6/r7). Work that runs to its end reads them through `unpolled()`.
+/// during an operation that has a stop, each one read is attempted work.
+/// Work that runs to its end reads them through `unpolled()`.
 ///
 /// ```compile_fail
 /// fn uncounted(program: &nrese_reasoner::eval::GroundProgram, fact: [u64; 3]) -> usize {
@@ -2462,11 +2462,11 @@ impl GroundProgram {
     /// Visits every set of schema facts `grounding` was grounded on (the first, then the
     /// others), each a unit of attempted work on `poll`, counted before `body` reads it; `body`
     /// gets the poller back for its own work. `Some` with what `body` broke with; `None` once
-    /// every alternative was visited; [`Stopped`] where `poll` stopped first (fix check r2:
-    /// "all visited" and "stopped" were one answer).
+    /// every alternative was visited; [`Stopped`] where `poll` stopped first ("all visited" and "stopped" were one
+    /// answer).
     ///
     /// The one way to enumerate them during an operation that has a stop: a read that no
-    /// poller counts can't be written (REAS review r1, sol-loop r6/r7). Explanations, which
+    /// poller counts can't be written. Explanations, which
     /// run to their end, read them through [`Self::unpolled`].
     pub fn for_each_alternative<'p, B>(
         &self,
@@ -2488,7 +2488,7 @@ impl GroundProgram {
     /// Visits each rule (by index, ascending) whose head can give `fact`, once each, as
     /// [`Self::for_each_alternative`] visits alternatives. Discovery is attempted work as it
     /// is read: each head reference, a duplicate of the previous rule's included, is a unit
-    /// counted before it is used, and a `Break` leaves the rest unread (fix check r2, R8-1).
+    /// counted before it is used, and a `Break` leaves the rest unread.
     pub fn for_each_producer<'p, B>(
         &self,
         fact: Triple,
@@ -2728,7 +2728,7 @@ impl GroundProgram {
     /// transitivity (instantiated premises, plus the schema facts the instance was grounded
     /// on). Each alternative, producer and search is attempted work on `poll` (DRed's
     /// proofs run under the update's stop); [`Stopped`] where it stopped them, never the
-    /// bodies found so far (fix check r2, B9).
+    /// bodies found so far.
     pub fn derivation_bodies<S: Source + ?Sized>(
         &self,
         source: &S,
@@ -2812,8 +2812,8 @@ impl GroundProgram {
     /// `transitivity_too`, transitivity. It asks `stop` before any work, then polls it per
     /// unit attempted ([`Poller::attempt`]): each bodiless alternative, each producer, each
     /// search, each fact a search scans ([`walk_until`]; one that finds nothing can try a
-    /// product of a body's matches, N10 review r1, F2). Stopped, it answers [`Stopped`],
-    /// never a "not derivable" (fix check r1, rule 2: its callers' filters kept going).
+    /// product of a body's matches). Stopped, it answers [`Stopped`],
+    /// never a "not derivable" (its callers' filters kept going).
     fn derivable_through<S: Source + ?Sized>(
         &self,
         source: &S,
@@ -2823,7 +2823,7 @@ impl GroundProgram {
         transitivity_too: bool,
         stop: Stop<'_>,
     ) -> Result<bool, Stopped> {
-        // Before the bodiless and producer prelude (review r1, F2).
+        // Before the bodiless and producer prelude.
         let poll = Poller::new(stop).ok_or(Stopped)?;
         if bodiless_too
             && self.bodiless.contains(&fact)
@@ -3108,7 +3108,7 @@ mod tests {
 
     /// A poller shared by several searches (one per parallel task: the support sets'
     /// one-step searches) stops one; every later search on it scans nothing, not even the
-    /// first scan it would open (sol-loop r4, R4-1).
+    /// first scan it would open.
     #[test]
     fn a_search_on_a_stopped_poller_scans_nothing() {
         // (?x 12 ?y), (?y 12 ?z) -> (?x 13 ?z), asked for (1 13 2): 5,000 facts (1 12 y) and
@@ -3151,7 +3151,7 @@ mod tests {
         );
     }
 
-    /// REAS-2 fix check r2 (R3-F2, SW143). Spec (design note, rule 2 completed: a parallel
+    /// REAS-2 (SW143). Spec (a parallel
     /// pass over tasks that can stop is a fallible pass, and no task starts after one has
     /// failed): a round's morsels end at the operation's stop. One job over 16 morsels of
     /// drivers, on a one-thread pool, the stop firing (a) as the first morsel makes its poller

@@ -70,8 +70,8 @@ impl ReadScope {
     /// update entry point returns through, naming itself (`_entry`: each has a row in the
     /// table that checks this boundary, [`EntryPoint`]). A reader of every graph is told
     /// everything; a reader of some, a memory refusal's kind and limit but not the bytes held
-    /// and asked for, which a scan or a view of graphs it may not read can size (round 13,
-    /// R13-diag).
+    /// and asked for, which a scan or a view of graphs it may not read can
+    /// size.
     pub(crate) fn told<T>(&self, _entry: EntryPoint, result: StoreResult<T>) -> StoreResult<T> {
         match result {
             Err(error) if !self.reads_everything() => Err(error.without_amounts()),

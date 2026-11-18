@@ -446,7 +446,7 @@ fn walk_by_subject_on(
 /// A walk that fits its budget is answered, however its parts start: two parallel parts of
 /// one group each, whose merge appends that one group, need about 2 KiB with their slab,
 /// and under 32 KiB they are answered with the group's whole count. The room a part asks
-/// for ahead is optional (D16-039, package review r1 SC-R1-01): none of it may refuse the
+/// for ahead is optional: none of it may refuse the
 /// merge.
 #[test]
 fn a_walk_in_parts_that_fits_its_budget_is_answered() {
@@ -459,7 +459,7 @@ fn a_walk_in_parts_that_fits_its_budget_is_answered() {
 /// Parts of uneven size, as the parts of a real walk are: one of a single group, one of 513.
 /// Grown as the groups come, they peak near 26 KiB with their merge and slab, and under
 /// 32 KiB the walk is answered: no part's room asked ahead and left unfilled may take the
-/// merge's (package fix check r2: a part held 16 KiB for one group, and the merge of 514 was
+/// merge's (a part held 16 KiB for one group, and the merge of 514 was
 /// refused).
 #[test]
 fn a_walk_in_uneven_parts_that_fits_its_budget_is_answered() {
@@ -479,7 +479,7 @@ fn a_walk_in_uneven_parts_that_fits_its_budget_is_answered() {
 }
 
 /// A walk leaves nothing charged once its groups are dropped, answered or refused: its parts,
-/// their growth and the merge's are all released (package fix check r2).
+/// their growth and the merge's are all released.
 #[test]
 fn a_walk_releases_every_charge_answered_or_refused() {
     let part = super::GROUP_PART as u64;
@@ -495,7 +495,7 @@ fn a_walk_releases_every_charge_answered_or_refused() {
     assert_eq!(held, 0, "a refused walk's charges");
 }
 
-/// A walk is refused only where the serial walk would be (package fix check r3). Two parts of
+/// A walk is refused only where the serial walk would be. Two parts of
 /// 16,385 disjoint groups each, under 1.5 MiB: grown in parallel, each holds capacity 32,768
 /// (1 MiB together) and the merge's 32,770 groups need 32 bytes more than is left; the serial
 /// walk, one buffer doubling to 65,536 beside its 32,768, peaks at exactly 1.5 MiB and fits.
@@ -516,7 +516,7 @@ fn a_walk_the_serial_walk_fits_is_answered() {
     assert_eq!(held, 0);
 }
 
-/// The path is the whole walk's (package fix check r4). Two runs under 6,291,584 bytes: the
+/// The path is the whole walk's. Two runs under 6,291,584 bytes: the
 /// first, 131,072 keys in two parts of 32,769 disjoint groups each, fits its parts' peak
 /// exactly; its merge leaves the output at capacity 65,538, from which the second run's
 /// 131,075 groups, walked serially, double to a growth 16 bytes past the limit. The fully
@@ -636,7 +636,7 @@ fn a_walk_of_few_groups_is_walked_serially() {
 /// A walk grouped by graph on a layout of the default graph alone (a graph-first plan
 /// adapted to graph-last) is one group, the default graph's, walked without parts: it adds
 /// no group to the estimate, so a snapshot's other stacks decide alone whether the walk
-/// goes in parts (GS-R2-02).
+/// goes in parts.
 #[test]
 fn a_default_graph_walk_by_graph_adds_no_group_to_the_estimate() {
     let rows = 2 * super::GROUP_PART as u64;

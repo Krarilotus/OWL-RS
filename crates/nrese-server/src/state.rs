@@ -574,7 +574,7 @@ mod tests {
         assert!(default.is_started(), "the default repository's state");
     }
 
-    /// DC-07 S1 (Sol, round 1): the system store takes the default store's memory policy.
+    /// DC-07: the system store takes the default store's memory policy.
     /// With the limit switched off (0) it needs no reading, so a server whose memory can't
     /// be read, and whose limits are all 0, opens its system store too.
     #[test]

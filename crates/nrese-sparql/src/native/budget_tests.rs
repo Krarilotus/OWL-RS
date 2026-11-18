@@ -123,7 +123,7 @@ const PLAN_BOOKKEEPING_BYTES: usize = 640;
 /// (19 Oct: about 122 bytes a column, the same at two chunks and at sixteen).
 const COLUMN_BOOKKEEPING_BYTES: usize = 128;
 
-/// Sol's case (review of 2b6ddbb7): 100 statements in two listed graphs under one-byte
+/// 100 statements in two listed graphs under one-byte
 /// request and server budgets, `LIMIT 100` refused with nothing left charged. And
 /// measured, beyond the engine's own scan or probes, with the inputs made inside the
 /// measurement: a streamed LIMIT over the merge holds exactly as much uncharged for 10,000
@@ -340,7 +340,7 @@ fn merged_graph_reads_hold_no_more_than_they_charge() {
     }
 }
 
-/// Guard (PR #84's timing, notes/2026-11-02-zero-width-budget.md ZW-10): one solution without
+/// Guard (PR #84's timing): one solution without
 /// bindings counts nothing, so making and consuming it, as an empty group does once per row
 /// of a substituted EXISTS, never draws on the query's budget: its peak stays where it was.
 /// Two such rows count one id, charged where they are made and released where they are
@@ -373,15 +373,15 @@ fn a_solution_without_bindings_draws_nothing_from_the_budget() {
     assert_eq!(ctx.budget.used(), held);
 }
 
-/// Spec (notes/2026-11-02-exec-memory-stack.md EMS-2): what a table is charged is what its
+/// Spec: what a table is charged is what its
 /// consumer releases. One solution without bindings counts nothing, so an operator that gives
 /// such a row a column, in place or in a table it makes of it, charges that column, or
 /// consuming its answer releases another holder's charge: a projection's UNDEF column, a
 /// union's widening, GRAPH ?g's column, a BIND's column, LATERAL's put-in column, and
-/// SERVICE ?e's endpoint column (that one on any width: sol-loop r1 S1). Each pattern is
+/// SERVICE ?e's endpoint column (that one on any width). Each pattern is
 /// evaluated with another holder's charge on the query's budget; after its answer is
 /// consumed the budget holds at least that much again. Every term the cases name is
-/// stored, so no computed term's kept charge covers a release (sol-loop r2 S2).
+/// stored, so no computed term's kept charge covers a release.
 #[test]
 fn a_column_given_to_a_row_without_columns_is_charged() {
     use crate::{ServiceCall, ServiceClient, ServiceResults, Services};
@@ -456,9 +456,9 @@ fn a_column_given_to_a_row_without_columns_is_charged() {
     assert!(failures.is_empty(), "{}", failures.join("; "));
 }
 
-/// Spec (sol-loop r3 S2; the budget types' owner, 3 Nov): under a 4 KiB envelope no grant
-/// holds spare, so CONSTRUCT's two grants (the copies it keeps to emit a triple once, and
-/// the triples) charge exactly and answer its one triple, never refused for spare.
+/// Spec: under a 4 KiB envelope no grant holds spare, so CONSTRUCT's two grants (the
+/// copies it keeps to emit a triple once, and the triples) charge exactly and answer its
+/// one triple, never refused for spare.
 #[test]
 fn construct_under_a_small_envelope_is_never_refused_for_spare() {
     let engine = store([]);
@@ -527,13 +527,13 @@ fn path_held(
     })
 }
 
-/// Guard (the executor memory stack's package fix check r3, EMS-R3-C1, and its related
-/// sites): a path's buffers hold no more than they are charged at any moment, so a query
+/// Guard: a path's buffers hold no more than they are charged at any moment, so a query
 /// sharing the server's budget can never take the room of memory that still lives. Each
 /// case runs at `rows` and at `more` rows, and the most it held beyond its charge may not
 /// grow by a byte a row it adds: what grows with the rows is charged throughout (what doesn't
-/// is the plan's bookkeeping, the same at both sizes). `case` makes the store for a size and
-/// names the path pattern, `limit` the request's limit at that size.
+/// is the plan's bookkeeping, the same at both sizes).
+/// `case` makes the store for a size and names the path pattern, `limit` the request's limit
+/// at that size.
 fn holds_nothing_uncharged_per_row(
     name: &str,
     (rows, more): (usize, usize),
@@ -565,9 +565,9 @@ fn rows_of(rows: Result<usize, String>, n: usize) -> Result<(), String> {
     }
 }
 
-/// Spec (EMS-R3-C1 and the sites the package fix check r3 named beside it): every row-sized
-/// buffer of a path is charged while it lives, through the move into its table and through a
-/// refusal. Cases, each at two sizes:
+/// Spec: every row-sized buffer of a path is charged while it lives, through the move into
+/// its table and through a refusal.
+/// Cases, each at two sizes:
 /// - `<h> (p|missing) ?y` over 2^k + 1 statements (T1): the union's vector has room for 2^(k+1)
 ///   ends; moved into its column, its whole capacity stays charged (it was released down to
 ///   its length, then charged again, at 6449d5cd).
@@ -695,7 +695,7 @@ fn a_paths_buffers_are_charged_while_they_live() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Spec (sol-loop r1 S1 of the executor memory stack's second lead): a path with both ends
+/// Spec: a path with both ends
 /// bound answers as many solutions as it connects the ends ways, a table without columns of
 /// that many rows, charged before its rows are made. Over `a p a`, 64 steps of `(p|p)`
 /// connect `a` to `a` 2^64 ways, saturated to `usize::MAX`: refused at once, within its
@@ -755,9 +755,9 @@ fn query_held(engine: &Engine, query: &str, limit: usize) -> (Result<usize, Stri
     )
 }
 
-/// Spec (the code-quality triage's S-03, carrier E4; the executor memory stack's fix check r4,
-/// R4-F1): a closure's quadratic structures are charged before they are allocated, so a
-/// request whose limit they don't fit is refused while it holds little. Under a 1 MiB limit:
+/// Spec: a closure's quadratic structures are charged before they are allocated,
+/// so a request whose limit they don't fit is refused while it holds little.
+/// Under a 1 MiB limit:
 /// - `?s p+ ?o` over a 1,024-node cycle: 1,048,576 pairs, 16 MiB of them;
 /// - over a 2,048-node chain: its reach sets, 2,098,176 ids (8 MiB), before its 2,096,128
 ///   pairs;
@@ -854,7 +854,7 @@ fn a_closures_buffers_are_charged_while_they_live() {
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// Spec (the graph closure package's review r1, R1-F1): a closure searched from a bound end
+/// Spec: a closure searched from a bound end
 /// charges what it holds while it searches (the nodes seen, the order, the frontiers), so a
 /// request whose limit they don't fit is refused while it holds little. Over a 131,072-node
 /// chain under a 1 MiB limit, the search reaches every node:

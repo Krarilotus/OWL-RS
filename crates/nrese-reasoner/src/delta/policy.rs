@@ -106,7 +106,7 @@ fn equality_region<B: Base + ?Sized>(
     equalities: impl Iterator<Item = Triple>,
     poll: &Poller<'_>,
 ) -> Result<Option<(HashSet<u64>, u64, u64)>, Stopped> {
-    // Its first stopped read ends the walk (fix check r1, rule 2: a stopped scan read as no
+    // Its first stopped read ends the walk (a stopped scan read as no
     // more members kept the queue going).
     let mut terms: HashSet<u64> = HashSet::new();
     let (mut facts, mut dred) = (0u64, 0u64);

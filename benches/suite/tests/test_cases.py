@@ -78,7 +78,7 @@ class Mistakes(unittest.TestCase):
             ({"workload": "watdiv"}, "workload 'watdiv'"),
             ({"home_turf": "rdfox"}, "home_turf 'rdfox'"),
             ({"levels": ["nightly"]}, "levels"),
-            # The master's decision of 11 Nov on IB1347, 1a: a baseline (base or main) and the capability it lacks.
+            # Decided on 11 Nov (IB1347, 1a): a baseline (base or main) and the capability it lacks.
             ({"absent": {"cand": "supported inference"}}, "absent: a baseline (base, main) and the capability"),
             ({"absent": {"main": ""}}, "absent: a baseline (base, main) and the capability"),
             # A case declares only phases its classifier tool prints (README.md, what the tool can resolve).

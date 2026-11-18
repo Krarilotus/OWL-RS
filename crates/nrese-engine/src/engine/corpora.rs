@@ -25,8 +25,8 @@
 //! ([`worth_deriving`], [`CorpusTuning::documents_per_probe`]), or the lineage doesn't
 //! reach one, the corpus is walked again.
 //!
-//! Memory is the memory-accounting owner's ([`nrese_exec::ChargedVec`],
-//! [`nrese_exec::Reservation`]), charged before it is allocated. What the store keeps is
+//! Memory is accounted for with [`nrese_exec::ChargedVec`] and
+//! [`nrese_exec::Reservation`], charged before it is allocated. What the store keeps is
 //! charged to its budget ([`crate::Engine::set_text_corpus_budget`]; at first
 //! [`DEFAULT_READER_CORPUS_BYTES`]): a kept corpus's members (built on it, so nothing moves
 //! between budgets), each entry's key and each lineage step; a kept corpus an evicted
@@ -36,8 +36,8 @@
 //! (the bits, the walk's counts, the probes' list). The budget is the only bound on how
 //! many corpora and steps are kept.
 //!
-//! Only a published snapshot, or a restriction of one, changes the store (the dictionary
-//! lifecycle's S3: its [`super::snapshot::CorpusAdmission`], from its `SharedState`): it makes it,
+//! Only a published snapshot, or a restriction of one, changes the store (published-only
+//! admission: its [`super::snapshot::CorpusAdmission`], from its `SharedState`): it makes it,
 //! claims, evicts, keeps, abandons; only a successful publication records a step. Any other
 //! snapshot (a writer's pending state, a view that adds facts) builds for its search alone,
 //! derived from a kept corpus where that corpus's runs are its own runs' prefix
@@ -256,7 +256,7 @@ fn key_bytes(kind: KindRef<'_>) -> usize {
 /// Whether a corpus of `documents` in `model`, read with `equality`, may expand equality
 /// classes of IRIs (as `Snapshot::corpus_classes` does where a class of two or more
 /// exists): then a statement about a blank node or literal of a class changes the
-/// membership of the class's IRIs (sol-loop r1 R1-S1).
+/// membership of the class's IRIs.
 fn reads_classes(documents: Documents, model: ReadModel, equality: Option<TermId>) -> bool {
     documents == Documents::Subjects && model != ReadModel::Asserted && equality.is_some()
 }
@@ -272,7 +272,7 @@ struct Step {
     predicates: Vec<u64>,
     /// Whether `touched` holds every subject, not only the IRIs: recorded while a corpus
     /// that reads equality classes is kept, and needed by one to derive across this step
-    /// (sol-loop r2 P1, `dictlc-p32-count4`: holding them always cost a commit of blank-node
+    /// (`dictlc-p32-count4`: holding them always cost a commit of blank-node
     /// statements 5 % more).
     subjects: bool,
     _charges: [Reservation; 2],
@@ -341,7 +341,7 @@ const BLANK: u64 = TermKind::BlankNode as u64;
 /// subject if an IRI, or of any kind with `subjects`. A blank node's or literal's class can
 /// hold IRIs, which a reader of equality classes shows as subjects of the statement: the
 /// derivation expands each term to its class and keeps the identities the corpus's
-/// documents hold (sol-loop r1 R1-S1). No other corpus holds them.
+/// documents hold. No other corpus holds them.
 fn terms(
     subject: TermId,
     object: TermId,
@@ -661,7 +661,7 @@ impl CorpusStore {
     /// nearest kept ancestor's corpus and the terms touched since (collected on `request`,
     /// the searching request's budget) where the lineage has one; none past a step that
     /// changed a `sameAs` statement the reader expands. Only a published snapshot (or a
-    /// restriction of one) is admitted (contract S3): it may claim an entry and evict.
+    /// restriction of one) is admitted (published-only admission): it may claim an entry and evict.
     pub(crate) fn find(
         &self,
         admitted: &CorpusAdmission<'_>,
@@ -858,15 +858,15 @@ impl CorpusStore {
     /// `with_run` build a pending state: the base's runs and one more), the longest such,
     /// and the terms of every run past the prefix (inserts and tombstones), collected on
     /// `request`. `None`: walk. Reads the store only; nothing is claimed, moved, charged to
-    /// the store or evicted (contract S3). The caller's derivation probes each touched term
+    /// the store or evicted. The caller's derivation probes each touched term
     /// in its own snapshot, so the result is exact whatever the runs hold.
     ///
     /// A `private` version (a private transaction's, V3) has an equality cell of its own
     /// whatever it changes, so it is not asked to share the base's: its classes are the
     /// base's where its extra runs hold no `sameAs` statement, checked below in both stacks
     /// (the classes read the default graph's `sameAs` statements of both; equality.rs), and
-    /// otherwise it walks. Every other version keeps the cell check (condition c: a
-    /// restricted or adding view has a fresh cell and a fresh content; DICT2 9 Nov 04:02).
+    /// otherwise it walks. Every other version keeps the equality-cell check: a
+    /// restricted or adding view has a fresh cell and a fresh content.
     pub(crate) fn derive_unadmitted(
         &self,
         version: &Arc<Version>,
@@ -981,7 +981,7 @@ mod tests {
         Corpus::finish(&bits, 64, budget)
     }
 
-    /// Sol-loop r2 R2-S1: a search builds its corpus on the store's budget; meanwhile the
+    /// A search builds its corpus on the store's budget; meanwhile the
     /// budget is set anew (every entry let go) and another search makes the same entry on
     /// the new one. What the first built is charged to the old budget: it serves that
     /// search, and the new entry stays for a corpus on the new budget.
@@ -1010,7 +1010,7 @@ mod tests {
         );
     }
 
-    /// Sol-loop r2 R2-S2: the lineage's map and order keep their storage when steps go;
+    /// The lineage's map and order keep their storage when steps go;
     /// that storage stays charged while it is held. 1,000 steps from a kept corpus, then a
     /// corpus kept at the last version: every step leads nowhere and goes, the storage
     /// stays. Oracle: the storage `std` reports (capacity times entry size, a lower bound).

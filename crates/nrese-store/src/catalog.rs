@@ -300,7 +300,7 @@ impl Repository {
     }
 
     /// Its settings and its write path as one observation: both before a change or both
-    /// after it, never one of each (C1001-R1-O1). Lock order, here and in `Self::publish`:
+    /// after it, never one of each. Lock order, here and in `Self::publish`:
     /// the write path, then the settings.
     pub fn observe(&self) -> (RepositorySettings, Arc<MutationPipeline>) {
         let pipeline = self.pipeline.read();
@@ -1118,8 +1118,8 @@ mod tests {
         }
     }
 
-    /// A change of reasoning publishes its settings and its write path together
-    /// (C1001-R1-O1): a reader, just before the change publishes its settings, sees the old
+    /// A change of reasoning publishes its settings and its write path together:
+    /// a reader, just before the change publishes its settings, sees the old
     /// reasoning beside the old settings, never the new write path beside the old settings.
     /// Red without the fix, which published the write path first.
     #[test]
@@ -1172,7 +1172,7 @@ mod tests {
 
     /// A removal whose tombstone can't be removed (held or protected; a failed sync of the
     /// directory too) keeps the id taken: a repository created under it would be reclaimed
-    /// by the next start, its acknowledged writes with it (Sol, r2 of the store lifecycle).
+    /// by the next start, its acknowledged writes with it.
     /// After a start has removed the tombstone the id is free, and what is written to the new
     /// repository stays across restarts.
     #[test]
@@ -1226,7 +1226,7 @@ mod tests {
         assert!(String::from_utf8(answer.payload).unwrap().contains("true"));
     }
 
-    /// A tombstone unlinked without the directory sync (R3-1, Sol r3 of the store lifecycle):
+    /// A tombstone unlinked without the directory sync:
     /// its absence isn't durable, and a restart doesn't make it so. A creation of the id after
     /// a restart, with the directory still unsyncable, is refused (a crash could bring the
     /// tombstone back, and the next start would reclaim the new repository). Once the
@@ -1295,7 +1295,7 @@ mod tests {
 
     /// A repository whose store became unavailable after it opened (here: namespaces written
     /// but not made durable) is unavailable wherever the catalogue is asked: not served,
-    /// not listed as serving, listed unavailable with why (Sol, r2 of the store lifecycle).
+    /// not listed as serving, listed unavailable with why.
     #[test]
     fn a_repository_whose_store_became_unavailable_is_not_served() {
         use super::RepositorySettings;

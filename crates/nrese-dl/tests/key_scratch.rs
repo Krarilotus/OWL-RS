@@ -1,4 +1,4 @@
-//! Guard of a key's scratch (`tableau::keys`; PR #48's review, F1, and its fix check): the
+//! Guard of a key's scratch (`tableau::keys`; PR #48): the
 //! pairs a key tries are enumerated, not stored, so evaluating it holds memory linear in its
 //! members, not in their pairs, and what it holds is what it is charged. Measured with a
 //! counting allocator, so this file is a test binary of its own.
@@ -35,7 +35,7 @@ fn shared_target(members: u64) -> Ontology {
     o
 }
 
-/// The fix check's witness: `HasKey(A (R₁ … Rₖ) ())` with each Rⱼ transitive and one
+/// The witness: `HasKey(A (R₁ … Rₖ) ())` with each Rⱼ transitive and one
 /// A-individual `a` with Rⱼ(a, a), so `a` holds the one name of each Rⱼ's group, a list each.
 fn self_reaching(properties: u64) -> Ontology {
     let mut o = Ontology::default();

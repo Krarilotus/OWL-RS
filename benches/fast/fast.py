@@ -57,7 +57,7 @@ from suitekit.compare import (KEPT_POINTS, UNSTABLE_PEAK, bootstrap_ratio, clien
                               compare_reports, counter_changes, load_report, peak_spread, pooled,
                               process_peak, series_ratios, spread, statistic, thin)
 # Every record says the generation of its timing units (compare.units_check() normalises or refuses
-# a mix; fix check r2 of pkg/declared-metrics).
+# a mix).
 from suitekit.compare import SERIES_UNITS  # noqa: E402
 from suitekit.workloads import fast_data_name  # noqa: E402
 from suitekit import ns  # noqa: E402
@@ -655,10 +655,10 @@ def ensure_data(spec: str) -> dict:
         # Into the shared volume whole, one job at a time per host (FAST_LOCK): another job may
         # be reading or making the same file. It is its parts' as they are now: their SHA-256 lie
         # beside it (TARGET.parts, a sidecar, prepared and shared with it), and one made from other
-        # bytes, here or by another gate through the shared index, is made again (Sol, PR #64 r1
-        # F1: a part restored to its freeze left the concatenation of its altered bytes). The old
+        # bytes, here or by another gate through the shared index, is made again (PR #64: a part restored to its freeze left the concatenation of its altered bytes).
+        # The old
         # sums go before the new file and the new sums last, so a making killed at any step leaves
-        # a file without sums, made again (Sol, gate-input-provenance r1: killed between the file
+        # a file without sums, made again (killed between the file
         # and its sums, the old sums stood beside the new file, and matched once the part was
         # restored). A failed making leaves nothing beside it (a TARGET.* there is a sidecar).
         part = f"{target}.{ns.name('part', ROOT)}"
@@ -949,8 +949,8 @@ def shacl_report_counts(text: str) -> dict[str, int] | None:
     """A SHACL validation report's (N-Triples, as nrese-rdf-io writes it) sh:value and
     sh:resultPath triples: its results' values and paths (SHACL 1.0 §5.3.2). Records end only at
     a physical newline: the writer escapes every control character in a literal (ntriples.rs
-    `quoted`), but not U+2028, U+2029 or U+0085, at which str.splitlines() would also split (fix
-    check r1 W). None: a record that isn't N-Triples as written, counts unknown, never guessed."""
+    `quoted`), but not U+2028, U+2029 or U+0085, at which str.splitlines() would also split.
+    None: a record that isn't N-Triples as written, counts unknown, never guessed."""
     values = paths = 0
     for record in text.split("\n"):
         if not record.strip(" \t\r") or record.lstrip(" \t").startswith("#"):
@@ -966,7 +966,7 @@ def shacl_report_counts(text: str) -> dict[str, int] | None:
 def shacl_report_reading(path: Path) -> tuple[dict[str, int] | None, str]:
     """An invocation's SHACL report's counts (shacl_report_counts()), or None and why they're
     unknown: every way of not getting them (none written, not UTF-8, a failed read, not N-Triples
-    as written) is the one unreadable state, never an exception out of measure() (fix check r3)."""
+    as written) is the one unreadable state, never an exception out of measure()."""
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -1063,7 +1063,7 @@ def measure(case: dict, label: str, rep: int, expect: dict, alt_expect: dict, da
                     counts, why = shacl_report_reading(report_nt)
                     if counts is None:
                         # Couldn't be read, not "not reported": its checks fail whatever --routes says
-                        # (fix check r2: check() left an absent value unchecked without routes).
+                        # (check() left an absent value unchecked without routes).
                         why += ": values and paths not counted"
                         record["notes"].append(why)
                         result["_unreadable"] = {"shacl.values": why, "shacl.paths": why}
@@ -1318,7 +1318,7 @@ def timed_metric(case: dict) -> str:
     return metric
 
 
-# "Loaded and ready" (D16-606, the orchestrator's decision of 14 Nov 2026): a load case's load plus
+# "Loaded and ready" (D16-606, decided on 14 Nov 2026): a load case's load plus
 # the planner statistics the load command builds before it returns (perf_lab's `statistics_ms`,
 # timed apart from `load_s`, which stays as it is), where the side reports such a build; a side
 # without one (main's has no such step) is ready when loaded. Compared against main only: base's
@@ -1408,7 +1408,7 @@ def same_taxonomy(case: dict) -> str | None:
 
 # The endpoint's classification (tool `endpoint-classify`): a fresh server per process, the case's
 # data loaded by the Graph Store Protocol, then one `GET /dataset/classification`, timed. Every
-# side's server gets this environment and no other NRESE setting (as the DL lead's endpoint
+# side's server gets this environment and no other NRESE setting (as the DL endpoint
 # measurement, 14 Nov 2026): an in-memory store without reasoning, limits wide enough for the case.
 ENDPOINT_ENV = {"NRESE_STORE_MODE": "in-memory", "NRESE_REASONING_MODE": "disabled",
                 "NRESE_QUERY_TIMEOUT_MS": "300000", "NRESE_GRAPH_WRITE_TIMEOUT_MS": "300000",
@@ -1678,7 +1678,7 @@ def cold_ms(result: dict) -> float | None:
 def ms_scale(metric: str) -> float:
     """The factor from a metric's declared unit to the milliseconds every timed series and metric value
     is in: a field in seconds (its last name ends in `_s`: load_s, open_s, commits.whole_s) times 1000,
-    anything else as it is (review r1 of pkg/declared-metrics, R1-F1: `commits.whole_s` reached the
+    anything else as it is (`commits.whole_s` reached the
     series in seconds, under the comparison's 2 ms floor)."""
     return 1000.0 if metric.rsplit(".", 1)[-1].endswith("_s") else 1.0
 
@@ -1744,7 +1744,7 @@ def samples(case: dict, result: dict) -> dict:
     runs = result.get("_repeats", [result])
     # A section's samples are its own latency: they stand for the metric only where the metric is
     # that latency's median (`SECTION.p50_ms`). Another field of it (a read latency, a p99, a max) is
-    # its own value, per process below (the orchestrator, 7 Nov 2026: C1's `commits.read_p50_ms` was
+    # its own value, per process below (7 Nov 2026: C1's `commits.read_p50_ms` was
     # timed by its commits' samples, and a 2,500-fold read slowdown was in no hypothesis).
     if metric == f"{section}.p50_ms" and isinstance(result.get(section), dict) and "samples_ms" in result[section]:
         return {"_": [s for r in runs for s in (r.get(section) or {}).get("samples_ms", [])]}
@@ -1851,8 +1851,8 @@ def case_inputs(case: dict) -> dict[str, str | None]:
     taxonomy, each concatenation), each resolved by data_file() as the run reads it; None where it
     isn't there or can't be read here (the Docker runtime's volume, a kind nothing resolves). From
     FAST_DATA/PREPARED.json where it holds the file unchanged, else hashed once a run. A record
-    carries them so that a comparison can tell runs of the same input from others (compare.input_check();
-    review r1 R1-W1 and fix check r2 of pkg/stage-data, 7 Nov 2026)."""
+    carries them so that a comparison can tell runs of the same input from others
+    (compare.input_check())."""
     from suitekit import inputs
     if "prepared" not in _DIGESTS:
         try:
@@ -1863,9 +1863,9 @@ def case_inputs(case: dict) -> dict[str, str | None]:
     keys = inputs.declared(case)
     for key in sorted(k for k in keys if inputs.kind(k) != "concat"):
         out[key] = loaded_digest(key)
-    # A concatenation loads its parts in its order: the same parts in another order are other bytes
-    # (sol-loop r3 V2). Its fingerprint: its parts in order, each by its input's hash (a generated part
-    # by its spec), keyed by the concatenation itself (sol-loop r4 W1).
+    # A concatenation loads its parts in its order: the same parts in another order are other bytes.
+    # Its fingerprint: its parts in order, each by its input's hash (a generated part
+    # by its spec), keyed by the concatenation itself.
     for spec in sorted(k for k in keys if inputs.kind(k) == "concat"):
         parts = []
         for part in spec[len("concat:"):].split("+"):
@@ -1902,7 +1902,7 @@ def loaded_digest(key: str) -> str | None:
         try:
             _DIGESTS[cache] = was["sha256"] if same and was.get("sha256") else file_digest(path)
         except OSError:
-            return None  # there but unreadable: unknown, and the run goes on (sol-loop r5 X2)
+            return None  # there but unreadable: unknown, and the run goes on
     return _DIGESTS[cache]
 
 

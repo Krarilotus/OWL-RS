@@ -56,7 +56,7 @@ class DriverKind(unittest.TestCase):
 
     def test_a_second_run_into_the_same_results_imports_only_its_own_rows(self):
         """Spec: suitekit/schema.py, a row per measured step: a run's results.csv holds each
-        run's rows once (fix round r1 S1: kits append to their results.csv)."""
+        run's rows once (kits append to their results.csv)."""
         with tempfile.TemporaryDirectory() as tmp:
             results = Path(tmp)
             writes = ("import pathlib, sys; from suitekit.schema import Result, Writer; "

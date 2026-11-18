@@ -78,12 +78,12 @@ def side(record: dict) -> dict:
 
 
 class QueryRefusal(unittest.TestCase):
-    """Spec: D16-596 (master, 14 Nov 2026): a refused query is no wrong answer, and it must stay as
+    """Spec: D16-596 (14 Nov 2026): a refused query is no wrong answer, and it must stay as
     visible as one: a failed run (fast.not_as_expected), a failed smoke check (abba.record_check),
     a failed candidate in the release gate (release_gate.state `failed`: gate() lists it, the
-    release verdict is NOT PASSED), whatever the case declares. Review r1: F1 (a declared limit
-    accepted it), F2 (it hid another failure), F3 (other errors taken for it), F4 (suite rows);
-    review r2: G1 (another declared failure hid it), G2 (the gate called it a wrong answer)."""
+    release verdict is NOT PASSED), whatever the case declares. Where it was lost: a declared limit
+    accepted it, it hid another failure, other errors were taken for it, the suite's rows called
+    it wrong, another declared failure hid it, and the gate called it a wrong answer."""
 
     def test_a_refused_query_is_its_own_status_never_a_wrong_answer(self):
         self.assertEqual(measured_with(None)["status"], "ok")  # the same case, answered: right
@@ -109,7 +109,7 @@ class QueryRefusal(unittest.TestCase):
                 self.assertEqual(record["status"], REFUSED)
 
     def test_another_failure_decides_the_status_and_the_refusal_still_fails_the_run(self):
-        # Review r2 G1: the refusal can't hide behind another failure that the case declares
+        # The refusal can't hide behind another failure that the case declares
         # (geo4-relations declares `wrong`; support-ladder-256 a process stopped at its limit).
         catalog = cases.load()
         runs = [(f"another query wrong, {outcome} declared", "wrong",
@@ -131,7 +131,7 @@ class QueryRefusal(unittest.TestCase):
                 self.assertEqual(list(record.get("refused", {})), ["count"])
 
     def test_the_gate_says_a_refusing_side_refused_not_that_its_answer_is_wrong(self):
-        # Review r2 G2: a baseline that refused a query, otherwise right.
+        # A baseline that refused a query, otherwise right.
         why = rg.why_not(side(measured_with(REFUSALS[0])), "base")
         self.assertNotIn("wrong", why)
         self.assertIn("count refused at its memory limit", why)

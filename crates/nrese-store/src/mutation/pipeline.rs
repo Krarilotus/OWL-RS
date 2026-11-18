@@ -188,7 +188,7 @@ impl MutationPipeline {
         // which the rematerialisation checks a last time under the writer slot before it
         // commits, so retiring during this preflight changes nothing either.
         //
-        // The check that decides is the one under the transaction's writer slot (review r1, F1):
+        // The check that decides is the one under the transaction's writer slot:
         // a write that doesn't maintain the closure (a bulk load, `clear_inferred`) may clear
         // the certificate between the preflight and the slot. Then the slot goes back, the
         // closure is rematerialised, and the transaction is taken again.

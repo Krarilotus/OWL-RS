@@ -1,6 +1,6 @@
 """Release acceptance (benches/fast/release_gate.py verdict, w3c, guards; scripts/release-gate.sh):
 the gate passes only the exact candidate, with every required outcome present and only approved
-exceptions (Harness notes 2026-11-09-g1-release-acceptance-design.md).
+exceptions.
 
 The audit of 8 Nov 2026 (tests-tooling T01-T03; catalogue D16-130, D16-126, D16-125) found the
 final join pass a candidate it must refuse, each reproduced on engine-v2 3a4e0a21e:
@@ -86,7 +86,7 @@ def receipt(kind: str, commit: str, tree: str, **changes) -> dict:
     """A check's receipt as release_gate.py w3c/guards --run write it: every unit the contract
     requires launched once and run whole."""
     units = [kit.name for kit in contract()[1]] if kind == "w3c" else ["guards"]
-    # The attempt where the receipt type holds one: on the code before attempts (the red of fix check r2)
+    # The attempt where the receipt type holds one: on the code before attempts (where this test was red)
     # the join then reads its own receipts, and shows what it accepts, not a receipt it can't read.
     attempt = {"attempt": ATTEMPT} if "attempt" in gate_module.CheckReceipt._fields else {}
     return {"kind": kind, "commit": commit, "tree": tree, "dirty": False, "identity": IDENTITY,
@@ -222,7 +222,7 @@ class CandidateJoin(Scratch):
 
     def test_the_candidate_s_own_evidence_passes_under_any_commit_of_its_tree(self):
         # Guard (the positive side; red on the parent only for want of --candidate): a verdict belongs
-        # to a tree (rule.owl-rs-results-keyed-by-tree): checks run at a merge commit of the candidate's
+        # to a tree: checks run at a merge commit of the candidate's
         # tree are the candidate's. A receipt whose commit isn't of the tree it names is refused.
         a = self.repo.commit(message="candidate A")
         merged = self.repo.same_tree(a)
@@ -236,7 +236,7 @@ class CandidateJoin(Scratch):
 
 
 class EvidenceContract(Scratch):
-    """Package review r1 R1: a check binds as the run the candidate's tree requires (its kits, suites
+    """A check binds as the run the candidate's tree requires (its kits, suites
     and guards), never by its own `passed`; the receipt proves that run."""
 
     def refused(self, name: str, w3c: dict, guards: dict, *named: str) -> None:
@@ -249,7 +249,7 @@ class EvidenceContract(Scratch):
             self.assertIn(text, done.stdout, name)
 
     def test_a_receipt_of_a_failed_or_unproven_run_is_refused_whatever_passed_says(self):
-        # Spec: review r1 R1, probes failed-kit, missing-summary, missing-hash, truthy-failed-result, and a
+        # Spec: probes failed-kit, missing-summary, missing-hash, truthy-failed-result, and a
         # unit launched twice: each result claims passed; each fails the candidate's contract, named.
         kit = contract()[1][0].name
         for name, change, text in (("failed-kit", {"exit": 101}, f"{kit}: exited 101"),
@@ -269,7 +269,7 @@ class EvidenceContract(Scratch):
             self.refused("a unit launched twice", w3c, guards, f"{kit}: launched 2 times")
 
     def test_a_partial_run_is_refused_its_missing_kits_suites_and_guards_named(self):
-        # Spec: review r1 R1, probe partial-kits-zero-guards: one of the seven kits, no guard ran.
+        # Spec: probe partial-kits-zero-guards: one of the seven kits, no guard ran.
         w3c, guards = checks("c", "t")
         w3c["receipt"]["outcomes"] = w3c["receipt"]["outcomes"][:1]
         del w3c["counts"]["OWL 2 RL"]
@@ -279,7 +279,7 @@ class EvidenceContract(Scratch):
                      "OWL 2 RL: no counts", f"{contract()[2][0]}: no test of that name ran")
 
     def test_the_producer_s_partial_expectations_never_pass_the_candidate(self):
-        # Spec: review r1 R1, probe generated-partial-w3c-final-verdict: `w3c --run` with an expectations
+        # Spec: probe generated-partial-w3c-final-verdict: `w3c --run` with an expectations
         # file declaring one kit writes a passing result and receipt at the candidate's own tree; the join
         # holds it to the candidate tree's seven kits.
         stub = "#!/usr/bin/env bash\necho 'test result: ok. 1 passed; 0 failed; 0 ignored'\n"
@@ -436,7 +436,7 @@ class KitOutcomes(Scratch):
         self.assertEqual(r["outcomes"][0]["log_sha256"], hashlib.sha256(log).hexdigest())
 
     def test_a_re_check_refuses_a_receipt_whose_logs_a_later_run_replaced(self):
-        # Spec: sol-loop r1 S1: a run passed and left its receipt; a later run stopped midway, having
+        # Spec: a run passed and left its receipt; a later run stopped midway, having
         # replaced w3c_owl2's log with a compile failure; a re-check (no --run) reads the logs as they are.
         done, _ = self.run_kits({"w3c_owl2_rl": self.RL_OK, "w3c_owl2": self.OK, "w3c_n3_reasoner": self.OK})
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
@@ -525,7 +525,7 @@ class GuardRun(Scratch):
                          f"SPEC the guard ran in {shell}")
 
     def test_a_launch_that_fails_leaves_no_earlier_result(self):
-        # Spec: review r1 R2, probes guards-launch-error and stale-guard-after-launch-error: a passed
+        # Spec: probes guards-launch-error and stale-guard-after-launch-error: a passed
         # guards.json from an earlier run, then a run that fails before it launches (its setup raises: the
         # guards' names can't be read): no result stands afterwards, never the earlier one.
         out = self.tmp / "guards.json"
@@ -539,7 +539,7 @@ class GuardRun(Scratch):
         self.assertFalse(out.exists(), f"SPEC the earlier passed result is gone\n{done.stdout}{done.stderr}")
 
     def test_the_guards_step_fails_when_its_checker_publishes_nothing(self):
-        # Spec: review r1 R2, probe exact-guards-shell-boundary: release-gate.sh's guards step, its checker
+        # Spec: probe exact-guards-shell-boundary: release-gate.sh's guards step, its checker
         # failing before it publishes, an earlier passed guards.json in its results: the step fails and no
         # earlier result stands.
         bash = shutil.which("bash")
@@ -563,9 +563,9 @@ class GuardRun(Scratch):
 
 
 class AttemptRecords(Scratch):
-    """Fix check r2, R2 (the orchestrator's design of 13:01): each check step writes a fresh attempt record
+    """Each check step writes a fresh attempt record
     first, its sequence its name (KIND.attempt.SEQUENCE.json, created exclusively; inside, a random id
-    and the tree; fix checks r2 and r3); its result and receipt carry that id; the verdict takes a
+    and the tree); its result and receipt carry that id; the verdict takes a
     result only of the newest record's id, and none from a history it can't order."""
 
     def attempt(self, kind: str, where: Path) -> str:
@@ -614,7 +614,7 @@ class AttemptRecords(Scratch):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
 
     def test_overlapping_attempts_never_hide_the_newest_behind_a_reused_sequence(self):
-        # Spec: fix check r3, R2 (check_ordering.py): attempt A scans the records, is descheduled before
+        # Spec: attempt A scans the records, is descheduled before
         # it records itself; B and then C record theirs, C's result is published; A resumes and records
         # its own. A's step never published. The verdict must refuse C's result: A's attempt is the newest.
         # Today A takes the sequence B already holds, C's stays highest, and the verdict passes, exit 0.
@@ -663,7 +663,7 @@ class AttemptRecords(Scratch):
         self.assertIn("guards:", done.stdout)
 
     def test_an_ambiguous_attempt_history_is_refused_at_any_position(self):
-        # Spec: fix check r3 (the 1, 1, 2 fixture): two records of sequence 1 under a third: the history
+        # Spec (the 1, 1, 2 fixture): two records of sequence 1 under a third: the history
         # doesn't order its attempts, so no result of it passes. Today only a doubled highest sequence
         # is refused; 1, 1, 2 passes, exit 0. Guard (no red on the code before, which reads no other
         # names): a name the verdict can't read, below the newest.
@@ -699,7 +699,7 @@ class AttemptRecords(Scratch):
             self.assertIn("guards.attempt.junk.json: not an attempt record's name", done.stdout)
 
     def test_an_attempt_never_takes_a_sequence_another_holds_and_its_tries_are_bounded(self):
-        # Spec: the orchestrator's design (fix check r3, item 1): a taken name sends an attempt to the next
+        # Spec: a taken name sends an attempt to the next
         # sequence; when every sequence it may try is taken, it refuses by name and records nothing.
         where = self.tmp / "taken"
         where.mkdir()
@@ -723,7 +723,7 @@ class AttemptRecords(Scratch):
                          [f"guards.attempt.00000000{n}.json" for n in (1, 2, 3)])
 
     def test_a_result_of_another_attempt_or_none_is_refused(self):
-        # Spec: the orchestrator's design, items 3 and 5, and 13:17: the result's own record, then a newer
+        # Spec: the result's own record, then a newer
         # one without its result (that attempt's producer never published); a result beside no record; a
         # malformed newest record; an attempt record with no result: each refused with its named reason.
         a = self.repo.commit()
@@ -770,7 +770,7 @@ def undeletable(path: Path):
 
 @unittest.skipUnless(os.name == "nt", "a reader that blocks deletion is Windows' (no delete sharing)")
 class ResultInvalidation(Scratch):
-    """Fix check r1, R2 (IB1223-a565): an earlier result that can't be removed is no run's result. The
+    """An earlier result that can't be removed is no run's result. The
     step fails before anything runs; the checker's failed removal is a crash (exit 3), never the judged
     result's 0 or 1."""
 
@@ -808,7 +808,7 @@ class ResultInvalidation(Scratch):
                                                                  REALGATE=GATE.as_posix(), PYTHONIOENCODING="utf-8"))
 
     def test_a_step_whose_earlier_result_can_t_be_removed_fails_and_runs_nothing(self):
-        # Spec: fix check r1, witness check_boundaries.py: a passed guards.json (w3c.json) of an earlier run,
+        # Spec: a passed guards.json (w3c.json) of an earlier run,
         # held by a reader without delete sharing; the step's checker can't publish (its names / expectations
         # can't be read). Today the step's rm fails silently, the checker exits 1 and the step accepts the
         # earlier file: exit 0, and the verdict passes on it. The step must fail, saying why.
@@ -826,7 +826,7 @@ class ResultInvalidation(Scratch):
                 self.assertIn(f"{name}: the earlier result", done.stdout + done.stderr)
 
     def test_a_locked_earlier_result_is_refused_by_the_verdict_after_its_step_fails(self):
-        # Spec: fix check r2, R2 (IB1254-0ebf; the orchestrator's design of 13:01 and 13:17): an earlier
+        # Spec (IB1254-0ebf): an earlier
         # complete passing result of this very candidate and its attempt record, both held by a reader
         # without delete sharing (the record too: a fixed-name record, replaced in place, could not be
         # renewed then); its step fails before anything runs; the actual verdict CLI on what the results
@@ -862,7 +862,7 @@ class ResultInvalidation(Scratch):
                 self.assertIn(f"{name}: stale result from an earlier attempt", judged.stdout)
 
     def test_the_checker_s_failed_removal_is_a_crash_not_a_judged_result(self):
-        # Spec: fix check r1: the checker exits 0 (passed) or 1 (not passed) only with its own published
+        # Spec: the checker exits 0 (passed) or 1 (not passed) only with its own published
         # result; an earlier result it can't remove exits 3.
         for name, args in (("guards", ["guards", "--run", "--identity", IDENTITY, "--attempt", ATTEMPT,
                                        "--names", "no-names", "--log", "test.log", "--json", "guards.json"]),
@@ -913,7 +913,7 @@ class Authority(Scratch):
             self.assertEqual(done.returncode, 1, f"SPEC out of scope: {policy}\n{done.stdout}")
 
     def test_an_exception_governs_its_wrong_answer_where_a_baseline_answers_right(self):
-        # Spec: sol-loop r1 S2: the candidate wrong, as the case declares, every baseline right. Without an
+        # Spec: the candidate wrong, as the case declares, every baseline right. Without an
         # exception: NOT PASSED, and the round alone never passes; with the owner's for that case and outcome:
         # PASSED, no other blocker left standing for the same outcome.
         def records_of(side, n):
@@ -949,7 +949,7 @@ class Authority(Scratch):
         self.assertEqual(done.returncode, 1, f"SPEC {other[:8]}'s exception doesn't cover {a[:8]}\n{done.stdout}")
 
     def test_a_limit_every_side_stops_at_is_named_never_silent(self):
-        # Guard (the master's decision 1 of 9 Nov; red on the parent only for want of --candidate): a
+        # Guard (decided on 9 Nov; red on the parent only for want of --candidate): a
         # declared capability limit (memory-limit) where every side stops is no wrong answer and no loss:
         # it passes, listed. One where a baseline completes blocks, as before.
         a = self.repo.commit()
@@ -988,7 +988,7 @@ def absence(side: str = "main", scope: str = 'cases = ["lab-olympics"]', by: str
 
 class DeclaredAbsence(Scratch):
     """A baseline that can't run a case (the release rehearsal of 11 Nov: main's measurement build
-    refuses 105 of the 172 cases, base's 57). The master's decision of 11 Nov on IB1347: a product
+    refuses 105 of the 172 cases, base's 57). Decided on 11 Nov (IB1347): a product
     gap is a fact the catalogue states with the case; a harness gap is accepted only by the owner's
     entry in the policy file; an undeclared refusal still blocks; the verdict counts, per baseline,
     what was compared and what is absent by product and by decision."""
@@ -1041,7 +1041,7 @@ class DeclaredAbsence(Scratch):
             self.assertIn("**not compared**: lab-olympics against main", done.stdout)
 
     def test_a_malformed_absence_is_a_policy_error_and_the_verdict_never_passes(self):
-        # Spec: decision 1b and review r1 C-1, F-2 (master, 11 Nov): an entry without by, approved, quote
+        # Spec: decision 1b (11 Nov): an entry without by, approved, quote
         # and source, without its port, with both scopes, or whose side isn't base or main (a list, a
         # table, a number, a boolean, another name) is a policy error: the verdict NOT PASSED, the entry
         # named, no crash; on rounds that otherwise pass, every side compared.
@@ -1061,7 +1061,7 @@ class DeclaredAbsence(Scratch):
             self.assertNotIn("Traceback", done.stderr)
 
     def test_a_case_the_candidate_fails_is_never_counted_as_compared(self):
-        # Spec: review r1 F-1 (master, 11 Nov): "N compared" counts only cases with an actual comparison;
+        # Spec: "N compared" counts only cases with an actual comparison;
         # the candidate failing lab-olympics (main absent by product) leaves base with none compared.
         catalog = [absent_case(main="supported inference")]
 
@@ -1132,7 +1132,7 @@ class Tradeoffs(Scratch):
     BROAD = (1.00, 1.08, 1.30)
 
     def test_a_round_that_showed_no_loss_neither_needs_nor_gives_cover(self):
-        # Spec: release-tradeoffs.toml, review load-peak-tradeoff r1 P-1: the bound is judged in the
+        # Spec: release-tradeoffs.toml: the bound is judged in the
         # rounds that showed the loss. An early broad round that didn't show it no longer sinks an
         # approval the later rounds confirm within its bound.
         done = self.verdict(self.entry(), losses=(self.BROAD, 1.08, 1.08))
@@ -1152,7 +1152,7 @@ class Tradeoffs(Scratch):
                 self.assertIn("**confirmed loss**: lab-olympics against", done.stdout)
 
     def test_a_trade_off_covers_a_loss_only_within_its_bound_in_every_round(self):
-        # Spec: review r1 R3, probe real-reports-tradeoff-8-percent-then-50-percent: an approval bounded
+        # Spec: probe real-reports-tradeoff-8-percent-then-50-percent: an approval bounded
         # at 1.12 with its win shown in both rounds; round 1's loss 8 %, round 2's 50 %: anything beyond
         # the bound blocks (PROTOCOL.md §5), whichever round shows it.
         done = self.verdict(self.entry(), losses=(1.08, 1.50))
@@ -1160,7 +1160,7 @@ class Tradeoffs(Scratch):
         self.assertIn("**confirmed loss**: lab-olympics against", done.stdout)
 
     def test_a_policy_file_of_another_shape_is_refused_never_read_as_none(self):
-        # Spec: review r1 (malformed input): `tradeoff = 1` raised TypeError; a [tradeoff] or [exception]
+        # Spec (malformed input): `tradeoff = 1` raised TypeError; a [tradeoff] or [exception]
         # table read as no entries. Each is an error naming its table, never an exception or an empty policy.
         for text in ("tradeoff = 1", '[tradeoff]\ncase = "x"\n', '[exception]\ncase = "x"\n', "exception = [1]"):
             with self.subTest(text):

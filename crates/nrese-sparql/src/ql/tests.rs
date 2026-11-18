@@ -110,7 +110,7 @@ fn equal_count_pending_witness_replacements_and_rollback_keep_the_published_prob
     let report = check(&pending, &options, &["<http://example.org/ann>"]);
     assert_eq!((report.patterns, report.realised, report.checks), (1, 0, 1));
     drop(tx);
-    // The pending read kept nothing (contract S3), so the published snapshot's own probe
+    // The pending read left the published probes unchanged, so the published snapshot's own probe
     // still answers: no check is asked again.
     let report = check(&engine.snapshot(), &options, &["<http://example.org/ann>"]);
     assert_eq!((report.patterns, report.realised, report.checks), (0, 1, 0));
@@ -118,7 +118,7 @@ fn equal_count_pending_witness_replacements_and_rollback_keep_the_published_prob
     assert_eq!((report.realised, report.checks), (1, 0));
 }
 
-/// Each entry the rewriting keeps for other operations (contract S3): its key, the asserted
+/// Each entry the rewriting keeps for other operations: its key, the asserted
 /// state its memberships were read at, and its TBox.
 fn kept_entries(ql: &QlRewriting) -> Vec<(SnapshotIdentity, AssertedIdentity, *const Tbox)> {
     let cached = ql.cached.lock().unwrap();
@@ -128,7 +128,7 @@ fn kept_entries(ql: &QlRewriting) -> Vec<(SnapshotIdentity, AssertedIdentity, *c
         .collect()
 }
 
-/// The probes the rewriting keeps for other operations (contract S3): the view they were
+/// The probes the rewriting keeps for other operations: the view they were
 /// asked of, and each probe with its truth value.
 fn kept_probes(ql: &QlRewriting) -> (Option<SnapshotIdentity>, ProbeAnswers) {
     let realised = ql.realised.lock().unwrap();
@@ -175,7 +175,7 @@ fn membership(snapshot: &Snapshot, s: &str, class: TermId) -> EncodedQuad {
 
 /// The snapshots no commit published that `changes` (each added or removed, by ids the
 /// store has) make over the latest: a writer's pending one, its canonical view, a
-/// speculative one and a private one (contract S3, review r0 §5 items 1 and 2). None has a
+/// speculative one and a private one. None has a
 /// `SharedState`.
 fn unpublished(engine: &Engine, changes: &[(EncodedQuad, bool)]) -> Vec<(&'static str, Snapshot)> {
     let apply = |tx: &mut nrese_engine::Transaction<'_>| {
@@ -220,7 +220,7 @@ fn unpublished(engine: &Engine, changes: &[(EncodedQuad, bool)]) -> Vec<(&'stati
     out
 }
 
-/// Contract S3, the TBox family (dictionary 3.3, G1): a snapshot no commit published whose
+/// Published-only admission, the TBox family (dictionary 3.3, G1): a snapshot no commit published whose
 /// restriction gains a member reads its own schema, answering as a fresh rewriting does,
 /// and leaves the kept entry as it found it. The next published read is the kept TBox,
 /// with no membership scanned.
@@ -248,7 +248,7 @@ fn unpublished_schema_reads_leave_the_kept_tbox() {
     assert_eq!((kept_entries(&ql), MEMBER_SCANS.get()), (before, 0));
 }
 
-/// Contract S3, the memberships family (G2): snapshots no commit published that leave the
+/// Published-only admission, the memberships family (G2): snapshots no commit published that leave the
 /// same expressions with a member (one more, one swapped, or no change) reuse the kept
 /// TBox and leave its key and memberships as they were. The next published read scans no
 /// membership.
@@ -283,11 +283,11 @@ fn unpublished_membership_reads_leave_the_kept_memberships() {
     assert_eq!((kept_entries(&ql), MEMBER_SCANS.get()), (before, 0));
 }
 
-/// Contract S3, the probes family (G3): a probe asked of a snapshot no commit published is
-/// answered from that snapshot's data and kept by its own version alone (dictionary 3.0c;
-/// review r1 F1), so asked again of the same snapshot it is answered without a check; the
+/// Published-only admission, the probes family (G3): a probe asked of a snapshot no commit published is
+/// answered from that snapshot's data and kept by its own version alone (dictionary 3.0c),
+/// so asked again of the same snapshot it is answered without a check; the
 /// published view's probes stay and answer it again. A probe the budget leaves unasked
-/// keeps no truth value (review r0 §5 item 4).
+/// keeps no truth value.
 #[test]
 fn unpublished_probes_are_kept_by_their_own_version_alone() {
     let engine = engine(":ann :worksFor :acme .");
@@ -339,7 +339,7 @@ fn unpublished_probes_are_kept_by_their_own_version_alone() {
     assert!(kept_probes(&unasked).1.is_empty());
 }
 
-/// Review r1 F1 (dictionary 3.0c): a pending snapshot read again, as a store session's is,
+/// Dictionary 3.0c: a pending snapshot read again, as a store session's is,
 /// reads its schema once. Its first read compiles, or reuses a published TBox its schema
 /// matches; later reads of it scan no membership and give the same TBox, and the store's
 /// shared entries stay as they were. A new pending snapshot is a new version, read afresh.
@@ -466,8 +466,8 @@ fn rewritings_with_other_closures_keep_their_own_tboxes_of_a_version() {
     assert!(Arc::ptr_eq(&on_ql, &ql.tbox(&pending, None)));
 }
 
-/// A probe asks the default graph the query reads, which the union mode decides (sol-loop
-/// r1 S1): a store's own snapshot and a pending one, read in one mode then the other, each
+/// A probe asks the default graph the query reads, which the union mode decides:
+/// a store's own snapshot and a pending one, read in one mode then the other, each
 /// get their answers, whether the probes are the store's or the version's. Here the witness
 /// is only in a named graph: in the union it is realised, outside it the rewriting answers.
 #[test]
@@ -502,7 +502,7 @@ fn probes_are_kept_per_default_graph_mode() {
 }
 
 /// A probe's answer depends on whether GeoSPARQL relations are computed from the geometries
-/// or only read as stated (sol-loop r2 S2): `ann` intersects `acme` by their points, and
+/// or only read as stated: `ann` intersects `acme` by their points, and
 /// states no relation. A published and a pending snapshot, read computing, stated only,
 /// then computing again with one rewriting, each answer as a fresh rewriting does on a
 /// snapshot of its own; stated only, the existential gives `ann` alone.
@@ -569,7 +569,7 @@ fn probes_are_kept_per_geosparql_mode() {
 
 /// A mask of a published snapshot is published (dictionary 3.0): changing only its
 /// inferred mask, the schema read reuses the kept TBox, and its answers and probes are what
-/// a fresh rewriting gives it (review r0 §5 item 4).
+/// a fresh rewriting gives it.
 #[test]
 fn a_published_mask_reuses_the_tbox_and_answers_as_a_fresh_read() {
     let engine = engine(":ann :worksFor :acme .");
@@ -590,7 +590,7 @@ fn a_published_mask_reuses_the_tbox_and_answers_as_a_fresh_read() {
     assert!(Arc::ptr_eq(&original, &ql.tbox(&mask, None)));
 }
 
-/// The probe gate (review r0 §1, "QL realised probes"): a reader of some graphs asks no
+/// The probe gate ("QL realised probes"): a reader of some graphs asks no
 /// probe of the data, so the store's probes stay as they were.
 #[test]
 fn graph_restricted_readers_keep_no_probes() {
@@ -611,7 +611,7 @@ fn graph_restricted_readers_keep_no_probes() {
 }
 
 /// A view that adds inferred statements to a published snapshot, as the DL bounds derive
-/// (master, 8 Nov 23:20), and its base: in either order of reading, each gets what a fresh
+/// them, and its base: in either order of reading, each gets what a fresh
 /// rewriting gives it.
 /// - Their TBoxes may be one: what the TBox reads (the core, the memberships, the equality
 ///   probe) is asserted only (`read_core`, `member_of`, `has_equality`).
@@ -813,7 +813,7 @@ fn a_noted_commit_rescans_only_the_memberships_it_touched() {
         ]
     };
     // What the TBox reads of a schema: its core, and which expressions have a member
-    // (the kept statement's identity is read by nothing: design note, "Membership cache").
+    // (the kept statement's identity is read by nothing).
     let presence = |schema: &[nrese_owl::Statement], snapshot: &Snapshot| {
         let rdf_type = iri(snapshot, RDF, "type").map(TermId::raw);
         let mut core = Vec::new();

@@ -1,7 +1,7 @@
 //! Package 3.0c's guards for the own-state slots of unpublished versions
-//! (`notes/2026-11-09-dict3-0c-own-state-design.md` §3, items 2 to 8; item 1 runs over every
-//! row of 3.0's matrix in `shared_state_tests`). The API is new, so the parent can't fail
-//! them: their red is the mutants the note names.
+//! (one more guard, in `shared_state_tests`, runs over every
+//! row of 3.0's matrix). The API is new, so the parent can't fail
+//! them: their red is by mutation.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Barrier, mpsc};
@@ -102,7 +102,7 @@ impl Tally {
     }
 }
 
-/// Item 2: a race keeps the first value stored.
+/// A race keeps the first value stored.
 ///
 /// - Input: two readers of one pending version, each making a value, both held at a barrier
 ///   inside `make` until both have made theirs (both missed).
@@ -142,8 +142,8 @@ fn a_race_keeps_the_first_value_stored() {
     assert_eq!(tally.charged(), 0);
 }
 
-/// Item 3, this slice's share: the views that share a version share its value; a snapshot of
-/// another version never sees it (the design note's §1 table).
+/// The views that share a version share its value; a snapshot of
+/// another version never sees it.
 ///
 /// - Input: a value made on a writer's pending snapshot; its equality, stored, canonical and
 ///   reading-within views and a clone; then a second `pending_snapshot`, a `pending_over`, the
@@ -219,7 +219,7 @@ fn views_of_one_version_share_its_value_and_no_other_version_does() {
     }
 }
 
-/// Item 4: the charge is released by the version's last holder.
+/// The charge is released by the version's last holder.
 ///
 /// - Input: a value made on a pending snapshot, then a clone and a view sharing its version,
 ///   dropped one by one; a value on a pending snapshot whose transaction is rolled back
@@ -272,7 +272,7 @@ fn the_charge_is_released_by_the_versions_last_holder() {
     assert_eq!(tally.drops(), 3);
 }
 
-/// Item 5: no version an unpublished snapshot held is installed. Installing takes a value
+/// No version an unpublished snapshot held is installed. Installing takes a value
 /// (`Versions::install`), so the compiler holds the rule; this guards what the bulk path
 /// keeps of its checkpoint image.
 ///
@@ -326,7 +326,7 @@ fn a_bulk_loads_image_keeps_nothing_past_the_load() {
     }
 }
 
-/// Item 6: the slots' lock is a leaf, never held while a value is made.
+/// The slots' lock is a leaf, never held while a value is made.
 ///
 /// - Input: a `make` that reads its snapshot, looks up its own type's slot, makes a value of
 ///   another type and, nested, one of its own type; on a thread with a deadline, so that a
@@ -369,7 +369,7 @@ fn a_make_may_read_its_snapshot_and_its_slots() {
     }
 }
 
-/// Item 7: two value types on one version get separate values.
+/// Two value types on one version get separate values.
 ///
 /// - Input: one pending snapshot; a value of each of two types, then each asked for again
 ///   with a different `make`.
@@ -399,7 +399,7 @@ fn two_value_types_on_one_version_are_separate() {
     );
 }
 
-/// Item 8: a commit never promotes a pending value.
+/// A commit never promotes a pending value.
 ///
 /// - Input: a value made on a transaction's pending snapshot, kept across its commit.
 /// - Expected: the engine's snapshot after the commit is `Shared` and of another version; the

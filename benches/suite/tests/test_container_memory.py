@@ -323,8 +323,8 @@ class LoadsAndKitsKeepTheKind(unittest.TestCase):
                 self.assertIn("docker stats 900 MiB", measured.memory_note)
 
     def test_a_load_into_a_running_server_reads_anon_kernel_not_docker_stats(self):
-        """AnzoGraph's load ends with its server still serving: its peak so far, 120 MiB anon + kernel,
-        while `docker stats` read 900 MiB (in the note only)."""
+        """A load into a server that goes on serving (the AnzoGraph adapter's case) reads its peak so far as
+        anon + kernel, the mocked 120 MiB; the mocked `docker stats` reading, 900 MiB, goes in the note only."""
         adapter = adapters.Anzograph()
         with tempfile.TemporaryDirectory() as tmp:
             ctx = SimpleNamespace(runtime=self.docker(None), logs=Path(tmp), dry=False, timeout_s=5,

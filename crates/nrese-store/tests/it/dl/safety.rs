@@ -336,7 +336,7 @@ fn told(dl: &nrese_store::MutationPipeline, reader: &ReadScope, q: &str) -> Vec<
     ]
 }
 
-/// R1-F1: what a reader of some graphs is told doesn't depend on a graph it can't read.
+/// What a reader of some graphs is told doesn't depend on a graph it can't read.
 /// Four stores alike in `open`: the hidden graph holds an annotation property's domain,
 /// another under another name, nothing, or an axiom the reader leaves out. The reader of
 /// `open` is told the same rows, the

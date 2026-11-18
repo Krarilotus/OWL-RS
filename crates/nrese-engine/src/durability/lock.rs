@@ -1,5 +1,5 @@
 //! The store's lock: one engine per data directory, across processes and within one (open row
-//! IB1312-8ba4, master's decision IB1440-0730 (A) with (i), 7 Nov 2026).
+//! IB1312-8ba4, decision IB1440-0730 (A) with (i), 7 Nov 2026).
 //!
 //! - **Within the process,** a registry of the open stores' directories refuses a second open
 //!   before the lock file is touched.
@@ -8,8 +8,8 @@
 //!   they and this exclude each other both ways.
 //!   - Another descriptor of the file, opened and closed by anyone in this process (a reader, an
 //!     image placement hashing it), is another description and releases nothing. A POSIX
-//!     record lock (`fcntl`), which any close drops, was tried and gave that up (review r1,
-//!     R1-F1).
+//!     record lock (`fcntl`) was tried and given up, because any close of the file
+//!     drops it.
 //!   - A child forked while the store is open shares the description until it execs or ends.
 //!     The lock is therefore released explicitly when the store is dropped (`unlock`, which
 //!     releases it for the description, the child's share included), never by the last close:
@@ -76,7 +76,7 @@ impl Drop for StoreLock {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Released explicitly, for the description (a forked child may share it), and closed,
-        // both under the registry, before another open of the store can try (sol-loop S1).
+        // both under the registry, before another open of the store can try.
         if let Some(file) = self.file.take()
             && let Err(error) = file.unlock()
         {
@@ -153,7 +153,7 @@ mod tests {
     }
 
     /// A store opened again in this process as it closes (one thread's engine dropped while
-    /// another opens its directory) stays locked against other processes (sol-loop S1). The
+    /// another opens its directory) stays locked against other processes. The
     /// second open runs at the moment the first's drop has let the registry go. Before the
     /// fix the first's descriptor closed only after that, and closing any descriptor of the
     /// file drops the process's record locks, the second's too: another process could then

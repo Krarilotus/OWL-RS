@@ -193,7 +193,7 @@ Behind `Config::dynamic_backtracking` (off), with `Config::check_retraction`.
   opened: by the scan, at or after that level's saved cursor, or taken from `reopen`, at
   any index below it. A reopened disjunction passed over as satisfied by a newer choice
   sat below that choice's window, and retracting the choice left it undecided: a wrong
-  answer (review D16-058 r1, a hand-made case). `Engine::reopened_low` is the run's lowest
+  answer (a hand-made case). `Engine::reopened_low` is the run's lowest
   reopened index, and a retraction's window starts at the smaller of the two.
 
 **Measured** (662 to 664, lab profile):

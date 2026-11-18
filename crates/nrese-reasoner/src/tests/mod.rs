@@ -870,7 +870,7 @@ fn stopped_updates_are_interrupted() {
     }
 }
 
-/// DC-07 S2 (Sol, round 1): the process limit's stop holds for the rest of the
+/// DC-07: the process limit's stop holds for the rest of the
 /// materialisation. One reading over the limit, or unread, then readings under it, at any
 /// poll: the run ends with that cause, or (past the last poll) has the join's fact; never a
 /// result without the fact a skipped morsel would have made. Every poll is checked for the
@@ -992,7 +992,7 @@ fn the_consistency_check_polls_the_stop_and_never_reports_a_stopped_list() {
     }
 }
 
-/// P2-C4 sol-loop r2 S3: once the list has refused, no further consistency job runs. An
+/// Once the list has refused, no further consistency job runs. An
 /// empty-body rule (its schema atom grounded) that violates under a budget of 0 refuses
 /// before the jobs; a three-atom rule queued before it, whose guard never holds, would
 /// still walk its drivers, two morsels (one stop poll each) of 5,000 drivers, without
@@ -1806,7 +1806,7 @@ fn chains_over_equal_properties_close_under_representatives() {
 /// later round, and three terms that differ pairwise don't fit in it. The representative
 /// closure expanded is the replicated closure and the same consistency rules fire, so
 /// maintenance (DRed, over every identity) equals full rematerialisation
-/// (reasoning-semantics.md, "Maintenance"; Sol's review of DMW-AB-mem, r1 S1).
+/// (reasoning-semantics.md, "Maintenance").
 #[test]
 fn guards_over_a_class_hold_where_its_members_satisfy_them() {
     use super::representatives;
@@ -1820,7 +1820,7 @@ fn guards_over_a_class_hold_where_its_members_satisfy_them() {
         ex:fp rdf:type owl:FunctionalProperty
         ex:s ex:fp ex:a
         ex:s ex:fp ex:b";
-    // The same over a schema fact, which grounding reads (Sol's review, r1 S2).
+    // The same over a schema fact, which grounding reads.
     let later_schema = "ex:a rdfs:subClassOf ex:a
         ex:fp rdf:type owl:FunctionalProperty
         ex:s ex:fp ex:a
@@ -1961,14 +1961,14 @@ fn maintenance_keeps_what_schema_facts_alone_derive() {
 /// Maintenance of rules whose guards see `owl:sameAs` classes equals rematerialisation,
 /// which runs over representatives (startup, the catalog, the draft check), after every
 /// change of random deletes and re-inserts, under each plan of the maintenance policy:
-/// classes that hold from the start, form through a functional property, and split when an
-/// equality or the fact that formed one goes; an equality between the property a guarded
-/// rule joins on and another; a guard on a variable that grounding binds from a schema fact,
-/// alone (decided while grounding) and against one a later join binds (decided then, with
-/// the value grounding kept), also for a term in no class (`ex:F`). DRed maintains every
-/// identity, so its closure is the replicated one, and the representative closure expanded
-/// must be that too (reasoning-semantics.md, "Maintenance"; review of the guard fix
-/// f2b7a4a4, r1, follow-up 2).
+/// classes that hold from the start, form through a functional property, and split when
+/// an equality or the fact that formed one goes; an equality between the property a
+/// guarded rule joins on and another; a guard on a variable that grounding binds from a
+/// schema fact, alone (decided while grounding) and against one a later join binds
+/// (decided then, with the value grounding kept), also for a term in no class (`ex:F`).
+/// DRed maintains every identity, so its closure is the replicated one, and the
+/// representative closure expanded must be that too (reasoning-semantics.md,
+/// "Maintenance").
 #[test]
 fn guarded_maintenance_equals_rematerialisation_over_representatives() {
     use super::delta::policy::{Plan, Policy};
@@ -2326,7 +2326,7 @@ fn batch_equals_naive_on_random_ontologies() {
     );
 }
 
-/// List axioms edited under the delta executor (the milestone review's R1): its list
+/// List axioms edited under the delta executor: its list
 /// rules follow the list's current members, as a rematerialisation's do, and commits
 /// that touch list facts don't pile up copies of the list-derived consistency rules.
 /// Both for short lists (a rule per pair) and long ones (one rule asking the members'

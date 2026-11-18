@@ -1,6 +1,6 @@
-"""`suite.py coverage` (suitekit/coverage.py): whether a catalogue cell's receipt is current. Specified by
-Harness notes 2026-11-08-coverage-refresh/p2-design-r5.md with addenda r6 and r7 (design check r6:
-SOUND): a cell is current only if its one newest receipt is a complete attempt whose every field a
+"""`suite.py coverage` (suitekit/coverage.py): whether a catalogue cell's receipt is current.
+The specification: a cell is current only if its one newest receipt is a complete
+attempt whose every field a
 positive rule accepts against what this clean checkout's owners declare for that receipt's own
 runtime; anything missing, unknown, unordered or unrecognised is not current, with its reason, and an
 owner read that fails is never an empty inventory. Each fixture below is a receipt the producer
@@ -137,25 +137,25 @@ class Fields(Base):
                 self.assertEqual(self.judge(self.repo.receipt(system, kind), system), ("current", []))
 
     def test_each_field_that_isn_t_the_owner_s_makes_the_cell_not_current_with_its_reason(self):
-        """r5/r6/r7 attack groups G2-G9 on one NRESE Docker receipt: (what changes, class, reason)."""
+        """The changes to one NRESE Docker receipt, by group: (what changes, class, reason)."""
         r = self.repo
         harness_src = "benches/nrese-bench-harness"
         cases = [
-            # G2: recognised outcome and answers, then the predicates
+            # Recognised outcome and answers, then the predicates
             (lambda x: x["outcome"].update(outcome="partial"), "not-ok", "outcome partial"),
             (lambda x: x["outcome"].update(outcome="bogus"), "unqualified", "unrecognised: outcome"),
             (lambda x: x.update(answers="pending"), "unqualified", "answers pending"),
             (lambda x: x.update(answers="not captured"), "unqualified", "answers not captured"),
             (lambda x: x["answers"].update(qualified=False), "unqualified", "answers not qualified"),
             (lambda x: x.update(answers={"worst": "ok"}), "unqualified", "unrecognised: answers"),
-            # G3: protocol, and the runtime the receipt names (F13)
+            # Protocol, and the runtime the receipt names
             (lambda x: x["protocol"].update(runs=1), "unqualified", "protocol short"),
             (lambda x: x["protocol"].update(cache=["off"]), "unqualified", "result cache"),
             (lambda x: x["protocol"].update(order="fixed"), "unqualified", "order fixed"),
             (lambda x: x["protocol"].pop("runtime"), "unqualified", "runtime None"),
             (lambda x: x["protocol"].update(runtime="kubernetes"), "unqualified", "runtime 'kubernetes'"),
             (lambda x: x["protocol"].update(runtime="process"), "unqualified", "images: expected"),
-            # G4: the invocation
+            # The invocation
             (lambda x: x.update(complete=False), "unqualified", "not complete"),
             (lambda x: x.update(commit=unknown("checkout moved during the run: a -> b")), "unqualified",
              "checkout moved"),
@@ -166,7 +166,7 @@ class Fields(Base):
             (lambda x: x["code"].update({"benches/suite": "0" * 40}), "stale", "code: benches/suite changed"),
             (lambda x: x["code"].pop("scripts"), "stale", "definition changed"),
             (lambda x: x["code"].update({"benches/suite": unknown()}), "unqualified", "code benches/suite"),
-            # G5: images
+            # Images
             (lambda x: x.update(images={}), "unqualified", "images: expected"),
             (lambda x: x["images"].update({"extra:1": {"id": IMAGE_ID, "source": "pulled, pinned " + RUST_PIN}}),
              "unqualified", "images: expected"),
@@ -175,7 +175,7 @@ class Fields(Base):
             (lambda x: x["images"]["rust:1.98.1-bookworm"].update(source=unknown("no build label and no digest pin")),
              "unqualified", "no digest pin"),
             (lambda x: x["images"]["rust:1.98.1-bookworm"].update(id="latest"), "unqualified", "unrecognised: image"),
-            # G6: the builds (F10, F14, F15, F16 through `controlled`, r7 export failure)
+            # The builds (sources, inputs, `controlled`, an export that failed)
             (lambda x: x["build"].pop("nrese"), "unqualified", "build: expected"),
             (lambda x: x["build"]["harness"]["sources"].update({harness_src: "0" * 40}), "stale",
              f"harness build sources: {harness_src} changed"),
@@ -195,12 +195,12 @@ class Fields(Base):
             (lambda x: x["build"]["harness"].update(controlled=False), "unqualified", "harness build not controlled: False"),
             (lambda x: x["build"]["harness"].update(toolchain={"rustc": "1.98.1"}), "unqualified",
              "harness build toolchain: unrecognised"),
-            (lambda x: x["build"]["harness"].update(toolchain=unknown("unreadable")), "unqualified",  # sol-loop S1
+            (lambda x: x["build"]["harness"].update(toolchain=unknown("unreadable")), "unqualified",  # a toolchain it couldn't read
              "harness build toolchain: unreadable"),
-            (lambda x: x.update(attempt=7), "unqualified", "attempt 7"),  # sol-loop S2
-            (lambda x: x["build"]["nrese"].update(rust_image=unknown("unreadable")), "unqualified",  # S4: no crash
+            (lambda x: x.update(attempt=7), "unqualified", "attempt 7"),  # an attempt that isn't an id
+            (lambda x: x["build"]["nrese"].update(rust_image=unknown("unreadable")), "unqualified",  # no crash
              "rust_image"),
-            (lambda x: x["data"].update({"/data/retired.nt": unknown("not hashed")}), "unqualified",  # S7
+            (lambda x: x["data"].update({"/data/retired.nt": unknown("not hashed")}), "unqualified",  # a file not hashed
              "not hashed"),
             (lambda x: [x["build"]["harness"].pop(k) for k in ("toolchain", "controlled")], "unqualified",
              "unrecognised: harness build fields"),  # an export that failed: built_from's record only
@@ -217,9 +217,9 @@ class Fields(Base):
             (lambda x: x["build"]["nrese"].update(commit="f" * 40), "unqualified", "ancestry unreadable"),
             (lambda x: x["build"].update(harness=unknown("--skip-build: the harness that was there")), "unqualified",
              "skip-build"),
-            # G7: settings in force
+            # Settings in force
             (lambda x: x.update(settings={"JAVA_HEAP": "8g"}), "unqualified", "settings set: JAVA_HEAP"),
-            # G8: data
+            # Data
             (lambda x: x["data"].update({"/data/lubm-1.nt": "0" * 64}), "stale", "data: /data/lubm-1.nt changed"),
             (lambda x: x["data"].pop("/data/univ-bench.nt"), "stale", "definition changed"),
             (lambda x: x["data"].update({"/data/lubm-1.nt": unknown("not there when hashed")}), "unqualified",
@@ -234,7 +234,7 @@ class Fields(Base):
                 self.assertTrue(any(reason in w for w in why), why)
 
     def test_a_scripted_image_is_current_only_at_its_dockerfile_s_declared_commit(self):
-        """r7 §4 G5: the recorded source commit equals the declared one exactly; a commit sharing its
+        """The recorded source commit equals the declared one exactly; a commit sharing its
         first seven characters (the tag's) is another commit; a declaration that isn't one value is
         unqualified, never an empty or the receipt's own value."""
         tag = "nrese-bench/millenniumdb:ecbf6dd"
@@ -257,7 +257,7 @@ class Fields(Base):
             self.assertTrue(any("dockerfile.declared_source_commit" in w for w in why), why)
 
     def test_engine_names_nrese_s_build_and_never_the_harness_s(self):
-        """r5 §3: under --engine C NRESE's build is C's, by commit and by source trees; the harness is
+        """Under --engine C NRESE's build is C's, by commit and by source trees; the harness is
         still judged against HEAD."""
         r = self.repo
         owners = r.owners(engine=r.base)
@@ -278,7 +278,7 @@ class Fields(Base):
             git(r.root, "reset", "-q", "--hard", r.head)
 
     def test_the_owners_are_read_with_explicit_inputs_never_the_environment(self):
-        """F14, G7: the process environment changes no class and is left as it was."""
+        """The process environment changes no class and is left as it was."""
         receipt = self.repo.receipt()
         noise = {"NRESE_TARGET_CPU": "znver3", "RUSTFLAGS": "-C opt-level=0", "RUST_IMAGE": "rust:1.97",
                  "QLEVER_IMAGE": "x:1"}
@@ -289,7 +289,7 @@ class Fields(Base):
 
 
 class Selection(unittest.TestCase):
-    """G1: which receipt is a cell's evidence (r3, F7), before any field is judged."""
+    """Which receipt is a cell's evidence, before any field is judged."""
 
     @staticmethod
     def pair(started=None, attempt="a", outcome="ok", **receipt):
@@ -364,7 +364,7 @@ class Cells(Base):
         self.assertEqual({p: p.read_bytes() for p in before}, before)
 
     def test_a_dirty_checkout_or_an_unreadable_owner_refuses_and_classifies_nothing(self):
-        """r5 §5 and r6 §3: a global read that fails, early or after a valid cell, is a refusal, exit 2,
+        """A global read that fails, early or after a valid cell, is a refusal, exit 2,
         with no class on stdout."""
         with tempfile.TemporaryDirectory() as d:
             dirty = Repo(Path(d).resolve() / "repo")
@@ -377,7 +377,7 @@ class Cells(Base):
         self.assertEqual((code, out), (2, ""))
         self.assertIn("images.toml", err)
         records = self.records()  # made before git is taken away: the fixture reads git too
-        with patch.object(receipts, "code_paths", side_effect=OSError("no git")):  # sol-loop S6: a cell's git
+        with patch.object(receipts, "code_paths", side_effect=OSError("no git")):  # A cell's git
             code, out, err = self.run_command(records=records)
         self.assertEqual((code, out), (2, ""))
         self.assertIn("no git", err)
@@ -406,7 +406,7 @@ class Cells(Base):
 
 
 class OwnerLines(unittest.TestCase):
-    """The declarations P2 reads, each at its owner and used by the producer too (r5 §2, r6 §2)."""
+    """The declarations P2 reads, each at its owner and used by the producer too."""
 
     def test_the_runtime_kinds_are_the_runtimes_the_suite_has(self):
         kinds = {cls.kind for cls in vars(runtime).values()

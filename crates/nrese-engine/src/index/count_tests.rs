@@ -1,4 +1,4 @@
-//! REAS-2 fix check r1 (R2-F1, held counts): a count tells its visitor about a run's
+//! REAS-2, held counts: a count tells its visitor about a run's
 //! tombstone words as it reads them, so a caller's stop ends the read within a run of words.
 
 use super::merge::{LINEAR_UP_TO, SignedMerge};
@@ -26,7 +26,7 @@ impl Account for Allow {
     }
 }
 
-/// REAS-3a fix check r1 F1 (design attacks D6 and r2 E3). Spec (`SignedMerge::step`): a merge
+/// REAS-3a. Spec (`SignedMerge::step`): a merge
 /// step its account stops leaves the merge stopped. Three ranges hold one key K: it is
 /// inserted, deleted, then inserted again, and the first and last ranges hold 255 more keys
 /// each, so taking K from the first decodes a block. The first step is stopped at each of its
@@ -137,7 +137,7 @@ fn largest_gap(read: impl Fn(Visitor<'_>)) -> u64 {
     unreachable!("a read asks its visitor finitely often")
 }
 
-/// REAS-3a fix check r1 F1 (design attack r2, E2). Spec (`crate::visit`: a unit is a key
+/// REAS-3a. Spec (`crate::visit`: a unit is a key
 /// comparison a read's search makes, counted before it is made): a counted read's range
 /// searches stay within its visitor's interval, also where they find nothing. An interval of
 /// runs, 32 statements each, and a subject above every stored one, so that each run's range is
@@ -201,7 +201,7 @@ fn counted_reads_search_empty_ranges_within_their_visitor_s_interval() {
     );
 }
 
-/// REAS-3a fix check r1 F1 (design attacks D1, E4). Spec (`crate::visit`: a unit is a key
+/// REAS-3a. Spec (`crate::visit`: a unit is a key
 /// comparison a merge makes, a cursor it advances or a key it decodes, counted before it is
 /// done): a counted scan steps through many deltas of one statement within its visitor's
 /// interval. Three intervals of runs that insert and delete one statement in turn (inserted
@@ -287,7 +287,7 @@ fn a_held_count_reads_its_tombstones_within_a_run_of_its_visitor() {
     );
 }
 
-/// REAS-3a, sol-loop r1 S2. Spec (`crate::visit`: a unit is each run a read searches or
+/// Spec (`crate::visit`: a unit is each run a read searches or
 /// probes, counted before it is looked at): a counted existence probe looks at its runs within
 /// its visitor's interval. Three intervals of runs, one statement each, none with tombstones
 /// and none matching the probe (so it reads every run): between two asks of the visitor (and
@@ -334,13 +334,13 @@ fn a_counted_existence_probe_looks_at_its_runs_within_its_visitor_s_interval() {
     );
 }
 
-/// REAS-3a review r1 R2. Spec (`crate::visit`: a counted read asks its visitor before the work
+/// Spec (`crate::visit`: a counted read asks its visitor before the work
 /// it counts; a merge step over its cursors is one step, counted before it is taken): a counted
 /// scan over many runs reads its cursors within its visitor's interval. Five intervals of runs,
 /// one statement each, all matching (a range in every run, a cursor each): from the scan's
 /// first ask to its third quad, between two asks of the visitor (and after the last), it
 /// does no more than an interval of work: runs searched, their comparisons, cursors read and
-/// the merge's work (fix check r1 F1: a step compared every cursor after one count). Its
+/// the merge's work (a step compared every cursor after one count). Its
 /// credit's hint summed every cursor before each ask, five intervals unseen.
 #[test]
 fn a_counted_scan_reads_its_cursors_within_its_visitor_s_interval() {
@@ -432,7 +432,7 @@ impl Account for Runs {
     }
 }
 
-/// REAS-3a fix check r3 H1. Spec (`crate::visit`: after a yes at most the units it allowed
+/// Spec (`crate::visit`: after a yes at most the units it allowed
 /// follow; `Ledger`: each portion's work is done before the next portion is taken): a merge
 /// does no work after a grant that it counted before it. Two to six runs of 600 statements
 /// each, their subjects alternating, merged with an account granted runs of 1 to 64 units:

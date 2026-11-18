@@ -72,7 +72,7 @@ fn none() -> Vec<Vec<(usize, u64)>> {
     vec![Vec::new(), Vec::new()]
 }
 
-/// D16-575 E2 (doubt review r1 F2): the read holds its lists inside the query's memory
+/// D16-575 E2: the read holds its lists inside the query's memory
 /// envelope.
 ///
 /// - Input: `a p ?x` and `b q ?x` sharing all of their 1,000 values, written in one commit
@@ -105,15 +105,15 @@ fn shared_values_lists_stay_inside_the_query_envelope() {
 /// D16-575 E2: a pair is read where its patterns' own counts fit the BGP's allowance, not
 /// where the counts it is planned with do: those may be narrowed by a filter or a range,
 /// while the read decodes the whole pattern. The allowance is the cost of the plan the
-/// planned counts give without the overlaps, at most [`plan::OVERLAP_VALUES`] (the master's
-/// GO of 14 November, 12:06).
+/// planned counts give without the overlaps, at most [`plan::OVERLAP_VALUES`] (decided on
+/// 14 November).
 ///
 /// - Input: `a p ?x` and `b q ?x` in one commit, sharing all their `n` values: `n` = 100
 ///   planned as 100 each (200 together, within that plan's cost of 300: two scans and the
 ///   join's rows), and as 1 each (narrowed: a plan costing 3, past which the patterns' own
 ///   200 are); `n` = 5,000 planned as 5,000 each (10,000, past [`plan::OVERLAP_VALUES`]).
 /// - Expected: 100 values counted; none for the others: no list decoded, and less charged
-///   than one list's values (only the candidates' storage is, review r1 F1).
+///   than one list's values (only the candidates' storage is).
 #[test]
 fn pairs_are_read_by_their_patterns_own_counts_not_narrowed_ones() {
     for (n, planned, expected) in [
@@ -143,7 +143,7 @@ fn pairs_are_read_by_their_patterns_own_counts_not_narrowed_ones() {
     }
 }
 
-/// D16-575 E1 (doubt review r1 F1): a read the budget stops part way is no count.
+/// D16-575 E1: a read the budget stops part way is no count.
 ///
 /// - Input: `a p rep` and `b q rep` stated, and 999 aliases `owl:sameAs`-equal to `rep`
 ///   (inferred), read with early equality expansion: `a p ?x` and `b q ?x` each match the

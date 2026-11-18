@@ -258,7 +258,7 @@ fn subjects(indexes: impl IntoIterator<Item = String>) -> Vec<String> {
     subjects
 }
 
-/// Spec: design note 12 Nov, "After the doubt review" (CRD-01): both operands can be ±14 h
+/// Spec (12 Nov, CRD-01): both operands can be ±14 h
 /// off UTC, so a value that passes a bound can lie up to 28 h of local time beyond it, and
 /// the bound is widened by two local days. Values and constants here all have timezones,
 /// where the engine's order and XPath's agree (instants): `2022-12-30T23:00:00-14:00` is
@@ -354,7 +354,7 @@ fn years_passing(objects: &[Literal], conjuncts: &[(&str, &str)]) -> Vec<String>
     )
 }
 
-/// Spec: design note 12 Nov (the remedy, kept by "After the doubt review"): bounds on a
+/// Spec (12 Nov): bounds on a
 /// variable by inline dateTimes narrow the scan that binds it, and a count's walk of its
 /// keys, to the inline dateTimes within two local days of the bounds plus the dictionary's
 /// typed literals: created-2023's query reads about one year of six. The same bounds in
@@ -408,7 +408,7 @@ fn date_time_bounds_narrow_the_scan_and_the_key_count() {
     );
 }
 
-/// Spec: design note 12 Nov, "After the doubt review": the typed literals' range is always
+/// Spec (12 Nov): the typed literals' range is always
 /// kept. Bounds further apart than two days, the lower above the upper, leave no inline
 /// dateTime to read, and the scan and the key count still read the typed literals
 /// ([`TYPED`]): no value passes, so the empty answer alone can't tell. Answers:
@@ -507,7 +507,7 @@ const BOUNDS: [&Conjunction; 22] = [
     &[("<=", "9999-12-31T10:00:00-14:00")],
 ];
 
-/// Spec: design note 12 Nov, "After the doubt review": the narrowing keeps every value that
+/// Spec (12 Nov): the narrowing keeps every value that
 /// passes, whatever the timezones on either side, across month ends, leap days and the
 /// inline years' ends, within a millisecond of a bound; dateTimes that aren't inline
 /// (`24:00:00`, non-canonical fractions and offsets, fractions past the millisecond, years
@@ -551,7 +551,7 @@ fn date_time_bounds_keep_every_value_that_passes() {
     }
 }
 
-/// Spec: design note 12 Nov, "After the doubt review" (CRD-07): the two-day envelope also
+/// Spec (12 Nov, CRD-07): the two-day envelope also
 /// holds every value XPath's comparison passes, where a value without a timezone takes the
 /// implicit one. The engine compares by XSD's partial order instead, and its FILTER rejects
 /// some of those values, so this checks what the narrowing keeps, not answers: alone under
@@ -588,7 +588,7 @@ fn every_value_xpath_passes_is_kept_by_the_envelope() {
     );
 }
 
-/// Spec: brief of 12 Nov: a conjunction mixing a dateTime bound with a YEAR or an integer
+/// Spec (12 Nov): a conjunction mixing a dateTime bound with a YEAR or an integer
 /// bound on one variable keeps today's behaviour. Before dateTimes had a hint, such a
 /// conjunct gave none, and the other bound's hint narrowed the scan and the key count
 /// alone; so it does now, whichever conjunct comes first (two other kinds of bound on one
@@ -646,7 +646,7 @@ fn a_date_time_bound_beside_a_year_or_integer_bound_keeps_that_hint() {
     }
 }
 
-/// Spec: review round of 12 Nov (SHOULD 1): a dateTime bound gives way to a string test on
+/// Spec: a dateTime bound gives way to a string test on
 /// its variable. `STRSTARTS(STR(?d), …)` is answered from the dictionary first (`strings`),
 /// and a count with it skips the key count; a broad dateTime bound beside it, in either
 /// order, changes neither the route nor the rows read. Here half the dateTimes are typed
@@ -704,7 +704,7 @@ fn a_date_time_bound_beside_a_string_test_keeps_its_route() {
     }
 }
 
-/// Spec: review round of 12 Nov (SHOULD 2): a path join takes no dateTime hint, so its plans
+/// Spec: a path join takes no dateTime hint, so its plans
 /// stay as they were. It takes each filter conjunct's hints apart, the first on a variable
 /// winning, so a broad dateTime bound before `YEAR(?d) = 2023` would replace the YEAR hint.
 /// Here the triple pattern runs first (the path is the larger input), narrowed by the YEAR

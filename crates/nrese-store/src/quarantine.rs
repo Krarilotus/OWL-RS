@@ -550,7 +550,7 @@ impl Quarantine {
     /// written (a discard, a readmission's commit note, its record after a commit that
     /// published nothing). An append that fails takes back what it may have written, so that
     /// no later record joins it; where that fails too, the log is latched [`Self::unknown`]
-    /// and refuses every append until the next open repairs it (review r1, F2).
+    /// and refuses every append until the next open repairs it.
     fn append_resolution(&self, dir: &Path, resolution: &Resolution) -> Result<(), AppendError> {
         self.appendable().map_err(AppendError::Clean)?;
         let before = log_len(dir).map_err(AppendError::Clean)?;
@@ -712,7 +712,7 @@ fn append(dir: &Path, resolution: &Resolution) -> io::Result<()> {
     // Durably named, the directory and the log (DUR-3): the quarantine reads them at open. The
     // directory is synced after every append, not only when the log is made: a log made by a
     // call whose sync then failed is in place but not known durable, and the next call must not
-    // take it for so (fix check r1, R2-F1).
+    // take it for so.
     nrese_engine::place::create_dir_all(dir)?;
     let path = dir.join(RESOLUTIONS);
     let mut log = fs::OpenOptions::new()
@@ -728,8 +728,8 @@ fn append(dir: &Path, resolution: &Resolution) -> io::Result<()> {
     log.write_all(format!("{line}\n").as_bytes())?;
     log.sync_data()?;
     // A log that is a link to a file elsewhere: its target's names are durable before the
-    // resolution is acknowledged (DUR-5, fix check r2 on DUR-4, R2-F1). After the append, which
-    // makes a target not there yet (sol-loop r1, S2); a failure refuses the resolution, written
+    // resolution is acknowledged. After the append, which
+    // makes a target not there yet; a failure refuses the resolution, written
     // but not known durable, as a failed sync below does, and every resolution's append, a
     // commit note's included, takes it back through [`Quarantine::append_resolution`].
     nrese_engine::place::name_existing_file(&path)?;
@@ -1074,7 +1074,7 @@ impl Collector<'_> {
             let file = out.into_inner().map_err(|error| error.into_error())?;
             file.sync_data()?;
             drop(file);
-            // Durably named before the load is acknowledged (DUR-3, sol-loop round 5, S3): a
+            // Durably named before the load is acknowledged: a
             // load of only invalid statements publishes nothing else.
             nrese_engine::place::rename(partial, &partial.with_extension("jsonl"))?;
             nrese_engine::place::sync_dir(partial.parent().expect("in the quarantine directory"))?;
@@ -1518,7 +1518,7 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// The log a start reads is the one a power loss keeps (sol-loop r1, S1): a start that
+    /// The log a start reads is the one a power loss keeps: a start that
     /// rewrote the log without a readmission past the store's revision renamed it into place,
     /// and the quarantine directory's sync then failed (`fault_points`). The next start, that
     /// sync still failing, must refuse too: its log is in place but not known durable, and a
@@ -1576,7 +1576,7 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// No resolution joins bytes a failed append left (sol-loop r1, S2): a readmission's
+    /// No resolution joins bytes a failed append left: a readmission's
     /// append writes half its record and fails, and taking it back fails too. A discard after
     /// it is either refused or, if acknowledged, kept after a restart; the readmission is
     /// open with no copy. Before the fix the discard was appended after the torn bytes,
@@ -1619,7 +1619,7 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// An ordinary resolution's torn append leaves nothing a later one joins (review r1, F2): a
+    /// An ordinary resolution's torn append leaves nothing a later one joins: a
     /// discard's append writes half its record and fails (the fault then gone). A readmission
     /// with fresh blank nodes after it is acknowledged; after a restart it must still be
     /// resolved, its statement in the data once, and a second readmission refused. Before the
@@ -1669,7 +1669,7 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// A complete last resolution followed only by zero bytes is kept (D16-322, Q06 r1 F2): a
+    /// A complete last resolution followed only by zero bytes is kept: a
     /// crash after the newline repair's write but before its sync can leave `{record}\0` where a
     /// filesystem extended the file before writing it. The record is an acknowledged
     /// readmission whose data is in; after a start it is still resolved, and a re-admission is
@@ -1705,8 +1705,8 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// A discard is acknowledged only once its log's name is durable (DUR-3 fix check r1,
-    /// R2-F1). The first discard makes the resolutions log, appends and syncs it, and the sync
+    /// A discard is acknowledged only once its log's name is durable.
+    /// The first discard makes the resolutions log, appends and syncs it, and the sync
     /// of the quarantine directory, which must name the log, fails: refused. Tried again with
     /// that sync still failing, the log now there: refused too. Before the fix the log was taken
     /// for durably named and the discard acknowledged. Once the sync works: acknowledged, and
@@ -1774,8 +1774,8 @@ mod tests {
     }
 
     /// A resolution appended through a log that is a link to a file elsewhere is acknowledged
-    /// only once the names its target's resolution reads are durable (DUR-5, fix check r2 on
-    /// DUR-4, R2-F1). The first discard makes the log; the store closed, the log moved to
+    /// only once the names its target's resolution reads are durable.
+    /// The first discard makes the log; the store closed, the log moved to
     /// `data/new-parent/` and linked back, the store reopened. With the sync of `data/new-parent`
     /// (a target ancestor) failing with a non-permission error, a discard is refused. Once the
     /// sync works it is acknowledged, and after a reopen nothing is open. Windows runs it on a
@@ -1854,8 +1854,8 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// The first resolution through a log that is a link to a file not made yet (sol-loop r1 on
-    /// DUR-5, S2): the append makes the target, as it did before naming linked logs, and the
+    /// The first resolution through a log that is a link to a file not made yet:
+    /// the append makes the target, as it did before naming linked logs, and the
     /// resolution is acknowledged and kept after a reopen. Windows runs it on a file symlink
     /// where the host may make one, else "not run". Before the fix the naming ahead of the
     /// append found no target and refused every resolution.

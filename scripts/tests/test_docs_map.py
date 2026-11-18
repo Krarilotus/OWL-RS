@@ -3,7 +3,7 @@
     python3 -I scripts/tests/test_docs_map.py
 
 Spec: CONTRIBUTING.md and benches/abba/README.md, "the one way to time a change against its
-base", on the fleet's timing hosts. PR #92 review r1 B4: the map sent a slowdown to
+base", on the fleet's timing hosts. PR #92: the map sent a slowdown to
 scripts/bisect-perf.py, which builds and times each revision itself. Stdlib only.
 """
 import os

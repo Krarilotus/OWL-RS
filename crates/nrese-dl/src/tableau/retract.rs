@@ -181,7 +181,7 @@ impl Engine<'_> {
         // A disjunction a retracted fact satisfied may be open again. It binds a touched node
         // (the fact's), lies behind the scan, and was looked at since `k`'s frame was opened:
         // by the scan, at or after the cursor `k` saved, or taken from `reopen`, at or after
-        // `reopened_low` (review D16-058 r1: a reopened disjunction a newer choice satisfied,
+        // `reopened_low` (a reopened disjunction a newer choice satisfied,
         // below that choice's saved cursor).
         let low = pending_open.min(self.reopened_low);
         for i in low..self.pending_open.min(self.pending.len() as u32) {

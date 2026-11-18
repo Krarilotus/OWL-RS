@@ -1,5 +1,5 @@
-//! Dictionary lifecycle V1's store guards for the DL source helpers
-//! (`notes/2026-11-09-dict-v1-speculative-private-design.md` §4, items 5, 6 and 7).
+//! Dictionary lifecycle V1's store guards for the DL source
+//! helpers.
 
 use std::sync::Arc;
 
@@ -8,8 +8,8 @@ use nrese_exec::Budget;
 use crate::dl::bounds::upper_facts;
 use crate::{StoreConfig, StoreError, StoreService};
 
-/// Item 5: the U1 a cold read keeps holds valid names until the next commit. Its red is the
-/// mutant that gives U1's names a private vocabulary (design note §4, item 5's record): the
+/// The U1 a cold read keeps holds valid names until the next commit. Its red is the
+/// mutant that gives U1's names a private vocabulary: the
 /// window is between the cold read and the next commit, and terms appended there (an aborted
 /// writer's stay in the dictionary) take the next ids.
 ///
@@ -63,7 +63,7 @@ fn the_kept_cold_upper_bound_survives_an_aborted_writers_terms() {
     assert_eq!(kept, afresh, "the kept U1 is U1 afresh");
 }
 
-/// Item 6: the bounded-prefix precondition, checked where a DL request opens its private
+/// The bounded-prefix precondition, checked where a DL request opens its private
 /// transaction.
 ///
 /// - Input: a published snapshot of another store's engine.
@@ -79,7 +79,7 @@ fn a_private_transaction_refuses_another_engines_published_input() {
     let _ = super::private_over(store.engine(), &foreign, Arc::new(Budget::unlimited()));
 }
 
-/// Item 6, its own engine: an earlier snapshot of the same engine is accepted.
+/// The same precondition, its own engine: an earlier snapshot of the same engine is accepted.
 #[test]
 fn a_private_transaction_takes_its_engines_earlier_snapshot() {
     let store = StoreService::new(StoreConfig::in_memory()).unwrap();
@@ -88,7 +88,7 @@ fn a_private_transaction_takes_its_engines_earlier_snapshot() {
     assert!(tx.extends(&earlier));
 }
 
-/// Item 7, at the error's owner: an engine memory refusal converts to the memory limit's
+/// At the error's owner: an engine memory refusal converts to the memory limit's
 /// class, any other engine error to an engine error.
 #[test]
 fn an_engine_memory_refusal_is_the_store_memory_limit() {
@@ -108,7 +108,7 @@ fn an_engine_memory_refusal_is_the_store_memory_limit() {
     );
 }
 
-/// Item 7: a private transaction's refusal is the request's memory limit.
+/// A private transaction's refusal is the request's memory limit.
 ///
 /// - Input: a DL request's private transaction with no room; the fresh names resolved in it.
 /// - Expected: `resolve` gives `Err`, classified as the memory limit (not an engine error, not

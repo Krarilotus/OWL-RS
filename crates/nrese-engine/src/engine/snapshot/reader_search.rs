@@ -125,14 +125,14 @@ fn own_length(
 }
 
 /// What an unpublished version's readers built, kept in that version's own slot (3.0c's
-/// `OwnState`; the 3.2 review's R32-N2: every search of one retained pending snapshot
+/// `OwnState`; otherwise every search of one retained pending snapshot
 /// derived again): its corpora by full kind and snapshot identity, and a private snapshot's
 /// own-document indexes by their corpus and stemming language. Views of one version share
 /// the slot (equality modes, stored, canonical, reading budgets), so the key holds the full
 /// identity: two of them never share an entry they shouldn't. Each value keeps the charge of
 /// the request that built it until the version's last holder drops it; each entry (its node,
 /// its value's shared allocation, its key's copies) is charged there too, before it is made
-/// ([`entry_bytes`]; sol-loop r3 B5). The locks are leaves, held only to look up or to link
+/// ([`entry_bytes`]). The locks are leaves, held only to look up or to link
 /// an entry in, never while a corpus is built; a losing entry drops after the lock. The
 /// first value kept for a key wins.
 #[derive(Default)]
@@ -356,7 +356,7 @@ fn request_budget(budget: Option<&Arc<nrese_exec::Budget>>) -> Arc<nrese_exec::B
     }
 }
 
-/// What the corpus store admits by (contract S3): the version of a snapshot with the
+/// What the corpus store admits by (published-only admission): the version of a snapshot with the
 /// shared-state capability, made only from its token ([`CorpusAdmission::of`]), so that an
 /// admission works on the token's own snapshot and never on one passed beside it. (Named
 /// apart from 3.0c's [`super::Admission`], the capability it is made from.)
@@ -386,7 +386,7 @@ impl<'s> CorpusAdmission<'s> {
 
 impl Snapshot {
     /// The engine's store of corpora, made at the first reader-scoped search of a published
-    /// snapshot (`admitted`: a snapshot without the capability makes none, contract S3);
+    /// snapshot (`admitted`: a snapshot without the capability makes none);
     /// `None` for statistics without an engine's cell, and where none was made yet for a
     /// search without the capability (a search then keeps nothing).
     fn corpora(&self, admitted: bool) -> Option<&CorpusStore> {
@@ -415,8 +415,8 @@ impl Snapshot {
     /// request's; `None`: unbounded); a kept corpus is the engine's. A budget that has no
     /// room returns its refusal, as does a read the reader's budget refused
     /// ([`Self::read_refused`]): what it read may be incomplete. A private snapshot searches
-    /// what it can see the same way, its own literals among them (V3; the lifecycle
-    /// contract's §7), and leaves the store of corpora as it found it.
+    /// what it can see the same way, its own literals among them (V3),
+    /// and leaves the store of corpora as it found it.
     pub fn text_search_in(
         &self,
         model: ReadModel,
@@ -450,8 +450,8 @@ impl Snapshot {
             });
         };
         let language = query.stem.as_deref();
-        // A corpus kept in the version's own slot keeps its own-document index beside it
-        // (R32-N2); one built for this search alone builds its index for it alone.
+        // A corpus kept in the version's own slot keeps its own-document index beside it;
+        // one built for this search alone builds its index for it alone.
         let (kept_local, fresh);
         let own: &crate::term::text::Local = match (corpus, self.own_corpora()) {
             (CorpusRef::Kept(kept), Some(slot)) => {
@@ -525,7 +525,7 @@ impl Snapshot {
             return self.private_vector_search(view, model, scope, query, accept, budget);
         }
         // The space first: no vector of the query's dimension, nothing found and nothing
-        // reported, before a corpus is admitted (attack list item 7; sol-loop r1 S3).
+        // reported, before a corpus is admitted.
         let Some(input) = self.underlying().vector_input(query) else {
             let none = crate::VectorSearchReport {
                 space: 0,
@@ -557,7 +557,7 @@ impl Snapshot {
         Ok((found?, report))
     }
 
-    /// [`Self::vector_search_in`] of a private snapshot (V3; the lifecycle contract's §7):
+    /// [`Self::vector_search_in`] of a private snapshot (V3):
     /// the shared vectors of its corpus below the overlay's `start`, compared exactly as a
     /// reader's are ([`crate::term::vectors::search_eligible`]), and its own (the overlay's
     /// vector literals of the query's dimension in its corpus) by an exact scan of their own,
@@ -578,7 +578,7 @@ impl Snapshot {
         let input = self.underlying().vector_input(query);
         let corpus = self.text_corpus(Documents::Vectors, model, scope, budget)?;
         let start = view.start();
-        // The own vectors of the dimension among the corpus's members (sol-loop r1 B2): each
+        // The own vectors of the dimension among the corpus's members: each
         // parse charged first (`parse_bytes`) and let go; counted, their storage charged as
         // nrese-vector counts it (`bytes_for`, whole chunks past the first), then filled.
         let dimension = query.vector.len();
@@ -790,7 +790,7 @@ impl Snapshot {
             canonical: self.canonical,
         };
         // An unpublished snapshot keeps what it builds in its own version, for that
-        // version's readers (3.0c's slot; R32-N2): found again by the kind and its identity.
+        // version's readers (3.0c's slot): found again by the kind and its identity.
         let own = self.own_corpora();
         let identity = self.identity();
         if let Some(corpus) = own.as_ref().and_then(|own| own.corpus(kind, identity)) {
@@ -882,7 +882,7 @@ impl Snapshot {
         let span = self.version.dictionary_len;
         // Where the reader's equality classes hold literals (`r owl:sameAs "alpha"`), a
         // statement about an IRI can show a literal its commit never touched: those corpora
-        // are walked, never derived (sol-loop r1 S1).
+        // are walked, never derived.
         let from = from.filter(|_| iris || !self.classes_relate_literals(model));
         let built = match from {
             Some((base, touched)) => {
@@ -1035,7 +1035,7 @@ impl Snapshot {
         let count = (view.end() - start) as usize;
         let mut lengths = nrese_exec::ChargedVec::with_capacity(Arc::clone(budget), count)?;
         // An IRI's local-name text is made to be counted: its bytes charged first, let go
-        // after (sol-loop r1 B4). Literals are counted in place.
+        // after. Literals are counted in place.
         let mut scratch = nrese_exec::Reservation::new(Arc::clone(budget));
         for (id, key) in view.own_entries() {
             lengths.push(own_length(documents, id, key, &mut scratch)?)?;
@@ -1047,7 +1047,7 @@ impl Snapshot {
     /// brings one. For a private snapshot otherwise its reader's (the budget a query
     /// attached with [`Self::reading_within`]), else its private transaction's (the
     /// overlay's, which its view holds as long as it lives); each kept value holds its charge
-    /// there (V3 review r1 B1: the global entry points brought none, and the work went
+    /// there (the global entry points brought none, and the work went
     /// uncharged). A published snapshot's caller that brings none is unbounded, as before.
     fn search_budget(&self, budget: Option<&Arc<nrese_exec::Budget>>) -> Arc<nrese_exec::Budget> {
         if let Some(budget) = budget {
@@ -1325,7 +1325,7 @@ impl Snapshot {
     }
 }
 
-/// The own slot's losing builds (V3 review r1 F1, deterministic): two readers miss one
+/// The own slot's losing builds (deterministic): two readers miss one
 /// entry before either keeps it, both build, both keep; the second gets the first's value,
 /// and its own value and its entry's charge are gone by the time `keep` returns. For a
 /// corpus and for a private snapshot's own-document index. No lock is held between the miss
@@ -1405,7 +1405,7 @@ mod corpus_walk_tests {
     use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 
     /// A corpus walk over a run too small to be walked in parts holds no group walk's slab:
-    /// its scratch is the serial walk's (package review r1 S2). One literal, so one word of
+    /// its scratch is the serial walk's. One literal, so one word of
     /// bits (8 bytes), and one run of one statement: a slice's counts of that run and as many
     /// again (2,048 bytes), and two parts of a cut, a vector and four counts (192). With a
     /// query's earlier holds leaving 3,200 bytes, that fits and the walk is answered, the

@@ -2,9 +2,9 @@
 //! ([`set_transparent_huge_pages`](super::set_transparent_huge_pages)) as a mode, and the
 //! bulk phases that hold it on under [`HugePages::Bulk`].
 //!
-//! Huge pages make work over large heaps faster (LUBM 100's materialisation 26 % faster)
-//! and make a serving process hold more: a pool thread's allocator keeps a whole 2 MiB
-//! page for a touched byte, about 13 MiB a thread after LUBM 100's queries against 6 MiB
+//! Huge pages make work over large heaps faster (LUBM 100's materialisation takes 26 % longer
+//! without them) and make a serving process hold more: a pool thread's allocator keeps a whole
+//! 2 MiB page for a touched byte, about 13 MiB a thread after LUBM 100's queries against 6 MiB
 //! without (serve-memory measurements, 11 Nov 2026). `Bulk` takes both: on while a bulk
 //! load or a materialisation runs, off while serving.
 

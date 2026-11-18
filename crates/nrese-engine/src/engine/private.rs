@@ -1,7 +1,7 @@
 //! A private transaction: speculative changes over a given snapshot whose new terms are its own
 //! and never enter the dictionary ([`Engine::speculative_over`](super::Engine::speculative_over)).
-//! It never commits. Dictionary lifecycle, package 2b (`notes/2026-11-08-p2b-snapshot-switch-design.md`
-//! §1 point 5 and §2).
+//! It never commits.
+//! Dictionary lifecycle, package 2b.
 //!
 //! - **One vocabulary for life:** one overlay over the dictionary's entries below the given
 //!   snapshot's length, its `start`, fixed here. A term the dictionary had there keeps its id;

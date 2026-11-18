@@ -1,5 +1,5 @@
-//! Guard of a charged lookup's and decode's memory across a checkpoint (Sol's review of
-//! b967b63c): their bound and the read it bounds meet one state of the dictionary, though a
+//! Guard of a charged lookup's and decode's memory across a checkpoint:
+//! their bound and the read it bounds meet one state of the dictionary, though a
 //! snapshot shares the dictionary and a checkpoint publishes a compressed base under it.
 //! Measured against the charging budget (`nrese_exec::measure`), so this file is a test
 //! binary of its own.

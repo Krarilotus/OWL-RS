@@ -1,8 +1,8 @@
-//! Dictionary lifecycle V1, attack item 4 (`notes/2026-11-09-dict-v1-speculative-private-design.md`
-//! §4; the caller trace's caller 1, item 5): QL across private vocabularies. Two private
-//! transactions over one snapshot give their own terms the same numbers, so their schemas can
-//! be equal by number and different in meaning. The QL rewriting must answer each from its own
-//! schema, never one read for the other.
+//! Dictionary lifecycle V1: QL across private vocabularies. Two private
+//! transactions over one snapshot give their own terms the same numbers, so
+//! their schemas can be equal by number and different in meaning. The QL
+//! rewriting must answer each from its own schema, never one read for the
+//! other.
 //!
 //! The rewriting answers through existentials (tree witnesses: `ql_tests`); what a class
 //! hierarchy alone entails is the materialisation's, so the schema here is an existential.
@@ -112,7 +112,7 @@ fn private_vocabularies_equal_by_number_keep_their_own_ql_schema() {
     assert!(failed.is_empty(), "{failed:#?}");
 }
 
-/// A publication after a private snapshot opened (review dict-v1c r2, R2): private
+/// A publication after a private snapshot opened: private
 /// transactions take no writer slot, so a writer over the same base gives its new terms the
 /// private snapshot's own numbers, and the store's entry its read compiles can be equal by
 /// number to the private schema and differ in meaning.

@@ -1,8 +1,8 @@
 //! SPARQL over a private transaction (`Engine::speculative_over`), read through
 //! [`PendingRead`]: what it reads is the transaction's own state and vocabulary, or the query
 //! fails with a typed error. It never falls back to the base, never answers empty for a
-//! refusal, and adds nothing to the dictionary. Dictionary lifecycle V2
-//! (`notes/2026-11-09-dict-v2-readview-design.md` §3–4).
+//! refusal, and adds nothing to the dictionary.
+//! Dictionary lifecycle V2.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -105,8 +105,8 @@ fn limits(engine: &Engine) -> (usize, usize) {
 ///
 /// - Input: `ex:a ex:p "published"` committed; a private transaction asserting
 ///   `ex:a ex:p "only the transaction has this"`.
-/// - Expected: the query answers both objects, and the dictionary is as it was (invariant
-///   item 1, A5, A6).
+/// - Expected: the query answers both objects, and the dictionary is
+///   as it was.
 #[test]
 fn a_query_over_a_private_transaction_reads_its_own_state() {
     let engine = engine();
@@ -125,7 +125,7 @@ fn a_query_over_a_private_transaction_reads_its_own_state() {
 }
 
 /// A refused evaluation snapshot is a typed error before anything runs, never the base's
-/// answer or an empty one (A1).
+/// answer or an empty one.
 ///
 /// - Input: a private transaction whose budget holds its own term but not the frozen view a
 ///   pending snapshot needs (the budgets measured by [`limits`]).
@@ -170,7 +170,7 @@ fn a_refused_evaluation_snapshot_is_a_memory_error_on_every_entry() {
     );
 }
 
-/// A held result keeps the vocabulary it was computed in (LC S2, A2).
+/// A held result keeps the vocabulary it was computed in.
 ///
 /// - Input: typed results of a query over a private transaction, read after the
 ///   transaction is dropped.
@@ -206,7 +206,7 @@ fn held_results_outlive_the_private_transaction() {
 }
 
 /// Queries nested in a running query's rows, on one private view, as SHACL's checks run
-/// per focus node (A3).
+/// per focus node.
 ///
 /// - Input: one SELECT over the transaction, an ASK on the same view for each of its rows,
 ///   then 50 more queries.
@@ -250,7 +250,7 @@ fn queries_reenter_one_private_view() {
 }
 
 /// An update over a private transaction: each `WHERE` reads the earlier operations, its own
-/// terms included, and nothing enters the dictionary (A4).
+/// terms included, and nothing enters the dictionary.
 ///
 /// - Input: `INSERT DATA` of the own term, also into a new graph, then `DELETE/INSERT …
 ///   WHERE` moving it to `ex:q`, then `CLEAR GRAPH` of the new graph.
@@ -300,7 +300,7 @@ fn an_update_over_a_private_transaction_reads_its_earlier_operations() {
 }
 
 /// A refused write and a refused `WHERE` snapshot fail the update with a typed error;
-/// neither is skipped (A1, A4).
+/// neither is skipped.
 ///
 /// - Input: (1) a budget with no room, `INSERT DATA` of a new term; (2) the least budget that
 ///   holds the own term ([`limits`]), `INSERT DATA` of it, then an `INSERT … WHERE` that must
@@ -345,7 +345,7 @@ fn a_refused_update_is_a_memory_error() {
 }
 
 /// The update's reader view of a private transaction comes from its read source's private
-/// method (A4, A5: a session read's `WHERE`).
+/// method (a session read's `WHERE`).
 ///
 /// - Input: a read source answering a transaction's pending snapshot and counting its calls
 ///   per kind; an update with one `WHERE` over a private transaction.
@@ -415,9 +415,9 @@ fn an_updates_read_source_reads_a_private_transaction() {
     ));
 }
 
-/// Search over a private view finds what the view holds, never an empty match (A7). Until V3
+/// Search over a private view finds what the view holds, never an empty match. Until V3
 /// such a search was refused with an error; V3 (dictionary lifecycle) searches a private
-/// snapshot through its own charged path, so the property A7 protects (no empty answer, no
+/// snapshot through its own charged path, so what this protects (no empty answer, no
 /// read of another state) is now the transaction's own term as the one match.
 ///
 /// - Input: a text search for a word only the transaction's own term has; the published base

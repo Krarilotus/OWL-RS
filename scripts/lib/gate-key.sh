@@ -22,7 +22,7 @@
 # - for `windows`, `python=<id>` after tools: the Python runtime the checked commit declares for
 #   the suite (gate_runtime), which its job's suite ran with, verified (scripts/lib/fleet-gate.sh):
 #   a pass under another runtime, or one recorded before the tier declared one (its key has no
-#   python=), is never carried (PR #76 r1, R76-F2).
+#   python=), is never carried (PR #76).
 #
 # A pass is a line `<key> | <the job, its host and CPU>` in <git-common-dir>/nrese-gate-passed,
 # written by scripts/check.sh only.
@@ -33,8 +33,8 @@ gate_identity() (
   local rev=${1:?gate_identity COMMIT} root channel info release commit flags tools
   set -o pipefail
   # Cargo takes CARGO_ENCODED_RUSTFLAGS over RUSTFLAGS, and the identity (and what a fleet gate is
-  # sent) names RUSTFLAGS only: a gate under it would stand for flags it never ran with (Sol,
-  # review-remote-gates-r1-20261020). Refused, before any pass is looked up or run.
+  # sent) names RUSTFLAGS only: a gate under it would stand for flags it never ran with.
+  # Refused, before any pass is looked up or run.
   if [ -n "${CARGO_ENCODED_RUSTFLAGS+set}" ]; then
     echo "the gate doesn't run under CARGO_ENCODED_RUSTFLAGS (it overrides RUSTFLAGS): unset it, set RUSTFLAGS" >&2
     return 1

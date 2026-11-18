@@ -321,7 +321,7 @@ mod tests {
     use crate::{Dictionary, TermView};
 
     /// An empty needle without regard to case: every text holds it, and only an empty
-    /// one is it (it panicked in `windows(0)`: Sol's review, 18 October).
+    /// one is it (it panicked in `windows(0)`).
     #[test]
     fn an_empty_needle_without_regard_to_case_holds_everywhere() {
         let dictionary = Dictionary::default();

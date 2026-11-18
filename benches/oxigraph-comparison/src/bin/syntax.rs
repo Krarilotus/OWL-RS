@@ -25,7 +25,7 @@ fn seconds(mut work: impl FnMut() -> usize) -> f64 {
 }
 
 /// The comparisons the filter selects, and of them those timed: a run that times none, or
-/// fewer than it selects, didn't do what it was asked (Sol, PR #61 F3: a filter matching no
+/// fewer than it selects, didn't do what it was asked (PR #61: a filter matching no
 /// comparison timed nothing and succeeded).
 #[derive(Default)]
 struct Receipt {

@@ -44,7 +44,7 @@ pub(crate) fn write_graph(
 /// Adds (or, with `replace`, substitutes) the payload's triples in the target graph, each as
 /// it is read: an invalid payload fails the write, whose transaction is then discarded (the
 /// mutation pipeline commits only a write that ends). The new terms it interned stay in the
-/// shared dictionary (stated limit L3 for v1.5, dictionary lifecycle contract).
+/// shared dictionary (a known limit of v1.5).
 pub(crate) fn apply_graph_write(
     tx: &mut Transaction<'_>,
     request: &GraphWriteRequest,

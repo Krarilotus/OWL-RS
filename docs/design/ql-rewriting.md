@@ -278,8 +278,8 @@ Tree witnesses can be exponential in the query: k independent ones give 2^k bran
 
 **A reader of some graphs who sees every inference** (`inferred = "visible"`) is told
 `NRESE-Completeness: not-certified` wherever the rewriting runs, and no QL report: the
-assessment reads the schema of every graph, graphs the reader can't read included
-(R13-diag). The token asserts neither soundness nor completeness, so answers may be missing
+assessment reads the schema of every graph, graphs the reader can't read included.
+The token asserts neither soundness nor completeness, so answers may be missing
 or wrong, and it carries no regime, reason or count. Whether the rewriting runs depends on
 the query and the configuration, not on the schema, so the token is the same with an empty
 schema, from the cache, inside a transaction and in an EXPLAIN (`explain=true` or `plan`),

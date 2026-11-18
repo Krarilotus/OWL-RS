@@ -42,8 +42,8 @@ fn an_unconsumed_result_keeps_its_shared_capacity_until_drop() {
 /// Spec: a live result keeps the charge of what it holds (as the test above), so no table
 /// the evaluation consumes may release a charge it never took. Rows without columns count
 /// one id each, made per row of a substituted EXISTS (as written): one solution without
-/// bindings (an empty group under OPTIONAL; sol-loop r1 S1), and a fast COUNT(*) projected
-/// to no column (r2 T1). The live result of n one-column rows keeps at least their n * 8
+/// bindings (an empty group under OPTIONAL), and a fast COUNT(*) projected
+/// to no column. The live result of n one-column rows keeps at least their n * 8
 /// bytes charged.
 #[test]
 fn rows_without_columns_never_release_another_holders_charge() {

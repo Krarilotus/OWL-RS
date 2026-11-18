@@ -33,7 +33,7 @@
 //! A scan stops once the slices have found more than
 //! [`MAX_SETS`](super::characteristic::MAX_SETS) sets between them.
 //!
-//! Only a published snapshot admits (the lifecycle contract's S3): every claim, rebuild,
+//! Only a published snapshot admits (published-only admission): every claim, rebuild,
 //! build, save, load and kept entry here takes its [`SharedState`] and works on that
 //! token's snapshot alone. An unpublished one (a writer's pending state, a speculative or
 //! private one, a view of them) reads what published snapshots kept and computes the rest
@@ -431,7 +431,7 @@ impl Statistics {
     /// Rebuilds the drifted sets of `model` on a thread of its own, scanning on that
     /// thread alone, and replaces them when done; planners go on with the old ones. The
     /// thread owns a clone of the token's snapshot and takes its own token from it for
-    /// every later stage (the design check's F3): the sets are that snapshot's, whatever
+    /// every later stage: the sets are that snapshot's, whatever
     /// is published meanwhile.
     fn rebuild(self: &Arc<Self>, state: &SharedState<'_>, model: ReadModel) {
         let (statistics, snapshot) = (Arc::clone(self), state.snapshot().clone());
@@ -849,7 +849,7 @@ mod tests {
     /// minimum of 64. Kept, they are charged, for as long as any holder keeps them (an
     /// entry gone with its version, a planner's list still charged until it lets go);
     /// where the budget can't take them, nothing is kept, nothing stays charged and the
-    /// planner gets none, never a part (PR #81 review r1, F2).
+    /// planner gets none, never a part (PR #81).
     #[test]
     fn heavy_groups_are_kept_within_the_statistics_budget() {
         const H: u32 = 4;
@@ -917,8 +917,8 @@ mod tests {
 
     /// A read that expands equality classes has no heavy groups (its groups aren't the
     /// index's), also where a read of the same version as stored walked and kept them: a
-    /// kept list answered both, and an empty one turned an expanding count's budget off
-    /// (Sol, P2 sol-loop r1 S1).
+    /// kept list answered both, and an empty one turned an expanding count's budget
+    /// off.
     #[test]
     fn an_expanding_read_has_no_heavy_groups_kept_for_a_stored_one() {
         let engine = Engine::new(EngineConfig {
@@ -1091,7 +1091,7 @@ mod tests {
 
     /// A rebuild of the same sets under a budget that holds one copy keeps the old ones,
     /// charged as before; one that holds two replaces them, and the old ones' charge goes
-    /// with them. Sol's review of 6c683347: the rebuild that didn't fit dropped the kept sets
+    /// with them. The rebuild that didn't fit dropped the kept sets
     /// and left none (and nothing charged).
     #[test]
     fn a_rebuild_the_budget_cannot_take_keeps_the_old_sets() {
@@ -1128,7 +1128,7 @@ mod tests {
 
     /// What the kept sets hold is what they are charged, at any number of predicates: they
     /// are built into charged vectors, and their `Arc`'s block is charged before it is
-    /// allocated. Sol's review of 6c683347: a charge estimated from the maps' capacities,
+    /// allocated. A charge estimated from the maps' capacities,
     /// and the `Arc` charged after it was allocated, left 81,968 bytes uncharged at 4,096
     /// predicates.
     #[test]

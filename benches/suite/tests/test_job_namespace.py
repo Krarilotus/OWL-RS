@@ -223,7 +223,7 @@ class JobNamespaces(unittest.TestCase):
             self.assertIn("not removed: nrese-target-work", done.stdout)
 
     def test_python_and_shell_name_alike(self):
-        # Master r3 B1: shell launch labels and Python labels share exact fleet ownership.
+        # Shell launch labels and Python labels share exact fleet ownership.
         with tempfile.TemporaryDirectory() as tmp:
             for job in ("", "Consol-SCC@shared"):
                 done = subprocess.run([BASH, "-c", f'. "{(ROOT / "scripts/lib/ns.sh").as_posix()}"; ns_name target "$1"; '
@@ -303,7 +303,7 @@ GATE_PUBLISH = ("scripts/lib/gate-publish.sh", *isolation.NS_SH, "scripts/cargo-
 
 @unittest.skipUnless(BASH, "needs bash")
 class GateBuilds(unittest.TestCase):
-    """The revisions these name (HEAD) are a commit of their own checkout's: PR #57 r1 R2, they
+    """The revisions these name (HEAD) are a commit of their own checkout's: in PR #57 they
     resolved HEAD in the checkout the run started in."""
 
     def setUp(self):
@@ -459,7 +459,7 @@ FLEET_JOB=mine ns_clean "$1" "" all
         return [words for words in lines if words[:1] == ["run"]]
 
     def test_a_maker_s_containers_carry_their_job_s_label_and_declared_limits(self):
-        """The master, 8 Nov 2026 (pkg/maker-containers): a timing job declares the container its data
+        """8 Nov 2026 (pkg/maker-containers): a timing job declares the container its data
         makers start (F61, release_gate.data_job()); the fleet's runner stops the step at a container
         made during it without the job's `fleet.job` label, or without a declared container's exact
         memory and CPUs. So every container the LUBM and OWL2Bench makers start, the `test -s` probes

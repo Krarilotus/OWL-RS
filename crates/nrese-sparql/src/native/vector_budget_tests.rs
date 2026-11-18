@@ -1,4 +1,4 @@
-//! What a vector search holds against what it charges (SRCH review r1, R1-C1), under this
+//! What a vector search holds against what it charges, under this
 //! test binary's counting allocator ([`nrese_exec::measure`]): the search widens its `k`
 //! towards the whole space while its hits fail the query's checks, and every hit list and
 //! heap that widening grows is charged to the query's budget before it is allocated.
@@ -138,7 +138,7 @@ fn a_vector_search_past_its_envelope_is_refused_and_releases_everything() {
 /// The exact scan holds nothing it didn't charge, at one, two and three parts (where a
 /// collected list of parts would round its allocation up) and at sixteen: each part's
 /// heap and hits, the list of parts and the merge are charged before they are allocated
-/// and released after they are freed (review fix check, S1).
+/// and released after they are freed.
 #[test]
 fn an_exact_scan_holds_no_more_than_it_charges() {
     use nrese_engine::vector::{Metric, Vectors, exact};

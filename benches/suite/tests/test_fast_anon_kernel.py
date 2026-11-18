@@ -138,7 +138,7 @@ class HugePages(unittest.TestCase):
                          {"anon_thp_peak_bytes": 6 << 20, "thp_fault_alloc": 5, "thp_collapse_alloc": 1})
 
     def test_each_process_new_in_the_scope_has_its_thp_enabled_with_its_pid(self):
-        # Spec (Sol r1, 14 Nov 2026; fast.py's setup cases): a shell runs `setup && case` in one
+        # Spec (fast.py's setup cases): a shell runs `setup && case` in one
         # scope; the setup (a perf_lab, its child) comes first, then the shell execs the case's
         # perf_lab under its own pid. Each process (pid and name) is kept, with when it was first
         # seen. The looks start after the dense first quarter second and come once a second.

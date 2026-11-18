@@ -55,7 +55,7 @@ pub enum Hazard {
     /// (I24c).
     OutsideProfile(Term),
     /// An axiom outside the profile, as [`Self::OutsideProfile`], that equates individuals
-    /// and names no term: global, which needs none (master, 8 Nov 13:15).
+    /// and names no term: global, which needs none.
     Equating,
     /// A structure the mapping drops (malformed, unsupported, a broken list), at the node
     /// it reports: the axiom it was part of isn't read at all (I24c-2).
@@ -207,8 +207,8 @@ struct Collect<'a> {
     o: &'a Ontology,
     found: Vec<Hazard>,
     /// The terms of a counting restriction's filler, with its [`Hazard::Cardinality`]: a
-    /// membership missed there misses an equality the restriction makes (D16-492 fix
-    /// check r1, F1).
+    /// membership missed there misses an equality the restriction
+    /// makes.
     counted: Vec<(Term, Hazard)>,
 }
 
@@ -410,7 +410,7 @@ pub(crate) fn hazards(
                     found.extend(left.iter().map(|&c| Hazard::Enumeration(c)));
                 }
                 // The right side is read too: `A ⊑ ∀R.B` gives an anonymous `R`-successor
-                // of an `A` its `B` (D16-492 fix check r2, F1).
+                // of an `A` its `B`.
                 let right = expr_terms(*r);
                 let premise = left.iter().chain(&right).copied().collect();
                 edges.push((premise, right));
@@ -559,7 +559,7 @@ pub(crate) fn hazards(
             equating.entry(t).or_insert(h);
         }
     }
-    // A counted filler's terms equate as its property does (fix check r2, F2: kept apart,
+    // A counted filler's terms equate as its property does (kept apart,
     // they reached the walk below anyway through the filler's own hazards).
     for (t, h) in collect.counted {
         equating.entry(t).or_insert(h);
@@ -625,8 +625,8 @@ pub(crate) fn hazards(
     }
     start.extend(asserted);
     start.extend(untyped);
-    // Axioms outside the closure's profile that no other hazard covers (I24c, design note
-    // "Source 3"): seeded after the walk below, along their own edges.
+    // Axioms outside the closure's profile that no other hazard covers (I24c): seeded after
+    // the walk below, along their own edges.
     let mut outside: Vec<(Term, Hazard, usize)> = Vec::new();
     // An uncovered axiom that equates named individuals: global, unless another hazard
     // already is (that one's reason is the more specific).
@@ -644,14 +644,14 @@ pub(crate) fn hazards(
             equating_properties.get_or_insert_with(|| crate::profile::equating_properties(o));
         let equality = crate::profile::concludes_equality(o, axiom, equating);
         // A conclusion that equates may name no term of its own (`∀R.{a}`, `C ⊑ {a}`): its
-        // hazard is global, named by any term of the axiom (review r1, F1).
+        // hazard is global, named by any term of the axiom.
         let name = match concluded.first() {
             Some(&t) => Some(t),
             None if equality => crate::profile::label(o, axiom),
             None => None,
         };
         // An equating axiom is global whether or not a term names it: a global hazard
-        // reaches every term (master, 8 Nov 13:15).
+        // reaches every term.
         if equality && outside_global.is_none() {
             outside_global = Some(name.map_or(Hazard::Equating, Hazard::OutsideProfile));
         }
@@ -714,7 +714,7 @@ pub(crate) fn hazards(
         global = outside_global.or(asserted_outside);
     }
     // What named individuals may miss of uncovered axioms' conclusions, along every axiom
-    // from premise to conclusion (design note "Source 3"). A seed doesn't follow its own
+    // from premise to conclusion. A seed doesn't follow its own
     // axiom back to its premise, which holds wherever its conclusion is missed. A term
     // reached through another axiom follows every axiom, its seed's included.
     // Built only for seeds to walk from: without an uncovered conclusion, nothing.
@@ -770,10 +770,10 @@ pub(crate) fn hazards(
 /// own, property inclusions, inverses and equivalences as they link. Assertions have
 /// none.
 fn directed_edges(o: &Ontology, axiom: &Axiom) -> Vec<(Vec<Term>, Vec<Term>)> {
-    // Premises by every term they read, the conclusion's own included: `A ⊑ ∀R.B` reads
-    // `R`, so an `R` edge missed misses a `B` (D16-492 fix check r1, F1). Conclusions by
-    // the terms they can add positive facts on (`profile::positive_terms`, review r1, F3:
-    // `∀R.D` adds none on `R`).
+    // Premises by every term they read, the conclusion's own included: `A ⊑ ∀R.B`
+    // reads `R`, so an `R` edge missed misses a `B`. Conclusions by the terms they
+    // can add positive facts on (`profile::positive_terms`: `∀R.D` adds none on
+    // `R`).
     let t = |es: &[ExprId]| {
         let mut out = Vec::new();
         for &e in es {
@@ -927,7 +927,7 @@ fn existential_roles(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
 /// The existentials concluded by `e` (`positive`) or by its complement: their roles into
 /// `roles`, their fillers' terms into `fillers` where given (a caller without them reads
 /// no filler's terms: #155's count). Every `≥ 1`-form of the expression's
-/// negation normal form is collected, at any depth (fix check r2, F4):
+/// negation normal form is collected, at any depth:
 /// - A restriction makes a successor where it reads as `≥ n` for n ≥ 1: `∃R.F`, `≥ n` and
 ///   `= n` for n ≥ 1, `¬∀R.F` (`∃R.¬F`), `¬≤ n` (`≥ n+1`) and `¬= n` (it may be `≥ n+1`).
 ///   `∀`, `≤` and `= 0` make none, nor do `¬∃` and `¬≥ n`, which are `∀` and `≤ n−1`.

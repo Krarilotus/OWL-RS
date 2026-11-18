@@ -358,7 +358,7 @@ fn embedded_low_memory_bounds_are_unavailable_on_every_build_path() {
     assert!(matches!(prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()));
 }
 
-/// REAS-3 (C17; master, 9 Nov 02:34). Spec (`GaveUp`'s docs and SYN-61: what memory refused is
+/// REAS-3 (C17). Spec (`GaveUp`'s docs and SYN-61: what memory refused is
 /// never kept, the next read builds it again): a U1 the process's memory stopped is not kept for
 /// its revision, on a read's build and on a commit's. Kept, every later reader of the revision
 /// is answered by the lower bound alone (dl/query/mod.rs: the view's `unavailable`) until the
@@ -457,7 +457,7 @@ fn embedded_low_memory_stops_maintenance_of_an_existing_upper_bound() {
     assert!(matches!(prepared.prepared, Prepared::Rebuilt(upper) if upper.is_err()));
 }
 
-/// REAS-2 fix check r1 (R2-F3, U1). Spec (design note, rule 2: a stop is an error the
+/// REAS-2, U1. Spec (a stop is an error the
 /// consumer has to handle, never an answer): U1's change for a commit ends at its stop. U1
 /// built over an existential axiom and one member, then a change deleting 16 × `POLL_UNITS`
 /// facts U1 doesn't hold, the stop firing at its first ask after the first of their view

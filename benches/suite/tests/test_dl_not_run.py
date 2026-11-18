@@ -123,7 +123,7 @@ class ElTrack(unittest.TestCase):
         return status, rows, commands
 
     def test_a_conversion_the_fleet_refuses_leaves_not_run_rows_and_exit_2(self):
-        # Spec: the master, 14 Nov 2026, D16-582: the conversion container stopped by the fleet (exit 125, as
+        # Spec: D16-582 (14 Nov 2026): the conversion container stopped by the fleet (exit 125, as
         # ore80-nrese-5009ce9b-r3 showed) is no answer: every EL task is `not-run` with the reason.
         with tempfile.TemporaryDirectory() as tmp:
             cases = self.cases(tmp)
@@ -183,7 +183,7 @@ class ElTrack(unittest.TestCase):
         self.assertEqual(status, 0)
 
     def test_a_file_a_failed_conversion_left_is_converted_again_never_classified(self):
-        # Spec: nrese.py's docstring (review round 1, R1): only a completed conversion's file is an input.
+        # Spec: nrese.py's docstring: only a completed conversion's file is an input.
         # The runner writes into the final file before its row, so a timeout (its exit 3, Runner.java) or a
         # kill leaves a partial file; the next run converts that task again instead of classifying it.
         manifests = []
@@ -218,9 +218,9 @@ def link(target, name):
 
 
 class RunsSomething(unittest.TestCase):
-    """D16-642 (the master, 15 Nov 2026): the kit refuses an ontology folder its conversion container
+    """D16-642 (15 Nov 2026): the kit refuses an ontology folder its conversion container
     cannot see, and a driver whose task list runs nothing fails. Twice a row was lost this way: ore80-nrese
-    r2 (14 Nov) and fc-dlnrese-4e0ff30f-1115b (15 Nov) linked CASES/files to the host's folder, and every
+    (14 Nov) and fc-dlnrese-4e0ff30f-1115b (15 Nov) linked CASES/files to the host's folder, and every
     EL conversion found no input."""
     cases, classify, run_el = ElTrack.cases, ElTrack.classify, ElTrack.run_el
 
@@ -317,9 +317,9 @@ class DlTracks(unittest.TestCase):
         return cases, task
 
     def test_a_dl_step_that_does_not_run_is_a_not_run_row_and_the_driver_exits_2(self):
-        # Spec: the master, 14 Nov 2026, D16-582: a missing input or a program that does not start is no
+        # Spec: D16-582 (14 Nov 2026): a missing input or a program that does not start is no
         # outcome of the reasoner's (before: `error`, or the driver stopped), and the job sees exit 2. Exit 127
-        # is the loader's when a library is missing (review round 1, R2): the program never ran either.
+        # is the loader's when a library is missing: the program never ran either.
         def not_found(command, **_):
             raise FileNotFoundError(2, "No such file or directory")
 
@@ -369,8 +369,8 @@ class DlTracks(unittest.TestCase):
 
     def test_a_task_not_run_before_is_run_again(self):
         # Spec: nrese.py's docstring: a `not-run` row is no answer, so a later run takes the task again
-        # (a task with an answer is skipped unless --again); the latest row decides, as in ore.py (review
-        # round 1, R3: an older answer, then a `--again` run that did not run).
+        # (a task with an answer is skipped unless --again); the latest row decides, as in ore.py (an older answer, then a `--again` run that did not
+        # run).
         task_id = "ore_ont_7-dl-classification"
         not_run = f"{task_id}\tnrese-dl\tclassify\tnot-run\t0\tinput missing\n"
         answered = f"{task_id}\tnrese-dl\tclassify\tclassified\t5\th\n"
@@ -402,7 +402,7 @@ class Readers(unittest.TestCase):
     def test_compare_counts_a_not_run_row_as_no_answer_and_exits_2(self):
         # Spec: the task's
         # verdict is the references', the not-run row's own verdict column says `not-run`; a task no reasoner
-        # ran (EL2) is no `undecided` task either (review round 1, R5).
+        # ran (EL2) is no `undecided` task either.
         h = "c" * 64
         results = (f"{EL1}\thermit\tclassify\tclassified\t9\t{h}\n{EL1}\telk\tclassify\tclassified\t9\t{h}\n"
                    f"{EL1}\tnrese-el\tclassify\tnot-run\t0\tno N-Triples: the conversion exited 125\n"
@@ -447,17 +447,17 @@ class ReferenceRunner(unittest.TestCase):
         # Spec: fleet Spec 9 and ns.run_args: in a job declaring its containers, every suite container
         # has the declared memory and CPUs (any other stops the step); elsewhere the runner's 12g without swap
         # and 8 CPUs. The declared size asked in another unit is the same size; a different size or CPU count
-        # starts nothing (review round 1, R6).
+        # starts nothing.
         with patch.object(hosts, "image", return_value="nrese-bench/dl-reference"):
             reference = load("reference_not_run_contract", DL / "reference.py")
         declared = str(2 * 2**30) + "b"
         # CPU counts as Docker reads them (docker/cli opts.ParseCPUs: an exact rational number of whole
         # nano-CPUs in a signed 64-bit integer). A fractional declaration is the same count asked again and is
-        # given as declared (review round 3, F1); a spelling finer than Docker takes is given at its nearest
-        # nano-CPU (round 4, F1) and compared there (round 5, F1); another spelling of the same number (`1/2`,
-        # `0x1`) is the same limit (round 6, F1); the exact number is rounded, not its float (round 6, F2).
+        # given as declared; a spelling finer than Docker takes is given at its nearest
+        # nano-CPU and compared there; another spelling of the same number (`1/2`,
+        # `0x1`) is the same limit; the exact number is rounded, not its float.
         # Refused, nothing started: below one nano-CPU (Docker refuses it as too precise; rounded it could be
-        # 0, no limit; round 5, F2, round 6, F2) and past the 64-bit count (Docker would wrap it; round 6, F3).
+        # 0, no limit) and past the 64-bit count (Docker would wrap it).
         fraction = {**JOB, "NRESE_SUITE_CPUS": "1.234567"}
         precise = {**JOB, "NRESE_SUITE_CPUS": "0.10000000000000001"}
         for environ, asked, memory, cpus in ((JOB, [], declared, "2"), ({}, [], "12g", "8"),
@@ -518,7 +518,7 @@ def cpu_limits(argv):
 
 
 class W3cReaders(unittest.TestCase):
-    """The other reader of the kit's rows (review round 1, R4): w3c.py's `compare` and `against`."""
+    """The other reader of the kit's rows: w3c.py's `compare` and `against`."""
 
     def setUp(self):
         try:

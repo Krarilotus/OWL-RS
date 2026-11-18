@@ -1,6 +1,6 @@
-//! A publisher's new entries before they are the dictionary's: the lifecycle contract's
-//! private heap (`notes/2026-11-08-dictionary-lifecycle-contract.md` P3–P4, package 1's design
-//! note `notes/2026-11-08-p1-prepared-install-design.md`).
+//! A publisher's new entries before they are the dictionary's:
+//! a private heap
+//! (package 1).
 //!
 //! A [`Suffix`] holds the keys one writer slot holder adds, numbered from the dictionary's
 //! length when it opened: their final ids, since no one else adds entries meanwhile. They stay

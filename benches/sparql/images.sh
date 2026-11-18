@@ -24,8 +24,8 @@ done
   --driver-opt cpuset-cpus=0-7 --driver-opt cpu-shares=2 --driver-opt memory=8g --driver-opt memory-swap=8g >/dev/null
 # What an image is built from, on the image itself: its context's git tree and the source commit it
 # builds (the receipt reads them off the id that ran: suitekit/driver.py image_source). Only from a
-# clean checkout, read as clean: a `git status` that fails is no evidence of one (review
-# image-source-commit r1 F1). A build at another commit than its Dockerfile's says so in its own label.
+# clean checkout, read as clean: a `git status` that fails is no evidence of one.
+# A build at another commit than its Dockerfile's says so in its own label.
 labels() {  # CONTEXT (under the repository) COMMIT -> LABELS
   LABELS=()
   local status tree
@@ -35,7 +35,7 @@ labels() {  # CONTEXT (under the repository) COMMIT -> LABELS
   LABELS=(--label "owlrs.built-from=$1@$tree" --label "owlrs.source-commit=$2")
 }
 # The source commit a context declares, the one place it is named: every `ARG NAME=` default of its
-# Dockerfile, one non-empty value. Absent, empty or two values: the build refuses (r1 follow-up),
+# Dockerfile, one non-empty value. Absent, empty or two values: the build refuses,
 # also with a commit given, which a Dockerfile without the ARG wouldn't build. Read by
 # suitekit/dockerfile.py, the one reader suite.py coverage shares.
 declared() {  # CONTEXT NAME -> the value

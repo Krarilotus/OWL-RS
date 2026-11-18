@@ -1,5 +1,5 @@
 //! A shared value whose `Arc` block is charged, and released only after the block is freed
-//! (package 1 review r1 F2's order, generalised from the suffix's chunk reference).
+//! (package 1's order, generalised from the suffix's chunk reference).
 //!
 //! An `Arc<T>` dropped as such drops `T` first, releasing whatever charges `T` holds, and frees
 //! its block after: memory held beyond its charge. A [`ChargedArc`]'s last holder instead takes

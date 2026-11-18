@@ -839,7 +839,7 @@ impl Run {
 
     /// The pairs matching the bound positions, as slices of one order (a slice per chunk
     /// they are in), with whether that order is `(object, subject)` and `old`, made as they
-    /// are asked for (REAS-2 fix check r1, rule 1: no list built and counted afterwards);
+    /// are asked for (no list built and counted afterwards);
     /// `None` if they aren't one slice per chunk (an object without its order).
     fn matching(&self, s: Option<u64>, o: Option<u64>, old: bool) -> Option<RunSlices<'_>> {
         Some(match (s, o) {
@@ -955,7 +955,7 @@ impl Run {
     }
 
     /// An upper bound on the pairs matching the bound positions: a chunk range read per chunk
-    /// the key's pairs span, each counted on `probe` (review r1 F2: a key can span many
+    /// the key's pairs span, each counted on `probe` (a key can span many
     /// chunks).
     fn estimate(&self, s: Option<u64>, o: Option<u64>, probe: Probe<'_, '_>) -> usize {
         match (s, o) {
@@ -1039,7 +1039,7 @@ impl<'a> Slice<'a> {
 }
 
 /// Keeps the facts of `facts` that `store` doesn't hold, in order; [`Stopped`] at the first
-/// probe its poller stopped, `facts` then emptied (fix check r1, rule 2: a stopped probe
+/// probe its poller stopped, `facts` then emptied (a stopped probe
 /// read as "not held" walked every fact after it).
 fn keep_unheld<S: Source + ?Sized>(
     store: &S,
@@ -1065,8 +1065,8 @@ fn keep_unheld<S: Source + ?Sized>(
 }
 
 /// One run's slices matching a pattern ([`Run::matching`]), each made as it is asked for:
-/// a chunk's slice of a key costs a search in that chunk, and nothing is collected (REAS-2
-/// fix check r1, R2-F2: one key can span any number of chunks).
+/// a chunk's slice of a key costs a search in that chunk, and nothing is collected (one key can span any number of
+/// chunks).
 #[derive(Clone)]
 struct RunSlices<'a> {
     /// A pair's own slice (both positions bound), handed on first.
@@ -1322,7 +1322,7 @@ impl Relation {
     }
 
     /// Whether the delta has a pair with object `o`, counting what it reads on `poll`;
-    /// [`Stopped`] once that has stopped (fix check r2, B9: never a "no").
+    /// [`Stopped`] once that has stopped (never a "no").
     pub(crate) fn delta_has_object(&self, o: u64, poll: &Poller<'_>) -> Result<bool, Stopped> {
         let mut found = false;
         let all = |_: u64, _: u64| true;
@@ -1356,7 +1356,7 @@ impl Relation {
                 }
             }
             None => {
-                // Each pair read counted as it is read (review r1 F1).
+                // Each pair read counted as it is read.
                 let mut objects: Vec<u64> = poll
                     .counted(self.delta.so.iter())
                     .map(|&(_, o)| o)
@@ -1364,8 +1364,8 @@ impl Relation {
                 poll.ended()?;
                 objects.sort_unstable();
                 objects.dedup();
-                // `f` counts its own work on `poll`: a stop there ends the objects (sol-loop
-                // r1 S1). The objects it passes over uncounted are REAS-3's (SW038).
+                // `f` counts its own work on `poll`: a stop there ends the objects.
+                // The objects it passes over uncounted are REAS-3's (SW038).
                 for o in objects {
                     f(o);
                     poll.ended()?;
@@ -1644,10 +1644,10 @@ impl Store {
     /// Those searches were 54 % of LUBM 100's reasoning samples, but mostly the cache
     /// misses at their targets, which a finger keeps: the reasoning took 6 % less.
     /// Returns how often it started the runs from the beginning: once per relation.
-    /// Each fact's probe counted on `poll`, a run of at most [`RUN`] at a time (review r1 F1:
-    /// a morsel bounds its drivers, not its output). The first run that finds `poll` stopped
+    /// Each fact's probe counted on `poll`, a run of at most [`RUN`] at a time (a morsel bounds its drivers, not its output).
+    /// The first run that finds `poll` stopped
     /// ends the keep: `facts` is emptied and [`Stopped`] returned, no candidate after it
-    /// looked at (fix check r1, R2-F3: a stopped keep answering "not new" for the rest still
+    /// looked at (a stopped keep answering "not new" for the rest still
     /// walked them all).
     fn retain_new(&self, facts: &mut Vec<Triple>, poll: &Poller<'_>) -> Result<u64, Stopped> {
         let mut at: Option<(u64, Option<&Relation>)> = None;
@@ -1827,7 +1827,7 @@ impl Store {
     /// them; a run without its object order is read whole for the objects. Each relation is
     /// a task with its own poller, counting each lookup (a term in a run's order) and each
     /// position read (sweep M17: relations × terms lookups). A stopped task fails the pass,
-    /// and no relation's task starts after it (fix check r2, R3-F2: each later relation
+    /// and no relation's task starts after it (each later relation
     /// made its poller and answered an empty list).
     fn mentioning(
         &self,
@@ -1841,7 +1841,7 @@ impl Store {
             .map(|(relation, &p)| -> Result<Vec<Triple>, Stopped> {
                 let mut out = Vec::new();
                 let poll = Poller::new(stop).ok_or(Stopped)?;
-                // The pairs of `slices`, each counted as it is read (review r1 F1: a slice is
+                // The pairs of `slices`, each counted as it is read (a slice is
                 // a whole chunk, or the whole input); false once stopped.
                 let read = |out: &mut Vec<Triple>,
                             slices: &mut dyn Iterator<Item = &[Pair]>,
@@ -2060,8 +2060,8 @@ impl Visits for Store {
         }
     }
 
-    /// Each relation asked about counted as it is asked, and each chunk range it reads
-    /// (review r1 F1, F2); a sum its stop cut short is `Err` (fix check r1, B9).
+    /// Each relation asked about counted as it is asked, and each chunk range it reads;
+    /// a sum its stop cut short is `Err`.
     fn size(
         &self,
         [s, p, o]: [Option<u64>; 3],
@@ -2090,9 +2090,9 @@ impl Visits for Store {
         seg: Seg,
         probe: Probe<'_, '_>,
     ) -> Result<Option<usize>, Stopped> {
-        // Each relation asked about, and each slice it holds of the matches, counted as it is
-        // made (review r1 F1, F2; fix check r1 R2-F2: the slices are made one at a time); a
-        // length its stop cut short is `Err` (B9).
+        // Each relation asked about, and each slice it holds of the matches,
+        // counted as it is made, one slice at a time; a length its stop cut short
+        // is `Err`.
         let positions = probe
             .counted(self.relations_of(p))
             .map(|(_, relation)| {
@@ -2116,9 +2116,9 @@ impl Visits for Store {
         range: std::ops::Range<usize>,
         visit: &mut Visit<'_, '_>,
     ) {
-        // The range's positions were counted ahead, filtered ones included (REAS sol-loop
-        // r7): each is delivered or skipped within that count. The relations and slices
-        // passed on the way to it are counted as they are made (fix check r1, R2-F2: a
+        // The range's positions were counted ahead, filtered ones included:
+        // each is delivered or skipped within that count. The relations and slices
+        // passed on the way to it are counted as they are made (a
         // range far into one key's chunks passes every slice before it).
         let poll = visit.poller();
         let mut at = 0;
@@ -2219,7 +2219,7 @@ impl Equality {
     }
 
     /// The class of `x`: itself and its `sameAs` partners, sorted; [`Stopped`] where its
-    /// poller stopped the read, never a part of the class (fix check r1, B9).
+    /// poller stopped the read, never a part of the class.
     fn members<S: Source + ?Sized>(
         &self,
         store: &S,
@@ -2255,7 +2255,7 @@ impl Equality {
     ) -> Result<Vec<Triple>, Interrupted> {
         let stop: super::eval::Stop<'_> = &|| operation.fired();
         let poll = Poller::new(stop).ok_or_else(|| operation.interrupted())?;
-        // A read its poller stopped ends the module (fix check r1, rule 2).
+        // A read its poller stopped ends the module.
         let stopped = |Stopped| operation.interrupted();
         // The equalities are asked only as far as the two decisions below need (an estimate
         // of `limit` or more reads as more): whether there are any, and, while the partners
@@ -2394,7 +2394,7 @@ impl Equality {
                     )
                 },
                 // The fold's error: `Some` a refusal, `None` a stop. Either ends the thread's
-                // fold (fix check r1, rule 2: a stopped thread passed over each later seed).
+                // fold (a stopped thread passed over each later seed).
                 |(mut copies, mut scratch, poll),
                  &[s, p, o]|
                  -> Result<_, Option<BudgetExceeded>> {
@@ -2407,7 +2407,7 @@ impl Equality {
                         let bound = copies_at_most([&ms, &mp, &mo]);
                         // The product of its classes, a probe each, counted ahead a run of at
                         // most POLL_UNITS objects at a time ([`Visit::ahead`]'s rule): stopped,
-                        // it ends there (sol-loop r1 S1), and the operation ends with what it
+                        // it ends there, and the operation ends with what it
                         // made. A tick and a stop check per probe were a quarter of the read
                         // layer's cost on replication (REAS-2 timing, p2-reas2-abl-v1).
                         let probe = Probe::of(poll);
@@ -3302,7 +3302,7 @@ fn run_body(
         let mut families: Vec<Option<u64>> = Vec::new();
         // After a merge, the rules whose guards see the classes run in full.
         let again = |rule: &Rule| reevaluate && sees_classes(rule);
-        // A stopped read ends the round's job list (fix check r2, R3-F1).
+        // A stopped read ends the round's job list.
         let stopped = |Stopped| Interrupted::default();
         for (r, i) in program.variants(&store, &stage).map_err(stopped)? {
             if r < evaluated && !again(&program.rules[r]) {
@@ -3661,7 +3661,7 @@ fn list(
                         )
                     },
                     // The fold's error: `Some` a refusal, `None` a stop. Either ends the
-                    // thread's fold before it touches the next fact (fix check r2, R3-F2: a
+                    // thread's fold before it touches the next fact (a
                     // stopped thread looked up every later fact's classes), as the equality
                     // fold's does.
                     |(mut copies, mut scratch, poll), fact| -> Result<_, Option<BudgetExceeded>> {
@@ -3825,7 +3825,7 @@ pub(crate) fn check<S: Source + ?Sized>(
     let Some(poll) = Poller::new(stop) else {
         return Err(Interrupted::default());
     };
-    // A stopped read ends the job list (fix check r2, R3-F1); each rule is a unit of work,
+    // A stopped read ends the job list; each rule is a unit of work,
     // a bodiless one recorded included.
     let stopped = |Stopped| Interrupted::default();
     let mut jobs: Vec<(usize, Job<'_>)> = Vec::new();
@@ -3902,7 +3902,7 @@ mod counted_tests {
         test(&poll);
     }
 
-    /// REAS-2 (master, 8 Nov 05:29: a counted test per leaf that filters): the store's scan
+    /// REAS-2 (a counted test per leaf that filters): the store's scan
     /// counts the positions its runs pass over, not only the facts it delivers. A lookup by
     /// object alone in a relation without its object order reads every pair: over three poll
     /// intervals of pairs, none with the object, a poller whose stop has fired polls within
@@ -3926,7 +3926,7 @@ mod counted_tests {
         });
     }
 
-    /// REAS-2 review r1 F1: the stored facts mentioning a term ([`Store::mentioning`], what an
+    /// The stored facts mentioning a term ([`Store::mentioning`], what an
     /// equality merge rewrites) are read as they are counted. A relation without its object
     /// order is read whole for the objects: its input of 8 × `POLL_UNITS` pairs, none with the
     /// object asked for, asks the stop at least once every `POLL_UNITS` plus one run (the
@@ -3998,7 +3998,7 @@ mod counted_tests {
         }
     }
 
-    /// REAS-2 (orchestrator, 8 Nov 15:54): a closed family's read of a marked delta
+    /// REAS-2 (8 Nov): a closed family's read of a marked delta
     /// ([`Run::scan_unmarked`]) counts a slice's positions ahead, so its reader asks its stop
     /// within `POLL_UNITS` plus one run, the longest run counted at once: [`RUN`], which is
     /// `POLL_UNITS` (`Run::scan_unmarked` hands each slice on in pieces of at most `RUN`). One
@@ -4046,7 +4046,7 @@ mod counted_tests {
         );
     }
 
-    /// REAS-2 fix check r1 (R2-F2). Spec (design note, rule 1: a producer of descriptors
+    /// REAS-2. Spec (a producer of descriptors
     /// yields them lazily, each counted as it is made): a job's length of one key's matches
     /// (`Source::matches_len`, what `Job::new` asks) and a morsel's range of them
     /// (`Source::scan_range`) read the key's chunk slices as they count them. One subject
@@ -4120,7 +4120,7 @@ mod counted_tests {
         );
     }
 
-    /// REAS-2 fix check r1 (R2-F3, a morsel's keep). Spec (design note, rule 2: a stop ends
+    /// REAS-2, a morsel's keep. Spec (a stop ends
     /// the loop around it): a morsel's keep of its candidates (`Store::retain_new`) ends once
     /// its poller has stopped. 16 × `POLL_UNITS` candidates the store doesn't hold, the stop
     /// firing at its first ask after the keep has begun: the keep looks at no more than one

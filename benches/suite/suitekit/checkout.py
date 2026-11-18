@@ -2,7 +2,7 @@
 them nothing but the gate's scratch (release-gate.sh worktree(); release_gate.py imports it). It
 imports nothing of the repository, so release-gate.sh runs it with `python3 -I`, which puts none of
 a checkout on Python's path: it checks the checkout of the gate's own code before any Python runs
-from there (Sol, PR #60 fix checks 1 and 2: files in the checkout the gate was launched from ran in
+from there (PR #60: files in the checkout the gate was launched from ran in
 the validator before anything was checked).
 
     python3 -I benches/suite/suitekit/checkout.py REV DIR [--nothing-else]
@@ -20,7 +20,7 @@ from pathlib import Path
 # The objects as stored, for every git call that decides what a side is built from or whether its
 # measurement ref may go: no replace ref stands another object in, no graft another parent.
 # release-gate.sh exports the same for a whole gate, so the check and the checkout it builds read
-# the same objects (PR #54 review: D1-D3, and fix check 1: a replace ref made after the check).
+# the same objects (PR #54: a replace ref made after the check).
 STORED_OBJECTS = {"GIT_NO_REPLACE_OBJECTS": "1", "GIT_GRAFT_FILE": os.devnull}
 # Where the gate's own scratch lives in a harness checkout: git-ignored directories at its root,
 # on no import path.
@@ -39,15 +39,15 @@ def checkout_differs(checkout: str, rev: str, nothing_else: bool = False) -> lis
     scratch (SCRATCH, the checkout's own directories, not links), with `nothing_else` (a checkout to
     be built) anywhere. HEAD and a clean status trust the index and the attributes: a smudge
     filter, or a change a stat cache can't see (core.checkStat=minimal), leaves other bytes behind
-    them (Sol, PR #54 fix check 1 S1), and an ignored file isn't shown at all: one a build reads
-    (nrese-server's build.rs embeds apps/nrese-console/dist/; Sol, S1 r1), a module the harness
-    imports (benches/suite/csv.pyc before the standard library's; Sol, S1 r3; csv.PYC on Windows),
-    or a file it reads (the catalogue loads every benches/cases/*.toml; Sol, PR #60 r1 R1). The
-    harness's checkout keeps the gate's scratch (Sol, S1 r2). Each file is hashed here as git
+    them (PR #54), and an ignored file isn't shown at all: one a build reads
+    (nrese-server's build.rs embeds apps/nrese-console/dist/), a module the harness
+    imports (benches/suite/csv.pyc before the standard library's; csv.PYC on Windows),
+    or a file it reads (the catalogue loads every benches/cases/*.toml; PR #60). The
+    harness's checkout keeps the gate's scratch. Each file is hashed here as git
     hashes a blob, so no filter applies. A linked directory (a junction on Windows) isn't walked,
     so it counts itself, a scratch root's link too: it's looked at before the scratch is left out.
     So does a directory the walk can't list: Python opens a file there by its name all the same
-    (Sol, PR #60 fix 2 r1: a planted cases/ of mode 0111)."""
+    (PR #60: a planted cases/ of mode 0111)."""
     algorithm = git(checkout, "rev-parse", "--show-object-format").decode().strip()
     differ, tracked = [], set()
     for record in git(checkout, "ls-tree", "-r", "-z", "--full-tree", rev).split(b"\0"):

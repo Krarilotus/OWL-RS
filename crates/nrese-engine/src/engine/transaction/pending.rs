@@ -2,7 +2,7 @@
 //! reads that see the base plus them. Shared by the write transaction ([`super::Transaction`])
 //! and, from the dictionary lifecycle's package 2b, a private one.
 //!
-//! What it keeps (the transaction owner's conditions, 8 Nov):
+//! What it keeps:
 //! - **One base for life.** The deltas are exact against the snapshot they were made over, the
 //!   one this holds from construction; nothing reads or extends them against another. For a
 //!   write transaction that is also the WAL's replay contract: its record is the change from
@@ -16,7 +16,7 @@
 //!   transaction's child, and what is `pub(super)` here, `into_parts`, the deltas' sets and the
 //!   takeover among it, is the write transaction's alone. What the private transaction
 //!   (`super::super::private`) reads and changes is `pub(in crate::engine)`.
-//! - **Growth charged before it happens** (SYN-54 review r1, F1; DUR, 8 Nov; D16-039): one
+//! - **Growth charged before it happens** (DUR, 8 Nov; D16-039): one
 //!   budget, attached once for life ([`Pending::charge_to`]), pays for both asserted tables, the
 //!   inserts and the deletes. A table grows only after the grown table is charged, beside the
 //!   old one while both live; the charge is then exactly the tables' allocation. That holds for
@@ -400,7 +400,7 @@ impl Pending {
         let list = |n: usize| 2 * n.max(4) * quad;
         // Shadowed: asserted inserts that are inferred, and inferred inserts that are asserted
         // (a statement retracted, inferred, then asserted again), as `shadowed_inferred` takes
-        // them (sol-loop r1 on DUR-6, S1).
+        // them.
         let shadowed = self.asserted.inserts.len() + self.inferred.inserts.len();
         let set = 2 * ((shadowed * 8 / 7 + 1).next_power_of_two().max(4) * (quad + 1) + 16);
         set + list(self.asserted.inserts.len())

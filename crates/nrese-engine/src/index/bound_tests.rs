@@ -32,7 +32,7 @@ fn quads(layout: Layout, n: usize, seed: u64) -> Vec<EncodedQuad> {
         .collect()
 }
 
-/// Spec (DUR-6 design note, slice 2, "bound once, build as engine-v2 builds"): for a delta of
+/// Spec (DUR-6 slice 2, "bound once, build as engine-v2 builds"): for a delta of
 /// `n` entries below the parallel threshold, `Run::from_delta` holds at most
 /// `Run::delta_bound(layout, n)` bytes at once, and the run it returns keeps at most that.
 /// Measured, alone.

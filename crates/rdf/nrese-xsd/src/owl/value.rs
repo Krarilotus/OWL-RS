@@ -389,7 +389,7 @@ mod tests {
     }
 
     /// Each datatype's lexical space is checked whole before a value is decided or found
-    /// beyond what is represented (XSDVAL review r1): a form outside it is ill-typed, never
+    /// beyond what is represented: a form outside it is ill-typed, never
     /// unsupported, and a std parser's wider grammar decides nothing. Sources: XML Schema 1.1
     /// Part 2 §3.4.28.1 (dateTimeStamp needs a timezone), §3.3.15.2 (hexBinary: hex digit
     /// pairs), §3.4.13 ff. (an integer type's bounds), OWL 2 Structural Specification §4.1

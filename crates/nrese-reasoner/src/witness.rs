@@ -1,4 +1,4 @@
-//! Test-only counters of the work producers do (REAS-2 fix check r1, attack list B10). A
+//! Test-only counters of the work producers do. A
 //! stopped poller doesn't ask its stop again, so the work a read does after a stop can't be
 //! seen from the stop; each counter counts it at the producer that does it, on the thread
 //! that does it. The module and every use of it are `#[cfg(test)]`: a use outside a test

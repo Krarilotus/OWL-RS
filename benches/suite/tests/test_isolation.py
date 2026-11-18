@@ -5,7 +5,7 @@ configuration (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_COUNT) set core.
 an outside hook in a test's own repository.
 
 A test's own setup runs git under the suite's policy too; only the process under test starts from
-a caller's environment (isolation.inherit(git={})). PR #57 r1 R1: the setup here built its git
+a caller's environment (isolation.inherit(git={})). PR #57: the setup here built its git
 environment by dropping every GIT_* variable, the suite's own configuration with them, so a
 caller's global commit.gpgSign failed it before its assertions."""
 from __future__ import annotations
@@ -100,8 +100,8 @@ class Isolation(unittest.TestCase):
             self.assertEqual(done.returncode, 0, done.stderr[-800:])
 
     def test_only_isolation_builds_a_git_environment(self):
-        """PR #57 r1 R3: five tests stripped or rebuilt git's environment themselves, and one of
-        them dropped the suite's configuration with the caller's (R1). A test module names no
+        """PR #57: five tests stripped or rebuilt git's environment themselves, and one of
+        them dropped the suite's configuration with the caller's. A test module names no
         GIT_ prefix to strip and asks git for no list of its variables: it takes
         isolation.inherit() or environment() and sets its scenario's values on top."""
         found = []

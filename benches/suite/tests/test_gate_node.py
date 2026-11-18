@@ -169,7 +169,7 @@ class GateNode(unittest.TestCase):
         self.assertEqual(reported, f"v{VERSION}", "SPEC gate-node: the entry is the pinned build now")
 
     def test_an_entry_without_its_npm_is_made_again(self):
-        # sol-loop r1 S2: an entry with the pinned node but no npm or npx was taken, and PATH then
+        # An entry with the pinned node but no npm or npx was taken, and PATH then
         # reached the host's npm (on Windows its launcher runs its own node.exe beside it).
         good = self.publish(VERSION)
         tools = self.pin(good)
@@ -191,7 +191,7 @@ class GateNode(unittest.TestCase):
                 self.assertTrue((bin_dir / missing).exists(), f"SPEC gate-node: and has its {missing} then")
 
     def test_an_entry_is_reused_only_as_the_build_it_records(self):
-        # Review r1 F2: reuse checked a version string, never the build: an entry of the pinned version
+        # Reuse checked a version string, never the build: an entry of the pinned version
         # with another payload and no record of the archive it came from was taken.
         good = self.publish(VERSION)
         tools = self.pin(good)
@@ -209,7 +209,7 @@ class GateNode(unittest.TestCase):
         return self.seen.read_text().count("dist.example") if self.seen.exists() else 0
 
     def test_an_unusable_npx_never_lets_the_hosts_run(self):
-        # Review r1 F1: npx was checked by existence alone; one that is a directory passed, and the console
+        # Npx was checked by existence alone; one that is a directory passed, and the console
         # step's bare `npx` reached the host's (on Windows, with the host's own node).
         good = self.publish(VERSION)
         tools = self.pin(good)
@@ -230,7 +230,7 @@ class GateNode(unittest.TestCase):
         self.assertEqual(done.stdout.strip(), "10.9.9", "SPEC gate-node: the pinned build's npx ran")
 
     def test_a_damaged_install_is_never_reused_under_its_record(self):
-        # Review r2 F1/F2: a genuine install, then damaged with its records left as they are: a zero-byte npx
+        # A genuine install, then damaged with its records left as they are: a zero-byte npx
         # (Git Bash runs it as an empty script, exit 0; a bare npx then skips it and finds the host's), an npx
         # replaced by another that runs, and npm's support code changed. Each is made again from the archive;
         # the host's npx never runs. Without the archive to make it again: no Node at all, never the host's.

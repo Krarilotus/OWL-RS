@@ -135,7 +135,7 @@ impl<'a> Found<'a> {
 
     /// Moves `other`'s entries in after its own (room charged first, beside `other`'s
     /// until it drops), with the charge of their words, which is handed over, not taken
-    /// again: it lives as long as the words do (the budget owner, 2 Nov).
+    /// again: it lives as long as the words do (2 Nov).
     pub(super) fn append(&mut self, other: Found<'a>) -> Result<(), BudgetExceeded> {
         self.entries.reserve(other.entries.len())?;
         let Found { entries, words, .. } = other;
@@ -246,8 +246,8 @@ mod tests {
         next
     }
 
-    /// The B16 review's example (notes/2026-10-26-codebase-review/B/B16-reasoner-audit.md,
-    /// B-703): at cap 2, A={1,2}, B={1,3}, C={4,5,6} found before D={1}. Capping as they
+    /// The B16 review's example:
+    /// at cap 2, A={1,2}, B={1,3}, C={4,5,6} found before D={1}. Capping as they
     /// come would keep A and B and lose C; minimising them all keeps D and C, and so must
     /// the reduction, with D in a later task and with all four in one task reduced at
     /// every entry.
@@ -367,7 +367,7 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    /// The budget owner's row (2 Nov): a round merged from tasks, whose reduction drops
+    /// A round merged from tasks, whose reduction drops
     /// spilled copies, ends charged for what it keeps (its entries' room and the kept sets'
     /// words), not for what the tasks found; the words' charge moves with them, never taken
     /// twice, and goes when they do.

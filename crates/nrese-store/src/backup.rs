@@ -150,8 +150,8 @@ pub fn export_dataset(
 /// store keeps it in. An invalid artifact changes nothing: a damaged one fails its checksum
 /// first, one that isn't N-Quads fails part-way, and the restore's transaction is then
 /// discarded (the mutation pipeline commits only a write that ends). The new terms it
-/// interned stay in the shared dictionary (stated limit L3 for v1.5, dictionary lifecycle
-/// contract).
+/// interned stay in the shared dictionary
+/// (a known limit of v1.5).
 pub(crate) fn apply_restore(
     tx: &mut Transaction<'_>,
     request: &DatasetRestoreRequest,

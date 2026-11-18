@@ -245,7 +245,7 @@ class PushGate(Repo):
 
     def test_a_push_to_engine_v2_is_a_merge_gate_and_a_packages_isnt(self):
         """The hook names the ref each commit goes to: the push tier of refactor/engine-v2's is a merge
-        gate on the fleet, a package's isn't (the orchestrator, 31 Oct 2026; Sol, merge-gate-class r1)."""
+        gate on the fleet, a package's isn't (31 Oct 2026)."""
         tip = self.commit("a.txt", "a changed\n")
         self.fleet("pending")
         self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
@@ -255,7 +255,7 @@ class PushGate(Repo):
         self.assertEqual(classes, [[], ['priority_class = "merge-gate"']], "SPEC merge-gate: by the hook")
 
     def test_the_hook_tells_both_tiers_their_ref(self):
-        """PR #69 r1 R1: one predicate for both tiers. The hook tells each ref's push tier, and
+        """PR #69: one predicate for both tiers. The hook tells each ref's push tier, and
         refactor/engine-v2's Windows check, the ref the commit goes to, over whatever the pusher's
         environment holds: a package's push beside engine-v2's stays unclassed, and engine-v2's
         Windows check is a merge gate with nothing in the environment too."""
@@ -285,7 +285,7 @@ class PushGate(Repo):
     def test_a_build_host_variable_in_the_pushers_environment_changes_nothing(self):
         """NRESE_ON_BUILD_HOST, the gate's own mark for a run on a build host, in the pusher's
         environment doesn't open a push: it is gated on the fleet as any push, and with no verdict
-        it is refused, with no tier run here (review PR 27 r1, B1: the push went through on an
+        it is refused, with no tier run here (the push went through on an
         empty file list, fmt alone)."""
         cargo = self.fake / "bin" / "cargo"  # a formatted tree's `cargo fmt --check`: the empty tier passes
         cargo.write_text("#!/bin/sh\nexit 0\n", newline="\n")
@@ -418,7 +418,7 @@ esac
             ("done", {"identity": "other"}, 75),
             ("done", {"tracked_changes": " M a.txt"}, 75),
             ("done", {"code": 137}, 75),
-            # Sol, review-remote-gates-r1-20261020 (EVIDENCE_ACCEPTANCE): a failed job with a
+            # Evidence acceptance: a failed job with a
             # zero-exit record and no steps; a done job whose record has exit 0 and a failed step.
             ("failed", {"steps": []}, 75),
             ("done", {"steps": failing}, 75),
@@ -453,7 +453,7 @@ esac
         statement, in the job as given; without it the job says nothing of a repair."""
         import tomllib
         statement = 'host load, four gates at once; evidence: "gate-windows-0d54ed893f-1794406264" C:\\fleet'
-        # Pasted, over lines and with a tab (review r1: a literal line break made the job invalid TOML).
+        # Pasted, over lines and with a tab (a literal line break made the job invalid TOML).
         pasted = "host load, four gates at once\r\nevidence:\tgate.log\n"
         for repair in (None, statement, pasted):
             self.reset()
@@ -468,9 +468,9 @@ esac
 
     def test_the_merge_checks_jobs_are_merge_gates(self):
         """The merge check's jobs go ahead as the fleet's merge gates, either
-        tier's for a commit that goes to refactor/engine-v2, as its caller states (NRESE_PUSH_REF). Sol,
-        merge-gate-class r1: told by the parents instead, a merge check of merges chained before their
-        push wasn't one, and a package that merges another was. PR #69 r1 R1: every Windows check was
+        tier's for a commit that goes to refactor/engine-v2, as its caller states (NRESE_PUSH_REF).
+        Told by the parents instead, a merge check of merges chained before their
+        push wasn't one, and a package that merges another was. PR #69: every Windows check was
         one, a package's own included."""
         package = self.tip
         self.git(self.repo, "checkout", "-q", "-b", "other", self.base)
@@ -505,7 +505,7 @@ esac
 
     def test_a_failure_on_an_unconfirmed_host_counts_only_when_another_host_fails_too(self):
         cases = [  # first host, its code, the re-run's code -> exit, recorded pass, jobs submitted
-            # The pass names the run it re-checked (Sol: durable provenance).
+            # The pass names the run it re-checked (durable provenance).
             ("khaleesi-wsl", 1, 0, 0,
              "fleet:gate-2@office-pc cpu=znver3 re-checking fleet:gate-1@khaleesi-wsl (failed there)", 2),
             ("khaleesi-wsl", 1, 1, 1, "", 2),
@@ -536,7 +536,7 @@ esac
             f"SPEC windows-unconfirmed\n{err}")
 
     def test_no_gate_under_flags_its_identity_doesnt_name(self):
-        """Sol, review-remote-gates-r1-20261020 (ENCODED_RUSTFLAGS): two encoded cfgs gave one identity."""
+        """Encoded rustflags: two encoded cfgs gave one identity."""
         for flags in ("--cfg\x1fvariant_a", ""):
             done = subprocess.run([BASH, "-c", ". scripts/lib/gate-key.sh && gate_identity HEAD"], cwd=self.repo,
                                   capture_output=True, text=True, env={**self.env, "CARGO_ENCODED_RUSTFLAGS": flags})
@@ -613,7 +613,7 @@ class MeasurementRefs(Repo):
         self.assertEqual(self.jobs(), [])
 
     def test_a_table_with_an_abbreviated_side_admits_nothing(self):
-        """Sol, T0 refs r1 S1: with the side abbreviated, the lookup by full revision missed, the
+        """With the side abbreviated, the lookup by full revision missed, the
         parent and path checks never ran, and a commit changing the lockfile went."""
         later = self.add({"a.txt": "later\n"}, "a later revision", self.side)
         commit = self.add({"Cargo.lock": "# another\n"}, "not a measurement side", later)
@@ -637,7 +637,7 @@ class MeasurementRefs(Repo):
         self.assertEqual(self.jobs(), [])
 
     def test_a_graft_publishes_no_side(self):
-        """PR #54 fix check 1, the check's other walk: whether the side is on a remote ref was
+        """PR #54, the check's other walk: whether the side is on a remote ref was
         asked of a history walk, which a graft changes; a graft putting an unpublished side under
         the remote branch let its ref go, and the push would have published the side. The check
         reads the objects as stored (release_gate.py STORED_OBJECTS)."""
@@ -654,7 +654,7 @@ class MeasurementRefs(Repo):
         self.assertIn("the side must be published", done.stdout + done.stderr)
 
     def test_a_remote_tracking_ref_made_here_publishes_no_side(self):
-        """Sol, PR #54 fix check 1 S2: the check took any refs/remotes/* ref for the remote's word, and
+        """PR #54: the check took any refs/remotes/* ref for the remote's word, and
         any local process can write one; a side no remote has went with a ref made here. Only the
         remote's own list of its branches counts."""
         unpublished = self.add({"a.txt": "only here\n"}, "a side no remote has", self.side)
@@ -685,7 +685,7 @@ class MeasurementRefs(Repo):
 
     @unittest.skipUnless(shutil.which("setsid"), "a process left behind in its own session (setsid)")
     def test_a_process_a_remote_leaves_behind_doesnt_hold_the_answer(self):
-        """Sol, S2 r1 D1: git's output was read from pipes, drained without a bound, so a transport
+        """Git's output was read from pipes, drained without a bound, so a transport
         helper's process left behind holding stderr (an ssh master, say) kept the check waiting after
         git had failed. Only git's exit counts: the push is refused at once."""
         commit = self.add({self.PERF_LAB: "fn main() { arm(); }\n"}, "its measurement side", self.side)
@@ -823,7 +823,7 @@ class WindowsCheck(Repo):
         self.assertNotIn("hosts =", text, "SPEC windows-job: the tool picked a host")
 
     def test_only_the_merge_checks_windows_part_is_a_merge_gate(self):
-        """PR #69 r1 R1: every Windows check got the merge-gate class, a package's own proof included.
+        """PR #69: every Windows check got the merge-gate class, a package's own proof included.
         It is one only when its caller says the commit goes to refactor/engine-v2 (NRESE_PUSH_REF)."""
         tip = self.commit("a.txt", "a changed\n")
         self.fleet("pending")
@@ -904,7 +904,7 @@ class WindowsCheck(Repo):
         self.assertEqual((done.returncode, self.submitted(), "has no Windows tier" in done.stderr), (2, [], True),
                          f"SPEC windows-tier\n{done.stderr}")
 
-    # PR #76 r1, R76-F2: the Windows verdict didn't depend on the Python the suite ran with. Its pass
+    # PR #76: the Windows verdict didn't depend on the Python the suite ran with. Its pass
     # was keyed by the repository's inputs and toolchain alone, and once recorded, `check.sh windows`
     # exited 0 on it before any job, whichever Python (3.13 on one host, 3.14 on another), packages or
     # cached environment the suite had run with.
@@ -1082,18 +1082,18 @@ class WindowsJob(Repo):
             (tree, "", False, there, False, 0, True, "valid"),
             ("0" * 40, "", False, there, False, 3, False, None),         # another tree checked out: no verdict
             (tree, "build:101", False, there, False, 1, True, "valid"),  # a step fails: the tree fails
-            # A lint of code only Windows compiles (cfg(windows)) fails the tree there (PR #68's review,
-            # R68-F2: the Windows tier built and tested it, and linted nothing).
+            # A lint of code only Windows compiles (cfg(windows)) fails the tree there (PR #68:
+            # the Windows tier built and tested it, and linted nothing).
             (tree, "clippy:101", False, there, False, 1, True, "valid"),
             (tree, "build:75", False, there, False, 75, True, "valid"),  # the PC guard stopped a build: no verdict
             (tree, "", True, there, False, 0, True, "invalid"),          # no usable stdin (fleet I14): said, steps get /dev/null
             # A host the fleet places it on by `rust` (rustup) without the tree's pinned release: the job
             # installs that release through rustup, and runs.
             (tree, "", False, missing, False, 0, True, "valid"),
-            # The release there without clippy: installed too, never a failed tree (sol-loop r1 S1).
+            # The release there without clippy: installed too, never a failed tree.
             (tree, "", False, no_clippy, False, 0, True, "valid"),
             (tree, "", False, uninstallable, False, 3, False, None),     # and if it can't be had: no verdict
-            # The declared Python isn't here and can't be had (R76-F2: the host's own ran the suite): no verdict.
+            # The declared Python isn't here and can't be had (the host's own ran the suite): no verdict.
             (tree, "", False, there, True, 3, False, None),
         ]
         for case, (sent, fail, closed, toolchain, gone, code, recorded, stdin) in enumerate(cases):
@@ -1230,7 +1230,7 @@ class SuitePython(unittest.TestCase):
                          "SPEC suite-python: an environment there is used as it is, never made again")
 
     def test_a_job_that_waited_for_the_lock_uses_the_environment_made_meanwhile(self):
-        """Sol (windows-job-python r1, S1): a job that found no environment removed the one another job
+        """A job that found no environment removed the one another job
         had made meanwhile, while that job was about to use it."""
         waiting = self.root / "waiting"
         with lock(self.cache / "py.lock"):  # another job, making it
@@ -1251,7 +1251,7 @@ class SuitePython(unittest.TestCase):
         self.assertFalse(self.seen.exists(), "SPEC suite-python: and makes none itself")
 
     def test_what_a_killed_job_left_goes_under_the_lock(self):
-        """Sol (windows-job-python r1, S2): a job killed while making one left its `.partial-*`, which
+        """A job killed while making one left its `.partial-*`, which
         nothing removed (no cache sweep runs on Windows)."""
         (self.cache / f"{self.env.name}.partial-a1b2c3" / "Lib").mkdir(parents=True)
         (self.env / "Lib").mkdir(parents=True)  # and one without a Python, no environment
@@ -1274,7 +1274,7 @@ class SuitePython(unittest.TestCase):
                          "SPEC suite-python: python3.exe is the environment's own launcher")
 
     def test_with_a_declared_runtime_only_an_environment_running_with_it_is_the_suites(self):
-        """PR #76 r1, R76-F2: an environment was taken by its requirements and a Python's being in
+        """PR #76: an environment was taken by its requirements and a Python's being in
         it, whatever Python and packages it ran with. With a declared runtime (gate_runtime) one that
         runs with another is made again, and one made that doesn't run with it either is refused."""
         declared = "python 3.13.3 (stand-in)\nscipy==1.17.1"

@@ -502,7 +502,7 @@ fn sparql_constraints_read_the_data_core_reads() {
 /// A selection's form doesn't change what a SPARQL constraint reads: its own `FROM` or
 /// `FROM NAMED` is replaced by the selected data whatever the selection's form, so leaving
 /// out a graph that holds nothing changes nothing, and the default graph alone is pinned as
-/// every other selection is (review N11 r1, F2).
+/// every other selection is.
 #[test]
 fn a_constraints_dataset_is_the_selection_whatever_its_form() {
     for clause in [
@@ -539,7 +539,7 @@ fn a_constraints_dataset_is_the_selection_whatever_its_form() {
 /// Pre-binding puts `$currentShape` and `$shapesGraph` in throughout the query (SHACL
 /// Appendix A: every basic graph pattern is joined with the pre-bound values), subqueries
 /// included, though a subquery needn't project them (§5.6.2): unprojected, they are still
-/// bound inside it (research round 12, R12-2).
+/// bound inside it (research round 12).
 #[test]
 fn current_shape_and_shapes_graph_are_bound_in_subqueries() {
     for query in [
@@ -649,7 +649,7 @@ fn failing_component(parameters: usize, values: usize, message: usize) -> String
     )
 }
 
-/// SHCL-AMP r1 R1, guard: with room for them, every combination's result is reported:
+/// Guard: with room for them, every combination's result is reported:
 /// 8^4 = 4096, each with the shape's 4 KiB message.
 #[test]
 fn a_component_s_results_are_all_reported_when_affordable() {
@@ -666,7 +666,7 @@ fn a_component_s_results_are_all_reported_when_affordable() {
     );
 }
 
-/// SHCL-AMP r1 R1: the decoded report is charged before it is built. 16^2 = 256 results are
+/// The decoded report is charged before it is built. 16^2 = 256 results are
 /// a few hundred bytes each as ids, but each decodes the shape's 16 KiB message: 4 MiB of
 /// message text. A 1 MiB envelope holds the results (every combination runs: 256 queries)
 /// and refuses their report.
@@ -699,7 +699,7 @@ fn a_report_past_the_envelope_is_refused() {
     );
 }
 
-/// SHCL-AMP r1 R1: a validation's results and their decoded messages are charged to its
+/// A validation's results and their decoded messages are charged to its
 /// envelope. 8^4 results, each decoding a 4 KiB message, are 16 MiB of message text alone;
 /// a 1 MiB envelope refuses them: the outcome is that refusal, with no report.
 #[test]
@@ -718,7 +718,7 @@ fn a_component_s_results_past_the_envelope_are_refused() {
     );
 }
 
-/// SHCL-AMP R1 sol r1 S3, guard (fails on 707e24dd): what a change's validation finds in the
+/// Guard (fails on 707e24dd): what a change's validation finds in the
 /// state before is charged per result found and returned per result found, though the set
 /// it is compared in keeps one of each. Sixteen shapes each fail all 16^2 combinations of a
 /// component with the same result (a result names no combination); an unrelated change
@@ -857,7 +857,7 @@ fn cancelled_after(
     (outcome, evaluations)
 }
 
-/// SHCL-AMP r1 R1, guard: a cancellation after some combinations ran stops the walk: of 4^2
+/// Guard: a cancellation after some combinations ran stops the walk: of 4^2
 /// = 16 combinations, the cancellation at the 5th query leaves the 7th unrun.
 #[test]
 fn a_cancellation_between_combinations_stops_the_walk() {
@@ -871,7 +871,7 @@ fn a_cancellation_between_combinations_stops_the_walk() {
     assert!(evaluations <= 6, "{evaluations} queries ran");
 }
 
-/// SHCL-AMP r1 R1: a cancellation while the report is decoded, after all 4^2 = 16
+/// A cancellation while the report is decoded, after all 4^2 = 16
 /// combinations ran, is the outcome: no report.
 #[test]
 fn a_cancellation_while_the_report_is_decoded_stops_it() {
@@ -904,7 +904,7 @@ fn failure_component(values: usize, named: bool) -> String {
     )
 }
 
-/// SHCL-AMP r2 F1: the failures a validation keeps are charged once, and the report takes
+/// The failures a validation keeps are charged once, and the report takes
 /// them over with their charge. 8192 failures of 85 bytes are charged 133 bytes each kept:
 /// 1,089,536 bytes, which a 1.5 MiB envelope affords once (not twice). The report is
 /// returned, with every failure.
@@ -921,7 +921,7 @@ fn a_failure_report_that_fits_once_is_returned() {
     assert!(matches!(outcome, Ok((0, 8192))), "{outcome:?}");
 }
 
-/// SHCL-AMP r2 F1, incremental: a change's validation keeps the failures of the state after
+/// Incremental: a change's validation keeps the failures of the state after
 /// (charged once, taken over by the report) and drops those of the state before with their
 /// charge. 4096 failures in each state (544,768 bytes each): both states fit a 1.25 MiB
 /// envelope while they are validated; the state after's, charged a second time beside the
@@ -956,7 +956,7 @@ fn a_change_s_failures_are_charged_once_and_the_earlier_ones_returned() {
     assert!(matches!(outcome, Ok((0, 4096))), "{outcome:?}");
 }
 
-/// SHCL-AMP r2: whatever ends a validation, its charges end with it. The request's envelope
+/// Whatever ends a validation, its charges end with it. The request's envelope
 /// draws on a server budget; after a refusal, after a cancellation while the report was
 /// decoded, and once a returned report is dropped, the server budget holds nothing.
 #[test]
@@ -1139,7 +1139,7 @@ fn applicability_follows_what_can_fail() {
     }
 }
 
-/// SYN-56 review r1 F4: whether a shape can fail doesn't depend on which shape is looked at
+/// Whether a shape can fail doesn't depend on which shape is looked at
 /// first. ex:B targets ex:a and needs it to conform to ex:A; ex:A needs ex:B back and has
 /// `sh:in ()`, which every node fails. So ex:a fails ex:A and ex:B: validation fails, and
 /// something applied. ex:A targets an absent class, so it is a root without focus nodes.
@@ -1204,7 +1204,7 @@ fn small_envelope() -> Resources {
     }
 }
 
-/// SYN-56 review r1 F3: the state before a shapes change is validated only to tell which of
+/// The state before a shapes change is validated only to tell which of
 /// the state after's results are new; its failures are no part of the outcome. Removing a
 /// shapes graph that asks for 1000 entailment regimes (diagnostics past a 64 KiB envelope)
 /// leaves nothing to validate: the change is accepted with an empty report.
@@ -1225,7 +1225,7 @@ fn removing_shapes_with_many_entailments_is_not_refused_for_their_diagnostics() 
     assert!(matches!(outcome, Ok((0, 0))), "{outcome:?}");
 }
 
-/// SYN-56 review r1 F3: as above, but the state after keeps a shape whose result (ex:a has no
+/// As above, but the state after keeps a shape whose result (ex:a has no
 /// ex:name) the state before had too, so the state before is validated; its 1000 entailment
 /// failures are still no part of the outcome, nor charged: nothing is introduced.
 #[test]
@@ -1253,8 +1253,8 @@ fn a_shapes_change_compares_results_without_the_state_before_s_diagnostics() {
 }
 
 /// SHACL over a private transaction (`Engine::speculative_over`), as a payload's shapes and a
-/// session's validation run once speculative work is private (dictionary lifecycle V2, A3
-/// and A5): SPARQL constraints with a nested `NOT EXISTS` are evaluated once per focus node
+/// session's validation run once speculative work is private (dictionary lifecycle V2):
+/// SPARQL constraints with a nested `NOT EXISTS` are evaluated once per focus node
 /// on one private view, in parallel (`validate` needs `Sync`). One projects the stored
 /// value; the other a computed one, which the report takes as computed (SHACL §5.3.2, SYN-56
 /// Part B) without interning it.
@@ -1340,7 +1340,7 @@ fn sparql_constraints_validate_a_private_transaction() {
     }
 }
 
-/// Parallel SHACL-SPARQL over a large private transaction finishes (V2 review r1, R1-C1):
+/// Parallel SHACL-SPARQL over a large private transaction finishes:
 /// every focus node's check asks the one view for its evaluation snapshot, the first on a
 /// cold memo builds it, and a pending state of 16,384 or more changes is built in parallel
 /// (`index/run.rs`'s parallel build threshold). No reader may wait on a lock held across that
@@ -1501,7 +1501,7 @@ fn inserting(
     (before, changed, after)
 }
 
-/// SYN-56 review r1 F5: a term a query computed is compared as the RDF term it is, whether or
+/// A term a query computed is compared as the RDF term it is, whether or
 /// not the dictionary held it: a change that stores the very term (as an unrelated statement's
 /// predicate or object) leaves the result as it was, so nothing is introduced, on both routes:
 /// a data change (`validate_changes`) and a change of the shapes graph
@@ -1565,7 +1565,7 @@ fn a_computed_term_the_change_stores_is_the_same_result() {
     }
 }
 
-/// SYN-56 Part B sol r1 S1: a path is compared as the IRI it is, whether a query computed it
+/// A path is compared as the IRI it is, whether a query computed it
 /// or the shape names it. Before: property shape ex:S has path ex:p, and its constraint ex:Q
 /// computes `<urn:x>` (no statement uses it) as `?path`. The change gives ex:S the path
 /// `<urn:x>` and ex:Q a query that names no path, so the result's path is the shape's: the
@@ -1631,7 +1631,7 @@ fn a_computed_path_that_becomes_the_shape_s_path_is_the_same_result() {
     );
 }
 
-/// SYN-56 Part B sol r2 S3: a stored triple term holding a blank node is the same value
+/// A stored triple term holding a blank node is the same value
 /// whether the query binds it or the focus node stands for it. ex:S targets the objects of
 /// ex:p, the stored `<<( _:b ex:q ex:o )>>`; while a flag holds, its query binds `?value` to
 /// that same triple (read from the data: a triple-term `$this` isn't substituted into the
@@ -1708,7 +1708,7 @@ fn triple_focus_is_copied_by_inner_bind() {
     assert!(report.failures.is_empty(), "{:?}", report.failures);
 }
 
-/// The same across a change of the shapes (sol r2 S3): a constraint component's property
+/// The same across a change of the shapes: a constraint component's property
 /// validator, a SELECT reporting each value of the path, becomes an ASK that every value
 /// fails. ex:s's one value, the stored `<<( _:b ex:q ex:o )>>`, is reported by both: the same
 /// result, nothing introduced.
@@ -1769,7 +1769,7 @@ fn a_stored_triple_term_is_the_same_value_from_select_or_ask() {
 
 /// A blank node a constraint's query makes (`BNODE() AS ?value`) is the result's value
 /// (SHACL §5.3.2), and the same result found again is the same result: a change elsewhere
-/// introduces none, though the query makes a new blank node at each evaluation (SYN-56 r1 S3).
+/// introduces none, though the query makes a new blank node at each evaluation.
 #[test]
 fn a_blank_node_a_query_made_is_the_same_result_when_found_again() {
     let data = "ex:a ex:p ex:b .";
@@ -1802,7 +1802,7 @@ fn a_blank_node_a_query_made_is_the_same_result_when_found_again() {
     );
 }
 
-/// SYN-56 review r1 F2: one blank node a query made is one node, in every result that names
+/// One blank node a query made is one node, in every result that names
 /// it. The subquery makes one blank node; joined with ex:a's two ex:p values it is the value
 /// of two solutions, so two results with one `sh:value` node, in the report and in its RDF
 /// graph. Validated again after an unrelated change, nothing is introduced.
@@ -1851,8 +1851,8 @@ fn one_blank_node_of_a_query_is_one_node_of_the_report() {
     );
 }
 
-/// A query's fresh blank nodes compare up to their names, result by result (SYN-56 r2 S3,
-/// S4):
+/// A query's fresh blank nodes compare up to their names, result by
+/// result:
 /// - a result that is unchanged stays the same when another result of the same constraint
 ///   goes: removing ex:a's ex:p ex:x1 removes the "newvalue" result and introduces nothing;
 /// - one blank node met twice in a value stays one: TRIPLE(?b, ex:p, ?b) has subject = object.
@@ -1978,8 +1978,8 @@ fn fresh_blank_nodes_compare_by_where_they_stand() {
     }
 }
 
-/// A query's fresh blank nodes are told apart from the data's, whatever their labels (SYN-56
-/// r3 S3): with a stored blank node labelled `fresh0`, TRIPLE(fresh, ex:p, stored) and
+/// A query's fresh blank nodes are told apart from the data's, whatever their labels:
+/// with a stored blank node labelled `fresh0`, TRIPLE(fresh, ex:p, stored) and
 /// TRIPLE(stored, ex:p, fresh) are different results; removing the first leaves the second
 /// as it was, so the change introduces nothing.
 #[test]
@@ -2031,8 +2031,8 @@ fn fresh_blank_nodes_are_told_apart_from_stored_ones() {
 }
 
 /// A change of the shapes introduces what the data newly violates, even where a result's
-/// value is a stored blank node labelled as a fresh one the query made before (SYN-56 r4
-/// S3): the query reports a fresh blank node for ex:a, and any named graph holding
+/// value is a stored blank node labelled as a fresh one the query made before:
+/// the query reports a fresh blank node for ex:a, and any named graph holding
 /// `ex:z ex:q ex:w` by its name. Read the fresh node's label L; then a graph named `_:L`
 /// gets that statement. One result is introduced: its value is the stored `_:L`.
 #[test]
@@ -2083,7 +2083,7 @@ fn a_stored_blank_node_labelled_as_a_fresh_one_is_still_introduced() {
     );
 }
 
-/// The same, inside a computed triple term (SYN-56 r5 S3): the query reports
+/// The same, inside a computed triple term: the query reports
 /// TRIPLE(fresh, ex:p, ex:o) for ex:a, and TRIPLE(g, ex:p, ex:o) for any named graph g holding
 /// `ex:z ex:q ex:w`. Read the fresh subject's label L; a graph named `_:L` then gets that
 /// statement. Neither triple is stored, so both values are computed; one result is introduced,
@@ -2145,7 +2145,7 @@ fn a_stored_blank_node_inside_a_computed_triple_is_still_introduced() {
     assert_eq!(subjects, [label], "the stored subject's result");
 }
 
-/// A change of the shapes compares a result's severity (SYN-56 r5 S6): a property shape that
+/// A change of the shapes compares a result's severity: a property shape that
 /// ex:a fails as a Warning, made a Violation, makes its result new, as a Violation.
 #[test]
 fn a_shapes_change_compares_severity() {
@@ -2189,7 +2189,7 @@ fn a_shapes_change_compares_severity() {
     assert_eq!(severities, [violation], "Warning made Violation");
 }
 
-/// A change of the shapes compares the messages in effect (SYN-56 r5 S6): an `sh:sparql`
+/// A change of the shapes compares the messages in effect: an `sh:sparql`
 /// constraint's message, the same as its shape's, removed leaves the result's messages as
 /// they were, so nothing is new.
 #[test]
@@ -2244,7 +2244,7 @@ fn many_messages(subjects: usize, messages: usize) -> (String, String) {
     (data, shapes)
 }
 
-/// SYN-56 review r1 F1: a change of the shapes compares results without copying what every
+/// A change of the shapes compares results without copying what every
 /// result of a shape shares. 512 results, each with its shape's 256 messages (decoded, about
 /// 25 KB per result): an annotation added to the shape changes no result, and the comparison
 /// fits a 2 MiB envelope that the raw results of both states fit, though the decoded results

@@ -934,8 +934,8 @@ mod tests {
                 true,
                 "ex:g { <urn:a> <urn:b> <urn:c> . } GRAPH [ ] { <urn:d> <urn:e> <urn:f> . }\n<urn:s> <urn:p> { <urn:q> . } <urn:x> <urn:y> <urn:z> .\n<urn:g> { <urn:s> <urn:p> [ <urn:q> <urn:o> }\n<urn:a> <urn:b> <urn:c> .\n",
             ),
-            // A name with a `.` and then an escaped closer, cut by a piece after the `.`
-            // (sol-loop r1 S1); a byte order mark cut by a piece (S4).
+            // A name with a `.` and then an escaped closer, cut by a piece after the `.`;
+            // a byte order mark cut by a piece.
             (
                 false,
                 "@prefix : <urn:> .\n<urn:s> <urn:p> ( :foo.bar\\) . <urn:u> <urn:v> <urn:w> . ) . <urn:a> <urn:b> <urn:c> .\n",

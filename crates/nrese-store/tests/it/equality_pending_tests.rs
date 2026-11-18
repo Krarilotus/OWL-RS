@@ -1,4 +1,4 @@
-//! Package 3.4's route C (`notes/2026-11-08-dict3-4-equality-design.md` §5, 1C): a product
+//! Package 3.4's route C (1C): a product
 //! query over a client's pending changes, with data closed under `owl:sameAs`, reaches the
 //! query side's equality representatives; it and the committed state's queries around it
 //! answer as specified. What the query side keeps is guarded in `nrese-sparql`'s
@@ -91,7 +91,7 @@ fn answer(pipeline: &MutationPipeline, pending: Option<&str>) -> Vec<String> {
         .collect()
 }
 
-/// Review §5 item 1, route C: a client's pending change over closed data, between queries of
+/// Route C: a client's pending change over closed data, between queries of
 /// the committed state.
 ///
 /// - Input: `a` and `b` one identity (`a sameAs b`), `c` alone; `k1 p0 a`, `k2 p0 b`,

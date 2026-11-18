@@ -1,6 +1,6 @@
-//! What a snapshot resolves its terms through (`notes/2026-11-08-p2-bounded-vocabulary-design.md`
-//! §10–§11, the interface the snapshot-views owner accepted): the dictionary, bounded by the
-//! snapshot's version, or a private overlay's frozen view ([`OverlayView`]).
+//! What a snapshot resolves its terms through: the dictionary, bounded by the snapshot's
+//! version, or a private overlay's frozen view
+//! ([`OverlayView`]).
 //!
 //! `Shared` answers exactly as `Snapshot`'s methods did before it, each with the bound they
 //! applied. `Private` ignores the bound passed in: its bound is its own (`start + n`), fixed when
@@ -27,7 +27,7 @@ impl Vocabulary {
         matches!(self, Self::Private(_))
     }
 
-    /// The contract's b(V) (§4.1): ids below it are the dictionary's, the same in every
+    /// The shared bound: ids below it are the dictionary's, the same in every
     /// vocabulary of that dictionary bounded at or past it. `bound` for shared, `start` for
     /// private.
     pub(crate) fn shared_bound(&self, bound: u64) -> u64 {

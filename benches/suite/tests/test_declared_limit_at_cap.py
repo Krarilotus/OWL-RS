@@ -93,7 +93,7 @@ def killed() -> dict:
 
 
 class DeclaredMemoryLimit(unittest.TestCase):
-    """Spec: D16-563 (the master, 15 Nov 2026): 'a pass killed at the limit and a pass timed out at
+    """Spec: D16-563 (15 Nov 2026): 'a pass killed at the limit and a pass timed out at
     the limit both match; a timeout below the limit, a completed baseline, and a crash do not.' A
     record is never relabelled; a timeout that is not at the limit still fails."""
 
@@ -115,14 +115,14 @@ class DeclaredMemoryLimit(unittest.TestCase):
         self.assertEqual(fast.not_as_expected([run]), [run])
 
     def test_a_slow_timeout_near_the_cap_that_the_cap_isn_t_holding_fails(self):
-        # Review r1 R2: 200 MiB under the cap (within 1 % of 28 GiB), its tasks never stalled on
+        # 200 MiB under the cap (within 1 % of 28 GiB), its tasks never stalled on
         # memory: a slow run that sits near its cap, not one the cap holds.
         run = record(*scoped(TIMED_OUT, used=CAP - (200 << 20), stall=0.0))
         self.assertEqual(state(run), "failed")
         self.assertEqual(fast.not_as_expected([run]), [run])
 
     def test_a_timeout_whose_scope_can_t_be_read_when_it_came_fails(self):
-        # Review r1 R1: no reading taken at the time limit is no reading, whatever was seen before.
+        # No reading taken at the time limit is no reading, whatever was seen before.
         for used, stall in ((AT_THE_CAP, None), (None, HELD_STALL)):
             with self.subTest(used=used, stall=stall):
                 run = record(*scoped(TIMED_OUT, used=used, stall=stall))
@@ -149,7 +149,7 @@ class DeclaredMemoryLimit(unittest.TestCase):
 
 
 class TwoReports(unittest.TestCase):
-    """Spec: review r1 R3: fast.py's comparison of two reports (suitekit/compare.py) judges a case as
+    """Spec: fast.py's comparison of two reports (suitekit/compare.py) judges a case as
     the gate does: two runs that each ended as the case declares are a known issue, however each
     ended, with no timing verdict and no acceptance failure."""
 

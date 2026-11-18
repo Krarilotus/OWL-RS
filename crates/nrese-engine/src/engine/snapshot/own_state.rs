@@ -1,5 +1,5 @@
-//! State an unpublished version keeps for its own readers (contract S3, "state owned by its
-//! own version"; `notes/2026-11-09-dict3-0c-own-state-design.md`): the other half of
+//! State an unpublished version keeps for its own readers (state owned by its
+//! own version): the other half of
 //! [`Snapshot::admission`] beside [`SharedState`].
 
 use std::any::{Any, TypeId};

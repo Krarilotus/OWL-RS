@@ -1,11 +1,11 @@
-//! A point read answers what a pattern read answers (D16-543, design note
-//! `2026-11-14-d16-543-point-reads-design.md`, test 1): the point read against
+//! A point read answers what a pattern read answers (D16-543): the point read
+//! against
 //! [`crate::CountedSnapshot::quads`] over random commits. A small universe makes inserts, deletes
 //! and re-inserts collide in the default and named graphs, inferred statements come and go, and a
 //! policy that merges no window keeps each commit's run, so reads meet tombstones across runs.
 //! First, a statement in every graph loses one graph's copy, then every copy. Then, over a fresh
 //! engine, the asserted stack holds the default graph alone (both stacks default-graph) before it
-//! takes named graphs (a quads stack beside the default-graph inferred one; D16-574 r3, M1).
+//! takes named graphs (a quads stack beside the default-graph inferred one; D16-574).
 //! Varied by `NRESE_FUZZ_SEED`.
 
 use nrese_rdf::NamedNode;

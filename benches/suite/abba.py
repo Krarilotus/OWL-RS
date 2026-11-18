@@ -150,7 +150,7 @@ def load_family(path: str | Path, repo: Path, catalog: list[dict] | None = None,
     if not isinstance(blocks, int) or blocks < MIN_BLOCKS:
         problems.append(f"blocks {blocks!r}: at least {MIN_BLOCKS}")
     else:
-        # Whole Latin squares of the three sides (release_gate.whole_squares(); Sol r1: 8 blocks
+        # Whole Latin squares of the three sides (release_gate.whole_squares(): 8 blocks
         # left A, A' or B opening one block fewer).
         blocks = rg.whole_squares(blocks, len(SIDES))
     if set(sides) != {"a", "b"} or not all(isinstance(v, str) and REV.match(v) for v in sides.values()):
@@ -162,17 +162,17 @@ def load_family(path: str | Path, repo: Path, catalog: list[dict] | None = None,
     if not entries:
         problems.append("no [[case]]")
     if catalog is None:
-        # The registry the job runs, the declared harness's, wherever this runs from (review r1
-        # R1-F4: a check in B's checkout read B's registry for an older harness); this tree's without one.
+        # The registry the job runs, the declared harness's, wherever this runs from (a check in B's checkout read B's registry for an older harness);
+        # this tree's without one.
         catalog = cases_registry.load_at(repo, harness) if harness else cases_registry.load()
     if own and harness:
         # The harness's fast suite times the family's own cases from its own copy of this file
         # (NRESE_FAMILY, read in the harness's tree): the file must be there as it is here, or the
-        # plan and the manifest describe cases other than those timed (sol-loop of review r1, S1).
+        # plan and the manifest describe cases other than those timed.
         # The same bytes, CRLF read as LF on both sides: line endings, stored, converted or not, are no
-        # change to what the suite times (sol-loop r2, T1; fix check r1, V1). Every other byte is: not
-        # compared parsed, as values equal in Python reach the suite as different text (sol-loop r3,
-        # U1: 268435456.0 is no buffer limit).
+        # change to what the suite times. Every other byte is: not
+        # compared parsed, as values equal in Python reach the suite as different text (268435456.0 is no buffer
+        # limit).
         at = subprocess.run(["git", "-C", str(repo), "show", f"{harness}:{rel}"], capture_output=True)
         if at.returncode != 0:
             raise Invalid([f"{rel} isn't at the harness {harness[:12]}, whose fast suite would time its own cases"])
@@ -255,7 +255,7 @@ def family_text(name: str, sides: dict[str, str], cases: list[str], blocks: int,
 
 def run_name(name: str | None, sides: dict[str, str], harness: str, cases: list[str], blocks: int,
              min_samples: int) -> str:
-    """A run's family name, and so its set's id: the request's own (Sol r1 S2: another A, case list,
+    """A run's family name, and so its set's id: the request's own (another A, case list,
     block count or sample floor gave the same id, and the fleet refused the new set as the old one)."""
     request = f"{sides['a']} {sides['b']} {harness} {','.join(cases)} {blocks} {min_samples}"
     return f"{name or 'run'}-{hashlib.sha256(request.encode()).hexdigest()[:8]}"
@@ -301,7 +301,7 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
     data's preparation, all in its first step; then its blocks, its report (the verdict in
     abba-verdict.json; the step fails only for an invalid family) and clean-up. Every step is
     exclusive: the fleet keeps an exclusive job's host only before an exclusive step (planner
-    held_between_steps; Sol r1 S1) and only while the host's policy takes exclusive work, so an
+    held_between_steps) and only while the host's policy takes exclusive work, so an
     untimed first step could build where timing is closed and the blocks then go elsewhere,
     without its builds (2 Nov 2026: built on the shared host by day, outside its timing window). The job
     starts only where it can time, and builds and blocks share that host."""
@@ -311,7 +311,7 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
     abba = ["python3", "-B", "benches/suite/abba.py"]
     cap = max(c["cap_gb"] for c in family["cases"])
     # Its gate state is its family's own (the family's SHA-256: sides, cases, blocks), its rounds'
-    # deliberately shared; another request never meets it on a host (review r1 R1-F3).
+    # deliberately shared; another request never meets it on a host.
     env = {"GATE_NAME": f"abba-{family['name']}-{b[:8]}-{family['sha256'][:8]}",
            "GATE_CASES": ",".join(c["name"] for c in family["cases"]), "GATE_BASELINES": "a",
            "GATE_MAX_GB": str(cap), "NRESE_QUIET_SLOT": "0",
@@ -340,8 +340,8 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
     mine = [by_name[c["name"]] for c in family["cases"] if c["name"] in by_name]
     # What its data takes where the host lacks it: the makers' needs, their disk (7 Nov 2026) and the
     # containers they start, declared (8 Nov 2026), all by the harness whose prepare makes it, refused where
-    # that harness can't (orchestrator, 8 Nov 2026: abba-run-055fe886-f3da61f9; review r1 R1 of
-    # pkg/maker-containers): release_gate.data_job().
+    # that harness can't (8 Nov 2026, abba-run-055fe886-f3da61f9):
+    # release_gate.data_job().
     try:
         requires, data_fields, data_env = rg.data_job(
             mine, {"roles": rg.TIMING_ROLES, "os": "linux", "cores": 16, "ram_gb": max(12, cap)},
@@ -357,7 +357,7 @@ def jobs(family: dict, harness: str, checkout: str, host: str = "", round_: int 
            f"{len(family['cases'])} cases", "notify": False,
            "env": env, "est_min": 0, "stall_after_min": 60, "steps": steps,
            # The first step asks the job's whole memory too: placed on a host too small for the blocks,
-           # its hold would end there and the blocks run elsewhere, without its builds (Sol r2 S1).
+           # its hold would end there and the blocks run elsewhere, without its builds.
            "step_deadline_min": rg.BUILD_MIN * len(revisions) + 120,
            "requires": requires, "inputs": source + rg.side_inputs(checkout, source[0]["source"]["rev"], revisions) + fetched}
     if host:
@@ -384,9 +384,9 @@ def set_file(set_id: str, members: list[dict]) -> str:
 # --- the verdict ---------------------------------------------------------------------------------
 
 def missing_checks(record: dict, paths: list[str], per_invocation: bool = True) -> list[str]:
-    """The declared content checks (`paths`) a run has no passing result for. Sol, 20 Oct 2026:
-    a run with no check results counted as checked (r1); then an invocation whose check list was
-    empty or absent borrowed a sibling's results (r2). With `per_invocation` (perf_lab: fast.py
+    """The declared content checks (`paths`) a run has no passing result for.
+    A run with no check results counted as checked; then an invocation whose check list was
+    empty or absent borrowed a sibling's results. With `per_invocation` (perf_lab: fast.py
     checks every invocation's answer, its observation's `checks`, and the record's own are only
     the last invocation's), every observation must prove every path itself, and only a record
     without observations is proved by its own results. Otherwise (the other tools: one
@@ -564,8 +564,8 @@ def b_number(passes: list[dict], hypothesis: str) -> str:
 
 
 def rounds_errors(rounds: list[Path]) -> list[str]:
-    """Why the rounds given aren't rounds 1, 2, ... of their own (empty: they are). Sol, 20 Oct 2026
-    (r1): the same round given twice confirmed its own loss. Each must be a distinct run with
+    """Why the rounds given aren't rounds 1, 2, ... of their own (empty: they are). On 20 Oct 2026
+    the same round given twice confirmed its own loss. Each must be a distinct run with
     fresh copies: its own directory, manifest round k at place k, its own check's session and
     fleet job, no pass file that another round has too, its blocks after the round before."""
     errors, seen, sessions, jobs_, spans = [], {}, {}, {}, []
@@ -751,7 +751,7 @@ def run(args) -> int:
 
 
 def declared_harness(args) -> str | None:
-    """The harness whose registry a command resolves the family's cases at (review r1 R1-F4): in a
+    """The harness whose registry a command resolves the family's cases at: in a
     job's check, ABBA_HARNESS (a job without it is refused); `jobs`, --harness, else the family's b;
     `report`, the one its rounds' manifests name (they must name one). None: this tree's (a local
     check)."""

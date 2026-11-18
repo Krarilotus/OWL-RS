@@ -1,5 +1,5 @@
 //! The corpus store admits only through the shared-state capability (dictionary lifecycle
-//! 3.2; the contract's S3 and §5 row 24; the token design check's §5 items 1, 2, 3 and 9).
+//! 3.2; published-only admission).
 //! A snapshot without a token (a writer's pending state, a view that adds facts) leaves
 //! the store as it found it: no store made, no entry, no key charge, no eviction, no
 //! lineage step. Its searches still answer as an independent engine holding exactly its
@@ -393,7 +393,7 @@ fn named(snapshot: &Snapshot, text: &str) -> Vec<(String, f64)> {
         .collect()
 }
 
-/// Attack items 2, 3 and 7 (the design note's list), guards: a writer's pending state's
+/// Guards: a writer's pending state's
 /// derived views (as stored, canonical, restricted) and a pending state searched after its
 /// transaction was dropped and another commit published keep nothing, and answer text,
 /// IRI and vector searches as an engine holding their statements; vectors with the store

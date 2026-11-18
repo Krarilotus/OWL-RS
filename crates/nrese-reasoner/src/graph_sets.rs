@@ -33,7 +33,7 @@
 //! it is allocated: it reports its size to a [`Watch`] at round boundaries and stops when
 //! the watch refuses (the reading query's envelope), or when the process passes its memory
 //! limit. A temporary exemption, shared with the materialiser's working set, until the
-//! reasoner's working set is charged (notes/2026-10-20-executor-admission-design.md, W1
+//! reasoner's working set is charged (W1
 //! site "reasoner fixpoint").
 
 mod found;
@@ -114,8 +114,8 @@ pub enum Stopped {
 
 // A read its poller stopped ([`ReadStopped`]) has no `From` here: a run's pollers stop on
 // its caller's stop, the process's memory and another morsel's latched refusal alike
-// (`Run::fired`), so each such read takes the run's own cause, `Run::stopped` (REAS-2 fix
-// check r1, B11: a refusal read as a cancel would lose the store's `Unavailable::Memory`).
+// (`Run::fired`), so each such read takes the run's own cause, `Run::stopped` (a refusal read as a cancel would lose the store's
+// `Unavailable::Memory`).
 
 /// A budget refusal keeps its cause through a lookup's `?` (`Lookup::sets_of`).
 impl From<BudgetExceeded> for Stopped {
@@ -287,7 +287,7 @@ fn table_bytes<K, V>(capacity: usize) -> usize {
 ///
 /// A copy holds exactly its words ([`Clone`] below, and a union's): what a copy's charge
 /// counts is what it allocates (`SmallVec`'s own clone rounds a spilled copy's capacity up to
-/// a power of two; review r1 C1 fix proof `p2c5-green17-e62a4843`).
+/// a power of two; fix proof `p2c5-green17-e62a4843`).
 #[derive(Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct GraphSet(smallvec::SmallVec<[u64; 2]>);
 
@@ -407,10 +407,10 @@ impl<S: Source + ?Sized> Visits for Changed<'_, S> {
 }
 
 /// Where facts are asserted, as an evaluation asks it: read where it is kept, never copied
-/// into a list per question (fix check r2, C1.b residual). Each question is read on the
+/// into a list per question. Each question is read on the
 /// reading task's poller (REAS-2, sweep M16): the call is counted before any lookup, then
 /// each graph handed on; on a stopped poller nothing more is read and the read answers
-/// [`ReadStopped`], never a partial list or a "no" (fix check r1, rule 2).
+/// [`ReadStopped`], never a partial list or a "no".
 pub trait Graphs: Sync {
     /// Calls `graph` with each graph that asserts `fact` (none for a fact only inferred), in
     /// any order, the same ones each time it is asked; `Err` if its poller stopped it, the
@@ -464,7 +464,7 @@ impl InGraphs<'_> {
     }
 }
 
-/// The call counted, then the fact's entries as they are handed on (review r1 F1).
+/// The call counted, then the fact's entries as they are handed on.
 impl Graphs for InGraphs<'_> {
     fn each(
         &self,
@@ -501,7 +501,7 @@ fn listed(graphs: &dyn Graphs, fact: Triple, poll: &Poller<'_>) -> Result<Vec<u3
 }
 
 /// A fact's sets where its caller keeps them, read by reference: a list, or the entries of
-/// a pool of distinct sets. Nothing is copied (fix check r2, C1.b residual).
+/// a pool of distinct sets. Nothing is copied.
 #[derive(Debug, Clone, Copy)]
 pub struct Sets<'k> {
     list: List<'k>,
@@ -596,7 +596,7 @@ pub enum Previous<'k> {
 /// where they are kept; made under the run's charge where nothing is kept ([`Looked`]),
 /// [`Stopped::Refused`] where that is refused. A store's answer is read on the reading
 /// task's poller (REAS-2, sweep M14): [`Stopped::Cancelled`] where that stopped it, never a
-/// "no sets" (fix check r1, rule 2).
+/// "no sets".
 trait Lookup<'r>: Sync {
     fn sets_of(&self, fact: &Triple, poll: &Poller<'_>) -> Result<Option<Looked<'_, 'r>>, Stopped>;
 }
@@ -664,10 +664,10 @@ const OWN_READ_ONCE: usize = 64;
 
 /// The sets `fact` starts with ([`initial_sets`] of its graphs; the empty set for an axiom,
 /// one of `axioms`, sorted), made for a lookup: one graph's set held inline is made with
-/// nothing allocated; any more are charged to `run` before they are made (fix check r2,
-/// C1.b residual). `None` where it has none. Its graphs are read on `poll`; where that
-/// stopped a read, [`Stopped::Cancelled`], before any set is made from a partly read list
-/// (fix check r1, B11).
+/// nothing allocated; any more are charged to `run` before they are made.
+/// `None` where it has none. Its graphs are read on `poll`; where that
+/// stopped a read, [`Stopped::Cancelled`], before any set is made from a partly read
+/// list.
 fn own_sets<'k, 'r>(
     fact: Triple,
     graphs: &dyn Graphs,
@@ -802,7 +802,7 @@ fn support_sets_run(
     let fired = || run.fired();
     let all = Store::new(facts.to_vec());
     // Each fact's graphs, a store read, on one poller per parallel task (sweep M16). The first
-    // read a stop ended ends them all, with the run's cause (fix check r1, rule 2).
+    // read a stop ended ends them all, with the run's cause.
     let initial: Vec<Option<(Triple, Annotation)>> = facts
         .par_iter()
         .map_init(
@@ -826,7 +826,7 @@ fn support_sets_run(
     sets.extend(initial);
     let empty = Annotation::empty_set();
     // The sequential stages' poller (the premise maps, the bodiless and schema sets): each
-    // premise alternative they read is attempted work (sol-loop r7, R7-1). The parallel
+    // premise alternative they read is attempted work. The parallel
     // morsels make their own. Made after the initial sets: a stop during them ends it here.
     let poll = Poller::new(&fired).ok_or_else(|| run.stopped())?;
     // Facts without a body (ground from schema facts alone, `C subClassOf C` from
@@ -937,7 +937,7 @@ fn support_sets_run(
             }
         }
         // The rules' schema parts, with their charges, for the round: one each, rule `k`'s at
-        // `k`; jobs refer to them by index, never copy them (review r2 C1.b).
+        // `k`; jobs refer to them by index, never copy them.
         let mut schemas: Vec<Held<'_>> = Vec::with_capacity(rules.len());
         for &(_, grounding) in &rules {
             // The schema facts' part, once per rule and round: the minimal sets over the
@@ -946,7 +946,7 @@ fn support_sets_run(
             schemas.push(held);
         }
         // Their construction reads on the sequential poller (sweep M01): stopped, it ends the
-        // run (fix check r2, R3-F1).
+        // run.
         let jobs =
             round_jobs(&source, &rules, &schemas, &whole, &poll).map_err(|_| run.stopped())?;
         let tasks: Vec<(usize, std::ops::Range<usize>)> = jobs
@@ -959,8 +959,8 @@ fn support_sets_run(
             })
             .collect();
         let sets_now = &sets;
-        // A morsel that stopped or refused fails the round, and none starts after it (fix
-        // check r2, R3-F2): each answered an empty part, and every later one started. A refusal
+        // A morsel that stopped or refused fails the round, and none starts after it:
+        // each answered an empty part, and every later one started. A refusal
         // is latched (`run.refuse`) before the error is made, so it stays `Refused`.
         let mut parts: Vec<Found> = tasks
             .par_iter()
@@ -1035,7 +1035,7 @@ fn support_sets_run(
         // change of the mark alone is news too: the facts derived from it are marked.
         // A head's own graphs are a store read ([`own_graph_of`]): one poller per task. A task
         // whose poller has stopped, or whose `minimal` it stopped, fails the pass, and no head
-        // starts after it (fix check r2, R3-F2: it answered "no change" for every later head).
+        // starts after it (it answered "no change" for every later head).
         let updates: Vec<(Triple, Annotation)> = starts
             .par_windows(2)
             .map_init(
@@ -1060,7 +1060,7 @@ fn support_sets_run(
                     {
                         return Ok(None);
                     }
-                    // The copies `minimal` takes, charged first (sol-loop r1 S1).
+                    // The copies `minimal` takes, charged first.
                     let copied = words(kept.iter().chain(group.iter().map(|(_, set, _)| set)));
                     let chosen = Charged::with_capacity(run, kept.len() + group.len(), cap, copied)
                         .and_then(|mut all| {
@@ -1110,9 +1110,9 @@ fn support_sets_run(
 /// A support round's jobs over `source`: of each rule with fact heads and a schema part
 /// (`schemas[k]` for rule `k`), the instances with a changed premise (all of them where
 /// `whole[k]`), each with its heads and `k`. They refer to their schema part by index and
-/// never copy it: the one charged part serves them all (review r2 C1.b). Their construction
-/// reads on `poll` (sweep M01): [`ReadStopped`] where it stopped one, the list then ending
-/// (fix check r2, R3-F1).
+/// never copy it: the one charged part serves them all. Their construction
+/// reads on `poll` (sweep M01): [`ReadStopped`] where it stopped one,
+/// the list then ending.
 #[allow(clippy::type_complexity)]
 fn round_jobs<'s, S: Source + ?Sized>(
     source: &'s S,
@@ -1200,7 +1200,7 @@ impl Graphs for OneGraph<'_> {
 ///
 /// It counts on `poll` ([`Poller`], one per parallel task) each unit it attempts, found or
 /// not: the fact, each producer, each search and each fact a search scans. [`ReadStopped`]
-/// where `poll` stopped it, never "not derived" (fix check r2, R3-F2: its callers' pass went
+/// where `poll` stopped it, never "not derived" (its callers' pass went
 /// on over every later candidate).
 pub fn derived_otherwise<S: Source + ?Sized>(
     source: &S,
@@ -1226,7 +1226,7 @@ pub fn derived_otherwise<S: Source + ?Sized>(
         }
         Ok(true)
     };
-    // Each premise alternative is attempted work (sol-loop r7, R7-1).
+    // Each premise alternative is attempted work.
     let grounded = |grounding: Grounding, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
         Ok(program
             .for_each_alternative(grounding, poll, |premises, poll| {
@@ -1255,8 +1255,8 @@ pub fn derived_otherwise<S: Source + ?Sized>(
         })?;
         Ok(found)
     };
-    // Each producer is attempted work before its schema check, an empty search or not
-    // (review r1, F1).
+    // Each producer is attempted work before its schema check, an empty search or
+    // not.
     let by_rule = program.for_each_producer(fact, poll, |r, poll| {
         Ok(
             match grounded(Grounding::Rule(r), poll)? && derives(&program.rules[r], poll)? {
@@ -1364,7 +1364,7 @@ pub fn rederived<S: Source + Sync + ?Sized>(
     let fired = || run.fired();
     // One poller per parallel task, not per candidate: a candidate whose search scans
     // nothing then costs no poll (a poll reads the process's memory limit). A stopped task
-    // fails the pass, and no candidate starts after it (fix check r2, R3-F2).
+    // fails the pass, and no candidate starts after it.
     let one_step: Vec<Triple> = candidates
         .par_iter()
         .copied()
@@ -1507,7 +1507,7 @@ pub struct Change<'a, S: ?Sized> {
     /// removed from it.
     pub touched: &'a [Triple],
     /// A fact's sets before the change, with its mark: lent from where the caller keeps them
-    /// for the whole update, never copied for it (fix check r2, C1.b residual); `Err` where
+    /// for the whole update, never copied for it; `Err` where
     /// the reading task's poller stopped it.
     pub previous: &'a (dyn Fn(Triple, &Poller<'_>) -> Result<Previous<'a>, ReadStopped> + Sync),
     /// Past this many affected facts the update gives up (a recomputation is cheaper).
@@ -1573,8 +1573,8 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
     // used.
     let fired = || run.fired();
     let stage = Poller::new(&fired).ok_or_else(|| run.stopped())?;
-    // The first read its poller stopped ends the update with the run's cause (fix check r1,
-    // SW111: a stopped probe read as "not in the closure" walked every affected fact).
+    // The first read its poller stopped ends the update with the run's cause (a stopped probe read as "not in the closure" walked every affected
+    // fact).
     let mut members: HashSet<Triple> = HashSet::new();
     for &fact in affected.iter() {
         if (change.in_closure)(fact, &stage).map_err(|_| run.stopped())? {
@@ -1603,7 +1603,7 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
     };
     run.check(held(&now, annotations))?;
     // The schema facts' part per rule: they aren't affected, so it is fixed. A sequential
-    // stage on the stage's poller (sol-loop r7, R7-1), checked before its sets are used.
+    // stage on the stage's poller, checked before its sets are used.
     let schemas: Vec<Held<'_>> = {
         let lookup = Recomputing {
             now: &now,
@@ -1661,9 +1661,9 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
                 || Poller::new(&fired),
                 |poll, &fact| {
                     // The fact is attempted work before either prelude (its bodiless sets,
-                    // its producers), and so is each grounding (review r1, F1; sol-loop r6,
-                    // R6-1). Stopped, or no poller (stopped before the task began): the run's
-                    // cause, which ends the pass (fix check r1, rule 2: an empty answer per
+                    // its producers), and so is each grounding.
+                    // Stopped, or no poller (stopped before the task began): the run's
+                    // cause, which ends the pass (an empty answer per
                     // fact walked every member after the stop).
                     let poll = poll.as_ref().ok_or_else(|| run.stopped())?;
                     if poll.attempt(1) {
@@ -1868,7 +1868,7 @@ fn words<'s>(sets: impl IntoIterator<Item = &'s GraphSet>) -> usize {
 
 /// [`merge`] of one fact's derivations, their sets `found` borrowed (marked if one was:
 /// [`merge`] reads the mark as one beyond the fact's own graphs), into its sets in `now`:
-/// their copy (its slots and words) charged before it is made (sol-loop r1 S1), then
+/// their copy (its slots and words) charged before it is made, then
 /// [`merge_owned`].
 #[allow(clippy::too_many_arguments)]
 fn merge_found<'s>(
@@ -1897,8 +1897,8 @@ fn merge_found<'s>(
 /// sets in `now`, moved, not copied (the base's merge; a copy of a fact's first-pass sets was
 /// the product's commit-2 peak, 1 MiB above the base's, phase `upd: first merge` of
 /// `p2c5-r4-memprof5-1809b4a9`): `merge`'s list, at its final capacity, of the fact's sets
-/// (copied: slots and words) with `from`'s (moved: slots only), charged first (sol-loop r1
-/// S1, r2 S1/S2). The fact's own graphs are read on `poll`.
+/// (copied: slots and words) with `from`'s (moved: slots only), charged first.
+/// The fact's own graphs are read on `poll`.
 #[allow(clippy::too_many_arguments)]
 fn merge_owned(
     run: &Run<'_>,
@@ -1918,12 +1918,12 @@ fn merge_owned(
 }
 
 /// An annotation of the support algebra and the charge of what its sets hold, on the run's
-/// working budget: the caller holds both until it has taken the sets (review r1 C1, sol-loop
-/// r5 S1). Fields drop in order: the sets before their charge.
+/// working budget: the caller holds both until it has taken the sets.
+/// Fields drop in order: the sets before their charge.
 struct Held<'a> {
     annotation: Annotation,
     /// `None` where nothing is charged: a zero-byte reservation's drop still runs the
-    /// budget's atomics, once per derivation on the inline path (sol-loop r11 S1).
+    /// budget's atomics, once per derivation on the inline path.
     _charge: Option<Reservation<&'a Budget>>,
 }
 
@@ -1946,10 +1946,10 @@ impl<'a> Held<'a> {
     }
 }
 
-/// Sets made under a charge taken before they were, owned together: the storage drops
-/// before its charge, and [`Self::minimal`] consumes the sets while the charge holds, so the
-/// release-before-free order can't be written by hand (sol-loop r5–r7, three rounds of it;
-/// the master, 8 Nov 05:10).
+/// Sets made under a charge taken before they were, owned together: the
+/// storage drops before its charge, and [`Self::minimal`] consumes the sets
+/// while the charge holds, so the release-before-free order can't be written
+/// by hand.
 struct Charged<'a> {
     /// Before `charge`: fields drop in order.
     sets: Vec<GraphSet>,
@@ -2004,7 +2004,7 @@ impl<'a> Charged<'a> {
 
 /// One set under the charge of its words (the singleton fast path's union), owned together:
 /// the set drops before its charge; each replacement is charged before it is made, the one
-/// it replaces released after it is freed (review r2 C1.a). A set held inline costs no charge.
+/// it replaces released after it is freed. A set held inline costs no charge.
 struct ChargedSet<'a> {
     /// Before `charge`: fields drop in order.
     set: GraphSet,
@@ -2157,7 +2157,7 @@ impl<'a> Gathered<'a> {
         }
     }
 
-    /// `held`'s sets moved in, `held` whole until they are (sol-loop r9 S5): the list's room
+    /// `held`'s sets moved in, `held` whole until they are: the list's room
     /// charged first; refused, or unwinding, `held` drops as it was, its sets before their
     /// charge. Moved, its old list is freed: of its charge, its slots' part is released and
     /// its sets' words' part handed over, not charged again.
@@ -2182,7 +2182,7 @@ impl<'a> Gathered<'a> {
     }
 
     /// `minimal` of the sets (its output's slots charged first, then every charge they hold
-    /// made one, so nothing is charged twice; sol-loop r6 S3), with the charge of what the
+    /// made one, so nothing is charged twice), with the charge of what the
     /// output holds alone.
     fn choose(self, cap: usize, run: &Run<'a>) -> Result<Held<'a>, BudgetExceeded> {
         // Refused here, the whole drops: the list before the words.
@@ -2225,7 +2225,7 @@ where
     // The jobs' construction reads (estimates, collected drivers) on one sequential poller
     // (sweep M01, M13).
     let stage = Poller::new(&fired).ok_or_else(|| run.stopped())?;
-    // A stopped construction ends the list (fix check r2, R3-F1).
+    // A stopped construction ends the list.
     let mut jobs: Vec<(usize, Job<'_>)> = Vec::new();
     for (k, &(rule, _)) in rules.iter().enumerate() {
         for i in 0..rule.body.len() {
@@ -2243,8 +2243,8 @@ where
                 .map(move |start| (j, start..(start + MORSEL).min(job.drivers())))
         })
         .collect();
-    // A morsel that stopped or refused fails the pass, and none starts after it (fix check
-    // r2, R3-F2); a refusal is latched before the error is made, so it stays `Refused`.
+    // A morsel that stopped or refused fails the pass, and none starts after it;
+    // a refusal is latched before the error is made, so it stays `Refused`.
     let parts: Vec<Found> = tasks
         .par_iter()
         .map(|(j, range)| -> Result<Found, Stopped> {
@@ -2284,12 +2284,12 @@ fn delta_facts(store: &Store, poll: &Poller<'_>) -> Result<Vec<Triple>, ReadStop
 /// cut them; none if no alternative has sets yet.
 ///
 /// Each alternative is a unit of attempted work on `poll`, counted before its premises are
-/// read (sol-loop r7, R7-1): stopped, the sets are incomplete, and the stage's check ends
+/// read: stopped, the sets are incomplete, and the stage's check ends
 /// the run before they are used.
 ///
 /// Every alternative's sets are held together until `minimal` chooses among them: their
 /// slots and words are charged to `run`'s working budget as they are added, and held
-/// through `minimal` (review r1 C1); `Err` where it has no room.
+/// through `minimal`; `Err` where it has no room.
 fn grounding_sets<'a, L: Lookup<'a> + ?Sized>(
     program: &GroundProgram,
     grounding: Grounding,
@@ -2301,7 +2301,7 @@ fn grounding_sets<'a, L: Lookup<'a> + ?Sized>(
 ) -> Result<Held<'a>, Stopped> {
     let mut all = Gathered::new(run.scratch);
     let mut truncated = false;
-    // Alternatives its poller cut short are a part of them (fix check r1, B9): the run's
+    // Alternatives its poller cut short are a part of them: the run's
     // cause; a refusal or a stopped lookup breaks with its own.
     let ended = program
         .for_each_alternative(grounding, poll, |premises, poll| {
@@ -2331,9 +2331,9 @@ fn grounding_sets<'a, L: Lookup<'a> + ?Sized>(
 ///
 /// Each step's product (every union of a kept set with one of the premise's) is charged to
 /// `run`'s working budget before it is built and held until `minimal` has consumed it: its
-/// slots, and at most the longer operand's words per union (review r1 C1); `Err` where it
+/// slots, and at most the longer operand's words per union; `Err` where it
 /// has no room. Exact: `minimal` sees the whole product, as before. A premise's sets are read
-/// where they are kept ([`Lookup`]), never copied first (fix check r2, C1.b residual), on
+/// where they are kept ([`Lookup`]), never copied first, on
 /// `poll`.
 fn premise_sets_from<'a, L: Lookup<'a> + ?Sized>(
     body: &[Triple],
@@ -2346,7 +2346,7 @@ fn premise_sets_from<'a, L: Lookup<'a> + ?Sized>(
     // A budget refusal is `Stopped::Refused` (its `From`), a lookup its poller stopped the
     // run's cause (`Lookup::sets_of`).
     // The usual case, one set everywhere: a single union, nothing to minimise. Its copies
-    // charged before they are made (review r2 C1.a); held inline, nothing is charged, so a
+    // charged before they are made; held inline, nothing is charged, so a
     // derivation makes no budget call.
     if let [only] = start.sets.as_slice() {
         let mut one = ChargedSet::copy(only, run.scratch)?;
@@ -2372,7 +2372,7 @@ fn premise_sets_from<'a, L: Lookup<'a> + ?Sized>(
             return Ok(one.into_held(truncated)?);
         }
     }
-    // The product as it stands, with its charge, until the next replaces it (sol-loop r5 S1).
+    // The product as it stands, with its charge, until the next replaces it.
     let mut product = {
         let mut copy = Charged::with_capacity(run, start.sets.len(), 0, words(&start.sets))?;
         start.sets.iter().for_each(|set| copy.push(set.clone()));
@@ -2422,7 +2422,7 @@ fn premise_sets_from<'a, L: Lookup<'a> + ?Sized>(
 /// fact's own graphs are read on `poll`. `Err` with the run's cause where that read stopped
 /// or the run has stopped since (its latched stop, a refusal included: atomic loads, no
 /// poll, [`Run::latched`]), before the fact's sets are written: a merge `minimal` cut short
-/// is a part (fix check r2, R3-F3: it answered an ordinary "changed", and the loop merged
+/// is a part (it answered an ordinary "changed", and the loop merged
 /// every later fact).
 #[allow(clippy::too_many_arguments)]
 fn merge(
@@ -2462,7 +2462,7 @@ fn merge(
 
 #[cfg(test)]
 mod tests {
-    /// Review r2 C1.a, by the allocator: the singleton fast path charges each spilled copy
+    /// By the allocator: the singleton fast path charges each spilled copy
     /// and union before it is made, under a budget with room or none, and holds nothing
     /// beyond its charge where it leaves early (a premise with no sets) or falls back to the
     /// product (a premise with two). Each row is checked on its own.
@@ -2517,7 +2517,7 @@ mod tests {
         assert!(failed.is_empty(), "{failed:#?}");
     }
 
-    /// Fix check r2 C1.b residual, by the allocator: an update's lookup of a premise it doesn't
+    /// By the allocator: an update's lookup of a premise it doesn't
     /// recompute reads the premise's sets where its caller keeps them (a store's pool of
     /// distinct sets, which the premise's entries index), and where nothing is kept (sets
     /// that are just those it starts with, from its graphs) makes them charged first. The
@@ -2633,7 +2633,7 @@ mod tests {
         assert!(failed.is_empty(), "{failed:#?}");
     }
 
-    /// Merge-time count of #159 (`p2c5-r4-memcount1-2df9ed96`, the master 12:50): a round's
+    /// Merge-time count of #159 (`p2c5-r4-memcount1-2df9ed96`): a round's
     /// parts gathered into one hold their entries once, as the base's one buffer did. Where a
     /// part has room for all of them, gathering allocates nothing; where none has, at most one
     /// buffer of their total. Each row on its own, by the allocator, with every entry kept
@@ -2692,7 +2692,7 @@ mod tests {
     }
 
     /// Merge-time count of #159 (`p2c5-r4-memcount3-caded3cf`: product's commit-2 update 13 %
-    /// slower than before r4): a lookup of a fact whose sets are its own graphs' reads them
+    /// slower than before): a lookup of a fact whose sets are its own graphs' reads them
     /// once where they fit its buffer, and a second time only past it, by the work counter
     /// (its calls to `Graphs::each`). Each row gives `initial_sets` of the fact's graphs.
     #[test]
@@ -2769,7 +2769,7 @@ mod tests {
         }
     }
 
-    /// Review r2 C1.b, by the allocator: a round's jobs refer to their rule's charged schema
+    /// By the allocator: a round's jobs refer to their rule's charged schema
     /// part and hold no copy of it. Over several live jobs, what building them allocates is
     /// the same whatever the schema parts' set count and span.
     #[test]
@@ -2837,7 +2837,7 @@ mod tests {
         );
     }
 
-    /// Sol-loop r6 S3: the sets a grounding's alternatives gathered are chosen among under a
+    /// The sets a grounding's alternatives gathered are chosen among under a
     /// budget that holds exactly them and `minimal`'s output slots, and nothing more is
     /// asked: their words are carried over, not charged again. After, only what the output
     /// holds stays charged.
@@ -2872,7 +2872,7 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    /// Sol-loop r7 S4, by the allocator: a choice refused (no room for `minimal`'s output)
+    /// By the allocator: a choice refused (no room for `minimal`'s output)
     /// frees its sets before it releases their words' charge: nothing held beyond the
     /// charge, and nothing charged after.
     #[test]
@@ -2905,7 +2905,7 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    /// Sol-loop r9 S5, by the allocator: a support algebra result moved into the sets a
+    /// By the allocator: a support algebra result moved into the sets a
     /// grounding gathers stays charged until its old list is freed, and the choice after
     /// holds nothing beyond its charge either.
     #[test]
@@ -2933,7 +2933,7 @@ mod tests {
         assert_eq!(budget.used(), 0);
     }
 
-    /// Sol-loop r5 S1, by the allocator (`nrese_exec::measure`, which `Budget::peak` can't
+    /// By the allocator (`nrese_exec::measure`, which `Budget::peak` can't
     /// replace: it sees allocations nothing charged). A premise product's unions and
     /// `minimal`'s output are charged before they are made, the product's charge lives as long
     /// as it does, and the result's goes with it: nothing held beyond the charge, at a cap as
@@ -3003,7 +3003,7 @@ mod tests {
         );
     }
 
-    /// REAS-2 review r1 F1 (the reviewer's witness): a fact's graphs as the support sets read
+    /// REAS-2: a fact's graphs as the support sets read
     /// them ([`super::InGraphs`], the store's `SupportSets::compute` and the own lookups) are
     /// handed on as they are counted. One fact asserted in 3 × `POLL_UNITS` graphs, the stop
     /// set from the first graph handed on: at most `POLL_UNITS` plus one run more are handed

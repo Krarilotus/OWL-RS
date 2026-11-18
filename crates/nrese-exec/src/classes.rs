@@ -14,8 +14,8 @@
 use hashbrown::HashMap;
 
 /// Test-only: the members unions moved on this thread, counted where they are moved, so a
-/// counted caller's tests see the work itself and not what it was told (REAS-3a fix check r1
-/// F3). Compiled for this crate's tests, or with the `witness` feature in a debug build (other
+/// counted caller's tests see the work itself and not what it was told.
+/// Compiled for this crate's tests, or with the `witness` feature in a debug build (other
 /// crates' tests, as a dev-dependency).
 #[cfg(any(test, all(feature = "witness", debug_assertions)))]
 pub mod witness {
@@ -39,7 +39,7 @@ pub mod witness {
         MOVED.with(Cell::get)
     }
 
-    /// The steps listing the classes has taken on this thread so far (fix check r2 G3).
+    /// The steps listing the classes has taken on this thread so far.
     pub fn examined() -> u64 {
         EXAMINED.with(Cell::get)
     }
@@ -54,7 +54,7 @@ pub struct Classes {
     /// place in `listed`.
     roots: HashMap<u64, (u64, Vec<u64>, usize)>,
     /// The roots, densely. Listing the classes walks only these, never a table emptied by
-    /// unions (fix check r2 G3); a lookup reads `roots` alone, as before G3 (`p2-reas3-abl3`:
+    /// unions; a lookup reads `roots` alone, never the list (`p2-reas3-abl3`:
     /// a lookup through the list cost reasoning and equality queries up to 0.4 % of their
     /// instructions).
     listed: Vec<u64>,
@@ -167,10 +167,10 @@ impl Classes {
     /// [`Self::union`], `ask(n)` called before each `n` members it moves, `n` at most
     /// [`crate::POLL_UNITS`], so a caller that counts its work for a stop sees it within a run
     /// of members however large the classes are (the engine's counted reads,
-    /// `nrese_engine::visit`; REAS-3a fix check r1 R1). `None` once `ask` answers false: the
-    /// union is then half made and these classes are no use, so a caller that stops drops
-    /// them. (Growing the larger side's list and the maps, allocator work, is held for the
-    /// owner with the engine's map initialisation: fix check r1 F2.)
+    /// `nrese_engine::visit`). `None` once `ask` answers false: the union is then half made
+    /// and these classes are no use, so a caller that stops drops them. (Growing the larger
+    /// side's list and the maps, allocator work, is held for the owner with the engine's map
+    /// initialisation.)
     pub fn union_asking(
         &mut self,
         a: u64,

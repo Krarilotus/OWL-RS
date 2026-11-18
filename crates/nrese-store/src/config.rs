@@ -257,8 +257,8 @@ impl FederationConfig {
 }
 
 /// When transparent huge pages may back the process's memory by default: always, as
-/// before the setting (LUBM 100 materialises 26 % faster with them; serving holds less
-/// without them: docs/ops/server-setup.md §12.1).
+/// before the setting (LUBM 100 takes 26 % longer to materialise without them; serving holds less
+/// without them: docs/ops/server-setup.md, "Memory over time").
 pub const DEFAULT_HUGE_PAGES: nrese_exec::memory::HugePages = nrese_exec::memory::HugePages::On;
 
 /// Whether a materialisation releases between its rounds by default: no, reasoning speed

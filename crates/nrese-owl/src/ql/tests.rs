@@ -440,7 +440,7 @@ fn axioms_beyond_ql_that_meet_anonymous_individuals_are_hazards() {
 /// - An individual asserted to be in `∀R.∃S.A`, with an `R`-successor: that successor has
 ///   an `S`-successor in `A`. OWL 2 QL asserts named classes only (Profiles §3.2.5) and RL's
 ///   rules don't apply this one, so the hazard is the assertion's, on every term.
-/// - A left side the TBox doesn't read, or reads in part (review r1, F1): `A ⊓ B ⊑ ∃S.A`
+/// - A left side the TBox doesn't read, or reads in part: `A ⊓ B ⊑ ∃S.A`
 ///   gives an `A ⊓ B` an `S`-successor in `A`. The same holds for `A ⊓ B ⊑ ∀R.∃S.A`, and
 ///   for the unread branch of `A ⊔ (B ⊓ E) ⊑ ∃S.A`.
 /// - `DisjointUnion(C, ∃R.A, ∃R.B)` (F2): a `C` has an `R`-successor (the direction from
@@ -560,7 +560,7 @@ fn existentials_in_right_sides_the_tbox_reads_as_nothing_are_hazards() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// Disjointness concludes a part's complement (fix check r1, F3), read in negation normal
+/// Disjointness concludes a part's complement, read in negation normal
 /// form. An `A` disjoint from `≤ 0 S.D` is in `≥ 1 S.D`; one disjoint from `∀S.¬D` is in
 /// `∃S.D`. Either way it has an `S`-successor in `D` (OWL 2 Direct Semantics), so every
 /// atom of `S(?x ?y), D(?y)` has a concern. The reason may be any hazard that reaches it.
@@ -606,7 +606,7 @@ fn disjointness_concludes_the_complement_of_its_parts() {
 /// - `C ≡ ≤ 0 S.D`, in its direction from the restriction to `C`.
 ///
 /// So under QL's closure and RL's, both atoms have a concern. Guards: `∃S.D ⊑ ⊥` concludes
-/// nothing of `S` or `D`, and `A ⊓ B ⊑ C` nothing of `A` or `B` (review r1, F3: each guard
+/// nothing of `S` or `D`, and `A ⊓ B ⊑ C` nothing of `A` or `B` (each guard
 /// queries the terms of its own left side): no concern.
 #[test]
 fn a_left_side_outside_the_profile_concludes_its_complement() {
@@ -647,7 +647,7 @@ fn a_left_side_outside_the_profile_concludes_its_complement() {
 }
 
 /// An axiom outside the profile whose left side, negated, makes individuals equal is a
-/// global hazard, as one whose right side does (review r1 of D16-492, F1):
+/// global hazard, as one whose right side does:
 /// - `≥ 2 R ⊑ ⊥` is `⊤ ⊑ ≤ 1 R`: `R` is functional, so `a R b` and `a R c` make `b = c`.
 /// - `¬{b} ⊑ ⊥` is `⊤ ⊑ {b}`: every individual is `b`.
 ///
@@ -676,7 +676,7 @@ fn an_equating_left_side_outside_the_profile_is_global() {
 }
 
 /// What an uncovered axiom's conclusions miss reaches an axiom through every term it reads,
-/// its right side's too (D16-492 fix check r1, F1). Under RL's closure, a reflexive `R`
+/// its right side's too. Under RL's closure, a reflexive `R`
 /// (outside RL) may miss `R(a, a)`:
 /// - With `A ⊑ ∀R.B`, an `A` is then missed in `B`; with `S`'s range `∀R.B`, so is an
 ///   `S`-successor. Both axioms are RL, so only the missed `R` edges reach `B`.
@@ -704,7 +704,7 @@ fn a_missed_conclusion_reaches_an_axiom_through_its_right_side() {
 }
 
 /// What anonymous individuals may miss reaches an axiom through every term it reads, its
-/// right side's too (D16-492 fix check r2, F1). With `A ⊑ ∃R.C` and `A ⊑ ∀R.B`, an `A`'s
+/// right side's too. With `A ⊑ ∃R.C` and `A ⊑ ∀R.B`, an `A`'s
 /// anonymous `R`-successor is a `B`. The rewriting types it `C` only, and under RL's
 /// closure the universal is RL, so only the successor's `R` reaches `B`. Under QL's the
 /// universal is outside the profile and reaches `B` itself. The same holds for `S`'s domain
@@ -729,7 +729,7 @@ fn an_anonymous_individual_reaches_an_axiom_through_its_right_side() {
 }
 
 /// A bounded restriction makes no successor itself, but it can force an existential on a
-/// successor that exists (fix check r2, F4). With `X = ∃S.D`, each conclusion below gives
+/// successor that exists. With `X = ∃S.D`, each conclusion below gives
 /// an `R`-successor of a `C` an `S`-successor in `D`, or may for some successor (OWL 2
 /// Direct Semantics §2.2.3): `≤ 0 R.¬X`, `¬≥ 1 R.¬X` and `= 0 R.¬X` are `∀R.X`; `≤ 1 R.¬X`,
 /// `¬≥ 2 R.¬X` and `= 1 R.¬X` put every `R`-successor past the first in `X`; `≤ 0 R.∀S.¬D`
@@ -912,7 +912,7 @@ fn a_data_existential_on_the_left_needs_rdfs_literal() {
 /// - `≥ 2 R.⊤ ⊑ A` with `P ⊑ ∃R` makes neither a `P` nor an individual with one `R` edge an
 ///   `A` (`{u, v}`, `P = {u}`, `R = {(u, v)}`, `A = ∅` is a model): neither is an
 ///   alternative. It is `⊤ ⊑ ≤ 1 R ⊔ A`: an individual outside `A` has one `R`-successor
-///   at most, so its hazard is global under QL's closure and RL's (D16-492 r1, F1);
+///   at most, so its hazard is global under QL's closure and RL's;
 /// - `≥ 1 R.⊤ ⊑ A` is `∃R ⊑ A`: an `R` edge is an alternative;
 /// - `≥ 0 R.C ⊑ A` is `⊤ ⊑ A`: rewritten as `owl:Thing ⊑ A` is, so an anonymous `S`-successor
 ///   is an `A` too. Inside an intersection on the left it isn't read, and `A` has a hazard
@@ -1104,7 +1104,7 @@ fn class_alternatives_are_paid_for_alike_cold_and_warm() {
 /// p2c1-s1-measure-*): 6 steps an atom without that read (10, 40, 100 atoms: 71, 251, 611),
 /// 8 with it (91, 331, 811). The bound sits between the two: 30 more atoms take at least
 /// 30 × 7 more steps (180 without the read, 240 with it), so a later saving that still
-/// pays the terms passes (P2-C1 merge Sol r2 S1: unpaid, the check was quadratic).
+/// pays the terms passes (unpaid, the check was quadratic).
 #[test]
 fn what_binds_an_atom_on_every_individual_is_read_once_and_paid() {
     let (tbox, mut table) = tbox("SubClassOf(owl:Thing :A)", true);
@@ -1160,7 +1160,7 @@ fn outside_ql_irreflexivity_and_asymmetry_conclude_nothing() {
 }
 
 /// An uncovered axiom that equates individuals makes the hazard global even where no term
-/// names it (master, 8 Nov 13:15): a global hazard reaches every term, so it needs none of
+/// names it: a global hazard reaches every term, so it needs none of
 /// its own. The reader gives every equating form a property, class or individual; an empty
 /// `SameIndividual`, built here directly, is one `label` can't name.
 #[test]

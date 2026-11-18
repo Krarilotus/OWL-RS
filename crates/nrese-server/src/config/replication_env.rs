@@ -115,8 +115,8 @@ mod tests {
     }
 
     /// A positive limit below one millisecond is refused, naming the setting, never read
-    /// as none (review p2-b7-syn69 r1, R1-F3: the units owner's rule, reached through
-    /// replication's settings). `1ms` stays finite. Every row is checked.
+    /// as none (the rule of `units::parse_duration_ms`, reached through replication's
+    /// settings). `1ms` stays finite. Every row is checked.
     #[test]
     fn a_replication_limit_below_a_millisecond_is_refused() {
         let mut wrong = Vec::new();

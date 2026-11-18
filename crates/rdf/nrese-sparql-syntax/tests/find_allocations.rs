@@ -1,7 +1,7 @@
 //! A search of the algebra ([`GraphPattern::find`]) allocates nothing: it runs on every query
 //! before evaluation, several times (the native executor's rewrite checks, its triple-term
-//! check), and a microsecond query paid for a vector at every node (Harness note
-//! 2026-11-10-small-query-fastpath-design.md, profile smallq-attrib-7d1e9109-1110). Counted
+//! check), and a microsecond query paid for a vector at every node (profile
+//! smallq-attrib-7d1e9109-1110). Counted
 //! with an allocator of this test binary's own, on this thread only.
 
 use std::alloc::{GlobalAlloc, Layout, System};

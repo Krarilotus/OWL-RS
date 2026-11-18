@@ -214,7 +214,7 @@ fn orders(n: usize) -> Vec<Vec<usize>> {
     out
 }
 
-/// Review D16-058 r1, R1-F1: under dynamic backtracking, a disjunction reopened and passed
+/// Under dynamic backtracking, a disjunction reopened and passed
 /// over as satisfied by a newer choice is reopened again when that choice is retracted.
 ///
 /// Everything is q = A ⊔ B ⊔ C (or `a` is) and everything is p = Y ⊔ X ⊔ B; `a` exists;
@@ -1210,7 +1210,7 @@ fn a_wide_clause_body_is_never_misread() {
     }
 }
 
-/// A clause head wider than a plan's head positions (PR #28 review, B1): `A ⊑ ≤ 1 R.B ⊔
+/// A clause head wider than a plan's head positions (PR #28): `A ⊑ ≤ 1 R.B ⊔
 /// {a₁ … aₖ} ⊔ ∃d.rdfs:Literal` with `A(a)`, `R(a, b)`, `B(b)` has a model (`a` with a `d`
 /// value), with 255 individuals (a 257-atom head) as with 254.
 #[test]

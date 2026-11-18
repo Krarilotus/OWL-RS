@@ -138,8 +138,8 @@ impl Engine {
         let Some(durable) = &shared.durable else {
             return Err(EngineError::LogTruncated { oldest: latest });
         };
-        // Nothing leaves the process before the store's names are durable (deferred-sync
-        // design note of 8 Nov): a follower must never hold what a power loss here could undo.
+        // Nothing leaves the process before the store's names are durable (the deferred
+        // sync of 8 Nov): a follower must never hold what a power loss here could undo.
         durable.settle_names()?;
         // Segments that kept moving: the follower starts again from an image, as for a log a
         // checkpoint has covered.
@@ -560,7 +560,7 @@ mod tests {
     }
 
     /// A stop raised before record 3 of an answer of 2 to 4: record 2 is published, 3 and 4
-    /// aren't, now or after a reopen (review p2-b7-syn69 r1, R1-F2: stop at whole records).
+    /// aren't, now or after a reopen (stop at whole records).
     #[test]
     fn a_stop_before_a_record_publishes_no_further_record() {
         use std::sync::Arc;
@@ -592,8 +592,8 @@ mod tests {
     }
 
     /// An answer that isn't what it says is refused before anything is published: the
-    /// replica keeps its revision and dictionary, also after a reopen (review p2-b7-syn69 r1,
-    /// R1-F1). Guard (passes before the check too): an answer that is what it says applies.
+    /// replica keeps its revision and dictionary, also after a reopen.
+    /// Guard (passes before the check too): an answer that is what it says applies.
     /// Every row is checked.
     #[test]
     fn an_answer_that_is_not_what_it_says_changes_nothing() {
@@ -608,12 +608,12 @@ mod tests {
         };
         let mut discontinuous = decoded(&batch.frames);
         discontinuous[1].dictionary_start += 1;
-        // Review r2 S1: a record with no keys of its own, its range past the dictionary.
+        // A record with no keys of its own, its range past the dictionary.
         let mut keyless = decoded(&batch.frames);
         keyless.truncate(1);
         keyless[0].keys.clear();
         keyless[0].dictionary_start += 1;
-        // Fix check r2 R2-F1: a range whose end is past u64 (start u64::MAX, one key), then a
+        // A range whose end is past u64 (start u64::MAX, one key), then a
         // keyless record starting at 0.
         let mut past_u64 = decoded(&batch.frames);
         past_u64.truncate(2);
@@ -623,7 +623,7 @@ mod tests {
         past_u64[1].keys.clear();
         let mut invalid_suffix = encoded(&all[..1]);
         invalid_suffix.extend_from_slice(b"not a record at all");
-        // DUR-2 fix check r3: a valid record, then one whose commit time no store keeps
+        // A valid record, then one whose commit time no store keeps
         // (`durability::MAX_COMMIT_TIME`).
         let mut past_time = decoded(&batch.frames);
         past_time.truncate(2);
@@ -719,7 +719,7 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// A stopped batch's unpublished tail stays unpublished (review r2 S3): records 2 to 4
+    /// A stopped batch's unpublished tail stays unpublished: records 2 to 4
     /// stopped before 3, then record 3 alone applied, checkpointed and reopened, hold the
     /// dictionary of a replica that applied 2 and 3 without a stop: none of record 4's
     /// entries.
@@ -796,8 +796,8 @@ mod tests {
         assert_eq!(held, expected);
     }
 
-    /// An answer whose revisions run past u64 is refused, not added up (SYN-69 r3 sol-loop
-    /// N1): a replica at revision u64::MAX - 1 (as a restored image can be; here its
+    /// An answer whose revisions run past u64 is refused, not added up:
+    /// a replica at revision u64::MAX - 1 (as a restored image can be; here its
     /// published revision is raised in memory) given records at revisions u64::MAX and 0,
     /// `last` 0. Refused as corruption with the replica as it was; nothing reaches its log
     /// (the reopened replica is at its logged revision, its dictionary unchanged).

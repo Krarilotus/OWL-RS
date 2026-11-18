@@ -177,7 +177,7 @@ pub(crate) struct Wal {
 }
 
 /// The names a store's open leaves to be synced before the first durable write that relies on
-/// them (deferred-sync design note of 8 Nov): the directories holding the levels of the
+/// them (the deferred sync of 8 Nov): the directories holding the levels of the
 /// store's path it found, then the WAL's directory and the store's own. Each is synced once;
 /// a found level's holder this process may not open for its sync is left as it is, as
 /// `place::create_dir_all` leaves it.
@@ -193,7 +193,7 @@ impl PendingNames {
     /// `holders` (found levels' holders, outermost first), then `own` (the store's
     /// directories), each once.
     /// Each directory once by its key: one spelled through a link (the store's root as opened)
-    /// and physically (the holder of its WAL directory's entry, DUR-4 review r1) is the same
+    /// and physically (the holder of its WAL directory's entry) is the same
     /// directory. Both come with their keys, made alike (`place::Named::key`).
     pub(crate) fn new(holders: Vec<(PathBuf, PathBuf)>, own: Vec<(PathBuf, PathBuf)>) -> Self {
         let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
@@ -335,7 +335,7 @@ impl Wal {
     ///
     /// A local commit is stamped here, by `stamp`, once the record's preparation and any
     /// rotation are done and just before it is written and synced: the time is that of the
-    /// commit, not of its build (review r1, R1-F1). Without `stamp` (a replicated record)
+    /// commit, not of its build. Without `stamp` (a replicated record)
     /// the record's own time is kept.
     ///
     /// A local commit's `note` ([`crate::Transaction::note_commit`]) is called after the
@@ -390,7 +390,7 @@ impl Wal {
         // The names the open left pending are synced after the record, before it is
         // acknowledged: the record's sync commits the journal and flushes the device, and the
         // directories' syncs after it find nothing left to flush (measured on the timing host:
-        // in the other order the record's sync paid a second flush; deferred-sync design note).
+        // in the other order the record's sync paid a second flush).
         // A failure there leaves the record written, its outcome unknown: it poisons the log.
         let result = written
             .and_then(|()| self.active.write_all(&self.buffer))
@@ -625,9 +625,9 @@ pub(crate) mod tests {
             }
         }
         // The log again, each record with its commit time: revision `r` at `r` ms. First,
-        // that the transactions wrote theirs: a stamp on every commit, and not zero (PR #79
-        // review, R79-02: the rewrite below replaces them; their order is the wall clock's,
-        // which may step back, so it isn't asserted).
+        // that the transactions wrote theirs: a stamp on every commit, and not zero (PR #79: the rewrite below replaces them; their order is the wall clock's,
+        // which may step back, so it isn't
+        // asserted).
         let mut stamped = 0;
         for (_, path) in super::list_segments(&super::wal_dir(dir.path())).unwrap() {
             let contents = super::read_segment(&path).unwrap();

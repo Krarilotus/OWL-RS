@@ -332,7 +332,7 @@ fn explain_estimates_every_operator() {
 }
 
 /// EXPLAIN prints one estimate per BGP: the BGP's line shows what its own planning
-/// estimated, the estimate of its last step (the master's decision of 14 November, 12:01;
+/// estimated, the estimate of its last step (decided on 14 November;
 /// its planning counts shared values that estimate-time planning doesn't).
 ///
 /// - Input: a counted pair (the 3 nodes knowing n2 and the 3 knowing n8, sharing 1), a

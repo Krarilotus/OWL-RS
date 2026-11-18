@@ -155,7 +155,7 @@ def machine(runtime: str, root: Path | None = None) -> dict:
     }
     # The fleet's name of the host a fleet job's step runs on (FLEET_HOST, set by the fleet): what a
     # round's manifest and a report's context name, so that passes from another host are told apart
-    # (review r1 R1-F1: `host` is the machine's own name, which the fleet's may not be).
+    # (`host` is the machine's own name, which the fleet's may not be).
     if os.environ.get("FLEET_HOST"):
         out["fleet_host"] = os.environ["FLEET_HOST"]
     # What changes timings on the host, as the run found it (hosts.toml `config` records the
@@ -282,7 +282,7 @@ def append_attempts(results: Path, attempts: dict[str, dict]):
     """Cells' attempts appended to <results>/attempts.jsonl, on disk before this returns: the
     file's own fsync (on Windows _commit, i.e. FlushFileBuffers) after the append, then its name
     (sync_directory). No rename: a file appended to only never comes back older after a crash,
-    on Windows too (review cell-receipts r3). Each record starts its own line, so a torn one (a
+    on Windows too. Each record starts its own line, so a torn one (a
     crash mid-append; its work never started) never takes the next with it. Raises if any of it
     fails: the cells' work must not start. Only the run that owns `results` appends (Manifest's
     lock): Windows' append is a seek, then a write, so two appenders could overwrite each other."""
@@ -352,10 +352,10 @@ class Manifest:
         }
         data = self._read()
         # The results directory's own name on disk before any of its attempts: a batch member that
-        # ran can't vanish while an older one's receipt stays (review cell-receipts r4 R2b).
+        # ran can't vanish while an older one's receipt stays.
         sync_directory(self.path.parent.parent)
         # The invocation in the journal before the manifest names it: a journal lacking an
-        # invocation its manifest names has lost records (ledger; review cell-receipts r4 R2b).
+        # invocation its manifest names has lost records (ledger).
         _append(self.path.parent, [{"invocation": self.entry["invocation"], "started": self.entry["started"]}])
         data.setdefault("invocations", []).append(self.entry)
         self.index = len(data["invocations"]) - 1
@@ -364,7 +364,7 @@ class Manifest:
     def _read(self) -> dict:
         """The manifest as it is: none yet is an empty one; one that can't be read or parsed is
         refused (ManifestError), never taken for empty: the next write would drop every earlier
-        invocation's evidence (review cell-receipts r2)."""
+        invocation's evidence."""
         if not self.path.exists():
             return {"schema": 1, "invocations": []}
         try:
@@ -378,7 +378,7 @@ class Manifest:
     def _write(self, data: dict):
         """The manifest, durably: its bytes on disk before it replaces the old one, and the
         replacement itself on disk, before this returns (a cell's attempt must survive a host crash
-        before its work starts: review cell-receipts r2). Raises if any of that fails."""
+        before its work starts). Raises if any of that fails."""
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".json.tmp")
         with open(tmp, "w", encoding="utf-8", newline="\n") as f:

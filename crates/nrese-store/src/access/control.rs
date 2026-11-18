@@ -62,7 +62,7 @@ struct Writer {
     /// The next change's number.
     next: u64,
     /// The names that ever had a local login ([`local_past`]): a user record created for
-    /// one of them gets an id (SYN-64 r2). Kept under this lock with the change that adds
+    /// one of them gets an id. Kept under this lock with the change that adds
     /// to it, so no create misses one.
     local_past: BTreeSet<String>,
 }
@@ -421,7 +421,7 @@ impl AccessControl {
 
 /// The names that ever had a local login, from `records` (every change, the latest first, of
 /// `resources` change resources) and the state they made (`state`, from `statements`
-/// statements): SYN-64 r2, a user record created for one of them is a new person. The history
+/// statements): a user record created for one of them is a new person. The history
 /// decides identities, so one that can't answer refuses the open rather than guess (either
 /// guess errs: on disclosure, or on moving token users' spaces).
 fn local_past(

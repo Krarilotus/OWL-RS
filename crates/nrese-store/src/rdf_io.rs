@@ -61,8 +61,8 @@ fn parser(
 // Uploads are read once, as they go: each statement goes to its consumer borrowed from the
 // parser's buffers (a write's transaction, a validation's speculative one, a check) and is
 // gone before the next. A write that fails part-way is discarded with its transaction; the
-// new terms it interned stay in the shared dictionary (stated limit L3 for v1.5, dictionary
-// lifecycle contract). A document's statements are never kept as owned copies uncharged:
+// new terms it interned stay in the shared dictionary (a known limit of v1.5).
+// A document's statements are never kept as owned copies uncharged:
 // with one long namespace and many short statements, those copies cost thousands of times
 // the document (the upload sizing). A caller that must keep them gets [`ChargedQuads`].
 

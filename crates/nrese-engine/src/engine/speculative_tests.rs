@@ -1,6 +1,6 @@
-//! Dictionary lifecycle V1's engine guards (`notes/2026-11-09-dict-v1-speculative-private-design.md`
-//! §4): item 8, a private transaction's memoised pending snapshot, and the system-vocabulary
-//! append (§1.1). Each states its input and what the design says it must give.
+//! Dictionary lifecycle V1's engine guards:
+//! a private transaction's memoised pending snapshot, and the system-vocabulary
+//! append. Each states its input and what it must give.
 
 use std::sync::Arc;
 
@@ -42,7 +42,7 @@ fn own(snapshot: &Snapshot) -> OwnState<'_> {
 /// What a probe stored in an own-state slot.
 struct Probe(u32);
 
-/// Item 8 (§4), the memo (§1.1).
+/// The memo: a private pending snapshot is reused while its state and budget are.
 ///
 /// - Input: a private transaction with one asserted statement; its pending snapshot asked for
 ///   twice with one budget; then after a write that changes nothing, a write that changes the
@@ -108,7 +108,7 @@ fn a_private_pending_snapshot_is_reused_while_its_state_and_budget_are() {
     );
 }
 
-/// Item 6 (§4), the bounded-prefix precondition (`PrivateTransaction::extends`).
+/// The bounded-prefix precondition (`PrivateTransaction::extends`).
 ///
 /// - Input: a published snapshot; then a system-vocabulary append (no commit); a private
 ///   transaction over the latest snapshot; then a commit of a new term; another engine's
@@ -151,7 +151,7 @@ fn a_private_transaction_extends_only_its_engines_earlier_snapshots() {
     );
 }
 
-/// Item 7 (§4), at the engine: a refusal.
+/// A private write refused at the engine.
 ///
 /// - Input: a private transaction whose budget has no room; a term and a statement of its own.
 /// - Expected: both refused as `MemoryLimit`, through the inherent methods and the trait
@@ -238,8 +238,8 @@ fn large_private<'e>(engine: &'e Engine, budget: &Arc<Budget>) -> super::Private
     tx
 }
 
-/// R1-C1 of V2's review r1 (`notes/review-dict-v2-r1/review.md`): the memo's lock and the
-/// pool. Red on the parent, whose memo held its lock while the snapshot was built.
+/// The memo's lock and the pool. Red on the parent, whose memo held its lock while the
+/// snapshot was built.
 ///
 /// - Input: 8 rounds, each on a thread of its own: a fresh private transaction with 20,000
 ///   pending statements (past the parallel-build threshold), so its memo starts cold, and 64
@@ -295,7 +295,7 @@ fn parallel_readers_of_a_cold_memo_finish_while_it_is_built_on_the_pool() {
     }
 }
 
-/// R1-C1 again, in the schedule that deadlocked the parent's memo (V2's lead, 06:44: readers
+/// The memo's lock again, in the schedule that deadlocked the parent's memo (readers
 /// that only park on the lock steal nothing, so a plain `par_iter` of readers rarely meets it).
 ///
 /// - Input: 12 trials, each a fresh private transaction with 20,000 pending statements, on a
@@ -351,7 +351,7 @@ const TRIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(20);
 /// lock first: short against the build, long against a fork.
 const READER_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
-/// DICT2's correction (06:38): a memo entry is keyed by the vocabulary end its snapshot froze.
+/// A memo entry is keyed by the vocabulary end its snapshot froze.
 /// `try_intern` takes `&self`, so a term can be added while a snapshot is built.
 ///
 /// - Input: a private transaction with 20,000 pending statements; one thread interning 2,000
@@ -503,7 +503,7 @@ fn a_pending_scan_outlives_its_pattern() {
 
 /// The shared kind through `PendingWrite` charges as its own charged writes do: since #219,
 /// engine-v2's update path calls `Transaction::try_insert` and `try_remove`, and a generic one
-/// calls the trait (V2's lead, 9 Nov).
+/// calls the trait (V2, 9 Nov).
 ///
 /// - Input: a write transaction whose pending changes are charged to an empty budget; through
 ///   the trait, an insert of a new statement, then the removal of the committed one.
@@ -573,7 +573,7 @@ fn a_private_transactions_pending_growth_is_charged_to_its_budget() {
 }
 
 /// A private transaction's pending snapshots are charged to the reader's budget, as a write
-/// transaction's are (DUR-6; V1-engine review r1, F2): what they make is charged before it is
+/// transaction's are (DUR-6): what they make is charged before it is
 /// made and held while they live.
 ///
 /// - Input: a private transaction with a statement of its own; through `PendingView`, its

@@ -122,7 +122,7 @@ fn product_input() -> (Vec<Triple>, crate::eval::GroundProgram, Vec<Triple>) {
     (closure, ground, asserted)
 }
 
-/// Review r1 C1 (`notes/review-p2-c5-r1/review.md`): the premise product, n² unions before
+/// The premise product, n² unions before
 /// `minimal` keeps n, is admitted on the working budget before it is built. Under a budget
 /// below its bytes (and far above what the kept sets take) the evaluation ends `Refused`,
 /// within the limit, holding nothing; with an ample one it answers. Two rows: unions held

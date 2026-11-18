@@ -121,7 +121,7 @@ fn remove_matching_clears_one_graph() {
     assert_eq!(snapshot.named_graphs().count(), 0);
 }
 
-/// A charged insert that grows nothing needs no room (D16-039, sol-loop r1 S1): one that
+/// A charged insert that grows nothing needs no room: one that
 /// undoes the transaction's removal of a statement, or of a statement asserted already,
 /// succeeds within a budget that the removal alone fills at its peak.
 #[test]

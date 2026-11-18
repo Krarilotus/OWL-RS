@@ -1,7 +1,7 @@
-//! REAS-2 fix check r2 (`Harness/notes/review-reas2-r3/review.md`): a stop is an error at
+//! REAS-2: a stop is an error at
 //! every level a read's answer reaches, the job lists, the parallel passes and the merges
-//! built from reads included, so the loop around a stopped one ends there (design note,
-//! "Fix check r2", rule 2 completed). Each witness counts, below the producer, the units a
+//! built from reads included, so the loop around a stopped one ends there.
+//! Each witness counts, below the producer, the units a
 //! pass starts after its stop fired (`witness`, per thread): every pass runs on a one-thread
 //! pool, so all of them count on the thread that asks the stop. The stop is
 //! [`witness::FirstWork`] on the counted site: it fires at the first poll after the first
@@ -42,7 +42,7 @@ fn subclasses(n: usize) -> (Vec<String>, Vec<String>) {
     (axioms, members)
 }
 
-/// R3-F1 (SW118–SW128). Spec: a job's construction that a stopped read cut short is an
+/// Spec: a job's construction that a stopped read cut short is an
 /// error, and the loop over the program's rules ends with it. Production-grounded OWL 2 RL
 /// over `n` subclass edges: (a) a materialisation's first round, one full job per instance;
 /// (b) an update inserting a member of every `cᵢ`, one variant per instance. The stop fires
@@ -103,7 +103,7 @@ fn job_construction_ends_at_its_stop() {
     assert!(failed.is_empty(), "of {n} instances: {failed:#?}");
 }
 
-/// R3-F1 (SW106). Spec: a dependency key's `sameAs` partners that a stopped read cut short
+/// Spec: a dependency key's `sameAs` partners that a stopped read cut short
 /// are an error, and the enumeration of the grounded rules' keys ends with it (its keys grow
 /// with the schema: one class pair per subclass edge). A deletion under OWL 2 RL (which
 /// reads `sameAs`) over `n` subclass edges, the stop firing at the first poll after a
@@ -142,7 +142,7 @@ fn a_deletion_s_dependency_keys_end_at_its_stop() {
     assert!(interrupted, "a stopped update is interrupted");
 }
 
-/// R3-F2 (SW141). Spec: an expanded listing's fold fails on a stopped poller before it
+/// Spec: an expanded listing's fold fails on a stopped poller before it
 /// touches the next fact. A class of two identities and `n` facts mentioning one of them:
 /// the stop fires at the first poll after the fold took a fact; at most one more is taken.
 /// A stopped thread's fold went on: three class lookups and the copies' bound per later fact.
@@ -229,7 +229,7 @@ fn two_ways(n: usize) -> TwoWays {
     }
 }
 
-/// R3-F2 (SW138, SW137). Spec: a parallel pass whose task poller has stopped fails, and no
+/// Spec: a parallel pass whose task poller has stopped fails, and no
 /// later item starts. (a) `rederived`'s one-step pass over `n` candidates, (b) the support
 /// round's per-head pass over `n` heads (each asks for its own graphs: two sets at cap 1).
 /// The stop fires at the first poll after the pass started an item: at most one more
@@ -294,7 +294,7 @@ fn a_support_pass_ends_at_its_stop() {
     assert!(failed.is_empty(), "of {n}: {failed:#?}");
 }
 
-/// R3-F3 (SW116, SW117). Spec: a merge whose own-graph read stopped is an error, and the
+/// Spec: a merge whose own-graph read stopped is an error, and the
 /// update's merge loop ends with it; no sets are returned. An update touching the `2n`
 /// asserted facts of [`two_ways`] at cap 1, so each of the `n` derived facts' merges reads
 /// its own graphs; the stop fires at the first poll after a merge started: at most one more

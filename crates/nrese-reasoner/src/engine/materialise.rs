@@ -82,7 +82,7 @@ pub(super) fn materialise_with_unstorable(
 impl Program {
     /// Whether the closure of the axioms alone concludes only facts a store can hold, read
     /// from `empty`, a snapshot with no asserted statement: then each such fact a first
-    /// load's closure holds is new to the state (review r1 F1, [`super::maintain`]).
+    /// load's closure holds is new to the state ([`super::maintain`]).
     /// Computed once for the program; `Err` if `operation` fired first, its cause kept. The
     /// axioms' own violations are those of the state before: charged to `memory` while it
     /// runs, and their equality copies to the operation's room.

@@ -74,8 +74,8 @@ class QueryNames(unittest.TestCase):
     def test_a_recorded_query_file_is_its_results_item(self):
         """answers.json records a query by its file, the results by the file's stem (the driver's
         item): answers.query_id turns the one into the other, without a directory, one `.rq`
-        and nothing else (Sol, PR #56 compare r1: geographica2's `…_1_1.0` lost its `.0`; fix
-        check 1: `q1.rq.rq` lost both)."""
+        and nothing else (PR #56: geographica2's `…_1_1.0` lost its `.0`;
+        `q1.rq.rq` lost both)."""
         dotted = "00-Synthetic_Selection_Intersects_1_1.0"
         self.assertEqual([answers.query_id(n) for n in (f"queries/{dotted}.rq", "queries\\q1.rq.rq", "q1.rq")],
                          [dotted, "q1.rq", "q1"], "SPEC the item is the query file's stem")
@@ -98,7 +98,7 @@ class OracleCompare(unittest.TestCase):
                    f'<http://e/1896>\t"26.186885245901639344"^^<{x}decimal>',
                    f'<http://e/1896>\t"26.186885245901639344262295"^^<{x}decimal>'),
             "q3": ("SELECT ?n WHERE { ?s <http://e/p> ?n }", f'"7"^^<{x}integer>', f'"8"^^<{x}integer>'),
-            # T8 Sol r1 S2: an AVG over doubles is compared by value; two decimal AVGs that can't
+            # An AVG over doubles is compared by value; two decimal AVGs that can't
             # both be one quotient at their own digits are no division to leave to an oracle.
             "q4": ("SELECT ?g (AVG(?w) AS ?m) WHERE { ?s <http://e/g> ?g ; <http://e/w> ?w } GROUP BY ?g",
                    f'<http://e/1896>\t"3.25E0"^^<{x}double>', f'<http://e/1896>\t"2.25E0"^^<{x}double>'),
@@ -125,7 +125,7 @@ class OracleCompare(unittest.TestCase):
                          "SPEC answer contract: a different value is unexplained, a division's result too")
 
     def test_every_shared_case_an_oracle_doesnt_decide(self):
-        """T8 PR #56 R1: equal rows counted as an agreement before the contract saw them, so a COUNT
+        """PR #56: equal rows counted as an agreement before the contract saw them, so a COUNT
         in xsd:int agreed. Every shared case without an exact oracle (which this comparison has
         none of) goes through it: its agreements, deviations, divisions and differences are the
         contract's."""
@@ -170,9 +170,9 @@ class OracleCompare(unittest.TestCase):
 
 class SameAnswers(unittest.TestCase):
     """benches/sparql/same_answers.py (two runs' answers, system by system) compares through the
-    contract with each query's operators (T8 Sol r1 S5): without them two conformant lengths of
+    contract with each query's operators: without them two conformant lengths of
     one AVG read as a wrong answer. Operators a run didn't record (answers.json from before T8)
-    are unknown, not absent (Sol r2 S5): such a difference stays undecided."""
+    are unknown, not absent: such a difference stays undecided."""
 
     def test_two_runs_compare_with_the_querys_operators(self):
         spec_ = importlib.util.spec_from_file_location(
@@ -226,7 +226,7 @@ class Compare(unittest.TestCase):
         query = ('SELECT ?g (COUNT(DISTINCT ?a) AS ?n) (AVG(?age) AS ?avg) (?x / 2 AS ?half) (STR(<http://a/b>) AS ?s)'
                  ' WHERE { ?a <http://e/g> ?g }')
         self.assertEqual(answers.operators(query), {"n": "count", "avg": "division", "half": "division"})
-        # T8 Sol r1 S3: only a COUNT's own result must be xsd:integer.
+        # Only a COUNT's own result must be xsd:integer.
         self.assertEqual(answers.operators("SELECT (COUNT(*) / 2 AS ?half) (COUNT(?x) + 1 AS ?m) WHERE { }"),
                          {"half": "division"}, "SPEC answer contract: a COUNT divided is a division")
 
@@ -541,7 +541,7 @@ class Recording(unittest.TestCase):
 
     def test_a_replayed_capture_whose_file_is_gone_fails_even_if_an_equal_one_was_compared(self):
         """A capture is an answer only while its file can be read as one: a byte-identical
-        capture compared before doesn't stand in for it (Sol review r1 finding 1)."""
+        capture compared before doesn't stand in for it."""
         q = "SELECT ?x { ?x ?p ?o }"
         one = (200, select(["x"], [iri("a")]))
         for gone, expected in ((("nrese", 2), {"jena": "reference", "nrese": "incomplete"}),
@@ -557,7 +557,7 @@ class Recording(unittest.TestCase):
 
     def test_a_reference_whose_first_limit_capture_failed_is_no_reference(self):
         """A reference's unordered LIMIT query timed out in its first repetition, its pool and
-        its second answered: no reference, not a crash (Sol review r1 finding 2)."""
+        its second answered: no reference, not a crash."""
         q, full = "SELECT ?x { ?x ?p ?o } LIMIT 1", "SELECT ?x { ?x ?p ?o }"
         with tempfile.TemporaryDirectory() as tmp:
             recorder = self.record(Path(tmp), q, {
@@ -567,8 +567,8 @@ class Recording(unittest.TestCase):
 
     def test_equal_limit_captures_are_each_checked_against_the_pool(self):
         """Two byte-identical captures of a LIMIT query are still each a legal subset of the
-        reference's pool: equal to each other proves nothing about the pool (Sol review r1
-        finding 3)."""
+        reference's pool: equal to each other proves nothing about the
+        pool."""
         q, full = "SELECT ?x { ?x ?p ?o } LIMIT 1", "SELECT ?x { ?x ?p ?o }"
         limited = (200, select(["x"], [iri("z")]))
         with tempfile.TemporaryDirectory() as tmp:

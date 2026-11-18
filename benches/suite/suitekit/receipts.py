@@ -3,9 +3,9 @@ attempt is appended to the results' attempts.jsonl, on disk, before the cell's w
 (manifest.append_attempts); its receipt goes into its invocation's manifest entry (`cells`), under
 the same attempt id, once the cell has run its whole protocol, and its answers once the run's
 answers.json is written. The ledger takes the newest attempt of each cell, finished or not, its
-receipt only under that attempt, and never an older one in its place; `suite.py
-coverage` compares it with what the evaluated commit expects (Harness notes
-2026-11-08-coverage-refresh/design.md r2; review cell-receipts r1).
+receipt only under that attempt, and never an older one in its place;
+`suite.py coverage` compares it with what the evaluated commit
+expects.
 
 | Field | What it holds |
 |---|---|
@@ -52,7 +52,7 @@ from pathlib import Path
 CODE_ROOTS = ("benches", "scripts", "rust-toolchain.toml", ".cargo")
 RESULTS = ("benches/runs", "benches/baselines", "benches/STATUS.md", "benches/STANDINGS.md", "benches/CATALOG.md")
 BUILD_PATHS = ("crates", "Cargo.toml", "Cargo.lock")  # a compiled NRESE server or timing harness
-# Each program's declared dependency envelope (P1d review r1 F2): the repository paths whose content
+# Each program's declared dependency envelope: the repository paths whose content
 # can change what its build makes, with the toolchain's configuration (rustup and cargo read
 # rust-toolchain.toml and .cargo from the repository root, where both builds run). Conservative, not
 # an exact read set: a change anywhere in it re-qualifies the build, though a given build may read
@@ -61,14 +61,14 @@ BUILD_PATHS = ("crates", "Cargo.toml", "Cargo.lock")  # a compiled NRESE server 
 # harness is a workspace of its own (--manifest-path, its own Cargo.lock) whose path dependencies
 # are crates/ members that inherit fields from the root Cargo.toml; it doesn't read the root
 # Cargo.lock. The launcher: scripts/cargo-guarded.sh and the two it sources for the compiler's flags
-# and room (P2 design check r4 B); on Windows it also runs scripts/lib/memory-cap.ps1, admission
+# and room; on Windows it also runs scripts/lib/memory-cap.ps1, admission
 # only, which shapes no program content and isn't in the envelope.
 LAUNCHER = ("scripts/cargo-guarded.sh", "scripts/lib/target-cpu.sh", "scripts/lib/disk.sh")
 BUILD_SOURCES = {
     "nrese": (*BUILD_PATHS, "rust-toolchain.toml", ".cargo", *LAUNCHER),
     "harness": ("benches/nrese-bench-harness", "crates", "Cargo.toml", "rust-toolchain.toml", ".cargo", *LAUNCHER),
 }
-# What a program's build scripts read that git doesn't hold (r4 A): crates/nrese-server/build.rs
+# What a program's build scripts read that git doesn't hold: crates/nrese-server/build.rs
 # embeds every file of the ignored console build.
 BUILD_INPUTS = {"nrese": ("apps/nrese-console/dist",), "harness": ()}
 

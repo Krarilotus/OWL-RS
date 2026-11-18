@@ -2,7 +2,7 @@
 //! ([`PrivateTransaction`]). Code that applies changes, or reads pending state, over either
 //! kind is generic over these traits, so one body serves both and the private kind can't be
 //! passed where only the shared kind belongs (its commit, its identity reservations). Dictionary
-//! lifecycle, V1 (`notes/2026-11-09-dict-v1-speculative-private-design.md` §1.1).
+//! lifecycle, V1.
 //!
 //! - **Sealed:** only this crate's two transaction kinds implement them.
 //! - **Every write can be refused** ([`crate::EngineError::MemoryLimit`]): a private

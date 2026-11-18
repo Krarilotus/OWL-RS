@@ -1,10 +1,10 @@
 """Cell attempts and receipts (suitekit/receipts.py): what a cell ran, under the attempt written
-before its work, kept per cell by the ledger. Specified by Harness notes
-2026-11-08-coverage-refresh/design.md r2, its doubt review (F1-F8) and review cell-receipts r1
-(R1-R6): an interrupted attempt stays incomplete and no older receipt stands in for it (F1, R2),
-answers are the attempt's own (F2, R3), a licensed system's results stay local whatever its
-outcome (R1), images are the ones run (R4), the code is everything the repository holds for it
-(F3, R5), and what can't be evidenced is said unknown, never an empty map (R6)."""
+before its work, kept per cell by the ledger. Specified:
+an interrupted attempt stays incomplete and no older receipt stands in for it,
+answers are the attempt's own,
+a licensed system's results stay local whatever its outcome, images are the ones run,
+the code is everything the repository holds for it, and what can't be evidenced
+is said unknown, never an empty map."""
 from __future__ import annotations
 
 import contextlib
@@ -75,7 +75,7 @@ class Crash:
     """What a host crash leaves of a results directory, from the calls its manifest writers made:
     a file's bytes once its fsync returned, under a name already on disk; a new name or a rename
     once its directory was synced, unless the directory sync makes nothing durable (`no_dirsync`:
-    the suite's on Windows before review r3, a share that can't flush): then it is lost. What is
+    an earlier suite's on Windows, a share that can't flush): then it is lost. What is
     there at the start counts as long on disk. `fail` fails the fsync publishing an attempt."""
 
     def __init__(self, directory: Path, no_dirsync: bool):
@@ -141,7 +141,7 @@ class Ledger(unittest.TestCase):
         return {p["system"]: p for p in self.record(*args, **kwargs)["pairs"]}
 
     def test_each_cell_keeps_its_own_invocation_s_receipt(self):
-        """F8: cell A ran at C1, cell B was added later at C2 in the same directory. Each cell's
+        """Cell A ran at C1, cell B was added later at C2 in the same directory. Each cell's
         receipt is its own invocation's, and survives the record's TOML, an unknown as it was."""
         a = done("a1", "2026-11-08T01:00:00.000001", "c1" * 20, code={"benches": "t1"},
                  data={"/rggs/x.ttl": receipts.unknown("outside the datasets: not hashed")})
@@ -156,7 +156,7 @@ class Ledger(unittest.TestCase):
         self.assertEqual(back["oxigraph"]["receipt"]["data"], {"/rggs/x.ttl": {"unknown": "outside the datasets: not hashed"}})
 
     def test_an_unfinished_newer_attempt_is_the_cell_s_evidence_never_an_older_receipt(self):
-        """R2: I1 completed A and B; I2 attempted A again in the same directory and died before its
+        """I1 completed A and B; I2 attempted A again in the same directory and died before its
         receipt. A's evidence is I2's incomplete attempt; B keeps I1's receipt."""
         i1 = invocation("2026-11-08T01:00:00", "c1" * 20,
                         {"lubm/1/oxigraph": done("a1", "2026-11-08T01:00:01.000000", "c1" * 20),
@@ -178,7 +178,7 @@ class Ledger(unittest.TestCase):
         self.assertEqual(manifest.read_journal(self.run), [{"cell": "lubm/1/x", **a2}])
 
     def test_answers_are_the_attempt_s_own_never_the_directory_s(self):
-        """R3: I1 measured A with full answers, ok; I2 measured A again with --answers off. The
+        """I1 measured A with full answers, ok; I2 measured A again with --answers off. The
         directory's answers.json is still I1's; A's evidence says not captured, and the pair has
         no answer verdict of the directory's."""
         verdicts = [{"workload": "lubm", "tier": "1", "system": "oxigraph", "query": "q1", "verdict": "ok"}]
@@ -190,7 +190,7 @@ class Ledger(unittest.TestCase):
         self.assertNotIn("answers", pairs["oxigraph"])
 
     def test_a_licensed_system_s_results_stay_local_whatever_its_outcome(self):
-        """R1: GraphDB ran with --answers full and its input missing: only skipped rows, its answers
+        """GraphDB ran with --answers full and its input missing: only skipped rows, its answers
         `incomplete`. Neither its outcome nor its answers are in the record, and the record says it
         holds a licensed system."""
         verdicts = [{"workload": "lubm", "tier": "1", "system": "graphdb", "query": "q1", "verdict": "incomplete"}]
@@ -245,7 +245,7 @@ class Driver(unittest.TestCase):
         return {a["cell"]: a for a in map(json.loads, filter(None, lines)) if "cell" in a}  # not invocations'
 
     def system(self, images=(), script_builds=()):
-        # definition_paths: what the reviewed head's adapters had (r1), so its red reaches the verdicts.
+        # definition_paths: none, as the adapters had before this test, so its red reaches the verdicts.
         return Mock(regimes={"none": ""}, images=Mock(return_value=list(images)), builds=Mock(return_value=[]),
                     script_builds=Mock(return_value=list(script_builds)),
                     supports=Mock(return_value=None), definition_paths=())
@@ -263,7 +263,7 @@ class Driver(unittest.TestCase):
             suite.run()
 
     def test_an_interrupted_tier_s_attempt_stays_incomplete_and_a_finished_one_has_its_receipt(self):
-        """F1, R2: tier 1 ran both repetitions; tier 2 was interrupted in its second. Tier 1's cell
+        """Tier 1 ran both repetitions; tier 2 was interrupted in its second. Tier 1's cell
         has its receipt, with its own outcome; tier 2's attempt was written first and stays incomplete."""
         suite = self.suite()
         (self.root / "data" / "a.nt").write_bytes(b"<a> <b> <c> .\n")
@@ -284,7 +284,7 @@ class Driver(unittest.TestCase):
         self.assertNotEqual(receipt["attempt"], journal["w/2/x"]["attempt"])
 
     def test_a_receipt_names_the_image_ids_the_run_pinned(self):
-        """R4: the run pinned tag T to A; T was moved to B since. The containers ran A (by its pinned
+        """The run pinned tag T to A; T was moved to B since. The containers ran A (by its pinned
         id), and so does the receipt; an image the pin map lacks is unknown."""
         suite = self.suite(runs=1)
         suite.manifest.update(images={"img:t": "sha256:B"})
@@ -319,7 +319,7 @@ class Driver(unittest.TestCase):
                 self.assertEqual(self.cells(suite)["w/1/x"]["images"]["img:t"]["source"], expected)
 
     def test_an_image_that_compiles_a_source_of_its_own_needs_its_source_commit_label(self):
-        """Review image-source-commit r1 F2 (orchestrator 18:26): an image its adapter declares built
+        """An image its adapter declares built
         from a source chosen apart from its context (script_builds: MillenniumDB's, by images.sh)
         is known only with its source commit; its context's tree alone says unknown, why. An image
         built from its context alone (builds: Jena's) is known by that tree, as before."""
@@ -350,7 +350,7 @@ class Driver(unittest.TestCase):
                 self.assertEqual(images["img:j"]["source"], f"built from benches/competitors/jena@{tree}")
 
     def test_the_millenniumdb_adapter_declares_the_image_images_sh_builds_at_its_dockerfile_s_commit(self):
-        """Review r1 F2: the declaration is the adapter's own; its tag is the one images.sh builds
+        """The declaration is the adapter's own; its tag is the one images.sh builds
         (nrese-bench/millenniumdb:<the declared commit's first seven>), so declaration, Dockerfile
         and tag can't drift apart unnoticed."""
         ctx = driver.Context(None, ROOT, ROOT, ROOT, driver.Mount("-", "/data"), [], 0, {}, "images")
@@ -383,7 +383,7 @@ class Driver(unittest.TestCase):
                 self.assertIn(why, source["unknown"])
 
     def test_a_run_s_answers_go_into_its_finished_attempts_only(self):
-        """R3: the run's own answer verdicts, each cell's worst, into its finished attempts; an
+        """The run's own answer verdicts, each cell's worst, into its finished attempts; an
         unfinished attempt keeps none."""
         suite = self.suite(runs=1)
         suite.answers = Mock(verdicts=Mock(return_value=[
@@ -552,18 +552,18 @@ class Driver(unittest.TestCase):
         return self.cells(suite)["w/1/x"]["build"]
 
     def test_a_build_names_the_trees_it_compiled_at_its_own_commit(self):
-        """Orchestrator, 8 Nov (P1d, design r2 F10; r3 F10): each build records the git ids of its
-        program's declared dependency envelope (P1d review r1 F2: what its build can read, not an exact
+        """8 Nov (P1d): each build records the git ids of its
+        program's declared dependency envelope (what its build can read, not an exact
         read set) at its own source's commit, so a receipt is compared by content. NRESE: crates,
         Cargo.toml, Cargo.lock, rust-toolchain.toml, .cargo, from its source, which can be another
         checkout. The harness, a workspace of its own built with --manifest-path whose path
         dependencies are crates/ members inheriting from the root Cargo.toml: its workspace
         directory, crates, Cargo.toml, rust-toolchain.toml, .cargo, from the repository. Both: the
-        launcher, scripts/cargo-guarded.sh and what it sources (r4 B)."""
+        launcher, scripts/cargo-guarded.sh and what it sources."""
         self.checkout(self.root, "suite")
         source = self.checkout(self.root / "data" / "nrese-src", "nrese")
         build = self.built(source)
-        launcher = ("scripts/cargo-guarded.sh", "scripts/lib/target-cpu.sh", "scripts/lib/disk.sh")  # r4 B
+        launcher = ("scripts/cargo-guarded.sh", "scripts/lib/target-cpu.sh", "scripts/lib/disk.sh")  # the launcher and what it sources
         paths = {"nrese": ("crates", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo", *launcher),
                  "harness": ("benches/nrese-bench-harness", "crates", "Cargo.toml", "rust-toolchain.toml", ".cargo",
                              *launcher)}
@@ -577,7 +577,7 @@ class Driver(unittest.TestCase):
         self.assertNotEqual(build["nrese"]["sources"]["crates"], build["harness"]["sources"]["crates"])
 
     def test_a_harness_built_from_other_source_says_so_where_nrese_s_trees_are_the_same(self):
-        """P2 design check r3 F10 (orchestrator 17:39): two commits that differ only in the harness's
+        """Two commits that differ only in the harness's
         src give different harness sources and the same NRESE ones: a harness built at another commit
         with NRESE's five trees unchanged is never read as the same build."""
         self.checkout(self.root, "suite", harness="fn main() {}\n")
@@ -591,7 +591,7 @@ class Driver(unittest.TestCase):
         self.assertEqual(first["nrese"]["sources"], second["nrese"]["sources"])
 
     def test_a_checkout_that_moves_during_the_run_and_stays_moved_has_no_commit(self):
-        """P2 design r4 R1 (orchestrator 17:47): as a tier's receipts are written the checkout is read
+        """As a tier's receipts are written the checkout is read
         again; one on another commit than the run started from, or changed since a clean start, gives
         the receipt no commit but why, so it is never current. (A run whose results directory is in the
         checkout and not ignored starts dirty, as the manifest records it after making that directory:
@@ -624,11 +624,11 @@ class Driver(unittest.TestCase):
                                   commit["unknown"])
 
     def test_a_build_names_what_its_build_scripts_read_from_outside_git(self):
-        """P2 design check r4 A (orchestrator 17:56): crates/nrese-server/build.rs embeds every file of
+        """crates/nrese-server/build.rs embeds every file of
         the ignored apps/nrese-console/dist, so equal trees with other console bytes are another binary.
         build_inputs names them: "no files" when the directory is missing or empty (the same empty
-        table), else a digest of every file's path and bytes, which changes with them. P1e (orchestrator
-        18:34): a build compiles a clean export of its commit, which never holds the ignored bundle, so
+        table), else a digest of every file's path and bytes, which changes with them. P1e:
+        a build compiles a clean export of its commit, which never holds the ignored bundle, so
         whatever the checkout has, the build's record is "no files", the default build's."""
         self.checkout(self.root, "suite")
         dist = self.root / "apps" / "nrese-console" / "dist"
@@ -657,8 +657,8 @@ class Driver(unittest.TestCase):
         self.assertEqual(len({values["bundle a"], values["bundle b"], values["nested"], "no files"}), 4)
 
     def test_a_host_build_runs_cargo_in_the_controlled_environment_only(self):
-        """P2 design check r4 F15 (orchestrator 17:56; P2 second lead 18:00, an allowlist): cargo,
-        rustc and every build script see only the variables the build owner names, so encoded flags
+        """An allowlist: cargo,
+        rustc and every build script see only the variables it names, so encoded flags
         (the counting allocator), a profile override, cc's knobs or a compile-time revision string
         never change a binary whose record says default. What a build is told to use is kept; its
         target directory is its program's own."""
@@ -686,7 +686,7 @@ class Driver(unittest.TestCase):
         self.assertIs(build["nrese"]["controlled"], True)
 
     def test_a_build_compiles_a_clean_export_of_its_commit(self):
-        """P1e (orchestrator 18:34; P2 design check r5 F17): a build runs in a fresh export of its
+        """P1e: a build runs in a fresh export of its
         checkout's commit, never the worktree: a file git ignores (a legacy .cargo/config with
         opt-level 0, excluded through .git/info/exclude) or a tracked file changed since the commit
         isn't there; the export is outside the checkout and goes with the build."""
@@ -746,7 +746,7 @@ class Driver(unittest.TestCase):
         self.assertIn("disk full", said)
 
     def test_a_build_running_another_toolchain_than_declared_is_uncontrolled(self):
-        """P2 design check r5 F16: a saved rustup override for the build directory, or a PATH straight at
+        """A saved rustup override for the build directory, or a PATH straight at
         another toolchain's bin, selects another compiler. The build records what rustc and cargo
         report there (toolchain_here) and is controlled only when both are rust-toolchain.toml's
         channel. A PATH whose first rustc and cargo report 1.97.0: unknown, naming both."""
@@ -775,7 +775,7 @@ class Driver(unittest.TestCase):
         self.assertIn("no rustc", driver.toolchain_here(self.root, {"PATH": str(self.root / "nothing")})["unknown"])
 
     def test_cargo_config_outside_the_export_makes_a_build_uncontrolled(self):
-        """P2 design check r4 F15, r5 F18: cargo also reads .cargo/config(.toml) in every ancestor of the
+        """Cargo also reads .cargo/config(.toml) in every ancestor of the
         directory it builds in and in its Cargo home; a build where one is there is `controlled`
         unknown, naming it. A relative CARGO_HOME is the child's, resolved against the build's own
         directory, never this process's (the suite launched from elsewhere). Neither: controlled."""
@@ -832,7 +832,7 @@ class Driver(unittest.TestCase):
         refused a build whose target had room. The export goes beside the build's own checkout,
         wherever TEMP is, on the filesystem the guard always measured. Cargo reads a .cargo/config
         above it there too: a build with one beside its checkout says so, naming the file the test
-        wrote (the layout of a fleet Windows job's checkout, master 22:34)."""
+        wrote (the layout of a fleet Windows job's checkout)."""
         outer = self.clean_root()
         source = self.checkout(outer / "repo", "nrese")
         (outer / ".cargo").mkdir()
@@ -849,7 +849,7 @@ class Driver(unittest.TestCase):
         self.assertIn(str((outer / ".cargo" / "config.toml").resolve()), controlled["unknown"])
 
     def test_an_export_is_the_commit_s_tree_byte_for_byte_whatever_git_s_attributes_say(self):
-        """P1e review r1 F1 (master 23:12): git archive applies export-ignore and export-subst, from
+        """Git archive applies export-ignore and export-subst, from
         attributes outside the commit too (core.attributesFile, .git/info/attributes), and replace refs
         swap an object under its id: an export without .cargo/config.toml read as controlled. The
         export holds every file of the commit's tree with its committed bytes, nothing else; a build
@@ -923,10 +923,10 @@ class Driver(unittest.TestCase):
                         tree(nested))
 
     def test_an_export_refuses_every_name_its_filesystem_would_read_otherwise(self):
-        """P1e review r2 F1 (master 00:03): Windows reads names git keeps as plain characters: a
+        """Windows reads names git keeps as plain characters: a
         backslash as a directory, `..\\x` outside the export (surviving its removal), a colon as a
         drive or an alternate stream, a device name, a trailing dot or space dropped. An export accepts
-        only portable names (attack 19) and refuses the whole tree otherwise, before writing anything:
+        only portable names and refuses the whole tree otherwise, before writing anything:
         the export directory stays empty and nothing appears beside it, on every system."""
         self.checkout(self.root, "suite")
         bad = ["dir\\file", "..\\outside.txt", "normal:stream", "C:x", "CON", "con.txt", "nul/x", "Aux .txt",
@@ -949,7 +949,7 @@ class Driver(unittest.TestCase):
             self.assertEqual((Path(d) / "a" / "b c" / "d+e@f-g_h.txt").read_bytes(), b"ok")
 
     def test_an_export_refuses_what_isn_t_a_plain_file(self):
-        """P1e review r1 F1, attack 14: a symlink (or submodule) entry is refused, never followed nor
+        """A symlink (or submodule) entry is refused, never followed nor
         dropped: the build doesn't run."""
         self.checkout(self.root, "suite")
         target = subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--stdin"], input="Cargo.toml",
@@ -961,7 +961,7 @@ class Driver(unittest.TestCase):
         self.assertIn("link", str(refused.exception))
 
     def test_the_commit_exported_is_the_one_the_build_s_record_names(self):
-        """P1e review r1 F1: the export binds to the commit built_from recorded, never HEAD read again
+        """The export binds to the commit built_from recorded, never HEAD read again
         (a checkout that moves between the two would build another commit than its record names)."""
         self.checkout(self.root, "suite")
         recorded = self.git(self.root, "rev-parse", "HEAD")
@@ -975,7 +975,7 @@ class Driver(unittest.TestCase):
         self.assertEqual(exported.call_args.args[1], recorded)
 
     def test_a_build_that_raises_still_has_its_record_in_the_manifest(self):
-        """P1e review r1 F2: a builder that raises (an OSError at launch, a log it can't create, an
+        """A builder that raises (an OSError at launch, a log it can't create, an
         interrupt) still leaves its record in the run's manifest."""
         suite = self.suite(runs=1, skip_build=False)
 
@@ -995,14 +995,14 @@ class Driver(unittest.TestCase):
         self.assertEqual(entry.get("builds"), {"nrese": {"commit": "a" * 40, "controlled": True}})
 
     def test_an_export_past_its_deadline_stops_its_git_and_fails(self):
-        """P1e review r1 F4: one deadline for the whole export, its git children killed at it."""
+        """One deadline for the whole export, its git children killed at it."""
         self.checkout(self.root, "suite")
         with tempfile.TemporaryDirectory() as d, self.assertRaises(OSError) as late:
             driver.export_commit(self.root, self.git(self.root, "rev-parse", "HEAD"), Path(d), timeout=0)
         self.assertIn("deadline", str(late.exception))
 
     def test_an_export_refuses_two_directory_spellings_one_filesystem_merges(self):
-        """P1e sol-loop r3 S3: `Dir/a` and `dir/b` are two trees in git, one directory where case
+        """`Dir/a` and `dir/b` are two trees in git, one directory where case
         folds (Windows): the export refuses rather than merge them (case folding emulated here)."""
         self.checkout(self.root, "suite")
         blob = subprocess.run(["git", "-C", str(self.root), "hash-object", "-w", "--stdin"], input="x",
@@ -1016,7 +1016,7 @@ class Driver(unittest.TestCase):
         self.assertIn("same", str(refused.exception))
 
     def test_a_stalled_export_is_killed_at_its_deadline(self):
-        """P1e sol-loop r3 S4: a cat-file that never answers is killed at the export's deadline, and
+        """A cat-file that never answers is killed at the export's deadline, and
         the export fails saying so, well within it plus a margin."""
         self.checkout(self.root, "suite")
         real = subprocess.Popen
@@ -1038,10 +1038,10 @@ class Driver(unittest.TestCase):
         self.assertIsNotNone(started[0].poll())  # killed, not left running
 
     def test_every_compile_time_variable_our_sources_read_is_set_by_cargo_or_never_passed(self):
-        """P2 second lead 17:59 (rule: fix recurring mistakes mechanically): a variable our Rust sources
+        """P2: a variable our Rust sources
         read at compile time (env!, option_env!) or a build script reads (env::var) changes the binary;
         each is one cargo sets for the build, or controlled_environment doesn't pass it. A new one
-        fails here until the build owner decides."""
+        fails here until it is one of the two."""
         import re
         names = set()
         sources = [*ROOT.glob("crates/**/src/**/*.rs"), *ROOT.glob("benches/nrese-bench-harness/src/**/*.rs")]
@@ -1057,7 +1057,7 @@ class Driver(unittest.TestCase):
                     self.assertNotIn(name, driver.controlled_environment({name: "x"}))
 
     def test_a_run_s_manifest_holds_what_it_built_whether_or_not_a_cell_ran(self):
-        """Orchestrator 18:09 (P1e's Windows proof): the build records a cell's receipt copies are in
+        """P1e's Windows proof: the build records a cell's receipt copies are in
         its invocation's manifest entry too (`builds`), as the builds end: a run whose cells all skip
         (no data) still says what it built and how."""
         suite = self.suite(runs=1)
@@ -1076,7 +1076,7 @@ class Driver(unittest.TestCase):
         self.assertEqual(entry.get("cells", {}), {})  # its one cell skipped: no receipt
 
     def test_a_relative_target_directory_is_the_checkout_s_never_the_export_s(self):
-        """P1e sol-loop r1 S1: a build now runs in its export, which goes after the build; a relative
+        """A build now runs in its export, which goes after the build; a relative
         CARGO_TARGET_DIR ("target") resolved there would put the binary in the export, removed with it,
         while the run executes the checkout's, maybe stale. Both owners resolve it against the
         repository: the harness's build and the harness the run executes, and NRESE's target_dir (its
@@ -1094,7 +1094,7 @@ class Driver(unittest.TestCase):
                 self.assertEqual(nrese.target_dir(ctx), expected)
 
     def test_a_run_records_each_build_as_it_ends_a_failed_one_too(self):
-        """P1e sol-loop r1 S2: the manifest's `builds` is written after each build, so a run whose
+        """The manifest's `builds` is written after each build, so a run whose
         harness build fails after NRESE's succeeded still says what it built and how."""
         suite = self.suite(runs=1, skip_build=False)
         records = {program: {"commit": "a" * 40, "controlled": True} for program in ("nrese", "harness")}
@@ -1118,17 +1118,17 @@ class Driver(unittest.TestCase):
         self.assertEqual(entry.get("builds"), records)
 
     def test_build_settings_are_read_from_the_environment_given_only(self):
-        """P2 design check r3 F14 (orchestrator 17:39): the default build's settings come from the build
+        """The default build's settings come from the build
         owner with an empty environment, whatever this process's environment holds; a given one is read.
         (Its witness against an owner that takes `env` but reads os.environ is a mutation of that one
-        read, run in the proof: P1d review r1 F1.)"""
+        read, run in the proof)"""
         with patch.dict(driver.os.environ, {"NRESE_TARGET_CPU": "znver3", "RUSTFLAGS": "-C opt-level=2"}):
             self.assertEqual(driver.build_settings({}), {"target_cpu": "native", "rustflags_env": ""})
         self.assertEqual(driver.build_settings({"NRESE_TARGET_CPU": "portable", "RUSTFLAGS": "-g"}),
                          {"target_cpu": "portable", "rustflags_env": "-g"})
 
     def test_a_docker_build_runs_in_its_rust_image_s_pinned_id(self):
-        """Orchestrator, 8 Nov (P1d): the Rust image a Docker build compiles in is the run's pinned
+        """P1d (8 Nov): the Rust image a Docker build compiles in is the run's pinned
         one (ns.pinned, as every container's), by id, never its tag looked up again, and the receipt
         names that id; a build whose image isn't pinned doesn't start. P1e: the source it mounts is the
         export of its commit, never the worktree, and its toolchain is the image's, checked."""
@@ -1177,7 +1177,7 @@ class Driver(unittest.TestCase):
                 self.assertEqual(f"owlrs.built-from=benches/competitors/jena@{'t' * 40}" in build, labelled)
 
     def test_an_image_s_source_is_the_pinned_id_s_own(self):
-        """P1b review r1 F1: the source was read from the tag, the id from the pin map, and the two
+        """The source was read from the tag, the id from the pin map, and the two
         could be different images: (a) an earlier preparation in the job pinned the tag to A (old,
         unlabelled), and the tag now names B, labelled from the current tree; the containers run A;
         (b) the tag was replaced between its preparation (a build, labelled) and its first pin. The
@@ -1217,7 +1217,7 @@ class Driver(unittest.TestCase):
         (self.root / "benches/suite/images.toml").write_text(text, encoding="utf-8")
 
     def test_a_pinned_image_is_pulled_by_its_digest(self):
-        """P1c (orchestrator, 8 Nov 11:22): a tag names no content, its digest does; a pulled image
+        """P1c (8 Nov): a tag names no content, its digest does; a pulled image
         with a pin is pulled by that digest and tagged, so the run runs the pinned content (one that
         is present but isn't the pin is pulled again by it); one without a pin is pulled by its tag."""
         self.pins(f'[pins]\n"qlever/qlever:latest" = "{self.PIN}"\n')
@@ -1238,7 +1238,7 @@ class Driver(unittest.TestCase):
                     self.assertIn(["docker", "pull", "-q", "other/thing:1"], calls)
 
     def test_a_pinned_image_runs_its_pin_or_the_run_stops_before_pinning(self):
-        """P1c review r1 F1, F2: the digest pull's and the retag's exit codes were ignored, so with a
+        """The digest pull's and the retag's exit codes were ignored, so with a
         mismatching image already holding the tag a failed pull went on, and the run timed the old
         content. Modelled on a local docker's state (tags, ids, digests): the tag ends on the pinned
         content, or the run stops (non-zero) before any image is pinned or timed."""
@@ -1317,7 +1317,7 @@ class Driver(unittest.TestCase):
                     driver.image_pins(self.root)
 
     def test_what_a_cell_can_t_evidence_is_unknown_never_empty(self):
-        """R6: a driver plan's inputs, images, build and settings are its child's; an input outside
+        """A driver plan's inputs, images, build and settings are its child's; an input outside
         the datasets and an external driver aren't hashed; a binary not built here is unknown."""
         suite = self.suite(runs=1)
         suite.receipts(Plan("w", "1", kind="driver"), [("x", None)],
@@ -1347,7 +1347,7 @@ class Driver(unittest.TestCase):
 
 
     def test_a_newer_attempt_outlives_a_crash_and_one_not_flushed_starts_no_work(self):
-        """R2 (reviews cell-receipts r2, r3): I1 completed A (tier 1) and B (tier 2), long on disk; I2
+        """I1 completed A (tier 1) and B (tier 2), long on disk; I2
         attempts A again. Its attempt's flush fails: no work of A starts, the rows stay, A is
         incomplete. Or it is flushed, A's work starts and the host dies: reopened with only what was
         on disk, A is I2's incomplete attempt, never I1's receipt, and B keeps I1's. Or the attempts'
@@ -1387,7 +1387,7 @@ class Driver(unittest.TestCase):
                          None if case == "journal lost" and no_dirsync else i1["w/2/x"]["attempt"])
 
     def test_one_run_at_a_time_owns_a_results_directory(self):
-        """R2a (review cell-receipts r4): two runs appending to one directory's journal can overwrite
+        """Two runs appending to one directory's journal can overwrite
         each other's attempts (Windows' append is a seek, then a write). While a run holds the
         directory, a second is refused with its remedy before anything runs, and the directory stays
         as it was; once the first ends, or fails, the next one runs."""
@@ -1405,7 +1405,7 @@ class Driver(unittest.TestCase):
         self.assertEqual(self.main(results)[0], 0)
 
     def test_a_batch_directory_whose_journal_lost_records_lets_no_older_receipt_stand(self):
-        """R2b (review cell-receipts r4): a batch of D1 and D2. D1's I1 completed A (tier 1) and B
+        """A batch of D1 and D2. D1's I1 completed A (tier 1) and B
         (tier 2); D2's I2 attempted A later and was interrupted. Then D2's journal is missing, or
         recreated with only a B attempt: what it lost is unknowable, so A is never I1's completed
         receipt. With D2's journal intact, A is I2's incomplete attempt. D2 itself can't vanish: its
@@ -1438,7 +1438,7 @@ class Driver(unittest.TestCase):
         self.assertIn(self.root / "batch", synced)
 
     def test_two_starters_at_once_never_truncate_the_winner_s_rows(self):
-        """Review cell-receipts r5 F1, results-lock r1 R1: two runs started at once into one
+        """Two runs started at once into one
         directory. The loser is paused after deciding its results.csv is missing and before
         Writer's open "w" (the order before the fix), or, with the fix, before it reaches the
         directory's lock; the winner takes the directory and writes its header and a known row;
@@ -1483,10 +1483,10 @@ class Driver(unittest.TestCase):
         self.assertIn("another run is writing into it", err)
 
     def test_a_second_starter_never_opens_the_results_another_run_owns(self):
-        """Guard of the order (review cell-receipts r5 F1): while one run owns the directory, a
+        """Guard of the order: while one run owns the directory, a
         second is refused without opening its results.csv at all, and the first's rows stay as
         they were. Its red before the fix is the constructor called, not a lost row: the first
-        run's header was already there, so that Writer truncated nothing (results-lock r1 R1)."""
+        run's header was already there, so that Writer truncated nothing."""
         first = self.suite(runs=1)
         first.emit(dict(date=first.date, host="h", runtime="process", system="x", version="-", publish="free",
                         workload="w", tier="1", regime="none", run=1), task="load", ms=5)
@@ -1506,7 +1506,7 @@ class Driver(unittest.TestCase):
         self.assertEqual((first.results / "results.csv").read_bytes(), rows)
 
     def test_a_run_into_a_directory_whose_manifest_can_t_be_read_is_refused_and_leaves_it(self):
-        """Review cell-receipts r2 (orchestrator, 8 Nov 05:38): a manifest that couldn't be parsed was
+        """A manifest that couldn't be parsed was
         read as empty, and the next write dropped every earlier invocation's evidence. The run is
         refused with its reason, before anything runs, and the file stays byte for byte."""
         results = self.root / "results"
@@ -1539,7 +1539,7 @@ class Driver(unittest.TestCase):
 
 
     def test_a_receipt_s_code_is_unchanged_by_what_measuring_writes_into_the_repository(self):
-        """P2 design review F1 (orchestrator, 8 Nov 10:50): the code identity was the tree of all of
+        """P2 design review F1 (8 Nov): the code identity was the tree of all of
         benches/, which holds the run records (benches/runs) and the views made from them, so committing
         a run's own record changed the identity its receipt is held to: stale as it landed. It is
         what a cell can execute: those left out, rust-toolchain.toml and .cargo/ in."""
@@ -1575,7 +1575,7 @@ class Driver(unittest.TestCase):
 
 class Code(unittest.TestCase):
     def test_a_cell_s_code_changes_with_anything_the_repository_holds_for_it(self):
-        """R5: commit-latency's driver reads queries, the harness and GraphDB's configuration outside
+        """Commit-latency's driver reads queries, the harness and GraphDB's configuration outside
         its kit's directory, LUBM's preparation sources scripts/lib: a change to any of them changes
         the code of every cell (coarse and exact); without a commit to read, it is unknown. Since F1 of
         the P2 design review benches/ counts entry by entry (its records and views left out), so the

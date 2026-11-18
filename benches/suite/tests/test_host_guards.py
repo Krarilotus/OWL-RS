@@ -51,7 +51,7 @@ def api(session=1, state=guard.ACTIVE, user="owner", fails=None, own=None):
 AT_CONSOLE = {"state": guard.ACTIVE, "user": "owner"}
 NOBODY = {"session": guard.NO_CONSOLE}
 UNKNOWN = ({"fails": "id"}, {"fails": "state"}, {"fails": "user"}, {"fails": "windows"}, {"fails": "own"},
-           {"session": 2, "own": 1},  # sol-loop r1 S1: fast user switching, the guard's last input isn't the console's
+           {"session": 2, "own": 1},  # Fast user switching, the guard's last input isn't the console's
            {"state": guard.ACTIVE, "user": ""}, {"state": guard.DISCONNECTED, "user": "owner"},
            *({"state": s, "user": u} for s in OTHER_STATES for u in ("owner", "")))
 
@@ -121,7 +121,7 @@ class Main(unittest.TestCase):
             self.assertEqual(list(self.retreat.parent.glob("RETREAT.*")), [], "written beside it, then renamed")
 
     def test_an_unknown_reading_keeps_and_refreshes_retreat_through_a_release(self):
-        # PR #52 review F1 and F2 (and fix checks 1-2's F4, F5): no reading the API can't vouch for is nobody, and
+        # PR #52: no reading the API can't vouch for is nobody, and
         # the owner's release lifts a known reading only.
         for reading in UNKNOWN:
             for free in (None, "", "2999-01-01T00:00:00"):
@@ -134,7 +134,7 @@ class Main(unittest.TestCase):
             self.assertFalse(self.retreat.exists(), reading)
 
     def test_a_retreat_that_cant_be_replaced_is_written_in_place_and_timed_jobs_still_stop(self):
-        # sol-loop r4 S1: on Windows a reader holding RETREAT open denies os.replace (WinError 5) but not a write in
+        # On Windows a reader holding RETREAT open denies os.replace (WinError 5) but not a write in
         # place; the denial crashed main() before stop_timed and left RETREAT.new behind.
         for reading, first in ((AT_CONSOLE, "present"), ({"fails": "id"}, "unknown: the console session can't be read (denied)")):
             with mock.patch.object(guard.os, "replace", side_effect=PermissionError(13, "denied")):
@@ -151,12 +151,12 @@ class Main(unittest.TestCase):
         self.assertFalse(self.retreat.exists())
 
     def test_a_release_time_with_an_offset_is_no_release_and_never_a_crash(self):
-        # PR #52 review F3: an ISO time with an offset raised TypeError before RETREAT was written.
+        # PR #52: an ISO time with an offset raised TypeError before RETREAT was written.
         for until in ("2999-01-01T00:00:00+01:00", "2999-01-01T00:00:00Z"):
             self.assertEqual(self.run_main(AT_CONSOLE, free=until, input_idle=0.5), (True, True))
 
     def test_a_release_file_that_cant_be_read_or_removed_is_no_release(self):
-        # PR #52 review F3: a failed read or a failed removal of a passed release must not stop the protection.
+        # PR #52: a failed read or a failed removal of a passed release must not stop the protection.
         with mock.patch.object(guard.Path, "read_text", side_effect=PermissionError("denied")):
             self.assertIsNone(guard.free_until({"free": __file__}))
         root = Path(tempfile.mkdtemp())
@@ -166,7 +166,7 @@ class Main(unittest.TestCase):
             self.assertIsNone(guard.free_until({"free": str(root / "FREE-UNTIL")}))
 
     def test_a_release_file_whose_existence_cant_be_checked_still_lets_retreat_be_written(self):
-        # sol-loop r2 S2: Path.exists() raised PermissionError past the boundary and main() wrote no RETREAT. A file
+        # Path.exists() raised PermissionError past the boundary and main() wrote no RETREAT. A file
         # whose stat is denied can't be read either.
         def denied(real):
             def call(path, *args, **kwargs):

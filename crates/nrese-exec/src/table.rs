@@ -597,8 +597,8 @@ mod tests {
         }
     }
 
-    /// Spec (SW1, `notes/2026-11-01-late-budget-r2.md`; first row, PR #84's timing,
-    /// notes/2026-11-02-zero-width-budget.md ZW-10): rows without columns count against the
+    /// Spec (first row, PR #84's timing):
+    /// rows without columns count against the
     /// budget where they are made, one id each after the first (the column an operator after
     /// them may make: an unbound variable's UNDEF), so `memory_bytes` reports
     /// `(rows - 1) * 8` for a table with no columns; one solution without bindings counts

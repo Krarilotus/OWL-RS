@@ -2,8 +2,8 @@
 
 Spec: fleet Spec 9 (fleet-scheduler docs/spec.md; declared.py check(), from fb46ffb): a container made during a
 declared job's step without the exact `fleet.job=<id>` label is unknown and stops the step; one with it needs a
-declared container of its own, matched by its memory (within two pages). The master, 8 Nov 2026 (#132 r4 B1;
-notes/2026-11-08-suite-fleet-launch-owner.md): every container the suite starts goes through one owner that gives it
+declared container of its own, matched by its memory (within two pages). #132, 8 Nov 2026:
+every container the suite starts goes through one owner that gives it
 both, and nothing else builds a `docker run`. Docker never runs here: every command is recorded, none executed."""
 from __future__ import annotations
 
@@ -144,7 +144,7 @@ class LaunchOwner(unittest.TestCase):
 
     @unittest.skipUnless(BASH, "needs bash")
     def test_a_makers_container_carries_the_jobs_label_once(self):
-        # ns_labels gives the label (#132 r3); ns_maker_args added its own beside it: one owner of it.
+        # ns_labels gives the label (#132); ns_maker_args added its own beside it: one owner of it.
         done = subprocess.run([BASH, "-c", f'. "{(ROOT / "scripts/lib/ns.sh").as_posix()}"; '
                                'ns_maker_args - "$1" sparql; printf "%s\\n" "${NS_ARGS[@]}"', "-", ROOT.as_posix()],
                               env={**os.environ, **DECLARED, "NRESE_MAKER_MEMORY_GB": "8", "NRESE_MAKER_CPUS": "8"},

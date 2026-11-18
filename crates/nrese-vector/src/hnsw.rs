@@ -604,8 +604,8 @@ mod tests {
     }
 
     /// Under every budget from none to what it held at its peak, a graph search either
-    /// answers as unlimited or is refused, and holds nothing afterwards either way (review
-    /// fix check, S2).
+    /// answers as unlimited or is refused, and holds nothing afterwards either
+    /// way.
     #[test]
     fn graph_searches_refused_partway_release_everything() {
         let vectors = random_vectors(2_000, 8, 5);

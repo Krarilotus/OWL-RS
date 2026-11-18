@@ -242,8 +242,8 @@ fn inferred_views_are_charged_for_all_they_hold() {
 /// A view or mask refused anywhere in its making holds nothing past its charge, and nothing
 /// once refused: every budget from none to what it needs, for a view of kept statements, a
 /// mask stacked on an earlier one, and the view of such a mask. Its charge is taken before
-/// anything it covers is made, so no refusal releases it while the caller still owns a run
-/// (review r1 of item 18 part 1, F5). What the earlier masks hold is charged elsewhere and
+/// anything it covers is made, so no refusal releases it while the caller still owns a run.
+/// What the earlier masks hold is charged elsewhere and
 /// made before the measurement.
 #[test]
 fn inferred_views_refused_anywhere_free_before_they_release() {

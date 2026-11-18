@@ -41,8 +41,8 @@ HIDDEN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 HOSTS = Path(__file__).resolve().parents[2] / "benches" / "hosts.toml"
 
 
-# Windows' session API (WtsApi32): the console session's state and user, as data (the orchestrator, 28 Oct 2026,
-# PR #52's outer view: three rounds of `query user` text parsing each certified "nobody" wrongly, F1, F4, F5).
+# Windows' session API (WtsApi32): the console session's state and user, as data (28 Oct 2026,
+# PR #52: three tries at parsing `query user` text each certified "nobody" wrongly).
 CONNECT_STATE, USER_NAME = 8, 5  # WTS_INFO_CLASS
 ACTIVE, CONNECTED, DISCONNECTED, IDLE = 0, 1, 4, 5  # WTS_CONNECTSTATE_CLASS
 NO_CONSOLE = 0xFFFFFFFF  # WTSGetActiveConsoleSessionId: no session attached to the console
@@ -96,8 +96,8 @@ def console() -> tuple[bool | None, str | None]:
     """Whether a user is at the console (True), nobody is (False), or None and why it can't say. Nobody: no
     session at the console, or one without a user that is connected (the logon screen, as `query user` said:
     no console row), disconnected or idle. Any failed call or other state is unknown, and so is a user at the
-    console in another session than the guard's, whose last input it can't read (fast user switching; sol-loop
-    r1 S1). A remote (RDP) session is never the console's."""
+    console in another session than the guard's, whose last input it can't read (fast user switching).
+    A remote (RDP) session is never the console's."""
     try:
         session = console_session_id()
         if session == NO_CONSOLE:
@@ -145,7 +145,7 @@ def present(someone: bool | None, input_idle: float | None) -> bool:
 
 def free_until(settings: dict) -> str | None:
     """The time the owner freed the machine until, while it hasn't passed (the free file). A file that
-    can't be read, or a time it can't compare (one with an offset), is no release (PR #52 review F3)."""
+    can't be read, or a time it can't compare (one with an offset), is no release (PR #52)."""
     import datetime
     path = Path(settings.get("free", "")) if settings.get("free") else None
     if path is None:
@@ -196,7 +196,7 @@ def stop_timed(directory: Path, say) -> None:
 def publish(retreat: Path, text: str, say) -> None:
     """RETREAT's new text: written beside it and renamed, so no reader sees half of it. Where the rename is
     denied (Windows: a reader holds RETREAT open), written in place; a reader then sees at worst a partial first
-    line, which the fleet takes as unknown. Never raises: timed jobs are stopped either way (sol-loop r4 S1)."""
+    line, which the fleet takes as unknown. Never raises: timed jobs are stopped either way."""
     written = retreat.with_name(retreat.name + ".new")
     try:
         written.write_text(text, encoding="utf-8")
@@ -225,7 +225,7 @@ def main() -> int:
 
     someone, why = console()
     now = int(time.time())
-    # The owner's release lifts a known reading only: an unknown one keeps RETREAT (PR #52 review F2).
+    # The owner's release lifts a known reading only: an unknown one keeps RETREAT (PR #52).
     freed = None if why else free_until(settings)
     if freed:
         if retreat.exists():

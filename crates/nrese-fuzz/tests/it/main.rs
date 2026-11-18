@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 
 use nrese_fuzz::Target;
 
-/// The corpus's admission, shared with the comparators (Sol, PR #61 F2: a second one here
+/// The corpus's admission, shared with the comparators (PR #61: a second one here
 /// counted any file under `.cache` as the W3C data).
 #[allow(dead_code)]
 #[path = "../../../../benches/oxigraph-comparison/src/w3c.rs"]
@@ -91,7 +91,7 @@ fn root() -> PathBuf {
 
 /// The corpora the campaign draws on, as the fetch script names its pins, each with what it
 /// brings. Every pin is declared here and every one declared is pinned: no corpus joins or
-/// leaves the campaign unseen (PR #61 fix check 1: a filter by repository had dropped the
+/// leaves the campaign unseen (PR #61: a filter by repository had dropped the
 /// GeoSPARQL benchmark and the OWL 2 test cases).
 const CORPORA: [(&str, &str); 7] = [
     (

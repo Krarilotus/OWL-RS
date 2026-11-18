@@ -76,7 +76,7 @@ class Abba(unittest.TestCase):
 
     def setUp(self):
         # A family lives in the checkout it names its sides in: the tests' own, with its rounds'
-        # results beside it (PR #57 r1 R2: in ROOT/tmp, a read-only checkout failed every test).
+        # results beside it (PR #57: in ROOT/tmp, a read-only checkout failed every test).
         self.tmp = tempfile.TemporaryDirectory(dir=self.repo)
         self.addCleanup(self.tmp.cleanup)
         self.path = Path(self.tmp.name) / "t.toml"
@@ -110,7 +110,7 @@ class Abba(unittest.TestCase):
         return code, text
 
     def test_baseline_routes_keep_answers_and_the_aa_control(self):
-        """Master 9 Nov21:38: a baseline may use its own optimizer, with checked answers;
+        """A baseline may use its own optimizer, with checked answers;
         B's route and the interleaved A-A' control remain required (PROTOCOL section5)."""
         for name, side, scale, wrong, expected in (
             ("baseline", "a", 1.0, False, abba.NO_LOSS),
@@ -168,7 +168,7 @@ class Abba(unittest.TestCase):
                     self.assertNotIn("| - | - |", row)
 
     def test_a_fourth_round_that_compared_nothing_is_never_read_as_no_loss(self):
-        """Review release-not-compared r1 W1: four rounds in order, the first three comparable, the
+        """Four rounds in order, the first three comparable, the
         fourth's A answering what the pinned rows don't (B's match), so it compared nothing; the
         decision took reasons from three slots only and the report said no loss."""
         pinned = {"q01-point-lookup": 5, "q06-text-filter": 1033}
@@ -222,7 +222,7 @@ class Abba(unittest.TestCase):
         self.assertEqual([s for s, _ in fixture.fast.palindrome(list(abba.SIDES), 1)], ["a", "a2", "b", "b", "a2", "a"])
 
     def test_passes_from_another_fleet_host_than_the_manifest_s_have_no_verdict(self):
-        """Review r1 R1-F1 (HOST_IDENTITY): passes all timed on the timed host, a manifest naming
+        """Host identity: passes all timed on the timed host, a manifest naming
         the shared host, got "no loss shown" against the shared host's floor. The fleet may move a timed job
         between steps when a host's window closes; such a round has no verdict, and so has one whose
         passes don't say which fleet host ran them."""
@@ -245,11 +245,11 @@ class Abba(unittest.TestCase):
         code, text = self.verdict(self.round_(records(broken=lambda side, n: side == "a2" and n == 2)))
         self.assertEqual(code, abba.NO_VERDICT, text)
         self.assertIn("lab-olympics on a2", text)
-        # Sol r1: a run with no check results counted as checked (exit 0).
+        # A run with no check results counted as checked (exit 0).
         code, text = self.verdict(self.round_(records(checked=False), name="no-results"))
         self.assertEqual(code, abba.NO_VERDICT, text)
         self.assertIn("no passing result for its content checks q.q01-point-lookup.rows", text)
-        # Sol r2: a perf_lab invocation with no check results borrowed its sibling's (exit 0).
+        # A perf_lab invocation with no check results borrowed its sibling's (exit 0).
         def two_invocations(side, n):
             out = records()(side, n)
             for rec in out:
@@ -301,7 +301,7 @@ systems = []
         self.assertEqual(self.verdict(one)[0], abba.LOSS_SHOWN)
         two = self.round_(records(b=1.08), name="loss2", k=2)
         self.assertEqual(self.verdict(one, two)[0], abba.CONFIRMED)
-        # Sol r1: the same round given twice confirmed its loss. Neither it, nor a copy of it
+        # The same round given twice confirmed its loss. Neither it, nor a copy of it
         # renamed round 2, nor the rounds out of order is a confirmation.
         copy = Path(self.tmp.name) / "copy"
         shutil.copytree(one, copy)
@@ -319,7 +319,7 @@ systems = []
     def test_a_cost_appearing_from_below_the_counter_s_step_is_a_confirmed_loss(self):
         """The gate's `emerged` (below-resolution design, 14 Nov 2026): A and A' read q06 0.0 in
         every block, B 4.8: a cost decided by the readings, no round to wait for, and A-B-B-A has
-        no owner's entry to accept it (Sol, below-resolution r1: it exited 0, "no loss shown").
+        no owner's entry to accept it (it exited 0, "no loss shown").
         Between A and its copy the same appearance voids the round, as any A-A' difference does."""
         code, text = self.verdict(self.round_(records(zero=("a", "a2")), name="emerged"))
         self.assertEqual(code, abba.CONFIRMED, text)
@@ -330,7 +330,7 @@ systems = []
 
     def test_the_jobs_time_every_block_on_one_host_with_the_a_a_arm(self):
         self.path.write_text(FAMILY.replace("blocks = 6", "blocks = 8"), encoding="utf-8")
-        eight = self.load()  # Sol r1: whole squares of A, A' and B
+        eight = self.load()  # Whole squares of A, A' and B
         self.assertEqual(sum("block" in s for s in abba.jobs(eight, B, self.repo.as_posix(), "shared-a")["abba-t-bbbbbbbb"]["steps"]), 9)
         # One whole square is the least a family may ask (a long, flat case needs no more), fewer
         # is refused: N11 found 6 hard-coded.
@@ -366,7 +366,7 @@ systems = []
         self.assertGreaterEqual(job["requires"].get("disk_gb", 0), 1)
 
     def test_a_job_making_its_data_in_containers_declares_them(self):
-        """The master, 8 Nov 2026 (#129's regression): `abba.py --plan` of shacl-lubm on engine-v2 was
+        """On 8 Nov 2026 (#129's regression), `abba.py --plan` of shacl-lubm on engine-v2 was
         refused by the fleet ("a Docker job a shared host could take: its steps start no container the
         fleet can see"). The job declares its maker's container (F61, spec 9) from the one data ask
         (release_gate.data_job()), asks that memory on top of what its blocks ask, and tells its
@@ -391,11 +391,11 @@ systems = []
         self.assertEqual((read["spec"], read["containers"]), (9, [maker]))
 
     def test_a_harness_that_can_t_make_its_family_s_data_is_refused_before_planning(self):
-        """Orchestrator, 8 Nov 2026: REAS's and C5's sets (abba-run-055fe886-f3da61f9) were planned by a
+        """8 Nov 2026: REAS's and C5's sets (abba-run-055fe886-f3da61f9) were planned by a
         submitter that makes support-stress data, so asked for no assets, but prepared by a harness
         from before the dataset makers (838cd7eb, PR #129), which didn't make them: "7 not as pinned"
-        on a host without them, after the builds. Refused at the plan, saying why. Fix check r3 R3-W1
-        of pkg/maker-containers (the master, 8 Nov 2026): a harness's makers are its catalogue's
+        on a host without them, after the builds. Refused at the plan, saying why.
+        A harness's makers are its catalogue's
         [makers], so one without them is refused as such, whichever of the cases' files it would make."""
         old = self.commits[-1]  # a real harness commit whose tree has no dataset makers
         sides = {"a": self.commits[0], "b": old}
@@ -413,7 +413,7 @@ systems = []
     def test_whether_a_harness_makes_data_is_read_from_its_own_catalogue(self):
         """The harness's own catalogue, at that commit, names its dataset makers ([makers]) or doesn't
         (harness_tables(): PR #139's makers_at(), unified into the one reader of a harness's metadata).
-        Fix check r3 R3-W1 (the master, 8 Nov 2026): one without [makers] is refused, whatever its
+        One without [makers] is refused, whatever its
         release_gate.py says, as is a commit the checkout doesn't have."""
         with tempfile.TemporaryDirectory() as d:
             git = lambda *a: abba.subprocess.run(["git", "-C", d, *a], capture_output=True, text=True,  # noqa: E731
@@ -437,7 +437,7 @@ systems = []
             self.assertEqual(HARNESS_TABLES(d, after).makers, {})
 
     def test_a_job_asks_what_its_harness_makes_and_how(self):
-        """Review r1 R1 of pkg/maker-containers (8 Nov 2026): a job's data is made by its harness's own
+        """A job's data is made by its harness's own
         prepare, from that harness's catalogue and makers (release-gate.sh:356, 401-406), so its
         declaration, its makers' env and its memory are the harness's, not the planning tree's: a
         harness whose LUBM maker takes 6 GB and 4 CPUs is declared so; one whose catalogue has LUBM from
@@ -469,7 +469,7 @@ systems = []
                         self.assertIn("owlrs-bench-assets", job["requires"]["has"])
 
     def test_one_job_asks_by_capability_and_builds_where_it_times(self):
-        """The brief of 2 Nov 2026: no host names. A build job and a timed job pinned to one host
+        """A job names no host. A build job and a timed job pinned to one host
         were the only way to time where the binaries were built; one job does both, its host held
         alone from its first step to its last."""
         found = abba.jobs(self.family, B, self.repo.as_posix())
@@ -480,7 +480,7 @@ systems = []
         self.assertEqual((job["kind"], job["requires"]["roles"], job["requires"]["os"]),
                          ("owlrs.timed", ["measure", "build"], "linux"))
         # The fleet keeps an exclusive job's host only before an exclusive step (planner
-        # held_between_steps; Sol r1 S1) and while the host takes exclusive work: every step is
+        # held_between_steps) and while the host takes exclusive work: every step is
         # exclusive, none untimed, so the job starts only where it can time (2 Nov 2026: an untimed
         # first step built on the shared host outside its timing window, and the blocks were offered
         # another host). The check, every build and the preparation are its first step.
@@ -491,16 +491,16 @@ systems = []
             self.assertIn(word, first[2])
         self.assertEqual(first[4:], [abba.ENV_FAMILY, A, B])  # the family, then every revision built
         self.assertEqual([s[2] for s in job["steps"][1:7]], ["block"] * 6)
-        # Its gate state is its family's own: another A at the same B and name is another directory
-        # (review r1 R1-F3); a family's rounds share it.
+        # Its gate state is its family's own: another A at the same B and name is another directory;
+        # a family's rounds share it.
         self.path.write_text(FAMILY.replace(A, "c" * 40), encoding="utf-8")
         other = next(iter(abba.jobs(self.load(), B, self.repo.as_posix()).values()))
         self.assertNotEqual(other["env"]["GATE_NAME"], job["env"]["GATE_NAME"])
         self.path.write_text(FAMILY, encoding="utf-8")
         round2 = next(iter(abba.jobs(self.load(), B, self.repo.as_posix(), round_=2).values()))
         self.assertEqual(round2["env"]["GATE_NAME"], job["env"]["GATE_NAME"])
-        # The first step asks no less memory than the blocks (Sol r2 S1): a case past 12 GB, the
-        # builds' own figure before, so that a lower first-step ask would show (Sol r3 U1).
+        # The first step asks no less memory than the blocks: a case past 12 GB, the
+        # builds' own figure before, so that a lower first-step ask would show.
         big = dict(self.family, cases=[{**self.family["cases"][0], "cap_gb": 24}])
         heavy = next(iter(abba.jobs(big, B, self.repo.as_posix()).values()))
         self.assertEqual(heavy["requires"]["ram_gb"], 24)
@@ -542,7 +542,7 @@ systems = []
         self.assertIn("lives in the repository", "\n".join(refused.exception.args[0]))
 
     def test_a_job_resolves_its_family_at_the_declared_harness(self):
-        """Review r1 R1-F4: a job's check, run in B's checkout, took a case from B's registry that
+        """A job's check, run in B's checkout, took a case from B's registry that
         the declared harness doesn't have (dl-number-fragment, absent at 313e5a64), and wrote a
         manifest claiming that harness. Check, jobs and report resolve the family's cases at the
         declared harness; a case absent there is refused before anything is timed."""
@@ -585,7 +585,7 @@ systems = []
                              ["dl-number-fragment"])
 
     def test_a_family_s_own_cases_are_the_declared_harness_s(self):
-        """Sol-loop of review r1's fix (S1): a family's own cases were read from the launching
+        """A family's own cases were read from the launching
         checkout while the harness's fast suite times them from its own copy of the family file
         (NRESE_FAMILY in the harness's tree). With a declared harness, the family file must be at it
         byte for byte, line endings aside; a file absent there, or changed since, is refused before anything runs."""
@@ -615,7 +615,7 @@ systems = []
                         abba.load_family(path, repo, catalog, harness=at)
                     self.assertIn(why, "\n".join(refused.exception.args[0]))
             self.assertEqual(len(abba.load_family(path, repo, catalog, harness=changed)["cases"]), 2)
-            # Line endings aren't a change (sol-loop r2, T1): a file stored with CRLF, read in a
+            # Line endings aren't a change: a file stored with CRLF, read in a
             # checkout that normalises line endings, is the harness's file as it is.
             path.write_bytes((FAMILY + own_case.format(n=2000)).replace("\n", "\r\n").encode("utf-8"))
             git("-c", "core.autocrlf=false", "add", "-A")
@@ -623,7 +623,7 @@ systems = []
             git("config", "core.autocrlf", "true")
             self.assertEqual(len(abba.load_family(path, repo, catalog, harness=git("rev-parse", "HEAD"))["cases"]), 2)
             git("config", "core.autocrlf", "false")
-            # A value equal in Python but not as the suite passes it on (sol-loop r3, U1): the fast
+            # A value equal in Python but not as the suite passes it on: the fast
             # suite stringifies env values ("268435456.0" vs "268435456"), and perf_lab reads the
             # former as no limit. A family that differs so is refused.
             typed = FAMILY + own_case.format(n=2000) + "env = { NRESE_BULK_LOAD_MEMORY = VALUE }\n"
@@ -633,7 +633,7 @@ systems = []
             with self.assertRaises(abba.Invalid) as refused:
                 abba.load_family(path, repo, catalog, harness=as_float)
             self.assertIn("differs", "\n".join(refused.exception.args[0]))
-            # Line endings alone, both committed, no conversion (fix check r1, V1): the harness's
+            # Line endings alone, both committed, no conversion: the harness's
             # suite times the same cases, so the family is valid, in either direction.
             lf = (FAMILY + own_case.format(n=3000)).encode("utf-8")
             crlf = lf.replace(b"\n", b"\r\n")
@@ -671,7 +671,7 @@ systems = []
         self.path.write_text(FAMILY.replace('dimensions = ["time/q01-point-lookup", "time/q06-text-filter"]\n'
                                             "min_samples = 3\n", ""), encoding="utf-8")
         self.assertEqual(built["hypotheses"], self.load()["hypotheses"])
-        # The run's id is its request's: the same request is the same set, another one another (Sol r1 S2).
+        # The run's id is its request's: the same request is the same set, another one another.
         same = abba.run_name(None, {"a": A, "b": B}, B, ["lab-olympics"], 3, 1)
         self.assertEqual(same, abba.run_name(None, {"a": A, "b": B}, B, ["lab-olympics"], 3, 1))
         for other in (abba.run_name(None, {"a": B, "b": B}, B, ["lab-olympics"], 3, 1),
@@ -687,7 +687,7 @@ systems = []
         """Placed by capability, the round's host is known only where it runs: the check writes
         FLEET_HOST into the manifest (GATE_HOST, a pin, wins), and the report reads that host's floor."""
         with tempfile.TemporaryDirectory() as out:
-            # The harness is a commit of this checkout: the job's check reads its registry (R1-F4).
+            # The harness is a commit of this checkout: the job's check reads its registry.
             env = {"FLEET_OUT": out, "FLEET_HOST": "shared-a", "ABBA_HARNESS": abba.git(ROOT, "rev-parse", "HEAD"),
                    "ABBA_FAMILY": FAMILY}
             inherited = {k: v for k, v in abba.os.environ.items() if k not in ("GATE_HOST", "NRESE_FAMILY")}

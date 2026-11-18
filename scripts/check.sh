@@ -277,7 +277,7 @@ harness() {
 }
 # The console's typecheck and tests, wherever the tier runs. The dependencies come from the
 # console's lockfile first, every time (`npm ci` replaces node_modules: the Linux gate's worktree
-# keeps an earlier tree's, sol-loop r1 S1), and a host that can't install them fails that step by
+# keeps an earlier tree's), and a host that can't install them fails that step by
 # name; the console is never passed unchecked (benches/suite/tests/test_console_step.py).
 console() {
   step "console dependencies" npm --prefix apps/nrese-console ci --no-audit --no-fund
@@ -503,7 +503,7 @@ case "$mode" in
     w3c_data
     step build "$guarded" build --locked --workspace --all-targets
     # Lints of the code only Windows compiles (cfg(windows)), which no Linux tier sees: the push
-    # tier lints the changed crates on Linux alone (PR #68's review, R68-F2).
+    # tier lints the changed crates on Linux alone (PR #68).
     step clippy "$guarded" clippy --locked --workspace --all-targets
     step test run_tests "${everything[@]}"
     step "doc tests" "$guarded" test --locked --workspace --doc --no-fail-fast

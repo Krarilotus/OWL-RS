@@ -19,8 +19,8 @@ use super::ir::Triple;
 
 /// What an explanation's reads count on: nothing stops one, it runs to its end (bounded by
 /// its budget), as the program's enumerations it reads do ([`GroundProgram::unpolled`]).
-/// A read on [`to_its_end`]'s poller, which never stops: its answer (fix check r1 triage,
-/// NEVER rows).
+/// A read on [`to_its_end`]'s poller, which never stops:
+/// its answer.
 fn known<T>(read: Result<T, Stopped>) -> T {
     read.expect("an explanation reads to its end")
 }

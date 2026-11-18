@@ -135,7 +135,7 @@ pub struct Engine<'a> {
     /// The lowest pending index ever taken from `reopen` in the run (`u32::MAX`: none). The
     /// scan only looks at its cursor or beyond, but `reopen` brings back older disjunctions,
     /// which a later choice may then satisfy: a retraction's window reaches down to here
-    /// (`retract.rs`, review D16-058 r1).
+    /// (`retract.rs`).
     pub reopened_low: u32,
     pub bindings: Vec<u32>,
     pub pending_open: u32,

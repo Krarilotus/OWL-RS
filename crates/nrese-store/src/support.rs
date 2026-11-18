@@ -36,8 +36,8 @@
 //!   are computed once in, with its box (`Shared`). What computing them reads and builds
 //!   is charged to the reading query's envelope; the evaluation's own working set reports
 //!   its size at its rounds and is charged there as it goes (an exemption until the
-//!   reasoner's working set is charged before it is allocated:
-//!   notes/2026-10-20-executor-admission-design.md, W1 site "reasoner fixpoint"). A read
+//!   reasoner's working set is charged before it is allocated; the site is
+//!   "reasoner fixpoint"). A read
 //!   that finds no room fails with the error, never with a partial view; nothing failed is
 //!   kept, so the next read tries again.
 
@@ -456,7 +456,7 @@ struct InSnapshot<'s> {
 }
 
 /// Store reads the update calls back: the call counted before its lookup, then each quad
-/// read, on the reading task's poller (REAS-2, sweep M14; sol-loop r2 S5), and the engine's
+/// read, on the reading task's poller (REAS-2, sweep M14), and the engine's
 /// work below them (REAS-3, sweep SW022).
 impl Graphs for InSnapshot<'_> {
     fn each(
@@ -514,9 +514,9 @@ impl SupportSets {
         axioms.extend_from_slice(program.axioms())?;
         axioms.sort_unstable();
         let closure = Closure::of(snapshot, &graphs, &axioms, working)?;
-        // Read where the closure keeps them, no list per fact (fix check r2, C1.b residual);
+        // Read where the closure keeps them, no list per fact;
         // each lookup counted before it is made, then its entries, on the reading task's
-        // poller ([`InGraphs`]'s `Graphs`; sol-loop r1 S4, r2 S5).
+        // poller ([`InGraphs`]'s `Graphs`).
         let graphs_of = InGraphs(&closure.asserted);
         let ground = program.ground_program(snapshot);
         let following = Following::new(working);
@@ -698,7 +698,7 @@ impl SupportSets {
         let following = Following::new(working);
         let cancelled = || following.cancelled();
         // The touched facts' probes, on the query's cancellation; the first that finds it
-        // stopped ends the update (fix check r1, rule 2).
+        // stopped ends the update.
         let prep = Poller::new(&cancelled).ok_or(Unavailable::Cancelled)?;
         let mut removed: Kept<Triple> =
             ChargedVec::with_capacity(Arc::clone(working), touched.len())?;
@@ -711,7 +711,7 @@ impl SupportSets {
             snapshot: counted.clone(),
             removed: &removed,
         };
-        // Lent from the pool for the whole update, not copied (fix check r2, C1.b residual):
+        // Lent from the pool for the whole update, not copied:
         // `self` outlives it, and the pool is shared and never changed. A fact recorded as
         // its own sets keeps none; the update makes them, charged, its graphs read on the
         // reading task's poller ([`Previous::Own`]). The record itself is an in-memory
@@ -1192,10 +1192,10 @@ impl SupportSets {
         let mut scanning = Reservation::new(Arc::clone(working));
         scanning.charge(snapshot.scan_bytes(ReadModel::Asserted))?;
         // Each changed fact counted before it is decided, and its reads, on `stop` (the
-        // query's cancellation; sweep M15, review r1 F4): a fact both versions hide is
+        // query's cancellation): a fact both versions hide is
         // decided with no store read, and still counts.
         let poll = Poller::new(stop).ok_or(Unavailable::Cancelled)?;
-        // A probe its poller stopped ends the changes (fix check r1, rule 2: it read as "not
+        // A probe its poller stopped ends the changes (it read as "not
         // out of reach").
         let (counted_before, counted_now) = (before.counted(), snapshot.counted());
         let out_of_reach = |view: &Snapshot,
@@ -1237,7 +1237,7 @@ impl SupportSets {
                 .map_err(|ReadStopped| Unavailable::Cancelled)
         };
         for &fact in changed.iter() {
-            // The fact's four store probes, counted before they are made (review r1 F4), and
+            // The fact's four store probes, counted before they are made, and
             // each one's runs in the engine (REAS-3, sweep SW009).
             if poll.attempt(4) {
                 return Err(Unavailable::Cancelled);
@@ -1541,7 +1541,7 @@ impl Visits for After<'_> {
         }
     }
 
-    /// Each removed fact counted as it is read (review r1 F1).
+    /// Each removed fact counted as it is read.
     fn size(
         &self,
         bound: [Option<u64>; 3],
@@ -1552,7 +1552,7 @@ impl Visits for After<'_> {
             .counted(self.removed)
             .filter(|fact| matches(bound, fact))
             .count();
-        // A count its stop cut short is `Err` (fix check r1, B9).
+        // A count its stop cut short is `Err`.
         probe.ended()?;
         let stored =
             self.snapshot
@@ -2392,7 +2392,7 @@ impl Supports {
     /// over every asserted fact. What computing them reads charged to `working`. Under
     /// `reasoner.equality = "compact"` none: the stack is over representatives (its
     /// spellings aren't the asserted ones), and that mode's restricted reads are their own
-    /// design (item 18, compact equality).
+    /// design (compact equality).
     fn compute_rederived(
         &self,
         snapshot: &Snapshot,
@@ -2427,7 +2427,7 @@ impl Supports {
             removed: &[],
         };
         // A store probe, one unit on the reading task's poller (REAS-2, sweep M16), its work
-        // in the engine there too (REAS-3); `Err` once that has stopped (fix check r1, rule 2).
+        // in the engine there too (REAS-3); `Err` once that has stopped.
         let asserted = |fact: Triple, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
             if poll.tick() {
                 return Err(ReadStopped);
@@ -2492,7 +2492,7 @@ impl Supports {
         if let Some((earlier, touched)) = earlier {
             // A store probe, one unit on the query's poller, its work in the engine there too
             // (REAS-3, the caller of sweep SW010/SW011); `Err` once that has stopped, which
-            // ends the loop (fix check r2, R3-F3: "not in the closure" kept every later
+            // ends the loop ("not in the closure" kept every later
             // touched fact as removed).
             let counted = snapshot.counted();
             let in_closure = |fact: Triple, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
@@ -2778,9 +2778,9 @@ impl Supports {
             readable.push(access.allows_id(snapshot, graph))?;
         }
         // A lookup in the closure's list, counted before it is made, then each graph entry
-        // as it is read: on the reading task's poller (sol-loop r1 S4, r2 S5, review r1 F1).
-        // `Err` where its poller stopped it before a readable graph was found (fix check r1,
-        // rule 2: it read as not readable).
+        // as it is read: on the reading task's poller.
+        // `Err` where its poller stopped it before a readable graph was found (it read as not
+        // readable).
         let reads = |fact: Triple, poll: &Poller<'_>| -> Result<bool, ReadStopped> {
             if poll.tick() {
                 return Err(ReadStopped);

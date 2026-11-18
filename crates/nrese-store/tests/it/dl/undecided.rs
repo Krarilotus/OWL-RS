@@ -186,7 +186,7 @@ fn assert_told_inconsistent(dl: &MutationPipeline, at: &str) {
 }
 
 /// Spec: a store in quarantine proves nothing on the rules' route; at its start, before any
-/// commit, a read is told what the full check finds (the claim, sentence 1).
+/// commit, a read is told what the full check finds.
 #[test]
 fn a_quarantined_store_at_its_start_is_told_inconsistent() {
     let dl = quarantined(CLASH);
@@ -207,7 +207,7 @@ fn exact_answers_refuse_a_read_over_a_quarantined_store() {
 
 /// Spec: a commit into a store in quarantine on the rules' route records no DL verdict for
 /// its revision (its version keeps no assessment); the reads after it are told what they
-/// were told before it (the claim, sentence 2, then 1).
+/// were told before it.
 #[test]
 fn a_commit_in_quarantine_records_no_verdict_and_reads_stay_told_inconsistent() {
     let dl = quarantined(CLASH);
@@ -322,7 +322,7 @@ fn a_clean_store_on_the_rules_route_stays_complete_and_recorded() {
 }
 
 /// Spec: once the repair takes a store out of quarantine, a read is told what a clean store
-/// is told (the claim, sentence 3).
+/// is told.
 #[test]
 fn a_repaired_store_is_told_what_a_clean_store_is_told() {
     let q = quarantined(CLASH);

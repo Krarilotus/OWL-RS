@@ -187,7 +187,7 @@ fn readers_past_the_cap_see_what_their_graphs_derive() {
 }
 
 /// What a reader derives from its own graph doesn't depend on whether a graph it can't read
-/// also asserts it (review r1 of N12, P0-1): the stack keeps no inferred copy of a statement
+/// also asserts it: the stack keeps no inferred copy of a statement
 /// asserted anywhere, so a view that only filters the stack lost it exactly when a hidden
 /// graph asserted it, an exact membership test for any statement the reader can make
 /// derivable. Each row: the reader's graph `open` derives the statement, `secret` asserts it
@@ -244,8 +244,8 @@ fn a_hidden_assertion_does_not_change_what_a_reader_derives() {
     }
 }
 
-/// An update's WHERE reads what its requester reads, as its queries do (review r1 of PR #50,
-/// F1): a supported reader of `open` finds what `open` derives whether or not `secret`
+/// An update's WHERE reads what its requester reads, as its queries do (PR #50):
+/// a supported reader of `open` finds what `open` derives whether or not `secret`
 /// asserts it (`a_hidden_assertion_does_not_change_what_a_reader_derives`), so a marker its
 /// update inserts where that holds lands either way. Through the mutation pipeline, and in a
 /// transaction's pending operations, read before any commit.
@@ -388,7 +388,7 @@ fn patients(
 }
 
 /// Each `WHERE` of a request reads the state before its operation, the earlier operations
-/// included, as its requester reads it (the orchestrator's case 1 of F1): after a first
+/// included, as its requester reads it: after a first
 /// operation, the transaction holds changes, and a later `WHERE` that depends on them reads
 /// that pending state through the requester's view too. It sees `alice a Patient`, derived
 /// from `open`, whether or not `secret` asserts it, and not `bob a Patient`, which only
@@ -446,7 +446,7 @@ fn an_updates_later_where_reads_the_earlier_operations_as_its_requester_reads() 
 }
 
 /// An update's `WHERE` reads the graphs its requester may read only, its view of the inferred
-/// statements notwithstanding (the orchestrator's case 2 of F1: graph access and the read
+/// statements notwithstanding (graph access and the read
 /// source both apply): copying every statement of every graph into `open` copies none of
 /// `secret`'s.
 #[test]
@@ -521,7 +521,7 @@ fn a_hidden_assertion_committed_later_does_not_change_what_a_reader_derives() {
 
 /// A fact asserted only in a graph the reader can't read is shown to it as inferred only
 /// where it follows without that assertion: a cycle back through the fact itself is no
-/// derivation (review r1 of item 18 part 1, F3). `C ⊑ D` and `D ⊑ C` turn the hidden
+/// derivation. `C ⊑ D` and `D ⊑ C` turn the hidden
 /// `alice a C` into `alice a D` and back, and `sameAs` symmetry does the same; with an
 /// independent public proof the fact is shown. Both modes.
 #[test]
@@ -648,12 +648,12 @@ fn a_cancelled_restricted_read_fails_and_leaves_nothing_behind() {
 }
 
 /// A read inside a transaction charges the view it makes to its query's memory, as a read
-/// outside one does (sol-loop r1 of item 18 part 1, S2). 5,000 facts in the reader's graph
+/// outside one does. 5,000 facts in the reader's graph
 /// give its supported view sets well past 64 KiB, which the query itself fits (a reader of
 /// every graph, with no view, answers): the reader's first read fails with the query's
 /// memory limit. Nothing of it is kept, so the same read without a limit answers. With the
-/// base's view made, the read keeps no more than its operations' delta of it (review r1 of
-/// PR #50, D5; review r1 of O4, M charged the copy it made before), and answers within the
+/// base's view made, the read keeps no more than its operations' delta of it (PR #50; before,
+/// it charged the whole copy it made), and answers within the
 /// limit.
 #[test]
 fn a_pending_read_charges_its_view_to_the_query() {
@@ -700,8 +700,8 @@ fn a_pending_read_charges_its_view_to_the_query() {
 }
 
 /// A read inside a transaction charges what its operations' replay reads and builds to its
-/// query's memory, as it charges the read itself (sol-loop of PR #50 over F1, D5 and D7, S1;
-/// G1's I37). Each row: a control that answers within the query's limit, then the read whose
+/// query's memory, as it charges the read itself (PR #50; G1's I37). Each row: a control
+/// that answers within the query's limit, then the read whose
 /// replay takes it past that limit, refused with the query's memory limit, not the server's.
 /// - The view: the replay's `WHERE` reads through the reader's view, so the reader's first
 ///   read makes it there (5,000 facts in its graph: well past 64 KiB, as in
@@ -781,11 +781,11 @@ fn a_pending_reads_replay_is_charged_to_the_query() {
 
 /// A read inside a transaction whose query is cancelled (its time running out cancels it too)
 /// fails as cancelled and keeps no view, as one outside it does
-/// (`a_cancelled_restricted_read_fails_and_leaves_nothing_behind`; Sol's review of O4's
-/// boundary round, S2). Cold, the base's view stops at its first round, so nothing of it is
+/// (`a_cancelled_restricted_read_fails_and_leaves_nothing_behind`). Cold, the base's view
+/// stops at its first round, so nothing of it is
 /// made. With the base's view made, the read stops before it applies its operations to it.
 /// With the sets made, a reader of other graphs, whose view is new, doesn't build it either,
-/// nor charge for it (Sol's round 3).
+/// nor charge for it.
 /// 5,000 facts in the reader's graph give its view sets to compute; the transaction holds
 /// one RDF4J `ADD`.
 #[test]
@@ -866,8 +866,8 @@ fn a_cancelled_pending_read_fails_and_keeps_no_view() {
 }
 
 /// A statement or graph read whose read is cancelled (its time running out cancels it too)
-/// fails as cancelled and keeps no view, as a query does (Sol's review of O4's boundary
-/// round, round 4, S5). With the sets made, a reader whose view is new doesn't build it: RDF4J's
+/// fails as cancelled and keeps no view, as a query does.
+/// With the sets made, a reader whose view is new doesn't build it: RDF4J's
 /// statements (its size goes through the same read) and the Graph Store's GET and HEAD, each
 /// for a reader of its own. 5,000 facts in the readers' graph give their views sets to build
 /// from.
@@ -953,7 +953,7 @@ fn a_cancelled_statement_read_fails_and_keeps_no_view() {
 }
 
 /// A planned read (EXPLAIN without running) charges the view it makes to its query's memory,
-/// as a run does (Sol's review of O4's boundary round, S1). With the query's limit at 1 byte,
+/// as a run does. With the query's limit at 1 byte,
 /// a supported reader whose view is past it is refused by that limit, not by the server's
 /// query memory (64 KiB here), which the view passes too.
 #[test]
@@ -1010,8 +1010,8 @@ fn without_rules_a_reader_of_some_graphs_who_sees_inferences_is_refused() {
 }
 
 /// A read inside a session answers by the rules in place, as one outside it does
-/// (`without_rules_a_reader_of_some_graphs_who_sees_inferences_is_refused`; review of O4's
-/// fix round, S1): the session's kept view of its first read is no answer once the rules are
+/// (`without_rules_a_reader_of_some_graphs_who_sees_inferences_is_refused`):
+/// the session's kept view of its first read is no answer once the rules are
 /// switched off. A supported reader asks for `ex:a a ex:D` inside a session with one
 /// unrelated operation, before and after; after it, outside the session and inside it, the
 /// read is refused until the store is rematerialised.

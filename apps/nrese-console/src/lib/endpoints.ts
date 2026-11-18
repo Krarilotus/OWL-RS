@@ -35,7 +35,7 @@ export const DEFAULT_GRAPH_ALIASES: readonly string[] = [
 
 /** The request's query string for `target`, which every graph request is built from. A
  * named target the server would read as the default graph is refused here, before any
- * request: a named target acts on that named graph or on nothing (SYN-72 R1-F1). The server
+ * request: a named target acts on that named graph or on nothing (SYN-72). The server
  * checks the IRI and the graph's existence; the client sends what was named, whole. */
 export function graphQuery(target: GraphTarget): string {
   if (target.kind === "default") {

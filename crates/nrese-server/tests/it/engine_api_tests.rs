@@ -1201,7 +1201,7 @@ async fn a_default_repository_left_in_no_known_state_is_unavailable_alone() {
     .await;
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
     let query = |base: &str| format!("{base}/query?query={}", urlencoding(COUNT));
-    // By its path and by its id, plain or percent-encoded (the route decodes it: Sol r2), in
+    // By its path and by its id, plain or percent-encoded (the route decodes it), in
     // the engine API and in RDF4J's.
     for base in [
         "/dataset",

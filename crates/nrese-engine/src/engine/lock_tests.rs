@@ -1,5 +1,5 @@
-//! SYN-22 storage slots: what a Rayon pool thread gets when a slot is held (design note
-//! `2026-11-02-p2-c6a-storage-locks-design.md`). A pool thread never waits for the writer or
+//! SYN-22 storage slots: what a Rayon pool thread gets when a slot is held. A pool thread
+//! never waits for the writer or
 //! checkpoint slot: their holders fork onto the caller's pool, which the waiting thread may
 //! be part of. Each test asks from a pool of its own, so it can't hold up other tests' pools.
 
@@ -143,7 +143,7 @@ fn a_compaction_on_a_pool_thread_defers_to_a_running_merge() {
     assert!(engine.stats().runs < runs);
 }
 
-/// IB0024 sol-loop r3 S1: dropping the last Engine off the pool, with maintenance requested,
+/// Dropping the last Engine off the pool, with maintenance requested,
 /// while every thread of the global pool waits for a mutex that is let go only after the drop:
 /// the drop returns. The task needs no pool thread to run (here it has nothing to merge), so
 /// nothing that can't start may hold it up. The pool is held busy for this test only.
@@ -217,7 +217,7 @@ fn the_last_engine_dropped_on_a_pool_thread_runs_no_job_while_maintenance_is_in_
         tx.commit().unwrap();
     }
     // The maintenance merge holds its claim: it has started, and it can't finish until the
-    // slot is let go (sol-loop r3 S3: `maintaining` alone is set before a task starts).
+    // slot is let go (`maintaining` alone is set before a task starts).
     let started = std::time::Instant::now();
     while !*shared.versions.merging.lock() {
         assert!(

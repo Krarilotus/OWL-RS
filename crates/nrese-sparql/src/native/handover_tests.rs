@@ -402,7 +402,7 @@ fn a_declined_buffer_marks_no_refusal() {
     assert!(!refused, "a declined buffer marked the request refused");
 }
 
-/// Review r1, F1: the candidate pairs are stored only as far as the optional part has room
+/// The candidate pairs are stored only as far as the optional part has room
 /// for them; n patterns on one variable make n²/2 pairs, which no admission bounds before
 /// they are sorted. Where the room is short, the BGP plans with its counts alone and the
 /// request isn't marked refused.
@@ -466,12 +466,12 @@ fn candidate_pairs_stay_within_the_optional_budget() {
     );
 }
 
-/// Review r1, F1, and its fix check: the candidate pairs are never held beyond what is
+/// The candidate pairs are never held beyond what is
 /// charged for them, a growth included (a reallocation holds the old storage and the new at
 /// once), however many the patterns make; and none is kept where no list can be read.
 ///
 /// - Input: n subjects `sI`, each with two objects `aI` and `bI` of `p` in two uncompacted
-///   commits, so no pattern's list is in one run (r1's case: the lists can't be read); the n
+///   commits, so no pattern's list is in one run (the lists can't be read); the n
 ///   patterns `sI p ?x`, each counted 2, so every pair is a candidate (n²/2 of them, 24 bytes
 ///   each); no pair admitted (an allowance of 0). n = 150 and 300, measured within the
 ///   request's envelope (`measure_within`), unlimited, then within 64 KiB.
@@ -533,7 +533,7 @@ fn candidate_pairs_are_charged_before_they_are_held() {
     }
 }
 
-/// The budget types' owner's review of the optional part, R2: a list building that the
+/// A list building that the
 /// optional part refused once gives no overlap at all, not the counts of the lists read
 /// before the refusal; and the request isn't marked refused.
 ///

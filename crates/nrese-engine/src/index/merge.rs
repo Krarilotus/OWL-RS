@@ -8,8 +8,8 @@
 //! occurrences can be taken in any order.
 //!
 //! One step ([`SignedMerge::step`]) serves the plain reads and the counted ones: its work is
-//! counted on an [`Account`] a portion at a time, each portion before it is done (REAS-3a fix
-//! check r1 F1). Over at most [`LINEAR_UP_TO`] inputs a step compares all their keys for the
+//! counted on an [`Account`] a portion at a time, each portion before it is done.
+//! Over at most [`LINEAR_UP_TO`] inputs a step compares all their keys for the
 //! least, O(k) for k inputs. Over more, their heads are kept in a binary heap with the least
 //! key on top, so each occurrence a step takes costs O(log k) comparisons. A last live input
 //! is read without comparing.
@@ -98,7 +98,7 @@ const _: () = assert!(2 * (LINEAR_UP_TO as u64) <= crate::visit::PORTION);
 const _: () = assert!(HEAP_BUILD < crate::visit::PORTION);
 
 /// `n` units of a merge's work, counted where they are done in a build with the work
-/// counters ([`crate::witness`]; REAS-3a fix check r1 F1); nothing elsewhere.
+/// counters ([`crate::witness`]); nothing elsewhere.
 #[inline(always)]
 fn worked(n: usize) {
     #[cfg(any(test, all(feature = "witness", debug_assertions)))]
@@ -210,7 +210,7 @@ pub(crate) struct SignedMerge<'a> {
     /// The live cursor while just one is, after a heap: read without comparing.
     single: Option<usize>,
     /// The entries the live cursors have left: summed as they are made, less one for each
-    /// occurrence a step takes, so [`Self::remaining`] reads no cursor (REAS-3a review r1 R2).
+    /// occurrence a step takes, so [`Self::remaining`] reads no cursor.
     left: usize,
     /// A step its account stopped. Every later step answers [`Stopped`] and does nothing,
     /// whatever its account, until a refill makes this merge a new one (design attack D6).
@@ -305,7 +305,7 @@ impl<'a> SignedMerge<'a> {
 
     /// The next distinct key and the sum of its signs, or `None` at the end. Its work is
     /// counted on `account` a portion at a time, each before it is done, and each done before
-    /// the next is taken, so no work counted before a yes is done after it (fix check r3 H1).
+    /// the next is taken, so no work counted before a yes is done after it.
     /// For each occurrence a heap step takes, a portion is the cursor's advance with what it
     /// reads ([`Cursor::advance_cost`]) together with the heap's repair and the test of whether
     /// the next head holds the same key. The end is counted too. [`Stopped`] once the account
@@ -436,7 +436,7 @@ impl Iterator for SignedMerge<'_> {
 
     /// [`SignedMerge::step`], counting nothing. A merge that a counted read stopped reads as
     /// ended here: the plain reads never stop one, and the counted reader keeps getting
-    /// [`Stopped`] from its own steps (design attack r2, E3).
+    /// [`Stopped`] from its own steps.
     #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         self.step(&mut Free).unwrap_or(None)

@@ -393,7 +393,7 @@ fn shacl_rejection_depends_only_on_the_readable_graphs() {
     );
 }
 
-// Sol-loop r1 (S1–S3): the view's reasons don't depend on the gates' own state.
+// The view's reasons don't depend on the gates' own state.
 
 /// The rejection `requester` gets for `commit` on a fresh store after the `setup` writes
 /// (by a reader of every graph), in order.
@@ -508,7 +508,7 @@ Consistency: r
 }
 "#;
 
-/// Sol-loop r2-S4: the view's violation of the second rule isn't explained by the first
+/// The view's violation of the second rule isn't explained by the first
 /// rule of its name, whose premise is a statement of `:secret` (asserted there or not).
 #[test]
 fn rl_view_violation_isnt_explained_by_another_rule_of_its_name() {
@@ -569,7 +569,7 @@ fn dl_reason_of_the_view_doesnt_depend_on_the_dl_verdict() {
     same_for_both(dl, shacl);
 }
 
-// Package review r1: what is shown, and in which order, doesn't follow term ids, and a
+// What is shown, and in which order, doesn't follow term ids, and a
 // refused shapes graph a committer may not read isn't described to it.
 
 /// The rejection `requester` gets for `commit` on a fresh store where `first` was committed
@@ -593,7 +593,7 @@ fn after_first(
     reject_on(&p, commit, requester)
 }
 
-/// R1-D1 (SHACL): two readable focus nodes break the shape; which one is shown doesn't
+/// Two readable focus nodes break the shape; which one is shown doesn't
 /// depend on which of them a secret statement made the dictionary know first.
 #[test]
 fn shacl_focus_shown_doesnt_follow_term_ids() {
@@ -619,7 +619,7 @@ fn shacl_focus_shown_doesnt_follow_term_ids() {
     same_for_both(a, b);
 }
 
-/// R1-D1 (DL): the committer's graphs have two minimal inconsistent sets (`:x` in `:A` and
+/// The committer's graphs have two minimal inconsistent sets (`:x` in `:A` and
 /// `:B`, or in `:A` and `:C`, each pair disjoint); which one is shown doesn't depend on
 /// which of `:B` and `:C` a secret statement made the dictionary know first.
 #[test]
@@ -679,7 +679,7 @@ fn shapes_writer() -> Requester {
     Requester::new(ReadScope::Graphs(read), WriteScope::Graphs(write))
 }
 
-/// R1-D2: the problems of a shapes graph the committer may not read don't name its shapes.
+/// The problems of a shapes graph the committer may not read don't name its shapes.
 #[test]
 fn shapes_refusal_doesnt_describe_an_unreadable_shapes_graph() {
     let (a, b) = (
@@ -697,7 +697,7 @@ fn shapes_refusal_full_reader_names_the_shape() {
     assert!(refusal.contains("SECRET_A"), "{refusal}");
 }
 
-// Fix check r1 (R1-D1 still open): every term is compared whole, a blank node by its
+// Every term is compared whole, a blank node by its
 // label (the store's name for it, in the committer's own view), so the shown focus or
 // individual is the least of the view's, whatever was interned first.
 

@@ -309,8 +309,8 @@ fn copied(dir: &std::path::Path) -> tempfile::TempDir {
     copy_dir
 }
 
-/// A transaction is stamped when its record goes to the log, its preparation done (review
-/// r1, R1-F1): the clock reads 1000 when it commits and 2000 once its runs are built, its
+/// A transaction is stamped when its record goes to the log, its preparation done:
+/// the clock reads 1000 when it commits and 2000 once its runs are built, its
 /// layout converted or the log rotated (`fault::CLOCK_AT_APPEND`). Its record and its version
 /// take 2000: a restore at 1500 leaves it out, and a checkpoint after it is refused at 1999,
 /// used at 2000. Before the fix both took 1000, so a restore at 1500 kept a commit made at
@@ -377,7 +377,7 @@ fn a_transaction_is_stamped_at_its_log_append() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// Commits of unknown time leave the store's clock where it was (review r1, R1-F2): a version
+/// Commits of unknown time leave the store's clock where it was: a version
 /// holding them has no known time, but the commits after them still never go back. Each row
 /// starts from such a history and steps the clock back from 2000 to 1000:
 /// - two commits after a format 11 checkpoint are logged at 2000 and 2000;
@@ -538,8 +538,8 @@ fn apply_one(replica: &Engine, frames: &[u8]) -> EngineResult<crate::Applied> {
     replica.apply_log(frames, &expected, &nrese_exec::stop::StopSource::none())
 }
 
-/// A replicated commit's time moves the store's clock in memory as on disk (sol-loop, review
-/// fix S1): an in-memory replica applies a primary's commit made at 2000, then replaces its
+/// A replicated commit's time moves the store's clock in memory as on disk:
+/// an in-memory replica applies a primary's commit made at 2000, then replaces its
 /// data under a clock reading 1000. The replacement is stamped no earlier than 2000, so an
 /// image of it is refused by a restore at 1500. Before the fix it was stamped 1000.
 #[test]
@@ -560,7 +560,7 @@ fn a_replicated_time_moves_the_clock_in_memory_too() {
     );
 }
 
-/// A commit time is below 2^63 (sol-loop, review fix S2): a checkpoint keeps it in 63 bits.
+/// A commit time is below 2^63: a checkpoint keeps it in 63 bits.
 /// A replicated record at 2^63 or `u64::MAX` is refused, nothing applied; one at 2^63 - 1 is
 /// applied, and its checkpoint keeps the time exactly (refused by a restore at 2^63 - 2,
 /// used at 2^63 - 1; a guard). Before the fix the top bit was dropped when checkpointed,
@@ -624,16 +624,16 @@ fn as_format_11(dir: &std::path::Path) {
     std::fs::write(&path, old).unwrap();
 }
 
-/// A version's time bounds every commit in it, whatever history it was recovered from
-/// (sol-loop r1 S1, S2). Rows, each a restore at 1500 that must refuse, judged apart:
+/// A version's time bounds every commit in it, whatever history it was recovered from.
+/// Rows, each a restore at 1500 that must refuse, judged apart:
 /// - a log an earlier binary wrote under a clock that stepped back (commits logged at 2000,
 ///   then 1000), replayed and checkpointed: the checkpoint's commits include one at 2000;
 /// - a format 11 checkpoint (no time) of a commit made at 2000, then a commit at 1000 and a
 ///   checkpoint: what it holds from before is still of unknown time;
 /// - a bulk replacement at 3000 after that, restored at 3500: it holds nothing from before,
-///   but a commit of unknown time may have been made after any time this store would stamp
-///   (review r2, R1-F2: a legacy log loses its times), so no later time is certified. This
-///   row expected the replacement's time known until that review.
+///   but a commit of unknown time may have been made after any time this store would
+///   stamp (a legacy log loses its times),
+///   so no later time is certified.
 ///
 /// And a guard: a bulk replacement after a history of known time keeps its time, and a
 /// restore after it opens.
@@ -753,8 +753,8 @@ fn legacy() -> tempfile::TempDir {
     dir
 }
 
-/// A time a legacy store's log couldn't keep is never certified by a later commit (review r2,
-/// R1-F2): its version 4 segments keep no times, so a reopen replays its commits untimed.
+/// A time a legacy store's log couldn't keep is never certified by a later commit:
+/// its version 4 segments keep no times, so a reopen replays its commits untimed.
 /// Rows, judged apart, each refused by a restore at 1500 for its time (`Configuration`), the
 /// store opening plainly with the replacement:
 /// - a bulk replacement at 500, a transaction at 2000, a reopen, a replacement at 1000;
@@ -832,7 +832,7 @@ fn a_time_a_legacy_log_lost_is_never_certified() {
 }
 
 /// A bulk publication is stamped when it commits, at its checkpoint's end, not when its
-/// version was built before the (long) write (sol-loop r1 S3). The clock reads 1000 while the
+/// version was built before the (long) write. The clock reads 1000 while the
 /// load is built and 2000 once its checkpoint is written (`fault::CLOCK_AT_TRAILER`); a
 /// restore at 1500 must refuse it. Rows, judged apart: an append (built in memory), a
 /// replacement (streamed into the checkpoint) and a rematerialisation.
@@ -888,8 +888,8 @@ fn a_bulk_publication_is_stamped_when_it_commits() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// The bytes a torn tail's cut removes are kept under a durable name before the cut (sol-loop
-/// r2 S3): an open whose `wal-cut/` can't be synced after the copy is placed fails, the log
+/// The bytes a torn tail's cut removes are kept under a durable name before the cut:
+/// an open whose `wal-cut/` can't be synced after the copy is placed fails, the log
 /// uncut; so does the next open while that sync still fails, though it finds the copy
 /// already there (it must sync it before cutting). Once the sync works, the open cuts.
 #[test]
@@ -958,8 +958,8 @@ fn a_directory_sync_is_real() {
     super::sync_dir(dir.path()).unwrap();
 }
 
-/// The directories an open creates for its store are durably named before it takes commits
-/// (review r1, R1-F2): each new one's entry in the directory holding it is synced, so a power
+/// The directories an open creates for its store are durably named before it takes commits:
+/// each new one's entry in the directory holding it is synced, so a power
 /// loss can't take the store's name with every commit acknowledged in it. Here the sync of
 /// that holding directory fails (`fault::FAIL_DIR_SYNC_OF`), and the open must refuse. Before
 /// the fix only the store's own directory was synced, so it opened. Rows, judged apart:
@@ -967,14 +967,14 @@ fn a_directory_sync_is_real() {
 /// - one missing level, the same;
 /// - a relative single directory, the sync of `.` failing (made in the working directory,
 ///   removed after);
-/// - the same open tried again, the sync still failing (sol-loop on review r1, S1): the first
+/// - the same open tried again, the sync still failing: the first
 ///   refusal mustn't leave a directory the retry takes for durably named;
 /// - a directory that exists, made by someone else (another attempt, another process) and not
 ///   known to be named durably: its holder's sync failing, the open refuses (it makes the
 ///   store's WAL directory in it, so it syncs every name at once);
 /// - an existing store, its holder's sync failing: the open succeeds, as it changes nothing and
 ///   leaves its names to the first durable write, and the first commit is refused
-///   (deferred-sync design note of 8 Nov);
+///   (the deferred sync of 8 Nov);
 /// - guards: an existing directory whose holder can't be opened for the sync (no permission)
 ///   opens, as nothing more can be done for its name there; two missing levels open with every
 ///   sync working.
@@ -1080,8 +1080,8 @@ fn an_open_names_every_directory_it_creates() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// A directory is made only where its name can be made durable (sol-loop round 2 on review r1,
-/// S1): made first and its holder's sync then refused (`PermissionDenied`), it is in sight of
+/// A directory is made only where its name can be made durable:
+/// made first and its holder's sync then refused (`PermissionDenied`), it is in sight of
 /// another process opening the same path, which finds it, can't sync its holder either, takes
 /// it for one provisioned beforehand and commits into a name never made durable. Here the
 /// holder's sync is refused that way: when it is tried, the new directory must not exist yet,
@@ -1124,11 +1124,11 @@ fn a_directory_is_made_only_where_its_name_can_be_made_durable() {
 }
 
 /// Every directory a store, its log or archive, a restore, a backup or a replica's bootstrap
-/// places what recovery reads in is made through the placement owner (sol-loop round 3 on review
-/// r1, S1): a directory made elsewhere, then found by `place::create_dir_all`, is taken for one
+/// places what recovery reads in is made through the placement owner:
+/// a directory made elsewhere, then found by `place::create_dir_all`, is taken for one
 /// provisioned beforehand where its holder can't be synced, and its name is never made durable
 /// (replica bootstrap made its data directory that way). Files recovery reads are renamed into
-/// place through it too (round 5, S3: the quarantine's, and the reasoning marker). A source scan
+/// place through it too (the quarantine's, and the reasoning marker). A source scan
 /// of those callers, their test modules left out.
 #[test]
 fn store_directories_are_made_through_the_placement_owner() {
@@ -1143,7 +1143,7 @@ fn store_directories_are_made_through_the_placement_owner() {
         "nrese-store/src/metadata.rs",
         "nrese-server/src/replication.rs",
         "nrese-server/src/http/admin_dataset.rs",
-        // DUR-3 sol-loop round 5, S3, and the sweep after it: the quarantine and the reasoning
+        // DUR-3: the quarantine and the reasoning
         // marker are read at open too.
         "nrese-store/src/quarantine.rs",
         "nrese-store/src/service.rs",
@@ -1168,8 +1168,8 @@ fn store_directories_are_made_through_the_placement_owner() {
                     line.contains(call)
                         && !line.contains(&format!("place::{}", call.trim_start_matches("fs::")))
                 });
-            // A raw write may only make a temporary, which is then synced and placed (fix check
-            // r1: the backup manifest was written under its own name, unsynced).
+            // A raw write may only make a temporary, which is then synced and placed (the backup manifest was written under its own name,
+            // unsynced).
             let writes = ["fs::write(", "File::create("]
                 .iter()
                 .any(|call| line.contains(call))
@@ -1189,9 +1189,9 @@ fn store_directories_are_made_through_the_placement_owner() {
 
 /// The product code of a Rust source file, with each line's index: every line but those of its
 /// inline test modules. A test module is `#[cfg(test)]` at column 0 followed by a `mod … {`
-/// line at column 0 (any name; an out-of-line `mod tests;` is none: sol-loop round 4, S2), and
+/// line at column 0 (any name; an out-of-line `mod tests;` is none), and
 /// it ends at a bare `}` at column 0. Any other line at column 0 that starts with `}` inside one,
-/// or a file ending inside one, is refused rather than guessed (fix check r2, N4: a close like
+/// or a file ending inside one, is refused rather than guessed (a close like
 /// `} // comment` skipped the product code after it).
 fn product_lines(text: &str) -> Result<Vec<(usize, &str)>, String> {
     let lines: Vec<&str> = text.lines().collect();
@@ -1231,7 +1231,7 @@ fn product_lines(text: &str) -> Result<Vec<(usize, &str)>, String> {
     }
 }
 
-/// [`product_lines`] reads the shapes it is given, and refuses others (fix check r2, N4). Rows:
+/// [`product_lines`] reads the shapes it is given, and refuses others. Rows:
 /// a test module named anything, closed by a bare `}`, then product code; an out-of-line
 /// `mod tests;` (no module: the code after it is read); a `#[cfg(test)]` seam inside a function
 /// (indented: read); a module closed by `} // comment` (refused); a module never closed
@@ -1304,7 +1304,7 @@ fn an_open_syncs_what_it_replayed() {
     }
 }
 
-/// The names a reopen of the store in `root` makes durable (R1-F2 and F5): each directory
+/// The names a reopen of the store in `root` makes durable: each directory
 /// holding a level of its path (the root, or a Windows prefix, holds nothing), the WAL's
 /// directory and the store's own, each once.
 fn names_of(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, usize> {
@@ -1345,8 +1345,8 @@ fn a_closed_store(config: EngineConfig) -> (tempfile::TempDir, std::path::PathBu
     (base, root)
 }
 
-/// A reopen syncs its names once, by its first commit (timing of 8 Nov, the master's decisions
-/// of 12:15 and 14:37): the open itself syncs no directory, as the first sync an open does pays
+/// A reopen syncs its names once, by its first commit (timing and decisions of 8 Nov):
+/// the open itself syncs no directory, as the first sync an open does pays
 /// the journal's commit and a device flush (+0.5 ms a reopen on the timing host); the first
 /// commit syncs each of its names (`names_of`) once, before it is acknowledged; the second
 /// syncs none. Before the fix the open synced them all and the commit none. Rows, judged
@@ -1393,8 +1393,8 @@ fn a_reopen_syncs_its_names_once_by_its_first_commit() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Whatever relies on a reopened store's names first syncs them (the deferred-sync design
-/// note's invariant): a checkpoint, a bulk publication and the log served to a follower each
+/// Whatever relies on a reopened store's names first syncs them:
+/// a checkpoint, a bulk publication and the log served to a follower each
 /// sync every name (`names_of`) before they return, when no commit came first. Before the fix
 /// the open had synced them, and none of these did again. Rows, judged apart.
 #[test]
@@ -1437,7 +1437,7 @@ fn a_reopen_syncs_its_names_before_anything_relies_on_them() {
 }
 
 /// Naming an existing directory (`place::name_existing`, which the store's metadata writes go
-/// through: fix check DEFER-F1) syncs the holder of each level of its path, each once, and
+/// through) syncs the holder of each level of its path, each once, and
 /// makes nothing. Rows, judged apart: an existing directory; one that isn't there (refused,
 /// `NotFound`, and not made: a write into a directory gone meanwhile mustn't make it again); a
 /// holder whose sync fails (refused); a holder this process may not open (`PermissionDenied`:
@@ -1486,8 +1486,8 @@ fn naming_a_directory_syncs_its_holders_and_makes_nothing() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A first commit whose names can't be synced is not acknowledged (the design note's attack
-/// 2): the store's directory sync failing, the commit returns an error and publishes nothing,
+/// A first commit whose names can't be synced is not acknowledged:
+/// the store's directory sync failing, the commit returns an error and publishes nothing,
 /// and the log takes no more commits (the record is written, its outcome unknown, as for a
 /// record whose own sync failed); reopened, the store opens, with or without that commit.
 /// Before the fix the commit didn't sync the names, and succeeded. Second row: a checkpoint

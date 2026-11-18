@@ -333,8 +333,8 @@ async fn a_replica_gives_its_primarys_dl_answers() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
-/// A replica's data directory, made by its bootstrap, is durably named (sol-loop round 3 on
-/// DUR-3 review r1, S1): into `sealed/a`, where `sealed` exists but can't be opened (mode
+/// A replica's data directory, made by its bootstrap, is durably named:
+/// into `sealed/a`, where `sealed` exists but can't be opened (mode
 /// 0o311), so its sync, which must name `a`, fails, the bootstrap must refuse. Before the fix it
 /// made `a` itself, and the placement then took it for a directory provisioned beforehand. Guard:
 /// into `open/a` it takes the image and the store opens with it. Unix only (permissions); as root,

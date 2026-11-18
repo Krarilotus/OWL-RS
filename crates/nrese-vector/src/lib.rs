@@ -534,7 +534,7 @@ mod tests {
 
     /// Under every budget from none to what it held at its peak, a scan of several parts
     /// either answers as unlimited or is refused (some parts refused while others finished),
-    /// and holds nothing afterwards either way (review fix check, S2). On one worker, so
+    /// and holds nothing afterwards either way. On one worker, so
     /// that the peak of the unlimited run is the peak of every run; the peak itself is one
     /// of the limits, so one run answers.
     #[test]

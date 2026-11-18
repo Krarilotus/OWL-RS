@@ -1,4 +1,4 @@
-//! Package 2a's guards (`notes/2026-11-08-p2-bounded-vocabulary-design.md` §4 and §9): new-contract
+//! Package 2a's guards: new-contract
 //! tests of an API the base doesn't have, so none is red there. Each states its specified result:
 //! ids by position from the overlay's `start`, terms decoded back to the inputs.
 
@@ -158,7 +158,7 @@ fn triple_terms_resolve_components_first() {
     let published = dictionary.intern(TermRef::Triple(&later));
     let own = overlay.intern(TermRef::Triple(&later)).unwrap();
     // The overlay's own: at or past start. The dictionary's later copy may have the same
-    // number in its own domain (contract §4.1: equal numbers across vocabularies mean nothing).
+    // number in its own domain (equal numbers across vocabularies mean nothing).
     assert!(own.payload() >= start);
     assert_eq!(
         dictionary.decode(published),
@@ -243,8 +243,8 @@ fn a_frozen_view_answers_what_it_was_taken_with() {
 }
 
 /// B9. The bounded and charged reads at the edge: the last own id, the first past it, an id below
-/// start, a triple term (decoded and charged as a whole, its components with it: package C3,
-/// `notes/2026-11-09-d039-update-sweep.md` row C3; before it, `None`).
+/// start, a triple term (decoded and charged as a whole, its components with it: package C3;
+/// before it, `None`).
 #[test]
 fn bounded_reads_answer_at_the_own_edge() {
     let budget = unlimited();
@@ -357,7 +357,7 @@ fn a_refused_intern_adds_nothing() {
     assert_eq!(view.decode(small), Some(literal("small")));
 }
 
-/// B12 (sol-loop r1 S2: what a refused triple intern leaves). The components interned before
+/// B12 (what a refused triple intern leaves). The components interned before
 /// the refusal stay, each its own entry, found and charged; the triple term isn't added; a later
 /// intern of the same component finds the same id.
 #[test]
@@ -384,7 +384,7 @@ fn a_refused_triple_intern_keeps_the_components_it_added() {
     );
 }
 
-/// B11 (sol-loop r1 S1: the order across kinds). Ids sort by kind before payload, so an own
+/// B11 (the order across kinds). Ids sort by kind before payload, so an own
 /// simple literal sorts before a shared language-tagged string: the merged matches are sorted
 /// as the dictionary's are, whatever kinds they mix.
 #[test]
@@ -418,7 +418,7 @@ fn matching_strings_keeps_the_dictionarys_order_across_kinds() {
 /// allocated and released with the last holder: the overlay dropped before its view. Its
 /// reservations are made inside the measurement (`measure`'s rule), so the overlay is too; its
 /// own `Arc` block is the one allocation held uncharged, deliberately (a transaction's fixed
-/// state, as the transaction is: design note §11), and exactly that is allowed. Measured, alone.
+/// state, as the transaction is), and exactly that is allowed. Measured, alone.
 #[test]
 fn an_overlay_and_its_views_hold_only_what_they_charged() {
     if !nrese_exec::measure::alone() {
@@ -589,7 +589,7 @@ fn a_private_lookup_holds_one_key_for_both_probes() {
     }
 }
 
-/// Sol-loop e1 S1: a probe of a key already made allocates nothing on a plain dictionary, so
+/// A probe of a key already made allocates nothing on a plain dictionary, so
 /// interning a shared term through the overlay charges its key and not the compressed base's
 /// probe bound.
 ///
@@ -614,7 +614,7 @@ fn a_shared_long_term_is_interned_on_a_plain_base_within_its_key() {
     assert_eq!(encoded.map(|quad| quad.object), Ok(shared));
 }
 
-/// V3's own entries (DICT2 9 Nov 04:02). Input: a dictionary of two literals, an overlay at
+/// V3's own entries. Input: a dictionary of two literals, an overlay at
 /// its length that interns a shared literal, an IRI, a simple and a language-tagged literal of
 /// its own, then is frozen; one more own term interned after the freeze. Expected: the view's
 /// own entries are exactly the three own terms, in id order, each id the overlay's (its kind

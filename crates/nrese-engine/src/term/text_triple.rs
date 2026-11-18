@@ -20,7 +20,7 @@ use nrese_rdf::{BaseDirection, BlankNode, Literal, NamedNode, NamedOrBlankNode, 
 
 /// The text a triple term has read of its own when [`decode`] boxes it, at least: `<<(` and the
 /// two bytes at least (`<>`, or `_:` and a byte) of its subject and of its predicate. Its
-/// closing `)>>` isn't counted, since a damaged text may lack it (sol-loop r4 S3), nor its
+/// closing `)>>` isn't counted, since a damaged text may lack it, nor its
 /// object, which may be a triple term's, nor the spaces the writer puts between them, since
 /// [`decode`] reads text without them too.
 const TRIPLE_TEXT: usize = 3 + 2 + 2;
@@ -312,7 +312,7 @@ mod tests {
         }
     }
 
-    /// Package C3, review r1 R1: the first RDF 1.2 version wrote triple terms of any depth
+    /// The first RDF 1.2 version wrote triple terms of any depth
     /// (`Triple::new` and its interning set no limit), and its stores still open, so their text
     /// reads back as the term at any depth: 65 levels (one past the 64 the N-Triples parser
     /// takes, which gave the text back as a literal) and 1,000, each against the term built
@@ -341,7 +341,7 @@ mod tests {
         assert!(decode(&text) == Literal::new_simple_literal(&text).into());
     }
 
-    /// Package C3, sol-loop r4 S3: a triple term is boxed once its opening, subject and
+    /// A triple term is boxed once its opening, subject and
     /// predicate are read, before its closing, so damaged text of only those, `<<(<><>` (7
     /// bytes) once and repeated, holds a box for each. Measured (`nrese_exec::measure`): the
     /// decode's peak is within [`bound`] of the text's length.
@@ -362,7 +362,7 @@ mod tests {
         }
     }
 
-    /// Package C3 (sol-loop r2 S2): the text was the term the dictionary interned, as `Display`
+    /// Package C3: the text was the term the dictionary interned, as `Display`
     /// writes it, and terms are interned unchecked, so it may hold what the N-Triples parser
     /// refuses: a tag that isn't well-formed BCP 47, a relative IRI, a blank label the grammar
     /// has no room for. The parser gave the text back as a literal, not the term; the decode
