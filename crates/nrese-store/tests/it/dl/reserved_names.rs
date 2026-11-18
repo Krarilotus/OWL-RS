@@ -70,28 +70,36 @@ fn after_is_fresh(
     (bounds.last, later.store().dl_bounds().last, wrong)
 }
 
+/// The RDF mapping's two spellings of an annotation property's declaration (OWL 2 Mapping to
+/// RDF Graphs, Table 6).
+const SPELLINGS: [&str; 2] = ["owl:AnnotationProperty", "owl:OntologyProperty"];
+
 /// Spec (Structural Specification §5.5: of the reserved vocabulary only the nine built-in
-/// annotation properties are annotation properties, so `owl:sameAs` declared one is none; a
-/// store's reading after any history equals a fresh read of its statements): with `owl:sameAs`
-/// declared an annotation property, a later `:Person owl:sameAs :p2` on a class is an equality
-/// on `:Person`, which an individual's class then also names: the commit takes the route and
-/// the reading a fresh read of the same statements takes, each read the same answers with the
-/// same status. No SHACL term takes part.
+/// annotation properties are annotation properties, so `owl:sameAs` declared one, in either of
+/// the RDF mapping's spellings (Table 6), is none; a store's reading after any history equals
+/// a fresh read of its statements): with `owl:sameAs` so declared, a later `:Person owl:sameAs
+/// :p2` on a class is an equality on `:Person`, which an individual's class then also names:
+/// the commit takes the route and the reading a fresh read of the same statements takes, each
+/// read the same answers with the same status. No SHACL term takes part.
 #[test]
 fn an_equality_on_a_class_with_owl_same_as_declared_an_annotation_property_reads_as_a_fresh_store()
 {
-    let first = "owl:sameAs a owl:AnnotationProperty . :Person a owl:Class . :ann a :Person .";
-    let then = ":Person owl:sameAs :p2 .";
-    let (_, _, wrong) = after_is_fresh(
-        first,
-        &format!("INSERT DATA {{ {then} }}"),
-        &format!("{first} {then}"),
-        &[
-            "SELECT ?x { ?x a :Person }",
-            "SELECT ?x { ?x owl:sameAs :p2 }",
-            "SELECT ?x { :ann a ?x }",
-        ],
-    );
+    let mut wrong = Vec::new();
+    for spelling in SPELLINGS {
+        let first = format!("owl:sameAs a {spelling} . :Person a owl:Class . :ann a :Person .");
+        let then = ":Person owl:sameAs :p2 .";
+        let (_, _, differs) = after_is_fresh(
+            &first,
+            &format!("INSERT DATA {{ {then} }}"),
+            &format!("{first} {then}"),
+            &[
+                "SELECT ?x { ?x a :Person }",
+                "SELECT ?x { ?x owl:sameAs :p2 }",
+                "SELECT ?x { :ann a ?x }",
+            ],
+        );
+        wrong.extend(differs.into_iter().map(|d| format!("{spelling}: {d}")));
+    }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
@@ -140,26 +148,66 @@ fn an_equality_on_sh_path_with_owl_same_as_declared_an_annotation_property_reads
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Spec (Structural Specification §5.5: `owl:sameAs` declared an annotation property is none,
-/// so the declaration gives nothing a meaning, and `sh:path owl:sameAs :alias` is an equality
-/// on `sh:path`, which names it, and the SHACL content `:s sh:path :knows` is then read as any
-/// other statement): a store with the declaration reads as one without it: the same route,
-/// and each read the same answers with the same status.
+/// Spec (Structural Specification §5.5: `owl:sameAs` declared an annotation property, in either
+/// of the RDF mapping's spellings (Table 6), is none, so the declaration gives nothing a
+/// meaning, and `sh:path owl:sameAs :alias` is an equality on `sh:path`, which names it, and
+/// the SHACL content `:s sh:path :knows` is then read as any other statement): a store with
+/// the declaration reads as one without it: the same route, and each read the same answers
+/// with the same status.
 #[test]
 fn owl_same_as_declared_an_annotation_property_reads_as_a_store_without_the_declaration() {
     let rest = ":knows a owl:ObjectProperty . :s sh:path :knows . sh:path owl:sameAs :alias .";
-    let (declared, without) = (pipeline(), pipeline());
-    insert(
-        &declared,
-        &format!("owl:sameAs a owl:AnnotationProperty . {rest}"),
-    )
-    .expect("one");
+    let without = pipeline();
     insert(&without, rest).expect("one commit");
     let reads = [
         "SELECT ?x { ?x sh:path ?o }",
         "SELECT ?x { ?x a owl:Thing }",
     ];
-    let wrong = differs(&declared, &without, &reads);
+    let mut wrong = Vec::new();
+    for spelling in SPELLINGS {
+        let declared = pipeline();
+        insert(&declared, &format!("owl:sameAs a {spelling} . {rest}")).expect("one");
+        let differs = differs(&declared, &without, &reads);
+        wrong.extend(differs.into_iter().map(|d| format!("{spelling}: {d}")));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// How a store takes the commit of `data`: accepted, or rejected and by which constraint.
+fn taken(dl: &nrese_store::MutationPipeline, data: &str) -> String {
+    match insert(dl, data) {
+        Ok(_) => "accepted".to_owned(),
+        Err(nrese_store::MutationError::Rejected(reject)) => {
+            let by = reject.explanation.map(|e| e.violated_constraint);
+            format!("rejected by {by:?}")
+        }
+        Err(other) => format!("failed: {other:?}"),
+    }
+}
+
+/// Spec (Structural Specification §2.4 allows `owl:bottomObjectProperty` as an entity, and
+/// §5.5 lets of the reserved vocabulary only the nine built-in annotation properties be
+/// annotation properties, so declared one it is none; Direct Semantics: no pair is in the
+/// bottom object property's extension, so an assertion of it has no model): the commit of
+/// `:s owl:bottomObjectProperty :o` beside that declaration is taken as the same commit
+/// without it: rejected alike, or accepted alike and each read the same.
+#[test]
+fn owl_bottom_object_property_declared_an_annotation_property_reads_as_a_store_without_the_declaration()
+ {
+    let rest = ":s owl:bottomObjectProperty :o .";
+    let (declared, without) = (pipeline(), pipeline());
+    let declaration = "owl:bottomObjectProperty a owl:AnnotationProperty .";
+    let commits = [
+        taken(&declared, &format!("{declaration} {rest}")),
+        taken(&without, rest),
+    ];
+    eprintln!("commits {commits:?} (declared, without)");
+    let mut wrong = Vec::new();
+    if commits[0] != commits[1] {
+        wrong.push(format!("commits {commits:?}"));
+    } else if commits[0] == "accepted" {
+        wrong.extend(differs(&declared, &without, &["SELECT ?x { ?x ?p :o }"]));
+    }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
