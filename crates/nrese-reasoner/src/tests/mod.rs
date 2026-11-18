@@ -12,6 +12,7 @@ use super::vocabulary::LocalVocabulary;
 
 mod attempted;
 mod boundaries;
+mod commit_cost;
 mod equality_shapes;
 mod sources;
 mod stops;
