@@ -1083,3 +1083,62 @@ fn a_store_entering_quarantine_at_a_rebuild_is_told_inconsistent_after_a_read_in
         "the setup: the read in between read another revision"
     );
 }
+
+/// A pending fact through an alias of `owl:hasKey` reaches the list scan of a reader by
+/// support's own pending view, under compact equality: the data of
+/// `tests/it/mutation_pipeline_tests.rs`'s
+/// `a_pending_fact_through_an_alias_of_has_key_leaves_out_a_list_under_compact_equality`,
+/// whose reader is told `not-certified`, so its status no longer shows the scan. `:hk`, its
+/// class's representative with `owl:hasKey`, is written first with reasoning off; the pending
+/// `:K :hk :head` (an RDF4J `ADD`) makes a key of 128 properties, more than the rules build.
+/// Committed, no list is left out.
+#[test]
+fn a_readers_pending_view_scans_a_key_through_an_alias_of_has_key() {
+    let config = StoreConfig {
+        ql_rewriting: crate::QlRewritingMode::On,
+        equality_compact: true,
+        ..StoreConfig::in_memory()
+    };
+    let store = Arc::new(StoreService::new(config).expect("store"));
+    let (ex, owl) = ("http://example.com/", "http://www.w3.org/2002/07/owl#");
+    let rdf = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let cell = |i: usize| match i {
+        1 => format!("<{ex}head>"),
+        129 => format!("<{rdf}nil>"),
+        i => format!("<{ex}c{i}>"),
+    };
+    let mut data = format!("<{ex}hk> <{owl}sameAs> <{owl}hasKey> .");
+    for i in 1..=128 {
+        let (at, next) = (cell(i), cell(i + 1));
+        data += &format!(" {at} <{rdf}first> <{ex}p{i}> . {at} <{rdf}rest> {next} .");
+        data += &format!(" <{ex}p{i}> a <{owl}ObjectProperty> .");
+    }
+    commit(&pipeline(&store, ReasoningMode::Disabled), &data);
+    store.rematerialise(Ruleset::Owl2Rl).expect("the closure");
+    let _rules = pipeline(&store, ReasoningMode::Owl2Rl);
+    let reader = crate::ReadScope::of(Some(Arc::new(nrese_sparql::GraphAccess {
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..nrese_sparql::GraphAccess::default()
+    })));
+    let prepared =
+        (store.prepare_query(&SparqlQueryRequest::all("ASK {}".to_owned()))).expect("prepared");
+    let payload = format!("<{ex}K> <{ex}hk> <{ex}head> .\n")
+        .into_bytes()
+        .into();
+    let add = StatementsRequest::new(vec![StatementOp::Add {
+        data: crate::RdfPayload {
+            payload,
+            format: crate::GraphResultFormat::NTriples,
+            base_iri: None,
+        },
+        contexts: Vec::new(),
+    }]);
+    let memory = store.settings.query_envelope(&prepared);
+    let scan = |view: &nrese_engine::Snapshot| Ok(store.lists_left_out(view));
+    let pending = (store.with_pending(&add, &reader, &memory, &CancellationToken::new(), scan))
+        .expect("the reader's pending view");
+    let committed = store.lists_left_out(&store.engine.snapshot());
+    assert_eq!((committed, pending), (false, true), "(committed, pending)");
+}

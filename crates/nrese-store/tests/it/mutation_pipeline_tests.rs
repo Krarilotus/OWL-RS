@@ -2057,8 +2057,11 @@ fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
 /// as written. The read of `owl:hasKey` reads `:hk` and expands it, so the list scan sees a
 /// key of `:head`'s 128 properties, more than the rules build. `:x` and `:z` agree on all of
 /// them, so `:x :name :Z` is entailed: the pending read answers it, or is told the list is
-/// left out (any pending read is not `complete`). A restricted reader of the same data, whose
-/// pending read always scans its own view, shows what the scan sees. The store is filled with
+/// left out (any pending read is not `complete`). A restricted reader of the same data by
+/// support sees no inferred statement under compact equality and is told `not-certified`,
+/// no regime, no reason; the scan of its own pending view is checked in the crate's own test
+/// (`certificate_lifecycle_tests::a_readers_pending_view_scans_a_key_through_an_alias_of_has_key`).
+/// The store is filled with
 /// reasoning off and then closed under `owl2-rl`, as a store is whose user IRIs were interned
 /// before the rules' first compile (one filled with reasoning off, or preloaded): written
 /// through the `owl2-rl` pipeline first, `owl:hasKey` would be the older id and `:hk` the
@@ -2066,9 +2069,10 @@ fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
 #[test]
 fn a_pending_fact_through_an_alias_of_has_key_leaves_out_a_list_under_compact_equality() {
     let (answer, status, scanned) = alias_of_has_key(true);
-    assert!(
-        scanned.as_ref().is_some_and(list_left_out),
-        "the scan doesn't see the key: {scanned:?}"
+    assert_eq!(
+        scanned.map(|s| s.header()).as_deref(),
+        Some("not-certified"),
+        "the restricted reader"
     );
     if !answer.contains("true") {
         assert!(status.as_ref().is_some_and(list_left_out), "{status:?}");
