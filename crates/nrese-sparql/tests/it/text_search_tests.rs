@@ -594,3 +594,110 @@ fn default_graph_aliases_respect_reader_scope() {
         failed.join("\n")
     );
 }
+
+/// An engine with these Turtle statements.
+fn engine_of(turtle: &str) -> Engine {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for quad in nrese_rdf_io::RdfParser::from_format(nrese_rdf_io::RdfFormat::Turtle)
+        .for_reader(turtle.as_bytes())
+    {
+        tx.insert(quad.unwrap().as_ref());
+    }
+    tx.commit().unwrap();
+    engine
+}
+
+/// The query's answers, optimised and as written; each must be `want`.
+fn answers_as_written(engine: &Engine, shape: &str, query: &str, want: &[&[&str]]) {
+    let as_written = QueryOptions {
+        as_written: true,
+        ..QueryOptions::default()
+    };
+    for options in [&QueryOptions::default(), &as_written] {
+        let got = sorted(rows(engine, query, options));
+        let written = options.as_written;
+        assert_eq!(got, table(want), "{shape}, as_written={written}: {query}");
+    }
+}
+
+/// Spec: a search is read within the group it is written in (`search`), so a query
+/// holding one gives the answers its groups give as written: a `bds:` option in another
+/// group is a statement no data has, and a Jena call without a literal is read as
+/// statements. Each shape below is one the planner could otherwise rewrite.
+#[test]
+fn a_query_holding_a_search_answers_as_its_groups_are_written() {
+    let engine = engine_of(
+        "@prefix ex: <http://example.com/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:a rdfs:label \"alpha one\" . ex:b rdfs:label \"alpha two\" .
+         ex:t <http://jena.apache.org/text#query> ex:o . ex:m ex:p ex:n .",
+    );
+    let none: &[&[&str]] = &[];
+    for (shape, query, want) in [
+        (
+            "groups across a VALUES, an option apart",
+            "SELECT ?o ?r { { ?o bds:search \"alpha\" } VALUES ?x { 1 } { ?o bds:relevance ?r } }",
+            none,
+        ),
+        (
+            "groups across a VALUES, a Jena call apart",
+            "SELECT ?s ?t { { ?s text:query \"alpha\" } VALUES ?x { 1 } { ?t text:query [] } }",
+            &[&["a", "t"], &["b", "t"]],
+        ),
+        (
+            "an ordered subquery first, an option apart",
+            "SELECT ?o ?r { { SELECT ?k { VALUES ?k { 1 } } ORDER BY ?k } \
+             { ?o bds:search \"alpha\" } { ?o bds:relevance ?r } }",
+            none,
+        ),
+        (
+            "a SERVICE between the groups",
+            "SELECT ?o ?r { { ?o bds:search \"alpha\" } SERVICE SILENT ?e { ?a ?b ?c } \
+             { ?o bds:relevance ?r } }",
+            none,
+        ),
+        (
+            "a path between the groups",
+            "SELECT ?s ?t ?x ?y { { ?s text:query \"alpha\" } ?x ex:p+ ?y . { ?t text:query [] } }",
+            &[&["a", "t", "m", "n"], &["b", "t", "m", "n"]],
+        ),
+        (
+            "a path from the search's subject",
+            "SELECT ?s ?t ?x { { ?s text:query \"alpha\" } ?s ex:p* ?x . { ?t text:query [] } }",
+            &[&["a", "t", "a"], &["b", "t", "b"]],
+        ),
+    ] {
+        answers_as_written(&engine, shape, query, want);
+    }
+    // One pattern whose second Jena call has no literal, so it is read as statements:
+    // no statement has `text:query "alpha"`, so there is no group to count.
+    let grouped = engine_of(
+        "@prefix ex: <http://example.com/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:a rdfs:label \"alpha one\" ; ex:p ex:u .
+         ex:u <http://jena.apache.org/text#query> \"x1\", \"x2\", \"x3\", \"x4\", \"x5\",
+             \"x6\", \"x7\", \"x8\", \"x9\", \"x10\" .",
+    );
+    let query = "SELECT ?s (COUNT(?v) AS ?n) WHERE { ?s text:query \"alpha\" . ?s ex:p ?t . \
+                 ?t text:query ?v } GROUP BY ?s";
+    answers_as_written(&grouped, "a grouped pattern", query, none);
+}
+
+/// Spec: a query holding a search is evaluated as written, and a query without one keeps
+/// its plan: here join-groups still makes one pattern of two plain groups.
+#[test]
+fn only_a_query_holding_a_search_is_evaluated_as_written() {
+    let engine = engine();
+    let rewrites = |query: &str| {
+        let text = format!("{PREFIXES}{query}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        explain_query(&engine.snapshot(), &query, &QueryOptions::default())
+            .unwrap()
+            .rewrites
+    };
+    let plain = "SELECT * { { ?s rdfs:label ?o } VALUES ?x { 1 } { ?s ex:p ?u } }";
+    assert_eq!(rewrites(plain), ["join-groups"], "{plain}");
+    let search = "SELECT * { { ?o bds:search \"alpha\" } VALUES ?x { 1 } { ?s rdfs:label ?o } }";
+    assert!(rewrites(search).is_empty(), "{search}");
+}
