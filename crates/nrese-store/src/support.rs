@@ -395,6 +395,10 @@ pub struct SupportSets {
     /// Where these sets were updated from: that revision, and the facts (sorted) whose
     /// sets or presence may differ from it.
     since: Option<(u64, Shared<Kept<Triple>>)>,
+    /// Whether the program these sets were evaluated under left out a list axiom. Its
+    /// grounding reads the stored closure, every identity of an equality class apart, so it
+    /// can leave out a list the publication's grounding built: its views aren't vouched for.
+    lists_left_out: bool,
 }
 
 /// The facts of a revision's closure, read for an evaluation, charged to the reading
@@ -534,8 +538,9 @@ impl SupportSets {
         )
         .map_err(|stopped| following.failure(stopped))?;
         let schema = ground.schema_premises();
+        let lists_left_out = !ground.list_diagnostics.is_empty();
         drop(ground);
-        Ok(Self::retain(
+        let sets = Self::retain(
             graphs,
             &by_fact,
             &closure.asserted,
@@ -543,7 +548,11 @@ impl SupportSets {
             &schema,
             cap,
             kept,
-        )?)
+        )?;
+        Ok(Self {
+            lists_left_out,
+            ..sets
+        })
     }
 
     /// The sets of an evaluation (`by_fact`, every fact of a closure under a program
@@ -645,6 +654,7 @@ impl SupportSets {
             axioms: Shared::new(kept_axioms, kept)?,
             schema: Shared::new(kept_schema, kept)?,
             since: None,
+            lists_left_out: false,
         })
     }
 
@@ -743,6 +753,7 @@ impl SupportSets {
                 Ok(None) => return Ok(None),
                 Err(stopped) => return Err(following.failure(stopped)),
             };
+        let lists_left_out = !ground.list_diagnostics.is_empty();
         drop(ground);
         // Whether a recomputed fact has only the sets it starts with, from its graphs as
         // `snapshot` holds them (one read at a time, its working memory reserved).
@@ -923,6 +934,7 @@ impl SupportSets {
             axioms: self.axioms.clone(),
             schema: self.schema.clone(),
             since: Some((from, Shared::new(changed, kept)?)),
+            lists_left_out,
         };
         if updated.overlay.entries.len() > MAX_OVERLAY.max(updated.base.len() / 16) {
             updated.fold(kept)?;
@@ -2362,7 +2374,10 @@ impl Supports {
                                 &working,
                             )
                         }
-                        (Ok(_), _) => Ok(snapshot.with_inferred_only(&[], &self.kept)?),
+                        // No sets (compact equality, or no rules): not the reader's closure.
+                        (Ok(_), _) => Ok(snapshot
+                            .with_inferred_only(&[], &self.kept)?
+                            .withheld_within(&self.kept)?),
                         (Err(unavailable), _) => Err(*unavailable),
                     }
                 }
@@ -2371,6 +2386,10 @@ impl Supports {
                         self.compute_rederived(snapshot, &generation, compilation, &working)
                     });
                     match found {
+                        // Compact restores nothing a reader can't read: not its closure.
+                        Ok(found) if compilation.compact => Ok(self
+                            .visible_view(snapshot, access, found, &working)?
+                            .withheld_within(&self.kept)?),
                         Ok(found) => self.visible_view(snapshot, access, found, &working),
                         Err(unavailable) => Err(*unavailable),
                     }
@@ -2741,6 +2760,11 @@ impl Supports {
                 .with_inferred_mask(mask, &self.kept)?
                 .expect("a mask built for this stack's layout"),
             Form::Only(list) => snapshot.with_inferred_only(list, &self.kept)?,
+        };
+        // Sets under a program that left out a list may lack what the publication holds.
+        let view = match sets.lists_left_out {
+            true => view.withheld_within(&self.kept)?,
+            false => view,
         };
         working.go_on()?;
         let reader = Shared::new(

@@ -849,6 +849,19 @@ impl Snapshot {
         Ok(Some(self.restricted(inferred, held, of)))
     }
 
+    /// This snapshot with no certificate, never published, for a view its maker can't vouch
+    /// for (a reader's view that may not be its closure): the same stacks, a version of its
+    /// own. What it makes is charged to `budget` first and held by the view.
+    pub fn withheld_within(
+        &self,
+        budget: &Arc<nrese_exec::Budget>,
+    ) -> Result<Snapshot, nrese_exec::BudgetExceeded> {
+        let mut held = nrese_exec::Reservation::new(Arc::clone(budget));
+        held.charge(Self::restricted_bytes() + Held::overhead(self.held.count()))?;
+        let held = Held::new(self.held.with(0), held);
+        Ok(self.restricted(self.version.inferred.clone(), held, ViewOf::Withheld))
+    }
+
     /// What [`Self::restricted`] allocates for a view: its version, equality cell and
     /// statistics.
     fn restricted_bytes() -> usize {
@@ -877,8 +890,8 @@ impl Snapshot {
             canonical: Default::default(),
             own: Default::default(),
             // A restriction or a derivation: the source's, as it is published as its source
-            // is. An addition: statements no one vouched for.
-            certificate: (!matches!(of, ViewOf::Addition))
+            // is. An addition: statements no one vouched for. Withheld: its maker's word.
+            certificate: matches!(of, ViewOf::Restriction | ViewOf::Derived)
                 .then(|| self.version.certificate.clone())
                 .flatten(),
         });
@@ -891,7 +904,7 @@ impl Snapshot {
             vocabulary: self.vocabulary.clone(),
             published: match of {
                 ViewOf::Restriction | ViewOf::Derived => self.published,
-                ViewOf::Addition => false,
+                ViewOf::Addition | ViewOf::Withheld => false,
             },
             statistics: Arc::new(self.statistics.for_view()),
             equality: self.equality,
@@ -2741,6 +2754,9 @@ enum ViewOf {
     /// Statements the source's own DL bounds derive from it alone
     /// ([`Snapshot::with_inferred_derived_within`]).
     Derived,
+    /// The source's statements, which its maker doesn't vouch for
+    /// ([`Snapshot::withheld_within`]).
+    Withheld,
 }
 
 /// Why a [`Snapshot`]'s search gave no answer: a refusal, never an empty answer.
