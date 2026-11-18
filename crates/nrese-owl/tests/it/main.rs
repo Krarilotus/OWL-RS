@@ -3,6 +3,7 @@
 //! on a sample ontology and on random ones.
 
 mod functional;
+mod order;
 
 use std::collections::HashMap;
 
