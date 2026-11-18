@@ -111,6 +111,11 @@ pub struct Ontology {
     /// `rdfs:Literal` too), which OWL 2 RL's rules don't read: its range can't tell it from
     /// an unqualified maximum.
     pub qualified_data_max: Option<Term>,
+    /// The first statement OWL 2 RL's rules don't read, by its subject, that the reader read
+    /// as axioms they would read: a disjoint union whose operands read as one (no rule reads
+    /// `owl:disjointUnionOf`), read as an equivalence and an empty operand. Every later
+    /// rewrite of that kind sets it too.
+    pub rules_unread: Option<Term>,
 }
 
 /// The properties OWL 2 gives a fixed meaning, by their ids in the source (`None` where
@@ -434,6 +439,7 @@ struct Reader<'a> {
     annotations: usize,
     noncanonical_cardinality: Option<Term>,
     empty_list: Option<Term>,
+    rules_unread: Option<Term>,
     annotation_schema: Vec<Term>,
     shacl: BTreeSet<Term>,
 }
@@ -620,6 +626,7 @@ impl<'a> Reader<'a> {
             annotations: 0,
             noncanonical_cardinality: None,
             empty_list: None,
+            rules_unread: None,
             annotation_schema: Vec::new(),
             shacl: BTreeSet::new(),
         }
@@ -1400,8 +1407,9 @@ impl<'a> Reader<'a> {
 
     // Axioms ---------------------------------------------------------------------------
 
-    /// A disjointness's axioms (`Disjoint::axioms`): a repeated operand reported.
-    fn disjoint(&mut self, d: Disjoint, triple: [Term; 3]) {
+    /// A disjointness's axioms (`Disjoint::axioms`): a repeated operand reported. Whether
+    /// one was.
+    fn disjoint(&mut self, d: Disjoint, triple: [Term; 3]) -> bool {
         let (axioms, repeated) = d.axioms(&mut self.classes, &mut self.ranges);
         if repeated {
             self.report(Diagnostic::RepeatedOperand);
@@ -1409,6 +1417,7 @@ impl<'a> Reader<'a> {
         for a in axioms {
             self.add(a, triple);
         }
+        repeated
     }
 
     fn add(&mut self, axiom: Axiom, triple: [Term; 3]) {
@@ -1653,8 +1662,10 @@ impl<'a> Reader<'a> {
                         node: s,
                         what: "a disjoint union of fewer than two classes",
                     });
-                } else {
-                    self.disjoint(Disjoint::Union(class, classes), triple);
+                } else if self.disjoint(Disjoint::Union(class, classes), triple) {
+                    // A repeat, or one distinct operand left: read as axioms the rules would
+                    // read ([`Ontology::rules_unread`]).
+                    self.rules_unread.get_or_insert(s);
                 }
             }
         } else if is(p, v.rdfs_sub_property_of) {
@@ -1968,6 +1979,7 @@ impl<'a> Reader<'a> {
             noncanonical_cardinality: self.noncanonical_cardinality,
             empty_list: self.empty_list,
             qualified_data_max: self.qualified_data_max,
+            rules_unread: self.rules_unread,
         };
         complete(&mut ontology, self.terms);
         ontology
