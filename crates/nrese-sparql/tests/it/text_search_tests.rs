@@ -701,3 +701,85 @@ fn only_a_query_holding_a_search_is_evaluated_as_written() {
     let search = "SELECT * { { ?o bds:search \"alpha\" } VALUES ?x { 1 } { ?s rdfs:label ?o } }";
     assert!(rewrites(search).is_empty(), "{search}");
 }
+
+/// One label, "alpha one", and no `bds:` statement.
+fn alpha_engine() -> Engine {
+    engine_of(
+        "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         <http://example.com/a> rdfs:label \"alpha one\" .",
+    )
+}
+
+/// The number of `query`'s answers.
+fn count(engine: &Engine, query: &nrese_sparql_syntax::Query, options: &QueryOptions) -> usize {
+    match evaluate_query(&engine.snapshot(), query, options).unwrap() {
+        QueryResults::Solutions(solutions) => solutions.count(),
+        _ => panic!("solutions"),
+    }
+}
+
+fn parsed(query: &str) -> nrese_sparql_syntax::Query {
+    let text = format!("{PREFIXES}{query}");
+    SparqlParser::new()
+        .parse_query(&text)
+        .unwrap_or_else(|e| panic!("{e}: {text}"))
+}
+
+/// Spec: a search whose literal `pre_bound` puts in is read within its group as a written
+/// one is: the `bds:` option in the other group is a statement no data has, so no answer.
+#[test]
+fn a_pre_bound_search_keeps_its_groups() {
+    let values = std::collections::HashMap::from([(
+        nrese_rdf::Variable::new_unchecked("q"),
+        Term::from(Literal::new_simple_literal("alpha")),
+    )]);
+    let options = QueryOptions {
+        pre_bound: Some(std::sync::Arc::new(values)),
+        ..QueryOptions::default()
+    };
+    let query = "SELECT ?o ?r { { ?o bds:search ?q } VALUES ?x { 1 } { ?o bds:relevance ?r } }";
+    let found = count(&alpha_engine(), &parsed(query), &options);
+    assert_eq!(found, 0, "{query}");
+}
+
+/// Spec: a search whose literal a `LATERAL`'s binding puts in is read within its group as
+/// a written one is: the `bds:` option in the other group matches nothing, so no answer.
+#[test]
+fn a_search_bound_by_a_lateral_keeps_its_groups() {
+    let query = "SELECT ?o ?r { VALUES ?q { \"alpha\" } \
+                 LATERAL { { ?o bds:search ?q } VALUES ?x { 1 } { ?o bds:relevance ?r } } }";
+    let options = QueryOptions::default();
+    let found = count(&alpha_engine(), &parsed(query), &options);
+    assert_eq!(found, 0, "{query}");
+}
+
+/// Spec: a SERVICE beside one local input keeps that input's groups apart: the `bds:`
+/// option in the second group matches nothing, so no answer. No text writes this input,
+/// a join of two groups (the parser makes one group of `{ {A} {B} }`); the algebra does.
+#[test]
+fn a_service_beside_one_joined_input_keeps_its_groups() {
+    use nrese_sparql_syntax::algebra::GraphPattern;
+    let mut query = parsed(
+        "SELECT ?o ?r { { ?o bds:search \"alpha\" } VALUES ?x { 1 } { ?o bds:relevance ?r } \
+         SERVICE SILENT ?e { ?a ?b ?c } }",
+    );
+    let nrese_sparql_syntax::Query::Select { pattern, .. } = &mut query else {
+        panic!("a SELECT")
+    };
+    let GraphPattern::Project { inner, .. } = pattern else {
+        panic!("a projection: {pattern:?}")
+    };
+    let GraphPattern::Join { inputs } = &mut **inner else {
+        panic!("a join: {inner:?}")
+    };
+    let groups: Vec<GraphPattern> = inputs
+        .iter()
+        .filter(|input| matches!(input, GraphPattern::Bgp { .. }))
+        .cloned()
+        .collect();
+    let service = inputs.pop().expect("the SERVICE last");
+    assert!(matches!(service, GraphPattern::Service { .. }) && groups.len() == 2);
+    *inputs = vec![GraphPattern::Join { inputs: groups }, service];
+    let options = QueryOptions::default();
+    assert_eq!(count(&alpha_engine(), &query, &options), 0, "{query:?}");
+}
