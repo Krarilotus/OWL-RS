@@ -226,6 +226,7 @@ pub(super) fn refuted_by_labels(
 ) -> nrese_exec::ChargedVec<bool, nrese_exec::Envelope> {
     use nrese_dl::tableau::{Answer, Cancel, Label, Want};
     let config = &store.config().dl;
+    let memory = &memory.optional();
     let stop = || cancellation.is_cancelled() || deadline.passed();
     let none = || nrese_exec::ChargedVec::new(memory.clone());
     if stop() {
