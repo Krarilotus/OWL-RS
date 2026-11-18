@@ -160,3 +160,54 @@ fn named_inverses_keep_the_commits_plan() {
         }
     }
 }
+
+/// Spec: `ReflexiveObjectProperty(ObjectInverseOf(:p))` (§9.2.9) relates every individual
+/// to itself by the inverse, so with its domain `:C` a declared individual `:a` is in `:C`,
+/// also where the domain comes in a later commit. Only OWL 2 QL's rules here have
+/// reflexivity (prp-refl-i, a rule whose head's predicate is a variable).
+#[test]
+fn a_reflexive_inverse_expressions_domain_from_a_later_commit_reaches_its_facts() {
+    for equality in ["representatives", "replicate", "compact"] {
+        let [once, two, rebuilt] = three_ways(
+            ReasoningMode::Owl2Ql,
+            equality,
+            "_:i owl:inverseOf :p ; a owl:ReflexiveProperty . :a a owl:NamedIndividual .",
+            "INSERT { ?i rdfs:domain :C } WHERE { ?i owl:inverseOf :p }",
+            ":a a :C",
+        );
+        assert!(once.0, "{equality}: at once {once:?}");
+        assert_eq!(two, once, "{equality}: after two commits, against at once");
+        assert_eq!(
+            rebuilt, once,
+            "{equality}: after a rebuild, against at once"
+        );
+    }
+}
+
+/// Spec: `:x a owl:Nothing` is inconsistent (OWL 2 Direct Semantics §2.3.1; cls-nothing2,
+/// OWL 2 Profiles §4.3, table 7), also in a store that holds an inverse expression: the
+/// commit that asserts it is refused, as a commit is that a rebuild follows.
+#[test]
+fn a_clash_after_an_inverse_expression_is_refused() {
+    for mode in [
+        ReasoningMode::Owl2Ql,
+        ReasoningMode::Owl2Rl,
+        ReasoningMode::Owl2Dl,
+    ] {
+        for equality in ["representatives", "replicate", "compact"] {
+            let history = store(equality);
+            let writer = pipeline(&history, mode);
+            update(&writer, "INSERT DATA { _:i owl:inverseOf :p . :a :p :b . }");
+            let refused = writer.apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                    "{PREFIXES}INSERT DATA {{ :x a owl:Nothing }}"
+                ))),
+                &Requester::all(),
+                &MutationTicket::new(),
+            );
+            let label = format!("{}, {equality}", mode.as_str());
+            let e = format!("{:?}", refused.expect_err(&label));
+            assert!(e.contains("Inconsistent"), "{label}: refused as {e}");
+        }
+    }
+}
