@@ -595,6 +595,46 @@ fn consistent_answers_are_certified() {
     );
 }
 
+/// Spec (*OWL 2 Direct Semantics* Table 6: `DisjointUnion(C C1 … Cn)` holds where `C`'s
+/// extension is the union of the `Ci`'s and they are pairwise disjoint; Table 2: `owl:Thing` is
+/// the domain, `owl:Nothing` empty): the certificate checker accepts a model of a disjoint union
+/// on `owl:Thing` whose parts cover the domain, and refuses one whose parts leave an element
+/// out, and one with an element of a part of a disjoint union on `owl:Nothing`, whatever a class
+/// named by those IRIs holds in the interpretation. Each case's failing axioms printed.
+#[test]
+fn the_certificate_reads_a_disjoint_union_on_the_top_or_bottom_class_as_that_class() {
+    const OWL: &str = "http://www.w3.org/2002/07/owl#";
+    const EX: &str = "http://example.org/";
+    let mut wrong = Vec::new();
+    for (axiom, model, a_model) in [
+        (
+            "DisjointUnion(owl:Thing ex:A ex:B)",
+            format!("2 elements; <{EX}A> = {{0}}; <{EX}B> = {{1}}"),
+            true,
+        ),
+        (
+            "DisjointUnion(owl:Thing ex:A ex:B)",
+            format!("2 elements; <{EX}A> = {{0}}; <{EX}B> = {{}}; <{OWL}Thing> = {{0}}"),
+            false,
+        ),
+        (
+            "DisjointUnion(owl:Nothing ex:A ex:B)",
+            format!("1 element; <{EX}A> = {{0}}; <{EX}B> = {{}}; <{OWL}Nothing> = {{0}}"),
+            false,
+        ),
+    ] {
+        let mut table = Table::default();
+        let o = (table.functional(&format!("Prefix(ex:=<{EX}>) Ontology({axiom})")))
+            .expect("OWL 2 DL, no fatal diagnostic");
+        let failing = nrese_dl::certificate::failures(&o, &witness(&model, &table));
+        eprintln!("CERTIFICATE {axiom} under {model}: fails {failing:?}");
+        if failing.as_ref().map(Vec::is_empty) != Ok(a_model) {
+            wrong.push(format!("{axiom} under {model}: fails {failing:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The witness of every disputed test is a model of its premise.
 #[test]
 fn disputed_witnesses_are_models() {
