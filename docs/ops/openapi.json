@@ -4892,7 +4892,7 @@
                 }
               }
             },
-            "description": "`inference-scope=dataset` where this server can't serve it: `reasoner.equality = \"compact\"`, no support sets for the rules in force, a text or vector search, or a computed spatial relation"
+            "description": "`inference-scope=dataset` where this server can't serve it: `reasoner.equality = \"compact\"`, `reasoner.unnamed_classes = \"skip\"`, no support sets for the rules in force, a text or vector search, or a computed spatial relation"
           },
           "503": {
             "content": {
@@ -5100,7 +5100,7 @@
                 }
               }
             },
-            "description": "`inference-scope=dataset` where this server can't serve it: `reasoner.equality = \"compact\"`, no support sets for the rules in force, a text or vector search, or a computed spatial relation"
+            "description": "`inference-scope=dataset` where this server can't serve it: `reasoner.equality = \"compact\"`, `reasoner.unnamed_classes = \"skip\"`, no support sets for the rules in force, a text or vector search, or a computed spatial relation"
           },
           "503": {
             "content": {
@@ -6248,7 +6248,7 @@
                 }
               }
             },
-            "description": "`inference-scope=dataset` where this server can't serve it: `reasoner.equality = \"compact\"`, no support sets for the rules in force, a text or vector search, or a computed spatial relation"
+            "description": "`inference-scope=dataset` where this server can't serve it: `reasoner.equality = \"compact\"`, `reasoner.unnamed_classes = \"skip\"`, no support sets for the rules in force, a text or vector search, or a computed spatial relation"
           },
           "503": {
             "content": {
