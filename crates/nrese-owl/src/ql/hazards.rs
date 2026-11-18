@@ -64,9 +64,11 @@ pub enum Hazard {
     /// ([`reads_data_values`]), or a property not declared an object property in a key or
     /// a disjointness, which may be one: global.
     DataValues(Term),
-    /// A restriction whose cardinality isn't spelled as the RDF mapping writes it
-    /// ([`Ontology::noncanonical_cardinality`]), which OWL 2 RL's rules don't read: global.
-    CardinalitySpelling(Term),
+    /// What the closure's rules don't read as the RDF mapping does: under OWL 2 RL's, a
+    /// restriction whose cardinality isn't spelled as the mapping writes it
+    /// ([`Ontology::noncanonical_cardinality`]); under either, an empty intersection or union
+    /// ([`Ontology::empty_list`]): global.
+    Unread(Term),
 }
 
 /// A data property whose values OWL 2 RL's rules would compare or type, where the rule
@@ -117,7 +119,7 @@ impl Hazard {
             | Self::OutsideProfile(t)
             | Self::Dropped(t)
             | Self::DataValues(t)
-            | Self::CardinalitySpelling(t) => t,
+            | Self::Unread(t) => t,
             Self::Equating => return None,
         })
     }
@@ -172,9 +174,10 @@ impl Hazard {
                  and dt-type2: one value in two lexical forms isn't matched, nor a value's \
                  datatype read"
             ),
-            Self::CardinalitySpelling(_) => format!(
-                "the cardinality at {t} isn't written as the RDF mapping writes it, and the \
-                 rules read only the mapping's spelling (\"0\" or \"1\"^^xsd:nonNegativeInteger)"
+            Self::Unread(_) => format!(
+                "the rules don't read {t} as the RDF mapping does: a cardinality they read only \
+                 in the mapping's spelling (\"0\" or \"1\"^^xsd:nonNegativeInteger), or an \
+                 empty intersection or union"
             ),
         }
     }
@@ -380,6 +383,8 @@ pub(crate) fn hazards(
     // unread (`open_axiom`): their right sides' terms, and an enumerated individual.
     let mut open: Vec<Term> = Vec::new();
     let mut open_individual: Option<Term> = None;
+    // An individual asserted into an anonymous expression the closure doesn't apply.
+    let mut asserted_outside: Option<Hazard> = None;
     // Whether such an axiom concludes an existential: anonymous individuals of its own.
     let mut open_generates = false;
     // The terms of expressions individuals are asserted to be in, with an existential.
@@ -505,7 +510,16 @@ pub(crate) fn hazards(
                 found.extend(ops.iter().map(|p| Hazard::Key(p.named())));
                 found.extend(dps.iter().map(|&p| Hazard::Key(p)));
             }
-            Axiom::ClassAssertion(c, _) if !matches!(o.class(*c), ClassExpr::Class(_)) => {
+            Axiom::ClassAssertion(c, a) if !matches!(o.class(*c), ClassExpr::Class(_)) => {
+                // OWL 2 QL asserts named classes only (OWL 2 Profiles §3.2.5), and the
+                // rewriting answers a class through its named subclasses: where the
+                // closure's rules don't apply the expression, any read may miss what it
+                // entails, a contradiction included. Named by the expression's first term,
+                // which no change of its members alone changes.
+                if !(rl && crate::profile::rl_super(o, *c)) {
+                    let named = expr_terms(*c).first().copied().unwrap_or(*a);
+                    asserted_outside.get_or_insert(Hazard::OutsideProfile(named));
+                }
                 let mut roles = Vec::new();
                 existential_roles(o, *c, &mut roles);
                 // The anonymous individuals it makes are in its fillers' classes too.
@@ -697,7 +711,7 @@ pub(crate) fn hazards(
         global = open_individual.map(Hazard::OpenLeft);
     }
     if global.is_none() {
-        global = outside_global;
+        global = outside_global.or(asserted_outside);
     }
     // What named individuals may miss of uncovered axioms' conclusions, along every axiom
     // from premise to conclusion (design note "Source 3"). A seed doesn't follow its own

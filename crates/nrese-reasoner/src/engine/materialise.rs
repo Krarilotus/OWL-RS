@@ -153,6 +153,7 @@ fn closure_with(
             &result.derived,
             program.rdf_type,
             program.same_as,
+            program.store_representatives.then_some(&result.classes),
             &|id| snapshot.decode(TermId::from_raw(id)),
             memory,
         ));

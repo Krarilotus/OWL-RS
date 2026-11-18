@@ -1,5 +1,6 @@
 //! The `owl2-dl` mode (docs/design/owl2-dl.md §8), through the store's normal interfaces.
 
+mod annotations;
 mod answer_domain;
 mod bounds;
 mod cache_admission;
@@ -25,6 +26,7 @@ mod review;
 mod routing;
 mod safety;
 mod speculative;
+mod symmetric_chains;
 mod u1_limits;
 mod undecided;
 mod versions;

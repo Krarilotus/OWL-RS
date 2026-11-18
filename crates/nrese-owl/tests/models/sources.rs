@@ -246,3 +246,60 @@ fn a_shared_automaton_has_each_axiom_that_uses_it_as_a_source() {
     ];
     assert_rows(&n, &[ia, ib, ic], &rows);
 }
+
+/// A chain into a symmetric role (*OWL 2 Direct Semantics* §2.3.2, Table 6): with
+/// `Symmetric(R)` (0), `P Q ⊑ R` (1), `R`'s range `C` (2), `P(x, b)` (3) and `Q(b, z)` (4),
+/// `R(x, z)` gives `C(z)` without symmetry, and `R(z, x)`, so `C(x)`, only with it: the
+/// model `R = {(x, z)}`, `C = {z}` of 1–4 has `x` outside `C`. With `Symmetric(S)` (5),
+/// `Transitive(S)` (6), `A ⊑ ∀S.D` (7), `A(u)` (8), `S(u, v)` (9) and `S(v, w)` (10):
+/// transitivity alone gives `S(u, w)`, so `D(w)`; `S(u, u)` needs both, so `D(u)`.
+#[test]
+fn a_chain_into_a_symmetric_role_needs_the_symmetry_for_its_first_end() {
+    let (cc, ca, cd, p, q, r, s) = (1, 2, 3, 10, 11, 12, 13);
+    let (x, b, z, u, v, w) = (100, 101, 102, 103, 104, 105);
+    let mut o = Ontology::default();
+    let (ec, ea, ed) = (class(&mut o, cc), class(&mut o, ca), class(&mut o, cd));
+    let all = expr(&mut o, ClassExpr::All(ObjProp::Named(s), ed));
+    let n = normalised(
+        o,
+        vec![
+            Axiom::ObjectCharacteristic(Characteristic::Symmetric, ObjProp::Named(r)),
+            Axiom::SubObjectPropertyOf(
+                vec![ObjProp::Named(p), ObjProp::Named(q)],
+                ObjProp::Named(r),
+            ),
+            Axiom::ObjectPropertyRange(ObjProp::Named(r), ec),
+            Axiom::ObjectPropertyAssertion(p, x, b),
+            Axiom::ObjectPropertyAssertion(q, b, z),
+            Axiom::ObjectCharacteristic(Characteristic::Symmetric, ObjProp::Named(s)),
+            Axiom::ObjectCharacteristic(Characteristic::Transitive, ObjProp::Named(s)),
+            Axiom::SubClassOf(ea, all),
+            Axiom::ClassAssertion(ea, u),
+            Axiom::ObjectPropertyAssertion(s, u, v),
+            Axiom::ObjectPropertyAssertion(s, v, w),
+        ],
+    );
+    let rows: [Row; 4] = [
+        (
+            &[0, 1, 2, 3, 4],
+            &[1, 2, 3, 4],
+            Fact::Concept(Concept::Named(cc), x),
+        ),
+        (
+            &[1, 2, 3, 4],
+            &[2, 3, 4],
+            Fact::Concept(Concept::Named(cc), z),
+        ),
+        (
+            &[6, 7, 8, 9, 10],
+            &[7, 8, 9, 10],
+            Fact::Concept(Concept::Named(cd), w),
+        ),
+        (
+            &[5, 6, 7, 8, 9],
+            &[6, 7, 8, 9],
+            Fact::Concept(Concept::Named(cd), u),
+        ),
+    ];
+    assert_rows(&n, &[x, b, z, u, v, w], &rows);
+}

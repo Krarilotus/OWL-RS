@@ -25,8 +25,8 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use nrese_reasoner::rulesets::Ruleset;
 use nrese_sparql::Completeness;
 use nrese_store::{
-    BulkLoadRequest, GraphTarget, SolutionsResultFormat, SparqlQueryRequest, StoreConfig,
-    StoreService,
+    BulkLoadRequest, ConsistencyStatus, GraphTarget, QlRewritingMode, SolutionsResultFormat,
+    SparqlQueryRequest, StoreConfig, StoreService,
 };
 
 const E: &str = "http://e/";
@@ -2722,4 +2722,381 @@ fn restricted_readers_get_nothing_from_graphs_they_cant_read() {
         "SELECT ?x WHERE { ?x a <http://e/Person> FILTER NOT EXISTS { ?x <http://e/helps> [] } }";
     assert_eq!(ask(idle, ReadScope::All), Vec::<String>::new());
     assert_eq!(ask(idle, supported), ["<bob>"]);
+}
+
+/// The quarantine cells' store: `:A` and `:B` disjoint, `:y` an `:A`, and, unless `clean`, `:x`
+/// both an `:A` and a `:B` (a clash the ruleset's `cax-dw` finds), loaded past the pipeline as a
+/// bulk load does, then reasoned under `ruleset` with the QL rewriting set to `ql`.
+fn quarantine_case(ruleset: Ruleset, ql: QlRewritingMode, clean: bool) -> StoreService {
+    let clash = if clean { "" } else { ":x a :A , :B ." };
+    quarantine_store(ruleset, ql, clash)
+}
+
+/// [`quarantine_case`]'s store with `more` in place of the clash.
+fn quarantine_store(ruleset: Ruleset, ql: QlRewritingMode, more: &str) -> StoreService {
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: ql,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    crate::support::load_past_the_pipeline(
+        &store,
+        &format!(
+            "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+             :A owl:disjointWith :B . :y a :A . {more}"
+        ),
+    );
+    store.rematerialise(ruleset).unwrap();
+    store
+}
+
+/// `query` (prefix `:` declared) on `store` for a reader of `scope`, which the QL rewriting must
+/// answer (setup: its report present): the read's status header (`none` without a status) and
+/// the status's reasons' texts.
+fn rewritten_read(
+    store: &StoreService,
+    query: &str,
+    scope: nrese_store::ReadScope,
+) -> (String, Vec<String>) {
+    let mut request = SparqlQueryRequest::new(format!("PREFIX : <{E}> {query}"), scope);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    let result = store.execute_query(&request).unwrap();
+    let status = (result.completeness.as_ref()).map_or_else(|| "none".to_owned(), |s| s.header());
+    assert!(
+        result.ql.is_some(),
+        "setup: the QL rewriting didn't answer ({status})"
+    );
+    let reasons = (result.completeness.into_iter())
+        .flat_map(|s| s.reasons.into_iter().map(|r| r.text))
+        .collect();
+    (status, reasons)
+}
+
+/// `SELECT ?x { ?x a :A }` on `store` by a reader of every graph: [`rewritten_read`]'s header.
+fn rewritten_read_of_a(store: &StoreService) -> String {
+    rewritten_read(store, "SELECT ?x { ?x a :A }", nrese_store::ReadScope::All).0
+}
+
+/// The status's first word: `complete`, `sound-only`, `unsound`, `not-certified` or `none`.
+fn status_class(header: &str) -> &str {
+    header.split(';').next().unwrap_or(header)
+}
+
+/// Setup of a quarantine cell: the rematerialisation found the clash, so the store is in
+/// quarantine, its data inconsistent under the recorded reasoning.
+fn assert_quarantined(store: &StoreService) {
+    let consistency = store.consistency();
+    let inconsistent = matches!(consistency, ConsistencyStatus::Inconsistent { .. });
+    assert!(
+        store.is_quarantined() && inconsistent,
+        "setup: the store isn't in quarantine: {consistency:?}"
+    );
+}
+
+/// Setup of a control: the data is consistent, the store not in quarantine.
+fn assert_clean(store: &StoreService) {
+    let consistency = store.consistency();
+    let consistent = matches!(consistency, ConsistencyStatus::Consistent);
+    assert!(
+        !store.is_quarantined() && consistent,
+        "setup: the store isn't clean: {consistency:?}"
+    );
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"): `complete` means no
+/// certain answer under the OWL 2 Direct Semantics is missing; inconsistent data entail every
+/// answer, so a read of a store in quarantine under `owl2-ql` that the QL rewriting answers is
+/// never told `complete`.
+#[test]
+fn a_rewritten_read_over_a_store_in_quarantine_under_owl2_ql_is_not_complete() {
+    let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, false);
+    assert_quarantined(&store);
+    let status = rewritten_read_of_a(&store);
+    assert_ne!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec: as under `owl2-ql`, under `owl2-rl` with the QL rewriting on: a read of a store in
+/// quarantine that the rewriting answers is never told `complete`.
+#[test]
+fn a_rewritten_read_over_a_store_in_quarantine_under_owl2_rl_is_not_complete() {
+    let store = quarantine_case(Ruleset::Owl2Rl, QlRewritingMode::On, false);
+    assert_quarantined(&store);
+    let status = rewritten_read_of_a(&store);
+    assert_ne!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"): on clean data under
+/// `owl2-ql`, a read the QL rewriting ran on, of a named class of the data's own, is `complete`.
+/// The control of the `owl2-ql` quarantine cell.
+#[test]
+fn a_rewritten_read_over_clean_data_under_owl2_ql_is_complete() {
+    let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, true);
+    assert_clean(&store);
+    let status = rewritten_read_of_a(&store);
+    assert_eq!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec: as under `owl2-ql`, under `owl2-rl` with the rewriting on. The control of the `owl2-rl`
+/// quarantine cell.
+#[test]
+fn a_rewritten_read_over_clean_data_under_owl2_rl_is_complete() {
+    let store = quarantine_case(Ruleset::Owl2Rl, QlRewritingMode::On, true);
+    assert_clean(&store);
+    let status = rewritten_read_of_a(&store);
+    assert_eq!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to", its operators: "where
+/// answers may be missing, … `MINUS` … make them `unsound`"): over a store in quarantine under
+/// `owl2-ql`, answers may be missing, so a `MINUS` read the QL rewriting answers is `unsound`.
+#[test]
+fn a_negated_read_over_a_store_in_quarantine_under_owl2_ql_is_unsound() {
+    let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, false);
+    assert_quarantined(&store);
+    let query = "SELECT ?x { ?x a :A MINUS { ?x a :B } }";
+    let (status, _) = rewritten_read(&store, query, nrese_store::ReadScope::All);
+    assert_eq!(status_class(&status), "unsound", "status: {status}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"; "Consistency": `/readyz`
+/// tells anyone `quarantined`): a reader of some graphs whose read the QL rewriting answers over
+/// a store in quarantine under `owl2-ql` is never told `complete` either, and is told why in
+/// fixed words: the store is in quarantine, and nothing of the clash.
+#[test]
+fn a_reader_of_some_graphs_over_a_store_in_quarantine_under_owl2_ql_is_not_complete() {
+    let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, false);
+    assert_quarantined(&store);
+    store.use_reasoning_rules(Some(Ruleset::Owl2Ql.into()));
+    let reader = nrese_store::ReadScope::Graphs(std::sync::Arc::new(nrese_sparql::GraphAccess {
+        graphs: vec![format!("{E}open")],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..nrese_sparql::GraphAccess::default()
+    }));
+    let (status, reasons) = rewritten_read(&store, "SELECT ?x { ?x a :A }", reader);
+    assert_ne!(status_class(&status), "complete", "status: {status}");
+    let fixed = "the store is in quarantine (the consistency rules found violations and have \
+                 not found the data clean since), and as inconsistent data entail every answer, \
+                 no read is certified complete until it leaves";
+    let told = reasons.iter().any(|r| r == fixed);
+    assert!(told, "status: no reason {fixed:?} in {reasons:?}");
+}
+
+/// The annotation cells' store: `data` (prefixes `:`, `owl:` and `rdfs:` declared; TriG, so
+/// graphs may be named) loaded past the pipeline, then reasoned under `ruleset` with the QL
+/// rewriting set to `ql`, its support sets kept for readers by support.
+fn annotation_store(ruleset: Ruleset, ql: QlRewritingMode, data: &str) -> StoreService {
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: ql,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    crate::support::load_past_the_pipeline(
+        &store,
+        &format!(
+            "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n{data}"
+        ),
+    );
+    store.rematerialise(ruleset).unwrap();
+    store.use_reasoning_rules(Some(ruleset.into()));
+    store
+}
+
+/// A declared `:note` on `:x`, which equals `:y`: `eq-rep-s` copies the note to `:y`.
+const EQUAL: &str = ":note a owl:AnnotationProperty . :x :note \"a\" . :x owl:sameAs :y .";
+
+/// Two annotation properties, one under the other: `prp-spo1` copies `:x :sub "a"` to `:super`.
+const SUB: &str = ":sub a owl:AnnotationProperty . :super a owl:AnnotationProperty . \
+                   :sub rdfs:subPropertyOf :super . :x :sub \"a\" .";
+
+/// The rows of `query` (prefix `:` declared) on `store` for a reader of `scope`, as TSV lines.
+fn rows_of(store: &StoreService, query: &str, scope: nrese_store::ReadScope) -> Vec<String> {
+    let mut request = SparqlQueryRequest::new(format!("PREFIX : <{E}> {query}"), scope);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    let payload = store.execute_query(&request).unwrap().payload;
+    String::from_utf8(payload)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to": under `owl2-ql` and
+/// `owl2-rl` with the QL rewriting, `complete` is the OWL 2 Direct Semantics'; Direct
+/// Semantics §2, annotations have no meaning; the ruling of 17 Nov 19:39): a read the
+/// rewriting answers that may return the rules' copy of an annotation statement is `unsound`,
+/// in its run, its EXPLAIN and its plan: `eq-rep-s`'s under `owl2-rl`, `prp-spo1`'s under
+/// `owl2-ql`.
+#[test]
+fn a_rewritten_read_that_may_return_a_copied_annotation_is_unsound() {
+    let mut wrong = Vec::new();
+    for (ruleset, ql, data, query, copy) in [
+        (
+            Ruleset::Owl2Rl,
+            QlRewritingMode::On,
+            EQUAL,
+            "SELECT ?s ?o { ?s :note ?o }",
+            "y",
+        ),
+        (
+            Ruleset::Owl2Ql,
+            QlRewritingMode::Auto,
+            SUB,
+            "SELECT ?s ?o { ?s :super ?o }",
+            "x",
+        ),
+    ] {
+        let store = annotation_store(ruleset, ql, data);
+        let rows = rows_of(&store, query, nrese_store::ReadScope::All);
+        let copied = rows.iter().any(|r| r.contains(&format!("<{E}{copy}>")));
+        assert!(copied, "setup: {ruleset:?}: no copy in {rows:?}");
+        let (run, _) = rewritten_read(&store, query, nrese_store::ReadScope::All);
+        let prepared = store
+            .prepare_query(&SparqlQueryRequest::all(format!("PREFIX : <{E}> {query}")))
+            .unwrap();
+        let token = nrese_store::CancellationToken::new();
+        let explain = store.explain_query(&prepared, &token).unwrap().completeness;
+        let plan = store.plan_query(&prepared, &token).unwrap().completeness;
+        let header = |s: Option<Completeness>| s.map_or_else(|| "none".to_owned(), |s| s.header());
+        for (path, status) in [
+            ("run", run),
+            ("explain", header(explain)),
+            ("plan", header(plan)),
+        ] {
+            if status_class(&status) != "unsound" {
+                wrong.push(format!("{ruleset:?} {path}: {status}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to": without the rewriting
+/// the status is the closure's, `sound-only` at best; the ruling of 19:39: under the
+/// RDF-Based Semantics the copies are right): a ruleset's own closure without the QL
+/// rewriting keeps its status for the same reads, `sound-only`.
+#[test]
+fn a_rulesets_own_closure_keeps_its_status_for_copied_annotations() {
+    let mut wrong = Vec::new();
+    for (ruleset, data, query) in [
+        (Ruleset::Owl2Rl, EQUAL, "SELECT ?s ?o { ?s :note ?o }"),
+        (Ruleset::Owl2Ql, SUB, "SELECT ?s ?o { ?s :super ?o }"),
+    ] {
+        let store = annotation_store(ruleset, QlRewritingMode::Off, data);
+        let request = SparqlQueryRequest::all(format!("PREFIX : <{E}> {query}"));
+        let result = store.execute_query(&request).unwrap();
+        assert!(result.ql.is_none(), "setup: {ruleset:?}: the rewriting ran");
+        let status = result
+            .completeness
+            .map_or_else(|| "none".to_owned(), |s| s.header());
+        if status_class(&status) != "sound-only" {
+            wrong.push(format!("{ruleset:?}: {status}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A reader of the default graph and `:open`, who sees the inferences derived from them alone,
+/// and not `:hidden`.
+fn reader_by_support() -> nrese_store::ReadScope {
+    nrese_store::ReadScope::Graphs(std::sync::Arc::new(nrese_sparql::GraphAccess {
+        graphs: vec![format!("{E}open")],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..nrese_sparql::GraphAccess::default()
+    }))
+}
+
+/// [`EQUAL`] with the declaration in `:hidden`, the note and the equality in `:open`.
+const HIDDEN: &str = ":hidden { :note a owl:AnnotationProperty . }\n\
+                      :open { :x :note \"a\" . :x owl:sameAs :y . :x a :A . }";
+
+/// [`HIDDEN`] without the declaration.
+const UNDECLARED: &str = ":open { :x :note \"a\" . :x owl:sameAs :y . :x a :A . }";
+
+/// [`HIDDEN`] with the declaration in `:open`, which the reader reads.
+const READABLE: &str = ":open { :note a owl:AnnotationProperty . \
+                        :x :note \"a\" . :x owl:sameAs :y . :x a :A . }";
+
+/// Whether `reasons` hold the annotation rule's: the closure may hold the rules' copies.
+fn names_copies(reasons: &[String]) -> bool {
+    reasons
+        .iter()
+        .any(|r| r.contains("the rules' copies of annotation statements"))
+}
+
+/// Spec (docs/spec/reasoning-semantics.md:86, a restricted reader's status says nothing about
+/// graphs they can't read; the master's ruling of 20:49, point 3: in its graphs a predicate
+/// without a declaration is no annotation property): with `:note`'s declaration in a graph the
+/// reader can't read, and the note and the equality in one it can, a read of `:note` the
+/// rewriting answers, whose rows hold the copy, is told as on the same data without the
+/// declaration: status and reasons alike, neither naming the copies. With the declaration in
+/// a graph the reader reads, the same read is told of them.
+#[test]
+fn a_reader_who_cant_see_the_declaration_is_told_as_without_it() {
+    let query = "SELECT ?s ?o { ?s :note ?o }";
+    let told = |data: &str| {
+        let store = annotation_store(Ruleset::Owl2Rl, QlRewritingMode::On, data);
+        let rows = rows_of(&store, query, reader_by_support());
+        let copied = rows.iter().any(|r| r.contains(&format!("<{E}y>")));
+        assert!(copied, "setup: the reader sees no copy: {rows:?}");
+        rewritten_read(&store, query, reader_by_support())
+    };
+    let (hidden, undeclared, readable) = (told(HIDDEN), told(UNDECLARED), told(READABLE));
+    assert!(!names_copies(&hidden.1), "hidden: {}", hidden.0);
+    assert!(!names_copies(&undeclared.1), "undeclared: {}", undeclared.0);
+    assert!(names_copies(&readable.1), "readable: {}", readable.0);
+    assert_eq!(hidden, undeclared);
+}
+
+/// Spec (docs/spec/reasoning-semantics.md:86; the master's ruling of 21:29: a reader told of
+/// a statement in a graph it can't read learns that it exists): a reader by support of the
+/// default graph, which holds an equality, reading an annotation property (built in, or
+/// declared in a graph it reads) whose only statement is in a graph it can't read, is told
+/// as on the same store without that statement: status and reasons alike.
+#[test]
+fn a_reader_by_support_isnt_told_of_a_hidden_annotation_statement() {
+    let told = |data: &str, query: &str| {
+        let store = annotation_store(Ruleset::Owl2Rl, QlRewritingMode::On, data);
+        rewritten_read(&store, query, reader_by_support())
+    };
+    let declared = ":open { :note a owl:AnnotationProperty . }";
+    let mut wrong = Vec::new();
+    for (case, without, hidden, query) in [
+        (
+            "built in",
+            ":a owl:sameAs :b .".to_owned(),
+            ":hidden { :c rdfs:label \"private\" . }",
+            "SELECT ?s ?o { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o }",
+        ),
+        (
+            "declared",
+            format!(":a owl:sameAs :b . {declared}"),
+            ":hidden { :c :note \"private\" . }",
+            "SELECT ?s ?o { ?s :note ?o }",
+        ),
+    ] {
+        let (with, alone) = (
+            told(&format!("{without}\n{hidden}"), query),
+            told(&without, query),
+        );
+        if with != alone {
+            wrong.push(format!("{case}: {} against {}", with.0, alone.0));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What may be `complete`": `rdf:type` with a named
+/// class of your own; no annotation is a class assertion): the same reader's read of a class
+/// the rewriting answers stays `complete`. The control of the cell above.
+#[test]
+fn the_same_readers_class_read_stays_complete() {
+    let store = annotation_store(Ruleset::Owl2Rl, QlRewritingMode::On, HIDDEN);
+    let (status, _) = rewritten_read(&store, "SELECT ?x { ?x a :A }", reader_by_support());
+    assert_eq!(status_class(&status), "complete", "status: {status}");
 }

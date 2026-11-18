@@ -189,10 +189,12 @@ impl Tbox {
             tbox.hazards.global = super::hazards::reads_data_values(ontology)
                 .or(by_use)
                 .map(Hazard::DataValues)
-                .or(ontology
-                    .noncanonical_cardinality
-                    .map(Hazard::CardinalitySpelling));
+                .or(ontology.noncanonical_cardinality.map(Hazard::Unread));
         }
+        // Over either closure: an empty intersection or union, where the rules name
+        // `owl:Thing` and `owl:Nothing` themselves (cls-svf2, cls-nothing2).
+        let empty = ontology.empty_list.map(Hazard::Unread);
+        tbox.hazards.global = tbox.hazards.global.or(empty);
         tbox.rewritable = tbox.rewritable_terms();
         tbox
     }

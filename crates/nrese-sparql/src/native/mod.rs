@@ -51,6 +51,8 @@ pub(crate) use pushdown::per_solution;
 #[cfg(test)]
 mod budget_tests;
 #[cfg(test)]
+mod graph_scope_tests;
+#[cfg(test)]
 mod graph_tests;
 #[cfg(test)]
 mod handover_tests;
@@ -1277,40 +1279,54 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
 }
 
 /// True if `GRAPH ?graph { pattern }` can be evaluated once for all graphs, every triple
-/// pattern binding `?graph` from its scan: every solution then comes from triple patterns
-/// in every branch, and the pattern holds nothing but triple patterns and the operators
-/// that join them on `?graph` like on any variable.
+/// pattern binding `?graph` from its scan: every row of every part then comes from triple
+/// patterns, so rows of different graphs never meet, and the pattern holds nothing but
+/// triple patterns and the operators that join them on `?graph` like on any variable.
 ///
-/// Anything else is evaluated graph by graph: a row without a scan (VALUES, an empty
-/// group, BIND alone), a property path (followed within one graph), a GeoSPARQL relation
+/// Anything else is evaluated graph by graph: a part whose row comes from no scan (VALUES,
+/// an empty group, BIND alone, at any depth: one row for all graphs), a property path (followed within one graph), a GeoSPARQL relation
 /// computed from geometries (`spatial`: within one graph's geometries), a subquery or a
 /// nested GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make
-/// rows with no other common variable remove each other) and a BIND to `?graph` itself.
+/// rows with no other common variable remove each other), a BIND to `?graph` itself, and
+/// an OPTIONAL, FILTER or BIND that names `?graph` where the rows before it may lack it.
 fn scans_everywhere(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
     fn only_scans(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
         match pattern {
-            GraphPattern::Bgp { patterns } => !spatial || !patterns.iter().any(spatial::is_spatial),
+            GraphPattern::Bgp { patterns } => {
+                !patterns.is_empty() && (!spatial || !patterns.iter().any(spatial::is_spatial))
+            }
             GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
                 inputs.iter().all(|input| only_scans(input, graph, spatial))
             }
+            // Inside the GRAPH, `?graph` is free (§18.6): an OPTIONAL that names it, or an
+            // expression that reads it, gives the same rows once for all graphs only where
+            // the rows it extends or tests bind `?graph` already.
             GraphPattern::LeftJoin {
                 left,
                 right,
                 expression,
             } => {
+                let held = binds(left, graph);
+                let mut named = Vec::new();
+                bound_variables(right, &mut named);
                 only_scans(left, graph, spatial)
                     && only_scans(right, graph, spatial)
+                    && (held || !named.contains(graph))
                     && expression
                         .as_ref()
-                        .is_none_or(|e| filter(e, graph, spatial))
+                        .is_none_or(|e| filter(e, graph, spatial) && (held || !reads(e, graph)))
             }
             GraphPattern::Filter { inner, expr } => {
-                only_scans(inner, graph, spatial) && filter(expr, graph, spatial)
+                only_scans(inner, graph, spatial)
+                    && filter(expr, graph, spatial)
+                    && (binds(inner, graph) || !reads(expr, graph))
             }
             GraphPattern::Extend { inner, bindings } => {
                 only_scans(inner, graph, spatial)
                     && bindings.iter().all(|(variable, expression)| {
-                        variable != graph && filter(expression, graph, spatial)
+                        variable != graph
+                            && filter(expression, graph, spatial)
+                            && (binds(inner, graph) || !reads(expression, graph))
                     })
             }
             _ => false,
@@ -1328,72 +1344,14 @@ fn scans_everywhere(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> 
             other => !pushdown::per_solution(other) || !contains_any_exists(other),
         }
     }
-    fn rows_from_scans(pattern: &GraphPattern) -> bool {
-        match pattern {
-            GraphPattern::Bgp { patterns } => !patterns.is_empty(),
-            GraphPattern::Join { inputs } => inputs.iter().any(rows_from_scans),
-            GraphPattern::Union { inputs } => inputs.iter().all(rows_from_scans),
-            GraphPattern::LeftJoin { left, .. } | GraphPattern::Minus { left, .. } => {
-                rows_from_scans(left)
-            }
-            GraphPattern::Filter { inner, .. } | GraphPattern::Extend { inner, .. } => {
-                rows_from_scans(inner)
-            }
-            _ => false,
-        }
+    // Whether every row of `pattern` binds `?graph` from data.
+    fn binds(pattern: &GraphPattern, graph: &Variable) -> bool {
+        pushdown::certain(pattern).contains(graph)
     }
-    // Inside `GRAPH ?g { P }`, `?g` is bound only where P binds it (SPARQL 1.1 §18.6: P
-    // is evaluated in each graph, then joined with `?g`). An expression reading `?g`
-    // sees it unbound, which only the graph-by-graph evaluation gives.
-    fn read_by_expressions(pattern: &GraphPattern, graph: &Variable) -> bool {
-        match pattern {
-            GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
-                inputs.iter().any(|input| read_by_expressions(input, graph))
-            }
-            GraphPattern::LeftJoin {
-                left,
-                right,
-                expression,
-            } => {
-                read_by_expressions(left, graph)
-                    || read_by_expressions(right, graph)
-                    || expression
-                        .as_ref()
-                        .is_some_and(|e| exists::deep_variables(e).contains(graph))
-            }
-            GraphPattern::Filter { inner, expr: e } => {
-                read_by_expressions(inner, graph) || exists::deep_variables(e).contains(graph)
-            }
-            GraphPattern::Extend { inner, bindings } => {
-                read_by_expressions(inner, graph)
-                    || bindings
-                        .iter()
-                        .any(|(_, e)| exists::deep_variables(e).contains(graph))
-            }
-            _ => false,
-        }
+    fn reads(expression: &Expression, graph: &Variable) -> bool {
+        exists::deep_variables(expression).contains(graph)
     }
-    fn bound_by_scans(pattern: &GraphPattern, graph: &Variable) -> bool {
-        match pattern {
-            GraphPattern::Bgp { patterns } => patterns.iter().any(|t| {
-                [&t.subject, &t.object]
-                    .into_iter()
-                    .any(|term| matches!(term, TermPattern::Variable(v) if v == graph))
-                    || matches!(&t.predicate, NamedNodePattern::Variable(v) if v == graph)
-            }),
-            GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
-                inputs.iter().any(|input| bound_by_scans(input, graph))
-            }
-            GraphPattern::LeftJoin { left, .. }
-            | GraphPattern::Filter { inner: left, .. }
-            | GraphPattern::Extend { inner: left, .. } => bound_by_scans(left, graph),
-            _ => false,
-        }
-    }
-    if read_by_expressions(pattern, graph) && !bound_by_scans(pattern, graph) {
-        return false;
-    }
-    only_scans(pattern, graph, spatial) && rows_from_scans(pattern)
+    only_scans(pattern, graph, spatial)
 }
 
 /// True if `expression` holds an `EXISTS` at any depth.
