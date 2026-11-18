@@ -1415,6 +1415,46 @@ mod tests {
         assert!(outer_join_with_undef(&many, &many, &[0], &[0], None, true, 99).is_err());
     }
 
+    /// An OPTIONAL that shares no variable and has no filter (`left_join` without keys) gives
+    /// the table the keyless pairing gives (`left_join_rows` without a hash table): the same
+    /// rows in the same order, the same columns and sort order. With an empty right side
+    /// that is every left row once, its right columns unbound. Small tables with unbound
+    /// values, empty right sides among them, and one left side past a parallel part.
+    #[test]
+    fn a_left_join_without_keys_gives_the_keyless_pairing() {
+        let mut rng = Rng(11);
+        for case in 0..300 {
+            let (lw, rw) = (1 + case % 3, 1 + (case / 3) % 3);
+            let (lrows, rrows) = match case {
+                0 => (2 * PARALLEL_ROWS + 3, 2),
+                _ => (rng.below(7) as usize, rng.below(4) as usize),
+            };
+            let left = random_table(&mut rng, lw, lrows, 4, true);
+            let right = random_table(&mut rng, rw, rrows, 4, true);
+            let keyless = LeftJoin {
+                left: &left,
+                right: &right,
+                left_keys: &[],
+                right_keys: &[],
+                table: None,
+            };
+            let all = Limit::new(usize::MAX);
+            let paired = left_join_rows(&keyless, 0..left.len(), None, &all).unwrap();
+            let joined = left_join(&left, &right, &[], &[], None, usize::MAX).unwrap();
+            assert_eq!(joined, paired, "case {case}: {lrows} x {rrows} rows");
+            if right.is_empty() {
+                let unbound: Vec<Vec<u64>> = left
+                    .rows()
+                    .map(|mut row| {
+                        row.extend(std::iter::repeat_n(UNDEF, rw));
+                        row
+                    })
+                    .collect();
+                assert_eq!(joined.rows().collect::<Vec<_>>(), unbound, "case {case}");
+            }
+        }
+    }
+
     #[test]
     fn left_and_anti_joins() {
         let left = IdTable::from_rows(2, [&[1, 10][..], &[2, 20], &[3, 30]]);
