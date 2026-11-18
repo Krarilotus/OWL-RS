@@ -384,10 +384,26 @@ fn data_terms(o: &Ontology, terms: &dyn Terms) -> DataTerms {
     out
 }
 
+/// The facets of the OWL 2 datatype map (*Structural Specification* §4): what a facet
+/// restriction's one statement may say.
+pub const FACETS: [&str; 9] = [
+    "http://www.w3.org/2001/XMLSchema#minInclusive",
+    "http://www.w3.org/2001/XMLSchema#maxInclusive",
+    "http://www.w3.org/2001/XMLSchema#minExclusive",
+    "http://www.w3.org/2001/XMLSchema#maxExclusive",
+    "http://www.w3.org/2001/XMLSchema#length",
+    "http://www.w3.org/2001/XMLSchema#minLength",
+    "http://www.w3.org/2001/XMLSchema#maxLength",
+    "http://www.w3.org/2001/XMLSchema#pattern",
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#langRange",
+];
+
 struct Reader<'a> {
     v: Vocabulary,
     /// [`DECLARATION_KINDS`] by the source's ids.
     declaration_kinds: [(Option<Term>, EntityKind); 9],
+    /// [`FACETS`] by the source's ids.
+    facets: [Option<Term>; 9],
     /// [`BUILTIN_ANNOTATIONS`] and `owl:versionIRI` by the source's ids, looked up once per
     /// read: [`Self::is_builtin_annotation`] meets them on every assertion.
     builtin_annotations: ([Option<Term>; 9], Option<Term>),
@@ -414,7 +430,7 @@ struct Reader<'a> {
     ranges: Interner<DataRange>,
     axioms: BTreeMap<Axiom, Vec<Source>>,
     diagnostics: Vec<Diagnostic>,
-    reported: HashSet<(Term, &'static str)>,
+    reported: HashSet<([Term; 3], &'static str)>,
     annotations: usize,
     noncanonical_cardinality: Option<Term>,
     empty_list: Option<Term>,
@@ -577,6 +593,7 @@ impl<'a> Reader<'a> {
         Self {
             v,
             declaration_kinds: DECLARATION_KINDS.map(|(iri, kind)| (terms.iri(iri), kind)),
+            facets: FACETS.map(|iri| terms.iri(iri)),
             builtin_annotations: (
                 BUILTIN_ANNOTATIONS.map(|iri| terms.iri(iri)),
                 terms.iri("http://www.w3.org/2002/07/owl#versionIRI"),
@@ -634,18 +651,50 @@ impl<'a> Reader<'a> {
         objects
     }
 
-    /// The single object of `subject`'s `predicate`, collected as structural.
+    /// The object of `subject`'s `predicate` where it has exactly one, not collected: evidence
+    /// for how to read, never a reading.
+    fn single(&self, subject: Term, predicate: Option<Term>) -> Option<Term> {
+        match self.objects(subject, predicate)[..] {
+            [object] => Some(object),
+            _ => None,
+        }
+    }
+
+    /// The single object of `subject`'s `predicate`, collected as structural; none where it
+    /// has two ([`Self::twice`]).
     fn one(&mut self, subject: Term, predicate: Option<Term>) -> Option<Term> {
         let objects = self.objects(subject, predicate);
-        let &object = objects.first()?;
         if objects.len() > 1 {
+            self.twice(subject);
+            return None;
+        }
+        let &object = objects.first()?;
+        self.collect([subject, predicate?, object]);
+        Some(object)
+    }
+
+    /// Whether `node` gives a structure property ([`Self::is_vocabulary`], `owl:inverseOf`)
+    /// two objects: then it is no structure, since which one a reading took would follow the
+    /// order the statements come in. Reported, and every statement of such a property taken.
+    fn twice(&mut self, node: Term) -> bool {
+        let pairs = self.by_subject.get(&node).cloned().unwrap_or_default();
+        let structure = |p| {
+            (self.is_vocabulary(p) || is(p, self.v.owl_inverse_of)) && !is(p, self.v.owl_imports)
+        };
+        let given_twice: Vec<[Term; 3]> = (pairs.iter())
+            .filter(|&&(p, o, _)| structure(p) && pairs.iter().any(|&(q, x, _)| q == p && x != o))
+            .map(|&(p, o, _)| [node, p, o])
+            .collect();
+        for &triple in &given_twice {
+            self.collect(triple);
+        }
+        if !given_twice.is_empty() {
             self.report(Diagnostic::Malformed {
-                node: subject,
+                node,
                 what: "a structure property given twice",
             });
         }
-        self.collect([subject, predicate?, object]);
-        Some(object)
+        !given_twice.is_empty()
     }
 
     fn has_type(&self, subject: Term, class: Option<Term>) -> bool {
@@ -792,6 +841,9 @@ impl<'a> Reader<'a> {
                 self.report(Diagnostic::BrokenList { head });
                 return None;
             }
+            if self.twice(cell) {
+                return None;
+            }
             let (Some(first), Some(rest)) =
                 (self.one(cell, self.v.first), self.one(cell, self.v.rest))
             else {
@@ -826,6 +878,9 @@ impl<'a> Reader<'a> {
         match self.kind(term) {
             TermKind::Iri => Some(ObjProp::Named(term)),
             TermKind::Blank => {
+                if self.twice(term) {
+                    return None;
+                }
                 let Some(inverse) = self.one(term, self.v.owl_inverse_of) else {
                     self.report(Diagnostic::Malformed {
                         node: term,
@@ -909,6 +964,9 @@ impl<'a> Reader<'a> {
                 self.collect([node, v.rdf_type?, class_type?]);
             }
         }
+        if self.twice(node) {
+            return None;
+        }
         for operator in set_operators {
             if let Some(operand) = self.one(node, operator) {
                 return self.set_operator(operator?, operand);
@@ -966,7 +1024,7 @@ impl<'a> Reader<'a> {
     /// no literal use does (a schema read alone): its value a literal, or its filler a data
     /// range ([`Self::is_data_range`]).
     fn says_data(&mut self, node: Term) -> bool {
-        let first = |reader: &Self, p| reader.objects(node, p).first().copied();
+        let first = |reader: &Self, p| reader.single(node, p);
         if let Some(value) = first(self, self.v.owl_has_value) {
             return self.kind(value) == TermKind::Literal;
         }
@@ -993,7 +1051,7 @@ impl<'a> Reader<'a> {
                         .any(|&iri| self.terms.iri(iri) == Some(term))
             }
             TermKind::Blank => {
-                let first = |reader: &Self, p| reader.objects(term, p).first().copied();
+                let first = |reader: &Self, p| reader.single(term, p);
                 if self.has_type(term, v.rdfs_datatype)
                     || self.has_type(term, v.owl_data_range)
                     || first(self, v.owl_on_datatype).is_some()
@@ -1191,6 +1249,9 @@ impl<'a> Reader<'a> {
                 self.collect([node, v.rdf_type?, range_type?]);
             }
         }
+        if self.twice(node) {
+            return None;
+        }
         let ranges = |reader: &mut Self, list: Term| -> Option<Vec<RangeId>> {
             let members = reader.list(list)?;
             members.iter().map(|&m| reader.range(m)).collect()
@@ -1215,6 +1276,14 @@ impl<'a> Reader<'a> {
             let list = self.one(node, v.owl_with_restrictions)?;
             let mut facets = Vec::new();
             for restriction in self.list(list)? {
+                // Blank (Mapping to RDF, Table 12): a named node's statements are its own.
+                if self.kind(restriction) != TermKind::Blank {
+                    self.report(Diagnostic::Malformed {
+                        node: restriction,
+                        what: "a facet restriction not on a blank node",
+                    });
+                    return None;
+                }
                 let mut pairs = self
                     .by_subject
                     .get(&restriction)
@@ -1230,6 +1299,13 @@ impl<'a> Reader<'a> {
                     });
                     return None;
                 };
+                if !self.facets.contains(&Some(facet)) {
+                    self.report(Diagnostic::Malformed {
+                        node: restriction,
+                        what: "a facet restriction without a facet",
+                    });
+                    return None;
+                }
                 self.collect([restriction, facet, value]);
                 facets.push((facet, value));
             }
@@ -1279,10 +1355,12 @@ impl<'a> Reader<'a> {
                 self.nary(s, o, statement.triple);
             }
         }
-        // Then: statements on IRIs; axioms on blank nodes (a complex left-hand side);
-        // the rest on blank nodes (anonymous individuals), once every structure has
+        // Then: statements on IRIs; axioms on blank nodes (a complex left-hand side); the
+        // blank nodes' other statements that read a structure (an anonymous individual's
+        // typing, a disjoint union); the rest on blank nodes, once every structure has
         // taken its statements.
         let v = self.v;
+        let reads_structure = [v.rdf_type, v.owl_disjoint_union_of];
         let axiom_predicates = [
             v.rdfs_sub_class_of,
             v.owl_equivalent_class,
@@ -1295,15 +1373,17 @@ impl<'a> Reader<'a> {
             v.rdfs_range,
             v.owl_has_key,
         ];
-        for pass in 0..3 {
+        for pass in 0..4 {
             for statement in statements {
                 let triple = statement.triple;
                 let blank = self.kind(triple[0]) == TermKind::Blank;
                 let axiom = axiom_predicates.contains(&Some(triple[1]));
+                let reads = reads_structure.contains(&Some(triple[1]));
                 let now = match pass {
                     0 => !blank,
                     1 => blank && axiom,
-                    _ => blank && !axiom,
+                    2 => blank && reads,
+                    _ => blank && !axiom && !reads,
                 };
                 if !now || self.structural.contains(&triple) {
                     continue;
@@ -1332,6 +1412,15 @@ impl<'a> Reader<'a> {
         let v = self.v;
         self.collected.clear();
         let without = |what| Diagnostic::Malformed { node, what };
+        let forms = [
+            v.owl_all_disjoint_classes,
+            v.owl_all_disjoint_properties,
+            v.owl_all_different,
+            v.owl_negative_property_assertion,
+        ];
+        if forms.contains(&Some(class)) && self.twice(node) {
+            return self.collect(triple);
+        }
         if is(class, v.owl_all_disjoint_classes) {
             self.collect(triple);
             let Some(list) = self.one(node, v.owl_members) else {
@@ -1535,6 +1624,12 @@ impl<'a> Reader<'a> {
                         datas.push(member);
                     } else if let Some(property) = self.object_property(member) {
                         objects.push(property);
+                    } else {
+                        // On its other members it would be a stronger key than stated.
+                        return self.report(Diagnostic::Malformed {
+                            node: s,
+                            what: "a key with a member that can't be read",
+                        });
                     }
                 }
                 self.add(

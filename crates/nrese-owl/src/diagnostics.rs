@@ -63,19 +63,17 @@ pub enum Diagnostic {
 }
 
 impl Diagnostic {
-    /// What makes two reports the same one.
-    pub(crate) fn key(&self) -> (Term, &'static str) {
-        match *self {
+    /// What makes two reports the same one: a statement outside the mapping by its whole
+    /// triple, any other by one term.
+    pub(crate) fn key(&self) -> ([Term; 3], &'static str) {
+        let (term, what) = match *self {
             Self::Malformed { node, what } => (node, what),
             Self::SharedBlankNode { node } => (node, "shared"),
             Self::BrokenList { head } => (head, "list"),
             Self::UndeclaredProperty { property } => (property, "undeclared"),
             Self::AmbiguousProperty { property } => (property, "ambiguous"),
             Self::Unsupported { node, what } => (node, what),
-            Self::NotOwl { triple } => (
-                triple[0] ^ triple[1].rotate_left(21) ^ triple[2].rotate_left(42),
-                "not owl",
-            ),
+            Self::NotOwl { triple } => return (triple, "not owl"),
             Self::Unused { node } => (node, "unused"),
             Self::NonSimpleProperty { property, what, .. } => (property, what),
             Self::AnonymousIndividual { node } => (node, "anonymous individual"),
@@ -85,7 +83,8 @@ impl Diagnostic {
             Self::Rule { rule } => (rule as Term, "rule"),
             Self::RepeatedOperand => (0, "repeated operand"),
             Self::Reserved { term } => (term, "reserved"),
-        }
+        };
+        ([term, 0, 0], what)
     }
 
     /// Whether reasoning over the ontology may go wrong because of it. Not for what OWL 2
@@ -351,9 +350,11 @@ pub fn reserved_vocabulary(iri: &str) -> bool {
 /// Leaves out the axioms that use an IRI of the reserved vocabulary (`rdf:`, `rdfs:`,
 /// `xsd:`, `owl:`; *OWL 2 Structural Specification* §2.4) as a class, a property or an
 /// individual, but for those §2.4 gives OWL 2 DL (`owl:Thing`, `owl:Nothing`, the top and
-/// bottom properties; datatypes are data ranges, not touched here): each with a
-/// [`Diagnostic::Reserved`]. Such a name means in OWL 2 DL nothing of what it means in
-/// RDF (`rdfs:Class`, `rdf:type`, `rdf:first` as entities belong to OWL 2 Full), so
+/// bottom properties; datatypes are data ranges, not touched here): every such name an
+/// axiom uses, each with a [`Diagnostic::Reserved`] (not only its first: what is reported
+/// doesn't depend on the order the statements are read in). Such a name means in OWL 2
+/// DL nothing of what it means in RDF (`rdfs:Class`, `rdf:type`, `rdf:first` as entities
+/// belong to OWL 2 Full), so
 /// reading it as a fresh name would decide what the input doesn't say; left out, what
 /// follows from the rest still follows. Terms whose IRI the source doesn't give
 /// ([`Terms::iri_text`]) aren't checked.
@@ -368,25 +369,33 @@ pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
     let mut kept = Vec::with_capacity(ontology.axioms.len());
     let mut sources = Vec::with_capacity(ontology.axioms.len());
     let mut found = Vec::new();
+    // Each reserved name reported once, those reported before included.
+    let mut met: HashSet<Term> = (ontology.diagnostics.iter())
+        .filter_map(|d| match *d {
+            Diagnostic::Reserved { term } => Some(term),
+            _ => None,
+        })
+        .collect();
     let axioms = std::mem::take(&mut ontology.axioms);
     let all_sources = std::mem::take(&mut ontology.sources);
     for (axiom, source) in axioms.into_iter().zip(all_sources) {
-        let names = entities_of(ontology, &axiom, &mut walk);
-        match names.iter().copied().find(|&t| reserved(t)) {
-            Some(term) => found.push(Diagnostic::Reserved { term }),
-            None => {
-                kept.push(axiom);
-                sources.push(source);
+        let mut any = false;
+        for &term in entities_of(ontology, &axiom, &mut walk) {
+            if reserved(term) {
+                any = true;
+                if met.insert(term) {
+                    found.push(Diagnostic::Reserved { term });
+                }
             }
+        }
+        if !any {
+            kept.push(axiom);
+            sources.push(source);
         }
     }
     ontology.axioms = kept;
     ontology.sources = sources;
-    for d in found {
-        if !ontology.diagnostics.contains(&d) {
-            ontology.diagnostics.push(d);
-        }
-    }
+    ontology.diagnostics.extend(found);
 }
 
 /// [`entities_of`]'s lists, kept from one axiom to the next so that the walk over every
