@@ -8,107 +8,26 @@
 //! the route `dl_bounds().last` and each read's answers and status.
 
 use super::pipeline;
+use super::shapes::{SH, shapes_insert as insert, u1_facts, up_to_blank_nodes};
 
-/// The SHACL and RDF prefixes, besides [`super::PREFIXES`].
-const SH: &str = "PREFIX sh: <http://www.w3.org/ns/shacl#> \
-     PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
-
-/// Commits `INSERT DATA { data }`, with [`SH`] besides the usual prefixes.
-fn insert(
-    dl: &nrese_store::MutationPipeline,
-    data: &str,
-) -> Result<u64, nrese_store::MutationError> {
-    super::update(dl, &format!("{SH}INSERT DATA {{ {data} }}"))
-}
-
-/// The answers of a one-variable `read` (with [`SH`]), sorted, and their status: an IRI written
-/// whole (`<…>`), a literal quoted, and each blank node `_:` with the number of answers it is,
-/// so that answers equal up to a renaming of blank nodes compare equal (RDF 1.1 Concepts §3.6).
-fn up_to_blank_nodes(
-    dl: &nrese_store::MutationPipeline,
-    read: &str,
-) -> (Vec<String>, super::Status) {
-    let store = dl.store();
-    let request = nrese_store::SparqlQueryRequest::all(format!("{}{SH}{read}", super::PREFIXES));
-    let prepared = store.prepare_query(&request).expect("query");
-    let mut out = Vec::new();
-    let status = super::run_dl(store, &prepared, &mut out)
-        .expect("query")
-        .expect("a status under owl2-dl");
-    let json: serde_json::Value = serde_json::from_slice(&out).expect("json results");
-    let answers: Vec<(&str, &str)> = json["results"]["bindings"]
-        .as_array()
-        .expect("bindings")
-        .iter()
-        .map(|row| {
-            let x = &row["x"];
-            (
-                x["type"].as_str().unwrap_or("-"),
-                x["value"].as_str().unwrap_or("-"),
-            )
-        })
-        .collect();
-    let mut rows: Vec<String> = answers
-        .iter()
-        .map(|&(kind, value)| match kind {
-            "bnode" => {
-                let n = answers.iter().filter(|&&a| a == (kind, value)).count();
-                format!("_:{n}")
-            }
-            "uri" => format!("<{value}>"),
-            _ => format!("{value:?}"),
-        })
-        .collect();
-    rows.sort();
-    (rows, status)
-}
-
-/// U1's facts beyond L, sorted: U1's own terms (Skolem constants, fresh classes) as one name,
-/// as `bounds.rs`'s `canonical` writes them (their numbering follows the clauses'), each blank
-/// node `_:` with the number of facts it is in (RDF 1.1 Concepts §3.6). `None` where U1 isn't
-/// built.
-fn u1_facts(dl: &nrese_store::MutationPipeline) -> Option<Vec<[String; 3]>> {
-    let facts = dl.store().dl_upper_facts(false)?;
-    let in_facts = |b: &str| facts.iter().filter(|f| f.iter().any(|t| t == b)).count();
-    let own = |t: &str| t.strip_prefix('<').is_some_and(nrese_dl::internal::is_made);
-    let name = |t: String| {
-        if own(&t) {
-            "<U1's own>".to_owned()
-        } else if t.starts_with("_:") {
-            format!("_:{}", in_facts(&t))
-        } else {
-            t
-        }
-    };
-    let mut named: Vec<[String; 3]> = facts.iter().map(|f| f.clone().map(name)).collect();
-    named.sort();
-    Some(named)
-}
-
-/// A store given `first`, then the update `then`, against a store given `statements`, the
-/// result, in one commit: what differs, as lines. The fresh store gives the expected route;
-/// off the rules' route the answers rest on U1, so the fresh store must have it built and the
-/// later store must hold its facts. Each of `reads` is compared up to blank-node renaming,
-/// with its status whole: soundness, completeness, the reasons' texts and the bounds' counts.
-fn after_is_fresh(first: &str, then: &str, statements: &str, reads: &[&str]) -> Vec<String> {
-    let (later, fresh) = (pipeline(), pipeline());
-    insert(&later, first).expect("the first commit");
-    let bounds = later.store().dl_bounds();
-    super::update(&later, &format!("{SH}{then}")).expect("the later commit");
-    insert(&fresh, statements).expect("one commit");
-    let routes = [&later, &fresh].map(|dl| dl.store().dl_bounds().last);
-    eprintln!("route {}, then {routes:?} (later, fresh)", bounds.last);
+/// What differs between two stores, as lines: the route (off the rules' route, a bound changed
+/// and one rebuilt are one route); off it, U1's facts, which the answers rest on, so `fresh`
+/// must have U1 built and `later` must hold its facts; and each of `reads`, compared up to
+/// blank-node renaming, with its status whole: soundness, completeness, the reasons' texts and
+/// the bounds' counts.
+fn differs(
+    later: &nrese_store::MutationPipeline,
+    fresh: &nrese_store::MutationPipeline,
+    reads: &[&str],
+) -> Vec<String> {
+    let routes = [later, fresh].map(|dl| dl.store().dl_bounds().last);
+    eprintln!("routes {routes:?} (later, fresh)");
     let mut wrong = Vec::new();
-    // Off the rules' route, the state before `then` has the upper bound built.
-    if bounds.last != "rules" && bounds.unavailable.is_some() {
-        wrong.push(format!("before the later commit: {:?}", bounds.unavailable));
-    }
-    // On the rules' route or off it: off it, a bound changed and one rebuilt are one route.
     if (routes[0] == "rules") != (routes[1] == "rules") {
         wrong.push(format!("routes {routes:?}"));
     }
     if routes[1] != "rules" {
-        let [kept, built] = [&later, &fresh].map(u1_facts);
+        let [kept, built] = [later, fresh].map(u1_facts);
         if built.is_none() || kept != built {
             wrong.push(format!("U1's facts: later {kept:?}; fresh {built:?}"));
         }
@@ -118,13 +37,37 @@ fn after_is_fresh(first: &str, then: &str, statements: &str, reads: &[&str]) -> 
             let (rows, status) = up_to_blank_nodes(dl, read);
             format!("{rows:?}, {:?}", status.shared)
         };
-        let [a, b] = [&later, &fresh].map(told);
+        let [a, b] = [later, fresh].map(told);
         eprintln!("{read}: later {a}; fresh {b}");
         if a != b {
             wrong.push(format!("{read}: later {a}; fresh {b}"));
         }
     }
     wrong
+}
+
+/// A store given `first`, then the update `then`, against a store given `statements`, the
+/// result, in one commit, which gives the expected route: the route before `then`, the later
+/// store's after it, and what [`differs`]. Off the rules' route, the state before `then` must
+/// have the upper bound built.
+fn after_is_fresh(
+    first: &str,
+    then: &str,
+    statements: &str,
+    reads: &[&str],
+) -> (&'static str, &'static str, Vec<String>) {
+    let (later, fresh) = (pipeline(), pipeline());
+    insert(&later, first).expect("the first commit");
+    let bounds = later.store().dl_bounds();
+    eprintln!("route {} before the later commit", bounds.last);
+    super::update(&later, &format!("{SH}{then}")).expect("the later commit");
+    insert(&fresh, statements).expect("one commit");
+    let mut wrong = Vec::new();
+    if bounds.last != "rules" && bounds.unavailable.is_some() {
+        wrong.push(format!("before the later commit: {:?}", bounds.unavailable));
+    }
+    wrong.extend(differs(&later, &fresh, reads));
+    (bounds.last, later.store().dl_bounds().last, wrong)
 }
 
 /// Spec (Structural Specification §5.5: of the reserved vocabulary only the nine built-in
@@ -139,7 +82,7 @@ fn an_equality_on_a_class_with_owl_same_as_declared_an_annotation_property_reads
 {
     let first = "owl:sameAs a owl:AnnotationProperty . :Person a owl:Class . :ann a :Person .";
     let then = ":Person owl:sameAs :p2 .";
-    let wrong = after_is_fresh(
+    let (_, _, wrong) = after_is_fresh(
         first,
         &format!("INSERT DATA {{ {then} }}"),
         &format!("{first} {then}"),
@@ -161,7 +104,7 @@ fn an_equality_on_a_class_with_owl_same_as_declared_an_annotation_property_reads
 fn deleting_rdf_type_declared_an_annotation_property_reads_as_a_fresh_store() {
     let rest = "sh:path a owl:ObjectProperty . :knows a owl:ObjectProperty . :s sh:path :knows .";
     let declared = "rdf:type a owl:AnnotationProperty .";
-    let wrong = after_is_fresh(
+    let (_, _, wrong) = after_is_fresh(
         &format!("{declared} {rest}"),
         &format!("DELETE DATA {{ {declared} }}"),
         rest,
@@ -184,7 +127,7 @@ fn an_equality_on_sh_path_with_owl_same_as_declared_an_annotation_property_reads
 {
     let first = "owl:sameAs a owl:AnnotationProperty .";
     let then = "sh:path owl:sameAs :alias .";
-    let wrong = after_is_fresh(
+    let (_, _, wrong) = after_is_fresh(
         first,
         &format!("INSERT DATA {{ {then} }}"),
         &format!("{first} {then}"),
@@ -194,5 +137,53 @@ fn an_equality_on_sh_path_with_owl_same_as_declared_an_annotation_property_reads
             "SELECT ?x { ?x a owl:Thing }",
         ],
     );
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (Structural Specification §5.5: `owl:sameAs` declared an annotation property is none,
+/// so the declaration gives nothing a meaning, and `sh:path owl:sameAs :alias` is an equality
+/// on `sh:path`, which names it, and the SHACL content `:s sh:path :knows` is then read as any
+/// other statement): a store with the declaration reads as one without it: the same route,
+/// and each read the same answers with the same status.
+#[test]
+fn owl_same_as_declared_an_annotation_property_reads_as_a_store_without_the_declaration() {
+    let rest = ":knows a owl:ObjectProperty . :s sh:path :knows . sh:path owl:sameAs :alias .";
+    let (declared, without) = (pipeline(), pipeline());
+    insert(
+        &declared,
+        &format!("owl:sameAs a owl:AnnotationProperty . {rest}"),
+    )
+    .expect("one");
+    insert(&without, rest).expect("one commit");
+    let reads = [
+        "SELECT ?x { ?x sh:path ?o }",
+        "SELECT ?x { ?x a owl:Thing }",
+    ];
+    let wrong = differs(&declared, &without, &reads);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (Structural Specification §5.5: the nine built-in annotation properties are the
+/// reserved vocabulary's annotation properties, declared or not; OWL 2 Direct Semantics gives
+/// annotations no meaning): with `rdfs:label` and `rdfs:comment` declared annotation
+/// properties beside a class and its member, on the rules' route, a later commit of their
+/// statements on both keeps the route, as a fresh read of the same statements takes it, each
+/// read the same answers with the same status.
+#[test]
+fn a_built_in_annotation_statement_keeps_the_route_as_a_fresh_store() {
+    let first = "rdfs:label a owl:AnnotationProperty . rdfs:comment a owl:AnnotationProperty . \
+                 :Person a owl:Class . :ann a :Person .";
+    let then = ":Person rdfs:label \"person\" . :ann rdfs:comment \"a note\" .";
+    let (before, after, wrong) = after_is_fresh(
+        first,
+        &format!("INSERT DATA {{ {then} }}"),
+        &format!("{first} {then}"),
+        &[
+            "SELECT ?x { ?x rdfs:label ?o }",
+            "SELECT ?x { ?x rdfs:comment ?o }",
+            "SELECT ?x { ?x a :Person }",
+        ],
+    );
+    assert_eq!([before, after], ["rules", "rules"], "the route kept");
     assert!(wrong.is_empty(), "{wrong:#?}");
 }

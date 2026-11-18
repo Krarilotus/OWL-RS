@@ -12,7 +12,7 @@ use super::entailment::entailed;
 use super::queries::query;
 use super::{insert, pipeline};
 
-const SH: &str = "PREFIX sh: <http://www.w3.org/ns/shacl#> \
+pub(super) const SH: &str = "PREFIX sh: <http://www.w3.org/ns/shacl#> \
      PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
 
 /// An OWL 2 RL ontology the shapes stand beside: `:bob` is a `:Person` and `:ann`, a
@@ -31,7 +31,7 @@ fn explicit_shapes() -> String {
 }
 
 /// Commits `INSERT DATA { data }`, with the SHACL and RDF prefixes besides the usual ones.
-fn shapes_insert(
+pub(super) fn shapes_insert(
     dl: &nrese_store::MutationPipeline,
     data: &str,
 ) -> Result<u64, nrese_store::MutationError> {
@@ -494,7 +494,7 @@ const READS: [&str; 3] = [
 /// Two stores' answers are equal so exactly when they are equal up to a renaming of blank
 /// nodes: each store labels a list's blank node its own way, and RDF graphs are equal up to
 /// that renaming (RDF 1.1 Concepts §3.6).
-fn up_to_blank_nodes(
+pub(super) fn up_to_blank_nodes(
     dl: &nrese_store::MutationPipeline,
     read: &str,
 ) -> (Vec<String>, super::Status) {
@@ -537,7 +537,7 @@ fn up_to_blank_nodes(
 /// as `bounds.rs`'s `canonical` writes them (their numbering follows the clauses'), each blank
 /// node (`_:…`) `_:` with the number of facts it is in, so that stores equal up to a renaming
 /// of blank nodes compare equal (RDF 1.1 Concepts §3.6). `None` where U1 isn't built.
-fn u1_facts(dl: &nrese_store::MutationPipeline) -> Option<Vec<[String; 3]>> {
+pub(super) fn u1_facts(dl: &nrese_store::MutationPipeline) -> Option<Vec<[String; 3]>> {
     let facts = dl.store().dl_upper_facts(false)?;
     let in_facts = |b: &str| facts.iter().filter(|f| f.iter().any(|t| t == b)).count();
     let own = |t: &str| t.strip_prefix('<').is_some_and(nrese_dl::internal::is_made);

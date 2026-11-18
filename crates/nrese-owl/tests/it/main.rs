@@ -644,6 +644,42 @@ fn reserved_vocabulary_as_an_entity_is_left_out() {
     );
 }
 
+/// Spec (Structural Specification §5.8, declarations; §5.5: of the reserved vocabulary only
+/// names other than the nine built-in annotation properties are no annotation properties): a
+/// declaration of each kind of entity is read as one, through its `rdf:type` statement, and so
+/// is `rdfs:label` declared an annotation property.
+#[test]
+fn a_declaration_of_each_kind_is_read_through_its_typing() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        r#"
+        ex:C a owl:Class . ex:K a rdfs:Class . ex:o a owl:ObjectProperty .
+        ex:d a owl:DatatypeProperty . ex:n a owl:AnnotationProperty . ex:t a rdfs:Datatype .
+        ex:i a owl:NamedIndividual . rdfs:label a owl:AnnotationProperty .
+        "#,
+    );
+    let lines = rendered(&read(&statements, &table), &table);
+    let missing: Vec<&str> = [
+        "Declaration(Class(ex:C))",
+        "Declaration(Class(ex:K))",
+        "Declaration(ObjectProperty(ex:o))",
+        "Declaration(DataProperty(ex:d))",
+        "Declaration(AnnotationProperty(ex:n))",
+        "Declaration(Datatype(ex:t))",
+        "Declaration(NamedIndividual(ex:i))",
+        "Declaration(AnnotationProperty(<http://www.w3.org/2000/01/rdf-schema#label>))",
+    ]
+    .into_iter()
+    .filter(|d| !lines.contains(&(*d).to_owned()))
+    .collect();
+    assert!(
+        missing.is_empty(),
+        "missing {missing:?}\nread:\n{}",
+        lines.join("\n")
+    );
+}
+
 /// A disjointness that repeats an operand says that operand is empty (an individual
 /// different from itself: a contradiction), as OWL 2's RDF-Based Semantics reads it; the
 /// operands were deduplicated and the axiom said nothing (WebOnt-disjointWith-010,
