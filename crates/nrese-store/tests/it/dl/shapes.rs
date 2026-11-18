@@ -533,6 +533,28 @@ fn up_to_blank_nodes(
     (rows, status)
 }
 
+/// U1's facts beyond L, sorted: U1's own terms (Skolem constants, fresh classes) as one name,
+/// as `bounds.rs`'s `canonical` writes them (their numbering follows the clauses'), each blank
+/// node (`_:…`) `_:` with the number of facts it is in, so that stores equal up to a renaming
+/// of blank nodes compare equal (RDF 1.1 Concepts §3.6). `None` where U1 isn't built.
+fn u1_facts(dl: &nrese_store::MutationPipeline) -> Option<Vec<[String; 3]>> {
+    let facts = dl.store().dl_upper_facts(false)?;
+    let in_facts = |b: &str| facts.iter().filter(|f| f.iter().any(|t| t == b)).count();
+    let own = |t: &str| t.strip_prefix('<').is_some_and(nrese_dl::internal::is_made);
+    let name = |t: String| {
+        if own(&t) {
+            "<U1's own>".to_owned()
+        } else if t.starts_with("_:") {
+            format!("_:{}", in_facts(&t))
+        } else {
+            t
+        }
+    };
+    let mut named: Vec<[String; 3]> = facts.iter().map(|f| f.clone().map(name)).collect();
+    named.sort();
+    Some(named)
+}
+
 /// A store given `first`, then `then`, in two commits, against a store given both in one,
 /// each after `ontology`: the route before the later commit, and what differs: the route
 /// after it and, for each of [`READS`], the answers and their status (the reasons printed).
@@ -575,18 +597,21 @@ fn after_is_fresh(
     if (routes[0] == "rules") != (routes[1] == "rules") {
         wrong.push(format!("routes {routes:?}"));
     }
+    // Off the rules' route the answers rest on U1: the fresh store has it built, and the later
+    // store holds its facts (two unbuilt ones don't pass).
+    if routes[1] != "rules" {
+        let [kept, built] = [&later, &fresh].map(u1_facts);
+        if built.is_none() || kept != built {
+            wrong.push(format!("U1's facts: later {kept:?}; fresh {built:?}"));
+        }
+    }
     for read in READS {
         let [a, b] = [&later, &fresh].map(|dl| up_to_blank_nodes(dl, read));
+        // The status whole: soundness, completeness, the reasons' texts, the bounds' counts.
         let told = |(rows, status): &(Vec<String>, super::Status)| {
-            format!("{rows:?}, {}", status.shared.as_str())
+            format!("{rows:?}, {:?}", status.shared)
         };
-        eprintln!(
-            "{read}: later {}; fresh {} ({:?}; {:?})",
-            told(&a),
-            told(&b),
-            a.1.reasons(),
-            b.1.reasons()
-        );
+        eprintln!("{read}: later {}; fresh {}", told(&a), told(&b));
         if told(&a) != told(&b) {
             wrong.push(format!("{read}: later {}; fresh {}", told(&a), told(&b)));
         }

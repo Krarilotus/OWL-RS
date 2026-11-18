@@ -195,11 +195,12 @@ const READS: [&str; 3] = [
     "SELECT ?x { ?x ?p :q }",
 ];
 
-/// The answers of a one-variable `read`, sorted, and their status: an IRI written whole, a
-/// literal quoted, each blank node `_:` with the number of answers it is, so that two stores'
-/// answers are equal exactly when they are equal up to a renaming of blank nodes (RDF 1.1
-/// Concepts §3.6).
-fn answers(store: &StoreService, read: &str) -> (Vec<String>, &'static str) {
+/// The answers of a one-variable `read`, sorted, and their status whole (soundness,
+/// completeness, the reasons' texts, the bounds' counts: every public field): an IRI written
+/// whole, a literal quoted, each blank node `_:` with the number of answers it is, so that two
+/// stores' answers are equal exactly when they are equal up to a renaming of blank nodes (RDF
+/// 1.1 Concepts §3.6).
+fn answers(store: &StoreService, read: &str) -> (Vec<String>, nrese_sparql::Completeness) {
     let request = crate::SparqlQueryRequest::all(format!("{PREFIXES}{read}"));
     let prepared = store.prepare_query(&request).expect("query");
     let mut out = Vec::new();
@@ -232,19 +233,23 @@ fn answers(store: &StoreService, read: &str) -> (Vec<String>, &'static str) {
         })
         .collect();
     rows.sort();
-    (rows, status.as_str())
+    (rows, status)
 }
 
-/// U1's facts beyond L, sorted, each blank node (`_:…`) written `_:` with the number of facts
-/// it is in. U1's own names are the same in both stores (`<dl u1 …>`); facts equal up to a
-/// renaming of blank nodes compare equal, and different ones compare different unless two blank
-/// nodes in as many facts trade places, which these cases' data, with one blank node an
-/// individual at most (the list of `(d)`), can't give.
+/// U1's facts beyond L, sorted: U1's own terms (Skolem constants, fresh classes) as one name,
+/// as the integration tests' `canonical` writes them (their numbering follows the clauses'),
+/// each blank node (`_:…`) `_:` with the number of facts it is in. Facts equal up to a renaming
+/// of blank nodes compare equal, and different ones compare different unless two blank nodes in
+/// as many facts trade places, which these cases' data, with one blank node an individual at
+/// most (the list of `(d)`), can't give. `None` where U1 isn't built.
 fn facts(store: &StoreService) -> Option<Vec<[String; 3]>> {
     let facts = super::upper_facts(store, false)?;
     let in_facts = |b: &str| facts.iter().filter(|f| f.iter().any(|t| t == b)).count();
+    let own = |t: &str| t.strip_prefix('<').is_some_and(nrese_dl::internal::is_made);
     let renamed = |t: String| {
-        if t.starts_with("_:") {
+        if own(&t) {
+            "<U1's own>".to_owned()
+        } else if t.starts_with("_:") {
             format!("_:{}", in_facts(&t))
         } else {
             t
@@ -312,11 +317,14 @@ fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_with_the_bou
             || fresh_routed != routed
             || (once.last == "rules") != routed
             || later.unavailable != once.unavailable
+            || (!routed && once.unavailable.is_some())
         {
             wrong.push(line);
         }
+        // Off the rules' route the answers rest on U1: the store compared with has it built,
+        // and the commit's store holds its facts (two unbuilt ones don't pass).
         let (kept, built) = (facts(&store), facts(&fresh));
-        if kept != built {
+        if !routed && (built.is_none() || kept != built) {
             wrong.push(format!(
                 "{what}: U1's facts {kept:?}, in one commit {built:?}"
             ));
