@@ -1796,3 +1796,59 @@ fn the_labels_mask_is_charged_while_it_lives() {
     assert!(alive >= 12, "the mask's 12 bytes charged while it lives");
     assert_eq!(dropped, 0, "nothing once it is dropped");
 }
+
+/// Spec: the labels' work is work the read can do without, so a charge it is refused is no
+/// limit on the read: where the labels have no room, the request is marked as limited by its
+/// memory (`refused`, which keeps a result from being published beyond it) only as the read
+/// without them is. Over S1's store (the gap's 200 candidates named by 8000-byte IRIs), under
+/// each request memory limit from 64 KiB to 512 KiB (steps of a fiftieth), every read the first
+/// of a store just committed: where the read with the labels off answers, the read with them on
+/// answers; and where it also selects the whole gap and refutes none by labels (they had no
+/// room), its envelope is marked refused exactly where the read's with them off is. And the
+/// case is reached.
+#[test]
+fn labels_refused_their_memory_leave_the_request_unmarked() {
+    let read = |labels: bool, limit: usize| {
+        let store = padded_unions_store(labels, 400, 8000);
+        let request = crate::SparqlQueryRequest::all("SELECT ?x { ?x a <urn:test:U0> }");
+        let prepared = PreparedQuery::parse(&request).unwrap();
+        let memory = nrese_exec::Envelope::new(Some(limit), None);
+        let outcome = decide_answers(
+            &store,
+            &prepared,
+            &analyse(prepared.query()),
+            &crate::dl::bounds::view(&store),
+            (&CancellationToken::new(), Deadline::after(None)),
+            &memory,
+            DlAnswers::default(),
+        );
+        let detail = outcome.ok().map(|outcome| match outcome {
+            Outcome::Stream(_, _, detail) | Outcome::Answers(_, _, detail) => detail,
+        });
+        (detail, memory.refused())
+    };
+    let (mut limit, mut reached) = (64usize << 10, Vec::new());
+    while limit <= 512 << 10 {
+        let (off, off_refused) = read(false, limit);
+        if off.is_some() {
+            let (on, refused) = read(true, limit);
+            // The switch-on read's paths and refutations by labels.
+            let seen = on.as_ref().map(|d| (&d.paths, d.refuted_by_labels));
+            println!("{limit}: off refused {off_refused}; on {seen:?}, refused {refused}");
+            assert!(on.is_some(), "{limit} bytes: off answered, on failed");
+            if let Some(detail) = on
+                && !detail.paths.contains(&"capped-gap")
+                && detail.refuted_by_labels == 0
+            {
+                assert_eq!(
+                    refused, off_refused,
+                    "{limit} bytes: labels without room, the request's mark differs"
+                );
+                reached.push(limit);
+            }
+        }
+        limit += limit / 50;
+    }
+    println!("the labels had no room, the request unmarked, under {reached:?}");
+    assert!(!reached.is_empty(), "no limit reaches the case");
+}
