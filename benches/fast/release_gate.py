@@ -1911,9 +1911,6 @@ def read_measure(text: str | None) -> dict:
 
 # --- the fleet jobs ----------------------------------------------------------------------------
 
-# Runs and notes from before the history rewrites of 26 Oct 2026 and of November 2026 name these
-# sides by their earlier ids, the same trees: v1.5 as 0f465633, then d348a8a1; main as 64a2711b
-# (earlier runs measured an older main, a0020134, before 26 Oct f9b515e8).
 BASE = "21f41249892e0b15635b522e52f284157685b4c7"  # v1.5, the last recorded run's base
 MAIN = "e7a479a33f0bc7879b7b647e1d3373edfd61c0a9"  # main
 
@@ -2069,7 +2066,7 @@ def measurement_ref(repo: str, ref: str, commit: str, remote: str | None,
         raise SystemExit(f"{ref}: its name doesn't name its side {rev[:8]} (refs/measure/<name>-{rev[:8]})")
     import subprocess
     # The ref's push sends its side's history along, so only a side that is already out may go (T0,
-    # 28 Oct 2026: main's and v1.5's sides were ids from before the history rewrite, on no remote).
+    # 28 Oct 2026: a side whose commit was on no remote would have been published with the ref).
     if published(repo, rev, remote) is None:
         raise SystemExit(f"{ref}: its side {rev[:12]} is on no branch of {remote} (as fetched here): "
                          "the side must be published")

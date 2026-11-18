@@ -1,6 +1,6 @@
 //! The join orderer's plans step by step: the order, and each step's estimated rows to the
 //! bit, for planning problems of each shape its searches meet. Identity tests: the tables
-//! were captured from the orderer before its state lifecycle change (engine-v2 38202f73d),
+//! were captured from the orderer before its state lifecycle change (engine-v2 f86999644),
 //! which keeps every comparison, so they hold on both trees by design. A change to the
 //! cost model changes them on purpose; the failure prints the new table. Last, the estimates
 //! the characteristic sets and pairs give a BGP admitted to them ([`plan::admits`]).

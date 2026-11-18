@@ -2495,7 +2495,7 @@ mod tests {
     /// Span 1 (P2-01). A bulk load's numbering and renumbering under the adoption guard never
     /// have the holder's thread run a pool job while the guard is held: a job that wanted the
     /// dictionary (to intern, or to read behind a queued writer) would wait there with the
-    /// numbering under it, and the numbering would wait for it. On engine-v2 688181dd they
+    /// numbering under it, and the numbering would wait for it. On engine-v2 b6e83d83 they
     /// ran as Rayon work on the caller's pool, which the holder's thread helps with.
     #[test]
     fn a_loads_numbering_takes_on_no_job_under_the_adoption_guard() {

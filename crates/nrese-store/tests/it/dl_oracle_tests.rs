@@ -345,7 +345,7 @@ const HEAD: &str = "@prefix : <http://e/> . @prefix owl: <http://www.w3.org/2002
 
 /// The fixtures of I24b, each with an
 /// entailed answer under the OWL 2 Direct Semantics that the rewriting missed on
-/// engine-v2 `7fa950ef`. Kept as the differential's fixed
+/// engine-v2 `1fd11df3`. Kept as the differential's fixed
 /// cases.
 fn review_fixtures() -> Vec<(&'static str, String, &'static str)> {
     let some = "[ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :D ]";
@@ -469,7 +469,7 @@ fn review_fixtures() -> Vec<(&'static str, String, &'static str)> {
 /// and the saturated one (the direct verdict was printed, never asserted).
 /// Every fixture is decidable, so a fixture without a verdict fails too.
 ///
-/// On engine-v2 `7fa950ef`, each of the I24b, F1–F4 fixtures should be `missed`: the
+/// On engine-v2 `1fd11df3`, each of the I24b, F1–F4 fixtures should be `missed`: the
 /// harness's own check.
 #[test]
 fn the_review_fixtures_answer_as_the_dl_oracle() {

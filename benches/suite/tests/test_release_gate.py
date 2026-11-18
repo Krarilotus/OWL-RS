@@ -737,7 +737,7 @@ class Rounds(unittest.TestCase):
 
     def test_a_harness_whose_makers_it_can_t_declare_is_refused(self):
         """A harness whose makers start
-        containers it declares no size for (between engine-v2 838cd7eb and this package: unlabelled,
+        containers it declares no size for (between engine-v2 73281252 and this package: unlabelled,
         unlimited), or whose tables are code, or whose catalogue can't be read, would have its data
         step stopped or its data unknown: refused at the plan, saying why.
         A harness's tables are its catalogue's [makers] alone, so every harness
@@ -749,7 +749,7 @@ class Rounds(unittest.TestCase):
                      "[makers]"),
                     ("uncatalogued", {"catalogue": False, "lubm_size": None}, "shacl-lubm", "datasets.toml"),
                     # A harness from before [makers] whose sizes are code (this package's
-                    # commits before it; bafc5741 declared 4/8 where H's code made 6/4): refused, never run.
+                    # commits before it; 406a7387 declared 4/8 where H's code made 6/4): refused, never run.
                     ("sizes as code", {"legacy": True}, "shacl-lubm", "[makers]"),
                     # Sized makers whose scripts don't take the declaration.
                     ("unheld", {"helper": False}, "shacl-lubm", "ns_maker_args"),
@@ -1307,7 +1307,7 @@ class MainAdapter(unittest.TestCase):
             return None, f"no report: {type(error).__name__}: {error}"
 
     def test_a_series_a_baseline_reports_as_null_is_not_compared(self):
-        """F 38202f73's report (12 Nov 2026) crashed in quantum(): main's perf lab writes no
+        """F f8699964's report (12 Nov 2026) crashed in quantum(): main's perf lab writes no
         first_ms, so fast.py's reopen-dbpedia series `cold/<query>/first` were [null] on every main
         pass. A null is no reading: such a series is treated like one main doesn't report (not
         compared, unsupported by this baseline), and the series main does report are judged."""
@@ -1596,7 +1596,7 @@ class DeclaredMetric(unittest.TestCase):
             code, text = self.compared(self.two_cases(None), self.two_cases(2, sweep_peak=2000))
             self.assertEqual(code, 1, text)
             self.assertRegex(text, r"rule-delta-sweep +peak .*1000 -> 2000 MiB +MORE MEMORY")
-        with self.subTest("guard (as at 43b1f309): all ok, the refused case listed, no ratio for it, exit 0"):
+        with self.subTest("guard (as at 6822c034): all ok, the refused case listed, no ratio for it, exit 0"):
             code, text = self.compared(self.two_cases(None), self.two_cases(2))
             self.assertEqual(code, 0, text)
             self.assertRegex(text, r"rule-delta-sweep.*not compared")
@@ -3173,7 +3173,7 @@ exec "{Path(shutil.which("git")).as_posix()}" "$@"
         space, = (gate / "run").iterdir()
         for pid in (dead, alive):
             (space / f"{pid}-abcdef" / f"src-{head}").mkdir(parents=True)
-        (gate / f"src-{head}").mkdir()  # 47e5cee7's shared code checkout, half made
+        (gate / f"src-{head}").mkdir()  # a19ce1b9's shared code checkout, half made
         output = self.run_gate(tmp, "stale", "clean")
         self.assertIn("MiB reclaimed", output, f"SPEC clean runs:\n{output}")
         self.assertFalse((space / f"{dead}-abcdef").exists(), "SPEC what a dead invocation left goes")

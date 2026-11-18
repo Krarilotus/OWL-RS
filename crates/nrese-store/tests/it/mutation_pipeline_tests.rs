@@ -1316,14 +1316,14 @@ fn ranged_commits_are_judged_by_the_whole_lexical_space() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// The reasoning marker engine-v2 621bf318 (`SEMANTICS_VERSION` 3) wrote for the store of
+/// The reasoning marker engine-v2 9a41df47 (`SEMANTICS_VERSION` 3) wrote for the store of
 /// [`a_marker_from_older_datatype_semantics_is_rechecked`] after rematerialising it under
 /// owl2-rl: 0 violations (fleet probe xsdval-probe-marker-56fd5f94).
 const OLD_MARKER: &str =
     "ruleset owl2-rl\nfingerprint a94cf90230548146\nviolations 0\nlists nil-class\n";
 
 /// A store whose reasoning marker a build with older datatype semantics wrote (engine-v2
-/// 621bf318, which didn't judge an ill-typed literal under a range, so recorded this data
+/// 9a41df47, which didn't judge an ill-typed literal under a range, so recorded this data
 /// consistent) isn't current once the semantics change (rulesets::SEMANTICS_VERSION): on
 /// reopen it is rechecked, and the inconsistency is reported.
 #[test]
@@ -1346,7 +1346,7 @@ fn a_marker_from_older_datatype_semantics_is_rechecked() {
             )))
             .expect("import");
     }
-    // The marker 621bf318 wrote for this store after rematerialising it (fleet probe
+    // The marker 9a41df47 wrote for this store after rematerialising it (fleet probe
     // xsdval-probe-marker-56fd5f94).
     std::fs::write(dir.path().join("reasoning.state"), OLD_MARKER).expect("write marker");
     let store = StoreService::new(config).expect("reopen");

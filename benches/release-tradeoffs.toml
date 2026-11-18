@@ -108,7 +108,7 @@ pays_with = { case = "load-entities", dimension = "time/_" }
 # EL classification through the endpoint (el-classify-endpoint: el-classify's 20,000 classes loaded into a fresh
 # server, then GET /dataset/classification). The row is the server scope's anon + kernel peak, the load included.
 # Measured 14 Nov 2026 in the gate's form: its own runner, 12 blocks of the three sides in whole Latin squares, on
-# engine-v2 e0745e067 (the code this case runs is unchanged since).
+# engine-v2 372cf8d06 (the code this case runs is unchanged since).
 # - Memory: 720 MiB against main's 196, x3.60 (interval 3.50-3.71). The runs spread by 3.6 % (sd), main's by 4.4 %.
 # - Time: the request takes 0.53 s against main's 5.4 s, x0.096 (interval 0.094-0.098). This is the win the owner
 #   traded for, the same case's time/request; it shows as better against main in every round drawn from the blocks.

@@ -5,7 +5,7 @@
 //! derived, not stored data: `CLEAR` leaves it), not a protocol dataset (SYN-54).
 //!
 //! Each row checks the asserted statements of every graph afterwards. Rows marked `guard`
-//! held before the fix; the others failed at their answer on engine-v2 58af963dc.
+//! held before the fix; the others failed at their answer on engine-v2 fa4fe73d3.
 
 use std::sync::Arc;
 

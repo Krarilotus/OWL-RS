@@ -50,7 +50,7 @@ class CheckDocPaths(unittest.TestCase):
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             return checker.main([doc])
 
-    # Inline links resolve from their document (dbe29b41), never from the repository root.
+    # Inline links resolve from their document (3739aa16), never from the repository root.
     def test_an_inline_link_to_a_missing_file_fails(self):
         self.assertEqual(self.check("[missing](definitely-missing-pr92.md)\n"), 1)  # fixtures/missing.md
         self.assertEqual(self.check("[exists](guide.md)\n"), 0)

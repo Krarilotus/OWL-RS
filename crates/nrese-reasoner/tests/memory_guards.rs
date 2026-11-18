@@ -342,8 +342,8 @@ fn equality_copies_past_the_memory_limit_stop_within_it() {
 /// The equality copies, charged as they grow, are joined once into a list of exactly their
 /// number, so their charge costs no memory the uncharged copies didn't: 2,000 `owl:sameAs`
 /// groups of 10 (560,000 facts), on one thread. The heap's peak per fact on 7 November
-/// 2026: listed by representatives 72.1 bytes uncharged (313e5a64), 93.4 joined pairwise
-/// with the joined list's doubling room kept (459d47c8), 72.5 joined once; by replication
+/// 2026: listed by representatives 72.1 bytes uncharged (b1bc0ca8), 93.4 joined pairwise
+/// with the joined list's doubling room kept (4257760b), 72.5 joined once; by replication
 /// 183.7, 192.8 and 183.7.
 #[test]
 fn equality_copies_are_joined_once_at_their_number() {
