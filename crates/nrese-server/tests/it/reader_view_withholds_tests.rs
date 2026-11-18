@@ -173,3 +173,105 @@ async fn a_reader_by_support_missing_a_chain_its_graphs_close_is_never_told_comp
     assert!(wrong.is_empty(), "told complete:\n{}", wrong.join("\n"));
     Ok(())
 }
+
+/// The reader of the pending rows: it reads and writes `:g1` and reads the default graph.
+const WRITER_POLICY: &str = r#"
+default = "deny"
+inferred = "supported"
+
+[[role]]
+name = "one"
+read = ["urn:graph:g1"]
+write = ["urn:graph:g1"]
+default_graph = "read"
+"#;
+
+/// The status `roles` are told of `ask` inside an RDF4J transaction with `update` pending.
+async fn pending_status(
+    app: &Router,
+    roles: &[&str],
+    update: &str,
+    ask: &str,
+) -> TestResult<String> {
+    let bearer = format!("Bearer {}", token(roles));
+    let begin = Request::builder()
+        .method(Method::POST)
+        .uri("/repositories/nrese/transactions")
+        .header(header::AUTHORIZATION, &bearer)
+        .body(Body::empty())?;
+    let begin = app.clone().oneshot(begin).await?;
+    assert_eq!(begin.status(), StatusCode::CREATED);
+    let tx = begin.headers()[header::LOCATION].to_str()?.to_owned();
+    let form = serde_urlencoded::to_string([("update", format!("{PREFIXES} {update}"))])?;
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{tx}?action=UPDATE"))
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .header(header::AUTHORIZATION, &bearer)
+        .body(Body::from(form))?;
+    let response = app.clone().oneshot(request).await?;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "{}",
+        body_text(response).await?
+    );
+    let query = serde_urlencoded::to_string([("query", format!("{PREFIXES} {ask}"))])?;
+    let request = Request::builder()
+        .method(Method::PUT)
+        .uri(format!("{tx}?action=QUERY&{query}"))
+        .header(header::ACCEPT, "application/sparql-results+json")
+        .header(header::AUTHORIZATION, &bearer)
+        .body(Body::empty())?;
+    let response = app.clone().oneshot(request).await?;
+    let header = response.headers().get("nrese-completeness").cloned();
+    let body = body_text(response).await?;
+    let header = header.ok_or_else(|| format!("no status: {body}"))?;
+    Ok(header.to_str()?.to_owned())
+}
+
+/// Spec: docs/spec/reasoning-semantics.md (transactions): a read inside a transaction whose
+/// pending operations may delete is `unsound`, as they may delete what an inference rests
+/// on, when its view is certified; under compact equality a reader by support's view isn't
+/// its closure, so no certificate stands and it is `not-certified`, the pending reasons
+/// absorbed. So a reader by support of `:g1` asking for `ex:a ex:q ex:b` (which `:g1`
+/// entails) after a pending `DELETE DATA` of `ex:a ex:p ex:b` is told `unsound` with the
+/// delete reason under `representatives`, and `not-certified` under compact; after a pending
+/// insert of an unrelated statement, under compact, `not-certified`.
+#[tokio::test]
+async fn a_pending_delete_is_unsound_on_a_certified_view_and_a_compact_pending_read_not_certified()
+-> TestResult {
+    let delete = "DELETE DATA { GRAPH :g1 { ex:a ex:p ex:b } }";
+    let add = "INSERT DATA { GRAPH :g1 { ex:c ex:r ex:d } }";
+    let rows = [
+        ("representatives, pending delete", false, delete),
+        ("compact, pending delete", true, delete),
+        ("compact, pending insert", true, add),
+    ];
+    let mut wrong = Vec::new();
+    for (name, compact, update) in rows {
+        let app = test_app_with_store_config(
+            StoreConfig {
+                equality_compact: compact,
+                ql_rewriting: QlRewritingMode::On,
+                ..StoreConfig::default()
+            },
+            policy_of(WRITER_POLICY)?,
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+        )?;
+        let data = "GRAPH :g1 { ex:p <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> ex:q . \
+                    ex:a ex:p ex:b }";
+        insert(&app, data).await?;
+        let status = pending_status(&app, READER, update, "ASK { ex:a ex:q ex:b }").await?;
+        println!("SEEN {name}: {status:?}");
+        let right = match compact {
+            false => status.starts_with("unsound;") && status.contains("may delete"),
+            true => status == "not-certified",
+        };
+        if !right {
+            wrong.push(format!("{name}: {status:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "wrong rows:\n{}", wrong.join("\n"));
+    Ok(())
+}
