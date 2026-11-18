@@ -17,9 +17,9 @@ use crate::state::AppState;
 const QUERY_TIMEOUT_MESSAGE: &str = "query execution exceeded policy timeout";
 
 /// How long before the policy deadline an `owl2-dl` read stops deciding, so that its answer,
-/// told incomplete with the rows it has, is written before the deadline's 408: the time from
-/// that stop to the first frame written, at the bounds. Provisional, until measured.
-const DL_ANSWER_MARGIN: std::time::Duration = std::time::Duration::from_millis(250);
+/// told incomplete with the rows it has, is written before the deadline's 408: twice the largest
+/// time measured from that stop to the first frame, 0.135 s (57,000 individuals, a 10 s limit).
+const DL_ANSWER_MARGIN: std::time::Duration = std::time::Duration::from_millis(300);
 
 /// Evaluates a query and streams its results. The policy timeout is a real deadline: when
 /// it passes, evaluation is cancelled, whether or not results have started streaming.
