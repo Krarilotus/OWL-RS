@@ -223,11 +223,11 @@ pub(super) fn refuted_by_labels(
     cancellation: &CancellationToken,
     deadline: Deadline,
     memory: &nrese_exec::Envelope,
-) -> Vec<bool> {
+) -> nrese_exec::ChargedVec<bool, nrese_exec::Envelope> {
     use nrese_dl::tableau::{Answer, Cancel, Label, Want};
     let config = &store.config().dl;
     let stop = || cancellation.is_cancelled() || deadline.passed();
-    let none = Vec::new;
+    let none = || nrese_exec::ChargedVec::new(memory.clone());
     if stop() {
         return none();
     }
@@ -242,7 +242,7 @@ pub(super) fn refuted_by_labels(
         return none();
     };
     let mut scratch = nrese_dl::memory::Scratch::new(Some(memory));
-    let atoms_bytes = n * (size_of::<Option<(u64, u64)>>() + 2 * size_of::<u64>() + 1);
+    let atoms_bytes = n * (size_of::<Option<(u64, u64)>>() + 2 * size_of::<u64>());
     let premise = || nrese_dl::memory::ontology_bytes(base.value()) + atoms_bytes;
     if consistency::left_out(base.value()).is_some() || scratch.charge(premise).is_err() {
         return none();
@@ -303,7 +303,10 @@ pub(super) fn refuted_by_labels(
     let Some(labels) = out.labels.filter(|_| out.answer == Answer::Consistent) else {
         return none();
     };
-    let mut refuted = vec![false; n];
+    let mut refuted = nrese_exec::ChargedVec::new(memory.clone());
+    if refuted.resize(n, false).is_err() {
+        return none();
+    }
     for (r, atom) in atoms.iter().enumerate() {
         if r % 1024 == 0 && stop() {
             return none();

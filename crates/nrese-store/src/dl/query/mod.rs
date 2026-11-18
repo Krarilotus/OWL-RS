@@ -1245,7 +1245,7 @@ fn decide_answers(
                     labels_deadline,
                     memory,
                 ),
-                false => Vec::new(),
+                false => nrese_exec::ChargedVec::new(memory.clone()),
             };
             // No row past the capped read's first ones is admitted where its batches cost more.
             let most = |b: &[usize]| b.chunks(64).map(|c| c.iter().sum::<usize>()).max();
@@ -1254,7 +1254,8 @@ fn decide_answers(
             let (mut rows, mut bytes) = (refuted.iter(), refuted.iter());
             gap.rows.retain(|_| rows.next() != Some(&true));
             gap.bytes.retain(|_| bytes.next() != Some(&true));
-            let by_labels = refuted.into_iter().filter(|&r| r).count() as u64;
+            let by_labels = refuted.iter().filter(|&&r| r).count() as u64;
+            drop(refuted);
             if labelled {
                 gap.keep(limit.saturating_add(super::UNRESOLVED_SHOWN));
             }
