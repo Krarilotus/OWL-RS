@@ -29,6 +29,7 @@ mod query_protocol_tests;
 mod rdf4j_admission_tests;
 mod rdf4j_protocol_tests;
 mod read_ahead_tests;
+mod reader_status_tests;
 mod reasoning_certificate_tests;
 mod replica_fail_closed_tests;
 mod replication_apply_tests;
