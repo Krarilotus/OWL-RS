@@ -489,6 +489,48 @@ const READS: [&str; 3] = [
     "SELECT ?x { ?x ?p :q }",
 ];
 
+/// The answers of a one-variable `read` (with [`SH`]), sorted, and their status, each blank
+/// node written `_:` with the number of answers it is: two stores' answers are equal so exactly
+/// when they are equal up to a renaming of blank nodes. Each store labels a list's blank node
+/// its own way, and RDF graphs are equal up to that renaming (RDF 1.1 Concepts §3.6).
+fn up_to_blank_nodes(
+    dl: &nrese_store::MutationPipeline,
+    read: &str,
+) -> (Vec<String>, super::Status) {
+    let store = dl.store();
+    let request = nrese_store::SparqlQueryRequest::all(format!("{}{SH}{read}", super::PREFIXES));
+    let prepared = store.prepare_query(&request).expect("query");
+    let mut out = Vec::new();
+    let status = super::run_dl(store, &prepared, &mut out)
+        .expect("query")
+        .expect("a status under owl2-dl");
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("json results");
+    let answers: Vec<(bool, &str)> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|row| {
+            (
+                row["x"]["type"] == "bnode",
+                row["x"]["value"].as_str().unwrap_or("-"),
+            )
+        })
+        .collect();
+    let mut rows: Vec<String> = answers
+        .iter()
+        .map(|&(blank, value)| {
+            if blank {
+                let n = answers.iter().filter(|&&a| a == (true, value)).count();
+                format!("_:{n}")
+            } else {
+                value.trim_start_matches("http://example.com/").to_owned()
+            }
+        })
+        .collect();
+    rows.sort();
+    (rows, status)
+}
+
 /// A store given `first`, then `then`, in two commits, against a store given both in one,
 /// each after `ontology`: the route before the later commit, and what differs: the route
 /// after it and, for each of [`READS`], the answers and their status (the reasons printed).
@@ -526,7 +568,7 @@ fn after_is_fresh(
         wrong.push(format!("routes {routes:?}"));
     }
     for read in READS {
-        let [a, b] = [&later, &fresh].map(|dl| query(dl, &format!("{SH}{read}")));
+        let [a, b] = [&later, &fresh].map(|dl| up_to_blank_nodes(dl, read));
         let told = |(rows, status): &(Vec<String>, super::Status)| {
             format!("{rows:?}, {}", status.shared.as_str())
         };

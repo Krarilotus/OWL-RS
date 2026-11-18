@@ -191,7 +191,8 @@ const NAMED_BEFORE: [(&str, &str, &str, bool); 5] = [
 /// rules' route with the upper bound unavailable (its build gave up at its deadline, the build
 /// seam holding it past it), a commit giving a SHACL property its first content, where the
 /// store already names it ([`NAMED_BEFORE`]), takes the route a fresh read of the revision
-/// takes, and its upper bound is the one a store given the same statements at once builds.
+/// takes, and its upper bound is the one a store given the same statements in one commit
+/// builds.
 #[test]
 fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_with_the_bound_unavailable() {
     let timeout = std::time::Duration::from_millis(500);
@@ -202,15 +203,18 @@ fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_with_the_bou
         },
         ..StoreConfig::in_memory()
     };
-    let mut wrong = Vec::new();
-    for (what, prior, content, routed) in NAMED_BEFORE {
-        let store = Arc::new(StoreService::new(config()).unwrap());
-        let pipeline = MutationPipeline::new(
-            Arc::clone(&store),
+    let pipeline_for = |store: &Arc<StoreService>| {
+        MutationPipeline::new(
+            Arc::clone(store),
             Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
                 ReasoningMode::Owl2Dl,
             ))),
-        );
+        )
+    };
+    let mut wrong = Vec::new();
+    for (what, prior, content, routed) in NAMED_BEFORE {
+        let store = Arc::new(StoreService::new(config()).unwrap());
+        let pipeline = pipeline_for(&store);
         let data = format!("{PREFIXES} INSERT DATA {{ {OFF_THE_ROUTE} {prior} }}");
         store.update_str_ungated(&data).unwrap();
         // The revision's upper bound gives up: its build begins past its deadline.
@@ -221,13 +225,17 @@ fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_with_the_bou
         update(&store, &pipeline, &format!("INSERT DATA {{ {content} }}"));
         let (last, fresh_routed) = route(&store);
         let later = super::report(&store);
-        let fresh = StoreService::new(config()).unwrap();
-        let all = format!("{PREFIXES} INSERT DATA {{ {OFF_THE_ROUTE} {prior} {content} }}");
-        fresh.update_str_ungated(&all).unwrap();
+        // The store compared with is read as a user's store is: given the same statements in
+        // one commit, so it has the rules' closure and the status a user's read has (a write
+        // past the pipeline has neither).
+        let fresh = Arc::new(StoreService::new(config()).unwrap());
+        let all = format!("INSERT DATA {{ {OFF_THE_ROUTE} {prior} {content} }}");
+        update(&fresh, &pipeline_for(&fresh), &all);
         let once = super::report(&fresh);
         let line = format!(
             "{what}, off the route, the upper bound unavailable ({unavailable:?}): route {last}, \
-             a fresh read routed {fresh_routed}; the bound {:?} with {} facts, at once {:?} with {}",
+             a fresh read routed {fresh_routed}; the bound {:?} with {} facts, \
+             in one commit {:?} with {}",
             later.unavailable, later.upper_facts, once.unavailable, once.upper_facts
         );
         eprintln!("{line}");
