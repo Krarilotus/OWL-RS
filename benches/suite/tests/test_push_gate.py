@@ -336,6 +336,46 @@ class PushGate(Repo):
         self.assertEqual(self.jobs(), [(tip, self.tree(tip), ["a.txt", "b.txt"]), (tip, self.tree(tip), ["b.txt"])],
                          "SPEC pushed-range: the gate wasn't told the pushed range's files, for the pushed commit")
 
+    @unittest.skipUnless(shutil.which("flock"), "the gate job runs on Linux fleet hosts (flock)")
+    def test_a_range_too_long_for_a_request_is_listed_on_the_host_as_here(self):
+        """The fleet refuses a request over 64 KB, and a range's file list can be longer (a release
+        merge's listed 2,057 paths, 95 KB). Then the request names the range instead, and its step
+        makes the list on the host and hands gate-job.sh the list check.sh hashed here, whatever the
+        host's git configuration."""
+        names = [f"many/{n:04}-{'x' * 100}.txt" for n in range(600)]  # 69,000 bytes of paths
+        for name in names:
+            (self.repo / name).parent.mkdir(exist_ok=True)
+            (self.repo / name).write_text(f"{name}\n", newline="\n")
+        self.git(self.repo, "mv", "a.txt", "many/a.txt")  # a rename: listed once, by its new name
+        self.git(self.repo, "add", "-A")
+        self.git(self.repo, "commit", "-q", "-m", "many")
+        tip = self.git(self.repo, "rev-parse", "HEAD")
+        self.fleet("pending")
+        self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+        request = (self.fake / "job-0.toml").read_text()
+        self.assertLess(len(request.encode()), 64 * 1024, "SPEC long-range: the request is over the fleet's limit")
+        listed = "".join(f"{name}\n" for name in sorted([*names, "many/a.txt"])).encode()
+        want = subprocess.run(["git", "hash-object", "--stdin"], input=listed, capture_output=True, check=True,
+                              env=self.env).stdout.decode().strip()
+        step = json.loads(re.search(r"^steps = (.*)$", request, re.M).group(1))[0]
+        # The host: a git configured otherwise, the real gate-job.sh, no C compiler (its first check
+        # after the list's: exit 3, no verdict). gate-job.sh says why on its output, stderr included.
+        host, order = self.root / "host-gitconfig", self.root / "host-order"
+        order.write_text("many/a.txt\n")  # the rename first, where git's order has it last
+        # orderFile relative to the work tree's top: no temporary path in the config to quote.
+        host.write_text("[diff]\n\trenames = false\n\trenameLimit = 1\n\torderFile = ../host-order\n"
+                        "[core]\n\tquotePath = false\n")
+        shutil.copy(ROOT / "scripts/lib/gate-job.sh", self.repo / "scripts/lib/gate-job.sh")
+        out, cache = self.root / "out", self.root / "cache"
+        out.mkdir()
+        done = subprocess.run([BASH, *step[1:]], cwd=self.repo, capture_output=True, text=True, timeout=120,
+                              env={**self.env, "GIT_CONFIG_GLOBAL": host.as_posix(), "FLEET_OUT": str(out),
+                                   "NRESE_GATE_CACHE": str(cache), "HOME": str(self.root),
+                                   "NRESE_GATE_CC": "no-such-cc", "FLEET_JOB": "gate-1", "FLEET_STEP": "1"})
+        self.assertIn("no C compiler", done.stdout, f"SPEC long-range: the list didn't pass gate-job.sh's check\n"
+                                                    f"{done.stdout}{done.stderr}")
+        self.assertEqual((done.returncode, self.git(self.repo, "hash-object", str(cache / "files"))), (3, want))
+
     def test_landing_on_engine_v2_takes_the_windows_part_too(self):
         """A push to refactor/engine-v2 lands a merge: besides the push tier it needs the merge
         check's Windows part for the pushed commit, since nothing else builds and tests it on Windows

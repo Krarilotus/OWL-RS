@@ -2,7 +2,7 @@
 # The push tier of a pushed commit, or the merge check's Windows part, as a fleet job
 # (scripts/check.sh push, scripts/check.sh windows).
 #
-#   scripts/lib/fleet-gate.sh MODE LIST TREE LIST_HASH IDENTITY WHERE COMMIT
+#   scripts/lib/fleet-gate.sh MODE LIST TREE LIST_HASH IDENTITY WHERE COMMIT [BASE]
 #
 # MODE push: submits a job of kind owlrs.gate that runs the commit's own scripts/lib/gate-job.sh on
 # COMMIT (its tree TREE) with the changed files of LIST. The job yields to timed work: never
@@ -42,7 +42,7 @@
 # 16 threads, its owner's own load 2-6 of those); 6 cores took 696 s. The build and the tests are
 # what more cores speed up, not the suite contracts (466 s of the 899).
 set -u
-mode=$1 list=$2 tree=$3 list_hash=$4 identity=$5 where=$6 commit=$7
+mode=$1 list=$2 tree=$3 list_hash=$4 identity=$5 where=$6 commit=$7 base=${8:-}
 cd "$(git rev-parse --show-toplevel)" || exit 75
 export NRESE_FLEET_POLL_S=${NRESE_GATE_POLL_S:-10}
 fleet_label="fleet gate"
@@ -96,6 +96,17 @@ class=""
 if [ "${NRESE_PUSH_REF:-}" = refs/heads/refactor/engine-v2 ]; then
   class=merge-gate
 fi
+# A list longer than a step carries well within the fleet's 64 KB request is made on the host from
+# BASE..COMMIT, under git's defaults whatever the host's configuration (renames, their limit,
+# quoting, order); gate-job.sh checks it against LIST_HASH as it checks a list sent whole.
+long=""
+if [ "$mode" != windows ] && [ "$(wc -c < "$list")" -gt 16384 ]; then
+  long=1
+  [ -n "$base" ] && base=$(git rev-parse -q --verify "$base^{commit}") || no_verdict "a list this long needs its base"
+fi
+from_git='l=$(git -c diff.renames=true -c diff.renameLimit=1000 -c core.quotePath=true diff -O/dev/null --name-only "$4" "$5") || exit 3
+IFS="
+"; set -f; set -- "$1" "$2" "$3" -- $l; exec bash scripts/lib/gate-job.sh "$@"'
 job=$(mktemp)
 trap 'rm -f "$job"' EXIT
 
@@ -119,6 +130,9 @@ gate() {
     if [ "$mode" = windows ]; then
       printf 'steps = [["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", %s, %s]]\n' \
         '"scripts/lib/windows-job.ps1"' "$(q "$tree")"
+    elif [ -n "$long" ]; then
+      printf 'steps = [["bash", "-c", %s, "gate-list", %s, %s, %s, %s, %s]]\n' "$(q "$from_git")" \
+        "$(q "$mode")" "$(q "$tree")" "$(q "$list_hash")" "$(q "$base")" "$(q "$commit")"
     else
       printf 'steps = [["bash", "scripts/lib/gate-job.sh", %s, %s, %s, "--"' "$(q "$mode")" "$(q "$tree")" "$(q "$list_hash")"
       while IFS= read -r file; do printf ', %s' "$(q "$file")"; done < "$list"

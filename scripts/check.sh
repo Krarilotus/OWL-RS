@@ -395,7 +395,7 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
     fi
     exit 0
   fi
-  bash scripts/lib/fleet-gate.sh "$mode" "$list" "$tree" "$list_hash" "$identity" "$where" "$push_commit"
+  bash scripts/lib/fleet-gate.sh "$mode" "$list" "$tree" "$list_hash" "$identity" "$where" "$push_commit" "${push_base:-}"
   case $? in
     0) gate_record "$key" "$on$(cat "$where")"; exit 0 ;;
     1) exit 1 ;;
