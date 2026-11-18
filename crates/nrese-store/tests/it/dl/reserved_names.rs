@@ -173,15 +173,20 @@ fn owl_same_as_declared_an_annotation_property_reads_as_a_store_without_the_decl
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// How a store takes the commit of `data`: accepted, or rejected and by which constraint.
-fn taken(dl: &nrese_store::MutationPipeline, data: &str) -> String {
-    match insert(dl, data) {
-        Ok(_) => "accepted".to_owned(),
-        Err(nrese_store::MutationError::Rejected(reject)) => {
-            let by = reject.explanation.map(|e| e.violated_constraint);
-            format!("rejected by {by:?}")
+/// `Ok` where a fresh store rejects the commit of `data` as inconsistent; otherwise how it
+/// took it: accepted, rejected for another kind of reason, or failed.
+fn rejected_as_inconsistent(data: &str) -> Result<(), String> {
+    match insert(&pipeline(), data) {
+        Err(nrese_store::MutationError::Rejected(reject))
+            if reject.kind == nrese_store::RejectKind::Inconsistent =>
+        {
+            Ok(())
         }
-        Err(other) => format!("failed: {other:?}"),
+        Err(nrese_store::MutationError::Rejected(reject)) => {
+            Err(format!("rejected as {:?}: {}", reject.kind, reject.detail))
+        }
+        Ok(_) => Err("accepted".to_owned()),
+        Err(other) => Err(format!("failed: {other:?}")),
     }
 }
 
@@ -189,25 +194,17 @@ fn taken(dl: &nrese_store::MutationPipeline, data: &str) -> String {
 /// §5.5 lets of the reserved vocabulary only the nine built-in annotation properties be
 /// annotation properties, so declared one it is none; Direct Semantics: no pair is in the
 /// bottom object property's extension, so an assertion of it has no model): the commit of
-/// `:s owl:bottomObjectProperty :o` beside that declaration is taken as the same commit
-/// without it: rejected alike, or accepted alike and each read the same.
+/// `:s owl:bottomObjectProperty :o` is rejected as inconsistent, beside that declaration as
+/// without it.
 #[test]
 fn owl_bottom_object_property_declared_an_annotation_property_reads_as_a_store_without_the_declaration()
  {
     let rest = ":s owl:bottomObjectProperty :o .";
-    let (declared, without) = (pipeline(), pipeline());
-    let declaration = "owl:bottomObjectProperty a owl:AnnotationProperty .";
-    let commits = [
-        taken(&declared, &format!("{declaration} {rest}")),
-        taken(&without, rest),
-    ];
-    eprintln!("commits {commits:?} (declared, without)");
-    let mut wrong = Vec::new();
-    if commits[0] != commits[1] {
-        wrong.push(format!("commits {commits:?}"));
-    } else if commits[0] == "accepted" {
-        wrong.extend(differs(&declared, &without, &["SELECT ?x { ?x ?p :o }"]));
-    }
+    let declared = format!("owl:bottomObjectProperty a owl:AnnotationProperty . {rest}");
+    let commits = [("declared", declared.as_str()), ("without", rest)]
+        .map(|(which, data)| (which, rejected_as_inconsistent(data)));
+    eprintln!("commits {commits:?}");
+    let wrong: Vec<_> = commits.iter().filter(|(_, taken)| taken.is_err()).collect();
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
