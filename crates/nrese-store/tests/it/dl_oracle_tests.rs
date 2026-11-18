@@ -905,6 +905,29 @@ fn declined_cases_are_not_undecided_but_a_family_compares_half() {
     assert_eq!(judge(&counts, later), ["disjoint: 4 of 10 compared"]);
 }
 
+/// Undecided verdicts (a budget's, the deadline's) are at most a fifth of the compared and
+/// undecided ones. A family of ten, two undecided, passes; three undecided beside a family
+/// that agrees fail that family alone. Two families too small to be judged alone, each a
+/// third undecided, fail the run's total.
+#[test]
+fn undecided_verdicts_past_a_fifth_fail_their_family_and_the_total() {
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let at_a_fifth: Counts = [("disjoint", [8, 0, 0, 0, 2, 0, 0])].into_iter().collect();
+    assert_eq!(judge(&at_a_fifth, later), Vec::<String>::new());
+    let past = [
+        ("disjoint", [7, 0, 0, 0, 3, 0, 0]),
+        ("uniform", [90, 0, 0, 0, 0, 0, 0]),
+    ];
+    let past: Counts = past.into_iter().collect();
+    assert_eq!(judge(&past, later), ["disjoint: 3 of 10 undecided"]);
+    let small = [
+        ("left", [4, 0, 0, 0, 2, 0, 0]),
+        ("sol", [4, 0, 0, 0, 2, 0, 0]),
+    ];
+    let small: Counts = small.into_iter().collect();
+    assert_eq!(judge(&small, later), ["total: 4 of 12 undecided"]);
+}
+
 /// - Input: every element is in C0 (`owl:Thing ⊑ C0`), the classes are names with no
 ///   individual, and a union takes the data off the rules route; the read is `?x a C0`.
 /// - Expected: owl2-dl proves C0 holds of every element and refuses an exact answer, so
@@ -923,7 +946,9 @@ fn a_read_every_element_answers_is_declined() {
         query: "SELECT ?x { ?x a <http://e/C0> }",
     };
     let expiry = Expiry::at(std::time::Instant::now() + std::time::Duration::from_secs(120));
-    for (ruleset, verdict) in verdicts(&case, Relation::Direct, &expiry) {
+    let found = verdicts(&case, Relation::Direct, &expiry);
+    assert_eq!(found.len(), 2, "{found:?}");
+    for (ruleset, verdict) in found {
         assert!(
             matches!(verdict, Verdict::Declined(_)),
             "{}: {verdict:?}",
