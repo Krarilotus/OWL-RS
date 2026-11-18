@@ -16,6 +16,11 @@ use crate::state::AppState;
 
 const QUERY_TIMEOUT_MESSAGE: &str = "query execution exceeded policy timeout";
 
+/// How long before the policy deadline an `owl2-dl` read stops deciding, so that its answer,
+/// told incomplete with the rows it has, is written before the deadline's 408: the time from
+/// that stop to the first frame written, at the bounds. Provisional, until measured.
+const DL_ANSWER_MARGIN: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Evaluates a query and streams its results. The policy timeout is a real deadline: when
 /// it passes, evaluation is cancelled, whether or not results have started streaming.
 pub async fn execute_query(
@@ -52,6 +57,8 @@ pub async fn execute_query_in(
     let mut request = build_query_request(operation);
     let memory = policy.limits.max_query_memory_bytes;
     request.memory_limit = (memory > 0).then_some(memory);
+    let at = deadline.into_std();
+    request.deadline = Some(at.checked_sub(DL_ANSWER_MARGIN).unwrap_or(at));
     // Prefixes it doesn't declare mean what the repository's namespaces say.
     let mut prepared = state
         .store()
