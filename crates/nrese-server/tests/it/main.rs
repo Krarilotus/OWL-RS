@@ -30,6 +30,8 @@ mod rdf4j_admission_tests;
 mod rdf4j_client_shapes_tests;
 mod rdf4j_protocol_tests;
 mod read_ahead_tests;
+mod reader_status_tests;
+mod reader_view_withholds_tests;
 mod reasoning_certificate_tests;
 mod replica_fail_closed_tests;
 mod replication_apply_tests;

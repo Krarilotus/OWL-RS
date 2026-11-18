@@ -179,7 +179,7 @@ fn gathered(reading: &Reading, tx: &Transaction<'_>) -> Snapshot {
         .collect();
     kept.sort_unstable();
     tx.pending_snapshot()
-        .with_inferred_only(&kept, &Arc::new(Budget::unlimited()))
+        .with_inferred_only(&kept, true, &Arc::new(Budget::unlimited()))
         .unwrap()
 }
 

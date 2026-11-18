@@ -596,6 +596,48 @@ async fn scoped_rows_and_explanations_are_not_certified() -> TestResult {
 }
 
 #[tokio::test]
+async fn a_scoped_read_of_a_withheld_view_with_no_inferred_statement_is_not_certified() -> TestResult
+{
+    // Spec: Dataset-scoped reads and their explanations carry the not-certified completeness
+    // header, also where the reader's view holds no inferred statement: `:g1` asserts the
+    // owl2-rl closure of `ex:a ex:p ex:b` (taken from a store holding that fact alone), and
+    // an unrelated chain axiom on a list with no `rdf:rest` in `:g2`, which the reader by
+    // support of `:g1` can't read, makes the support grounding leave a list out.
+    let source = app(StoreConfig::default(), false)?;
+    insert(&source, G1_FACT).await?;
+    let closure = select(&source, &[], "", "?s ?p ?o", "", "{ ?s ?p ?o }")
+        .await?
+        .rows()
+        .map_err(|refused| format!("{refused:?}"))?;
+    let closure: String = closure
+        .iter()
+        .map(|row| format!("{} . ", row.replace('\t', " ")))
+        .collect();
+    let app = app(StoreConfig::default(), true)?;
+    let first = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#first>";
+    let chain = "<http://www.w3.org/2002/07/owl#propertyChainAxiom>";
+    insert(
+        &app,
+        &format!(
+            "GRAPH :g1 {{ ex:a ex:p ex:b . {closure} }} GRAPH :g2 {{ ex:q {chain} _:l . _:l {first} ex:r }}"
+        ),
+    )
+    .await?;
+    let pattern = "{ ?s ex:p ex:b }";
+    let mut told = Vec::new();
+    for options in ["", "&explain=true", "&explain=plan"] {
+        let options = format!("{SCOPED}{options}");
+        let reply = select(&app, READER, &options, "?s", G1, pattern).await?;
+        assert_eq!(reply.code, StatusCode::OK, "{reply:?}");
+        told.push(format!("{options}: {:?}", reply.completeness));
+    }
+    let want = ["", "&explain=true", "&explain=plan"]
+        .map(|options| format!("{SCOPED}{options}: Some(\"not-certified\")"));
+    assert_eq!(told, want, "the closure asserted in :g1: {closure}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn ordinary_datasets_keep_their_rows_and_completeness() -> TestResult {
     // Spec: Without inference-scope, plain FROM selects stored graphs and the two
     // pseudo-graphs and infer=false keep their existing rows and completeness.
