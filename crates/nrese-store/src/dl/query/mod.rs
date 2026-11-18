@@ -1337,7 +1337,11 @@ fn decide_answers(
             let admitted = start;
             counts.unresolved += left.saturating_sub(admitted as u64);
             if left > admitted as u64 {
-                why.get_or_insert_with(|| stop.unwrap_or_else(|| Limit::Candidates.reached(limit)));
+                // A stop is named beside an earlier batch's reason; without one, the limit is.
+                why = match (why, stop) {
+                    (Some(w), Some(s)) if w != s => Some(format!("{w}; {s}")),
+                    (w, s) => w.or(s).or_else(|| Some(Limit::Candidates.reached(limit))),
+                };
                 for &index in &gap.rows[admitted..] {
                     if status.detail.unresolved.len() == super::UNRESOLVED_SHOWN {
                         break;
