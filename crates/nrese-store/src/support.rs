@@ -1915,6 +1915,15 @@ pub(crate) struct Compilation {
     pub(crate) replica: bool,
 }
 
+impl Compilation {
+    /// Whether support graph sets are computed ([`Supports::compute`]): not under compact
+    /// equality, whose stack is over representatives. Without them a reader by support sees
+    /// no inferred statement, so its view isn't its closure.
+    pub(crate) fn computes_sets(self) -> bool {
+        !self.compact
+    }
+}
+
 /// What one read sees of the store, the one decision of it ([`Reading::of`]): of a committed
 /// revision ([`Self::committed`]) or of a transaction's pending state ([`Self::pending`]).
 /// Queries, EXPLAIN, statement and graph reads, explanations and reads in a client
@@ -2862,7 +2871,7 @@ impl Supports {
         let Some(rules) = &generation.rules else {
             return Ok(None);
         };
-        if compilation.compact {
+        if !compilation.computes_sets() {
             return Ok(None);
         }
         let program = self.program(rules, snapshot, compilation)?;

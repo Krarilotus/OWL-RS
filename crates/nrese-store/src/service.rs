@@ -1253,7 +1253,7 @@ impl StoreService {
         Option<nrese_sparql::ql::QlReport>,
     )> {
         let run = self.run_reporting_whole(prepared, cancellation, out, report);
-        let run = run.map_err(|error| refusal_for_its_reader(prepared, error));
+        let run = run.map_err(|error| refusal_for_its_reader(self, prepared, error));
         for_its_reader(prepared, crate::EntryPoint::Run, run, |_| {})
     }
 
@@ -1280,7 +1280,10 @@ impl StoreService {
             use crate::dl::query::{Outcome, Read};
             let detail = match answer(self, &snapshot, prepared, cancellation, &memory, mode)? {
                 Outcome::Answers(answers, status, detail) => {
-                    report(status_for_its_reader(prepared, Some(status), false), None);
+                    report(
+                        status_for_its_reader(self, prepared, Some(status), false),
+                        None,
+                    );
                     crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
                     detail
                 }
@@ -1300,7 +1303,7 @@ impl StoreService {
                         &memory,
                         out,
                         |_| {
-                            let told = status_for_its_reader(prepared, Some(status), false);
+                            let told = status_for_its_reader(self, prepared, Some(status), false);
                             (context, move |kept| report(told, kept))
                         },
                     )?;
@@ -1327,11 +1330,14 @@ impl StoreService {
                 let status = self.status_outside_dl(prepared, ql, at);
                 // The cache's context is the whole assessment, not what the reader is told.
                 let context = context_outside_dl(status.as_ref(), ql.is_some());
-                let told = status_for_its_reader(prepared, status, ql.is_some());
+                let told = status_for_its_reader(self, prepared, status, ql.is_some());
                 (context, move |kept| report(told, kept))
             },
         )?;
-        Ok((None, ql.filter(|_| !withholds_certification(prepared))))
+        Ok((
+            None,
+            ql.filter(|_| !withholds_certification(self, prepared)),
+        ))
     }
 
     /// The status of answers outside the DL bounds: the QL rewriting's report where it ran,
@@ -1418,7 +1424,7 @@ impl StoreService {
     ) -> Option<nrese_sparql::Completeness> {
         let status =
             self.status_outside_dl(prepared, None, Revision::Committed(&self.engine.snapshot()));
-        status_for_its_reader(prepared, status, false)
+        status_for_its_reader(self, prepared, status, false)
     }
 
     /// [`Self::status_without_dl`] of a read of the data `at`.
@@ -1523,6 +1529,7 @@ impl StoreService {
                 explanation.rewrites.clear();
                 explanation.decoded = 0;
                 certification_for_its_reader(
+                    self,
                     prepared,
                     &mut explanation.completeness,
                     &mut explanation.ql,
@@ -1587,7 +1594,12 @@ impl StoreService {
             |planned| {
                 planned.steps.clear();
                 planned.rewrites.clear();
-                certification_for_its_reader(prepared, &mut planned.completeness, &mut planned.ql);
+                certification_for_its_reader(
+                    self,
+                    prepared,
+                    &mut planned.completeness,
+                    &mut planned.ql,
+                );
             },
         )
     }
@@ -1822,7 +1834,7 @@ impl StoreService {
         let latest = &self.engine.snapshot();
         let committed = self.view_of(latest, prepared.access(), &memory, Some(cancellation));
         if let Err(error) = committed.map(|view| prepared.announce_on(&view)) {
-            let run = Err(refusal_for_its_reader(prepared, error));
+            let run = Err(refusal_for_its_reader(self, prepared, error));
             return for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {});
         }
         let run = self.with_pending(pending, &scope, &memory, cancellation, |snapshot| {
@@ -1841,13 +1853,16 @@ impl StoreService {
                 |ql| {
                     // A transaction's pending state: never answered from the cache.
                     let status = self.status_outside_dl(prepared, ql, at);
-                    report(status_for_its_reader(prepared, status, ql.is_some()), None);
+                    report(
+                        status_for_its_reader(self, prepared, status, ql.is_some()),
+                        None,
+                    );
                     (Vec::new(), |_| None)
                 },
             )
             .map(|_| ())
         });
-        let run = run.map_err(|error| refusal_for_its_reader(prepared, error));
+        let run = run.map_err(|error| refusal_for_its_reader(self, prepared, error));
         for_its_reader(prepared, crate::EntryPoint::RunPending, run, |_| {})
     }
 
@@ -2657,14 +2672,20 @@ fn read_model(infer: bool) -> crate::ReadModel {
 /// on the schema, so the token tells nothing of hidden data. So is every reader of some
 /// graphs told it for a status under `owl2-dl`: whether OWL 2 DL reads the data
 /// otherwise than the rules is a question of every graph's axioms
-/// ([`crate::dl::query::mark`]), and the regime is the configuration's.
+/// ([`crate::dl::query::mark`]), and the regime is the configuration's. So is a reader
+/// whose view isn't its closure ([`reads_without_closure`]) told it for any status: each
+/// speaks of a closure that reader doesn't read.
 fn status_for_its_reader(
+    store: &StoreService,
     prepared: &PreparedQuery,
     status: Option<nrese_sparql::Completeness>,
     rewritten: bool,
 ) -> Option<nrese_sparql::Completeness> {
     let dl = status.as_ref().and_then(|s| s.regime) == Some(nrese_sparql::Regime::Owl2Dl);
-    match (rewritten && withholds_certification(prepared)) || (dl && prepared.access().is_some()) {
+    let withheld = (rewritten && withholds_certification(store, prepared))
+        || (dl && prepared.access().is_some())
+        || (status.is_some() && reads_without_closure(store, prepared));
+    match withheld {
         true => Some(nrese_sparql::Completeness::not_certified()),
         false => status,
     }
@@ -2672,11 +2693,15 @@ fn status_for_its_reader(
 
 /// An exact answer's refusal as its reader may be told it: its status through
 /// [`status_for_its_reader`], its unresolved candidates only where that is the status.
-fn refusal_for_its_reader(prepared: &PreparedQuery, error: crate::StoreError) -> crate::StoreError {
+fn refusal_for_its_reader(
+    store: &StoreService,
+    prepared: &PreparedQuery,
+    error: crate::StoreError,
+) -> crate::StoreError {
     let crate::StoreError::Incomplete(mut answer) = error else {
         return error;
     };
-    let told = status_for_its_reader(prepared, Some(answer.status.clone()), false);
+    let told = status_for_its_reader(store, prepared, Some(answer.status.clone()), false);
     if let Some(told) = told.filter(|told| *told != answer.status) {
         answer.status = told;
         answer.unresolved.clear();
@@ -2687,22 +2712,35 @@ fn refusal_for_its_reader(prepared: &PreparedQuery, error: crate::StoreError) ->
 /// [`status_for_its_reader`] for an answer that carries the rewriting's report too, as an
 /// EXPLAIN does: the status as its reader is told it, and no report where that is withheld.
 fn certification_for_its_reader(
+    store: &StoreService,
     prepared: &PreparedQuery,
     completeness: &mut Option<nrese_sparql::Completeness>,
     ql: &mut Option<nrese_sparql::ql::QlReport>,
 ) {
-    *completeness = status_for_its_reader(prepared, completeness.take(), ql.is_some());
-    if withholds_certification(prepared) {
+    *completeness = status_for_its_reader(store, prepared, completeness.take(), ql.is_some());
+    if withholds_certification(store, prepared) {
         *ql = None;
     }
 }
 
 /// Whether `prepared`'s reader is told no assessment of the rewriting, neither its status
-/// nor its report ([`status_for_its_reader`]).
-fn withholds_certification(prepared: &PreparedQuery) -> bool {
+/// nor its report ([`status_for_its_reader`]): one who sees every inference, and one whose
+/// view isn't its closure.
+fn withholds_certification(store: &StoreService, prepared: &PreparedQuery) -> bool {
     prepared
         .access()
         .is_some_and(|access| access.inferred && !access.inferred_by_support)
+        || reads_without_closure(store, prepared)
+}
+
+/// Whether `prepared`'s reader reads by support where no support graph sets are computed
+/// ([`crate::support::Compilation::computes_sets`]): its view holds no inferred statement,
+/// and no certificate covers it.
+fn reads_without_closure(store: &StoreService, prepared: &PreparedQuery) -> bool {
+    prepared
+        .access()
+        .is_some_and(|access| access.inferred_by_support)
+        && !store.support_compilation().computes_sets()
 }
 
 /// Whether `op` only adds statements: an Add, or an update of `INSERT DATA` alone as it
