@@ -489,10 +489,11 @@ const READS: [&str; 3] = [
     "SELECT ?x { ?x ?p :q }",
 ];
 
-/// The answers of a one-variable `read` (with [`SH`]), sorted, and their status, each blank
-/// node written `_:` with the number of answers it is: two stores' answers are equal so exactly
-/// when they are equal up to a renaming of blank nodes. Each store labels a list's blank node
-/// its own way, and RDF graphs are equal up to that renaming (RDF 1.1 Concepts §3.6).
+/// The answers of a one-variable `read` (with [`SH`]), sorted, and their status: an IRI written
+/// whole (`<…>`), a literal quoted, and each blank node `_:` with the number of answers it is.
+/// Two stores' answers are equal so exactly when they are equal up to a renaming of blank
+/// nodes: each store labels a list's blank node its own way, and RDF graphs are equal up to
+/// that renaming (RDF 1.1 Concepts §3.6).
 fn up_to_blank_nodes(
     dl: &nrese_store::MutationPipeline,
     read: &str,
@@ -505,26 +506,27 @@ fn up_to_blank_nodes(
         .expect("query")
         .expect("a status under owl2-dl");
     let json: serde_json::Value = serde_json::from_slice(&out).expect("json results");
-    let answers: Vec<(bool, &str)> = json["results"]["bindings"]
+    let answers: Vec<(&str, &str)> = json["results"]["bindings"]
         .as_array()
         .expect("bindings")
         .iter()
         .map(|row| {
+            let x = &row["x"];
             (
-                row["x"]["type"] == "bnode",
-                row["x"]["value"].as_str().unwrap_or("-"),
+                x["type"].as_str().unwrap_or("-"),
+                x["value"].as_str().unwrap_or("-"),
             )
         })
         .collect();
     let mut rows: Vec<String> = answers
         .iter()
-        .map(|&(blank, value)| {
-            if blank {
-                let n = answers.iter().filter(|&&a| a == (true, value)).count();
+        .map(|&(kind, value)| match kind {
+            "bnode" => {
+                let n = answers.iter().filter(|&&a| a == (kind, value)).count();
                 format!("_:{n}")
-            } else {
-                value.trim_start_matches("http://example.com/").to_owned()
             }
+            "uri" => format!("<{value}>"),
+            _ => format!("{value:?}"),
         })
         .collect();
     rows.sort();
@@ -553,7 +555,8 @@ fn after_is_fresh(
     let (later, fresh) = (pipeline(), pipeline());
     insert(&later, ontology).expect("the ontology");
     shapes_insert(&later, first).expect("the first commit");
-    let before = later.store().dl_bounds().last;
+    let bounds = later.store().dl_bounds();
+    let before = bounds.last;
     super::update(&later, &format!("{SH}{then}")).expect("the later commit");
     insert(&fresh, ontology).expect("the ontology");
     shapes_insert(&fresh, statements).expect("one commit");
@@ -563,6 +566,11 @@ fn after_is_fresh(
     ];
     eprintln!("route {before}, then {routes:?} (later, fresh)");
     let mut wrong = Vec::new();
+    // Off the rules' route, the state before `then` is the one these cases claim: the upper
+    // bound built (the unavailable one is the unit tests', `bounds_shapes_tests.rs`).
+    if before != "rules" && bounds.unavailable.is_some() {
+        wrong.push(format!("before the later commit: {:?}", bounds.unavailable));
+    }
     // On the rules' route or off it: off it, a bound changed and one rebuilt are one route.
     if (routes[0] == "rules") != (routes[1] == "rules") {
         wrong.push(format!("routes {routes:?}"));

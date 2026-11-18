@@ -187,12 +187,80 @@ const NAMED_BEFORE: [(&str, &str, &str, bool); 5] = [
     ),
 ];
 
+/// The reads a commit's store and a fresh one are compared by, as the integration tests'
+/// (`tests/it/dl/shapes.rs`): through `sh:path`, of `owl:Thing`, through any predicate.
+const READS: [&str; 3] = [
+    "SELECT ?x { ?x sh:path ?o }",
+    "SELECT ?x { ?x a owl:Thing }",
+    "SELECT ?x { ?x ?p :q }",
+];
+
+/// The answers of a one-variable `read`, sorted, and their status: an IRI written whole, a
+/// literal quoted, each blank node `_:` with the number of answers it is, so that two stores'
+/// answers are equal exactly when they are equal up to a renaming of blank nodes (RDF 1.1
+/// Concepts §3.6).
+fn answers(store: &StoreService, read: &str) -> (Vec<String>, &'static str) {
+    let request = crate::SparqlQueryRequest::all(format!("{PREFIXES}{read}"));
+    let prepared = store.prepare_query(&request).expect("query");
+    let mut out = Vec::new();
+    let (status, _) = store
+        .run_query_dl(&prepared, &crate::CancellationToken::new(), &mut out)
+        .expect("query")
+        .expect("a status under owl2-dl");
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("json results");
+    let cells: Vec<(&str, &str)> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|row| {
+            let x = &row["x"];
+            (
+                x["type"].as_str().unwrap_or("-"),
+                x["value"].as_str().unwrap_or("-"),
+            )
+        })
+        .collect();
+    let mut rows: Vec<String> = cells
+        .iter()
+        .map(|&(kind, value)| match kind {
+            "bnode" => {
+                let n = cells.iter().filter(|&&c| c == (kind, value)).count();
+                format!("_:{n}")
+            }
+            "uri" => format!("<{value}>"),
+            _ => format!("{value:?}"),
+        })
+        .collect();
+    rows.sort();
+    (rows, status.as_str())
+}
+
+/// U1's facts beyond L, sorted, each blank node (`_:…`) written `_:` with the number of facts
+/// it is in. U1's own names are the same in both stores (`<dl u1 …>`); facts equal up to a
+/// renaming of blank nodes compare equal, and different ones compare different unless two blank
+/// nodes in as many facts trade places, which these cases' data, with one blank node an
+/// individual at most (the list of `(d)`), can't give.
+fn facts(store: &StoreService) -> Option<Vec<[String; 3]>> {
+    let facts = super::upper_facts(store, false)?;
+    let in_facts = |b: &str| facts.iter().filter(|f| f.iter().any(|t| t == b)).count();
+    let renamed = |t: String| {
+        if t.starts_with("_:") {
+            format!("_:{}", in_facts(&t))
+        } else {
+            t
+        }
+    };
+    let mut renamed: Vec<[String; 3]> = facts.iter().map(|f| f.clone().map(renamed)).collect();
+    renamed.sort();
+    Some(renamed)
+}
+
 /// Spec (a store's reading after any history equals a fresh read of its statements): off the
 /// rules' route with the upper bound unavailable (its build gave up at its deadline, the build
 /// seam holding it past it), a commit giving a SHACL property its first content, where the
 /// store already names it ([`NAMED_BEFORE`]), takes the route a fresh read of the revision
-/// takes, and its upper bound is the one a store given the same statements in one commit
-/// builds.
+/// takes, and the route, U1's facts and the answers of a store given the same statements in one
+/// commit.
 #[test]
 fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_with_the_bound_unavailable() {
     let timeout = std::time::Duration::from_millis(500);
@@ -234,18 +302,30 @@ fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_with_the_bou
         let once = super::report(&fresh);
         let line = format!(
             "{what}, off the route, the upper bound unavailable ({unavailable:?}): route {last}, \
-             a fresh read routed {fresh_routed}; the bound {:?} with {} facts, \
-             in one commit {:?} with {}",
-            later.unavailable, later.upper_facts, once.unavailable, once.upper_facts
+             a fresh read routed {fresh_routed}, in one commit {}; the bound {:?}, in one \
+             commit {:?}",
+            once.last, later.unavailable, once.unavailable
         );
         eprintln!("{line}");
         if unavailable.is_none()
             || (last == "rules") != routed
             || fresh_routed != routed
+            || (once.last == "rules") != routed
             || later.unavailable != once.unavailable
-            || later.upper_facts != once.upper_facts
         {
             wrong.push(line);
+        }
+        let (kept, built) = (facts(&store), facts(&fresh));
+        if kept != built {
+            wrong.push(format!(
+                "{what}: U1's facts {kept:?}, in one commit {built:?}"
+            ));
+        }
+        for read in READS {
+            let (a, b) = (answers(&store, read), answers(&fresh, read));
+            if a != b {
+                wrong.push(format!("{what}: {read}: {a:?}, in one commit {b:?}"));
+            }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
