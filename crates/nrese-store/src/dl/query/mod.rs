@@ -1259,10 +1259,10 @@ fn decide_answers(
             drop(refuted);
             gap.keep(limit.saturating_add(super::UNRESOLVED_SHOWN));
             let left = gap.total - by_labels;
-            let mut admitted = limit.min(gap.rows.len());
-            if most(&gap.bytes[..admitted]) > prefix {
-                admitted = own;
-            }
+            let (admitted, width) = match limit.min(gap.rows.len()) {
+                n if most(&gap.bytes[..n]) > prefix => (own, 1),
+                n => (n, 64),
+            };
             let mut counts = Counts {
                 lower: gap.lower,
                 upper: Some(gap.lower + gap.total),
@@ -1274,8 +1274,8 @@ fn decide_answers(
             let mut why = None;
             pair.reserve_appends(admitted)?;
             // Bounds, candidate production and all batches share the entry deadline.
-            for start in (0..admitted).step_by(64) {
-                let end = (start + 64).min(admitted);
+            for start in (0..admitted).step_by(width) {
+                let end = (start + width).min(admitted);
                 let mut batch_memory = nrese_exec::Reservation::new(&*budget);
                 batch_memory.charge(gap.bytes[start..end].iter().sum())?;
                 let rows: Vec<_> = gap.rows[start..end]
