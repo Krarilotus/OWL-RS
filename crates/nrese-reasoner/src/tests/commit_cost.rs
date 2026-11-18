@@ -52,26 +52,30 @@ fn chain(vocabulary: &mut LocalVocabulary, classes: usize, equal: Equal) -> Vec<
     asserted
 }
 
-/// One commit of `inserted` and `deleted` over `asserted` and its closure, under DRed:
-/// the maintained inferred stack against a rematerialisation's, and the partner reads it
-/// took on this thread.
+/// One commit of `inserted` and `deleted` over `asserted` and its closure, under DRed, by
+/// OWL 2 RL or by `custom` rules (in the rule syntax, without lists): the maintained inferred
+/// stack against a rematerialisation's, and the partner reads it took on this thread.
 fn commit(
     vocabulary: &mut LocalVocabulary,
+    custom: Option<&str>,
     asserted: &[Triple],
     inserted: &[Triple],
     deleted: &[Triple],
 ) -> (Vec<Triple>, Vec<Triple>, u64) {
-    let rules = Ruleset::Owl2Rl.rules(vocabulary).unwrap();
-    let lists = ListVocabulary::new(vocabulary);
+    let rules = match custom {
+        None => Ruleset::Owl2Rl.rules(vocabulary).unwrap(),
+        Some(text) => crate::ir::parse_rules(text, vocabulary).unwrap(),
+    };
+    let lists = custom.is_none().then(|| ListVocabulary::new(vocabulary));
     let schema = Schema::owl(vocabulary);
     let compiled = Rules {
         rules: &rules,
-        lists: Some(&lists),
+        lists: lists.as_ref(),
         schema: &schema,
         equality: crate::representatives::same_as(&rules, schema.same_as()),
     };
     let closure =
-        |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema).derived;
+        |asserted: &[Triple]| batch::materialise(asserted, &rules, lists.as_ref(), &schema).derived;
     let before = closure(asserted);
     let mut after: Vec<Triple> = asserted
         .iter()
@@ -123,7 +127,8 @@ fn an_insert_reads_nothing_that_grows_with_the_schema() {
         let mut vocabulary = LocalVocabulary::default();
         let asserted = chain(&mut vocabulary, classes, Equal::Nothing);
         let inserted = load(&mut vocabulary, "ex:w ex:value ex:v");
-        let (maintained, expected, reads) = commit(&mut vocabulary, &asserted, &inserted, &[]);
+        let (maintained, expected, reads) =
+            commit(&mut vocabulary, None, &asserted, &inserted, &[]);
         assert_eq!(maintained, expected, "{classes} classes: rematerialised");
         assert_eq!(reads, 0, "{classes} classes: partner reads of an insert");
     }
@@ -139,7 +144,7 @@ fn a_delete_without_candidates_reads_nothing_that_grows_with_the_schema() {
         let deleted = load(&mut vocabulary, "ex:w ex:value ex:v");
         asserted.extend(deleted.iter().copied());
         asserted.sort_unstable();
-        let (maintained, expected, reads) = commit(&mut vocabulary, &asserted, &[], &deleted);
+        let (maintained, expected, reads) = commit(&mut vocabulary, None, &asserted, &[], &deleted);
         assert_eq!(maintained, expected, "{classes} classes: rematerialised");
         assert_eq!(
             reads, 0,
@@ -159,9 +164,50 @@ fn a_delete_with_a_candidate_keeps_what_remains_derived() {
         let asserted = chain(&mut vocabulary, 10, equal);
         let deleted = load(&mut vocabulary, "ex:a rdf:type ex:C0");
         let kept = load(&mut vocabulary, "ex:a rdf:type ex:C1")[0];
-        let (maintained, expected, reads) = commit(&mut vocabulary, &asserted, &[], &deleted);
+        let (maintained, expected, reads) = commit(&mut vocabulary, None, &asserted, &[], &deleted);
         assert!(expected.binary_search(&kept).is_ok(), "rematerialised");
         assert_eq!(maintained, expected, "{equal:?}");
         assert!(reads > 0, "{equal:?}: the analysis a candidate asks for");
     }
+}
+
+/// A candidate whose one remaining derivation runs back through an equality of classes is not
+/// kept. Under the fixed rules `type(D) -> type(E)` and `type(C0) -> type(E)`, with the
+/// equality rules over `D owl:sameAs E` (they copy `type(E)` to `type(D)`), deleting `ex:a`'s
+/// only asserted type `C0` leaves it no type, as a rematerialisation does. Its types `E` and `D`
+/// then derive each other only through that equality, which the recursion analysis reads as an
+/// edge between the two classes: without it, `type(D) -> type(E)` counts as non-recursive and
+/// keeps both.
+#[test]
+fn a_class_equality_is_an_edge_of_the_recursion_analysis() {
+    let rules = "sym: (?a owl:sameAs ?b) -> (?b owl:sameAs ?a)
+trans: (?b owl:sameAs ?c), (?a owl:sameAs ?b) -> (?a owl:sameAs ?c)
+subject: (?x ?y ?z), (?x owl:sameAs ?w) -> (?w ?y ?z)
+predicate: (?x ?y ?z), (?y owl:sameAs ?w) -> (?x ?w ?z)
+object: (?x ?y ?z), (?z owl:sameAs ?w) -> (?x ?y ?w)
+viaD: (?x rdf:type rdfs:D) -> (?x rdf:type rdfs:E)
+viaC0: (?x rdf:type rdfs:C0) -> (?x rdf:type rdfs:E)";
+    let mut vocabulary = LocalVocabulary::default();
+    let mut asserted = load(
+        &mut vocabulary,
+        "rdfs:D owl:sameAs rdfs:E\nex:a rdf:type rdfs:C0",
+    );
+    asserted.sort_unstable();
+    let deleted = load(&mut vocabulary, "ex:a rdf:type rdfs:C0");
+    let typed = load(
+        &mut vocabulary,
+        "ex:a rdf:type rdfs:E\nex:a rdf:type rdfs:D",
+    );
+    let (maintained, expected, reads) =
+        commit(&mut vocabulary, Some(rules), &asserted, &[], &deleted);
+    assert!(
+        reads > 0,
+        "the analysis the candidate `ex:a rdf:type rdfs:E` asks for"
+    );
+    let kept: Vec<bool> = typed
+        .iter()
+        .map(|t| maintained.binary_search(t).is_ok())
+        .collect();
+    assert_eq!(kept, [false, false], "ex:a's types E and D kept");
+    assert_eq!(maintained, expected, "rematerialised");
 }
