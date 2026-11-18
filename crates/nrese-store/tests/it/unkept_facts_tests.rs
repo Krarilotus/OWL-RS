@@ -140,16 +140,23 @@ fn a_later_commit_of_data_reaches_an_inverse_expressions_facts() {
     );
 }
 
-/// Spec: OWL 2 Profiles §4.3, table 4, eq-rep-p: a property equal to a blank node `_:x`
-/// (`:p owl:sameAs _:x`) gives `:a _:x :b` from `:a :p :b`, and prp-dom then `:a a :C`
-/// from `_:x rdfs:domain :C`, also where the domain comes in a later commit. OWL 2 QL's
-/// rules apply no equality.
+/// The control: with named properties only (`:q owl:inverseOf :p`), every fact the rules
+/// derive can be stored, and a later commit's domain takes the plan the policy chooses,
+/// not a rebuild; it answers as the same data at once.
 #[test]
-fn a_property_equal_to_a_blank_node_reaches_its_facts_from_a_later_commit() {
-    check(
-        ":p owl:sameAs _:x . :a :p :b .",
-        "INSERT { ?x rdfs:domain :C } WHERE { :p owl:sameAs ?x }",
-        ":a a :C",
-        |mode| mode != ReasoningMode::Owl2Ql,
-    );
+fn named_inverses_keep_the_commits_plan() {
+    use nrese_reasoner::delta::policy::Plan;
+    let first = ":q owl:inverseOf :p ; rdfs:range :D . :a :p :b .";
+    let second = "INSERT DATA { :q rdfs:domain :C }";
+    check(first, second, ":b a :C", |_| true);
+    for mode in MODES {
+        for equality in ["representatives", "replicate", "compact"] {
+            let history = store(equality);
+            let writer = pipeline(&history, mode);
+            update(&writer, &format!("INSERT DATA {{ {first} }}"));
+            update(&writer, second);
+            let plan = writer.last_reasoning_run().expect("recorded").work.plan;
+            assert_ne!(plan, Plan::Rebuild, "{}, {equality}", mode.as_str());
+        }
+    }
 }
