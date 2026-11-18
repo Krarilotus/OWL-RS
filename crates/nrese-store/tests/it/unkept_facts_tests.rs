@@ -207,7 +207,11 @@ fn a_clash_after_an_inverse_expression_is_refused() {
             );
             let label = format!("{}, {equality}", mode.as_str());
             let e = format!("{:?}", refused.expect_err(&label));
-            assert!(e.contains("Inconsistent"), "{label}: refused as {e}");
+            // Refused for the clash itself: the reason names `owl:Nothing`.
+            assert!(
+                e.contains("Inconsistent") && e.contains("Nothing"),
+                "{label}: refused as {e}"
+            );
         }
     }
 }
