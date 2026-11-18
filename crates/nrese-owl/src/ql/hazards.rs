@@ -380,6 +380,8 @@ pub(crate) fn hazards(
     // unread (`open_axiom`): their right sides' terms, and an enumerated individual.
     let mut open: Vec<Term> = Vec::new();
     let mut open_individual: Option<Term> = None;
+    // An individual asserted into an anonymous expression the closure doesn't apply.
+    let mut asserted_outside: Option<Hazard> = None;
     // Whether such an axiom concludes an existential: anonymous individuals of its own.
     let mut open_generates = false;
     // The terms of expressions individuals are asserted to be in, with an existential.
@@ -505,7 +507,14 @@ pub(crate) fn hazards(
                 found.extend(ops.iter().map(|p| Hazard::Key(p.named())));
                 found.extend(dps.iter().map(|&p| Hazard::Key(p)));
             }
-            Axiom::ClassAssertion(c, _) if !matches!(o.class(*c), ClassExpr::Class(_)) => {
+            Axiom::ClassAssertion(c, a) if !matches!(o.class(*c), ClassExpr::Class(_)) => {
+                // OWL 2 QL asserts named classes only (OWL 2 Profiles §3.2.5), and the
+                // rewriting answers a class through its named subclasses: where the
+                // closure's rules don't apply the expression, any read may miss what it
+                // entails, a contradiction included.
+                if !(rl && crate::profile::rl_super(o, *c)) {
+                    asserted_outside.get_or_insert(Hazard::OutsideProfile(*a));
+                }
                 let mut roles = Vec::new();
                 existential_roles(o, *c, &mut roles);
                 // The anonymous individuals it makes are in its fillers' classes too.
@@ -697,7 +706,7 @@ pub(crate) fn hazards(
         global = open_individual.map(Hazard::OpenLeft);
     }
     if global.is_none() {
-        global = outside_global;
+        global = outside_global.or(asserted_outside);
     }
     // What named individuals may miss of uncovered axioms' conclusions, along every axiom
     // from premise to conclusion (design note "Source 3"). A seed doesn't follow its own

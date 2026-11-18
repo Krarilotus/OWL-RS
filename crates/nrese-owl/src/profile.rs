@@ -230,7 +230,7 @@ fn rl_sub(o: &Ontology, e: ExprId) -> bool {
 /// RL's `superClassExpression`: a class other than `owl:Thing`, intersections, the
 /// complement of a `subClassExpression`, `∀R.super`, values, `≤ 0/1 R(.sub)`, `∀D.range`,
 /// `≤ 0/1 D(.range)`.
-fn rl_super(o: &Ontology, e: ExprId) -> bool {
+pub(crate) fn rl_super(o: &Ontology, e: ExprId) -> bool {
     let e = unwrap(o, e);
     match o.class(e) {
         ClassExpr::Class(_) | ClassExpr::Nothing => true,

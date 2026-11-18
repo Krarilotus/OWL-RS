@@ -438,7 +438,8 @@ fn axioms_beyond_ql_that_meet_anonymous_individuals_are_hazards() {
 /// - `C ⊑ ∃R.A ⊔ ∃R.B`: a `C` has an `R`-successor.
 /// - `C ⊑ ¬∀R.¬A`, which is `∃R.A`.
 /// - An individual asserted to be in `∀R.∃S.A`, with an `R`-successor: that successor has
-///   an `S`-successor in `A`.
+///   an `S`-successor in `A`. OWL 2 QL asserts named classes only (Profiles §3.2.5) and RL's
+///   rules don't apply this one, so the hazard is the assertion's, on every term.
 /// - A left side the TBox doesn't read, or reads in part (review r1, F1): `A ⊓ B ⊑ ∃S.A`
 ///   gives an `A ⊓ B` an `S`-successor in `A`. The same holds for `A ⊓ B ⊑ ∀R.∃S.A`, and
 ///   for the unread branch of `A ⊔ (B ⊓ E) ⊑ ∃S.A`.
@@ -453,9 +454,11 @@ fn existentials_in_right_sides_the_tbox_reads_as_nothing_are_hazards() {
             .map(|t| format!("{t}: an existential on {r} in a conclusion the TBox doesn't read"))
             .collect()
     };
-    let asserted = |r: &str, ts: &[&str]| -> Vec<String> {
+    let asserted = |i: &str, ts: &[&str]| -> Vec<String> {
         ts.iter()
-            .map(|t| format!("{t}: an individual is asserted to be in an existential on {r}"))
+            .map(|t| {
+                format!("{t}: an axiom on {i} outside the profile whose rules the closure applies")
+            })
             .collect()
     };
     let some = "ObjectSomeValuesFrom(:S :A)";
@@ -495,7 +498,7 @@ fn existentials_in_right_sides_the_tbox_reads_as_nothing_are_hazards() {
         (
             format!("ClassAssertion(ObjectAllValuesFrom(:R {some}) :c)\nObjectPropertyAssertion(:R :c :x)"),
             "S(?x ?y), A(?y)",
-            asserted("S", &["S", "A"]),
+            asserted("c", &["S", "A"]),
         ),
         (
             format!("SubClassOf(ObjectIntersectionOf(:A :B) {some})"),
