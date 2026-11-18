@@ -255,11 +255,12 @@ fn a_premise_the_reader_left_part_of_refutes_no_candidate_by_its_model() {
 /// `?x a :U0 . ?x a :U1`, the 6 with `v1` are both (the lower bound). A row with `v0` holds
 /// `U0` and one with `v2` holds `U1`, so each of those 12 keeps one class assertion, and the
 /// labels refute it (a model with `x`'s value apart from `v1` keeps it out of the other). A row
-/// with `v3` keeps both, so no label decides it. The capped read's first 4 rows (`i0`, `i2`,
-/// `i3`, `i4`) decode to 680 bytes; the 4 the labels leave (`i3`, `i7`, `i11`, `i15`, two
-/// names a byte longer) to 684, more, so only the first 4's one survivor, `i3`, is admitted to
-/// its test (refuted), and the other 5 with `v3` are unresolved, the read not `complete`.
-// The counts, not `by_labels` or the unresolved rows, rest on that 680/684-byte difference.
+/// with `v3` keeps both, so no label decides it. Under the candidate limit of 4, the capped
+/// read's first 4 rows (`i0`, `i2`, `i3`, `i4`, 680 bytes decoded) leave one survivor, `i3`,
+/// tested as what the labels leave of their batch; then the next 3 survivors (`i7`, `i11`,
+/// `i15`, 514 bytes) in one batch within those 680: 4 tested, each refuted by its test, as many
+/// as the limit. The other 2 with `v3` are unresolved for that limit, the read not `complete`.
+// The counts rest on the 3 survivors' bytes fitting in the first 4 rows' 680.
 #[test]
 fn a_candidate_of_two_class_atoms_is_left_to_its_tests() {
     let dl = pipeline_with(DlConfig {
@@ -282,7 +283,7 @@ fn a_candidate_of_two_class_atoms_is_left_to_its_tests() {
     );
     assert_eq!(
         counts(&status),
-        (6, Some(24), 0, 13, 5),
+        (6, Some(24), 0, 16, 2),
         "lower, upper, proved, refuted, unresolved"
     );
     assert_eq!(
@@ -299,7 +300,7 @@ fn a_candidate_of_two_class_atoms_is_left_to_its_tests() {
         })
         .collect();
     assert!(
-        unresolved.len() == 5 && unresolved.iter().all(|r| v3.iter().any(|n| n == r)),
+        unresolved.len() == 2 && unresolved.iter().all(|r| v3.iter().any(|n| n == r)),
         "the unresolved have v3: {unresolved:?}"
     );
     assert!(!status.is_complete());
