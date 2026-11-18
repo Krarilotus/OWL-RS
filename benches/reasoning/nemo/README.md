@@ -15,7 +15,7 @@ step's note.
 `nemo-sparq` runs only on LUBM: the suite skips it on inputs without `univ-bench.nt`.
 Elsewhere its closure is incomplete by design and wouldn't be a result.
 
-## Closure checks (3 October 2026, main PC)
+## Closure checks (3 October 2026, development machine)
 
 These are set-for-set comparisons of the inferred statements, without timing.
 - Blank nodes are compared up to renaming (`../compare_blank_nodes.py`): each blank
@@ -65,8 +65,8 @@ derives 6 statements that OWL 2 RL/RDF doesn't:
 
 ## Times so far
 
-These are single runs on the main PC, which was also building at the time: indicative
-only. The benchmark runs on the office PC (batch B) decide.
+These are single runs on the development machine, which was also building at the time: indicative
+only. The benchmark runs on the checks host (batch B) decide.
 
 | Tier | `nemo` | `nemo-schemafirst` | `nemo-sparq` | NRESE (closure) |
 |---|---|---|---|---|
@@ -85,5 +85,5 @@ LUBM(100) (13,880,276 input triples, TBox included), on a dedicated AWS box, bes
 B measures the same encoding on our LUBM(100), under these conditions:
 - Nemo version: v0.10.1 (theirs v0.9.1);
 - Input: 13,405,674 triples (another generator run, so different data);
-- Hardware: the office PC;
+- Hardware: the checks host (Ryzen 9 5950X, 31 GiB, Linux);
 - Recorded time: the step's `reason_ms`, Nemo's self-reported reasoning time.

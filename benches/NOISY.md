@@ -5,7 +5,7 @@ run-to-run noise is large can't be decided at a practical number of blocks: a lo
 unseen (the gate controls false blocks, so noise costs power, not blocks). These are to be
 fixed, not tolerated; `probes/gate-power.py power` gives each case's blocks at its noise. The list: every series whose noise
 (the standard deviation of the log of its four per-pass medians) exceeds 5 % in the A-B-B-A
-passes of 14 Oct 2026 on phuoc-yu: 137 of the 621 series of at least 5 µs, each
+passes of 14 Oct 2026 on the timed host: 137 of the 621 series of at least 5 µs, each
 binary measured on its own (v1.5 0f465633 and v2 32ecf1e5 on the fast suite; main f9b515e8 and v2
 32ecf1e5 on the perf-lab datasets). Re-measure on the head before fixing: some came with defects
 fixed since (q02, the text filter). Grouped by likely cause, the cause inferred from the shape
@@ -31,14 +31,14 @@ The pass medians fall into two clusters (one process fast, the next slow), the s
 | lab-dbpedia-core | q03-top-birthplaces | main f9b515e8 (perf-lab datasets) | 3.224 | 0.161 | 2.648, 3.65, 2.859, 3.589 |
 | writes-under-readers | --readers 32 | v1.5 0f465633 | 0.1638 | 0.213 | 0.1937, 0.1925, 0.1352, 0.1318 |
 
-**dl-roles blocking: a probable engine effect, by run order within a process** (19 Oct 2026; for a
-DL owner, not the harness). The tableau tool runs the case's file four times in one process
+**dl-roles blocking: a probable engine effect, by run order within a process** (19 Oct 2026; for the
+DL engine, not the harness). The tableau tool runs the case's file four times in one process
 (`repeat = 4`). In every pass, of v1.5 0f465633, v2 32ecf1e5 and c9be1609 alike, the first two runs'
 blocking phase takes 0.053–0.062 ms, the third 0.32–0.36 ms (six times as long), the fourth
 either 0.29–0.31 ms or 0.053–0.060 ms again; the other phases don't move with it (saturate
 7.4–8.7 ms in every run), and the work counters are the same in every process. The "bimodal"
 pass medians (0.056 against 0.175 ms) are only the median of four flipping with the fourth run.
-Per pass, the runs' blocking times in ms (phuoc-yu):
+Per pass, the runs' blocking times in ms (the timed host):
 
 | Pass | Binary | Runs 1-4 |
 |---|---|---|

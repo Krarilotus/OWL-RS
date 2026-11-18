@@ -68,3 +68,29 @@ dependencies through `CARGO_HOME`, never build artifacts of different revisions.
 
 CI (`.github/workflows/ci.yml`, the same steps on Linux) runs at milestones and on merges to
 `main`: `gh workflow run ci.yml --ref <branch>`; the Jena oracle likewise (`oracle.yml`).
+
+### Without the fleet
+
+The commit tier and the full tier also run on one Linux machine of your own, with no fleet and no
+build host. Install:
+
+- Rust through [rustup](https://rustup.rs): `rust-toolchain.toml` selects the toolchain, with
+  rustfmt and clippy.
+- Node from nodejs.org at the version `scripts/lib/gate-tools.txt` names (the console refuses
+  others).
+- Python 3.13, with the suite's packages in an environment of their own that comes first on
+  `PATH`: `python3.13 -m venv ~/.venvs/nrese-suite`, then
+  `~/.venvs/nrese-suite/bin/pip install --require-hashes -r benches/suite/requirements.txt`. An
+  older Python can't install the pinned packages.
+- cargo-deny at its pinned version:
+  `cargo install --locked cargo-deny@$(sed -n 's/^cargo-deny //p' scripts/lib/gate-tools.txt)`.
+
+Then run `bash scripts/check.sh commit` and `NRESE_BUILD_HOST=local bash scripts/check.sh all`.
+The full tier fetches the pinned W3C test suites and runs every step on this machine. From a
+clean start, with 6 build jobs, it took about 20 minutes (15 Nov 2026).
+
+The push tier and the Windows part need the fleet: they run as fleet jobs, and the pre-push hook
+refuses a push the fleet gave no verdict for. The hooks are active only after the setup step under
+[Checks](#checks) (`git config core.hooksPath .githooks`). A contributor without the fleet doesn't
+take that step: they run the commit tier and the full tier as above and open a pull request from
+a fork. Both fleet tiers run on the pull request's commits before it merges.

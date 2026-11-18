@@ -1,7 +1,7 @@
 # Read replicas
 
 One server takes the writes and ships its write-ahead log. Other servers apply it and answer
-queries (hardware plan H6, step 1). This gives more query throughput and availability. The
+queries. This gives more query throughput and availability. The
 data must still fit one machine; partitioning across machines is a later step.
 
 ## How it works
@@ -12,18 +12,17 @@ data must still fit one machine; partitioning across machines is a later step.
   - `GET /api/v1/replication/image` (an image of its latest revision, streamed, with its
     manifest).
 - **A replica** (`replication.mode = "replica"`) starts from the primary's image when its
-  data directory holds no store. It then follows the log: it asks for the records after its
+  data directory holds no store, so start one from an empty data directory. Over a directory
+  that holds a store (a copy of another server's, say) it takes no image and logs no warning,
+  and serves what that directory holds. It then follows the log: it asks for the records after its
   revision, applies them, and asks again at once while records come, and after
   `replication.poll` once it has caught up.
   - Each record becomes a commit with the primary's revision and term ids, in the replica's
     own log too, so a replica restarts where it stopped.
   - A replica takes no writes (its write surfaces are off, as in the read-only posture) and
     doesn't reason: the records carry the inferences.
-  - Every exchange with the primary ends: a log answer must begin within 30 s, an image
-    within `replication.image_timeout` (an hour unless set: the primary prepares it
-    first), and every body keep coming (30 s at most between pieces; an image streams as
-    long as it comes); a log round takes `replication.round_timeout` at most (5 minutes
-    unless set; `0` or `unlimited` for no total limit). A log answer must say how many records it carries
+  - Every exchange with the primary has
+    [deadlines](config-reference.md#replication). A log answer must say how many records it carries
     and up to which revision; one that doesn't, or whose records don't reach that revision,
     is an error. Errors are retried with a growing pause and shown in the status.
 - **Both** need an on-disk store.
@@ -71,6 +70,26 @@ primary, only bulk loads and rematerialisations send replicas back to an image.
 
 ## Limits of this first step
 
+- A replica serves its primary's statements without its primary's reasoning certificate:
+  its reasoned reads say `not-certified`, under `dl.answers = "exact"` they are refused,
+  and its consistency reads `unknown`. This holds from its start on, also after a rebuild of
+  its inferences or a change of its settings.
+- A primary under `reasoner.equality = "compact"`, with a ruleset that reasons with
+  `owl:sameAs`, serves no replica in this release. It answers the log and the image with
+  `409` and a sentence that says so, also where the log no longer holds the records. A
+  replica shows the refusal as `last_error` in its status and asks again, about once a
+  minute; one with an empty data directory doesn't start. A primary for replicas keeps the
+  default, `representatives`.
+- A replica started over a data directory restored from such a primary's backup takes no
+  image: its reasoned reads say `not-certified` and may miss rows, and the primary's refusal
+  shows only in its status. Don't start a replica over such a backup.
+- On a replica, a reader of only some graphs who sees inferred statements
+  (`inferred = "visible"` or `"supported"`) is refused every read with `503` and a sentence
+  that says the replica doesn't serve it, also a read of the stored statements alone, though
+  that one could be answered. Such a reader reads from the primary.
+- Only the default repository is replicated. Other repositories on a replica are served
+  read-only as its data directory holds them, reasoned at its start, and their reasoned
+  reads say `not-certified`.
 - A replica isn't promoted automatically. To promote one, stop it, set
   `replication.mode = "primary"` (or `"off"`), and point the writers and the other replicas
   at it.
@@ -78,6 +97,6 @@ primary, only bulk loads and rematerialisations send replicas back to an image.
   the records it applies, not incrementally.
 - A replica doesn't yet take a new image by itself when the log no longer
   serves it.
-- A replica computes no inferences, so it keeps a closure an older
-  build's maintenance wrote; after upgrading to reasoning semantics 3, start it again from an
-  empty data directory.
+- A replica computes no inferences, so it keeps a closure an older build wrote: after an
+  upgrade that changes the reasoning semantics (`reasoning_semantics` on `/version`), start
+  it again from an empty data directory.

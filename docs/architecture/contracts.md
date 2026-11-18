@@ -1,6 +1,6 @@
 # Cross-cutting contracts
 
-This page is an inventory of the source at engine-v2 `a3453435` (7 November 2026), not the contract of a release. [ARCHITECTURE.md](../ARCHITECTURE.md) owns the layer model and crate
+This page is an inventory of the source at engine-v2 `2f0d2c9e` (7 November 2026), not the contract of a release. [ARCHITECTURE.md](../ARCHITECTURE.md) owns the layer model and crate
 boundaries; [ADRs](../adr/README.md) own design decisions. Change a shared contract at its owner, then migrate callers. This inventory does not approve
 API changes or classify the listed bypasses as defects.
 
@@ -72,9 +72,31 @@ Known bypasses:
 - `crates/nrese-exec/src/graph.rs:118`: Plain closure produces a growing IdTable with no budget argument.
 - `crates/nrese-exec/src/graph.rs:148`: Transitive closure produces a plain Vec of potentially quadratic pairs without reservation; :155 constructs the output.
 
+What stays outside a request's envelope in v1.5, by design (users read the short form in
+[limits](../limits.md#memory-and-stopping)):
+
+- Charged only after it is built: a join's output, and the rows a query produces.
+- Outside: the full-text index and the text order, built at first need and kept; operators' working state
+  (`OPTIONAL`'s keys, `ORDER BY`'s decoded terms, `GROUP BY`'s ids, the aggregates' members, the table of `MINUS`
+  and `NOT EXISTS`, `CONTAINS`'s view of the dictionary, `BIND`'s copy, `FILTER`'s mask); a cyclic count's working
+  state; the sample of `EXPLAIN`'s cyclic estimate; the range hints' counts; the per-query cache of compiled regular
+  expressions, and `REPLACE`'s output; a vector charged only after it was allocated (`adopt_vec`); the keys and
+  values a charged map holds apart from its table; the request's and its parts' bookkeeping; the planner's small
+  temporaries (a few words per pattern of a basic graph pattern, at most 4,096 states of the join order's exact
+  search, the characteristic-set search's copies, bounded at 2¹⁶ steps); cache entries still held after the cache
+  released their charge; reasoning's `owl:sameAs` copies; and everything else reasoning allocates, polled rather
+  than charged.
+- The planner's distinct-value counts live in a table of 16,384 entries charged to the engine's budget, not the
+  request's, and a count stops when its query does. What a characteristic-set build holds isn't charged, a view of
+  the data builds sets of its own that no budget limits, and closing the store doesn't stop a rebuild.
+- A join's cap, half the room left at its start, is checked every 1,024 rows, and the capacity of its vectors and
+  the joining of its parts can exceed it.
+- Reservations are taken ahead, in grants and credit; the unused part has no stated bound yet. A cached decoding
+  near the limit can refuse while the cache holds memory it could give back.
+
 DL documents sampled accounting in `crates/nrese-dl/src/memory.rs:1`; it is not exact pre-allocation admission.
 
-A dropped transaction does not undo dictionary interning (`crates/nrese-engine/src/engine/transaction.rs:503–515`, open row, owner engine/transaction). Uploads insert each statement as it is read, their pending growth charged (D16-039); one that fails part-way is discarded with its transaction, and the new terms it interned stay, as stated limit L3 accepts for v1.5 (`crates/nrese-store/src/rdf_io.rs`).
+A dropped transaction does not undo dictionary interning (`crates/nrese-engine/src/engine/transaction.rs:503–515`). Uploads insert each statement as it is read, their pending growth charged; one that fails part-way is discarded with its transaction, and the new terms it interned stay (`crates/nrese-store/src/rdf_io.rs`).
 
 ## Lock order
 
@@ -87,20 +109,20 @@ commit converts the stack, the compaction slot held: it takes no lock and calls 
 compaction, checkpoints and the served log for its length (quarantine readmissions only). State that changes only between commits takes a
 `WriterHeld` proof (the store's reasoning certificate: `StoreService::invalidate_held`, `record_reasoning` under `Rematerialisation::finish_held`).
 
-A version's own slots (`OwnSlots`, `crates/nrese-engine/src/engine/snapshot/own_state.rs:92`, P2 3.0c) have a leaf lock: held only to look a
+A version's own slots (`OwnSlots`, `crates/nrese-engine/src/engine/snapshot/own_state.rs:92`) have a leaf lock: held only to look a
 value up or store one (:102), never while a value is made or dropped, and nothing is taken while it is held. `make` runs unlocked, so it may read
 the snapshot and its other slots. The engine takes it under none of its own locks: an installed version is a value no snapshot held
 (`Versions::install`), so nothing drains it.
 
-The `owl2-dl` bounds (U1) are `Bounds` in `crates/nrese-store/src/dl/bounds.rs:145` (P2-C6b). Its `state` and `view` mutexes guard
+The `owl2-dl` bounds (U1) are `Bounds` in `crates/nrese-store/src/dl/bounds.rs:145`. Its `state` and `view` mutexes guard
 serial work only: taking what a read or a commit needs, a revision check, publishing, applying a computed change. The engine's writer slot and
 the mutation pipeline's ground cache (`crates/nrese-store/src/mutation/pipeline.rs:227`) come before the mutation-side `state`, which `install`
 takes after the commit returns (:363). A build cell's `building` mutex (`crates/nrese-exec/src/cell.rs:145`) comes before the `state`/`view`
 check its `kept` closure makes. No path that holds a bounds guard enters the Rayon pool, the engine or the dictionary: U1's change, its
 builds, the taxonomy and a view's runs hold none, and a revision's builds go through the `BuildCell` under the bounded rule (a Rayon worker
 builds its own instead of waiting). "Before the dictionary" is the guards' place in the hierarchy, not permission to call the dictionary or a
-dictionary callback under one. Until P2-C6b, `state` was held across that parallel work. At pool widths 1 and 2 the cycle with pool readers
-was reproduced on `a3453435` (red proof `c6b-u1-red-3-94d752b7`).
+dictionary callback under one. Until it was changed, `state` was held across that parallel work. At pool widths 1 and 2 the cycle with pool readers
+was reproduced on `2f0d2c9e`.
 
 Known bypasses and gaps:
 

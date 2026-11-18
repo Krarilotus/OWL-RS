@@ -16,7 +16,7 @@ This is the contract the storage engine (`nrese-engine`, layer L1) and the mutat
   - The *inferred* stack holds what the reasoner derived, always in the default graph.
   - The two are disjoint: a statement that is both asserted and derivable counts as asserted.
   - An N-Quads export holds the asserted statements only; an image backup holds the inferred
-    ones too ([backups](../ops/server-setup.md#10-backup-and-recovery-setup)).
+    ones too ([backups](../ops/backups.md)).
 - Blank nodes are scoped to one payload. Every write request (update, Graph Store write, `TELL`, restore) gets fresh blank nodes. Within one payload, labels stay consistent. The startup ontology preload keeps the file's labels, so re-preloading is idempotent.
 
 ## Reads
@@ -54,7 +54,7 @@ Every write goes through the mutation pipeline:
   - Retracting an asserted statement leaves the inferred stack alone. Re-deriving a statement that is still supported is the reasoner's job.
   - These rules apply to the transaction's final state, so asserting and retracting a statement within one request changes nothing.
 - Request paths write asserted statements only. SPARQL Update, the Graph Store Protocol and restore can't reach the inferred stack. `DELETE`, `CLEAR` and `DROP` retract asserted statements, never inferred ones.
-- Writes are serialised by the engine's writer slot. Commit cost is O(d log d) for a delta of d quads, independent of the dataset size.
+- Writes are serialised by the engine's writer slot. Commit cost is O(d log d) for a delta of d quads, independent of the dataset size, but for the reasoning of a store whose ontology uses an inverse property expression, which is rebuilt at every commit ([limits](../limits.md#reasoning)).
 - Revisions increase by one per commit with a net change. They are persistent in on-disk mode and don't change for no-op writes.
 - Any error before the commit discards the whole request. There are no partial writes.
 
@@ -84,7 +84,7 @@ Initial loads and full restores bypass the per-commit path (`Engine::bulk_load`;
 
 - Index runs are packed (compressed keys) in memory and in checkpoints. In on-disk mode a restart, a bulk load and a background checkpoint map the checkpoint and use its dictionary and packed runs in place (`durability/checkpoint.rs`, `crate::mapped`): the OS pages in what queries touch. Runs written since the last checkpoint are on the heap.
 - One commit holds at most 4 GiB of WAL payload, about 130 M quads. Larger loads go through the bulk loader.
-- A commit's reasoning is incremental (the delta executor) unless the program changes or a compact-equality split falls back to a whole-dataset rebuild, in the commit's transaction and holding the writer ([reasoner design](../design/reasoner-v2.md) §2.1); the `rules-mvp` reasoner, whose every write cost O(dataset), was removed (the server refuses the name).
+- A commit's reasoning is incremental (the delta executor) unless the program changes, the ontology uses an inverse property expression, or a compact-equality split falls back to a whole-dataset rebuild, in the commit's transaction and holding the writer ([reasoner design](../design/reasoner-v2.md) §2.1); the `rules-mvp` reasoner, whose every write cost O(dataset), was removed (the server refuses the name).
 
 ## Evidence
 

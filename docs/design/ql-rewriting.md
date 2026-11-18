@@ -302,6 +302,10 @@ conservatively:
   `rdf:type` statements whose object is a class expression's blank node), whose anonymous
   successors count also where the schema has nothing to rewrite, and are in the
   expression's classes;
+- an individual asserted to be in a class expression, which OWL 2 QL doesn't allow there
+  (only a named class, OWL 2 Profiles §3.2.5), unless the closure's rules apply it (under
+  `owl2-rl`: a `superClassExpression` of OWL 2 RL, §4.2.3, such as an intersection of such,
+  `allValuesFrom`, `hasValue`, a complement or an at-most of one): every term is affected;
 - an anonymous individual's type is *affected* when a property connected to its role (by
   inclusions, inverses, equivalences or chains) or one of its classes has a hazard;
 - the *affected terms* are the properties and classes of affected types, closed upward

@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 755" width="400" height="755" role="img" aria-labelledby="title desc">
+<!-- Generated; the light and dark variants differ only in <style>. -->
+<title id="title">How NRESE fits together</title>
+<desc id="desc">You tell NRESE statements with SPARQL Update, the Graph Store Protocol, RDF4J's protocol or an RDF document, over HTTP; a write is all of it or nothing, and a refusal says why. You ask it with SPARQL queries and, with reasoning on, why a statement holds; each SPARQL answer says if rows may be missing or wrong. A bulk load skips the checks below. Reasoning is off by default (disabled, rdfs, owl2-rl, owl2-dl and more): when on, it infers with every write and refuses a write found to make the data inconsistent. SHACL validation is off by default: report logs the results a write introduces, and enforce refuses a write that introduces a violation. Storage keeps what you told it (asserted) apart from what reasoning derived (inferred). It is in memory by default, which is lost when the server stops; on-disk saves each commit before confirming it, and the container image uses it.</desc>
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #1F2328; }
+  .paper { fill: #FFFFFF; }
+  .name { font-size: 16px; font-weight: 600; }
+  .text { font-size: 14.5px; }
+  .muted { font-size: 14.5px; fill: #59636E; }
+  .edge { font-size: 14px; font-style: italic; fill: #59636E; }
+  .code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; }
+  .box { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1.25; }
+  .band { fill: #F6F8FA; }
+  .chip { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1.1; }
+  .chip-on { fill: #1F2328; }
+  .chip-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; fill: #FFFFFF; }
+  .asserted { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1.1; }
+  .inferred { fill: #FFF3D6; stroke: #D4A72C; stroke-width: 1.1; }
+  .inferred-text { font-size: 16px; font-weight: 600; fill: #8A5300; }
+  .track { fill: #E6EAEF; }
+  .frame { fill: none; stroke: #8C959F; stroke-width: 1.25; }
+  .divider { fill: none; stroke: #8C959F; stroke-width: 1.25; }
+  .mark { fill: none; stroke: #1F2328; stroke-width: 2; }
+  .seg-on { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1; }
+  .seg-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; font-weight: 600; }
+  .refused { fill: #B42318; }
+  .refused-text { fill: #B42318; font-weight: 600; }
+  .inferred-word { fill: #8A5300; font-weight: 600; }
+  .flow { fill: none; stroke: #59636E; stroke-width: 1.4; }
+  .flow-refused { fill: none; stroke: #B42318; stroke-width: 1.4; }
+</style>
+<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow" d="M1 1 L9 5 L1 9"/></marker><marker id="head-refused" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow-refused" d="M1 1 L9 5 L1 9"/></marker></defs>
+<rect class="paper" x="0" y="0" width="400" height="755" rx="0"/>
+<rect class="box" x="0" y="0" width="400" height="124" rx="6"/>
+<text x="16" y="26" class="name">Tell</text>
+<text x="16" y="50" class="muted">SPARQL Update, the Graph Store Protocol, RDF4J's</text>
+<text x="16" y="69" class="muted">protocol or an RDF document, over HTTP</text>
+<text x="16" y="94" class="text">all of it or nothing; a refusal says why</text>
+<text x="16" y="113" class="text"><tspan class="muted">a bulk load skips the checks below</tspan></text>
+<rect class="box" x="0" y="134" width="400" height="124" rx="6"/>
+<text x="16" y="160" class="name">Ask</text>
+<text x="16" y="184" class="muted">SPARQL queries; with reasoning on, why a</text>
+<text x="16" y="203" class="muted">statement holds</text>
+<text x="16" y="228" class="text">each SPARQL answer says if rows may be</text>
+<text x="16" y="247" class="text">missing or wrong</text>
+<rect class="band" x="0" y="278" width="400" height="124" rx="8"/>
+<text x="16" y="304" class="name">Reasoning</text>
+<text x="384" y="304" class="muted" text-anchor="end">off by default</text>
+<rect class="track" x="16" y="318" width="295.18" height="28" rx="7"/>
+<rect class="seg-on" x="18" y="320" width="85.44" height="24" rx="5"/>
+<text x="60.72" y="336.5" class="seg-on-text" text-anchor="middle">disabled</text>
+<text x="129.3" y="336.5" class="code" text-anchor="middle">rdfs</text>
+<text x="193.665" y="336.5" class="code" text-anchor="middle">owl2-rl</text>
+<text x="270.675" y="336.5" class="code" text-anchor="middle">owl2-dl</text>
+<text x="319.18" y="337" class="muted">and more</text>
+<text x="16" y="364" class="text">when on, it infers with every write and refuses a</text>
+<text x="16" y="383" class="text">write found to make the data inconsistent</text>
+<rect class="band" x="0" y="412" width="400" height="124" rx="8"/>
+<text x="16" y="438" class="name">SHACL validation</text>
+<text x="384" y="438" class="muted" text-anchor="end">off by default</text>
+<rect class="track" x="16" y="452" width="192.88" height="28" rx="7"/>
+<rect class="seg-on" x="18" y="454" width="43.29" height="24" rx="5"/>
+<text x="39.645" y="470.5" class="seg-on-text" text-anchor="middle">off</text>
+<text x="95.58" y="470.5" class="code" text-anchor="middle">report</text>
+<text x="168.375" y="470.5" class="code" text-anchor="middle">enforce</text>
+<text x="16" y="498" class="text"><tspan class="code">report</tspan> logs the results a write introduces;</text>
+<text x="16" y="517" class="text"><tspan class="code">enforce</tspan> refuses a write that introduces a violation</text>
+<rect class="band" x="0" y="546" width="400" height="209" rx="8"/>
+<text x="16" y="572" class="name">Storage</text>
+<text x="384" y="572" class="muted" text-anchor="end">in memory by default</text>
+<rect class="asserted" x="16" y="586" width="179" height="54" rx="4"/>
+<text x="28" y="609" class="name">asserted</text>
+<text x="28" y="629" class="muted">what you told it</text>
+<rect class="inferred" x="205" y="586" width="179" height="54" rx="4"/>
+<text x="217" y="609" class="inferred-text">inferred</text>
+<text x="217" y="629" class="muted">what reasoning derived</text>
+<rect class="track" x="16" y="652" width="174.88" height="28" rx="7"/>
+<rect class="seg-on" x="18" y="654" width="93.87" height="24" rx="5"/>
+<text x="64.935" y="670.5" class="seg-on-text" text-anchor="middle">in-memory</text>
+<text x="150.375" y="670.5" class="code" text-anchor="middle">on-disk</text>
+<text x="16" y="698" class="text"><tspan class="code">in-memory</tspan> is lost when the server stops;</text>
+<text x="16" y="717" class="text"><tspan class="code">on-disk</tspan> saves each commit before confirming it, and</text>
+<text x="16" y="736" class="text">the container image uses it</text>
+</svg>

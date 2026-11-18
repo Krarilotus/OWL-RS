@@ -2116,7 +2116,7 @@ rewrite = "not-expressible"
 [[case]]
 name = "first-load-chain"
 area = "maintenance"
-what = "a first commit into an empty store: a 250-class subclass chain and 400 members of its last class, as one INSERT DATA (DMW's A/B chain; 21 Oct 2026: the repository route held 854-862 MiB VmHWM, main 518-558)"
+what = "a first commit into an empty store: a 250-class subclass chain and 400 members of its last class, as one INSERT DATA (an application's A/B chain; 21 Oct 2026: the repository route held 854-862 MiB VmHWM, main 518-558)"
 semantics = "owl2-rl"
 data = "first-load classes=250 individuals=400"
 args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru"]

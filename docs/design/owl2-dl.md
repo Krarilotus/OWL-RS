@@ -685,7 +685,7 @@ recomputes, and the test that holds each maintained path to a cold rebuild:
 | State | On a commit of assertions only (no statement that may change the schema) | On a schema change | Against a cold rebuild |
 |---|---|---|---|
 | L: the RL closure | maintained by the reasoner's delta executor (B/F, DRed) | the same | the reasoner's maintenance tests against rematerialisation |
-| L: the taxonomy's memberships | recomputed per revision from L (one scan per subclass); the taxonomy kept per schema | taxonomy recomputed on its next read | – (no maintained state) |
+| L: the taxonomy's memberships | recomputed per revision from L (one scan per class of a subsumption); the taxonomy kept per schema | taxonomy recomputed on its next read | – (no maintained state) |
 | U1 | maintained by the delta executor; afresh where it has equality classes | recompiled, evaluated afresh | `the_maintained_upper_bound_is_the_one_evaluated_afresh`, `…_with_equality_classes_…` (store) |
 | consistency, base revision consistent | U1 where it proves it; else **only removals: consistent, no check** (monotone); **additions: the ABox islands with an individual the commit mentions** (`nrese_dl::islands::after_assertions`), the whole where the ABox doesn't split | checked whole | `incremental_consistency_on_commit_is_the_cold_check` (store: every commit of random sequences accepted exactly when a fresh store given the same data accepts it; 200 seeds swept, 3,200 commits, 707 decided on islands, 220 by monotonicity), `touched_islands_decide_as_a_cold_check_does` (dl: 2,000 cases swept) |
 | consistency, base inconsistent or unknown | checked whole (quarantine) | checked whole | `inconsistent_data_loaded_past_the_gate_is_quarantined_not_locked` |

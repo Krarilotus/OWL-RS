@@ -25,7 +25,7 @@ as its risk needs; a level's evidence never stands in for a lower one's.
 | 1. Unit | Does each function keep its contract and its work bound? | seconds per crate | `cargo test`; the guards of [performance.md §0](../docs/design/performance.md#0-wins-to-keep-check-these-before-a-rewrite-and-guard-them) (exact counts, plan shapes) | every commit (the gate, [CONTRIBUTING.md](../CONTRIBUTING.md)) |
 | 2. Focused | Did this change make its area faster, slower or wrong? | minutes to an hour: the cases of one area, chainable | `fast.py run --cases …` / `--areas …`, then `compare` against the same host's baseline | a `measure` host |
 | 3. Full | Where does a build stand, against its base and against the competitors? | everything, up to a day, in checkpointed chunks | every fast case, every suite workload × system, the DL corpora | a `measure` host, one comparison per host |
-| 4. Cluster | How does it scale past one machine? | later: the Draco cluster with a large real graph | the suite under Apptainer (`cluster/`) | `draco` |
+| 4. Cluster | How does it scale past one machine? | later: a cluster with a large real graph | the suite under Apptainer (`cluster/`) | a cluster |
 
 A level-2 case is cut to one bottleneck (an operator, a ruleset, a kernel) and checks its
 answers and route before its time counts; level 3 runs the same cases and the realistic
@@ -94,11 +94,11 @@ captured runs again, without running.
 | One command on the fleet, by capability: a change timed (`abba.py run`, the family from the registry, nothing committed for it) and the release gate (`release_gate.py jobs --plan`, `--submit`), each one set, its data made by the job | done (2 Nov 2026) |
 | the fast runner moves into `suitekit` as the native plan kind; `fast.py` becomes `suite.py run --level focused` | next |
 | One `compare` over result rows: `suitekit/compare.py` reads fast reports, perf-lab reports and suite results, in the order missing, answers, time, memory by kind, disk; `fast.py compare` and `suite.py compare` are it. Suite pairs still use `summary.py`'s estimator: the bootstrap for them is the next step | started |
-| `perf-lab.sh` and `perf-lab-compare.py` retired: the `lab-*` fast cases (rows pinned; the same rows and times within the old runs' spread on Phuoc-Yu, 12 Oct 2026) and the one `compare` | done |
+| `perf-lab.sh` and `perf-lab-compare.py` retired: the `lab-*` fast cases (rows pinned; the same rows and times within the old runs' spread on the timed host, 12 Oct 2026) and the one `compare` | done |
 | `fast/compete.py` folds into the suite, the suite running comparators on any case | next |
 | Checkpointed chunks for level 3: resume after a pause, keep the order, never rerun a finished case | next |
 | The result row's answer and memory-kind fields | next |
-| Level 4: `runtime = "apptainer"` on `draco`, a large real graph as a workload | later |
+| Level 4: `runtime = "apptainer"` on a cluster, a large real graph as a workload | later |
 
 ## Hosts
 
@@ -140,7 +140,7 @@ benches/
     │   └── el-classification/  NRESE's EL classifier against ELK on random EL ontologies
     ├── competitors/     the basics datasets and query sets; licence rules; concurrency scorecard
     ├── integration/     RG × GS × GND: the HisQu integration workload
-    ├── clients/         RDF4J, Jena, rdflib and DMW clients against NRESE
+    ├── clients/         RDF4J, Jena and rdflib clients, and an application's, against NRESE
     ├── oracle/          Jena's ARQ as a second oracle for SPARQL answers
     ├── oxigraph-comparison/  NRESE's RDF bundle against Oxigraph's libraries
     ├── nrese-bench-harness/  the Rust HTTP client: query-mix, write-scaling, compatibility packs
@@ -172,7 +172,7 @@ benches/
 | perf lab | the store and query engine without HTTP, per query p50; the fast suite's measuring tool, on the perf lab's datasets the `lab-*` cases | `fast.py run --cases lab-…` | — | `baselines/perf-lab/*.json` (until 27 Sep 2026; `compare` reads them) |
 | [probes](probes/README.md) | one property at a time | one script each | stdout | — |
 | [term-reads-count](term-reads-count/src/lib.rs) | instructions and allocations per row of the engine's committed term reads and a transaction's pending deltas, A against B (a count case pending its registry kind; Linux, under `perf stat`) | `term-reads-count --shape … --op …`, `--count allocs` | the job's directory | — |
-| [cluster](cluster/README.md) | the suite on Draco | `suite.sbatch` | the job's directory | record in `runs/` |
+| [cluster](cluster/README.md) | the suite on a SLURM cluster | `suite.sbatch` | the job's directory | record in `runs/` |
 
 A case without an answer check times only that it ran: consult its checks before reading
 its time as validated. Correctness also has owners outside these kits: crate conformance
@@ -192,7 +192,7 @@ Single measurements and diagnoses outside the kits, run with
 | Rule reasoning | `nrese-reasoner`: `v2_closure` (closures for the oracle), `v2_delta` (commit latency against rematerialisation), `graph_sets`, `classify` (EL, against ELK) |
 | DL | `nrese-dl`: `tableau_consistency` (per-phase times, search counters), `context_classify`, `bounds_eval` (the L and U1 bounds), `tableau_fuzz`; `nrese-owl`: `fuzz` (random OWL 2 DL ontologies), `ofn_speed` (the functional-syntax reader's speed gate) |
 | Studies kept for open targets | `nrese-engine`'s ignored tests `compression_study` and `vocabulary_study` (store-size options, P2 in [performance.md](../docs/design/performance.md) §6) |
-| Office PC | `scripts/office/`: dataset preparation (`dbpedia.sh`, `wikidata.sh`) and the perf lab there (`perflab.sh`) |
+| Checks host | `scripts/office/`: dataset preparation (`dbpedia.sh`, `wikidata.sh`) and the perf lab there (`perflab.sh`) |
 
 ## On the fleet
 
@@ -226,7 +226,7 @@ delivery status. `results_at` names the host landing, not a local copy destinati
 members retain partial evidence. Coverage refresh and reconciliation of unindexed old
 outputs remain follow-ups. Review the plan before submission.
 
-Every run on another machine is a fleet job (`fleet` on the main PC; the fleet-jobs skill):
+Every run on another machine is a fleet job (`fleet` on the development machine):
 the fleet owns the hosts, their windows and their rules (`fleet rules`, `fleet why ID`), and a
 job says what it needs, never which host. No two timings share a host: a timed job
 (`owlrs.timed`) holds its host alone from its first timed step to its end.

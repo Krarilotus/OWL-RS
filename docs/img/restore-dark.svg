@@ -1,0 +1,52 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 208" width="400" height="208" role="img" aria-labelledby="title desc">
+<!-- Generated; the light and dark variants differ only in <style>. -->
+<title id="title">Point-in-time restore</title>
+<desc id="desc">The log lies in two parts, oldest first: wal-archive/, then wal/. A restore places an image at revision R, at or before the target N, a revision or a time, and replays the commits R+1 to N from the log; the log before the image and after the target is not replayed.</desc>
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #E6EDF3; }
+  .paper { fill: #0D1117; }
+  .name { font-size: 16px; font-weight: 600; }
+  .text { font-size: 14.5px; }
+  .muted { font-size: 14.5px; fill: #9198A1; }
+  .edge { font-size: 14px; font-style: italic; fill: #9198A1; }
+  .code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; }
+  .box { fill: #0D1117; stroke: #6E7681; stroke-width: 1.25; }
+  .band { fill: #151B23; }
+  .chip { fill: #0D1117; stroke: #6E7681; stroke-width: 1.1; }
+  .chip-on { fill: #E6EDF3; }
+  .chip-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; fill: #0D1117; }
+  .asserted { fill: #0D1117; stroke: #6E7681; stroke-width: 1.1; }
+  .inferred { fill: #2B2111; stroke: #9E6A03; stroke-width: 1.1; }
+  .inferred-text { font-size: 16px; font-weight: 600; fill: #E3B341; }
+  .track { fill: #262C36; }
+  .frame { fill: none; stroke: #6E7681; stroke-width: 1.25; }
+  .divider { fill: none; stroke: #6E7681; stroke-width: 1.25; }
+  .mark { fill: none; stroke: #E6EDF3; stroke-width: 2; }
+  .seg-on { fill: #0D1117; stroke: #6E7681; stroke-width: 1; }
+  .seg-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; font-weight: 600; }
+  .refused { fill: #FF8A80; }
+  .refused-text { fill: #FF8A80; font-weight: 600; }
+  .inferred-word { fill: #E3B341; font-weight: 600; }
+  .flow { fill: none; stroke: #9198A1; stroke-width: 1.4; }
+  .flow-refused { fill: none; stroke: #FF8A80; stroke-width: 1.4; }
+</style>
+<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow" d="M1 1 L9 5 L1 9"/></marker><marker id="head-refused" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow-refused" d="M1 1 L9 5 L1 9"/></marker></defs>
+<rect class="paper" x="0" y="0" width="400" height="208" rx="0"/>
+<text x="150" y="20" class="text" text-anchor="middle"><tspan class="name">image </tspan><tspan class="code">R</tspan></text>
+<text x="150" y="40" class="muted" text-anchor="middle">at or before the target</text>
+<text x="322" y="20" class="text" text-anchor="middle"><tspan class="name">target </tspan><tspan class="code">N</tspan></text>
+<text x="322" y="40" class="muted" text-anchor="middle">a revision or a time</text>
+<rect class="box" x="1" y="92" width="149" height="32" rx="0"/>
+<rect class="track" x="150" y="92" width="172" height="32" rx="0"/>
+<rect class="box" x="322" y="92" width="77" height="32" rx="0"/>
+<rect class="frame" x="1" y="92" width="398" height="32" rx="4"/>
+<path class="divider" d="M252 92 V124"/>
+<text x="10" y="113" class="code">wal-archive/</text>
+<text x="260" y="113" class="code">wal/</text>
+<path class="mark" d="M150 70 V132"/>
+<path class="mark" d="M322 70 V132"/>
+<path class="flow" d="M150 140 V146 H322 V140"/>
+<text x="236" y="166" class="text" text-anchor="middle">commits <tspan class="code">R+1</tspan> to <tspan class="code">N</tspan> replayed</text>
+<text x="1" y="198" class="muted">older</text>
+<text x="399" y="198" class="muted" text-anchor="end">newer</text>
+</svg>

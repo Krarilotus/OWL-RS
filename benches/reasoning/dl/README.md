@@ -39,7 +39,7 @@ python w3c.py against ../../../tmp/dlw3c published-2009.tsv hermit
 rm -rf ../../../tmp/dlw3c
 ```
 
-## Results so far (3 October 2026, main PC)
+## Results so far (3 October 2026, development machine)
 
 - **W3C, direct semantics, species DL** (411 tasks of 311 tests; 20 s per task, and a
   rerun at 120 s of the tasks the 2009 results list as passes that ran out of time;
@@ -64,7 +64,7 @@ rm -rf ../../../tmp/dlw3c
   `cargo run -p nrese-owl --example fuzz`), run on HermiT, Konclude and Openllet as
   reference tools.
 
-## The small scope (12 October 2026, main PC)
+## The small scope (12 October 2026, development machine)
 
 ```bash
 cargo build --release -p nrese-owl --example scope -p nrese-dl --example scope_check

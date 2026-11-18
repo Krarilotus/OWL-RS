@@ -50,6 +50,11 @@ more than once copies only its additional occurrences.
 
 This section owns the execution policy; there is no setting for it besides `dl.threads`.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../img/memory-dark.svg">
+  <img src="../img/memory-light.svg" width="480" alt="The process (budgets.process_memory) holds the limit shared by every repository (budgets.total_query_memory): what requests reserve, and the state kept between them. Inside it, one query has its own limit (budgets.query_memory): its tables, kept results and DL work. Any other request has no limit of its own. Each level counts what work reserves, not all memory held; 0 turns it off. A bulk load is limited apart (budgets.bulk_load_memory).">
+</picture>
+
 - **Queries run on their caller.** Native evaluation, update `WHERE`, result encoding and
   output stay on the thread that asked; a parallel kernel (joins, sorts, closures, spill)
   forks into Rayon's global pool and joins before it returns. There is no dedicated query
@@ -60,7 +65,7 @@ This section owns the execution policy; there is no setting for it besides `dl.t
 - **One envelope per request.** Each request (a query, an update, a DL entailment check or
   explanation) gets one `nrese_exec::Envelope` within the catalog's budget, its limit the
   request's own (a query's memory limit, `budgets.query_memory`; an update has none of its
-  own). Everything the request holds draws from it: each evaluation as a part counted on
+  own). What the request reserves draws from it: each evaluation as a part counted on
   its own (`Envelope::part`, whose rest its live result keeps), the DL bounds' retained
   results and the gap, the DL engines' capacity (context saturation through its observer,
   the hypertableau at its memory checks) and DL compilation scratch (the premise's copy,
@@ -106,6 +111,8 @@ This section owns the execution policy; there is no setting for it besides `dl.t
   (cached per revision: an envelope of their own within the catalog's budget, not the
   requesting operation's, besides `dl.memory` and the process limit;
   `store/dl/classification.rs`), rule materialisation, bulk spill and background storage.
+  A checkpoint's working memory is charged to no budget: the store leaves the engine's
+  `admission` unset (the store's `EngineConfig` in `nrese-store/src/service.rs`; [limits](../limits.md#memory-and-stopping)).
   A cached result keeps what it retains after the request that computed it ends.
 - **A Rayon worker never waits on a cache flight.** A part another query computes is
   waited for only off the pool; a request on a worker computes it itself, so no wait can

@@ -1,12 +1,17 @@
 # The quarantine of invalid statements
 
-What a bulk load does with statements it can't read (the owner's decision of 13 October
-2026, after the Claros case: one IRI with a `%` that starts no escape stopped a load of
-millions of good statements). Code: `nrese_store::quarantine`, the bulk loader
-(`nrese_store::bulk_load`), the parsers' `SkippedStatement` (`nrese_rdf_io::error`).
+What a bulk load does with statements it can't read (after the Claros case: one IRI with a
+`%` that starts no escape stopped a load of millions of good statements). Code:
+`nrese_store::quarantine`, the bulk loader (`nrese_store::bulk_load`), the parsers'
+`SkippedStatement` (`nrese_rdf_io::error`).
 
 Not to be confused with the *reasoning* quarantine (`reasoning_state`, `/readyz` 503): a
 store whose asserted data is inconsistent. This one holds statements that are not data.
+
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../img/quarantine-dark.svg">
+  <img src="../img/quarantine-light.svg" width="480" alt="A bulk load sends valid statements to the data, what queries, reasoning and exports see. A bad statement the loader can read past goes to the quarantine, kept with its file and reason, and its text and line where known; it is not data. Re-admission, drawn dashed: fixed if need be, it is checked like any write; refused, it stays in quarantine; otherwise it becomes data. Today re-admission is a store function only; its HTTP API and command are proposed. A cut-off file, or another error the loader can't read past, stops the whole load, as a syntax error does with --strict; none of it is committed.">
+</picture>
 
 ## 1. The rule
 

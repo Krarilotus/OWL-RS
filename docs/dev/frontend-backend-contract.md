@@ -74,8 +74,8 @@ For frontend hosting under a different path prefix:
 
 The frontend package also ships a fast CLI on top of the same TypeScript client boundary:
 
-```powershell
-Set-Location .\apps\nrese-console
+```bash
+cd apps/nrese-console
 npm run cli -- runtime
 npm run cli -- capabilities
 npm run cli -- query --text "SELECT * WHERE { ?s ?p ?o } LIMIT 5"

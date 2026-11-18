@@ -37,7 +37,7 @@ Ontology reasoning is what NRESE is built to be best at. Load, storage and plain
 | **NRESE v1** (`rules-mvp`) | Bounded RDFS and OWL rules; commit gate only, inferences not queryable | RT4, RT5 (partial) | Today's baseline, honest about its limits |
 | **NRESE v2** | Materialised, incremental, per [reasoner-v2.md](reasoner-v2.md) | all | Arrives through M3 (R1–R6) |
 | **GraphDB 11.5** | Forward chaining with rulesets; `isSupported` retraction | RT1–RT5, RT7 | Needs a licence file (Free); results need Ontotext's permission to publish |
-| **RDFox 7.6** | Parallel datalog materialisation; B/F/FBF maintenance | RT1–RT5, RT7 | Evaluation licence requested; results need OST's approval |
+| **RDFox 7.6** | Parallel datalog materialisation; B/F/FBF maintenance | RT1–RT5, RT7 | We hold no licence for RDFox, so it runs nowhere here; its figures are shown as its authors published them, with their hardware |
 | **AnzoGraph 3.5** (Altair Graph Lakehouse) | RDFS-plus and an OWL 2 RL subset | RT1, RT3 | Free up to 8 GB RAM; results need CSI's consent |
 | **Stardog** | Query-time reasoning (RL/QL/EL/SL) | RT3, RT4 | Free developer licence; licence terms still to be checked |
 | **Apache Jena** | Rule reasoners (RDFS, OWL micro/mini/full) in memory | RT1, RT3 (small) | Apache 2.0, publishable |
@@ -48,7 +48,7 @@ Ontology reasoning is what NRESE is built to be best at. Load, storage and plain
 
 ## 4. Correctness oracles
 
-- **OWL 2 RL / RDFS materialisation:** the inferred set from RDFox or GraphDB once licensed. Before that:
+- **OWL 2 RL / RDFS materialisation:** the inferred set from GraphDB once licensed. Before that:
   - owlrl, on small inputs
   - agreement between Jena's rule reasoner and Nemo on the rules they share
 - **Queries:** the published LUBM reference answers for LUBM(1). Beyond that, agreement across the systems that claim completeness for the profile.
@@ -72,7 +72,7 @@ Ontology reasoning is what NRESE is built to be best at. Load, storage and plain
    - the publishable baselines: Jena, Nemo, Virtuoso
    - AnzoGraph, locally
    - NRESE v1 on RT4/RT5
-2. **With licences:** GraphDB, RDFox and Stardog, locally, published only with permission.
+2. **With licences:** GraphDB and Stardog, locally, published only with permission.
 3. **Through M3:**
    - NRESE v2 enters task by task: R2 → RT1, R4 → RT3, R5 → RT2/RT5, R6 → RT4/RT7, R8 → RT6
    - every M3 work package's "done when" cites this benchmark
@@ -161,6 +161,6 @@ What the paper claims, and the experiment that supports each claim. Every experi
 **What the paper needs that doesn't exist yet:**
 1. A cluster account, and the adapters for the other systems under Apptainer.
 2. The cohort and full tiers of the integration workload, and its authors' agreement to be named.
-3. Licence files for GraphDB, RDFox, Stardog and AnzoGraph, and the vendors' answers on publishing.
+3. Licence files for GraphDB, Stardog and AnzoGraph, and the vendors' answers on publishing.
 4. The engine work the first measurement asks for (W3 to W6), so that the larger tiers are answered and not only loaded.
 5. RT6 (classification) stays out of the paper unless R8 is built.

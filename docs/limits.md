@@ -1,23 +1,24 @@
 # Limits and deviations
 
-What NRESE doesn't do, and where it departs from a standard on purpose, for the code of
-the commit this page is in. Each item is stated in the document it links to; this page only gathers them, each
-with what to do instead, or "none known" where there is nothing. It is the detail of the
-"left out" list of the [scope](what-it-covers.md#scope), which also says what is in and what is
-planned.
+Where NRESE stops, and where it departs from a standard on purpose, in the commit these pages
+come with. What is in is on
+[features and standards](what-it-covers.md).
 
 ## Choose another system when
 
-- You need several writers at once. One commit runs at a time; reads never wait for
+- You need several writers at once. One commit runs at a time, and reads never wait for
   it ([storage](spec/02-storage-and-transactions.md#writes)).
 - You need automatic failover, or data spread over several machines. Read replicas
-  follow a primary's log; nothing promotes a replica or partitions the data
+  follow a primary's log, but nothing promotes a replica or partitions the data
   ([replication](ops/replication.md)).
+- You need reasoned answers on a replica that say whether rows may be missing. A replica's
+  reasoned reads say `not-certified`, and a primary under `reasoner.equality = "compact"`
+  serves no replica ([replication](ops/replication.md#limits-of-this-first-step)).
 - You need named graphs as separate reasoning contexts. Rules read every graph, and
   inferences go to the default graph ([graph scope](spec/reasoning-semantics.md#graph-scope)).
-- You need every OWL 2 DL answer proven complete. Some answers are `sound-only` and say
-  so; asking for exact answers turns those into an error rather than a guess
-  ([owl2-dl](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
+- You need every OWL 2 DL answer proven complete. Some answers are `sound-only`, which
+  means rows may be missing, and if you ask for exact answers, a request whose answer can't be
+  proven complete fails with an error ([owl2-dl](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
 - You need SHACL rules (SHACL Advanced Features) or `sh:entailment`. Neither is
   supported ([SHACL limits](ops/http-api.md#shacl-validation)).
 - You need property-graph query languages (openCypher, Gremlin, GQL). Only SPARQL is
@@ -29,7 +30,7 @@ planned.
 ## SPARQL
 
 - Update's `LOAD` is refused, and `LOAD SILENT` does nothing. Load data over the Graph Store
-  Protocol or with `nrese-server load` ([server setup](ops/server-setup.md)).
+  Protocol or with `nrese-server load` ([loading data](ops/server-setup.md#loading-data)).
 - `SERVICE` calls only the endpoints `federation.allow` names
   ([configuration](ops/config-reference.md)).
 - `HAVING` may name a `SELECT` alias, an extension ([why](ops/http-api.md#sparql)). For
@@ -37,46 +38,63 @@ planned.
   `HAVING (COUNT(?x) > 1)`.
 - A default graph merged from several graphs keeps a blank node they share as one node,
   where SPARQL's RDF merge keeps them apart ([why](ops/http-api.md#sparql)). No setting
-  gives the standard merge; where it matters, read with `GRAPH ?g { … }` and keep `?g` in
+  gives the standard merge. Where it matters, read with `GRAPH ?g { … }` and keep `?g` in
   the answer.
 - GeoSPARQL measures in metres only in CRS84 and a listed set of projected systems, and reads
   no GML arcs or 3D solids: such a measure or literal gives no value. Convert coordinates and
-  approximate arcs before loading; for solids, none known ([GeoSPARQL](ops/http-api.md#sparql)).
+  approximate arcs before loading ([GeoSPARQL](ops/http-api.md#sparql)).
 - Full-text query strings drop Lucene's `OR`, `+`, field names and boosts
   ([full-text search](ops/http-api.md#sparql)). Words without `AND` match as any of them, as
-  `OR` would; to require words, join them with `AND` (every word is then needed); to search one
-  property, name it in `text:query`'s list; for boosts, none known.
-- A named graph without statements doesn't exist: `CREATE GRAPH` stores nothing, and an
+  `OR` would. To require words, join them with `AND` (every word is then needed), and to search
+  one property, name it in `text:query`'s list.
+- A named graph without statements doesn't exist. `CREATE GRAPH` stores nothing, and an
   emptied graph answers 404 ([Graph Store Protocol](ops/http-api.md#graph-store-protocol)).
-  Read that 404 as an empty graph; to keep an empty graph listed, none known.
-- A reader of only some graphs gets no plan steps in `EXPLAIN`. None known.
-- Directional strings in the data alone don't make a result announce RDF 1.2; a query that
+  Read that 404 as an empty graph.
+- A reader of only some graphs gets no plan steps in `EXPLAIN`.
+- Directional strings in the data alone don't make a result announce RDF 1.2, but a query that
   makes or matches them, or triple terms, does ([announcing](ops/http-api.md#requests-in-detail)).
-  None known: a client that may meet them should read results as RDF 1.2.
+  A client that may meet them should read results as RDF 1.2.
+- The first query that plans with a pattern counts the pattern's distinct values, and waits for the count. Counts
+  are reused until the pattern's matches change by a quarter, and a pattern with more than about 4 million matches
+  isn't counted afresh.
+- After a load, the planner's statistics of which predicates occur together (characteristic sets) are built once,
+  about 1.5 s at one thread for 10 M statements, kept beside the checkpoint, and rebuilt in the background once
+  the data has changed by a quarter. Data with more than 131,072 distinct predicate sets (DBpedia among them) gets
+  none. A build at first use runs inside the planning query and can't be cancelled.
 
 ## RDF syntaxes
 
-- JSON-LD remote contexts aren't fetched. Over HTTP, send the context inline; a library
-  caller supplies a document loader.
+- JSON-LD remote contexts aren't fetched. Over HTTP, send the context inline, and in the library
+  supply a document loader.
 - Notation3 is read in the library only (not over HTTP), and only what RDF can hold. N3
   rules go to the reasoner through `reasoner.rules`
   ([configuration](ops/config-reference.md#reasoner)).
-- Blank nodes are scoped to one write: every request gets fresh ones
+- Blank nodes are scoped to one write, so every request gets fresh ones
   ([storage](spec/02-storage-and-transactions.md#data-model)). Give a node an IRI where a
   later write must name it.
 
 ## Reasoning
 
-- Inferences are materialised, in the default graph. A statement both asserted and derivable counts as
-  asserted ([storage](spec/02-storage-and-transactions.md#data-model)).
-- `rdfs` is a six-rule subset without axiomatic triples; `rdfs-full` has the RDFS rules
-  but `rdfD1`, and the axioms but those about `rdf:_1`, `rdf:_2`, …
-  ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset), [modes](spec/reasoning-semantics.md#modes)).
-- `owl2-rl` doesn't infer `x owl:sameAs x` for every term (`?x owl:sameAs ?x` doesn't
-  return one for each; an asserted one is returned), checks the datatype rules in part, and of the axiomatic triples holds only `dt-type1`'s 32 datatype statements, in every store ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
-  Lists past their limits (a property chain of more than 250 properties, a key of more
-  than 127, an intersection of more than 256 classes, more than 64 member sequences) aren't used at all, never truncated, and each is reported in the log
-  and the reasoning diagnostics
+What each mode computes and what its answers promise is in
+[the reasoning contract](spec/reasoning-semantics.md#modes). These are the parts of it that
+leave something out.
+
+- A statement both asserted and derivable counts as asserted
+  ([storage](spec/02-storage-and-transactions.md#data-model)).
+- `rdfs` has no axiomatic triples, and `rdfs-full` leaves out `rdfD1` and the axioms about
+  `rdf:_1`, `rdf:_2`, … ([rdfs](spec/reasoning-semantics.md#rdfs-a-6-rule-rdfs-subset),
+  [modes](spec/reasoning-semantics.md#modes)).
+- `owl2-rl` doesn't infer `x owl:sameAs x` for every term, so `?x owl:sameAs ?x` doesn't
+  return one for each, though an asserted one is returned. It checks the datatype rules in part,
+  and of the axiomatic triples it holds only `dt-type1`'s 32 datatype statements, in every store.
+  It doesn't type a literal by its own datatype (`dt-type2`), nor do `owl-horst` and
+  `rdfs-plus`: without a range, `∃:p.xsd:integer ⊑ :C` and `:a :p 5` give no `:a a :C`, even in
+  one commit, where `owl2-dl` gives it
+  ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
+  Lists past their limits (a property chain of more than 250 properties, a key of more than
+  127, an intersection of more than 256 classes, more than 64 member sequences) aren't used
+  at all, never truncated, and each is reported in the log and the reasoning diagnostics;
+  while one is left out, no answer that reads the inferences is `complete`
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)); none known beyond
   keeping lists within those limits. Literals aren't
   equated by value (`"1"^^xsd:integer` and `"01"^^xsd:integer` stay two terms): compare
@@ -85,10 +103,21 @@ planned.
   ruleset's closure is `sound-only`. The rewriting runs by default under `owl2-ql` only;
   under `owl2-rl`, `reasoner.ql_rewriting = "on"` checks each query as under `owl2-ql`.
   Under `owl2-dl`, budgets and undecided candidates give `sound-only` (raise the `dl.*`
-  budgets, or ask `dl-answers=exact` to get an error instead), and an operator that isn't
+  budgets, or ask `dl-answers=exact` to get an error instead); candidates are decided only
+  in a query that is one basic graph pattern with filters, so under a `UNION`, for one, they
+  stay undecided. Where the class or property a read asks about may hold of every element
+  (`owl:Thing` a subclass of it, a reflexive property), every name of the ontology may be an
+  answer, a class's or property's name too, and the store returns only its individuals: such
+  a read is `sound-only`, its reason naming the class or property. A query with two answer
+  variables or more, or a path, is `sound-only` there without the check that could keep it
+  `complete`. An operator that isn't
   monotone over answers that may be missing gives `unsound`
   ([what an answer promises](what-it-covers.md#what-an-answer-promises)). Under `owl2-dl`
-  and `owl2-ql`, and under `owl2-rl` with the rewriting on, a query that matches a number
+  and `owl2-ql`, and under `owl2-rl` with the rewriting on, a read of the RDF, RDFS or OWL
+  vocabulary (`?s rdfs:label ?l`), a variable predicate or class (`?x a ?class`) and
+  `DESCRIBE` give `sound-only` at best
+  ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)). In those
+  modes, a query that matches a number
   or a date it names or computes against the data gives `sound-only` at best: the store
   matches it as written, so `"01"^^xsd:integer` doesn't find a stored `"1"`. Compare values
   in a `FILTER` instead
@@ -103,19 +132,129 @@ planned.
   reader's graphs hold a triple term, is never `complete`: OWL 2 doesn't define them. For
   triple terms, none known
   ([what may be complete](spec/reasoning-semantics.md#what-may-be-complete)).
+- Under `owl2-ql`, and under `owl2-rl` with the QL rewriting on, a read that asks only about a
+  predicate or class that appears nowhere in the store can be told `false` and `complete` on
+  data that are inconsistent under OWL 2 DL in a way the rules don't read (a cardinality
+  written in another spelling than the mapping's `"0"` or `"1"^^xsd:nonNegativeInteger`,
+  say). On consistent data such a read is right: nothing entails a statement of a name that
+  appears nowhere.
+- Under `owl2-ql`, a store that asserts an individual into a class expression
+  (`:x a [ owl:intersectionOf ( :A :B ) ]`, or a cardinality restriction) gets no `complete`
+  answer, since what follows from that assertion may be missing (`:x a :A` answers `false`):
+  OWL 2 QL allows only a named class there. Under `owl2-rl` with the QL rewriting on, the same
+  holds for every expression but those OWL 2 RL allows on the right of a subclass axiom (an
+  intersection of such, `allValuesFrom`, `hasValue`, a complement, an at-most of one), which
+  the rules apply. An inclusion into an intersection
+  (`:C rdfs:subClassOf [ owl:intersectionOf ( :A :B ) ]`), which OWL 2 QL allows, is answered
+  and `complete`.
+- Under `owl2-rl` with `reasoner.ql_rewriting = "on"`, a universal restriction on
+  `owl:topObjectProperty` puts every individual into its filler, which the rules don't derive:
+  the read answers `false` and is told `complete`. For one:
+  `:x a [ owl:onProperty owl:topObjectProperty ; owl:allValuesFrom :D ] . :y a :Y`, asked
+  `:y a :D`. At the defaults it isn't told `complete`.
+- Under `owl2-ql`, and under `owl2-rl` with the rewriting on, a store inconsistent only through
+  an existential the rewriting gives isn't found inconsistent: a read every inconsistent store
+  entails answers `false` and is told `complete`. For one: `:A ⊑ ∃:p.:B`, `:N ⊑ ¬∃:p.:B`,
+  `:x a :A, :N`, asked `:x a :D`.
+- Under `owl2-ql`, a contradiction over data values by axioms outside OWL 2 QL is accepted, and
+  the store reports itself consistent, with reads of unrelated terms told `complete`:
+  `:C rdfs:subClassOf [ owl:onProperty :p ; owl:allValuesFrom xsd:integer ]` and `:a :p "x"`,
+  then `:a a :C`; or a `hasValue` of a literal outside the property's datatype range. `owl2-rl`
+  and `owl2-dl` refuse both. A plain datatype range with a literal outside it is refused in
+  every mode.
+- A rebuild of the inferences (`POST …/reasoning/rematerialise`) that fails while it replaces
+  them leaves them uncertified: answers are `not-certified` until a rebuild succeeds. A change of
+  a repository's QL rewriting made in between takes effect with that rebuild, not at once. Run
+  the rebuild again ([HTTP interface](ops/http-api.md#engine-api-apiv1)).
 - User rules (Notation3 or `.pie`) have no built-ins but `log:equalTo` and
   `log:notEqualTo`, make no new blank nodes, and hold at most 256 atoms in a rule's
   premises or conclusion (split a longer rule); with user rules no answer is claimed
-  complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)). None known.
+  complete ([user rules](spec/reasoning-semantics.md#user-rules-notation3)).
 - Under `owl2-dl`, a commit whose consistency check isn't decided
-  (a budget or the timeout) goes through, and the status says `unknown`; no answer is then
+  (a budget or the timeout) goes through, and the status says `unknown`. No answer is then
   complete ([consistency](spec/reasoning-semantics.md#consistency)). Raise `dl.timeout`
   and the `dl.*` budgets ([configuration](ops/config-reference.md#reasoner)).
+- Under `owl2-dl`, the datatypes of the standard vocabularies outside the OWL 2 datatype map
+  (`xsd:date`, `xsd:gYear`, `xsd:duration` and the like) have no values the checks read.
+  Where such a value can decide a clash (under a range, a functional property or a
+  cardinality, or compared), the consistency is `unknown` and no read is `complete`; a date
+  nothing reads changes nothing. Use `xsd:dateTime`, which is in the map, where you can
+  ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
+- Under `reasoner.equality = "compact"`, four cases are checked less than under the default
+  (`representatives`) and `replicate`. Where they matter, use the default
+  ([`reasoner.equality`](ops/config-reference.md#reasoner.equality)).
+  - A commit that makes two different data values the same can be accepted where one value
+    reached its `owl:sameAs` class through an earlier commit that merged two individuals (one of
+    them declared `owl:sameAs` a literal). The other settings refuse that commit, and a full
+    rebuild of the inferences finds the clash in every setting.
+  - A full rebuild doesn't check a literal against a datatype it reaches only through an
+    `owl:sameAs` alias of the datatype's IRI, so it finds such data consistent. Commits refuse
+    that data in every setting, and the other settings' rebuilds find it.
+  - After a full rebuild, a key whose list is reached through `owl:sameAs rdf:nil`
+    (`:C owl:hasKey :l . :l owl:sameAs rdf:nil`) doesn't make two instances of `:C` the same,
+    where a commit, and `owl:hasKey rdf:nil` written directly, do in every setting.
+  - A write of an `owl:sameAs` statement, between two properties or two individuals, can pass a
+    SHACL gate set to `enforce` though it brings a result: the equality is expanded when the data
+    are read, so the gate starts from that statement alone. An insert of the statement that
+    breaks the shape is refused in every setting. After such writes, validate in full
+    (`GET /dataset/shacl`).
+- A store whose ontology uses an inverse property expression (`ObjectInverseOf`, written
+  `_:x owl:inverseOf :p`) rebuilds its inferences at every commit that changes its data, so a
+  commit's time grows with the store: at 100,000 individuals, a one-fact commit takes about 40
+  to 55 ms instead of 0.3 to 0.4 ms. Stores with named inverses only (`:q owl:inverseOf :p`)
+  are unchanged.
+- Such a store decides a commit's consistency without the facts the inverse gave in earlier
+  commits. A clash only they reach is not refused, and a clash only they held is refused, until
+  the next commit. After an accepted clash of that kind the store still reports itself
+  consistent; a rebuild of the inferences finds it.
+- A blank node used as a property otherwise than as an inverse expression
+  (`_:b a owl:ReflexiveProperty`, `:p rdfs:subPropertyOf _:b`, an equality that copies a
+  predicate onto a blank node) gives facts no store holds; a read after a later commit may miss
+  them. Such input is outside OWL 2 DL.
+- A literal value under an inverse, symmetric or functional object property gives a fact no
+  store holds, with the literal as its subject. A read after a later commit may miss what
+  follows from it, and `owl2-ql` and `owl2-dl` still tell it `complete`; `owl2-rl` doesn't. For
+  one: `:p owl:inverseOf :q . :a :p "v"`, then `:q rdfs:range :D`, asked `:a a :D`. That input
+  is outside OWL 2 DL. A literal typed by a range is such a fact too, in valid OWL 2 DL: read
+  back by `someValuesFrom` that datatype in a later commit (`:p rdfs:range xsd:integer .
+  :a :p 5`, then `∃:p.xsd:integer ⊑ :C`, asked `:a a :C`), `owl2-rl` and `owl-horst` miss it
+  until a rebuild, and don't tell it `complete`; `owl2-dl` answers it.
+- <a id="two-spellings-across-commits"></a>Under `owl2-dl`, a functional data property (or an
+  at-most-one restriction) that holds one value written two ways (`"1"^^xsd:int`,
+  `"01"^^xsd:int`) equates the two literals within a commit, but not across commits: after a
+  later commit, a read of another property's values may return one spelling where the same data
+  in one commit return both, and it is still told `complete`. The data are valid, consistent
+  OWL 2 DL, so here a `complete` answer can be wrong. The missing row is the same value in its
+  other spelling: a count is off by such duplicates, and a `FILTER` on the spelling (`STR`) can
+  differ, while a `FILTER` on the value (`?v = 1`) finds it either way. A rebuild of the
+  inferences (`POST …/reasoning/rematerialise`) restores it.
+- A value the store can't represent (an `xsd:dateTime` with a year beyond 10¹¹, say) is checked
+  neither for a clash nor for being in its datatype, so a store that holds one is told consistent.
+- Under `owl2-dl`, a key or a negative property assertion over a value the store's quick
+  proof of consistency can't read (an `xsd:date` written two ways; also, stricter than needed,
+  an integer beyond 128 bits or a string with a base direction) leaves the consistency
+  `unknown`. Keys on strings and language-tagged strings are decided. Once the store met
+  such a value, later commits are decided without that proof, by the slower checks, until
+  the store is restarted or its inferences are rebuilt (`POST …/reasoning/rematerialise`).
+- Under `owl2-dl`, a literal OWL 2 DL gives no meaning is told as the rules tell it where
+  they can. An ill-typed literal of the map (`"abc"^^xsd:integer`) alone leaves the store
+  consistent and its reads `complete`; under a range its commit is refused; where the full
+  check must read its value (beside a `hasValue`), the consistency is `unknown`. A literal of
+  a datatype the ontology names itself (`"x"^^:T`) is kept as written and never compared
+  by value; where the full check must read it, the consistency is `unknown`. A literal typed
+  `rdfs:Literal` is ill-typed: under any range, `rdfs:Literal` included, its commit is
+  refused.
 - Under `owl2-dl`, an ontology with annotation-property axioms (a domain, range or
-  super-property of an annotation property) or a punned name (one IRI as a class or
-  property and as an individual) leaves the rules-only route. With annotation-property
+  super-property of an annotation property, or another kind of property made its
+  sub-property; `rdfs:label`, `rdfs:comment` and the other built-in ones count without a
+  declaration), a punned name (one IRI as a class or
+  property and as an individual), or an empty intersection or union (`owl:intersectionOf
+  rdf:nil`, used or not) leaves the rules-only route: reads that were `complete` by the rules
+  alone lose that or take a slower way. The SHACL shapes graph is a
+  graph of the store and is read too: a shape's `sh:targetClass ex:Animal` makes `ex:Animal`
+  an individual as well as a class, a punned name. With annotation-property
   axioms every answer is `unsound`; with punning, every answer is `unsound` where an
-  `owl:sameAs` reaches a punned name. Both are the whole ontology's, not the query's
+  `owl:sameAs` reaches a punned name. Each is the whole ontology's, not the query's
   ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
   Remove such axioms, give the individual its own IRI, or use `owl2-rl`, whose promise
   is the rules' reading.
@@ -123,14 +262,50 @@ planned.
   doesn't decide whether the data is consistent under OWL 2 DL: the commit is refused,
   saying so, and data loaded with such a clash is `undecided` and quarantined, with the
   reason in `/dataset/info` (`consistency_reason`). The check is the whole ontology's, so a
-  real clash beside an unrelated punned name reads `undecided` too, and a DL engine's later
+  real clash beside an unrelated punned name or empty list reads `undecided` too, and a DL engine's later
   verdict at a query doesn't change readiness. In quarantine, each commit rebuilds the
   inferences in full, and under `owl2-dl` reads the asserted ontology once more to tell
   `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
-  annotation property's domain, range or super-property, or give the individual its own
-  IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
+  annotation property's domain, range, super-property or sub-property or the empty list, or give
+  the individual its own IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
+- On a store in quarantine, a delete of a schema statement that the remaining statements derive
+  again can be refused as introducing the violation that was already there, though a full
+  rebuild finds the same violation after it (under `owl2-rl`, for one). The delete changes
+  nothing, and the store stays as it was. Repair the existing violation first.
+- Labels and notes on a store with `owl:sameAs` read as `unsound`. Under `owl2-dl`, and under `owl2-ql`
+  and `owl2-rl` where the QL rewriting answers, a query that reads an annotation property
+  (`rdfs:label`, `rdfs:comment`, or one the data declares) or any predicate (a variable
+  predicate, `DESCRIBE`) is `unsound` where the store holds `owl:sameAs` between two different
+  terms, or an inferred annotation statement: the rules copy annotations across equal names, and
+  OWL 2 DL doesn't. The copies are still among the rows. Read the annotations as stated with
+  `infer=false`; under a ruleset's own closure without the rewriting the same reads stay
+  `sound-only`, since there the copies are right
+  ([the rule](spec/reasoning-semantics.md#annotation-copies)).
+- Under `owl2-dl`, an ontology with a part the reader leaves out is never told consistent:
+  every verdict but an inconsistency is `unknown`. Where that part is one the OWL 2 RL rules
+  may still read (a reserved name used as a class or individual, OWL's vocabulary outside the
+  mapping's forms, a malformed structure or list such as `owl:hasKey ()`, a key without a
+  property, syntax not read yet), every answer is
+  `unsound` too. The reason gives how many parts were left out and names the first in words,
+  with its terms as the data writes them (a blank node by a statement next to it, a triple
+  term as `_`; a read that finds the part itself names no term). Only the first is named, and
+  no log or endpoint lists the others. A read inside a transaction is told what
+  was left out of the revision it began on, so an addition still pending that would be left
+  out may be told `sound-only` until it is committed
+  ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
+  Remove such statements, or use `owl2-rl`, whose promise is the rules' reading.
+- Under `owl2-dl`, `owl:Thing`, `owl:Nothing` and the four top and bottom properties where an
+  individual goes (`:a :p owl:Thing`) aren't noticed. OWL 2 DL allows no reserved name as an
+  individual, and any other one stated so is a part the reader leaves out, as above; these six
+  are not, so a read that returns one (with `:p rdfs:range :C`, `SELECT ?x { ?x a :C }`
+  returns `owl:Thing`) can be told `complete`. Don't state them as individuals.
+- Under `owl2-dl`, a variable the query doesn't return is read existentially: it may stand
+  for an element that has no name. The SPARQL entailment regime binds every variable of the
+  pattern to a name of the ontology, so the store may return a row the regime doesn't
+  ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
 - An undeclared property used with literal values is read as a data property. Declare
-  annotation properties such as `skos:prefLabel` (`skos:prefLabel a owl:AnnotationProperty`);
+  annotation properties other than the built-in ones, such as `skos:prefLabel`
+  (`skos:prefLabel a owl:AnnotationProperty`);
   otherwise a labelled class reads as punned, and under `owl2-dl` it leaves the rules-only
   route. Nothing in this release shows which properties were typed by their use; this
   query lists the ones used with literals and given no declaration:
@@ -149,42 +324,150 @@ planned.
         && !STRSTARTS(STR(?property), STR(owl:)))
   }
   ```
-- Bulk loads skip the commit gates ([storage](spec/02-storage-and-transactions.md#bulk-loads)):
-  neither SHACL nor the OWL 2 DL consistency check runs. With reasoning on,
-  `nrese-server load` recomputes the inferences and fails when the rules' consistency
-  checks find a violation (under `owl2-dl`, those of OWL 2 RL; `undecided`, as above, where
-  OWL 2 DL may read the ontology otherwise); the data stays loaded, and the store is
-  quarantined until it is repaired. With reasoning off, nothing is checked
-  ([consistency](spec/reasoning-semantics.md#consistency)). For the gates, load over HTTP
-  (Graph Store), or validate after the load with `GET /dataset/shacl`.
+- An explanation of what the rules derived (`/explain`) examines at most 4,096 statements.
+  Outside `owl2-dl`, a derivation it doesn't find within them is answered 404, the same as for a
+  statement that doesn't hold, so you can't tell the two apart. Justifications
+  (`justifications=…`) say `complete: false` when a budget cut them short, and under `owl2-dl`
+  a set of axioms past `dl.explanation_tests` or `dl.timeout` comes back unminimised, with
+  `minimal: false`. Where OWL 2 DL doesn't decide it, the answer is a 422 that says why, not a
+  404 ([HTTP interface](ops/http-api.md#engine-api-apiv1)).
+- Bulk loads and the ontology file loaded at start-up skip the commit checks
+  ([what a commit does](what-it-covers.md#what-a-commit-does),
+  [storage](spec/02-storage-and-transactions.md#bulk-loads)), so neither SHACL nor the OWL 2 DL
+  consistency check runs. To have the checks, load over HTTP (Graph Store), or validate after
+  the load with `GET /dataset/shacl`.
+- Under `owl2-dl`, a large `owl:sameAs` class is proven member by member, which can be slow. At a budget the answer
+  is `sound-only` and partial. Proofs per class are planned for v1.6. Raise `dl.timeout` and the `dl.*` budgets.
+- Under `owl2-dl`, a read whose candidates the exact services must each refute (all members of
+  `:H` where `owl:Thing` is a subclass of `:H` or `:K`, say) grows steeply with the store, as
+  each candidate's test reads every individual: measured on one machine, about 18 ms at 100
+  members, 0.3 s at 300 and 10 s at 1,000. [`dl.max_candidates`](ops/config-reference.md#dl.max_candidates)
+  (1,000) bounds how many are tested, not what each test costs; the rest are left out of the
+  answer, which is `sound-only` and names the setting, as it does at
+  [`dl.timeout`](ops/config-reference.md#dl.timeout) (30 min). On a server the query's timeout
+  ([`budgets.query_timeout`](ops/config-reference.md#budgets.query_timeout), 30 s) comes first:
+  the answer is a `408` with no rows and no status, and nothing in it says that the OWL 2 DL
+  checks took the time or which setting to raise. Raise the query timeout for such a read, or
+  ask `dl-answers=sound`, whose answers skip those checks and are `sound-only`.
+- Under `owl2-dl`, a query past the query timeout is answered `408`, but the reasoning its
+  answer needs first (the bounds over the data, which every `owl2-dl` read waits for) runs on
+  until it ends or until [`dl.timeout`](ops/config-reference.md#dl.timeout) (30 min), on the
+  server's shared workers. Meanwhile reads on other repositories of the same server can slow
+  down or time out, and further `owl2-dl` reads on that repository wait for the same work and
+  time out too. It is a wait, not a lock: when the work ends, the other reads are at their
+  usual speed at once. Measured on one machine (10 workers, bounds that take 59 s to build,
+  a query timeout of 5 s): for about 30 s after the `408` a read on another repository that
+  takes 8 ms idle timed out or took up to 4.3 s; with `dl.timeout` at 10 s the other reads
+  were normal again within 5 to 10 s. Set `dl.timeout` a little above the query timeout: a
+  store whose reasoning needs longer then never gets it, so its `owl2-dl` answers stay
+  `sound-only`, and each such read spends up to `dl.timeout` again.
+  [`dl.threads`](ops/config-reference.md#dl.threads) doesn't confine this work. A store with
+  heavy `owl2-dl` data on a server of its own avoids it.
 
 ## SHACL
 
-- SHACL Core and SHACL-SPARQL. Not supported: SHACL Advanced Features, and `sh:entailment`,
-  which is reported as a failure ([HTTP interface](ops/http-api.md#shacl-validation)).
-  None known.
-- The commit gate is off by default; when on, it checks only what a commit introduces
+- The commit gate is off by default, and when it is on, it checks only what a commit introduces
   ([configuration](ops/config-reference.md)). To check data already stored, validate it
   with `GET /dataset/shacl`.
+- A rebuild of the inferences passes no gate: a change of the rules, the rebuild at a start, the
+  one after a load or an import, and one asked for (`POST …/reasoning/rematerialise`) store
+  their inferences without checking them against the shapes, and
+  later commits are checked only for what they introduce. Validate with `GET /dataset/shacl`
+  after one.
+- With no shapes stored, a gate set to `enforce` accepts every write. An upload of shapes that
+  fails (one that runs past its timeout, say) stores none, so check its status and read the
+  shapes graph back.
+- A commit that changes the shapes is checked against the shapes as they are after it: one
+  update that removes the shapes and adds data is checked against none. It needs the right to
+  write the shapes graph.
+- The gate follows a recursive shape (one that refers to itself through `sh:node`, inside
+  `sh:or` too) one step back from the changed statements. A write whose new violation lies two
+  or more such steps from the target node is accepted, and a full validation
+  (`GET /dataset/shacl`) reports it afterwards. Where recursive shapes matter, run one after
+  writes.
+- Under `reasoner.equality = "compact"`, a write of `owl:sameAs` can pass the gate though it
+  brings a result ([reasoning](#reasoning)).
+- A write can be refused for a result that was already there: a result reached through a nested
+  shape (a `sh:property` inside a `sh:property`) counts as introduced when a new focus node
+  reaches it, though another focus node reached it before. Repair that result first
+  (`GET /dataset/shacl` lists it).
+- Shapes that don't compile refuse every write, and a validation stopped by its budget fails
+  the write, with the gate set to `report` as to `enforce`.
+
+## Memory and stopping
+
+- A memory limit bounds what requests reserve, not what the process holds, and the process can hold more than the
+  limits add up to. No fixed factor bounds the difference.
+  - The settings: one query, [`budgets.query_memory`](ops/config-reference.md#budgets.query_memory) (4 GiB by
+    default); every running request together,
+    [`budgets.total_query_memory`](ops/config-reference.md#budgets.total_query_memory) (50 % of the memory);
+    both inside the process's, [`budgets.process_memory`](ops/config-reference.md#budgets.process_memory) (75 %).
+    An embedded store has no separate query pool, and its queries charge the process's budget.
+  - None of these is set aside for queries. The data, the text index, reasoning, the allocator's retained memory
+    and other processes draw on the same memory, so leave room beside them.
+  - Outside the limits: the full-text index, built by the first text search and kept; operators' working state
+    (the keys of `OPTIONAL`, `ORDER BY`, `GROUP BY`, `MINUS` and `NOT EXISTS`, and the like) and a join's output
+    while it is built; the working state of a cyclic count (triangles, four-cycles); and what reasoning allocates,
+    which is watched rather than charged, so an overshoot is seen within 10 ms. The full list is on
+    [contracts](architecture/contracts.md#memory).
+  - A checkpoint's working memory, a background one's and the one a bulk load commits by, counts
+    against no limit, not even `budgets.process_memory`. It grows with the whole dictionary, about
+    17 to 23 bytes per term: about 720 MiB for DBpedia core's 40.5 million terms. Leave room for it.
+  - A join may take half the room left when it starts. That is a reading, not a reservation: it is checked every
+    1,024 rows, and joins running at once can read the same room.
+  - A design that bounds the rest follows this release.
+- A query can be refused while part of what it reserved is still unused, since reservations are taken ahead. That
+  part has no stated bound in this release.
+- Near the memory limit, a cached decoding can cause a refusal while memory the cache could give back is still
+  held. The output is never wrong.
+- A cancel, a deadline or a refusal takes effect at the work's next poll, which bounds work, not time. Under
+  nested reads in reasoning, more work runs between two polls ([the bound](architecture/contracts.md#cancellation)).
+  A stop never gives a partial or wrong answer.
+- Some phases run to their end after a stop: the executor's selection and sorting (seconds at 10 M rows on a term
+  key), one call of a regular expression (seconds for adversarial megabyte literals), and the graph kernel's
+  sorts and set-up arrays.
 
 ## Storage and transactions
 
-- One writer at a time; a commit holds at most 4 GiB of log payload, about 130 M quads;
-  larger loads go through the bulk loader
+- A commit holds at most 4 GiB of log payload, about 130 M quads.
+  Larger loads go through the bulk loader
   ([storage](spec/02-storage-and-transactions.md#limits)).
-- Client transactions read the latest commit; `SNAPSHOT` and `SERIALIZABLE` isolation are
-  refused ([RDF4J protocol](ops/http-api.md#rdf4j-protocol)). A read, then a write
+- A client transaction keeps its operations, not their effects, and runs them again at its
+  commit ([RDF4J protocol](ops/http-api.md#rdf4j-protocol)). An update with a `WHERE`, a
+  `CLEAR` or `DROP`, or a removal by pattern matches what another client committed meanwhile; a
+  value an update generates (`UUID()`, `RAND()`, `NOW()`, `BNODE()`, blank nodes) and read inside
+  the transaction isn't the one committed; a malformed update fails only at the next read or at
+  the commit; and a failed commit ends the transaction. Reads take the latest commit, and
+  `SNAPSHOT` and `SERIALIZABLE` isolation are refused. A read, then a write
   that depends on it, fits in one SPARQL update (`DELETE … INSERT … WHERE`), which is one
   commit.
 - A stop signal during start-up acts as a kill, and on Windows a service stop or
-  `taskkill /F` ends the server without letting its requests finish; acknowledged commits
-  are kept either way ([stopping](ops/server-setup.md#64-stopping)). On Windows, stop it
+  `taskkill /F` ends the server without letting its requests finish. Acknowledged commits
+  are kept either way ([stopping](ops/server-setup.md#stopping)). On Windows, stop it
   with ctrl-c in its console.
+- A write that fails or is refused can leave its new terms in the dictionary, and the next commit publishes them,
+  at most what its own request added ([dictionary continuity](adr/0002-engine-storage-lsm-permutations.md#implementation-notes-2026-09-25-e2e4)). Under
+  the global search scope they show in text and IRI search, and under the reader's scope they don't
+  ([`store.search_scope`](ops/config-reference.md#store.search_scope)). v1.6 removes them.
+- A commit keeps every term it added, even one no statement uses (an `INSERT` and a `DELETE` of it in one
+  transaction), and such terms behave like those of deleted statements. Reclaiming them is
+  planned for v1.6.
+- A point-in-time restore doesn't cross a bulk load or a rematerialisation: they write a
+  checkpoint, not a log record, so it needs an image taken after them. A restore by time can't
+  tell a complete log from one missing its end, and replays log records without a commit time
+  whatever the time; compare the revision it reports with the one you expect
+  ([point-in-time restore](ops/backups.md#point-in-time-restore)).
 
 ## Access control
 
-- No authentication by default (`auth.mode = none`): set one before the server is reachable
-  from other machines ([configuration](ops/config-reference.md#auth-modes)).
+- There is no authentication by default (`auth.mode = none`), so set one before the server is
+  reachable from other machines ([configuration](ops/config-reference.md#auth-modes)).
 - Endpoints over the whole dataset (classification, SHACL validation, autocomplete) are
   only for readers of every graph
-  ([access control](ops/http-api.md#graph-level-access-control)). None known.
+  ([access control](ops/http-api.md#graph-level-access-control)).
+- A reader of some graphs who sees inferred statements by support (`inferred = "supported"`) is
+  told `not-certified` for every read at a revision where a statement it can derive is also
+  asserted in a graph it can't read. Its answers are right, and so is the status, but the status
+  tells that reader that such an assertion exists.
+- A refusal for memory or work can hint at how much data a reader of only some graphs may not see. v2.0 admits
+  requests by what the reader sees.

@@ -1,46 +1,63 @@
-description = """The first example (README.md, "A first answer: inference", and docs/tutorial.md),
-as written there: under owl2-rl with the SHACL gate enforcing, an instance of a
-subclass is an instance of its superclass by inference, with a sound-only answer; deleting the
-premise takes the inference with it; a shape in the shapes graph makes the gate reject an unnamed
-cat (400, a SHACL Reject problem) and nothing of it remains; with a name the commit passes."""
+description = """The first example (README.md, "A first answer", and docs/tutorial.md), as
+written there: under owl2-dl with the SHACL gate enforcing, a cat is an animal by a rule, and a
+pet, which is a cat or a dog, is an animal only through the union, which the OWL 2 DL engines
+prove: both rows, and the answer is complete; reading asserted
+statements only (infer=false) finds none, with a complete answer; deleting the premises leaves
+no animal; a shape in the shapes graph makes the gate reject an unnamed
+cat (400, a SHACL Reject problem) and nothing of it remains; with a name the commit passes.
+An upload is checked as an update is (docs/tutorial.md, "Your own data"): a Graph Store PUT
+of the default graph with an unnamed animal is refused (400, SHACL Reject) and leaves the
+default graph as it was; with a name it passes (204) and replaces the default graph; the
+shapes graph, a named graph, stays, so an unnamed animal is still refused."""
 
 [server]
-set = { "reasoner.mode" = "owl2-rl", "shacl.gate" = "enforce" }
+set = { "reasoner.mode" = "owl2-dl", "shacl.gate" = "enforce" }
 
 [vars]
 prefix = "PREFIX ex: <http://example.org/>"
 animals = "PREFIX ex: <http://example.org/> SELECT ?x WHERE { ?x a ex:Animal }"
 
 [[step]]
-name = "a class hierarchy and an instance"
+name = "cats and dogs are animals, a pet is a cat or a dog, tom is a cat and rex a pet"
 method = "POST"
 path = "/dataset/update"
-form = { update = "${prefix} PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> INSERT DATA { ex:Cat rdfs:subClassOf ex:Animal . ex:tom a ex:Cat }" }
+form = { update = "${prefix} PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> PREFIX owl: <http://www.w3.org/2002/07/owl#> INSERT DATA { ex:Cat rdfs:subClassOf ex:Animal . ex:Dog rdfs:subClassOf ex:Animal . ex:Pet rdfs:subClassOf [ owl:unionOf (ex:Cat ex:Dog) ] . ex:tom a ex:Cat . ex:rex a ex:Pet }" }
 [step.expect]
 status = [200, 204]
 
 [[step]]
-name = "tom is an animal by inference, sound-only"
+name = "tom by a rule and rex through the union: both rows, complete"
 method = "POST"
 path = "/dataset/query"
 form = { query = "${animals}" }
 headers = { Accept = "application/sparql-results+json" }
 [step.expect]
 status = 200
-headers = { nrese-completeness = { contains = "sound-only; regime=owl2-rl" } }
-rows = 1
-json = { "$.results.bindings[*].x.value" = { contains = "http://example.org/tom" } }
+headers = { nrese-completeness = "complete; regime=owl2-dl" }
+rows = 2
+json = { "$.results.bindings[*].x.value" = { length = 2, matches = '^(?=.*"http://example\.org/rex")(?=.*"http://example\.org/tom")' } }
 
 [[step]]
-name = "delete the premise"
+name = "asserted statements only: no animal, complete"
+method = "POST"
+path = "/dataset/query"
+form = { query = "${animals}", infer = "false" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+headers = { nrese-completeness = "complete" }
+rows = 0
+
+[[step]]
+name = "delete the premises"
 method = "POST"
 path = "/dataset/update"
-form = { update = "${prefix} DELETE DATA { ex:tom a ex:Cat }" }
+form = { update = "${prefix} DELETE DATA { ex:tom a ex:Cat . ex:rex a ex:Pet }" }
 [step.expect]
 status = [200, 204]
 
 [[step]]
-name = "the inference went with it"
+name = "no animal is left"
 method = "POST"
 path = "/dataset/query"
 form = { query = "${animals}" }
@@ -95,3 +112,63 @@ headers = { Accept = "application/sparql-results+json" }
 status = 200
 rows = 1
 json = { "$.results.bindings[*].x.value" = { contains = "http://example.org/felix" } }
+
+[[step]]
+name = "an upload of the default graph with an unnamed animal is refused"
+method = "PUT"
+path = "/dataset/data"
+params = { default = "" }
+headers = { Content-Type = "text/turtle" }
+body = """
+@prefix ex: <http://example.org/> .
+ex:oscar a ex:Animal .
+"""
+[step.expect]
+status = 400
+headers = { content-type = { contains = "application/problem+json" } }
+json = { "$.title" = "SHACL Reject", "$.type" = "https://nrese.dev/problems/shacl-reject", "$.detail" = { contains = "focus node <http://example.org/oscar>" } }
+
+[[step]]
+name = "nothing of the refused upload remains: felix is still the one animal"
+method = "POST"
+path = "/dataset/query"
+form = { query = "${animals}" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+rows = 1
+json = { "$.results.bindings[*].x.value" = { contains = "http://example.org/felix" } }
+
+[[step]]
+name = "with a name the upload passes"
+method = "PUT"
+path = "/dataset/data"
+params = { default = "" }
+headers = { Content-Type = "text/turtle" }
+body = """
+@prefix ex: <http://example.org/> .
+ex:oscar a ex:Animal ; ex:name "Oscar" .
+"""
+[step.expect]
+status = 204
+
+[[step]]
+name = "the upload replaced the default graph: oscar is the one animal"
+method = "POST"
+path = "/dataset/query"
+form = { query = "${animals}" }
+headers = { Accept = "application/sparql-results+json" }
+[step.expect]
+status = 200
+rows = 1
+json = { "$.results.bindings[*].x.value" = { contains = "http://example.org/oscar" } }
+
+[[step]]
+name = "the shape outlived the upload: an unnamed animal is still refused"
+method = "POST"
+path = "/dataset/update"
+form = { update = "${prefix} INSERT DATA { ex:felix a ex:Animal }" }
+[step.expect]
+status = 400
+headers = { content-type = { contains = "application/problem+json" } }
+json = { "$.title" = "SHACL Reject", "$.type" = "https://nrese.dev/problems/shacl-reject", "$.detail" = { contains = "focus node <http://example.org/felix>" } }

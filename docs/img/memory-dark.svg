@@ -1,0 +1,53 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 390" width="400" height="390" role="img" aria-labelledby="title desc">
+<!-- Generated; the light and dark variants differ only in <style>. -->
+<title id="title">How the memory limits nest</title>
+<desc id="desc">The process (budgets.process_memory) holds the limit shared by every repository (budgets.total_query_memory): what requests reserve, and the state kept between them. Inside it, one query has its own limit (budgets.query_memory): its tables, kept results and DL work. Any other request has no limit of its own. Each level counts what work reserves, not all memory held; 0 turns it off. A bulk load is limited apart (budgets.bulk_load_memory).</desc>
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #E6EDF3; }
+  .paper { fill: #0D1117; }
+  .name { font-size: 16px; font-weight: 600; }
+  .text { font-size: 14.5px; }
+  .muted { font-size: 14.5px; fill: #9198A1; }
+  .edge { font-size: 14px; font-style: italic; fill: #9198A1; }
+  .code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; }
+  .box { fill: #0D1117; stroke: #6E7681; stroke-width: 1.25; }
+  .band { fill: #151B23; }
+  .chip { fill: #0D1117; stroke: #6E7681; stroke-width: 1.1; }
+  .chip-on { fill: #E6EDF3; }
+  .chip-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; fill: #0D1117; }
+  .asserted { fill: #0D1117; stroke: #6E7681; stroke-width: 1.1; }
+  .inferred { fill: #2B2111; stroke: #9E6A03; stroke-width: 1.1; }
+  .inferred-text { font-size: 16px; font-weight: 600; fill: #E3B341; }
+  .track { fill: #262C36; }
+  .frame { fill: none; stroke: #6E7681; stroke-width: 1.25; }
+  .divider { fill: none; stroke: #6E7681; stroke-width: 1.25; }
+  .mark { fill: none; stroke: #E6EDF3; stroke-width: 2; }
+  .seg-on { fill: #0D1117; stroke: #6E7681; stroke-width: 1; }
+  .seg-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; font-weight: 600; }
+  .refused { fill: #FF8A80; }
+  .refused-text { fill: #FF8A80; font-weight: 600; }
+  .inferred-word { fill: #E3B341; font-weight: 600; }
+  .flow { fill: none; stroke: #9198A1; stroke-width: 1.4; }
+  .flow-refused { fill: none; stroke: #FF8A80; stroke-width: 1.4; }
+</style>
+<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow" d="M1 1 L9 5 L1 9"/></marker><marker id="head-refused" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow-refused" d="M1 1 L9 5 L1 9"/></marker></defs>
+<rect class="paper" x="0" y="0" width="400" height="390" rx="0"/>
+<rect class="band" x="0" y="0" width="400" height="312" rx="8"/>
+<text x="14" y="26" class="name">The process</text>
+<text x="14" y="46" class="text"><tspan class="code">budgets.process_memory</tspan></text>
+<g transform="translate(0 60)"><rect class="track" x="16" y="0" width="368" height="236" rx="6"/>
+<text x="30" y="26" class="name">Shared by every repository</text>
+<text x="30" y="46" class="text"><tspan class="code">budgets.total_query_memory</tspan></text>
+<text x="30" y="72" class="text">what requests reserve, and the state</text>
+<text x="30" y="91" class="text">kept between them</text>
+<g transform="translate(0 106)"><rect class="box" x="32" y="0" width="336" height="88" rx="6"/>
+<text x="46" y="26" class="name">One query</text>
+<text x="46" y="46" class="text"><tspan class="code">budgets.query_memory</tspan></text>
+<text x="46" y="72" class="text">its tables, kept results and DL work</text>
+</g>
+<text x="30" y="220" class="text"><tspan class="muted">any other request has no limit of its own</tspan></text>
+</g>
+<text x="1" y="342" class="muted">Each level counts what work reserves, not all</text>
+<text x="1" y="361" class="muted"><tspan class="muted">memory held; </tspan><tspan class="code">0</tspan><tspan class="muted"> turns it off. A bulk load is limited</tspan></text>
+<text x="1" y="380" class="muted"><tspan class="muted">apart (</tspan><tspan class="code">budgets.bulk_load_memory</tspan><tspan class="muted">).</tspan></text>
+</svg>
