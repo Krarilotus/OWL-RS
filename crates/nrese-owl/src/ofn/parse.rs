@@ -624,7 +624,7 @@ impl<'t, 'm> Parser<'t, 'm> {
                 if classes.len() < 2 {
                     return fail(at, "a disjoint union of fewer than two classes");
                 }
-                Some(Axiom::DisjointUnion(class, canonical(classes)))
+                return self.disjoint(Disjoint::Union(class, classes));
             }
             "SubObjectPropertyOf" => {
                 let chain = if matches!(self.peek(), Tok::Name("ObjectPropertyChain")) {

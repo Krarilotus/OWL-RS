@@ -697,6 +697,31 @@ impl<'a> Reader<'a> {
         !given_twice.is_empty()
     }
 
+    /// The properties that each make a blank node one class expression or one data range
+    /// (*Mapping to RDF* Tables 12 and 13), the forms [`Self::forms`] takes for both: a node
+    /// has one form, whichever it is read as.
+    fn expression_forms(&self) -> [Option<Term>; 8] {
+        let v = self.v;
+        let ClassExpressionMarkers {
+            types: _,
+            set_operators: [intersection, union, complement, one_of],
+            on_properties,
+            on_property,
+        } = ClassExpressionMarkers::of(&v);
+        // A data range's `owl:intersectionOf`, `owl:unionOf` and `owl:oneOf` are a class
+        // expression's too.
+        [
+            intersection,
+            union,
+            complement,
+            one_of,
+            on_properties,
+            on_property,
+            v.owl_datatype_complement_of,
+            v.owl_on_datatype,
+        ]
+    }
+
     /// Whether the blank node `node` gives more than one of `forms`, the properties that each
     /// make it one structure (*Mapping to RDF* Tables 12 and 13: a node has one form): then it
     /// is no structure, as with a structure property given twice ([`Self::twice`]). Reported,
@@ -1000,12 +1025,7 @@ impl<'a> Reader<'a> {
                 self.collect([node, v.rdf_type?, class_type?]);
             }
         }
-        if self.twice(node) {
-            return None;
-        }
-        let mut forms = set_operators.to_vec();
-        forms.extend([on_properties, on_property]);
-        if self.forms(node, &forms) {
+        if self.twice(node) || self.forms(node, &self.expression_forms()) {
             return None;
         }
         for operator in set_operators {
@@ -1309,17 +1329,7 @@ impl<'a> Reader<'a> {
                 self.collect([node, v.rdf_type?, range_type?]);
             }
         }
-        if self.twice(node) {
-            return None;
-        }
-        let forms = [
-            v.owl_intersection_of,
-            v.owl_union_of,
-            v.owl_datatype_complement_of,
-            v.owl_one_of,
-            v.owl_on_datatype,
-        ];
-        if self.forms(node, &forms) {
+        if self.twice(node) || self.forms(node, &self.expression_forms()) {
             return None;
         }
         let ranges = |reader: &mut Self, list: Term| -> Option<Vec<RangeId>> {
@@ -1644,7 +1654,7 @@ impl<'a> Reader<'a> {
                         what: "a disjoint union of fewer than two classes",
                     });
                 } else {
-                    self.add(Axiom::DisjointUnion(class, canonical(classes)), triple);
+                    self.disjoint(Disjoint::Union(class, classes), triple);
                 }
             }
         } else if is(p, v.rdfs_sub_property_of) {
@@ -1797,6 +1807,13 @@ impl<'a> Reader<'a> {
             // An annotation, SHACL content, or a statement about the ontology: its header's
             // annotations (an anonymous ontology's too: its node is a blank node).
             self.annotations += 1;
+        } else if self.kind(o) == TermKind::Literal
+            && self.declared_as(p, EntityKind::ObjectProperty)
+            && !self.declared_as(p, EntityKind::DataProperty)
+        {
+            // An object property's assertion (Table 16, `*:x` or `_:x`): a literal there is
+            // malformed. A property declared both ways is read as a data property, as before.
+            self.individual(o);
         } else if self.kind(o) == TermKind::Literal || self.is_data_property(p) {
             self.add(Axiom::DataPropertyAssertion(p, s, o), triple);
         } else {
