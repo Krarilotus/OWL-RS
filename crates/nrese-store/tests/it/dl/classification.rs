@@ -608,7 +608,8 @@ fn an_irregular_el_answer_leaves_an_annotation_propertys_domain_out() {
 /// An axiom's reification (`owl:Axiom`) states no axiom for the DL engines, but the EL
 /// classifier reads the class axiom its node carries (`X ⊓ Y ⊑ Z`): its answer names
 /// classes the DL engines' signature lacks, so neither reading is trusted, and the answer
-/// stays the DL engines' marked lower bound.
+/// stays the DL engines' marked lower bound. The reification has no main triple
+/// (*Mapping to RDF* Table 17), so the reader reports it, and the bound says so too.
 #[test]
 fn an_irregular_ontology_whose_classes_the_two_readers_read_differently_is_not_answered_by_the_el_classifier()
  {
@@ -622,7 +623,16 @@ fn an_irregular_ontology_whose_classes_the_two_readers_read_differently_is_not_a
         "{:?}",
         report.subsumptions
     );
-    assert_lower_bound(&report);
+    assert_eq!(report.engine, "tableau");
+    assert!(!report.complete());
+    assert!(
+        report.incomplete.contains(&format!(
+            "consistency not decided (unsupported): {LEFT_OUT}; \
+             1 reader diagnostics (not OWL 2 DL, left out)"
+        )),
+        "{:?}",
+        report.incomplete
+    );
 }
 
 /// The EL classifier skips a datatype declared `owl:DataRange` where it reads a class (a

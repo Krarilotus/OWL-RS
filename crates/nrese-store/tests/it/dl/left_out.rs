@@ -469,8 +469,12 @@ fn a_commit_that_makes_or_ends_a_left_out_axiom_changes_the_status() {
             format!("{NAMES} {range} :v :p :x ."),
         ),
         (
+            // No literal value: on a declared object property it is malformed, read past.
             "a declared object property's node value deleted",
-            format!("{NAMES} {range} :p a owl:ObjectProperty ."),
+            format!(
+                "{NAMES} :p rdfs:range [ owl:complementOf owl:Nothing ] . :x :p :v . \
+                 :p a owl:ObjectProperty ."
+            ),
         ),
     ]
     .map(|(name, data)| {
