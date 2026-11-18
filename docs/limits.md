@@ -142,8 +142,9 @@ leave something out.
   (`:x a [ owl:intersectionOf ( :A :B ) ]`, or a cardinality restriction) gets no `complete`
   answer, since what follows from that assertion may be missing (`:x a :A` answers `false`):
   OWL 2 QL allows only a named class there. Under `owl2-rl` with the QL rewriting on, the same
-  holds for every expression but an intersection, `allValuesFrom`, `hasValue` or an at-most of
-  one, which the rules apply. An inclusion into an intersection
+  holds for every expression but those OWL 2 RL allows on the right of a subclass axiom (an
+  intersection of such, `allValuesFrom`, `hasValue`, a complement, an at-most of one), which
+  the rules apply. An inclusion into an intersection
   (`:C rdfs:subClassOf [ owl:intersectionOf ( :A :B ) ]`), which OWL 2 QL allows, is answered
   and `complete`.
 - Under `owl2-rl` with `reasoner.ql_rewriting = "on"`, a universal restriction on
