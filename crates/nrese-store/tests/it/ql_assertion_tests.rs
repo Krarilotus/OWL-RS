@@ -82,16 +82,59 @@ fn an_asserted_intersection_is_not_told_complete_without_its_members() {
     }
 }
 
-/// Spec: OWL 2 RL's cls-int2 (OWL 2 Profiles §4.3, table 6) gives `:x a :A` from the same
-/// assertion, so under `owl2-rl` with the rewriting on, the read is right and stays complete.
+/// Spec: OWL 2 RL's cls-int2, cls-avf and cls-hv1 (OWL 2 Profiles §4.3, table 6) give
+/// `:x a :A` from an asserted intersection, `:y a :D` from an asserted `∀:p.:D` with
+/// `:x :p :y`, and `:x :p :v` from an asserted `∃:p.{:v}`; under `owl2-rl` with the
+/// rewriting on, each read is right and stays complete.
 #[test]
-fn an_asserted_intersection_the_rules_apply_stays_complete() {
+fn asserted_expressions_the_rules_apply_stay_complete() {
+    let restriction = ":x a [ a owl:Restriction ; owl:onProperty :p ;";
+    for (data, question) in [
+        (INTERSECTION.to_owned(), ":x a :A"),
+        (
+            format!("{restriction} owl:allValuesFrom :D ] . :x :p :y ."),
+            ":y a :D",
+        ),
+        (format!("{restriction} owl:hasValue :v ] ."), ":x :p :v"),
+    ] {
+        each(
+            ReasoningMode::Owl2Rl,
+            QlRewritingMode::On,
+            &data,
+            question,
+            |o| o == Some((true, true)),
+        );
+    }
+}
+
+/// Spec: OWL 2 Profiles §3.2.4 allows an intersection on the right of a subclass axiom, so
+/// `:C ⊑ :A ⊓ :B` with `:x a :C` is OWL 2 QL, and `:x a :A` follows: right, and complete.
+#[test]
+fn an_inclusion_into_an_intersection_stays_complete() {
+    let data = ":C <http://www.w3.org/2000/01/rdf-schema#subClassOf> \
+                [ a owl:Class ; owl:intersectionOf ( :A :B ) ] . :x a :C .";
+    for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+        each(ReasoningMode::Owl2Ql, ql, data, ":x a :A", |o| {
+            o == Some((true, true))
+        });
+    }
+}
+
+/// The cost, stated on purpose: a store that asserts an individual into an anonymous
+/// expression is outside OWL 2 QL as a whole, so under `owl2-ql` a read on terms the
+/// assertion doesn't name (`:y a :E` from `:y a :F`, `:F ⊑ :E`) isn't told complete
+/// either, though its answer is right.
+#[test]
+fn such_an_assertion_takes_complete_from_every_read() {
+    let data = format!(
+        "{INTERSECTION} :y a :F . :F <http://www.w3.org/2000/01/rdf-schema#subClassOf> :E ."
+    );
     each(
-        ReasoningMode::Owl2Rl,
-        QlRewritingMode::On,
-        INTERSECTION,
-        ":x a :A",
-        |o| o == Some((true, true)),
+        ReasoningMode::Owl2Ql,
+        QlRewritingMode::Auto,
+        &data,
+        ":y a :E",
+        |o| o == Some((true, false)),
     );
 }
 
