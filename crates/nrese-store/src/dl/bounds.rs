@@ -223,9 +223,11 @@ impl Kinds {
     }
 
     /// Whether an asserted triple, inserted or deleted, leaves every term the kinds the
-    /// reader gave it, which it gives by use (`nrese_owl::profile::Signature`): a known
-    /// annotation property's statement gives none, nor a statement of a known SHACL property
-    /// (read as SHACL content, which has no OWL meaning); any other leaves the schema as it is,
+    /// reader gave it, which it gives by use (`nrese_owl::profile::Signature`): a statement of
+    /// a SHACL property the reader read as SHACL content gives none (it has no OWL meaning),
+    /// nor one of a known annotation property that is no SHACL property; a SHACL property's
+    /// first content may change how the reader reads the whole source (`Ontology::shacl`), so
+    /// it reads again, whatever the property is declared; any other leaves the schema as it is,
     /// names no class or property, and no name of the reserved vocabulary, which the reader
     /// leaves out (`nrese_owl::diagnostics::reserved_name`), as subject or IRI object, and
     /// its predicate is `rdf:type` with a known class, `owl:sameAs`, or a property known
@@ -235,7 +237,7 @@ impl Kinds {
     /// object property.
     fn keep(&self, tx: &Transaction<'_>, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
         let k = &self.signature;
-        if k.annotations.contains(&p) || self.shacl.contains(&p) {
+        if self.shacl.contains(&p) || (k.annotations.contains(&p) && !named(tx, p, false)) {
             return true;
         }
         if changes_schema(tx, triple) || k.names.contains(&s) || reserved_named(tx, triple) {
@@ -562,15 +564,20 @@ pub(crate) fn prepare(
 /// whether the reader reads SHACL content as content or as any other statement
 /// (`Ontology::shacl`).
 fn reserved_named(tx: &Transaction<'_>, [s, p, o]: Triple) -> bool {
-    let named = |t, reserved: bool| match tx.decode(TermId::from_raw(t)) {
+    named(tx, s, true) || named(tx, o, true) || named(tx, p, false)
+}
+
+/// Whether the term `t` is a SHACL property (`nrese_owl::shacl_properties`) or, with
+/// `reserved`, a reserved name (`nrese_owl::diagnostics::reserved_name`).
+fn named(tx: &Transaction<'_>, t: u64, reserved: bool) -> bool {
+    match tx.decode(TermId::from_raw(t)) {
         Some(nrese_rdf::Term::NamedNode(n)) => {
             let iri = n.as_str();
             nrese_owl::is_shacl_property(iri)
                 || (reserved && nrese_owl::diagnostics::reserved_name(iri))
         }
         _ => false,
-    };
-    named(s, true) || named(o, true) || named(p, false)
+    }
 }
 
 /// Whether deleting a statement may change its property's kind for the reader: a literal

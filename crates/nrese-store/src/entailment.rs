@@ -453,6 +453,9 @@ impl StoreService {
                 lookup: &lookup,
             },
         );
+        // The premise's statements are read: their charge goes back to the envelope before
+        // the check draws on it.
+        drop(read_statements);
         // A structure no axiom uses says nothing under the Direct Semantics (OWL 1
         // conclusions state expressions so); anything else unread leaves it undecided.
         // Named by the conclusion's IRIs and literals, as the requester wrote them; its blank
