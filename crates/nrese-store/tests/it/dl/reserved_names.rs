@@ -72,7 +72,7 @@ fn after_is_fresh(
 
 /// The RDF mapping's two spellings of an annotation property's declaration (OWL 2 Mapping to
 /// RDF Graphs, Table 6).
-const SPELLINGS: [&str; 2] = ["owl:AnnotationProperty", "owl:OntologyProperty"];
+pub(super) const SPELLINGS: [&str; 2] = ["owl:AnnotationProperty", "owl:OntologyProperty"];
 
 /// Spec (Structural Specification §5.5: of the reserved vocabulary only the nine built-in
 /// annotation properties are annotation properties, so `owl:sameAs` declared one, in either of
@@ -170,6 +170,83 @@ fn owl_same_as_declared_an_annotation_property_reads_as_a_store_without_the_decl
         let differs = differs(&declared, &without, &reads);
         wrong.extend(differs.into_iter().map(|d| format!("{spelling}: {d}")));
     }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// What differs between a store given `rest` and, for each of `declared`, a store given it
+/// and `rest`, both in one commit, as [`differs`] gives it, each line under its declaration.
+fn declared_reads_as_without(declared: &[String], rest: &str, reads: &[&str]) -> Vec<String> {
+    let without = pipeline();
+    insert(&without, rest).expect("one commit");
+    let mut wrong = Vec::new();
+    for declaration in declared {
+        let with = pipeline();
+        insert(&with, &format!("{declaration} {rest}")).expect("one commit");
+        let differs = differs(&with, &without, reads);
+        wrong.extend(differs.into_iter().map(|d| format!("{declaration}: {d}")));
+    }
+    wrong
+}
+
+/// `owl:sameAs` declared an annotation property, in each spelling.
+fn same_as_declared() -> Vec<String> {
+    SPELLINGS.map(|s| format!("owl:sameAs a {s} .")).to_vec()
+}
+
+/// The equality and the assertion the two cells below read.
+const EQUAL_INDIVIDUALS: &str = ":knows a owl:ObjectProperty . :a :knows :c . :a owl:sameAs :b .";
+
+/// Spec (Structural Specification §5.5: `owl:sameAs` declared an annotation property, in either
+/// spelling (Table 6), is none, so the store holds no annotation property but the built-in
+/// ones, none of which has a statement here; OWL 2 Direct Semantics: `:b :knows :c` follows
+/// from the equality, as a fact about individuals, not as a copy of an annotation statement):
+/// a read of any predicate of `:b` reads as in a store without the declaration: the same
+/// answers with the same status.
+#[test]
+fn a_read_of_any_predicate_with_owl_same_as_declared_an_annotation_property_reads_as_a_store_without_the_declaration()
+ {
+    let reads = ["SELECT ?x { :b ?x ?o }", "SELECT ?x { :b ?p ?x }"];
+    let wrong = declared_reads_as_without(&same_as_declared(), EQUAL_INDIVIDUALS, &reads);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (Structural Specification §5.5, as above: `owl:sameAs` declared an annotation property
+/// is none, so `:a owl:sameAs :b` is an equality and the statements of `owl:sameAs` its
+/// consequences, not copies of annotation statements): a read of `owl:sameAs` reads as in a
+/// store without the declaration: the same answers with the same status.
+#[test]
+fn a_read_of_owl_same_as_declared_an_annotation_property_reads_as_a_store_without_the_declaration()
+{
+    let reads = [
+        "SELECT ?x { ?x owl:sameAs :b }",
+        "SELECT ?x { :a owl:sameAs ?x }",
+    ];
+    let wrong = declared_reads_as_without(&same_as_declared(), EQUAL_INDIVIDUALS, &reads);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (OWL 2 Mapping to RDF Graphs, Table 6: OWL 1's `owl:OntologyProperty` is read as
+/// OWL 2's annotation property declaration, so an OWL 1 ontology may declare `owl:imports` one,
+/// and `owl:versionInfo` an annotation property; Structural Specification §3.1, §3.4 and
+/// §5.5: `owl:imports` and `owl:versionIRI` are the
+/// ontology's header and `owl:versionInfo` a built-in annotation property, declared or not):
+/// a store with those two declarations beside an ontology header with an import, a version IRI
+/// and a version, a class and its member reads as one without them: the same route, and each
+/// read the same answers with the same status.
+#[test]
+fn an_owl_1_header_declaring_its_properties_reads_as_a_store_without_the_declarations() {
+    let declared = ["owl:imports a owl:OntologyProperty . \
+                     owl:versionInfo a owl:AnnotationProperty ."
+        .to_owned()];
+    let rest = ":o a owl:Ontology ; owl:imports :x ; owl:versionIRI :o1 ; owl:versionInfo \"1\" . \
+                :Person a owl:Class . :ann a :Person .";
+    let reads = [
+        "SELECT ?x { ?x a :Person }",
+        "SELECT ?x { :o owl:versionIRI ?x }",
+        "SELECT ?x { :o owl:versionInfo ?x }",
+        "SELECT ?x { :o owl:imports ?x }",
+    ];
+    let wrong = declared_reads_as_without(&declared, rest, &reads);
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 

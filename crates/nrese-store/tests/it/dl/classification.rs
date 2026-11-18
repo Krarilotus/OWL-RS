@@ -504,6 +504,62 @@ fn an_irregular_ontology_with_an_axiom_the_el_classifier_skips_is_not_answered_b
     assert_lower_bound(&irregular(":F owl:equivalentClass [ owl:oneOf ( :o ) ] ."));
 }
 
+/// [`irregular`] with `extra`, its time left out: two reports of the same ontology are equal.
+fn irregular_untimed(extra: &str) -> nrese_store::ClassificationReport {
+    let mut report = irregular(extra);
+    report.micros = 0;
+    report
+}
+
+/// Spec (Structural Specification §5.5: of the reserved vocabulary only the nine built-in
+/// annotation properties are annotation properties, so `owl:bottomObjectProperty` declared one,
+/// in either spelling (Mapping to RDF Graphs, Table 6), is none, and `:r4 rdfs:subPropertyOf
+/// owl:bottomObjectProperty` stays a property inclusion: with `:H ⊑ ∃r4.B` it makes `:H`
+/// unsatisfiable (Direct Semantics: the bottom property's extension is empty)): the irregular
+/// ontology with that inclusion and the declaration classifies as one without the
+/// declaration: the same engine, the same answer and the same reasons.
+#[test]
+fn owl_bottom_object_property_declared_an_annotation_property_classifies_as_without_the_declaration()
+ {
+    let rest = ":r4 a owl:ObjectProperty . :r4 rdfs:subPropertyOf owl:bottomObjectProperty . \
+                :H a owl:Class . \
+                :H rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r4 ; owl:someValuesFrom :B ] .";
+    let without = irregular_untimed(rest);
+    eprintln!("without: {without:?}");
+    let mut wrong = Vec::new();
+    for spelling in super::reserved_names::SPELLINGS {
+        let declared =
+            irregular_untimed(&format!("owl:bottomObjectProperty a {spelling} . {rest}"));
+        if declared != without {
+            wrong.push(format!("{spelling}: {declared:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (Structural Specification §5.5 and §10: a user IRI declared an annotation property, in
+/// either spelling (Mapping to RDF Graphs, Table 6), is one; its assertions, its range and its
+/// sub-property axioms are annotation axioms, which OWL 2 Direct Semantics gives no meaning):
+/// the irregular ontology with such a property, an annotation of a class, a range and a
+/// sub-property of `rdfs:comment` keeps the EL classifier's answer, as without them: the same
+/// engine, the same answer and the same reasons.
+#[test]
+fn an_irregular_el_ontology_with_a_declared_annotation_property_keeps_the_el_classifiers_answer() {
+    let plain = irregular_untimed("");
+    assert_eq!(plain.engine, "el");
+    let mut wrong = Vec::new();
+    for spelling in super::reserved_names::SPELLINGS {
+        let annotated = irregular_untimed(&format!(
+            ":note a {spelling} . :A :note \"a note\" . :note rdfs:range xsd:string . \
+             :note rdfs:subPropertyOf rdfs:comment ."
+        ));
+        if annotated != plain {
+            wrong.push(format!("{spelling}: {annotated:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}\nwithout: {plain:?}");
+}
+
 /// A class the EL classifier reads nothing about (named only as a data property's domain)
 /// is still classified: below a class equivalent to `owl:Thing`, as every class is.
 #[test]
