@@ -1881,7 +1881,7 @@ fn run_morsels<S: Source + ?Sized, T: Send>(
             // What `keep` removed goes back now, not when every morsel is done: a round's
             // morsels are all held until their results are collected. A commit whose
             // round derived nothing new held 30,876 emptied buffers of 400 heads each,
-            // about 360 MiB, beside its jobs (DMW's subclass chain, fleet pm-dmwab-3,
+            // about 360 MiB, beside its jobs (a downstream application's subclass chain,
             // 21 Oct 2026).
             out.shrink_to_fit();
             if let Some(probes) = probes {

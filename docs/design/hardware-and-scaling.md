@@ -201,7 +201,7 @@ software uses NRESE either over the network (HTTP, any language) or in its own p
   per-row cost; the engine itself is the same machine code.
 - *WebAssembly*: the parsers, writers and an in-memory engine for browsers and edge
   runtimes.
-Which of these come first depends on who integrates (DMW, ResearchSpace, others).
+Which of these come first depends on who integrates (a data-modelling application, ResearchSpace, others).
 
 Remaining sequencing belongs to [ROADMAP.md](../ROADMAP.md). The RDF migration's step 5
 is complete; it did not deliver H1's installation profile or H7's stable facade/bindings.

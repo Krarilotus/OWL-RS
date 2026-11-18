@@ -2716,6 +2716,7 @@ def bench_inputs(cases: list[dict]) -> list[dict]:
         return []
     source = hosts_registry.load().get("sources", {}).get("bench-inputs", {})
     repo = os.environ.get(source.get("env") or "BENCH_INPUTS_GIT") or source.get("git")
+    repo = repo and os.path.expanduser(repo)  # hosts.toml gives it from the home directory
     if not repo or not Path(repo).is_dir():
         return []
     rev = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"], capture_output=True, text=True, timeout=60)

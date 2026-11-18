@@ -304,12 +304,12 @@ A draft check validates, queries or reasons over inputs sent with the request, b
 
 | Method and URL | What |
 |---|---|
-| `GET /api/v1/draft-check/capabilities` | `protocol`, `operations` (`shacl`, `query`, `reasoning`), `profiles`, `semantics`, `build_id` and `max_seconds`, the longest time limit a request may ask for |
+| `GET /api/v1/draft-check/capabilities` | `protocol` (the protocol's earlier name, until clients read `protocols`), `protocols` (every name a request may give, the preferred first), `operations` (`shacl`, `query`, `reasoning`), `profiles`, `semantics`, `build_id` and `max_seconds`, the longest time limit a request may ask for |
 | `POST /api/v1/draft-check` | One check, as JSON, answered as JSON |
 
 A request names:
 
-- `protocol` (`dmw-store-check/1`) and `operation`;
+- `protocol` (`store-check/1`; the protocol's earlier name, which the capabilities' `protocol` gives, is accepted too) and `operation`;
 - the check's identity, echoed unchanged in the answer: `request_sha256`, `scope`, `build_id`, `semantics_id`, `profile`, `input_hashes`;
 - `limits`: `max_seconds`, `max_results`, `max_triples`;
 - `inputs`: `data`, `schema` and `shapes` as N-Triples, and `query` as SPARQL, as the operation needs them.
