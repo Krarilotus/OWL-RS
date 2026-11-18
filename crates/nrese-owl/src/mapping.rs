@@ -384,10 +384,26 @@ fn data_terms(o: &Ontology, terms: &dyn Terms) -> DataTerms {
     out
 }
 
+/// The facets of the OWL 2 datatype map (*Structural Specification* §4): what a facet
+/// restriction's one statement may say.
+const FACETS: [&str; 9] = [
+    "http://www.w3.org/2001/XMLSchema#minInclusive",
+    "http://www.w3.org/2001/XMLSchema#maxInclusive",
+    "http://www.w3.org/2001/XMLSchema#minExclusive",
+    "http://www.w3.org/2001/XMLSchema#maxExclusive",
+    "http://www.w3.org/2001/XMLSchema#length",
+    "http://www.w3.org/2001/XMLSchema#minLength",
+    "http://www.w3.org/2001/XMLSchema#maxLength",
+    "http://www.w3.org/2001/XMLSchema#pattern",
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#langRange",
+];
+
 struct Reader<'a> {
     v: Vocabulary,
     /// [`DECLARATION_KINDS`] by the source's ids.
     declaration_kinds: [(Option<Term>, EntityKind); 9],
+    /// [`FACETS`] by the source's ids.
+    facets: [Option<Term>; 9],
     /// [`BUILTIN_ANNOTATIONS`] and `owl:versionIRI` by the source's ids, looked up once per
     /// read: [`Self::is_builtin_annotation`] meets them on every assertion.
     builtin_annotations: ([Option<Term>; 9], Option<Term>),
@@ -577,6 +593,7 @@ impl<'a> Reader<'a> {
         Self {
             v,
             declaration_kinds: DECLARATION_KINDS.map(|(iri, kind)| (terms.iri(iri), kind)),
+            facets: FACETS.map(|iri| terms.iri(iri)),
             builtin_annotations: (
                 BUILTIN_ANNOTATIONS.map(|iri| terms.iri(iri)),
                 terms.iri("http://www.w3.org/2002/07/owl#versionIRI"),
@@ -1274,6 +1291,13 @@ impl<'a> Reader<'a> {
                     });
                     return None;
                 };
+                if !self.facets.contains(&Some(facet)) {
+                    self.report(Diagnostic::Malformed {
+                        node: restriction,
+                        what: "a facet restriction without a facet",
+                    });
+                    return None;
+                }
                 self.collect([restriction, facet, value]);
                 facets.push((facet, value));
             }
