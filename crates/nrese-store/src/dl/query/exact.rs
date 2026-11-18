@@ -90,23 +90,15 @@ pub(super) fn decide_until(
             jobs.push(Err(Entailed::Unknown(Limit::Candidates.reached(most))));
             continue;
         }
-        let instantiated = instantiate(shape, variables, row, snapshot);
-        let reserved = |atoms: &Vec<_>| atoms.iter().any(|a| reserved_individual(a, snapshot, ids));
-        if instantiated.as_ref().is_ok_and(reserved) {
-            jobs.push(Err(Entailed::No));
-            continue;
-        }
-        let built = instantiated.and_then(|atoms| {
-            tests_of(
-                &mut ontology,
-                snapshot,
-                &atoms,
-                ids,
-                &data_properties,
-                &mut paths,
-            )
-        });
-        let built = built.map_err(Entailed::Unknown);
+        let built = row_tests(
+            &mut ontology,
+            snapshot,
+            (shape, variables),
+            row,
+            ids,
+            &data_properties,
+            &mut paths,
+        );
         jobs.push(built.map(|built| {
             let start = tests.len();
             tests.extend(built);
@@ -194,6 +186,24 @@ pub(super) fn decide_until(
         paths,
         why,
     }
+}
+
+/// A row's tests over `o`: `Err(No)` where an atom puts a reserved IRI where an individual
+/// goes (no test is needed), `Err(Unknown)` where the row can't be read.
+fn row_tests(
+    o: &mut Ontology,
+    snapshot: &Snapshot,
+    (shape, variables): (&Shape, &[Variable]),
+    row: &[Option<Term>],
+    ids: Ids,
+    data_properties: &HashSet<u64>,
+    paths: &mut Vec<&'static str>,
+) -> Result<Vec<Test>, Entailed> {
+    let atoms = instantiate(shape, variables, row, snapshot).map_err(Entailed::Unknown)?;
+    if atoms.iter().any(|a| reserved_individual(a, snapshot, ids)) {
+        return Err(Entailed::No);
+    }
+    tests_of(o, snapshot, &atoms, ids, data_properties, paths).map_err(Entailed::Unknown)
 }
 
 /// The ontology's data properties (an existential value of one is `DataSomeValuesFrom`).
