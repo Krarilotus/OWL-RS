@@ -533,13 +533,14 @@ fn a_join_past_memory_names_its_rows_and_the_room() {
             Err(other) => panic!("{query}: {other}"),
             Ok(_) => panic!("{query}: answered within 1 MiB"),
         };
-        // "… 20000 rows …, room for N …", N below 20,000.
+        // "…: 20000 rows of 4 columns asked for, room for N rows (…", N below 20,000.
         let room = message
             .split("room for ")
             .nth(1)
             .and_then(|rest| rest.split(' ').next())
             .and_then(|n| n.parse::<usize>().ok());
-        if !message.contains("20000 rows") || !room.is_some_and(|n| n < 20_000) {
+        let rows = message.contains(": 20000 rows of 4 columns asked for, room for ");
+        if !rows || !room.is_some_and(|n| n < 20_000) {
             wrong.push(format!("{query}: {message}"));
         }
     }

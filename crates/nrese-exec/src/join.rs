@@ -339,7 +339,7 @@ fn cross_product(left: &IdTable, right: &IdTable, limit: &Limit) -> Result<IdTab
     if rows > limit.max_rows {
         return Err(TooManyRows {
             max_rows: limit.max_rows,
-            rows: Some(rows),
+            rows: (rows < usize::MAX).then_some(rows),
         });
     }
     let width = left.width() + right.width();
@@ -671,6 +671,10 @@ pub fn left_join(
     {
         let out = sorted_left_join(left, right, *lk, *rk, &limit)?;
         return Ok(out.assume_sorted_by(left_keys.to_vec()));
+    }
+    // No key and no filter: every left row with every right row, a counted cross product.
+    if left_keys.is_empty() && accept.is_none() && !right.is_empty() {
+        return Ok(cross_product(left, right, &limit)?);
     }
     let table = match left_keys.is_empty() {
         true => None,

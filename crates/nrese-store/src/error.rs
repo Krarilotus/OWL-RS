@@ -115,9 +115,9 @@ pub enum StoreError {
     /// A query's memory refusal as a reader of some graphs is told it
     /// (`Self::without_amounts`): the limit, not the bytes held and asked for.
     #[error(
-        "{}: limit {} MiB (what the query held and asked for is not reported to a reader of some graphs)",
+        "{}: limit {} (what the query held and asked for is not reported to a reader of some graphs)",
         memory_refusal(.shared),
-        .limit >> 20
+        nrese_exec::limit_text(*.limit)
     )]
     MemoryLimitWithoutAmounts { limit: usize, shared: bool },
     /// A reader of some graphs who sees inferences, refused while nothing vouches that the

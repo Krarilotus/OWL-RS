@@ -481,17 +481,23 @@ pub struct BudgetExceeded {
     /// unread, [`SharedBudget::lazy`]): refused because the limit can't be enforced, not
     /// because memory is in use.
     pub unread: bool,
-    /// A table refused by its row limit: the rows it would hold, not only its bytes.
     pub rows: Option<RowsPast>,
 }
 
-/// A table past the rows its memory has room for: the rows it would hold (`room + 1` where
-/// it stopped before knowing more) and its columns.
+/// A table past the rows its memory has room for (`rows`: `room + 1` where not counted).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RowsPast {
     pub rows: usize,
     pub width: usize,
     pub room: usize,
+}
+
+/// A limit as a refusal writes it: `usize::MAX` is none.
+pub fn limit_text(limit: usize) -> String {
+    match limit {
+        usize::MAX => "unlimited".to_owned(),
+        bytes => format!("{} MiB", bytes >> 20),
+    }
 }
 
 impl std::fmt::Display for BudgetExceeded {
@@ -507,12 +513,7 @@ impl std::fmt::Display for BudgetExceeded {
         } else {
             "query memory budget exceeded"
         };
-        // `usize::MAX` is no limit, and a size past what memory can address.
-        let used = self.used >> 20;
-        let limit = match self.limit {
-            usize::MAX => "unlimited".to_owned(),
-            bytes => format!("{} MiB", bytes >> 20),
-        };
+        let (used, limit) = (self.used >> 20, limit_text(self.limit));
         let Some(RowsPast { rows, width, room }) = self.rows else {
             let requested = match self.requested {
                 usize::MAX => "more requested than memory can address".to_owned(),
