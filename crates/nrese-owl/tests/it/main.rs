@@ -551,6 +551,31 @@ fn malformed_n_ary_structures_are_reported() {
     assert!(rendered(&ontology, &table).contains(&"SubClassOf(ex:A ex:B)".to_owned()));
 }
 
+/// Spec (*Structural Specification* §9.5: a key is on all its property expressions): a key one
+/// of whose members can't be read is no key, and is reported malformed. Read on its other
+/// members it would be a stronger key than the input states, identifying more individuals.
+#[test]
+fn a_key_with_a_member_that_cannot_be_read_is_no_key() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        "ex:p a owl:ObjectProperty . ex:q a owl:ObjectProperty . ex:r a owl:ObjectProperty .
+        ex:C a owl:Class ; owl:hasKey ( ex:p [ owl:inverseOf ex:q, ex:r ] ) .",
+    );
+    let ontology = read(&statements, &table);
+    let keys: Vec<String> = (rendered(&ontology, &table).into_iter())
+        .filter(|axiom| axiom.starts_with("HasKey("))
+        .collect();
+    assert!(keys.is_empty(), "{keys:?}");
+    let what = "a key with a member that can't be read";
+    assert!(
+        (ontology.diagnostics.iter())
+            .any(|d| matches!(d, Diagnostic::Malformed { what: w, .. } if *w == what)),
+        "{:?}",
+        ontology.diagnostics
+    );
+}
+
 /// What the W3C OWL 2 DL tests showed read wrongly or dropped silently: a cardinality over
 /// a data property where the source has no term for `rdfs:Literal` (DL-601: the axiom was
 /// dropped without a diagnostic), RDF's `rdfs:Class`, `rdf:Property` and `rdf:List`
