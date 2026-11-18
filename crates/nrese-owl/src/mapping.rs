@@ -414,7 +414,7 @@ struct Reader<'a> {
     ranges: Interner<DataRange>,
     axioms: BTreeMap<Axiom, Vec<Source>>,
     diagnostics: Vec<Diagnostic>,
-    reported: HashSet<(Term, &'static str)>,
+    reported: HashSet<([Term; 3], &'static str)>,
     annotations: usize,
     noncanonical_cardinality: Option<Term>,
     empty_list: Option<Term>,
@@ -634,16 +634,31 @@ impl<'a> Reader<'a> {
         objects
     }
 
-    /// The single object of `subject`'s `predicate`, collected as structural.
+    /// The object of `subject`'s `predicate` where it has exactly one, not collected: evidence
+    /// for how to read, never a reading.
+    fn single(&self, subject: Term, predicate: Option<Term>) -> Option<Term> {
+        match self.objects(subject, predicate)[..] {
+            [object] => Some(object),
+            _ => None,
+        }
+    }
+
+    /// The single object of `subject`'s `predicate`, collected as structural. None where it
+    /// has two (reported, every one collected): which one a reading took would follow the
+    /// order the statements come in.
     fn one(&mut self, subject: Term, predicate: Option<Term>) -> Option<Term> {
         let objects = self.objects(subject, predicate);
-        let &object = objects.first()?;
         if objects.len() > 1 {
             self.report(Diagnostic::Malformed {
                 node: subject,
                 what: "a structure property given twice",
             });
+            for &object in &objects {
+                self.collect([subject, predicate?, object]);
+            }
+            return None;
         }
+        let &object = objects.first()?;
         self.collect([subject, predicate?, object]);
         Some(object)
     }
@@ -966,7 +981,7 @@ impl<'a> Reader<'a> {
     /// no literal use does (a schema read alone): its value a literal, or its filler a data
     /// range ([`Self::is_data_range`]).
     fn says_data(&mut self, node: Term) -> bool {
-        let first = |reader: &Self, p| reader.objects(node, p).first().copied();
+        let first = |reader: &Self, p| reader.single(node, p);
         if let Some(value) = first(self, self.v.owl_has_value) {
             return self.kind(value) == TermKind::Literal;
         }
@@ -993,7 +1008,7 @@ impl<'a> Reader<'a> {
                         .any(|&iri| self.terms.iri(iri) == Some(term))
             }
             TermKind::Blank => {
-                let first = |reader: &Self, p| reader.objects(term, p).first().copied();
+                let first = |reader: &Self, p| reader.single(term, p);
                 if self.has_type(term, v.rdfs_datatype)
                     || self.has_type(term, v.owl_data_range)
                     || first(self, v.owl_on_datatype).is_some()
