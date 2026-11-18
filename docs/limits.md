@@ -497,6 +497,9 @@ leave something out.
   asserted in a graph it can't read. The status tells that reader that such an assertion exists.
   Its rows are right, but under the QL rewriting (`owl2-ql`, or `owl2-rl` with
   `reasoner.ql_rewriting = "on"`) the rewriting doesn't run for it at such a revision, so a row
-  only the rewriting gives (one an existential leads to) can be missing there.
+  only the rewriting gives (one an existential leads to) can be missing there. Where the
+  rewriting runs for it, its limits under `owl2-rl` ([reasoning](#reasoning): a universal
+  restriction on `owl:topObjectProperty`, a store inconsistent only through an existential) hold
+  for this reader alike, `complete` included.
 - A refusal for memory or work can hint at how much data a reader of only some graphs may not see. v2.0 admits
   requests by what the reader sees.
