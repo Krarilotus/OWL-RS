@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::diagnostics::Diagnostic;
+use crate::diagnostics::{Diagnostic, reserved_name};
 use crate::model::{
     Axiom, Characteristic, ClassExpr, DataRange, DataTerms, Disjoint, EntityKind, ExprId, Interner,
     Literal, ObjProp, RangeId, Term, canonical,
@@ -673,6 +673,9 @@ impl<'a> Reader<'a> {
             if !is(p, v.rdf_type) || self.kind(s) != TermKind::Iri {
                 continue;
             }
+            if is(o, v.owl_annotation_property) && self.reserved_annotation(s) {
+                continue;
+            }
             self.annotation_properties.read(statement.triple, true);
             for &(class, kind) in &kinds {
                 if is(o, class) {
@@ -726,7 +729,9 @@ impl<'a> Reader<'a> {
         let found: BTreeSet<Term> = all().filter_map(|s| content(s.triple)).collect();
         let mut declared = AnnotationProperties::new(&mut |i| terms.iri(i));
         for s in beside {
-            declared.read(s.triple, self.kind(s.triple[0]) == TermKind::Iri);
+            let [subject, ..] = s.triple;
+            let named = self.kind(subject) == TermKind::Iri && !self.reserved_annotation(subject);
+            declared.read(s.triple, named);
         }
         let named = !found.is_empty()
             && all().any(|s| {
@@ -1574,7 +1579,7 @@ impl<'a> Reader<'a> {
     fn typing(&mut self, s: Term, o: Term, triple: [Term; 3]) {
         let v = self.v;
         if let Some(&(_, kind)) = self.declaration_kinds.iter().find(|(c, _)| is(o, *c)) {
-            if self.kind(s) == TermKind::Iri {
+            if self.declared_as(s, kind) {
                 self.add(Axiom::Declaration(kind, s), triple);
             }
             return;
@@ -1675,6 +1680,13 @@ impl<'a> Reader<'a> {
     /// Declared an annotation property, or one OWL 2 builds in (declared implicitly: §5.8).
     fn annotation_property(&self, term: Term) -> bool {
         self.annotation_properties.contains(term)
+    }
+
+    /// Whether `term` is a name of the reserved vocabulary (§2.4) other than the annotation
+    /// properties OWL 2 builds in: no declaration makes it one (`rdf:type`, `owl:sameAs`).
+    fn reserved_annotation(&self, term: Term) -> bool {
+        let iri = self.terms.iri_text(term);
+        iri.is_some_and(|i| reserved_name(&i) && !BUILTIN_ANNOTATIONS.contains(&i.as_str()))
     }
 
     /// `rdfs:label` and the other annotation properties OWL 2 builds in.
