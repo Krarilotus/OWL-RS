@@ -1066,18 +1066,18 @@ fn a_compact_visible_read_is_charged_as_the_publications_read_is() {
     );
 }
 
-/// A compact store whose `ex:open` holds `data`, rematerialised under `owl2-rl`, the default
-/// graph the union of every graph.
-fn compact_store(data: &str) -> StoreService {
+/// A store holding `data` (its graphs), rematerialised under `owl2-rl`, the default graph
+/// the union of every graph; under compact equality where `compact`.
+fn reasoned_store(compact: bool, data: &str) -> StoreService {
     let store = StoreService::new(nrese_store::StoreConfig {
-        equality_compact: true,
+        equality_compact: compact,
         union_default_graph: true,
         ..in_memory_store_config()
     })
     .unwrap();
     store
         .execute_update(&SparqlUpdateRequest::new(format!(
-            "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ {data} }} }}"
+            "PREFIX ex: <{EX}> INSERT DATA {{ {data} }}"
         )))
         .unwrap();
     store.rematerialise(Ruleset::Owl2Rl).unwrap();
@@ -1085,51 +1085,103 @@ fn compact_store(data: &str) -> StoreService {
     store
 }
 
+/// The result cache's whole answers, the work reads did (parts stored, rejected and
+/// computed), and its hits.
+fn cache_work(store: &StoreService) -> (usize, (u64, u64, u64), u64) {
+    let stats = store.query_cache_stats();
+    let work = (stats.stored, stats.rejected, stats.misses);
+    (stats.answers, work, stats.hits)
+}
+
 /// Spec: crates/nrese-store/src/service.rs (`status_for_its_reader`): under compact equality
-/// [`reader`], who sees every inference, reads the publication, its answers in the store's
-/// result cache beside the reader of every graph's. Each typed answer carries its own reader's
-/// status, read cold and from the cache, whichever of them read first: the reader of every
-/// graph its certified one, the other `not-certified`. `ex:open` holds 500 facts, read by one
-/// SELECT.
+/// [`reader`], who sees every inference, reads the publication, its whole answers in the
+/// store's result cache beside the reader of every graph's, each under its own key. Each typed
+/// answer carries its own reader's rows and status, whichever of them read first: its first
+/// read admits its whole answer, its second is answered from it with no work. The reader of
+/// every graph is answered 501 rows, told the fixture's `owl2-rl` status both times;
+/// [`reader`] the 500 of `ex:open`, told `not-certified`. `ex:secret`, which [`reader`] can't
+/// read, holds the 501st.
 #[test]
 fn a_typed_answer_from_the_cache_carries_its_own_readers_status() {
     let facts: String = (0..500)
         .map(|i| format!("ex:s{i} ex:p ex:o{i} . "))
         .collect();
+    let data = format!("GRAPH ex:open {{ {facts} }} GRAPH ex:secret {{ ex:s500 ex:p ex:o500 }}");
     let select = format!("PREFIX ex: <{EX}> SELECT ?s ?o WHERE {{ ?s ex:p ?o }}");
     for (first, second) in [
         (ReadScope::All, reader(false)),
         (reader(false), ReadScope::All),
     ] {
-        let store = compact_store(&facts);
+        let store = reasoned_store(true, &data);
         let mut told = Vec::new();
-        for scope in [&first, &second, &first, &second] {
-            let hits = store.query_cache_stats().hits;
+        for (i, scope) in [&first, &second, &first, &second].into_iter().enumerate() {
+            let before = cache_work(&store);
             let request = SparqlQueryRequest::new(select.clone(), scope.clone());
             let result = store.execute_query(&request).unwrap();
+            let after = cache_work(&store);
             let rows = String::from_utf8_lossy(&result.payload)
                 .matches(&format!("{EX}o"))
                 .count();
-            let status = result
-                .completeness
-                .map_or("none".to_owned(), |c| c.header());
-            let hit = store.query_cache_stats().hits > hits;
-            told.push((*scope == ReadScope::All, status, rows, hit));
+            let cache = match i < 2 {
+                true => after.0 > before.0,
+                false => after.0 == before.0 && after.1 == before.1 && after.2 > before.2,
+            };
+            let status = result.completeness.map(|c| c.header());
+            told.push((*scope == ReadScope::All, status, rows, cache));
         }
-        let certified = told.iter().find(|t| t.0).map(|t| t.1.clone()).unwrap();
-        let own = |every: bool| {
-            if every {
-                certified.as_str()
-            } else {
-                "not-certified"
-            }
+        let every: Vec<_> = told.iter().filter(|t| t.0).map(|t| t.1.clone()).collect();
+        // `sound-only`, regime `owl2-rl`: the fixture's status.
+        let rl = every[0]
+            .as_deref()
+            .is_some_and(|s| s.split("; ").take(2).eq(["sound-only", "regime=owl2-rl"]));
+        let own = |t: &(bool, Option<String>, usize, bool)| match t.0 {
+            true => t.1 == every[0] && t.2 == 501,
+            false => t.1.as_deref() == Some("not-certified") && t.2 == 500,
         };
-        let right = certified != "not-certified"
-            && told.iter().all(|t| (t.1.as_str(), t.2) == (own(t.0), 500))
-            && told[2].3
-            && told[3].3;
+        let right = rl && every[0] == every[1] && told.iter().all(|t| own(t) && t.3);
         assert!(right, "{told:?}");
     }
+}
+
+/// Spec: crates/nrese-store/src/service.rs (`status_without_dl`): what a prepared query's
+/// reader is told before it runs is what its read is told, of the view it reads. Under
+/// compact equality a reader by support reads a withheld view (no sets, so not its closure):
+/// both `not-certified`. Its scoped read (`inference-scope=dataset`) is refused there, and
+/// before it the reader is told `not-certified`, not no status. Without compact equality its
+/// scoped read is told a status, the one it is told before it.
+#[test]
+fn a_supported_readers_status_before_its_read_is_its_reads() {
+    let unscoped = format!("PREFIX ex: <{EX}> SELECT ?o WHERE {{ ex:a ex:p ?o }}");
+    let scoped = format!("PREFIX ex: <{EX}> SELECT ?o FROM ex:open WHERE {{ ex:a ex:p ?o }}");
+    let told = |compact: bool, query: &str, in_scope: bool| {
+        let store = reasoned_store(compact, "GRAPH ex:open { ex:a ex:p ex:b }");
+        let mut request = SparqlQueryRequest::new(query.to_owned(), reader(true));
+        request.inference_scope_dataset = in_scope;
+        let prepared = store.prepare_query(&request).unwrap();
+        let before = store.status_without_dl(&prepared).map(|c| c.header());
+        let read = store.execute_query(&request);
+        (
+            before,
+            read.map(|r| r.completeness.map(|c| c.header()))
+                .map_err(|e| e.to_string()),
+        )
+    };
+    let withheld = Some("not-certified".to_owned());
+    let (before, read) = told(true, &unscoped, false);
+    assert!(
+        before == withheld && read == Ok(withheld.clone()),
+        "compact: {before:?}, {read:?}"
+    );
+    let (before, read) = told(true, &scoped, true);
+    assert!(
+        before == withheld && read.is_err(),
+        "compact, scoped: {before:?}, {read:?}"
+    );
+    let (before, read) = told(false, &scoped, true);
+    assert!(
+        before.is_some() && read == Ok(before.clone()),
+        "scoped: {before:?}, {read:?}"
+    );
 }
 
 /// Spec: crates/nrese-store/src/service.rs (`pin_query`): under compact equality [`reader`]
@@ -1137,7 +1189,7 @@ fn a_typed_answer_from_the_cache_carries_its_own_readers_status() {
 /// one fact in `ex:open` is pinned; read again, it keeps its row, told `not-certified`.
 #[test]
 fn a_compact_visible_reader_pins_its_select() {
-    let store = compact_store("ex:a ex:p ex:b");
+    let store = reasoned_store(true, "GRAPH ex:open { ex:a ex:p ex:b }");
     let select = format!("PREFIX ex: <{EX}> SELECT ?o WHERE {{ ex:a ex:p ?o }}");
     let request = SparqlQueryRequest::new(select, reader(false));
     let pinned = store.pin_query("one", &request, &nrese_store::CancellationToken::new());

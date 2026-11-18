@@ -1418,14 +1418,17 @@ impl StoreService {
     /// statement outside a transaction; sound only, never complete. A read of every
     /// statement inside one lacks only its pending operations' reasoning (`Self::assess`).
     /// Either is unsound where a missing row can make a returned one wrong (`NOT EXISTS`,
-    /// `MINUS`, …: [`crate::dl::query::certify_closure`]). As
-    /// `prepared`'s reader is told it (`status_for_its_reader`).
+    /// `MINUS`, …: [`crate::dl::query::certify_closure`]). Of the view `prepared`'s read
+    /// reads, as its reader is told it (`status_for_its_reader`). Where that view is
+    /// refused, `not-certified`: no read could run, so it says nothing of the data.
     pub fn status_without_dl(
         &self,
         prepared: &PreparedQuery,
     ) -> Option<nrese_sparql::Completeness> {
-        let status =
-            self.status_outside_dl(prepared, None, Revision::Committed(&self.engine.snapshot()));
+        let Ok(view) = self.query_view(prepared, &self.envelope(None), &Default::default()) else {
+            return Some(nrese_sparql::Completeness::not_certified());
+        };
+        let status = self.status_outside_dl(prepared, None, Revision::Committed(&view));
         self.told(prepared, status, false)
     }
 

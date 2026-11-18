@@ -10,7 +10,7 @@ use nrese_store::{QlRewritingMode, StoreConfig};
 use tower::util::ServiceExt;
 
 use crate::access_control_tests::{policy_of, token};
-use crate::support::{body_text, test_app_with_store_config};
+use crate::support::{body_text, test_app_with_store_config, test_state_with_store_config};
 
 type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
@@ -289,24 +289,67 @@ async fn a_compact_visible_reader_is_told_the_same_whether_a_graph_it_cant_read_
     Ok(())
 }
 
-/// The result cache's hits, as `/api/v1/repositories/nrese/cache` counts them.
-async fn cache_hits(app: &Router) -> TestResult<u64> {
-    let request = Request::builder()
-        .uri("/api/v1/repositories/nrese/cache")
-        .header(header::AUTHORIZATION, format!("Bearer {}", token(ADMIN)))
-        .body(Body::empty())?;
-    let view: serde_json::Value =
-        serde_json::from_str(&body_text(app.clone().oneshot(request).await?).await?)?;
-    Ok(view["hits"].as_u64().ok_or("no hits")?)
+/// The result cache's whole answers, the work reads did (parts stored, rejected and
+/// computed), and its hits.
+fn cache_work(store: &nrese_store::StoreService) -> (usize, (u64, u64, u64), u64) {
+    let stats = store.query_cache_stats();
+    (
+        stats.answers,
+        (stats.stored, stats.rejected, stats.misses),
+        stats.hits,
+    )
+}
+
+/// Each of `roles` sends `select` in turn: what it is told (its header, `none` where it has
+/// none, and its answer's rows of `urn:ex:o`), and whether its read was a whole-output
+/// admission (`fresh`: a new whole answer stored) or a whole-output hit (no part stored,
+/// rejected or computed, no new whole answer, a hit).
+async fn cached_reads(
+    app: &Router,
+    store: &nrese_store::StoreService,
+    reads: &[(&[&str], bool)],
+    select: &str,
+) -> TestResult<Vec<(String, usize, bool)>> {
+    let mut told = Vec::new();
+    for (roles, fresh) in reads {
+        let before = cache_work(store);
+        let (code, header, body) = send(
+            app,
+            roles,
+            Method::POST,
+            "/dataset/query",
+            select.to_owned(),
+        )
+        .await?;
+        assert_eq!(code, StatusCode::OK, "{body}");
+        let after = cache_work(store);
+        let cache = match fresh {
+            true => after.0 > before.0,
+            false => after.0 == before.0 && after.1 == before.1 && after.2 > before.2,
+        };
+        let header = header.unwrap_or_else(|| "none".to_owned());
+        told.push((header, body.matches("urn:ex:o").count(), cache));
+    }
+    Ok(told)
+}
+
+/// Whether `header` says the fixture's `owl2-rl` status: `sound-only`, regime `owl2-rl`.
+fn owl2_rl(header: &str) -> bool {
+    header
+        .split("; ")
+        .take(2)
+        .eq(["sound-only", "regime=owl2-rl"])
 }
 
 /// Spec: crates/nrese-store/src/service.rs (`status_for_its_reader`) and
 /// crates/nrese-server/src/http/sparql.rs (a cached answer's header): under compact equality
 /// a reader of `:g1` who sees every inference reads the publication, so its answers and the
-/// reader of every graph's share the store's result cache. Each is told its own status with
-/// an answer from it: the reader of every graph its certified one, the other `not-certified`,
-/// whichever of them read first. `:g1` holds 500 facts read by one SELECT, read by each
-/// twice, the second read a hit.
+/// reader of every graph's share the store's result cache, each under its own key. Each is
+/// told its own rows and status with an answer from it, whichever of them read first: its
+/// first read admits its whole answer, its second is answered from it with no work. The
+/// reader of every graph is answered 501 rows, told the fixture's `owl2-rl` status both
+/// times; the other the 500 of `:g1`, told `not-certified`. `:g2`, which it can't read, holds
+/// the 501st.
 #[tokio::test]
 async fn a_cached_answer_is_told_with_its_own_readers_status() -> TestResult {
     let facts: String = (0..500)
@@ -314,7 +357,7 @@ async fn a_cached_answer_is_told_with_its_own_readers_status() -> TestResult {
         .collect();
     let select = "SELECT ?s ?o WHERE { ?s ex:p ?o }";
     for (first, second) in [(ADMIN, READER), (READER, ADMIN)] {
-        let app = test_app_with_store_config(
+        let state = test_state_with_store_config(
             StoreConfig {
                 ql_rewriting: QlRewritingMode::Off,
                 union_default_graph: true,
@@ -324,40 +367,64 @@ async fn a_cached_answer_is_told_with_its_own_readers_status() -> TestResult {
             policy_of(VISIBLE_POLICY)?,
             ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
         )?;
-        insert(&app, &format!("GRAPH :g1 {{ {facts} }}")).await?;
-        let mut told = Vec::new();
-        for roles in [first, second, first, second] {
-            let hits = cache_hits(&app).await?;
-            let (code, header, body) = send(
-                &app,
-                roles,
-                Method::POST,
-                "/dataset/query",
-                select.to_owned(),
-            )
-            .await?;
-            assert_eq!(code, StatusCode::OK, "{body}");
-            let rows = body.matches("urn:ex:o").count();
-            told.push((
-                header.unwrap_or_default(),
-                rows,
-                cache_hits(&app).await? > hits,
-            ));
-        }
-        let (every, some) = match first == ADMIN {
-            true => ([&told[0], &told[2]], [&told[1], &told[3]]),
-            false => ([&told[1], &told[3]], [&told[0], &told[2]]),
+        let app = nrese_server::build_app(state.clone());
+        insert(
+            &app,
+            &format!("GRAPH :g1 {{ {facts} }} GRAPH :g2 {{ ex:s500 ex:p ex:o500 }}"),
+        )
+        .await?;
+        let reads = [
+            (first, true),
+            (second, true),
+            (first, false),
+            (second, false),
+        ];
+        let told = cached_reads(&app, &state.store(), &reads, select).await?;
+        let every: Vec<_> = (0..4).filter(|i| reads[*i].0 == ADMIN).collect();
+        let certified = &told[every[0]].0;
+        let own = |i: usize| match reads[i].0 == ADMIN {
+            true => (&told[i].0, told[i].1) == (certified, 501),
+            false => (told[i].0.as_str(), told[i].1) == ("not-certified", 500),
         };
-        let certified = &every[0].0;
-        let right = certified != "not-certified"
-            && every.iter().all(|t| (&t.0, t.1) == (certified, 500))
-            && some
-                .iter()
-                .all(|t| (t.0.as_str(), t.1) == ("not-certified", 500))
-            && told[2].2
-            && told[3].2;
+        let right = owl2_rl(certified) && (0..4).all(|i| own(i) && told[i].2);
         assert!(right, "first {first:?}: {told:?}");
     }
+    Ok(())
+}
+
+/// Spec: crates/nrese-store/src/service.rs (`status_outside_dl`'s cache context): a cached
+/// answer is kept under the status its read was assessed with, so a change of the
+/// assessment that leaves the publication as it was reaches the next read. On a store
+/// without reasoning, a reader of every graph's SELECT of 500 facts in the default graph is
+/// told `complete`, its second read a whole-output hit; with the rules registered, the same
+/// SELECT is read again: it is told `not-certified` (an inferred stack that isn't the rules'
+/// closure), a new whole answer, and its repeat a hit told the same.
+#[tokio::test]
+async fn a_cached_answer_is_told_the_assessment_after_the_rules_are_registered() -> TestResult {
+    let facts: String = (0..500)
+        .map(|i| format!("ex:s{i} ex:p ex:o{i} . "))
+        .collect();
+    let select = "SELECT ?s ?o WHERE { ?s ex:p ?o }";
+    let state = test_state_with_store_config(
+        StoreConfig::default(),
+        policy_of(VISIBLE_POLICY)?,
+        ReasonerConfig::default(),
+    )?;
+    let app = nrese_server::build_app(state.clone());
+    insert(&app, &facts).await?;
+    let reads = [(ADMIN, true), (ADMIN, false)];
+    let mut told = cached_reads(&app, &state.store(), &reads, select).await?;
+    let owl2_rl = nrese_reasoner::rulesets::Ruleset::Owl2Rl;
+    state.store().use_reasoning_rules(Some(owl2_rl.into()));
+    told.extend(cached_reads(&app, &state.store(), &reads, select).await?);
+    // Each read is told its header and 500 rows, and is the admission or the hit it reads as.
+    let expected = [
+        ("complete".to_owned(), 500, true),
+        ("complete".to_owned(), 500, true),
+        ("not-certified".to_owned(), 500, true),
+        ("not-certified".to_owned(), 500, true),
+    ];
+    assert_eq!(told, expected);
     Ok(())
 }
 
