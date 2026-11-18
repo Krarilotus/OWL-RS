@@ -86,7 +86,10 @@ leave something out.
   [modes](spec/reasoning-semantics.md#modes)).
 - `owl2-rl` doesn't infer `x owl:sameAs x` for every term, so `?x owl:sameAs ?x` doesn't
   return one for each, though an asserted one is returned. It checks the datatype rules in part,
-  and of the axiomatic triples it holds only `dt-type1`'s 32 datatype statements, in every store
+  and of the axiomatic triples it holds only `dt-type1`'s 32 datatype statements, in every store.
+  It doesn't type a literal by its own datatype (`dt-type2`), nor do `owl-horst` and
+  `rdfs-plus`: without a range, `∃:p.xsd:integer ⊑ :C` and `:a :p 5` give no `:a a :C`, even in
+  one commit, where `owl2-dl` gives it
   ([omissions](spec/reasoning-semantics.md#owl2-rl-owl-2-rlrdf-rules)).
   Lists past their limits (a property chain of more than 250 properties, a key of more than
   127, an intersection of more than 256 classes, more than 64 member sequences) aren't used
@@ -210,8 +213,11 @@ leave something out.
 - A literal value under an inverse, symmetric or functional object property gives a fact no
   store holds, with the literal as its subject. A read after a later commit may miss what
   follows from it, and `owl2-ql` and `owl2-dl` still tell it `complete`; `owl2-rl` doesn't. For
-  one: `:p owl:inverseOf :q . :a :p "v"`, then `:q rdfs:range :D`, asked `:a a :D`. Such input
-  is outside OWL 2 DL.
+  one: `:p owl:inverseOf :q . :a :p "v"`, then `:q rdfs:range :D`, asked `:a a :D`. That input
+  is outside OWL 2 DL. A literal typed by a range is such a fact too, in valid OWL 2 DL: read
+  back by `someValuesFrom` that datatype in a later commit (`:p rdfs:range xsd:integer .
+  :a :p 5`, then `∃:p.xsd:integer ⊑ :C`, asked `:a a :C`), `owl2-rl` and `owl-horst` miss it
+  until a rebuild, and don't tell it `complete`; `owl2-dl` answers it.
 - <a id="two-spellings-across-commits"></a>Under `owl2-dl`, a functional data property (or an
   at-most-one restriction) that holds one value written two ways (`"1"^^xsd:int`,
   `"01"^^xsd:int`) equates the two literals within a commit, but not across commits: after a
