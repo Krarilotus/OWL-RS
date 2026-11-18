@@ -1867,3 +1867,54 @@ fn labels_refused_their_memory_leave_the_request_unmarked() {
     assert!(empty > 0, "no limit refuses the labels");
     assert_eq!(mask, vec![true; 12], "all 12 refuted under the last limit");
 }
+
+/// The store of [`lower_true_store_with`] with `:x` in `:A` or `:E`: `:A` below `≥ 200 :r` (200
+/// successors, about a megabyte with their inequalities), `:E` a class of nothing else. `:A`
+/// is first in the union if `a_first.0`, and committed before `:E` if `a_first.1`.
+fn at_least_or_e_store(a_first: (bool, bool)) -> Arc<StoreService> {
+    let union = if a_first.0 { "( :A :E )" } else { "( :E :A )" };
+    let a = ":A <http://www.w3.org/2000/01/rdf-schema#subClassOf> [ a owl:Restriction ; \
+             owl:onProperty :r ; owl:minCardinality \
+             \"200\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ] .";
+    let classes = if a_first.1 {
+        format!("{a} :E a owl:Class .")
+    } else {
+        format!(":E a owl:Class . {a}")
+    };
+    let data = format!(":r a owl:ObjectProperty . {classes} :x a [ owl:unionOf {union} ] .");
+    lower_true_store_with(crate::StoreConfig::in_memory(), &data)
+}
+
+/// Spec: the labels give a mask only from a run none of their charges was refused in: a model
+/// found after a branch was abandoned for want of room is no mask (the optional part's terms:
+/// no call goes on past a refusal). Over [`at_least_or_e_store`] in each union and commit
+/// order, the rows of `?x a :E` (`:x`), under each limit from 4 KiB to 16 MiB (steps of a
+/// tenth): the labels give no mask or the one they give under 1 GiB. And the case is reached:
+/// in an order whose model under 1 GiB takes the `≥ 200` branch (`:x` refuted), some limit
+/// gives no mask though the labels' premise was charged (the envelope's peak above 0).
+#[test]
+fn labels_whose_run_abandoned_a_branch_give_no_mask() {
+    use nrese_rdf::NamedNode;
+    let rows = vec![vec![Some(NamedNode::new_unchecked("urn:test:x").into())]];
+    let (token, deadline) = (CancellationToken::new(), Deadline::after(None));
+    let mut reached = false;
+    for order in [(true, true), (false, true), (true, false), (false, false)] {
+        let store = at_least_or_e_store(order);
+        let of = |limit| labels_of(&store, "?x a <urn:test:E>", &rows, &token, deadline, limit);
+        let (whole, ..) = of(1 << 30);
+        let (mut limit, mut none) = (4usize << 10, 0);
+        while limit <= 16 << 20 {
+            let (mask, _, peak, _) = of(limit);
+            println!("order {order:?}, {limit}: mask {mask:?}, peak {peak}");
+            assert!(
+                mask.is_empty() || mask == whole,
+                "{limit} bytes: {mask:?}, not {whole:?}, from a run past a refusal"
+            );
+            none += usize::from(mask.is_empty() && peak > 0);
+            limit += limit / 10;
+        }
+        println!("order {order:?}: {whole:?} under 1 GiB, {none} gave none past the premise");
+        reached |= whole == [true] && none > 0;
+    }
+    assert!(reached, "no order reaches the case");
+}
