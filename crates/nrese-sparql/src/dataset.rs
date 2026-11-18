@@ -185,10 +185,13 @@ impl ResolvedDataset {
             Some(graphs) => only(ids_of(graphs)),
         };
         let named = specification.available_named_graphs().map(|graphs| {
-            graphs
+            let mut ids: Vec<TermId> = graphs
                 .iter()
                 .filter_map(|name| graph(name.as_ref()))
-                .collect()
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
         });
         Self {
             default,

@@ -230,7 +230,7 @@ fn rl_sub(o: &Ontology, e: ExprId) -> bool {
 /// RL's `superClassExpression`: a class other than `owl:Thing`, intersections, the
 /// complement of a `subClassExpression`, `∀R.super`, values, `≤ 0/1 R(.sub)`, `∀D.range`,
 /// `≤ 0/1 D(.range)`.
-fn rl_super(o: &Ontology, e: ExprId) -> bool {
+pub(crate) fn rl_super(o: &Ontology, e: ExprId) -> bool {
     let e = unwrap(o, e);
     match o.class(e) {
         ClassExpr::Class(_) | ClassExpr::Nothing => true,
@@ -879,10 +879,11 @@ pub fn punned(o: &Ontology) -> Vec<Term> {
 
 /// Whether the OWL 2 RL rules may read `o` otherwise than OWL 2 DL does: `o` has
 /// annotation-property axioms ([`Ontology::annotation_schema`]) or puns ([`punned`]), which
-/// theorem PR1 (OWL 2 Profiles §4.3) excludes. The one detection the route, the answers'
-/// status and the consistency verdicts take.
+/// theorem PR1 (OWL 2 Profiles §4.3) excludes, or an empty intersection or union
+/// ([`Ontology::empty_list`]), which they don't read. The one detection the route,
+/// the answers' status and the consistency verdicts take.
 pub fn rules_read_differently(o: &Ontology) -> bool {
-    !o.annotation_schema.is_empty() || !punned(o).is_empty()
+    !o.annotation_schema.is_empty() || !punned(o).is_empty() || o.empty_list.is_some()
 }
 
 /// The profiles every axiom of `o` is in.

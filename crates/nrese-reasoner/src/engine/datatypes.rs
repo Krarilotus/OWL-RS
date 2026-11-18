@@ -21,6 +21,7 @@
 //! beyond what the owner represents (`LiteralError::Unsupported`).
 
 use crate::ir::{Triple, Violations};
+use crate::representatives::EqualityClasses;
 use nrese_engine::TermId;
 use nrese_exec::Budget;
 use nrese_rdf::{Literal, Term};
@@ -63,10 +64,16 @@ fn in_value_space(literal: &Literal, datatype: &str) -> Option<bool> {
 /// The datatype violations among `facts` (derived facts, generalised ones included),
 /// finished, charged to `memory` as [`Violations`] are: a budget without room ends the
 /// list there, still inconsistent.
+///
+/// `classes`: the `owl:sameAs` classes of a closure that keeps them by representatives
+/// (`reasoner.equality = "compact"`). Its facts are then its representatives' only, and its
+/// literal equalities only `member owl:sameAs representative`: both checks read each class's
+/// literals through `classes`. `None` where every identity's facts are listed.
 pub(crate) fn violations(
     facts: &[Triple],
     rdf_type: u64,
     same_as: Option<u64>,
+    classes: Option<&EqualityClasses>,
     decode: &dyn Fn(u64) -> Option<Term>,
     memory: &Arc<Budget>,
 ) -> Violations {
@@ -74,25 +81,33 @@ pub(crate) fn violations(
         Some(Term::Literal(l)) => Some(l),
         _ => None,
     };
+    let is_literal = |id: &&u64| TermId::from_raw(**id).kind().is_literal();
     let mut out = Violations::new(Arc::clone(memory));
     let (mut not_type, mut diff) = (None, None);
     for &[s, p, o] in facts {
         if !out.complete() {
             break;
         }
-        if !TermId::from_raw(s).kind().is_literal() {
-            continue;
-        }
         if p == rdf_type {
-            let (Some(lt), Some(Term::NamedNode(dt))) = (literal(s), decode(o)) else {
+            // A type of a class's representative is every member's.
+            let one = [s];
+            let class = classes.and_then(|c| c.class_of(s)).unwrap_or(&one);
+            let mut members = class.iter().filter(is_literal).peekable();
+            let (Some(_), Some(Term::NamedNode(dt))) = (members.peek(), decode(o)) else {
                 continue;
             };
-            if in_value_space(&lt, dt.as_str()) == Some(false)
-                && let Some(group) = *not_type.get_or_insert_with(|| out.group("dt-not-type", 2))
-            {
-                out.record(group, [s, o]);
+            for &m in members {
+                if let Some(lt) = literal(m)
+                    && in_value_space(&lt, dt.as_str()) == Some(false)
+                    && let Some(group) =
+                        *not_type.get_or_insert_with(|| out.group("dt-not-type", 2))
+                {
+                    out.record(group, [m, o]);
+                }
             }
-        } else if Some(p) == same_as && TermId::from_raw(o).kind().is_literal() && s < o {
+        } else if Some(p) == same_as && is_literal(&&s) && is_literal(&&o) && s != o {
+            // Either direction; the pair is recorded smaller id first, and the list drops
+            // it where the other direction is listed too.
             let (Some(a), Some(b)) = (literal(s), literal(o)) else {
                 continue;
             };
@@ -100,8 +115,26 @@ pub(crate) fn violations(
                 && x != y
                 && let Some(group) = *diff.get_or_insert_with(|| out.group("dt-diff", 2))
             {
-                out.record(group, [s, o]);
+                out.record(group, [s.min(o), s.max(o)]);
             }
+        }
+    }
+    // dt-diff over kept classes: the representative may hold no value (an IRI, a blank
+    // node, an ill-typed or unrepresented literal), so the class's judged literals are
+    // compared among themselves. Value equality is transitive: if two of them differ, one
+    // differs from the first. The pair is recorded smaller id first.
+    for (_, class) in classes.into_iter().flat_map(|c| c.classes()) {
+        let mut values = class.iter().filter(is_literal).filter_map(|&m| {
+            let Judged::Value(v) = judge(&literal(m)?) else {
+                return None;
+            };
+            Some((m, v))
+        });
+        if let Some((f, x)) = values.next()
+            && let Some((m, _)) = values.find(|(_, v)| *v != x)
+            && let Some(group) = *diff.get_or_insert_with(|| out.group("dt-diff", 2))
+        {
+            out.record(group, [m.min(f), m.max(f)]);
         }
     }
     out.finish();

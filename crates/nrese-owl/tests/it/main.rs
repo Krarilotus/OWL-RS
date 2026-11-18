@@ -442,7 +442,7 @@ ex:p a owl:DatatypeProperty . owl:topDataProperty rdfs:subPropertyOf ex:p .
 /// the RDF mapping writes them: a max or max-qualified one spelled otherwise is marked
 /// (`Ontology::noncanonical_cardinality`, which the RL route and the rewriting's status read).
 /// The mapping's spelling isn't, and neither is an exact or min one, whose spelling no rule
-/// reads, so plain `owl:cardinality 1` gives no `CardinalitySpelling` hazard.
+/// reads, so plain `owl:cardinality 1` gives no `Unread` hazard.
 #[test]
 fn only_a_max_cardinality_the_rules_dont_read_is_marked() {
     for (restriction, marked) in [
