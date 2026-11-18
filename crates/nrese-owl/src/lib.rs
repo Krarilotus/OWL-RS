@@ -36,7 +36,7 @@ pub use diagnostics::Diagnostic;
 pub use functional::{iri_text, literal_text};
 pub use mapping::{
     BUILTIN_ANNOTATIONS, BuiltinProperties, DECLARATION_KINDS, Ontology, Source, Statement,
-    TermKind, Terms, is_shacl_property, read, read_beside, shacl_properties,
+    TermKind, Terms, is_shacl_property, may_name_annotation, read, read_beside, shacl_properties,
 };
 pub use model::{
     Axiom, Characteristic, ClassExpr, DataRange, DataTerms, EntityKind, ExprId, Interner, Literal,

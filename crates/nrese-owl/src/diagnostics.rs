@@ -328,7 +328,6 @@ fn uses_any<'a>(
 /// properties): an entity the reader leaves out (`leave_out_reserved`). Callers that
 /// choose input for the reader ask it here, not by a copy of the list.
 pub fn reserved_name(iri: &str) -> bool {
-    use crate::vocab::{OWL, RDF, RDFS, XSD};
     const ALLOWED: [&str; 6] = [
         "Thing",
         "Nothing",
@@ -337,10 +336,16 @@ pub fn reserved_name(iri: &str) -> bool {
         "topDataProperty",
         "bottomDataProperty",
     ];
-    if let Some(local) = iri.strip_prefix(OWL) {
-        return !ALLOWED.contains(&local);
-    }
-    [RDF, RDFS, XSD].iter().any(|ns| iri.starts_with(ns))
+    let allowed = iri
+        .strip_prefix(crate::vocab::OWL)
+        .is_some_and(|l| ALLOWED.contains(&l));
+    reserved_vocabulary(iri) && !allowed
+}
+
+/// Whether an IRI is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`; §2.4).
+pub fn reserved_vocabulary(iri: &str) -> bool {
+    use crate::vocab::{OWL, RDF, RDFS, XSD};
+    [OWL, RDF, RDFS, XSD].iter().any(|ns| iri.starts_with(ns))
 }
 
 /// Leaves out the axioms that use an IRI of the reserved vocabulary (`rdf:`, `rdfs:`,

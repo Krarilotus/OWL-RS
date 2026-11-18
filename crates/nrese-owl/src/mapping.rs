@@ -17,7 +17,7 @@ use crate::model::{
     Axiom, Characteristic, ClassExpr, DataRange, DataTerms, Disjoint, EntityKind, ExprId, Interner,
     Literal, ObjProp, RangeId, Term, canonical,
 };
-use crate::vocab::{OWL, RDF, RDFS, Vocabulary, XSD};
+use crate::vocab::Vocabulary;
 
 /// What a term of the source is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -513,6 +513,12 @@ pub fn is_shacl_property(iri: &str) -> bool {
         .is_some_and(|name| SHACL_PROPERTIES.contains(&name))
 }
 
+/// Whether `iri` may name an annotation property (Structural Specification §5.5): of the
+/// reserved vocabulary only the nine built-in ones, [`BUILTIN_ANNOTATIONS`].
+pub fn may_name_annotation(iri: &str) -> bool {
+    BUILTIN_ANNOTATIONS.contains(&iri) || !crate::diagnostics::reserved_vocabulary(iri)
+}
+
 /// The annotation properties as [`read`] reads them (§5.8), for every reader of the RDF: the
 /// built-in ones, and each IRI declared one by [`DECLARATION_KINDS`] (no blank node). Holds
 /// the declarations' `rdf:type` and class, and the properties.
@@ -532,9 +538,14 @@ impl AnnotationProperties {
 
     /// Reads a statement, whose subject is an IRI where `named`.
     pub fn read(&mut self, [s, p, o]: [Term; 3], named: bool) {
-        if named && self.0.contains(&[Some(p), Some(o)]) {
+        if named && self.declares([s, p, o]) {
             self.1.insert(s);
         }
+    }
+
+    /// Whether a statement declares its subject an annotation property, in either spelling.
+    pub fn declares(&self, [_, p, o]: [Term; 3]) -> bool {
+        self.0.contains(&[Some(p), Some(o)])
     }
 
     pub fn contains(&self, term: Term) -> bool {
@@ -731,8 +742,8 @@ impl<'a> Reader<'a> {
         let mut declared = AnnotationProperties::new(&mut |i| terms.iri(i));
         for s in beside {
             let [subject, ..] = s.triple;
-            let named = self.kind(subject) == TermKind::Iri && !self.reserved_annotation(subject);
-            declared.read(s.triple, named);
+            let declares = self.kind(subject) == TermKind::Iri && declared.declares(s.triple);
+            declared.read(s.triple, declares && !self.reserved_annotation(subject));
         }
         let named = !found.is_empty()
             && all().any(|s| {
@@ -1687,9 +1698,9 @@ impl<'a> Reader<'a> {
     /// one of the nine annotation properties OWL 2 builds in: no declaration makes it one
     /// (§5.5), `rdf:type`, `owl:sameAs`, `owl:Thing` and the top and bottom properties alike.
     fn reserved_annotation(&self, term: Term) -> bool {
-        let reserved = |i: &str| [OWL, RDF, RDFS, XSD].iter().any(|ns| i.starts_with(ns));
-        let iri = self.terms.iri_text(term);
-        iri.is_some_and(|i| reserved(&i) && !BUILTIN_ANNOTATIONS.contains(&i.as_str()))
+        self.terms
+            .iri_text(term)
+            .is_some_and(|i| !may_name_annotation(&i))
     }
 
     /// `rdfs:label` and the other annotation properties OWL 2 builds in.

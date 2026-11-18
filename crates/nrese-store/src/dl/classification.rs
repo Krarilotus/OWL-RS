@@ -462,10 +462,15 @@ pub(crate) fn el_answer(
         return Some(ElRoute::Stopped(memory_stop.error(interrupted)));
     }
     let mut triples = nrese_exec::ChargedVec::new(memory);
+    let id = |i: &str| snapshot.lookup(NamedNodeRef::new_unchecked(i).into());
+    let declaring = nrese_owl::mapping::AnnotationProperties::new(&mut |i| id(i).map(TermId::raw));
     for q in snapshot.quads_for_pattern_in(ReadModel::Asserted, &source::ANY) {
-        triples
-            .push([q.subject.raw(), q.predicate.raw(), q.object.raw()])
-            .ok()?;
+        let triple = [q.subject.raw(), q.predicate.raw(), q.object.raw()];
+        // The reader leaves out a declaration of a name that may not be one (§5.5).
+        if declaring.declares(triple) && !super::query::may_name_annotation(snapshot, q.subject) {
+            continue;
+        }
+        triples.push(triple).ok()?;
     }
     let mut vocabulary = Lookup {
         snapshot,
