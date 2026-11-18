@@ -78,11 +78,11 @@ fn shown(statements: &[Statement], table: &Table) -> String {
 /// name, a restriction without its property, a list without its rest, `owl:onProperties`);
 /// in about half, a structure property given twice, one value a reserved name met nowhere else
 /// and one a plain name (`owl:complementOf`, or a restriction's `owl:someValuesFrom`; `true`
-/// with them); in about half, a datatype restriction with a facet reached only through an
-/// anonymous individual's class assertion, its datatype complement given twice (`true` with
-/// them); then up to twelve statements over names, reserved names and blank nodes, with
+/// with them); in about a third each, a datatype restriction with a facet reached only through
+/// an anonymous individual's class assertion, its datatype complement given twice (1) or valid
+/// OWL 2 DL (2); then up to twelve statements over names, reserved names and blank nodes, with
 /// OWL's structure predicates.
-fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool, bool) {
+fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool, u64) {
     let mut iri = |ns: &str, local: &str| table.iri_id(&format!("{ns}{local}"));
     let [a, b, c, d, h, p, q] = ["A", "B", "C", "D", "H", "p", "q"].map(|l| iri(EX, l));
     let reserved = [
@@ -131,6 +131,7 @@ fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool, bool) {
         iri(XSD, "string"),
         iri(XSD, "integer"),
         iri(XSD, "minInclusive"),
+        iri(RDFS, "Datatype"),
     ];
     let types = [
         iri(OWL, "Class"),
@@ -187,8 +188,9 @@ fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool, bool) {
         };
         triples.extend([[e, sub, t], [t, operator, defined_by], [t, operator, c]]);
     }
-    let facets = rng.one_in(2);
-    if facets {
+    // 1: its datatype complement given twice; 2: valid OWL 2 DL.
+    let facets = rng.below(3);
+    if facets > 0 {
         let [
             dp,
             data_property,
@@ -199,6 +201,7 @@ fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool, bool) {
             string,
             integer,
             min,
+            datatype,
         ] = data_restriction;
         let zero =
             Literal::new_typed_literal("0", NamedNode::new_unchecked(format!("{XSD}integer")));
@@ -209,14 +212,16 @@ fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool, bool) {
             [i, ty, cx],
             [cx, on_property, dp],
             [cx, all, rg],
-            [rg, complement, string],
-            [rg, complement, integer],
             [rg, on_datatype, integer],
             [rg, with, fl],
             [fl, first, f],
             [fl, rest, reserved[3]],
             [f, min, zero],
         ]);
+        triples.extend(match facets {
+            1 => [[rg, complement, string], [rg, complement, integer]],
+            _ => [[cx, ty, types[1]], [rg, ty, datatype]],
+        });
     }
     for _ in 0..rng.below(13) {
         let predicate = pick(rng, &predicates);
@@ -248,11 +253,11 @@ fn shuffled(statements: &[Statement], rng: &mut Rng) -> Vec<Statement> {
 /// in every order the statements come in. Random small graphs, each with an
 /// `owl:equivalentClass` between two reserved names, the second named by another axiom too,
 /// one structure of each other kind, in about half a structure property given twice (one
-/// value a reserved name, one a plain one), and in about half a datatype restriction with a
-/// facet reached only through an anonymous individual, its datatype complement given twice,
-/// are each read in their order and in six seeded
-/// others. `NRESE_FUZZ_SEED` (default 0) varies the graphs. A kind or shape the graphs never
-/// reach fails the test, which would state nothing of it; a kind whose set differs is shown by the
+/// value a reserved name, one a plain one), and in about a third each a datatype restriction
+/// with a facet reached only through an anonymous individual, its datatype complement given
+/// twice or valid OWL 2 DL, are each read in their order and in six seeded others.
+/// `NRESE_FUZZ_SEED` (default 0) varies the graphs. A kind or shape the graphs never reach
+/// fails the test, which would state nothing of it; a kind whose set differs is shown by the
 /// fewest statements that still show it, in both orders.
 #[test]
 fn what_the_reader_leaves_out_is_the_same_in_every_order() {
@@ -264,12 +269,12 @@ fn what_the_reader_leaves_out_is_the_same_in_every_order() {
         .unwrap_or(0);
     let mut rng = Rng::new(seed ^ 0x006f_7264_6572);
     let mut table = Table::default();
-    let (mut reached, mut twice, mut facets) = ([0usize; KINDS.len()], 0, 0);
+    let (mut reached, mut twice, mut facets) = ([0usize; KINDS.len()], 0, [0usize; 3]);
     let mut moved: Vec<(&str, String)> = Vec::new();
     for case in 0..GRAPHS {
         let (statements, given_twice, with_facets) = graph(&mut rng, &mut table);
         twice += usize::from(given_twice);
-        facets += usize::from(with_facets);
+        facets[with_facets as usize] += 1;
         for (i, of) in KINDS.iter().enumerate() {
             reached[i] += usize::from(!left_out(&statements, &table, of).is_empty());
         }
@@ -299,12 +304,12 @@ fn what_the_reader_leaves_out_is_the_same_in_every_order() {
     eprintln!(
         "NRESE_FUZZ_SEED={seed}: {GRAPHS} graphs; with each kind: {KINDS:?} {reached:?}; with \
          a structure property given twice: {twice}; with a facet through an anonymous \
-         individual: {facets}"
+         individual, [none, its complement given twice, valid]: {facets:?}"
     );
     assert!(
-        reached.iter().all(|&n| n > 0) && twice > 0 && facets > 0,
+        reached.iter().all(|&n| n > 0) && twice > 0 && facets.iter().all(|&n| n > 0),
         "a kind or shape no graph reached: {KINDS:?} {reached:?}, given twice {twice}, facets \
-         {facets}"
+         {facets:?}"
     );
     let moved: Vec<String> = moved.into_iter().map(|(_, m)| m).collect();
     assert!(moved.is_empty(), "{}", moved.join("\n"));
@@ -397,4 +402,38 @@ fn a_datatype_restriction_beside_a_doubled_complement_reads_the_same_in_either_o
             "{facet}: as written, then reversed"
         );
     }
+}
+
+/// Spec ([`read`]): valid OWL 2 DL, `ClassAssertion(DataAllValuesFrom(ex:p
+/// DatatypeRestriction(xsd:integer xsd:minInclusive 0)) _:i)`, whose datatype restriction is
+/// reached only through the anonymous individual's class assertion, is read the same in either
+/// order of its statements, the facet's statement first or last: nothing left out, the same
+/// axioms kept. Each order's reading is printed.
+#[test]
+fn a_datatype_restriction_reached_by_an_anonymous_individual_reads_the_same_in_either_order() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        "ex:p a owl:DatatypeProperty .
+        _:i a _:c .
+        _:c a owl:Restriction ; owl:onProperty ex:p ; owl:allValuesFrom _:r .
+        _:r a rdfs:Datatype ; owl:onDatatype xsd:integer ; owl:withRestrictions ( _:f ) .
+        _:f xsd:minInclusive 0 .",
+    );
+    let reversed: Vec<Statement> = statements.iter().rev().copied().collect();
+    let [written, backwards] = [&statements, &reversed].map(|order| reading(order, &table));
+    eprintln!(
+        "VALID as written: left out {:?}; kept {:?}",
+        written.0, written.1
+    );
+    eprintln!(
+        "VALID reversed: left out {:?}; kept {:?}",
+        backwards.0, backwards.1
+    );
+    assert_eq!(written, backwards, "as written, then reversed");
+    assert!(
+        written.0.is_empty(),
+        "valid input, nothing left out: {:?}",
+        written.0
+    );
 }
