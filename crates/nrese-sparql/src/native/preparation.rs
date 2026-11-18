@@ -24,10 +24,7 @@ impl Context<'_> {
                     if patterns.iter().any(|triple| self.is_spatial(triple)) {
                         return Some("computed-spatial-relation");
                     }
-                    patterns
-                        .iter()
-                        .any(search::invokes_search)
-                        .then_some("store.search_scope")
+                    search::invokes_search(patterns).then_some("store.search_scope")
                 }
                 Node::Pattern(GraphPattern::Service { name, .. }) if vectors::is_search(name) => {
                     Some("store.search_scope")

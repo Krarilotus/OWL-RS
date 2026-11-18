@@ -674,6 +674,26 @@ mod tests {
     use crate::{QueryOptions, QueryResults, ResultCache, evaluate_query};
 
     #[test]
+    fn output_keys_preserve_blank_pattern_kind() {
+        // Spec: Whole-output caching preserves the term kinds that operator
+        // recognition can distinguish, while blank node renaming shares a key.
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let snapshot = engine.snapshot();
+        let options = QueryOptions {
+            result_cache: Some(std::sync::Arc::new(ResultCache::new(1 << 20))),
+            ..QueryOptions::default()
+        };
+        let key = |object| {
+            let query = SparqlParser::new()
+                .parse_query(&format!("SELECT ?s WHERE {{ ?s <urn:ex:p> {object} }}"))
+                .unwrap();
+            super::output_key(&snapshot, &query, &options, "text/csv", b"").unwrap()
+        };
+        assert_ne!(key("?term"), key("_:term"));
+        assert_eq!(key("_:term"), key("_:renamed"));
+    }
+
+    #[test]
     fn scoped_and_plain_merges_have_distinct_keys_on_the_same_snapshot() {
         // Spec: With the same snapshot, query and FROM graphs, adding the inferred
         // layer changes the cache key of the default graph merge.
