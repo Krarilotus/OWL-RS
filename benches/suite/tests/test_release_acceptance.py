@@ -1182,6 +1182,36 @@ class Tradeoffs(Scratch):
                 self.assertEqual((policy.tradeoffs, policy.exceptions), ([], []))
                 self.assertTrue(any("an array of tables" in e for e in policy.errors), policy.errors)
 
+    def test_an_entry_whose_value_has_another_type_is_refused_one_message_per_fault_never_raised(self):
+        # Spec (18 Nov 2026): every key of every kind is read by its type before any use, so a malformed
+        # entry makes the file an error with one message per fault and never raises (this loader also
+        # decides fast.py's absences). Each case raised, or loaded what it shouldn't, before, but the
+        # side's and the approval's, checked already and kept as the one read for every kind.
+        auth = 'approved = "2026-11-09"\nby = "the maintainer"\nreason = "r"\n' + QUOTE
+        win = 'pays_with = { case = "kernel-intersect", dimension = "time/triangles" }\n'
+        loss = '[[tradeoff]]\ncase = "lab-olympics"\ndimension = "time/q06"\n'
+        for label, text, faults in (
+                ("an outcome that is a list", exception().replace('"wrong"', '["wrong"]'), 1),
+                ("a case that is a list, and an outcome too", exception().replace('"lab-olympics"', '["x"]')
+                 .replace('"wrong"', '["wrong"]'), 2),
+                ("a max no float holds", '[[emerged]]\ncase = "x"\ndimension = "time/a"\nmax = 1' + "0" * 400 + "\n" + auth, 1),
+                ("a baseline that is a list", '[[emerged]]\ncase = "x"\ndimension = "time/a"\nmax = 2.0\nagainst = ["main"]\n'
+                 + auth, 1),
+                ("a win named by a list", loss + "max_ratio = 1.1\n" + win.replace('"kernel-intersect"', '["k"]') + auth, 1),
+                ("a bound that bounds nothing", loss + "max_ratio = inf\n" + win + auth, 1),
+                ("a baseline misspelt", loss + 'against = "mian"\nmax_ratio = 1.1\n' + win + auth, 1),
+                ("a side that is a table", absence(side_toml="{ a = 1 }"), 1),
+                ("a bound past the digit limit", loss + "max_ratio = 0x" + "f" * 4000 + "\n" + win + auth, 1),
+                ("an integer the TOML reader can't convert", loss + "max_ratio = 1" + "0" * 4300 + "\n" + win + auth, 1),
+                ("a case missing and an outcome that is a list",
+                 exception().replace('case = "lab-olympics"\n', "").replace('"wrong"', '["wrong"]'), 2),
+                ("an approval that is a time", exception().replace('approved = "2026-11-09"', "approved = 2026-11-09T10:00:00"), 1)):
+            with self.subTest(label):
+                # a valid exception beside it: discarded with the file
+                policy = gate_module.load_policy(APPROVER + text + exception(case="lab-sibling"))
+                self.assertEqual((policy.tradeoffs, policy.exceptions, policy.absences, policy.emerged, len(policy.errors)),
+                                 ([], [], (), (), faults), policy.errors)
+
     def test_a_confirmed_loss_blocks_unless_an_approved_trade_off_with_its_win_covers_it(self):
         self.assertEqual(self.verdict().returncode, 1)
         done = self.verdict(self.entry())
@@ -1199,6 +1229,62 @@ class Tradeoffs(Scratch):
                 done = self.verdict(f'approver = "{name}"\n' + self.entry(by=name))
                 self.assertIn(f"approver {name!r};", done.stdout)
 
+    # An accepted row: the reading the approver accepted for it.
+    ROW = '{ row = 17, case = "lab-olympics", dimension = "time/q06", ratio = 1.08, interval = [1.05, 1.11] }'
+
+    def known(self, rows: str = ROW) -> str:
+        return ('[[accepted]]\nrelease = "1.5"\nagainst = "main"\nbaseline_commit = "928100bdc095195ae515"\n'
+                'tree = "180860fbadc7"\napproved = "2026-11-17"\n'
+                f'by = "the maintainer"\nreason = "r"\nquote = "q"\nsource = "s"\nrows = [{rows}]\n')
+
+    def test_an_accepted_row_is_named_beside_its_flag_and_the_flag_still_blocks(self):
+        # Spec (18 Nov 2026): beside a row accepted for a release the report prints the reading
+        # accepted and this run's; the gate derives nothing from it (no tolerance), and it names the row
+        # only against its baseline.
+        done = self.verdict(self.known())
+        self.assertEqual(done.returncode, 1, f"SPEC an accepted row waived its loss\n{done.stdout}")
+        flag = {side: next(line for line in done.stdout.splitlines()
+                           if line.startswith(f"- **confirmed loss**: lab-olympics against {side}"))
+                for side in ("main", "base")}
+        self.assertIn("; known, accepted for 1.5, row 17: 1.08 [1.05, 1.11] on tree 180860fbadc7 against main at "
+                      "928100bdc095", flag["main"])
+        self.assertRegex(flag["main"], r"; now 1\.0[6-9]\d \[")
+        self.assertNotIn("known", flag["base"])
+
+    def test_an_accepted_row_below_the_step_shows_this_runs_medians_beside_the_reading_accepted(self):
+        # Spec (review r1, finding 2): below the counter's step the ratio is the step's midpoint on both
+        # sides, so the note shows the medians, unit and step this run read, beside the reading accepted.
+        r = {"status": "below resolution", "base": 0.0006, "new": 0.0007, "unit": "ms", "step": 0.001, "ratio": 1.0,
+             "ci": [1.0, 1.0]}
+        policy = gate_module.load_policy(APPROVER + self.known())
+        note = gate_module.known_note(policy, "main", "lab-olympics", "time/q06", r)
+        self.assertIn("; now below resolution: 0.0006 -> 0.0007 ms, step 0.001; known, accepted for 1.5, row 17", note)
+        self.assertIn("now no reading in the report;", gate_module.known_note(policy, "main", "lab-olympics",
+                                                                              "time/q06", {"ratio": "x", "ci": [1]}))
+
+    def test_an_accepted_entry_lists_its_rows_and_one_of_another_shape_is_refused(self):
+        # Spec: a row needs its number, case, dimension, and its ratio within its interval; a case and
+        # dimension listed twice against one baseline is ambiguous. Each makes the file an error, so
+        # it lists nothing (and accepts nothing else).
+        policy = gate_module.load_policy(APPROVER + self.known())
+        self.assertEqual(([k["row"] for k in getattr(policy, "accepted", ())], policy.errors), ([17], []))
+        for label, rows in (("a ratio outside its interval", self.ROW.replace("1.08", "1.2")),
+                            ("no interval", self.ROW.replace(", interval = [1.05, 1.11]", "")),
+                            ("a row listed twice", f"{self.ROW}, {self.ROW.replace('17', '18')}"),
+                            ("no rows", "")):
+            with self.subTest(label):
+                policy = gate_module.load_policy(APPROVER + self.known(rows))
+                self.assertEqual((policy.accepted, len(policy.errors)), ((), 1), policy.errors)
+        # The entry itself: a baseline that is no name (TOML gives a list), a ratio no float holds, a
+        # release over two lines, a key it doesn't have (a tolerance). Each is refused, never raised.
+        for label, text in (("a list as the baseline", self.known().replace('against = "main"', 'against = ["main"]')),
+                            ("a ratio no float holds", self.known(self.ROW.replace("ratio = 1.08", "ratio = 1" + "0" * 400))),
+                            ("a release over two lines", self.known().replace('release = "1.5"', 'release = "1.5\\nx"')),
+                            ("a key it doesn't have", self.known() + "max_ratio = 1.1\n")):
+            with self.subTest(label):
+                policy = gate_module.load_policy(APPROVER + text + exception())
+                self.assertEqual((policy.accepted, policy.exceptions, len(policy.errors)), ((), [], 1), policy.errors)
+
     def test_the_trees_policy_names_gated_rows_and_a_malformed_entry_is_refused(self):
         # A malformed file makes every verdict NOT PASSED; a trade-off whose loss or win names no
         # row the gate judges covers nothing, and the loss it was approved for blocks.
@@ -1211,6 +1297,13 @@ class Tradeoffs(Scratch):
                 family = gate_module.family_of(catalog, [case])
                 self.assertTrue(any(gate_module.hypothesis(s, case, dimension_) in family for s in sides),
                                 f"{case} {dimension_}: no row the gate judges ({t['reason']})")
+        # An accepted row names a case the gate runs, and one of its rows where the catalogue declares
+        # them (a workload's, as watdiv's, come from its query set when it runs: `time/_` here).
+        for k in policy.accepted:
+            family = gate_module.family_of(catalog, [k["case"]])
+            self.assertTrue(family, f"row {k['row']}: {k['case']} is no case the gate runs")
+            if not (k["dimension"].startswith("time/") and gate_module.hypothesis(k["against"], k["case"], "time/_") in family):
+                self.assertIn(gate_module.hypothesis(k["against"], k["case"], k["dimension"]), family, f"row {k['row']}")
         bad = gate_module.load_policy('[[tradeoff]]\ncase = "x"\ndimension = "time/q"\nmax_ratio = 1.1\n')
         self.assertEqual(bad.tradeoffs, [])
         self.assertIn("missing approved, by, pays_with, quote, reason, source", bad.errors[0])

@@ -1734,9 +1734,9 @@ class BelowResolution(unittest.TestCase):
                 f'[[emerged]]\ncase = "lab-olympics"\ndimension = "time/prepare"\nmax = {limit}\n'
                 'approved = "2026-11-14"\nby = "the maintainer"\nreason = "r"\nquote = "q"\nsource = "s"\n')
         # TOML `true` is Python's 1: no limit the owner wrote.
-        for bad in ("true", "0", "-1.0", "nan", "inf"):
+        for bad, read in (("true", "True"), ("0", "0"), ("-1.0", "-1.0"), ("nan", "nan"), ("inf", "inf")):
             with self.subTest(max=bad):
-                self.assertEqual(entry(bad).errors, ["emerged 1: max must be a finite number above 0"])
+                self.assertEqual(entry(bad).errors, [f"emerged 1: max: a finite number above 0, not {read}"])
         self.assertEqual(entry(5.0).errors, [])
         passed, text = gate_module.verdict([summary], Rounds.W3C, Rounds.GUARDS, entry(5.0))
         self.assertTrue(passed, text)
@@ -1766,6 +1766,26 @@ class BelowResolution(unittest.TestCase):
         summary, blocks = run({"read": [10.0, 10.1, 9.9, 10.0, 10.2]})
         self.assertEqual(len(blocks), 1, summary["blocking"])
         self.assertIn("no measured time/wall covers it", blocks[0])
+
+    def test_a_row_accepted_below_the_step_shows_this_runs_medians_and_a_report_without_comparisons_raises_nothing(self):
+        # Spec (accepted rows, 18 Nov 2026): beside a row decided below the counter's step that the
+        # policy accepted for a release, the verdict prints this run's medians, unit and step; a part
+        # whose report holds no comparisons reads "no reading in the report", never a raise.
+        summary = run_gate(passes(lambda side, n: [record(samples={"wall": [300.0, 301.0, 299.5, 300.2, 300.4],
+                                                                   "prepare": [0.0] * 5})], blocks=3))
+        policy = gate_module.load_policy(
+            'approver = "the maintainer"\n[[accepted]]\nrelease = "1.5"\nagainst = "main"\nbaseline_commit = "928100bdc095"\n'
+            'tree = "180860fbadc7"\napproved = "2026-11-15"\nby = "the maintainer"\nreason = "r"\nquote = "q"\nsource = "s"\n'
+            'rows = [{ row = 9, case = "lab-olympics", dimension = "time/prepare", ratio = 1.5, interval = [1.2, 1.8] }]\n')
+        self.assertEqual(policy.errors, [])
+
+        def line(part):
+            text = gate_module.verdict([part], Rounds.W3C, Rounds.GUARDS, policy)[1]
+            return next(line for line in text.splitlines()
+                        if line.startswith("- decided below the counter's step: lab-olympics against main: time/prepare"))
+        self.assertRegex(line(summary), r"; now below resolution: 0 -> 0 ms, step [\d.e-]+; known, accepted for 1\.5, row 9: ")
+        summary["comparisons"] = None
+        self.assertIn("; now no reading in the report; known, accepted for 1.5, row 9: ", line(summary))
 
     def test_only_a_case_counting_live_bytes_declares_the_live_peak(self):
         # Spec: --count-allocations alone counts calls and bytes, as the

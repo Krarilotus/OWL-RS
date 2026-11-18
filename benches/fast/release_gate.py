@@ -23,6 +23,7 @@ Each subcommand exits 0 only when its part passes; `verdict` only when every par
 from __future__ import annotations
 
 import argparse
+import datetime
 import fnmatch
 import hashlib
 import json
@@ -794,6 +795,10 @@ TRADEOFF_KEYS = {"case", "dimension", "max_ratio", "pays_with"} | AUTHORITY_KEYS
 EXCEPTION_KEYS = {"case", "outcome"} | AUTHORITY_KEYS
 ABSENCE_KEYS = {"side", "port"} | AUTHORITY_KEYS  # and its scope: `cases` or `pattern`, one of them
 EMERGED_KEYS = {"case", "dimension", "max"} | AUTHORITY_KEYS
+# Rows the approver accepted for a release with nothing that pays for them: the reading accepted,
+# printed beside the row's flag. The verdict derives nothing from it; the flag stands.
+ACCEPTED_KEYS = {"release", "against", "baseline_commit", "tree", "rows"} | AUTHORITY_KEYS
+ACCEPTED_ROW_KEYS = {"row", "case", "dimension", "ratio", "interval"}
 # The outcomes the bar forbids, which only an owner exception accepts: a wrong answer. A declared
 # limit (memory-limit, gave-up, timeout, unsupported) blocks where a baseline completes (compare_case)
 # and is named where none does; it is neither a wrong answer nor a loss.
@@ -809,18 +814,61 @@ class Policy(NamedTuple):
     absences: tuple[dict, ...] = ()
     emerged: tuple[dict, ...] = ()
     approver: str = ""
+    accepted: tuple[dict, ...] = ()   # one per row, its entry's release, baseline, tree and approval in it
 
 
 NO_POLICY = Policy([], [], [])
 
 
 def authority_error(what: str, e: dict, approver: str) -> str | None:
+    """An entry by another name than the file's approver (its keys' types read before, shape_errors)."""
     if e["by"] != approver:
         return f"{what}: by {e['by']!r}: only the file's approver, {approver!r}, approves what the bar forbids"
-    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(e["approved"])) or not all(
-            isinstance(e[k], str) and e[k].strip() for k in ("reason", "quote", "source")):
-        return f"{what}: an approval date (YYYY-MM-DD), a reason, the approver's quote and its source are required"
     return None
+
+
+def is_name(v) -> bool:
+    return isinstance(v, str) and bool(v.strip())
+
+
+def is_baseline(v) -> bool:
+    return isinstance(v, str) and v in cases_registry.BASELINES
+
+
+# The type each key of an entry must have, whatever its kind, read once before any use (a membership,
+# a comparison, a format, a key), so that a malformed entry is an error, one message per fault, and
+# never a raise: this loader also decides fast.py's absences.
+KEY_SHAPES = {
+    "by": (is_name, "a name"), "reason": (is_name, "a text"), "quote": (is_name, "a text"), "source": (is_name, "a text"),
+    "approved": (lambda v: isinstance(v, (str, datetime.date)) and not isinstance(v, datetime.datetime)
+                 and bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(v))), "a date (YYYY-MM-DD)"),
+    "case": (is_name, "a name"), "dimension": (is_name, "a name"), "outcome": (is_name, "a name"),
+    "port": (is_name, "a text"), "pattern": (is_name, "a pattern"),
+    "against": (is_baseline, "a baseline (base, main)"), "side": (is_baseline, "a baseline (base, main)"),
+    "cases": (lambda v: isinstance(v, list) and bool(v) and all(map(is_name, v)), "a list of case names"),
+    "max_ratio": (lambda v: number(v) and v > 1, "a finite number above 1"),
+    "max": (lambda v: number(v) and v > 0, "a finite number above 0"),
+    "pays_with": (lambda v: isinstance(v, dict) and set(v) == {"case", "dimension"} and all(map(is_name, v.values())),
+                  "the case and dimension of the win"),
+    "release": (lambda v: isinstance(v, str) and bool(re.fullmatch(r"[\w.+-]+", v)), "one word"),
+    "baseline_commit": (lambda v: isinstance(v, str) and bool(re.fullmatch(r"[0-9a-f]{7,40}", v)), "a commit"),
+    "tree": (lambda v: isinstance(v, str) and bool(re.fullmatch(r"[0-9a-f]{7,40}", v)), "a tree"),
+}
+
+
+def shown(v) -> str:
+    """V for a message, never a raise: an integer past Python's digit limit can't be printed."""
+    if type(v) is int and abs(v) >= 10 ** 40:
+        return f"an integer of {v.bit_length()} bits"
+    text = repr(v)
+    return text if len(text) <= 80 else f"a {type(v).__name__} of {len(text)} characters"
+
+
+def shape_errors(what: str, e: dict, keys: set) -> list[str]:
+    """One message per fault of E: each of KEYS missing, each key whose value hasn't its type (KEY_SHAPES)."""
+    missing = [f"{what}: missing {', '.join(sorted(keys - set(e)))}"] if keys - set(e) else []
+    return missing + [f"{what}: {k}: {why}, not {shown(e[k])}" for k, (ok, why) in KEY_SHAPES.items()
+                      if k in e and not ok(e[k])]
 
 
 def load_policy(text: str) -> Policy:
@@ -831,41 +879,40 @@ def load_policy(text: str) -> Policy:
     the cases (`cases`, or a `pattern` of their names) a baseline (`side`) isn't compared on, why,
     and the `port` planned to compare them. An emerged entry names a case, a dimension, optionally
     the baseline (`against`), and the largest candidate median (`max`, in the dimension's unit) a
-    cost appearing from below the counter's step may reach. Each carries the approval of the file's
+    cost appearing from below the counter's step may reach. An accepted entry names the rows the
+    approver accepted for a `release` against a baseline (`against`, at `baseline_commit`): each row's
+    number in the table accepted, its case, dimension, and the ratio and interval read on the entry's
+    `tree`. Each carries the approval of the file's
     `approver`: `approved` (date), `by`, `reason`, `quote` (the approver's words) and `source`. A file
     from before `approver` is read as approved by its entries' one name; two names are an error."""
     try:
         data = tomllib.loads(text)
-    except tomllib.TOMLDecodeError as error:
-        return Policy([], [], [f"not TOML: {error}"])
-    tables = {"tradeoff", "exception", "absence", "emerged"}
-    errors = [f"unknown table {k!r} (tradeoff, exception, absence, emerged)"
+    except (tomllib.TOMLDecodeError, ValueError) as error:   # ValueError: an integer past Python's digit limit
+        return Policy([], [], [f"not TOML: {str(error)[:200]}"])
+    tables = {"tradeoff", "exception", "absence", "emerged", "accepted"}
+    errors = [f"unknown table {k!r} (tradeoff, exception, absence, emerged, accepted)"
               for k in sorted(set(data) - tables - {"approver"})]
     tradeoffs, exceptions = data.get("tradeoff", []), data.get("exception", [])
-    absences, emerged = data.get("absence", []), data.get("emerged", [])
+    absences, emerged, known = data.get("absence", []), data.get("emerged", []), data.get("accepted", [])
     for key, entries in (("tradeoff", tradeoffs), ("exception", exceptions), ("absence", absences),
-                         ("emerged", emerged)):
+                         ("emerged", emerged), ("accepted", known)):
         if not (isinstance(entries, list) and all(isinstance(e, dict) for e in entries)):
             errors.append(f"{key}: an array of tables ([[{key}]]), not {type(entries).__name__}")
     if errors:
         return Policy([], [], errors)
-    names = {e["by"] for e in tradeoffs + exceptions + absences + emerged if isinstance(e.get("by"), str)}
+    names = {e["by"] for e in tradeoffs + exceptions + absences + emerged + known if isinstance(e.get("by"), str)}
     approver = data.get("approver", next(iter(names)) if len(names) == 1 else None)
     if (names or "approver" in data) and not (isinstance(approver, str) and approver.strip()):
         return Policy([], [], ["the file's approver: an `approver` name, or in a file from before it its entries' "
                                f"one name, not {data.get('approver')!r} and {sorted(names)}"])
     for i, e in enumerate(tradeoffs, start=1):
-        if missing := TRADEOFF_KEYS - set(e):
-            errors.append(f"trade-off {i}: missing {', '.join(sorted(missing))}")
+        if bad := shape_errors(f"trade-off {i}", e, TRADEOFF_KEYS):
+            errors += bad
         elif error := authority_error(f"trade-off {i}", e, approver):
             errors.append(error)
-        elif not (isinstance(e["max_ratio"], (int, float)) and e["max_ratio"] > 1):
-            errors.append(f"trade-off {i}: max_ratio must be a number above 1")
-        elif not (isinstance(e["pays_with"], dict) and {"case", "dimension"} <= set(e["pays_with"])):
-            errors.append(f"trade-off {i}: pays_with needs the case and dimension of the win")
     for i, e in enumerate(exceptions, start=1):
-        if missing := EXCEPTION_KEYS - set(e):
-            errors.append(f"exception {i}: missing {', '.join(sorted(missing))}")
+        if bad := shape_errors(f"exception {i}", e, EXCEPTION_KEYS):
+            errors += bad
         elif error := authority_error(f"exception {i}", e, approver):
             errors.append(error)
         elif e["outcome"] not in BAR_OUTCOMES:
@@ -873,29 +920,73 @@ def load_policy(text: str) -> Policy:
                           f"{', '.join(sorted(BAR_OUTCOMES))} (a declared limit needs none)")
     for i, e in enumerate(absences, start=1):
         scope = [k for k in ("cases", "pattern") if k in e]
-        if missing := ABSENCE_KEYS - set(e):
-            errors.append(f"absence {i}: missing {', '.join(sorted(missing))}")
+        if bad := shape_errors(f"absence {i}", e, ABSENCE_KEYS):
+            errors += bad
         elif error := authority_error(f"absence {i}", e, approver):
             errors.append(error)
-        elif not (isinstance(e["side"], str) and e["side"] in cases_registry.BASELINES
-                  and isinstance(e["port"], str) and e["port"].strip()):
-            errors.append(f"absence {i}: a baseline (base, main) and the port planned to compare it")
-        elif not (scope in (["cases"], ["pattern"]) and (
-                isinstance(e.get("pattern"), str) and e["pattern"].strip() or
-                isinstance(e.get("cases"), list) and e["cases"] and all(isinstance(c, str) for c in e["cases"]))):
+        elif scope not in (["cases"], ["pattern"]):
             errors.append(f"absence {i}: its cases: a list (`cases`) or a pattern of their names (`pattern`), one")
     for i, e in enumerate(emerged, start=1):
-        if missing := EMERGED_KEYS - set(e):
-            errors.append(f"emerged {i}: missing {', '.join(sorted(missing))}")
+        if bad := shape_errors(f"emerged {i}", e, EMERGED_KEYS):   # TOML true is no limit: `max` a number, not a bool
+            errors += bad
         elif error := authority_error(f"emerged {i}", e, approver):
             errors.append(error)
-        elif (isinstance(e["max"], bool) or not isinstance(e["max"], (int, float))
-              or not (math.isfinite(e["max"]) and e["max"] > 0)):   # TOML true is no limit
-            errors.append(f"emerged {i}: max must be a finite number above 0")
-        elif "against" in e and e["against"] not in cases_registry.BASELINES:
-            errors.append(f"emerged {i}: against: a baseline (base, main)")
+    rows = []
+    for i, e in enumerate(known, start=1):
+        extra = [f"accepted {i}: unknown {', '.join(sorted(set(e) - ACCEPTED_KEYS))}"] if set(e) - ACCEPTED_KEYS else []
+        if bad := shape_errors(f"accepted {i}", e, ACCEPTED_KEYS) + extra:   # extra: a mistyped key, or a tolerance
+            errors += bad
+        elif error := authority_error(f"accepted {i}", e, approver):
+            errors.append(error)
+        elif not (isinstance(e["rows"], list) and e["rows"] and all(map(accepted_row, e["rows"]))):
+            errors.append(f"accepted {i}: rows: each its number, case, dimension, and ratio within its interval")
+        else:
+            rows += [{**r, **{k: e[k] for k in ACCEPTED_KEYS - {"rows"}}} for r in e["rows"]]
+    if len({(r["against"], r["case"], r["dimension"]) for r in rows}) < len(rows):
+        errors.append("accepted: a case and dimension listed twice against one baseline")
     return Policy([], [], errors) if errors else Policy(tradeoffs, exceptions, [], tuple(absences), tuple(emerged),
-                                                        approver or "")
+                                                        approver or "", tuple(rows))
+
+
+def number(x) -> bool:
+    """A finite number, not a bool; an integer too large for a float is none (math.isfinite raises)."""
+    return (type(x) is int and abs(x) < 2 ** 53) or (type(x) is float and math.isfinite(x))
+
+
+def accepted_row(r) -> bool:
+    """A row of an accepted entry: its number in the table, case, dimension, and the ratio
+    read with its interval [low, high] around it."""
+    return (isinstance(r, dict) and set(r) == ACCEPTED_ROW_KEYS and type(r["row"]) is int and r["row"] > 0
+            and is_name(r["case"]) and is_name(r["dimension"])
+            and number(r["ratio"]) and isinstance(r["interval"], list) and len(r["interval"]) == 2
+            and all(map(number, r["interval"])) and r["interval"][0] <= r["ratio"] <= r["interval"][1])
+
+
+def reading(r) -> str:
+    """A row's reading in this run's report (R, its dimension record): ratio and interval; below the
+    counter's step, its medians, unit and step (its ratio there is the step's midpoint on both sides)."""
+    if not isinstance(r, dict):
+        return "no reading in the report"
+    if r.get("status") in OUTSIDE_FAMILY and all(number(r.get(k)) or r.get(k) is None for k in ("base", "new")):
+        unit = r["unit"] if isinstance(r.get("unit"), str) else "(no unit)"
+        step = f"step {r['step']:g}" if number(r.get("step")) else "no step in the report"
+        return f"{r['status']}: {fmt(r.get('base'))} -> {fmt(r.get('new'))} {unit}, {step}"
+    ci = r.get("ci")
+    if number(r.get("ratio")) and isinstance(ci, list) and len(ci) == 2 and all(map(number, ci)):
+        return f"{r['ratio']:.3f} [{ci[0]:.3f}, {ci[1]:.3f}]"
+    return "no reading in the report"
+
+
+def known_note(policy: Policy, side: str, case: str, dimension_: str, r: dict | None) -> str:
+    """Beside a flag: this run's reading (R, reading()) and the one the approver accepted for the row;
+    '' for a row no accepted entry names."""
+    k = next((k for k in policy.accepted if (k["against"], k["case"], k["dimension"]) == (side, case, dimension_)), None)
+    if k is None:
+        return ""
+    now = f"; now {reading(r)}"
+    return (f"{now}; known, accepted for {k['release']}, row {k['row']}: {k['ratio']} [{k['interval'][0]}, "
+            f"{k['interval'][1]}] on tree {k['tree']} against {k['against']} at {k['baseline_commit'][:12]} "
+            f"(approved {k['approved']})")
 
 
 def emerged_accepted(policy: Policy, e: dict) -> dict | None:
@@ -2919,7 +3010,17 @@ def rounds_of(reports: list[dict]) -> list[list[dict]]:
 
 
 def dimension_in(report: dict, side: str, case: str, dimension: str) -> dict | None:
-    return report.get("comparisons", {}).get(side, {}).get(case, {}).get("dimensions", {}).get(dimension)
+    """The row's record in REPORT, None where the report has none or holds another shape there."""
+    x = report.get("comparisons") if isinstance(report, dict) else None
+    for key in (side, case, "dimensions", dimension):
+        x = x.get(key) if isinstance(x, dict) else None
+    return x if isinstance(x, dict) else None
+
+
+def latest(parts: list, side: str, case: str, dimension: str) -> dict | None:
+    """The row's record in the last round that has it."""
+    found = [r for rounds in parts for report in rounds if (r := dimension_in(report, side, case, dimension)) is not None]
+    return found[-1] if found else None
 
 
 CONFIRM_BLOCKS = (2, 30)  # blocks of a confirmation round: its cases' calibrated blocks, within these
@@ -3009,12 +3110,13 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
              + (f"; {len(d['outside'])} more decided below the counter's resolution, outside it" if d["outside"] else "")
              + ".", ""]
     lines += [f"- decided below the counter's step: {h.split('|')[1]} against {h.split('|')[0]}: {h.split('|', 2)[2]}: "
-              f"{', '.join(s)}" for h, s in d["outside"].items()]
+              f"{', '.join(s)}{known_note(policy, *h.split('|', 2), latest(parts, *h.split('|', 2)) if policy.accepted else None)}"
+              for h, s in d["outside"].items()]
     evidence = list(evidence or [])
     lines += [f"- **not the candidate's**: {e}" for e in evidence]
     lines += [f"- **policy**: {POLICY_FILE}: {e}" for e in policy.errors] or [
         f"- policy: {POLICY_FILE}: approver {policy.approver or 'none named'!r}; {len(policy.tradeoffs)} trade-offs, "
-        f"{len(policy.exceptions)} exceptions, {len(policy.absences)} absences, {len(policy.emerged)} emerged"]
+        f"{len(policy.exceptions)} exceptions, {len(policy.absences)} absences, {len(policy.emerged)} emerged, {len(policy.accepted)} accepted rows"]
     known, wrong = known_lines(timed, policy)
     lines += [f"- **wrong answer**: {w}" for w in wrong] + known
     errors = [e for rounds in parts for r in rounds for e in r["errors"]]
@@ -3030,16 +3132,16 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
         # loss neither needs nor gives cover: its interval, too broad to show the loss, says nothing
         # of its size (a 3-block round's is t(2) = 4.30 errors wide). A confirmed loss always has two
         # rounds that showed it (combine_rounds: two p at most ALPHA * PAIR_WEIGHTS[0]); none, none covers it.
-        covers = [accepted(policy.tradeoffs, side, case, dim, r, report.get("comparisons", {}))
-                  for rounds in parts for report in rounds
-                  if (r := dimension_in(report, side, case, dim)) is not None and r.get("status") == "loss shown"]
+        shown = [(r, report) for rounds in parts for report in rounds
+                 if (r := dimension_in(report, side, case, dim)) is not None and r.get("status") == "loss shown"]
+        covers = [accepted(policy.tradeoffs, side, case, dim, r, report.get("comparisons", {})) for r, report in shown]
         accepted_ = covers[0] if covers and all(covers) else None
         text = f"{case} against {side}: {dim}: p per round {ps}, combined {d['combined'][h]:.3g}"
         if accepted_:
             lines.append(f"- accepted trade-off: {text} (at most {accepted_['max_ratio']}, approved "
                          f"{accepted_['approved']} by {accepted_['by']}, {accepted_['source']})")
         else:
-            blocking_losses.append(text)
+            blocking_losses.append(text + known_note(policy, side, case, dim, shown[-1][0] if shown else None))
     lines += [f"- **confirmed loss**: {t}" for t in blocking_losses]
     # A cost appearing from below the counter's step, in any round: no statistics to wait for.
     blocking_emerged = []
