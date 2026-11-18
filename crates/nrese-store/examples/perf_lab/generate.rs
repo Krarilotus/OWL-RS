@@ -690,7 +690,9 @@ fn ql_memberships(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Exp
 
 /// A small university-like schema and `people` people, and commits that each add a
 /// person with types and links and later remove them: after the last commit the store
-/// holds what it held before, so the closure must too.
+/// holds what it held before, so the closure must too. `schema=N`: N more classes in a
+/// tree of fan 8 under `Person`, which no commit touches; `delete=0`: the adding commits
+/// only.
 fn churn(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
     let (people, changes) = (p.get("people", 200_000), p.get("changes", 1000));
     let sub = rdfs("subClassOf");
@@ -706,6 +708,13 @@ fn churn(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
     nt.t(&ex("advisor"), &rdfs("range"), &ex("Professor"))?;
     nt.t(&ex("advisee"), &owl("inverseOf"), &ex("advisor"))?;
     nt.t(&ex("memberOf"), &rdfs("subPropertyOf"), &ex("worksWith"))?;
+    for c in 0..p.get("schema", 0) {
+        let parent = match c {
+            0 => ex("Person"),
+            c => ex(format!("K{}", (c - 1) / 8)),
+        };
+        nt.t(&ex(format!("K{c}")), &sub, &parent)?;
+    }
     // `violate=1`: students and professors are disjoint, and the last commit makes a
     // student a professor: the OWL 2 RL gate rejects it (cax-dw). `violate=2`: a visitor is
     // faculty or a professor (a union on the right, outside RL) and disjoint from both, and
@@ -739,7 +748,8 @@ fn churn(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
     for i in 0..changes {
         writeln!(out, "INSERT DATA {{ {} }}", statements(i))?;
     }
-    for i in 0..changes {
+    let deletes = changes * p.get("delete", 1).min(1);
+    for i in 0..deletes {
         writeln!(out, "DELETE DATA {{ {} }}", statements(i))?;
     }
     if violate == 1 {
@@ -760,7 +770,10 @@ fn churn(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expect> {
     out.flush()?;
     let mut e = Expect::new();
     e.insert("people".into(), json!(people));
-    e.insert("commits".into(), json!(2 * changes + p.get("existing", 0)));
+    e.insert(
+        "commits".into(),
+        json!(changes + deletes + p.get("existing", 0)),
+    );
     Ok(e)
 }
 
