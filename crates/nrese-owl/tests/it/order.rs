@@ -3,9 +3,9 @@
 
 use nrese_owl::fuzz::Rng;
 use nrese_owl::{Diagnostic, Statement, Term, TermKind, Terms, read};
-use nrese_rdf::BlankNode;
+use nrese_rdf::{BlankNode, Literal, NamedNode};
 
-use super::{EX, Table};
+use super::{EX, Table, XSD, load, rendered};
 
 const OWL: &str = "http://www.w3.org/2002/07/owl#";
 const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
@@ -78,9 +78,11 @@ fn shown(statements: &[Statement], table: &Table) -> String {
 /// name, a restriction without its property, a list without its rest, `owl:onProperties`);
 /// in about half, a structure property given twice, one value a reserved name met nowhere else
 /// and one a plain name (`owl:complementOf`, or a restriction's `owl:someValuesFrom`; `true`
-/// with them); then up to twelve statements over names, reserved names and blank nodes, with
+/// with them); in about half, a datatype restriction with a facet reached only through an
+/// anonymous individual's class assertion, its datatype complement given twice (`true` with
+/// them); then up to twelve statements over names, reserved names and blank nodes, with
 /// OWL's structure predicates.
-fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool) {
+fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool, bool) {
     let mut iri = |ns: &str, local: &str| table.iri_id(&format!("{ns}{local}"));
     let [a, b, c, d, h, p, q] = ["A", "B", "C", "D", "H", "p", "q"].map(|l| iri(EX, l));
     let reserved = [
@@ -119,6 +121,17 @@ fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool) {
         iri(OWL, "complementOf"),
     ];
     let [e, defined_by] = [iri(EX, "E"), iri(RDFS, "isDefinedBy")];
+    let data_restriction = [
+        iri(EX, "dp"),
+        iri(OWL, "DatatypeProperty"),
+        iri(OWL, "allValuesFrom"),
+        iri(OWL, "datatypeComplementOf"),
+        iri(OWL, "onDatatype"),
+        iri(OWL, "withRestrictions"),
+        iri(XSD, "string"),
+        iri(XSD, "integer"),
+        iri(XSD, "minInclusive"),
+    ];
     let types = [
         iri(OWL, "Class"),
         iri(OWL, "Restriction"),
@@ -174,6 +187,37 @@ fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool) {
         };
         triples.extend([[e, sub, t], [t, operator, defined_by], [t, operator, c]]);
     }
+    let facets = rng.one_in(2);
+    if facets {
+        let [
+            dp,
+            data_property,
+            all,
+            complement,
+            on_datatype,
+            with,
+            string,
+            integer,
+            min,
+        ] = data_restriction;
+        let zero =
+            Literal::new_typed_literal("0", NamedNode::new_unchecked(format!("{XSD}integer")));
+        let zero = table.id(zero.into());
+        let [i, cx, rg, fl, f] = ["i", "cx", "rg", "fl", "f"].map(|x| blank(table, x));
+        triples.extend([
+            [dp, ty, data_property],
+            [i, ty, cx],
+            [cx, on_property, dp],
+            [cx, all, rg],
+            [rg, complement, string],
+            [rg, complement, integer],
+            [rg, on_datatype, integer],
+            [rg, with, fl],
+            [fl, first, f],
+            [fl, rest, reserved[3]],
+            [f, min, zero],
+        ]);
+    }
     for _ in 0..rng.below(13) {
         let predicate = pick(rng, &predicates);
         let object = if predicate == ty {
@@ -186,7 +230,7 @@ fn graph(rng: &mut Rng, table: &mut Table) -> (Vec<Statement>, bool) {
     let statements = (triples.into_iter())
         .map(|triple| Statement { triple, graph: 0 })
         .collect();
-    (statements, twice)
+    (statements, twice, facets)
 }
 
 /// `statements` in a random order (Fisher-Yates).
@@ -203,8 +247,10 @@ fn shuffled(statements: &[Statement], rng: &mut Rng) -> Vec<Statement> {
 /// the mapping, a malformed structure, a broken list, syntax not read yet) are the same set
 /// in every order the statements come in. Random small graphs, each with an
 /// `owl:equivalentClass` between two reserved names, the second named by another axiom too,
-/// one structure of each other kind, and in about half a structure property given twice (one
-/// value a reserved name, one a plain one), are each read in their order and in six seeded
+/// one structure of each other kind, in about half a structure property given twice (one
+/// value a reserved name, one a plain one), and in about half a datatype restriction with a
+/// facet reached only through an anonymous individual, its datatype complement given twice,
+/// are each read in their order and in six seeded
 /// others. `NRESE_FUZZ_SEED` (default 0) varies the graphs. A kind or shape the graphs never
 /// reach fails the test, which would state nothing of it; a kind whose set differs is shown by the
 /// fewest statements that still show it, in both orders.
@@ -218,11 +264,12 @@ fn what_the_reader_leaves_out_is_the_same_in_every_order() {
         .unwrap_or(0);
     let mut rng = Rng::new(seed ^ 0x006f_7264_6572);
     let mut table = Table::default();
-    let (mut reached, mut twice) = ([0usize; KINDS.len()], 0);
+    let (mut reached, mut twice, mut facets) = ([0usize; KINDS.len()], 0, 0);
     let mut moved: Vec<(&str, String)> = Vec::new();
     for case in 0..GRAPHS {
-        let (statements, given_twice) = graph(&mut rng, &mut table);
+        let (statements, given_twice, with_facets) = graph(&mut rng, &mut table);
         twice += usize::from(given_twice);
+        facets += usize::from(with_facets);
         for (i, of) in KINDS.iter().enumerate() {
             reached[i] += usize::from(!left_out(&statements, &table, of).is_empty());
         }
@@ -251,11 +298,13 @@ fn what_the_reader_leaves_out_is_the_same_in_every_order() {
     }
     eprintln!(
         "NRESE_FUZZ_SEED={seed}: {GRAPHS} graphs; with each kind: {KINDS:?} {reached:?}; with \
-         a structure property given twice: {twice}"
+         a structure property given twice: {twice}; with a facet through an anonymous \
+         individual: {facets}"
     );
     assert!(
-        reached.iter().all(|&n| n > 0) && twice > 0,
-        "a kind or shape no graph reached: {KINDS:?} {reached:?}, given twice {twice}"
+        reached.iter().all(|&n| n > 0) && twice > 0 && facets > 0,
+        "a kind or shape no graph reached: {KINDS:?} {reached:?}, given twice {twice}, facets \
+         {facets}"
     );
     let moved: Vec<String> = moved.into_iter().map(|(_, m)| m).collect();
     assert!(moved.is_empty(), "{}", moved.join("\n"));
@@ -309,4 +358,43 @@ fn two_statements_outside_the_mapping_are_two_parts_left_out() {
         .filter(|d| matches!(d, Diagnostic::NotOwl { .. }))
         .count();
     assert_eq!(not_owl, 2, "{diagnostics:?}");
+}
+
+/// What `statements`, read in their order, leave out (in words) and the axioms they keep.
+fn reading(statements: &[Statement], table: &Table) -> (Vec<String>, Vec<String>) {
+    let ontology = read(statements, table);
+    let mut left: Vec<String> = (ontology.diagnostics.iter())
+        .filter(|d| d.leaves_out())
+        .map(|d| d.describe(&|t| table.name(t)))
+        .collect();
+    left.sort();
+    (left, rendered(&ontology, table))
+}
+
+/// Spec ([`read`]): a datatype restriction reached only through an anonymous individual's class
+/// assertion, its datatype complement given twice, is read the same in either order of its
+/// statements, the facet's statement first or last: the same parts left out, the same axioms
+/// kept; with a reserved name as the facet and with a plain property.
+#[test]
+fn a_datatype_restriction_beside_a_doubled_complement_reads_the_same_in_either_order() {
+    for facet in ["xsd:minInclusive", "ex:q"] {
+        let mut table = Table::default();
+        let statements = load(
+            &mut table,
+            &format!(
+                "ex:p a owl:DatatypeProperty .
+                _:i a _:c .
+                _:c owl:onProperty ex:p ; owl:allValuesFrom _:r .
+                _:r owl:datatypeComplementOf xsd:string, xsd:integer ;
+                    owl:onDatatype xsd:integer ; owl:withRestrictions ( _:f ) .
+                _:f {facet} 0 ."
+            ),
+        );
+        let reversed: Vec<Statement> = statements.iter().rev().copied().collect();
+        assert_eq!(
+            reading(&statements, &table),
+            reading(&reversed, &table),
+            "{facet}: as written, then reversed"
+        );
+    }
 }
