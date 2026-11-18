@@ -525,7 +525,6 @@ fn owl_bottom_object_property_declared_an_annotation_property_classifies_as_with
                 :H a owl:Class . \
                 :H rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r4 ; owl:someValuesFrom :B ] .";
     let without = irregular_untimed(rest);
-    eprintln!("without: {without:?}");
     let mut wrong = Vec::new();
     for spelling in super::reserved_names::SPELLINGS {
         let declared =
@@ -534,7 +533,7 @@ fn owl_bottom_object_property_declared_an_annotation_property_classifies_as_with
             wrong.push(format!("{spelling}: {declared:?}"));
         }
     }
-    assert!(wrong.is_empty(), "{wrong:#?}");
+    assert!(wrong.is_empty(), "{wrong:#?}\nwithout: {without:?}");
 }
 
 /// Spec (Structural Specification §5.5 and §10: a user IRI declared an annotation property, in

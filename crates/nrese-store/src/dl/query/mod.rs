@@ -888,9 +888,9 @@ fn copied<'a>(
         Some(iri) => id(iri).is_some_and(|p| {
             let typed = id(RDF_TYPE).map(|ty| asserted(any_graph(Some(p), Some(ty), None)));
             let shacl = nrese_owl::is_shacl_property(iri) && equal();
-            let declared =
-                nrese_owl::may_name_annotation(iri) && typed.into_iter().flatten().any(declares);
-            (BUILTIN.contains(&iri) || shacl || declared) && copies(p)
+            let declared = || typed.into_iter().flatten().any(declares);
+            (BUILTIN.contains(&iri) || shacl || (nrese_owl::may_name_annotation(iri) && declared()))
+                && copies(p)
         }),
     })
 }
