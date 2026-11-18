@@ -995,6 +995,144 @@ async fn scoped_reads_refuse_text_search_before_shortcuts() -> TestResult {
 }
 
 #[tokio::test]
+#[ignore = "Preparation does not yet refuse search in an empty optional"]
+async fn scoped_preparation_refuses_search_in_an_empty_optional() -> TestResult {
+    // Spec: An empty OPTIONAL seed does not exempt its local text search from 501.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ VALUES ?s {} OPTIONAL {
+            ?s <http://www.bigdata.com/rdf/search#search> "alpha"
+        } }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "Preparation does not yet refuse search inside an unselected graph"]
+async fn scoped_preparation_refuses_search_in_an_unselected_graph() -> TestResult {
+    // Spec: A local vector search returns 501 even when its GRAPH IRI is
+    // absent from FROM NAMED.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ GRAPH :g2 { SERVICE <urn:nrese:vector:search> {
+             ?s <urn:nrese:vector:near> "[1,0]"^^<urn:nrese:vector:vector>
+         } } }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "Preparation does not yet refuse spatial relations over an empty named list"]
+async fn scoped_preparation_refuses_computed_spatial_over_no_named_graphs() -> TestResult {
+    // Spec: A computed spatial relation returns 501 even when GRAPH ?g has
+    // no named graphs to visit.
+    scoped_preparation_refusal(
+        SCOPED,
+        "{ GRAPH ?g { ?s <http://www.opengis.net/ont/geosparql#sfWithin> ex:box } }",
+        "computed-spatial-relation",
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "Preparation does not yet refuse search in an empty minus operand"]
+async fn scoped_preparation_refuses_search_in_an_empty_minus_operand() -> TestResult {
+    // Spec: MINUS with empty operands still refuses a local text search in its
+    // right operand, even though BIND has no rows on which to run it.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ VALUES ?s {} MINUS { VALUES ?s {} BIND(EXISTS {
+            ?s <http://www.bigdata.com/rdf/search#search> "alpha"
+        } AS ?found) } }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "Preparation does not yet refuse search inside exists over empty input"]
+async fn scoped_preparation_refuses_search_in_exists_over_empty_input() -> TestResult {
+    // Spec: A correlated EXISTS filter with no incoming rows still refuses its
+    // local text search.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ VALUES ?outer {} FILTER EXISTS {
+            ?s <http://www.bigdata.com/rdf/search#search> "alpha"
+            FILTER (?s = ?outer)
+        } }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "Preparation does not yet refuse search in a subquery joined to empty input"]
+async fn scoped_preparation_refuses_search_in_a_subquery_joined_to_empty_input() -> TestResult {
+    // Spec: A subquery's local text search returns 501 even when the other join
+    // operand has no rows.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ VALUES ?s {} { SELECT ?s WHERE {
+            ?s <http://www.bigdata.com/rdf/search#search> "alpha"
+        } } }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "Preparation does not yet refuse search in a plan request"]
+async fn scoped_preparation_refuses_search_in_a_plan_request() -> TestResult {
+    // Spec: A plan request refuses a local search before evaluating it.
+    scoped_preparation_refusal(
+        "?inference-scope=dataset&explain=plan",
+        r#"{ ?s <http://www.bigdata.com/rdf/search#search> "alpha" }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+async fn scoped_preparation_refusal(options: &str, pattern: &str, problem: &str) -> TestResult {
+    let app = app(StoreConfig::default(), false)?;
+    insert(&app, SPLIT).await?;
+    let reply = select(&app, &[], options, "?s", G1, pattern).await?;
+    assert_eq!(reply.code, StatusCode::NOT_IMPLEMENTED, "{reply:?}");
+    assert_eq!(
+        reply.json()["type"],
+        format!("https://nrese.dev/problems/{problem}"),
+        "{reply:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_preparation_leaves_remote_service_bodies_to_the_endpoint() -> TestResult {
+    // Spec: A scoped plan leaves the remote SERVICE body to its endpoint, even
+    // when the body contains search or spatial algebra.
+    let app = app(StoreConfig::default(), false)?;
+    insert(&app, G1_FACT).await?;
+    let reply = select(
+        &app,
+        &[],
+        "?inference-scope=dataset&explain=plan",
+        "?s",
+        G1,
+        r#"{ SERVICE <urn:ex:remote> {
+            ?s <http://www.bigdata.com/rdf/search#search> "alpha" .
+            ?s <http://www.opengis.net/ont/geosparql#sfWithin> ex:box .
+            SERVICE <urn:nrese:vector:search> {
+                ?v <urn:nrese:vector:near> "[1,0]"^^<urn:nrese:vector:vector>
+            }
+        } }"#,
+    )
+    .await?;
+    assert_eq!(reply.code, StatusCode::OK, "{reply:?}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn scoped_reads_refuse_global_vector_search() -> TestResult {
     // Spec: A scoped vector search in global mode returns 501 and names the search setting.
     let app = app(StoreConfig::default(), false)?;
