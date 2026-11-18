@@ -132,6 +132,8 @@ pub struct DlConfig {
     pub max_join_steps: Option<usize>,
     /// What a classification answers on an input outside OWL 2 DL ([`OutsideProfile`]).
     pub outside_profile: OutsideProfile,
+    /// Whether an exact read first refutes candidates by one model of the premise (off: tests).
+    pub model_labels: bool,
 }
 
 impl Default for DlConfig {
@@ -152,6 +154,7 @@ impl Default for DlConfig {
             max_join: routes.max_join,
             max_join_steps: routes.max_join_steps,
             outside_profile: OutsideProfile::default(),
+            model_labels: false,
         }
     }
 }

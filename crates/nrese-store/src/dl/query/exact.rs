@@ -206,6 +206,122 @@ fn row_tests(
     tests_of(o, snapshot, &atoms, ids, data_properties, paths).map_err(Entailed::Unknown)
 }
 
+/// Of the gap's `n` rows, those one model of the premise refutes, for `?x a C` atoms alone (no
+/// row's test adds to the premise): one test `C(a)`, `C` not in `a`'s label (*Direct Semantics*
+/// §2.5). No model in the DL limits and `deadline`, not `Consistent`, or a part left out: none.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the request's limits travel with the rows"
+)]
+pub(super) fn refuted_by_labels(
+    store: &StoreService,
+    snapshot: &Snapshot,
+    analysis: &Analysis,
+    variables: &[Variable],
+    n: usize,
+    row: &dyn Fn(usize) -> Vec<Option<Term>>,
+    cancellation: &CancellationToken,
+    deadline: Deadline,
+    memory: &nrese_exec::Envelope,
+) -> Vec<bool> {
+    use nrese_dl::tableau::{Answer, Cancel, Label, Want};
+    let config = &store.config().dl;
+    let stop = || cancellation.is_cancelled() || deadline.passed();
+    let none = Vec::new;
+    if stop() {
+        return none();
+    }
+    let shape = analysis.shape.as_ref().filter(|s| {
+        s.patterns.iter().all(|t| {
+            matches!(&t.predicate, NamedNodePattern::NamedNode(p) if p.as_str() == RDF_TYPE)
+                && matches!(&t.subject, TermPattern::Variable(x) if s.projected.contains(x))
+                && matches!(t.object, TermPattern::NamedNode(_))
+        })
+    });
+    let Some((shape, Ok(base))) = shape.map(|s| (s, ontology_at(store, snapshot))) else {
+        return none();
+    };
+    let mut scratch = nrese_dl::memory::Scratch::new(Some(memory));
+    let atoms_bytes = n * (size_of::<Option<(u64, u64)>>() + 2 * size_of::<u64>() + 1);
+    let premise = || nrese_dl::memory::ontology_bytes(base.value()) + atoms_bytes;
+    if consistency::left_out(base.value()).is_some() || scratch.charge(premise).is_err() {
+        return none();
+    }
+    let mut ontology = (**base.value()).clone();
+    let (ids, data_properties) = (Ids::of(snapshot), data_properties(&ontology));
+    let mut atoms = Vec::with_capacity(n);
+    for i in 0..n {
+        if i % 1024 == 0 && stop() {
+            return none();
+        }
+        let tests = row_tests(
+            &mut ontology,
+            snapshot,
+            (shape, variables),
+            &row(i),
+            ids,
+            &data_properties,
+            &mut Vec::new(),
+        );
+        atoms.push(match tests.as_deref() {
+            Ok([Test::Axiom(Axiom::ClassAssertion(c, a))]) => match ontology.classes.get(c.0) {
+                ClassExpr::Class(c) => Some((*c, *a)),
+                _ => None,
+            },
+            _ => None,
+        });
+    }
+    let mut both = (Vec::with_capacity(n), Vec::with_capacity(n));
+    both.extend(atoms.iter().flatten().copied());
+    let (mut classes, mut individuals): (Vec<u64>, Vec<u64>) = both;
+    classes.sort_unstable();
+    classes.dedup();
+    individuals.sort_unstable();
+    individuals.dedup();
+    if classes.is_empty() || stop() {
+        return none();
+    }
+    let Some(program) = entailment::compile(&ontology, &classes, &individuals, &mut scratch) else {
+        return none();
+    };
+    // A label's two `Vec<u32>`s hold each class once: the classes' next power of two, 4 at least.
+    let vector = 4 * classes.len().next_power_of_two().max(4);
+    let labels = individuals.len() * (size_of::<Option<Label>>() + 2 * vector);
+    if stop() || scratch.charge(|| labels).is_err() {
+        return none();
+    }
+    let mut run = config.tableau(None, config.memory_per_worker(1));
+    run.deadline = deadline.instant();
+    run.memory = Some(memory.clone());
+    run.cancel = Some(Cancel::from_flag(cancellation.flag()));
+    run.workers = Some(nrese_exec::workers::Workers::current().limited(1));
+    let want = Want {
+        individuals: true,
+        ..Want::default()
+    };
+    let (out, _) = program.consistency_with_base(&run, want, false);
+    let Some(labels) = out.labels.filter(|_| out.answer == Answer::Consistent) else {
+        return none();
+    };
+    let mut refuted = vec![false; n];
+    for (r, atom) in atoms.iter().enumerate() {
+        if r % 1024 == 0 && stop() {
+            return none();
+        }
+        let Some((c, a)) = atom else { continue };
+        let (Ok(ci), Ok(ai)) = (classes.binary_search(c), individuals.binary_search(a)) else {
+            continue;
+        };
+        if let Some(label) = &labels.individuals[ai] {
+            refuted[r] = label.classes.binary_search(&(ci as u32)).is_err();
+        }
+    }
+    if stop() {
+        return none();
+    }
+    refuted
+}
+
 /// The ontology's data properties (an existential value of one is `DataSomeValuesFrom`).
 fn data_properties(o: &Ontology) -> HashSet<u64> {
     let mut out = HashSet::new();

@@ -247,6 +247,11 @@ fn parse_dl(source: &dyn ConfigSource) -> Result<nrese_store::DlConfig> {
             count,
         )?,
         outside_profile,
+        model_labels: super::env_values::parse_bool(
+            source,
+            names::DL_MODEL_LABELS,
+            defaults.model_labels,
+        )?,
     })
 }
 

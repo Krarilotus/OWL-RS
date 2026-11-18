@@ -226,6 +226,7 @@ struct Counts {
     upper: Option<u64>,
     proved: u64,
     refuted: u64,
+    by_labels: u64,
     unresolved: u64,
 }
 
@@ -277,6 +278,7 @@ impl Status {
     fn set_counts(&mut self, c: Counts) {
         self.detail.proved = c.proved;
         self.detail.refuted = c.refuted;
+        self.detail.refuted_by_labels = c.by_labels;
         self.completeness.bounds = c.upper.map(|upper| Bounds {
             lower: c.lower,
             upper,
@@ -1205,26 +1207,75 @@ fn decide_answers(
             let budget = Arc::new(memory.part());
             let mut pair = lower.align(upper, Arc::clone(&budget))?;
             // A query's candidate budget, unlimited where none is set.
-            let limit = store.config().dl.max_candidates.unwrap_or(usize::MAX);
-            let gap = gap::select(
-                &mut pair,
-                limit.saturating_add(super::UNRESOLVED_SHOWN),
-                &budget,
-                cancellation,
-            )?;
+            let config = &store.config().dl;
+            let limit = config.max_candidates.unwrap_or(usize::MAX);
+            // The labels' one deadline: a quarter of what the read has left, the selection included.
+            let labels_deadline = Deadline::after(deadline.within(config.timeout).map(|t| t / 4));
+            // The labels read the whole gap; where it has no room, the capped one, with no labels.
+            let whole = match config.model_labels {
+                true => match gap::select(&mut pair, usize::MAX, &budget, cancellation) {
+                    Err(e) if e.is_memory_limit() || e.is_server_memory_limit() => None,
+                    other => Some(other?),
+                },
+                false => None,
+            };
+            if config.model_labels && whole.is_none() {
+                status.path("capped-gap");
+            }
+            let labelled = whole.is_some();
+            let mut gap = match whole {
+                Some(gap) => gap,
+                None => gap::select(
+                    &mut pair,
+                    limit.saturating_add(super::UNRESOLVED_SHOWN),
+                    &budget,
+                    cancellation,
+                )?,
+            };
+            let variables = pair.variables().to_vec();
+            let refuted = match labelled {
+                true => exact::refuted_by_labels(
+                    store,
+                    &view.lower,
+                    analysis,
+                    &variables,
+                    gap.rows.len(),
+                    &|i| pair.upper_row(gap.rows[i]),
+                    cancellation,
+                    labels_deadline,
+                    memory,
+                ),
+                false => Vec::new(),
+            };
+            // No row past the capped read's first ones is admitted where its batches cost more.
+            let most = |b: &[usize]| b.chunks(64).map(|c| c.iter().sum::<usize>()).max();
+            let prefix = most(&gap.bytes[..limit.min(gap.bytes.len())]);
+            let own = refuted.iter().take(limit).filter(|&&r| !r).count();
+            let (mut rows, mut bytes) = (refuted.iter(), refuted.iter());
+            gap.rows.retain(|_| rows.next() != Some(&true));
+            gap.bytes.retain(|_| bytes.next() != Some(&true));
+            let by_labels = refuted.into_iter().filter(|&r| r).count() as u64;
+            if labelled {
+                gap.keep(limit.saturating_add(super::UNRESOLVED_SHOWN));
+            }
+            let left = gap.total - by_labels;
+            let (admitted, width) = match limit.min(gap.rows.len()) {
+                n if most(&gap.bytes[..n]) > prefix => (own, 1),
+                n => (n, 64),
+            };
             let mut counts = Counts {
                 lower: gap.lower,
                 upper: Some(gap.lower + gap.total),
-                unresolved: gap.total.saturating_sub(limit as u64),
+                refuted: by_labels,
+                by_labels,
+                unresolved: left.saturating_sub(admitted as u64),
                 ..Counts::default()
             };
-            let variables = pair.variables().to_vec();
             let mut why = None;
-            let admitted = limit.min(gap.rows.len());
             pair.reserve_appends(admitted)?;
             // Bounds, candidate production and all batches share the entry deadline.
-            for start in (0..admitted).step_by(64) {
-                let end = (start + 64).min(admitted);
+            for start in (0..admitted).step_by(width) {
+                let end = (start + width).min(admitted);
                 let mut batch_memory = nrese_exec::Reservation::new(&*budget);
                 batch_memory.charge(gap.bytes[start..end].iter().sum())?;
                 let rows: Vec<_> = gap.rows[start..end]
@@ -1261,7 +1312,7 @@ fn decide_answers(
                     }
                 }
             }
-            if gap.total > limit as u64 {
+            if left > admitted as u64 {
                 why.get_or_insert_with(|| Limit::Candidates.reached(limit));
                 for &index in &gap.rows[admitted..] {
                     if status.detail.unresolved.len() == super::UNRESOLVED_SHOWN {

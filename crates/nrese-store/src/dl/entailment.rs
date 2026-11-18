@@ -13,7 +13,7 @@ use nrese_owl::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, On
 use super::consistency::{self, Budget, Verdict};
 
 mod batch;
-pub(crate) use batch::{Batch, Test};
+pub(crate) use batch::{Batch, Test, compile};
 
 /// Whether an axiom (or every axiom of a set) is entailed.
 #[derive(Debug, Clone, PartialEq, Eq)]
