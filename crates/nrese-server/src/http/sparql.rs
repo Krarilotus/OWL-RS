@@ -225,6 +225,7 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
         "candidates": explanation.candidates.map(|c| serde_json::json!({
             "proved": c.proved,
             "refuted": c.refuted,
+            "refuted_by_labels": c.refuted_by_labels,
         })),
         "ql": ql_json(explanation.ql.as_ref()),
         "steps": steps,

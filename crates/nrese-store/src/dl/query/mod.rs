@@ -226,6 +226,7 @@ struct Counts {
     upper: Option<u64>,
     proved: u64,
     refuted: u64,
+    by_labels: u64,
     unresolved: u64,
 }
 
@@ -277,6 +278,7 @@ impl Status {
     fn set_counts(&mut self, c: Counts) {
         self.detail.proved = c.proved;
         self.detail.refuted = c.refuted;
+        self.detail.refuted_by_labels = c.by_labels;
         self.completeness.bounds = c.upper.map(|upper| Bounds {
             lower: c.lower,
             upper,
@@ -1205,20 +1207,59 @@ fn decide_answers(
             let budget = Arc::new(memory.part());
             let mut pair = lower.align(upper, Arc::clone(&budget))?;
             // A query's candidate budget, unlimited where none is set.
-            let limit = store.config().dl.max_candidates.unwrap_or(usize::MAX);
-            let gap = gap::select(
-                &mut pair,
-                limit.saturating_add(super::UNRESOLVED_SHOWN),
-                &budget,
-                cancellation,
-            )?;
+            let config = &store.config().dl;
+            let limit = config.max_candidates.unwrap_or(usize::MAX);
+            // The model's labels decide every gap row before the limit, so they read the whole
+            // gap; where it has no room, the capped selection, with no labels.
+            let whole = match config.model_labels {
+                true => match gap::select(&mut pair, usize::MAX, &budget, cancellation) {
+                    Err(e) if e.is_memory_limit() || e.is_server_memory_limit() => None,
+                    other => Some(other?),
+                },
+                false => None,
+            };
+            if config.model_labels && whole.is_none() {
+                status.path("capped-gap");
+            }
+            let labelled = whole.is_some();
+            let mut gap = match whole {
+                Some(gap) => gap,
+                None => gap::select(
+                    &mut pair,
+                    limit.saturating_add(super::UNRESOLVED_SHOWN),
+                    &budget,
+                    cancellation,
+                )?,
+            };
+            let variables = pair.variables().to_vec();
+            let refuted = match labelled {
+                true => exact::refuted_by_labels(
+                    store,
+                    &view.lower,
+                    analysis,
+                    &variables,
+                    gap.rows.len(),
+                    &|i| pair.upper_row(gap.rows[i]),
+                    cancellation,
+                    deadline,
+                    memory,
+                ),
+                false => Vec::new(),
+            };
+            // A row the model refutes is decided `No`; the others meet the limit as before.
+            let (mut rows, mut bytes) = (refuted.iter(), refuted.iter());
+            gap.rows.retain(|_| rows.next() != Some(&true));
+            gap.bytes.retain(|_| bytes.next() != Some(&true));
+            let by_labels = refuted.iter().filter(|&&r| r).count() as u64;
+            let left = gap.total - by_labels;
             let mut counts = Counts {
                 lower: gap.lower,
                 upper: Some(gap.lower + gap.total),
-                unresolved: gap.total.saturating_sub(limit as u64),
+                refuted: by_labels,
+                by_labels,
+                unresolved: left.saturating_sub(limit as u64),
                 ..Counts::default()
             };
-            let variables = pair.variables().to_vec();
             let mut why = None;
             let admitted = limit.min(gap.rows.len());
             pair.reserve_appends(admitted)?;
@@ -1261,7 +1302,7 @@ fn decide_answers(
                     }
                 }
             }
-            if gap.total > limit as u64 {
+            if left > limit as u64 {
                 why.get_or_insert_with(|| Limit::Candidates.reached(limit));
                 for &index in &gap.rows[admitted..] {
                     if status.detail.unresolved.len() == super::UNRESOLVED_SHOWN {

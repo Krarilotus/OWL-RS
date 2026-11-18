@@ -441,6 +441,14 @@ pub const SETTINGS: &[Setting] = &[
          most; the rest are reported unresolved (0 or unlimited: none).",
     ),
     setting(
+        "dl.model_labels",
+        names::DL_MODEL_LABELS,
+        Bool,
+        Unset::Flag(false),
+        "Under owl2-dl, an exact read first refutes its candidates by one model of the \
+         premise, before the candidate limit; off, each candidate goes to its own test.",
+    ),
+    setting(
         "dl.threads",
         names::DL_THREADS,
         Integer,

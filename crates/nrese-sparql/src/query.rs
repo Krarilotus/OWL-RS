@@ -301,6 +301,8 @@ pub struct Explanation {
 pub struct Candidates {
     pub proved: u64,
     pub refuted: u64,
+    /// Of `refuted`, those one model of the premise refuted by its labels, with no test.
+    pub refuted_by_labels: u64,
 }
 
 /// Runs `query` like [`evaluate_query`], consuming its results, and reports how it ran:

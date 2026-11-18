@@ -1532,6 +1532,7 @@ impl StoreService {
             explanation.candidates = Some(nrese_sparql::Candidates {
                 proved: detail.proved,
                 refuted: detail.refuted,
+                refuted_by_labels: detail.refuted_by_labels,
             });
         } else {
             let at = Revision::Committed(&snapshot);

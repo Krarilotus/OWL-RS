@@ -667,6 +667,12 @@
             "unlimited"
           ]
         },
+        "model_labels": {
+          "default": false,
+          "description": "Under owl2-dl, an exact read first refutes its candidates by one model of the premise, before the candidate limit; off, each candidate goes to its own test.",
+          "type": "boolean",
+          "x-env": "NRESE_DL_MODEL_LABELS"
+        },
         "outside_profile": {
           "default": "proven",
           "description": "Under owl2-dl, what a classification answers on an input outside OWL 2 DL: where a procedure proven sound for the input applies, its answer, marked as outside the profile (proven, the default); or the DL engines' answer on the part they read, marked incomplete (dl-part). A repository's outside_profile overrides it.",

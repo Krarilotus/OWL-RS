@@ -1310,14 +1310,16 @@ fn unions_read(
     Ok((out, status))
 }
 
-/// Spec: a setting turns the model's refutations off, and off a read is decided by each
-/// candidate's own test as before: over the 24 individuals with a candidate limit of 4, the
-/// 4 admitted refuted, 8 unresolved, the read not `complete`, none refuted by labels. On,
-/// the model refutes all 12 (*Direct Semantics* §2.5: one model with the candidate outside
-/// the class), the read is `complete`, and its rows are the same 12.
+/// Spec: a setting turns the model's refutations on, off by default, and off a read is decided
+/// by each candidate's own test as before: over the 24 individuals with a candidate limit of 4,
+/// the 4 admitted refuted, 8 unresolved, the read not `complete`, none refuted by labels. On,
+/// the model refutes all 12 (*Direct Semantics* §2.5: one model with the candidate outside the
+/// class), the read is `complete`, and its rows are the same 12.
 #[test]
 fn without_model_labels_a_read_is_decided_by_its_tests_alone() {
-    let (off, on) = (unions_store(false, 24), unions_store(true, 24));
+    let default = crate::DlConfig::default().model_labels;
+    assert!(!default, "off by default");
+    let (off, on) = (unions_store(default, 24), unions_store(true, 24));
     let (off_rows, off_status) = unions_read(&off, None).unwrap();
     let (on_rows, on_status) = unions_read(&on, None).unwrap();
     let ((off_status, off_detail), (on_status, on_detail)) =
@@ -1350,8 +1352,10 @@ fn without_model_labels_a_read_is_decided_by_its_tests_alone() {
 
 /// Spec: the model's refutations need the whole gap selected, but never fail a read: under
 /// each request memory limit from 16 KiB to 64 MiB (steps of a tenth), over 400 individuals,
-/// a read answered with the refutations off is answered with them on. This can't show the
-/// selection's own fallback taken; it holds the read to the outcome either way.
+/// a read answered with the refutations off is answered with them on. And the fallback is
+/// reached: at the least limit the read is answered under with them off (found to 256 bytes),
+/// or within 16 KiB above it, the whole gap (400 rows) has no room beside what the capped
+/// selection needs, and the read with them on says so (`capped-gap`) and is answered.
 #[test]
 fn a_read_answered_without_model_labels_is_answered_with_them_under_every_memory_limit() {
     let (off, on) = (unions_store(false, 400), unions_store(true, 400));
@@ -1375,5 +1379,23 @@ fn a_read_answered_without_model_labels_is_answered_with_them_under_every_memory
     assert!(
         answered > 0 && failed > 0,
         "the limits cross the read's need"
+    );
+    let (mut low, mut high) = (16usize << 10, 64usize << 20);
+    while high - low > 256 {
+        let middle = low + (high - low) / 2;
+        match unions_read(&off, Some(middle)) {
+            Ok(_) => high = middle,
+            Err(_) => low = middle,
+        }
+    }
+    let capped = |limit: usize| match unions_read(&on, Some(limit)) {
+        Ok((_, Some((_, detail)))) => detail.paths.contains(&"capped-gap"),
+        _ => false,
+    };
+    let fallback = (0..64).map(|k| high + k * 256).find(|&limit| capped(limit));
+    println!("off answered from {high} bytes; on fell back to the capped gap at {fallback:?}");
+    assert!(
+        fallback.is_some(),
+        "no fallback within 16 KiB of {high} bytes"
     );
 }
