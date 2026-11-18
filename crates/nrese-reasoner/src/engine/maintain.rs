@@ -5,8 +5,8 @@ use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use nrese_engine::{
-    CountedSnapshot, EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, TermId,
-    Transaction,
+    CountedSnapshot, EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, Snapshot,
+    TermId, TermKind, Transaction,
 };
 use nrese_exec::Budget;
 
@@ -220,6 +220,25 @@ pub struct Maintenance {
     pub work: delta::policy::Counts,
 }
 
+/// Whether `base` holds an inverse property expression (`_:x owl:inverseOf :p`), OWL 2's
+/// one property that is no IRI: the rules conclude facts with it as their predicate, which
+/// no store holds ([`storable`]), whichever rule concludes them. Its reads count on `poll`
+/// (REAS-3), as [`EngineBase`]'s do; [`Stopped`] once that has stopped.
+fn has_inverse_expression(base: &Snapshot, poll: &Poller<'_>) -> Result<bool, Stopped> {
+    let iri = nrese_rdf::NamedNodeRef::new_unchecked("http://www.w3.org/2002/07/owl#inverseOf");
+    let Some(inverse_of) = base.lookup(iri.into()) else {
+        return Ok(false);
+    };
+    let mut pattern = QuadPattern::all();
+    pattern.predicate = Some(inverse_of);
+    let blank = |t: TermId| t.kind() == TermKind::BlankNode;
+    let (counted, reads) = (base.counted(), |n| poll.visit(n));
+    let mut quads = counted.quads(ReadModel::Materialised, &pattern, &reads);
+    quads.try_fold(false, |found, q| {
+        q.map(|q| found || blank(q.subject) || blank(q.object))
+    })
+}
+
 /// Keeps the transaction's inferred stack equal to the closure of its asserted state,
 /// given that it was before the transaction's changes: runs the delta executor and applies
 /// its result.
@@ -320,6 +339,7 @@ pub fn maintain_with(
             &mut unstorable,
         )?);
     }
+    let unkept: bool;
     let update = {
         let base = EngineBase::new(tx, &program.axioms);
         // The change's own probes of the base (a deleted fact still asserted elsewhere, a
@@ -372,6 +392,11 @@ pub fn maintain_with(
         }
         deleted.sort_unstable();
         deleted.dedup();
+        // Facts with an inverse expression as their predicate: the stored closure lacks the
+        // base's, so a delta can't read them. Such a change runs its delta, whose consistency
+        // check stands, and is then rebuilt: the closure after it is the one a rebuild gives.
+        unkept = !(first_load || inserted.is_empty() && deleted.is_empty())
+            && has_inverse_expression(tx.base(), &prep).map_err(interrupted)?;
         // A rebuild reads the asserted facts and writes the closure, both about the size
         // of the stored state; the policy offers it to a change that inserts nothing
         // ([`delta::policy::Plan::Rebuild`]).
@@ -441,7 +466,7 @@ pub fn maintain_with(
     let (mut inserted, mut removed) = (0, 0);
     // Over representatives, a change that may split a class is rebuilt (B3a: the
     // translation can't follow it; the representative view for the delta executor is B3b).
-    let mut rebuild = revived || update.policy.plan == delta::policy::Plan::Rebuild;
+    let mut rebuild = revived || unkept || update.policy.plan == delta::policy::Plan::Rebuild;
     if !rebuild && program.stores_representatives() {
         match store_over_representatives(program, &update, &missing_axioms, tx) {
             Some((added, dropped)) => (inserted, removed) = (added, dropped),
@@ -526,6 +551,10 @@ pub fn maintain_with(
         if operation.fired() {
             return Err(operation.interrupted());
         }
+    }
+    // The delta ran (its violations and diagnostics stand), and the closure is a rebuild's.
+    if unkept {
+        update.policy.plan = delta::policy::Plan::Rebuild;
     }
     Ok(Maintenance {
         violations: update.violations,
