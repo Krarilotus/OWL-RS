@@ -44,8 +44,9 @@ enum Route {
     Explain,
 }
 
-/// What a reader is told: the answer, the status's first word (`complete`, `sound-only`,
-/// `unsound`, `not-certified`) and, from EXPLAIN, whether the QL report is shown.
+/// What a reader is told: the answer, the whole status (`NRESE-Completeness`; from EXPLAIN,
+/// its `completeness` with `; …` where it has a regime or reasons) and, from EXPLAIN,
+/// whether its `ql` member is a report (`None`: the member is absent).
 #[derive(Debug, PartialEq)]
 struct Told {
     answer: bool,
@@ -85,19 +86,14 @@ async fn send(
     Ok(app.clone().oneshot(request.body(Body::from(body))?).await?)
 }
 
-/// The JSON body of `response` (200 asserted) and its `NRESE-Completeness`'s first word.
+/// The JSON body of `response` (200 asserted) and its whole `NRESE-Completeness`.
 async fn read(response: axum::response::Response) -> TestResult<(serde_json::Value, String)> {
     let code = response.status();
     let header = response.headers().get("nrese-completeness").cloned();
     let body = body_text(response).await?;
     assert_eq!(code, StatusCode::OK, "{body}");
     let status = match header {
-        Some(value) => value
-            .to_str()?
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .to_owned(),
+        Some(value) => value.to_str()?.to_owned(),
         None => String::new(),
     };
     Ok((serde_json::from_str(&body)?, status))
@@ -172,10 +168,12 @@ async fn ask(app: &Router, roles: &[&str], route: Route) -> TestResult<Told> {
     )
     .await?;
     let (explanation, _) = read(explain).await?;
-    let status = explanation["completeness"]["status"]
-        .as_str()
-        .unwrap_or_default();
-    Ok(told(answer, status, Some(!explanation["ql"].is_null())))
+    let c = &explanation["completeness"];
+    let bare = c["regime"].is_null() && c["reasons"].as_array().is_some_and(Vec::is_empty);
+    let status =
+        c["status"].as_str().unwrap_or_default().to_owned() + if bare { "" } else { "; …" };
+    let report = explanation.get("ql").map(|ql| !ql.is_null());
+    Ok(told(answer, &status, report))
 }
 
 /// Spec: docs/ops/config-reference.md (access policy): under `reasoner.equality =
@@ -257,7 +255,11 @@ async fn a_reader_by_support_is_never_told_complete_for_a_view_without_its_closu
             assert_eq!(inserted.status(), StatusCode::NO_CONTENT);
             let whole = ask(&app, ADMIN, Route::Query).await?.answer;
             let got = ask(&app, READER, route).await?;
-            if !whole || got != want {
+            // A control by the status's first word; `not-certified` whole, with nothing after.
+            let first = got.status.split(';').next().unwrap_or_default();
+            let status =
+                (compact && got.status == want.status) || (!compact && first == want.status);
+            if !whole || got.answer != want.answer || got.report != want.report || !status {
                 wrong.push(format!(
                     "{name} compact={compact}: every graph {whole}, reader {got:?}, want {want:?}"
                 ));

@@ -1916,9 +1916,9 @@ pub(crate) struct Compilation {
 }
 
 impl Compilation {
-    /// Whether support graph sets are computed ([`Supports::compute`]): not under compact
-    /// equality, whose stack is over representatives. Without them a reader by support sees
-    /// no inferred statement, so its view isn't its closure.
+    /// The compact-mode gate of [`Supports::compute`]: whether the equality mode lets support
+    /// graph sets be computed at all, which compact equality (a stack over representatives)
+    /// doesn't. The no-rules and refusal branches there own the other outcomes.
     pub(crate) fn computes_sets(self) -> bool {
         !self.compact
     }
