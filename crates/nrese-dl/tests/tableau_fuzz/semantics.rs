@@ -121,8 +121,7 @@ pub fn holds(o: &Ontology, axiom: &Axiom, i: &Interp) -> bool {
         Axiom::EquivalentClasses(xs) => xs.windows(2).all(|w| c(w[0]) == c(w[1])),
         Axiom::DisjointClasses(xs) => pairwise(xs),
         Axiom::DisjointUnion(class, xs) => {
-            let named = i.concepts.get(class).copied().unwrap_or(0);
-            named == xs.iter().fold(0, |m, &x| m | c(x)) && pairwise(xs)
+            c(*class) == xs.iter().fold(0, |m, &x| m | c(x)) && pairwise(xs)
         }
         Axiom::SubObjectPropertyOf(chain, sup) => {
             let (got, have) = (compose(i, chain), rel(*sup));

@@ -145,8 +145,7 @@ fn holds(o: &Ontology, axiom: &Axiom, i: &Interp) -> bool {
         Axiom::InverseObjectProperties(a, b) => rel(*a) == rel(b.inverse()),
         Axiom::EquivalentObjectProperties(ps) => ps.windows(2).all(|w| rel(w[0]) == rel(w[1])),
         Axiom::DisjointUnion(class, xs) => {
-            let named = i.concepts.get(class).copied().unwrap_or(0);
-            named == xs.iter().fold(0, |m, &x| m | c(x))
+            c(*class) == xs.iter().fold(0, |m, &x| m | c(x))
                 && xs
                     .iter()
                     .enumerate()
@@ -671,7 +670,8 @@ fn clauses_and_ontologies_have_the_same_models() {
                 ),
                 13 => {
                     let union = vec![c(&mut o, &mut next, 1), c(&mut o, &mut next, 1)];
-                    Axiom::DisjointUnion(classes[next(3) as usize], union)
+                    let class = ClassExpr::Class(classes[next(3) as usize]);
+                    Axiom::DisjointUnion(ExprId(o.classes.intern(class)), union)
                 }
                 // Role axioms: into the transitive role from the simple one, else any.
                 14 if transitive => Axiom::SubObjectPropertyOf(

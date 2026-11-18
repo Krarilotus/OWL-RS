@@ -1104,3 +1104,40 @@ fn fuzzed_ontologies_are_owl2_dl() {
         check(&defined, &mut table, "defined");
     }
 }
+
+/// Spec (*OWL 2 Structural Specification* §9.1.4: a disjoint union is of a class; *Mapping to
+/// RDF* Table 16, `CE(*:x)`): `owl:disjointUnionOf` on a blank node, a class expression or
+/// not, is malformed on that node and keeps no axiom; on a named class it is read. The kept
+/// disjoint unions and the subjects' reports printed.
+#[test]
+fn a_disjoint_union_on_a_blank_node_is_malformed() {
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        r#"
+        _:u owl:disjointUnionOf ( ex:A ex:B ) .
+        [ owl:unionOf ( ex:C ex:D ) ] owl:disjointUnionOf ( ex:A ex:B ) .
+        ex:E owl:disjointUnionOf ( ex:A ex:B ) .
+        "#,
+    );
+    let ontology = read(&statements, &table);
+    let union_of = table.iri_id("http://www.w3.org/2002/07/owl#disjointUnionOf");
+    let reported: Vec<bool> = (statements.iter())
+        .filter(|s| s.triple[1] == union_of && table.kind(s.triple[0]) == TermKind::Blank)
+        .map(|s| {
+            (ontology.diagnostics.iter())
+                .any(|d| matches!(d, Diagnostic::Malformed { node, .. } if *node == s.triple[0]))
+        })
+        .collect();
+    let lines = rendered(&ontology, &table);
+    let kept: Vec<&str> = (lines.iter().map(String::as_str))
+        .filter(|l| l.starts_with("DisjointUnion"))
+        .collect();
+    eprintln!("DISJOINT UNION kept {kept:?}; the blank subjects reported {reported:?}");
+    assert_eq!(
+        (kept, reported),
+        (vec!["DisjointUnion(ex:E ex:A ex:B)"], vec![true, true]),
+        "{:?}",
+        ontology.diagnostics
+    );
+}

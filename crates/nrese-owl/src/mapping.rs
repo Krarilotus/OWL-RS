@@ -1524,10 +1524,22 @@ impl<'a> Reader<'a> {
                 self.disjoint(Disjoint::Classes(vec![a, b]), triple);
             }
         } else if is(p, v.owl_disjoint_union_of) {
+            // The subject is a class (Table 16, `CE(*:x)`): an IRI, `owl:Thing` and
+            // `owl:Nothing` read as such; a blank node, a class expression or not, is none.
+            let class = if self.kind(s) == TermKind::Iri {
+                self.class(s)
+            } else {
+                self.report(Diagnostic::Malformed {
+                    node: s,
+                    what: "a disjoint union of no named class",
+                });
+                None
+            };
             if let Some(members) = self.list(o)
                 && let Some(classes) = self.classes(&members)
+                && let Some(class) = class
             {
-                self.add(Axiom::DisjointUnion(s, canonical(classes)), triple);
+                self.add(Axiom::DisjointUnion(class, canonical(classes)), triple);
             }
         } else if is(p, v.rdfs_sub_property_of) {
             let subject = self.annotation_property(s);

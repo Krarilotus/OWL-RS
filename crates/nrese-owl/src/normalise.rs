@@ -567,10 +567,10 @@ impl<'a> Normaliser<'a> {
                 }
             }
             Axiom::DisjointUnion(class, xs) => {
-                let named = self.e(ClassExpr::Class(*class));
+                // The class as read: a named class, `⊤` or `⊥`.
                 let union = self.e(ClassExpr::Or(xs.clone()));
-                self.sub(named, union, index);
-                self.sub(union, named, index);
+                self.sub(*class, union, index);
+                self.sub(union, *class, index);
                 for (i, &a) in xs.iter().enumerate() {
                     for &b in &xs[i + 1..] {
                         let (Some(na), Some(nb)) = (self.nnf_not(a), self.nnf_not(b)) else {

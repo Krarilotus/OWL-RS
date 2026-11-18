@@ -144,8 +144,9 @@ pub enum Axiom {
     SubClassOf(ExprId, ExprId),
     EquivalentClasses(Vec<ExprId>),
     DisjointClasses(Vec<ExprId>),
-    /// The class is the disjoint union of the expressions.
-    DisjointUnion(Term, Vec<ExprId>),
+    /// The class is the disjoint union of the expressions. The class is a named class,
+    /// `owl:Thing` or `owl:Nothing` (*Structural Specification* §9.1.4); the readers keep it so.
+    DisjointUnion(ExprId, Vec<ExprId>),
     /// The chain (one property: a plain subproperty axiom) is a subproperty of the last.
     SubObjectPropertyOf(Vec<ObjProp>, ObjProp),
     EquivalentObjectProperties(Vec<ObjProp>),

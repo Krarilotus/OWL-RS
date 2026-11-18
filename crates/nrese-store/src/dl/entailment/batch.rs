@@ -60,8 +60,9 @@ impl Batch {
                 _ => None,
             })
             .collect();
+        // A disjoint union's class is among the expressions above.
         for axiom in &ontology.axioms {
-            if let Axiom::Declaration(EntityKind::Class, c) | Axiom::DisjointUnion(c, _) = axiom {
+            if let Axiom::Declaration(EntityKind::Class, c) = axiom {
                 names.insert(*c);
             }
         }

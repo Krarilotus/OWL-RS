@@ -441,3 +441,48 @@ fn fuzzed_ontologies_round_trip_through_the_functional_syntax() {
         );
     }
 }
+
+/// Spec (*OWL 2 Structural Specification* §5.1 and §9.1.4: `owl:Thing` and `owl:Nothing` are
+/// classes, and a disjoint union's first argument is a class; *Mapping to RDF* Table 16): a
+/// disjoint union on either is read as that class from the functional syntax and from RDF, and
+/// written back as the same one statement in both. The model's lines and the written subjects
+/// printed.
+#[test]
+fn a_disjoint_union_on_the_top_or_bottom_class_round_trips() {
+    const OWL: &str = "http://www.w3.org/2002/07/owl#";
+    let expected = [
+        "DisjointUnion(owl:Nothing ex:C ex:D)",
+        "DisjointUnion(owl:Thing ex:A ex:B)",
+    ];
+    let mut table = Table::default();
+    let (o, _) = read_functional(
+        "Prefix(ex:=<http://example.com/>) Ontology(DisjointUnion(owl:Thing ex:A ex:B) \
+         DisjointUnion(owl:Nothing ex:C ex:D))",
+        &mut table,
+    );
+    let from_rdf = read(
+        &load(
+            &mut table,
+            "owl:Thing owl:disjointUnionOf ( ex:A ex:B ) . \
+             owl:Nothing owl:disjointUnionOf ( ex:C ex:D ) .",
+        ),
+        &table,
+    );
+    let vocabulary = table.vocabulary();
+    let union_of = table.iri_id(&format!("{OWL}disjointUnionOf"));
+    let mut subjects: Vec<String> = (write(&o, &vocabulary, &mut table).into_iter())
+        .filter(|t| t[1] == union_of)
+        .map(|t| table.name(t[0]))
+        .collect();
+    subjects.sort();
+    let lines = [rendered(&o, &table), rendered(&from_rdf, &table)];
+    eprintln!("DISJOINT UNION read {lines:?}; written on {subjects:?}");
+    assert!(o.diagnostics.is_empty(), "{:?}", o.diagnostics);
+    assert_eq!(lines, [expected, expected]);
+    assert_eq!(
+        subjects,
+        [format!("<{OWL}Nothing>"), format!("<{OWL}Thing>")]
+    );
+    assert_functional_round_trip(&o, &mut table, "top and bottom");
+    assert_triples_round_trip(&o, &mut table);
+}

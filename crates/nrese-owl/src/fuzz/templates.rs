@@ -281,7 +281,7 @@ impl T<'_> {
                     return Vec::new();
                 }
                 let axiom = match class {
-                    Some(c) => Axiom::DisjointUnion(c, parts),
+                    Some(c) => Axiom::DisjointUnion(self.e(ClassExpr::Class(c)), parts),
                     None => Axiom::DisjointClasses(parts),
                 };
                 vec![axiom, Axiom::ClassAssertion(member, a)]

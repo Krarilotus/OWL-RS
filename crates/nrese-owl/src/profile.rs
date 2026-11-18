@@ -605,7 +605,8 @@ pub fn concluded_terms(o: &Ontology, axiom: &Axiom, rl: bool) -> Vec<Term> {
             }
         }
         Axiom::DisjointUnion(c, v) => {
-            out.push(*c);
+            // A named class's term; `⊤` and `⊥` none.
+            positive_terms(o, *c, true, &mut out);
             for &e in v {
                 positive_terms(o, e, true, &mut out);
                 positive_terms(o, e, false, &mut out);
@@ -686,7 +687,11 @@ pub(crate) fn label(o: &Ontology, axiom: &Axiom) -> Option<Term> {
     let exprs: Vec<ExprId> = match axiom {
         Axiom::SubClassOf(a, b) => vec![*a, *b],
         Axiom::EquivalentClasses(v) | Axiom::DisjointClasses(v) => v.clone(),
-        Axiom::DisjointUnion(c, _) => return Some(*c),
+        // A named class names it; on `⊤` or `⊥`, its parts as for the other class axioms.
+        Axiom::DisjointUnion(c, v) => match o.class(*c) {
+            ClassExpr::Class(t) => return Some(*t),
+            _ => v.clone(),
+        },
         // Equality of individuals names no property or class.
         Axiom::SameIndividual(v) => return v.first().copied(),
         Axiom::ObjectPropertyDomain(_, c)
