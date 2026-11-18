@@ -356,6 +356,37 @@ SubClassOf(:A :B)
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// Spec (*OWL 2 Structural Specification* §9.1.4: `disjointClassExpressions` is two class
+/// expressions at least): `DisjointUnion(:C)` and `DisjointUnion(:C :A)` are no axiom: a syntax
+/// error, and what follows is read; `DisjointUnion(:C :A :B)` is read without a report. Each
+/// case's reading printed.
+#[test]
+fn a_functional_disjoint_union_of_fewer_than_two_classes_is_a_syntax_error() {
+    let mut wrong = Vec::new();
+    for (axiom, error) in [
+        ("DisjointUnion(:C)", true),
+        ("DisjointUnion(:C :A)", true),
+        ("DisjointUnion(:C :A :B)", false),
+    ] {
+        let mut table = Table::default();
+        let (o, _) = read_functional(
+            &format!("Prefix(:=<http://example.com/>) Ontology({axiom} SubClassOf(:A :B))"),
+            &mut table,
+        );
+        let lines = rendered(&o, &table);
+        let diagnostics = &o.diagnostics;
+        eprintln!("SHORT DISJOINT UNION {axiom}: read {lines:?}; {diagnostics:?}");
+        let syntax = (diagnostics.iter()).any(|d| matches!(d, Diagnostic::Syntax { .. }));
+        let kept = lines.iter().any(|l| l.starts_with("DisjointUnion"));
+        let read_on = lines.contains(&"SubClassOf(ex:A ex:B)".to_owned());
+        let expected = if error { (true, false) } else { (false, true) };
+        if (syntax, kept) != expected || o.diagnostics.len() != usize::from(error) || !read_on {
+            wrong.push(format!("{axiom}: {lines:?}; {:?}", o.diagnostics));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// An anonymous individual only in a nominal or a `hasValue` (review A-1102) stays
 /// anonymous: not among the named individuals (so no key or rule binds it), and reported,
 /// since OWL 2 DL takes named individuals there (*OWL 2 Structural Specification* §11.2).

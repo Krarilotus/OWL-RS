@@ -1141,3 +1141,237 @@ fn a_disjoint_union_on_a_blank_node_is_malformed() {
         ontology.diagnostics
     );
 }
+
+/// A graph read alone: its axioms but declarations, the terms its malformed reports are on
+/// (as [`Table::name`] writes them), and every diagnostic.
+fn kept_and_malformed(turtle: &str) -> (Vec<String>, Vec<String>, Vec<Diagnostic>) {
+    let mut table = Table::default();
+    let statements = load(&mut table, turtle);
+    let ontology = read(&statements, &table);
+    let kept = (rendered(&ontology, &table).into_iter())
+        .filter(|l| !l.starts_with("Declaration"))
+        .collect();
+    let malformed = (ontology.diagnostics.iter())
+        .filter_map(|d| match d {
+            Diagnostic::Malformed { node, .. } => Some(table.name(*node)),
+            _ => None,
+        })
+        .collect();
+    (kept, malformed, ontology.diagnostics)
+}
+
+/// Each case is malformed: only the given number of axioms kept from it (none but where it
+/// holds another axiom too), and a malformed report on `node` (`None`: on some node); each
+/// case's reading printed. `what` names the kind in the printout.
+fn assert_malformed(what: &str, cases: &[(&str, Option<&str>, usize)]) {
+    let mut wrong = Vec::new();
+    for &(turtle, node, axioms) in cases {
+        let (kept, malformed, diagnostics) = kept_and_malformed(turtle);
+        eprintln!("{what}: {turtle:?}: kept {kept:?}; malformed on {malformed:?}");
+        let reported = node.map_or(!malformed.is_empty(), |n| malformed.iter().any(|m| m == n));
+        if kept.len() != axioms || !reported {
+            wrong.push(format!("{turtle}: kept {kept:?}; {diagnostics:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (*Mapping to RDF* Tables 12 and 13: a blank node of a class expression or a data
+/// range has one form, its operator or its restriction's one filler or cardinality): a node
+/// with two is no structure, as a structure property given twice is not: malformed, and no
+/// axiom is read from it. Two set operators, a set operator with `owl:onProperty`, a
+/// restriction with two fillers, one with a filler and a cardinality, a data range with two
+/// forms.
+#[test]
+fn a_node_with_more_than_one_form_is_no_structure() {
+    assert_malformed(
+        "TWO FORMS",
+        &[
+            (
+                "ex:E owl:equivalentClass [ owl:intersectionOf ( ex:A ex:B ) ; \
+                 owl:unionOf ( ex:C ex:D ) ] .",
+                None,
+                0,
+            ),
+            (
+                "ex:p a owl:ObjectProperty . ex:E owl:equivalentClass [ owl:unionOf ( ex:A ex:B ) ; \
+                 owl:onProperty ex:p ; owl:someValuesFrom ex:C ] .",
+                None,
+                0,
+            ),
+            (
+                "ex:p a owl:ObjectProperty . ex:E rdfs:subClassOf [ a owl:Restriction ; \
+                 owl:onProperty ex:p ; owl:someValuesFrom ex:A ; owl:allValuesFrom ex:B ] .",
+                None,
+                0,
+            ),
+            (
+                "ex:p a owl:ObjectProperty . ex:E rdfs:subClassOf [ a owl:Restriction ; \
+                 owl:onProperty ex:p ; owl:someValuesFrom ex:A ; \
+                 owl:maxCardinality \"1\"^^xsd:nonNegativeInteger ] .",
+                None,
+                0,
+            ),
+            (
+                "ex:d a owl:DatatypeProperty . ex:d rdfs:range [ a rdfs:Datatype ; \
+                 owl:intersectionOf ( xsd:integer xsd:decimal ) ; \
+                 owl:datatypeComplementOf xsd:string ] .",
+                None,
+                0,
+            ),
+        ],
+    );
+}
+
+/// Spec (*Mapping to RDF* Tables 13 and 16: a class `owl:oneOf`'s members, `owl:AllDifferent`'s,
+/// `owl:sameAs`'s and `owl:differentFrom`'s object, an object `owl:hasValue`'s value and a negative
+/// object assertion's source and target are individuals, `*:x` or `_:x`): a literal there is
+/// malformed on the literal, and the axiom is left out. `C ≡ {"1"}` among them, and `a = "1"`
+/// with `"1"` and `a` all different, which read with the literal as an individual has no model.
+#[test]
+fn a_literal_where_an_individual_belongs_is_malformed() {
+    let one = Some("\"1\"^^xsd:string");
+    assert_malformed(
+        "LITERAL INDIVIDUAL",
+        &[
+            ("ex:C owl:equivalentClass [ owl:oneOf ( \"1\" ) ] .", one, 0),
+            (
+                "[] a owl:AllDifferent ; owl:members ( \"1\" ex:a ) .",
+                one,
+                0,
+            ),
+            ("ex:a owl:sameAs \"1\" .", one, 0),
+            (
+                "ex:a owl:sameAs \"1\" . [] a owl:AllDifferent ; owl:members ( \"1\" ex:a ) .",
+                one,
+                0,
+            ),
+            ("ex:a owl:differentFrom \"1\" .", one, 0),
+            (
+                "ex:p a owl:ObjectProperty . ex:C rdfs:subClassOf [ a owl:Restriction ; \
+                 owl:onProperty ex:p ; owl:hasValue \"1\" ] .",
+                one,
+                0,
+            ),
+            (
+                "ex:p a owl:ObjectProperty . [] a owl:NegativePropertyAssertion ; \
+                 owl:sourceIndividual ex:a ; owl:assertionProperty ex:p ; \
+                 owl:targetIndividual \"1\" .",
+                one,
+                0,
+            ),
+            (
+                "ex:p a owl:ObjectProperty . [] a owl:NegativePropertyAssertion ; \
+                 owl:sourceIndividual \"1\" ; owl:assertionProperty ex:p ; \
+                 owl:targetIndividual ex:b .",
+                one,
+                0,
+            ),
+        ],
+    );
+}
+
+/// Spec (*Mapping to RDF* Table 16, `owl:disjointUnionOf` with `n ≥ 2`; *Structural
+/// Specification* §9.1.4, `disjointClassExpressions`, two at least): a disjoint union of no
+/// class, read as its class equal to an empty union, says the class is empty; of one, that it
+/// is that one. Each is malformed on its class, and no axiom is read.
+#[test]
+fn a_disjoint_union_of_fewer_than_two_classes_is_malformed() {
+    assert_malformed(
+        "SHORT DISJOINT UNION",
+        &[
+            ("ex:C owl:disjointUnionOf () .", Some("ex:C"), 0),
+            ("ex:C owl:disjointUnionOf ( ex:A ) .", Some("ex:C"), 0),
+        ],
+    );
+}
+
+/// Spec (*Mapping to RDF* Table 17, §3.2.2: an `owl:Axiom` or `owl:Annotation` node annotates
+/// its main triple, `s p o` from its `owl:annotatedSource`, `owl:annotatedProperty` and
+/// `owl:annotatedTarget`, which the graph contains): one whose main triple is absent annotates
+/// nothing, and states no axiom: malformed, not taken as annotations without a word.
+#[test]
+fn a_reified_axiom_without_its_main_triple_is_malformed() {
+    assert_malformed(
+        "NO MAIN TRIPLE",
+        &[
+            (
+                "[] a owl:Axiom ; owl:annotatedSource ex:A ; \
+                 owl:annotatedProperty rdfs:subClassOf ; owl:annotatedTarget ex:B ; \
+                 rdfs:comment \"why\" .",
+                None,
+                0,
+            ),
+            (
+                "ex:A rdfs:subClassOf ex:B . _:x a owl:Axiom ; owl:annotatedSource ex:A ; \
+                 owl:annotatedProperty rdfs:subClassOf ; owl:annotatedTarget ex:B ; \
+                 rdfs:comment \"why\" . [] a owl:Annotation ; owl:annotatedSource _:x ; \
+                 owl:annotatedProperty rdfs:comment ; owl:annotatedTarget \"not given\" ; \
+                 rdfs:comment \"how\" .",
+                None,
+                1,
+            ),
+        ],
+    );
+}
+
+/// The valid neighbours of the four forms above get no report, and keep their axioms: a named
+/// class with two forms (OWL 1's two axioms on it, or two equivalences); a restriction with a
+/// qualified cardinality and its `owl:onClass`; a datatype restriction with its facets; a class
+/// `owl:oneOf` of individuals; a data `owl:hasValue` with a literal; a data `owl:oneOf` of
+/// literals; a disjoint union of two; an annotated axiom and an annotated annotation whose
+/// main triples are present. Each case's reading printed.
+#[test]
+fn the_valid_neighbours_of_the_unchecked_forms_get_no_report() {
+    let mut wrong = Vec::new();
+    for (turtle, axioms) in [
+        (
+            "ex:E owl:intersectionOf ( ex:A ex:B ) . ex:E owl:unionOf ( ex:C ex:D ) .",
+            2,
+        ),
+        (
+            "ex:E owl:equivalentClass [ owl:intersectionOf ( ex:A ex:B ) ] , \
+             [ owl:unionOf ( ex:C ex:D ) ] .",
+            2,
+        ),
+        (
+            "ex:p a owl:ObjectProperty . ex:E rdfs:subClassOf [ a owl:Restriction ; \
+             owl:onProperty ex:p ; owl:maxQualifiedCardinality \"1\"^^xsd:nonNegativeInteger ; \
+             owl:onClass ex:A ] .",
+            1,
+        ),
+        (
+            "ex:d a owl:DatatypeProperty . ex:d rdfs:range [ a rdfs:Datatype ; \
+             owl:onDatatype xsd:integer ; \
+             owl:withRestrictions ( [ xsd:minInclusive \"1\"^^xsd:integer ] ) ] .",
+            1,
+        ),
+        ("ex:C owl:equivalentClass [ owl:oneOf ( ex:a ex:b ) ] .", 1),
+        (
+            "ex:d a owl:DatatypeProperty . ex:C rdfs:subClassOf [ a owl:Restriction ; \
+             owl:onProperty ex:d ; owl:hasValue \"1\" ] .",
+            1,
+        ),
+        (
+            "ex:d a owl:DatatypeProperty . ex:d rdfs:range [ a rdfs:Datatype ; \
+             owl:oneOf ( \"1\" \"2\" ) ] .",
+            1,
+        ),
+        ("ex:C owl:disjointUnionOf ( ex:A ex:B ) .", 1),
+        (
+            "ex:A rdfs:subClassOf ex:B . _:x a owl:Axiom ; owl:annotatedSource ex:A ; \
+             owl:annotatedProperty rdfs:subClassOf ; owl:annotatedTarget ex:B ; \
+             rdfs:comment \"why\" . _:x rdfs:comment \"given\" . [] a owl:Annotation ; \
+             owl:annotatedSource _:x ; owl:annotatedProperty rdfs:comment ; \
+             owl:annotatedTarget \"given\" ; rdfs:comment \"how\" .",
+            1,
+        ),
+    ] {
+        let (kept, _, diagnostics) = kept_and_malformed(turtle);
+        eprintln!("NEIGHBOUR {turtle:?}: kept {kept:?}; {diagnostics:?}");
+        if kept.len() != axioms || !diagnostics.is_empty() {
+            wrong.push(format!("{turtle}: kept {kept:?}; {diagnostics:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
