@@ -532,6 +532,7 @@ the tableau). Pairs that hang are recorded in their case (`hangs`) and not run a
 | `commits-readers` | maintenance | owl2-rl | graphdb: owl2-rl |  | 4,000 one-person commits added then removed under OWL 2 RL, with 8 readers running queries |
 | `commits-rdfs` | maintenance | rdfs | graphdb: rdfs |  | the same commits under RDFS, without readers |
 | `commits-plain` | maintenance | none | rdf4j: plain, oxigraph: plain, jena: plain | RDF4J | 20,000 commits without reasoning: the store's own write path, 4 readers alongside |
+| `commits-large-schema` | maintenance | owl2-rl | none: NRESE's own column |  | 2,000 one-person inserts under OWL 2 RL over 30,000 classes that no commit touches: a commit's cost follows its change, not the schema's size |
 | `deletes-layered` | maintenance | owl2-rl | graphdb: owl2-rl |  | 6 deletions in a layered graph whose facts have many derivations (after SSPE): 4-10 s each on 6 Oct 2026 |
 | `deletes-clique` | maintenance | owl2-rl | graphdb: owl2-rl |  | 4 edge deletions splitting a 300-node symmetric-transitive clique (the worst case for proofs) |
 | `support-copies-8` | access | owl2-rl | none: NRESE's own column |  | support sets: 5,000 subjects, each target derivable from 8 graphs alone (8 sets), capped at 16 (all kept) and every set kept |

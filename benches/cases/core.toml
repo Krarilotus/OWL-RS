@@ -373,6 +373,20 @@ systems = ["rdf4j:plain", "oxigraph:plain", "jena:plain"]
 home_turf = "rdf4j"
 
 [[case]]
+name = "commits-large-schema"
+area = "maintenance"
+what = "2,000 one-person inserts under OWL 2 RL over 30,000 classes that no commit touches: a commit's cost follows its change, not the schema's size"
+semantics = "owl2-rl"
+data = "churn people=20000 changes=2000 schema=30000 delete=0"
+args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru"]
+queries = "churn"
+metric = "commits.p50_ms"
+check = { "closure_after_commits.equal" = "true", "commits.commits" = 2000 }
+route = { "commits.incremental" = "== true" }
+cap_gb = 4
+systems = []
+
+[[case]]
 name = "deletes-layered"
 area = "maintenance"
 what = "6 deletions in a layered graph whose facts have many derivations (after SSPE): 4-10 s each on 6 Oct 2026"
