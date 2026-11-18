@@ -478,3 +478,33 @@ fn a_facet_node_without_a_facet_reads_its_statement_as_itself_in_either_order() 
         );
     }
 }
+
+/// Spec (*Mapping to RDF Graphs* Table 12: a facet restriction is a blank node): a datatype
+/// restriction whose facet node is named (`ex:f xsd:minInclusive 0`, alone in its list or
+/// before a facet node that isn't a facet) is malformed, reported in either order of the
+/// statements, the same parts left out and the same axioms kept. Each order's reading printed.
+#[test]
+fn a_facet_restriction_on_a_named_node_reads_the_same_in_either_order() {
+    for list in ["ex:f", "ex:f _:bad"] {
+        let mut table = Table::default();
+        let statements = load(
+            &mut table,
+            &format!(
+                "ex:p a owl:DatatypeProperty . ex:A a owl:Class .
+                ex:p rdfs:range [ owl:onDatatype xsd:integer ; owl:withRestrictions ( {list} ) ] .
+                ex:f xsd:minInclusive 0 .
+                _:bad a ex:A ."
+            ),
+        );
+        let reversed: Vec<Statement> = statements.iter().rev().copied().collect();
+        let [written, backwards] = [&statements, &reversed].map(|order| reading(order, &table));
+        eprintln!("NAMED ( {list} ) as written: {written:?}");
+        eprintln!("NAMED ( {list} ) reversed: {backwards:?}");
+        assert_eq!(written, backwards, "( {list} ): either order");
+        assert!(
+            (written.0.iter()).any(|d| d.starts_with("a facet restriction not on a blank node: ")),
+            "( {list} ): left out {:?}",
+            written.0
+        );
+    }
+}
