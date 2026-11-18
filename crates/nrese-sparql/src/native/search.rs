@@ -147,10 +147,7 @@ pub(super) fn is_jena(triple: &TriplePattern) -> bool {
 }
 
 pub(super) fn invokes_search(triples: &[TriplePattern]) -> bool {
-    triples.iter().any(|triple| {
-        (is_jena(triple) && jena_arguments(triple, triples).is_some())
-            || bds_search(triple).is_some()
-    })
+    jena(triples).is_some() || triples.iter().any(|triple| bds_search(triple).is_some())
 }
 
 fn bds_search(triple: &TriplePattern) -> Option<(Variable, &Literal)> {
@@ -295,25 +292,6 @@ fn lucene(text: &str) -> (String, bool) {
     (out.join(" "), all_words)
 }
 
-type JenaArguments = (Option<NamedNode>, Literal, Vec<TermPattern>, Vec<usize>);
-
-fn jena_arguments(triple: &TriplePattern, triples: &[TriplePattern]) -> Option<JenaArguments> {
-    if matches!(&triple.subject, TermPattern::NamedNode(n) if n.as_str() == rdf::NIL.as_str()) {
-        return None;
-    }
-    let (terms, used) =
-        list(&triple.object, triples).unwrap_or_else(|| (vec![triple.object.clone()], Vec::new()));
-    let mut arguments = terms.into_iter();
-    let (property, query) = match arguments.next()? {
-        TermPattern::NamedNode(property) => (Some(property), arguments.next()?),
-        query => (None, query),
-    };
-    match query {
-        TermPattern::Literal(text) => Some((property, text, arguments.collect(), used)),
-        _ => None,
-    }
-}
-
 /// The `text:query` patterns among `triples` as searches, each with the triple pattern
 /// that joins its literal to the subject (`?s <property> ?literal`), and the other triple
 /// patterns; `None` if there is none.
@@ -333,8 +311,17 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
         consumed.extend(used);
         let subject = outputs.first().cloned()?;
         // The object: "query", or (property? "query" limit? "name:value"*).
-        let (property, text, arguments, used) = jena_arguments(triple, triples)?;
+        let (arguments, used) = list(&triple.object, triples)
+            .unwrap_or_else(|| (vec![triple.object.clone()], Vec::new()));
         consumed.extend(used);
+        let mut arguments = arguments.into_iter();
+        let (property, query) = match arguments.next()? {
+            TermPattern::NamedNode(property) => (Some(property), arguments.next()?),
+            query => (None, query),
+        };
+        let TermPattern::Literal(text) = query else {
+            return None;
+        };
         let (text, all_words) = lucene(text.value());
         let literal = outputs
             .get(2)

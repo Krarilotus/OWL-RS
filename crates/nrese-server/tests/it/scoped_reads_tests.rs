@@ -1089,24 +1089,22 @@ async fn scoped_preparation_refuses_search_in_a_plan_request() -> TestResult {
 
 #[tokio::test]
 async fn scoped_preparation_preserves_an_ordinary_text_predicate() -> TestResult {
-    // Spec: A blank object without a Jena query argument is an ordinary
-    // triple pattern, so a scoped query returns its asserted match.
+    // Spec: A Jena-shaped group with a bare blank argument uses ordinary
+    // triple scans, including when another triple has a valid query argument.
     let app = app(StoreConfig::default(), false)?;
     insert(
         &app,
-        "GRAPH :g1 { ex:a <http://jena.apache.org/text#query> ex:b }",
+        r#"GRAPH :g1 { ex:a <http://jena.apache.org/text#query> "alpha" }"#,
     )
     .await?;
-    let reply = select(
-        &app,
-        &[],
-        SCOPED,
-        "?s",
-        G1,
+    for pattern in [
         "{ ?s <http://jena.apache.org/text#query> [] }",
-    )
-    .await?;
-    assert_eq!(reply.rows(), bindings(&[A]));
+        r#"{ ?s <http://jena.apache.org/text#query> [] .
+             ?s <http://jena.apache.org/text#query> "alpha" }"#,
+    ] {
+        let reply = select(&app, &[], SCOPED, "?s", G1, pattern).await?;
+        assert_eq!(reply.rows(), bindings(&[A]), "{pattern}");
+    }
     Ok(())
 }
 
