@@ -142,15 +142,32 @@ pub(super) fn is_search(triple: &TriplePattern, triples: &[TriplePattern]) -> bo
             }))
 }
 
-/// Whether `pattern` holds a search anywhere, in an `EXISTS` too. A search reads the group
-/// it is written in whole, which the rewrites and routes that move triple patterns between
-/// groups don't know: such a query is evaluated as written ([`Context::for_query`]).
-pub(super) fn anywhere(pattern: &nrese_sparql_syntax::algebra::GraphPattern) -> bool {
+/// Whether a query is evaluated as written: asked so in `options`, or its pattern may hold a
+/// search anywhere, in an `EXISTS` too. A search reads the group it is written in whole,
+/// which the rewrites and routes that move triple patterns between groups don't know.
+/// "May": a triple pattern with a search vocabulary's predicate, written or pre-bound,
+/// whatever its object, since a binding put in later can still make it a search.
+pub(super) fn as_written(
+    pattern: &nrese_sparql_syntax::algebra::GraphPattern,
+    options: &crate::QueryOptions,
+) -> bool {
     use nrese_sparql_syntax::{algebra::GraphPattern, visit::Node};
-    pattern.find(&mut |node| {
-        matches!(node, Node::Pattern(GraphPattern::Bgp { patterns })
-            if patterns.iter().any(|t| is_search(t, patterns)))
-    })
+    let pre_bound = options.pre_bound.as_deref();
+    let vocabulary = |triple: &TriplePattern| {
+        let iri = match &triple.predicate {
+            NamedNodePattern::NamedNode(n) => n.as_str(),
+            NamedNodePattern::Variable(v) => match pre_bound.and_then(|values| values.get(v)) {
+                Some(Term::NamedNode(n)) => n.as_str(),
+                _ => return false,
+            },
+        };
+        iri == JENA_QUERY || iri.starts_with(BDS) || iri.starts_with(LUC)
+    };
+    options.as_written
+        || pattern.find(&mut |node| {
+            matches!(node, Node::Pattern(GraphPattern::Bgp { patterns })
+                if patterns.iter().any(vocabulary))
+        })
 }
 
 /// A `text:query`, or a GraphDB `luc:` search (`?x luc:index "query"`).

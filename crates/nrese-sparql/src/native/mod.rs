@@ -572,10 +572,9 @@ pub(crate) fn delete_insert(
     if let Some(what) = unsupported_part(pattern) {
         return Err(QueryEvaluationError::Unsupported(what));
     }
-    let mut ctx = Context::new(snapshot, options, using, base);
-    let searched = search::anywhere(pattern);
-    ctx.as_written |= searched;
-    let pattern = match searched {
+    let as_written = search::as_written(pattern, options);
+    let ctx = Context::in_mode(snapshot, options, using, base, as_written);
+    let pattern = match as_written {
         true => pattern.clone(),
         false => optimise(pattern.clone(), &mut Vec::new(), &ctx),
     };
@@ -684,7 +683,7 @@ fn index_answer(
     let Query::Select { pattern, .. } = query else {
         return None;
     };
-    if options.as_written
+    if ctx.as_written
         || options.pre_bound.is_some()
         || options.pin.is_some()
         || ctx.canonical_answers()
@@ -1677,19 +1676,32 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// [`Self::new`] for `query`, as written where it holds a search ([`search::anywhere`]).
+    /// The context for `query`, in the mode it is evaluated in ([`search::as_written`]).
     fn for_query(snapshot: &'a Snapshot, query: &Query, options: &QueryOptions) -> Self {
-        let mut ctx = Self::new(snapshot, options, query_dataset(query), query_base(query));
-        ctx.as_written |= search::anywhere(pattern_and_form(query).0);
-        ctx
+        let as_written = search::as_written(pattern_and_form(query).0, options);
+        let (dataset, base) = (query_dataset(query), query_base(query));
+        Self::in_mode(snapshot, options, dataset, base, as_written)
     }
 
     /// `dataset` is the query's own (`FROM`); the protocol's, in `options`, replaces it.
+    #[cfg(test)]
     fn new(
         snapshot: &'a Snapshot,
         options: &QueryOptions,
         dataset: Option<&nrese_sparql_syntax::algebra::QueryDataset>,
         base: Option<&nrese_rdf::Iri<String>>,
+    ) -> Self {
+        Self::in_mode(snapshot, options, dataset, base, options.as_written)
+    }
+
+    /// [`Self::new`], evaluating as written if `as_written`: decided before the result
+    /// cache's scope is, which keys by it.
+    fn in_mode(
+        snapshot: &'a Snapshot,
+        options: &QueryOptions,
+        dataset: Option<&nrese_sparql_syntax::algebra::QueryDataset>,
+        base: Option<&nrese_rdf::Iri<String>>,
+        as_written: bool,
     ) -> Self {
         use crate::dataset::{DefaultGraph, ResolvedDataset};
         let resolved = ResolvedDataset::resolve(
@@ -1750,7 +1762,7 @@ impl<'a> Context<'a> {
             merge_set,
             named,
             store_default,
-            as_written: options.as_written,
+            as_written,
             spatial_rewrite: !options.geosparql_stated_only,
             cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
             stream_rows: options.stream_rows,
@@ -2316,16 +2328,17 @@ impl<'a> Context<'a> {
                 else {
                     unreachable!("matched above")
                 };
-                let others: Vec<GraphPattern> = inputs
+                let mut others: Vec<GraphPattern> = inputs
                     .iter()
                     .enumerate()
                     .filter(|&(i, _)| i != at)
                     .map(|(_, input)| input.clone())
                     .collect();
-                // As written, the groups stay apart (`join_all` merges leading ones).
-                let local = match self.as_written && others.len() > 1 {
-                    true => GraphPattern::Join { inputs: others },
-                    false => GraphPattern::join_all(others),
+                // As written, the groups stay apart (`join_all` flattens and merges them).
+                let local = match (self.as_written, others.len()) {
+                    (true, 1) => others.remove(0),
+                    (true, 2..) => GraphPattern::Join { inputs: others },
+                    _ => GraphPattern::join_all(others),
                 };
                 if vectors::is_search(name) {
                     return self.vector_join(&local, inner);
