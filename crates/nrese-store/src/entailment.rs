@@ -390,9 +390,21 @@ impl StoreService {
         };
         let budget = gate::budget(self, None, &memory);
         let checked = consistency::check(&premise, &budget);
-        if checked.verdict != Verdict::Consistent {
-            let answer = match &checked.verdict {
-                Verdict::Unknown(why) => Entailed::Unknown(format!("the premise: {why}")),
+        // Over a consistent premise, a conclusion stating SHACL content is left undecided: whether
+        // it reads as SHACL content or as any other statement turns on the premise and the
+        // conclusion read together (`nrese_owl::Ontology::shacl`), which isn't decided yet.
+        let shacl = conclusion
+            .iter()
+            .find(|t| nrese_owl::is_shacl_property(t.predicate.as_str()));
+        if checked.verdict != Verdict::Consistent || shacl.is_some() {
+            let answer = match (&checked.verdict, shacl) {
+                (Verdict::Unknown(why), _) => Entailed::Unknown(format!("the premise: {why}")),
+                (Verdict::Consistent, Some(t)) => Entailed::Unknown(format!(
+                    "the conclusion states SHACL content ({}): whether it is read as SHACL \
+                     content or as OWL together with the premise isn't decided yet; the \
+                     premise's own reading is unaffected",
+                    t.predicate
+                )),
                 _ => Entailed::Yes,
             };
             return Ok(DlEntailment {
@@ -442,20 +454,7 @@ impl StoreService {
             });
         };
         let decode = |term| tx.decode(term);
-        // The conclusion reads SHACL content as one store of it and the premise would
-        // (`nrese_owl::Ontology::shacl`): where it states SHACL content and the premise reads its
-        // own as any other (a SHACL property as an axiom's predicate), or an axiom of the premise
-        // names a SHACL property it states, every statement of it is read as any other (the
-        // reader looks the SHACL vocabulary up only to find its content); else as it reads alone.
-        let id = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
-        let shacl: Vec<u64> = nrese_owl::shacl_properties()
-            .filter_map(|i| Some(id(&i)?.raw()))
-            .collect();
-        let stated = |t: &u64| shacl.contains(t) && statements.iter().any(|s| s.triple[1] == *t);
-        let names = |&[s, p, o]: &[u64; 3]| shacl.contains(&p) || stated(&s) || stated(&o);
-        let mut triples = premise.sources.iter().flatten().flat_map(|s| &s.triples);
-        let owl = shacl.iter().any(stated) && triples.any(names);
-        let lookup = |iri: &str| id(iri).filter(|_| !(owl && nrese_owl::is_shacl_property(iri)));
+        let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
         let read = nrese_owl::read(
             &statements,
             &source::StoreTerms {
