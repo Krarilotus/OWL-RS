@@ -42,7 +42,7 @@ use super::{
 pub(super) fn supported_expression(expression: &Expression, outer: &[Variable]) -> bool {
     let mut patterns = Vec::new();
     let plain = split(expression, &mut patterns, &mut |n| {
-        Variable::new_unchecked(format!("exists {n}"))
+        nrese_sparql_syntax::internal::variable("exists", n)
     });
     let _ = outer;
     expr::supported(&plain) && patterns.iter().all(|(_, pattern)| supported(pattern))
@@ -72,8 +72,8 @@ pub(super) fn correlation_safe(pattern: &GraphPattern, outer: &[Variable]) -> bo
     };
     match pattern {
         GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => true,
-        GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
-            correlation_safe(left, outer) && correlation_safe(right, outer)
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            inputs.iter().all(|input| correlation_safe(input, outer))
         }
         GraphPattern::Graph { inner, .. }
         | GraphPattern::Distinct { inner }
@@ -82,9 +82,12 @@ pub(super) fn correlation_safe(pattern: &GraphPattern, outer: &[Variable]) -> bo
         GraphPattern::Filter { expr, inner } => {
             correlation_safe(inner, outer) && covered(&deep_variables(expr), inner)
         }
-        GraphPattern::Extend {
-            inner, expression, ..
-        } => correlation_safe(inner, outer) && covered(&deep_variables(expression), inner),
+        GraphPattern::Extend { inner, bindings } => {
+            correlation_safe(inner, outer)
+                && bindings
+                    .iter()
+                    .all(|(_, expression)| covered(&deep_variables(expression), inner))
+        }
         GraphPattern::LeftJoin {
             left,
             right,
@@ -175,10 +178,12 @@ fn walk_pattern(pattern: &GraphPattern, out: &mut Vec<Variable>) {
             }
             walk_pattern(inner, out);
         }
-        GraphPattern::Join { left, right }
-        | GraphPattern::Lateral { left, right }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => {
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            for input in inputs {
+                walk_pattern(input, out);
+            }
+        }
+        GraphPattern::Lateral { left, right } | GraphPattern::Minus { left, right } => {
             walk_pattern(left, out);
             walk_pattern(right, out);
         }
@@ -197,14 +202,12 @@ fn walk_pattern(pattern: &GraphPattern, out: &mut Vec<Variable>) {
             walk_pattern(inner, out);
             walk_expression(expr, out);
         }
-        GraphPattern::Extend {
-            inner,
-            variable,
-            expression,
-        } => {
+        GraphPattern::Extend { inner, bindings } => {
             walk_pattern(inner, out);
-            push(out, variable);
-            walk_expression(expression, out);
+            for (variable, expression) in bindings {
+                push(out, variable);
+                walk_expression(expression, out);
+            }
         }
         GraphPattern::Values { variables, .. } => {
             for v in variables {
@@ -345,15 +348,18 @@ fn split(
 }
 
 impl Context<'_> {
-    /// A variable no query can name, for a column the executor adds for itself.
-    fn synthetic(&self, what: &str) -> Variable {
+    /// A variable no query can name, for a column the executor adds for itself (`what`, one
+    /// word: [`nrese_sparql_syntax::internal::variable`]).
+    pub(super) fn synthetic(&self, what: &str) -> Variable {
         let n = self.synthetic.get();
         self.synthetic.set(n + 1);
-        Variable::new_unchecked(format!("{what} {n}"))
+        nrese_sparql_syntax::internal::variable(what, n)
     }
 
-    /// `solutions` with a boolean column for each `EXISTS` in `expression`, and the
-    /// expression reading those columns instead; the columns are the last `count`.
+    /// `solutions` (charged) with a boolean column for each `EXISTS` in `expression`, and
+    /// the expression reading those columns instead; the columns are the last `count`,
+    /// each charged before it is made, however many the expression holds
+    /// ([`Self::drop_added`] releases them).
     pub(super) fn with_exists(
         &self,
         mut solutions: Solutions,
@@ -361,14 +367,17 @@ impl Context<'_> {
     ) -> NativeResult<(Solutions, Expression, usize)> {
         let mut patterns = Vec::new();
         let plain = split(expression, &mut patterns, &mut |_| self.synthetic("exists"));
-        let yes = self.id(&Term::from(Literal::from(true)));
-        let no = self.id(&Term::from(Literal::from(false)));
+        let yes = self.id(&Term::from(Literal::from(true)))?;
+        let no = self.id(&Term::from(Literal::from(false)))?;
         for (variable, pattern) in &patterns {
             let mask = self.exists_mask(&solutions, pattern)?;
-            let mut columns = std::mem::take(&mut solutions.table).into_columns();
-            columns.push(mask.iter().map(|&m| if m { yes } else { no }).collect());
-            solutions.table = IdTable::from_columns(columns);
-            solutions.vars.push(variable.clone());
+            let growth = mask.len().saturating_mul(8);
+            solutions = self.reshaped(solutions, growth, |mut solutions| {
+                let column = mask.iter().map(|&m| if m { yes } else { no }).collect();
+                solutions.table.push_column(column);
+                solutions.vars.push(variable.clone());
+                solutions
+            })?;
         }
         Ok((solutions, plain, patterns.len()))
     }
@@ -380,6 +389,22 @@ impl Context<'_> {
         pattern: &GraphPattern,
         keep_matching: bool,
     ) -> NativeResult<Solutions> {
+        let start = std::time::Instant::now();
+        let input = solutions.table.len();
+        // EXPLAIN: how the EXISTS ran, with the filter's estimate (all rows for EXISTS,
+        // nine in ten for NOT EXISTS, as `pushdown::selectivity` has it).
+        let note = |operator: &str, detail: String, rows: usize| {
+            if self.trace.is_some() {
+                let kept = if keep_matching { 1.0 } else { 0.9 };
+                let estimate = Some((input as f64 * kept).round() as u64);
+                self.note(operator, detail, estimate, rows, start);
+            }
+        };
+        let joined = if keep_matching {
+            "semi join"
+        } else {
+            "anti join"
+        };
         let (conjuncts, inner) = top_filters(pattern);
         let correlated = conjuncts
             .iter()
@@ -392,6 +417,8 @@ impl Context<'_> {
                 solutions
                     .table
                     .retain_mask(&mask.iter().map(|m| *m == keep_matching).collect::<Vec<_>>());
+                let detail = "the pattern per distinct value of the row it reads".to_owned();
+                note("exists per value", detail, solutions.table.len());
                 return Ok(solutions);
             }
             // One evaluation, one semi- or anti-join. Only the shared variables' distinct
@@ -408,19 +435,35 @@ impl Context<'_> {
                 self.eval_set(pattern, &shared)?
             };
             let (lk, rk) = shared_columns(&solutions, &found);
+            let names: Vec<String> = lk.iter().map(|&c| solutions.vars[c].to_string()).collect();
+            let detail = format!(
+                "EXISTS once, as a set of {} row(s) over {}",
+                found.table.len(),
+                names.join(" ")
+            );
             if !has_undef(&solutions.table, &lk) && !has_undef(&found.table, &rk) {
                 match keep_matching {
                     true => semi_join_in_place(&mut solutions.table, &found.table, &lk, &rk),
                     false => anti_join_in_place(&mut solutions.table, &found.table, &lk, &rk),
                 }
-                self.consumed(&found);
+                .map_err(crate::QueryEvaluationError::from)?;
+                self.consumed(found);
+                note(joined, detail, solutions.table.len());
                 return Ok(solutions);
             }
             // An unbound variable isn't put into the pattern: any value matches.
-            let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false);
-            self.consumed(&found);
+            let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false)
+                .map_err(crate::QueryEvaluationError::from)?;
+            self.consumed(found);
+            let kept = mask.iter().filter(|m| **m == keep_matching).count();
+            note(joined, detail, kept);
             mask
         };
+        if correlated {
+            let kept = mask.iter().filter(|m| **m == keep_matching).count();
+            let detail = "the pattern once, joined to the rows' distinct values".to_owned();
+            note("correlated exists", detail, kept);
+        }
         solutions
             .table
             .retain_mask(&mask.iter().map(|m| *m == keep_matching).collect::<Vec<_>>());
@@ -486,12 +529,15 @@ impl Context<'_> {
                 }
                 if let Some(term) = self.term(id) {
                     if let Term::BlankNode(b) = &term {
-                        self.register_alias(super::substitute::alias(b.as_str()).as_str(), id);
+                        self.register_alias(
+                            nrese_sparql_syntax::internal::blank_constant(b.as_str()).as_str(),
+                            id,
+                        );
                     }
                     terms.insert(variable.clone(), term);
                 }
             }
-            let substituted = super::substitute::Values { terms: &terms }.pattern(pattern);
+            let substituted = super::substitute::Values::new(self, &terms)?.pattern(pattern);
             let found = match graph {
                 Some(id) => self.in_graph(
                     GraphScope::Named(nrese_engine::TermId::from_raw(id)),
@@ -500,7 +546,7 @@ impl Context<'_> {
                 None => self.eval(&substituted)?,
             };
             let holds = !found.table.is_empty();
-            self.consumed(&found);
+            self.consumed(found);
             answers.insert(key, holds);
             mask.push(holds);
         }
@@ -526,8 +572,9 @@ impl Context<'_> {
         if correlated.is_empty() {
             let found = self.eval(pattern)?;
             let (lk, rk) = shared_columns(solutions, &found);
-            let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false);
-            self.consumed(&found);
+            let mask = compatible_mask(&solutions.table, &found.table, &lk, &rk, false)
+                .map_err(crate::QueryEvaluationError::from)?;
+            self.consumed(found);
             return Ok(mask);
         }
         let mut found = self.eval(inner)?;
@@ -563,7 +610,7 @@ impl Context<'_> {
             });
             key_of_row.push(id);
         }
-        let key_variable = self.synthetic("exists key");
+        let key_variable = self.synthetic("exists-key");
         let mut vars: Vec<Variable> = keys.iter().map(|&c| solutions.vars[c].clone()).collect();
         vars.push(key_variable.clone());
         let distinct = self.produced(Solutions {
@@ -580,7 +627,7 @@ impl Context<'_> {
         for &id in joined.table.column(column) {
             holds[id as usize] = true;
         }
-        self.consumed(&joined);
+        self.consumed(joined);
         Ok(key_of_row.iter().map(|&id| holds[id as usize]).collect())
     }
 
@@ -595,12 +642,14 @@ impl Context<'_> {
     ) -> NativeResult<Solutions> {
         let ordered = left.ordered;
         let rows = left.table.len();
-        let row_variable = self.synthetic("left row");
-        let mut numbered = left;
-        let mut columns = std::mem::take(&mut numbered.table).into_columns();
-        columns.push((0..rows as u64).collect());
-        numbered.table = IdTable::from_columns(columns);
-        numbered.vars.push(row_variable.clone());
+        let row_variable = self.synthetic("left-row");
+        // The row numbers' column, charged before it is made: `numbered` is consumed as
+        // the charged table it is.
+        let numbered = self.reshaped(left, rows.saturating_mul(8), |mut numbered| {
+            numbered.table.push_column((0..rows as u64).collect());
+            numbered.vars.push(row_variable.clone());
+            numbered
+        })?;
         let (lk, rk) = shared_columns(&numbered, &right);
         let vars = super::joined_vars(&numbered, &right, &rk);
         let max_rows = self.row_limit(vars.len());
@@ -613,8 +662,8 @@ impl Context<'_> {
             false,
             max_rows,
         )
-        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
-        self.consumed(&right);
+        .map_err(|e| self.join_stopped(e, vars.len()))?;
+        self.consumed(right);
         let pairs = self.produced(Solutions {
             vars,
             table: pairs,
@@ -656,13 +705,13 @@ impl Context<'_> {
             out.push_row(&line);
         }
         unmatched_before(rows, &mut out, &mut line);
-        self.consumed(&pairs);
-        self.consumed(&numbered);
         let vars: Vec<Variable> = pairs.vars[..width]
             .iter()
             .filter(|v| **v != row_variable)
             .cloned()
             .collect();
+        self.consumed(pairs);
+        self.consumed(numbered);
         debug_assert_eq!(vars.len(), width - 1);
         self.produced(Solutions {
             vars,

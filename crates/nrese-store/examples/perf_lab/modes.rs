@@ -1,0 +1,807 @@
+//! The perf lab's measurements beyond a query set, for the fast suite (`benches/fast`):
+//! commits through the mutation pipeline with readers alongside, clients running the query
+//! set concurrently, blank-node canonicalisation, and Turtle parsing alone.
+
+use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
+
+use nrese_store::{
+    CancellationToken, MutationCommand, MutationPipeline, MutationTicket, PreparedQuery, Requester,
+    SparqlUpdateRequest, StoreService,
+};
+
+use crate::CountingSink;
+
+/// `p50`, `p99` and `max` of `times`, in ms (sorted here).
+pub fn percentiles(times: &mut [Duration]) -> (f64, f64, f64) {
+    if times.is_empty() {
+        return (0.0, 0.0, 0.0);
+    }
+    times.sort();
+    let at = |q: f64| times[((times.len() - 1) as f64 * q).round() as usize].as_secs_f64() * 1e3;
+    (at(0.5), at(0.99), at(1.0))
+}
+
+/// Readers cycling through `queries` until `stop`, each from its own offset; their
+/// latencies.
+fn spawn_readers(
+    store: &Arc<StoreService>,
+    queries: &[String],
+    readers: usize,
+    stop: &Arc<AtomicBool>,
+) -> Vec<std::thread::JoinHandle<Result<Vec<Duration>, String>>> {
+    (0..readers)
+        .map(|reader| {
+            let (store, stop) = (Arc::clone(store), Arc::clone(stop));
+            let queries = queries.to_vec();
+            std::thread::spawn(move || {
+                let prepared: Vec<PreparedQuery> = queries
+                    .iter()
+                    .map(|q| PreparedQuery::parse(&crate::request(q)))
+                    .collect::<Result<_, _>>()
+                    .map_err(|e| e.to_string())?;
+                let mut times = Vec::new();
+                let mut i = reader;
+                while !stop.load(Ordering::Relaxed) && !prepared.is_empty() {
+                    let started = Instant::now();
+                    store
+                        .run_query(
+                            &prepared[i % prepared.len()],
+                            &CancellationToken::new(),
+                            &mut CountingSink::default(),
+                        )
+                        .map_err(|e| e.to_string())?;
+                    times.push(started.elapsed());
+                    i += 1;
+                }
+                Ok(times)
+            })
+        })
+        .collect()
+}
+
+fn join_readers(
+    handles: Vec<std::thread::JoinHandle<Result<Vec<Duration>, String>>>,
+) -> Result<Vec<Duration>, String> {
+    let mut all = Vec::new();
+    for handle in handles {
+        all.extend(
+            handle
+                .join()
+                .map_err(|_| "a reader panicked".to_owned())??,
+        );
+    }
+    Ok(all)
+}
+
+/// Applies every line of `file` (one SPARQL update each) as a commit through `pipeline`,
+/// with `readers` threads running `queries` meanwhile. The JSON object of the
+/// measurement: commit and read latencies, and whether every commit was maintained
+/// incrementally (no full rematerialisation since `revision_before`).
+pub fn commits(
+    pipeline: &MutationPipeline,
+    file: &Path,
+    queries: &[String],
+    readers: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let store = Arc::clone(pipeline.store());
+    let updates: Vec<String> = std::fs::read_to_string(file)?
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .map(str::to_owned)
+        .collect();
+    let rematerialised_before = store.last_materialisation().map(|m| m.revision);
+    let stop = Arc::new(AtomicBool::new(false));
+    // Checkpoints written meanwhile: on a durable store, the automatic ones the commits'
+    // log growth asks for (checkpoint-under-readers checks that they overlap).
+    let checkpoints_before = store.engine_stats().checkpoints;
+    let handles = spawn_readers(&store, queries, readers, &stop);
+    let (mut times, mut inserted, mut deleted, mut rounds) = (Vec::new(), 0u64, 0u64, 0usize);
+    // The maintenance's work over the commits, in counts (equality cases compare these).
+    let mut work = [0u64; 9];
+    let started = Instant::now();
+    let mut failure = None;
+    for update in &updates {
+        let at = Instant::now();
+        match pipeline.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(update.clone())),
+            &Requester::all(),
+            &MutationTicket::new(),
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                failure = Some(format!("{e}"));
+                break;
+            }
+        }
+        times.push(at.elapsed());
+        if let Some(run) = pipeline.last_reasoning_run() {
+            inserted += run.inferred_inserted;
+            deleted += run.inferred_deleted;
+            rounds = rounds.max(run.rounds);
+            let w = &run.work;
+            let plan = |plan| u64::from(w.plan == plan);
+            let counts = [
+                plan(nrese_reasoner::delta::policy::Plan::Recompute),
+                plan(nrese_reasoner::delta::policy::Plan::Rebuild),
+                w.region_terms,
+                w.region_facts,
+                w.overdeleted,
+                w.rederived,
+                w.dred_estimate,
+                w.recompute_estimate,
+                w.rebuild_estimate,
+            ];
+            for (total, count) in work.iter_mut().zip(counts) {
+                *total = total.saturating_add(count);
+            }
+        }
+    }
+    let whole = started.elapsed();
+    // Written by the time the commits ended, before the readers stop: overlapping both.
+    let checkpoints = store.engine_stats().checkpoints - checkpoints_before;
+    stop.store(true, Ordering::Relaxed);
+    let mut reads = join_readers(handles)?;
+    let read_qps = reads.len() as f64 / whole.as_secs_f64();
+    let incremental = store.last_materialisation().map(|m| m.revision) == rematerialised_before;
+    let (p50, p99, max) = percentiles(&mut times);
+    let samples: Vec<String> = times
+        .iter()
+        .map(|t| format!("{:.4}", t.as_secs_f64() * 1e3))
+        .collect();
+    let (r50, r99, _) = percentiles(&mut reads);
+    eprintln!(
+        "commits: {} in {:.2} s, p50 {p50:.3} ms, p99 {p99:.3} ms, max {max:.1} ms; inferred +{inserted} -{deleted}; \
+         {} reads (p50 {r50:.2} ms, p99 {r99:.2} ms) by {readers} readers; incremental: {incremental}",
+        times.len(),
+        whole.as_secs_f64(),
+        reads.len(),
+    );
+    let names = [
+        "recomputed",
+        "rebuilt",
+        "region_terms",
+        "region_facts",
+        "overdeleted",
+        "rederived",
+        "dred_estimate",
+        "recompute_estimate",
+        "rebuild_estimate",
+    ];
+    let work: Vec<String> = names
+        .iter()
+        .zip(work)
+        .map(|(name, count)| format!("\"{name}\": {count}"))
+        .collect();
+    Ok(format!(
+        "{{\"commits\": {}, \"whole_s\": {:.3}, \"p50_ms\": {p50:.4}, \"p99_ms\": {p99:.4}, \"max_ms\": {max:.3}, \
+         \"inferred_inserted\": {inserted}, \"inferred_deleted\": {deleted}, \"max_rounds\": {rounds}, \
+         \"incremental\": {incremental}, \"readers\": {readers}, \"reads\": {}, \"read_p50_ms\": {r50:.3}, \
+         \"read_p99_ms\": {r99:.3}, \"read_qps\": {read_qps:.1}, \"checkpoints\": {checkpoints}, \
+         \"samples_ms\": [{}], \"work\": {{{}}}{}}}",
+        times.len(),
+        whole.as_secs_f64(),
+        reads.len(),
+        samples.join(", "),
+        work.join(", "),
+        failure.map_or(String::new(), |f| format!(", \"error\": {f:?}"))
+    ))
+}
+
+/// `clients` threads cycling through `queries` for `duration`: throughput and latency.
+pub fn clients(
+    store: &Arc<StoreService>,
+    queries: &[String],
+    clients: usize,
+    duration: Duration,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let handles = spawn_readers(store, queries, clients, &stop);
+    std::thread::sleep(duration);
+    stop.store(true, Ordering::Relaxed);
+    let mut times = join_readers(handles)?;
+    let qps = times.len() as f64 / duration.as_secs_f64();
+    let (p50, p99, max) = percentiles(&mut times);
+    eprintln!(
+        "clients: {clients} for {:.0} s: {} queries, {qps:.0}/s, p50 {p50:.3} ms, p99 {p99:.3} ms",
+        duration.as_secs_f64(),
+        times.len()
+    );
+    Ok(format!(
+        "{{\"clients\": {clients}, \"queries\": {}, \"qps\": {qps:.1}, \"p50_ms\": {p50:.3}, \"p99_ms\": {p99:.3}, \"max_ms\": {max:.3}}}",
+        times.len()
+    ))
+}
+
+/// Canonicalises each N-Triples file `runs` times; every file must come out the same (the
+/// fast suite passes one graph under different labels and orders).
+pub fn canonicalize(
+    files: &[std::path::PathBuf],
+    runs: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use nrese_rdf_io::{RdfFormat, RdfParser};
+    let mut graphs = Vec::new();
+    for file in files {
+        let bytes = std::fs::read(file)?;
+        let mut graph = nrese_rdf::Graph::new();
+        for triple in RdfParser::from_format(RdfFormat::NTriples).for_slice(&bytes) {
+            graph.insert(&nrese_rdf::Triple::from(triple?));
+        }
+        graphs.push(graph);
+    }
+    let mut times = Vec::new();
+    let mut forms = Vec::new();
+    for _ in 0..runs {
+        forms.clear();
+        for graph in &graphs {
+            let mut graph = graph.clone();
+            let at = Instant::now();
+            graph.canonicalize();
+            times.push(at.elapsed());
+            forms.push(graph.to_string());
+        }
+    }
+    let equal = forms.windows(2).all(|w| w[0] == w[1]);
+    let (p50, _, max) = percentiles(&mut times);
+    eprintln!(
+        "canonicalised {} graphs × {runs}: p50 {p50:.2} ms, max {max:.2} ms; equal: {equal}",
+        graphs.len()
+    );
+    Ok(format!(
+        "{{\"graphs\": {}, \"runs\": {runs}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \"equal\": {equal}}}",
+        graphs.len()
+    ))
+}
+
+/// SplitMix64, for the kernels' data (the same as the generators').
+fn splitmix(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^ (z >> 31)
+}
+
+/// A kernel on generated data, `runs` times: `sort-u128-N` sorts N random 128-bit keys
+/// (two id columns) with the executor's `IdTable::sort_by`, and, for scale, the same keys as
+/// `u128` with the standard library's unstable sort.
+pub fn kernel(name: &str, runs: usize) -> Result<String, Box<dyn std::error::Error>> {
+    let rows: usize = name
+        .strip_prefix("sort-u128-")
+        .ok_or(format!("unknown kernel {name}"))?
+        .parse()?;
+    let mut state = 1u64;
+    let a: Vec<u64> = (0..rows).map(|_| splitmix(&mut state)).collect();
+    let b: Vec<u64> = (0..rows).map(|_| splitmix(&mut state)).collect();
+    let (mut table_times, mut std_times) = (Vec::new(), Vec::new());
+    let mut sorted = true;
+    for _ in 0..runs {
+        let mut table = nrese_exec::IdTable::from_columns(vec![a.clone(), b.clone()]);
+        let at = Instant::now();
+        table.sort_by(&[0, 1]);
+        table_times.push(at.elapsed());
+        sorted &= (1..table.len()).all(|i| {
+            (table.get(i - 1, 0), table.get(i - 1, 1)) <= (table.get(i, 0), table.get(i, 1))
+        });
+        let mut keys: Vec<u128> = a
+            .iter()
+            .zip(&b)
+            .map(|(&x, &y)| (u128::from(x) << 64) | u128::from(y))
+            .collect();
+        let at = Instant::now();
+        keys.sort_unstable();
+        std_times.push(at.elapsed());
+    }
+    let samples: Vec<String> = table_times
+        .iter()
+        .map(|t| format!("{:.3}", t.as_secs_f64() * 1e3))
+        .collect();
+    let (p50, _, _) = percentiles(&mut table_times);
+    let (std50, _, _) = percentiles(&mut std_times);
+    let megabytes = (rows * 16) as f64 / 1048576.0;
+    eprintln!(
+        "{name}: IdTable::sort_by p50 {p50:.1} ms ({:.0} MB/s), std sort_unstable {std50:.1} ms; sorted: {sorted}",
+        megabytes / (p50 / 1e3)
+    );
+    Ok(format!(
+        "{{\"name\": {name:?}, \"rows\": {rows}, \"p50_ms\": {p50:.3}, \"mb_per_s\": {:.1}, \"std_p50_ms\": {std50:.3}, \
+         \"sorted\": {sorted}, \"samples_ms\": [{}]}}",
+        megabytes / (p50 / 1e3),
+        samples.join(", ")
+    ))
+}
+
+/// A Turtle file parsed `runs` times on this thread from memory, nothing stored: the
+/// Turtle parser's own cost (`perf_lab generate turtle` writes the data). The quads are
+/// borrowed and counted; any error fails the run.
+pub fn parse_turtle(file: &Path, runs: usize) -> Result<String, Box<dyn std::error::Error>> {
+    use nrese_rdf_io::{RdfFormat, RdfParser};
+    let bytes = std::fs::read(file)?;
+    let mut times = Vec::new();
+    let mut quads = 0u64;
+    for _ in 0..runs {
+        let at = Instant::now();
+        let mut parser = RdfParser::from_format(RdfFormat::Turtle).for_slice(&bytes);
+        let mut count = 0u64;
+        while let Some(quad) = parser.next_ref() {
+            quad?;
+            count += 1;
+        }
+        times.push(at.elapsed());
+        quads = count;
+    }
+    let (p50, _, max) = percentiles(&mut times);
+    eprintln!(
+        "parsed {quads} quads from {} bytes × {runs}: p50 {p50:.1} ms, max {max:.1} ms",
+        bytes.len()
+    );
+    Ok(format!(
+        "{{\"quads\": {quads}, \"bytes\": {}, \"runs\": {runs}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}}}",
+        bytes.len()
+    ))
+}
+
+/// A Turtle file cut into up to `parts` chunks for parallel parsing `runs` times from
+/// memory, recovering as bulk load does (`RdfParser::split_slice_for_parallel_parsing`):
+/// the skim alone, nothing parsed.
+pub fn split_turtle(
+    file: &Path,
+    parts: usize,
+    runs: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use nrese_rdf_io::{RdfFormat, RdfParser};
+    let bytes = std::fs::read(file)?;
+    let mut times = Vec::new();
+    let mut chunks = 0;
+    for _ in 0..runs {
+        let at = Instant::now();
+        chunks = RdfParser::from_format(RdfFormat::Turtle)
+            .recovering()
+            .split_slice_for_parallel_parsing(&bytes, parts)?
+            .len();
+        times.push(at.elapsed());
+    }
+    let (p50, _, max) = percentiles(&mut times);
+    eprintln!(
+        "split {} bytes into {chunks} chunks × {runs}: p50 {p50:.1} ms, max {max:.1} ms",
+        bytes.len()
+    );
+    Ok(format!(
+        "{{\"chunks\": {chunks}, \"parts\": {parts}, \"bytes\": {}, \"runs\": {runs}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}}}",
+        bytes.len()
+    ))
+}
+
+/// Parsing and planning a query without running it, `runs` times: the cost of the parser
+/// and the rewrites on large or deeply nested queries. The JSON object of a query in the
+/// report, with the plan's size (steps and rewrites) as its counts and no `rows`: no query
+/// runs, so there is no answer to count.
+pub fn parse_and_plan(
+    store: &StoreService,
+    name: &str,
+    text: &str,
+    runs: usize,
+) -> Result<(String, f64), Box<dyn std::error::Error>> {
+    let mut times = Vec::new();
+    let (mut steps, mut rewrites) = (0, 0);
+    for _ in 0..runs {
+        let at = Instant::now();
+        let prepared = PreparedQuery::parse(&crate::request(text))?;
+        let plan = store.plan_query(&prepared, &CancellationToken::new())?;
+        times.push(at.elapsed());
+        steps = plan.steps.len();
+        rewrites = plan.rewrites.len();
+    }
+    let samples: Vec<String> = times
+        .iter()
+        .map(|t| format!("{:.3}", t.as_secs_f64() * 1e3))
+        .collect();
+    let (p50, _, max) = percentiles(&mut times);
+    println!("{name:<28} parse and plan p50 {p50:.2} ms, {steps} steps, {rewrites} rewrites");
+    let json = format!(
+        "    {{\n      \"name\": \"{name}\",\n      \"p50_ms\": {p50:.3},\n      \"max_ms\": {max:.3},\n      \"steps\": {steps},\n      \"rewrites\": {rewrites},\n      \"samples_ms\": [{}]\n    }}",
+        samples.join(", ")
+    );
+    Ok((json, p50))
+}
+
+/// The store's OWL 2 DL classification (`/classification`), `runs` times on fresh stores'
+/// state: the engine that classified, the hierarchy's size, whether it is complete.
+pub fn classification(
+    store: &StoreService,
+    runs: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let mut times = Vec::new();
+    let mut last = None;
+    for _ in 0..runs {
+        let at = Instant::now();
+        let report = store.classify(&nrese_store::ReadScope::All)?;
+        times.push(at.elapsed());
+        last = Some(report);
+    }
+    let report = last.ok_or("--runs must be > 0")?;
+    let samples: Vec<String> = times
+        .iter()
+        .map(|t| format!("{:.3}", t.as_secs_f64() * 1e3))
+        .collect();
+    let (p50, _, max) = percentiles(&mut times);
+    eprintln!(
+        "classification ({}): {} subsumptions, {} unsatisfiable, {}, {} reasons it may be incomplete; p50 {p50:.1} ms",
+        report.engine,
+        report.subsumptions.len(),
+        report.unsatisfiable.len(),
+        report.consistency.as_str(),
+        report.incomplete.len()
+    );
+    // `consistent` (`null` where undecided) stays for harnesses that check it.
+    let consistent = match report.consistency.decided() {
+        Some(decided) => decided.to_string(),
+        None => "null".to_owned(),
+    };
+    Ok(format!(
+        "{{\"engine\": {:?}, \"subsumptions\": {}, \"unsatisfiable\": {}, \"consistency\": {:?}, \
+         \"consistent\": {consistent}, \"incomplete\": {}, \"p50_ms\": {p50:.3}, \"max_ms\": {max:.3}, \
+         \"samples_ms\": [{}]}}",
+        report.engine,
+        report.subsumptions.len(),
+        report.unsatisfiable.len(),
+        report.consistency.as_str(),
+        report.incomplete.len(),
+        samples.join(", ")
+    ))
+}
+
+/// Read replicas' log shipping (`--replication COMMITS:QUADS`): a durable primary commits
+/// COMMITS transactions of QUADS new statements each; then, `runs` times, a fresh durable
+/// follower started from the primary's image (taken before those commits) catches up in
+/// the server's batches (8 MiB), each read from the primary's feed (`Engine::log_since`)
+/// and applied (`Engine::apply_log`). Feed and apply are timed apart, per run; `catch_up`
+/// is the peak memory of a run's catch-up (the apply's, with one batch beside it); and
+/// `caught_up` whether every follower ended at the primary's revision holding exactly the
+/// statements the generator wrote: their decoded set's digest against the generator's own
+/// (`content_ok`), computed after the run's timed and measured window.
+/// Without background maintenance on either engine: no checkpoint lands in a run.
+/// `swap_one` (`--replication-probe swap-one`, for testing that check) has the primary write
+/// one statement other than the generator's: the same revision and count, other content,
+/// which must make the report ineligible.
+pub fn replication(
+    spec: &str,
+    runs: usize,
+    store: Option<&Path>,
+    swap_one: bool,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use nrese_engine::{DurabilityConfig, Engine, EngineConfig, SyncPolicy};
+    use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
+    let (commits, quads) = spec
+        .split_once(':')
+        .ok_or(format!("--replication COMMITS:QUADS, not {spec}"))?;
+    let (commits, quads): (u64, u64) = (commits.parse()?, quads.parse()?);
+    let config = |sync| EngineConfig {
+        background_maintenance: false,
+        durability: DurabilityConfig {
+            sync,
+            ..DurabilityConfig::default()
+        },
+        ..EngineConfig::default()
+    };
+    let root = match store {
+        Some(dir) => tempfile::tempdir_in(dir)?,
+        None => tempfile::tempdir()?,
+    };
+    let (primary_dir, image_dir) = (root.path().join("primary"), root.path().join("image"));
+    // The primary's commits are set-up, not measured: buffered.
+    let primary = Engine::open(&primary_dir, config(SyncPolicy::OsBuffered))?;
+    let quad = |n: u64| {
+        Quad::new(
+            NamedNode::new_unchecked(format!("http://example.com/s{}", n / 8)),
+            NamedNode::new_unchecked(format!("http://example.com/p{}", n % 8)),
+            Literal::new_simple_literal(format!("value {n}")),
+            GraphName::DefaultGraph,
+        )
+    };
+    let expected = digest(
+        std::iter::once(u64::MAX)
+            .chain(0..commits * quads)
+            .map(|n| quad(n).to_string())
+            .collect(),
+    );
+    let held = |engine: &Engine| contents(&engine.snapshot()).map(digest);
+    let mut tx = primary.transaction();
+    tx.insert(quad(u64::MAX).as_ref());
+    tx.commit()?;
+    std::fs::create_dir_all(&image_dir)?;
+    primary.write_image(&image_dir)?;
+    let started = Instant::now();
+    for commit in 0..commits {
+        let mut tx = primary.transaction();
+        for n in 0..quads {
+            let n = commit * quads + n;
+            match swap_one && n == 0 {
+                // Another value in the statement's place: the same count.
+                true => tx.insert(
+                    Quad::new(
+                        NamedNode::new_unchecked("http://example.com/s0"),
+                        NamedNode::new_unchecked("http://example.com/p0"),
+                        Literal::new_simple_literal("swapped"),
+                        GraphName::DefaultGraph,
+                    )
+                    .as_ref(),
+                ),
+                false => tx.insert(quad(n).as_ref()),
+            };
+        }
+        tx.commit()?;
+    }
+    let commit_s = started.elapsed().as_secs_f64();
+    let latest = primary.stats();
+    let (mut feed_times, mut apply_times) = (Vec::new(), Vec::new());
+    let (mut records, mut bytes, mut caught_up, mut content_ok) = (0usize, 0usize, true, true);
+    let mut peaks = Vec::new();
+    for run in 0..runs {
+        let follower_dir = root.path().join(format!("follower-{run}"));
+        std::fs::create_dir_all(&follower_dir)?;
+        for entry in std::fs::read_dir(&image_dir)? {
+            let entry = entry?;
+            std::fs::copy(entry.path(), follower_dir.join(entry.file_name()))?;
+        }
+        // The follower syncs every commit, as a server's replica does by default.
+        let follower = Engine::open(&follower_dir, config(SyncPolicy::EveryCommit))?;
+        let phase = crate::Phase::start();
+        let caught = catch_up(
+            follower.stats().revision,
+            latest.revision,
+            |at| primary.log_since(at, BATCH_BYTES),
+            |batch, at| {
+                follower
+                    .apply_log(
+                        &batch.frames,
+                        &batch.expectation(at),
+                        &nrese_exec::stop::StopSource::none(),
+                    )
+                    .map(|applied| applied.revision)
+            },
+        )?;
+        peaks.push(phase.json());
+        // After the run's window: what the follower holds, against the generator.
+        let reached = follower.stats();
+        let same = held(&follower).is_ok_and(|held| held == expected);
+        content_ok &= same;
+        caught_up &= reached.revision == latest.revision && reached.quads == latest.quads && same;
+        (records, bytes) = (caught.records, caught.bytes);
+        feed_times.push(caught.feed);
+        apply_times.push(caught.apply);
+        drop(follower);
+        std::fs::remove_dir_all(&follower_dir)?;
+    }
+    let ms = |times: &[Duration]| -> Vec<String> {
+        times
+            .iter()
+            .map(|t| format!("{:.3}", t.as_secs_f64() * 1e3))
+            .collect()
+    };
+    let (feed_samples, apply_samples) = (ms(&feed_times), ms(&apply_times));
+    let (feed_p50, _, _) = percentiles(&mut feed_times);
+    let (apply_p50, _, _) = percentiles(&mut apply_times);
+    let per_s = |p50_ms: f64| records as f64 / (p50_ms / 1e3).max(1e-9);
+    let mib = bytes as f64 / 1048576.0;
+    eprintln!(
+        "replication {spec}: {records} records ({mib:.1} MiB); feed p50 {feed_p50:.1} ms ({:.0} records/s), \
+         apply p50 {apply_p50:.1} ms ({:.0} records/s); caught up: {caught_up}",
+        per_s(feed_p50),
+        per_s(apply_p50)
+    );
+    Ok(format!(
+        "{{\"commits\": {commits}, \"quads_per_commit\": {quads}, \"records\": {records}, \"frames_mib\": {mib:.3}, \
+         \"commit_s\": {commit_s:.3}, \"feed_p50_ms\": {feed_p50:.3}, \"apply_p50_ms\": {apply_p50:.3}, \
+         \"feed_records_per_s\": {:.1}, \"apply_records_per_s\": {:.1}, \"caught_up\": {caught_up}, \"content_ok\": {content_ok}, \
+         \"feed_samples_ms\": [{}], \"apply_samples_ms\": [{}], \"catch_up\": [{}]}}",
+        per_s(feed_p50),
+        per_s(apply_p50),
+        feed_samples.join(", "),
+        apply_samples.join(", "),
+        peaks.join(", ")
+    ))
+}
+
+/// A replica's catch-up batch size: the server's (8 MiB).
+pub const BATCH_BYTES: usize = 8 << 20;
+
+/// What a catch-up took: the feed's and the apply's time apart, and the records and frame
+/// bytes it carried.
+pub struct CatchUp {
+    pub feed: Duration,
+    pub apply: Duration,
+    pub records: usize,
+    pub bytes: usize,
+}
+
+/// A follower's catch-up from revision `at` to `latest`: each batch read from the primary's
+/// feed (`feed(at)`) and applied (`apply(batch, at)`, the revision reached), timed apart.
+pub fn catch_up<E: std::error::Error + 'static>(
+    mut at: u64,
+    latest: u64,
+    mut feed: impl FnMut(u64) -> Result<nrese_engine::LogBatch, E>,
+    mut apply: impl FnMut(&nrese_engine::LogBatch, u64) -> Result<u64, E>,
+) -> Result<CatchUp, Box<dyn std::error::Error>> {
+    let mut run = CatchUp {
+        feed: Duration::ZERO,
+        apply: Duration::ZERO,
+        records: 0,
+        bytes: 0,
+    };
+    while at < latest {
+        let started = Instant::now();
+        let batch = feed(at)?;
+        run.feed += started.elapsed();
+        let started = Instant::now();
+        at = apply(&batch, at)?;
+        run.apply += started.elapsed();
+        run.records += batch.records;
+        run.bytes += batch.frames.len();
+    }
+    Ok(run)
+}
+
+/// Every asserted statement `snapshot` holds, decoded, as N-Quads lines, sorted.
+pub fn contents(snapshot: &nrese_engine::Snapshot) -> Result<Vec<String>, String> {
+    use nrese_engine::{QuadPattern, ReadModel};
+    let mut lines = snapshot
+        .quads_for_pattern_in(ReadModel::Asserted, &QuadPattern::all())
+        .map(|q| {
+            snapshot
+                .decode_quad(q)
+                .map(|q| q.to_string())
+                .ok_or_else(|| "a statement doesn't decode".to_owned())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    lines.sort_unstable();
+    Ok(lines)
+}
+
+/// The digest of a set of statements: their N-Quads lines, sorted, hashed.
+pub fn digest(mut lines: Vec<String>) -> String {
+    use sha2::{Digest, Sha256};
+    lines.sort_unstable();
+    let mut hasher = Sha256::new();
+    for line in &lines {
+        hasher.update(line.as_bytes());
+        hasher.update(b"\n");
+    }
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// How `--upload` sends its file (`--upload-as`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadRoute {
+    /// A Graph Store PUT into a named graph.
+    GraphStore,
+    /// RDF4J's statements Add into three contexts.
+    Statements,
+    /// An RDF4J transaction's DELETE of the file's statements, put there first.
+    Delete,
+}
+
+/// An RDF4J transaction's DELETE of `data`, from `graph`, as the server makes it when the
+/// body arrives (`http/rdf4j.rs` `removals`).
+fn delete_ops(
+    data: nrese_store::RdfPayload,
+    graph: nrese_rdf::GraphName,
+) -> Result<Vec<nrese_store::StatementOp>, Box<dyn std::error::Error>> {
+    Ok(vec![nrese_store::StatementOp::remove_patterns(
+        data,
+        vec![graph],
+        false,
+    )?])
+}
+
+/// The upload path (`--upload FILE`): the file sent along `route` to a fresh in-memory
+/// store, `runs` times, each run its own store, through the mutation pipeline as the server
+/// applies it (parse, write, commit). The route's times, the last run's peak memory, and
+/// the statements the store holds after it (the case's check).
+pub fn upload(
+    config: &nrese_store::StoreConfig,
+    file: &Path,
+    format: nrese_store::GraphResultFormat,
+    route: UploadRoute,
+    runs: usize,
+) -> Result<String, Box<dyn std::error::Error>> {
+    use nrese_store::{
+        GraphTarget, GraphWriteRequest, RdfPayload, ReadContext, StatementOp, StatementPattern,
+        StatementsRequest,
+    };
+    const GRAPH: &str = "urn:perf-lab:upload";
+    let graph = || nrese_rdf::NamedNode::new_unchecked(GRAPH);
+    let payload = std::fs::read(file)?;
+    let data = || RdfPayload {
+        payload: payload.clone().into(),
+        format,
+        base_iri: None,
+    };
+    let put = || {
+        MutationCommand::GraphWrite(GraphWriteRequest {
+            target: GraphTarget::NamedGraph(GRAPH.to_owned()),
+            format,
+            base_iri: None,
+            payload: payload.clone().into(),
+            replace: true,
+        })
+    };
+    let (mut times, mut statements, mut peak) = (Vec::new(), 0, String::from("null"));
+    for _ in 0..runs.max(1) {
+        let store = Arc::new(StoreService::new(config.clone())?);
+        let pipeline = MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(nrese_reasoner::ReasonerService::new(Default::default())),
+        );
+        let apply = |command| pipeline.apply(command, &Requester::all(), &MutationTicket::new());
+        if route == UploadRoute::Delete {
+            // The statements to delete, put there first (not timed).
+            apply(put())?;
+        }
+        let phase = crate::Phase::start();
+        let started = Instant::now();
+        match route {
+            UploadRoute::GraphStore => drop(apply(put())?),
+            // RDF4J's `/statements` with three `context` parameters: each statement into
+            // three graphs.
+            UploadRoute::Statements => {
+                let contexts = (0..3)
+                    .map(|i| nrese_rdf::NamedNode::new_unchecked(format!("{GRAPH}:{i}")).into())
+                    .collect();
+                let add = StatementOp::Add {
+                    data: data(),
+                    contexts,
+                };
+                drop(apply(MutationCommand::Statements(StatementsRequest::new(
+                    vec![add],
+                )))?);
+            }
+            // An RDF4J transaction's DELETE of the statements in the graph: its arrival, a
+            // read inside the transaction (its pending operations applied), its commit.
+            UploadRoute::Delete => {
+                let request = StatementsRequest::new(delete_ops(data(), graph().into())?);
+                store.count(
+                    &ReadContext {
+                        pending: Some(&request),
+                        ..ReadContext::all()
+                    },
+                    &StatementPattern::default(),
+                )?;
+                drop(apply(MutationCommand::Statements(request))?);
+            }
+        }
+        times.push(started.elapsed());
+        peak = phase.json();
+        statements = store.count(&ReadContext::all(), &StatementPattern::default())?;
+    }
+    let runs = times.len();
+    let (p50, _, max) = percentiles(&mut times);
+    let min = times.first().map_or(0.0, |t| t.as_secs_f64() * 1e3);
+    Ok(format!(
+        "{{\"p50_ms\": {p50:.3}, \"min_ms\": {min:.3}, \"max_ms\": {max:.3}, \"runs\": {runs}, \"statements\": {statements}, \"bytes\": {}, \"memory\": {peak}}}",
+        payload.len()
+    ))
+}
+
+/// `parse_and_plan`'s query object: the plan's counts and no `rows`, since no query runs (the
+/// gate would compare rows as an answer).
+#[cfg(test)]
+mod parse_only_tests {
+    use nrese_store::{StoreConfig, StoreService};
+
+    #[test]
+    fn a_parse_only_query_reports_its_plan_s_counts_and_no_rows() {
+        let store = StoreService::new(StoreConfig::in_memory()).expect("an in-memory store");
+        let (json, _) = super::parse_and_plan(&store, "all", "SELECT * WHERE { ?s ?p ?o }", 1)
+            .expect("planned");
+        let query: serde_json::Value = serde_json::from_str(&json).expect("a JSON object");
+        assert_eq!(query.get("rows"), None, "rows of a query that never ran");
+        assert!(query["steps"].as_u64().is_some(), "the plan's steps");
+    }
+}

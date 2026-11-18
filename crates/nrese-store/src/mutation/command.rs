@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use nrese_engine::Transaction;
 use nrese_sparql::{CancellationToken, UpdateOptions, apply_update};
 use nrese_sparql_syntax::SparqlParser;
@@ -21,6 +23,32 @@ pub enum MutationCommand {
     Restore(DatasetRestoreRequest),
     /// RDF4J's statement operations, in order ([`crate::statements`]).
     Statements(StatementsRequest),
+    /// A write of any other front-end (a GQL or Cypher `CREATE`, `SET`, `DELETE`): its
+    /// planner makes the delta, the pipeline gates and commits it as every other write's.
+    Delta(Arc<dyn DeltaPlanner>),
+}
+
+/// The extension point for writes: what a front-end's write does to the dataset, planned
+/// into the pipeline's transaction. The pipeline then gates it exactly as a SPARQL update
+/// (the requester's write scope over every graph the transaction changes, reasoning,
+/// consistency, SHACL, cancellation) and commits it; no front-end needs a command of its
+/// own, and none can commit around the gates.
+pub trait DeltaPlanner: Send + Sync + std::fmt::Debug {
+    /// What the front-end calls the write, for logs and errors (`gql`, `cypher`, ...).
+    fn name(&self) -> &str;
+
+    /// Applies the write to `tx` for `requester`, without committing: the statements `tx`
+    /// then inserts and deletes are the write's delta. What it reads, it reads within
+    /// `requester.read` (a pattern of the write must not see a graph the requester may not
+    /// read); `context` carries the evaluation's cancellation, memory budget and the
+    /// store's settings ([`UpdateContext::update_options`] for a write lowered to SPARQL
+    /// Update's algebra). An error rolls the whole write back.
+    fn plan(
+        &self,
+        tx: &mut Transaction<'_>,
+        requester: &crate::Requester,
+        context: &UpdateContext<'_>,
+    ) -> Result<(), StoreError>;
 }
 
 /// The entry point a mutation came from; transport layers use it to map errors.
@@ -32,11 +60,14 @@ pub enum MutationKind {
     GraphDelete,
     Restore,
     Statements,
+    /// [`MutationCommand::Delta`].
+    Delta,
 }
 
 #[derive(Debug, Clone)]
 pub enum MutationCommitReport {
-    /// A SPARQL update or TELL; `revision` is the dataset revision after the commit.
+    /// A SPARQL update, TELL, statements or a front-end's write; `revision` is the dataset
+    /// revision after the commit.
     Applied {
         revision: u64,
     },
@@ -54,6 +85,7 @@ impl MutationCommand {
             Self::GraphDelete(_) => MutationKind::GraphDelete,
             Self::Restore(_) => MutationKind::Restore,
             Self::Statements(_) => MutationKind::Statements,
+            Self::Delta(_) => MutationKind::Delta,
         }
     }
 
@@ -71,8 +103,16 @@ impl MutationCommand {
         requester: &crate::Requester,
         context: &UpdateContext<'_>,
     ) -> Result<MutationCommitReport, StoreError> {
-        if let Self::Restore(_) = self {
-            requester.write.require_all("a restore")?;
+        match self {
+            Self::Restore(_) => requester.write.require_all("a restore")?,
+            // The target, whether or not the write changes it: a write of statements the
+            // graph has already would otherwise succeed where a new one is refused, telling
+            // a requester who may not read the graph what it holds (the review of
+            // 3 October 2026, A3).
+            Self::Tell(request) => require_writable(requester, &request.target)?,
+            Self::GraphWrite(request) => require_writable(requester, &request.target)?,
+            Self::GraphDelete(target) => require_writable(requester, target)?,
+            Self::Update(_) | Self::Statements(_) | Self::Delta(_) => {}
         }
         let report = self.apply_unchecked(tx, requester, context)?;
         if let Some(writable) = requester.write.access() {
@@ -96,7 +136,8 @@ impl MutationCommand {
                 Ok(MutationCommitReport::Applied { revision: 0 })
             }
             Self::Statements(request) => {
-                apply_statements(tx, request, requester, &mut update)?;
+                let budget = Arc::new(context.memory.part());
+                apply_statements(tx, request, requester, &budget, &mut update)?;
                 Ok(MutationCommitReport::Applied { revision: 0 })
             }
             Self::Tell(request) => {
@@ -110,24 +151,92 @@ impl MutationCommand {
                 apply_graph_delete(tx, target).map(MutationCommitReport::GraphDelete)
             }
             Self::Restore(request) => apply_restore(tx, request).map(MutationCommitReport::Restore),
+            Self::Delta(planner) => {
+                planner.plan(tx, requester, context)?;
+                Ok(MutationCommitReport::Applied { revision: 0 })
+            }
         }
     }
 }
 
-/// What updates are evaluated with besides their transaction and requester.
-pub(crate) struct UpdateContext<'a> {
+/// What writes are evaluated with besides their transaction and requester.
+pub struct UpdateContext<'a> {
+    /// The request's memory envelope within the catalog's budget: the `WHERE` clauses (and
+    /// a front-end's patterns) draw from it, as the request's DL gate does.
+    pub(crate) memory: nrese_exec::Envelope,
     /// Stops a long-running `WHERE` clause.
-    pub cancellation: &'a CancellationToken,
-    pub union_default_graph: bool,
-    pub services: Option<nrese_sparql::Services>,
+    pub(crate) cancellation: &'a CancellationToken,
+    pub(crate) union_default_graph: bool,
+    /// [`crate::StoreConfig::geosparql_stated_only`].
+    pub(crate) geosparql_stated_only: bool,
+    /// [`crate::StoreService::search_scope`], as the write started.
+    pub(crate) search_scope: nrese_sparql::SearchScope,
+    pub(crate) services: Option<nrese_sparql::Services>,
     /// The repository's namespaces: what a prefix an update uses without declaring it
     /// means (as for queries, [`crate::PreparedQuery::parse_with`]).
-    pub namespaces: crate::NamespaceMap,
+    pub(crate) namespaces: crate::NamespaceMap,
+    /// What a requester's `WHERE` clauses read ([`crate::support::Reading`], as its queries).
+    pub(crate) supports: Arc<crate::support::Supports>,
+    pub(crate) compilation: crate::support::Compilation,
 }
 
-/// Applies a SPARQL update request to `tx` for `requester`.
-pub(crate) fn apply_sparql_update(
-    tx: &mut Transaction<'_>,
+impl UpdateContext<'_> {
+    /// Fires when the caller cancels the write: a long evaluation stops at it.
+    pub fn cancellation(&self) -> &CancellationToken {
+        self.cancellation
+    }
+
+    /// The repository's namespaces, by prefix.
+    pub fn namespaces(&self) -> &crate::NamespaceMap {
+        &self.namespaces
+    }
+
+    /// What the executor evaluates a write's patterns with: the cancellation and the
+    /// request's memory envelope (within the catalog's budget, as its DL gate draws).
+    pub fn resources(&self) -> nrese_sparql::Resources {
+        nrese_sparql::Resources {
+            cancellation: Some(self.cancellation.clone()),
+            memory: self.memory.clone(),
+            ..Default::default()
+        }
+    }
+
+    /// The options of a SPARQL update for `requester` over the `using` dataset: what a
+    /// write lowered to SPARQL Update's algebra runs [`nrese_sparql::apply_update`] with,
+    /// the requester's graph access included, and what its `WHERE` clauses read: the data as
+    /// its queries read it, model and view (`crate::support::Reading::of`), its views
+    /// charged to the request's envelope and stopped by its cancellation.
+    pub fn update_options(
+        &self,
+        requester: &crate::Requester,
+        using: Option<nrese_sparql::QueryDatasetSpecification>,
+    ) -> UpdateOptions {
+        let (read_model, read) = crate::support::Reading::of(
+            &self.supports,
+            self.compilation,
+            &requester.read,
+            &self.memory,
+            Some(self.cancellation),
+        );
+        UpdateOptions {
+            using,
+            resources: self.resources(),
+            union_default_graph: self.union_default_graph,
+            services: self.services.clone(),
+            access: requester.read.access().cloned(),
+            writable: requester.write.access().cloned(),
+            geosparql_stated_only: self.geosparql_stated_only,
+            search_scope: self.search_scope,
+            read_model,
+            read: read.map(|read| Arc::new(read) as Arc<dyn nrese_sparql::ReadSource>),
+        }
+    }
+}
+
+/// Applies a SPARQL update request to `tx` for `requester`: a writer's transaction, or a
+/// private one's (a session's read), whose refused writes are the request's memory limit.
+pub(crate) fn apply_sparql_update<T: nrese_sparql::UpdateTarget>(
+    tx: &mut T,
     request: &SparqlUpdateRequest,
     requester: &crate::Requester,
     context: &UpdateContext<'_>,
@@ -149,21 +258,19 @@ pub(crate) fn apply_sparql_update(
             parser.parse_update(&request.update).map_err(|_| error)?
         }
     };
-    let options = UpdateOptions {
-        using: crate::query_executor::protocol_dataset(
-            &request.using_graphs,
-            &request.using_named_graphs,
-        )?,
-        cancellation: Some(context.cancellation.clone()),
-        union_default_graph: context.union_default_graph,
-        services: context.services.clone(),
-        access: requester.read.access().cloned(),
-        writable: requester.write.access().cloned(),
-    };
-    apply_update(tx, &update, &options).map_err(|error| match error {
-        nrese_sparql::UpdateError::Forbidden(graph) => crate::Refusal::Write(graph).into(),
-        error => error.into(),
-    })
+    let using = crate::query_executor::protocol_dataset(
+        &request.using_graphs,
+        &request.using_named_graphs,
+    )?;
+    let options = context.update_options(requester, using);
+    // Its WHERE's memory refusal as its reader may be told it (`ReadScope::told`).
+    requester.read.told(
+        crate::EntryPoint::UpdateWhere,
+        apply_update(tx, &update, &options).map_err(|error| match error {
+            nrese_sparql::UpdateError::Forbidden(graph) => crate::Refusal::Write(graph).into(),
+            error => StoreError::from(error),
+        }),
+    )
 }
 
 impl MutationCommitReport {
@@ -201,9 +308,25 @@ fn check_writable(
     }
 }
 
-/// The graph `id` of `tx` as a name.
+/// Refuses a graph-level command whose target `requester` may not write.
+fn require_writable(
+    requester: &crate::Requester,
+    target: &crate::GraphTarget,
+) -> Result<(), StoreError> {
+    let Some(writable) = requester.write.access() else {
+        return Ok(());
+    };
+    let graph = target.graph_name()?;
+    if writable.allows_graph(&graph) {
+        Ok(())
+    } else {
+        Err(crate::Refusal::Write(graph).into())
+    }
+}
+
+/// The graph `id` of `tx` (either transaction kind) as a name.
 pub(crate) fn graph_name(
-    tx: &nrese_engine::Transaction<'_>,
+    tx: &impl nrese_engine::PendingView,
     id: nrese_engine::TermId,
 ) -> nrese_rdf::GraphName {
     match tx.decode(id) {

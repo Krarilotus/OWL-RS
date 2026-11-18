@@ -7,10 +7,31 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+# The counting allocator and measurements (src/measure.rs), for other crates' tests: a
+# dev-dependency with this feature. Never in product builds.
+measure = ["dep:parking_lot_core"]
+# The union kernel's work counter (src/classes.rs, `witness`), for other crates' tests (REAS-3a):
+# a dev-dependency with this feature, counting only in debug builds. Never in product builds
+# (scripts/check-features.sh).
+witness = []
+
 [dependencies]
 foldhash = { workspace = true }
 hashbrown = { workspace = true }
 rayon = { workspace = true }
+# Warmed before measurements (src/measure.rs): its waiter table, grown once per process.
+parking_lot_core = { version = "0.9", optional = true }
+
+[dev-dependencies]
+parking_lot_core = "0.9"
+
+# The process's and the machine's memory (memory.rs), and regions' own pages (region.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Security", "Win32_System_JobObjects", "Win32_System_Memory", "Win32_System_ProcessStatus", "Win32_System_SystemInformation", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [lints]
 workspace = true

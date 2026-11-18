@@ -1,0 +1,24 @@
+# Known failures of the store (owl2-ql ruleset with the tree-witness rewriting) on the
+# W3C OWL 2 test cases of the QL profile under the Direct Semantics
+# (scripts/fetch-w3c-tests.sh). Format: <test identifier> # reason.
+#
+# None of them is about the rewriting: no conclusion of these tests goes through an
+# anonymous individual. They are limits of the owl2-ql ruleset and of the entailment check.
+
+# Difference: the store's check refutes `a owl:differentFrom b` by adding `a owl:sameAs b`,
+# and owl2-ql has no equality rules to carry the clash (OWL 2 QL has no unique names, and
+# the ruleset follows GraphDB's in leaving equality out).
+New-Feature-DisjointDataProperties-002 # owl:AllDifferent from disjoint data properties
+New-Feature-DisjointObjectProperties-001 # owl:differentFrom from disjoint object properties
+New-Feature-DisjointObjectProperties-002 # owl:AllDifferent from disjoint object properties
+WebOnt-differentFrom-001 # owl:differentFrom is symmetric
+WebOnt-disjointWith-001 # owl:differentFrom from disjoint classes
+
+# Class expressions without an axiom in the conclusion (no statement the closure holds; the
+# RL runner lists them too):
+WebOnt-I5.26-010 # an anonymous owl:minCardinality restriction
+WebOnt-I5.5-005 # an anonymous owl:unionOf class
+
+# Inconsistencies the ruleset doesn't detect:
+WebOnt-Thing-003 # owl:Thing equivalent to owl:Nothing, without an individual for a rule to fire on
+WebOnt-description-logic-104 # owl:complementOf on the right of a subclass axiom: owl2-ql has no cls-com

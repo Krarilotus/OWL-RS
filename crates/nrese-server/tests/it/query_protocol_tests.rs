@@ -1,16 +1,20 @@
 //! Q1 gate (HTTP side): the query timeout is a real deadline, large results stream
 //! completely, and the SPARQL Protocol dataset parameters are honoured.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use nrese_reasoner::ReasonerConfig;
+use nrese_server::build_app;
 use nrese_server::policy::{PolicyConfig, RequestTimeouts};
-use nrese_store::StoreConfig;
+use nrese_store::{StoreConfig, StoreService};
 use tower::util::ServiceExt;
 
-use crate::support::{body_text, test_app_with_store_config};
+use crate::support::held_service::{HeldEndpoint, past_deadline};
+use crate::support::{
+    body_text, test_app_with_store, test_app_with_store_config, test_state_with_store_config,
+};
 
 /// An app whose store holds `count` triples (preloaded from an N-Triples file).
 fn app_with_triples(
@@ -62,22 +66,38 @@ fn encode(value: &str) -> String {
         .collect()
 }
 
-#[tokio::test]
+/// The deadline: a query held in a `SERVICE` call that never answers gets its 408 once the
+/// deadline has passed, and lets go of the call.
+/// The test's clock is paused: tokio doesn't move it while the query's blocking evaluator runs,
+/// so the deadline passes when the test moves it, once the call has connected, however slow
+/// the host.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_query_past_its_deadline_times_out() -> Result<(), Box<dyn std::error::Error>> {
-    let (app, _dir) = app_with_triples(2_000, Duration::from_millis(300))?;
-    // 4 million rows, each through a regular expression: seconds of work, little memory.
-    let query = "SELECT (COUNT(*) AS ?n) WHERE { ?a ?b ?c . ?d ?e ?f FILTER(REGEX(CONCAT(STR(?c), STR(?f)), \"^(a|b)*x$\")) }";
-    let started = Instant::now();
-    let response = app
-        .oneshot(get(&format!("/dataset/query?query={}", encode(query)))?)
-        .await?;
-    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "answered at the deadline, not when evaluation ended: {:?}",
-        started.elapsed()
+    let deadline = Duration::from_secs(1);
+    let endpoint = HeldEndpoint::bind().await?;
+    let store = StoreService::new(StoreConfig::in_memory())?;
+    store.set_service_client(endpoint.client()?);
+    let policy = PolicyConfig {
+        timeouts: RequestTimeouts {
+            query: deadline,
+            ..RequestTimeouts::default()
+        },
+        ..PolicyConfig::default()
+    };
+    let app = test_app_with_store(store, policy, ReasonerConfig::default())?;
+    let query = format!(
+        "SELECT * WHERE {{ SERVICE <{}> {{ ?s ?p ?o }} }}",
+        endpoint.url()
     );
-    Ok(())
+    let started = tokio::time::Instant::now();
+    let mut answer =
+        tokio::spawn(app.oneshot(get(&format!("/dataset/query?query={}", encode(&query)))?));
+    let call = endpoint.call(&mut answer).await?;
+    let response = past_deadline(started, deadline, answer, &call).await??;
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    // Real time again for the close's bound.
+    tokio::time::resume();
+    call.closed().await
 }
 
 #[tokio::test]
@@ -184,6 +204,7 @@ async fn explain_reports_how_the_query_ran() -> Result<(), Box<dyn std::error::E
     assert_eq!(response.headers()["content-type"], "application/json");
     let explanation: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
     assert_eq!(explanation["executor"], "native");
+    assert_eq!(explanation["rewrites"], serde_json::json!([]));
     assert_eq!(explanation["rows"], 200);
     let steps = explanation["steps"].as_array().expect("steps");
     assert_eq!(steps[0]["operator"], "project");
@@ -197,17 +218,43 @@ async fn explain_reports_how_the_query_ran() -> Result<(), Box<dyn std::error::E
 }
 
 #[tokio::test]
+async fn explain_plan_shows_the_plan_without_running_it() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (app, _dir) = app_with_triples(1_000, Duration::from_secs(30))?;
+    let query = "SELECT ?s ?v WHERE { ?s <http://example.com/p1> ?v . ?s ?p ?v }";
+    let response = app
+        .oneshot(get(&format!(
+            "/dataset/query?query={}&explain=plan",
+            encode(query)
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    let planned: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    assert_eq!(planned["rewrites"], serde_json::json!([]));
+    let steps = planned["steps"].as_array().expect("steps");
+    assert_eq!(steps[0]["operator"], "project");
+    assert!(
+        steps
+            .iter()
+            .any(|s| s["operator"] == "scan" && s["estimated_rows"] == 200),
+        "{steps:?}"
+    );
+    // Nothing ran: no actual rows or times.
+    assert!(steps.iter().all(|s| s.get("rows").is_none()), "{steps:?}");
+    Ok(())
+}
+
+#[tokio::test]
 async fn a_query_beyond_its_memory_limit_is_rejected() -> Result<(), Box<dyn std::error::Error>> {
     let (app, _dir) = app_with_triples(2_000, Duration::from_secs(30))?;
-    // 8·10⁹ rows: refused before any memory is taken.
+    // 8·10⁹ rows: refused before any memory is taken, which the executor's join measures
+    // (nrese-exec's tests/join_limits.rs); here, the refusal's status and message.
     let query = "SELECT (COUNT(*) AS ?n) WHERE { ?a ?b ?c . ?d ?e ?f . ?g ?h ?i }";
-    let started = Instant::now();
     let response = app
         .oneshot(get(&format!("/dataset/query?query={}", encode(query)))?)
         .await?;
     assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert!(body_text(response).await?.contains("memory budget"));
-    assert!(started.elapsed() < Duration::from_secs(10));
     Ok(())
 }
 
@@ -249,5 +296,135 @@ async fn a_query_beyond_the_servers_memory_budget_is_told_to_retry()
         ))?)
         .await?;
     assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn a_repository_answers_within_its_own_query_timeout()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    // The server's budget: an hour, past anything this test waits for.
+    let policy = PolicyConfig {
+        timeouts: RequestTimeouts {
+            query: Duration::from_secs(3_600),
+            ..RequestTimeouts::default()
+        },
+        ..PolicyConfig::default()
+    };
+    let state = test_state_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        policy,
+        ReasonerConfig::default(),
+    )?;
+    let app = build_app(state.clone());
+    let send = |method: Method, uri: &str, content_type: &str, body: String| {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("content-type", content_type)
+            .body(Body::from(body))
+    };
+    let created = app
+        .clone()
+        .oneshot(send(
+            Method::PUT,
+            "/api/v1/repositories/quick",
+            "application/json",
+            r#"{"query_timeout_ms": 1000}"#.to_owned(),
+        )?)
+        .await?;
+    assert_eq!(created.status(), StatusCode::CREATED);
+    let refused = app
+        .clone()
+        .oneshot(send(
+            Method::PUT,
+            "/api/v1/repositories/never",
+            "application/json",
+            r#"{"query_timeout_ms": 0}"#.to_owned(),
+        )?)
+        .await?;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    // A query held in a SERVICE call: the repository's second stops it, not the server's
+    // hour. The default repository has no SERVICE client here, so the test gives this one
+    // the endpoint's.
+    let endpoint = HeldEndpoint::bind().await?;
+    state
+        .repositories()
+        .get("quick")
+        .ok_or("the repository just created")?
+        .pipeline
+        .read()
+        .store()
+        .set_service_client(endpoint.client()?);
+    let query = format!(
+        "SELECT * WHERE {{ SERVICE <{}> {{ ?s ?p ?o }} }}",
+        endpoint.url()
+    );
+    // The clock paused, as in the deadline test: the repository's second, not the server's
+    // hour, is the deadline that answers.
+    tokio::time::pause();
+    let started = tokio::time::Instant::now();
+    let mut answer = tokio::spawn(app.clone().oneshot(get(&format!(
+        "/api/v1/repositories/quick/query?query={}",
+        encode(&query)
+    ))?));
+    let call = endpoint.call(&mut answer).await?;
+    let response = past_deadline(started, Duration::from_secs(1), answer, &call).await??;
+    assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
+    tokio::time::resume();
+    call.closed().await?;
+    // The default repository keeps the server's budget.
+    let response = app
+        .oneshot(get(&format!(
+            "/dataset/query?query={}",
+            encode("SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }")
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    Ok(())
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"; "Consistency": reads work
+/// in quarantine): over a store in quarantine under `owl2-ql`, the QL report EXPLAIN shows for a
+/// read the rewriting answered is never `complete`: inconsistent data entail every answer.
+#[tokio::test]
+async fn explains_ql_report_over_a_store_in_quarantine_is_not_complete()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nrese_reasoner::ReasoningMode;
+
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("data.ttl");
+    std::fs::write(
+        &path,
+        "@prefix : <http://example.com/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+         :A owl:disjointWith :B . :y a :A . :x a :A , :B .\n",
+    )?;
+    // Loaded past the pipeline, as a bulk load does, then reasoned: the clash quarantines it.
+    let store = StoreService::new(StoreConfig::in_memory())?;
+    store.bulk_load(&nrese_store::BulkLoadRequest {
+        files: vec![path],
+        replace: false,
+        graph: nrese_store::GraphTarget::DefaultGraph,
+        invalid: None,
+    })?;
+    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Owl2Ql);
+    store.rematerialise(reasoner.materialised_program().ok_or("setup: no program")?)?;
+    assert!(
+        store.is_quarantined(),
+        "setup: the store isn't in quarantine"
+    );
+    let app = test_app_with_store(store, PolicyConfig::default(), reasoner)?;
+    let query = "PREFIX : <http://example.com/> SELECT ?x { ?x a :A }";
+    let response = app
+        .oneshot(get(&format!(
+            "/dataset/query?query={}&explain=true",
+            encode(query)
+        ))?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK, "setup: EXPLAIN refused");
+    let explanation: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+    let ql = &explanation["ql"];
+    assert!(!ql.is_null(), "setup: no QL report: {explanation}");
+    assert_ne!(ql["completeness"], "complete", "status: {ql}");
     Ok(())
 }

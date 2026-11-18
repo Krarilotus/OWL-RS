@@ -41,7 +41,7 @@
 //! results (`GROUP_CONCAT`, `SAMPLE`, the first of equal `MIN`/`MAX`) come out as they do
 //! from the full join.
 
-use nrese_exec::{IdTable, UNDEF, group::group_rows};
+use nrese_exec::{IdTable, Reservation, UNDEF};
 use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern,
@@ -49,9 +49,10 @@ use nrese_sparql_syntax::algebra::{
 use nrese_sparql_syntax::term::TriplePattern;
 
 use super::{
-    Agg, Context, NativeResult, Solutions, as_path, bound_variables, expression_variables,
-    pushdown, triple_variables,
+    Context, NativeResult, Solutions, as_path, bound_variables, expression_variables, pushdown,
+    triple_variables,
 };
+use crate::QueryEvaluationError;
 
 /// The variables each aggregate reads, if none of the aggregates counts duplicate rows.
 pub(super) fn insensitive_arguments(
@@ -110,7 +111,7 @@ pub(super) fn shares(a: &[Variable], b: &[Variable]) -> bool {
 /// The group a row belongs to, as a column next to the row's values. No variable of a
 /// query can have this name.
 fn group_column() -> Variable {
-    Variable::new_unchecked("group of the row")
+    nrese_sparql_syntax::internal::variable("group", "of the row")
 }
 
 impl Context<'_> {
@@ -120,25 +121,24 @@ impl Context<'_> {
         let kept: Vec<usize> = (0..solutions.vars.len())
             .filter(|&column| needed.contains(&solutions.vars[column]))
             .collect();
-        let rows = solutions.table.len();
-        let mut table = if kept.is_empty() {
-            // No column left: one row if there was any.
-            IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows.min(1)))
-        } else if kept.len() == solutions.vars.len() {
-            self.consumed(&solutions);
-            solutions.table
-        } else {
-            let projected = solutions.table.project(&kept);
-            self.consumed(&solutions);
-            projected
-        };
-        if !kept.is_empty() {
-            table.dedup_preserving_order();
-        }
-        self.produced(Solutions {
-            vars: kept.iter().map(|&c| solutions.vars[c].clone()).collect(),
-            table,
-            ordered: solutions.ordered,
+        self.reshaped(solutions, 0, |solutions| {
+            let rows = solutions.table.len();
+            let vars = kept.iter().map(|&c| solutions.vars[c].clone()).collect();
+            let ordered = solutions.ordered;
+            let table = if kept.is_empty() {
+                drop(solutions);
+                // No column left: one row if there was any.
+                IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows.min(1)))
+            } else {
+                let mut table = solutions.table.project(&kept);
+                table.dedup_preserving_order();
+                table
+            };
+            Solutions {
+                vars,
+                table,
+                ordered,
+            }
         })
     }
 
@@ -150,29 +150,62 @@ impl Context<'_> {
         needed: &[Variable],
     ) -> NativeResult<Solutions> {
         let solutions = match pattern {
-            GraphPattern::Join { left, right } => {
-                let (left_scope, right_scope) = (in_scope(left), in_scope(right));
+            // Paths joined to triple patterns: ordered with them (`path_joins`).
+            GraphPattern::Join { .. }
+                if !self.as_written && super::path_joins::PathJoin::of(pattern).is_some() =>
+            {
+                self.eval(pattern)?
+            }
+            GraphPattern::Join { inputs } => {
+                // Each input keeps what the consumer reads and what it shares with another
+                // input (a fold of binary joins keeps the same: at each step, what the
+                // two sides share).
+                let scopes: Vec<Vec<Variable>> = inputs.iter().map(in_scope).collect();
                 let mut keep = needed.to_vec();
-                add(
-                    &mut keep,
-                    left_scope.into_iter().filter(|v| right_scope.contains(v)),
-                );
-                match (as_path(left), as_path(right)) {
-                    (_, Some(path)) => {
-                        let bound = self.eval_set(left, &keep)?;
-                        let reached = self.path_from(&bound, &path)?;
-                        self.join(bound, reached)?
-                    }
-                    (Some(path), None) => {
-                        let bound = self.eval_set(right, &keep)?;
-                        let reached = self.path_from(&bound, &path)?;
-                        self.join(reached, bound)?
-                    }
-                    (None, None) => {
-                        let (left, right) =
-                            (self.eval_set(left, &keep)?, self.eval_set(right, &keep)?);
-                        self.join(left, right)?
-                    }
+                for (i, scope) in scopes.iter().enumerate() {
+                    add(
+                        &mut keep,
+                        scope
+                            .iter()
+                            .filter(|v| scopes[i + 1..].iter().any(|later| later.contains(v)))
+                            .cloned(),
+                    );
+                }
+                // From the left; a path is followed from the rows before it, paths before
+                // the first other input from what that input binds.
+                let first_bound = inputs
+                    .iter()
+                    .position(|input| as_path(input).is_none())
+                    .unwrap_or(0);
+                let mut leading = Vec::new();
+                let mut joined: Option<Solutions> = None;
+                for (i, input) in inputs.iter().enumerate() {
+                    let path = (i != first_bound).then(|| as_path(input)).flatten();
+                    joined = Some(match (path, joined.take()) {
+                        (Some(path), Some(bound)) => {
+                            let reached = self.path_from(&bound, &path)?;
+                            self.join(bound, reached)?
+                        }
+                        (Some(path), None) => {
+                            leading.push(path);
+                            continue;
+                        }
+                        (None, bound) => {
+                            let mut rows = self.eval_set(input, &keep)?;
+                            for path in leading.drain(..) {
+                                let reached = self.path_from(&rows, &path)?;
+                                rows = self.join(reached, rows)?;
+                            }
+                            match bound {
+                                Some(bound) => self.join(bound, rows)?,
+                                None => rows,
+                            }
+                        }
+                    });
+                }
+                match joined {
+                    Some(joined) => joined,
+                    None => self.unit()?,
                 }
             }
             GraphPattern::LeftJoin {
@@ -194,25 +227,43 @@ impl Context<'_> {
                 };
                 self.left_join(left, right, expression.as_ref())?
             }
-            GraphPattern::Union { left, right } => {
-                let (left, right) = (self.eval_set(left, needed)?, self.eval_set(right, needed)?);
-                self.union(left, right)?
+            GraphPattern::Union { inputs } => {
+                let mut rows: Option<Solutions> = None;
+                for input in inputs {
+                    let next = self.eval_set(input, needed)?;
+                    rows = Some(match rows.take() {
+                        Some(before) => self.union(before, next)?,
+                        None => next,
+                    });
+                }
+                rows.unwrap_or_else(|| Solutions {
+                    vars: needed.to_vec(),
+                    table: IdTable::new(needed.len()),
+                    ordered: false,
+                })
             }
             // A value per row (RAND, BNODE, ...) differs between rows that are otherwise
             // duplicates: such a BIND or FILTER sees every row.
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } if !pushdown::per_solution(expression) && joins(inner) => {
-                if !needed.contains(variable) {
-                    // Nothing reads the value, and a BIND neither adds nor removes rows.
-                    return self.eval_set(inner, needed);
-                }
+            GraphPattern::Extend { inner, bindings }
+                if !bindings.iter().any(|(_, e)| pushdown::per_solution(e)) && joins(inner) =>
+            {
+                // From the last: a binding nothing reads is left out (a BIND neither adds
+                // nor removes rows), and one that is read needs what it reads.
                 let mut keep = needed.to_vec();
-                add(&mut keep, expression_variables(expression));
-                let solutions = self.eval_set(inner, &keep)?;
-                self.extend(solutions, variable, expression)?
+                let mut read = vec![false; bindings.len()];
+                for (i, (variable, expression)) in bindings.iter().enumerate().rev() {
+                    if keep.contains(variable) {
+                        read[i] = true;
+                        add(&mut keep, expression_variables(expression));
+                    }
+                }
+                let mut solutions = self.eval_set(inner, &keep)?;
+                for ((variable, expression), read) in bindings.iter().zip(read) {
+                    if read {
+                        solutions = self.extend(solutions, variable, expression)?;
+                    }
+                }
+                solutions
             }
             GraphPattern::Filter { expr, inner }
                 if !pushdown::per_solution(expr) && joins(inner) =>
@@ -270,24 +321,31 @@ impl Context<'_> {
                 continue;
             }
             let start = std::time::Instant::now();
-            let Some(groups) =
-                self.snapshot
-                    .group_counts_in(self.model, &scan.quad_pattern(), permutation)
+            // The groups charged as they are found ([`Snapshot::group_counts_in`]).
+            let Some(groups) = self
+                .snapshot
+                .group_counts_in(self.model, &scan.quad_pattern(), permutation, &self.budget)
+                .map_err(QueryEvaluationError::MemoryLimit)?
             else {
                 continue;
             };
             if self.trace.is_some() {
                 let detail = format!("distinct {kept} of {triple}");
-                self.note("group walk", detail, None, groups.len(), start);
+                let count = self.snapshot.estimate_in(self.model, &scan.quad_pattern());
+                let estimate = Some(self.distinct(&scan, kept, count));
+                self.note("group walk", detail, estimate, groups.len(), start);
             }
             // The column at once: a row at a time cost as much as the walk (DBpedia q13,
-            // 363 k subjects).
-            let table =
-                IdTable::from_columns(vec![groups.iter().map(|(id, _)| id.raw()).collect()]);
-            let values = self.produced(Solutions {
-                vars: vec![(*kept).clone()],
-                table: table.assume_sorted_by(vec![0]),
-                ordered: false,
+            // 363 k subjects). Charged before it is made: one id a group.
+            let column_bytes = groups.len().saturating_mul(size_of::<u64>());
+            let values = self.made(column_bytes, || {
+                let table =
+                    IdTable::from_columns(vec![groups.iter().map(|(id, _)| id.raw()).collect()]);
+                Ok(Solutions {
+                    vars: vec![(*kept).clone()],
+                    table: table.assume_sorted_by(vec![0]),
+                    ordered: false,
+                })
             })?;
             let rest: Vec<TriplePattern> = patterns
                 .iter()
@@ -409,25 +467,21 @@ impl Context<'_> {
             );
         }
         let start = std::time::Instant::now();
+        let core_estimate = match self.trace {
+            Some(_) => self.estimate_rows(&core),
+            None => None,
+        };
         let core = self.eval_set(&core, &needed)?;
         if self.trace.is_some() {
             let detail = format!(
                 "the pattern without {} detached OPTIONAL(s), as a set",
                 detached.iter().filter(|d| **d).count()
             );
-            self.note("group core", detail, None, core.table.len(), start);
+            self.note("group core", detail, core_estimate, core.table.len(), start);
         }
 
         // The groups, from the core.
-        let key_columns: Vec<Vec<u64>> = variables
-            .iter()
-            .map(|v| match core.column(v) {
-                Some(column) => core.table.column(column).to_vec(),
-                None => vec![UNDEF; core.table.len()],
-            })
-            .collect();
-        let key_table = IdTable::from_columns(key_columns);
-        let groups = group_rows(&key_table, &(0..variables.len()).collect::<Vec<_>>());
+        let (groups, positions) = super::aggregate::groups_of(&core, variables)?;
         let group_count = groups.len();
         let members_of = |group_of: &mut dyn Iterator<Item = usize>| {
             let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
@@ -437,26 +491,20 @@ impl Context<'_> {
             members
         };
         // Aggregates in the caller's order; each column is filled by the part that
-        // computes it.
+        // computes it, charged before (to `held`), however many the query names.
+        let mut held = Reservation::new(&*self.budget);
+        // Declared after `held`: dropped before it.
         let mut values: Vec<Option<Vec<u64>>> = vec![None; aggregates.len()];
         let compute = |solutions: &Solutions,
                        members: &[Vec<usize>],
                        selected: &[usize],
+                       held: &mut Reservation<&nrese_exec::Budget>,
                        values: &mut Vec<Option<Vec<u64>>>|
          -> NativeResult<()> {
-            let chosen: Vec<(Variable, AggregateExpression)> =
-                selected.iter().map(|&a| aggregates[a].clone()).collect();
-            let computed = self.aggregate_groups(solutions, members, &chosen)?;
-            for (position, &a) in selected.iter().enumerate() {
-                values[a] = Some(
-                    computed
-                        .iter()
-                        .map(|group| match &group[position] {
-                            Agg::Id(id) => *id,
-                            Agg::Term(term) => self.id(term),
-                        })
-                        .collect(),
-                );
+            for &a in selected {
+                held.charge(group_count.saturating_mul(8))
+                    .map_err(QueryEvaluationError::MemoryLimit)?;
+                values[a] = Some(self.aggregate_column(solutions, members, &aggregates[a])?);
             }
             Ok(())
         };
@@ -465,27 +513,33 @@ impl Context<'_> {
             .collect();
         let members = members_of(&mut groups.group_of.iter().map(|&g| g as usize));
         let start = std::time::Instant::now();
-        compute(&core, &members, &core_aggregates, &mut values)?;
+        compute(&core, &members, &core_aggregates, &mut held, &mut values)?;
         if self.trace.is_some() {
             let detail = format!("{} aggregate(s) of the core", core_aggregates.len());
-            self.note("aggregate", detail, None, group_count, start);
+            // At most a group per row of the core (`estimate`'s rule for GROUP BY).
+            let estimate = Some(core.table.len() as u64);
+            self.note("aggregate", detail, estimate, group_count, start);
         }
 
         // HAVING over what is known by now drops groups before the OPTIONALs are read.
         let mut keep = vec![true; group_count];
         if let Some(having) = having {
             let mut vars = variables.to_vec();
-            let mut columns = groups.keys.clone().into_columns();
-            for &a in &core_aggregates {
-                vars.push(aggregates[a].0.clone());
-                columns.push(values[a].clone().unwrap_or_default());
-            }
-            if !columns.is_empty() {
-                let known = Solutions {
-                    vars,
-                    table: IdTable::from_columns(columns),
-                    ordered: false,
-                };
+            vars.extend(core_aggregates.iter().map(|&a| aggregates[a].0.clone()));
+            if !vars.is_empty() {
+                // What HAVING reads, a column per key and core aggregate, charged first.
+                let bytes = group_count.saturating_mul(8).saturating_mul(vars.len());
+                let known = self.made(bytes, || {
+                    let mut columns = super::aggregate::key_columns(&groups, &positions, None);
+                    for &a in &core_aggregates {
+                        columns.push(values[a].clone().unwrap_or_default());
+                    }
+                    Ok(Solutions {
+                        vars,
+                        table: IdTable::from_columns(columns),
+                        ordered: false,
+                    })
+                })?;
                 let mut conjuncts = Vec::new();
                 pushdown::conjuncts_of(having, &mut conjuncts);
                 for conjunct in conjuncts {
@@ -497,6 +551,7 @@ impl Context<'_> {
                             .for_each(|(keep, pass)| *keep &= pass);
                     }
                 }
+                self.consumed(known);
             }
         }
 
@@ -594,6 +649,8 @@ impl Context<'_> {
                 right.table.dedup_preserving_order();
             }
             let start = std::time::Instant::now();
+            // A left join keeps its left rows, and meets about one partner per row.
+            let estimate = Some(left.table.len().max(right.table.len()) as u64);
             let joined = self.left_join(left, right, *expression)?;
             let column = joined.column(&group).expect("the left side's first column");
             let members = members_of(&mut joined.table.column(column).iter().map(|&g| g as usize));
@@ -602,38 +659,111 @@ impl Context<'_> {
                     "a detached OPTIONAL joined to {} kept group(s)",
                     kept_groups
                 );
-                self.note("optional", detail, None, joined.table.len(), start);
+                self.note("optional", detail, estimate, joined.table.len(), start);
             }
             let start = std::time::Instant::now();
-            compute(&joined, &members, &selected, &mut values)?;
+            compute(&joined, &members, &selected, &mut held, &mut values)?;
             if self.trace.is_some() {
                 let detail = format!("{} aggregate(s) of the detached OPTIONAL", selected.len());
-                self.note("aggregate", detail, None, kept_groups, start);
+                let estimate = Some(kept_groups as u64);
+                self.note("aggregate", detail, estimate, kept_groups, start);
             }
-            self.consumed(&joined);
+            self.consumed(joined);
         }
 
         // Detached OPTIONALs without aggregates contribute nothing. The kept groups, with
         // the aggregates in the caller's order.
         let kept: Vec<usize> = (0..group_count).filter(|&g| keep[g]).collect();
-        let mut columns: Vec<Vec<u64>> = groups
-            .keys
-            .columns()
-            .iter()
-            .map(|column| kept.iter().map(|&g| column[g]).collect())
-            .collect();
         let mut vars = variables.to_vec();
-        for (a, (target, _)) in aggregates.iter().enumerate() {
-            let column = values[a].take().unwrap_or_else(|| vec![UNDEF; group_count]);
-            columns.push(kept.iter().map(|&g| column[g]).collect());
-            vars.push(target.clone());
+        vars.extend(aggregates.iter().map(|(target, _)| target.clone()));
+        // The kept groups' table, a column per key and aggregate, charged before it is made.
+        let bytes = kept.len().saturating_mul(8).saturating_mul(vars.len());
+        let grouped = self.made(bytes, || {
+            let mut columns = super::aggregate::key_columns(&groups, &positions, Some(&kept));
+            for column in &values {
+                columns.push(match column {
+                    Some(column) => kept.iter().map(|&g| column[g]).collect(),
+                    None => vec![UNDEF; kept.len()],
+                });
+            }
+            Ok(Solutions {
+                vars,
+                table: IdTable::from_columns(columns),
+                ordered: false,
+            })
+        });
+        drop(values);
+        drop(held);
+        self.consumed(core);
+        grouped.map(Some)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::QueryOptions;
+
+    /// A table remade from charged ones keeps their charge, and is charged only for what it
+    /// allocates beyond their capacity: under an envelope of just their bytes, none is
+    /// refused (charged again, they were).
+    #[test]
+    fn a_table_remade_from_charged_ones_is_charged_once() {
+        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+        let snapshot = engine.snapshot();
+        let v = Variable::new_unchecked("v");
+        let table = |rows: &[u64], capacity: usize| {
+            let mut table = IdTable::with_capacity(1, capacity);
+            rows.iter().for_each(|&id| table.push_row(&[id]));
+            Solutions {
+                vars: vec![v.clone()],
+                table,
+                ordered: false,
+            }
+        };
+        let concat = |ctx: &Context<'_>, parts: Vec<Solutions>| {
+            let growth = super::super::concat_growth(&parts);
+            ctx.reshaped(parts, growth, |parts| Solutions {
+                vars: vec![v.clone()],
+                table: IdTable::concat(1, parts.into_iter().map(|p| p.table).collect()),
+                ordered: false,
+            })
+        };
+        let cases: [(&str, Vec<Solutions>, usize); 3] = [
+            ("a projection keeping its column", vec![table(&[], 8)], 64),
+            ("one table joined into one", vec![table(&[1], 8)], 64),
+            (
+                "two, with room in the first",
+                vec![table(&[1], 8), table(&[2], 1)],
+                72,
+            ),
+        ];
+        // Beside the tables, what the context holds of its own.
+        let own = super::super::own_bytes(&snapshot);
+        for (case, parts, limit) in cases {
+            let mut options = QueryOptions::default();
+            options.resources.memory = nrese_exec::Envelope::new(Some(own + limit), None);
+            let ctx = Context::new(&snapshot, &options, None, None);
+            let parts: Vec<Solutions> = parts
+                .into_iter()
+                .map(|p| ctx.produced(p).ok().unwrap())
+                .collect();
+            let remade = match case {
+                "a projection keeping its column" => {
+                    let rows = parts.into_iter().next().unwrap();
+                    ctx.distinct_on(rows, std::slice::from_ref(&v))
+                }
+                _ => concat(&ctx, parts),
+            };
+            let remade = remade.ok().unwrap_or_else(|| panic!("{case}: refused"));
+            assert_eq!(
+                ctx.budget.used(),
+                own + remade.table.memory_bytes(),
+                "{case}"
+            );
+            assert!(ctx.budget.peak() <= own + limit, "{case}");
+            ctx.consumed(remade);
+            assert_eq!(ctx.budget.used(), own, "{case}");
         }
-        self.consumed(&core);
-        self.produced(Solutions {
-            vars,
-            table: IdTable::from_columns(columns),
-            ordered: false,
-        })
-        .map(Some)
     }
 }

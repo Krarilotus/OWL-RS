@@ -1,0 +1,493 @@
+//! Ownership guards: live results retain capacity, and parallel encoding never moves a
+//! caller's writer. Large output crosses the existing encoding windows.
+
+use std::{cell::RefCell, io::Write, rc::Rc};
+
+use nrese_engine::{Engine, EngineConfig};
+use nrese_exec::{SharedBudget, workers::Workers};
+use nrese_sparql::{QueryOptions, Resources, ResultsFormat, evaluate_query, write_results};
+use nrese_sparql_syntax::SparqlParser;
+
+fn values(rows: usize) -> nrese_sparql_syntax::Query {
+    let data = (0..rows)
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    SparqlParser::new()
+        .parse_query(&format!("SELECT ?x WHERE {{ VALUES ?x {{ {data} }} }}"))
+        .unwrap()
+}
+
+#[test]
+fn an_unconsumed_result_keeps_its_shared_capacity_until_drop() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let shared = SharedBudget::new(1 << 20);
+    let options = QueryOptions {
+        resources: Resources {
+            memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
+            ..Default::default()
+        },
+        ..QueryOptions::default()
+    };
+    let result = evaluate_query(&snapshot, &values(128), &options).unwrap();
+    assert!(
+        shared.used() > 0,
+        "a live ID table must still count against the shared budget"
+    );
+    drop(result);
+    assert_eq!(shared.used(), 0);
+}
+
+/// Spec: a live result keeps the charge of what it holds (as the test above), so no table
+/// the evaluation consumes may release a charge it never took. Rows without columns count
+/// one id each, made per row of a substituted EXISTS (as written): one solution without
+/// bindings (an empty group under OPTIONAL), and a fast COUNT(*) projected
+/// to no column. The live result of n one-column rows keeps at least their n * 8
+/// bytes charged.
+#[test]
+fn rows_without_columns_never_release_another_holders_charge() {
+    use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
+    use nrese_sparql::QueryResults;
+
+    let (subjects, counts) = (2_000, 200);
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let node = |name: &str| NamedNode::new_unchecked(name);
+    let mut tx = engine.transaction();
+    for i in 0..subjects {
+        let quad = Quad::new(
+            node(&format!("urn:s{i}")),
+            node("urn:p"),
+            node("urn:o"),
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    }
+    // k statements with the object k, for k = 1..=200.
+    let integer = node("http://www.w3.org/2001/XMLSchema#integer");
+    for k in 1..=counts {
+        for j in 0..k {
+            let quad = Quad::new(
+                node(&format!("urn:t{k}-{j}")),
+                node("urn:q"),
+                Literal::new_typed_literal(k.to_string(), integer.clone()),
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let values = (1..=counts).map(|k| k.to_string()).collect::<Vec<_>>();
+    let cases = [
+        (
+            "an empty group",
+            "SELECT ?s WHERE { ?s <urn:p> ?o FILTER EXISTS { OPTIONAL { FILTER(?s = ?s) } } }"
+                .to_owned(),
+        ),
+        (
+            "a fast count",
+            format!(
+                "SELECT ?c WHERE {{ VALUES ?c {{ {} }} FILTER EXISTS {{ \
+                 SELECT (COUNT(*) AS ?c) WHERE {{ ?s <urn:q> ?c }} LIMIT 1 }} }}",
+                values.join(" ")
+            ),
+        ),
+    ];
+    for (case, query) in &cases {
+        let query = SparqlParser::new().parse_query(query).unwrap();
+        let shared = SharedBudget::new(1 << 30);
+        let options = QueryOptions {
+            as_written: true,
+            resources: Resources {
+                memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
+                ..Default::default()
+            },
+            ..QueryOptions::default()
+        };
+        let result = evaluate_query(&snapshot, &query, &options).unwrap();
+        let held = shared.used();
+        let QueryResults::Solutions(rows) = result else {
+            panic!("solutions")
+        };
+        let rows = rows.count();
+        assert!(rows > 0, "{case}: no rows, nothing tested");
+        assert!(
+            held >= rows * 8,
+            "{case}: the live result of {rows} rows keeps {held} bytes charged"
+        );
+    }
+}
+
+#[test]
+fn graph_results_keep_shared_capacity_through_conversion_and_early_drop() {
+    use nrese_rdf::{GraphName, NamedNode, Quad};
+    use nrese_sparql::{QueryResults, evaluate_query_typed};
+
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for name in ["urn:a", "urn:b"] {
+        tx.insert(
+            Quad::new(
+                NamedNode::new_unchecked(name),
+                NamedNode::new_unchecked("urn:p"),
+                NamedNode::new_unchecked("urn:o"),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    for text in [
+        "CONSTRUCT { ?s <urn:p> ?value } WHERE { VALUES ?s { <urn:a> <urn:a> <urn:b> } BIND(CONCAT(STR(?s), 'value') AS ?value) }",
+        "DESCRIBE ?s WHERE { VALUES ?s { <urn:a> <urn:b> } }",
+    ] {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        let shared = SharedBudget::new(1 << 20);
+        let options = QueryOptions {
+            resources: Resources {
+                memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let retained = evaluate_query_typed(&snapshot, &query, &options).unwrap();
+        assert!(
+            shared.used() > 0,
+            "typed graph retains its evaluation reservation"
+        );
+        drop(retained);
+        assert_eq!(shared.used(), 0);
+        let result = evaluate_query(&snapshot, &query, &options).unwrap();
+        let QueryResults::Graph(mut triples) = result else {
+            panic!()
+        };
+        assert!(shared.used() > 0, "conversion retains the same reservation");
+        assert!(triples.next().unwrap().is_ok());
+        assert!(
+            shared.used() > 0,
+            "partial consumption must not release capacity"
+        );
+        drop(triples);
+        assert_eq!(shared.used(), 0);
+        let QueryResults::Graph(triples) = evaluate_query(&snapshot, &query, &options).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(triples.collect::<Result<Vec<_>, _>>().unwrap().len(), 2);
+        assert_eq!(shared.used(), 0);
+    }
+}
+
+#[test]
+fn update_where_uses_shared_capacity_and_reads_earlier_operations() {
+    use nrese_sparql::{QueryResults, UpdateOptions, apply_update};
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let update = SparqlParser::new()
+        .parse_update(
+            "INSERT DATA { <urn:a> <urn:p> 1 }; \
+         INSERT { <urn:a> <urn:q> ?x } WHERE { <urn:a> <urn:p> ?x }",
+        )
+        .unwrap();
+    for bytes in [1, 1 << 20] {
+        let shared = SharedBudget::new(bytes);
+        let options = UpdateOptions {
+            resources: Resources {
+                memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
+                ..Default::default()
+            },
+            ..UpdateOptions::default()
+        };
+        let mut tx = engine.transaction();
+        let result = apply_update(&mut tx, &update, &options);
+        if bytes == 1 {
+            let error = result.unwrap_err();
+            assert!(error.to_string().contains("memory"), "{error}");
+            drop(tx);
+        } else {
+            result.unwrap();
+            tx.commit().unwrap();
+        }
+        assert_eq!(shared.used(), 0);
+        let query = SparqlParser::new()
+            .parse_query("ASK { <urn:a> <urn:p> 1; <urn:q> 1 }")
+            .unwrap();
+        assert!(matches!(
+            evaluate_query(&engine.snapshot(), &query, &QueryOptions::default()).unwrap(),
+            QueryResults::Boolean(found) if found == (bytes > 1)
+        ));
+    }
+}
+
+struct CallerWriter {
+    bytes: Rc<RefCell<Vec<u8>>>,
+    caller: std::thread::ThreadId,
+    fail: bool,
+}
+
+impl Write for CallerWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        assert_eq!(std::thread::current().id(), self.caller);
+        if self.fail {
+            return Err(std::io::Error::other("consumer stopped"));
+        }
+        self.bytes.borrow_mut().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn encoding_widths_preserve_direct_output_and_caller_owned_writers() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let wide = Workers::new(4);
+    for rows in [3, 20_000] {
+        let query = values(rows);
+        for format in [ResultsFormat::Json, ResultsFormat::Tsv, ResultsFormat::Csv] {
+            let mut baseline = Vec::new();
+            write_results(
+                &snapshot,
+                &query,
+                &QueryOptions::default(),
+                format,
+                None,
+                &mut baseline,
+            )
+            .unwrap()
+            .unwrap();
+            for workers in [Workers::serial(), wide.limited(2)] {
+                let shared = SharedBudget::new(16 << 20);
+                let options = QueryOptions {
+                    resources: Resources {
+                        workers,
+                        memory: nrese_exec::Envelope::new(None, Some(shared.clone())),
+                        ..Default::default()
+                    },
+                    ..QueryOptions::default()
+                };
+                let bytes = Rc::new(RefCell::new(Vec::new()));
+                let mut writer = CallerWriter {
+                    bytes: bytes.clone(),
+                    caller: std::thread::current().id(),
+                    fail: false,
+                };
+                write_results(&snapshot, &query, &options, format, None, &mut writer)
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(*bytes.borrow(), baseline);
+                assert_eq!(shared.used(), 0);
+                writer.fail = true;
+                assert!(
+                    write_results(&snapshot, &query, &options, format, None, &mut writer)
+                        .unwrap()
+                        .is_err()
+                );
+                assert_eq!(
+                    shared.used(),
+                    0,
+                    "writer failure must release execution capacity"
+                );
+            }
+        }
+    }
+}
+
+/// An expanded read the query's budget refuses part way fails the query. A class of 1,000
+/// identities over a representative with 20 statements: an early-expanding read holds the
+/// copies until they are in order. At every limit from 1 KiB to 16 MiB the answer is all
+/// 20,000 rows or the query's memory error, never the rows read before the refusal.
+#[test]
+fn a_refused_expanded_read_fails_the_query() {
+    use nrese_sparql::{QueryEvaluationError, QueryResults};
+
+    let engine = a_class_of_1000_over_20_statements();
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }")
+        .unwrap();
+    let (mut answered, mut refused) = (0, 0);
+    for shift in 10..=24 {
+        let options = QueryOptions {
+            equality_early_expansion: true,
+            resources: Resources {
+                memory: nrese_exec::Envelope::new(Some(1 << shift), None),
+                ..Default::default()
+            },
+            ..QueryOptions::default()
+        };
+        let rows = match evaluate_query(&snapshot, &query, &options) {
+            Ok(QueryResults::Solutions(rows)) => rows.collect::<Result<Vec<_>, _>>(),
+            Ok(_) => panic!("solutions"),
+            Err(error) => Err(error),
+        };
+        match rows {
+            Ok(rows) => {
+                assert_eq!(rows.len(), 20_000, "{} bytes: a partial answer", 1 << shift);
+                answered += 1;
+            }
+            Err(QueryEvaluationError::MemoryLimit(_)) => refused += 1,
+            Err(other) => panic!("{} bytes: {other}", 1 << shift),
+        }
+    }
+    assert!(
+        answered > 0 && refused > 0,
+        "{answered} answered, {refused} refused"
+    );
+}
+
+/// The same refused read, delivered by the direct writer (`write_results`, the HTTP
+/// endpoint's SELECT path): at every limit from 1 KiB to 16 MiB the writer reports success
+/// only with all 20,000 rows written, and otherwise the query's memory error, never success
+/// with the rows read before the refusal.
+///
+/// What it holds: for this query the refusal is reported by the native evaluator's checks
+/// in `Context::holding` and, without that one, in `Context::reshaped`
+/// (`nrese-sparql/src/native/mod.rs`). With both removed, 1 KiB answers success with none
+/// of the rows.
+#[test]
+fn a_refused_expanded_read_written_directly_fails_the_query() {
+    use nrese_sparql::{QueryEvaluationError, WriteResultsError};
+
+    let engine = a_class_of_1000_over_20_statements();
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query("SELECT ?s ?o WHERE { ?s <urn:p> ?o }")
+        .unwrap();
+    let (mut answered, mut refused) = (0, 0);
+    for shift in 10..=24 {
+        let options = QueryOptions {
+            equality_early_expansion: true,
+            resources: Resources {
+                memory: nrese_exec::Envelope::new(Some(1 << shift), None),
+                ..Default::default()
+            },
+            ..QueryOptions::default()
+        };
+        let mut written = Vec::new();
+        let result = write_results(
+            &snapshot,
+            &query,
+            &options,
+            ResultsFormat::Tsv,
+            None,
+            &mut written,
+        )
+        .expect("a SELECT over a snapshot is written directly");
+        match result {
+            Ok(()) => {
+                // A header line, then one line per row.
+                let lines = written.iter().filter(|&&b| b == b'\n').count();
+                assert_eq!(
+                    lines.saturating_sub(1),
+                    20_000,
+                    "{} bytes: a partial answer",
+                    1 << shift
+                );
+                answered += 1;
+            }
+            Err(WriteResultsError::Evaluation(QueryEvaluationError::MemoryLimit(_))) => {
+                refused += 1
+            }
+            Err(other) => panic!("{} bytes: {other}", 1 << shift),
+        }
+    }
+    assert!(
+        answered > 0 && refused > 0,
+        "{answered} answered, {refused} refused"
+    );
+}
+
+/// A class of 1,000 identities (`urn:sameAs`, inferred) over `urn:rep`, which has 20
+/// statements on `urn:p`; equality by representatives on.
+fn a_class_of_1000_over_20_statements() -> Engine {
+    use nrese_engine::EncodedTriple;
+    use nrese_rdf::{GraphName, NamedNode, Quad};
+
+    let node = |name: &str| NamedNode::new_unchecked(format!("urn:{name}"));
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let mut tx = engine.transaction();
+    let rep = tx.intern(node("rep").as_ref().into());
+    let same_as = tx.intern(node("sameAs").as_ref().into());
+    for i in 1..1_000 {
+        let alias = tx.intern(node(&format!("alias{i}")).as_ref().into());
+        tx.insert_inferred(EncodedTriple {
+            subject: alias,
+            predicate: same_as,
+            object: rep,
+        });
+    }
+    for i in 0..20 {
+        let object = node(&format!("o{i}"));
+        tx.insert(Quad::new(node("rep"), node("p"), object, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    engine.transaction().install(Some(same_as), None);
+    engine
+}
+
+/// Equality classes expanded after a join (the default) fail as the query's memory error
+/// when the answer is too large, with a budget or without one; they never abort the
+/// process. One class of 1,000 identities that holds the predicate: `sameAs sameAs sameAs`
+/// joined with itself is one row over representatives and 1000^5 rows expanded.
+#[test]
+fn a_late_expansion_past_memory_fails_the_query() {
+    use nrese_engine::EncodedTriple;
+    use nrese_rdf::NamedNode;
+    use nrese_sparql::{QueryEvaluationError, QueryResults};
+
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let mut tx = engine.transaction();
+    let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+    // Interned first, owl:sameAs has the smallest id: its class's representative.
+    let same_as = tx.intern(same_as.as_ref().into());
+    let same_as_rep = |subject| EncodedTriple {
+        subject,
+        predicate: same_as,
+        object: same_as,
+    };
+    tx.insert_inferred(same_as_rep(same_as));
+    for i in 1..1_000 {
+        let identity = NamedNode::new_unchecked(format!("urn:i{i}"));
+        let identity = tx.intern(identity.as_ref().into());
+        tx.insert_inferred(same_as_rep(identity));
+    }
+    tx.commit().unwrap();
+    engine.transaction().install(Some(same_as), None);
+    let snapshot = engine.snapshot();
+    let query = SparqlParser::new()
+        .parse_query("SELECT * WHERE { ?s ?p ?o . ?o ?q ?x }")
+        .unwrap();
+    for limit in [Some(1 << 30), None] {
+        let options = QueryOptions {
+            resources: Resources {
+                memory: nrese_exec::Envelope::new(limit, None),
+                ..Default::default()
+            },
+            ..QueryOptions::default()
+        };
+        let rows = match evaluate_query(&snapshot, &query, &options) {
+            Ok(QueryResults::Solutions(rows)) => rows.count(),
+            Ok(_) => panic!("solutions"),
+            Err(QueryEvaluationError::MemoryLimit(_)) => continue,
+            Err(other) => panic!("{limit:?} bytes: {other}"),
+        };
+        panic!("{limit:?} bytes: {rows} rows, past what memory holds");
+    }
+}

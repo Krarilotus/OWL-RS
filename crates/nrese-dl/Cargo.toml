@@ -1,0 +1,32 @@
+[package]
+name = "nrese-dl"
+description = "NRESE OWL 2 DL engines over nrese-owl's DL-clauses: the context-saturation core, the hypertableau, and the bounds (docs/design/owl2-dl.md §5, §6, §8)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+
+# Test binaries that take more than ~15 s (the W3C OWL 2 DL suite, fuzzed ontologies, the
+# bounds on ORE samples, the small-scope check): the push tier runs them when this crate
+# changed, the commit tier never (scripts/check.sh).
+[package.metadata.nrese]
+slow-tests = ["tableau_w3c", "tableau_fuzz", "bounds", "scope"]
+[dependencies]
+nrese-owl = { path = "../nrese-owl" }
+# The process's memory, for the context core's budget.
+nrese-exec = { path = "../nrese-exec" }
+# The OWL 2 datatype map's value spaces, for the datatype theory.
+nrese-xsd = { path = "../rdf/nrese-xsd" }
+hashbrown = { workspace = true }
+rayon = { workspace = true }
+
+[dev-dependencies]
+# The bounds' tests evaluate U1 with the rule reasoner and compare it with the RL closure.
+nrese-reasoner = { path = "../nrese-reasoner" }
+nrese-rdf = { path = "../rdf/nrese-rdf" }
+nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+
+[lints]
+workspace = true

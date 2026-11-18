@@ -9,9 +9,12 @@
 //! is the *sum* of its entries across runs (+1 insert, -1 tombstone) and is either 0 or 1,
 //! independent of run order. Merges of any adjacent runs just add the signs.
 
+use std::sync::Arc;
+
 use rayon::prelude::*;
 
 use super::Layout;
+use super::derive::Ordered;
 use super::keys::PackedKeys;
 use crate::quad::{EncodedQuad, Key, Permutation};
 
@@ -45,6 +48,11 @@ impl PermutationRun {
             return 0;
         }
         let (first, last) = (start / 64, (end - 1) / 64);
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        crate::witness::add(
+            crate::witness::Site::TombstoneWords,
+            (last - first + 1) as u64,
+        );
         let mask_from = |bit: usize| u64::MAX << (bit % 64);
         let mask_to = |bit: usize| u64::MAX >> (63 - bit % 64);
         if first == last {
@@ -61,6 +69,46 @@ impl PermutationRun {
         head + middle + tail
     }
 
+    /// [`Self::tombstones_in`], its bitmap read a run of at most `POLL_UNITS` words at a
+    /// time, `visit(k)` called before each run of `k` words (the
+    /// count lives in the reader). `None` once `visit` returns false, nothing more read.
+    /// Without tombstones, nothing is read and nothing visited.
+    pub(crate) fn tombstones_in_visiting(
+        &self,
+        start: usize,
+        end: usize,
+        visit: crate::visit::Visitor<'_>,
+    ) -> Option<u64> {
+        if self.tombstones.is_empty() || start >= end {
+            return Some(0);
+        }
+        let (first, last) = (start / 64, (end - 1) / 64);
+        let run = nrese_exec::POLL_UNITS as usize;
+        let (head, tail) = (u64::MAX << (start % 64), u64::MAX >> (63 - (end - 1) % 64));
+        let mut count = 0;
+        let mut at = first;
+        while at <= last {
+            let upto = (at + run).min(last + 1);
+            if !visit((upto - at) as u64) {
+                return None;
+            }
+            #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+            crate::witness::add(crate::witness::Site::TombstoneWords, (upto - at) as u64);
+            for (i, &word) in self.tombstones[at..upto].iter().enumerate() {
+                let i = at + i;
+                let word = match (i == first, i == last) {
+                    (true, true) => word & head & tail,
+                    (true, false) => word & head,
+                    (false, true) => word & tail,
+                    (false, false) => word,
+                };
+                count += u64::from(word.count_ones());
+            }
+            at = upto;
+        }
+        Some(count)
+    }
+
     /// Index range of keys in `[low, high]`. O(log n).
     #[inline]
     pub(crate) fn range(&self, low: &Key, high: &Key) -> (usize, usize) {
@@ -69,26 +117,89 @@ impl PermutationRun {
 
     /// Builds a run from entries sorted by key, each flagged as tombstone or not.
     pub(crate) fn from_sorted(entries: Vec<(Key, bool)>) -> Self {
+        Self::from_sorted_within(entries, &mut super::Uncharged, true)
+            .unwrap_or_else(|_| unreachable!("nothing is charged"))
+    }
+
+    /// [`Self::from_sorted`], each array reserved on `charge` before it is made, the keys
+    /// packed on one thread unless `parallel`.
+    fn from_sorted_within<C: super::Charge>(
+        entries: Vec<(Key, bool)>,
+        charge: &mut C,
+        parallel: bool,
+    ) -> Result<Self, nrese_exec::BudgetExceeded> {
         let has_tombstones = entries.iter().any(|(_, tomb)| *tomb);
-        let mut tombstones = if has_tombstones {
-            vec![0u64; entries.len().div_ceil(64)]
+        let words = if has_tombstones {
+            entries.len().div_ceil(64)
         } else {
-            Vec::new()
+            0
         };
-        let keys: Vec<Key> = entries
-            .into_iter()
-            .enumerate()
-            .map(|(i, (key, tomb))| {
-                if tomb {
-                    tombstones[i / 64] |= 1 << (i % 64);
+        charge.reserve(words * std::mem::size_of::<u64>())?;
+        let mut tombstones = vec![0u64; words];
+        let keys_bytes = entries.len() * std::mem::size_of::<Key>();
+        charge.reserve(keys_bytes)?;
+        let mut mark = |i: usize, tomb: bool| {
+            if tomb {
+                tombstones[i / 64] |= 1 << (i % 64);
+            }
+        };
+        let keys: Vec<Key> = match C::COUNTED {
+            // A collect in place keeps the entries' allocation and, its size not a multiple
+            // of the keys', shrinks it by a reallocation that holds both blocks at once: a
+            // charged build makes the keys beside the entries instead, in the room reserved.
+            true => {
+                let mut keys = Vec::with_capacity(entries.len());
+                for (i, &(key, tomb)) in entries.iter().enumerate() {
+                    mark(i, tomb);
+                    keys.push(key);
                 }
-                key
-            })
-            .collect();
-        Self {
-            keys: PackedKeys::from_sorted(&keys),
+                drop(entries);
+                keys
+            }
+            false => entries
+                .into_iter()
+                .enumerate()
+                .map(|(i, (key, tomb))| {
+                    mark(i, tomb);
+                    key
+                })
+                .collect(),
+        };
+        let packed = match parallel {
+            true => PackedKeys::from_sorted(&keys),
+            false => PackedKeys::from_sorted_within(&keys, charge)?,
+        };
+        drop(keys);
+        charge.release(keys_bytes);
+        Ok(Self {
+            keys: packed,
             tombstones: tombstones.into_boxed_slice(),
-        }
+        })
+    }
+}
+
+/// The heap bytes of the quad-layout forms of default-graph runs alive in one engine
+/// ([`Run::quads_layout_shared`], DUR-6): counted in its index memory from when a form is
+/// made until it is freed, published by a commit or not.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Forms(std::sync::Arc<std::sync::atomic::AtomicU64>);
+
+impl Forms {
+    pub(crate) fn bytes(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// A form's bytes in its engine's [`Forms`], given back when the form is freed.
+#[derive(Debug)]
+struct Accounted {
+    bytes: u64,
+    forms: Forms,
+}
+
+impl Drop for Accounted {
+    fn drop(&mut self) {
+        (self.forms.0).fetch_sub(self.bytes, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -99,6 +210,11 @@ pub(crate) struct Run {
     perms: [PermutationRun; Permutation::COUNT],
     inserts: u64,
     deletes: u64,
+    /// This run's quad-layout form while a holder keeps it (a default-graph run's, made by
+    /// [`Self::quads_layout_shared`]): one form, shared by every holder.
+    quads_form: parking_lot::Mutex<std::sync::Weak<Run>>,
+    /// On a quad-layout form: its bytes in its engine's [`Forms`] while it lives.
+    account: Option<Accounted>,
 }
 
 impl Run {
@@ -122,11 +238,100 @@ impl Run {
         )
     }
 
+    /// Whether [`super::IndexVersion::with_change_within`] builds a delta of `n` entries
+    /// charged array by array ([`Self::from_delta_within_parallel`]: at or above the parallel
+    /// threshold, where those charges are noise against the build and a bound's slack would
+    /// be large) rather than as [`Self::from_delta`] within [`Self::delta_bound`], charged
+    /// before it builds (DUR-6 slice 2: one reservation per pending snapshot).
+    pub(crate) fn charged_exactly(n: usize) -> bool {
+        n >= PARALLEL_BUILD_THRESHOLD
+    }
+
+    /// At most what [`Self::from_delta`] allocates at once for `n` entries in `layout` below
+    /// the parallel threshold, where it builds one permutation after another: what every
+    /// permutation keeps (its tombstone words and packed keys, [`PackedKeys::bound`]), plus
+    /// what one holds while it builds (its entries, then their keys collected in place, whose
+    /// shrinking reallocation may hold both blocks at once, and the packing's own).
+    pub(crate) fn delta_bound(layout: Layout, n: usize) -> usize {
+        use std::mem::size_of;
+        debug_assert!(
+            !Self::charged_exactly(n),
+            "built in parallel above the threshold"
+        );
+        let (packed, packing) = PackedKeys::bound(n);
+        let kept = n.div_ceil(64) * size_of::<u64>() + packed;
+        let building = n * (size_of::<(Key, bool)>() + size_of::<Key>()) + packing;
+        layout.permutations().len() * kept + building
+    }
+
+    /// [`Self::from_delta`], on one thread, every array reserved on `held` before it is
+    /// made; what the run keeps stays reserved there, for its maker to hold while the run
+    /// lives (`engine::equality::View`). A refusal leaves nothing made.
+    pub(crate) fn from_delta_within(
+        layout: Layout,
+        inserts: &[EncodedQuad],
+        deletes: &[EncodedQuad],
+        held: &mut nrese_exec::Reservation,
+    ) -> Result<Self, nrese_exec::BudgetExceeded> {
+        let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
+        for &permutation in layout.permutations() {
+            perms[permutation as usize] = permutation_within(permutation, inserts, deletes, held)?;
+        }
+        Ok(Self::from_permutations(layout, perms))
+    }
+
+    /// [`Self::from_delta_within`] with its permutations built in parallel on the caller's
+    /// pool once the delta makes it worthwhile ([`build_all`]'s threshold), each on a
+    /// reservation of its own of `budget`, charged before its arrays are made. The run, and
+    /// one reservation holding what it keeps, for its maker to hold while the run lives. A
+    /// refusal leaves nothing made: the permutations built are freed before their charges go.
+    pub(crate) fn from_delta_within_parallel(
+        layout: Layout,
+        inserts: &[EncodedQuad],
+        deletes: &[EncodedQuad],
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+    ) -> Result<(Self, nrese_exec::Reservation), nrese_exec::BudgetExceeded> {
+        type Built = Result<(PermutationRun, nrese_exec::Reservation), nrese_exec::BudgetExceeded>;
+        let wanted = layout.permutations();
+        // One slot per permutation, on the stack: the parallel build allocates nothing beside
+        // what its reservations cover (a collected list would be uncharged).
+        let mut slots: [Option<Built>; Permutation::COUNT] = std::array::from_fn(|_| None);
+        let fill = |(i, slot): (usize, &mut Option<Built>)| {
+            let permutation = Permutation::ALL[i];
+            if wanted.contains(&permutation) {
+                let mut held = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+                // The run before its charge in the tuple: dropped first on a refusal elsewhere.
+                *slot = Some(
+                    permutation_within(permutation, inserts, deletes, &mut held)
+                        .map(|run| (run, held)),
+                );
+            }
+        };
+        if inserts.len() + deletes.len() >= PARALLEL_BUILD_THRESHOLD {
+            slots.par_iter_mut().enumerate().for_each(fill);
+        } else {
+            slots.iter_mut().enumerate().for_each(fill);
+        }
+        if let Some(Err(refused)) = slots.iter().flatten().find(|built| built.is_err()) {
+            return Err(*refused);
+        }
+        let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
+        let mut bytes = 0;
+        for (i, slot) in slots.into_iter().enumerate() {
+            if let Some(Ok((run, held))) = slot {
+                perms[i] = run;
+                bytes += held.transfer();
+            }
+        }
+        let held = nrese_exec::Reservation::adopt(std::sync::Arc::clone(budget), bytes);
+        Ok((Self::from_permutations(layout, perms), held))
+    }
+
     /// Builds a tombstone-free run from arbitrary quads, removing duplicates. Used for bulk
     /// replacement and checkpoint loading. O(n log n), parallel over permutations and within
     /// each sort.
     pub(crate) fn from_quads(layout: Layout, quads: Vec<EncodedQuad>) -> Self {
-        let mut builder = PermutationBuilder::new(quads);
+        let mut builder = PermutationBuilder::planned(quads, layout.permutations());
         let mut perms: [PermutationRun; Permutation::COUNT] = Default::default();
         for &permutation in layout.permutations() {
             perms[permutation as usize] = PermutationRun {
@@ -152,6 +357,8 @@ impl Run {
             perms,
             inserts,
             deletes,
+            quads_form: Default::default(),
+            account: None,
         }
     }
 
@@ -177,6 +384,12 @@ impl Run {
     /// Number of entries (inserts + tombstones); the size used by the compaction policy.
     pub(crate) fn entries(&self) -> u64 {
         self.inserts + self.deletes
+    }
+
+    /// Every entry, inserts and tombstones alike, as `[subject, predicate, object, graph]`
+    /// (raw ids), in SPOG order: every layout keeps that permutation.
+    pub(crate) fn statements(&self) -> impl Iterator<Item = Key> + '_ {
+        self.permutation(Permutation::Spog).keys.iter()
     }
 
     /// This run (of the default-graph layout) in the quad layout: SPOG, POSG and OSPG
@@ -208,12 +421,46 @@ impl Run {
         for (permutation, run) in built {
             perms[permutation as usize] = run;
         }
-        Self {
-            layout: Layout::Quads,
-            perms,
-            inserts: self.inserts,
-            deletes: self.deletes,
+        Self::from_permutations(Layout::Quads, perms)
+    }
+
+    /// This run in the quad layout ([`Self::with_quads_layout`]), made once and shared by
+    /// every holder while any keeps it (DUR-6): N pending versions over one base hold one form
+    /// of each of its runs, not N. A run of the quad layout is itself. Made without the slot's
+    /// lock (the build is parallel on the caller's pool; no lock is held across pool work), so
+    /// K callers that miss the slot at once make K conversions: the peak while they build grows
+    /// with concurrent misses, it isn't bounded at one or two forms. Each
+    /// that installs second takes the installed one and frees its own before returning, so
+    /// once they return, all share one form. A form counts in `forms` from when it is made
+    /// (its arrays exist a moment before) until it is freed. The slot's `Weak` keeps the
+    /// form's `Arc` allocation, not its arrays, after the last holder lets it go, until the
+    /// slot is filled again or the run is dropped: bounded metadata per source run.
+    pub(crate) fn quads_layout_shared(self: &Arc<Self>, forms: &Forms) -> Arc<Self> {
+        if self.layout == Layout::Quads {
+            return Arc::clone(self);
         }
+        if let Some(form) = self.quads_form.lock().upgrade() {
+            return form;
+        }
+        let mut form = self.with_quads_layout();
+        let bytes = form.memory_bytes();
+        (forms.0).fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        form.account = Some(Accounted {
+            bytes,
+            forms: forms.clone(),
+        });
+        let form = Arc::new(form);
+        let mut slot = self.quads_form.lock();
+        if let Some(installed) = slot.upgrade() {
+            return installed;
+        }
+        *slot = Arc::downgrade(&form);
+        form
+    }
+
+    /// Whether this run is a shared quad-layout form, counted in its engine's [`Forms`].
+    pub(crate) fn is_form(&self) -> bool {
+        self.account.is_some()
     }
 
     /// Net contribution to the visible quad count.
@@ -239,49 +486,189 @@ impl Run {
 
     /// Sign of `quad` in this run: +1 insert, -1 tombstone, 0 absent. O(log n).
     pub(crate) fn sign_of(&self, quad: &EncodedQuad) -> i64 {
+        self.sign_of_counted(quad, &mut crate::visit::Free)
+            .expect("nothing is counted")
+    }
+
+    /// [`Self::sign_of`], its searches counted on `account` before they are made: `None`
+    /// once the account has stopped.
+    pub(crate) fn sign_of_counted(
+        &self,
+        quad: &EncodedQuad,
+        account: &mut impl crate::visit::Account,
+    ) -> Option<i64> {
         let perm = self.permutation(Permutation::Spog);
         let key = Permutation::Spog.to_key(quad);
-        match perm.range(&key, &key) {
+        Some(match perm.keys.range_counted(&key, &key, account)? {
             (start, end) if start == end => 0,
             (start, _) if perm.is_tombstone(start) => -1,
             _ => 1,
-        }
+        })
     }
 }
 
 /// The packed permutations of a set of quads, one after another, from one array of keys,
-/// 32 bytes per quad, in the quads' place (the same size): each permutation in turn
-/// reorders the keys in place, sorts them and packs them. Building the permutations at
-/// once, or from copies, would hold several such arrays.
+/// 32 bytes per quad, in the quads' place (the same size). A permutation that is another's
+/// partitioned by a leading component with few values (PSOG from SPOG, POSG from OSPG,
+/// graph-first from graph-last) is derived by a stable counting partition of the keys'
+/// positions, 4 bytes each ([`super::derive`]); the others reorder the keys in place and
+/// sort them. Knowing
+/// the permutations it will be asked for ([`Self::planned`]), it sorts the ones the others
+/// derive from and derives those as soon as it can, keeping them packed until asked:
+/// default-graph quads take two sorts instead of four, quads in named graphs three
+/// instead of seven.
 pub(crate) struct PermutationBuilder {
     keys: Vec<Key>,
     /// The order the keys are in.
     order: Permutation,
+    /// The permutations still to be asked for and not built yet.
+    wanted: Vec<Permutation>,
+    /// Permutations built ahead of being asked for.
+    ready: Vec<(Permutation, PackedKeys)>,
+    /// Full sorts of the keys so far (the first one included): what deriving saves, and
+    /// what a guard test counts.
+    sorts: usize,
 }
 
 impl PermutationBuilder {
-    /// For `quads`, in any order and with duplicates.
-    pub(crate) fn new(mut quads: Vec<EncodedQuad>) -> Self {
+    /// For `quads`, in any order and with duplicates, nothing planned: every permutation
+    /// asked for in the layout's order is sorted (the tests' oracle).
+    #[cfg(test)]
+    pub(crate) fn new(quads: Vec<EncodedQuad>) -> Self {
+        Self::planned(quads, &[])
+    }
+
+    /// For `quads`, to be asked for the permutations in `wanted`, in any order.
+    pub(crate) fn planned(mut quads: Vec<EncodedQuad>, wanted: &[Permutation]) -> Self {
         quads.par_sort_unstable();
         quads.dedup();
         Self {
             keys: quads.into_iter().map(EncodedQuad::components).collect(),
             order: Permutation::Spog,
+            wanted: wanted.to_vec(),
+            ready: Vec::new(),
+            sorts: 1,
         }
+    }
+
+    /// Full sorts of the keys so far.
+    #[cfg(test)]
+    pub(crate) fn sorts(&self) -> usize {
+        self.sorts
     }
 
     /// The quads' keys in `permutation`, packed.
     pub(crate) fn packed(&mut self, permutation: Permutation) -> PackedKeys {
-        if permutation != self.order {
-            let order = self.order;
-            self.keys.par_iter_mut().for_each(|key| {
-                *key = permutation.to_key(&order.key_to_quad(key));
-            });
-            self.keys.par_sort_unstable();
-            self.order = permutation;
+        self.wanted.retain(|&p| p != permutation);
+        if let Some(at) = self.ready.iter().position(|(p, _)| *p == permutation) {
+            return self.ready.swap_remove(at).1;
         }
-        PackedKeys::from_sorted(&self.keys)
+        if permutation == self.order {
+            let packed = PackedKeys::from_sorted(&self.keys);
+            self.derive_ahead();
+            return packed;
+        }
+        let own = Ordered {
+            keys: &self.keys,
+            base: self.order,
+            order: self.order,
+            positions: None,
+        };
+        if let Some(positions) = own.partitioned(permutation) {
+            let packed = self.ordered(permutation, &positions).packed();
+            self.derive_ahead_from(permutation, Some(&positions));
+            return packed;
+        }
+        // Sorted: a wanted permutation this one derives from, built ahead, else this one.
+        let source = self
+            .wanted
+            .iter()
+            .copied()
+            .find(|&source| super::derive::derivable(source, permutation).is_some())
+            .unwrap_or(permutation);
+        self.sort_into(source);
+        if source == permutation {
+            let packed = PackedKeys::from_sorted(&self.keys);
+            self.derive_ahead();
+            return packed;
+        }
+        self.wanted.retain(|&p| p != source);
+        self.ready
+            .push((source, PackedKeys::from_sorted(&self.keys)));
+        self.derive_ahead();
+        self.packed(permutation)
     }
+
+    /// The keys visited in `order` through `positions`.
+    fn ordered<'k>(&'k self, order: Permutation, positions: &'k [u32]) -> Ordered<'k> {
+        Ordered {
+            keys: &self.keys,
+            base: self.order,
+            order,
+            positions: Some(positions),
+        }
+    }
+
+    /// Reorders the keys into `permutation` and sorts them.
+    fn sort_into(&mut self, permutation: Permutation) {
+        let order = self.order;
+        self.keys.par_iter_mut().for_each(|key| {
+            *key = permutation.to_key(&order.key_to_quad(key));
+        });
+        nrese_exec::sort::sort_keys(&mut self.keys);
+        self.order = permutation;
+        self.sorts += 1;
+    }
+
+    /// Builds the wanted permutations derivable from the keys as they are.
+    fn derive_ahead(&mut self) {
+        self.derive_ahead_from(self.order, None);
+    }
+
+    /// Builds the wanted permutations derivable from the keys visited in `order` through
+    /// `positions` (`None`: as they are), and those derivable from them in turn.
+    fn derive_ahead_from(&mut self, order: Permutation, positions: Option<&[u32]>) {
+        let derivable: Vec<Permutation> = self
+            .wanted
+            .iter()
+            .copied()
+            .filter(|&p| super::derive::derivable(order, p).is_some())
+            .collect();
+        for permutation in derivable {
+            let from = Ordered {
+                keys: &self.keys,
+                base: self.order,
+                order,
+                positions,
+            };
+            if let Some(derived) = from.partitioned(permutation) {
+                let packed = self.ordered(permutation, &derived).packed();
+                self.wanted.retain(|&p| p != permutation);
+                self.ready.push((permutation, packed));
+                self.derive_ahead_from(permutation, Some(&derived));
+            }
+        }
+    }
+}
+
+/// One permutation of an exact delta, on one thread, every array reserved on `held` before
+/// it is made; the entries' sort buffer released once the run is packed, what the run keeps
+/// still reserved there.
+fn permutation_within(
+    permutation: Permutation,
+    inserts: &[EncodedQuad],
+    deletes: &[EncodedQuad],
+    held: &mut nrese_exec::Reservation,
+) -> Result<PermutationRun, nrese_exec::BudgetExceeded> {
+    let entries_bytes = (inserts.len() + deletes.len()) * std::mem::size_of::<(Key, bool)>();
+    held.charge(entries_bytes)?;
+    let mut entries: Vec<(Key, bool)> = Vec::with_capacity(inserts.len() + deletes.len());
+    entries.extend(inserts.iter().map(|q| (permutation.to_key(q), false)));
+    entries.extend(deletes.iter().map(|q| (permutation.to_key(q), true)));
+    entries.sort_unstable_by_key(|entry| entry.0);
+    let built = PermutationRun::from_sorted_within(entries, held, false);
+    held.release(entries_bytes);
+    built
 }
 
 /// Builds the permutations of `layout` (the others stay empty), in parallel once `size`

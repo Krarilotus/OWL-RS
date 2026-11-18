@@ -3,11 +3,98 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+use nrese_reasoner::{ReasonerConfig, ReasonerService};
 use nrese_store::{
-    MutationCommand, MutationPipeline, MutationTicket, ReadModel, SolutionsResultFormat,
-    SparqlQueryRequest, SparqlUpdateRequest, StoreConfig, StoreService,
+    DatasetRestoreReport, DatasetRestoreRequest, GraphDeleteReport, GraphTarget, GraphWriteReport,
+    GraphWriteRequest, MutationCommand, MutationCommitReport, MutationError, MutationPipeline,
+    MutationTicket, ReadModel, Requester, SolutionsResultFormat, SparqlQueryRequest,
+    SparqlUpdateRequest, StoreConfig, StoreService, UpdateExecutionReport,
 };
+
+/// A store's writes in tests, through the mutation pipeline's gates (the store has no
+/// write around them): a pipeline without reasoning, as a store without a reasoner is
+/// written. Like any such pipeline it registers no rules with the store and switches its
+/// `owl2-dl` mode off, so a test of a store with a reasoner writes through that store's
+/// own pipeline instead, and data meant to bypass the gates goes in
+/// [`write_past_the_pipeline`].
+pub trait Writes {
+    /// The pipeline the writes go through.
+    fn writer(&self) -> MutationPipeline;
+
+    fn execute_update(
+        &self,
+        request: &SparqlUpdateRequest,
+    ) -> Result<UpdateExecutionReport, MutationError> {
+        self.writer().execute_update(request)
+    }
+
+    fn execute_update_str(&self, update: &str) -> Result<UpdateExecutionReport, MutationError> {
+        self.writer().execute_update_str(update)
+    }
+
+    fn execute_graph_write(
+        &self,
+        request: &GraphWriteRequest,
+    ) -> Result<GraphWriteReport, MutationError> {
+        self.writer().execute_graph_write(request)
+    }
+
+    fn execute_graph_delete(
+        &self,
+        target: &GraphTarget,
+    ) -> Result<GraphDeleteReport, MutationError> {
+        self.writer().execute_graph_delete(target)
+    }
+
+    fn restore_dataset(
+        &self,
+        request: &DatasetRestoreRequest,
+    ) -> Result<DatasetRestoreReport, MutationError> {
+        match self
+            .writer()
+            .apply_as_owner(MutationCommand::Restore(request.clone()))?
+        {
+            MutationCommitReport::Restore(report) => Ok(report),
+            other => unreachable!("restore produced {other:?}"),
+        }
+    }
+
+    /// `command` for `requester`, as a request is applied.
+    fn apply(
+        &self,
+        command: &MutationCommand,
+        requester: &Requester,
+    ) -> Result<MutationCommitReport, MutationError> {
+        self.writer()
+            .apply(command.clone(), requester, &MutationTicket::new())
+    }
+}
+
+impl Writes for StoreService {
+    fn writer(&self) -> MutationPipeline {
+        MutationPipeline::new(
+            Arc::new(self.clone()),
+            Arc::new(ReasonerService::new(ReasonerConfig::default())),
+        )
+    }
+}
+
+/// Loads the TriG `data` past the mutation pipeline, as a bulk load of a file does: no
+/// gate, no reasoning; the store's closure is no longer current. For tests of what the
+/// store does with data that came in that way.
+pub fn load_past_the_pipeline(store: &StoreService, data: &str) {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("data.trig");
+    std::fs::write(&file, data).unwrap();
+    store
+        .bulk_load(&nrese_store::BulkLoadRequest {
+            files: vec![file],
+            replace: false,
+            graph: GraphTarget::DefaultGraph,
+            invalid: None,
+        })
+        .unwrap();
+}
 
 pub fn catalog_fixture_path(filename: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -47,31 +134,6 @@ pub fn inferred_statements(store: &StoreService) -> Result<Inferred, Box<dyn std
             ))
         })
         .collect())
-}
-
-/// Loads an official catalog ontology, applies `update` through the mutation pipeline
-/// under reasoner v2 (`owl2-rl`), and returns the inferred statements.
-pub fn run_owl2_rl_catalog_fixture(
-    filename: &str,
-    update: &str,
-) -> Result<Inferred, Box<dyn std::error::Error>> {
-    let store = Arc::new(StoreService::new(StoreConfig {
-        ontology_path: Some(catalog_fixture_path(filename)),
-        ..in_memory_store_config()
-    })?);
-    store.rematerialise(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)?;
-    let pipeline = MutationPipeline::new(
-        Arc::clone(&store),
-        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
-            ReasoningMode::Owl2Rl,
-        ))),
-    );
-    pipeline.apply(
-        MutationCommand::Update(SparqlUpdateRequest::new(update)),
-        &nrese_store::Requester::all(),
-        &MutationTicket::new(),
-    )?;
-    inferred_statements(&store)
 }
 
 pub fn assert_inferred_triple(inferred: &Inferred, subject: &str, predicate: &str, object: &str) {

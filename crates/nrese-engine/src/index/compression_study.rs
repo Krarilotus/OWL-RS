@@ -1,5 +1,5 @@
 //! What other encodings of the packed permutations would take, measured on a checkpoint:
-//! for the decision on the store-size gap to QLever (docs/reviews/2026-10-02-suite-results.md).
+//! for the decision on the store-size gap to QLever (the suite run of 2 October, benches/runs/2026-10-02.toml).
 //!
 //! ```text
 //! NRESE_STUDY_CHECKPOINT=/path/checkpoint-….nck \

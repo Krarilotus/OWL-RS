@@ -206,7 +206,7 @@ fn compact_equality_survives_a_restart() {
     assert!(
         pipeline
             .store()
-            .reasoning_is_current(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+            .reasoning_is_current(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
     );
     assert_eq!(observe(&pipeline), before);
     drop(pipeline);
@@ -214,7 +214,7 @@ fn compact_equality_survives_a_restart() {
     assert!(
         !other
             .store()
-            .reasoning_is_current(nrese_reasoner::v2::rulesets::Ruleset::Owl2Rl)
+            .reasoning_is_current(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
     );
 }
 
@@ -351,4 +351,861 @@ fn compact_equality_answers_as_replication_on_random_data() {
             );
         }
     }
+}
+
+fn pipeline_with(config: StoreConfig) -> MutationPipeline {
+    MutationPipeline::new(
+        Arc::new(StoreService::new(config).expect("store")),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Rl,
+        ))),
+    )
+}
+
+/// Stage C: the classes expanded after the joins (`equality.expansion = "late"`, the
+/// default) answer as stage B's expanding reads and as replication, on random data
+/// without named graphs (where late expansion applies) and on queries of every shape:
+/// joins, OPTIONAL and UNION over representatives, and above and around them the
+/// operators that stay expanded early (FILTER, MINUS, paths, DISTINCT, groups, LIMIT).
+/// Canonical answers (`equality.answers = "canonical"`) name one identity per class.
+#[test]
+fn late_expansion_answers_as_early_expansion_and_replication() {
+    let compact = |early: bool, canonical: bool| StoreConfig {
+        equality_by_representatives: true,
+        equality_compact: true,
+        equality_early_expansion: early,
+        equality_canonical_answers: canonical,
+        ..in_memory_store_config()
+    };
+    for seed in 1..=16u64 {
+        let mut random = Lcg(fuzz(seed ^ 0x5eed));
+        let entity = |i: usize| format!("ex:e{i}");
+        let predicates = ["ex:p", "ex:q", "ex:r", "ex:f"];
+        let fact = |random: &mut Lcg| {
+            format!(
+                "{} {} {} .",
+                entity(random.below(10)),
+                predicates[random.below(predicates.len())],
+                entity(random.below(10))
+            )
+        };
+        let mut data = String::from(
+            "ex:f a owl:FunctionalProperty . ex:q rdfs:subPropertyOf ex:p .
+             ex:e0 a ex:C . ex:C rdfs:subClassOf ex:D . ex:e3 a ex:D . ",
+        );
+        for _ in 0..24 {
+            data.push_str(&fact(&mut random));
+        }
+        for _ in 0..1 + random.below(5) {
+            data.push_str(&format!(
+                "{} owl:sameAs {} .",
+                entity(random.below(10)),
+                entity(random.below(10))
+            ));
+        }
+        let pipelines = [
+            pipeline(Mode::Replicate),
+            pipeline_with(compact(true, false)),
+            pipeline_with(compact(false, false)),
+        ];
+        let commits = [
+            format!("INSERT DATA {{ {data} }}"),
+            format!(
+                "INSERT DATA {{ {} owl:sameAs {} . {} }}",
+                entity(random.below(10)),
+                entity(random.below(10)),
+                fact(&mut random)
+            ),
+            format!("DELETE DATA {{ {} }}", fact(&mut random)),
+        ];
+        for commit in &commits {
+            for pipeline in &pipelines {
+                let _ = pipeline.apply(
+                    MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                        "{PREFIXES}{commit}"
+                    ))),
+                    &nrese_store::Requester::all(),
+                    &MutationTicket::new(),
+                );
+            }
+            let (a, p) = (entity(random.below(10)), predicates[random.below(3)]);
+            let queries = [
+                format!("SELECT ?x ?z WHERE {{ ?x {p} ?y . ?y ex:q ?z }} ORDER BY ?x ?z"),
+                "SELECT ?x ?y ?z WHERE { ?x ex:p ?y . ?y ex:p ?z . ?z ex:r ?x } ORDER BY ?x ?y ?z"
+                    .to_owned(),
+                "SELECT (COUNT(*) AS ?n) WHERE { ?x ex:p ?y . ?y ex:p ?z }".to_owned(),
+                format!("SELECT ?y ?z WHERE {{ {a} ex:p ?y . ?y ?q ?z }} ORDER BY ?y ?q ?z"),
+                "SELECT ?x ?y WHERE { ?x ex:p ?y . ?y ex:p ?x } ORDER BY ?x ?y".to_owned(),
+                "SELECT ?x ?w WHERE { ?x ex:p ?y OPTIONAL { ?y ex:r ?w } } ORDER BY ?x ?y ?w"
+                    .to_owned(),
+                "SELECT ?x ?y WHERE { { ?x ex:p ?y } UNION { ?x ex:r ?y . ?y a ex:D } } ORDER BY ?x ?y"
+                    .to_owned(),
+                "SELECT ?y (COUNT(?x) AS ?n) WHERE { ?x ex:p ?y . ?x ?r ?z } GROUP BY ?y ORDER BY ?y"
+                    .to_owned(),
+                "SELECT DISTINCT ?x WHERE { ?x ex:p ?y . ?y a ex:D } ORDER BY ?x".to_owned(),
+                "SELECT ?x ?y WHERE { ?x owl:sameAs ?y . ?y ex:p ?z } ORDER BY ?x ?y ?z".to_owned(),
+                format!(
+                    "SELECT ?x ?y WHERE {{ ?x ex:p ?y . ?y ex:q ?z FILTER(?x != {a}) }} ORDER BY ?x ?y"
+                ),
+                "SELECT ?x ?y WHERE { ?x ex:p ?y . ?y ex:p ?z MINUS { ?x ex:q ?y } } ORDER BY ?x ?y"
+                    .to_owned(),
+                "SELECT ?x ?y WHERE { ?x ex:p+ ?y . ?y ex:r ?z } ORDER BY ?x ?y ?z".to_owned(),
+                "SELECT (COUNT(*) AS ?n) WHERE { SELECT * WHERE { ?x ex:p ?y . ?y ?q ?z } LIMIT 7 }"
+                    .to_owned(),
+                "SELECT ?x (STR(?y) AS ?s) WHERE { ?x ex:p ?y . ?y ex:p ?z } ORDER BY ?x ?s ?z"
+                    .to_owned(),
+                "ASK { ?x ex:p ?y . ?y ex:r ?x }".to_owned(),
+            ];
+            for query in &queries {
+                let want = answer(&pipelines[0], query);
+                let early = answer(&pipelines[1], query);
+                let late = answer(&pipelines[2], query);
+                assert_eq!(early, want, "seed {seed}, early, after {commit}: {query}");
+                assert_eq!(late, want, "seed {seed}, late, after {commit}: {query}");
+            }
+        }
+    }
+
+    // Canonical answers: one identity per class, its representative.
+    let canonical = pipeline_with(compact(false, true));
+    let strict = pipeline_with(compact(false, false));
+    let data = "INSERT DATA { ex:a ex:p ex:x . ex:b owl:sameAs ex:a . ex:c owl:sameAs ex:a .
+                ex:x ex:q ex:y . ex:y owl:sameAs ex:z }";
+    update(&canonical, data);
+    update(&strict, data);
+    let q = "SELECT (COUNT(*) AS ?n) WHERE { ?s ex:p ?x . ?x ex:q ?o }";
+    let (strict_count, canonical_count) = (answer(&strict, q), answer(&canonical, q));
+    // Every identity of each class (3 for ?s, 2 for ?o), and one per class.
+    assert!(strict_count.contains("\"6\""), "{strict_count}");
+    assert!(canonical_count.contains("\"1\""), "{canonical_count}");
+    // A constant stands for its class.
+    let text = answer(&canonical, "SELECT ?o WHERE { ex:b ex:p ?o }");
+    assert!(text.contains("http://example.com/x"), "{text}");
+
+    // The late path ran: the plan shows the expansion over the joined representatives,
+    // and early expansion doesn't.
+    let early = pipeline_with(compact(true, false));
+    update(&early, data);
+    let operators = |pipeline: &MutationPipeline| {
+        // Evaluated afresh: the answer above left the query in the result cache.
+        pipeline.store().clear_query_cache();
+        let prepared = pipeline
+            .store()
+            .prepare_query(&nrese_store::SparqlQueryRequest::new(
+                format!("{PREFIXES}{q}"),
+                nrese_store::ReadScope::All,
+            ))
+            .unwrap();
+        let explanation = pipeline
+            .store()
+            .explain_query(&prepared, &nrese_store::CancellationToken::new())
+            .unwrap();
+        explanation
+            .steps
+            .iter()
+            .map(|s| s.operator.clone())
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        operators(&strict)
+            .iter()
+            .any(|o| o == "late equality expansion"),
+        "{:?}",
+        operators(&strict)
+    );
+    assert!(
+        !operators(&early)
+            .iter()
+            .any(|o| o == "late equality expansion")
+    );
+}
+
+/// G5 of the investigation of 6 October 2026: a commit that merges `sameAs` classes in
+/// compact mode publishes its inferences with it, in one revision, as every other commit
+/// does (reasoner-v2 §2.2). Before, it committed the asserted change alone and the store
+/// re-materialised afterwards, in a second revision: readers of the first saw the
+/// equality without its consequences.
+#[test]
+fn a_commit_that_merges_classes_publishes_its_inferences_with_it() {
+    let modes = [Mode::Replicate, Mode::Compact];
+    let pipelines = modes.map(pipeline);
+    let steps = [
+        // The first commit to a fresh store also materialises it: a revision of its own.
+        "INSERT DATA { ex:z ex:knows ex:w }",
+        "INSERT DATA {
+           ex:a owl:sameAs ex:b . ex:a ex:knows ex:kim . ex:c a ex:Person .
+           ex:Person rdfs:subClassOf ex:Agent . ex:hasMother a owl:FunctionalProperty .
+           ex:kim ex:hasMother ex:m1 . ex:m2 ex:livesIn ex:berlin }",
+        // Asserted merges: of a class with a term in none, and of two classes.
+        "INSERT DATA { ex:c owl:sameAs ex:b }",
+        "INSERT DATA { ex:x owl:sameAs ex:y . ex:y ex:likes ex:z . ex:x owl:sameAs ex:a }",
+        // A merge the rules derive.
+        "INSERT DATA { ex:kim ex:hasMother ex:m2 }",
+        // A merge whose displaced representative (`ex:n`, interned after `ex:z`) loses an
+        // asserted statement in the same commit: neither it nor what it implied returns
+        // over the new representative (`ex:z a ex:Person`, `ex:z a ex:Agent`).
+        "INSERT DATA { ex:n a ex:Person . ex:n ex:likes ex:w }",
+        "DELETE DATA { ex:n a ex:Person } ; INSERT DATA { ex:n owl:sameAs ex:z }",
+    ];
+    for (i, step) in steps.into_iter().enumerate() {
+        let before = pipelines[1].store().current_revision();
+        for pipeline in &pipelines {
+            update(pipeline, step);
+        }
+        if i > 0 {
+            assert_eq!(
+                pipelines[1].store().current_revision(),
+                before + 1,
+                "one revision for: {step}"
+            );
+        }
+        let (reference, seen) = (observe(&pipelines[0]), observe(&pipelines[1]));
+        for (i, (got, want)) in seen.iter().zip(&reference).enumerate() {
+            assert_eq!(got, want, "observation {i}, after: {step}");
+        }
+    }
+}
+
+/// B3a: a commit that splits `sameAs` classes in compact mode maintains them in the same
+/// revision, as one that merges them does, by the plan the maintenance policy picks.
+/// Splits by an asserted equality, by a derived one losing its premise, and of a class
+/// whose representative leaves.
+#[test]
+fn a_commit_that_splits_a_class_maintains_it_in_the_same_revision() {
+    let modes = [Mode::Replicate, Mode::Compact];
+    let pipelines = modes.map(pipeline);
+    let steps = [
+        "INSERT DATA { ex:z ex:knows ex:w }",
+        "INSERT DATA {
+           ex:a owl:sameAs ex:b . ex:b owl:sameAs ex:c . ex:c owl:sameAs ex:d .
+           ex:a ex:knows ex:kim . ex:d a ex:Person . ex:c ex:likes ex:z .
+           ex:Person rdfs:subClassOf ex:Agent . ex:hasMother a owl:FunctionalProperty .
+           ex:kim ex:hasMother ex:m1 . ex:kim ex:hasMother ex:m2 . ex:m2 ex:livesIn ex:berlin .
+           ex:m1 owl:sameAs ex:a }",
+        // An asserted equality in the middle of a chain: two classes.
+        "DELETE DATA { ex:b owl:sameAs ex:c }",
+        // A derived equality losing its premise.
+        "DELETE DATA { ex:kim ex:hasMother ex:m2 }",
+        // The representative's own equality: it leaves its class.
+        "DELETE DATA { ex:m1 owl:sameAs ex:a }",
+        // Merged again, then split by deleting the representative's facts.
+        "INSERT DATA { ex:b owl:sameAs ex:c . ex:kim ex:hasMother ex:m2 }",
+        "DELETE WHERE { ex:a ?p ?o }",
+        // The ground program cached after a split, in use.
+        "INSERT DATA { ex:d ex:knows ex:kim . ex:m1 ex:likes ex:w }",
+    ];
+    for (i, step) in steps.into_iter().enumerate() {
+        let before = pipelines[1].store().current_revision();
+        for pipeline in &pipelines {
+            update(pipeline, step);
+        }
+        if i > 0 {
+            assert_eq!(
+                pipelines[1].store().current_revision(),
+                before + 1,
+                "one revision for: {step}"
+            );
+        }
+        let (reference, seen) = (observe(&pipelines[0]), observe(&pipelines[1]));
+        for (i, (got, want)) in seen.iter().zip(&reference).enumerate() {
+            assert_eq!(got, want, "observation {i}, after: {step}");
+        }
+    }
+}
+
+/// The fuzz campaign's `NRESE_FUZZ_SEED=4` (its first commit), reduced: a commit asserts
+/// facts whose objects a functional property merges, and the representative's form of
+/// them is asserted only in a named graph. The compact stack must store that form (the
+/// default graph's reads expand it to the other identities): the delta executor doesn't
+/// report it, as it is asserted.
+#[test]
+fn a_merging_commit_stores_the_representative_form_of_what_it_asserts() {
+    let modes = [Mode::Replicate, Mode::Compact];
+    let pipelines = modes.map(pipeline);
+    let steps = [
+        "INSERT DATA { ex:e3 ex:r ex:e3 }",
+        "INSERT DATA { ex:f a owl:FunctionalProperty . ex:e0 ex:f ex:e9 . ex:e0 ex:f ex:e1 .
+                       GRAPH ex:g { ex:e0 ex:f ex:e3 } }",
+    ];
+    for step in steps {
+        for pipeline in &pipelines {
+            update(pipeline, step);
+        }
+        let (reference, seen) = (observe(&pipelines[0]), observe(&pipelines[1]));
+        for (i, (got, want)) in seen.iter().zip(&reference).enumerate() {
+            assert_eq!(got, want, "observation {i}, after: {step}");
+        }
+    }
+}
+
+/// A commit that deletes an equality keeps what schema facts alone derive about the class
+/// it splits (`ex:C ⊑ ex:C` gives `ex:C ≡ ex:C`), in every equality mode. A store keeping
+/// every copy maintains the split by recomputing its region, which lost such a fact; a
+/// compact store rebuilds. The filler makes a rebuild dearer than the recomputation, as
+/// in a store of any size.
+#[test]
+fn a_split_keeps_what_schema_facts_alone_derive() {
+    use nrese_reasoner::delta::policy::Plan;
+    let filler: String = (0..200)
+        .map(|i| format!("ex:f{i} ex:filler ex:g{i} . "))
+        .collect();
+    for mode in [Mode::Replicate, Mode::Representatives, Mode::Compact] {
+        let pipeline = pipeline(mode);
+        update(
+            &pipeline,
+            &format!(
+                "INSERT DATA {{ ex:C rdfs:subClassOf ex:C . ex:C owl:sameAs ex:D . {filler} }}"
+            ),
+        );
+        let kept = "ASK { ex:C owl:equivalentClass ex:C }";
+        assert!(answer(&pipeline, kept).contains("true"), "{mode:?}: before");
+        update(&pipeline, "DELETE DATA { ex:C owl:sameAs ex:D }");
+        let plan = pipeline.last_reasoning_run().expect("recorded").work.plan;
+        assert!(
+            answer(&pipeline, kept).contains("true"),
+            "{mode:?}: after the split (plan {plan:?})"
+        );
+        if mode != Mode::Compact {
+            assert_eq!(plan, Plan::Recompute, "{mode:?}: the path under test");
+        }
+    }
+}
+
+/// A custom program with the equality rules and no axioms.
+const EQUALITY_RULES: &str = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+{ ?x rdf:type ?c . ?c rdfs:subClassOf ?d } => { ?x rdf:type ?d } .
+{ ?x owl:sameAs ?y } => { ?y owl:sameAs ?x } .
+{ ?x owl:sameAs ?y . ?x ?p ?o } => { ?y ?p ?o } .
+";
+
+/// The commits of `way` (`load`: one; `commit`: the data in two parts) at `step` of taking
+/// the data apart: 0 as written; from 1 `ex:a`'s type asserted, not inferred through the
+/// subclass; from 2 its `owl:sameAs` in a commit after its type; from 3 without `ex:rex`,
+/// from 4 without the existential, from 5 without `ex:bob`; 6 also without the subclass;
+/// 7 as 6 with the `owl:sameAs` committed before the type; 8 as 5 with the `owl:sameAs`
+/// committed before the type (the subclass kept). An empty part is no commit.
+fn commits(way: &str, step: usize) -> Vec<String> {
+    let mut first = Vec::new();
+    if step < 6 || step == 8 {
+        first.push("ex:Dog rdfs:subClassOf ex:Animal .");
+    }
+    if step < 3 {
+        first.push("ex:rex a ex:Dog .");
+    }
+    if step < 4 {
+        first.push(
+            "ex:Employee rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:worksFor ; \
+             owl:someValuesFrom owl:Thing ] .",
+        );
+    }
+    let mut second = vec![if step < 1 {
+        "ex:a a ex:Dog ."
+    } else {
+        "ex:a a ex:Animal ."
+    }];
+    if step < 5 {
+        second.push("ex:bob a ex:Employee .");
+    }
+    let same = "ex:a owl:sameAs ex:b .";
+    if step < 2 {
+        second.push(same);
+    }
+    let mut commits = match way {
+        "load" => vec![[first, second].concat()],
+        _ => vec![first, second],
+    };
+    if step == 7 || step == 8 {
+        let at = commits.len() - 1;
+        commits.insert(at, vec![same]);
+    } else if step >= 2 {
+        commits.push(vec![same]);
+    }
+    commits
+        .into_iter()
+        .filter(|parts| !parts.is_empty())
+        .map(|parts| format!("INSERT DATA {{ {} }}", parts.join(" ")))
+        .collect()
+}
+
+/// A GraphDB ruleset with the equality rules under OWL 2 RL's names (`eq-rep-s` among them)
+/// and no axioms.
+const EQUALITY_PIE: &str = "Prefices
+{
+  rdf  : http://www.w3.org/1999/02/22-rdf-syntax-ns#
+  rdfs : http://www.w3.org/2000/01/rdf-schema#
+  owl  : http://www.w3.org/2002/07/owl#
+}
+
+Rules
+{
+Id: cax-sco
+  x <rdf:type> c
+  c <rdfs:subClassOf> d
+  ---------------------
+  x <rdf:type> d
+
+Id: eq-sym
+  x <owl:sameAs> y
+  ----------------
+  y <owl:sameAs> x
+
+Id: eq-trans
+  x <owl:sameAs> y
+  y <owl:sameAs> z
+  ----------------
+  x <owl:sameAs> z
+
+Id: eq-rep-s
+  s <owl:sameAs> t
+  s p o
+  ----------------
+  t p o
+
+Id: eq-rep-p
+  p <owl:sameAs> q
+  s p o
+  ----------------
+  s q o
+
+Id: eq-rep-o
+  o <owl:sameAs> t
+  s p o
+  ----------------
+  s p t
+}
+";
+
+/// The programs that close equality, by name: built-in ones whose closure of an empty store
+/// is empty (`rdfs-plus`, `owl-horst`) and one with axioms (`owl2-rl`); custom ones with
+/// the equality rules and no axioms, in Notation3 (`Custom`) and as a GraphDB ruleset whose
+/// rules carry OWL 2 RL's names (`Pie`).
+fn programs() -> Vec<(String, ReasonerConfig)> {
+    let custom = |rules: nrese_reasoner::UserRules| {
+        ReasonerConfig::for_mode(ReasoningMode::Custom)
+            .with_rules(Some(Arc::new(rules)))
+            .expect("rules")
+    };
+    let mut programs: Vec<(String, ReasonerConfig)> = [
+        ReasoningMode::RdfsPlus,
+        ReasoningMode::OwlHorst,
+        ReasoningMode::Owl2Rl,
+    ]
+    .into_iter()
+    .map(|mode| (format!("{mode:?}"), ReasonerConfig::for_mode(mode)))
+    .collect();
+    let n3 = nrese_reasoner::UserRules::n3("equality.n3", EQUALITY_RULES).expect("rules");
+    programs.push(("Custom".to_owned(), custom(n3)));
+    let pie = nrese_reasoner::UserRules::pie("equality.pie", EQUALITY_PIE).expect("rules");
+    programs.push(("Pie".to_owned(), custom(pie)));
+    programs
+}
+
+/// A store under `reasoner` with `reasoner.equality` `compact` or `representatives`, on
+/// disk in `dir` or in memory.
+fn equality_store(
+    reasoner: &ReasonerConfig,
+    compact: bool,
+    disk: Option<&std::path::Path>,
+) -> MutationPipeline {
+    let storage = disk.map_or_else(in_memory_store_config, StoreConfig::on_disk);
+    equality_store_over(reasoner, compact, storage)
+}
+
+/// [`equality_store`] over `storage`'s other settings.
+fn equality_store_over(
+    reasoner: &ReasonerConfig,
+    compact: bool,
+    storage: StoreConfig,
+) -> MutationPipeline {
+    let config = StoreConfig {
+        equality_by_representatives: true,
+        equality_compact: compact,
+        ..storage
+    };
+    MutationPipeline::new(
+        Arc::new(StoreService::new(config).expect("store")),
+        Arc::new(ReasonerService::new(reasoner.clone())),
+    )
+}
+
+/// A store filled by commits answers through `owl:sameAs` as a store reasoned from scratch
+/// does, however its data came in, under `reasoner.equality` `representatives` (the
+/// default) and `compact`, and under every program that closes equality ([`programs`]);
+/// in memory and on disk. The data is the class table's (nrese-server
+/// `status_class_tests.rs`), then taken apart step by step ([`commits`]); every case is
+/// printed, and the wrong ones listed.
+#[test]
+fn a_store_filled_by_commits_reads_its_equalities_expanded() {
+    let mut wrong = Vec::new();
+    for (program, reasoner) in programs() {
+        for (equality, compact) in [("representatives", false), ("compact", true)] {
+            for disk in [false, true] {
+                for way in ["load", "commit"] {
+                    for step in 0..=8 {
+                        let dir = tempfile::tempdir().expect("dir");
+                        let pipeline =
+                            equality_store(&reasoner, compact, disk.then_some(dir.path()));
+                        for commit in commits(way, step) {
+                            update(&pipeline, &commit);
+                        }
+                        let rows =
+                            answer(&pipeline, "SELECT ?x WHERE { ?x a ex:Animal } ORDER BY ?x");
+                        let case = format!(
+                            "{program} {equality} {} {way} step {step}",
+                            if disk { "on-disk" } else { "in-memory" }
+                        );
+                        let right = rows.contains("http://example.com/b");
+                        println!(
+                            "CASE {case}: {} {rows}",
+                            if right { "right" } else { "WRONG" }
+                        );
+                        if !right {
+                            wrong.push(case);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "ex:b missing in {} cases: {wrong:?}",
+        wrong.len()
+    );
+}
+
+/// The statements `pipeline`'s store keeps as inferred, as stored: no equality expansion.
+fn stored_inferred(pipeline: &MutationPipeline) -> Vec<String> {
+    let snapshot = pipeline
+        .store()
+        .read_snapshot(None)
+        .expect("snapshot")
+        .stored();
+    let name = |id| {
+        snapshot
+            .decode(id)
+            .map_or_else(|| "-".to_owned(), |term| term.to_string())
+    };
+    let mut rows: Vec<String> = snapshot
+        .quads_for_pattern_in(
+            nrese_engine::ReadModel::Inferred,
+            &nrese_engine::QuadPattern::all(),
+        )
+        .map(|q| {
+            format!(
+                "{} {} {}",
+                name(q.subject),
+                name(q.predicate),
+                name(q.object)
+            )
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// A store keeps the same inferred statements whatever order its data came in, not only the
+/// same answers: the facts before their `owl:sameAs`, or after it, as in one commit; under
+/// `reasoner.equality` `representatives` and `compact`, every program that closes equality
+/// ([`programs`]), in memory and on disk. Every case is printed, and the differing ones
+/// listed.
+#[test]
+fn a_store_keeps_the_same_inferences_in_either_order() {
+    const FACTS: &str = "ex:Dog rdfs:subClassOf ex:Animal . ex:a a ex:Dog . ex:a ex:knows ex:c .";
+    const SAME: &str = "ex:a owl:sameAs ex:b .";
+    let orders = [
+        ("facts first", vec![FACTS, SAME]),
+        ("sameAs first", vec![SAME, FACTS]),
+    ];
+    let mut different = Vec::new();
+    for (program, reasoner) in programs() {
+        for (equality, compact) in [("representatives", false), ("compact", true)] {
+            for disk in [false, true] {
+                let fill = |commits: &[&str]| {
+                    let dir = tempfile::tempdir().expect("dir");
+                    let pipeline = equality_store(&reasoner, compact, disk.then_some(dir.path()));
+                    for commit in commits {
+                        update(&pipeline, &format!("INSERT DATA {{ {commit} }}"));
+                    }
+                    stored_inferred(&pipeline)
+                };
+                let once = fill(&[format!("{FACTS} {SAME}").as_str()]);
+                for (order, commits) in &orders {
+                    let rows = fill(commits);
+                    let case = format!(
+                        "{program} {equality} {} {order}",
+                        if disk { "on-disk" } else { "in-memory" }
+                    );
+                    if rows == once {
+                        println!("CASE {case}: same {} rows", rows.len());
+                    } else {
+                        let extra: Vec<_> = rows.iter().filter(|r| !once.contains(r)).collect();
+                        let missing: Vec<_> = once.iter().filter(|r| !rows.contains(r)).collect();
+                        println!("CASE {case}: DIFFERENT extra {extra:?} missing {missing:?}");
+                        different.push(case);
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        different.is_empty(),
+        "other inferences in {} cases: {different:?}",
+        different.len()
+    );
+}
+
+/// A compact store written with `owl:sameAs` before the facts, then reopened, reads and is
+/// maintained as a store under `representatives` that took the same data at once.
+#[test]
+fn a_store_written_sameas_first_reads_right_after_a_reopen() {
+    const FIRST: &str = "INSERT DATA { ex:a owl:sameAs ex:b }";
+    const SECOND: &str = "INSERT DATA { ex:a a ex:Animal . ex:a ex:knows ex:c . \
+                          ex:Dog rdfs:subClassOf ex:Animal . ex:c a ex:Dog }";
+    const THIRD: &str = "DELETE DATA { ex:a a ex:Animal } ; INSERT DATA { ex:c a ex:Plant }";
+    const AFTER_SECOND: &str = "INSERT DATA { ex:a owl:sameAs ex:b . ex:a a ex:Animal . \
+                                ex:a ex:knows ex:c . ex:Dog rdfs:subClassOf ex:Animal . ex:c a ex:Dog }";
+    const AFTER_THIRD: &str = "INSERT DATA { ex:a owl:sameAs ex:b . ex:a ex:knows ex:c . \
+                               ex:Dog rdfs:subClassOf ex:Animal . ex:c a ex:Dog . ex:c a ex:Plant }";
+    const READS: [(&str, &str); 6] = [
+        (
+            "every statement",
+            "SELECT ?s ?p ?o WHERE { ?s ?p ?o } ORDER BY ?s ?p ?o",
+        ),
+        ("count", "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }"),
+        ("animals", "SELECT ?x WHERE { ?x a ex:Animal } ORDER BY ?x"),
+        ("plants", "SELECT ?x WHERE { ?x a ex:Plant } ORDER BY ?x"),
+        (
+            "knows",
+            "SELECT ?x ?y WHERE { ?x ex:knows ?y } ORDER BY ?x ?y",
+        ),
+        (
+            "about ex:b",
+            "SELECT ?p ?o WHERE { ex:b ?p ?o } ORDER BY ?p ?o",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for mode in [
+        ReasoningMode::RdfsPlus,
+        ReasoningMode::OwlHorst,
+        ReasoningMode::Owl2Rl,
+    ] {
+        let reasoner = ReasonerConfig::for_mode(mode);
+        let reference = |data: &str| {
+            let pipeline = equality_store(&reasoner, false, None);
+            update(&pipeline, data);
+            pipeline
+        };
+        let dir = tempfile::tempdir().expect("dir");
+        {
+            let pipeline = equality_store(&reasoner, true, Some(dir.path()));
+            update(&pipeline, FIRST);
+            update(&pipeline, SECOND);
+        }
+        let pipeline = equality_store(&reasoner, true, Some(dir.path()));
+        for (point, want) in [
+            ("after the reopen", AFTER_SECOND),
+            ("after a commit", AFTER_THIRD),
+        ] {
+            if point == "after a commit" {
+                update(&pipeline, THIRD);
+            }
+            let want = reference(want);
+            for (read, query) in READS {
+                let (got, expected) = (answer(&pipeline, query), answer(&want, query));
+                let case = format!("{mode:?} {point} {read}");
+                if got == expected {
+                    println!("CASE {case}: right");
+                } else {
+                    println!("CASE {case}: WRONG {got} | want {expected}");
+                    wrong.push(case);
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "wrong: {wrong:?}");
+}
+
+/// A store whose closure was recorded while it held nothing (a server's first start on an
+/// empty data directory), closed and opened again, answers through the `owl:sameAs` its
+/// first commits bring as a store under `representatives` does: in one commit and in two,
+/// under every program that closes equality ([`programs`]), with `reasoner.equality`
+/// `compact`. Every case is printed, and the wrong ones listed.
+#[test]
+fn a_store_recorded_empty_and_reopened_reads_its_first_equalities_expanded() {
+    const TYPE: &str = "ex:Dog rdfs:subClassOf ex:Animal . ex:a a ex:Dog .";
+    const SAME: &str = "ex:a owl:sameAs ex:b .";
+    const QUERY: &str = "SELECT ?x WHERE { ?x a ex:Animal } ORDER BY ?x";
+    let mut wrong = Vec::new();
+    for (program, reasoner) in programs() {
+        for (way, commits) in [
+            ("load", vec![format!("{TYPE} {SAME}")]),
+            ("commit", vec![TYPE.to_owned(), SAME.to_owned()]),
+        ] {
+            let dir = tempfile::tempdir().expect("dir");
+            {
+                let started = equality_store(&reasoner, true, Some(dir.path()));
+                let rules = reasoner.materialised_program().expect("a program");
+                started
+                    .store()
+                    .rematerialise(&rules)
+                    .expect("the start's reasoning");
+            }
+            let reopened = equality_store(&reasoner, true, Some(dir.path()));
+            let want = equality_store(&reasoner, false, None);
+            for commit in &commits {
+                update(&reopened, &format!("INSERT DATA {{ {commit} }}"));
+                update(&want, &format!("INSERT DATA {{ {commit} }}"));
+            }
+            let (got, expected) = (answer(&reopened, QUERY), answer(&want, QUERY));
+            let case = format!("{program} {way}");
+            if got == expected {
+                println!("CASE {case}: right");
+            } else {
+                println!("CASE {case}: WRONG {got} | want {expected}");
+                wrong.push(case);
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "wrong: {wrong:?}");
+}
+
+/// A compact store under a custom program, written with `owl:sameAs` before the facts and
+/// reopened, answers as its rules entail: with their own equality rules ([`programs`]'
+/// `Custom` and `Pie`), `b` is an Animal through `a owl:sameAs b`; with none, it isn't.
+/// `Custom`'s Notation3 rules aren't named as equality rules, so its store always holds
+/// every copy.
+#[test]
+fn a_compact_store_under_custom_rules_reopened_answers_as_they_entail() {
+    const NO_EQUALITY: &str = "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+{ ?x rdf:type ?c . ?c rdfs:subClassOf ?d } => { ?x rdf:type ?d } .
+";
+    let rules = nrese_reasoner::UserRules::n3("no-equality.n3", NO_EQUALITY).expect("rules");
+    let without = ReasonerConfig::for_mode(ReasoningMode::Custom)
+        .with_rules(Some(Arc::new(rules)))
+        .expect("rules");
+    let cases = programs()
+        .into_iter()
+        .filter(|(program, _)| program == "Custom" || program == "Pie")
+        .map(|(program, reasoner)| (program, reasoner, true))
+        .chain([("NoEquality".to_owned(), without, false)]);
+    let mut wrong = Vec::new();
+    for (program, reasoner, b_entailed) in cases {
+        let dir = tempfile::tempdir().expect("dir");
+        {
+            let written = equality_store(&reasoner, true, Some(dir.path()));
+            update(&written, "INSERT DATA { ex:a owl:sameAs ex:b }");
+            update(
+                &written,
+                "INSERT DATA { ex:Dog rdfs:subClassOf ex:Animal . ex:a a ex:Dog }",
+            );
+        }
+        let reopened = equality_store(&reasoner, true, Some(dir.path()));
+        let rows = answer(&reopened, "SELECT ?x WHERE { ?x a ex:Animal } ORDER BY ?x");
+        let right = rows.contains("http://example.com/a")
+            && rows.contains("http://example.com/b") == b_entailed;
+        let verdict = if right { "right" } else { "WRONG" };
+        println!("CASE {program}: {verdict} {rows} (b entailed: {b_entailed})");
+        if !right {
+            wrong.push(program);
+        }
+    }
+    assert!(wrong.is_empty(), "wrong: {wrong:?}");
+}
+
+/// A primary under `reasoner.equality = "compact"` whose program closes equality
+/// (`RuleProgram::closes_equality`), so that its rows are stored over representatives, sends
+/// no replica its log (the replica's fail-closed form:
+/// refused at the store): a replica would read those rows with no reading. The primary
+/// commits the type through a subclass, then `owl:sameAs`. The replica follows the log from
+/// an empty directory, between the two and after (`pulled between`) or once after both
+/// (`pulled once`): its first pull is refused with the sentence. Under a program that doesn't
+/// close equality (custom rules: its rows are stored as they are) it follows, and answers
+/// through the `owl:sameAs` as the primary does. Always through the store's own calls
+/// (`replication_log`, `apply_replication_log`), as the server's pull; the image's refusal is
+/// the server's (its replica tests). Under every program of [`programs`] but `owl2-rl`,
+/// whose first closure writes no record, so its log starts after it. Every case is printed;
+/// a refusal otherwise, or a replica that couldn't follow, is an ERROR.
+#[test]
+fn a_compact_primary_sends_no_replica_its_log() {
+    const TYPE: &str = "INSERT DATA { ex:Dog rdfs:subClassOf ex:Animal . ex:a a ex:Dog }";
+    const SAME: &str = "INSERT DATA { ex:a owl:sameAs ex:b }";
+    const QUERY: &str = "SELECT ?x WHERE { ?x a ex:Animal } ORDER BY ?x";
+    // What a refusal says, in part.
+    const REFUSED: &str = "serves no replica";
+    let mut wrong = Vec::new();
+    for (program, reasoner) in programs() {
+        if program == "Owl2Rl" {
+            continue;
+        }
+        let refused = reasoner
+            .materialised_program()
+            .is_some_and(|p| nrese_reasoner::RuleProgram::closes_equality(&p.name()));
+        for way in ["pulled between", "pulled once"] {
+            let (at, follows) = (
+                tempfile::tempdir().expect("dir"),
+                tempfile::tempdir().expect("dir"),
+            );
+            let primary = equality_store(&reasoner, true, Some(at.path()));
+            let case = format!("{program} {way}");
+            update(&primary, TYPE);
+            let as_replica = StoreConfig {
+                replica: true,
+                ..StoreConfig::on_disk(follows.path())
+            };
+            let replica = equality_store_over(&reasoner, true, as_replica);
+            let pull = || -> Result<(), String> {
+                let after = replica.store().current_revision();
+                let batch = primary
+                    .store()
+                    .replication_log(after, 1 << 20)
+                    .map_err(|e| format!("log after {after}: {e}"))?;
+                let expected = nrese_store::LogExpectation {
+                    after,
+                    records: batch.records as u64,
+                    last: batch.last,
+                };
+                let stop = nrese_exec::stop::StopSource::new(None, None);
+                let applied = replica
+                    .store()
+                    .apply_replication_log(&batch.frames, &expected, &stop)
+                    .map_err(|e| format!("apply after {after}: {e}"))?;
+                (applied.revision == primary.store().current_revision())
+                    .then_some(())
+                    .ok_or(format!("at {} of {}", applied.revision, batch.latest))
+            };
+            let caught_up = match way {
+                "pulled between" => pull(),
+                _ => Ok(()),
+            };
+            update(&primary, SAME);
+            let followed = caught_up.and_then(|()| pull());
+            match followed {
+                Err(error) if refused && error.contains(REFUSED) => {
+                    println!("CASE {case}: right, refused: {error}");
+                }
+                Err(error) => {
+                    println!("CASE {case}: ERROR {error}");
+                    wrong.push(case);
+                }
+                Ok(()) if refused => {
+                    println!("CASE {case}: WRONG served its log");
+                    wrong.push(case);
+                }
+                Ok(()) => {
+                    let (got, want) = (answer(&replica, QUERY), answer(&primary, QUERY));
+                    if got == want {
+                        println!("CASE {case}: right");
+                    } else {
+                        println!("CASE {case}: WRONG {got} | primary {want}");
+                        wrong.push(case);
+                    }
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "wrong: {wrong:?}");
 }

@@ -1,0 +1,417 @@
+//! Guards of the batch executor's memory and probe wins (docs/design/performance.md §0):
+//! counts, not times, on a small LUBM-shaped input under OWL 2 RL, on one thread so the
+//! allocations are deterministic. Measured with a counting allocator, so this file is a
+//! test binary of its own, and its tests run one at a time.
+
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use nrese_exec::heap;
+use nrese_reasoner::batch::{self, Materialisation, Schema};
+use nrese_reasoner::lists::ListVocabulary;
+use nrese_reasoner::rulesets::Ruleset;
+use nrese_reasoner::vocabulary::LocalVocabulary;
+
+#[path = "support/lubm.rs"]
+mod lubm;
+use lubm::{DEPARTMENTS, cascade, grouped, lubm_like};
+
+#[global_allocator]
+static ALLOCATOR: heap::Counting<std::alloc::System> = heap::Counting(std::alloc::System);
+
+/// The tests share the allocator's counts.
+static SERIAL: Mutex<()> = Mutex::new(());
+
+/// OWL 2 RL over [`lubm_like`] with `departments`, on one thread, as the store runs it
+/// (grouped input), with the heap profile of the run and the bytes live before it besides
+/// the input's pairs (which become the working set's input runs).
+fn materialise(departments: u64) -> (Materialisation, Vec<heap::Phase>, usize) {
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = Ruleset::Owl2Rl
+        .rules(&mut vocabulary)
+        .expect("OWL 2 RL parses");
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let facts = lubm_like(&mut vocabulary, departments);
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(1)
+        .build()
+        .expect("a pool");
+    let input = grouped(facts);
+    let pairs: usize = input.iter().map(|(_, pairs)| pairs.capacity() * 16).sum();
+    let before = heap::live() - pairs;
+    heap::start("input");
+    let result = pool.install(|| batch::materialise_grouped(input, &rules, Some(&lists), &schema));
+    (result, heap::finish(), before)
+}
+
+/// P1-F1 and P1-F4. Rule jobs read their drivers in the working set's runs instead of
+/// copying them, and the rounds keep no list of the facts they derived beside the
+/// working set (the base and recent runs are that list). Reverting either shows here:
+/// copied drivers count bytes, and a derived-facts list holds 24 bytes per derived fact
+/// outside the runs at the end of every round.
+#[test]
+fn rule_jobs_copy_no_drivers_and_rounds_keep_no_derived_facts_list() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let (result, phases, before) = materialise(DEPARTMENTS);
+    assert_eq!(
+        result.counters.driver_bytes_copied, 0,
+        "rule jobs copied their drivers"
+    );
+    // The heap live at the end of each round (when the next one grounds, or the
+    // consistency check begins), against the runs it holds.
+    let ends: Vec<usize> = phases
+        .windows(2)
+        .filter(|pair| match pair[1].label {
+            "reasoner: grounding" => pair[0].label != "input",
+            next => next == "reasoner: consistency",
+        })
+        .map(|pair| pair[0].live_after)
+        .collect();
+    assert_eq!(ends.len(), result.rounds);
+    assert_eq!(result.counters.store_bytes.len(), result.rounds);
+    let derived = result.derived.len();
+    assert!(derived > 20_000, "{derived} derived facts: too few to tell");
+    let (&end, store) = ends
+        .last()
+        .zip(result.counters.store_bytes.last())
+        .expect("rounds");
+    let outside = end - before - store.total();
+    // What else a round holds is the program (schema-sized), not data: 38,812 bytes on
+    // 5 October 2026, where a derived-facts list would take 893,280.
+    assert!(
+        outside < derived * 24 / 4,
+        "{outside} bytes beside the working set's {} after the last round, {derived} derived facts",
+        store.total()
+    );
+}
+
+/// P1-F9 and P1-F10. A round holds its candidates as its morsels found them (not
+/// concatenated, never grown by doubling), merges each predicate's into chunks without a
+/// sorted copy of all of them, folds the recent run into the base a chunk at a time, and
+/// the derived facts are listed while the working set is taken apart. So no phase holds
+/// much beside the working set: counted in bytes per fact of the final working set
+/// above it (not as a share of it, which P1-F11 shrank). With chunks of 1,024 pairs, so
+/// that this input's runs have many: the rounds 3.55, the listing 0.52 bytes per fact on
+/// 6 October 2026; reverted, one-vector folds 8.10, a one-vector union 8.40,
+/// concatenated candidates 19.50, the listing beside the whole working set 9.74.
+#[test]
+fn rounds_hold_no_second_copy_beside_the_working_set() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    batch::set_chunk_pairs(1024);
+    let (result, phases, before) = materialise(DEPARTMENTS);
+    batch::set_chunk_pairs(1 << 20);
+    let store = result.counters.store_bytes.last().expect("rounds").total();
+    let facts = store_facts(&result);
+    let peak = |labels: &[&str]| {
+        phases
+            .iter()
+            .filter(|phase| labels.contains(&phase.label))
+            .map(|phase| phase.peak - before)
+            .max()
+            .expect("the phases ran")
+    };
+    let rounds = peak(&[
+        "reasoner: grounding",
+        "reasoner: joins",
+        "reasoner: modules",
+        "reasoner: merge",
+        "reasoner: install",
+    ]);
+    let per_fact = |bytes: usize| bytes.saturating_sub(store) as f64 / facts as f64;
+    let rounds = per_fact(rounds);
+    assert!(
+        rounds <= 6.0,
+        "the rounds held {rounds:.2} bytes per fact beside the working set, at most 6"
+    );
+    let listing = per_fact(peak(&["reasoner: derived"]));
+    assert!(
+        listing <= 3.0,
+        "listing the derived facts held {listing:.2} bytes per fact beside the working set, at most 3"
+    );
+}
+
+/// P1-F11. A relation keeps its `(object, subject)` order only if a rule of the program
+/// can look it up by object alone (or grounding reads it): here `takesCourse`, `advisor`,
+/// `teacherOf`, the degrees and the inverse `member`, among others, keep only their
+/// subject order. Every order kept, the final working set holds 32 bytes per fact; 22.4
+/// on 6 October 2026. No lookup by object meets a relation without that order.
+#[test]
+fn relations_keep_no_object_order_their_rules_never_use() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let (result, _, _) = materialise(DEPARTMENTS);
+    assert_eq!(result.counters.lookups_without_order, 0);
+    let store = result.counters.store_bytes.last().expect("rounds").total();
+    let facts = store_facts(&result);
+    assert!(
+        store <= facts * BYTES_PER_FACT,
+        "{store} bytes for {facts} facts, at most {BYTES_PER_FACT} each"
+    );
+}
+
+/// Releases of the allocator's unused memory (`nrese_engine::memory::release_all`): once on
+/// the one pool thread, once on the calling thread.
+static RELEASES: AtomicUsize = AtomicUsize::new(0);
+
+/// The rounds give back what the last one freed only where `budgets.reasoning_release` asks
+/// for it, then before every round and after the last. Off by default: the memory given
+/// back is soon taken and faulted in again, 5.6 % more reasoning time on LUBM 100 for a
+/// 14 % lower peak (office-pc, 13 Oct 2026); on, the peak no longer depends on whether
+/// mimalloc's 100 ms delay kept the last round's buffers.
+#[test]
+fn rounds_release_between_them_only_when_asked() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    nrese_engine::memory::set_release(|_| {
+        RELEASES.fetch_add(1, Ordering::Relaxed);
+    });
+    let releases = || {
+        let before = RELEASES.load(Ordering::Relaxed);
+        let (result, _, _) = materialise(DEPARTMENTS);
+        (RELEASES.load(Ordering::Relaxed) - before, result.rounds)
+    };
+    let (by_default, _) = releases();
+    assert_eq!(by_default, 0, "rounds released without the setting");
+    nrese_engine::memory::set_release_between_rounds(true);
+    let (asked, rounds) = releases();
+    nrese_engine::memory::set_release_between_rounds(false);
+    assert!(rounds > 1, "{rounds} rounds: too few to tell");
+    assert!(
+        asked >= 2 * (rounds + 1),
+        "{asked} releases over {rounds} rounds"
+    );
+}
+
+/// The facts of the working set at the end: the input's and the derived ones.
+fn store_facts(result: &Materialisation) -> usize {
+    let input = grouped(lubm_like(&mut LocalVocabulary::default(), DEPARTMENTS));
+    input.iter().map(|(_, pairs)| pairs.len()).sum::<usize>() + result.derived.len()
+}
+
+/// P1-F8. A morsel's candidates are checked against the working set once each, in
+/// (predicate, subject, object) order. Unsorted, every probe misses the cache at each
+/// level of each binary search; without the deduplication about half the probes repeat.
+#[test]
+fn membership_probes_are_distinct_and_ordered_per_morsel() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let (result, _, _) = materialise(DEPARTMENTS);
+    let counters = &result.counters;
+    assert_eq!(counters.unordered_probes, 0, "probes out of order");
+    let probes: u64 = counters.probes.iter().sum();
+    assert!(
+        probes <= PROBES,
+        "{probes} membership probes over {} rounds ({:?}), at most {PROBES}",
+        result.rounds,
+        counters.probes
+    );
+    // G1: within a morsel, each relation's runs are read forward from the last check's
+    // place (58 starts for 83,643 checks on 7 October 2026); checked one by one, every
+    // check started every run from the root and none is counted.
+    assert!(
+        (1..=100).contains(&counters.probe_starts),
+        "{} starts of the runs for {probes} checks",
+        counters.probe_starts
+    );
+}
+
+/// The probes of [`membership_probes_are_distinct_and_ordered_per_morsel`]'s run on
+/// 5 October 2026 (37,014, 49,813, 8,016 and 200 in its four rounds). Deterministic: a
+/// change of the rules or the input shape that adds probes for a reason re-measures it.
+const PROBES: u64 = 95_043;
+
+/// G8 and #4 of the investigation of 6 October 2026: with equality by representatives
+/// the closure is computed in the working set, from the grouped input, whatever
+/// `sameAs` merges it meets. Before (133671c), one `sameAs` moved the store's
+/// materialisation off the grouped input onto lists of triples (24 bytes each: the
+/// input, a copy with what a first pass derived, each outer pass's rewrite and closure).
+/// The heap's peak with a cascade of 8 merges is within 1.1 times the peak without.
+#[test]
+fn equality_keeps_the_working_set_as_the_only_copy() {
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let peak = |depth: usize| {
+        let mut vocabulary = LocalVocabulary::default();
+        let rules = Ruleset::Owl2Rl
+            .rules(&mut vocabulary)
+            .expect("OWL 2 RL parses");
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let mut facts = lubm_like(&mut vocabulary, DEPARTMENTS);
+        if depth > 0 {
+            let extra = cascade(&mut vocabulary, &facts, depth);
+            facts.extend(extra);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a pool");
+        let input = grouped(facts);
+        let before = heap::live();
+        heap::start("input");
+        let result = pool.install(|| {
+            batch::materialise_representatives_until(
+                batch::Input::Grouped(input),
+                &rules,
+                Some(&lists),
+                &schema,
+                batch::Listing::Expanded,
+                nrese_reasoner::eval::NEVER,
+            )
+            .expect("never stopped")
+        });
+        let phases = heap::finish();
+        assert_eq!(result.merges, usize::from(depth > 0) * depth);
+        phases.iter().map(|phase| phase.peak).max().expect("phases") - before
+    };
+    let (plain, merged) = (peak(0), peak(8));
+    assert!(
+        merged * 10 <= plain * 11,
+        "heap peak {merged} bytes with 8 merges, {plain} without: at most 1.1 times"
+    );
+}
+
+/// See [`relations_keep_no_object_order_their_rules_never_use`].
+const BYTES_PER_FACT: usize = 26;
+
+/// The equality copies a materialisation adds (by replication) or lists (by
+/// representatives, expanded) are charged to what the process's memory limit leaves before
+/// they are made: where they don't fit, the materialisation stops without passing it. One
+/// class of 300 identities and one fact over it in all three places are 27 M copies, about
+/// 650 MB, under a limit 32 MiB above what the process holds: the heap stays under 64 MiB.
+#[test]
+fn equality_copies_past_the_memory_limit_stop_within_it() {
+    use nrese_reasoner::ir::{OWL, Vocabulary};
+
+    /// The process's memory limit cleared when the test ends, however it ends.
+    struct Unlimited;
+    impl Drop for Unlimited {
+        fn drop(&mut self) {
+            nrese_exec::memory::set_process_limit(0);
+        }
+    }
+
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let mut vocabulary = LocalVocabulary::default();
+    let rules = Ruleset::Owl2Rl
+        .rules(&mut vocabulary)
+        .expect("OWL 2 RL parses");
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let schema = Schema::owl(&mut vocabulary);
+    let same_as = vocabulary.iri(&format!("{OWL}sameAs"));
+    let rep = vocabulary.iri("http://example.com/rep");
+    let mut facts = vec![[rep, rep, rep]];
+    for i in 1..300 {
+        let identity = vocabulary.iri(&format!("http://example.com/i{i}"));
+        facts.push([identity, same_as, rep]);
+    }
+    let held = nrese_exec::memory::process_bytes().expect("the process's memory reads here");
+    let _unlimited = Unlimited;
+    nrese_exec::memory::set_process_limit(held + (32 << 20));
+    for replicate in [false, true] {
+        let input = grouped(facts.clone());
+        let before = heap::live();
+        heap::start("input");
+        let result = match replicate {
+            true => batch::materialise_grouped_until(
+                input,
+                &rules,
+                Some(&lists),
+                &schema,
+                nrese_reasoner::eval::NEVER,
+            ),
+            false => batch::materialise_representatives_until(
+                batch::Input::Grouped(input),
+                &rules,
+                Some(&lists),
+                &schema,
+                batch::Listing::Expanded,
+                nrese_reasoner::eval::NEVER,
+            ),
+        };
+        let phases = heap::finish();
+        let peak = phases.iter().map(|phase| phase.peak).max().expect("phases") - before;
+        assert!(
+            result.is_err(),
+            "replicate {replicate}: the copies were made"
+        );
+        assert!(
+            peak < 64 << 20,
+            "replicate {replicate}: {peak} bytes at the heap's peak"
+        );
+    }
+}
+
+/// The equality copies, charged as they grow, are joined once into a list of exactly their
+/// number, so their charge costs no memory the uncharged copies didn't: 2,000 `owl:sameAs`
+/// groups of 10 (560,000 facts), on one thread. The heap's peak per fact on 7 November
+/// 2026: listed by representatives 72.1 bytes uncharged (313e5a64), 93.4 joined pairwise
+/// with the joined list's doubling room kept (459d47c8), 72.5 joined once; by replication
+/// 183.7, 192.8 and 183.7.
+#[test]
+fn equality_copies_are_joined_once_at_their_number() {
+    use nrese_reasoner::ir::{OWL, Vocabulary};
+
+    let _serial = SERIAL.lock().unwrap_or_else(|p| p.into_inner());
+    let peak_per_fact = |replicate: bool| {
+        let mut vocabulary = LocalVocabulary::default();
+        let rules = Ruleset::Owl2Rl
+            .rules(&mut vocabulary)
+            .expect("OWL 2 RL parses");
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let same_as = vocabulary.iri(&format!("{OWL}sameAs"));
+        let [val, group, knows] = ["val", "group", "knows"]
+            .map(|name| vocabulary.iri(&format!("http://example.com/{name}")));
+        let (groups, size) = (2_000, 10);
+        let mut facts = Vec::new();
+        for g in 0..groups {
+            let ids: Vec<u64> = (0..size)
+                .map(|j| vocabulary.iri(&format!("http://example.com/i{g}_{j}")))
+                .collect();
+            let label = vocabulary.iri(&format!("http://example.com/G{g}"));
+            for (j, &id) in ids.iter().enumerate() {
+                let value = vocabulary.iri(&format!("http://example.com/v{g}_{j}"));
+                facts.extend([[id, val, value], [id, group, label]]);
+                if let Some(&next) = ids.get(j + 1) {
+                    facts.push([id, same_as, next]);
+                }
+            }
+            let next = vocabulary.iri(&format!("http://example.com/i{}_0", (g + 1) % groups));
+            facts.push([ids[0], knows, next]);
+        }
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .expect("a pool");
+        let input = grouped(facts);
+        let before = heap::live();
+        heap::start("input");
+        let result = pool.install(|| match replicate {
+            true => batch::materialise_grouped_until(
+                input,
+                &rules,
+                Some(&lists),
+                &schema,
+                nrese_reasoner::eval::NEVER,
+            ),
+            false => batch::materialise_representatives_until(
+                batch::Input::Grouped(input),
+                &rules,
+                Some(&lists),
+                &schema,
+                batch::Listing::Expanded,
+                nrese_reasoner::eval::NEVER,
+            ),
+        });
+        let phases = heap::finish();
+        let derived = result.expect("never stopped").derived.len();
+        assert!(derived > 500_000, "{derived} facts: too few to tell");
+        let peak = phases.iter().map(|phase| phase.peak).max().expect("phases") - before;
+        peak as f64 / derived as f64
+    };
+    for (replicate, at_most) in [(false, 75.0), (true, 187.0)] {
+        let per_fact = peak_per_fact(replicate);
+        assert!(
+            per_fact <= at_most,
+            "replicate {replicate}: {per_fact:.1} bytes per fact at the heap's peak, at most {at_most}"
+        );
+    }
+}

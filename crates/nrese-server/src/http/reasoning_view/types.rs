@@ -35,6 +35,8 @@ pub struct MaterialisationView {
     pub asserted: u64,
     pub inferred: u64,
     pub consistency_violations: usize,
+    /// Their list stopped at its memory budget: `consistency_violations` is a lower bound.
+    pub consistency_violations_at_least: bool,
     pub rounds: usize,
     pub elapsed_millis: u64,
     pub ontology_diagnostics: Vec<OntologyDiagnosticView>,
@@ -67,6 +69,8 @@ pub struct LastReasoningRunView {
     pub inferred_inserted: u64,
     pub inferred_deleted: u64,
     pub consistency_violations: u64,
+    /// Their list stopped at its memory budget: `consistency_violations` is a lower bound.
+    pub consistency_violations_at_least: bool,
     pub rounds: usize,
     pub elapsed_micros: u64,
     pub primary_reject: Option<RejectExplanationView>,

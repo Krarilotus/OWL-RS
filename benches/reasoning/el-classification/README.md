@@ -1,6 +1,6 @@
 # EL classification against ELK
 
-Checks NRESE's OWL 2 EL classifier (`crates/nrese-reasoner/src/v2/classify.rs`) against
+Checks NRESE's OWL 2 EL classifier (`crates/nrese-reasoner/src/classify.rs`) against
 ELK on random EL ontologies: conjunctions, existential restrictions, equivalences,
 property hierarchies, chains, transitivity and domains. On 30 September 2026, 300 of 300
 ontologies (10,540 subsumptions) agreed; a classifier with the chain rule removed

@@ -2,6 +2,12 @@
 
 Status: accepted (2026-09-25). Index implementation: tantivy (roadmap decision D3).
 
+Amended 14 Nov 2026, where the code differs from the text below: the index is NRESE's own
+inverted index, without tantivy ([ADR-0010](0010-standing-product-decisions.md)). It is built at
+the first search and persisted after each checkpoint, not maintained from commit deltas or
+replayed from the WAL; its query surface is in the
+[HTTP interface](../ops/http-api.md#requests-in-detail).
+
 ## Context
 
 ResearchSpace (v4) is the main user-facing platform on top of the store. Its shipped keyword-search templates use Blazegraph's `bds:search` magic predicate. The team has agreed to adapt ResearchSpace to NRESE, so we aren't bound to any vendor's text-search syntax. QLever (`ql:contains-word`) and GraphDB (Lucene connectors) both treat text search as a first-class feature.

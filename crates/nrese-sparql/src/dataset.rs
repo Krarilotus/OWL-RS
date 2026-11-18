@@ -1,9 +1,11 @@
 //! The dataset of a query (`FROM`, `FROM NAMED`, the protocol's parameters), resolved
-//! against a view ([`ResolvedDataset`]). The default graph of several `FROM` graphs is their
-//! RDF merge (SPARQL 1.1 §13.2): a statement two of them hold counts once.
+//! against a view (`ResolvedDataset`). The default graph of several `FROM` graphs is their
+//! merge: a statement two of them hold counts once. Blank nodes keep their identity across
+//! graphs, as in Jena, GraphDB and Oxigraph: a deliberate deviation from the RDF merge of
+//! SPARQL 1.1 §13.2, which keeps them apart (docs/ops/http-api.md, the owner's decision).
 
 use nrese_engine::TermId;
-use nrese_rdf::{GraphName, NamedOrBlankNodeRef, Term};
+use nrese_rdf::{GraphName, GraphNameRef, NamedOrBlankNodeRef, Term};
 use nrese_sparql_syntax::algebra::QueryDataset;
 
 use crate::results::QueryDatasetSpecification;
@@ -24,6 +26,9 @@ pub struct GraphAccess {
     /// The inferred statements (they live in the default graph; whether a user who may not
     /// read every graph sees them is the configuration's choice).
     pub inferred: bool,
+    /// With `inferred`: only the inferred statements one of whose derivations uses
+    /// readable graphs alone (their support graph sets); the store hides the others.
+    pub inferred_by_support: bool,
     /// Graph IRIs excluded whatever `graphs` and `prefixes` say (an explicit deny).
     pub excluded: Vec<String>,
     /// IRI prefixes excluded the same way.
@@ -61,6 +66,17 @@ impl GraphAccess {
     }
 }
 
+/// The default graph merged from `ids` (sorted, each once): nothing, the store's default
+/// graph, one graph, or their merge.
+fn only(ids: Vec<TermId>) -> DefaultGraph {
+    match ids[..] {
+        [] => DefaultGraph::Empty,
+        [id] if id == TermId::DEFAULT_GRAPH => DefaultGraph::Store,
+        [id] => DefaultGraph::Graph(id),
+        _ => DefaultGraph::Merge(Some(GraphSet::Only(ids))),
+    }
+}
+
 /// The default graph of a query's dataset.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum DefaultGraph {
@@ -68,11 +84,32 @@ pub(crate) enum DefaultGraph {
     Store,
     /// One named graph.
     Graph(TermId),
-    /// The RDF merge of every graph (`None`) or of the listed ones: a statement counts
-    /// once, however many of them hold it.
-    Merge(Option<Vec<TermId>>),
+    /// The merge of every graph (`None`) or of some ([`GraphSet`]): a statement counts once,
+    /// however many of them hold it.
+    Merge(Option<GraphSet>),
     /// No graph the store holds.
     Empty,
+}
+
+/// The graphs of a merged default graph that isn't every graph: the listed ones (several
+/// `FROM`), or every graph but the listed ones (SHACL's data graph, without the shapes).
+/// Each list is sorted and holds a graph once.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) enum GraphSet {
+    Only(Vec<TermId>),
+    AllBut(Vec<TermId>),
+}
+
+/// No graph at all: the merge of `GRAPH <g>` for a graph the store doesn't know.
+pub(crate) static NO_GRAPHS: GraphSet = GraphSet::Only(Vec::new());
+
+impl GraphSet {
+    pub(crate) fn contains(&self, graph: &TermId) -> bool {
+        match self {
+            Self::Only(graphs) => graphs.contains(graph),
+            Self::AllBut(graphs) => !graphs.contains(graph),
+        }
+    }
 }
 
 /// What a query reads (SPARQL 1.1 §13.2): its default graph, and the graphs `GRAPH` may
@@ -81,6 +118,11 @@ pub(crate) enum DefaultGraph {
 pub(crate) struct ResolvedDataset {
     pub(crate) default: DefaultGraph,
     pub(crate) named: Option<Vec<TermId>>,
+    /// Whether the store's default graph is in reach: what another store's name for it
+    /// (`GRAPH <urn:x-arq:DefaultGraph>`, [`crate::compat`]) reads. Always, but for a reader
+    /// who may not read it ([`Self::restricted`]): then it is absent, as an unreadable named
+    /// graph is.
+    pub(crate) store_default: bool,
 }
 
 impl ResolvedDataset {
@@ -94,6 +136,7 @@ impl ResolvedDataset {
                 DefaultGraph::Store
             },
             named: None,
+            store_default: true,
         }
     }
 
@@ -117,34 +160,44 @@ impl ResolvedDataset {
             view.lookup(name.into())
                 .filter(|&id| view.contains_named_graph(id))
         };
+        let ids_of = |graphs: &[GraphName]| -> Vec<TermId> {
+            let mut ids: Vec<TermId> = graphs
+                .iter()
+                .filter_map(|name| match name {
+                    GraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
+                    // Another store's name for the default graph names it (`compat`).
+                    GraphName::NamedNode(n) => match crate::compat::graph_named(n) {
+                        GraphNameRef::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
+                        _ => graph(n.as_ref().into()),
+                    },
+                    GraphName::BlankNode(b) => graph(b.as_ref().into()),
+                })
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
+        };
         let default = match specification.default_graph_graphs() {
-            None => DefaultGraph::Merge(None),
-            Some(graphs) => {
-                let mut ids: Vec<TermId> = graphs
-                    .iter()
-                    .filter_map(|name| match name {
-                        GraphName::DefaultGraph => Some(TermId::DEFAULT_GRAPH),
-                        GraphName::NamedNode(n) => graph(n.as_ref().into()),
-                        GraphName::BlankNode(b) => graph(b.as_ref().into()),
-                    })
-                    .collect();
-                ids.sort_unstable();
-                ids.dedup();
-                match ids[..] {
-                    [] => DefaultGraph::Empty,
-                    [id] if id == TermId::DEFAULT_GRAPH => DefaultGraph::Store,
-                    [id] => DefaultGraph::Graph(id),
-                    _ => DefaultGraph::Merge(Some(ids)),
-                }
-            }
+            None => match ids_of(specification.excluded_default_graphs().unwrap_or_default()) {
+                left_out if left_out.is_empty() => DefaultGraph::Merge(None),
+                left_out => DefaultGraph::Merge(Some(GraphSet::AllBut(left_out))),
+            },
+            Some(graphs) => only(ids_of(graphs)),
         };
         let named = specification.available_named_graphs().map(|graphs| {
-            graphs
+            let mut ids: Vec<TermId> = graphs
                 .iter()
                 .filter_map(|name| graph(name.as_ref()))
-                .collect()
+                .collect();
+            ids.sort_unstable();
+            ids.dedup();
+            ids
         });
-        Self { default, named }
+        Self {
+            default,
+            named,
+            store_default: true,
+        }
     }
 
     /// This dataset restricted to what `access` lets its user read: the default graph
@@ -158,12 +211,7 @@ impl ResolvedDataset {
         let merge = |mut ids: Vec<TermId>| {
             ids.sort_unstable();
             ids.dedup();
-            match ids[..] {
-                [] => DefaultGraph::Empty,
-                [id] if id == TermId::DEFAULT_GRAPH => DefaultGraph::Store,
-                [id] => DefaultGraph::Graph(id),
-                _ => DefaultGraph::Merge(Some(ids)),
-            }
+            only(ids)
         };
         let default = match self.default {
             DefaultGraph::Store if access.default_graph => DefaultGraph::Store,
@@ -177,11 +225,19 @@ impl ResolvedDataset {
                 }
                 merge(ids)
             }
-            DefaultGraph::Merge(Some(ids)) => merge(
+            DefaultGraph::Merge(Some(GraphSet::Only(ids))) => merge(
                 ids.into_iter()
                     .filter(|&g| access.allows_id(view, g))
                     .collect(),
             ),
+            DefaultGraph::Merge(Some(GraphSet::AllBut(left_out))) => {
+                let mut ids = readable_named();
+                if access.default_graph {
+                    ids.push(TermId::DEFAULT_GRAPH);
+                }
+                ids.retain(|g| left_out.binary_search(g).is_err());
+                merge(ids)
+            }
         };
         let named = Some(match self.named {
             None => readable_named(),
@@ -190,14 +246,10 @@ impl ResolvedDataset {
                 .filter(|&g| access.allows_id(view, g))
                 .collect(),
         });
-        Self { default, named }
-    }
-
-    /// Whether the dataset has the named graph `graph`, which the store holds.
-    #[expect(dead_code)]
-    pub(crate) fn names(&self, graph: TermId) -> bool {
-        self.named
-            .as_ref()
-            .is_none_or(|named| named.contains(&graph))
+        Self {
+            default,
+            named,
+            store_default: self.store_default && access.default_graph,
+        }
     }
 }

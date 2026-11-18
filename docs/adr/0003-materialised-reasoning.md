@@ -2,6 +2,20 @@
 
 Status: accepted (2026-09-25)
 
+Amended 14 Nov 2026, where the code differs from the text below:
+- the inferred stack has the default-graph layout, four orders (SPOG, POSG, OSPG, PSOG), not
+  the asserted stack's layout or three orders ([storage contract](../spec/02-storage-and-transactions.md));
+- of the behaviour named as settings, the ruleset and the `owl:sameAs` handling are settings
+  ([configuration](../ops/config-reference.md#reasoner.mode)); timing, placement, consistency
+  handling (but `dl.consistency` under `owl2-dl`) and the maintenance strategy are not, and
+  reasoning runs in the commit;
+- a large TBox change is reasoned inside the commit, holding the writer, not as a separate job;
+  a compact-equality split can fall back to a whole-dataset rebuild there
+  ([reasoner design](../design/reasoner-v2.md) §2.1);
+- facts are kept over representatives in the store only with `reasoner.equality = "compact"`;
+  otherwise the stored closure is expanded to every identity;
+- `rules-mvp` has been removed.
+
 ## Context
 
 v1 (`rules-mvp`) had three limits:

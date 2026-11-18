@@ -1,15 +1,66 @@
-//! NRESE's reasoner: reasoner v2 ([`v2`]), with the configuration and profile the server
-//! exposes. The store runs it: the batch executor materialises after loads and at
-//! startup, the delta executor maintains the inferred stack on every commit.
+//! NRESE's reasoner, with the configuration and profile the server exposes. The store
+//! runs it: the batch executor materialises after loads and at startup, the delta
+//! executor maintains the inferred stack on every commit.
+//!
+//! - [`ir`]: the rule IR and its text syntax; rules are data
+//! - [`rulesets`]: the built-in rulesets (`rdfs`, `owl2-rl`, ...), with the W3C rule names
+//! - [`lists`]: list axioms (chains, keys, intersections, ...) compiled to fixed-arity rules
+//! - `naive`: the naive reference evaluator, the oracle for the fast executors (tests
+//!   and the `oracle` feature only)
+//! - [`eval`]: rule evaluation over any [`eval::Source`]: grounding, planning, joins
+//! - [`batch`]: the batch executor: schema grounding and parallel semi-naive evaluation
+//! - [`delta`]: the delta executor: maintenance under inserts and deletes (DRed)
+//! - [`explain`], [`graph_sets`]: justifications and the graphs each inference needs
+//! - [`classify`]: OWL 2 EL classification
+//!
+//! Everything works on ids through a [`ir::Vocabulary`] that interns the rules' constants.
 
+/// The unit tests' allocator: the system's, counting what measured operations hold
+/// (`graph_sets`' premise product guard measures against its budget).
+#[cfg(test)]
+#[global_allocator]
+static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
+    nrese_exec::measure::Measured(std::alloc::System);
+
+pub mod batch;
+pub mod capability;
+pub mod classify;
 pub mod config;
+pub mod delta;
+pub mod engine;
+mod equality_rules;
+pub mod eval;
+pub mod explain;
+pub mod graph_sets;
+pub mod ir;
+pub mod lists;
+pub mod n3;
+#[cfg(any(test, feature = "oracle"))]
+pub mod naive;
 pub mod output;
+mod pie;
 pub mod profile;
+pub mod program;
+mod recursion;
+pub mod representatives;
+pub mod rulesets;
 pub mod service;
-pub mod v2;
+#[cfg(test)]
+mod tests;
+pub mod unnamed;
+mod violations;
+pub mod vocabulary;
+#[cfg(test)]
+mod witness;
 
+pub use capability::{CapabilityMaturity, ReasonerCapability, ReasonerFeature, ReasonerRunStatus};
 pub use config::{ConfigError, ReasonerConfig, ReasoningMode};
+/// The read interface a store implements to be reasoned over: [`Source`] and [`Base`], provided
+/// through [`Visits`] and [`VisitsBase`], with the types their methods take.
+pub use delta::{Base, VisitsBase};
+pub use eval::{Poller, Probe, Seg, Source, Stopped, Visit, Visits};
+pub use ir::Triple;
 pub use output::{RejectEvidence, RejectExplanation};
 pub use profile::{ReasonerProfile, mode_name, profile_for_config, profile_for_mode};
+pub use program::{RuleFormat, RuleProgram, UserRules};
 pub use service::ReasonerService;
-pub use v2::program::{RuleFormat, RuleProgram, UserRules};

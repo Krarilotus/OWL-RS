@@ -8,7 +8,7 @@ use super::types::{
     RejectDiagnosticsBaseline,
 };
 
-pub fn capability_view(capability: &nrese_core::ReasonerCapability) -> ReasoningCapabilityView {
+pub fn capability_view(capability: &nrese_reasoner::ReasonerCapability) -> ReasoningCapabilityView {
     ReasoningCapabilityView {
         feature: feature_name(capability.feature),
         maturity: maturity_name(capability.maturity),
@@ -25,6 +25,7 @@ pub fn last_run_view(run: &ReasoningRunRecord) -> LastReasoningRunView {
         inferred_inserted: run.inferred_inserted,
         inferred_deleted: run.inferred_deleted,
         consistency_violations: run.consistency_violations,
+        consistency_violations_at_least: run.consistency_violations_at_least,
         rounds: run.rounds,
         elapsed_micros: run.elapsed_micros,
         primary_reject: run
@@ -44,6 +45,7 @@ pub fn materialisation_view(report: &MaterialisationReport) -> MaterialisationVi
         asserted: report.asserted,
         inferred: report.inferred,
         consistency_violations: report.violations,
+        consistency_violations_at_least: report.violations_at_least,
         rounds: report.rounds,
         elapsed_millis: u64::try_from(report.elapsed.as_millis()).unwrap_or(u64::MAX),
         ontology_diagnostics: report.diagnostics.iter().map(diagnostic_view).collect(),
@@ -79,33 +81,33 @@ pub fn reject_diagnostics_baseline(
     }
 }
 
-fn run_status_name(status: nrese_core::ReasonerRunStatus) -> &'static str {
+fn run_status_name(status: nrese_reasoner::ReasonerRunStatus) -> &'static str {
     match status {
-        nrese_core::ReasonerRunStatus::Completed => "completed",
-        nrese_core::ReasonerRunStatus::Skipped => "skipped",
-        nrese_core::ReasonerRunStatus::Rejected => "rejected",
+        nrese_reasoner::ReasonerRunStatus::Completed => "completed",
+        nrese_reasoner::ReasonerRunStatus::Skipped => "skipped",
+        nrese_reasoner::ReasonerRunStatus::Rejected => "rejected",
     }
 }
 
-fn feature_name(feature: nrese_core::ReasonerFeature) -> &'static str {
+fn feature_name(feature: nrese_reasoner::ReasonerFeature) -> &'static str {
     match feature {
-        nrese_core::ReasonerFeature::RdfsSubclassClosure => "rdfs-subclass-closure",
-        nrese_core::ReasonerFeature::RdfsSubpropertyClosure => "rdfs-subproperty-closure",
-        nrese_core::ReasonerFeature::RdfsTypePropagation => "rdfs-type-propagation",
-        nrese_core::ReasonerFeature::RdfsDomainRangeTyping => "rdfs-domain-range-typing",
-        nrese_core::ReasonerFeature::OwlEqualityReasoning => "owl-equality-reasoning",
-        nrese_core::ReasonerFeature::OwlPropertyChainAxioms => "owl-property-chain-axioms",
-        nrese_core::ReasonerFeature::OwlClassSatisfiability => "owl-class-satisfiability",
-        nrese_core::ReasonerFeature::OwlConsistencyCheck => "owl-consistency-check",
-        nrese_core::ReasonerFeature::IncrementalRefresh => "incremental-refresh",
-        nrese_core::ReasonerFeature::ExplanationTrace => "explanation-trace",
+        nrese_reasoner::ReasonerFeature::RdfsSubclassClosure => "rdfs-subclass-closure",
+        nrese_reasoner::ReasonerFeature::RdfsSubpropertyClosure => "rdfs-subproperty-closure",
+        nrese_reasoner::ReasonerFeature::RdfsTypePropagation => "rdfs-type-propagation",
+        nrese_reasoner::ReasonerFeature::RdfsDomainRangeTyping => "rdfs-domain-range-typing",
+        nrese_reasoner::ReasonerFeature::OwlEqualityReasoning => "owl-equality-reasoning",
+        nrese_reasoner::ReasonerFeature::OwlPropertyChainAxioms => "owl-property-chain-axioms",
+        nrese_reasoner::ReasonerFeature::OwlClassSatisfiability => "owl-class-satisfiability",
+        nrese_reasoner::ReasonerFeature::OwlConsistencyCheck => "owl-consistency-check",
+        nrese_reasoner::ReasonerFeature::IncrementalRefresh => "incremental-refresh",
+        nrese_reasoner::ReasonerFeature::ExplanationTrace => "explanation-trace",
     }
 }
 
-fn maturity_name(maturity: nrese_core::CapabilityMaturity) -> &'static str {
+fn maturity_name(maturity: nrese_reasoner::CapabilityMaturity) -> &'static str {
     match maturity {
-        nrese_core::CapabilityMaturity::Experimental => "experimental",
-        nrese_core::CapabilityMaturity::Mvp => "mvp",
-        nrese_core::CapabilityMaturity::Target => "target",
+        nrese_reasoner::CapabilityMaturity::Experimental => "experimental",
+        nrese_reasoner::CapabilityMaturity::Mvp => "mvp",
+        nrese_reasoner::CapabilityMaturity::Target => "target",
     }
 }

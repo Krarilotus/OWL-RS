@@ -2,13 +2,28 @@
 
 use crate::term::TermId;
 
-/// A quad in canonical `(subject, predicate, object, graph)` order.
+/// A quad in canonical `(subject, predicate, object, graph)` order. `repr(C)`: four
+/// `u64`s in that order, the layout and order of its SPOG key (`as_keys_mut`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(C)]
 pub struct EncodedQuad {
     pub subject: TermId,
     pub predicate: TermId,
     pub object: TermId,
     pub graph: TermId,
+}
+
+const _: () = assert!(
+    size_of::<EncodedQuad>() == size_of::<Key>() && align_of::<EncodedQuad>() == align_of::<Key>()
+);
+
+/// `quads` as their SPOG keys, in place, for the key kernels ([`nrese_exec::sort`]): the
+/// keys sort as the quads do (components compared in the same order, by their raw ids).
+pub(crate) fn as_keys_mut(quads: &mut [EncodedQuad]) -> &mut [Key] {
+    // SAFETY: `EncodedQuad` is `repr(C)` of four `TermId`s, each `repr(transparent)` over
+    // a `u64`: the size, alignment and bytes of a `[u64; 4]` (asserted above), and every
+    // bit pattern is a valid one of either. The slice borrows `quads` for its lifetime.
+    unsafe { std::slice::from_raw_parts_mut(quads.as_mut_ptr().cast::<Key>(), quads.len()) }
 }
 
 impl EncodedQuad {
@@ -114,6 +129,13 @@ impl QuadPattern {
         }
     }
 
+    /// The components (subject 0, predicate 1, object 2, graph 3) in the order the index
+    /// reads patterns of this shape, its bound ones first: patterns whose bound values
+    /// ascend in this order are read forward by a [`crate::ProbeCursor`].
+    pub fn read_order(&self) -> [usize; 4] {
+        AccessPlan::for_pattern(self).permutation.order()
+    }
+
     pub fn matches(&self, quad: &EncodedQuad) -> bool {
         self.subject.is_none_or(|s| s == quad.subject)
             && self.predicate.is_none_or(|p| p == quad.predicate)
@@ -129,7 +151,7 @@ impl QuadPattern {
 pub(crate) type Key = [u64; 4];
 
 /// The sort orders the index maintains. Every [`QuadPattern`] is answered by a contiguous
-/// key range in one of the first six (see [`AccessPlan::for_pattern`]).
+/// key range in one of the first six (see `AccessPlan::for_pattern`).
 ///
 /// The last two exist for executors that need `(?s p ?o)` sorted by subject (star joins):
 /// [`Gpso`](Self::Gpso) in the asserted stack, and [`Psog`](Self::Psog) in the inferred
@@ -194,6 +216,17 @@ impl Permutation {
         let c = quad.components();
         let o = self.order();
         [c[o[0]], c[o[1]], c[o[2]], c[o[3]]]
+    }
+
+    /// The key position that holds the graph: first in a graph-first permutation, last in
+    /// the others. A scan that only asks a key's graph reads it there, not through
+    /// [`Self::key_to_quad`].
+    #[inline]
+    pub(crate) const fn graph_slot(self) -> usize {
+        match self {
+            Self::Gspo | Self::Gpos | Self::Gosp | Self::Gpso => 0,
+            Self::Spog | Self::Posg | Self::Ospg | Self::Psog => 3,
+        }
     }
 
     #[inline]
@@ -336,6 +369,19 @@ mod tests {
         let quad = EncodedQuad::new(id(1), id(2), id(3), id(4));
         for permutation in Permutation::ALL {
             assert_eq!(permutation.key_to_quad(&permutation.to_key(&quad)), quad);
+        }
+    }
+
+    /// A key's graph is at `graph_slot` in every permutation.
+    #[test]
+    fn graph_slot_holds_the_graph() {
+        let quad = EncodedQuad::new(id(1), id(2), id(3), id(4));
+        for permutation in Permutation::ALL {
+            assert_eq!(
+                permutation.to_key(&quad)[permutation.graph_slot()],
+                quad.graph.raw(),
+                "{permutation:?}"
+            );
         }
     }
 

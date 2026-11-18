@@ -12,8 +12,12 @@ use crate::http::mutation;
 use crate::http::rdf_payload::{
     parse_graph_content_format, parse_graph_target, parse_rdf_base_iri,
 };
+use crate::http::result_stream::{Pace, stream_blocking};
+use crate::http::sparql::refused_or;
 use crate::state::AppState;
 
+/// A graph (Graph Store Protocol `GET`), streamed as it is read: a whole graph in constant
+/// memory, for as long as the client keeps reading ([`Pace::stalled_after`]).
 pub async fn get_graph(
     state: AppState,
     authenticated: crate::auth::Authenticated,
@@ -21,18 +25,32 @@ pub async fn get_graph(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let access = guard::graph_read_access(&state, &authenticated).await?;
-    let result = read_graph(state, raw_query, headers, &access).await?;
-
-    let mut response = (StatusCode::OK, result.payload).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_str(result.media_type)
-            .map_err(|error| ApiError::internal(error.to_string()))?,
-    );
-
-    Ok(response)
+    let request = graph_request(&state, &raw_query, &headers, &access)?;
+    let store = state.store();
+    let scope = access.read_scope();
+    let cancellation = nrese_store::CancellationToken::new();
+    let token = cancellation.clone();
+    stream_blocking(
+        Pace::stalled_after(state.policy().timeouts.graph_read),
+        cancellation,
+        request.format.media_type(),
+        "graph read exceeded policy timeout",
+        move |out| {
+            let read = nrese_store::ReadContext::new(scope).cancelled_by(token);
+            match store.write_graph(&read, &request, out) {
+                Ok(true) => Ok(()),
+                // Graph Store Protocol §5.2: a graph that doesn't exist is 404, not an empty
+                // document. Nothing is written for it, so the status is still open.
+                Ok(false) => Err(ApiError::not_found("the graph does not exist")),
+                Err(error) => Err(refused_or(error, ApiError::bad_request)),
+            }
+        },
+    )
+    .await
 }
 
+/// `GET`'s status and media type without its body (RFC 9110 §9.3.2): whether the graph
+/// exists, with no statement decoded.
 pub async fn head_graph(
     state: AppState,
     authenticated: crate::auth::Authenticated,
@@ -40,48 +58,44 @@ pub async fn head_graph(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     let access = guard::graph_read_access(&state, &authenticated).await?;
-    let result = read_graph(state, raw_query, headers, &access).await?;
+    let request = graph_request(&state, &raw_query, &headers, &access)?;
+    let store = state.store();
+    let read = nrese_store::ReadContext::new(access.read_scope());
+    let target = request.target;
+    let exists = tokio::time::timeout(
+        state.policy().timeouts.graph_read,
+        tokio::task::spawn_blocking(move || store.graph_exists(&read, &target)),
+    )
+    .await
+    .map_err(|_| ApiError::timeout("graph read exceeded policy timeout"))?
+    .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(|error| refused_or(error, ApiError::bad_request))?;
+    if !exists {
+        return Err(ApiError::not_found("the graph does not exist"));
+    }
     let mut response = StatusCode::OK.into_response();
     response.headers_mut().insert(
         header::CONTENT_TYPE,
-        HeaderValue::from_str(result.media_type)
-            .map_err(|error| ApiError::internal(error.to_string()))?,
+        HeaderValue::from_static(request.format.media_type()),
     );
-
     Ok(response)
 }
 
-async fn read_graph(
-    state: AppState,
-    raw_query: RawQuery,
-    headers: HeaderMap,
+/// The graph a read addresses and the format it is answered in.
+fn graph_request(
+    state: &AppState,
+    raw_query: &RawQuery,
+    headers: &HeaderMap,
     access: &AccessView,
-) -> Result<nrese_store::GraphReadResult, ApiError> {
+) -> Result<GraphReadRequest, ApiError> {
     state.ensure_serving()?;
-
-    let target = parse_graph_target(&raw_query)?;
+    let target = parse_graph_target(raw_query)?;
     // A graph the requester may not read is absent.
     if !access.can_read(&guard::target_graph(&target)?) {
         return Err(ApiError::not_found("the graph does not exist"));
     }
     let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
-    let request = GraphReadRequest { target, format };
-    let store = state.store();
-    let read = nrese_store::ReadContext::new(access.read_scope());
-    let result = tokio::time::timeout(
-        state.policy().timeouts.graph_read,
-        tokio::task::spawn_blocking(move || store.execute_graph_read(&read, &request)),
-    )
-    .await
-    .map_err(|_| ApiError::timeout("graph read exceeded policy timeout"))?
-    .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    // Graph Store Protocol §5.2: a graph that doesn't exist is 404, not an empty document.
-    if result.exists {
-        Ok(result)
-    } else {
-        Err(ApiError::not_found("the graph does not exist"))
-    }
+    Ok(GraphReadRequest { target, format })
 }
 
 pub async fn put_graph(
@@ -152,7 +166,7 @@ async fn write_graph(
         target,
         format,
         base_iri: parse_rdf_base_iri(&headers),
-        payload: body.to_vec(),
+        payload: body,
         replace,
     };
     let report = match mutation::run(
@@ -194,29 +208,12 @@ mod tests {
     use super::write_graph_status;
 
     #[test]
-    fn graph_target_defaults_to_default_graph() {
-        let target = parse_graph_target(&RawQuery(None)).expect("target should parse");
-        assert_eq!(target, nrese_store::GraphTarget::DefaultGraph);
-    }
-
-    #[test]
-    fn graph_target_accepts_named_graph_parameter() {
+    fn graph_target_reads_jenas_default_graph_name_as_the_default_graph() {
         let target = parse_graph_target(&RawQuery(Some(
-            "graph=http%3A%2F%2Fexample.com%2Fg".to_owned(),
+            "graph=urn%3Ax-arq%3ADefaultGraph".to_owned(),
         )))
         .expect("target should parse");
-        assert_eq!(
-            target,
-            nrese_store::GraphTarget::NamedGraph("http://example.com/g".to_owned())
-        );
-    }
-
-    #[test]
-    fn graph_target_rejects_conflicting_default_and_graph() {
-        let result = parse_graph_target(&RawQuery(Some(
-            "default=&graph=http%3A%2F%2Fexample.com%2Fg".to_owned(),
-        )));
-        assert!(result.is_err());
+        assert_eq!(target, nrese_store::GraphTarget::DefaultGraph);
     }
 
     #[test]

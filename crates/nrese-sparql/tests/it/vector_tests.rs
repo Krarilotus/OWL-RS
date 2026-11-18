@@ -1,0 +1,489 @@
+//! Vector similarity search through `SERVICE nrv:search` (native/vectors.rs): the
+//! nearest, scores and ranks, candidates from the rest of the query, query vectors bound
+//! outside the block, metrics, literals the data no longer uses, graphs a user may not
+//! read, and the options' errors.
+
+use std::sync::Arc;
+
+use nrese_engine::vector::{DATATYPE, lexical};
+use nrese_engine::{Engine, EngineConfig};
+use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
+use nrese_sparql::{GraphAccess, QueryOptions, QueryResults, evaluate_query};
+use nrese_sparql_syntax::SparqlParser;
+
+const EX: &str = "http://example.com/";
+const PREFIXES: &str = "PREFIX nrv: <urn:nrese:vector:> PREFIX ex: <http://example.com/> ";
+
+fn ex(local: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("{EX}{local}"))
+}
+
+fn vector(values: &[f32]) -> Literal {
+    Literal::new_typed_literal(lexical(values), NamedNode::new_unchecked(DATATYPE))
+}
+
+/// Items on a circle, `item/i` at angle 10·i degrees, each with a kind (even or odd); one
+/// in another graph, one whose vector the data no longer uses.
+fn engine() -> Engine {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let embedding = ex("embedding");
+    for i in 0..36 {
+        let angle = (i as f32 * 10.0).to_radians();
+        let item = ex(&format!("item/{i}"));
+        tx.insert(
+            Quad::new(
+                item.clone(),
+                embedding.clone(),
+                vector(&[angle.cos(), angle.sin()]),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        let kind = if i % 2 == 0 { "even" } else { "odd" };
+        tx.insert(Quad::new(item, ex("kind"), ex(kind), GraphName::DefaultGraph).as_ref());
+    }
+    // In another graph, right at 90 degrees.
+    tx.insert(
+        Quad::new(
+            ex("secret"),
+            embedding.clone(),
+            vector(&[0.0, 1.0]),
+            GraphName::from(ex("g")),
+        )
+        .as_ref(),
+    );
+    // Used once, at 91 degrees.
+    let gone = Quad::new(
+        ex("gone"),
+        embedding,
+        vector(&[91f32.to_radians().cos(), 91f32.to_radians().sin()]),
+        GraphName::DefaultGraph,
+    );
+    tx.insert(gone.as_ref());
+    tx.commit().unwrap();
+    let mut tx = engine.transaction();
+    tx.remove(gone.as_ref());
+    tx.commit().unwrap();
+    engine
+}
+
+fn rows(engine: &Engine, query: &str, options: &QueryOptions) -> Vec<Vec<String>> {
+    let text = format!("{PREFIXES}{query}");
+    let query = SparqlParser::new()
+        .parse_query(&text)
+        .unwrap_or_else(|e| panic!("{e}: {text}"));
+    let snapshot = engine.snapshot();
+    let QueryResults::Solutions(solutions) = evaluate_query(&snapshot, &query, options).unwrap()
+    else {
+        panic!("solutions")
+    };
+    let variables = solutions.variables().to_vec();
+    solutions
+        .map(|solution| {
+            let solution = solution.unwrap();
+            variables
+                .iter()
+                .map(|v| {
+                    solution.get(v).map_or("-".to_owned(), |t| match t {
+                        Term::NamedNode(n) => n.as_str().trim_start_matches(EX).to_owned(),
+                        Term::Literal(l) => l.value().to_owned(),
+                        other => other.to_string(),
+                    })
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// The query's error, if it has one.
+fn error_of(engine: &Engine, query: &str) -> Option<String> {
+    let text = format!("{PREFIXES}{query}");
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let snapshot = engine.snapshot();
+    match evaluate_query(&snapshot, &query, &QueryOptions::default()) {
+        Ok(QueryResults::Solutions(mut solutions)) => match solutions.next() {
+            Some(Err(error)) => Some(error.to_string()),
+            _ => None,
+        },
+        Ok(_) => None,
+        Err(error) => Some(error.to_string()),
+    }
+}
+
+fn near(degrees: f32) -> String {
+    let angle = degrees.to_radians();
+    format!("\"{}\"^^nrv:vector", lexical(&[angle.cos(), angle.sin()]))
+}
+
+#[test]
+fn the_nearest_items_are_found_and_ranked() {
+    let engine = engine();
+    let plain = QueryOptions::default();
+    let found = rows(
+        &engine,
+        &format!(
+            "SELECT ?item ?rank WHERE {{
+               ?item ex:embedding ?v .
+               SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 3 ; nrv:rank ?rank }}
+             }} ORDER BY ?rank",
+            near(92.0)
+        ),
+        &plain,
+    );
+    // 90 (item/9) is nearest; the unused literal at 91 and the other graph's at 90 are
+    // not found.
+    assert_eq!(
+        found,
+        [["item/9", "1"], ["item/10", "2"], ["item/8", "3"]].map(|r| r.map(str::to_owned).to_vec())
+    );
+    // The search alone, first in the group: the same vectors, with scores.
+    let scored = rows(
+        &engine,
+        &format!(
+            "SELECT ?v ?score WHERE {{
+               SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 2 ; nrv:score ?score }}
+             }} ORDER BY DESC(?score)",
+            near(90.0)
+        ),
+        &plain,
+    );
+    assert_eq!(scored.len(), 2);
+    let best: f64 = scored[0][1].parse().unwrap();
+    assert!((best - 1.0).abs() < 1e-5, "{scored:?}");
+    // Euclidean distances, nearest first.
+    let distances = rows(
+        &engine,
+        &format!(
+            "SELECT ?item ?d WHERE {{
+               ?item ex:embedding ?v .
+               SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 2 ; nrv:metric \"l2\" ; nrv:score ?d }}
+             }} ORDER BY ?d",
+            near(0.0)
+        ),
+        &plain,
+    );
+    assert_eq!(distances[0][0], "item/0");
+    assert!(distances[0][1].parse::<f64>().unwrap() < 1e-5);
+    // Exact, explicitly: the same answer.
+    let exact = rows(
+        &engine,
+        &format!(
+            "SELECT ?item WHERE {{
+               ?item ex:embedding ?v .
+               SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 1 ; nrv:exact true }}
+             }}",
+            near(92.0)
+        ),
+        &plain,
+    );
+    assert_eq!(exact, [vec!["item/9".to_owned()]]);
+}
+
+#[test]
+fn the_rest_of_the_query_chooses_the_candidates() {
+    let engine = engine();
+    let plain = QueryOptions::default();
+    // Only odd items: the nearest odd ones to 98 degrees (90, 110, 70).
+    let odd = rows(
+        &engine,
+        &format!(
+            "SELECT ?item WHERE {{
+               ?item ex:kind ex:odd ; ex:embedding ?v .
+               SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 3 ; nrv:rank ?r }}
+             }} ORDER BY ?r",
+            near(98.0)
+        ),
+        &plain,
+    );
+    assert_eq!(
+        odd,
+        [["item/9"], ["item/11"], ["item/7"]].map(|r| r.map(str::to_owned).to_vec())
+    );
+    // Items like item/0: the query vector bound outside the block, a search per value.
+    let similar = rows(
+        &engine,
+        "SELECT ?query ?item WHERE {
+           VALUES ?query { <http://example.com/item/0> <http://example.com/item/18> }
+           ?query ex:embedding ?q .
+           ?item ex:embedding ?v .
+           SERVICE nrv:search { ?v nrv:near ?q ; nrv:k 2 ; nrv:rank ?r }
+           FILTER(?item != ?query)
+         } ORDER BY ?query ?r",
+        &plain,
+    );
+    assert_eq!(similar.len(), 2, "{similar:?}");
+    assert_eq!(similar[0], ["item/0", "item/1"].map(str::to_owned).to_vec());
+    assert_eq!(similar[1][0], "item/18");
+}
+
+#[test]
+fn a_user_finds_only_vectors_of_graphs_it_may_read() {
+    let engine = engine();
+    // Every graph merged: the other graph's vector at 90 degrees is found.
+    let everything = QueryOptions {
+        union_default_graph: true,
+        ..QueryOptions::default()
+    };
+    let query = format!(
+        "SELECT ?v WHERE {{ SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 1 }} }}",
+        near(90.0)
+    );
+    let all = rows(&engine, &query, &everything);
+    assert_eq!(all.len(), 1);
+    // A user who may read the default graph only: the other graph's vector (at exactly
+    // 90 degrees) isn't found, item/9's (at 90 degrees as computed) and the next are.
+    let restricted = QueryOptions {
+        union_default_graph: true,
+        access: Some(Arc::new(GraphAccess {
+            default_graph: true,
+            ..GraphAccess::default()
+        })),
+        ..QueryOptions::default()
+    };
+    let seen = rows(
+        &engine,
+        &format!(
+            "SELECT ?item WHERE {{ ?item ex:embedding ?v . SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 2 }} }}",
+            near(90.0)
+        ),
+        &restricted,
+    );
+    assert!(seen.iter().all(|row| row[0] != "secret"), "{seen:?}");
+    assert_eq!(seen.len(), 2);
+}
+
+#[test]
+fn malformed_searches_are_explained() {
+    let engine = engine();
+    let cases: [(&str, &str); 10] = [
+        ("?v nrv:k 3", "nrv:near gives the query vector"),
+        ("?v nrv:near \"[1, x]\"^^nrv:vector", "not a finite number"),
+        (
+            &format!("?v nrv:near {} ; nrv:metric \"manhattan\"", near(0.0)),
+            "nrv:metric",
+        ),
+        (
+            &format!("?v nrv:near {} ; nrv:bogus 1", near(0.0)),
+            "unknown option nrv:bogus",
+        ),
+        (
+            &format!("?v nrv:near {} ; nrv:k \"many\"", near(0.0)),
+            "whole number",
+        ),
+        ("?v nrv:near ?q", "has no value"),
+        // Past their bounds, refused rather than clamped to another question.
+        (
+            &format!("?v nrv:near {} ; nrv:k 0", near(0.0)),
+            "nrv:k is from 1 to 10000, not 0",
+        ),
+        (
+            &format!("?v nrv:near {} ; nrv:k 10001", near(0.0)),
+            "nrv:k is from 1 to 10000, not 10001",
+        ),
+        (
+            &format!("?v nrv:near {} ; nrv:searchBudget 0", near(0.0)),
+            "nrv:searchBudget is from 1 to 1000000, not 0",
+        ),
+        (
+            &format!("?v nrv:near {} ; nrv:searchBudget 1000001", near(0.0)),
+            "nrv:searchBudget is from 1 to 1000000, not 1000001",
+        ),
+    ];
+    // Every row's outcome, before failing: the red proof shows each one.
+    let failures: Vec<String> = cases
+        .iter()
+        .filter_map(|(block, expected)| {
+            match error_of(
+                &engine,
+                &format!("SELECT * WHERE {{ SERVICE nrv:search {{ {block} }} }}"),
+            ) {
+                Some(message) if message.contains(expected) => None,
+                Some(message) => Some(format!("{block}: {message}")),
+                None => Some(format!("{block}: answered, an error expected")),
+            }
+        })
+        .collect();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// `nrv:k` and `nrv:searchBudget` at their largest are taken as given: every one of the
+/// 36 vectors the default graph uses, the widest beam answering as a narrow one.
+#[test]
+fn the_largest_k_and_budget_are_taken_as_given() {
+    let engine = engine();
+    let plain = QueryOptions::default();
+    let query = |options: &str| {
+        rows(
+            &engine,
+            &format!(
+                "SELECT ?v WHERE {{ SERVICE nrv:search {{ ?v nrv:near {} ; {options} }} }}",
+                near(0.0)
+            ),
+            &plain,
+        )
+    };
+    assert_eq!(query("nrv:k 10000").len(), 36);
+    assert_eq!(
+        query("nrv:k 3 ; nrv:searchBudget 1000000"),
+        query("nrv:k 3 ; nrv:searchBudget 1")
+    );
+}
+
+/// A large joined pattern: the search goes first and each hit is probed against the
+/// pattern, the hits kept in order until `k` pass; the answer is the bind join's.
+#[test]
+fn searches_go_first_when_the_pattern_is_large() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..720 {
+        let angle = (i as f32 * 0.5).to_radians();
+        let item = ex(&format!("item/{i}"));
+        tx.insert(
+            Quad::new(
+                item.clone(),
+                ex("embedding"),
+                vector(&[angle.cos(), angle.sin()]),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        // Every third item is wanted.
+        let kind = if i % 3 == 0 { "wanted" } else { "other" };
+        tx.insert(Quad::new(item, ex("kind"), ex(kind), GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let query = format!(
+        "SELECT ?item ?r WHERE {{
+           ?item ex:kind ex:wanted ; ex:embedding ?v .
+           SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 3 ; nrv:rank ?r }}
+         }} ORDER BY ?r",
+        near(90.2)
+    );
+    let found = rows(&engine, &query, &QueryOptions::default());
+    // Wanted items are at multiples of 1.5 degrees: 90 (item/180), 91.5 (item/183),
+    // 88.5 (item/177).
+    assert_eq!(
+        found,
+        [["item/180", "1"], ["item/183", "2"], ["item/177", "3"]]
+            .map(|r| r.map(str::to_owned).to_vec())
+    );
+
+    // Two subjects share the best vector, and each has duplicate probe rows. Rank is
+    // per vector, while all RDF matches and their bag multiplicities must survive.
+    let angle = 90f32.to_radians();
+    let mut tx = engine.transaction();
+    tx.insert(
+        Quad::new(
+            ex("alias"),
+            ex("embedding"),
+            vector(&[angle.cos(), angle.sin()]),
+            GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    tx.insert(
+        Quad::new(
+            ex("alias"),
+            ex("kind"),
+            ex("wanted"),
+            GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    tx.commit().unwrap();
+    let found = rows(
+        &engine,
+        &format!(
+            "SELECT ?item ?r WHERE {{
+           {{ ?item ex:kind ex:wanted ; ex:embedding ?v }}
+           UNION {{ ?item ex:kind ex:wanted ; ex:embedding ?v }}
+           SERVICE nrv:search {{ ?v nrv:near {} ; nrv:k 3 ; nrv:rank ?r }}
+         }} ORDER BY ?r ?item",
+            near(90.2)
+        ),
+        &QueryOptions::default(),
+    );
+    let expected: Vec<_> = [
+        ("alias", "1"),
+        ("item/180", "1"),
+        ("item/183", "2"),
+        ("item/177", "3"),
+    ]
+    .into_iter()
+    .flat_map(|(item, rank)| std::iter::repeat_n([item, rank].map(str::to_owned).to_vec(), 2))
+    .collect();
+    assert_eq!(found, expected);
+}
+
+/// Uniform random vectors in [-1, 1]^dimension (hard for any graph index), from a seed.
+struct Rng(u64);
+
+impl Rng {
+    fn vector(&mut self, dimension: usize) -> Vec<f32> {
+        (0..dimension)
+            .map(|_| {
+                self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+                let mut z = self.0;
+                z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+                z ^= z >> 31;
+                ((z >> 40) as f32 / (1u64 << 24) as f32) * 2.0 - 1.0
+            })
+            .collect()
+    }
+}
+
+/// A filtered search that goes first (the joined pattern binds far more than
+/// PROBE_ABOVE · k rows) searches the graph without the filter and probes its hits. The
+/// index must be told the pattern's share of the vectors, or the first `k` hits that pass
+/// come from the tail of an approximate list: on this data recall 0.86 without it (the fast
+/// suite's `vector-knn-filtered`: 0.40-0.60), 0.99 with it
+/// (crates/nrese-vector/examples/filtered_recall.rs).
+#[test]
+fn a_filtered_search_that_goes_first_finds_the_true_nearest() {
+    // Past nrese_engine::vector::EXACT_BELOW (the graph is used), below SYNC_BUILD (it is
+    // built at the first search, not on a thread).
+    const ITEMS: usize = 24_000;
+    const DIMENSION: usize = 64;
+    const QUERIES: usize = 20;
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut rng = Rng(7);
+    let mut tx = engine.transaction();
+    for i in 0..ITEMS {
+        let item = ex(&format!("item/{i}"));
+        tx.insert(
+            Quad::new(
+                item.clone(),
+                ex("embedding"),
+                vector(&rng.vector(DIMENSION)),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        let kind = ex(&format!("k{}", i % 10));
+        tx.insert(Quad::new(item, ex("kind"), kind, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let mut found = 0;
+    for _ in 0..QUERIES {
+        let near = format!("\"{}\"^^nrv:vector", lexical(&rng.vector(DIMENSION)));
+        let search = |exact: &str| {
+            let query = format!(
+                "SELECT ?item WHERE {{ ?item ex:kind ex:k3 ; ex:embedding ?v .
+                   SERVICE nrv:search {{ ?v nrv:near {near} ; nrv:k 10{exact} }} }}"
+            );
+            rows(&engine, &query, &QueryOptions::default())
+        };
+        let truth = search(" ; nrv:exact true");
+        assert_eq!(truth.len(), 10);
+        let approximate = search("");
+        assert_eq!(approximate.len(), 10);
+        found += approximate.iter().filter(|i| truth.contains(i)).count();
+    }
+    let recall = found as f64 / (QUERIES * 10) as f64;
+    assert!(
+        recall >= 0.95,
+        "recall@10 {recall:.3} under a one-in-ten filter"
+    );
+}

@@ -1,0 +1,471 @@
+# The owner-approved policy of the release gate (benches/PROTOCOL.md §5, "The release gate";
+# benches/fast/release_gate.py load_policy): the one place that accepts what the bar forbids. The
+# gate tolerates no loss in time or memory and no wrong answer. A loss is accepted only when a
+# trade-off here covers it; a wrong answer only when an exception here names its case and outcome;
+# a baseline left uncompared only when an absence here names its cases; a cost appearing where the
+# baseline read below the counter's step only when an emerged entry here names it. Each is then reported in the verdict. Nothing else waives either: a case's declared `outcome` and
+# `known` issue explain evidence, they grant nothing.
+#
+# `release-gate.sh verdict CAND ...` reads this file at the candidate's commit, never from a timed
+# report: an entry counts for the candidates whose tree holds it.
+#
+# Only Johannes approves an entry (role.owners). Each carries `by = "Johannes"`, the `approved`
+# date, a `reason`, his words (`quote`, verbatim) and where he said them (`source`). An entry
+# without them makes the file an error, and the verdict NOT PASSED.
+#
+# A trade-off covers a loss when its case and dimension match (and its baseline, if `against` names
+# one), and in every round that showed the loss the worse end of its interval is at most `max_ratio`
+# and the paying win shows as `better` against the same baseline in the same report. A round that
+# showed no loss neither needs nor gives cover. Dimensions are as the report names them:
+# time/<series>, memory/lifetime, memory/phase/<phase>, qps/<clients>, ...
+#
+# [[tradeoff]]
+# case = "lab-olympics"
+# dimension = "memory/lifetime"
+# against = "main"                      # optional: base or main; omitted, either
+# max_ratio = 1.10                      # the loss's interval may reach at most this ratio
+# approved = "2026-10-20"
+# by = "Johannes"
+# reason = "the string interner's shards: 10 % more memory at load for loads 27 % faster"
+# quote = "<his words, verbatim>"
+# source = "<the thread and time, or the intent entry>"
+# pays_with = { case = "load-entities", dimension = "time/_" }
+#
+# An exception accepts one outcome of one case (outcome: wrong; a declared limit needs none: it
+# blocks where a baseline completes and is named where none does).
+#
+# [[exception]]
+# case = "<a case of benches/cases>"
+# outcome = "wrong"
+# approved = "2026-11-09"
+# by = "Johannes"
+# reason = "<why it ships>"
+# quote = "<his words, verbatim>"
+# source = "<the thread and time, or the intent entry>"
+#
+# An absence accepts that a baseline isn't compared on some cases whose capability its product has
+# but its measurement build can't run yet (a product that lacks it says so in the catalogue: the
+# case's `absent`). Without one, such a case stays not compared and blocks. A timed block doesn't
+# run the side on them; the verdict lists each as "not compared by the owner's decision".
+#
+# [[absence]]
+# cases = ["commits-plain", "commits-readers"]   # or: pattern = "support-*" (one of the two)
+# side = "main"
+# reason = "main's measurement build has no commits mode"
+# port = "<the package planned to compare them>"
+# approved = "2026-11-11"
+# by = "Johannes"
+# quote = "<his words, verbatim>"
+# source = "<the thread and time, or the intent entry>"
+#
+# An emerged entry accepts a cost appearing in a series the baseline reads below the counter's step
+# in every block (the gate's `emerged`: a phase printing 0.0 on the baseline and a measurable time
+# on the candidate). Without one it blocks. `max` is the largest candidate median it covers, in the
+# dimension's unit; a larger one blocks again.
+#
+# [[emerged]]
+# case = "el-classify"
+# dimension = "time/prepare"
+# against = "base"                      # optional: base or main; omitted, either
+# max = 2.0                             # ms
+# approved = "2026-11-14"
+# by = "Johannes"
+# reason = "<the check that costs it, and why it ships>"
+# quote = "<his words, verbatim>"
+# source = "<the thread and time, or the intent entry>"
+
+# The DBpedia core store load's memory peak (reopen-dbpedia's setup: 67 M quads loaded into a store on
+# disk), measured apart in the gate's form: a 10 GB scope, anon + kernel every 50 ms, on the gate's host,
+# 14 Nov 2026.
+# - engine-v2 with the arena fix (#335) and the checkpoint release (#330): 5.95 GiB, the median of five
+#   runs; seven later runs of the same code gave 5.80-5.95 (median 5.91). Main: 5.20, and 5.14-5.18 in
+#   the later runs. That is x1.14-1.15.
+# - Load time: 15.4 s against main's 28.0 s, the win the owner traded for. No gated row times this load:
+#   the gate doesn't time a case's setup, and no other case times DBpedia's load. The row that stands in
+#   is the bulk load the gate does time against main, load-entities: 1.98 s against main's 4.01 s (the
+#   medians of every pass of the last release run).
+# - max_ratio 1.20: the row's interval as the gate computes it (t over the block contrasts), over every
+#   round drawn from the runs above. The landed code's runs spread by 1.0 % (sd); main's by 0.3 %, plus
+#   one load in six at 5.76. The gate judges the bound in the rounds that showed the loss. At 1.20, about
+#   1 % of 3-block rounds (2 % of those that show it) and no 6-block round would show it past the bound.
+#   At 1.19, 2 % of 3-block rounds would, and 6-block rounds end within 0.002 of it. The
+#   states before the fixes stay above 1.20 in every round: engine-v2 before both (6.37 GiB, x1.23) and
+#   with the release alone (6.23, x1.21).
+[[tradeoff]]
+case = "reopen-dbpedia"
+dimension = "memory/anon_kernel"
+against = "main"
+max_ratio = 1.20
+approved = "2026-11-14"
+by = "Johannes"
+reason = "the DBpedia core store load peaks about 0.75 GiB above main (5.95 against 5.20 GiB, x1.14) and is 1.8 times as fast; the remainder is resident in the allocator's arenas, not memory freed lazily. The ceiling of 1.20 is the lowest the landed code's measured runs pass reliably as the gate reads them (comment above)"
+quote = "Ok"
+source = "his answer of 14 Nov 2026, 20:26 Berlin, accepting the recommendation \"DBpedia load is 5.95 GiB against main's 5.20 at 1.8× the speed … I recommend accepting it, with the spill budget and the huge-pages setting named in the release notes\""
+pays_with = { case = "load-entities", dimension = "time/_" }
+
+# EL classification through the endpoint (el-classify-endpoint: el-classify's 20,000 classes loaded into a fresh
+# server, then GET /dataset/classification). The row is the server scope's anon + kernel peak, the load included.
+# Measured 14 Nov 2026 in the gate's form: its own runner, 12 blocks of the three sides in whole Latin squares, on
+# engine-v2 e0745e067 (the code this case runs is unchanged since).
+# - Memory: 720 MiB against main's 196, x3.60 (interval 3.50-3.71). The runs spread by 3.6 % (sd), main's by 4.4 %.
+# - Time: the request takes 0.53 s against main's 5.4 s, x0.096 (interval 0.094-0.098). This is the win the owner
+#   traded for, the same case's time/request; it shows as better against main in every round drawn from the blocks.
+# - max_ratio 4.49: the gate runs this case in 3-block rounds, where the interval is t(2) = 4.30 errors wide. Of
+#   every round of 3 of the 12 blocks, 1 in 220 ends above 4.49, 2 above 4.48, none above 4.61. It lets growth
+#   through: a head 10 % above this one passes 56 % of 3-block rounds, one 25 % above it 2 %. In 6-block rounds
+#   3.95 would hold every round and pass 10 % growth in 0.6 % of them.
+[[tradeoff]]
+case = "el-classify-endpoint"
+dimension = "memory/anon_kernel"
+against = "main"
+max_ratio = 4.49
+approved = "2026-11-14"
+by = "Johannes"
+reason = "classifying el-classify's ontology through the endpoint peaks at 720 MiB against main's 196 (x3.6) and answers ten times as fast (0.53 against 5.4 s); the memory is the DL classifier's working state, needed to the end. The ceiling of 4.49 is the lowest the measured blocks pass reliably in the 3-block rounds the gate runs; it lets about 10 % growth through in half of them and stops only about 25 % reliably (comment above)"
+quote = "Accepted and put on list for optimization efforts later with better caching design maybe we can trim down the memory further"
+source = "his answer of 14 Nov 2026, 21:31 Berlin, accepting the EL endpoint's memory against its time (727 against main's 208 MiB at 0.42 against 4.67 s)"
+pays_with = { case = "el-classify-endpoint", dimension = "time/request" }
+
+# The release baselines' measurement builds can't run these cases yet, though their products
+# can (a static audit of each build against each case's command, 11 Nov 2026). Each pair stays
+# uncompared until the port its entry names lands.
+
+[[absence]]
+cases = ["checkpoint-under-readers", "checkpoint-under-readers-commits", "checkpoint-under-readers-w1"]
+side = "base"
+reason = "base's measurement build doesn't parse --checkpoint-after-wal-bytes"
+port = "the measurement tool's checkpoint trigger ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["snapshot-private-cost"]
+side = "base"
+reason = "base's measurement build doesn't parse --held-views --staggered-views"
+port = "the measurement tool's held views ported to base's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["dl-abox-lubm1", "dl-datatypes", "dl-keys-100", "dl-keys-1200", "dl-keys-128x3", "dl-keys-2400", "dl-keys-400", "dl-keys-8x3", "dl-nominals", "dl-number", "dl-number-fragment", "dl-pipeline", "dl-roles", "dl-transitive", "dl-transitive-400"]
+side = "base"
+reason = "base's measurement build doesn't parse --memory-mib"
+port = "the DL consistency tool's shared memory limit ported to base's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["parse-turtle-flat", "parse-turtle-nested"]
+side = "base"
+reason = "base's measurement build doesn't parse --parse-turtle"
+port = "the measurement tool's Turtle parsing mode ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["vector-knn-filtered"]
+side = "base"
+reason = "base's measurement build doesn't parse --prepare-vector-graph"
+port = "the measurement tool's vector graph preparation ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["graphs4-reader"]
+side = "base"
+reason = "base's measurement build doesn't parse --read-graphs"
+port = "the measurement tool's named-graph reader mode ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["recovery-catchup-cost"]
+side = "base"
+reason = "base's measurement build doesn't parse --recovery --recovery-prepare"
+port = "the measurement tool's recovery mode ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["split-turtle-flat", "split-turtle-nested"]
+side = "base"
+reason = "base's measurement build doesn't parse --split-turtle"
+port = "the measurement tool's Turtle splitting mode ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["support-copies-16", "support-copies-17-capped", "support-copies-256-capped", "support-copies-8", "support-ladder-16", "support-ladder-256-capped", "support-ladder-4096-capped", "support-product-1024-capped", "support-product-256-capped", "support-product-4096-capped", "support-product-64-capped"]
+side = "base"
+reason = "base's measurement build doesn't parse --support-reader --support-commits --support-sets"
+port = "the measurement tool's supported-inference modes ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["support-copies-16-capped", "support-copies-17", "support-copies-256", "support-copies-8-capped", "support-ladder-16-capped", "support-ladder-256", "support-ladder-4096", "support-product-1024", "support-product-256", "support-product-4096", "support-product-4096-limit", "support-product-4096-limit-capped", "support-product-64"]
+side = "base"
+reason = "base's measurement build doesn't parse --support-sets --support-reader --support-commits"
+port = "the measurement tool's supported-inference modes ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["support-pending-read", "support-update-committed", "support-update-pending"]
+side = "base"
+reason = "base's measurement build doesn't parse --support-sets --support-reader --support-commits --support-updates"
+port = "the measurement tool's supported-inference modes ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["upload-graph-nt", "upload-graph-ttl"]
+side = "base"
+reason = "base's measurement build doesn't parse --upload --upload-format"
+port = "the measurement tool's upload mode ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["upload-statements-contexts", "upload-transaction-delete"]
+side = "base"
+reason = "base's measurement build doesn't parse --upload --upload-format --upload-as"
+port = "the measurement tool's upload mode ported to base's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["cache-replay", "cache-replay-cached"]
+side = "main"
+reason = "main's measurement build doesn't parse --cache-bytes"
+port = "the measurement tool's cache size setting ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["canon-twins"]
+side = "main"
+reason = "main's measurement build doesn't parse --canonicalize"
+port = "the measurement tool's canonicalization mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["clients-lookups", "clients-sweep"]
+side = "main"
+reason = "main's measurement build doesn't parse --clients --duration-s"
+port = "the measurement tool's concurrent clients mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["commits-rdfs", "deletes-clique", "deletes-layered", "deletes-tail", "eq-giant-split", "first-load-chain", "first-load-chain-ranged", "rule-delta-sweep"]
+side = "main"
+reason = "main's measurement build doesn't parse --commits"
+port = "the measurement tool's commits mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["commits-plain", "commits-readers", "eq-merge-compact", "ql-memberships-data-commits", "ql-memberships-type-commits-deep", "ql-memberships-type-commits-wide", "writes-under-readers"]
+side = "main"
+reason = "main's measurement build doesn't parse --commits --readers"
+port = "the measurement tool's commits mode and concurrent readers ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["checkpoint-under-readers", "checkpoint-under-readers-commits"]
+side = "main"
+reason = "main's measurement build doesn't parse --commits --readers --checkpoint-after-wal-bytes"
+port = "the measurement tool's commits mode, concurrent readers and checkpoint trigger ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["checkpoint-under-readers-w1"]
+side = "main"
+reason = "main's measurement build doesn't parse --commits --readers --checkpoint-after-wal-bytes --threads"
+port = "the measurement tool's commits mode, concurrent readers, checkpoint trigger and thread setting ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["alloc-load", "alloc-lubm10", "index-join-keys"]
+side = "main"
+reason = "main's measurement build doesn't parse --count-allocations"
+port = "the measurement tool's allocation counting ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["snapshot-private-cost"]
+side = "main"
+reason = "main's measurement build doesn't parse --held-views --staggered-views"
+port = "the measurement tool's held views ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["kernel-sort-u128"]
+side = "main"
+reason = "main's measurement build doesn't parse --kernel"
+port = "the measurement tool's kernel mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["parse-large"]
+side = "main"
+reason = "main's measurement build doesn't parse --parse-only"
+port = "the measurement tool's parse-only mode ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["parse-turtle-flat", "parse-turtle-nested"]
+side = "main"
+reason = "main's measurement build doesn't parse --parse-turtle"
+port = "the measurement tool's Turtle parsing mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["plan-estimates"]
+side = "main"
+reason = "main's measurement build doesn't parse --qerror"
+port = "the measurement tool's estimate-error mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["graphs4-reader"]
+side = "main"
+reason = "main's measurement build doesn't parse --read-graphs"
+port = "the measurement tool's named-graph reader mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["recovery-catchup-cost"]
+side = "main"
+reason = "main's measurement build doesn't parse --recovery --recovery-prepare"
+port = "the measurement tool's recovery mode ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["el-classify", "el-classify-irregular", "el-shallow-existentials"]
+side = "main"
+reason = "main's measurement build doesn't parse --repeat"
+port = "the EL classifier tool's repeat setting ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["custom-tc"]
+side = "main"
+reason = "main's measurement build doesn't parse --rules"
+port = "the measurement tool's rules mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["split-turtle-flat", "split-turtle-nested"]
+side = "main"
+reason = "main's measurement build doesn't parse --split-turtle"
+port = "the measurement tool's Turtle splitting mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["load-threads", "rl-single-thread"]
+side = "main"
+reason = "main's measurement build doesn't parse --threads"
+port = "the measurement tool's thread setting ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["upload-graph-nt", "upload-graph-ttl"]
+side = "main"
+reason = "main's measurement build doesn't parse --upload --upload-format"
+port = "the measurement tool's upload mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+[[absence]]
+cases = ["upload-statements-contexts", "upload-transaction-delete"]
+side = "main"
+reason = "main's measurement build doesn't parse --upload --upload-format --upload-as"
+port = "the measurement tool's upload mode ported to main's build, planned right after v1.5"
+approved = "2026-11-11"
+by = "Johannes"
+quote = "i take the recommendations on both the decisions thank you"
+source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"

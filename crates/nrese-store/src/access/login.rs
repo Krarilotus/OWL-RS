@@ -3,10 +3,18 @@
 //! `Basic` credentials or at a login that opens a session.
 //!
 //! Argon2 is slow by design (tens of milliseconds): a credential verified once is
-//! remembered by its SHA-256 for as long as the user's hash stays the same, so a client
+//! remembered for as long as the user's hash stays the same, by its HMAC-SHA-256 under a
+//! key drawn at start and never stored (so a memory dump doesn't let anyone test guesses
+//! at SHA-256 speed, past Argon2), so a client
 //! that sends `Basic` credentials with every request pays it once. A user name without a
 //! login is checked against a fixed hash all the same, so the time a refusal takes doesn't
 //! tell which names exist.
+//!
+//! Argon2 holds about 19 MiB while it runs, uncharged: at most [`LoginLimits::hashes`]
+//! runs go at once (the named exemption `login-argon2`, K × 19 MiB; it is CPU-bound, so
+//! more at once gain nothing). A check that can't start within [`LoginLimits::hash_wait`]
+//! fails as busy, to be retried, and doesn't count as a failed attempt. A remembered
+//! credential runs no Argon2 and never waits.
 //!
 //! Failed attempts are counted per user name and client address, never per name alone:
 //! someone who can reach the port can slow down their own guesses, not lock a user out.
@@ -19,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::net::IpAddr;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use argon2::Argon2;
@@ -42,6 +50,10 @@ pub struct LoginLimits {
     pub remembered: usize,
     /// Counts kept, per name and address and per address (beyond, the oldest go).
     pub tracked: usize,
+    /// Argon2 runs at once (hashing a new password, checking one not remembered).
+    pub hashes: usize,
+    /// How long a check waits for its turn before it fails as busy.
+    pub hash_wait: Duration,
 }
 
 impl Default for LoginLimits {
@@ -52,6 +64,8 @@ impl Default for LoginLimits {
             window: Duration::from_secs(300),
             remembered: 10_000,
             tracked: 10_000,
+            hashes: std::thread::available_parallelism().map_or(1, usize::from),
+            hash_wait: Duration::from_secs(10),
         }
     }
 }
@@ -135,21 +149,90 @@ struct Throttle {
     addresses: Counts<Option<IpAddr>>,
 }
 
-/// The hash a user name without a login is checked against: the work of a check, which
-/// no password passes in practice (made from random bytes).
-fn dummy_hash() -> &'static str {
-    static DUMMY: OnceLock<String> = OnceLock::new();
-    DUMMY.get_or_init(|| {
-        let mut bytes = [0u8; 32];
-        // Without randomness, zeros: it only has to cost what a check costs.
-        let _ = getrandom::fill(&mut bytes);
-        let text: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        hash_password(&text).unwrap_or_default()
-    })
+/// Admits at most `limit` Argon2 runs at once (the exemption `login-argon2`).
+pub(super) struct Argon2Gate {
+    limit: usize,
+    running: Mutex<usize>,
+    freed: Condvar,
+    /// The most runs there were at once.
+    #[cfg(test)]
+    most: std::sync::atomic::AtomicUsize,
+}
+
+impl Argon2Gate {
+    fn new(limit: usize) -> Self {
+        Self {
+            limit: limit.max(1),
+            running: Mutex::new(0),
+            freed: Condvar::new(),
+            #[cfg(test)]
+            most: Default::default(),
+        }
+    }
+
+    /// `work` (an Argon2 run), once fewer than `limit` run, waiting `wait` at most: past
+    /// it, [`AccessError::Busy`].
+    pub(super) fn run<T>(
+        &self,
+        wait: Duration,
+        work: impl FnOnce() -> T,
+    ) -> Result<T, AccessError> {
+        let deadline = Instant::now() + wait;
+        let mut running = self.running.lock().expect("argon2 gate");
+        while *running >= self.limit {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Err(AccessError::Busy(
+                    "too many password checks at once; try again shortly".to_owned(),
+                ));
+            }
+            running = self
+                .freed
+                .wait_timeout(running, left)
+                .expect("argon2 gate")
+                .0;
+        }
+        *running += 1;
+        #[cfg(test)]
+        self.most
+            .fetch_max(*running, std::sync::atomic::Ordering::Relaxed);
+        drop(running);
+        // Its turn ends however `work` ends.
+        struct Turn<'a>(&'a Argon2Gate);
+        impl Drop for Turn<'_> {
+            fn drop(&mut self) {
+                *self.0.running.lock().expect("argon2 gate") -= 1;
+                self.0.freed.notify_one();
+            }
+        }
+        let _turn = Turn(self);
+        Ok(work())
+    }
+}
+
+impl Default for Argon2Gate {
+    fn default() -> Self {
+        Self::new(LoginLimits::default().hashes)
+    }
+}
+
+/// The hash a user name without a login is checked against: a PHC string with
+/// [`hash_password`]'s algorithm and parameters, so checking it is the work of a check,
+/// and a random salt and output, which no known password was hashed to. Fixed, so no
+/// login makes it first (that extra hash told a missing name from a wrong password,
+/// PR #80).
+const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$8JmJzvxTKI3MtmVdVMLZEQ$raTfQ5S6+jmfK261pBbtAolYcPmAsCVPGL/guuFDyx8";
+
+#[cfg(test)]
+thread_local! {
+    /// Argon2 runs on this thread so far, (hashes, checks): the work a test sees a login do.
+    static ARGON2_RUNS: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
 }
 
 /// The PHC string of `password` (Argon2id, a random salt).
 pub fn hash_password(password: &str) -> Result<String, AccessError> {
+    #[cfg(test)]
+    ARGON2_RUNS.with(|runs| runs.set((runs.get().0 + 1, runs.get().1)));
     Argon2::default()
         .hash_password(password.as_bytes())
         .map(|hash| hash.to_string())
@@ -158,6 +241,8 @@ pub fn hash_password(password: &str) -> Result<String, AccessError> {
 
 /// Whether `password` is the one `hash` (a PHC string) was made from.
 pub fn verify_password(password: &str, hash: &str) -> bool {
+    #[cfg(test)]
+    ARGON2_RUNS.with(|runs| runs.set((runs.get().0, runs.get().1 + 1)));
     PasswordHash::new(hash).is_ok_and(|parsed| {
         Argon2::default()
             .verify_password(password.as_bytes(), &parsed)
@@ -165,27 +250,101 @@ pub fn verify_password(password: &str, hash: &str) -> bool {
     })
 }
 
+/// HMAC-SHA-256 (RFC 2104) of the concatenated `parts` under `key` (at most one block).
+fn hmac_sha256(key: &[u8; 32], parts: &[&[u8]]) -> [u8; 32] {
+    const BLOCK: usize = 64;
+    let mut padded = [0u8; BLOCK];
+    padded[..key.len()].copy_from_slice(key);
+    let pad = |byte: u8| padded.map(|k| k ^ byte);
+    let mut inner = Sha256::new().chain_update(pad(0x36));
+    for part in parts {
+        inner.update(part);
+    }
+    Sha256::new()
+        .chain_update(pad(0x5c))
+        .chain_update(inner.finalize())
+        .finalize()
+        .into()
+}
+
 /// The open sessions and what logins remember.
 #[derive(Default)]
 pub(super) struct Logins {
     limits: LoginLimits,
-    /// Verified credentials (by SHA-256 of `user`, NUL, `password`): the user and the
-    /// hash they were verified against.
+    /// The key of [`Self::verified`]'s HMACs: random, per process.
+    secret: [u8; 32],
+    /// Verified credentials (by HMAC of `user`, NUL, `password`): the user and the hash
+    /// they were verified against.
     verified: Mutex<HashMap<[u8; 32], (String, String)>>,
     /// Failed attempts ([`Throttle`]).
     failures: Mutex<Throttle>,
-    /// Session tokens: the user and when the session ends.
-    sessions: Mutex<HashMap<String, (String, Instant)>>,
+    /// Session tokens and their sessions. Lock order: this, then the access state.
+    sessions: Mutex<HashMap<String, Session>>,
+    /// Every Argon2 run's turn.
+    argon2: Argon2Gate,
+    /// What a password is checked with, in its turn: [`verify_password`].
+    verify: Verifier,
+}
+
+/// Checks a password against a PHC string; [`verify_password`] outside tests, which
+/// install a recording one to see which hash each refusal was checked against.
+#[derive(Clone, Copy)]
+struct Verifier(fn(&str, &str) -> bool);
+
+impl Default for Verifier {
+    fn default() -> Self {
+        Self(verify_password)
+    }
 }
 
 /// A session token's prefix, which tells it from other bearer tokens.
 pub const SESSION_PREFIX: &str = "nrese-session.";
 
+/// An open session: its user, the credential it was opened with (the user's PHC string
+/// its password was verified against) and when it ends.
+struct Session {
+    user: String,
+    credential: String,
+    until: Instant,
+}
+
+/// Whether `credential` is still `user`'s local login in `state`. A session is valid only
+/// for the credential it was verified against (SYN-63): a new password is a new PHC
+/// string (a fresh random salt), so it ends every session of the old one, as removing the
+/// user or its login does.
+fn current(state: &AccessState, user: &str, credential: &str) -> bool {
+    state
+        .users
+        .get(user)
+        .and_then(|record| record.password_hash.as_deref())
+        == Some(credential)
+}
+
+/// The refusal of a wrong user name or password.
+fn refused() -> AccessError {
+    AccessError::Forbidden("wrong user name or password".to_owned())
+}
+
 impl Logins {
     pub(super) fn new(limits: LoginLimits) -> Self {
+        let mut secret = [0u8; 32];
+        // Without randomness, the cache key is a plain hash again, which is what it was.
+        let _ = getrandom::fill(&mut secret);
         Self {
             limits,
+            secret,
+            argon2: Argon2Gate::new(limits.hashes),
+            verify: Verifier(verify_password),
             ..Self::default()
+        }
+    }
+
+    /// [`Self::new`], checking passwords with `verify` instead of [`verify_password`].
+    #[cfg(test)]
+    pub(super) fn verifying_with(limits: LoginLimits, verify: fn(&str, &str) -> bool) -> Self {
+        Self {
+            verify: Verifier(verify),
+            ..Self::new(limits)
         }
     }
 
@@ -198,7 +357,22 @@ impl Logins {
         password: &str,
         client: Option<IpAddr>,
     ) -> Result<Principal, AccessError> {
-        let refused = || AccessError::Forbidden("wrong user name or password".to_owned());
+        self.verify(state, user, password, client)?;
+        Ok(Principal {
+            user: Some(user.to_owned()),
+            ..Principal::default()
+        })
+    }
+
+    /// [`Self::login`]'s check: the credential `password` was verified against, `user`'s
+    /// PHC string in `state`.
+    pub(super) fn verify(
+        &self,
+        state: &AccessState,
+        user: &str,
+        password: &str,
+        client: Option<IpAddr>,
+    ) -> Result<String, AccessError> {
         let pair = (user.to_owned(), client);
         {
             let mut failures = self.failures.lock().expect("failures");
@@ -218,16 +392,11 @@ impl Logins {
         }
         let Some(hash) = state.users.get(user).and_then(|u| u.password_hash.clone()) else {
             // As long as a wrong password takes.
-            let _ = verify_password(password, dummy_hash());
+            self.hashing(|| (self.verify.0)(password, DUMMY_HASH))?;
             self.failed(&pair);
             return Err(refused());
         };
-        let key: [u8; 32] = Sha256::new()
-            .chain_update(user.as_bytes())
-            .chain_update([0])
-            .chain_update(password.as_bytes())
-            .finalize()
-            .into();
+        let key = hmac_sha256(&self.secret, &[user.as_bytes(), &[0], password.as_bytes()]);
         let known = self
             .verified
             .lock()
@@ -235,7 +404,7 @@ impl Logins {
             .get(&key)
             .is_some_and(|(name, verified)| name == user && *verified == hash);
         if !known {
-            if !verify_password(password, &hash) {
+            if !self.hashing(|| (self.verify.0)(password, &hash))? {
                 self.failed(&pair);
                 return Err(refused());
             }
@@ -243,13 +412,15 @@ impl Logins {
             if verified.len() >= self.limits.remembered {
                 verified.clear();
             }
-            verified.insert(key, (user.to_owned(), hash));
+            verified.insert(key, (user.to_owned(), hash.clone()));
         }
         self.failures.lock().expect("failures").pairs.clear(&pair);
-        Ok(Principal {
-            user: Some(user.to_owned()),
-            ..Principal::default()
-        })
+        Ok(hash)
+    }
+
+    /// `work`, an Argon2 run, in its turn ([`Argon2Gate`]).
+    pub(super) fn hashing<T>(&self, work: impl FnOnce() -> T) -> Result<T, AccessError> {
+        self.argon2.run(self.limits.hash_wait, work)
     }
 
     fn failed(&self, pair: &(String, Option<IpAddr>)) {
@@ -264,8 +435,19 @@ impl Logins {
         (failures.pairs.len(), failures.addresses.len())
     }
 
-    /// Opens a session for `user` for `lifetime`; its token.
-    pub(super) fn open(&self, user: &str, lifetime: Duration) -> Result<String, AccessError> {
+    /// Opens a session for `user` for `lifetime`, with the `credential` its password was
+    /// verified against: its token. Refused as a wrong password if `credential` is no
+    /// longer the user's in the state `now` returns, read under the sessions lock: a change
+    /// of the credential publishes its state before it closes the user's sessions under
+    /// that lock ([`Self::close_all`]), so a session opened in between is closed, and one
+    /// opened later is refused. No session of an old credential is ever kept.
+    pub(super) fn open(
+        &self,
+        user: &str,
+        credential: String,
+        lifetime: Duration,
+        now: impl FnOnce() -> std::sync::Arc<AccessState>,
+    ) -> Result<String, AccessError> {
         let mut bytes = [0u8; 32];
         getrandom::fill(&mut bytes)
             .map_err(|error| AccessError::Store(format!("no randomness: {error}")))?;
@@ -274,18 +456,28 @@ impl Logins {
             bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
         );
         let mut sessions = self.sessions.lock().expect("sessions");
-        sessions.retain(|_, (_, until)| *until > Instant::now());
-        sessions.insert(token.clone(), (user.to_owned(), Instant::now() + lifetime));
+        if !current(&now(), user, &credential) {
+            return Err(refused());
+        }
+        sessions.retain(|_, session| session.until > Instant::now());
+        let session = Session {
+            user: user.to_owned(),
+            credential,
+            until: Instant::now() + lifetime,
+        };
+        sessions.insert(token.clone(), session);
         Ok(token)
     }
 
-    /// The user of session `token`, while it lasts.
-    pub(super) fn session(&self, token: &str) -> Option<String> {
+    /// The user of session `token`, while it lasts and the credential it was opened with
+    /// is still the user's in `state`.
+    pub(super) fn session(&self, token: &str, state: &AccessState) -> Option<String> {
         let sessions = self.sessions.lock().expect("sessions");
         sessions
             .get(token)
-            .filter(|(_, until)| *until > Instant::now())
-            .map(|(user, _)| user.clone())
+            .filter(|session| session.until > Instant::now())
+            .filter(|session| current(state, &session.user, &session.credential))
+            .map(|session| session.user.clone())
     }
 
     /// Closes session `token`; whether it was open.
@@ -297,11 +489,304 @@ impl Logins {
             .is_some()
     }
 
-    /// Closes every session of `user` (its password or record changed).
+    /// Closes every session of `user` (its password or record changed), once the state
+    /// with that change is published ([`Self::open`] relies on that order).
     pub(super) fn close_all(&self, user: &str) {
         self.sessions
             .lock()
             .expect("sessions")
-            .retain(|_, (owner, _)| owner != user);
+            .retain(|_, session| session.user != user);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Barrier;
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+    use crate::access::User;
+
+    const PASSWORD: &str = "correct horse battery";
+
+    fn logins(hashes: usize, hash_wait: Duration) -> Logins {
+        Logins::new(LoginLimits {
+            hashes,
+            hash_wait,
+            ..LoginLimits::default()
+        })
+    }
+
+    /// alice, with a local login.
+    fn state() -> AccessState {
+        let mut state = AccessState::default();
+        let user = User {
+            password_hash: Some(hash_password(PASSWORD).unwrap()),
+            ..User::default()
+        };
+        state.users.insert("alice".to_owned(), user);
+        state
+    }
+
+    /// `then`, while a run holds every turn of `logins`' gate (one turn).
+    fn while_held<T>(logins: &Logins, then: impl FnOnce() -> T) -> T {
+        let (held, done) = (Barrier::new(2), Barrier::new(2));
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                logins
+                    .argon2
+                    .run(Duration::ZERO, || {
+                        held.wait();
+                        done.wait();
+                    })
+                    .unwrap()
+            });
+            held.wait();
+            let outcome = then();
+            done.wait();
+            outcome
+        })
+    }
+
+    /// Checks that aren't remembered, all at once: never more Argon2 runs than the gate's turns.
+    #[test]
+    fn concurrent_checks_hash_at_most_k_at_once() {
+        let logins = logins(2, Duration::from_secs(600));
+        let state = state();
+        let start = Barrier::new(6);
+        std::thread::scope(|scope| {
+            for guess in 0..6 {
+                let (logins, state, start) = (&logins, &state, &start);
+                scope.spawn(move || {
+                    start.wait();
+                    let refused = logins.login(state, "alice", &format!("guess {guess}"), None);
+                    assert!(matches!(refused, Err(AccessError::Forbidden(_))));
+                });
+            }
+        });
+        let most = logins.argon2.most.load(Ordering::Relaxed);
+        assert!((1..=2).contains(&most), "{most} at once");
+    }
+
+    /// A check that can't start before its wait ends fails as busy, and isn't counted as a
+    /// failed attempt.
+    #[test]
+    fn a_check_without_a_turn_in_time_is_busy() {
+        let logins = logins(1, Duration::from_millis(20));
+        let state = state();
+        let outcome = while_held(&logins, || logins.login(&state, "alice", PASSWORD, None));
+        assert!(matches!(outcome, Err(AccessError::Busy(_))), "{outcome:?}");
+        assert_eq!(logins.tracked(), (0, 0));
+    }
+
+    /// A remembered credential runs no Argon2, so it never waits for a turn.
+    #[test]
+    fn a_remembered_credential_needs_no_turn() {
+        let logins = logins(1, Duration::ZERO);
+        let state = state();
+        logins.login(&state, "alice", PASSWORD, None).unwrap();
+        let again = while_held(&logins, || logins.login(&state, "alice", PASSWORD, None));
+        assert!(again.is_ok(), "{again:?}");
+    }
+
+    /// The variable that marks the child [`in_a_process_of_its_own`] starts: its test's name.
+    const OWN_PROCESS: &str = "NRESE_LOGIN_TEST_OWN_PROCESS";
+
+    /// How long that child may run: far past its few Argon2 runs, unoptimised and on a busy
+    /// machine.
+    const OWN_PROCESS_DEADLINE: Duration = Duration::from_secs(600);
+
+    /// Whether the calling test runs in a process of its own, where no other test ran before
+    /// it: only in the child this starts. Elsewhere it runs the test again, alone, in a child
+    /// of this test binary, fails if it failed there (printing what it printed) and returns
+    /// false: the caller returns. A child still running at [`OWN_PROCESS_DEADLINE`] is
+    /// stopped, and the test fails. For a test of what a process does first: in the test
+    /// binary's own process, another test may have done it already (PR #86).
+    /// [`nrese_exec::measure::alone`] does the same for measurements, in binaries that measure.
+    fn in_a_process_of_its_own() -> bool {
+        use std::io::Read;
+        use std::process::{Command, Stdio};
+        // Both pipes are read as the child writes, or a child that fills one would wait for it.
+        fn drain(mut pipe: impl Read + Send + 'static) -> std::thread::JoinHandle<String> {
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                pipe.read_to_end(&mut bytes)
+                    .expect("the child's output reads");
+                String::from_utf8_lossy(&bytes).into_owned()
+            })
+        }
+        let current = std::thread::current();
+        let test = current.name().expect("a test thread, named after its test");
+        let alone = [test, "--exact", "--test-threads=1", "--nocapture"];
+        // The child this starts: the marker names this test, and the process was started with
+        // exactly the arguments that run it alone. A marker inherited by a run of other
+        // arguments, a whole suite, is no such child (PR #86).
+        if std::env::var(OWN_PROCESS).is_ok_and(|marked| marked == test)
+            && std::env::args_os().skip(1).eq(alone)
+        {
+            return true;
+        }
+        let started = Instant::now();
+        let mut child = Command::new(std::env::current_exe().expect("the test binary"))
+            .args(alone)
+            .env(OWN_PROCESS, test)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("the test binary runs");
+        let stdout = drain(child.stdout.take().expect("piped"));
+        let stderr = drain(child.stderr.take().expect("piped"));
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("the child's state") {
+                break Some(status);
+            }
+            if started.elapsed() >= OWN_PROCESS_DEADLINE {
+                child.kill().expect("the child stops");
+                child.wait().expect("the stopped child is waited for");
+                break None;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let stdout = stdout.join().expect("the child's output");
+        let stderr = stderr.join().expect("the child's output");
+        eprint!("{stdout}{stderr}");
+        let Some(status) = status else {
+            panic!(
+                "{test}, in a process of its own ({}), passed its deadline of {} s: stopped",
+                child.id(),
+                OWN_PROCESS_DEADLINE.as_secs()
+            );
+        };
+        // Exactly this test ran there, and passed: a name that matched none would pass too.
+        assert!(
+            status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{test}, in a process of its own ({}), failed: {status}",
+            child.id()
+        );
+        false
+    }
+
+    /// A fresh service's first refusal of a name without a login does the work of a wrong
+    /// password, and no more: no hash, and one check against a hash of the same algorithm,
+    /// parameters and lengths (that first refusal made the dummy hash, a hash more).
+    /// Work, not time. In a process of its own: work done once per process, as that dummy
+    /// hash was, may have been done by another test in this one first.
+    #[test]
+    fn a_missing_name_s_first_refusal_does_a_wrong_password_s_work() {
+        if !in_a_process_of_its_own() {
+            return;
+        }
+        let state = state();
+        let fresh = logins(1, Duration::from_secs(600));
+        let runs = |login: &dyn Fn() -> Result<Principal, AccessError>| {
+            let before = ARGON2_RUNS.with(std::cell::Cell::get);
+            let refused = login();
+            assert!(
+                matches!(refused, Err(AccessError::Forbidden(_))),
+                "{refused:?}"
+            );
+            let after = ARGON2_RUNS.with(std::cell::Cell::get);
+            (after.0 - before.0, after.1 - before.1)
+        };
+        let missing = runs(&|| fresh.login(&state, "mallory", PASSWORD, None));
+        let wrong = runs(&|| fresh.login(&state, "alice", "wrong", None));
+        assert_eq!(missing, (0, 1), "(hashes, checks) of the missing name");
+        assert_eq!(
+            missing, wrong,
+            "(hashes, checks): missing name, wrong password"
+        );
+        let shape = |phc: &str| -> Vec<String> {
+            phc.split('$')
+                .enumerate()
+                .map(|(at, part)| match at {
+                    0..4 => part.to_owned(),
+                    _ => part.len().to_string(),
+                })
+                .collect()
+        };
+        let alice = state.users["alice"].password_hash.clone().unwrap();
+        assert_eq!(shape(DUMMY_HASH), shape(&alice));
+        assert!(
+            PasswordHash::new(DUMMY_HASH).is_ok(),
+            "the check runs Argon2"
+        );
+    }
+
+    thread_local! {
+        /// The checks [`recording`] made on this thread: password and hash.
+        static CHECKED: std::cell::RefCell<Vec<(String, String)>> = Default::default();
+    }
+
+    /// [`verify_password`], recording each check. A check runs on the caller's thread
+    /// (in its gate turn), so tests running beside each other don't see each other's.
+    fn recording(password: &str, hash: &str) -> bool {
+        CHECKED.with(|checked| {
+            checked
+                .borrow_mut()
+                .push((password.to_owned(), hash.to_owned()))
+        });
+        verify_password(password, hash)
+    }
+
+    /// A name without a login is refused after the work a wrong password takes, and in its
+    /// words: no such credential is remembered, so each waits
+    /// for an Argon2 turn and is checked in it, once, against the fixed hash, as a wrong
+    /// password is against the user's; the fixed hash costs what a user's does; and the
+    /// refusals read the same. A name without a login is one without a record (`nobody`)
+    /// or one whose record has no password (`bob`).
+    #[test]
+    fn unknown_names_are_refused_like_wrong_passwords() {
+        let logins = Logins::verifying_with(
+            LoginLimits {
+                hashes: 1,
+                hash_wait: Duration::ZERO,
+                ..LoginLimits::default()
+            },
+            recording,
+        );
+        let mut state = state();
+        state.users.insert("bob".to_owned(), User::default());
+        let user_hash = state.users["alice"].password_hash.clone().unwrap();
+        let checked = || CHECKED.with(|checked| checked.take());
+        for user in ["nobody", "bob", "alice"] {
+            let outcome = while_held(&logins, || logins.login(&state, user, "guess", None));
+            assert!(
+                matches!(outcome, Err(AccessError::Busy(_))),
+                "{user}: {outcome:?}"
+            );
+            let without_a_turn = checked();
+            assert!(without_a_turn.is_empty(), "{user}: {without_a_turn:?}");
+        }
+        let refusal = |user: &str| match logins.login(&state, user, "guess", None) {
+            Err(AccessError::Forbidden(message)) => message,
+            other => panic!("{user}: {other:?}"),
+        };
+        let guess = |hash: &str| vec![("guess".to_owned(), hash.to_owned())];
+        let wrong_password = refusal("alice");
+        assert_eq!(checked(), guess(&user_hash), "alice");
+        for user in ["nobody", "bob"] {
+            assert_eq!(refusal(user), wrong_password);
+            assert_eq!(checked(), guess(DUMMY_HASH), "{user}");
+        }
+        // A PHC string's algorithm, version and parameters: all but its salt and hash.
+        let cost = |phc: &str| phc.rsplitn(3, '$').nth(2).map(str::to_owned);
+        assert_eq!(cost(DUMMY_HASH), cost(&user_hash));
+        assert!(cost(&user_hash).is_some_and(|c| c.starts_with("$argon2id$")));
+    }
+
+    /// RFC 4231, test case 1.
+    #[test]
+    fn hmac_matches_rfc_4231() {
+        // RFC 4231 test case 1 uses a 20-byte key 0x0b..; padded to 32 bytes with zeros it
+        // is the same HMAC key (keys shorter than a block are zero-padded).
+        let mut key = [0u8; 32];
+        key[..20].fill(0x0b);
+        let mac = super::hmac_sha256(&key, &[b"Hi ", b"There"]);
+        let hex: String = mac.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(
+            hex,
+            "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7"
+        );
     }
 }

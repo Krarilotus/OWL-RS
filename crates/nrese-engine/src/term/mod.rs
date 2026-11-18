@@ -2,26 +2,41 @@
 //!
 //! Layout: the top 4 bits are the [`TermKind`] tag, the low 60 bits the payload.
 //! Dictionary-backed kinds (IRI, blank node, literal) carry an index into the
-//! [`Dictionary`](dictionary::Dictionary); inline kinds carry the value itself.
+//! [`Dictionary`]; inline kinds carry the value itself.
 //!
 //! Inline encoding is only used when the lexical form is the canonical form of the value,
 //! so RDF term identity is preserved (`"01"^^xsd:integer` and `"1"^^xsd:integer` are
 //! different terms and get different ids). See ADR-0002.
 
+mod charged;
+pub(crate) mod derived;
 pub(crate) mod dictionary;
 pub(crate) mod hash;
 mod inline;
 pub(crate) mod offsets;
 pub(crate) mod order;
+pub(crate) mod overlay;
+pub(crate) mod pending;
+mod pieces;
+pub(crate) mod resolve;
+pub(crate) mod slot;
 mod strings;
+pub(crate) mod suffix;
 pub mod text;
+mod text_triple;
+pub mod vectors;
 pub(crate) mod vocabulary;
 #[cfg(test)]
 mod vocabulary_study;
 
 pub use dictionary::{Dictionary, DictionaryStats, TermView};
-pub use strings::{Placement, StringTest};
+
+/// Test support: keys in a sealed block of the dictionary's heap.
+#[cfg(test)]
+pub(crate) const BLOCK: usize = pieces::BLOCK;
+pub use strings::{Placement, StringScan, StringTest};
 pub use text::{TextMatch, TextQuery};
+pub use vectors::{VectorQuery, VectorSearchReport, VectorStrategy};
 
 /// Number of bits used by the payload of a [`TermId`].
 pub const PAYLOAD_BITS: u32 = 60;
@@ -98,6 +113,22 @@ impl TermKind {
                 | Self::TypedLiteral
                 | Self::Triple
         )
+    }
+
+    /// True for every RDF literal kind; triple terms and the graph marker are not literals.
+    pub const fn is_literal(self) -> bool {
+        match self {
+            Self::String
+            | Self::Integer
+            | Self::Boolean
+            | Self::Decimal
+            | Self::Date
+            | Self::DateTime
+            | Self::LangString
+            | Self::TypedLiteral
+            | Self::DerivedInteger => true,
+            Self::DefaultGraph | Self::Iri | Self::BlankNode | Self::Triple => false,
+        }
     }
 
     /// True for dictionary-backed literal kinds.
@@ -185,6 +216,14 @@ impl TermId {
         inline::date_widened(self, later)
     }
 
+    /// For an inline dateTime, an id two local days earlier (`later == false`) or later, at
+    /// its clock, with the smallest or largest timezone code: widened FILTER range bounds
+    /// that hold every value comparing true whatever either side's timezone (see
+    /// `inline::date_time_widened`). `None` for other ids.
+    pub fn date_time_widened(self, later: bool) -> Option<Self> {
+        inline::date_time_widened(self, later)
+    }
+
     /// The smallest and largest inline ids of `kind` (`Date` or `DateTime`) whose local
     /// year is in `low..=high` (0000-9999): the ids for which `YEAR` gives those years, as
     /// one range, since the year leads the payload. `None` for other kinds or years.
@@ -216,6 +255,33 @@ pub(crate) use inline::{inline_to_literal, try_inline_literal};
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn literal_classification_covers_every_raw_tag() {
+        // Spec: DICT2's literal-kind contract; reserved/executor tags are not RDF literals.
+        let cases = [
+            (0, false),  // default graph
+            (1, false),  // IRI
+            (2, false),  // blank node
+            (3, true),   // string
+            (4, true),   // integer
+            (5, true),   // boolean
+            (6, true),   // decimal
+            (7, true),   // date
+            (8, true),   // dateTime
+            (9, true),   // langString
+            (10, true),  // typed literal
+            (11, false), // triple term
+            (12, true),  // derived integer
+            (13, false), // reserved
+            (14, false), // computed id
+            (15, false), // UNDEF tag
+        ];
+        for (tag, expected) in cases {
+            let id = TermId::from_raw(tag << PAYLOAD_BITS);
+            assert_eq!(id.kind().is_literal(), expected, "raw tag {tag}");
+        }
+    }
 
     #[test]
     fn kind_and_payload_roundtrip() {

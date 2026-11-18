@@ -39,6 +39,8 @@ State of the art considered:
 - Write cost is O(d log d) for a delta of d quads, plus amortised compaction.
 - Memory is 6 × 32 bytes per quad while uncompressed. Block compression (delta + bit-packing per block, QLever/RDF-3X style) is the next planned storage step. It's invisible to upper layers, because scans go through the run API.
 - The index is memory-resident in this phase. On-disk memory-mapped runs come after compression.
+- (14 Nov 2026) Both have been built since: bit-packed blocks and memory-mapped checkpoints
+  ([capability matrix](../spec/06-target-capability-matrix.md), compressed indexes).
 
 ## Implementation notes (2026-09-25, E2–E4)
 
@@ -46,19 +48,21 @@ State of the art considered:
 - **Compaction placement.** Windows of up to `inline_entry_limit` entries (default 32 Ki) are merged inside the commit. Larger ones, and checkpoints, run on one background maintenance thread. Measured result: commit latency is independent of dataset size (see `benches/baselines/README.md`).
 - **Commit protocol.** The WAL mutex is held across append and publish. A checkpoint snapshots under that mutex and rotates the segment, so every older segment is provably covered and can be deleted.
 - **Failure model.**
-  - A failed WAL append poisons the log until reopen, so a torn frame can never be followed by valid ones.
-  - On recovery, a torn tail in the last segment is truncated; an invalid frame anywhere else is a `Corruption` error, never skipped.
+  - A failed WAL append poisons the log until reopen, so the engine itself never writes a valid frame after a torn one.
+  - On recovery (revised 2 Nov 2026, owner decision of 26 Oct), only a torn tail in the last segment is cut: one incomplete final frame, or zeros to the end of the file, with no intact frame after it. Its bytes are kept in `wal-cut/`. Any other invalid frame in the last segment is a `Corruption` error that leaves the log as it is, unless the operator opted into keeping the prefix (`WalDamage::KeepPrefix`, which copies the rest aside first). An invalid frame in an earlier segment is always a `Corruption` error. Nothing is skipped. Before this, any invalid frame in the last segment was truncated with everything after it, intact acknowledged records included.
+  - A bulk load or rematerialisation commits when its checkpoint is renamed into place. The log rotates before that point; past it, a failure never reports the revision uncommitted, and an unknown outcome poisons the log until reopen.
   - A single commit is capped at 4 GiB of WAL payload (about 130 M quads); larger loads go through the bulk loader (E5).
 - **Dictionary continuity.** Terms interned by aborted transactions stay in the dictionary and are logged with the next commit. This keeps logged ids one contiguous range, so replay is deterministic. Unused terms are a later GC concern; they're never visible as data.
-- **Platform.** On Unix, renames and segment creation are followed by a directory `fsync`. Windows can't open directories as files, so that step is skipped there and NTFS metadata journaling is relied on instead.
+- **Platform.** Every name recovery reads is placed by one owner, `durability::place` (revised 7 Nov 2026, DUR-3). On Unix a rename is followed by a directory `fsync`. On Windows the rename is `MoveFileExW` with `MOVEFILE_WRITE_THROUGH`, followed by `FlushFileBuffers` on the directory, which is opened with backup semantics. A failed flush fails the placement. Before this, Windows skipped the directory step and relied on NTFS's lazily flushed journal, so an acknowledged bulk load could vanish after a power loss. Restores place their image and segments through the same owner, and an open syncs the segments it replayed before it takes new commits.
 - **Second stack (E6).** A version holds an asserted stack and an inferred stack (decision D2). Both use the same run, merge and compaction code. A stack's `Layout` decides which permutations its runs hold:
-  - The inferred stack holds default-graph quads only, so it keeps SPOG/POSG/OSPG.
+  - The inferred stack holds default-graph quads only, so it keeps SPOG/POSG/OSPG (and PSOG
+    since: [ARCHITECTURE §4](../ARCHITECTURE.md#4-engine-design-l1)).
   - Graph-first plans over the inferred stack are rotated to the matching graph-last permutation, or answered as empty for named graphs.
   - Disjointness of the two stacks keeps the materialised count an O(1) sum, and lets scans concatenate the stacks without deduplication.
 
 ## Observable differences from v1 (Oxigraph), confirmed by differential tests
 
-Both differences are intentional; they are pinned by tests in `crates/nrese-sparql/tests/differential_tests.rs` and must be listed in the release notes when engine v2 replaces v1 (P2).
+Both differences are intentional; they are pinned by tests in `crates/nrese-sparql/tests/it/differential_tests.rs` and must be listed in the release notes when engine v2 replaces v1 (P2).
 
 1. **Literal lexical forms are preserved.** Oxigraph canonicalises typed literals on storage (`"030"^^xsd:integer` is stored as `"30"`, `"1"^^xsd:boolean` as `"true"`, `"25.0"^^xsd:decimal` as `"25"`). RDF 1.1 treats these as distinct terms, and NRESE keeps them. Consequences:
    - Graph patterns match by term: `?s ex:age 30` doesn't match `"030"`.
@@ -66,4 +70,6 @@ Both differences are intentional; they are pinned by tests in `crates/nrese-spar
    - Stored data comes back byte-for-byte as it was written, which ResearchSpace forms and provenance workflows rely on.
 2. **A named graph exists iff it holds a quad** (QLever and RDF4J/GraphDB semantics). Oxigraph keeps an explicit registry, so `CREATE GRAPH` persists an empty graph and a graph stays listed after its last quad is deleted. In NRESE:
    - `CREATE GRAPH` stores nothing.
-   - `CLEAR`/`DROP` of an empty named graph fails without `SILENT`.
+   - `CLEAR`/`DROP` of an empty named graph fails without `SILENT`. (14 Nov 2026: changed
+     since; it succeeds and changes nothing, because RDF4J clients clear a graph before they
+     write it: `clearing_a_graph_that_holds_nothing_succeeds`.)

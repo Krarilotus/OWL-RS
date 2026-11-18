@@ -14,7 +14,7 @@ use axum::http::HeaderMap;
 use axum::response::{IntoResponse, Response};
 use nrese_store::access::{
     AccessState, Change, ChangeRecord, DefaultGraphRight, Fallback, Inferred, Level, Principal,
-    RoleRule,
+    RoleRule, SettingsPatch,
 };
 use serde::{Deserialize, Serialize};
 
@@ -62,6 +62,16 @@ async fn change(
     reason: String,
 ) -> Result<Response, ApiError> {
     let by = requester(state, authenticated).await?;
+    apply_by(state, by, change, reason).await
+}
+
+/// Applies `change` by `by`; the change's record.
+async fn apply_by(
+    state: &AppState,
+    by: Principal,
+    change: Change,
+    reason: String,
+) -> Result<Response, ApiError> {
     let access = state.clone();
     let record = tokio::task::spawn_blocking(move || access.access().apply(&by, change, &reason))
         .await
@@ -273,26 +283,23 @@ pub async fn settings_put(
     bytes: Bytes,
 ) -> Result<Response, ApiError> {
     let request: SettingsBody = body(&bytes)?;
-    let mut settings = state.access().state().settings.clone();
-    if let Some(enforced) = request.enforced {
-        settings.enforced = enforced;
-    }
-    if let Some(fallback) = request.fallback {
-        settings.fallback = fallback;
-    }
-    if let Some(inferred) = request.inferred {
-        settings.inferred = inferred;
-    }
-    if let Some(create) = request.users_create_workspaces {
-        settings.users_create_workspaces = create;
-    }
-    change(
+    // The fields given only: the others are those the change applies to (C-1001).
+    let patch = SettingsPatch {
+        enforced: request.enforced,
+        fallback: request.fallback,
+        inferred: request.inferred,
+        users_create_workspaces: request.users_create_workspaces,
+        ..SettingsPatch::default()
+    };
+    let response = change(
         &state,
         &authenticated,
-        Change::Settings(settings),
+        Change::Settings(patch),
         request.reason,
     )
-    .await
+    .await?;
+    state.prepare_support_sets();
+    Ok(response)
 }
 
 #[derive(Deserialize, utoipa::ToSchema)]
@@ -374,24 +381,22 @@ pub async fn user_put(
     bytes: Bytes,
 ) -> Result<Response, ApiError> {
     let request: UserBody = body(&bytes)?;
-    let password_hash = match request.password {
-        None => None,
-        Some(password) => {
-            let access = state.clone();
-            Some(
-                tokio::task::spawn_blocking(move || access.access().password_hash(&password))
-                    .await
-                    .map_err(|error| ApiError::internal(error.to_string()))??,
-            )
-        }
-    };
-    let change_user = Change::PutUser {
-        name,
-        admin: request.admin,
-        roles: request.roles,
-        password_hash,
-    };
-    change(&state, &authenticated, change_user, request.reason).await
+    // Authorised before the password is hashed (Argon2 holds ~19 MiB for tens of ms).
+    let by = requester(&state, &authenticated).await?;
+    let access = state.clone();
+    let who = by.clone();
+    let change_user = tokio::task::spawn_blocking(move || {
+        access.access().put_user(
+            &who,
+            name,
+            request.admin,
+            request.roles,
+            request.password.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    apply_by(&state, by, change_user, request.reason).await
 }
 
 #[utoipa::path(delete, path = "/api/v1/access/users/{name}", tag = "access", params(("name" = String, Path), ("reason" = String, Query, description = "Why (required)")),
@@ -624,6 +629,7 @@ pub async fn login(
         Err(nrese_store::access::AccessError::Throttled(message)) => {
             Err(ApiError::too_many_requests(message))
         }
+        Err(nrese_store::access::AccessError::Busy(message)) => Err(ApiError::busy(message)),
         Err(_) => Err(ApiError::unauthorized("wrong user name or password")),
     }
 }
@@ -647,7 +653,7 @@ pub async fn logout(
     }
 }
 
-#[utoipa::path(get, path = "/api/v1/queries", tag = "queries",
+#[utoipa::path(get, path = "/api/v1/saved-queries", tag = "queries",
     responses((status = 200, description = "The saved queries the requester may read, by space and name", body = Vec<nrese_store::access::SavedQuery>)))]
 /// The saved queries in the spaces the requester reads: its personal space, those shared
 /// with it, its workspaces (administrators: all).
@@ -659,7 +665,7 @@ pub async fn saved_queries(
     Ok(Json(state.access().saved_queries(&by)).into_response())
 }
 
-#[utoipa::path(get, path = "/api/v1/queries/{space}/{name}", tag = "queries",
+#[utoipa::path(get, path = "/api/v1/saved-queries/{space}/{name}", tag = "queries",
     params(("space" = String, Path, description = "A personal space (`~alice`) or a workspace"), ("name" = String, Path)),
     responses((status = 200, description = "The saved query", body = nrese_store::access::SavedQuery),
         (status = 404, description = "None the requester may read", body = crate::http::openapi::Problem)))]
@@ -673,7 +679,7 @@ pub async fn saved_query(
     Ok(Json(state.access().saved_query(&by, &space, &name)?).into_response())
 }
 
-#[utoipa::path(put, path = "/api/v1/queries/{space}/{name}", tag = "queries",
+#[utoipa::path(put, path = "/api/v1/saved-queries/{space}/{name}", tag = "queries",
     params(("space" = String, Path, description = "A personal space (`~alice`) or a workspace"), ("name" = String, Path, description = "Letters, digits, `.`, `_`, `-`")),
     request_body = nrese_store::access::QueryDraft,
     responses((status = 200, description = "Saved", body = nrese_store::access::SavedQuery),
@@ -706,7 +712,7 @@ pub async fn saved_query_put(
     Ok(Json(saved).into_response())
 }
 
-#[utoipa::path(delete, path = "/api/v1/queries/{space}/{name}", tag = "queries",
+#[utoipa::path(delete, path = "/api/v1/saved-queries/{space}/{name}", tag = "queries",
     params(("space" = String, Path), ("name" = String, Path)),
     responses((status = 204, description = "Removed"),
         (status = 403, description = "Not an editor or owner of the space", body = crate::http::openapi::Problem),

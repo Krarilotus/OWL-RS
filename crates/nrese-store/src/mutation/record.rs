@@ -1,4 +1,4 @@
-use nrese_core::ReasonerRunStatus;
+use nrese_reasoner::ReasonerRunStatus;
 use nrese_reasoner::RejectExplanation;
 
 use super::attribution::RejectAttribution;
@@ -15,6 +15,8 @@ pub struct ReasoningRunRecord {
     pub inferred_inserted: u64,
     pub inferred_deleted: u64,
     pub consistency_violations: u64,
+    /// Their list stopped at its memory budget: `consistency_violations` is a lower bound.
+    pub consistency_violations_at_least: bool,
     pub rounds: usize,
     pub elapsed_micros: u64,
     pub primary_reject: Option<RejectExplanation>,
@@ -23,6 +25,8 @@ pub struct ReasoningRunRecord {
     /// [`crate::reasoning::MAX_REPORTED_DIAGNOSTICS`]), and how many there are.
     pub diagnostics: Vec<OntologyDiagnostic>,
     pub diagnostics_total: usize,
+    /// What the maintenance did, in counts.
+    pub work: nrese_reasoner::delta::policy::Counts,
 }
 
 impl ReasoningRunRecord {
@@ -43,12 +47,14 @@ impl ReasoningRunRecord {
             inferred_inserted: report.inferred_inserted,
             inferred_deleted: report.inferred_deleted,
             consistency_violations: report.violations as u64,
+            consistency_violations_at_least: report.violations_at_least,
             rounds: report.rounds,
             elapsed_micros: u64::try_from(report.elapsed.as_micros()).unwrap_or(u64::MAX),
             primary_reject,
             commit_attribution,
             diagnostics: report.diagnostics.clone(),
             diagnostics_total: report.diagnostics_total,
+            work: report.work.clone(),
         }
     }
 

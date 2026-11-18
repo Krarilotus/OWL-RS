@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::sync::OnceLock;
 
 use nrese_engine::{
-    EncodedQuad, EncodedTriple, Engine, EngineConfig, GraphSelector, QuadPattern, ReadModel,
+    Count, EncodedQuad, EncodedTriple, Engine, EngineConfig, GraphSelector, QuadPattern, ReadModel,
     Snapshot, TermId, Transaction, quad::Permutation,
 };
 use nrese_rdf::NamedNode;
@@ -62,6 +62,110 @@ fn scan(snapshot: &Snapshot, model: ReadModel) -> BTreeSet<EncodedQuad> {
     snapshot
         .quads_for_pattern_in(model, &QuadPattern::all())
         .collect()
+}
+
+#[test]
+fn equality_reenabled_after_a_disabled_commit_matches_reopening() {
+    // Spec: a version's reading expands the current version's classes. Removing
+    // a sameAs edge while disabled must split the class after re-enabling, just as
+    // reopening does; an older snapshot must retain its original answers.
+    let dir = tempfile::tempdir().unwrap();
+    let config = EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::open(dir.path(), config.clone()).unwrap();
+    intern_terms(&engine);
+    let (a, b, same_as, p, o) = (id(1), id(2), id(3), id(4), id(5));
+    let edge = EncodedTriple::new(a, same_as, b).in_default_graph();
+    let fact = EncodedTriple::new(a, p, o).in_default_graph();
+    engine.transaction().install(Some(same_as), None);
+    let mut tx = engine.transaction();
+    tx.insert_encoded(edge);
+    tx.insert_encoded(fact);
+    tx.commit().unwrap();
+    let held = engine.snapshot();
+    let before = scan(&held, ReadModel::Materialised);
+    assert!(before.contains(&EncodedTriple::new(b, p, o).in_default_graph()));
+    engine.transaction().install(None, None);
+    let mut tx = engine.transaction();
+    tx.remove_encoded(edge);
+    tx.commit().unwrap();
+    engine.transaction().install(Some(same_as), None);
+    let after = scan(&engine.snapshot(), ReadModel::Materialised);
+    assert_eq!(
+        after,
+        BTreeSet::from([fact]),
+        "the removed edge no longer equates a and b"
+    );
+    assert_eq!(
+        scan(&held, ReadModel::Materialised),
+        before,
+        "held snapshot"
+    );
+    drop(held);
+    drop(engine);
+    let reopened = Engine::open(dir.path(), config).unwrap();
+    reopened.transaction().install(Some(same_as), None);
+    assert_eq!(after, scan(&reopened.snapshot(), ReadModel::Materialised));
+}
+
+#[test]
+fn a_commit_after_its_own_install_publishes_the_installed_reading() {
+    // Spec: a commit given no reading publishes the installed version's, one its own
+    // transaction installed under the writer slot included: never its base's older one.
+    let engine = engine();
+    let same_as = id(3);
+    let mut tx = engine.transaction();
+    tx.install(Some(same_as), None);
+    tx.insert_encoded(triple(1, 4, 5).in_default_graph());
+    tx.commit().unwrap();
+    assert_eq!(engine.equality(), Some(same_as), "the published reading");
+}
+
+#[test]
+fn a_rematerialisation_that_changes_no_statement_installs_its_reading() {
+    // Spec: a rematerialisation installs its rows with the reading it is given. Rows that
+    // differ from the stored ones go in with a new revision, even where the old stack reads
+    // as them; the same rows take the reading alone, without one (a store whose reasoning
+    // changes only how its stack is read). Over the class `a sameAs b`, `a` representing it:
+    // stored compactly and read by `sameAs`, `a p o` stands for `b p o` too.
+    let engine = engine();
+    let (a, b, same_as, p, o) = (1, 2, 3, 4, 5);
+    let compact = [
+        triple(a, p, o),
+        triple(a, same_as, a),
+        triple(b, same_as, a),
+    ];
+    let expanded = [
+        triple(a, p, o),
+        triple(b, p, o),
+        triple(a, same_as, a),
+        triple(a, same_as, b),
+        triple(b, same_as, a),
+        triple(b, same_as, b),
+    ];
+    let by_same_as = Some(id(same_as));
+    // (the rows, their reading, what a reader reads, whether the rows change)
+    let steps: [(&[EncodedTriple], _, &[EncodedTriple], bool); 4] = [
+        (&compact, by_same_as, &expanded, true),
+        (&expanded, None, &expanded, true),
+        (&compact, None, &compact, true),
+        (&compact, by_same_as, &expanded, false),
+    ];
+    let mut revision = engine.snapshot().revision();
+    for (step, (rows, reading, reads, changes)) in steps.into_iter().enumerate() {
+        let finished = engine
+            .rematerialisation()
+            .finish_held(rows.to_vec(), reading, None);
+        let summary = finished.unwrap().summary();
+        let answer = scan(&engine.snapshot(), ReadModel::Materialised);
+        let entailed: BTreeSet<_> = reads.iter().map(|t| t.in_default_graph()).collect();
+        assert_eq!(answer, entailed, "step {step}: the answer");
+        revision += u64::from(changes);
+        assert_eq!(summary.revision, revision, "step {step}: the revision");
+        assert_eq!(engine.equality(), reading, "step {step}: the reading");
+    }
 }
 
 #[test]
@@ -209,7 +313,7 @@ fn remove_matching_retracts_asserted_statements_only() {
     let mut tx = engine.transaction();
     tx.insert_encoded(triple(1, 2, 3).in_default_graph());
     tx.insert_inferred(triple(1, 2, 4));
-    assert_eq!(tx.remove_matching(&QuadPattern::all()), 1);
+    assert_eq!(tx.remove_matching(&QuadPattern::all()).unwrap(), 1);
     tx.commit().expect("commit");
     let snapshot = engine.snapshot();
     assert_eq!(MODELS.map(|model| snapshot.len_in(model)), [1, 0, 1]);
@@ -391,7 +495,7 @@ fn assert_snapshot(snapshot: &Snapshot, model: &Model, context: &str) {
                 .collect();
             assert_eq!(
                 snapshot.count_in(read_model, &pattern),
-                expected.len() as u64,
+                Count::Exact(expected.len() as u64),
                 "{context}: count {read_model:?} {pattern:?}"
             );
             for permutation in Permutation::ALL {
@@ -424,7 +528,8 @@ fn assert_snapshot(snapshot: &Snapshot, model: &Model, context: &str) {
                 if position == 4 {
                     continue;
                 }
-                let (low, high) = (id(3), id(10));
+                // Inside the generated terms (`TERMS`): some quads match, `id(0)` is excluded.
+                let (low, high) = (id(1), id(2));
                 let in_range: Vec<_> = sorted
                     .iter()
                     .filter(|q| (low..=high).contains(&key(permutation, q)[position]))
@@ -462,6 +567,9 @@ fn assert_transaction(tx: &Transaction<'_>, model: &Model, context: &str) {
         |m, p| tx.quads_for_pattern_in(m, p).collect(),
         context,
     );
+    // The pending snapshot reads the transaction's changes in its own stacks: its sorted
+    // and range scans see the same quads, whichever stacks hold them now.
+    assert_snapshot(&tx.pending_snapshot(), model, &format!("{context} pending"));
 }
 
 /// Runs `steps` random transactions against `engine`, committing most and aborting some.
@@ -504,7 +612,7 @@ fn both_stacks_survive_checkpoints_and_reopening() {
     let mut rng = Rng(fuzz(99));
     let mut committed = Model::default();
     for round in 0..6 {
-        let engine = Engine::open(dir.path(), config).expect("open");
+        let engine = Engine::open(dir.path(), config.clone()).expect("open");
         assert_eq!(
             intern_terms(&engine),
             (0..TERM_COUNT).map(id).collect::<Vec<_>>()
@@ -515,4 +623,557 @@ fn both_stacks_survive_checkpoints_and_reopening() {
             engine.checkpoint().expect("checkpoint");
         }
     }
+}
+
+/// A snapshot restricted to a subset of its inferred statements reads that subset alone,
+/// in every read path, whichever side of the split names it; the whole snapshot is
+/// unchanged.
+#[test]
+fn inferred_subsets_restrict_every_read() {
+    use nrese_engine::InferredSubset;
+    let engine = engine();
+    let mut tx = engine.transaction();
+    assert!(tx.insert_encoded(triple(1, 2, 3).in_default_graph()));
+    let inferred: Vec<EncodedQuad> = (4..10)
+        .map(|o| triple(1, 2, o).in_default_graph())
+        .collect();
+    for quad in &inferred {
+        assert!(tx.insert_inferred(EncodedTriple::new(
+            quad.subject,
+            quad.predicate,
+            quad.object
+        )));
+    }
+    tx.commit().expect("commit");
+    let whole = engine.snapshot();
+    let (kept, hidden) = inferred.split_at(2);
+    for subset in [
+        InferredSubset::Only(kept.to_vec()),
+        InferredSubset::Without(hidden.to_vec()),
+    ] {
+        let restricted = whole.with_inferred_subset(subset);
+        let expected: BTreeSet<EncodedQuad> = kept.iter().copied().collect();
+        assert_eq!(scan(&restricted, ReadModel::Inferred), expected);
+        assert_eq!(restricted.len_in(ReadModel::Inferred), 2);
+        let pattern = QuadPattern {
+            subject: Some(id(1)),
+            ..QuadPattern::all()
+        };
+        assert_eq!(
+            restricted.count_in(ReadModel::Materialised, &pattern),
+            Count::Exact(3)
+        );
+        let sorted: Vec<EncodedQuad> = restricted
+            .scan_sorted_in(ReadModel::Materialised, &pattern, Permutation::Spog)
+            .expect("sorted scan")
+            .collect();
+        assert_eq!(sorted.len(), 3);
+        assert!(!restricted.contains_in(ReadModel::Materialised, &hidden[0]));
+        assert!(restricted.contains_in(ReadModel::Materialised, &kept[0]));
+        assert_eq!(restricted.revision(), whole.revision());
+    }
+    assert_eq!(whole.len_in(ReadModel::Inferred), 6);
+}
+
+/// A snapshot with statements added to its inferred stack reads them in every read path,
+/// counts and sorted scans included; the whole snapshot is unchanged.
+#[test]
+fn inferred_additions_are_read_by_that_snapshot_alone() {
+    let engine = engine();
+    let mut tx = engine.transaction();
+    assert!(tx.insert_encoded(triple(1, 2, 3).in_default_graph()));
+    assert!(tx.insert_inferred(EncodedTriple::new(id(1), id(2), id(4))));
+    tx.commit().expect("commit");
+    let whole = engine.snapshot();
+    let added: Vec<EncodedQuad> = (5..8).map(|o| triple(1, 2, o).in_default_graph()).collect();
+    let extended = whole.with_inferred_added(&added);
+    assert_eq!(extended.len_in(ReadModel::Inferred), 4);
+    let pattern = QuadPattern {
+        subject: Some(id(1)),
+        ..QuadPattern::all()
+    };
+    assert_eq!(
+        extended.count_in(ReadModel::Materialised, &pattern),
+        Count::Exact(5)
+    );
+    let sorted: Vec<EncodedQuad> = extended
+        .scan_sorted_in(ReadModel::Materialised, &pattern, Permutation::Spog)
+        .expect("sorted scan")
+        .collect();
+    assert_eq!(sorted.len(), 5);
+    assert!(extended.contains_in(ReadModel::Materialised, &added[0]));
+    assert!(!whole.contains_in(ReadModel::Materialised, &added[0]));
+    assert_eq!(whole.len_in(ReadModel::Inferred), 1);
+    assert_eq!(extended.revision(), whole.revision());
+}
+
+/// A mask of hidden inferred statements carried across a commit by a run per change:
+/// reads see exactly the statements neither hidden nor gone, counts included. What the
+/// masks and views make stays charged until the last of them lets it go.
+#[test]
+fn inferred_masks_stack_across_commits() {
+    use nrese_engine::InferredMask;
+    let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+    let engine = engine();
+    let quad = |o: u64| triple(1, 2, o).in_default_graph();
+    let infer = |tx: &mut Transaction<'_>, o: u64| {
+        let q = quad(o);
+        assert!(tx.insert_inferred(EncodedTriple::new(q.subject, q.predicate, q.object)));
+    };
+    let mut tx = engine.transaction();
+    for o in 4..10 {
+        infer(&mut tx, o);
+    }
+    tx.commit().expect("commit");
+    let first = engine.snapshot();
+    // Hide 6, 7, 8.
+    let first_mask = InferredMask::hiding(&first, &[quad(6), quad(7), quad(8)], &budget).unwrap();
+    let view = first
+        .with_inferred_mask(&first_mask, &budget)
+        .unwrap()
+        .expect("same layout");
+    let seen = |view: &Snapshot| -> Vec<u64> {
+        scan(view, ReadModel::Inferred)
+            .into_iter()
+            .map(|q| (0..TERM_COUNT).find(|&n| id(n) == q.object).unwrap())
+            .collect()
+    };
+    assert_eq!(seen(&view), [4, 5, 9]);
+    assert_eq!(view.len_in(ReadModel::Inferred), 3);
+    // A commit removes 7 (hidden) and 4 (shown) and adds 10 and 11.
+    let mut tx = engine.transaction();
+    for o in [7, 4] {
+        let q = quad(o);
+        assert!(tx.remove_inferred(EncodedTriple::new(q.subject, q.predicate, q.object)));
+    }
+    infer(&mut tx, 10);
+    infer(&mut tx, 11);
+    tx.commit().expect("commit");
+    let second = engine.snapshot();
+    // Now hidden: 6 still, 11 newly; 8 shown again; 7 gone.
+    let mask = first_mask
+        .changed(&second, &[quad(11)], &[quad(8), quad(7)], &budget)
+        .unwrap();
+    assert_eq!(mask.runs(), 2);
+    drop((first_mask, view));
+    let view = second
+        .with_inferred_mask(&mask, &budget)
+        .unwrap()
+        .expect("same layout");
+    assert_eq!(seen(&view), [5, 8, 9, 10]);
+    assert_eq!(view.len_in(ReadModel::Inferred), 4);
+    let pattern = QuadPattern {
+        subject: Some(id(1)),
+        ..QuadPattern::all()
+    };
+    assert_eq!(
+        view.count_in(ReadModel::Inferred, &pattern),
+        Count::Exact(4)
+    );
+    assert!(!view.contains_in(ReadModel::Materialised, &quad(6)));
+    assert!(!view.contains_in(ReadModel::Materialised, &quad(7)));
+    assert!(view.contains_in(ReadModel::Materialised, &quad(8)));
+    let sorted: Vec<EncodedQuad> = view
+        .scan_sorted_in(ReadModel::Inferred, &pattern, Permutation::Spog)
+        .expect("sorted scan")
+        .collect();
+    assert_eq!(sorted.len(), 4);
+    // The first run is the second mask's too: still charged, as the view over it is.
+    assert!(budget.used() > mask.charged());
+    drop(mask);
+    assert!(budget.used() > 0);
+    drop(view);
+    assert_eq!(budget.used(), 0);
+}
+
+/// A canonical view is an exact delta over the asserted stack (`index/run.rs`): a
+/// named-graph statement it renames onto one that is asserted too is one statement, which
+/// every read counts once, while the stored snapshot keeps both (review B-201: the renamed
+/// statement was inserted again, so counts, the length and group counts found two where a
+/// scan found one).
+#[test]
+fn a_canonical_view_counts_a_statement_renamed_onto_an_asserted_one_once() {
+    let engine = engine();
+    let (rep, alias, same_as, p, o, g) = (id(1), id(2), id(3), id(4), id(5), id(10));
+    let mut tx = engine.transaction();
+    // The class's statements in the default graph: the alias's marker, and the
+    // representative's own `sameAs`, which canonical reads give once and expanding reads
+    // give for every pair of identities.
+    assert!(tx.insert_inferred(EncodedTriple::new(alias, same_as, rep)));
+    assert!(tx.insert_inferred(EncodedTriple::new(rep, same_as, rep)));
+    for subject in [alias, rep] {
+        assert!(tx.insert_encoded(EncodedQuad::new(subject, p, o, g)));
+    }
+    tx.commit().expect("commit");
+    engine.transaction().install(Some(same_as), None);
+    let stored = engine.snapshot();
+    let canonical = stored.with_canonical_equality();
+    let in_g = QuadPattern::in_graph(g);
+    let named = QuadPattern {
+        graph: GraphSelector::AnyNamed,
+        ..QuadPattern::all()
+    };
+    // Canonical reads are those with inferred statements (asserted ones read as stored).
+    let model = ReadModel::Materialised;
+    let read: Vec<_> = canonical.quads_for_pattern_in(model, &in_g).collect();
+    assert_eq!(read, [EncodedQuad::new(rep, p, o, g)]);
+    assert_eq!(
+        canonical.count_in(model, &in_g),
+        Count::Exact(1),
+        "count in the graph"
+    );
+    assert_eq!(
+        canonical.count_in(model, &named),
+        Count::Exact(1),
+        "named graphs"
+    );
+    // What canonical reads see: the named statement and `rep sameAs rep`, nothing expanded;
+    // the inferred `alias sameAs rep` is held but not visible, so the length, which counts
+    // what the stacks hold, is one more (PR #65; PR #70).
+    let all = QuadPattern::all();
+    assert_eq!(
+        canonical.quads_for_pattern_in(model, &all).count(),
+        2,
+        "scan"
+    );
+    assert_eq!(canonical.count_in(model, &all), Count::Exact(2), "count");
+    assert_eq!(canonical.len_in(model), 3, "held");
+    // Expanding reads see more than is held: both named statements and `sameAs` between
+    // every pair of the two identities, of the four held.
+    assert_eq!(
+        stored.count_in(model, &all),
+        Count::Exact(6),
+        "expanded count"
+    );
+    assert_eq!(stored.len_in(model), 4, "held, expanding");
+    let budget = nrese_exec::Budget::unlimited();
+    assert_eq!(
+        canonical
+            .group_counts_in(model, &in_g, Permutation::Gspo, &budget)
+            .expect("an unlimited budget")
+            .map(|groups| groups.to_vec()),
+        Some(vec![(rep, 1)]),
+        "subjects counted"
+    );
+    assert_eq!(stored.count_in(model, &in_g), Count::Exact(2), "stored");
+    assert_eq!(stored.quads_for_pattern_in(model, &in_g).count(), 2);
+}
+
+/// A snapshot is empty when reads see nothing, even where its stacks hold quads equality
+/// hides: a subset holding only an alias's marker reads as empty, expanded or canonical
+/// (PR #70: `is_empty` answered from the held length).
+#[test]
+fn equality_subset_emptiness_agrees_with_reads() {
+    let engine = engine();
+    let (rep, alias, same_as) = (id(1), id(2), id(3));
+    let mut tx = engine.transaction();
+    assert!(tx.insert_inferred(EncodedTriple::new(rep, same_as, rep)));
+    assert!(tx.insert_inferred(EncodedTriple::new(alias, same_as, rep)));
+    tx.commit().expect("commit");
+    engine.transaction().install(Some(same_as), None);
+    let marker = EncodedTriple::new(alias, same_as, rep).in_default_graph();
+    let subset = engine
+        .snapshot()
+        .with_inferred_subset(nrese_engine::InferredSubset::Only(vec![marker]));
+    let (all, model) = (QuadPattern::all(), ReadModel::Materialised);
+    for (name, view) in [
+        ("expanding", subset.clone()),
+        ("canonical", subset.with_canonical_equality()),
+    ] {
+        assert_eq!(view.len_in(model), 1, "{name}: held");
+        assert_eq!(view.quads_for_pattern_in(model, &all).count(), 0, "{name}");
+        assert_eq!(view.count_in(model, &all), Count::Exact(0), "{name}");
+        assert!(view.is_empty(), "{name}");
+    }
+    assert!(!engine.snapshot().is_empty(), "the whole class reads");
+}
+
+/// Whether a read under equality finds a first quad makes none of a class's copies: over a
+/// class of 301 identities, a snapshot reading within 256 KiB isn't empty and refused
+/// nothing (PR #70: existence reserved every copy of `rep sameAs rep` first, so the
+/// read was refused and the snapshot looked empty).
+#[test]
+fn emptiness_under_equality_makes_no_copies() {
+    let engine = engine();
+    let mut tx = engine.transaction();
+    let terms: Vec<TermId> = (0..=301)
+        .map(|n| {
+            let iri = NamedNode::new_unchecked(format!("http://example.com/class/{n}"));
+            tx.intern(iri.as_ref().into())
+        })
+        .collect();
+    let (same_as, rep, aliases) = (terms[0], terms[1], &terms[2..]);
+    assert!(tx.insert_inferred(EncodedTriple::new(rep, same_as, rep)));
+    for &alias in aliases {
+        assert!(tx.insert_inferred(EncodedTriple::new(alias, same_as, rep)));
+    }
+    tx.commit().expect("commit");
+    engine.transaction().install(Some(same_as), None);
+    let view = engine
+        .snapshot()
+        .reading_within(std::sync::Arc::new(nrese_exec::Budget::new(256 << 10)))
+        .expect("a reader's budget");
+    assert!(view.exists_in(ReadModel::Materialised, &QuadPattern::all()));
+    // Inferred reads show a copy only where it isn't asserted, so they look at the copies:
+    // the first shown one answers.
+    assert!(view.exists_in(ReadModel::Inferred, &QuadPattern::all()));
+    assert!(!view.is_empty());
+    assert!(view.read_refused().is_none(), "nothing refused");
+}
+
+/// Columns of both stacks, merged, come in the order [`Snapshot::scan_sorted_in`] yields
+/// their quads, or not at all (the caller then reads quads): merged on the projected
+/// columns alone, rows whose order an unprojected column decides came out by the
+/// projected ones (review B-202). A projection that holds every varying column up to its
+/// last keeps the column read, through both entry points.
+#[test]
+fn merged_columns_keep_the_scan_order_or_are_refused() {
+    let engine = engine();
+    let (s1, s2, p, o1, o100) = (id(1), id(2), id(4), id(5), id(9));
+    let mut tx = engine.transaction();
+    assert!(tx.insert_encoded(EncodedTriple::new(s1, p, o100).in_default_graph()));
+    assert!(tx.insert_inferred(EncodedTriple::new(s2, p, o1)));
+    tx.commit().expect("commit");
+    let snapshot = engine.snapshot();
+    let model = ReadModel::Materialised;
+    let all = QuadPattern::all();
+    // In subject order the objects are o100, o1: the subject, not projected, decides.
+    let scanned: Vec<u64> = snapshot
+        .scan_sorted_in(model, &all, Permutation::Spog)
+        .expect("sorted scan")
+        .map(|q| q.object.raw())
+        .collect();
+    assert_eq!(scanned, [o100.raw(), o1.raw()]);
+    let budget = nrese_exec::Budget::unlimited();
+    fn columns(
+        scanned: Result<Option<nrese_engine::ScanColumns<'_>>, nrese_exec::BudgetExceeded>,
+    ) -> Option<Vec<Vec<u64>>> {
+        scanned
+            .expect("an unlimited budget")
+            .map(|columns| columns.into_parts().0)
+    }
+    let all_columns =
+        columns(snapshot.scan_columns_in(model, &all, Permutation::Spog, &[2], &budget));
+    assert!(
+        all_columns.as_ref().is_none_or(|c| c[0] == scanned),
+        "columns {all_columns:?}, scan {scanned:?}"
+    );
+    let ranged = columns(snapshot.scan_range_columns_in(
+        model,
+        &all,
+        Permutation::Spog,
+        s1,
+        s2,
+        &[2],
+        &budget,
+    ));
+    assert!(
+        ranged.as_ref().is_none_or(|c| c[0] == scanned),
+        "range columns {ranged:?}, scan {scanned:?}"
+    );
+    // The predicate bound, the object is the first varying column: merged on it.
+    let by_predicate = QuadPattern {
+        predicate: Some(p),
+        ..QuadPattern::all()
+    };
+    let in_order = vec![vec![o1.raw(), o100.raw()]];
+    assert_eq!(
+        columns(snapshot.scan_columns_in(model, &by_predicate, Permutation::Posg, &[2], &budget)),
+        Some(in_order.clone())
+    );
+    assert_eq!(
+        columns(snapshot.scan_range_columns_in(
+            model,
+            &by_predicate,
+            Permutation::Posg,
+            o1,
+            o100,
+            &[2],
+            &budget,
+        )),
+        Some(in_order)
+    );
+}
+
+/// What `Snapshot::asserted_identity` says (P2-C1; DUR's and NUM's conditions): a commit of
+/// inferred statements only keeps it, as does a restricted view; a commit of asserted
+/// statements gives a new one, as does a transaction's pending state, even unchanged, and
+/// `CommitSummary::asserted` is the published snapshot's.
+#[test]
+fn the_asserted_identity_follows_the_asserted_statements_only() {
+    let engine = engine();
+    let first = engine.snapshot().asserted_identity();
+    let mut tx = engine.transaction();
+    tx.insert_inferred(triple(1, 2, 3));
+    let summary = tx.commit().expect("commit");
+    assert_eq!(
+        engine.snapshot().asserted_identity(),
+        first,
+        "inferred only"
+    );
+    assert_eq!(summary.asserted, first);
+    let mut tx = engine.transaction();
+    assert_ne!(
+        tx.pending_snapshot().asserted_identity(),
+        first,
+        "pending, unchanged"
+    );
+    assert!(tx.insert_encoded(EncodedQuad::new(id(4), id(5), id(6), TermId::DEFAULT_GRAPH)));
+    let pending = tx.pending_snapshot().asserted_identity();
+    assert_ne!(pending, first, "pending");
+    let summary = tx.commit().expect("commit");
+    let after = engine.snapshot().asserted_identity();
+    assert_ne!(after, first, "an asserted commit");
+    assert_ne!(after, pending, "the committed state isn't the pending view");
+    assert_eq!(
+        summary.asserted, after,
+        "the summary names what was published"
+    );
+    let nothing = engine.transaction().commit().expect("commit");
+    assert_eq!(nothing.asserted, after, "a commit that changes nothing");
+}
+
+/// Spec (`Transaction::pending_over`'s contract; review P2B0-F1, 8 Nov): the pending state as a
+/// reader of a restricted view reads it is the view's asserted statements with the pending
+/// asserted changes, and the view's inferred statements less those the pending changes delete
+/// or assert and those `hidden` names. The pending inferred inserts aren't in it.
+///
+/// - Input: a base asserting `a` and inferring `i1`..`i5`; a view without `i5`; a transaction
+///   that deletes `i1` as inferred and asserts it too (two removal sources of one statement),
+///   asserts `i2`, infers `n`; `hidden` naming `i2` (asserted as well), `i3`, `i5` (not in the
+///   view) and `x` (in nothing).
+/// - Expected: asserted `a`, `i1`, `i2`; inferred `i4` alone; the view itself unchanged.
+#[test]
+fn a_pending_read_over_a_view_drops_every_removed_inference_once() {
+    use nrese_engine::InferredSubset;
+    let engine = engine();
+    let a = triple(1, 2, 3).in_default_graph();
+    let inferred: Vec<EncodedTriple> = (4..9).map(|o| triple(1, 2, o)).collect();
+    let [i1, i2, i3, i4, i5] = [0, 1, 2, 3, 4].map(|n| inferred[n].in_default_graph());
+    let mut tx = engine.transaction();
+    assert!(tx.insert_encoded(a));
+    for &statement in &inferred {
+        assert!(tx.insert_inferred(statement));
+    }
+    tx.commit().expect("commit");
+
+    let view = engine
+        .snapshot()
+        .with_inferred_subset(InferredSubset::Without(vec![i5]));
+    let mut tx = engine.transaction();
+    assert!(tx.remove_inferred(inferred[0]), "i1 deleted as inferred");
+    assert!(tx.insert_encoded(i1), "i1 asserted too");
+    assert!(tx.insert_encoded(i2), "i2 asserted");
+    let n = triple(1, 2, 9);
+    assert!(tx.insert_inferred(n), "n inferred, pending");
+    let x = triple(9, 9, 9).in_default_graph();
+    let pending = tx.pending_over(&view, &[i2, i3, i5, x]);
+
+    assert_eq!(
+        scan(&pending, ReadModel::Asserted),
+        BTreeSet::from([a, i1, i2]),
+        "the view's asserted statements with the pending changes"
+    );
+    assert_eq!(
+        scan(&pending, ReadModel::Inferred),
+        BTreeSet::from([i4]),
+        "the view's inferred statements less those deleted, asserted or hidden"
+    );
+    assert_eq!(
+        MODELS.map(|model| pending.len_in(model)),
+        [4, 3, 1],
+        "materialised, asserted, inferred: the counts kept"
+    );
+    assert!(
+        !pending.contains(&n.in_default_graph()),
+        "no pending inference"
+    );
+    assert!(!pending.contains(&x));
+    assert_eq!(
+        scan(&view, ReadModel::Inferred),
+        BTreeSet::from([i1, i2, i3, i4]),
+        "the view unchanged"
+    );
+    assert_eq!(scan(&view, ReadModel::Asserted), BTreeSet::from([a]));
+}
+
+/// Spec (the transaction's read methods' docs; review P2B0-F2, 8 Nov): a transaction's named
+/// graphs and its pending inferred changes include what it has done so far.
+///
+/// - Input: a base asserting in graphs `g9` and `g10` and the default graph, inferring `i`; a
+///   transaction that empties `g10`, fills `g11`, asserts and retracts in `g12`, asserts one
+///   more statement in `g9` (a graph both the base and the pending inserts name) and one in
+///   `g8` (an id before every base graph's: review P2B1-F2, so the order and the single
+///   listing are the method's work); deletes `i`, infers `n`, infers `m` and then asserts it,
+///   and tries to infer an asserted statement.
+/// - Expected: named graphs `g8`, `g9` and `g11`, in id order, each once, and only those
+///   contain statements (the default graph is not a named graph); inferred pending: inserted
+///   `n` and `m`, deleted `i`, counted before the commit; the commit drops `m` from the
+///   inferred stack.
+#[test]
+fn a_transaction_reads_its_own_graphs_and_pending_inferences() {
+    let engine = engine();
+    let in_graph = |o: u64, g: u64| EncodedQuad::new(id(1), id(2), id(o), id(g));
+    let asserted = triple(1, 2, 5).in_default_graph();
+    let i = triple(1, 2, 6);
+    let mut tx = engine.transaction();
+    assert!(tx.insert_encoded(in_graph(3, 9)));
+    assert!(tx.insert_encoded(in_graph(4, 10)));
+    assert!(tx.insert_encoded(asserted));
+    assert!(tx.insert_inferred(i));
+    tx.commit().expect("commit");
+
+    let mut tx = engine.transaction();
+    assert!(tx.remove_encoded(in_graph(4, 10)), "g10 emptied");
+    assert!(tx.insert_encoded(in_graph(7, 11)), "g11 filled");
+    assert!(tx.insert_encoded(in_graph(8, 12)));
+    assert!(tx.remove_encoded(in_graph(8, 12)), "g12 back to empty");
+    assert!(
+        tx.insert_encoded(in_graph(14, 9)),
+        "g9 named by a pending insert too"
+    );
+    assert!(
+        tx.insert_encoded(in_graph(16, 8)),
+        "g8, before every base graph"
+    );
+    assert!(id(8) < id(9), "the fixture's ids are in order");
+    assert_eq!(
+        tx.named_graphs(),
+        vec![id(8), id(9), id(11)],
+        "the non-empty named graphs, in id order, each once"
+    );
+    assert_eq!(
+        [8, 9, 10, 11, 12].map(|g| tx.contains_named_graph(id(g))),
+        [true, true, false, true, false],
+        "g8, g9, g10, g11, g12"
+    );
+    assert!(
+        !tx.contains_named_graph(TermId::DEFAULT_GRAPH),
+        "the default graph is not a named graph"
+    );
+
+    let (n, m) = (triple(1, 2, 13), triple(1, 2, 15));
+    assert!(tx.remove_inferred(i));
+    assert!(tx.insert_inferred(n));
+    assert!(tx.insert_inferred(m));
+    assert!(tx.insert_encoded(m.in_default_graph()), "m asserted");
+    assert!(
+        !tx.insert_inferred(EncodedTriple::new(id(1), id(2), id(5))),
+        "an asserted statement is never inferred"
+    );
+    assert_eq!(tx.inferred_pending(), (2, 1), "inserted n and m, deleted i");
+    assert_eq!(
+        tx.inferred_inserted().collect::<BTreeSet<_>>(),
+        BTreeSet::from([n, m])
+    );
+    assert_eq!(
+        tx.inferred_deleted().collect::<BTreeSet<_>>(),
+        BTreeSet::from([i])
+    );
+    let summary = tx.commit().expect("commit");
+    assert_eq!(
+        (summary.inferred_inserted, summary.inferred_deleted),
+        (1, 1),
+        "m asserted, so not inferred: {summary:?}"
+    );
 }

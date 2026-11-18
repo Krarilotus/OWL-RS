@@ -1,5 +1,5 @@
 //! A SPARQL 1.1 evaluator written straight from the specification's algebra (§18), as the
-//! reference of NRESE's differential tests (docs/plan/2026-10-01-oxigraph-migration.md).
+//! reference of NRESE's differential tests (docs/design/rdf-bundle.md).
 //!
 //! It evaluates the algebra the way §18.5 and §18.6 define it: solutions as maps from
 //! variables to terms, multisets as lists, every operator on the whole of its inputs, no
@@ -41,7 +41,7 @@ use nrese_sparql_syntax::term::{
     GraphNamePattern, GroundQuadPattern, GroundTermPattern, NamedNodePattern,
     QuadPattern as PatternQuad, TermPattern, TriplePattern,
 };
-use nrese_sparql_syntax::{GraphUpdateOperation, Query, Update};
+use nrese_sparql_syntax::{GraphUpdateOperation, Query, TransferOp, Update};
 
 /// A dataset: quads, the default graph's with [`GraphName::DefaultGraph`].
 #[derive(Debug, Clone, Default)]
@@ -277,6 +277,30 @@ impl Dataset {
                         GraphTarget::AllGraphs => false,
                     });
                 }
+                // SPARQL 1.1 Update §3.2.3–3.2.5: the statements stored in `from`, whatever the
+                // options a WHERE clause reads with; a graph to itself changes nothing.
+                GraphUpdateOperation::Transfer { op, from, to, .. } => {
+                    let (from, to) = (graph_of(from), graph_of(to));
+                    if from == to {
+                        continue;
+                    }
+                    let copies: Vec<Quad> = self
+                        .quads
+                        .iter()
+                        .filter(|q| q.graph_name == from)
+                        .map(|q| Quad {
+                            graph_name: to.clone(),
+                            ..q.clone()
+                        })
+                        .collect();
+                    if *op != TransferOp::Add {
+                        self.quads.retain(|q| q.graph_name != to);
+                    }
+                    if *op == TransferOp::Move {
+                        self.quads.retain(|q| q.graph_name != from);
+                    }
+                    self.quads.extend(copies);
+                }
             }
         }
         Ok(())
@@ -336,9 +360,12 @@ fn in_scope(pattern: &GraphPattern, out: &mut Vec<Variable>) {
             term(subject, out);
             term(object, out);
         }
-        GraphPattern::Join { left, right }
-        | GraphPattern::LeftJoin { left, right, .. }
-        | GraphPattern::Union { left, right } => {
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            for input in inputs {
+                in_scope(input, out);
+            }
+        }
+        GraphPattern::LeftJoin { left, right, .. } => {
             in_scope(left, out);
             in_scope(right, out);
         }
@@ -349,11 +376,11 @@ fn in_scope(pattern: &GraphPattern, out: &mut Vec<Variable>) {
             }
             in_scope(inner, out);
         }
-        GraphPattern::Extend {
-            inner, variable, ..
-        } => {
+        GraphPattern::Extend { inner, bindings } => {
             in_scope(inner, out);
-            push(variable, out);
+            for (variable, _) in bindings {
+                push(variable, out);
+            }
         }
         GraphPattern::Values { variables, .. } | GraphPattern::Project { variables, .. } => {
             for v in variables {
@@ -494,7 +521,17 @@ impl<'d> Context<'d> {
             ),
             Some(specification) => {
                 let default = match specification.default_graph_graphs() {
-                    None => merge(dataset, None),
+                    // Every graph, or every graph but those it leaves out.
+                    None => match specification.excluded_default_graphs().unwrap_or_default() {
+                        [] => merge(dataset, None),
+                        left_out => {
+                            let graphs: Vec<GraphName> = std::iter::once(GraphName::DefaultGraph)
+                                .chain(all.iter().cloned().map(GraphName::from))
+                                .filter(|graph| !left_out.contains(graph))
+                                .collect();
+                            merge(dataset, Some(&graphs))
+                        }
+                    },
                     Some(graphs) => merge(dataset, Some(graphs)),
                 };
                 // A store has a named graph while it holds a statement: a graph the
@@ -590,10 +627,14 @@ impl<'d> Context<'d> {
                 }
                 out
             }
-            GraphPattern::Join { left, right } => {
-                let left = self.eval(left, graph, outer)?;
-                let right = self.eval(right, graph, outer)?;
-                join(&left, &right)
+            GraphPattern::Join { inputs } => {
+                // From the left, as the definition joins two at a time.
+                let mut out = vec![Solution::default()];
+                for input in inputs {
+                    let right = self.eval(input, graph, outer)?;
+                    out = join(&out, &right);
+                }
+                out
             }
             GraphPattern::LeftJoin {
                 left,
@@ -633,9 +674,11 @@ impl<'d> Context<'d> {
                 }
                 out
             }
-            GraphPattern::Union { left, right } => {
-                let mut out = self.eval(left, graph, outer)?;
-                out.extend(self.eval(right, graph, outer)?);
+            GraphPattern::Union { inputs } => {
+                let mut out = Vec::new();
+                for input in inputs {
+                    out.extend(self.eval(input, graph, outer)?);
+                }
                 out
             }
             GraphPattern::Graph { name, inner } => {
@@ -669,19 +712,18 @@ impl<'d> Context<'d> {
                 }
                 out
             }
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => {
-                let mut out = Vec::new();
-                for (i, mut s) in self.eval(inner, graph, outer)?.into_iter().enumerate() {
-                    if !s.contains_key(variable)
-                        && let Some(value) = self.value(expression, &s, graph, outer, i as u64)?
-                    {
-                        s.insert(variable.clone(), value);
+            // Each binding as an `Extend` of its own, from the first.
+            GraphPattern::Extend { inner, bindings } => {
+                let mut out = self.eval(inner, graph, outer)?;
+                for (variable, expression) in bindings {
+                    for (i, s) in out.iter_mut().enumerate() {
+                        if !s.contains_key(variable)
+                            && let Some(value) =
+                                self.value(expression, s, graph, outer, i as u64)?
+                        {
+                            s.insert(variable.clone(), value);
+                        }
                     }
-                    out.push(s);
                 }
                 out
             }
@@ -1053,24 +1095,38 @@ impl<'d> Context<'d> {
                 .into_iter()
                 .map(|(s, o)| (o, s))
                 .collect(),
-            PropertyPathExpression::Sequence(a, b) => {
-                let left = self.pairs(a, graph, start, None);
-                let right = self.pairs(b, graph, None, end);
-                let mut out = Vec::new();
-                // One pair per path: a pair two intermediate nodes connect comes twice.
-                for (x, m) in &left {
-                    for (n, y) in &right {
-                        if m == n {
-                            out.push((x.clone(), y.clone()));
+            PropertyPathExpression::Sequence(steps) => {
+                // Step by step, the start bound on the first and the end on the last. One
+                // pair per path: a pair two intermediate nodes connect comes twice.
+                let last = steps.len().saturating_sub(1);
+                let mut out: Option<Vec<(Term, Term)>> = None;
+                for (i, step) in steps.iter().enumerate() {
+                    let from = if i == 0 { start } else { None };
+                    let to = if i == last { end } else { None };
+                    let right = self.pairs(step, graph, from, to);
+                    out = Some(match out {
+                        None => right,
+                        Some(left) => {
+                            let mut joined = Vec::new();
+                            for (x, m) in &left {
+                                for (n, y) in &right {
+                                    if m == n {
+                                        joined.push((x.clone(), y.clone()));
+                                    }
+                                }
+                            }
+                            joined
                         }
-                    }
+                    });
                 }
-                out
+                out.unwrap_or_default()
             }
-            PropertyPathExpression::Alternative(a, b) => {
-                // A UNION: a pair both sides give comes twice.
-                let mut out = self.pairs(a, graph, start, end);
-                out.extend(self.pairs(b, graph, start, end));
+            PropertyPathExpression::Alternative(paths) => {
+                // A UNION: a pair several give comes as often.
+                let mut out = Vec::new();
+                for path in paths {
+                    out.extend(self.pairs(path, graph, start, end));
+                }
                 out
             }
             PropertyPathExpression::NegatedPropertySet(excluded) => graph
@@ -1235,12 +1291,14 @@ fn merge(dataset: &Dataset, graphs: Option<&[GraphName]>) -> Graph {
 
 /// Blank nodes of a pattern are variables no query can name (§18.2.1): they join where
 /// the parser's translation shares them (a path sequence becomes two paths through one),
-/// and no projection lists them.
+/// and no projection lists them. Each is named as it is written, `_:label`: a colon is in
+/// no SPARQL `VARNAME`, so no variable of the query is spelt like one. (The executor's own
+/// made names are `nrese_sparql_syntax::internal`'s; this evaluator keeps its own.)
 fn blank_variable(b: &nrese_sparql_syntax::term::BlankNode) -> Variable {
     Variable::new_unchecked(format!("{BLANK}{}", b.as_str()))
 }
 
-const BLANK: &str = "__blank_";
+const BLANK: &str = "_:";
 
 fn bind_term(
     pattern: &TermPattern,

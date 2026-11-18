@@ -1,0 +1,8 @@
+?s	?p	?o
+<http://e/a>	<http://e/p>	<http://e/z>
+<http://e/a>	<http://e/partOf>	<http://e/b>
+<http://e/a>	<http://e/partOf>	<http://e/c>
+<http://e/b>	<http://e/partOf>	<http://e/c>
+<http://e/p>	<http://www.w3.org/2002/07/owl#inverseOf>	<http://e/q>
+<http://e/partOf>	<http://www.w3.org/1999/02/22-rdf-syntax-ns#type>	<http://www.w3.org/2002/07/owl#TransitiveProperty>
+<http://e/z>	<http://e/q>	<http://e/a>

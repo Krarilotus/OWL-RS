@@ -47,6 +47,10 @@ pub const GRAPHS: Offers<GraphResultFormat> = &[
     ("application/trig", GraphResultFormat::TriG),
     ("application/x-binary-rdf", GraphResultFormat::BinaryRdf),
     ("application/x-turtle", GraphResultFormat::Turtle),
+    // RDF4J's other names for N-Quads and TriG (its RDFFormat registry), as its clients send them.
+    ("text/x-nquads", GraphResultFormat::NQuads),
+    ("text/nquads", GraphResultFormat::NQuads),
+    ("application/x-trig", GraphResultFormat::TriG),
     ("text/plain", GraphResultFormat::NTriples),
 ];
 

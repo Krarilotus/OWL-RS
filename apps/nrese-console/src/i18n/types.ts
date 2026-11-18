@@ -69,6 +69,10 @@ export type AppStrings = {
   queryAcceptLabel: string;
   namedGraphLabel: string;
   noOutput: string;
+  /** Before the `NRESE-Completeness` header of answers not shown to be complete. */
+  incompleteAnswer: string;
+  /** Neither soundness nor completeness is certified; answers may also be incorrect. */
+  uncertifiedAnswer: string;
   searchTitle: string;
   searchHint: string;
   searchPlaceholder: string;

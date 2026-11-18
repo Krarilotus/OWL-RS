@@ -13,12 +13,12 @@ use crate::binary::BinaryParser;
 use crate::blank::BlankNodes;
 use crate::error::{RdfParseError, RdfSyntaxError, TextPosition};
 use crate::format::RdfFormat;
-use crate::input::Lines;
+use crate::input::{Before, Lines};
 use crate::jsonld::JsonLdOptions;
 use crate::jsonld::parser::{JsonLdParser, JsonLdSettings};
 use crate::ntriples::LineParser;
 use crate::rdfxml::{RdfXmlParser, RdfXmlSettings};
-use crate::turtle::split::{Skimmer, directives_before};
+use crate::turtle::split::{Cut, Skim, Skimmer, directives_before};
 use crate::turtle::{TurtleParser, TurtleSettings};
 
 /// How to read a document: its format, and the settings that apply to every format.
@@ -90,10 +90,16 @@ impl RdfParser {
         self
     }
 
-    /// Goes on after a syntax error in Turtle or TriG: the error is returned, the rest of
-    /// its statement (up to the `.` ending it, or the `}` ending its graph block) skipped,
-    /// and the statements after it follow. N-Triples and N-Quads go on after a bad line
-    /// anyway; other formats stop at the first error. A read error always stops.
+    /// Goes on after a syntax error: the error is returned, the statements after it follow.
+    /// Turtle and TriG skip the rest of the statement (up to the `.` ending it, or the `}`
+    /// ending its graph block); RDF/XML skips the rest of the outermost node element the
+    /// error is in, unless the XML isn't well-formed; JSON-LD skips an element of a
+    /// top-level array (or of a top-level object's `@graph` array) that fails to expand,
+    /// unless the JSON is malformed. N-Triples and N-Quads go on after a bad line anyway;
+    /// other formats stop at the first error. A read error always stops. An error the
+    /// document ends with says so ([`RdfParseError::ends_document`]), and where the input
+    /// ended inside a statement (the last line of N-Triples or N-Quads without its line end,
+    /// a Turtle or TriG statement that recovery finds no end of), that it may be cut off.
     pub fn recovering(mut self) -> Self {
         self.recover = true;
         self
@@ -197,6 +203,7 @@ impl RdfParser {
             unchecked: self.unchecked,
             max_depth: self.max_nesting,
             options: self.json_ld.clone(),
+            recover: self.recover,
         }
     }
 
@@ -205,20 +212,31 @@ impl RdfParser {
             base: self.base_iri.clone(),
             blank_nodes: self.blank_nodes.clone(),
             unchecked: self.unchecked,
+            recover: self.recover,
         }
     }
 
     fn wrap<'a, R: Read>(self, inner: Inner<'a, R>) -> QuadParser<'a, R> {
+        // The formats that go on after a syntax error (see `recovering`).
+        let recovers = match self.format {
+            RdfFormat::NTriples | RdfFormat::NQuads => true,
+            RdfFormat::Turtle | RdfFormat::TriG | RdfFormat::RdfXml | RdfFormat::JsonLd => {
+                self.recover
+            }
+            _ => false,
+        };
         QuadParser {
             inner,
             default_graph: self.default_graph,
             without_named_graphs: self.without_named_graphs,
+            recovers,
+            done: false,
         }
     }
 
     /// `bytes` in up to `parts` chunks that parse independently, for parsing in parallel:
     /// N-Triples and N-Quads cut at line ends; Turtle and TriG at statement ends found by
-    /// a skim of the document (exact, see [`crate::turtle::split`]), each chunk starting
+    /// a skim of the document (exact, see `crate::turtle::split`), each chunk starting
     /// with the prefixes and base in force there. With renamed blank nodes, every chunk
     /// names a label alike.
     pub fn split_slice_for_parallel_parsing(
@@ -227,27 +245,11 @@ impl RdfParser {
         parts: usize,
     ) -> Result<Vec<QuadParser<'_, io::Empty>>, RdfParseError> {
         if matches!(self.format, RdfFormat::Turtle | RdfFormat::TriG) {
-            let mut skimmer = Skimmer::new(bytes.len() as u64, parts);
+            let trig = self.format == RdfFormat::TriG;
+            let mut skimmer = Skimmer::new(bytes.len() as u64, parts, trig);
             skimmer.feed(bytes);
             let skim = skimmer.finish();
-            let mut starts = vec![(0, 0, 0)];
-            starts.extend(skim.cuts.iter().copied());
-            let mut parsers = Vec::with_capacity(starts.len());
-            for (i, &(start, line, line_start)) in starts.iter().enumerate() {
-                let end = starts.get(i + 1).map_or(bytes.len() as u64, |s| s.0);
-                let parser = TurtleParser::from_slice(
-                    &bytes[start as usize..end as usize],
-                    self.turtle_settings(),
-                )
-                .for_chunk(
-                    start,
-                    line,
-                    line_start,
-                    &directives_before(&skim, start),
-                )?;
-                parsers.push(self.clone().wrap(Inner::Turtle(parser)));
-            }
-            return Ok(parsers);
+            return self.turtle_chunks(bytes, &skim, &skim.cuts);
         }
         self.line_based()?;
         let bounds = boundaries(bytes.len() as u64, parts, |at| {
@@ -258,10 +260,35 @@ impl RdfParser {
             .windows(2)
             .map(|w| {
                 let (start, end) = (w[0] as usize, w[1] as usize);
-                self.clone()
-                    .parser(Lines::from_slice(&bytes[start..end], w[0]))
+                self.clone().parser(
+                    Lines::from_slice(&bytes[start..end], w[0])
+                        .after(Before::Bytes(&bytes[..start])),
+                )
             })
             .collect())
+    }
+
+    /// Turtle or TriG `bytes` in chunks starting at `cuts` (cuts of `skim`, the skim of
+    /// `bytes`), each starting with the directives in force there.
+    fn turtle_chunks<'b>(
+        &self,
+        bytes: &'b [u8],
+        skim: &Skim,
+        cuts: &[Cut],
+    ) -> Result<Vec<QuadParser<'b, io::Empty>>, RdfParseError> {
+        let mut starts = vec![Cut::START];
+        starts.extend(cuts.iter().copied());
+        let mut parsers = Vec::with_capacity(starts.len());
+        for (i, &cut) in starts.iter().enumerate() {
+            let end = starts.get(i + 1).map_or(bytes.len() as u64, |s| s.offset);
+            let parser = TurtleParser::from_slice(
+                &bytes[cut.offset as usize..end as usize],
+                self.turtle_settings(),
+            )
+            .for_chunk(cut, &directives_before(skim, cut.offset))?;
+            parsers.push(self.clone().wrap(Inner::Turtle(parser)));
+        }
+        Ok(parsers)
     }
 
     /// The file at `path` in up to `parts` chunks that parse independently, each read
@@ -275,7 +302,8 @@ impl RdfParser {
             // The skim reads the file once, in large pieces.
             let mut file = BufReader::with_capacity(1 << 20, File::open(path)?);
             let length = file.get_ref().metadata()?.len();
-            let mut skimmer = Skimmer::new(length, parts);
+            let trig = self.format == RdfFormat::TriG;
+            let mut skimmer = Skimmer::new(length, parts, trig);
             let mut buffer = vec![0_u8; 1 << 20];
             loop {
                 let read = file.read(&mut buffer)?;
@@ -285,20 +313,16 @@ impl RdfParser {
                 skimmer.feed(&buffer[..read]);
             }
             let skim = skimmer.finish();
-            let mut starts = vec![(0, 0, 0)];
+            let mut starts = vec![Cut::START];
             starts.extend(skim.cuts.iter().copied());
             let mut parsers = Vec::with_capacity(starts.len());
-            for (i, &(start, line, line_start)) in starts.iter().enumerate() {
-                let end = starts.get(i + 1).map_or(length, |s| s.0);
+            for (i, &cut) in starts.iter().enumerate() {
+                let end = starts.get(i + 1).map_or(length, |s| s.offset);
                 let mut file = File::open(path)?;
-                file.seek(SeekFrom::Start(start))?;
-                let reader = BufReader::with_capacity(256 * 1024, file).take(end - start);
-                let parser = TurtleParser::from_reader(reader, self.turtle_settings()).for_chunk(
-                    start,
-                    line,
-                    line_start,
-                    &directives_before(&skim, start),
-                )?;
+                file.seek(SeekFrom::Start(cut.offset))?;
+                let reader = BufReader::with_capacity(256 * 1024, file).take(end - cut.offset);
+                let parser = TurtleParser::from_reader(reader, self.turtle_settings())
+                    .for_chunk(cut, &directives_before(&skim, cut.offset))?;
                 parsers.push(self.clone().wrap(Inner::Turtle(parser)));
             }
             return Ok(parsers);
@@ -328,7 +352,9 @@ impl RdfParser {
                 let mut file = File::open(path)?;
                 file.seek(SeekFrom::Start(w[0]))?;
                 let reader = BufReader::with_capacity(256 * 1024, file).take(w[1] - w[0]);
-                Ok(self.clone().parser(Lines::from_reader(reader, w[0])))
+                Ok(self.clone().parser(
+                    Lines::from_reader(reader, w[0]).after(Before::File(path.to_path_buf(), w[0])),
+                ))
             })
             .collect()
     }
@@ -413,118 +439,146 @@ pub struct QuadParser<'a, R: Read> {
     inner: Inner<'a, R>,
     default_graph: GraphName,
     without_named_graphs: bool,
+    /// Whether the format goes on after a syntax error.
+    recovers: bool,
+    /// After an error that stops the document: nothing more.
+    done: bool,
 }
 
 impl<R: Read> QuadParser<'_, R> {
-    /// The next quad, borrowed until the next call; `None` at the end.
+    /// The next quad, borrowed until the next call; `None` at the end. A read error always
+    /// ends the document, and so does a syntax error unless the format goes on after one
+    /// ([`RdfParser::recovering`]), whichever layer found it.
     pub fn next_ref(&mut self) -> Option<Result<QuadRef<'_>, RdfParseError>> {
         let Self {
             inner,
             default_graph,
             without_named_graphs,
+            recovers,
+            done,
         } = self;
-        let (quad, at) = match inner {
-            Inner::Unsupported(format) => {
-                let format = format.take()?;
-                return Some(Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("reading {format} is not implemented yet"),
-                )
-                .into()));
+        if *done {
+            return None;
+        }
+        match next_quad(inner, default_graph, *without_named_graphs) {
+            // The error ends the document if the format or the parser goes no further: it
+            // says so, for a consumer that would otherwise skip it.
+            Some(Err(error)) => {
+                *done = error.ends_document() || !*recovers;
+                Some(Err(error.ending(*done, false)))
             }
-            Inner::RdfXmlSlice(parser) => match parser.advance() {
-                Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
-                Ok(false) => return None,
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::RdfXmlReader(parser) => match parser.advance() {
-                Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
-                Ok(false) => return None,
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::BinarySlice(parser) => match parser.advance() {
-                Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
-                Ok(false) => return None,
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::BinaryReader(parser) => match parser.advance() {
-                Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
-                Ok(false) => return None,
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::JsonLd(parser) => match parser.next_ref()? {
-                Ok(quad) => (quad, TextPosition::default()),
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::JsonLdReader(pending, parser) => {
-                if let Some((mut reader, settings)) = pending.take() {
-                    let mut bytes = Vec::new();
-                    if let Err(error) = reader.read_to_end(&mut bytes) {
-                        return Some(Err(error.into()));
-                    }
-                    *parser = Some(Box::new(JsonLdParser::new(Cow::Owned(bytes), settings)));
-                }
-                match parser.as_mut()?.next_ref()? {
-                    Ok(quad) => (quad, TextPosition::default()),
-                    Err(error) => return Some(Err(error)),
-                }
-            }
-            Inner::N3(parser, current) => match parser.next_n3()? {
-                Ok(quad) => match quad.into_quad() {
-                    Ok(quad) => (current.insert(quad).as_ref(), TextPosition::default()),
-                    Err(quad) => {
-                        return Some(Err(RdfSyntaxError::new(
-                            format!("not RDF (read it with nrese_rdf_io::n3): {quad}"),
-                            TextPosition::default()..TextPosition::default(),
-                        )
-                        .into()));
-                    }
-                },
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::Turtle(parser) => match parser.next_ref()? {
-                Ok(quad) => (quad, TextPosition::default()),
-                Err(error) => return Some(Err(error)),
-            },
-            Inner::Lines { lines, parser } => {
-                // The next line with a statement. A `VERSION` directive (RDF 1.2) has none:
-                // it is checked here and skipped (no statement starts with `VERSION`).
-                let (range, line, offset) = loop {
-                    let range = match lines.next() {
-                        Ok(Some(range)) => range,
-                        Ok(None) => return None,
-                        Err(error) => return Some(Err(error.into())),
-                    };
-                    let text = lines.slice(range.clone());
-                    if !has_statement(text) {
-                        continue;
-                    }
-                    let (line, offset) = lines.position();
-                    if text.trim_ascii_start().starts_with(b"VERSION") {
-                        match parser.parse(text, line, offset) {
-                            Ok(None) => continue,
-                            Ok(Some(_)) => unreachable!("a directive has no statement"),
-                            Err(error) => return Some(Err(error.into())),
-                        }
-                    }
-                    break (range, line, offset);
-                };
-                match parser.parse(lines.slice(range), line, offset) {
-                    Ok(Some(quad)) => (
-                        quad,
-                        TextPosition {
-                            line,
-                            column: 0,
-                            offset,
-                        },
-                    ),
-                    Ok(None) => unreachable!("parsed to a statement above"),
-                    Err(error) => return Some(Err(error.into())),
-                }
-            }
-        };
-        Some(place(quad, default_graph, *without_named_graphs, at))
+            step => step,
+        }
     }
+}
+
+/// The next quad of `inner`, in the graph the settings say.
+fn next_quad<'p, R: Read>(
+    inner: &'p mut Inner<'_, R>,
+    default_graph: &'p GraphName,
+    without_named_graphs: bool,
+) -> Option<Result<QuadRef<'p>, RdfParseError>> {
+    let (quad, at) = match inner {
+        Inner::Unsupported(format) => {
+            let format = format.take()?;
+            return Some(Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("reading {format} is not implemented yet"),
+            )
+            .into()));
+        }
+        Inner::RdfXmlSlice(parser) => match parser.advance() {
+            Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
+            Ok(false) => return None,
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::RdfXmlReader(parser) => match parser.advance() {
+            Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
+            Ok(false) => return None,
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::BinarySlice(parser) => match parser.advance() {
+            Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
+            Ok(false) => return None,
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::BinaryReader(parser) => match parser.advance() {
+            Ok(true) => (parser.current.as_ref()?.as_ref(), TextPosition::default()),
+            Ok(false) => return None,
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::JsonLd(parser) => match parser.next_ref()? {
+            Ok(quad) => (quad, TextPosition::default()),
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::JsonLdReader(pending, parser) => {
+            if let Some((mut reader, settings)) = pending.take() {
+                let mut bytes = Vec::new();
+                if let Err(error) = reader.read_to_end(&mut bytes) {
+                    return Some(Err(error.into()));
+                }
+                *parser = Some(Box::new(JsonLdParser::new(Cow::Owned(bytes), settings)));
+            }
+            match parser.as_mut()?.next_ref()? {
+                Ok(quad) => (quad, TextPosition::default()),
+                Err(error) => return Some(Err(error)),
+            }
+        }
+        Inner::N3(parser, current) => match parser.next_n3()? {
+            Ok(quad) => match quad.into_quad() {
+                Ok(quad) => (current.insert(quad).as_ref(), TextPosition::default()),
+                Err(quad) => {
+                    return Some(Err(RdfSyntaxError::new(
+                        format!("not RDF (read it with nrese_rdf_io::n3): {quad}"),
+                        TextPosition::default()..TextPosition::default(),
+                    )
+                    .into()));
+                }
+            },
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::Turtle(parser) => match parser.next_ref()? {
+            Ok(quad) => (quad, TextPosition::default()),
+            Err(error) => return Some(Err(error)),
+        },
+        Inner::Lines { lines, parser } => {
+            // The next line with a statement. A `VERSION` directive (RDF 1.2) has none:
+            // it is checked here and skipped (no statement starts with `VERSION`).
+            let (range, line, offset) = loop {
+                let range = match lines.next() {
+                    Ok(Some(range)) => range,
+                    Ok(None) => return None,
+                    Err(error) => return Some(Err(error.into())),
+                };
+                let text = lines.slice(range.clone());
+                if !has_statement(text) {
+                    continue;
+                }
+                let (line, offset) = lines.position();
+                if text.trim_ascii_start().starts_with(b"VERSION") {
+                    match parser.parse(text, line, offset) {
+                        Ok(None) => continue,
+                        Ok(Some(_)) => unreachable!("a directive has no statement"),
+                        Err(error) => return Some(Err(lines.failed(error.into()))),
+                    }
+                }
+                break (range, line, offset);
+            };
+            match parser.parse(lines.slice(range), line, offset) {
+                Ok(Some(quad)) => (
+                    quad,
+                    TextPosition {
+                        line,
+                        column: 0,
+                        offset,
+                    },
+                ),
+                Ok(None) => unreachable!("parsed to a statement above"),
+                Err(error) => return Some(Err(lines.failed(error.into()))),
+            }
+        }
+    };
+    Some(place(quad, default_graph, without_named_graphs, at))
 }
 
 /// The quad in the graph the settings say.
@@ -561,3 +615,6 @@ impl<R: Read> Iterator for QuadParser<'_, R> {
         Some(self.next_ref()?.map(QuadRef::into_owned))
     }
 }
+
+#[cfg(test)]
+mod split_cuts;

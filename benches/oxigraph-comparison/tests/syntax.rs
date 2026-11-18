@@ -1,15 +1,27 @@
-//! nrese-sparql-syntax against spargebra: every query and update of the W3C SPARQL 1.0,
-//! 1.1 and 1.2 suites (and the repository's own `.rq`/`.ru` files) parsed by both, their
-//! algebra compared after converting spargebra's into nrese's.
+//! nrese-sparql-syntax against spargebra: every query and update of the pinned W3C SPARQL
+//! 1.0, 1.1 and 1.2 suites (and the repository's own `.rq`/`.ru` files) parsed by both, their
+//! algebra compared after converting spargebra's into nrese's. Without the suites in full the
+//! test fails where they are required (`NRESE_W3C_REQUIRED`) and else compares the
+//! repository's files alone, saying it doesn't qualify.
 //!
-//! What may differ, and is normalised before comparing:
-//! - generated names (spargebra's are random 128-bit numbers, nrese's are numbered);
+//! What may differ, and is normalised on the algebra (never its text) before comparing:
+//! - generated names of variables and blank nodes (spargebra's are random 128-bit numbers,
+//!   nrese's are numbered);
 //! - `-1` in an expression: nrese reads the signed literal the grammar's tokens make,
-//!   spargebra a negation of `1` computed at run time.
+//!   spargebra a negation of `1` computed at run time. Folded only where both are one term, a
+//!   minus over a canonical integer within 64 bits; every other sign over a number (`+1`, `-0`,
+//!   `-01`, `-.5`, `-1.5e3`, `-9223372036854775808`) is unresolved, since spargebra reads the
+//!   token and the expression (`+(1)`) alike though they are two terms;
+//! - the shape of a nest of `&&` or `||` (both associative): nrese balances it, spargebra
+//!   folds it left;
+//! - `ADD`, `MOVE` and `COPY`: nrese keeps each as one operation (it reads the stored graph and
+//!   resolves both names first, SYN-54), spargebra lowers it to the `DROP` and `DELETE`/`INSERT`
+//!   steps §3.2.3–3.2.5 define it as, none for two equal names.
 //!
 //! Every other difference is listed. Those explained (spargebra's right-associative
 //! `-` and `/`, and what each accepts or rejects) are checked to be exactly the expected
-//! ones.
+//! ones. A query whose algebras are equal but hold an unresolved sign is listed and counted
+//! apart, never as the same (IB1350-71f7: an EARL report's cannot-tell).
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -26,11 +38,17 @@ use nrese_sparql_syntax::term::{
     GroundTriple, GroundTriplePattern, NamedNodePattern, Quad, QuadPattern, TermPattern,
     TriplePattern,
 };
-use nrese_sparql_syntax::{GraphUpdateOperation as U, Query, SparqlParser, Update};
+use nrese_sparql_syntax::visit::{Node, NodeMut};
+use nrese_sparql_syntax::{GraphUpdateOperation as U, Query, SparqlParser, TransferOp, Update};
+use oxigraph_comparison::w3c;
 use spargebra::algebra as sa;
 use spargebra::term as st;
 
-/// Renames spargebra's random names (and keeps the query's own).
+/// Renames spargebra's random names (and keeps the query's own): each its own alias, `__x:0`,
+/// `__x:1`, … in order of first appearance. An alias holds a `:`, which no variable name or
+/// blank-node label does (the grammar's VARNAME and BLANK_NODE_LABEL, SPARQL 1.1 rules 166 and
+/// 142), so it never meets a name of the query's (PR #73: the alias `__x0` merged
+/// an aggregate's variable with the query's own `?__x0`).
 #[derive(Default)]
 struct Names {
     map: HashMap<String, String>,
@@ -45,7 +63,7 @@ impl Names {
         let n = self.map.len();
         self.map
             .entry(name.to_owned())
-            .or_insert_with(|| format!("__x{n}"))
+            .or_insert_with(|| format!("__x:{n}"))
             .clone()
     }
 
@@ -144,8 +162,9 @@ impl Names {
         match p {
             S::NamedNode(n) => PP::NamedNode(nn(n)),
             S::Reverse(p) => PP::Reverse(Box::new(self.path(p))),
-            S::Sequence(a, b) => PP::Sequence(Box::new(self.path(a)), Box::new(self.path(b))),
-            S::Alternative(a, b) => PP::Alternative(Box::new(self.path(a)), Box::new(self.path(b))),
+            // Binary in spargebra, n-ary and flattened in NRESE (ADR-0012).
+            S::Sequence(a, b) => PP::sequence(vec![self.path(a), self.path(b)]),
+            S::Alternative(a, b) => PP::alternative(vec![self.path(a), self.path(b)]),
             S::ZeroOrMore(p) => PP::ZeroOrMore(Box::new(self.path(p))),
             S::OneOrMore(p) => PP::OneOrMore(Box::new(self.path(p))),
             S::ZeroOrOne(p) => PP::ZeroOrOne(Box::new(self.path(p))),
@@ -293,10 +312,7 @@ impl Names {
                 path: self.path(path),
                 object: self.tp(object),
             },
-            S::Join { left, right } => P::Join {
-                left: b(self, left),
-                right: b(self, right),
-            },
+            S::Join { left, right } => P::join_all(vec![self.pattern(left), self.pattern(right)]),
             S::LeftJoin {
                 left,
                 right,
@@ -314,23 +330,20 @@ impl Names {
                 expr: self.expr(expr),
                 inner: b(self, inner),
             },
-            S::Union { left, right } => P::Union {
-                left: b(self, left),
-                right: b(self, right),
-            },
+            S::Union { left, right } => P::union_all(vec![self.pattern(left), self.pattern(right)]),
             S::Graph { name, inner } => P::Graph {
                 name: self.nnp(name),
                 inner: b(self, inner),
             },
+            // A chain in spargebra, one `Extend` in NRESE (ADR-0012).
             S::Extend {
                 inner,
                 variable,
                 expression,
-            } => P::Extend {
-                inner: b(self, inner),
-                variable: self.var(variable),
-                expression: self.expr(expression),
-            },
+            } => {
+                let inner = self.pattern(inner);
+                inner.extend(self.var(variable), self.expr(expression))
+            }
             S::Minus { left, right } => P::Minus {
                 left: b(self, left),
                 right: b(self, right),
@@ -582,109 +595,491 @@ impl Names {
     }
 }
 
-/// A `Debug` rendering with generated names (`__agg0`, `__x3`, …) replaced by their order
-/// of first appearance, and `-(1)` of a number as the signed literal.
-fn normalised(debug: &str) -> String {
-    let mut names: HashMap<String, usize> = HashMap::new();
-    let mut out = String::with_capacity(debug.len());
-    let mut rest = debug;
-    while let Some(i) = rest.find("\"__") {
-        out.push_str(&rest[..=i]);
-        let after = &rest[i + 1..];
-        let end = after.find('"').unwrap_or(after.len());
-        let name = &after[..end];
-        let n = names.len();
-        let id = *names.entry(name.to_owned()).or_insert(n);
-        out.push_str(&format!("#gen{id}"));
-        rest = &after[end..];
-    }
-    out.push_str(rest);
-    out
-}
+/// The names a parser made up, renamed `__0`, `__1`, … in order of first appearance:
+/// nrese's (`__agg0`, `__b1`, …; a query using such a name of its own gets a longer prefix,
+/// parser/mod.rs) and spargebra's random ones as [`Names`] renames them (`__x:0`, …). A
+/// query's own name starting with `__` is renamed with them, alike on both sides. Variables
+/// and blank nodes alone: an IRI or a literal is no name (the literal
+/// `"__agg0"` was renamed with the aggregate's variable, and `"__a"` compared equal to `"__b"`).
+#[derive(Default)]
+struct Generated(HashMap<String, usize>);
 
-/// `UnaryMinus(1)` and `UnaryPlus(1)` of a number literal as the signed literal.
-fn fold_signs(debug: String) -> String {
-    let mut out = debug;
-    for (op, sign) in [("UnaryMinus(Literal(", "-"), ("UnaryPlus(Literal(", "+")] {
-        while let Some(i) = out.find(op) {
-            // UnaryMinus(Literal(Literal { value: "1", kind: Typed(…) }))
-            let start = i + op.len();
-            let Some(value_at) = out[start..].find("value: \"").map(|v| start + v + 8) else {
-                break;
-            };
-            let Some(close) = find_close(&out, i + op.len() - 1) else {
-                break;
-            };
-            let inner = out[i + op.len() - "Literal(".len()..close].to_owned();
-            let numeric = [xsd::INTEGER, xsd::DECIMAL, xsd::DOUBLE]
-                .iter()
-                .any(|dt| inner.contains(dt.as_str()));
-            if !numeric {
-                // Not a number: leave it, marked so the loop moves on.
-                out.replace_range(i..i + 5, "Unary_");
-                continue;
-            }
-            let mut literal = inner;
-            let v = value_at - (i + op.len() - "Literal(".len());
-            literal.insert_str(v, sign);
-            out.replace_range(i..=close, &literal);
+impl Generated {
+    fn name(&mut self, name: &str) -> Option<String> {
+        let n = self.0.len();
+        name.starts_with("__")
+            .then(|| format!("__{}", self.0.entry(name.to_owned()).or_insert(n)))
+    }
+
+    fn variable(&mut self, variable: &mut Variable) {
+        if let Some(name) = self.name(variable.as_str()) {
+            *variable = Variable::new_unchecked(name);
         }
     }
-    out.replace("Unary_", "Unary")
+
+    fn blank_node(&mut self, node: &mut BlankNode) {
+        if let Some(name) = self.name(node.as_str()) {
+            *node = BlankNode::new_unchecked(name);
+        }
+    }
+
+    fn term(&mut self, term: &mut TermPattern) {
+        match term {
+            TermPattern::Variable(v) => self.variable(v),
+            TermPattern::BlankNode(b) => self.blank_node(b),
+            TermPattern::Triple(t) => self.triple(t),
+            TermPattern::NamedNode(_) | TermPattern::Literal(_) => {}
+        }
+    }
+
+    fn predicate(&mut self, predicate: &mut NamedNodePattern) {
+        match predicate {
+            NamedNodePattern::Variable(v) => self.variable(v),
+            NamedNodePattern::NamedNode(_) => {}
+        }
+    }
+
+    fn graph(&mut self, graph: &mut GraphNamePattern) {
+        match graph {
+            GraphNamePattern::Variable(v) => self.variable(v),
+            GraphNamePattern::NamedNode(_) | GraphNamePattern::DefaultGraph => {}
+        }
+    }
+
+    fn triple(&mut self, triple: &mut TriplePattern) {
+        self.term(&mut triple.subject);
+        self.predicate(&mut triple.predicate);
+        self.term(&mut triple.object);
+    }
+
+    fn ground(&mut self, term: &mut GroundTermPattern) {
+        match term {
+            GroundTermPattern::Variable(v) => self.variable(v),
+            GroundTermPattern::Triple(t) => {
+                self.ground(&mut t.subject);
+                self.predicate(&mut t.predicate);
+                self.ground(&mut t.object);
+            }
+            GroundTermPattern::NamedNode(_) | GroundTermPattern::Literal(_) => {}
+        }
+    }
+
+    fn data(&mut self, term: &mut nrese_rdf::Term) {
+        match term {
+            nrese_rdf::Term::BlankNode(b) => self.blank_node(b),
+            nrese_rdf::Term::Triple(t) => {
+                self.subject(&mut t.subject);
+                self.data(&mut t.object);
+            }
+            nrese_rdf::Term::NamedNode(_) | nrese_rdf::Term::Literal(_) => {}
+        }
+    }
+
+    fn subject(&mut self, subject: &mut nrese_rdf::NamedOrBlankNode) {
+        match subject {
+            nrese_rdf::NamedOrBlankNode::BlankNode(b) => self.blank_node(b),
+            nrese_rdf::NamedOrBlankNode::NamedNode(_) => {}
+        }
+    }
+
+    /// The names a node holds itself, then its children's (`visit.rs`).
+    fn node(&mut self, node: NodeMut<'_>) {
+        match node {
+            NodeMut::Pattern(pattern) => {
+                match pattern {
+                    P::Bgp { patterns } => patterns.iter_mut().for_each(|t| self.triple(t)),
+                    P::Path {
+                        subject, object, ..
+                    } => {
+                        self.term(subject);
+                        self.term(object);
+                    }
+                    P::Graph { name, .. } | P::Service { name, .. } => self.predicate(name),
+                    P::Extend { bindings, .. } => {
+                        bindings.iter_mut().for_each(|(v, _)| self.variable(v))
+                    }
+                    P::Values { variables, .. } | P::Project { variables, .. } => {
+                        variables.iter_mut().for_each(|v| self.variable(v))
+                    }
+                    P::Group {
+                        variables,
+                        aggregates,
+                        ..
+                    } => {
+                        variables.iter_mut().for_each(|v| self.variable(v));
+                        aggregates.iter_mut().for_each(|(v, _)| self.variable(v));
+                    }
+                    P::Join { .. }
+                    | P::LeftJoin { .. }
+                    | P::Lateral { .. }
+                    | P::Filter { .. }
+                    | P::Union { .. }
+                    | P::Minus { .. }
+                    | P::OrderBy { .. }
+                    | P::Distinct { .. }
+                    | P::Reduced { .. }
+                    | P::Slice { .. } => {}
+                }
+                pattern
+                    .children_mut()
+                    .into_iter()
+                    .for_each(|n| self.node(n));
+            }
+            NodeMut::Expression(expression) => {
+                if let E::Variable(v) | E::Bound(v) = expression {
+                    self.variable(v);
+                }
+                expression
+                    .children_mut()
+                    .into_iter()
+                    .for_each(|n| self.node(n));
+            }
+        }
+    }
 }
 
-/// The index of the `)` closing the `(` at `open`.
-fn find_close(s: &str, open: usize) -> Option<usize> {
-    let mut depth = 0;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, c) in s[open..].char_indices() {
-        if in_string {
-            match (escaped, c) {
-                (true, _) => escaped = false,
-                (false, '\\') => escaped = true,
-                (false, '"') => in_string = false,
-                _ => {}
-            }
-            continue;
+/// The function an unresolved sign becomes ([`fold_sign`]), its sign after it: an IRI no query
+/// holds, as no IRI the grammar reads has a space.
+const UNRESOLVED: &str = "unresolved sign ";
+
+/// A sign over a number literal, written either way: as a sign over it (`UnaryMinus(Literal
+/// ("2"))`, spargebra's reading of the token `-2` and both parsers' of `-(2)`) or as the signed
+/// literal the grammar's tokens make (`Literal("-2")`, nrese's). A minus over a canonical
+/// integer becomes the signed literal: `-(2)` evaluates to the term the token `-2` is. Any
+/// other becomes the marker `<unresolved sign ±>(unsigned literal)`, alike both ways: they are
+/// two terms, which spargebra's reading can't tell apart (PR #73:
+/// `sameTerm(+(1), 1)` is true, `sameTerm(+1, 1)` false). An operand no unsigned token spells
+/// keeps its sign (`-(-1)` became `"--1"`, no number). Over a literal alone (a
+/// base IRI spelling `UnaryMinus(Literal(…integer))` panicked, `Unary_` and
+/// `Unary` compared equal).
+fn fold_sign(expression: &mut E) {
+    let Some((sign, number)) = signed_number(expression) else {
+        return;
+    };
+    *expression = if sign == '-' && canonical_integer(&number) {
+        let signed = format!("-{}", number.value());
+        E::Literal(Literal::new_typed_literal(signed, number.datatype()))
+    } else {
+        let marker = NamedNode::new_unchecked(format!("{UNRESOLVED}{sign}"));
+        E::FunctionCall(F::Custom(marker), vec![E::Literal(number)])
+    };
+}
+
+/// The sign and the unsigned literal of a sign over a number literal, written either way
+/// ([`fold_sign`]), if the literal is spelled as an unsigned token ([`unsigned_number`]).
+fn signed_number(expression: &E) -> Option<(char, Literal)> {
+    let (sign, number) = match expression {
+        E::UnaryMinus(operand) | E::UnaryPlus(operand) => {
+            let E::Literal(number) = &**operand else {
+                return None;
+            };
+            let sign = if matches!(expression, E::UnaryMinus(_)) {
+                '-'
+            } else {
+                '+'
+            };
+            (sign, number.clone())
         }
-        match c {
-            '"' => in_string = true,
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(open + i);
+        E::Literal(literal) => {
+            let unsigned = literal.value().strip_prefix(['+', '-'])?;
+            let sign = literal.value().chars().next()?;
+            (
+                sign,
+                Literal::new_typed_literal(unsigned, literal.datatype()),
+            )
+        }
+        _ => return None,
+    };
+    unsigned_number(&number).then_some((sign, number))
+}
+
+/// Whether an integer literal is spelled canonically and isn't zero (digits, no leading zero,
+/// not `0`; XSD 1.1 part 2) and fits nrese's evaluator's 64 bits: a minus before it is then the
+/// spelling its negation has. Past them the operand is no number there, so `-(9223372036854775808)`
+/// is an error and the token `-9223372036854775808` a number (PR #73).
+fn canonical_integer(number: &Literal) -> bool {
+    let value = number.value();
+    number.datatype() == xsd::INTEGER
+        && value.bytes().all(|b| b.is_ascii_digit())
+        && value.bytes().next().is_some_and(|b| b != b'0')
+        && value.parse::<i64>().is_ok()
+}
+
+/// Whether a literal is spelled as the grammar's unsigned number of its datatype (SPARQL 1.1
+/// rules 146-148), the operand spargebra keeps of a signed token: `INTEGER` `[0-9]+`,
+/// `DECIMAL` `[0-9]* '.' [0-9]+`, `DOUBLE` `([0-9]+ '.' [0-9]* | '.' [0-9]+ | [0-9]+)
+/// EXPONENT`. A sign before each is in its datatype's lexical space (XSD 1.1 part 2). No other
+/// spelling (signed already, `NaN`, `INF`, no number) and no other datatype: `-` of an
+/// `xsd:int` is an `xsd:integer` (SPARQL 1.1 section 17.3), and no token is an `xsd:float`.
+fn unsigned_number(number: &Literal) -> bool {
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    let any_digits = |s: &str| s.is_empty() || digits(s);
+    let (value, datatype) = (number.value(), number.datatype());
+    if datatype == xsd::INTEGER {
+        digits(value)
+    } else if datatype == xsd::DECIMAL {
+        value
+            .split_once('.')
+            .is_some_and(|(whole, fraction)| any_digits(whole) && digits(fraction))
+    } else if datatype == xsd::DOUBLE {
+        value
+            .split_once(['e', 'E'])
+            .is_some_and(|(mantissa, exponent)| {
+                let mantissa = match mantissa.split_once('.') {
+                    Some((whole, fraction)) => {
+                        mantissa != "." && any_digits(whole) && any_digits(fraction)
+                    }
+                    None => digits(mantissa),
+                };
+                mantissa && digits(exponent.strip_prefix(['+', '-']).unwrap_or(exponent))
+            })
+    } else {
+        false
+    }
+}
+
+/// `&&` and `||` as the n-ary operators they are: each nest of one of them is built again
+/// from its operands, in order, as `Expression::balanced` builds it; and a sign over a number
+/// literal folded ([`fold_sign`]). Both operators are associative in SPARQL's logic of true,
+/// false and error; nrese builds them as balanced trees (ADR-0012) where spargebra folds them
+/// left, and parentheses group them either way: the tree's shape is no difference. On the
+/// algebra itself, so nothing else (a base IRI's text) is taken for an operator (two distinct bases compared equal as
+/// text).
+fn associate(node: NodeMut<'_>) {
+    match node {
+        NodeMut::Pattern(pattern) => pattern.children_mut().into_iter().for_each(associate),
+        NodeMut::Expression(expression) if matches!(expression, E::And(..) | E::Or(..)) => {
+            let and = matches!(expression, E::And(..));
+            let placeholder = E::Variable(Variable::new_unchecked("nest"));
+            let mut operands = Vec::new();
+            nest(
+                std::mem::replace(expression, placeholder),
+                and,
+                &mut operands,
+            );
+            for operand in &mut operands {
+                associate(NodeMut::Expression(operand));
+            }
+            let join = if and { E::And } else { E::Or };
+            *expression = E::balanced(operands, join).expect("&& and || have two operands");
+        }
+        NodeMut::Expression(expression) => {
+            expression.children_mut().into_iter().for_each(associate);
+            fold_sign(expression);
+        }
+    }
+}
+
+/// The operands of a nest of `&&` (`and`) or `||`, in order.
+fn nest(expression: E, and: bool, operands: &mut Vec<E>) {
+    match (expression, and) {
+        (E::And(a, b), true) | (E::Or(a, b), false) => {
+            nest(*a, and, operands);
+            nest(*b, and, operands);
+        }
+        (other, _) => operands.push(other),
+    }
+}
+
+/// A query or update as the test compares it: its algebra rendered, and whether a sign in it is
+/// unresolved ([`fold_sign`]).
+#[derive(Debug, PartialEq)]
+struct Canonical {
+    algebra: String,
+    unresolved: bool,
+}
+
+/// Whether a pattern holds an unresolved sign's marker ([`fold_sign`]), found on the algebra.
+fn holds_unresolved(pattern: &P) -> bool {
+    pattern.find(&mut |node| {
+        matches!(node, Node::Expression(E::FunctionCall(F::Custom(iri), _))
+            if iri.as_str().starts_with(UNRESOLVED))
+    })
+}
+
+/// How two canonical forms compare, the outcome the test counts: "different algebra" when they
+/// differ; equal, "unresolved" when a sign in them is, which is never the same
+/// (IB1350-71f7), else "same algebra".
+fn compare(ours: &Canonical, theirs: &Canonical) -> &'static str {
+    if ours.algebra != theirs.algebra {
+        "different algebra"
+    } else if ours.unresolved || theirs.unresolved {
+        "unresolved"
+    } else {
+        "same algebra"
+    }
+}
+
+/// A query as the test compares it: `&&` and `||` associated and signs folded alike, the
+/// generated names renamed, then rendered.
+fn canonical(mut query: Query) -> Canonical {
+    let mut names = Generated::default();
+    match &mut query {
+        Query::Construct {
+            template, pattern, ..
+        } => {
+            template.iter_mut().for_each(|t| names.triple(t));
+            associate(NodeMut::Pattern(pattern));
+            names.node(NodeMut::Pattern(pattern));
+        }
+        Query::Select { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Ask { pattern, .. } => {
+            associate(NodeMut::Pattern(pattern));
+            names.node(NodeMut::Pattern(pattern));
+        }
+    }
+    let (Query::Construct { pattern, .. }
+    | Query::Select { pattern, .. }
+    | Query::Describe { pattern, .. }
+    | Query::Ask { pattern, .. }) = &query;
+    Canonical {
+        unresolved: holds_unresolved(pattern),
+        algebra: format!("{query:?}"),
+    }
+}
+
+/// spargebra's form of nrese's `ADD`: the `DeleteInsert` SPARQL 1.1 Update §3.2.3 defines it
+/// as, `?s ?p ?o` of `from` into `to`.
+fn lowered(from: &GraphName, to: &GraphName) -> U {
+    let [s, p, o] = ["s", "p", "o"].map(Variable::new_unchecked);
+    let bgp = P::Bgp {
+        patterns: vec![TriplePattern::new(s.clone(), p.clone(), o.clone())],
+    };
+    U::DeleteInsert {
+        delete: Vec::new(),
+        insert: vec![QuadPattern::new(
+            s,
+            p,
+            o,
+            GraphNamePattern::from(to.clone()),
+        )],
+        using: None,
+        pattern: Box::new(match from {
+            GraphName::NamedNode(from) => P::Graph {
+                name: from.clone().into(),
+                inner: Box::new(bgp),
+            },
+            GraphName::DefaultGraph => bgp,
+        }),
+    }
+}
+
+/// spargebra's form of nrese's transfer: nothing for two equal names, else the `DROP` and
+/// `DELETE`/`INSERT` steps SPARQL 1.1 Update §3.2.3–3.2.5 define it as.
+fn spargebra_form(operation: U) -> Vec<U> {
+    let U::Transfer {
+        op,
+        silent,
+        from,
+        to,
+    } = operation
+    else {
+        return vec![operation];
+    };
+    if from == to {
+        return Vec::new();
+    }
+    let target = |g: &GraphName| match g {
+        GraphName::NamedNode(n) => GraphTarget::NamedNode(n.clone()),
+        GraphName::DefaultGraph => GraphTarget::DefaultGraph,
+    };
+    let drop_to = U::Drop {
+        silent: true,
+        graph: target(&to),
+    };
+    let copy = lowered(&from, &to);
+    match op {
+        TransferOp::Add => vec![copy],
+        TransferOp::Copy => vec![drop_to, copy],
+        TransferOp::Move => vec![
+            drop_to,
+            copy,
+            U::Drop {
+                silent,
+                graph: target(&from),
+            },
+        ],
+    }
+}
+
+/// An update as the test compares it, as [`canonical`] a query.
+fn canonical_update(mut update: Update) -> Canonical {
+    let mut names = Generated::default();
+    update.operations = update
+        .operations
+        .into_iter()
+        .flat_map(spargebra_form)
+        .collect();
+    for operation in &mut update.operations {
+        match operation {
+            U::InsertData { data } => {
+                for quad in data {
+                    names.subject(&mut quad.subject);
+                    names.data(&mut quad.object);
                 }
             }
-            _ => {}
+            U::DeleteInsert {
+                delete,
+                insert,
+                pattern,
+                ..
+            } => {
+                for quad in delete {
+                    names.ground(&mut quad.subject);
+                    names.predicate(&mut quad.predicate);
+                    names.ground(&mut quad.object);
+                    names.graph(&mut quad.graph_name);
+                }
+                for quad in insert {
+                    names.term(&mut quad.subject);
+                    names.predicate(&mut quad.predicate);
+                    names.term(&mut quad.object);
+                    names.graph(&mut quad.graph_name);
+                }
+                associate(NodeMut::Pattern(pattern));
+                names.node(NodeMut::Pattern(pattern));
+            }
+            U::DeleteData { .. }
+            | U::Load { .. }
+            | U::Clear { .. }
+            | U::Create { .. }
+            | U::Drop { .. }
+            | U::Transfer { .. } => {}
         }
     }
-    None
+    Canonical {
+        unresolved: update.operations.iter().any(|operation| {
+            matches!(operation, U::DeleteInsert { pattern, .. } if holds_unresolved(pattern))
+        }),
+        algebra: format!("{update:?}"),
+    }
 }
 
-fn corpus() -> Vec<PathBuf> {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+/// The repository's own queries and updates (`.rq`, `.ru` under `crates`, `benches` and
+/// `docs`): its name relative to the repository, its path. A directory that can't be read
+/// fails the test.
+fn repository() -> Vec<(String, PathBuf)> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap();
     let mut files = Vec::new();
-    let mut stack = vec![
-        root.join(".cache/rdf-tests/sparql"),
-        root.join("crates"),
-        root.join("benches"),
-        root.join("docs"),
-    ];
+    let mut stack = vec![root.join("crates"), root.join("benches"), root.join("docs")];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
+        let entries = std::fs::read_dir(&dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry
+                .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+                .path();
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
             if path.is_dir() {
-                if name != "target" && !name.starts_with('.') || name == ".cache" {
+                if name != "target" && !name.starts_with('.') {
                     stack.push(path);
                 }
             } else if name.ends_with(".rq") || name.ends_with(".ru") {
-                files.push(path);
+                let relative = path.strip_prefix(&root).unwrap();
+                files.push((relative.to_string_lossy().replace('\\', "/"), path));
             }
         }
     }
@@ -692,12 +1087,27 @@ fn corpus() -> Vec<PathBuf> {
     files
 }
 
+/// Where two normalised algebras part: after how many characters, and each from shortly
+/// before that point.
+fn divergence(ours: &str, theirs: &str) -> String {
+    let same = ours
+        .chars()
+        .zip(theirs.chars())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let start = same.saturating_sub(120);
+    let show = |algebra: &str| algebra.chars().skip(start).take(600).collect::<String>();
+    format!(
+        "  they part after {same} characters\n  nrese:     ...{}\n  spargebra: ...{}",
+        show(ours),
+        show(theirs)
+    )
+}
+
 fn file_iri(path: &Path) -> String {
-    let path = path
-        .canonicalize()
-        .unwrap()
-        .to_string_lossy()
-        .replace('\\', "/");
+    // An absolute path as given (w3c.rs and repository() make them from canonical roots): the
+    // file itself may be gone, its bytes being the pinned ones.
+    let path = path.to_string_lossy().replace('\\', "/");
     let path = path.trim_start_matches("//?/");
     if path.starts_with('/') {
         format!("file://{path}")
@@ -708,52 +1118,67 @@ fn file_iri(path: &Path) -> String {
 
 #[test]
 fn every_query_parses_to_the_same_algebra() {
-    let files = corpus();
-    if files.len() < 100 {
-        eprintln!("skipped: no W3C suites (scripts/fetch-w3c-tests.sh)");
-        return;
-    }
+    // The pinned W3C suites in full, or (where they aren't required) the repository's own
+    // files alone, said to qualify nothing.
+    let suites = w3c::admitted(w3c::sparql(&["rq", "ru"])).unwrap_or_default();
+    let own = repository();
+    eprintln!(
+        "W3C files: {} ({}); the repository's own: {}",
+        suites.len(),
+        w3c::counts(&suites),
+        own.len()
+    );
+    let inputs = suites
+        .iter()
+        .map(|file| (file.name.clone(), file.path.clone(), file.bytes.clone()))
+        .chain(own.into_iter().map(|(name, path)| {
+            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("{name}: {e}"));
+            (name, path, bytes)
+        }));
     let mut outcome: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for path in &files {
-        let Ok(text) = std::fs::read_to_string(path) else {
+    // The two normalised algebras of each file whose algebra differs, for the report.
+    let mut algebras: BTreeMap<String, (String, String)> = BTreeMap::new();
+    for (name, path, bytes) in inputs {
+        // Neither parser reads bytes: a file that isn't UTF-8 is counted, not compared.
+        let Ok(text) = String::from_utf8(bytes) else {
+            outcome.entry("not UTF-8").or_default().push(name);
             continue;
         };
+        let path = path.as_path();
         let base = file_iri(path);
         let update = path.extension().is_some_and(|e| e == "ru");
-        let name = path.to_string_lossy().replace('\\', "/");
-        let name = name.split("/sparql/").last().unwrap_or(&name).to_owned();
         let ours = SparqlParser::new().with_base_iri(base.as_str()).unwrap();
         let theirs = spargebra::SparqlParser::new()
             .with_base_iri(base.as_str())
             .unwrap();
-        let (ours, theirs): (Result<String, String>, Result<String, String>) = if update {
+        let (ours, theirs): (Result<Canonical, String>, Result<Canonical, String>) = if update {
             (
                 ours.parse_update(&text)
-                    .map(|u| format!("{u:?}"))
+                    .map(canonical_update)
                     .map_err(|e| e.to_string()),
                 theirs
                     .parse_update(&text)
-                    .map(|u| format!("{:?}", Names::default().update(&u)))
+                    .map(|u| canonical_update(Names::default().update(&u)))
                     .map_err(|e| e.to_string()),
             )
         } else {
             (
                 ours.parse_query(&text)
-                    .map(|q| format!("{q:?}"))
+                    .map(canonical)
                     .map_err(|e| e.to_string()),
                 theirs
                     .parse_query(&text)
-                    .map(|q| format!("{:?}", Names::default().query(&q)))
+                    .map(|q| canonical(Names::default().query(&q)))
                     .map_err(|e| e.to_string()),
             )
         };
         let key = match (ours, theirs) {
             (Ok(a), Ok(b)) => {
-                if normalised(&fold_signs(a)) == normalised(&fold_signs(b)) {
-                    "same algebra"
-                } else {
-                    "different algebra"
+                let key = compare(&a, &b);
+                if key == "different algebra" {
+                    algebras.insert(name.clone(), (a.algebra, b.algebra));
                 }
+                key
             }
             (Err(_), Err(_)) => "both reject",
             (Ok(_), Err(_)) => "only nrese accepts",
@@ -769,51 +1194,98 @@ fn every_query_parses_to_the_same_algebra() {
             }
         }
     }
-    let unexplained: Vec<&String> = outcome
+    // A difference is explained only by an entry naming its file and this outcome; and with
+    // the suites read, every entry is seen with its outcome (none stands for a file that
+    // now agrees, or differs otherwise). An unresolved sign is no difference to explain: its
+    // files are listed above and counted apart.
+    let explained = |file: &str, key: &str| explains(EXPLAINED, file, key);
+    let unexplained: Vec<String> = outcome
         .iter()
-        .filter(|(k, _)| **k != "same algebra" && **k != "both reject")
-        .flat_map(|(_, files)| files)
-        .filter(|f| !EXPLAINED.iter().any(|(e, _)| f.ends_with(e)))
+        .filter(|(k, _)| {
+            !matches!(
+                **k,
+                "same algebra" | "unresolved" | "both reject" | "not UTF-8"
+            )
+        })
+        .flat_map(|(key, files)| files.iter().map(move |file| (key, file)))
+        .filter(|(key, file)| !explained(file, key))
+        .map(|(key, file)| match algebras.get(file.as_str()) {
+            Some((ours, theirs)) => format!("{file}: {key}\n{}", divergence(ours, theirs)),
+            None => format!("{file}: {key}"),
+        })
         .collect();
+    let unseen: Vec<String> = if suites.is_empty() {
+        Vec::new()
+    } else {
+        not_seen(&outcome, EXPLAINED)
+    };
     assert!(
-        unexplained.is_empty(),
-        "unexplained differences: {unexplained:#?}"
+        unexplained.is_empty() && unseen.is_empty(),
+        "unexplained differences:\n{}\nexplained but not seen so: {unseen:#?}",
+        unexplained.join("\n")
     );
 }
 
-/// Differences with their reasons: in each, nrese follows the specification.
-const EXPLAINED: &[(&str, &str)] = &[
+/// Differences, each with the outcome it has and its reason: in each, nrese follows the
+/// specification.
+const EXPLAINED: &[(&str, &str, &str)] = &[
+    (
+        "sparql10/syntax-sparql2/syntax-general-04.rq",
+        "different algebra",
+        "SPARQL 1.1 section 19.8 note 3 requires the longest token: NumericLiteralPositive [132] \
+         consumes `+11`; spargebra 0.4.6 instead consumes `+` as PathMod [93]",
+    ),
+    (
+        "sparql10/syntax-sparql2/syntax-general-07.rq",
+        "different algebra",
+        "SPARQL 1.1 section 19.8 note 3 requires the longest token: NumericLiteralPositive [132] \
+         consumes `+1.0`; spargebra 0.4.6 instead consumes `+` as PathMod [93]",
+    ),
+    (
+        "sparql10/syntax-sparql2/syntax-general-10.rq",
+        "different algebra",
+        "SPARQL 1.1 section 19.8 note 3 requires the longest token: NumericLiteralPositive [132] \
+         consumes `+1.0e+1`; spargebra 0.4.6 instead consumes `+` as PathMod [93]",
+    ),
     (
         "sparql10/expr-ops/query-add-literals.rq",
+        "different algebra",
         "spargebra reads `a + b + c` as `a + (b + c)`; the grammar's rule 116 associates to the left",
     ),
     (
         "sparql10/i18n/normalization-02.rq",
+        "different algebra",
         "an absolute IRI with dot segments: nrese resolves it as RFC 3986 section 5.2.2 says \
          (and as nrese-rdf-io does for data), spargebra (oxiri) keeps the segments",
     ),
     (
         "sparql10/expr-builtin/case-insensitive-booleans.rq",
+        "only nrese accepts",
         "TRUE and FALSE: keywords are case-insensitive (SPARQL 1.1 section 19.3), spargebra rejects them",
     ),
     (
         "sparql12/grouping/select-variable-reuse.rq",
+        "only nrese accepts",
         "W3C SPARQL 1.2 positive test: a select expression may use an earlier one's variable",
     ),
     (
         "sparql10/syntax-sparql3/syn-bad-26.rq",
+        "only spargebra accepts",
         "W3C negative test: by the longest-token rule `<?a&&?b>` is an IRI, not `<` and `&&`",
     ),
     (
         "sparql12/syntax/nested-aggregate-functions.rq",
+        "only spargebra accepts",
         "W3C negative test: an aggregate's argument holds no aggregate",
     ),
     (
         "sparql12/syntax-triple-terms-negative/tripleterm-subject-03.rq",
+        "only spargebra accepts",
         "W3C negative test: a triple term in an expression has no triple term as subject",
     ),
     (
         "sparql12/syntax-triple-terms-negative/tripleterm-subject-06.rq",
+        "only spargebra accepts",
         "W3C negative test: a triple term in an expression has no literal as subject",
     ),
 ];
@@ -829,7 +1301,329 @@ fn subtraction_associates_to_the_left_in_nrese_only() {
     let ours = format!("{ours:?}");
     // spargebra: the outer subtraction's left operand is the literal 10, its right `5 - 2`.
     assert!(!theirs.contains("Subtract(Subtract("), "{theirs}");
-    assert!(theirs.contains("Subtract(Literal(Literal { value: \"10\""), "{theirs}");
+    assert!(
+        theirs.contains("Subtract(Literal(Literal { value: \"10\""),
+        "{theirs}"
+    );
     // nrese: the left operand of the outer subtraction is `10 - 5`.
-    assert!(ours.contains("Subtract(Subtract(Literal(Literal { value: \"10\""), "{ours}");
+    assert!(
+        ours.contains("Subtract(Subtract(Literal(Literal { value: \"10\""),
+        "{ours}"
+    );
+}
+
+/// PR #61: `&&` and `||` were reassociated in the algebra's
+/// text, a base IRI's included, so two distinct bases (which `IRI("leaf")` resolves against)
+/// compared equal, and a base spelling `And()` panicked. The nesting of one of them is no
+/// difference; bases, terms, mixed operators, negation, scope and operand order are.
+#[test]
+fn and_and_or_differ_in_nothing_but_their_nesting() {
+    let query = |text: &str| canonical(SparqlParser::new().parse_query(text).unwrap());
+    // The base alone tells the queries apart.
+    let base = |iri: &str| query(&format!("BASE <http://example.org/{iri}/> SELECT * {{}}"));
+    assert_ne!(
+        base("And(aaaa,And(bbbb,cccc))"),
+        base("And(And(aaaa,bbbb),cccc)"),
+        "SPEC two base IRIs differ, whatever they spell"
+    );
+    base("And()"); // read as no operator
+
+    let filter = |e: &str| format!("SELECT * {{ ?a ?b ?c FILTER({e}) }}");
+    let same = [
+        (filter("?a && (?b && ?c)"), filter("(?a && ?b) && ?c")),
+        (
+            filter("?a || ?b || ?c || ?d || ?e"),
+            filter("((?a || ?b) || (?c || ?d)) || ?e"),
+        ),
+        (
+            "SELECT * { ?a ?b ?c FILTER EXISTS { ?a ?b ?c FILTER(?a && (?b && ?c)) } }".into(),
+            "SELECT * { ?a ?b ?c FILTER EXISTS { ?a ?b ?c FILTER((?a && ?b) && ?c) } }".into(),
+        ),
+        (
+            "SELECT * { ?a ?b ?c } ORDER BY (?a && (?b && ?c))".into(),
+            "SELECT * { ?a ?b ?c } ORDER BY ((?a && ?b) && ?c)".into(),
+        ),
+        (
+            "SELECT (SUM(IF(?a || (?b || ?c), 1, 0)) AS ?n) { ?a ?b ?c }".into(),
+            "SELECT (SUM(IF((?a || ?b) || ?c, 1, 0)) AS ?n) { ?a ?b ?c }".into(),
+        ),
+        (
+            "SELECT * { ?a ?b ?c BIND(?a || (?b || ?c) AS ?d) }".into(),
+            "SELECT * { ?a ?b ?c BIND((?a || ?b) || ?c AS ?d) }".into(),
+        ),
+        (
+            "SELECT * { ?a ?b ?c OPTIONAL { ?a ?b ?d FILTER(?a && (?b && ?d)) } }".into(),
+            "SELECT * { ?a ?b ?c OPTIONAL { ?a ?b ?d FILTER((?a && ?b) && ?d) } }".into(),
+        ),
+    ];
+    for (a, b) in &same {
+        assert_eq!(
+            query(a),
+            query(b),
+            "SPEC only the nesting differs: {a} | {b}"
+        );
+    }
+    let update = |text: &str| canonical_update(SparqlParser::new().parse_update(text).unwrap());
+    assert_eq!(
+        update("DELETE { ?a ?b ?c } WHERE { ?a ?b ?c FILTER(?a && (?b && ?c)) }"),
+        update("DELETE { ?a ?b ?c } WHERE { ?a ?b ?c FILTER((?a && ?b) && ?c) }"),
+        "SPEC an update's pattern alike"
+    );
+    let distinct = [
+        (filter("?a && ?b"), filter("?a && ?c")),
+        (filter("?a && (?b || ?c)"), filter("(?a && ?b) || ?c")),
+        (filter("!(?a && ?b)"), filter("!?a && ?b")),
+        (filter("?a && ?b"), filter("?b && ?a")),
+        (
+            filter("?a = \"And(x,And(y,z))\""),
+            filter("?a = \"And(And(x,y),z)\""),
+        ),
+        (
+            "SELECT * { ?a ?b ?c OPTIONAL { ?a ?b ?d FILTER(?a && ?d) } }".into(),
+            "SELECT * { ?a ?b ?c OPTIONAL { ?a ?b ?d } FILTER(?a && ?d) }".into(),
+        ),
+    ];
+    for (a, b) in &distinct {
+        assert_ne!(
+            query(a),
+            query(b),
+            "SPEC more than the nesting differs: {a} | {b}"
+        );
+    }
+}
+
+/// Signs were folded in the algebra's text, so a base IRI spelling
+/// `UnaryMinus(Literal(…integer))` panicked and two bases apart by `Unary_` compared equal.
+/// A sign folds over a number literal and nothing else.
+#[test]
+fn a_sign_folds_over_a_number_literal_alone() {
+    let query = |text: &str| canonical(SparqlParser::new().parse_query(text).unwrap());
+    let base = |iri: &str| query(&format!("BASE <http://example.org/{iri}/> SELECT * {{}}"));
+    assert_ne!(
+        base("Unary_"),
+        base("Unary"),
+        "SPEC two base IRIs differ, whatever they spell"
+    );
+    let update = concat!(
+        "BASE <http://example.org/UnaryMinus(Literal(http://www.w3.org/2001/XMLSchema#integer))> ",
+        "INSERT DATA { <urn:s> <urn:p> 1 }"
+    );
+    canonical_update(SparqlParser::new().parse_update(update).unwrap()); // read as no sign
+    let text = "SELECT (-1 AS ?a) {}";
+    let theirs = spargebra::SparqlParser::new().parse_query(text).unwrap();
+    assert_eq!(
+        query(text),
+        canonical(Names::default().query(&theirs)),
+        "SPEC -1 is the signed literal on both sides"
+    );
+    assert_ne!(
+        query("SELECT (-\"1\" AS ?a) {}"),
+        query("SELECT (\"-1\" AS ?a) {}"),
+        "SPEC a sign over a string stays"
+    );
+}
+
+/// Generated names were renamed in the algebra's text, so a literal
+/// starting with `__` was renamed as one: `"__agg0"` beside an aggregate made a difference
+/// where there is none, and `"__a"` compared equal to `"__b"`. Names are variables and blank
+/// nodes.
+#[test]
+fn generated_names_are_variables_and_blank_nodes_alone() {
+    let ours = |text: &str| canonical(SparqlParser::new().parse_query(text).unwrap());
+    let theirs = |text: &str| {
+        let query = spargebra::SparqlParser::new().parse_query(text).unwrap();
+        canonical(Names::default().query(&query))
+    };
+    let text = "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p \"__agg0\" }";
+    assert_eq!(ours(text), theirs(text), "SPEC a literal is no name");
+    let text = "SELECT * { ?s ?p [] }";
+    assert_eq!(
+        ours(text),
+        theirs(text),
+        "SPEC generated blank nodes renamed alike"
+    );
+    assert_ne!(
+        ours("SELECT * { ?a ?b ?c FILTER(?a = \"__a\") }"),
+        ours("SELECT * { ?a ?b ?c FILTER(?a = \"__b\") }"),
+        "SPEC two literals differ, whatever they spell"
+    );
+}
+
+/// PR #73: a sign was written before any number literal's text, so `-(-1)`, the
+/// number 1, became `"--1"^^xsd:integer`, which is no number and another query's own literal.
+/// A sign over a literal no unsigned token spells keeps its unary structure.
+#[test]
+fn a_sign_never_folds_into_another_term() {
+    let query = |text: &str| canonical(SparqlParser::new().parse_query(text).unwrap());
+    assert_eq!(
+        compare(
+            &query("SELECT (isNumeric(-(-1)) AS ?ok) {}"),
+            &query(
+                "SELECT (isNumeric(\"--1\"^^<http://www.w3.org/2001/XMLSchema#integer>) AS ?ok) {}"
+            ),
+        ),
+        "different algebra",
+        "SPEC -(-1) is a number, \"--1\" none (SPARQL 1.1 sections 17.3, 17.4.2.4)"
+    );
+    let select = |e: &str| {
+        query(&format!(
+            "PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> SELECT ({e} AS ?a) {{}}"
+        ))
+    };
+    let distinct = [
+        (
+            "-\"abc\"^^xsd:integer",
+            "\"-abc\"^^xsd:integer",
+            "the sign of no number is an error, the literal ill-typed",
+        ),
+        (
+            "-\"NaN\"^^xsd:double",
+            "\"-NaN\"^^xsd:double",
+            "NaN negated is NaN, \"-NaN\" no double",
+        ),
+        (
+            "-\"1\"^^xsd:int",
+            "\"-1\"^^xsd:int",
+            "the negation of an xsd:int is an xsd:integer",
+        ),
+    ];
+    for (sign, literal, why) in distinct {
+        assert_eq!(
+            compare(&select(sign), &select(literal)),
+            "different algebra",
+            "SPEC {why}: {sign} | {literal}"
+        );
+    }
+}
+
+/// PR #73: a sign was folded into a number wherever the spelling allowed,
+/// so `+(1)` and the token `+1` compared the same, though `sameTerm(+(1), 1)` is true and
+/// `sameTerm(+1, 1)` false: unary plus keeps its operand's term, the token is a term of its
+/// own. spargebra reads the two alike, so such a sign is unresolved, never the same; a minus
+/// over a canonical integer alone is one term both ways, and only one nrese's evaluator holds
+/// (`-(9223372036854775808)` is an error there, the token a number).
+#[test]
+fn a_sign_over_a_number_is_the_same_only_as_one_term() {
+    let query = |text: &str| canonical(SparqlParser::new().parse_query(text).unwrap());
+    assert_eq!(
+        compare(
+            &query("SELECT (sameTerm(+(1), 1) AS ?ok) {}"),
+            &query("SELECT (sameTerm(+1, 1) AS ?ok) {}"),
+        ),
+        "unresolved",
+        "SPEC sameTerm(+(1), 1) is true, sameTerm(+1, 1) false: never the same"
+    );
+    let select = |e: &str| format!("SELECT ({e} AS ?a) {{}}");
+    let two_terms = [
+        ("-(0)", "-0"),
+        ("-(.5)", "-.5"),
+        ("-(1.5e3)", "-1.5e3"),
+        ("-(01)", "-01"),
+    ];
+    for (expression, token) in two_terms {
+        assert_eq!(
+            compare(&query(&select(expression)), &query(&select(token))),
+            "unresolved",
+            "SPEC the expression's term isn't the token's: {expression} | {token}"
+        );
+    }
+    assert_eq!(
+        compare(&query(&select("-(2)")), &query(&select("-2"))),
+        "same algebra",
+        "SPEC -(2) evaluates to \"-2\", the token's term"
+    );
+    let bound = |e: &str| {
+        query(&format!(
+            "SELECT (BOUND(?x) AS ?ok) WHERE {{ BIND({e} AS ?x) }}"
+        ))
+    };
+    assert_eq!(
+        compare(
+            &bound("-(9223372036854775808)"),
+            &bound("-9223372036854775808")
+        ),
+        "unresolved",
+        "SPEC an integer past 64 bits is no number to nrese's evaluator, so -(9223372036854775808) \
+         leaves ?x unbound, while the token -9223372036854775808 binds it: never the same"
+    );
+    assert_eq!(
+        compare(
+            &bound("-(9223372036854775807)"),
+            &bound("-9223372036854775807")
+        ),
+        "same algebra",
+        "SPEC -(9223372036854775807) evaluates to the token -9223372036854775807's term"
+    );
+    let both = |text: &str| {
+        let theirs = spargebra::SparqlParser::new().parse_query(text).unwrap();
+        compare(&query(text), &canonical(Names::default().query(&theirs)))
+    };
+    assert_eq!(
+        both("SELECT (+1 AS ?a) (-.5 AS ?b) (+1.5e3 AS ?c) (-1.E-2 AS ?d) {}"),
+        "unresolved",
+        "SPEC spargebra reads each signed token as a sign over it: unresolved"
+    );
+    assert_eq!(
+        both(&select("-2")),
+        "same algebra",
+        "SPEC -2 is one term on both sides"
+    );
+}
+
+/// PR #73: spargebra's random names were given the aliases `__x0`, `__x1`, …,
+/// names a query may have itself, so an aggregate's variable merged with the query's own
+/// `?__x0`, and an anonymous blank node with its `_:__x0`. An alias is no name of the query's.
+#[test]
+fn an_alias_is_no_name_of_the_query_s() {
+    let texts = [
+        "SELECT ?__x0 (COUNT(*) AS ?n) WHERE { ?__x0 <urn:p> ?o } GROUP BY ?__x0",
+        "SELECT * { _:__x0 <urn:p> [] }",
+    ];
+    for text in texts {
+        let theirs = spargebra::SparqlParser::new().parse_query(text).unwrap();
+        assert_eq!(
+            canonical(SparqlParser::new().parse_query(text).unwrap()),
+            canonical(Names::default().query(&theirs)),
+            "SPEC the query's name and a generated one stay two names on both sides: {text}"
+        );
+    }
+}
+
+/// Whether an entry of `list` explains `file`'s difference `key`: one naming the file and
+/// that outcome (D-106: the file's name alone explained any outcome it came to have).
+fn explains(list: &[(&str, &str, &str)], file: &str, key: &str) -> bool {
+    list.iter().any(|(f, k, _)| *f == file && *k == key)
+}
+
+/// The entries of `list` the outcome doesn't show, each as `file: outcome`: an entry stands
+/// for a difference that is there, as it is.
+fn not_seen(outcome: &BTreeMap<&str, Vec<String>>, list: &[(&str, &str, &str)]) -> Vec<String> {
+    list.iter()
+        .filter(|(file, key, _)| {
+            !outcome
+                .get(key)
+                .is_some_and(|files| files.iter().any(|f| f == file))
+        })
+        .map(|(file, key, _)| format!("{file}: {key}"))
+        .collect()
+}
+
+#[test]
+fn an_explanation_holds_for_its_file_and_outcome_alone() {
+    // D-106 (PR #61: a witness the existing differences don't mask): an explained file
+    // whose outcome changed is a difference again, and its entry stands unseen.
+    let list = [("a.rq", "only nrese accepts", "why")];
+    let changed = BTreeMap::from([("different algebra", vec!["a.rq".to_owned()])]);
+    assert!(
+        !explains(&list, "a.rq", "different algebra"),
+        "SPEC the file's name alone explains nothing"
+    );
+    assert_eq!(
+        not_seen(&changed, &list),
+        ["a.rq: only nrese accepts"],
+        "SPEC the entry isn't seen so"
+    );
+    let kept = BTreeMap::from([("only nrese accepts", vec!["a.rq".to_owned()])]);
+    assert!(explains(&list, "a.rq", "only nrese accepts"));
+    assert!(not_seen(&kept, &list).is_empty());
 }

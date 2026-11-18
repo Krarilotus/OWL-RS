@@ -22,13 +22,13 @@ FUSEKI_VERSION=${FUSEKI_VERSION:-6.0.0} # the integration workload's project pin
 RUST_IMAGE=rust:$(sed -n 's/^channel = "\(.*\)"/\1/p' "$ROOT/rust-toolchain.toml")-bookworm
 
 PULLED=(
-  "adfreiburg/qlever:latest"
-  "ghcr.io/oxigraph/oxigraph:0.5.11"
+  "adfreiburg/qlever:commit-0998359ab0"
+  "ghcr.io/oxigraph/oxigraph:0.5.13"
   "openlink/virtuoso-opensource-7:7.2.17"
-  "ontotext/graphdb:11.5.1"
+  "ontotext/graphdb:11.5.2"
   "oxfordsemantic/rdfox:7.6b"
   "stardog/stardog:latest"
-  "eclipse/rdf4j-workbench:latest"
+  "eclipse/rdf4j-workbench:6.1.0-tomcat"
   "obolibrary/robot:v1.9.8" # ELK and HermiT: the classification oracle
   "eclipse-temurin:21-jre"
   "eclipse-temurin:21-jdk" # compiles the Java runners (reasoning/jena, oracle/jena)

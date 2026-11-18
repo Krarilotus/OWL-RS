@@ -6,7 +6,13 @@ use nrese_engine::{
 };
 use nrese_rdf::{Graph, GraphNameRef, NamedNode, NamedNodeRef, QuadRef, TermRef};
 use nrese_rdf_io::{RdfFormat, RdfParser};
-use nrese_shacl::{Component, PropertyPath, Selection, Shapes, compile, validate};
+use nrese_shacl::{Component, PropertyPath, Selection, Shapes, ValidationReport, compile};
+use nrese_sparql::{CancellationToken, QueryEvaluationError, ReadView, Resources};
+
+/// Validation on resources that never stop it.
+fn validate<V: ReadView + Sync>(view: &V, shapes: &Shapes, data: Selection) -> ValidationReport {
+    nrese_shacl::validate(view, shapes, data, &Resources::default()).expect("nothing stops it")
+}
 
 const PREFIXES: &str = "@prefix ex: <http://example.com/> .
 @prefix sh: <http://www.w3.org/ns/shacl#> .
@@ -58,6 +64,25 @@ fn compiled(snapshot: &Snapshot) -> Shapes {
 
 const DEFAULT: Selection = Selection::of(GraphSelector::Exact(TermId::DEFAULT_GRAPH));
 
+// Spec: SHACL node kinds containing Literal do not accept an RDF 1.2 triple term.
+#[test]
+fn d066_f1_triple_term_is_not_a_literal_node_kind() {
+    for kind in ["Literal", "BlankNodeOrLiteral", "IRIOrLiteral"] {
+        let store = engine(
+            "ex:s ex:p <<( ex:a ex:b ex:c )>> .",
+            &format!("ex:S a sh:NodeShape ; sh:targetObjectsOf ex:p ; sh:nodeKind sh:{kind} ."),
+        );
+        let snapshot = store.snapshot();
+        let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+        assert!(!report.conforms(), "a triple term is not sh:{kind}");
+        assert_eq!(report.results.len(), 1);
+        assert_eq!(
+            report.results[0].component.as_str(),
+            Component::NodeKind.iri()
+        );
+    }
+}
+
 fn ex(local: &str) -> String {
     format!("<http://example.com/{local}>")
 }
@@ -104,6 +129,114 @@ fn ill_formed_shapes_are_errors_that_name_the_shape() {
             "{shape}: {errors:?}"
         );
         assert!(!errors[0].shape.is_empty());
+    }
+}
+
+/// SHACL 1.0 §4.1.2: a literal matches `sh:datatype` only if it isn't ill-typed. Which
+/// lexical forms a datatype has is the engine's one datatype map (nrese-xsd's), as OWL
+/// reads it: the same literal isn't ill-typed to one and well-typed to the other. Each row:
+/// ex:a's one value of ex:v against `sh:datatype`, and whether it is a result. Controls: a
+/// valid binary; a valid form past what the engine represents (a 200-digit integer; a
+/// dateTimeStamp with 30 fractional digits), which is well-typed, only not represented; a
+/// language-tagged literal against rdf:langString. xsd:string takes XML 1.0's characters, as
+/// the map does (XSD 1.1 leaves XML 1.0 or 1.1 to the implementation): a string holding
+/// U+0001 is ill-typed; a plain string is the control.
+#[test]
+fn sh_datatype_rejects_what_the_datatype_map_calls_ill_typed() {
+    let huge = "9".repeat(200);
+    let rows: [(&str, String, &str, bool); 12] = [
+        (
+            "string holding U+0001",
+            "\"a\\u0001b\"^^xsd:string".into(),
+            "xsd:string",
+            true,
+        ),
+        (
+            "control: a plain string",
+            "\"plain\"".into(),
+            "xsd:string",
+            false,
+        ),
+        (
+            "hexBinary GG",
+            "\"GG\"^^xsd:hexBinary".into(),
+            "xsd:hexBinary",
+            true,
+        ),
+        (
+            "base64Binary !!!!",
+            "\"!!!!\"^^xsd:base64Binary".into(),
+            "xsd:base64Binary",
+            true,
+        ),
+        (
+            "dateTimeStamp without a timezone",
+            "\"2026-11-09T00:00:00\"^^xsd:dateTimeStamp".into(),
+            "xsd:dateTimeStamp",
+            true,
+        ),
+        (
+            "token with a double space",
+            "\"a  b\"^^xsd:token".into(),
+            "xsd:token",
+            true,
+        ),
+        (
+            "control: hexBinary 0FA1",
+            "\"0FA1\"^^xsd:hexBinary".into(),
+            "xsd:hexBinary",
+            false,
+        ),
+        (
+            "control: a 200-digit integer",
+            format!("\"{huge}\"^^xsd:integer"),
+            "xsd:integer",
+            false,
+        ),
+        (
+            "control: a 200-digit nonNegativeInteger",
+            format!("\"{huge}\"^^xsd:nonNegativeInteger"),
+            "xsd:nonNegativeInteger",
+            false,
+        ),
+        (
+            "control: dateTimeStamp past the represented precision",
+            "\"2026-11-09T00:00:00.123456789012345678901234567890Z\"^^xsd:dateTimeStamp".into(),
+            "xsd:dateTimeStamp",
+            false,
+        ),
+        (
+            "control: a language-tagged literal",
+            "\"a\"@en".into(),
+            "rdf:langString",
+            false,
+        ),
+        // RDF 1.1 Concepts §3.3: a language-tagged string is any lexical form with a tag; the
+        // XML character restriction is xsd:string's (the U+0001 row above), not rdf:langString's.
+        (
+            "language-tagged string holding U+0001",
+            "\"a\\u0001b\"@en".into(),
+            "rdf:langString",
+            false,
+        ),
+    ];
+    for (row, value, datatype, result) in rows {
+        let engine = engine(
+            &format!("ex:a ex:v {value} ."),
+            &format!(
+                "ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+                   sh:property [ sh:path ex:v ; sh:datatype {datatype} ] ."
+            ),
+        );
+        let snapshot = engine.snapshot();
+        let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+        assert!(report.failures.is_empty(), "{row}: {:?}", report.failures);
+        assert_eq!(
+            report.results.len(),
+            usize::from(result),
+            "{row}: {:?}",
+            report.results
+        );
     }
 }
 
@@ -276,4 +409,1869 @@ fn the_report_is_an_rdf_graph() {
     let graph: Graph = empty.to_triples().into_iter().collect();
     assert_eq!(graph.len(), 2);
     assert!(empty.conforms());
+}
+
+/// `$PATH` is the property shape's path where it is a triple pattern's predicate, and only
+/// there (SHACL §5.2): a literal and a longer name keep their text, and any other use is
+/// ill-formed. A sequence path joins through its middle nodes as the path written there
+/// would: each solution is one result, so two ways to the same value are two results.
+#[test]
+fn path_is_substituted_only_as_a_predicate() {
+    let literal = "ex:a ex:p \"$PATH\" .";
+    let two_ways = "ex:a ex:p ex:m1, ex:m2 . ex:m1 ex:q ex:z . ex:m2 ex:q ex:z .";
+    for (data, path, query, expected) in [
+        (
+            literal,
+            "ex:p",
+            r#"SELECT $this ?value WHERE { $this $PATH ?value FILTER(STR(?value) != "$PATH") }"#,
+            Ok(0),
+        ),
+        (
+            literal,
+            "ex:p",
+            "SELECT $this ?value WHERE { $this $PATH ?value
+               OPTIONAL { ?value <http://example.com/q> ?PATHX } FILTER(!BOUND(?PATHX)) }",
+            Ok(1),
+        ),
+        (
+            literal,
+            "ex:p",
+            "SELECT $this ?value WHERE { $this $PATH ?value . ?value <http://example.com/q> $PATH }",
+            Err("other than as a predicate"),
+        ),
+        (
+            two_ways,
+            "( ex:p ex:q )",
+            "SELECT $this ?value WHERE { $this $PATH ?value }",
+            Ok(2),
+        ),
+    ] {
+        let engine = engine(
+            data,
+            &format!(
+                "ex:S sh:targetNode ex:a ; sh:property [ sh:path {path} ; sh:sparql [ sh:select '''{query}''' ] ] ."
+            ),
+        );
+        let snapshot = engine.snapshot();
+        match (compile(&snapshot, shapes_selection(&snapshot)), expected) {
+            (Ok(shapes), Ok(results)) => {
+                let report = validate(&snapshot, &shapes, DEFAULT);
+                assert!(report.failures.is_empty(), "{query}: {:?}", report.failures);
+                assert_eq!(report.results.len(), results, "{query}");
+            }
+            (Err(errors), Err(problem)) => assert!(
+                errors.iter().any(|error| error.message.contains(problem)),
+                "{query}: {errors:?}"
+            ),
+            (outcome, _) => panic!("{query}: {:?}", outcome.map(|shapes| shapes.len())),
+        }
+    }
+}
+
+/// SHACL-SPARQL reads the statements Core reads: a shapes graph left out of the data is
+/// left out of the queries' default graph too, so the two agree on a data-like statement in
+/// it, and `GRAPH $shapesGraph` still reads the shapes (RSH-06).
+#[test]
+fn sparql_constraints_read_the_data_core_reads() {
+    let engine = engine(
+        "ex:a ex:p ex:b .",
+        r#"ex:a ex:q ex:c .
+        ex:Core sh:targetNode ex:a ; sh:property [ sh:path ex:q ; sh:maxCount 0 ] .
+        ex:Sparql sh:targetNode ex:a ;
+            sh:sparql [ sh:select "SELECT $this WHERE { $this <http://example.com/q> ?o }" ] .
+        ex:Shapes sh:targetNode ex:a ; sh:sparql [ sh:select
+            "SELECT $this WHERE { GRAPH $shapesGraph { $this <http://example.com/q> ?o } }" ] ."#,
+    );
+    let snapshot = engine.snapshot();
+    let shapes = compiled(&snapshot);
+    let data = Selection::of(GraphSelector::Any).excluding(id(&snapshot, SHAPES_GRAPH));
+    let report = validate(&snapshot, &shapes, data);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let sources: Vec<String> = report
+        .results
+        .iter()
+        .map(|result| result.source_shape.to_string())
+        .collect();
+    assert_eq!(
+        sources,
+        [ex("Shapes")],
+        "only the query that reads the shapes graph"
+    );
+}
+
+/// A selection's form doesn't change what a SPARQL constraint reads: its own `FROM` or
+/// `FROM NAMED` is replaced by the selected data whatever the selection's form, so leaving
+/// out a graph that holds nothing changes nothing, and the default graph alone is pinned as
+/// every other selection is.
+#[test]
+fn a_constraints_dataset_is_the_selection_whatever_its_form() {
+    for clause in [
+        "FROM <http://example.com/shapes>",
+        "FROM NAMED <http://example.com/shapes>",
+    ] {
+        let engine = engine(
+            "ex:a ex:p ex:b .",
+            &format!(
+                "ex:Sparql sh:targetNode ex:a ; sh:sparql [ sh:select
+                  \"SELECT $this {clause} WHERE {{ $this <http://example.com/p> ?o }}\" ] ."
+            ),
+        );
+        let snapshot = engine.snapshot();
+        let shapes = compiled(&snapshot);
+        let results = |selection: Selection| {
+            let report = validate(&snapshot, &shapes, selection);
+            assert!(
+                report.failures.is_empty(),
+                "{clause}: {:?}",
+                report.failures
+            );
+            report.results.len()
+        };
+        // ex:p is a term, but no graph is named so: leaving it out leaves the data as it is.
+        let any = Selection::of(GraphSelector::Any);
+        let p = id(&snapshot, "http://example.com/p");
+        for selection in [any, any.excluding(p), DEFAULT] {
+            assert_eq!(results(selection), 1, "{clause}, {selection:?}");
+        }
+    }
+}
+
+/// Pre-binding puts `$currentShape` and `$shapesGraph` in throughout the query (SHACL
+/// Appendix A: every basic graph pattern is joined with the pre-bound values), subqueries
+/// included, though a subquery needn't project them (§5.6.2): unprojected, they are still
+/// bound inside it (research round 12).
+#[test]
+fn current_shape_and_shapes_graph_are_bound_in_subqueries() {
+    for query in [
+        "SELECT $this WHERE { { SELECT $this WHERE {
+           $this <http://example.com/p> ?v FILTER(sameTerm($currentShape, <http://example.com/S>)) } } }",
+        "SELECT $this WHERE { { SELECT $this WHERE {
+           $this <http://example.com/p> ?v GRAPH $shapesGraph { $currentShape a <http://www.w3.org/ns/shacl#NodeShape> } } } }",
+    ] {
+        let engine = engine(
+            "ex:a ex:p ex:b .",
+            &format!("ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''{query}''' ] ."),
+        );
+        let snapshot = engine.snapshot();
+        let shapes = compiled(&snapshot);
+        let report = validate(&snapshot, &shapes, DEFAULT);
+        assert!(report.failures.is_empty(), "{query}: {:?}", report.failures);
+        assert_eq!(report.results.len(), 1, "{query}");
+    }
+}
+
+/// SHACL §6.2: a SPARQL-based constraint component constrains a shape once per combination of
+/// the shape's values for its parameters. Two values of ex:p1 and three of ex:p2 are six
+/// constraints; the ASK fails where p1 < p2: (1 2), (1 3) and (2 3), so the focus node has
+/// three results. Pairing values by position, or stopping at the shorter list, finds fewer.
+#[test]
+fn a_component_constrains_once_per_combination_of_its_parameter_values() {
+    let engine = engine(
+        "ex:a ex:q ex:b .",
+        "ex:C a sh:ConstraintComponent ;
+           sh:parameter [ sh:path ex:p1 ] , [ sh:path ex:p2 ] ;
+           sh:validator [ a sh:SPARQLAskValidator ; sh:ask '''ASK { FILTER ($p1 >= $p2) }''' ] .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ; ex:p1 1 , 2 ; ex:p2 1 , 2 , 3 .",
+    );
+    let snapshot = engine.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.results.len(), 3, "{:?}", report.results);
+}
+
+/// `Shapes::uses_sparql` (Q07): a store confines a restricted reader's validation to its
+/// graphs through the view's quad reads, which SHACL-SPARQL's queries bypass. Each form,
+/// nested and deactivated shapes say so; SHACL Core alone doesn't.
+#[test]
+fn shapes_tell_whether_any_constraint_is_a_sparql_query() {
+    let component = "ex:C a sh:ConstraintComponent ; sh:parameter [ sh:path ex:p1 ] ;
+        sh:validator [ a sh:SPARQLAskValidator ; sh:ask '''ASK { FILTER (true) }''' ] .";
+    let select = "sh:sparql [ sh:select 'SELECT $this WHERE { FILTER (false) }' ]";
+    let cases = [
+        (
+            "core only",
+            "ex:S sh:targetNode ex:a ; sh:property [ sh:path ex:p ; sh:minCount 1 ] .".to_owned(),
+            false,
+        ),
+        (
+            "sh:sparql",
+            format!("ex:S sh:targetNode ex:a ; {select} ."),
+            true,
+        ),
+        (
+            "component",
+            format!("{component} ex:S sh:targetNode ex:a ; ex:p1 1 ."),
+            true,
+        ),
+        (
+            "nested in sh:node",
+            format!("ex:S sh:targetNode ex:a ; sh:node ex:N . ex:N {select} ."),
+            true,
+        ),
+        (
+            "nested in sh:property",
+            format!("ex:S sh:targetNode ex:a ; sh:property [ sh:path ex:p ; {select} ] ."),
+            true,
+        ),
+        (
+            "deactivated",
+            format!("ex:S sh:targetNode ex:a ; sh:deactivated true ; {select} ."),
+            true,
+        ),
+    ];
+    for (case, shapes, expected) in cases {
+        let engine = engine("ex:a ex:p ex:b .", &shapes);
+        let snapshot = engine.snapshot();
+        assert_eq!(compiled(&snapshot).uses_sparql(), expected, "{case}");
+    }
+}
+
+/// Shapes with a constraint component of `parameters` parameters, `values` values each on
+/// shape ex:S (targeting ex:a), an ASK that every combination fails, and a message of
+/// `message` bytes on ex:S: `values`^`parameters` results, each with that message.
+fn failing_component(parameters: usize, values: usize, message: usize) -> String {
+    let declared: Vec<String> = (0..parameters)
+        .map(|p| format!("[ sh:path ex:p{p} ]"))
+        .collect();
+    let given: Vec<String> = (0..parameters)
+        .map(|p| {
+            let values: Vec<String> = (0..values).map(|v| v.to_string()).collect();
+            format!("ex:p{p} {}", values.join(" , "))
+        })
+        .collect();
+    format!(
+        "ex:C a sh:ConstraintComponent ; sh:parameter {} ;
+           sh:validator [ a sh:SPARQLAskValidator ; sh:ask '''ASK {{ FILTER(false) }}''' ] .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:message \"{}\" ; {} .",
+        declared.join(" , "),
+        "x".repeat(message),
+        given.join(" ; ")
+    )
+}
+
+/// Guard: with room for them, every combination's result is reported:
+/// 8^4 = 4096, each with the shape's 4 KiB message.
+#[test]
+fn a_component_s_results_are_all_reported_when_affordable() {
+    let store = engine("ex:a ex:q ex:b .", &failing_component(4, 8, 4096));
+    let snapshot = store.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(report.results.len(), 4096);
+    assert!(
+        report
+            .results
+            .iter()
+            .all(|result| result.messages.len() == 1 && result.messages[0].value().len() == 4096)
+    );
+}
+
+/// The decoded report is charged before it is built. 16^2 = 256 results are
+/// a few hundred bytes each as ids, but each decodes the shape's 16 KiB message: 4 MiB of
+/// message text. A 1 MiB envelope holds the results (every combination runs: 256 queries)
+/// and refuses their report.
+#[test]
+fn a_report_past_the_envelope_is_refused() {
+    let store = engine("ex:a ex:q ex:b .", &failing_component(2, 16, 16 << 10));
+    let snapshot = store.snapshot();
+    // A view that never cancels: it counts the queries.
+    let view = CancelAfter {
+        inner: &snapshot,
+        token: CancellationToken::new(),
+        evaluations: std::sync::atomic::AtomicUsize::new(0),
+        at: usize::MAX,
+        in_report: false,
+    };
+    let resources = Resources {
+        memory: nrese_exec::Envelope::new(Some(1 << 20), None),
+        ..Resources::default()
+    };
+    let outcome = nrese_shacl::validate(&view, &compiled(&snapshot), DEFAULT, &resources);
+    assert_eq!(
+        view.evaluations.load(std::sync::atomic::Ordering::SeqCst),
+        256,
+        "the walk ran every combination before the refusal"
+    );
+    assert!(
+        matches!(outcome, Err(QueryEvaluationError::MemoryLimit(_))),
+        "{:?}",
+        outcome.map(|report| report.results.len())
+    );
+}
+
+/// A validation's results and their decoded messages are charged to its
+/// envelope. 8^4 results, each decoding a 4 KiB message, are 16 MiB of message text alone;
+/// a 1 MiB envelope refuses them: the outcome is that refusal, with no report.
+#[test]
+fn a_component_s_results_past_the_envelope_are_refused() {
+    let store = engine("ex:a ex:q ex:b .", &failing_component(4, 8, 4096));
+    let snapshot = store.snapshot();
+    let resources = Resources {
+        memory: nrese_exec::Envelope::new(Some(1 << 20), None),
+        ..Resources::default()
+    };
+    let outcome = nrese_shacl::validate(&snapshot, &compiled(&snapshot), DEFAULT, &resources);
+    assert!(
+        matches!(outcome, Err(QueryEvaluationError::MemoryLimit(_))),
+        "{:?}",
+        outcome.map(|report| report.results.len())
+    );
+}
+
+/// Guard (fails on 707e24dd): what a change's validation finds in the
+/// state before is charged per result found and returned per result found, though the set
+/// it is compared in keeps one of each. Sixteen shapes each fail all 16^2 combinations of a
+/// component with the same result (a result names no combination); an unrelated change
+/// introduces nothing, and a 1 MiB envelope affords it, one shape at a time.
+#[test]
+fn repeated_results_of_a_change_s_validation_are_returned() {
+    let values: Vec<String> = (0..16).map(|v| v.to_string()).collect();
+    let values = values.join(" , ");
+    let shapes: Vec<String> = (0..16)
+        .map(|s| {
+            format!(
+                "ex:S{s} a sh:NodeShape ; sh:targetNode ex:a ; ex:p0 {values} ; ex:p1 {values} ."
+            )
+        })
+        .collect();
+    let store = engine(
+        "ex:a ex:q ex:b .",
+        &format!(
+            "ex:C a sh:ConstraintComponent ; sh:parameter [ sh:path ex:p0 ] , [ sh:path ex:p1 ] ;
+               sh:validator [ a sh:SPARQLAskValidator ; sh:ask '''ASK {{ FILTER(false) }}''' ] .
+             {}",
+            shapes.join("\n")
+        ),
+    );
+    let before = store.snapshot();
+    let compiled_before = compiled(&before);
+    let mut tx = store.transaction();
+    tx.insert(QuadRef::new(
+        NamedNodeRef::new_unchecked("http://example.com/z"),
+        NamedNodeRef::new_unchecked("http://example.com/q"),
+        NamedNodeRef::new_unchecked("http://example.com/w"),
+        GraphNameRef::DefaultGraph,
+    ));
+    let changed: Vec<_> = tx.inserted().collect();
+    let after = tx.pending_snapshot();
+    let resources = Resources {
+        memory: nrese_exec::Envelope::new(Some(1 << 20), None),
+        ..Resources::default()
+    };
+    let introduced = nrese_shacl::validate_changes(
+        &before,
+        &after,
+        &compiled_before,
+        DEFAULT,
+        &changed,
+        &resources,
+    );
+    assert!(
+        matches!(&introduced, Ok(report) if report.results.is_empty()),
+        "{:?}",
+        introduced.map(|report| report.results.len())
+    );
+}
+
+/// A view of `inner` that cancels `token` at its `at`-th query evaluation, or, with
+/// `in_report`, at the first term it decodes after that evaluation (by then the walk has
+/// run every query, so the decode is the report's).
+struct CancelAfter<'v> {
+    inner: &'v Snapshot,
+    token: CancellationToken,
+    evaluations: std::sync::atomic::AtomicUsize,
+    at: usize,
+    in_report: bool,
+}
+
+impl<'v> ReadView for CancelAfter<'v> {
+    fn quads_for_pattern_in<'a>(
+        &'a self,
+        model: ReadModel,
+        pattern: &nrese_engine::QuadPattern,
+    ) -> impl Iterator<Item = nrese_engine::EncodedQuad> + use<'a, 'v> {
+        self.inner.quads_for_pattern_in(model, pattern)
+    }
+
+    fn named_graphs<'a>(&'a self) -> impl Iterator<Item = TermId> + use<'a, 'v> {
+        ReadView::named_graphs(self.inner)
+    }
+
+    fn contains_named_graph(&self, graph: TermId) -> bool {
+        ReadView::contains_named_graph(self.inner, graph)
+    }
+
+    fn lookup(&self, term: TermRef<'_>) -> Option<TermId> {
+        ReadView::lookup(self.inner, term)
+    }
+
+    fn decode(&self, id: TermId) -> Option<nrese_rdf::Term> {
+        if self.in_report && self.evaluations.load(std::sync::atomic::Ordering::SeqCst) >= self.at {
+            self.token.cancel();
+        }
+        ReadView::decode(self.inner, id)
+    }
+
+    fn decode_quad(&self, quad: nrese_engine::EncodedQuad) -> Option<nrese_rdf::Quad> {
+        ReadView::decode_quad(self.inner, quad)
+    }
+
+    fn snapshot(&self) -> Option<&Snapshot> {
+        Some(self.inner)
+    }
+
+    fn evaluation_snapshot(&self) -> Result<std::borrow::Cow<'_, Snapshot>, QueryEvaluationError> {
+        let n = self
+            .evaluations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        if !self.in_report && n == self.at {
+            self.token.cancel();
+        }
+        Ok(std::borrow::Cow::Borrowed(self.inner))
+    }
+}
+
+/// Validates `snapshot` against its shapes through a [`CancelAfter`] view: the outcome and
+/// the number of queries evaluated.
+fn cancelled_after(
+    snapshot: &Snapshot,
+    at: usize,
+    in_report: bool,
+) -> (Result<usize, QueryEvaluationError>, usize) {
+    let token = CancellationToken::new();
+    let view = CancelAfter {
+        inner: snapshot,
+        token: token.clone(),
+        evaluations: std::sync::atomic::AtomicUsize::new(0),
+        at,
+        in_report,
+    };
+    let resources = Resources {
+        cancellation: Some(token),
+        ..Resources::default()
+    };
+    let outcome = nrese_shacl::validate(&view, &compiled(snapshot), DEFAULT, &resources)
+        .map(|report| report.results.len());
+    let evaluations = view.evaluations.load(std::sync::atomic::Ordering::SeqCst);
+    (outcome, evaluations)
+}
+
+/// Guard: a cancellation after some combinations ran stops the walk: of 4^2
+/// = 16 combinations, the cancellation at the 5th query leaves the 7th unrun.
+#[test]
+fn a_cancellation_between_combinations_stops_the_walk() {
+    let store = engine("ex:a ex:q ex:b .", &failing_component(2, 4, 16));
+    let snapshot = store.snapshot();
+    let (outcome, evaluations) = cancelled_after(&snapshot, 5, false);
+    assert!(
+        matches!(outcome, Err(QueryEvaluationError::Cancelled)),
+        "{outcome:?}"
+    );
+    assert!(evaluations <= 6, "{evaluations} queries ran");
+}
+
+/// A cancellation while the report is decoded, after all 4^2 = 16
+/// combinations ran, is the outcome: no report.
+#[test]
+fn a_cancellation_while_the_report_is_decoded_stops_it() {
+    let store = engine("ex:a ex:q ex:b .", &failing_component(2, 4, 16));
+    let snapshot = store.snapshot();
+    let (outcome, evaluations) = cancelled_after(&snapshot, 16, true);
+    assert_eq!(evaluations, 16, "every combination ran first");
+    assert!(
+        matches!(outcome, Err(QueryEvaluationError::Cancelled)),
+        "{outcome:?}"
+    );
+}
+
+/// Shapes with a component whose SELECT node validator reports `?failure` once for each of
+/// `values` parameter values on ex:S (targeting ex:a), and, with `named`, a property shape
+/// that ex:a fails (no ex:name): `values` failures, each the same 85-byte message.
+fn failure_component(values: usize, named: bool) -> String {
+    let values: Vec<String> = (0..values).map(|v| v.to_string()).collect();
+    format!(
+        "ex:C a sh:ConstraintComponent ; sh:parameter [ sh:path ex:p ] ;
+           sh:nodeValidator [ a sh:SPARQLSelectValidator ;
+             sh:select '''SELECT $this ?failure WHERE {{ BIND(true AS ?failure) }}''' ] .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ; ex:p {} {} .",
+        values.join(" , "),
+        if named {
+            "; sh:property [ sh:path ex:name ; sh:minCount 1 ]"
+        } else {
+            ""
+        }
+    )
+}
+
+/// The failures a validation keeps are charged once, and the report takes
+/// them over with their charge. 8192 failures of 85 bytes are charged 133 bytes each kept:
+/// 1,089,536 bytes, which a 1.5 MiB envelope affords once (not twice). The report is
+/// returned, with every failure.
+#[test]
+fn a_failure_report_that_fits_once_is_returned() {
+    let store = engine("ex:b ex:q ex:c .", &failure_component(8192, false));
+    let snapshot = store.snapshot();
+    let resources = Resources {
+        memory: nrese_exec::Envelope::new(Some(3 << 19), None),
+        ..Resources::default()
+    };
+    let outcome = nrese_shacl::validate(&snapshot, &compiled(&snapshot), DEFAULT, &resources)
+        .map(|report| (report.results.len(), report.failures.len()));
+    assert!(matches!(outcome, Ok((0, 8192))), "{outcome:?}");
+}
+
+/// Incremental: a change's validation keeps the failures of the state after
+/// (charged once, taken over by the report) and drops those of the state before with their
+/// charge. 4096 failures in each state (544,768 bytes each): both states fit a 1.25 MiB
+/// envelope while they are validated; the state after's, charged a second time beside the
+/// state before's, would not.
+#[test]
+fn a_change_s_failures_are_charged_once_and_the_earlier_ones_returned() {
+    let store = engine("ex:b ex:q ex:c .", &failure_component(4096, true));
+    let before = store.snapshot();
+    let compiled_before = compiled(&before);
+    let mut tx = store.transaction();
+    tx.insert(QuadRef::new(
+        NamedNodeRef::new_unchecked("http://example.com/z"),
+        NamedNodeRef::new_unchecked("http://example.com/q"),
+        NamedNodeRef::new_unchecked("http://example.com/w"),
+        GraphNameRef::DefaultGraph,
+    ));
+    let changed: Vec<_> = tx.inserted().collect();
+    let after = tx.pending_snapshot();
+    let resources = Resources {
+        memory: nrese_exec::Envelope::new(Some(5 << 18), None),
+        ..Resources::default()
+    };
+    let outcome = nrese_shacl::validate_changes(
+        &before,
+        &after,
+        &compiled_before,
+        DEFAULT,
+        &changed,
+        &resources,
+    )
+    .map(|report| (report.results.len(), report.failures.len()));
+    assert!(matches!(outcome, Ok((0, 4096))), "{outcome:?}");
+}
+
+/// Whatever ends a validation, its charges end with it. The request's envelope
+/// draws on a server budget; after a refusal, after a cancellation while the report was
+/// decoded, and once a returned report is dropped, the server budget holds nothing.
+#[test]
+fn a_validation_s_charges_end_with_it() {
+    let server = nrese_exec::SharedBudget::new(64 << 20);
+    let envelope = || nrese_exec::Envelope::new(Some(1 << 20), Some(server.clone()));
+    // Refused.
+    let store = engine("ex:a ex:q ex:b .", &failing_component(4, 8, 4096));
+    let snapshot = store.snapshot();
+    let resources = Resources {
+        memory: envelope(),
+        ..Resources::default()
+    };
+    let refused = nrese_shacl::validate(&snapshot, &compiled(&snapshot), DEFAULT, &resources);
+    assert!(matches!(refused, Err(QueryEvaluationError::MemoryLimit(_))));
+    assert_eq!(server.used(), 0, "after a refusal");
+    // Cancelled while the report was decoded.
+    let store = engine("ex:a ex:q ex:b .", &failing_component(2, 4, 16));
+    let snapshot = store.snapshot();
+    let token = CancellationToken::new();
+    let view = CancelAfter {
+        inner: &snapshot,
+        token: token.clone(),
+        evaluations: std::sync::atomic::AtomicUsize::new(0),
+        at: 16,
+        in_report: true,
+    };
+    let resources = Resources {
+        cancellation: Some(token),
+        memory: envelope(),
+        ..Resources::default()
+    };
+    let cancelled = nrese_shacl::validate(&view, &compiled(&snapshot), DEFAULT, &resources);
+    assert!(matches!(cancelled, Err(QueryEvaluationError::Cancelled)));
+    assert_eq!(server.used(), 0, "after a cancellation");
+    // Returned, then dropped.
+    let resources = Resources {
+        memory: envelope(),
+        ..Resources::default()
+    };
+    let report = nrese_shacl::validate(&snapshot, &compiled(&snapshot), DEFAULT, &resources)
+        .expect("affordable");
+    assert_eq!(report.results.len(), 16);
+    assert!(server.used() > 0, "a report holds its charge");
+    drop(report);
+    assert_eq!(server.used(), 0, "after the report is dropped");
+}
+
+/// RSH-07: a validation runs on its caller's resources, its SHACL-SPARQL queries included,
+/// nested shapes' too. When they stop it (the cancellation fired, or the envelope refused
+/// a charge), the outcome is that stop: not a report of what was found before it, and not a
+/// "failure" of the constraint whose query was stopped (a commit gate would pass a warning).
+#[test]
+fn a_stopped_validation_returns_the_stop_not_a_report() {
+    let cancelled = {
+        let token = CancellationToken::new();
+        token.cancel();
+        Resources {
+            cancellation: Some(token),
+            ..Resources::default()
+        }
+    };
+    // Forty subjects of ex:p: the query's three-way product is 64,000 rows, past 64 KiB.
+    let small = Resources {
+        memory: nrese_exec::Envelope::new(Some(64 * 1024), None),
+        ..Resources::default()
+    };
+    let data: String = (0..40).map(|i| format!("ex:s{i} ex:p ex:o . ")).collect();
+    let data = format!("{data} ex:a a ex:Person .");
+    let wide = "SELECT $this ?value ?b ?c WHERE { ?value <http://example.com/p> ?x .
+        ?b <http://example.com/p> ?y . ?c <http://example.com/p> ?z }";
+    let named = "ex:S a sh:NodeShape ; sh:targetClass ex:Person ;
+        sh:property [ sh:path ex:name ; sh:minCount 1 ] .";
+    let rows = [
+        ("a Core shape, cancelled", named.to_owned(), &cancelled),
+        (
+            "sh:sparql past the envelope",
+            format!(
+                "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''{wide}''' ] ."
+            ),
+            &small,
+        ),
+        (
+            "sh:sparql of a nested shape past the envelope",
+            format!(
+                "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:node ex:N .
+                 ex:N a sh:NodeShape ; sh:sparql [ sh:select '''{wide}''' ] ."
+            ),
+            &small,
+        ),
+    ];
+    for (row, shapes, resources) in rows {
+        let engine = engine(&data, &shapes);
+        let snapshot = engine.snapshot();
+        let outcome = nrese_shacl::validate(&snapshot, &compiled(&snapshot), DEFAULT, resources);
+        let stopped = match &outcome {
+            Err(QueryEvaluationError::Cancelled) => resources.cancellation.is_some(),
+            Err(QueryEvaluationError::MemoryLimit(_)) => resources.cancellation.is_none(),
+            _ => false,
+        };
+        assert!(stopped, "{row}: {outcome:?}");
+    }
+
+    // What a change introduces, the same: ex:b is a person without a name.
+    let engine = engine(&data, named);
+    let before = engine.snapshot();
+    let shapes = compiled(&before);
+    let mut tx = engine.transaction();
+    tx.insert(QuadRef::new(
+        NamedNodeRef::new_unchecked("http://example.com/b"),
+        NamedNodeRef::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        NamedNodeRef::new_unchecked("http://example.com/Person"),
+        GraphNameRef::DefaultGraph,
+    ));
+    let changed: Vec<_> = tx.inserted().collect();
+    let after = tx.pending_snapshot();
+    let outcome =
+        nrese_shacl::validate_changes(&before, &after, &shapes, DEFAULT, &changed, &cancelled);
+    assert!(
+        matches!(outcome, Err(QueryEvaluationError::Cancelled)),
+        "validate_changes: {outcome:?}"
+    );
+}
+
+/// SHACL §1.5: a shapes graph with `sh:entailment E`, where the processor doesn't support E,
+/// makes the processor signal a failure: the report is no verdict (SYN-56, B-1401). The data
+/// conforms to the shape, so only the failure can make the report not conform.
+#[test]
+fn an_unsupported_entailment_is_a_failure() {
+    let engine = engine(
+        "ex:a ex:name \"A\" .",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+           sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+         ex:S sh:entailment <http://www.w3.org/ns/entailment/RDFS> .",
+    );
+    let snapshot = engine.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert!(report.results.is_empty(), "{:?}", report.results);
+    assert!(
+        report
+            .failures
+            .iter()
+            .any(|failure| failure.contains("http://www.w3.org/ns/entailment/RDFS")),
+        "{:?}",
+        report.failures
+    );
+    assert!(!report.conforms());
+}
+
+/// Whether anything applies (the vacuous-pass flag) follows what can fail (SYN-56, B-1406): a
+/// node that fails a shape had something applicable. `sh:not` of a shape without constraints
+/// always fails (the empty shape conforms); `sh:or ()` and `sh:xone ( [] [] )` always fail;
+/// `sh:or ( [] )` and `sh:xone ( [] )` never do. Focus ex:a has no statements; ex:N needs
+/// class ex:C, so ex:a fails it. Each row also checks validation agrees with its expectation.
+#[test]
+fn applicability_follows_what_can_fail() {
+    for (row, constraint, expected) in [
+        ("sh:not []", "sh:not [ ]", true),
+        ("sh:or ()", "sh:or ( )", true),
+        ("sh:xone ( [] [] )", "sh:xone ( [ ] [ ] )", true),
+        ("guard: sh:or ( [] )", "sh:or ( [ ] )", false),
+        ("guard: sh:xone ( [] )", "sh:xone ( [ ] )", false),
+        ("guard: sh:or ( N N )", "sh:or ( ex:N ex:N )", true),
+    ] {
+        let engine = engine(
+            "ex:b ex:p ex:c .",
+            &format!(
+                "ex:S a sh:NodeShape ; sh:targetNode ex:a ; {constraint} . ex:N sh:class ex:C ."
+            ),
+        );
+        let snapshot = engine.snapshot();
+        let shapes = compiled(&snapshot);
+        let failed = !validate(&snapshot, &shapes, DEFAULT).conforms();
+        assert_eq!(failed, expected, "{row}: validation");
+        assert_eq!(
+            nrese_shacl::applicable(&snapshot, &shapes, DEFAULT),
+            expected,
+            "{row}: applicable"
+        );
+    }
+}
+
+/// Whether a shape can fail doesn't depend on which shape is looked at
+/// first. ex:B targets ex:a and needs it to conform to ex:A; ex:A needs ex:B back and has
+/// `sh:in ()`, which every node fails. So ex:a fails ex:A and ex:B: validation fails, and
+/// something applied. ex:A targets an absent class, so it is a root without focus nodes.
+/// Roots are visited in term id order: the two declaration orders intern ex:A or ex:B first.
+#[test]
+fn applicability_of_recursive_shapes_does_not_depend_on_their_order() {
+    let a = "ex:A a sh:NodeShape ; sh:targetClass ex:Absent ; sh:node ex:B ; sh:in ( ) .";
+    let b = "ex:B a sh:NodeShape ; sh:targetNode ex:a ; sh:node ex:A .";
+    for (row, shapes) in [
+        ("ex:A first", format!("{a}\n{b}")),
+        ("ex:B first", format!("{b}\n{a}")),
+    ] {
+        let engine = engine("ex:b ex:p ex:c .", &shapes);
+        let snapshot = engine.snapshot();
+        let shapes = compiled(&snapshot);
+        assert!(
+            !validate(&snapshot, &shapes, DEFAULT).conforms(),
+            "{row}: validation"
+        );
+        assert!(
+            nrese_shacl::applicable(&snapshot, &shapes, DEFAULT),
+            "{row}: applicable"
+        );
+    }
+}
+
+/// 1000 distinct `sh:entailment` values, each a failure charged at 192 bytes: 192,000 bytes of
+/// diagnostics, past a 64 KiB envelope.
+fn many_entailments() -> String {
+    (0..1000)
+        .map(|i| format!("ex:S sh:entailment <http://example.com/entailment/regime-{i:04}> .\n"))
+        .collect()
+}
+
+/// A shapes change in one transaction on `store`: the state before, its shapes, the state
+/// after `removed` left the shapes graph, and that state's shapes.
+fn shapes_removed(store: &Engine, removed: &str) -> (Snapshot, Shapes, Snapshot, Shapes) {
+    let before = store.snapshot();
+    let shapes_before = compiled(&before);
+    let selection = shapes_selection(&before);
+    let mut tx = store.transaction();
+    for quad in RdfParser::from_format(RdfFormat::Turtle)
+        .for_slice(format!("{PREFIXES}{removed}").as_bytes())
+    {
+        let quad = quad.expect("turtle");
+        tx.remove(QuadRef::new(
+            &quad.subject,
+            &quad.predicate,
+            &quad.object,
+            GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES_GRAPH)),
+        ));
+    }
+    let after = tx.pending_snapshot();
+    let shapes_after = compile(&after, selection).expect("shapes");
+    (before, shapes_before, after, shapes_after)
+}
+
+fn small_envelope() -> Resources {
+    Resources {
+        memory: nrese_exec::Envelope::new(Some(64 * 1024), None),
+        ..Resources::default()
+    }
+}
+
+/// The state before a shapes change is validated only to tell which of
+/// the state after's results are new; its failures are no part of the outcome. Removing a
+/// shapes graph that asks for 1000 entailment regimes (diagnostics past a 64 KiB envelope)
+/// leaves nothing to validate: the change is accepted with an empty report.
+#[test]
+fn removing_shapes_with_many_entailments_is_not_refused_for_their_diagnostics() {
+    let shapes = many_entailments();
+    let store = engine("ex:a ex:p ex:b .", &shapes);
+    let (before, shapes_before, after, shapes_after) = shapes_removed(&store, &shapes);
+    let outcome = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        DEFAULT,
+        &small_envelope(),
+    )
+    .map(|report| (report.results.len(), report.failures.len()));
+    assert!(matches!(outcome, Ok((0, 0))), "{outcome:?}");
+}
+
+/// As above, but the state after keeps a shape whose result (ex:a has no
+/// ex:name) the state before had too, so the state before is validated; its 1000 entailment
+/// failures are still no part of the outcome, nor charged: nothing is introduced.
+#[test]
+fn a_shapes_change_compares_results_without_the_state_before_s_diagnostics() {
+    let entailments = many_entailments();
+    let store = engine(
+        "ex:a ex:p ex:b .",
+        &format!(
+            "ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+               sh:property [ sh:path ex:name ; sh:minCount 1 ] .
+             {entailments}"
+        ),
+    );
+    let (before, shapes_before, after, shapes_after) = shapes_removed(&store, &entailments);
+    let outcome = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        DEFAULT,
+        &small_envelope(),
+    )
+    .map(|report| (report.results.len(), report.failures.len()));
+    assert!(matches!(outcome, Ok((0, 0))), "{outcome:?}");
+}
+
+/// SHACL over a private transaction (`Engine::speculative_over`), as a payload's shapes and a
+/// session's validation run once speculative work is private (dictionary lifecycle V2):
+/// SPARQL constraints with a nested `NOT EXISTS` are evaluated once per focus node
+/// on one private view, in parallel (`validate` needs `Sync`). One projects the stored
+/// value; the other a computed one, which the report takes as computed (SHACL §5.3.2, SYN-56
+/// Part B) without interning it.
+///
+/// - Input: committed shapes with both constraints on `ex:C`; a private transaction
+///   asserting 20 members of `ex:C`, each with a value only the transaction has.
+/// - Expected: 40 results: `ex:Stored`'s 20 name each member's own private value (decoded
+///   in the transaction's vocabulary), `ex:Computed`'s 20 each value with " computed"
+///   appended. A second validation leaves the transaction's charge where the first left it;
+///   the dictionary holds as many terms as before, and none of the private or computed
+///   values.
+#[test]
+fn sparql_constraints_validate_a_private_transaction() {
+    let store = engine(
+        "",
+        r#"ex:Stored sh:targetClass ex:C ; sh:sparql [ sh:select
+            "SELECT $this ?value WHERE { $this <http://example.com/q> ?value FILTER NOT EXISTS { ?value <http://example.com/ok> true } }" ] .
+        ex:Computed sh:targetClass ex:C ; sh:sparql [ sh:select
+            "SELECT $this (CONCAT(STR(?v), ' computed') AS ?value) WHERE { $this <http://example.com/q> ?v FILTER NOT EXISTS { ?v <http://example.com/ok> true } }" ] ."#,
+    );
+    let snapshot = store.snapshot();
+    let terms = store.stats().dictionary.terms;
+    let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+    let mut tx = store
+        .speculative_over(&snapshot, std::sync::Arc::clone(&budget))
+        .expect("private");
+    let members: String = (0..20)
+        .map(|n| format!("ex:n{n} a ex:C ; ex:q \"private {n}\" .\n"))
+        .collect();
+    for quad in RdfParser::from_format(RdfFormat::Turtle)
+        .for_slice(format!("{PREFIXES}{members}").as_bytes())
+    {
+        let quad = quad.expect("turtle");
+        tx.try_insert(QuadRef::new(
+            &quad.subject,
+            &quad.predicate,
+            &quad.object,
+            GraphNameRef::DefaultGraph,
+        ))
+        .expect("room");
+    }
+    let reads = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+    let view = nrese_sparql::PendingRead::new(&tx, &reads);
+    let shapes = compile(&view, shapes_selection(&snapshot)).expect("shapes");
+    let report = validate(&view, &shapes, DEFAULT);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let values = |shape: &str| -> Vec<Option<String>> {
+        let mut values: Vec<Option<String>> = report
+            .results
+            .iter()
+            .filter(|result| result.source_shape.to_string() == ex(shape))
+            .map(|result| result.value.as_ref().map(ToString::to_string))
+            .collect();
+        values.sort();
+        values
+    };
+    let expected = |suffix: &str| -> Vec<Option<String>> {
+        let mut values: Vec<Option<String>> = (0..20)
+            .map(|n| Some(format!("\"private {n}{suffix}\"")))
+            .collect();
+        values.sort();
+        values
+    };
+    assert_eq!(values("Stored"), expected(""));
+    assert_eq!(values("Computed"), expected(" computed"));
+    drop(report);
+    let settled = budget.used();
+    assert_eq!(validate(&view, &shapes, DEFAULT).results.len(), 40);
+    assert_eq!(
+        budget.used(),
+        settled,
+        "no charge left behind per validation"
+    );
+    drop(tx);
+    assert_eq!(
+        store.stats().dictionary.terms,
+        terms,
+        "no term entered the dictionary"
+    );
+    for value in ["private 3", "private 3 computed"] {
+        let value = nrese_rdf::Literal::new_simple_literal(value);
+        assert_eq!(store.snapshot().lookup(TermRef::from(&value)), None);
+    }
+}
+
+/// Parallel SHACL-SPARQL over a large private transaction finishes:
+/// every focus node's check asks the one view for its evaluation snapshot, the first on a
+/// cold memo builds it, and a pending state of 16,384 or more changes is built in parallel
+/// (`index/run.rs`'s parallel build threshold). No reader may wait on a lock held across that
+/// Rayon work, or a worker that steals a queued check while waiting for its build blocks on
+/// the lock it holds.
+///
+/// - Input: committed shapes with a SPARQL constraint on `ex:C`; per round, a fresh private
+///   transaction (a cold memo) with 16,384 filler statements and 512 members of `ex:C`, each
+///   with a value of its own; validation in a 4-thread pool (more than one task of 32 nodes
+///   each, so checks run concurrently), 8 rounds.
+/// - Expected: each round reports its 512 results within the deadline. The deadline is a
+///   hang guard, not a bound on the work: the job's log records each round's time.
+#[test]
+fn parallel_sparql_validation_of_a_large_private_transaction_finishes() {
+    const ROUNDS: usize = 8;
+    const MEMBERS: usize = 512;
+    const FILLER: usize = 16 * 1024;
+    let deadline = std::time::Duration::from_secs(300);
+    let (done, outcome) = std::sync::mpsc::channel();
+    // Not scoped: a deadlocked validation must not keep the test from failing.
+    std::thread::spawn(move || {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("pool");
+        let store = engine(
+            "",
+            r#"ex:S sh:targetClass ex:C ; sh:sparql [ sh:select
+            "SELECT $this ?value WHERE { $this <http://example.com/q> ?value FILTER NOT EXISTS { ?value <http://example.com/ok> true } }" ] ."#,
+        );
+        let snapshot = store.snapshot();
+        let iri = |local: String| NamedNode::new_unchecked(format!("http://example.com/{local}"));
+        let (rdf_type, class, q, filler) = (
+            NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            iri("C".to_owned()),
+            iri("q".to_owned()),
+            iri("filler".to_owned()),
+        );
+        for round in 0..ROUNDS {
+            let started = std::time::Instant::now();
+            let budget = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+            let mut tx = store.speculative_over(&snapshot, budget).expect("private");
+            let mut insert =
+                |subject: &NamedNode, predicate: &NamedNode, object: nrese_rdf::Term| {
+                    tx.try_insert(QuadRef::new(
+                        subject,
+                        predicate,
+                        &object,
+                        GraphNameRef::DefaultGraph,
+                    ))
+                    .expect("room");
+                };
+            for n in 0..FILLER {
+                let value = nrese_rdf::Literal::new_simple_literal(format!("filler {n}"));
+                insert(&iri(format!("f{n}")), &filler, value.into());
+            }
+            for n in 0..MEMBERS {
+                let member = iri(format!("m{n}"));
+                insert(&member, &rdf_type, class.clone().into());
+                let value = nrese_rdf::Literal::new_simple_literal(format!("member {n}"));
+                insert(&member, &q, value.into());
+            }
+            let reads = std::sync::Arc::new(nrese_exec::Budget::unlimited());
+            let view = nrese_sparql::PendingRead::new(&tx, &reads);
+            let shapes = compile(&view, shapes_selection(&snapshot)).expect("shapes");
+            let results = pool
+                .install(|| validate(&view, &shapes, DEFAULT))
+                .results
+                .len();
+            eprintln!(
+                "round {round}: {results} results in {:?}",
+                started.elapsed()
+            );
+            if done.send(results).is_err() {
+                return;
+            }
+        }
+    });
+    for round in 0..ROUNDS {
+        match outcome.recv_timeout(deadline) {
+            Ok(results) => assert_eq!(results, MEMBERS, "round {round}"),
+            Err(_) => panic!(
+                "round {round}: validation didn't finish within {deadline:?}: a reader waits on \
+                 the private snapshot memo while its builder needs the pool (R1-C1)"
+            ),
+        }
+    }
+}
+
+/// SHACL §5.3.2: a SELECT constraint's result has `sh:value` the solution's `?value` and
+/// `sh:resultPath` its `?path` if that is an IRI, whatever the query computed them from: a
+/// term no statement uses is still the result's term (SYN-56, B-1402).
+#[test]
+fn a_constraint_reports_the_terms_its_query_computed() {
+    let select = |projection: &str| {
+        format!(
+            "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''
+               SELECT $this {projection} WHERE {{ $this <http://example.com/p> ?x }}''' ] ."
+        )
+    };
+    // The value: a literal no statement holds.
+    let computed_value = engine(
+        "ex:a ex:p ex:b .",
+        &select("(CONCAT(\"new\", \"value\") AS ?value)"),
+    );
+    let snapshot = computed_value.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let values: Vec<_> = report.results.iter().map(|r| r.value.clone()).collect();
+    assert_eq!(
+        values,
+        [Some(
+            nrese_rdf::Literal::new_simple_literal("newvalue").into()
+        )],
+        "computed value"
+    );
+    // The path: an IRI no statement uses.
+    let computed_path = engine(
+        "ex:a ex:p ex:b .",
+        &select("(IRI(\"http://example.com/computed\") AS ?path)"),
+    );
+    let snapshot = computed_path.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let paths: Vec<_> = report.results.iter().map(|r| r.path.clone()).collect();
+    assert_eq!(
+        paths,
+        [Some(PropertyPath::Predicate(NamedNode::new_unchecked(
+            "http://example.com/computed"
+        )))],
+        "computed path"
+    );
+}
+
+/// The change of one transaction on `store`: `insert` (N-Triples-like turtle) into `graph`
+/// (`None`: the default graph); the state before, the change and the state after.
+fn inserting(
+    store: &Engine,
+    insert: &str,
+    graph: Option<&str>,
+) -> (Snapshot, Vec<nrese_engine::EncodedQuad>, Snapshot) {
+    let before = store.snapshot();
+    let graph = graph.map(NamedNodeRef::new_unchecked);
+    let mut tx = store.transaction();
+    for quad in RdfParser::from_format(RdfFormat::Turtle)
+        .for_slice(format!("{PREFIXES}{insert}").as_bytes())
+    {
+        let quad = quad.expect("turtle");
+        tx.insert(QuadRef::new(
+            &quad.subject,
+            &quad.predicate,
+            &quad.object,
+            graph.map_or(GraphNameRef::DefaultGraph, GraphNameRef::from),
+        ));
+    }
+    let changed: Vec<_> = tx.inserted().collect();
+    let after = tx.pending_snapshot();
+    (before, changed, after)
+}
+
+/// A term a query computed is compared as the RDF term it is, whether or
+/// not the dictionary held it: a change that stores the very term (as an unrelated statement's
+/// predicate or object) leaves the result as it was, so nothing is introduced, on both routes:
+/// a data change (`validate_changes`) and a change of the shapes graph
+/// (`validate_shapes_change`).
+#[test]
+fn a_computed_term_the_change_stores_is_the_same_result() {
+    let rows = [
+        (
+            "path",
+            "(IRI(CONCAT(\"urn:computed-\", \"path\")) AS ?path)",
+            "ex:z <urn:computed-path> ex:w .",
+        ),
+        (
+            "value",
+            "(CONCAT(\"computed-\", \"value\") AS ?value)",
+            "ex:z ex:q \"computed-value\" .",
+        ),
+    ];
+    for (row, projection, stored) in rows {
+        let shapes = format!(
+            "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''
+               SELECT $this {projection} WHERE {{ }}''' ] ."
+        );
+        // A data change.
+        let store = engine("ex:b ex:p ex:c .", &shapes);
+        let (before, changed, after) = inserting(&store, stored, None);
+        let compiled_before = compiled(&before);
+        let introduced = nrese_shacl::validate_changes(
+            &before,
+            &after,
+            &compiled_before,
+            DEFAULT,
+            &changed,
+            &Resources::default(),
+        )
+        .expect("nothing stops it");
+        assert!(
+            introduced.results.is_empty(),
+            "{row}, data change: {:?}",
+            introduced.results
+        );
+        // A change of the shapes graph that stores the term.
+        let store = engine("ex:b ex:p ex:c .", &shapes);
+        let (before, _, after) = inserting(&store, stored, Some(SHAPES_GRAPH));
+        let shapes_before = compiled(&before);
+        let shapes_after = compile(&after, shapes_selection(&before)).expect("shapes");
+        let introduced = nrese_shacl::validate_shapes_change(
+            &before,
+            Some(&shapes_before),
+            &after,
+            &shapes_after,
+            DEFAULT,
+            &Resources::default(),
+        )
+        .expect("nothing stops it");
+        assert!(
+            introduced.results.is_empty(),
+            "{row}, shapes change: {:?}",
+            introduced.results
+        );
+    }
+}
+
+/// A path is compared as the IRI it is, whether a query computed it
+/// or the shape names it. Before: property shape ex:S has path ex:p, and its constraint ex:Q
+/// computes `<urn:x>` (no statement uses it) as `?path`. The change gives ex:S the path
+/// `<urn:x>` and ex:Q a query that names no path, so the result's path is the shape's: the
+/// same IRI, the same result, nothing introduced.
+#[test]
+fn a_computed_path_that_becomes_the_shape_s_path_is_the_same_result() {
+    let shapes = "ex:S a sh:PropertyShape ; sh:targetNode ex:a ; sh:path ex:p ; sh:sparql ex:Q .
+        ex:Q sh:select '''SELECT $this (IRI(CONCAT(\"urn:\", \"x\")) AS ?path) WHERE { }''' .";
+    let store = engine("ex:b ex:q ex:c .", shapes);
+    let before = store.snapshot();
+    let shapes_before = compiled(&before);
+    let quads = |turtle: &str| -> Vec<nrese_rdf::Quad> {
+        RdfParser::from_format(RdfFormat::Turtle)
+            .for_slice(format!("{PREFIXES}{turtle}").as_bytes())
+            .map(|quad| quad.expect("turtle"))
+            .collect()
+    };
+    let graph = GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES_GRAPH));
+    let mut tx = store.transaction();
+    for quad in quads(
+        "ex:S sh:path ex:p .
+         ex:Q sh:select '''SELECT $this (IRI(CONCAT(\"urn:\", \"x\")) AS ?path) WHERE { }''' .",
+    ) {
+        tx.remove(QuadRef::new(
+            &quad.subject,
+            &quad.predicate,
+            &quad.object,
+            graph,
+        ));
+    }
+    for quad in quads("ex:S sh:path <urn:x> . ex:Q sh:select '''SELECT $this WHERE { }''' .") {
+        tx.insert(QuadRef::new(
+            &quad.subject,
+            &quad.predicate,
+            &quad.object,
+            graph,
+        ));
+    }
+    let after = tx.pending_snapshot();
+    let shapes_after = compile(&after, shapes_selection(&before)).expect("shapes");
+    let later = validate(&after, &shapes_after, DEFAULT);
+    let paths: Vec<_> = later.results.iter().map(|r| r.path.clone()).collect();
+    assert_eq!(
+        paths,
+        [Some(PropertyPath::Predicate(NamedNode::new_unchecked(
+            "urn:x"
+        )))],
+        "the state after's result has the shape's path"
+    );
+    let introduced = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        DEFAULT,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "the same path, the same result: {:?}",
+        introduced.results
+    );
+}
+
+/// A stored triple term holding a blank node is the same value
+/// whether the query binds it or the focus node stands for it. ex:S targets the objects of
+/// ex:p, the stored `<<( _:b ex:q ex:o )>>`; while a flag holds, its query binds `?value` to
+/// that same triple (read from the data: a triple-term `$this` isn't substituted into the
+/// query, so `BIND($this …)` inside the OPTIONAL wouldn't see it), and else binds nothing,
+/// so the value is the focus node either way. Deleting the flag changes no result: nothing
+/// is introduced.
+#[test]
+fn a_stored_triple_term_is_the_same_value_bound_or_not() {
+    let shapes = "ex:S a sh:NodeShape ; sh:targetObjectsOf ex:p ; sh:sparql [ sh:select '''
+        SELECT $this ?value WHERE {
+          OPTIONAL { <urn:flag> <urn:on> <urn:yes> . ?x <http://example.com/p> ?value }
+        }''' ] .";
+    let store = engine(
+        "ex:s ex:p <<( _:b ex:q ex:o )>> . <urn:flag> <urn:on> <urn:yes> .",
+        shapes,
+    );
+    let before = store.snapshot();
+    let compiled_before = compiled(&before);
+    let mut tx = store.transaction();
+    tx.remove(QuadRef::new(
+        NamedNodeRef::new_unchecked("urn:flag"),
+        NamedNodeRef::new_unchecked("urn:on"),
+        NamedNodeRef::new_unchecked("urn:yes"),
+        GraphNameRef::DefaultGraph,
+    ));
+    let changed: Vec<_> = tx.deleted().collect();
+    assert_eq!(changed.len(), 1, "the flag is removed");
+    let after = tx.pending_snapshot();
+    // Both states have the one result, the triple term its value: bound, then the focus node.
+    for (state, report) in [
+        ("before", validate(&before, &compiled_before, DEFAULT)),
+        ("after", validate(&after, &compiled_before, DEFAULT)),
+    ] {
+        assert!(report.failures.is_empty(), "{state}: {:?}", report.failures);
+        let values: Vec<_> = report.results.iter().map(|r| r.value.clone()).collect();
+        assert!(
+            matches!(values.as_slice(), [Some(nrese_rdf::Term::Triple(_))]),
+            "{state}: {values:?}"
+        );
+    }
+    let introduced = nrese_shacl::validate_changes(
+        &before,
+        &after,
+        &compiled_before,
+        DEFAULT,
+        &changed,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "the same value, the same result: {:?}",
+        introduced.results
+    );
+}
+
+/// Spec: SHACL §5.6.2 pre-binds a targetObjectsOf triple focus as $this; an inner
+/// BIND copies it, preserving the blank subject's stored identity (D16-067).
+#[test]
+fn triple_focus_is_copied_by_inner_bind() {
+    let store = engine(
+        "ex:s ex:p <<( _:b ex:q ex:o )>> .",
+        "ex:S a sh:NodeShape ; sh:targetObjectsOf ex:p ; sh:sparql [ sh:select '''
+            SELECT $this ?value WHERE {
+                BIND($this AS ?value) FILTER(BOUND(?value))
+            }''' ] .",
+    );
+    let snapshot = store.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert_eq!(report.results.len(), 1, "BIND exposes the triple focus");
+    let result = &report.results[0];
+    assert!(matches!(result.value, Some(nrese_rdf::Term::Triple(_))));
+    assert_eq!(result.value.as_ref(), Some(&result.focus_node));
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+}
+
+/// The same across a change of the shapes: a constraint component's property
+/// validator, a SELECT reporting each value of the path, becomes an ASK that every value
+/// fails. ex:s's one value, the stored `<<( _:b ex:q ex:o )>>`, is reported by both: the same
+/// result, nothing introduced.
+#[test]
+fn a_stored_triple_term_is_the_same_value_from_select_or_ask() {
+    let shapes = "ex:C a sh:ConstraintComponent ; sh:parameter [ sh:path ex:on ] ;
+          sh:propertyValidator ex:V .
+        ex:V sh:select '''SELECT $this ?value WHERE { $this $PATH ?value }''' .
+        ex:P a sh:PropertyShape ; sh:targetNode ex:s ; sh:path ex:p ; ex:on true .";
+    let store = engine("ex:s ex:p <<( _:b ex:q ex:o )>> .", shapes);
+    let before = store.snapshot();
+    let shapes_before = compiled(&before);
+    let graph = GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES_GRAPH));
+    let validator = NamedNodeRef::new_unchecked("http://example.com/V");
+    let mut tx = store.transaction();
+    tx.remove(QuadRef::new(
+        validator,
+        NamedNodeRef::new_unchecked("http://www.w3.org/ns/shacl#select"),
+        nrese_rdf::LiteralRef::new_simple_literal(
+            "SELECT $this ?value WHERE { $this $PATH ?value }",
+        ),
+        graph,
+    ));
+    tx.insert(QuadRef::new(
+        validator,
+        NamedNodeRef::new_unchecked("http://www.w3.org/ns/shacl#ask"),
+        nrese_rdf::LiteralRef::new_simple_literal("ASK { FILTER(false) }"),
+        graph,
+    ));
+    let after = tx.pending_snapshot();
+    let shapes_after = compile(&after, shapes_selection(&before)).expect("shapes");
+    for (state, report) in [
+        ("SELECT", validate(&before, &shapes_before, DEFAULT)),
+        ("ASK", validate(&after, &shapes_after, DEFAULT)),
+    ] {
+        assert!(report.failures.is_empty(), "{state}: {:?}", report.failures);
+        let values: Vec<_> = report.results.iter().map(|r| r.value.clone()).collect();
+        assert!(
+            matches!(values.as_slice(), [Some(nrese_rdf::Term::Triple(_))]),
+            "{state}: {values:?}"
+        );
+    }
+    let introduced = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        DEFAULT,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "the same value, the same result: {:?}",
+        introduced.results
+    );
+}
+
+/// A blank node a constraint's query makes (`BNODE() AS ?value`) is the result's value
+/// (SHACL §5.3.2), and the same result found again is the same result: a change elsewhere
+/// introduces none, though the query makes a new blank node at each evaluation.
+#[test]
+fn a_blank_node_a_query_made_is_the_same_result_when_found_again() {
+    let data = "ex:a ex:p ex:b .";
+    let shapes = "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''
+        SELECT $this (BNODE() AS ?value) WHERE { $this <http://example.com/p> ?x }''' ] .";
+    let store = engine(data, shapes);
+    let before = store.snapshot();
+    let compiled = compiled(&before);
+    let report = validate(&before, &compiled, DEFAULT);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let values: Vec<_> = report.results.iter().map(|r| r.value.clone()).collect();
+    assert!(
+        matches!(values.as_slice(), [Some(nrese_rdf::Term::BlankNode(_))]),
+        "the blank node is the value: {values:?}"
+    );
+    let (before, changed, after) = inserting(&store, "ex:z ex:q ex:w .", None);
+    let introduced = nrese_shacl::validate_changes(
+        &before,
+        &after,
+        &compiled,
+        DEFAULT,
+        &changed,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "an unrelated change introduced {:?}",
+        introduced.results
+    );
+}
+
+/// One blank node a query made is one node, in every result that names
+/// it. The subquery makes one blank node; joined with ex:a's two ex:p values it is the value
+/// of two solutions, so two results with one `sh:value` node, in the report and in its RDF
+/// graph. Validated again after an unrelated change, nothing is introduced.
+#[test]
+fn one_blank_node_of_a_query_is_one_node_of_the_report() {
+    let shapes = "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''
+        SELECT $this ?value WHERE {
+          { SELECT $this (BNODE() AS ?value) WHERE { } }
+          $this <http://example.com/p> ?x .
+        }''' ] .";
+    let store = engine("ex:a ex:p ex:x1 , ex:x2 .", shapes);
+    let snapshot = store.snapshot();
+    let compiled = compiled(&snapshot);
+    let report = validate(&snapshot, &compiled, DEFAULT);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let values: Vec<_> = report.results.iter().map(|r| r.value.clone()).collect();
+    assert!(
+        matches!(
+            values.as_slice(),
+            [Some(nrese_rdf::Term::BlankNode(a)), Some(nrese_rdf::Term::BlankNode(b))] if a == b
+        ),
+        "two results, one blank node: {values:?}"
+    );
+    let value = NamedNode::new_unchecked("http://www.w3.org/ns/shacl#value");
+    let nodes: std::collections::BTreeSet<_> = report
+        .to_triples()
+        .into_iter()
+        .filter(|triple| triple.predicate == value)
+        .map(|triple| triple.object)
+        .collect();
+    assert_eq!(nodes.len(), 1, "one sh:value node: {nodes:?}");
+    let (before, changed, after) = inserting(&store, "ex:z ex:q ex:w .", None);
+    let introduced = nrese_shacl::validate_changes(
+        &before,
+        &after,
+        &compiled,
+        DEFAULT,
+        &changed,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "an unrelated change introduced {:?}",
+        introduced.results
+    );
+}
+
+/// A query's fresh blank nodes compare up to their names, result by
+/// result:
+/// - a result that is unchanged stays the same when another result of the same constraint
+///   goes: removing ex:a's ex:p ex:x1 removes the "newvalue" result and introduces nothing;
+/// - one blank node met twice in a value stays one: TRIPLE(?b, ex:p, ?b) has subject = object.
+#[test]
+fn fresh_blank_nodes_compare_up_to_their_names() {
+    let shapes = "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''
+        SELECT $this (IF(?x = <http://example.com/x1>, CONCAT(\"new\", \"value\"), BNODE()) AS ?value)
+        WHERE { $this <http://example.com/p> ?x } ORDER BY ?x''' ] .";
+    let store = engine("ex:a ex:p ex:x1 , ex:x2 .", shapes);
+    let before = store.snapshot();
+    let compiled_before = compiled(&before);
+    let mut tx = store.transaction();
+    tx.remove(QuadRef::new(
+        NamedNodeRef::new_unchecked("http://example.com/a"),
+        NamedNodeRef::new_unchecked("http://example.com/p"),
+        NamedNodeRef::new_unchecked("http://example.com/x1"),
+        GraphNameRef::DefaultGraph,
+    ));
+    let changed: Vec<_> = tx.deleted().collect();
+    let after = tx.pending_snapshot();
+    let introduced = nrese_shacl::validate_changes(
+        &before,
+        &after,
+        &compiled_before,
+        DEFAULT,
+        &changed,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "removing a result introduced {:?}",
+        introduced.results
+    );
+
+    let shapes = "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''
+        SELECT $this (TRIPLE(?b, <http://example.com/p>, ?b) AS ?value)
+        WHERE { $this <http://example.com/p> ?x BIND(BNODE() AS ?b) }''' ] .";
+    let store = engine("ex:a ex:p ex:x1 .", shapes);
+    let snapshot = store.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let same = report.results.iter().all(|result| match &result.value {
+        Some(nrese_rdf::Term::Triple(triple)) => match (&triple.subject, &triple.object) {
+            (nrese_rdf::NamedOrBlankNode::BlankNode(s), nrese_rdf::Term::BlankNode(o)) => s == o,
+            _ => false,
+        },
+        _ => false,
+    });
+    assert!(
+        same && report.results.len() == 1,
+        "one blank node, subject and object: {:?}",
+        report.results
+    );
+}
+
+/// Fresh blank nodes compare up to their names, not beyond: a value whose triple names one
+/// fresh node twice (`<<( _:x ex:p _:x )>>`) and one that names two (`<<( _:x ex:p _:y )>>`)
+/// are different results. A change of the shapes from the first query to the second
+/// introduces its result; the same query again (fresh names drawn anew) introduces nothing.
+#[test]
+fn fresh_blank_nodes_compare_by_where_they_stand() {
+    let one = "TRIPLE(?b, <http://example.com/p>, ?b)";
+    let two = "TRIPLE(?b, <http://example.com/p>, BNODE())";
+    let select =
+        |value: &str| format!("SELECT $this ({value} AS ?value) WHERE {{ BIND(BNODE() AS ?b) }}");
+    let shapes = |value: &str| {
+        format!(
+            "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql ex:Q .
+             ex:Q sh:select '''{}''' .",
+            select(value)
+        )
+    };
+    let graph = GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES_GRAPH));
+    let query = NamedNodeRef::new_unchecked("http://example.com/Q");
+    let sh_select = NamedNodeRef::new_unchecked("http://www.w3.org/ns/shacl#select");
+    for (row, from, to, introduced) in [("one to two", one, two, 1), ("again", one, one, 0)] {
+        let store = engine("ex:b ex:q ex:c .", &shapes(from));
+        let before = store.snapshot();
+        let shapes_before = compiled(&before);
+        let mut tx = store.transaction();
+        if from != to {
+            let (old, new) = (select(from), select(to));
+            tx.remove(QuadRef::new(
+                query,
+                sh_select,
+                nrese_rdf::LiteralRef::new_simple_literal(&old),
+                graph,
+            ));
+            tx.insert(QuadRef::new(
+                query,
+                sh_select,
+                nrese_rdf::LiteralRef::new_simple_literal(&new),
+                graph,
+            ));
+        } else {
+            // A change of the shapes that leaves the constraint as it was.
+            tx.insert(QuadRef::new(
+                NamedNodeRef::new_unchecked("http://example.com/S"),
+                NamedNodeRef::new_unchecked("http://www.w3.org/2000/01/rdf-schema#comment"),
+                nrese_rdf::LiteralRef::new_simple_literal("annotated"),
+                graph,
+            ));
+        }
+        let after = tx.pending_snapshot();
+        let shapes_after = compile(&after, shapes_selection(&before)).expect("shapes");
+        let report = nrese_shacl::validate_shapes_change(
+            &before,
+            Some(&shapes_before),
+            &after,
+            &shapes_after,
+            DEFAULT,
+            &Resources::default(),
+        )
+        .expect("nothing stops it");
+        assert!(report.failures.is_empty(), "{row}: {:?}", report.failures);
+        assert_eq!(
+            report.results.len(),
+            introduced,
+            "{row}: {:?}",
+            report.results
+        );
+    }
+}
+
+/// A query's fresh blank nodes are told apart from the data's, whatever their labels:
+/// with a stored blank node labelled `fresh0`, TRIPLE(fresh, ex:p, stored) and
+/// TRIPLE(stored, ex:p, fresh) are different results; removing the first leaves the second
+/// as it was, so the change introduces nothing.
+#[test]
+fn fresh_blank_nodes_are_told_apart_from_stored_ones() {
+    let store = engine(
+        "",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''
+           SELECT $this ?value WHERE {
+             { $this <http://example.com/r1> ?s BIND(1 AS ?k)
+               BIND(TRIPLE(BNODE(), <http://example.com/p>, ?s) AS ?value) }
+             UNION
+             { $this <http://example.com/r2> ?s BIND(2 AS ?k)
+               BIND(TRIPLE(?s, <http://example.com/p>, BNODE()) AS ?value) }
+           } ORDER BY ?k''' ] .",
+    );
+    let stored = nrese_rdf::BlankNodeRef::new_unchecked("fresh0");
+    let quad = |predicate: &'static str| {
+        QuadRef::new(
+            NamedNodeRef::new_unchecked("http://example.com/a"),
+            NamedNodeRef::new_unchecked(predicate),
+            stored,
+            GraphNameRef::DefaultGraph,
+        )
+    };
+    let mut tx = store.transaction();
+    tx.insert(quad("http://example.com/r1"));
+    tx.insert(quad("http://example.com/r2"));
+    tx.commit().expect("commit");
+    let before = store.snapshot();
+    let compiled_before = compiled(&before);
+    let mut tx = store.transaction();
+    tx.remove(quad("http://example.com/r1"));
+    let changed: Vec<_> = tx.deleted().collect();
+    let after = tx.pending_snapshot();
+    let introduced = nrese_shacl::validate_changes(
+        &before,
+        &after,
+        &compiled_before,
+        DEFAULT,
+        &changed,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "removing a result introduced {:?}",
+        introduced.results
+    );
+}
+
+/// A change of the shapes introduces what the data newly violates, even where a result's
+/// value is a stored blank node labelled as a fresh one the query made before:
+/// the query reports a fresh blank node for ex:a, and any named graph holding
+/// `ex:z ex:q ex:w` by its name. Read the fresh node's label L; then a graph named `_:L`
+/// gets that statement. One result is introduced: its value is the stored `_:L`.
+#[test]
+fn a_stored_blank_node_labelled_as_a_fresh_one_is_still_introduced() {
+    let shapes = "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''
+        SELECT $this ?value WHERE {
+          { $this <http://example.com/p> ?x BIND(BNODE() AS ?value) }
+          UNION
+          { GRAPH ?value { <http://example.com/z> <http://example.com/q> <http://example.com/w> } }
+        }''' ] .";
+    let store = engine("ex:a ex:p ex:b .", shapes);
+    let before = store.snapshot();
+    let shapes_before = compiled(&before);
+    let any = Selection::of(GraphSelector::Any).excluding(id(&before, SHAPES_GRAPH));
+    let found = validate(&before, &shapes_before, any);
+    let label = match found.results.as_slice() {
+        [result] => match &result.value {
+            Some(nrese_rdf::Term::BlankNode(node)) => node.as_str().to_owned(),
+            other => panic!("a fresh blank node is the value: {other:?}"),
+        },
+        other => panic!("one result: {other:?}"),
+    };
+    let mut tx = store.transaction();
+    tx.insert(QuadRef::new(
+        NamedNodeRef::new_unchecked("http://example.com/z"),
+        NamedNodeRef::new_unchecked("http://example.com/q"),
+        NamedNodeRef::new_unchecked("http://example.com/w"),
+        GraphNameRef::BlankNode(nrese_rdf::BlankNodeRef::new_unchecked(&label)),
+    ));
+    let after = tx.pending_snapshot();
+    let shapes_after = compiled(&after);
+    let introduced = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        any,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    let values: Vec<_> = introduced.results.iter().map(|r| r.value.clone()).collect();
+    assert_eq!(
+        values,
+        [Some(nrese_rdf::Term::BlankNode(
+            nrese_rdf::BlankNode::new_unchecked(label)
+        ))],
+        "the stored blank node's result is introduced"
+    );
+}
+
+/// The same, inside a computed triple term: the query reports
+/// TRIPLE(fresh, ex:p, ex:o) for ex:a, and TRIPLE(g, ex:p, ex:o) for any named graph g holding
+/// `ex:z ex:q ex:w`. Read the fresh subject's label L; a graph named `_:L` then gets that
+/// statement. Neither triple is stored, so both values are computed; one result is introduced,
+/// the one whose subject is the stored `_:L`.
+#[test]
+fn a_stored_blank_node_inside_a_computed_triple_is_still_introduced() {
+    let shapes = "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''
+        SELECT $this ?value WHERE {
+          { $this <http://example.com/p> ?x
+            BIND(TRIPLE(BNODE(), <http://example.com/p>, <http://example.com/o>) AS ?value) }
+          UNION
+          { GRAPH ?g { <http://example.com/z> <http://example.com/q> <http://example.com/w> }
+            BIND(TRIPLE(?g, <http://example.com/p>, <http://example.com/o>) AS ?value) }
+        }''' ] .";
+    let store = engine("ex:a ex:p ex:b .", shapes);
+    let before = store.snapshot();
+    let shapes_before = compiled(&before);
+    let any = Selection::of(GraphSelector::Any).excluding(id(&before, SHAPES_GRAPH));
+    let found = validate(&before, &shapes_before, any);
+    let label = match found.results.as_slice() {
+        [result] => match &result.value {
+            Some(nrese_rdf::Term::Triple(triple)) => match &triple.subject {
+                nrese_rdf::NamedOrBlankNode::BlankNode(node) => node.as_str().to_owned(),
+                other => panic!("a fresh subject: {other:?}"),
+            },
+            other => panic!("a triple is the value: {other:?}"),
+        },
+        other => panic!("one result: {other:?}"),
+    };
+    let mut tx = store.transaction();
+    tx.insert(QuadRef::new(
+        NamedNodeRef::new_unchecked("http://example.com/z"),
+        NamedNodeRef::new_unchecked("http://example.com/q"),
+        NamedNodeRef::new_unchecked("http://example.com/w"),
+        GraphNameRef::BlankNode(nrese_rdf::BlankNodeRef::new_unchecked(&label)),
+    ));
+    let after = tx.pending_snapshot();
+    let shapes_after = compiled(&after);
+    let introduced = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        any,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    let subjects: Vec<String> = introduced
+        .results
+        .iter()
+        .map(|result| match &result.value {
+            Some(nrese_rdf::Term::Triple(triple)) => match &triple.subject {
+                nrese_rdf::NamedOrBlankNode::BlankNode(node) => node.as_str().to_owned(),
+                other => format!("{other:?}"),
+            },
+            other => format!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(subjects, [label], "the stored subject's result");
+}
+
+/// A change of the shapes compares a result's severity: a property shape that
+/// ex:a fails as a Warning, made a Violation, makes its result new, as a Violation.
+#[test]
+fn a_shapes_change_compares_severity() {
+    let iri = NamedNodeRef::new_unchecked;
+    let shapes_graph = GraphNameRef::NamedNode(iri(SHAPES_GRAPH));
+    let severity = "http://www.w3.org/ns/shacl#severity";
+    let violation = "http://www.w3.org/ns/shacl#Violation";
+    let store = engine(
+        "ex:b ex:q ex:c .",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:property ex:P .
+         ex:P a sh:PropertyShape ; sh:path ex:name ; sh:minCount 1 ; sh:severity sh:Warning .",
+    );
+    let before = store.snapshot();
+    let shapes_before = compiled(&before);
+    let any = Selection::of(GraphSelector::Any).excluding(id(&before, SHAPES_GRAPH));
+    let mut tx = store.transaction();
+    let p = iri("http://example.com/P");
+    tx.remove(QuadRef::new(
+        p,
+        iri(severity),
+        iri("http://www.w3.org/ns/shacl#Warning"),
+        shapes_graph,
+    ));
+    tx.insert(QuadRef::new(p, iri(severity), iri(violation), shapes_graph));
+    let after = tx.pending_snapshot();
+    let shapes_after = compiled(&after);
+    let introduced = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        any,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    let severities: Vec<&str> = introduced
+        .results
+        .iter()
+        .map(|result| result.severity.as_str())
+        .collect();
+    assert_eq!(severities, [violation], "Warning made Violation");
+}
+
+/// A change of the shapes compares the messages in effect: an `sh:sparql`
+/// constraint's message, the same as its shape's, removed leaves the result's messages as
+/// they were, so nothing is new.
+#[test]
+fn a_shapes_change_compares_effective_messages() {
+    let iri = NamedNodeRef::new_unchecked;
+    let shapes_graph = GraphNameRef::NamedNode(iri(SHAPES_GRAPH));
+    let store = engine(
+        "ex:b ex:q ex:c .",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:message \"m\" ; sh:sparql ex:Q .
+         ex:Q sh:select '''SELECT $this WHERE { }''' ; sh:message \"m\" .",
+    );
+    let before = store.snapshot();
+    let shapes_before = compiled(&before);
+    let any = Selection::of(GraphSelector::Any).excluding(id(&before, SHAPES_GRAPH));
+    let mut tx = store.transaction();
+    tx.remove(QuadRef::new(
+        iri("http://example.com/Q"),
+        iri("http://www.w3.org/ns/shacl#message"),
+        nrese_rdf::LiteralRef::new_simple_literal("m"),
+        shapes_graph,
+    ));
+    let after = tx.pending_snapshot();
+    let shapes_after = compiled(&after);
+    let introduced = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        any,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "an override equal to the shape's messages, removed: {:?}",
+        introduced.results
+    );
+}
+
+/// Shapes: one property shape whose `subjects` subjects of ex:p each lack ex:required, with
+/// `messages` distinct `sh:message` literals: `subjects` results, each naming every message.
+fn many_messages(subjects: usize, messages: usize) -> (String, String) {
+    let data: String = (0..subjects)
+        .map(|i| format!("ex:s{i} ex:p ex:o .\n"))
+        .collect();
+    let messages: Vec<String> = (0..messages).map(|i| format!("\"m{i}\"")).collect();
+    let shapes = format!(
+        "ex:S a sh:PropertyShape ; sh:targetSubjectsOf ex:p ; sh:path ex:required ;
+           sh:minCount 1 ; sh:message {} .",
+        messages.join(" , ")
+    );
+    (data, shapes)
+}
+
+/// A change of the shapes compares results without copying what every
+/// result of a shape shares. 512 results, each with its shape's 256 messages (decoded, about
+/// 25 KB per result): an annotation added to the shape changes no result, and the comparison
+/// fits a 2 MiB envelope that the raw results of both states fit, though the decoded results
+/// (about 13 MB) would not.
+#[test]
+fn a_shapes_change_compares_results_without_copying_their_messages() {
+    let (data, shapes) = many_messages(512, 256);
+    let store = engine(&data, &shapes);
+    let (before, _, after) = inserting(
+        &store,
+        "ex:S rdfs:comment \"annotated\" .",
+        Some(SHAPES_GRAPH),
+    );
+    let shapes_before = compiled(&before);
+    let shapes_after = compile(&after, shapes_selection(&before)).expect("shapes");
+    let resources = Resources {
+        memory: nrese_exec::Envelope::new(Some(2 << 20), None),
+        ..Resources::default()
+    };
+    let outcome = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        DEFAULT,
+        &resources,
+    )
+    .map(|report| (report.results.len(), report.failures.len()));
+    assert!(matches!(outcome, Ok((0, 0))), "{outcome:?}");
 }

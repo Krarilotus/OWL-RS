@@ -9,6 +9,7 @@ license.workspace = true
 
 [dependencies]
 nrese-rdf = { path = "../nrese-rdf", default-features = false }
+smallvec.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

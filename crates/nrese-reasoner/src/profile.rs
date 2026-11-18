@@ -1,4 +1,4 @@
-use nrese_core::{CapabilityMaturity, ReasonerCapability, ReasonerFeature};
+use crate::capability::{CapabilityMaturity, ReasonerCapability, ReasonerFeature};
 
 use crate::config::{ReasonerConfig, ReasoningMode};
 
@@ -48,7 +48,9 @@ pub fn profile_for_config(config: &ReasonerConfig) -> ReasonerProfile {
             &[rdfs.as_slice(), equality.as_slice()].concat()
         }
         ReasoningMode::Owl2Ql => &[rdfs.as_slice(), consistency.as_slice()].concat(),
-        ReasoningMode::Owl2Rl => &[rdfs.as_slice(), owl.as_slice()].concat(),
+        ReasoningMode::Owl2Rl | ReasoningMode::Owl2Dl => {
+            &[rdfs.as_slice(), owl.as_slice()].concat()
+        }
         // The user's rules: what they derive is theirs to say; it is maintained on commits.
         ReasoningMode::Custom => &[ReasonerFeature::IncrementalRefresh],
     };
@@ -73,7 +75,7 @@ pub const fn mode_name(mode: ReasoningMode) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use nrese_core::ReasonerFeature;
+    use crate::capability::ReasonerFeature;
 
     use super::profile_for_mode;
     use crate::config::ReasoningMode;

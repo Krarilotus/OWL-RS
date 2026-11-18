@@ -2,6 +2,14 @@
 //! store, tell, backup/restore, stats - and the mutation pipeline that owns commit semantics.
 //! No HTTP concerns live here. See `docs/ARCHITECTURE.md`.
 
+/// The unit tests' allocator: the system's, counting what measured operations hold against
+/// their budgets ([`nrese_exec::measure`]), so that an allocation not charged to its budget
+/// fails a test (as `nrese-engine`'s unit tests do).
+#[cfg(test)]
+#[global_allocator]
+static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
+    nrese_exec::measure::Measured(std::alloc::System);
+
 pub mod access;
 pub mod autocomplete;
 mod backup;
@@ -9,44 +17,67 @@ mod bulk_load;
 pub mod catalog;
 mod classification;
 pub mod config;
-mod datatypes;
 mod delta;
+pub mod dl;
+pub mod draft_check;
+mod entailment;
 pub mod error;
+/// Process-memory measurements and explicit host policy helpers. Store operations use
+/// [`StoreConfig::process_memory_bytes`] for their own watches; opening a store does not
+/// install a process-wide limit. An embedding host may install that fallback explicitly.
+pub use nrese_exec::memory;
 pub mod graph_store;
 mod graph_store_executor;
+#[cfg(all(test, target_os = "linux"))]
+mod huge_pages_tests;
 pub mod image_backup;
 pub mod jobs;
 mod loader;
+mod metadata;
 pub mod mutation;
 pub mod namespaces;
+mod process_settings;
+#[cfg(test)]
+mod process_settings_tests;
+pub mod quarantine;
 pub mod query;
-mod query_cache;
 mod query_executor;
 mod rdf_io;
 pub mod reasoning;
 pub mod reasoning_state;
 pub mod running;
+mod runtime;
 pub mod scope;
 pub mod service;
 pub mod sessions;
 pub mod shacl;
 pub mod statements;
 mod stats;
+pub mod support;
 mod tell;
 pub mod update;
 mod view;
+#[cfg(test)]
+mod witness;
 
 pub use backup::{
-    DatasetBackupArtifact, DatasetBackupFormat, DatasetRestoreReport, DatasetRestoreRequest,
+    DIGEST_PREFIX, DatasetBackupArtifact, DatasetBackupFormat, DatasetExport, DatasetRestoreReport,
+    DatasetRestoreRequest,
 };
 pub use bulk_load::{BulkLoadReport, BulkLoadRequest, LoadProgress};
-pub use classification::ClassificationReport;
+pub use classification::{ClassificationReport, RealisationReport};
 pub use config::{
-    DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity, ShaclGate,
-    StoreConfig, StoreMode,
+    DEFAULT_QUERY_CACHE_BYTES, DEFAULT_SHAPES_GRAPH, FederationConfig, GateSeverity, ProcessMemory,
+    QlRewritingMode, ShaclGate, StoreConfig, StoreMode,
 };
 pub use delta::MutationDeltaPreview;
-pub use error::{Refusal, StoreError, StoreResult};
+pub use dl::{DlAnswers, DlConfig, DlConsistency, DlDetail, OutsideProfile};
+pub use draft_check::{
+    DRAFT_CHECK_PROFILES, DRAFT_CHECK_PROTOCOL, DRAFT_CHECK_SEMANTICS, DraftInputs, DraftLimits,
+    DraftOperation, DraftOutcome, DraftStatus, DraftTerm, input_hash_mismatch, run_draft_check,
+};
+pub use entailment::{DlEntailment, Entailment};
+pub use error::{IncompleteAnswer, Refusal, StoreError, StoreResult};
 pub use graph_store::{
     GraphDeleteReport, GraphReadRequest, GraphReadResult, GraphTarget, GraphWriteReport,
     GraphWriteRequest,
@@ -55,31 +86,49 @@ pub use image_backup::{
     ImageManifest, prune_wal_archive, read_manifest, restore_image, restore_until,
 };
 pub use mutation::{
-    MutationCommand, MutationCommitReport, MutationError, MutationKind, MutationPipeline,
-    MutationReject, MutationTicket, ReasoningRunRecord, RejectAttribution,
-    RejectAttributionCandidate,
+    DeltaPlanner, MutationCommand, MutationCommitReport, MutationError, MutationKind,
+    MutationPipeline, MutationReject, MutationTicket, ReasoningRunRecord, RejectAttribution,
+    RejectAttributionCandidate, RejectKind, UpdateContext,
 };
 pub use namespaces::{NamespaceMap, Namespaces};
-pub use nrese_engine::{EngineError, ReadModel};
+/// The CPU the binary was built for against the one it runs on, for the server's start.
+pub use nrese_engine::cpu;
+/// How the process returns freed memory to the system, registered by the binary that picks
+/// the allocator.
+pub use nrese_engine::memory::set_release as set_memory_release;
+/// Durable placement of what recovery reads (a replica's data directory, for the server).
+pub use nrese_engine::place;
+pub use nrese_engine::{
+    Applied, CorpusTuning, EngineError, IndexEncoding, LogExpectation, ReadModel,
+    VocabularyEncoding, WalDamage,
+};
 pub use nrese_shacl::{ValidationReport, ValidationResult};
-pub use nrese_sparql::{CancellationToken, Explanation, PlanStep, QueryEvaluationError};
+pub use nrese_sparql::{
+    CancellationToken, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryEvaluationError,
+    SearchScope,
+};
+pub use process_settings::{ProcessSettings, apply_process_settings, process_settings};
+pub use quarantine::{
+    EntryState, InvalidStatements, Outcome, Quarantine, QuarantineFilter, QuarantineItem,
+    QuarantinedStatement, Readmission, Repair, Resolution, readmit,
+};
 pub use query::{
     GraphResultFormat, QueryResultKind, SerializedQueryResult, SolutionsResultFormat,
     SparqlQueryRequest,
 };
-pub use query_cache::QueryCacheStats;
 pub use query_executor::PreparedQuery;
-pub use rdf_io::{convert_file, parse_payload, parse_payload_preserving_blank_nodes};
+pub use rdf_io::{ChargedQuads, convert_file, parse_payload};
 pub use reasoning::{InferenceStep, MaterialisationReport, OntologyDiagnostic};
-pub use reasoning_state::{ConsistencyStatus, ReasoningState};
+pub use reasoning_state::{ConsistencyStatus, ReasoningState, WhyUndecided};
 pub use running::{RunningQueries, RunningQuery};
-pub use scope::{ReadContext, ReadScope, Requester, WriteScope};
+pub use runtime::Runtime;
+pub use scope::{EntryPoint, ReadContext, ReadScope, Requester, WriteScope};
 pub use service::StoreService;
 pub use sessions::{SESSION_IDLE, Sessions};
 pub use shacl::{
     ShaclResultText, ShaclValidation, ShaclValidationRequest, ShapesSource, ValidatedGraphs,
 };
-pub use statements::{RdfPayload, StatementOp, StatementPattern, StatementsRequest};
+pub use statements::{RdfPayload, StatementOp, StatementOps, StatementPattern, StatementsRequest};
 pub use stats::StoreStats;
 pub use tell::TellRequest;
 pub use update::{SparqlUpdateRequest, UpdateExecutionReport};

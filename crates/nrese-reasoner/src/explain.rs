@@ -1,0 +1,350 @@
+//! Why an inferred fact holds: a derivation of it from asserted facts, step by step, each
+//! step naming the rule and the premises it used (G3 of the gap plan; GraphDB's and
+//! Stardog's "explain inference").
+//!
+//! The rules are grounded on the materialised state ([`super::delta::program`]), and the
+//! one-step derivations of the fact are collected backwards ([`GroundProgram::named_derivations`]),
+//! then those of their inferred premises, up to a budget. A forward pass then proves facts
+//! from the asserted ones: a fact is proved by the first derivation whose premises are all
+//! proved, so the proof is well-founded (no fact is its own premise) however cyclic the
+//! derivations are. The fact's explanation is the proof of it, shared premises once.
+
+use hashbrown::HashMap;
+
+use nrese_owl::ProofGraph;
+
+use super::delta::{Base, Rules};
+use super::eval::{GroundProgram, Poller, Probe, Seg, Stopped, Visit, Visits};
+use super::ir::Triple;
+
+/// What an explanation's reads count on: nothing stops one, it runs to its end (bounded by
+/// its budget), as the program's enumerations it reads do ([`GroundProgram::unpolled`]).
+/// A read on [`to_its_end`]'s poller, which never stops:
+/// its answer.
+fn known<T>(read: Result<T, Stopped>) -> T {
+    read.expect("an explanation reads to its end")
+}
+
+fn to_its_end() -> Poller<'static> {
+    Poller::never()
+}
+
+/// One step of an [`Explanation`]: a fact, how it holds, and its premises (indexes of
+/// steps).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Step {
+    pub fact: Triple,
+    /// The rule that derives it; `None` for an asserted fact, `Some("axiom")` for a fact
+    /// of the ruleset or a rule instance without a body.
+    pub rule: Option<String>,
+    pub premises: Vec<usize>,
+}
+
+/// A derivation of a fact from asserted facts: [`Step`]s, the fact first, each premise
+/// after the steps that use it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Explanation {
+    pub steps: Vec<Step>,
+}
+
+/// Derivations collected per fact.
+const BRANCHES: usize = 16;
+
+/// The derivation of `fact` over the materialised state `base` under `rules`, if `fact`
+/// holds there; facts examined at most `budget`.
+pub fn explain<B: Base + ?Sized>(
+    base: &B,
+    rules: Rules<'_>,
+    fact: Triple,
+    budget: usize,
+) -> Option<Explanation> {
+    if !known(base.contains(fact, &to_its_end())) {
+        return None;
+    }
+    let program = super::delta::program(base, rules);
+    explain_with(base, &program, fact, budget)
+}
+
+/// [`explain`] with the ground program of `base` given.
+pub fn explain_with<B: Base + ?Sized>(
+    base: &B,
+    program: &GroundProgram,
+    fact: Triple,
+    budget: usize,
+) -> Option<Explanation> {
+    let source = Whole(base);
+    let poll = to_its_end();
+    // Backwards: the derivations of every inferred fact reachable from `fact`.
+    let mut derivations: HashMap<Triple, Vec<(String, Vec<Triple>)>> = HashMap::new();
+    let mut queue = vec![fact];
+    while let Some(next) = queue.pop() {
+        if derivations.contains_key(&next) || known(base.is_asserted(next, &poll)) {
+            continue;
+        }
+        if derivations.len() >= budget {
+            break;
+        }
+        let mut found = program
+            .unpolled()
+            .named_derivations(&source, next, BRANCHES);
+        if program.bodiless.contains(&next) {
+            found.insert(
+                0,
+                ("axiom".to_owned(), program.bodiless_premises(next).to_vec()),
+            );
+        }
+        for (_, body) in &found {
+            queue.extend(body.iter().copied().filter(|premise| *premise != next));
+        }
+        derivations.insert(next, found);
+    }
+    // Forwards, in rounds: a fact is proved in the first round where a derivation of it
+    // has every premise proved in an earlier one, so its proof is as shallow as can be;
+    // of the derivations usable then, the smallest proof wins (then the rule's name and
+    // the premises), so the explanation is the same on every run.
+    let mut proved: HashMap<Triple, Proved> = HashMap::new();
+    let size = |fact: Triple, proved: &HashMap<Triple, Proved>| -> Option<usize> {
+        match proved.get(&fact) {
+            Some(entry) => Some(entry.size),
+            None => known(base.is_asserted(fact, &poll)).then_some(1),
+        }
+    };
+    let mut pending: Vec<Triple> = derivations.keys().copied().collect();
+    pending.sort_unstable();
+    while !proved.contains_key(&fact) {
+        let mut round: Vec<(Triple, Proved)> = Vec::new();
+        for &next in &pending {
+            let best = derivations[&next]
+                .iter()
+                .filter_map(|(rule, body)| {
+                    let sizes = body
+                        .iter()
+                        .map(|&premise| match premise == next {
+                            true => None,
+                            false => size(premise, &proved),
+                        })
+                        .collect::<Option<Vec<usize>>>()?;
+                    // Saturating: a premise used twice counts twice, so on a proof DAG
+                    // with shared premises the size grows like Fibonacci and can pass
+                    // usize (the review of 3 October 2026, C7). Saturated sizes still
+                    // compare deterministically: then the rule and premises decide.
+                    let total = sizes
+                        .iter()
+                        .fold(1usize, |sum, size| sum.saturating_add(*size));
+                    Some((total, rule, body))
+                })
+                .min();
+            if let Some((size, rule, body)) = best {
+                let derivation = Some((rule.clone(), body.clone()));
+                round.push((next, Proved { size, derivation }));
+            }
+        }
+        if round.is_empty() {
+            break;
+        }
+        pending.retain(|next| !round.iter().any(|(fact, _)| fact == next));
+        proved.extend(round);
+    }
+    if !proved.contains_key(&fact) && !known(base.is_asserted(fact, &poll)) {
+        return None;
+    }
+    // The proof of `fact`, each fact once.
+    let mut steps: Vec<Step> = Vec::new();
+    let mut index: HashMap<Triple, usize> = HashMap::new();
+    fn add(
+        fact: Triple,
+        proved: &HashMap<Triple, Proved>,
+        steps: &mut Vec<Step>,
+        index: &mut HashMap<Triple, usize>,
+    ) -> usize {
+        if let Some(&at) = index.get(&fact) {
+            return at;
+        }
+        let at = steps.len();
+        index.insert(fact, at);
+        steps.push(Step {
+            fact,
+            rule: None,
+            premises: Vec::new(),
+        });
+        if let Some(Proved {
+            derivation: Some((rule, body)),
+            ..
+        }) = proved.get(&fact)
+        {
+            let premises: Vec<usize> = body
+                .iter()
+                .map(|&premise| add(premise, proved, steps, index))
+                .collect();
+            steps[at].rule = Some(rule.clone());
+            steps[at].premises = premises;
+        }
+        at
+    }
+    add(fact, &proved, &mut steps, &mut index);
+    Some(Explanation { steps })
+}
+
+/// One-step derivations collected per fact for a proof graph: enough for every
+/// justification of ordinary ontologies; past it the graph says it isn't complete.
+const DERIVATIONS: usize = 256;
+
+/// The derivation hypergraph of `fact` over the materialised state `base` (the proof IR of
+/// docs/design/owl2-dl.md §10): every one-step derivation of every fact reachable
+/// backwards from `fact`, with every set of schema facts each rule was grounded on. The
+/// axioms are the asserted facts (and the ruleset's): an asserted fact is an inference of
+/// its own (`asserted`) besides its derivations, so a justification may avoid it.
+/// Justifications, cores, unions and proofs are computed on it ([`nrese_owl::proof`]).
+/// `None` if `fact` doesn't hold; at most `budget` facts examined, past which the graph
+/// is marked incomplete.
+pub fn proof_graph<B: Base + ?Sized>(
+    base: &B,
+    program: &GroundProgram,
+    fact: Triple,
+    budget: usize,
+) -> Option<ProofGraph<Triple, Triple>> {
+    let poll = to_its_end();
+    if !known(base.contains(fact, &poll)) {
+        return None;
+    }
+    let source = Whole(base);
+    let mut graph = ProofGraph::new(fact);
+    let mut seen: hashbrown::HashSet<Triple> = hashbrown::HashSet::new();
+    let mut queue = vec![fact];
+    while let Some(next) = queue.pop() {
+        if !seen.insert(next) {
+            continue;
+        }
+        if seen.len() > budget {
+            graph.complete = false;
+            break;
+        }
+        if known(base.is_asserted(next, &poll)) {
+            graph.add("asserted", &[], &[next], next);
+        }
+        let mut found = program
+            .unpolled()
+            .every_named_derivation(&source, next, DERIVATIONS);
+        if found.len() >= DERIVATIONS {
+            graph.complete = false;
+        }
+        if program.bodiless.contains(&next) {
+            let alternatives = program
+                .unpolled()
+                .premise_alternatives(super::eval::Grounding::Bodiless(next));
+            for premises in alternatives {
+                found.push(("axiom".to_owned(), premises.to_vec()));
+            }
+        }
+        for (rule, body) in found {
+            // Facts of the ruleset hold without premises: axioms as well.
+            graph.add(rule, &body, &[], next);
+            queue.extend(body.iter().copied().filter(|premise| *premise != next));
+        }
+    }
+    Some(graph)
+}
+
+/// Whether `inference` is a valid step over `base`: an asserted fact taken as itself, or
+/// an instance of its rule whose body (and schema facts) is exactly its premises,
+/// re-derived from the rules (the proof checker's check of a step).
+pub fn valid_step<B: Base + ?Sized>(
+    base: &B,
+    program: &GroundProgram,
+    inference: &nrese_owl::Inference<Triple, Triple>,
+) -> bool {
+    if inference.rule == "asserted" {
+        return inference.premises.is_empty()
+            && inference.axioms == [inference.conclusion]
+            && known(base.is_asserted(inference.conclusion, &to_its_end()));
+    }
+    let same = |body: &[Triple]| {
+        let mut body = body.to_vec();
+        body.sort_unstable();
+        body.dedup();
+        body.retain(|premise| *premise != inference.conclusion);
+        body == inference.premises
+    };
+    if inference.rule == "axiom" {
+        return program.bodiless.contains(&inference.conclusion)
+            && program
+                .unpolled()
+                .premise_alternatives(super::eval::Grounding::Bodiless(inference.conclusion))
+                .iter()
+                .any(|premises| same(premises));
+    }
+    program
+        .unpolled()
+        .every_named_derivation(&Whole(base), inference.conclusion, usize::MAX)
+        .iter()
+        .any(|(rule, body)| *rule == inference.rule && same(body))
+}
+
+/// A fact proved: the size of its proof (steps, shared ones counted per use) and how.
+struct Proved {
+    size: usize,
+    derivation: Option<(String, Vec<Triple>)>,
+}
+
+/// A [`Base`] as a [`Source`] whose every fact is old; reads count on the base's.
+pub(crate) struct Whole<'a, B: ?Sized>(pub(crate) &'a B);
+
+impl<B: Base + ?Sized> Visits for Whole<'_, B> {
+    fn visit(&self, pattern: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {
+        if seg.plain() != Seg::Delta {
+            // The base's scan counts each position it visits on this visit's poller; stopped,
+            // the read around this visit answers `Stopped` (the poller is latched).
+            let scanned = self
+                .0
+                .scan(pattern, visit.poller(), &mut |fact| visit.counted(fact));
+            debug_assert!(scanned.is_ok() || visit.stopped());
+        }
+    }
+
+    fn size(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
+        match seg.plain() {
+            Seg::Delta => Ok(0),
+            _ => self.0.estimate(pattern, probe.poller()),
+        }
+    }
+
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        self.0.contains(fact, probe.poller())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::delta::MemoryBase;
+    use super::super::ir::{Atom, Head, Rule, Term};
+    use super::*;
+
+    #[test]
+    fn a_proof_dag_with_shared_premises_does_not_overflow_its_size() {
+        // Fact i follows from facts i - 1 and i - 2: 101 facts, but counting repeated
+        // uses the proof of the last is Fibonacci(100) steps large.
+        let facts: Vec<Triple> = (0u64..=100).map(|i| [i, 7, 8]).collect();
+        let base = MemoryBase::new(&facts[..2], &facts[2..]);
+        let mut program = GroundProgram::default();
+        let atom = |fact: Triple| Atom(fact.map(Term::Const));
+        for i in 2..=100 {
+            program.add(Rule {
+                name: format!("shared_{i}"),
+                body: vec![atom(facts[i - 1]), atom(facts[i - 2])],
+                guards: vec![],
+                head: Head::Facts(vec![atom(facts[i])]),
+            });
+        }
+        let explanation = explain_with(&base, &program, facts[100], 200).expect("derivable");
+        assert_eq!(
+            explanation.steps.len(),
+            101,
+            "one step per fact, the asserted leaves too"
+        );
+    }
+}

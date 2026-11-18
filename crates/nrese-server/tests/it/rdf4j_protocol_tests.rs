@@ -805,6 +805,77 @@ async fn transaction_locations_are_absolute() {
     }
 }
 
+/// A transaction's begin may name its isolation level, in the form body (RDF4J's client) or
+/// the URL (graphdb.js), under the current name or the older one (whose value may carry the
+/// Sesame namespace). The levels this server's transactions meet begin; SNAPSHOT and
+/// SERIALIZABLE, which they don't, and unknown levels are refused at the begin with the
+/// reason as plain text, never given weaker in silence.
+#[tokio::test]
+async fn transaction_isolation_levels_are_met_or_refused_at_begin() {
+    const SETTING: &str =
+        "transaction-setting__org.eclipse.rdf4j.common.transaction.IsolationLevel";
+    const SESAME: &str = "http://www.openrdf.org/schema/sesame#";
+    let app = test_app().unwrap();
+    let names = [
+        (SETTING, ""),
+        ("isolation-level", ""),
+        ("isolation-level", SESAME),
+    ];
+    let mut wrong = Vec::new();
+    for (level, met) in [
+        ("NONE", true),
+        ("READ_UNCOMMITTED", true),
+        ("READ_COMMITTED", true),
+        ("SNAPSHOT_READ", true),
+        ("SNAPSHOT", false),
+        ("SERIALIZABLE", false),
+        ("snapshot_read", false), // RDF4J's names only, as its server reads them
+    ] {
+        for (name, prefix) in names {
+            let pair = encode(&[(name, &format!("{prefix}{level}"))]);
+            for in_body in [true, false] {
+                let request = Request::builder().method(Method::POST);
+                let request = if in_body {
+                    request
+                        .uri(format!("{REPO}/transactions"))
+                        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                        .body(Body::from(pair.clone()))
+                } else {
+                    request
+                        .uri(format!("{REPO}/transactions?{pair}"))
+                        .body(Body::empty())
+                };
+                let response = app.clone().oneshot(request.unwrap()).await.unwrap();
+                let status = response.status();
+                let content_type = response
+                    .headers()
+                    .get(header::CONTENT_TYPE)
+                    .map(|v| v.to_str().unwrap().to_owned());
+                let text = body_text(response).await.unwrap();
+                let as_expected = if met {
+                    status == StatusCode::CREATED
+                } else {
+                    status == StatusCode::BAD_REQUEST
+                        && content_type.as_deref() == Some("text/plain")
+                        && text.contains(level)
+                };
+                if !as_expected {
+                    let place = if in_body { "body" } else { "URL" };
+                    wrong.push(format!(
+                        "{pair} in the {place}: {status} {content_type:?} {text}"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} begins answered wrongly:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+}
+
 /// A transaction's DELETE takes statements as patterns, as RDF4J's client sends them
 /// (`clear()` too): `sesame:wildcard` matches any value, no graph means every graph,
 /// `rdf4j:nil` the default graph.
@@ -881,4 +952,213 @@ async fn transaction_deletes_take_wildcards() {
     .await;
     assert_eq!(size(&app, None).await, 1);
     assert_eq!(size(&app, Some(graph)).await, 1);
+}
+
+/// A transaction's `DELETE` that isn't RDF is refused when it is sent, not at the commit:
+/// the transaction stays as it was, and commits what it had (RDF4J's server parses it on
+/// arrival). Guard: held while the document was decoded on arrival.
+#[tokio::test]
+async fn a_transaction_delete_that_isnt_rdf_is_refused_on_arrival() {
+    let app = test_app().unwrap();
+    let (status, location) = {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{REPO}/transactions"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let location = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        (response.status(), location)
+    };
+    assert_eq!(status, StatusCode::CREATED);
+    let action = |name: &str| format!("{location}?action={name}");
+    let (status, _) = send(
+        &app,
+        Method::PUT,
+        &action("ADD"),
+        Some("text/turtle"),
+        None,
+        DATA,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, text) = send(
+        &app,
+        Method::PUT,
+        &action("DELETE"),
+        Some("text/turtle"),
+        None,
+        "<http://example.com/a> <http://example.com/p> \"one\" .\n<http://example.com/a> <http://example.com/p> .\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    let (status, _) = send(&app, Method::PUT, &action("COMMIT"), None, None, "").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(size(&app, None).await, 3);
+}
+
+/// In a transaction's DELETE, a statement whose graph is
+/// another store's name for the default graph (`urn:x-arq:DefaultGraph`, `urn:x-rdflib:default`)
+/// names the default graph, as `rdf4j:nil` does: its copy in another graph stays. A statement
+/// without a graph still means every graph (guard). With and without `preserveNodeId`.
+#[tokio::test]
+async fn transaction_deletes_of_a_default_graph_alias_stay_in_the_default_graph() {
+    let keep = "<urn:keep>";
+    let statement = "<urn:s> <urn:p> <urn:o>";
+    let cases = [
+        ("<urn:x-arq:DefaultGraph>", "true", 1),
+        ("<urn:x-arq:DefaultGraph>", "false", 1),
+        ("<urn:x-rdflib:default>", "true", 1),
+        ("<urn:x-rdflib:default>", "false", 1),
+        ("", "false", 0),
+    ];
+    let mut failures = Vec::new();
+    for (graph, preserve, kept) in cases {
+        let app = test_app().unwrap();
+        for context in [None, Some(keep)] {
+            let uri = match context {
+                Some(context) => format!("{REPO}/statements?{}", encode(&[("context", context)])),
+                None => format!("{REPO}/statements"),
+            };
+            let body = format!("{statement} .");
+            let (status, _) =
+                send(&app, Method::POST, &uri, Some("text/turtle"), None, &body).await;
+            assert_eq!(status, StatusCode::NO_CONTENT);
+        }
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("{REPO}/transactions"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let tx = response.headers()[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let body = format!("{statement} {graph} .");
+        let (status, text) = send(
+            &app,
+            Method::PUT,
+            &format!("{tx}?preserveNodeId={preserve}&action=DELETE"),
+            Some("application/n-quads"),
+            None,
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let (status, _) = send(
+            &app,
+            Method::PUT,
+            &format!("{tx}?action=COMMIT"),
+            None,
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let got = (size(&app, None).await, size(&app, Some(keep)).await);
+        let ok = got == (kept, kept);
+        println!(
+            "{} graph '{graph}' preserveNodeId={preserve}: total {}, in {keep} {}",
+            if ok { "ok" } else { "FAILED" },
+            got.0,
+            got.1
+        );
+        if !ok {
+            failures.push(format!(
+                "{graph} {preserve}: expected ({kept}, {kept}), got {got:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Every media type RDF4J's own format registry lists for a format we read (RDF4J 6.1.0,
+/// `core/rio/api/src/main/java/org/eclipse/rdf4j/rio/RDFFormat.java`), as an RDF4J client sends
+/// it to `/statements`: each is stored, or refused (415) where taking it could guess a payload
+/// wrong: `application/xml` and `text/xml` (TriX and SPARQL results are XML too), `text/plain`
+/// (any text), `text/n3` and `text/rdf+n3` (the HTTP endpoints have no N3 format, in or out;
+/// only the bulk loader reads N3 files). What is stored is the statement sent, in the graph
+/// the payload names (the default graph for triple formats), and nothing else.
+#[tokio::test]
+async fn statements_take_rdf4j_media_types_or_refuse_the_ambiguous() {
+    const G: &str = "<http://example.com/g>";
+    const DEFAULT: &str = "null";
+    const NT: &str = "<http://example.com/s> <http://example.com/p> \"o\" .\n";
+    const NQ: &str =
+        "<http://example.com/s> <http://example.com/p> \"o\" <http://example.com/g> .\n";
+    const TRIG: &str =
+        "<http://example.com/g> { <http://example.com/s> <http://example.com/p> \"o\" . }\n";
+    const XML: &str = "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" \
+                       xmlns:ex=\"http://example.com/\"><rdf:Description rdf:about=\"http://example.com/s\">\
+                       <ex:p>o</ex:p></rdf:Description></rdf:RDF>";
+    const JSONLD: &str = "{\"@id\": \"http://example.com/s\", \"http://example.com/p\": \"o\"}";
+    // The graph the statement is stored in; `None`: refused.
+    let cases: &[(&str, &str, Option<&str>)] = &[
+        ("application/n-quads", NQ, Some(G)),
+        ("text/x-nquads", NQ, Some(G)),
+        ("text/nquads", NQ, Some(G)),
+        ("application/trig", TRIG, Some(G)),
+        ("application/x-trig", TRIG, Some(G)),
+        ("text/turtle", NT, Some(DEFAULT)),
+        ("application/x-turtle", NT, Some(DEFAULT)),
+        ("application/n-triples", NT, Some(DEFAULT)),
+        ("application/rdf+xml", XML, Some(DEFAULT)),
+        ("application/ld+json", JSONLD, Some(DEFAULT)),
+        ("application/xml", XML, None),
+        ("text/xml", XML, None),
+        ("text/plain", NT, None),
+        ("text/n3", NT, None),
+        ("text/rdf+n3", NT, None),
+    ];
+    let mut failures = Vec::new();
+    for &(media_type, body, graph) in cases {
+        let app = test_app().unwrap();
+        let uri = format!("{REPO}/statements");
+        let (status, text) = send(&app, Method::POST, &uri, Some(media_type), None, body).await;
+        // The statement sent, read back by pattern from the graph it belongs in.
+        let pattern = encode(&[
+            ("subj", "<http://example.com/s>"),
+            ("pred", "<http://example.com/p>"),
+            ("obj", "\"o\""),
+            ("context", graph.unwrap_or(DEFAULT)),
+        ]);
+        let uri = format!("{REPO}/statements?{pattern}");
+        let accept = Some("application/n-quads");
+        let (_, found) = send(&app, Method::GET, &uri, None, accept, "").await;
+        let got = (
+            status,
+            size(&app, None).await,
+            found.lines().filter(|line| !line.trim().is_empty()).count(),
+            size(&app, Some(DEFAULT)).await,
+        );
+        let want = match graph {
+            Some(G) => (StatusCode::NO_CONTENT, 1, 1, 0),
+            Some(_) => (StatusCode::NO_CONTENT, 1, 1, 1),
+            None => (StatusCode::UNSUPPORTED_MEDIA_TYPE, 0, 0, 0),
+        };
+        if got != want {
+            failures.push(format!(
+                "{media_type}: {} {:?} (status, stored, the statement in {}, in the default graph), \
+                 expected {want:?} ({text})",
+                got.0,
+                (got.1, got.2, got.3),
+                graph.unwrap_or(DEFAULT)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

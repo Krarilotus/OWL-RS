@@ -66,10 +66,15 @@ fn map_error(policy: &PolicyConfig, error: MutationError, timeout_message: &str)
         }
         MutationError::Rejected(reject) => {
             let reject = *reject;
-            ApiError::reasoner_reject(reject.detail, reject.explanation, reject.attribution)
+            ApiError::rejected(
+                reject.kind,
+                reject.detail,
+                reject.explanation,
+                reject.attribution,
+            )
         }
         MutationError::Cancelled => ApiError::timeout(timeout_message.to_owned()),
-        error @ MutationError::Retired => ApiError::unavailable(error.to_string()),
+        error @ MutationError::Retired => ApiError::busy(error.to_string()),
         error @ (MutationError::Gate(_) | MutationError::Poisoned) => {
             ApiError::internal(error.to_string())
         }
@@ -84,6 +89,7 @@ fn kind_name(kind: MutationKind) -> &'static str {
         MutationKind::GraphDelete => "graph delete",
         MutationKind::Restore => "restore",
         MutationKind::Statements => "statements",
+        MutationKind::Delta => "write",
     }
 }
 
@@ -113,6 +119,7 @@ mod tests {
             MutationKind::GraphDelete,
             MutationKind::Restore,
             MutationKind::Statements,
+            MutationKind::Delta,
         ];
         for kind in kinds {
             let syntax = nrese_store::PreparedQuery::parse(&nrese_store::SparqlQueryRequest::all(
@@ -147,6 +154,32 @@ mod tests {
         assert_eq!(
             status(MutationError::Cancelled),
             StatusCode::REQUEST_TIMEOUT
+        );
+    }
+
+    /// DC-07: a commit stopped because the process's memory couldn't be read is the server's
+    /// fault, as one stopped at the memory limit is, and its message says what happened, not
+    /// that the limit was reached.
+    #[test]
+    fn an_unreadable_memory_stop_is_the_servers_fault_and_says_so() {
+        let kind = MutationKind::Update;
+        let response = |source| {
+            map_error(
+                &PolicyConfig::default(),
+                MutationError::Store { kind, source },
+                "timeout",
+            )
+            .into_response()
+        };
+        let limit = response(StoreError::ProcessMemoryLimit { limit: 1 << 30 });
+        let unread = response(StoreError::MemoryUnreadable { limit: 1 << 30 });
+        assert_eq!(limit.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(unread.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let message = StoreError::MemoryUnreadable { limit: 1 << 30 }.to_string();
+        assert!(message.contains("couldn't be read"), "{message}");
+        assert!(
+            !message.contains("at the process's memory limit"),
+            "{message}"
         );
     }
 }

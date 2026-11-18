@@ -1,6 +1,7 @@
 //! E5 gate (store side): bulk loading files through parallel parsing and the engine's bulk
 //! path.
 
+use crate::support::Writes;
 use std::fmt::Write as _;
 use std::fs;
 use std::path::Path;
@@ -17,7 +18,7 @@ fn request(files: &[&Path]) -> BulkLoadRequest {
         files: files.iter().map(|path| path.to_path_buf()).collect(),
         replace: false,
         graph: GraphTarget::DefaultGraph,
-        skip_errors: false,
+        invalid: Some(nrese_store::InvalidStatements::Strict),
     }
 }
 
@@ -175,10 +176,10 @@ fn a_parse_error_names_the_file_and_changes_nothing() {
     assert!(matches!(error, StoreError::Configuration(_)), "{error}");
 }
 
-/// With `skip_errors`, bad statements are counted and skipped and the rest loads: lines of
-/// N-Triples, statements of Turtle.
+/// By default bad statements are quarantined and the rest loads: lines of N-Triples,
+/// statements of Turtle, node elements of RDF/XML (more in quarantine_tests.rs).
 #[test]
-fn skip_errors_loads_the_good_statements() {
+fn bad_statements_are_quarantined_and_the_rest_loads() {
     let dir = tempdir().unwrap();
     let lines = dir.path().join("lines.nt");
     let mut text = ntriples(10);
@@ -191,16 +192,23 @@ fn skip_errors_loads_the_good_statements() {
         "@prefix ex: <http://example.com/> .\nex:t1 ex:p 1 .\nex:t2 ex:p ex:q ex:r .\nex:t3 ex:p 3 .\n",
     )
     .unwrap();
+    // RDF/XML: the node element with the bad language tag goes, the others stay.
+    let xml = dir.path().join("doc.rdf");
+    fs::write(
+        &xml,
+        "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" xmlns:e=\"http://example.com/\">         <rdf:Description rdf:about=\"http://example.com/x1\"><e:p>1</e:p></rdf:Description>         <rdf:Description rdf:about=\"http://example.com/x2\"><e:p xml:lang=\"es/wn\">2</e:p></rdf:Description>         <rdf:Description rdf:about=\"http://example.com/x3\"><e:p>3</e:p></rdf:Description>         </rdf:RDF>",
+    )
+    .unwrap();
     let service = service();
     let report = service
         .bulk_load(&BulkLoadRequest {
-            skip_errors: true,
-            ..request(&[&lines, &turtle])
+            invalid: None,
+            ..request(&[&lines, &turtle, &xml])
         })
         .unwrap();
-    assert_eq!(report.skipped, 2);
-    assert_eq!(report.inserted, 13);
-    // Without: the first bad statement stops the load.
+    assert_eq!(report.quarantined, 3);
+    assert_eq!(report.inserted, 15);
+    // Strict: the first bad statement stops the load.
     let service = self::service();
     assert!(service.bulk_load(&request(&[&lines])).is_err());
 }
@@ -283,4 +291,42 @@ fn loads_report_progress_and_stop_when_cancelled() {
         count(&service, "SELECT (COUNT(*) AS ?n) WHERE { ?s ?p ?o }"),
         before
     );
+}
+
+/// Bulk loads number new terms in the order they first occur in the files, whatever the
+/// number of threads parsing them (one chunk per thread): the same ids, so the same
+/// answers in the same order (a scan answers in id order).
+#[test]
+fn loads_give_the_same_ids_at_any_thread_count() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("data.nt");
+    let mut text = ntriples(20_000);
+    for i in 0..20_000 {
+        writeln!(
+            text,
+            "<http://example.com/s{}> <http://example.com/q{}> <http://example.com/o{}> .",
+            (i * 7919) % 5000,
+            i % 11,
+            (i * 104_729) % 3000
+        )
+        .unwrap();
+    }
+    fs::write(&path, text).unwrap();
+    let answers = |threads: usize| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let service = service();
+        pool.install(|| service.bulk_load(&request(&[&path])).expect("load"));
+        // Blank nodes are labelled afresh per load: the IRIs' statements, whose ids lie
+        // among the blank nodes' (any difference there moves them too).
+        service
+            .execute_query_str("SELECT * WHERE { ?s ?p ?o FILTER(isIRI(?s)) }")
+            .expect("query")
+            .payload
+    };
+    let one = answers(1);
+    assert_eq!(answers(6), one);
+    assert_eq!(answers(3), one);
 }

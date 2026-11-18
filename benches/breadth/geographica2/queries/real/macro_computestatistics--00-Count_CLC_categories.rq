@@ -1,0 +1,16 @@
+PREFIX ns: <http://geographica.di.uoa.gr/dataset/> 
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> 
+PREFIX clc: <http://geo.linkedopendata.gr/corine/ontology#>
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
+
+SELECT ?clcLandUse (COUNT(DISTINCT ?clc) AS ?count) 
+WHERE { 
+	GRAPH ns:clc { 
+		?clc rdf:type clc:Area. 
+		?clc clc:hasLandUse ?clcLandUse. 
+		?clc clc:hasGeometry ?clcGeo. 
+		?clcGeo clc:asWKT ?clcWkt. 
+		FILTER(geof:sfIntersects(?clcWkt, "POLYGON ((23.5669247401051 37.9893271592633, 23.5669247401051 38.0366287295546, 23.6743333558464 38.0366287295546, 23.6743333558464 37.9893271592633, 23.5669247401051 37.9893271592633))"^^geo:wktLiteral)). 
+	}
+} 
+GROUP BY ?clcLandUse

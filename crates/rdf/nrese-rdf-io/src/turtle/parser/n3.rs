@@ -35,6 +35,7 @@ impl<R: Read> TurtleParser<'_, R> {
             self.triples.clear();
             self.handed_out = 0;
             if let Err(error) = self.statement() {
+                self.abort_statement();
                 self.done = true;
                 return Some(Err(error));
             }

@@ -11,14 +11,38 @@ use rayon::prelude::*;
 /// Row count from which sorting runs in parallel.
 const PARALLEL_SORT_ROWS: usize = 1 << 16;
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// What a row of a table without columns counts for memory budgets, after its first: one
+/// id, the column an operator after it may make for it (an unbound variable's UNDEF, a
+/// BIND), as a join's row limit counts it. The table itself holds only its row count, so
+/// without this a query could make rows past its budget that hold nothing, and the next
+/// operator a column of them, before anything is charged. The first row, the one solution
+/// of an empty pattern, counts nothing: a column of it is one id a table, which a table's
+/// charge leaves out as it leaves out its list of columns. So making and consuming one
+/// solution without bindings, once per row of a substituted EXISTS, charges nothing.
+const ROW_WITHOUT_COLUMNS_BYTES: usize = size_of::<u64>();
+
+#[derive(Debug, Clone, Default)]
 pub struct IdTable {
     columns: Vec<Vec<u64>>,
     len: usize,
+    /// Without columns, the rows the table counts room for, as a column counts its
+    /// capacity ([`Self::memory_bytes`]): what was reserved, and the most it held; it
+    /// doesn't drop as rows go.
+    rows_held: usize,
     /// The table is sorted lexicographically on these columns (in this order). Empty if
     /// nothing is known.
     sorted_by: Vec<usize>,
 }
+
+/// Tables are equal by their rows and sort order; what they count for budgets doesn't
+/// matter.
+impl PartialEq for IdTable {
+    fn eq(&self, other: &Self) -> bool {
+        self.columns == other.columns && self.len == other.len && self.sorted_by == other.sorted_by
+    }
+}
+
+impl Eq for IdTable {}
 
 impl IdTable {
     /// An empty table with `width` columns.
@@ -30,6 +54,7 @@ impl IdTable {
         Self {
             columns: (0..width).map(|_| Vec::with_capacity(rows)).collect(),
             len: 0,
+            rows_held: rows,
             sorted_by: Vec::new(),
         }
     }
@@ -47,6 +72,7 @@ impl IdTable {
         Self {
             columns,
             len,
+            rows_held: 0,
             sorted_by: Vec::new(),
         }
     }
@@ -109,6 +135,50 @@ impl IdTable {
         self.sorted_by.clear();
     }
 
+    /// Adds a column, one value per row.
+    pub fn push_column(&mut self, column: Vec<u64>) {
+        assert_eq!(column.len(), self.len, "push_column: rows differ");
+        self.columns.push(column);
+    }
+
+    /// The rows that fit before the table reallocates; without columns, before it counts
+    /// more ([`Self::memory_bytes`]).
+    pub fn spare_rows(&self) -> usize {
+        self.columns
+            .iter()
+            .map(|c| c.capacity() - c.len())
+            .min()
+            .unwrap_or(self.rows_held.saturating_sub(self.len))
+    }
+
+    /// Room for `rows` more rows, allocated exactly; without columns, counted.
+    pub fn reserve_exact(&mut self, rows: usize) {
+        for column in &mut self.columns {
+            column.reserve_exact(rows);
+        }
+        self.rows_held = self.rows_held.max(self.len.saturating_add(rows));
+    }
+
+    /// What a row of this table counts for memory budgets ([`Self::memory_bytes`]): an id
+    /// a column, and one for a table without columns (after its first row).
+    pub fn row_bytes(&self) -> usize {
+        match self.width() {
+            0 => ROW_WITHOUT_COLUMNS_BYTES,
+            width => width * size_of::<u64>(),
+        }
+    }
+
+    /// What this table counts for memory budgets with room for exactly `rows` rows
+    /// ([`Self::memory_bytes`]): what to charge before it grows to that room.
+    pub fn bytes_for_rows(&self, rows: usize) -> usize {
+        match self.width() {
+            0 => rows
+                .saturating_sub(1)
+                .saturating_mul(ROW_WITHOUT_COLUMNS_BYTES),
+            width => rows.saturating_mul(width * size_of::<u64>()),
+        }
+    }
+
     /// Appends all rows of `other`, which must have the same width. Sortedness is lost.
     pub fn append(&mut self, other: &IdTable) {
         assert_eq!(self.width(), other.width(), "append: widths differ");
@@ -156,9 +226,32 @@ impl IdTable {
         out
     }
 
-    /// Bytes held by the column buffers (by capacity), for memory budgets.
+    /// The bytes [`Self::concat`] of `parts` allocates beyond them: each column of the first
+    /// part without room for every row, reallocated to hold them all.
+    pub fn concat_growth<'a>(parts: impl IntoIterator<Item = &'a IdTable>) -> usize {
+        let mut parts = parts.into_iter();
+        let Some(first) = parts.next() else {
+            return 0;
+        };
+        let rows = first.len + parts.map(IdTable::len).sum::<usize>();
+        let short = first.columns.iter().filter(|c| c.capacity() < rows).count();
+        short.saturating_mul(rows).saturating_mul(8)
+    }
+
+    /// Bytes held by the column buffers (by capacity), for memory budgets. A table without
+    /// columns counts one id a row after the first (`ROW_WITHOUT_COLUMNS_BYTES`) of the
+    /// rows it has room for: what was reserved, and the most it held, which doesn't drop as
+    /// rows go.
     pub fn memory_bytes(&self) -> usize {
+        if self.columns.is_empty() {
+            return self.bytes_for_rows(self.len.max(self.rows_held));
+        }
         self.columns.iter().map(|c| c.capacity() * 8).sum()
+    }
+
+    /// Before rows are removed: a table without columns keeps counting them.
+    fn hold_rows(&mut self) {
+        self.rows_held = self.rows_held.max(self.len);
     }
 
     /// The columns the table is known to be sorted on, most significant first.
@@ -278,6 +371,7 @@ impl IdTable {
 
     pub fn retain_mask(&mut self, mask: &[bool]) {
         assert_eq!(mask.len(), self.len, "mask length");
+        self.hold_rows();
         let filter = |column: &mut Vec<u64>| {
             let mut keep = mask.iter();
             column.retain(|_| *keep.next().unwrap());
@@ -294,9 +388,18 @@ impl IdTable {
     pub fn dedup(&mut self) {
         let all: Vec<usize> = (0..self.width()).collect();
         self.sort_by(&all);
+        self.dedup_adjacent();
+    }
+
+    /// Equal rows are adjacent when any permutation of all columns orders the table.
+    fn dedup_adjacent(&mut self) {
         let mask: Vec<bool> = (0..self.len)
             .map(|row| {
-                row == 0 || self.compare_rows(row - 1, row, &all) != std::cmp::Ordering::Equal
+                row == 0
+                    || self
+                        .columns
+                        .iter()
+                        .any(|column| column[row - 1] != column[row])
             })
             .collect();
         self.retain_mask(&mask);
@@ -305,8 +408,8 @@ impl IdTable {
     /// Removes duplicate rows, keeping the first occurrence of each and the row order
     /// (SPARQL DISTINCT after ORDER BY). Sortedness is kept.
     pub fn dedup_preserving_order(&mut self) {
-        if self.sorted_by.len() == self.width() && self.width() > 0 {
-            self.dedup();
+        if self.width() > 0 && (0..self.width()).all(|column| self.sorted_by.contains(&column)) {
+            self.dedup_adjacent();
             return;
         }
         // A table of row numbers, hashed and compared through the columns: no row is
@@ -338,18 +441,37 @@ impl IdTable {
         self.retain_mask(&mask);
     }
 
-    /// A table with the given columns of `self`, in that order. Sortedness is kept for the
-    /// longest prefix of the sort order that survives.
-    pub fn project(&self, columns: &[usize]) -> IdTable {
-        let projected = columns.iter().map(|&c| self.columns[c].clone()).collect();
+    /// Keeps the given columns in that order, moving their buffers. Only repeated columns
+    /// are copied. O(width + output width * (sort keys + 1)), plus copied repeated columns.
+    /// Sortedness is kept for the longest prefix of the sort order that survives.
+    pub fn project(mut self, columns: &[usize]) -> IdTable {
+        if columns.len() == self.width() && columns.iter().copied().eq(0..self.width()) {
+            return self;
+        }
         let sorted_by = self
             .sorted_by
             .iter()
             .map_while(|key| columns.iter().position(|c| c == key))
             .collect();
+        let mut remaining = vec![0usize; self.width()];
+        for &column in columns {
+            remaining[column] += 1;
+        }
+        let projected = columns
+            .iter()
+            .map(|&column| {
+                remaining[column] -= 1;
+                if remaining[column] == 0 {
+                    std::mem::take(&mut self.columns[column])
+                } else {
+                    self.columns[column].clone()
+                }
+            })
+            .collect();
         IdTable {
             columns: projected,
             len: self.len,
+            rows_held: 0,
             sorted_by,
         }
     }
@@ -358,6 +480,7 @@ impl IdTable {
     pub fn slice(&mut self, offset: usize, limit: Option<usize>) {
         let start = offset.min(self.len);
         let end = limit.map_or(self.len, |l| start.saturating_add(l).min(self.len));
+        self.hold_rows();
         for column in &mut self.columns {
             column.truncate(end);
             column.drain(..start);
@@ -432,10 +555,10 @@ mod tests {
             t.rows().collect::<Vec<_>>(),
             vec![vec![1, 4], vec![1, 5], vec![2, 5]]
         );
-        let p = t.project(&[1]);
+        let p = t.clone().project(&[1]);
         assert_eq!(p.column(0), &[4, 5, 5]);
         assert!(p.sorted_by().is_empty(), "column 1 alone isn't sorted");
-        let q = t.project(&[0]);
+        let q = t.clone().project(&[0]);
         assert_eq!(q.sorted_by(), &[0]);
         let mut s = t.clone();
         s.slice(1, Some(1));
@@ -443,5 +566,107 @@ mod tests {
         t.retain(|t, row| t.get(row, 1) == 5);
         assert_eq!(t.len(), 2);
         assert!(t.is_sorted_on(&[0, 1]));
+    }
+
+    #[test]
+    fn projection_moves_buffers_and_preserves_order_and_empty_rows() {
+        let original = table(&[&[1, 4], &[1, 5], &[2, 5]]).assume_sorted_by(vec![0, 1]);
+        for columns in [
+            vec![],
+            vec![0],
+            vec![1],
+            vec![1, 0],
+            vec![0, 1],
+            vec![1, 0, 1],
+        ] {
+            let input = original.clone();
+            let buffers: Vec<_> = input.columns().iter().map(|c| c.as_ptr()).collect();
+            let expected: Vec<Vec<_>> = original
+                .rows()
+                .map(|row| columns.iter().map(|&c| row[c]).collect())
+                .collect();
+            let projected = input.project(&columns);
+            assert_eq!(projected.rows().collect::<Vec<_>>(), expected);
+            assert_eq!(projected.len(), original.len());
+            for (at, &column) in columns.iter().enumerate() {
+                if !columns[at + 1..].contains(&column) {
+                    assert_eq!(projected.column(at).as_ptr(), buffers[column]);
+                }
+            }
+            assert!(projected.check_sorted(projected.sorted_by()));
+        }
+    }
+
+    /// Spec (first row, PR #84's timing):
+    /// rows without columns count against the
+    /// budget where they are made, one id each after the first (the column an operator after
+    /// them may make: an unbound variable's UNDEF), so `memory_bytes` reports
+    /// `(rows - 1) * 8` for a table with no columns; one solution without bindings counts
+    /// nothing. What a table reports doesn't drop while it lives, as a column's capacity
+    /// doesn't when rows go: the charge taken for it is the charge released. Room for `n`
+    /// rows counts what `bytes_for_rows(n)` says, with columns or without.
+    #[test]
+    fn rows_without_columns_count_one_id_each() {
+        let rows = |n: usize| IdTable::from_rows(0, std::iter::repeat_n(&[][..], n));
+        let wide = |n: usize, width: usize| {
+            IdTable::from_columns((0..width).map(|_| vec![7; n]).collect())
+        };
+        assert_eq!(rows(0).memory_bytes(), 0);
+        assert_eq!(rows(1).memory_bytes(), 0);
+        assert_eq!(rows(2).memory_bytes(), 8);
+        assert_eq!(rows(1_000).memory_bytes(), 7_992);
+        let mut grown = rows(10);
+        grown.append(&rows(990));
+        assert_eq!(grown.memory_bytes(), 7_992);
+        assert_eq!(
+            IdTable::concat(0, vec![rows(400), rows(600)]).memory_bytes(),
+            7_992
+        );
+        assert_eq!(wide(1_000, 2).project(&[]).memory_bytes(), 7_992);
+        // Room reserved counts as a column's capacity does, and is what fits before more
+        // is counted.
+        let mut room = IdTable::with_capacity(0, 100);
+        assert_eq!((room.memory_bytes(), room.spare_rows()), (792, 100));
+        room.reserve_exact(400);
+        assert_eq!((room.memory_bytes(), room.spare_rows()), (3_192, 400));
+        room.append(&rows(450));
+        assert_eq!((room.memory_bytes(), room.spare_rows()), (3_592, 0));
+        for width in [0, 1, 3] {
+            let room = IdTable::with_capacity(width, 100);
+            assert_eq!(
+                room.bytes_for_rows(100),
+                room.memory_bytes(),
+                "{width} columns"
+            );
+        }
+        let mut cut = rows(1_000);
+        cut.retain_mask(&[true, false].repeat(500));
+        assert_eq!(cut.len(), 500);
+        assert_eq!(cut.memory_bytes(), 7_992);
+        cut.slice(100, Some(10));
+        assert_eq!(cut.len(), 10);
+        assert_eq!(cut.memory_bytes(), 7_992);
+    }
+
+    #[test]
+    fn ordered_dedup_uses_any_complete_sort_order_without_gathering() {
+        let mut input = table(&[&[2, 1], &[2, 1], &[1, 2]]).assume_sorted_by(vec![1, 0]);
+        let buffers: Vec<_> = input
+            .columns()
+            .iter()
+            .map(|column| column.as_ptr())
+            .collect();
+        input.dedup_preserving_order();
+        assert_eq!(input.rows().collect::<Vec<_>>(), [vec![2, 1], vec![1, 2]]);
+        assert_eq!(input.sorted_by(), [1, 0]);
+        for (column, buffer) in input.columns().iter().zip(buffers) {
+            assert_eq!(column.as_ptr(), buffer, "dedup must not sort/gather again");
+        }
+
+        // Repeating one key does not cover the other column: equal rows need not be
+        // adjacent. Keep the hash path's first occurrence and its order in that case.
+        let mut partial = table(&[&[1, 2], &[1, 3], &[1, 2]]).assume_sorted_by(vec![0, 0]);
+        partial.dedup_preserving_order();
+        assert_eq!(partial.rows().collect::<Vec<_>>(), [vec![1, 2], vec![1, 3]]);
     }
 }

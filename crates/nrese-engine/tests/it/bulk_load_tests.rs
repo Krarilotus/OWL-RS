@@ -90,31 +90,6 @@ fn bulk_append_equals_a_transactional_load() {
 }
 
 #[test]
-fn parallel_batches_give_the_same_dataset() {
-    let data = quads(0..20_000);
-    let engine = Engine::new(config()).unwrap();
-    let load = engine.bulk_load(BulkMode::Append);
-    std::thread::scope(|scope| {
-        for chunk in data.chunks(2_500) {
-            let load = &load;
-            scope.spawn(move || {
-                for batch in chunk.chunks(300) {
-                    load.add(batch);
-                }
-            });
-        }
-    });
-    load.finish().expect("finish");
-    let expected: HashSet<Quad> = data.into_iter().collect();
-    assert_eq!(contents(&engine.snapshot(), ReadModel::Asserted), expected);
-    // Every interned term decodes to itself: ids assigned under concurrency are consistent.
-    let snapshot = engine.snapshot();
-    for quad in &expected {
-        assert!(snapshot.lookup_quad(quad.as_ref()).is_some(), "{quad}");
-    }
-}
-
-#[test]
 fn append_skips_existing_quads_and_makes_inferred_ones_explicit() {
     let engine = Engine::new(config()).unwrap();
     load_by_transaction(&engine, &quads(0..100));
@@ -290,4 +265,259 @@ fn rematerialisation_replaces_the_inferred_stack_durably() {
         expected
     );
     assert_eq!(contents(&engine.snapshot(), ReadModel::Inferred), inferred);
+}
+
+/// Each term's id in `data` (subject, predicate, object, graph per quad), as `engine`'s
+/// dictionary has it.
+fn ids_of(engine: &Engine, data: &[Quad]) -> Vec<TermId> {
+    let snapshot = engine.snapshot();
+    data.iter()
+        .flat_map(|quad| {
+            let graph = match &quad.graph_name {
+                GraphName::DefaultGraph => TermId::DEFAULT_GRAPH,
+                GraphName::NamedNode(node) => snapshot.lookup(node.as_ref().into()).unwrap(),
+                GraphName::BlankNode(node) => snapshot.lookup(node.as_ref().into()).unwrap(),
+            };
+            [
+                snapshot.lookup(quad.subject.as_ref().into()).unwrap(),
+                snapshot.lookup(quad.predicate.as_ref().into()).unwrap(),
+                snapshot.lookup(quad.object.as_ref()).unwrap(),
+                graph,
+            ]
+        })
+        .collect()
+}
+
+/// Interning without the global lock (performance.md §0): a bulk load's new terms take
+/// dense ids in the order they first occur in the input, whatever order the batches
+/// arrive in, on however many threads, however the input is cut into chunks and batches,
+/// and when the load spills to disk.
+#[test]
+fn new_terms_take_ids_in_input_order_whatever_the_threads() {
+    use rayon::prelude::*;
+    let data = quads(0..6000);
+    let batches: Vec<&[Quad]> = data.chunks(500).collect();
+    let in_order = {
+        let engine = Engine::new(config()).unwrap();
+        let load = engine.bulk_load(BulkMode::Replace);
+        for (b, batch) in batches.iter().enumerate() {
+            load.add_at(1, b as u32, batch);
+        }
+        load.finish().unwrap();
+        ids_of(&engine, &data)
+    };
+    // First occurrences ascend and the new ids are dense.
+    let mut seen = HashSet::new();
+    let firsts: Vec<u64> = in_order
+        .iter()
+        .filter(|id| id.kind().is_dictionary() && seen.insert(**id))
+        .map(|id| id.payload())
+        .collect();
+    assert!(firsts.windows(2).all(|w| w[0] < w[1]), "ids in input order");
+    assert_eq!(
+        firsts.last().unwrap() - firsts[0] + 1,
+        firsts.len() as u64,
+        "dense"
+    );
+    let reversed = {
+        let engine = Engine::new(config()).unwrap();
+        let load = engine.bulk_load(BulkMode::Replace);
+        for (b, batch) in batches.iter().enumerate().rev() {
+            load.add_at(1, b as u32, batch);
+        }
+        load.finish().unwrap();
+        ids_of(&engine, &data)
+    };
+    assert_eq!(reversed, in_order);
+    let parallel = |engine: &Engine, threads| {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .unwrap();
+        let load = engine.bulk_load(BulkMode::Replace);
+        // Cut differently: three chunks of 2,000 quads, batches of 300.
+        pool.install(|| {
+            data.par_chunks(2000).enumerate().for_each(|(c, chunk)| {
+                chunk
+                    .par_chunks(300)
+                    .enumerate()
+                    .for_each(|(b, batch)| load.add_at(1 + c as u32, b as u32, batch));
+            });
+        });
+        load.finish().unwrap();
+        ids_of(engine, &data)
+    };
+    // Concurrent batches give the input's dataset, every term found.
+    let engine = Engine::new(config()).unwrap();
+    assert_eq!(parallel(&engine, 8), in_order);
+    let expected: HashSet<Quad> = data.iter().cloned().collect();
+    assert_eq!(contents(&engine.snapshot(), ReadModel::Asserted), expected);
+    // Spilled to disk in chunks of 21 quads, each renumbered before it is sorted.
+    let spilling = EngineConfig {
+        durability: nrese_engine::DurabilityConfig {
+            bulk_load_memory: Some(2048),
+            ..nrese_engine::DurabilityConfig::default()
+        },
+        ..config()
+    };
+    for threads in [1, 2, 8] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Engine::open(dir.path(), spilling.clone()).unwrap();
+        assert_eq!(parallel(&engine, threads), in_order);
+        assert_eq!(contents(&engine.snapshot(), ReadModel::Asserted), expected);
+        drop(engine);
+        let engine = Engine::open(dir.path(), spilling.clone()).unwrap();
+        assert_eq!(ids_of(&engine, &data), in_order);
+        assert_eq!(contents(&engine.snapshot(), ReadModel::Asserted), expected);
+    }
+}
+
+/// A bulk load's terms stay in the arenas they were interned into, a segment of the
+/// dictionary between the entries before it (frozen) and those after: every term decodes,
+/// is found, and a string scan sees all of them, in memory and after reopening.
+#[test]
+fn bulk_loaded_terms_are_found_beside_the_others() {
+    use nrese_engine::{Placement, StringTest};
+    let before = quads(0..300);
+    let loaded: Vec<Quad> = (300..3000).map(quad).collect();
+    let after = quads(3000..3300);
+    let check = |engine: &Engine| {
+        let snapshot = engine.snapshot();
+        for quad in before.iter().chain(&loaded).chain(&after) {
+            let id = snapshot.lookup(quad.object.as_ref()).expect("found");
+            assert_eq!(snapshot.decode(id).as_ref(), Some(&quad.object));
+        }
+        // "label 1…" in each part: before, loaded and after.
+        let test = StringTest {
+            needle: "label 1",
+            placement: Placement::Anywhere,
+            iris: false,
+            strings: false,
+            lang_strings: true,
+            typed: false,
+            language: None,
+            ascii_case_insensitive: false,
+        };
+        let found: HashSet<String> = snapshot
+            .matching_strings(&test)
+            .into_iter()
+            .filter_map(|id| match snapshot.decode(id)? {
+                nrese_rdf::Term::Literal(literal) => Some(literal.value().to_owned()),
+                _ => None,
+            })
+            .collect();
+        let expected: HashSet<String> = before
+            .iter()
+            .chain(&loaded)
+            .chain(&after)
+            .filter_map(|quad| match &quad.object {
+                nrese_rdf::Term::Literal(l) if l.value().contains("label 1") => {
+                    Some(l.value().to_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(found, expected);
+    };
+    let dir = tempfile::tempdir().unwrap();
+    for durable in [false, true] {
+        let engine = match durable {
+            false => Engine::new(config()).unwrap(),
+            true => Engine::open(dir.path(), config()).unwrap(),
+        };
+        load_by_transaction(&engine, &before);
+        let load = engine.bulk_load(BulkMode::Append);
+        for (b, batch) in loaded.chunks(400).enumerate() {
+            load.add_at(1, b as u32, batch);
+        }
+        load.finish().unwrap();
+        load_by_transaction(&engine, &after);
+        check(&engine);
+        if durable {
+            drop(engine);
+            check(&Engine::open(dir.path(), config()).unwrap());
+        }
+    }
+}
+
+/// The planner's characteristic sets are there for every query from the first one after
+/// a load or a start (docs/design/performance.md §0): planners that arrive together on a
+/// store whose sets nobody built wait for one build; a restart reads them from
+/// `derived/`, or builds them at its first query if the file is gone. Above 2^20
+/// statements, where they were built on a thread of their own while queries planned
+/// without them: DBpedia core q02 then planned by arrival, 3.3-7.5 ms against main's 2.1
+/// (release gate, 14 Oct 2026).
+#[test]
+fn characteristic_sets_are_complete_for_the_first_planners() {
+    // 330,000 subjects, each with two to four of four predicates: 1,100,000 statements.
+    let star = |i: u64| -> Vec<Quad> {
+        let subject = NamedNode::new_unchecked(format!("http://example.com/s{i}"));
+        (0..4)
+            .filter(|p| *p < 2 || !(i + p).is_multiple_of(3))
+            .map(|p| {
+                Quad::new(
+                    subject.clone(),
+                    NamedNode::new_unchecked(format!("http://example.com/p{p}")),
+                    Literal::new_typed_literal(format!("{}", i % 1000), xsd::INTEGER),
+                    GraphName::DefaultGraph,
+                )
+            })
+            .collect()
+    };
+    let first_planners = |engine: &Engine| -> Vec<Option<(usize, u64, bool)>> {
+        let snapshot = engine.snapshot();
+        std::thread::scope(|scope| {
+            let planners: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        snapshot
+                            .characteristic_sets_in(ReadModel::default())
+                            .map(|sets| (sets.len(), sets.subjects(), sets.has_pairs()))
+                    })
+                })
+                .collect();
+            planners.into_iter().map(|p| p.join().unwrap()).collect()
+        })
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let expected = {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        let load = engine.bulk_load(BulkMode::Append);
+        for chunk in (0..330_000u64).collect::<Vec<_>>().chunks(10_000) {
+            load.add(&chunk.iter().flat_map(|&i| star(i)).collect::<Vec<_>>());
+        }
+        load.finish().unwrap();
+        assert!(
+            engine
+                .snapshot()
+                .count_in(
+                    ReadModel::default(),
+                    &QuadPattern::in_graph(TermId::DEFAULT_GRAPH)
+                )
+                .at_least()
+                > 1 << 20
+        );
+        let planned = first_planners(&engine);
+        let expected = planned[0].expect("the first planners have the sets");
+        assert!(planned.iter().all(|p| *p == Some(expected)), "{planned:?}");
+        expected
+    };
+    // After a start: read from their file.
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(first_planners(&engine), vec![Some(expected); 8]);
+    drop(engine);
+    // After a start without the file: built at the first query, which waits for them.
+    for entry in std::fs::read_dir(dir.path().join("derived")).unwrap() {
+        let path = entry.unwrap().path();
+        if path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .starts_with("statistics-")
+        {
+            std::fs::remove_file(path).unwrap();
+        }
+    }
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(first_planners(&engine), vec![Some(expected); 8]);
 }

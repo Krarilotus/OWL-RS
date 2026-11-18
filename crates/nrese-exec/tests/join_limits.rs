@@ -1,0 +1,110 @@
+//! A join over its row limit stops before it expands its matches: the pairs of an
+//! equal-key group are charged before they are made (the review of 3 October 2026, P1),
+//! and a cross product is refused from its inputs' sizes (the server's
+//! `a_query_beyond_its_memory_limit_is_rejected`). Measured with a counting allocator, so
+//! this file is a test binary of its own, and one test.
+
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use nrese_exec::IdTable;
+use nrese_exec::join::{RowLimit, join, left_join};
+
+struct Counting;
+
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+// SAFETY: every call is forwarded to the system allocator; the counters only observe.
+unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let now = CURRENT.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
+        PEAK.fetch_max(now, Ordering::Relaxed);
+        // SAFETY: forwarded unchanged to the system allocator.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        CURRENT.fetch_sub(layout.size(), Ordering::Relaxed);
+        // SAFETY: `ptr` came from `alloc` with this layout.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOCATOR: Counting = Counting;
+
+/// Bytes allocated at the peak of `work` beyond what was live before it.
+fn peak_of(work: impl FnOnce()) -> usize {
+    let before = CURRENT.load(Ordering::Relaxed);
+    PEAK.store(before, Ordering::Relaxed);
+    work();
+    PEAK.load(Ordering::Relaxed) - before
+}
+
+/// `rows` rows of one key value, sorted on it, with a second column.
+fn one_key(rows: usize) -> IdTable {
+    IdTable::from_columns(vec![vec![5; rows], (0..rows as u64).collect()]).assume_sorted_by(vec![0])
+}
+
+#[test]
+fn joins_over_their_limit_stop_before_expanding_a_group() {
+    // 2,000 × 2,000 rows of one key: 4 million pairs, 32 MB of row numbers if expanded.
+    let (left, right) = (one_key(2_000), one_key(2_000));
+    let peak = peak_of(|| {
+        assert!(join(&left, &right, &[0], &[0], 1).is_err());
+    });
+    assert!(
+        peak < 256 * 1024,
+        "the inner join allocated {peak} bytes before refusing"
+    );
+    // A stop flag set before the join, and a limit reached in the group's middle: neither
+    // expands the group. (That a refused left row adds no pair is join.rs's unit test.)
+    let stopped = RowLimit {
+        max_rows: usize::MAX,
+        stop: Some(Arc::new(AtomicBool::new(true))),
+    };
+    let peak = peak_of(|| {
+        assert!(join(&left, &right, &[0], &[0], stopped).is_err());
+    });
+    assert!(peak < 256 * 1024, "a stopped join allocated {peak} bytes");
+    let peak = peak_of(|| {
+        assert!(join(&left, &right, &[0], &[0], 100_000).is_err());
+    });
+    // Its pairs' row numbers, 8 bytes each, four times over for the vectors' doubling.
+    assert!(
+        peak < 4 * 8 * 102_000,
+        "a join stopped at 100,000 rows allocated {peak} bytes"
+    );
+    let peak = peak_of(|| {
+        assert!(left_join(&left, &right, &[0], &[0], None, 1).is_err());
+    });
+    assert!(
+        peak < 256 * 1024,
+        "OPTIONAL allocated {peak} bytes before refusing"
+    );
+    // Without keys: 4 million rows of four columns, 128 MB if made.
+    let peak = peak_of(|| {
+        assert!(join(&left, &right, &[], &[], 1_000_000).is_err());
+    });
+    assert!(
+        peak < 256 * 1024,
+        "the cross product allocated {peak} bytes before refusing"
+    );
+    // Within the limit the same joins give every pair.
+    assert_eq!(
+        join(&left, &right, &[0], &[0], usize::MAX).unwrap().len(),
+        4_000_000
+    );
+    assert_eq!(
+        left_join(&left, &right, &[0], &[0], None, usize::MAX)
+            .unwrap()
+            .len(),
+        4_000_000
+    );
+    assert_eq!(
+        join(&left, &right, &[], &[], 4_000_000).unwrap().len(),
+        4_000_000
+    );
+}

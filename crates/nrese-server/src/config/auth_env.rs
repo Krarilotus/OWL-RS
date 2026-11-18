@@ -128,7 +128,7 @@ mod tests {
     use crate::auth::{AuthConfig, MtlsConfig, OidcIntrospectionConfig, StaticBearerConfig};
     use crate::config::source::KeyValueSource;
 
-    use super::{ConfiguredAuthMode, parse_auth_config, parse_auth_mode};
+    use super::parse_auth_config;
 
     /// The settings `values` as the parser reads them (the process environment untouched).
     fn source(values: &[(&str, &str)]) -> KeyValueSource {
@@ -139,35 +139,20 @@ mod tests {
         source
     }
 
+    /// Each mode without the setting it can't work without is refused, naming that setting.
     #[test]
-    fn auth_mode_parser_accepts_static_bearer() {
-        assert_eq!(
-            parse_auth_mode(Some("bearer-static")).expect("auth mode should parse"),
-            ConfiguredAuthMode::BearerStatic
-        );
-    }
-
-    #[test]
-    fn bearer_jwt_mode_parser_accepts_kebab_case() {
-        assert_eq!(
-            parse_auth_mode(Some("bearer-jwt")).expect("auth mode should parse"),
-            ConfiguredAuthMode::BearerJwt
-        );
-    }
-
-    #[test]
-    fn oidc_introspection_mode_parser_accepts_kebab_case() {
-        assert_eq!(
-            parse_auth_mode(Some("oidc-introspection")).expect("auth mode should parse"),
-            ConfiguredAuthMode::OidcIntrospection
-        );
-    }
-
-    #[test]
-    fn bearer_static_config_requires_admin_token() {
-        let source = source(&[("NRESE_AUTH_MODE", "bearer-static")]);
-
-        assert!(parse_auth_config(&source).is_err());
+    fn required_auth_settings() {
+        for (mode, setting) in [
+            ("bearer-static", "NRESE_AUTH_ADMIN_TOKEN"),
+            ("bearer-jwt", "NRESE_AUTH_JWT_SECRET"),
+            ("mtls", "NRESE_AUTH_MTLS_ADMIN_SUBJECTS"),
+            ("oidc-introspection", "NRESE_AUTH_OIDC_INTROSPECTION_URL"),
+        ] {
+            let error = parse_auth_config(&source(&[("NRESE_AUTH_MODE", mode)]))
+                .expect_err(mode)
+                .to_string();
+            assert_eq!(error, format!("{setting} is required in {mode} mode"));
+        }
     }
 
     #[test]
@@ -185,20 +170,6 @@ mod tests {
                 admin_token: "admin".to_owned(),
             })
         );
-    }
-
-    #[test]
-    fn bearer_jwt_config_requires_shared_secret() {
-        let source = source(&[("NRESE_AUTH_MODE", "bearer-jwt")]);
-
-        assert!(parse_auth_config(&source).is_err());
-    }
-
-    #[test]
-    fn mtls_config_requires_admin_subjects() {
-        let source = source(&[("NRESE_AUTH_MODE", "mtls")]);
-
-        assert!(parse_auth_config(&source).is_err());
     }
 
     #[test]
@@ -231,13 +202,6 @@ mod tests {
                 trusted_proxies: crate::auth::peers::AddressRange::loopback(),
             })
         );
-    }
-
-    #[test]
-    fn oidc_introspection_requires_introspection_url() {
-        let source = source(&[("NRESE_AUTH_MODE", "oidc-introspection")]);
-
-        assert!(parse_auth_config(&source).is_err());
     }
 
     #[test]

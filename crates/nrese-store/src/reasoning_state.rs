@@ -24,9 +24,18 @@ pub struct ReasoningState {
     pub fingerprint: u64,
     /// Consistency violations in the materialised closure.
     pub violations: usize,
+    /// Why `owl2-dl` doesn't decide the violations, where it doesn't: derived when the state
+    /// is recorded or read at open (`dl::undecided`), never written.
+    pub(crate) undecided: Option<WhyUndecided>,
     /// The inferred stack holds the closure over representatives of the `owl:sameAs`
     /// classes, which reads expand (`reasoner.equality = "compact"`).
     pub compact_equality: bool,
+    /// The closure reads lists through `rdf:nil`'s equality class, as the replacement rules
+    /// do (`nrese_reasoner::batch::Materialisation::nil_merged`): every state written since
+    /// 27 Oct 2026 except a compact stack's, which keeps the old reading. A state without it
+    /// is current only for data that doesn't equate `rdf:nil` with another term, so only a
+    /// store whose data does rebuilds, once.
+    pub nil_lists: bool,
 }
 
 /// Whether the stored data is consistent under the configured ruleset.
@@ -39,6 +48,12 @@ pub enum ConsistencyStatus {
     Inconsistent {
         violations: usize,
     },
+    /// The rules' violations, which `owl2-dl` doesn't decide, for `why`: in quarantine as
+    /// [`Self::Inconsistent`] is, but not said to be inconsistent.
+    Undecided {
+        violations: usize,
+        why: WhyUndecided,
+    },
 }
 
 impl ConsistencyStatus {
@@ -47,18 +62,53 @@ impl ConsistencyStatus {
             Self::Unknown => "unknown",
             Self::Consistent => "consistent",
             Self::Inconsistent { .. } => "inconsistent",
+            Self::Undecided { .. } => "undecided",
         }
     }
 }
 
+/// Why the OWL 2 RL rules' violations aren't decided under OWL 2 DL in this release.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WhyUndecided {
+    /// The ontology has annotation-property axioms or a punned name, or an empty
+    /// intersection or union (`nrese_owl::profile::rules_read_differently`).
+    ReadsDifferently,
+    /// The check whether it has didn't finish within its budget.
+    Unchecked,
+}
+
+impl WhyUndecided {
+    /// What is known, and the ways out: the one text for each place that says it.
+    pub fn text(self, violations: usize) -> String {
+        let why = match self {
+            Self::ReadsDifferently => {
+                "the ontology has annotation-property axioms or a punned name, or an empty \
+                 intersection or union, which OWL 2 DL reads differently"
+            }
+            Self::Unchecked => {
+                "the check whether OWL 2 DL reads this ontology differently did not finish \
+                 within its budget"
+            }
+        };
+        format!(
+            "the OWL 2 RL rules find {violations} clash(es), and {why}; this release doesn't \
+             decide whether the data is consistent under OWL 2 DL. Remove the statements \
+             behind the clash, remove the annotation property's domain, range or \
+             super-property, or give the individual its own IRI"
+        )
+    }
+}
+
 /// The fingerprint of `program` as the store runs it: leaving out unnamed classes'
-/// memberships is another closure.
+/// memberships is another closure. Its value changed when the program, not a rule's name,
+/// came to say whether those classes' members are things: every closure an older
+/// build left out memberships in is rebuilt once.
 pub(crate) fn fingerprint(
     program: &RuleProgram,
     hide_unnamed_classes: bool,
     compact_equality: bool,
 ) -> u64 {
-    const HIDDEN_UNNAMED_CLASSES: u64 = 0x5717_c1a5_5e5f_0007;
+    const HIDDEN_UNNAMED_CLASSES: u64 = 0x5717_c1a5_5e5f_0008;
     // Another form of the stack, not another closure; still not interchangeable.
     const COMPACT_EQUALITY: u64 = 0x0e9a_11c0_3a5c_0b02;
     program.fingerprint()
@@ -72,6 +122,33 @@ pub(crate) fn fingerprint(
         } else {
             0
         }
+}
+
+/// Whether `snapshot` equates `rdf:nil` with another term, asserted or inferred
+/// ([`ReasoningState::nil_lists`]).
+pub(crate) fn nil_equated(snapshot: &nrese_engine::Snapshot) -> bool {
+    use nrese_engine::{GraphSelector, QuadPattern, ReadModel};
+    use nrese_rdf::vocab::{owl, rdf};
+    let (Some(nil), Some(same_as)) = (
+        snapshot.lookup(rdf::NIL.into()),
+        snapshot.lookup(owl::SAME_AS.into()),
+    ) else {
+        return false;
+    };
+    let pattern = |subject, object| QuadPattern {
+        subject,
+        predicate: Some(same_as),
+        object,
+        graph: GraphSelector::Any,
+    };
+    [ReadModel::Asserted, ReadModel::Inferred]
+        .into_iter()
+        .any(|model| {
+            (snapshot.quads_for_pattern_in(model, &pattern(Some(nil), None)))
+                .any(|quad| quad.object != nil)
+                || (snapshot.quads_for_pattern_in(model, &pattern(None, Some(nil))))
+                    .any(|quad| quad.subject != nil)
+        })
 }
 
 impl ReasoningState {
@@ -90,32 +167,48 @@ impl ReasoningState {
             ruleset: program.name(),
             fingerprint: fingerprint(program, hide_unnamed_classes, compact_equality),
             violations,
+            undecided: None,
             compact_equality,
+            nil_lists: !compact_equality,
         }
     }
 
-    /// Whether the inferred stack is exactly `program`'s closure of the asserted data.
+    /// Whether the inferred stack is exactly `program`'s closure of the asserted data. Not
+    /// knowing the data, a state without [`Self::nil_lists`] is taken as stale.
     pub fn is_current_for(&self, program: impl Into<RuleProgram>) -> bool {
-        self.is_current_with(&program.into(), false, false)
+        self.is_current_with(&program.into(), false, false, || true)
     }
 
-    /// [`Self::is_current_for`] with unnamed classes' memberships left out or not, and
-    /// equality stored compactly or not.
+    /// [`Self::is_current_for`] with unnamed classes' memberships left out or not and
+    /// equality stored compactly or not; `nil_equated` tells whether the data equates
+    /// `rdf:nil` with another term, asked only of a state without [`Self::nil_lists`].
     pub fn is_current_with(
         &self,
         program: &RuleProgram,
         hide_unnamed_classes: bool,
         compact_equality: bool,
+        nil_equated: impl FnOnce() -> bool,
     ) -> bool {
         self.ruleset == program.name()
             && self.fingerprint == fingerprint(program, hide_unnamed_classes, compact_equality)
             && self.compact_equality == compact_equality
+            && (compact_equality || self.nil_lists || !nil_equated())
+    }
+
+    /// Whether `program` made the stack this state records, unnamed classes' memberships left
+    /// out or not (`hide_unnamed_classes`), in the state's own form of equality: the one
+    /// comparison by which the store vouches for a stack under the rules registered
+    /// (`StoreService::vouches`) and refuses a reader of some graphs who sees inferences a
+    /// stack other rules made (`support::made_with_other_rules`).
+    pub(crate) fn made_by(&self, program: &RuleProgram, hide_unnamed_classes: bool) -> bool {
+        self.fingerprint == fingerprint(program, hide_unnamed_classes, self.compact_equality)
     }
 
     pub fn consistency(&self) -> ConsistencyStatus {
-        match self.violations {
-            0 => ConsistencyStatus::Consistent,
-            violations => ConsistencyStatus::Inconsistent { violations },
+        match (self.violations, self.undecided) {
+            (0, _) => ConsistencyStatus::Consistent,
+            (violations, Some(why)) => ConsistencyStatus::Undecided { violations, why },
+            (violations, None) => ConsistencyStatus::Inconsistent { violations },
         }
     }
 
@@ -128,6 +221,9 @@ impl ReasoningState {
         if self.compact_equality {
             text.push_str("equality compact\n");
         }
+        if self.nil_lists {
+            text.push_str("lists nil-class\n");
+        }
         text
     }
 
@@ -135,7 +231,7 @@ impl ReasoningState {
     /// marker that held only the ruleset name (the store then rematerialises once).
     pub(crate) fn from_text(text: &str) -> Option<Self> {
         let (mut ruleset, mut fingerprint, mut violations) = (None, None, None);
-        let mut compact_equality = false;
+        let (mut compact_equality, mut nil_lists) = (false, false);
         for line in text.lines() {
             let (key, value) = line.split_once(' ')?;
             match key {
@@ -143,6 +239,7 @@ impl ReasoningState {
                 "fingerprint" => fingerprint = u64::from_str_radix(value, 16).ok(),
                 "violations" => violations = value.parse().ok(),
                 "equality" => compact_equality = value == "compact",
+                "lists" => nil_lists = value == "nil-class",
                 _ => {}
             }
         }
@@ -150,14 +247,16 @@ impl ReasoningState {
             ruleset: ruleset?,
             fingerprint: fingerprint?,
             violations: violations?,
+            undecided: None,
             compact_equality,
+            nil_lists,
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use nrese_reasoner::v2::rulesets::Ruleset;
+    use nrese_reasoner::rulesets::Ruleset;
 
     use super::*;
 
@@ -182,5 +281,124 @@ mod tests {
             ..state
         };
         assert!(!stale.is_current_for(Ruleset::Owl2Rl));
+    }
+
+    /// A state written before [`ReasoningState::nil_lists`] stays current for a store whose
+    /// data doesn't equate `rdf:nil` with another term and is stale for one whose data does:
+    /// only that store rebuilds. A state written since stays current when a commit equates
+    /// it, so the next write doesn't rebuild.
+    #[test]
+    fn only_data_equating_nil_makes_an_older_state_stale() {
+        use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+        use std::sync::Arc;
+        let config = || ReasonerConfig::for_mode(ReasoningMode::Owl2Rl);
+        let program = config().materialised_program().unwrap();
+        for (other, older_is_current) in [
+            ("urn:m", true),
+            ("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil", false),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let open = || {
+                let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir.path()));
+                crate::MutationPipeline::new(
+                    Arc::new(store.unwrap()),
+                    Arc::new(ReasonerService::new(config())),
+                )
+            };
+            let pipeline = open();
+            let update = format!(
+                "INSERT DATA {{ <urn:l> <http://www.w3.org/2002/07/owl#sameAs> <{other}> }}"
+            );
+            pipeline
+                .apply(
+                    crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(update)),
+                    &crate::Requester::all(),
+                    &crate::MutationTicket::new(),
+                )
+                .unwrap();
+            let current = |pipeline: &crate::MutationPipeline| {
+                pipeline.store().reasoning_is_current(&program)
+            };
+            assert!(current(&pipeline), "{other}: a state written since");
+            drop(pipeline);
+            // As the store wrote it before.
+            let older = format!(
+                "ruleset {}\nfingerprint {:016x}\nviolations 0\n",
+                program.name(),
+                program.fingerprint()
+            );
+            std::fs::write(dir.path().join("reasoning.state"), older).unwrap();
+            assert_eq!(
+                current(&open()),
+                older_is_current,
+                "{other}: a state written before"
+            );
+        }
+    }
+
+    /// A closure semantics version 2 wrote is recomputed by a build of another version, at
+    /// the first write after opening (PR #58): version 2's maintenance could
+    /// recompute an `owl:sameAs` split without what schema statements alone derive, here
+    /// `C owl:equivalentClass C` from `C rdfs:subClassOf C`. The marker is the one version 2
+    /// wrote for this store, as it wrote it (tests audit DC-09: never recomputed from
+    /// today's constants).
+    #[test]
+    fn a_closure_version_2_wrote_is_recomputed_after_opening() {
+        use nrese_engine::EncodedTriple;
+        use nrese_rdf::NamedNode;
+        use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+        use std::sync::Arc;
+        /// The marker of an on-disk OWL 2 RL store under semantics version 2 (dfe8b71f,
+        /// fleet lane-m-g2-w1-marker-probe).
+        const VERSION_2: &str =
+            "ruleset owl2-rl\nfingerprint 9ba81328ee5cf5c7\nviolations 0\nlists nil-class\n";
+        const OWL: &str = "http://www.w3.org/2002/07/owl#";
+        let dir = tempfile::tempdir().unwrap();
+        let open = || {
+            let store = crate::StoreService::new(crate::StoreConfig::on_disk(dir.path()));
+            crate::MutationPipeline::new(
+                Arc::new(store.unwrap()),
+                Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                    ReasoningMode::Owl2Rl,
+                ))),
+            )
+        };
+        let update = |pipeline: &crate::MutationPipeline, text: &str| {
+            pipeline
+                .apply(
+                    crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(format!(
+                        "PREFIX owl: <{OWL}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> {text}"
+                    ))),
+                    &crate::Requester::all(),
+                    &crate::MutationTicket::new(),
+                )
+                .unwrap();
+        };
+        let kept = |pipeline: &crate::MutationPipeline| {
+            let ask = format!("ASK {{ <urn:C> <{OWL}equivalentClass> <urn:C> }}");
+            let result = pipeline.store().execute_query_str(&ask).unwrap();
+            String::from_utf8(result.payload).unwrap().contains("true")
+        };
+        let pipeline = open();
+        update(
+            &pipeline,
+            "INSERT DATA { <urn:C> rdfs:subClassOf <urn:C> . <urn:C> owl:sameAs <urn:D> }",
+        );
+        update(&pipeline, "DELETE DATA { <urn:C> owl:sameAs <urn:D> }");
+        assert!(kept(&pipeline), "today's maintenance keeps it");
+        // The closure version 2 left: the same, without `C owl:equivalentClass C`.
+        {
+            let mut tx = pipeline.store().engine().transaction();
+            let id = |iri: &str| tx.intern(NamedNode::new_unchecked(iri).as_ref().into());
+            let (c, equivalent) = (id("urn:C"), id(&format!("{OWL}equivalentClass")));
+            assert!(tx.remove_inferred(EncodedTriple::new(c, equivalent, c)));
+            tx.commit().unwrap();
+        }
+        assert!(!kept(&pipeline), "the closure version 2 left");
+        drop(pipeline);
+        std::fs::write(dir.path().join("reasoning.state"), VERSION_2).unwrap();
+        let pipeline = open();
+        update(&pipeline, "INSERT DATA { <urn:x> <urn:p> <urn:y> }");
+        assert!(kept(&pipeline), "recomputed after opening");
     }
 }

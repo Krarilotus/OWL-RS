@@ -1,3 +1,5 @@
+use std::borrow::Cow;
+
 use axum::Json;
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -6,7 +8,7 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::reject_view::RejectExplanationView;
-use nrese_store::RejectAttribution;
+use nrese_store::{RejectAttribution, RejectKind};
 
 #[derive(Debug, Error)]
 pub enum ApiError {
@@ -14,8 +16,10 @@ pub enum ApiError {
     BadRequest(String),
     #[error("bad request: {0}")]
     BadRequestPlainText(String),
-    #[error("reasoner reject: {detail}")]
-    ReasonerReject {
+    /// A commit a gate rejected, labelled by the kind of reason the committer is shown.
+    #[error("rejected: {detail}")]
+    Rejected {
+        kind: RejectKind,
         detail: String,
         reject: Box<Option<RejectExplanationView>>,
     },
@@ -27,6 +31,12 @@ pub enum ApiError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// Exact answers asked for (`dl-answers=exact`) that can't be proven complete (422).
+    #[error("incomplete answer: {0}")]
+    IncompleteAnswer(Box<nrese_store::IncompleteAnswer>),
+    /// What was asked for is gone for good (a replica's log a checkpoint covered).
+    #[error("gone: {0}")]
+    Gone(String),
     #[error("not acceptable: {0}")]
     NotAcceptable(String),
     #[error("unsupported media type: {0}")]
@@ -39,6 +49,9 @@ pub enum ApiError {
     Timeout(String),
     #[error("service unavailable: {0}")]
     ServiceUnavailable(String),
+    /// Busy for now: 503 with `Retry-After`, to be tried again shortly.
+    #[error("busy: {0}")]
+    Busy(String),
     #[error("internal server error: {0}")]
     Internal(String),
 }
@@ -56,12 +69,14 @@ impl ApiError {
         Self::Unauthorized(message.into())
     }
 
-    pub fn reasoner_reject(
+    pub fn rejected(
+        kind: RejectKind,
         message: impl Into<String>,
         reject: Option<RejectExplanation>,
         commit_attribution: Option<RejectAttribution>,
     ) -> Self {
-        Self::ReasonerReject {
+        Self::Rejected {
+            kind,
             detail: message.into(),
             reject: Box::new(reject.as_ref().map(|reject| {
                 crate::reject_view::reject_view(reject, commit_attribution.as_ref())
@@ -80,6 +95,11 @@ impl ApiError {
     /// The request conflicts with the resource's state (it exists already, say).
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::Conflict(message.into())
+    }
+
+    /// What was asked for is gone for good (410).
+    pub fn gone(message: impl Into<String>) -> Self {
+        Self::Gone(message.into())
     }
 
     /// The client accepts no media type the endpoint can produce.
@@ -108,6 +128,11 @@ impl ApiError {
         Self::ServiceUnavailable(message.into())
     }
 
+    /// 503 with `Retry-After: 1`: the request may succeed when tried again.
+    pub fn busy(message: impl Into<String>) -> Self {
+        Self::Busy(message.into())
+    }
+
     pub fn internal(message: impl Into<String>) -> Self {
         Self::Internal(message.into())
     }
@@ -116,137 +141,210 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         // Server faults are logged once, here; the request span carries the request id,
-        // which the response returns in `x-request-id`.
+        // which the response returns in `x-request-id` and the problem in `request_id`.
         if let Self::Internal(detail) = &self {
             tracing::error!(%detail, "request failed on the server side");
         }
-        let (status, problem_type, title, detail, reasoner_reject) = match self {
-            Self::BadRequest(detail) => (
-                StatusCode::BAD_REQUEST,
-                "https://nrese.dev/problems/bad-request",
-                "Bad Request",
-                detail,
-                None,
-            ),
+        let rejected = match &self {
+            Self::Rejected { kind, .. } => Some(*kind),
+            _ => None,
+        };
+        if let Self::IncompleteAnswer(answer) = self {
+            return incomplete_answer(&answer);
+        }
+        if let Self::Busy(detail) = self {
+            let mut response = Self::ServiceUnavailable(detail).into_response();
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+            return response;
+        }
+        let (status, detail, reasoner_reject) = match self {
+            Self::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail, None),
             Self::BadRequestPlainText(detail) => {
                 let mut response = (StatusCode::BAD_REQUEST, detail).into_response();
                 response
                     .headers_mut()
                     .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/plain"));
+                response.extensions_mut().insert(Verbatim);
                 return response;
             }
-            Self::ReasonerReject { detail, reject } => (
-                StatusCode::BAD_REQUEST,
-                "https://nrese.dev/problems/reasoner-reject",
-                "Reasoner Reject",
-                detail,
-                *reject,
-            ),
-            Self::Unauthorized(detail) => (
-                StatusCode::UNAUTHORIZED,
-                "https://nrese.dev/problems/unauthorized",
-                "Unauthorized",
-                detail,
-                None,
-            ),
-            Self::Forbidden(detail) => (
-                StatusCode::FORBIDDEN,
-                "https://nrese.dev/problems/forbidden",
-                "Forbidden",
-                detail,
-                None,
-            ),
-            Self::NotFound(detail) => (
-                StatusCode::NOT_FOUND,
-                "https://nrese.dev/problems/not-found",
-                "Not Found",
-                detail,
-                None,
-            ),
-            Self::Conflict(detail) => (
-                StatusCode::CONFLICT,
-                "https://nrese.dev/problems/conflict",
-                "Conflict",
-                detail,
-                None,
-            ),
-            Self::NotAcceptable(detail) => (
-                StatusCode::NOT_ACCEPTABLE,
-                "https://nrese.dev/problems/not-acceptable",
-                "Not Acceptable",
-                detail,
-                None,
-            ),
-            Self::UnsupportedMediaType(detail) => (
-                StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                "https://nrese.dev/problems/unsupported-media-type",
-                "Unsupported Media Type",
-                detail,
-                None,
-            ),
-            Self::PayloadTooLarge(detail) => (
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "https://nrese.dev/problems/payload-too-large",
-                "Payload Too Large",
-                detail,
-                None,
-            ),
-            Self::TooManyRequests(detail) => (
-                StatusCode::TOO_MANY_REQUESTS,
-                "https://nrese.dev/problems/too-many-requests",
-                "Too Many Requests",
-                detail,
-                None,
-            ),
-            Self::Timeout(detail) => (
-                StatusCode::REQUEST_TIMEOUT,
-                "https://nrese.dev/problems/timeout",
-                "Request Timeout",
-                detail,
-                None,
-            ),
-            Self::ServiceUnavailable(detail) => (
-                StatusCode::SERVICE_UNAVAILABLE,
-                "https://nrese.dev/problems/service-unavailable",
-                "Service Unavailable",
-                detail,
-                None,
-            ),
-            Self::Internal(detail) => (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "https://nrese.dev/problems/internal-error",
-                "Internal Error",
-                detail,
-                None,
-            ),
+            Self::Rejected { detail, reject, .. } => (StatusCode::BAD_REQUEST, detail, *reject),
+            Self::Unauthorized(detail) => (StatusCode::UNAUTHORIZED, detail, None),
+            Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
+            Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
+            Self::Conflict(detail) => (StatusCode::CONFLICT, detail, None),
+            Self::IncompleteAnswer(_) | Self::Busy(_) => unreachable!("answered above"),
+            Self::Gone(detail) => (StatusCode::GONE, detail, None),
+            Self::NotAcceptable(detail) => (StatusCode::NOT_ACCEPTABLE, detail, None),
+            Self::UnsupportedMediaType(detail) => {
+                (StatusCode::UNSUPPORTED_MEDIA_TYPE, detail, None)
+            }
+            Self::PayloadTooLarge(detail) => (StatusCode::PAYLOAD_TOO_LARGE, detail, None),
+            Self::TooManyRequests(detail) => (StatusCode::TOO_MANY_REQUESTS, detail, None),
+            Self::Timeout(detail) => (StatusCode::REQUEST_TIMEOUT, detail, None),
+            Self::ServiceUnavailable(detail) => (StatusCode::SERVICE_UNAVAILABLE, detail, None),
+            Self::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail, None),
         };
-
-        let body = ProblemJson {
-            r#type: problem_type,
-            title,
-            status: status.as_u16(),
-            detail,
-            instance: None,
-            trace_id: None,
-            reasoner_reject,
+        let (problem_type, title) = match rejected {
+            Some(reject) => {
+                let (slug, title) = reject_label(reject);
+                (
+                    Cow::Owned(format!("https://nrese.dev/problems/{slug}")),
+                    Cow::Borrowed(title),
+                )
+            }
+            None => kind(status),
         };
-
-        let mut response = (status, Json(body)).into_response();
-        response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("application/problem+json"),
-        );
-        response
+        problem(
+            status,
+            &ProblemJson {
+                r#type: problem_type,
+                title,
+                status: status.as_u16(),
+                detail,
+                reasoner_reject,
+            },
+        )
     }
 }
 
+/// A rejected commit's problem type (its slug) and title, by the kind of reason the committer
+/// is shown. One whose graphs show no reason gets a label that names no gate: which gate
+/// rejected depends on graphs it may not read.
+fn reject_label(kind: RejectKind) -> (&'static str, &'static str) {
+    match kind {
+        RejectKind::Inconsistent => ("reasoner-reject", "Reasoner Reject"),
+        RejectKind::Undecided => ("undecided-reject", "Undecided Reject"),
+        RejectKind::ShapesViolated => ("shacl-reject", "SHACL Reject"),
+        RejectKind::NotShown => ("commit-reject", "Commit Reject"),
+    }
+}
+
+/// The problem document of exact answers that can't be proven complete: 422, type
+/// `incomplete-answer`, with the status's reasons, its bounds and the first unresolved
+/// candidates.
+fn incomplete_answer(answer: &nrese_store::IncompleteAnswer) -> Response {
+    let status = StatusCode::UNPROCESSABLE_ENTITY;
+    let completeness = &answer.status;
+    problem(
+        status,
+        &serde_json::json!({
+            "type": "https://nrese.dev/problems/incomplete-answer",
+            "title": "Incomplete Answer",
+            "status": status.as_u16(),
+            "detail": format!(
+                "the answers can't be proven complete under OWL 2 DL: {answer}"
+            ),
+            "regime": completeness.regime.map(|r| r.as_str()),
+            "reasons": completeness
+                .reasons
+                .iter()
+                .map(|r| serde_json::json!({"source": r.source, "text": r.text}))
+                .collect::<Vec<_>>(),
+            "bounds": completeness.bounds.map(|b| serde_json::json!({
+                "lower": b.lower,
+                "upper": b.upper,
+                "unresolved": b.unresolved,
+            })),
+            "unresolved": answer.unresolved,
+        }),
+    )
+}
+
+/// Marks an error status whose body must stay as written: the plain-text profile for
+/// SPARQL parse errors, for clients that show the message as text, and the readiness
+/// documents a 503 carries (`/readyz`, the extended health), which probes read. The
+/// envelope layer (`http::problems`) leaves it alone.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Verbatim;
+
+/// A status's problem type and title: the one place they are named, for the handlers'
+/// errors and for what the framework answers on its own.
+pub(crate) fn kind(status: StatusCode) -> (Cow<'static, str>, Cow<'static, str>) {
+    let named = |slug: &'static str, title: &'static str| {
+        (
+            Cow::Owned(format!("https://nrese.dev/problems/{slug}")),
+            Cow::Borrowed(title),
+        )
+    };
+    match status {
+        StatusCode::BAD_REQUEST => named("bad-request", "Bad Request"),
+        StatusCode::UNAUTHORIZED => named("unauthorized", "Unauthorized"),
+        StatusCode::FORBIDDEN => named("forbidden", "Forbidden"),
+        StatusCode::NOT_FOUND => named("not-found", "Not Found"),
+        StatusCode::CONFLICT => named("conflict", "Conflict"),
+        StatusCode::GONE => named("gone", "Gone"),
+        StatusCode::NOT_ACCEPTABLE => named("not-acceptable", "Not Acceptable"),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            named("unsupported-media-type", "Unsupported Media Type")
+        }
+        StatusCode::PAYLOAD_TOO_LARGE => named("payload-too-large", "Payload Too Large"),
+        StatusCode::TOO_MANY_REQUESTS => named("too-many-requests", "Too Many Requests"),
+        StatusCode::REQUEST_TIMEOUT => named("timeout", "Request Timeout"),
+        StatusCode::SERVICE_UNAVAILABLE => named("service-unavailable", "Service Unavailable"),
+        StatusCode::INTERNAL_SERVER_ERROR => named("internal-error", "Internal Error"),
+        other => {
+            let title = other.canonical_reason().unwrap_or("Error");
+            let slug = title.to_ascii_lowercase().replace([' ', '\''], "-");
+            (
+                Cow::Owned(format!("https://nrese.dev/problems/{slug}")),
+                Cow::Borrowed(title),
+            )
+        }
+    }
+}
+
+/// A problem document as the answer, with its media type.
+pub(crate) fn problem(status: StatusCode, body: &impl Serialize) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(PROBLEM_JSON));
+    response
+}
+
+pub(crate) const PROBLEM_JSON: &str = "application/problem+json";
+
 #[derive(Debug, Serialize)]
 struct ProblemJson {
-    r#type: &'static str,
-    title: &'static str,
+    r#type: Cow<'static, str>,
+    title: Cow<'static, str>,
     status: u16,
     detail: String,
-    instance: Option<String>,
-    trace_id: Option<String>,
     reasoner_reject: Option<RejectExplanationView>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A retryable refusal (busy, or a write that met a reconfiguration) is told when to send
+    /// it again; a plain unavailability isn't.
+    #[test]
+    fn a_retryable_refusal_says_when_to_retry() {
+        let response = ApiError::busy("reconfigured").into_response();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+        let plain = ApiError::unavailable("down").into_response();
+        assert!(plain.headers().get(header::RETRY_AFTER).is_none());
+    }
+
+    /// A rejection whose committer's graphs show no reason names no gate: its type is the
+    /// same whichever gate rejected (D16-503).
+    #[tokio::test]
+    async fn a_rejection_with_no_reason_shown_names_no_gate() {
+        let response =
+            ApiError::rejected(RejectKind::NotShown, "rejected", None, None).into_response();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let problem: serde_json::Value = serde_json::from_slice(&body).expect("problem json");
+        assert_eq!(problem["type"], "https://nrese.dev/problems/commit-reject");
+        assert_eq!(problem["title"], "Commit Reject");
+    }
 }

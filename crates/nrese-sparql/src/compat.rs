@@ -13,13 +13,44 @@
 //! Blazegraph's planner what to do; ResearchSpace's and other Blazegraph clients' queries
 //! carry them. Read as data they match nothing, and the query with them. They are dropped:
 //! NRESE plans on its own.
+//!
+//! **Other stores' names for the default graph.** `urn:x-arq:DefaultGraph` names the
+//! default graph in Jena and Fuseki ([`JENA_DEFAULT_GRAPH`]), and clients written for them
+//! use it: rdflib's SPARQL store writes a graph so named into
+//! `GRAPH <urn:x-arq:DefaultGraph> { … }`. rdflib names its own default graph
+//! `urn:x-rdflib:default` ([`RDFLIB_DEFAULT_GRAPH`]) and asks for it as the query's
+//! `default-graph-uri` while writing its triples into the default graph. Here both are the
+//! default graph: in `GRAPH` patterns of queries and updates, in the data and templates of
+//! updates, as the graph of `CLEAR`, `DROP`, `CREATE`, `ADD`, `MOVE` and `COPY`, in a query's
+//! dataset (`FROM`, `default-graph-uri`), and as the Graph Store Protocol's `?graph=`; with the
+//! default graph's access rules. [`graph_named`] is that one resolution.
 
 use std::collections::HashMap;
 
-use nrese_rdf::Variable;
+use nrese_rdf::{GraphNameRef, NamedNode, Variable};
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern, OrderExpression};
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
 use nrese_sparql_syntax::{Query, SparqlParser, SparqlSyntaxError};
+
+/// Jena's and Fuseki's name for the default graph (module docs).
+pub const JENA_DEFAULT_GRAPH: &str = "urn:x-arq:DefaultGraph";
+
+/// rdflib's name for the default graph of a dataset (module docs).
+pub const RDFLIB_DEFAULT_GRAPH: &str = "urn:x-rdflib:default";
+
+/// Whether `iri` names the default graph by another store's convention.
+pub fn names_default_graph(iri: &str) -> bool {
+    iri == JENA_DEFAULT_GRAPH || iri == RDFLIB_DEFAULT_GRAPH
+}
+
+/// The store graph `name` names: the default graph for another store's name for it, else the
+/// named graph. Every graph name of a query or an update resolves here (module docs).
+pub fn graph_named(name: &NamedNode) -> GraphNameRef<'_> {
+    match names_default_graph(name.as_str()) {
+        true => GraphNameRef::DefaultGraph,
+        false => GraphNameRef::NamedNode(name.as_ref()),
+    }
+}
 
 /// Parses a query and applies the compatibility rewrites.
 pub fn parse_query(
@@ -64,17 +95,15 @@ fn having_under<'a>(
     aliases: &mut Vec<(Variable, Expression)>,
 ) -> Option<&'a mut Expression> {
     match pattern {
-        GraphPattern::Extend {
-            inner,
-            variable,
-            expression,
-        } => {
-            aliases.push((variable.clone(), expression.clone()));
+        // The outermost first, as a chain of them would be walked.
+        GraphPattern::Extend { inner, bindings } => {
+            aliases.extend(bindings.iter().rev().cloned());
             having_under(inner, aliases)
         }
-        GraphPattern::Join { left, right } if matches!(**right, GraphPattern::Values { .. }) => {
-            having_under(left, aliases)
-        }
+        GraphPattern::Join { inputs } => match inputs.as_mut_slice() {
+            [left, GraphPattern::Values { .. }] => having_under(left, aliases),
+            _ => None,
+        },
         GraphPattern::Filter { expr, inner } if matches!(**inner, GraphPattern::Group { .. }) => {
             Some(expr)
         }
@@ -101,9 +130,10 @@ fn having_aliases(pattern: &mut GraphPattern) {
     match pattern {
         GraphPattern::Bgp { patterns } => patterns.retain(|triple| !is_hint(triple)),
         GraphPattern::Path { .. } | GraphPattern::Values { .. } => {}
-        GraphPattern::Join { left, right }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => {
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            inputs.iter_mut().for_each(having_aliases);
+        }
+        GraphPattern::Minus { left, right } => {
             having_aliases(left);
             having_aliases(right);
         }
@@ -122,10 +152,10 @@ fn having_aliases(pattern: &mut GraphPattern) {
             in_expression(expr);
             having_aliases(inner);
         }
-        GraphPattern::Extend {
-            inner, expression, ..
-        } => {
-            in_expression(expression);
+        GraphPattern::Extend { inner, bindings } => {
+            for (_, expression) in bindings {
+                in_expression(expression);
+            }
             having_aliases(inner);
         }
         GraphPattern::OrderBy { inner, expression } => {

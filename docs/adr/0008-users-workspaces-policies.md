@@ -2,7 +2,7 @@
 
 Status: accepted (2026-10-02; the personal space is mandatory). The owner's direction: policies modifiable and justifiable at
 the store level, but user control and the users' own space first; the best model for the
-use cases ahead ([gap plan G2b](../plan/2026-10-02-engine-gaps.md)).
+use cases ahead (STATUS, goal G2).
 
 ## Context
 
@@ -31,7 +31,7 @@ API and the UI manage, with an audit log.
 ## Decision
 
 - **Workspaces are the user-facing unit.** A workspace is a named set of graphs (an IRI
-  prefix of its own, `…/workspace/{name}/`, plus graphs it takes in) with members, each
+  prefix of its own, `…/workspace/{name}~{id}/`, plus graphs it takes in) with members, each
   an owner, an editor or a viewer. Owners manage members; editors write the workspace's
   graphs; viewers read them. A project in ResearchSpace maps to a workspace.
 - **Every user has a personal space:** a workspace only they own and write, readable by
@@ -86,3 +86,44 @@ API and the UI manage, with an audit log.
   stays) or a session token from `POST /api/v1/access/login`; failures throttled per
   user name; sessions end with a password change. On by default, beside any token mode.
 - Provenance-based visibility of inferred statements waits for G3.
+- (14 Nov 2026, changed since: a remembered credential is kept by its HMAC-SHA-256 under a key
+  drawn at start, not by its SHA-256; failures are counted per user name and client address,
+  never per name alone; inferred statements are visible by the graphs they came from,
+  `inferred = "supported"` ([STATUS](../STATUS.md)).)
+
+## A reused name starts empty (8 November)
+
+Removing a workspace removes its record and keeps its graphs and saved queries (for
+administrators). Its name is free again, but its content is not passed on: the owner's
+decision of 26 October (C-204 (b)) binds content to an internal id.
+- The id is the number of the change that created the workspace. A user record gets one
+  when it is created, and only if a new person can be starting: it is created with a
+  password, or its name had a local login before (a removed local user's name used again,
+  also one removed before ids). Nothing later sets or changes an id: a password added or
+  removed, or a role, never moves anyone's space. Change numbers never repeat, so neither do
+  ids. A user record also keeps the number of the change that created it (`nra:created`).
+- The prefix carries it: `{base}workspace/{name}~{id}/`, and such a user's personal
+  space `{base}space/{user}~{id}/`. Names hold no `~`, so the prefixes of two incarnations
+  never overlap. Saved queries carry their space's id (`nra:spaceId`) and are found only in
+  that incarnation.
+- Workspaces and users from before ids keep their prefixes `…/workspace/{name}/` and
+  `…/space/{user}/`, as do users named by their credentials (a token's subject, who is the
+  same person whenever that name comes back), also when a record is made for one of them
+  for its roles. No data is migrated.
+- Whether a name had a local login is read from the access history, which keeps every
+  change's statements (the password itself left out). The history therefore decides
+  identities: an access state whose history is incomplete (no history for a state that has
+  statements, a gap in its change numbers, a change without a readable number, or a current
+  local login no change recorded) refuses to open, and the system store is restored from a
+  backup. Neither guess is safe: assuming no local login can pass a removed user's content
+  to a new person under the name; assuming one would move every token user's space when a
+  role record is first made for them. The history is never pruned; a future compaction must
+  keep, for every name, whether it had a local login.
+- Stated behaviour: an administrator who creates a local account (with a password) under the
+  name of a token user who already keeps personal content gives that name a fresh space, and
+  the token user then sees the fresh one: the administrator made the two share a name, and
+  the fresh space keeps the existing content from a possibly different person. Its earlier
+  content stays stored under the old prefix, readable by administrators.
+- Going back to a server version from before ids, once a workspace or a user with an id
+  exists, is not supported: such a version doesn't know the ids, may keep some and lose
+  others, and would give id-bearing content the prefixes without one.

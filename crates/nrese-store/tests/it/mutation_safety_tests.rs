@@ -1,3 +1,4 @@
+use crate::support::Writes;
 use nrese_store::{
     GraphResultFormat, GraphTarget, GraphWriteRequest, QueryResultKind, SparqlUpdateRequest,
     StoreConfig, StoreService,
@@ -41,7 +42,9 @@ fn failed_graph_write_does_not_advance_revision_or_publish()
         target: GraphTarget::DefaultGraph,
         format: GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:broken ex:p ".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:broken ex:p "
+            .to_vec()
+            .into(),
         replace: true,
     });
 

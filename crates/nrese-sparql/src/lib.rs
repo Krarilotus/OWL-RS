@@ -13,11 +13,19 @@
 //! - [`query`] evaluates queries ([`evaluate_query`]) over id tables (`native`, the
 //!   execution core of D11)
 //! - [`update`] applies SPARQL Update requests ([`apply_update`])
+//! - [`cache`]: the results of query plan parts, shared by a store's queries
 
+pub mod cache;
 pub mod compat;
+pub mod completeness;
 pub mod dataset;
+pub mod plan;
+pub use cache::{
+    CachedOutput, OutputSlot, PinRequest, PinnedResult, ResultCache, ResultCacheStats,
+};
 pub use dataset::GraphAccess;
 mod native;
+pub mod ql;
 pub mod query;
 pub mod results;
 pub mod service;
@@ -41,16 +49,26 @@ pub mod expression {
     pub use crate::native::expr::Evaluator;
 }
 
+pub use completeness::{Completeness, Outside, Regime};
+pub use native::typed_results::{AlignedSolutions, SolutionTable, TypedResults};
 pub use native::{ResultsFormat, geometry_literal};
 pub use nrese_exec::{BudgetExceeded, SharedBudget};
 pub use query::{
-    Explanation, PlanStep, QueryOptions, WriteResultsError, evaluate_query, explain_query,
-    runs_natively, write_results,
+    Candidates, Explanation, PlanStep, PlannedQuery, PlannedStep, QueryOptions, Resources,
+    SearchScope, WriteResultsError, cached_output, evaluate_query, evaluate_query_typed,
+    explain_query, plan_query, prepare_ql_query, ql_report, runs_natively, write_results,
 };
 pub use results::{
     CancellationToken, QueryDatasetSpecification, QueryEvaluationError, QueryResults,
     QuerySolution, QuerySolutionIter, QueryTripleIter,
 };
-pub use service::{ServiceClient, ServiceResults, Services};
-pub use update::{UpdateError, UpdateOptions, apply_update, graph_label};
-pub use view::ReadView;
+pub use service::{ServiceCall, ServiceClient, ServiceResults, Services};
+pub use update::{ReadSource, UpdateError, UpdateOptions, UpdateTarget, apply_update, graph_label};
+pub use view::{PendingRead, ReadView};
+
+/// The unit tests' allocator: the system's, counting what a measured operation holds live
+/// ([`nrese_exec::measure`]), so that an allocation not charged to its budget fails a test.
+#[cfg(test)]
+#[global_allocator]
+static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
+    nrese_exec::measure::Measured(std::alloc::System);

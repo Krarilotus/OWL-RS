@@ -5,6 +5,8 @@ use nrese_rdf::{GraphName, NamedNode};
 use super::*;
 use crate::{StoreConfig, StoreService};
 
+mod sessions;
+
 fn named(iri: &str) -> GraphName {
     GraphName::NamedNode(NamedNode::new_unchecked(iri))
 }
@@ -105,9 +107,11 @@ fn roles_union_their_rules_and_a_deny_wins() {
     assert!(!view.can_write(&named("https://kg.example/public/hr/salaries")));
     assert!(!view.can_read(&GraphName::DefaultGraph));
 
-    let mut settings = state.settings.clone();
-    settings.fallback = Fallback::Allow;
-    settings.inferred = Inferred::Visible;
+    let settings = SettingsPatch {
+        fallback: Some(Fallback::Allow),
+        inferred: Some(Inferred::Visible),
+        ..SettingsPatch::default()
+    };
     state.apply(&admin(), Change::Settings(settings)).unwrap();
     assert!(state.view(&roles(&["guest"]), "nrese").reads_everything());
     assert!(state.view(&roles(&["analyst"]), "nrese").sees_inferred());
@@ -480,10 +484,11 @@ fn local_logins_check_passwords_open_sessions_and_throttle_failures() {
     ));
 }
 
-/// Failed logins are counted per user name and client address (the milestone review's
-/// R2-R4): guesses from one address don't lock the user out elsewhere; an address that
-/// guesses many names waits too; the counts are bounded, names without a login counted
-/// like the others; and refusing a name without a login takes as long as a wrong password.
+/// Failed logins are counted per user name and client address:
+/// guesses from one address don't lock the user out elsewhere; an address that
+/// guesses many names waits too; and the counts are bounded, names without a login counted
+/// like the others. That refusing a name without a login does a wrong password's work is
+/// `login::tests::unknown_names_are_refused_like_wrong_passwords`.
 #[test]
 fn failed_logins_slow_down_the_guesser_not_the_user() {
     use std::net::IpAddr;
@@ -553,19 +558,38 @@ fn failed_logins_slow_down_the_guesser_not_the_user() {
     }
     let (pairs, addresses) = control.login_failures_tracked();
     assert!(pairs <= 5 && addresses <= 5, "{pairs} {addresses}");
-    // A name without a login is refused after as much work as a wrong password.
-    let time = |name: &str, client| {
-        let start = std::time::Instant::now();
-        let _ = control.login(name, "guess", client);
-        start.elapsed()
+}
+
+/// A user name with a character an IRI can't hold (`|`) has a personal space for queries
+/// too (the review of 3 October 2026, A5): the query's resource encodes it.
+#[test]
+fn a_user_name_with_a_bar_saves_queries() {
+    let dir = tempfile::tempdir().unwrap();
+    let open = || {
+        let store = StoreService::new(StoreConfig::on_disk(dir.path())).unwrap();
+        AccessControl::open(store, "urn:nrese:").unwrap()
     };
-    let _ = time("nobody", address("10.1.0.1"));
-    let unknown = time("nobody", address("10.1.0.2"));
-    let known = time("alice", address("10.1.0.3"));
-    assert!(
-        unknown * 4 >= known,
-        "unknown name {unknown:?}, wrong password {known:?}"
+    let draft = QueryDraft {
+        query: "ASK {}".to_owned(),
+        ..QueryDraft::default()
+    };
+    let namespaces = crate::NamespaceMap::new();
+    let tenant = user("alice|tenant");
+    open()
+        .save_query(&tenant, "~alice|tenant", "q", draft, &namespaces)
+        .unwrap();
+    let control = open();
+    let saved = control.saved_queries(&tenant);
+    assert_eq!(
+        saved
+            .iter()
+            .map(|q| (q.space.as_str(), q.name.as_str()))
+            .collect::<Vec<_>>(),
+        [("~alice|tenant", "q")]
     );
+    control.delete_query(&tenant, "~alice|tenant", "q").unwrap();
+    drop(control);
+    assert!(open().saved_queries(&tenant).is_empty());
 }
 
 /// Saved queries live in spaces: a personal space's owner and those it shares with read
@@ -707,3 +731,5 @@ fn roles_grant_service_and_keep_it() {
     assert!(service("federator"));
     assert!(!service("reader"));
 }
+
+mod identity;

@@ -21,11 +21,14 @@ use std::fmt;
 
 use nrese_rdf::{BlankNode, Iri, IriParseError, NamedNode, Variable};
 
-use crate::algebra::AggregateExpression;
-use crate::query::{Query, Update};
+use crate::algebra::{AggregateExpression, GraphPattern, PropertyPathExpression};
+use crate::query::{GraphUpdateOperation, Query, Update};
 
-/// Nesting allowed by default: groups, brackets, paths, collections and triple terms
-/// together. Deeper input is an error, not a stack overflow.
+/// Nesting allowed by default: of groups, brackets, paths, collections, triple terms and
+/// annotation blocks as the text is read, and of the algebra it builds ([`GraphPattern::depth`]). The passes
+/// over the algebra recurse as deep as it nests, and at this depth every one fits on a
+/// thread of 2 MiB with room to spare (ADR-0012). Deeper input is an error, not a stack
+/// overflow.
 pub const DEFAULT_MAX_NESTING: usize = 128;
 
 /// Parses SPARQL queries and updates. The options are those of the text's surroundings:
@@ -40,6 +43,9 @@ pub struct SparqlParser {
     lateral: bool,
     adjust: bool,
     max_nesting: usize,
+    /// A variable that stands for a property path in the predicate position
+    /// ([`Self::with_path_variable`]).
+    path_variable: Option<(Variable, PropertyPathExpression)>,
 }
 
 impl Default for SparqlParser {
@@ -59,6 +65,7 @@ impl SparqlParser {
             lateral: true,
             adjust: true,
             max_nesting: DEFAULT_MAX_NESTING,
+            path_variable: None,
         }
     }
 
@@ -104,18 +111,67 @@ impl SparqlParser {
         self
     }
 
-    /// How deep groups, brackets, paths, collections and triple terms may nest.
+    /// How deep groups, brackets, paths, collections, triple terms and annotation blocks,
+    /// and the algebra they build, may nest ([`DEFAULT_MAX_NESTING`]).
     pub fn with_max_nesting(mut self, depth: usize) -> Self {
         self.max_nesting = depth;
         self
     }
 
+    /// Reads `variable` as the predicate of a triple pattern as `path`: the pattern is
+    /// translated as if the text had the path there (one step a triple, `/` through fresh
+    /// blank nodes), and only there, not in a literal, a comment or a longer name. This is
+    /// SHACL-SPARQL's `$PATH` (SHACL §5.3); any other use of the variable stays a variable.
+    pub fn with_path_variable(mut self, variable: Variable, path: PropertyPathExpression) -> Self {
+        self.path_variable = Some((variable, path));
+        self
+    }
+
     pub fn parse_query(&self, text: &str) -> Result<Query, SparqlSyntaxError> {
-        self.parse_with_names(text, |p| p.query())
+        let query = self.parse_with_names(text, |p| p.query())?;
+        let (Query::Select { pattern, .. }
+        | Query::Construct { pattern, .. }
+        | Query::Describe { pattern, .. }
+        | Query::Ask { pattern, .. }) = &query;
+        self.within_nesting([pattern])?;
+        Ok(query)
     }
 
     pub fn parse_update(&self, text: &str) -> Result<Update, SparqlSyntaxError> {
-        self.parse_with_names(text, |p| p.update())
+        let update = self.parse_with_names(text, |p| p.update())?;
+        self.within_nesting(
+            update
+                .operations
+                .iter()
+                .filter_map(|operation| match operation {
+                    GraphUpdateOperation::DeleteInsert { pattern, .. } => Some(pattern.as_ref()),
+                    _ => None,
+                }),
+        )?;
+        Ok(update)
+    }
+
+    /// The algebra the text built nests no deeper than the limit (ADR-0012): the passes
+    /// over it (planning, rewriting, evaluating, printing) recurse that deep. Braces count
+    /// as the text is read; this counts what a group builds of them too (each `OPTIONAL`,
+    /// `MINUS` or `BIND` wraps what is before it).
+    fn within_nesting<'p>(
+        &self,
+        patterns: impl IntoIterator<Item = &'p GraphPattern>,
+    ) -> Result<(), SparqlSyntaxError> {
+        for pattern in patterns {
+            let depth = pattern.depth();
+            if depth > self.max_nesting {
+                return Err(SparqlSyntaxError::new(
+                    format!(
+                        "nested deeper than {} levels: its operators nest {depth} deep",
+                        self.max_nesting
+                    ),
+                    None,
+                ));
+            }
+        }
+        Ok(())
     }
 
     /// Parses with the shortest prefix for generated names that the text doesn't use.

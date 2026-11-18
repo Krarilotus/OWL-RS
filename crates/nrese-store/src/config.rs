@@ -10,6 +10,9 @@ pub enum StoreMode {
 }
 
 /// Typed store configuration. Parsing from env/files lives in `nrese-server/src/config/`.
+/// Support graph sets kept per inferred statement by default ([`StoreConfig::support_sets`]).
+pub const DEFAULT_SUPPORT_SETS: usize = 16;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreConfig {
     pub mode: StoreMode,
@@ -17,23 +20,75 @@ pub struct StoreConfig {
     /// Ontology file loaded at startup. `None` means no preload; there are no implicit
     /// fallback locations.
     pub ontology_path: Option<PathBuf>,
-    /// Bytes of serialised query results kept for repeated queries on an unchanged store
-    /// (see `query_cache`); 0 disables the cache.
+    /// Bytes of query part results kept for repeated queries and shared sub-patterns on an
+    /// unchanged store (`nrese_sparql::cache`); 0 disables the cache.
     pub query_cache_bytes: usize,
+    /// SPARQL query files whose results are pinned in the result cache at startup, each
+    /// under its file name without the extension.
+    pub pinned_queries: Vec<PathBuf>,
     /// The graph that holds the repository's SHACL shapes.
     pub shapes_graph: String,
     /// The default graph of queries and update `WHERE` clauses that name no dataset is
     /// the merge of all graphs, not only the default graph.
     pub union_default_graph: bool,
+    /// GeoSPARQL relations in triple patterns read only the statements that assert them,
+    /// without the query-rewrite extension computing them from geometries.
+    pub geosparql_stated_only: bool,
+    /// What full-text relevance, IRI search and vector selection are computed over
+    /// (`store.search_scope`, a repository's `search_scope`):
+    /// [`global`](nrese_sparql::SearchScope::Global), the default, ranks over the
+    /// dictionary's whole indexes and selects vectors through the shared graph (returned
+    /// data respects graph access, scores and approximate selection may depend on data
+    /// outside the reader's graphs); [`reader`](nrese_sparql::SearchScope::Reader) ranks
+    /// and selects among what the reader's snapshot, read model and active graphs show
+    /// alone, at the cost of a corpus per scope and an exact scan of the visible vectors.
+    pub search_scope: nrese_sparql::SearchScope,
+    /// Bytes the corpora a `reader` search scope keeps, and their lineage, may take within
+    /// the memory the queries draw on (`store.reader_corpus_bytes`, a repository's
+    /// `reader_corpus_bytes`; default [`nrese_engine::DEFAULT_READER_CORPUS_BYTES`], whose doc
+    /// gives the measured reason). The least recently used go first; a corpus that doesn't
+    /// fit serves its own search alone.
+    pub reader_corpus_bytes: usize,
+    /// How a `reader` search scope builds its corpora (`store.reader_walk_slice`; default
+    /// [`nrese_engine::CorpusTuning::DEFAULT`]).
+    pub reader_corpus_tuning: nrese_engine::CorpusTuning,
     /// Bytes of intermediate results all running queries may hold together; 0 is
     /// unlimited. A query that asks for more than is left fails with
     /// [`StoreError::is_server_memory_limit`](crate::StoreError::is_server_memory_limit).
     pub total_query_memory_bytes: usize,
+    /// The memory the process may hold before a long operation (a materialisation, the
+    /// reasoning of a commit) stops with [`StoreError::ProcessMemoryLimit`]
+    /// instead of taking the machine; 0 is no limit. By default three quarters of what the
+    /// process may use ([`ProcessMemory::Default`]); a limit set by hand is never more than
+    /// that capacity. The capacity is read once per process, at the limit's first need,
+    /// never when a store opens ([`nrese_exec::memory::capacity`]); where it can't be read,
+    /// a limit set by hand stands and what needed the default is refused; where this target
+    /// can't read memory a limit is refused when the store opens
+    /// ([`ProcessMemory::supported`]).
+    /// It is also the limit of the process's budget ([`Runtime::memory`](crate::Runtime::memory)),
+    /// which what queries and maintenance charge draws on, the queries' budget within it.
+    /// This is the store's watch policy, not a write to the global process limit.
+    /// The server installs its process-wide fallback separately at startup. Disabling
+    /// this watch does not bypass a fallback explicitly installed by the process owner.
+    pub process_memory_bytes: ProcessMemory,
+    /// When transparent huge pages may back the process's memory (Linux;
+    /// [`HugePages`](nrese_exec::memory::HugePages)): faster work over large heaps
+    /// (materialisation, loads), more memory held while serving many small requests;
+    /// `Bulk` has them only while a bulk load or a materialisation runs.
+    pub huge_pages: nrese_exec::memory::HugePages,
+    /// Whether a materialisation gives back between its rounds what the last one freed
+    /// (`nrese_engine::memory::set_release_between_rounds`): a lower, steadier peak for
+    /// more reasoning time.
+    pub reasoning_release: bool,
     /// Which remote endpoints `SERVICE` may call.
     pub federation: FederationConfig,
     /// Reasoning leaves out memberships in unnamed union classes that nothing consumes
     /// (`reasoner.unnamed_classes = "skip"`; work package W7).
     pub hide_unnamed_classes: bool,
+    /// OWL 2 QL answers through existentials by tree-witness rewriting
+    /// (`reasoner.ql_rewriting`, docs/design/ql-rewriting.md §4); a repository's settings
+    /// may choose another.
+    pub ql_rewriting: QlRewritingMode,
     /// Full materialisations with equality rules compute the closure over representatives
     /// of the `owl:sameAs` classes and expand it (`reasoner.equality = "representatives"`,
     /// the default) instead of copying every fact to every identity while computing it
@@ -44,6 +99,19 @@ pub struct StoreConfig {
     /// (`reasoner.equality = "compact"`; W4 stage B): storage and commits shrink by the
     /// replication factor, reads of facts about identities pay the expansion.
     pub equality_compact: bool,
+    /// With [`Self::equality_compact`]: queries answer with one identity per class, its
+    /// representative (`equality.answers = "canonical"`, stage C): for analytics, where
+    /// the identities are one thing. Off (`"strict"`): every identity, as if replicated.
+    pub equality_canonical_answers: bool,
+    /// With [`Self::equality_compact`]: queries expand the classes at every read (stage
+    /// B, `equality.expansion = "early"`) instead of after the joins where the answer
+    /// can't tell (stage C, `"late"`, the default). The same answers.
+    pub equality_early_expansion: bool,
+    /// Support graph sets kept per inferred statement for `inferred = "supported"` in the
+    /// access policy (`reasoner.support_sets`, at least 1): the smallest first. A bound on
+    /// memory and work, not on what readers see: a reader none of a statement's kept sets
+    /// fits, where the cap left some out, is decided by the closure of its graphs.
+    pub support_sets: usize,
     /// On disk: check the whole checkpoint when opening (see
     /// `nrese_engine::DurabilityConfig::verify_on_open`). Off: the checkpoint is used in
     /// place and opening reads only its structure.
@@ -51,16 +119,30 @@ pub struct StoreConfig {
     /// On disk: serve the data from each checkpoint once written, freeing its copies in
     /// memory (see `nrese_engine::DurabilityConfig::map_checkpoints`).
     pub map_checkpoints: bool,
+    /// On disk: a checkpoint is written in the background once the write-ahead log has
+    /// grown by this many bytes since the last (see
+    /// `nrese_engine::DurabilityConfig::checkpoint_after_wal_bytes`): what a restart
+    /// replays, against the work of writing checkpoints.
+    pub checkpoint_after_wal_bytes: u64,
     /// On disk: memory for a bulk load's quads, in bytes (`0`: no limit); past it they are
     /// sorted in chunks spilled to the data directory (see
     /// `nrese_engine::DurabilityConfig::bulk_load_memory`).
     pub bulk_load_memory_bytes: u64,
+    /// What a bulk load does with a statement it can't read (`store.invalid_statements`):
+    /// quarantine it and load the rest, or stop ([`crate::quarantine`]). A load may ask
+    /// for either ([`crate::BulkLoadRequest::invalid`]).
+    pub invalid_statements: crate::quarantine::InvalidStatements,
     /// On disk: keep the WAL segments checkpoints cover in `wal-archive/` of the data
     /// directory (point-in-time restore; see `nrese_engine::DurabilityConfig::wal_archive`).
     pub wal_archive: bool,
+    /// On disk: what opening does with damage in the newest WAL segment that a crash
+    /// mid-append doesn't leave (`store.wal_damage`): refuse to open (the default), or open
+    /// with the log up to it, the rest copied aside (see `nrese_engine::WalDamage`).
+    pub wal_damage: nrese_engine::WalDamage,
     /// How index blocks are encoded when built (`store.index_encoding`): `Fast`, or
-    /// `Compact` (palettes: a smaller store, scans up to a tenth slower). Set for the
-    /// process when the store opens; see `nrese_engine::IndexEncoding`.
+    /// `Compact` (palettes: a smaller store, scans up to a tenth slower). The process's, set
+    /// once ([`crate::apply_process_settings`]); see
+    /// `nrese_engine::IndexEncoding`.
     pub index_encoding: nrese_engine::IndexEncoding,
     /// How checkpoints store the dictionary's keys (`store.vocabulary`): `Plain`, or `Fsst`
     /// (compressed to about half; a key costs a decode when read).
@@ -68,6 +150,51 @@ pub struct StoreConfig {
     /// SHACL as a commit gate (design `docs/design/shacl.md` §7): what a commit's changes
     /// may introduce against the shapes graph.
     pub shacl_gate: ShaclGate,
+    /// The `owl2-dl` mode's settings (`dl.*`), used when the reasoner runs that mode.
+    pub dl: crate::dl::DlConfig,
+    /// Opened as a read replica (`replication.mode = "replica"`), set before the open: its
+    /// reasoned reads carry no certificate, from the open on, whatever marker the data
+    /// directory holds; its primary's records carry no certificate either (until v1.6).
+    pub replica: bool,
+}
+
+/// When queries get the OWL 2 QL answers through existentials (`reasoner.ql_rewriting`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QlRewritingMode {
+    /// Under `owl2-ql`, the profile that names them; not under `owl2-rl`, whose users chose
+    /// its standard semantics (and answer counts equal to other systems' `owl2-rl`).
+    #[default]
+    Auto,
+    /// Under `owl2-ql` and `owl2-rl`.
+    On,
+    Off,
+}
+
+impl QlRewritingMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+
+    /// The mode named `name` (`auto`, `on`, `off`).
+    pub fn from_name(name: &str) -> Option<Self> {
+        [Self::Auto, Self::On, Self::Off]
+            .into_iter()
+            .find(|mode| mode.name() == name)
+    }
+
+    /// Whether queries over a closure of `ruleset` are rewritten.
+    pub fn applies_to(self, ruleset: &str) -> bool {
+        match (self, ruleset) {
+            (Self::Off, _) => false,
+            (_, "owl2-ql") => true,
+            (Self::On, "owl2-rl") => true,
+            _ => false,
+        }
+    }
 }
 
 /// The SHACL commit gate's policy.
@@ -129,6 +256,18 @@ impl FederationConfig {
     }
 }
 
+/// When transparent huge pages may back the process's memory by default: always, as
+/// before the setting (LUBM 100 takes 26 % longer to materialise without them; serving holds less
+/// without them: docs/ops/server-setup.md, "Memory over time").
+pub const DEFAULT_HUGE_PAGES: nrese_exec::memory::HugePages = nrese_exec::memory::HugePages::On;
+
+/// Whether a materialisation releases between its rounds by default: no, reasoning speed
+/// leads (LUBM 100 5.6 % slower with it, its peak 14 % lower: nrese_engine::memory).
+pub const DEFAULT_REASONING_RELEASE: bool = false;
+
+/// The write-ahead log's growth after which a checkpoint is written: 256 MiB.
+pub const DEFAULT_CHECKPOINT_AFTER_WAL_BYTES: u64 = 256 << 20;
+
 /// Default query result cache: 64 MiB.
 pub const DEFAULT_QUERY_CACHE_BYTES: usize = 64 << 20;
 
@@ -142,6 +281,76 @@ impl Default for StoreConfig {
     }
 }
 
+/// [`StoreConfig::process_memory_bytes`]: the default, or a number of bytes (0: no limit);
+/// either found at its first need ([`Self::bytes_with`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessMemory {
+    /// Three quarters of the memory the process may use (the container's limit, else the
+    /// machine's: [`nrese_exec::memory::available_bytes`]).
+    Default,
+    /// This many bytes, never more than the memory the process may use; 0 is no limit.
+    Bytes(u64),
+}
+
+impl ProcessMemory {
+    /// The limit in bytes (0: none) now, read where not yet ([`nrese_exec::memory::capacity`]),
+    /// refused where it can't be enforced: a limit where this target doesn't read memory
+    /// ([`Self::supported`]), or where the memory the process may use can't be read. For a
+    /// process's owner at its start (the server); a store asks at the limit's first need.
+    pub fn resolve(self) -> StoreResult<u64> {
+        self.resolve_with(
+            nrese_exec::memory::READS_MEMORY,
+            nrese_exec::memory::capacity,
+        )
+    }
+
+    /// [`Self::resolve`] on a target that reads memory or not, `capacity` reading the memory
+    /// the process may use: the resolution itself, for a caller that must show what it does
+    /// where memory isn't read.
+    pub fn resolve_with(
+        self,
+        reads_memory: bool,
+        capacity: impl FnOnce() -> nrese_exec::memory::Reading,
+    ) -> StoreResult<u64> {
+        self.supported(reads_memory)?;
+        self.bytes_with(capacity).map_err(|unread| {
+            StoreError::Configuration(format!(
+                "process_memory_bytes: its default, three quarters of the memory the \
+                 process may use, needs that memory read ({unread}); set it by hand, in \
+                 bytes, or 0 to run without a limit"
+            ))
+        })
+    }
+
+    /// Refuses, reading nothing, a limit this target can't enforce: any but none (0) where
+    /// it doesn't read memory ([`nrese_exec::memory::READS_MEMORY`]).
+    pub fn supported(self, reads_memory: bool) -> StoreResult<()> {
+        if reads_memory || self == Self::Bytes(0) {
+            return Ok(());
+        }
+        Err(StoreError::Configuration(
+            "process_memory_bytes: this platform doesn't read the process's memory, so the \
+             limit can't be enforced; set it to 0 to run without one"
+                .to_owned(),
+        ))
+    }
+
+    /// The limit in bytes (0: none, read nothing), of the memory `capacity` reads the
+    /// process may use ([`nrese_exec::memory::limit_within`]): a limit set by hand stands
+    /// where that can't be read; the default is then unread.
+    pub fn bytes_with(
+        self,
+        capacity: impl FnOnce() -> nrese_exec::memory::Reading,
+    ) -> nrese_exec::memory::Reading {
+        let explicit = match self {
+            Self::Bytes(0) => return Ok(0),
+            Self::Bytes(bytes) => Some(bytes),
+            Self::Default => None,
+        };
+        nrese_exec::memory::limit_within(explicit, capacity())
+    }
+}
+
 impl StoreConfig {
     pub fn in_memory() -> Self {
         Self {
@@ -149,20 +358,37 @@ impl StoreConfig {
             data_dir: PathBuf::from("./data"),
             ontology_path: None,
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
+            pinned_queries: Vec::new(),
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
+            geosparql_stated_only: false,
+            search_scope: nrese_sparql::SearchScope::Global,
+            reader_corpus_bytes: nrese_engine::DEFAULT_READER_CORPUS_BYTES,
+            reader_corpus_tuning: nrese_engine::CorpusTuning::DEFAULT,
             total_query_memory_bytes: 0,
+            process_memory_bytes: ProcessMemory::Default,
+            huge_pages: DEFAULT_HUGE_PAGES,
+            reasoning_release: DEFAULT_REASONING_RELEASE,
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
+            ql_rewriting: QlRewritingMode::Auto,
             equality_by_representatives: true,
             equality_compact: false,
+            equality_canonical_answers: false,
+            equality_early_expansion: false,
+            support_sets: DEFAULT_SUPPORT_SETS,
             verify_on_open: false,
             map_checkpoints: true,
+            checkpoint_after_wal_bytes: DEFAULT_CHECKPOINT_AFTER_WAL_BYTES,
             bulk_load_memory_bytes: 0,
+            invalid_statements: crate::quarantine::InvalidStatements::Quarantine,
             wal_archive: false,
+            wal_damage: nrese_engine::WalDamage::Refuse,
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
+            dl: crate::dl::DlConfig::default(),
+            replica: false,
         }
     }
 
@@ -172,20 +398,37 @@ impl StoreConfig {
             data_dir: data_dir.into(),
             ontology_path: None,
             query_cache_bytes: DEFAULT_QUERY_CACHE_BYTES,
+            pinned_queries: Vec::new(),
             shapes_graph: DEFAULT_SHAPES_GRAPH.to_owned(),
             union_default_graph: false,
+            geosparql_stated_only: false,
+            search_scope: nrese_sparql::SearchScope::Global,
+            reader_corpus_bytes: nrese_engine::DEFAULT_READER_CORPUS_BYTES,
+            reader_corpus_tuning: nrese_engine::CorpusTuning::DEFAULT,
             total_query_memory_bytes: 0,
+            process_memory_bytes: ProcessMemory::Default,
+            huge_pages: DEFAULT_HUGE_PAGES,
+            reasoning_release: DEFAULT_REASONING_RELEASE,
             federation: FederationConfig::default(),
             hide_unnamed_classes: false,
+            ql_rewriting: QlRewritingMode::Auto,
             equality_by_representatives: true,
             equality_compact: false,
+            equality_canonical_answers: false,
+            equality_early_expansion: false,
+            support_sets: DEFAULT_SUPPORT_SETS,
             verify_on_open: false,
             map_checkpoints: true,
+            checkpoint_after_wal_bytes: DEFAULT_CHECKPOINT_AFTER_WAL_BYTES,
             bulk_load_memory_bytes: 0,
+            invalid_statements: crate::quarantine::InvalidStatements::Quarantine,
             wal_archive: false,
+            wal_damage: nrese_engine::WalDamage::Refuse,
             index_encoding: nrese_engine::IndexEncoding::Fast,
             vocabulary: nrese_engine::VocabularyEncoding::Plain,
             shacl_gate: ShaclGate::Off,
+            dl: crate::dl::DlConfig::default(),
+            replica: false,
         }
     }
 
@@ -201,6 +444,16 @@ impl StoreConfig {
                 "compact equality storage computes over representatives; it needs \
                  equality_by_representatives"
                     .to_owned(),
+            ));
+        }
+        if self.dl.max_candidates == Some(0) || self.dl.timeout.is_some_and(|t| t.is_zero()) {
+            return Err(StoreError::Configuration(
+                "dl.max_candidates and dl.timeout must be above 0; unset is unlimited".to_owned(),
+            ));
+        }
+        if self.support_sets == 0 {
+            return Err(StoreError::Configuration(
+                "support_sets must be at least 1".to_owned(),
             ));
         }
         if matches!(self.mode, StoreMode::OnDisk) && self.data_dir.as_os_str().is_empty() {
@@ -220,5 +473,65 @@ impl StoreConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ProcessMemory;
+    use nrese_exec::memory::{Reading, Unread};
+
+    const G: u64 = 1 << 30;
+
+    fn unused() -> Reading {
+        panic!("a limit set by hand reads nothing")
+    }
+
+    /// The message of a refusal: a configuration error that names the setting.
+    fn refusal(resolved: crate::StoreResult<u64>) -> String {
+        match resolved {
+            Err(crate::StoreError::Configuration(message)) => {
+                assert!(message.contains("process_memory_bytes"), "{message}");
+                message
+            }
+            other => panic!("refused, not {other:?}"),
+        }
+    }
+
+    /// DC-07: where memory isn't read, a limit (set by hand or the default) can't be enforced
+    /// and is refused without reading, naming the setting and the way out; no limit (0)
+    /// stays allowed and never reads.
+    #[test]
+    fn a_limit_is_refused_where_memory_isnt_read() {
+        for limit in [ProcessMemory::Bytes(G), ProcessMemory::Default] {
+            let message = refusal(limit.resolve_with(false, unused));
+            assert!(message.contains('0'), "says 0 runs without one: {message}");
+        }
+        assert_eq!(
+            ProcessMemory::Bytes(0).resolve_with(false, unused).ok(),
+            Some(0)
+        );
+        assert_eq!(ProcessMemory::Bytes(0).bytes_with(unused), Ok(0));
+    }
+
+    /// DC-07, D2: the default is three quarters of what the process may use; a limit set by
+    /// hand is never more than that memory. Where it can't be read the default is refused
+    /// (never "no limit"), naming the setting to set by hand; a limit set by hand stands,
+    /// the operator's fallback.
+    #[test]
+    fn a_limit_is_found_within_the_memory_the_process_may_use() {
+        let capacity = || Ok(4 * G);
+        let unread = || Err(Unread::Failed);
+        let default = ProcessMemory::Default;
+        assert_eq!(default.resolve_with(true, capacity).ok(), Some(3 * G));
+        assert_eq!(ProcessMemory::Bytes(G).bytes_with(capacity), Ok(G));
+        assert_eq!(ProcessMemory::Bytes(8 * G).bytes_with(capacity), Ok(4 * G));
+        assert_eq!(default.bytes_with(unread), Err(Unread::Failed));
+        refusal(default.resolve_with(true, unread));
+        assert_eq!(ProcessMemory::Bytes(8 * G).bytes_with(unread), Ok(8 * G));
+        assert_eq!(
+            ProcessMemory::Bytes(8 * G).resolve_with(true, unread).ok(),
+            Some(8 * G)
+        );
     }
 }

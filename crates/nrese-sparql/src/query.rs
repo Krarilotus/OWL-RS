@@ -1,5 +1,7 @@
 //! SPARQL query execution over a [`ReadView`].
 
+use std::borrow::Cow;
+
 use nrese_sparql_syntax::Query;
 
 use crate::results::{
@@ -7,20 +9,80 @@ use crate::results::{
 };
 use crate::view::ReadView;
 
+/// What an evaluation may use while it runs, for queries and update `WHERE` clauses.
+#[derive(Clone, Default)]
+pub struct Resources {
+    /// Checked by the evaluator while it runs; the transport layer cancels it at the
+    /// request deadline.
+    pub cancellation: Option<CancellationToken>,
+    /// The request's memory envelope (within the server's budget for all requests): each
+    /// evaluation's intermediate and retained results draw from it, beside whatever else
+    /// the request holds. Unlimited by default.
+    pub memory: nrese_exec::Envelope,
+    /// The width of result encoding's parallel work; the work stays on the caller. Other
+    /// parallel kernels use the whole current pool: nested Rayon work doesn't inherit a
+    /// narrower handle.
+    pub workers: nrese_exec::workers::Workers,
+}
+
+impl Resources {
+    pub fn check(&self) -> Result<(), QueryEvaluationError> {
+        self.cancellation
+            .as_ref()
+            .map_or(Ok(()), CancellationToken::check)
+    }
+
+    /// What long work polls ([`nrese_exec::Ticker`]): the cancellation's flag, no deadline of
+    /// its own (the transport cancels the token at its deadline).
+    pub fn stop(&self) -> nrese_exec::StopSource {
+        nrese_exec::StopSource::new(
+            self.cancellation.as_ref().map(CancellationToken::flag),
+            None,
+        )
+    }
+}
+
+/// What full-text relevance, IRI search and vector selection are computed over
+/// (`store.search_scope`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub enum SearchScope {
+    /// The dictionary's whole text and vector indexes: the fastest. Returned data respects
+    /// graph access, but relevance and approximate selection may depend on data outside
+    /// the reader's graphs.
+    #[default]
+    Global,
+    /// The statements the reader's own scans show (snapshot, read model, active graphs as
+    /// access restricts them): nothing outside them changes a score, a rank or which
+    /// vectors are selected. Costs a corpus per scope (kept, and derived across commits)
+    /// and an exact scan of the visible vectors.
+    Reader,
+}
+
+impl SearchScope {
+    /// The scope named `name` (`global`, `reader`), if it is one.
+    pub fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "global" => Some(Self::Global),
+            "reader" => Some(Self::Reader),
+            _ => None,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Global => "global",
+            Self::Reader => "reader",
+        }
+    }
+}
+
 /// Per-request query options (the transport layer fills these from the protocol request).
 #[derive(Clone, Default)]
 pub struct QueryOptions {
     /// Protocol `default-graph-uri` / `named-graph-uri`. When set, it replaces the query's
     /// own `FROM` / `FROM NAMED` clauses, as the SPARQL 1.1 Protocol requires.
     pub dataset: Option<QueryDatasetSpecification>,
-    /// Checked by the evaluator while it runs; the transport layer cancels it at the
-    /// request deadline.
-    pub cancellation: Option<CancellationToken>,
-    /// Bytes of intermediate results the native executor may hold; `None` is unlimited.
-    pub memory_limit: Option<usize>,
-    /// The server's budget for all running queries together, which this query's memory
-    /// counts against as well.
-    pub shared_memory: Option<std::sync::Arc<nrese_exec::SharedBudget>>,
+    pub resources: Resources,
     /// Which statements the query reads: asserted and inferred (the default), or one
     /// stack (GraphDB's `infer=false`, `FROM onto:explicit` / `onto:implicit`).
     pub read_model: nrese_engine::ReadModel,
@@ -39,10 +101,22 @@ pub struct QueryOptions {
     /// rules): every fact about one identity holds for the others. Some operators then
     /// work on one representative per identity class where the answer can't tell.
     pub equality_closed: bool,
+    /// With equality classes kept over representatives (`reasoner.equality = "compact"`):
+    /// answer with one identity per class, the representative, instead of every identity
+    /// (`equality.answers = "canonical"`, work package W4 stage C): for analytics, where
+    /// the identities are one thing. A term the query names (in a pattern, VALUES, an
+    /// expression) stands for its class too, and is answered by its representative
+    /// (research-designs §1, "Canonical answers").
+    pub equality_canonical: bool,
+    /// With equality classes kept over representatives: expand them at every read (stage
+    /// B), not after the joins (stage C, the default: the parts of a query whose answer
+    /// can't tell the identities apart are joined over representatives and expanded
+    /// once). The answers are the same; this is the comparison and an escape hatch.
+    pub equality_early_expansion: bool,
     /// Pre-bound variables (SHACL-SPARQL's `$this`, `$value`, parameters): their values
     /// are put in for them throughout the query before it is evaluated, as SHACL §5.6
-    /// defines pre-binding. A subquery sees them only where it projects them; the query's
-    /// own projection drops them (the caller knows their values).
+    /// defines pre-binding. Subqueries see them even where they do not project them;
+    /// projections drop them from the result (the caller knows their values).
     pub pre_bound:
         Option<std::sync::Arc<std::collections::HashMap<nrese_rdf::Variable, nrese_rdf::Term>>>,
     /// The rows of a cross product made at once below a GROUP BY (the product is grouped
@@ -52,9 +126,31 @@ pub struct QueryOptions {
     /// Evaluate every GROUP BY that can stream in morsels of this many rows of its first
     /// pattern (`native/stream.rs`), not only when it runs out of memory. Tests set it.
     pub stream_rows: Option<usize>,
+    /// Join a pattern by probing the index once per row (`Some(true)`) or by scanning it
+    /// (`Some(false)`) wherever either can; `None`: by the estimates. The results are the
+    /// same; tests compare the two.
+    pub index_joins: Option<bool>,
     /// The graphs the query's user may read (graph-level access control): its dataset is
     /// restricted to them. `None`: every graph.
     pub access: Option<std::sync::Arc<crate::GraphAccess>>,
+    /// GeoSPARQL relations in triple patterns (`?a geo:sfWithin ?b`) read only the
+    /// statements that assert them: GeoSPARQL's topology vocabulary without its
+    /// query-rewrite extension, which by default also computes them from the geometries.
+    pub geosparql_stated_only: bool,
+    /// The store's result cache ([`crate::cache`]): the results of the query's parts are
+    /// looked up in it and offered to it. `None`: everything is computed.
+    pub result_cache: Option<std::sync::Arc<crate::ResultCache>>,
+    /// Pin the query's result in the result cache under a name.
+    pub pin: Option<crate::PinRequest>,
+    /// OWL 2 QL answers through existentials (docs/design/ql-rewriting.md): the store's
+    /// tree-witness rewriting, set while its closure is current under a ruleset that makes
+    /// the data H-complete; `None`: off. Applies to queries over the default graph that read
+    /// the inferred statements, without a dataset, access restrictions or pre-bound
+    /// variables.
+    pub ql: Option<std::sync::Arc<crate::ql::QlRewriting>>,
+    /// What search relevance and vector selection are computed over ([`SearchScope`]);
+    /// subqueries, `EXISTS` and update `WHERE` clauses evaluate with their query's.
+    pub search_scope: SearchScope,
 }
 
 /// Evaluates `query` against `view` over the engine's id tables (`native`); a transaction
@@ -65,7 +161,60 @@ pub fn evaluate_query<'a, V: ReadView>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
-    crate::native::evaluate(view.evaluation_snapshot(), query, options)
+    crate::native::evaluate(view.evaluation_snapshot()?, query, &for_view(view, options))
+}
+
+/// Retains the evaluator's ID columns and their decoding context for bound comparison.
+pub fn evaluate_query_typed(
+    view: &impl ReadView,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<crate::TypedResults, QueryEvaluationError> {
+    crate::native::typed_results::evaluate(
+        view.evaluation_snapshot()?.into_owned(),
+        query,
+        &for_view(view, options),
+    )
+}
+
+/// `options` for evaluating on `view`: a transaction's pending state is read once, so its
+/// parts are not offered to the result cache (their snapshot identity is the pending
+/// state's own: they could never be hit).
+fn for_view<'o>(view: &impl ReadView, options: &'o QueryOptions) -> Cow<'o, QueryOptions> {
+    match (&options.result_cache, view.snapshot()) {
+        (Some(_), None) => Cow::Owned(QueryOptions {
+            result_cache: None,
+            ..options.clone()
+        }),
+        _ => Cow::Borrowed(options),
+    }
+}
+
+/// What the result cache holds of `query`'s whole answer on `view` written in `format`
+/// (the media type with its parameters, as sent) and `context` (what else the caller's
+/// answer depends on: the store's reasoning mode, the status it reports): its bytes, or a slot to offer them to
+/// once written, or nothing to do with the cache ([`crate::cache`]). An unpublished snapshot
+/// (a detached pending or private one) is answered from its own version's cache, never the
+/// store's; a transaction view, a pin and pre-bound variables never from either.
+pub fn cached_output<'v, V: ReadView>(
+    view: &'v V,
+    query: &Query,
+    options: &QueryOptions,
+    format: &str,
+    context: &[u8],
+) -> crate::cache::CachedOutput<'v> {
+    use crate::cache::{CachedOutput, ResultCache};
+    let (Some(shared), Some(snapshot), None) =
+        (&options.result_cache, view.snapshot(), &options.pin)
+    else {
+        return CachedOutput::Off;
+    };
+    let admission = snapshot.admission();
+    let cache = ResultCache::for_admission(shared, admission, &options.resources.memory);
+    match crate::native::output_key(snapshot, query, options, format, context) {
+        Some(part) => cache.output(admission, part),
+        None => CachedOutput::Off,
+    }
 }
 
 /// A failure while writing results directly ([`write_results`]).
@@ -109,6 +258,9 @@ pub struct PlanStep {
     pub rows: u64,
     /// Wall time including the operator's inputs.
     pub micros: u64,
+    /// Where the result came from if not computed here: `hit` (the result cache) or
+    /// `shared` (another query computing the same part at the same time).
+    pub cache: Option<&'static str>,
 }
 
 /// How a query ran ([`explain_query`]).
@@ -116,10 +268,39 @@ pub struct PlanStep {
 pub struct Explanation {
     /// `native`: the executor (one; the field stays for the report's format).
     pub executor: &'static str,
+    /// The rewrites that changed the query before it ran, in the order applied:
+    /// `triple-terms`, `ql-tree-witness` (and `ql-limit` where a pattern reached a bound of
+    /// the QL rewriting), `join-groups`, `filter-pushdown`, `ask-limit`.
+    pub rewrites: Vec<&'static str>,
     pub steps: Vec<PlanStep>,
     /// Solutions (1 or 0 for ASK); CONSTRUCT and DESCRIBE count triples.
     pub rows: u64,
+    /// Stored terms the executor decoded to evaluate expressions, orders and aggregates
+    /// (the output's terms aren't counted): what id-level evaluation saves.
+    pub decoded: u64,
     pub micros: u64,
+    /// What the OWL 2 QL rewriting did, and whether the answers are complete; `None` where
+    /// it doesn't apply.
+    pub ql: Option<crate::ql::QlReport>,
+    /// Whether the answers are complete, where a reasoning path can leave some out: the
+    /// status the answers carry (set by the store: QL's, the DL bounds', a closure's).
+    pub completeness: Option<crate::completeness::Completeness>,
+    /// What decided the status (the DL bounds' paths: `closed-predicates`,
+    /// `skolem-only-gap`, `bounds-equal`, `exact-ground-entailment`,
+    /// `exact-internalisable-cq`).
+    pub decided_by: Vec<&'static str>,
+    /// The candidates of the DL bounds' gap the exact services decided; `None` where the
+    /// bounds didn't run. Diagnostics: the status says what the answers are.
+    pub candidates: Option<Candidates>,
+}
+
+/// The candidates of the DL bounds' gap (in the upper bound, not the lower) the exact
+/// services decided: proved (returned) and refuted (dropped). The rest are the status's
+/// `unresolved`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Candidates {
+    pub proved: u64,
+    pub refuted: u64,
 }
 
 /// Runs `query` like [`evaluate_query`], consuming its results, and reports how it ran:
@@ -130,18 +311,112 @@ pub fn explain_query<V: ReadView>(
     options: &QueryOptions,
 ) -> Result<Explanation, QueryEvaluationError> {
     let start = std::time::Instant::now();
-    let snapshot = view.evaluation_snapshot();
-    let (steps, rows) = crate::native::explain(&snapshot, query, options)?;
+    let snapshot = view.evaluation_snapshot()?;
+    let (rewrites, steps, rows, decoded, ql) =
+        crate::native::explain(&snapshot, query, &for_view(view, options))?;
     Ok(Explanation {
         executor: "native",
+        rewrites,
         steps,
         rows,
+        decoded,
         micros: start.elapsed().as_micros() as u64,
+        ql,
+        completeness: None,
+        decided_by: Vec::new(),
+        candidates: None,
     })
+}
+
+/// One node of a query's plan before it runs ([`plan_query`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedStep {
+    /// Nesting depth: a node's inputs follow it one level deeper.
+    pub depth: usize,
+    /// `scan`, `bgp`, `join`, `optional`, `filter`, `union`, `path`, `group`, ...
+    pub operator: String,
+    /// The triple pattern, expression or variables the node works on.
+    pub detail: String,
+    /// Rows estimated from the store's statistics; `None` where unknown (`SERVICE`).
+    pub estimated_rows: Option<u64>,
+}
+
+/// The plan a query would run as ([`plan_query`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedQuery {
+    /// The rewrites that changed the query, in the order applied (as in [`Explanation`]).
+    pub rewrites: Vec<&'static str>,
+    pub steps: Vec<PlannedStep>,
+    /// As in [`Explanation`].
+    pub ql: Option<crate::ql::QlReport>,
+    /// What the store can say about completeness before running (set by the store).
+    pub completeness: Option<crate::completeness::Completeness>,
+}
+
+/// The plan `query` would run as on `view`, after the rewrites, each node with an estimate
+/// of its rows, without running it (EXPLAIN without ANALYZE).
+pub fn plan_query<V: ReadView>(
+    view: &V,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<PlannedQuery, QueryEvaluationError> {
+    let snapshot = view.evaluation_snapshot()?;
+    let (rewrites, steps, ql) = crate::native::plan(&snapshot, query, options)?;
+    Ok(PlannedQuery {
+        rewrites,
+        steps,
+        ql,
+        completeness: None,
+    })
+}
+
+/// What the OWL 2 QL rewriting does to `query` on `view` and whether its answers are
+/// complete (docs/design/ql-rewriting.md), without running it; `None` where the rewriting
+/// doesn't apply. The status [`evaluate_query`]'s answers on the same view go with.
+pub fn ql_report<V: ReadView>(
+    view: &V,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<Option<crate::ql::QlReport>, QueryEvaluationError> {
+    prepare_ql_query(view, query, options).map(|(_, report)| report)
+}
+
+/// Prepares the semantic QL rewriting once, before planning or evaluating. Execute the
+/// returned query on the same view with `options.ql = None`; retain the original query
+/// and options for whole-output cache keys. The report describes these prepared answers.
+/// Borrows unchanged queries; work is bounded by the configured QL rewriting limits.
+pub fn prepare_ql_query<'q, V: ReadView>(
+    view: &V,
+    query: &'q Query,
+    options: &QueryOptions,
+) -> Result<(Cow<'q, Query>, Option<crate::ql::QlReport>), QueryEvaluationError> {
+    let snapshot = view.evaluation_snapshot()?;
+    crate::native::prepare_ql_query(&snapshot, query, options)
 }
 
 /// True if `query` would run on the native executor over a snapshot with default options.
 /// For coverage reports and tests; the decision itself is made per call.
 pub fn runs_natively(query: &Query) -> bool {
     crate::native::query_supported(query)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Resources;
+    use crate::results::CancellationToken;
+
+    /// The stop long work polls is the request's cancellation: cancelling the token stops it.
+    #[test]
+    fn the_stop_follows_the_cancellation() {
+        let token = CancellationToken::new();
+        let resources = Resources {
+            cancellation: Some(token.clone()),
+            ..Resources::default()
+        };
+        let stop = resources.stop();
+        assert_eq!(stop.check(), Ok(()));
+        token.cancel();
+        assert_eq!(stop.check(), Err(nrese_exec::Stop::Cancelled));
+        assert_eq!(Resources::default().stop().check(), Ok(()));
+    }
 }

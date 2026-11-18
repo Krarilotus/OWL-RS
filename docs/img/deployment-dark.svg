@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 683" width="400" height="683" role="img" aria-labelledby="title desc">
+<!-- Generated; the light and dark variants differ only in <style>. -->
+<title id="title">What runs</title>
+<desc id="desc">Clients reach your TLS proxy over HTTPS, and the proxy reaches nrese-server over HTTP, over loopback or a private network. On the server's machine, nrese-server is one process: the HTTP APIs, /ops, and /console when the console is built in. It reads and writes its data directory, on disk only. For the default repository: checkpoint-*.nck, the saved state; wal/, the writes since then; wal-archive/, the older log, if kept; and repositories/&lt;id&gt;/ holds each other repository, laid out alike. The directory is locked: one process at a time. On another machine, if you want one, a read replica, a second nrese-server that answers queries from its own data directory on disk, both servers set up for replication, pulls the server's log over HTTP.</desc>
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #E6EDF3; }
+  .paper { fill: #0D1117; }
+  .name { font-size: 16px; font-weight: 600; }
+  .text { font-size: 14.5px; }
+  .muted { font-size: 14.5px; fill: #9198A1; }
+  .edge { font-size: 14px; font-style: italic; fill: #9198A1; }
+  .code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; }
+  .box { fill: #0D1117; stroke: #6E7681; stroke-width: 1.25; }
+  .band { fill: #151B23; }
+  .chip { fill: #0D1117; stroke: #6E7681; stroke-width: 1.1; }
+  .chip-on { fill: #E6EDF3; }
+  .chip-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; fill: #0D1117; }
+  .asserted { fill: #0D1117; stroke: #6E7681; stroke-width: 1.1; }
+  .inferred { fill: #2B2111; stroke: #9E6A03; stroke-width: 1.1; }
+  .inferred-text { font-size: 16px; font-weight: 600; fill: #E3B341; }
+  .track { fill: #262C36; }
+  .frame { fill: none; stroke: #6E7681; stroke-width: 1.25; }
+  .divider { fill: none; stroke: #6E7681; stroke-width: 1.25; }
+  .mark { fill: none; stroke: #E6EDF3; stroke-width: 2; }
+  .seg-on { fill: #0D1117; stroke: #6E7681; stroke-width: 1; }
+  .seg-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; font-weight: 600; }
+  .refused { fill: #FF8A80; }
+  .refused-text { fill: #FF8A80; font-weight: 600; }
+  .inferred-word { fill: #E3B341; font-weight: 600; }
+  .flow { fill: none; stroke: #9198A1; stroke-width: 1.4; }
+  .flow-refused { fill: none; stroke: #FF8A80; stroke-width: 1.4; }
+</style>
+<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow" d="M1 1 L9 5 L1 9"/></marker><marker id="head-refused" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow-refused" d="M1 1 L9 5 L1 9"/></marker></defs>
+<rect class="paper" x="0" y="0" width="400" height="683" rx="0"/>
+<rect class="box" x="0" y="0" width="400" height="34" rx="6"/>
+<text x="16" y="22" class="name">Clients</text>
+<path class="flow" d="M40 36 V67" marker-end="url(#head)"/>
+<text x="54" y="57" class="edge">HTTPS</text>
+<rect class="box" x="0" y="70" width="400" height="34" rx="6"/>
+<text x="16" y="92" class="name">Your TLS proxy</text>
+<path class="flow" d="M40 106 V137" marker-end="url(#head)"/>
+<text x="54" y="127" class="edge">HTTP over loopback or a private network</text>
+<rect class="band" x="0" y="140" width="400" height="352" rx="8"/>
+<text x="16" y="164" class="muted">the server's machine</text>
+<rect class="box" x="16" y="176" width="368" height="82" rx="6"/>
+<text x="32" y="202" class="name">nrese-server</text>
+<text x="32" y="224" class="text">one process: the HTTP APIs, <tspan class="code">/ops</tspan>, and</text>
+<text x="32" y="243" class="text"><tspan class="code">/console</tspan> when the console is built in</text>
+<path class="flow" d="M40 258 V294"/>
+<text x="54" y="281" class="edge">reads and writes</text>
+<rect class="box" x="16" y="294" width="352" height="182" rx="6"/>
+<text x="32" y="320" class="name">Data directory</text>
+<text x="352" y="320" class="muted" text-anchor="end">on disk only</text>
+<text x="32" y="344" class="muted">the default repository:</text>
+<text x="32" y="363" class="code">checkpoint-*.nck</text>
+<text x="198" y="363" class="muted">the saved state</text>
+<text x="32" y="382" class="code">wal/</text>
+<text x="198" y="382" class="muted">writes since then</text>
+<text x="32" y="401" class="code">wal-archive/</text>
+<text x="198" y="401" class="muted">older log, if kept</text>
+<text x="32" y="428" class="code">repositories/&lt;id&gt;/</text>
+<text x="198" y="428" class="muted">each other repository</text>
+<text x="32" y="459" class="text">locked: one process at a time</text>
+<rect class="band" x="0" y="528" width="400" height="153" rx="8"/>
+<text x="16" y="552" class="muted">another machine, if you want one</text>
+<rect class="box" x="16" y="564" width="368" height="101" rx="6"/>
+<text x="32" y="590" class="name">Read replica</text>
+<text x="32" y="612" class="text">a second nrese-server that answers queries</text>
+<text x="32" y="631" class="text">from its own data directory, on disk; both</text>
+<text x="32" y="650" class="text">servers are set up for replication</text>
+<path class="flow" d="M378 564 V261" marker-end="url(#head)"/>
+<text x="366" y="515" class="edge" text-anchor="end">pulls the server's log over HTTP</text>
+</svg>

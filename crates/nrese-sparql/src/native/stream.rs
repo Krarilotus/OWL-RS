@@ -47,7 +47,7 @@ enum Final {
 
 /// A column no query variable can be named like.
 fn partial(i: usize) -> Variable {
-    Variable::new_unchecked(format!("partial {i}"))
+    nrese_sparql_syntax::internal::variable("partial", i)
 }
 
 fn of(name: AggregateFunction, expr: Expression) -> AggregateExpression {
@@ -241,7 +241,7 @@ impl Context<'_> {
             // A morsel without rows adds no group (without keys, grouping nothing would
             // make one, whose unbound MIN would spoil the merge).
             if rows.table.is_empty() {
-                self.consumed(&rows);
+                self.consumed(rows);
             } else {
                 let grouped = self.group_solutions(rows, variables, &plan.partials)?;
                 collected += grouped.table.len();
@@ -261,7 +261,7 @@ impl Context<'_> {
                 };
             }
         }
-        self.consumed(&seeds);
+        self.consumed(seeds);
         if partials.is_empty() {
             // No rows at all: the GROUP BY of nothing (one empty group without keys).
             return self.group_solutions(self.empty_of(plan.patterns), variables, aggregates);
@@ -286,8 +286,9 @@ impl Context<'_> {
         }
         let mut wanted = variables.to_vec();
         wanted.extend(aggregates.iter().map(|(target, _)| target.clone()));
-        let projected = self.project(solutions, &wanted);
-        self.produced(projected)
+        // Charged already (each final is `produced`, the merge `reshaped`): the projection
+        // keeps that charge and charges only the columns it makes.
+        self.project(solutions, &wanted)
     }
 
     /// The partial groups of several morsels merged into one partial per group.
@@ -298,15 +299,9 @@ impl Context<'_> {
         plan: &Plan<'_>,
     ) -> NativeResult<Solutions> {
         let vars = partials[0].vars.clone();
-        let tables = partials
-            .into_iter()
-            .map(|part| {
-                self.consumed(&part);
-                part.table
-            })
-            .collect();
-        let all = self.produced(Solutions {
-            table: IdTable::concat(vars.len(), tables),
+        let growth = super::concat_growth(&partials);
+        let all = self.reshaped(partials, growth, |partials| Solutions {
+            table: IdTable::concat(vars.len(), partials.into_iter().map(|p| p.table).collect()),
             vars,
             ordered: false,
         })?;

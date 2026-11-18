@@ -1,0 +1,692 @@
+//! The upper bound U1 (docs/design/owl2-dl.md §8, package 3.2), evaluated by the rule
+//! reasoner and checked:
+//!
+//! - on PAGOdA's running example (Zhou et al., JAIR 2015, Table 2), against the bound the
+//!   paper computes for it (Example 5.6);
+//! - through its Notation3 form, which must give the same closure;
+//! - with large at-least restrictions collapsed, against the full encoding;
+//! - on fuzzed ontologies with ABoxes ([`fuzz`]): a clash-free U1 must be a model of the
+//!   ontology (so it contains every certain answer), L ⊆ U1, and an L violation means a
+//!   clash in U1;
+//! - on the W3C OWL 2 test cases ([`w3c`]).
+
+mod fuzz;
+mod support;
+mod w3c;
+
+use std::collections::{BTreeSet, HashMap};
+
+use nrese_dl::bounds::{Answer, AtomicQuery, Bounds, Origin};
+use nrese_rdf_io::RdfFormat;
+use nrese_reasoner::{ir, rulesets::Ruleset};
+use support::{Table, Triple};
+
+const EX: &str = "http://example.org/kex#";
+
+/// PAGOdA's running example `Kex` (Table 2) in OWL: rules (R1)–(R9) as axioms, facts
+/// (D1)–(D15) as assertions.
+const KEX: &str = r#"
+@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:Carnivore a owl:Class . :Mammal a owl:Class . :Herbivore a owl:Class .
+:Folivore a owl:Class . :MeatEater a owl:Class . :Plant a owl:Class . :Leaf a owl:Class .
+:eats a owl:ObjectProperty .
+:Carnivore rdfs:subClassOf :Mammal .
+:Herbivore rdfs:subClassOf :Mammal .
+:Folivore owl:disjointWith :MeatEater .
+:Herbivore rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :eats ; owl:allValuesFrom :Plant ] .
+:Mammal rdfs:subClassOf [ a owl:Class ; owl:unionOf ( :Herbivore :MeatEater ) ] .
+:MeatEater rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :eats ; owl:someValuesFrom :Herbivore ] .
+:Mammal rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :eats ; owl:someValuesFrom owl:Thing ] .
+:Folivore rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :eats ; owl:someValuesFrom :Leaf ] .
+:Leaf rdfs:subClassOf :Plant .
+:tiger a :Mammal . :lion a :Mammal . :python a :MeatEater . :python :eats :rabbit .
+:rabbit a :Herbivore . :wolf a :Mammal . :wolf a :MeatEater . :wolf :eats :sheep .
+:sheep a :Herbivore . :sheep :eats :grass . :howler a :Mammal . :howler a :Folivore .
+:a_hare a :Mammal . :a_hare a :Folivore . :a_hare :eats :willow .
+"#;
+
+struct Example {
+    table: Table,
+    input: Vec<Triple>,
+    program: nrese_dl::bounds::Program,
+    lower: support::Closure,
+    upper: support::Closure,
+}
+
+fn example(text: &str) -> Example {
+    let mut table = Table::default();
+    let input = table.parse(RdfFormat::Turtle, text.as_bytes());
+    let (ontology, normalised) = support::read(&mut table, &input);
+    let program = support::compile(&mut table, &ontology, &normalised);
+    let lower = support::lower(&mut table, &input);
+    let upper = support::upper(&mut table, &program, &input);
+    Example {
+        table,
+        input,
+        program,
+        lower,
+        upper,
+    }
+}
+
+fn ex(table: &mut Table, local: &str) -> u64 {
+    table.named(&format!("{EX}{local}"))
+}
+
+#[test]
+fn normalised_assertions_keep_missing_memberships_clashes_and_original_sources() {
+    use nrese_owl::{Axiom, ClassExpr, Concept};
+
+    for contradictory in [false, true] {
+        let mut text = String::from(
+            r#"
+@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+:C a owl:Class .
+:b a :C .
+:a a [ a owl:Class; owl:complementOf [ a owl:Class; owl:complementOf :C ] ] .
+"#,
+        );
+        if contradictory {
+            text.push_str(":a a [ a owl:Class; owl:complementOf :C ] .\n");
+        }
+        let mut table = Table::default();
+        let input = table.parse(RdfFormat::Turtle, text.as_bytes());
+        let (ontology, normalised) = support::read(&mut table, &input);
+        let (a, b, c) = (
+            ex(&mut table, "a"),
+            ex(&mut table, "b"),
+            ex(&mut table, "C"),
+        );
+        let source = ontology
+            .axioms
+            .iter()
+            .position(|axiom| {
+                matches!(axiom, Axiom::ClassAssertion(expr, individual)
+                    if *individual == a
+                        && matches!(ontology.classes.get(expr.0), ClassExpr::Not(inner)
+                            if matches!(ontology.classes.get(inner.0), ClassExpr::Not(_))))
+            })
+            .unwrap();
+        let ordinary_source = ontology
+            .axioms
+            .iter()
+            .position(
+                |axiom| matches!(axiom, Axiom::ClassAssertion(_, individual) if *individual == b),
+            )
+            .unwrap();
+        assert!(
+            normalised
+                .facts
+                .concepts
+                .contains(&(Concept::Named(c), a, source))
+        );
+        let program = support::compile(&mut table, &ontology, &normalised);
+        let missing = [a, program.names.rdf_type, c];
+        let ordinary = [b, program.names.rdf_type, c];
+        assert!(!input.contains(&missing));
+        assert!(input.contains(&ordinary));
+        let seeded: Vec<_> = program
+            .facts
+            .iter()
+            .filter(|(fact, _)| *fact == missing)
+            .collect();
+        assert_eq!(
+            seeded.len(),
+            1,
+            "seed the normalised membership exactly once"
+        );
+        assert_eq!(seeded[0].1.origin, Origin::Assertion);
+        assert_eq!(seeded[0].1.sources, vec![vec![source]]);
+        assert!(seeded[0].1.approximations.exact());
+        assert!(
+            program.facts.iter().all(|(fact, provenance)| {
+                *fact != ordinary
+                    && !provenance
+                        .sources
+                        .iter()
+                        .flatten()
+                        .any(|&s| s == ordinary_source)
+            }),
+            "ordinary named ABox facts and provenance must not be retained twice"
+        );
+        // Also retain the existing fresh-concept assertion path (the negative case).
+        for &(concept, individual, source) in &normalised.facts.concepts {
+            if let Concept::Fresh(q) = concept {
+                let fact = [
+                    individual,
+                    program.names.rdf_type,
+                    program.names.fresh[q as usize],
+                ];
+                assert!(program.facts.iter().any(|(f, p)| {
+                    *f == fact && p.origin == Origin::Assertion && p.sources == vec![vec![source]]
+                }));
+            }
+        }
+        assert!(program.incomplete.is_empty());
+        let upper = support::upper(&mut table, &program, &input);
+        assert!(upper.facts.binary_search(&missing).is_ok());
+        assert!(upper.facts.binary_search(&ordinary).is_ok());
+        assert_eq!(
+            upper.facts.iter().any(|t| t[1] == program.names.clash),
+            contradictory
+        );
+    }
+}
+
+#[test]
+fn pagoda_running_example_gives_the_papers_bound() {
+    let mut e = example(KEX);
+    assert!(e.program.incomplete.is_empty());
+    let has = |e: &mut Example, s: &str, p: &str, o: &str| {
+        let rdf_type = e.program.names.rdf_type;
+        let s = ex(&mut e.table, s);
+        let p = if p == "a" {
+            rdf_type
+        } else {
+            ex(&mut e.table, p)
+        };
+        let o = ex(&mut e.table, o);
+        e.upper.facts.binary_search(&[s, p, o]).is_ok()
+    };
+    // Certain answers (by hand, as in the paper's §3): all in U1.
+    for (s, p, o) in [
+        ("rabbit", "a", "Mammal"),
+        ("howler", "a", "Herbivore"),
+        ("a_hare", "a", "Herbivore"),
+        ("grass", "a", "Plant"),
+        ("willow", "a", "Plant"),
+    ] {
+        assert!(has(&mut e, s, p, o), "{s} {p} {o}");
+    }
+    // The clash of (R3) fires on howler and a_hare (Example 5.3), and U1 still answers.
+    let clash = e.program.names.clash;
+    let clashes: BTreeSet<String> = e
+        .upper
+        .facts
+        .iter()
+        .filter(|t| t[1] == clash)
+        .map(|t| e.table.text(t[0]))
+        .collect();
+    assert_eq!(
+        clashes,
+        BTreeSet::from([format!("<{EX}a_hare>"), format!("<{EX}howler>")])
+    );
+    // q(x) = ∃y eats(x, y) ∧ Plant(y) over U1: Example 5.6's answers over named terms.
+    let (eats, plant) = (ex(&mut e.table, "eats"), ex(&mut e.table, "Plant"));
+    let rdf_type = e.program.names.rdf_type;
+    let plants: BTreeSet<u64> = e
+        .upper
+        .facts
+        .iter()
+        .filter(|t| t[1] == rdf_type && t[2] == plant)
+        .map(|t| t[0])
+        .collect();
+    let answers: BTreeSet<String> = e
+        .upper
+        .facts
+        .iter()
+        .filter(|t| t[1] == eats && plants.contains(&t[2]) && !e.program.is_internal(t[0]))
+        .map(|t| e.table.text(t[0]).replace(EX, "").replace(['<', '>'], ""))
+        .collect();
+    let paper: BTreeSet<String> = [
+        "tiger", "lion", "python", "rabbit", "wolf", "sheep", "howler", "a_hare",
+    ]
+    .map(str::to_owned)
+    .into();
+    assert_eq!(answers, paper);
+    // L ⊆ U1, and the gap: Herbivore(howler) needs reasoning by cases.
+    let bounds = Bounds::new(
+        &e.program,
+        &e.table,
+        e.lower.facts.clone(),
+        e.upper.facts.clone(),
+    );
+    assert_eq!(bounds.lower_not_in_upper(), Vec::<Triple>::new());
+    let herbivore = ex(&mut e.table, "Herbivore");
+    let howler = ex(&mut e.table, "howler");
+    match bounds.answer(AtomicQuery::Instances(herbivore)) {
+        Answer::Gap { candidates, .. } => {
+            assert!(candidates.contains(&[howler, rdf_type, herbivore]))
+        }
+        Answer::Exact(_) => panic!("Herbivore(howler) is not in L"),
+    }
+    let grass = ex(&mut e.table, "grass");
+    assert_eq!(
+        bounds.answer(AtomicQuery::Fact([grass, rdf_type, plant])),
+        Answer::Exact(vec![[grass, rdf_type, plant]])
+    );
+    let report = bounds.report();
+    assert_eq!(report.lower_only, 0);
+    assert!(report.gap > 0 && report.clashes == 2);
+    // Provenance: every clause rule names its source axioms.
+    assert!(e.program.rules.iter().all(|r| match r.provenance.origin {
+        Origin::Clause(_) | Origin::Chain | Origin::Key | Origin::Skolem | Origin::Assertion => {
+            !r.provenance.sources.is_empty()
+        }
+        Origin::Thing | Origin::Equality | Origin::Nominal | Origin::Builtin => true,
+    }));
+}
+
+#[test]
+fn the_n3_form_gives_the_same_closure() {
+    let mut e = example(KEX);
+    // U1's own terms have no IRI: written as they are, the text would be no N3.
+    let raw = e.program.to_n3(&|t| e.table.text(t));
+    assert!(
+        matches!(raw, Err(nrese_dl::bounds::RenderError::OwnTerm { .. })),
+        "{raw:?}"
+    );
+    let copied = assert_n3_round_trip(&mut e);
+    // support::upper (what the other tests read) gives the same answers.
+    let program = &e.program;
+    let answers = |facts: &[Triple]| -> Vec<Triple> {
+        facts
+            .iter()
+            .filter(|t| !program.is_internal(t[0]) && !program.is_internal(t[2]))
+            .copied()
+            .collect()
+    };
+    assert_eq!(answers(&copied), answers(&e.upper.facts));
+}
+
+/// The export names U1's own terms apart from every input term, whatever IRIs the input
+/// holds: an individual `b` spelled as an earlier export named the Skolem constant of
+/// `A ⊑ ∃r.B` stays apart from that constant, so the text doesn't make `b` a `B`, nor
+/// derive the clash of `B` and `C`.
+#[test]
+fn the_n3_form_names_own_terms_apart_from_the_input() {
+    let text = |b: &str| {
+        format!(
+            r#"
+@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+:A a owl:Class . :B a owl:Class . :C a owl:Class . :r a owl:ObjectProperty .
+:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom :B ] .
+:B owl:disjointWith :C .
+:a a :A .
+<{b}> a :C .
+"#
+        )
+    };
+    let mut first = example(&text(&format!("{EX}b")));
+    let (a, r) = (ex(&mut first.table, "a"), ex(&mut first.table, "r"));
+    let skolem = first
+        .upper
+        .facts
+        .iter()
+        .find(|f| f[0] == a && f[1] == r && first.program.is_internal(f[2]))
+        .expect("a's r-successor is U1's constant")[2];
+    let alias = first.table.own_iris(&first.program)[&skolem].clone();
+    // The same ontology, b spelled as that name: the terms keep their ids.
+    let mut e = example(&text(&alias));
+    let b = e.table.named(&alias);
+    assert_eq!(b, ex(&mut first.table, "b"));
+    assert!(e.program.is_internal(skolem) && !e.program.is_internal(b));
+    let copied = assert_n3_round_trip(&mut e);
+    let (rdf_type, class_b) = (e.program.names.rdf_type, ex(&mut e.table, "B"));
+    assert!(!copied.contains(&[b, rdf_type, class_b]));
+}
+
+/// U1 through its Notation3 export, named as the bounds example names it
+/// ([`Table::own_iris`]), and read back as a reader of the text would: over the input's
+/// terms, so a name the input holds is that term. Only the export's names the input
+/// doesn't hold are then decoded to U1's terms. The text's facts must be U1's, and its
+/// closure U1's closure by the same engine, which this returns.
+fn assert_n3_round_trip(e: &mut Example) -> Vec<Triple> {
+    let own = e.table.own_iris(&e.program);
+    let text = {
+        let table = &e.table;
+        let term = |t| {
+            own.get(&t)
+                .map_or_else(|| table.text(t), |iri| format!("<{iri}>"))
+        };
+        e.program.to_n3(&term).expect("no blank nodes")
+    };
+    let held = e.table.terms.len() as u64;
+    let n3 = nrese_reasoner::n3::compile("u1", &text, &mut e.table).expect("U1 is valid N3");
+    let names: HashMap<u64, u64> = (own.iter())
+        .map(|(&t, iri)| (e.table.named(iri), t))
+        .filter(|&(read, _)| read >= held)
+        .collect();
+    let decode = |facts: &[Triple]| -> Vec<Triple> {
+        let mut out: Vec<Triple> = (facts.iter())
+            .map(|f| f.map(|x| names.get(&x).copied().unwrap_or(x)))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    };
+    let upper_input = support::upper_input(&e.program, &e.input);
+    let mut input = e.input.clone();
+    input.extend(n3.facts);
+    assert_eq!(decode(&input), upper_input);
+    let from_n3 = support::upper_copied(&mut e.table, &n3.rules, &input);
+    let rules = support::reasoner_rules(&e.program);
+    let copied = support::upper_copied(&mut e.table, &rules, &upper_input);
+    assert_eq!(decode(&from_n3), copied);
+    copied
+}
+
+/// `≥ n` collapsed to two constants keeps every answer and every clash of the full
+/// encoding (the homomorphism and symmetry argument of `bounds::upper`'s docs).
+#[test]
+fn collapsed_at_least_keeps_answers_and_clashes() {
+    let prefix = r#"
+@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class .
+:r a owl:ObjectProperty . :s a owl:ObjectProperty .
+:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ;
+    owl:minQualifiedCardinality "5"^^xsd:nonNegativeInteger ; owl:onClass :B ] .
+:B rdfs:subClassOf :C , [ a owl:Restriction ; owl:onProperty :s ; owl:hasValue :o ] .
+:r rdfs:range :D .
+:a a :A . :a :r :b .
+"#;
+    let cases = [
+        ("consistent", ""),
+        (
+            "at-most atom",
+            ":A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; \
+             owl:maxQualifiedCardinality \"3\"^^xsd:nonNegativeInteger ; owl:onClass :B ] .",
+        ),
+        ("functional", ":r a owl:FunctionalProperty ."),
+        (
+            "at-most above n",
+            ":A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; \
+             owl:maxQualifiedCardinality \"7\"^^xsd:nonNegativeInteger ; owl:onClass :B ] .",
+        ),
+        ("inverse functional", ":s a owl:InverseFunctionalProperty ."),
+    ];
+    for (name, extra) in cases {
+        let text = format!("{prefix}{extra}\n");
+        let mut table = Table::default();
+        let input = table.parse(RdfFormat::Turtle, text.as_bytes());
+        let (ontology, normalised) = support::read(&mut table, &input);
+        let full = support::compile(&mut table, &ontology, &normalised);
+        let options = nrese_dl::bounds::Options { max_skolems: 2 };
+        let collapsed = support::compile_with(&mut table, &ontology, &normalised, options);
+        assert!(
+            !full
+                .rules
+                .iter()
+                .any(|r| r.provenance.approximations.collapsed)
+        );
+        assert!(
+            collapsed
+                .rules
+                .iter()
+                .any(|r| r.provenance.approximations.collapsed)
+        );
+        let answers = |program: &nrese_dl::bounds::Program, table: &mut Table| {
+            let closure = support::upper(table, program, &input);
+            let clash = closure.facts.iter().any(|t| t[1] == program.names.clash);
+            let named: BTreeSet<Triple> = closure
+                .facts
+                .into_iter()
+                .filter(|t| !t.iter().any(|&x| program.is_internal(x)))
+                .collect();
+            (named, clash)
+        };
+        let (full_answers, full_clash) = answers(&full, &mut table);
+        let (collapsed_answers, collapsed_clash) = answers(&collapsed, &mut table);
+        let lost: Vec<_> = full_answers.difference(&collapsed_answers).collect();
+        assert!(lost.is_empty(), "{name}: the collapse lost {lost:?}");
+        assert!(
+            !full_clash || collapsed_clash,
+            "{name}: the collapse lost the clash"
+        );
+        let expect_clash = name != "consistent";
+        assert_eq!(full_clash, expect_clash, "{name}");
+    }
+}
+
+#[test]
+fn chains_nominals_cardinalities_and_keys() {
+    let text = r#"
+@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+:A a owl:Class . :B a owl:Class . :C a owl:Class . :D a owl:Class .
+:r a owl:ObjectProperty . :s a owl:ObjectProperty . :t a owl:ObjectProperty .
+:f a owl:ObjectProperty , owl:FunctionalProperty . :k a owl:DatatypeProperty .
+:t a owl:TransitiveProperty .
+:t owl:propertyChainAxiom ( :r :s ) .
+:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:hasValue :o ] .
+:B rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :f ; owl:maxCardinality "1"^^xsd:nonNegativeInteger ] .
+:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :s ; owl:minCardinality "2"^^xsd:nonNegativeInteger ] .
+:D owl:hasKey ( :k ) .
+:a a :A . :o :s :p . :p :t :q .
+:b :f :c1 . :b :f :c2 .
+:d1 a :D . :d2 a :D . :d1 :k "7"^^xsd:integer . :d2 :k "7"^^xsd:integer .
+:e a :C .
+"#;
+    let mut e = example(text);
+    let rdf_type = e.program.names.rdf_type;
+    let same = e.program.names.same_as;
+    let (r, t) = (ex(&mut e.table, "r"), ex(&mut e.table, "t"));
+    let mut has = |s: &str, p: u64, o: &str| {
+        let (s, o) = (ex(&mut e.table, s), ex(&mut e.table, o));
+        e.upper.facts.binary_search(&[s, p, o]).is_ok()
+    };
+    // A ⊑ ∃r.{o} with the nominal; the chain r∘s ⊑ t; t transitive.
+    assert!(has("a", r, "o"));
+    assert!(has("a", t, "p"));
+    assert!(has("a", t, "q"));
+    // Functional: the two successors are equal; the key equates d1 and d2.
+    assert!(has("c1", same, "c2"));
+    assert!(has("d1", same, "d2"));
+    // ≥ 2 s at e: two Skolem constants, distinct, no clash.
+    let _ = rdf_type;
+    let s = ex(&mut e.table, "s");
+    let e_ = ex(&mut e.table, "e");
+    let successors = e
+        .upper
+        .facts
+        .iter()
+        .filter(|f| f[0] == e_ && f[1] == s)
+        .count();
+    assert_eq!(successors, 2);
+    assert!(!e.upper.facts.iter().any(|f| f[1] == e.program.names.clash));
+    // The key is a rule of U1: covered, so U1 bounds every answer.
+    assert!(
+        e.program.incomplete.is_empty(),
+        "{:?}",
+        e.program.incomplete
+    );
+}
+
+/// A key over `owl:topObjectProperty` (review A-1704): named `a`, `b` in `K` share a named
+/// value (`a` itself) by the universal property, so the key makes them equal (OWL 2 Direct
+/// Semantics, §2.3.5) and `b : A` follows; with `a ≠ b` asserted, there is no model.
+#[test]
+fn a_key_over_the_universal_property_equates() {
+    for different in [false, true] {
+        let mut text = String::from(
+            r#"
+@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+:K a owl:Class . :A a owl:Class .
+:a a owl:NamedIndividual . :b a owl:NamedIndividual .
+:K owl:hasKey ( owl:topObjectProperty ) .
+:a a :K , :A . :b a :K .
+"#,
+        );
+        if different {
+            text.push_str(":a owl:differentFrom :b .\n");
+        }
+        let mut e = example(&text);
+        let clash = e.upper.facts.iter().any(|f| f[1] == e.program.names.clash);
+        if different {
+            assert!(clash, "a ≠ b against the key");
+        } else {
+            let (b, a) = (ex(&mut e.table, "b"), ex(&mut e.table, "A"));
+            let fact = [b, e.program.names.rdf_type, a];
+            assert!(e.upper.facts.binary_search(&fact).is_ok(), "b : A");
+        }
+    }
+}
+
+/// A key of no property makes every named member of its class one (OWL 2 Direct Semantics,
+/// §2.3.5), which U1 doesn't compile: it marks the key not compiled, so it proves no
+/// consistency over it, here against `a ≠ b`. The reader leaves such a key out of the source
+/// (*Structural Specification* §9.5), so it is given to U1 past the reader.
+#[test]
+fn u1_proves_no_consistency_over_a_key_it_did_not_compile() {
+    use nrese_owl::{Axiom, ClassExpr, ExprId};
+    let mut table = Table::default();
+    let input = table.parse(
+        RdfFormat::Turtle,
+        b"@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+:K a owl:Class . :a a owl:NamedIndividual , :K . :b a owl:NamedIndividual , :K .
+:a owl:differentFrom :b .",
+    );
+    let (mut ontology, _) = support::read(&mut table, &input);
+    let k = ex(&mut table, "K");
+    let class = ExprId(ontology.classes.intern(ClassExpr::Class(k)));
+    ontology
+        .axioms
+        .push(Axiom::HasKey(class, Vec::new(), Vec::new()));
+    ontology.sources.push(Vec::new());
+    let normalised = nrese_owl::normalise(&ontology);
+    let program = support::compile(&mut table, &ontology, &normalised);
+    let upper = support::upper(&mut table, &program, &input);
+    let clash = upper.facts.iter().any(|f| f[1] == program.names.clash);
+    assert!(
+        clash || !program.proves_consistency(),
+        "proved consistent; incomplete {:?}",
+        program.incomplete
+    );
+}
+
+/// U1 proves an ontology consistent only where it has a model. Without one:
+/// - a data existential over a defined datatype with no value (review A-1705): `xsd:string`
+///   and `xsd:integer` have disjoint value spaces (OWL 2 Structural Specification, §4), so
+///   `D` is empty and `a : A` has no `d` value in it;
+/// - a TBox alone, `⊤ ⊑ A ⊑ ⊥` (review A-1703): the domain is never empty (OWL 2 Direct
+///   Semantics, §2.2), so its element is in `A`, which has none;
+/// - a value a defined datatype forces (`D ≡ {0}`) that a negative assertion excludes, or
+///   that a key shares with an individual in a disjoint class (Direct Semantics, §2.3.5);
+///   also where the negative assertion is on a super-property, which has the value too, or
+///   on a property the value reaches through inverses, which the reader accepts on data
+///   properties outside OWL 2 DL (`d⁻ = r`, `r⁻ = q`: `q` = `d`; F1's review, W1).
+///
+/// With one, the proof stands: a defined datatype with values (`xsd:integer[≥ 0]`, PR #30),
+/// a datatype outside the map, whose values a model may choose (§4), and the
+/// forced value where the negative assertion or the key is on another property
+/// (PR #30).
+#[test]
+fn a_proof_of_consistency_needs_a_model() {
+    let data = ":A a owl:Class . :d a owl:DatatypeProperty . :q a owl:DatatypeProperty . \
+                :a a :A .";
+    let some = |range: &str| {
+        format!(
+            "{data} :A rdfs:subClassOf \
+             [ a owl:Restriction ; owl:onProperty :d ; owl:someValuesFrom {range} ] ."
+        )
+    };
+    let defined = |definition: &str| {
+        format!(
+            "{} :D a rdfs:Datatype ; owl:equivalentClass [ a rdfs:Datatype ; {definition} ] .",
+            some(":D")
+        )
+    };
+    let zero = defined("owl:oneOf ( \"0\"^^xsd:integer )");
+    let not_zero = |property: &str| {
+        format!(
+            "{zero} [] a owl:NegativePropertyAssertion ; owl:sourceIndividual :a ; \
+             owl:assertionProperty {property} ; owl:targetValue \"0\"^^xsd:integer ."
+        )
+    };
+    let key = |property: &str| {
+        format!(
+            "{zero} owl:Thing owl:hasKey ( {property} ) . :B a owl:Class ; \
+             owl:disjointWith :A . :b a :B ; {property} \"0\"^^xsd:integer ."
+        )
+    };
+    let cases = [
+        (
+            "an empty defined datatype",
+            defined("owl:intersectionOf ( xsd:string xsd:integer )"),
+            false,
+        ),
+        (
+            "a forced value a negative assertion excludes",
+            not_zero(":d"),
+            false,
+        ),
+        ("a forced value a key shares", key(":d"), false),
+        (
+            "a forced value a negative assertion on a super-property excludes",
+            format!("{} :d rdfs:subPropertyOf :q .", not_zero(":q")),
+            false,
+        ),
+        (
+            "a forced value a negative assertion through inverses excludes",
+            format!(
+                "{} :r a owl:ObjectProperty . :d owl:inverseOf :r . :r owl:inverseOf :q .",
+                not_zero(":q")
+            ),
+            false,
+        ),
+        (
+            "a negative assertion on another property",
+            not_zero(":q"),
+            true,
+        ),
+        ("a key on another property", key(":q"), true),
+        (
+            "a TBox alone",
+            ":A a owl:Class . owl:Thing rdfs:subClassOf :A . :A rdfs:subClassOf owl:Nothing ."
+                .to_owned(),
+            false,
+        ),
+        (
+            "an inhabited defined datatype",
+            defined(
+                "owl:onDatatype xsd:integer ; \
+                 owl:withRestrictions ( [ xsd:minInclusive \"0\"^^xsd:integer ] )",
+            ),
+            true,
+        ),
+        ("a datatype outside the map", some("xsd:date"), true),
+    ];
+    let mut wrong = Vec::new();
+    for (name, axioms, proved) in cases {
+        let e = example(&format!(
+            "@prefix : <http://example.org/kex#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .
+{axioms}"
+        ));
+        let clash = e.upper.facts.iter().any(|f| f[1] == e.program.names.clash);
+        if (!clash && e.program.proves_consistency()) != proved {
+            let unchecked = &e.program.unchecked;
+            wrong.push(format!(
+                "{name}: proved {}, clash {clash}, unchecked {unchecked:?}",
+                !proved
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// U1's equality rules are OWL 2 RL's that conclude facts, as the reasoner's ruleset states
+/// them, rule for rule: `bounds::upper` writes the five out a second time, and the
+/// reasoner's equality module stands in for exactly those.
+#[test]
+fn the_equality_rules_are_owl_2_rls() {
+    let mut e = example(KEX);
+    let rl = Ruleset::Owl2Rl.rules(&mut e.table).expect("it parses");
+    let facts = |r: &ir::Rule| r.name.starts_with("eq-") && r.head != ir::Head::Inconsistent;
+    let five = |rules: Vec<ir::Rule>| rules.into_iter().filter(facts).collect::<Vec<_>>();
+    assert_eq!(five(support::reasoner_rules(&e.program)), five(rl));
+}

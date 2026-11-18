@@ -1,13 +1,15 @@
 [workspace]
 members = [
-    "crates/nrese-core",
+    "crates/nrese-dl",
     "crates/nrese-engine",
     "crates/nrese-exec",
     "crates/nrese-fuzz",
+    "crates/nrese-owl",
     "crates/nrese-sparql",
     "crates/nrese-sparql-reference",
     "crates/nrese-shacl",
     "crates/nrese-store",
+    "crates/nrese-vector",
     "crates/nrese-reasoner",
     "crates/nrese-server",
     "crates/rdf/nrese-json",
@@ -27,16 +29,19 @@ rust-version = "1.98"
 publish = false
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/Krarilotus/OWL-RS"
-version = "0.1.0"
+version = "1.5.0"
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"
-# `--cfg system_alloc` switches the perf lab to the system allocator (benches/perf-lab.sh).
-unexpected_cfgs = { level = "warn", check-cfg = ["cfg(system_alloc)"] }
+# `--cfg system_alloc` switches the perf lab to the system allocator (RUSTFLAGS for a perf_lab build),
+# `--cfg alloc_profile` to a counting one with a heap profile of reasoning by phase.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(system_alloc)", "cfg(alloc_profile)"] }
 
 [workspace.lints.clippy]
 undocumented_unsafe_blocks = "deny"
 dbg_macro = "deny"
+# The methods `clippy.toml` names, outside their allowed callers.
+disallowed_methods = "deny"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
@@ -51,9 +56,11 @@ quick-xml = "0.42"
 rand = "0.9"
 rayon = "1.10"
 regex = "1.12"
+regex-syntax = "0.8"
 serde = "1.0.228"
 serde_json = "1.0.145"
 sha2 = "0.10.9"
+smallvec = "1.15"
 tempfile = "3.23.0"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread"] }
@@ -67,7 +74,23 @@ utoipa = "6.0.0"
 lto = "fat"
 codegen-units = 1
 
+# `--profile lab`: release code built fast, for iterating on an A/B (thin LTO, parallel code
+# generation). Numbers that are kept or published are measured on `release`.
+[profile.lab]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+
 # `cargo build --profile profiling`: release code with symbols, for perf/samply.
 [profile.profiling]
 inherits = "release"
 debug = "line-tables-only"
+
+# The SPARQL crates recurse as deep as a query nests. At opt-level 1 a level takes 0.8 to
+# 1.4 times the stack it takes in release (ADR-0012's measurements), so the depth tests'
+# 2 MiB thread represents the server's; the differential tests run faster too.
+[profile.dev.package.nrese-sparql]
+opt-level = 1
+
+[profile.dev.package.nrese-sparql-syntax]
+opt-level = 1

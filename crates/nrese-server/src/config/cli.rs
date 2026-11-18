@@ -6,15 +6,22 @@ use anyhow::{Result, bail};
 /// Command line: `nrese-server [--config PATH] [--set KEY=VALUE]...` serves (`--set`
 /// overrides a configuration file key, over the file and the environment; every command
 /// takes it); `nrese-server config-schema` prints the JSON Schema of the configuration file;
-/// `nrese-server load [--config PATH] [--replace] [--graph IRI] [--skip-errors] FILE...` bulk-loads files
-/// into the configured store and exits (the server must not be running on the same data
-/// directory; the engine's directory lock enforces that);
+/// `nrese-server load [--config PATH] [--replace] [--graph IRI] [--strict | --quarantine] FILE...`
+/// bulk-loads files into the configured store and exits (the server must not be running on
+/// the same data directory; the engine's directory lock enforces that); statements it can't
+/// read are quarantined, or with `--strict` stop it (`store.invalid_statements`);
 /// `nrese-server query [--config PATH] [--format F] (QUERY | --file PATH)` answers one query
-/// from the configured store on standard output (the same lock);
+/// from the configured store on standard output (the same lock), its inferences first
+/// brought up to date as the server's start does;
+/// `nrese-server print-query [--config PATH] [--form paths|values] [--schema FILE]...
+/// (QUERY | --file PATH)` prints the query as standard SPARQL 1.1 that answers, on a store
+/// without reasoning holding the same statements, as NRESE answers it under `owl2-rl` with
+/// the QL rewriting on (against the configured store, or with `--schema` against those files
+/// alone; exit status 2 if it can't be written exactly);
 /// `nrese-server convert INPUT OUTPUT` converts an RDF file into another format (by the
 /// extensions), without a store;
 /// `nrese-server backup DIR` writes an image backup of the configured store into `DIR`
-/// (the same lock: for a running server, `POST /ops/api/admin/dataset/image`);
+/// (the same lock: for a running server, `POST /api/v1/repositories/{id}/image`);
 /// `nrese-server prune-archive REVISION` removes the archived WAL segments whose records all
 /// come before `REVISION` (safe while the server runs);
 /// `nrese-server restore DIR [--wal LOGDIR]... [--until-revision N] [--until-time T]`
@@ -40,6 +47,8 @@ pub enum CliCommand {
     /// `config-schema`: print the JSON Schema of the configuration file and exit.
     ConfigSchema,
     Query(QueryCommand),
+    /// `print-query`: the query as standard SPARQL 1.1 for a store without reasoning.
+    PrintQuery(PrintQueryCommand),
     Convert(ConvertCommand),
     /// `backup DIR`: an image backup of the store into `DIR`.
     Backup(PathBuf),
@@ -60,59 +69,33 @@ pub struct RestoreCommand {
 }
 
 /// An RFC 3339 time (`2026-10-02T14:05:00Z`, `…T16:05:00.5+02:00`) as microseconds since
-/// 1970.
+/// 1970. Its calendar is `xsd:dateTime`'s, which RFC 3339's times are: a real date and
+/// clock time with an offset from UTC (`T`, `t` or a space between them; `Z` or `z`).
+/// Digits past the microsecond are cut off; a leap second (`:60`) and an offset past
+/// ±14:00 are refused, as `xsd:dateTime` refuses them.
 pub fn parse_time(text: &str) -> Result<u64> {
-    let bad = || anyhow::anyhow!("'{text}' is not an RFC 3339 time (2026-10-02T14:05:00Z)");
-    let number = |part: &str| part.parse::<i64>().map_err(|_| bad());
-    let (date, rest) = text.split_once(['T', 't', ' ']).ok_or_else(bad)?;
-    let mut date = date.splitn(3, '-');
-    let (year, month, day) = (
-        number(date.next().ok_or_else(bad)?)?,
-        number(date.next().ok_or_else(bad)?)?,
-        number(date.next().ok_or_else(bad)?)?,
-    );
-    // The zone: Z, or an offset from UTC.
-    let (time, offset_minutes) = if let Some(time) = rest.strip_suffix(['Z', 'z']) {
-        (time, 0)
-    } else {
-        let at = rest.rfind(['+', '-']).ok_or_else(bad)?;
-        let (time, zone) = rest.split_at(at);
-        let sign = if zone.starts_with('-') { -1 } else { 1 };
-        let (hours, minutes) = zone[1..].split_once(':').ok_or_else(bad)?;
-        (time, sign * (number(hours)? * 60 + number(minutes)?))
+    use std::str::FromStr as _;
+    let bad = |why: &dyn std::fmt::Display| {
+        anyhow::anyhow!("'{text}' is not an RFC 3339 time (2026-10-02T14:05:00Z): {why}")
     };
-    let mut clock = time.splitn(3, ':');
-    let (hour, minute, second) = (
-        number(clock.next().ok_or_else(bad)?)?,
-        number(clock.next().ok_or_else(bad)?)?,
-        clock.next().ok_or_else(bad)?,
-    );
-    let (whole, fraction) = second.split_once('.').unwrap_or((second, ""));
-    let second = number(whole)?;
-    let micros: i64 = match fraction {
-        "" => 0,
-        digits if digits.len() <= 9 && digits.bytes().all(|b| b.is_ascii_digit()) => {
-            format!("{digits:0<6}")[..6].parse().map_err(|_| bad())?
-        }
-        _ => return Err(bad()),
-    };
-    if !(1..=12).contains(&month)
-        || !(1..=31).contains(&day)
-        || hour > 23
-        || minute > 59
-        || second > 60
-    {
-        return Err(bad());
+    let (date, time) = text
+        .split_once(['T', 't', ' '])
+        .ok_or_else(|| bad(&"no time"))?;
+    let time = time
+        .strip_suffix('z')
+        .map_or_else(|| time.to_owned(), |time| format!("{time}Z"));
+    let offset = time.len().checked_sub(6).map(|at| time.as_bytes()[at]);
+    if !time.ends_with('Z') && !matches!(offset, Some(b'+' | b'-')) {
+        return Err(bad(&"no offset from UTC"));
     }
-    // Days since 1970 of the civil date (Howard Hinnant's algorithm).
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = y.div_euclid(400);
-    let year_of_era = y - era * 400;
-    let day_of_year = (153 * ((month + 9) % 12) + 2) / 5 + day - 1;
-    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
-    let days = era * 146_097 + day_of_era - 719_468;
-    let seconds = days * 86_400 + hour * 3_600 + minute * 60 + second - offset_minutes * 60;
-    u64::try_from(seconds * 1_000_000 + micros).map_err(|_| bad())
+    let at = nrese_xsd::DateTime::from_str(&format!("{date}T{time}")).map_err(|e| bad(&e))?;
+    let epoch = nrese_xsd::DateTime::from_str("1970-01-01T00:00:00Z").map_err(|e| bad(&e))?;
+    let micros = at
+        .checked_sub(epoch)
+        .and_then(|since| since.as_seconds().checked_mul(1_000_000))
+        .and_then(|micros| nrese_xsd::Integer::try_from(micros).ok())
+        .ok_or_else(|| bad(&"out of range"))?;
+    u64::try_from(i64::from(micros)).map_err(|_| bad(&"before 1970"))
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -123,6 +106,18 @@ pub struct QueryCommand {
     /// A results format (`json`, `xml`, `csv`, `tsv`) or, for CONSTRUCT and DESCRIBE, an
     /// RDF format by its extension (`nt`, `ttl`, `nq`, `trig`, `rdf`, `jsonld`).
     pub format: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PrintQueryCommand {
+    /// The query text, or the file holding it.
+    pub query: Option<String>,
+    pub file: Option<PathBuf>,
+    /// `paths` (property paths over the schema, the default) or `values` (the hierarchy
+    /// enumerated).
+    pub form: Option<String>,
+    /// Schema files to print against, in an in-memory store, instead of the configured store.
+    pub schema: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -137,8 +132,9 @@ pub struct LoadCommand {
     pub replace: bool,
     /// Target graph IRI for triple formats; `None` = the default graph.
     pub graph: Option<String>,
-    /// Skip statements with syntax errors (logged and counted) instead of stopping.
-    pub skip_errors: bool,
+    /// What a statement with a syntax error does (`--strict`, `--quarantine`, the older
+    /// `--skip-errors`); `None`: `store.invalid_statements`.
+    pub invalid: Option<nrese_store::InvalidStatements>,
 }
 
 impl CliConfig {
@@ -166,6 +162,12 @@ impl CliConfig {
         } else if args.peek().is_some_and(|argument| argument == "query") {
             args.next();
             config.command = CliCommand::Query(QueryCommand::default());
+        } else if args
+            .peek()
+            .is_some_and(|argument| argument == "print-query")
+        {
+            args.next();
+            config.command = CliCommand::PrintQuery(PrintQueryCommand::default());
         } else if args.peek().is_some_and(|argument| argument == "convert") {
             args.next();
             config.command = CliCommand::Convert(ConvertCommand::default());
@@ -232,6 +234,29 @@ impl CliConfig {
                         query.file = Some(PathBuf::from(file));
                     } else if query.query.is_none() && query.file.is_none() {
                         query.query = Some(text(argument, "query")?);
+                    } else {
+                        bail!("unsupported argument: {:?}", argument);
+                    }
+                    continue;
+                }
+                CliCommand::PrintQuery(print) => {
+                    if argument == "--form" {
+                        let Some(form) = args.next() else {
+                            bail!("missing value for --form");
+                        };
+                        print.form = Some(text(form, "form")?);
+                    } else if argument == "--file" {
+                        let Some(file) = args.next() else {
+                            bail!("missing value for --file");
+                        };
+                        print.file = Some(PathBuf::from(file));
+                    } else if argument == "--schema" {
+                        let Some(file) = args.next() else {
+                            bail!("missing value for --schema");
+                        };
+                        print.schema.push(PathBuf::from(file));
+                    } else if print.query.is_none() && print.file.is_none() {
+                        print.query = Some(text(argument, "query")?);
                     } else {
                         bail!("unsupported argument: {:?}", argument);
                     }
@@ -305,8 +330,10 @@ impl CliConfig {
             };
             if argument == "--replace" {
                 load.replace = true;
-            } else if argument == "--skip-errors" {
-                load.skip_errors = true;
+            } else if argument == "--strict" {
+                load.invalid = Some(nrese_store::InvalidStatements::Strict);
+            } else if argument == "--quarantine" || argument == "--skip-errors" {
+                load.invalid = Some(nrese_store::InvalidStatements::Quarantine);
             } else if argument == "--graph" {
                 let Some(graph) = args.next().and_then(|graph| graph.into_string().ok()) else {
                     bail!("missing or non-UTF-8 value for --graph");
@@ -328,6 +355,18 @@ impl CliConfig {
             && query.query.is_some() == query.file.is_some()
         {
             bail!("`query` needs a query or --file (one of them)");
+        }
+        if let CliCommand::PrintQuery(print) = &config.command {
+            if print.query.is_some() == print.file.is_some() {
+                bail!("`print-query` needs a query or --file (one of them)");
+            }
+            if print
+                .form
+                .as_deref()
+                .is_some_and(|form| !matches!(form, "paths" | "values"))
+            {
+                bail!("--form is paths or values");
+            }
         }
         if let CliCommand::Convert(convert) = &config.command
             && convert.output.as_os_str().is_empty()
@@ -352,7 +391,10 @@ mod tests {
     use std::ffi::OsString;
     use std::path::PathBuf;
 
-    use super::{CliCommand, CliConfig, ConvertCommand, LoadCommand, QueryCommand, RestoreCommand};
+    use super::{
+        CliCommand, CliConfig, ConvertCommand, LoadCommand, PrintQueryCommand, QueryCommand,
+        RestoreCommand,
+    };
 
     fn parse(args: &[&str]) -> anyhow::Result<CliConfig> {
         CliConfig::from_args(
@@ -436,9 +478,25 @@ mod tests {
                 files: vec![PathBuf::from("a.nt"), PathBuf::from("b.ttl")],
                 replace: true,
                 graph: Some("http://example.com/g".to_owned()),
-                skip_errors: false,
+                invalid: None,
             })
         );
+    }
+
+    #[test]
+    fn load_takes_what_bad_statements_do() {
+        use nrese_store::InvalidStatements::{Quarantine, Strict};
+        for (flag, invalid) in [
+            ("--strict", Strict),
+            ("--quarantine", Quarantine),
+            ("--skip-errors", Quarantine),
+        ] {
+            let config = parse(&["load", flag, "a.nt"]).expect("cli config");
+            let CliCommand::Load(load) = config.command else {
+                panic!("{flag}: not a load");
+            };
+            assert_eq!(load.invalid, Some(invalid), "{flag}");
+        }
     }
 
     #[test]
@@ -456,6 +514,29 @@ mod tests {
         assert_eq!(config.config_path, Some(PathBuf::from("n.toml")));
         assert!(parse(&["query"]).is_err());
         assert!(parse(&["query", "--file", "q.rq", "SELECT * {}"]).is_err());
+        let config = parse(&[
+            "print-query",
+            "--form",
+            "values",
+            "--schema",
+            "a.ttl",
+            "--schema",
+            "b.nt",
+            "SELECT * {}",
+        ])
+        .expect("cli config");
+        assert_eq!(
+            config.command,
+            CliCommand::PrintQuery(PrintQueryCommand {
+                query: Some("SELECT * {}".to_owned()),
+                file: None,
+                form: Some("values".to_owned()),
+                schema: vec![PathBuf::from("a.ttl"), PathBuf::from("b.nt")],
+            })
+        );
+        assert!(parse(&["print-query", "--file", "q.rq"]).is_ok());
+        assert!(parse(&["print-query"]).is_err());
+        assert!(parse(&["print-query", "--form", "flat", "SELECT * {}"]).is_err());
         let config = parse(&["convert", "a.ttl", "b.nt"]).expect("cli config");
         assert_eq!(
             config.command,
@@ -546,5 +627,75 @@ mod tests {
         assert!(parse_time("2026-13-02T14:05:00Z").is_err());
         assert!(parse_time("yesterday").is_err());
         assert!(parse_time("2026-10-02T14:05:00").is_err());
+    }
+
+    /// Only real calendar dates, clock times and offsets (RFC 3339 §5.6 and §5.7): an
+    /// impossible one is refused, not moved to another instant. Every row is checked; the
+    /// failures are reported together.
+    #[test]
+    fn rfc3339_times_outside_the_calendar_are_refused() {
+        use super::parse_time;
+        let mut wrong = Vec::new();
+        for text in [
+            "2026-02-31T00:00:00Z",
+            "2025-02-29T00:00:00Z",
+            "2026-04-31T12:00:00Z",
+            "2026-10-02T14:05:00+02:99",
+            "2026-10-02T14:05:00+99:00",
+            "2026-10-02T-1:05:00Z",
+            "2026-10-02T14:-5:00Z",
+            "2026-10-02T14:05:-1Z",
+            "2026-1-02T14:05:00Z",
+            "2026-10-02T14:05:00+2:00",
+        ] {
+            if let Ok(micros) = parse_time(text) {
+                wrong.push(format!("{text} read as {micros}"));
+            }
+        }
+        // Guards: the separators and zone letters RFC 3339 allows, a leap day, an offset
+        // that is the same instant.
+        for (text, micros) in [
+            ("2024-02-29T00:00:00Z", 1_709_164_800_000_000u64),
+            ("2026-10-02t14:05:00z", 1_790_949_900_000_000),
+            ("2026-10-02 14:05:00Z", 1_790_949_900_000_000),
+            ("2026-10-02T23:35:00+09:30", 1_790_949_900_000_000),
+            ("2026-10-02T14:05:00.1234567Z", 1_790_949_900_123_456),
+        ] {
+            if parse_time(text).ok() != Some(micros) {
+                wrong.push(format!("{text}: {:?}, not {micros}", parse_time(text)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
+    /// Guards: the profile `restore --until-time` takes is RFC 3339 read by the xsd:dateTime
+    /// calendar (docs/ops/server-setup.md): a leap second (`:60`) and an offset past ±14:00
+    /// are refused, ±14:00 itself taken, and `24:00:00` is the next day's midnight. Every row
+    /// is checked.
+    #[test]
+    fn rfc3339_times_follow_the_xsd_profile_at_its_boundaries() {
+        use super::parse_time;
+        let mut wrong = Vec::new();
+        for text in [
+            "2016-12-31T23:59:60Z",
+            "2026-10-02T14:05:00+14:01",
+            "2026-10-02T14:05:00-14:01",
+            "2026-10-02T14:05:00+15:00",
+            "2026-10-02T24:00:01Z",
+        ] {
+            if let Ok(micros) = parse_time(text) {
+                wrong.push(format!("{text} read as {micros}"));
+            }
+        }
+        for (text, micros) in [
+            ("2026-10-03T04:05:00+14:00", 1_790_949_900_000_000u64),
+            ("2026-10-02T00:05:00-14:00", 1_790_949_900_000_000),
+            ("2026-10-01T24:00:00Z", 1_790_899_200_000_000),
+        ] {
+            if parse_time(text).ok() != Some(micros) {
+                wrong.push(format!("{text}: {:?}, not {micros}", parse_time(text)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

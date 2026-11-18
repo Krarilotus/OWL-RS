@@ -23,6 +23,7 @@ use nrese_xsd::{
 };
 
 use super::calendar;
+use super::numeric::{Numeric, Operator};
 use super::value::{
     Value, boolean_term, canonical, compare, effective_boolean, equals, is_lang_string,
 };
@@ -130,6 +131,9 @@ pub struct Evaluator {
     aliases: std::sync::RwLock<HashMap<String, Term>>,
     /// This query run, in the blank nodes `BNODE(label)` makes.
     run: u64,
+    /// Under canonical answers, the classes the canonical-name function names terms by
+    /// ([`super::canonical`]).
+    canonical: Option<super::canonical::Names>,
 }
 
 thread_local! {
@@ -138,6 +142,11 @@ thread_local! {
 }
 
 impl Evaluator {
+    /// The query's `BASE`.
+    pub(super) fn base(&self) -> Option<&Iri<String>> {
+        self.base.as_ref()
+    }
+
     /// An evaluator for one query; `base` resolves relative IRIs of `IRI()`.
     pub fn with_base(base: Option<Iri<String>>) -> Self {
         Self {
@@ -153,6 +162,11 @@ impl Evaluator {
         let result = evaluate();
         SOLUTION.with(|s| s.set(previous));
         result
+    }
+
+    /// The classes canonical answers name terms by ([`super::canonical`]).
+    pub(crate) fn set_canonical(&mut self, names: Option<super::canonical::Names>) {
+        self.canonical = names;
     }
 
     /// Makes `alias` evaluate to `term` (a blank node put into a pattern).
@@ -200,7 +214,9 @@ impl Evaluator {
             ))
         };
         match expr {
-            Expression::NamedNode(node) if node.as_str().starts_with(super::substitute::ALIAS) => {
+            Expression::NamedNode(node)
+                if nrese_sparql_syntax::internal::is_constant(node.as_str()) =>
+            {
                 self.aliases
                     .read()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -342,9 +358,12 @@ impl Evaluator {
         match function {
             Function::SubStr => {
                 let (source, language) = string(&arg(0)?)?;
-                let position = |i: usize| -> Option<usize> {
+                // Positions must be integers (SPARQL 1.1 §17.4.3.3), zero and negative ones
+                // too; a decimal or double position is a type error and leaves the result
+                // unbound.
+                let position = |i: usize| -> Option<i128> {
                     match Value::of(&arg(i)?) {
-                        Value::Integer(v) => usize::try_from(i64::from(v)).ok(),
+                        Value::Integer(v) => Some(i128::from(i64::from(v))),
                         _ => None,
                     }
                 };
@@ -354,17 +373,21 @@ impl Evaluator {
                 } else {
                     None
                 };
-                // Character positions, 1-based (XPath fn:substring).
-                let mut chars = source.char_indices().skip(start.checked_sub(1)?).peekable();
-                let result = match chars.peek().copied() {
-                    Some((from, _)) => match length {
-                        Some(length) => match chars.nth(length) {
-                            Some((to, _)) => &source[from..to],
-                            None => &source[from..],
-                        },
-                        None => &source[from..],
-                    },
-                    None => "",
+                // The characters at 1-based positions p with start <= p < start + length
+                // (XPath fn:substring), clipped to the string.
+                let count = source.chars().count() as i128;
+                let first = start.max(1);
+                let end = length.map_or(count + 1, |length| (start + length).min(count + 1));
+                let result = match first < end {
+                    true => {
+                        let mut bytes = source.char_indices().map(|(at, _)| at);
+                        let from = bytes.nth((first - 1) as usize).unwrap_or(source.len());
+                        let to = bytes
+                            .nth((end - first - 1) as usize)
+                            .unwrap_or(source.len());
+                        &source[from..to]
+                    }
+                    false => "",
                 };
                 Some(plain(result.to_owned(), language))
             }
@@ -382,6 +405,14 @@ impl Evaluator {
                     String::new()
                 };
                 let regex = self.regex(&pattern, &flags)?;
+                // A pattern that matches the empty string is an error (FORX0003).
+                if regex.is_match("") {
+                    return None;
+                }
+                let replacement = match flags.contains('q') {
+                    true => replacement.replace('$', "$$"),
+                    false => xpath_replacement(&replacement, regex.captures_len() - 1)?,
+                };
                 let replaced = regex.replace_all(&text, replacement.as_str()).into_owned();
                 Some(plain(replaced, language))
             }
@@ -486,7 +517,14 @@ impl Evaluator {
                 let values: Option<Vec<Term>> = (0..args.len()).map(arg).collect();
                 super::geo::call(name.as_str(), &values?)
             }
-            Function::Custom(name) => cast(name.as_str(), arg(0)?),
+            // The canonical-name function is only in canonical answers' plans: no cast
+            // pays for it.
+            Function::Custom(name) => match cast(name.as_str(), arg(0)?) {
+                None if name.as_str() == super::canonical::FUNCTION => {
+                    Some(self.canonical.as_ref()?.term(arg(0)?))
+                }
+                cast => cast,
+            },
             Function::Str => match arg(0)? {
                 Term::NamedNode(node) => Some(Literal::new_simple_literal(node.as_str()).into()),
                 // The lexical form, as written (SPARQL 1.1 §17.4.2.5): STR("03"^^xsd:integer)
@@ -745,19 +783,67 @@ fn uuid() -> String {
     )
 }
 
+/// XPath's replacement string (F&O 3.1 `fn:replace`) for a pattern with `groups` capturing
+/// groups, in the `regex` crate's syntax: `\$` and `\\` are a literal `$` and `\`; `$` and
+/// the digits after it are the number N of a group: N at most `groups` (0: the whole
+/// match) that group, N above `groups` but at most 9 the empty string, else the last digit
+/// literal and the rest read again. Any other `$` or `\` is an error (FORX0004): `None`.
+fn xpath_replacement(replacement: &str, groups: usize) -> Option<String> {
+    let mut out = String::with_capacity(replacement.len() + 8);
+    let mut chars = replacement.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' => match chars.next()? {
+                '$' => out.push_str("$$"),
+                '\\' => out.push('\\'),
+                _ => return None,
+            },
+            '$' => {
+                let mut digits = String::new();
+                while let Some(&d) = chars.peek().filter(|d| d.is_ascii_digit()) {
+                    digits.push(d);
+                    chars.next();
+                }
+                if digits.is_empty() {
+                    return None;
+                }
+                // The longest number that names a group (or is at most 9); the digits
+                // after it are literal. A longer prefix is never a smaller number, so one
+                // pass finds it (a first digit always is at most 9).
+                let limit = groups.max(9);
+                let (mut number, mut take) = (0, 0);
+                for digit in digits.bytes() {
+                    let next = number * 10 + usize::from(digit - b'0');
+                    if next > limit {
+                        break;
+                    }
+                    (number, take) = (next, take + 1);
+                }
+                if number <= groups {
+                    out.push_str(&format!("${{{number}}}"));
+                }
+                out.push_str(&digits[take..]);
+            }
+            c => out.push(c),
+        }
+    }
+    Some(out)
+}
+
 /// The regular expression of SPARQL's `REGEX(_, pattern, flags)`; `None` if the pattern
 /// or a flag is invalid. Flags (XPath): i, s, m, x, and q (the pattern is a literal string).
+/// With q only i still applies; s, m and x have no effect (F&O 3.1 §5.6.1).
 pub fn compile_regex(pattern: &str, flags: &str) -> Option<Regex> {
     let mut builder_pattern = String::new();
-    let mut literal = false;
+    let literal = flags.contains('q');
     for flag in flags.chars() {
         match flag {
-            'i' | 's' | 'm' | 'x' => {
+            'i' | 's' | 'm' | 'x' if !literal || flag == 'i' => {
                 builder_pattern.push_str("(?");
                 builder_pattern.push(flag);
                 builder_pattern.push(')');
             }
-            'q' => literal = true,
+            'i' | 's' | 'm' | 'x' | 'q' => {}
             _ => return None,
         }
     }
@@ -772,82 +858,7 @@ pub fn compile_regex(pattern: &str, flags: &str) -> Option<Regex> {
         .ok()
 }
 
-#[derive(Clone, Copy)]
-enum Operator {
-    Add,
-    Subtract,
-    Multiply,
-    Divide,
-}
-
-/// A numeric value, for arithmetic with SPARQL's type promotion
-/// (integer → decimal → float → double); results print in the XSD value's string form.
-#[derive(Clone, Copy)]
-enum Numeric {
-    Integer(Integer),
-    Decimal(Decimal),
-    Float(Float),
-    Double(Double),
-}
-
-impl Numeric {
-    fn of(value: &Value) -> Option<Self> {
-        Some(match value {
-            Value::Integer(i) => Self::Integer(*i),
-            Value::Decimal(d) => Self::Decimal(*d),
-            Value::Float(f) => Self::Float(*f),
-            Value::Double(d) => Self::Double(*d),
-            _ => return None,
-        })
-    }
-
-    fn term(self) -> Term {
-        match self {
-            Self::Integer(i) => Literal::new_typed_literal(i.to_string(), xsd::INTEGER),
-            Self::Decimal(d) => Literal::new_typed_literal(d.to_string(), xsd::DECIMAL),
-            Self::Float(f) => Literal::new_typed_literal(f.to_string(), xsd::FLOAT),
-            Self::Double(d) => Literal::new_typed_literal(d.to_string(), xsd::DOUBLE),
-        }
-        .into()
-    }
-
-    fn negate(self) -> Option<Term> {
-        Some(
-            match self {
-                Self::Integer(i) => Self::Integer(i.checked_neg()?),
-                Self::Decimal(d) => Self::Decimal(d.checked_neg()?),
-                Self::Float(f) => Self::Float(-f),
-                Self::Double(d) => Self::Double(-d),
-            }
-            .term(),
-        )
-    }
-
-    fn rounding(self, function: &Function) -> Option<Term> {
-        Some(
-            match (self, function) {
-                (Self::Integer(i), Function::Abs) => Self::Integer(i.checked_abs()?),
-                (Self::Integer(i), _) => Self::Integer(i),
-                (Self::Decimal(d), Function::Abs) => Self::Decimal(d.checked_abs()?),
-                (Self::Decimal(d), Function::Ceil) => Self::Decimal(d.checked_ceil()?),
-                (Self::Decimal(d), Function::Floor) => Self::Decimal(d.checked_floor()?),
-                (Self::Decimal(d), _) => Self::Decimal(d.checked_round()?),
-                (Self::Float(f), Function::Abs) => Self::Float(f.abs()),
-                (Self::Float(f), Function::Ceil) => Self::Float(f.ceil()),
-                (Self::Float(f), Function::Floor) => Self::Float(f.floor()),
-                (Self::Float(f), _) => Self::Float(f.round()),
-                (Self::Double(d), Function::Abs) => Self::Double(d.abs()),
-                (Self::Double(d), Function::Ceil) => Self::Double(d.ceil()),
-                (Self::Double(d), Function::Floor) => Self::Double(d.floor()),
-                (Self::Double(d), _) => Self::Double(d.round()),
-            }
-            .term(),
-        )
-    }
-}
-
 fn arithmetic(operator: Operator, (x, y): (Value, Value)) -> Option<Term> {
-    use Numeric::{Decimal as D, Double as Db, Float as F, Integer as I};
     let (Some(a), Some(b)) = (Numeric::of(&x), Numeric::of(&y)) else {
         // Dates, times and durations (SEP-0002).
         return match operator {
@@ -857,60 +868,7 @@ fn arithmetic(operator: Operator, (x, y): (Value, Value)) -> Option<Term> {
             Operator::Divide => calendar::divide(&x, &y),
         };
     };
-    let decimal = |n: Numeric| match n {
-        I(i) => Some(Decimal::from(i)),
-        D(d) => Some(d),
-        _ => None,
-    };
-    let float = |n: Numeric| match n {
-        I(i) => Some(Float::from(i)),
-        D(d) => Some(Float::from(d)),
-        F(f) => Some(f),
-        Db(_) => None,
-    };
-    let double = |n: Numeric| match n {
-        I(i) => Double::from(i),
-        D(d) => Double::from(d),
-        F(f) => Double::from(f),
-        Db(d) => d,
-    };
-    let result = match (a, b) {
-        (I(x), I(y)) => match operator {
-            Operator::Add => I(x.checked_add(y)?),
-            Operator::Subtract => I(x.checked_sub(y)?),
-            Operator::Multiply => I(x.checked_mul(y)?),
-            // Integer division is decimal division in SPARQL.
-            Operator::Divide => D(Decimal::from(x).checked_div(Decimal::from(y))?),
-        },
-        (I(_) | D(_), I(_) | D(_)) => {
-            let (x, y) = (decimal(a)?, decimal(b)?);
-            D(match operator {
-                Operator::Add => x.checked_add(y)?,
-                Operator::Subtract => x.checked_sub(y)?,
-                Operator::Multiply => x.checked_mul(y)?,
-                Operator::Divide => x.checked_div(y)?,
-            })
-        }
-        (I(_) | D(_) | F(_), I(_) | D(_) | F(_)) => {
-            let (x, y) = (float(a)?, float(b)?);
-            F(match operator {
-                Operator::Add => x + y,
-                Operator::Subtract => x - y,
-                Operator::Multiply => x * y,
-                Operator::Divide => x / y,
-            })
-        }
-        _ => {
-            let (x, y) = (double(a), double(b));
-            Db(match operator {
-                Operator::Add => x + y,
-                Operator::Subtract => x - y,
-                Operator::Multiply => x * y,
-                Operator::Divide => x / y,
-            })
-        }
-    };
-    Some(result.term())
+    Some(a.arithmetic(operator, b)?.term())
 }
 
 /// `name(term)` for a cast (XPath §19): the value read from the literal, converted, in

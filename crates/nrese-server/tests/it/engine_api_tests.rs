@@ -7,10 +7,11 @@ use axum::body::Body;
 use axum::http::{Method, Request, StatusCode, header};
 use tower::util::ServiceExt;
 
-use crate::support::{body_text, test_app_with_store_config};
+use crate::support::held_service::{HANG, HeldEndpoint};
+use crate::support::{body_text, test_app_with_store, test_app_with_store_config};
 use nrese_reasoner::ReasonerConfig;
-use nrese_server::policy::PolicyConfig;
-use nrese_store::StoreConfig;
+use nrese_server::policy::{PolicyConfig, RequestTimeouts};
+use nrese_store::{StoreConfig, StoreService};
 
 async fn send(
     app: &Router,
@@ -437,6 +438,50 @@ async fn explanations_through_the_engine_api() {
     assert_eq!(steps[0]["premises"].as_array().unwrap().len(), 2);
     let (status, _) = send(&app, Method::GET, &explain("X"), None, "").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+
+    // Justifications: the two asserted statements, as one set, checked.
+    let justify = |mode: &str| format!("{}&justifications={mode}", explain("D"));
+    let (status, text) = send(&app, Method::GET, &justify("all"), None, "").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["mode"], "all");
+    assert_eq!(body["complete"], true);
+    assert_eq!(body["verified"], true);
+    let sets = body["justifications"].as_array().unwrap();
+    assert_eq!(sets.len(), 1, "{text}");
+    assert_eq!(sets[0].as_array().unwrap().len(), 2, "{text}");
+    assert!(
+        sets[0]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|s| s["origin"] == "asserted")
+    );
+    let (status, text) = send(&app, Method::GET, &justify("core"), None, "").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["statements"].as_array().unwrap().len(), 2, "{text}");
+    assert!(body.get("verified").is_none());
+    let (status, text) = send(
+        &app,
+        Method::GET,
+        &format!("{}&k=2", justify("top-k")),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let (status, _) = send(
+        &app,
+        Method::GET,
+        &format!("{}&k=0", justify("top-k")),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    let (status, _) = send(&app, Method::GET, &justify("some"), None, "").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]
@@ -474,7 +519,8 @@ async fn imports_load_documents_and_reason_over_them() {
     )
     .await;
     assert_eq!(count_of(&text), 2, "the import was reasoned over");
-    // Into a named graph; then replacing everything; a broken document with skip_errors.
+    // Into a named graph; then replacing everything; a broken document (its bad
+    // statement quarantined, by the older flag too).
     let (status, text) = send(
         &app,
         Method::POST,
@@ -505,6 +551,8 @@ async fn imports_load_documents_and_reason_over_them() {
     assert_eq!(status, StatusCode::OK, "{text}");
     let report: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(report["skipped"], 1, "{text}");
+    assert_eq!(report["quarantined"], 1, "{text}");
+    assert_eq!(report["examples"][0]["line"], 2, "{text}");
     let all = "SELECT (COUNT(*) AS ?n) WHERE { { ?s ?p ?o } UNION { GRAPH ?g { ?s ?p ?o } } FILTER(?p != <http://www.w3.org/1999/02/22-rdf-syntax-ns#type>) }";
     let (_, text) = send(
         &app,
@@ -528,13 +576,37 @@ async fn imports_load_documents_and_reason_over_them() {
         0,
         "replaced: the old statements and their inferences are gone"
     );
-    // Without skipping, a broken document is refused.
-    let (status, _) = send(
+    // By default its bad statements are quarantined; strict, a broken document is
+    // refused.
+    let (status, text) = send(
         &app,
         Method::POST,
         &format!("{base}/import"),
         Some("application/n-triples"),
         "not rdf\n",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(report["quarantined"], 1, "{text}");
+    assert!(report["load"].is_string(), "{text}");
+    for strict in ["invalid=strict", "strict=true"] {
+        let (status, _) = send(
+            &app,
+            Method::POST,
+            &format!("{base}/import?{strict}"),
+            Some("application/n-triples"),
+            "not rdf\n",
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        &format!("{base}/import?invalid=skip"),
+        Some("application/n-triples"),
+        "<http://example.com/z> <http://example.com/p> \"3\" .\n",
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -593,31 +665,34 @@ async fn graphs_are_listed_with_their_sizes() {
 }
 
 /// A query in flight is listed with its text; cancelling it stops it, and its client gets
-/// an error instead of results.
+/// the cancellation's answer (408) instead of results. SILENT doesn't change that: a call
+/// cancelled with its query is the query's cancellation, not an endpoint's failure.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn running_queries_are_listed_and_cancelled() {
-    let app = test_app_with_store_config(
-        StoreConfig::in_memory(),
-        PolicyConfig::default(),
-        ReasonerConfig::default(),
-    )
-    .unwrap();
-    let data: String = (0..300)
-        .map(|i| format!("<urn:s{i}> <urn:p> {i} . "))
-        .collect();
-    let (status, _) = send(
-        &app,
-        Method::POST,
-        "/api/v1/repositories/nrese/update",
-        Some("application/sparql-update"),
-        &format!("INSERT DATA {{ {data} }}"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::NO_CONTENT);
-    // 300³ rows, each compared: minutes, unless cancelled.
-    let slow = "SELECT (COUNT(*) AS ?n) WHERE { ?a <urn:p> ?x . ?b <urn:p> ?y . ?c <urn:p> ?z \
-                FILTER(?x + ?y != ?z * 1000) }";
-    let running = {
+    for service in ["SERVICE", "SERVICE SILENT"] {
+        cancel_held(service).await;
+    }
+}
+
+async fn cancel_held(service: &str) {
+    // A query held in a SERVICE call that never answers, under a deadline (an hour) this
+    // test never reaches: only the cancellation can stop it.
+    let endpoint = HeldEndpoint::bind().await.unwrap();
+    let store = StoreService::new(StoreConfig::in_memory()).unwrap();
+    store.set_service_client(endpoint.client().unwrap());
+    let policy = PolicyConfig {
+        timeouts: RequestTimeouts {
+            query: std::time::Duration::from_secs(3_600),
+            ..RequestTimeouts::default()
+        },
+        ..PolicyConfig::default()
+    };
+    let app = test_app_with_store(store, policy, ReasonerConfig::default()).unwrap();
+    let held = format!(
+        "SELECT * WHERE {{ {service} <{}> {{ ?s ?p ?o }} }}",
+        endpoint.url()
+    );
+    let mut running = {
         let app = app.clone();
         tokio::spawn(async move {
             send(
@@ -625,31 +700,28 @@ async fn running_queries_are_listed_and_cancelled() {
                 Method::POST,
                 "/api/v1/repositories/nrese/query",
                 Some("application/sparql-query"),
-                slow,
+                &held,
             )
             .await
         })
     };
-    let mut id = None;
-    for _ in 0..200 {
-        let (_, text) = send(
-            &app,
-            Method::GET,
-            "/api/v1/repositories/nrese/queries",
-            None,
-            "",
-        )
-        .await;
-        let list: serde_json::Value = serde_json::from_str(&text).unwrap();
-        if let Some(query) = list.as_array().unwrap().first() {
-            assert!(query["query"].as_str().unwrap().contains("COUNT(*)"));
-            assert_eq!(query["origin"], "roles: anonymous");
-            id = query["id"].as_u64();
-            break;
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    let id = id.expect("the query was listed while it ran");
+    // Registered before it is evaluated: listed once its SERVICE call has connected.
+    let call = endpoint.call(&mut running).await.unwrap();
+    let (_, text) = send(
+        &app,
+        Method::GET,
+        "/api/v1/repositories/nrese/queries",
+        None,
+        "",
+    )
+    .await;
+    let list: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let [query] = list.as_array().unwrap().as_slice() else {
+        panic!("one running query: {list}");
+    };
+    assert!(query["query"].as_str().unwrap().contains(endpoint.url()));
+    assert_eq!(query["origin"], "roles: anonymous");
+    let id = query["id"].as_u64().expect("an id");
     let (status, _) = send(
         &app,
         Method::DELETE,
@@ -659,11 +731,12 @@ async fn running_queries_are_listed_and_cancelled() {
     )
     .await;
     assert_eq!(status, StatusCode::NO_CONTENT);
-    let (status, _) = tokio::time::timeout(std::time::Duration::from_secs(30), running)
+    let (status, _) = tokio::time::timeout(HANG, running)
         .await
         .expect("the cancelled query stops")
         .unwrap();
-    assert!(!status.is_success(), "{status}");
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT, "{service}");
+    call.closed().await.unwrap();
     let (_, text) = send(
         &app,
         Method::GET,
@@ -988,4 +1061,343 @@ async fn rules_are_uploaded_checked_and_removed() {
     )
     .await;
     assert!(text.contains("false"), "the inference is gone: {text}");
+}
+
+/// The result cache through the engine API: a query pinned by name is listed with its
+/// result's size, EXPLAIN shows its answer coming from the cache, a query that can't be
+/// cached can't be pinned, and unpinning a name twice finds nothing the second time.
+#[tokio::test]
+async fn query_results_are_pinned_listed_and_unpinned() {
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory(),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let data: String = (0..50)
+        .map(|i| {
+            format!(
+                "<urn:s{i}> <urn:p> {i} . <urn:s{i}> <urn:q> <urn:s{}> . ",
+                i / 2
+            )
+        })
+        .collect();
+    let (status, _) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/update",
+        Some("application/sparql-update"),
+        &format!("INSERT DATA {{ {data} }}"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let query = "SELECT ?a ?x WHERE { ?a <urn:q> ?b . ?b <urn:p> ?x }";
+    let (status, text) = send(
+        &app,
+        Method::PUT,
+        "/api/v1/repositories/nrese/cache/pins/pairs",
+        Some("application/sparql-query"),
+        query,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let pin: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        (pin["name"].as_str(), pin["rows"].as_u64()),
+        (Some("pairs"), Some(50))
+    );
+    let (status, text) = send(
+        &app,
+        Method::GET,
+        "/api/v1/repositories/nrese/cache",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let cache: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(cache["pins"][0]["query"], query);
+    assert!(cache["pinned_bytes"].as_u64().unwrap() > 0, "{cache}");
+    // The pinned answer, from the cache.
+    let (status, text) = send(
+        &app,
+        Method::GET,
+        &format!(
+            "/api/v1/repositories/nrese/query?explain=true&query={}",
+            urlencoding(query)
+        ),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let explanation: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(explanation["steps"][0]["cache"], "hit", "{explanation}");
+    let (status, _) = send(
+        &app,
+        Method::PUT,
+        "/api/v1/repositories/nrese/cache/pins/random",
+        Some("application/sparql-query"),
+        "SELECT (RAND() AS ?r) WHERE {}",
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    for expected in [StatusCode::NO_CONTENT, StatusCode::NOT_FOUND] {
+        let (status, _) = send(
+            &app,
+            Method::DELETE,
+            "/api/v1/repositories/nrese/cache/pins/pairs",
+            None,
+            "",
+        )
+        .await;
+        assert_eq!(status, expected);
+    }
+    let (status, _) = send(
+        &app,
+        Method::DELETE,
+        "/api/v1/repositories/nrese/cache",
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+}
+
+/// A change of the default repository's reasoning that fails after publishing its
+/// inferences, and can't restore the old ones either (neither reasoning's state file can be
+/// written: its staging name `reasoning.state.tmp` taken), leaves the default repository
+/// unavailable until a restart: its requests get 503, while the repository list (which says why
+/// to operators), `/readyz` (ready) and the other repositories go on.
+#[tokio::test]
+async fn a_default_repository_left_in_no_known_state_is_unavailable_alone() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = test_app_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let json = Some("application/json");
+    let (status, text) = send(&app, Method::PUT, "/api/v1/repositories/r2", json, "{}").await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let (status, text) = send(
+        &app,
+        Method::PATCH,
+        "/api/v1/repositories/nrese",
+        json,
+        r#"{"reasoning": "rdfs"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    std::fs::create_dir(dir.path().join("reasoning.state.tmp")).unwrap();
+    let (status, text) = send(
+        &app,
+        Method::PATCH,
+        "/api/v1/repositories/nrese",
+        json,
+        r#"{"reasoning": "owl2-rl"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{text}");
+    let query = |base: &str| format!("{base}/query?query={}", urlencoding(COUNT));
+    // By its path and by its id, plain or percent-encoded (the route decodes it), in
+    // the engine API and in RDF4J's.
+    for base in [
+        "/dataset",
+        "/api/v1/repositories/nrese",
+        "/api/v1/repositories/%6Erese",
+    ] {
+        let (status, text) = send(&app, Method::GET, &query(base), None, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{base}: {text}");
+        assert!(text.contains("restart"), "{text}");
+    }
+    for rdf4j in ["/repositories/nrese", "/repositories/%6Erese"] {
+        let uri = format!("{rdf4j}?query={}", urlencoding(COUNT));
+        let (status, text) = send(&app, Method::GET, &uri, None, "").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{rdf4j}: {text}");
+    }
+    let uri = format!("/repositories/r2?query={}", urlencoding(COUNT));
+    let (status, text) = send(&app, Method::GET, &uri, None, "").await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "RDF4J's other repository serves: {text}"
+    );
+    let (status, text) = send(
+        &app,
+        Method::GET,
+        &query("/api/v1/repositories/r2"),
+        None,
+        "",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "the other repository serves: {text}"
+    );
+    let (status, text) = send(&app, Method::GET, "/readyz", None, "").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let ready: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(ready, serde_json::json!({"status": "ready"}));
+    let (status, text) = send(&app, Method::GET, "/api/v1/repositories/r2/info", None, "").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let ready: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(
+        ready["degraded"],
+        serde_json::json!(["nrese: unavailable"]),
+        "{text}"
+    );
+    let (status, text) = send(&app, Method::GET, "/api/v1/repositories", None, "").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let list: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert!(
+        list[0]["unavailable"]
+            .as_str()
+            .is_some_and(|why| why.contains("restart")),
+        "{text}"
+    );
+}
+
+/// Rounds of [`repository_patches_at_once_keep_each_other`]: without its fix, whether a
+/// round loses a change depends on how its two requests interleave.
+const PATCH_ROUNDS: usize = 20;
+
+/// Two `PATCH`es of different settings of one repository at once (C-1001, SYN-63): neither
+/// undoes the other. Specified: absent fields stay (the endpoint's contract), also against
+/// a change made meanwhile. On disk, so each change writes its settings file, as in
+/// production. Each round resets both, sends the two concurrently, and reads them back; the
+/// rounds that lost a change are reported.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repository_patches_at_once_keep_each_other() {
+    let dir = tempfile::tempdir().unwrap();
+    let app = test_app_with_store_config(
+        StoreConfig::on_disk(dir.path()),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let base = "/api/v1/repositories/r2";
+    let json = Some("application/json");
+    let (status, text) = send(
+        &app,
+        Method::PUT,
+        base,
+        json,
+        r#"{"reasoning": "disabled"}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{text}");
+    let patch = |body: String| {
+        let app = app.clone();
+        tokio::spawn(async move { send(&app, Method::PATCH, base, json, &body).await })
+    };
+    let mut lost = Vec::new();
+    for round in 0..PATCH_ROUNDS {
+        let reset = r#"{"title": null, "query_timeout_ms": null}"#.to_owned();
+        let (status, text) = patch(reset).await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let titled = patch(format!(r#"{{"title": "round {round}"}}"#));
+        let timed = patch(r#"{"query_timeout_ms": 5000}"#.to_owned());
+        let (titled, timed) = (titled.await.unwrap(), timed.await.unwrap());
+        assert_eq!(
+            (titled.0, timed.0),
+            (StatusCode::OK, StatusCode::OK),
+            "{titled:?} {timed:?}"
+        );
+        let (status, text) = send(&app, Method::GET, base, None, "").await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let view: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let settings = &view["settings"];
+        if settings["title"] != format!("round {round}") || settings["query_timeout_ms"] != 5000 {
+            lost.push(format!("round {round}: {settings}"));
+        }
+    }
+    assert!(
+        lost.is_empty(),
+        "{} of {PATCH_ROUNDS} rounds lost a change: {lost:#?}",
+        lost.len()
+    );
+}
+
+/// An import that stops changes no answer: under `owl2-ql`, an answer through the rewriting
+/// the reasoning certificate switches on stays after a cut document fails, imported at once
+/// (400) or as a job (`failed`), and the marker on disk stays. (A restart can't show the
+/// marker lost: the server reasons at its start where the certificate isn't current. The
+/// store's reopen without reasoning is in `document_end_tests`.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_import_changes_no_answer() {
+    let dir = tempfile::tempdir().unwrap();
+    let store_dir = dir.path().join("store");
+    let first = test_app_with_store_config(
+        StoreConfig::on_disk(&store_dir),
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Ql),
+    )
+    .unwrap();
+    let base = "/api/v1/repositories/nrese";
+    let prefixes = "@prefix : <http://example.com/> . \
+        @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n";
+    // `:a :p ?o` holds only through the rewriting of the existential.
+    let ontology = format!(
+        "{prefixes}:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; \
+         owl:someValuesFrom owl:Thing ] .\n:a a :A .\n"
+    );
+    let cut = format!("{prefixes}:c a :A .\n:d a :");
+    let ask = |app: Router| async move {
+        let query = "ASK { <http://example.com/a> <http://example.com/p> ?o }";
+        let (status, text) = send(
+            &app,
+            Method::POST,
+            &format!("{base}/query"),
+            Some("application/sparql-query"),
+            query,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{text}");
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        value["boolean"].as_bool().expect("a boolean")
+    };
+    let marker = || std::fs::read(store_dir.join("reasoning.state")).ok();
+    let import = format!("{base}/import");
+    let (status, text) = send(
+        &first,
+        Method::POST,
+        &import,
+        Some("text/turtle"),
+        &ontology,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(
+        ask(first.clone()).await,
+        "the rewriting answers the existential"
+    );
+    let written = marker();
+    assert!(
+        written.is_some(),
+        "the import's reasoning certified the store"
+    );
+    let mut wrong = Vec::new();
+    let (status, text) = send(&first, Method::POST, &import, Some("text/turtle"), &cut).await;
+    if status != StatusCode::BAD_REQUEST {
+        wrong.push(format!("the cut import: {status} {text}"));
+    }
+    if !ask(first.clone()).await || marker() != written {
+        wrong.push("the cut import changed the answer or the marker".to_owned());
+    }
+    let jobs = format!("{import}?async=true");
+    let (status, text) = send(&first, Method::POST, &jobs, Some("text/turtle"), &cut).await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{text}");
+    let started: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let job = finished(&first, started["path"].as_str().unwrap()).await;
+    if job["state"] != "failed" {
+        wrong.push(format!("the cut job: {job}"));
+    }
+    if !ask(first.clone()).await || marker() != written {
+        wrong.push("the cut job changed the answer or the marker".to_owned());
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

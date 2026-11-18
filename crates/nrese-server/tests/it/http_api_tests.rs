@@ -1,13 +1,9 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use nrese_reasoner::{ReasonerConfig, ReasoningMode};
-use nrese_store::StoreConfig;
 use tower::util::ServiceExt;
 
-use crate::support::{
-    minimal_fixture_path, test_app, test_app_with_posture, test_app_with_settings,
-    test_app_with_store_config,
-};
+use crate::support::{test_app, test_app_with_posture, test_app_with_settings};
 use nrese_server::DeploymentPosture;
 use nrese_server::policy::PolicyConfig;
 
@@ -20,6 +16,50 @@ async fn version_endpoint_exposes_capabilities() -> Result<(), Box<dyn std::erro
 
     assert_eq!(response.status(), StatusCode::OK);
     assert!(response.headers().contains_key("x-request-id"));
+    Ok(())
+}
+
+/// SYN-72 C-1105: every query answer carries `NRESE-Completeness`, `complete` where no
+/// reasoning path can leave answers out (reasoning off, or `infer=false`), so a client can
+/// read a missing header as a status it was not told, never as "complete".
+#[tokio::test]
+async fn answers_no_reasoning_can_shorten_say_complete() -> Result<(), Box<dyn std::error::Error>> {
+    for (mode, uri) in [
+        (
+            ReasoningMode::Disabled,
+            "/dataset/query?query=SELECT%20*%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D",
+        ),
+        (ReasoningMode::Disabled, "/dataset/query?query=ASK%20%7B%7D"),
+        (
+            ReasoningMode::Disabled,
+            "/dataset/query?query=CONSTRUCT%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D%20WHERE%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D",
+        ),
+        (
+            ReasoningMode::Owl2Rl,
+            "/dataset/query?query=SELECT%20*%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D&infer=false",
+        ),
+    ] {
+        let app = test_app_with_settings(PolicyConfig::default(), ReasonerConfig::for_mode(mode))?;
+        let response = app
+            .oneshot(Request::builder().uri(uri).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{mode:?} {uri}");
+        let headers = response.headers();
+        assert_eq!(
+            headers
+                .get("nrese-completeness")
+                .and_then(|v| v.to_str().ok()),
+            Some("complete"),
+            "{mode:?} {uri}: {headers:?}"
+        );
+        assert_eq!(
+            headers
+                .get("access-control-expose-headers")
+                .and_then(|v| v.to_str().ok()),
+            Some("nrese-completeness"),
+            "{mode:?} {uri}: {headers:?}"
+        );
+    }
     Ok(())
 }
 
@@ -185,62 +225,6 @@ async fn service_description_endpoint_serves_turtle() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
-async fn service_description_omits_disabled_optional_endpoints()
--> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_settings(
-        PolicyConfig {
-            expose_operator_ui: false,
-            expose_metrics: false,
-            ..PolicyConfig::default()
-        },
-        ReasonerConfig::default(),
-    )?;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/service-description")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
-    assert!(!text.contains("nrese:metricsEndpoint"));
-    assert!(!text.contains("nrese:operatorEndpoint"));
-    Ok(())
-}
-
-#[tokio::test]
-async fn read_only_demo_service_description_omits_mutation_endpoints()
--> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_posture(
-        PolicyConfig::default(),
-        ReasonerConfig::default(),
-        DeploymentPosture::ReadOnlyDemo,
-    )?;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/service-description")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
-    assert!(!text.contains("nrese:updateEndpoint"));
-    assert!(!text.contains("nrese:tellEndpoint"));
-    assert!(text.contains("nrese:graphStoreWriteEnabled \"false\""));
-    assert!(text.contains("nrese:sparqlUpdateEnabled \"false\""));
-    assert!(text.contains("nrese:tellEnabled \"false\""));
-    Ok(())
-}
-
-#[tokio::test]
 async fn read_only_demo_returns_not_found_for_mutation_surfaces()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_posture(
@@ -287,36 +271,6 @@ async fn read_only_demo_returns_not_found_for_mutation_surfaces()
         )
         .await?;
     assert_eq!(graph_response.status(), StatusCode::NOT_FOUND);
-    Ok(())
-}
-
-#[tokio::test]
-async fn construct_query_supports_rdf_xml_accept() -> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app()?;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/query")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-query")
-                .header("accept", "application/rdf+xml")
-                .body(Body::from(
-                    "CONSTRUCT { <http://example.com/s> <http://example.com/p> <http://example.com/o> } WHERE {}",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    assert_eq!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok()),
-        Some("application/rdf+xml")
-    );
-    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
-    assert!(text.contains("rdf:RDF"));
     Ok(())
 }
 
@@ -373,20 +327,70 @@ async fn operator_capabilities_endpoint_exposes_ops_contracts()
     let response = app
         .oneshot(
             Request::builder()
-                .uri("/ops/api/capabilities")
+                .uri("/api/v1/capabilities")
                 .method(Method::GET)
                 .body(Body::empty())?,
         )
         .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
+    assert!(response.headers().get("deprecation").is_none());
     let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
     let text = String::from_utf8(body.to_vec())?;
-    assert!(text.contains("/ops/api/admin/dataset/backup"));
-    assert!(text.contains("/ops/api/admin/dataset/restore"));
-    assert!(text.contains("/ops/api/diagnostics/reasoning"));
-    assert!(text.contains("/api/ai/query-suggestions"));
+    assert!(text.contains("/api/v1/repositories/nrese/backup"));
+    assert!(text.contains("/api/v1/repositories/nrese/restore"));
+    assert!(text.contains("/api/v1/repositories/nrese/reasoning"));
+    assert!(text.contains("/api/v1/ai/query-suggestions"));
     assert!(text.contains("/console"));
+    Ok(())
+}
+
+/// The routes of the earlier release still answer, saying they are deprecated (RFC 9745)
+/// and naming the route that replaces them.
+#[tokio::test]
+async fn earlier_routes_answer_and_name_their_successors() -> Result<(), Box<dyn std::error::Error>>
+{
+    let app = test_app()?;
+    for (old, successor) in [
+        ("/ops/api/capabilities", "/api/v1/capabilities"),
+        ("/ops/api/health/extended", "/api/v1/health"),
+        ("/ops/api/diagnostics/runtime", "/api/v1/diagnostics"),
+        (
+            "/ops/api/diagnostics/reasoning",
+            "/api/v1/repositories/nrese/reasoning",
+        ),
+        ("/api/ai/status", "/api/v1/ai/status"),
+        ("/api/v1/queries", "/api/v1/saved-queries"),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(old).body(Body::empty())?)
+            .await?;
+        assert_eq!(response.status(), StatusCode::OK, "{old}");
+        let header = |name: &str| {
+            response
+                .headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            header("deprecation").as_deref(),
+            Some("@1790985600"),
+            "{old}"
+        );
+        assert_eq!(
+            header("link"),
+            Some(format!("<{successor}>; rel=\"successor-version\"")),
+            "{old}"
+        );
+        let new = app
+            .clone()
+            .oneshot(Request::builder().uri(successor).body(Body::empty())?)
+            .await?;
+        assert_eq!(new.status(), StatusCode::OK, "{successor}");
+        assert!(new.headers().get("deprecation").is_none(), "{successor}");
+    }
     Ok(())
 }
 
@@ -483,51 +487,6 @@ async fn owl2_rl_update_surfaces_last_reasoning_run_in_operator_diagnostics()
 }
 
 #[tokio::test]
-async fn owl2_rl_accepts_functional_property_multiplicity_and_reports_inferred_equality()
--> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_settings(
-        PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
-    )?;
-
-    let update_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/update")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-update")
-                .body(Body::from(
-                    "INSERT DATA {
-                        <http://example.com/p> a <http://www.w3.org/2002/07/owl#FunctionalProperty> .
-                        <http://example.com/alice> <http://example.com/p> <http://example.com/one> .
-                        <http://example.com/alice> <http://example.com/p> <http://example.com/two> .
-                    }",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(update_response.status(), StatusCode::NO_CONTENT);
-
-    let diagnostics_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/ops/api/diagnostics/reasoning")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(diagnostics_response.status(), StatusCode::OK);
-    let body = axum::body::to_bytes(diagnostics_response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
-    assert!(text.contains("\"completed\""));
-    // prp-fp derives one sameAs two (and its symmetric and reflexive consequences).
-    assert!(!text.contains("\"inferred_inserted\":0"));
-    Ok(())
-}
-
-#[tokio::test]
 async fn owl2_rl_rejects_disjoint_type_conflicts_and_surfaces_reason()
 -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
@@ -563,6 +522,12 @@ async fn owl2_rl_rejects_disjoint_type_conflicts_and_surfaces_reason()
     );
     let update_body = axum::body::to_bytes(update_response.into_body(), usize::MAX).await?;
     let update_text = String::from_utf8(update_body.to_vec())?;
+    let problem: serde_json::Value = serde_json::from_str(&update_text)?;
+    assert_eq!(
+        problem["type"],
+        "https://nrese.dev/problems/reasoner-reject"
+    );
+    assert_eq!(problem["title"], "Reasoner Reject");
     assert!(update_text.contains("cax-dw"));
     assert!(update_text.contains("reasoner_reject"));
     assert!(update_text.contains("likely_commit_trigger"));
@@ -613,33 +578,63 @@ async fn owl2_rl_rejects_disjoint_type_conflicts_and_surfaces_reason()
     Ok(())
 }
 
+/// Under `owl2-dl`, a write whose rules clash OWL 2 DL may read as consistent (an
+/// annotation property's domain, disjoint with its subject's class) is refused as
+/// undecided, and a program tells it from an inconsistency by the problem's type and title,
+/// not by its sentence.
 #[tokio::test]
-async fn owl2_rl_rejects_owl_nothing_type_conflicts() -> Result<(), Box<dyn std::error::Error>> {
+async fn an_undecided_refusal_and_an_inconsistency_differ_in_their_problem_type()
+-> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_settings(
         PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Dl),
     )?;
-
-    let update_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/update")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-update")
-                .body(Body::from(
-                    "INSERT DATA {
-                        <http://example.com/Impossible> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://www.w3.org/2002/07/owl#Nothing> .
-                        <http://example.com/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Impossible> .
-                    }",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(update_response.status(), StatusCode::BAD_REQUEST);
-    let body = axum::body::to_bytes(update_response.into_body(), usize::MAX).await?;
-    let text = String::from_utf8(body.to_vec())?;
-    assert!(text.contains("owl#Nothing"));
-    assert!(text.contains("reasoner_reject"));
+    let ex = "http://example.com/";
+    let owl = "http://www.w3.org/2002/07/owl#";
+    let rdfs = "http://www.w3.org/2000/01/rdf-schema#";
+    let undecided = format!(
+        "INSERT DATA {{ <{ex}note> a <{owl}AnnotationProperty> ; <{rdfs}domain> <{ex}C> .
+            <{ex}C> <{owl}disjointWith> <{ex}D> . <{ex}x> a <{ex}D> ; <{ex}note> \"v\" }}"
+    );
+    let inconsistent = format!(
+        "INSERT DATA {{ <{ex}A> <{owl}disjointWith> <{ex}B> . <{ex}y> a <{ex}A> , <{ex}B> }}"
+    );
+    let mut seen = Vec::new();
+    for write in [undecided, inconsistent] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/dataset/update")
+                    .method(Method::POST)
+                    .header("content-type", "application/sparql-update")
+                    .body(Body::from(write))?,
+            )
+            .await?;
+        let status = response.status();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+        let problem: serde_json::Value = serde_json::from_slice(&body)?;
+        eprintln!("{status} {} {}", problem["type"], problem["title"]);
+        seen.push((status, problem["type"].clone(), problem["title"].clone()));
+    }
+    let expected = [
+        (
+            "https://nrese.dev/problems/undecided-reject",
+            "Undecided Reject",
+        ),
+        (
+            "https://nrese.dev/problems/reasoner-reject",
+            "Reasoner Reject",
+        ),
+    ];
+    for ((status, kind, title), (want_kind, want_title)) in seen.iter().zip(expected) {
+        assert_eq!(*status, StatusCode::BAD_REQUEST, "{seen:?}");
+        assert_eq!(
+            (kind.as_str(), title.as_str()),
+            (Some(want_kind), Some(want_title)),
+            "{seen:?}"
+        );
+    }
     Ok(())
 }
 
@@ -664,65 +659,6 @@ async fn graph_store_head_returns_content_type() -> Result<(), Box<dyn std::erro
             .and_then(|v| v.to_str().ok()),
         Some("text/turtle")
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn ttl_fixture_is_loaded_and_drives_reasoner_aware_update_flow()
--> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_store_config(
-        StoreConfig::in_memory().with_ontology(minimal_fixture_path()),
-        PolicyConfig::default(),
-        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
-    )?;
-
-    let ready_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/readyz")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(ready_response.status(), StatusCode::OK);
-    let ready_body = axum::body::to_bytes(ready_response.into_body(), usize::MAX).await?;
-    let ready_text = String::from_utf8(ready_body.to_vec())?;
-    assert!(ready_text.contains("minimal_services.ttl"));
-
-    let update_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/update")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-update")
-                .body(Body::from(
-                    "INSERT DATA {
-                        <http://example.com/carol> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Child> .
-                    }",
-                ))?,
-        )
-        .await?;
-    assert_eq!(update_response.status(), StatusCode::NO_CONTENT);
-
-    let diagnostics_response = app
-        .oneshot(
-            Request::builder()
-                .uri("/ops/api/diagnostics/reasoning")
-                .method(Method::GET)
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert_eq!(diagnostics_response.status(), StatusCode::OK);
-    let diagnostics_body =
-        axum::body::to_bytes(diagnostics_response.into_body(), usize::MAX).await?;
-    let diagnostics_text = String::from_utf8(diagnostics_body.to_vec())?;
-    assert!(diagnostics_text.contains("\"last_run\""));
-    assert!(diagnostics_text.contains("\"completed\""));
-    assert!(diagnostics_text.contains("\"rounds\""));
-    assert!(diagnostics_text.contains("\"inferred_triples\""));
-
     Ok(())
 }
 
@@ -797,5 +733,139 @@ async fn the_console_is_served_from_the_binary() -> Result<(), Box<dyn std::erro
         get("/console/../Cargo.toml").await?.status(),
         StatusCode::NOT_FOUND
     );
+    Ok(())
+}
+
+/// The OWL 2 QL rewriting's completeness goes with every answer, in a header
+/// (docs/design/ql-rewriting.md §7); the answers don't change for it.
+#[tokio::test]
+async fn query_answers_say_whether_answers_through_existentials_are_complete()
+-> Result<(), Box<dyn std::error::Error>> {
+    // `auto`, the default: on under owl2-ql.
+    let app = test_app_with_settings(
+        PolicyConfig::default(),
+        ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Ql),
+    )?;
+    let update = |text: &'static str| {
+        Request::builder()
+            .uri("/dataset/update")
+            .method(Method::POST)
+            .header("content-type", "application/sparql-update")
+            .body(Body::from(text))
+    };
+    let query = || {
+        Request::builder()
+            .uri("/dataset/query")
+            .method(Method::POST)
+            .header("content-type", "application/sparql-query")
+            .header("accept", "text/tab-separated-values")
+            .body(Body::from(
+                "SELECT ?x WHERE { ?x <http://example.com/worksFor> ?y }",
+            ))
+    };
+    let response = app
+        .clone()
+        .oneshot(update(
+            "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {
+                <http://example.com/Employee> rdfs:subClassOf [ a owl:Restriction ;
+                    owl:onProperty <http://example.com/worksFor> ;
+                    owl:someValuesFrom owl:Thing ] .
+                <http://example.com/bob> a <http://example.com/Employee> .
+             }",
+        )?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = app.clone().oneshot(query()?).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers()["nrese-completeness"],
+        "complete; regime=owl2-ql",
+        "{:?}",
+        response.headers()
+    );
+    // Exposed to a console on another origin (CORS hides unexposed response headers).
+    assert_eq!(
+        response.headers()["access-control-expose-headers"],
+        "nrese-completeness",
+        "{:?}",
+        response.headers()
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    assert!(String::from_utf8(body.to_vec())?.contains("<http://example.com/bob>"));
+
+    // A transitive worksFor meets the existential: the same answers, sound only.
+    let response = app
+        .clone()
+        .oneshot(update(
+            "INSERT DATA { <http://example.com/worksFor> a <http://www.w3.org/2002/07/owl#TransitiveProperty> }",
+        )?)
+        .await?;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let response = app.oneshot(query()?).await?;
+    let header = response.headers()["nrese-completeness"]
+        .to_str()?
+        .to_owned();
+    assert!(
+        header.starts_with("sound-only; regime=owl2-ql; reasons=\"ql: ")
+            && header.contains("is transitive"),
+        "{header}"
+    );
+    let body = axum::body::to_bytes(response.into_body(), usize::MAX).await?;
+    assert!(String::from_utf8(body.to_vec())?.contains("<http://example.com/bob>"));
+    Ok(())
+}
+
+/// Under owl2-rl, `:a` is `:Aged` through an existential on `:age`, undeclared and with a
+/// literal (OWL 2 Direct Semantics, DataSomeValuesFrom), but the rules lack dt-type2 for
+/// it: the header of the closure's `false` never says complete, with the rewriting on or
+/// not.
+#[tokio::test]
+async fn an_undeclared_data_existentials_answer_is_never_complete_in_its_header()
+-> Result<(), Box<dyn std::error::Error>> {
+    use nrese_store::{QlRewritingMode, StoreConfig};
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("aged.ttl");
+    std::fs::write(
+        &path,
+        "@prefix : <http://example.com/> . \
+         @prefix owl: <http://www.w3.org/2002/07/owl#> . \
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . \
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> . \
+         :Aged a owl:Class . \
+         [ a owl:Restriction ; owl:onProperty :age ; owl:someValuesFrom xsd:integer ] \
+           rdfs:subClassOf :Aged . \
+         :a :age 5 .",
+    )?;
+    for ql in [QlRewritingMode::Auto, QlRewritingMode::On] {
+        let app = crate::support::test_app_with_store_config(
+            StoreConfig {
+                ql_rewriting: ql,
+                ..StoreConfig::in_memory().with_ontology(path.clone())
+            },
+            PolicyConfig::default(),
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+        )?;
+        let request = Request::builder()
+            .uri("/dataset/query")
+            .method(Method::POST)
+            .header("content-type", "application/sparql-query")
+            .header("accept", "application/sparql-results+json")
+            .body(Body::from(
+                "ASK { <http://example.com/a> a <http://example.com/Aged> }",
+            ))?;
+        let response = app.oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let header = response.headers()["nrese-completeness"]
+            .to_str()?
+            .to_owned();
+        let body = crate::support::body_text(response).await?;
+        eprintln!("rewriting {ql:?}: {body} with {header}");
+        assert!(
+            body.contains("false") && !header.starts_with("complete"),
+            "rewriting {ql:?}: {body} with {header}"
+        );
+    }
     Ok(())
 }

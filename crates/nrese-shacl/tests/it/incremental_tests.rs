@@ -9,6 +9,7 @@ use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_shacl::{Selection, ValidationReport, compile, validate, validate_changes};
+use nrese_sparql::Resources;
 
 const EX: &str = "http://example.com/";
 const SHAPES_GRAPH: &str = "http://example.com/shapes";
@@ -91,7 +92,14 @@ fn keys(report: &ValidationReport) -> BTreeSet<String> {
 fn incremental_validation_equals_the_difference_of_full_validations() {
     let mut rng = Rng(fuzz(20_261_002));
     let mut checked = 0;
-    for round in 0..200 {
+    let covered = |checked: usize| checked > 20;
+    // Draw on (up to ten times as many cases) until the run covers what the assertion
+    // below asks for, so that coverage never depends on the seed (the NI fuzz test's
+    // fix, a901e34; seed 66810 of the SPARQL differential tests, 12 October 2026).
+    for round in 0..200 * 10 {
+        if round >= 200 && covered(checked) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         let shapes_graph = ex("shapes");
@@ -141,9 +149,11 @@ fn incremental_validation_equals_the_difference_of_full_validations() {
         }
         let changed: Vec<_> = tx.inserted().chain(tx.deleted()).collect();
         let after = tx.pending_snapshot();
-        let incremental = validate_changes(&before, &after, &shapes, data, &changed);
-        let full_before = keys(&validate(&before, &shapes, data));
-        let full_after = keys(&validate(&after, &shapes, data));
+        let resources = Resources::default();
+        let incremental = validate_changes(&before, &after, &shapes, data, &changed, &resources)
+            .expect("nothing stops it");
+        let full_before = keys(&validate(&before, &shapes, data, &resources).expect("validated"));
+        let full_after = keys(&validate(&after, &shapes, data, &resources).expect("validated"));
         let expected: BTreeSet<String> = full_after.difference(&full_before).cloned().collect();
         assert_eq!(
             keys(&incremental),
@@ -152,5 +162,5 @@ fn incremental_validation_equals_the_difference_of_full_validations() {
         );
         checked += usize::from(!expected.is_empty());
     }
-    assert!(checked > 20, "only {checked} rounds introduced results");
+    assert!(covered(checked), "only {checked} rounds introduced results");
 }

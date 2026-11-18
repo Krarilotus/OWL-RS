@@ -1,0 +1,1175 @@
+//! Tree witnesses and rewritings of small queries, checked by hand.
+
+use std::collections::HashMap;
+
+use super::*;
+use crate::mapping::{TermKind, Terms};
+use crate::model::Term;
+use crate::ofn::{Intern, read_functional};
+
+/// Term ids for IRIs written `:name` (in `http://e/`).
+#[derive(Default)]
+struct Table {
+    ids: HashMap<String, Term>,
+    names: Vec<String>,
+}
+
+impl Table {
+    fn id(&mut self, key: String) -> Term {
+        if let Some(&id) = self.ids.get(&key) {
+            return id;
+        }
+        let id = self.names.len() as Term;
+        self.names.push(key.clone());
+        self.ids.insert(key, id);
+        id
+    }
+}
+
+impl Terms for Table {
+    fn kind(&self, term: Term) -> TermKind {
+        match self.names[term as usize].as_bytes()[0] {
+            b'_' => TermKind::Blank,
+            b'"' => TermKind::Literal,
+            _ => TermKind::Iri,
+        }
+    }
+
+    fn lexical(&self, term: Term) -> Option<String> {
+        Some(self.names[term as usize].trim_matches('"').to_owned())
+    }
+
+    fn iri(&self, iri: &str) -> Option<Term> {
+        self.ids.get(iri).copied()
+    }
+
+    // The table keys a literal by its lexical form alone: it keeps no datatype.
+    fn datatype(&self, _: Term) -> Option<String> {
+        None
+    }
+}
+
+impl Intern for Table {
+    fn iri_id(&mut self, iri: &str) -> Term {
+        self.id(iri.to_owned())
+    }
+
+    fn literal_id(&mut self, lexical: &str, _: &str, _: Option<&str>) -> Term {
+        self.id(format!("\"{lexical}\""))
+    }
+
+    fn blank_id(&mut self, label: &str, _: u32) -> Term {
+        self.id(format!("_:{label}"))
+    }
+}
+
+/// The compiled TBox of the axioms (functional syntax, prefix `:`).
+fn tbox(axioms: &str, lists: bool) -> (Tbox, Table) {
+    let mut table = Table::default();
+    let text = format!("Prefix(:=<http://e/>)\nOntology(<http://e/o>\n{axioms}\n)");
+    let (ontology, _) = read_functional(&text, &mut table);
+    let thing = table.iri("http://www.w3.org/2002/07/owl#Thing");
+    (Tbox::compile(&ontology, Closure { lists }, thing), table)
+}
+
+/// A query: atoms `C(t)` and `p(s, o)` over variables `?a`… (existential if listed in
+/// `existential`) and constants `:c`.
+fn cq(table: &mut Table, atoms: &str, existential: &[&str]) -> (Cq, Vec<String>) {
+    let mut vars: Vec<String> = Vec::new();
+    let mut term = |table: &mut Table, text: &str| -> QTerm {
+        if let Some(name) = text.strip_prefix('?') {
+            let at = vars.iter().position(|v| v == name).unwrap_or_else(|| {
+                vars.push(name.to_owned());
+                vars.len() - 1
+            });
+            QTerm::Var(at as u32)
+        } else {
+            QTerm::Const(table.id(format!("http://e/{}", text.trim_start_matches(':'))))
+        }
+    };
+    let mut parsed = Vec::new();
+    for atom in atoms.split(',').map(str::trim) {
+        let (name, args) = atom.trim_end_matches(')').split_once('(').unwrap();
+        let args: Vec<&str> = args.split(' ').collect();
+        let predicate = table.id(format!("http://e/{name}"));
+        parsed.push(match args[..] {
+            [t] => Atom::Class(term(table, t), predicate),
+            [s, o] => Atom::Role(term(table, s), predicate, term(table, o)),
+            _ => panic!("{atom}"),
+        });
+    }
+    let existential = vars
+        .iter()
+        .map(|v| existential.contains(&v.as_str()))
+        .collect();
+    (
+        Cq {
+            atoms: parsed,
+            vars: vars.len() as u32,
+            existential,
+        },
+        vars,
+    )
+}
+
+/// The branches written back as text, sorted: `A(?x) R(?x ?_1) {B(?x) | ∃R(?x)}`.
+fn branches(rewriting: &Rewriting, table: &Table, vars: &[String]) -> Vec<String> {
+    let name = |t: Term| {
+        table.names[t as usize]
+            .trim_start_matches("http://e/")
+            .to_owned()
+    };
+    let term = |t: &QTerm| match t {
+        QTerm::Var(v) if (*v as usize) < vars.len() => format!("?{}", vars[*v as usize]),
+        QTerm::Var(_) => "_".to_owned(),
+        QTerm::Const(c) => format!(":{}", name(*c)),
+    };
+    let atom = |a: &Atom| match a {
+        Atom::Class(t, c) => format!("{}({})", name(*c), term(t)),
+        Atom::Role(s, p, o) => format!("{}({} {})", name(*p), term(s), term(o)),
+        Atom::Other(..) => "other".to_owned(),
+    };
+    let mut out: Vec<String> = rewriting
+        .branches
+        .iter()
+        .map(|b| {
+            let mut parts: Vec<String> = b
+                .parts
+                .iter()
+                .map(|p| match p {
+                    Part::Atom(a) => atom(a),
+                    Part::Top(t) => format!("⊤({})", term(t)),
+                    Part::Any(alternatives) => {
+                        let mut alternatives: Vec<String> = alternatives.iter().map(atom).collect();
+                        alternatives.sort();
+                        format!("{{{}}}", alternatives.join(" | "))
+                    }
+                })
+                .collect();
+            parts.sort();
+            for (v, t) in &b.merged {
+                parts.push(format!("?{}={}", vars[*v as usize], term(t)));
+            }
+            parts.join(" ")
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn rewritten(axioms: &str, atoms: &str, existential: &[&str]) -> Vec<String> {
+    let (tbox, mut table) = tbox(axioms, true);
+    let (cq, vars) = cq(&mut table, atoms, existential);
+    match rewrite(&tbox, &cq, &Limits::default()) {
+        Outcome::Rewritten(r) => branches(&r, &table, &vars),
+        Outcome::Unchanged => vec!["unchanged".to_owned()],
+        Outcome::Exceeded(what) => vec![format!("exceeded {what}")],
+    }
+}
+
+#[test]
+fn an_unprojected_object_is_a_tree_witness() {
+    let axioms = "SubClassOf(:Employee ObjectSomeValuesFrom(:worksFor owl:Thing))";
+    assert_eq!(
+        rewritten(axioms, "worksFor(?x ?y)", &["y"]),
+        ["worksFor(?x ?y)", "{Employee(?x)}"]
+    );
+    // A projected one isn't.
+    assert_eq!(rewritten(axioms, "worksFor(?x ?y)", &[]), ["unchanged"]);
+}
+
+#[test]
+fn ontops_example_gives_its_four_queries() {
+    // Rodríguez-Muro, Kontchakov and Zakharyaschev, ISWC 2013, §2.1.
+    let axioms = "SubClassOf(:RA ObjectSomeValuesFrom(:worksOn :Project))
+        SubClassOf(:Project ObjectSomeValuesFrom(:isManagedBy :Prof))
+        SubObjectPropertyOf(ObjectInverseOf(:worksOn) :involves)
+        SubObjectPropertyOf(:isManagedBy :involves)";
+    assert_eq!(
+        rewritten(
+            axioms,
+            "worksOn(?x ?y), involves(?y ?z), Prof(?z)",
+            &["y", "z"]
+        ),
+        [
+            "Prof(?x) {RA(?x)} ?z=?x",
+            "Prof(?z) involves(?y ?z) worksOn(?x ?y)",
+            "worksOn(?x ?y) {Project(?y)}",
+            "{RA(?x)}",
+        ]
+    );
+}
+
+#[test]
+fn trees_are_followed_below_the_first_anonymous_element() {
+    let axioms = "SubClassOf(:A ObjectSomeValuesFrom(:R :B))
+        SubClassOf(:B ObjectSomeValuesFrom(:S :C))";
+    let out = rewritten(axioms, "R(?x ?y), S(?y ?z), C(?z)", &["y", "z"]);
+    assert!(out.contains(&"{A(?x)}".to_owned()), "{out:?}");
+    assert!(out.contains(&"R(?x ?y) {B(?y)}".to_owned()), "{out:?}");
+    // Without roots: any tree that reaches an `S`-successor in `C`, or a named `B`.
+    let out = rewritten(axioms, "S(?y ?z), C(?z)", &["y", "z"]);
+    assert!(out.contains(&"{A(_)}".to_owned()), "{out:?}");
+    assert!(out.contains(&"{B(?y)}".to_owned()), "{out:?}");
+}
+
+#[test]
+fn inverses_and_role_hierarchies_reach_the_anonymous_part() {
+    let axioms = "SubClassOf(:A ObjectSomeValuesFrom(:R owl:Thing))
+        InverseObjectProperties(:R :S)
+        SubObjectPropertyOf(:S :T)";
+    assert_eq!(
+        rewritten(axioms, "T(?y ?x)", &["y"]),
+        ["T(?y ?x)", "{A(?x)}"]
+    );
+    // The wrong direction has no witness.
+    assert_eq!(rewritten(axioms, "T(?x ?y)", &["y"]), ["unchanged"]);
+}
+
+#[test]
+fn roots_of_one_witness_are_one_individual() {
+    let axioms = "SubClassOf(:A ObjectSomeValuesFrom(:R owl:Thing))";
+    assert_eq!(
+        rewritten(axioms, "R(?x ?y), R(?w ?y)", &["y"]),
+        ["R(?w ?y) R(?x ?y)", "{A(?x)} ?w=?x"]
+    );
+    // Two constants can't be one individual.
+    assert_eq!(
+        rewritten(axioms, "R(:a ?y), R(:b ?y)", &["y"]),
+        ["unchanged"]
+    );
+}
+
+#[test]
+fn memberships_only_an_existential_gives_are_alternatives() {
+    let axioms = "SubClassOf(:Employee ObjectSomeValuesFrom(:worksFor :Organisation))
+        ObjectPropertyDomain(:worksFor :Person)
+        SubClassOf(:Manager :Employee)";
+    // `Manager` is an `Employee` in the closure already.
+    assert_eq!(
+        rewritten(axioms, "Person(?x)", &[]),
+        ["{Employee(?x) | Person(?x)}"]
+    );
+    // Applied by the materialisation: nothing to add.
+    assert_eq!(rewritten(axioms, "Employee(?x)", &[]), ["unchanged"]);
+    // The filler's class holds of the anonymous employer.
+    assert_eq!(
+        rewritten(axioms, "worksFor(?x ?y), Organisation(?y)", &["y"]),
+        ["Organisation(?y) worksFor(?x ?y)", "{Employee(?x)}"]
+    );
+}
+
+#[test]
+fn intersections_on_the_right_are_alternatives_only_without_the_list_rules() {
+    let axioms = "SubClassOf(:A ObjectIntersectionOf(:B :C))";
+    let (rl, mut table) = tbox(axioms, true);
+    let (query, _) = cq(&mut table, "B(?x)", &[]);
+    assert_eq!(rewrite(&rl, &query, &Limits::default()), Outcome::Unchanged);
+    let (ql, mut table) = tbox(axioms, false);
+    let (query, vars) = cq(&mut table, "B(?x)", &[]);
+    let Outcome::Rewritten(r) = rewrite(&ql, &query, &Limits::default()) else {
+        panic!("not rewritten");
+    };
+    assert_eq!(branches(&r, &table, &vars), ["{A(?x) | B(?x)}"]);
+}
+
+#[test]
+fn nested_fillers_and_data_values_generate() {
+    let axioms = "SubClassOf(:A ObjectSomeValuesFrom(:R ObjectIntersectionOf(:B ObjectSomeValuesFrom(:S :C))))
+        Declaration(DataProperty(:age))
+        SubClassOf(:P DataSomeValuesFrom(:age xsd:integer))";
+    let out = rewritten(axioms, "R(?x ?y), B(?y), S(?y ?z), C(?z)", &["y", "z"]);
+    assert!(out.contains(&"{A(?x)}".to_owned()), "{out:?}");
+    assert_eq!(
+        rewritten(axioms, "age(?x ?v)", &["v"]),
+        ["age(?x ?v)", "{P(?x)}"]
+    );
+    // A data value has no class and no successor.
+    assert_eq!(
+        rewritten(axioms, "age(?x ?v), B(?v)", &["v"]),
+        ["unchanged"]
+    );
+}
+
+#[test]
+fn reflexive_properties_hold_of_anonymous_elements() {
+    let axioms = "SubClassOf(:A ObjectSomeValuesFrom(:R :B))
+        ReflexiveObjectProperty(:knows)";
+    let out = rewritten(axioms, "R(?x ?y), knows(?y ?y), B(?y)", &["y"]);
+    assert!(out.contains(&"{A(?x)}".to_owned()), "{out:?}");
+}
+
+#[test]
+fn without_generating_axioms_nothing_changes() {
+    let axioms = "SubClassOf(:A :B)
+        ObjectPropertyDomain(:R :A)
+        SubObjectPropertyOf(:R :S)";
+    let (tbox, mut table) = tbox(axioms, false);
+    assert!(tbox.is_empty());
+    let (query, _) = cq(&mut table, "S(?x ?y), B(?x)", &["y"]);
+    assert_eq!(
+        rewrite(&tbox, &query, &Limits::default()),
+        Outcome::Unchanged
+    );
+}
+
+#[test]
+fn rewritings_stop_at_their_bounds() {
+    let axioms = "SubClassOf(:A ObjectSomeValuesFrom(:R :A))";
+    let chain: Vec<String> = (0..20).map(|i| format!("R(?v{i} ?v{})", i + 1)).collect();
+    let existential: Vec<String> = (1..=20).map(|i| format!("v{i}")).collect();
+    let existential: Vec<&str> = existential.iter().map(String::as_str).collect();
+    assert_eq!(
+        rewritten(axioms, &chain.join(", "), &existential),
+        ["exceeded existential variables"]
+    );
+    // A chain of eight below an individual: witnesses for every suffix.
+    let (tbox, mut table) = tbox(axioms, true);
+    let chain: Vec<String> = (0..8).map(|i| format!("R(?v{i} ?v{})", i + 1)).collect();
+    let existential: Vec<String> = (1..=8).map(|i| format!("v{i}")).collect();
+    let existential: Vec<&str> = existential.iter().map(String::as_str).collect();
+    let (query, _) = cq(&mut table, &chain.join(", "), &existential);
+    let Outcome::Rewritten(r) = rewrite(&tbox, &query, &Limits::default()) else {
+        panic!("not rewritten");
+    };
+    assert_eq!(r.witnesses, 8);
+    assert_eq!(r.branches.len(), 9);
+    let tight = Limits {
+        branches: 4,
+        ..Limits::default()
+    };
+    assert_eq!(
+        rewrite(&tbox, &query, &tight),
+        Outcome::Exceeded("branches")
+    );
+}
+
+#[test]
+fn witnesses_the_query_implies_are_dropped() {
+    let axioms = "SubClassOf(:Wellbore ObjectSomeValuesFrom(:drilledBy owl:Thing))
+        SubClassOf(:Wellbore ObjectSomeValuesFrom(:permit owl:Thing))
+        SubClassOf(:Exploration :Wellbore)";
+    // The root is stated to be a class that generates both arms: the class atom alone.
+    assert_eq!(
+        rewritten(
+            axioms,
+            "Exploration(?w), drilledBy(?w ?a), permit(?w ?b)",
+            &["a", "b"]
+        ),
+        ["Exploration(?w)"]
+    );
+    // Not stated: four branches, the arms folded one by one.
+    assert_eq!(
+        rewritten(axioms, "drilledBy(?w ?a), permit(?w ?b)", &["a", "b"]).len(),
+        4
+    );
+    // A projected arm stays.
+    assert_eq!(
+        rewritten(
+            axioms,
+            "Wellbore(?w), drilledBy(?w ?a), permit(?w ?b)",
+            &["b"]
+        ),
+        ["Wellbore(?w) drilledBy(?w ?a)"]
+    );
+}
+
+/// The hazards a query's atoms reach, as `term: hazard` with local names.
+fn concerns(axioms: &str, atoms: &str) -> Vec<String> {
+    concerns_over(axioms, atoms, true)
+}
+
+/// [`concerns`] over QL's closure (`lists` false) or RL's.
+fn concerns_over(axioms: &str, atoms: &str, lists: bool) -> Vec<String> {
+    let (tbox, mut table) = tbox(axioms, lists);
+    let (query, _) = cq(&mut table, atoms, &[]);
+    let name = |t: Term| {
+        table.names[t as usize]
+            .trim_start_matches("http://e/")
+            .to_owned()
+    };
+    tbox.concerns(&query)
+        .into_iter()
+        .map(|(t, h)| format!("{}: {}", name(t), h.describe(&name)))
+        .collect()
+}
+
+#[test]
+fn axioms_beyond_ql_that_meet_anonymous_individuals_are_hazards() {
+    let ql = "SubClassOf(:A ObjectSomeValuesFrom(:R :B))
+        SubObjectPropertyOf(:R :S)";
+    // Pure QL: nothing.
+    assert!(concerns(ql, "S(?x ?y), B(?y), A(?x)").is_empty());
+    // A transitive super-role: its atoms, the role's and the filler's.
+    let transitive = format!("{ql}\nTransitiveObjectProperty(:S)");
+    assert_eq!(
+        concerns(&transitive, "S(?x ?y), B(?y), C(?x)"),
+        ["S: S is transitive", "B: S is transitive"]
+    );
+    // A transitive property no existential reaches: nothing.
+    let apart = format!("{ql}\nTransitiveObjectProperty(:T)");
+    assert!(concerns(&apart, "S(?x ?y), T(?x ?y)").is_empty());
+    // A chain through the role, and what the chain's result implies.
+    let chain = format!(
+        "{ql}\nSubObjectPropertyOf(ObjectPropertyChain(:R :Q) :P)\nObjectPropertyDomain(:P :D)"
+    );
+    let found = concerns(&chain, "P(?x ?y), D(?x), A(?x)");
+    assert!(found.iter().any(|c| c.starts_with("P: ")), "{found:?}");
+    assert!(found.iter().any(|c| c.starts_with("D: ")), "{found:?}");
+    // A functional role can make an anonymous individual a named one: every term.
+    let functional = format!("{ql}\nFunctionalObjectProperty(:R)");
+    assert_eq!(
+        concerns(&functional, "E(?x)"),
+        ["E: R is functional or inverse functional"]
+    );
+    // An RL axiom on the left classifies anonymous individuals: its conclusion.
+    let left = format!("{ql}\nSubClassOf(ObjectSomeValuesFrom(:R :B) :D)");
+    assert_eq!(
+        concerns(&left, "D(?x)"),
+        ["D: a qualified someValuesFrom on R on the left of an axiom"]
+    );
+}
+
+/// Existentials in a conclusion the TBox doesn't read make anonymous individuals no
+/// generator types (I24b). Each row gives the entailment that names the terms, from the
+/// OWL 2 Direct Semantics. A row expecting nothing has no anonymous individual to meet.
+/// - `C ⊑ ∀R.∃S.A`: an `R`-successor of a `C` has an `S`-successor in `A`. The same holds
+///   through an inverse, nested under `∀T`, and for `∃S.⊤` (`S` only).
+/// - `C ⊑ ∃R.A ⊔ ∃R.B`: a `C` has an `R`-successor.
+/// - `C ⊑ ¬∀R.¬A`, which is `∃R.A`.
+/// - An individual asserted to be in `∀R.∃S.A`, with an `R`-successor: that successor has
+///   an `S`-successor in `A`. OWL 2 QL asserts named classes only (Profiles §3.2.5) and RL's
+///   rules don't apply this one, so the hazard is the assertion's, on every term.
+/// - A left side the TBox doesn't read, or reads in part: `A ⊓ B ⊑ ∃S.A`
+///   gives an `A ⊓ B` an `S`-successor in `A`. The same holds for `A ⊓ B ⊑ ∀R.∃S.A`, and
+///   for the unread branch of `A ⊔ (B ⊓ E) ⊑ ∃S.A`.
+/// - `DisjointUnion(C, ∃R.A, ∃R.B)` (F2): a `C` has an `R`-successor (the direction from
+///   `C` to the union).
+/// - Nothing: `∀R.⊤`, `∀R.⊥`, `≤ 0 R`, `∀` over a data property, and an unread left side
+///   whose conclusion is a class (`A ⊓ B ⊑ C`).
+#[test]
+fn existentials_in_right_sides_the_tbox_reads_as_nothing_are_hazards() {
+    let untyped = |r: &str, ts: &[&str]| -> Vec<String> {
+        ts.iter()
+            .map(|t| format!("{t}: an existential on {r} in a conclusion the TBox doesn't read"))
+            .collect()
+    };
+    let asserted = |i: &str, ts: &[&str]| -> Vec<String> {
+        ts.iter()
+            .map(|t| {
+                format!("{t}: an axiom on {i} outside the profile whose rules the closure applies")
+            })
+            .collect()
+    };
+    let some = "ObjectSomeValuesFrom(:S :A)";
+    let rows: Vec<(String, &str, Vec<String>)> = vec![
+        (
+            format!("SubClassOf(:C ObjectAllValuesFrom(:R {some}))"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            format!("SubClassOf(:C ObjectAllValuesFrom(ObjectInverseOf(:R) {some}))"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            format!("SubClassOf(:C ObjectAllValuesFrom(:R ObjectAllValuesFrom(:T {some})))"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            "SubClassOf(:C ObjectAllValuesFrom(:R ObjectSomeValuesFrom(:S owl:Thing)))".into(),
+            "S(?x ?y)",
+            untyped("S", &["S"]),
+        ),
+        (
+            "SubClassOf(:C ObjectUnionOf(ObjectSomeValuesFrom(:R :A) ObjectSomeValuesFrom(:R :B)))"
+                .into(),
+            "R(?x ?y)",
+            untyped("R", &["R"]),
+        ),
+        (
+            "SubClassOf(:C ObjectComplementOf(ObjectAllValuesFrom(:R ObjectComplementOf(:A))))"
+                .into(),
+            "R(?x ?y), A(?y)",
+            untyped("R", &["R", "A"]),
+        ),
+        (
+            format!("ClassAssertion(ObjectAllValuesFrom(:R {some}) :c)\nObjectPropertyAssertion(:R :c :x)"),
+            "S(?x ?y), A(?y)",
+            asserted("R", &["S", "A"]),
+        ),
+        (
+            format!("SubClassOf(ObjectIntersectionOf(:A :B) {some})"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            format!("SubClassOf(ObjectIntersectionOf(:A :B) ObjectAllValuesFrom(:R {some}))"),
+            "S(?x ?y), A(?y)",
+            untyped("S", &["S", "A"]),
+        ),
+        (
+            "SubClassOf(ObjectUnionOf(:A ObjectIntersectionOf(:B :E)) ObjectSomeValuesFrom(:S :D))"
+                .into(),
+            "S(?x ?y), D(?y)",
+            untyped("S", &["S", "D"]),
+        ),
+        (
+            "DisjointUnion(:C ObjectSomeValuesFrom(:R :A) ObjectSomeValuesFrom(:R :B))".into(),
+            "R(?x ?y)",
+            untyped("R", &["R"]),
+        ),
+        (
+            "SubClassOf(ObjectIntersectionOf(:A :B) :C)".into(),
+            "C(?x), A(?x)",
+            Vec::new(),
+        ),
+        (
+            "SubClassOf(:C ObjectAllValuesFrom(:R owl:Thing))".into(),
+            "R(?x ?y), C(?x)",
+            Vec::new(),
+        ),
+        (
+            "SubClassOf(:C ObjectAllValuesFrom(:R owl:Nothing))".into(),
+            "R(?x ?y), C(?x)",
+            Vec::new(),
+        ),
+        (
+            "SubClassOf(:C ObjectMaxCardinality(0 :R))".into(),
+            "R(?x ?y), C(?x)",
+            Vec::new(),
+        ),
+        (
+            "Declaration(DataProperty(:d))\nSubClassOf(:C DataAllValuesFrom(:d <http://www.w3.org/2001/XMLSchema#integer>))"
+                .into(),
+            "d(?x ?y), C(?x)",
+            Vec::new(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (axioms, atoms, expected) in rows {
+        let found = concerns(&axioms, atoms);
+        if found != expected {
+            wrong.push(format!(
+                "{axioms}\n  {atoms}: {found:?}, expected {expected:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Disjointness concludes a part's complement, read in negation normal
+/// form. An `A` disjoint from `≤ 0 S.D` is in `≥ 1 S.D`; one disjoint from `∀S.¬D` is in
+/// `∃S.D`. Either way it has an `S`-successor in `D` (OWL 2 Direct Semantics), so every
+/// atom of `S(?x ?y), D(?y)` has a concern. The reason may be any hazard that reaches it.
+/// Guards, with no anonymous individual: `≤ 0 S.D` and `∀S.¬D` as a plain conclusion, and
+/// named disjoint classes.
+#[test]
+fn disjointness_concludes_the_complement_of_its_parts() {
+    let none = "ObjectMaxCardinality(0 :S :D)";
+    let all_not = "ObjectAllValuesFrom(:S ObjectComplementOf(:D))";
+    let mut wrong = Vec::new();
+    for axioms in [
+        format!("DisjointUnion(:C :A {none})"),
+        format!("DisjointUnion(:C :A {all_not})"),
+        format!("DisjointClasses(:A {none})"),
+        format!("DisjointClasses({all_not} :A)"),
+    ] {
+        let found = concerns(&axioms, "S(?x ?y), D(?y)");
+        if found.len() != 2 {
+            wrong.push(format!(
+                "{axioms}: {found:?}, expected a concern on S and on D"
+            ));
+        }
+    }
+    for axioms in [
+        format!("SubClassOf(:C {none})"),
+        format!("SubClassOf(:C {all_not})"),
+        "DisjointClasses(:A :B)".to_owned(),
+    ] {
+        let found = concerns(&axioms, "S(?x ?y), D(?y), A(?x)");
+        if !found.is_empty() {
+            wrong.push(format!("{axioms}: {found:?}, expected nothing"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// An axiom outside the profile concludes the complement of its left side too: `L ⊑ R` is
+/// `¬R ⊑ ¬L` (D16-492, seed 700169's case 53). Each row below concludes, of some
+/// individual, an `S`-successor in `D` (OWL 2 Direct Semantics §2.2.3):
+/// - `≥ 1 S.(≤ 0 S.D) ⊑ ⊥` is `⊤ ⊑ ∀S.∃S.D`, so with `a S a` the individual `a` has an
+///   anonymous `S`-successor in `D`.
+/// - `¬∃S.D ⊑ C`, `≤ 0 S.D ⊑ C` and `∀S.¬D ⊑ C` each put everything outside `C` in `∃S.D`.
+/// - `C ≡ ≤ 0 S.D`, in its direction from the restriction to `C`.
+///
+/// So under QL's closure and RL's, both atoms have a concern. Guards: `∃S.D ⊑ ⊥` concludes
+/// nothing of `S` or `D`, and `A ⊓ B ⊑ C` nothing of `A` or `B` (each guard
+/// queries the terms of its own left side): no concern.
+#[test]
+fn a_left_side_outside_the_profile_concludes_its_complement() {
+    let none = "ObjectMaxCardinality(0 :S :D)";
+    let mut wrong = Vec::new();
+    for lists in [false, true] {
+        for axioms in [
+            format!("SubClassOf(ObjectMinCardinality(1 :S {none}) owl:Nothing)"),
+            "SubClassOf(ObjectComplementOf(ObjectSomeValuesFrom(:S :D)) :C)".to_owned(),
+            format!("SubClassOf({none} :C)"),
+            "SubClassOf(ObjectAllValuesFrom(:S ObjectComplementOf(:D)) :C)".to_owned(),
+            format!("EquivalentClasses(:C {none})"),
+        ] {
+            let found = concerns_over(&axioms, "S(?x ?y), D(?y)", lists);
+            let on = |t: &str| found.iter().any(|c| c.starts_with(t));
+            if !(on("S: ") && on("D: ")) {
+                wrong.push(format!(
+                    "{axioms} (lists {lists}): {found:?}, expected S and D"
+                ));
+            }
+        }
+        for (axioms, atoms) in [
+            (
+                "SubClassOf(ObjectSomeValuesFrom(:S :D) owl:Nothing)",
+                "S(?x ?y), D(?y)",
+            ),
+            ("SubClassOf(ObjectIntersectionOf(:A :B) :C)", "A(?x), B(?x)"),
+        ] {
+            let found = concerns_over(axioms, atoms, lists);
+            if !found.is_empty() {
+                wrong.push(format!(
+                    "{axioms} (lists {lists}): {found:?}, expected nothing"
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// An axiom outside the profile whose left side, negated, makes individuals equal is a
+/// global hazard, as one whose right side does:
+/// - `≥ 2 R ⊑ ⊥` is `⊤ ⊑ ≤ 1 R`: `R` is functional, so `a R b` and `a R c` make `b = c`.
+/// - `¬{b} ⊑ ⊥` is `⊤ ⊑ {b}`: every individual is `b`.
+///
+/// Neither names a term its conclusion adds a positive fact on, so only equality reaches
+/// the answers it changes. Under QL's closure and RL's, both are global. Guard: `∀R.D ⊑ C`
+/// is `⊤ ⊑ ∃R.¬D ⊔ C`, which equates nobody.
+#[test]
+fn an_equating_left_side_outside_the_profile_is_global() {
+    let mut wrong = Vec::new();
+    for lists in [false, true] {
+        for axioms in [
+            "SubClassOf(ObjectMinCardinality(2 :R) owl:Nothing)",
+            "SubClassOf(ObjectComplementOf(ObjectOneOf(:b)) owl:Nothing)",
+        ] {
+            let (tbox, _) = tbox(axioms, lists);
+            if tbox.global_hazard().is_none() {
+                wrong.push(format!("{axioms} (lists {lists}): no global hazard"));
+            }
+        }
+        let guard = "SubClassOf(ObjectAllValuesFrom(:R :D) :C)";
+        if let Some(h) = tbox(guard, lists).0.global_hazard() {
+            wrong.push(format!("{guard} (lists {lists}): global {h:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// What an uncovered axiom's conclusions miss reaches an axiom through every term it reads,
+/// its right side's too. Under RL's closure, a reflexive `R`
+/// (outside RL) may miss `R(a, a)`:
+/// - With `A ⊑ ∀R.B`, an `A` is then missed in `B`; with `S`'s range `∀R.B`, so is an
+///   `S`-successor. Both axioms are RL, so only the missed `R` edges reach `B`.
+/// - With `D ⊑ ¬¬B` (outside RL) and `A ⊑ ≤ 1 R.B`, a `D` may be missed in `B`, and with
+///   it the equality of an `A`'s two `R`-successors in `D`: global.
+#[test]
+fn a_missed_conclusion_reaches_an_axiom_through_its_right_side() {
+    let reflexive = "ReflexiveObjectProperty(:R)";
+    let mut wrong = Vec::new();
+    for axioms in [
+        format!("{reflexive} SubClassOf(:A ObjectAllValuesFrom(:R :B))"),
+        format!("{reflexive} ObjectPropertyRange(:S ObjectAllValuesFrom(:R :B))"),
+    ] {
+        let found = concerns_over(&axioms, "B(?x)", true);
+        if !found.iter().any(|c| c.starts_with("B: ")) {
+            wrong.push(format!("{axioms}: {found:?}, expected a concern on B"));
+        }
+    }
+    let equality = "SubClassOf(:D ObjectComplementOf(ObjectComplementOf(:B))) \
+                    SubClassOf(:A ObjectMaxCardinality(1 :R :B))";
+    if tbox(equality, true).0.global_hazard().is_none() {
+        wrong.push(format!("{equality}: no global hazard"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// What anonymous individuals may miss reaches an axiom through every term it reads, its
+/// right side's too. With `A ⊑ ∃R.C` and `A ⊑ ∀R.B`, an `A`'s
+/// anonymous `R`-successor is a `B`. The rewriting types it `C` only, and under RL's
+/// closure the universal is RL, so only the successor's `R` reaches `B`. Under QL's the
+/// universal is outside the profile and reaches `B` itself. The same holds for `S`'s domain
+/// `∀R.B` with `A ⊑ ∃R.C`: an `A` with an `S` edge has an anonymous `R`-successor in `B`.
+/// A concern on `B` either way.
+#[test]
+fn an_anonymous_individual_reaches_an_axiom_through_its_right_side() {
+    let mut wrong = Vec::new();
+    for axioms in [
+        "SubClassOf(:A ObjectSomeValuesFrom(:R :C)) SubClassOf(:A ObjectAllValuesFrom(:R :B))",
+        "SubClassOf(:A ObjectSomeValuesFrom(:R :C)) \
+         ObjectPropertyDomain(:S ObjectAllValuesFrom(:R :B))",
+    ] {
+        for lists in [false, true] {
+            let found = concerns_over(axioms, "B(?x)", lists);
+            if !found.iter().any(|c| c.starts_with("B: ")) {
+                wrong.push(format!("{axioms} (lists {lists}): {found:?}, expected B"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A bounded restriction makes no successor itself, but it can force an existential on a
+/// successor that exists. With `X = ∃S.D`, each conclusion below gives
+/// an `R`-successor of a `C` an `S`-successor in `D`, or may for some successor (OWL 2
+/// Direct Semantics §2.2.3): `≤ 0 R.¬X`, `¬≥ 1 R.¬X` and `= 0 R.¬X` are `∀R.X`; `≤ 1 R.¬X`,
+/// `¬≥ 2 R.¬X` and `= 1 R.¬X` put every `R`-successor past the first in `X`; `≤ 0 R.∀S.¬D`
+/// is `∀R.X` too. The same holds under `∀T` and nested twice, through an inverse, in a
+/// disjointness, in an asserted membership, and for a data existential (`∃d.integer`).
+/// (`∀R.X` alone is a row of the test above.) So every atom of the
+/// existential has a concern; the reason may be any hazard that reaches it.
+/// Guards, with no existential inside: `≤ 1 R.D`, `= 0 R.D`, `¬≥ 1 R.D` and `∀R.∀S.¬D`
+/// conclude nothing of a successor's successors, and nothing of `C`'s: nothing.
+#[test]
+fn existentials_under_bounded_restrictions_are_hazards() {
+    let x = "ObjectSomeValuesFrom(:S :D)";
+    let not_x = format!("ObjectComplementOf({x})");
+    let atoms = "S(?x ?y), D(?y)";
+    let rows: Vec<(String, &str, &[&str])> = vec![
+        (format!("SubClassOf(:C ObjectMaxCardinality(0 :R {not_x}))"), atoms, &["S", "D"]),
+        (format!("SubClassOf(:C ObjectMaxCardinality(1 :R {not_x}))"), atoms, &["S", "D"]),
+        (format!("SubClassOf(:C ObjectExactCardinality(0 :R {not_x}))"), atoms, &["S", "D"]),
+        (format!("SubClassOf(:C ObjectExactCardinality(1 :R {not_x}))"), atoms, &["S", "D"]),
+        (
+            format!("SubClassOf(:C ObjectComplementOf(ObjectMinCardinality(1 :R {not_x})))"),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            format!("SubClassOf(:C ObjectComplementOf(ObjectMinCardinality(2 :R {not_x})))"),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            "SubClassOf(:C ObjectMaxCardinality(0 :R ObjectAllValuesFrom(:S ObjectComplementOf(:D))))"
+                .into(),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            format!("SubClassOf(:C ObjectAllValuesFrom(:T ObjectMaxCardinality(0 :R {not_x})))"),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            format!(
+                "SubClassOf(:C ObjectComplementOf(ObjectMinCardinality(1 :T ObjectComplementOf(ObjectExactCardinality(0 :R {not_x})))))"
+            ),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            format!("SubClassOf(:C ObjectMaxCardinality(0 ObjectInverseOf(:R) {not_x}))"),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            format!("DisjointClasses(:A ObjectMinCardinality(1 :R {not_x}))"),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            format!(
+                "ClassAssertion(ObjectMaxCardinality(0 :R {not_x}) :c)\nObjectPropertyAssertion(:R :c :x)"
+            ),
+            atoms,
+            &["S", "D"],
+        ),
+        (
+            "Declaration(DataProperty(:d))\nSubClassOf(:C ObjectMaxCardinality(0 :R ObjectComplementOf(DataSomeValuesFrom(:d <http://www.w3.org/2001/XMLSchema#integer>))))"
+                .into(),
+            "d(?x ?y)",
+            &["d"],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (axioms, atoms, terms) in rows {
+        let found = concerns(&axioms, atoms);
+        for t in terms {
+            if !found.iter().any(|c| c.starts_with(&format!("{t}: "))) {
+                wrong.push(format!(
+                    "{axioms}\n  {atoms}: {found:?}, expected a concern on {t}"
+                ));
+            }
+        }
+    }
+    for axioms in [
+        "SubClassOf(:C ObjectMaxCardinality(1 :R :D))",
+        "SubClassOf(:C ObjectExactCardinality(0 :R :D))",
+        "SubClassOf(:C ObjectComplementOf(ObjectMinCardinality(1 :R :D)))",
+        "SubClassOf(:C ObjectAllValuesFrom(:R ObjectAllValuesFrom(:S ObjectComplementOf(:D))))",
+    ] {
+        let found = concerns(axioms, "R(?x ?y), S(?y ?z), D(?z), C(?x)");
+        if !found.is_empty() {
+            wrong.push(format!("{axioms}: {found:?}, expected nothing"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+#[test]
+fn an_equating_hazard_is_not_hidden_by_another_on_the_same_role() {
+    // Found by the mixed differential test (case 2378 of seed 11): a transitive property
+    // whose inverse is inverse functional makes two named individuals equal through an
+    // anonymous one; transitivity came first and hid it.
+    let axioms = "SubClassOf(:A ObjectSomeValuesFrom(:P :A))
+        InverseObjectProperties(:P :Q)
+        TransitiveObjectProperty(:Q)
+        InverseFunctionalObjectProperty(:P)";
+    assert_eq!(
+        concerns(axioms, "R(?x :a)"),
+        ["R: P is functional or inverse functional"]
+    );
+}
+
+/// An equating hazard on a term the axioms lead an anonymous individual to: every term.
+/// `P ⊑ ∃S.L`, `L ⊑ A`, `A ⊑ {a}` with `L` a left side the TBox doesn't read (`∃R.C`, or
+/// `≥ 2 R.⊤` since A-1202): `P`'s `S`-successor is an `A`, so `a`, and `S(p, a)` follows
+/// for every `P` `p`, unread.
+#[test]
+fn an_equating_hazard_the_axioms_lead_to_reaches_every_term() {
+    let mut wrong = Vec::new();
+    for left in [
+        "ObjectSomeValuesFrom(:R :C)",
+        "ObjectMinCardinality(2 :R owl:Thing)",
+    ] {
+        let axioms = format!(
+            "SubClassOf(:P ObjectSomeValuesFrom(:S {left}))
+            SubClassOf({left} :A)
+            SubClassOf(:A ObjectOneOf(:a))"
+        );
+        let found = concerns(&axioms, "S(?x :a)");
+        if found != ["S: A is contained in an enumeration"] {
+            wrong.push(format!("{left}: {found:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A TBox where every anonymous element has ten successor types, and a chain of twelve
+/// existential arms ending in a class none of them has: the witness search would try
+/// about 10^11 places before failing.
+fn dense() -> (String, String) {
+    let axioms: Vec<String> = (0..10)
+        .flat_map(|i| {
+            (0..10).map(move |j| format!("SubClassOf(:C{i} ObjectSomeValuesFrom(:P :C{j}))"))
+        })
+        .collect();
+    let mut chain: Vec<String> = vec!["P(?x ?v1)".to_owned()];
+    chain.extend((1..12).map(|i| format!("P(?v{i} ?v{})", i + 1)));
+    chain.push("D(?v12)".to_owned());
+    (axioms.join("\n"), chain.join(", "))
+}
+
+#[test]
+fn the_work_bound_stops_a_search_the_size_bounds_dont() {
+    let (axioms, atoms) = dense();
+    let existential: Vec<String> = (1..=12).map(|i| format!("v{i}")).collect();
+    let existential: Vec<&str> = existential.iter().map(String::as_str).collect();
+    // Within every size bound (12 existential variables, few witnesses), but not the work.
+    assert_eq!(rewritten(&axioms, &atoms, &existential), ["exceeded work"]);
+}
+
+#[test]
+fn a_data_existential_on_the_left_needs_rdfs_literal() {
+    // `∃age.xsd:integer ⊑ Adult` says nothing about a string age: no alternative.
+    let typed = "Declaration(DataProperty(:age))
+        SubClassOf(DataSomeValuesFrom(:age xsd:integer) :Adult)
+        SubClassOf(:P DataSomeValuesFrom(:age rdfs:Literal))";
+    let out = rewritten(typed, "Adult(?x)", &[]);
+    assert!(out.iter().all(|b| !b.contains("P(")), "{out:?}");
+    // Over `rdfs:Literal` it is QL: any value will do (no RL rule applies it, so having a
+    // value is an alternative of its own).
+    let literal = "Declaration(DataProperty(:age))
+        SubClassOf(DataSomeValuesFrom(:age rdfs:Literal) :Adult)
+        SubClassOf(:P DataSomeValuesFrom(:age rdfs:Literal))";
+    assert_eq!(
+        rewritten(literal, "Adult(?x)", &[]),
+        ["{Adult(?x) | P(?x) | age(?x _)}"]
+    );
+}
+
+/// A minimum cardinality on the left (review A-1202):
+/// - `≥ 2 R.⊤ ⊑ A` with `P ⊑ ∃R` makes neither a `P` nor an individual with one `R` edge an
+///   `A` (`{u, v}`, `P = {u}`, `R = {(u, v)}`, `A = ∅` is a model): neither is an
+///   alternative. It is `⊤ ⊑ ≤ 1 R ⊔ A`: an individual outside `A` has one `R`-successor
+///   at most, so its hazard is global under QL's closure and RL's;
+/// - `≥ 1 R.⊤ ⊑ A` is `∃R ⊑ A`: an `R` edge is an alternative;
+/// - `≥ 0 R.C ⊑ A` is `⊤ ⊑ A`: rewritten as `owl:Thing ⊑ A` is, so an anonymous `S`-successor
+///   is an `A` too. Inside an intersection on the left it isn't read, and `A` has a hazard
+///   from its role (with `P ⊑ ∃R`, `P`'s anonymous `R`-successor is an `A`) and from its
+///   filler (with `P ⊑ ∃S.C`, `P`'s anonymous `S`-successor, a `C`, is an `A`).
+#[test]
+fn a_minimum_cardinality_on_the_left_is_read_as_it_counts() {
+    let mut wrong = Vec::new();
+    let hazard = ["A: a minimum cardinality on R on the left of an axiom"];
+    let two = "SubClassOf(:P ObjectSomeValuesFrom(:R owl:Thing))
+        SubClassOf(ObjectMinCardinality(2 :R owl:Thing) :A)";
+    let out = rewritten(two, "A(?x)", &[]);
+    if out.iter().any(|b| b.contains("R(") || b.contains("P(")) {
+        wrong.push(format!("≥ 2: {out:?}"));
+    }
+    for lists in [false, true] {
+        if tbox(two, lists).0.global_hazard().is_none() {
+            wrong.push(format!("≥ 2 (lists {lists}): no global hazard"));
+        }
+    }
+    let one = rewritten(
+        "SubClassOf(ObjectMinCardinality(1 :R owl:Thing) :A)",
+        "A(?x)",
+        &[],
+    );
+    if !one.iter().any(|b| b.contains("R(?x _)")) {
+        wrong.push(format!("≥ 1: {one:?}"));
+    }
+    let generating = "SubClassOf(:P ObjectSomeValuesFrom(:S owl:Thing))";
+    let [zero, thing] = ["ObjectMinCardinality(0 :R :C)", "owl:Thing"].map(|left| {
+        let axioms = format!("{generating}\nSubClassOf({left} :A)");
+        rewritten(&axioms, "S(?x ?y), A(?y)", &["y"])
+    });
+    if zero != thing || zero == rewritten(generating, "S(?x ?y), A(?y)", &["y"]) {
+        wrong.push(format!("≥ 0: {zero:?}, as ⊤: {thing:?}"));
+    }
+    let inside = "SubClassOf(ObjectIntersectionOf(ObjectMinCardinality(0 :R :C)
+        ObjectMinCardinality(0 :R :D)) :A)";
+    let found = concerns(
+        &format!("SubClassOf(:P ObjectSomeValuesFrom(:R owl:Thing))\n{inside}"),
+        "A(?x)",
+    );
+    if found != hazard {
+        wrong.push(format!("≥ 0 inside: {found:?}"));
+    }
+    let found = concerns(
+        &format!("SubClassOf(:P ObjectSomeValuesFrom(:S :C))\n{inside}"),
+        "A(?x)",
+    );
+    if found != ["A: C in a complex class expression on the left"] {
+        wrong.push(format!("≥ 0 inside, by the filler: {found:?}"));
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// One query's patterns share one work budget (`Limits::query_work`): many patterns can't
+/// multiply the time `Limits::work` bounds. Given exactly what one pattern takes, a second
+/// stops at "the query's work".
+#[test]
+fn a_query_has_one_work_budget_for_its_patterns() {
+    let (tbox, mut table) = tbox("SubClassOf(:A ObjectSomeValuesFrom(:R :A))", true);
+    let (query, _) = cq(&mut table, "R(?x ?y), R(?y ?z)", &["y", "z"]);
+    let limits = Limits::default();
+    let budget = Budget::new(limits.query_work);
+    let none = &mut |_: &Probe<'_>| false;
+    assert!(matches!(
+        rewrite_with(&tbox, &query, &limits, &budget, none),
+        Outcome::Rewritten(_)
+    ));
+    let used = limits.query_work - budget.left();
+    assert!(used > 0);
+    let budget = Budget::new(used);
+    assert!(matches!(
+        rewrite_with(&tbox, &query, &limits, &budget, none),
+        Outcome::Rewritten(_)
+    ));
+    assert_eq!(budget.left(), 0);
+    assert_eq!(
+        rewrite_with(&tbox, &query, &limits, &budget, none),
+        Outcome::Exceeded("the query's work")
+    );
+}
+
+/// `?s :p ?o0 . … ?s :p ?o{n-1}` with every object existential, as constants and variables
+/// of `table`.
+fn flat(table: &mut Table, n: u32) -> Cq {
+    let p = table.id("http://e/p".to_owned());
+    Cq {
+        atoms: (1..=n)
+            .map(|o| Atom::Role(QTerm::Var(0), p, QTerm::Var(o)))
+            .collect(),
+        vars: n + 1,
+        existential: (0..=n).map(|v| v > 0).collect(),
+    }
+}
+
+/// Review A-1206: with no step left a pattern reads nothing, so the bound it reports is
+/// the query's work, not one that reading it would reach: here 5,000 existential objects,
+/// each a candidate interior, past `Limits::candidates`.
+#[test]
+fn a_pattern_with_no_work_left_reads_nothing() {
+    let (tbox, mut table) = tbox("SubClassOf(:A ObjectSomeValuesFrom(:p owl:Thing))", true);
+    let query = flat(&mut table, 5_000);
+    let none = &mut |_: &Probe<'_>| false;
+    let limits = Limits::default();
+    let no_work = Limits { work: 0, ..limits };
+    // Both rows, each reported: the query's budget spent, and a pattern bound of none.
+    let rows = [
+        (
+            "query budget 0",
+            rewrite_with(&tbox, &query, &limits, &Budget::new(0), none),
+            Outcome::Exceeded("the query's work"),
+        ),
+        (
+            "Limits::work 0",
+            rewrite(&tbox, &query, &no_work),
+            Outcome::Exceeded("work"),
+        ),
+    ];
+    let wrong: Vec<String> = rows
+        .iter()
+        .filter(|(_, got, want)| got != want)
+        .map(|(row, got, want)| format!("{row}: {got:?}, not {want:?}"))
+        .collect();
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Review A-1206: an atom the rewriting doesn't read keeps its variables out of every tree
+/// witness (`Atom::Other`), so they are no candidate interiors. Fourteen of them in one such
+/// atom make 2¹⁴ − 1 connected sets, past `Limits::candidates`; beside it, `p(?x ?y)` still
+/// gets its witness.
+#[test]
+fn variables_of_an_atom_the_rewriting_doesnt_read_are_no_candidates() {
+    let (tbox, mut table) = tbox("SubClassOf(:A ObjectSomeValuesFrom(:p owl:Thing))", true);
+    let p = table.id("http://e/p".to_owned());
+    let query = Cq {
+        atoms: vec![
+            Atom::Role(QTerm::Var(0), p, QTerm::Var(1)),
+            Atom::Other(0, (2..16).collect()),
+        ],
+        vars: 16,
+        existential: (0..16).map(|v| v > 0).collect(),
+    };
+    let Outcome::Rewritten(r) = rewrite(&tbox, &query, &Limits::default()) else {
+        panic!(
+            "not rewritten: {:?}",
+            rewrite(&tbox, &query, &Limits::default())
+        );
+    };
+    assert_eq!(r.witnesses, 1);
+}
+
+/// Review A-1206: a class atom's alternatives come from a walk of the hierarchy below the
+/// class, and the walk is paid for: each of `k` gap inclusions `C{i+1} ⊑ C{i} ⊓ X` (no list
+/// rules) below `C0` costs the pattern a step at least. A second run, with the walk's result
+/// memoised, takes the same steps.
+#[test]
+fn class_alternatives_are_paid_for_alike_cold_and_warm() {
+    let used = |k: usize| {
+        let axioms: Vec<String> = (0..k)
+            .map(|i| format!("SubClassOf(:C{} ObjectIntersectionOf(:C{i} :X))", i + 1))
+            .collect();
+        let (tbox, mut table) = tbox(&axioms.join("\n"), false);
+        let (query, _) = cq(&mut table, "C0(?x)", &[]);
+        let limits = Limits::default();
+        let none = &mut |_: &Probe<'_>| false;
+        let mut steps = Vec::new();
+        for _ in 0..2 {
+            let budget = Budget::new(limits.query_work);
+            let Outcome::Rewritten(r) = rewrite_with(&tbox, &query, &limits, &budget, none) else {
+                panic!("not rewritten");
+            };
+            assert_eq!(r.size(), k + 1);
+            steps.push(limits.query_work - budget.left());
+        }
+        assert_eq!(steps[0], steps[1], "cold and warm differ (k = {k})");
+        steps[0]
+    };
+    let (short, long) = (used(10), used(40));
+    assert!(
+        long >= short + 30,
+        "{short} steps for 10 classes, {long} for 40"
+    );
+}
+
+/// What binds an atom every individual is in (`⊤ ⊑ A`: `A(?x)` needs `?x` bound
+/// elsewhere) is read once, paid: each atom `p(?y ?z)` beside `A(?x)` costs its two terms'
+/// reading on top of what the rewriting takes for it otherwise. Measured (7 Nov, proofs
+/// p2c1-s1-measure-*): 6 steps an atom without that read (10, 40, 100 atoms: 71, 251, 611),
+/// 8 with it (91, 331, 811). The bound sits between the two: 30 more atoms take at least
+/// 30 × 7 more steps (180 without the read, 240 with it), so a later saving that still
+/// pays the terms passes (unpaid, the check was quadratic).
+#[test]
+fn what_binds_an_atom_on_every_individual_is_read_once_and_paid() {
+    let (tbox, mut table) = tbox("SubClassOf(owl:Thing :A)", true);
+    let limits = Limits::default();
+    let none = &mut |_: &Probe<'_>| false;
+    let mut used = |n: usize| {
+        let atoms: Vec<String> = std::iter::once("A(?x)".to_owned())
+            .chain((0..n).map(|i| format!("p(?y{i} ?z{i})")))
+            .collect();
+        let (query, _) = cq(&mut table, &atoms.join(", "), &["x"]);
+        let budget = Budget::new(limits.query_work);
+        let Outcome::Rewritten(_) = rewrite_with(&tbox, &query, &limits, &budget, none) else {
+            panic!("not rewritten ({n})");
+        };
+        limits.query_work - budget.left()
+    };
+    let (short, long) = (used(10), used(40));
+    assert!(
+        long >= short + 30 * 7,
+        "{short} steps for 10 atoms, {long} for 40"
+    );
+}
+
+/// Outside the profile, under owl2-ql (I24c-1 rework, found by I24c-2's green2): an
+/// equality of individuals, which the QL closure has no rule for, reaches every term. Its
+/// hazard is global, named by an individual (no property or class names it). Under
+/// owl2-rl the closure's equality rules apply it, so it is no hazard.
+#[test]
+fn outside_ql_an_equality_of_individuals_is_global() {
+    let (same, _) = tbox("SameIndividual(:c :e)", false);
+    assert!(
+        matches!(same.global_hazard(), Some(Hazard::OutsideProfile(_))),
+        "{:?}",
+        same.global_hazard()
+    );
+    let (same, _) = tbox("SameIndividual(:c :e)", true);
+    assert_eq!(same.global_hazard(), None);
+}
+
+/// Outside the profile, under owl2-ql (I24c-1 rework, found by I24c-2's green2): an
+/// irreflexive and asymmetric property only rules pairs out, so it concludes nothing.
+/// Irreflexivity is outside the QL grammar (`w3c2012owl2profiles.txt:599`), though the QL
+/// feature list of the same document includes it (`:457`).
+#[test]
+fn outside_ql_irreflexivity_and_asymmetry_conclude_nothing() {
+    let (irreflexive, table) = tbox(
+        "IrreflexiveObjectProperty(:p) AsymmetricObjectProperty(:p) \
+         ObjectPropertyAssertion(:p :c :d)",
+        false,
+    );
+    let p = table.iri("http://e/p").expect(":p");
+    assert!(!irreflexive.has_concerns(), "{:?}", irreflexive.concern(p));
+}
+
+/// An uncovered axiom that equates individuals makes the hazard global even where no term
+/// names it: a global hazard reaches every term, so it needs none of
+/// its own. The reader gives every equating form a property, class or individual; an empty
+/// `SameIndividual`, built here directly, is one `label` can't name.
+#[test]
+fn outside_ql_an_unnamed_equating_axiom_is_global() {
+    let mut ontology = crate::mapping::Ontology::default();
+    ontology
+        .axioms
+        .push(crate::model::Axiom::SameIndividual(Vec::new()));
+    ontology.sources = vec![Vec::new()];
+    let tbox = Tbox::compile(&ontology, Closure { lists: false }, None);
+    assert!(tbox.global_hazard().is_some(), "no global hazard");
+}

@@ -11,59 +11,75 @@ use crate::http::media::{header_value_str, media_type_matches};
 use crate::http::mutation;
 use crate::http::request_metrics::BackupKind;
 use crate::http::responses::build_admin_restore_response;
+use crate::http::result_stream::{Pace, stream_blocking};
 use crate::state::AppState;
 
 const BACKUP_FORMAT_HEADER: &str = "x-nrese-backup-format";
 const SOURCE_REVISION_HEADER: &str = "x-nrese-source-revision";
 const QUAD_COUNT_HEADER: &str = "x-nrese-quad-count";
+/// A trailer of the export: its SHA-256, as its closing comment holds it.
 const CHECKSUM_HEADER: &str = "x-nrese-checksum-sha256";
 
+/// The N-Quads export of every asserted statement, streamed as it is read: a whole store in
+/// constant memory, for as long as the client keeps reading. Its revision and statement
+/// count go in the headers; its SHA-256 closes the body as a comment
+/// (`# nrese-sha256 <hex>`) and follows it as the trailer [`CHECKSUM_HEADER`], announced in
+/// `Trailer` (HTTP/1.1 clients send `TE: trailers` to receive it).
 pub async fn backup(state: AppState) -> Result<Response, ApiError> {
     state.ensure_serving()?;
-
-    let store = state.store();
+    // Administrators only (the caller's guard): every graph.
+    let export = state
+        .store()
+        .dataset_export(&nrese_store::ReadScope::All, DatasetBackupFormat::NQuads)
+        .map_err(map_backup_error)?;
+    let (revision, quads) = (export.source_revision, export.quad_count);
+    let cancellation = nrese_store::CancellationToken::new();
+    let token = cancellation.clone();
+    let metrics = state.clone();
     let started = std::time::Instant::now();
-    let artifact =
-        // Administrators only (the caller's guard): every graph.
-        tokio::task::spawn_blocking(move || {
-            store.export_dataset(&nrese_store::ReadScope::All, DatasetBackupFormat::NQuads)
-        })
-            .await
-            .map_err(|error| ApiError::internal(error.to_string()))
-            .and_then(|result| result.map_err(map_backup_error));
-    state.request_metrics().record_backup(
-        BackupKind::Dump,
-        artifact
-            .as_ref()
-            .ok()
-            .map(|artifact| artifact.payload.len() as u64),
-        started.elapsed(),
-    );
-    let artifact = artifact?;
-
-    let mut response = (StatusCode::OK, artifact.payload).into_response();
-    response.headers_mut().insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/n-quads"),
-    );
-    insert_header(response.headers_mut(), BACKUP_FORMAT_HEADER, "n-quads")?;
-    insert_header(
-        response.headers_mut(),
-        SOURCE_REVISION_HEADER,
-        &artifact.source_revision.to_string(),
-    )?;
-    insert_header(
-        response.headers_mut(),
-        QUAD_COUNT_HEADER,
-        &artifact.quad_count.to_string(),
-    )?;
-    insert_header(
-        response.headers_mut(),
-        CHECKSUM_HEADER,
-        &artifact.checksum_sha256,
-    )?;
-
+    let mut response = stream_blocking(
+        Pace::stalled_after(state.policy().timeouts.graph_read),
+        cancellation,
+        "application/n-quads",
+        "the export's client stopped reading (timeouts.graph_read)",
+        move |out| {
+            let mut counted = Counting(&mut *out, 0);
+            let written = export.write(&token, &mut counted);
+            let bytes = counted.1;
+            metrics.request_metrics().record_backup(
+                BackupKind::Dump,
+                written.as_ref().ok().map(|_| bytes),
+                started.elapsed(),
+            );
+            let checksum = written.map_err(map_backup_error)?;
+            let mut trailers = HeaderMap::new();
+            insert_header(&mut trailers, CHECKSUM_HEADER, &checksum)?;
+            out.trailers(trailers)
+                .map_err(|error| ApiError::internal(error.to_string()))
+        },
+    )
+    .await?;
+    let headers = response.headers_mut();
+    insert_header(headers, BACKUP_FORMAT_HEADER, "n-quads")?;
+    insert_header(headers, SOURCE_REVISION_HEADER, &revision.to_string())?;
+    insert_header(headers, QUAD_COUNT_HEADER, &quads.to_string())?;
+    headers.insert(header::TRAILER, HeaderValue::from_static(CHECKSUM_HEADER));
     Ok(response)
+}
+
+/// A writer that counts the bytes it passes on.
+struct Counting<W>(W, u64);
+
+impl<W: std::io::Write> std::io::Write for Counting<W> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        let written = self.0.write(bytes)?;
+        self.1 += written as u64;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
 }
 
 pub async fn restore(
@@ -115,22 +131,31 @@ pub async fn image_backup(state: AppState, repository: &str) -> Result<Response,
     let seconds = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
-    let dir = backups.join(match repository {
+    let name = match repository {
         crate::repositories::DEFAULT_REPOSITORY => seconds.to_string(),
         other => format!("{other}-{seconds}"),
-    });
-    let target = dir.clone();
+    };
     let started = std::time::Instant::now();
-    let manifest = tokio::task::spawn_blocking(move || store.backup_image(&target))
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))
-        .and_then(|result| result.map_err(map_backup_error));
+    let written = tokio::task::spawn_blocking(move || {
+        let dir = claim_backup_dir(&backups, &name)
+            .map_err(|error| ApiError::internal(format!("{}: {error}", backups.display())))?;
+        let manifest = store.backup_image(&dir).map_err(map_backup_error)?;
+        Ok::<_, ApiError>((dir, manifest))
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))
+    .and_then(|result| result);
+    let (dir, manifest) = match written {
+        Ok((dir, manifest)) => (Some(dir), Ok(manifest)),
+        Err(error) => (None, Err(error)),
+    };
     state.request_metrics().record_backup(
         BackupKind::Image,
         manifest.as_ref().ok().map(|manifest| manifest.bytes),
         started.elapsed(),
     );
     let manifest = manifest?;
+    let dir = dir.unwrap_or_default();
     Ok((
         StatusCode::OK,
         Json(serde_json::json!({
@@ -139,6 +164,27 @@ pub async fn image_backup(state: AppState, repository: &str) -> Result<Response,
         })),
     )
         .into_response())
+}
+
+/// A new, empty directory for a backup in `backups`: `name`, or `name-1`, `name-2`, … where
+/// it is taken (two backups within a second; creating the directory claims it, so
+/// concurrent backups can't share one).
+fn claim_backup_dir(backups: &std::path::Path, name: &str) -> std::io::Result<std::path::PathBuf> {
+    for n in 0u32.. {
+        let dir = if n == 0 {
+            backups.join(name)
+        } else {
+            backups.join(format!("{name}-{n}"))
+        };
+        // Durably named, `backups` too (DUR-3): made elsewhere, the image backup's placement
+        // would take it for one provisioned beforehand.
+        match nrese_store::place::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && n < 10_000 => {}
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("the loop returns")
 }
 
 fn parse_restore_format(
@@ -181,6 +227,51 @@ mod tests {
     use nrese_store::DatasetBackupFormat;
 
     use super::parse_restore_format;
+
+    /// A backup's directory is durably named: in
+    /// `sealed/backups`, where `sealed/backups` exists but can't be opened (mode 0o311), so its
+    /// sync, which must name the new directory, fails, the claim must refuse. Before the fix it
+    /// made the directory, and the image backup's placement then took it for one provisioned
+    /// beforehand. Guards: in a readable directory it claims `name`, then `name-1` beside it.
+    /// Unix only (permissions); as root, where the mode doesn't keep the directory closed, the
+    /// first row isn't checked.
+    #[cfg(unix)]
+    #[test]
+    fn a_backup_directory_is_claimed_only_where_its_name_can_be_durable() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let base = tempfile::tempdir().unwrap();
+        let mut wrong = Vec::new();
+        let sealed = base.path().join("sealed");
+        std::fs::create_dir_all(&sealed).unwrap();
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o311)).unwrap();
+        if std::fs::read_dir(&sealed).is_ok() {
+            eprintln!("row sealed: not checked (the directory opens: root?)");
+        } else {
+            let claimed = super::claim_backup_dir(&sealed, "image");
+            eprintln!(
+                "row sealed: {}",
+                if claimed.is_err() { "ok" } else { "FAILED" }
+            );
+            if let Ok(claimed) = claimed {
+                wrong.push(format!(
+                    "claimed under a directory whose sync fails: {claimed:?}"
+                ));
+            }
+        }
+        std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let open = base.path().join("open");
+        let first = super::claim_backup_dir(&open, "image");
+        let second = super::claim_backup_dir(&open, "image");
+        let ok = first.as_ref().is_ok_and(|dir| dir == &open.join("image"))
+            && second
+                .as_ref()
+                .is_ok_and(|dir| dir == &open.join("image-1"));
+        eprintln!("row open (guard): {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            wrong.push(format!("guard: claims {first:?}, {second:?}"));
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
 
     #[test]
     fn restore_format_accepts_parameterized_nquads_content_type() {

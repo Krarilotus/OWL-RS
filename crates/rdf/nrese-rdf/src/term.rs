@@ -1199,6 +1199,69 @@ impl fmt::Display for Variable {
     }
 }
 
+// The heap bytes an owned term holds beside its own slot (`size_of`): its strings'
+// capacities, and a triple term's box with what that holds. For a holder that charges what
+// it keeps.
+
+impl NamedNode {
+    pub fn heap_bytes(&self) -> usize {
+        self.iri.capacity()
+    }
+}
+
+impl BlankNode {
+    pub fn heap_bytes(&self) -> usize {
+        self.id.capacity()
+    }
+}
+
+impl Literal {
+    pub fn heap_bytes(&self) -> usize {
+        self.value.capacity()
+            + match &self.kind {
+                Kind::Simple => 0,
+                Kind::Language(tag) | Kind::DirectionalLanguage(tag, _) => tag.capacity(),
+                Kind::Typed(datatype) => datatype.heap_bytes(),
+            }
+    }
+}
+
+impl NamedOrBlankNode {
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Self::NamedNode(node) => node.heap_bytes(),
+            Self::BlankNode(node) => node.heap_bytes(),
+        }
+    }
+}
+
+impl Term {
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Self::NamedNode(node) => node.heap_bytes(),
+            Self::BlankNode(node) => node.heap_bytes(),
+            Self::Literal(literal) => literal.heap_bytes(),
+            Self::Triple(triple) => std::mem::size_of::<Triple>() + triple.heap_bytes(),
+        }
+    }
+}
+
+impl GraphName {
+    pub fn heap_bytes(&self) -> usize {
+        match self {
+            Self::NamedNode(node) => node.heap_bytes(),
+            Self::BlankNode(node) => node.heap_bytes(),
+            Self::DefaultGraph => 0,
+        }
+    }
+}
+
+impl Triple {
+    pub fn heap_bytes(&self) -> usize {
+        self.subject.heap_bytes() + self.predicate.heap_bytes() + self.object.heap_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1373,5 +1436,21 @@ mod tests {
         assert!(NamedOrBlankNode::try_from(Term::from(n.clone())).is_ok());
         assert!(NamedOrBlankNode::try_from(t).is_err());
         assert_eq!(GraphName::from(n).as_ref().into_owned().to_string(), "_:x");
+    }
+
+    /// Spec: an owned term's heap bytes cover every string it owns (a holder charging them
+    /// charges no less than it keeps), a triple term's box and its terms included.
+    #[test]
+    fn heap_bytes_cover_every_string_a_term_owns() {
+        let iri = "http://example.com/a";
+        let node = || NamedNode::new(iri).unwrap();
+        let tagged = Term::from(Literal::new_language_tagged_literal("hello", "en").unwrap());
+        assert!(tagged.heap_bytes() >= "hello".len() + "en".len());
+        let typed = Literal::new_typed_literal("1", node());
+        assert!(typed.heap_bytes() >= "1".len() + iri.len());
+        let triple = Term::Triple(Box::new(Triple::new(node(), node(), tagged.clone())));
+        let parts = std::mem::size_of::<Triple>() + 2 * iri.len() + tagged.heap_bytes();
+        assert!(triple.heap_bytes() >= parts);
+        assert_eq!(GraphName::DefaultGraph.heap_bytes(), 0);
     }
 }

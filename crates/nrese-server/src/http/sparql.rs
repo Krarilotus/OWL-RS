@@ -1,4 +1,5 @@
 use axum::http::StatusCode;
+use axum::http::header::CONTENT_TYPE;
 use axum::response::Response;
 use nrese_store::{
     CancellationToken, GraphResultFormat, MutationCommand, QueryResultKind, SolutionsResultFormat,
@@ -8,8 +9,8 @@ use nrese_store::{
 use crate::error::ApiError;
 use crate::http::media::{BOOLEAN, GRAPHS, SOLUTIONS, negotiated};
 use crate::http::mutation;
-use crate::http::requests::{QueryOperation, UpdateOperation};
-use crate::http::result_stream::stream_blocking;
+use crate::http::requests::{Explain, QueryOperation, UpdateOperation};
+use crate::http::result_stream::{Pace, stream_blocking};
 use crate::policy::PolicyConfig;
 use crate::state::AppState;
 
@@ -39,6 +40,14 @@ pub async fn execute_query_in(
     let deadline = tokio::time::Instant::now() + policy.timeouts.query;
 
     let explain = operation.explain;
+    // An EXPLAIN plans or runs on the committed data alone: inside a transaction it would
+    // describe a dataset other than the one the transaction's reads see.
+    if explain != Explain::No && pending.is_some() {
+        return Err(ApiError::bad_request(
+            "explain isn't available inside a transaction: its plan would be the committed \
+             data's, not the transaction's",
+        ));
+    }
     let origin = operation.origin.clone();
     let mut request = build_query_request(operation);
     let memory = policy.limits.max_query_memory_bytes;
@@ -52,7 +61,7 @@ pub async fn execute_query_in(
         prepared.set_origin(origin);
     }
     // The query form decides which formats exist; an EXPLAIN is always JSON.
-    if !explain {
+    if explain == Explain::No {
         let (solutions, graph) = negotiate_formats(prepared.kind(), accept)?;
         prepared.set_formats(solutions, graph);
     }
@@ -60,9 +69,27 @@ pub async fn execute_query_in(
     let store = state.store();
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
-    if explain {
+    if explain == Explain::Plan {
+        // Statistics only, nothing evaluated; under the deadline as evaluation is: planning
+        // a large pattern stops when the deadline cancels it.
         return stream_blocking(
-            deadline,
+            Pace::Total(deadline),
+            cancellation,
+            "application/json",
+            QUERY_TIMEOUT_MESSAGE,
+            move |out| {
+                let planned = store
+                    .plan_query(&prepared, &token)
+                    .map_err(|error| map_query_error(&policy, error))?;
+                serde_json::to_writer(out, &plan_json(&planned))
+                    .map_err(|error| ApiError::internal(error.to_string()))
+            },
+        )
+        .await;
+    }
+    if explain == Explain::Analyze {
+        return stream_blocking(
+            Pace::Total(deadline),
             cancellation,
             "application/json",
             QUERY_TIMEOUT_MESSAGE,
@@ -76,24 +103,100 @@ pub async fn execute_query_in(
         )
         .await;
     }
-    stream_blocking(
-        deadline,
+    // The completeness goes with the answers, in a header: the store reports it on the
+    // snapshot it reads before writing any answer, and the response starts after that.
+    // Every reported status is sent, `complete` where no reasoning path can leave answers
+    // out (the store's `None`), so a client never has to read an absent header as one;
+    // a run that reported nothing sends none (SYN-72). Its text is kept with a cached
+    // answer and sent again with it: the same status for every request of its key.
+    use axum::http::HeaderValue;
+    let status: std::sync::Arc<std::sync::Mutex<Option<HeaderValue>>> = Default::default();
+    let slot = std::sync::Arc::clone(&status);
+    let report = move |r: Option<nrese_sparql::Completeness>, kept: Option<std::sync::Arc<str>>| {
+        let r = told(r);
+        let made = kept.is_none().then(|| r.header());
+        let text = kept.as_deref().or(made.as_deref()).unwrap_or_default();
+        let value =
+            HeaderValue::from_str(text).unwrap_or_else(|_| HeaderValue::from_static(r.as_str()));
+        *slot.lock().unwrap_or_else(|p| p.into_inner()) = Some(value);
+        made
+    };
+    let announced = prepared.clone();
+    let mut response = stream_blocking(
+        Pace::Total(deadline),
         cancellation,
         media_type,
         QUERY_TIMEOUT_MESSAGE,
         move |out| {
             match &pending {
-                None => store.run_query(&prepared, &token, out),
-                Some(pending) => store.run_query_pending(pending, &prepared, &token, out),
+                None => store.run_query_reporting(&prepared, &token, out, report),
+                Some(pending) => {
+                    store.run_query_pending_reporting(pending, &prepared, &token, out, report)
+                }
             }
             .map_err(|error| map_query_error(&policy, error))
         },
     )
-    .await
+    .await?;
+    // The run decided the announcement on what its reader reads before its first byte, which
+    // `stream_blocking` waits for: the media type is the run's (its place among the headers kept).
+    let media_type = HeaderValue::from_static(announced.media_type());
+    response.headers_mut().insert(CONTENT_TYPE, media_type);
+    let reported = status.lock().unwrap_or_else(|p| p.into_inner()).take();
+    if let Some(value) = reported {
+        let headers = response.headers_mut();
+        headers.insert(COMPLETENESS, value);
+        // Readable by a console on another origin too (CORS hides other response headers),
+        // so an incomplete answer never shows as a complete one there; appended, so what a
+        // proxy exposes besides stays exposed.
+        headers.append(
+            axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            axum::http::HeaderValue::from_static(COMPLETENESS),
+        );
+    }
+    Ok(response)
 }
 
-/// The JSON form of an EXPLAIN: the executor, totals, and one object per operator in
-/// evaluation order (`depth` gives the nesting).
+/// The header that says whether the answers are sound and complete, and why not
+/// ([`nrese_sparql::Completeness::header`]; docs/design/ql-rewriting.md §7).
+pub const COMPLETENESS: &str = "nrese-completeness";
+
+/// What a read with no status is told: `complete`, no reasoning path can leave its answers
+/// out (the store's `None`). The query's header, EXPLAIN and the plan all say it through
+/// here, so they never say different things of one read.
+fn told(status: Option<nrese_sparql::Completeness>) -> nrese_sparql::Completeness {
+    status.unwrap_or_default()
+}
+
+/// The JSON form of an answer's status, as the query's header tells it ([`told`]): the
+/// shared status ([`nrese_sparql::Completeness`]), the bounds' counts where known, and
+/// what decided it (`decided_by`, the DL bounds' paths).
+fn completeness_json(
+    status: Option<&nrese_sparql::Completeness>,
+    decided_by: &[&'static str],
+) -> serde_json::Value {
+    let c = told(status.cloned());
+    serde_json::json!({
+        "status": c.as_str(),
+        "regime": c.regime.map(|r| r.as_str()),
+        "sound": c.sound,
+        "complete": c.complete,
+        "reasons": c
+            .reasons
+            .iter()
+            .map(|reason| serde_json::json!({"source": reason.source, "text": reason.text}))
+            .collect::<Vec<_>>(),
+        "bounds": c.bounds.map(|b| serde_json::json!({
+            "lower": b.lower,
+            "upper": b.upper,
+            "unresolved": b.unresolved,
+        })),
+        "decided_by": decided_by,
+    })
+}
+
+/// The JSON form of an EXPLAIN: the executor, the rewrites that changed the query, totals,
+/// and one object per operator in evaluation order (`depth` gives the nesting).
 fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value {
     let steps: Vec<serde_json::Value> = explanation
         .steps
@@ -106,20 +209,80 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
                 "estimated_rows": step.estimated_rows,
                 "rows": step.rows,
                 "micros": step.micros,
+                "cache": step.cache,
             })
         })
         .collect();
     serde_json::json!({
         "executor": explanation.executor,
+        "rewrites": explanation.rewrites,
         "rows": explanation.rows,
         "micros": explanation.micros,
+        "completeness": completeness_json(
+            explanation.completeness.as_ref(),
+            &explanation.decided_by,
+        ),
+        "candidates": explanation.candidates.map(|c| serde_json::json!({
+            "proved": c.proved,
+            "refuted": c.refuted,
+        })),
+        "ql": ql_json(explanation.ql.as_ref()),
         "steps": steps,
     })
 }
 
-/// Query errors caused by the request are 400s; a cancelled evaluation is a timeout;
-/// anything else is the server's fault.
-fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
+/// What the OWL 2 QL rewriting did and whether the answers are complete (`null` where it
+/// doesn't apply).
+fn ql_json(report: Option<&nrese_sparql::ql::QlReport>) -> serde_json::Value {
+    report.map_or(serde_json::Value::Null, |r| {
+        serde_json::json!({
+            "completeness": r.completeness.as_str(),
+            "sound": r.completeness.sound,
+            "complete": r.completeness.complete,
+            "reasons": r
+                .completeness
+                .reasons
+                .iter()
+                .map(|reason| serde_json::json!({"source": reason.source, "text": reason.text}))
+                .collect::<Vec<_>>(),
+            "patterns": r.patterns,
+            "witnesses": r.witnesses,
+            "realised": r.realised,
+            "branches": r.branches,
+            "atoms": r.atoms,
+            "limits": r.limits,
+        })
+    })
+}
+
+/// The JSON form of a plan before running: the rewrites that changed the query, and one
+/// object per node from the top down (`depth` gives the nesting), each with its estimated
+/// rows (`null` where unknown).
+fn plan_json(planned: &nrese_store::PlannedQuery) -> serde_json::Value {
+    let steps: Vec<serde_json::Value> = planned
+        .steps
+        .iter()
+        .map(|step| {
+            serde_json::json!({
+                "depth": step.depth,
+                "operator": step.operator,
+                "detail": step.detail,
+                "estimated_rows": step.estimated_rows,
+            })
+        })
+        .collect();
+    serde_json::json!({
+        "executor": "native",
+        "rewrites": planned.rewrites,
+        "completeness": completeness_json(planned.completeness.as_ref(), &[]),
+        "ql": ql_json(planned.ql.as_ref()),
+        "steps": steps,
+    })
+}
+
+/// Query errors caused by the request are 400s, a refusal by graph access a 403; a
+/// cancelled evaluation is a timeout; anything else is the server's fault.
+pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
     match error {
         // The policy deadline cancels a query, and so may an operator
         // (`DELETE /api/v1/repositories/{id}/queries/{query}`).
@@ -136,10 +299,28 @@ fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiError {
         error if error.is_memory_limit() => ApiError::payload_too_large(format!(
             "{error} (budgets.query_memory, NRESE_MAX_QUERY_MEMORY_BYTES)"
         )),
+        // Graph access refused it: a read of every graph by a reader of some.
+        error @ StoreError::Forbidden(_) => ApiError::forbidden(error.to_string()),
         error if error.is_request_error() => {
             policy.bad_request_for_sparql_parse_error(error.to_string())
         }
-        error => ApiError::internal(error.to_string()),
+        // Exact answers asked for under owl2-dl, and the store can't prove them complete.
+        StoreError::Incomplete(answer) => ApiError::IncompleteAnswer(answer),
+        error => refused_or(error, ApiError::internal),
+    }
+}
+
+/// A store error of a read (query, RDF4J, Graph Store), `otherwise` unless it is a refusal
+/// until the store is rematerialised ([`StoreError::NotRematerialised`]): that is 503, with the
+/// store's sentence and, on a primary, the administrator's route. A replica refuses that route
+/// (`guard::enforce_admin_write`), so its answer adds nothing.
+pub(crate) fn refused_or(error: StoreError, otherwise: fn(String) -> ApiError) -> ApiError {
+    match error {
+        StoreError::NotRematerialised { replica: false } => ApiError::unavailable(format!(
+            "{error} (an administrator: POST /api/v1/repositories/{{id}}/reasoning/rematerialise)"
+        )),
+        error @ StoreError::NotRematerialised { .. } => ApiError::unavailable(error.to_string()),
+        error => otherwise(error.to_string()),
     }
 }
 
@@ -190,6 +371,7 @@ fn build_query_request(operation: QueryOperation) -> SparqlQueryRequest {
     if operation.infer == Some(false) {
         request.read_model = Some(nrese_store::ReadModel::Asserted);
     }
+    request.dl_answers = operation.dl_answers;
     request
 }
 

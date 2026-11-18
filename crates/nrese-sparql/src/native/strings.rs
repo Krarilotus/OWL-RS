@@ -21,7 +21,7 @@
 //! Many passing terms are matched by a scan of the whole pattern against a bitmap of them
 //! rather than a seek each (`Context::scan_ranges`).
 
-use nrese_engine::{Placement, Snapshot, StringTest, TermId, TermKind};
+use nrese_engine::{Placement, Snapshot, StringScan, StringTest, TermId, TermKind};
 use nrese_rdf::Variable;
 use nrese_rdf::vocab::xsd;
 use nrese_sparql_syntax::algebra::{Expression, Function};
@@ -52,6 +52,19 @@ impl Condition<'_> {
         matches!(self.placement, Placement::Start | Placement::Whole)
             && !self.needle.is_empty()
             && !self.fold_case
+    }
+
+    /// A test of the term's text, not of its language alone: few terms pass one.
+    pub(crate) fn tests_text(&self) -> bool {
+        !self.needle.is_empty()
+    }
+
+    /// Whether the dictionary pass for this test is worth its cost on a pattern of `rows`
+    /// rows: a prefix found by binary search in the text order costs nothing worth
+    /// weighing; otherwise the pass must be worth the dictionary's size.
+    pub(crate) fn worth_a_pass(&self, snapshot: &Snapshot, rows: u64) -> bool {
+        (self.is_prefix() && snapshot.text_order_ready())
+            || rows >= snapshot.dictionary_bytes() / DICTIONARY_BYTES_PER_ROW
     }
 }
 
@@ -171,12 +184,12 @@ fn operand(expression: &Expression) -> Option<(&Variable, bool)> {
 }
 
 /// The id ranges of the terms that can pass `condition`, sorted, for a pattern of `rows`
-/// rows; `None` if they would hardly prune it.
+/// rows, and what the dictionary's scan for them did; `None` if they would hardly prune it.
 pub(crate) fn ranges(
     snapshot: &Snapshot,
     condition: &Condition<'_>,
     rows: u64,
-) -> Option<Vec<(TermId, TermId)>> {
+) -> Option<(Vec<(TermId, TermId)>, StringScan)> {
     let test = StringTest {
         needle: condition.needle,
         placement: condition.placement,
@@ -187,7 +200,7 @@ pub(crate) fn ranges(
         language: condition.language,
         ascii_case_insensitive: condition.fold_case,
     };
-    let ids = snapshot.matching_strings(&test);
+    let (ids, scan) = snapshot.matching_strings_scan(&test);
     if ids.len() as u64 > rows {
         return None;
     }
@@ -213,5 +226,5 @@ pub(crate) fn ranges(
         );
         ranges.sort_unstable();
     }
-    Some(ranges)
+    Some((ranges, scan))
 }

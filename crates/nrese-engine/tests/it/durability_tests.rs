@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use nrese_engine::{
     BulkMode, DurabilityConfig, Engine, EngineConfig, EngineError, QuadPattern, SyncPolicy,
-    TermKind,
+    TermKind, WalDamage,
 };
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
@@ -129,7 +129,7 @@ fn checkpoint_plus_wal_recovers_and_releases_covered_segments() {
         ..config()
     };
     let states = {
-        let engine = Engine::open(dir.path(), small_segments).unwrap();
+        let engine = Engine::open(dir.path(), small_segments.clone()).unwrap();
         let mut states = commit_all(&engine, &batches(0..30));
         assert!(segments(dir.path()).len() > 3, "small segments rotate");
         assert_eq!(engine.checkpoint().unwrap(), 30);
@@ -182,6 +182,258 @@ fn torn_tail_at_every_byte_recovers_the_previous_revision() {
     }
 }
 
+/// Where each frame of a WAL segment starts, after its 8-byte magic.
+fn frame_starts(bytes: &[u8]) -> Vec<usize> {
+    let mut starts = Vec::new();
+    let mut at = 8;
+    while at + 8 <= bytes.len() {
+        starts.push(at);
+        at += 8 + u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap()) as usize;
+    }
+    starts
+}
+
+/// Four acknowledged commits, one record each, in the store's only segment.
+fn four_records() -> (tempfile::TempDir, Vec<HashSet<Quad>>, Vec<u8>) {
+    let dir = tempfile::tempdir().unwrap();
+    let states = {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        commit_all(&engine, &batches(0..4))
+    };
+    let bytes = fs::read(&segments(dir.path())[0]).unwrap();
+    assert_eq!(frame_starts(&bytes).len(), 4);
+    (dir, states, bytes)
+}
+
+/// Damage in the newest segment that a crash mid-append doesn't leave (owner, 26 Oct:
+/// refused by default) fails the open, and leaves the log as it was: a flipped byte in a
+/// record with records after it (B-302: they were cut with it), a garbage header (its
+/// length runs past the end), zeros over a frame boundary with an intact record after
+/// them, and a flipped byte in the last record, which is complete. Each row is judged on
+/// its own.
+#[test]
+fn damage_in_the_last_segment_is_refused_and_left_in_place() {
+    let (source, _, original) = four_records();
+    let starts = frame_starts(&original);
+    let (second, third, last) = (starts[1], starts[2], starts[3]);
+    type Damage = Box<dyn Fn(&mut Vec<u8>)>;
+    let damages: [(&str, Damage); 4] = [
+        (
+            "a flipped byte in record 2 of 4",
+            Box::new(move |bytes: &mut Vec<u8>| bytes[second + 20] ^= 0x10),
+        ),
+        (
+            "a garbage header over record 2",
+            Box::new(move |bytes: &mut Vec<u8>| bytes[second..second + 8].fill(0xff)),
+        ),
+        (
+            "zeros from record 2 into record 3",
+            Box::new(move |bytes: &mut Vec<u8>| bytes[second + 10..third + 12].fill(0)),
+        ),
+        (
+            "a flipped byte in the last record",
+            Box::new(move |bytes: &mut Vec<u8>| bytes[last + 20] ^= 0x10),
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, damage) in damages {
+        let dir = tempfile::tempdir().unwrap();
+        copy_dir(source.path(), dir.path());
+        let segment = &segments(dir.path())[0];
+        let mut bytes = original.clone();
+        damage(&mut bytes);
+        fs::write(segment, &bytes).unwrap();
+        let mut wrong = None;
+        for attempt in 1..=2 {
+            match Engine::open(dir.path(), config()) {
+                Err(EngineError::Corruption(_)) => {}
+                Ok(engine) => {
+                    wrong = Some(format!(
+                        "opened at revision {} (attempt {attempt})",
+                        engine.stats().revision
+                    ))
+                }
+                Err(other) => wrong = Some(format!("{other} (attempt {attempt})")),
+            }
+            if wrong.is_none() && fs::read(segment).unwrap() != bytes {
+                wrong = Some(format!("the log changed (attempt {attempt})"));
+            }
+            if wrong.is_some() {
+                break;
+            }
+        }
+        eprintln!(
+            "row {case}: {}",
+            if wrong.is_some() { "FAILED" } else { "ok" }
+        );
+        failures.extend(wrong.map(|w| format!("{case}: {w}")));
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Guard (right on the base too): a size extension that never got its data (zeros to the
+/// end of the file) is a torn tail, so every record recovers.
+#[test]
+fn a_zero_filled_tail_is_torn() {
+    let (dir, states, mut bytes) = four_records();
+    bytes.extend_from_slice(&[0; 300]);
+    fs::write(&segments(dir.path())[0], &bytes).unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(contents(&engine), states[3]);
+}
+
+/// What opening cuts from a torn tail is kept, byte for byte, in `wal-cut/`: a zero-filled
+/// extension and a last record cut short alike.
+#[test]
+fn a_cut_torn_tail_is_kept() {
+    let (source, _, original) = four_records();
+    let last = frame_starts(&original)[3];
+    let mut zeros = original.clone();
+    zeros.extend_from_slice(&[0; 300]);
+    let tails = [
+        ("zeros to the end", zeros, original.len()),
+        (
+            "the last record cut short",
+            original[..last + 20].to_vec(),
+            last,
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, bytes, at) in tails {
+        let dir = tempfile::tempdir().unwrap();
+        copy_dir(source.path(), dir.path());
+        let segment = segments(dir.path())[0].clone();
+        fs::write(&segment, &bytes).unwrap();
+        drop(Engine::open(dir.path(), config()).unwrap());
+        let kept = fs::read(cut_copy(dir.path(), &segment, at)).ok();
+        let ok = kept.as_deref() == Some(&bytes[at..]);
+        eprintln!("row {case}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            failures.push(format!("{case}: kept {:?} bytes", kept.map(|k| k.len())));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Where opening keeps the bytes it cut from `segment` at `offset`.
+fn cut_copy(dir: &Path, segment: &Path, offset: usize) -> PathBuf {
+    let name = segment.file_name().unwrap().to_string_lossy();
+    dir.join("wal-cut").join(format!("{name}.{offset}"))
+}
+
+/// With the prefix kept (`WalDamage::KeepPrefix`, opted into), damage in record 2 of 4
+/// opens the store at revision 1. Records 2 to 4 are kept byte for byte in the copy, and
+/// the store takes commits again, across a restart.
+#[test]
+fn keeping_the_prefix_opens_up_to_the_damage_and_keeps_the_rest() {
+    let (dir, states, mut bytes) = four_records();
+    let second = frame_starts(&bytes)[1];
+    bytes[second + 20] ^= 0x10;
+    let segment = segments(dir.path())[0].clone();
+    fs::write(&segment, &bytes).unwrap();
+    let keep = EngineConfig {
+        durability: DurabilityConfig {
+            wal_damage: WalDamage::KeepPrefix,
+            ..config().durability
+        },
+        ..config()
+    };
+    let engine = Engine::open(dir.path(), keep.clone()).unwrap();
+    assert_eq!(engine.stats().revision, 1);
+    assert_eq!(contents(&engine), states[0]);
+    assert_eq!(
+        fs::read(cut_copy(dir.path(), &segment, second)).unwrap(),
+        bytes[second..]
+    );
+    let again = commit_all(&engine, &batches(1..2));
+    drop(engine);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(contents(&engine), again[0]);
+}
+
+/// A later cut at the same offset never replaces an earlier copy: after a
+/// prefix kept at record 2, the next commit is written where record 2 was, and a crash
+/// tears it. Cutting that torn tail keeps it under another name; the copy of the damaged
+/// records 2 to 4, possibly the only one of acknowledged commits, stays as it was.
+#[test]
+fn a_later_cut_at_the_same_offset_keeps_the_earlier_copy() {
+    let (dir, _, mut bytes) = four_records();
+    let second = frame_starts(&bytes)[1];
+    bytes[second + 20] ^= 0x10;
+    let segment = segments(dir.path())[0].clone();
+    fs::write(&segment, &bytes).unwrap();
+    let keep = EngineConfig {
+        durability: DurabilityConfig {
+            wal_damage: WalDamage::KeepPrefix,
+            ..config().durability
+        },
+        ..config()
+    };
+    let engine = Engine::open(dir.path(), keep).unwrap();
+    commit_all(&engine, &batches(1..2));
+    drop(engine);
+    fs::OpenOptions::new()
+        .write(true)
+        .open(&segment)
+        .unwrap()
+        .set_len(second as u64 + 20)
+        .unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(engine.stats().revision, 1);
+    assert_eq!(
+        fs::read(cut_copy(dir.path(), &segment, second)).unwrap(),
+        bytes[second..],
+        "the earlier copy as it was"
+    );
+    assert_eq!(fs::read_dir(dir.path().join("wal-cut")).unwrap().count(), 2);
+}
+
+/// A segment's name is a lower bound of its records only: bulk loads advance the revision
+/// by checkpoints alone, and an empty active segment keeps its name. Here
+/// 30 replacements leave the store at revision 30 with its first segment, named 1, empty;
+/// two small commits (31 and 32, one quad of known terms each) follow in it, far more
+/// revisions past the name than frames fit. A garbage length over record 31 still finds
+/// record 32 intact after it: the open refuses, the log as it was.
+#[test]
+fn damage_is_found_in_a_segment_named_far_below_its_records() {
+    let node = |n: &str| NamedNode::new_unchecked(format!("http://example.com/{n}"));
+    let triple = |o: u64| {
+        Quad::new(
+            node("s"),
+            node("p"),
+            node(&format!("o{o}")),
+            GraphName::DefaultGraph,
+        )
+    };
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        for n in 0..30 {
+            let load = engine.bulk_load(BulkMode::Replace);
+            load.add(&[triple(n)]);
+            load.finish().unwrap();
+        }
+        assert_eq!(engine.stats().revision, 30);
+        for o in [0, 1] {
+            let mut tx = engine.transaction();
+            tx.insert(triple(o).as_ref());
+            tx.commit().unwrap();
+        }
+    }
+    let segment = segments(dir.path())[0].clone();
+    let mut bytes = fs::read(&segment).unwrap();
+    let starts = frame_starts(&bytes);
+    assert_eq!(starts.len(), 2, "both commits in the first segment");
+    bytes[starts[0]..starts[0] + 4].fill(0xff);
+    fs::write(&segment, &bytes).unwrap();
+    match Engine::open(dir.path(), config()) {
+        Err(EngineError::Corruption(_)) => {}
+        Ok(engine) => panic!("opened at revision {}", engine.stats().revision),
+        Err(other) => panic!("{other}"),
+    }
+    assert_eq!(fs::read(&segment).unwrap(), bytes, "the log as it was");
+}
+
 #[test]
 fn corruption_before_the_tail_is_an_error_not_data_loss() {
     let dir = tempfile::tempdir().unwrap();
@@ -193,7 +445,7 @@ fn corruption_before_the_tail_is_an_error_not_data_loss() {
         ..config()
     };
     {
-        let engine = Engine::open(dir.path(), small_segments).unwrap();
+        let engine = Engine::open(dir.path(), small_segments.clone()).unwrap();
         commit_all(&engine, &batches(0..30));
     }
     let first = &segments(dir.path())[0];
@@ -246,6 +498,208 @@ fn crash_between_checkpoint_and_wal_release_skips_covered_records() {
     let engine = Engine::open(dir.path(), config()).unwrap();
     assert_eq!(engine.stats().revision, 10);
     assert_eq!(contents(&engine), states[9]);
+}
+
+/// Damage in a segment the checkpoint wholly covers, one a failed release left behind,
+/// neither refuses the open nor costs a record after it (F7): its records are all in the
+/// checkpoint. Here records 1 to 10 are in a leftover segment, the checkpoint is at 10, and
+/// records 11 and 12 are in the next segment; the leftover's middle is garbled. Before the fix
+/// the open refused it as damage outside the last segment, and the repair that refusal named
+/// (`recover_until`) cut away the later segments.
+#[test]
+fn damage_in_a_covered_leftover_segment_costs_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let saved_wal = tempfile::tempdir().unwrap();
+    let states = {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        let mut states = commit_all(&engine, &batches(0..10));
+        copy_dir(&dir.path().join("wal"), saved_wal.path());
+        engine.checkpoint().unwrap();
+        states.extend(commit_all(&engine, &batches(10..12)));
+        states
+    };
+    // The covered segment back, as if its release had failed, garbled in the middle.
+    for entry in fs::read_dir(saved_wal.path()).unwrap() {
+        let path = entry.unwrap().path();
+        let mut bytes = fs::read(&path).unwrap();
+        let middle = bytes.len() / 2;
+        bytes[middle] ^= 0xff;
+        fs::write(
+            dir.path().join("wal").join(path.file_name().unwrap()),
+            bytes,
+        )
+        .unwrap();
+    }
+    assert!(segments(dir.path()).len() >= 2);
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_eq!(engine.stats().revision, 12);
+    assert_eq!(contents(&engine), states[11]);
+}
+
+/// A store closed and reopened while another thread of the process starts a child process
+/// opens again (open row IB1312-8ba4, the store lock's). On Linux the child is forked holding a
+/// copy of every open descriptor, the store's `LOCK` among them, until it execs; here it is held
+/// in that window (a `pre_exec` hook that marks it is there and sleeps 3 s) while the store
+/// is dropped and reopened. A lock held by the descriptor's open file description (`flock`)
+/// is then still held by the child, and the reopen fails with `Locked`. On Windows the same
+/// sequence with a child that just lives a while (handles are not inherited unless marked).
+#[test]
+fn a_reopen_is_not_locked_out_by_a_child_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let marks = tempfile::tempdir().unwrap();
+    let mark = marks.path().join("forked");
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    commit_all(&engine, &batches(0..1));
+    let spawner = {
+        let marker = fs::File::create(&mark).unwrap();
+        std::thread::spawn(move || child_in_its_window(marker))
+    };
+    // The child exists, holding what it inherited, before the store is dropped.
+    let started = std::time::Instant::now();
+    while fs::metadata(&mark).unwrap().len() == 0 {
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(30),
+            "the child never started"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    drop(engine);
+    let reopened = Engine::open(dir.path(), config());
+    let ended = spawner.join().unwrap();
+    assert!(
+        reopened.is_ok(),
+        "reopened while a child process was starting: {:?}",
+        reopened.err()
+    );
+    assert!(ended, "the child ran");
+}
+
+/// Guard (right on the base too): a store an earlier binary has open is refused. An earlier
+/// binary holds `flock` on `LOCK` for as long as it runs; here a second open file description
+/// in this process holds it (`flock` locks of two descriptions conflict, in one process too).
+/// Released, the store opens.
+#[test]
+fn a_store_an_earlier_binary_has_open_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    drop(Engine::open(dir.path(), config()).unwrap());
+    let earlier = fs::OpenOptions::new()
+        .write(true)
+        .open(dir.path().join("LOCK"))
+        .unwrap();
+    earlier.try_lock().unwrap();
+    let refused = Engine::open(dir.path(), config());
+    assert!(
+        matches!(refused, Err(EngineError::Locked(_))),
+        "opened beside an earlier binary: {:?}",
+        refused.err()
+    );
+    earlier.unlock().unwrap();
+    drop(earlier);
+    Engine::open(dir.path(), config()).unwrap();
+}
+
+/// The variable that makes [`a_second_process_opens`] act: the store it opens.
+const SECOND_OPEN: &str = "NRESE_TEST_SECOND_OPEN";
+
+/// Run in a second process of this test binary ([`second_process_open`]): opens the store
+/// named by [`SECOND_OPEN`] and exits 3 if it is `Locked`, 0 if it opens holding `quad(0)`, 4
+/// otherwise. In a test run (no variable) it does nothing.
+#[test]
+fn a_second_process_opens() {
+    let Ok(dir) = std::env::var(SECOND_OPEN) else {
+        return;
+    };
+    let code = match Engine::open(Path::new(&dir), config()) {
+        Err(EngineError::Locked(_)) => 3,
+        Ok(engine) if contents(&engine).contains(&quad(0)) => 0,
+        other => {
+            eprintln!(
+                "the second open: {:?}",
+                other.map(|engine| contents(&engine))
+            );
+            4
+        }
+    };
+    std::process::exit(code);
+}
+
+/// What a second process of this test binary gets opening the store in `dir`: 3 `Locked`,
+/// 0 opened with `quad(0)` ([`a_second_process_opens`]).
+fn second_process_open(dir: &Path) -> Option<i32> {
+    std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "durability_tests::a_second_process_opens",
+            "--nocapture",
+            "--test-threads",
+            "1",
+        ])
+        .env(SECOND_OPEN, dir)
+        .status()
+        .unwrap()
+        .code()
+}
+
+/// A store stays locked against another process whatever else this process does with its
+/// lock file: here `LOCK` is read, so opened and closed, while the store is
+/// open. Before the fix the store's lock was a record lock, which any close of the file by the
+/// process drops: a second process opened the store too, and both could commit the same
+/// revision, one of them lost at the next reopen. Once the first engine is dropped, the second
+/// process opens and recovers its commit. Windows: a guard (a handle's lock is its own).
+#[test]
+fn a_store_stays_locked_when_its_lock_file_is_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    commit_all(&engine, &[(vec![quad(0)], Vec::new())]);
+    // Opened and closed; read where the platform lets it (Windows refuses a read of the
+    // locked range, which leaves the open and the close).
+    {
+        use std::io::Read as _;
+        let mut lock = fs::File::open(dir.path().join("LOCK")).unwrap();
+        let _ = lock.read_to_end(&mut Vec::new());
+    }
+    assert_eq!(
+        second_process_open(dir.path()),
+        Some(3),
+        "a second process opened the store beside a live engine"
+    );
+    drop(engine);
+    assert_eq!(
+        second_process_open(dir.path()),
+        Some(0),
+        "the released store didn't open in a second process with its commit"
+    );
+}
+
+/// Starts a child that marks `marker` once it exists and holds the process's descriptors
+/// for 3 s before it runs (Linux: in its fork-to-exec window); whether it ran.
+#[cfg(unix)]
+fn child_in_its_window(marker: fs::File) -> bool {
+    use std::io::Write as _;
+    use std::os::unix::process::CommandExt as _;
+    let mut command = std::process::Command::new("true");
+    // SAFETY: the hook runs in the forked child before exec and only writes to an already
+    // open file and sleeps (system calls, no allocation and no lock), which is safe there.
+    unsafe {
+        command.pre_exec(move || {
+            (&marker).write_all(b"x")?;
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            Ok(())
+        });
+    }
+    command.status().is_ok_and(|status| status.success())
+}
+
+/// Windows: a child that lives 3 s, started while the store is open.
+#[cfg(windows)]
+fn child_in_its_window(marker: fs::File) -> bool {
+    use std::io::Write as _;
+    let mut child = std::process::Command::new("cmd")
+        .args(["/C", "ping -n 4 127.0.0.1 > NUL"])
+        .spawn()
+        .unwrap();
+    (&marker).write_all(b"x").unwrap();
+    child.wait().is_ok_and(|status| status.success())
 }
 
 #[test]
@@ -349,11 +803,13 @@ fn background_checkpoints_bound_the_wal() {
             wal_archive: false,
             recover_until: None,
             recover_until_micros: None,
+            wal_damage: WalDamage::Refuse,
+            forget_on_cut: None,
         },
         ..EngineConfig::default()
     };
     let states = {
-        let engine = Engine::open(dir.path(), config).unwrap();
+        let engine = Engine::open(dir.path(), config.clone()).unwrap();
         commit_all(&engine, &batches(0..200))
     };
     let checkpoints = fs::read_dir(dir.path())
@@ -400,7 +856,7 @@ fn checkpoint_of_many_runs_with_tombstones_recovers() {
         },
         ..config()
     };
-    let engine = Engine::open(dir.path(), config).unwrap();
+    let engine = Engine::open(dir.path(), config.clone()).unwrap();
     let mut batches = batches(0..400);
     // Delete quads inserted by earlier commits: tombstones in later runs.
     for (i, (_, deletes)) in batches.iter_mut().enumerate().skip(1) {
@@ -671,7 +1127,7 @@ fn bulk_loads_are_served_from_their_checkpoint() {
             },
             ..config()
         };
-        let engine = Engine::open(dir.path(), config).unwrap();
+        let engine = Engine::open(dir.path(), config.clone()).unwrap();
         let data: Vec<Quad> = (0..500).flat_map(|n| [quad(n), label(n)]).collect();
         let load = engine.bulk_load(BulkMode::Append);
         load.add(&data);
@@ -704,7 +1160,7 @@ fn bulk_loads_past_their_budget_spill_and_merge() {
         },
         ..config()
     };
-    let engine = Engine::open(dir.path(), config).unwrap();
+    let engine = Engine::open(dir.path(), config.clone()).unwrap();
     commit_all(&engine, &batches(0..5));
     let data: Vec<Quad> = (0..900).flat_map(|n| [quad(n), label(n)]).collect();
     let load = engine.bulk_load(BulkMode::Replace);
@@ -859,43 +1315,6 @@ fn an_image_and_the_archived_log_restore_any_later_revision() {
     assert!(restore(Some(36)).0.is_err());
 }
 
-/// Point-in-time restore by time: the commits made up to a time, from the log's commit
-/// times.
-#[test]
-fn the_log_restores_the_state_at_a_time() {
-    let dir = tempfile::tempdir().unwrap();
-    let engine = Engine::open(dir.path(), config()).unwrap();
-    let now = || {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_micros() as u64
-    };
-    let mut states = commit_all(&engine, &batches(0..5));
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    let middle = now();
-    std::thread::sleep(std::time::Duration::from_millis(5));
-    states.extend(commit_all(&engine, &batches(5..9)));
-    drop(engine);
-    let copy = tempfile::tempdir().unwrap();
-    let wal = copy.path().join("wal");
-    fs::create_dir_all(&wal).unwrap();
-    for entry in fs::read_dir(dir.path().join("wal")).unwrap() {
-        let entry = entry.unwrap();
-        fs::copy(entry.path(), wal.join(entry.file_name())).unwrap();
-    }
-    let config = EngineConfig {
-        durability: DurabilityConfig {
-            recover_until_micros: Some(middle),
-            ..config().durability
-        },
-        ..config()
-    };
-    let engine = Engine::open(copy.path(), config).unwrap();
-    assert_eq!(engine.snapshot().revision(), 5);
-    assert_eq!(contents(&engine), states[4]);
-}
-
 /// A spill directory left by a crashed load goes when the store opens.
 #[test]
 fn opening_removes_a_crashed_loads_spill() {
@@ -929,4 +1348,131 @@ fn bulk_replacement_is_streamed_into_its_checkpoint() {
     drop(engine);
     let engine = Engine::open(dir.path(), config()).unwrap();
     assert_eq!(contents(&engine), expected);
+}
+
+/// A checkpoint orders the dictionary's texts (format 7): two equal texts of 256 KiB, a
+/// simple literal's and a typed one's, are ordered as any others, and a prefix search finds
+/// both after reopening. (The order refined them a level per shared 8 bytes, which
+/// overflowed the checkpoint's worker stacks.)
+#[test]
+fn a_checkpoint_orders_equal_long_texts() {
+    use nrese_engine::{Placement, StringTest};
+    let dir = tempfile::tempdir().unwrap();
+    let text = "abcdefgh".repeat(32 << 10);
+    let objects = [
+        Literal::new_simple_literal(&text),
+        Literal::new_typed_literal(&text, NamedNode::new_unchecked("http://example.com/type")),
+    ];
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    let mut tx = engine.transaction();
+    for (i, object) in objects.iter().enumerate() {
+        let subject = NamedNode::new_unchecked(format!("http://example.com/s{i}"));
+        let predicate = NamedNode::new_unchecked("http://example.com/p");
+        tx.insert(Quad::new(subject, predicate, object.clone(), GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    engine.checkpoint().unwrap();
+    drop(engine);
+    let snapshot = Engine::open(dir.path(), config()).unwrap().snapshot();
+    let test = StringTest {
+        needle: "abcdefghabcdefgh",
+        placement: Placement::Start,
+        iris: false,
+        strings: true,
+        lang_strings: false,
+        typed: true,
+        language: None,
+        ascii_case_insensitive: false,
+    };
+    assert!(snapshot.text_order_ready());
+    assert_eq!(snapshot.matching_strings(&test).len(), 2);
+}
+
+/// A reopen gives a new asserted identity (P2-C1, DUR's condition): it is never persisted,
+/// so a cache keyed by it can't take one process's state for another's.
+#[test]
+fn a_reopen_gives_a_new_asserted_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let before = {
+        let engine = Engine::open(dir.path(), config()).unwrap();
+        commit_all(&engine, &batches(0..2));
+        engine.snapshot().asserted_identity()
+    };
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    assert_ne!(engine.snapshot().asserted_identity(), before);
+}
+
+/// A change a transaction makes, for a table of rows.
+type Change = dyn Fn(&mut nrese_engine::Transaction<'_>);
+
+/// `Transaction::asserted_identity_after` names what the commit publishes (P2-C1, DUR's
+/// conditions of 8 Nov): a new id for a commit that changes asserted statements, the
+/// base's for an inferred-only one, an empty one, and one inserting and then removing the
+/// same statement (no net change); the same on every call; equal to the commit's summary
+/// and to the published snapshot's. In memory and durable.
+#[test]
+fn the_asserted_identity_after_a_transaction_is_what_its_commit_publishes() {
+    let dir = tempfile::tempdir().unwrap();
+    let engines = [
+        ("in memory", Engine::new(config()).unwrap()),
+        ("durable", Engine::open(dir.path(), config()).unwrap()),
+    ];
+    let mut wrong = Vec::new();
+    for (kind, engine) in &engines {
+        let rows: [(&str, &Change, bool); 4] = [
+            (
+                "asserted",
+                &|tx| {
+                    tx.insert(quad(1).as_ref());
+                },
+                true,
+            ),
+            (
+                "inferred only",
+                &|tx| {
+                    let [s, p, o] = ["s", "p", "o"].map(|n| {
+                        tx.intern(
+                            NamedNode::new_unchecked(format!("http://example.com/{n}"))
+                                .as_ref()
+                                .into(),
+                        )
+                    });
+                    tx.insert_inferred(nrese_engine::EncodedTriple::new(s, p, o));
+                },
+                false,
+            ),
+            ("empty", &|_| {}, false),
+            (
+                "inserted, then removed",
+                &|tx| {
+                    tx.insert(quad(2).as_ref());
+                    tx.remove(quad(2).as_ref());
+                },
+                false,
+            ),
+        ];
+        for (name, change, new) in rows {
+            let base = engine.snapshot().asserted_identity();
+            let mut tx = engine.transaction();
+            change(&mut tx);
+            let after = tx.asserted_identity_after();
+            let again = tx.asserted_identity_after();
+            let summary = tx.commit().unwrap();
+            let published = engine.snapshot().asserted_identity();
+            let row = format!("{kind}, {name}");
+            if after != again {
+                wrong.push(format!("{row}: {after:?}, then {again:?}"));
+            }
+            if (after != base) != new {
+                wrong.push(format!("{row}: new {}, expected {new}", after != base));
+            }
+            if summary.asserted != after || published != after {
+                wrong.push(format!(
+                    "{row}: said {after:?}, summary {:?}, published {published:?}",
+                    summary.asserted
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

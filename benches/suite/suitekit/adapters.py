@@ -27,6 +27,7 @@ ruleset; AnzoGraph through the suite).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -39,9 +40,47 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .runtime import PREFIX, DockerRuntime, Measured, Mount, Runtime, Server, Spec
+from . import ns
+from .manifest import docker_memory_bytes
+from .runtime import DockerRuntime, Measured, Mount, Runtime, Server, Spec, memory_now, slice_limit_mib
 
 ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+
+class DeclaredRuntime:
+    """A runtime that says only its kind and that it runs nothing: what an adapter's declarations
+    (images, builds, script_builds, rust_image) may ask of one. Anything else is an AttributeError."""
+    __slots__ = ("kind",)
+    dry = True
+
+    def __init__(self, kind: str):
+        self.kind = kind
+
+
+def declared_context(root: Path, kind: str) -> "Context":
+    """The context an adapter declares its images and builds in for runtime `kind`: `root`, no
+    settings (the defaults), never the environment (suite.py coverage: a receipt's own runtime)."""
+    return Context(DeclaredRuntime(kind), root, root, root, Mount("-", "/data"), [], 0, {}, "declared")
+
+
+def images_for(adapter, root: Path) -> list[str]:
+    """The images an adapter's containers run, the pulled (`images`) and the built here (`builds`),
+    as `suite.py images` asks: the pin set of the tools that pin them at their start
+    (DockerRuntime.pin). An adapter's containers take their image from the same declarations."""
+    ctx = Context(None, root, root, root, Mount("-", "/data"), [], 0, dict(os.environ), "images")
+    return [*adapter.images(ctx), *(image for image, _ in adapter.builds())]
+
+
+def target_mount(kind: str) -> str:
+    """A build's /target: a directory of prebuilt binaries the job names (NRESE_TARGET_VOLUME,
+    an absolute path), else this checkout's own volume. A volume name from outside is refused:
+    another job's name would be its build to time and its volume to remove."""
+    given = os.environ.get("NRESE_TARGET_VOLUME", "")
+    if given and kind == "target":
+        if not os.path.isabs(given):
+            raise SystemExit(f"NRESE_TARGET_VOLUME={given}: a directory of binaries (absolute), not a volume name")
+        return given
+    return ns.name(kind, Path(__file__).resolve().parents[3])
 
 
 @dataclass
@@ -58,13 +97,16 @@ class Context:
     tier_small: bool = False
     # The result cache of a system that has one (`result_cache`): off, or on (its default).
     cache: str = "off"
+    # The services the workload needs beyond SPARQL (`geosparql`, `fulltext`): an adapter
+    # configures its own index for each, as its documentation recommends for the workload.
+    services: tuple[str, ...] = ()
 
     @property
     def dry(self) -> bool:
         return self.runtime.dry
 
     def name(self, part: str) -> str:
-        return f"{PREFIX}{self.run_id}-{part}"
+        return ns.name(f"suite-{self.run_id}-{part}", self.root)
 
     def mounts(self, *more: Mount) -> list[Mount]:
         return [self.data, Mount(str(self.work), "/work", readonly=False), *self.extra, *more]
@@ -93,7 +135,43 @@ class Context:
 
     @property
     def memory(self) -> str | None:
-        return self.setting("DOCKER_MEMORY") or None
+        """Every container's hard memory cap, without swap: DOCKER_MEMORY, "0" for none,
+        by default 90 % of Docker's memory. A run past it is killed in its container
+        instead of making the host thrash (nemo-sparq on LUBM 1000, 5 October 2026); it
+        couldn't have finished within the memory anyway. In a fleet job that declares its
+        containers, the declaration's (ns.declared_memory): the fleet holds it outside the step's
+        slice, so the slice's ceiling below isn't its (#132, fleet Spec 9)."""
+        if declared := ns.declared_memory():
+            return declared
+        setting = self.setting("DOCKER_MEMORY")
+        # Under fleet no container runs uncapped or past what the job declared: Docker can't
+        # join the step's slice, so its ceiling is the slice's limit less a GiB for the driver
+        # (14 Oct 2026: an uncounted 10.7 GB container in a whole-host OOM on the shared host). An
+        # explicit cap above that ceiling is refused, never shrunk (PROTOCOL.md §3).
+        declared = slice_limit_mib()
+        ceiling = max(declared - 1024, 512) if declared is not None else None
+        if setting and setting != "0":
+            asked = docker_mib(setting)
+            if ceiling is not None and asked > ceiling:
+                raise ValueError(f"DOCKER_MEMORY={setting} ({asked} MiB) exceeds the fleet step's slice "
+                                 f"({declared} MiB, {ceiling} MiB for containers): declare more ram_gb")
+            return setting
+        if setting == "0" and declared is None:
+            return None
+        total = docker_memory_bytes()
+        cap = total * 9 // 10 // 1048576 if total else None
+        if ceiling is not None:
+            cap = min(cap or ceiling, ceiling)
+        return f"{cap}m" if cap else None
+
+
+def docker_mib(setting: str) -> int:
+    """A memory size in Docker's notation (bytes, or a number with b, k, m, g), in MiB."""
+    match = re.fullmatch(r"(\d+)([bkmg]?)", setting.strip().lower())
+    if not match:
+        raise ValueError(f"DOCKER_MEMORY={setting}: not a size in Docker's notation (12g, 900m)")
+    scale = {"": 1, "b": 1, "k": 2**10, "m": 2**20, "g": 2**30}[match.group(2)]
+    return int(match.group(1)) * scale // 2**20
 
 
 @dataclass
@@ -113,6 +191,10 @@ class Endpoint:
     ready: str | None = None  # a GET URL that answers 200 when ready (else ASK {} on query)
     server: Server | None = None
     restart_ms: float | None = None
+    # A service index built after the server started (GraphDB's GeoSPARQL plugin), apart
+    # from the restart: its time and what it was.
+    index_ms: float | None = None
+    index_note: str = ""
 
 
 # --- HTTP -----------------------------------------------------------------------------------
@@ -127,6 +209,26 @@ def post(url: str, data: dict, accept: str = "application/sparql-results+json", 
         return e.code, e.read().decode("utf-8", "replace")
     except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
         return 0, ""
+
+
+def upload(url: str, data_source: str, path: str, content_type: str, timeout: float) -> tuple[int, str]:
+    """POSTs a data file (`/data/...` under `data_source`, a host directory) as the body,
+    streamed from the host; a Docker volume isn't a host path, so it needs --data DIR."""
+    relative = path[len("/data/"):]
+    source = Path(data_source)
+    if source.is_dir():
+        with open(source / relative, "rb") as body:
+            request = urllib.request.Request(url, data=body, method="POST",
+                                             headers={"Content-Type": content_type,
+                                                      "Content-Length": str((source / relative).stat().st_size)})
+            try:
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    return response.status, response.read().decode("utf-8", "replace")
+            except urllib.error.HTTPError as e:
+                return e.code, e.read().decode("utf-8", "replace")
+            except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+                return 0, str(e)
+    return 0, f"{path}: uploading from a Docker volume isn't supported; run with --data DIR"
 
 
 def put(url: str, body: str, content_type: str, timeout: float = 60) -> int:
@@ -149,6 +251,13 @@ def get(url: str, timeout: float = 10) -> int:
         return e.code
     except (urllib.error.URLError, ConnectionError, TimeoutError, OSError):
         return 0
+
+
+def query_limit(ctx: "Context") -> int:
+    """A server's own limit per query: the suite's query timeout (QUERY_TIMEOUT_S, which the
+    driver sets), so that a query the client gave up on doesn't run on in the server beside
+    the next ones; the load timeout where none is set."""
+    return int(ctx.setting("QUERY_TIMEOUT_S", "0") or 0) or ctx.timeout_s
 
 
 def wait_ready(ctx: Context, endpoint: Endpoint, timeout_s: float) -> bool:
@@ -209,7 +318,7 @@ def all_ntriples(inputs: list[str]) -> bool:
 class Adapter:
     key = ""
     regimes: dict[str, str] = {"none": ""}
-    runtimes = {"docker", "apptainer"}
+    runtimes = {"docker", "apptainer", "rootfs"}
     answers_only = False
     serves_from_load = False
     persistent = True  # the store is on disk (a size and a restart are measured)
@@ -234,6 +343,13 @@ class Adapter:
 
     def builds(self) -> list[tuple[str, str]]:
         """(image, build context under benches/) for images this repository builds."""
+        return []
+
+    def script_builds(self, ctx: Context) -> list[tuple[str, str, str]]:
+        """(image, build context under benches/, the Dockerfile ARG naming its source commit) for
+        images a script builds from a source chosen apart from their context (benches/sparql/images.sh):
+        their build label names that source commit, and a receipt without it is
+        unknown."""
         return []
 
     def supports(self, ctx: Context, inputs: list[str], regime: str) -> str | None:
@@ -264,6 +380,13 @@ class Adapter:
         self.server = None
         return peak
 
+    def stop_memory(self, ctx: Context) -> tuple[int | None, str, str]:
+        """stop, with the peak's kind and note where the runtime knows them (Docker: anon-kernel
+        or unknown, runtime.container_memory); a row of the peak carries all three."""
+        ctx.runtime.last_memory = ("", "")
+        peak = self.stop(ctx)
+        return (peak, *ctx.runtime.last_memory)
+
     def version(self, ctx: Context, endpoint: Endpoint | None) -> str:
         images = self.images(ctx)
         return image_tag(images[0]) if images else "-"
@@ -276,8 +399,10 @@ class Nrese(Adapter):
     result_cache = True
     regimes = {"none": "disabled", "rdfs": "rdfs", "owl-horst": "owl-horst",
                "owl2-rl": "owl2-rl", "owl2-ql": "owl2-ql"}
-    runtimes = {"docker", "apptainer", "process"}
-    target_volume = "nrese-target"  # the Docker build's output, mounted at /target
+    runtimes = {"docker", "apptainer", "rootfs", "process"}
+    # The Docker build's output, mounted at /target: this checkout's own volume (ns.py), or a
+    # directory of prebuilt binaries a job names (NRESE_TARGET_VOLUME, an absolute path).
+    target_volume = target_mount("target")
     bin_setting = "NRESE_BIN"
 
     def source(self, ctx: Context) -> Path:
@@ -306,8 +431,10 @@ class Nrese(Adapter):
         return str(target / "release" / ("nrese-server.exe" if os.name == "nt" else "nrese-server"))
 
     def target_dir(self, ctx: Context) -> Path:
-        """The host build's output directory."""
-        return Path(ctx.setting("CARGO_TARGET_DIR", str(ctx.root / "target")))
+        """The host build's output directory; a relative CARGO_TARGET_DIR is the repository's (the
+        build runs in an export, removed after it)."""
+        target = Path(ctx.setting("CARGO_TARGET_DIR", str(ctx.root / "target")))
+        return target if target.is_absolute() else ctx.root / target
 
     def spec(self, ctx: Context, name: str, store: str, command: list[str], env: dict) -> Spec:
         env = {"NRESE_STORE_MODE": "on-disk", "NRESE_DATA_DIR": "/store", "RUST_LOG": "info", **env}
@@ -336,7 +463,7 @@ class Nrese(Adapter):
         env = {
             "NRESE_REASONING_MODE": self.regimes[regime],
             "NRESE_BIND_ADDR": f"{host}:{port}",
-            "NRESE_QUERY_TIMEOUT_MS": str(ctx.timeout_s * 1000),
+            "NRESE_QUERY_TIMEOUT_MS": str(query_limit(ctx) * 1000),
             # No rate limits.
             "NRESE_READ_REQUESTS_PER_WINDOW": "100000000",
         }
@@ -345,6 +472,10 @@ class Nrese(Adapter):
             env["NRESE_QUERY_CACHE_BYTES"] = "0"
         if ctx.setting("QUERY_MEMORY_MIB"):
             env["NRESE_MAX_QUERY_MEMORY_BYTES"] = str(int(ctx.setting("QUERY_MEMORY_MIB")) * 1048576)
+        # All queries together (default half the memory): TOTAL_QUERY_MEMORY_MIB, set to what a
+        # competitor's documented configuration gives its queries (QLever's 26 GB on DBLP).
+        if ctx.setting("TOTAL_QUERY_MEMORY_MIB"):
+            env["NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES"] = str(int(ctx.setting("TOTAL_QUERY_MEMORY_MIB")) * 1048576)
         spec = self.spec(ctx, ctx.name("serve"), store, [], env)
         spec.port = port
         base = ctx.runtime.url(spec)
@@ -370,7 +501,7 @@ class NreseOxigraph(Nrese):
     baseline/pre-oxigraph-migration`) or wherever NRESE_OXIGRAPH_SRC points."""
 
     key = "nrese-oxigraph"
-    target_volume = "nrese-oxigraph-target"
+    target_volume = target_mount("oxigraph-target")
     bin_setting = "NRESE_OXIGRAPH_BIN"
 
     def source(self, ctx):
@@ -398,14 +529,27 @@ class Qlever(Adapter):
     result_cache = True
 
     def images(self, ctx):
-        return [ctx.setting("QLEVER_IMAGE", "adfreiburg/qlever:latest")]
+        return [ctx.setting("QLEVER_IMAGE", "adfreiburg/qlever:commit-0998359ab0")]
 
     def load(self, ctx, store, inputs, regime):
-        fmt = "nt" if all_ntriples(inputs) else "ttl"
-        # One input stream: the Turtle files concatenated are one Turtle document.
-        script = ('cat "$@" | /qlever/qlever-index -i /index/idx -f /dev/stdin -F ' + fmt +
-                  ' -p true --stxxl-memory ' + ctx.setting("QLEVER_SORT_MEMORY", "8G"))
-        spec = Spec(ctx.name("load"), self.images(ctx)[0], ["sh", "-c", script, "sh", *inputs],
+        fmt = "nt" if all_ntriples(inputs) else "nq" if all(i.endswith(".nq") for i in inputs) else "ttl"
+        # A dataset's documented index configuration (its Qleverfile): QLEVER_INDEX_SETTINGS,
+        # the settings JSON (SETTINGS_JSON), and QLEVER_VOCABULARY_TYPE (VOCABULARY_TYPE).
+        env, extra, prefix = {}, "", ""
+        if ctx.setting("QLEVER_INDEX_SETTINGS"):
+            env["QLEVER_INDEX_SETTINGS"] = ctx.setting("QLEVER_INDEX_SETTINGS")
+            prefix = 'printf "%s" "$QLEVER_INDEX_SETTINGS" > /index/settings.json && '
+            extra += " -s /index/settings.json"
+        if ctx.setting("QLEVER_VOCABULARY_TYPE"):
+            extra += " --vocabulary-type " + ctx.setting("QLEVER_VOCABULARY_TYPE")
+        # The open-files limit raised as qlever-control's `qlever index` raises it for inputs
+        # past 10 GB (ulimit -Sn 500000): the index builder writes a partial vocabulary per
+        # batch, past the default 1024 (DBLP: 592 batches). One input stream: the Turtle files
+        # concatenated are one Turtle document.
+        prefix = 'ulimit -Sn 500000 2>/dev/null || ulimit -Sn "$(ulimit -Hn)"; ' + prefix
+        script = (prefix + 'cat "$@" | /qlever/qlever-index -i /index/idx -f /dev/stdin -F ' + fmt +
+                  ' -p true --stxxl-memory ' + ctx.setting("QLEVER_SORT_MEMORY", "8G") + extra)
+        spec = Spec(ctx.name("load"), self.images(ctx)[0], ["sh", "-c", script, "sh", *inputs], env,
                     mounts=ctx.mounts(Mount(store, "/index", readonly=False)), workdir="/index",
                     user="root", memory=ctx.memory)
         return Step(ctx.runtime.run(spec, ctx.logs / "load.log", ctx.timeout_s))
@@ -416,20 +560,36 @@ class Qlever(Adapter):
         # result, such as a count, so a repeated run would be a cache hit). On: QLever's
         # default cache.
         cache = ["-k", "0"] if ctx.cache == "off" else []
+        # Queries answered at once (`-j`, --num-simultaneous-queries; QLever's own default
+        # is 1): QLEVER_SIMULTANEOUS_QUERIES, 8 unless set (the concurrency case's defaults
+        # track sets 1, its best-configuration track the core count).
+        simultaneous = ctx.setting("QLEVER_SIMULTANEOUS_QUERIES", "8")
+        # The cache's size with the cache on (`-c`, CACHE_MAX_SIZE of a Qleverfile):
+        # QLEVER_CACHE_MAX_SIZE, else QLever's default.
+        if ctx.cache != "off" and ctx.setting("QLEVER_CACHE_MAX_SIZE"):
+            cache = ["-c", ctx.setting("QLEVER_CACHE_MAX_SIZE")]
         spec = Spec(ctx.name("serve"), self.images(ctx)[0],
-                    ["/qlever/qlever-server", "-i", "/index/idx", "-p", str(port), "-n", "-j", "8",
-                     "-m", ctx.setting("QLEVER_MEMORY", "16G"), *cache, "-s", f"{ctx.timeout_s}s"],
+                    ["/qlever/qlever-server", "-i", "/index/idx", "-p", str(port), "-n", "-j", simultaneous,
+                     "-m", ctx.setting("QLEVER_MEMORY", "16G"), *cache, "-s", f"{query_limit(ctx)}s"],
                     mounts=ctx.mounts(Mount(store, "/index", readonly=False)), port=port,
                     workdir="/index", user="root", memory=ctx.memory)
         base = ctx.runtime.url(spec) + "/"
-        return self.start(ctx, spec, Endpoint(base, base))
+        endpoint = self.start(ctx, spec, Endpoint(base, base))
+        # Runtime parameters a dataset's documentation sets after the start (`qlever settings
+        # KEY=VALUE`, e.g. group-by-hash-map-enabled=true for Sparqloscope): QLEVER_RUNTIME,
+        # space-separated KEY=VALUE pairs, each sent as the server's own settings request.
+        for pair in ctx.setting("QLEVER_RUNTIME").split():
+            key, _, value = pair.partition("=")
+            if not ctx.dry and get(f"{base}?{urllib.parse.urlencode({key: value})}") != 200:
+                raise RuntimeError(f"qlever: the runtime parameter {pair} was not accepted")
+        return endpoint
 
 
 class Oxigraph(Adapter):
     key = "oxigraph"
 
     def images(self, ctx):
-        return [ctx.setting("OXIGRAPH_IMAGE", "ghcr.io/oxigraph/oxigraph:0.5.11")]
+        return [ctx.setting("OXIGRAPH_IMAGE", "ghcr.io/oxigraph/oxigraph:0.5.13")]
 
     def load(self, ctx, store, inputs, regime, log_name="load.log"):
         files = [a for i in inputs for a in ("--file", i)]
@@ -475,8 +635,12 @@ class Jena(Adapter):
     def load(self, ctx, store, inputs, regime):
         env = {"JVM_ARGS": f"-Xmx{ctx.heap}"}
         if regime == "none":
-            spec = Spec(ctx.name("load"), self.image(ctx),
-                        ["tdb2.tdbloader", "--loader=parallel", "--loc", "/store/db", *inputs], env,
+            # JENA_LOADER=xloader: tdb2.xloader, Jena's loader for large data (as Sparqloscope
+            # loads DBLP); else tdb2.tdbloader's parallel loader.
+            command = (["tdb2.xloader", "--loc", "/store/db", "--tmpdir", "/store/tmp", *inputs]
+                       if ctx.setting("JENA_LOADER") == "xloader" else
+                       ["tdb2.tdbloader", "--loader=parallel", "--loc", "/store/db", *inputs])
+            spec = Spec(ctx.name("load"), self.image(ctx), command, env,
                         ctx.mounts(Mount(store, "/store", readonly=False)), memory=ctx.memory)
             return Step(ctx.runtime.run(spec, ctx.logs / "load.log", ctx.timeout_s))
         # A rule reasoner over an in-memory model: Fuseki reads the data at start-up, the
@@ -497,15 +661,19 @@ class Jena(Adapter):
   ja:baseModel <#asserted> .
 <#asserted> a ja:MemoryModel ; ja:content {content} .
 """, encoding="utf-8")
-        self.endpoint = self.serve_config(ctx, env)
+        self.endpoint = self.serve_config(ctx, env, store)
         return Step(Measured(self.endpoint.restart_ms or 0.0, None, 0),
                     note=f"in memory, {reasoner}; the rules run at the first query (count)")
 
-    def serve_config(self, ctx, env):
+    def serve_config(self, ctx, env, store):
         port = ctx.listen(3030)
+        # Fuseki's own state (FUSEKI_BASE, by default $PWD/run) goes into the run's store, which the runtime owns and
+        # removes on every runtime: written into /work as the container's user (root on Docker), the suite couldn't
+        # remove it and the run's cleanup failed.
         spec = Spec(ctx.name("serve"), self.image(ctx),
-                    ["fuseki-server", "--config=/work/fuseki.ttl", f"--port={port}"], env,
-                    ctx.mounts(), port=port, workdir="/work", memory=ctx.memory)
+                    ["fuseki-server", "--config=/work/fuseki.ttl", f"--port={port}"],
+                    {**env, "FUSEKI_BASE": "/store/fuseki"}, ctx.mounts(Mount(store, "/store", readonly=False)),
+                    port=port, workdir="/work", memory=ctx.memory)
         base = ctx.runtime.url(spec)
         return self.start(ctx, spec, Endpoint(f"{base}/ds/query", f"{base}/ds/update"))
 
@@ -513,8 +681,29 @@ class Jena(Adapter):
         if regime != "none":
             return self.endpoint
         port = ctx.listen(3030)
-        spec = Spec(ctx.name("serve"), self.image(ctx),
-                    ["fuseki-server", "--update", "--tdb2", "--loc=/store/db", f"--port={port}", "/ds"],
+        # --timeout: Fuseki stops a query at the suite's limit, as the harness does, so that a
+        # query past it doesn't run on beside the next ones.
+        timeout = f"--timeout={query_limit(ctx) * 1000}"
+        command = ["fuseki-server", "--update", "--tdb2", "--loc=/store/db", f"--port={port}", timeout, "/ds"]
+        if "geosparql" in ctx.services:
+            # Jena's GeoSPARQL dataset over the TDB2 store, its documented defaults
+            # (inference, query rewriting, the spatial index), the index kept in the store:
+            # built at the first start, so the restart includes it.
+            (ctx.work / "fuseki.ttl").write_text("""\
+@prefix fuseki: <http://jena.apache.org/fuseki#> .
+@prefix tdb2: <http://jena.apache.org/2016/tdb#> .
+@prefix geosparql: <http://jena.apache.org/geosparql#> .
+<#service> a fuseki:Service ; fuseki:name "ds" ;
+  fuseki:endpoint [ fuseki:operation fuseki:query ; fuseki:name "query" ] ,
+                  [ fuseki:operation fuseki:update ; fuseki:name "update" ] ;
+  fuseki:dataset <#geo> .
+<#geo> a geosparql:GeosparqlDataset ;
+  geosparql:spatialIndexFile "/store/spatial.index" ;
+  geosparql:dataset <#tdb> .
+<#tdb> a tdb2:DatasetTDB2 ; tdb2:location "/store/db" .
+""", encoding="utf-8")
+            command = ["fuseki-server", "--config=/work/fuseki.ttl", f"--port={port}", timeout]
+        spec = Spec(ctx.name("serve"), self.image(ctx), command,
                     {"JVM_ARGS": f"-Xmx{ctx.heap}"}, ctx.mounts(Mount(store, "/store", readonly=False)),
                     port=port, memory=ctx.memory)
         base = ctx.runtime.url(spec)
@@ -545,7 +734,25 @@ class Virtuoso(Adapter):
         return [ctx.setting("VIRTUOSO_IMAGE", "openlink/virtuoso-opensource-7:7.2.17")]
 
     def spec(self, ctx, name, store, port=None):
-        return Spec(name, self.images(ctx)[0], [], dict(VIRTUOSO_ENV),
+        env = dict(VIRTUOSO_ENV)
+        # Worker threads (ServerThreads; Virtuoso's default 10): VIRTUOSO_SERVER_THREADS,
+        # set by the concurrency case's tracks.
+        if ctx.setting("VIRTUOSO_SERVER_THREADS"):
+            env["VIRT_PARAMETERS_SERVERTHREADS"] = ctx.setting("VIRTUOSO_SERVER_THREADS")
+        # The buffers of virtuoso.ini's table for the machine's memory (16 GB above; 32 GB:
+        # 2720000 and 2000000, as Sparqloscope's DBLP setup): VIRTUOSO_NUMBER_OF_BUFFERS and
+        # VIRTUOSO_MAX_DIRTY_BUFFERS; VIRTUOSO_THREADS_PER_QUERY (ThreadsPerQuery) as the
+        # BSBM V3.1 configuration sets it.
+        for setting, parameter in (("VIRTUOSO_NUMBER_OF_BUFFERS", "NUMBEROFBUFFERS"),
+                                   ("VIRTUOSO_MAX_DIRTY_BUFFERS", "MAXDIRTYBUFFERS"),
+                                   ("VIRTUOSO_THREADS_PER_QUERY", "THREADSPERQUERY")):
+            if ctx.setting(setting):
+                env[f"VIRT_PARAMETERS_{parameter}"] = ctx.setting(setting)
+        # The HTTP listener's own threads ([HTTPServer] ServerThreads; 30 in the V3.1 report's
+        # virtuoso.ini): VIRTUOSO_HTTP_THREADS.
+        if ctx.setting("VIRTUOSO_HTTP_THREADS"):
+            env["VIRT_HTTPSERVER_SERVERTHREADS"] = ctx.setting("VIRTUOSO_HTTP_THREADS")
+        return Spec(name, self.images(ctx)[0], [], env,
                     ctx.mounts(Mount(store, "/database", readonly=False)), port=port, entrypoint=True,
                     memory=ctx.memory)
 
@@ -571,8 +778,8 @@ class Virtuoso(Adapter):
         output.append(text)
         ms = (time.monotonic() - started) * 1000
         (ctx.logs / "load.log").write_text("\n".join(output), encoding="utf-8")
-        peak = self.stop(ctx)
-        return Step(Measured(ms, peak, rc), note="server start-up excluded")
+        peak, kind, memory_note = self.stop_memory(ctx)
+        return Step(Measured(ms, peak, rc, memory_kind=kind, memory_note=memory_note), note="server start-up excluded")
 
     def serve(self, ctx, store, regime):
         port = ctx.listen(8890, fixed=True)
@@ -581,6 +788,45 @@ class Virtuoso(Adapter):
         endpoint = self.start(ctx, spec, Endpoint(f"{base}/sparql", f"{base}/sparql", write_graph="http://bench"))
         self.isql(ctx, "GRANT SPARQL_UPDATE TO \"SPARQL\"; DB.DBA.RDF_DEFAULT_USER_PERMS_SET('nobody', 7);")
         return endpoint
+
+
+class MillenniumDB(Adapter):
+    """MillenniumDB (benches/competitors/millenniumdb): `mdb import` builds the database,
+    `mdb server` answers SPARQL at /sparql. The buffers are its documented configuration for a
+    32 GB machine (Sparqloscope's docs/setup.md, DBLP): MDB_VERSIONED_BUFFER 22GB,
+    MDB_UNVERSIONED_BUFFER 2GB, MDB_STRINGS_STATIC and MDB_STRINGS_DYNAMIC 4GB, and
+    MDB_THREADS 2 worker threads as there (a concurrency track sets the core count); the import
+    buffers MDB_IMPORT_BUFFER (4GB each for strings and tensors)."""
+
+    key = "millenniumdb"
+    runtimes = {"docker", "rootfs"}
+
+    def images(self, ctx):
+        return [ctx.setting("MILLENNIUMDB_IMAGE", "nrese-bench/millenniumdb:ecbf6dd")]
+
+    def script_builds(self, ctx):
+        # benches/sparql/images.sh millenniumdb: its source at MDB_COMMIT (the Dockerfile's default).
+        return [(self.images(ctx)[0], "competitors/millenniumdb", "MDB_COMMIT")]
+
+    def load(self, ctx, store, inputs, regime):
+        buffer = ctx.setting("MDB_IMPORT_BUFFER", "4GB")
+        spec = Spec(ctx.name("load"), self.images(ctx)[0],
+                    ["mdb", "import", *inputs, "/store/db", "--buffer-strings", buffer, "--buffer-tensors", buffer],
+                    mounts=ctx.mounts(Mount(store, "/store", readonly=False)), memory=ctx.memory)
+        return Step(ctx.runtime.run(spec, ctx.logs / "load.log", ctx.timeout_s))
+
+    def serve(self, ctx, store, regime):
+        port = ctx.listen(1234)
+        spec = Spec(ctx.name("serve"), self.images(ctx)[0],
+                    ["mdb", "server", "/store/db", "--port", str(port), "--timeout", str(query_limit(ctx)),
+                     "--threads", ctx.setting("MDB_THREADS", "2"),
+                     "--versioned-buffer", ctx.setting("MDB_VERSIONED_BUFFER", "22GB"),
+                     "--unversioned-buffer", ctx.setting("MDB_UNVERSIONED_BUFFER", "2GB"),
+                     "--strings-static", ctx.setting("MDB_STRINGS_STATIC", "4GB"),
+                     "--strings-dynamic", ctx.setting("MDB_STRINGS_DYNAMIC", "4GB")],
+                    mounts=ctx.mounts(Mount(store, "/store", readonly=False)), port=port, memory=ctx.memory)
+        base = ctx.runtime.url(spec)
+        return self.start(ctx, spec, Endpoint(f"{base}/sparql"))
 
 
 def server_log(ctx: Context, server: Server) -> str:
@@ -637,14 +883,20 @@ class Rdf4j(Adapter):
         for path in inputs:
             if rc != 0:
                 break
-            status, text = post(endpoint.update, {"update": f"LOAD <file://{path}>"},
-                                timeout=ctx.timeout_s)
+            if path.endswith(".nq"):
+                # SPARQL LOAD reads into one graph; quads keep theirs through the REST API.
+                status, text = upload(endpoint.update, ctx.data.source, path, "application/n-quads",
+                                      ctx.timeout_s)
+            else:
+                status, text = post(endpoint.update, {"update": f"LOAD <file://{path}>"},
+                                    timeout=ctx.timeout_s)
             log.append(f"LOAD {path}: HTTP {status} {text[:500]}")
             rc = 0 if status in (200, 204) else 1
         ms = (time.monotonic() - started) * 1000
         (ctx.logs / "load.log").write_text("\n".join(log), encoding="utf-8")
-        peak = self.stop(ctx)
-        return Step(Measured(ms, peak, rc), note="server start-up excluded; SPARQL LOAD per file")
+        peak, kind, memory_note = self.stop_memory(ctx)
+        return Step(Measured(ms, peak, rc, memory_kind=kind, memory_note=memory_note),
+                    note="server start-up excluded; SPARQL LOAD per file")
 
     def serve(self, ctx, store, regime):
         spec = self.spec(ctx, ctx.name("serve"), store, ctx.listen(8080))
@@ -656,20 +908,31 @@ GRAPHDB_RULESETS = {"none": "empty", "rdfs": "rdfs", "owl-horst": "owl-horst",
 
 
 class Graphdb(Adapter):
-    """importrdf into a fresh home (preload without reasoning; load with a ruleset, which
-    infers while loading: UNVERIFIED until a licensed run). Queries need a licence:
-    GRAPHDB_EDITION=free (default; one core, two concurrent queries) or enterprise (all
-    cores, and 40-bit entity IDs for more than two billion distinct values, which full
-    Wikidata needs)."""
+    """Offline preload for plain data, parallel load including inference otherwise.
+
+    11.5 Free: one licensed core, two concurrent queries, five repositories; EE uses
+    its licensed core count, not necessarily the host's. Edition is a requested
+    configuration, not proof of entitlement. Verify the actual license before runs.
+    40-bit IDs require EE here and are useful above 2**31 unique RDF values, not
+    merely because EE is selected. Size the entity index for each workload.
+    See 11.5/{licensing,configuring-a-repository,configuring-graphdb-memory}.html.
+    The total runtime memory cap includes heap, native/direct memory and file cache.
+    """
 
     key = "graphdb"
     regimes = GRAPHDB_RULESETS
+    defaults = {"GRAPHDB_IMAGE": "ontotext/graphdb:11.5.2", "GRAPHDB_EDITION": "free",
+                "GRAPHDB_ENTITY_ID_SIZE": "32", "GRAPHDB_ENTITY_INDEX_SIZE": "10000000",
+                "GRAPHDB_CONTEXT_INDEX": "false", "GRAPHDB_CHECK_INCONSISTENCIES": "false"}
 
     def images(self, ctx):
-        return [ctx.setting("GRAPHDB_IMAGE", "ontotext/graphdb:11.5.1")]
+        return [ctx.setting("GRAPHDB_IMAGE", self.defaults["GRAPHDB_IMAGE"])]
 
     def enterprise(self, ctx) -> bool:
-        return ctx.setting("GRAPHDB_EDITION", "free") == "enterprise"
+        edition = ctx.setting("GRAPHDB_EDITION", self.defaults["GRAPHDB_EDITION"])
+        if edition not in ("free", "enterprise"):
+            raise ValueError("GRAPHDB_EDITION must be free or enterprise")
+        return edition == "enterprise"
 
     def licence(self, ctx) -> str:
         if self.enterprise(ctx):
@@ -677,22 +940,82 @@ class Graphdb(Adapter):
         return ctx.licence("GRAPHDB_LICENSE", "graphdb.license")
 
     def supports(self, ctx, inputs, regime):
+        unsupported = super().supports(ctx, inputs, regime)
+        if unsupported:
+            return unsupported
+        if regime not in self.regimes:
+            return f"no GraphDB ruleset for {regime}"
+        try:
+            self.repository_settings(ctx, regime)
+            self.env(ctx, "")
+        except ValueError as error:
+            return str(error)
         if not self.licence(ctx):
             file = "graphdb-enterprise.license" if self.enterprise(ctx) else "graphdb.license"
             return (f"needs {file} in the licences directory, or GRAPHDB_LICENSE=/path "
                     "(it answers no queries without one)")
-        return super().supports(ctx, inputs, regime)
+        return None
+
+    def repository_settings(self, ctx, regime) -> dict[str, str]:
+        enterprise = self.enterprise(ctx)
+        width = ctx.setting("GRAPHDB_ENTITY_ID_SIZE", self.defaults["GRAPHDB_ENTITY_ID_SIZE"])
+        if width not in ("32", "40") or (width == "40" and not enterprise):
+            raise ValueError("GRAPHDB_ENTITY_ID_SIZE must be 32, or 40 with an Enterprise license")
+        size = ctx.setting("GRAPHDB_ENTITY_INDEX_SIZE", self.defaults["GRAPHDB_ENTITY_INDEX_SIZE"])
+        if not re.fullmatch(r"[0-9]+", size) or not 1 <= int(size) <= 2147483647:
+            raise ValueError("GRAPHDB_ENTITY_INDEX_SIZE must be 1..2147483647")
+        values = {"ruleset": self.regimes[regime], "entity-id-size": width, "entity-index-size": size,
+                  # 11.5 reasoning.html: native equality belongs to the OWL regimes.
+                  "disable-sameAs": "false" if regime in ("owl-horst", "owl2-rl", "owl2-ql") else "true"}
+        for setting, predicate in (("GRAPHDB_CONTEXT_INDEX", "enable-context-index"),
+                                   ("GRAPHDB_CHECK_INCONSISTENCIES", "check-for-inconsistencies")):
+            value = ctx.setting(setting, self.defaults[setting])
+            if value not in ("true", "false"):
+                raise ValueError(f"{setting} must be true or false")
+            values[predicate] = value
+        return values
 
     def env(self, ctx, options: str) -> dict:
-        return {"GDB_HEAP_SIZE": ctx.heap, "GDB_JAVA_OPTS": options}
+        for setting, option in (("GRAPHDB_PAGE_CACHE_SIZE", "-Dgraphdb.page.cache.size="),
+                                ("GRAPHDB_QUERY_MEMORY_THRESHOLD", "-Dgraphdb.query.memory.threshold="),
+                                ("GRAPHDB_MAX_DIRECT_MEMORY", "-XX:MaxDirectMemorySize="),
+                                ("GRAPHDB_INFERENCE_CONCURRENCY", "-Dgraphdb.inference.concurrency="),
+                                ("GRAPHDB_INFERENCE_BUFFER", "-Dgraphdb.inference.buffer=")):
+            value = ctx.setting(setting)
+            if not value:
+                continue
+            integer = setting in ("GRAPHDB_INFERENCE_CONCURRENCY", "GRAPHDB_INFERENCE_BUFFER")
+            if not re.fullmatch(r"[1-9][0-9]*" + ("" if integer else "[kKmMgG]?"), value):
+                raise ValueError(f"{setting} must be positive {'integer' if integer else 'bytes or K/M/G size'}")
+            # 11.5 memory docs use page.cache.size=3G/5g and query threshold=250m.
+            # Normalize our size syntax to bytes; do not rely on JVM flag parsing
+            # for GraphDB properties. The native JVM flag keeps its own size syntax.
+            amount = int(value[:-1]) * 1024 ** ("kmg".index(value[-1].lower()) + 1) if value[-1].isalpha() else int(value)
+            if not integer and setting != "GRAPHDB_MAX_DIRECT_MEMORY":
+                value = str(amount)
+            options += " " + option + value
+        return {"GDB_HEAP_SIZE": ctx.heap, "GDB_JAVA_OPTS": options.strip()}
+
+    def configuration(self, ctx, regime) -> str:
+        config = (ctx.root / "benches/competitors/graphdb/repo-owl2-rl.ttl").read_text(encoding="utf-8")
+        for predicate, value in self.repository_settings(ctx, regime).items():
+            config = re.sub(r'graphdb:' + re.escape(predicate) + r' "[^"\n]*"',
+                            f'graphdb:{predicate} "{value}"', config)
+        return config
+
+    def record_configuration(self, ctx, spec, phase):
+        env = dict(spec.env)
+        env["GDB_JAVA_OPTS"] = re.sub(r"-Dgraphdb\.license\.file=\S+",
+                                     "-Dgraphdb.license.file=<set>", env["GDB_JAVA_OPTS"])
+        record = {"image": spec.image, "requested_edition": "enterprise" if self.enterprise(ctx) else "free",
+                  "memory": spec.memory, "env": env}
+        (ctx.logs / f"graphdb-{phase}-config.json").write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
 
     def load(self, ctx, store, inputs, regime):
-        template = (ctx.root / "benches/competitors/graphdb/repo-owl2-rl.ttl").read_text(encoding="utf-8")
-        config = template.replace('graphdb:ruleset "owl2-rl"', f'graphdb:ruleset "{self.regimes[regime]}"')
-        if self.enterprise(ctx):
-            config = config.replace('graphdb:entity-id-size "32"', 'graphdb:entity-id-size "40"')
-        (ctx.work / "repo.ttl").write_text(config, encoding="utf-8")
-        mode = ["preload", "-f"] if regime == "none" else ["load", "-f", "-m", "parallel"]
+        config = self.configuration(ctx, regime)
+        for path in (ctx.work / "repo.ttl", ctx.logs / "graphdb-repo.ttl"):
+            path.write_text(config, encoding="utf-8")
+        mode = ["preload", "-f"] if regime == "none" else ["load", "-f", "-s", "-m", "parallel"]
         # The load runs under the same licence as the server: the edition decides the cores
         # it may use and whether 40-bit IDs are allowed.
         spec = Spec(ctx.name("load"), self.images(ctx)[0],
@@ -700,8 +1023,9 @@ class Graphdb(Adapter):
                     self.env(ctx, "-Dgraphdb.home=/opt/graphdb/home -Dgraphdb.license.file=/license/graphdb.license"),
                     ctx.mounts(Mount(self.licence(ctx), "/license/graphdb.license"),
                                Mount(store, "/opt/graphdb/home", readonly=False)), memory=ctx.memory)
+        self.record_configuration(ctx, spec, "load")
         return Step(ctx.runtime.run(spec, ctx.logs / "load.log", ctx.timeout_s),
-                    note="" if regime == "none" else "UNVERIFIED: importrdf load with a ruleset")
+                    note="" if regime == "none" else "importrdf load includes inference; qualify each workload's answers")
 
     def serve(self, ctx, store, regime):
         port = ctx.listen(7200, fixed=True)
@@ -710,9 +1034,37 @@ class Graphdb(Adapter):
                     self.env(ctx, "-Dgraphdb.license.file=/license/graphdb.license"),
                     ctx.mounts(licence, Mount(store, "/opt/graphdb/home", readonly=False)), port=port,
                     entrypoint=True, memory=ctx.memory)
+        self.record_configuration(ctx, spec, "serve")
         base = ctx.runtime.url(spec)
-        return self.start(ctx, spec, Endpoint(f"{base}/repositories/bench",
-                                              f"{base}/repositories/bench/statements"))
+        endpoint = self.start(ctx, spec, Endpoint(f"{base}/repositories/bench",
+                                                  f"{base}/repositories/bench/statements"))
+        if "geosparql" in ctx.services and not ctx.dry:
+            # 11.5 geosparql-support.html: the plugin is enabled by an update, which builds
+            # its index (the defaults: quad prefix tree, precision 11) before it returns.
+            started = time.monotonic()
+            status, text = post(endpoint.update, {"update": "INSERT DATA { [] "
+                                "<http://www.ontotext.com/plugins/geosparql#enabled> \"true\" . }"},
+                                timeout=ctx.timeout_s)
+            endpoint.index_ms = (time.monotonic() - started) * 1000
+            endpoint.index_note = f"GeoSPARQL plugin enabled (HTTP {status})"
+            if not 200 <= status < 300:
+                raise RuntimeError(f"graphdb: enabling GeoSPARQL failed: {status} {text[:200]}")
+        return endpoint
+
+    def version(self, ctx, endpoint):
+        if endpoint is None or ctx.dry:
+            return "-"
+        base = endpoint.query.rsplit("/repositories/", 1)[0]
+        try:
+            with urllib.request.urlopen(f"{base}/rest/info/version", timeout=10) as response:
+                info = json.loads(response.read())
+            metadata = {key: info[key] for key in ("productVersion", "productType")}
+            if not all(isinstance(v, str) and len(v) < 80 for v in metadata.values()):
+                return "-"
+            (ctx.logs / "graphdb-runtime.json").write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+            return metadata["productVersion"]
+        except (OSError, ValueError, KeyError, TypeError):
+            return "-"
 
 
 class Rdfox(Adapter):
@@ -782,8 +1134,9 @@ class Anzograph(Adapter):
             rc = rc or (0 if status == 200 else 1)
         ms = (time.monotonic() - started) * 1000
         (ctx.logs / "load.log").write_text("\n".join(output), encoding="utf-8")
-        peak = self.server.sampler.peak if self.server and self.server.sampler else None
-        return Step(Measured(ms, peak, rc), note="server start-up excluded; in memory")
+        peak, kind, memory_note = memory_now(self.server)  # it serves on: its peak so far
+        return Step(Measured(ms, peak, rc, memory_kind=kind, memory_note=memory_note),
+                    note="server start-up excluded; in memory")
 
     def serve(self, ctx, store, regime):
         return self.endpoint
@@ -825,8 +1178,17 @@ class ClosureAdapter(Adapter):
 
 
 class Nemo(ClosureAdapter):
+    """Nemo (TU Dresden's Rust datalog engine) on an OWL 2 RL encoding. Three encodings, each
+    a system of its own so that every Nemo number names its encoding
+    (benches/reasoning/nemo/): `nemo`, the general translation of the W3C rule tables;
+    `nemo-schemafirst`, the same rules with every schema pattern folded into a small
+    relation first; `nemo-sparq`, sparq's LUBM-tailored encoding, vendored unchanged. The
+    image holds only the pinned Nemo binary; the rules are mounted from the repository, so
+    a run always uses the committed file, and its SHA-256 goes into the step's note."""
+
     key = "nemo"
-    regimes = {"owl2-rl": "benches/reasoning/nemo/owl2rl.rls"}
+    regimes = {"owl2-rl": "owl2-rl"}
+    rules = "owl2rl.rls"
 
     def builds(self):
         return [("nrese-bench/nemo", "reasoning/nemo")]
@@ -836,18 +1198,52 @@ class Nemo(ClosureAdapter):
             return "its rules read one N-Triples file; the inputs aren't N-Triples"
         return super().supports(ctx, inputs, regime)
 
+    def program(self) -> str:
+        """Shell lines that leave the program to run in /tmp/rules.rls."""
+        return f"cp /rules/{self.rules} /tmp/rules.rls"
+
     def load(self, ctx, store, inputs, regime):
         self.inputs = inputs
-        script = ('mkdir -p /tmp/in /tmp/nemo && cat "$@" > /tmp/in/input.nt && '
-                  'nmo -I /tmp/in -D /tmp/nemo -o --report short /nemo/owl2rl.rls && '
+        directory = ctx.root / "benches/reasoning/nemo"
+        source = directory / self.rules
+        digest = hashlib.sha256(source.read_bytes()).hexdigest()[:16] if source.exists() else "?"
+        script = (f'mkdir -p /tmp/in /tmp/nemo && cat "$@" > /tmp/in/input.nt && {self.program()} && '
+                  'nmo -I /tmp/in -D /tmp/nemo -o --report short /tmp/rules.rls && '
                   'cp /tmp/nemo/inferred.nt /work/closure.nt')
-        spec = Spec(ctx.name("load"), "nrese-bench/nemo", ["sh", "-c", script, "sh", *inputs],
-                    mounts=ctx.mounts(), memory=ctx.memory)
+        spec = Spec(ctx.name("load"), self.builds()[0][0], ["sh", "-c", script, "sh", *inputs],
+                    mounts=ctx.mounts(Mount(str(directory), "/rules")), memory=ctx.memory)
         log = ctx.logs / "load.log"
         measured = ctx.runtime.run(spec, log, ctx.timeout_s)
         reasoning = last_int(r"Reasoning: +(\d+)ms", read_text(log))
         return Step(measured, inferred=self.closure_size(ctx), reason_ms=reasoning,
-                    note="load time includes concatenating the inputs")
+                    note=f"encoding {self.rules} sha256 {digest}; load time includes concatenating the inputs")
+
+
+class NemoSchemaFirst(Nemo):
+    key = "nemo-schemafirst"
+    rules = "owl2rl-schemafirst.rls"
+
+
+class NemoSparq(Nemo):
+    """sparq's LUBM-tailored encoding (benches/reasoning/nemo/sparq/README.md): the file
+    unchanged; on a copy, its input placeholder filled in, its own export dropped, and the
+    suite's output rule (the derived statements that weren't asserted) appended."""
+
+    key = "nemo-sparq"
+    rules = "sparq/owl-rl.rls"
+
+    def supports(self, ctx, inputs, regime):
+        # Its rules are the OWL rules the LUBM TBox uses: elsewhere its closure is
+        # incomplete by design, not a result.
+        if not any(Path(path).name == "univ-bench.nt" for path in inputs):
+            return "LUBM-tailored: its rules cover the LUBM TBox (univ-bench) only"
+        return super().supports(ctx, inputs, regime)
+
+    def program(self) -> str:
+        output = ("INFERRED(?s, ?p, ?o) :- closed(?s, ?p, ?o), ~triple(?s, ?p, ?o) .\n"
+                  "@export INFERRED :- ntriples { resource = \"inferred.nt\" } .\n")
+        return (f"sed -e 's/@@DATA@@/input.nt/' -e '/^@export closed/d' /rules/{self.rules} > /tmp/rules.rls && "
+                f"printf '{output}' >> /tmp/rules.rls")
 
 
 class Owlrl(ClosureAdapter):
@@ -868,7 +1264,7 @@ class Owlrl(ClosureAdapter):
 
     def load(self, ctx, store, inputs, regime):
         self.inputs = inputs
-        spec = Spec(ctx.name("load"), "nrese-bench/owlrl-oracle",
+        spec = Spec(ctx.name("load"), self.builds()[0][0],
                     ["python", "/oracle/owlrl_materialise.py", "--profile", self.regimes[regime],
                      "--out", "/work/closure.nt", *inputs], mounts=ctx.mounts(), memory=ctx.memory)
         log = ctx.logs / "load.log"
@@ -879,8 +1275,8 @@ class Owlrl(ClosureAdapter):
                     reason_ms=float(seconds[-1]) * 1000 if seconds else None)
 
 
-ADAPTERS = {a.key: a for a in (Nrese, NreseOxigraph, NreseFsst, Qlever, Oxigraph, Jena, Virtuoso, Rdf4j, Graphdb, Rdfox, Anzograph,
-                                 Nemo, Owlrl)}
+ADAPTERS = {a.key: a for a in (Nrese, NreseOxigraph, NreseFsst, Qlever, Oxigraph, Jena, Virtuoso, MillenniumDB, Rdf4j,
+                                 Graphdb, Rdfox, Anzograph, Nemo, NemoSchemaFirst, NemoSparq, Owlrl)}
 
 
 def adapter(key: str) -> Adapter | None:

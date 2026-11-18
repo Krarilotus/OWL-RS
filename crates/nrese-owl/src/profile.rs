@@ -1,0 +1,894 @@
+//! The OWL 2 profiles per axiom (W3C *OWL 2 Web Ontology Language Profiles*, second
+//! edition): which of EL (§2), QL (§3) and RL (§4) an axiom's grammar admits, and so
+//! which profiles an ontology is in. The store routes by it: an RL ontology is answered
+//! by the RL rules (complete for it, theorem PR1), EL and Horn parts by the context core,
+//! the rest by the hypertableau (docs/design/owl2-dl.md §4).
+//!
+//! The grammars are checked as written, by position: QL and RL distinguish the class
+//! expressions allowed on the left of a subclass axiom (`subClassExpression`), on its
+//! right (`superClassExpression`) and in an equivalence (RL's `equivClassExpression`),
+//! and each profile has its datatypes. Not checked: the global restrictions beyond the
+//! grammar (EL's on property chains and ranges, QL's and RL's on anonymous individuals in
+//! assertions); an axiom outside every profile is still OWL 2 DL.
+
+use std::collections::HashSet;
+
+use crate::model::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, RangeId};
+use crate::{Ontology, Term};
+
+/// The profiles an axiom (or an ontology: each of its axioms) is in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Profiles {
+    pub el: bool,
+    pub ql: bool,
+    pub rl: bool,
+}
+
+impl Profiles {
+    pub const ALL: Self = Self {
+        el: true,
+        ql: true,
+        rl: true,
+    };
+
+    /// In both.
+    pub fn and(self, other: Self) -> Self {
+        Self {
+            el: self.el && other.el,
+            ql: self.ql && other.ql,
+            rl: self.rl && other.rl,
+        }
+    }
+
+    /// The names of the profiles it is in (`EL`, `QL`, `RL`).
+    pub fn names(self) -> Vec<&'static str> {
+        [(self.el, "EL"), (self.ql, "QL"), (self.rl, "RL")]
+            .into_iter()
+            .filter_map(|(on, name)| on.then_some(name))
+            .collect()
+    }
+}
+
+const XSD: &str = "http://www.w3.org/2001/XMLSchema#";
+const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+const RDFS: &str = "http://www.w3.org/2000/01/rdf-schema#";
+const OWL: &str = "http://www.w3.org/2002/07/owl#";
+
+/// EL's and QL's datatypes (§2.2.1, §3.2.1).
+const EL_QL_DATATYPES: &[&str] = &[
+    "rdf:PlainLiteral",
+    "rdf:XMLLiteral",
+    "rdfs:Literal",
+    "owl:real",
+    "owl:rational",
+    "xsd:decimal",
+    "xsd:integer",
+    "xsd:nonNegativeInteger",
+    "xsd:string",
+    "xsd:normalizedString",
+    "xsd:token",
+    "xsd:Name",
+    "xsd:NCName",
+    "xsd:NMTOKEN",
+    "xsd:hexBinary",
+    "xsd:base64Binary",
+    "xsd:anyURI",
+    "xsd:dateTime",
+    "xsd:dateTimeStamp",
+];
+
+/// RL's beyond EL's and QL's: those §2.2.1 bars from EL, and `rdf:langString` (the rules
+/// judge it as the language-tagged part of `rdf:PlainLiteral`). With EL's and QL's but
+/// `owl:real` and `owl:rational`, RL's are the OWL 2 datatype map (§4.2.1), and no other.
+const RL_BEYOND_EL_QL: &[&str] = &[
+    "xsd:double",
+    "xsd:float",
+    "xsd:nonPositiveInteger",
+    "xsd:positiveInteger",
+    "xsd:negativeInteger",
+    "xsd:long",
+    "xsd:int",
+    "xsd:short",
+    "xsd:byte",
+    "xsd:unsignedLong",
+    "xsd:unsignedInt",
+    "xsd:unsignedShort",
+    "xsd:unsignedByte",
+    "xsd:language",
+    "xsd:boolean",
+    "rdf:langString",
+];
+
+fn rl_name(name: &str) -> bool {
+    !matches!(name, "owl:real" | "owl:rational")
+        && (EL_QL_DATATYPES.contains(&name) || RL_BEYOND_EL_QL.contains(&name))
+}
+
+/// Whether OWL 2 RL admits the datatype `iri`: one of its datatypes, or one outside the
+/// standard vocabularies (the ontology's own, whose values nothing fixes).
+pub fn rl_datatype(iri: &str) -> bool {
+    short(iri).is_none_or(|name| rl_name(&name))
+}
+
+/// The short name of a datatype in one of the standard vocabularies, if it is in one.
+fn short(iri: &str) -> Option<String> {
+    for (ns, prefix) in [(XSD, "xsd"), (RDF, "rdf"), (RDFS, "rdfs"), (OWL, "owl")] {
+        if let Some(local) = iri.strip_prefix(ns) {
+            return Some(format!("{prefix}:{local}"));
+        }
+    }
+    None
+}
+
+/// Which profiles' datatypes include `datatype` (a datatype the ontology defines itself,
+/// outside the standard vocabularies, counts as in every profile's).
+fn datatype(o: &Ontology, datatype: Term) -> Profiles {
+    let Some(name) = o.data.iris.get(&datatype).and_then(|iri| short(iri)) else {
+        return Profiles::ALL;
+    };
+    let el_ql = EL_QL_DATATYPES.contains(&name.as_str());
+    Profiles {
+        el: el_ql,
+        ql: el_ql,
+        rl: rl_name(&name),
+    }
+}
+
+/// Which profiles admit the data range `r`.
+fn range(o: &Ontology, r: RangeId) -> Profiles {
+    match o.range(r) {
+        DataRange::Literal => Profiles::ALL,
+        DataRange::Datatype(t) => datatype(o, *t),
+        DataRange::And(rs) => rs
+            .iter()
+            .fold(Profiles::ALL, |acc, &r| acc.and(range(o, r))),
+        // EL: one literal only.
+        DataRange::OneOf(xs) => Profiles {
+            el: xs.len() == 1,
+            ql: false,
+            rl: false,
+        },
+        DataRange::Or(_) | DataRange::Not(_) | DataRange::Restriction(..) => Profiles {
+            el: false,
+            ql: false,
+            rl: false,
+        },
+    }
+}
+
+fn named(p: ObjProp) -> bool {
+    matches!(p, ObjProp::Named(_))
+}
+
+/// `e`, through intersections of one operand (an OWL 1 form the reader keeps), which
+/// mean their operand.
+fn unwrap(o: &Ontology, mut e: ExprId) -> ExprId {
+    while let ClassExpr::And(es) = o.class(e) {
+        match es.as_slice() {
+            [only] => e = *only,
+            _ => break,
+        }
+    }
+    e
+}
+
+/// Whether EL admits the class expression `e` (EL has one grammar for every position).
+fn el(o: &Ontology, e: ExprId) -> bool {
+    let e = unwrap(o, e);
+    match o.class(e) {
+        ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => true,
+        ClassExpr::And(es) => es.iter().all(|&e| el(o, e)),
+        ClassExpr::Some(p, f) => named(*p) && el(o, *f),
+        ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => named(*p),
+        ClassExpr::OneOf(xs) => xs.len() == 1,
+        ClassExpr::DataSome(_, r) => range(o, *r).el,
+        ClassExpr::DataHasValue(..) => true,
+        _ => false,
+    }
+}
+
+/// QL's `subClassExpression` (§3.2.3): a class, `∃R.⊤`, `∃D.Literal`.
+fn ql_sub(o: &Ontology, e: ExprId) -> bool {
+    let e = unwrap(o, e);
+    match o.class(e) {
+        ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => true,
+        ClassExpr::Some(_, f) => matches!(o.class(*f), ClassExpr::Thing),
+        ClassExpr::DataSome(_, r) => matches!(o.range(*r), DataRange::Literal),
+        _ => false,
+    }
+}
+
+/// QL's `superClassExpression`: a class, an intersection of them, the complement of a
+/// `subClassExpression`, `∃R.A`, `∃D.range`.
+fn ql_super(o: &Ontology, e: ExprId) -> bool {
+    let e = unwrap(o, e);
+    match o.class(e) {
+        ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => true,
+        ClassExpr::And(es) => es.iter().all(|&e| ql_super(o, e)),
+        ClassExpr::Not(e) => ql_sub(o, *e),
+        ClassExpr::Some(_, f) => matches!(o.class(*f), ClassExpr::Class(_) | ClassExpr::Thing),
+        ClassExpr::DataSome(_, r) => range(o, *r).ql,
+        _ => false,
+    }
+}
+
+/// RL's `subClassExpression` (§4.2.3): a class other than `owl:Thing`, intersections and
+/// unions of them, enumerations, `∃R.sub` (or `∃R.⊤`), `∃D.range`, values.
+fn rl_sub(o: &Ontology, e: ExprId) -> bool {
+    let e = unwrap(o, e);
+    match o.class(e) {
+        ClassExpr::Class(_) | ClassExpr::Nothing => true,
+        ClassExpr::And(es) | ClassExpr::Or(es) => es.iter().all(|&e| rl_sub(o, e)),
+        ClassExpr::OneOf(_) => true,
+        ClassExpr::Some(_, f) => matches!(o.class(*f), ClassExpr::Thing) || rl_sub(o, *f),
+        ClassExpr::DataSome(_, r) => range(o, *r).rl,
+        ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => true,
+        _ => false,
+    }
+}
+
+/// RL's `superClassExpression`: a class other than `owl:Thing`, intersections, the
+/// complement of a `subClassExpression`, `∀R.super`, values, `≤ 0/1 R(.sub)`, `∀D.range`,
+/// `≤ 0/1 D(.range)`.
+pub(crate) fn rl_super(o: &Ontology, e: ExprId) -> bool {
+    let e = unwrap(o, e);
+    match o.class(e) {
+        ClassExpr::Class(_) | ClassExpr::Nothing => true,
+        ClassExpr::And(es) => es.iter().all(|&e| rl_super(o, e)),
+        ClassExpr::Not(e) => rl_sub(o, *e),
+        ClassExpr::All(_, f) => rl_super(o, *f),
+        ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => true,
+        ClassExpr::Max(n, _, f) => {
+            *n <= 1 && (matches!(o.class(*f), ClassExpr::Thing) || rl_sub(o, *f))
+        }
+        ClassExpr::DataAll(_, r) => range(o, *r).rl,
+        ClassExpr::DataMax(n, _, r) => *n <= 1 && range(o, *r).rl,
+        _ => false,
+    }
+}
+
+/// RL's `equivClassExpression`: a class other than `owl:Thing`, intersections, values.
+fn rl_equiv(o: &Ontology, e: ExprId) -> bool {
+    let e = unwrap(o, e);
+    match o.class(e) {
+        ClassExpr::Class(_) | ClassExpr::Nothing => true,
+        ClassExpr::And(es) => es.iter().all(|&e| rl_equiv(o, e)),
+        ClassExpr::HasValue(..) | ClassExpr::DataHasValue(..) => true,
+        _ => false,
+    }
+}
+
+/// The individuals an assertion names.
+fn individuals(axiom: &Axiom) -> Vec<Term> {
+    match axiom {
+        Axiom::ClassAssertion(_, a) => vec![*a],
+        Axiom::ObjectPropertyAssertion(_, a, b)
+        | Axiom::NegativeObjectPropertyAssertion(_, a, b) => {
+            vec![*a, *b]
+        }
+        Axiom::DataPropertyAssertion(_, a, _) | Axiom::NegativeDataPropertyAssertion(_, a, _) => {
+            vec![*a]
+        }
+        Axiom::SameIndividual(v) | Axiom::DifferentIndividuals(v) => v.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// The properties an expression names, with those of its fillers.
+fn expr_properties(o: &Ontology, e: ExprId, out: &mut Vec<Term>) {
+    match o.class(e) {
+        ClassExpr::And(es) | ClassExpr::Or(es) => {
+            for &e in es {
+                expr_properties(o, e, out);
+            }
+        }
+        ClassExpr::Not(e) => expr_properties(o, *e, out),
+        ClassExpr::Some(p, f)
+        | ClassExpr::All(p, f)
+        | ClassExpr::Min(_, p, f)
+        | ClassExpr::Max(_, p, f)
+        | ClassExpr::Exact(_, p, f) => {
+            out.push(p.named());
+            expr_properties(o, *f, out);
+        }
+        ClassExpr::HasValue(p, _) | ClassExpr::HasSelf(p) => out.push(p.named()),
+        ClassExpr::DataSome(d, _)
+        | ClassExpr::DataAll(d, _)
+        | ClassExpr::DataHasValue(d, _)
+        | ClassExpr::DataMin(_, d, _)
+        | ClassExpr::DataMax(_, d, _)
+        | ClassExpr::DataExact(_, d, _) => out.push(*d),
+        _ => {}
+    }
+}
+
+/// The properties an axiom names, in its expressions too.
+pub(crate) fn properties(o: &Ontology, axiom: &Axiom) -> Vec<Term> {
+    let mut out = Vec::new();
+    let mut exprs: Vec<ExprId> = Vec::new();
+    match axiom {
+        Axiom::SubClassOf(a, b) => exprs.extend([*a, *b]),
+        Axiom::EquivalentClasses(v) | Axiom::DisjointClasses(v) | Axiom::DisjointUnion(_, v) => {
+            exprs.extend(v)
+        }
+        Axiom::SubObjectPropertyOf(chain, q) => {
+            out.extend(chain.iter().map(|p| p.named()));
+            out.push(q.named());
+        }
+        Axiom::EquivalentObjectProperties(v) | Axiom::DisjointObjectProperties(v) => {
+            out.extend(v.iter().map(|p| p.named()))
+        }
+        Axiom::InverseObjectProperties(p, q) => out.extend([p.named(), q.named()]),
+        Axiom::ObjectPropertyDomain(p, c) | Axiom::ObjectPropertyRange(p, c) => {
+            out.push(p.named());
+            exprs.push(*c);
+        }
+        Axiom::ObjectCharacteristic(_, p) => out.push(p.named()),
+        Axiom::SubDataPropertyOf(a, b) => out.extend([*a, *b]),
+        Axiom::EquivalentDataProperties(v) | Axiom::DisjointDataProperties(v) => out.extend(v),
+        Axiom::DataPropertyDomain(d, c) => {
+            out.push(*d);
+            exprs.push(*c);
+        }
+        Axiom::DataPropertyRange(d, _) | Axiom::FunctionalDataProperty(d) => out.push(*d),
+        Axiom::HasKey(c, ps, ds) => {
+            exprs.push(*c);
+            out.extend(ps.iter().map(|p| p.named()));
+            out.extend(ds);
+        }
+        Axiom::ClassAssertion(c, _) => exprs.push(*c),
+        Axiom::ObjectPropertyAssertion(p, ..)
+        | Axiom::NegativeObjectPropertyAssertion(p, ..)
+        | Axiom::DataPropertyAssertion(p, ..)
+        | Axiom::NegativeDataPropertyAssertion(p, ..) => out.push(*p),
+        _ => {}
+    }
+    for e in exprs {
+        expr_properties(o, e, &mut out);
+    }
+    out
+}
+
+/// The profiles that admit `axiom` (of `o`'s interners). EL and QL admit no anonymous
+/// individual (`Individual := NamedIndividual`); RL admits none of the built-in top and
+/// bottom properties (§4.2.1).
+pub fn of(o: &Ontology, axiom: &Axiom) -> Profiles {
+    let mut profiles = grammar(o, axiom);
+    if individuals(axiom).iter().any(|a| o.anonymous.contains(a)) {
+        profiles.el = false;
+        profiles.ql = false;
+    }
+    let b = o.builtin;
+    let builtin = [b.top_object, b.bottom_object, b.top_data, b.bottom_data];
+    if properties(o, axiom)
+        .iter()
+        .any(|p| builtin.contains(&Some(*p)))
+    {
+        profiles.rl = false;
+    }
+    profiles
+}
+
+/// The profiles whose grammar admits `axiom`.
+fn grammar(o: &Ontology, axiom: &Axiom) -> Profiles {
+    let all = |v: &[ExprId], f: &dyn Fn(ExprId) -> bool| v.iter().all(|&e| f(e));
+    let el_ = |e: ExprId| el(o, e);
+    let none = Profiles {
+        el: false,
+        ql: false,
+        rl: false,
+    };
+    match axiom {
+        Axiom::Declaration(..) => Profiles::ALL,
+        Axiom::SubClassOf(a, b) => Profiles {
+            el: el_(*a) && el_(*b),
+            ql: ql_sub(o, *a) && ql_super(o, *b),
+            rl: rl_sub(o, *a) && rl_super(o, *b),
+        },
+        Axiom::EquivalentClasses(v) => Profiles {
+            el: all(v, &el_),
+            ql: all(v, &|e| ql_sub(o, e)),
+            rl: all(v, &|e| rl_equiv(o, e)),
+        },
+        Axiom::DisjointClasses(v) => Profiles {
+            el: all(v, &el_),
+            ql: all(v, &|e| ql_sub(o, e)),
+            rl: all(v, &|e| rl_sub(o, e)),
+        },
+        Axiom::DisjointUnion(..) => none,
+        Axiom::SubObjectPropertyOf(chain, q) => Profiles {
+            el: chain.iter().all(|&p| named(p)) && named(*q),
+            ql: chain.len() == 1,
+            rl: true,
+        },
+        Axiom::EquivalentObjectProperties(v) => Profiles {
+            el: v.iter().all(|&p| named(p)),
+            ql: true,
+            rl: true,
+        },
+        Axiom::DisjointObjectProperties(_) | Axiom::InverseObjectProperties(..) => Profiles {
+            el: false,
+            ql: true,
+            rl: true,
+        },
+        Axiom::ObjectPropertyDomain(p, c) | Axiom::ObjectPropertyRange(p, c) => Profiles {
+            el: named(*p) && el_(*c),
+            ql: ql_super(o, *c),
+            rl: rl_super(o, *c),
+        },
+        Axiom::ObjectCharacteristic(c, p) => match c {
+            Characteristic::Reflexive => Profiles {
+                el: named(*p),
+                ql: true,
+                rl: false,
+            },
+            Characteristic::Transitive => Profiles {
+                el: named(*p),
+                ql: false,
+                rl: true,
+            },
+            Characteristic::Symmetric | Characteristic::Asymmetric => Profiles {
+                el: false,
+                ql: true,
+                rl: true,
+            },
+            Characteristic::Irreflexive => Profiles {
+                el: false,
+                ql: false,
+                rl: true,
+            },
+            Characteristic::Functional | Characteristic::InverseFunctional => Profiles {
+                el: false,
+                ql: false,
+                rl: true,
+            },
+        },
+        Axiom::SubDataPropertyOf(..) | Axiom::EquivalentDataProperties(_) => Profiles::ALL,
+        Axiom::DisjointDataProperties(_) => Profiles {
+            el: false,
+            ql: true,
+            rl: true,
+        },
+        Axiom::DataPropertyDomain(_, c) => Profiles {
+            el: el_(*c),
+            ql: ql_super(o, *c),
+            rl: rl_super(o, *c),
+        },
+        Axiom::DataPropertyRange(_, r) => range(o, *r),
+        Axiom::FunctionalDataProperty(_) => Profiles {
+            el: true,
+            ql: false,
+            rl: true,
+        },
+        Axiom::DatatypeDefinition(_, r) => Profiles {
+            rl: false,
+            ..range(o, *r)
+        },
+        Axiom::HasKey(c, ps, _) => Profiles {
+            el: el_(*c) && ps.iter().all(|&p| named(p)),
+            ql: false,
+            rl: rl_sub(o, *c),
+        },
+        Axiom::ClassAssertion(c, _) => Profiles {
+            el: el_(*c),
+            ql: matches!(
+                o.class(unwrap(o, *c)),
+                ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing
+            ),
+            rl: rl_super(o, *c),
+        },
+        Axiom::ObjectPropertyAssertion(..) | Axiom::DifferentIndividuals(_) => Profiles::ALL,
+        // RL's rules judge only RL's datatypes. A literal the source didn't give is outside RL;
+        // one whose datatype the source doesn't know (`Terms::datatype`'s `None`) is admitted:
+        // a source that keeps no datatypes, as the W3C runner's, would otherwise put every
+        // data assertion outside RL. The store's and the query compiler's sources give one.
+        Axiom::DataPropertyAssertion(_, _, v) => Profiles {
+            rl: o
+                .data
+                .literals
+                .get(v)
+                .is_some_and(|l| l.datatype.as_deref().is_none_or(rl_datatype)),
+            ..Profiles::ALL
+        },
+        Axiom::NegativeObjectPropertyAssertion(..)
+        | Axiom::NegativeDataPropertyAssertion(..)
+        | Axiom::SameIndividual(_) => Profiles {
+            el: true,
+            ql: false,
+            rl: true,
+        },
+    }
+}
+
+/// A superclass expression of QL (`rl` false) or RL, also allowing the existentials the
+/// QL rewriting covers where it runs over that profile's closure: `∃R.C` and `≥ n R.C`
+/// with n ≥ 1, for any filler, and their data forms. Its generators and the TBox's ledger
+/// of unread conclusions seed them (I24b).
+fn super_covered(o: &Ontology, e: ExprId, rl: bool) -> bool {
+    let e = unwrap(o, e);
+    let plain = match rl {
+        true => rl_super(o, e),
+        false => ql_super(o, e),
+    };
+    plain
+        || match o.class(e) {
+            ClassExpr::And(es) => es.iter().all(|&e| super_covered(o, e, rl)),
+            ClassExpr::Some(..) | ClassExpr::DataSome(..) => true,
+            ClassExpr::Min(n, ..) | ClassExpr::DataMin(n, ..) => *n >= 1,
+            // `∀R.F` concludes `F` of the successors: what the closure's `cls-avf` gives,
+            // where RL has it.
+            ClassExpr::All(_, f) => rl && super_covered(o, *f, rl),
+            // Nothing else: a form the grammar doesn't admit as written is answered by
+            // neither the TBox nor the rules, which see it as written (`¬¬D`, `¬≥ 2 R`).
+            // What it may conclude decides whether it matters
+            // ([`concluded_terms`], [`concludes_equality`]).
+            _ => false,
+        }
+}
+
+/// Whether what a rewriting over the closure of QL (`rl` false) or RL can miss of
+/// `axiom`'s conclusions is covered: the axiom is in that profile, apart from
+/// existentials on the right, which the rewriting covers (I24c, decided on 8 Nov).
+/// Uncovered, an answer that reads the axiom's conclusions can't be
+/// claimed `complete` under that regime: the profile's rules are complete only for the
+/// ontologies of the profile (W3C OWL 2 Profiles, theorem PR1).
+///
+/// A disjoint union is never covered: its covering direction is a union on the right. The
+/// anonymous individuals of assertions aren't checked: only the schema is read.
+pub fn covered(o: &Ontology, axiom: &Axiom, rl: bool) -> bool {
+    let sub = |e: ExprId| match rl {
+        true => rl_sub(o, e),
+        false => ql_sub(o, e),
+    };
+    let sup = |e: ExprId| super_covered(o, e, rl);
+    let in_profile = |p: Profiles| match rl {
+        true => p.rl,
+        false => p.ql,
+    };
+    match axiom {
+        Axiom::SubClassOf(a, b) => sub(*a) && sup(*b),
+        // Each direction on its own: `Chair ≡ Person ⊓ ∃headOf.Department` is covered
+        // one way under QL and not the other.
+        Axiom::EquivalentClasses(v) => v
+            .iter()
+            .all(|&a| v.iter().all(|&b| a == b || (sub(a) && sup(b)))),
+        Axiom::ObjectPropertyDomain(_, c)
+        | Axiom::ObjectPropertyRange(_, c)
+        | Axiom::DataPropertyDomain(_, c) => sup(*c),
+        Axiom::ClassAssertion(c, _) => sup(*c),
+        _ => in_profile(grammar(o, axiom)),
+    }
+}
+
+/// The terms an axiom concludes, where it isn't [`covered`]: those it can add positive
+/// facts on (`positive_terms`). They come from both sides of a subclass axiom and of each
+/// uncovered direction of an equivalence (the left side negated: `L ⊑ R` is `¬R ⊑ ¬L`, so
+/// `≥ 1 R.(≤ 0 R.C) ⊑ ⊥` concludes `R` and `C`, D16-492), the class of a domain or range,
+/// every part of a disjointness (negated), a disjoint union's class and parts, and a
+/// characteristic's (not irreflexivity's or asymmetry's) or chain's property.
+pub fn concluded_terms(o: &Ontology, axiom: &Axiom, rl: bool) -> Vec<Term> {
+    let mut out = Vec::new();
+    let sub = |e: ExprId| match rl {
+        true => rl_sub(o, e),
+        false => ql_sub(o, e),
+    };
+    match axiom {
+        Axiom::SubClassOf(a, b) => {
+            positive_terms(o, *a, false, &mut out);
+            positive_terms(o, *b, true, &mut out);
+        }
+        Axiom::EquivalentClasses(v) => {
+            for &a in v {
+                for &b in v.iter().filter(|&&b| b != a) {
+                    if !(sub(a) && super_covered(o, b, rl)) {
+                        positive_terms(o, a, false, &mut out);
+                        positive_terms(o, b, true, &mut out);
+                    }
+                }
+            }
+        }
+        Axiom::ObjectPropertyDomain(_, c)
+        | Axiom::ObjectPropertyRange(_, c)
+        | Axiom::DataPropertyDomain(_, c)
+        | Axiom::ClassAssertion(c, _) => positive_terms(o, *c, true, &mut out),
+        // They rule pairs out and add no fact. Irreflexivity is outside the QL grammar
+        // (`w3c2012owl2profiles.txt:599`), though the QL feature list includes it.
+        Axiom::ObjectCharacteristic(
+            Characteristic::Irreflexive | Characteristic::Asymmetric,
+            _,
+        ) => {}
+        Axiom::ObjectCharacteristic(_, p) => out.push(p.named()),
+        Axiom::SubObjectPropertyOf(_, q) => out.push(q.named()),
+        Axiom::DisjointClasses(v) => {
+            for &e in v {
+                positive_terms(o, e, false, &mut out);
+            }
+        }
+        Axiom::DisjointUnion(c, v) => {
+            out.push(*c);
+            for &e in v {
+                positive_terms(o, e, true, &mut out);
+                positive_terms(o, e, false, &mut out);
+            }
+        }
+        _ => out.extend(properties(o, axiom)),
+    }
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The named classes and properties on which concluding `e` (`positive`), or its
+/// complement, can add a positive fact. It is read in negation normal form, so a
+/// complement flips the polarity, as the hazards' reading of existentials does:
+/// - `∀R.F` adds facts on `F` only, never an `R` edge; `¬∀R.F` adds an
+///   `R` edge.
+/// - `¬∃R.F` adds no `R` edge, only the negation of `F`.
+/// - `≤ n` adds none; `¬≤ n` is `≥ n+1`, which adds `R` and its filler.
+/// - A class adds a membership positively only.
+///
+/// Equality is [`concludes_equality`]'s.
+pub(crate) fn positive_terms(o: &Ontology, e: ExprId, positive: bool, out: &mut Vec<Term>) {
+    match (o.class(e), positive) {
+        (ClassExpr::Class(c), true) => out.push(*c),
+        (ClassExpr::And(es) | ClassExpr::Or(es), p) => {
+            for &e in es {
+                positive_terms(o, e, p, out);
+            }
+        }
+        (ClassExpr::Not(e), p) => positive_terms(o, *e, !p, out),
+        (ClassExpr::Some(r, f), true) | (ClassExpr::All(r, f), false) => {
+            out.push(r.named());
+            positive_terms(o, *f, positive, out);
+        }
+        (ClassExpr::Some(_, f), false) | (ClassExpr::All(_, f), true) => {
+            positive_terms(o, *f, positive, out)
+        }
+        (ClassExpr::Min(n, r, f) | ClassExpr::Exact(n, r, f), true) if *n >= 1 => {
+            out.push(r.named());
+            positive_terms(o, *f, true, out);
+        }
+        // `≤ 0 R.F` (also `= 0`, `¬≥ 1`) puts every successor outside `F`: facts of `¬F`,
+        // no `R` edge. A larger bound equates ([`concludes_equality`]).
+        (ClassExpr::Max(0, _, f) | ClassExpr::Exact(0, _, f), true)
+        | (ClassExpr::Min(1, _, f), false) => positive_terms(o, *f, false, out),
+        (ClassExpr::Max(_, r, f) | ClassExpr::Exact(_, r, f), false) => {
+            out.push(r.named());
+            positive_terms(o, *f, true, out);
+            // `¬= 1` may be `≤ 0`.
+            if matches!(o.class(e), ClassExpr::Exact(1, ..)) {
+                positive_terms(o, *f, false, out);
+            }
+        }
+        (ClassExpr::HasValue(r, _) | ClassExpr::HasSelf(r), true) => out.push(r.named()),
+        (ClassExpr::DataSome(d, _) | ClassExpr::DataHasValue(d, _), true)
+        | (ClassExpr::DataAll(d, _) | ClassExpr::DataMax(_, d, _), false) => out.push(*d),
+        (ClassExpr::DataMin(n, d, _) | ClassExpr::DataExact(n, d, _), true) if *n >= 1 => {
+            out.push(*d)
+        }
+        (ClassExpr::DataExact(_, d, _), false) => out.push(*d),
+        _ => {}
+    }
+}
+
+/// A term to name an axiom's hazard by: a property, else a class or an individual of its
+/// expressions (`C ⊑ {a}` names no property).
+pub(crate) fn label(o: &Ontology, axiom: &Axiom) -> Option<Term> {
+    fn any(o: &Ontology, e: ExprId) -> Option<Term> {
+        match o.class(e) {
+            ClassExpr::Class(c) => Some(*c),
+            ClassExpr::OneOf(xs) => xs.first().copied(),
+            ClassExpr::And(es) | ClassExpr::Or(es) => es.iter().find_map(|&e| any(o, e)),
+            ClassExpr::Not(e) => any(o, *e),
+            _ => None,
+        }
+    }
+    let exprs: Vec<ExprId> = match axiom {
+        Axiom::SubClassOf(a, b) => vec![*a, *b],
+        Axiom::EquivalentClasses(v) | Axiom::DisjointClasses(v) => v.clone(),
+        Axiom::DisjointUnion(c, _) => return Some(*c),
+        // Equality of individuals names no property or class.
+        Axiom::SameIndividual(v) => return v.first().copied(),
+        Axiom::ObjectPropertyDomain(_, c)
+        | Axiom::ObjectPropertyRange(_, c)
+        | Axiom::DataPropertyDomain(_, c)
+        | Axiom::ClassAssertion(c, _) => vec![*c],
+        _ => Vec::new(),
+    };
+    properties(o, axiom)
+        .first()
+        .copied()
+        .or_else(|| exprs.iter().find_map(|&e| any(o, e)))
+}
+
+/// The properties whose edges can make individuals equal: functional, inverse functional,
+/// in a key, functional on data; and, closed downward, every property whose edges are
+/// theirs: sub-, equivalent and inverse properties, and a chain's
+/// links.
+pub fn equating_properties(o: &Ontology) -> std::collections::HashSet<Term> {
+    let mut out = std::collections::HashSet::new();
+    for axiom in &o.axioms {
+        match axiom {
+            Axiom::ObjectCharacteristic(
+                Characteristic::Functional | Characteristic::InverseFunctional,
+                p,
+            ) => {
+                out.insert(p.named());
+            }
+            Axiom::FunctionalDataProperty(d) => {
+                out.insert(*d);
+            }
+            Axiom::HasKey(_, ps, ds) => {
+                out.extend(ps.iter().map(|p| p.named()));
+                out.extend(ds.iter().copied());
+            }
+            _ => {}
+        }
+    }
+    loop {
+        let before = out.len();
+        for axiom in &o.axioms {
+            let (subs, sup): (Vec<Term>, Option<Term>) = match axiom {
+                Axiom::SubObjectPropertyOf(chain, q) => {
+                    (chain.iter().map(|p| p.named()).collect(), Some(q.named()))
+                }
+                Axiom::SubDataPropertyOf(a, b) => (vec![*a], Some(*b)),
+                // Linked both ways: either one's edges are the other's.
+                Axiom::EquivalentObjectProperties(_)
+                | Axiom::InverseObjectProperties(..)
+                | Axiom::EquivalentDataProperties(_) => (properties(o, axiom), None),
+                _ => continue,
+            };
+            let reached = match sup {
+                Some(q) => out.contains(&q),
+                None => subs.iter().any(|t| out.contains(t)),
+            };
+            if reached {
+                out.extend(subs);
+            }
+        }
+        if out.len() == before {
+            return out;
+        }
+    }
+}
+
+/// Whether an uncovered axiom's conclusion (of a subclass axiom, either side's, as for an
+/// equivalence) can make individuals equal, fail-closed by construction: it can when it
+/// contains, in either polarity, a nominal (also `hasValue`), `Self`, a counting
+/// restriction that bounds from above in one of its polarities (`≤ n` and `= n` for
+/// n ≥ 1, `≥ n` for n ≥ 2), or a property of `equating` ([`equating_properties`]). No
+/// witness or polarity reading: a conjunction of nominals on one witness is as equating
+/// as one nominal. `≥ 0` holds of everything and its complement of nothing, so it
+/// concludes nothing.
+///
+/// Then any fact may follow, and its hazard reaches every term.
+pub fn concludes_equality(
+    o: &Ontology,
+    axiom: &Axiom,
+    equating: &std::collections::HashSet<Term>,
+) -> bool {
+    fn contains(o: &Ontology, e: ExprId, equating: &std::collections::HashSet<Term>) -> bool {
+        let p = |r: &ObjProp| equating.contains(&r.named());
+        let inner = |f: &ExprId| contains(o, *f, equating);
+        match o.class(e) {
+            ClassExpr::OneOf(_) | ClassExpr::HasValue(..) | ClassExpr::HasSelf(_) => true,
+            ClassExpr::Class(_) | ClassExpr::Thing | ClassExpr::Nothing => false,
+            ClassExpr::And(es) | ClassExpr::Or(es) => es.iter().any(inner),
+            ClassExpr::Not(f) => inner(f),
+            ClassExpr::Min(0, ..) | ClassExpr::DataMin(0, ..) => false,
+            ClassExpr::Max(n, r, f) | ClassExpr::Exact(n, r, f) => *n >= 1 || p(r) || inner(f),
+            ClassExpr::Min(n, r, f) => *n >= 2 || p(r) || inner(f),
+            ClassExpr::Some(r, f) | ClassExpr::All(r, f) => p(r) || inner(f),
+            ClassExpr::DataSome(d, _)
+            | ClassExpr::DataAll(d, _)
+            | ClassExpr::DataHasValue(d, _)
+            | ClassExpr::DataMin(_, d, _)
+            | ClassExpr::DataMax(_, d, _)
+            | ClassExpr::DataExact(_, d, _) => equating.contains(d),
+        }
+    }
+    let any = |v: &[ExprId]| v.iter().any(|&e| contains(o, e, equating));
+    match axiom {
+        // Both sides: `L ⊑ R` is `¬R ⊑ ¬L`, so `≥ 2 R ⊑ ⊥` is `⊤ ⊑ ≤ 1 R`.
+        Axiom::SubClassOf(a, b) => contains(o, *a, equating) || contains(o, *b, equating),
+        Axiom::EquivalentClasses(v) | Axiom::DisjointClasses(v) | Axiom::DisjointUnion(_, v) => {
+            any(v.as_slice())
+        }
+        Axiom::ObjectPropertyDomain(_, c)
+        | Axiom::ObjectPropertyRange(_, c)
+        | Axiom::DataPropertyDomain(_, c)
+        | Axiom::ClassAssertion(c, _) => contains(o, *c, equating),
+        Axiom::ObjectCharacteristic(
+            Characteristic::Functional | Characteristic::InverseFunctional,
+            _,
+        )
+        | Axiom::FunctionalDataProperty(_)
+        | Axiom::HasKey(..)
+        | Axiom::SameIndividual(_) => true,
+        // Any other conclusion on an equating property (a chain into a functional one).
+        _ => properties(o, axiom).iter().any(|t| equating.contains(t)),
+    }
+}
+
+/// The TBox signature as the reader typed it, the individuals left out: the reader types
+/// terms by use, assertions included, so an assertion whose terms already have these kinds
+/// changes nothing it reads.
+#[derive(Debug, Clone, Default)]
+pub struct Signature {
+    /// Every class and property name.
+    pub names: TermSet,
+    pub classes: TermSet,
+    /// The properties declared, or asserted, as object, as data, as annotation properties.
+    pub objects: TermSet,
+    pub data: TermSet,
+    pub annotations: TermSet,
+    /// The data properties declared so: the others are data properties only while they
+    /// have a literal (`mapping.rs`, `is_data_property`).
+    pub declared_data: TermSet,
+}
+
+/// A set of term ids, hashed fast (ids aren't chosen by an adversary).
+pub type TermSet = HashSet<Term, foldhash::fast::RandomState>;
+
+/// [`Signature`] of `o`. O(axioms + class expressions); an assertion of a property or a
+/// named class costs a lookup or two, no walk.
+pub fn signature(o: &Ontology) -> Signature {
+    use crate::model::EntityKind::{AnnotationProperty, Class, DataProperty, ObjectProperty};
+    let mut s = Signature::default();
+    for e in 0..o.classes.len() as u32 {
+        if let ClassExpr::Class(c) = o.classes.get(e) {
+            s.classes.insert(*c);
+        }
+    }
+    for axiom in &o.axioms {
+        let _ = match axiom {
+            Axiom::Declaration(Class, t) => s.classes.insert(*t),
+            Axiom::Declaration(ObjectProperty, t) | Axiom::ObjectPropertyAssertion(t, ..) => {
+                s.objects.insert(*t)
+            }
+            Axiom::Declaration(DataProperty, t) => {
+                s.declared_data.insert(*t);
+                s.data.insert(*t)
+            }
+            Axiom::DataPropertyAssertion(t, ..) => s.data.insert(*t),
+            Axiom::Declaration(AnnotationProperty, t) => s.annotations.insert(*t),
+            Axiom::ClassAssertion(c, _) if matches!(o.class(*c), ClassExpr::Class(_)) => false,
+            _ => {
+                s.names.extend(properties(o, axiom));
+                false
+            }
+        };
+    }
+    // A property declared and never used is a name too.
+    let declared = [&s.classes, &s.annotations, &s.objects, &s.data];
+    s.names.extend(declared.into_iter().flatten());
+    s
+}
+
+/// The names `o` puns (OWL 2 Structural Specification §5.9): each read both as a named
+/// individual and as a class or a property ([`Signature::names`]). Theorem PR1 (OWL 2
+/// Profiles §4.3) needs none, and an equality the RL rules carry to such a name (eq-rep-p,
+/// eq-rep-o) equates the class or property, which the Direct Semantics doesn't. Sorted.
+pub fn punned(o: &Ontology) -> Vec<Term> {
+    let names = signature(o).names;
+    let mut punned = o.named_individuals();
+    punned.retain(|t| names.contains(t));
+    punned
+}
+
+/// Whether the OWL 2 RL rules may read `o` otherwise than OWL 2 DL does: `o` has
+/// annotation-property axioms ([`Ontology::annotation_schema`]) or puns ([`punned`]), which
+/// theorem PR1 (OWL 2 Profiles §4.3) excludes, or an empty intersection or union
+/// ([`Ontology::empty_list`]), which they don't read. The one detection the route,
+/// the answers' status and the consistency verdicts take.
+pub fn rules_read_differently(o: &Ontology) -> bool {
+    !o.annotation_schema.is_empty() || !punned(o).is_empty() || o.empty_list.is_some()
+}
+
+/// The profiles every axiom of `o` is in.
+pub fn of_ontology(o: &Ontology) -> Profiles {
+    o.axioms
+        .iter()
+        .fold(Profiles::ALL, |acc, a| acc.and(of(o, a)))
+}

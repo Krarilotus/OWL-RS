@@ -9,16 +9,21 @@
 //! (point-in-time restore).
 //!
 //! Failure model: if an append fails midway, the file may end in a partial frame. The log
-//! is then *poisoned*: every later append fails until the engine is reopened, and recovery
-//! truncates the torn tail. Appending after a partial frame would turn a recoverable torn
-//! tail into mid-log corruption.
+//! is then *poisoned*: every later append, rotation and bulk publication fails until the
+//! engine is reopened, and recovery cuts the torn tail ([`super::tail`]). Appending after a
+//! partial frame would turn a recoverable torn tail into mid-log corruption. A new segment
+//! appears under its name only with its magic synced (written under a temporary name, then
+//! renamed): a rotation that fails before the rename leaves the log as it was; one whose
+//! outcome is unknown after it poisons the log.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::SyncPolicy;
-use super::codec::{CommitRecord, Frame, decode_frame, encode_record};
+#[cfg(test)]
+use super::codec::encode_record;
+use super::codec::{CommitRecord, Frame, decode_frame, encode_record_at};
 use crate::error::{EngineError, EngineResult};
 
 /// Version 2 added the inferred stack to commit records (roadmap E6); version 3 inlines
@@ -78,7 +83,14 @@ pub(crate) struct SegmentContents {
 }
 
 pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
-    let bytes = fs::read(path)?;
+    read_open_segment(&mut File::open(path)?, path)
+}
+
+/// [`read_segment`] of a segment already open (`path` names it in errors): what it holds
+/// stays readable while the log releases or archives it.
+pub(crate) fn read_open_segment(file: &mut File, path: &Path) -> EngineResult<SegmentContents> {
+    let mut bytes = Vec::new();
+    std::io::Read::read_to_end(file, &mut bytes)?;
     if bytes.len() < SEGMENT_MAGIC.len() {
         // Crash while creating the segment: treat it as empty and torn.
         return Ok(SegmentContents {
@@ -131,18 +143,19 @@ pub(crate) fn read_segment(path: &Path) -> EngineResult<SegmentContents> {
     })
 }
 
-/// Cuts a torn tail off a segment and syncs the result.
-pub(crate) fn truncate_segment(path: &Path, valid_len: u64) -> EngineResult<()> {
+/// Cuts a torn tail off a segment and syncs the result. Whether the segment is still there: one
+/// left without even its header is removed.
+pub(crate) fn truncate_segment(path: &Path, valid_len: u64) -> EngineResult<bool> {
     let file = OpenOptions::new().write(true).open(path)?;
     if valid_len < SEGMENT_MAGIC.len() as u64 {
         file.set_len(0)?;
         drop(file);
         fs::remove_file(path)?;
-        return Ok(());
+        return Ok(false);
     }
     file.set_len(valid_len)?;
     file.sync_all()?;
-    Ok(())
+    Ok(true)
 }
 
 pub(crate) struct Wal {
@@ -159,12 +172,94 @@ pub(crate) struct Wal {
     magic: &'static [u8; 8],
     /// Where released segments go instead of being deleted.
     archive: Option<PathBuf>,
+    /// The names the store's open left to sync before the first durable write.
+    pending_names: PendingNames,
+}
+
+/// The names a store's open leaves to be synced before the first durable write that relies on
+/// them (the deferred sync of 8 Nov): the directories holding the levels of the
+/// store's path it found, then the WAL's directory and the store's own. Each is synced once;
+/// a found level's holder this process may not open for its sync is left as it is, as
+/// `place::create_dir_all` leaves it.
+pub(crate) struct PendingNames {
+    /// In the order synced (outermost first), each with whether `PermissionDenied` leaves it.
+    dirs: Vec<(PathBuf, bool)>,
+    /// What the store's open left to resolve (D16-548): resolved at the first use
+    /// ([`Self::resolve`]), its directories then synced as these are.
+    unresolved: Option<Box<super::NamesToResolve>>,
+}
+
+impl PendingNames {
+    /// `holders` (found levels' holders, outermost first), then `own` (the store's
+    /// directories), each once.
+    /// Each directory once by its key: one spelled through a link (the store's root as opened)
+    /// and physically (the holder of its WAL directory's entry) is the same
+    /// directory. Both come with their keys, made alike (`place::Named::key`).
+    pub(crate) fn new(holders: Vec<(PathBuf, PathBuf)>, own: Vec<(PathBuf, PathBuf)>) -> Self {
+        let mut dirs: Vec<(PathBuf, bool)> = Vec::new();
+        let mut keys: Vec<PathBuf> = Vec::new();
+        let named = holders
+            .into_iter()
+            .map(|(dir, key)| (dir, key, true))
+            .chain(own.into_iter().map(|(dir, key)| (dir, key, false)));
+        for (dir, key, found) in named {
+            match keys.iter().position(|seen| *seen == key) {
+                // Both a holder and the store's own (a relative root, a linked root): the
+                // stricter.
+                Some(at) => dirs[at].1 &= found,
+                None => {
+                    keys.push(key);
+                    dirs.push((dir, found));
+                }
+            }
+        }
+        Self {
+            dirs,
+            unresolved: None,
+        }
+    }
+
+    /// The names a found store's open, which changed nothing, leaves unresolved.
+    pub(crate) fn deferred(names: super::NamesToResolve) -> Self {
+        Self {
+            dirs: Vec::new(),
+            unresolved: Some(Box::new(names)),
+        }
+    }
+
+    /// Resolves what the open left unresolved, all of it or nothing: a failure keeps it, for
+    /// the next call to try again.
+    pub(crate) fn resolve(&mut self) -> std::io::Result<()> {
+        if let Some(names) = &self.unresolved {
+            self.dirs = names.resolve()?.dirs;
+            self.unresolved = None;
+        }
+        Ok(())
+    }
+
+    /// Resolves them ([`Self::resolve`]), then syncs each, removing it once synced; the first
+    /// failure is returned, leaving it and the rest for the next call.
+    pub(crate) fn settle(&mut self) -> std::io::Result<()> {
+        use std::io::ErrorKind::PermissionDenied;
+        self.resolve()?;
+        while let Some((dir, tolerant)) = self.dirs.first() {
+            match super::place::sync_dir(dir) {
+                Ok(()) => {}
+                Err(error) if *tolerant && error.kind() == PermissionDenied => {}
+                Err(error) => return Err(error),
+            }
+            self.dirs.remove(0);
+        }
+        Ok(())
+    }
 }
 
 impl Wal {
     /// Opens the log for appending after recovery. Appends to the newest segment, or starts
     /// one for `next_revision` if there is none. New segments are of the store's encoding
-    /// (`integers_in_dictionary`: version 4).
+    /// (`integers_in_dictionary`: version 4). `dir` and `archive` exist, named by the store's
+    /// open (`place::create_store_dir`); `pending_names` are synced before the first record is
+    /// acknowledged ([`Self::settle_names`]).
     pub(crate) fn open(
         dir: &Path,
         next_revision: u64,
@@ -172,14 +267,22 @@ impl Wal {
         sync: SyncPolicy,
         integers_in_dictionary: bool,
         archive: Option<PathBuf>,
+        pending_names: PendingNames,
     ) -> EngineResult<Self> {
         let magic = match integers_in_dictionary {
             true => SEGMENT_MAGIC_V4,
             false => SEGMENT_MAGIC,
         };
-        fs::create_dir_all(dir)?;
-        if let Some(archive) = &archive {
-            fs::create_dir_all(archive)?;
+        // A segment a crash left under its temporary name was never part of the log.
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(TEMPORARY_SUFFIX))
+            {
+                fs::remove_file(&path)?;
+            }
         }
         // The newest segment is appended to if it is of the format written now; otherwise
         // (a store from before version 6) a new segment starts.
@@ -212,63 +315,144 @@ impl Wal {
             buffer: Vec::new(),
             magic,
             archive,
+            pending_names,
         })
+    }
+
+    /// Syncs the names the store's open left pending, before a durable write that relies on
+    /// them and doesn't go through [`Self::append`] (a checkpoint, a bulk publication, the log
+    /// served). A failure is only returned: nothing was written, and the next call tries again.
+    pub(crate) fn settle_names(&mut self) -> EngineResult<()> {
+        Ok(self.pending_names.settle()?)
     }
 
     pub(crate) fn bytes_since_checkpoint(&self) -> u64 {
         self.bytes_since_checkpoint
     }
 
-    /// Appends one record and makes it durable according to the sync policy. The caller
-    /// publishes the commit only after this returns `Ok`.
-    pub(crate) fn append(&mut self, record: &CommitRecord) -> EngineResult<()> {
+    /// Appends one record and makes it durable according to the sync policy, and returns its
+    /// commit time. The caller publishes the commit only after this returns `Ok`.
+    ///
+    /// A local commit is stamped here, by `stamp`, once the record's preparation and any
+    /// rotation are done and just before it is written and synced: the time is that of the
+    /// commit, not of its build. Without `stamp` (a replicated record)
+    /// the record's own time is kept.
+    ///
+    /// A local commit's `note` ([`crate::Transaction::note_commit`]) is called after the
+    /// rotation, the stamp and the encoding, the steps whose failure leaves the log as it was,
+    /// and before the record is written: so the time logged precedes the note's own I/O, as it
+    /// precedes the record's sync. The log is poisoned while the note runs, so that a note that
+    /// panics, having perhaps written its journal, leaves no later commit to take its revision;
+    /// `Ok` and a refusal clear that, an unknown journal keeps it.
+    pub(crate) fn append(
+        &mut self,
+        record: &CommitRecord,
+        stamp: Option<&mut dyn FnMut() -> u64>,
+        note: Option<crate::engine::CommitNote<'_>>,
+    ) -> EngineResult<Option<u64>> {
         if self.poisoned {
             return Err(EngineError::WalPoisoned);
         }
+        // The names the open left unresolved are resolved before anything of this commit is
+        // done (D16-548): a failure refuses it with the log as it was, not poisoned. They are
+        // synced after the record, as the names pending are (below).
+        self.pending_names.resolve()?;
         if self.active_bytes >= self.segment_bytes {
             self.rotate(record.revision)?;
         }
+        #[cfg(test)]
+        if let Some(at) = super::fault::CLOCK_AT_APPEND.get() {
+            super::fault::CLOCK.set(Some(at));
+        }
+        let committed = match stamp {
+            Some(stamp) => Some(stamp()),
+            None => record.committed_micros,
+        };
         self.buffer.clear();
         // Version 4 segments (stores that keep integers in their dictionary) have no times.
-        let timed;
-        let record = match self.magic == SEGMENT_MAGIC {
-            true => record,
-            false => {
-                timed = CommitRecord {
-                    committed_micros: None,
-                    ..record.clone()
-                };
-                &timed
+        let logged = committed.filter(|_| self.magic == SEGMENT_MAGIC);
+        encode_record_at(record, logged, &mut self.buffer)?; // nothing written yet on error
+        if let Some(note) = note {
+            self.poisoned = true;
+            match note(record.revision) {
+                Ok(()) => self.poisoned = false,
+                Err(crate::engine::NoteError::Refused(error)) => {
+                    self.poisoned = false;
+                    return Err(EngineError::CommitNoteRefused(error));
+                }
+                Err(crate::engine::NoteError::Unknown(error)) => return Err(error.into()),
             }
-        };
-        encode_record(record, &mut self.buffer)?; // nothing written yet on error
-        let result = self
-            .active
-            .write_all(&self.buffer)
+        }
+        #[cfg(test)]
+        let written = super::fault::check(&super::fault::FAIL_RECORD_WRITE, "the record's write");
+        #[cfg(not(test))]
+        let written = Ok(());
+        // The names the open left pending are synced after the record, before it is
+        // acknowledged: the record's sync commits the journal and flushes the device, and the
+        // directories' syncs after it find nothing left to flush (measured on the timing host:
+        // in the other order the record's sync paid a second flush).
+        // A failure there leaves the record written, its outcome unknown: it poisons the log.
+        let result = written
+            .and_then(|()| self.active.write_all(&self.buffer))
             .and_then(|()| match self.sync {
                 SyncPolicy::EveryCommit => self.active.sync_data(),
                 SyncPolicy::OsBuffered => Ok(()),
-            });
+            })
+            .and_then(|()| self.pending_names.settle());
         if let Err(error) = result {
             self.poisoned = true;
             return Err(error.into());
         }
         self.active_bytes += self.buffer.len() as u64;
         self.bytes_since_checkpoint += self.buffer.len() as u64;
-        Ok(())
+        Ok(committed)
     }
 
-    /// Starts a new segment whose first record will be `next_revision`. No-op if the active
-    /// segment is still empty.
+    /// Starts a new segment for the records from `next_revision` on (a lower bound: a bulk
+    /// load rotates before it knows whether it commits). No-op if the active segment is
+    /// still empty; refused once the log is poisoned.
+    ///
+    /// A failure that leaves the log as it was is only returned. One that leaves its state
+    /// unknown poisons it: the active segment's sync (its records may not be on disk), or a
+    /// new segment possibly in place under its name (records appended to the old one after
+    /// it would sit behind a later-named segment, which replication and release read as
+    /// covering them).
     pub(crate) fn rotate(&mut self, next_revision: u64) -> EngineResult<()> {
+        if self.poisoned {
+            return Err(EngineError::WalPoisoned);
+        }
         if self.active_bytes <= SEGMENT_MAGIC.len() as u64 {
             return Ok(());
         }
-        self.active.sync_all()?;
-        self.active = create_segment(&self.dir, next_revision, self.magic)?;
-        self.active_first_revision = next_revision;
-        self.active_bytes = SEGMENT_MAGIC.len() as u64;
-        Ok(())
+        #[cfg(test)]
+        super::fault::check(&super::fault::FAIL_ROTATE, "rotation")?;
+        if let Err(error) = self.active.sync_all() {
+            self.poisoned = true;
+            return Err(error.into());
+        }
+        match create_segment(&self.dir, next_revision, self.magic) {
+            Ok(file) => {
+                self.active = file;
+                self.active_first_revision = next_revision;
+                self.active_bytes = SEGMENT_MAGIC.len() as u64;
+                Ok(())
+            }
+            Err(error) => {
+                if !matches!(
+                    segment_path(&self.dir, next_revision).try_exists(),
+                    Ok(false)
+                ) {
+                    self.poisoned = true;
+                }
+                Err(error)
+            }
+        }
+    }
+
+    /// Takes no more appends, rotations or bulk publications until the engine is reopened:
+    /// a revision may be on disk that the live state doesn't hold ([`crate::engine::bulk`]).
+    pub(crate) fn poison(&mut self) {
+        self.poisoned = true;
     }
 
     /// Called after a checkpoint at `revision`: restarts the byte counter and deletes (or
@@ -276,6 +460,10 @@ impl Wal {
     /// segment stays.
     pub(crate) fn release_through(&mut self, revision: u64) -> EngineResult<()> {
         self.bytes_since_checkpoint = 0;
+        #[cfg(test)]
+        if tests::FAIL_RELEASE.get() {
+            return Err(std::io::Error::other("segment release failed (a test's)").into());
+        }
         let segments = list_segments(&self.dir)?;
         for pair in segments.windows(2) {
             let ((_, path), (next_first, _)) = (&pair[0], &pair[1]);
@@ -293,9 +481,10 @@ impl Wal {
 /// Moves a segment into `archive` (a copy where a rename can't cross file systems).
 fn archive_segment(path: &Path, archive: &Path) -> EngineResult<()> {
     let target = archive.join(path.file_name().expect("segment file name"));
-    if fs::rename(path, &target).is_err() {
-        fs::copy(path, &target)?;
-        File::open(&target)?.sync_all()?;
+    if super::place::rename(path, &target).is_err() {
+        // Synced through a writable handle (the read-only one this took before can't be
+        // flushed on Windows), and in place before the original goes.
+        super::place::copy(path, &target)?;
         fs::remove_file(path)?;
     }
     super::sync_dir(archive)?;
@@ -304,15 +493,173 @@ fn archive_segment(path: &Path, archive: &Path) -> EngineResult<()> {
 
 impl Wal {}
 
+/// What a segment is written under until its magic is synced.
+const TEMPORARY_SUFFIX: &str = ".wal.tmp";
+
+/// Places a new segment holding only its magic, under its name only once that is synced: a
+/// failure before the rename leaves no segment behind (its temporary goes, here or at the
+/// next open).
 fn create_segment(dir: &Path, first_revision: u64, magic: &[u8; 8]) -> EngineResult<File> {
     let path = segment_path(dir, first_revision);
-    let mut file = OpenOptions::new()
+    let temporary = dir.join(format!("{first_revision:020}{TEMPORARY_SUFFIX}"));
+    let written = OpenOptions::new()
         .create(true)
         .truncate(true)
         .write(true)
-        .open(&path)?;
-    file.write_all(magic)?;
-    file.sync_all()?;
+        .open(&temporary)
+        .and_then(|mut file| {
+            file.write_all(magic)?;
+            file.sync_all()
+        });
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    super::place::rename(&temporary, &path)?;
+    #[cfg(test)]
+    super::fault::check(&super::fault::FAIL_SEGMENT_PLACED, "segment directory sync")?;
     super::sync_dir(dir)?;
     Ok(OpenOptions::new().append(true).open(&path)?)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    thread_local! {
+        /// Makes this thread's segment releases fail: a test's fault after a checkpoint.
+        pub(crate) static FAIL_RELEASE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A rematerialisation whose covered log segments can't be released (held, on Windows)
+    /// has published its inferences: it succeeds, and the next checkpoint that writes (after
+    /// a commit) releases them.
+    /// Reported as failed, its caller would take the published inferences for the old ones.
+    #[test]
+    fn a_published_rematerialisation_survives_a_failed_segment_release() {
+        use crate::{DurabilityConfig, Engine, EngineConfig, SyncPolicy};
+        let dir = tempfile::tempdir().unwrap();
+        let config = EngineConfig {
+            background_maintenance: false,
+            durability: DurabilityConfig {
+                sync: SyncPolicy::EveryCommit,
+                ..DurabilityConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        let engine = Engine::open(dir.path(), config).unwrap();
+        let node = |n: &str| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{n}"));
+        let mut tx = engine.transaction();
+        let quad = nrese_rdf::Quad::new(
+            node("a"),
+            node("p"),
+            node("b"),
+            nrese_rdf::GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+        tx.commit().unwrap();
+        let segments = || {
+            super::list_segments(&super::wal_dir(dir.path()))
+                .unwrap()
+                .len()
+        };
+        let rematerialisation = engine.rematerialisation();
+        // One statement that isn't asserted (an asserted one isn't inferred: nothing would
+        // change, and nothing be published).
+        let id =
+            |n: &str| rematerialisation.intern(nrese_rdf::TermRef::NamedNode(node(n).as_ref()));
+        let inferred = vec![crate::EncodedTriple {
+            subject: id("a"),
+            predicate: id("q"),
+            object: id("b"),
+        }];
+        FAIL_RELEASE.set(true);
+        let finished = rematerialisation.finish(inferred);
+        FAIL_RELEASE.set(false);
+        assert!(finished.is_ok(), "{:?}", finished.err());
+        assert_eq!(engine.stats().inferred, 1, "published");
+        let kept = segments();
+        assert!(kept >= 2, "the covered segment is still there ({kept})");
+        // The next checkpoint that writes (after a commit; one with nothing new returns early).
+        let mut tx = engine.transaction();
+        let next = nrese_rdf::Quad::new(
+            node("c"),
+            node("p"),
+            node("d"),
+            nrese_rdf::GraphName::DefaultGraph,
+        );
+        tx.insert(next.as_ref());
+        tx.commit().unwrap();
+        engine.checkpoint().unwrap();
+        assert!(segments() < kept, "the next checkpoint released it");
+    }
+
+    /// Point-in-time restore by time (`recover_until_micros`): the commits made up to the
+    /// time, by the commit times in the log. Commit `r` here was made at `r` ms; at commit
+    /// 5's own time, commit 5 is kept and commit 6 cut.
+    #[test]
+    fn the_log_restores_the_state_at_a_time() {
+        use crate::{DurabilityConfig, Engine, EngineConfig, QuadPattern};
+        let dir = tempfile::tempdir().unwrap();
+        let config = |until| EngineConfig {
+            background_maintenance: false,
+            durability: DurabilityConfig {
+                recover_until_micros: until,
+                ..DurabilityConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        let node = |n: &str| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{n}"));
+        let quad = |r: u64| {
+            nrese_rdf::Quad::new(
+                node(&format!("s{r}")),
+                node("p"),
+                node("o"),
+                nrese_rdf::GraphName::DefaultGraph,
+            )
+        };
+        {
+            let engine = Engine::open(dir.path(), config(None)).unwrap();
+            for r in 1..=9 {
+                let mut tx = engine.transaction();
+                tx.insert(quad(r).as_ref());
+                tx.commit().unwrap();
+            }
+        }
+        // The log again, each record with its commit time: revision `r` at `r` ms. First,
+        // that the transactions wrote theirs: a stamp on every commit, and not zero (PR #79: the rewrite below replaces them; their order is the wall clock's,
+        // which may step back, so it isn't
+        // asserted).
+        let mut stamped = 0;
+        for (_, path) in super::list_segments(&super::wal_dir(dir.path())).unwrap() {
+            let contents = super::read_segment(&path).unwrap();
+            assert!(!contents.torn && !contents.integers_in_dictionary);
+            for record in &contents.records {
+                let stamp = record.committed_micros;
+                assert!(
+                    stamp.is_some_and(|at| at > 0),
+                    "revision {}: {stamp:?}",
+                    record.revision
+                );
+                stamped += 1;
+            }
+            let mut bytes = super::SEGMENT_MAGIC.to_vec();
+            for record in contents.records {
+                let committed_micros = Some(record.revision * 1000);
+                let record = super::CommitRecord {
+                    committed_micros,
+                    ..record
+                };
+                super::encode_record(&record, &mut bytes).unwrap();
+            }
+            std::fs::write(&path, bytes).unwrap();
+        }
+        assert_eq!(stamped, 9, "every commit in the log");
+        let engine = Engine::open(dir.path(), config(Some(5_000))).unwrap();
+        let snapshot = engine.snapshot();
+        assert_eq!(snapshot.revision(), 5);
+        let held: std::collections::HashSet<nrese_rdf::Quad> = snapshot
+            .quads_for_pattern(&QuadPattern::all())
+            .map(|q| snapshot.decode_quad(q).unwrap())
+            .collect();
+        assert_eq!(held, (1..=5).map(quad).collect());
+    }
 }

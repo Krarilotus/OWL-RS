@@ -1,10 +1,15 @@
 //! Bulk loads (E5): initial loads and restores that bypass the per-commit path.
 //!
 //! A [`BulkLoad`] holds the writer slot for its whole lifetime. Callers add batches of
-//! quads, from any number of threads; each batch is interned with one lock acquisition
-//! ([`Dictionary::intern_quads`](crate::term::Dictionary)). [`BulkLoad::finish`] then
-//! sorts once in parallel, builds the base run directly (no transaction hash sets, no
-//! per-quad existence checks against an empty base) and publishes one revision.
+//! quads, from any number of threads, each at its place in the input
+//! ([`BulkLoad::add_at`]). Terms the dictionary holds are found under its shared lock;
+//! new ones go to tables of their own, a lock per shard, and the quads take provisional
+//! ids ([`crate::term::pending`]). [`BulkLoad::finish`] numbers the new terms in the order
+//! they first occur in the input (dense ids, the same at any thread count, their text left
+//! where it was interned), renumbers the quads, sorts once in parallel, builds the base
+//! run directly (no transaction hash sets, no per-quad existence checks against an empty
+//! base) and publishes one revision. A load dropped unfinished leaves the dictionary as
+//! it was.
 //!
 //! Memory: in a durable store with `map_checkpoints`, a load into an empty store or one
 //! replacing its data is bounded by `bulk_load_memory`: past it, quads are sorted in chunks
@@ -16,21 +21,25 @@
 //! so nothing is ever visible that a crash could lose. Its cost is O(dataset), which is why
 //! small changes should use transactions.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
+use nrese_exec::memory::HugePagesPhase;
 use nrese_rdf::Quad;
 use parking_lot::{Mutex, MutexGuard};
 use rayon::prelude::*;
 
 use super::spill::{Spill, Spiller};
 use super::{CommitSummary, Inner, ReadModel, Snapshot, Stack, Version};
-use crate::durability::checkpoint;
+use crate::durability::{Durable, checkpoint, later};
 use crate::error::{EngineError, EngineResult};
 use crate::index::keys::PackedKeys;
 use crate::index::run::{PermutationBuilder, Run};
 use crate::index::{IndexVersion, Layout};
 use crate::quad::{EncodedQuad, EncodedTriple, Permutation, QuadPattern};
+use crate::term::dictionary::BatchScratch;
+use crate::term::pending::Pending;
 
 /// Batches copied between releases of their memory ([`crate::memory`]): about 256 MiB at
 /// the stores' batch size.
@@ -51,7 +60,6 @@ pub enum BulkMode {
 /// it interned stay unreferenced in the dictionary, as with an aborted transaction.
 pub struct BulkLoad<'e> {
     engine: &'e Inner,
-    _slot: MutexGuard<'e, ()>,
     mode: BulkMode,
     batches: Mutex<Batches>,
     /// Quads per spilled chunk, if the load spills past its memory budget.
@@ -60,6 +68,18 @@ pub struct BulkLoad<'e> {
     spiller: Mutex<Option<Spiller>>,
     /// Spilling failed (setting it up, or the thread): the load fails at `finish`.
     spill_failed: Mutex<Option<std::io::Error>>,
+    /// The new terms, numbered at `finish`.
+    pending: Pending,
+    /// Batches [`add`](Self::add) has numbered.
+    added: std::sync::atomic::AtomicU32,
+    /// What interning a batch works in, kept for the next ones: one per thread adding.
+    scratch: Mutex<Vec<BatchScratch>>,
+    /// A bulk phase for the load's life (`budgets.huge_pages = "bulk"`), however it ends.
+    _huge_pages: HugePagesPhase,
+    /// The writer slot. Last, because fields drop in order: a load dropped unfinished joins
+    /// its spilling thread and removes the spill directory (`spiller`) before the next load
+    /// can start and create its own there (B-303).
+    _slot: MutexGuard<'e, ()>,
 }
 
 /// Interned quads not yet spilled.
@@ -83,20 +103,47 @@ impl<'e> BulkLoad<'e> {
             .map(|budget| (budget as usize / 3 / size_of::<EncodedQuad>()).max(1));
         Self {
             engine,
-            _slot: slot,
             mode,
             batches: Mutex::default(),
             chunk,
             spiller: Mutex::new(None),
             spill_failed: Mutex::new(None),
+            pending: Pending::default(),
+            added: std::sync::atomic::AtomicU32::new(0),
+            scratch: Mutex::default(),
+            _huge_pages: HugePagesPhase::begin(),
+            _slot: slot,
         }
     }
 
-    /// Adds a batch of quads. Callable from several threads at once; batches of 10⁴–10⁵
-    /// quads amortise the dictionary lock well. Past the memory budget, it waits while the
-    /// last chunk is spilled.
+    /// Proof that this load holds the writer slot.
+    pub fn writer(&self) -> super::WriterHeld<'_> {
+        super::WriterHeld::new()
+    }
+
+    /// Adds a batch of quads as the next of this load's own numbering (chunk 0): in the
+    /// order the calls come, which is the input's where one thread adds.
     pub fn add(&self, quads: &[Quad]) {
-        let encoded = self.engine.shared.dictionary.intern_quads(quads);
+        let batch = self
+            .added
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.add_at(0, batch, quads);
+    }
+
+    /// Adds batch `batch` of chunk `chunk` of the input, chunks and their batches numbered
+    /// in input order (chunk 0 is [`add`](Self::add)'s): new terms take their ids at
+    /// `finish` in the order they first occur so, whatever the threads' order. Callable
+    /// from several threads at once. Past the memory budget, it waits while the last
+    /// chunk is spilled.
+    pub fn add_at(&self, chunk: u32, batch: u32, quads: &[Quad]) {
+        let mut scratch = self.scratch.lock().pop().unwrap_or_default();
+        let encoded = self.engine.shared.dictionary.intern_quads_pending(
+            quads,
+            &self.pending,
+            (chunk, batch),
+            &mut scratch,
+        );
+        self.scratch.lock().push(scratch);
         let full = {
             let mut batches = self.batches.lock();
             batches.quads += encoded.len();
@@ -153,6 +200,17 @@ impl<'e> BulkLoad<'e> {
     /// Publishes the loaded quads as one new revision (see the module docs for durability).
     /// Returns the revision and the asserted and inferred quads added and removed.
     pub fn finish(self) -> EngineResult<CommitSummary> {
+        self.finish_with(|_| Ok(()))
+    }
+
+    /// [`finish`](Self::finish), calling `before_publish` once the load is known to publish,
+    /// under its writer slot and before anything of the new version is written (its
+    /// checkpoint) or served. A load that changes nothing, or fails before, doesn't call it;
+    /// its error fails the load, nothing published.
+    pub fn finish_with(
+        self,
+        before_publish: impl FnOnce(super::WriterHeld<'_>) -> EngineResult<()>,
+    ) -> EngineResult<CommitSummary> {
         // A load that spilled sends what is left as its last chunk.
         if self.spiller.lock().is_some() {
             self.spill(true);
@@ -164,25 +222,36 @@ impl<'e> BulkLoad<'e> {
             batches,
             spiller,
             spill_failed,
+            pending,
+            scratch,
+            _huge_pages,
             ..
         } = self;
+        drop(scratch);
         let shared = &engine.shared;
-        // No commit can run (writer slot) and no compaction can replace runs while the new
-        // version is built from the current one and installed.
-        let _compaction = shared.versions.compaction_slot.lock();
+        // No commit can run (writer slot): `base` stays the latest content, though a merge or
+        // a mapped checkpoint may replace its runs with the same statements. The new version
+        // is built from it without the compaction slot, which `publish` takes to install it:
+        // nothing that waits for that slot waits for the load's parallel work.
         let base = shared.snapshot();
         let started = Instant::now();
         let spilled = match (spill_failed.into_inner(), spiller.into_inner()) {
-            (Some(error), _) => return Err(EngineError::Io(error)),
+            (Some(error), spiller) => {
+                // Joined, its directory gone, while the writer slot is held.
+                drop(spiller);
+                return Err(EngineError::Io(error));
+            }
             (None, Some(spiller)) => Some(spiller.finish()?),
             (None, None) => None,
         };
         let current = base.version();
-        if let Some(spill) = spilled {
-            return publish_spilled(engine, spill, current, started, _compaction);
-        }
+        let mut spilled = spilled;
         // The batches into one array, each freed once copied (not all held twice).
         let batches = batches.into_inner().batches;
+        // What the threads freed while interning (the shards' arrays outgrown by doubling,
+        // freed by whichever thread grew them) goes back before the largest allocation:
+        // without, LUBM 1000's committed peak was 0.9 GB higher, at this copy.
+        crate::memory::release_all();
         let mut quads: Vec<EncodedQuad> = Vec::with_capacity(batches.iter().map(Vec::len).sum());
         // What the copied batches held stays with the threads that interned them until
         // released: without, the batches would count twice at the peak.
@@ -193,10 +262,33 @@ impl<'e> BulkLoad<'e> {
                 crate::memory::release_all();
             }
         }
-        quads.par_sort_unstable();
-        quads.dedup();
+        // The new terms numbered, the quads (and spilled chunks) renumbered to them.
+        nrese_exec::heap::phase("load: numbering");
+        let mut renumbered = Ok(());
+        shared.dictionary.adopt_pending(pending, |adopted| {
+            // The shards' arrays, freed as their texts moved into the segment's arena, go
+            // back before any sort or index build (a spilled chunk's here, the quads' after):
+            // held, the text would count twice. Here the adoption guard is let go.
+            crate::memory::release_all();
+            nrese_exec::heap::phase("load: renumbering");
+            adopted.renumber(&mut quads);
+            if let Some(spill) = spilled.as_mut() {
+                renumbered = spill.sort_raw(&|quads: &mut [EncodedQuad]| adopted.renumber(quads));
+            }
+        });
+        renumbered?;
+        if let Some(spill) = spilled {
+            // A load spills only what it holds: it publishes.
+            before_publish(super::WriterHeld::new())?;
+            return publish_spilled(engine, spill, current, started);
+        }
+        // By radix over the bits the ids use ([`nrese_exec::sort`]).
+        nrese_exec::heap::phase("load: sorting");
+        let kept = nrese_exec::sort::sort_dedup_keys(crate::quad::as_keys_mut(&mut quads));
+        quads.truncate(kept);
 
         // Nothing else in the new version: its permutations go straight into the checkpoint.
+        nrese_exec::heap::phase("load: permutations");
         let streamed = streamable(engine, mode);
         let (next, summary) = match mode {
             _ if streamed => {
@@ -206,11 +298,17 @@ impl<'e> BulkLoad<'e> {
                     deleted: current.asserted.len(),
                     inferred_inserted: 0,
                     inferred_deleted: current.inferred.len(),
+                    // Replaced by the published version's once it is out.
+                    asserted: current.asserted_content,
                 };
+                let layout = Layout::holding(&quads);
                 let next = Next::Streamed {
-                    layout: Layout::holding(&quads),
-                    builder: PermutationBuilder::new(quads),
+                    layout,
+                    builder: PermutationBuilder::planned(quads, layout.permutations()),
                     revision: summary.revision,
+                    stamp: Stamp {
+                        previous: current.committed_micros,
+                    },
                     dictionary_len: shared.dictionary.len(),
                 };
                 (next, summary)
@@ -222,51 +320,91 @@ impl<'e> BulkLoad<'e> {
                     deleted: current.asserted.len(),
                     inferred_inserted: 0,
                     inferred_deleted: current.inferred.len(),
+                    // Replaced by the published version's once it is out.
+                    asserted: current.asserted_content,
                 };
                 let next = Version {
+                    content: super::Content::fresh(),
+                    asserted_content: super::AssertedIdentity::fresh(),
                     asserted: IndexVersion::from_quads(Layout::holding(&quads), quads),
                     inferred: IndexVersion::empty(Layout::DefaultGraph),
                     revision: summary.revision,
+                    // Stamped as it commits ([`publish`]).
+                    committed_micros: None,
                     dictionary_len: shared.dictionary.len(),
                     equality: Default::default(),
+                    // An empty inferred stack, kept by no program: read as stored.
+                    reading: None,
+                    certificate: None,
+                    canonical: Default::default(),
+                    own: Default::default(),
                 };
-                (Next::Built(next), summary)
+                let stamp = Stamp {
+                    previous: current.committed_micros,
+                };
+                (Next::Built(next, stamp), summary)
             }
             BulkMode::Append => {
-                let inserts: Vec<EncodedQuad> = quads
-                    .into_par_iter()
-                    .filter(|quad| !base.stack_contains(Stack::Asserted, quad))
-                    .collect();
+                // Into a store asserting nothing every quad is new: moved, not filtered into
+                // a copy, a second array of 32 bytes a quad beside the first while the
+                // index is built (DBpedia core's load peaked 2 GB higher, as on main;
+                // fleet pm-ib1801-1, 21 Oct 2026).
+                let inserts: Vec<EncodedQuad> = match current.asserted.len() {
+                    0 => quads,
+                    _ => quads
+                        .into_par_iter()
+                        .filter(|quad| !base.stack_contains(Stack::Asserted, quad))
+                        .collect(),
+                };
                 // Disjointness: newly asserted statements leave the inferred stack.
-                let explicit: Vec<EncodedQuad> = inserts
-                    .par_iter()
-                    .filter(|quad| {
-                        quad.graph.is_default_graph() && base.stack_contains(Stack::Inferred, quad)
-                    })
-                    .copied()
-                    .collect();
+                let explicit: Vec<EncodedQuad> = match current.inferred.len() {
+                    0 => Vec::new(),
+                    _ => inserts
+                        .par_iter()
+                        .filter(|quad| {
+                            quad.graph.is_default_graph()
+                                && base.stack_contains(Stack::Inferred, quad)
+                        })
+                        .copied()
+                        .collect(),
+                };
                 let summary = CommitSummary {
                     revision: current.revision + 1,
                     inserted: inserts.len() as u64,
                     deleted: 0,
                     inferred_inserted: 0,
                     inferred_deleted: explicit.len() as u64,
+                    // Replaced by the published version's once it is out.
+                    asserted: current.asserted_content,
                 };
                 // The first quad in a named graph turns a default-graph stack into a quad
                 // stack.
                 let asserted = match Layout::holding(&inserts) {
-                    Layout::Quads => current.asserted.with_quads_layout(),
+                    Layout::Quads => current.asserted.with_quads_layout_alone(),
                     Layout::DefaultGraph => current.asserted.clone(),
                 };
                 let run = Run::from_quads(asserted.layout(), inserts);
                 let next = Version {
+                    content: super::Content::fresh(),
+                    asserted_content: super::AssertedIdentity::fresh(),
                     asserted: asserted.with_run(run),
                     inferred: current.inferred.with_delta(&[], &explicit),
                     revision: summary.revision,
+                    // Stamped as it commits ([`publish`]).
+                    committed_micros: None,
                     dictionary_len: shared.dictionary.len(),
                     equality: Default::default(),
+                    // The inferred stack kept (less what is now asserted): read as before.
+                    reading: current.reading,
+                    certificate: None,
+                    canonical: Default::default(),
+                    own: Default::default(),
                 };
-                (Next::Built(next), summary)
+                // It keeps what was there: of unknown time if that is.
+                let stamp = Stamp {
+                    previous: current.committed_micros,
+                };
+                (Next::Built(next, stamp), summary)
             }
         };
         if summary.inserted + summary.deleted + summary.inferred_deleted == 0 {
@@ -276,9 +414,14 @@ impl<'e> BulkLoad<'e> {
             });
         }
 
+        before_publish(super::WriterHeld::new())?;
         let built = started.elapsed();
         publish(engine, next)?;
-        drop(_compaction);
+        // The writer slot is held: the latest version is the one just published.
+        let summary = CommitSummary {
+            asserted: engine.shared.snapshot().asserted_identity(),
+            ..summary
+        };
         tracing::info!(
             revision = summary.revision,
             inserted = summary.inserted,
@@ -310,7 +453,6 @@ fn publish_spilled(
     spill: Spill,
     current: &Version,
     started: Instant,
-    compaction: MutexGuard<'_, ()>,
 ) -> EngineResult<CommitSummary> {
     let revision = current.revision + 1;
     let dictionary_len = engine.shared.dictionary.len();
@@ -320,15 +462,19 @@ fn publish_spilled(
         Source::Spilled(spill),
         layout,
         revision,
+        Stamp {
+            previous: current.committed_micros,
+        },
         dictionary_len,
     )?;
-    drop(compaction);
     let summary = CommitSummary {
         revision,
         inserted,
         deleted: current.asserted.len(),
         inferred_inserted: 0,
         inferred_deleted: current.inferred.len(),
+        // The writer slot is held: the latest version is the one just published.
+        asserted: engine.shared.snapshot().asserted_identity(),
     };
     tracing::info!(
         revision,
@@ -359,8 +505,8 @@ impl Source {
 
 /// The version a bulk load publishes.
 enum Next {
-    /// Built in memory.
-    Built(Version),
+    /// Built in memory, its time stamped as it commits.
+    Built(Version, Stamp),
     /// Asserted quads and nothing else: their permutations are built one at a time, each
     /// written to the checkpoint and dropped before the next (durable, `map_checkpoints`).
     /// The load's peak then holds one packed permutation instead of all of them.
@@ -369,81 +515,143 @@ enum Next {
         layout: Layout,
         builder: PermutationBuilder,
         revision: u64,
+        stamp: Stamp,
         dictionary_len: u64,
     },
+}
+
+/// The time a bulk publication's version takes, stamped as it commits ([`Stamp::take`]): at
+/// its checkpoint's end, just before the file is synced and renamed, not when the version was
+/// built (a long checkpoint write could then commit after a time it was stamped before).
+#[derive(Debug, Clone, Copy)]
+struct Stamp {
+    /// The time of the version it follows, which a replacement takes too, though it keeps
+    /// nothing of it: while that time is unknown, a commit may have been made after any time
+    /// the store's clock gives (a legacy store's version 4 log keeps no times, so a reopen
+    /// loses them), and no later time is certified.
+    previous: Option<u64>,
+}
+
+impl Stamp {
+    /// The version's times, taken now: the commit is stamped by the store's clock
+    /// ([`super::Shared::stamp`]: never before an earlier commit whose time it knows), and the
+    /// version's time is the later of that and the previous version's, unknown if that is
+    /// ([`later`]). Returns that and the clock ([`checkpoint::Times`]).
+    fn take(self, shared: &super::Shared) -> checkpoint::Times {
+        let commit = shared.stamp();
+        (later(self.previous, Some(commit)), commit)
+    }
 }
 
 /// Installs `next` as the latest version, the bulk way: in durable mode a checkpoint of it
 /// is written first, so no WAL record is needed, and with `map_checkpoints` the version
 /// installed is the checkpoint's, mapped (same content: memory then holds what queries
-/// touch, as after a restart). The caller holds the writer and compaction slots.
+/// touch, as after a restart). The caller holds the writer slot. The checkpoint is written
+/// under the checkpoint slot, on the caller's pool, and the version installed under the
+/// compaction slot, held for nothing else: a merge or mapped checkpoint published since
+/// `next` was built is replaced (the same statements: the writer slot kept them).
 fn publish(engine: &Inner, next: Next) -> EngineResult<()> {
     let shared = &engine.shared;
-    let next = match next {
-        Next::Built(version) => version,
+    let (mut next, stamp) = match next {
+        Next::Built(version, stamp) => (version, stamp),
         Next::Streamed {
             layout,
             builder,
             revision,
+            stamp,
             dictionary_len,
         } => {
             let source = Source::Memory(builder);
-            return publish_streamed(engine, source, layout, revision, dictionary_len).map(|_| ());
+            return publish_streamed(engine, source, layout, revision, stamp, dictionary_len)
+                .map(|_| ());
         }
     };
-    let next = Arc::new(next);
-    match &shared.durable {
-        Some(durable) => {
-            let revision = next.revision;
-            let _checkpoint = durable.checkpoint_slot.lock();
-            let image = Snapshot::new(
-                Arc::clone(&next),
-                Arc::clone(&shared.dictionary),
-                Arc::clone(&shared.statistics),
-                None,
-            );
-            let path = checkpoint::write(durable.root(), &image)?;
-            shared
-                .checkpoints
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            drop(image);
-            let mut base = None;
-            let next = match durable
-                .config
-                .map_checkpoints
-                .then(|| checkpoint::map_written(&path))
-            {
-                Some(Ok((dictionary, [asserted, inferred]))) => {
-                    base = Some(dictionary);
-                    Arc::new(Version {
-                        asserted,
-                        inferred,
-                        equality: Arc::clone(&next.equality),
-                        revision,
-                        dictionary_len: next.dictionary_len,
-                    })
-                }
-                Some(Err(error)) => {
-                    tracing::warn!(%error, "checkpoint not mapped; data stays in memory");
-                    next
-                }
-                None => next,
-            };
-            // The checkpoint covers every logged revision: later commits start a new
-            // segment, and all older segments can go.
-            let mut wal = durable.wal.lock();
-            wal.rotate(revision + 1)?;
-            shared.versions.install(next);
-            wal.release_through(revision)?;
-            drop(wal);
-            if let Some(base) = base
-                && let Err(error) = shared.dictionary.rebase(base)
-            {
-                tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
-            }
-            checkpoint::remove_older_than(durable.root(), revision)?;
+    let Some(durable) = &shared.durable else {
+        next.committed_micros = stamp.take(shared).0;
+        let _compaction = shared.versions.compaction_slot.lock();
+        shared.versions.install(next);
+        return Ok(());
+    };
+    // The checkpoint image's version: an unpublished snapshot's, never installed. The one
+    // installed is made from it as a value, with slots of its own (empty).
+    let imaged = Arc::new(next);
+    let revision = imaged.revision;
+    let _checkpoint = super::admit(&durable.checkpoint_slot, "checkpoint")?;
+    let image = Snapshot::new(
+        Arc::clone(&imaged),
+        Arc::clone(&shared.dictionary),
+        Arc::clone(&shared.statistics),
+        None,
+        Arc::clone(&shared.views.read()),
+    );
+    #[cfg(test)]
+    crate::durability::fault::IMAGE_READER.with_borrow_mut(|reader| {
+        if let Some(read) = reader {
+            read(&image);
         }
-        None => shared.versions.install(next),
+    });
+    let mut committed_micros = None;
+    let path = commit_image(durable, revision, || {
+        checkpoint::write_stamped(
+            durable.root(),
+            &image,
+            shared.admission.as_ref(),
+            &mut || {
+                let times = stamp.take(shared);
+                committed_micros = times.0;
+                times
+            },
+        )
+    })?;
+    shared
+        .checkpoints
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    drop(image);
+    let mut base = None;
+    let next = match durable
+        .config
+        .map_checkpoints
+        .then(|| checkpoint::map_written(&path))
+    {
+        Some(Ok((dictionary, [asserted, inferred]))) => {
+            base = Some(dictionary);
+            Version {
+                // The same statements, mapped from the checkpoint.
+                content: imaged.content,
+                asserted_content: imaged.asserted_content,
+                asserted,
+                inferred,
+                equality: Arc::clone(&imaged.equality),
+                reading: imaged.reading,
+                certificate: imaged.certificate.clone(),
+                revision,
+                committed_micros,
+                dictionary_len: imaged.dictionary_len,
+                canonical: Default::default(),
+                own: Default::default(),
+            }
+        }
+        Some(Err(error)) => {
+            tracing::warn!(%error, "checkpoint not mapped; data stays in memory");
+            imaged.with_time(committed_micros)
+        }
+        None => imaged.with_time(committed_micros),
+    };
+    // What the image's readers kept in its version's own slots goes with it, before the
+    // slots: nothing of it outlives the load.
+    drop(imaged);
+    // The checkpoint covers every logged revision: later commits go to the segment
+    // `commit_image` started, and all older segments can go.
+    let compaction = shared.versions.compaction_slot.lock();
+    let mut wal = durable.wal.lock();
+    shared.versions.install(next);
+    release_covered(&mut wal, durable.root(), revision);
+    drop(wal);
+    drop(compaction);
+    if let Some(base) = base
+        && let Err(error) = shared.dictionary.rebase(base)
+    {
+        tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
     }
     Ok(())
 }
@@ -456,6 +664,7 @@ fn publish_streamed(
     mut source: Source,
     layout: Layout,
     revision: u64,
+    stamp: Stamp,
     dictionary_len: u64,
 ) -> EngineResult<u64> {
     let shared = &engine.shared;
@@ -468,39 +677,69 @@ fn publish_streamed(
         let asserted =
             IndexVersion::from_packed(packed).map_err(crate::error::EngineError::Corruption)?;
         let next = Version {
+            content: super::Content::fresh(),
+            asserted_content: super::AssertedIdentity::fresh(),
             asserted,
             inferred: IndexVersion::empty(Layout::DefaultGraph),
             revision,
+            committed_micros: None,
             dictionary_len,
             equality: Default::default(),
+            // An empty inferred stack, kept by no program: read as stored.
+            reading: None,
+            certificate: None,
+            canonical: Default::default(),
+            own: Default::default(),
         };
         let len = next.asserted.len();
-        publish(engine, Next::Built(next))?;
+        publish(engine, Next::Built(next, stamp))?;
         return Ok(len);
     };
-    let _checkpoint = durable.checkpoint_slot.lock();
+    let _checkpoint = super::admit(&durable.checkpoint_slot, "checkpoint")?;
     let empty = PackedKeys::from_sorted(&[]);
     // Every layout has SPOG: its length is the number of quads.
     let mut len = 0;
-    let path = checkpoint::write_parts(
-        durable.root(),
-        revision,
-        &shared.dictionary,
-        dictionary_len,
-        [layout, Layout::DefaultGraph],
-        &mut |stack, permutation| {
-            Ok(match stack {
-                Stack::Asserted => {
-                    let packed = source.packed(permutation)?;
-                    if permutation == Permutation::Spog {
-                        len = packed.len() as u64;
+    let mut committed_micros = None;
+    // The checkpoint's sections (the dictionary, its text order, each permutation) each
+    // allocate and free buffers of their own. What the load freed goes back here, before the
+    // checkpoint; what the sections freed, before each asserted permutation is asked for (the
+    // first after both the dictionary and its text order: the shared writer doesn't release
+    // between them). Held, it stacked up to the load's peak: on DBpedia core the median of
+    // five peaks fell from 6.37 to 6.23 GiB, the load time within the runs' spread
+    // (14 Nov 2026). Only a load's checkpoint releases: a serving store's
+    // ([`checkpoint::write_stamped`]) doesn't.
+    crate::memory::release_all();
+    let path = commit_image(durable, revision, || {
+        checkpoint::write_parts(
+            durable.root(),
+            shared.admission.as_ref(),
+            revision,
+            &mut || {
+                let times = stamp.take(shared);
+                committed_micros = times.0;
+                times
+            },
+            &shared.dictionary,
+            dictionary_len,
+            [layout, Layout::DefaultGraph],
+            &mut |stack, permutation| {
+                Ok(match stack {
+                    Stack::Asserted => {
+                        // What the sections before freed (the dictionary and its text
+                        // order, or the last permutation written), back before this one is
+                        // asked for.
+                        crate::memory::release_all();
+                        let packed = source.packed(permutation)?;
+                        if permutation == Permutation::Spog {
+                            len = packed.len() as u64;
+                        }
+                        std::borrow::Cow::Owned(packed)
                     }
-                    std::borrow::Cow::Owned(packed)
-                }
-                Stack::Inferred => std::borrow::Cow::Borrowed(&empty),
-            })
-        },
-    );
+                    Stack::Inferred => std::borrow::Cow::Borrowed(&empty),
+                })
+            },
+        )
+    });
     drop(source);
     let path = path?;
     shared
@@ -509,41 +748,104 @@ fn publish_streamed(
     let (base, [asserted, inferred]) = match checkpoint::map_written(&path) {
         Ok(mapped) => mapped,
         Err(error) => {
-            // Nothing else holds the data: the load fails, and the checkpoint goes so that
-            // a restart doesn't recover what was never published.
-            let _ = std::fs::remove_file(&path);
-            return Err(error);
+            // Committed (the checkpoint is in place), but nothing else holds the data to
+            // serve it: no write may follow before a reopen recovers it.
+            durable.wal.lock().poison();
+            tracing::error!(%error, revision, "a committed bulk load's checkpoint couldn't be mapped; reopen the engine to serve it");
+            return Err(EngineError::CommitUnsettled { revision });
         }
     };
-    let next = Arc::new(Version {
+    let next = Version {
+        content: super::Content::fresh(),
+        // New: always sound for a cache keyed by it (a rescan), kept only where certain.
+        asserted_content: super::AssertedIdentity::fresh(),
         asserted,
         inferred,
         revision,
+        committed_micros,
         dictionary_len,
         equality: Default::default(),
-    });
+        // An empty inferred stack, kept by no program: read as stored.
+        reading: None,
+        certificate: None,
+        canonical: Default::default(),
+        own: Default::default(),
+    };
+    let compaction = shared.versions.compaction_slot.lock();
     let mut wal = durable.wal.lock();
-    wal.rotate(revision + 1)?;
     shared.versions.install(next);
-    wal.release_through(revision)?;
+    release_covered(&mut wal, durable.root(), revision);
     drop(wal);
+    drop(compaction);
     if let Err(error) = shared.dictionary.rebase(base) {
         tracing::warn!(%error, "checkpoint dictionary not mapped; it stays in memory");
     }
-    checkpoint::remove_older_than(durable.root(), revision)?;
     Ok(len)
+}
+
+/// Writes, with `write`, the checkpoint of `revision`, a new revision of a bulk load or
+/// rematerialisation, and returns its path: the commit point (EEV-01, B-301). The caller
+/// holds the writer, compaction and checkpoint slots.
+///
+/// Before it the log moves to a new segment, the one step that can leave it unfit for the
+/// commits after; past it nothing may report the revision uncommitted, since a restart
+/// recovers it. A write that failed with the checkpoint possibly in place (its rename's
+/// outcome unknown, its directory unsynced) poisons the log: no commit of any kind can then
+/// take the revision again before a reopen settles which one is on disk.
+fn commit_image(
+    durable: &Durable,
+    revision: u64,
+    write: impl FnOnce() -> EngineResult<PathBuf>,
+) -> EngineResult<PathBuf> {
+    {
+        let mut wal = durable.wal.lock();
+        // The names a reopen left pending, before anything is written (deferred-sync design
+        // note of 8 Nov): a failure leaves the log as it was.
+        wal.settle_names()?;
+        wal.rotate(revision)?;
+    }
+    let error = match write() {
+        Ok(path) => return Ok(path),
+        Err(error) => error,
+    };
+    match checkpoint::placed(durable.root(), revision) {
+        Ok(false) => Err(error),
+        placed => {
+            durable.wal.lock().poison();
+            tracing::error!(%error, revision, ?placed, "a bulk publication's outcome is unknown until the engine is reopened");
+            Err(EngineError::CommitUnsettled { revision })
+        }
+    }
+}
+
+/// Removes what a published checkpoint at `revision` covers: the log segments before it and
+/// the older checkpoints. After the version is installed this is cleanup, not part of the
+/// commit, which has happened (its checkpoint is written and synced): a failure keeps those
+/// files, which recovery skips (the newest checkpoint and the records after it count), and the
+/// next checkpoint that writes removes them. Returning it would report a published commit as
+/// failed.
+fn release_covered(wal: &mut crate::durability::wal::Wal, root: &std::path::Path, revision: u64) {
+    if let Err(error) = wal.release_through(revision) {
+        tracing::warn!(%error, revision, "log segments the checkpoint covers kept for now; the next checkpoint releases them");
+    }
+    if let Err(error) = checkpoint::remove_older_than(root, revision) {
+        tracing::warn!(%error, revision, "older checkpoints kept for now; the next checkpoint removes them");
+    }
 }
 
 /// A rematerialisation in progress: the reasoner reads [`base`](Self::base), computes the
 /// complete inferred set, and [`finish`](Self::finish) replaces the inferred stack with it
-/// as one revision. The batch counterpart of [`Transaction::insert_inferred`]
-/// (crate::Transaction::insert_inferred), for initial reasoning after a bulk load and for
+/// as one revision. The batch counterpart of [`Transaction::insert_inferred`](crate::Transaction::insert_inferred),
+/// for initial reasoning after a bulk load and for
 /// ruleset changes; durable the way bulk loads are.
 ///
 /// It holds the writer slot for its lifetime, so the base can't change underneath. Dropping
 /// it without `finish` aborts it.
 pub struct Rematerialisation<'e> {
     engine: &'e Inner,
+    /// A bulk phase for the materialisation's life (`budgets.huge_pages = "bulk"`), however
+    /// it ends; before the slot, as fields drop in order.
+    _huge_pages: HugePagesPhase,
     _slot: MutexGuard<'e, ()>,
     base: Snapshot,
 }
@@ -553,6 +855,7 @@ impl<'e> Rematerialisation<'e> {
         let base = engine.shared.snapshot();
         Self {
             engine,
+            _huge_pages: HugePagesPhase::begin(),
             _slot: slot,
             base,
         }
@@ -568,17 +871,44 @@ impl<'e> Rematerialisation<'e> {
         self.engine.shared.dictionary.intern(term)
     }
 
+    /// Proof that this rematerialisation holds the writer slot.
+    pub fn writer(&self) -> super::WriterHeld<'_> {
+        super::WriterHeld::new()
+    }
+
     /// Replaces the inferred stack with `inferred` (in the default graph). Statements that
     /// are asserted in the default graph are dropped: the stacks stay disjoint. Returns the
-    /// revision and the inferred statements added and removed.
+    /// revision and the inferred statements added and removed. The new stack is read as the
+    /// one it replaces ([`Self::finish_held`] gives it a reading of its own).
     pub fn finish(self, inferred: Vec<EncodedTriple>) -> EngineResult<CommitSummary> {
+        let reading = self.base.version().reading;
+        self.finish_held(inferred, reading, None)
+            .map(|finished| finished.summary())
+    }
+
+    /// [`Self::finish`], keeping the writer slot until the returned [`super::Finished`] drops:
+    /// what describes the published inferences (a store's reasoning certificate) is recorded
+    /// before any other write can change the data they were computed over. The new stack is
+    /// installed with `reading` ([`Version::reading`]), in one install: a reader reads the old
+    /// stack in its reading or the new one in this. A stack whose stored rows don't change
+    /// still takes `reading`, without a new revision (`Shared::install`). The new stack
+    /// carries `certificate` ([`super::Certificate`]). A failure installs nothing.
+    pub fn finish_held(
+        self,
+        inferred: Vec<EncodedTriple>,
+        reading: Option<crate::TermId>,
+        certificate: Option<super::Certificate>,
+    ) -> EngineResult<super::Finished<'e>> {
         let Self {
             engine,
-            _slot,
+            _huge_pages,
+            _slot: slot,
             base,
         } = self;
         let shared = &engine.shared;
-        let _compaction = shared.versions.compaction_slot.lock();
+        // The new stack is built from `base` alone (the writer slot keeps it the latest
+        // content) without the compaction slot, which `publish` takes to install it: nothing
+        // that waits for that slot waits for this parallel work.
         let started = Instant::now();
         let mut quads: Vec<EncodedQuad> = inferred
             .into_par_iter()
@@ -587,7 +917,9 @@ impl<'e> Rematerialisation<'e> {
             .collect();
         quads.par_sort_unstable();
         quads.dedup();
+        // The stored rows: rows that only read alike (compact and expanded) still change.
         let mut old: Vec<EncodedQuad> = base
+            .stored()
             .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
             .collect();
         old.par_sort_unstable();
@@ -599,31 +931,50 @@ impl<'e> Rematerialisation<'e> {
             .par_iter()
             .filter(|q| quads.binary_search(q).is_err())
             .count();
-        // Compaction may have replaced runs since `base` was taken, with the same content.
-        let current = shared.snapshot();
-        let current = current.version();
         let summary = CommitSummary {
-            revision: current.revision + 1,
+            revision: base.revision() + 1,
             inserted: 0,
             deleted: 0,
             inferred_inserted: inserted as u64,
             inferred_deleted: deleted as u64,
+            // Rematerialisation keeps the asserted stack.
+            asserted: base.asserted_identity(),
         };
         if inserted + deleted == 0 {
-            return Ok(CommitSummary {
-                revision: current.revision,
+            shared.install(reading, certificate);
+            let summary = CommitSummary {
+                revision: base.revision(),
                 ..summary
-            });
+            };
+            return Ok(super::Finished::new(summary, slot));
         }
+        let inferred = IndexVersion::from_quads(Layout::DefaultGraph, quads);
+        // A merge may have replaced the asserted runs since `base` was taken, with the same
+        // statements: the latest ones are kept.
+        let current = shared.snapshot();
+        let current = current.version();
+        debug_assert_eq!(current.revision, base.revision(), "single writer");
         let next = Version {
+            content: super::Content::fresh(),
+            // Rematerialisation: the inferred stack only.
+            asserted_content: current.asserted_content,
             asserted: current.asserted.clone(),
-            inferred: IndexVersion::from_quads(Layout::DefaultGraph, quads),
+            inferred,
             revision: summary.revision,
+            // Stamped as it commits ([`publish`]).
+            committed_micros: None,
             dictionary_len: shared.dictionary.len(),
             equality: Default::default(),
+            reading,
+            certificate,
+            canonical: Default::default(),
+            own: Default::default(),
         };
-        publish(engine, Next::Built(next))?;
-        drop(_compaction);
+        // It keeps the asserted stack: of unknown time if that is.
+        let stamp = Stamp {
+            previous: current.committed_micros,
+        };
+        publish(engine, Next::Built(next, stamp))?;
         tracing::info!(
             revision = summary.revision,
             inferred_inserted = summary.inferred_inserted,
@@ -632,6 +983,6 @@ impl<'e> Rematerialisation<'e> {
             "inferred stack replaced"
         );
         engine.after_commit(0);
-        Ok(summary)
+        Ok(super::Finished::new(summary, slot))
     }
 }

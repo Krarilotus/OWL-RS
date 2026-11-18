@@ -1,0 +1,8 @@
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/> 
+
+SELECT (geof:boundary(?o1) AS ?ret) 
+WHERE { 
+	GRAPH <http://geographica.di.uoa.gr/dataset/clc> {
+		?s1 <http://geo.linkedopendata.gr/corine/ontology#asWKT> ?o1
+	} 
+}

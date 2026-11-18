@@ -12,17 +12,24 @@ use crate::runtime_posture::{DeploymentPosture, validate_configuration};
 mod ai_env;
 mod auth_env;
 mod cli;
+#[cfg(test)]
+mod defaults_tests;
 mod env_names;
 mod env_values;
 mod file_config;
+#[cfg(test)]
+mod percent_budget_tests;
 mod policy_env;
 mod reasoner_env;
+mod replication_env;
 pub mod settings;
 mod source;
 mod store_env;
 pub mod units;
 
-pub use cli::{CliCommand, CliConfig, ConvertCommand, LoadCommand, QueryCommand};
+pub use cli::{
+    CliCommand, CliConfig, ConvertCommand, LoadCommand, PrintQueryCommand, QueryCommand,
+};
 
 use ai_env::parse_ai_config;
 use env_names as names;
@@ -32,7 +39,7 @@ use reasoner_env::parse_reasoner_config;
 use source::{ConfigSource, KeyValueSource, LayeredSource, ProcessEnv};
 use store_env::parse_store_config;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub bind_address: SocketAddr,
     pub deployment_posture: DeploymentPosture,
@@ -40,9 +47,39 @@ pub struct ServerConfig {
     pub reasoner: ReasonerConfig,
     pub policy: PolicyConfig,
     pub ai: AiConfig,
+    pub replication: crate::replication::ReplicationConfig,
 }
 
 impl ServerConfig {
+    /// Installs the process's memory limit, once at startup, before opening stores. Refuses
+    /// one it can't enforce ([`nrese_store::ProcessMemory::resolve`]): the server doesn't
+    /// start with a limit it would ignore.
+    pub fn install_process_memory_policy(&self) -> Result<()> {
+        let limit = self.store.process_memory_bytes.resolve().map_err(|error| {
+            anyhow::anyhow!(
+                "budgets.process_memory ({}) can't be installed: {error}",
+                names::PROCESS_MEMORY_BYTES
+            )
+        })?;
+        nrese_exec::memory::set_process_limit(limit);
+        Ok(())
+    }
+
+    /// Sets the process's index encoding, vocabulary, huge pages and reasoning release from
+    /// the configuration, once at startup, before opening stores: no store opened later (the
+    /// system store, a draft check's) changes them (D16-489). Refuses to start if a store
+    /// opened earlier set other values.
+    pub fn install_process_settings(&self) -> Result<()> {
+        let configured = nrese_store::ProcessSettings::of(&self.store);
+        let in_effect = nrese_store::apply_process_settings(&self.store);
+        anyhow::ensure!(
+            in_effect == configured,
+            "a store opened before the configuration was installed set the process's settings \
+             ({in_effect:?}, configured {configured:?})"
+        );
+        Ok(())
+    }
+
     /// The effective settings, one `key = value` per line, for `check-config`. Credentials
     /// are never printed: authentication and AI show their mode and provider only.
     pub fn summary(&self) -> String {
@@ -62,15 +99,24 @@ impl ServerConfig {
                 self.deployment_posture.as_str().to_owned(),
             ),
             ("store.mode", format!("{:?}", store.mode)),
+            (
+                "replication.mode",
+                self.replication.mode.as_str().to_owned(),
+            ),
             ("store.data_dir", store.data_dir.display().to_string()),
             ("store.verify_on_open", store.verify_on_open.to_string()),
             ("store.map_checkpoints", store.map_checkpoints.to_string()),
             ("store.wal_archive", store.wal_archive.to_string()),
+            ("store.wal_damage", store.wal_damage.as_str().to_owned()),
             (
                 "store.index_encoding",
                 store.index_encoding.as_str().to_owned(),
             ),
             ("store.vocabulary", store.vocabulary.as_str().to_owned()),
+            (
+                "store.invalid_statements",
+                store.invalid_statements.name().to_owned(),
+            ),
             (
                 "store.ontology_path",
                 store
@@ -114,6 +160,11 @@ impl ServerConfig {
                 }
                 .to_owned(),
             ),
+            (
+                "reasoner.ql_rewriting",
+                store.ql_rewriting.name().to_owned(),
+            ),
+            ("reasoner.support_sets", store.support_sets.to_string()),
             (
                 "reasoner.semantics",
                 nrese_reasoner::ReasonerService::new(self.reasoner.clone())
@@ -214,10 +265,18 @@ impl ServerConfig {
             .context("failed to parse bind address")?;
         let deployment_posture =
             parse_deployment_posture(source.get(names::DEPLOYMENT_POSTURE).as_deref())?;
-        let store = parse_store_config(source)?;
+        // Resolve all memory shares against one reading of the process's capacity.
+        let machine = units::machine_memory_bytes();
+        let store = parse_store_config(source, machine)?;
         let reasoner = parse_reasoner_config(source)?;
-        let policy = parse_policy_config(source)?;
+        let policy = parse_policy_config(source, machine)?;
         let ai = parse_ai_config(source)?;
+        let replication = replication_env::parse_replication_config(source)?;
+        if replication.mode != crate::replication::ReplicationMode::Off
+            && store.mode != nrese_store::StoreMode::OnDisk
+        {
+            anyhow::bail!("replication needs an on-disk store (store.mode = \"on-disk\")");
+        }
 
         validate_configuration(deployment_posture, store.mode, &policy)
             .map_err(anyhow::Error::msg)?;
@@ -229,6 +288,7 @@ impl ServerConfig {
             reasoner,
             policy,
             ai,
+            replication,
         })
     }
 }

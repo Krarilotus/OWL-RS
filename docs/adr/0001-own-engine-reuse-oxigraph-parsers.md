@@ -1,8 +1,8 @@
 # ADR-0001: Own storage engine; reuse Oxigraph's parsers and SPARQL evaluator
 
 Status: accepted (2026-09-25); amended 2026-10-01: the Oxigraph libraries are being
-replaced altogether ([migration plan](../plan/2026-10-01-oxigraph-migration.md)); done
-by the merge into `main` of 2 October: no Oxigraph crate is a dependency any more.
+replaced altogether ([migration plan](../design/rdf-bundle.md)); done by the merge into
+`main` of 2 October: no Oxigraph crate is a dependency any more.
 `spareval` has left the runtime (the native executor evaluates everything), and the
 differential tests' oracle is `nrese-sparql-reference`.
 
@@ -31,6 +31,6 @@ Oxigraph is also published as separate, well-tested crates:
 ## Consequences
 
 - Full SPARQL 1.1 query/update and the protocol dataset parameters are available immediately on the new engine.
-- Performance work concentrates where it matters: indexes, the commit path, joins.
+- Performance work concentrates on indexes, the commit path and joins.
 - We depend on the Oxigraph crate family's release cadence. Versions are pinned and upgraded deliberately.
 - The `durable-storage` Cargo feature and the RocksDB dependency are removed.

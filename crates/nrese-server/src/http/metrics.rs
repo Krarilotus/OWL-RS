@@ -49,25 +49,60 @@ nrese_store_mode_info{{mode=\"{}\",durability=\"{}\"}} 1\n",
         state.store_mode_name(),
         state.durability_name(),
     );
+    let replication = state.replication();
+    if replication.is_replica() {
+        let status = replication.status(state.store().current_revision());
+        body.push_str(&format!(
+            "# HELP nrese_replication_lag_revisions Revisions this replica is behind its primary, as last seen.
+# TYPE nrese_replication_lag_revisions gauge
+nrese_replication_lag_revisions {}
+# HELP nrese_replication_records_applied_total Records of the primary's log applied since start.
+# TYPE nrese_replication_records_applied_total counter
+nrese_replication_records_applied_total {}
+# HELP nrese_replication_healthy Whether the last attempt to follow the primary succeeded.
+# TYPE nrese_replication_healthy gauge
+nrese_replication_healthy {}
+",
+            status.lag_revisions.unwrap_or(0),
+            status.records_applied,
+            u8::from(status.last_error.is_none() && status.last_contact_unix.is_some()),
+        ));
+    }
     body.push_str(&format!(
-        "# HELP nrese_query_cache_hits_total Queries answered from the result cache.
+        "# HELP nrese_query_cache_hits_total Query parts answered from the result cache.
 # TYPE nrese_query_cache_hits_total counter
 nrese_query_cache_hits_total {}
-# HELP nrese_query_cache_misses_total Cacheable queries evaluated.
+# HELP nrese_query_cache_misses_total Query parts computed that could have been cached.
 # TYPE nrese_query_cache_misses_total counter
 nrese_query_cache_misses_total {}
 # HELP nrese_query_cache_bytes Bytes held by the query result cache.
 # TYPE nrese_query_cache_bytes gauge
 nrese_query_cache_bytes {}
+# HELP nrese_query_cache_entries Entries of the result cache: parts' id columns and answers' bytes.
+# TYPE nrese_query_cache_entries gauge
+nrese_query_cache_entries{{kind=\"parts\"}} {}
+nrese_query_cache_entries{{kind=\"answers\"}} {}
+# HELP nrese_sessions_open Client transactions open (idle ones until the next begin drops them).
+# TYPE nrese_sessions_open gauge
+nrese_sessions_open {}
+# HELP nrese_queries_running Queries running now.
+# TYPE nrese_queries_running gauge
+nrese_queries_running {}
 ",
-        cache.hits, cache.misses, cache.bytes,
+        cache.hits,
+        cache.misses,
+        cache.bytes,
+        cache.entries - cache.answers,
+        cache.answers,
+        state.store().sessions().len(),
+        state.store().running_queries().list().len(),
     ));
     if let Some((used, peak, limit)) = state.store().query_memory() {
         body.push_str(&format!(
-            "# HELP nrese_query_memory_bytes Intermediate results the running queries hold.
+            "# HELP nrese_query_memory_bytes What the running queries have reserved: their intermediate results plus what each took ahead and hasn't used yet (its credit, at most 64 KiB, and its operators' spare).
 # TYPE nrese_query_memory_bytes gauge
 nrese_query_memory_bytes {used}
-# HELP nrese_query_memory_peak_bytes The most the running queries held at once.
+# HELP nrese_query_memory_peak_bytes The most the running queries had reserved at once.
 # TYPE nrese_query_memory_peak_bytes gauge
 nrese_query_memory_peak_bytes {peak}
 # HELP nrese_query_memory_limit_bytes The budget for all running queries together.
@@ -83,7 +118,7 @@ nrese_query_memory_limit_bytes {limit}
         "# HELP nrese_index_runs Index runs of both stacks.
 # TYPE nrese_index_runs gauge
 nrese_index_runs {}
-# HELP nrese_index_bytes Index data by where it lives: heap, or mapped from the checkpoint.
+# HELP nrese_index_bytes Index data by where it lives: heap (with the quad-layout forms pending reads share), or mapped from the checkpoint.
 # TYPE nrese_index_bytes gauge
 nrese_index_bytes{{place=\"heap\"}} {}
 nrese_index_bytes{{place=\"mapped\"}} {}
@@ -116,6 +151,39 @@ nrese_dictionary_bytes{{part=\"mapped\"}} {}
         engine.dictionary.index_bytes,
         engine.dictionary.mapped_bytes,
     ));
+    body.push_str(&format!(
+        "# HELP nrese_text_index_terms Terms the full-text indexes cover (none until a query searches text).
+# TYPE nrese_text_index_terms gauge
+nrese_text_index_terms {}
+",
+        engine.dictionary.text_covered
+    ));
+    // What the allocator holds for the process (mimalloc's committed memory), and, in
+    // builds that count every allocation (`--cfg alloc_profile`), what the program holds.
+    let mut committed = 0usize;
+    // SAFETY: every out-parameter is null but `committed`, a valid, writable usize.
+    unsafe {
+        libmimalloc_sys::mi_process_info(
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &raw mut committed,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        );
+    }
+    body.push_str(&format!(
+        "# HELP nrese_allocator_bytes What the allocator holds: committed (mimalloc's); live (allocated and not freed) and peak (the most live at once since the start), only in builds with `--cfg alloc_profile`, else 0.
+# TYPE nrese_allocator_bytes gauge
+nrese_allocator_bytes{{kind=\"committed\"}} {committed}
+nrese_allocator_bytes{{kind=\"live\"}} {}
+nrese_allocator_bytes{{kind=\"peak\"}} {}
+",
+        nrese_exec::heap::live(),
+        nrese_exec::heap::peak()
+    ));
     if let Some(resident) = resident_bytes() {
         body.push_str(&format!(
             "# HELP nrese_process_resident_bytes Memory the process holds resident (file-backed pages included).
@@ -124,6 +192,40 @@ nrese_process_resident_bytes {resident}
 "
         ));
     }
+    let support = state.store().support_statistics();
+    body.push_str(&format!(
+        "# HELP nrese_vector_index_bytes The vector index: vectors and their graphs.
+# TYPE nrese_vector_index_bytes gauge
+nrese_vector_index_bytes {}
+# HELP nrese_derived_indexes_loaded_total Derived indexes read from their files since start.
+# TYPE nrese_derived_indexes_loaded_total counter
+nrese_derived_indexes_loaded_total {}
+# HELP nrese_support_sets_total Support graph sets (inferred = \"supported\") computed afresh or updated for a commit.
+# TYPE nrese_support_sets_total counter
+nrese_support_sets_total{{how=\"computed\"}} {}
+nrese_support_sets_total{{how=\"updated\"}} {}
+# HELP nrese_support_views_total Readers' views built: all, from the reader's earlier one, and those that asked the reader's closure about statements past reasoner.support_sets.
+# TYPE nrese_support_views_total counter
+nrese_support_views_total{{how=\"built\"}} {}
+nrese_support_views_total{{how=\"patched\"}} {}
+nrese_support_views_total{{how=\"closure\"}} {}
+# HELP nrese_support_seconds_total Time spent on support graph sets and views.
+# TYPE nrese_support_seconds_total counter
+nrese_support_seconds_total{{phase=\"compute\"}} {}
+nrese_support_seconds_total{{phase=\"update\"}} {}
+nrese_support_seconds_total{{phase=\"view\"}} {}
+",
+        engine.dictionary.vector_bytes,
+        engine.dictionary.derived_loaded,
+        support.computed,
+        support.updated,
+        support.views,
+        support.patched,
+        support.closures,
+        support.computing_us as f64 / 1e6,
+        support.updating_us as f64 / 1e6,
+        support.viewing_us as f64 / 1e6,
+    ));
     state.request_metrics().render(&mut body);
 
     let mut response = (StatusCode::OK, body).into_response();

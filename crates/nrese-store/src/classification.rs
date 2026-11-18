@@ -1,121 +1,231 @@
-//! OWL 2 EL classification of the store's asserted statements (all graphs), on request
-//! ([`nrese_reasoner::v2::classify`]).
+//! Classification and realisation of the store's asserted statements (all graphs), on
+//! request, by the OWL 2 DL engines ([`crate::dl::classification`]): complete for OWL 2
+//! DL within `dl.timeout`, and saying so when a budget or an unsupported construct leaves
+//! a result incomplete (what it contains is entailed either way). Where an irregular role
+//! hierarchy is all they leave out, the EL classifier answers if it is complete for the
+//! ontology ([`crate::dl::classification::el_answer`]); stopped, it says so, and the DL
+//! engines' answer stands.
 
-use std::collections::BTreeMap;
 use std::time::Instant;
 
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, TermKind};
-use nrese_rdf::{LiteralRef, NamedNodeRef};
-use nrese_reasoner::v2::classify::classify;
-use nrese_reasoner::v2::ir::Vocabulary;
+use nrese_engine::{Snapshot, TermId};
 
+use crate::dl::Verdict;
 use crate::{StoreResult, StoreService};
 
-/// The class hierarchy of the store's asserted ontology.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// The class hierarchy of the store's asserted ontology. An inconsistent ontology lists
+/// nothing: every class is unsatisfiable then, and "this class can have no instance"
+/// describes a consistent ontology only.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassificationReport {
     /// `(sub, super)` IRIs, sorted; equivalent classes both ways; `owl:Thing` left out.
     pub subsumptions: Vec<(String, String)>,
     /// Classes that can have no instance.
     pub unsatisfiable: Vec<String>,
-    /// Axioms outside OWL 2 EL that were skipped, by kind.
-    pub skipped: BTreeMap<&'static str, usize>,
+    /// Classes equivalent to `owl:Thing`.
+    pub equivalent_to_thing: Vec<String>,
+    /// Whether the ontology has a model; `Unknown`: what is listed holds either way.
+    pub consistency: Verdict,
+    /// The engine that classified: `context-core` (the Horn stage took the ontology),
+    /// `tableau` (the hypertableau driver) or `el` (the EL classifier, where an irregular
+    /// role hierarchy is all the DL engines left out: `dl::classification::el_answer`).
+    pub engine: &'static str,
+    /// Why the hierarchy may lack subsumptions (empty: it is complete).
+    pub incomplete: Vec<String>,
+    /// Set where a procedure outside OWL 2 DL answered (`el`): what is outside, and what
+    /// its answer guarantees and what not.
+    pub outside: Option<nrese_sparql::Outside>,
     pub micros: u64,
 }
 
-/// Ids of the vocabulary the classifier looks for; a term the store doesn't hold gets an
-/// id no statement has.
-struct Lookup<'a> {
-    snapshot: &'a Snapshot,
-    missing: u64,
+impl ClassificationReport {
+    /// Nothing left out, and the consistency decided.
+    pub fn complete(&self) -> bool {
+        self.incomplete.is_empty() && self.consistency.decided().is_some()
+    }
 }
 
-impl Vocabulary for Lookup<'_> {
-    fn iri(&mut self, iri: &str) -> u64 {
-        self.snapshot
-            .lookup(NamedNodeRef::new_unchecked(iri).into())
-            .map_or_else(
-                || {
-                    self.missing -= 1;
-                    self.missing
-                },
-                TermId::raw,
-            )
-    }
+/// The named individuals' types under the store's asserted ontology; none for an
+/// inconsistent one (as [`ClassificationReport`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RealisationReport {
+    /// Per named individual (IRI, sorted): every named class it is an instance of.
+    pub types: Vec<(String, Vec<String>)>,
+    pub consistency: Verdict,
+    /// The engine that classified (as [`ClassificationReport::engine`]).
+    pub engine: &'static str,
+    /// Why types may be missing (empty: complete).
+    pub incomplete: Vec<String>,
+    pub micros: u64,
+}
 
-    fn literal(&mut self, lexical: &str, datatype: &str) -> u64 {
-        let literal = LiteralRef::new_typed_literal(lexical, NamedNodeRef::new_unchecked(datatype));
-        self.snapshot.lookup(literal.into()).map_or_else(
-            || {
-                self.missing -= 1;
-                self.missing
-            },
-            TermId::raw,
-        )
+impl RealisationReport {
+    /// Nothing left out, and the consistency decided.
+    pub fn complete(&self) -> bool {
+        self.incomplete.is_empty() && self.consistency.decided().is_some()
     }
+}
 
-    fn language_literal(&mut self, lexical: &str, language: &str) -> u64 {
-        let literal = LiteralRef::new_language_tagged_literal_unchecked(lexical, language);
-        self.snapshot.lookup(literal.into()).map_or_else(
-            || {
-                self.missing -= 1;
-                self.missing
-            },
-            TermId::raw,
-        )
+/// An IRI's text; `None` for any other term.
+fn iri(snapshot: &Snapshot, id: u64) -> Option<String> {
+    match snapshot.decode(TermId::from_raw(id)) {
+        Some(nrese_rdf::Term::NamedNode(n)) => Some(n.into_string()),
+        _ => None,
     }
+}
+
+/// A report's reasons: the engines', and an undecided verdict's own where they list none,
+/// so an answer without a verdict never reads as complete in any form.
+fn reasons(consistency: &Verdict, mut incomplete: Vec<String>) -> Vec<String> {
+    if let Some(why) = consistency.reason()
+        && incomplete.is_empty()
+    {
+        incomplete.push(format!("consistency not decided: {why}"));
+    }
+    incomplete
+}
+
+fn sorted_iris(snapshot: &Snapshot, ids: &[u64]) -> Vec<String> {
+    let mut out: Vec<String> = ids.iter().filter_map(|&c| iri(snapshot, c)).collect();
+    out.sort();
+    out
 }
 
 impl StoreService {
-    /// Classifies the asserted statements of every graph under OWL 2 EL; for a scope that
+    /// Classifies the asserted statements of every graph under OWL 2 DL; for a scope that
     /// reads every graph.
     pub fn classify(&self, scope: &crate::ReadScope) -> StoreResult<ClassificationReport> {
+        self.classify_until(scope, nrese_reasoner::eval::NEVER)
+    }
+
+    /// [`Self::classify`], given up when `stop` fires while it waits for another request's
+    /// computation of this revision: then
+    /// [`ClassificationCancelled`](crate::StoreError::ClassificationCancelled). That
+    /// computation, and one it runs itself, run to their end.
+    pub fn classify_until(
+        &self,
+        scope: &crate::ReadScope,
+        stop: nrese_reasoner::eval::Stop<'_>,
+    ) -> StoreResult<ClassificationReport> {
         scope.require_all("classification")?;
         let started = Instant::now();
         let snapshot = self.engine().snapshot();
-        let mut triples: Vec<[u64; 3]> = snapshot
-            .quads_for_pattern_in(
-                ReadModel::Asserted,
-                &QuadPattern {
-                    subject: None,
-                    predicate: None,
-                    object: None,
-                    graph: GraphSelector::Any,
-                },
-            )
-            .map(|q| [q.subject.raw(), q.predicate.raw(), q.object.raw()])
-            .collect();
-        triples.sort_unstable();
-        triples.dedup();
-        let mut vocabulary = Lookup {
-            snapshot: &snapshot,
-            missing: u64::MAX,
+        use crate::dl::classification::{self as dl, ElRoute};
+        // An EL answer kept for this revision: neither engine runs again.
+        let answer = match dl::kept_el(self, &snapshot) {
+            Some(el) => Ok(el),
+            None => {
+                let taxonomy = dl::taxonomy(self, &snapshot, stop)
+                    .ok_or(crate::StoreError::ClassificationCancelled)?;
+                match dl::el_answer(self, &snapshot, &taxonomy, started) {
+                    Some(ElRoute::Answered(el)) => Ok(el),
+                    None => Err((taxonomy, None)),
+                    Some(ElRoute::Stopped(memory)) => {
+                        let why = memory
+                            .map_or_else(|| "`dl.timeout` passed".to_owned(), |e| e.to_string());
+                        Err((taxonomy, Some(format!("the EL classifier stopped: {why}"))))
+                    }
+                }
+            }
         };
-        let result = classify(&triples, &mut vocabulary, &|id| {
-            TermId::from_raw(id).kind() == TermKind::Iri
-        });
-        let text = |id: u64| match snapshot.decode(TermId::from_raw(id)) {
-            Some(nrese_rdf::Term::NamedNode(n)) => n.into_string(),
-            other => format!("{other:?}"),
+        let ((pairs, unsatisfiable, top), consistency, engine, incomplete) = match &answer {
+            Ok(el) => {
+                let c = &el.classification;
+                let lists = (&c.subsumptions[..], &c.unsatisfiable[..], &c.top[..]);
+                (
+                    lists,
+                    &el.consistency,
+                    "el",
+                    el.unproven.iter().cloned().collect(),
+                )
+            }
+            Err((taxonomy, stopped)) => {
+                let c = &taxonomy.classification;
+                let lists = (&c.subsumptions[..], &c.unsatisfiable[..], &c.top[..]);
+                let mut why = taxonomy.incomplete.clone();
+                why.extend(stopped.clone());
+                (lists, &c.consistency, taxonomy.profile.path, why)
+            }
         };
-        let mut skipped = BTreeMap::new();
-        for (_, kind) in &result.skipped {
-            *skipped.entry(*kind).or_default() += 1;
-        }
-        let mut subsumptions: Vec<(String, String)> = result
-            .subsumptions
+        let listed = *consistency != Verdict::Inconsistent;
+        let mut subsumptions: Vec<(String, String)> = pairs
             .iter()
-            .map(|&(a, b)| (text(a), text(b)))
+            .filter(|_| listed)
+            .filter_map(|&(a, b)| Some((iri(&snapshot, a)?, iri(&snapshot, b)?)))
             .collect();
         subsumptions.sort();
-        let mut unsatisfiable: Vec<String> =
-            result.unsatisfiable.iter().map(|&c| text(c)).collect();
-        unsatisfiable.sort();
+        let list = |ids: &[u64]| match listed {
+            true => sorted_iris(&snapshot, ids),
+            false => Vec::new(),
+        };
         Ok(ClassificationReport {
             subsumptions,
-            unsatisfiable,
-            skipped,
+            unsatisfiable: list(unsatisfiable),
+            equivalent_to_thing: list(top),
+            consistency: consistency.clone(),
+            engine,
+            incomplete: reasons(consistency, incomplete),
+            outside: answer.is_ok().then(dl::el_outside),
             micros: started.elapsed().as_micros() as u64,
         })
+    }
+
+    /// Realises the asserted statements of every graph under OWL 2 DL: each named
+    /// individual's types; for a scope that reads every graph.
+    pub fn realise(&self, scope: &crate::ReadScope) -> StoreResult<RealisationReport> {
+        self.realise_until(scope, nrese_reasoner::eval::NEVER)
+    }
+
+    /// [`Self::realise`], given up as [`Self::classify_until`] is.
+    pub fn realise_until(
+        &self,
+        scope: &crate::ReadScope,
+        stop: nrese_reasoner::eval::Stop<'_>,
+    ) -> StoreResult<RealisationReport> {
+        scope.require_all("realisation")?;
+        let started = Instant::now();
+        let snapshot = self.engine().snapshot();
+        let r = crate::dl::classification::realisation(self, &snapshot, stop)
+            .ok_or(crate::StoreError::ClassificationCancelled)?;
+        let consistency = r.taxonomy.classification.consistency.clone();
+        let mut types: Vec<(String, Vec<String>)> = r
+            .individuals
+            .iter()
+            .zip(&r.types)
+            .filter(|_| consistency != Verdict::Inconsistent)
+            .filter_map(|(&a, classes)| Some((iri(&snapshot, a)?, sorted_iris(&snapshot, classes))))
+            .collect();
+        types.sort();
+        let mut incomplete = r.taxonomy.incomplete.clone();
+        incomplete.extend(r.incomplete.iter().cloned());
+        Ok(RealisationReport {
+            types,
+            incomplete: reasons(&consistency, incomplete),
+            consistency,
+            engine: r.taxonomy.profile.path,
+            micros: started.elapsed().as_micros() as u64,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A report's reasons are never empty while its verdict is undecided: the verdict's
+    /// own reason stands in where the engines listed none (N4 design, G4-1: every form
+    /// carries the verdict or its absence).
+    #[test]
+    fn an_undecided_verdict_always_carries_a_reason() {
+        let budget = Verdict::Unknown("gave up: the node budget".to_owned());
+        assert_eq!(
+            reasons(&budget, Vec::new()),
+            ["consistency not decided: gave up: the node budget"]
+        );
+        let listed = vec!["consistency not decided (unsupported): x".to_owned()];
+        assert_eq!(reasons(&budget, listed.clone()), listed);
+        for decided in [Verdict::Consistent, Verdict::Inconsistent] {
+            assert!(reasons(&decided, Vec::new()).is_empty());
+        }
     }
 }

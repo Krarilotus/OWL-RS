@@ -12,8 +12,9 @@
 //!
 //! **Pre-binding** puts the values in for the variables, throughout the query
 //! ([`nrese_sparql::QueryOptions::pre_bound`]): `$this`, `$currentShape`, `$shapesGraph`
-//! (if the shapes graph is a named graph), `$value` and the parameters. `$PATH` in a
-//! property shape's query is replaced by its path in SPARQL syntax before parsing. The
+//! (if the shapes graph is a named graph), `$value` and the parameters. `$PATH` as the
+//! predicate of a triple pattern in a property shape's query is read as its path while the
+//! query is parsed, as if the path were written there; any other use is ill-formed. The
 //! restrictions of §5.6.2 make a query ill-formed: `MINUS`, `VALUES`, `SERVICE`,
 //! binding a pre-bound variable (`AS ?this`), and a subquery that doesn't project every
 //! pre-bound variable (`$shapesGraph` and `$currentShape` aside).
@@ -25,10 +26,13 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use nrese_engine::{GraphSelector, TermId};
-use nrese_rdf::{GraphName, NamedNode, Term, Variable};
-use nrese_sparql::{QueryDatasetSpecification, QueryOptions, QueryResults, ReadView};
-use nrese_sparql_syntax::algebra::{Expression, GraphPattern};
+use nrese_engine::TermId;
+use nrese_rdf::{NamedNode, Term, Variable};
+use nrese_sparql::{
+    QueryEvaluationError, QueryOptions, QueryResults, QuerySolution, QuerySolutionIter, ReadView,
+    Resources,
+};
+use nrese_sparql_syntax::algebra::{Expression, GraphPattern, PropertyPathExpression};
 
 use crate::graph::Selection;
 use crate::model::{Path, SparqlCheck};
@@ -38,6 +42,9 @@ pub(crate) const THIS: &str = "this";
 pub(crate) const CURRENT_SHAPE: &str = "currentShape";
 pub(crate) const SHAPES_GRAPH: &str = "shapesGraph";
 pub(crate) const VALUE: &str = "value";
+/// The placeholder for a property shape's path (SHACL §5.2): legal only as the predicate of
+/// a triple pattern, where it is read as the path.
+pub(crate) const PATH: &str = "PATH";
 
 /// Why `pattern` can't be pre-bound with `pre_bound` (§5.6.2), if it can't: `MINUS`,
 /// `VALUES`, `SERVICE`, a pre-bound variable bound by `AS`, or a subquery that leaves out
@@ -50,18 +57,19 @@ pub(crate) fn prebinding_problem(pattern: &GraphPattern, pre_bound: &[String]) -
             GraphPattern::Minus { .. } => Some("uses MINUS".into()),
             GraphPattern::Values { .. } => Some("uses VALUES".into()),
             GraphPattern::Service { .. } => Some("uses SERVICE".into()),
-            GraphPattern::Extend {
-                inner: p,
-                variable,
-                expression,
-            } => {
-                if pre_bound.iter().any(|v| v == variable.as_str()) {
-                    return Some(format!(
-                        "binds the pre-bound variable ?{}",
-                        variable.as_str()
-                    ));
+            GraphPattern::Extend { inner: p, bindings } => {
+                for (variable, expression) in bindings {
+                    if pre_bound.iter().any(|v| v == variable.as_str()) {
+                        return Some(format!(
+                            "binds the pre-bound variable ?{}",
+                            variable.as_str()
+                        ));
+                    }
+                    if let Some(problem) = expression_problem(expression, pre_bound) {
+                        return Some(problem);
+                    }
                 }
-                expression_problem(expression, pre_bound).or_else(|| inner(p))
+                inner(p)
             }
             GraphPattern::Project {
                 inner: p,
@@ -91,8 +99,8 @@ pub(crate) fn prebinding_problem(pattern: &GraphPattern, pre_bound: &[String]) -
                 .and_then(|e| expression_problem(e, pre_bound))
                 .or_else(|| inner(left))
                 .or_else(|| inner(right)),
-            GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
-                inner(left).or_else(|| inner(right))
+            GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+                inputs.iter().find_map(&inner)
             }
             GraphPattern::Graph { inner: p, .. }
             | GraphPattern::Distinct { inner: p }
@@ -139,25 +147,28 @@ fn expression_problem(expression: &Expression, pre_bound: &[String]) -> Option<S
     }
 }
 
-/// `path` in SPARQL property path syntax, with `iri` naming each predicate.
-pub(crate) fn path_text(path: &Path, iri: &dyn Fn(TermId) -> Option<String>) -> Option<String> {
-    let joined = |parts: &[Path], separator: &str| -> Option<String> {
-        let parts: Option<Vec<String>> = parts.iter().map(|p| path_text(p, iri)).collect();
-        Some(format!("({})", parts?.join(separator)))
+/// `path` as a SPARQL property path, with `iri` naming each predicate.
+pub(crate) fn path_expression(
+    path: &Path,
+    iri: &dyn Fn(TermId) -> Option<NamedNode>,
+) -> Option<PropertyPathExpression> {
+    let parts = |parts: &[Path]| -> Option<Vec<PropertyPathExpression>> {
+        parts.iter().map(|p| path_expression(p, iri)).collect()
     };
+    let inner = |inner: &Path| path_expression(inner, iri).map(Box::new);
     Some(match path {
-        Path::Predicate(predicate) => format!("<{}>", iri(*predicate)?),
-        Path::Inverse(inner) => format!("^({})", path_text(inner, iri)?),
-        Path::Sequence(parts) => joined(parts, "/")?,
-        Path::Alternative(parts) => joined(parts, "|")?,
-        Path::ZeroOrMore(inner) => format!("({})*", path_text(inner, iri)?),
-        Path::OneOrMore(inner) => format!("({})+", path_text(inner, iri)?),
-        Path::ZeroOrOne(inner) => format!("({})?", path_text(inner, iri)?),
+        Path::Predicate(predicate) => PropertyPathExpression::NamedNode(iri(*predicate)?),
+        Path::Inverse(path) => PropertyPathExpression::Reverse(inner(path)?),
+        Path::Sequence(steps) => PropertyPathExpression::sequence(parts(steps)?),
+        Path::Alternative(paths) => PropertyPathExpression::alternative(parts(paths)?),
+        Path::ZeroOrMore(path) => PropertyPathExpression::ZeroOrMore(inner(path)?),
+        Path::OneOrMore(path) => PropertyPathExpression::OneOrMore(inner(path)?),
+        Path::ZeroOrOne(path) => PropertyPathExpression::ZeroOrOne(inner(path)?),
     })
 }
 
-/// A solution of a SELECT check, as a result: the value and path it names, if any, and
-/// whether it reports a failure.
+/// A solution of a SELECT check, as a result: the value and path it names, if any (taken out
+/// of the solution, not copied), and whether it reports a failure.
 pub(crate) struct Found {
     pub(crate) value: Option<Term>,
     pub(crate) path: Option<NamedNode>,
@@ -165,23 +176,57 @@ pub(crate) struct Found {
 }
 
 /// What a check found for one focus node: per value node (ASK) or per solution (SELECT).
-pub(crate) enum Outcome {
+pub(crate) enum Outcome<'a> {
     /// The value nodes an ASK validator answered false for.
     Failed(Vec<TermId>),
-    Solutions(Vec<Found>),
+    /// A SELECT's solutions, decoded as they are read ([`found`]): none is kept here.
+    Solutions(QuerySolutionIter<'a>),
 }
 
-/// Runs `check` for `focus` (with `values`, its value nodes, for an ASK validator) over
-/// `data`, with the pre-bound variables of SHACL-SPARQL.
-pub(crate) fn run<V: ReadView>(
-    view: &V,
+/// Why a check has no outcome.
+pub(crate) enum Problem {
+    /// The validation's resources stopped the query: the cancellation fired, or the envelope
+    /// refused a charge. No verdict on the data: the whole validation stops with it.
+    Stopped(QueryEvaluationError),
+    /// The check couldn't be evaluated: a failure of this constraint.
+    Failed(String),
+}
+
+impl From<String> for Problem {
+    fn from(problem: String) -> Self {
+        Self::Failed(problem)
+    }
+}
+
+impl From<QueryEvaluationError> for Problem {
+    fn from(error: QueryEvaluationError) -> Self {
+        match error {
+            QueryEvaluationError::Cancelled | QueryEvaluationError::MemoryLimit(_) => {
+                Self::Stopped(error)
+            }
+            other => Self::Failed(other.to_string()),
+        }
+    }
+}
+
+/// Runs `check` with one combination of its `parameters`' values ([`SparqlCheck::each_combination`])
+/// for `focus` (with `values`, its value nodes, for an ASK validator) over `data`, with the
+/// pre-bound variables of SHACL-SPARQL, on the validation's `resources`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one check's inputs: the data, the check and its parameters, its focus and values, its shape's terms and the resources"
+)]
+pub(crate) fn run<'a, V: ReadView>(
+    view: &'a V,
     data: Selection,
     check: &SparqlCheck,
+    parameters: &[(Variable, TermId)],
     focus: TermId,
     values: &[TermId],
     shape: TermId,
     shapes_graph: Option<TermId>,
-) -> Result<Outcome, String> {
+    resources: &Resources,
+) -> Result<Outcome<'a>, Problem> {
     let decode = |id: TermId| {
         view.decode(id)
             .ok_or_else(|| format!("term #{} isn't known", id.raw()))
@@ -193,32 +238,22 @@ pub(crate) fn run<V: ReadView>(
     if let Some(graph) = shapes_graph {
         bound.insert(variable(SHAPES_GRAPH), decode(graph)?);
     }
-    for (name, value) in &check.parameters {
+    for (name, value) in parameters {
         bound.insert(name.clone(), decode(*value)?);
     }
+    // The statements Core reads, shapes graphs left out ([`Selection::query_dataset`]), on
+    // the validation's cancellation and envelope.
     let mut options = QueryOptions {
-        read_model: data.model,
+        resources: resources.clone(),
         ..QueryOptions::default()
     };
-    match data.graphs {
-        GraphSelector::Exact(graph) if !graph.is_default_graph() => {
-            let mut dataset = QueryDatasetSpecification::new();
-            let Term::NamedNode(name) = decode(graph)? else {
-                return Err("the data graph isn't an IRI".into());
-            };
-            dataset.set_default_graph(vec![GraphName::NamedNode(name)]);
-            options.dataset = Some(dataset);
-        }
-        GraphSelector::Exact(_) => {}
-        // Every graph: their merge (a shapes graph among them is read too).
-        _ => options.union_default_graph = true,
-    }
+    data.query_dataset(view, &mut options)?;
     let evaluate = |bound: HashMap<Variable, Term>| {
         let options = QueryOptions {
             pre_bound: Some(Arc::new(bound)),
             ..options.clone()
         };
-        nrese_sparql::evaluate_query(view, &check.query, &options).map_err(|e| e.to_string())
+        nrese_sparql::evaluate_query(view, &check.query, &options).map_err(Problem::from)
     };
     if check.ask {
         let mut failed = Vec::new();
@@ -228,30 +263,51 @@ pub(crate) fn run<V: ReadView>(
             match evaluate(bound)? {
                 QueryResults::Boolean(true) => {}
                 QueryResults::Boolean(false) => failed.push(value),
-                _ => return Err("an ASK validator isn't an ASK query".into()),
+                _ => {
+                    return Err(Problem::Failed(
+                        "an ASK validator isn't an ASK query".into(),
+                    ));
+                }
             }
         }
         return Ok(Outcome::Failed(failed));
     }
     let QueryResults::Solutions(solutions) = evaluate(bound)? else {
-        return Err("a SELECT constraint isn't a SELECT query".into());
+        return Err(Problem::Failed(
+            "a SELECT constraint isn't a SELECT query".into(),
+        ));
     };
-    let mut found = Vec::new();
-    for solution in solutions {
-        let solution = solution.map_err(|e| e.to_string())?;
-        let failure = matches!(
-            solution.get("failure"),
-            Some(Term::Literal(l)) if l.value() == "true"
-        );
-        let path = match solution.get("path") {
-            Some(Term::NamedNode(path)) => Some(path.clone()),
-            _ => None,
-        };
-        found.push(Found {
-            value: solution.get(VALUE).cloned(),
-            path,
+    Ok(Outcome::Solutions(solutions))
+}
+
+/// A SELECT check's solution, as a result ([`Outcome::Solutions`] yields them as they are
+/// read: each is decoded, used and dropped before the next). Its terms are moved out of it,
+/// not copied; a row that reports `?failure` has its value and path dropped with it.
+pub(crate) fn found(solution: QuerySolution) -> Found {
+    let at = |name: &str| {
+        solution
+            .variables()
+            .iter()
+            .position(|variable| variable.as_str() == name)
+    };
+    let (failure_at, path_at, value_at) = (at("failure"), at("path"), at(VALUE));
+    let mut values = solution.into_values();
+    let mut take = |at: Option<usize>| at.and_then(|at| values.get_mut(at)?.take());
+    let failure = matches!(take(failure_at), Some(Term::Literal(l)) if l.value() == "true");
+    if failure {
+        return Found {
+            value: None,
+            path: None,
             failure,
-        });
+        };
     }
-    Ok(Outcome::Solutions(found))
+    let path = match take(path_at) {
+        Some(Term::NamedNode(path)) => Some(path),
+        _ => None,
+    };
+    Found {
+        value: take(value_at),
+        path,
+        failure,
+    }
 }

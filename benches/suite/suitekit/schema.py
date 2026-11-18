@@ -5,19 +5,21 @@
 | date | when the run started (ISO 8601, minutes) |
 | host, runtime | the machine and how the system ran (docker, apptainer, process) |
 | system, version, publish | the system (systems.toml key), its version where it says, and whether its results may be published (free) or need the vendor's permission |
-| workload, tier, regime | the workload (workloads.toml key), its size, and the entailment regime the system ran (none, rdfs, owl-horst, owl2-rl, owl2-ql) |
+| workload, tier, regime | the workload (workloads.toml key), its size, and the entailment regime the system ran (none, rdfs, owl-horst, owl2-rl, owl2-ql), or custom: a named rule program (the tier names it), so that its results compare only with the same program's |
 | run | the repetition (a fresh store each) |
-| task | load, reason, size, restart, count, query, update, serve, conformance (a skipped pair: load, status skipped) |
-| item | the query or test the row is about (task query, conformance) |
+| task | load, reason, size, restart, count, query, update, serve, conformance, validate (SHACL; item = the shape set, rows = validation results), index (a service index built after the server started) (a skipped pair: load, status skipped) |
+| item | the query or test the row is about (task query, conformance); task count: `count:REL`, the facts of one derived relation (empty: the whole closure) |
 | repeat | the measured repetition of a query within a run; 0 is its first execution on the fresh server (a warm-up run, not in the medians) |
 | status | ok, failed, timeout, wrong (an answer count differs from the expected one), skipped |
 | ms | wall time |
 | peak_mib | peak resident memory of the step |
-| rows | answers (query), statements (load: asserted; reason: inferred; count: all answered) |
+| rows | answers (query), statements (load: asserted; reason: inferred; count: all answered, or a relation's facts), checked before any time counts: a count that differs from the known one is `wrong` |
 | bytes | store size (task size) |
 | note | what else the row needs to be read right |
 | cache | the system's result cache while the queries ran: off, on (the system's default), or - (it has none) |
 | order | the query order: fixed (each query's runs back to back), or shuffled:SEED (rounds over all queries, each in a new order; the same seed gives every system the same orders) |
+| recall | approximate search: the share of the true nearest found (recall@k, k = rows), 0 to 1; its times compare only at equal recall (empty: an exact answer) |
+| memory_kind | the kind of peak_mib (suitekit/compare.py, "Memory, by kind"): `anon-kernel` (a container's anonymous plus kernel memory from memory.stat), `unknown` (it couldn't be read: no peak, the note says why); empty in rows written before 11 Nov 2026 and by runtimes that don't say, where readers take the runtime's (docker: `sampled`, `docker stats`) |
 
 The results of systems with publish = permission stay in the result files; `suite.py
 report` leaves them out unless asked (and they may not leave the machine without the
@@ -29,9 +31,9 @@ import csv
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
-TASKS = {"load", "reason", "size", "restart", "count", "query", "update", "serve", "conformance"}
+TASKS = {"load", "reason", "size", "restart", "count", "query", "update", "serve", "conformance", "validate", "index"}
 STATUSES = {"ok", "failed", "timeout", "wrong", "skipped"}
-REGIMES = {"none", "rdfs", "owl-horst", "owl2-rl", "owl2-ql", "-"}
+REGIMES = {"none", "rdfs", "owl-horst", "owl2-rl", "owl2-ql", "custom", "-"}
 
 
 @dataclass
@@ -57,6 +59,8 @@ class Result:
     note: str = ""
     cache: str = "-"
     order: str = "-"
+    recall: float | str = ""
+    memory_kind: str = ""
 
 
 FIELDS = [f.name for f in fields(Result)]
@@ -72,18 +76,22 @@ def problems(result: Result) -> list[str]:
         out.append(f"unknown regime {result.regime!r}")
     if result.publish not in ("free", "permission"):
         out.append(f"publish must be free or permission, not {result.publish!r}")
-    if result.task == "query" and not result.item:
-        out.append("a query row names its query (item)")
+    if result.task in ("query", "validate") and not result.item:
+        out.append(f"a {result.task} row names its query or shape set (item)")
     return out
 
 
 class Writer:
-    """Appends results to a CSV file (with its header when new). A file written with other
-    fields (an older schema) is left alone: the rows go to results-2.csv, -3, … instead."""
+    """Appends results to a CSV file (with its header when new). A file of an older schema whose
+    fields are this one's first (columns are only ever added last) takes rows under its own header
+    while they leave the newer columns empty; a row that fills one is refused: readers read
+    results.csv only, so it can go nowhere they look. A file of other fields is left alone: the
+    rows go to results-2.csv, -3, … instead."""
 
     def __init__(self, path: Path, echo=None):
         n = 1
-        while path.exists() and path.stat().st_size > 0 and header(path) != FIELDS:
+        while (path.exists() and path.stat().st_size > 0
+               and (not (found := header(path)) or FIELDS[:len(found)] != found)):
             n += 1
             path = path.with_name(f"{path.stem.split('-')[0]}-{n}{path.suffix}")
         self.path = path
@@ -92,16 +100,21 @@ class Writer:
         if not path.exists() or path.stat().st_size == 0:
             with open(path, "w", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow(FIELDS)
+        self.fields = header(path)
 
     def write(self, result: Result):
         found = problems(result)
         if found:
             raise ValueError(f"result {result}: {'; '.join(found)}")
         row = asdict(result)
+        newer = [k for k in FIELDS[len(self.fields):] if row[k] not in ("", None)]
+        if newer:
+            raise ValueError(f"{self.path} predates the column(s) {', '.join(newer)}: this row needs a new "
+                             "results directory (rows written beside the file are read by nobody)")
         if isinstance(row["ms"], float):
             row["ms"] = f"{row['ms']:.2f}"
         with open(self.path, "a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, FIELDS).writerow(row)
+            csv.DictWriter(f, self.fields, extrasaction="ignore").writerow(row)
         if self.echo:
             shown = [result.system, result.workload, result.tier, f"run {result.run}", result.task]
             if result.cache != "-":

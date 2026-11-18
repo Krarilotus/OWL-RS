@@ -1,0 +1,17 @@
+# Sides measured at a reviewed commit on top of them (benches/PROTOCOL.md §5, "No thread started in
+# a timed window"): the side's revision → its measurement commit, which changes nothing but its perf
+# lab (crates/nrese-store/examples/) and has the revision as its only parent. release-gate.sh build
+# builds and times that commit for the side and refuses any other (release_gate.py measured_at); the
+# jobs take it as an input (measurement_inputs). Each commit is pushed as its ref, named for the
+# side it carries and what it adds (main3sfirst: the open printed in microseconds and each query's
+# first execution reported, as the candidate's and v1.5's are; v15cus: a timing loop that starts no
+# thread in the timed window, the consistency answer and SHACL report the release cases check, the
+# open printed in microseconds, and parse-only queries that give no rows, as the candidate's do).
+
+[side.e7a479a33f0bc7879b7b647e1d3373edfd61c0a9]  # main
+commit = "a6a2738fbc2d590195eeaf3ecb3fd955c2a0e69e"
+ref = "refs/measure/main3sfirst-e7a479a3"
+
+[side.21f41249892e0b15635b522e52f284157685b4c7]  # v1.5, the release gate's base
+commit = "25bd9c268515a7ad109fa5f6b186207da2ae09d2"
+ref = "refs/measure/v15cus-21f41249"

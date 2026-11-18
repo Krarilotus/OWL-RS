@@ -183,6 +183,105 @@ fn chunks_of_any_size_cover_the_document_once() {
     );
 }
 
+/// A parse in chunks names an error's line in the document, not in its chunk (Claros, 13 Oct
+/// 2026: an invalid IRI on line 17,794,519 was reported at line 3,751,763 of its chunk).
+#[test]
+fn chunks_name_the_documents_line() {
+    let good = "<http://e/s> <http://e/p> <http://e/o> .\n";
+    let mut text = good.repeat(40);
+    // \r and \n each end a line, as the reader counts them: three lines here.
+    text.push_str("# a comment\r\n\n");
+    text.push_str(&good.repeat(40));
+    text.push_str("<http://e/s> <http://e/p> <http://e/a%&b> .\n");
+    text.push_str(&good.repeat(5));
+    // 40 lines, three, 40 more: the bad one is line 84, from 1.
+    fn error_line<R: std::io::Read>(chunks: Vec<nrese_rdf_io::QuadParser<'_, R>>) -> u64 {
+        let error = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.filter_map(Result::err))
+            .next()
+            .expect("the invalid IRI is refused");
+        match error {
+            nrese_rdf_io::RdfParseError::Syntax(syntax) => syntax.location().start.line + 1,
+            other => panic!("a syntax error, not {other}"),
+        }
+    }
+    for parts in [1, 2, 3, 7, 64] {
+        let chunks = RdfParser::from_format(RdfFormat::NTriples)
+            .split_slice_for_parallel_parsing(text.as_bytes(), parts)
+            .unwrap();
+        assert_eq!(error_line(chunks), 84, "{parts} parts");
+    }
+    let path = std::env::temp_dir().join(format!("nrese-rdf-io-lines-{}.nt", std::process::id()));
+    std::fs::write(&path, &text).unwrap();
+    for parts in [1, 4, 13] {
+        let chunks = RdfParser::from_format(RdfFormat::NTriples)
+            .split_file_for_parallel_parsing(&path, parts)
+            .unwrap();
+        assert_eq!(error_line(chunks), 84, "{parts} file parts");
+    }
+    std::fs::remove_file(&path).unwrap();
+}
+
+/// Recovering, a parse in chunks names every error's line in the document, however many
+/// errors a chunk holds, and the statement it skips starts on that line (the quarantine's
+/// line). D16-546: N-Quads named `.nt`, every line an error.
+#[test]
+fn recovering_chunks_name_each_errors_line() {
+    let good = "<http://e/s> <http://e/p> <http://e/o> .\n";
+    let quad = "<http://e/s> <http://e/p> <http://e/o> <http://e/g> .\n";
+    let iri = "<http://e/s> <http://e/p> <http://e/a%&b> .\n";
+    let text = [
+        good.repeat(30),
+        quad.repeat(2),
+        good.repeat(10),
+        iri.to_owned(),
+        // \r and \n each end a line: three lines here.
+        "# a comment\r\n\n".to_owned(),
+        good.repeat(20),
+        quad.repeat(25),
+        good.repeat(5),
+        iri.to_owned(),
+    ]
+    .concat();
+    // The document's lines (from 1) of the bad ones.
+    let mut expected = vec![31, 32, 43];
+    expected.extend(67..=91);
+    expected.push(97);
+    fn error_lines<R: std::io::Read>(chunks: Vec<nrese_rdf_io::QuadParser<'_, R>>) -> Vec<u64> {
+        let errors = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.filter_map(Result::err));
+        errors
+            .map(|error| match error {
+                nrese_rdf_io::RdfParseError::Syntax(syntax) => {
+                    let line = syntax.location().start.line;
+                    let skipped = syntax.statement().expect("a line's statement is skipped");
+                    assert_eq!(skipped.span.start.line, line, "{syntax}");
+                    line + 1
+                }
+                other => panic!("a syntax error, not {other}"),
+            })
+            .collect()
+    }
+    let parser = || RdfParser::from_format(RdfFormat::NTriples).recovering();
+    for parts in [1, 2, 3, 7, 64] {
+        let chunks = parser()
+            .split_slice_for_parallel_parsing(text.as_bytes(), parts)
+            .unwrap();
+        assert_eq!(error_lines(chunks), expected, "{parts} parts");
+    }
+    let path = std::env::temp_dir().join(format!("nrese-rdf-io-errors-{}.nt", std::process::id()));
+    std::fs::write(&path, &text).unwrap();
+    for parts in [1, 4, 13] {
+        let chunks = parser()
+            .split_file_for_parallel_parsing(&path, parts)
+            .unwrap();
+        assert_eq!(error_lines(chunks), expected, "{parts} file parts");
+    }
+    std::fs::remove_file(&path).unwrap();
+}
+
 #[test]
 fn errors_say_where() {
     let text = "<http://e/s> <http://e/p> <http://e/o> .\n# a comment\n<http://e/s> <http://e/p> \"open .\n";
@@ -213,17 +312,18 @@ fn errors_say_where() {
     assert_eq!(quad.object, Term::from(NamedNode::new_unchecked("o")));
 }
 
+/// `next_ref` gives the document's quads, borrowed, in order: each one the quad written.
 #[test]
-fn borrowed_quads_need_no_allocation_per_term() {
-    let text = write(RdfFormat::NQuads, &sample());
+fn borrowed_quads_are_the_documents() {
+    let quads = sample();
+    let text = write(RdfFormat::NQuads, &quads);
     let mut parser = RdfParser::from_format(RdfFormat::NQuads).for_slice(&text);
-    let mut count = 0;
+    let mut expected = quads.iter();
     while let Some(quad) = parser.next_ref() {
-        let quad = quad.unwrap();
-        assert!(!quad.predicate.as_str().is_empty());
-        count += 1;
+        let written = expected.next().expect("no more quads than written");
+        assert_eq!(quad.unwrap(), written.as_ref());
     }
-    assert_eq!(count, sample().len());
+    assert_eq!(expected.next(), None, "as many quads as written");
 }
 
 /// RDF 1.2's `VERSION` directive: written first when asked for, and read back in every

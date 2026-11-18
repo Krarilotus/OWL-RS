@@ -75,6 +75,8 @@ export const de: AppStrings = {
   queryAcceptLabel: "Antwortformat",
   namedGraphLabel: "Named-Graph-IRI",
   noOutput: "(noch keine Antwort)",
+  incompleteAnswer: "Nicht als vollständig belegt: Antworten können fehlen",
+  uncertifiedAnswer: "Korrektheit und Vollständigkeit sind nicht belegt: Antworten können fehlen oder falsch sein",
   searchTitle: "Ressourcen finden",
   searchHint: "Ressourcen, deren Labels oder Namen Wörter haben, die mit dem Eingegebenen beginnen.",
   searchPlaceholder: "albert ein",

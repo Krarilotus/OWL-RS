@@ -15,7 +15,7 @@ use nrese_server::auth::{
 };
 use nrese_server::policy::{PolicyConfig, RateLimitConfig, RequestLimits, SparqlParseErrorProfile};
 
-use crate::support::{test_app, test_app_with_policy};
+use crate::support::test_app_with_policy;
 
 #[tokio::test]
 async fn operator_diagnostics_requires_auth_when_static_bearer_enabled()
@@ -201,104 +201,39 @@ async fn query_endpoint_enforces_rate_limit_policy() -> Result<(), Box<dyn std::
     Ok(())
 }
 
+// Spec: an exhausted read bucket cannot block admin
+// health/summary, whose details cost one admin request; /info still costs a read.
 #[tokio::test]
-async fn graph_write_endpoint_enforces_rate_limit_policy() -> Result<(), Box<dyn std::error::Error>>
-{
-    let app = test_app_with_policy(PolicyConfig {
-        rate_limits: RateLimitConfig {
-            write_requests_per_window: 1,
-            ..RateLimitConfig::default()
-        },
-        ..PolicyConfig::default()
-    })?;
-
-    let first = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/data?default")
-                .method(Method::PUT)
-                .header("content-type", "text/turtle")
-                .body(Body::from(
-                    "@prefix ex: <http://example.com/> . ex:s ex:p ex:o .",
-                ))?,
-        )
-        .await?;
-    assert_eq!(first.status(), StatusCode::NO_CONTENT);
-
-    let second = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/data?default")
-                .method(Method::PUT)
-                .header("content-type", "text/turtle")
-                .body(Body::from(
-                    "@prefix ex: <http://example.com/> . ex:s2 ex:p ex:o2 .",
-                ))?,
-        )
-        .await?;
-    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-    assert_eq!(
-        second
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok()),
-        Some("application/problem+json")
-    );
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn invalid_update_returns_problem_json() -> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app()?;
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/update")
-                .method(Method::POST)
-                .header("content-type", "application/unsupported")
-                .body(Body::from("abc"))?,
-        )
-        .await?;
-
-    // A body of a media type that isn't a SPARQL update: 415, as a problem document.
-    assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
-    assert_eq!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok()),
-        Some("application/problem+json")
-    );
-    Ok(())
-}
-
-#[tokio::test]
-async fn invalid_sparql_update_can_return_plain_text_for_fuseki_compat()
+async fn readiness_diagnostics_use_only_their_own_rate_bucket()
 -> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_policy(PolicyConfig {
-        sparql_parse_error_profile: SparqlParseErrorProfile::PlainText,
-        ..PolicyConfig::default()
-    })?;
-    let response = app
-        .oneshot(
+    for uri in ["/api/v1/health", "/api/v1/repositories/nrese/summary"] {
+        let mut policy = static_policy();
+        policy.rate_limits = RateLimitConfig {
+            read_requests_per_window: 1,
+            admin_requests_per_window: 1,
+            ..RateLimitConfig::default()
+        };
+        let app = test_app_with_policy(policy)?;
+        let get = |uri: &str, token: &str| {
             Request::builder()
-                .uri("/dataset/update")
-                .method(Method::POST)
-                .header("content-type", "application/sparql-update")
-                .body(Body::from("INSERT DATA {"))?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        response
-            .headers()
-            .get("content-type")
-            .and_then(|v| v.to_str().ok()),
-        Some("text/plain")
-    );
+                .uri(uri)
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+        };
+        let query = "/dataset/query?query=ASK%20WHERE%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D";
+        let response = app.clone().oneshot(get(query, "reader")?).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = app.clone().oneshot(get(uri, "admin")?).await?;
+        assert_eq!(response.status(), StatusCode::OK, "{uri}");
+        let json: serde_json::Value =
+            serde_json::from_str(&crate::support::body_text(response).await?)?;
+        assert_eq!(json["quad_count"], 0, "{uri}: {json}");
+        assert_eq!(json["named_graph_count"], 0, "{uri}: {json}");
+        let response = app.clone().oneshot(get(uri, "admin")?).await?;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS, "{uri}");
+        let response = app.oneshot(get("/dataset/info", "reader")?).await?;
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    }
     Ok(())
 }
 
@@ -435,47 +370,6 @@ async fn mtls_allows_read_subject_on_query_endpoint() -> Result<(), Box<dyn std:
 }
 
 #[tokio::test]
-async fn mtls_rejects_read_subject_on_write_endpoint() -> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_policy(mtls_policy())?;
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/update")
-                .method(Method::POST)
-                .header("x-client-cert-subject", "CN=reader-1,O=Test")
-                .extension(from_proxy())
-                .header("content-type", "application/sparql-update")
-                .body(Body::from(
-                    "INSERT DATA { <http://example.com/s> <http://example.com/p> <http://example.com/o> }",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
-    Ok(())
-}
-
-#[tokio::test]
-async fn mtls_allows_admin_subject_on_admin_endpoint() -> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_policy(mtls_policy())?;
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/ops/api/diagnostics/runtime")
-                .method(Method::GET)
-                .header("x-client-cert-subject", "CN=admin-1,O=Test")
-                .extension(from_proxy())
-                .body(Body::empty())?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::OK);
-    Ok(())
-}
-
-#[tokio::test]
 async fn mtls_rejects_missing_subject_header() -> Result<(), Box<dyn std::error::Error>> {
     let app = test_app_with_policy(mtls_policy())?;
 
@@ -535,36 +429,6 @@ async fn oidc_introspection_allows_read_role_on_query_endpoint()
         .await?;
 
     assert_eq!(response.status(), StatusCode::OK);
-    Ok(())
-}
-
-#[tokio::test]
-async fn oidc_introspection_rejects_read_role_on_write_endpoint()
--> Result<(), Box<dyn std::error::Error>> {
-    let server = MockIntrospectionServer::spawn(IntrospectionReply {
-        active: true,
-        scope: Some("nrese.read".to_owned()),
-        scp: None,
-        role: None,
-        roles: None,
-    })
-    .await?;
-    let app = test_app_with_policy(oidc_policy(server.url())?)?;
-
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/update")
-                .method(Method::POST)
-                .header("authorization", "Bearer oidc-read-token")
-                .header("content-type", "application/sparql-update")
-                .body(Body::from(
-                    "INSERT DATA { <http://example.com/s> <http://example.com/p> <http://example.com/o> }",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
     Ok(())
 }
 

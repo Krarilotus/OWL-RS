@@ -1,0 +1,2 @@
+PREFIX e: <http://example.org/fast/>
+SELECT (COUNT(*) AS ?n) WHERE { ?e a e:Kind7 . ?e e:link ?x . ?x e:link ?y }

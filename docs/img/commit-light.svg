@@ -1,0 +1,61 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 581" width="400" height="581" role="img" aria-labelledby="title desc">
+<!-- Generated; the light and dark variants differ only in <style>. -->
+<title id="title">What happens to a write</title>
+<desc id="desc">A write goes through four steps in order. Apply works out the change, and no query sees it yet; it is refused if not allowed or invalid. Reasoning, when it is on, updates the inferred statements; it is refused if found to make the data inconsistent. Under owl2-dl, a check that runs out of its own budget doesn't refuse; consistency is then unknown. SHACL, when it is on, checks the data the write can affect against your shapes; with enforce it is refused if it introduces a violation or a shape can't be checked. The request's deadline or memory stops the write up to here. Publish: the asserted and inferred changes become one revision, on disk saved before you get the answer. A refused write commits nothing; the response says why.</desc>
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Noto Sans", Helvetica, Arial, sans-serif; fill: #1F2328; }
+  .paper { fill: #FFFFFF; }
+  .name { font-size: 16px; font-weight: 600; }
+  .text { font-size: 14.5px; }
+  .muted { font-size: 14.5px; fill: #59636E; }
+  .edge { font-size: 14px; font-style: italic; fill: #59636E; }
+  .code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; }
+  .box { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1.25; }
+  .band { fill: #F6F8FA; }
+  .chip { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1.1; }
+  .chip-on { fill: #1F2328; }
+  .chip-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; fill: #FFFFFF; }
+  .asserted { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1.1; }
+  .inferred { fill: #FFF3D6; stroke: #D4A72C; stroke-width: 1.1; }
+  .inferred-text { font-size: 16px; font-weight: 600; fill: #8A5300; }
+  .track { fill: #E6EAEF; }
+  .frame { fill: none; stroke: #8C959F; stroke-width: 1.25; }
+  .divider { fill: none; stroke: #8C959F; stroke-width: 1.25; }
+  .mark { fill: none; stroke: #1F2328; stroke-width: 2; }
+  .seg-on { fill: #FFFFFF; stroke: #8C959F; stroke-width: 1; }
+  .seg-on-text { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; font-size: 14px; font-weight: 600; }
+  .refused { fill: #B42318; }
+  .refused-text { fill: #B42318; font-weight: 600; }
+  .inferred-word { fill: #8A5300; font-weight: 600; }
+  .flow { fill: none; stroke: #59636E; stroke-width: 1.4; }
+  .flow-refused { fill: none; stroke: #B42318; stroke-width: 1.4; }
+</style>
+<defs><marker id="head" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow" d="M1 1 L9 5 L1 9"/></marker><marker id="head-refused" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse"><path class="flow-refused" d="M1 1 L9 5 L1 9"/></marker></defs>
+<rect class="paper" x="0" y="0" width="400" height="581" rx="0"/>
+<rect class="box" x="0" y="0" width="400" height="94" rx="6"/>
+<text x="16" y="26" class="name">Apply</text>
+<text x="16" y="50" class="text">works out the change; no query sees it yet</text>
+<text x="16" y="77" class="text"><tspan class="refused-text">Refused if</tspan> not allowed or invalid</text>
+<path class="flow" d="M28 96 V127" marker-end="url(#head)"/>
+<rect class="box" x="0" y="130" width="400" height="140" rx="6"/>
+<text x="16" y="156" class="name">Reasoning</text>
+<text x="384" y="156" class="muted" text-anchor="end">when it is on</text>
+<text x="16" y="180" class="text">updates the <tspan class="inferred-word">inferred</tspan> statements</text>
+<text x="16" y="207" class="text"><tspan class="refused-text">Refused if</tspan> found to make the data inconsistent</text>
+<text x="16" y="234" class="text"><tspan class="muted">Under </tspan><tspan class="code">owl2-dl</tspan><tspan class="muted">, a check that runs out of its own</tspan></text>
+<text x="16" y="253" class="text"><tspan class="muted">budget doesn't refuse; consistency is then </tspan><tspan class="code">unknown</tspan></text>
+<path class="flow" d="M28 272 V303" marker-end="url(#head)"/>
+<rect class="box" x="0" y="306" width="400" height="113" rx="6"/>
+<text x="16" y="332" class="name">SHACL</text>
+<text x="384" y="332" class="muted" text-anchor="end">when it is on</text>
+<text x="16" y="356" class="text">checks the data the write can affect against your shapes</text>
+<text x="16" y="383" class="text"><tspan class="refused-text">Refused if</tspan> with <tspan class="code">enforce</tspan>, it introduces a violation</text>
+<text x="16" y="402" class="text">or a shape can't be checked</text>
+<path class="flow" d="M28 421 V452" marker-end="url(#head)"/>
+<text x="42" y="442" class="edge">the request's deadline or memory stops it up to here</text>
+<rect class="box" x="0" y="455" width="400" height="86" rx="6"/>
+<text x="16" y="481" class="name">Publish</text>
+<text x="16" y="505" class="text">asserted and <tspan class="inferred-word">inferred</tspan> changes become one revision;</text>
+<text x="16" y="524" class="text">on disk, saved before you get the answer</text>
+<text x="1" y="571" class="text">A refused write commits nothing; the response says why.</text>
+</svg>

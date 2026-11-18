@@ -1,20 +1,23 @@
 //! External sorting for bulk loads with bounded memory, as QLever's index builder does it.
 //!
 //! A bulk load whose quads outgrow its budget ([`DurabilityConfig::bulk_load_memory`]
-//! (crate::DurabilityConfig)) hands them over in chunks to a spilling thread. That thread
-//! sorts each chunk in every permutation of the smallest layout that holds it and writes
-//! each permutation packed ([`PackedKeys`], 6 to 12 bytes per key) to its own file. At the
-//! end, each permutation is the merge of its chunk files, read through memory maps, with
-//! duplicates dropped. A chunk without named graphs gives the graph-first permutations of
+//! (crate::DurabilityConfig)) hands them over in chunks to a spilling thread, which writes
+//! each as it is: its new terms have provisional ids until the load finishes
+//! ([`crate::term::pending`]), and sorted by those a chunk would be out of order once
+//! renumbered. At the end each chunk is read back, renumbered and sorted in every
+//! permutation of the smallest layout that holds it, each permutation written packed
+//! ([`PackedKeys`], 6 to 12 bytes per key) to its own file, one chunk at a time
+//! ([`Spill::sort_raw`]). Then each permutation is the merge of its chunk files, read
+//! through memory maps, with duplicates dropped. A chunk without named graphs gives the graph-first permutations of
 //! the quad layout (if another chunk needs that layout) from its graph-last ones, the
 //! graph moved to the front of each key: they sort alike when every graph is the default.
 //! The merged permutation is packed on the fly and goes into the checkpoint before the
 //! next is merged. So the load's quads take the budget plus one packed permutation,
-//! whatever the data's size, at the cost of writing and reading each key once more.
+//! whatever the data's size, at the cost of writing and reading each key twice more.
 //!
-//! The spilling thread sorts on a thread pool of its own. The loader's threads, which add
-//! the quads from the global pool, wait for it when the next chunk is full: a sort on
-//! the global pool could wait for those very threads.
+//! Raw writes run on an independent I/O thread: loader workers wait for it when the next
+//! chunk is full, so it must not need their pool to make progress. Sorting runs only after
+//! that thread has joined, when the load's terms have their final ids.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -34,20 +37,14 @@ use crate::quad::{EncodedQuad, Key, Permutation};
 /// removing it (a crash) leaves it behind; opening the store removes it.
 pub(crate) const SPILL_DIR: &str = "bulk-spill";
 
-/// Quads concatenated into one array, each batch freed once copied.
-fn concat(batches: Vec<Vec<EncodedQuad>>) -> Vec<EncodedQuad> {
-    let mut quads: Vec<EncodedQuad> = Vec::with_capacity(batches.iter().map(Vec::len).sum());
-    for batch in batches {
-        quads.extend_from_slice(&batch);
-    }
-    quads
-}
-
-/// Chunks spilled to disk: per chunk, one packed file per permutation of its layout.
+/// Chunks spilled to disk: as written (raw, until [`Spill::sort_raw`]), then per chunk one
+/// packed file per permutation of its layout.
 pub(crate) struct Spill {
     dir: PathBuf,
-    /// The layout of each chunk.
+    /// The layout of each sorted chunk.
     chunks: Vec<Layout>,
+    /// The raw chunks' files, in the order they came.
+    raw: Vec<PathBuf>,
 }
 
 impl Spill {
@@ -61,7 +58,54 @@ impl Spill {
         Ok(Self {
             dir,
             chunks: Vec::new(),
+            raw: Vec::new(),
         })
+    }
+
+    /// Writes batches in order (32 bytes per quad, little-endian), freeing each once
+    /// written. O(n) with one fixed-size I/O buffer, without concatenating the input.
+    fn write_raw(&mut self, batches: Vec<Vec<EncodedQuad>>) -> std::io::Result<()> {
+        let path = self.dir.join(format!("raw-{:05}.quads", self.raw.len()));
+        let mut out = BufWriter::with_capacity(1 << 20, File::create(&path)?);
+        for batch in batches {
+            for quad in batch {
+                for component in quad.components() {
+                    out.write_all(&component.to_le_bytes())?;
+                }
+            }
+        }
+        out.into_inner()
+            .map_err(|error| error.into_error())?
+            .sync_all()?;
+        self.raw.push(path);
+        Ok(())
+    }
+
+    /// Reads each raw chunk back, renumbers its quads with `renumber` and writes it sorted
+    /// ([`Self::write_chunk`]), one chunk at a time; the raw files go.
+    pub(crate) fn sort_raw(
+        &mut self,
+        renumber: &dyn Fn(&mut [EncodedQuad]),
+    ) -> std::io::Result<()> {
+        for path in std::mem::take(&mut self.raw) {
+            let bytes = fs::read(&path)?;
+            let mut quads: Vec<EncodedQuad> = bytes
+                .as_chunks::<32>()
+                .0
+                .iter()
+                .map(|raw| {
+                    let word = |i: usize| {
+                        u64::from_le_bytes(raw[8 * i..8 * i + 8].try_into().expect("8 bytes"))
+                    };
+                    EncodedQuad::from_components([word(0), word(1), word(2), word(3)])
+                })
+                .collect();
+            drop(bytes);
+            renumber(&mut quads);
+            self.write_chunk(quads)?;
+            fs::remove_file(&path)?;
+        }
+        Ok(())
     }
 
     /// The layout of the merged quads: the quad layout if a chunk has a named graph.
@@ -82,7 +126,7 @@ impl Spill {
     fn write_chunk(&mut self, quads: Vec<EncodedQuad>) -> std::io::Result<()> {
         let layout = Layout::holding(&quads);
         let chunk = self.chunks.len();
-        let mut builder = PermutationBuilder::new(quads);
+        let mut builder = PermutationBuilder::planned(quads, layout.permutations());
         for &permutation in layout.permutations() {
             let packed = builder.packed(permutation);
             let file = File::create(self.path(chunk, permutation))?;
@@ -125,6 +169,8 @@ impl Spill {
 
 impl Drop for Spill {
     fn drop(&mut self) {
+        #[cfg(test)]
+        tests::on_teardown(&self.dir);
         let _ = fs::remove_dir_all(&self.dir);
     }
 }
@@ -211,21 +257,18 @@ impl Iterator for Merge {
     }
 }
 
-/// The spilling thread of a bulk load, started with its first chunk.
+/// The spilling thread of a bulk load, started with its first chunk. Dropped, it is joined
+/// and its spill removed: an aborted load's thread never outlives it (B-303).
 pub(super) struct Spiller {
-    chunks: SyncSender<Vec<Vec<EncodedQuad>>>,
-    thread: JoinHandle<std::io::Result<Spill>>,
+    /// Taken when the thread is told to stop.
+    chunks: Option<SyncSender<Vec<Vec<EncodedQuad>>>>,
+    /// Taken when it is joined.
+    thread: Option<JoinHandle<std::io::Result<Spill>>>,
 }
 
 impl Spiller {
     pub(super) fn start(root: &Path) -> std::io::Result<Self> {
         let mut spill = Spill::create(root)?;
-        let threads = std::thread::available_parallelism().map_or(4, usize::from);
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .thread_name(|i| format!("nrese-spill-{i}"))
-            .build()
-            .map_err(std::io::Error::other)?;
         // One chunk waits while the last is written: a full chunk in the sender's hands
         // blocks it.
         let (chunks, received) = sync_channel::<Vec<Vec<EncodedQuad>>>(0);
@@ -233,27 +276,49 @@ impl Spiller {
             .name("nrese-spill".into())
             .spawn(move || {
                 for batches in received {
-                    pool.install(|| spill.write_chunk(concat(batches)))?;
-                    pool.broadcast(|_| crate::memory::release_thread());
+                    nrese_exec::heap::begin_step();
+                    spill.write_raw(batches)?;
+                    nrese_exec::heap::end_step("spill: a chunk written");
                     crate::memory::release_thread();
                 }
                 Ok(spill)
             })?;
-        Ok(Self { chunks, thread })
+        Ok(Self {
+            chunks: Some(chunks),
+            thread: Some(thread),
+        })
     }
 
     /// Hands a full chunk over, waiting while the last one is written. `false` if the
     /// thread stopped on an error ([`finish`](Self::finish) returns it).
     pub(super) fn send(&self, batches: Vec<Vec<EncodedQuad>>) -> bool {
-        self.chunks.send(batches).is_ok()
+        self.chunks
+            .as_ref()
+            .is_some_and(|chunks| chunks.send(batches).is_ok())
     }
 
     /// Waits for the last chunk to be written; the chunks, or the first error.
-    pub(super) fn finish(self) -> std::io::Result<Spill> {
-        drop(self.chunks);
-        self.thread
-            .join()
-            .unwrap_or_else(|_| Err(std::io::Error::other("the spilling thread panicked")))
+    pub(super) fn finish(mut self) -> std::io::Result<Spill> {
+        self.join()
+            .unwrap_or_else(|| Err(std::io::Error::other("the spilling thread was joined")))
+    }
+
+    /// Stops the thread after the chunk it is writing and waits for it, once.
+    fn join(&mut self) -> Option<std::io::Result<Spill>> {
+        drop(self.chunks.take());
+        let thread = self.thread.take()?;
+        Some(
+            thread
+                .join()
+                .unwrap_or_else(|_| Err(std::io::Error::other("the spilling thread panicked"))),
+        )
+    }
+}
+
+impl Drop for Spiller {
+    fn drop(&mut self) {
+        // The spill, if the thread returned one, removes its directory as it drops.
+        drop(self.join());
     }
 }
 
@@ -270,6 +335,95 @@ pub(crate) fn remove_leftovers(root: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::TermId;
+
+    /// What a test wants to know when a spill directory is torn down, by directory.
+    type Observer = Box<dyn Fn() + Send>;
+    static TEARDOWN: std::sync::Mutex<Vec<(PathBuf, Observer)>> = std::sync::Mutex::new(Vec::new());
+
+    /// Called as the spill in `dir` is torn down, by whichever thread drops it.
+    pub(super) fn on_teardown(dir: &Path) {
+        for (watched, observe) in TEARDOWN.lock().unwrap().iter() {
+            if watched == dir {
+                observe();
+            }
+        }
+    }
+
+    /// A load dropped unfinished after it spilled removes its spill directory while it
+    /// still holds the writer slot (B-303). Released first, the next load could start,
+    /// recreate the directory and have its chunks removed by the old load's writer.
+    #[test]
+    fn an_aborted_load_tears_its_spill_down_before_the_writer_slot_goes() {
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::EngineConfig {
+            background_maintenance: false,
+            durability: crate::DurabilityConfig {
+                // Chunks of 4 quads.
+                bulk_load_memory: Some(384),
+                ..crate::DurabilityConfig::default()
+            },
+            ..crate::EngineConfig::default()
+        };
+        let engine = crate::Engine::open(dir.path(), config).unwrap();
+        let inner = Arc::clone(&engine.inner);
+        let (sender, held) = std::sync::mpsc::channel();
+        let spill_dir = dir.path().join(SPILL_DIR);
+        let observer: Observer = Box::new(move || {
+            let _ = sender.send(inner.writer.try_lock().is_none());
+        });
+        TEARDOWN.lock().unwrap().push((spill_dir.clone(), observer));
+        let node = |n: u64| nrese_rdf::NamedNode::new_unchecked(format!("http://example.com/{n}"));
+        let quads: Vec<nrese_rdf::Quad> = (0..8)
+            .map(|n| {
+                nrese_rdf::Quad::new(
+                    node(n),
+                    node(100),
+                    node(n + 1),
+                    nrese_rdf::GraphName::DefaultGraph,
+                )
+            })
+            .collect();
+        let load = engine.bulk_load(crate::BulkMode::Replace);
+        load.add(&quads);
+        drop(load);
+        let held = held.recv_timeout(std::time::Duration::from_secs(60));
+        TEARDOWN
+            .lock()
+            .unwrap()
+            .retain(|(watched, _)| *watched != spill_dir);
+        assert_eq!(
+            held,
+            Ok(true),
+            "the writer slot was free while the spill directory was removed"
+        );
+    }
+
+    #[test]
+    fn raw_spill_preserves_batch_order_and_reports_write_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let spiller = Spiller::start(dir.path()).unwrap();
+        assert!(spiller.send(vec![
+            vec![quad(4, 1, 2, 3)],
+            Vec::new(),
+            vec![quad(8, 5, 6, 7)],
+        ]));
+        assert!(spiller.send(Vec::new()));
+        let spill = spiller.finish().unwrap();
+        let expected: Vec<u8> = (1u64..=8).flat_map(u64::to_le_bytes).collect();
+        assert_eq!(fs::read(&spill.raw[0]).unwrap(), expected);
+        assert!(fs::read(&spill.raw[1]).unwrap().is_empty());
+        drop(spill);
+        assert!(!dir.path().join(SPILL_DIR).exists());
+
+        let spiller = Spiller::start(dir.path()).unwrap();
+        // A directory at the next file's path fails on every platform, without relying
+        // on permissions (which privileged test runners may bypass).
+        fs::create_dir(dir.path().join(SPILL_DIR).join("raw-00000.quads")).unwrap();
+        assert!(spiller.send(vec![vec![quad(4, 1, 2, 3)]]));
+        assert!(spiller.finish().is_err());
+        assert!(!dir.path().join(SPILL_DIR).exists());
+    }
 
     fn quad(g: u64, s: u64, p: u64, o: u64) -> EncodedQuad {
         EncodedQuad {

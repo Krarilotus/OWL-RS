@@ -1,203 +1,80 @@
-//! Reasoner v2 in the store (reasoner-v2 design §4.3, R4): the configured ruleset's closure
-//! over the asserted data is materialised into the engine's inferred stack, so every read
-//! under the default `Materialised` model sees it.
-//!
-//! - **After bulk loads and at startup:** [`StoreService::rematerialise`](crate::StoreService::rematerialise)
-//!   computes the closure with the batch executor and replaces the inferred stack in one
-//!   revision ([`Rematerialisation`](nrese_engine::Rematerialisation)).
-//! - **On commits:** the mutation pipeline runs the delta executor over the transaction
-//!   ([`apply_delta`]): it reads the committed indexes plus the pending changes through
-//!   [`EngineBase`] and applies the inferred changes inside the same transaction, so
-//!   asserted and inferred changes publish atomically. The cost follows the change, plus
-//!   grounding the rules against the TBox.
-//!
-//! Rules match over the union of all graphs and inferences go to the default graph
-//! (design §6.2). OWL 2 RL derives some generalised triples, such as a literal typed by a
-//! datatype property's range; RDF can't store a literal subject or a non-IRI predicate, so
-//! those are dropped. Commits therefore don't see them either, which matters only for
-//! rules that turn them back into storable facts (an `owl:inverseOf` on a datatype
-//! property, which OWL 2 doesn't allow).
+//! The reasoner in the store: what a rematerialisation or a commit-path run reports, and
+//! the reasoner's engine verbs (`nrese_reasoner::engine`) the store calls. The store
+//! decides when to reason; how is the reasoner's.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use nrese_engine::quad::Permutation;
-use nrese_engine::{
-    EncodedQuad, EncodedTriple, GraphSelector, QuadPattern, ReadModel, Snapshot, TermId, TermKind,
-    Transaction,
+use nrese_engine::{ReadModel, TermId, Transaction};
+use nrese_reasoner::delta;
+use nrese_reasoner::eval::GroundProgram;
+use nrese_reasoner::ir::Violations;
+use nrese_reasoner::lists::ListDiagnostic;
+
+pub use nrese_reasoner::RuleProgram;
+pub use nrese_reasoner::engine::{
+    Closure, InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
+    JustifiedStatement, Program, decoded, explain_fact, explain_violation, justify_fact,
+    materialise, materialise_until, materialise_with, materialise_within,
 };
-use nrese_rdf::{LiteralRef, NamedNodeRef, TermRef};
-use nrese_reasoner::RuleProgram;
-use nrese_reasoner::v2::batch::{self, Phases, Schema};
-use nrese_reasoner::v2::delta::{self, Base, MemoryBase};
-use nrese_reasoner::v2::eval::GroundProgram;
-use nrese_reasoner::v2::ir::{Rule, Vocabulary};
-use nrese_reasoner::v2::ir::{Triple, Violation};
-use nrese_reasoner::v2::lists::ListDiagnostic;
-use nrese_reasoner::v2::lists::ListVocabulary;
-use nrese_reasoner::v2::unnamed::UnnamedVocabulary;
-use rayon::prelude::*;
-use std::collections::HashSet;
 
-/// A rule program compiled against the engine dictionary: its rules, list vocabulary and
-/// schema vocabulary as engine ids. Ids never change once interned, so it is built once.
-pub struct Program {
-    pub program: RuleProgram,
-    rules: Vec<Rule>,
-    lists: Option<ListVocabulary>,
-    schema: Schema,
-    /// Leave out memberships in unnamed classes nothing consumes (W7).
-    hide_unnamed_classes: bool,
-    unnamed: UnnamedVocabulary,
-    /// The rules make a declared class a subclass of `owl:Thing` (scm-cls).
-    things: bool,
-    /// For the datatype checks ([`crate::datatypes`]).
-    rdf_type: u64,
-    same_as: Option<u64>,
-    /// Full materialisations compute the closure over representatives of the `owl:sameAs`
-    /// classes and expand it (W4 stage A): the same closure, without rules copying every
-    /// fact to every identity while it is computed (`reasoner.equality`).
-    by_representatives: bool,
-    /// With `by_representatives`: the inferred stack keeps the closure over
-    /// representatives, each other identity stored as `identity sameAs representative`,
-    /// and reads expand it (W4 stage B; `reasoner.equality = "compact"`).
-    store_representatives: bool,
-    /// The ruleset's axiomatic triples, sorted: they seed every closure, and a commit
-    /// never retracts them.
-    axioms: Vec<Triple>,
-}
+/// The revisions whose closure leaves out no list axiom (a list the rules can't build, any
+/// list diagnostic), as one range `[from, to]` (`from > to`: empty), and the last revision a
+/// scan found leaving one out. A commit off `to` that leaves none out extends it, any other
+/// commit empties it, and a scan past it that finds none starts it there: a mark is never
+/// lost, for a reader of any revision. Outside it, a revision is scanned. Beside it, what the
+/// last 32 scans of views and pending versions found, by their identity, never the record.
+#[derive(Debug)]
+pub(crate) struct ListsKept(std::sync::Mutex<(u64, u64, u64)>, Own);
 
-impl std::fmt::Debug for Program {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Program")
-            .field("program", &self.program.name())
-            .field("rules", &self.rules.len())
-            .finish_non_exhaustive()
+type Own = std::sync::Mutex<std::collections::VecDeque<(nrese_engine::SnapshotIdentity, bool)>>;
+
+impl Default for ListsKept {
+    fn default() -> Self {
+        Self(std::sync::Mutex::new((1, 0, u64::MAX)), Own::default())
     }
 }
 
-impl Program {
-    /// The rules as the delta executor takes them.
-    pub fn rules(&self) -> delta::Rules<'_> {
-        delta::Rules {
-            rules: &self.rules,
-            lists: self.lists.as_ref(),
-            schema: &self.schema,
+impl ListsKept {
+    pub(crate) fn commit(&self, base: u64, revision: u64, left_out: bool) {
+        let mut r = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        let clean = !left_out && r.0 <= base && base == r.1;
+        (r.0, r.1) = if clean { (r.0, revision) } else { (1, 0) };
+    }
+
+    /// What the record holds of `revision`, if anything: never scanned, never written.
+    pub(crate) fn known(&self, revision: u64) -> Option<bool> {
+        let r = *self.0.lock().unwrap_or_else(|p| p.into_inner());
+        ((r.0..=r.1).contains(&revision) || r.2 == revision).then_some(r.2 == revision)
+    }
+
+    pub(crate) fn left_out(&self, revision: u64, scan: impl FnOnce() -> bool) -> bool {
+        if let Some(known) = self.known(revision) {
+            return known;
         }
-    }
-
-    /// Compiles `program`; `intern` gives ids to the constants.
-    pub fn new(program: &RuleProgram, intern: &dyn Fn(TermRef<'_>) -> TermId) -> Self {
-        let mut constants = Constants { intern };
-        let rules = program
-            .rules(&mut constants)
-            .expect("the built-in rulesets parse (tested), user rules are checked at startup");
-        let lists = program
-            .has_list_rules()
-            .then(|| ListVocabulary::new(&mut constants));
-        let schema = Schema::owl(&mut constants);
-        let unnamed = UnnamedVocabulary::new(&mut constants);
-        let things = rules.iter().any(|rule| rule.name == "scm-cls");
-        let rdf_type = constants.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
-        let same_as = nrese_reasoner::v2::representatives::same_as(&rules);
-        let mut axioms = program
-            .axiom_triples(&mut constants)
-            .expect("the built-in axioms parse (tested), user facts are checked at startup");
-        axioms.sort_unstable();
-        Self {
-            program: program.clone(),
-            rules,
-            lists,
-            schema,
-            hide_unnamed_classes: false,
-            unnamed,
-            things,
-            rdf_type,
-            same_as,
-            by_representatives: true,
-            store_representatives: false,
-            axioms,
+        let found = scan();
+        let mut r = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        match found {
+            true => r.2 = revision,
+            false if revision > r.1 => (r.0, r.1) = (revision, revision),
+            false => {}
         }
+        found
     }
 
-    /// This program computing full closures over representatives of `owl:sameAs` classes
-    /// (the default), or with the replacement rules.
-    #[must_use]
-    pub fn by_representatives(mut self, representatives: bool) -> Self {
-        self.by_representatives = representatives;
-        self
+    /// What the own scan of `view` (a reader's view or a pending version) found; if none is
+    /// noted, `scan`, noted by its identity (the newest 32 kept). Scanned outside the lock.
+    pub(crate) fn own(&self, view: &nrese_engine::Snapshot, scan: impl FnOnce() -> bool) -> bool {
+        let noted = (self.1.lock().unwrap_or_else(|p| p.into_inner()).iter())
+            .find_map(|&(at, found)| (at == view.identity()).then_some(found));
+        noted.unwrap_or_else(|| {
+            let found = scan();
+            let mut own = self.1.lock().unwrap_or_else(|p| p.into_inner());
+            own.push_front((view.identity(), found));
+            own.truncate(32);
+            found
+        })
     }
-
-    /// This program keeping the closure over representatives in the store (with
-    /// [`Self::by_representatives`]), or every copy.
-    #[must_use]
-    pub fn storing_representatives(mut self, store: bool) -> Self {
-        self.store_representatives = store;
-        self
-    }
-
-    /// Whether the inferred stack holds the closure over representatives.
-    pub(crate) fn stores_representatives(&self) -> bool {
-        self.by_representatives && self.store_representatives && self.same_as.is_some()
-    }
-
-    /// This program leaving out memberships in unnamed classes nothing consumes, or not.
-    #[must_use]
-    pub fn hiding_unnamed_classes(mut self, hide: bool) -> Self {
-        self.hide_unnamed_classes = hide;
-        self
-    }
-
-    /// The schema for a run over `snapshot`: with the unnamed classes to leave out, when
-    /// the program does.
-    fn schema_for(&self, snapshot: &Snapshot) -> Schema {
-        if !self.hide_unnamed_classes {
-            return self.schema.clone();
-        }
-        self.schema.clone().hiding(self.hidden_classes(snapshot))
-    }
-
-    /// The unnamed classes of `snapshot`'s asserted statements that can be left out.
-    fn hidden_classes(&self, snapshot: &Snapshot) -> std::collections::HashMap<u64, bool> {
-        let quads = |pattern: QuadPattern| -> Vec<Triple> {
-            snapshot
-                .quads_for_pattern_in(ReadModel::Asserted, &pattern)
-                .map(triple)
-                .collect()
-        };
-        let any =
-            |s: Option<u64>, p: Option<u64>, o: Option<u64>| pattern([s, p, o], GraphSelector::Any);
-        let union_of = self.unnamed.union_of();
-        let mut candidates: Vec<u64> = quads(any(None, Some(union_of), None))
-            .into_iter()
-            .map(|t| t[0])
-            .filter(|&s| TermId::from_raw(s).kind() == TermKind::BlankNode)
-            .collect();
-        candidates.sort_unstable();
-        candidates.dedup();
-        nrese_reasoner::v2::unnamed::hidden_classes(
-            candidates,
-            &|class| {
-                let mut out = quads(any(Some(class), None, None));
-                out.extend(quads(any(None, None, Some(class))));
-                out.extend(quads(any(None, Some(class), None)));
-                out
-            },
-            &self.unnamed,
-            self.things,
-        )
-    }
-}
-
-/// A closure computed over engine term ids.
-#[derive(Debug, Default)]
-pub struct Closure {
-    /// The storable inferred statements (in the default graph).
-    pub inferred: Vec<EncodedTriple>,
-    pub violations: Vec<Violation>,
-    /// List axioms that weren't instantiated.
-    pub diagnostics: Vec<ListDiagnostic>,
-    pub rounds: usize,
-    pub phases: Phases,
 }
 
 /// The most diagnostics a report lists; `diagnostics_total` counts them all.
@@ -266,16 +143,24 @@ pub struct MaterialisationReport {
     pub inferred: u64,
     pub inferred_inserted: u64,
     pub inferred_deleted: u64,
+    /// The consistency violations found: 0 exactly when the state is consistent; a lower
+    /// bound where [`Self::violations_at_least`].
     pub violations: usize,
+    /// Their list stopped at its memory budget, so [`Self::violations`] is a lower bound
+    /// (at least 1: the state is inconsistent).
+    pub violations_at_least: bool,
     /// Ontology parts the reasoner couldn't use: after a rematerialisation all of them,
     /// after a commit those the commit introduced. At most [`MAX_REPORTED_DIAGNOSTICS`].
     pub diagnostics: Vec<OntologyDiagnostic>,
     pub diagnostics_total: usize,
     pub rounds: usize,
     pub elapsed: Duration,
-    /// A commit made an unnamed class that was left out consumable: its memberships are
-    /// missing until the store rematerialises.
-    pub needs_rematerialisation: bool,
+    /// Time per phase of a full materialisation (grounding, rule joins, the modules for
+    /// hierarchies, transitive and equivalence properties and equality, merging,
+    /// consistency); zero for a commit.
+    pub phases: nrese_reasoner::batch::Phases,
+    /// What a commit's maintenance did, in counts (zero for a rematerialisation).
+    pub work: nrese_reasoner::delta::policy::Counts,
 }
 
 impl MaterialisationReport {
@@ -291,822 +176,173 @@ impl MaterialisationReport {
     }
 }
 
-/// An id decoded for reports ([`term_text`]); `#id` if the dictionary lacks it.
-pub(crate) fn decoded(term: Option<nrese_rdf::Term>, id: u64) -> String {
-    term.map_or_else(|| format!("#{id}"), |term| term_text(&term))
-}
-
-/// Interns the rules' constants into the engine dictionary.
-struct Constants<'a> {
-    intern: &'a dyn Fn(TermRef<'_>) -> TermId,
-}
-
-impl Vocabulary for Constants<'_> {
-    fn iri(&mut self, iri: &str) -> u64 {
-        (self.intern)(NamedNodeRef::new_unchecked(iri).into()).raw()
-    }
-
-    fn literal(&mut self, lexical: &str, datatype: &str) -> u64 {
-        let literal = LiteralRef::new_typed_literal(lexical, NamedNodeRef::new_unchecked(datatype));
-        (self.intern)(literal.into()).raw()
-    }
-
-    fn language_literal(&mut self, lexical: &str, language: &str) -> u64 {
-        let literal = LiteralRef::new_language_tagged_literal_unchecked(lexical, language);
-        (self.intern)(literal.into()).raw()
-    }
-
-    fn blank_node_ids(&self) -> Option<(u64, u64)> {
-        let (low, high) = TermId::kind_range(TermKind::BlankNode);
-        Some((low.raw(), high.raw()))
-    }
-}
-
-/// Whether RDF can store the triple: an IRI or blank node subject and an IRI predicate.
-fn storable([subject, predicate, _]: Triple) -> bool {
-    matches!(
-        TermId::from_raw(subject).kind(),
-        TermKind::Iri | TermKind::BlankNode
-    ) && TermId::from_raw(predicate).kind() == TermKind::Iri
-}
-
-fn encode([s, p, o]: Triple) -> EncodedTriple {
-    EncodedTriple::new(
-        TermId::from_raw(s),
-        TermId::from_raw(p),
-        TermId::from_raw(o),
-    )
-}
-
-fn triple(quad: EncodedQuad) -> Triple {
-    [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()]
-}
-
-/// The closure of `asserted` (any graphs) under `program`, its axioms included.
-pub fn materialise(program: &Program, snapshot: &Snapshot) -> Closure {
-    materialise_until(program, snapshot, nrese_reasoner::v2::eval::NEVER).expect("never stopped")
-}
-
-/// [`materialise`], polling `stop` throughout; `Err` if it fired.
-pub fn materialise_until(
-    program: &Program,
-    snapshot: &Snapshot,
-    stop: nrese_reasoner::v2::eval::Stop<'_>,
-) -> Result<Closure, delta::Interrupted> {
-    let (input, axioms) = input_of(program, snapshot);
-    let schema = program.schema_for(snapshot);
-    let result = match program.same_as.filter(|_| program.by_representatives) {
-        Some(same_as) => by_representatives(
-            program,
-            input,
-            &|| input_of(program, snapshot).0,
-            same_as,
-            &schema,
-            stop,
-        )?,
-        None => batch::materialise_grouped_until(
-            input,
-            &program.rules,
-            program.lists.as_ref(),
-            &schema,
-            stop,
-        )?,
-    };
-    let mut violations = result.violations;
-    violations.extend(crate::datatypes::violations(
-        &result.derived,
-        program.rdf_type,
-        program.same_as,
-        &|id| snapshot.decode(TermId::from_raw(id)),
-    ));
-    Ok(Closure {
-        inferred: result
-            .derived
-            .into_iter()
-            .chain(axioms)
-            .filter(|&t| storable(t))
-            .map(encode)
-            .collect(),
-        violations,
-        diagnostics: result.diagnostics,
-        rounds: result.rounds,
-        phases: result.phases,
-    })
-}
-
-/// Facts grouped by predicate: each predicate once, its `(object, subject)` pairs sorted.
-type Grouped = Vec<(u64, Vec<(u64, u64)>)>;
-
-/// The input of a full materialisation of `snapshot`: its asserted statements (any graph)
-/// grouped by predicate, with the ruleset's axioms; and the axioms nothing asserts (they
-/// are inferred statements, and premises of the rules).
-fn input_of(program: &Program, snapshot: &Snapshot) -> (Grouped, Vec<Triple>) {
-    let mut input = asserted_by_predicate(snapshot);
-    let mut axioms: Vec<Triple> = Vec::new();
-    for &axiom in &program.axioms {
-        let [s, p, o] = axiom;
-        let at = input.partition_point(|(predicate, _)| *predicate < p);
-        match input.get_mut(at) {
-            Some((predicate, pairs)) if *predicate == p => match pairs.binary_search(&(o, s)) {
-                Ok(_) => continue,
-                Err(position) => pairs.insert(position, (o, s)),
-            },
-            _ => input.insert(at, (p, vec![(o, s)])),
-        }
-        axioms.push(axiom);
-    }
-    (input, axioms)
-}
-
-/// The closure of `input` (grouped by predicate) over representatives of the `owl:sameAs`
-/// classes, expanded to every identity: what the replacement rules derive, as a batch
-/// materialisation reports it (the derived facts beyond the input). Violations are over
-/// representatives.
-///
-/// Where no equality appears, nothing needs representatives: without asserted `sameAs`,
-/// the closure is computed first on the compact grouped input without the replacement
-/// rules, and if it derives no `sameAs` between two terms either, that is the closure
-/// (LUBM: the replicated time and memory, the replacement rules saved). Otherwise the
-/// representative closure starts from the input (`rebuild` reads it again) and what that
-/// first pass derived.
-fn by_representatives(
-    program: &Program,
-    input: Grouped,
-    rebuild: &dyn Fn() -> Grouped,
-    same_as: u64,
-    schema: &Schema,
-    stop: nrese_reasoner::v2::eval::Stop<'_>,
-) -> Result<batch::Materialisation, delta::Interrupted> {
-    let equal = |pairs: &[(u64, u64)]| pairs.iter().any(|&(o, s)| o != s);
-    let asserts_equality = input
-        .binary_search_by_key(&same_as, |(p, _)| *p)
-        .is_ok_and(|at| equal(&input[at].1));
-    let mut seeds: Vec<Triple> = Vec::new();
-    let input = if asserts_equality {
-        input
-    } else {
-        let rules = nrese_reasoner::v2::representatives::without_replacement(&program.rules);
-        let first =
-            batch::materialise_grouped_until(input, &rules, program.lists.as_ref(), schema, stop)?;
-        if !first
-            .derived
-            .iter()
-            .any(|t| t[1] == same_as && t[0] != t[2])
-        {
-            return Ok(first);
-        }
-        seeds = first.derived;
-        rebuild()
-    };
-    let mut asserted: Vec<Triple> = input
-        .into_iter()
-        .flat_map(|(p, pairs)| pairs.into_iter().map(move |(o, s)| [s, p, o]))
-        .collect();
-    asserted.par_sort_unstable();
-    let start: Vec<Triple> = match seeds.is_empty() {
-        true => asserted.clone(),
-        false => {
-            let mut all = asserted.clone();
-            all.extend(seeds);
-            all.par_sort_unstable();
-            all.dedup();
-            all
-        }
-    };
-    let closure = nrese_reasoner::v2::representatives::materialise_until(
-        &start,
-        &program.rules,
-        program.lists.as_ref(),
-        schema,
-        stop,
-    )?;
-    drop(start);
-    let classes = &closure.classes;
-    if program.store_representatives {
-        // The closure as it is, and each identity's place in its class. A fact asserted
-        // in some graph needs no inferred copy unless its terms have identities (the
-        // default graph's reads expand only what it holds).
-        let touches = |fact: &Triple| fact.iter().any(|&term| classes.class_of(term).is_some());
-        let mut derived: Vec<Triple> = closure
-            .facts
-            .par_iter()
-            .copied()
-            .filter(|fact| touches(fact) || asserted.binary_search(fact).is_err())
-            .collect();
-        derived.extend(classes.classes().flat_map(|(representative, members)| {
-            members
-                .iter()
-                .filter(move |&&member| member != representative)
-                .map(move |&member| [member, same_as, representative])
-        }));
-        derived.par_sort_unstable();
-        derived.dedup();
-        return Ok(batch::Materialisation {
-            derived,
-            violations: closure.violations,
-            diagnostics: closure.diagnostics,
-            rounds: closure.rounds,
-            ..batch::Materialisation::default()
-        });
-    }
-    let mut derived: Vec<Triple> = closure
-        .facts
-        .par_iter()
-        .flat_map_iter(|&fact| {
-            let [s, p, o] = fact;
-            match classes.class_of(s).is_none()
-                && classes.class_of(p).is_none()
-                && classes.class_of(o).is_none()
-            {
-                true => vec![fact],
-                false => classes.expand(fact),
-            }
-        })
-        .filter(|fact| asserted.binary_search(fact).is_err())
-        .collect();
-    derived.par_sort_unstable();
-    derived.dedup();
-    Ok(batch::Materialisation {
-        derived,
-        violations: closure.violations,
-        diagnostics: closure.diagnostics,
-        rounds: closure.rounds,
-        ..batch::Materialisation::default()
-    })
-}
-
-/// Equality by representatives against replication on the asserted data of `snapshot`
-/// (work package W4): facts and time of both closures, and the classes. A measurement,
-/// not a store operation.
-pub fn equality_report(program: &Program, snapshot: &Snapshot) -> String {
-    let input: Vec<Triple> = asserted_by_predicate(snapshot)
-        .into_iter()
-        .flat_map(|(p, pairs)| pairs.into_iter().map(move |(o, s)| [s, p, o]))
-        .collect();
-    let started = Instant::now();
-    let replicated = batch::materialise(
-        &input,
-        &program.rules,
-        program.lists.as_ref(),
-        &program.schema,
-    );
-    let replicated_time = started.elapsed();
-    let started = Instant::now();
-    let closure = nrese_reasoner::v2::representatives::materialise(
-        &input,
-        &program.rules,
-        program.lists.as_ref(),
-        &program.schema,
-    );
-    let representative_time = started.elapsed();
-    let classes = closure.classes.classes().count();
-    let members: usize = closure.classes.classes().map(|(_, m)| m.len()).sum();
-    let largest = closure
-        .classes
-        .classes()
-        .map(|(_, m)| m.len())
-        .max()
-        .unwrap_or(0);
-    format!(
-        "equality: asserted {} | replicated closure {} facts in {:.3} s | representatives {} facts in {:.3} s, {} merges | {} classes, {} members, largest {}",
-        input.len(),
-        input.len() + replicated.derived.len(),
-        replicated_time.as_secs_f64(),
-        closure.facts.len(),
-        representative_time.as_secs_f64(),
-        closure.merges,
-        classes,
-        members,
-        largest
-    )
-}
-
-/// The asserted facts (any graph) of `snapshot` per predicate, as sorted, distinct
-/// `(object, subject)` pairs: one POSG scan, where a fact asserted in several graphs comes
-/// out adjacently.
-fn asserted_by_predicate(snapshot: &Snapshot) -> Vec<(u64, Vec<(u64, u64)>)> {
-    let scan = snapshot
-        .scan_sorted_in(ReadModel::Asserted, &QuadPattern::all(), Permutation::Posg)
-        .expect("the asserted stack keeps POSG");
-    let mut groups: Vec<(u64, Vec<(u64, u64)>)> = Vec::new();
-    for quad in scan {
-        let (p, pair) = (
-            quad.predicate.raw(),
-            (quad.object.raw(), quad.subject.raw()),
-        );
-        match groups.last_mut() {
-            Some((last, pairs)) if *last == p => {
-                if pairs.last() != Some(&pair) {
-                    pairs.push(pair);
-                }
-            }
-            _ => groups.push((p, vec![pair])),
-        }
-    }
-    groups
-}
-
-fn pattern([s, p, o]: [Option<u64>; 3], graph: GraphSelector) -> QuadPattern {
-    QuadPattern {
-        subject: s.map(TermId::from_raw),
-        predicate: p.map(TermId::from_raw),
-        object: o.map(TermId::from_raw),
-        graph,
-    }
-}
-
-/// A transaction's state as the delta executor reads it: the committed indexes (asserted
-/// and inferred, any graph) without the pending deletes, plus the pending inserts, indexed
-/// in memory. Scanning the transaction itself would filter every pending insert on each
-/// lookup.
-pub struct EngineBase<'a> {
-    snapshot: &'a Snapshot,
-    inserts: MemoryBase,
-    deletes: HashSet<EncodedQuad>,
-    /// The ruleset's axioms (sorted): they count as asserted, so no deletion retracts them.
-    axioms: &'a [Triple],
-}
-
-impl<'a> EngineBase<'a> {
-    pub fn new(tx: &'a Transaction<'_>, axioms: &'a [Triple]) -> Self {
-        let inserts: Vec<Triple> = tx.inserted().map(triple).collect();
-        Self {
-            snapshot: tx.base(),
-            inserts: MemoryBase::new(&inserts, &[]),
-            deletes: tx.deleted().collect(),
-            axioms,
-        }
-    }
-
-    /// Whether `fact` was in the state before the transaction (any graph, either stack).
-    fn known_before(&self, fact: Triple) -> bool {
-        let [s, p, o] = fact.map(Some);
-        self.snapshot
-            .quads_for_pattern_in(
-                ReadModel::Materialised,
-                &pattern([s, p, o], GraphSelector::Any),
-            )
-            .next()
-            .is_some()
-    }
-
-    fn committed(&self, model: ReadModel, fact: Triple) -> bool {
-        let [s, p, o] = fact.map(Some);
-        self.snapshot
-            .quads_for_pattern_in(model, &pattern([s, p, o], GraphSelector::Any))
-            .any(|quad| !self.deletes.contains(&quad))
-    }
-}
-
-impl Base for EngineBase<'_> {
-    fn scan(&self, bound: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
-        for quad in self
-            .snapshot
-            .quads_for_pattern_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any))
-        {
-            if !self.deletes.contains(&quad) {
-                f(triple(quad));
-            }
-        }
-        self.inserts.scan(bound, f);
-    }
-
-    fn estimate(&self, bound: [Option<u64>; 3]) -> usize {
-        let committed = self
-            .snapshot
-            .count_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any));
-        usize::try_from(committed).unwrap_or(usize::MAX) + self.inserts.estimate(bound)
-    }
-
-    fn contains(&self, fact: Triple) -> bool {
-        self.inserts.contains(fact) || self.committed(ReadModel::Materialised, fact)
-    }
-
-    fn is_asserted(&self, fact: Triple) -> bool {
-        self.inserts.contains(fact)
-            || self.axioms.binary_search(&fact).is_ok()
-            || self.committed(ReadModel::Asserted, fact)
-    }
-}
-
-/// Keeps the transaction's inferred stack equal to the closure of its asserted state,
-/// given that it was before the transaction's changes: runs the delta executor and applies
-/// its result. Returns the violations the change introduced and the counts.
-///
-/// `stop` is polled throughout the reasoning; when it fires, nothing has been applied to
-/// `tx`'s inferred stack and [`delta::Interrupted`] is returned.
-pub fn apply_delta(
+/// [`nrese_reasoner::engine::maintain_with`] on a commit, with its report: the violations the
+/// change introduced (charged to `memory`, the request's part), what it did, and the
+/// ground program to reuse.
+pub(crate) fn apply_delta(
     program: &Program,
     ground: Option<&GroundProgram>,
     tx: &mut Transaction<'_>,
-    stop: nrese_reasoner::v2::eval::Stop<'_>,
-) -> Result<(Vec<Violation>, MaterialisationReport, Option<GroundProgram>), delta::Interrupted> {
+    operation: &nrese_reasoner::eval::OperationStop<'_>,
+    memory: &Arc<nrese_exec::Budget>,
+) -> Result<(Violations, MaterialisationReport, Option<GroundProgram>), delta::Interrupted> {
     let started = Instant::now();
-    // Axioms the state lacks (a store that never rematerialised): added with this commit.
-    let mut missing_axioms: Vec<Triple> = Vec::new();
-    // Unnamed classes left out: as the commit leaves them; one it makes consumable
-    // needs a rematerialisation for the memberships left out so far.
-    let (schema, revived) = if program.hide_unnamed_classes {
-        let before = program.hidden_classes(tx.base());
-        let after = program.hidden_classes(&tx.pending_snapshot());
-        let revived = before.keys().any(|class| !after.contains_key(class));
-        (program.schema.clone().hiding(after), revived)
-    } else {
-        (program.schema.clone(), false)
-    };
-    let rules = delta::Rules {
-        schema: &schema,
-        ..program.rules()
-    };
-    let update = {
-        let base = EngineBase::new(tx, &program.axioms);
-        // Facts new to the state: in no graph and not inferred before the transaction.
-        let mut inserted: Vec<Triple> = tx
-            .inserted()
-            .map(triple)
-            .filter(|&t| !base.known_before(t))
-            .collect();
-        if !(inserted.is_empty() && tx.deleted().next().is_none()) {
-            missing_axioms = program
-                .axioms
-                .iter()
-                .copied()
-                .filter(|&axiom| !base.known_before(axiom) && !base.inserts.contains(axiom))
-                .collect();
-            inserted.extend(missing_axioms.iter().copied());
-        }
-        inserted.sort_unstable();
-        inserted.dedup();
-        // A triple deleted from one graph but still asserted in another stays a fact.
-        let mut deleted: Vec<Triple> = tx
-            .deleted()
-            .map(triple)
-            .filter(|&t| !base.is_asserted(t))
-            .collect();
-        deleted.sort_unstable();
-        deleted.dedup();
-        if inserted.is_empty() && deleted.is_empty() {
-            delta::Update::default()
-        } else {
-            delta::update_until(&base, &inserted, &deleted, rules, ground, stop)?
-        }
-    };
-    let mut update = update;
-    update.violations.extend(crate::datatypes::violations(
-        &update.insert,
-        program.rdf_type,
-        program.same_as,
-        &|id| tx.decode(TermId::from_raw(id)),
-    ));
-    let (mut inserted, mut removed) = (0, 0);
-    let mut recompute = false;
-    if program.stores_representatives() {
-        match store_over_representatives(program, &update, &missing_axioms, tx) {
-            Some((added, dropped)) => (inserted, removed) = (added, dropped),
-            None => recompute = true,
-        }
-    } else {
-        // A statement asserted in any graph is explicit, never also inferred (the engine
-        // enforces that for the default graph only).
-        let asserted_now: Vec<EncodedTriple> = tx.inserted().map(EncodedTriple::from).collect();
-        for fact in update.remove.iter().map(|&t| encode(t)).chain(asserted_now) {
-            if tx.remove_inferred(fact) {
-                removed += 1;
-            }
-        }
-        for &fact in update
-            .insert
-            .iter()
-            .chain(&missing_axioms)
-            .filter(|&&t| storable(t))
-        {
-            if tx.insert_inferred(encode(fact)) {
-                inserted += 1;
-            }
-        }
-    }
+    let done = nrese_reasoner::engine::maintain_with(program, ground, tx, operation, memory)?;
     let report = MaterialisationReport {
         ruleset: program.program.name(),
         revision: tx.base().revision() + 1,
         asserted: tx.len_in(ReadModel::Asserted),
         inferred: tx.len_in(ReadModel::Inferred),
-        inferred_inserted: inserted,
-        inferred_deleted: removed,
-        violations: update.violations.len(),
-        rounds: update.rounds,
+        inferred_inserted: done.inserted,
+        inferred_deleted: done.removed,
+        violations: done.violations.at_least(),
+        violations_at_least: !done.violations.complete(),
+        rounds: done.rounds,
         elapsed: started.elapsed(),
-        needs_rematerialisation: revived || recompute,
+        work: done.work,
         ..MaterialisationReport::default()
     }
-    .with_diagnostics(&update.diagnostics, &|id| {
+    .with_diagnostics(&done.diagnostics, &|id| {
         decoded(tx.decode(TermId::from_raw(id)), id)
     });
-    Ok((update.violations, report, update.program))
+    Ok((done.violations, report, done.program))
 }
 
-/// Applies `update` (over every identity, as the delta executor reads the expanded stack)
-/// to an inferred stack kept over representatives (W4 stage B): each fact rewritten to
-/// its representatives. Returns the inferred statements added and removed; `None` if the
-/// change merges or splits `owl:sameAs` classes, which rewrites every fact about them: the
-/// caller recomputes the stack after the commit, and nothing is applied.
-fn store_over_representatives(
-    program: &Program,
-    update: &delta::Update,
-    missing_axioms: &[Triple],
-    tx: &mut Transaction<'_>,
-) -> Option<(u64, u64)> {
-    let same_as = program.same_as?;
-    let equates = |t: &Triple| t[1] == same_as && t[0] != t[2];
-    let asserted_change = tx
-        .inserted()
-        .chain(tx.deleted())
-        .map(triple)
-        .any(|t| equates(&t));
-    if asserted_change || update.insert.iter().chain(&update.remove).any(equates) {
-        return None;
-    }
-    let classes = tx.base().equality_classes();
-    let rewrite = |t: Triple| -> Triple {
-        match &classes {
-            Some(classes) => t.map(|term| classes.representative(TermId::from_raw(term)).raw()),
-            None => t,
-        }
-    };
-    let touches = |t: &Triple| {
-        classes.as_ref().is_some_and(|classes| {
-            t.iter()
-                .any(|&term| classes.class_of(TermId::from_raw(term)).is_some())
-        })
-    };
-    let asserted_somewhere = |tx: &Transaction<'_>, t: Triple| {
-        tx.quads_for_pattern_in(
-            ReadModel::Asserted,
-            &pattern(t.map(Some), GraphSelector::Any),
-        )
-        .next()
-        .is_some()
-    };
-    let (mut inserted, mut removed) = (0, 0);
-    let mut removals: Vec<Triple> = update.remove.iter().map(|&t| rewrite(t)).collect();
-    // A statement asserted now needs no inferred copy, unless its terms have identities.
-    for quad in tx.inserted().collect::<Vec<_>>() {
-        let fact = rewrite(triple(quad));
-        if !touches(&fact) {
-            removals.push(fact);
-        }
-    }
-    removals.sort_unstable();
-    removals.dedup();
-    for fact in removals {
-        if tx.remove_inferred(encode(fact)) {
-            removed += 1;
-        }
-    }
-    let mut additions: Vec<Triple> = update
-        .insert
-        .iter()
-        .chain(missing_axioms)
-        .map(|&t| rewrite(t))
-        .filter(|&t| storable(t))
-        .collect();
-    // A statement deleted from the default graph but still asserted in another stays a
-    // fact (the delta executor never sees it), and its copies for other identities stay
-    // inferred: their representative form must stay stored, which the deleted statement
-    // may have been.
-    let still_asserted: Vec<Triple> = tx
-        .deleted()
-        .filter(|quad| quad.graph.is_default_graph())
-        .map(triple)
-        .collect();
-    for fact in still_asserted {
-        let representative = rewrite(fact);
-        if touches(&representative) && storable(representative) && asserted_somewhere(tx, fact) {
-            additions.push(representative);
-        }
-    }
-    additions.sort_unstable();
-    additions.dedup();
-    for fact in additions {
-        if !touches(&fact) && asserted_somewhere(tx, fact) {
-            continue;
-        }
-        if tx.insert_inferred(encode(fact)) {
-            inserted += 1;
-        }
-    }
-    Some((inserted, removed))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{StoreConfig, StoreService};
+    use nrese_engine::{EncodedTriple, QuadPattern};
+    use nrese_rdf::{GraphName, Literal, NamedNode, Quad, vocab::owl};
+    use nrese_reasoner::rulesets::Ruleset;
+    use std::collections::HashSet;
 
-/// What an OWL 2 RL consistency rule's violation means, for reject reports.
-fn describe(rule: &str) -> &'static str {
-    match rule {
-        "cax-dw" => "an instance of two disjoint classes",
-        "cax-adc" => "an instance of two classes of an owl:AllDisjointClasses axiom",
-        "cls-com" => "an instance of a class and of its complement",
-        "cls-nothing2" => "an instance of owl:Nothing",
-        "cls-maxc1" | "cls-maxqc1" | "cls-maxqc2" => "a maximum cardinality of 0 is exceeded",
-        "prp-irp" => "an irreflexive property relates a resource to itself",
-        "prp-asyp" => "an asymmetric property holds in both directions",
-        "prp-pdw" => "two disjoint properties relate the same pair",
-        "prp-adp" => "two properties of an owl:AllDisjointProperties axiom relate the same pair",
-        "prp-npa1" | "prp-npa2" => "a negative property assertion is contradicted",
-        "eq-diff1" | "eq-diff2" | "eq-diff3" => "resources declared different are the same",
-        "dt-not-type" => "a literal is typed with a datatype whose value space doesn't contain it",
-        "dt-diff" => "two different data values would be the same",
-        _ => "a consistency rule is violated",
+    /// A reader of a revision whose closure left out a list keeps the mark after a later
+    /// commit deletes that list (and after the scan of a later clean revision); revisions the
+    /// record doesn't know are scanned, and clean commits off a clean revision extend it.
+    #[test]
+    fn a_reader_of_a_revision_with_a_list_left_out_keeps_the_mark() {
+        let kept = ListsKept::default();
+        let unknown = || panic!("scanned a known revision");
+        assert!(!kept.left_out(1, || false), "revision 1, scanned clean");
+        kept.commit(1, 2, true); // the long list written
+        assert!(kept.left_out(2, || true), "revision 2, scanned");
+        assert!(kept.left_out(2, unknown), "revision 2, as found");
+        kept.commit(2, 3, false); // the long list deleted
+        assert!(!kept.left_out(3, || false), "revision 3, scanned clean");
+        kept.commit(3, 4, false);
+        assert!(!kept.left_out(4, unknown), "revision 4, extended");
+        assert!(kept.left_out(2, || true), "the older reader keeps the mark");
+        assert!(
+            !kept.left_out(1, || false),
+            "revision 1 scanned again, clean"
+        );
     }
-}
 
-/// A term as reject reports show it: an IRI plainly, anything else in N-Triples form.
-fn term_text(term: &nrese_rdf::Term) -> String {
-    match term {
-        nrese_rdf::Term::NamedNode(node) => node.as_str().to_owned(),
-        other => other.to_string(),
-    }
-}
-
-/// A violation decoded for a reject report: the violated rule's premises under its
-/// bindings (the facts that clash), each marked asserted or inferred.
-pub fn explain(
-    program: &Program,
-    violation: &Violation,
-    tx: &Transaction<'_>,
-) -> nrese_reasoner::RejectExplanation {
-    use nrese_reasoner::v2::ir::{Head, Term};
-    let decode = |id: u64| decoded(tx.decode(TermId::from_raw(id)), id);
-    let value = |term: Term| match term {
-        Term::Const(c) => Some(c),
-        Term::Var(v) => violation.bindings.get(usize::from(v)).copied(),
-    };
-    let evidence: Vec<nrese_reasoner::RejectEvidence> = program
-        .rules
-        .iter()
-        .find(|r| r.name == violation.rule && r.head == Head::Inconsistent)
-        .map(|rule| {
-            rule.body
-                .iter()
-                .filter_map(|atom| {
-                    let [s, p, o] = [value(atom.0[0])?, value(atom.0[1])?, value(atom.0[2])?];
-                    let asserted = tx
-                        .quads_for_pattern_in(
-                            ReadModel::Asserted,
-                            &pattern([Some(s), Some(p), Some(o)], GraphSelector::Any),
-                        )
-                        .next()
-                        .is_some();
-                    Some(nrese_reasoner::RejectEvidence {
-                        role: "premise",
-                        subject: decode(s),
-                        predicate: decode(p),
-                        object: decode(o),
-                        origin: if asserted { "asserted" } else { "inferred" }.to_owned(),
-                    })
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    // The instance the violation is about: the subject of the last premise (OWL 2 RL
-    // rules list schema premises first), else the first binding.
-    let focus = evidence
-        .last()
-        .map(|e| e.subject.clone())
-        .or_else(|| violation.bindings.first().map(|&id| decode(id)))
-        .unwrap_or_default();
-    let premises: Vec<String> = evidence
-        .iter()
-        .map(|e| format!("{} {} {} ({})", e.subject, e.predicate, e.object, e.origin))
-        .collect();
-    let summary = if premises.is_empty() {
-        let bindings: Vec<String> = violation.bindings.iter().map(|&id| decode(id)).collect();
-        format!(
-            "{} ({}): {}",
-            violation.rule,
-            describe(&violation.rule),
-            bindings.join(", ")
-        )
-    } else {
-        format!(
-            "{} ({}): {}",
-            violation.rule,
-            describe(&violation.rule),
-            premises.join("; ")
-        )
-    };
-    nrese_reasoner::RejectExplanation {
-        summary,
-        violated_constraint: violation.rule.clone(),
-        focus_resource: focus,
-        evidence,
-    }
-}
-
-/// One step of an inference's explanation ([`explain_fact`]), decoded: the fact, whether it
-/// is asserted or inferred, the rule that derives it and its premises (indexes of steps).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct InferenceStep {
-    /// The statement's terms (N-Triples); empty for a `hidden` step.
-    pub subject: String,
-    pub predicate: String,
-    pub object: String,
-    /// `asserted`, `inferred`, or `hidden`: asserted in no graph the requester may read
-    /// (the step stays, so the proof's shape does, without the statement).
-    pub origin: &'static str,
-    /// The rule (`cax-sco`, `prp-trp`, ...); `None` for an asserted fact.
-    pub rule: Option<String>,
-    pub premises: Vec<usize>,
-}
-
-/// Facts an explanation examines at most.
-const EXPLANATION_BUDGET: usize = 4096;
-
-/// Why the fact `[s, p, o]` holds in `snapshot` under `program`: a derivation of it from
-/// asserted facts ([`nrese_reasoner::v2::explain`]), the fact first. `None` if it doesn't
-/// hold, or no derivation is found within the budget.
-///
-/// `readable`, where the requester may not read every graph, tells whether an asserted
-/// statement is in a graph it may read: steps on others are `hidden`.
-pub fn explain_fact(
-    program: &Program,
-    snapshot: &Snapshot,
-    fact: Triple,
-    readable: Option<&dyn Fn(Triple) -> bool>,
-) -> Option<Vec<InferenceStep>> {
-    let base = SnapshotBase {
-        snapshot,
-        axioms: &program.axioms,
-    };
-    let explanation =
-        nrese_reasoner::v2::explain::explain(&base, program.rules(), fact, EXPLANATION_BUDGET)?;
-    let decode = |id: u64| decoded(snapshot.decode(TermId::from_raw(id)), id);
-    Some(
-        explanation
-            .steps
-            .into_iter()
-            .map(|step| {
-                let [s, p, o] = step.fact;
-                if step.rule.is_none() && readable.is_some_and(|readable| !readable(step.fact)) {
-                    return InferenceStep {
-                        subject: String::new(),
-                        predicate: String::new(),
-                        object: String::new(),
-                        origin: "hidden",
-                        rule: None,
-                        premises: step.premises,
-                    };
-                }
-                InferenceStep {
-                    subject: decode(s),
-                    predicate: decode(p),
-                    object: decode(o),
-                    origin: if step.rule.is_some() {
-                        "inferred"
-                    } else {
-                        "asserted"
-                    },
-                    rule: step.rule,
-                    premises: step.premises,
-                }
+    /// `eq-giant-split`'s shape: a class of `size` members (two `owl:sameAs` chains and a
+    /// bridge) beside classes of ten. Deleting the bridge splits the class; over a compact
+    /// stack, rebuilding the state reads fewer facts than recomputing the class's copies,
+    /// so the maintenance policy rebuilds in the commit's transaction (B3a) and the delta
+    /// executor never runs. Its stack is the fresh closure, and the commit's work is linear
+    /// in the class: its `stop` polls and its changes to the stack, never the class's
+    /// pairs. Counts, not times. Before B3a, the delta ran first and was thrown away: its
+    /// polls were 2,442 / 10,205 / 38,997 for 20 / 40 / 80 members.
+    #[test]
+    fn a_split_commit_changes_the_compact_stack_linearly_in_the_class() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let split = |size: usize| -> u64 {
+            let store = StoreService::new(StoreConfig {
+                equality_by_representatives: true,
+                equality_compact: true,
+                ..StoreConfig::in_memory()
             })
-            .collect(),
-    )
-}
+            .unwrap();
+            let ex = |s: String| NamedNode::new_unchecked(format!("http://example.com/{s}"));
+            let mut facts = Vec::new();
+            let mut class = |name: &str, members: usize| {
+                let same = |j: usize| {
+                    let [a, b] = [j, j + 1].map(|j| ex(format!("{name}{j}")));
+                    Quad::new(a, owl::SAME_AS, b, GraphName::DefaultGraph)
+                };
+                for j in 0..members {
+                    let value = Literal::new_simple_literal(format!("{name}{j}"));
+                    let member = ex(format!("{name}{j}"));
+                    facts.push(Quad::new(
+                        member,
+                        ex("val".into()),
+                        value,
+                        GraphName::DefaultGraph,
+                    ));
+                    if j + 1 < members {
+                        facts.push(same(j));
+                    }
+                }
+                same(members / 2 - 1)
+            };
+            let bridge = class("g", size);
+            for g in 0..20 {
+                class(&format!("s{g}_"), 10);
+            }
+            let mut tx = store.engine().transaction();
+            for quad in &facts {
+                tx.insert(quad.as_ref());
+            }
+            tx.commit().unwrap();
+            store.rematerialise(Ruleset::Owl2Rl).unwrap();
 
-/// A committed state as the reasoner reads it: asserted and inferred statements of every
-/// graph, the ruleset's axioms counting as asserted.
-struct SnapshotBase<'a> {
-    snapshot: &'a Snapshot,
-    axioms: &'a [Triple],
-}
-
-impl Base for SnapshotBase<'_> {
-    fn scan(&self, bound: [Option<u64>; 3], f: &mut dyn FnMut(Triple)) {
-        for quad in self
-            .snapshot
-            .quads_for_pattern_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any))
-        {
-            f(triple(quad));
+            let mut tx = store.engine().transaction();
+            let config = store.config();
+            let program = Program::compile(&Ruleset::Owl2Rl.into(), &|term| tx.intern(term))
+                .hiding_unnamed_classes(config.hide_unnamed_classes)
+                .unwrap()
+                .by_representatives(config.equality_by_representatives)
+                .storing_representatives(config.equality_compact);
+            assert!(program.stores_representatives());
+            tx.remove(bridge.as_ref());
+            let polls = AtomicU64::new(0);
+            let poll = || {
+                polls.fetch_add(1, Ordering::Relaxed);
+                false
+            };
+            let operation = nrese_reasoner::eval::OperationStop::new(&poll);
+            let memory = Arc::new(nrese_exec::Budget::unlimited());
+            let (violations, report, _) =
+                apply_delta(&program, None, &mut tx, &operation, &memory).unwrap();
+            assert!(violations.consistent());
+            let pending = tx.pending_snapshot();
+            let stored: HashSet<EncodedTriple> = pending
+                .stored()
+                .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+                .map(Into::into)
+                .collect();
+            let fresh: HashSet<EncodedTriple> = materialise(&program, &pending)
+                .inferred
+                .into_iter()
+                .filter(|t| !pending.contains_in(ReadModel::Asserted, &t.in_default_graph()))
+                .collect();
+            assert_eq!(
+                stored, fresh,
+                "{size}: the split's stack is the fresh closure"
+            );
+            assert_eq!(
+                report.work.plan,
+                nrese_reasoner::delta::policy::Plan::Rebuild,
+                "{size}: {report:?}"
+            );
+            assert!(
+                report.inferred_inserted + report.inferred_deleted < 2 * size as u64,
+                "{size}: {report:?}"
+            );
+            polls.into_inner()
+        };
+        let polls = [20, 40, 80].map(split);
+        // Linear work, a + b·size, at most doubles when the class doubles; the class's
+        // pairs would quadruple it.
+        for pair in polls.windows(2) {
+            assert!(
+                pair[1] <= 2 * pair[0],
+                "polls by size 20, 40, 80: {polls:?}"
+            );
         }
-    }
-
-    fn estimate(&self, bound: [Option<u64>; 3]) -> usize {
-        let count = self
-            .snapshot
-            .estimate_in(ReadModel::Materialised, &pattern(bound, GraphSelector::Any));
-        usize::try_from(count).unwrap_or(usize::MAX)
-    }
-
-    fn contains(&self, fact: Triple) -> bool {
-        self.snapshot.exists_in(
-            ReadModel::Materialised,
-            &pattern(fact.map(Some), GraphSelector::Any),
-        )
-    }
-
-    fn is_asserted(&self, fact: Triple) -> bool {
-        self.axioms.binary_search(&fact).is_ok()
-            || self.snapshot.exists_in(
-                ReadModel::Asserted,
-                &pattern(fact.map(Some), GraphSelector::Any),
-            )
     }
 }

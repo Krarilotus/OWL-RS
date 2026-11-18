@@ -22,6 +22,10 @@ const ITS: &str = "http://www.w3.org/2005/11/its";
 
 pub(crate) struct RdfXmlWriter {
     prefixes: Vec<(String, String)>,
+    /// The prefix of a predicate whose namespace has none, declared on its element.
+    fallback: String,
+    /// The prefix of `its:dir`, declared on its element.
+    its: String,
     started: bool,
     subject: Option<NamedOrBlankNode>,
 }
@@ -32,8 +36,15 @@ fn invalid(message: String) -> io::Error {
 
 impl RdfXmlWriter {
     pub(crate) fn new(prefixes: Vec<(String, String)>) -> Self {
+        // The prefixes this writer declares on an element are none of the configured ones,
+        // so such a declaration never shadows a mapping that names inside it still use (a
+        // nested triple's predicates, the element's own name beside `its:dir`).
+        let fallback = unused("ns", &prefixes, &[]);
+        let its = unused("its", &prefixes, &[&fallback]);
         Self {
             prefixes,
+            fallback,
+            its,
             started: false,
             subject: None,
         }
@@ -77,18 +88,17 @@ impl RdfXmlWriter {
         } else {
             self.prefixes
                 .iter()
-                .find(|(_, ns)| ns == namespace)
+                .find(|(p, ns)| ns == namespace && declared(p))
                 .map(|(p, _)| p.as_str())
         };
         indent(out, depth);
         out.push(b'<');
-        let name = match prefix {
-            Some(p) => format!("{p}:{local}"),
-            None => format!("ns:{local}"),
-        };
+        let name = format!("{}:{local}", prefix.unwrap_or(&self.fallback));
         out.extend_from_slice(name.as_bytes());
         if prefix.is_none() {
-            out.extend_from_slice(b" xmlns:ns=\"");
+            out.extend_from_slice(b" xmlns:");
+            out.extend_from_slice(self.fallback.as_bytes());
+            out.extend_from_slice(b"=\"");
             escape_attribute(namespace, out)?;
             out.push(b'"');
         }
@@ -117,9 +127,13 @@ impl RdfXmlWriter {
                     escape_attribute(language, out)?;
                     out.push(b'"');
                     if let Some(direction) = literal.direction() {
-                        out.extend_from_slice(b" xmlns:its=\"");
+                        out.extend_from_slice(b" xmlns:");
+                        out.extend_from_slice(self.its.as_bytes());
+                        out.extend_from_slice(b"=\"");
                         out.extend_from_slice(ITS.as_bytes());
-                        out.extend_from_slice(b"\" its:dir=\"");
+                        out.extend_from_slice(b"\" ");
+                        out.extend_from_slice(self.its.as_bytes());
+                        out.extend_from_slice(b":dir=\"");
                         out.extend_from_slice(direction.as_str().as_bytes());
                         out.push(b'"');
                     }
@@ -171,7 +185,7 @@ impl RdfXmlWriter {
         out.extend_from_slice(RDF.as_bytes());
         out.push(b'"');
         for (prefix, namespace) in &self.prefixes {
-            if prefix == "rdf" || prefix.is_empty() || !is_nc_name(prefix) {
+            if !declared(prefix) {
                 continue;
             }
             out.extend_from_slice(b"\n\txmlns:");
@@ -188,6 +202,30 @@ impl RdfXmlWriter {
             out.extend_from_slice(b"\t</rdf:Description>\n");
         }
     }
+}
+
+/// Whether `prefix` goes on `rdf:RDF`, so that a qualified name may use it: an NCName that
+/// isn't `rdf` (always RDF's own namespace here) or reserved by XML (`xml…`). Any other
+/// namespace is declared on the property element itself.
+fn declared(prefix: &str) -> bool {
+    prefix != "rdf"
+        && is_nc_name(prefix)
+        && !prefix
+            .get(..3)
+            .is_some_and(|start| start.eq_ignore_ascii_case("xml"))
+}
+
+/// `base`, or `base` and a number, whichever is first neither a configured prefix nor in
+/// `taken`.
+fn unused(base: &str, prefixes: &[(String, String)], taken: &[&str]) -> String {
+    let free = |name: &str| !taken.contains(&name) && prefixes.iter().all(|(p, _)| p != name);
+    (0..)
+        .map(|n| match n {
+            0 => base.to_owned(),
+            n => format!("{base}{n}"),
+        })
+        .find(|name| free(name))
+        .expect("a free prefix among the unbounded candidates")
 }
 
 fn indent(out: &mut Vec<u8>, depth: usize) {

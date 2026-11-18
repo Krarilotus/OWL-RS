@@ -1,0 +1,3102 @@
+//! OWL 2 QL answers through existentials (docs/design/ql-rewriting.md §6): the store's
+//! answers (the `owl2-ql` or `owl2-rl` closure, queried with the tree-witness rewriting)
+//! against certain answers computed apart, by a bounded chase, on random small QL
+//! ontologies, data and conjunctive queries.
+//!
+//! The chase reads the generated axioms directly, not the store's reading of their RDF:
+//! inclusions between classes and existentials, generating axioms and role inclusions with
+//! inverses, applied until nothing changes, with a new anonymous element for each element
+//! and generating axiom up to a depth that a match of the query never needs to exceed
+//! (the generated types, then the query's variables). A query's certain answers are its
+//! matches on the named individuals.
+//!
+//! Mixed ontologies add what OWL 2 QL leaves out on purpose: transitive properties,
+//! property chains, functional and inverse functional properties, and `owl:sameAs` in the
+//! data. The chase applies them too (equality by merging elements, named ones kept as
+//! representatives). The store's answers must all be certain, and every query that misses
+//! one must say `sound-only` (docs/design/ql-rewriting.md §7).
+//!
+//! `NRESE_QL_CASES` sets the number of cases (default 150 per test), `NRESE_QL_SEED` the
+//! seed.
+
+use crate::support::Writes;
+use std::collections::{BTreeSet, HashMap, HashSet};
+
+use nrese_reasoner::rulesets::Ruleset;
+use nrese_sparql::Completeness;
+use nrese_store::{
+    BulkLoadRequest, ConsistencyStatus, GraphTarget, QlRewritingMode, SolutionsResultFormat,
+    SparqlQueryRequest, StoreConfig, StoreService,
+};
+
+const E: &str = "http://e/";
+const CLASSES: usize = 4;
+const PROPERTIES: usize = 3;
+const INDIVIDUALS: usize = 4;
+/// Edges a chase may hold: transitivity and chains over many anonymous elements are
+/// quadratic. A case past it is skipped (and counted).
+const MAX_EDGES: usize = 50_000;
+
+/// xorshift64*: deterministic cases without a dependency.
+pub(crate) struct Rng(pub(crate) u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 >> 12;
+        self.0 ^= self.0 << 25;
+        self.0 ^= self.0 >> 27;
+        self.0.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    pub(crate) fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+
+    pub(crate) fn chance(&mut self, percent: usize) -> bool {
+        self.below(100) < percent
+    }
+}
+
+/// A role: a property, or its inverse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct Role {
+    property: usize,
+    inverse: bool,
+}
+
+impl Role {
+    fn inverse(self) -> Self {
+        Self {
+            inverse: !self.inverse,
+            ..self
+        }
+    }
+
+    fn turtle(self) -> String {
+        if self.inverse {
+            format!("[ owl:inverseOf :P{} ]", self.property)
+        } else {
+            format!(":P{}", self.property)
+        }
+    }
+}
+
+/// A basic concept on the left of an inclusion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Basic {
+    Class(usize),
+    Exists(Role),
+}
+
+/// The TBox as the chase reads it.
+#[derive(Debug, Default)]
+struct Tbox {
+    /// `left ⊑ class`.
+    inclusions: Vec<(Basic, usize)>,
+    /// `left ⊑ ∃role.filler`.
+    generating: Vec<(Basic, Role, Option<usize>)>,
+    /// `sub ⊑ sup`, closed under inverses.
+    roles: Vec<(Role, Role)>,
+    turtle: Vec<String>,
+}
+
+impl Tbox {
+    fn role_inclusion(&mut self, sub: Role, sup: Role) {
+        self.roles.push((sub, sup));
+        self.roles.push((sub.inverse(), sup.inverse()));
+    }
+}
+
+/// Axioms beyond OWL 2 QL, and equalities in the data.
+#[derive(Debug, Default)]
+struct Extras {
+    /// `p ∘ q ⊑ r` (a transitive `p` is `p ∘ p ⊑ p`).
+    chains: Vec<(usize, usize, usize)>,
+    functional: Vec<usize>,
+    inverse_functional: Vec<usize>,
+    same: Vec<(usize, usize)>,
+    turtle: Vec<String>,
+}
+
+/// Extras over the properties, mostly over `generating` ones (the roles of existentials),
+/// where they meet anonymous individuals.
+fn random_extras(rng: &mut Rng, generating: &[usize]) -> Extras {
+    let mut e = Extras::default();
+    for _ in 0..1 + rng.below(3) {
+        let p = if !generating.is_empty() && rng.chance(70) {
+            generating[rng.below(generating.len())]
+        } else {
+            rng.below(PROPERTIES)
+        };
+        match rng.below(5) {
+            0 | 1 => {
+                e.chains.push((p, p, p));
+                e.turtle.push(format!(":P{p} a owl:TransitiveProperty ."));
+            }
+            2 => {
+                let (q, r) = (rng.below(PROPERTIES), rng.below(PROPERTIES));
+                e.chains.push((p, q, r));
+                e.turtle
+                    .push(format!(":P{r} owl:propertyChainAxiom ( :P{p} :P{q} ) ."));
+            }
+            3 => {
+                e.functional.push(p);
+                e.turtle.push(format!(":P{p} a owl:FunctionalProperty ."));
+            }
+            _ => {
+                e.inverse_functional.push(p);
+                e.turtle
+                    .push(format!(":P{p} a owl:InverseFunctionalProperty ."));
+            }
+        }
+    }
+    if rng.chance(40) {
+        let (a, b) = (rng.below(INDIVIDUALS), rng.below(INDIVIDUALS));
+        e.same.push((a, b));
+        e.turtle.push(format!(":a{a} owl:sameAs :a{b} ."));
+    }
+    e
+}
+
+fn restriction(role: Role, filler: Option<usize>) -> String {
+    let filler = filler.map_or_else(|| "owl:Thing".to_owned(), |c| format!(":C{c}"));
+    format!(
+        "[ a owl:Restriction ; owl:onProperty {} ; owl:someValuesFrom {filler} ]",
+        role.turtle()
+    )
+}
+
+fn random_tbox(rng: &mut Rng) -> Tbox {
+    let mut t = Tbox::default();
+    let class = |rng: &mut Rng| rng.below(CLASSES);
+    let role = |rng: &mut Rng| Role {
+        property: rng.below(PROPERTIES),
+        inverse: rng.chance(30),
+    };
+    let axioms = 2 + rng.below(6);
+    let mut generating = 0;
+    for _ in 0..axioms {
+        let kind = rng.below(12);
+        // At most three generating axioms keep the chase small.
+        if matches!(kind, 1 | 2 | 8 | 9) && generating == 3 {
+            continue;
+        }
+        match kind {
+            0 => {
+                let (a, b) = (class(rng), class(rng));
+                t.inclusions.push((Basic::Class(a), b));
+                t.turtle.push(format!(":C{a} rdfs:subClassOf :C{b} ."));
+            }
+            1 | 2 => {
+                let (a, r) = (class(rng), role(rng));
+                let filler = (kind == 1).then(|| class(rng));
+                t.generating.push((Basic::Class(a), r, filler));
+                t.turtle.push(format!(
+                    ":C{a} rdfs:subClassOf {} .",
+                    restriction(r, filler)
+                ));
+                generating += 1;
+            }
+            3 | 4 => {
+                let (p, a) = (rng.below(PROPERTIES), class(rng));
+                let r = Role {
+                    property: p,
+                    inverse: kind == 4,
+                };
+                t.inclusions.push((Basic::Exists(r), a));
+                let key = if kind == 3 { "domain" } else { "range" };
+                t.turtle.push(format!(":P{p} rdfs:{key} :C{a} ."));
+            }
+            5 => {
+                let (p, q) = (rng.below(PROPERTIES), rng.below(PROPERTIES));
+                t.role_inclusion(
+                    Role {
+                        property: p,
+                        inverse: false,
+                    },
+                    Role {
+                        property: q,
+                        inverse: false,
+                    },
+                );
+                t.turtle.push(format!(":P{p} rdfs:subPropertyOf :P{q} ."));
+            }
+            6 => {
+                let (p, q) = (rng.below(PROPERTIES), rng.below(PROPERTIES));
+                let (p_, q_) = (
+                    Role {
+                        property: p,
+                        inverse: false,
+                    },
+                    Role {
+                        property: q,
+                        inverse: false,
+                    },
+                );
+                t.role_inclusion(p_, q_.inverse());
+                t.role_inclusion(q_.inverse(), p_);
+                t.turtle.push(format!(":P{p} owl:inverseOf :P{q} ."));
+            }
+            7 => {
+                let (r, a) = (role(rng), class(rng));
+                t.inclusions.push((Basic::Exists(r), a));
+                t.turtle
+                    .push(format!("{} rdfs:subClassOf :C{a} .", restriction(r, None)));
+            }
+            8 => {
+                let (a, b, c, r) = (class(rng), class(rng), class(rng), role(rng));
+                t.inclusions.push((Basic::Class(a), b));
+                t.generating.push((Basic::Class(a), r, Some(c)));
+                t.turtle.push(format!(
+                    ":C{a} rdfs:subClassOf [ owl:intersectionOf ( :C{b} {} ) ] .",
+                    restriction(r, Some(c))
+                ));
+                generating += 1;
+            }
+            9 => {
+                let (p, r, c) = (rng.below(PROPERTIES), role(rng), class(rng));
+                let left = Role {
+                    property: p,
+                    inverse: false,
+                };
+                t.generating.push((Basic::Exists(left), r, Some(c)));
+                t.turtle
+                    .push(format!(":P{p} rdfs:domain {} .", restriction(r, Some(c))));
+                generating += 1;
+            }
+            10 => {
+                let (a, b) = (class(rng), class(rng));
+                t.inclusions.push((Basic::Class(a), b));
+                t.inclusions.push((Basic::Class(b), a));
+                t.turtle.push(format!(":C{a} owl:equivalentClass :C{b} ."));
+            }
+            _ => {
+                let p = rng.below(PROPERTIES);
+                let r = Role {
+                    property: p,
+                    inverse: false,
+                };
+                t.role_inclusion(r, r.inverse());
+                t.turtle.push(format!(":P{p} a owl:SymmetricProperty ."));
+            }
+        }
+    }
+    t
+}
+
+/// A query term: a variable or an individual.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum T {
+    Var(usize),
+    Ind(usize),
+}
+
+#[derive(Debug, Clone)]
+enum QAtom {
+    Class(T, usize),
+    Role(T, usize, T),
+}
+
+struct Query {
+    atoms: Vec<QAtom>,
+    vars: usize,
+    answers: Vec<usize>,
+}
+
+impl Query {
+    /// The triple patterns.
+    fn body(&self) -> String {
+        let term = |t: &T| match t {
+            T::Var(v) => format!("?v{v}"),
+            T::Ind(i) => format!(":a{i}"),
+        };
+        self.atoms
+            .iter()
+            .map(|a| match a {
+                QAtom::Class(t, c) => format!("{} a :C{c} .", term(t)),
+                QAtom::Role(s, p, o) => format!("{} :P{p} {} .", term(s), term(o)),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// The variables the atoms mention, in order.
+    fn variables(&self) -> Vec<usize> {
+        let used: BTreeSet<usize> = self.atoms.iter().flat_map(atom_vars).collect();
+        used.into_iter().collect()
+    }
+
+    fn sparql(&self, distinct: bool) -> String {
+        let body = self.body();
+        let head = if self.answers.is_empty() {
+            "(1 AS ?k)".to_owned()
+        } else {
+            self.answers
+                .iter()
+                .map(|v| format!("?v{v}"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        };
+        format!(
+            "PREFIX : <{E}> SELECT {}{head} WHERE {{ {body} }}",
+            if distinct { "DISTINCT " } else { "" },
+        )
+    }
+}
+
+fn random_query(rng: &mut Rng) -> Query {
+    let atoms = 1 + rng.below(4);
+    let vars = 1 + rng.below(4);
+    let term = |rng: &mut Rng| {
+        if rng.chance(10) {
+            T::Ind(rng.below(INDIVIDUALS))
+        } else {
+            T::Var(rng.below(vars))
+        }
+    };
+    let atoms: Vec<QAtom> = (0..atoms)
+        .map(|_| {
+            if rng.chance(40) {
+                QAtom::Class(term(rng), rng.below(CLASSES))
+            } else {
+                QAtom::Role(term(rng), rng.below(PROPERTIES), term(rng))
+            }
+        })
+        .collect();
+    let used: BTreeSet<usize> = atoms
+        .iter()
+        .flat_map(|a| match a {
+            QAtom::Class(t, _) => vec![*t],
+            QAtom::Role(s, _, o) => vec![*s, *o],
+        })
+        .filter_map(|t| match t {
+            T::Var(v) => Some(v),
+            T::Ind(_) => None,
+        })
+        .collect();
+    let answers = used.into_iter().filter(|_| rng.chance(50)).collect();
+    Query {
+        atoms,
+        vars,
+        answers,
+    }
+}
+
+/// The chase: elements `0..INDIVIDUALS` are the individuals, the others anonymous.
+struct Chase {
+    depth: Vec<usize>,
+    types: HashSet<(usize, usize)>,
+    /// `(subject, property, object)`.
+    edges: HashSet<(usize, usize, usize)>,
+    /// `(element, role)` for each element with an edge of the role.
+    has: HashSet<(usize, Role)>,
+    /// Union-find: each element's representative is the least of its class, so a class
+    /// with an individual is represented by one.
+    rep: Vec<usize>,
+}
+
+impl Chase {
+    fn holds(&self, x: usize, basic: Basic) -> bool {
+        match basic {
+            Basic::Class(c) => self.types.contains(&(x, c)),
+            Basic::Exists(r) => self.has.contains(&(x, r)),
+        }
+    }
+
+    fn add_edge(&mut self, edge: (usize, usize, usize)) -> bool {
+        let (s, p, o) = edge;
+        self.has.insert((
+            s,
+            Role {
+                property: p,
+                inverse: false,
+            },
+        ));
+        self.has.insert((
+            o,
+            Role {
+                property: p,
+                inverse: true,
+            },
+        ));
+        self.edges.insert(edge)
+    }
+
+    fn find(&self, mut x: usize) -> usize {
+        while self.rep[x] != x {
+            x = self.rep[x];
+        }
+        x
+    }
+
+    /// Makes `a` and `b` one element; whether they were two.
+    fn merge(&mut self, a: usize, b: usize) -> bool {
+        let (a, b) = (self.find(a), self.find(b));
+        if a == b {
+            return false;
+        }
+        let (low, high) = (a.min(b), a.max(b));
+        self.rep[high] = low;
+        self.depth[low] = self.depth[low].min(self.depth[high]);
+        true
+    }
+
+    /// Every fact over representatives.
+    fn canonical(&mut self) {
+        let types: HashSet<(usize, usize)> =
+            self.types.iter().map(|&(x, c)| (self.find(x), c)).collect();
+        let edges: Vec<(usize, usize, usize)> = self
+            .edges
+            .iter()
+            .map(|&(x, p, y)| (self.find(x), p, self.find(y)))
+            .collect();
+        self.types = types;
+        self.edges.clear();
+        self.has.clear();
+        for edge in edges {
+            self.add_edge(edge);
+        }
+    }
+
+    /// The individuals an element stands for.
+    fn names(&self, x: usize) -> Vec<usize> {
+        (0..INDIVIDUALS).filter(|&i| self.find(i) == x).collect()
+    }
+
+    /// The certain answers with each element written as every individual it is.
+    fn named_answers(&self, query: &Query) -> BTreeSet<Vec<usize>> {
+        let mut out = BTreeSet::new();
+        for tuple in self.answers(query) {
+            let mut rows: Vec<Vec<usize>> = vec![Vec::new()];
+            for &x in &tuple {
+                rows = rows
+                    .into_iter()
+                    .flat_map(|row| {
+                        self.names(x).into_iter().map(move |n| {
+                            let mut row = row.clone();
+                            row.push(n);
+                            row
+                        })
+                    })
+                    .collect();
+            }
+            out.extend(rows);
+        }
+        out
+    }
+
+    /// Runs `tbox` and `extras` over the facts, anonymous elements to `max_depth`; `None`
+    /// past `max_elements`.
+    fn run(
+        tbox: &Tbox,
+        extras: &Extras,
+        types: &[(usize, usize)],
+        edges: &[(usize, usize, usize)],
+        max_depth: usize,
+        max_elements: usize,
+    ) -> Option<Self> {
+        let mut chase = Self {
+            depth: vec![0; INDIVIDUALS],
+            types: types.iter().copied().collect(),
+            edges: HashSet::new(),
+            has: HashSet::new(),
+            rep: (0..INDIVIDUALS).collect(),
+        };
+        for &edge in edges {
+            chase.add_edge(edge);
+        }
+        for &(a, b) in &extras.same {
+            chase.merge(a, b);
+        }
+        chase.canonical();
+        let mut generated: HashSet<(usize, usize)> = HashSet::new();
+        loop {
+            let mut changed = false;
+            let elements = chase.depth.len();
+            // Chains and transitivity, then the equalities functional properties force.
+            for &(p, q, r) in &extras.chains {
+                let mut out_q: HashMap<usize, Vec<usize>> = HashMap::new();
+                for &(y, s, z) in &chase.edges {
+                    if s == q {
+                        out_q.entry(y).or_default().push(z);
+                    }
+                }
+                let new: Vec<(usize, usize, usize)> = chase
+                    .edges
+                    .iter()
+                    .filter(|&&(_, s, _)| s == p)
+                    .flat_map(|&(x, _, y)| {
+                        out_q.get(&y).into_iter().flatten().map(move |&z| (x, r, z))
+                    })
+                    .collect();
+                for edge in new {
+                    changed |= chase.add_edge(edge);
+                }
+                if chase.edges.len() > MAX_EDGES {
+                    return None;
+                }
+            }
+            let mut merged = false;
+            let mut pairs: Vec<(usize, usize)> = Vec::new();
+            for (list, inverse) in [
+                (&extras.functional, false),
+                (&extras.inverse_functional, true),
+            ] {
+                for &p in list {
+                    let mut by: HashMap<usize, usize> = HashMap::new();
+                    for &(x, s, y) in &chase.edges {
+                        if s == p {
+                            let (key, value) = if inverse { (y, x) } else { (x, y) };
+                            match by.get(&key) {
+                                Some(&other) if other != value => pairs.push((other, value)),
+                                Some(_) => {}
+                                None => {
+                                    by.insert(key, value);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            for (a, b) in pairs {
+                merged |= chase.merge(a, b);
+            }
+            if merged {
+                chase.canonical();
+                changed = true;
+            }
+            let reps: Vec<usize> = (0..elements).filter(|&x| chase.rep[x] == x).collect();
+            for &(left, class) in &tbox.inclusions {
+                for &x in &reps {
+                    if !chase.types.contains(&(x, class)) && chase.holds(x, left) {
+                        chase.types.insert((x, class));
+                        changed = true;
+                    }
+                }
+            }
+            for &(sub, sup) in &tbox.roles {
+                let matching: Vec<(usize, usize)> = chase
+                    .edges
+                    .iter()
+                    .filter(|&&(_, p, _)| p == sub.property)
+                    .map(|&(s, _, o)| if sub.inverse { (o, s) } else { (s, o) })
+                    .collect();
+                for (x, y) in matching {
+                    let edge = if sup.inverse {
+                        (y, sup.property, x)
+                    } else {
+                        (x, sup.property, y)
+                    };
+                    changed |= chase.add_edge(edge);
+                }
+            }
+            for (g, &(left, role, filler)) in tbox.generating.iter().enumerate() {
+                for &x in &reps {
+                    if chase.depth[x] < max_depth
+                        && !generated.contains(&(x, g))
+                        && chase.holds(x, left)
+                    {
+                        generated.insert((x, g));
+                        let n = chase.depth.len();
+                        chase.depth.push(chase.depth[x] + 1);
+                        chase.rep.push(n);
+                        chase.add_edge(if role.inverse {
+                            (n, role.property, x)
+                        } else {
+                            (x, role.property, n)
+                        });
+                        if let Some(c) = filler {
+                            chase.types.insert((n, c));
+                        }
+                        changed = true;
+                    }
+                }
+            }
+            if chase.depth.len() > max_elements || chase.edges.len() > MAX_EDGES {
+                return None;
+            }
+            if !changed {
+                return Some(chase);
+            }
+        }
+    }
+
+    /// The query's answers on the individuals (empty tuple for a boolean query that holds).
+    /// Each connected part of the query is matched on its own (its answer variables on
+    /// individuals only; a part without them until its first match), and the parts'
+    /// answers combined.
+    fn answers(&self, query: &Query) -> BTreeSet<Vec<usize>> {
+        let mut by_property: HashMap<usize, Vec<(usize, usize)>> = HashMap::new();
+        for &(x, p, y) in &self.edges {
+            by_property.entry(p).or_default().push((x, y));
+        }
+        let mut combined: Vec<HashMap<usize, usize>> = vec![HashMap::new()];
+        for part in parts(query) {
+            let answers: Vec<usize> = query
+                .answers
+                .iter()
+                .copied()
+                .filter(|v| part.iter().any(|a| atom_vars(a).contains(v)))
+                .collect();
+            let sub = Query {
+                atoms: part,
+                vars: query.vars,
+                answers,
+            };
+            let mut found = BTreeSet::new();
+            let mut assignment = vec![None; query.vars];
+            self.matches(&sub, &by_property, 0, &mut assignment, &mut found);
+            let names = &sub.answers;
+            combined = combined
+                .into_iter()
+                .flat_map(|row| {
+                    found.iter().map(move |tuple| {
+                        let mut row = row.clone();
+                        row.extend(names.iter().copied().zip(tuple.iter().copied()));
+                        row
+                    })
+                })
+                .collect();
+        }
+        combined
+            .into_iter()
+            .map(|row| query.answers.iter().map(|v| row[v]).collect())
+            .collect()
+    }
+
+    /// Matches the atoms from `at` on; true once a part without answer variables matched.
+    fn matches(
+        &self,
+        query: &Query,
+        by_property: &HashMap<usize, Vec<(usize, usize)>>,
+        at: usize,
+        assignment: &mut Vec<Option<usize>>,
+        out: &mut BTreeSet<Vec<usize>>,
+    ) -> bool {
+        if at == query.atoms.len() {
+            out.insert(
+                query
+                    .answers
+                    .iter()
+                    .map(|&v| assignment[v].expect("answer variables are bound"))
+                    .collect(),
+            );
+            return query.answers.is_empty();
+        }
+        let value = |t: T, assignment: &[Option<usize>]| match t {
+            T::Ind(i) => Some(self.find(i)),
+            T::Var(v) => assignment[v],
+        };
+        let answer = |v: usize| query.answers.contains(&v);
+        let bind = |t: T, x: usize, assignment: &mut Vec<Option<usize>>| -> Option<Option<usize>> {
+            match t {
+                T::Ind(i) => (self.find(i) == x).then_some(None),
+                T::Var(v) => match assignment[v] {
+                    Some(y) => (y == x).then_some(None),
+                    None if answer(v) && x >= INDIVIDUALS => None,
+                    None => {
+                        assignment[v] = Some(x);
+                        Some(Some(v))
+                    }
+                },
+            }
+        };
+        match query.atoms[at] {
+            QAtom::Class(t, c) => {
+                let candidates: Vec<usize> = match value(t, assignment) {
+                    Some(x) => vec![x],
+                    None => (0..self.depth.len()).collect(),
+                };
+                for x in candidates {
+                    if self.types.contains(&(x, c))
+                        && let Some(bound) = bind(t, x, assignment)
+                    {
+                        let done = self.matches(query, by_property, at + 1, assignment, out);
+                        if let Some(v) = bound {
+                            assignment[v] = None;
+                        }
+                        if done {
+                            return true;
+                        }
+                    }
+                }
+            }
+            QAtom::Role(s, p, o) => {
+                for &(x, y) in by_property.get(&p).into_iter().flatten() {
+                    let Some(first) = bind(s, x, assignment) else {
+                        continue;
+                    };
+                    let mut done = false;
+                    if let Some(second) = bind(o, y, assignment) {
+                        done = self.matches(query, by_property, at + 1, assignment, out);
+                        if let Some(v) = second {
+                            assignment[v] = None;
+                        }
+                    }
+                    if let Some(v) = first {
+                        assignment[v] = None;
+                    }
+                    if done {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+}
+
+fn atom_vars(atom: &QAtom) -> Vec<usize> {
+    let terms = match atom {
+        QAtom::Class(t, _) => vec![*t],
+        QAtom::Role(s, _, o) => vec![*s, *o],
+    };
+    terms
+        .into_iter()
+        .filter_map(|t| match t {
+            T::Var(v) => Some(v),
+            T::Ind(_) => None,
+        })
+        .collect()
+}
+
+/// The query's atoms in parts connected through variables, each in an order where every
+/// atom after the first shares a variable with one before it.
+fn parts(query: &Query) -> Vec<Vec<QAtom>> {
+    let mut left: Vec<QAtom> = query.atoms.clone();
+    let mut out = Vec::new();
+    while !left.is_empty() {
+        let mut part = vec![left.remove(0)];
+        let mut vars: HashSet<usize> = atom_vars(&part[0]).into_iter().collect();
+        while let Some(at) = left
+            .iter()
+            .position(|a| atom_vars(a).iter().any(|v| vars.contains(v)))
+        {
+            let atom = left.remove(at);
+            vars.extend(atom_vars(&atom));
+            part.push(atom);
+        }
+        out.push(part);
+    }
+    out
+}
+
+/// The rows of a query's TSV results, as tuples of individuals (`k` for the boolean form).
+fn store_rows(store: &StoreService, query: &str) -> Vec<Vec<usize>> {
+    store_answer(store, query).0
+}
+
+/// [`store_rows`], and whether the store says they are complete (with its reasons).
+/// What the rewriting did for a query.
+fn store_report(store: &StoreService, query: &str) -> Option<nrese_sparql::ql::QlReport> {
+    let mut request = SparqlQueryRequest::all(query);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    store.execute_query(&request).ok()?.ql
+}
+
+fn store_answer(store: &StoreService, query: &str) -> (Vec<Vec<usize>>, Completeness) {
+    let mut request = SparqlQueryRequest::all(query);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    let result = store
+        .execute_query(&request)
+        .unwrap_or_else(|e| panic!("{query}: {e}"));
+    let completeness = result
+        .ql
+        .map(|report| report.completeness)
+        .unwrap_or_default();
+    let text = String::from_utf8(result.payload).unwrap();
+    let rows = text
+        .lines()
+        .skip(1)
+        .map(|line| {
+            line.split('\t')
+                .filter(|cell| cell.starts_with('<'))
+                .map(|cell| {
+                    let name = cell.trim_matches(['<', '>']).trim_start_matches(E);
+                    name.trim_start_matches('a').parse().unwrap_or_else(|_| {
+                        panic!("{query}: an answer that isn't an individual: {cell}")
+                    })
+                })
+                .collect()
+        })
+        .collect();
+    (rows, completeness)
+}
+
+pub(crate) fn store(
+    turtle: &str,
+    dir: &std::path::Path,
+    ruleset: Ruleset,
+    ql: bool,
+) -> StoreService {
+    let file = dir.join("case.ttl");
+    std::fs::write(&file, turtle).unwrap();
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: if ql {
+            nrese_store::QlRewritingMode::On
+        } else {
+            nrese_store::QlRewritingMode::Off
+        },
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    store
+        .bulk_load(&BulkLoadRequest {
+            files: vec![file],
+            replace: false,
+            graph: GraphTarget::DefaultGraph,
+            invalid: Some(nrese_store::InvalidStatements::Strict),
+        })
+        .unwrap();
+    store.rematerialise(ruleset).unwrap();
+    store
+}
+
+#[test]
+fn rewritten_answers_are_the_certain_answers_of_random_ql_cases() {
+    let cases: usize = std::env::var("NRESE_QL_CASES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(150);
+    let dir = tempfile::tempdir().unwrap();
+    let seed = std::env::var("NRESE_QL_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x9e37_79b9_7f4a_7c15);
+    let mut rng = Rng(seed);
+    let (mut checked, mut skipped, mut gained) = (0, 0, 0);
+    // Witnesses the data had wherever they fold (not folded, design §3).
+    let mut realised = 0;
+    for case in 0..cases {
+        let tbox = random_tbox(&mut rng);
+        let mut types = Vec::new();
+        let mut edges = Vec::new();
+        let mut data = Vec::new();
+        for _ in 0..1 + rng.below(5) {
+            if rng.chance(50) {
+                let (a, c) = (rng.below(INDIVIDUALS), rng.below(CLASSES));
+                types.push((a, c));
+                data.push(format!(":a{a} a :C{c} ."));
+            } else {
+                let (a, p, b) = (
+                    rng.below(INDIVIDUALS),
+                    rng.below(PROPERTIES),
+                    rng.below(INDIVIDUALS),
+                );
+                edges.push((a, p, b));
+                data.push(format!(":a{a} :P{p} :a{b} ."));
+            }
+        }
+        let queries: Vec<Query> = (0..4).map(|_| random_query(&mut rng)).collect();
+        let kinds: HashSet<(Role, Option<usize>)> =
+            tbox.generating.iter().map(|&(_, r, f)| (r, f)).collect();
+        let max_vars = queries.iter().map(|q| q.vars).max().unwrap_or(1);
+        let Some(chase) = Chase::run(
+            &tbox,
+            &Extras::default(),
+            &types,
+            &edges,
+            kinds.len() + max_vars + 1,
+            20_000,
+        ) else {
+            skipped += 1;
+            continue;
+        };
+        let ruleset = if case % 2 == 0 {
+            Ruleset::Owl2Ql
+        } else {
+            Ruleset::Owl2Rl
+        };
+        let turtle = format!(
+            "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             {}\n{}",
+            tbox.turtle.join("\n"),
+            data.join("\n")
+        );
+        let with = store(&turtle, dir.path(), ruleset, true);
+        let without = store(&turtle, dir.path(), ruleset, false);
+        for query in &queries {
+            let certain = chase.answers(query);
+            realised += store_report(&with, &query.sparql(false)).map_or(0, |r| r.realised);
+            let (rows, completeness) = store_answer(&with, &query.sparql(true));
+            let distinct: BTreeSet<Vec<usize>> = rows.into_iter().collect();
+            // Pure QL: nothing the rewriting doesn't follow.
+            assert!(
+                completeness.complete,
+                "case {case}: {completeness:?}\n{turtle}\n{}",
+                query.sparql(true)
+            );
+            assert_eq!(
+                distinct,
+                certain,
+                "case {case} ({}):\n{turtle}\n{}",
+                ruleset.name(),
+                query.sparql(true)
+            );
+            // Bags: the materialised rows, and each further answer once.
+            let bag = store_rows(&with, &query.sparql(false));
+            let plain = store_rows(&without, &query.sparql(false));
+            let plain_set: BTreeSet<Vec<usize>> = plain.iter().cloned().collect();
+            let added = certain.difference(&plain_set).count();
+            let mut expected = plain.clone();
+            expected.extend(certain.difference(&plain_set).cloned());
+            let mut bag_sorted = bag.clone();
+            bag_sorted.sort();
+            expected.sort();
+            if query.answers.is_empty() {
+                // A boolean query: one row, materialised or not.
+                assert_eq!(
+                    bag_sorted.is_empty(),
+                    certain.is_empty(),
+                    "case {case}: {}",
+                    query.sparql(false)
+                );
+            } else {
+                assert_eq!(
+                    bag_sorted,
+                    expected,
+                    "case {case} ({}):\n{turtle}\n{}",
+                    ruleset.name(),
+                    query.sparql(false)
+                );
+            }
+            gained += added;
+            checked += 1;
+        }
+    }
+    eprintln!(
+        "QL differential: {checked} queries checked, {gained} answers only through the rewriting, {realised} witnesses the data had (not folded), {skipped} cases skipped (chase too large)"
+    );
+    assert!(
+        realised > 0,
+        "no witness the data had: the check went untested"
+    );
+    assert!(checked >= cases * 3, "too many cases skipped: {skipped}");
+    assert!(gained > 0, "no case exercised the rewriting");
+}
+
+#[test]
+fn mixed_ontologies_answer_soundly_and_say_when_they_may_miss() {
+    let cases: usize = std::env::var("NRESE_QL_CASES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(150);
+    let dir = tempfile::tempdir().unwrap();
+    let seed = std::env::var("NRESE_QL_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x2545_f491_4f6c_dd1d);
+    let mut rng = Rng(seed);
+    let (mut checked, mut skipped) = (0, 0);
+    // Queries that missed answers (all flagged), flagged ones that missed none, complete ones.
+    let (mut missed, mut cautious, mut complete) = (0, 0, 0);
+    // The misses by the hazards their reasons name.
+    let mut by_hazard: std::collections::BTreeMap<&'static str, usize> = Default::default();
+    for case in 0..cases {
+        let tbox = random_tbox(&mut rng);
+        let roles: Vec<usize> = tbox.generating.iter().map(|g| g.1.property).collect();
+        let extras = random_extras(&mut rng, &roles);
+        let mut types = Vec::new();
+        let mut edges = Vec::new();
+        let mut data = Vec::new();
+        for _ in 0..1 + rng.below(8) {
+            if rng.chance(50) {
+                let (a, c) = (rng.below(INDIVIDUALS), rng.below(CLASSES));
+                types.push((a, c));
+                data.push(format!(":a{a} a :C{c} ."));
+            } else {
+                let (a, p, b) = (
+                    rng.below(INDIVIDUALS),
+                    rng.below(PROPERTIES),
+                    rng.below(INDIVIDUALS),
+                );
+                edges.push((a, p, b));
+                data.push(format!(":a{a} :P{p} :a{b} ."));
+            }
+        }
+        let queries: Vec<Query> = (0..4).map(|_| random_query(&mut rng)).collect();
+        let kinds: HashSet<(Role, Option<usize>)> =
+            tbox.generating.iter().map(|&(_, r, f)| (r, f)).collect();
+        let max_vars = queries.iter().map(|q| q.vars).max().unwrap_or(1);
+        let Some(chase) = Chase::run(
+            &tbox,
+            &extras,
+            &types,
+            &edges,
+            kinds.len() + max_vars + 2,
+            5_000,
+        ) else {
+            skipped += 1;
+            continue;
+        };
+        let turtle = format!(
+            "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             {}\n{}\n{}",
+            tbox.turtle.join("\n"),
+            extras.turtle.join("\n"),
+            data.join("\n")
+        );
+        let store = store(&turtle, dir.path(), Ruleset::Owl2Rl, true);
+        for query in &queries {
+            let certain = chase.named_answers(query);
+            let (rows, completeness) = store_answer(&store, &query.sparql(true));
+            let answered: BTreeSet<Vec<usize>> = rows.into_iter().collect();
+            let context = || {
+                format!(
+                    "case {case}:\n{turtle}\n{}\n{completeness:?}",
+                    query.sparql(true)
+                )
+            };
+            // Sound: every answer is certain.
+            let wrong: Vec<_> = answered.difference(&certain).collect();
+            assert!(
+                wrong.is_empty(),
+                "answers that aren't certain {wrong:?}: {}",
+                context()
+            );
+            // Never silent: a miss says so.
+            let misses = certain.difference(&answered).count();
+            match (misses, completeness.complete) {
+                (0, true) => complete += 1,
+                (0, false) => cautious += 1,
+                (_, false) => {
+                    missed += 1;
+                    for kind in hazard_kinds(&completeness) {
+                        *by_hazard.entry(kind).or_default() += 1;
+                    }
+                }
+                (_, true) => {
+                    panic!("{misses} answers missed without saying so: {}", context())
+                }
+            }
+            checked += 1;
+        }
+    }
+    eprintln!(
+        "QL mixed: {checked} queries checked, {skipped} cases skipped (chase too large); \
+         {missed} missed answers and said sound-only, {cautious} said sound-only and missed \
+         none, {complete} complete; the misses by hazard: {by_hazard:?}"
+    );
+    assert!(checked >= cases * 3, "too many cases skipped: {skipped}");
+    assert!(
+        missed > 0,
+        "no case missed an answer: the flag went untested"
+    );
+}
+
+/// The kinds of hazard a status's reasons name.
+fn hazard_kinds(completeness: &Completeness) -> Vec<&'static str> {
+    let kinds = [
+        ("is transitive", "transitive"),
+        ("property chain", "chain"),
+        ("functional", "functional"),
+        ("on the left", "left"),
+        ("bound", "bound"),
+    ];
+    kinds
+        .iter()
+        .filter(|(text, _)| completeness.reasons.iter().any(|r| r.text.contains(text)))
+        .map(|&(_, kind)| kind)
+        .collect()
+}
+
+/// `owl:Thing` on the left of an OWL 2 QL axiom (OWL 2 Profiles §3.2.3 allows any class
+/// there): every individual is in its right side (OWL 2 Direct Semantics §2.3.1), and the
+/// domain is never empty. `⊤ ⊑ A` with no data must answer
+/// `ASK { ?x a :A }` true.
+///
+/// Rows (expected answer first, then the status):
+/// - `⊤ ⊑ A`, no data: `ASK { ?x a :A }` is `true`;
+/// - `⊤ ⊑ ∃P1.⊤`, no data: `ASK { ?x :P1 ?y }` is `true`;
+/// - the same two with a constant no statement has (`:zzz`, an individual all the same):
+///   `ASK { :zzz a :A }` and `ASK { :zzz :P1 ?y }` are `true`;
+/// - guard: `⊤ ⊑ A`: `ASK { ?x a :Zzz }`, a class no axiom names, is `false`, complete;
+/// - `⊤ ⊑ A`, `P0(a0, a1)`: `SELECT ?x { ?x :P0 ?y . ?y a :A }` is `{a0}`, complete;
+/// - `⊤ ⊑ A`, `P0(a0, a1)`: `SELECT ?x { ?x a :A }` has the certain answers `{a0, a1}`:
+///   what is returned is among them, and if it isn't all of them the status says so;
+/// - guard: `⊤ ⊑ A`, `D(a0, "3")`: `SELECT ?x { :a0 :D ?y . ?y a :A }` has no answer (a
+///   literal is in no class), complete (it passes on the base too).
+#[test]
+fn owl_thing_on_the_left_answers_for_every_individual() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> ."
+    );
+    let top = "owl:Thing rdfs:subClassOf :A .";
+    let some = "owl:Thing rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :P1 ;
+        owl:someValuesFrom owl:Thing ] .";
+    let edge = ":a0 :P0 :a1 .";
+    let data = ":D a owl:DatatypeProperty . :a0 :D \"3\" .";
+    let ask = |store: &StoreService, query: &str| -> (String, String) {
+        let result = store
+            .execute_query(&SparqlQueryRequest::all(query))
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let answer = String::from_utf8(result.payload).unwrap();
+        let answer = if answer.contains("true") {
+            "true"
+        } else {
+            "false"
+        };
+        let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+        (answer.to_owned(), status.to_owned())
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut wrong = Vec::new();
+    for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+        let name = ruleset.name();
+        let open = |extra: &str| store(&format!("{head}\n{extra}"), dir.path(), ruleset, true);
+        for (axiom, query) in [
+            (top, format!("ASK {{ ?x a <{E}A> }}")),
+            (some, format!("ASK {{ ?x <{E}P1> ?y }}")),
+            // A constant no statement has is an individual too.
+            (top, format!("ASK {{ <{E}zzz> a <{E}A> }}")),
+            (some, format!("ASK {{ <{E}zzz> <{E}P1> ?y }}")),
+        ] {
+            let (answer, status) = ask(&open(axiom), &query);
+            if answer != "true" {
+                wrong.push(format!("{name}, {query}: {answer}, {status}"));
+            }
+        }
+        // Guard: a class no axiom names has no member.
+        let unseen = format!("ASK {{ ?x a <{E}Zzz> }}");
+        let (answer, status) = ask(&open(top), &unseen);
+        if (answer.as_str(), status.as_str()) != ("false", "complete") {
+            wrong.push(format!("{name}, guard {unseen}: {answer}, {status}"));
+        }
+        let store_ = open(&format!("{top}\n{edge}"));
+        let through = format!("SELECT ?x {{ ?x <{E}P0> ?y . ?y a <{E}A> }}");
+        let (rows, status) = store_answer(&store_, &through);
+        if rows != [vec![0]] || status.as_str() != "complete" {
+            wrong.push(format!("{name}, {through}: {rows:?}, {}", status.as_str()));
+        }
+        let all = format!("SELECT ?x {{ ?x a <{E}A> }}");
+        let (rows, status) = store_answer(&store_, &all);
+        let rows: BTreeSet<Vec<usize>> = rows.into_iter().collect();
+        let certain = BTreeSet::from([vec![0], vec![1]]);
+        if !rows.is_subset(&certain) || (rows != certain && status.complete) {
+            wrong.push(format!("{name}, {all}: {rows:?}, {}", status.as_str()));
+        }
+        // Guard: a literal is in no class.
+        let store_ = open(&format!("{top}\n{data}"));
+        let literal = format!("SELECT ?y {{ <{E}a0> <{E}D> ?y . ?y a <{E}A> }}");
+        let result = store_
+            .execute_query(&SparqlQueryRequest::all(literal.as_str()))
+            .unwrap_or_else(|e| panic!("{literal}: {e}"));
+        let text = String::from_utf8(result.payload).unwrap();
+        let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+        if text.contains("\"3\"") || status != "complete" {
+            wrong.push(format!("{name}, guard {literal}: {text}, {status}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// The research review's case: existentials feeding a transitive role. `Engine ⊑
+/// ∃partOf.Car`, `Car ⊑ ∃partOf.Fleet`, `partOf` transitive, `e1 a Engine`; `SELECT ?x
+/// { ?x partOf ?f . ?f a Fleet }` has the certain answer `e1` (through two anonymous
+/// individuals and the transitive shortcut), which neither the RL closure nor the
+/// tree-witness rewriting over it finds. The answer must say `sound-only`, naming the
+/// transitive role; a miss without the flag fails. Here `C0`, `C1`, `C2` are Engine, Car
+/// and Fleet, `P0` is partOf, `a0` is e1.
+#[test]
+fn existentials_feeding_a_transitive_role_miss_with_the_flag() {
+    let (engine, car, fleet, part_of) = (0, 1, 2, 0);
+    let role = Role {
+        property: part_of,
+        inverse: false,
+    };
+    let tbox = Tbox {
+        generating: vec![
+            (Basic::Class(engine), role, Some(car)),
+            (Basic::Class(car), role, Some(fleet)),
+        ],
+        turtle: vec![
+            format!(
+                ":C{engine} rdfs:subClassOf {} .",
+                restriction(role, Some(car))
+            ),
+            format!(
+                ":C{car} rdfs:subClassOf {} .",
+                restriction(role, Some(fleet))
+            ),
+        ],
+        ..Tbox::default()
+    };
+    let extras = Extras {
+        chains: vec![(part_of, part_of, part_of)],
+        turtle: vec![format!(":P{part_of} a owl:TransitiveProperty .")],
+        ..Extras::default()
+    };
+    let query = Query {
+        atoms: vec![
+            QAtom::Role(T::Var(0), part_of, T::Var(1)),
+            QAtom::Class(T::Var(1), fleet),
+        ],
+        vars: 2,
+        answers: vec![0],
+    };
+    let chase = Chase::run(&tbox, &extras, &[(0, engine)], &[], 6, 1_000).expect("a small chase");
+    let certain = chase.named_answers(&query);
+    assert_eq!(certain, BTreeSet::from([vec![0]]), "e1 is a certain answer");
+    let turtle = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         {}\n{}\n:a0 a :C{engine} .",
+        tbox.turtle.join("\n"),
+        extras.turtle.join("\n")
+    );
+    let dir = tempfile::tempdir().unwrap();
+    for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
+        let store = store(&turtle, dir.path(), ruleset, true);
+        let (rows, completeness) = store_answer(&store, &query.sparql(true));
+        // Repeated: from the result cache, with the status a fresh run reports.
+        let hits = store.query_cache_stats().hits;
+        let again = store_answer(&store, &query.sparql(true));
+        assert_eq!((&again.0, &again.1), (&rows, &completeness));
+        assert!(store.query_cache_stats().hits > hits, "{}", ruleset.name());
+        let answered: BTreeSet<Vec<usize>> = rows.into_iter().collect();
+        assert!(
+            answered.is_subset(&certain),
+            "{}: {answered:?}",
+            ruleset.name()
+        );
+        if answered != certain {
+            assert!(
+                !completeness.complete,
+                "{}: e1 missed without saying so",
+                ruleset.name()
+            );
+        }
+        // Today it is missed, and said so, naming the transitive role.
+        assert!(answered.is_empty(), "{}: {answered:?}", ruleset.name());
+        assert_eq!(completeness.as_str(), "sound-only", "{}", ruleset.name());
+        assert!(
+            completeness
+                .reasons
+                .iter()
+                .any(|r| r.source == "ql" && r.text.contains("P0> is transitive")),
+            "{}: {completeness:?}",
+            ruleset.name()
+        );
+    }
+}
+
+/// An existential under a universal on the right makes anonymous individuals no
+/// generating axiom types (I24b): with `C ⊑ ∀R.(∃S.A)`, `c : C` and `R(c, x)`, `x` has an
+/// `S`-successor in `A` (OWL 2 Direct Semantics), so `ASK { :x :S ?y . ?y a :A }` and
+/// `ASK { ?y a :A }` are entailed. `∀` on the right is outside OWL 2 QL (OWL 2 Profiles
+/// §3.2), so neither closure need find them; then the status the store reports must not be
+/// `complete` (docs/design/ql-rewriting.md §7).
+#[test]
+fn existentials_under_a_universal_are_answered_or_reported() {
+    let turtle = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom
+             [ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :A ] ] .
+         :c a :C ; :R :x ."
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let mut wrong = Vec::new();
+    for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
+        let store = store(&turtle, dir.path(), ruleset, true);
+        for query in [
+            format!("ASK {{ <{E}x> <{E}S> ?y . ?y a <{E}A> }}"),
+            format!("ASK {{ ?y a <{E}A> }}"),
+        ] {
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap_or_else(|e| panic!("{query}: {e}"));
+            let answer = String::from_utf8(result.payload).unwrap();
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            if !answer.contains("true") && matches!(status, "complete" | "none") {
+                wrong.push(format!("{}, {query}: {answer}, {status}", ruleset.name()));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Existentials an axiom concludes where the TBox reads the axiom in part.
+/// Each case is entailed by the OWL 2 Direct Semantics (§2.2.3, §2.3.1). Each
+/// must be answered true, or reported as not `complete`, under owl2-rl and owl2-ql.
+/// - `(A ⊓ B) ⊑ ∃S.D` with `c : A, B`: `c` has an `S`-successor in `D`.
+/// - `(A ⊓ B) ⊑ ∀R.∃S.D` with `R(c, x)`: `x` has one.
+/// - `DisjointUnion(C, ∃R.A, ∃R.B)` with `c : C`: `c` has an `R`-successor, though neither
+///   branch is certain.
+/// - Disjointness concludes a part's complement: with `c : A` and `A`
+///   disjoint from `≤ 0 S.D`, `c` is in `≥ 1 S.D`, so it has an `S`-successor in `D`. The
+///   disjointness can come from a disjoint union, `owl:disjointWith` or
+///   `owl:AllDisjointClasses`. The same holds where `A` is disjoint from `∀S.¬D`.
+#[test]
+fn existentials_of_axioms_the_tbox_reads_in_part_are_answered_or_reported() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
+    );
+    let some = "[ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :D ]";
+    let none = "[ a owl:Restriction ; owl:onProperty :S ; owl:onClass :D ;
+                  owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ]";
+    let all_not = "[ a owl:Restriction ; owl:onProperty :S ;
+                     owl:allValuesFrom [ a owl:Class ; owl:complementOf :D ] ]";
+    let successor = vec![format!("ASK {{ <{E}c> <{E}S> ?y . ?y a <{E}D> }}")];
+    let cases = [
+        (
+            format!(
+                "{head}[ owl:intersectionOf ( :A :B ) ] rdfs:subClassOf {some} .
+                 :c a :A, :B ."
+            ),
+            vec![
+                format!("ASK {{ <{E}c> <{E}S> ?y . ?y a <{E}D> }}"),
+                format!("ASK {{ ?y a <{E}D> }}"),
+            ],
+        ),
+        (
+            format!(
+                "{head}[ owl:intersectionOf ( :A :B ) ] rdfs:subClassOf
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom {some} ] .
+                 :c a :A, :B ; :R :x ."
+            ),
+            vec![
+                format!("ASK {{ <{E}x> <{E}S> ?y . ?y a <{E}D> }}"),
+                format!("ASK {{ ?y a <{E}D> }}"),
+            ],
+        ),
+        (
+            format!(
+                "{head}:C a owl:Class ; owl:disjointUnionOf (
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:someValuesFrom :A ]
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:someValuesFrom :B ] ) .
+                 :c a :C ."
+            ),
+            vec![format!("ASK {{ <{E}c> <{E}R> ?y }}")],
+        ),
+        (
+            format!(
+                "{head}:C a owl:Class ; owl:disjointUnionOf ( :A {none} ) .
+                 :c a :A ."
+            ),
+            successor.clone(),
+        ),
+        (
+            format!(
+                "{head}:C a owl:Class ; owl:disjointUnionOf ( :A {all_not} ) .
+                 :c a :A ."
+            ),
+            successor.clone(),
+        ),
+        (
+            format!(
+                "{head}:A owl:disjointWith {none} .
+                 :c a :A ."
+            ),
+            successor.clone(),
+        ),
+        (
+            format!(
+                "{head}[ a owl:AllDisjointClasses ; owl:members ( :A {none} ) ] .
+                 :c a :A ."
+            ),
+            successor.clone(),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (n, (turtle, queries)) in cases.iter().enumerate() {
+        for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            for query in queries {
+                let result = store
+                    .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                    .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
+                let answer = String::from_utf8(result.payload).unwrap();
+                let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+                if !answer.contains("true") && matches!(status, "complete" | "none") {
+                    wrong.push(format!(
+                        "case {n}, {}, {query}: {answer}, {status}",
+                        ruleset.name()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A bounded restriction forces an existential on a successor that exists (I24b):
+/// `C ⊑ ¬(≥ 1 R.¬∃S.D)`
+/// and `C ⊑ (= 0 R.¬∃S.D)` are both `C ⊑ ∀R.∃S.D` (OWL 2 Direct Semantics §2.2.3): with
+/// `c : C` and `R(c, x)`, `x` has an `S`-successor in `D`, so both queries are entailed.
+/// Each must be answered true, or reported as not `complete`, under owl2-rl and owl2-ql.
+#[test]
+fn existentials_bounded_restrictions_force_are_answered_or_reported() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
+    );
+    let not_x = "[ a owl:Class ; owl:complementOf
+                   [ a owl:Restriction ; owl:onProperty :S ; owl:someValuesFrom :D ] ]";
+    let cases = [
+        format!(
+            "{head}:C rdfs:subClassOf [ a owl:Class ; owl:complementOf
+                 [ a owl:Restriction ; owl:onProperty :R ;
+                   owl:minQualifiedCardinality \"1\"^^xsd:nonNegativeInteger ; owl:onClass {not_x} ] ] .
+             :c a :C ; :R :x ."
+        ),
+        format!(
+            "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                 owl:qualifiedCardinality \"0\"^^xsd:nonNegativeInteger ; owl:onClass {not_x} ] .
+             :c a :C ; :R :x ."
+        ),
+    ];
+    let queries = [
+        format!("ASK {{ <{E}x> <{E}S> ?y . ?y a <{E}D> }}"),
+        format!("ASK {{ ?y a <{E}D> }}"),
+    ];
+    let mut wrong = Vec::new();
+    for (n, turtle) in cases.iter().enumerate() {
+        for ruleset in [Ruleset::Owl2Rl, Ruleset::Owl2Ql] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            for query in &queries {
+                let result = store
+                    .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                    .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
+                let answer = String::from_utf8(result.payload).unwrap();
+                let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+                if !answer.contains("true") && matches!(status, "complete" | "none") {
+                    wrong.push(format!(
+                        "case {n}, {}, {query}: {answer}, {status}",
+                        ruleset.name()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A `complete` status under a regime is claimed only where every axiom an answer's terms
+/// can meet is in that regime's profile, or covered by a hazard (I24c; decided on
+/// 8 Nov). The profile's rules are complete only for its ontologies (W3C OWL 2
+/// Profiles, theorem PR1). Each `true` below is entailed under the OWL 2 Direct Semantics.
+///
+/// Answered true, or not reported `complete`:
+/// - W-N1: `C ⊑ ∀R.Self(S)` with `c : C`, `R(c, x)`: `S(x, x)`.
+/// - W-N2: `C ⊑ ∀R.{a}` with `c : C`, `R(c, x)`, `a : D`: `x = a`, so `x : D`.
+/// - Under owl2-ql, `Person ⊓ Employed ⊑ Worker ⊑ Taxpayer` with `x : Person, Employed`:
+///   `x : Taxpayer`, on a superclass of the uncovered conclusion.
+/// - `C ⊑ ∃R.Self`, `R` with domain `D`, `D ⊓ F ⊑ G`, with `x : C, F`: `x : G`. The chain
+///   runs through two axioms in the RL profile, which RL's rules apply only to facts the
+///   closure has.
+/// - `C ⊑ {a}` with `c : C`, `a : D`: `c = a`, so `c : D`.
+/// - F2: `C ⊑ ¬¬D` with `c : C`: `c : D`. Neither the TBox nor the closure removes the
+///   double complement.
+/// - F2: `C ⊑ ¬(≥ 2 R)` with `c : C`, `R(c, x)`, `R(c, y)`, `x : D`: `x = y`, so `y : D`.
+/// - `C ⊑ ≤ 0 R.¬D` with `R(c, x)`: `x : D`. With `≤ 0 R.¬{a}` and `a : D`:
+///   `x = a`, so `x : D`.
+/// - `C ⊑ ≤ 0 R.¬∃S.(∀S⁻.{a})` with `R(c, x)`, `a : D`: `x = a`, so `x : D`.
+/// - `C ⊑ ≤ 0 R.¬∃S.({a} ⊓ {b})` with `R(c, x)`, `a : D`: `x`'s
+///   `S`-successor is `a` and `b`, so `b : D`.
+/// - DL44: a reflexive `p2` and a named `a0`: `p2(a0, a0)` (Direct Semantics §2.3.2,
+///   Table 6). RL's rules make no such loop (it is outside RL, Profiles §4.2.5); QL's do.
+/// - The same with `p2` of domain `D`: `a0 : D`, a consequence of the missing loop.
+/// - D16-492 (seed 700169): `≥ 1 R.(≤ 0 R.D) ⊑ ⊥` with `R(a, a)`: `a` has an anonymous
+///   `R`-successor in `D`. `≥ 2 R ⊑ ⊥` with `R(a, b)`, `R(a, c)`, `b : C`:
+///   `b = c`, so `c : C`; `¬{b} ⊑ ⊥` with `a : C`: `a = b`, so `b : C`.
+/// - D16-492: a reflexive `R` and `A ⊑ ∀R.B` with `a : A`: `R(a, a)`, so
+///   `a : B` (RL misses the loop). `D ⊑ ¬¬B` and `A ⊑ ≤ 1 R.B` with `a : A`, `R(a, b)`,
+///   `R(a, c)`, `b : D`, `c : D`, `b : E`: `b = c`, so `c : E`.
+/// - D16-492: `A ⊑ ∃R.C` and `A ⊑ ∀R.B` with `a : A`: `a`'s anonymous
+///   `R`-successor is a `B`, so some individual is.
+///
+/// Answered false, or reported `unsound`: under DL44's schema, `NOT EXISTS` of the loop.
+///
+/// Guards, each with its specified answer, compared first:
+/// - `x : Person` and `x : Employed` of the third case, terms of the same axiom that no
+///   uncovered conclusion reaches: `x`, complete (owl2-ql).
+/// - After `A ⊓ B ⊑ C` and `C ⊑ ∀R.D`, the edges of `R`, which the universal
+///   adds none of: `(c, z)`, complete (owl2-ql).
+/// - `C ⊑ ≥ 0 S.(∀T.{a})` concludes nothing: `Z` is `z`, complete (both).
+/// - `C ⊑ ∀R.¬{a}`, `C ⊑ = 0 R.{a}` and `C ⊑ ≤ 0 R.¬∃S.{a}`: `Z` is
+///   `z`. They equate nobody, but equality is fail-closed for any nominal, so their
+///   status isn't required.
+/// - DL44 under owl2-ql, whose rules make the loop: the `p2` edge `(a0, a0)`, complete.
+/// - A reflexive `p2` beside an unrelated `r` edge: `(a0, a1)`, complete (both).
+#[test]
+fn axioms_outside_the_profile_are_answered_or_reported() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
+    );
+    let cases = [
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom
+                     [ a owl:Restriction ; owl:onProperty :S ; owl:hasSelf true ] ] .
+                 :c a :C ; :R :x ."
+            ),
+            format!("ASK {{ <{E}x> <{E}S> <{E}x> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:allValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] .
+                 :c a :C ; :R :x . :a a :D ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}D> }}"),
+        ),
+        (
+            format!(
+                "{head}[ owl:intersectionOf ( :Person :Employed ) ] rdfs:subClassOf :Worker .
+                 :Worker rdfs:subClassOf :Taxpayer .
+                 :x a :Person, :Employed ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}Taxpayer> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:hasSelf true ] .
+                 :R rdfs:domain :D .
+                 [ owl:intersectionOf ( :D :F ) ] rdfs:subClassOf :G .
+                 :x a :C, :F ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}G> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Class ; owl:oneOf ( :a ) ] .
+                 :c a :C . :a a :D ."
+            ),
+            format!("ASK {{ <{E}c> a <{E}D> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ owl:complementOf [ owl:complementOf :D ] ] .
+                 :c a :C ."
+            ),
+            format!("ASK {{ <{E}c> a <{E}D> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ owl:complementOf [ a owl:Restriction ;
+                     owl:onProperty :R ; owl:minCardinality 2 ] ] .
+                 :c a :C ; :R :x , :y . :x a :D ."
+            ),
+            format!("ASK {{ <{E}y> a <{E}D> }}"),
+        ),
+        // `≤ 0 R.F` puts every successor outside `F`.
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ owl:complementOf :D ] ] .
+                 :c a :C ; :R :x ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}D> }}"),
+        ),
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ owl:complementOf [ a owl:Class ; owl:oneOf ( :a ) ] ] ] .
+                 :c a :C ; :R :x . :a a :D ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}D> }}"),
+        ),
+        // `≤ 0 R.¬∃S.(∀S⁻.{a})` gives `x` an `S`-successor whose every
+        // `S`-predecessor, `x` among them, is `a`.
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ owl:complementOf [ a owl:Restriction ; owl:onProperty :S ;
+                         owl:someValuesFrom [ a owl:Restriction ; owl:onProperty [ owl:inverseOf :S ] ;
+                             owl:allValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] ] ] ] .
+                 :c a :C ; :R :x . :a a :D ."
+            ),
+            format!("ASK {{ <{E}x> a <{E}D> }}"),
+        ),
+        // `x`'s required `S`-successor is both `a` and `b`, so `a = b`
+        // and `b : D`.
+        (
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ owl:complementOf [ a owl:Restriction ; owl:onProperty :S ;
+                         owl:someValuesFrom [ owl:intersectionOf (
+                             [ owl:oneOf ( :a ) ] [ owl:oneOf ( :b ) ] ) ] ] ] ] .
+                 :c a :C ; :R :x . :a a :D ."
+            ),
+            format!("ASK {{ <{E}b> a <{E}D> }}"),
+        ),
+        // DL44 (base 44, case 99), reduced to its two statements.
+        (
+            format!("{head}:p2 a owl:ReflexiveProperty . :a0 a owl:NamedIndividual ."),
+            format!("ASK {{ <{E}a0> <{E}p2> <{E}a0> }}"),
+        ),
+        (
+            format!(
+                "{head}:p2 a owl:ReflexiveProperty ; rdfs:domain :D . :a0 a owl:NamedIndividual ."
+            ),
+            format!("ASK {{ <{E}a0> a <{E}D> }}"),
+        ),
+        // D16-492 (seed 700169, case 53): `≥ 1 R.(≤ 0 R.D) ⊑ ⊥` is `⊤ ⊑ ∀R.∃R.D`, so `a`,
+        // its own `R`-successor, has an `R`-successor in `D`.
+        (
+            format!(
+                "{head}[ a owl:Restriction ; owl:onProperty :R ;
+                     owl:minQualifiedCardinality \"1\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass [ a owl:Restriction ; owl:onProperty :R ;
+                         owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                         owl:onClass :D ] ] rdfs:subClassOf owl:Nothing .
+                 :a :R :a ."
+            ),
+            format!("ASK {{ <{E}a> <{E}R> ?y . ?y a <{E}D> }}"),
+        ),
+        // `≥ 2 R ⊑ ⊥` makes `R` functional, so `b = c`.
+        (
+            format!(
+                "{head}[ a owl:Restriction ; owl:onProperty :R ; owl:minCardinality 2 ]
+                     rdfs:subClassOf owl:Nothing .
+                 :a :R :b , :c . :b a :C ."
+            ),
+            format!("ASK {{ <{E}c> a <{E}C> }}"),
+        ),
+        // `¬{b} ⊑ ⊥` is `⊤ ⊑ {b}`, so `a = b`.
+        (
+            format!(
+                "{head}[ owl:complementOf [ a owl:Class ; owl:oneOf ( :b ) ] ]
+                     rdfs:subClassOf owl:Nothing .
+                 :a a :C . :b a :B ."
+            ),
+            format!("ASK {{ <{E}b> a <{E}C> }}"),
+        ),
+        // `R(a, a)` from reflexivity, so `a : B`.
+        (
+            format!(
+                "{head}:R a owl:ReflexiveProperty .
+                 :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom :B ] .
+                 :a a :A ."
+            ),
+            format!("ASK {{ <{E}a> a <{E}B> }}"),
+        ),
+        // `b` and `c` are `B`s, so `a`'s two `R`-successors are
+        // one: `b = c`, and `c : E`.
+        (
+            format!(
+                "{head}:D rdfs:subClassOf [ owl:complementOf [ owl:complementOf :B ] ] .
+                 :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+                     owl:maxQualifiedCardinality \"1\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+                     owl:onClass :B ] .
+                 :a a :A ; :R :b , :c . :b a :D , :E . :c a :D ."
+            ),
+            format!("ASK {{ <{E}c> a <{E}E> }}"),
+        ),
+        // `a`'s anonymous `R`-successor is a `B`.
+        (
+            format!(
+                "{head}:A rdfs:subClassOf
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:someValuesFrom :C ] ,
+                     [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom :B ] .
+                 :a a :A ."
+            ),
+            format!("ASK {{ ?x a <{E}B> }}"),
+        ),
+    ];
+    // Not entailed: a missed loop must not certify `true` (sound-only is no cover).
+    let negated = [(
+        cases[11].0.clone(),
+        format!("ASK {{ FILTER NOT EXISTS {{ <{E}a0> <{E}p2> <{E}a0> }} }}"),
+    )];
+    let asks = cases
+        .iter()
+        .map(|c| (c, true))
+        .chain(negated.iter().map(|c| (c, false)));
+    let mut wrong = Vec::new();
+    for (n, ((turtle, query), entailed)) in asks.enumerate() {
+        for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
+            let answer = String::from_utf8(result.payload).unwrap();
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            let claimed = match entailed {
+                true => matches!(status, "complete" | "none"),
+                false => matches!(status, "complete" | "sound-only" | "none"),
+            };
+            if answer.contains("true") != entailed && claimed {
+                wrong.push(format!(
+                    "case {n}, {}, {query}: {answer}, {status}",
+                    ruleset.name()
+                ));
+            }
+        }
+    }
+    let universal = format!(
+        "{head}[ owl:intersectionOf ( :A :B ) ] rdfs:subClassOf :C .
+         :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ; owl:allValuesFrom :D ] .
+         :c a :A, :B ; :R :z ."
+    );
+    let not_a = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+             owl:allValuesFrom [ owl:complementOf [ a owl:Class ; owl:oneOf ( :a ) ] ] ] .
+         :c a :C ; :R :b . :z a :Z ."
+    );
+    // `= 0 R.{a}` keeps successors away from `a`, equating nobody.
+    let zero_a = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+             owl:qualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+             owl:onClass [ a owl:Class ; owl:oneOf ( :a ) ] ] .
+         :c a :C . :z a :Z ."
+    );
+    // `≤ 0 R.¬∃S.{a}` is `∀R.∃S.{a}`, an edge to `a`, equating nobody.
+    let edge_to_a = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ;
+             owl:maxQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+             owl:onClass [ owl:complementOf [ a owl:Restriction ; owl:onProperty :S ;
+                 owl:someValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] ] ] .
+         :c a :C ; :R :x . :z a :Z ."
+    );
+    // `≥ 0 S.F` holds of everything and requires no successor.
+    let at_least_zero = format!(
+        "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :S ;
+             owl:minQualifiedCardinality \"0\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ;
+             owl:onClass [ a owl:Restriction ; owl:onProperty :T ;
+                 owl:allValuesFrom [ a owl:Class ; owl:oneOf ( :a ) ] ] ] .
+         :c a :C . :z a :Z ."
+    );
+    let unrelated =
+        format!("{head}:p2 a owl:ReflexiveProperty . :a0 a owl:NamedIndividual ; :r :a1 .");
+    let both = vec![Ruleset::Owl2Ql, Ruleset::Owl2Rl];
+    let ql = vec![Ruleset::Owl2Ql];
+    let z_query = format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}");
+    let z = vec![format!("x={E}z")];
+    // Each guard's specified rows, compared before its status, and
+    // whether `complete` is required. The three nominal guards keep their
+    // answers only: equality is fail-closed for any nominal.
+    let guards = [
+        (
+            &cases[2].0,
+            ql.clone(),
+            format!("SELECT ?x WHERE {{ ?x a <{E}Person> }}"),
+            vec![format!("x={E}x")],
+            true,
+        ),
+        (
+            &cases[2].0,
+            ql.clone(),
+            format!("SELECT ?x WHERE {{ ?x a <{E}Employed> }}"),
+            vec![format!("x={E}x")],
+            true,
+        ),
+        (
+            &universal,
+            ql.clone(),
+            format!("SELECT ?x ?y WHERE {{ ?x <{E}R> ?y }}"),
+            vec![format!("x={E}c y={E}z")],
+            true,
+        ),
+        (
+            &cases[11].0,
+            ql,
+            format!("SELECT ?x ?y WHERE {{ ?x <{E}p2> ?y }}"),
+            vec![format!("x={E}a0 y={E}a0")],
+            true,
+        ),
+        (
+            &unrelated,
+            both.clone(),
+            format!("SELECT ?x ?y WHERE {{ ?x <{E}r> ?y }}"),
+            vec![format!("x={E}a0 y={E}a1")],
+            true,
+        ),
+        (&not_a, both.clone(), z_query.clone(), z.clone(), false),
+        (&zero_a, both.clone(), z_query.clone(), z.clone(), false),
+        (&edge_to_a, both.clone(), z_query.clone(), z.clone(), false),
+        (&at_least_zero, both, z_query, z, true),
+    ];
+    for (turtle, rulesets, query, expected, complete) in guards {
+        for ruleset in rulesets {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap();
+            let json: serde_json::Value = serde_json::from_slice(&result.payload).unwrap();
+            let mut rows: Vec<String> = json["results"]["bindings"]
+                .as_array()
+                .expect("bindings")
+                .iter()
+                .map(|row| {
+                    let mut cells: Vec<String> = row
+                        .as_object()
+                        .expect("a row")
+                        .iter()
+                        .map(|(var, v)| format!("{var}={}", v["value"].as_str().unwrap_or("")))
+                        .collect();
+                    cells.sort();
+                    cells.join(" ")
+                })
+                .collect();
+            rows.sort();
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            if rows != expected {
+                wrong.push(format!(
+                    "guard, {}, {query}: {rows:?}, expected {expected:?}",
+                    ruleset.name()
+                ));
+            } else if complete && !matches!(status, "complete" | "none") {
+                wrong.push(format!(
+                    "guard, {}, {query}: {status}, expected complete",
+                    ruleset.name()
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// What the store's reader passes to the mapping, and what the mapping drops, can't hide an
+/// answer behind a `complete` status (I24c-2). Each case under
+/// owl2-ql and owl2-rl, the QL rewriting on.
+///
+/// Answered true, or not reported `complete`:
+/// - `C ⊑ ∃d.integer[≥ 5]` with `c : C`: `c` has a `d` value. The data range's facets
+///   (`owl:onDatatype`, `owl:withRestrictions`, `xsd:minInclusive`) are vocabulary the
+///   mapping reads.
+/// - `c owl:sameAs e`, `e : D`: `c : D`. The QL closure has no equality rules.
+/// - Under owl2-ql, the same beside `rdf:type owl:sameAs :discarded`, which the
+///   mapping leaves out and which comes first in scan order.
+///
+/// With their exact rows, not reported `complete` (rows first). The mapping
+/// drops each structure, and a dropped axiom can't support the claim either way:
+/// - a malformed schema statement, a restriction without its filler: `C` is `c`;
+/// - restrictions asserted of `c` directly: an n-ary data restriction
+///   (`owl:onProperties`), and one with no property: `Z` is `z`.
+///
+/// With their exact rows, still `complete` (guards):
+/// - a restriction no individual is in, which says nothing: `Z` is `z`;
+/// - an irreflexive, asymmetric property, which the reader now reads and which adds no
+///   fact: the `p` edges are `c`'s.
+#[test]
+fn schema_the_reader_or_the_mapping_leaves_out_is_reported() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         @prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n"
+    );
+    let answered = [
+        (
+            format!(
+                "{head}:d a owl:DatatypeProperty .
+                 :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :d ;
+                     owl:someValuesFrom [ a rdfs:Datatype ; owl:onDatatype xsd:integer ;
+                         owl:withRestrictions ( [ xsd:minInclusive 5 ] ) ] ] .
+                 :c a :C ."
+            ),
+            format!("ASK {{ <{E}c> <{E}d> ?v }}"),
+        ),
+        (
+            format!("{head}:c owl:sameAs :e . :e a :D ."),
+            format!("ASK {{ <{E}c> a <{E}D> }}"),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (n, (turtle, query)) in answered.iter().enumerate() {
+        for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(turtle, dir.path(), ruleset, true);
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap_or_else(|e| panic!("case {n}, {query}: {e}"));
+            let answer = String::from_utf8(result.payload).unwrap();
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            if !answer.contains("true") && matches!(status, "complete" | "none") {
+                wrong.push(format!(
+                    "case {n}, {}, {query}: {answer}, {status}",
+                    ruleset.name()
+                ));
+            }
+        }
+    }
+    // Under owl2-ql: the reader's equality may not rest on one sampled
+    // statement. Here the first `owl:sameAs` in scan order is `rdf:type owl:sameAs
+    // :discarded`, which the mapping leaves out (a reserved name);
+    // `c = e` must still count.
+    let reserved_first = format!(
+        "{head}<http://www.w3.org/1999/02/22-rdf-syntax-ns#type> owl:sameAs :discarded .
+         :c owl:sameAs :e . :e a :D ."
+    );
+    let query = format!("ASK {{ <{E}c> a <{E}D> }}");
+    let dir = tempfile::tempdir().unwrap();
+    let reserved_store = store(&reserved_first, dir.path(), Ruleset::Owl2Ql, true);
+    // Its precondition: the first asserted `owl:sameAs` in the snapshot's
+    // scan, the one a reader sampling one statement took, is the reserved one.
+    {
+        use nrese_engine::{GraphSelector, QuadPattern, ReadModel};
+        use nrese_rdf::NamedNodeRef;
+        let snapshot = reserved_store.read_snapshot(None).unwrap();
+        let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+        let same_as = id("http://www.w3.org/2002/07/owl#sameAs").expect("owl:sameAs");
+        let first = snapshot
+            .quads_for_pattern_in(
+                ReadModel::Asserted,
+                &QuadPattern {
+                    subject: None,
+                    predicate: Some(same_as),
+                    object: None,
+                    graph: GraphSelector::Any,
+                },
+            )
+            .next()
+            .expect("an equality");
+        assert_eq!(
+            Some(first.subject),
+            id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+            "the reserved equality comes first in scan order"
+        );
+    }
+    let result = reserved_store
+        .execute_query(&SparqlQueryRequest::all(query.as_str()))
+        .unwrap();
+    let answer = String::from_utf8(result.payload).unwrap();
+    let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+    if !answer.contains("true") && matches!(status, "complete" | "none") {
+        wrong.push(format!(
+            "reserved sameAs first, owl2-ql, {query}: {answer}, {status}"
+        ));
+    }
+    // Each with its specified rows, compared before its status, and whether
+    // it must be `complete` (a guard) or must not be.
+    let z = format!("SELECT ?x WHERE {{ ?x a <{E}Z> }}");
+    let rows_cases = [
+        // A malformed schema statement, a restriction without its filler.
+        (
+            "malformed",
+            format!(
+                "{head}:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :R ] .
+                 :c a :C ."
+            ),
+            format!("SELECT ?x WHERE {{ ?x a <{E}C> }}"),
+            vec![format!("x={E}c")],
+            false,
+        ),
+        // Restrictions asserted of an individual directly, which the mapping
+        // can't read: an n-ary data restriction, and one with no property.
+        (
+            "onProperties",
+            format!(
+                "{head}:z a :Z . :c a _:r .
+                 _:r a owl:Restriction ; owl:onProperties ( :d ) ; owl:someValuesFrom rdfs:Literal ."
+            ),
+            z.clone(),
+            vec![format!("x={E}z")],
+            false,
+        ),
+        (
+            "no property",
+            format!("{head}:z a :Z . :c a [ a owl:Restriction ; owl:someValuesFrom :D ] ."),
+            z.clone(),
+            vec![format!("x={E}z")],
+            false,
+        ),
+        // Guards. A structure no individual is in says nothing: still `complete`.
+        (
+            "unreferenced",
+            format!("{head}:z a :Z . [ a owl:Restriction ; owl:someValuesFrom :D ] ."),
+            z,
+            vec![format!("x={E}z")],
+            true,
+        ),
+        // An irreflexive or asymmetric property, read now, rules pairs out and adds no fact
+        // (OWL2Bench-QL's `isAffiliatedOrganizationOf`).
+        (
+            "irreflexive",
+            format!(
+                "{head}:p a owl:ObjectProperty, owl:IrreflexiveProperty, owl:AsymmetricProperty .
+                 :c :p :d ."
+            ),
+            format!("SELECT ?x WHERE {{ ?x <{E}p> ?y }}"),
+            vec![format!("x={E}c")],
+            true,
+        ),
+    ];
+    for (name, turtle, query, expected, complete) in rows_cases {
+        for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+            let dir = tempfile::tempdir().unwrap();
+            let store = store(&turtle, dir.path(), ruleset, true);
+            let result = store
+                .execute_query(&SparqlQueryRequest::all(query.as_str()))
+                .unwrap();
+            let rows = select_rows(&result.payload);
+            let status = result.completeness.map(|c| c.as_str()).unwrap_or("none");
+            let claimed = matches!(status, "complete" | "none");
+            if rows != expected {
+                wrong.push(format!(
+                    "{name}, {}, {query}: {rows:?}, expected {expected:?}",
+                    ruleset.name()
+                ));
+            } else if claimed != complete {
+                wrong.push(format!(
+                    "{name}, {}, {query}: {status}, expected complete: {complete}",
+                    ruleset.name()
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// A SELECT's rows (SPARQL JSON results), each `var=value` sorted by variable, sorted.
+fn select_rows(payload: &[u8]) -> Vec<String> {
+    let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
+    let mut rows: Vec<String> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|row| {
+            let mut cells: Vec<String> = row
+                .as_object()
+                .expect("a row")
+                .iter()
+                .map(|(var, v)| format!("{var}={}", v["value"].as_str().unwrap_or("")))
+                .collect();
+            cells.sort();
+            cells.join(" ")
+        })
+        .collect();
+    rows.sort();
+    rows
+}
+
+/// An equality the reader may not read still keeps `complete` from
+/// being claimed under owl2-ql, but no name of it reaches the reader. `:privateA owl:sameAs
+/// :privateB` is in a graph the reader can't read; `:public a :C` in the default graph,
+/// which it can. The answer is exactly `:public`, and neither private name is in the
+/// completeness reasons or header, on a fresh preparation and on a cached one.
+#[test]
+fn an_unreadable_equality_names_no_individual() {
+    use std::sync::Arc;
+
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, SparqlUpdateRequest};
+
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::On,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    store
+        .execute_update(&SparqlUpdateRequest::new(
+            "PREFIX ex: <http://e/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             INSERT DATA {
+                ex:public a ex:C .
+                GRAPH ex:secret { ex:privateA owl:sameAs ex:privateB }
+             }",
+        ))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Ql).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Ql.into()));
+    let scope = ReadScope::Graphs(Arc::new(GraphAccess {
+        graphs: vec!["http://e/open".to_owned()],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    }));
+    for run in ["fresh", "cached"] {
+        let request =
+            SparqlQueryRequest::new("SELECT ?x WHERE { ?x a <http://e/C> }", scope.clone());
+        let result = store.execute_query(&request).unwrap();
+        assert_eq!(
+            select_rows(&result.payload),
+            vec!["x=http://e/public".to_owned()],
+            "{run}: rows"
+        );
+        let mut said = Vec::new();
+        if let Some(c) = &result.completeness {
+            said.push(c.header());
+            said.extend(c.reasons.iter().map(|r| r.text.clone()));
+        }
+        if let Some(ql) = &result.ql {
+            said.extend(ql.completeness.reasons.iter().map(|r| r.text.clone()));
+        }
+        let leaked: Vec<&String> = said.iter().filter(|s| s.contains("private")).collect();
+        assert!(leaked.is_empty(), "{run}: {leaked:?}");
+    }
+}
+
+/// A rewritten query reads only what its reader may (design §1), and uses the schema as
+/// the RL closure the reader sees was computed: a reader who sees the inferences its graphs
+/// support (`inferred = "supported"`) gets the existentials of readable graphs only, one who
+/// sees every inference (`"visible"`) all of them, one who sees none no rewriting.
+/// The one who sees every inference is told `not-certified` and no QL report, since the
+/// assessment reads the schema of every graph.
+#[test]
+fn rewritten_answers_follow_the_readers_graph_access() {
+    use std::sync::Arc;
+
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, SparqlUpdateRequest};
+
+    // Rewriting over the owl2-rl closure is asked for (`auto` is owl2-ql only).
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::On,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    store
+        .execute_update(&SparqlUpdateRequest::new(
+            "PREFIX ex: <http://e/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {
+                ex:bob a ex:Employee .
+                GRAPH ex:secret { ex:Employee rdfs:subClassOf [ a owl:Restriction ;
+                    owl:onProperty ex:worksFor ; owl:someValuesFrom owl:Thing ] }
+             }",
+        ))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    let reader = |inferred: bool, by_support: bool| {
+        ReadScope::Graphs(Arc::new(GraphAccess {
+            graphs: vec!["http://e/open".to_owned()],
+            default_graph: true,
+            inferred,
+            inferred_by_support: by_support,
+            ..GraphAccess::default()
+        }))
+    };
+    let ask = |scope: ReadScope| {
+        let mut request =
+            SparqlQueryRequest::new("SELECT ?x WHERE { ?x <http://e/worksFor> ?y }", scope);
+        request.solutions_format = SolutionsResultFormat::Tsv;
+        let result = store.execute_query(&request).unwrap();
+        let text = String::from_utf8(result.payload).unwrap();
+        let published = result.completeness.as_ref().map(|c| c.as_str());
+        let raw = result.ql.as_ref().map(|r| r.completeness.as_str());
+        (text.contains("<http://e/bob>"), published, raw)
+    };
+    let answers = [
+        // Everything readable: through the existential.
+        ask(ReadScope::All),
+        // The axiom is unreadable; only supported inferences: not through it.
+        ask(reader(true, true)),
+        // Every inference is visible, using even the unreadable schema.
+        ask(reader(true, false)),
+        // No inferences: no rewriting or certification.
+        ask(reader(false, false)),
+    ];
+    assert_eq!(
+        answers.map(|(answer, _, _)| answer),
+        [true, false, true, false],
+        "reader-scoped answers"
+    );
+    assert_eq!(
+        answers.map(|(_, published, _)| published),
+        [
+            Some("complete"),
+            Some("complete"),
+            Some("not-certified"),
+            None
+        ],
+        "public certification by reader scope"
+    );
+    assert_eq!(
+        answers.map(|(_, _, raw)| raw),
+        [Some("complete"), Some("complete"), None, None],
+        "raw QL detail by reader scope"
+    );
+}
+
+/// The printer (design §8): each query printed as standard SPARQL 1.1, in both forms, and
+/// run on a store holding the same statements without any reasoning, answers as the store
+/// with reasoning (`owl2-rl`, the rewriting on) does: the same rows, as bags and with
+/// DISTINCT, and the same completeness. On the pure and the mixed random cases; what the
+/// printer can't write exactly it says, and those are counted.
+#[test]
+fn printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it() {
+    use nrese_sparql::ql::{PrintForm, Printed};
+
+    let cases: usize = std::env::var("NRESE_QL_CASES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(150);
+    let dir = tempfile::tempdir().unwrap();
+    let seed = std::env::var("NRESE_QL_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x5851_f42d_4c95_7f2d);
+    let mut rng = Rng(seed);
+    // Printed queries of pure and mixed cases, those NRESE answers sound-only, answers only
+    // through reasoning.
+    let (mut pure, mut mixed_printed, mut sound_only, mut gained) = (0, 0, 0, 0);
+    let mut refused: std::collections::BTreeMap<String, usize> = Default::default();
+    for case in 0..cases {
+        let mixed = case % 2 == 1;
+        let tbox = random_tbox(&mut rng);
+        let roles: Vec<usize> = tbox.generating.iter().map(|g| g.1.property).collect();
+        let extras = if mixed {
+            random_extras(&mut rng, &roles)
+        } else {
+            Extras::default()
+        };
+        let data: Vec<String> = (0..1 + rng.below(8))
+            .map(|_| {
+                if rng.chance(50) {
+                    format!(":a{} a :C{} .", rng.below(INDIVIDUALS), rng.below(CLASSES))
+                } else {
+                    format!(
+                        ":a{} :P{} :a{} .",
+                        rng.below(INDIVIDUALS),
+                        rng.below(PROPERTIES),
+                        rng.below(INDIVIDUALS)
+                    )
+                }
+            })
+            .collect();
+        let queries: Vec<Query> = (0..4).map(|_| random_query(&mut rng)).collect();
+        let turtle = format!(
+            "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             {}\n{}\n{}",
+            tbox.turtle.join("\n"),
+            extras.turtle.join("\n"),
+            data.join("\n")
+        );
+        let with = store(&turtle, dir.path(), Ruleset::Owl2Rl, true);
+        let without = raw_store(&turtle, dir.path());
+        for query in &queries {
+            for distinct in [true, false] {
+                let text = query.sparql(distinct);
+                let (mut expected, completeness) = store_answer(&with, &text);
+                expected.sort();
+                let asserted: BTreeSet<Vec<usize>> =
+                    store_rows(&without, &text).into_iter().collect();
+                for form in [PrintForm::Paths, PrintForm::Values] {
+                    let context = format!("case {case}, {}:\n{turtle}\n{text}", form.name());
+                    match with.print_query(&text, form).unwrap() {
+                        Printed::NotExpressible(_) if !distinct || form != PrintForm::Paths => {}
+                        Printed::NotExpressible(reasons) => {
+                            for reason in reasons {
+                                let kind = reason
+                                    .split_once(" (")
+                                    .map_or(reason.as_str(), |(kind, _)| kind);
+                                let kind = kind.rsplit(": ").next().unwrap_or(kind);
+                                *refused.entry(kind.replace(E, ":")).or_default() += 1;
+                            }
+                        }
+                        Printed::Query {
+                            text: q,
+                            completeness: theirs,
+                        } => {
+                            let (mut rows, none) = store_answer(&without, &q);
+                            rows.sort();
+                            assert_eq!(rows, expected, "{context}\nprinted:\n{q}");
+                            assert_eq!(
+                                theirs.as_str(),
+                                completeness.as_str(),
+                                "{context}\n{theirs:?}"
+                            );
+                            // The store without reasoning had nothing to say about it.
+                            assert!(none.complete && none.reasons.is_empty(), "{context}");
+                            if distinct && form == PrintForm::Paths {
+                                if mixed {
+                                    mixed_printed += 1;
+                                } else {
+                                    pure += 1;
+                                }
+                                sound_only += usize::from(!completeness.complete);
+                                gained += expected
+                                    .iter()
+                                    .filter(|row| !asserted.contains(*row))
+                                    .count();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "QL printer: {pure} pure and {mixed_printed} mixed queries printed (both forms, \
+         DISTINCT and bags; {sound_only} sound-only as NRESE's), {gained} answers only \
+         through reasoning; not expressible (queries): {refused:?}"
+    );
+    // Pure QL prints whole.
+    assert_eq!(pure, cases.div_ceil(2) * 4, "{refused:?}");
+    assert!(mixed_printed > 0 && sound_only > 0, "{refused:?}");
+    assert!(gained > 0, "no printed query needed reasoning");
+}
+
+/// A store holding `turtle` as asserted: no reasoning, no rewriting.
+fn raw_store(turtle: &str, dir: &std::path::Path) -> StoreService {
+    let file = dir.join("raw.ttl");
+    std::fs::write(&file, turtle).unwrap();
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::Off,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    store
+        .bulk_load(&BulkLoadRequest {
+            files: vec![file],
+            replace: false,
+            graph: GraphTarget::DefaultGraph,
+            invalid: Some(nrese_store::InvalidStatements::Strict),
+        })
+        .unwrap();
+    store
+}
+
+/// The TBox counts inclusions through inverse expressions among those the materialisation
+/// applies (`nrese-owl::ql`, the base ones): both rulesets derive them, their facts being
+/// generalised triples (`x [owl:inverseOf p] y`).
+#[test]
+fn inclusions_through_inverse_expressions_are_materialised() {
+    let dir = tempfile::tempdir().unwrap();
+    let cases = [
+        (
+            ":Q rdfs:subPropertyOf [ owl:inverseOf :P ] . :a1 :Q :a2 .",
+            "?x :P ?y",
+            "2 1",
+        ),
+        (
+            "[ owl:inverseOf :P ] rdfs:subPropertyOf :Q . :a1 :P :a2 .",
+            "?x :Q ?y",
+            "2 1",
+        ),
+        (
+            ":Q owl:equivalentProperty [ owl:inverseOf :P ] . :a1 :P :a2 .",
+            "?x :Q ?y",
+            "2 1",
+        ),
+        (
+            ":Q owl:inverseOf [ owl:inverseOf :P ] . :a1 :P :a2 .",
+            "?x :Q ?y",
+            "1 2",
+        ),
+        (
+            "[ owl:inverseOf :P ] rdfs:domain :C . :a1 :P :a2 .",
+            "?x a :C",
+            "2",
+        ),
+        (
+            "[ owl:inverseOf :P ] rdfs:range :C . :a1 :P :a2 .",
+            "?x a :C",
+            "1",
+        ),
+        (
+            "[ a owl:Restriction ; owl:onProperty [ owl:inverseOf :P ] ;
+               owl:someValuesFrom owl:Thing ] rdfs:subClassOf :C . :a1 :P :a2 .",
+            "?x a :C",
+            "2",
+        ),
+    ];
+    for ruleset in [Ruleset::Owl2Ql, Ruleset::Owl2Rl] {
+        for (axioms, pattern, expected) in cases {
+            let turtle = format!(
+                "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+                 @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> . {axioms}"
+            );
+            let store = store(&turtle, dir.path(), ruleset, false);
+            let rows = store_rows(&store, &format!("PREFIX : <{E}> SELECT * {{ {pattern} }}"));
+            let rows: Vec<String> = rows
+                .iter()
+                .map(|r| {
+                    r.iter()
+                        .map(|i| i.to_string())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect();
+            assert_eq!(rows, [expected], "{}: {axioms}", ruleset.name());
+        }
+    }
+}
+
+/// `EXISTS`, `NOT EXISTS` and `MINUS` read the entailments as the rest of the query does
+/// (design §2): for random queries `Q1` and `Q2` over the same variables, `Q1`'s certain
+/// answers kept where `Q2` has a certain answer agreeing on their shared variables (or
+/// where it hasn't), by the chase. Pure QL: exactly those, complete. Mixed ontologies: an
+/// answer that isn't the chase's says `unsound`, a missing one says so too (the
+/// negation's pattern may miss what makes an answer wrong).
+#[test]
+fn negation_and_exists_answer_as_the_chase() {
+    let cases: usize = std::env::var("NRESE_QL_CASES")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(150);
+    let dir = tempfile::tempdir().unwrap();
+    let seed = std::env::var("NRESE_QL_SEED")
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0x6a09_e667_f3bc_c908);
+    let mut rng = Rng(seed);
+    let (mut checked, mut skipped, mut decided_by_rewriting) = (0, 0, 0);
+    let (mut flagged, mut silent_ok) = (0, 0);
+    for case in 0..cases {
+        let mixed = case % 2 == 1;
+        let tbox = random_tbox(&mut rng);
+        let roles: Vec<usize> = tbox.generating.iter().map(|g| g.1.property).collect();
+        let extras = if mixed {
+            random_extras(&mut rng, &roles)
+        } else {
+            Extras::default()
+        };
+        let (mut types, mut edges, mut data) = (Vec::new(), Vec::new(), Vec::new());
+        for _ in 0..1 + rng.below(6) {
+            if rng.chance(50) {
+                let (a, c) = (rng.below(INDIVIDUALS), rng.below(CLASSES));
+                types.push((a, c));
+                data.push(format!(":a{a} a :C{c} ."));
+            } else {
+                let (a, p, b) = (
+                    rng.below(INDIVIDUALS),
+                    rng.below(PROPERTIES),
+                    rng.below(INDIVIDUALS),
+                );
+                edges.push((a, p, b));
+                data.push(format!(":a{a} :P{p} :a{b} ."));
+            }
+        }
+        // `Q2` shares one variable with `Q1` (its `?v0`), its others its own: existential
+        // inside the negation.
+        let pairs: Vec<(Query, Query)> = (0..4)
+            .map(|_| {
+                if rng.chance(50) {
+                    // "Instances of C with (or without) some P-edge (into D)": what an
+                    // existential decides.
+                    let q1 = Query {
+                        atoms: vec![QAtom::Class(T::Var(0), rng.below(CLASSES))],
+                        vars: 2,
+                        answers: vec![0],
+                    };
+                    let p = rng.below(PROPERTIES);
+                    let mut atoms = vec![if rng.chance(50) {
+                        QAtom::Role(T::Var(0), p, T::Var(1))
+                    } else {
+                        QAtom::Role(T::Var(1), p, T::Var(0))
+                    }];
+                    if rng.chance(50) {
+                        atoms.push(QAtom::Class(T::Var(1), rng.below(CLASSES)));
+                    }
+                    let q2 = Query {
+                        atoms,
+                        vars: 2,
+                        answers: Vec::new(),
+                    };
+                    return (q1, q2);
+                }
+                let q1 = random_query(&mut rng);
+                let q2 = random_query(&mut rng);
+                let used = q1.variables();
+                let target = if used.is_empty() {
+                    0
+                } else {
+                    used[rng.below(used.len())]
+                };
+                let rename = |t: T| match t {
+                    T::Var(0) => T::Var(target),
+                    T::Var(v) => T::Var(q1.vars + v),
+                    ind => ind,
+                };
+                let atoms = q2
+                    .atoms
+                    .iter()
+                    .map(|a| match *a {
+                        QAtom::Class(t, c) => QAtom::Class(rename(t), c),
+                        QAtom::Role(s, p, o) => QAtom::Role(rename(s), p, rename(o)),
+                    })
+                    .collect();
+                let q2 = Query {
+                    atoms,
+                    vars: q1.vars + q2.vars,
+                    answers: Vec::new(),
+                };
+                (q1, q2)
+            })
+            .collect();
+        let kinds: HashSet<(Role, Option<usize>)> =
+            tbox.generating.iter().map(|&(_, r, f)| (r, f)).collect();
+        let max_vars = pairs
+            .iter()
+            .map(|(a, b)| a.vars.max(b.vars))
+            .max()
+            .unwrap_or(1);
+        let Some(chase) = Chase::run(
+            &tbox,
+            &extras,
+            &types,
+            &edges,
+            kinds.len() + max_vars + 2,
+            if mixed { 5_000 } else { 20_000 },
+        ) else {
+            skipped += 1;
+            continue;
+        };
+        let turtle = format!(
+            "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+             {}\n{}\n{}",
+            tbox.turtle.join("\n"),
+            extras.turtle.join("\n"),
+            data.join("\n")
+        );
+        let with = store(&turtle, dir.path(), Ruleset::Owl2Rl, true);
+        let without = store(&turtle, dir.path(), Ruleset::Owl2Rl, false);
+        let certain = |q: &Query| {
+            if mixed {
+                chase.named_answers(q)
+            } else {
+                chase.answers(q)
+            }
+        };
+        for (q1, q2) in &pairs {
+            let outer = Query {
+                atoms: q1.atoms.clone(),
+                vars: q1.vars.max(q2.vars),
+                answers: q1.variables(),
+            };
+            if outer.answers.is_empty() {
+                continue;
+            }
+            let shared: Vec<usize> = q2
+                .variables()
+                .into_iter()
+                .filter(|v| outer.answers.contains(v))
+                .collect();
+            let inner = Query {
+                atoms: q2.atoms.clone(),
+                vars: outer.vars,
+                answers: shared.clone(),
+            };
+            let holds = certain(&inner);
+            let at: Vec<usize> = shared
+                .iter()
+                .map(|v| outer.answers.iter().position(|w| w == v).unwrap())
+                .collect();
+            let agrees =
+                |t: &Vec<usize>| holds.contains(&at.iter().map(|&i| t[i]).collect::<Vec<_>>());
+            let ones = certain(&outer);
+            let head = outer
+                .answers
+                .iter()
+                .map(|v| format!("?v{v}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mut forms = vec![
+                ("EXISTS", format!("FILTER EXISTS {{ {} }}", q2.body()), true),
+                (
+                    "NOT EXISTS",
+                    format!("FILTER NOT EXISTS {{ {} }}", q2.body()),
+                    false,
+                ),
+            ];
+            // MINUS removes only what shares a variable with it.
+            if !shared.is_empty() {
+                forms.push(("MINUS", format!("MINUS {{ {} }}", q2.body()), false));
+            }
+            for (name, tail, keep) in forms {
+                let text = format!(
+                    "PREFIX : <{E}> SELECT DISTINCT {head} WHERE {{ {} {tail} }}",
+                    outer.body()
+                );
+                let expected: BTreeSet<Vec<usize>> =
+                    ones.iter().filter(|t| agrees(t) == keep).cloned().collect();
+                let (rows, status) = store_answer(&with, &text);
+                let answered: BTreeSet<Vec<usize>> = rows.into_iter().collect();
+                let context = || format!("case {case} {name}:\n{turtle}\n{text}\n{status:?}");
+                if !mixed {
+                    assert_eq!(answered, expected, "{}", context());
+                    assert!(status.complete && status.sound, "{}", context());
+                } else {
+                    let wrong = answered.difference(&expected).count();
+                    let missing = expected.difference(&answered).count();
+                    assert!(
+                        wrong == 0 || !status.sound,
+                        "{wrong} wrong, silently: {}",
+                        context()
+                    );
+                    assert!(
+                        missing == 0 || !status.complete,
+                        "{missing} missing, silently: {}",
+                        context()
+                    );
+                    if status.complete {
+                        silent_ok += 1;
+                    } else {
+                        flagged += 1;
+                    }
+                }
+                let (plain, _) = store_answer(&without, &text);
+                if plain.into_iter().collect::<BTreeSet<_>>() != answered {
+                    decided_by_rewriting += 1;
+                }
+                checked += 1;
+            }
+        }
+    }
+    eprintln!(
+        "QL negation: {checked} queries checked, {decided_by_rewriting} answered otherwise than \
+         over the closure alone, {skipped} cases skipped (chase too large); mixed: {flagged} \
+         flagged, {silent_ok} complete"
+    );
+    assert!(checked >= cases * 2, "too few checked: {checked}");
+    assert!(
+        decided_by_rewriting > 0,
+        "no query needed the rewriting inside the negation"
+    );
+}
+
+/// A reader who may not read every graph gets nothing derived from what it can't see
+/// (merge checklist §4). Neither the data check (asked of the whole data, design §3) nor a
+/// negated pattern's rewriting reads such a graph for it.
+#[test]
+fn restricted_readers_get_nothing_from_graphs_they_cant_read() {
+    use std::sync::Arc;
+
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, SparqlUpdateRequest};
+
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: nrese_store::QlRewritingMode::On,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    // Ann is an employee; that she works for Acme is inferred from a secret graph only.
+    // Bob is a clerk; that clerks help someone is secret.
+    store
+        .execute_update(&SparqlUpdateRequest::new(
+            "PREFIX ex: <http://e/> PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {
+                ex:Employee rdfs:subClassOf [ a owl:Restriction ;
+                    owl:onProperty ex:worksFor ; owl:someValuesFrom owl:Thing ] .
+                ex:headOf rdfs:subPropertyOf ex:worksFor .
+                ex:ann a ex:Employee .
+                GRAPH ex:secret { ex:ann ex:headOf ex:acme }
+                ex:Clerk rdfs:subClassOf ex:Person . ex:bob a ex:Clerk .
+                GRAPH ex:secret2 { ex:Clerk rdfs:subClassOf [ a owl:Restriction ;
+                    owl:onProperty ex:helps ; owl:someValuesFrom owl:Thing ] }
+             }",
+        ))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    let supported = ReadScope::Graphs(Arc::new(GraphAccess {
+        graphs: vec!["http://e/open".to_owned()],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    }));
+    let ask = |query: &str, scope: ReadScope| {
+        let mut request = SparqlQueryRequest::new(query, scope);
+        request.solutions_format = SolutionsResultFormat::Tsv;
+        let result = store.execute_query(&request).unwrap();
+        let mut rows: Vec<String> = String::from_utf8(result.payload)
+            .unwrap()
+            .lines()
+            .skip(1)
+            .map(|l| l.replace("http://e/", ""))
+            .collect();
+        rows.sort();
+        rows
+    };
+    // The whole data has Ann's employer, so for a reader of everything the witness adds
+    // nothing; the restricted reader doesn't see that inference, and gets Ann through
+    // the existential: the data check isn't asked for it.
+    let works = "SELECT ?x WHERE { ?x <http://e/worksFor> ?y }";
+    assert_eq!(ask(works, ReadScope::All), ["<ann>"]);
+    assert_eq!(ask(works, supported.clone()), ["<ann>"]);
+    // A negated pattern reads the reader's schema only: that clerks help someone is in a
+    // graph the reader can't read, so Bob stays an answer for it.
+    let idle =
+        "SELECT ?x WHERE { ?x a <http://e/Person> FILTER NOT EXISTS { ?x <http://e/helps> [] } }";
+    assert_eq!(ask(idle, ReadScope::All), Vec::<String>::new());
+    assert_eq!(ask(idle, supported), ["<bob>"]);
+}
+
+/// The quarantine cells' store: `:A` and `:B` disjoint, `:y` an `:A`, and, unless `clean`, `:x`
+/// both an `:A` and a `:B` (a clash the ruleset's `cax-dw` finds), loaded past the pipeline as a
+/// bulk load does, then reasoned under `ruleset` with the QL rewriting set to `ql`.
+fn quarantine_case(ruleset: Ruleset, ql: QlRewritingMode, clean: bool) -> StoreService {
+    let clash = if clean { "" } else { ":x a :A , :B ." };
+    quarantine_store(ruleset, ql, clash)
+}
+
+/// [`quarantine_case`]'s store with `more` in place of the clash.
+fn quarantine_store(ruleset: Ruleset, ql: QlRewritingMode, more: &str) -> StoreService {
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: ql,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    crate::support::load_past_the_pipeline(
+        &store,
+        &format!(
+            "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+             :A owl:disjointWith :B . :y a :A . {more}"
+        ),
+    );
+    store.rematerialise(ruleset).unwrap();
+    store
+}
+
+/// `query` (prefix `:` declared) on `store` for a reader of `scope`, which the QL rewriting must
+/// answer (setup: its report present): the read's status header (`none` without a status) and
+/// the status's reasons' texts.
+fn rewritten_read(
+    store: &StoreService,
+    query: &str,
+    scope: nrese_store::ReadScope,
+) -> (String, Vec<String>) {
+    let mut request = SparqlQueryRequest::new(format!("PREFIX : <{E}> {query}"), scope);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    let result = store.execute_query(&request).unwrap();
+    let status = (result.completeness.as_ref()).map_or_else(|| "none".to_owned(), |s| s.header());
+    assert!(
+        result.ql.is_some(),
+        "setup: the QL rewriting didn't answer ({status})"
+    );
+    let reasons = (result.completeness.into_iter())
+        .flat_map(|s| s.reasons.into_iter().map(|r| r.text))
+        .collect();
+    (status, reasons)
+}
+
+/// `SELECT ?x { ?x a :A }` on `store` by a reader of every graph: [`rewritten_read`]'s header.
+fn rewritten_read_of_a(store: &StoreService) -> String {
+    rewritten_read(store, "SELECT ?x { ?x a :A }", nrese_store::ReadScope::All).0
+}
+
+/// The status's first word: `complete`, `sound-only`, `unsound`, `not-certified` or `none`.
+fn status_class(header: &str) -> &str {
+    header.split(';').next().unwrap_or(header)
+}
+
+/// Setup of a quarantine cell: the rematerialisation found the clash, so the store is in
+/// quarantine, its data inconsistent under the recorded reasoning.
+fn assert_quarantined(store: &StoreService) {
+    let consistency = store.consistency();
+    let inconsistent = matches!(consistency, ConsistencyStatus::Inconsistent { .. });
+    assert!(
+        store.is_quarantined() && inconsistent,
+        "setup: the store isn't in quarantine: {consistency:?}"
+    );
+}
+
+/// Setup of a control: the data is consistent, the store not in quarantine.
+fn assert_clean(store: &StoreService) {
+    let consistency = store.consistency();
+    let consistent = matches!(consistency, ConsistencyStatus::Consistent);
+    assert!(
+        !store.is_quarantined() && consistent,
+        "setup: the store isn't clean: {consistency:?}"
+    );
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"): `complete` means no
+/// certain answer under the OWL 2 Direct Semantics is missing; inconsistent data entail every
+/// answer, so a read of a store in quarantine under `owl2-ql` that the QL rewriting answers is
+/// never told `complete`.
+#[test]
+fn a_rewritten_read_over_a_store_in_quarantine_under_owl2_ql_is_not_complete() {
+    let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, false);
+    assert_quarantined(&store);
+    let status = rewritten_read_of_a(&store);
+    assert_ne!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec: as under `owl2-ql`, under `owl2-rl` with the QL rewriting on: a read of a store in
+/// quarantine that the rewriting answers is never told `complete`.
+#[test]
+fn a_rewritten_read_over_a_store_in_quarantine_under_owl2_rl_is_not_complete() {
+    let store = quarantine_case(Ruleset::Owl2Rl, QlRewritingMode::On, false);
+    assert_quarantined(&store);
+    let status = rewritten_read_of_a(&store);
+    assert_ne!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"): on clean data under
+/// `owl2-ql`, a read the QL rewriting ran on, of a named class of the data's own, is `complete`.
+/// The control of the `owl2-ql` quarantine cell.
+#[test]
+fn a_rewritten_read_over_clean_data_under_owl2_ql_is_complete() {
+    let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, true);
+    assert_clean(&store);
+    let status = rewritten_read_of_a(&store);
+    assert_eq!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec: as under `owl2-ql`, under `owl2-rl` with the rewriting on. The control of the `owl2-rl`
+/// quarantine cell.
+#[test]
+fn a_rewritten_read_over_clean_data_under_owl2_rl_is_complete() {
+    let store = quarantine_case(Ruleset::Owl2Rl, QlRewritingMode::On, true);
+    assert_clean(&store);
+    let status = rewritten_read_of_a(&store);
+    assert_eq!(status_class(&status), "complete", "status: {status}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to", its operators: "where
+/// answers may be missing, … `MINUS` … make them `unsound`"): over a store in quarantine under
+/// `owl2-ql`, answers may be missing, so a `MINUS` read the QL rewriting answers is `unsound`.
+#[test]
+fn a_negated_read_over_a_store_in_quarantine_under_owl2_ql_is_unsound() {
+    let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, false);
+    assert_quarantined(&store);
+    let query = "SELECT ?x { ?x a :A MINUS { ?x a :B } }";
+    let (status, _) = rewritten_read(&store, query, nrese_store::ReadScope::All);
+    assert_eq!(status_class(&status), "unsound", "status: {status}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"; "Consistency": `/readyz`
+/// tells anyone `quarantined`): a reader of some graphs whose read the QL rewriting answers over
+/// a store in quarantine under `owl2-ql` is never told `complete` either, and is told why in
+/// fixed words: the store is in quarantine, and nothing of the clash.
+#[test]
+fn a_reader_of_some_graphs_over_a_store_in_quarantine_under_owl2_ql_is_not_complete() {
+    let store = quarantine_case(Ruleset::Owl2Ql, QlRewritingMode::Auto, false);
+    assert_quarantined(&store);
+    store.use_reasoning_rules(Some(Ruleset::Owl2Ql.into()));
+    let reader = nrese_store::ReadScope::Graphs(std::sync::Arc::new(nrese_sparql::GraphAccess {
+        graphs: vec![format!("{E}open")],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..nrese_sparql::GraphAccess::default()
+    }));
+    let (status, reasons) = rewritten_read(&store, "SELECT ?x { ?x a :A }", reader);
+    assert_ne!(status_class(&status), "complete", "status: {status}");
+    let fixed = "the store is in quarantine (the consistency rules found violations and have \
+                 not found the data clean since), and as inconsistent data entail every answer, \
+                 no read is certified complete until it leaves";
+    let told = reasons.iter().any(|r| r == fixed);
+    assert!(told, "status: no reason {fixed:?} in {reasons:?}");
+}
+
+/// The annotation cells' store: `data` (prefixes `:`, `owl:` and `rdfs:` declared; TriG, so
+/// graphs may be named) loaded past the pipeline, then reasoned under `ruleset` with the QL
+/// rewriting set to `ql`, its support sets kept for readers by support.
+fn annotation_store(ruleset: Ruleset, ql: QlRewritingMode, data: &str) -> StoreService {
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: ql,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    crate::support::load_past_the_pipeline(
+        &store,
+        &format!(
+            "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .\n\
+             @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n{data}"
+        ),
+    );
+    store.rematerialise(ruleset).unwrap();
+    store.use_reasoning_rules(Some(ruleset.into()));
+    store
+}
+
+/// A declared `:note` on `:x`, which equals `:y`: `eq-rep-s` copies the note to `:y`.
+const EQUAL: &str = ":note a owl:AnnotationProperty . :x :note \"a\" . :x owl:sameAs :y .";
+
+/// Two annotation properties, one under the other: `prp-spo1` copies `:x :sub "a"` to `:super`.
+const SUB: &str = ":sub a owl:AnnotationProperty . :super a owl:AnnotationProperty . \
+                   :sub rdfs:subPropertyOf :super . :x :sub \"a\" .";
+
+/// The rows of `query` (prefix `:` declared) on `store` for a reader of `scope`, as TSV lines.
+fn rows_of(store: &StoreService, query: &str, scope: nrese_store::ReadScope) -> Vec<String> {
+    let mut request = SparqlQueryRequest::new(format!("PREFIX : <{E}> {query}"), scope);
+    request.solutions_format = SolutionsResultFormat::Tsv;
+    let payload = store.execute_query(&request).unwrap().payload;
+    String::from_utf8(payload)
+        .unwrap()
+        .lines()
+        .skip(1)
+        .map(str::to_owned)
+        .collect()
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to": under `owl2-ql` and
+/// `owl2-rl` with the QL rewriting, `complete` is the OWL 2 Direct Semantics'; Direct
+/// Semantics §2, annotations have no meaning; decided on 17 Nov): a read the
+/// rewriting answers that may return the rules' copy of an annotation statement is `unsound`,
+/// in its run, its EXPLAIN and its plan: `eq-rep-s`'s under `owl2-rl`, `prp-spo1`'s under
+/// `owl2-ql`.
+#[test]
+fn a_rewritten_read_that_may_return_a_copied_annotation_is_unsound() {
+    let mut wrong = Vec::new();
+    for (ruleset, ql, data, query, copy) in [
+        (
+            Ruleset::Owl2Rl,
+            QlRewritingMode::On,
+            EQUAL,
+            "SELECT ?s ?o { ?s :note ?o }",
+            "y",
+        ),
+        (
+            Ruleset::Owl2Ql,
+            QlRewritingMode::Auto,
+            SUB,
+            "SELECT ?s ?o { ?s :super ?o }",
+            "x",
+        ),
+    ] {
+        let store = annotation_store(ruleset, ql, data);
+        let rows = rows_of(&store, query, nrese_store::ReadScope::All);
+        let copied = rows.iter().any(|r| r.contains(&format!("<{E}{copy}>")));
+        assert!(copied, "setup: {ruleset:?}: no copy in {rows:?}");
+        let (run, _) = rewritten_read(&store, query, nrese_store::ReadScope::All);
+        let prepared = store
+            .prepare_query(&SparqlQueryRequest::all(format!("PREFIX : <{E}> {query}")))
+            .unwrap();
+        let token = nrese_store::CancellationToken::new();
+        let explain = store.explain_query(&prepared, &token).unwrap().completeness;
+        let plan = store.plan_query(&prepared, &token).unwrap().completeness;
+        let header = |s: Option<Completeness>| s.map_or_else(|| "none".to_owned(), |s| s.header());
+        for (path, status) in [
+            ("run", run),
+            ("explain", header(explain)),
+            ("plan", header(plan)),
+        ] {
+            if status_class(&status) != "unsound" {
+                wrong.push(format!("{ruleset:?} {path}: {status}"));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to": without the rewriting
+/// the status is the closure's, `sound-only` at best; under the
+/// RDF-Based Semantics the copies are right): a ruleset's own closure without the QL
+/// rewriting keeps its status for the same reads, `sound-only`.
+#[test]
+fn a_rulesets_own_closure_keeps_its_status_for_copied_annotations() {
+    let mut wrong = Vec::new();
+    for (ruleset, data, query) in [
+        (Ruleset::Owl2Rl, EQUAL, "SELECT ?s ?o { ?s :note ?o }"),
+        (Ruleset::Owl2Ql, SUB, "SELECT ?s ?o { ?s :super ?o }"),
+    ] {
+        let store = annotation_store(ruleset, QlRewritingMode::Off, data);
+        let request = SparqlQueryRequest::all(format!("PREFIX : <{E}> {query}"));
+        let result = store.execute_query(&request).unwrap();
+        assert!(result.ql.is_none(), "setup: {ruleset:?}: the rewriting ran");
+        let status = result
+            .completeness
+            .map_or_else(|| "none".to_owned(), |s| s.header());
+        if status_class(&status) != "sound-only" {
+            wrong.push(format!("{ruleset:?}: {status}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A reader of the default graph and `:open`, who sees the inferences derived from them alone,
+/// and not `:hidden`.
+fn reader_by_support() -> nrese_store::ReadScope {
+    nrese_store::ReadScope::Graphs(std::sync::Arc::new(nrese_sparql::GraphAccess {
+        graphs: vec![format!("{E}open")],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..nrese_sparql::GraphAccess::default()
+    }))
+}
+
+/// [`EQUAL`] with the declaration in `:hidden`, the note and the equality in `:open`.
+const HIDDEN: &str = ":hidden { :note a owl:AnnotationProperty . }\n\
+                      :open { :x :note \"a\" . :x owl:sameAs :y . :x a :A . }";
+
+/// [`HIDDEN`] without the declaration.
+const UNDECLARED: &str = ":open { :x :note \"a\" . :x owl:sameAs :y . :x a :A . }";
+
+/// [`HIDDEN`] with the declaration in `:open`, which the reader reads.
+const READABLE: &str = ":open { :note a owl:AnnotationProperty . \
+                        :x :note \"a\" . :x owl:sameAs :y . :x a :A . }";
+
+/// Whether `reasons` hold the annotation rule's: the closure may hold the rules' copies.
+fn names_copies(reasons: &[String]) -> bool {
+    reasons
+        .iter()
+        .any(|r| r.contains("the rules' copies of annotation statements"))
+}
+
+/// Spec (docs/spec/reasoning-semantics.md:86, a restricted reader's status says nothing about
+/// graphs they can't read; in its graphs a predicate
+/// without a declaration is no annotation property): with `:note`'s declaration in a graph the
+/// reader can't read, and the note and the equality in one it can, a read of `:note` the
+/// rewriting answers, whose rows hold the copy, is told as on the same data without the
+/// declaration: status and reasons alike, neither naming the copies. With the declaration in
+/// a graph the reader reads, the same read is told of them.
+#[test]
+fn a_reader_who_cant_see_the_declaration_is_told_as_without_it() {
+    let query = "SELECT ?s ?o { ?s :note ?o }";
+    let told = |data: &str| {
+        let store = annotation_store(Ruleset::Owl2Rl, QlRewritingMode::On, data);
+        let rows = rows_of(&store, query, reader_by_support());
+        let copied = rows.iter().any(|r| r.contains(&format!("<{E}y>")));
+        assert!(copied, "setup: the reader sees no copy: {rows:?}");
+        rewritten_read(&store, query, reader_by_support())
+    };
+    let (hidden, undeclared, readable) = (told(HIDDEN), told(UNDECLARED), told(READABLE));
+    assert!(!names_copies(&hidden.1), "hidden: {}", hidden.0);
+    assert!(!names_copies(&undeclared.1), "undeclared: {}", undeclared.0);
+    assert!(names_copies(&readable.1), "readable: {}", readable.0);
+    assert_eq!(hidden, undeclared);
+}
+
+/// Spec (docs/spec/reasoning-semantics.md:86; a reader told of
+/// a statement in a graph it can't read learns that it exists): a reader by support of the
+/// default graph, which holds an equality, reading an annotation property (built in, or
+/// declared in a graph it reads) whose only statement is in a graph it can't read, is told
+/// as on the same store without that statement: status and reasons alike.
+#[test]
+fn a_reader_by_support_isnt_told_of_a_hidden_annotation_statement() {
+    let told = |data: &str, query: &str| {
+        let store = annotation_store(Ruleset::Owl2Rl, QlRewritingMode::On, data);
+        rewritten_read(&store, query, reader_by_support())
+    };
+    let declared = ":open { :note a owl:AnnotationProperty . }";
+    let mut wrong = Vec::new();
+    for (case, without, hidden, query) in [
+        (
+            "built in",
+            ":a owl:sameAs :b .".to_owned(),
+            ":hidden { :c rdfs:label \"private\" . }",
+            "SELECT ?s ?o { ?s <http://www.w3.org/2000/01/rdf-schema#label> ?o }",
+        ),
+        (
+            "declared",
+            format!(":a owl:sameAs :b . {declared}"),
+            ":hidden { :c :note \"private\" . }",
+            "SELECT ?s ?o { ?s :note ?o }",
+        ),
+    ] {
+        let (with, alone) = (
+            told(&format!("{without}\n{hidden}"), query),
+            told(&without, query),
+        );
+        if with != alone {
+            wrong.push(format!("{case}: {} against {}", with.0, alone.0));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (docs/spec/reasoning-semantics.md, "What may be `complete`": `rdf:type` with a named
+/// class of your own; no annotation is a class assertion): the same reader's read of a class
+/// the rewriting answers stays `complete`. The control of the cell above.
+#[test]
+fn the_same_readers_class_read_stays_complete() {
+    let store = annotation_store(Ruleset::Owl2Rl, QlRewritingMode::On, HIDDEN);
+    let (status, _) = rewritten_read(&store, "SELECT ?x { ?x a :A }", reader_by_support());
+    assert_eq!(status_class(&status), "complete", "status: {status}");
+}

@@ -10,6 +10,13 @@
 //! - a date bound covers the inline date range widened by a day on each side (dates with
 //!   timezones compare indeterminately within ±14 h, and the FILTER decides those), plus
 //!   every dictionary typed literal (non-canonical dates)
+//! - a dateTime bound covers the inline dateTime range widened by two local days on each
+//!   side, at the bound's clock (the value and the bound can each be ±14 h off UTC, so a
+//!   value that passes can lie 28 h of local time beyond the bound), plus every dictionary
+//!   typed literal (non-canonical forms, `24:00:00`, years past 9999). Beside a bound of
+//!   another kind or a string test (`strings`) on the same variable it gives way: that
+//!   bound's hint, or the string test's route, stays as it was before dateTimes had hints;
+//!   path joins take none ([`hints_without_date_times`])
 //!
 //! - a bound on `YEAR(?v)` covers the inline dates and dateTimes of those years exactly
 //!   (an inline id's payload starts with the local year, which is what `YEAR` returns),
@@ -25,6 +32,8 @@ use nrese_rdf::Variable;
 use nrese_rdf::vocab::xsd;
 use nrese_sparql_syntax::algebra::{Expression, Function};
 
+use super::{pushdown, strings};
+
 pub(crate) struct Hint {
     pub(crate) variable: Variable,
     pub(crate) ranges: Vec<(TermId, TermId)>,
@@ -34,12 +43,13 @@ pub(crate) struct Hint {
 enum Domain {
     Integer,
     Date,
+    DateTime,
     /// Bounds on `YEAR(?v)`: inclusive years in `low` and `high`.
     Year,
 }
 
 /// Bounds collected for one variable: inclusive integer bounds (of the value, or of its
-/// year), or date ids.
+/// year), or date or dateTime ids.
 struct Bounds {
     domain: Domain,
     low: Option<i64>,
@@ -48,16 +58,58 @@ struct Bounds {
     high_id: Option<TermId>,
 }
 
+impl Bounds {
+    fn new(domain: Domain) -> Self {
+        Self {
+            domain,
+            low: None,
+            high: None,
+            low_id: None,
+            high_id: None,
+        }
+    }
+}
+
 /// The range hints implied by the conjuncts of `expr`.
 pub(crate) fn hints(expr: &Expression, snapshot: &Snapshot) -> Vec<Hint> {
+    hints_of(expr, snapshot, true)
+}
+
+/// [`hints`] with no hint from dateTime bounds, as before they had one: a path join takes
+/// each conjunct's hints apart, the first on a variable winning, and its plans stay as they
+/// were.
+pub(crate) fn hints_without_date_times(expr: &Expression, snapshot: &Snapshot) -> Vec<Hint> {
+    hints_of(expr, snapshot, false)
+}
+
+fn hints_of(expr: &Expression, snapshot: &Snapshot, date_times: bool) -> Vec<Hint> {
     let mut bounds: Vec<(Variable, Option<Bounds>)> = Vec::new();
     collect(expr, snapshot, &mut bounds);
+    // The conjuncts are listed only when a dateTime bound needs them, so other hints cost
+    // what they did.
+    let mut conjuncts: Option<Vec<&Expression>> = None;
     bounds
         .into_iter()
         .filter_map(|(variable, bounds)| {
+            let bounds = bounds?;
+            // A dateTime bound gives way to a string test on its variable: the dictionary's
+            // route for the test (`strings`) and the key count's refusal stay as they were.
+            if bounds.domain == Domain::DateTime {
+                if !date_times {
+                    return None;
+                }
+                let conjuncts = conjuncts.get_or_insert_with(|| {
+                    let mut list = Vec::new();
+                    pushdown::conjuncts_of(expr, &mut list);
+                    list
+                });
+                if strings::combined(conjuncts.iter().copied(), &variable).is_some() {
+                    return None;
+                }
+            }
             Some(Hint {
+                ranges: ranges(bounds)?,
                 variable,
-                ranges: ranges(bounds?)?,
             })
         })
         .collect()
@@ -123,22 +175,19 @@ fn collect<'e>(
             // A non-canonical date constant: no hint (still correct, just not narrowed).
             _ => return,
         }
+    } else if literal.datatype() == xsd::DATE_TIME {
+        match snapshot.lookup(literal.as_ref().into()) {
+            Some(id) if id.kind() == TermKind::DateTime => (Domain::DateTime, None, Some(id)),
+            // Not inline (`24:00:00`, a non-canonical form, a year past 9999): no hint.
+            _ => return,
+        }
     } else {
         return;
     };
     let entry = match out.iter_mut().find(|(v, _)| v == variable) {
         Some(entry) => entry,
         None => {
-            out.push((
-                variable.clone(),
-                Some(Bounds {
-                    domain,
-                    low: None,
-                    high: None,
-                    low_id: None,
-                    high_id: None,
-                }),
-            ));
+            out.push((variable.clone(), Some(Bounds::new(domain))));
             out.last_mut().expect("just pushed")
         }
     };
@@ -146,9 +195,17 @@ fn collect<'e>(
         return;
     };
     if bounds.domain != domain {
-        // Mixed domains on one variable: no hint.
-        entry.1 = None;
-        return;
+        match (bounds.domain, domain) {
+            // A dateTime bound gives way to a bound of another kind on the same variable:
+            // that bound's hint stays as it was before dateTimes had one.
+            (_, Domain::DateTime) => return,
+            (Domain::DateTime, _) => *bounds = Bounds::new(domain),
+            // Mixed domains on one variable: no hint.
+            _ => {
+                entry.1 = None;
+                return;
+            }
+        }
     }
     let lower = orderings.contains(&Greater) || orderings == [Equal];
     let upper = orderings.contains(&Less) || orderings == [Equal];
@@ -173,14 +230,19 @@ fn collect<'e>(
                 bounds.high = Some(bounds.high.map_or(high, |h| h.min(high)));
             }
         }
-        Domain::Date => {
+        Domain::Date | Domain::DateTime => {
             let id = id.expect("date domain");
+            // Inclusive bounds, also for `<` and `>`: the FILTER decides the edges.
+            let widened = |later| match domain {
+                Domain::Date => id.date_widened(later),
+                _ => id.date_time_widened(later),
+            };
             if lower {
-                let low = id.date_widened(false).expect("date id");
+                let low = widened(false).expect("a date or dateTime id");
                 bounds.low_id = Some(bounds.low_id.map_or(low, |l| l.max(low)));
             }
             if upper {
-                let high = id.date_widened(true).expect("date id");
+                let high = widened(true).expect("a date or dateTime id");
                 bounds.high_id = Some(bounds.high_id.map_or(high, |h| h.min(high)));
             }
         }
@@ -214,8 +276,11 @@ fn ranges(bounds: Bounds) -> Option<Vec<(TermId, TermId)>> {
             }
             ranges
         }
-        Domain::Date => {
-            let (min, max) = kind(TermKind::Date);
+        Domain::Date | Domain::DateTime => {
+            let (min, max) = kind(match bounds.domain {
+                Domain::Date => TermKind::Date,
+                _ => TermKind::DateTime,
+            });
             let low = bounds.low_id.unwrap_or(min);
             let high = bounds.high_id.unwrap_or(max);
             let mut ranges = Vec::new();

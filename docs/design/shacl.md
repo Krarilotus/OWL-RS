@@ -1,6 +1,6 @@
 # SHACL validation: design
 
-Status: design for phase C of the [parity plan](../plan/2026-09-30-graphdb-parity-plan.md) (30 September 2026). Slices C1a, C1b, C2 and C3 are done (C2 and C3 on 2 October 2026); C1c is planned.
+Status: design for phase C of the [parity plan](../adr/0010-standing-product-decisions.md) (30 September 2026). Slices C1a, C1b, C2 and C3 are done (C2 and C3 on 2 October 2026); C1c is planned.
 
 ## 1. Goal and scope
 
@@ -32,7 +32,7 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
 - **What is validated** is a graph selection plus a read model:
   - graphs: the default graph, one named graph, or every graph except the shapes graph (the default for the commit gate);
   - read model: asserted and inferred statements (the default, so `sh:class` sees inferred types), or asserted only.
-- A shapes graph given with a request (validate-only) is put into a graph of a transaction that is never committed, so it shares the repository's dictionary like stored shapes and leaves nothing behind. That transaction holds the writer while it validates; a snapshot-local overlay would avoid that and is the follow-up.
+- A shapes graph given with a request (validate-only) is put into a graph of a private transaction (`Engine::speculative`), never committed. Its terms are its own, charged to the request's memory, and none enters the dictionary; the repository's terms keep their ids in it, so stored data and shapes read as they are. It takes no writer slot, so commits go on while it validates, and nothing of it outlives the request.
 
 ## 4. Compilation
 
@@ -55,7 +55,7 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
 4. **Nested shapes:**
    - `sh:property` reports the nested shape's own results;
    - `sh:node`, `sh:not`, `sh:and`, `sh:or`, `sh:xone` and `sh:qualifiedValueShape` only ask whether the value conforms.
-5. **Recursion:** the specification leaves recursive shapes undefined. A node being checked against a shape it is already being checked against is taken to conform (the common reading). This is a stated choice, not a guarantee.
+5. **Recursion:** the specification leaves recursive shapes undefined. A node being checked against a shape it is already being checked against is taken to conform. This is a stated choice, not a guarantee.
 
 **Where the time goes, and what the design does about it:**
 
@@ -69,7 +69,7 @@ Validate RDF data against SHACL shapes, natively and fast enough to run on every
 - A boolean parameter (`sh:closed`, `sh:deactivated`, `sh:uniqueLang`, `sh:qualifiedValueShapesDisjoint`) is on only for the literal `true`; `"1"^^xsd:boolean` doesn't switch it on (the W3C suite pins this).
 - A path node that is an RDF list is a sequence path, whatever else it says (also pinned by the suite).
 - An implicit class target needs the shape to be typed `sh:NodeShape` or `sh:PropertyShape` and `rdfs:Class` or `owl:Class`.
-- `sh:datatype` rejects ill-formed literals of the XSD types it knows (numbers with their ranges, booleans, dates, times, durations); unknown datatypes accept any lexical form.
+- `sh:datatype` rejects ill-typed literals (SHACL 1.0 §4.1.2 asks it for the types SPARQL 1.1 supports, and allows more). Which lexical forms a datatype has is the engine's one datatype map, nrese-xsd's (`nrese_xsd::owl::Value::parse`, which OWL reads too), beside the XSD types SPARQL compares (numbers with their ranges, booleans, dates, times, durations): binaries, `dateTimeStamp`, `anyURI`, the string types and `rdf:XMLLiteral` included. A valid form past what the map represents (a number beyond 128 bits) is well-typed; datatypes outside the map accept any lexical form. `rdf:langString` is matched by its datatype IRI alone, until the map's text model holds all of Unicode (RDF 1.1 Concepts §3.3 allows any characters in a language string; the map holds XML's Char only).
 
 ## 6. The report
 

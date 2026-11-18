@@ -1,0 +1,12 @@
+PREFIX xsd: <http://www.w3.org/2001/XMLSchema#>
+PREFIX geonames: <http://www.geonames.org/ontology#>
+
+SELECT ?f ?name ?geo ?wkt 
+WHERE { 
+   GRAPH <http://geographica.di.uoa.gr/dataset/geonames> { 
+      ?f geonames:name ?name;
+         <http://www.geonames.org/ontology#hasGeometry> ?geo.
+	   ?geo <http://www.geonames.org/ontology#asWKT> ?wkt.
+      FILTER(?name = "Tális"^^xsd:string) 
+   }
+}

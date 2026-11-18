@@ -145,6 +145,31 @@ _:b <http://e/p> _:c <http://e/g> .
     );
 }
 
+/// A subject whose statements pass the writer's bound (`jsonld-node-flush`, 64 KiB) is
+/// written as several node objects with one `@id`: they read back as the same statements.
+#[test]
+fn a_large_subject_is_written_in_several_node_objects() {
+    let mut text = String::new();
+    for i in 0..4000 {
+        text.push_str(&format!(
+            "<http://e/hub> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://e/C{}> .\n\
+             <http://e/hub> <http://e/p> <http://e/o{i}> .\n",
+            i % 3
+        ));
+    }
+    let quads: Vec<Quad> = RdfParser::from_format(RdfFormat::NQuads)
+        .for_slice(text.as_bytes())
+        .collect::<Result<_, _>>()
+        .unwrap();
+    let serializer = RdfSerializer::from_format(RdfFormat::JsonLd)
+        .with_prefix("ex", "http://e/")
+        .unwrap();
+    let (written, back) = round_trip(&quads, serializer);
+    let objects = written.matches(r#""@id":"ex:hub""#).count();
+    assert!(objects > 1, "one node object of {} bytes", written.len());
+    assert_eq!(canonical(back), canonical(quads));
+}
+
 #[test]
 fn the_expanded_writer_finds_lists() {
     let quads: Vec<Quad> = RdfParser::from_format(RdfFormat::Turtle)
@@ -162,4 +187,57 @@ fn the_expanded_writer_finds_lists() {
         r#"[{"@id":"http://e/s","http://e/p":[{"@list":[{"@value":1},{"@value":"two"},{"@list":[{"@value":3}]}]}]}]"#
     );
     assert_eq!(canonical(back), canonical(quads));
+}
+
+/// A recovering JSON-LD parser skips an element of a top-level array (or `@graph` array)
+/// that fails to expand and goes on with the next; malformed JSON still stops it.
+#[test]
+fn recovering_parsers_skip_bad_elements_and_go_on() {
+    let document = r#"[
+        {"@id": "http://example.org/a", "http://example.org/p": "1"},
+        {"@id": "http://example.org/b", "@type": 5},
+        {"@id": "http://example.org/c", "http://example.org/p": "3"}
+    ]"#;
+    let subjects = |results: &[Result<Quad, nrese_rdf_io::RdfParseError>]| -> Vec<String> {
+        results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|q| q.subject.to_string())
+            .collect()
+    };
+    let read = |text: &str, recovering: bool| -> Vec<Result<Quad, nrese_rdf_io::RdfParseError>> {
+        let parser = RdfParser::from_format(RdfFormat::JsonLd);
+        let parser = if recovering {
+            parser.recovering()
+        } else {
+            parser
+        };
+        parser.for_slice(text.as_bytes()).collect()
+    };
+    let results = read(document, true);
+    assert_eq!(
+        subjects(&results),
+        ["<http://example.org/a>", "<http://example.org/c>"],
+        "{results:?}"
+    );
+    assert_eq!(
+        results.iter().filter(|r| r.is_err()).count(),
+        1,
+        "{results:?}"
+    );
+    // Inside a top-level `@graph`, the same.
+    let graph = format!(r#"{{"@graph": {document}}}"#);
+    assert_eq!(subjects(&read(&graph, true)).len(), 2);
+    // Without recovery: nothing after the first error.
+    let strict = read(document, false);
+    assert_eq!(subjects(&strict), ["<http://example.org/a>"], "{strict:?}");
+    assert_eq!(strict.iter().filter(|r| r.is_err()).count(), 1);
+    // Malformed JSON: no recovery.
+    let broken = document.replace(r#""@type": 5}"#, r#""@type": 5"#);
+    let results = read(&broken, true);
+    assert_eq!(
+        results.iter().filter(|r| r.is_err()).count(),
+        1,
+        "{results:?}"
+    );
 }

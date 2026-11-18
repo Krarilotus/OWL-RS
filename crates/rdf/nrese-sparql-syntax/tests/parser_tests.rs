@@ -20,15 +20,108 @@ fn expression(e: &str) -> Expression {
     let GraphPattern::Project { inner, .. } = query.pattern() else {
         panic!("no projection")
     };
-    let GraphPattern::Extend { expression, .. } = inner.as_ref() else {
+    let GraphPattern::Extend { bindings, .. } = inner.as_ref() else {
         panic!("no extension")
     };
-    expression.clone()
+    bindings[0].1.clone()
 }
 
 fn int(value: &str) -> Expression {
     Literal::new_typed_literal(value, xsd::INTEGER).into()
 }
+
+// SPARQL 1.1 section 19.8: longest token, signed numerics and PathMod.
+macro_rules! signed_object_row {
+    ($name:ident, $value:literal, $datatype:literal) => {
+        #[test]
+        fn $name() {
+            let triple = format!("?s <http://e/p> {}", $value);
+            let query = parse(&format!("SELECT * {{ {triple} }}"));
+            let expected = parse(&format!(
+                "SELECT * {{ ?s <http://e/p> \"{}\"^^<http://www.w3.org/2001/XMLSchema#{}> }}",
+                $value, $datatype
+            ));
+            assert_eq!(query, expected, "signed object must remain a triple");
+            assert_eq!(round_trip(&query), query);
+            let construct = parse(&format!("CONSTRUCT WHERE {{ {triple} }}"));
+            assert_eq!(round_trip(&construct), construct);
+        }
+    };
+}
+
+signed_object_row!(path_token_positive_integer, "+3", "integer");
+signed_object_row!(path_token_negative_integer_guard, "-3", "integer");
+signed_object_row!(path_token_positive_decimal, "+3.5", "decimal");
+signed_object_row!(path_token_positive_double, "+3e2", "double");
+signed_object_row!(path_token_leading_dot_decimal, "+.5", "decimal");
+signed_object_row!(path_token_leading_dot_double, "+.5e2", "double");
+
+#[test]
+fn path_token_construct_round_trip() {
+    // Reduced from crash-15491783f49d4d5c91b5e3e24519bd3c3d99c3fa (P4-F14).
+    let query = parse("CONSTRUCT WHERE { <http://e/a> <http://e/p> +3e0 }");
+    assert_eq!(round_trip(&query), query);
+}
+
+#[test]
+fn path_token_variable_object_guard() {
+    for name in ["o", "1", "\u{e9}"] {
+        let query = parse(&format!("SELECT * {{ ?s <http://e/p>?{name} }}"));
+        let GraphPattern::Project { inner, .. } = query.pattern() else {
+            panic!("no projection")
+        };
+        assert_eq!(
+            inner.as_ref(),
+            &GraphPattern::Bgp {
+                patterns: vec![TriplePattern::new(
+                    Variable::new_unchecked("s"),
+                    NamedNode::new_unchecked("http://e/p"),
+                    TermPattern::from(Variable::new_unchecked(name)),
+                )],
+            }
+        );
+    }
+}
+
+macro_rules! path_modifier_guard {
+    ($name:ident, $modifier:literal, $variant:ident, $object:literal) => {
+        #[test]
+        fn $name() {
+            use nrese_sparql_syntax::algebra::PropertyPathExpression;
+            for gap in ["", " ", " # comment\n"] {
+                let query = parse(&format!(
+                    "SELECT * {{ ?s <http://e/p>{gap}{}{gap}{} }}",
+                    $modifier, $object
+                ));
+                let GraphPattern::Project { inner, .. } = query.pattern() else {
+                    panic!("no projection")
+                };
+                let GraphPattern::Path { path, .. } = inner.as_ref() else {
+                    panic!("expected a path: {inner:?}")
+                };
+                assert_eq!(
+                    path,
+                    &PropertyPathExpression::$variant(Box::new(
+                        NamedNode::new_unchecked("http://e/p").into()
+                    ))
+                );
+                assert_eq!(round_trip(&query), query);
+            }
+        }
+    };
+}
+
+path_modifier_guard!(path_token_plus_variable_guard, "+", OneOrMore, "?o");
+path_modifier_guard!(path_token_star_variable_guard, "*", ZeroOrMore, "?o");
+path_modifier_guard!(path_token_question_variable_guard, "?", ZeroOrOne, "?o");
+path_modifier_guard!(path_token_plus_iri_guard, "+", OneOrMore, "<http://e/o>");
+path_modifier_guard!(path_token_star_iri_guard, "*", ZeroOrMore, "<http://e/o>");
+path_modifier_guard!(
+    path_token_question_iri_guard,
+    "?",
+    ZeroOrOne,
+    "<http://e/o>"
+);
 
 fn sub(a: Expression, b: Expression) -> Expression {
     Expression::Subtract(Box::new(a), Box::new(b))
@@ -63,10 +156,11 @@ fn a_sign_before_digits_makes_a_literal() {
     let GraphPattern::Project { inner, .. } = query.pattern() else {
         panic!()
     };
-    let GraphPattern::Extend { expression, .. } = inner.as_ref() else {
+    let GraphPattern::Extend { bindings, .. } = inner.as_ref() else {
         panic!()
     };
-    assert_eq!(*expression, sub(x, int("1")));
+    // The select expression continues the group's `Extend`: the last binding.
+    assert_eq!(bindings.last().unwrap().1, sub(x, int("1")));
 }
 
 #[test]
@@ -127,6 +221,61 @@ fn nesting_is_bounded_and_deep_input_is_an_error() {
         " }".repeat(depth - 1)
     ))
     .unwrap();
+}
+
+/// SPARQL 1.2 grammar: `AnnotationPath ::= ( Reifier | AnnotationBlockPath )*` and
+/// `AnnotationBlockPath ::= '{|' PropertyListPathNotEmpty '|}'`, so an object inside a
+/// block may carry a block of its own. Nested blocks count toward the nesting limit like
+/// groups and brackets ([`SparqlParser::with_max_nesting`], ADR-0012), so deep input is an
+/// error instead of unbounded recursion. Blocks side by side are siblings and add no depth.
+#[test]
+fn nested_annotation_blocks_count_toward_the_nesting_limit() {
+    let parser = SparqlParser::new().with_max_nesting(8);
+    let nested = |n: usize| {
+        format!(
+            "SELECT * {{ ?s <urn:p> ?o {}{} }}",
+            "{| <urn:q> ?x ".repeat(n),
+            "|} ".repeat(n)
+        )
+    };
+    let update = format!(
+        "INSERT {{ <urn:s> <urn:p> <urn:o> {}{} }} WHERE {{}}",
+        "{| <urn:q> <urn:x> ".repeat(20),
+        "|} ".repeat(20)
+    );
+    let siblings = format!(
+        "SELECT * {{ ?s <urn:p> ?o {} }}",
+        "{| <urn:q> ?x |} ".repeat(1000)
+    );
+    let deep = |result: Result<(), String>| result.is_err_and(|e| e.contains("nested deeper"));
+    let query = |text: &str| {
+        parser
+            .parse_query(text)
+            .map(|_| ())
+            .map_err(|e| e.message().to_string())
+    };
+    let cases = [
+        ("20 nested blocks in a query", deep(query(&nested(20)))),
+        (
+            "20 nested blocks in an update template",
+            deep(
+                parser
+                    .parse_update(&update)
+                    .map(|_| ())
+                    .map_err(|e| e.message().to_string()),
+            ),
+        ),
+        // Guards (they parse on the base too): within the limit, and siblings add no depth.
+        ("4 nested blocks parse", query(&nested(4)).is_ok()),
+        ("1,000 sibling blocks parse", query(&siblings).is_ok()),
+    ];
+    // Every case is checked, so a failure lists each wrong one.
+    let wrong: Vec<&str> = cases
+        .iter()
+        .filter(|(_, holds)| !holds)
+        .map(|(what, _)| *what)
+        .collect();
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 #[test]
@@ -205,11 +354,12 @@ fn the_writer_keeps_a_filter_where_it_was() {
         inner: Box::new(bgp("a")),
     };
     let pattern = GraphPattern::Join {
-        left: Box::new(filter.clone()),
-        right: Box::new(GraphPattern::Union {
-            left: Box::new(bgp("b")),
-            right: Box::new(bgp("c")),
-        }),
+        inputs: vec![
+            filter.clone(),
+            GraphPattern::Union {
+                inputs: vec![bgp("b"), bgp("c")],
+            },
+        ],
     };
     let query = Query::Select {
         dataset: None,
@@ -314,4 +464,26 @@ fn a_blank_node_spans_a_filter_before_a_path() {
     let printed = parser.parse_query(text).unwrap().to_string();
     let again = parser.parse_query(&printed).unwrap().to_string();
     assert_eq!(again, printed);
+}
+
+/// A path variable (SHACL's `$PATH`) reads as its path in the predicate position, as the
+/// path written there would (a sequence through fresh blank nodes), and nowhere else: a
+/// literal, a comment and a longer name keep their text.
+#[test]
+fn a_path_variable_reads_as_its_path_only_as_a_predicate() {
+    use nrese_sparql_syntax::algebra::PropertyPathExpression;
+    let (p, q) = (
+        NamedNode::new_unchecked("http://e/p"),
+        NamedNode::new_unchecked("http://e/q"),
+    );
+    let path = PropertyPathExpression::sequence(vec![
+        p.into(),
+        PropertyPathExpression::Reverse(Box::new(q.into())),
+    ]);
+    let parser = SparqlParser::new().with_path_variable(Variable::new_unchecked("PATH"), path);
+    let substituted = parser
+        .parse_query("SELECT * { ?s $PATH ?o . ?o ?PATHX \"$PATH\" } # $PATH")
+        .unwrap();
+    let written = parse("SELECT * { ?s <http://e/p>/^<http://e/q> ?o . ?o ?PATHX \"$PATH\" }");
+    assert_eq!(substituted, written);
 }

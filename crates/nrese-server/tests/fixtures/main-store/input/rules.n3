@@ -1,0 +1,3 @@
+@prefix : <http://e/> .
+
+{ ?x :memberOf ?d . ?d :subOrganisationOf ?u } => { ?x :affiliatedWith ?u } .

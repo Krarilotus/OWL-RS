@@ -7,22 +7,33 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-nrese-core = { path = "../nrese-core" }
+smallvec = { workspace = true }
+# The store's engine: the reasoner reads its snapshots and maintains its transactions
+# (engine).
+nrese-engine = { path = "../nrese-engine" }
 nrese-exec = { path = "../nrese-exec" }
-# User rules in Notation3 (v2::n3).
+# The proof IR justifications are computed on (explain).
+nrese-owl = { path = "../nrese-owl" }
+# User rules in Notation3 (n3).
 nrese-rdf = { path = "../rdf/nrese-rdf", default-features = false }
 nrese-rdf-io = { path = "../rdf/nrese-rdf-io" }
+# Data values for the datatype consistency rules (engine::datatypes).
+nrese-xsd = { path = "../rdf/nrese-xsd" }
 hashbrown = { workspace = true }
 rayon = { workspace = true }
 thiserror.workspace = true
 
 [features]
-# The naive reference evaluator (v2::naive), the oracle the executors are tested against.
+# The naive reference evaluator (naive), the oracle the executors are tested against.
 oracle = []
 
 [dev-dependencies]
 # Its own tests and examples use the oracle.
 nrese-reasoner = { path = ".", features = ["oracle"] }
+# The consistency report's memory guard measures against budgets (tests/violations_memory.rs).
+nrese-exec = { path = "../nrese-exec", features = ["measure"] }
+# The engine's work counters, for the tests of the work a read does after its stop (REAS-3).
+nrese-engine = { path = "../nrese-engine", features = ["witness"] }
 
 [lints]
 workspace = true

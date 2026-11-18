@@ -1,10 +1,16 @@
 //! Write transactions: exact deltas over a base snapshot, published atomically on commit.
 
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
+
 use hashbrown::HashSet;
 use nrese_rdf::{Quad, QuadRef, Term, TermRef};
 use parking_lot::MutexGuard;
 
-use super::{Inner, ReadModel, Snapshot, Stack, Version};
+mod pending;
+
+pub(super) use self::pending::{Pending, SnapshotChanges};
+use super::{Inner, ReadModel, Snapshot, Version};
 use crate::durability::codec::CommitRecord;
 use crate::error::EngineResult;
 use crate::index::Layout;
@@ -22,53 +28,18 @@ pub struct CommitSummary {
     /// Inferred quads added and removed.
     pub inferred_inserted: u64,
     pub inferred_deleted: u64,
-}
-
-/// Pending changes to one stack, kept *exact* against the base snapshot: `inserts` are
-/// absent from the base, `deletes` are present in it, and the two sets are disjoint. That
-/// invariant is what the index's sign-sum visibility rule relies on.
-#[derive(Default)]
-struct Delta {
-    inserts: HashSet<EncodedQuad>,
-    deletes: HashSet<EncodedQuad>,
-}
-
-impl Delta {
-    /// Adds `quad`; returns `false` if it was already visible. `in_base` is only evaluated
-    /// when needed.
-    fn insert(&mut self, quad: EncodedQuad, in_base: impl FnOnce() -> bool) -> bool {
-        if self.deletes.remove(&quad) {
-            return true; // re-insert of a quad deleted earlier in this transaction
-        }
-        !in_base() && self.inserts.insert(quad)
-    }
-
-    /// Removes `quad`; returns `false` if it was not visible.
-    fn remove(&mut self, quad: EncodedQuad, in_base: impl FnOnce() -> bool) -> bool {
-        if self.inserts.remove(&quad) {
-            return true; // undo an insert made earlier in this transaction
-        }
-        in_base() && self.deletes.insert(quad)
-    }
-
-    fn contains(&self, quad: &EncodedQuad, in_base: impl FnOnce() -> bool) -> bool {
-        self.inserts.contains(quad) || (!self.deletes.contains(quad) && in_base())
-    }
-
-    fn counts(&self) -> (usize, usize) {
-        (self.inserts.len(), self.deletes.len())
-    }
-
-    fn net(&self) -> i64 {
-        self.inserts.len() as i64 - self.deletes.len() as i64
-    }
+    /// The asserted state after it ([`Snapshot::asserted_identity`](crate::Snapshot::asserted_identity)):
+    /// new where it changed asserted statements, the base's otherwise. A caller that
+    /// keeps state by it learns here what the commit published, never from a later read.
+    pub asserted: super::AssertedIdentity,
 }
 
 /// A write transaction holding the engine's single writer slot.
 ///
-/// It keeps one exact delta per stack. Asserted quads are written through the plain methods
-/// ([`insert`](Self::insert), [`remove`](Self::remove), …); inferred ones only through the
-/// `*_inferred` methods, which the reasoner uses and request handlers must not.
+/// It keeps one exact delta per stack, in its `Pending` changes. Asserted quads are written
+/// through the plain methods ([`insert`](Self::insert), [`remove`](Self::remove), …); inferred
+/// ones only through the `*_inferred` methods, which the reasoner uses and request handlers
+/// must not.
 ///
 /// **Disjointness.** No quad is ever both asserted and inferred. An inferred quad is visible
 /// only while it is not asserted (including pending changes), and the commit drops every
@@ -83,63 +54,290 @@ impl Delta {
 /// [`ReadModel::Materialised`]. Dropping the transaction aborts it.
 pub struct Transaction<'e> {
     engine: &'e Inner,
-    /// The writer slot; `None` for a speculative transaction ([`crate::Engine::speculative`]),
-    /// which never commits.
+    /// The writer slot; `None` for the old speculative transaction
+    /// ([`crate::Engine::speculative_shared`], until V1b), which never commits.
     _slot: Option<MutexGuard<'e, ()>>,
-    base: Snapshot,
-    asserted: Delta,
-    inferred: Delta,
+    /// The base snapshot and the pending changes over it.
+    pending: Pending,
+    /// What [`Self::asserted_identity_after`] answered first, which the commit publishes.
+    after: OnceLock<super::AssertedIdentity>,
+    /// The commit's note in a journal of the caller's ([`Self::note_commit`]).
+    note: Option<super::CommitNote<'e>>,
+    /// The reading the commit installs with its stack ([`Self::read_equality_as`]); `None`
+    /// keeps the base's.
+    reading: Option<Option<TermId>>,
+    /// What the commit publishes as its certificate ([`Self::vouch`]); `None` by default.
+    vouched: Option<super::Certificate>,
 }
 
 impl<'e> Transaction<'e> {
     pub(super) fn new(engine: &'e Inner, slot: Option<MutexGuard<'e, ()>>) -> Self {
         Self {
-            base: engine.shared.snapshot(),
+            pending: Pending::over(engine.shared.snapshot()),
             engine,
             _slot: slot,
-            asserted: Delta::default(),
-            inferred: Delta::default(),
+            after: OnceLock::new(),
+            note: None,
+            reading: None,
+            vouched: None,
         }
     }
 
-    fn delta(&self, stack: Stack) -> &Delta {
-        match stack {
-            Stack::Asserted => &self.asserted,
-            Stack::Inferred => &self.inferred,
+    /// Proof that this transaction holds the writer slot; `None` for a speculative one.
+    pub fn writer(&self) -> Option<super::WriterHeld<'_>> {
+        self._slot.as_ref().map(|_| super::WriterHeld::new())
+    }
+
+    /// The stack this commit publishes is read with `same_as` ([`Version::reading`]): its
+    /// inferred stack holds the closure over representatives of `same_as` classes, or with
+    /// `None` is read as stored. Installed with the commit's changes, in one install; a commit
+    /// without changes installs nothing.
+    pub fn read_equality_as(&mut self, same_as: Option<TermId>) {
+        self.reading = Some(same_as);
+    }
+
+    /// Installs the current stack with `same_as` as its reading and `certificate` as its
+    /// certificate now, under this transaction's writer slot: its statements, revision and
+    /// time unchanged, nothing logged or checkpointed. A store's open, whose reading and
+    /// certificate aren't on disk. Nothing for a speculative transaction.
+    pub fn install(&self, same_as: Option<TermId>, certificate: Option<super::Certificate>) {
+        if self._slot.is_some() {
+            self.engine.shared.install(same_as, certificate);
         }
     }
 
-    /// True if `quad` is in `stack`'s base plus pending delta, before disjointness is applied.
-    fn delta_contains(&self, stack: Stack, quad: &EncodedQuad) -> bool {
-        self.delta(stack)
-            .contains(quad, || self.base.stack_contains(stack, quad))
+    /// The commit publishes `certificate` with its version, for statements whose closure
+    /// it maintained; without this it publishes none.
+    pub fn vouch(&mut self, certificate: super::Certificate) {
+        self.vouched = Some(certificate);
     }
 
-    /// True if `quad` is visible in `stack`, including pending changes. An asserted quad
-    /// hides the same inferred quad, as the commit will drop it.
-    fn stack_contains(&self, stack: Stack, quad: &EncodedQuad) -> bool {
-        self.delta_contains(stack, quad)
-            && (stack == Stack::Asserted || !self.delta_contains(Stack::Asserted, quad))
+    /// The reading the commit installs: the one given, or the installed version's (the base's,
+    /// or one [`Self::install`] installed since: under the slot nothing else does).
+    fn reading(&self) -> Option<TermId> {
+        let installed = || self.engine.shared.versions.load().reading;
+        self.reading.unwrap_or_else(installed)
     }
 
-    /// Inferred quads that are also asserted after the pending changes; the commit drops them
-    /// from the inferred stack. The base stacks are disjoint, so only pending inserts of
-    /// either stack can overlap. O(d log n) for d pending inserts.
-    fn shadowed_inferred(&self) -> impl Iterator<Item = EncodedQuad> + '_ {
-        let newly_asserted = self
-            .asserted
-            .inserts
-            .iter()
-            .filter(|quad| self.delta_contains(Stack::Inferred, quad));
-        let newly_inferred = self.inferred.inserts.iter().filter(|quad| {
-            !self.asserted.inserts.contains(*quad) && self.delta_contains(Stack::Asserted, quad)
-        });
-        newly_asserted.chain(newly_inferred).copied()
+    /// Has the commit note itself in a journal of the caller's, so that the journal and the
+    /// log agree on whether it committed (a store's quarantine resolutions). [`Self::commit`]
+    /// calls `note` once, under the writer slot, with the revision it publishes: after every
+    /// step that can fail leaving the log as it was (its segment's rotation, its record's
+    /// encoding and commit time), and before the record's bytes are written. From the moment
+    /// it returns `Ok` the record alone decides the outcome: published, or the log poisoned by
+    /// its failed write (outcome unknown until the next open, and no later commit in this
+    /// process takes the revision). So a journal that holds the note is in agreement with the
+    /// log where the recovered store holds the revision, and only there.
+    ///
+    /// Not called for a commit that publishes nothing (it keeps the base's revision), nor for
+    /// one that fails before; a speculative transaction never commits. On an engine in memory
+    /// it is called before the publication, which can't fail: there is no log to poison, so
+    /// [`super::NoteError::Unknown`] refuses the commit as `Refused` does. The note runs with
+    /// the writer slot, the WAL and possibly the compaction slot held (contracts.md, lock
+    /// order): it must not call into the engine or wait for a lock, and its own I/O holds back
+    /// compaction and checkpoints for as long as it takes. One note per commit.
+    pub fn note_commit(&mut self, note: super::CommitNote<'e>) {
+        debug_assert!(self.note.is_none(), "one note per commit");
+        self.note = Some(note);
+    }
+
+    /// The asserted identity the commit will publish
+    /// ([`CommitSummary::asserted`]): a new one, reserved here, where the pending changes
+    /// change asserted statements, the base's otherwise (an inferred-only change, none, or
+    /// inserts undone by removes). A caller can key state by it before the commit makes
+    /// it visible. The same on every call. It holds only if no asserted change follows the
+    /// call (debug builds check that, and the commit's id against it); a commit that fails
+    /// or never happens leaves the id to no snapshot. Never persisted: a reopen gives new
+    /// ones.
+    pub fn asserted_identity_after(&self) -> super::AssertedIdentity {
+        *self
+            .after
+            .get_or_init(|| match self.pending.asserted().is_empty() {
+                true => self.pending.base().asserted_identity(),
+                false => super::AssertedIdentity::fresh(),
+            })
+    }
+
+    /// Debug builds: no asserted change follows [`Self::asserted_identity_after`].
+    fn assert_unanswered(&self, changed: bool) -> bool {
+        debug_assert!(
+            !changed || self.after.get().is_none(),
+            "an asserted change after asserted_identity_after"
+        );
+        changed
     }
 
     /// The state this transaction started from, without its pending changes.
     pub fn base(&self) -> &Snapshot {
-        &self.base
+        self.pending.base()
+    }
+
+    /// [`Self::pending_snapshot`], what it makes charged to `budget` before it is made and held
+    /// by the snapshot (DUR-6): its scratch, its runs of the pending changes, their lists and
+    /// its version. The base's runs read in the quad layout are their shared forms, the
+    /// store's index memory, not charged here. A refusal ([`crate::EngineError::MemoryLimit`])
+    /// returns no snapshot, keeps no charge and records no statistics. It isn't free of every
+    /// effect: it may have let go of the kept snapshot (not current), and a quad-layout form
+    /// built for the asserted stack before the refusal may stay installed in its source run's
+    /// slot (its arrays freed once nothing holds them). An unchanged
+    /// transaction asking under the same budget gets the same snapshot: the last one is kept,
+    /// with its charge, until the next write, a term interned since, or the transaction's drop.
+    pub fn pending_snapshot_within(
+        &self,
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+    ) -> EngineResult<Snapshot> {
+        let generation = self.pending.generation();
+        // Read before the memo's lock, which then holds no other lock's wait: a term interned
+        // after this read leaves the kept snapshot as current as the read it answers.
+        let dictionary_len = self.engine.shared.dictionary.len();
+        // Kept only while nothing it shows changed: no write (the generation), no term interned
+        // since (its vocabulary ends at the dictionary's length then), the
+        // same budget. Not current: taken out under the same guard (another reader may have
+        // made the current one meanwhile) and let go, outside it, before its
+        // replacement is charged. Held through the build, a stale one would count twice against
+        // the same budget; a caller still holding it keeps its own share.
+        let stale = {
+            let mut memo = self.pending.memo().lock();
+            if let Some(kept) = memo.as_ref()
+                && kept.generation == generation
+                && kept.snapshot.version().dictionary_len == dictionary_len
+                && std::ptr::eq(kept.budget.as_ptr(), std::sync::Arc::as_ptr(budget))
+            {
+                return Ok(kept.snapshot.clone());
+            }
+            memo.take()
+        };
+        drop(stale);
+        let mut scratch = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+        scratch.charge(self.pending.snapshot_changes_bound())?;
+        // A statement asserted now leaves the inferred stack (as `take_over_inferred`).
+        let SnapshotChanges {
+            asserted_inserts,
+            asserted_deletes,
+            inferred_inserts,
+            inferred_deletes,
+        } = self.pending.snapshot_changes();
+        let base = self.pending.base();
+        let seen = base.version();
+        let content = super::Content::fresh();
+        let equality = match self.changes_equality() {
+            true => Default::default(),
+            false => std::sync::Arc::clone(&seen.equality),
+        };
+        let snapshot = base.pending_within(
+            [&asserted_inserts[..], &asserted_deletes[..]],
+            [&inferred_inserts[..], &inferred_deletes[..]],
+            &self.engine.shared.forms,
+            budget,
+            |asserted, inferred| Version {
+                content,
+                // Pending: its own, even without asserted changes (staged terms).
+                asserted_content: super::AssertedIdentity::fresh(),
+                asserted,
+                inferred,
+                revision: seen.revision,
+                committed_micros: seen.committed_micros,
+                dictionary_len: self.engine.shared.dictionary.len(),
+                equality,
+                reading: seen.reading,
+                certificate: seen.certificate.clone(),
+                canonical: Default::default(),
+                // Empty, as every new version's: what this pending version's readers keep
+                // (its memo's hits share it, as they share the version).
+                own: Default::default(),
+            },
+        )?;
+        // Recorded once nothing can be refused any more (a refusal records nothing).
+        if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
+            let changed = [
+                &asserted_inserts,
+                &asserted_deletes,
+                &inferred_inserts,
+                &inferred_deletes,
+            ];
+            corpora.record(
+                seen.content,
+                content,
+                changed
+                    .into_iter()
+                    .flatten()
+                    .map(|quad| (quad.subject, quad.predicate, quad.object)),
+            );
+        }
+        drop((
+            asserted_inserts,
+            asserted_deletes,
+            inferred_inserts,
+            inferred_deletes,
+        ));
+        drop(scratch);
+        // Installed in place of what another reader kept meanwhile, which is let go after the
+        // lock (its drop may free a snapshot and release its charge).
+        let displaced = self.pending.memo().lock().replace(pending::Memo {
+            generation,
+            budget: std::sync::Arc::downgrade(budget),
+            snapshot: snapshot.clone(),
+        });
+        drop(displaced);
+        Ok(snapshot)
+    }
+
+    /// [`Self::pending_over`], what it makes charged to `budget` before it is made and held by
+    /// the snapshot (DUR-6), as [`Self::pending_snapshot_within`] charges (not kept: it reads
+    /// `view` and `hidden`, a new snapshot each call).
+    pub fn pending_over_within(
+        &self,
+        view: &Snapshot,
+        hidden: &[EncodedQuad],
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+    ) -> EngineResult<Snapshot> {
+        let mut scratch = nrese_exec::Reservation::new(std::sync::Arc::clone(budget));
+        let asserted = self.pending.asserted();
+        scratch.charge(self.pending.over_bound(hidden))?;
+        let seen = view.version();
+        let gone = self.pending.over_gone(&seen.inferred, hidden);
+        let asserted_inserts: Vec<EncodedQuad> = asserted.inserts.iter().copied().collect();
+        let asserted_deletes: Vec<EncodedQuad> = asserted.deletes.iter().copied().collect();
+        let content = super::Content::fresh();
+        let equality = match self.changes_equality() {
+            true => Default::default(),
+            false => std::sync::Arc::clone(&seen.equality),
+        };
+        let snapshot = view.pending_within(
+            [&asserted_inserts[..], &asserted_deletes[..]],
+            [&[][..], &gone[..]],
+            &self.engine.shared.forms,
+            budget,
+            |asserted, inferred| Version {
+                content,
+                // Pending: its own, even without asserted changes (staged terms).
+                asserted_content: super::AssertedIdentity::fresh(),
+                asserted,
+                inferred,
+                revision: seen.revision,
+                committed_micros: seen.committed_micros,
+                dictionary_len: self.engine.shared.dictionary.len(),
+                equality,
+                reading: seen.reading,
+                certificate: seen.certificate.clone(),
+                canonical: Default::default(),
+                // Empty, as every new version's: what this pending version's readers keep.
+                own: Default::default(),
+            },
+        )?;
+        if let Some(corpora) = self.engine.shared.statistics.corpora.get() {
+            corpora.record(
+                seen.content,
+                content,
+                [&asserted_inserts, &asserted_deletes, &gone]
+                    .into_iter()
+                    .flatten()
+                    .map(|quad| (quad.subject, quad.predicate, quad.object)),
+            );
+        }
+        drop((gone, asserted_inserts, asserted_deletes));
+        drop(scratch);
+        Ok(snapshot)
     }
 
     /// The state the transaction would commit, as a snapshot: the base with the pending
@@ -147,56 +345,89 @@ impl<'e> Transaction<'e> {
     /// published. It sees the terms the transaction interned. Costs O(d log d) for d
     /// pending changes.
     pub fn pending_snapshot(&self) -> Snapshot {
-        let shadowed: HashSet<EncodedQuad> = self.shadowed_inferred().collect();
-        let asserted_inserts: Vec<EncodedQuad> = self.asserted.inserts.iter().copied().collect();
-        let asserted_deletes: Vec<EncodedQuad> = self.asserted.deletes.iter().copied().collect();
         // A statement asserted now leaves the inferred stack (as `take_over_inferred`).
-        let inferred_inserts: Vec<EncodedQuad> = self
-            .inferred
-            .inserts
-            .iter()
-            .filter(|quad| !shadowed.contains(*quad))
-            .copied()
-            .collect();
-        let mut inferred_deletes: Vec<EncodedQuad> =
-            self.inferred.deletes.iter().copied().collect();
-        inferred_deletes.extend(shadowed.iter().filter(|quad| {
-            !self.inferred.inserts.contains(*quad)
-                && !self.inferred.deletes.contains(*quad)
-                && self.base.stack_contains(Stack::Inferred, quad)
-        }));
-        let base = self.base.version();
+        let SnapshotChanges {
+            asserted_inserts,
+            asserted_deletes,
+            inferred_inserts,
+            inferred_deletes,
+        } = self.pending.snapshot_changes();
+        let base = self.pending.base().version();
+        let content = super::Content::fresh();
         let version = Version {
-            asserted: base
-                .asserted
-                .with_delta(&asserted_inserts, &asserted_deletes),
+            content,
+            // Pending: its own, even without asserted changes (staged terms).
+            asserted_content: super::AssertedIdentity::fresh(),
+            asserted: base.asserted.with_delta_in(
+                &asserted_inserts,
+                &asserted_deletes,
+                &self.engine.shared.forms,
+            ),
             inferred: base
                 .inferred
                 .with_delta(&inferred_inserts, &inferred_deletes),
             revision: base.revision,
+            committed_micros: base.committed_micros,
             dictionary_len: self.engine.shared.dictionary.len(),
             equality: match self.changes_equality() {
                 true => Default::default(),
                 false => std::sync::Arc::clone(&base.equality),
             },
+            reading: base.reading,
+            certificate: base.certificate.clone(),
+            canonical: Default::default(),
+            own: Default::default(),
         };
-        self.base.with_version(version)
+        self.pending.base().with_version(version)
+    }
+
+    /// [`Self::pending_snapshot`] as a reader of `view` reads it: `view` is a restricted
+    /// snapshot of this transaction's base (its asserted statements, a subset of its
+    /// inferred ones and statements added to them: [`Snapshot::with_inferred_only`],
+    /// [`Snapshot::with_inferred_mask`]). The result is `view` with the pending asserted
+    /// changes, and without the inferred statements the pending changes delete, assert, or
+    /// that `hidden` names. The pending inferred inserts aren't in it: only the reasoner
+    /// writes them, for the commit. O(d log d + h) for d pending changes and h hidden
+    /// statements: the view's runs are shared, never copied or scanned.
+    pub fn pending_over(&self, view: &Snapshot, hidden: &[EncodedQuad]) -> Snapshot {
+        let seen = view.version();
+        let gone = self.pending.over_gone(&seen.inferred, hidden);
+        let asserted = self.pending.asserted();
+        let asserted_inserts: Vec<EncodedQuad> = asserted.inserts.iter().copied().collect();
+        let asserted_deletes: Vec<EncodedQuad> = asserted.deletes.iter().copied().collect();
+        let content = super::Content::fresh();
+        let version = Version {
+            content,
+            // Pending: its own, even without asserted changes (staged terms).
+            asserted_content: super::AssertedIdentity::fresh(),
+            asserted: seen.asserted.with_delta_in(
+                &asserted_inserts,
+                &asserted_deletes,
+                &self.engine.shared.forms,
+            ),
+            inferred: seen.inferred.with_delta(&[], &gone),
+            revision: seen.revision,
+            committed_micros: seen.committed_micros,
+            dictionary_len: self.engine.shared.dictionary.len(),
+            equality: match self.changes_equality() {
+                true => Default::default(),
+                false => std::sync::Arc::clone(&seen.equality),
+            },
+            reading: seen.reading,
+            certificate: seen.certificate.clone(),
+            canonical: Default::default(),
+            own: Default::default(),
+        };
+        view.with_version(version)
     }
 
     /// Whether the pending changes touch an `owl:sameAs` statement while reads expand
     /// equality classes: then the next version computes its classes anew.
     fn changes_equality(&self) -> bool {
-        let Some(same_as) = *self.engine.shared.equality.read() else {
+        let Some(same_as) = self.reading() else {
             return false;
         };
-        [
-            &self.asserted.inserts,
-            &self.asserted.deletes,
-            &self.inferred.inserts,
-            &self.inferred.deletes,
-        ]
-        .into_iter()
-        .any(|set| set.iter().any(|quad| quad.predicate == same_as))
+        self.pending.touches_predicate(same_as)
     }
 
     /// Number of asserted and inferred quads, including pending changes.
@@ -207,20 +438,7 @@ impl<'e> Transaction<'e> {
     /// Number of quads visible in `model`, including pending changes. O(1) for the asserted
     /// stack; the inferred count costs O(d log n) for d pending inserts.
     pub fn len_in(&self, model: ReadModel) -> u64 {
-        Stack::ALL
-            .into_iter()
-            .filter(|&stack| model.includes(stack))
-            .map(|stack| {
-                let base = self.base.len_in(stack.model());
-                let shadowed = match stack {
-                    Stack::Asserted => 0,
-                    Stack::Inferred => self.shadowed_inferred().count() as u64,
-                };
-                base.checked_add_signed(self.delta(stack).net())
-                    .and_then(|len| len.checked_sub(shadowed))
-                    .expect("exact deltas keep counts non-negative")
-            })
-            .sum()
+        self.pending.len_in(model)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -229,23 +447,23 @@ impl<'e> Transaction<'e> {
 
     /// Pending asserted (inserted, deleted) counts.
     pub fn pending(&self) -> (usize, usize) {
-        self.asserted.counts()
+        self.pending.asserted().counts()
     }
 
     /// Pending asserted inserts: quads absent from the base that the commit would add.
     pub fn inserted(&self) -> impl Iterator<Item = EncodedQuad> + '_ {
-        self.asserted.inserts.iter().copied()
+        self.pending.asserted().inserts.iter().copied()
     }
 
     /// Pending asserted deletes: quads present in the base that the commit would remove.
     pub fn deleted(&self) -> impl Iterator<Item = EncodedQuad> + '_ {
-        self.asserted.deletes.iter().copied()
+        self.pending.asserted().deletes.iter().copied()
     }
 
     /// Pending inferred (inserted, deleted) counts, before the commit drops inferred quads
     /// that end up asserted.
     pub fn inferred_pending(&self) -> (usize, usize) {
-        self.inferred.counts()
+        self.pending.inferred().counts()
     }
 
     pub fn contains(&self, quad: &EncodedQuad) -> bool {
@@ -253,9 +471,7 @@ impl<'e> Transaction<'e> {
     }
 
     pub fn contains_in(&self, model: ReadModel, quad: &EncodedQuad) -> bool {
-        Stack::ALL
-            .into_iter()
-            .any(|stack| model.includes(stack) && self.stack_contains(stack, quad))
+        self.pending.contains_in(model, quad)
     }
 
     /// Asserted and inferred quads matching `pattern`, including pending changes.
@@ -273,48 +489,17 @@ impl<'e> Transaction<'e> {
         model: ReadModel,
         pattern: &QuadPattern,
     ) -> impl Iterator<Item = EncodedQuad> + use<'a, 'e> {
-        let pattern = *pattern;
-        Stack::ALL
-            .into_iter()
-            .filter(move |&stack| model.includes(stack))
-            .flat_map(move |stack| {
-                let delta = self.delta(stack);
-                let inferred = stack == Stack::Inferred;
-                // Base inferred quads can only be shadowed by pending asserted inserts (the
-                // base stacks are disjoint): a hash probe instead of an index lookup.
-                let base = self.base.stack_quads(stack, &pattern).filter(move |quad| {
-                    let shadowed = inferred && self.asserted.inserts.contains(quad);
-                    !shadowed && !delta.deletes.contains(quad)
-                });
-                let pending = delta.inserts.iter().copied().filter(move |quad| {
-                    let shadowed = inferred && self.delta_contains(Stack::Asserted, quad);
-                    !shadowed && pattern.matches(quad)
-                });
-                base.chain(pending)
-            })
+        self.pending.quads_for_pattern_in(model, pattern)
     }
 
     /// True if the named graph `graph` contains at least one quad, including pending changes.
     pub fn contains_named_graph(&self, graph: TermId) -> bool {
-        !graph.is_default_graph()
-            && self
-                .quads_for_pattern(&QuadPattern::in_graph(graph))
-                .next()
-                .is_some()
+        self.pending.contains_named_graph(graph)
     }
 
     /// Named graphs that are non-empty including pending changes, in id order.
     pub fn named_graphs(&self) -> Vec<TermId> {
-        let mut graphs: Vec<TermId> = self
-            .base
-            .named_graphs()
-            .chain(self.asserted.inserts.iter().map(|quad| quad.graph))
-            .filter(|graph| !graph.is_default_graph())
-            .collect();
-        graphs.sort_unstable();
-        graphs.dedup();
-        graphs.retain(|&graph| self.contains_named_graph(graph));
-        graphs
+        self.pending.named_graphs()
     }
 
     /// Returns the id of `term`, adding it to the dictionary if needed.
@@ -335,10 +520,44 @@ impl<'e> Transaction<'e> {
         self.engine.shared.dictionary.decode(id)
     }
 
-    /// Asserts `quad`; returns `false` if it was already asserted.
+    /// Asserts `quad`; returns `false` if it was already asserted. Its growth is uncharged
+    /// ([`Self::try_insert`] charges it).
     pub fn insert(&mut self, quad: QuadRef<'_>) -> bool {
         let encoded = self.engine.shared.dictionary.intern_quad(quad);
         self.insert_encoded(encoded)
+    }
+
+    /// [`Self::insert`], the pending changes' growth charged to the attached budget
+    /// ([`Self::charge_pending_to`]) before it happens, and before `quad`'s terms are interned:
+    /// refused ([`crate::EngineError::MemoryLimit`]), nothing changes and nothing is interned.
+    /// Without a budget attached it is [`Self::insert`].
+    pub fn try_insert(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
+        if self.pending.insert_may_grow() {
+            let dictionary = &self.engine.shared.dictionary;
+            match dictionary.lookup_quad_bounded(quad, u64::MAX) {
+                // Its terms are known: charged only where it is a new entry, not where it
+                // undoes a removal or is asserted already.
+                Some(encoded) => return self.try_insert_encoded(encoded),
+                // A term new to the dictionary: the quad is new, and needs the room, charged
+                // before its terms are interned.
+                None => self.pending.try_room_for_insert()?,
+            }
+        }
+        let encoded = self.engine.shared.dictionary.intern_quad(quad);
+        self.try_insert_encoded(encoded)
+    }
+
+    /// [`Self::remove`], the pending changes' growth charged as [`Self::try_insert`]'s is.
+    pub fn try_remove(&mut self, quad: QuadRef<'_>) -> EngineResult<bool> {
+        match self
+            .engine
+            .shared
+            .dictionary
+            .lookup_quad_bounded(quad, u64::MAX)
+        {
+            Some(encoded) => self.try_remove_encoded(encoded),
+            None => Ok(false),
+        }
     }
 
     /// Retracts the asserted `quad`; returns `false` if it was not asserted. Never interns.
@@ -354,76 +573,104 @@ impl<'e> Transaction<'e> {
         }
     }
 
-    /// Asserts an already-encoded quad. Its ids must come from this engine's dictionary.
-    /// Returns `false` if it was already asserted; asserting an inferred quad returns `true`
-    /// (it becomes explicit).
-    pub fn insert_encoded(&mut self, quad: EncodedQuad) -> bool {
-        let base = &self.base;
-        self.asserted
-            .insert(quad, || base.stack_contains(Stack::Asserted, &quad))
+    /// Pays for the pending changes' growth from `budget` for their life: what
+    /// [`Self::try_reserve_inserts`] reserves and the charged changes ([`Self::try_insert`],
+    /// [`Self::try_remove`], [`Self::remove_matching`]) grow is charged to it before it is
+    /// allocated, and held until the transaction is dropped or its commit has freed the
+    /// changes. The mutation
+    /// pipeline attaches the request's envelope here. Attaching the same budget again changes
+    /// nothing; another one is refused ([`crate::EngineError::Configuration`]).
+    pub fn charge_pending_to(&mut self, budget: Arc<nrese_exec::Budget>) -> EngineResult<()> {
+        self.pending.charge_to(budget)
     }
 
-    /// Retracts an asserted quad; inferred quads are unaffected.
+    /// Whether a budget pays for the pending changes' growth ([`Self::charge_pending_to`]): a
+    /// caller that reserves only where one does, as one without a budget has nothing to reserve
+    /// from (an engine user's own transaction, a test).
+    pub fn charges_pending(&self) -> bool {
+        self.pending.charged()
+    }
+
+    /// Room for `more` asserted inserts, charged to the attached budget
+    /// ([`Self::charge_pending_to`]) before the pending table grows: the next `more` inserts
+    /// allocate nothing. Refused ([`crate::EngineError::MemoryLimit`]), nothing changes;
+    /// without a budget attached it is an error ([`crate::EngineError::Configuration`]).
+    pub fn try_reserve_inserts(&mut self, more: usize) -> EngineResult<()> {
+        self.pending.try_reserve_inserts(more)
+    }
+
+    /// Asserts an already-encoded quad. Its ids must come from this engine's dictionary.
+    /// Returns `false` if it was already asserted; asserting an inferred quad returns `true`
+    /// (it becomes explicit). Growth past the room [`Self::try_reserve_inserts`] reserved is
+    /// uncharged here ([`Self::try_insert_encoded`] charges it).
+    pub fn insert_encoded(&mut self, quad: EncodedQuad) -> bool {
+        let changed = self.pending.insert_asserted(quad);
+        self.assert_unanswered(changed)
+    }
+
+    /// [`Self::insert_encoded`], its growth charged as [`Self::try_insert`]'s is.
+    pub fn try_insert_encoded(&mut self, quad: EncodedQuad) -> EngineResult<bool> {
+        let changed = self.pending.try_insert_asserted(quad)?;
+        Ok(self.assert_unanswered(changed))
+    }
+
+    /// Retracts an asserted quad; inferred quads are unaffected. Its growth is uncharged
+    /// ([`Self::try_remove_encoded`] charges it).
     pub fn remove_encoded(&mut self, quad: EncodedQuad) -> bool {
-        let base = &self.base;
-        self.asserted
-            .remove(quad, || base.stack_contains(Stack::Asserted, &quad))
+        let changed = self.pending.remove_asserted(quad);
+        self.assert_unanswered(changed)
+    }
+
+    /// [`Self::remove_encoded`], its growth charged as [`Self::try_insert`]'s is.
+    pub fn try_remove_encoded(&mut self, quad: EncodedQuad) -> EngineResult<bool> {
+        let changed = self.pending.try_remove_asserted(quad)?;
+        Ok(self.assert_unanswered(changed))
     }
 
     /// Retracts every asserted quad matching `pattern` (SPARQL `CLEAR`/`DROP`, GSP
-    /// `PUT`/`DELETE`). Returns the number of quads removed.
-    pub fn remove_matching(&mut self, pattern: &QuadPattern) -> u64 {
-        let matching: Vec<_> = self
-            .quads_for_pattern_in(ReadModel::Asserted, pattern)
-            .collect();
-        matching
-            .into_iter()
-            .map(|quad| u64::from(self.remove_encoded(quad)))
-            .sum()
+    /// `PUT`/`DELETE`). Returns the number of quads removed. What the retractions grow is
+    /// charged to the attached budget before it is allocated, and nothing else is, however
+    /// many quads match: refused ([`crate::EngineError::MemoryLimit`]) part way, the
+    /// transaction holds part of the removal and is to be dropped.
+    pub fn remove_matching(&mut self, pattern: &QuadPattern) -> EngineResult<u64> {
+        let removed = self.pending.try_remove_matching(pattern)?;
+        self.assert_unanswered(removed > 0);
+        Ok(removed)
     }
 
     /// Adds an inferred statement (in the default graph). Returns `false` if it is already
     /// inferred, or asserted (asserted statements are never also inferred). Reasoner only.
     pub fn insert_inferred(&mut self, triple: EncodedTriple) -> bool {
-        let quad = triple.in_default_graph();
-        if self.stack_contains(Stack::Asserted, &quad) {
-            return false;
-        }
-        let base = &self.base;
-        self.inferred
-            .insert(quad, || base.stack_contains(Stack::Inferred, &quad))
+        self.pending.insert_inferred(triple.in_default_graph())
     }
 
     /// Removes an inferred statement; returns `false` if it was not visible as inferred.
     /// Reasoner only.
     pub fn remove_inferred(&mut self, triple: EncodedTriple) -> bool {
-        let quad = triple.in_default_graph();
-        if !self.stack_contains(Stack::Inferred, &quad) {
-            return false;
-        }
-        let base = &self.base;
-        self.inferred
-            .remove(quad, || base.stack_contains(Stack::Inferred, &quad))
+        self.pending.remove_inferred(triple.in_default_graph())
     }
 
     /// Pending inferred inserts.
     pub fn inferred_inserted(&self) -> impl Iterator<Item = EncodedTriple> + '_ {
-        self.inferred.inserts.iter().map(|&quad| quad.into())
+        self.pending
+            .inferred()
+            .inserts
+            .iter()
+            .map(|&quad| quad.into())
     }
 
     /// Pending inferred deletes.
     pub fn inferred_deleted(&self) -> impl Iterator<Item = EncodedTriple> + '_ {
-        self.inferred.deletes.iter().map(|&quad| quad.into())
+        self.pending
+            .inferred()
+            .deletes
+            .iter()
+            .map(|&quad| quad.into())
     }
 
     /// Enforces disjointness: inferred quads that end up asserted leave the inferred stack.
     fn take_over_inferred(&mut self) {
-        let shadowed: Vec<_> = self.shadowed_inferred().collect();
-        let base = &self.base;
-        for quad in shadowed {
-            self.inferred
-                .remove(quad, || base.stack_contains(Stack::Inferred, &quad));
-        }
+        self.pending.take_over_inferred();
     }
 
     /// Publishes the pending changes of both stacks as one new revision. In durable mode the
@@ -438,25 +685,47 @@ impl<'e> Transaction<'e> {
         }
         self.take_over_inferred();
         let changes_equality = self.changes_equality();
+        let reading = self.reading();
+        // The id the commit publishes where it changes asserted statements: the one
+        // reserved ([`Self::asserted_identity_after`]), or one chosen when published. Never
+        // the base's: a change after an answer of "unchanged" still gets a new one.
+        let reserved = self.after.get().copied().filter(|&after| {
+            !self.pending.asserted().is_empty() && after != self.pending.base().asserted_identity()
+        });
         let Self {
             engine,
             _slot,
-            base,
-            asserted,
-            inferred,
+            pending,
+            after,
+            note,
+            vouched,
+            ..
         } = self;
+        // The pending changes' charge, bound first so it drops last: after the sets are freed,
+        // and after the record made of them is published.
+        let (_charge, base, asserted, inferred) = pending.into_parts();
+        let promised = after.into_inner();
         let count = |set: &HashSet<EncodedQuad>| set.len() as u64;
-        let summary = |revision| CommitSummary {
+        let summary = |revision, asserted_identity| CommitSummary {
             revision,
+            asserted: asserted_identity,
             inserted: count(&asserted.inserts),
             deleted: count(&asserted.deletes),
             inferred_inserted: count(&inferred.inserts),
             inferred_deleted: count(&inferred.deletes),
         };
-        if asserted.counts() == (0, 0) && inferred.counts() == (0, 0) {
-            return Ok(summary(base.revision()));
+        let checked = |summary: CommitSummary| {
+            debug_assert!(
+                promised.is_none_or(|promised| promised == summary.asserted),
+                "the commit publishes what asserted_identity_after said"
+            );
+            summary
+        };
+        if asserted.is_empty() && inferred.is_empty() {
+            // Nothing published: the note isn't called ([`Self::note_commit`]).
+            return Ok(checked(summary(base.revision(), base.asserted_identity())));
         }
-        let summary = summary(base.revision() + 1);
+        let mut summary = summary(base.revision() + 1, base.asserted_identity());
         let shared = &engine.shared;
         let dictionary_len = shared.dictionary.len();
         let dictionary_start = base.dictionary_len();
@@ -476,54 +745,196 @@ impl<'e> Transaction<'e> {
             deletes: asserted.deletes.into_iter().collect(),
             inferred_inserts: triples(inferred.inserts),
             inferred_deletes: triples(inferred.deletes),
-            committed_micros: Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map_or(0, |since| since.as_micros() as u64),
-            ),
+            // Stamped as it goes to the log ([`Inner::publish_record`]).
+            committed_micros: None,
         };
+        // Kept: the base's (single writer; a merge keeps it).
+        if let Some(new) = engine.publish_record(
+            &record,
+            true,
+            reserved,
+            dictionary_len,
+            changes_equality,
+            reading,
+            vouched,
+            note,
+        )? {
+            summary.asserted = new;
+        }
+        Ok(checked(summary))
+    }
+}
+
+impl Inner {
+    /// Publishes `record` as the next revision, its terms already in the dictionary
+    /// (`dictionary_len` of them): logged first in durable mode, then post-commit
+    /// maintenance. The caller holds the writer slot: a commit, or a replicated record.
+    /// Returns the published version's new [`AssertedIdentity`](super::AssertedIdentity),
+    /// `None` where it keeps the previous one (no asserted change). A `local` commit may
+    /// bring the new one, `reserved` ([`Transaction::asserted_identity_after`]); otherwise
+    /// it is chosen here.
+    ///
+    /// A `local` commit is stamped by the store's clock ([`Shared::stamp`]) when its record
+    /// goes to the log, its runs built and its layout converted, and the record and the
+    /// version take that one time. A replicated record keeps the
+    /// primary's time, which the clock takes too.
+    ///
+    /// A local commit's `note` ([`Transaction::note_commit`]) is called at the point that
+    /// method names: in the log's append, or, in memory, before the publication.
+    #[expect(clippy::too_many_arguments, reason = "a record and its reading")]
+    pub(super) fn publish_record(
+        &self,
+        record: &CommitRecord,
+        local: bool,
+        reserved: Option<super::AssertedIdentity>,
+        dictionary_len: u64,
+        changes_equality: bool,
+        reading: Option<TermId>,
+        certificate: Option<super::Certificate>,
+        note: Option<super::CommitNote<'_>>,
+    ) -> EngineResult<Option<super::AssertedIdentity>> {
+        // New where the record changes asserted statements; kept for an inferred-only one.
+        // Chosen once, for the durable and the in-memory path alike.
+        let changes_asserted = !record.inserts.is_empty() || !record.deletes.is_empty();
+        debug_assert!(local || reserved.is_none(), "only a local commit reserves");
+        debug_assert!(local || note.is_none(), "only a local commit has a note");
+        debug_assert!(
+            reserved.is_none() || changes_asserted,
+            "the commit's delta and its record agree on an asserted change"
+        );
+        let asserted_identity =
+            changes_asserted.then(|| reserved.unwrap_or_else(super::AssertedIdentity::fresh));
+        let shared = &self.shared;
         // The first quad in a named graph turns a default-graph asserted stack into a quad
-        // stack. No compaction or checkpoint may replace its runs meanwhile: the writer slot
-        // excludes other commits, the compaction slot both of those.
+        // stack. No merge or mapped checkpoint may replace its runs between the conversion
+        // and the publication: the writer slot excludes other commits, the compaction slot
+        // both of those. It is converted first, in parallel without the slot, and kept where
+        // the stack's runs are still the ones converted. The record's runs are built before
+        // that, in the layout the stack will have (no holder of the compaction slot runs
+        // parallel work; only commits, under the writer slot, change the layout).
         let latest = shared.versions.load();
         let converting = latest.asserted.layout() == Layout::DefaultGraph && record.names_a_graph();
-        let _compaction = converting.then(|| shared.versions.compaction_slot.lock());
-        let converted = converting.then(|| shared.versions.load().asserted.with_quads_layout());
-        let asserted_layout = converted
-            .as_ref()
-            .map_or(latest.asserted.layout(), |index| index.layout());
+        let asserted_layout = match converting {
+            true => Layout::Quads,
+            false => latest.asserted.layout(),
+        };
         drop(latest);
         let [asserted_run, inferred_run] = record.runs(asserted_layout);
+        let (_compaction, converted) = match converting {
+            true => {
+                let (slot, converted) = shared.versions.converted_asserted(&shared.forms);
+                (Some(slot), Some(converted))
+            }
+            false => (None, None),
+        };
+        debug_assert!(
+            converted
+                .as_ref()
+                .is_none_or(|index| index.layout() == asserted_layout)
+        );
         let revision = record.revision;
-        let publish = move |current: &Version| {
+        // The contents published from and to, for reader-scoped searches' lineage
+        // ([`super::corpora`]), recorded once the publication's locks are let go.
+        let published = std::cell::Cell::new(None);
+        let published_to = &published;
+        let publish = move |current: &Version, committed: Option<u64>| {
             debug_assert_eq!(current.revision + 1, revision, "single writer");
             let asserted = converted.as_ref().unwrap_or(&current.asserted);
+            let content = super::Content::fresh();
+            published_to.set(Some((current.content, content)));
             Version {
+                content,
+                asserted_content: asserted_identity.unwrap_or(current.asserted_content),
                 asserted: asserted.with_run(asserted_run),
                 inferred: current.inferred.with_run(inferred_run),
                 revision,
+                // The latest of its commits: unknown stays unknown, and a replicated record
+                // (a primary's log may step back) bounds what came before too.
+                committed_micros: crate::durability::later(current.committed_micros, committed),
                 dictionary_len,
-                equality: match changes_equality {
+                // While expansion is disabled no predicate is tracked. A published
+                // version must not inherit a cell an older snapshot may still fill.
+                // Pending views instead keep their base's frozen equality mode.
+                equality: match changes_equality || reading.is_none() {
                     true => Default::default(),
                     false => std::sync::Arc::clone(&current.equality),
                 },
+                // With its changes, in the one install: a reader reads the old stack in its
+                // reading or this one in the commit's.
+                reading,
+                certificate: certificate.clone(),
+                canonical: Default::default(),
+                own: Default::default(),
             }
         };
         let wal_bytes = match &shared.durable {
             Some(durable) => {
                 let mut wal = durable.wal.lock();
-                wal.append(&record)?;
-                shared.versions.publish(publish);
+                let mut stamp = || shared.stamp();
+                let stamp: Option<&mut dyn FnMut() -> u64> = match local {
+                    true => Some(&mut stamp),
+                    false => None,
+                };
+                let committed = wal.append(record, stamp, note)?;
+                if !local {
+                    shared
+                        .clock
+                        .fetch_max(committed.unwrap_or(0), Ordering::Relaxed);
+                }
+                shared
+                    .versions
+                    .publish(|current| publish(current, committed));
                 wal.bytes_since_checkpoint()
             }
             None => {
-                shared.versions.publish(publish);
+                // No log to poison: an unknown journal refuses the commit as a refusal does.
+                if let Some(note) = note {
+                    match note(revision) {
+                        Ok(()) => {}
+                        Err(
+                            super::NoteError::Refused(error) | super::NoteError::Unknown(error),
+                        ) => {
+                            return Err(crate::EngineError::CommitNoteRefused(error));
+                        }
+                    }
+                }
+                let committed = match local {
+                    true => Some(shared.stamp()),
+                    false => {
+                        shared
+                            .clock
+                            .fetch_max(record.committed_micros.unwrap_or(0), Ordering::Relaxed);
+                        record.committed_micros
+                    }
+                };
+                shared
+                    .versions
+                    .publish(|current| publish(current, committed));
                 0
             }
         };
+        // What the commit touched, where reader-scoped searches keep corpora: under the
+        // writer slot (steps are recorded in commit order), after the publication's locks.
+        // A search of the new version meanwhile finds no step and walks.
+        if let (Some(corpora), Some((parent, child))) =
+            (shared.statistics.corpora.get(), published.get())
+        {
+            let quads = record.inserts.iter().chain(&record.deletes);
+            let triples = record
+                .inferred_inserts
+                .iter()
+                .chain(&record.inferred_deletes);
+            corpora.record(
+                parent,
+                child,
+                quads
+                    .map(|q| (q.subject, q.predicate, q.object))
+                    .chain(triples.map(|t| (t.subject, t.predicate, t.object))),
+            );
+        }
         // After the commit's own compaction slot (a conversion's): compacting takes it.
         drop(_compaction);
-        engine.after_commit(wal_bytes);
-        Ok(summary)
+        self.after_commit(wal_bytes);
+        Ok(asserted_identity)
     }
 }

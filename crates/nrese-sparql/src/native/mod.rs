@@ -11,16 +11,27 @@
 //! smaller than the next pattern, and otherwise by merge joins on sorted scans or hash joins.
 //! `COUNT(*)` over a single pattern reads the count from the index.
 
+mod aggregate;
+pub(crate) mod cache_key;
+mod cached;
+pub(crate) use cached::output_key;
 mod calendar;
+mod canonical;
+mod decode_cache;
 mod equality;
+#[cfg(test)]
+mod equality_tests;
 mod equijoin;
+mod estimate;
 mod exists;
 pub(crate) mod expr;
 mod fast;
 mod federation;
 mod geo;
 mod geo_formats;
+mod late;
 mod lateral;
+mod numeric;
 
 /// The reference system (an IRI) and geometry of a GeoSPARQL literal: WKT, GeoJSON or
 /// GML; `None` for other terms. EPSG:4326 is read as CRS84 (longitude first).
@@ -28,48 +39,85 @@ pub fn geometry_literal(term: &nrese_rdf::Term) -> Option<(String, ::geo::Geomet
     geo::parse(term).map(|shape| (shape.crs, shape.geometry))
 }
 mod output;
+mod path_joins;
 mod paths;
 mod plan;
+mod preparation;
+pub(crate) use preparation::prepare_ql_query;
+use preparation::{ql_rewriting, semantic_pattern};
+use reads::{Buffer, List, Reads};
 mod pushdown;
+pub(crate) use pushdown::per_solution;
+#[cfg(test)]
+mod budget_tests;
+#[cfg(test)]
+mod graph_scope_tests;
+#[cfg(test)]
+mod graph_tests;
+#[cfg(test)]
+mod handover_tests;
+#[cfg(test)]
+mod id_set_tests;
+#[cfg(test)]
+mod join_order_tests;
+#[cfg(test)]
+mod lone_pattern_tests;
+#[cfg(test)]
+mod optimise_tests;
+#[cfg(test)]
+mod overlap_tests;
+pub(crate) mod ql;
 mod ranges;
+mod reads;
+mod scan_columns;
 mod search;
+#[cfg(test)]
+mod set_budget_tests;
 mod sets;
 mod sideways;
 mod spatial;
 mod stream;
 mod strings;
 mod substitute;
+mod triple_joins;
 mod triple_terms;
+pub(crate) mod typed_results;
 pub(crate) mod value;
+#[cfg(test)]
+mod vector_budget_tests;
+mod vectors;
 mod wcoj;
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering as AtomicOrdering};
 use std::time::Instant;
 
 use crate::results::{
     CancellationToken, QueryEvaluationError, QueryResults, QuerySolutionIter, QueryTripleIter,
 };
+use nrese_engine::engine::characteristic::CharacteristicSets;
 use nrese_engine::quad::Permutation;
 use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
 use nrese_exec::join::{
-    anti_join_in_place, compatible_mask, join, join_keeping_left_order, join_with_undef, left_join,
-    outer_join_with_undef,
+    JoinStop, anti_join_in_place, compatible_mask, join, join_keeping_left_order, join_with_undef,
+    left_join, outer_join_with_undef,
 };
 use nrese_exec::{
-    Budget, BudgetExceeded, IdTable, UNDEF, computed_id, computed_index, group::group_rows,
+    Budget, BudgetExceeded, ChargedMap, ChargedVec, Grant, IdTable, Reservation, UNDEF,
+    computed_id, computed_index,
 };
-use nrese_rdf::vocab::xsd;
-use nrese_rdf::{Literal, Term, Variable};
+use nrese_rdf::{Term, Variable};
 use nrese_sparql_syntax::Query;
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, AggregateFunction, Expression, GraphPattern, OrderExpression,
 };
+use nrese_sparql_syntax::internal;
 use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern, TriplePattern};
-use nrese_xsd::{Decimal, Double, Float, Integer};
+use nrese_xsd::Integer;
+use numeric::Numeric;
 use rayon::prelude::*;
 
 /// The most numbers kept per aggregate argument between groupings ([`Context::numeric_pass`]).
@@ -83,6 +131,8 @@ const PARALLEL_RANKS: usize = 4096;
 use std::borrow::Cow;
 
 use crate::query::{PlanStep, QueryOptions};
+use aggregate::{Agg, Aggregator, Number, counts_rows, finish_total, integer, integer_agg};
+pub use aggregate::{average, group_concat, sum};
 use expr::Evaluator;
 use value::Value;
 
@@ -90,9 +140,27 @@ use value::Value;
 /// probing the index once per result row instead of scanning it.
 const PROBE_FACTOR: u64 = 32;
 
+/// EXPLAIN's step for a BGP planned without the characteristic sets, its estimate budget
+/// passed ([`Context::with_sets`]).
+const WITHOUT_SETS: &str = "join order";
+
+/// A planning of a BGP's inputs, with the characteristic sets or without, within a budget
+/// ([`Context::with_sets`]).
+type Planning<'p> =
+    dyn Fn(Option<&CharacteristicSets>, usize) -> Result<plan::Plan, plan::Stopped> + 'p;
+
+/// The count of a lone BGP pattern [`Context::bgp`] doesn't take: never read as empty. Of
+/// the reads of a BGP's counts, only the join order and the worst-case-optimal join's tests
+/// reach a lone pattern's outside EXPLAIN, and neither acts on one (two patterns at least
+/// to order, three to join so).
+const NOT_COUNTED: u64 = u64::MAX;
+
 /// Rows of the first pattern in the first (and smallest) morsel of a basic graph pattern
 /// under LIMIT.
 const MIN_MORSEL: usize = 1024;
+
+/// Rows a streamed LIMIT of one pattern reads at a time ([`Context::limited_scan`]).
+const LIMIT_CHUNK: usize = 4096;
 
 /// A range scan over at least this many id ranges scans the whole pattern and keeps the
 /// rows whose object is in one ([`IdSet`]).
@@ -130,6 +198,17 @@ fn unsupported<T>(what: impl Into<String>) -> NativeResult<T> {
     Err(NativeError::Unsupported(what.into()))
 }
 
+/// `count` where it is exact, as an answer needs it; else the engine's range limit as the
+/// query's error, never a capped number (PR #70).
+fn exact_count(count: nrese_engine::Count) -> NativeResult<u64> {
+    count.exact().ok_or_else(|| {
+        QueryEvaluationError::CountBeyondRange {
+            at_least: count.at_least(),
+        }
+        .into()
+    })
+}
+
 type NativeResult<T> = Result<T, NativeError>;
 
 /// Runs `query` on `snapshot` (borrowed from the view, or owned: a transaction's pending
@@ -139,74 +218,220 @@ pub(crate) fn evaluate<'a>(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<QueryResults<'a>, QueryEvaluationError> {
-    let (pattern, form) = native_pattern(query, options)?;
-    let ctx = Context::new(&snapshot, options, query_dataset(query), query_base(query));
-    let pattern = match &options.pre_bound {
-        Some(values) => {
-            // A blank node is put in as an alias IRI that stands for the node.
-            for term in values.values() {
-                if let nrese_rdf::Term::BlankNode(b) = term
-                    && let Some(id) = snapshot.lookup(term.as_ref())
-                {
-                    ctx.register_alias(substitute::alias(b.as_str()).as_str(), id.raw());
-                }
-            }
-            substitute::Values { terms: values }.top(&pattern)
+    let (outcome, held) = run(&snapshot, query, options)?;
+    Ok(match outcome {
+        Outcome::Boolean(value) => QueryResults::Boolean(value),
+        Outcome::Graph(triples) => QueryResults::Graph(QueryTripleIter::new(Holding::new(
+            triples.into_iter().map(Ok),
+            held,
+        ))),
+        Outcome::Solutions(solutions, computed) => {
+            let table = solutions.table;
+            let rows = (0..table.len()).map(move |row| {
+                Ok((0..table.width())
+                    .map(|column| decode(&snapshot, &computed, table.get(row, column)))
+                    .collect::<Vec<_>>())
+            });
+            QueryResults::Solutions(QuerySolutionIter::new(
+                solutions.vars.into(),
+                Holding::new(rows, held),
+            ))
         }
-        None => pattern,
-    };
-    let solutions = ctx.eval(&pattern)?;
-    match form {
-        Form::Select => {}
-        Form::Describe => {
-            let triples = ctx.describe(&solutions)?;
-            return Ok(QueryResults::Graph(QueryTripleIter::new(
-                triples.into_iter().map(Ok),
-            )));
-        }
-        Form::Ask => return Ok(QueryResults::Boolean(!solutions.table.is_empty())),
-        Form::Construct(template) => {
-            let computed = ctx.computed.into_inner();
-            let triples: Vec<_> = construct(&snapshot, computed, solutions, template).collect();
-            return Ok(QueryResults::Graph(QueryTripleIter::new(
-                triples.into_iter().map(Ok),
-            )));
-        }
-    }
-    let variables: Arc<[Variable]> = solutions.vars.clone().into();
-    let computed = ctx.computed.into_inner();
-    let table = solutions.table;
-    let rows = (0..table.len()).map(move |row| {
-        Ok((0..table.width())
-            .map(|column| decode(&snapshot, &computed, table.get(row, column)))
-            .collect::<Vec<_>>())
-    });
-    Ok(QueryResults::Solutions(QuerySolutionIter::new(
-        variables, rows,
-    )))
+    })
 }
 
-/// Runs `query`, recording each operator ([`PlanStep`]); returns the steps and the number
-/// of solutions (triples for CONSTRUCT and DESCRIBE).
+/// What evaluating a query gives before delivery.
+enum Outcome {
+    Boolean(bool),
+    Graph(Vec<nrese_rdf::Triple>),
+    /// The solutions and the query's computed terms.
+    Solutions(Solutions, Vec<Term>),
+}
+
+/// Evaluates `query` to its [`Outcome`], with the reservation of what that holds.
+fn run(
+    snapshot: &Snapshot,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<(Outcome, Reservation), QueryEvaluationError> {
+    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let (solutions, form) = match index_answer(&ctx, query, options) {
+        Some(solutions) => (solutions?, Form::Select),
+        None => {
+            let (pattern, form, _, _) = native_pattern(query, options, &ctx)?;
+            (ctx.eval_root(&pattern, options.pin.as_ref())?, form)
+        }
+    };
+    ctx.check()?;
+    let outcome = match form {
+        Form::Ask => Outcome::Boolean(!solutions.table.is_empty()),
+        Form::Describe => Outcome::Graph(ctx.describe(&solutions)?),
+        Form::Construct(template) => {
+            // A triple per solution and template triple, however many the template has:
+            // each charged as it is made, before it is kept.
+            let mut triples = Vec::new();
+            let computed = ctx.computed.take();
+            let made = construct(
+                snapshot,
+                &ctx.budget,
+                computed,
+                solutions,
+                &template,
+                || ctx.check(),
+            );
+            // One at a time through a grant (no budget call within its spare); the triples
+            // keep their charge with the outcome. One thread, beside `construct`'s own grant:
+            // half the spare each.
+            let mut grant = Grant::with_workers(&*ctx.budget, 2);
+            for triple in made {
+                let triple = triple?;
+                grant
+                    .take(triple_bytes(&triple))
+                    .map_err(QueryEvaluationError::MemoryLimit)?;
+                triples.push(triple);
+            }
+            grant.transfer();
+            Outcome::Graph(triples)
+        }
+        Form::Select => Outcome::Solutions(solutions, ctx.computed.take()),
+    };
+    // The computed terms go with the outcome: their charge goes with what it holds.
+    let kept = Reservation::new(Arc::clone(&ctx.budget));
+    ctx.kept.replace(kept).transfer();
+    Ok((
+        outcome,
+        Reservation::adopt(Arc::clone(&ctx.budget), ctx.budget.used()),
+    ))
+}
+
+/// An iterator that holds a reservation until it drops.
+struct Holding<I> {
+    items: I,
+    _held: Reservation,
+}
+
+impl<I> Holding<I> {
+    fn new(items: I, held: Reservation) -> Self {
+        Self { items, _held: held }
+    }
+}
+
+impl<I: Iterator> Iterator for Holding<I> {
+    type Item = I::Item;
+
+    fn next(&mut self) -> Option<I::Item> {
+        self.items.next()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.items.size_hint()
+    }
+}
+
+/// Runs `query`, recording each operator ([`PlanStep`]); returns the rewrites that changed
+/// the query ([`optimise`]), the steps and the number of solutions (triples for CONSTRUCT
+/// and DESCRIBE).
 pub(crate) fn explain(
     snapshot: &Snapshot,
     query: &Query,
     options: &QueryOptions,
-) -> Result<(Vec<PlanStep>, u64), QueryEvaluationError> {
-    let (pattern, form) = native_pattern(query, options)?;
+) -> Result<ExplainParts, QueryEvaluationError> {
     let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let begun = Instant::now();
+    if let Some(solutions) = index_answer(&ctx, query, options) {
+        let rows = solutions?.table.len();
+        ctx.trace = Some(RefCell::default());
+        let detail = "COUNT(*) of one triple pattern, from the index".to_owned();
+        ctx.note("index answer", detail, Some(1), rows, begun);
+        let steps = ctx.trace.take().unwrap_or_default().into_inner();
+        let decoded = ctx.decodes.load(AtomicOrdering::Relaxed);
+        return Ok((Vec::new(), steps, rows as u64, decoded, None));
+    }
+    let (pattern, form, rewrites, ql) = native_pattern(query, options, &ctx)?;
     ctx.trace = Some(RefCell::default());
-    let solutions = ctx.eval(&pattern)?;
+    let solutions = ctx.eval_root(&pattern, options.pin.as_ref())?;
+    ctx.check()?;
     let steps = ctx.trace.take().unwrap_or_default().into_inner();
-    // CONSTRUCT and DESCRIBE count triples.
+    // CONSTRUCT and DESCRIBE count triples, without retaining a constructed graph.
     let rows = match form {
         Form::Select | Form::Ask => solutions.table.len(),
         Form::Describe => ctx.describe(&solutions)?.len(),
         Form::Construct(template) => {
-            construct(snapshot, ctx.computed.into_inner(), solutions, template).count()
+            let computed = ctx.computed.take();
+            construct(
+                snapshot,
+                &ctx.budget,
+                computed,
+                solutions,
+                &template,
+                || ctx.check(),
+            )
+            .try_fold(0usize, |count, triple| triple.map(|_| count + 1))?
         }
     };
-    Ok((steps, rows as u64))
+    let decoded = ctx.decodes.load(AtomicOrdering::Relaxed);
+    Ok((rewrites, steps, rows as u64, decoded, ql))
+}
+
+/// The plan `query` would run as, after the rewrites, with estimated rows per node
+/// ([`estimate`]), without running it; and the rewrites that changed it.
+pub(crate) fn plan(
+    snapshot: &Snapshot,
+    query: &Query,
+    options: &QueryOptions,
+) -> Result<PlanParts, QueryEvaluationError> {
+    let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let (pattern, _, rewrites, ql) = native_pattern(query, options, &ctx)?;
+    // Traced for the BGPs planned without the characteristic sets ([`Context::with_sets`]):
+    // their notes follow the plan's nodes, in the order planned.
+    ctx.trace = Some(RefCell::default());
+    let mut steps = Vec::new();
+    ctx.estimate_plan(&crate::plan::Plan::of(&pattern), 0, &mut steps);
+    // The orderer stops when the query is cancelled, leaving estimates out: a plan cut short
+    // is the cancellation, not an answer.
+    options.resources.check()?;
+    let noted = ctx.trace.take().unwrap_or_default().into_inner();
+    steps.extend(
+        noted
+            .into_iter()
+            .filter(|s| s.operator == WITHOUT_SETS)
+            .map(|s| crate::query::PlannedStep {
+                depth: 0,
+                operator: s.operator,
+                detail: s.detail,
+                estimated_rows: None,
+            }),
+    );
+    Ok((rewrites, steps, ql))
+}
+
+/// The rewrites, the steps with their rows, the rows, the terms decoded, and what the QL
+/// rewriting did.
+type ExplainParts = (
+    Vec<&'static str>,
+    Vec<PlanStep>,
+    u64,
+    u64,
+    Option<crate::ql::QlReport>,
+);
+
+/// The rewrites, the planned steps, and what the QL rewriting did.
+type PlanParts = (
+    Vec<&'static str>,
+    Vec<crate::query::PlannedStep>,
+    Option<crate::ql::QlReport>,
+);
+
+/// A query's pattern and form.
+fn pattern_and_form(query: &Query) -> (&GraphPattern, Form<'_>) {
+    match query {
+        Query::Select { pattern, .. } => (pattern, Form::Select),
+        Query::Ask { pattern, .. } => (pattern, Form::Ask),
+        Query::Construct {
+            template, pattern, ..
+        } => (pattern, Form::Construct(Cow::Borrowed(template))),
+        Query::Describe { pattern, .. } => (pattern, Form::Describe),
+    }
 }
 
 pub use output::ResultsFormat;
@@ -222,27 +447,34 @@ pub(crate) fn write_results(
     version: Option<&'static str>,
     out: &mut dyn std::io::Write,
 ) -> Option<Result<(), crate::query::WriteResultsError>> {
-    let (pattern, form) = match native_pattern(query, options) {
-        Ok(native) => native,
-        Err(error) => return Some(Err(error.into())),
-    };
-    match form {
-        Form::Construct(_) | Form::Describe => return None,
-        Form::Ask if format != ResultsFormat::Json => return None,
+    match query {
+        Query::Construct { .. } | Query::Describe { .. } => return None,
+        Query::Ask { .. } if format != ResultsFormat::Json => return None,
         _ => {}
     }
     let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
-    let solutions = match ctx.eval(&pattern) {
-        Ok(solutions) => solutions,
+    let evaluated = match index_answer(&ctx, query, options) {
+        Some(solutions) => solutions.map(|solutions| (solutions, Form::Select)),
+        None => match native_pattern(query, options, &ctx) {
+            Ok((pattern, form, _, _)) => ctx
+                .eval_root(&pattern, options.pin.as_ref())
+                .map(|solutions| (solutions, form)),
+            Err(error) => return Some(Err(error.into())),
+        },
+    };
+    let (solutions, form) = match evaluated {
+        Ok(evaluated) => evaluated,
         Err(error) => return Some(Err(QueryEvaluationError::from(error).into())),
     };
     if matches!(form, Form::Ask) {
         let bytes = output::boolean(!solutions.table.is_empty(), version);
-        return Some(out.write_all(&bytes).map_err(Into::into));
+        return Some(match ctx.check() {
+            Ok(()) => out.write_all(&bytes).map_err(Into::into),
+            Err(error) => Err(QueryEvaluationError::from(error).into()),
+        });
     }
     let computed = ctx.computed.into_inner();
-    let token = options.cancellation.clone();
-    let cancelled = || token.as_ref().is_some_and(CancellationToken::is_cancelled);
+    let cancelled = || options.resources.check().is_err();
     let alive = || {
         if cancelled() {
             Err(std::io::Error::other("query cancelled"))
@@ -258,7 +490,13 @@ pub(crate) fn write_results(
     };
     Some(
         writer
-            .write(&solutions.vars, &solutions.table, out, &alive)
+            .write(
+                &solutions.vars,
+                &solutions.table,
+                out,
+                &alive,
+                &options.resources.workers,
+            )
             .map_err(|error| {
                 if cancelled() {
                     QueryEvaluationError::Cancelled.into()
@@ -269,8 +507,43 @@ pub(crate) fn write_results(
     )
 }
 
-/// The quads an update removes and adds, in that order.
-pub(crate) type QuadChanges = (Vec<nrese_rdf::Quad>, Vec<nrese_rdf::Quad>);
+/// The quads an update removes and adds, in that order, decoded, and charged to the request's
+/// envelope while they live (D16-039): their room ([`ChargedVec`]) before it grows, and their
+/// terms' text ([`Grant`], [`nrese_rdf::Term::heap_bytes`]) before each quad is kept, as
+/// CONSTRUCT and DESCRIBE charge theirs. Dropped, the quads are freed and then their charge.
+pub(crate) struct QuadChanges {
+    pub(crate) deletes: ChargedVec<nrese_rdf::Quad>,
+    pub(crate) inserts: ChargedVec<nrese_rdf::Quad>,
+    /// After the quads: fields drop in order, the terms freed before their charge goes.
+    terms: Grant,
+}
+
+impl QuadChanges {
+    /// No changes yet, charged to `budget`. One thread fills them, with no sibling grant: the
+    /// whole spare.
+    fn new(budget: &Arc<Budget>) -> Self {
+        Self {
+            deletes: ChargedVec::new(Arc::clone(budget)),
+            inserts: ChargedVec::new(Arc::clone(budget)),
+            terms: Grant::with_workers(Arc::clone(budget), 1),
+        }
+    }
+
+    /// Keeps `quad` among the deletes, or the inserts, its terms charged first.
+    fn keep(&mut self, quad: nrese_rdf::Quad, delete: bool) -> Result<(), BudgetExceeded> {
+        self.terms.take(
+            quad.subject.heap_bytes()
+                + quad.predicate.heap_bytes()
+                + quad.object.heap_bytes()
+                + quad.graph_name.heap_bytes(),
+        )?;
+        if delete {
+            self.deletes.push(quad)
+        } else {
+            self.inserts.push(quad)
+        }
+    }
+}
 
 /// The quads a `DELETE`/`INSERT … WHERE` removes and adds, with its `WHERE` evaluated on
 /// `snapshot`. `using`
@@ -299,13 +572,17 @@ pub(crate) fn delete_insert(
     if let Some(what) = unsupported_part(pattern) {
         return Err(QueryEvaluationError::Unsupported(what));
     }
-    let pattern = pushdown::push_filters(pattern.clone());
     let ctx = Context::new(snapshot, options, using, base);
+    let pattern = optimise(pattern.clone(), &mut Vec::new(), &ctx);
     let solutions = ctx.eval(&pattern)?;
-    let computed = ctx.computed.into_inner();
+    let mut changes = QuadChanges::new(&ctx.budget);
+    let memory = QueryEvaluationError::MemoryLimit;
+    let computed = std::mem::take(&mut *ctx.computed.borrow_mut());
     let table = &solutions.table;
-    let (mut deletes, mut inserts) = (Vec::new(), Vec::new());
     for row in 0..table.len() {
+        if row % 256 == 0 {
+            ctx.check()?;
+        }
         let value = |v: &Variable| -> Option<Term> {
             decode(snapshot, &computed, table.get(row, solutions.column(v)?))
         };
@@ -322,10 +599,12 @@ pub(crate) fn delete_insert(
             },
         };
         let graph = |g: &GraphNamePattern| match g {
-            GraphNamePattern::NamedNode(n) => Some(nrese_rdf::GraphName::from(n.clone())),
+            GraphNamePattern::NamedNode(n) => Some(crate::compat::graph_named(n).into_owned()),
             GraphNamePattern::DefaultGraph => Some(nrese_rdf::GraphName::DefaultGraph),
+            // A value bound to the graph slot names a store graph as a constant does,
+            // whatever bound it: VALUES, BIND, SERVICE or GRAPH ?g.
             GraphNamePattern::Variable(v) => match value(v)? {
-                Term::NamedNode(n) => Some(n.into()),
+                Term::NamedNode(n) => Some(crate::compat::graph_named(&n).into_owned()),
                 Term::BlankNode(b) => Some(b.into()),
                 Term::Literal(_) | Term::Triple(_) => None,
             },
@@ -340,7 +619,9 @@ pub(crate) fn delete_insert(
                     graph(&quad.graph_name)?,
                 ))
             })();
-            deletes.extend(filled);
+            if let Some(quad) = filled {
+                changes.keep(quad, true).map_err(memory)?;
+            }
         }
         let mut fresh: HashMap<String, nrese_rdf::BlankNode> = HashMap::new();
         let mut term = |t: &TermPattern| fill_template(t, &value, &mut fresh);
@@ -354,68 +635,304 @@ pub(crate) fn delete_insert(
             let (Some(p), Some(g)) = (predicate(&quad.predicate), graph(&quad.graph_name)) else {
                 continue;
             };
-            inserts.push(nrese_rdf::Quad::new(s, p, o, g));
+            changes
+                .keep(nrese_rdf::Quad::new(s, p, o, g), false)
+                .map_err(memory)?;
         }
     }
-    Ok((deletes, inserts))
+    ctx.check()?;
+    Ok(changes)
 }
 
 /// What a query returns.
 enum Form<'q> {
     Select,
     Ask,
-    /// The triples of the template, per solution.
-    Construct(&'q [TriplePattern]),
+    /// The triples of the template, per solution (canonical answers' own: [`canonical`]).
+    Construct(Cow<'q, [TriplePattern]>),
     /// The statements about each term the solutions bind ([`Context::describe`]).
     Describe,
 }
 
-/// The pattern of a query the native executor runs, as it runs it (filters pushed down,
-/// [`pushdown`]), and the query form.
+/// A query as the executor runs it: its pattern (the query's own where nothing rewrote
+/// it), its form, the rewrites that changed it, and what the QL rewriting did.
+type NativePattern<'q> = (
+    Cow<'q, GraphPattern>,
+    Form<'q>,
+    Vec<&'static str>,
+    Option<crate::ql::QlReport>,
+);
+
+/// The answer of a query that is the index's count of one triple pattern and nothing else,
+/// `SELECT (COUNT(*) AS ?n) WHERE { s p o }`, from the index alone: without preparing the
+/// query ([`native_pattern`]) or running its operators through the result cache (entities
+/// q03: about 5k of its 23k instructions, 10 Nov 2026). `None` for any other
+/// query, for a count the index doesn't hold ([`Context::index_count`]), and where the
+/// preparation would change the query: an open triple term, the QL rewriting, canonical
+/// answers (or their refusal, which the preparation reports), pre-bound values, a pin, or
+/// `as_written`. The general path answers the same: it is the oracle (index_answer_tests).
+fn index_answer(
+    ctx: &Context<'_>,
+    query: &Query,
+    options: &QueryOptions,
+) -> Option<NativeResult<Solutions>> {
+    let Query::Select { pattern, .. } = query else {
+        return None;
+    };
+    if options.as_written
+        || options.pre_bound.is_some()
+        || options.pin.is_some()
+        || ctx.canonical_answers()
+        || ql_rewriting(query, options).is_some()
+    {
+        return None;
+    }
+    let GraphPattern::Project { inner, variables } = pattern else {
+        return None;
+    };
+    let GraphPattern::Extend { inner, bindings } = &**inner else {
+        return None;
+    };
+    let GraphPattern::Group {
+        inner,
+        variables: keys,
+        aggregates,
+    } = &**inner
+    else {
+        return None;
+    };
+    let (
+        [projected],
+        [(name, Expression::Variable(counted))],
+        [(target, AggregateExpression::CountSolutions { distinct: false })],
+        GraphPattern::Bgp { patterns },
+    ) = (
+        variables.as_slice(),
+        bindings.as_slice(),
+        aggregates.as_slice(),
+        &**inner,
+    )
+    else {
+        return None;
+    };
+    let [triple] = patterns.as_slice() else {
+        return None;
+    };
+    if projected != name
+        || counted != target
+        || !keys.is_empty()
+        || search::is_search(triple, patterns)
+        || ctx.is_spatial(triple)
+        || triple_terms::has_open(pattern)
+    {
+        return None;
+    }
+    let answer = || -> NativeResult<Option<Solutions>> {
+        ctx.check()?;
+        let Some(count) = ctx.index_count(triple)? else {
+            return Ok(None);
+        };
+        let solutions = ctx.count_row(name, count)?;
+        ctx.check()?;
+        Ok(Some(solutions))
+    };
+    answer().transpose()
+}
+
+/// The pattern of a query the native executor runs, as it runs it ([`optimise`]), the
+/// query form, and the rewrites that changed it: the one preparation every delivery of the
+/// answer reads (results, typed results, the direct writer, EXPLAIN and its plan), so a
+/// request option holds in all of them. Pre-bound variables are put in last
+/// ([`substitute::Values::top`]), their blank nodes registered on `ctx`.
 fn native_pattern<'q>(
     query: &'q Query,
     options: &QueryOptions,
-) -> Result<(GraphPattern, Form<'q>), QueryEvaluationError> {
-    let (pattern, form) = match query {
-        Query::Select { pattern, .. } => (pattern, Form::Select),
-        Query::Ask { pattern, .. } => (pattern, Form::Ask),
-        Query::Construct {
-            template, pattern, ..
-        } => (pattern, Form::Construct(template)),
-        Query::Describe { pattern, .. } => (pattern, Form::Describe),
-    };
-    // SPARQL 1.2 triple-term patterns with variables, as plain algebra.
-    let rewritten;
-    let pattern = if triple_terms::has_open(pattern) {
-        rewritten = triple_terms::rewrite(pattern);
-        &rewritten
-    } else {
-        pattern
-    };
+    ctx: &Context<'_>,
+) -> Result<NativePattern<'q>, QueryEvaluationError> {
+    let (_, form) = pattern_and_form(query);
+    let mut rewrites = Vec::new();
+    let (pattern, ql_report) = semantic_pattern(&ctx.snapshot, query, options, &mut rewrites)?;
     let template_supported = match &form {
         Form::Construct(template) => template.iter().all(supported_template_triple),
         _ => true,
     };
-    if !supported(pattern) || !template_supported {
+    if !supported(&pattern) || !template_supported {
         return Err(QueryEvaluationError::Unsupported(
-            unsupported_part(pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
+            unsupported_part(&pattern).unwrap_or_else(|| "a construct of the query".to_owned()),
         ));
     }
-    let pattern = if options.as_written {
-        pattern.clone()
+    // The query's own pattern is copied only where a step below changes it: a copy and its
+    // drop were about 0.8k of a one-row lookup's instructions (11 November 2026). Canonical
+    // answers rewrite every constant, or refuse ([`Context::canonical_query`]).
+    let (pattern, form) = if ctx.canonical_answers() {
+        let (pattern, form) = ctx.canonical_query(pattern.into_owned(), form)?;
+        (Cow::Owned(pattern), form)
     } else {
-        pushdown::push_filters(pattern.clone())
+        (pattern, form)
+    };
+    let pattern = if options.as_written {
+        pattern
+    } else {
+        optimised(pattern, &mut rewrites, ctx)
     };
     // ASK needs one solution: LIMIT 1 lets the evaluation stop at it.
     let pattern = match form {
-        Form::Ask if !options.as_written => GraphPattern::Slice {
-            inner: Box::new(pattern),
-            start: 0,
-            length: Some(1),
-        },
+        Form::Ask if !options.as_written => {
+            rewrites.push("ask-limit");
+            Cow::Owned(GraphPattern::Slice {
+                inner: Box::new(pattern.into_owned()),
+                start: 0,
+                length: Some(1),
+            })
+        }
         _ => pattern,
     };
-    Ok((pattern, form))
+    let pre_bound = options
+        .pre_bound
+        .as_ref()
+        .map(|values| match &ctx.canonical {
+            Some(names) => Cow::Owned(names.values(values)),
+            None => Cow::Borrowed(&**values),
+        });
+    let pattern = match &pre_bound {
+        Some(values) => {
+            // A blank node is put in as a made constant that stands for the node.
+            for term in values.values() {
+                if let Term::BlankNode(b) = term
+                    && let Some(id) = ctx.snapshot.lookup(term.as_ref())
+                {
+                    ctx.register_alias(internal::blank_constant(b.as_str()).as_str(), id.raw());
+                }
+            }
+            Cow::Owned(substitute::Values::new(ctx, values)?.top(&pattern))
+        }
+        None => pattern,
+    };
+    if let Some(refused) = ctx.aliases_refused.get() {
+        return Err(QueryEvaluationError::MemoryLimit(refused));
+    }
+    Ok((pattern, form, rewrites, ql_report))
+}
+
+/// The rewrites the executor applies to a query's (or an update's) pattern, in order;
+/// `fired` gets the name of each that changed it, for EXPLAIN.
+///
+/// - `join-groups`: groups joined to each other become one basic graph pattern, so their
+///   triple patterns are ordered together ([`crate::plan::Plan::flatten_joins`]).
+/// - `eager-aggregation`: a group over a join aggregates the side its aggregates read
+///   before the join ([`crate::plan::Plan::eager_aggregation`]).
+/// - `filter-pushdown`: each filter moves to the smallest sub-pattern that binds its
+///   variables ([`pushdown`]).
+///
+/// A pass runs only where its input has a node it can change (each pass's `changes_at`,
+/// asked of the input as the passes before left it): elsewhere it would return its input,
+/// and building, lowering and comparing its plan was most of a microsecond query's
+/// preparation (entities COUNT: 1 µs on main, 3–4 µs with the passes, 10 Nov 2026). One
+/// search answers all three, again only after a pass changed the pattern.
+fn optimise(
+    pattern: GraphPattern,
+    fired: &mut Vec<&'static str>,
+    ctx: &Context<'_>,
+) -> GraphPattern {
+    optimised(Cow::Owned(pattern), fired, ctx).into_owned()
+}
+
+/// [`optimise`], copying a borrowed pattern only where a pass changes it.
+fn optimised<'q>(
+    mut pattern: Cow<'q, GraphPattern>,
+    fired: &mut Vec<&'static str>,
+    ctx: &Context<'_>,
+) -> Cow<'q, GraphPattern> {
+    use nrese_sparql_syntax::visit::Node;
+    let pays = |side: &crate::plan::Plan, keys: &[Variable]| ctx.pre_aggregation_pays(side, keys);
+    let eager = |pattern: &GraphPattern| crate::plan::eager_aggregation_where(pattern, &pays);
+    type Pass<'p> = &'p dyn Fn(&GraphPattern) -> GraphPattern;
+    let passes: [(&'static str, Pass<'_>); 3] = [
+        ("join-groups", &crate::plan::rewrite),
+        ("eager-aggregation", &eager),
+        ("filter-pushdown", &|pattern| {
+            pushdown::push_filters(pattern.clone())
+        }),
+    ];
+    // Whether a pattern with this node in it is one the pass can change, in the passes' order.
+    let changes_at: [fn(&GraphPattern) -> bool; 3] = [
+        crate::plan::rewrite_changes_at,
+        crate::plan::eager_aggregation_changes_at,
+        pushdown::changes_at,
+    ];
+    let shapes = |pattern: &GraphPattern| {
+        let mut found = [false; 3];
+        pattern.find(&mut |node| {
+            if let Node::Pattern(p) = node {
+                for (found, changes_at) in found.iter_mut().zip(changes_at) {
+                    *found = *found || changes_at(p);
+                }
+            }
+            found.iter().all(|&found| found)
+        });
+        found
+    };
+    let mut found = shapes(&pattern);
+    for (i, (name, pass)) in passes.into_iter().enumerate() {
+        if !found[i] {
+            debug_assert!(pass(&pattern) == *pattern, "{name} changes {pattern}");
+            continue;
+        }
+        #[cfg(test)]
+        PASSES_RUN.set(PASSES_RUN.get() + 1);
+        let rewritten = pass(&pattern);
+        if rewritten != *pattern {
+            fired.push(name);
+            pattern = Cow::Owned(rewritten);
+            found = shapes(&pattern);
+        }
+    }
+    pattern
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The rewrite passes [`optimise`] ran on this thread.
+    static PASSES_RUN: Cell<usize> = const { Cell::new(0) };
+    /// The patterns [`Context::bgp`] counted on this thread (exact or within a hint's ranges).
+    static BGP_ESTIMATES: Cell<usize> = const { Cell::new(0) };
+    /// The lists [`Context::overlaps`] read on this thread ([`Context::read_list`]).
+    static LIST_READS: Cell<usize> = const { Cell::new(0) };
+    /// The column reads [`Context::scan`] made on this thread (its column path).
+    static SCAN_READS: Cell<usize> = const { Cell::new(0) };
+    /// Whether [`Context::bgp`] hands its planning's reads to its steps ([`reads`]); off,
+    /// it drops them once planned, as before the hand-over.
+    static HANDOVER: Cell<bool> = const { Cell::new(true) };
+    /// Whether [`Context::overlaps`] makes its intersection buffer ([`Context::shared`]).
+    static BUFFERS: Cell<bool> = const { Cell::new(true) };
+    /// The plannings planned again without the characteristic sets on this thread
+    /// ([`Context::with_sets`]).
+    static REPLANS: Cell<usize> = const { Cell::new(0) };
+    /// Run where an admitted BGP has asked for the statistics ([`Context::with_sets`]), as
+    /// part of that call, which builds them or waits for a build: true keeps its answer,
+    /// false makes it none (a build that failed or wasn't kept). A test's way to cancel a
+    /// query while it asks.
+    static STATISTICS_ASKED: RefCell<Option<Box<dyn Fn() -> bool>>> = const { RefCell::new(None) };
+    /// Run with each `n` a distinct estimate asks its visitor for ([`Context::distinct`]),
+    /// before the answer (`0`: whether the query has stopped). A test's way to cancel a
+    /// query while it estimates, and to see what is asked after.
+    static DISTINCT_ASKED: RefCell<Option<DistinctAsked>> = const { RefCell::new(None) };
+}
+
+/// What [`DISTINCT_ASKED`] runs.
+#[cfg(test)]
+type DistinctAsked = Box<dyn Fn(u64)>;
+
+/// One more pattern counted by [`Context::bgp`] ([`BGP_ESTIMATES`]).
+#[cfg(test)]
+fn bgp_estimated() {
+    BGP_ESTIMATES.set(BGP_ESTIMATES.get() + 1);
+}
+
+/// The lists read on this thread so far ([`LIST_READS`]).
+#[cfg(test)]
+fn list_reads() -> usize {
+    LIST_READS.get()
 }
 
 /// A description of the first part of `pattern` the executor doesn't implement.
@@ -485,10 +1002,14 @@ enum TemplateTerm {
 /// nodes are emitted once (the memory of emitted triples is bounded).
 fn construct<'a>(
     snapshot: &'a Snapshot,
+    budget: &'a Budget,
     computed: Vec<Term>,
     solutions: Solutions,
     template: &[TriplePattern],
-) -> impl Iterator<Item = nrese_rdf::Triple> + 'a {
+    check: impl Fn() -> NativeResult<()> + 'a,
+) -> impl Iterator<Item = NativeResult<nrese_rdf::Triple>> + 'a {
+    #[cfg(test)]
+    graph_tests::checkpoint();
     let mut labels: Vec<String> = Vec::new();
     let mut resolve = |term: &TermPattern| resolve_template(term, &solutions, &mut labels);
     let resolved: Vec<[TemplateTerm; 3]> = template
@@ -506,19 +1027,36 @@ fn construct<'a>(
     let fresh_count = labels.len();
     let table = solutions.table;
     let mut emitted: HashSet<nrese_rdf::Triple> = HashSet::new();
-    let mut buffer: Vec<nrese_rdf::Triple> = Vec::new();
-    let mut row = 0;
+    // The copies `emitted` keeps, each charged before it is kept, one at a time through a
+    // grant: one thread, beside the caller's grant for the triples (half the spare each).
+    let mut held = Grant::with_workers(budget, 2);
+    // A triple at a time, however many the template has: the next is the template's
+    // `index`-th triple of row `row`, with the row's fresh blank nodes.
+    let (mut row, mut index) = (0, 0);
+    let mut fresh: Vec<nrese_rdf::BlankNode> = Vec::new();
     std::iter::from_fn(move || {
         loop {
-            if let Some(triple) = buffer.pop() {
-                return Some(triple);
-            }
             if row >= table.len() {
                 return None;
             }
-            let fresh: Vec<nrese_rdf::BlankNode> = (0..fresh_count)
-                .map(|_| nrese_rdf::BlankNode::default())
-                .collect();
+            // One check per row, and one per 256 entries of a wide template; an error
+            // ends the iteration.
+            if index % 256 == 0
+                && let Err(error) = check()
+            {
+                row = table.len();
+                return Some(Err(error));
+            }
+            if index == 0 {
+                fresh = (0..fresh_count)
+                    .map(|_| nrese_rdf::BlankNode::default())
+                    .collect();
+            }
+            let Some([s, p, o]) = resolved.get(index) else {
+                (row, index) = (row + 1, 0);
+                continue;
+            };
+            index += 1;
             fn template_value(
                 term: &TemplateTerm,
                 column: &dyn Fn(usize) -> Option<Term>,
@@ -544,35 +1082,60 @@ fn construct<'a>(
                     }
                 }
             }
-            let column = |c: usize| decode(snapshot, &computed, table.get(row, c));
+            let current = row;
+            let column = |c: usize| decode(snapshot, &computed, table.get(current, c));
             let value = |term: &TemplateTerm| template_value(term, &column, &fresh);
-            for [s, p, o] in &resolved {
-                let subject = match value(s) {
-                    Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
-                    Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
-                    _ => continue,
-                };
-                let Some(Term::NamedNode(predicate)) = value(p) else {
+            let subject = match value(s) {
+                Some(Term::NamedNode(n)) => nrese_rdf::NamedOrBlankNode::from(n),
+                Some(Term::BlankNode(b)) => nrese_rdf::NamedOrBlankNode::from(b),
+                _ => continue,
+            };
+            let Some(Term::NamedNode(predicate)) = value(p) else {
+                continue;
+            };
+            let Some(object) = value(o) else {
+                continue;
+            };
+            let triple = nrese_rdf::Triple::new(subject, predicate, object);
+            if !triple.subject.is_blank_node() && !triple.object.is_blank_node() {
+                // The copy kept to emit it once, charged first (its slot counted twice:
+                // the set doubles).
+                let copy = triple_heap(&triple)
+                    .saturating_add(2 * std::mem::size_of::<nrese_rdf::Triple>());
+                if let Err(refused) = held.take(copy) {
+                    row = table.len();
+                    return Some(Err(QueryEvaluationError::MemoryLimit(refused).into()));
+                }
+                if !emitted.insert(triple.clone()) {
+                    held.give_back(copy);
                     continue;
-                };
-                let Some(object) = value(o) else {
-                    continue;
-                };
-                let triple = nrese_rdf::Triple::new(subject, predicate, object);
-                let new = triple.subject.is_blank_node()
-                    || triple.object.is_blank_node()
-                    || emitted.insert(triple.clone());
-                if new {
-                    buffer.push(triple);
-                    if emitted.len() > 1024 * 1024 {
-                        emitted.clear();
-                    }
+                }
+                if emitted.len() > 1024 * 1024 {
+                    emitted = HashSet::new();
+                    held.trim();
                 }
             }
-            buffer.reverse();
-            row += 1;
+            return Some(Ok(triple));
         }
     })
+}
+
+/// The bytes of a triple's terms' strings.
+fn triple_heap(triple: &nrese_rdf::Triple) -> usize {
+    let subject = match &triple.subject {
+        nrese_rdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+        nrese_rdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+    };
+    subject
+        .saturating_add(triple.predicate.as_str().len())
+        .saturating_add(crate::cache::term_heap(&triple.object))
+}
+
+/// What a constructed triple holds once kept ([`run`]): its strings, and its slot with the
+/// list's room for it counted at its most (a list doubles). The copy [`construct`] keeps to
+/// emit repeated triples once is charged there.
+fn triple_bytes(triple: &nrese_rdf::Triple) -> usize {
+    triple_heap(triple).saturating_add(2 * std::mem::size_of::<nrese_rdf::Triple>())
 }
 
 fn decode(snapshot: &Snapshot, computed: &[Term], id: u64) -> Option<Term> {
@@ -645,9 +1208,10 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
         GraphPattern::Path {
             subject, object, ..
         } => supported_term(subject) && supported_term(object),
-        GraphPattern::Join { left, right }
-        | GraphPattern::Union { left, right }
-        | GraphPattern::Minus { left, right } => supported(left) && supported(right),
+        GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+            inputs.iter().all(supported)
+        }
+        GraphPattern::Minus { left, right } => supported(left) && supported(right),
         GraphPattern::LeftJoin {
             left,
             right,
@@ -667,12 +1231,16 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
             bound_variables(inner, &mut outer);
             supported(inner) && exists::supported_expression(expr, &outer)
         }
-        GraphPattern::Extend {
-            inner, expression, ..
-        } => {
+        // Each binding over the inner pattern's variables and the bindings before it.
+        GraphPattern::Extend { inner, bindings } => {
             let mut outer = Vec::new();
             bound_variables(inner, &mut outer);
-            supported(inner) && exists::supported_expression(expression, &outer)
+            supported(inner)
+                && bindings.iter().all(|(variable, expression)| {
+                    let supported = exists::supported_expression(expression, &outer);
+                    outer.push(variable.clone());
+                    supported
+                })
         }
         GraphPattern::Values { .. } => true,
         GraphPattern::OrderBy { inner, expression } => {
@@ -711,114 +1279,79 @@ pub(crate) fn supported(pattern: &GraphPattern) -> bool {
 }
 
 /// True if `GRAPH ?graph { pattern }` can be evaluated once for all graphs, every triple
-/// pattern binding `?graph` from its scan: every solution then comes from triple patterns
-/// in every branch, and the pattern holds nothing but triple patterns and the operators
-/// that join them on `?graph` like on any variable.
+/// pattern binding `?graph` from its scan: every row of every part then comes from triple
+/// patterns, so rows of different graphs never meet, and the pattern holds nothing but
+/// triple patterns and the operators that join them on `?graph` like on any variable.
 ///
-/// Anything else is evaluated graph by graph: a row without a scan (VALUES, an empty
-/// group, BIND alone), a property path (followed within one graph), a subquery or a nested
-/// GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make rows
-/// with no other common variable remove each other) and a BIND to `?graph` itself.
-fn scans_everywhere(pattern: &GraphPattern, graph: &Variable) -> bool {
-    fn only_scans(pattern: &GraphPattern, graph: &Variable) -> bool {
+/// Anything else is evaluated graph by graph: a part whose row comes from no scan (VALUES,
+/// an empty group, BIND alone, at any depth: one row for all graphs), a property path (followed within one graph), a GeoSPARQL relation
+/// computed from geometries (`spatial`: within one graph's geometries), a subquery or a
+/// nested GRAPH (their `?graph` is another variable), MINUS (the shared `?graph` would make
+/// rows with no other common variable remove each other), a BIND to `?graph` itself, and
+/// an OPTIONAL, FILTER or BIND that names `?graph` where the rows before it may lack it.
+fn scans_everywhere(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
+    fn only_scans(pattern: &GraphPattern, graph: &Variable, spatial: bool) -> bool {
         match pattern {
-            GraphPattern::Bgp { .. } => true,
-            GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
-                only_scans(left, graph) && only_scans(right, graph)
+            GraphPattern::Bgp { patterns } => {
+                !patterns.is_empty() && (!spatial || !patterns.iter().any(spatial::is_spatial))
             }
+            GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+                inputs.iter().all(|input| only_scans(input, graph, spatial))
+            }
+            // Inside the GRAPH, `?graph` is free (§18.6): an OPTIONAL that names it, or an
+            // expression that reads it, gives the same rows once for all graphs only where
+            // the rows it extends or tests bind `?graph` already.
             GraphPattern::LeftJoin {
                 left,
                 right,
                 expression,
             } => {
-                only_scans(left, graph)
-                    && only_scans(right, graph)
-                    && expression.as_ref().is_none_or(|e| filter(e, graph))
+                let held = binds(left, graph);
+                let mut named = Vec::new();
+                bound_variables(right, &mut named);
+                only_scans(left, graph, spatial)
+                    && only_scans(right, graph, spatial)
+                    && (held || !named.contains(graph))
+                    && expression
+                        .as_ref()
+                        .is_none_or(|e| filter(e, graph, spatial) && (held || !reads(e, graph)))
             }
-            GraphPattern::Filter { inner, expr } => only_scans(inner, graph) && filter(expr, graph),
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => variable != graph && only_scans(inner, graph) && filter(expression, graph),
+            GraphPattern::Filter { inner, expr } => {
+                only_scans(inner, graph, spatial)
+                    && filter(expr, graph, spatial)
+                    && (binds(inner, graph) || !reads(expr, graph))
+            }
+            GraphPattern::Extend { inner, bindings } => {
+                only_scans(inner, graph, spatial)
+                    && bindings.iter().all(|(variable, expression)| {
+                        variable != graph
+                            && filter(expression, graph, spatial)
+                            && (binds(inner, graph) || !reads(expression, graph))
+                    })
+            }
             _ => false,
         }
     }
     // `EXISTS` is a join on the shared variables, `?graph` among them.
-    fn filter(expression: &Expression, graph: &Variable) -> bool {
+    fn filter(expression: &Expression, graph: &Variable, spatial: bool) -> bool {
         match expression {
-            Expression::And(a, b) => filter(a, graph) && filter(b, graph),
-            Expression::Exists(pattern) => only_scans(pattern, graph),
+            Expression::And(a, b) => filter(a, graph, spatial) && filter(b, graph, spatial),
+            Expression::Exists(pattern) => only_scans(pattern, graph, spatial),
             Expression::Not(inner) if matches!(**inner, Expression::Exists(_)) => {
-                filter(inner, graph)
+                filter(inner, graph, spatial)
             }
             // An `EXISTS` anywhere else is not a join.
             other => !pushdown::per_solution(other) || !contains_any_exists(other),
         }
     }
-    fn rows_from_scans(pattern: &GraphPattern) -> bool {
-        match pattern {
-            GraphPattern::Bgp { patterns } => !patterns.is_empty(),
-            GraphPattern::Join { left, right } => rows_from_scans(left) || rows_from_scans(right),
-            GraphPattern::Union { left, right } => rows_from_scans(left) && rows_from_scans(right),
-            GraphPattern::LeftJoin { left, .. } | GraphPattern::Minus { left, .. } => {
-                rows_from_scans(left)
-            }
-            GraphPattern::Filter { inner, .. } | GraphPattern::Extend { inner, .. } => {
-                rows_from_scans(inner)
-            }
-            _ => false,
-        }
+    // Whether every row of `pattern` binds `?graph` from data.
+    fn binds(pattern: &GraphPattern, graph: &Variable) -> bool {
+        pushdown::certain(pattern).contains(graph)
     }
-    // Inside `GRAPH ?g { P }`, `?g` is bound only where P binds it (SPARQL 1.1 §18.6: P
-    // is evaluated in each graph, then joined with `?g`). An expression reading `?g`
-    // sees it unbound, which only the graph-by-graph evaluation gives.
-    fn read_by_expressions(pattern: &GraphPattern, graph: &Variable) -> bool {
-        match pattern {
-            GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
-                read_by_expressions(left, graph) || read_by_expressions(right, graph)
-            }
-            GraphPattern::LeftJoin {
-                left,
-                right,
-                expression,
-            } => {
-                read_by_expressions(left, graph)
-                    || read_by_expressions(right, graph)
-                    || expression
-                        .as_ref()
-                        .is_some_and(|e| exists::deep_variables(e).contains(graph))
-            }
-            GraphPattern::Filter { inner, expr: e }
-            | GraphPattern::Extend {
-                inner,
-                expression: e,
-                ..
-            } => read_by_expressions(inner, graph) || exists::deep_variables(e).contains(graph),
-            _ => false,
-        }
+    fn reads(expression: &Expression, graph: &Variable) -> bool {
+        exists::deep_variables(expression).contains(graph)
     }
-    fn bound_by_scans(pattern: &GraphPattern, graph: &Variable) -> bool {
-        match pattern {
-            GraphPattern::Bgp { patterns } => patterns.iter().any(|t| {
-                [&t.subject, &t.object]
-                    .into_iter()
-                    .any(|term| matches!(term, TermPattern::Variable(v) if v == graph))
-                    || matches!(&t.predicate, NamedNodePattern::Variable(v) if v == graph)
-            }),
-            GraphPattern::Join { left, right } | GraphPattern::Union { left, right } => {
-                bound_by_scans(left, graph) || bound_by_scans(right, graph)
-            }
-            GraphPattern::LeftJoin { left, .. }
-            | GraphPattern::Filter { inner: left, .. }
-            | GraphPattern::Extend { inner: left, .. } => bound_by_scans(left, graph),
-            _ => false,
-        }
-    }
-    if read_by_expressions(pattern, graph) && !bound_by_scans(pattern, graph) {
-        return false;
-    }
-    only_scans(pattern, graph) && rows_from_scans(pattern)
+    only_scans(pattern, graph, spatial)
 }
 
 /// True if `expression` holds an `EXISTS` at any depth.
@@ -848,6 +1381,19 @@ fn supported_triple(triple: &TriplePattern) -> bool {
         _ => true,
     };
     term(&triple.subject) && term(&triple.object)
+}
+
+/// `v`'s place in `vars`, added at the end if it isn't there.
+fn variable_index(vars: &mut Vec<Variable>, v: Variable) -> usize {
+    vars.iter().position(|x| *x == v).unwrap_or_else(|| {
+        vars.push(v);
+        vars.len() - 1
+    })
+}
+
+/// EXPLAIN's estimate of the rows `expression` keeps of `rows` ([`pushdown::selectivity`]).
+fn filtered(rows: usize, expression: &Expression) -> Option<u64> {
+    Some((rows as f64 * pushdown::selectivity(expression)).round() as u64)
 }
 
 /// A property path pattern, with the filter directly on it, if any.
@@ -944,37 +1490,53 @@ impl Solutions {
     fn column(&self, variable: &Variable) -> Option<usize> {
         self.vars.iter().position(|v| v == variable)
     }
-
-    fn unit() -> Self {
-        Self {
-            vars: Vec::new(),
-            table: IdTable::from_rows(0, [&[][..]]),
-            ordered: false,
-        }
-    }
 }
 
 struct Context<'a> {
-    snapshot: &'a Snapshot,
+    /// The snapshot read; owned when it reads equality classes canonically
+    /// ([`QueryOptions::equality_canonical`], [`Context::late_expansion`]).
+    snapshot: Cow<'a, Snapshot>,
     /// Which statements the query reads (asserted, inferred or both).
     model: ReadModel,
     /// Alias IRIs that stand for blank nodes put into a pattern ([`substitute`]).
     aliases: RefCell<HashMap<String, u64>>,
+    /// An alias reservation refused; checked before any answer is delivered.
+    aliases_refused: Cell<Option<nrese_exec::BudgetExceeded>>,
+    /// A room question ([`Self::max_rows`]) found the process's limit unread: a join its
+    /// row limit stopped is refused for that, whatever a later reading finds.
+    room_unread: Cell<bool>,
     evaluator: Evaluator,
     computed: RefCell<Vec<Term>>,
     computed_ids: RefCell<HashMap<Term, u64>>,
-    decoded: RefCell<HashMap<u64, Option<Term>>>,
+    /// Stored terms decoded once, charged to `budget` while kept ([`decode_cache`]).
+    decoded: RefCell<decode_cache::DecodeCache>,
+    /// The distinct counts this query's planning asked for ([`Self::distinct`]), per pattern
+    /// and order, charged to `budget` and freed with the query: a pattern planned again (an
+    /// EXISTS per outer key) walks once, though a view keeps nothing beyond the query.
+    distinct_counts: RefCell<ChargedMap<(QuadPattern, Permutation), Option<u64>>>,
+    /// Stored terms decoded for expressions, orders and aggregates (EXPLAIN's `decoded`;
+    /// the output's aren't counted).
+    decodes: AtomicU64,
     /// Per aggregate argument, the variable it reads and id: its number for SUM and AVG
     /// ([`Context::numeric_pass`]), kept for the whole evaluation. Keyed by the expression
     /// itself, not its address: patterns made during the evaluation (substituted
     /// subqueries) come and go, and a freed address may hold another expression next.
     numbers: RefCell<HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>>,
     cancellation: Option<CancellationToken>,
-    budget: Budget,
+    budget: Arc<Budget>,
+    /// What the context keeps to the query's end, charged to `budget`: its computed terms
+    /// ([`Self::id`]) and remembered numbers ([`Self::numeric_pass`]). A retry that releases
+    /// what a failed attempt held ([`Self::group`]) leaves it.
+    kept: RefCell<Reservation>,
+    /// The request's envelope: what a part of the evaluation keeps beyond it (the spatial
+    /// index) draws from it ([`spatial`]).
+    memory: nrese_exec::Envelope,
     /// The operators run so far, for EXPLAIN; `None` when not explaining.
     trace: Option<RefCell<Vec<PlanStep>>>,
     /// Nesting depth of the operator being evaluated (for the trace).
     depth: Cell<usize>,
+    /// The seeks of the last index nested-loop join, for EXPLAIN ([`Probe`]).
+    probed: Cell<nrese_engine::SeekStats>,
     /// A LIMIT for the next basic graph pattern: any this many of its rows will do
     /// ([`Context::eval_limited`]). Taken by the pattern, so nothing nested sees it.
     limit: Cell<Option<usize>>,
@@ -986,11 +1548,17 @@ struct Context<'a> {
     cross_chunk_rows: usize,
     /// [`QueryOptions::stream_rows`].
     stream_rows: Option<usize>,
+    /// [`QueryOptions::index_joins`].
+    index_joins: Option<bool>,
     /// With a dataset of several default graphs (`FROM <a> FROM <b>`), the graphs whose
     /// merge the default graph is; the scope is then [`GraphScope::Union`].
-    merge_set: Option<Vec<TermId>>,
+    merge_set: Option<crate::dataset::GraphSet>,
     /// The graphs `GRAPH` may name, if the dataset lists them (`FROM NAMED`).
     named: Option<Vec<TermId>>,
+    /// Whether `GRAPH` with another store's name for the default graph reads the store's
+    /// default graph ([`crate::dataset::ResolvedDataset::store_default`]): not for a reader
+    /// who may not read it.
+    store_default: bool,
     /// Numbers the columns the executor adds for itself ([`exists`]).
     synthetic: Cell<usize>,
     /// [`QueryOptions::services`].
@@ -999,6 +1567,36 @@ struct Context<'a> {
     service_denied: bool,
     /// [`QueryOptions::equality_closed`].
     equality_closed: bool,
+    /// The identities' representatives this query joins on, found at their first use
+    /// ([`Context::representatives`]).
+    representatives: equality::Found,
+    /// The equality classes to expand after joins over canonical reads (stage C,
+    /// [`Context::late_expansion`]); `None` where reads expand them, or don't need to.
+    late: Option<Arc<nrese_engine::EqualityClasses>>,
+    /// Canonical answers, where they apply to this query: the classes its terms stand for
+    /// ([`canonical`]). Decided once, for the whole query; `None` evaluates as without.
+    canonical: Option<canonical::Names>,
+    /// Canonical answers' view refused by this query's budget too: the query's error
+    /// ([`canonical`]).
+    canonical_refused: Option<nrese_exec::BudgetExceeded>,
+    /// The reader's state refused by this query's budget ([`Snapshot::reading_within`]): the
+    /// query's error at its first check.
+    reads_refused: Option<nrese_exec::BudgetExceeded>,
+    /// Whether GeoSPARQL relations in triple patterns are computed from geometries too
+    /// (the query-rewrite extension; not [`QueryOptions::geosparql_stated_only`]).
+    spatial_rewrite: bool,
+    /// The result cache and this context's part of its keys ([`cached`]); `None` without
+    /// one.
+    cache: Option<Arc<cached::CacheScope>>,
+    /// The name to pin the next part evaluated under: the query's whole pattern
+    /// ([`Context::eval_root`]).
+    pin: RefCell<Option<crate::cache::PinRequest>>,
+    /// [`QueryOptions::search_scope`]: what the searches rank and select among, chosen once
+    /// per search before its scan ([`search::SearchIn`]).
+    search_scope: crate::SearchScope,
+    /// EXPLAIN: the trace line of the basic graph pattern [`Self::eval`] is evaluating, until
+    /// its planning ([`Self::bgp`]) gives it the estimate its steps have.
+    bgp_line: Cell<Option<usize>>,
 }
 
 /// The active graph of triple patterns.
@@ -1015,7 +1613,65 @@ enum GraphScope {
     Missing,
 }
 
+/// Tables charged to a query's budget ([`Context::reshaped`]).
+trait Charged {
+    fn charged(&self) -> usize;
+}
+
+impl Charged for Solutions {
+    fn charged(&self) -> usize {
+        self.table.memory_bytes()
+    }
+}
+
+impl Charged for Vec<Solutions> {
+    fn charged(&self) -> usize {
+        self.iter().map(Charged::charged).sum()
+    }
+}
+
+impl<A: Charged, B: Charged> Charged for (A, B) {
+    fn charged(&self) -> usize {
+        self.0.charged() + self.1.charged()
+    }
+}
+
+/// What [`IdTable::concat`] of `parts`' tables allocates beyond them.
+fn concat_growth(parts: &[Solutions]) -> usize {
+    IdTable::concat_growth(parts.iter().map(|p| &p.table))
+}
+
+/// What a context holds of its own before it evaluates anything (its reader's state,
+/// [`Snapshot::reading_within`]): tests that count a query's charges exactly add it.
+#[cfg(test)]
+pub(crate) fn own_bytes(snapshot: &Snapshot) -> usize {
+    let mut options = QueryOptions::default();
+    options.resources.memory = nrese_exec::Envelope::unlimited();
+    let memory = options.resources.memory.clone();
+    let _context = Context::new(snapshot, &options, None, None);
+    memory.used()
+}
+
 impl<'a> Context<'a> {
+    /// Whether `triple` is a GeoSPARQL relation computed from geometries
+    /// ([`spatial`]): not when only stated relations are read.
+    fn is_spatial(&self, triple: &TriplePattern) -> bool {
+        self.spatial_rewrite && spatial::is_spatial(triple)
+    }
+
+    /// [`spatial::split`], when relations are computed from geometries.
+    #[allow(clippy::type_complexity)]
+    fn spatial_split(
+        &self,
+        triples: &[TriplePattern],
+    ) -> Option<(Vec<TriplePattern>, Vec<TriplePattern>, Vec<TriplePattern>)> {
+        if self.spatial_rewrite {
+            spatial::split(triples)
+        } else {
+            None
+        }
+    }
+
     /// `dataset` is the query's own (`FROM`); the protocol's, in `options`, replaces it.
     fn new(
         snapshot: &'a Snapshot,
@@ -1034,33 +1690,90 @@ impl<'a> Context<'a> {
             Some(access) => resolved.restricted(snapshot, access),
             None => resolved,
         };
+        let store_default = resolved.store_default;
         let (scope, merge_set) = match resolved.default {
             DefaultGraph::Store => (GraphScope::Default, None),
             DefaultGraph::Graph(graph) => (GraphScope::Named(graph), None),
             DefaultGraph::Merge(graphs) => (GraphScope::Union, graphs),
             DefaultGraph::Empty => (GraphScope::Missing, None),
         };
-        Self {
+        // Canonical answers where the query's default graph is the one the equality covers
+        // (the store's, or the merge of every graph) and some class exists ([`canonical`]).
+        let in_scope = match scope {
+            GraphScope::Default => true,
+            GraphScope::Union => merge_set.is_none(),
+            _ => false,
+        };
+        // What this evaluation holds, counted on its own (what it leaves behind is its
+        // result's reservation), drawn from the request's envelope; a canonical view the
+        // store's view budget refuses is made on it, for this query.
+        let budget = Arc::new(options.resources.memory.part());
+        let (canonical, canonical_refused) = match options.equality_canonical && in_scope {
+            true => match snapshot.with_canonical_equality_within(&budget) {
+                Ok(read) => (
+                    canonical::Names::of(&read, options.read_model).map(|names| (names, read)),
+                    None,
+                ),
+                Err(refused) => (None, Some(refused)),
+            },
+            false => (None, None),
+        };
+        // What the reads hold while they run (an equality expansion's waiting copies) is
+        // charged to the evaluation too; a read it refuses fails the query at its next check
+        // ([`Self::check`]), and so does the reader's state refused.
+        let unread = match &canonical {
+            Some((_, read)) => read,
+            None => snapshot,
+        };
+        let (read, reads_refused) = match unread.reading_within(Arc::clone(&budget)) {
+            Ok(read) => (read, None),
+            Err(refused) => (unread.clone(), Some(refused)),
+        };
+        let named = match &canonical {
+            // The graphs `FROM NAMED` lists, by the names canonical reads give them.
+            Some((names, _)) => resolved.named.map(|graphs| names.graphs(graphs)),
+            None => resolved.named,
+        };
+        let mut ctx = Self {
             merge_set,
-            named: resolved.named,
+            named,
+            store_default,
             as_written: options.as_written,
+            spatial_rewrite: !options.geosparql_stated_only,
             cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
             stream_rows: options.stream_rows,
-            snapshot,
+            index_joins: options.index_joins,
+            late: match options.equality_canonical || options.equality_early_expansion {
+                true => None,
+                false => snapshot.expand_late(options.read_model),
+            },
+            snapshot: Cow::Owned(read),
+            canonical: canonical.map(|(names, _)| names),
+            canonical_refused,
+            reads_refused,
             model: options.read_model,
             evaluator: Evaluator::with_base(base.cloned()),
             aliases: RefCell::default(),
+            aliases_refused: Cell::new(None),
+            room_unread: Cell::new(false),
             computed: RefCell::default(),
             computed_ids: RefCell::default(),
-            decoded: RefCell::default(),
+            // One thread fills it, with no sibling grant: the whole spare.
+            decoded: RefCell::new(decode_cache::DecodeCache::new(
+                &budget,
+                DECODE_CACHE_ENTRIES,
+                1,
+            )),
+            distinct_counts: RefCell::new(ChargedMap::new(Arc::clone(&budget))),
+            decodes: AtomicU64::new(0),
             numbers: RefCell::default(),
-            cancellation: options.cancellation.clone(),
-            budget: options
-                .memory_limit
-                .map_or_else(Budget::unlimited, Budget::new)
-                .within(options.shared_memory.clone()),
+            cancellation: options.resources.cancellation.clone(),
+            kept: RefCell::new(Reservation::new(Arc::clone(&budget))),
+            budget,
+            memory: options.resources.memory.clone(),
             trace: None,
             depth: Cell::new(0),
+            probed: Cell::default(),
             limit: Cell::new(None),
             graph: RefCell::new(scope),
             synthetic: Cell::new(0),
@@ -1070,14 +1783,43 @@ impl<'a> Context<'a> {
                 .as_ref()
                 .is_some_and(|access| !access.service),
             equality_closed: options.equality_closed,
+            representatives: equality::Found::default(),
+            cache: None,
+            pin: RefCell::default(),
+            search_scope: options.search_scope,
+            bgp_line: Cell::new(None),
+        };
+        if let Some(cache) = &options.result_cache {
+            // Besides the context's options, a result depends on the base IRI (`IRI()`)
+            // and on the user's access, which may hide inferred statements.
+            let fixed = format!("{base:?} {:?}", options.access);
+            ctx.cache = Some(ctx.cache_scope(Arc::clone(cache), fixed.into_bytes().into()));
         }
+        ctx.evaluator.set_canonical(ctx.canonical.clone());
+        ctx
     }
 
-    /// The id of a constant of a pattern: an alias IRI ([`substitute`]) stands for its
-    /// blank node.
+    /// The id of a constant of a pattern: a made constant ([`substitute`]) stands for the
+    /// term registered for it, every IRI for itself.
+    /// [`Self::lookup_const`], what the snapshot's lookup allocates charged to `held` first
+    /// ([`Snapshot::lookup_charged`]).
+    fn lookup_const_charged(
+        &self,
+        term: nrese_rdf::TermRef<'_>,
+        held: &mut Reservation<&nrese_exec::Budget>,
+    ) -> Result<Option<TermId>, nrese_exec::BudgetExceeded> {
+        if let nrese_rdf::TermRef::NamedNode(n) = term
+            && internal::is_constant(n.as_str())
+        {
+            return Ok(self.lookup_const(term));
+        }
+        self.snapshot
+            .lookup_charged(term, |bytes| held.charge(bytes))
+    }
+
     fn lookup_const(&self, term: nrese_rdf::TermRef<'_>) -> Option<TermId> {
         if let nrese_rdf::TermRef::NamedNode(n) = term
-            && n.as_str().starts_with(substitute::ALIAS)
+            && internal::is_constant(n.as_str())
         {
             return self
                 .aliases
@@ -1088,10 +1830,18 @@ impl<'a> Context<'a> {
         self.snapshot.lookup(term)
     }
 
-    /// Makes `alias` stand for the blank node `id` in patterns and expressions.
+    /// Retains one typed alias, reserved before either map keeps it. Refusal is sticky,
+    /// like a refused read during preparation, and every delivery checks it.
     fn register_alias(&self, alias: &str, id: u64) {
-        self.aliases.borrow_mut().insert(alias.to_owned(), id);
+        if self.aliases_refused.get().is_some() || self.aliases.borrow().get(alias) == Some(&id) {
+            return;
+        }
         if let Some(term) = self.term(id) {
+            if let Err(refused) = self.kept.borrow_mut().charge(alias_bytes(alias, &term)) {
+                self.aliases_refused.set(Some(refused));
+                return;
+            }
+            self.aliases.borrow_mut().insert(alias.to_owned(), id);
             self.evaluator.register_alias(alias, term);
         }
     }
@@ -1113,27 +1863,49 @@ impl<'a> Context<'a> {
                 estimated_rows,
                 rows: rows as u64,
                 micros: start.elapsed().as_micros() as u64,
+                cache: None,
             });
         }
     }
 
+    /// Fails a cancelled query, and one a read refused memory to: what it read since may
+    /// be incomplete ([`Snapshot::reading_within`]).
     fn check(&self) -> NativeResult<()> {
-        if self
+        if let Some(refused) = self
+            .aliases_refused
+            .get()
+            .or(self.reads_refused)
+            .or_else(|| self.snapshot.read_refused())
+        {
+            return Err(QueryEvaluationError::MemoryLimit(refused).into());
+        }
+        Ok(self
             .cancellation
             .as_ref()
-            .is_some_and(CancellationToken::is_cancelled)
-        {
-            return Err(QueryEvaluationError::Cancelled.into());
-        }
-        Ok(())
+            .map_or(Ok(()), CancellationToken::check)?)
     }
 
-    /// Charges a produced table against the query's memory budget.
+    /// One solution without bindings (an empty group's), made as every table is
+    /// ([`Self::produced`]): it counts nothing ([`IdTable::memory_bytes`]), so neither making
+    /// it nor consuming it touches the budget.
+    fn unit(&self) -> NativeResult<Solutions> {
+        self.produced(Solutions {
+            vars: Vec::new(),
+            table: IdTable::from_rows(0, [&[][..]]),
+            ordered: false,
+        })
+    }
+
+    /// Charges a produced table against the query's memory budget. A table that counts
+    /// nothing is charged nothing: no call up the budget's levels for it.
     fn produced(&self, solutions: Solutions) -> NativeResult<Solutions> {
         self.check()?;
-        self.budget
-            .charge(solutions.table.memory_bytes())
-            .map_err(QueryEvaluationError::MemoryLimit)?;
+        let bytes = solutions.table.memory_bytes();
+        if bytes > 0 {
+            self.budget
+                .charge(bytes)
+                .map_err(QueryEvaluationError::MemoryLimit)?;
+        }
         Ok(solutions)
     }
 
@@ -1141,7 +1913,11 @@ impl<'a> Context<'a> {
     /// Half of what the bytes would hold: a table that grows reallocates, and a join's
     /// parallel parts are copied into one table, so for a moment the rows exist twice.
     fn max_rows(&self, width: usize) -> usize {
-        self.budget.remaining() / (width.max(1) * 8 * 2)
+        let Ok(room) = self.budget.room() else {
+            self.room_unread.set(true);
+            return 0;
+        };
+        room / (width.max(1) * 8 * 2)
     }
 
     /// Charges a join's hash table over `rows` build rows (a key, a row number and the
@@ -1171,18 +1947,102 @@ impl<'a> Context<'a> {
             return cancelled;
         }
         let requested = rows.saturating_mul(width.max(1) * 8);
+        // No room because the process's limit can't be read: that, not a full budget, even
+        // where a reading since has found it.
+        let room = self.budget.room().ok().filter(|_| !self.room_unread.get());
+        let Some(room) = room else {
+            return QueryEvaluationError::MemoryLimit(BudgetExceeded {
+                limit: 0,
+                requested,
+                used: self.budget.used(),
+                shared: true,
+                unread: true,
+            })
+            .into();
+        };
         QueryEvaluationError::MemoryLimit(BudgetExceeded {
-            limit: self.budget.used().saturating_add(self.budget.remaining()),
+            limit: self.budget.used().saturating_add(room),
             // A table may grow to half of what is left (`max_rows`).
             requested: requested.saturating_mul(2),
             used: self.budget.used(),
             shared: self.budget.bounded_by_shared(),
+            unread: false,
         })
         .into()
     }
 
-    fn consumed(&self, solutions: &Solutions) {
-        self.budget.release(solutions.table.memory_bytes());
+    /// The error of a stopped join of `width` output columns: its row limit
+    /// ([`Self::too_large`]), or an input with more rows than the join's row numbers name.
+    fn join_stopped(&self, stop: JoinStop, width: usize) -> NativeError {
+        match stop {
+            JoinStop::Rows(rows) => self.too_large(rows.max_rows.saturating_add(1), width),
+            JoinStop::TooLarge(limit) => QueryEvaluationError::TooLarge(limit).into(),
+        }
+    }
+
+    /// Frees a table charged to the query's budget, then releases its charge: the budget
+    /// never shows less than the tables hold. A table that counts nothing releases nothing.
+    fn consumed(&self, solutions: Solutions) {
+        let bytes = solutions.table.memory_bytes();
+        drop(solutions);
+        if bytes > 0 {
+            self.budget.release(bytes);
+        }
+    }
+
+    /// A table that `reshape` makes of charged ones, which it takes (filtering in place,
+    /// projecting, joining into one): their charge carries over to it, not charged again.
+    /// `growth`, the most it allocates beyond what it frees as it goes, is charged first;
+    /// once the tables it was made of are gone, it holds the charge of exactly its bytes.
+    /// On an error the tables are freed before their charge is released.
+    fn reshaped<T: Charged>(
+        &self,
+        from: T,
+        growth: usize,
+        reshape: impl FnOnce(T) -> Solutions,
+    ) -> NativeResult<Solutions> {
+        let mut held = Reservation::adopt(&*self.budget, from.charged());
+        if let Err(error) = held.charge(growth) {
+            drop(from);
+            return Err(QueryEvaluationError::MemoryLimit(error).into());
+        }
+        // Declared after `held`: dropped before it.
+        let solutions = reshape(from);
+        self.check()?;
+        held.resize(solutions.table.memory_bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        held.transfer();
+        Ok(solutions)
+    }
+
+    /// A table `make` makes of nothing charged: `bytes`, the most it allocates for the
+    /// table, charged first; then the charge of exactly the table's bytes, which it keeps.
+    fn made(
+        &self,
+        bytes: usize,
+        make: impl FnOnce() -> NativeResult<Solutions>,
+    ) -> NativeResult<Solutions> {
+        let mut held = Reservation::new(&*self.budget);
+        held.charge(bytes)
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        // Declared after `held`: dropped before it.
+        let solutions = make()?;
+        self.check()?;
+        held.resize(solutions.table.memory_bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        held.transfer();
+        Ok(solutions)
+    }
+
+    /// `solutions` (charged) without its last `count` columns ([`Self::with_exists`]'),
+    /// their charge released.
+    fn drop_added(&self, solutions: Solutions, count: usize) -> NativeResult<Solutions> {
+        if count == 0 {
+            return Ok(solutions);
+        }
+        self.reshaped(solutions, 0, |solutions| {
+            drop_last_columns(solutions, count)
+        })
     }
 
     fn term(&self, id: u64) -> Option<Term> {
@@ -1193,32 +2053,38 @@ impl<'a> Context<'a> {
             return self.computed.borrow().get(index as usize).cloned();
         }
         let mut decoded = self.decoded.borrow_mut();
-        if let Some(term) = decoded.get(&id) {
+        if let Some(term) = decoded.get(id) {
             return term.clone();
         }
+        self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         let term = self.snapshot.decode(TermId::from_raw(id));
-        // Bounded: a scan over millions of distinct labels must not keep them all.
-        if decoded.len() < DECODE_CACHE_ENTRIES {
-            decoded.insert(id, term.clone());
-        }
+        // Bounded: a scan over millions of distinct labels must not keep them all; and charged
+        // while kept (D16-039).
+        decoded.keep(id, &term);
         term
     }
 
     /// The id of `term`: its stored id if the snapshot knows it, else a computed id, the same
-    /// one for equal terms.
-    fn id(&self, term: &Term) -> u64 {
+    /// one for equal terms. A term new to the query is charged before it is kept
+    /// ([`computed_bytes`]), however many the query's text makes per row; the charge stays
+    /// with what the query holds to its end (its result keeps the computed terms).
+    fn id(&self, term: &Term) -> NativeResult<u64> {
         if let Some(id) = self.lookup_const(term.as_ref()) {
-            return id.raw();
+            return Ok(id.raw());
         }
         let mut ids = self.computed_ids.borrow_mut();
         if let Some(&id) = ids.get(term) {
-            return id;
+            return Ok(id);
         }
+        self.kept
+            .borrow_mut()
+            .charge(computed_bytes(term))
+            .map_err(QueryEvaluationError::MemoryLimit)?;
         let mut computed = self.computed.borrow_mut();
         let id = computed_id(computed.len() as u64);
         computed.push(term.clone());
         ids.insert(term.clone(), id);
-        id
+        Ok(id)
     }
 
     fn binding<'s>(
@@ -1234,9 +2100,17 @@ impl<'a> Context<'a> {
 
     fn eval(&self, pattern: &GraphPattern) -> NativeResult<Solutions> {
         let Some(trace) = &self.trace else {
-            return self.eval_operator(pattern);
+            return self.eval_cached(pattern, None);
         };
         let depth = self.depth.get();
+        // The plan's estimate of what this operator gives (`estimate`), as `plan_query`
+        // shows it before running.
+        // It plans the operator's BGPs, noting each planned without the characteristic sets
+        // ([`Self::with_sets`]): set aside, as the evaluation that plans one again notes it
+        // in its place; not noted again here per enclosing operator.
+        let noted = trace.borrow().len();
+        let estimated_rows = self.estimate_rows(pattern);
+        let planned = trace.borrow_mut().split_off(noted);
         let index = {
             let mut trace = trace.borrow_mut();
             let (operator, detail) = describe(pattern);
@@ -1244,20 +2118,43 @@ impl<'a> Context<'a> {
                 depth,
                 operator: operator.to_owned(),
                 detail,
-                estimated_rows: None,
+                estimated_rows,
                 rows: 0,
                 micros: 0,
+                cache: None,
             });
             trace.len() - 1
         };
+        if matches!(pattern, GraphPattern::Bgp { .. }) {
+            self.bgp_line.set(Some(index));
+        }
         self.depth.set(depth + 1);
         let start = Instant::now();
-        let result = self.eval_operator(pattern);
+        let result = self.eval_cached(pattern, Some(index));
+        self.bgp_line.set(None);
         self.depth.set(depth);
         if let Ok(solutions) = &result {
-            let step = &mut trace.borrow_mut()[index];
+            let mut trace = trace.borrow_mut();
+            let step = &mut trace[index];
             step.rows = solutions.table.len() as u64;
             step.micros = start.elapsed().as_micros() as u64;
+            // A cyclic BGP the operator ran by a worst-case-optimal join without planning it
+            // again (a join with paths plans it with them, and notes that): its estimate's
+            // note goes first under the operator, where planning would put it.
+            let ran = |operator: &str| {
+                trace[index + 1..]
+                    .iter()
+                    .any(|s| s.depth == depth + 1 && s.operator == operator)
+            };
+            if ran("wcoj") && !ran(WITHOUT_SETS) {
+                let below = trace.split_off(index + 1);
+                let notes = planned.into_iter().filter(|s| s.operator == WITHOUT_SETS);
+                trace.extend(notes.map(|s| PlanStep {
+                    depth: depth + 1,
+                    ..s
+                }));
+                trace.extend(below);
+            }
         }
         result
     }
@@ -1272,7 +2169,7 @@ impl<'a> Context<'a> {
         match pattern {
             GraphPattern::Project { inner, variables } => {
                 let solutions = self.eval_limited(inner, limit)?;
-                Ok(self.project(solutions, variables))
+                self.project(solutions, variables)
             }
             GraphPattern::LeftJoin {
                 left,
@@ -1331,16 +2228,33 @@ impl<'a> Context<'a> {
         } else {
             (solutions, expression.clone(), 0)
         };
-        let values: Vec<u64> = (0..solutions.table.len())
-            .map(|row| {
-                self.evaluator
-                    .in_solution(row as u64, || {
-                        self.evaluator.eval(&plain, &self.binding(&solutions, row))
-                    })
-                    .map_or(UNDEF, |term| self.id(&term))
-            })
-            .collect();
-        let mut solutions = drop_last_columns(solutions, added);
+        // A triple term's part or `TRIPLE(…)` on ids ([`fast::IdTerm`]); other rows and
+        // expressions by the generic evaluator.
+        let on_ids = fast::compile_term(&plain, &self.snapshot)
+            .filter(|term| matches!(term, fast::IdTerm::Part(..) | fast::IdTerm::Triple(_)));
+        let value = |row: usize| -> NativeResult<u64> {
+            if let Some(term) = &on_ids {
+                let value = |v: &Variable| {
+                    solutions
+                        .column(v)
+                        .map_or(UNDEF, |c| solutions.table.get(row, c))
+                };
+                match term.value(&value, &self.snapshot) {
+                    fast::Id::Stored(id) => return Ok(id.raw()),
+                    fast::Id::Error => return Ok(UNDEF),
+                    fast::Id::Absent | fast::Id::Unknown => {}
+                }
+            }
+            let term = self.evaluator.in_solution(row as u64, || {
+                self.evaluator.eval(&plain, &self.binding(&solutions, row))
+            });
+            term.map_or(Ok(UNDEF), |term| self.id(&term))
+        };
+        let mut values = Vec::with_capacity(solutions.table.len());
+        for row in 0..solutions.table.len() {
+            values.push(value(row)?);
+        }
+        let mut solutions = self.drop_added(solutions, added)?;
         let mut columns = std::mem::take(&mut solutions.table).into_columns();
         columns.push(values);
         solutions.vars.push(variable.clone());
@@ -1350,6 +2264,13 @@ impl<'a> Context<'a> {
 
     fn eval_operator(&self, pattern: &GraphPattern) -> NativeResult<Solutions> {
         self.check()?;
+        if let Some(classes) = &self.late
+            && late::joins(pattern)
+            && late::safe(pattern)
+            && self.late_scope()
+        {
+            return self.late_expansion(pattern, classes);
+        }
         match pattern {
             GraphPattern::Bgp { patterns } => self.bgp(patterns, &[], &mut Vec::new()),
             GraphPattern::Graph { name, inner } => self.graph(name, inner),
@@ -1357,27 +2278,38 @@ impl<'a> Context<'a> {
                 name,
                 inner,
                 silent,
-            } => self.service(name, inner, *silent, None),
+            } => self.service(name, inner, *silent),
             // A SERVICE joined to a pattern gets the values the pattern binds.
-            GraphPattern::Join { left, right }
-                if matches!(**right, GraphPattern::Service { .. })
-                    || matches!(**left, GraphPattern::Service { .. }) =>
+            GraphPattern::Join { inputs }
+                if inputs
+                    .iter()
+                    .any(|input| matches!(input, GraphPattern::Service { .. })) =>
             {
-                let (local, remote) = match &**right {
-                    GraphPattern::Service { .. } => (left, right),
-                    _ => (right, left),
-                };
+                // The last SERVICE gets what the other inputs bind, joined.
+                let at = inputs
+                    .iter()
+                    .rposition(|input| matches!(input, GraphPattern::Service { .. }))
+                    .expect("matched above");
                 let GraphPattern::Service {
                     name,
                     inner,
                     silent,
-                } = &**remote
+                } = &inputs[at]
                 else {
                     unreachable!("matched above")
                 };
-                let bound = self.eval(local)?;
-                let found = self.service(name, inner, *silent, Some(&bound))?;
-                self.join(bound, found)
+                let others: Vec<GraphPattern> = inputs
+                    .iter()
+                    .enumerate()
+                    .filter(|&(i, _)| i != at)
+                    .map(|(_, input)| input.clone())
+                    .collect();
+                let local = GraphPattern::join_all(others);
+                if vectors::is_search(name) {
+                    return self.vector_join(&local, inner);
+                }
+                let bound = self.eval(&local)?;
+                self.service_attached(name, inner, *silent, bound, federation::Attach::Join)
             }
             GraphPattern::LeftJoin {
                 left,
@@ -1393,35 +2325,24 @@ impl<'a> Context<'a> {
                     unreachable!("matched above")
                 };
                 let left = self.eval(left)?;
-                let found = self.service(name, inner, *silent, Some(&left))?;
-                self.left_join(left, found, expression.as_ref())
+                let attach = federation::Attach::Optional(expression.as_ref());
+                self.service_attached(name, inner, *silent, left, attach)
             }
             GraphPattern::Path {
                 subject,
                 path,
                 object,
             } => self.path(subject, path, object),
-            GraphPattern::Join { left, right } => {
-                // A path joined to a pattern is evaluated second, from the values the
-                // pattern binds to one of its ends.
-                match (as_path(left), as_path(right)) {
-                    (_, Some(path)) => {
-                        let bound = self.eval(left)?;
-                        let reached = self.path_from(&bound, &path)?;
-                        self.join(bound, reached)
-                    }
-                    (Some(path), None) => {
-                        let bound = self.eval(right)?;
-                        let reached = self.path_from(&bound, &path)?;
-                        self.join(reached, bound)
-                    }
-                    (None, None) if self.as_written => {
-                        let (left, right) = (self.eval(left)?, self.eval(right)?);
-                        self.join(left, right)
-                    }
-                    // The smaller side first; the other from its rows (`sideways`).
-                    (None, None) => self.join_sideways(left, right),
+            GraphPattern::Join { inputs } => {
+                // Paths joined to triple patterns: ordered with them (`path_joins`).
+                if !self.as_written
+                    && let Some(join) = path_joins::PathJoin::of(pattern)
+                {
+                    return self.join_with_paths(&join);
                 }
+                // The most selective input first, the others from its rows (`sideways`);
+                // a path from the values the inputs before it bind to one of its ends.
+                self.join_inputs(inputs)
             }
             GraphPattern::LeftJoin {
                 left,
@@ -1446,22 +2367,23 @@ impl<'a> Context<'a> {
                     // conjunct still runs on every row, so the ranges only prune). Each
                     // conjunct runs as soon as the join sequence has bound its variables,
                     // so that a selective filter keeps the following joins small.
-                    let hints = ranges::hints(expr, self.snapshot);
+                    let hints = ranges::hints(expr, &self.snapshot);
                     let mut all = Vec::new();
                     pushdown::conjuncts_of(expr, &mut all);
                     let as_written = self.as_written;
                     let (early, late): (Vec<_>, Vec<_>) = all
                         .into_iter()
                         .partition(|c| !as_written && pushdown::movable(c));
-                    let spatial_seed = self.spatial_seed(&early, patterns);
+                    let spatial_seed = self.spatial_seed(&early, patterns)?;
                     let mut early: Vec<(&Expression, Vec<Variable>)> = early
                         .into_iter()
                         .map(|c| (c, expression_variables(c)))
                         .collect();
-                    // A spatial filter's candidates from the R-tree start the joins.
+                    // A spatial filter's literals from the index start the joins; they
+                    // decide its conjunct, and come charged.
                     let mut solutions = match spatial_seed {
-                        Some(seed) => {
-                            let seed = self.produced(seed)?;
+                        Some((seed, decided)) => {
+                            early.remove(decided);
                             self.bgp_from(seed, patterns, &mut early)?
                         }
                         None => self.bgp(patterns, &hints, &mut early)?,
@@ -1488,17 +2410,23 @@ impl<'a> Context<'a> {
                     self.filter(solutions, expr)
                 }
             },
-            GraphPattern::Union { left, right } => {
-                let (left, right) = (self.eval(left)?, self.eval(right)?);
-                self.union(left, right)
+            GraphPattern::Union { inputs } => {
+                let mut united: Option<Solutions> = None;
+                for input in inputs {
+                    let rows = self.eval(input)?;
+                    united = Some(match united.take() {
+                        Some(before) => self.union(before, rows)?,
+                        None => rows,
+                    });
+                }
+                united.map_or_else(|| self.unit(), Ok)
             }
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => {
-                let solutions = self.eval(inner)?;
-                self.extend(solutions, variable, expression)
+            GraphPattern::Extend { inner, bindings } => {
+                let mut solutions = self.eval(inner)?;
+                for (variable, expression) in bindings {
+                    solutions = self.extend(solutions, variable, expression)?;
+                }
+                Ok(solutions)
             }
             GraphPattern::Minus { left, right } => {
                 let (left, right) = (self.eval(left)?, self.eval(right)?);
@@ -1509,12 +2437,14 @@ impl<'a> Context<'a> {
                 let mut table = left.table;
                 if has_undef(&table, &lk) || has_undef(&right.table, &rk) {
                     // A row goes if a compatible row shares a variable both bind.
-                    let removed = compatible_mask(&table, &right.table, &lk, &rk, true);
+                    let removed = compatible_mask(&table, &right.table, &lk, &rk, true)
+                        .map_err(QueryEvaluationError::from)?;
                     table.retain_mask(&removed.iter().map(|r| !r).collect::<Vec<_>>());
                 } else {
-                    anti_join_in_place(&mut table, &right.table, &lk, &rk);
+                    anti_join_in_place(&mut table, &right.table, &lk, &rk)
+                        .map_err(QueryEvaluationError::from)?;
                 }
-                self.consumed(&right);
+                self.consumed(right);
                 self.produced(Solutions {
                     vars: left.vars,
                     table,
@@ -1526,14 +2456,15 @@ impl<'a> Context<'a> {
                 bindings,
             } => {
                 let mut table = IdTable::new(variables.len());
+                let mut row = Vec::with_capacity(variables.len());
                 for binding in bindings {
-                    let row: Vec<u64> = binding
-                        .iter()
-                        .map(|term| match term {
-                            Some(term) => self.id(&Term::from(term.clone())),
+                    row.clear();
+                    for term in binding {
+                        row.push(match term {
+                            Some(term) => self.id(&Term::from(term.clone()))?,
                             None => UNDEF,
-                        })
-                        .collect();
+                        });
+                    }
                     table.push_row(&row);
                 }
                 self.produced(Solutions {
@@ -1548,7 +2479,7 @@ impl<'a> Context<'a> {
             }
             GraphPattern::Project { inner, variables } => {
                 let solutions = self.eval(inner)?;
-                Ok(self.project(solutions, variables))
+                self.project(solutions, variables)
             }
             GraphPattern::Distinct { inner } => {
                 // SELECT DISTINCT … ORDER BY projected variables: deduplicate first, then sort
@@ -1577,7 +2508,7 @@ impl<'a> Context<'a> {
                         }
                         _ => self.eval(sorted)?,
                     };
-                    let mut solutions = self.project(solutions, variables);
+                    let mut solutions = self.project(solutions, variables)?;
                     solutions.table.dedup_preserving_order();
                     return self.order_by(solutions, expression, None);
                 }
@@ -1591,7 +2522,7 @@ impl<'a> Context<'a> {
                     && !self.as_written
                 {
                     let solutions = self.eval_set(projected, variables)?;
-                    let mut solutions = self.project(solutions, variables);
+                    let mut solutions = self.project(solutions, variables)?;
                     solutions.table.dedup_preserving_order();
                     return Ok(solutions);
                 }
@@ -1637,7 +2568,7 @@ impl<'a> Context<'a> {
                     let solutions = self.eval(sorted)?;
                     let solutions =
                         self.order_by(solutions, expression, length.map(|l| start + l))?;
-                    let mut solutions = self.project(solutions, variables);
+                    let mut solutions = self.project(solutions, variables)?;
                     solutions.table.slice(*start, *length);
                     return Ok(solutions);
                 }
@@ -1680,10 +2611,19 @@ impl<'a> Context<'a> {
 
     fn graph(&self, name: &NamedNodePattern, inner: &GraphPattern) -> NativeResult<Solutions> {
         let variable = match name {
+            // Jena's name for the default graph (`compat`): the store's default graph, where
+            // it is in reach; for a reader who may not read it, absent as an unreadable named
+            // graph is (below).
             NamedNodePattern::NamedNode(n) => {
-                let id = self
-                    .lookup_const(n.as_ref().into())
-                    .filter(|&id| self.is_named_graph(id));
+                let id = match crate::compat::graph_named(n) {
+                    nrese_rdf::GraphNameRef::DefaultGraph if self.store_default => {
+                        return self.in_graph(GraphScope::Default, inner);
+                    }
+                    nrese_rdf::GraphNameRef::DefaultGraph => None,
+                    _ => self
+                        .lookup_const(n.as_ref().into())
+                        .filter(|&id| self.is_named_graph(id)),
+                };
                 return match id {
                     Some(id) => self.in_graph(GraphScope::Named(id), inner),
                     // No such graph in the dataset: no solutions, whatever the pattern
@@ -1702,7 +2642,7 @@ impl<'a> Context<'a> {
             }
             NamedNodePattern::Variable(v) => v,
         };
-        if scans_everywhere(inner, variable) {
+        if scans_everywhere(inner, variable, self.spatial_rewrite) {
             // Every row comes from scans, which bind the variable: one evaluation for
             // all graphs.
             let mut solutions = self.in_graph(GraphScope::Variable(variable.clone()), inner)?;
@@ -1720,34 +2660,21 @@ impl<'a> Context<'a> {
         // Graph by graph: the pattern in each named graph, with the variable bound to it.
         let graphs: Vec<TermId> = match &self.named {
             Some(named) => named.clone(),
-            None => self.snapshot.named_graphs().collect(),
+            None => self.snapshot.named_graphs_in(self.model).collect(),
         };
         let mut all: Option<Solutions> = None;
         for graph in graphs {
             self.check()?;
-            let mut solutions = self.in_graph(GraphScope::Named(graph), inner)?;
-            match solutions.column(variable) {
-                // The pattern binds the variable itself: it must be this graph.
-                Some(column) => {
-                    let mask: Vec<bool> = solutions
-                        .table
-                        .column(column)
-                        .iter()
-                        .map(|&id| id == graph.raw() || id == UNDEF)
-                        .collect();
-                    solutions.table.retain_mask(&mask);
-                    let mut columns = std::mem::take(&mut solutions.table).into_columns();
-                    columns[column].fill(graph.raw());
-                    solutions.table = IdTable::from_columns(columns);
-                }
-                None => {
-                    let rows = solutions.table.len();
-                    let mut columns = std::mem::take(&mut solutions.table).into_columns();
-                    columns.push(vec![graph.raw(); rows]);
-                    solutions.vars.push(variable.clone());
-                    solutions.table = IdTable::from_columns(columns);
-                }
-            }
+            let solutions = self.in_graph(GraphScope::Named(graph), inner)?;
+            // The graph's column, where the pattern doesn't bind the variable, charged
+            // before it is made; the charge then follows the table's bytes (`reshaped`).
+            let growth = match solutions.column(variable) {
+                Some(_) => 0,
+                None => solutions.table.len().saturating_mul(8),
+            };
+            let solutions = self.reshaped(solutions, growth, |solutions| {
+                bind_graph(solutions, variable, RowGraphs::One(graph.raw()))
+            })?;
             all = Some(match all {
                 Some(all) => self.union(all, solutions)?,
                 None => solutions,
@@ -1775,17 +2702,15 @@ impl<'a> Context<'a> {
 
     /// An end of a path: a variable (blank nodes are variables here), or a constant's id
     /// (computed if the store doesn't know it; such an id has no edges).
-    fn path_end(&self, term: &TermPattern) -> Result<Variable, u64> {
-        match term {
+    fn path_end(&self, term: &TermPattern) -> NativeResult<Result<Variable, u64>> {
+        Ok(match term {
             TermPattern::Variable(v) => Ok(v.clone()),
-            TermPattern::BlankNode(b) => {
-                Ok(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-            }
-            TermPattern::NamedNode(n) => Err(self.id(&n.clone().into())),
-            TermPattern::Literal(l) => Err(self.id(&l.clone().into())),
+            TermPattern::BlankNode(b) => Ok(internal::blank_variable(b)),
+            TermPattern::NamedNode(n) => Err(self.id(&n.clone().into())?),
+            TermPattern::Literal(l) => Err(self.id(&l.clone().into())?),
             // A triple term at a path's end matches nothing a path reaches.
             TermPattern::Triple(_) => Err(UNDEF),
-        }
+        })
     }
 
     /// The path evaluator for the active graph. There is none while `GRAPH ?g` is evaluated
@@ -1793,19 +2718,20 @@ impl<'a> Context<'a> {
     fn path_evaluator(&self) -> NativeResult<paths::PathEvaluator<'_>> {
         let graph = match &*self.graph.borrow() {
             GraphScope::Default => paths::PathGraph::Default,
-            GraphScope::Union => paths::PathGraph::Merged(self.merge_set.as_deref()),
+            GraphScope::Union => paths::PathGraph::Merged(self.merge_set.as_ref()),
             GraphScope::Named(id) => paths::PathGraph::Named(*id),
             // A graph the store doesn't hold: the merge of no graphs.
-            GraphScope::Missing => paths::PathGraph::Merged(Some(&[])),
+            GraphScope::Missing => paths::PathGraph::Merged(Some(&crate::dataset::NO_GRAPHS)),
             // `GRAPH ?g` sends patterns with paths graph by graph (`scans_everywhere`).
             GraphScope::Variable(_) => return unsupported("a path read in all graphs at once"),
         };
-        Ok(paths::PathEvaluator {
-            snapshot: self.snapshot,
-            model: self.model,
+        Ok(paths::PathEvaluator::new(
+            &self.snapshot,
+            self.model,
             graph,
-            fixed: None,
-        })
+            self.cancellation.as_ref(),
+            &self.budget,
+        ))
     }
 
     /// The solutions of `path` that can join `bound`: if `bound` binds one of the path's
@@ -1824,11 +2750,11 @@ impl<'a> Context<'a> {
         if self.as_written {
             return self.filtered_path(path, None, start);
         }
-        let (Ok(s), Ok(o)) = (self.path_end(path.subject), self.path_end(path.object)) else {
+        let (Ok(s), Ok(o)) = (self.path_end(path.subject)?, self.path_end(path.object)?) else {
             // A constant end already bounds the path.
             return self.filtered_path(path, None, start);
         };
-        let resolved = paths::Path::resolve(path.path, self.snapshot);
+        let resolved = paths::Path::resolve(path.path, &self.snapshot);
         let evaluator = self.path_evaluator()?;
         // Bound at both ends: followed from the end with fewer values (the join with
         // `bound` keeps the rows whose other end matches).
@@ -1843,19 +2769,99 @@ impl<'a> Context<'a> {
         } else {
             return self.filtered_path(path, None, start);
         };
-        let (vars, table) = if s == o {
-            let same = pairs.into_iter().filter(|(a, b)| a == b).map(|(a, _)| a);
-            (vec![s], IdTable::from_columns(vec![same.collect()]))
-        } else {
-            let (starts, ends): (Vec<u64>, Vec<u64>) = pairs.into_iter().unzip();
-            (vec![s, o], IdTable::from_columns(vec![starts, ends]))
+        let pairs = pairs.map_err(QueryEvaluationError::MemoryLimit)?;
+        let estimate = || self.path_estimate(path, Some(from));
+        self.note_closures(&evaluator, path.path, estimate, pairs.len(), start);
+        let reached = self.path_pairs(evaluator.pool(), pairs, s, o)?;
+        self.filtered_path(path, Some((reached, from)), start)
+    }
+
+    /// The table of a path's ends (or starts), a row per copy of its bag: a bag of copies moves
+    /// into the column with its charge; a counted one's copies are charged to `pool` before
+    /// they are made, beside it.
+    fn path_column<'e>(
+        &self,
+        pool: &'e nrese_exec::Pool,
+        variable: Variable,
+        ends: paths::Bag<'e, u64>,
+    ) -> NativeResult<Solutions> {
+        let column = ends
+            .into_copies(pool)
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        self.path_table(vec![variable], vec![column])
+    }
+
+    /// The table of a path's `(s, o)` pairs (one column if `s` and `o` are one variable,
+    /// of the pairs that start where they end): a row per copy (a sequence of alternatives
+    /// counts a pair once per way through), every column charged to `pool` before it is made,
+    /// beside the pairs, which are freed once the columns are made ([`Self::path_table`]).
+    fn path_pairs(
+        &self,
+        pool: &nrese_exec::Pool,
+        pairs: paths::Bag<'_, (u64, u64)>,
+        s: Variable,
+        o: Variable,
+    ) -> NativeResult<Solutions> {
+        let refused = QueryEvaluationError::MemoryLimit;
+        // A column of `rows` ids, the copies of each pair's `end` (of the pairs `keep` takes).
+        let column = |rows: usize, keep: fn(&(u64, u64)) -> bool, end: fn((u64, u64)) -> u64| {
+            let mut column = paths::Buf::with_capacity_in(pool, rows).map_err(refused)?;
+            let filled = column.fill(rows, |room| {
+                for (pair, copies) in pairs.counted().filter(|(pair, _)| keep(pair)) {
+                    room.extend(std::iter::repeat_n(end(pair), copies));
+                }
+            });
+            filled.map_err(refused)?;
+            Ok::<_, NativeError>(column)
         };
-        let reached = self.produced(Solutions {
+        let (vars, columns) = if s == o {
+            let same = |(a, b): &(u64, u64)| a == b;
+            let rows = pairs
+                .counted()
+                .filter(|(pair, _)| same(pair))
+                .fold(0usize, |n, (_, copies)| n.saturating_add(copies));
+            (vec![s], vec![column(rows, same, |(a, _)| a)?])
+        } else {
+            let (rows, all) = (pairs.len(), |_: &(u64, u64)| true);
+            let starts = column(rows, all, |(a, _)| a)?;
+            (vec![s, o], vec![starts, column(rows, all, |(_, b)| b)?])
+        };
+        drop(pairs);
+        self.path_table(vars, columns)
+    }
+
+    /// A path's table of `columns`, each charged to the path's pool since before it was
+    /// made: their charge is handed to the table whole ([`nrese_exec::Share::transfer`]),
+    /// never released and charged again, exactly the table's bytes (not, as before, a
+    /// column's capacity released down to its length while it lived). Cancelled or
+    /// refused before, the columns are dropped: freed,
+    /// then released.
+    fn path_table(
+        &self,
+        vars: Vec<Variable>,
+        columns: Vec<paths::Buf<'_, u64>>,
+    ) -> NativeResult<Solutions> {
+        self.check()?;
+        let mut bytes = 0usize;
+        let columns = columns
+            .into_iter()
+            .map(|column| {
+                let (column, held) = column.into_parts();
+                bytes += held.transfer();
+                column
+            })
+            .collect();
+        let table = IdTable::from_columns(columns);
+        debug_assert_eq!(
+            table.memory_bytes(),
+            bytes,
+            "a path table's charge is its bytes"
+        );
+        Ok(Solutions {
             vars,
             table,
             ordered: false,
-        })?;
-        self.filtered_path(path, Some((reached, from)), start)
+        })
     }
 
     /// The path's solutions (`reached`, from that many bound values, or all of them),
@@ -1868,6 +2874,7 @@ impl<'a> Context<'a> {
     ) -> NativeResult<Solutions> {
         let (subject, object) = (path.subject, path.object);
         let mut detail = format!("{subject} {} {object}", path.path);
+        let bound_values = reached.as_ref().map(|(_, values)| *values);
         let mut solutions = match reached {
             Some((solutions, values)) => {
                 detail.push_str(&format!(" from {values} bound values"));
@@ -1876,17 +2883,34 @@ impl<'a> Context<'a> {
             None => self.path(subject, path.path, object)?,
         };
         if self.trace.is_some() {
-            self.note("path", detail, None, solutions.table.len(), start);
+            let estimate = self.path_estimate(path, bound_values);
+            self.note("path", detail, estimate, solutions.table.len(), start);
         }
         if let Some(filter) = path.filter {
             let start = Instant::now();
+            let estimate = filtered(solutions.table.len(), filter);
             solutions = self.filter(solutions, filter)?;
             if self.trace.is_some() {
                 let rows = solutions.table.len();
-                self.note("filter", filter.to_string(), None, rows, start);
+                self.note("filter", filter.to_string(), estimate, rows, start);
             }
         }
         Ok(solutions)
+    }
+
+    /// Notes a closure computed per strongly connected component by `evaluator` (EXPLAIN).
+    fn note_closures(
+        &self,
+        evaluator: &paths::PathEvaluator<'_>,
+        path: &nrese_sparql_syntax::algebra::PropertyPathExpression,
+        estimate: impl FnOnce() -> Option<u64>,
+        rows: usize,
+        start: Instant,
+    ) {
+        if self.trace.is_some() && evaluator.closures.get() > 0 {
+            let detail = format!("{path} by strongly connected components");
+            self.note("closure", detail, estimate(), rows, start);
+        }
     }
 
     fn path(
@@ -1895,41 +2919,61 @@ impl<'a> Context<'a> {
         path: &nrese_sparql_syntax::algebra::PropertyPathExpression,
         object: &TermPattern,
     ) -> NativeResult<Solutions> {
-        let resolved = paths::Path::resolve(path, self.snapshot);
-        let end = |term: &TermPattern| self.path_end(term);
+        let start = Instant::now();
+        let resolved = paths::Path::resolve(path, &self.snapshot);
+        let ends = (self.path_end(subject)?, self.path_end(object)?);
         let mut evaluator = self.path_evaluator()?;
-        evaluator.fixed = end(subject).err().or_else(|| end(object).err());
-        let column = |values: Vec<u64>| IdTable::from_columns(vec![values]);
-        let (vars, table) = match (end(subject), end(object)) {
+        let constant = |end: &Result<Variable, u64>| end.as_ref().err().copied();
+        evaluator.fixed = constant(&ends.0).or_else(|| constant(&ends.1));
+        let refused = QueryEvaluationError::MemoryLimit;
+        let pool = evaluator.pool();
+        let solutions = match ends {
+            // As many solutions without bindings as the path connects the two ways: a table
+            // without columns, which holds no buffer, charged its rows ([`Self::produced`]).
+            // As many solutions without bindings as the path connects the two ways: a table
+            // without columns, which holds no buffer but counts its rows, charged before they
+            // are made (64 `(p|p)` steps over `a p a` count `usize::MAX` ways, once made one by
+            // one before the charge).
             (Err(start), Err(finish)) => {
-                let rows = evaluator.multiplicity(&resolved, start, finish);
-                (
-                    Vec::new(),
-                    IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
-                )
+                let rows = evaluator
+                    .solutions(&resolved, start, finish)
+                    .map_err(refused)?;
+                self.check()?;
+                let bytes = IdTable::new(0).bytes_for_rows(rows);
+                if bytes > 0 {
+                    self.budget.charge(bytes).map_err(refused)?;
+                }
+                Solutions {
+                    vars: Vec::new(),
+                    table: IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows)),
+                    ordered: false,
+                }
             }
-            (Err(start), Ok(o)) => (vec![o], column(evaluator.from(&resolved, start))),
-            (Ok(s), Err(finish)) => (vec![s], column(evaluator.to(&resolved, finish))),
-            (Ok(s), Ok(o)) if s == o => {
-                let same: Vec<u64> = evaluator
-                    .open(&resolved)
-                    .into_iter()
-                    .filter(|(a, b)| a == b)
-                    .map(|(a, _)| a)
-                    .collect();
-                (vec![s], column(same))
+            (Err(start), Ok(o)) => {
+                let ends = evaluator.ends(&resolved, start).map_err(refused)?;
+                self.path_column(pool, o, ends)?
+            }
+            (Ok(s), Err(finish)) => {
+                let starts = evaluator.starts(&resolved, finish).map_err(refused)?;
+                self.path_column(pool, s, starts)?
             }
             (Ok(s), Ok(o)) => {
-                let (starts, ends): (Vec<u64>, Vec<u64>) =
-                    evaluator.open(&resolved).into_iter().unzip();
-                (vec![s, o], IdTable::from_columns(vec![starts, ends]))
+                let pairs = evaluator.pairs(&resolved).map_err(refused)?;
+                self.path_pairs(pool, pairs, s, o)?
             }
         };
-        self.produced(Solutions {
-            vars,
-            table,
-            ordered: false,
-        })
+        let estimate = || {
+            let pattern = PathPattern {
+                subject,
+                path,
+                object,
+                filter: None,
+            };
+            Some(self.path_size(&pattern).round() as u64)
+        };
+        let rows = solutions.table.len();
+        self.note_closures(&evaluator, path, estimate, rows, start);
+        Ok(solutions)
     }
 
     // --- basic graph patterns ------------------------------------------------------------
@@ -1946,8 +2990,8 @@ impl<'a> Context<'a> {
         let limit = self.limit.take();
         // GeoSPARQL relations between features (`spatial`): those with a constant side
         // start the joins, the others follow them.
-        if let Some((first, later, rest)) = spatial::split(triples) {
-            let mut result = Solutions::unit();
+        if let Some((first, later, rest)) = self.spatial_split(triples) {
+            let mut result = self.unit()?;
             for triple in &first {
                 result = self.spatial_join(result, triple)?;
             }
@@ -1966,7 +3010,7 @@ impl<'a> Context<'a> {
         }
         // Full-text searches start the joins (`search`).
         if let Some((searches, rest)) = search::split(triples) {
-            let mut result = Solutions::unit();
+            let mut result = self.unit()?;
             for search in &searches {
                 let start = Instant::now();
                 let found = self.search(search)?;
@@ -2003,7 +3047,7 @@ impl<'a> Context<'a> {
             }
         }
         if scans.is_empty() {
-            return Ok(Solutions::unit());
+            return self.unit();
         }
         // A string test on a large pattern's object: the terms that pass, from the
         // dictionary first (`strings`), as a hint.
@@ -2012,26 +3056,36 @@ impl<'a> Context<'a> {
         } else {
             // The smallest pattern, with its range hint if it has one: a pattern many times
             // larger is joined by probing from the rows before it, never scanned, and a
-            // dictionary pass for it would be wasted.
-            let smallest = scans
-                .iter()
-                .map(|s| {
-                    let hinted = match &s.slots[2] {
-                        Slot::Var(object) if s.in_default_graph() && !s.repeats_variable() => hints
-                            .iter()
-                            .find(|h| &h.variable == object)
-                            .and_then(|hint| {
-                                let permutation = s.permutation_for(Some(object));
-                                (s.first_free(permutation) == Some(2))
-                                    .then(|| self.count_ranges(s, permutation, &hint.ranges))
-                            }),
-                        _ => None,
-                    };
-                    hinted
-                        .unwrap_or_else(|| self.snapshot.estimate_in(self.model, &s.quad_pattern()))
-                })
-                .min()
-                .unwrap_or(0);
+            // dictionary pass for it would be wasted. Counted only when a string test asks,
+            // and only beside other patterns: a lone pattern is the smallest itself.
+            let mut smallest = None;
+            let count_smallest = || {
+                scans
+                    .iter()
+                    .map(|s| {
+                        #[cfg(test)]
+                        bgp_estimated();
+                        let hinted = match &s.slots[2] {
+                            Slot::Var(object) if s.in_default_graph() && !s.repeats_variable() => {
+                                hints
+                                    .iter()
+                                    .find(|h| &h.variable == object)
+                                    .and_then(|hint| {
+                                        let permutation = s.permutation_for(Some(object));
+                                        (s.first_free(permutation) == Some(2)).then(|| {
+                                            self.count_ranges(s, permutation, &hint.ranges)
+                                        })
+                                    })
+                            }
+                            _ => None,
+                        };
+                        hinted.unwrap_or_else(|| {
+                            self.snapshot.estimate_in(self.model, &s.quad_pattern())
+                        })
+                    })
+                    .min()
+                    .unwrap_or(0)
+            };
             let mut found: Vec<ranges::Hint> = Vec::new();
             for s in &scans {
                 let Slot::Var(object) = &s.slots[2] else {
@@ -2049,21 +3103,33 @@ impl<'a> Context<'a> {
                 ) else {
                     continue;
                 };
+                #[cfg(test)]
+                bgp_estimated();
                 let rows = self.snapshot.estimate_in(self.model, &s.quad_pattern());
-                // A prefix found by binary search in the text order costs nothing worth
-                // weighing; otherwise the dictionary pass must be worth its size.
-                let cheap = condition.is_prefix() && self.snapshot.text_order_ready();
-                if (!cheap
-                    && rows < self.snapshot.dictionary_bytes() / strings::DICTIONARY_BYTES_PER_ROW)
-                    || rows > smallest.saturating_mul(PROBE_FACTOR)
+                if !condition.worth_a_pass(&self.snapshot, rows)
+                    || (scans.len() > 1
+                        && rows
+                            > smallest
+                                .get_or_insert_with(count_smallest)
+                                .saturating_mul(PROBE_FACTOR))
                 {
                     continue;
                 }
                 let start = Instant::now();
-                if let Some(ranges) = strings::ranges(self.snapshot, &condition, rows) {
+                if let Some((ranges, scan)) = strings::ranges(&self.snapshot, &condition, rows) {
                     if self.trace.is_some() {
-                        let detail = format!("terms {object} can take");
-                        self.note("dictionary string test", detail, None, ranges.len(), start);
+                        let detail = format!("terms {object} can take | {scan}");
+                        // The object's distinct values the conjuncts on it keep (each
+                        // passing term is a range of one id or more).
+                        let selectivity: f64 = filters
+                            .iter()
+                            .filter(|(_, read)| read.as_slice() == std::slice::from_ref(object))
+                            .map(|(conjunct, _)| pushdown::selectivity(conjunct))
+                            .product();
+                        let distinct = self.distinct(s, object, rows) as f64;
+                        let estimate = Some((distinct * selectivity).round() as u64);
+                        let found = ranges.len();
+                        self.note("dictionary string test", detail, estimate, found, start);
                     }
                     found.push(ranges::Hint {
                         variable: condition.variable.clone(),
@@ -2093,28 +3159,45 @@ impl<'a> Context<'a> {
                     .then_some((permutation, hint.ranges.as_slice()))
             })
             .collect();
+        // Exact counts order the joins, decide how each later one joins and give EXPLAIN its
+        // estimates: a lone pattern outside EXPLAIN has none of these to do, and is scanned
+        // uncounted ([`NOT_COUNTED`]). Its two counts were about 4.9k of a one-row lookup's
+        // 25k instructions (11 November 2026).
+        let counted = scans.len() > 1 || self.trace.is_some();
         let counts: Vec<u64> = scans
             .iter()
             .zip(&ranged)
-            .map(|(s, ranged)| match ranged {
-                // One pattern: nothing to order, and the ranges are read once anyway.
-                Some(_) if scans.len() == 1 => {
-                    self.snapshot.estimate_in(self.model, &s.quad_pattern())
+            .map(|(s, ranged)| {
+                if !counted {
+                    return NOT_COUNTED;
                 }
-                Some((permutation, ranges)) => self.count_ranges(s, *permutation, ranges),
-                None => self.snapshot.estimate_in(self.model, &s.quad_pattern()),
+                #[cfg(test)]
+                bgp_estimated();
+                match ranged {
+                    // One pattern: nothing to order, and the ranges are read once anyway.
+                    Some(_) if scans.len() == 1 => {
+                        self.snapshot.estimate_in(self.model, &s.quad_pattern())
+                    }
+                    Some((permutation, ranges)) => self.count_ranges(s, *permutation, ranges),
+                    None => self.snapshot.estimate_in(self.model, &s.quad_pattern()),
+                }
             })
             .collect();
+        let cyclic = ranged.iter().all(Option::is_none);
+        // EXPLAIN's estimate of a cyclic BGP samples its join: before the join is timed.
+        let estimate = match self.trace {
+            Some(_) if cyclic => self
+                .cyclic_estimate(&scans, &counts)
+                .map(|rows| rows.round() as u64),
+            _ => None,
+        };
         let start = Instant::now();
-        if scans.len() >= 3
-            && ranged.iter().all(Option::is_none)
-            && scans.iter().all(ScanPattern::in_default_graph)
-            && let Some(solutions) = self.cyclic_bgp(&scans, &counts)?
-        {
+        let start_joins = start;
+        if cyclic && let Some(solutions) = self.cyclic_bgp(&scans, &counts, estimate)? {
             if self.trace.is_some() {
                 let detail = triples.iter().map(ToString::to_string).collect::<Vec<_>>();
                 let rows = solutions.table.len();
-                self.note("wcoj", detail.join(" . "), None, rows, start);
+                self.note("wcoj", detail.join(" . "), estimate, rows, start);
             }
             return Ok(solutions);
         }
@@ -2142,12 +3225,51 @@ impl<'a> Context<'a> {
                 }
             })
             .collect();
-        let plan = self.join_order(&scans, &planned);
-        let estimate = |step: usize| {
-            let rows = plan.rows[step];
-            rows.is_finite().then(|| rows.round() as u64)
-        };
+        let links = triple_joins::planned(filters);
+        // What planning reads for the overlap counts is kept for the steps that read the same
+        // data ([`reads`]). None under a LIMIT, whose morsels may probe where a whole pattern
+        // would be read, nor with index joins forced, where every step probes.
+        let read = limit.is_none() && self.index_joins != Some(true);
+        let (plan, mut reads) =
+            self.join_order(&scans, &planned, &links, self.trace.is_some(), read)?;
+        #[cfg(test)]
+        if !HANDOVER.get() {
+            reads = Reads::default();
+        }
+        let estimate = |step: usize| Some(plan.rows[step].max(0.0).round() as u64);
         let order = &plan.order;
+        // EXPLAIN: the BGP's own line shows what its planning estimated, as its last step
+        // does. Estimate-time planning reads no lists, so its estimate may lack the overlap
+        // counts; an enclosing operator's line keeps that one.
+        if let (Some(trace), Some(line)) = (&self.trace, self.bgp_line.take()) {
+            let last = estimate(order.len() - 1).map(|e| limit.map_or(e, |l| e.min(l as u64)));
+            trace.borrow_mut()[line].estimated_rows = last;
+        }
+        // A ranged step reads its ranges, never the whole pattern: its list serves no step.
+        for (k, ranged) in ranged.iter().enumerate() {
+            if ranged.is_some() {
+                reads.release(k);
+            }
+        }
+        reads.keep_buffer_for(order[0], order.get(1).copied());
+        let reads = RefCell::new(reads);
+        // Each prefix of the order is a part of the result cache ([`cached::Joins`]): the
+        // longest one cached is where the joins start.
+        let given = filters.clone();
+        let joins = cached::Joins {
+            triples,
+            scans: &scans,
+            ranged: &ranged,
+            order,
+            filters: &given,
+            keys: Default::default(),
+        };
+        // A cached prefix replaces its steps: their lists are released before its rows are made.
+        let reused = self.cached_prefix(&joins, filters, limit.is_some(), |length| {
+            for &k in &order[..length] {
+                reads.borrow_mut().release(k);
+            }
+        })?;
         let first = order[0];
         let join_var = order.get(1).and_then(|&i| {
             scans[first]
@@ -2155,63 +3277,136 @@ impl<'a> Context<'a> {
                 .into_iter()
                 .find(|v| scans[i].vars().contains(v))
         });
-        let mut result = match ranged[first] {
-            Some((permutation, ranges)) => self.scan_ranges(&scans[first], permutation, ranges)?,
-            None => self.scan(&scans[first], join_var.as_ref())?,
+        // The buffer, if kept: the first two steps' result (their join on their one variable
+        // is the intersection of their lists).
+        let buffer = if reused.is_none() {
+            reads.borrow_mut().take_buffer(first)
+        } else {
+            None
         };
-        if self.trace.is_some() {
-            let operator = if ranged[first].is_some() {
-                "range scan"
-            } else {
-                "scan"
-            };
-            let detail = triples[first].to_string();
-            self.note(operator, detail, estimate(0), result.table.len(), start);
+        let (mut result, joined) = match (reused, buffer) {
+            (Some(prefix), _) => prefix,
+            (None, Some((Buffer { values, held, .. }, rows))) => {
+                let result = self.read_solutions(&scans[first], values, held)?;
+                if self.trace.is_some() {
+                    let detail = format!("{} (read at planning)", triples[first]);
+                    self.note("scan", detail, estimate(0), rows, start);
+                    let detail = format!("{} (read at planning)", triples[order[1]]);
+                    self.note("join", detail, estimate(1), result.table.len(), start);
+                }
+                // The conjuncts after step 1 and after step 2, at once: they read only bound
+                // variables.
+                let result = self.filter_bound(result, filters)?;
+                self.offer_prefix(&joins, 2, &result, start_joins.elapsed());
+                (result, 2)
+            }
+            (None, None) => {
+                let list = reads.borrow_mut().take(first);
+                let read = list.is_some();
+                let result = match (ranged[first], list) {
+                    (Some((permutation, ranges)), _) => {
+                        self.scan_ranges(&scans[first], permutation, ranges)?
+                    }
+                    (None, Some(List { values, held, .. })) => {
+                        self.read_solutions(&scans[first], values, held)?
+                    }
+                    (None, None) => self.scan(&scans[first], join_var.as_ref())?,
+                };
+                if self.trace.is_some() {
+                    let operator = if ranged[first].is_some() {
+                        "range scan"
+                    } else {
+                        "scan"
+                    };
+                    let mut detail = triples[first].to_string();
+                    if read {
+                        detail.push_str(" (read at planning)");
+                    }
+                    self.note(operator, detail, estimate(0), result.table.len(), start);
+                }
+                (self.filter_bound(result, filters)?, 1)
+            }
+        };
+        // The whole pattern from the cache.
+        if joined > 1 && joined == order.len() {
+            return Ok(result);
         }
-        result = self.filter_bound(result, filters)?;
+        // Joins from `from` patterns on; the prefixes they make are offered to the cache
+        // (`offer`: not for a morsel, whose rows are some of the prefix's).
         let join_rest = |mut result: Solutions,
-                         filters: &mut Vec<(&Expression, Vec<Variable>)>|
+                         filters: &mut Vec<(&Expression, Vec<Variable>)>,
+                         from: usize,
+                         offer: bool|
          -> NativeResult<Solutions> {
-            for (step, &next) in order.iter().enumerate().skip(1) {
+            for (step, &next) in order.iter().enumerate().skip(from) {
                 let start = Instant::now();
                 let shared: Vec<Variable> = scans[next]
                     .vars()
                     .into_iter()
                     .filter(|v| result.column(v).is_some())
                     .collect();
-                // (A default graph merged from listed graphs is read by scans, which filter.)
-                let probe = !shared.is_empty()
-                    && self.merge_set.is_none()
-                    && (result.table.len() as u64).saturating_mul(PROBE_FACTOR) < counts[next];
+                let probe = !shared.is_empty() && self.index_join(result.table.len(), counts[next]);
+                // A triple term between them: composed from the bound parts or taken apart
+                // into the pattern's (`triple_joins`).
+                let through = (!self.as_written && ranged[next].is_none())
+                    .then(|| triple_joins::link(filters, &result, &scans[next], &self.snapshot))
+                    .flatten()
+                    .and_then(|link| self.linked_rows(&result, &link).map(|rows| (link, rows)));
                 // No shared variable, but `?a = ?b` between them: a join, not a cross
                 // product (`equijoin`).
-                let linked = (shared.is_empty() && !self.as_written && ranged[next].is_none())
-                    .then(|| equijoin::link(filters, &result, &scans[next].vars()))
-                    .flatten();
-                result = if let Some((a, b, same_term)) = &linked {
+                let linked = (through.is_none()
+                    && shared.is_empty()
+                    && !self.as_written
+                    && ranged[next].is_none())
+                .then(|| equijoin::link(filters, &result, &scans[next].vars()))
+                .flatten();
+                let triple = through.is_some();
+                // Pattern `next`'s list, for its scan or in place of its probe; a link reads
+                // otherwise, so the list is released first.
+                let list = reads.borrow_mut().take(next);
+                let list = list.filter(|_| !triple && linked.is_none());
+                let read = list.is_some();
+                result = if let Some((link, rows)) = through {
+                    self.triple_join(result, &scans[next], counts[next], &link, rows)?
+                } else if let Some((a, b, same_term)) = &linked {
                     self.equality_join(result, &scans[next], counts[next], a, b, *same_term)?
                 } else if probe {
-                    self.probe_join(result, &scans[next], &shared)?
+                    match list {
+                        Some(list) => self.member_join(result, &scans[next], &shared[0], list)?,
+                        None => self.probe_join(result, &scans[next], &shared)?,
+                    }
                 } else {
-                    let scanned = match ranged[next] {
-                        Some((permutation, ranges)) => {
+                    let scanned = match (ranged[next], list) {
+                        (Some((permutation, ranges)), _) => {
                             self.scan_ranges(&scans[next], permutation, ranges)?
                         }
-                        None => self.scan(&scans[next], shared.first())?,
+                        (None, Some(List { values, held, .. })) => {
+                            self.read_solutions(&scans[next], values, held)?
+                        }
+                        (None, None) => self.scan(&scans[next], shared.first())?,
                     };
                     self.join(result, scanned)?
                 };
                 if self.trace.is_some() {
                     let operator = match (probe, shared.is_empty()) {
+                        _ if triple => "triple term join",
                         _ if linked.is_some() => "equality join",
                         (true, _) => "index join",
                         (false, true) => "cross product",
                         (false, false) => "join",
                     };
-                    let detail = triples[next].to_string();
+                    let mut detail = triples[next].to_string();
+                    if read {
+                        detail.push_str(" (read at planning)");
+                    } else if probe && linked.is_none() && !triple {
+                        detail = self.probed_detail(detail);
+                    }
                     self.note(operator, detail, estimate(step), result.table.len(), start);
                 }
                 result = self.filter_bound(result, filters)?;
+                if offer {
+                    self.offer_prefix(&joins, step + 1, &result, start_joins.elapsed());
+                }
             }
             Ok(result)
         };
@@ -2222,37 +3417,61 @@ impl<'a> Context<'a> {
         // most eight times the last. Small morsels also make the later joins probe the
         // index instead of scanning whole patterns.
         let Some(limit) = limit.filter(|_| result.table.width() > 0) else {
-            return join_rest(result, filters);
+            return join_rest(result, filters, joined, true);
+        };
+        // EXPLAIN: the rows the limit lets the pattern stop at, against what it would give.
+        let limited = |detail: String, rows: usize, start: Instant| {
+            if self.trace.is_some() {
+                let estimate = estimate(order.len() - 1).map(|e| e.min(limit as u64));
+                self.note("limit pushdown", detail, estimate, rows, start);
+            }
         };
         if order.len() == 1 {
-            if result.table.len() > limit {
+            let read = result.table.len();
+            if read > limit {
                 result.table.slice(0, Some(limit));
             }
+            let detail = format!("{limit} wanted: the first of {read} rows of one pattern");
+            limited(detail, result.table.len(), start);
             return Ok(result);
         }
         if result.table.len() <= MIN_MORSEL {
-            return join_rest(result, filters);
+            return join_rest(result, filters, joined, false);
         }
+        // Caller-side steps (D16-579): each morsel is charged before it is copied, and the
+        // first table and every part are released on each way out; a table that carries its
+        // own charge (the ownership change after the cut) makes these steps go.
         let sorted = result.table.sorted_by().to_vec();
         let mut parts: Vec<Solutions> = Vec::new();
         let (mut rows, mut from, mut size) = (0, 0, MIN_MORSEL);
         let mut applied = None;
-        while from < result.table.len() && rows < limit {
+        let mut failed = None;
+        // At least one morsel, LIMIT 0 too: the parts' variables come from its joins.
+        while from < result.table.len() && (parts.is_empty() || rows < limit) {
             let to = (from + size).min(result.table.len());
-            let columns = result
-                .table
-                .columns()
-                .iter()
-                .map(|column| column[from..to].to_vec())
-                .collect();
-            let morsel = Solutions {
-                vars: result.vars.clone(),
-                table: IdTable::from_columns(columns).assume_sorted_by(sorted.clone()),
-                ordered: false,
-            };
+            // The copy lives beside the first table: charged before it is made.
+            let morsel = self.made(result.table.bytes_for_rows(to - from), || {
+                let columns = result
+                    .table
+                    .columns()
+                    .iter()
+                    .map(|column| column[from..to].to_vec())
+                    .collect();
+                Ok(Solutions {
+                    vars: result.vars.clone(),
+                    table: IdTable::from_columns(columns).assume_sorted_by(sorted.clone()),
+                    ordered: false,
+                })
+            });
             // Each morsel applies the same conjuncts at the same steps.
             let mut left = filters.clone();
-            let part = join_rest(morsel, &mut left)?;
+            let part = match morsel.and_then(|morsel| join_rest(morsel, &mut left, joined, false)) {
+                Ok(part) => part,
+                Err(error) => {
+                    failed = Some(error);
+                    break;
+                }
+            };
             applied = Some(left);
             rows += part.table.len();
             parts.push(part);
@@ -2265,22 +3484,53 @@ impl<'a> Context<'a> {
             };
             size = wanted.clamp(MIN_MORSEL, size.saturating_mul(8));
         }
+        let first_rows = result.table.len();
+        // Its rows are in the morsels or not wanted: the first table goes, and its charge.
+        self.consumed(result);
+        if let Some(error) = failed {
+            for part in parts {
+                self.consumed(part);
+            }
+            return Err(error);
+        }
         if let Some(applied) = applied {
             *filters = applied;
         }
+        let detail = format!(
+            "{limit} wanted: {} morsel(s), {from} of {first_rows} rows of the first pattern joined",
+            parts.len(),
+        );
+        limited(detail, rows, start);
         let vars = parts[0].vars.clone();
-        let tables = parts
-            .into_iter()
-            .map(|part| {
-                if part.vars == vars {
-                    part.table
-                } else {
-                    self.project(part, &vars).table
-                }
-            })
-            .collect();
-        Ok(Solutions {
-            table: IdTable::concat(vars.len(), tables),
+        let mut same = Vec::with_capacity(parts.len());
+        let mut failed = None;
+        for part in parts {
+            if failed.is_some() {
+                self.consumed(part);
+                continue;
+            }
+            match if part.vars == vars {
+                Ok(part)
+            } else {
+                self.project(part, &vars)
+            } {
+                Ok(part) => same.push(part),
+                Err(error) => failed = Some(error),
+            }
+        }
+        if let Some(error) = failed {
+            for part in same {
+                self.consumed(part);
+            }
+            return Err(error);
+        }
+        // The parts' charge carries over to the one table, its copy charged first.
+        let growth = concat_growth(&same);
+        self.reshaped(same, growth, |same| Solutions {
+            table: IdTable::concat(
+                vars.len(),
+                same.into_iter().map(|part| part.table).collect(),
+            ),
             vars,
             ordered: false,
         })
@@ -2295,7 +3545,7 @@ impl<'a> Context<'a> {
         filters: &mut Vec<(&Expression, Vec<Variable>)>,
     ) -> NativeResult<Solutions> {
         // GeoSPARQL relations (`spatial`) join after the other patterns.
-        if let Some((first, later, rest)) = spatial::split(triples) {
+        if let Some((first, later, rest)) = self.spatial_split(triples) {
             let mut result = if rest.is_empty() {
                 result
             } else {
@@ -2327,7 +3577,7 @@ impl<'a> Context<'a> {
                         }
                     }
                     let width = vars.len();
-                    self.consumed(&result);
+                    self.consumed(result);
                     return Ok(Solutions {
                         vars,
                         table: IdTable::new(width),
@@ -2350,9 +3600,23 @@ impl<'a> Context<'a> {
             .filter(|&(c, _)| !result.table.column(c).contains(&UNDEF))
             .map(|(_, v)| v.clone())
             .collect();
+        // EXPLAIN's estimates, from the seed's rows on: each pattern multiplies the rows by
+        // its count over the distinct values of the variables it shares (independence,
+        // as the join orderer; the seed's rows taken as distinct).
+        let begun = Instant::now();
+        let seed_rows = result.table.len();
+        let mut estimated = seed_rows as f64;
+        let mut distinct: HashMap<Variable, f64> = result
+            .vars
+            .iter()
+            .map(|v| (v.clone(), estimated.max(1.0)))
+            .collect();
         let mut left: Vec<usize> = (0..scans.len()).collect();
         while !left.is_empty() {
-            let connected = |i: &usize| scans[*i].vars().iter().any(|v| result.column(v).is_some());
+            let connected = |i: &usize| {
+                scans[*i].vars().iter().any(|v| result.column(v).is_some())
+                    || triple_joins::link(filters, &result, &scans[*i], &self.snapshot).is_some()
+            };
             let at = left
                 .iter()
                 .enumerate()
@@ -2366,19 +3630,63 @@ impl<'a> Context<'a> {
                 .into_iter()
                 .filter(|v| result.column(v).is_some())
                 .collect();
-            let probe = !shared.is_empty()
-                && self.merge_set.is_none()
-                && (result.table.len() as u64).saturating_mul(PROBE_FACTOR) < counts[next];
-            result = if probe {
+            let probe = !shared.is_empty() && self.index_join(result.table.len(), counts[next]);
+            if self.trace.is_some() {
+                let count = counts[next] as f64;
+                let mut divisor = 1.0f64;
+                let mut check = true;
+                for v in scans[next].vars() {
+                    let d = self.distinct(&scans[next], &v, counts[next]) as f64;
+                    let joined = match distinct.get(&v) {
+                        Some(&seen) => {
+                            divisor *= seen.max(d).max(1.0);
+                            seen.min(d)
+                        }
+                        None => {
+                            check = false;
+                            d
+                        }
+                    };
+                    distinct.insert(v, joined.max(1.0));
+                }
+                // The orderer's bounds (`plan`): a check keeps at most its input, and a
+                // fraction of a row is one.
+                let before = estimated;
+                estimated = estimated * count / divisor;
+                if check {
+                    estimated = estimated.min(before);
+                }
+                if estimated > 0.0 {
+                    estimated = estimated.max(1.0);
+                }
+                for d in distinct.values_mut() {
+                    *d = d.min(estimated.max(1.0));
+                }
+            }
+            let through = triple_joins::link(filters, &result, &scans[next], &self.snapshot)
+                .and_then(|link| self.linked_rows(&result, &link).map(|rows| (link, rows)));
+            let triple = through.is_some();
+            result = if let Some((link, rows)) = through {
+                self.triple_join(result, &scans[next], counts[next], &link, rows)?
+            } else if probe {
                 self.probe_join(result, &scans[next], &shared)?
             } else {
                 let scanned = self.scan(&scans[next], shared.first())?;
                 self.join(result, scanned)?
             };
             if self.trace.is_some() {
-                let operator = if probe { "index join" } else { "join" };
+                let operator = match (triple, probe) {
+                    (true, _) => "triple term join",
+                    (false, true) => "index join",
+                    (false, false) => "join",
+                };
                 let rows = result.table.len();
-                self.note(operator, triples[next].to_string(), None, rows, start);
+                let estimate = Some(estimated.round() as u64);
+                let mut detail = triples[next].to_string();
+                if probe && !triple {
+                    detail = self.probed_detail(detail);
+                }
+                self.note(operator, detail, estimate, rows, start);
             }
             for v in scans[next].vars() {
                 if !bound.contains(&v) {
@@ -2386,6 +3694,11 @@ impl<'a> Context<'a> {
                 }
             }
             result = self.filter_among(result, filters, &bound)?;
+        }
+        if self.trace.is_some() {
+            let detail = format!("{} pattern(s) from {seed_rows} rows", triples.len());
+            let estimate = Some(estimated.round() as u64);
+            self.note("sideways", detail, estimate, result.table.len(), begun);
         }
         Ok(result)
     }
@@ -2451,10 +3764,11 @@ impl<'a> Context<'a> {
             }
             let (conjunct, _) = filters.remove(index);
             let start = Instant::now();
+            let estimate = filtered(solutions.table.len(), conjunct);
             solutions = self.filter(solutions, conjunct)?;
             if self.trace.is_some() {
                 let rows = solutions.table.len();
-                self.note("filter", conjunct.to_string(), None, rows, start);
+                self.note("filter", conjunct.to_string(), estimate, rows, start);
             }
         }
         Ok(solutions)
@@ -2462,39 +3776,529 @@ impl<'a> Context<'a> {
 
     /// The order in which to join a BGP's patterns ([`plan`]; `counts` are exact). Two
     /// patterns start with the smaller one; larger BGPs are planned with distinct counts.
-    fn join_order(&self, scans: &[ScanPattern], counts: &[u64]) -> plan::Plan {
-        if scans.len() <= 2 {
-            let mut order: Vec<usize> = (0..scans.len()).collect();
-            order.sort_by_key(|&i| counts[i]);
-            let mut rows = vec![f64::NAN; order.len()];
-            rows[0] = counts[order[0]] as f64;
-            return plan::Plan { order, rows };
+    /// The rows after each step are estimated where `estimated` asks (or the order
+    /// depends on them): a two-pattern BGP run without EXPLAIN skips its model. Planning
+    /// observes the query's cancellation as evaluating does ([`Self::order_inputs`]).
+    /// With the order, the lists its overlap counts read where `read` asks ([`Reads`]):
+    /// `bgp`'s own planning, which hands them to its steps.
+    fn join_order(
+        &self,
+        scans: &[ScanPattern],
+        counts: &[u64],
+        links: &[(Variable, Vec<Variable>)],
+        estimated: bool,
+        read: bool,
+    ) -> NativeResult<(plan::Plan, Reads)> {
+        if scans.is_empty() {
+            let plan = plan::Plan {
+                order: Vec::new(),
+                rows: Vec::new(),
+                cost: 0.0,
+                work: 0,
+            };
+            return Ok((plan, Reads::default()));
+        }
+        let mut order: Vec<usize> = (0..scans.len()).collect();
+        order.sort_by_key(|&i| counts[i]);
+        if scans.len() <= 2 && !estimated {
+            let rows = vec![f64::NAN; order.len()];
+            let plan = plan::Plan {
+                order,
+                rows,
+                cost: 0.0,
+                work: 0,
+            };
+            return Ok((plan, Reads::default()));
         }
         let mut vars: Vec<Variable> = Vec::new();
-        let inputs: Vec<plan::Input> = scans
+        let (inputs, reads) = self.plan_inputs(scans, counts, links, &mut vars, read);
+        if scans.len() <= 2 {
+            // The smaller pattern first; the join's rows by the orderer's model (a star's
+            // pair by the characteristic sets, an edge and a star on its object by the
+            // characteristic pairs, a check bounded by the rows it checks).
+            let along = |sets: Option<&CharacteristicSets>, budget: usize| {
+                plan::along(&inputs, vars.len(), PROBE_FACTOR, sets, budget, &order)
+            };
+            return Ok((self.with_sets(&inputs, &along)?, reads));
+        }
+        Ok((self.order_inputs(&inputs, vars.len())?, reads))
+    }
+
+    /// The join orderer's order of `inputs` over `variables` variables, with the
+    /// characteristic sets where an input is part of a star ([`Self::with_sets`]). Cancelled
+    /// with the query: the orderer asks at every step, so a large pattern's planning ends at
+    /// the deadline.
+    fn order_inputs(&self, inputs: &[plan::Input], variables: usize) -> NativeResult<plan::Plan> {
+        let cancelled = || {
+            self.cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        };
+        let order = |sets: Option<&CharacteristicSets>, budget: usize| {
+            plan::order(inputs, variables, PROBE_FACTOR, sets, budget, &cancelled)
+        };
+        self.with_sets(inputs, &order)
+    }
+
+    /// `planning` of `inputs`: the plain plan (without the characteristic sets) first, and a
+    /// BGP is refined by the sets only where the work that plan expects admits it
+    /// ([`plan::admits`]): every other BGP keeps its plain plan and never asks for the
+    /// statistics. Admitted, it is searched with the sets within a budget that follows that
+    /// work ([`plan::budget_for`]; one policy for every path that plans: scans, and scans with
+    /// paths), and only where an input is part of an open star ([`plan::Star::open`]): without
+    /// one, the search would make the plain plan again. A BGP kept from the sets gets its plain
+    /// plan without a note: that is the normal case. One whose set search passes its budget gets
+    /// the plain plan too, noted for EXPLAIN ([`WITHOUT_SETS`]): the sets were wanted and the
+    /// budget stopped them. A query cancelled in or between its plannings fails (a
+    /// fixed order's planning doesn't ask, so each is checked after), and isn't planned again.
+    fn with_sets(
+        &self,
+        inputs: &[plan::Input],
+        planning: &Planning<'_>,
+    ) -> NativeResult<plan::Plan> {
+        // Read only by EXPLAIN's notes: no clock for a query that isn't explained.
+        let start = self.trace.is_some().then(Instant::now);
+        let cancelled = || {
+            self.cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        };
+        // A cancelled query plans nothing.
+        if cancelled() {
+            return Err(QueryEvaluationError::Cancelled.into());
+        }
+        let mut plain = match planning(None, 0) {
+            Ok(planned) if !cancelled() => planned,
+            Ok(_) | Err(plan::Stopped::Cancelled) => {
+                return Err(QueryEvaluationError::Cancelled.into());
+            }
+            Err(plan::Stopped::Budget { .. }) => unreachable!("no sets, no work on them"),
+        };
+        // Only an open star's patterns are estimated from the sets.
+        if !inputs.iter().any(|i| i.star.is_some_and(|s| s.open())) {
+            return Ok(plain);
+        }
+        let expected = plan::expected_work(&plain);
+        if !plan::admits(expected) {
+            return Ok(plain);
+        }
+        // Asking for the statistics may build them, or wait for a build, and takes no
+        // cancellation of its own: a cancelled query doesn't ask, and one cancelled while it
+        // asked fails, whether the statistics came back or not.
+        let sets = self.snapshot.characteristic_sets_in(self.model);
+        #[cfg(test)]
+        let sets = sets.filter(|_| {
+            STATISTICS_ASKED.with_borrow(|asked| asked.as_ref().is_none_or(|asked| asked()))
+        });
+        if cancelled() {
+            return Err(QueryEvaluationError::Cancelled.into());
+        }
+        let Some(sets) = sets else {
+            return Ok(plain);
+        };
+        let budget = plan::budget_for(expected);
+        // The search asks for the cancellation at its steps, and can pass the budget before
+        // its first (a greedy search's starts): the query's cancellation comes first.
+        // A fixed order's planning doesn't ask: a query cancelled while it planned fails too.
+        let work = match planning(Some(&*sets), budget) {
+            Ok(planned) if !cancelled() => return Ok(planned),
+            Err(plan::Stopped::Budget { work }) if !cancelled() => work,
+            Ok(_) | Err(_) => return Err(QueryEvaluationError::Cancelled.into()),
+        };
+        #[cfg(test)]
+        REPLANS.set(REPLANS.get() + 1);
+        plain.work = work;
+        if let Some(start) = start {
+            let detail = format!(
+                "{} patterns planned without characteristic sets: \
+                 estimate budget of {budget} passed after {work}",
+                inputs.len(),
+            );
+            self.note(WITHOUT_SETS, detail, None, 0, start);
+        }
+        Ok(plain)
+    }
+
+    /// The join orderer's inputs for `scans` with their `counts`: distinct values per
+    /// variable (numbered by their place in `vars`, which gets the new ones), stars and
+    /// edges for the characteristic sets and pairs. A pattern that binds every variable a
+    /// link's other side reads (`triple_joins::planned`) also has the link's variable, as
+    /// many values as matches: the link joins it to the patterns that bind that variable.
+    /// The overlaps are counted only where `read` asks, with the lists read for them
+    /// ([`Self::overlaps`]), against the cost of the plan these inputs give without them.
+    fn plan_inputs(
+        &self,
+        scans: &[ScanPattern],
+        counts: &[u64],
+        links: &[(Variable, Vec<Variable>)],
+        vars: &mut Vec<Variable>,
+        read: bool,
+    ) -> (Vec<plan::Input>, Reads) {
+        let mut index_of = |v: Variable| variable_index(vars, v);
+        // Each pattern's variables, read once for the overlaps and its input.
+        let own: Vec<Vec<Variable>> = scans.iter().map(ScanPattern::vars).collect();
+        let mut inputs: Vec<plan::Input> = scans
             .iter()
             .zip(counts)
-            .map(|(scan, &count)| plan::Input {
-                count,
-                vars: scan
-                    .vars()
-                    .into_iter()
+            .zip(&own)
+            .map(|((scan, &count), own)| {
+                let star = match &scan.slots[0] {
+                    Slot::Var(v) => self.star(scan, count, index_of(v.clone())),
+                    _ => None,
+                };
+                let edge_object = match (&star, &scan.slots[2]) {
+                    (Some(_), Slot::Var(o)) if scan.slots[0] != scan.slots[2] => {
+                        Some(index_of(o.clone()))
+                    }
+                    _ => None,
+                };
+                let linked: Vec<Variable> = links
+                    .iter()
+                    .filter(|(v, read)| !own.contains(v) && read.iter().all(|r| own.contains(r)))
+                    .map(|(v, _)| v.clone())
+                    .collect();
+                let mut input_vars: Vec<(usize, u64)> = own
+                    .iter()
                     .map(|v| {
-                        let d = self.distinct(scan, &v, count).min(count);
-                        let index = vars.iter().position(|x| *x == v).unwrap_or_else(|| {
-                            vars.push(v);
-                            vars.len() - 1
-                        });
-                        (index, d)
+                        let d = self.distinct(scan, v, count).min(count);
+                        (index_of(v.clone()), d)
                     })
-                    .collect(),
+                    .collect();
+                for v in linked {
+                    let at = index_of(v);
+                    if input_vars.iter().all(|&(i, _)| i != at) {
+                        input_vars.push((at, count));
+                    }
+                }
+                plan::Input {
+                    count,
+                    edge_object,
+                    vars: input_vars,
+                    star,
+                    overlaps: Vec::new(),
+                }
             })
             .collect();
-        plan::order(&inputs, vars.len(), PROBE_FACTOR)
+        // The plain plan's cost: these inputs ordered on their counts alone, without the
+        // characteristic sets (as `with_sets` first plans them). `None` if cancelled.
+        let plain_cost = || {
+            let cancelled = || {
+                self.cancellation
+                    .as_ref()
+                    .is_some_and(CancellationToken::is_cancelled)
+            };
+            plan::order(&inputs, vars.len(), PROBE_FACTOR, None, 0, &cancelled)
+                .ok()
+                .map(|plain| plain.cost)
+        };
+        let (overlaps, reads) = self.overlaps(scans, &own, counts, read, plain_cost);
+        for (input, overlaps) in inputs.iter_mut().zip(overlaps) {
+            input.overlaps = overlaps;
+        }
+        (inputs, reads)
+    }
+
+    /// Per pattern of `scans` with one variable, the values it has in common with each
+    /// other such pattern on the same variable ([`plan::Input::overlaps`]), and the lists
+    /// read for them, kept for the steps that read the same data ([`Reads`]). Only where
+    /// `read` asks (`bgp`'s own planning, without a LIMIT or forced index joins): path
+    /// ordering and estimates plan with counts alone, as for a pair never counted.
+    ///
+    /// Admitted against the plan's expected work, per BGP: at most `plain_cost` values
+    /// decoded for the whole BGP (the cost of its plain plan, planned on its counts alone: the
+    /// rows its steps read, a probe counting as `PROBE_COST`, and the rows they make; reading
+    /// the lists may at most double the work the plan expects), and at most
+    /// [`plan::OVERLAP_VALUES`], in at most [`reads::MAX_LISTS`] lists. The plain plan is made
+    /// only for a BGP with a candidate pair, and the candidates are stored only within the
+    /// optional part's room. The pairs are read in order of their patterns' own counts,
+    /// smallest first, a list read for an earlier pair counting once. Each list is read
+    /// sorted from the index a column at a time and charged to the query's budget. A pattern the index can't give so, or a read the budget
+    /// refuses, has no count with any other: the plan keeps its plain estimate (D16-575).
+    /// `vars` are each pattern's variables ([`ScanPattern::vars`]).
+    fn overlaps(
+        &self,
+        scans: &[ScanPattern],
+        vars: &[Vec<Variable>],
+        counts: &[u64],
+        read: bool,
+        plain_cost: impl FnOnce() -> Option<f64>,
+    ) -> (Vec<Vec<(usize, u64)>>, Reads) {
+        let mut out = vec![Vec::new(); scans.len()];
+        if !read {
+            return (out, Reads::default());
+        }
+        // The single-variable patterns: their variable and its position.
+        let single: Vec<Option<(&Variable, usize)>> = scans
+            .iter()
+            .zip(vars)
+            .map(|(scan, vars)| {
+                let [v] = &vars[..] else {
+                    return None;
+                };
+                if !scan.in_default_graph() || scan.repeats_variable() {
+                    return None;
+                }
+                let position = (0..3).find(|&c| scan.slots[c].is_var(v))?;
+                Some((v, position))
+            })
+            .collect();
+        // Pairs of patterns: cancelled, the rest is left out, here or below, so the lists are
+        // complete only for a run that isn't cancelled; the orderer that reads them reports
+        // the cancellation. Asked per pattern: the pairs are n²/2.
+        let cancelled = || {
+            self.cancellation
+                .as_ref()
+                .is_some_and(CancellationToken::is_cancelled)
+        };
+        // The candidate pairs: two patterns on one variable, within OVERLAP_VALUES as planned
+        // and by their patterns' own counts, the rows a read decodes (a filter's or a range's
+        // share is read whole). The own counts are taken once each, only for pairs small as
+        // planned.
+        let most = plan::OVERLAP_VALUES;
+        let mut own: Vec<Option<u64>> = vec![None; scans.len()];
+        // The pairs are kept in a vector charged to the optional part, each growth charged
+        // beside the storage it replaces (a reallocation holds both), and freed before its
+        // charge is released: n patterns on one variable make n²/2 pairs, more than any
+        // request's room. Refused, the BGP plans with its
+        // counts alone, as for a pair the allowance leaves out. Made at the first pair: most
+        // BGPs have none.
+        let mut optional: Option<Arc<Budget>> = None;
+        let mut pairs: Option<ChargedVec<(u64, usize, usize)>> = None;
+        for i in 0..scans.len() {
+            if cancelled() {
+                return (out, Reads::default());
+            }
+            let Some((a, _)) = single[i] else {
+                continue;
+            };
+            for j in i + 1..scans.len() {
+                let Some((b, _)) = single[j] else {
+                    continue;
+                };
+                if a != b || counts[i].saturating_add(counts[j]) > most {
+                    continue;
+                }
+                let mut size = |k: usize| {
+                    *own[k].get_or_insert_with(|| {
+                        self.snapshot
+                            .estimate_in(self.model, &scans[k].quad_pattern())
+                    })
+                };
+                let both = size(i).saturating_add(size(j));
+                if both > most {
+                    continue;
+                }
+                let kept = pairs.get_or_insert_with(|| {
+                    let part =
+                        optional.get_or_insert_with(|| Arc::new(self.memory.optional_part()));
+                    ChargedVec::new(Arc::clone(part))
+                });
+                if kept.push((both, i, j)).is_err() {
+                    return (out, Reads::default());
+                }
+            }
+        }
+        // None (most BGPs): no list to read, nothing to charge, no plain plan made.
+        let Some(mut pairs) = pairs else {
+            return (out, Reads::default());
+        };
+        // The allowance: the plain plan's cost, at most OVERLAP_VALUES (NaN gives 0).
+        let Some(cost) = plain_cost() else {
+            return (out, Reads::default());
+        };
+        let allowance = cost.clamp(0.0, most as f64) as u64;
+        pairs.sort_unstable();
+        if cancelled() {
+            return (out, Reads::default());
+        }
+        // The pairs admitted, and the lists they read, each counted once: at most MAX_LISTS
+        // lists, so at most as many pairs as two of them make, plus one per list.
+        let (mut lists, mut admitted, mut decoded) = (Vec::new(), Vec::new(), 0u64);
+        for (n, &(_, i, j)) in pairs.iter().enumerate() {
+            if n % 4096 == 4095 && cancelled() {
+                return (out, Reads::default());
+            }
+            let new: Vec<usize> = [i, j].into_iter().filter(|k| !lists.contains(k)).collect();
+            let more: u64 = new.iter().map(|&k| own[k].unwrap_or(0)).sum();
+            if decoded.saturating_add(more) > allowance
+                || lists.len() + new.len() > reads::MAX_LISTS
+            {
+                continue;
+            }
+            decoded += more;
+            lists.extend(new);
+            admitted.push((i, j));
+        }
+        // The candidates are freed, then their charge released, before a list is read.
+        drop(pairs);
+        // Planning can do without the lists: their charges go to an optional part, whose
+        // refusals mark only itself, never the request.
+        let optional = optional.expect("made with the first pair");
+        let Some(mut reads) = Reads::with_room(&optional, lists.len()) else {
+            return (out, Reads::default());
+        };
+        for &k in &lists {
+            if cancelled() {
+                break;
+            }
+            let (v, position) = single[k].expect("a listed pattern has one variable");
+            if let Some(list) = self.read_list(&optional, &scans[k], k, v, position) {
+                reads.keep(list);
+            }
+        }
+        // A read the optional part refused: no list of this building counts, so no overlap
+        // comes of a callee that went on past a refusal (a documented rule of use).
+        // The buffer's refusal comes later and leaves the counts.
+        if optional.refused() {
+            return (out, Reads::default());
+        }
+        // The counts, and the shared values of the pair with the fewest: the likeliest start.
+        // Each pair is merged once, its values written as they are counted; a pair's are
+        // dropped as soon as another has fewer.
+        let mut fewest: Option<(u64, Option<Buffer>)> = None;
+        for &(i, j) in &admitted {
+            let (Some(x), Some(y)) = (reads.list(i), reads.list(j)) else {
+                continue;
+            };
+            let (both, buffer) = self.shared(&optional, x, y, (i, j));
+            out[i].push((j, both));
+            out[j].push((i, both));
+            if fewest.as_ref().is_none_or(|(least, _)| both < *least) {
+                fewest = Some((both, buffer));
+            }
+        }
+        if let Some((_, Some(buffer))) = fewest {
+            reads.set_buffer(buffer);
+        }
+        (out, reads)
+    }
+
+    /// Pattern `pattern`'s list (`scan`'s column of its one variable `v`, at `position`):
+    /// the read the execution's [`Self::scan`] makes on the column path, sorted on `v`. The
+    /// one place planning reads a list. It reads on `optional`, the optional part
+    /// ([`nrese_exec::Envelope::optional_part`]): a
+    /// refusal ends the read with its error and marks only that part, never the request
+    /// ([`Budget::refused`]). The read qualifies: it ends complete or with the error.
+    fn read_list(
+        &self,
+        optional: &Arc<Budget>,
+        scan: &ScanPattern,
+        pattern: usize,
+        v: &Variable,
+        position: usize,
+    ) -> Option<List> {
+        #[cfg(test)]
+        LIST_READS.set(LIST_READS.get() + 1);
+        // A column at a time where the index allows (a few ns a value; a quad at a time
+        // took 50: LUBM-10 q11 0.06 → 0.18 ms). Only a column read is a list: charged
+        // before it decodes, and complete or refused. Where the index can't give the pattern
+        // so (an equality expansion, several runs, deletions) a read quad by quad would hold
+        // it uncharged, and an expansion the budget stops would end as if complete
+        // (D16-575): no list, as for a refusal; the plan goes without.
+        let decoded = self.snapshot.scan_columns_in(
+            self.model,
+            &scan.quad_pattern(),
+            scan.permutation_for(Some(v)),
+            &[position],
+            optional,
+        );
+        let (mut columns, held) = match decoded {
+            Ok(Some(columns)) => columns.into_parts(),
+            Ok(None) | Err(_) => return None,
+        };
+        Some(List {
+            pattern,
+            values: columns.pop()?,
+            held: Reservation::adopt(Arc::clone(optional), held.transfer()),
+        })
+    }
+
+    /// The values the sorted lists `x` and `y` of the patterns `pair` share: their count, and
+    /// the values themselves, written in the same merge, as the pair's buffer. The buffer is
+    /// reserved on `optional` for the smaller list's length (a length already held, at most
+    /// [`reads::BUFFER_VALUES`]) before it is written, and what the count leaves unused is
+    /// freed, then released. Where that length is past [`reads::BUFFER_VALUES`] or the
+    /// reservation is refused, the pair is only counted: no buffer, no error, no refusal
+    /// marked on the request.
+    fn shared(
+        &self,
+        optional: &Arc<Budget>,
+        x: &[u64],
+        y: &[u64],
+        pair: (usize, usize),
+    ) -> (u64, Option<Buffer>) {
+        let most = x.len().min(y.len());
+        #[cfg(test)]
+        if !BUFFERS.get() {
+            return (sorted_overlap(x, y), None);
+        }
+        if most > reads::BUFFER_VALUES {
+            return (sorted_overlap(x, y), None);
+        }
+        let mut held = Reservation::new(Arc::clone(optional));
+        if held.charge(most * size_of::<u64>()).is_err() {
+            return (sorted_overlap(x, y), None);
+        }
+        let mut values = Vec::with_capacity(most);
+        let (mut a, mut b) = (0, 0);
+        while a < x.len() && b < y.len() {
+            match x[a].cmp(&y[b]) {
+                std::cmp::Ordering::Less => a += 1,
+                std::cmp::Ordering::Greater => b += 1,
+                std::cmp::Ordering::Equal => {
+                    // Counted once, as `sorted_overlap` counts it.
+                    let value = x[a];
+                    values.push(value);
+                    while a < x.len() && x[a] == value {
+                        a += 1;
+                    }
+                    while b < y.len() && y[b] == value {
+                        b += 1;
+                    }
+                }
+            }
+        }
+        values.shrink_to_fit();
+        held.release((most - values.len()) * size_of::<u64>());
+        let both = values.len() as u64;
+        let buffer = Buffer { pair, values, held };
+        (both, Some(buffer))
+    }
+
+    /// `scan` (with `count` matches) as part of a star on its subject (the variable with
+    /// index `subject`): a variable subject and a constant predicate in the default graph.
+    /// A constant object keeps the share of the predicate's statements it matches.
+    fn star(&self, scan: &ScanPattern, count: u64, subject: usize) -> Option<plan::Star> {
+        let (Slot::Var(_), Slot::Const(predicate)) = (&scan.slots[0], &scan.slots[1]) else {
+            return None;
+        };
+        if !scan.in_default_graph() {
+            return None;
+        }
+        let selectivity = match &scan.slots[2] {
+            Slot::Var(_) => 1.0,
+            _ => {
+                let mut free = scan.clone();
+                free.slots[2] = Slot::Var(Variable::new_unchecked("_star_object"));
+                let all = self.snapshot.estimate_in(self.model, &free.quad_pattern());
+                if all == 0 {
+                    0.0
+                } else {
+                    count as f64 / all as f64
+                }
+            }
+        };
+        Some(plan::Star {
+            subject,
+            predicate: predicate.raw(),
+            selectivity,
+        })
     }
 
     /// Distinct values of `var` among `scan`'s `count` matches: the engine's statistics
-    /// where an index order puts `var` right after the constants, else `count`.
+    /// where an index order puts `var` right after the constants, else `count`; kept for the
+    /// query (`distinct_counts`). Their walk stops with the query: then `count`,
+    /// nothing kept, and the planner's next check of the cancellation ends the query.
     fn distinct(&self, scan: &ScanPattern, var: &Variable, count: u64) -> u64 {
         const CANDIDATES: [Permutation; 4] = [
             Permutation::Gspo,
@@ -2505,11 +4309,16 @@ impl<'a> Context<'a> {
         if !scan.in_default_graph() {
             return count;
         }
-        let positions: Vec<usize> = (0..4).filter(|&c| scan.slots[c].is_var(var)).collect();
-        let [position] = positions[..] else {
+        let mut positions = (0..4).filter(|&c| scan.slots[c].is_var(var));
+        let (Some(position), None) = (positions.next(), positions.next()) else {
             return count;
         };
-        if scan.vars().len() == 1 {
+        // `var` alone: each match has a value of its own.
+        if !scan
+            .slots
+            .iter()
+            .any(|s| matches!(s, Slot::Var(v) if v != var))
+        {
             return count;
         }
         let bound = |c: usize| c == 3 || matches!(scan.slots[c], Slot::Const(_));
@@ -2521,14 +4330,42 @@ impl<'a> Context<'a> {
                 order[prefix] == position && order[prefix + 1..].iter().all(|&c| !bound(c))
             })
             .and_then(|&p| {
-                self.snapshot
-                    .distinct_estimate_in(self.model, &scan.quad_pattern(), p)
+                let key = (scan.quad_pattern(), p);
+                if let Some(&kept) = self.distinct_counts.borrow().get(&key) {
+                    return kept;
+                }
+                let going = |#[cfg_attr(not(test), expect(unused_variables))] units: u64| {
+                    #[cfg(test)]
+                    DISTINCT_ASKED.with_borrow(|asked| {
+                        if let Some(asked) = asked {
+                            asked(units);
+                        }
+                    });
+                    !self
+                        .cancellation
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled)
+                };
+                let distinct = self
+                    .snapshot
+                    .distinct_estimate_in(self.model, &key.0, p, &going)
+                    .ok()?;
+                // Refused, nothing is kept: the next plan asks the snapshot again.
+                let _ = self.distinct_counts.borrow_mut().insert(key, distinct);
+                distinct
             })
             .map_or(count, |d| d.min(count))
     }
 
-    /// A cyclic BGP by a worst-case-optimal join ([`wcoj`]); `None` if it isn't cyclic.
-    fn cyclic_bgp(&self, scans: &[ScanPattern], counts: &[u64]) -> NativeResult<Option<Solutions>> {
+    /// `scans` as a worst-case-optimal join's patterns over their variables, if they are a
+    /// cyclic BGP the executor joins so: at least three patterns, all in the default graph.
+    fn cyclic_patterns(
+        &self,
+        scans: &[ScanPattern],
+    ) -> Option<(Vec<Variable>, Vec<[wcoj::Pos; 3]>)> {
+        if scans.len() < 3 || !scans.iter().all(ScanPattern::in_default_graph) {
+            return None;
+        }
         let mut vars: Vec<Variable> = Vec::new();
         for scan in scans {
             for v in scan.vars() {
@@ -2540,7 +4377,7 @@ impl<'a> Context<'a> {
         let patterns: Vec<[wcoj::Pos; 3]> = scans
             .iter()
             .map(|scan| {
-                // Default-graph patterns only (checked by the caller): the graph is constant.
+                // Default-graph patterns only: the graph is constant.
                 [0, 1, 2].map(|c| match &scan.slots[c] {
                     Slot::Const(id) => wcoj::Pos::Const(id.raw()),
                     Slot::Var(v) => {
@@ -2550,9 +4387,39 @@ impl<'a> Context<'a> {
                 })
             })
             .collect();
-        if !wcoj::cyclic(&patterns, vars.len()) {
-            return Ok(None);
+        wcoj::cyclic(&patterns, vars.len()).then_some((vars, patterns))
+    }
+
+    /// The rows of a cyclic BGP ([`Self::cyclic_patterns`]) by sampling its
+    /// worst-case-optimal join ([`wcoj::Query::estimate`]): independence can't see a
+    /// cycle closed by a correlated pattern (LUBM-10 q9, students taking a course of
+    /// their advisor: 14 estimated for 2,540). `None` if the BGP isn't one.
+    fn cyclic_estimate(&self, scans: &[ScanPattern], counts: &[u64]) -> Option<f64> {
+        let (vars, patterns) = self.cyclic_patterns(scans)?;
+        if counts.contains(&0) {
+            return Some(0.0);
         }
+        let patterns: Vec<[wcoj::Pos; 3]> = patterns
+            .into_iter()
+            .filter(|p| p.iter().any(|x| matches!(x, wcoj::Pos::Var(_))))
+            .collect();
+        let width = vars.len();
+        let rows = wcoj::SAMPLE_ROWS;
+        let query = wcoj::Query::new(&self.snapshot, self.model, patterns, width, rows);
+        Some(query.estimate())
+    }
+
+    /// A cyclic BGP by a worst-case-optimal join ([`wcoj`]); `None` if it isn't cyclic.
+    /// `estimate` is EXPLAIN's.
+    fn cyclic_bgp(
+        &self,
+        scans: &[ScanPattern],
+        counts: &[u64],
+        estimate: Option<u64>,
+    ) -> NativeResult<Option<Solutions>> {
+        let Some((vars, patterns)) = self.cyclic_patterns(scans) else {
+            return Ok(None);
+        };
         let width = vars.len();
         // A pattern without matches (constants-only ones included) empties the BGP.
         if counts.contains(&0) {
@@ -2567,7 +4434,7 @@ impl<'a> Context<'a> {
             .filter(|p| p.iter().any(|x| matches!(x, wcoj::Pos::Var(_))))
             .collect();
         let query = wcoj::Query::new(
-            self.snapshot,
+            &self.snapshot,
             self.model,
             patterns,
             width,
@@ -2587,32 +4454,7 @@ impl<'a> Context<'a> {
         for row in rows.chunks_exact(width) {
             table.push_row(row);
         }
-        if let Some(trace) = &self.trace {
-            let order: Vec<String> = stats
-                .order
-                .iter()
-                .zip(&stats.candidates)
-                .map(|(&v, n)| {
-                    format!(
-                        "{} ({} candidates)",
-                        vars[v],
-                        n.load(std::sync::atomic::Ordering::Relaxed)
-                    )
-                })
-                .collect();
-            trace.borrow_mut().push(PlanStep {
-                depth: self.depth.get() + 1,
-                operator: "wcoj order".to_owned(),
-                detail: format!(
-                    "{} | {} lookups",
-                    order.join(", "),
-                    stats.lookups.load(std::sync::atomic::Ordering::Relaxed)
-                ),
-                estimated_rows: None,
-                rows: table.len() as u64,
-                micros: 0,
-            });
-        }
+        self.wcoj_step(&vars, &stats, estimate, table.len() as u64);
         Ok(Some(self.produced(Solutions {
             vars,
             table,
@@ -2620,29 +4462,144 @@ impl<'a> Context<'a> {
         })?))
     }
 
+    /// `COUNT(*)` of a BGP that is cyclic ([`Self::cyclic_patterns`]), by its
+    /// worst-case-optimal join counting instead of producing its solutions
+    /// ([`wcoj::Query::count_solutions`]); `None` if it isn't one. Past what a `u64` holds,
+    /// [`QueryEvaluationError::CountBeyondRange`].
+    fn cyclic_count(&self, triples: &[TriplePattern]) -> NativeResult<Option<u64>> {
+        if triples
+            .iter()
+            .any(|t| search::is_search(t, triples) || self.is_spatial(t))
+        {
+            return Ok(None);
+        }
+        let Some(scans) = triples
+            .iter()
+            .map(|t| self.scan_pattern(t))
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        let Some((vars, patterns)) = self.cyclic_patterns(&scans) else {
+            return Ok(None);
+        };
+        let start = Instant::now();
+        let counts: Vec<u64> = scans
+            .iter()
+            .map(|s| self.snapshot.estimate_in(self.model, &s.quad_pattern()))
+            .collect();
+        let estimate = self
+            .trace
+            .as_ref()
+            .and_then(|_| self.cyclic_estimate(&scans, &counts))
+            .map(|rows| rows.round() as u64);
+        let mut stats = wcoj::Stats::default();
+        let count = if counts.contains(&0) {
+            nrese_engine::Count::Exact(0)
+        } else {
+            let patterns: Vec<[wcoj::Pos; 3]> = patterns
+                .into_iter()
+                .filter(|p| p.iter().any(|x| matches!(x, wcoj::Pos::Var(_))))
+                .collect();
+            let query =
+                wcoj::Query::new(&self.snapshot, self.model, patterns, vars.len(), usize::MAX);
+            let token = self.cancellation.clone();
+            let cancelled = move || token.as_ref().is_some_and(CancellationToken::is_cancelled);
+            match query.count_solutions(&cancelled, &mut stats) {
+                Ok(count) => count,
+                Err(wcoj::Stop::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
+                Err(wcoj::Stop::TooManyRows) => unreachable!("a count keeps no rows"),
+            }
+        };
+        if self.trace.is_some() {
+            self.wcoj_step(&vars, &stats, estimate, count.at_least());
+            let detail = triples.iter().map(ToString::to_string).collect::<Vec<_>>();
+            let rows = count.at_least() as usize;
+            self.note("wcoj", detail.join(" . "), estimate, rows, start);
+        }
+        exact_count(count).map(Some)
+    }
+
+    /// EXPLAIN's step for a worst-case-optimal join: its variable order with each one's
+    /// candidates, its checks, and for a count the variables counted rather than bound.
+    fn wcoj_step(&self, vars: &[Variable], stats: &wcoj::Stats, estimate: Option<u64>, rows: u64) {
+        let Some(trace) = &self.trace else {
+            return;
+        };
+        let load = |n: &AtomicUsize| n.load(AtomicOrdering::Relaxed);
+        let order: Vec<String> = stats
+            .order
+            .iter()
+            .zip(&stats.candidates)
+            .map(|(&v, n)| format!("{} ({} candidates)", vars[v], load(n)))
+            .collect();
+        let counted = match stats.counted_after {
+            Some(depth) if depth < stats.order.len() => {
+                let rest: Vec<String> = stats.order[depth..]
+                    .iter()
+                    .map(|&v| vars[v].to_string())
+                    .collect();
+                format!(", {} counted as a forest", rest.join(", "))
+            }
+            _ => String::new(),
+        };
+        trace.borrow_mut().push(PlanStep {
+            depth: self.depth.get() + 1,
+            operator: "wcoj order".to_owned(),
+            detail: format!(
+                "{} | {} lookups ({} seeks, {} from the root), {} candidates skipped{counted}",
+                order.join(", "),
+                load(&stats.lookups),
+                load(&stats.seeks),
+                load(&stats.roots),
+                load(&stats.skipped)
+            ),
+            estimated_rows: estimate,
+            rows,
+            micros: 0,
+            cache: None,
+        });
+    }
+
     /// `DESCRIBE` (its answer is implementation-defined, §16.4): each term the solutions bind, once, with the
     /// statements of the default graph it is the subject of; a blank node such a statement
     /// has as its object is described in turn.
     fn describe(&self, solutions: &Solutions) -> NativeResult<Vec<nrese_rdf::Triple>> {
+        #[cfg(test)]
+        graph_tests::checkpoint();
+        self.check()?;
         let (predicate, object) = (
-            Variable::new_unchecked("described predicate"),
-            Variable::new_unchecked("described object"),
+            internal::variable("described", "predicate"),
+            internal::variable("described", "object"),
         );
         let Some(graph) = self.graph_slot() else {
             return Ok(Vec::new());
         };
         let table = &solutions.table;
-        let mut described: HashSet<u64> = HashSet::new();
-        let mut todo = Vec::new();
-        let mut out = Vec::new();
+        let mut described = ChargedMap::new(&*self.budget);
+        let mut todo = ChargedVec::new(&*self.budget);
+        // The decoded payloads stay charged with the output, just as CONSTRUCT's do.
+        // One thread, with no sibling payload grant: the whole spare.
+        // Declared before `out` so the triples are freed before their payload charge.
+        let mut kept = Grant::with_workers(&*self.budget, 1);
+        let mut out = ChargedVec::new(&*self.budget);
         for row in 0..table.len() {
+            self.check()?;
             for column in 0..table.width() {
                 let id = table.get(row, column);
-                if id != UNDEF && computed_index(id).is_none() && described.insert(id) {
-                    todo.push(id);
+                if id != UNDEF
+                    && computed_index(id).is_none()
+                    && described
+                        .get_or_insert_with(id, || ())
+                        .map_err(QueryEvaluationError::MemoryLimit)?
+                        .1
+                {
+                    todo.push(id).map_err(QueryEvaluationError::MemoryLimit)?;
                 }
             }
-            while let Some(node) = todo.pop() {
+            while let Some(node) = todo.last().copied() {
+                todo.truncate(todo.len() - 1);
+                self.check()?;
                 let Some(subject) = self
                     .term(node)
                     .and_then(|t| nrese_rdf::NamedOrBlankNode::try_from(t).ok())
@@ -2663,6 +4620,9 @@ impl<'a> Context<'a> {
                     statements.column(&object).expect("scanned"),
                 );
                 for r in 0..statements.table.len() {
+                    if r % 256 == 0 {
+                        self.check()?;
+                    }
                     let o_id = statements.table.get(r, o_column);
                     let (Some(Term::NamedNode(p)), Some(o)) = (
                         self.term(statements.table.get(r, p_column)),
@@ -2670,14 +4630,27 @@ impl<'a> Context<'a> {
                     ) else {
                         continue;
                     };
-                    if o.is_blank_node() && described.insert(o_id) {
-                        todo.push(o_id);
+                    if o.is_blank_node()
+                        && described
+                            .get_or_insert_with(o_id, || ())
+                            .map_err(QueryEvaluationError::MemoryLimit)?
+                            .1
+                    {
+                        todo.push(o_id).map_err(QueryEvaluationError::MemoryLimit)?;
                     }
-                    out.push(nrese_rdf::Triple::new(subject.clone(), p, o));
+                    let triple = nrese_rdf::Triple::new(subject.clone(), p, o);
+                    kept.take(triple_heap(&triple))
+                        .map_err(QueryEvaluationError::MemoryLimit)?;
+                    out.push(triple)
+                        .map_err(QueryEvaluationError::MemoryLimit)?;
                 }
-                self.consumed(&statements);
+                self.consumed(statements);
             }
         }
+        self.check()?;
+        let (out, capacity) = out.into_parts();
+        capacity.transfer();
+        kept.transfer();
         Ok(out)
     }
 
@@ -2697,9 +4670,7 @@ impl<'a> Context<'a> {
         let slot = |term: &TermPattern| -> Option<Slot> {
             Some(match term {
                 TermPattern::Variable(v) => Slot::Var(v.clone()),
-                TermPattern::BlankNode(b) => {
-                    Slot::Var(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-                }
+                TermPattern::BlankNode(b) => Slot::Var(internal::blank_variable(b)),
                 TermPattern::NamedNode(n) => Slot::Const(self.lookup_const(n.as_ref().into())?),
                 TermPattern::Literal(l) => Slot::Const(self.lookup_const(l.as_ref().into())?),
                 TermPattern::Triple(t) => {
@@ -2736,24 +4707,41 @@ impl<'a> Context<'a> {
         // One run, no deletions, nothing to merge: whole columns, decoded a block at a time.
         if !merged && !scan.repeats_variable() {
             let components: Vec<usize> = columns_of.iter().map(|positions| positions[0]).collect();
-            if let Some(columns) =
-                self.snapshot
-                    .scan_columns_in(self.model, &pattern, permutation, &components)
+            // Charged before they are decoded ([`Snapshot::scan_columns_in`]): the table
+            // takes over their charge.
+            if let Some(columns) = self
+                .snapshot
+                .scan_columns_in(self.model, &pattern, permutation, &components, &self.budget)
+                .map_err(QueryEvaluationError::MemoryLimit)?
             {
-                let table = if vars.is_empty() {
-                    let rows = self.snapshot.count_in(self.model, &pattern) as usize;
-                    IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
-                } else {
-                    IdTable::from_columns(columns)
-                };
-                return self.produced(Solutions {
-                    vars: vars.clone(),
-                    table: table.assume_sorted_by(sorted_columns(scan, permutation, &vars)),
-                    ordered: false,
-                });
+                #[cfg(test)]
+                SCAN_READS.set(SCAN_READS.get() + 1);
+                let sorted = sorted_columns(scan, permutation, &vars);
+                if vars.is_empty() {
+                    let rows = exact_count(self.snapshot.count_in(self.model, &pattern))? as usize;
+                    let table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows));
+                    return self.produced(Solutions {
+                        vars: vars.clone(),
+                        table: table.assume_sorted_by(sorted),
+                        ordered: false,
+                    });
+                }
+                let (columns, held) = columns.into_parts();
+                return self.holding(
+                    held,
+                    Solutions {
+                        vars: vars.clone(),
+                        table: IdTable::from_columns(columns).assume_sorted_by(sorted),
+                        ordered: false,
+                    },
+                );
             }
         }
-        let mut table = IdTable::new(vars.len());
+        if vars.is_empty() {
+            return self.scan_without_columns(scan, permutation);
+        }
+        // Rows known only as they are read: each column charged before it grows.
+        let mut columns = scan_columns::Columns::new(&self.budget, vars.len());
         let mut row = vec![0u64; vars.len()];
         let quads = self
             .snapshot
@@ -2772,6 +4760,7 @@ impl<'a> Context<'a> {
                     continue;
                 }
                 // Graph-last order: the copies of a statement follow each other.
+                // Blank nodes keep their identity: not §13.2's RDF merge (dataset.rs).
                 let statement = [components[0], components[1], components[2]];
                 if previous == Some(statement) {
                     continue;
@@ -2786,14 +4775,80 @@ impl<'a> Context<'a> {
                 }
                 *slot = value;
             }
-            table.push_row(&row);
+            columns
+                .push_row(&row)
+                .map_err(QueryEvaluationError::MemoryLimit)?;
         }
+        let (table, held) = columns
+            .into_table()
+            .map_err(QueryEvaluationError::MemoryLimit)?;
         let table = table.assume_sorted_by(sorted_columns(scan, permutation, &vars));
+        self.holding(
+            held,
+            Solutions {
+                vars,
+                table,
+                ordered: false,
+            },
+        )
+    }
+
+    /// [`Self::scan`] of a pattern without variables, matched quad by quad: its rows hold
+    /// nothing until something makes a column of them, charged as such
+    /// ([`IdTable::memory_bytes`]) once they are counted.
+    fn scan_without_columns(
+        &self,
+        scan: &ScanPattern,
+        permutation: Permutation,
+    ) -> NativeResult<Solutions> {
+        let pattern = scan.quad_pattern();
+        let merged = scan.merged();
+        let mut table = IdTable::new(0);
+        let quads = self
+            .snapshot
+            .scan_sorted_in(self.model, &pattern, permutation)
+            .expect("permutation_for returns a usable permutation");
+        let mut previous: Option<[u64; 3]> = None;
+        for (n, quad) in quads.enumerate() {
+            if n % (1 << 16) == 0 {
+                self.check()?;
+            }
+            if merged {
+                if let Some(graphs) = &self.merge_set
+                    && !graphs.contains(&quad.graph)
+                {
+                    continue;
+                }
+                // Graph-last order: the copies of a statement follow each other.
+                let components = quad.components();
+                let statement = [components[0], components[1], components[2]];
+                if previous == Some(statement) {
+                    continue;
+                }
+                previous = Some(statement);
+            }
+            table.push_row(&[]);
+        }
         self.produced(Solutions {
-            vars,
+            vars: Vec::new(),
             table,
             ordered: false,
         })
+    }
+
+    /// `solutions`, whose table `held` holds the charge of (exactly its bytes, once
+    /// resized): the charge handed on with them, never released and charged again. A
+    /// cancelled query fails here, as at [`Self::produced`].
+    fn holding(
+        &self,
+        mut held: Reservation<&Budget>,
+        solutions: Solutions,
+    ) -> NativeResult<Solutions> {
+        self.check()?;
+        held.resize(solutions.table.memory_bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        held.transfer();
+        Ok(solutions)
     }
 
     /// Scans `scan` over `ranges` of its object (the first free component of
@@ -2819,32 +4874,39 @@ impl<'a> Context<'a> {
         if ranges.len() >= MANY_RANGES
             && let Slot::Var(object) = &scan.slots[2]
         {
-            let mut solutions = self.scan(scan, Some(object))?;
+            let solutions = self.scan(scan, Some(object))?;
             let column = solutions
                 .column(object)
                 .expect("the pattern binds its object");
             let set = IdSet::new(ranges);
-            self.consumed(&solutions);
-            solutions
-                .table
-                .par_retain(|table, row| set.contains(table.get(row, column)));
-            return self.produced(solutions);
+            return self.reshaped(solutions, 0, |mut solutions| {
+                solutions
+                    .table
+                    .par_retain(|table, row| set.contains(table.get(row, column)));
+                solutions
+            });
         }
-        // Each range a block and a column at a time where the index can, else quad by quad.
-        let mut out: Vec<Vec<u64>> = vec![Vec::new(); vars.len()];
+        // Each range a block and a column at a time where the index can, else quad by quad;
+        // what each range decodes and the table it goes into charged before they grow.
+        let memory = QueryEvaluationError::MemoryLimit;
+        let mut out = scan_columns::Columns::new(&self.budget, vars.len());
+        let mut row = vec![0u64; vars.len()];
         for &(low, high) in ranges {
             self.check()?;
-            if let Some(decoded) = self.snapshot.scan_range_columns_in(
-                self.model,
-                &pattern,
-                permutation,
-                low,
-                high,
-                &columns,
-            ) {
-                for (column, values) in out.iter_mut().zip(decoded) {
-                    column.extend(values);
-                }
+            if let Some(decoded) = self
+                .snapshot
+                .scan_range_columns_in(
+                    self.model,
+                    &pattern,
+                    permutation,
+                    low,
+                    high,
+                    &columns,
+                    &self.budget,
+                )
+                .map_err(memory)?
+            {
+                out.extend(decoded.columns()).map_err(memory)?;
                 continue;
             }
             let Some(quads) =
@@ -2858,21 +4920,102 @@ impl<'a> Context<'a> {
                     self.check()?;
                 }
                 let components = quad.components();
-                for (column, &c) in out.iter_mut().zip(&columns) {
-                    column.push(components[c]);
+                for (slot, &c) in row.iter_mut().zip(&columns) {
+                    *slot = components[c];
                 }
+                out.push_row(&row).map_err(memory)?;
             }
         }
         let object = vars
             .iter()
             .position(|v| scan.slots[2].is_var(v))
             .expect("ranged object");
-        let table = IdTable::from_columns(out).assume_sorted_by(vec![object]);
-        self.produced(Solutions {
-            vars,
-            table,
-            ordered: false,
-        })
+        let (table, held) = out.into_table().map_err(memory)?;
+        self.holding(
+            held,
+            Solutions {
+                vars,
+                table: table.assume_sorted_by(vec![object]),
+                ordered: false,
+            },
+        )
+    }
+
+    /// Pattern `scan`'s scan from a list read at planning ([`reads`]): `values`, its one
+    /// variable's sorted column (the table the scan on that variable makes), with their
+    /// charge `held` on the optional part. The table's rows are released on the request's
+    /// own part ([`Self::consumed`]): a charge is released on the part it was taken on, so
+    /// the bytes move there as the step's own scan would charge them. Charged on this part
+    /// first, then released on the optional one, so they are never allocated and charged
+    /// nowhere; refused, the step fails as its scan would, and `held` releases them.
+    fn read_solutions(
+        &self,
+        scan: &ScanPattern,
+        values: Vec<u64>,
+        optional: Reservation<Arc<Budget>>,
+    ) -> NativeResult<Solutions> {
+        let mut held = Reservation::new(&*self.budget);
+        held.charge(optional.bytes())
+            .map_err(QueryEvaluationError::MemoryLimit)?;
+        drop(optional);
+        let vars = scan.vars();
+        let sorted = sorted_columns(scan, scan.permutation_for(vars.first()), &vars);
+        self.holding(
+            held,
+            Solutions {
+                vars,
+                table: IdTable::from_columns(vec![values]).assume_sorted_by(sorted),
+                ordered: false,
+            },
+        )
+    }
+
+    /// The index join of `result` with `scan` on `v`, from the pattern's list: the rows
+    /// whose `v` is in it. `scan` has the one variable `v`, its other components fixed, so
+    /// it holds each value of `v` at most once, and its probe keeps exactly these rows,
+    /// without a seek. Rows with `v` unbound join as the probe's do, by the scan.
+    fn member_join(
+        &self,
+        result: Solutions,
+        scan: &ScanPattern,
+        v: &Variable,
+        list: List,
+    ) -> NativeResult<Solutions> {
+        let List { values, held, .. } = list;
+        let column = result.column(v).expect("shared");
+        if has_undef(&result.table, &[column]) {
+            let scanned = self.read_solutions(scan, values, held)?;
+            return self.join(result, scanned);
+        }
+        // The retained rows' mask, a byte a row, charged as growth.
+        let rows = result.table.len();
+        let kept = self.reshaped(result, rows, |mut solutions| {
+            solutions
+                .table
+                .par_retain(|table, row| values.binary_search(&table.get(row, column)).is_ok());
+            solutions
+        });
+        drop(values);
+        drop(held);
+        kept
+    }
+
+    /// EXPLAIN's detail of an index nested-loop join: the pattern, its seeks in the
+    /// index's runs and how many of them searched from the root.
+    fn probed_detail(&self, pattern: String) -> String {
+        let seeks = self.probed.get();
+        format!(
+            "{pattern} | {} seeks, {} from the root",
+            seeks.seeks, seeks.root_searches
+        )
+    }
+
+    /// Whether a pattern of about `count` statements joins `rows` rows by probing the index
+    /// once per row rather than by a scan ([`PROBE_FACTOR`], [`QueryOptions::index_joins`]).
+    /// In a merged default graph both read every graph's copies of a statement.
+    fn index_join(&self, rows: usize, count: u64) -> bool {
+        self.index_joins
+            .unwrap_or_else(|| (rows as u64).saturating_mul(PROBE_FACTOR) < count)
     }
 
     /// Joins `result` with `scan` by probing the index once per distinct key of `result`.
@@ -2882,6 +5025,25 @@ impl<'a> Context<'a> {
         scan: &ScanPattern,
         shared: &[Variable],
     ) -> NativeResult<Solutions> {
+        let mut shared = shared.to_vec();
+        if !result.ordered {
+            // The keys sorted in the order the index reads the probed pattern: the probes
+            // then ascend, and its cursor reads each run forward ([`Probe`]).
+            let mut shape = scan.clone();
+            for slot in &mut shape.slots {
+                if matches!(slot, Slot::Var(v) if shared.contains(v)) {
+                    *slot = Slot::Const(TermId::DEFAULT_GRAPH);
+                }
+            }
+            let order = shape.quad_pattern().read_order();
+            shared.sort_by_key(|v| {
+                (0..4)
+                    .filter(|&i| scan.slots[i].is_var(v))
+                    .filter_map(|i| order.iter().position(|&c| c == i))
+                    .min()
+            });
+        }
+        let shared = &shared[..];
         let key_columns: Vec<usize> = shared
             .iter()
             .map(|v| result.column(v).expect("shared"))
@@ -2891,6 +5053,10 @@ impl<'a> Context<'a> {
             return self.join(result, scanned);
         }
         if !result.ordered {
+            let mut scratch = Reservation::new(&*self.budget);
+            scratch
+                .charge(sort_scratch_bytes(&result.table))
+                .map_err(QueryEvaluationError::MemoryLimit)?;
             result.table.sort_by(&key_columns);
         }
         let new_vars: Vec<Variable> = scan
@@ -2910,16 +5076,19 @@ impl<'a> Context<'a> {
             .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
         let probe = Probe {
-            snapshot: self.snapshot,
+            snapshot: &self.snapshot,
             model: self.model,
             table: &result.table,
             scan,
             key_columns: &key_columns,
             shared_positions: &shared_positions,
             positions: &positions,
+            graphs: self.merge_set.as_ref().filter(|_| scan.merged()),
+            budget: &self.budget,
             width: vars.len(),
             max_rows: self.max_rows(vars.len()),
             produced: AtomicUsize::new(0),
+            seeks: std::sync::Mutex::default(),
         };
         let token = self.cancellation.clone();
         let cancelled = move || token.as_ref().is_some_and(CancellationToken::is_cancelled);
@@ -2927,37 +5096,59 @@ impl<'a> Context<'a> {
         let out = if rows < 2 * PROBE_CHUNK {
             probe.rows(0..rows, &cancelled)
         } else {
-            let parts: Vec<Result<IdTable, ProbeStop>> = (0..rows.div_ceil(PROBE_CHUNK))
-                .into_par_iter()
-                .map(|i| {
-                    probe.rows(
-                        i * PROBE_CHUNK..((i + 1) * PROBE_CHUNK).min(rows),
-                        &cancelled,
-                    )
-                })
-                .collect();
-            parts
-                .into_iter()
-                .collect::<Result<Vec<IdTable>, ProbeStop>>()
-                .map(|parts| IdTable::concat(vars.len(), parts))
+            // The chunks' lists (their results, then their tables and their charges apart,
+            // then the tables joined) and each chunk's own column list and row buffer, a
+            // column header and a value a column, charged first: the chunks grow with the
+            // input's rows.
+            let chunks = rows.div_ceil(PROBE_CHUNK);
+            let entry = size_of::<Result<(IdTable, Reservation<&Budget>), ProbeStop>>();
+            let columns = vars.len() * (size_of::<Vec<u64>>() + size_of::<u64>());
+            let mut lists = Reservation::new(&*self.budget);
+            match lists.charge(chunks.saturating_mul(4 * entry + columns)) {
+                Err(exceeded) => Err(ProbeStop::Memory(exceeded)),
+                Ok(()) => {
+                    let parts: Vec<Result<_, ProbeStop>> = (0..chunks)
+                        .into_par_iter()
+                        .map(|i| {
+                            probe.rows(
+                                i * PROBE_CHUNK..((i + 1) * PROBE_CHUNK).min(rows),
+                                &cancelled,
+                            )
+                        })
+                        .collect();
+                    parts
+                        .into_iter()
+                        .collect::<Result<Vec<_>, ProbeStop>>()
+                        .and_then(|parts| probe.concat(parts))
+                }
+            }
         };
-        let out = match out {
+        let (out, held) = match out {
             Ok(out) => out,
             Err(ProbeStop::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
             Err(ProbeStop::TooManyRows) => {
                 return Err(self.too_large(probe.max_rows.saturating_add(1), vars.len()));
             }
+            Err(ProbeStop::Memory(exceeded)) => {
+                return Err(QueryEvaluationError::MemoryLimit(exceeded).into());
+            }
         };
-        let out = if result.ordered {
+        self.probed
+            .set(*probe.seeks.lock().unwrap_or_else(|e| e.into_inner()));
+        let ordered = result.ordered;
+        // The rows probed from freed, then the result keeps the charge it grew under.
+        self.consumed(result);
+        held.transfer();
+        let out = if ordered {
             out
         } else {
             out.assume_sorted_by(key_columns)
         };
-        self.consumed(&result);
-        self.produced(Solutions {
+        self.check()?;
+        Ok(Solutions {
             vars,
             table: out,
-            ordered: result.ordered,
+            ordered,
         })
     }
 
@@ -2979,14 +5170,15 @@ impl<'a> Context<'a> {
         } else {
             join(&left.table, &right.table, &lk, &rk, max_rows)
         }
-        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
+        .map_err(|e| self.join_stopped(e, vars.len()))?;
         self.budget.release(hash_table);
-        self.consumed(&left);
-        self.consumed(&right);
+        let ordered = left.ordered;
+        self.consumed(left);
+        self.consumed(right);
         self.produced(Solutions {
             vars,
             table,
-            ordered: left.ordered,
+            ordered,
         })
     }
 
@@ -3023,17 +5215,22 @@ impl<'a> Context<'a> {
         } else {
             left_join(&left.table, &right.table, &lk, &rk, accept, max_rows)
         }
-        .map_err(|e| self.too_large(e.max_rows.saturating_add(1), vars.len()))?;
+        .map_err(|e| self.join_stopped(e, vars.len()))?;
         self.budget.release(hash_table);
-        self.consumed(&left);
-        self.consumed(&right);
+        let ordered = left.ordered;
+        self.consumed(left);
+        self.consumed(right);
         self.produced(Solutions {
             vars,
             table,
-            ordered: left.ordered,
+            ordered,
         })
     }
 
+    /// The rows of both sides over the variables of either: a variable a side lacks is
+    /// UNDEF in its rows. Every column of the result is made, for the rows of both sides,
+    /// while they are held: charged before it is made, however many variables a side
+    /// lacks.
     fn union(&self, left: Solutions, right: Solutions) -> NativeResult<Solutions> {
         let mut vars = left.vars.clone();
         for v in &right.vars {
@@ -3041,28 +5238,30 @@ impl<'a> Context<'a> {
                 vars.push(v.clone());
             }
         }
-        let widen = |s: &Solutions| {
+        let rows = left.table.len() + right.table.len();
+        let growth = rows.saturating_mul(8).saturating_mul(vars.len());
+        self.reshaped((left, right), growth, |(left, right)| {
             // No variables on either side: rows without columns, as many as there are.
-            if vars.is_empty() {
-                return IdTable::from_rows(0, std::iter::repeat_n(&[][..], s.table.len()));
+            let table = if vars.is_empty() {
+                IdTable::from_rows(0, std::iter::repeat_n(&[][..], rows))
+            } else {
+                let column = |v: &Variable| {
+                    let mut column = Vec::with_capacity(rows);
+                    for side in [&left, &right] {
+                        match side.column(v) {
+                            Some(c) => column.extend_from_slice(side.table.column(c)),
+                            None => column.resize(column.len() + side.table.len(), UNDEF),
+                        }
+                    }
+                    column
+                };
+                IdTable::from_columns(vars.iter().map(column).collect())
+            };
+            Solutions {
+                vars,
+                table,
+                ordered: false,
             }
-            let columns: Vec<Vec<u64>> = vars
-                .iter()
-                .map(|v| match s.column(v) {
-                    Some(c) => s.table.column(c).to_vec(),
-                    None => vec![UNDEF; s.table.len()],
-                })
-                .collect();
-            IdTable::from_columns(columns)
-        };
-        let mut table = widen(&left);
-        table.append(&widen(&right));
-        self.consumed(&left);
-        self.consumed(&right);
-        self.produced(Solutions {
-            vars,
-            table,
-            ordered: false,
         })
     }
 
@@ -3092,10 +5291,7 @@ impl<'a> Context<'a> {
         let [triple] = patterns.as_slice() else {
             return Ok(None);
         };
-        if self.merge_set.is_some()
-            || search::is_search(triple, patterns)
-            || spatial::is_spatial(triple)
-        {
+        if search::is_search(triple, patterns) || self.is_spatial(triple) {
             return Ok(None);
         }
         let vars = triple_variables(triple);
@@ -3113,38 +5309,58 @@ impl<'a> Context<'a> {
                 ordered: false,
             };
             return Ok(Some(match projection {
-                Some(variables) => self.project(solutions, variables),
+                Some(variables) => self.project(solutions, variables)?,
                 None => solutions,
             }));
         };
+        let start = Instant::now();
         let places: Vec<Vec<usize>> = vars_unique
             .iter()
             .map(|v| (0..4).filter(|&i| scan.slots[i].is_var(v)).collect())
             .collect();
-        let mut out = IdTable::new(width);
-        let mut chunk = IdTable::new(width);
+        // Both tables are charged before they grow; the result keeps its charge, which
+        // whoever consumes it releases, as for a produced table.
+        let memory = QueryEvaluationError::MemoryLimit;
+        // (Each reservation before its table: locals drop in reverse, the table first.)
+        let mut out_held = Reservation::new(Arc::clone(&self.budget));
+        let mut chunk_held = Reservation::new(Arc::clone(&self.budget));
+        let (mut out, mut chunk) = (IdTable::new(width), IdTable::new(width));
+        // Without a filter, every row read is kept: no more than the limit are read at once.
+        let chunk_rows = match filter {
+            Some(_) => LIMIT_CHUNK,
+            None => LIMIT_CHUNK.min(limit.max(1)),
+        };
+        reserve_rows(&mut chunk, &mut chunk_held, chunk_rows, chunk_rows).map_err(memory)?;
         let mut row = vec![0u64; width];
         // The merged default graph is read in a graph-last order, where the copies of a
-        // statement are adjacent, and all but the first are skipped.
-        let mut quads: Box<dyn Iterator<Item = nrese_engine::EncodedQuad> + '_> = if scan.merged() {
+        // statement are adjacent, and all but the first are skipped (of a merge of listed
+        // graphs, those in other graphs first). One of the two reads, unboxed.
+        let merged = scan.merged().then(|| {
             let sorted = self
                 .snapshot
                 .scan_sorted_in(self.model, &scan.quad_pattern(), scan.permutation_for(None))
                 .expect("permutation_for returns a usable permutation");
             let mut previous: Option<[u64; 3]> = None;
-            Box::new(sorted.filter(move |quad| {
+            let graphs = self.merge_set.as_ref();
+            sorted.filter(move |quad| {
+                if graphs.is_some_and(|graphs| !graphs.contains(&quad.graph)) {
+                    return false;
+                }
                 let components = quad.components();
                 let statement = [components[0], components[1], components[2]];
                 let first = previous != Some(statement);
                 previous = Some(statement);
                 first
-            }))
-        } else {
-            Box::new(
-                self.snapshot
-                    .quads_for_pattern_in(self.model, &scan.quad_pattern()),
-            )
-        };
+            })
+        });
+        let own = (!scan.merged()).then(|| {
+            self.snapshot
+                .quads_for_pattern_in(self.model, &scan.quad_pattern())
+        });
+        let mut quads = merged
+            .into_iter()
+            .flatten()
+            .chain(own.into_iter().flatten());
         loop {
             let more = quads.next();
             if let Some(quad) = more {
@@ -3157,18 +5373,21 @@ impl<'a> Context<'a> {
                     chunk.push_row(&row);
                 }
             }
-            if chunk.len() >= 4096 || (more.is_none() && !chunk.is_empty()) {
+            if chunk.len() >= chunk_rows || (more.is_none() && !chunk.is_empty()) {
                 self.check()?;
-                let mut part = Solutions {
-                    vars: vars_unique.clone(),
-                    table: std::mem::replace(&mut chunk, IdTable::new(width)),
-                    ordered: false,
-                };
                 if let Some(expression) = filter {
+                    let part = Solutions {
+                        vars: vars_unique.clone(),
+                        table: chunk,
+                        ordered: false,
+                    };
                     let mask = self.filter_mask(&part, expression)?;
-                    part.table.retain_mask(&mask);
+                    chunk = part.table;
+                    chunk.retain_mask(&mask);
                 }
-                out.append(&part.table);
+                reserve_rows(&mut out, &mut out_held, chunk.len(), limit).map_err(memory)?;
+                out.append(&chunk);
+                chunk.slice(0, Some(0));
                 if out.len() >= limit {
                     out.slice(0, Some(limit));
                     break;
@@ -3178,13 +5397,26 @@ impl<'a> Context<'a> {
                 break;
             }
         }
+        if self.trace.is_some() {
+            let count = self.snapshot.estimate_in(self.model, &scan.quad_pattern()) as f64;
+            let kept = filter.map_or(1.0, pushdown::selectivity);
+            let estimate = Some(((count * kept).round() as u64).min(limit as u64));
+            let detail = format!("{triple} until {limit} rows");
+            self.note("limit pushdown", detail, estimate, out.len(), start);
+        }
         let solutions = Solutions {
             vars: vars_unique,
             table: out,
             ordered: false,
         };
+        // The result keeps the charge of exactly its bytes; a projection charges the columns
+        // it makes before making them (`project`).
+        out_held
+            .resize(solutions.table.memory_bytes())
+            .map_err(memory)?;
+        out_held.transfer();
         Ok(Some(match projection {
-            Some(variables) => self.project(solutions, variables),
+            Some(variables) => self.project(solutions, variables)?,
             None => solutions,
         }))
     }
@@ -3196,10 +5428,10 @@ impl<'a> Context<'a> {
         solutions: &Solutions,
         expression: &Expression,
     ) -> NativeResult<Vec<bool>> {
-        let compiled = fast::compile(expression, self.snapshot);
+        let compiled = fast::compile(expression, &self.snapshot);
         let rows = solutions.table.len();
         let mask = FilterMask {
-            snapshot: self.snapshot,
+            snapshot: &self.snapshot,
             evaluator: &self.evaluator,
             compiled: compiled.as_ref(),
             expression,
@@ -3219,13 +5451,15 @@ impl<'a> Context<'a> {
         let computed = self.computed.borrow();
         let computed: &[Term] = &computed;
         let token = self.cancellation.as_ref();
+        let snapshot: &Snapshot = &self.snapshot;
+        let (decodes, budget) = (&self.decodes, &self.budget);
         let parts: Vec<Option<Vec<bool>>> = (0..rows.div_ceil(PARALLEL_EXPRESSION_ROWS))
             .into_par_iter()
             .map(|i| {
                 if token.is_some_and(CancellationToken::is_cancelled) {
                     return None;
                 }
-                let decoder = Decoder::new(self.snapshot, computed);
+                let decoder = Decoder::new(snapshot, computed, decodes, budget);
                 let range =
                     i * PARALLEL_EXPRESSION_ROWS..((i + 1) * PARALLEL_EXPRESSION_ROWS).min(rows);
                 Some(mask.rows(range, &|id| decoder.term(id)))
@@ -3259,7 +5493,7 @@ impl<'a> Context<'a> {
                 let (mut solutions, plain, added) = self.with_exists(solutions, expression)?;
                 let mask = self.filter_mask(&solutions, &plain)?;
                 solutions.table.retain_mask(&mask);
-                Ok(drop_last_columns(solutions, added))
+                self.drop_added(solutions, added)
             }
             _ => {
                 let mask = self.filter_mask(&solutions, expression)?;
@@ -3271,23 +5505,39 @@ impl<'a> Context<'a> {
 
     // --- modifiers -----------------------------------------------------------------------
 
-    fn project(&self, solutions: Solutions, variables: &[Variable]) -> Solutions {
-        let columns: Vec<Vec<u64>> = variables
+    /// The columns of `variables` of a charged table: a bound variable's column moves,
+    /// every other one is made (an unbound variable's UNDEF, a column projected again),
+    /// charged before it is made, however many the query names. The result keeps the
+    /// charge, of exactly its bytes.
+    fn project(&self, solutions: Solutions, variables: &[Variable]) -> NativeResult<Solutions> {
+        // The input's columns that move: the first named by each variable, each once.
+        let mut moved: Vec<usize> = variables
             .iter()
-            .map(|v| match solutions.column(v) {
-                Some(c) => solutions.table.column(c).to_vec(),
-                None => vec![UNDEF; solutions.table.len()],
-            })
+            .filter_map(|variable| solutions.vars.iter().position(|v| v == variable))
             .collect();
-        let mut table = IdTable::from_columns(columns);
-        if variables.is_empty() {
-            table = IdTable::from_rows(0, std::iter::repeat_n(&[][..], solutions.table.len()));
-        }
-        Solutions {
-            vars: variables.to_vec(),
-            table,
-            ordered: solutions.ordered,
-        }
+        moved.sort_unstable();
+        moved.dedup();
+        let made = variables.len() - moved.len();
+        let growth = solutions.table.len().saturating_mul(8).saturating_mul(made);
+        self.reshaped(solutions, growth, |solutions| {
+            let mut table = solutions.table;
+            let mut undef = None;
+            let mut columns = Vec::with_capacity(variables.len());
+            for variable in variables {
+                columns.push(match solutions.vars.iter().position(|v| v == variable) {
+                    Some(column) => column,
+                    None => *undef.get_or_insert_with(|| {
+                        table.push_column(vec![UNDEF; table.len()]);
+                        table.width() - 1
+                    }),
+                });
+            }
+            Solutions {
+                vars: variables.to_vec(),
+                table: table.project(&columns),
+                ordered: solutions.ordered,
+            }
+        })
     }
 
     /// Sorts by the ORDER BY keys. With `limit`, only the first `limit` rows are guaranteed to
@@ -3297,31 +5547,51 @@ impl<'a> Context<'a> {
     /// each distinct id is decoded once, the distinct terms are sorted, and every row gets its
     /// term's rank: equal-ordering terms (1 and 1.0) share a rank.
     /// Every aggregate of every group (`members` lists each group's rows), in parallel
-    /// chunks of groups for large inputs.
+    /// chunks of groups for large inputs. The terms the aggregation keeps are charged as
+    /// they are made ([`aggregate::Kept`]); with the results comes their charge (bytes the
+    /// caller releases once it let them go).
     fn aggregate_groups(
         &self,
         solutions: &Solutions,
         members: &[Vec<usize>],
         aggregates: &[(Variable, AggregateExpression)],
-    ) -> NativeResult<Vec<Vec<Agg>>> {
-        let per_group = |aggregator: &Aggregator<'_>, rows: &[usize]| -> Vec<Agg> {
-            aggregates
-                .iter()
-                .map(|(_, aggregate)| aggregator.aggregate(solutions, rows, aggregate))
-                .collect()
+    ) -> NativeResult<(Vec<Vec<Agg>>, usize)> {
+        let shared: &Arc<Budget> = &self.budget;
+        let budget: &Budget = shared;
+        // The aggregates of `groups`, with their results' charge; the refusal that ended
+        // them, if one did.
+        let aggregate = |aggregator: &Aggregator<'_>,
+                         kept: &aggregate::Kept,
+                         groups: &[Vec<usize>]|
+         -> Result<Vec<Vec<Agg>>, BudgetExceeded> {
+            let mut out = Vec::with_capacity(groups.len());
+            for rows in groups {
+                out.push(
+                    aggregates
+                        .iter()
+                        .map(|(_, aggregate)| aggregator.aggregate(solutions, rows, aggregate))
+                        .collect(),
+                );
+                if let Some(refused) = kept.refused() {
+                    return Err(refused);
+                }
+            }
+            Ok(out)
         };
         if solutions.table.len() < 2 * PARALLEL_EXPRESSION_ROWS || members.len() < 2 {
             let term = |id: u64| self.term(id);
+            let kept = aggregate::Kept::new(&self.budget);
             let aggregator = Aggregator {
                 evaluator: &self.evaluator,
                 term: &term,
                 memo: RefCell::default(),
                 numbers: RefCell::default(),
+                kept: Some(&kept),
             };
-            return Ok(members
-                .iter()
-                .map(|rows| per_group(&aggregator, rows))
-                .collect());
+            let out = aggregate(&aggregator, &kept, members)
+                .map_err(QueryEvaluationError::MemoryLimit)?;
+            drop(aggregator);
+            return Ok((out, kept.results()));
         }
         // Chunks of groups holding about PARALLEL_EXPRESSION_ROWS rows each.
         let mut bounds = vec![0];
@@ -3339,37 +5609,60 @@ impl<'a> Context<'a> {
         let computed = self.computed.borrow();
         let computed: &[Term] = &computed;
         let token = self.cancellation.as_ref();
-        let (snapshot, evaluator) = (self.snapshot, &self.evaluator);
-        let parts: Vec<Option<Vec<Vec<Agg>>>> = bounds
+        let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
+        let decodes = &self.decodes;
+        // A part's aggregates and their charge; `Err(None)` once cancelled.
+        type Part = Result<(Vec<Vec<Agg>>, usize), Option<BudgetExceeded>>;
+        let parts: Vec<Part> = bounds
             .par_windows(2)
             .map(|window| {
                 if token.is_some_and(CancellationToken::is_cancelled) {
-                    return None;
+                    return Err(None);
                 }
-                let decoder = Decoder::new(snapshot, computed);
+                let decoder = Decoder::new(snapshot, computed, decodes, shared);
                 let term = |id: u64| decoder.term(id);
+                let kept = aggregate::Kept::new(shared);
                 let aggregator = Aggregator {
                     evaluator,
                     term: &term,
                     memo: RefCell::default(),
                     numbers: RefCell::default(),
+                    kept: Some(&kept),
                 };
-                Some(
-                    members[window[0]..window[1]]
-                        .iter()
-                        .map(|rows| per_group(&aggregator, rows))
-                        .collect(),
-                )
+                let part = aggregate(&aggregator, &kept, &members[window[0]..window[1]]);
+                drop(aggregator);
+                let charged = kept.results();
+                match part {
+                    Ok(part) => Ok((part, charged)),
+                    Err(refused) => {
+                        budget.release(charged);
+                        Err(Some(refused))
+                    }
+                }
             })
             .collect();
-        let mut out = Vec::with_capacity(members.len());
+        let (mut out, mut charged) = (Vec::with_capacity(members.len()), 0usize);
+        let mut stop = None;
         for part in parts {
-            let Some(part) = part else {
-                return Err(QueryEvaluationError::Cancelled.into());
-            };
-            out.extend(part);
+            match part {
+                Ok((part, bytes)) => {
+                    out.extend(part);
+                    charged = charged.saturating_add(bytes);
+                }
+                Err(why) => stop = Some(stop.flatten().or(why)),
+            }
         }
-        Ok(out)
+        if let Some(why) = stop {
+            // Let go of what the other parts made, then of their charge.
+            drop(out);
+            budget.release(charged);
+            return Err(match why {
+                Some(refused) => QueryEvaluationError::MemoryLimit(refused),
+                None => QueryEvaluationError::Cancelled,
+            }
+            .into());
+        }
+        Ok((out, charged))
     }
 
     /// Ranks of `column`'s values in SPARQL's order. With `top = (k, descending)` only the
@@ -3409,7 +5702,9 @@ impl<'a> Context<'a> {
         let terms: Vec<value::Sortable> = if distinct.len() >= PARALLEL_RANKS
             && distinct.iter().all(|&id| computed_index(id).is_none())
         {
-            let snapshot = self.snapshot;
+            let snapshot = &*self.snapshot;
+            self.decodes
+                .fetch_add(distinct.len() as u64, AtomicOrdering::Relaxed);
             distinct
                 .par_iter()
                 .map(|&id| {
@@ -3488,48 +5783,88 @@ impl<'a> Context<'a> {
             .collect()
     }
 
-    /// The values of the sort `keys` for `rows` of `solutions`, by position in `rows`. A key
-    /// that is a variable sorts by rank ([`Self::order_ranks`]: inline integers by id, so
-    /// no term is decoded); others are evaluated per row.
-    fn sort_keys(
-        &self,
+    /// The values of the sort `keys` for `rows` of `solutions`, by position in `rows`, each
+    /// key's charged to `held` before it is made (a term's strings as it is made), however
+    /// many keys the query names. A key that is a variable sorts by rank
+    /// ([`Self::order_ranks`]: inline integers by id, so no term is decoded); others are
+    /// evaluated per row.
+    fn sort_keys<'b>(
+        &'b self,
         solutions: &Solutions,
         keys: &[OrderExpression],
         rows: &[usize],
         limit: Option<usize>,
-    ) -> Vec<SortKey> {
-        keys.iter()
-            .enumerate()
-            .map(|(i, key)| {
-                let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
-                if let Expression::Variable(v) = e
-                    && let Some(column) = solutions.column(v)
-                {
-                    let column = solutions.table.column(column);
-                    let values: Vec<u64> = rows.iter().map(|&row| column[row]).collect();
-                    // With a limit, the first key needs only its first values told apart
-                    // when it is the only key (later keys break its ties).
-                    let descending = matches!(key, OrderExpression::Desc(_));
-                    let top = limit
-                        .filter(|_| i == 0 && keys.len() == 1)
-                        .map(|k| (k, descending));
-                    return SortKey::Ids(self.order_ranks(&values, top));
+        held: &mut Reservation<&'b Budget>,
+    ) -> NativeResult<Vec<SortKey>> {
+        let memory = QueryEvaluationError::MemoryLimit;
+        let mut sort_keys = Vec::with_capacity(keys.len());
+        for (i, key) in keys.iter().enumerate() {
+            let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
+            if let Expression::Variable(v) = e
+                && let Some(column) = solutions.column(v)
+            {
+                held.charge(rows.len().saturating_mul(8)).map_err(memory)?;
+                let column = solutions.table.column(column);
+                let values: Vec<u64> = rows.iter().map(|&row| column[row]).collect();
+                // With a limit, the first key needs only its first values told apart
+                // when it is the only key (later keys break its ties).
+                let descending = matches!(key, OrderExpression::Desc(_));
+                let top = limit
+                    .filter(|_| i == 0 && keys.len() == 1)
+                    .map(|k| (k, descending));
+                sort_keys.push(SortKey::Ids(self.order_ranks(&values, top)));
+                continue;
+            }
+            let slot = std::mem::size_of::<Option<Term>>();
+            held.charge(rows.len().saturating_mul(slot))
+                .map_err(memory)?;
+            let mut terms = Vec::with_capacity(rows.len());
+            // A term at a time through a grant (no budget call within its spare), its charge
+            // then held with the keys'. One thread.
+            let mut strings = Grant::with_workers(&*self.budget, 1);
+            for &row in rows {
+                let term = self.evaluator.eval(e, &self.binding(solutions, row));
+                if let Some(term) = &term {
+                    strings
+                        .take(crate::cache::term_heap(term))
+                        .map_err(memory)?;
                 }
-                SortKey::Terms(
-                    rows.iter()
-                        .map(|&row| self.evaluator.eval(e, &self.binding(solutions, row)))
-                        .collect(),
-                )
-            })
-            .collect()
+                terms.push(term);
+            }
+            held.absorb(strings.into_reservation());
+            sort_keys.push(SortKey::Terms(terms));
+        }
+        Ok(sort_keys)
     }
 
+    /// `solutions` (charged) in the order of `keys`; what that holds per key, and the
+    /// reordered table, charged before they are made. Keys that order nothing are left out,
+    /// however many the query names: a variable no row binds (unbound in every row, all rows
+    /// tie, §15.1), and an expression an earlier key has (it only meets that key's ties,
+    /// which it ties too), unless drawn per row (`RAND()`).
     fn order_by(
         &self,
-        mut solutions: Solutions,
+        solutions: Solutions,
         keys: &[OrderExpression],
         limit: Option<usize>,
     ) -> NativeResult<Solutions> {
+        fn expression(key: &OrderExpression) -> &Expression {
+            let (OrderExpression::Asc(e) | OrderExpression::Desc(e)) = key;
+            e
+        }
+        let mut deciding: Vec<OrderExpression> = Vec::with_capacity(keys.len());
+        for key in keys {
+            let e = expression(key);
+            let unbound = matches!(e, Expression::Variable(v) if solutions.column(v).is_none());
+            let repeated = !pushdown::per_solution(e)
+                && deciding.iter().any(|earlier| expression(earlier) == e);
+            if !unbound && !repeated {
+                deciding.push(key.clone());
+            }
+        }
+        let keys = &deciding[..];
+        let memory = QueryEvaluationError::MemoryLimit;
+        let mut held = Reservation::new(&*self.budget);
         let n = solutions.table.len();
         // The order of positions `a` and `b` by `values` of `keys` (no tie-break).
         let by_keys = |keys: &[OrderExpression], values: &[SortKey], a: usize, b: usize| {
@@ -3552,20 +5887,28 @@ impl<'a> Context<'a> {
         // can be among the first k (those up to the k-th row's value, ties included); the
         // other keys are computed for those only. Olympics q4 ranked 28 k athletes' IRIs
         // to break ties among the top 10 medal counts.
+        // The rows' positions and their order: a word a row each.
+        held.charge(n.saturating_mul(16)).map_err(memory)?;
         let mut rows: Vec<usize> = (0..n).collect();
         if let Some(k) = limit
             && k > 0
             && k < n
             && keys.len() > 1
         {
-            let first = self.sort_keys(&solutions, &keys[..1], &rows, Some(k));
+            let before = held.bytes();
+            held.charge(n.saturating_mul(8)).map_err(memory)?;
+            let first = self.sort_keys(&solutions, &keys[..1], &rows, Some(k), &mut held)?;
             let cmp = |a: &usize, b: &usize| by_keys(&keys[..1], &first, *a, *b);
             let mut positions = rows.clone();
             positions.select_nth_unstable_by(k - 1, cmp);
             let pivot = positions[k - 1];
             rows.retain(|row| cmp(row, &pivot).is_le());
+            drop(positions);
+            drop(first);
+            // The first key and the positions are gone: so is their charge.
+            held.resize(before).map_err(memory)?;
         }
-        let key_values = self.sort_keys(&solutions, keys, &rows, limit);
+        let key_values = self.sort_keys(&solutions, keys, &rows, limit, &mut held)?;
         let compare = |a: &usize, b: &usize| {
             by_keys(keys, &key_values, *a, *b).then_with(|| rows[*a].cmp(&rows[*b]))
         };
@@ -3579,20 +5922,30 @@ impl<'a> Context<'a> {
             _ => order.sort_unstable_by(compare),
         }
         let order: Vec<usize> = order.into_iter().map(|position| rows[position]).collect();
-        let columns: Vec<Vec<u64>> = solutions
-            .table
-            .columns()
-            .iter()
-            .map(|column| order.iter().map(|&row| column[row]).collect())
-            .collect();
+        drop(key_values);
+        drop(rows);
+        // Only the order is left of the scratch, and charged.
+        held.resize(order.capacity().saturating_mul(8))
+            .map_err(memory)?;
+        // The rows in that order: a table made of the charged one.
         let width = solutions.table.width();
-        solutions.table = if width == 0 {
-            IdTable::from_rows(0, std::iter::repeat_n(&[][..], order.len()))
-        } else {
-            IdTable::from_columns(columns)
-        };
-        solutions.ordered = true;
-        Ok(solutions)
+        let growth = order.len().saturating_mul(8).saturating_mul(width.max(1));
+        let mut sorted = self.reshaped(solutions, growth, |mut solutions| {
+            let columns: Vec<Vec<u64>> = solutions
+                .table
+                .columns()
+                .iter()
+                .map(|column| order.iter().map(|&row| column[row]).collect())
+                .collect();
+            solutions.table = if width == 0 {
+                IdTable::from_rows(0, std::iter::repeat_n(&[][..], order.len()))
+            } else {
+                IdTable::from_columns(columns)
+            };
+            solutions
+        })?;
+        sorted.ordered = true;
+        Ok(sorted)
     }
 
     // --- aggregation ---------------------------------------------------------------------
@@ -3617,15 +5970,230 @@ impl<'a> Context<'a> {
             return self.group_streamed(plan, variables, aggregates);
         }
         let before = self.budget.used();
+        let kept = self.kept.borrow().bytes();
         match self.group_direct(inner, variables, aggregates, having) {
             Err(error) if streamable.is_some() && stream::is_memory_limit(&error) => {
-                self.budget
-                    .release(self.budget.used().saturating_sub(before));
+                // What the attempt held, not what the context keeps of it (its computed
+                // terms and numbers stay, and stay charged).
+                let grown = self.kept.borrow().bytes().saturating_sub(kept);
+                self.budget.release(
+                    self.budget
+                        .used()
+                        .saturating_sub(before)
+                        .saturating_sub(grown),
+                );
                 let plan = streamable.as_ref().expect("checked");
                 self.group_streamed(plan, variables, aggregates)
             }
             result => result,
         }
+    }
+
+    /// The index's count of the quads `triple` matches, where that is its number of
+    /// solutions: `None` in the merged default graph (a statement in several graphs is
+    /// several quads there), with a repeated variable, and where the pattern can't match.
+    fn index_count(&self, triple: &TriplePattern) -> NativeResult<Option<u64>> {
+        match self.scan_pattern(triple) {
+            Some(scan) if !scan.repeats_variable() && !scan.merged() => Ok(Some(exact_count(
+                self.snapshot.count_in(self.model, &scan.quad_pattern()),
+            )?)),
+            _ => Ok(None),
+        }
+    }
+
+    /// Row counts, alone or per `?k`, of one triple pattern under a FILTER that reads only
+    /// its key `?k`: every row of a key gets the same verdict, so the counts are the index's
+    /// group counts of the keys that pass ([`Snapshot::group_counts_in_range`] within the
+    /// FILTER's range hints, else of the whole pattern), each key's term tested once. The
+    /// walk reads at most the keys the general path's range scan reads rows. `None` for
+    /// any other shape, or where the index can't walk the pattern (equality classes
+    /// expanded): the general path answers.
+    fn group_key_filtered(
+        &self,
+        inner: &GraphPattern,
+        variables: &[Variable],
+        aggregates: &[(Variable, AggregateExpression)],
+    ) -> NativeResult<Option<Solutions>> {
+        let GraphPattern::Filter { expr, inner } = inner else {
+            return Ok(None);
+        };
+        let GraphPattern::Bgp { patterns } = &**inner else {
+            return Ok(None);
+        };
+        let [triple] = patterns.as_slice() else {
+            return Ok(None);
+        };
+        let read = expression_variables(expr);
+        let Some(key) = read.first() else {
+            return Ok(None);
+        };
+        if read.iter().any(|v| v != key)
+            || !(variables.is_empty() || variables == std::slice::from_ref(key))
+            || aggregates.is_empty()
+            || per_solution(expr)
+            || contains_any_exists(expr)
+            || search::is_search(triple, patterns)
+            || self.is_spatial(triple)
+        {
+            return Ok(None);
+        }
+        let Some(scan) = self.scan_pattern(triple) else {
+            return Ok(None);
+        };
+        let permutation = scan.permutation_for(Some(key));
+        if scan.repeats_variable()
+            || scan.merged()
+            || !aggregates
+                .iter()
+                .all(|(_, aggregate)| counts_rows(aggregate, &scan))
+            || (0..4)
+                .find(|&c| scan.slots[c].is_var(key))
+                .is_none_or(|component| scan.first_free(permutation) != Some(component))
+        {
+            return Ok(None);
+        }
+        let pattern = scan.quad_pattern();
+        let hinted = ranges::hints(expr, &self.snapshot)
+            .into_iter()
+            .find(|hint| hint.variable == *key)
+            .map(|hint| hint.ranges);
+        // A text test on the key passes few of its terms: where the dictionary answers it
+        // first (`bgp`'s string hints: an unhinted object in the default graph, the pass
+        // worth its cost), its pass and a scan of those terms' rows beat testing every
+        // key's text. A language alone passes most terms: the key count stays.
+        let mut conjuncts = Vec::new();
+        pushdown::conjuncts_of(expr, &mut conjuncts);
+        if hinted.is_none()
+            && scan.slots[2].is_var(key)
+            && scan.in_default_graph()
+            && strings::combined(conjuncts, key).is_some_and(|condition| {
+                condition.tests_text()
+                    && condition.worth_a_pass(
+                        &self.snapshot,
+                        self.snapshot.estimate_in(self.model, &pattern),
+                    )
+            })
+        {
+            return Ok(None);
+        }
+        let start = Instant::now();
+        let memory = QueryEvaluationError::MemoryLimit;
+        // The FILTER's ranges of `?k`, each walked apart; many, or none: the whole pattern
+        // once (a seek per range would cost more than the walk).
+        let ranges = hinted.filter(|ranges| ranges.len() < MANY_RANGES);
+        let mut walks = Vec::new();
+        match ranges {
+            Some(ranges) => {
+                for (low, high) in ranges {
+                    self.check()?;
+                    let Some(groups) = self
+                        .snapshot
+                        .group_counts_in_range(
+                            self.model,
+                            &pattern,
+                            permutation,
+                            low,
+                            high,
+                            &self.budget,
+                        )
+                        .map_err(memory)?
+                    else {
+                        return Ok(None);
+                    };
+                    walks.push(groups);
+                }
+            }
+            None => match self
+                .snapshot
+                .group_counts_in(self.model, &pattern, permutation, &self.budget)
+                .map_err(memory)?
+            {
+                Some(groups) => walks.push(groups),
+                None => return Ok(None),
+            },
+        }
+        // The ranges are increasing and apart: their groups, in turn, are in id order.
+        let walked: usize = walks.iter().map(|groups| groups.len()).sum();
+        let keys = self.made(walked.saturating_mul(8), || {
+            let column = walks
+                .iter()
+                .flat_map(|groups| groups.iter().map(|(value, _)| value.raw()))
+                .collect();
+            Ok(Solutions {
+                vars: vec![key.clone()],
+                table: IdTable::from_columns(vec![column]).assume_sorted_by(vec![0]),
+                ordered: false,
+            })
+        })?;
+        // The keys' table and its charge go before an error returns, too.
+        let pass = self.filter_mask(&keys, expr);
+        self.consumed(keys);
+        let pass = pass?;
+        let passed = walks
+            .iter()
+            .flat_map(|groups| groups.iter())
+            .zip(&pass)
+            .filter(|&(_, &pass)| pass)
+            .map(|(&group, _)| group);
+        let mut vars = variables.to_vec();
+        vars.extend(aggregates.iter().map(|(target, _)| target.clone()));
+        let count_id = |n: u64| match TermId::inline_integer(n as i64) {
+            Some(id) => Ok(id.raw()),
+            None => self.id(&integer(n)),
+        };
+        let solutions = if variables.is_empty() {
+            let mut total = 0u64;
+            for (_, n) in passed {
+                total = total
+                    .checked_add(n)
+                    .ok_or_else(|| QueryEvaluationError::CountBeyondRange { at_least: u64::MAX })?;
+            }
+            let row = vec![count_id(total)?; aggregates.len()];
+            let mut table = IdTable::new(row.len());
+            table.push_row(&row);
+            self.produced(Solutions {
+                vars,
+                table,
+                ordered: false,
+            })?
+        } else {
+            let kept = pass.iter().filter(|&&pass| pass).count();
+            self.made(kept.saturating_mul(8).saturating_mul(vars.len()), || {
+                let mut columns = vec![Vec::with_capacity(kept), Vec::with_capacity(kept)];
+                for (value, n) in passed {
+                    columns[0].push(value.raw());
+                    columns[1].push(count_id(n)?);
+                }
+                let counts = columns.pop().expect("two columns");
+                columns.resize(vars.len(), counts);
+                Ok(Solutions {
+                    vars: vars.clone(),
+                    table: IdTable::from_columns(columns).assume_sorted_by(vec![0]),
+                    ordered: false,
+                })
+            })?
+        };
+        if self.trace.is_some() {
+            self.note(
+                "key count",
+                format!("{key} of {triple} where {expr}"),
+                None,
+                walked,
+                start,
+            );
+        }
+        Ok(Some(solutions))
+    }
+
+    /// One row binding `target` to `count`, charged as the query's.
+    fn count_row(&self, target: &Variable, count: u64) -> NativeResult<Solutions> {
+        let mut table = IdTable::new(1);
+        table.push_row(&[self.id(&integer(count))?]);
+        self.produced(Solutions {
+            vars: vec![target.clone()],
+            table,
+            ordered: false,
+        })
     }
 
     fn group_direct(
@@ -3641,28 +6209,31 @@ impl<'a> Context<'a> {
             && let GraphPattern::Bgp { patterns } = inner
             && let [triple] = patterns.as_slice()
             && !search::is_search(triple, patterns)
-            && !spatial::is_spatial(triple)
+            && !self.is_spatial(triple)
         {
-            let count = match self.scan_pattern(triple) {
-                // The index counts quads; in the merged default graph a statement in
-                // several graphs is several quads, so there the scan counts.
-                Some(scan) if !scan.repeats_variable() && !scan.merged() => {
-                    self.snapshot.count_in(self.model, &scan.quad_pattern())
-                }
-                Some(scan) => self.scan(&scan, None)?.table.len() as u64,
-                None => 0,
+            let count = match self.index_count(triple)? {
+                Some(count) => count,
+                None => match self.scan_pattern(triple) {
+                    Some(scan) => self.scan(&scan, None)?.table.len() as u64,
+                    None => 0,
+                },
             };
-            let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))]);
-            return Ok(Solutions {
-                vars: vec![target.clone()],
-                table,
-                ordered: false,
-            });
+            return self.count_row(target, count);
+        }
+        // COUNT(*) of a cyclic BGP: its worst-case-optimal join counts the solutions
+        // instead of producing them (4-cycles of a social graph: 19.2 M two-paths
+        // checked → two lists of 2-paths per node).
+        if variables.is_empty()
+            && let [(target, AggregateExpression::CountSolutions { distinct: false })] = aggregates
+            && let GraphPattern::Bgp { patterns } = inner
+            && let Some(count) = self.cyclic_count(patterns)?
+        {
+            return self.count_row(target, count);
         }
         // COUNT(*) of an open closure (`?a p* ?b`, `?a p+ ?b`): from the closure's size
         // per node, without building its pairs. Its pairs are distinct, so DISTINCT counts
         // the same.
+        let begun = Instant::now();
         if variables.is_empty()
             && let [(target, AggregateExpression::CountSolutions { .. })] = aggregates
             && let GraphPattern::Path {
@@ -3670,19 +6241,18 @@ impl<'a> Context<'a> {
                 path,
                 object,
             } = inner
-            && let (Ok(start), Ok(end)) = (self.path_end(subject), self.path_end(object))
+            && let (Ok(start), Ok(end)) = (self.path_end(subject)?, self.path_end(object)?)
             && start != end
             && let Some(count) = self
                 .path_evaluator()?
-                .count_open(&paths::Path::resolve(path, self.snapshot))
+                .count_open(&paths::Path::resolve(path, &self.snapshot))
+                .map_err(QueryEvaluationError::MemoryLimit)?
         {
-            let mut table = IdTable::new(1);
-            table.push_row(&[self.id(&integer(count))]);
-            return Ok(Solutions {
-                vars: vec![target.clone()],
-                table,
-                ordered: false,
-            });
+            if self.trace.is_some() {
+                let detail = format!("COUNT of {path} from the closure's size per component");
+                self.note("closure", detail, Some(1), 1, begun);
+            }
+            return self.count_row(target, count);
         }
         // GROUP BY one variable with only row counts, over one triple pattern: the index
         // counts each group by binary search (O(groups · log n)), without reading matches.
@@ -3690,7 +6260,7 @@ impl<'a> Context<'a> {
             && let GraphPattern::Bgp { patterns } = inner
             && let [triple] = patterns.as_slice()
             && !search::is_search(triple, patterns)
-            && !spatial::is_spatial(triple)
+            && !self.is_spatial(triple)
             && let Some(scan) = self.scan_pattern(triple)
             && !scan.repeats_variable()
             && !scan.merged()
@@ -3700,36 +6270,49 @@ impl<'a> Context<'a> {
             && let Some(component) = (0..4).find(|&c| scan.slots[c].is_var(key))
         {
             let permutation = scan.permutation_for(Some(key));
+            let start = std::time::Instant::now();
+            // The groups charged as they are found ([`Snapshot::group_counts_in`]).
             if scan.first_free(permutation) == Some(component)
-                && let Some(groups) =
-                    self.snapshot
-                        .group_counts_in(self.model, &scan.quad_pattern(), permutation)
+                && let Some(groups) = self
+                    .snapshot
+                    .group_counts_in(self.model, &scan.quad_pattern(), permutation, &self.budget)
+                    .map_err(QueryEvaluationError::MemoryLimit)?
             {
-                let mut columns = vec![
-                    groups
-                        .iter()
-                        .map(|(value, _)| value.raw())
-                        .collect::<Vec<_>>(),
-                ];
-                let counts: Vec<u64> = groups
-                    .iter()
-                    .map(|&(_, n)| match TermId::inline_integer(n as i64) {
-                        Some(id) => id.raw(),
-                        None => self.id(&integer(n)),
-                    })
-                    .collect();
-                let mut vars = vec![key.clone()];
-                for (target, _) in aggregates {
-                    columns.push(counts.clone());
-                    vars.push(target.clone());
+                if self.trace.is_some() {
+                    let detail = format!("{key} of {triple}");
+                    let count = self.snapshot.estimate_in(self.model, &scan.quad_pattern());
+                    let estimate = Some(self.distinct(&scan, key, count));
+                    self.note("group count", detail, estimate, groups.len(), start);
                 }
-                let table = IdTable::from_columns(columns).assume_sorted_by(vec![0]);
-                return self.produced(Solutions {
-                    vars,
-                    table,
-                    ordered: false,
+                // The key's column and the counts' for each aggregate, however many the
+                // query names, charged before they are made.
+                let mut vars = vec![key.clone()];
+                vars.extend(aggregates.iter().map(|(target, _)| target.clone()));
+                let bytes = groups.len().saturating_mul(8).saturating_mul(vars.len());
+                return self.made(bytes, || {
+                    let mut columns = Vec::with_capacity(vars.len());
+                    columns.push(groups.iter().map(|(value, _)| value.raw()).collect());
+                    let mut counts = Vec::with_capacity(groups.len());
+                    for &(_, n) in groups.iter() {
+                        counts.push(match TermId::inline_integer(n as i64) {
+                            Some(id) => id.raw(),
+                            None => self.id(&integer(n))?,
+                        });
+                    }
+                    columns.resize(vars.len(), counts);
+                    let table = IdTable::from_columns(columns).assume_sorted_by(vec![0]);
+                    Ok(Solutions {
+                        vars,
+                        table,
+                        ordered: false,
+                    })
                 });
             }
+        }
+        if !self.as_written
+            && let Some(solutions) = self.group_key_filtered(inner, variables, aggregates)?
+        {
+            return Ok(solutions);
         }
         if !self.as_written
             && !variables.is_empty()
@@ -3778,15 +6361,18 @@ impl<'a> Context<'a> {
             filters.push(expr);
             pattern = inner;
         }
-        let GraphPattern::Join { left, right } = pattern else {
+        let GraphPattern::Join { inputs } = pattern else {
+            return Ok(None);
+        };
+        let [left, right] = inputs.as_slice() else {
             return Ok(None);
         };
         let (left_vars, right_vars) = (sets::in_scope(left), sets::in_scope(right));
         if sets::shares(&left_vars, &right_vars)
             || as_path(left).is_some()
             || as_path(right).is_some()
-            || matches!(**left, GraphPattern::Service { .. })
-            || matches!(**right, GraphPattern::Service { .. })
+            || matches!(left, GraphPattern::Service { .. })
+            || matches!(right, GraphPattern::Service { .. })
         {
             return Ok(None);
         }
@@ -3802,19 +6388,32 @@ impl<'a> Context<'a> {
         // Rows of the keyed side per chunk, so that a chunk's product has about
         // CROSS_CHUNK_ROWS rows.
         let per_chunk = (self.cross_chunk_rows / other.table.len().max(1)).max(1);
-        // A key in scope but never bound has no column: unbound in every row, it splits no
-        // group.
-        let key_columns: Vec<usize> = variables.iter().filter_map(|v| keyed.column(v)).collect();
+        // The keys' columns, each once: a key named again orders and splits nothing more,
+        // and one in scope but never bound has no column (unbound in every row, it splits
+        // no group).
+        let (key_columns, _) = aggregate::bound_keys(&keyed, variables);
+        let memory = QueryEvaluationError::MemoryLimit;
+        // The keyed rows' order and the sort's buffer: a word a row each, charged before
+        // they are made. Declared before `order`: dropped after it.
+        let mut scratch = Reservation::new(&*self.budget);
+        scratch
+            .charge(keyed.table.len().saturating_mul(16))
+            .map_err(memory)?;
         let mut order: Vec<usize> = (0..keyed.table.len()).collect();
         if keyed.table.len() > per_chunk {
-            let key_of = |row: usize| -> Vec<u64> {
+            // Stable: rows of a key keep their order, as the groups' members do.
+            order.sort_by(|&a, &b| {
                 key_columns
                     .iter()
-                    .map(|&c| keyed.table.get(row, c))
-                    .collect()
-            };
-            order.sort_by_cached_key(|&row| key_of(row));
+                    .map(|&c| keyed.table.get(a, c).cmp(&keyed.table.get(b, c)))
+                    .find(|ordering| ordering.is_ne())
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
         }
+        // The buffer is gone; the order is left, charged until the chunks are made.
+        scratch
+            .resize(order.capacity().saturating_mul(8))
+            .map_err(memory)?;
         let same_key = |a: usize, b: usize| {
             key_columns
                 .iter()
@@ -3856,8 +6455,10 @@ impl<'a> Context<'a> {
             parts.push(self.group_solutions(crossed, variables, aggregates)?);
             start = end;
         }
-        self.consumed(&keyed);
-        self.consumed(&other);
+        drop(order);
+        drop(scratch);
+        self.consumed(keyed);
+        self.consumed(other);
         let Some(first) = parts.first() else {
             // No keyed rows: no groups (with GROUP BY, an empty input has none).
             let mut vars = variables.to_vec();
@@ -3870,16 +6471,10 @@ impl<'a> Context<'a> {
         };
         let vars = first.vars.clone();
         let width = first.table.width();
-        let tables = parts
-            .into_iter()
-            .map(|part| {
-                self.consumed(&part);
-                part.table
-            })
-            .collect();
-        Ok(Some(self.produced(Solutions {
+        let growth = concat_growth(&parts);
+        Ok(Some(self.reshaped(parts, growth, |parts| Solutions {
             vars,
-            table: IdTable::concat(width, tables),
+            table: IdTable::concat(width, parts.into_iter().map(|p| p.table).collect()),
             ordered: false,
         })?))
     }
@@ -3890,13 +6485,17 @@ impl<'a> Context<'a> {
     /// are read in order instead of per group. `None` otherwise (and where a value isn't a
     /// number: the general path decides, durations included). BSBM BI q4: 154 M rows of
     /// `AVG(xsd:float(xsd:string(?price)))` at 80 ns a row per group, now a pass.
+    /// Once it applies, and before it allocates, it calls `reserve` with what the pass
+    /// holds at most ([`aggregate::pass_bytes`]); the numbers it remembers are charged to
+    /// the query before they are found, and released as they are let go. A refusal ends it.
     fn numeric_pass(
         &self,
         solutions: &Solutions,
         group_of: &[u32],
         groups: usize,
         aggregates: &[(Variable, AggregateExpression)],
-    ) -> Option<Vec<Vec<Agg>>> {
+        reserve: &mut dyn FnMut(usize) -> Result<(), BudgetExceeded>,
+    ) -> Result<Option<Vec<Vec<Agg>>>, BudgetExceeded> {
         enum Plan<'e> {
             Rows,
             Bound(usize),
@@ -3915,7 +6514,10 @@ impl<'a> Context<'a> {
                     name: AggregateFunction::Count,
                     expr: Expression::Variable(variable),
                     distinct: false,
-                } => Plan::Bound(solutions.column(variable)?),
+                } => match solutions.column(variable) {
+                    Some(column) => Plan::Bound(column),
+                    None => return Ok(None),
+                },
                 AggregateExpression::FunctionCall {
                     name: name @ (AggregateFunction::Sum | AggregateFunction::Avg),
                     expr,
@@ -3928,7 +6530,7 @@ impl<'a> Context<'a> {
                     columns.sort_unstable();
                     columns.dedup();
                     let [column] = columns[..] else {
-                        return None;
+                        return Ok(None);
                     };
                     totals += 1;
                     Plan::Total {
@@ -3937,12 +6539,12 @@ impl<'a> Context<'a> {
                         average: *name == AggregateFunction::Avg,
                     }
                 }
-                _ => return None,
+                _ => return Ok(None),
             });
         }
         // Only worth it where a total is computed; counts alone take the other paths.
         if totals == 0 {
-            return None;
+            return Ok(None);
         }
         #[derive(Clone, Copy)]
         struct State {
@@ -3950,6 +6552,8 @@ impl<'a> Context<'a> {
             total: Option<Numeric>,
             error: bool,
         }
+        const { assert!(std::mem::size_of::<State>() <= aggregate::STATE_BYTES) };
+        reserve(aggregate::pass_bytes(groups, plans.len()))?;
         let width = plans.len();
         let table = &solutions.table;
         // Every id's number, found once per query: the chunks of a cross product
@@ -3972,11 +6576,16 @@ impl<'a> Context<'a> {
                 }
             }
             let missing: Vec<(u64, usize)> = missing.into_iter().collect();
+            // Each number found is kept: charged before (`number_bytes`), however many
+            // expressions the query sums.
+            self.kept
+                .borrow_mut()
+                .charge(missing.len().saturating_mul(number_bytes()))?;
             let number = |aggregator: &Aggregator<'_>, row: usize| {
                 let binding = aggregator.binding(solutions, row);
                 match aggregator.evaluator.eval(expr, &binding) {
                     None => Number::Error,
-                    Some(term) => match Numeric::of(&term) {
+                    Some(term) => match Numeric::of(&Value::of(&term)) {
                         Some(number) => Number::Value(number),
                         None => Number::Other,
                     },
@@ -3989,6 +6598,7 @@ impl<'a> Context<'a> {
                     term: &term,
                     memo: RefCell::default(),
                     numbers: RefCell::default(),
+                    kept: None,
                 };
                 missing
                     .iter()
@@ -3997,17 +6607,19 @@ impl<'a> Context<'a> {
             } else {
                 let computed = self.computed.borrow();
                 let computed: &[Term] = &computed;
-                let (snapshot, evaluator) = (self.snapshot, &self.evaluator);
+                let (snapshot, evaluator): (&Snapshot, _) = (&self.snapshot, &self.evaluator);
+                let (decodes, budget) = (&self.decodes, &self.budget);
                 missing
                     .par_chunks(PARALLEL_EXPRESSION_ROWS)
                     .flat_map_iter(|part| {
-                        let decoder = Decoder::new(snapshot, computed);
+                        let decoder = Decoder::new(snapshot, computed, decodes, budget);
                         let term = |id: u64| decoder.term(id);
                         let aggregator = Aggregator {
                             evaluator,
                             term: &term,
                             memo: RefCell::default(),
                             numbers: RefCell::default(),
+                            kept: None,
                         };
                         part.iter()
                             .map(|&(id, row)| (id, number(&aggregator, row)))
@@ -4074,27 +6686,46 @@ impl<'a> Context<'a> {
         // Parts of the groups on every core where there are many rows: each part reads the
         // rows in order, so every group adds its values in the order the general path does.
         let parts = rayon::current_num_threads().min(groups).max(1);
-        let states: Vec<State> = if group_of.len() < 2 * PARALLEL_EXPRESSION_ROWS || parts < 2 {
-            pass(0..groups)?
-        } else {
-            let done: Vec<Option<Vec<State>>> = (0..parts)
-                .into_par_iter()
-                .map(|part| pass(part * groups / parts..(part + 1) * groups / parts))
-                .collect();
-            let mut states = Vec::with_capacity(groups * width);
-            for part in done {
-                states.extend(part?);
-            }
-            states
+        let states: Option<Vec<State>> =
+            if group_of.len() < 2 * PARALLEL_EXPRESSION_ROWS || parts < 2 {
+                pass(0..groups)
+            } else {
+                let done: Vec<Option<Vec<State>>> = (0..parts)
+                    .into_par_iter()
+                    .map(|part| pass(part * groups / parts..(part + 1) * groups / parts))
+                    .collect();
+                let mut states = Vec::with_capacity(groups * width);
+                let mut numbers_only = true;
+                for part in done {
+                    match part {
+                        Some(part) => states.extend(part),
+                        None => {
+                            numbers_only = false;
+                            break;
+                        }
+                    }
+                }
+                numbers_only.then_some(states)
+            };
+        let Some(states) = states else {
+            return Ok(None);
         };
         // Kept for the next chunk only while small: a GROUP BY over many distinct values
         // would hold all their numbers to the end of the query.
         drop(known);
         drop(numbers);
-        self.numbers
+        let mut let_go = 0usize;
+        self.numbers.borrow_mut().retain(|_, known| {
+            let keep = known.len() <= NUMBER_MEMO_ENTRIES;
+            if !keep {
+                let_go = let_go.saturating_add(known.len());
+            }
+            keep
+        });
+        self.kept
             .borrow_mut()
-            .retain(|_, known| known.len() <= NUMBER_MEMO_ENTRIES);
-        Some(
+            .release(let_go.saturating_mul(number_bytes()));
+        Ok(Some(
             (0..groups)
                 .map(|group| {
                     plans
@@ -4112,77 +6743,43 @@ impl<'a> Context<'a> {
                         .collect()
                 })
                 .collect(),
-        )
+        ))
     }
 
-    /// GROUP BY over evaluated `solutions`.
+    /// GROUP BY over evaluated `solutions` (charged). The groups' table, a column per key
+    /// and per aggregate however many the query names, is charged before it is made, beside
+    /// the rows it is made of.
     fn group_solutions(
         &self,
         solutions: Solutions,
         variables: &[Variable],
         aggregates: &[(Variable, AggregateExpression)],
     ) -> NativeResult<Solutions> {
-        let key_table = if variables.is_empty() {
-            IdTable::from_rows(0, std::iter::repeat_n(&[][..], solutions.table.len()))
-        } else {
-            let key_columns: Vec<Vec<u64>> = variables
-                .iter()
-                .map(|v| match solutions.column(v) {
-                    Some(c) => solutions.table.column(c).to_vec(),
-                    None => vec![UNDEF; solutions.table.len()],
-                })
-                .collect();
-            let key_table = IdTable::from_columns(key_columns);
-            let sorted_on: Vec<usize> = variables
-                .iter()
-                .map_while(|v| solutions.column(v))
-                .collect();
-            if sorted_on.len() == variables.len() && solutions.table.is_sorted_on(&sorted_on) {
-                key_table.assume_sorted_by((0..variables.len()).collect())
-            } else {
-                key_table
-            }
-        };
-        let keys: Vec<usize> = (0..variables.len()).collect();
-        let groups = group_rows(&key_table, &keys);
-        // Without GROUP BY, an empty input still yields one (empty) group.
+        let (groups, positions) = aggregate::groups_of(&solutions, variables)?;
         let group_count = groups.len();
-        let one_pass = aggregate_in_one_pass(&solutions, &groups.group_of, group_count, aggregates)
-            .or_else(|| self.numeric_pass(&solutions, &groups.group_of, group_count, aggregates));
-        let values = match one_pass {
-            Some(values) => values,
-            None => {
-                let mut members: Vec<Vec<usize>> = vec![Vec::new(); group_count];
-                for (row, &group) in groups.group_of.iter().enumerate() {
-                    members[group as usize].push(row);
-                }
-                self.aggregate_groups(&solutions, &members, aggregates)?
-            }
-        };
-        let mut columns: Vec<Vec<u64>> = groups.keys.clone().into_columns();
         let mut vars: Vec<Variable> = variables.to_vec();
-        for (index, (target, _)) in aggregates.iter().enumerate() {
-            let column: Vec<u64> = values
-                .iter()
-                .map(|group| match &group[index] {
-                    Agg::Id(id) => *id,
-                    Agg::Term(term) => self.id(term),
-                })
-                .collect();
-            columns.push(column);
-            vars.push(target.clone());
-        }
-        let table = if columns.is_empty() {
-            IdTable::from_rows(0, std::iter::repeat_n(&[][..], group_count))
-        } else {
-            IdTable::from_columns(columns)
-        };
-        self.consumed(&solutions);
-        self.produced(Solutions {
-            vars,
-            table,
-            ordered: false,
-        })
+        vars.extend(aggregates.iter().map(|(target, _)| target.clone()));
+        let bytes = group_count
+            .saturating_mul(8)
+            .saturating_mul(vars.len().max(1));
+        let grouped = self.made(bytes, || {
+            let mut columns = aggregate::key_columns(&groups, &positions, None);
+            let values =
+                self.aggregate_columns(&solutions, &groups.group_of, group_count, aggregates)?;
+            columns.extend(values);
+            let table = if columns.is_empty() {
+                IdTable::from_rows(0, std::iter::repeat_n(&[][..], group_count))
+            } else {
+                IdTable::from_columns(columns)
+            };
+            Ok(Solutions {
+                vars,
+                table,
+                ordered: false,
+            })
+        });
+        self.consumed(solutions);
+        grouped
     }
 }
 
@@ -4223,11 +6820,14 @@ fn describe(pattern: &GraphPattern) -> (&'static str, String) {
         ),
         GraphPattern::Filter { expr, .. } => ("filter", expr.to_string()),
         GraphPattern::Union { .. } => ("union", String::new()),
-        GraphPattern::Extend {
-            variable,
-            expression,
-            ..
-        } => ("bind", format!("{expression} AS {variable}")),
+        GraphPattern::Extend { bindings, .. } => (
+            "bind",
+            bindings
+                .iter()
+                .map(|(variable, expression)| format!("{expression} AS {variable}"))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
         GraphPattern::Minus { .. } => ("minus", String::new()),
         GraphPattern::Values { variables, .. } => ("values", list(variables)),
         GraphPattern::OrderBy { expression, .. } => (
@@ -4249,7 +6849,9 @@ fn describe(pattern: &GraphPattern) -> (&'static str, String) {
             },
         ),
         GraphPattern::Group { variables, .. } => ("group", list(variables)),
-        _ => ("operator", String::new()),
+        GraphPattern::Graph { name, .. } => ("graph", name.to_string()),
+        GraphPattern::Service { name, .. } => ("service", name.to_string()),
+        GraphPattern::Lateral { .. } => ("lateral", String::new()),
     }
 }
 
@@ -4260,31 +6862,45 @@ const PARALLEL_EXPRESSION_ROWS: usize = 1 << 13;
 const DECODER_CACHE_ENTRIES: usize = 1 << 12;
 
 /// Term decoding for one task of a parallel operator: the snapshot, the query's computed
-/// terms (read-only meanwhile), and a small cache of its own.
+/// terms (read-only meanwhile), and a small cache of its own, charged to the query's budget
+/// while kept ([`decode_cache`]).
 struct Decoder<'a> {
     snapshot: &'a Snapshot,
     computed: &'a [Term],
-    cache: RefCell<HashMap<u64, Option<Term>>>,
+    cache: RefCell<decode_cache::DecodeCache>,
+    /// The query's count of decoded terms ([`Context::decodes`]).
+    decodes: &'a AtomicU64,
 }
 
 impl<'a> Decoder<'a> {
-    fn new(snapshot: &'a Snapshot, computed: &'a [Term]) -> Self {
+    fn new(
+        snapshot: &'a Snapshot,
+        computed: &'a [Term],
+        decodes: &'a AtomicU64,
+        budget: &Arc<Budget>,
+    ) -> Self {
         Self {
             snapshot,
             computed,
-            cache: RefCell::default(),
+            // As many fill theirs at once as the pool has threads.
+            cache: RefCell::new(decode_cache::DecodeCache::new(
+                budget,
+                DECODER_CACHE_ENTRIES,
+                rayon::current_num_threads(),
+            )),
+            decodes,
         }
     }
 
     fn term(&self, id: u64) -> Option<Term> {
-        if let Some(term) = self.cache.borrow().get(&id) {
+        if let Some(term) = self.cache.borrow().get(id) {
             return term.clone();
         }
-        let term = decode(self.snapshot, self.computed, id);
-        let mut cache = self.cache.borrow_mut();
-        if cache.len() < DECODER_CACHE_ENTRIES {
-            cache.insert(id, term.clone());
+        if id != UNDEF && computed_index(id).is_none() {
+            self.decodes.fetch_add(1, AtomicOrdering::Relaxed);
         }
+        let term = decode(self.snapshot, self.computed, id);
+        self.cache.borrow_mut().keep(id, &term);
         term
     }
 }
@@ -4312,7 +6928,7 @@ impl FilterMask<'_> {
                             .column(v)
                             .map_or(UNDEF, |c| table.get(row, c))
                     };
-                    fast.eval(&value, view)
+                    fast.eval(&value, view, self.snapshot)
                 });
                 match decided {
                     Some(fast::Tri::True) => true,
@@ -4331,7 +6947,7 @@ impl FilterMask<'_> {
 
 /// An index nested-loop join of a key-sorted `table` with `scan`: the index is probed once
 /// per distinct key. Holds only thread-safe state, so chunks of rows run in parallel.
-struct Probe<'a> {
+struct Probe<'a, 'b> {
     snapshot: &'a Snapshot,
     model: ReadModel,
     table: &'a IdTable,
@@ -4341,33 +6957,66 @@ struct Probe<'a> {
     shared_positions: &'a [Vec<usize>],
     /// The scan positions of each new variable.
     positions: &'a [Vec<usize>],
+    /// For a merged default graph of listed graphs, the graphs ([`Context::merge_set`]):
+    /// the index's matches in other graphs are skipped.
+    graphs: Option<&'a crate::dataset::GraphSet>,
+    /// The query's budget: each chunk's output and scratch are charged to it before they
+    /// grow.
+    budget: &'b Budget,
     width: usize,
     /// Output rows allowed in total (the query's memory budget), and produced so far.
     max_rows: usize,
     produced: AtomicUsize,
+    /// The index seeks of all chunks.
+    seeks: std::sync::Mutex<nrese_engine::SeekStats>,
 }
 
 /// Why an index nested-loop join stopped early.
 enum ProbeStop {
     Cancelled,
     TooManyRows,
+    Memory(BudgetExceeded),
 }
 
-impl Probe<'_> {
-    /// The joined rows for `table` rows `rows`, in order.
+impl<'b> Probe<'_, 'b> {
+    /// The joined rows for `table` rows `rows`, in order. One probe cursor reads the index
+    /// for all of them: the keys ascend in its order (`probe_join`), so each probe seeks
+    /// forward from the last instead of searching every run from the root. The matches
+    /// of a key are kept flat, `positions.len()` values each: nothing is allocated per
+    /// match. The rows come with their charge.
     fn rows(
         &self,
         rows: Range<usize>,
         cancelled: &(dyn Fn() -> bool + Sync),
-    ) -> Result<IdTable, ProbeStop> {
+    ) -> Result<(IdTable, Reservation<&'b Budget>), ProbeStop> {
         let table = self.table;
         let width = table.width();
+        let stride = self.positions.len();
+        // The reservation before the table: locals drop in reverse, the table first.
+        let mut held = Reservation::new(self.budget);
         let mut out = IdTable::new(self.width);
-        let mut matches: Vec<Vec<u64>> = Vec::new();
+        let mut cursor = self.snapshot.probe_cursor(self.model);
+        // The new variables' values of each match of the current key, and their number
+        // (a pattern binding nothing new matches without values).
+        let mut matches = ChargedVec::new(self.budget);
+        let mut refused = None;
+        let mut found = 0usize;
+        // A key's distinct records of several values in a merged default graph
+        // ([`distinct`]): scratch kept from key to key, charged only when it grows.
+        let mut scratch = (self.scan.merged() && stride > 1)
+            .then(|| (ChargedVec::new(self.budget), ChargedVec::new(self.budget)));
+        // The rows `out` has room for: below it, a key's matches need no charge. A row a
+        // key to start with.
+        reserve_rows(&mut out, &mut held, rows.len(), usize::MAX).map_err(ProbeStop::Memory)?;
+        let mut room = rows.len();
         let mut row = vec![0u64; self.width];
         let mut bound = self.scan.clone();
         let first = rows.start;
         let mut counted = 0;
+        let finish = |cursor: &nrese_engine::ProbeCursor<'_>| {
+            let mut seeks = self.seeks.lock().unwrap_or_else(|e| e.into_inner());
+            seeks.add(cursor.stats());
+        };
         for r in rows {
             if (r - first).is_multiple_of(4096) {
                 if cancelled() {
@@ -4383,39 +7032,52 @@ impl Probe<'_> {
                     .all(|&k| table.get(r, k) == table.get(r - 1, k));
             if !same_key {
                 matches.clear();
+                found = 0;
                 for (slots, &k) in self.shared_positions.iter().zip(self.key_columns) {
                     let id = TermId::from_raw(table.get(r, k));
                     for &i in slots {
                         bound.slots[i] = Slot::Const(id);
                     }
                 }
-                'quads: for quad in self
-                    .snapshot
-                    .quads_for_pattern_in(self.model, &bound.quad_pattern())
-                {
+                cursor.for_each(&bound.quad_pattern(), |quad| {
+                    if refused.is_some()
+                        || self
+                            .graphs
+                            .is_some_and(|graphs| !graphs.contains(&quad.graph))
+                    {
+                        return;
+                    }
                     let components = quad.components();
-                    let mut values = Vec::with_capacity(self.positions.len());
+                    let start = matches.len();
                     for places in self.positions {
                         let value = components[places[0]];
                         if places[1..].iter().any(|&p| components[p] != value) {
-                            continue 'quads;
+                            matches.truncate(start);
+                            return;
                         }
-                        values.push(value);
+                        if let Err(exceeded) = matches.push(value) {
+                            refused = Some(exceeded);
+                            return;
+                        }
                     }
-                    matches.push(values);
+                    found += 1;
+                });
+                if let Some(exceeded) = refused.take() {
+                    return Err(ProbeStop::Memory(exceeded));
                 }
-                if self.scan.merged() {
-                    // A statement in several graphs matched once per graph; its values
-                    // are the same each time.
-                    matches.sort_unstable();
-                    matches.dedup();
+                if self.scan.merged() && found > 1 {
+                    found = distinct(&mut matches, scratch.as_mut(), stride)
+                        .map_err(ProbeStop::Memory)?;
                 }
             }
-            for values in &matches {
+            if out.len() + found > room {
+                room = grown_room(&mut out, &mut held, found).map_err(ProbeStop::Memory)?;
+            }
+            for m in 0..found {
                 for (c, slot) in row.iter_mut().enumerate().take(width) {
                     *slot = table.get(r, c);
                 }
-                row[width..].copy_from_slice(values);
+                row[width..].copy_from_slice(&matches[m * stride..(m + 1) * stride]);
                 out.push_row(&row);
             }
             // One key can match a whole index range: check within large fan-outs too.
@@ -4424,8 +7086,26 @@ impl Probe<'_> {
                 counted = out.len();
             }
         }
+        finish(&cursor);
         self.grow(out.len() - counted)?;
-        Ok(out)
+        Ok((out, held))
+    }
+
+    /// The chunks' rows as one table, charged before they are copied; each chunk's charge
+    /// goes with it.
+    fn concat(
+        &self,
+        parts: Vec<(IdTable, Reservation<&'b Budget>)>,
+    ) -> Result<(IdTable, Reservation<&'b Budget>), ProbeStop> {
+        let rows: usize = parts.iter().map(|(part, _)| part.len()).sum();
+        let mut held = Reservation::new(self.budget);
+        held.charge(rows.saturating_mul(8 * self.width))
+            .map_err(ProbeStop::Memory)?;
+        let (parts, charges): (Vec<IdTable>, Vec<_>) = parts.into_iter().unzip();
+        let out = IdTable::concat(self.width, parts);
+        drop(charges);
+        held.resize(out.memory_bytes()).map_err(ProbeStop::Memory)?;
+        Ok((out, held))
     }
 
     fn grow(&self, rows: usize) -> Result<(), ProbeStop> {
@@ -4437,616 +7117,57 @@ impl Probe<'_> {
     }
 }
 
-/// An aggregate's value: a stored or computed id, or a new term the query interns.
-enum Agg {
-    Id(u64),
-    Term(Term),
+/// The graphs [`bind_graph`] binds: one for every row, or each row's own.
+enum RowGraphs {
+    One(u64),
+    Each(Vec<u64>),
 }
 
-/// Computes aggregates over groups of rows. Thread-safe given a thread-safe `term`, so
-/// groups can be aggregated in parallel; the caller interns the results.
-struct Aggregator<'a> {
-    evaluator: &'a Evaluator,
-    term: &'a dyn Fn(u64) -> Option<Term>,
-    /// The value of an expression over one variable, per (expression, id): groups share
-    /// most of their values, and `STR(?x)` of an id is the same in each of them.
-    memo: RefCell<HashMap<(usize, u64), Option<Term>>>,
-    /// The same for SUM and AVG: the value as a number ([`Aggregator::numeric_total`]).
-    numbers: RefCell<HashMap<(usize, u64), Number>>,
+impl RowGraphs {
+    fn of(&self, row: usize) -> u64 {
+        match self {
+            Self::One(graph) => *graph,
+            Self::Each(graphs) => graphs[row],
+        }
+    }
 }
 
-/// An expression's value for SUM and AVG.
-#[derive(Clone, Copy)]
-enum Number {
-    Value(Numeric),
-    /// An error: SUM and AVG are unbound.
-    Error,
-    /// Not a number (a duration, or no sum): the general path decides.
-    Other,
-}
-
-impl Aggregator<'_> {
-    /// SUM (or AVG with `average`) of `expr`, an expression of one variable, over `rows`:
-    /// each id's number found once, then added up without a term per row. `None` where the
-    /// general path must decide (a value that isn't a number, a value drawn per row). BSBM
-    /// BI q4 averaged `xsd:float(xsd:string(?price))` over 154 M rows.
-    fn numeric_total(
-        &self,
-        solutions: &Solutions,
-        rows: &[usize],
-        expr: &Expression,
-        average: bool,
-    ) -> Option<Agg> {
-        if pushdown::per_solution(expr) {
-            return None;
-        }
-        let mut columns: Vec<usize> = expression_variables(expr)
-            .iter()
-            .filter_map(|v| solutions.column(v))
-            .collect();
-        columns.sort_unstable();
-        columns.dedup();
-        let [column] = columns[..] else {
-            return None;
-        };
-        let key = expr as *const Expression as usize;
-        let table = &solutions.table;
-        let mut numbers = self.numbers.borrow_mut();
-        let mut total = Some(Numeric::Integer(Integer::from(0)));
-        let mut error = false;
-        for &row in rows {
-            let number =
-                *numbers
-                    .entry((key, table.get(row, column)))
-                    .or_insert_with(|| {
-                        match self.evaluator.eval(expr, &self.binding(solutions, row)) {
-                            None => Number::Error,
-                            Some(term) => match Numeric::of(&term) {
-                                Some(number) => Number::Value(number),
-                                None => Number::Other,
-                            },
-                        }
-                    });
-            match number {
-                Number::Value(number) => total = total.and_then(|total| total.add(number)),
-                Number::Error => error = true,
-                Number::Other => return None,
-            }
-        }
-        Some(finish_total(total, error, rows.len() as u64, average))
+/// `solutions`, a pattern's rows in named graphs, joined with `variable` bound to each row's
+/// graph, as SPARQL 1.1 §18.6 evaluates `GRAPH ?g { P }`: where the pattern binds `variable`
+/// itself, only the rows whose value is their graph (or unbound) stay, the graph written
+/// into its column in place (the column keeps its capacity, so what was charged for it is
+/// what [`Context::consumed`] releases); else the graphs become `variable`'s column. One
+/// rule for every evaluation of a graph variable: graph by graph ([`Context::graph`]) and a
+/// search's rows across graphs ([`search`]).
+fn bind_graph(mut solutions: Solutions, variable: &Variable, graphs: RowGraphs) -> Solutions {
+    let rows = solutions.table.len();
+    if let RowGraphs::Each(each) = &graphs {
+        debug_assert_eq!(each.len(), rows);
     }
-
-    fn binding<'s>(
-        &'s self,
-        solutions: &'s Solutions,
-        row: usize,
-    ) -> impl Fn(&Variable) -> Option<Term> + 's {
-        move |variable| (self.term)(solutions.table.get(row, solutions.column(variable)?))
-    }
-
-    /// An aggregate over one variable's ids without decoding terms, where that is exact:
-    /// COUNT always, and SUM/AVG/MIN/MAX when every value is an inline integer (whose id
-    /// order is value order). `None` means "evaluate on terms". Errors as in §18.5.1: an
-    /// unbound value makes SUM/AVG/MIN/MAX unbound, and an i64 overflow makes SUM/AVG
-    /// unbound.
-    fn aggregate_ids(
-        &self,
-        name: &AggregateFunction,
-        mut ids: Vec<u64>,
-        distinct: bool,
-    ) -> Option<Agg> {
-        let dedup = |ids: &mut Vec<u64>| {
-            let mut seen = std::collections::HashSet::with_capacity(ids.len());
-            ids.retain(|id| seen.insert(*id));
-        };
-        match name {
-            AggregateFunction::Count => {
-                ids.retain(|&id| id != UNDEF);
-                if distinct {
-                    dedup(&mut ids);
-                }
-                Some(Agg::Term(integer(ids.len() as u64)))
-            }
-            AggregateFunction::Sum
-            | AggregateFunction::Avg
-            | AggregateFunction::Min
-            | AggregateFunction::Max => {
-                if ids.contains(&UNDEF) {
-                    return Some(Agg::Id(UNDEF));
-                }
-                let values: Option<Vec<i64>> = ids
-                    .iter()
-                    .map(|&id| TermId::from_raw(id).as_inline_integer())
-                    .collect();
-                let values = values?;
-                if distinct {
-                    dedup(&mut ids);
-                }
-                let values: Vec<i64> = if distinct {
-                    ids.iter()
-                        .filter_map(|&id| TermId::from_raw(id).as_inline_integer())
-                        .collect()
-                } else {
-                    values
-                };
-                // By value: xsd:integer and derived ids are of different kinds.
-                let value = |id: &u64| TermId::from_raw(*id).as_inline_integer();
-                Some(match name {
-                    AggregateFunction::Min => {
-                        Agg::Id(ids.iter().copied().min_by_key(value).unwrap_or(UNDEF))
-                    }
-                    AggregateFunction::Max => {
-                        Agg::Id(ids.iter().copied().max_by_key(value).unwrap_or(UNDEF))
-                    }
-                    _ => {
-                        let Some(sum) = values.iter().try_fold(0i64, |acc, &v| acc.checked_add(v))
-                        else {
-                            return Some(Agg::Id(UNDEF));
-                        };
-                        if *name == AggregateFunction::Sum {
-                            Agg::Term(
-                                Literal::new_typed_literal(sum.to_string(), xsd::INTEGER).into(),
-                            )
-                        } else if values.is_empty() {
-                            Agg::Term(integer(0))
-                        } else {
-                            match Decimal::from(sum).checked_div(Decimal::from(values.len() as i64))
-                            {
-                                Some(avg) => Agg::Term(
-                                    Literal::new_typed_literal(avg.to_string(), xsd::DECIMAL)
-                                        .into(),
-                                ),
-                                None => Agg::Id(UNDEF),
-                            }
-                        }
-                    }
-                })
-            }
-            _ => None,
-        }
-    }
-
-    /// The expression's value for each of `rows`. With `distinct`, only for the first row
-    /// of each combination of the expression's variables: the repeats can't add a value.
-    fn evaluated(
-        &self,
-        solutions: &Solutions,
-        rows: &[usize],
-        expr: &Expression,
-        distinct: bool,
-    ) -> Vec<Option<Term>> {
-        let mut columns: Vec<usize> = expression_variables(expr)
-            .iter()
-            .filter_map(|v| solutions.column(v))
-            .collect();
-        columns.sort_unstable();
-        columns.dedup();
-        let table = &solutions.table;
-        let eval = |row: usize| self.evaluator.eval(expr, &self.binding(solutions, row));
-        // A value drawn per row (RAND, BNODE, ...) is drawn for every row.
-        if pushdown::per_solution(expr) {
-            return rows.iter().map(|&row| eval(row)).collect();
-        }
-        if let [column] = columns[..] {
-            // One variable: its ids stand for the rows, and the values are remembered
-            // across groups.
-            let key = expr as *const Expression as usize;
-            let mut seen = HashSet::new();
-            let mut memo = self.memo.borrow_mut();
-            return rows
+    let mut columns = std::mem::take(&mut solutions.table).into_columns();
+    match solutions.column(variable) {
+        Some(column) => {
+            let mask: Vec<bool> = columns[column]
                 .iter()
-                .filter(|&&row| !distinct || seen.insert(table.get(row, column)))
-                .map(|&row| {
-                    memo.entry((key, table.get(row, column)))
-                        .or_insert_with(|| eval(row))
-                        .clone()
-                })
+                .enumerate()
+                .map(|(row, &id)| id == graphs.of(row) || id == UNDEF)
                 .collect();
-        }
-        if !distinct || columns.is_empty() {
-            return rows.iter().map(|&row| eval(row)).collect();
-        }
-        let mut seen: HashSet<Vec<u64>> = HashSet::new();
-        rows.iter()
-            .filter(|&&row| seen.insert(columns.iter().map(|&c| table.get(row, c)).collect()))
-            .map(|&row| eval(row))
-            .collect()
-    }
-
-    fn aggregate(
-        &self,
-        solutions: &Solutions,
-        rows: &[usize],
-        aggregate: &AggregateExpression,
-    ) -> Agg {
-        match aggregate {
-            AggregateExpression::CountSolutions { distinct } => {
-                let count = if *distinct {
-                    let mut seen: Vec<Vec<u64>> =
-                        rows.iter().map(|&r| solutions.table.row(r)).collect();
-                    seen.sort_unstable();
-                    seen.dedup();
-                    seen.len()
-                } else {
-                    rows.len()
-                };
-                Agg::Term(integer(count as u64))
+            for (row, value) in columns[column].iter_mut().enumerate() {
+                *value = graphs.of(row);
             }
-            AggregateExpression::FunctionCall {
-                name,
-                expr,
-                distinct,
-            } => {
-                if let Expression::Variable(variable) = expr {
-                    let ids: Vec<u64> = match solutions.column(variable) {
-                        Some(column) => rows
-                            .iter()
-                            .map(|&r| solutions.table.get(r, column))
-                            .collect(),
-                        None => vec![UNDEF; rows.len()],
-                    };
-                    if let Some(result) = self.aggregate_ids(name, ids, *distinct) {
-                        return result;
-                    }
-                }
-                if !*distinct
-                    && matches!(name, AggregateFunction::Sum | AggregateFunction::Avg)
-                    && let Some(result) =
-                        self.numeric_total(solutions, rows, expr, *name == AggregateFunction::Avg)
-                {
-                    return result;
-                }
-                let evaluated = self.evaluated(solutions, rows, expr, *distinct);
-                // COUNT skips errors and SAMPLE takes the first value, but one error makes
-                // SUM, AVG, MIN and MAX unbound.
-                let fails_on_error =
-                    !matches!(name, AggregateFunction::Count | AggregateFunction::Sample);
-                if fails_on_error && evaluated.iter().any(Option::is_none) {
-                    return Agg::Id(UNDEF);
-                }
-                let mut values: Vec<Term> = evaluated.into_iter().flatten().collect();
-                if *distinct {
-                    // The first of each, in order.
-                    let mut seen: HashSet<&Term> = HashSet::with_capacity(values.len());
-                    let first: Vec<bool> = values.iter().map(|value| seen.insert(value)).collect();
-                    let mut first = first.into_iter();
-                    values.retain(|_| first.next().unwrap_or(false));
-                }
-                let result = match name {
-                    AggregateFunction::Count => Some(integer(values.len() as u64)),
-                    AggregateFunction::Sample => values.into_iter().next(),
-                    // The first of equal extremes.
-                    AggregateFunction::Min => values.into_iter().reduce(|best, v| {
-                        if value::order(Some(&v), Some(&best)).is_lt() {
-                            v
-                        } else {
-                            best
-                        }
-                    }),
-                    AggregateFunction::Max => values.into_iter().reduce(|best, v| {
-                        if value::order(Some(&v), Some(&best)).is_gt() {
-                            v
-                        } else {
-                            best
-                        }
-                    }),
-                    AggregateFunction::Sum => sum(&values),
-                    AggregateFunction::Avg => average(&values),
-                    AggregateFunction::GroupConcat { separator } => {
-                        group_concat(&values, separator.as_deref().unwrap_or(" "))
-                    }
-                    _ => None,
-                };
-                result.map_or(Agg::Id(UNDEF), Agg::Term)
-            }
+            solutions.table = IdTable::from_columns(columns);
+            solutions.table.retain_mask(&mask);
+        }
+        None => {
+            columns.push(match graphs {
+                RowGraphs::One(graph) => vec![graph; rows],
+                RowGraphs::Each(graphs) => graphs,
+            });
+            solutions.vars.push(variable.clone());
+            solutions.table = IdTable::from_columns(columns);
         }
     }
-}
-
-/// SUM (or AVG with `average`) of `count` values adding up to `total`, as `sum` and
-/// `average` give it: unbound after an error or an overflow, AVG of none 0, of integers
-/// and decimals a decimal.
-fn finish_total(total: Option<Numeric>, error: bool, count: u64, average: bool) -> Agg {
-    let Some(total) = total.filter(|_| !error) else {
-        return Agg::Id(UNDEF);
-    };
-    if !average {
-        return Agg::Term(total.term());
-    }
-    if count == 0 {
-        return Agg::Term(integer(0));
-    }
-    let mean = match total {
-        Numeric::Integer(_) | Numeric::Decimal(_) => total
-            .decimal()
-            .and_then(|sum| sum.checked_div(Decimal::from(count as i64)))
-            .map(|mean| Numeric::Decimal(mean).term()),
-        Numeric::Float(f) => Some(Numeric::Float(f / Float::from(count as f32)).term()),
-        Numeric::Double(d) => Some(Numeric::Double(d / Double::from(count as f64)).term()),
-    };
-    mean.map_or(Agg::Id(UNDEF), Agg::Term)
-}
-
-fn counts_rows(aggregate: &AggregateExpression, scan: &ScanPattern) -> bool {
-    match aggregate {
-        AggregateExpression::CountSolutions { distinct: false } => true,
-        AggregateExpression::FunctionCall {
-            name: AggregateFunction::Count,
-            expr: Expression::Variable(v),
-            distinct: false,
-        } => scan.vars().contains(v),
-        _ => false,
-    }
-}
-
-fn integer(value: u64) -> Term {
-    Literal::new_typed_literal(value.to_string(), xsd::INTEGER).into()
-}
-
-/// An `xsd:integer` result as an inline id where it fits, else as a term.
-fn integer_agg(value: i64) -> Agg {
-    match TermId::inline_integer(value) {
-        Some(id) => Agg::Id(id.raw()),
-        None => Agg::Term(Literal::new_typed_literal(value.to_string(), xsd::INTEGER).into()),
-    }
-}
-
-/// What one pass keeps of a group's values for one aggregate.
-#[derive(Clone, Copy, Default)]
-struct Running {
-    /// Bound values.
-    count: u64,
-    sum: i64,
-    overflow: bool,
-    unbound: bool,
-    /// The smallest and largest value, with its id.
-    min: Option<(i64, u64)>,
-    max: Option<(i64, u64)>,
-}
-
-impl Running {
-    fn add(&mut self, id: u64) {
-        if id == UNDEF {
-            self.unbound = true;
-            return;
-        }
-        self.count += 1;
-        let Some(value) = TermId::from_raw(id).as_inline_integer() else {
-            return;
-        };
-        match self.sum.checked_add(value) {
-            Some(sum) => self.sum = sum,
-            None => self.overflow = true,
-        }
-        if self.min.is_none_or(|(m, _)| value < m) {
-            self.min = Some((value, id));
-        }
-        if self.max.is_none_or(|(m, _)| value > m) {
-            self.max = Some((value, id));
-        }
-    }
-}
-
-/// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,
-/// or `COUNT`, `SUM`, `AVG`, `MIN` or `MAX` (without DISTINCT) of a variable holding only
-/// inline integers (`COUNT`: any terms): the results [`Aggregator::aggregate_ids`] gives,
-/// without a list of rows per group. `None` for other aggregates. DBpedia q12 summed 1 M
-/// goals into 35 k teams.
-fn aggregate_in_one_pass(
-    solutions: &Solutions,
-    group_of: &[u32],
-    groups: usize,
-    aggregates: &[(Variable, AggregateExpression)],
-) -> Option<Vec<Vec<Agg>>> {
-    // Per aggregate: the column it reads (`None`: the rows) and its function.
-    let mut plan: Vec<(Option<usize>, AggregateFunction)> = Vec::new();
-    for (_, aggregate) in aggregates {
-        match aggregate {
-            AggregateExpression::CountSolutions { distinct: false } => {
-                plan.push((None, AggregateFunction::Count));
-            }
-            AggregateExpression::FunctionCall {
-                name,
-                expr: Expression::Variable(variable),
-                distinct: false,
-            } => {
-                let numeric = matches!(
-                    name,
-                    AggregateFunction::Sum
-                        | AggregateFunction::Avg
-                        | AggregateFunction::Min
-                        | AggregateFunction::Max
-                );
-                if !numeric && *name != AggregateFunction::Count {
-                    return None;
-                }
-                let column = solutions.column(variable)?;
-                if numeric
-                    && !solutions.table.column(column).iter().all(|&id| {
-                        id == UNDEF || TermId::from_raw(id).as_inline_integer().is_some()
-                    })
-                {
-                    return None;
-                }
-                plan.push((Some(column), name.clone()));
-            }
-            _ => return None,
-        }
-    }
-    let mut running = vec![Running::default(); groups * plan.len()];
-    let mut rows = vec![0u64; groups];
-    for (row, &group) in group_of.iter().enumerate() {
-        let group = group as usize;
-        rows[group] += 1;
-        for (a, (column, _)) in plan.iter().enumerate() {
-            if let Some(column) = column {
-                running[group * plan.len() + a].add(solutions.table.get(row, *column));
-            }
-        }
-    }
-    Some(
-        (0..groups)
-            .map(|group| {
-                plan.iter()
-                    .enumerate()
-                    .map(|(a, (column, name))| {
-                        let r = running[group * plan.len() + a];
-                        if column.is_none() {
-                            return integer_agg(rows[group] as i64);
-                        }
-                        match name {
-                            AggregateFunction::Count => integer_agg(r.count as i64),
-                            _ if r.unbound => Agg::Id(UNDEF),
-                            AggregateFunction::Min => Agg::Id(r.min.map_or(UNDEF, |m| m.1)),
-                            AggregateFunction::Max => Agg::Id(r.max.map_or(UNDEF, |m| m.1)),
-                            _ if r.overflow => Agg::Id(UNDEF),
-                            AggregateFunction::Sum => integer_agg(r.sum),
-                            _ if r.count == 0 => Agg::Term(integer(0)),
-                            _ => match Decimal::from(r.sum)
-                                .checked_div(Decimal::from(r.count as i64))
-                            {
-                                Some(avg) => Agg::Term(
-                                    Literal::new_typed_literal(avg.to_string(), xsd::DECIMAL)
-                                        .into(),
-                                ),
-                                None => Agg::Id(UNDEF),
-                            },
-                        }
-                    })
-                    .collect()
-            })
-            .collect(),
-    )
-}
-
-/// A running numeric sum with SPARQL type promotion; `None` once a non-number appears.
-#[derive(Clone, Copy)]
-enum Numeric {
-    Integer(Integer),
-    Decimal(Decimal),
-    Float(Float),
-    Double(Double),
-}
-
-impl Numeric {
-    fn of(term: &Term) -> Option<Self> {
-        Some(match Value::of(term) {
-            Value::Integer(i) => Self::Integer(i),
-            Value::Decimal(d) => Self::Decimal(d),
-            Value::Float(f) => Self::Float(f),
-            Value::Double(d) => Self::Double(d),
-            _ => return None,
-        })
-    }
-
-    fn add(self, other: Self) -> Option<Self> {
-        use Numeric::{Decimal as D, Double as Db, Float as F, Integer as I};
-        Some(match (self, other) {
-            (I(a), I(b)) => I(a.checked_add(b)?),
-            (I(_) | D(_), I(_) | D(_)) => D(self.decimal()?.checked_add(other.decimal()?)?),
-            (I(_) | D(_) | F(_), I(_) | D(_) | F(_)) => F(self.float()? + other.float()?),
-            _ => Db(self.double() + other.double()),
-        })
-    }
-
-    fn decimal(self) -> Option<Decimal> {
-        match self {
-            Self::Integer(i) => Some(Decimal::from(i)),
-            Self::Decimal(d) => Some(d),
-            _ => None,
-        }
-    }
-
-    fn float(self) -> Option<Float> {
-        match self {
-            Self::Integer(i) => Some(Float::from(i)),
-            Self::Decimal(d) => Some(Float::from(d)),
-            Self::Float(f) => Some(f),
-            Self::Double(_) => None,
-        }
-    }
-
-    fn double(self) -> Double {
-        match self {
-            Self::Integer(i) => Double::from(i),
-            Self::Decimal(d) => Double::from(d),
-            Self::Float(f) => Double::from(f),
-            Self::Double(d) => d,
-        }
-    }
-
-    fn term(self) -> Term {
-        let (lexical, datatype) = match self {
-            Self::Integer(i) => (i.to_string(), xsd::INTEGER),
-            Self::Decimal(d) => (d.to_string(), xsd::DECIMAL),
-            Self::Float(f) => (f.to_string(), xsd::FLOAT),
-            Self::Double(d) => (d.to_string(), xsd::DOUBLE),
-        };
-        Literal::new_typed_literal(lexical, datatype).into()
-    }
-}
-
-/// GROUP_CONCAT (SPARQL 1.1 §18.5.1.7): string literals only (anything else makes the
-/// result unbound), joined in row order with the separator, as CONCAT of the values: a
-/// simple literal whatever language the values share.
-pub fn group_concat(values: &[Term], separator: &str) -> Option<Term> {
-    let mut concat = String::new();
-    for (i, value) in values.iter().enumerate() {
-        let Term::Literal(literal) = value else {
-            return None;
-        };
-        if literal.language().is_none() && literal.datatype() != xsd::STRING {
-            return None;
-        }
-        if i > 0 {
-            concat.push_str(separator);
-        }
-        concat.push_str(literal.value());
-    }
-    Some(Literal::new_simple_literal(concat).into())
-}
-
-pub fn sum(values: &[Term]) -> Option<Term> {
-    if let Some(durations) = durations(values) {
-        return calendar::sum(&durations);
-    }
-    let mut total = Numeric::Integer(Integer::from(0));
-    for value in values {
-        total = total.add(Numeric::of(value)?)?;
-    }
-    Some(total.term())
-}
-
-pub fn average(values: &[Term]) -> Option<Term> {
-    if values.is_empty() {
-        return Some(integer(0));
-    }
-    if let Some(durations) = durations(values) {
-        return calendar::average(&durations);
-    }
-    let mut total = Numeric::Integer(Integer::from(0));
-    for value in values {
-        total = total.add(Numeric::of(value)?)?;
-    }
-    let count = values.len() as i64;
-    Some(match total {
-        // SPARQL: the average of integers or decimals is a decimal.
-        Numeric::Integer(_) | Numeric::Decimal(_) => {
-            Numeric::Decimal(total.decimal()?.checked_div(Decimal::from(count))?).term()
-        }
-        Numeric::Float(f) => Numeric::Float(f / Float::from(count as f32)).term(),
-        Numeric::Double(d) => Numeric::Double(d / Double::from(count as f64)).term(),
-    })
-}
-
-/// The values, if the first is a year-month or day-time duration (`SUM` and `AVG` of
-/// durations, SEP-0002); `None` for numbers.
-fn durations(values: &[Term]) -> Option<Vec<Value>> {
-    let first = value::Value::of(values.first()?);
-    if !calendar::is_summable_duration(&first) {
-        return None;
-    }
-    Some(values.iter().map(value::Value::of).collect())
+    solutions
 }
 
 /// Columns of the variables `left` and `right` share, pairwise.
@@ -5072,6 +7193,61 @@ fn joined_vars(left: &Solutions, right: &Solutions, right_keys: &[usize]) -> Vec
 }
 
 /// `solutions` without its last `count` columns.
+/// What a computed term holds once [`Context::id`] keeps it: a copy in the list and one as
+/// the map's key (their strings, [`crate::cache::term_heap`]), with each container's room
+/// for it counted at its most, twice the slot (a vector doubles; a map doubles at
+/// seven-eighths full, with a control byte and the id per entry).
+fn computed_bytes(term: &Term) -> usize {
+    let slot = std::mem::size_of::<Term>();
+    let entry = slot + std::mem::size_of::<u64>() + 1;
+    let heap = crate::cache::term_heap(term);
+    (2 * slot)
+        .saturating_add(2 * entry * 8 / 7 + 2)
+        .saturating_add(heap.saturating_mul(2))
+}
+
+/// Both alias maps and the one possible canonical child's name-map copy (late.rs);
+/// that child has late expansion disabled and lives within this query. Four slots per
+/// entry and two control words per slot cover growth and the first allocation.
+/// Size without formatting.
+fn alias_bytes(alias: &str, term: &Term) -> usize {
+    fn heap(term: &Term) -> usize {
+        match term {
+            Term::NamedNode(n) => n.as_str().len(),
+            Term::BlankNode(b) => b.as_str().len(),
+            Term::Literal(l) => {
+                l.value().len() + l.datatype().as_str().len() + l.language().map_or(0, str::len)
+            }
+            Term::Triple(t) => {
+                let subject = match &t.subject {
+                    nrese_rdf::NamedOrBlankNode::NamedNode(n) => n.as_str().len(),
+                    nrese_rdf::NamedOrBlankNode::BlankNode(b) => b.as_str().len(),
+                };
+                std::mem::size_of::<nrese_rdf::Triple>()
+                    + subject
+                    + t.predicate.as_str().len()
+                    + heap(&t.object)
+            }
+        }
+    }
+    let slots = 2 * std::mem::size_of::<(String, u64)>()
+        + std::mem::size_of::<(String, Term)>()
+        + 6 * std::mem::size_of::<usize>();
+    alias
+        .len()
+        .saturating_mul(3)
+        .saturating_add(slots * 4)
+        .saturating_add(heap(term))
+}
+
+/// What a number [`Context::numeric_pass`] remembers holds in its map: the id and the
+/// number, a control byte, the map's room for it counted at its most (it doubles at
+/// seven-eighths full).
+fn number_bytes() -> usize {
+    let entry = std::mem::size_of::<(u64, Number)>() + 1;
+    2 * entry * 8 / 7 + 2
+}
+
 fn drop_last_columns(mut solutions: Solutions, count: usize) -> Solutions {
     if count == 0 {
         return solutions;
@@ -5086,6 +7262,128 @@ fn drop_last_columns(mut solutions: Solutions, count: usize) -> Solutions {
         IdTable::from_columns(columns)
     };
     solutions
+}
+
+/// The distinct values two sorted lists have in common: one merge.
+fn sorted_overlap(a: &[u64], b: &[u64]) -> u64 {
+    let (mut i, mut j, mut both) = (0, 0, 0);
+    while i < a.len() && j < b.len() {
+        match a[i].cmp(&b[j]) {
+            std::cmp::Ordering::Less => i += 1,
+            std::cmp::Ordering::Greater => j += 1,
+            std::cmp::Ordering::Equal => {
+                let value = a[i];
+                both += 1;
+                while i < a.len() && a[i] == value {
+                    i += 1;
+                }
+                while j < b.len() && b[j] == value {
+                    j += 1;
+                }
+            }
+        }
+    }
+    both
+}
+
+/// The distinct matches of a key in a merged default graph, records of `stride` values
+/// each, left in `matches`, and their number: a statement in several graphs matched once
+/// per graph, its values the same each time. One value a record is sorted in place; longer
+/// records through `scratch` (an order and the distinct records), the caller's, kept from
+/// key to key: it grows (charged first) only past the largest key.
+#[allow(clippy::type_complexity)]
+fn distinct<B: std::ops::Deref<Target = Budget>>(
+    matches: &mut ChargedVec<u64, B>,
+    scratch: Option<&mut (ChargedVec<usize, B>, ChargedVec<u64, B>)>,
+    stride: usize,
+) -> Result<usize, BudgetExceeded> {
+    match (stride, scratch) {
+        (0, _) => Ok(1),
+        (1, _) => {
+            matches.sort_unstable();
+            let mut kept = 0;
+            for i in 0..matches.len() {
+                if kept == 0 || matches[i] != matches[kept - 1] {
+                    matches[kept] = matches[i];
+                    kept += 1;
+                }
+            }
+            matches.truncate(kept);
+            Ok(kept)
+        }
+        (_, Some((order, unique))) => {
+            let found = matches.len() / stride;
+            order.clear();
+            order.extend_bounded(found, 0..found)?;
+            let record = |i: usize| &matches[i * stride..(i + 1) * stride];
+            order.sort_unstable_by(|&a, &b| record(a).cmp(record(b)));
+            unique.clear();
+            unique.reserve(found * stride)?;
+            let mut last = None;
+            for &i in order.iter() {
+                if last.is_none_or(|last| record(last) != record(i)) {
+                    unique.extend_from_slice(record(i))?;
+                    last = Some(i);
+                }
+            }
+            std::mem::swap(matches, unique);
+            Ok(matches.len() / stride)
+        }
+        (_, None) => unreachable!("scratch for records of several values"),
+    }
+}
+
+/// The most a sort of `table` ([`IdTable::sort_by`]) holds beside it, per row: (value, row)
+/// pairs, then the rows' order, and each column gathered anew (all at once in parallel).
+fn sort_scratch_bytes(table: &IdTable) -> usize {
+    table.len().saturating_mul(4 + 16.max(8 * table.width()))
+}
+
+/// Room in `table` for `rows` more rows, charged to `held` (which holds exactly `table`'s
+/// capacity) before the columns grow: the capacity doubles, up to `most` rows, where the
+/// budget has room, else grows by what is asked. The old capacity and the new are both
+/// held while the columns move.
+fn reserve_rows<B: std::ops::Deref<Target = Budget>>(
+    table: &mut IdTable,
+    held: &mut Reservation<B>,
+    rows: usize,
+    most: usize,
+) -> Result<(), BudgetExceeded> {
+    // What room for so many rows counts is the table's to say: without columns, its rows
+    // after the first ([`IdTable::bytes_for_rows`]).
+    let needed = table.len().saturating_add(rows);
+    let room = table.len() + table.spare_rows();
+    if needed <= room {
+        return Ok(());
+    }
+    let doubled = room.saturating_mul(2).min(most).max(needed);
+    let mut grow = |capacity: usize| -> Result<(), BudgetExceeded> {
+        let old = held.bytes();
+        held.charge(table.bytes_for_rows(capacity))?;
+        table.reserve_exact(capacity - table.len());
+        held.release(old);
+        // An allocator may hand out more than asked: held too.
+        let actual = table.memory_bytes();
+        if actual > held.bytes() {
+            held.charge(actual - held.bytes())?;
+        }
+        Ok(())
+    };
+    grow(doubled).or_else(|_| grow(needed))
+}
+
+/// [`reserve_rows`] for `rows` more rows, then the rows `table` has room for: the index
+/// join probe's rare growth, kept out of its loop over rows (PR #84's timing: with it inlined
+/// there, the probe took more cycles at the same instruction count).
+#[cold]
+#[inline(never)]
+fn grown_room<B: std::ops::Deref<Target = Budget>>(
+    table: &mut IdTable,
+    held: &mut Reservation<B>,
+    rows: usize,
+) -> Result<usize, BudgetExceeded> {
+    reserve_rows(table, held, rows, usize::MAX)?;
+    Ok(table.len() + table.spare_rows())
 }
 
 fn has_undef(table: &IdTable, columns: &[usize]) -> bool {
@@ -5107,11 +7405,14 @@ fn placed_in(expr: &Expression, patterns: &[TriplePattern]) -> bool {
     })
 }
 
-/// Sorted, disjoint id ranges for membership tests: single ids of one kind in a bitmap over
-/// their payloads, the few wider ranges (whole kinds) in a list.
+/// Sorted, disjoint id ranges for membership tests: ranges of at most 64 ids of one kind in
+/// a bitmap over their payloads, the wider ones in a sorted list searched by their ends.
+/// A string test's passing terms can merge into thousands of wide runs (3,114 of 737,454
+/// ranges for a broad prefix over input-order ids), so the list is never walked.
 struct IdSet {
     /// Per kind tag: a bitmap over payloads, if the kind has single ids.
     bits: Vec<Vec<u64>>,
+    /// Inclusive raw ranges, increasing and apart.
     wide: Vec<(u64, u64)>,
 }
 
@@ -5135,6 +7436,10 @@ impl IdSet {
                 bits[word] |= 1 << (payload % 64);
             }
         }
+        debug_assert!(
+            set.wide.windows(2).all(|w| w[0].1 < w[1].0),
+            "sorted, disjoint"
+        );
         set
     }
 
@@ -5145,7 +7450,9 @@ impl IdSet {
         let in_bits = self.bits[term.kind() as usize]
             .get((payload / 64) as usize)
             .is_some_and(|word| word & (1 << (payload % 64)) != 0);
-        in_bits || self.wide.iter().any(|&(low, high)| low <= id && id <= high)
+        // The first wide range not ending below `id` is the only one that can hold it.
+        let at = self.wide.partition_point(|&(_, high)| high < id);
+        in_bits || self.wide.get(at).is_some_and(|&(low, _)| low <= id)
     }
 }
 
@@ -5167,9 +7474,7 @@ fn sorted_columns(scan: &ScanPattern, permutation: Permutation, vars: &[Variable
 fn triple_variables(triple: &TriplePattern) -> Vec<Variable> {
     let term = |t: &TermPattern| match t {
         TermPattern::Variable(v) => Some(v.clone()),
-        TermPattern::BlankNode(b) => {
-            Some(Variable::new_unchecked(format!("_bnode_{}", b.as_str())))
-        }
+        TermPattern::BlankNode(b) => Some(internal::blank_variable(b)),
         _ => None,
     };
     let predicate = match &triple.predicate {
@@ -5182,7 +7487,7 @@ fn triple_variables(triple: &TriplePattern) -> Vec<Variable> {
         .collect()
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum Slot {
     Var(Variable),
     Const(TermId),

@@ -1,6 +1,6 @@
 #!/bin/bash
 # The benchmark suite (benches/suite) on a whole node of a SLURM cluster, the systems in
-# Apptainer images, NRESE and the client as processes. Written for Draco (FSU Jena); see
+# Apptainer images, NRESE and the client as processes. Written for a SLURM cluster; see
 # README.md for what has and hasn't been run.
 #
 #   sbatch benches/cluster/suite.sbatch --workloads lubm --tier lubm=100

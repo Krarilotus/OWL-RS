@@ -1,0 +1,2 @@
+PREFIX e: <http://example.org/fast/>
+SELECT ?d FROM e:graph0 FROM e:graph1 WHERE { e:u0 e:follows ?a . ?a e:follows ?b . ?b e:follows ?c . ?c e:follows ?d }

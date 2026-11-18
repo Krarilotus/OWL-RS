@@ -1,8 +1,13 @@
 use axum::Router;
-use axum::routing::{delete, get, post, put};
+use axum::extract::Request;
+use axum::http::HeaderValue;
+use axum::middleware::Next;
+use axum::routing::{MethodRouter, delete, get, post, put};
 
 use crate::http::access_api;
 use crate::http::api_v1;
+use crate::http::cache_api;
+use crate::http::draft_check;
 use crate::http::handlers;
 use crate::http::rdf4j;
 use crate::state::AppState;
@@ -44,8 +49,10 @@ fn repository_routes() -> Router<AppState> {
         )
         .route("/autocomplete", get(handlers::autocomplete))
         .route("/classification", get(handlers::classification_get))
+        .route("/realisation", get(handlers::realisation_get))
         .route("/backup", get(handlers::admin_backup_dataset))
         .route("/restore", post(handlers::admin_restore_dataset))
+        .route("/image", post(handlers::repository_image_backup))
         .route("/namespaces", get(api_v1::namespaces_get))
         .route(
             "/namespaces/{prefix}",
@@ -54,6 +61,14 @@ fn repository_routes() -> Router<AppState> {
         .route("/explain", get(api_v1::explain))
         .route("/queries", get(api_v1::running_queries))
         .route("/queries/{query}", delete(api_v1::cancel_query))
+        .route(
+            "/cache",
+            get(cache_api::cache_get).delete(cache_api::cache_delete),
+        )
+        .route(
+            "/cache/pins/{name}",
+            put(cache_api::pin_put).delete(cache_api::pin_delete),
+        )
         .route("/graphs", get(api_v1::graphs))
         .route("/import", post(api_v1::import))
         .route(
@@ -81,10 +96,38 @@ fn repository_routes() -> Router<AppState> {
         .route("/sessions/{session}/commit", post(api_v1::session_commit))
 }
 
+/// When the routes kept for clients of an earlier release were deprecated (RFC 9745's
+/// form: `@` and the Unix time; 3 October 2026, ADR-0007).
+const DEPRECATED_SINCE: &str = "@1790985600";
+
+/// `route`, kept for clients of an earlier release: its answers say so (`Deprecation`,
+/// RFC 9745) and link to the route that replaces it (`Link` with `rel="successor-version"`:
+/// the request's path with `old` replaced by `new`).
+fn deprecated(
+    route: MethodRouter<AppState>,
+    old: &'static str,
+    new: &'static str,
+) -> MethodRouter<AppState> {
+    route.layer(axum::middleware::from_fn(
+        move |request: Request, next: Next| async move {
+            let successor = request.uri().path().replacen(old, new, 1);
+            let mut response = next.run(request).await;
+            let headers = response.headers_mut();
+            headers.insert("deprecation", HeaderValue::from_static(DEPRECATED_SINCE));
+            if let Ok(link) =
+                HeaderValue::from_str(&format!("<{successor}>; rel=\"successor-version\""))
+            {
+                headers.insert(axum::http::header::LINK, link);
+            }
+            response
+        },
+    ))
+}
+
 /// Every route. The public ones (health, version, the console's files, the API
 /// description, logging in and out, RDF4J's protocol version) answer anyone; every other
-/// request is authenticated first ([`super::authentication`]), before its handler and its
-/// body are read, and its handler checks its action ([`super::guard`]).
+/// request is authenticated first (`super::authentication`), before its handler and its
+/// body are read, and its handler checks its action (`super::guard`).
 pub fn router(state: AppState) -> Router {
     let public = Router::new()
         .route("/", get(handlers::root_redirect))
@@ -98,44 +141,107 @@ pub fn router(state: AppState) -> Router {
         .route("/protocol", get(rdf4j::protocol));
     let authenticated = Router::new()
         .route("/console", get(handlers::console_ui))
-        .route("/api/ai/status", get(handlers::ai_status))
         .route(
-            "/api/ai/query-suggestions",
+            "/api/v1/draft-check/capabilities",
+            get(draft_check::capabilities),
+        )
+        .route("/api/v1/draft-check", post(draft_check::check))
+        // The server: what it offers, how it runs, AI query suggestions.
+        .route("/api/v1/capabilities", get(handlers::operator_capabilities))
+        .route("/api/v1/replication/log", get(crate::replication::log))
+        .route("/api/v1/replication/image", get(crate::replication::image))
+        .route(
+            "/api/v1/replication/status",
+            get(crate::replication::status),
+        )
+        .route("/api/v1/health", get(handlers::operator_extended_health))
+        .route(
+            "/api/v1/diagnostics",
+            get(handlers::operator_runtime_diagnostics),
+        )
+        .route("/api/v1/ai/status", get(handlers::ai_status))
+        .route(
+            "/api/v1/ai/query-suggestions",
             post(handlers::ai_query_suggestions),
         )
         .route("/ops", get(handlers::operator_ui))
         .route("/ui", get(handlers::operator_ui))
+        // The routes of earlier releases, until the next one (ADR-0007).
+        .route(
+            "/api/ai/status",
+            deprecated(get(handlers::ai_status), "/api/ai/", "/api/v1/ai/"),
+        )
+        .route(
+            "/api/ai/query-suggestions",
+            deprecated(
+                post(handlers::ai_query_suggestions),
+                "/api/ai/",
+                "/api/v1/ai/",
+            ),
+        )
         .route(
             "/ops/api/capabilities",
-            get(handlers::operator_capabilities),
+            deprecated(
+                get(handlers::operator_capabilities),
+                "/ops/api/capabilities",
+                "/api/v1/capabilities",
+            ),
         )
         .route(
             "/ops/api/dataset/summary",
-            get(handlers::operator_dataset_summary),
+            deprecated(
+                get(handlers::operator_dataset_summary),
+                "/ops/api/dataset/summary",
+                "/api/v1/repositories/nrese/summary",
+            ),
         )
         .route(
             "/ops/api/health/extended",
-            get(handlers::operator_extended_health),
+            deprecated(
+                get(handlers::operator_extended_health),
+                "/ops/api/health/extended",
+                "/api/v1/health",
+            ),
         )
         .route(
             "/ops/api/diagnostics/runtime",
-            get(handlers::operator_runtime_diagnostics),
+            deprecated(
+                get(handlers::operator_runtime_diagnostics),
+                "/ops/api/diagnostics/runtime",
+                "/api/v1/diagnostics",
+            ),
         )
         .route(
             "/ops/api/diagnostics/reasoning",
-            get(handlers::operator_reasoning_diagnostics),
+            deprecated(
+                get(handlers::operator_reasoning_diagnostics),
+                "/ops/api/diagnostics/reasoning",
+                "/api/v1/repositories/nrese/reasoning",
+            ),
         )
         .route(
             "/ops/api/admin/dataset/backup",
-            get(handlers::admin_backup_dataset),
+            deprecated(
+                get(handlers::admin_backup_dataset),
+                "/ops/api/admin/dataset/backup",
+                "/api/v1/repositories/nrese/backup",
+            ),
         )
         .route(
             "/ops/api/admin/dataset/restore",
-            post(handlers::admin_restore_dataset),
+            deprecated(
+                post(handlers::admin_restore_dataset),
+                "/ops/api/admin/dataset/restore",
+                "/api/v1/repositories/nrese/restore",
+            ),
         )
         .route(
             "/ops/api/admin/dataset/image",
-            post(handlers::admin_image_backup),
+            deprecated(
+                post(handlers::admin_image_backup),
+                "/ops/api/admin/dataset/image",
+                "/api/v1/repositories/nrese/image",
+            ),
         )
         .route("/metrics", get(handlers::metrics))
         .route(
@@ -172,6 +278,7 @@ pub fn router(state: AppState) -> Router {
             get(handlers::shacl_get).post(handlers::shacl_post),
         )
         .route("/dataset/classification", get(handlers::classification_get))
+        .route("/dataset/realisation", get(handlers::realisation_get))
         // The engine API (ADR-0007): every capability for every repository, by the same
         // handlers as the default repository's `/dataset/…` routes.
         .route("/api/v1/repositories", get(api_v1::repositories))
@@ -206,12 +313,31 @@ pub fn router(state: AppState) -> Router {
         .route("/api/v1/access/history", get(access_api::history))
         .route("/api/v1/access/import", post(access_api::import))
         .route("/api/v1/access/export", get(access_api::export))
-        .route("/api/v1/queries", get(access_api::saved_queries))
+        .route("/api/v1/saved-queries", get(access_api::saved_queries))
         .route(
-            "/api/v1/queries/{space}/{name}",
+            "/api/v1/saved-queries/{space}/{name}",
             get(access_api::saved_query)
                 .put(access_api::saved_query_put)
                 .delete(access_api::saved_query_delete),
+        )
+        // Saved queries' earlier path (it read like the running queries').
+        .route(
+            "/api/v1/queries",
+            deprecated(
+                get(access_api::saved_queries),
+                "/api/v1/queries",
+                "/api/v1/saved-queries",
+            ),
+        )
+        .route(
+            "/api/v1/queries/{space}/{name}",
+            deprecated(
+                get(access_api::saved_query)
+                    .put(access_api::saved_query_put)
+                    .delete(access_api::saved_query_delete),
+                "/api/v1/queries",
+                "/api/v1/saved-queries",
+            ),
         )
         .route(
             "/api/v1/repositories/{id}",

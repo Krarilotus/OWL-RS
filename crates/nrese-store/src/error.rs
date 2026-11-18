@@ -8,14 +8,38 @@ use thiserror::Error;
 
 pub type StoreResult<T> = Result<T, StoreError>;
 
+/// Exact answers that can't be proven complete ([`StoreError::Incomplete`]): their status,
+/// and the first candidates neither proved nor refuted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncompleteAnswer {
+    pub status: nrese_sparql::Completeness,
+    /// Unresolved candidates as `?x=<…> ?y=<…>` (`ASK` for a boolean query), at most
+    /// [`crate::dl::UNRESOLVED_SHOWN`]; the status's bounds count them all.
+    pub unresolved: Vec<String>,
+}
+
+impl std::fmt::Display for IncompleteAnswer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reasons: Vec<&str> = self
+            .status
+            .reasons
+            .iter()
+            .map(|r| r.text.as_str())
+            .collect();
+        f.write_str(&reasons.join("; "))
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum StoreError {
     #[error("invalid store configuration: {0}")]
     Configuration(String),
     #[error("i/o error: {0}")]
     Io(#[from] std::io::Error),
+    /// An engine error other than a refusal for memory, which is the request's memory error
+    /// (`From<EngineError>`).
     #[error("storage engine error: {0}")]
-    Engine(#[from] EngineError),
+    Engine(#[source] EngineError),
     #[error("SPARQL syntax error: {0}")]
     SparqlSyntax(#[from] SparqlSyntaxError),
     #[error("SPARQL evaluation error: {0}")]
@@ -29,7 +53,7 @@ pub enum StoreError {
     /// The shapes graph is ill-formed; one message per problem.
     #[error("ill-formed SHACL shapes: {}", .0.join("; "))]
     ShaclShapes(Vec<String>),
-    #[error("RDF parse error in {}: {source}", path.display())]
+    #[error("RDF parse error in {}: {source}; nothing was loaded", path.display())]
     FileParse {
         path: PathBuf,
         source: RdfParseError,
@@ -39,13 +63,68 @@ pub enum StoreError {
     /// A materialisation was stopped; the previous inferred stack stands.
     #[error("materialisation cancelled")]
     MaterialisationCancelled,
+    /// A recomputation published its inferred statements, then couldn't record them (the
+    /// reasoning state file): the store holds the new inferences, unrecorded.
+    #[error("the inferences were recomputed and published, but not recorded: {0}")]
+    InferencesNotRecorded(Box<StoreError>),
+    /// A long operation stopped because the process reached its memory limit
+    /// ([`crate::StoreConfig::process_memory_bytes`]); nothing of it was applied.
+    #[error(
+        "stopped at the process's memory limit ({} MiB); nothing was applied",
+        .limit / (1 << 20)
+    )]
+    ProcessMemoryLimit { limit: u64 },
+    /// A long operation stopped because the process's memory couldn't be read, so its
+    /// memory limit couldn't be enforced (`nrese_exec::memory::Unread`); nothing of it was
+    /// applied.
+    #[error(
+        "stopped: the process's memory couldn't be read to hold it to its limit ({} MiB); \
+         nothing was applied",
+        .limit / (1 << 20)
+    )]
+    MemoryUnreadable { limit: u64 },
     /// A bulk load was stopped ([`crate::LoadProgress::cancel`]); nothing of it was
     /// committed.
     #[error("the load was cancelled; nothing of it was committed")]
     LoadCancelled,
+    /// A classification or realisation request gave up waiting for the computation under
+    /// way for its revision, which runs on and is kept.
+    #[error("the classification request was cancelled while it waited")]
+    ClassificationCancelled,
+    /// A quarantined statement that isn't there, isn't open or can't be admitted as asked
+    /// ([`crate::quarantine`]).
+    #[error("{0}")]
+    Quarantine(String),
+    /// Under `owl2-dl`, the rules' violations aren't decided ([`crate::WhyUndecided`]): no
+    /// answer that rests on the data's consistency.
+    #[error("{0}")]
+    Undecided(String),
+    /// A read replica's log or image from a primary whose served version is stored over
+    /// representatives: the replica would read those rows as the only identities, with no
+    /// reading ([`crate::StoreService::replication_log`]).
+    #[error("a primary under `reasoner.equality = \"compact\"` serves no replica in this release")]
+    CompactPrimary,
+    /// Under `owl2-dl` with exact answers asked for (`dl.answers = exact`), or for an OWL 2
+    /// DL explanation that wasn't decided: the store can't prove the answers complete, for
+    /// the reasons given.
+    #[error("the answers can't be proven complete under OWL 2 DL: {0}")]
+    Incomplete(Box<IncompleteAnswer>),
     /// Graph-level access control refused the request; nothing of it is applied.
     #[error(transparent)]
     Forbidden(#[from] Refusal),
+    /// A query's memory refusal as a reader of some graphs is told it
+    /// (`Self::without_amounts`): the limit, not the bytes held and asked for.
+    #[error(
+        "{}: limit {} MiB (what the query held and asked for is not reported to a reader of some graphs)",
+        memory_refusal(.shared),
+        .limit >> 20
+    )]
+    MemoryLimitWithoutAmounts { limit: usize, shared: bool },
+    /// A reader of some graphs who sees inferences, refused while nothing vouches that the
+    /// inferred statements are the closure of the rules in place: until the store is
+    /// rematerialised, which a read replica isn't (`replica`).
+    #[error("{}", not_rematerialised(.replica))]
+    NotRematerialised { replica: bool },
 }
 
 /// Why graph-level access control refused a request.
@@ -65,52 +144,226 @@ pub enum Refusal {
     WriteAll(String),
 }
 
+impl From<nrese_exec::BudgetExceeded> for StoreError {
+    fn from(exceeded: nrese_exec::BudgetExceeded) -> Self {
+        QueryEvaluationError::MemoryLimit(exceeded).into()
+    }
+}
+
+/// The engine refusing for memory is the request's memory error, as a query's or an update's
+/// is, so every transport answers it alike ([`StoreError::is_memory_limit`]): the pending
+/// changes' growth past the request's envelope (D16-039), and a private transaction's own
+/// terms past its budget (dictionary lifecycle V1). Any other engine error is the store's.
+impl From<EngineError> for StoreError {
+    fn from(error: EngineError) -> Self {
+        match error {
+            EngineError::MemoryLimit(exceeded) => exceeded.into(),
+            error => Self::Engine(error),
+        }
+    }
+}
+
+/// A search's refusal, as a query's ([`QueryEvaluationError`]'s `From`).
+impl From<nrese_engine::SearchRefused> for StoreError {
+    fn from(refused: nrese_engine::SearchRefused) -> Self {
+        QueryEvaluationError::from(refused).into()
+    }
+}
+
 impl StoreError {
+    /// This error with a memory refusal's bytes held and asked for left out (for a reader
+    /// of some graphs: a scan of graphs it may not read can size them); any other as it is.
+    pub(crate) fn without_amounts(self) -> Self {
+        let refused = match self.evaluation() {
+            // Its cause, without the amounts.
+            Some(QueryEvaluationError::MemoryLimit(exceeded)) if exceeded.unread => {
+                return QueryEvaluationError::MemoryLimit(nrese_exec::BudgetExceeded {
+                    limit: 0,
+                    requested: 0,
+                    used: 0,
+                    ..*exceeded
+                })
+                .into();
+            }
+            Some(QueryEvaluationError::MemoryLimit(exceeded)) => {
+                Some((exceeded.limit, exceeded.shared))
+            }
+            _ => None,
+        };
+        match refused {
+            Some((limit, shared)) => Self::MemoryLimitWithoutAmounts { limit, shared },
+            None => self,
+        }
+    }
+
+    /// This error, or the refusal before rematerialisation ([`Self::NotRematerialised`]) an
+    /// update's `WHERE` met, which its evaluation carries as its dataset's failure: a read of
+    /// a session's pending operations is refused as any other read.
+    pub(crate) fn refusal_within(self) -> Self {
+        let replica = match self.evaluation() {
+            Some(QueryEvaluationError::Dataset(error)) => match error.downcast_ref::<Self>() {
+                Some(&Self::NotRematerialised { replica }) => Some(replica),
+                _ => None,
+            },
+            _ => None,
+        };
+        replica.map_or(self, |replica| Self::NotRematerialised { replica })
+    }
+
+    /// The evaluation error, of a query or of an update's pattern: both are classified
+    /// alike (the review of 3 October 2026, A6).
+    fn evaluation(&self) -> Option<&QueryEvaluationError> {
+        match self {
+            Self::SparqlEvaluation(error)
+            | Self::SparqlUpdate(nrese_sparql::UpdateError::Evaluation(error)) => Some(error),
+            _ => None,
+        }
+    }
+
     /// The query needed more memory than its limit
-    /// ([`SparqlQueryRequest::memory_limit`](crate::SparqlQueryRequest::memory_limit)).
+    /// ([`SparqlQueryRequest::memory_limit`](crate::SparqlQueryRequest::memory_limit)). Not
+    /// a refusal because the process's limit couldn't be read
+    /// ([`nrese_exec::BudgetExceeded::unread`]): that is the server's, not the request's.
     pub fn is_memory_limit(&self) -> bool {
-        matches!(
-            self,
-            Self::SparqlEvaluation(QueryEvaluationError::MemoryLimit(_))
-        )
+        matches!(self, Self::MemoryLimitWithoutAmounts { .. })
+            || matches!(
+                self.evaluation(),
+                Some(QueryEvaluationError::MemoryLimit(exceeded)) if !exceeded.unread
+            )
     }
 
     /// The query needed memory that other running queries hold: the server's budget for
     /// all queries ([`StoreConfig::total_query_memory_bytes`](crate::StoreConfig)) is
     /// used up. The same query may succeed later.
     pub fn is_server_memory_limit(&self) -> bool {
-        matches!(
-            self,
-            Self::SparqlEvaluation(QueryEvaluationError::MemoryLimit(exceeded))
-                if exceeded.shared
-        )
+        matches!(self, Self::MemoryLimitWithoutAmounts { shared: true, .. })
+            || matches!(
+                self.evaluation(),
+                Some(QueryEvaluationError::MemoryLimit(exceeded))
+                    if exceeded.shared && !exceeded.unread
+            )
     }
 
     /// True if the request is at fault (syntax, invalid IRIs or payloads, unsupported query
     /// features) rather than the store. Transports map these to client errors. A cancelled
     /// evaluation is neither: the transport decides what cancelled it.
     pub fn is_request_error(&self) -> bool {
+        if let Some(error) = self.evaluation() {
+            return !matches!(
+                error,
+                QueryEvaluationError::Dataset(_)
+                    | QueryEvaluationError::MemoryLimit(_)
+                    | QueryEvaluationError::Unexpected(_)
+                    | QueryEvaluationError::Cancelled
+            );
+        }
         match self {
+            Self::SparqlUpdate(nrese_sparql::UpdateError::Cancelled) => false,
             Self::SparqlSyntax(_)
             | Self::SparqlUpdate(_)
             | Self::InvalidGraphIri(_)
             | Self::RdfParse(_)
             | Self::ShaclShapes(_)
             | Self::Forbidden(_)
+            | Self::Quarantine(_)
             | Self::FileParse { .. } => true,
-            Self::SparqlEvaluation(error) => !matches!(
-                error,
-                QueryEvaluationError::Dataset(_)
-                    | QueryEvaluationError::MemoryLimit(_)
-                    | QueryEvaluationError::Unexpected(_)
-                    | QueryEvaluationError::Cancelled
-            ),
+            Self::SparqlEvaluation(_) => unreachable!("classified above"),
             Self::Configuration(_)
             | Self::Io(_)
             | Self::Engine(_)
             | Self::OntologyFileNotFound { .. }
             | Self::MaterialisationCancelled
-            | Self::LoadCancelled => false,
+            | Self::InferencesNotRecorded(_)
+            | Self::ProcessMemoryLimit { .. }
+            | Self::MemoryUnreadable { .. }
+            | Self::MemoryLimitWithoutAmounts { .. }
+            | Self::LoadCancelled
+            | Self::Undecided(_)
+            | Self::ClassificationCancelled
+            | Self::NotRematerialised { .. }
+            | Self::CompactPrimary
+            // Answered by the transport as what it is (the query is fine; its answers
+            // can't be proven complete).
+            | Self::Incomplete(_) => false,
         }
+    }
+}
+
+/// What a memory refusal says first: whose memory ran out ([`nrese_exec::BudgetExceeded`]'s
+/// words).
+fn memory_refusal(shared: &bool) -> &'static str {
+    match shared {
+        true => "the server's query memory is in use",
+        false => "query memory budget exceeded",
+    }
+}
+
+/// What a refusal before rematerialisation says, on a primary and on a read replica.
+fn not_rematerialised(replica: &bool) -> &'static str {
+    match replica {
+        false => "the inferred statements aren't the rules' closure: rematerialise first",
+        true => {
+            "the inferred statements aren't known to be the rules' closure, and this store \
+             is a read replica: it doesn't serve this read"
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nrese_sparql::UpdateError;
+
+    use super::*;
+
+    #[test]
+    fn an_update_s_evaluation_error_is_classified_as_a_query_s() {
+        let errors: [fn() -> QueryEvaluationError; 3] = [
+            || QueryEvaluationError::Unexpected("probe".into()),
+            || QueryEvaluationError::Cancelled,
+            || QueryEvaluationError::Unsupported("probe".into()),
+        ];
+        for error in errors {
+            let query = StoreError::SparqlEvaluation(error());
+            let update = StoreError::SparqlUpdate(UpdateError::Evaluation(error()));
+            assert_eq!(
+                query.is_request_error(),
+                update.is_request_error(),
+                "{query}"
+            );
+            assert_eq!(query.is_memory_limit(), update.is_memory_limit());
+        }
+        assert!(!StoreError::SparqlUpdate(UpdateError::Cancelled).is_request_error());
+    }
+}
+
+#[cfg(test)]
+mod unread_tests {
+    use super::*;
+
+    /// D2, A-902: a refusal because the process's limit couldn't be read is the server's,
+    /// neither the request's memory limit nor contention for the queries' budget; a reader
+    /// of some graphs is told that cause, without amounts.
+    #[test]
+    fn an_unread_limit_is_no_memory_limit_and_keeps_its_cause_unsized() {
+        let unread = StoreError::from(nrese_exec::BudgetExceeded {
+            limit: 0,
+            requested: 4096,
+            used: 1 << 20,
+            shared: true,
+            unread: true,
+        });
+        assert!(!unread.is_memory_limit());
+        assert!(!unread.is_server_memory_limit());
+        assert!(!unread.is_request_error());
+        let told = unread.without_amounts();
+        assert!(
+            matches!(
+                told.evaluation(),
+                Some(QueryEvaluationError::MemoryLimit(exceeded))
+                    if exceeded.unread && exceeded.requested == 0 && exceeded.used == 0
+            ),
+            "{told:?}"
+        );
+        assert!(told.to_string().contains("couldn't be read"), "{told}");
     }
 }

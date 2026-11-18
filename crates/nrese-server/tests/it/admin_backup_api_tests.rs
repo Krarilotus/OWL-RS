@@ -1,14 +1,12 @@
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
-use nrese_reasoner::{ReasonerConfig, ReasoningMode};
+use nrese_reasoner::ReasonerConfig;
 use nrese_server::auth::{AuthConfig, StaticBearerConfig};
 use nrese_server::policy::{PolicyConfig, RateLimitConfig};
 use nrese_store::StoreConfig;
 use tower::util::ServiceExt;
 
-use crate::support::{
-    body_text, ready_revision, readyz_text, test_app_with_policy, test_app_with_store_config,
-};
+use crate::support::{body_text, test_app_with_policy, test_app_with_store_config};
 
 fn admin_policy() -> PolicyConfig {
     PolicyConfig {
@@ -76,6 +74,59 @@ async fn backup_endpoint_returns_dataset_payload_with_expected_headers()
     Ok(())
 }
 
+/// The export streams; its SHA-256 closes the body as a comment and follows it as the
+/// trailer the `Trailer` header announces: both equal a SHA-256 computed here over the
+/// bytes before the comment.
+#[tokio::test]
+async fn the_exports_trailer_and_closing_comment_hold_its_checksum()
+-> Result<(), Box<dyn std::error::Error>> {
+    use http_body_util::BodyExt;
+    use sha2::{Digest, Sha256};
+
+    let app = test_app_with_store_config(
+        StoreConfig::in_memory().with_ontology(crate::support::minimal_fixture_path()),
+        admin_policy(),
+        ReasonerConfig::default(),
+    )?;
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/ops/api/admin/dataset/backup")
+                .method(Method::GET)
+                .header("authorization", "Bearer admin")
+                .body(Body::empty())?,
+        )
+        .await?;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("trailer")
+            .and_then(|v| v.to_str().ok()),
+        Some("x-nrese-checksum-sha256")
+    );
+    let mut body = response.into_body();
+    let (mut bytes, mut trailers) = (Vec::new(), None);
+    while let Some(frame) = body.frame().await {
+        match frame?.into_data() {
+            Ok(data) => bytes.extend_from_slice(&data),
+            Err(frame) => trailers = frame.into_trailers().ok(),
+        }
+    }
+    let text = String::from_utf8(bytes)?;
+    let (statements, comment) = text.trim_end().rsplit_once('\n').ok_or("a statement")?;
+    let computed = format!("{:x}", Sha256::digest(format!("{statements}\n")));
+    assert_eq!(comment, format!("# nrese-sha256 {computed}"));
+    let trailer = trailers.ok_or("no trailers")?;
+    assert_eq!(
+        trailer
+            .get("x-nrese-checksum-sha256")
+            .and_then(|v| v.to_str().ok()),
+        Some(computed.as_str())
+    );
+    Ok(())
+}
+
 #[tokio::test]
 async fn restore_endpoint_replaces_dataset_and_updates_ready_surface()
 -> Result<(), Box<dyn std::error::Error>> {
@@ -111,109 +162,16 @@ async fn restore_endpoint_replaces_dataset_and_updates_ready_surface()
         .await?;
     assert!(body_text(ask).await?.contains("true"));
 
-    assert!(readyz_text(app).await?.contains("\"revision\":1"));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn restore_endpoint_rejects_invalid_payload_with_problem_json()
--> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_policy(admin_policy())?;
-
-    let seed = app
-        .clone()
+    let info = app
         .oneshot(
             Request::builder()
-                .uri("/dataset/update")
-                .method(Method::POST)
-                .header("authorization", "Bearer admin")
-                .header("content-type", "application/sparql-update")
-                .body(Body::from(
-                    "INSERT DATA { <http://example.com/live-s> <http://example.com/p> <http://example.com/live-o> }",
-                ))?,
-        )
-        .await?;
-    assert_eq!(seed.status(), StatusCode::NO_CONTENT);
-
-    let restore = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/ops/api/admin/dataset/restore")
-                .method(Method::POST)
-                .header("authorization", "Bearer admin")
-                .header("content-type", "application/n-quads")
-                .body(Body::from("not valid n-quads"))?,
-        )
-        .await?;
-
-    assert_eq!(restore.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        restore
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok()),
-        Some("application/problem+json")
-    );
-
-    let ask = app
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/query?query=ASK%20WHERE%20%7B%20%3Chttp%3A%2F%2Fexample.com%2Flive-s%3E%20%3Chttp%3A%2F%2Fexample.com%2Fp%3E%20%3Chttp%3A%2F%2Fexample.com%2Flive-o%3E%20%7D")
-                .method(Method::GET)
+                .uri("/dataset/info")
                 .header("authorization", "Bearer reader")
                 .body(Body::empty())?,
         )
         .await?;
-    assert!(body_text(ask).await?.contains("true"));
-
-    Ok(())
-}
-
-#[tokio::test]
-async fn restore_endpoint_uses_reasoner_gate_and_rejects_without_publish()
--> Result<(), Box<dyn std::error::Error>> {
-    let app = test_app_with_store_config(
-        StoreConfig::default(),
-        admin_policy(),
-        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
-    )?;
-    let revision_before = ready_revision(app.clone()).await?;
-
-    let restore = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/ops/api/admin/dataset/restore")
-                .method(Method::POST)
-                .header("authorization", "Bearer admin")
-                .header("content-type", "application/n-quads")
-                .body(Body::from(
-                    "<http://example.com/Parent> <http://www.w3.org/2002/07/owl#disjointWith> <http://example.com/Other> .\n\
-                     <http://example.com/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Parent> .\n\
-                     <http://example.com/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Other> .\n",
-                ))?,
-        )
-        .await?;
-
-    assert_eq!(restore.status(), StatusCode::BAD_REQUEST);
-    let restore_text = body_text(restore).await?;
-    assert!(restore_text.contains("reasoner_reject"));
-    assert!(restore_text.contains("cax-dw"));
-
-    let ask = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/dataset/query?query=ASK%20WHERE%20%7B%20%3Chttp%3A%2F%2Fexample.com%2Falice%3E%20a%20%3Chttp%3A%2F%2Fexample.com%2FOther%3E%20%7D")
-                .method(Method::GET)
-                .header("authorization", "Bearer reader")
-                .body(Body::empty())?,
-        )
-        .await?;
-    assert!(body_text(ask).await?.contains("false"));
-    assert_eq!(ready_revision(app).await?, revision_before);
+    assert_eq!(info.status(), StatusCode::OK);
+    assert!(body_text(info).await?.contains("\"revision\":1"));
 
     Ok(())
 }
@@ -275,7 +233,7 @@ async fn image_backup_writes_a_manifest_into_the_data_directory()
     };
     let denied = app.clone().oneshot(request("reader")?).await?;
     assert_eq!(denied.status(), StatusCode::FORBIDDEN);
-    let response = app.oneshot(request("admin")?).await?;
+    let response = app.clone().oneshot(request("admin")?).await?;
     assert_eq!(response.status(), StatusCode::OK);
     let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
     let directory = std::path::PathBuf::from(json["directory"].as_str().unwrap());
@@ -286,5 +244,22 @@ async fn image_backup_writes_a_manifest_into_the_data_directory()
         nrese_store::read_manifest(&directory)?.sha256,
         json["manifest"]["sha256"]
     );
+    // More backups within the same second each get a directory of their own (found by
+    // the HTTP fuzzing: the second one failed with a 500).
+    let mut directories = vec![directory];
+    for _ in 0..3 {
+        let response = app.clone().oneshot(request("admin")?).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        let json: serde_json::Value = serde_json::from_str(&body_text(response).await?)?;
+        directories.push(std::path::PathBuf::from(
+            json["directory"].as_str().unwrap(),
+        ));
+    }
+    directories.sort();
+    directories.dedup();
+    assert_eq!(directories.len(), 4, "{directories:?}");
+    for directory in &directories {
+        nrese_store::read_manifest(directory)?;
+    }
     Ok(())
 }

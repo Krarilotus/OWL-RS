@@ -1,5 +1,5 @@
 //! The W3C N3 Community Group's reasoner tests (w3c/N3, `manifest-reasoner.ttl`) on the
-//! user rules of the reasoner: the N3 compiler ([`nrese_reasoner::v2::n3`]) and the
+//! user rules of the reasoner: the N3 compiler ([`nrese_reasoner::n3`]) and the
 //! reference evaluator.
 //!
 //! - **In scope.** Tests whose options are cwm's `--think --data` (rules to a fixpoint, then
@@ -18,10 +18,10 @@ use std::path::{Path, PathBuf};
 use nrese_rdf::{BlankNode, Dataset, GraphName, Literal, NamedNode, NamedOrBlankNode, Quad, Term};
 use nrese_rdf_io::n3::{N3Parser, N3Quad, N3Term};
 use nrese_rdf_io::{RdfFormat, RdfParser};
-use nrese_reasoner::v2::ir::Vocabulary;
-use nrese_reasoner::v2::n3::compile_quads;
-use nrese_reasoner::v2::naive::materialise;
-use nrese_reasoner::v2::vocabulary::LocalVocabulary;
+use nrese_reasoner::ir::Vocabulary;
+use nrese_reasoner::n3::compile_quads;
+use nrese_reasoner::naive::materialise;
+use nrese_reasoner::vocabulary::LocalVocabulary;
 
 const BASE: &str = "https://w3c.github.io/N3/tests/N3Tests/";
 const MF: &str = "http://www.w3.org/2001/sw/DataAccess/tests/test-manifest#";

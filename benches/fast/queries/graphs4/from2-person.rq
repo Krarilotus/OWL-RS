@@ -1,0 +1,2 @@
+PREFIX e: <http://example.org/fast/>
+SELECT ?p ?o FROM e:graph0 FROM e:graph1 WHERE { e:u4711 ?p ?o }

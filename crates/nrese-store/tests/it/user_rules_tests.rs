@@ -29,7 +29,7 @@ fn rules(text: &str) -> Arc<UserRules> {
     Arc::new(UserRules::n3("family.n3", text).expect("the rules compile"))
 }
 
-fn pipeline(mode: ReasoningMode, text: &str) -> MutationPipeline {
+pub(crate) fn pipeline(mode: ReasoningMode, text: &str) -> MutationPipeline {
     let store = StoreService::new(in_memory_store_config()).expect("store");
     let config = ReasonerConfig::for_mode(mode)
         .with_rules(Some(rules(text)))
@@ -148,7 +148,7 @@ fn changed_rules_make_the_recorded_closure_stale() {
     assert!(!store.reasoning_is_current(&edited));
     // Adding the same rules to a ruleset is another program as well.
     let added = RuleProgram::new(
-        Some(nrese_reasoner::v2::rulesets::Ruleset::Rdfs),
+        Some(nrese_reasoner::rulesets::Ruleset::Rdfs),
         Some(rules(FAMILY)),
     )
     .expect("a program");

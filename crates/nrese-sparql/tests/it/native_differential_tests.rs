@@ -22,10 +22,12 @@ use std::path::PathBuf;
 use nrese_engine::{EncodedTriple, Engine, EngineConfig, ReadModel};
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
-use nrese_sparql::{QueryOptions, QueryResults, evaluate_query, explain_query, runs_natively};
+use nrese_sparql::{
+    QueryOptions, QueryResults, evaluate_query, explain_query, plan_query, runs_natively,
+};
 use nrese_sparql_syntax::SparqlParser;
 
-const EX: &str = "http://example.com/";
+pub(crate) const EX: &str = "http://example.com/";
 
 /// The reference evaluator's answer on what `snapshot` holds in `options.read_model`.
 fn reference(
@@ -74,12 +76,12 @@ fn update_engine(
 }
 
 /// SplitMix64: deterministic test-case generation.
-struct Rng(u64);
+pub(crate) struct Rng(pub(crate) u64);
 
 impl Rng {
     /// The generator of a test's base seed, varied by `NRESE_FUZZ_SEED` (a number) for bug
     /// hunts over many seeds; without it, the same cases on every run.
-    fn seeded(base: u64) -> Self {
+    pub(crate) fn seeded(base: u64) -> Self {
         let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
             .ok()
             .and_then(|seed| seed.trim().parse().ok())
@@ -87,7 +89,7 @@ impl Rng {
         Self(base ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15))
     }
 
-    fn next(&mut self) -> u64 {
+    pub(crate) fn next(&mut self) -> u64 {
         self.0 = self.0.wrapping_add(0x9e37_79b9_7f4a_7c15);
         let mut z = self.0;
         z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -95,13 +97,23 @@ impl Rng {
         z ^ (z >> 31)
     }
 
-    fn below(&mut self, n: u64) -> u64 {
+    pub(crate) fn below(&mut self, n: u64) -> u64 {
         self.next() % n
     }
 
-    fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
+    pub(crate) fn pick<'a, T>(&mut self, items: &'a [T]) -> &'a T {
         &items[self.below(items.len() as u64) as usize]
     }
+}
+
+/// Whether a random test that has drawn `drawn` cases draws another: every one of the
+/// `cases` it plans, then more (up to ten times as many) while it lacks the coverage its last
+/// assertion asks for, so that its coverage never depends on the seed's luck. Seed 66810
+/// drew 1,333 queries with solutions in 4,000 where more than a third were asked: every
+/// answer right, the gate red (12 October 2026). The NI fuzz test's fix, `a901e34`, did so
+/// first.
+pub(crate) fn draws_on(drawn: usize, cases: usize, covered: bool) -> bool {
+    drawn < cases || (!covered && drawn < cases * 10)
 }
 
 /// Cases for a second oracle (benches/oracle/README.md): with `NRESE_ORACLE_DUMP=<dir>`, a
@@ -201,11 +213,11 @@ impl Dump {
     }
 }
 
-fn ex(local: &str) -> NamedNode {
+pub(crate) fn ex(local: &str) -> NamedNode {
     NamedNode::new_unchecked(format!("{EX}{local}"))
 }
 
-fn random_object(rng: &mut Rng) -> Term {
+pub(crate) fn random_object(rng: &mut Rng) -> Term {
     match rng.below(12) {
         // Range pruning edge cases: dates with timezones next to the FILTER bounds, a
         // non-canonical integer (a dictionary typed literal), and integer-derived literals
@@ -252,7 +264,7 @@ fn random_object(rng: &mut Rng) -> Term {
     }
 }
 
-fn random_dataset(rng: &mut Rng) -> Vec<Quad> {
+pub(crate) fn random_dataset(rng: &mut Rng) -> Vec<Quad> {
     (0..10 + rng.below(50))
         .map(|_| {
             Quad::new(
@@ -426,7 +438,7 @@ fn group_pattern(rng: &mut Rng, depth: u32) -> String {
     parts.join(" ")
 }
 
-fn random_query(rng: &mut Rng) -> (String, bool) {
+pub(crate) fn random_query(rng: &mut Rng) -> (String, bool) {
     let pattern = group_pattern(rng, 0);
     if rng.below(8) == 0 {
         // LIMIT over one filtered pattern (the streamed scan); see `limited` below.
@@ -515,13 +527,19 @@ fn canonical_number(literal: &Literal) -> Literal {
     }
 }
 
-/// The column of a `(SAMPLE(…) AS ?v)` in a result with `variables`, if the query has one.
-fn sample_column(text: &str, variables: &[String]) -> Option<usize> {
-    let after = &text[text.find("(SAMPLE(")?..];
-    let alias = after[after.find(" AS ?")? + 5..]
-        .split(|c: char| !c.is_alphanumeric() && c != '_')
-        .next()?;
-    variables.iter().position(|v| v == alias)
+/// The columns of every `(SAMPLE(…) AS ?v)` in a result with `variables`: each picks any
+/// value of its group, independently of the others (seed 1814 of the fuzz campaign: two
+/// `SAMPLE(?d)` of one group, the second compared, `<e3>` and `"-1"` both in it).
+fn sample_columns(text: &str, variables: &[String]) -> Vec<usize> {
+    text.match_indices("(SAMPLE(")
+        .filter_map(|(at, _)| {
+            let after = &text[at..];
+            let alias = after[after.find(" AS ?")? + 5..]
+                .split(|c: char| !c.is_alphanumeric() && c != '_')
+                .next()?;
+            variables.iter().position(|v| v == alias)
+        })
+        .collect()
 }
 
 /// Rows with the parts of every simple literal that holds `separator` sorted (as
@@ -551,13 +569,29 @@ fn concatenations_sorted(rows: &[String], separator: char) -> Vec<String> {
 }
 
 /// Rows of tab-separated cells without cell `column`, sorted.
-fn without_column(rows: &[String], column: usize) -> Vec<String> {
+/// Every `SAMPLE` column is left out of a comparison, not only the first: the queries of
+/// fuzz seeds 1814 and 1908, two `SAMPLE(?d)` of one group, the second compared.
+#[test]
+fn every_sample_column_is_left_out() {
+    let variables = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+    let seed_1814 = "SELECT ?b (SAMPLE(?d) AS ?x0) (SAMPLE(?d) AS ?x1) (MAX(STR(?e)) AS ?x2) WHERE { ?a <http://example.com/p0> ?b } GROUP BY ?b";
+    assert_eq!(
+        sample_columns(seed_1814, &variables(&["b", "x0", "x1", "x2"])),
+        [1, 2]
+    );
+    let seed_1908 = "SELECT ?b (SAMPLE(?d) AS ?x0) (SAMPLE(?d) AS ?x1) WHERE { ?a <http://example.com/p1> ?b } GROUP BY ?b";
+    let rows = ["<e2>\t\"300\"\t<e1>".to_owned()];
+    let columns = sample_columns(seed_1908, &variables(&["b", "x0", "x1"]));
+    assert_eq!(without_columns(&rows, &columns), ["<e2>"]);
+}
+
+fn without_columns(rows: &[String], columns: &[usize]) -> Vec<String> {
     let mut out: Vec<String> = rows
         .iter()
         .map(|row| {
             row.split('\t')
                 .enumerate()
-                .filter(|(i, _)| *i != column)
+                .filter(|(i, _)| !columns.contains(i))
                 .map(|(_, cell)| cell)
                 .collect::<Vec<_>>()
                 .join("\t")
@@ -587,8 +621,45 @@ fn rows(results: QueryResults<'_>, ordered: bool) -> Vec<String> {
 /// [`rows`], with integer literals by value where SPARQL leaves open which of equal values
 /// comes out: `ORDER BY` puts `"02"` and `"2"` in either order (and a `LIMIT` may cut
 /// between them), and `MIN`/`MAX` may give either as the extreme (`open` for those).
-fn rows_up_to_equal_values(results: QueryResults<'_>, ordered: bool, open: bool) -> Vec<String> {
+pub(crate) fn rows_up_to_equal_values(
+    results: QueryResults<'_>,
+    ordered: bool,
+    open: bool,
+) -> Vec<String> {
     rows_with(results, ordered, ordered || open)
+}
+
+/// [`rows`] and [`rows_up_to_equal_values`] (unordered) of one evaluation.
+fn rows_both_ways(results: QueryResults<'_>, open: bool) -> (Vec<String>, Vec<String>) {
+    let QueryResults::Solutions(solutions) = results else {
+        let rows = rows_with(results, false, false);
+        return (rows.clone(), rows);
+    };
+    let variables: Vec<_> = solutions.variables().to_vec();
+    let cells: Vec<Vec<Option<Term>>> = solutions
+        .map(|solution| {
+            let solution = solution.expect("no evaluation error");
+            variables.iter().map(|v| solution.get(v).cloned()).collect()
+        })
+        .collect();
+    let format = |by_values: bool| {
+        let mut out: Vec<String> = cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|cell| {
+                        cell.as_ref().map_or("UNDEF".to_owned(), |t| {
+                            if by_values { by_value(t) } else { t.clone() }.to_string()
+                        })
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\t")
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    (format(false), format(open))
 }
 
 fn rows_with(results: QueryResults<'_>, ordered: bool, by_values: bool) -> Vec<String> {
@@ -661,15 +732,26 @@ fn cell_by_value(cell: &str) -> String {
 }
 
 /// Whether a query's results hold a `MIN` or `MAX`, whose extreme may be any of equal values.
-fn has_extremes(text: &str) -> bool {
+pub(crate) fn has_extremes(text: &str) -> bool {
     text.contains("MIN(") || text.contains("MAX(")
 }
 
 /// The LIMIT of a generated `SELECT * … LIMIT n` query without ORDER BY.
-fn limited(text: &str) -> Option<usize> {
+pub(crate) fn limited(text: &str) -> Option<usize> {
     (!text.contains("ORDER BY"))
         .then(|| text.rsplit_once(" LIMIT ")?.1.parse().ok())
         .flatten()
+}
+
+/// The logical plan of `query`'s pattern lowers to that pattern again (step 1 of the query
+/// plan: until a rewrite changes it, the plan is the algebra).
+fn plan_round_trips(query: &nrese_sparql_syntax::Query) {
+    use nrese_sparql_syntax::Query;
+    let (Query::Select { pattern, .. }
+    | Query::Construct { pattern, .. }
+    | Query::Describe { pattern, .. }
+    | Query::Ask { pattern, .. }) = query;
+    assert_eq!(&nrese_sparql::plan::Plan::of(pattern).lower(), pattern);
 }
 
 #[test]
@@ -678,7 +760,17 @@ fn native_results_equal_the_reference_on_random_queries() {
     let (mut checked, mut fallbacks) = (0, Vec::new());
     let mut with_solutions = 0;
     let dump = Dump::new("random");
-    for dataset_case in 0..150 {
+    let covered = |checked: usize, with_solutions: usize, fallbacks: usize| {
+        with_solutions * 6 > checked && fallbacks * 20 < checked
+    };
+    for dataset_case in 0.. {
+        if !draws_on(
+            dataset_case,
+            150,
+            covered(checked, with_solutions, fallbacks.len()),
+        ) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         let quads = random_dataset(&mut rng);
@@ -719,6 +811,10 @@ fn native_results_equal_the_reference_on_random_queries() {
                 fallbacks.push(text);
                 continue;
             }
+            plan_round_trips(&query);
+            // Every query that runs has a plan with estimates.
+            plan_query(&snapshot, &query, &native_options)
+                .unwrap_or_else(|e| panic!("plan of {text}: {e}"));
             let native = rows_up_to_equal_values(
                 evaluate_query(&snapshot, &query, &native_options).unwrap(),
                 ordered,
@@ -775,17 +871,12 @@ fn native_results_equal_the_reference_on_random_queries() {
     }
     // Agreement on empty results proves little: a fair share of the queries must have
     // solutions. It is a fifth (a tenth before the generator got its connected patterns);
-    // the tests with their own generators below reach a quarter to three quarters.
+    // the tests with their own generators below reach a quarter to three quarters. And the
+    // generator's shapes must be almost all native (the executor refuses the rest).
     assert!(
-        with_solutions * 6 > checked,
-        "only {with_solutions} of {checked} queries have solutions"
-    );
-    // The generator's shapes must be almost all native (the executor refuses the rest).
-    assert!(
-        fallbacks.len() * 20 < checked,
-        "{} of {} generated queries not native, e.g. {:#?}",
+        covered(checked, with_solutions, fallbacks.len()),
+        "{checked} checked, {with_solutions} with solutions, {} not native, e.g. {:#?}",
         fallbacks.len(),
-        checked + fallbacks.len(),
         &fallbacks[..fallbacks.len().min(3)]
     );
 }
@@ -879,7 +970,17 @@ fn pushed_filters_equal_the_reference() {
         ..QueryOptions::default()
     };
     let dump = Dump::new("pushed-filters");
-    for dataset_case in 0..60 {
+    let covered = |checked: usize, with_solutions: usize, fallbacks: usize| {
+        fallbacks * 5 < checked && with_solutions * 5 > checked
+    };
+    for dataset_case in 0.. {
+        if !draws_on(
+            dataset_case,
+            60,
+            covered(checked, with_solutions, fallbacks),
+        ) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         let quads = random_dataset(&mut rng);
@@ -898,6 +999,9 @@ fn pushed_filters_equal_the_reference() {
                 fallbacks += 1;
                 continue;
             }
+            plan_round_trips(&query);
+            plan_query(&snapshot, &query, &QueryOptions::default())
+                .unwrap_or_else(|e| panic!("plan of {text}: {e}"));
             let native = rows(
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
@@ -928,15 +1032,10 @@ fn pushed_filters_equal_the_reference() {
             with_solutions += usize::from(!expected.is_empty());
         }
     }
-    assert!(
-        fallbacks * 5 < checked,
-        "{fallbacks} of {} queries not native",
-        checked + fallbacks
-    );
     // A filter that drops everything proves little: enough queries must keep solutions.
     assert!(
-        with_solutions * 5 > checked,
-        "only {with_solutions} of {checked} queries have solutions"
+        covered(checked, with_solutions, fallbacks),
+        "{checked} checked, {with_solutions} with solutions, {fallbacks} not native"
     );
 }
 
@@ -1017,7 +1116,11 @@ fn paths_from_bound_values_equal_the_reference() {
     ];
     let mut rng = Rng::seeded(20_261_001);
     let (mut checked, mut with_solutions) = (0, 0);
-    for dataset_case in 0..50 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions * 2 > checked;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 50, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         let quads = random_dataset(&mut rng);
@@ -1094,7 +1197,7 @@ fn paths_from_bound_values_equal_the_reference() {
         }
     }
     assert!(
-        with_solutions * 2 > checked,
+        covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
@@ -1518,11 +1621,93 @@ fn open_closures_and_their_counts_equal_the_reference() {
     }
 }
 
+/// A path over the merge of graphs answers as it does over one graph that holds their
+/// statements once. SPARQL 1.1 §13.1 makes the default graph of several `FROM` their RDF
+/// merge, and §18.4 evaluates paths on that graph.
+///
+/// The test puts the same statements in two stores:
+/// - in the first, all of them in the store's default graph;
+/// - in the second, spread over two named graphs, with some in both.
+///
+/// It then compares the rows over the second store's merge, through several `FROM` and
+/// through the union default graph, with the rows over the first store's default graph.
+/// The two are read by separate probes (the arms of the evaluator's index probe). The
+/// paths cover a bound start, a reverse search from a bound end, both ends bound, a
+/// sequence, an alternative with an inverse, a negated set, and an open closure with its
+/// zero-length pairs.
+#[test]
+fn paths_over_a_merge_of_graphs_answer_as_over_one_graph() {
+    let answer = |snapshot: &nrese_engine::Snapshot, text: &str, union: bool| {
+        let query = SparqlParser::new()
+            .parse_query(text)
+            .unwrap_or_else(|e| panic!("{e}: {text}"));
+        assert!(runs_natively(&query), "{text}");
+        let options = QueryOptions {
+            union_default_graph: union,
+            ..QueryOptions::default()
+        };
+        rows(evaluate_query(snapshot, &query, &options).unwrap(), false)
+    };
+    let mut rng = Rng::seeded(20_261_113);
+    for round in 0..8 {
+        let nodes = 5 + rng.below(25);
+        let (one, split) = (
+            Engine::new(EngineConfig::default()).unwrap(),
+            Engine::new(EngineConfig::default()).unwrap(),
+        );
+        let (mut into_one, mut into_split) = (one.transaction(), split.transaction());
+        for _ in 0..nodes + rng.below(3 * nodes) {
+            let (a, b) = (rng.below(nodes), rng.below(nodes));
+            let p = if rng.below(4) == 0 { "other" } else { "next" };
+            let quad = |graph: GraphName| {
+                Quad::new(ex(&format!("n{a}")), ex(p), ex(&format!("n{b}")), graph)
+            };
+            into_one.insert(quad(GraphName::DefaultGraph).as_ref());
+            // In g1, in g2, or in both: the merge has it once.
+            let graphs: &[&str] = match rng.below(3) {
+                0 => &["g1"],
+                1 => &["g2"],
+                _ => &["g1", "g2"],
+            };
+            for graph in graphs {
+                into_split.insert(quad(GraphName::NamedNode(ex(graph))).as_ref());
+            }
+        }
+        into_one.commit().unwrap();
+        into_split.commit().unwrap();
+        let (one_graph, merged) = (one.snapshot(), split.snapshot());
+        let start = format!("<{EX}n{}>", rng.below(nodes));
+        let end = format!("<{EX}n{}>", rng.below(nodes));
+        for pattern in [
+            format!("{start} <{EX}next>* ?b"),
+            format!("?a <{EX}next>* {end}"),
+            format!("{start} <{EX}next>+ {end}"),
+            format!("{start} <{EX}next>/<{EX}next> ?b"),
+            format!("{start} (<{EX}next>|^<{EX}other>)+ ?b"),
+            format!("?a !(<{EX}other>) ?b"),
+            format!("?a <{EX}next>* ?b"),
+        ] {
+            let in_default = format!("SELECT * WHERE {{ {pattern} }}");
+            let expected = answer(&one_graph, &in_default, false);
+            for (text, union) in [
+                (
+                    format!("SELECT * FROM <{EX}g1> FROM <{EX}g2> WHERE {{ {pattern} }}"),
+                    false,
+                ),
+                (in_default.clone(), true),
+            ] {
+                let context = format!("round {round}, union {union}: {text}");
+                assert_same_rows(&answer(&merged, &text, union), &expected, &context);
+            }
+        }
+    }
+}
+
 /// A query over values the query computes itself: grouping, aggregating, ordering,
 /// deduplicating, joining and filtering on the results of `BIND` and `SELECT` expressions
 /// and of aggregates in subqueries. The patterns are single statements and joins on `?a`,
 /// so nearly every query has solutions. Returns the query and whether its rows are ordered.
-fn computed_query(rng: &mut Rng) -> (String, bool) {
+pub(crate) fn computed_query(rng: &mut Rng) -> (String, bool) {
     let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
     let base = match rng.below(3) {
         0 => format!("?a {} ?b", p(rng)),
@@ -1672,7 +1857,17 @@ fn computed_values_equal_the_reference() {
         ..QueryOptions::default()
     };
     let dump = Dump::new("computed-values");
-    for dataset_case in 0..60 {
+    let covered = |checked: usize, with_solutions: usize, fallbacks: usize| {
+        fallbacks * 5 < checked && with_solutions * 4 > checked * 3
+    };
+    for dataset_case in 0.. {
+        if !draws_on(
+            dataset_case,
+            60,
+            covered(checked, with_solutions, fallbacks),
+        ) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         let quads = random_dataset(&mut rng);
@@ -1691,6 +1886,7 @@ fn computed_values_equal_the_reference() {
                 fallbacks += 1;
                 continue;
             }
+            plan_round_trips(&query);
             let open = has_extremes(&text);
             let native = rows_up_to_equal_values(
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
@@ -1727,13 +1923,8 @@ fn computed_values_equal_the_reference() {
         }
     }
     assert!(
-        fallbacks * 5 < checked,
-        "{fallbacks} of {} queries not native",
-        checked + fallbacks
-    );
-    assert!(
-        with_solutions * 4 > checked * 3,
-        "only {with_solutions} of {checked} queries have solutions"
+        covered(checked, with_solutions, fallbacks),
+        "{checked} checked, {with_solutions} with solutions, {fallbacks} not native"
     );
 }
 
@@ -1743,7 +1934,7 @@ fn computed_values_equal_the_reference() {
 /// BINDs. Some queries mix in an aggregate that does count duplicates, which switches the
 /// set evaluation off. Returns the query and whether its results depend on the order of
 /// the rows (`GROUP_CONCAT`, `SAMPLE`).
-fn set_query(rng: &mut Rng) -> (String, bool) {
+pub(crate) fn set_query(rng: &mut Rng) -> (String, bool) {
     let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
     let mut pattern = format!("?a {} ?b .", p(rng));
     for _ in 0..1 + rng.below(3) {
@@ -1846,7 +2037,11 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
     let oracle = QueryOptions {
         ..QueryOptions::default()
     };
-    for dataset_case in 0..60 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions * 4 > checked * 3;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 60, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -1861,24 +2056,24 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
                 .unwrap_or_else(|e| panic!("{e}: {text}"));
             assert!(runs_natively(&query), "{text}");
             let context = format!("dataset {dataset_case}, query {query_case}: {text}");
-            let native = rows(
+            // One native evaluation, compared both ways: with the as-written one, and up
+            // to equal values with the reference.
+            let open = has_extremes(&text);
+            let (native, native_by_value) = rows_both_ways(
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
-                false,
+                open,
             );
             let plain = rows(
                 evaluate_query(&snapshot, &query, &as_written).unwrap(),
                 false,
             );
             // SAMPLE may pick any value of its group, and two plans may visit the rows in
-            // another order: its column is left out of the comparison.
-            let (native_rows, plain_rows) =
-                match sample_column(&text, &variables(&snapshot, &query)) {
-                    Some(column) => (
-                        without_column(&native, column),
-                        without_column(&plain, column),
-                    ),
-                    None => (native.clone(), plain.clone()),
-                };
+            // another order: its columns are left out of the comparison.
+            let samples = sample_columns(&text, &variables(&snapshot, &query));
+            let (native_rows, plain_rows) = (
+                without_columns(&native, &samples),
+                without_columns(&plain, &samples),
+            );
             let (native_rows, plain_rows) = match text.contains("GROUP_CONCAT") {
                 true => (
                     concatenations_sorted(&native_rows, '|'),
@@ -1892,25 +2087,19 @@ fn duplicate_insensitive_queries_equal_both_evaluations() {
                 &format!("against as written: {context}"),
             );
             if !order_dependent {
-                let open = has_extremes(&text);
-                let native = rows_up_to_equal_values(
-                    evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
-                    false,
-                    open,
-                );
                 let expected = rows_up_to_equal_values(
                     reference(&snapshot, &query, &oracle).unwrap(),
                     false,
                     open,
                 );
-                assert_same_rows(&native, &expected, &context);
+                assert_same_rows(&native_by_value, &expected, &context);
             }
             checked += 1;
             with_solutions += usize::from(!native.is_empty());
         }
     }
     assert!(
-        with_solutions * 4 > checked * 3,
+        covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
@@ -1928,7 +2117,11 @@ fn joins_on_unbound_variables_equal_the_reference() {
     let oracle = QueryOptions {
         ..QueryOptions::default()
     };
-    for dataset_case in 0..60 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions * 4 > checked * 3;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 60, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -1973,7 +2166,7 @@ fn joins_on_unbound_variables_equal_the_reference() {
         }
     }
     assert!(
-        with_solutions * 4 > checked * 3,
+        covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
@@ -2112,7 +2305,7 @@ fn cyclic_bgps_equal_the_reference() {
                     format!("{b} {predicate} {a} .")
                 }
             };
-            let mut body = match rng.below(6) {
+            let mut body = match rng.below(9) {
                 0 | 1 => format!(
                     "{} {} {}",
                     edge(&mut rng, "?a", "?b"),
@@ -2135,6 +2328,34 @@ fn cyclic_bgps_equal_the_reference() {
                     "?a <{EX}p0> ?a . {} {}",
                     edge(&mut rng, "?a", "?b"),
                     edge(&mut rng, "?b", "?a")
+                ),
+                5 => format!(
+                    "{} {} {} {} {}",
+                    edge(&mut rng, "?a", "?b"),
+                    edge(&mut rng, "?b", "?c"),
+                    edge(&mut rng, "?c", "?d"),
+                    edge(&mut rng, "?d", "?e"),
+                    edge(&mut rng, "?e", "?a")
+                ),
+                // Two triangles sharing `?a`.
+                6 => format!(
+                    "{} {} {} {} {} {}",
+                    edge(&mut rng, "?a", "?b"),
+                    edge(&mut rng, "?b", "?c"),
+                    edge(&mut rng, "?c", "?a"),
+                    edge(&mut rng, "?a", "?d"),
+                    edge(&mut rng, "?d", "?e"),
+                    edge(&mut rng, "?e", "?a")
+                ),
+                // A 4-cycle with a tail and a chord.
+                7 => format!(
+                    "{} {} {} {} {} {}",
+                    edge(&mut rng, "?a", "?b"),
+                    edge(&mut rng, "?b", "?c"),
+                    edge(&mut rng, "?c", "?d"),
+                    edge(&mut rng, "?d", "?a"),
+                    edge(&mut rng, "?c", "?e"),
+                    edge(&mut rng, "?a", "?c")
                 ),
                 _ => {
                     let (x, y) = (
@@ -2163,10 +2384,80 @@ fn cyclic_bgps_equal_the_reference() {
             );
             let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
             assert_eq!(native, expected, "{text}");
+            // Counted by the join (`wcoj::Query::count_solutions`), not from its rows: as
+            // many as the reference's solutions.
+            let count = format!("SELECT (COUNT(*) AS ?n) WHERE {{ {body} }}");
+            let query = SparqlParser::new().parse_query(&count).unwrap();
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            let solutions = expected.len();
+            assert_eq!(
+                native,
+                [format!(
+                    "\"{solutions}\"^^<http://www.w3.org/2001/XMLSchema#integer>"
+                )],
+                "{count}"
+            );
             checked += 1;
         }
     }
     assert_eq!(checked, 1000);
+}
+
+/// COUNT(*) of a cyclic BGP, counted by its join, is exact while 64 bits hold it and fails
+/// as the engine's range limit past them; it never answers a capped number. A triangle over
+/// one statement and `m` patterns of 256 matches each are 256^m solutions: 2^56 for 7, and
+/// 2^64, one past `u64::MAX`, for 8.
+#[test]
+fn a_cyclic_count_past_64_bits_fails_as_a_range_limit() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    tx.insert(Quad::new(ex("a"), ex("link"), ex("a"), GraphName::DefaultGraph).as_ref());
+    for i in 0..256 {
+        let quad = Quad::new(
+            ex(&format!("s{i}")),
+            ex("p"),
+            ex("o"),
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    // A budget, so that a count from the rows would fail at once instead of making them.
+    let options = QueryOptions {
+        resources: nrese_sparql::Resources {
+            memory: nrese_exec::Envelope::new(Some(64 << 20), None),
+            ..Default::default()
+        },
+        ..QueryOptions::default()
+    };
+    let count = |m: usize| -> Result<Option<Term>, nrese_sparql::QueryEvaluationError> {
+        let independent: String = (0..m)
+            .map(|i| format!(" ?x{i} <{EX}p> <{EX}o> ."))
+            .collect();
+        let text = format!(
+            "SELECT (COUNT(*) AS ?n) WHERE {{ ?a <{EX}link> ?b . ?b <{EX}link> ?c . \
+             ?c <{EX}link> ?a .{independent} }}"
+        );
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let QueryResults::Solutions(mut solutions) = evaluate_query(&snapshot, &query, &options)?
+        else {
+            unreachable!("a SELECT")
+        };
+        Ok(solutions
+            .next()
+            .transpose()?
+            .and_then(|s| s.get("n").cloned()))
+    };
+    let exact = Literal::new_typed_literal((1u64 << 56).to_string(), xsd::INTEGER);
+    assert_eq!(count(7).unwrap(), Some(exact.into()));
+    match count(8) {
+        Err(nrese_sparql::QueryEvaluationError::CountBeyondRange { .. }) => {}
+        other => panic!("256^8 solutions: {other:?}"),
+    }
 }
 
 /// A selective pattern joined with a much larger one runs as a parallel index nested-loop
@@ -2271,6 +2562,57 @@ fn explain_reports_the_plan() {
     );
     assert_eq!(explanation.executor, "native");
     assert_eq!(explanation.rows, solutions.len() as u64);
+    // A filter over one basic graph pattern is placed inside it by the executor: no
+    // rewrite. Over an OPTIONAL it moves into the left side.
+    assert!(
+        explanation.rewrites.is_empty(),
+        "{:?}",
+        explanation.rewrites
+    );
+    let optional = format!(
+        "SELECT ?x WHERE {{ ?x <{EX}memberOf> <{EX}d0> OPTIONAL {{ ?x <{EX}takes> ?c }} FILTER(?x != <{EX}s1>) }}"
+    );
+    let optional = SparqlParser::new().parse_query(&optional).unwrap();
+    let optional = explain_query(&snapshot, &optional, &QueryOptions::default()).unwrap();
+    assert_eq!(optional.rewrites, ["filter-pushdown"]);
+    // (The parser merges adjacent basic graph patterns itself; a group with an OPTIONAL
+    // stays apart until the rewrite.)
+    let grouped = format!(
+        "SELECT ?x ?c WHERE {{ {{ ?x a <{EX}Grad> OPTIONAL {{ ?x <{EX}takes> ?c }} }} ?x <{EX}memberOf> <{EX}d0> }}"
+    );
+    let grouped = SparqlParser::new().parse_query(&grouped).unwrap();
+    let explained = explain_query(&snapshot, &grouped, &QueryOptions::default()).unwrap();
+    assert_eq!(explained.rewrites, ["join-groups"]);
+    let grouped_rows = rows(
+        evaluate_query(&snapshot, &grouped, &QueryOptions::default()).unwrap(),
+        false,
+    );
+    assert_eq!(explained.rows, grouped_rows.len() as u64);
+    // The plan before running: the same rewrites, the nodes from the top down, each
+    // triple pattern with its exact count, the join with the orderer's estimate.
+    let planned = plan_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    assert_eq!(planned.rewrites, explanation.rewrites);
+    assert_eq!(planned.steps[0].operator, "project");
+    let member_of = planned
+        .steps
+        .iter()
+        .find(|s| s.operator == "scan" && s.detail.contains("memberOf"))
+        .unwrap();
+    assert_eq!(member_of.estimated_rows, Some(20), "{:#?}", planned.steps);
+    let bgp = planned.steps.iter().find(|s| s.operator == "bgp").unwrap();
+    assert!(bgp.estimated_rows.is_some_and(|rows| rows <= 20), "{bgp:?}");
+    // What a remote endpoint returns is unknown, and so is what contains it.
+    let remote = SparqlParser::new()
+        .parse_query("SELECT * WHERE { SERVICE <http://example.com/sparql> { ?s ?p ?o } }")
+        .unwrap();
+    let planned = plan_query(&snapshot, &remote, &QueryOptions::default()).unwrap();
+    let service = planned
+        .steps
+        .iter()
+        .find(|s| s.operator == "service")
+        .unwrap();
+    assert_eq!(service.estimated_rows, None);
+    assert_eq!(planned.steps[0].estimated_rows, None);
     let operators: Vec<(usize, &str)> = explanation
         .steps
         .iter()
@@ -2520,7 +2862,11 @@ fn construct_equals_the_reference() {
         },
     ];
     let mut checked = 0;
-    for _ in 0..60 {
+    let covered = |checked: usize| checked > 1000;
+    for drawn in 0.. {
+        if !draws_on(drawn, 60, covered(checked)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -2560,7 +2906,7 @@ fn construct_equals_the_reference() {
             checked += 1;
         }
     }
-    assert!(checked > 1000, "{checked}");
+    assert!(covered(checked), "{checked}");
 }
 
 /// GRAPH patterns (a graph variable or constant, mixed with default-graph patterns, the
@@ -2569,7 +2915,11 @@ fn construct_equals_the_reference() {
 fn graph_patterns_equal_the_reference() {
     let mut rng = Rng::seeded(20_260_930);
     let (mut checked, mut fallbacks) = (0, 0);
-    for _ in 0..80 {
+    let covered = |checked: usize, fallbacks: usize| checked > 1500 && fallbacks * 4 < checked;
+    for drawn in 0.. {
+        if !draws_on(drawn, 80, covered(checked, fallbacks)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -2614,6 +2964,7 @@ fn graph_patterns_equal_the_reference() {
                 fallbacks += 1;
                 continue;
             }
+            plan_round_trips(&query);
             let native = rows(
                 evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
                 false,
@@ -2627,7 +2978,7 @@ fn graph_patterns_equal_the_reference() {
         }
     }
     assert!(
-        checked > 1500 && fallbacks * 4 < checked,
+        covered(checked, fallbacks),
         "{checked} checked, {fallbacks} fallbacks"
     );
 }
@@ -2905,7 +3256,11 @@ fn direct_results_equal_the_results_serialiser() {
     ];
     let mut rng = Rng::seeded(20_260_933);
     let mut checked = 0;
-    for _ in 0..60 {
+    let covered = |checked: usize| checked > 3000;
+    for drawn in 0.. {
+        if !draws_on(drawn, 60, covered(checked)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -2965,7 +3320,7 @@ fn direct_results_equal_the_results_serialiser() {
             }
         }
     }
-    assert!(checked > 3000, "{checked}");
+    assert!(covered(checked), "{checked}");
 }
 
 /// Results of many blocks are serialised in parallel ([`nrese_sparql::write_results`]):
@@ -3096,7 +3451,21 @@ fn load_spread_over_graphs(engine: &Engine, rng: &mut Rng) {
 fn the_merged_default_graph_equals_the_reference() {
     let mut rng = Rng::seeded(20_260_933);
     let (mut checked, mut fallbacks, mut native_runs, mut native_runs_plain) = (0, 0, 0, 0);
-    for dataset_case in 0..120 {
+    let covered =
+        |checked: usize, fallbacks: usize, native_runs: usize, native_runs_plain: usize| {
+            checked > 4000
+                && fallbacks * 20 < checked
+                && native_runs * 4 > checked * 3
+                && native_runs * 20 > native_runs_plain * 19
+        };
+    for dataset_case in 0.. {
+        if !draws_on(
+            dataset_case,
+            120,
+            covered(checked, fallbacks, native_runs, native_runs_plain),
+        ) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         load_spread_over_graphs(&engine, &mut rng);
         let snapshot = engine.snapshot();
@@ -3139,6 +3508,7 @@ fn the_merged_default_graph_equals_the_reference() {
                 fallbacks += 1;
                 continue;
             }
+            plan_round_trips(&query);
             let native_in = |options: &QueryOptions| {
                 explain_query(&snapshot, &query, options).unwrap().executor == "native"
             };
@@ -3180,12 +3550,8 @@ fn the_merged_default_graph_equals_the_reference() {
     // the plain default graph:
     // what hands a query back at run time (unbound join keys) isn't the merge.
     assert!(
-        checked > 4000
-            && fallbacks * 20 < checked
-            && native_runs * 4 > checked * 3
-            && native_runs * 20 > native_runs_plain * 19,
-        "{checked} checked, {fallbacks} not native by shape, {native_runs} ran natively, \
-         {native_runs_plain} with the plain default graph"
+        covered(checked, fallbacks, native_runs, native_runs_plain),
+        "{checked} checked, {fallbacks} not native by shape, {native_runs} ran natively, {native_runs_plain} with the plain default graph"
     );
 }
 
@@ -3342,7 +3708,11 @@ fn updates_over_the_merged_default_graph_equal_the_reference() {
         ("DELETE { ?a ?p ?b }", ""),
     ];
     let mut changed = 0;
-    for _ in 0..60 {
+    let covered = |changed: usize| changed > 100;
+    for drawn in 0.. {
+        if !draws_on(drawn, 60, covered(changed)) {
+            break;
+        }
         let engines = [
             Engine::new(EngineConfig::default()).unwrap(),
             Engine::new(EngineConfig::default()).unwrap(),
@@ -3377,7 +3747,7 @@ fn updates_over_the_merged_default_graph_equal_the_reference() {
             changed += usize::from(native != before);
         }
     }
-    assert!(changed > 100, "only {changed} updates changed anything");
+    assert!(covered(changed), "only {changed} updates changed anything");
 }
 
 /// A `WHERE` body for the dataset tests: what the default graph of the dataset holds,
@@ -3563,7 +3933,17 @@ fn protocol_dataset(rng: &mut Rng) -> Option<nrese_sparql::QueryDatasetSpecifica
 fn datasets_and_graph_patterns_equal_the_reference() {
     let mut rng = Rng::seeded(20_260_935);
     let (mut checked, mut with_solutions, mut with_dataset, mut fallbacks) = (0, 0, 0, 0);
-    for dataset_case in 0..100 {
+    let covered = |checked: usize, with_solutions: usize, with_dataset: usize, fallbacks: usize| {
+        fallbacks * 50 < checked && with_solutions * 3 > checked && with_dataset * 2 > checked
+    };
+    for dataset_case in 0.. {
+        if !draws_on(
+            dataset_case,
+            100,
+            covered(checked, with_solutions, with_dataset, fallbacks),
+        ) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         load_spread_over_graphs(&engine, &mut rng);
         let snapshot = engine.snapshot();
@@ -3598,6 +3978,7 @@ fn datasets_and_graph_patterns_equal_the_reference() {
                 fallbacks += 1;
                 continue;
             }
+            plan_round_trips(&query);
             // A silent fallback would hide a query the executor can't take.
             assert_eq!(
                 explain_query(&snapshot, &query, &options).unwrap().executor,
@@ -3614,9 +3995,8 @@ fn datasets_and_graph_patterns_equal_the_reference() {
         }
     }
     assert!(
-        fallbacks * 50 < checked && with_solutions * 3 > checked && with_dataset * 2 > checked,
-        "{checked} checked, {fallbacks} not native by shape, {with_solutions} with solutions, \
-         {with_dataset} with a dataset"
+        covered(checked, with_solutions, with_dataset, fallbacks),
+        "{checked} checked, {fallbacks} not native by shape, {with_solutions} with solutions, {with_dataset} with a dataset"
     );
 }
 
@@ -3762,6 +4142,33 @@ fn a_dataset_is_what_the_query_names() {
             options.dataset
         );
     }
+    // The merge of every graph but some (SHACL's data graph), asked for without the union
+    // default graph: nothing left out is every graph, as is leaving out a graph the store
+    // doesn't hold; the named graphs stay the store's.
+    let unknown = || -> GraphName { ex("g9").into() };
+    for (left_out, text, solutions) in [
+        (vec![], "SELECT * WHERE { ?s ?p ?o }", 5),
+        (vec![unknown()], "SELECT * WHERE { ?s ?p ?o }", 5),
+        (vec![ex("g0").into()], "SELECT * WHERE { ?s ?p ?o }", 4),
+        (
+            vec![GraphName::DefaultGraph, ex("g2").into()],
+            "SELECT * WHERE { ?s ?p ?o }",
+            3,
+        ),
+        (vec![ex("g0").into()], "SELECT * WHERE { GRAPH ?g { } }", 3),
+    ] {
+        let mut dataset = nrese_sparql::QueryDatasetSpecification::new();
+        dataset.set_default_graph_excluding(left_out.clone());
+        let options = QueryOptions {
+            dataset: Some(dataset),
+            ..QueryOptions::default()
+        };
+        assert_eq!(
+            count(text, &options),
+            solutions,
+            "{text} without {left_out:?}"
+        );
+    }
     // Rows no statement gives, under names in and outside the dataset: checked by example
     // and against the reference evaluator.
     let native_count = |text: &str| {
@@ -3859,7 +4266,11 @@ fn updates_with_a_dataset_equal_the_reference() {
     use nrese_sparql::UpdateOptions;
     let mut rng = Rng::seeded(20_260_936);
     let (mut checked, mut changed) = (0, 0);
-    for _ in 0..60 {
+    let covered = |checked: usize, changed: usize| checked >= 480 && changed * 4 > checked;
+    for drawn in 0.. {
+        if !draws_on(drawn, 60, covered(checked, changed)) {
+            break;
+        }
         let engines = [
             Engine::new(EngineConfig::default()).unwrap(),
             Engine::new(EngineConfig::default()).unwrap(),
@@ -3916,14 +4327,17 @@ fn updates_with_a_dataset_equal_the_reference() {
         }
     }
     assert!(
-        checked == 480 && changed * 4 > checked,
+        covered(checked, changed),
         "{changed} of {checked} updates changed something"
     );
 }
 
 /// The default graph merged from listed graphs (`FROM <g0> FROM <g1>`) through the
 /// shortcuts that read the index directly (an index nested-loop join, a streamed `LIMIT`,
-/// `COUNT(*)` of one pattern): each statement once, and none from another graph.
+/// `COUNT(*)` of one pattern): each statement once, and none from another graph. The
+/// `LIMIT` of one pattern streams until it has its rows, as over one graph. A blank node
+/// two graphs share is one node of the merge (the owner's decision, as Jena, GraphDB and
+/// Oxigraph; RDF merge, SPARQL 1.1 §13.2, would keep the two apart: two solutions).
 #[test]
 fn a_merge_of_listed_graphs_takes_no_shortcut_through_other_graphs() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
@@ -3936,29 +4350,47 @@ fn a_merge_of_listed_graphs_takes_no_shortcut_through_other_graphs() {
         }
         tx.insert(quad("b", format!("y{i}"), "g2").as_ref());
     }
+    for g in ["g0", "g1"] {
+        let shared = nrese_rdf::BlankNode::new_unchecked("shared");
+        tx.insert(Quad::new(shared, ex("q"), ex("x"), ex(g)).as_ref());
+    }
     tx.commit().unwrap();
     let snapshot = engine.snapshot();
     let from = format!("FROM <{EX}g0> FROM <{EX}g1>");
-    for (text, solutions) in [
+    for (text, solutions, operator) in [
         (
             format!("SELECT * {from} WHERE {{ <{EX}a> <{EX}p> ?b . ?b <{EX}p> ?c }}"),
             40,
+            None,
         ),
         (
             format!("SELECT * {from} WHERE {{ ?b <{EX}p> ?c }} LIMIT 100"),
             41,
+            Some(("limit pushdown", "until 100 rows")),
         ),
         (
             format!("SELECT (COUNT(*) AS ?n) {from} WHERE {{ ?b <{EX}p> ?c }}"),
             1,
+            None,
+        ),
+        (
+            format!("SELECT * {from} WHERE {{ ?s <{EX}q> ?o }}"),
+            1,
+            None,
         ),
     ] {
         let query = SparqlParser::new().parse_query(&text).unwrap();
         let options = QueryOptions::default();
-        assert_eq!(
-            explain_query(&snapshot, &query, &options).unwrap().executor,
-            "native"
-        );
+        let plan = explain_query(&snapshot, &query, &options).unwrap();
+        assert_eq!(plan.executor, "native");
+        if let Some((operator, detail)) = operator {
+            assert!(
+                plan.steps
+                    .iter()
+                    .any(|s| s.operator == operator && s.detail.ends_with(detail)),
+                "{text}: no {operator} {detail}"
+            );
+        }
         let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
         assert_eq!(native.len(), solutions, "{text}");
         assert!(
@@ -3969,6 +4401,152 @@ fn a_merge_of_listed_graphs_takes_no_shortcut_through_other_graphs() {
             assert!(native[0].starts_with("\"41\""), "{text}: {native:?}");
         }
     }
+}
+
+/// Joins in a default graph merged from several graphs (`FROM`, the protocol's dataset, the
+/// merge of every graph, a restricted reader's readable graphs) and in `GRAPH`, run by
+/// index probes and by scans ([`QueryOptions::index_joins`]): both equal the reference
+/// evaluator (a restricted reader's on the dataset of its readable graphs). A third of the
+/// statements are in a second graph too: a probe skips the graphs outside the set and
+/// gives a statement once.
+#[test]
+fn joins_over_graph_sets_by_probes_and_by_scans_equal_the_reference() {
+    use nrese_rdf::NamedOrBlankNode;
+    use nrese_sparql::{GraphAccess, QueryDatasetSpecification};
+    let mut rng = Rng::seeded(20_261_019);
+    let (mut checked, mut probed, mut with_solutions) = (0, 0, 0);
+    let covered = |checked: usize, probed: usize, with_solutions: usize| {
+        checked > 200 && probed * 2 > checked && with_solutions * 3 > checked
+    };
+    let graph = |rng: &mut Rng| -> GraphName {
+        match rng.below(4) {
+            0 => GraphName::DefaultGraph,
+            n => ex(&format!("g{}", n - 1)).into(),
+        }
+    };
+    let named = |graphs: &[&str]| -> Vec<NamedOrBlankNode> {
+        graphs.iter().map(|g| ex(g).into()).collect()
+    };
+    let dataset = |default: Vec<GraphName>, named: Vec<NamedOrBlankNode>| {
+        let mut dataset = QueryDatasetSpecification::new();
+        dataset.set_default_graph(default);
+        dataset.set_available_named_graphs(named);
+        Some(dataset)
+    };
+    for drawn in 0.. {
+        if !draws_on(drawn, 6, covered(checked, probed, with_solutions)) {
+            break;
+        }
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        for quad in skewed_dataset(&mut rng) {
+            let copies = 1 + usize::from(rng.below(3) == 0);
+            for _ in 0..copies {
+                let g = graph(&mut rng);
+                let copy = Quad::new(
+                    quad.subject.clone(),
+                    quad.predicate.clone(),
+                    quad.object.clone(),
+                    g,
+                );
+                tx.insert(copy.as_ref());
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for query_case in 0..40 {
+            let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(3));
+            let rare = format!("?a <{EX}rare> ?b .");
+            let body = match rng.below(7) {
+                0 => format!("{rare} ?b {} ?c .", p(&mut rng)),
+                1 => format!("{rare} ?b {} ?c . ?c <{EX}name> ?n .", p(&mut rng)),
+                2 => format!("{rare} ?a {} ?c . ?c {} ?d .", p(&mut rng), p(&mut rng)),
+                3 => format!("{rare} OPTIONAL {{ ?b {} ?c }}", p(&mut rng)),
+                4 => format!("{rare} ?c {} ?d FILTER(?c = ?b)", p(&mut rng)),
+                5 => format!("GRAPH ?g {{ {rare} ?b {} ?c }}", p(&mut rng)),
+                _ => format!("{rare} GRAPH ?g {{ ?b {} ?c }}", p(&mut rng)),
+            };
+            let from = |graphs: &[&str]| -> String {
+                graphs.iter().map(|g| format!("FROM <{EX}{g}> ")).collect()
+            };
+            let (clause, options, oracle) = match rng.below(5) {
+                0 => (from(&["g0", "g1"]), QueryOptions::default(), None),
+                1 => (
+                    format!(
+                        "{}FROM NAMED <{EX}g1> FROM NAMED <{EX}g2> ",
+                        from(&["g0", "g1", "g2"])
+                    ),
+                    QueryOptions::default(),
+                    None,
+                ),
+                2 => {
+                    let default = vec![GraphName::DefaultGraph, ex("g1").into(), ex("g2").into()];
+                    let options = QueryOptions {
+                        dataset: dataset(default, named(&["g0", "g1"])),
+                        ..QueryOptions::default()
+                    };
+                    (String::new(), options, None)
+                }
+                3 => {
+                    let options = QueryOptions {
+                        union_default_graph: true,
+                        ..QueryOptions::default()
+                    };
+                    (String::new(), options, None)
+                }
+                _ => {
+                    let access = GraphAccess {
+                        graphs: vec![format!("{EX}g0"), format!("{EX}g1")],
+                        default_graph: rng.below(2) == 0,
+                        inferred: true,
+                        ..GraphAccess::default()
+                    };
+                    let mut default: Vec<GraphName> = vec![ex("g0").into(), ex("g1").into()];
+                    if access.default_graph {
+                        default.push(GraphName::DefaultGraph);
+                    }
+                    let oracle = QueryOptions {
+                        dataset: dataset(default, named(&["g0", "g1"])),
+                        ..QueryOptions::default()
+                    };
+                    let options = QueryOptions {
+                        union_default_graph: true,
+                        access: Some(std::sync::Arc::new(access)),
+                        ..QueryOptions::default()
+                    };
+                    (String::new(), options, Some(oracle))
+                }
+            };
+            let text = format!("SELECT * {clause}WHERE {{ {body} }}");
+            let context = format!("dataset {drawn}, query {query_case}: {text}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let oracle = oracle.unwrap_or_else(|| options.clone());
+            let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
+            for index_joins in [Some(true), Some(false)] {
+                let options = QueryOptions {
+                    index_joins,
+                    ..options.clone()
+                };
+                let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+                assert_same_rows(&native, &expected, &format!("{context}, {index_joins:?}"));
+            }
+            let probes = QueryOptions {
+                index_joins: Some(true),
+                ..options
+            };
+            let plan = explain_query(&snapshot, &query, &probes).unwrap();
+            assert_eq!(plan.executor, "native", "{context}");
+            probed += usize::from(plan.steps.iter().any(|s| s.operator == "index join"));
+            with_solutions += usize::from(!expected.is_empty());
+            checked += 1;
+        }
+    }
+    assert!(
+        covered(checked, probed, with_solutions),
+        "{checked} checked, {probed} probed, {with_solutions} with solutions"
+    );
 }
 
 /// An `EXISTS` for [`exists_equal_the_reference`]: over any pattern, correlated with the outer
@@ -4031,7 +4609,13 @@ fn exists_pattern(rng: &mut Rng) -> String {
 fn exists_equal_the_reference() {
     let mut rng = Rng::seeded(20_260_937);
     let (mut checked, mut native_runs, mut with_solutions) = (0, 0, 0);
-    for _ in 0..80 {
+    let covered = |checked: usize, native_runs: usize, with_solutions: usize| {
+        native_runs * 10 > checked * 7 && with_solutions * 2 > checked
+    };
+    for drawn in 0.. {
+        if !draws_on(drawn, 80, covered(checked, native_runs, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         load_spread_over_graphs(&engine, &mut rng);
         let snapshot = engine.snapshot();
@@ -4094,10 +4678,8 @@ fn exists_equal_the_reference() {
         }
     }
     assert!(
-        // A quarter of the EXISTS patterns are correlated deeper than the native executor
-        // takes.
-        native_runs * 10 > checked * 7 && with_solutions * 2 > checked,
-        "{checked} checked, {native_runs} native, {with_solutions} with solutions"
+        covered(checked, native_runs, with_solutions),
+        "{checked} checked, {native_runs} native (a quarter of the EXISTS patterns are correlated deeper than the native executor takes), {with_solutions} with solutions"
     );
 }
 
@@ -4160,6 +4742,173 @@ fn describe_equals_the_reference() {
         }
     }
     assert_eq!(checked, 1000);
+}
+
+/// Promotion, checked arithmetic and aggregate error handling at the shared numeric
+/// boundary, compared term for term across native and reference execution paths.
+#[test]
+fn numeric_expressions_and_totals_equal_the_reference() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    let check = |body: String| {
+        let text = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {body}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        assert!(runs_natively(&query), "{text}");
+        assert_eq!(
+            rows(evaluate_query(&snapshot, &query, &options).unwrap(), false),
+            rows(reference(&snapshot, &query, &options).unwrap(), false),
+            "{text}"
+        );
+    };
+    let values = [
+        "0",
+        "1",
+        "-1",
+        "9223372036854775807",
+        "-9223372036854775808",
+        "1.5",
+        "-0.5",
+        "1e0",
+        "\"2.5\"^^xsd:float",
+        "\"-0\"^^xsd:float",
+        "\"INF\"^^xsd:double",
+        "\"-INF\"^^xsd:double",
+        "\"NaN\"^^xsd:float",
+        "\"NaN\"^^xsd:double",
+        "\"01\"^^xsd:int",
+        "\"bad\"^^xsd:integer",
+        "\"text\"",
+        "UNDEF",
+    ];
+    // The reference shares expression and aggregate value semantics, but evaluates
+    // groups independently of the native fast paths. Fixed value expectations below
+    // separately guard arithmetic itself.
+    for left in values {
+        check(format!(
+            "SELECT (-?a AS ?neg) (ABS(?a) AS ?abs) (CEIL(?a) AS ?ceil) \
+             (FLOOR(?a) AS ?floor) (ROUND(?a) AS ?round) {{ VALUES ?a {{ {left} }} }}"
+        ));
+        for right in values {
+            check(format!(
+                "SELECT (?a + ?b AS ?add) (?a - ?b AS ?sub) (?a * ?b AS ?mul) \
+                 (?a / ?b AS ?div) {{ VALUES (?a ?b) {{ ({left} {right}) }} }}"
+            ));
+            // Variable, memoised expression and DISTINCT/general aggregate paths.
+            for argument in ["?v", "(?v + 0)", "DISTINCT ?v"] {
+                check(format!(
+                    "SELECT (SUM({argument}) AS ?sum) (AVG({argument}) AS ?avg) \
+                     {{ VALUES ?v {{ {left} {right} }} }}"
+                ));
+            }
+        }
+    }
+    for values in ["", "UNDEF", "1 UNDEF", "1 1 2"] {
+        check(format!(
+            "SELECT (SUM(?v) AS ?sum) (AVG(?v) AS ?avg) (COUNT(?v) AS ?count) \
+             (MIN(?v) AS ?min) (MAX(?v) AS ?max) {{ VALUES ?v {{ {values} }} }}"
+        ));
+    }
+}
+
+/// Fixed expectations, independent of the shared expression evaluator and SUM/AVG
+/// helpers used by the reference. Check lexical value, datatype and unbound results.
+#[test]
+fn numeric_values_keep_their_sparql_semantics() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    let check = |body: String, expected: Option<(&str, nrese_rdf::NamedNodeRef<'_>)>| {
+        let text = format!("PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> {body}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let QueryResults::Solutions(mut solutions) =
+            evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap()
+        else {
+            panic!("expected solutions: {text}");
+        };
+        let solution = solutions.next().unwrap().unwrap();
+        let expected = expected
+            .map(|(value, datatype)| Term::from(Literal::new_typed_literal(value, datatype)));
+        assert_eq!(solution.get("result"), expected.as_ref(), "{text}");
+        assert!(solutions.next().is_none(), "{text}");
+    };
+    for (expression, expected) in [
+        ("1 + 2", Some(("3", xsd::INTEGER))),
+        ("1 + 2.5", Some(("3.5", xsd::DECIMAL))),
+        ("1.0 + \"2.5\"^^xsd:float", Some(("3.5", xsd::FLOAT))),
+        ("\"2.5\"^^xsd:float + 1e0", Some(("3.5", xsd::DOUBLE))),
+        ("1 / 2", Some(("0.5", xsd::DECIMAL))),
+        ("1 / 0", None),
+        ("1.0 / 0.0", None),
+        ("1e0 / 0e0", Some(("INF", xsd::DOUBLE))),
+        ("0e0 / 0e0", Some(("NaN", xsd::DOUBLE))),
+        ("\"NaN\"^^xsd:float + 1", Some(("NaN", xsd::FLOAT))),
+        ("9223372036854775807 + 1", None),
+        ("-9223372036854775808 - 1", None),
+        ("9223372036854775807 * 2", None),
+        ("-(-9223372036854775808)", None),
+        ("ABS(-9223372036854775808)", None),
+        ("ROUND(-0.5)", Some(("0", xsd::DECIMAL))),
+        (
+            "\"PT1H\"^^xsd:dayTimeDuration + \"PT30M\"^^xsd:dayTimeDuration",
+            Some(("PT1H30M", xsd::DAY_TIME_DURATION)),
+        ),
+        ("\"text\" + 1", None),
+    ] {
+        check(format!("SELECT ({expression} AS ?result) {{}}"), expected);
+    }
+    for (values, sum, average) in [
+        ("", Some(("0", xsd::INTEGER)), Some(("0", xsd::INTEGER))),
+        (
+            "1 2",
+            Some(("3", xsd::INTEGER)),
+            Some(("1.5", xsd::DECIMAL)),
+        ),
+        (
+            "1 2.5",
+            Some(("3.5", xsd::DECIMAL)),
+            Some(("1.75", xsd::DECIMAL)),
+        ),
+        (
+            "1 \"2.5\"^^xsd:float",
+            Some(("3.5", xsd::FLOAT)),
+            Some(("1.75", xsd::FLOAT)),
+        ),
+        (
+            "1 2.5e0",
+            Some(("3.5", xsd::DOUBLE)),
+            Some(("1.75", xsd::DOUBLE)),
+        ),
+        (
+            "1 \"NaN\"^^xsd:float",
+            Some(("NaN", xsd::FLOAT)),
+            Some(("NaN", xsd::FLOAT)),
+        ),
+        ("9223372036854775807 1", None, None),
+        ("1 UNDEF", None, None),
+        ("1 \"text\"", None, None),
+        (
+            "\"P1M\"^^xsd:yearMonthDuration \"P3M\"^^xsd:yearMonthDuration",
+            Some(("P4M", xsd::YEAR_MONTH_DURATION)),
+            Some(("P2M", xsd::YEAR_MONTH_DURATION)),
+        ),
+        (
+            "\"PT1H\"^^xsd:dayTimeDuration \"PT2H\"^^xsd:dayTimeDuration",
+            Some(("PT3H", xsd::DAY_TIME_DURATION)),
+            Some(("PT1H30M", xsd::DAY_TIME_DURATION)),
+        ),
+        (
+            "\"P1M\"^^xsd:yearMonthDuration \"PT1H\"^^xsd:dayTimeDuration",
+            None,
+            None,
+        ),
+    ] {
+        for (function, expected) in [("SUM", sum), ("AVG", average)] {
+            check(
+                format!("SELECT ({function}(?v) AS ?result) {{ VALUES ?v {{ {values} }} }}"),
+                expected,
+            );
+        }
+    }
 }
 
 /// TIMEZONE and TZ of dates and times of every kind, the hashes, and IRI() resolved against
@@ -4306,7 +5055,11 @@ fn skewed_dataset(rng: &mut Rng) -> Vec<Quad> {
 fn sideways_joins_equal_the_reference() {
     let mut rng = Rng::seeded(20_260_940);
     let (mut checked, mut probed) = (0, 0);
-    for _ in 0..4 {
+    let covered = |checked: usize, probed: usize| probed * 3 > checked;
+    for drawn in 0.. {
+        if !draws_on(drawn, 4, covered(checked, probed)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in skewed_dataset(&mut rng) {
@@ -4373,7 +5126,7 @@ fn sideways_joins_equal_the_reference() {
         }
     }
     assert!(
-        probed * 3 > checked,
+        covered(checked, probed),
         "{probed} of {checked} probed the index"
     );
 }
@@ -4385,7 +5138,11 @@ fn multi_operation_updates_equal_the_reference() {
     use nrese_sparql::UpdateOptions;
     let mut rng = Rng::seeded(20_260_941);
     let mut changed = 0;
-    for _ in 0..40 {
+    let covered = |changed: usize| changed > 150;
+    for drawn in 0.. {
+        if !draws_on(drawn, 40, covered(changed)) {
+            break;
+        }
         let data = random_dataset(&mut rng);
         let engines = [
             Engine::new(EngineConfig::default()).unwrap(),
@@ -4439,7 +5196,7 @@ fn multi_operation_updates_equal_the_reference() {
             changed += usize::from(native != before);
         }
     }
-    assert!(changed > 150, "only {changed} requests changed anything");
+    assert!(covered(changed), "only {changed} requests changed anything");
 }
 
 /// Data closed under `owl:sameAs` (every fact replicated over identity classes, the
@@ -4451,7 +5208,11 @@ fn identity_classes_shrink_detached_optionals() {
     let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
     let mut rng = Rng::seeded(20_260_942);
     let (mut checked, mut shrunk) = (0, 0);
-    for _ in 0..12 {
+    let covered = |checked: usize, shrunk: usize| shrunk * 3 > checked;
+    for drawn in 0.. {
+        if !draws_on(drawn, 12, covered(checked, shrunk)) {
+            break;
+        }
         // Classes of 1 to 5 identities; facts between classes, replicated.
         let mut classes: Vec<Vec<NamedNode>> = Vec::new();
         for c in 0..12 {
@@ -4567,7 +5328,10 @@ fn identity_classes_shrink_detached_optionals() {
             checked += 1;
         }
     }
-    assert!(shrunk * 3 > checked, "{shrunk} of {checked} joins shrank");
+    assert!(
+        covered(checked, shrunk),
+        "{shrunk} of {checked} joins shrank"
+    );
 }
 
 /// A selective filter makes its pattern count as smaller when the join order is planned:
@@ -4694,7 +5458,11 @@ fn triple_terms_and_base_directions_equal_the_reference() {
     let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
     let mut checked = 0;
     let mut with_solutions = 0;
-    for dataset_case in 0..60 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions > checked / 4;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 60, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for _ in 0..10 + rng.below(30) {
@@ -4792,9 +5560,153 @@ fn triple_terms_and_base_directions_equal_the_reference() {
     }
     assert_eq!(checked, 60 * 40);
     assert!(
-        with_solutions > checked / 4,
+        covered(checked, with_solutions),
         "{with_solutions} of {checked} with solutions"
     );
+}
+
+/// Edges with properties as RDF 1.2 reifiers (the property-graph mapping) against the
+/// reference: hops whose triple terms the joins compose from the edge or take apart into
+/// it (`triple_joins`), edges without their base triple, several reifiers of one edge,
+/// literal objects, nested triple terms, parts bound by `VALUES` (a node the store lacks
+/// included), `OPTIONAL` and `EXISTS`, and `SUBJECT`/`OBJECT`/`TRIPLE` on ids in `BIND`
+/// and `FILTER`. Enough queries must join through a triple term to say so.
+#[test]
+fn reified_edges_hop_through_triple_terms_as_the_reference() {
+    let mut rng = Rng::seeded(20_261_013);
+    let reifies = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies>";
+    let reifies_node = NamedNode::new_unchecked(&reifies[1..reifies.len() - 1]);
+    let mut checked = 0;
+    let mut with_solutions = 0;
+    let mut linked = 0;
+    let covered = |checked: usize, with_solutions: usize| with_solutions > checked / 3;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 40, covered(checked, with_solutions)) {
+            break;
+        }
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let mut insert = |s: NamedNode, p: NamedNode, o: Term| {
+            tx.insert(Quad::new(s, p, o, GraphName::DefaultGraph).as_ref());
+        };
+        for i in 0..8 {
+            if rng.below(3) != 0 {
+                let name = Literal::new_simple_literal(format!("n{i}"));
+                insert(ex(&format!("n{i}")), ex("name"), name.into());
+            }
+        }
+        for edge in 0..10 + rng.below(30) {
+            let a = ex(&format!("n{}", rng.below(8)));
+            let p = ex(rng.pick(&["knows", "likes"]));
+            let b: Term = match rng.below(6) {
+                0 => Literal::new_simple_literal(format!("v{}", rng.below(3))).into(),
+                _ => ex(&format!("n{}", rng.below(8))).into(),
+            };
+            if rng.below(5) != 0 {
+                insert(a.clone(), p.clone(), b.clone());
+            }
+            let triple = nrese_rdf::Triple::new(a, p, b);
+            for k in 0..rng.below(3) {
+                let r = ex(&format!("r{edge}_{k}"));
+                insert(r.clone(), reifies_node.clone(), triple.clone().into());
+                let since = Literal::new_typed_literal(rng.below(5).to_string(), xsd::INTEGER);
+                insert(r.clone(), ex("since"), since.into());
+                if rng.below(3) == 0 {
+                    let source = ex(&format!("src{}", rng.below(2)));
+                    insert(r, ex("source"), source.into());
+                }
+            }
+            // A statement about the edge, itself reified.
+            if rng.below(5) == 0 {
+                let witness = ex(&format!("n{}", rng.below(8)));
+                let says = nrese_rdf::Triple::new(witness, ex("says"), triple);
+                insert(ex(&format!("w{edge}")), reifies_node.clone(), says.into());
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for query_case in 0..30 {
+            let pattern = match rng.below(12) {
+                0 => format!("?a ?p ?b . ?r {reifies} <<( ?a ?p ?b )>> . ?r <{EX}since> ?s ."),
+                1 => format!(
+                    "<{EX}n1> <{EX}knows> ?b . ?r {reifies} <<( <{EX}n1> <{EX}knows> ?b )>> . \
+                     ?r <{EX}since> ?s ."
+                ),
+                2 => format!(
+                    "?r <{EX}since> {} . ?r {reifies} <<( ?a <{EX}knows> ?b )>> . \
+                     ?a <{EX}knows> ?b .",
+                    rng.below(5)
+                ),
+                3 => format!(
+                    "?a <{EX}knows> ?b . ?r1 {reifies} <<( ?a <{EX}knows> ?b )>> . \
+                     ?b <{EX}knows> ?c . ?r2 {reifies} <<( ?b <{EX}knows> ?c )>> . \
+                     ?r2 <{EX}since> ?s ."
+                ),
+                4 => format!("?r {reifies} <<( <{EX}n2> ?p ?b )>> . ?r <{EX}since> ?s ."),
+                5 => format!("?r {reifies} <<( ?a <{EX}knows> ?b )>> . ?a <{EX}name> ?n ."),
+                6 => format!(
+                    "?w {reifies} <<( ?x <{EX}says> <<( ?a ?p ?b )>> )>> . ?a ?p ?b . \
+                     ?x <{EX}name> ?n ."
+                ),
+                7 => format!(
+                    "VALUES ?b {{ <{EX}n1> <{EX}n3> <{EX}nowhere> }} ?a <{EX}knows> ?b . \
+                     ?r {reifies} <<( ?a <{EX}knows> ?b )>> ."
+                ),
+                8 => format!(
+                    "?a <{EX}likes> ?b . OPTIONAL {{ ?r {reifies} <<( ?a <{EX}likes> ?b )>> . \
+                     ?r <{EX}source> ?src }}"
+                ),
+                9 => format!(
+                    "?a <{EX}knows> ?b . FILTER({} EXISTS {{ ?r {reifies} <<( ?a <{EX}knows> ?b )>> }})",
+                    rng.pick(&["", "NOT"])
+                ),
+                10 => format!(
+                    "?r {reifies} ?t . BIND(SUBJECT(?t) AS ?a) BIND(OBJECT(?t) AS ?b) \
+                     ?a <{EX}knows> ?b . FILTER(sameTerm(?t, TRIPLE(?a, <{EX}knows>, ?b)))"
+                ),
+                _ => format!(
+                    "?r {reifies} ?t . ?a ?p ?b . FILTER(sameTerm(?t, TRIPLE(?a, ?p, ?b)) {})",
+                    rng.pick(&["", "&& isIRI(?b)", "|| sameTerm(SUBJECT(?t), ?b)"])
+                ),
+            };
+            let (projection, modifier) = match rng.below(3) {
+                0 => ("(COUNT(*) AS ?count)", ""),
+                1 => ("*", " ORDER BY ?a ?b ?c ?p ?r ?r1 ?r2 ?s ?n ?w ?x ?t ?src"),
+                _ => ("*", ""),
+            };
+            let text = format!("SELECT {projection} WHERE {{ {pattern} }}{modifier}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            assert!(runs_natively(&query), "runs natively: {text}");
+            let options = QueryOptions::default();
+            let ordered = !modifier.is_empty();
+            let native = rows(
+                evaluate_query(&snapshot, &query, &options).unwrap(),
+                ordered,
+            );
+            let expected = rows(reference(&snapshot, &query, &options).unwrap(), ordered);
+            assert_eq!(
+                native, expected,
+                "dataset {dataset_case}, query {query_case}: {text}"
+            );
+            let explained = explain_query(&snapshot, &query, &options).unwrap();
+            linked += usize::from(
+                explained
+                    .steps
+                    .iter()
+                    .any(|step| step.operator == "triple term join"),
+            );
+            checked += 1;
+            // A count of none is no solution.
+            with_solutions += usize::from(expected.iter().any(|row| !row.starts_with("\"0\"^^")));
+        }
+    }
+    assert!(
+        covered(checked, with_solutions),
+        "{with_solutions} of {checked} with solutions"
+    );
+    assert!(linked > checked / 5, "{linked} of {checked} through a link");
 }
 
 /// GROUP BY over a cross product (`Context::group_crossed`), grouped in chunks of one row
@@ -4806,7 +5718,11 @@ fn triple_terms_and_base_directions_equal_the_reference() {
 fn grouped_cross_products_equal_the_reference() {
     let mut rng = Rng::seeded(20_261_002);
     let (mut checked, mut with_solutions) = (0, 0);
-    for dataset_case in 0..40 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions * 2 > checked;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 40, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -4887,7 +5803,7 @@ fn grouped_cross_products_equal_the_reference() {
         }
     }
     assert!(
-        with_solutions * 2 > checked,
+        covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
@@ -4900,7 +5816,11 @@ fn grouped_cross_products_equal_the_reference() {
 fn equalities_across_patterns_equal_the_reference() {
     let mut rng = Rng::seeded(20_261_005);
     let (mut checked, mut with_solutions) = (0, 0);
-    for dataset_case in 0..40 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions * 2 > checked;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 40, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -4949,7 +5869,7 @@ fn equalities_across_patterns_equal_the_reference() {
         }
     }
     assert!(
-        with_solutions * 2 > checked,
+        covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
@@ -4962,7 +5882,11 @@ fn equalities_across_patterns_equal_the_reference() {
 fn streamed_groups_equal_the_reference() {
     let mut rng = Rng::seeded(20_261_006);
     let (mut checked, mut with_solutions) = (0, 0);
-    for dataset_case in 0..40 {
+    let covered = |checked: usize, with_solutions: usize| with_solutions * 2 > checked;
+    for dataset_case in 0.. {
+        if !draws_on(dataset_case, 40, covered(checked, with_solutions)) {
+            break;
+        }
         let engine = Engine::new(EngineConfig::default()).unwrap();
         let mut tx = engine.transaction();
         for quad in random_dataset(&mut rng) {
@@ -5041,7 +5965,7 @@ fn streamed_groups_equal_the_reference() {
         }
     }
     assert!(
-        with_solutions * 2 > checked,
+        covered(checked, with_solutions),
         "only {with_solutions} of {checked} queries have solutions"
     );
 }
@@ -5072,7 +5996,10 @@ fn groups_over_joins_larger_than_memory_answer() {
     );
     let query = SparqlParser::new().parse_query(&text).unwrap();
     let limited = QueryOptions {
-        memory_limit: Some(4 << 20),
+        resources: nrese_sparql::Resources {
+            memory: nrese_exec::Envelope::new(Some(4 << 20), None),
+            ..Default::default()
+        },
         ..QueryOptions::default()
     };
     let native = rows(evaluate_query(&snapshot, &query, &limited).unwrap(), false);
@@ -5363,4 +6290,543 @@ fn long_operator_chains_neither_overflow_nor_print_unreadably() {
         .unwrap()
         .join()
         .unwrap();
+}
+
+/// The early group of eager aggregation must pay for itself: with one offer per product (the shape of DBpedia's
+/// career stations, one goal count each), aggregating the offers by product first reduces
+/// nothing, and the plan stays as written (dbpedia-core q12 got 3× slower without the
+/// statistics' say, 3 October 2026). The answers are the same either way.
+#[test]
+fn groups_over_joins_stay_where_the_early_group_reduces_nothing() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let add = |tx: &mut nrese_engine::Transaction, s: String, p: &str, o: Term| {
+        tx.insert(Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph).as_ref());
+    };
+    for product in 0..60 {
+        add(
+            &mut tx,
+            format!("product{product}"),
+            "team",
+            ex(&format!("t{}", product % 9)).into(),
+        );
+        add(
+            &mut tx,
+            format!("offer{product}"),
+            "product",
+            ex(&format!("product{product}")).into(),
+        );
+        add(
+            &mut tx,
+            format!("offer{product}"),
+            "price",
+            Literal::new_typed_literal(format!("{product}"), xsd::INTEGER).into(),
+        );
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let oracle = QueryOptions {
+        as_written: true,
+        ..QueryOptions::default()
+    };
+    let text = format!(
+        "PREFIX : <{EX}> SELECT ?team (SUM(?price) AS ?total) WHERE {{ ?product :team ?team . ?offer :product ?product ; :price ?price }} GROUP BY ?team"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let explained = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+    assert!(
+        !explained.rewrites.contains(&"eager-aggregation"),
+        "{:?}",
+        explained.rewrites
+    );
+    let native = rows(
+        evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+        false,
+    );
+    let expected = rows(reference(&snapshot, &query, &oracle).unwrap(), false);
+    assert_eq!(native, expected);
+    assert_eq!(native.len(), 9);
+}
+
+/// A value of an offer for [`eager_aggregation_equals_the_reference_on_random_groups`]:
+/// numbers of each type (exact in binary, so sums don't depend on their order), a
+/// non-canonical integer and a derived one, durations of both summable types, and terms
+/// that are no numbers. `kinds` narrows the draw, so that many groups are all numbers or
+/// all durations and their sums and averages are bound.
+fn eager_value(rng: &mut Rng, kinds: u64) -> Term {
+    let n = rng.below(9);
+    let typed = |lexical: String, datatype| Literal::new_typed_literal(lexical, datatype).into();
+    match (kinds, rng.below(12)) {
+        (0, _) => typed(n.to_string(), xsd::INTEGER),
+        (1, k) => match k % 6 {
+            0 | 1 => typed(n.to_string(), xsd::INTEGER),
+            2 => typed(format!("{n}.5"), xsd::DECIMAL),
+            3 => typed(format!("{n}.25"), xsd::FLOAT),
+            4 => typed(format!("{n}.75E0"), xsd::DOUBLE),
+            _ => typed(format!("0{n}"), xsd::INT),
+        },
+        (2, k) => match k % 2 {
+            0 => typed(format!("PT{n}H"), xsd::DAY_TIME_DURATION),
+            _ => typed(format!("P{n}DT30M"), xsd::DAY_TIME_DURATION),
+        },
+        (_, 0) => typed(format!("P{n}M"), xsd::YEAR_MONTH_DURATION),
+        (_, 1) => typed(format!("PT{n}M"), xsd::DAY_TIME_DURATION),
+        (_, 2) => Literal::new_simple_literal(format!("s{n}")).into(),
+        (_, 3) => Literal::new_language_tagged_literal_unchecked(format!("t{n}"), "en").into(),
+        (_, 4) => ex(&format!("e{n}")).into(),
+        (_, 5) => typed(format!("200{}-01-01", n % 3), xsd::DATE),
+        (_, 6) => typed(format!("0{n}"), xsd::INTEGER),
+        (_, 7) => typed(format!("{n}.5"), xsd::DECIMAL),
+        (_, 8) => typed(format!("{n}.75E0"), xsd::DOUBLE),
+        _ => typed(n.to_string(), xsd::INTEGER),
+    }
+}
+
+/// Eager aggregation, differentially: random groups over the join of products (with one
+/// or two key properties) and their offers (none to four, one or two values each, some
+/// without a second value: unbound under OPTIONAL), with every aggregate the rewrite takes
+/// (COUNT, SUM, AVG, MIN, MAX, DISTINCT extremes) over values, expressions that fail on
+/// some (`?v * 2` on strings and dates, a cast) and unbound values, mixed with one it
+/// doesn't take (COUNT DISTINCT). Each query is answered three ways, which must agree: the
+/// reference evaluator on the query as written, the executor with its own rewrites (the
+/// early group where the statistics say it pays), and the executor on the plan with the
+/// early group forced. The values' sums are exact in every numeric type, so the answers
+/// are compared term for term; extremes by value (`MIN` of `"07"` and `"7"` may give
+/// either).
+#[test]
+fn eager_aggregation_equals_the_reference_on_random_groups() {
+    let mut rng = Rng::seeded(20_261_005);
+    let (mut checked, mut rewritten, mut bound) = (0, 0, 0);
+    let covered = |checked: usize, rewritten: usize, bound: usize| {
+        rewritten * 2 > checked && bound * 2 > checked
+    };
+    for drawn in 0.. {
+        if !draws_on(drawn, 40, covered(checked, rewritten, bound)) {
+            break;
+        }
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let kinds = rng.below(4);
+        let add = |tx: &mut nrese_engine::Transaction, s: String, p: &str, o: Term| {
+            tx.insert(Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph).as_ref());
+        };
+        for product in 0..2 + rng.below(12) {
+            for _ in 0..1 + rng.below(2) {
+                let key = ex(&format!("k{}", rng.below(4)));
+                add(&mut tx, format!("product{product}"), "key", key.into());
+            }
+            if rng.below(3) > 0 {
+                let other = Literal::new_typed_literal(rng.below(2).to_string(), xsd::INTEGER);
+                add(&mut tx, format!("product{product}"), "other", other.into());
+            }
+            for offer in 0..rng.below(5) {
+                let offer = format!("offer{product}_{offer}");
+                let product = ex(&format!("product{product}"));
+                add(&mut tx, offer.clone(), "product", product.into());
+                for _ in 0..1 + rng.below(2) {
+                    let value = eager_value(&mut rng, kinds);
+                    add(&mut tx, offer.clone(), "v", value);
+                }
+                if rng.below(2) == 0 {
+                    let value = eager_value(&mut rng, kinds);
+                    add(&mut tx, offer.clone(), "w", value);
+                }
+            }
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..30 {
+            let argument = *rng.pick(&[
+                "?v",
+                "?v",
+                "?w",
+                "(?v * 2)",
+                "COALESCE(?w, ?v)",
+                "<http://www.w3.org/2001/XMLSchema#double>(?v)",
+                "STRLEN(STR(?v))",
+            ]);
+            let aggregates: Vec<String> = (0..1 + rng.below(3))
+                .map(|i| {
+                    let function = *rng.pick(&[
+                        "COUNT(*)",
+                        "COUNT(ARG)",
+                        "SUM(ARG)",
+                        "AVG(ARG)",
+                        "AVG(ARG)",
+                        "MIN(ARG)",
+                        "MAX(ARG)",
+                        "MIN(DISTINCT ARG)",
+                        "MAX(DISTINCT ARG)",
+                        "COUNT(DISTINCT ARG)",
+                    ]);
+                    format!("({} AS ?x{i})", function.replace("ARG", argument))
+                })
+                .collect();
+            let keys = *rng.pick(&["?k", "?k", "?k ?o2"]);
+            let products = match keys {
+                "?k ?o2" => "?p <EXkey> ?k ; <EXother> ?o2 .",
+                _ => "?p <EXkey> ?k .",
+            };
+            let side = match rng.below(3) {
+                0 => "?o <EXproduct> ?p ; <EXv> ?v . ?o <EXw> ?w",
+                _ => "?o <EXproduct> ?p ; <EXv> ?v OPTIONAL { ?o <EXw> ?w }",
+            };
+            let modifier = *rng.pick(&["", "", " HAVING (COUNT(*) > 1)", " ORDER BY ?k"]);
+            let text = format!(
+                "SELECT {keys} {} WHERE {{ {products} {{ {side} }} }} GROUP BY {keys}{modifier}",
+                aggregates.join(" ")
+            )
+            .replace("<EX", &format!("<{EX}"));
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let nrese_sparql_syntax::Query::Select { pattern, .. } = &query else {
+                unreachable!("a select")
+            };
+            let joined = nrese_sparql::plan::rewrite(pattern);
+            let forced = nrese_sparql::plan::eager_aggregation(&joined);
+            let decomposable = !text.contains("COUNT(DISTINCT");
+            assert_eq!(forced != joined, decomposable, "{text}");
+            rewritten += usize::from(decomposable);
+            let forced = nrese_sparql_syntax::Query::Select {
+                dataset: None,
+                pattern: forced,
+                base_iri: None,
+            };
+            let as_written = QueryOptions {
+                as_written: true,
+                ..QueryOptions::default()
+            };
+            let expected = rows_up_to_equal_values(
+                reference(&snapshot, &query, &as_written).unwrap(),
+                false,
+                true,
+            );
+            let native = rows_up_to_equal_values(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+                true,
+            );
+            assert_eq!(native, expected, "{text}");
+            let early = rows_up_to_equal_values(
+                evaluate_query(&snapshot, &forced, &as_written).unwrap(),
+                false,
+                true,
+            );
+            assert_eq!(early, expected, "the early group forced: {text}\n{forced}");
+            checked += 1;
+            bound += usize::from(expected.iter().any(|row| {
+                row.split('\t')
+                    .skip(keys.split(' ').count())
+                    .any(|cell| cell != "UNDEF")
+            }));
+        }
+    }
+    // The comparison must cover the rewrite, and answers that aren't all unbound.
+    assert!(
+        covered(checked, rewritten, bound),
+        "{rewritten} of {checked} rewritten, {bound} with bound aggregates"
+    );
+}
+
+/// Paths ordered with the triple patterns they are joined to (`path_joins`), on random
+/// graphs: one to three patterns and one or two paths (closures, sequences, inverses,
+/// alternatives, `?`), with constant or shared ends and filters, against the reference
+/// evaluator. Most queries must take the planned route (EXPLAIN's "paths ordered with
+/// patterns"), with the path first in some and later in others.
+#[test]
+fn paths_ordered_with_patterns_equal_the_reference() {
+    let mut rng = Rng::seeded(20_261_006);
+    let (mut checked, mut planned, mut path_first) = (0, 0, 0);
+    let covered = |checked: usize, planned: usize, path_first: usize| {
+        planned * 2 > checked && path_first * 10 > planned
+    };
+    for drawn in 0.. {
+        if !draws_on(drawn, 40, covered(checked, planned, path_first)) {
+            break;
+        }
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        let mut tx = engine.transaction();
+        let nodes = 4 + rng.below(30);
+        for _ in 0..10 + rng.below(120) {
+            let object: Term = match rng.below(8) {
+                0 => Literal::new_typed_literal(rng.below(5).to_string(), xsd::INTEGER).into(),
+                _ => ex(&format!("e{}", rng.below(nodes))).into(),
+            };
+            let quad = Quad::new(
+                ex(&format!("e{}", rng.below(nodes))),
+                ex(&format!("p{}", rng.below(4))),
+                object,
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let snapshot = engine.snapshot();
+        for _ in 0..25 {
+            let p = |rng: &mut Rng| format!("<{EX}p{}>", rng.below(4));
+            let node = |rng: &mut Rng| format!("<{EX}e{}>", rng.below(6));
+            let end = |rng: &mut Rng| match rng.below(3) {
+                0 => node(rng),
+                _ => rng.pick(&["?a", "?b", "?c"]).to_string(),
+            };
+            let mut parts: Vec<String> = Vec::new();
+            for _ in 0..1 + rng.below(3) {
+                let (s, o) = (rng.pick(&["?a", "?b"]).to_string(), end(&mut rng));
+                parts.push(format!("{s} {} {o} .", p(&mut rng)));
+            }
+            for _ in 0..1 + rng.below(2) {
+                let path = match rng.below(7) {
+                    0 => format!("{}+", p(&mut rng)),
+                    1 => format!("{}*", p(&mut rng)),
+                    2 => format!("{}/{}", p(&mut rng), p(&mut rng)),
+                    3 => format!("^{}", p(&mut rng)),
+                    4 => format!("({}|{})+", p(&mut rng), p(&mut rng)),
+                    5 => format!("{}?", p(&mut rng)),
+                    _ => format!("(^{})*", p(&mut rng)),
+                };
+                parts.push(format!("{} {path} {} .", end(&mut rng), end(&mut rng)));
+            }
+            if rng.below(3) == 0 {
+                parts.push(format!("FILTER(?a != {})", node(&mut rng)));
+            }
+            for i in (1..parts.len()).rev() {
+                let j = rng.below(i as u64 + 1) as usize;
+                parts.swap(i, j);
+            }
+            let text = format!("SELECT * WHERE {{ {} }}", parts.join(" "));
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let native = rows(
+                evaluate_query(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            let expected = rows(
+                reference(&snapshot, &query, &QueryOptions::default()).unwrap(),
+                false,
+            );
+            assert_eq!(native, expected, "{text}");
+            let explained = explain_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+            if let Some(step) = explained
+                .steps
+                .iter()
+                .find(|s| s.operator == "paths ordered with patterns")
+            {
+                planned += 1;
+                let first = step.detail.split(", then ").next().unwrap_or("");
+                path_first += usize::from(
+                    first.contains(&format!("<{EX}p"))
+                        && !first.ends_with('.')
+                        && first
+                            .split(' ')
+                            .nth(1)
+                            .is_some_and(|p| p.contains(['+', '*', '/', '^', '?', '|'])),
+                );
+            }
+            plan_query(&snapshot, &query, &QueryOptions::default()).unwrap();
+            checked += 1;
+        }
+    }
+    assert!(
+        covered(checked, planned, path_first),
+        "{planned} of {checked} planned with their paths, a path first in {path_first}"
+    );
+}
+
+/// Row counts, alone or per key, of one pattern under a FILTER on its key are counted per
+/// key from the index (`key count`): the same answers as the reference, on dates with
+/// timezones at the range's edges, non-canonical and invalid forms, numbers of every kind,
+/// strings, IRIs and blank nodes, keys held in several graphs and by several subjects, a
+/// FILTER that errors on some keys, ranges with no key, and several counts at once.
+#[test]
+fn counts_under_a_key_filter_equal_the_reference() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let typed = |lexical: &str, datatype| Term::from(Literal::new_typed_literal(lexical, datatype));
+    let values: Vec<Term> = vec![
+        typed("1450-01-01", xsd::DATE),
+        typed("1450-01-01+14:00", xsd::DATE),
+        typed("1449-12-31-14:00", xsd::DATE),
+        typed("1455-06-01", xsd::DATE),
+        typed("01455-06-01", xsd::DATE),
+        typed("1459-12-31Z", xsd::DATE),
+        typed("1460-01-01", xsd::DATE),
+        typed("1460-01-01-14:00", xsd::DATE),
+        typed("1455-06-01T12:00:00", xsd::DATE_TIME),
+        typed("not a date", xsd::DATE),
+        typed("5", xsd::INTEGER),
+        typed("05", xsd::INTEGER),
+        typed("7.5", xsd::DECIMAL),
+        typed("9.0E0", xsd::DOUBLE),
+        typed("12", xsd::INT),
+        Term::from(Literal::new_simple_literal("1455-06-01")),
+        Term::from(Literal::new_language_tagged_literal_unchecked("x", "en")),
+        Term::from(ex("thing")),
+        Term::from(nrese_rdf::BlankNode::new("b1").unwrap()),
+    ];
+    for (i, value) in values.iter().enumerate() {
+        for copy in 0..=i % 3 {
+            let graph = match copy {
+                1 => GraphName::NamedNode(ex("g")),
+                _ => GraphName::DefaultGraph,
+            };
+            let subject = ex(&format!("p{i}-{copy}"));
+            tx.insert(Quad::new(subject, ex("born"), value.clone(), graph).as_ref());
+        }
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let date = |d: &str| format!("\"{d}\"^^<http://www.w3.org/2001/XMLSchema#date>");
+    let filters = [
+        format!(
+            "?d >= {} && ?d < {}",
+            date("1450-01-01"),
+            date("1460-01-01")
+        ),
+        format!(
+            "?d > {} && ?d <= {}",
+            date("1449-12-31"),
+            date("1460-01-01")
+        ),
+        format!("?d = {}", date("1455-06-01")),
+        format!("?d > {}", date("3000-01-01")),
+        "?d >= 5 && ?d < 10".to_string(),
+        "?d = 5".to_string(),
+        "STRSTARTS(STR(?d), \"14\")".to_string(),
+        "isIRI(?d) || isBlank(?d)".to_string(),
+        "BOUND(?d) && LANG(?d) = \"\"".to_string(),
+        "?d > \"1455\"".to_string(),
+    ];
+    let options = QueryOptions::default();
+    for filter in &filters {
+        for select in [
+            "SELECT (COUNT(*) AS ?n)",
+            "SELECT (COUNT(*) AS ?n) (COUNT(?p) AS ?m)",
+            "SELECT ?d (COUNT(*) AS ?n)",
+            "SELECT ?d (COUNT(?p) AS ?n) (COUNT(*) AS ?m)",
+        ] {
+            let group = if select.starts_with("SELECT ?d") {
+                " GROUP BY ?d"
+            } else {
+                ""
+            };
+            let text = format!("{select} WHERE {{ ?p <{EX}born> ?d FILTER({filter}) }}{group}");
+            let query = SparqlParser::new()
+                .parse_query(&text)
+                .unwrap_or_else(|e| panic!("{e}: {text}"));
+            let operators: Vec<String> = explain_query(&snapshot, &query, &options)
+                .unwrap()
+                .steps
+                .into_iter()
+                .map(|step| step.operator)
+                .collect();
+            let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+            let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+            assert_same_rows(&native, &expected, &text);
+            // A text test takes the dictionary's route instead (the test after this one).
+            let text_test = filter.starts_with("STRSTARTS");
+            assert_eq!(
+                operators.iter().any(|o| o == "key count"),
+                !text_test,
+                "{text}: key count among {operators:?}"
+            );
+        }
+    }
+    // Not the key's alone: the general path, with the same answers.
+    for text in [
+        format!(
+            "SELECT (COUNT(*) AS ?n) WHERE {{ ?p <{EX}born> ?d FILTER(?d = 5 || ?p = <{EX}p10-0>) }}"
+        ),
+        format!(
+            "SELECT ?p (COUNT(*) AS ?n) WHERE {{ ?p <{EX}born> ?d FILTER(?d = 5) }} GROUP BY ?p"
+        ),
+        format!(
+            "SELECT (COUNT(*) AS ?n) WHERE {{ ?p <{EX}born> ?d FILTER(?d = 5 && RAND() < 2) }}"
+        ),
+    ] {
+        let query = SparqlParser::new()
+            .parse_query(&text)
+            .unwrap_or_else(|e| panic!("{e}: {text}"));
+        let operators: Vec<String> = explain_query(&snapshot, &query, &options)
+            .unwrap()
+            .steps
+            .into_iter()
+            .map(|step| step.operator)
+            .collect();
+        let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+        assert_same_rows(&native, &expected, &text);
+        assert!(
+            !operators.iter().any(|o| o == "key count"),
+            "{text}: a key count among {operators:?}"
+        );
+    }
+}
+
+/// Spec: a count under a text test on its key (`CONTAINS`, `STRSTARTS`) takes the
+/// dictionary's route, as on any pattern large enough for the dictionary pass: the pass
+/// finds the few terms with the text, the scan reads their rows ("dictionary string
+/// test"), and no key's text is tested apart ("key count"). A language test alone, which
+/// most terms pass, keeps the key count, as does a text test the dictionary route can't
+/// take (on the subject). The answers are the reference's.
+#[test]
+fn text_tests_on_a_counted_key_go_to_the_dictionary() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let mut names: Vec<Literal> = (0..200)
+        .map(|i| {
+            Literal::new_language_tagged_literal_unchecked(format!("user {i} w{}", i % 50), "en")
+        })
+        .collect();
+    names.push(Literal::new_simple_literal("w42 untagged"));
+    names.push(Literal::new_simple_literal("user 7 untagged"));
+    for (i, name) in names.into_iter().enumerate() {
+        let quad = Quad::new(
+            ex(&format!("u{i}")),
+            ex("name"),
+            name,
+            GraphName::DefaultGraph,
+        );
+        tx.insert(quad.as_ref());
+    }
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let options = QueryOptions::default();
+    for (filter, route, count) in [
+        ("CONTAINS(?name, \"w42\")", "dictionary string test", 5),
+        ("STRSTARTS(?name, \"user 7\")", "dictionary string test", 12),
+        ("LANG(?name) = \"en\"", "key count", 200),
+        // The subject: no dictionary route for it (`bgp` hints objects only).
+        (
+            "STRSTARTS(STR(?u), \"http://example.com/u1\")",
+            "key count",
+            111,
+        ),
+    ] {
+        let text =
+            format!("SELECT (COUNT(*) AS ?n) WHERE {{ ?u <{EX}name> ?name FILTER({filter}) }}");
+        let query = SparqlParser::new()
+            .parse_query(&text)
+            .unwrap_or_else(|e| panic!("{e}: {text}"));
+        let operators: Vec<String> = explain_query(&snapshot, &query, &options)
+            .unwrap()
+            .steps
+            .into_iter()
+            .map(|step| step.operator)
+            .collect();
+        let native = rows(evaluate_query(&snapshot, &query, &options).unwrap(), false);
+        let expected = rows(reference(&snapshot, &query, &options).unwrap(), false);
+        assert_same_rows(&native, &expected, &text);
+        let n = Term::from(Literal::new_typed_literal(count.to_string(), xsd::INTEGER));
+        assert_eq!(native, [n.to_string()], "{text}");
+        let other = ["dictionary string test", "key count"]
+            .into_iter()
+            .find(|o| *o != route);
+        assert!(
+            operators.iter().any(|o| o == route)
+                && !operators.iter().any(|o| Some(o.as_str()) == other),
+            "{text}: {route} expected among {operators:?}"
+        );
+    }
 }

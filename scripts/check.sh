@@ -1,102 +1,551 @@
 #!/usr/bin/env bash
-# The gate every commit passes, with the steps of CI (.github/workflows/ci.yml): rustfmt,
-# clippy on all targets with warnings as errors, the tests (both Cargo workspaces), the
-# lock check, cargo-deny (licences, advisories, bans, sources) where it is installed, and
-# the console's typecheck and tests where its dependencies are installed. Builds go
-# through scripts/cargo-guarded.sh. Every step runs; the summary lists each one's exit
-# code, and the script fails if any failed.
+# The gate, in three tiers. A test runs where it matters: each crate owns its tests, so a
+# change runs the tests of the crates it touches, and the crates that depend on them run
+# their fast tests (push). Slow suites (conformance, fuzz campaigns) are declared by their
+# crate (`[package.metadata.nrese] slow-tests`) and run when that crate changed, or at a
+# milestone. Benchmarks never run here.
 #
-# Usage: scripts/check.sh            the whole gate (before a push; what CI runs)
-#        scripts/check.sh --changed  the crates changed against HEAD (staged or not) and
-#                                    every workspace crate depending on them: fmt, clippy
-#                                    and tests for those, and the lock check
-#                                    when a manifest or lock changed (the pre-commit hook)
+# Usage: scripts/check.sh commit   pre-commit hook, here, in seconds: fmt; for the files
+#                                  changed against HEAD (staged or not), their lock files
+#                                  and Docker names. Nothing is built, linted or tested: a
+#                                  branch may hold unchecked commits; a tree lands only
+#                                  when its push tier passed for that exact tree, and its
+#                                  Windows inputs passed the Windows check (below).
+#        scripts/check.sh push     pre-push hook (.githooks/pre-push): the crates a pushed
+#                                  commit changes in the pushed range (every crate when the
+#                                  root manifest, lock file or toolchain changed:
+#                                  changed_crates, below), on the fleet only
+#                                  (scripts/lib/fleet-gate.sh). fmt; clippy on them; all their
+#                                  tests, the dependents' fast tests; random tests on new
+#                                  seeds; the lock check; nrese-exec's unsafe code under Miri
+#                                  and its doc tests when it changed (scripts/miri.sh). By
+#                                  hand: HEAD, from its upstream (else from where it left
+#                                  origin's refactor/engine-v2), so a push then finds the pass;
+#                                  NRESE_PUSH_REF names the ref it will go to, as the hook's
+#                                  does (a merge check: refs/heads/refactor/engine-v2, which
+#                                  makes its job a merge gate on the fleet). A value the
+#                                  caller's environment already holds is that caller's word.
+#        scripts/check.sh windows [COMMIT]
+#                                  the merge check's Windows part, on the fleet only
+#                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
+#                                  built whole, clippy on it all, all its tests and doc tests,
+#                                  the suite contracts, the console, by its own tier here, which its own
+#                                  scripts/lib/windows-job.sh runs on a Windows host. A commit
+#                                  whose inputs (scripts/lib/gate-key.sh windows_inputs)
+#                                  passed before, under the Python runtime it declares
+#                                  (gate_runtime), carries that pass: "carried from <commit>".
+#                                  NRESE_PUSH_REF as for push: the merge check's Windows part
+#                                  for refactor/engine-v2 is a merge gate, a package's isn't.
+#        scripts/check.sh [all]    milestones and CI: everything, both Cargo workspaces,
+#                                  doc tests, cargo-deny, the console.
+#        scripts/check.sh crates FILE...
+#                                  the workspace crates the push tier lints and tests for
+#                                  these changed files, one per line; nothing else runs.
+#
+# Tests run under cargo-nextest when it is installed (every test of every binary in
+# parallel; `cargo install --locked cargo-nextest`), else under cargo test, crate by
+# crate. Builds go through scripts/cargo-guarded.sh. Every step runs; the summary lists
+# each one's exit code.
+#
+# Exit: 0 passed, 1 failed; 75 no verdict: the fleet gave none (push, windows), or the PC's
+# guard held or stopped a build (scripts/cargo-guarded.sh's 75), which isn't the tree's
+# failure; 2 a usage error, or nothing to check.
+#
+# The W3C suites run with their test data required (NRESE_W3C_REQUIRED=1, the data fetched
+# first by scripts/fetch-w3c-tests.sh): a suite without its data fails instead of passing by
+# skipping. NRESE_W3C_OPTIONAL=1 opts out for a local run without the data; such a pass isn't
+# remembered as the tier's.
 set -u
 cd "$(dirname "$0")/.."
 mode=${1:-all}
+# Warnings fail the gate through Cargo (build.warnings), not through a lint flag: a flag
+# changes the build's fingerprint, so the gate and plain clippy runs would not share
+# artifacts.
+export CARGO_BUILD_WARNINGS=deny
+[ "$mode" = --changed ] && mode=commit
 guarded=scripts/cargo-guarded.sh
 declare -a results=()
 step() {
   local name=$1
   shift
   echo "=== $name"
+  local start=$SECONDS
   "$@"
   local code=$?
-  results+=("$code  $name")
+  results+=("$code  $name ($((SECONDS - start)) s)")
   echo "=== $name: exit $code"
 }
+nextest() { cargo nextest --version > /dev/null 2>&1; }
+# Python under either name: Windows has `python`, some Linux hosts only `python3`. A missing
+# interpreter fails the gate; it must never shrink the gate to nothing.
+python() {
+  if type -P python > /dev/null; then command python "$@"
+  elif type -P python3 > /dev/null; then command python3 "$@"
+  else echo "the gate needs python (or python3)" >&2; return 127; fi
+}
 
-if [ "$mode" = --changed ]; then
-  # The crates whose files changed (a crate is a directory with a Cargo.toml under crates/).
-  mapfile -t files < <(git diff --name-only HEAD; git ls-files --others --exclude-standard)
+# The workspace crates a change reaches, which the push tier lints and tests
+# (benches/suite/tests/test_changed_crates.py). A file under a crate's directory (crates/) reaches
+# that crate. The root manifest (its [workspace.package], [workspace.dependencies], profiles and
+# lints), the root lock file, the toolchain file, Cargo's build configuration and clippy's
+# configuration reach every crate of the workspace: a change to one of them is every crate
+# changed. (D16-637: a version bump changed only such files, and the push tier printed "changed:
+# none" and ran no crate's clippy or tests.) The lock files of the other Cargo projects (fuzz/,
+# benches/*) pin only those projects' builds. It stays in this file: check.sh needs no other file
+# to start, and the suite's fixtures copy it alone or stub the scripts it names.
+EVERY_CRATE='^(Cargo\.toml|Cargo\.lock|rust-toolchain(\.toml)?|\.cargo/config(\.toml)?|clippy\.toml)$'
+
+changed_crates() {
+  if printf '%s\n' "$@" | grep -qE "$EVERY_CRATE"; then
+    workspace_packages
+  else
+    crates_of "$@"
+  fi
+}
+
+# The workspace crates (directories with a Cargo.toml under crates/) that `files` touch.
+crates_of() {
+  local file dir name
   declare -A seen=()
-  packages=()
-  for file in "${files[@]}"; do
+  for file in "$@"; do
     dir=$(dirname "$file")
     while [ "$dir" != . ] && [ "$dir" != / ]; do
       if [ -f "$dir/Cargo.toml" ] && [[ "$dir" == crates/* ]]; then
         name=$(sed -n 's/^name = "\(.*\)"/\1/p' "$dir/Cargo.toml" | head -1)
-        if [ -n "$name" ] && [ -z "${seen[$name]:-}" ]; then
-          seen[$name]=1
-          packages+=("-p" "$name")
-        fi
+        [ -n "$name" ] && [ -z "${seen[$name]:-}" ] && { seen[$name]=1; echo "$name"; }
         break
       fi
       dir=$(dirname "$dir")
     done
   done
-  # And every workspace crate that depends on a changed one (directly or not), so an
-  # engine change runs the store's and the server's tests too.
-  changed=("${!seen[@]}")
-  for name in "${changed[@]}"; do
-    while read -r dependent _; do
-      if [ -n "$dependent" ] && [ -z "${seen[$dependent]:-}" ]; then
-        seen[$dependent]=1
-        packages+=("-p" "$dependent")
-      fi
-    done < <(cargo tree -i "$name" --workspace --prefix none -e normal,build,dev --offline 2>/dev/null \
-               | sed 's/ (\*)//' | sort -u)
+}
+
+# The workspace's packages, by name.
+workspace_packages() {
+  cargo metadata --no-deps --format-version 1 --offline \
+    | python -c "import json,sys; print('\n'.join(p['name'] for p in json.load(sys.stdin)['packages']))" \
+    | tr -d '\r'
+}
+
+if [ "$mode" = crates ]; then shift; changed_crates "$@"; exit; fi
+
+# The workspace crates depending on any of the given ones (directly or not, dev-
+# dependencies included: their tests must still compile), the given ones excluded.
+dependents_of() {
+  local name
+  declare -A given=()
+  for name in "$@"; do given[$name]=1; done
+  for name in "$@"; do
+    cargo tree -i "$name" --workspace --prefix none -e normal,build,dev --offline 2>/dev/null \
+      | sed 's/ (\*)//; s/ .*//'
+  done | sort -u | while read -r dep; do
+    [ -n "$dep" ] && [ -z "${given[$dep]:-}" ] && echo "$dep"
   done
-  echo "=== crates: ${!seen[*]}"
-  step fmt cargo fmt --all --check
-  if [ ${#packages[@]} -gt 0 ]; then
-    step clippy "$guarded" clippy --locked "${packages[@]}" --all-targets -- -D warnings
-    step test "$guarded" test --locked "${packages[@]}" --no-fail-fast
+}
+
+package_args() { local name; for name in "$@"; do printf -- '-p %s ' "$name"; done; }
+
+# Tests of `all` crates, with the slow binaries of `fast_only` left out. Python's output is
+# read without carriage returns: Windows writes them, and cargo rejects names with them.
+run_tests() {
+  local -a all=() fast_only=()
+  local into=all arg
+  for arg in "$@"; do
+    if [ "$arg" = -- ]; then into=fast_only; continue; fi
+    if [ $into = all ]; then all+=("$arg"); else fast_only+=("$arg"); fi
+  done
+  [ ${#all[@]} -eq 0 ] && return 0
+  if nextest; then
+    local filter=""
+    [ ${#fast_only[@]} -gt 0 ] && filter=$(python scripts/lib/test-targets.py exclude "${fast_only[@]}" | tr -d '\r')
+    # shellcheck disable=SC2046
+    "$guarded" nextest run --locked --no-fail-fast $(package_args "${all[@]}") \
+      ${filter:+-E "$filter"}
   else
-    echo "=== no crate changed: fmt only"
+    local code=0 line
+    declare -A fast=()
+    for arg in "${fast_only[@]}"; do fast[$arg]=1; done
+    for arg in "${all[@]}"; do
+      if [ -n "${fast[$arg]:-}" ]; then
+        line=$(python scripts/lib/test-targets.py fast "$arg") || return 2
+        line=$(printf '%s' "$line" | tr -d '\r')
+        [ -n "$line" ] || continue
+        # shellcheck disable=SC2086
+        "$guarded" test --locked --no-fail-fast $line || code=$?
+      else
+        "$guarded" test --locked --no-fail-fast -p "$arg" --lib --bins --tests || code=$?
+      fi
+    done
+    return $code
   fi
-  # A changed manifest or lock can leave another workspace's lock (benches/) stale.
+}
+
+# The random tests of the given crates (scripts/lib/fuzz-targets.txt) with a few more seeds
+# than the one they run with otherwise: seeds drawn from the commit, so each push tries new
+# ones and a failure replays (NRESE_FUZZ_SEED=<seed>). The fuzz campaign runs many more.
+run_seeds() {
+  local -A wanted=()
+  local -a crates=() exprs=()
+  local name crate target filter seed binary code=0
+  for name in "$@"; do wanted[$name]=1; done
+  local base=$(( 16#$(git rev-parse --short=6 HEAD) % 100000 + 1000 ))
+  while IFS=: read -r crate target filter; do
+    [ -n "${wanted[$crate]:-}" ] || continue
+    crates+=("$crate")
+    binary=$crate
+    [ "$target" = lib ] || binary="$crate::$target"
+    exprs+=("(binary_id($binary)${filter:+ & test($filter)})")
+  done < <(grep -v '^#' scripts/lib/fuzz-targets.txt | tr -d '\r' | grep .)
+  [ ${#exprs[@]} -gt 0 ] || return 0
+  local expr
+  expr=$(IFS='|'; echo "${exprs[*]}")
+  for seed in $base $((base + 1)) $((base + 2)); do
+    if nextest; then
+      # One run per seed: every random test of every changed crate in parallel.
+      # shellcheck disable=SC2046
+      local out
+      if ! out=$(NRESE_FUZZ_SEED=$seed "$guarded" nextest run --locked --no-fail-fast \
+          $(package_args "${crates[@]}") -E "$expr" 2>&1); then
+        echo "random tests fail with NRESE_FUZZ_SEED=$seed:"
+        printf '%s\n' "$out" | grep -E '^ +FAIL|panicked at' -A1 | grep -v '^--' | sort -u | head -20
+        code=1
+      fi
+      continue
+    fi
+    while IFS=: read -r crate target filter; do
+      [ -n "${wanted[$crate]:-}" ] || continue
+      local kind=(--test "$target")
+      [ "$target" = lib ] && kind=(--lib)
+      if ! NRESE_FUZZ_SEED=$seed "$guarded" test --locked -q -p "$crate" "${kind[@]}" -- $filter > /dev/null 2>&1; then
+        echo "random tests fail: NRESE_FUZZ_SEED=$seed cargo test -p $crate ${kind[*]} -- $filter"
+        code=1
+      fi
+    done < <(grep -v '^#' scripts/lib/fuzz-targets.txt | tr -d '\r' | grep .)
+  done
+  return $code
+}
+
+# The W3C suites' data, required unless NRESE_W3C_OPTIONAL (the release gate's first W3C part,
+# 13 Oct 2026, skipped every suite for want of it and passed).
+w3c_data() {
+  if [ -n "${NRESE_W3C_OPTIONAL:-}" ]; then
+    unset NRESE_W3C_REQUIRED
+    echo "=== W3C suites optional (NRESE_W3C_OPTIONAL): a suite without its data skips"
+  else
+    export NRESE_W3C_REQUIRED=1
+    step "W3C data" bash scripts/fetch-w3c-tests.sh
+  fi
+}
+
+# The steps for files outside the Rust workspace.
+side_steps() {
+  local files=("$@")
   if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
     step locks bash scripts/check-locks.sh
+    # No test-only feature in a product build (scripts/check-features.sh, DUR-4).
+    step features bash scripts/check-features.sh
   fi
-else
-  step fmt cargo fmt --all --check
-  step "fmt (bench harness)" cargo fmt --manifest-path benches/nrese-bench-harness/Cargo.toml --all --check
-  step clippy "$guarded" clippy --locked --workspace --all-targets -- -D warnings
-  step "clippy (bench harness)" "$guarded" clippy --locked \
-    --manifest-path benches/nrese-bench-harness/Cargo.toml --all-targets -- -D warnings
-  step test "$guarded" test --locked --workspace --no-fail-fast
-  step "test (bench harness)" "$guarded" test --locked \
-    --manifest-path benches/nrese-bench-harness/Cargo.toml --no-fail-fast
-  step locks bash scripts/check-locks.sh
-  if cargo deny --version > /dev/null 2>&1; then
-    step deny cargo deny --all-features check
-  else
-    echo "=== cargo-deny isn't installed (cargo install --locked cargo-deny): skipped"
+  # The suite contracts test the gate's own scripts and hooks too (test_push_gate, test_full_gate,
+  # test_commit_tier, ...): a change to them runs the contracts.
+  if printf '%s\n' "${files[@]}" | grep -qE '^(benches/suite/|scripts/|\.githooks/)'; then
+    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
   fi
-  if [ -d apps/nrese-console/node_modules ]; then
-    step "console typecheck" npm --prefix apps/nrese-console run typecheck
-    step "console tests" npx --prefix apps/nrese-console vitest run --root apps/nrese-console
+  # Names the changed Python can't resolve, which a test replacing a whole function never runs
+  # (scripts/check-python-names.py).
+  local py
+  mapfile -t py < <(printf '%s\n' "${files[@]}" | grep -E '^(benches|scripts)/.*\.py$')
+  if [ ${#py[@]} -gt 0 ]; then
+    step "python names" python scripts/check-python-names.py "${py[@]}"
+  fi
+  # Docker names only from the job namespace (scripts/check-names.sh).
+  if printf '%s\n' "${files[@]}" | grep -qE '^(benches|scripts)/'; then
+    step names bash scripts/check-names.sh
+  fi
+  if printf '%s\n' "${files[@]}" | grep -qE '^benches/nrese-bench-harness/'; then
+    harness
+  fi
+  if printf '%s\n' "${files[@]}" | grep -qE '^apps/nrese-console/'; then
+    console
+  fi
+}
+harness() {
+  local manifest=benches/nrese-bench-harness/Cargo.toml
+  step "fmt (bench harness)" cargo fmt --manifest-path $manifest --all --check
+  step "clippy (bench harness)" "$guarded" clippy --locked --manifest-path $manifest \
+    --all-targets
+  step "test (bench harness)" "$guarded" test --locked --manifest-path $manifest --no-fail-fast
+}
+# The console's typecheck and tests, wherever the tier runs. The dependencies come from the
+# console's lockfile first, every time (`npm ci` replaces node_modules: the Linux gate's worktree
+# keeps an earlier tree's), and a host that can't install them fails that step by
+# name; the console is never passed unchecked (benches/suite/tests/test_console_step.py).
+console() {
+  step "console dependencies" npm --prefix apps/nrese-console ci --no-audit --no-fund
+  [ "${results[-1]%% *}" = 0 ] || return 0
+  step "console typecheck" npm --prefix apps/nrese-console run typecheck
+  step "console tests" npx --prefix apps/nrese-console vitest run --root apps/nrese-console
+}
+
+# A full tier uses the declared cargo-deny release; installing it belongs to prerequisites.
+deny_version() {
+  local want got
+  want=$(sed -n 's/^cargo-deny //p' scripts/lib/gate-tools.txt | tr -d '\r')
+  got=$(cargo deny --version 2> /dev/null) || {
+    echo "cargo-deny unavailable; required ${want:-missing pin} (scripts/lib/gate-tools.txt)" >&2
+    return 1
+  }
+  got=$(printf '%s\n' "$got" | awk 'NR == 1 { print $2 }' | tr -d '\r')
+  if [ -z "$want" ] || [ "$got" != "$want" ]; then
+    echo "cargo-deny version ${got:-unknown}; required ${want:-missing pin} (scripts/lib/gate-tools.txt)" >&2
+    return 1
+  fi
+}
+
+# Whether nrese-exec differs from where this branch left refactor/engine-v2, committed or
+# not (Miri's step): the upstream or the last commit alone would miss earlier commits of a
+# branch that has none. Without that history, it is taken to differ.
+exec_changed() {
+  local base
+  base=$(git merge-base HEAD origin/refactor/engine-v2 2>/dev/null) || return 0
+  ! git diff --quiet "$base" -- crates/nrese-exec ||
+    [ -n "$(git ls-files --others --exclude-standard -- crates/nrese-exec)" ]
+}
+
+# The files a commit or push changes. A merge commit: a file the same as on one side was
+# tested on that side; new is what differs from both (resolved conflicts, files both sides
+# changed). A push: the pushed range, from the base the remote has to the pushed commit
+# (push_base, push_commit); never the work tree, which a push doesn't send. Without a range it
+# fails: an empty list would gate nothing.
+
+changed_files() {
+  if [ "$1" = commit ] && git rev-parse -q --verify MERGE_HEAD > /dev/null; then
+    comm -12 <(git diff --name-only --cached HEAD | sort) <(git diff --name-only --cached MERGE_HEAD | sort)
+  elif [ "$1" = commit ]; then
+    git diff --name-only HEAD
   else
-    echo "=== the console's dependencies aren't installed (npm ci in apps/nrese-console): skipped"
+    [ -n "${push_base:-}" ] && [ -n "${push_commit:-}" ] || return 2
+    git diff --name-only "$push_base" "$push_commit"
+    return
+  fi
+  git ls-files --others --exclude-standard
+}
+
+# A push gates one commit, from the base the remote has: .githooks/pre-push names both
+# (NRESE_PUSH_COMMIT, NRESE_PUSH_BASE); by hand, HEAD from its upstream, else from where it left
+# origin's refactor/engine-v2. Never the last commit alone.
+if [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+  push_commit=$(git rev-parse -q --verify "${NRESE_PUSH_COMMIT:-HEAD}^{commit}") \
+    || { echo "no commit ${NRESE_PUSH_COMMIT:-HEAD} to gate" >&2; exit 2; }
+  push_base=${NRESE_PUSH_BASE:-$(git rev-parse -q --verify '@{upstream}' 2> /dev/null \
+    || git merge-base "$push_commit" refs/remotes/origin/refactor/engine-v2 2> /dev/null)}
+  [ -n "$push_base" ] || { echo "no base for the push range: no upstream, and no origin/refactor/engine-v2" >&2; exit 2; }
+  # A measurement commit (refs/measure/*, benches/PROTOCOL.md §5) is a commit on an old side's tree,
+  # which this tier isn't for: its one check is the measurement rule against the declared sides, the
+  # side on a branch of the remote the push goes to (NRESE_PUSH_REMOTE, from the hook).
+  if [[ ${NRESE_PUSH_REF:-} == refs/measure/* ]]; then
+    python -B benches/fast/release_gate.py measurement-ref "$NRESE_PUSH_REF" "$push_commit" \
+      --remote "${NRESE_PUSH_REMOTE:-}"
+    exit $?
   fi
 fi
+# The Windows part checks one commit, whole: COMMIT, else HEAD, by its own tier, so a commit from
+# before the tier can't be checked.
+if [ "$mode" = windows ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+  push_commit=$(git rev-parse -q --verify "${2:-HEAD}^{commit}") || { echo "no commit ${2:-HEAD} to check" >&2; exit 2; }
+  git cat-file -e "$push_commit:scripts/lib/windows-job.ps1" 2> /dev/null \
+    || { echo "$(git rev-parse --short "$push_commit") has no Windows tier (scripts/lib/windows-job.ps1): it can't be checked" >&2; exit 2; }
+fi
+
+# The push tier and the Windows part run on the fleet only (scripts/lib/fleet-gate.sh), for the
+# commit's own tree and the pushed range's files (Windows: none, everything runs). A pass is a
+# verified fleet result, remembered by content (scripts/lib/gate-key.sh: the tier, the tree, the
+# files, the toolchain), and only check.sh writes it. No verdict, no pass (no push): nothing runs
+# here instead.
+if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+  # shellcheck source=lib/gate-key.sh
+  . scripts/lib/gate-key.sh
+  list=$(mktemp)
+  where=$(mktemp)
+  trap 'rm -f "$list" "$where"' EXIT
+  if [ "$mode" = push ]; then
+    changed_files push > "$list" || { echo "the push range $push_base..$push_commit isn't all here: fetch, then push" >&2; exit 2; }
+  fi
+  tree=$(git rev-parse "$push_commit^{tree}")
+  list_hash=$(git hash-object "$list")
+  identity=$(gate_identity "$push_commit") || { echo "the gate can't name its toolchain and flags (above): no $mode pass" >&2; exit 2; }
+  # The Windows part's pass belongs to the commit's inputs, not its tree: a later commit with the
+  # same inputs carries it (scripts/lib/gate-key.sh windows_inputs), and its record names the commit.
+  keyed=$tree on=""
+  if [ "$mode" = windows ]; then
+    keyed=inputs-$(windows_inputs "$push_commit") || { echo "no inputs of $push_commit to key its pass" >&2; exit 2; }
+    # And the Python runtime the commit declares for the suite: a pass under another, or one from
+    # before the tier declared one, is never carried (scripts/lib/gate-key.sh gate_runtime).
+    runtime=$(gate_runtime "$push_commit") \
+      || { echo "$(git rev-parse --short "$push_commit") declares no Python runtime for the suite" \
+             "(scripts/lib/gate-tools.txt python-windows): it can't be checked" >&2; exit 2; }
+    identity="$identity $(gate_python "$runtime")"
+    on="$push_commit "
+  fi
+  key=$(gate_key "$mode" "$keyed" "$list_hash" "$identity")
+  if record=$(gate_pass "$key"); then
+    if [ "$mode" = windows ]; then
+      echo "=== windows: $(git rev-parse --short "$push_commit") carried from $record (the same inputs)"
+    else
+      echo "=== $mode: $(git rev-parse --short "$push_commit") passed on the fleet before (its tree, these files)"
+    fi
+    exit 0
+  fi
+  bash scripts/lib/fleet-gate.sh "$mode" "$list" "$tree" "$list_hash" "$identity" "$where" "$push_commit"
+  case $? in
+    0) gate_record "$key" "$on$(cat "$where")"; exit 0 ;;
+    1) exit 1 ;;
+    *) echo "no fleet verdict for $(git rev-parse --short "$push_commit") (tree $tree): no $mode pass; the $mode" \
+         "tier runs on the fleet only" >&2
+       exit 75 ;;
+  esac
+fi
+
+# The commit tier runs here, always: it builds nothing, so no build host or guard applies to it.
+# For the other tiers this machine selects the changed files. With a build host
+# (scripts/lib/remote.sh), the host runs every step on a snapshot of this working tree; without
+# one, or with NRESE_BUILD_HOST=local, this script runs them here. Either way a passed tier is
+# remembered.
+if [ "$mode" != commit ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+  build_host=${NRESE_BUILD_HOST:-$(git config --get nrese.buildHost)}
+  # A machine's guard marks it busy (low memory or disk); then a local build goes to the build host.
+  if [ "$build_host" = local ] && [ -f "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}" ]; then
+    echo "this machine is busy ($(cat "${NRESE_GUARD_BUSY:-$HOME/owlrs-guard/BUSY}")); building on the build host" >&2
+    build_host=$(git config --get nrese.buildHost)
+  fi
+  list=$(mktemp)
+  [ "$mode" = all ] || changed_files "$mode" > "$list"
+  # A tier that passed for this exact tree and file list doesn't run again. So the gate can
+  # run before `git push`, whose hook then needn't hold the remote's connection open for it.
+  key="$mode${NRESE_W3C_OPTIONAL:+ w3c-optional} $(bash scripts/lib/remote.sh tree) $(git hash-object "$list")"
+  passed="$(git rev-parse --git-common-dir)/nrese-gate-passed"
+  if grep -qxF "$key" "$passed" 2> /dev/null; then
+    echo "=== $mode: passed before for this tree and these files"
+    rm -f "$list"
+    exit 0
+  fi
+  if [ -n "$build_host" ] && [ "$build_host" != local ]; then
+    bash scripts/lib/remote.sh check "$mode" "$list"
+  else
+    NRESE_ON_BUILD_HOST=1 NRESE_FILES_FROM="$list" bash scripts/check.sh "$mode"
+  fi
+  code=$?
+  [ $code -eq 0 ] && echo "$key" >> "$passed"
+  rm -f "$list"
+  exit $code
+fi
+
+case "$mode" in
+  commit)
+    # Checks of a few seconds, with no build: rustfmt, and for the files changed against HEAD
+    # their lock files, Docker names and the bench harness's format. The compile, the lints and
+    # the tests run on the fleet before anything lands: the push tier for the pushed commit's exact
+    # tree, the merge check's Windows part for its Windows inputs (scripts/lib/gate-key.sh
+    # windows_inputs; process review 20 Oct 2026, §3A).
+    mapfile -t files < <(changed_files commit)
+    step fmt cargo fmt --all --check
+    # No run of spaces inside a product string: a string continued on the next line without its
+    # `\` keeps that line's indentation, and the message reaches its reader with it.
+    step "message strings" bash -c '! git grep -n -E "^\s*\"[^\"]*[a-z,;:)] {6,}[a-z(]" -- "crates/*/src/*.rs" ":!*tests*"'
+    if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
+      step locks bash scripts/check-locks.sh
+      step features bash scripts/check-features.sh
+    fi
+    # Docker names only from the job namespace (scripts/check-names.sh).
+    if printf '%s\n' "${files[@]}" | grep -qE '^(benches|scripts)/'; then
+      step names bash scripts/check-names.sh
+    fi
+    if printf '%s\n' "${files[@]}" | grep -qE '^benches/nrese-bench-harness/'; then
+      step "fmt (bench harness)" cargo fmt --manifest-path benches/nrese-bench-harness/Cargo.toml --all --check
+    fi
+    ;;
+  push)
+    # A push tier on a build host runs the list its gate sent (gate-job.sh, remote.sh), never one
+    # it selects itself: here it has no pushed range.
+    if [ -z "${NRESE_FILES_FROM:-}" ]; then
+      echo "check.sh push on a build host needs the gate's file list (NRESE_FILES_FROM): not run" >&2
+      exit 2
+    fi
+    mapfile -t files < "$NRESE_FILES_FROM"
+    mapfile -t changed < <(changed_crates "${files[@]}")
+    mapfile -t dependents < <([ ${#changed[@]} -gt 0 ] && dependents_of "${changed[@]}")
+    echo "=== changed: ${changed[*]:-none}; depending on them: ${dependents[*]:-none}"
+    step fmt cargo fmt --all --check
+    if [ ${#changed[@]} -gt 0 ]; then
+      # Lints where code changed: every target of the changed crates. A dependent's code didn't
+      # change, so its lints can't either; what can break there is compiling against the new
+      # API, and the dependents' tests are built and run, which checks every target of theirs.
+      # shellcheck disable=SC2046
+      step clippy "$guarded" clippy --locked $(package_args "${changed[@]}") --all-targets
+      w3c_data
+      step test run_tests "${changed[@]}" "${dependents[@]}" -- "${dependents[@]}"
+      step seeds run_seeds "${changed[@]}"
+      step locks bash scripts/check-locks.sh
+      step features bash scripts/check-features.sh
+    fi
+    # nrese-exec's unsafe primitives under Miri (scripts/miri.sh), and its doc tests: the
+    # compile-fail rows that keep their misuse unwritable (a settled region grows).
+    if exec_changed; then
+      step miri bash scripts/miri.sh
+      step "doc tests (nrese-exec)" "$guarded" test --locked --doc -p nrese-exec
+    fi
+    side_steps "${files[@]}"
+    ;;
+  windows)
+    # Inside its fleet job only, which readies the Windows host (scripts/lib/windows-job.sh).
+    [ -n "${FLEET_OUT:-}" ] || { echo "check.sh windows runs inside its fleet job only (scripts/lib/windows-job.sh): not run" >&2; exit 2; }
+    mapfile -t everything < <(workspace_packages)
+    [ ${#everything[@]} -gt 0 ] || { echo "no workspace packages found" >&2; exit 2; }
+    w3c_data
+    step build "$guarded" build --locked --workspace --all-targets
+    # Lints of the code only Windows compiles (cfg(windows)), which no Linux tier sees: the push
+    # tier lints the changed crates on Linux alone (PR #68).
+    step clippy "$guarded" clippy --locked --workspace --all-targets
+    step test run_tests "${everything[@]}"
+    step "doc tests" "$guarded" test --locked --workspace --doc --no-fail-fast
+    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+    # The console's typecheck and tests, with the gate's own Node (scripts/lib/windows-job.sh).
+    console
+    ;;
+  all)
+    step fmt cargo fmt --all --check
+    step clippy "$guarded" clippy --locked --workspace --all-targets
+    mapfile -t everything < <(workspace_packages)
+    [ ${#everything[@]} -gt 0 ] || { echo "no workspace packages found" >&2; exit 2; }
+    w3c_data
+    step test run_tests "${everything[@]}"
+    step "doc tests" "$guarded" test --locked --workspace --doc
+    harness
+    step locks bash scripts/check-locks.sh
+    step features bash scripts/check-features.sh
+    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+    step names bash scripts/check-names.sh
+    step "cargo-deny version" deny_version
+    step deny cargo deny --all-features check
+    step "deny (bench harness)" cargo deny --manifest-path benches/nrese-bench-harness/Cargo.toml \
+      --config deny.toml --all-features check
+    console
+    ;;
+  *)
+    echo "usage: scripts/check.sh commit|push|windows [COMMIT]|all" >&2
+    exit 2
+    ;;
+esac
 
 echo
 echo "=== summary"
 failed=0
 for result in "${results[@]}"; do
   echo "  $result"
-  [ "${result%% *}" = 0 ] || failed=1
+  case ${result%% *} in
+    0) ;;
+    75) failed=75 ;;
+    *) [ $failed -eq 75 ] || failed=1 ;;
+  esac
 done
+[ $failed -ne 75 ] || echo "the PC's guard held or stopped a build (exit 75): no verdict, not the tree's failure"
 exit $failed

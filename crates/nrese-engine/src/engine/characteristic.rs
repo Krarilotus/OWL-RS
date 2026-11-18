@@ -1,0 +1,852 @@
+//! Characteristic sets of the default graph (Neumann and Moerkotte, ICDE 2011), for the
+//! planner's estimates of star joins (XC4).
+//!
+//! A subject's characteristic set is the set of predicates it has statements with. Kept
+//! per distinct set: how many subjects have exactly it, and how many statements each of
+//! its predicates has among them. A star `?s p1 ?a . ?s p2 ?b` then has
+//! `Σ_{S ⊇ {p1, p2}} |S| · (occ_S(p1) / |S|) · (occ_S(p2) / |S|)` solutions: only the
+//! subjects that have both predicates count, where independence of the two patterns
+//! assumes every subject might. On data with kinds of subjects (products, offers,
+//! persons), that is the difference between an estimate of thousands and one of zero.
+//!
+//! Built by one scan of the default graph in subject order. Data whose subjects have too
+//! many different sets (more than [`MAX_SETS`]) gets none: the planner then estimates as
+//! before.
+//!
+//! **Characteristic pairs** (Gubichev and Neumann, *Exploiting the query structure for
+//! efficient join ordering in SPARQL queries*, EDBT 2014) estimate chains: for each
+//! predicate `p`, how many statements `s p o` link a subject of set `S1` to an object of
+//! set `S2` (an object that is a subject itself; `NONE` otherwise). The chain
+//! `?x p ?y . ?y q ?z` then counts only the links whose object has `q`
+//! ([`CharacteristicSets::pair`]), where independence assumes every object might. A second
+//! scan finds them (`Gathered::pair_counts`), within [`MAX_PAIR_SUBJECTS`] and
+//! [`MAX_PAIRS`].
+//!
+//! A scan gathers them first (`Gathered`); what is kept ([`CharacteristicSets`]) is built
+//! from that into vectors charged to the keeper's budget before they are allocated, sorted
+//! and looked up by binary search, so that its charge is what it holds.
+
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use nrese_exec::{Budget, BudgetExceeded, ChargedVec};
+
+use crate::quad::EncodedQuad;
+
+/// Distinct characteristic sets beyond which none are kept.
+pub const MAX_SETS: usize = 1 << 17;
+
+/// Subjects beyond which no characteristic pairs are kept (their set index is held, 12
+/// bytes each, while the pairs are counted).
+pub const MAX_PAIR_SUBJECTS: usize = 1 << 23;
+
+/// Distinct (set, predicate, set) pairs beyond which none are kept.
+pub const MAX_PAIRS: usize = 1 << 20;
+
+/// The set of an object that is no subject (a literal, or a node without statements).
+const NONE: u32 = u32::MAX;
+
+/// The characteristic sets of a graph, as kept: every container charged to the keeper's
+/// budget (`Gathered::kept`).
+#[derive(Debug)]
+pub struct CharacteristicSets {
+    /// Per set: where its predicates begin in `predicates` (they end where the next set's
+    /// begin), and its subjects.
+    sets: ChargedVec<(u64, u64)>,
+    /// Every set's predicates (raw ids, sorted within the set), each with its statements
+    /// among the set's subjects.
+    predicates: ChargedVec<(u64, u64)>,
+    /// The predicates (sorted), each with where its sets begin in `having`.
+    by_predicate: Index,
+    having: ChargedVec<u32>,
+    subjects: u64,
+    /// The pairs' predicates (sorted), each with where its links (subject set, object set,
+    /// statements; sorted) begin in the second; `None` if not counted.
+    pairs: Option<KeptPairs>,
+}
+
+/// Keys (sorted), each with where its entries begin in a vector beside it; they end where the
+/// next key's begin ([`entries`]).
+type Index = ChargedVec<(u64, u64)>;
+
+/// The pairs as kept: their predicates, each with where its links begin in the links.
+type KeptPairs = (Index, ChargedVec<(u32, u32, u64)>);
+
+/// The entries `key` has in `items`, by `index` (sorted by key, each key with where its
+/// entries begin; they end where the next key's begin).
+fn entries<'a, T>(index: &[(u64, u64)], items: &'a [T], key: u64) -> &'a [T] {
+    let Ok(at) = index.binary_search_by_key(&key, |&(k, _)| k) else {
+        return &[];
+    };
+    let end = index
+        .get(at + 1)
+        .map_or(items.len() as u64, |&(_, start)| start);
+    &items[index[at].1 as usize..end as usize]
+}
+
+/// The characteristic sets of a graph as a scan gathers them (or the file holds them), before
+/// they are kept ([`Self::kept`]).
+#[derive(Debug, Default)]
+pub(crate) struct Gathered {
+    sets: Vec<Set>,
+    /// Per predicate, the sets that have it.
+    by_predicate: HashMap<u64, Vec<u32>>,
+    subjects: u64,
+    /// Each subject's set, sorted by subject; while the pairs are being counted.
+    subject_sets: Vec<(u64, u32)>,
+    /// Per predicate, (subject set, object set, statements); `None` if not counted.
+    pairs: Option<Links>,
+}
+
+/// Characteristic pairs by predicate: (subject set, object set, statements).
+type Links = HashMap<u64, Vec<(u32, u32, u64)>>;
+
+/// Statements per (predicate, subject set, object set), while pairs are counted.
+pub(crate) type PairCounts = HashMap<(u64, u32, u32), u64>;
+
+#[derive(Debug)]
+struct Set {
+    /// Its predicates (raw ids, sorted), each with its statements among the set's subjects.
+    predicates: Box<[(u64, u64)]>,
+    subjects: u64,
+}
+
+impl Gathered {
+    /// These sets as they are kept: built into vectors charged to `budget` before they are
+    /// allocated (and the transient ones too), so that the charge is what they hold; nothing
+    /// kept, and nothing charged, where `budget` has no room for them.
+    pub(crate) fn kept(self, budget: &Arc<Budget>) -> Result<CharacteristicSets, BudgetExceeded> {
+        let vec = |capacity| ChargedVec::with_capacity(Arc::clone(budget), capacity);
+        let total = self.sets.iter().map(|set| set.predicates.len()).sum();
+        let (mut sets, mut predicates) = (vec(self.sets.len())?, vec(total)?);
+        for set in &self.sets {
+            sets.push((predicates.len() as u64, set.subjects))?;
+            predicates.extend_from_slice(&set.predicates)?;
+        }
+        let (by_predicate, having) = sorted(budget, &self.by_predicate)?;
+        let pairs = match &self.pairs {
+            Some(links) => Some(sorted(budget, links)?),
+            None => None,
+        };
+        Ok(CharacteristicSets {
+            sets,
+            predicates,
+            by_predicate,
+            having,
+            subjects: self.subjects,
+            pairs,
+        })
+    }
+
+    /// The sets of `quads`, which come sorted by subject and then predicate (as `Gspo`
+    /// scans them); `None` past [`MAX_SETS`] distinct sets.
+    #[cfg(test)]
+    pub(crate) fn build(quads: impl Iterator<Item = EncodedQuad>) -> Option<Self> {
+        Self::merge(vec![Partial::of(quads, &SetCount::default())?])
+    }
+
+    /// The number of distinct sets.
+    pub(crate) fn len(&self) -> usize {
+        self.sets.len()
+    }
+
+    /// Whether characteristic pairs were counted.
+    pub(crate) fn has_pairs(&self) -> bool {
+        self.pairs.is_some()
+    }
+
+    /// Kept against an unlimited budget of their own: what the tests query.
+    #[cfg(test)]
+    pub(crate) fn kept_unlimited(self) -> CharacteristicSets {
+        let unlimited = Arc::new(Budget::unlimited());
+        self.kept(&unlimited)
+            .unwrap_or_else(|_| unreachable!("an unlimited budget"))
+    }
+
+    /// The sets of the parts of a graph, each scanned by subject (the parts of [`Partial`]
+    /// in subject order): `None` past [`MAX_SETS`] distinct sets.
+    pub(crate) fn merge(parts: Vec<Partial>) -> Option<Self> {
+        // Each distinct set by its index, in the order the parts found them.
+        let mut index: HashMap<Box<[u64]>, u32> = HashMap::new();
+        let mut sets = Self::default();
+        let mut occurrences: Vec<Vec<u64>> = Vec::new();
+        let mut counts: Vec<u64> = Vec::new();
+        let mut keys: Vec<Box<[u64]>> = Vec::new();
+        let keep_subjects = parts.iter().map(|p| p.subject_sets.len()).sum::<usize>()
+            < MAX_PAIR_SUBJECTS
+            && parts.iter().all(|p| p.kept_subjects);
+        let mut subject_sets = Vec::new();
+        for part in parts {
+            let mut local_to_global = Vec::with_capacity(part.found.len());
+            for (key, subjects, occurs) in part.found {
+                let at = match index.get(&key) {
+                    Some(&at) => at,
+                    None => {
+                        if keys.len() >= MAX_SETS {
+                            return None;
+                        }
+                        let at = keys.len() as u32;
+                        index.insert(key.clone(), at);
+                        occurrences.push(vec![0; key.len()]);
+                        counts.push(0);
+                        keys.push(key);
+                        at
+                    }
+                };
+                counts[at as usize] += subjects;
+                for (total, n) in occurrences[at as usize].iter_mut().zip(occurs) {
+                    *total += n;
+                }
+                local_to_global.push(at);
+            }
+            if keep_subjects {
+                subject_sets.extend(
+                    part.subject_sets
+                        .into_iter()
+                        .map(|(s, local)| (s, local_to_global[local as usize])),
+                );
+            }
+        }
+        for (at, ((predicates, subjects), occurs)) in
+            keys.into_iter().zip(counts).zip(occurrences).enumerate()
+        {
+            for &p in predicates.iter() {
+                sets.by_predicate.entry(p).or_default().push(at as u32);
+            }
+            sets.subjects += subjects;
+            sets.sets.push(Set {
+                predicates: predicates.iter().copied().zip(occurs).collect(),
+                subjects,
+            });
+        }
+        sets.subject_sets = subject_sets;
+        Some(sets)
+    }
+
+    /// These sets with their characteristic pairs counted from `quads` (the same graph
+    /// again, in any order); without pairs if there are too many subjects or pairs.
+    #[cfg(test)]
+    pub(crate) fn with_pairs(mut self, quads: impl Iterator<Item = EncodedQuad>) -> Self {
+        let subjects = self.take_subjects();
+        let counted = (!subjects.is_empty()).then(|| Self::pair_counts(&subjects, quads));
+        self.with_pair_counts(counted.map(|c| c.into_iter().collect()))
+    }
+
+    /// The subjects' sets, which the pairs are counted by ([`Self::pair_counts`]), taken
+    /// out of these sets; empty where there are none to count by.
+    pub(crate) fn take_subjects(&mut self) -> Vec<(u64, u32)> {
+        std::mem::take(&mut self.subject_sets)
+    }
+
+    /// The characteristic pairs among `quads` (a part of the graph), by the subjects' sets
+    /// `subjects`; `None` past [`MAX_PAIRS`].
+    pub(crate) fn pair_counts(
+        subjects: &[(u64, u32)],
+        quads: impl Iterator<Item = EncodedQuad>,
+    ) -> Option<PairCounts> {
+        let set_of = |id: u64| {
+            subjects
+                .binary_search_by_key(&id, |&(s, _)| s)
+                .map_or(NONE, |at| subjects[at].1)
+        };
+        let mut counts: PairCounts = HashMap::new();
+        let mut last: Option<(u64, u32)> = None;
+        for quad in quads {
+            let s = quad.subject.raw();
+            let from = match last {
+                Some((subject, set)) if subject == s => set,
+                _ => {
+                    let set = set_of(s);
+                    last = Some((s, set));
+                    set
+                }
+            };
+            let key = (quad.predicate.raw(), from, set_of(quad.object.raw()));
+            if !counts.contains_key(&key) && counts.len() >= MAX_PAIRS {
+                return None;
+            }
+            *counts.entry(key).or_insert(0) += 1;
+        }
+        Some(counts)
+    }
+
+    /// These sets with the pairs counted over the graph's parts ([`Self::pair_counts`])
+    /// summed; without pairs where a part had too many (`None`) or the sum has.
+    pub(crate) fn with_pair_counts(mut self, counted: Option<Vec<PairCounts>>) -> Self {
+        let Some(counted) = counted else {
+            return self;
+        };
+        let mut counts: PairCounts = HashMap::new();
+        for part in counted {
+            for (key, n) in part {
+                if !counts.contains_key(&key) && counts.len() >= MAX_PAIRS {
+                    return self;
+                }
+                *counts.entry(key).or_insert(0) += n;
+            }
+        }
+        let mut pairs: Links = HashMap::new();
+        for ((p, from, to), n) in counts {
+            pairs.entry(p).or_default().push((from, to, n));
+        }
+        for links in pairs.values_mut() {
+            links.sort_unstable();
+        }
+        self.pairs = Some(pairs);
+        self
+    }
+
+    /// Writes the sets and pairs (not the subjects' sets, which only counting pairs needs).
+    pub(crate) fn write<W: std::io::Write>(
+        &self,
+        w: &mut crate::term::derived::Writer<W>,
+    ) -> std::io::Result<()> {
+        w.u32(FILE_VERSION)?;
+        w.u64(self.subjects)?;
+        w.u64(self.sets.len() as u64)?;
+        for set in &self.sets {
+            w.u64(set.subjects)?;
+            w.u64(set.predicates.len() as u64)?;
+            for &(p, n) in set.predicates.iter() {
+                w.u64(p)?;
+                w.u64(n)?;
+            }
+        }
+        match &self.pairs {
+            None => w.u64(u64::MAX)?,
+            Some(pairs) => {
+                w.u64(pairs.len() as u64)?;
+                let mut predicates: Vec<&u64> = pairs.keys().collect();
+                predicates.sort_unstable();
+                for p in predicates {
+                    let links = &pairs[p];
+                    w.u64(*p)?;
+                    w.u64(links.len() as u64)?;
+                    for &(from, to, n) in links {
+                        w.u32(from)?;
+                        w.u32(to)?;
+                        w.u64(n)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads what [`Self::write`] wrote; `None` if it is malformed or of another version.
+    pub(crate) fn read(r: &mut crate::term::derived::Reader<'_>) -> Option<Self> {
+        if r.u32()? != FILE_VERSION {
+            return None;
+        }
+        let mut sets = Self {
+            subjects: r.u64()?,
+            ..Self::default()
+        };
+        let count = r.len(16)?;
+        for at in 0..count {
+            let subjects = r.u64()?;
+            let n = r.len(16)?;
+            let mut predicates = Vec::with_capacity(n);
+            for _ in 0..n {
+                let p = r.u64()?;
+                predicates.push((p, r.u64()?));
+                sets.by_predicate.entry(p).or_default().push(at as u32);
+            }
+            sets.sets.push(Set {
+                predicates: predicates.into_boxed_slice(),
+                subjects,
+            });
+        }
+        let pair_predicates = r.u64()?;
+        if pair_predicates != u64::MAX {
+            let mut pairs: Links = HashMap::new();
+            for _ in 0..pair_predicates {
+                let p = r.u64()?;
+                let n = r.len(16)?;
+                let mut links = Vec::with_capacity(n);
+                for _ in 0..n {
+                    links.push((r.u32()?, r.u32()?, r.u64()?));
+                }
+                pairs.insert(p, links);
+            }
+            sets.pairs = Some(pairs);
+        }
+        Some(sets)
+    }
+}
+
+/// `map` by its keys, sorted: the keys each with where its entries begin in the second
+/// vector, which holds them all; built in vectors charged to `budget` first.
+fn sorted<T: Copy>(
+    budget: &Arc<Budget>,
+    map: &HashMap<u64, Vec<T>>,
+) -> Result<(Index, ChargedVec<T>), BudgetExceeded> {
+    let mut keys = ChargedVec::with_capacity(Arc::clone(budget), map.len())?;
+    for &key in map.keys() {
+        keys.push(key)?;
+    }
+    keys.sort_unstable();
+    let total = map.values().map(Vec::len).sum();
+    let mut index = ChargedVec::with_capacity(Arc::clone(budget), map.len())?;
+    let mut items = ChargedVec::with_capacity(Arc::clone(budget), total)?;
+    for &key in keys.iter() {
+        index.push((key, items.len() as u64))?;
+        items.extend_from_slice(&map[&key])?;
+    }
+    Ok((index, items))
+}
+
+impl CharacteristicSets {
+    /// Kept from gathered sets against an unlimited budget: what the tests query.
+    #[cfg(test)]
+    pub(crate) fn build(quads: impl Iterator<Item = EncodedQuad>) -> Option<Self> {
+        Some(Gathered::build(quads)?.kept_unlimited())
+    }
+
+    /// The predicates of set `i`, each with its statements among the set's subjects.
+    fn predicates_of(&self, i: u32) -> &[(u64, u64)] {
+        let start = self.sets[i as usize].0 as usize;
+        let end = self
+            .sets
+            .get(i as usize + 1)
+            .map_or(self.predicates.len(), |&(start, _)| start as usize);
+        &self.predicates[start..end]
+    }
+
+    /// The bytes it holds, charged ([`Gathered::kept`]).
+    #[cfg(test)]
+    pub(crate) fn charged(&self) -> usize {
+        self.sets.charged()
+            + self.predicates.charged()
+            + self.by_predicate.charged()
+            + self.having.charged()
+            + self
+                .pairs
+                .as_ref()
+                .map_or(0, |(index, links)| index.charged() + links.charged())
+    }
+
+    /// Whether characteristic pairs were counted.
+    pub fn has_pairs(&self) -> bool {
+        self.pairs.is_some()
+    }
+
+    /// The number of sets that have `predicate`: what [`Self::star_of`] reads. O(log P) for
+    /// P predicates; reads no list.
+    pub fn sets_having(&self, predicate: u64) -> usize {
+        entries(&self.by_predicate, &self.having, predicate).len()
+    }
+
+    /// The number of links `predicate` has among the characteristic pairs (none without
+    /// pairs): what [`Self::pair`] reads. O(log P) for P predicates; reads no list.
+    pub fn links_of(&self, predicate: u64) -> usize {
+        self.pairs
+            .as_ref()
+            .map_or(0, |(index, links)| entries(index, links, predicate).len())
+    }
+
+    /// The estimated solutions of the chain `?x p ?y` with `?x` also having the
+    /// predicates `from` and `?y` having `to` (every other object free): over the links
+    /// `p` makes from a set with `from` to a set with `to`, the links times each other
+    /// predicate's statements per subject on either side. With `to` empty, links to
+    /// objects that are no subject count too. `None` without pairs.
+    pub fn pair(&self, from: &[u64], p: u64, to: &[u64]) -> Option<f64> {
+        let (index, links) = self.pairs.as_ref()?;
+        let links = entries(index, links, p);
+        if links.is_empty() {
+            return Some(0.0);
+        }
+        // Statements per subject of each predicate, over a set that has them all.
+        let per_subject = |set: u32, predicates: &[u64]| -> Option<f64> {
+            predicates
+                .iter()
+                .try_fold(1.0, |rows, &q| Some(rows * self.share(set, q)?))
+        };
+        Some(
+            links
+                .iter()
+                .filter_map(|&(s1, s2, n)| {
+                    let left = per_subject(s1, from)?;
+                    let right = match (to.is_empty(), s2) {
+                        (true, _) => 1.0,
+                        (false, NONE) => return None,
+                        (false, s2) => per_subject(s2, to)?,
+                    };
+                    Some(n as f64 * left * right)
+                })
+                .sum(),
+        )
+    }
+
+    /// The estimated solutions of a star on one subject with these predicates (raw ids;
+    /// one may repeat, for two patterns with it), every object free: over the sets that
+    /// have them all, the subjects times each predicate's statements per subject.
+    pub fn star(&self, predicates: &[u64]) -> f64 {
+        let Some(rarest) = predicates
+            .iter()
+            .map(|&p| entries(&self.by_predicate, &self.having, p))
+            .min_by_key(|sets| sets.len())
+        else {
+            return self.subjects as f64;
+        };
+        rarest
+            .iter()
+            .filter_map(|&i| {
+                let subjects = self.sets[i as usize].1 as f64;
+                predicates
+                    .iter()
+                    .try_fold(subjects, |rows, &p| Some(rows * self.share(i, p)?))
+            })
+            .sum()
+    }
+
+    /// The star of `predicate` alone, to be extended a predicate at a time
+    /// ([`Self::star_with`]).
+    pub fn star_of(&self, predicate: u64) -> StarRows {
+        let sets: Vec<(u32, f64)> = entries(&self.by_predicate, &self.having, predicate)
+            .iter()
+            .filter_map(|&i| {
+                let subjects = self.sets[i as usize].1 as f64;
+                Some((i, subjects * self.share(i, predicate)?))
+            })
+            .collect();
+        StarRows::new(sets)
+    }
+
+    /// The rows of `star` with `predicate` added ([`Self::star`] of its predicates and
+    /// `predicate`), without keeping the sets: O(the sets that still match).
+    pub fn star_rows_with(&self, star: &StarRows, predicate: u64) -> f64 {
+        star.sets
+            .iter()
+            .filter_map(|&(i, rows)| Some(rows * self.share(i, predicate)?))
+            .sum()
+    }
+
+    /// `star` with `predicate` added.
+    pub fn star_with(&self, star: &StarRows, predicate: u64) -> StarRows {
+        let sets = star
+            .sets
+            .iter()
+            .filter_map(|&(i, rows)| Some((i, rows * self.share(i, predicate)?)))
+            .collect();
+        StarRows::new(sets)
+    }
+
+    /// The statements of `predicate` per subject of set `i`; `None` if it lacks it.
+    fn share(&self, i: u32, predicate: u64) -> Option<f64> {
+        let predicates = self.predicates_of(i);
+        let at = predicates
+            .binary_search_by_key(&predicate, |&(q, _)| q)
+            .ok()?;
+        Some(predicates[at].1 as f64 / self.sets[i as usize].1 as f64)
+    }
+
+    /// The number of distinct sets.
+    pub fn len(&self) -> usize {
+        self.sets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sets.is_empty()
+    }
+
+    /// The number of subjects.
+    pub fn subjects(&self) -> u64 {
+        self.subjects
+    }
+}
+
+/// A star built up one predicate at a time, as the planner adds a star's patterns
+/// ([`CharacteristicSets::star_of`], [`CharacteristicSets::star_with`]): the sets that have
+/// every predicate so far, each with the star's rows among its subjects. Adding a predicate
+/// reads one entry of each such set, where [`CharacteristicSets::star`] reads every
+/// predicate again.
+#[derive(Debug, Clone, Default)]
+pub struct StarRows {
+    sets: Vec<(u32, f64)>,
+    rows: f64,
+}
+
+impl StarRows {
+    fn new(sets: Vec<(u32, f64)>) -> Self {
+        let rows = sets.iter().map(|&(_, rows)| rows).sum();
+        Self { sets, rows }
+    }
+
+    /// The star's estimated solutions ([`CharacteristicSets::star`] of its predicates).
+    pub fn rows(&self) -> f64 {
+        self.rows
+    }
+
+    /// The sets that still match: what adding a predicate reads.
+    pub fn len(&self) -> usize {
+        self.sets.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sets.is_empty()
+    }
+}
+
+/// The version of [`CharacteristicSets::write`]'s bytes.
+const FILE_VERSION: u32 = 1;
+
+/// The sets of one part of a graph scanned by subject ([`CharacteristicSets::merge`]): in
+/// the order found, each with its subjects and its predicates' statements, and each
+/// subject's set (its index here), while there aren't too many subjects to keep.
+pub(crate) struct Partial {
+    found: Vec<(Box<[u64]>, u64, Vec<u64>)>,
+    subject_sets: Vec<(u64, u32)>,
+    kept_subjects: bool,
+}
+
+/// The distinct sets the parts of one scan have found between them, counted as they find
+/// them (by a hash of their predicates, in shards), so that each part stops once all are
+/// past [`MAX_SETS`] instead of at the merge after the whole scan (DBpedia core: none
+/// kept, its scan 0.37 s on phuoc-yu). A hash that collides counts once: a part may go
+/// on a little longer, the merge still decides.
+pub(crate) struct SetCount {
+    shards: Vec<parking_lot::Mutex<std::collections::HashSet<u64>>>,
+    found: std::sync::atomic::AtomicUsize,
+}
+
+impl Default for SetCount {
+    fn default() -> Self {
+        Self {
+            shards: (0..64).map(|_| Default::default()).collect(),
+            found: Default::default(),
+        }
+    }
+}
+
+impl SetCount {
+    /// Counts a set a part found new to it: whether the parts are still within
+    /// [`MAX_SETS`].
+    fn found(&self, key: &[u64]) -> bool {
+        use std::hash::{Hash, Hasher};
+        use std::sync::atomic::Ordering;
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        let hash = hasher.finish();
+        let shard = &self.shards[(hash % self.shards.len() as u64) as usize];
+        if shard.lock().insert(hash) {
+            self.found.fetch_add(1, Ordering::Relaxed);
+        }
+        self.within()
+    }
+
+    fn within(&self) -> bool {
+        self.found.load(std::sync::atomic::Ordering::Relaxed) <= MAX_SETS
+    }
+}
+
+impl Partial {
+    /// The sets of `quads`, sorted by subject and then predicate; `None` past
+    /// [`MAX_SETS`] distinct sets, here or among all the parts `count` counts for.
+    pub(crate) fn of(quads: impl Iterator<Item = EncodedQuad>, count: &SetCount) -> Option<Self> {
+        let mut index: HashMap<Box<[u64]>, u32> = HashMap::new();
+        let mut part = Partial {
+            found: Vec::new(),
+            subject_sets: Vec::new(),
+            kept_subjects: true,
+        };
+        let mut current: Vec<(u64, u64)> = Vec::new();
+        let mut subject = None;
+        let mut flush = |part: &mut Partial,
+                         current: &mut Vec<(u64, u64)>,
+                         subject: Option<u64>|
+         -> Option<()> {
+            if current.is_empty() {
+                return Some(());
+            }
+            let key: Box<[u64]> = current.iter().map(|&(p, _)| p).collect();
+            let at = match index.get(&key) {
+                // Another part may have found the set past the limit.
+                Some(_) if !count.within() => return None,
+                Some(&at) => at,
+                None => {
+                    if part.found.len() >= MAX_SETS || !count.found(&key) {
+                        return None;
+                    }
+                    let at = part.found.len() as u32;
+                    part.found.push((key.clone(), 0, vec![0; current.len()]));
+                    index.insert(key, at);
+                    at
+                }
+            };
+            let entry = &mut part.found[at as usize];
+            entry.1 += 1;
+            for (total, &(_, n)) in entry.2.iter_mut().zip(current.iter()) {
+                *total += n;
+            }
+            if part.kept_subjects {
+                if part.subject_sets.len() >= MAX_PAIR_SUBJECTS {
+                    part.kept_subjects = false;
+                    part.subject_sets = Vec::new();
+                } else if let Some(s) = subject {
+                    part.subject_sets.push((s, at));
+                }
+            }
+            current.clear();
+            Some(())
+        };
+        for quad in quads {
+            let (s, p) = (quad.subject.raw(), quad.predicate.raw());
+            if subject != Some(s) {
+                flush(&mut part, &mut current, subject)?;
+                subject = Some(s);
+            }
+            match current.last_mut() {
+                Some((last, n)) if *last == p => *n += 1,
+                _ => current.push((p, 1)),
+            }
+        }
+        flush(&mut part, &mut current, subject)?;
+        Some(part)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::term::TermId;
+
+    fn quad(s: u64, p: u64, o: u64) -> EncodedQuad {
+        let id = |raw| TermId::from_raw(raw);
+        EncodedQuad::new(id(s), id(p), id(o), TermId::DEFAULT_GRAPH)
+    }
+
+    #[test]
+    fn stars_count_only_subjects_with_every_predicate() {
+        // 10 products with a label and a price (two labels each), 20 persons with a
+        // label and a name.
+        let (label, price, name) = (100, 101, 102);
+        let mut quads = Vec::new();
+        for s in 0..10 {
+            quads.push(quad(s, label, 1000));
+            quads.push(quad(s, label, 1001));
+            quads.push(quad(s, price, 2000));
+        }
+        for s in 10..30 {
+            quads.push(quad(s, label, 1000));
+            quads.push(quad(s, name, 3000));
+        }
+        quads.sort_by_key(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()));
+        let sets = CharacteristicSets::build(quads.into_iter()).unwrap();
+        assert_eq!(sets.len(), 2);
+        assert_eq!(sets.subjects(), 30);
+        assert_eq!(sets.star(&[price, name]), 0.0, "no subject has both");
+        assert_eq!(
+            sets.star(&[label, price]),
+            20.0,
+            "10 products, 2 labels each"
+        );
+        assert_eq!(sets.star(&[label]), 40.0, "every label statement");
+        assert_eq!(
+            sets.star(&[label, label]),
+            60.0,
+            "4 label pairs per product, 1 per person"
+        );
+        assert_eq!(sets.star(&[999]), 0.0, "an unknown predicate");
+    }
+
+    #[test]
+    fn pairs_count_only_links_to_objects_with_the_predicates() {
+        // 10 people each know 2 people; 5 of the 10 work somewhere; 3 companies (no
+        // `knows`) are known by person 0.
+        let (knows, works, name) = (100, 101, 102);
+        let mut quads = Vec::new();
+        for s in 0..10 {
+            quads.push(quad(s, knows, (s + 1) % 10));
+            quads.push(quad(s, knows, (s + 2) % 10));
+            quads.push(quad(s, name, 1000 + s));
+            if s % 2 == 0 {
+                quads.push(quad(s, works, 50));
+            }
+        }
+        for c in 50..53 {
+            quads.push(quad(c, name, 2000 + c));
+            quads.push(quad(0, knows, c));
+        }
+        quads.sort_by_key(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()));
+        let sets = Gathered::build(quads.clone().into_iter())
+            .unwrap()
+            .with_pairs(quads.into_iter())
+            .kept_unlimited();
+        assert!(sets.has_pairs());
+        // Every `knows` link: 20 between people and 3 to companies.
+        assert_eq!(sets.pair(&[], knows, &[]), Some(23.0));
+        // Links to someone who works: each person is known by 2, 5 people work.
+        assert_eq!(sets.pair(&[], knows, &[works]), Some(10.0));
+        // Links to anyone with a name: people and companies.
+        assert_eq!(sets.pair(&[], knows, &[name]), Some(23.0));
+        // From someone who works to someone who works: 0 knows 1 and 2, 2 knows 3 and 4...
+        // every even person knows one odd and one even one.
+        assert_eq!(sets.pair(&[works], knows, &[works]), Some(5.0));
+        // Unknown predicates link nothing.
+        assert_eq!(sets.pair(&[], 999, &[]), Some(0.0));
+        // Independence would say 23 links × 5/13 workers among the subjects: about 9.
+        let unpaired = CharacteristicSets::build(std::iter::empty()).unwrap();
+        assert_eq!(unpaired.pair(&[], knows, &[]), None);
+    }
+
+    /// A star extended a predicate at a time has the rows [`CharacteristicSets::star`]
+    /// gives for its predicates, repeats and unknown predicates included.
+    #[test]
+    fn stars_extended_a_predicate_at_a_time_equal_stars_from_scratch() {
+        let mut quads = Vec::new();
+        let mut state = 7u64;
+        let mut next = |bound: u64| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) % bound
+        };
+        for s in 0..400 {
+            for p in 100..108 {
+                for o in 0..next(4) {
+                    quads.push(quad(s, p, 1000 + o));
+                }
+            }
+        }
+        quads.sort_by_key(|q| (q.subject.raw(), q.predicate.raw(), q.object.raw()));
+        quads.dedup();
+        let sets = CharacteristicSets::build(quads.into_iter()).unwrap();
+        for _ in 0..200 {
+            let predicates: Vec<u64> = (0..1 + next(6)).map(|_| 100 + next(9)).collect();
+            let mut star = sets.star_of(predicates[0]);
+            assert_eq!(star.rows(), sets.star(&predicates[..1]));
+            for (k, &p) in predicates.iter().enumerate().skip(1) {
+                let ahead = sets.star_rows_with(&star, p);
+                star = sets.star_with(&star, p);
+                assert!((ahead - star.rows()).abs() <= 1e-9 * star.rows().max(1.0));
+                let scratch = sets.star(&predicates[..=k]);
+                assert!(
+                    (star.rows() - scratch).abs() <= 1e-9 * scratch.max(1.0),
+                    "{predicates:?}: {} against {scratch}",
+                    star.rows()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn too_many_sets_give_none() {
+        // Every subject its own set: one predicate of its own.
+        let quads = (0..MAX_SETS as u64 + 1).map(|s| quad(s, 10_000_000 + s, 1));
+        assert!(CharacteristicSets::build(quads).is_none());
+    }
+
+    #[test]
+    fn parts_stop_once_past_the_limit_between_them() {
+        // Two parts with sets of their own, each within the limit, together past it: the
+        // second stops while scanning, not the merge after both.
+        let count = SetCount::default();
+        let half = MAX_SETS as u64 / 2;
+        let part = |subjects: std::ops::Range<u64>| {
+            Partial::of(subjects.map(|s| quad(s, 10_000_000 + s, 1)), &count)
+        };
+        assert!(part(0..half + 1).is_some());
+        assert!(part(half + 1..2 * half + 2).is_none());
+    }
+}

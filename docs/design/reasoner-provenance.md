@@ -1,0 +1,110 @@
+# Reasoner provenance: support counts and support graph sets (design, 3 October 2026)
+
+**Why:**
+- [Research designs §6](research-designs.md) asks for support counts always, provenance at a chosen level, and maintenance chosen per commit.
+- §4 asks for inferred statements to be visible to a reader who may read the graphs of at least one of their derivations (support graph sets, decided on 2 October).
+- The [roadmap](../ROADMAP.md) puts both in phase 1, under "reasoning that leads".
+
+## Today
+
+- The inferred stack holds the closure with set semantics: a fact is there or not.
+- Commits maintain it by DRed with backward/forward proofs (B/F; `nrese_reasoner::delta`). Overdeletion asks the prover whether a candidate keeps a proof avoiding the deleted facts. It restarts as plain DRed when a schema or list fact changes.
+- Explanations are searched backwards on demand.
+- Inferred statements under graph access: all-or-nothing per access policy (`GraphAccess::inferred`), or, with `inferred = "supported"`, visible to a reader exactly when the graphs it may read derive them: one of their minimal support graph sets is readable, or, past the cap on sets (`reasoner.support_sets`), the reader's closure holds them. A statement asserted only in graphs the reader can't read, and derived, is shown as inferred on the same terms (`"visible"`: whenever it follows from the other statements without its own assertion, `nrese_reasoner::graph_sets::rederived`), as the stack keeps no inferred copy of a statement asserted anywhere. The sets are computed in memory (`nrese_reasoner::graph_sets`, kept per revision by `nrese-store/src/support.rs` in heap and `Arc` structures and updated per commit); they are not in the WAL or checkpoints, so a restart computes them again. Not with `reasoner.equality = "compact"`: there the sets aren't computed and a `supported` reader sees no inferred statements ([configuration](../ops/config-reference.md)).
+
+## What the field does (the state to reach)
+
+- **Counting** (Gupta, Mumick and Subrahmanian 1993) keeps per fact the number of its derivations. It is exact for non-recursive programs; for recursive ones, counts alone can't tell a self-supporting cycle from a real derivation.
+- **Hu, Motik and Horrocks** (AAAI 2018, *Optimised Maintenance of Datalog Materialisations*; AIJ 2019 with Motik and Nenov) combine them. Each fact counts its derivations by rules that are *non-recursive* with respect to it, and the recursive part is repaired by DRed or B/F. A deleted premise removes a fact without a proof search when a non-recursive derivation survives. In their measurements, counting nearly always pays (UOBM, 1,000 deletes: B/F with counting 1.2 s, DRed with counting 179 s). Which recursive repair wins depends on the workload, and rematerialising the affected part wins once deletes invalidate much of a recursive closure.
+- **Modular materialisation** (Hu, Motik and Horrocks, AIJ 2022) handles transitive closure, class hierarchies and equality by specialised modules rather than generic rule firings. NRESE already has the transitive and equality modules.
+
+## Recursion at the right granularity
+
+At the level of predicates, almost every OWL 2 RL rule over RDF is recursive (`rdf:type` feeds `rdf:type`). NRESE's ground program, however, bakes the schema into the rules: `cax-sco` becomes `?x a :C → ?x a :D` per subclass axiom. So recursion is decided over **keys**:
+- an atom's key is its predicate;
+- for `rdf:type` with a constant class, the key is the pair (`rdf:type`, class);
+- an atom with a variable predicate or class has the wildcard key, which depends on every key of its predicate (all keys if the predicate is a variable).
+
+The keys' dependency graph (body key → head key) is condensed into strongly connected components. A rule instance is **non-recursive** if its head key's component is none of its body keys' components. On ontologies, class hierarchies without equivalence cycles are then non-recursive, as Hu et al.'s class-level programs are.
+
+## What is recorded, by level
+
+`reasoner.provenance` (proposed as a repository setting. 14 Nov 2026: no such setting exists;
+support graph sets are kept when the access policy asks for `inferred = "supported"`, as many
+as [`reasoner.support_sets`](../ops/config-reference.md#reasoner.support_sets) allows):
+
+| Level | Recorded per inferred fact | Serves |
+|---|---|---|
+| `none` (default) | nothing | the smallest store; maintenance by the one-step check, B/F and DRed |
+| `acl` | its minimal support graph sets | inferred statements under graph access (§4) |
+
+(A `count` level was built and measured, then dropped: see "Measured" below.)
+
+`witness` (one derivation per fact, for constant-time explanations) and `full` (every derivation) come later, if explanations need them.
+
+## Where it lives: a support stack (proposed, not built)
+
+The engine still has two stacks (`nrese-engine/src/engine/mod.rs`); today's sets are the in-memory ones above. The proposal: a third engine stack beside the asserted and inferred ones:
+- **Layout:** `DefaultGraph`, holding entries `(s, p, o, tag)`, with the same runs, MVCC, WAL, checkpoints and compaction, and set semantics.
+- **The tag** is a `TermId` of a reserved inline kind, `Set(id)`: one entry per minimal support graph set.
+- **Reading:** an SPO-prefix scan gives a fact's provenance, adjacent and sorted.
+- **No heap map:** per-fact provenance stays out of the heap (serving memory is a phase 1 goal). The runs are compressed and mapped like the others.
+- **The set table** maps interned graph-id sets to stable ids, kept with the engine's metadata and checkpointed. Sets are sorted id lists, interned so that facts share them.
+
+## Maintenance
+
+- **Materialisation (batch):** semi-naive evaluation finds each rule instance once; each non-recursive instance adds one to its head's count. At level `acl`, a fact's sets are the minimal ones among the unions of its premises' sets over its derivations, iterated to a fixpoint for recursive derivations (monotone and finite).
+- **Inserts:** new non-recursive instances add to counts; new derivations add candidate sets, and minimality is kept.
+- **Deletes:**
+  - overdeletion enumerates the lost rule instances (as today);
+  - each lost non-recursive instance subtracts one from its head's count;
+  - a candidate whose count stays above zero keeps a derivation, so it is neither overdeleted nor propagated, and the prover isn't asked;
+  - the rest goes to B/F or DRed as today.
+
+  Counting a lost instance twice, when it is found through two deleted premises, only over-subtracts. That leads to more overdeletion, which rederivation repairs; it is safe. Missing a lost instance would not be safe, and semi-naive overdeletion finds every one at least once. At level `acl`, the sets of the facts the commit touched are recomputed and the changes propagated forward until stable.
+- **The choice per commit** (`reasoner.maintenance = auto | bf-count | dred-count | remat`): `auto` estimates the impact from the deleted facts' fan-out and the counts. Small commits use B/F with counting; a commit that invalidates much of a recursive closure rematerialises the affected modules.
+
+## Reading under graph access
+
+- **Visible sets:** for a reader with readable graphs R, the set ids S with S ⊆ R are computed lazily per (policy epoch, R) as a bitmap over set ids.
+- **Visible facts:** an inferred fact is visible iff one of its `Set` entries is in the bitmap. Inferred scans join the support stack on the fact's key, which is sorted the same way.
+- **No filter needed** for readers who may read every graph, and in the compatibility mode (`GraphAccess::inferred` as today).
+- **The cap:** per fact at most `reasoner.support_sets` minimal sets are kept (default 16, the smallest first). A fact whose sets the cap cut, or one of whose premises' it cut on the way, is marked (`graph_sets::Annotation::truncated`; marked on a fact's own graphs too, on products, schema alternatives and merges, and a change of the mark alone propagates). Unmarked, the kept sets are all of them. A reader one of them fits sees the fact; a reader none fits, of an unmarked fact, doesn't; of a marked one, the closure of the statements it reads decides (`graph_sets::closure_within`, the same evaluation with every readable statement in one graph), once per view and only where such a fact is open for it. Exact for every reader (20 October; it was the safe direction, hiding what a reader could derive, before).
+
+## Measured (3 October): counts aren't needed for maintenance
+
+Step 1 built counting (`v2::supports`, `delta::update_counted`), exact against fresh counts
+over 40 random seeds. It also showed a cheaper way to the same effect.
+- **The one-step check:** without stored counts, a candidate is kept when a non-recursive rule still derives it in *one step* from what is left. The premises lie in lower components; if one goes later in the commit, its loss brings the candidate back, as with counting.
+- **In parallel:** that check and the B/F proofs of the rest run in parallel, with a prover per worker.
+
+Measured on LUBM(100) (13.4 M asserted, 8.7 M inferred statements; the rematerialisation takes 2.3 s), deletes per commit:
+
+| Deleted | Before (B/F alone) | One-step check, parallel | Stored counts |
+|---|---|---|---|
+| 1 | 0.61 ms | 0.48 ms | 0.46 ms |
+| 1,000 | (LUBM(10): 111 ms) | 6.7 ms | 8.8 ms |
+| 10,000 | (LUBM(10): 134 ms) | 55 ms | 74 ms |
+| 100,000 | | 129 ms | 174 ms |
+
+Stored counts are slower at scale: hash-map updates on every insert and delete, and an initial count (4.5 s on LUBM(100)), against a check that is nearly as fast without them.
+
+**So:**
+- Maintenance runs on the one-step check.
+- The counting code was removed (the owner, 3 October: nothing that measures slower stays). What remains is the recursion analysis, `nrese_reasoner::recursion`.
+- The `count` level is dropped; the levels are `none` and `acl`.
+- The support stack (step 2) is needed only for the support graph sets of level `acl`.
+- The steps below are re-ordered accordingly.
+
+## Steps
+
+1. **Recursion analysis and counts, in memory first.** Done, together with the one-step check (above), which is what maintenance uses.
+   - Keys, components, and non-recursive counts during materialisation and in the delta executor's overdeletion.
+   - Checked by the property tests (incremental = rematerialisation over random changes) and measured on the delete probes against the previous build.
+   - Engine changes only once the counts prove their worth.
+2. **Support graph sets over a closure** (done, 3 October): `nrese_reasoner::graph_sets`, annotated semi-naive evaluation over the ground program with every alternative grounding's schema premises; equal to the closure of every set of graphs over 30 seeds × 150 random ontologies × 8 sets; LUBM(10) in 1.1 s against 0.2 s for the materialisation.
+3. **Reads under graph access** (done, 3 October): `inferred = "supported"`; `nrese_store::support` keeps the sets of the latest revision in memory, computed on the first restricted read, and each reader's view as a snapshot with the invisible inferred statements removed (`Snapshot::with_inferred_subset`): no read path needs a filter of its own. This replaces the bitmap join of "Reading under graph access" above for now; the view costs O(k log k) for the smaller side k of the split, once per revision and access set.
+4. **The support stack** in the engine, with persistence across restarts, holding support graph sets (level `acl`). Counts there only if a workload shows they pay.
+5. **Maintenance on commits** (done, 3 October): `graph_sets::update_support_sets` recomputes only the facts a change can affect (the forward closure of the touched facts; a schema fact among them, or too many, computes all afresh): each starts again from its own graphs, one pass over its derivations takes in the unaffected premises, semi-naive rounds finish. Equal to a recomputation over 8 seeds × 300 random ontologies and changes. The store keeps a base shared between revisions with the recomputed facts on top. A reader who sees most has a mask: runs stacked over the inferred stack (`nrese_engine::InferredMask`), one per change, tombstones for what it newly misses and inserts for what it sees again or what left the stack, rebuilt as one past eight; a reader who misses most has the list of what it sees, patched. LUBM(10), 8 graphs: the first restricted read 2.4 s; after a one-statement commit 2.1 ms, after a thousand statements 53 ms (of which the update of 7,000 affected facts 35 ms).
+6. **`auto` maintenance** and the rematerialisation threshold.
+7. **Explanations** that prefer derivations whose premises the reader may read.

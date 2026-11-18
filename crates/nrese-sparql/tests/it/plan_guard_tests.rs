@@ -1,0 +1,688 @@
+//! Guards for the query engine's measured wins (docs/design/performance.md §0): each
+//! query below must still run with the operator that made it fast, read from EXPLAIN.
+//! A planner change that loses one fails here at once, not in a benchmark run.
+
+use nrese_engine::{BulkMode, Engine, EngineConfig};
+use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
+use nrese_sparql::{PlanStep, QueryOptions, explain_query};
+use nrese_sparql_syntax::SparqlParser;
+
+const EX: &str = "http://example.org/";
+
+fn ex(local: &str) -> NamedNode {
+    NamedNode::new_unchecked(format!("{EX}{local}"))
+}
+
+/// A store of 3,000 nodes: a cyclic `knows` graph (each node knows three others), a
+/// `label` per node and a `kind` among ten.
+fn engine() -> Engine {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for i in 0..3000u32 {
+        let node = ex(&format!("n{i}"));
+        for step in [1, 7, 31] {
+            tx.insert(
+                Quad::new(
+                    node.clone(),
+                    ex("knows"),
+                    ex(&format!("n{}", (i + step) % 3000)),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+        }
+        tx.insert(
+            Quad::new(
+                node.clone(),
+                ex("label"),
+                Literal::new_simple_literal(format!("label number {i}")),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        tx.insert(
+            Quad::new(
+                node,
+                ex("kind"),
+                ex(&format!("k{}", i % 10)),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+    }
+    tx.commit().unwrap();
+    engine
+}
+
+/// How `query` ran: every operator with its estimated and actual rows.
+fn steps(engine: &Engine, query: &str) -> Vec<PlanStep> {
+    let text = format!("PREFIX e: <{EX}> {query}");
+    let query = SparqlParser::new()
+        .parse_query(&text)
+        .unwrap_or_else(|e| panic!("{e}: {text}"));
+    explain_query(&engine.snapshot(), &query, &QueryOptions::default())
+        .unwrap()
+        .steps
+}
+
+/// The operators `query` ran with.
+fn operators(engine: &Engine, query: &str) -> Vec<String> {
+    steps(engine, query)
+        .into_iter()
+        .map(|s| s.operator)
+        .collect()
+}
+
+fn assert_uses(engine: &Engine, query: &str, operator: &str) {
+    let used = operators(engine, query);
+    assert!(
+        used.iter().any(|o| o == operator),
+        "{query}\nno {operator:?} among {used:?}"
+    );
+}
+
+/// Group counts on the index: COUNT … GROUP BY one variable of one pattern reads run
+/// lengths of the permutation sorted on it (Wikidata q07: 2,101 → 0.18 ms).
+#[test]
+fn group_counts_walk_the_index() {
+    assert_uses(
+        &engine(),
+        "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s e:kind ?k } GROUP BY ?k",
+        "group count",
+    );
+}
+
+/// The distinct values of a variable by a group walk where a set suffices, as for the
+/// side of a NOT EXISTS (DBpedia q13, people without a death date: 25 → 3.1 ms).
+#[test]
+fn distinct_values_walk_the_index() {
+    assert_uses(
+        &engine(),
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s e:kind ?k FILTER NOT EXISTS { ?s e:label ?l } }",
+        "group walk",
+    );
+}
+
+/// Worst-case-optimal joins for cyclic patterns (LUBM 100 q2: 18 → 4.8 ms).
+#[test]
+fn triangles_join_worst_case_optimally() {
+    assert_uses(
+        &engine(),
+        "SELECT * WHERE { ?a e:knows ?b . ?b e:knows ?c . ?c e:knows ?a }",
+        "wcoj",
+    );
+}
+
+/// `COUNT(*)` of a cyclic BGP: the worst-case-optimal join binds the order's prefix and
+/// counts the rest as a forest, never producing the solutions. 4-cycles bind `?a` and
+/// join two lists of 2-paths per node: one check per `?a` candidate, where enumerating
+/// them checked each of the 27,000 2-paths' last step.
+#[test]
+fn cycles_are_counted_without_their_solutions() {
+    let plan = steps(
+        &engine(),
+        "SELECT (COUNT(*) AS ?n) WHERE { ?a e:knows ?b . ?b e:knows ?c . ?c e:knows ?d . ?d e:knows ?a }",
+    );
+    let order = plan
+        .iter()
+        .find(|s| s.operator == "wcoj order")
+        .unwrap_or_else(|| panic!("{plan:#?}"));
+    assert!(
+        order.detail.ends_with("?b, ?c, ?d counted as a forest"),
+        "{}",
+        order.detail
+    );
+    let lookups: u64 = order
+        .detail
+        .split(" | ")
+        .nth(1)
+        .and_then(|d| d.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("{}", order.detail));
+    assert!(lookups <= 3000, "{}", order.detail);
+}
+
+/// Eager aggregation: a group over a join aggregates the side its aggregates read before
+/// the join, `AVG`, `MIN` and `MAX` included (BSBM BI q4's shape, an average of offer
+/// prices per product feature).
+#[test]
+fn averages_over_joins_aggregate_before_joining() {
+    let text = format!(
+        "PREFIX e: <{EX}> SELECT ?k (AVG(STRLEN(?l)) AS ?mean) (MAX(?l) AS ?last) WHERE {{ ?s e:kind ?k . ?s e:knows ?o . ?o e:label ?l }} GROUP BY ?k"
+    );
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let explained = explain_query(&engine().snapshot(), &query, &QueryOptions::default()).unwrap();
+    assert!(
+        explained.rewrites.contains(&"eager-aggregation"),
+        "{:?}",
+        explained.rewrites
+    );
+    assert_eq!(explained.rows, 10);
+}
+
+/// String filters on the dictionary: CONTAINS on a large pattern's object runs once per
+/// distinct term, and the passing ids semi-join the scan.
+#[test]
+fn string_filters_test_the_dictionary() {
+    assert_uses(
+        &engine(),
+        "SELECT ?s WHERE { ?s e:label ?l FILTER(CONTAINS(?l, \"number 12\")) }",
+        "dictionary string test",
+    );
+}
+
+/// String filters on a bulk load's terms: the 256 shards those stay in are searched in
+/// one parallel loop, with searchers built once, and the scan reads a key per hit (at most
+/// one per searcher per filtered row; every key once for a language alone). Shard after
+/// shard, each with searchers of its own, Olympics q06 went 4.3 → 18 ms and YAGO q10
+/// 62 → 216 ms (36704d9).
+#[test]
+fn string_filters_scan_a_bulk_load_in_one_loop() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let quads: Vec<Quad> = (0..20_000u32)
+        .map(|i| {
+            let text = format!("label number {i}");
+            let label = match i % 2 {
+                0 => Literal::new_language_tagged_literal_unchecked(text, "en"),
+                _ => Literal::new_simple_literal(text),
+            };
+            Quad::new(
+                ex(&format!("n{i}")),
+                ex("label"),
+                label,
+                GraphName::DefaultGraph,
+            )
+        })
+        .collect();
+    let load = engine.bulk_load(BulkMode::Append);
+    for (b, batch) in quads.chunks(1_000).enumerate() {
+        load.add_at(1, b as u32, batch);
+    }
+    load.finish().unwrap();
+    let terms = engine.stats().dictionary.terms;
+    for (filter, searchers, filtered) in [
+        ("CONTAINS(?l, \"number 12\")", 1, 1_111),
+        ("CONTAINS(LCASE(STR(?l)), \"number 12\")", 3, 1_111),
+        ("LANG(?l) = \"en\"", 1, 10_000),
+    ] {
+        let text = format!("PREFIX e: <{EX}> SELECT ?s WHERE {{ ?s e:label ?l FILTER({filter}) }}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let explained =
+            explain_query(&engine.snapshot(), &query, &QueryOptions::default()).unwrap();
+        assert_eq!(explained.rows, filtered, "{filter}");
+        let step = explained
+            .steps
+            .iter()
+            .find(|s| s.operator == "dictionary string test")
+            .unwrap_or_else(|| panic!("{filter}: {:#?}", explained.steps));
+        let count = |what: &str| -> u64 {
+            let before = step.detail.split(what).next().unwrap();
+            let number = before.trim_end().rsplit([' ', ',']).next().unwrap();
+            number
+                .parse()
+                .unwrap_or_else(|_| panic!("{what}: {}", step.detail))
+        };
+        assert_eq!(count(" searchers"), searchers, "{}", step.detail);
+        assert_eq!(count(" parallel loops"), 1, "{}", step.detail);
+        assert!(count(" arenas") >= 256, "{}", step.detail);
+        let tested = count(" keys tested");
+        if filter.starts_with("LANG") {
+            assert!(tested <= terms, "{}", step.detail);
+        } else {
+            assert!(tested <= searchers * filtered, "{}", step.detail);
+        }
+    }
+}
+
+/// Sideways information passing: a pattern joined to rows already computed is evaluated
+/// from them, probing the index per row (a provenance query: about 1,200x).
+#[test]
+fn patterns_joined_to_rows_are_evaluated_from_them() {
+    let steps = steps(
+        &engine(),
+        "SELECT * WHERE { VALUES ?s { e:n1 e:n2 } ?s e:knows ?o . ?o e:label ?l }",
+    );
+    let sideways = steps.iter().find(|s| s.operator == "sideways");
+    assert!(
+        sideways.is_some_and(|s| s.rows == 6 && s.detail.contains("from 2 rows")),
+        "{steps:#?}"
+    );
+}
+
+/// LIMIT pushdown: a LIMIT without ORDER BY stops the pattern's joins once it has enough
+/// rows (Wikidata q04, LIMIT 100 k: 3,380 -> 21 ms).
+#[test]
+fn limits_stop_the_joins_early() {
+    let steps = steps(
+        &engine(),
+        "SELECT * WHERE { ?s e:knows ?o . ?o e:label ?l } LIMIT 5",
+    );
+    let limit = steps.iter().find(|s| s.operator == "limit pushdown");
+    // 1,024 rows of the first pattern in the first morsel, not all 3,000 or 9,000.
+    assert!(
+        limit.is_some_and(|s| s.detail.contains("1 morsel(s), 1024 of")),
+        "{steps:#?}"
+    );
+}
+
+/// Closures by components: `p+` and `p*` through strongly connected components; `COUNT`
+/// of a closure from the components' sizes (YAGO q08: 11,432 -> 24 ms).
+#[test]
+fn closures_run_by_components() {
+    let steps = steps(
+        &engine(),
+        "SELECT (COUNT(*) AS ?n) WHERE { ?a e:knows+ ?b }",
+    );
+    assert!(steps.iter().any(|s| s.operator == "closure"), "{steps:#?}");
+}
+
+/// EXISTS as sets: the pattern evaluated once and semi- or anti-joined in place
+/// (DBpedia q13: 25 -> 3.1 ms).
+#[test]
+fn exists_runs_once_as_a_set() {
+    let engine = engine();
+    let not = operators(
+        &engine,
+        "SELECT ?s WHERE { ?s e:kind e:k1 FILTER NOT EXISTS { ?s e:knows e:n5 } }",
+    );
+    assert!(not.iter().any(|o| o == "anti join"), "{not:?}");
+    let exists = operators(
+        &engine,
+        "SELECT ?s WHERE { ?s e:kind e:k1 FILTER EXISTS { ?s e:knows ?o } }",
+    );
+    assert!(exists.iter().any(|o| o == "semi join"), "{exists:?}");
+}
+
+/// EXPLAIN shows every operator's estimated rows beside its actual ones (the merge
+/// checklist's item): the operators the query names and those inside them.
+#[test]
+fn explain_estimates_every_operator() {
+    let engine = engine();
+    for query in [
+        "SELECT ?k (COUNT(*) AS ?n) WHERE { ?s e:kind ?k } GROUP BY ?k",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?s e:kind ?k FILTER NOT EXISTS { ?s e:label ?l } }",
+        "SELECT * WHERE { ?a e:knows ?b . ?b e:knows ?c . ?c e:knows ?a }",
+        "SELECT ?s WHERE { ?s e:label ?l FILTER(CONTAINS(?l, \"number 12\")) }",
+        "SELECT * WHERE { VALUES ?s { e:n1 e:n2 } ?s e:knows ?o . ?o e:label ?l }",
+        "SELECT * WHERE { ?s e:knows ?o . ?o e:label ?l } LIMIT 5",
+        "SELECT * WHERE { ?s e:label ?l } LIMIT 5",
+        "SELECT (COUNT(*) AS ?n) WHERE { ?a e:knows+ ?b }",
+        "SELECT ?s WHERE { ?s e:kind e:k1 FILTER NOT EXISTS { ?s e:knows e:n5 } }",
+        "SELECT ?s WHERE { ?s e:kind e:k1 FILTER EXISTS { ?s e:knows ?o } }",
+        "SELECT ?s ?o WHERE { ?s e:kind e:k1 OPTIONAL { ?s e:knows ?o FILTER(?o != e:n3) } }",
+        "SELECT * WHERE { { ?s e:kind e:k1 } UNION { ?s e:kind e:k2 } MINUS { ?s e:knows e:n9 } }",
+        "SELECT DISTINCT ?k WHERE { ?s e:kind ?k BIND(STR(?k) AS ?t) } ORDER BY ?t LIMIT 3",
+        "SELECT * WHERE { ?s e:kind e:k3 . ?s e:knows/e:knows ?f }",
+        "SELECT * WHERE { e:n1 e:knows+ ?f . ?f e:kind e:k2 }",
+        "SELECT ?k (AVG(STRLEN(?l)) AS ?m) WHERE { ?s e:kind ?k . ?s e:knows ?o . ?o e:label ?l } GROUP BY ?k",
+        "SELECT * WHERE { ?s e:kind e:k1 { SELECT ?s (COUNT(*) AS ?n) WHERE { ?s e:knows ?o } GROUP BY ?s } }",
+        "SELECT * WHERE { GRAPH ?g { ?s e:kind ?k } }",
+    ] {
+        let steps = steps(&engine, query);
+        let missing: Vec<&PlanStep> = steps
+            .iter()
+            .filter(|s| s.estimated_rows.is_none())
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{query}
+{missing:#?}"
+        );
+    }
+}
+
+/// EXPLAIN prints one estimate per BGP: the BGP's line shows what its own planning
+/// estimated, the estimate of its last step (decided on 14 November;
+/// its planning counts shared values that estimate-time planning doesn't).
+///
+/// - Input: a counted pair (the 3 nodes knowing n2 and the 3 knowing n8, sharing 1), a
+///   chain, a star with a constant object, a cycle, and a chain under a LIMIT.
+/// - Expected: every BGP line's estimate equals that of the last step under it.
+#[test]
+fn explain_prints_one_estimate_per_bgp() {
+    let engine = engine();
+    for query in [
+        "SELECT * WHERE { ?s e:knows e:n2 . ?s e:knows e:n8 }",
+        "SELECT * WHERE { e:n1 e:knows ?o . ?o e:knows ?p . ?p e:kind ?k }",
+        "SELECT * WHERE { ?s e:kind e:k1 . ?s e:knows ?o . ?o e:label ?l }",
+        "SELECT * WHERE { ?a e:knows ?b . ?b e:knows ?c . ?c e:knows ?a }",
+        "SELECT * WHERE { ?s e:knows ?o . ?o e:label ?l } LIMIT 5",
+    ] {
+        let plan = steps(&engine, query);
+        let mut bgps = 0;
+        for (at, bgp) in plan.iter().enumerate().filter(|(_, s)| s.operator == "bgp") {
+            bgps += 1;
+            let last = plan[at + 1..]
+                .iter()
+                .take_while(|s| s.depth > bgp.depth)
+                .filter(|s| s.depth == bgp.depth + 1 && s.estimated_rows.is_some())
+                .last()
+                .unwrap_or_else(|| panic!("{query}: no step under its BGP\n{plan:#?}"));
+            assert_eq!(
+                bgp.estimated_rows, last.estimated_rows,
+                "{query}\n{plan:#?}"
+            );
+        }
+        assert_eq!(bgps, 1, "{query}\n{plan:#?}");
+    }
+}
+
+/// Estimates within their bounds (LUBM-10 materialised, `perf_lab --qerror`: q-error
+/// median 15 → 1.00, p90 2,540 → 1.89): a pattern whose variables are all bound keeps at
+/// most the rows it checks, a step over non-empty inputs is never estimated at 0, and two
+/// single-variable patterns on one variable, read within the BGP's allowance (its plain
+/// plan's cost), are estimated by the values they share.
+#[test]
+fn estimates_never_exceed_their_bounds() {
+    let engine = engine();
+    // Two patterns: the check `?o e:kind e:k1` keeps at most the 3 rows it checks (it
+    // was estimated by the larger pattern, 300).
+    let plan = steps(
+        &engine,
+        "SELECT * WHERE { e:n1 e:knows ?o . ?o e:kind e:k1 }",
+    );
+    let check = plan
+        .iter()
+        .find(|s| s.detail.contains("kind") && s.operator != "scan")
+        .unwrap_or_else(|| panic!("{plan:#?}"));
+    assert!(check.estimated_rows.is_some_and(|e| e <= 3), "{plan:#?}");
+    // The 3 nodes knowing n2 (n1, n2971, n2995) and the 3 knowing n8 (n1, n7, n2977)
+    // share 1: counted, within the allowance (the plain plan's cost), by the BGP's
+    // own planning (its join step; estimate-time planning reads no lists).
+    let plan = steps(
+        &engine,
+        "SELECT * WHERE { ?s e:knows e:n2 . ?s e:knows e:n8 }",
+    );
+    let join = plan.iter().find(|s| s.operator == "join").unwrap();
+    assert_eq!((join.estimated_rows, join.rows), (Some(1), 1), "{plan:#?}");
+    for query in [
+        "SELECT * WHERE { ?a e:knows ?b . ?b e:knows ?c . ?c e:kind e:k3 . ?a e:kind e:k1 }",
+        "SELECT * WHERE { ?s e:kind e:k1 . ?s e:knows ?o . ?o e:kind e:k8 . ?o e:label ?l }",
+        "SELECT * WHERE { e:n1 e:knows ?o . ?o e:kind e:k1 }",
+    ] {
+        let plan = steps(&engine, query);
+        let zero: Vec<&PlanStep> = plan
+            .iter()
+            .filter(|s| s.rows > 0 && s.estimated_rows == Some(0))
+            .collect();
+        assert!(zero.is_empty(), "{query}\n{zero:#?}");
+    }
+}
+
+/// The seeks and searches from the root an EXPLAIN detail reports (`… | N seeks, M from the
+/// root`, or `… | L lookups (N seeks, M from the root), …`).
+fn seeks(detail: &str) -> Option<(u64, u64)> {
+    let counts = detail.rsplit_once(" | ")?.1;
+    let counts = counts.split_once('(').map_or(counts, |(_, inner)| inner);
+    let mut numbers = counts
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.parse::<u64>().unwrap());
+    Some((numbers.next()?, numbers.next()?))
+}
+
+/// Seekable cursors (investigation §1 #3): an index join reads the index forward, its
+/// keys sorted in the index's order, one search from the root per run; the
+/// worst-case-optimal join checks candidates by leapfrog seeks kept across them (LUBM-10
+/// q9: 96.9 k searches from the root → 3,573 of 59,766 seeks).
+#[test]
+fn probes_seek_forward_instead_of_from_the_root() {
+    let engine = engine();
+    // 27 rows reached in three steps (10 distinct `?c`), their labels probed (3,000).
+    let plan = steps(
+        &engine,
+        "SELECT * WHERE { e:n1 e:knows ?a . ?a e:knows ?b . ?b e:knows ?c . ?c e:label ?l }",
+    );
+    let probed: Vec<(u64, u64)> = plan
+        .iter()
+        .filter(|s| s.operator == "index join")
+        .filter_map(|s| seeks(&s.detail))
+        .collect();
+    assert!(probed.iter().any(|&(seeks, _)| seeks >= 8), "{plan:#?}");
+    for (seeks, roots) in probed {
+        assert!(
+            roots * 8 <= seeks.max(8),
+            "{seeks} seeks, {roots} from the root"
+        );
+    }
+    let plan = steps(
+        &engine,
+        "SELECT * WHERE { ?a e:knows ?b . ?b e:knows ?c . ?c e:knows ?a }",
+    );
+    let order = plan
+        .iter()
+        .find(|s| s.operator == "wcoj order")
+        .unwrap_or_else(|| panic!("{plan:#?}"));
+    let (seeks, roots) = seeks(&order.detail).unwrap_or_else(|| panic!("{order:#?}"));
+    assert!(roots * 4 <= seeks, "{}", order.detail);
+}
+
+/// A selective join in a default graph merged from listed graphs (the dataset's `FROM`, a
+/// restricted reader's readable graphs) probes the index as one graph's does, not a
+/// scan of every graph's statements (GeoSPARQL over four graphs, `FROM` two of them: a
+/// 30 ms scan of the geometries' literals for a 1 ms join). Labels in four graphs, two read.
+#[test]
+fn joins_over_a_graph_set_probe_the_index() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let graph = |i: u32| GraphName::NamedNode(ex(&format!("g{}", i % 4)));
+    for i in 0..3000u32 {
+        let node = ex(&format!("n{i}"));
+        let next = ex(&format!("n{}", i + 1));
+        tx.insert(Quad::new(node.clone(), ex("knows"), next, graph(i)).as_ref());
+        let label = Literal::new_simple_literal(format!("label number {i}"));
+        tx.insert(Quad::new(node, ex("label"), label, graph(i)).as_ref());
+    }
+    tx.commit().unwrap();
+    let readable = nrese_sparql::GraphAccess {
+        graphs: vec![format!("{EX}g0"), format!("{EX}g1")],
+        ..Default::default()
+    };
+    for (from, options) in [
+        (
+            format!("FROM <{EX}g0> FROM <{EX}g1>"),
+            QueryOptions::default(),
+        ),
+        (
+            String::new(),
+            QueryOptions {
+                union_default_graph: true,
+                access: Some(std::sync::Arc::new(readable)),
+                ..QueryOptions::default()
+            },
+        ),
+    ] {
+        let text =
+            format!("SELECT * {from} WHERE {{ <{EX}n0> <{EX}knows> ?b . ?b <{EX}label> ?l }}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        let plan = explain_query(&engine.snapshot(), &query, &options).unwrap();
+        let used: Vec<(&str, u64)> = plan
+            .steps
+            .iter()
+            .map(|s| (s.operator.as_str(), s.rows))
+            .collect();
+        assert!(used.contains(&("index join", 1)), "{text}: {used:?}");
+    }
+}
+
+/// Paths planned with the patterns they are joined to: a path from a constant that
+/// reaches few nodes goes first and the large pattern is probed from what it reaches,
+/// instead of the pattern being joined whole and the path after it.
+#[test]
+fn selective_paths_join_first() {
+    let steps = steps(
+        &engine(),
+        "SELECT * WHERE { ?s e:label ?l . e:n1 e:knows? ?s }",
+    );
+    let planned = steps
+        .iter()
+        .find(|s| s.operator == "paths ordered with patterns");
+    assert!(
+        planned.is_some_and(|s| s.detail.starts_with("<http://example.org/n1>") && s.rows == 4),
+        "{steps:#?}"
+    );
+    assert!(
+        steps.iter().any(|s| s.operator == "sideways"),
+        "the labels probed from the path's rows: {steps:#?}"
+    );
+}
+
+/// The property-graph mapping's store: 3,000 nodes, each `knows` three others, and every
+/// edge reified (RDF 1.2) with a `since` among 1,000 values: 9,000 reifiers.
+fn reified_engine() -> Engine {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let reifies = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#reifies");
+    let mut insert = |s: NamedNode, p: NamedNode, o: nrese_rdf::Term| {
+        tx.insert(Quad::new(s, p, o, GraphName::DefaultGraph).as_ref());
+    };
+    for i in 0..3000u32 {
+        for (k, step) in [1, 7, 31].into_iter().enumerate() {
+            let (a, b) = (ex(&format!("n{i}")), ex(&format!("n{}", (i + step) % 3000)));
+            insert(a.clone(), ex("knows"), b.clone().into());
+            let r = ex(&format!("r{i}_{k}"));
+            let edge = nrese_rdf::Triple::new(a, ex("knows"), b);
+            insert(r.clone(), reifies.clone(), edge.into());
+            let since = Literal::from(i64::from((i * 3 + k as u32) % 1000));
+            insert(r, ex("since"), since.into());
+        }
+    }
+    tx.commit().unwrap();
+    engine
+}
+
+/// A hop through a triple term costs probes per edge, not a scan of every reifier
+/// (review v2 §2.2.1): the joins compose the triple term from the edge's bound parts by one
+/// hash probe and probe its reifiers by the index, or take a reifier's triple term apart
+/// into the edge; every step keeps to the edges of the start, and nothing is decoded.
+/// Without the link the reifiers are a cross product with the edges (27,000 rows here,
+/// past 6 GiB on `rdf12-join`), without ids every triple term is decoded.
+#[test]
+fn a_hop_through_a_triple_term_costs_probes_per_edge() {
+    let engine = reified_engine();
+    let explain = |query: &str| {
+        let text = format!(
+            "PREFIX e: <{EX}> PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> {query}"
+        );
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        explain_query(&engine.snapshot(), &query, &QueryOptions::default()).unwrap()
+    };
+    // Composed: from n1's three edges to their reifiers.
+    let hop = explain(
+        "SELECT * WHERE { e:n1 e:knows ?b . ?r rdf:reifies <<( e:n1 e:knows ?b )>> . \
+         ?r e:since ?s }",
+    );
+    // Taken apart: from the nine reifiers since 0 to their edges.
+    let back = explain(
+        "SELECT * WHERE { ?r e:since 0 . ?r rdf:reifies <<( ?a e:knows ?b )>> . \
+         ?a e:knows ?b }",
+    );
+    for (explanation, edges) in [(&hop, 3), (&back, 9)] {
+        assert_eq!(explanation.rows, edges);
+        assert!(
+            explanation
+                .steps
+                .iter()
+                .any(|s| s.operator == "triple term join" && s.rows == edges),
+            "{:#?}",
+            explanation.steps
+        );
+        let widest = explanation.steps.iter().map(|s| s.rows).max();
+        assert_eq!(widest, Some(edges), "{:#?}", explanation.steps);
+        assert_eq!(explanation.decoded, 0, "{:#?}", explanation.steps);
+    }
+    // Without the edge in the pattern the reifiers are read, but on ids.
+    let reifiers = explain("SELECT * WHERE { ?r rdf:reifies <<( e:n1 e:knows ?b )>> }");
+    assert_eq!(reifiers.rows, 3);
+    assert_eq!(reifiers.decoded, 0, "{:#?}", reifiers.steps);
+}
+
+/// Plan parts cached and shared across queries (the result cache, QLever's level): a
+/// query whose join another query computed before, under other variable names, gets the
+/// join from the cache, and EXPLAIN marks it; the answer is the one computed afresh. The
+/// same join alone under other names is answered from the cache too.
+#[test]
+fn parts_are_shared_across_queries_through_the_result_cache() {
+    let engine = engine();
+    let cache = std::sync::Arc::new(nrese_sparql::ResultCache::new(16 << 20).admitting_all());
+    let cached = QueryOptions {
+        result_cache: Some(std::sync::Arc::clone(&cache)),
+        ..QueryOptions::default()
+    };
+    let run = |query: &str, options: &QueryOptions| {
+        let text = format!("PREFIX e: <{EX}> {query}");
+        let query = SparqlParser::new().parse_query(&text).unwrap();
+        explain_query(&engine.snapshot(), &query, options).unwrap()
+    };
+    run(
+        "SELECT ?a ?b WHERE { ?a e:knows ?b . ?b e:kind e:k3 }",
+        &cached,
+    );
+    let renamed = "SELECT ?p ?q WHERE { ?p e:knows ?q . ?q e:kind e:k3 }";
+    let hits = cache.stats().hits;
+    assert_eq!(
+        run(renamed, &cached).rows,
+        run(renamed, &QueryOptions::default()).rows
+    );
+    assert!(cache.stats().hits > hits, "{:?}", cache.stats());
+    let shared = "SELECT ?x (COUNT(?l) AS ?n) WHERE { ?x e:knows ?y . ?y e:kind e:k3 . ?x e:label ?l } GROUP BY ?x";
+    let explanation = run(shared, &cached);
+    let hit = explanation.steps.iter().find(|s| s.cache == Some("hit"));
+    assert!(
+        hit.is_some_and(|s| s.rows == 900),
+        "the join of knows and kind from the cache: {:#?}",
+        explanation.steps
+    );
+    assert_eq!(explanation.rows, run(shared, &QueryOptions::default()).rows);
+}
+
+/// DBpedia core q02's shape, `?p :birthPlace :Berlin ; :name ?n ; :birthDate ?d`, plans
+/// the same on every run, from the first query on a fresh store: the constant first, then
+/// index joins, the estimate the same each time (main: 2.0-2.1 ms; v2 ran 3.3-7.5 ms while
+/// the characteristic sets were built beside the queries, release gate 14 Oct 2026). 4,000
+/// persons born in 40 cities, all with a birth date, six in seven with a name: 85 born in
+/// `city0` have one; the estimate within a quarter of that.
+#[test]
+fn a_star_from_a_constant_plans_alike_from_the_first_run() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let mut add = |s: String, p: &str, o: nrese_rdf::Term| {
+        tx.insert(Quad::new(ex(&s), ex(p), o, GraphName::DefaultGraph).as_ref());
+    };
+    for i in 0..4_000 {
+        let person = format!("person{i}");
+        let city = ex(&format!("city{}", i % 40));
+        add(person.clone(), "birthPlace", city.into());
+        let date = Literal::new_simple_literal(format!("19{:02}", i % 100));
+        add(person.clone(), "birthDate", date.into());
+        if i % 7 != 0 {
+            let name = Literal::new_simple_literal(format!("p{i}"));
+            add(person, "name", name.into());
+        }
+    }
+    tx.commit().unwrap();
+    let query = "SELECT * WHERE { ?p e:birthPlace e:city0 ; e:name ?n ; e:birthDate ?d }";
+    let plan = |steps: Vec<PlanStep>| -> Vec<(String, String, Option<u64>, u64)> {
+        steps
+            .into_iter()
+            .map(|s| (s.operator, s.detail, s.estimated_rows, s.rows))
+            .collect()
+    };
+    let first = plan(steps(&engine, query));
+    let bgp = first.iter().position(|s| s.0 == "bgp").expect("a bgp");
+    let operators: Vec<&str> = first[bgp + 1..].iter().map(|s| s.0.as_str()).collect();
+    assert_eq!(
+        operators,
+        ["scan", "index join", "index join"],
+        "{first:#?}"
+    );
+    assert!(first[bgp + 1].1.contains("birthPlace"), "{first:#?}");
+    assert_eq!(first[bgp].3, 85);
+    assert!(
+        first[bgp].2.is_some_and(|e| (68..=106).contains(&e)),
+        "{first:#?}"
+    );
+    for _ in 0..3 {
+        assert_eq!(plan(steps(&engine, query)), first);
+    }
+}

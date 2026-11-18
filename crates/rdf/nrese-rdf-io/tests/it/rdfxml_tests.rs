@@ -6,17 +6,28 @@ use std::path::Path;
 use nrese_rdf::{Dataset, Quad};
 use nrese_rdf_io::{RdfFormat, RdfParser, RdfSerializer};
 
+/// `NRESE_W3C_REQUIRED` set and not empty (check.sh and CI set it). P07's
+/// `nrese-corpus::required()` replaces this.
+fn required() -> bool {
+    std::env::var_os("NRESE_W3C_REQUIRED").is_some_and(|v| !v.is_empty())
+}
+
 /// The OWL 2 test cases (one large RDF/XML file with entities, fetched by
 /// `scripts/fetch-w3c-tests.sh`): read without error, written back and read again alike.
+/// A missing file skips the test unless `required()`; any other read error fails it.
 #[test]
 fn the_owl_2_test_cases_read_and_round_trip() {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../.cache/owl-test/all.rdf");
-    let Ok(bytes) = std::fs::read(&path) else {
-        eprintln!(
-            "skipped: {} not found (run scripts/fetch-w3c-tests.sh)",
-            path.display()
-        );
-        return;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && !required() => {
+            eprintln!(
+                "skipped: {} not found (run scripts/fetch-w3c-tests.sh)",
+                path.display()
+            );
+            return;
+        }
+        Err(e) => panic!("{}: {e} (run scripts/fetch-w3c-tests.sh)", path.display()),
     };
     let quads: BTreeSet<Quad> = RdfParser::from_format(RdfFormat::RdfXml)
         .with_base_iri("http://www.w3.org/2009/11/owl-test/all.rdf")
@@ -55,6 +66,95 @@ fn the_owl_2_test_cases_read_and_round_trip() {
     assert_eq!(canonical(back), expected);
 }
 
+/// Prefixes RDF/XML can't declare on `rdf:RDF` (the empty one, `rdf` bound elsewhere, `xml…`)
+/// are never used in a qualified name: the output reads back as what was written.
+#[test]
+fn undeclarable_prefixes_round_trip() {
+    let text = concat!(
+        "<http://e/s> <http://e/ns#p> <http://e/o> .\n",
+        "<http://e/s> <http://other/q> \"v\" .\n",
+        "<http://e/s> <http://x/r> \"w\" .\n",
+    );
+    let quads: BTreeSet<Quad> = RdfParser::from_format(RdfFormat::NQuads)
+        .for_slice(text.as_bytes())
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for (prefix, namespace) in [
+        ("", "http://e/ns#"),
+        ("rdf", "http://other/"),
+        ("xmlns", "http://x/"),
+    ] {
+        let mut writer = RdfSerializer::from_format(RdfFormat::RdfXml)
+            .with_prefix(prefix, namespace)
+            .unwrap()
+            .for_writer(Vec::new());
+        for quad in &quads {
+            writer.serialize_quad(quad).unwrap();
+        }
+        let written = writer.finish().unwrap();
+        let back: BTreeSet<Quad> = RdfParser::from_format(RdfFormat::RdfXml)
+            .for_slice(&written)
+            .collect::<Result<_, _>>()
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{prefix:?}: {error}
+{}",
+                    String::from_utf8_lossy(&written)
+                )
+            });
+        assert_eq!(
+            back,
+            quads,
+            "{prefix:?}
+{}",
+            String::from_utf8_lossy(&written)
+        );
+    }
+}
+
+/// The prefixes the writer declares on an element (for a namespace with no prefix, for
+/// `its:dir`) never shadow a configured one that names inside that element still use: a
+/// directional literal's own predicate, a triple term's predicates.
+#[test]
+fn element_declarations_shadow_no_configured_prefix() {
+    for (text, prefix, namespace) in [
+        (
+            "<http://e/s> <http://e/p> \"v\"@en--ltr .",
+            "its",
+            "http://e/",
+        ),
+        (
+            "<http://e/s> <http://other/p> <<( <http://e/a> <http://e/p> <http://e/b> )>> .",
+            "ns",
+            "http://e/",
+        ),
+    ] {
+        let quads: BTreeSet<Quad> = RdfParser::from_format(RdfFormat::NQuads)
+            .for_slice(text.as_bytes())
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let mut writer = RdfSerializer::from_format(RdfFormat::RdfXml)
+            .with_prefix(prefix, namespace)
+            .unwrap()
+            .for_writer(Vec::new());
+        for quad in &quads {
+            writer.serialize_quad(quad).unwrap();
+        }
+        let written = writer.finish().unwrap();
+        let back: BTreeSet<Quad> = RdfParser::from_format(RdfFormat::RdfXml)
+            .for_slice(&written)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            back,
+            quads,
+            "{prefix:?}
+{}",
+            String::from_utf8_lossy(&written)
+        );
+    }
+}
+
 #[test]
 fn what_rdf_xml_cant_hold_is_an_error() {
     let parse = |text: &str| -> Vec<Quad> {
@@ -77,6 +177,69 @@ fn what_rdf_xml_cant_hold_is_an_error() {
 /// fuzzing (`nrese-fuzz`), the RDF/XML reader took `"bar"@es/wn` and wrote N-Quads that
 /// didn't read back. Now it refuses the document, as the other readers do; unchecked, it
 /// still takes it.
+/// A recovering RDF/XML parser skips the rest of the outermost node element an error is
+/// in, wherever in it the error is (deep inside, or at an end tag), and goes on after it;
+/// XML that isn't well-formed still stops it.
+#[test]
+fn recovering_parsers_skip_bad_node_elements_and_go_on() {
+    let document = "<rdf:RDF xmlns:rdf=\"http://www.w3.org/1999/02/22-rdf-syntax-ns#\" \
+                    xmlns:e=\"http://example.org/\">\
+        <rdf:Description rdf:about=\"http://example.org/a\"><e:p>1</e:p></rdf:Description>\
+        <rdf:Description rdf:about=\"http://example.org/b\">\
+          <e:p xml:lang=\"es/wn\">x</e:p>\
+          <e:q><rdf:Description rdf:about=\"http://example.org/nested\"><e:r>2</e:r></rdf:Description></e:q>\
+        </rdf:Description>\
+        <rdf:Description rdf:about=\"http://example.org/c\"><e:p>3</e:p></rdf:Description>\
+        <rdf:Description rdf:about=\"http://example.org/d\">\
+          <e:p rdf:resource=\"http://example.org/x\">text</e:p>\
+        </rdf:Description>\
+        <rdf:Description rdf:about=\"http://example.org/e\"><e:p>5</e:p></rdf:Description>\
+        </rdf:RDF>";
+    let subjects = |results: &[Result<Quad, nrese_rdf_io::RdfParseError>]| -> Vec<String> {
+        results
+            .iter()
+            .filter_map(|r| r.as_ref().ok())
+            .map(|q| q.subject.to_string())
+            .collect()
+    };
+    let results: Vec<_> = RdfParser::from_format(RdfFormat::RdfXml)
+        .recovering()
+        .for_slice(document.as_bytes())
+        .collect();
+    assert_eq!(
+        subjects(&results),
+        [
+            "<http://example.org/a>",
+            "<http://example.org/c>",
+            "<http://example.org/e>"
+        ],
+        "{results:?}"
+    );
+    assert_eq!(
+        results.iter().filter(|r| r.is_err()).count(),
+        2,
+        "{results:?}"
+    );
+    // Without recovery: nothing after the first error.
+    let strict: Vec<_> = RdfParser::from_format(RdfFormat::RdfXml)
+        .for_slice(document.as_bytes())
+        .collect();
+    assert_eq!(subjects(&strict), ["<http://example.org/a>"], "{strict:?}");
+    assert_eq!(strict.iter().filter(|r| r.is_err()).count(), 1);
+    // Not well-formed: the end tag doesn't match, and nothing after it is read.
+    let broken = document.replacen("</e:p></rdf:Description>", "</e:q></rdf:Description>", 1);
+    let results: Vec<_> = RdfParser::from_format(RdfFormat::RdfXml)
+        .recovering()
+        .for_slice(broken.as_bytes())
+        .collect();
+    assert_eq!(
+        results.iter().filter(|r| r.is_err()).count(),
+        1,
+        "{results:?}"
+    );
+    assert!(subjects(&results).is_empty(), "{results:?}");
+}
+
 #[test]
 fn xml_lang_must_be_a_language_tag() {
     let document = |lang: &str| {

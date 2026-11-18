@@ -1,7 +1,7 @@
 //! What a query gives back, and what it runs under: results (solutions, a boolean, or
 //! triples), their errors, cancellation, and the dataset a request names.
 //!
-//! These are the evaluator's own types (docs/plan/2026-10-01-oxigraph-migration.md); their
+//! These are the evaluator's own types (docs/design/rdf-bundle.md); their
 //! methods follow the shape the store and the server use.
 
 use std::error::Error;
@@ -32,8 +32,35 @@ pub enum QueryEvaluationError {
     /// The query uses something the evaluator doesn't implement.
     #[error("not supported: {0}")]
     Unsupported(String),
+    /// A part of the query has a value it can't take (an extension's option, a malformed
+    /// literal it needs).
+    #[error("{0}")]
+    Argument(String),
+    /// A count the query asks for is more than this engine can report exactly: at least
+    /// `at_least`, past what its 64-bit counts hold (equality expansion of very large
+    /// `owl:sameAs` classes). A limit of the engine, not an error in the query.
+    #[error(
+        "the count is more than this engine can count exactly (at least {at_least}): a limit of this engine, not an error in the query"
+    )]
+    CountBeyondRange { at_least: u64 },
+    /// A table the query needs has more rows or groups than this engine's row numbers or
+    /// group ids name (joins and grouping keep them as `u32`). A limit of the engine, not
+    /// an error in the query.
+    #[error("{0}: a limit of this engine, not an error in the query")]
+    TooLarge(#[from] nrese_exec::RepresentationLimit),
     #[error("{0}")]
     Unexpected(String),
+}
+
+impl From<nrese_engine::SearchRefused> for QueryEvaluationError {
+    /// A search's refusal: its memory as any other memory refusal; a private snapshot's as
+    /// an error of its own, never an empty answer and never the client's.
+    fn from(refused: nrese_engine::SearchRefused) -> Self {
+        match refused {
+            nrese_engine::SearchRefused::Memory(exceeded) => Self::MemoryLimit(exceeded),
+            nrese_engine::SearchRefused::Private => Self::Unexpected(refused.to_string()),
+        }
+    }
 }
 
 /// A flag a running query checks; cancelling it stops the query at its next check.
@@ -49,12 +76,21 @@ impl CancellationToken {
         self.0.store(true, Ordering::Release);
     }
 
+    /// [`QueryEvaluationError::Cancelled`] once cancelled.
+    pub fn check(&self) -> Result<(), QueryEvaluationError> {
+        if self.is_cancelled() {
+            Err(QueryEvaluationError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn is_cancelled(&self) -> bool {
         self.0.load(Ordering::Acquire)
     }
 
     /// The flag itself, for loops that check it without knowing the token.
-    pub(crate) fn flag(&self) -> Arc<AtomicBool> {
+    pub fn flag(&self) -> Arc<AtomicBool> {
         self.0.clone()
     }
 }
@@ -65,6 +101,10 @@ impl CancellationToken {
 pub struct QueryDatasetSpecification {
     default: Option<Vec<GraphName>>,
     named: Option<Vec<NamedOrBlankNode>>,
+    /// With `default` unset: the default graph as the merge of every graph but these
+    /// ([`Self::set_default_graph_excluding`]); `Some` of no graphs is the merge of every
+    /// graph, asked for, unlike `None`, which leaves the default graph as the store has it.
+    excluded: Option<Vec<GraphName>>,
 }
 
 impl QueryDatasetSpecification {
@@ -75,6 +115,21 @@ impl QueryDatasetSpecification {
     /// The graphs whose merge is the default graph.
     pub fn set_default_graph(&mut self, graphs: Vec<GraphName>) {
         self.default = Some(graphs);
+        self.excluded = None;
+    }
+
+    /// The default graph as the merge of every graph but `graphs` (SHACL's data graph: every
+    /// graph except those holding shapes). No protocol request says this; the named graphs
+    /// stay as they are.
+    pub fn set_default_graph_excluding(&mut self, graphs: Vec<GraphName>) {
+        self.default = None;
+        self.excluded = Some(graphs);
+    }
+
+    /// The graphs a default graph merged from every graph leaves out, if it is one
+    /// ([`Self::set_default_graph_excluding`]; none left out: every graph).
+    pub fn excluded_default_graphs(&self) -> Option<&[GraphName]> {
+        self.excluded.as_deref()
     }
 
     /// The named graphs `GRAPH` may read.
@@ -92,7 +147,7 @@ impl QueryDatasetSpecification {
 
     /// Whether it leaves the store's dataset as it is.
     pub fn is_default_dataset(&self) -> bool {
-        self.default.is_none() && self.named.is_none()
+        self.default.is_none() && self.named.is_none() && self.excluded.is_none()
     }
 }
 
@@ -103,6 +158,7 @@ impl From<QueryDataset> for QueryDatasetSpecification {
             named: dataset
                 .named
                 .map(|named| named.into_iter().map(Into::into).collect()),
+            excluded: None,
         }
     }
 }
@@ -168,6 +224,12 @@ impl QuerySolution {
 
     pub fn values(&self) -> &[Option<Term>] {
         &self.values
+    }
+
+    /// The values, taken out of the solution: one per variable, in the order of
+    /// [`QuerySolution::variables`] (`None`: unbound).
+    pub fn into_values(self) -> Vec<Option<Term>> {
+        self.values
     }
 
     /// How many variables the solution binds.
@@ -311,6 +373,17 @@ mod tests {
         assert_eq!(solution.get("c"), None);
         assert_eq!(solution.iter().count(), 1);
         assert_eq!(solution.len(), 1);
+    }
+
+    /// A solution gives up its values in the order of its variables, unbound ones as `None`.
+    #[test]
+    fn a_solution_gives_up_its_values_in_variable_order() {
+        let variables: Arc<[Variable]> =
+            vec![Variable::new_unchecked("a"), Variable::new_unchecked("b")].into();
+        let b: Term = NamedNode::new_unchecked("http://e/b").into();
+        let solution = QuerySolution::new(variables, vec![None, Some(b.clone())]);
+        assert_eq!(solution.variables()[1].as_str(), "b");
+        assert_eq!(solution.into_values(), vec![None, Some(b)]);
     }
 
     #[test]

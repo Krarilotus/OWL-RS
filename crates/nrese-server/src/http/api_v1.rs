@@ -23,25 +23,54 @@ struct RepositoryEntry {
     /// The path of its engine API.
     path: String,
     default: bool,
+    /// Set when it didn't open at start (its stored settings or files can't be read): it
+    /// answers 503 until repaired or removed. Operators see why, with the file and the
+    /// repair; others only that it is unavailable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unavailable: Option<String>,
 }
 
 #[utoipa::path(get, path = "/api/v1/repositories", tag = "repositories",
-    responses((status = 200, description = "The repositories, the default one first", body = Vec<RepositoryEntry>)))]
-/// The repositories: the default one first, then the others.
+    responses((status = 200, description = "The repositories, the default one first, then the others, those unavailable included", body = Vec<RepositoryEntry>)))]
+/// The repositories: the default one first, then the others, with those that didn't open.
 pub async fn repositories(
     authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &authenticated).await?;
-    let entries: Vec<RepositoryEntry> = std::iter::once((DEFAULT_REPOSITORY.to_owned(), None))
-        .chain(state.repositories().list())
-        .map(|(id, title)| RepositoryEntry {
-            path: format!("/api/v1/repositories/{id}"),
-            title: title.unwrap_or_else(|| format!("NRESE: {id}")),
-            default: id == DEFAULT_REPOSITORY,
-            id,
-        })
-        .collect();
+    let operator = state
+        .authorize(crate::policy::PolicyAction::OperatorRead, &authenticated)
+        .is_ok();
+    let entry = |id: String, title: Option<String>, unavailable: Option<String>| RepositoryEntry {
+        path: format!("/api/v1/repositories/{id}"),
+        title: title.unwrap_or_else(|| format!("NRESE: {id}")),
+        default: id == DEFAULT_REPOSITORY,
+        id,
+        unavailable,
+    };
+    let catalog = state.repositories();
+    let default_unavailable = state.default_unavailable().map(|why| match operator {
+        true => why.to_owned(),
+        false => crate::state::UNAVAILABLE_UNTIL_RESTART.to_owned(),
+    });
+    let mut entries: Vec<RepositoryEntry> = vec![entry(
+        DEFAULT_REPOSITORY.to_owned(),
+        None,
+        default_unavailable,
+    )];
+    entries.extend(
+        catalog
+            .list()
+            .into_iter()
+            .map(|(id, title)| entry(id, title, None)),
+    );
+    entries.extend(catalog.unavailable_list().into_iter().map(|(id, why)| {
+        let why = match operator {
+            true => why,
+            false => crate::state::UNAVAILABLE.to_owned(),
+        };
+        entry(id, None, Some(why))
+    }));
     Ok(Json(entries).into_response())
 }
 
@@ -53,7 +82,7 @@ struct RepositoryView {
     default: bool,
     /// The reasoning mode in effect.
     reasoning: &'static str,
-    /// The settings it was created with (none for the default repository: the server's).
+    /// Its settings as created or since changed; none while they are the defaults (the server's).
     #[serde(skip_serializing_if = "Option::is_none")]
     settings: Option<crate::repository_config::RepositorySettings>,
 }
@@ -69,7 +98,12 @@ pub async fn repository_get(
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &authenticated).await?;
     let repository = state.for_repository(&id)?;
-    let settings = Some(repository.repository_settings())
+    // One observation: its settings and the reasoning in effect from the same change; a
+    // repository removed meanwhile is gone.
+    let (settings, reasoning) = repository
+        .observe_repository()
+        .ok_or_else(|| ApiError::not_found(format!("no repository '{id}'")))?;
+    let settings = Some(settings)
         .filter(|settings| *settings != crate::repository_config::RepositorySettings::default());
     Ok(Json(RepositoryView {
         path: format!("/api/v1/repositories/{id}"),
@@ -78,7 +112,7 @@ pub async fn repository_get(
             .and_then(|settings| settings.title.clone())
             .unwrap_or_else(|| format!("NRESE: {id}")),
         default: id == DEFAULT_REPOSITORY,
-        reasoning: repository.pipeline().reasoner().mode_name(),
+        reasoning,
         settings,
         id,
     })
@@ -239,15 +273,20 @@ fn add(
         .sessions()
         .add(session, access.origin.as_deref(), ops)
     {
-        true => Ok(StatusCode::NO_CONTENT),
-        false => Err(no_session(session)),
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
+        Ok(false) => Err(no_session(session)),
+        Err(refused) => Err(super::sparql::map_query_error(
+            &state.policy(),
+            refused.into(),
+        )),
     }
 }
 
 #[utoipa::path(post, path = "/api/v1/repositories/{id}/sessions/{session}/update", tag = "sessions",
     params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("session" = String, Path, description = "The session's id")),
     request_body(content = String, content_type = "application/sparql-update"),
-    responses((status = 204, description = "Collected for the commit"), (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
+    responses((status = 204, description = "Collected for the commit"), (status = 404, description = "No such session, or it expired", body = crate::http::openapi::Problem),
+        (status = 503, description = "No room in the memory queries and sessions share; the operations collected so far are kept", body = crate::http::openapi::Problem)))]
 /// A SPARQL update (as the update endpoint takes it), applied at the commit.
 pub async fn session_update(
     authenticated: crate::auth::Authenticated,
@@ -258,7 +297,7 @@ pub async fn session_update(
     body: Bytes,
 ) -> Result<StatusCode, ApiError> {
     let access = guard::update_access(&state, &authenticated).await?;
-    let request = super::rdf4j::update(&raw, &headers, &body)?;
+    let request = super::rdf4j::update(&state.policy(), &raw, &headers, &body)?;
     add(
         &state,
         &session,
@@ -271,7 +310,8 @@ pub async fn session_update(
     params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("session" = String, Path, description = "The session's id"), ("graph" = Option<String>, Query, description = "The graph (an IRI); else the graphs the data names")),
     request_body(content = String, description = "RDF in any format NRESE reads (`Content-Type`)"),
     responses((status = 204, description = "Collected: added (`POST`) or removed (`DELETE`) at the commit"),
-        (status = 404, description = "No such session", body = crate::http::openapi::Problem)))]
+        (status = 404, description = "No such session, or it expired", body = crate::http::openapi::Problem),
+        (status = 503, description = "No room in the memory queries and sessions share; the operations collected so far are kept", body = crate::http::openapi::Problem)))]
 /// RDF data to add (`POST`) or remove (`DELETE`) at the commit: into the graph `graph`
 /// if given (an IRI), else into the graphs the data names.
 pub async fn session_data(
@@ -387,6 +427,58 @@ pub async fn session_rollback(
 struct Explanation {
     /// The statement first; each premise after the steps that use it.
     steps: Vec<ExplanationStep>,
+    /// Under `owl2-dl`, for a statement the rules don't derive but OWL 2 DL entails: a
+    /// minimal set of the ontology's axioms it follows from (`steps` is then empty).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    owl2_dl: Option<DlJustified>,
+}
+
+/// A justification under OWL 2 DL.
+#[derive(Serialize, utoipa::ToSchema)]
+struct DlJustified {
+    /// The axioms, each in the functional-style syntax with the triples it was read from.
+    axioms: Vec<DlAxiom>,
+    /// No axiom can be left out (false: a budget ran out first; the set still entails it).
+    minimal: bool,
+    /// A fresh entailment test confirmed the set.
+    verified: bool,
+    /// Entailment tests run by the DL engines.
+    tests: usize,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct DlAxiom {
+    axiom: String,
+    sources: Vec<DlSource>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct DlSource {
+    /// The graph (`null`: the default graph).
+    graph: Option<String>,
+    triples: Vec<[String; 3]>,
+}
+
+impl From<nrese_store::dl::explain::DlExplanation> for DlJustified {
+    fn from(e: nrese_store::dl::explain::DlExplanation) -> Self {
+        Self {
+            axioms: e
+                .axioms
+                .into_iter()
+                .map(|a| DlAxiom {
+                    axiom: a.axiom,
+                    sources: a
+                        .sources
+                        .into_iter()
+                        .map(|(graph, triples)| DlSource { graph, triples })
+                        .collect(),
+                })
+                .collect(),
+            minimal: e.minimal,
+            verified: e.verified,
+            tests: e.tests,
+        }
+    }
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -409,10 +501,13 @@ struct ExplanationStep {
 
 #[utoipa::path(get, path = "/api/v1/repositories/{id}/explain", tag = "reasoning",
     params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("subj" = String, Query, description = "N-Triples term"),
-        ("pred" = String, Query, description = "N-Triples term"), ("obj" = String, Query, description = "N-Triples term")),
-    responses((status = 200, description = "`{\"steps\": [...]}`: the statement first, each step with its premises", body = Explanation),
+        ("pred" = String, Query, description = "N-Triples term"), ("obj" = String, Query, description = "N-Triples term"),
+        ("justifications" = Option<String>, Query, description = "Instead of one derivation, minimal sets of asserted statements the statement follows from: `one`, `core` (in every set), `union` (in some set), `top-k` (the `k` smallest), `all` (smallest first)"),
+        ("k" = Option<usize>, Query, description = "For `justifications=top-k`: how many (default 3)")),
+    responses((status = 200, description = "`{\"steps\": [...]}`: the statement first, each step with its premises; with `justifications`, `{\"mode\", \"justifications\" | \"statements\", \"complete\", \"verified\"}`", body = Explanation),
+        (status = 400, description = "An unknown `justifications` mode", body = crate::http::openapi::Problem),
         (status = 403, description = "The requester doesn't see inferred statements", body = crate::http::openapi::Problem),
-        (status = 404, description = "The statement doesn't hold, or reasoning is off", body = crate::http::openapi::Problem)))]
+        (status = 404, description = "The statement doesn't hold, or reasoning is off; under `owl2-dl`, a statement the rules don't derive is explained by `owl2_dl` (a minimal set of axioms) if OWL 2 DL entails it", body = crate::http::openapi::Problem)))]
 /// Why the statement `subj pred obj` (N-Triples terms, as RDF4J's parameters) holds: a
 /// derivation from asserted statements, the statement first. 404 if it doesn't hold or
 /// reasoning is off; 403 for users who don't see inferred statements.
@@ -442,18 +537,67 @@ pub async fn explain(
     };
     let store = state.store();
     let scope = nrese_store::ReadScope::of(access.read.clone());
-    let steps = tokio::task::spawn_blocking(move || {
-        store.explain_statement(
-            program,
-            &scope,
-            subject.as_ref(),
-            predicate.as_ref(),
-            object.as_ref(),
-        )
+    let param = |name: &str| {
+        pairs
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+    };
+    if let Some(mode) = param("justifications") {
+        use nrese_store::reasoning::JustificationMode;
+        let mode = match mode.as_str() {
+            "one" => JustificationMode::One,
+            "core" => JustificationMode::Core,
+            "union" => JustificationMode::Union,
+            "all" => JustificationMode::All,
+            "top-k" => JustificationMode::Top(match param("k") {
+                Some(k) => k
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|k| *k > 0)
+                    .ok_or_else(|| ApiError::bad_request("k must be a positive number"))?,
+                None => 3,
+            }),
+            other => {
+                return Err(ApiError::bad_request(format!(
+                    "justifications is one, core, union, top-k or all, not {other}"
+                )));
+            }
+        };
+        let answer = tokio::task::spawn_blocking(move || {
+            store.justify_statement(
+                program,
+                &scope,
+                [subject.as_ref(), predicate.as_ref(), object.as_ref()],
+                mode,
+            )
+        })
+        .await
+        .map_err(|error| ApiError::internal(error.to_string()))?
+        .map_err(|error| super::sparql::map_query_error(&state.policy(), error))?
+        .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
+        return Ok(Json(Justified::from(answer)).into_response());
+    }
+    let dl = state.store().dl().active();
+    let found = tokio::task::spawn_blocking(move || {
+        let statement = [subject.as_ref(), predicate.as_ref(), object.as_ref()];
+        let steps =
+            store.explain_statement(program, &scope, statement[0], statement[1], statement[2])?;
+        match steps {
+            Some(steps) => Ok(Some((steps, None))),
+            // Not derived by the rules: under owl2-dl, why OWL 2 DL entails it, or an
+            // incomplete answer where that isn't decided.
+            None if dl => store
+                .explain_dl(&scope, statement)
+                .map(|found| found.map(|e| (Vec::new(), Some(DlJustified::from(e))))),
+            None => Ok(None),
+        }
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
+    .map_err(|error| super::sparql::map_query_error(&state.policy(), error))?
     .ok_or_else(|| ApiError::not_found("the statement doesn't hold"))?;
+    let (steps, owl2_dl) = found;
     let steps: Vec<ExplanationStep> = steps
         .into_iter()
         .map(|step| ExplanationStep {
@@ -465,7 +609,74 @@ pub async fn explain(
             premises: step.premises,
         })
         .collect();
-    Ok(Json(Explanation { steps }).into_response())
+    Ok(Json(Explanation { steps, owl2_dl }).into_response())
+}
+
+/// The justifications of a statement (`explain?justifications=...`).
+#[derive(Serialize, utoipa::ToSchema)]
+struct Justified {
+    /// `one`, `core`, `union`, `top-k` or `all`.
+    mode: &'static str,
+    /// `one`, `top-k`, `all`: the minimal sets, smallest first.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    justifications: Option<Vec<Vec<JustifiedStatement>>>,
+    /// `core`: the statements in every set; `union`: those in some set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statements: Option<Vec<JustifiedStatement>>,
+    /// Whether the answer is exact (no budget or limit cut it short).
+    complete: bool,
+    /// `one`, `top-k`, `all`: whether a proof from each set was checked against the rules.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified: Option<bool>,
+}
+
+#[derive(Serialize, utoipa::ToSchema)]
+struct JustifiedStatement {
+    /// The statement's terms; left out for a `hidden` statement.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    subject: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    predicate: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    object: String,
+    /// `asserted`, or `hidden` (asserted in no graph the requester may read).
+    origin: &'static str,
+}
+
+impl From<nrese_store::reasoning::JustificationAnswer> for Justified {
+    fn from(answer: nrese_store::reasoning::JustificationAnswer) -> Self {
+        use nrese_store::reasoning::JustificationMode;
+        let convert =
+            |set: Vec<nrese_store::reasoning::JustifiedStatement>| -> Vec<JustifiedStatement> {
+                set.into_iter()
+                    .map(|s| JustifiedStatement {
+                        subject: s.subject,
+                        predicate: s.predicate,
+                        object: s.object,
+                        origin: s.origin,
+                    })
+                    .collect()
+            };
+        let mode = match answer.mode {
+            JustificationMode::One => "one",
+            JustificationMode::Core => "core",
+            JustificationMode::Union => "union",
+            JustificationMode::Top(_) => "top-k",
+            JustificationMode::All => "all",
+        };
+        let single = matches!(
+            answer.mode,
+            JustificationMode::Core | JustificationMode::Union
+        );
+        let mut sets: Vec<Vec<JustifiedStatement>> = answer.sets.into_iter().map(convert).collect();
+        Self {
+            mode,
+            statements: single.then(|| sets.pop().unwrap_or_default()),
+            justifications: (!single).then_some(sets),
+            complete: answer.complete,
+            verified: answer.verified,
+        }
+    }
 }
 
 #[derive(Serialize, utoipa::ToSchema)]
@@ -474,7 +685,10 @@ struct ReasoningRun {
     revision: u64,
     asserted: u64,
     inferred: u64,
+    /// The consistency violations found: 0 exactly when the data is consistent.
     violations: usize,
+    /// Their list stopped at its memory budget: `violations` is a lower bound.
+    violations_at_least: bool,
     elapsed_ms: u128,
 }
 
@@ -486,6 +700,7 @@ impl From<&nrese_store::MaterialisationReport> for ReasoningRun {
             asserted: report.asserted,
             inferred: report.inferred,
             violations: report.violations,
+            violations_at_least: report.violations_at_least,
             elapsed_ms: report.elapsed.as_millis(),
         }
     }
@@ -529,25 +744,72 @@ struct ImportReport {
     parsed: u64,
     inserted: u64,
     deleted: u64,
-    /// Statements skipped for syntax errors (`skip_errors=true`).
+    /// Statements quarantined for syntax errors (the repository's quarantine).
+    quarantined: u64,
+    /// The same count, by its older name.
     skipped: u64,
+    /// The load's id in the quarantine, if it quarantined any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    load: Option<String>,
+    /// The first quarantined statements in the files' order: where, and why.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    examples: Vec<QuarantineExample>,
     elapsed_ms: u128,
     /// The inferences recomputed after the load, where the repository reasons.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningRun>,
 }
 
+/// A quarantined statement as a load reports it.
+#[derive(Serialize, utoipa::ToSchema)]
+struct QuarantineExample {
+    id: String,
+    file: String,
+    /// From 1; 0 where the format's parser doesn't know it (RDF/XML, JSON-LD), and `reason`
+    /// then says what it knows, such as the byte offset.
+    line: u64,
+    column: u64,
+    reason: String,
+}
+
+/// What a load does with statements it can't read: `invalid=quarantine|strict`, or the
+/// older `strict=true` and `skip_errors=true`; `None`: the repository's setting.
+fn invalid_statements(
+    pairs: &[(String, String)],
+) -> Result<Option<nrese_store::InvalidStatements>, ApiError> {
+    let flag = |name: &str| {
+        pairs
+            .iter()
+            .any(|(key, value)| key == name && value.eq_ignore_ascii_case("true"))
+    };
+    if let Some((_, name)) = pairs.iter().find(|(key, _)| key == "invalid") {
+        return nrese_store::InvalidStatements::from_name(name)
+            .map(Some)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "invalid must be quarantine or strict, not '{name}'"
+                ))
+            });
+    }
+    Ok(match (flag("strict"), flag("skip_errors")) {
+        (true, _) => Some(nrese_store::InvalidStatements::Strict),
+        (false, true) => Some(nrese_store::InvalidStatements::Quarantine),
+        (false, false) => None,
+    })
+}
+
 #[utoipa::path(post, path = "/api/v1/repositories/{id}/import", tag = "data",
     params(("id" = String, Path, description = "The repository's id (`nrese` is the default one)"), ("graph" = Option<String>, Query, description = "The graph for triple formats"),
         ("replace" = Option<bool>, Query, description = "Replace the repository's statements"),
-        ("skip_errors" = Option<bool>, Query, description = "Skip statements with syntax errors")),
+        ("invalid" = Option<String>, Query, description = "Statements with syntax errors: `quarantine` (the rest loads) or `strict` (the load stops); the repository's setting without")),
     request_body(content = String, description = "An RDF document (`Content-Type` names its format)"),
     responses((status = 200, description = "Loaded, inferences recomputed", body = ImportReport),
         (status = 400, description = "Unreadable data", body = crate::http::openapi::Problem)))]
 /// Bulk-loads the RDF document in the body (its format from `Content-Type`): into the
 /// graph `graph` for triple formats (the default graph without), replacing the
-/// repository's statements with `replace=true`, skipping statements with syntax errors
-/// with `skip_errors=true`. Then the inferences are recomputed. For large loads: the
+/// repository's statements with `replace=true`. Statements with syntax errors go into the
+/// repository's quarantine, or stop the load with `invalid=strict` (the repository's
+/// `store.invalid_statements` without). Then the inferences are recomputed. For large loads: the
 /// loader's parallel path, not one commit's; administrators only, since a bulk load
 /// replaces whole indexes and passes no commit gate.
 pub async fn import(
@@ -597,7 +859,7 @@ pub async fn import(
         files: vec![file.clone()],
         replace: flag("replace"),
         graph,
-        skip_errors: flag("skip_errors"),
+        invalid: invalid_statements(&pairs)?,
     };
     {
         let (file, body) = (file.clone(), body.clone());
@@ -637,7 +899,20 @@ fn import_report(
         parsed: loaded.parsed,
         inserted: loaded.inserted,
         deleted: loaded.deleted,
-        skipped: loaded.skipped,
+        quarantined: loaded.quarantined,
+        skipped: loaded.quarantined,
+        load: loaded.load.clone(),
+        examples: loaded
+            .examples
+            .iter()
+            .map(|example| QuarantineExample {
+                id: example.id.clone(),
+                file: example.file.clone(),
+                line: example.line,
+                column: example.column,
+                reason: example.reason.clone(),
+            })
+            .collect(),
         elapsed_ms: loaded.elapsed.as_millis(),
         reasoning: reasoning.map(ReasoningRun::from),
     }
@@ -770,6 +1045,9 @@ struct ServerImport {
     graph: Option<String>,
     #[serde(default)]
     replace: bool,
+    /// `quarantine` or `strict`; the repository's setting without.
+    invalid: Option<String>,
+    /// The older form of `invalid = "quarantine"`.
     #[serde(default)]
     skip_errors: bool,
 }
@@ -830,7 +1108,18 @@ pub async fn import_server_files(
         files,
         replace: request.replace,
         graph,
-        skip_errors: request.skip_errors,
+        invalid: match request.invalid.as_deref() {
+            Some(name) => Some(nrese_store::InvalidStatements::from_name(name).ok_or_else(
+                || {
+                    ApiError::bad_request(format!(
+                        "invalid must be quarantine or strict, not '{name}'"
+                    ))
+                },
+            )?),
+            None => request
+                .skip_errors
+                .then_some(nrese_store::InvalidStatements::Quarantine),
+        },
     };
     Ok(start_import(&state, load, description, None).into_response())
 }
@@ -967,23 +1256,29 @@ pub async fn repository_patch(
     let repository = state.for_repository(&id)?;
     let changes: serde_json::Map<String, serde_json::Value> = serde_json::from_slice(&body)
         .map_err(|error| ApiError::bad_request(format!("repository settings: {error}")))?;
-    let mut merged = serde_json::to_value(repository.repository_settings())
-        .map_err(|error| ApiError::internal(error.to_string()))?;
-    let fields = merged.as_object_mut().expect("settings are an object");
-    for (key, value) in changes {
-        match value {
-            serde_json::Value::Null => {
-                fields.remove(&key);
-            }
-            value => {
-                fields.insert(key, value);
+    // Merged into the settings current when the change applies, not into a copy read
+    // here: a change made meanwhile stays (C-1001).
+    let merge = move |current: &crate::repository_config::RepositorySettings| {
+        let invalid = |error: serde_json::Error| {
+            crate::repositories::CatalogError::Invalid(format!("repository settings: {error}"))
+        };
+        let mut merged = serde_json::to_value(current)
+            .map_err(|error| crate::repositories::CatalogError::Store(error.to_string()))?;
+        let fields = merged.as_object_mut().expect("settings are an object");
+        for (key, value) in changes {
+            match value {
+                serde_json::Value::Null => {
+                    fields.remove(&key);
+                }
+                value => {
+                    fields.insert(key, value);
+                }
             }
         }
-    }
-    let settings: crate::repository_config::RepositorySettings = serde_json::from_value(merged)
-        .map_err(|error| ApiError::bad_request(format!("repository settings: {error}")))?;
+        serde_json::from_value(merged).map_err(invalid)
+    };
     let changing = repository.clone();
-    tokio::task::spawn_blocking(move || changing.change_repository_settings(settings))
+    tokio::task::spawn_blocking(move || changing.patch_repository_settings(merge))
         .await
         .map_err(|error| ApiError::internal(error.to_string()))??;
     repository_get(authenticated, State(state), Path(id)).await
@@ -1099,18 +1394,23 @@ pub async fn rules_put(
     };
     let text = String::from_utf8(body.to_vec())
         .map_err(|_| ApiError::bad_request("the rules are not UTF-8"))?;
-    let mut settings = repository.repository_settings();
-    if settings.reasoning.is_none() {
-        settings.reasoning = Some(match (format.as_str(), repository.reasoner_mode_name()) {
-            ("pie", _) | (_, "disabled") => "custom".to_owned(),
-            (_, mode) => mode.to_owned(),
-        });
-    }
-    settings.rules = Some(crate::repository_config::RepositoryRules { name, format, text });
     let changing = repository.clone();
-    tokio::task::spawn_blocking(move || changing.change_repository_settings(settings))
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))??;
+    tokio::task::spawn_blocking(move || {
+        changing.patch_repository_settings(|current| {
+            let mut settings = current.clone();
+            if settings.reasoning.is_none() {
+                // The mode in effect now, under the change's lock.
+                settings.reasoning = Some(match (format.as_str(), changing.reasoner_mode_name()) {
+                    ("pie", _) | (_, "disabled") => "custom".to_owned(),
+                    (_, mode) => mode.to_owned(),
+                });
+            }
+            settings.rules = Some(crate::repository_config::RepositoryRules { name, format, text });
+            Ok(settings)
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
     repository_get(authenticated, State(state), Path(id)).await
 }
 
@@ -1125,16 +1425,22 @@ pub async fn rules_delete(
     Repository(state): Repository,
 ) -> Result<StatusCode, ApiError> {
     guard::enforce_admin_write(&state, &authenticated).await?;
-    let mut settings = state.repository_settings();
-    if settings.rules.take().is_none() {
-        return Err(ApiError::not_found("the repository has no user rules"));
-    }
-    // `custom` is the rules alone: without them, the server's reasoning.
-    if settings.reasoning.as_deref() == Some("custom") {
-        settings.reasoning = None;
-    }
-    tokio::task::spawn_blocking(move || state.change_repository_settings(settings))
-        .await
-        .map_err(|error| ApiError::internal(error.to_string()))??;
+    tokio::task::spawn_blocking(move || {
+        state.patch_repository_settings(|current| {
+            let mut settings = current.clone();
+            if settings.rules.take().is_none() {
+                return Err(crate::repositories::CatalogError::NotFound(
+                    "the repository has no user rules".to_owned(),
+                ));
+            }
+            // `custom` is the rules alone: without them, the server's reasoning.
+            if settings.reasoning.as_deref() == Some("custom") {
+                settings.reasoning = None;
+            }
+            Ok(settings)
+        })
+    })
+    .await
+    .map_err(|error| ApiError::internal(error.to_string()))??;
     Ok(StatusCode::NO_CONTENT)
 }

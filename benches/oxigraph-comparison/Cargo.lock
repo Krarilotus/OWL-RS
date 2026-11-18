@@ -81,6 +81,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
+name = "iri-string"
+version = "0.7.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8e7418f59cc01c88316161279a7f665217ae316b388e58a0d10e29f54f1e5eb"
+
+[[package]]
 name = "json-event-parser"
 version = "0.2.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -100,7 +106,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "nrese-json"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "memchr",
  "thiserror",
@@ -108,7 +114,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-rdf"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash",
  "nrese-xsd",
@@ -119,7 +125,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-rdf-io"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash",
  "memchr",
@@ -131,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "nrese-sparql-results"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "memchr",
  "nrese-json",
@@ -142,16 +148,19 @@ dependencies = [
 
 [[package]]
 name = "nrese-sparql-syntax"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "nrese-rdf",
+ "smallvec",
  "thiserror",
 ]
 
 [[package]]
 name = "nrese-xsd"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
+ "iri-string",
+ "regex-syntax",
  "thiserror",
 ]
 
@@ -360,6 +369,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "regex-syntax"
+version = "0.8.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
 name = "ryu-js"
 version = "1.0.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -404,6 +419,12 @@ dependencies = [
  "cpufeatures",
  "digest",
 ]
+
+[[package]]
+name = "smallvec"
+version = "1.15.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "sparesults"

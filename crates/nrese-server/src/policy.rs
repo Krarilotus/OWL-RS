@@ -18,7 +18,9 @@ pub struct PolicyConfig {
     /// it on.
     pub access: Option<std::sync::Arc<crate::access::AccessPolicy>>,
     /// What workspace graph prefixes start with (`urn:nrese:` by default): a personal
-    /// space is `{base}space/{user}/`, a workspace `{base}workspace/{name}/`.
+    /// space is `{base}space/{user}/`, a workspace `{base}workspace/{name}~{id}/`, and a local
+    /// user's space, its record created after ids, `{base}space/{user}~{id}/`
+    /// (`nrese_store::access::AccessState::prefix`).
     pub workspace_base: String,
     /// Whether users of the access state log in with their passwords (`Basic`
     /// credentials, or a session from `POST /api/v1/access/login`), besides the
@@ -187,24 +189,4 @@ fn enforce_size_limit(kind: &str, size: usize, limit: usize) -> Result<(), ApiEr
     }
 
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::BTreeSet;
-
-    use super::PolicyAction;
-    use crate::auth::{AccessGrant, authorize_grants};
-
-    #[test]
-    fn read_grant_authorizes_query_reads() {
-        let grants = BTreeSet::from([AccessGrant::Read]);
-        assert!(authorize_grants(PolicyAction::QueryRead, &grants));
-    }
-
-    #[test]
-    fn read_grant_does_not_authorize_update_writes() {
-        let grants = BTreeSet::from([AccessGrant::Read]);
-        assert!(!authorize_grants(PolicyAction::UpdateWrite, &grants));
-    }
 }

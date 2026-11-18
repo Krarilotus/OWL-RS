@@ -1,0 +1,17 @@
+PREFIX ns: <http://geographica.di.uoa.gr/dataset/> 
+PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> 
+PREFIX geonames: <http://www.geonames.org/ontology#>
+PREFIX geof: <http://www.opengis.net/def/function/geosparql/>
+
+SELECT ?fClass ?fCode (COUNT(DISTINCT ?f) AS ?count) 
+WHERE  { 
+	GRAPH ns:geonames { 
+		?f rdf:type geonames:Feature. 
+		?f geonames:featureClass ?fClass. 
+		?f geonames:featureCode ?fCode. 
+		?f geonames:hasGeometry ?fGeo. 
+		?fGeo geonames:asWKT ?fWkt. 
+		FILTER(geof:sfIntersects(?fWkt, "POLYGON ((23.5669247401051 37.9893271592633, 23.5669247401051 38.0366287295546, 23.6743333558464 38.0366287295546, 23.6743333558464 37.9893271592633, 23.5669247401051 37.9893271592633))"^^geo:wktLiteral)). 
+ 	}
+} 
+GROUP BY ?fClass ?fCode

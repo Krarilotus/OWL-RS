@@ -110,11 +110,50 @@ fn remove_matching_clears_one_graph() {
 
     let mut tx = engine.transaction();
     let graph_id = tx.lookup(graph.as_ref().into()).unwrap();
-    assert_eq!(tx.remove_matching(&QuadPattern::in_graph(graph_id)), 5);
+    assert_eq!(
+        tx.remove_matching(&QuadPattern::in_graph(graph_id))
+            .unwrap(),
+        5
+    );
     tx.commit().expect("commit");
     let snapshot = engine.snapshot();
     assert_eq!(snapshot.len(), 1);
     assert_eq!(snapshot.named_graphs().count(), 0);
+}
+
+/// A charged insert that grows nothing needs no room: one that
+/// undoes the transaction's removal of a statement, or of a statement asserted already,
+/// succeeds within a budget that the removal alone fills at its peak.
+#[test]
+fn a_charged_insert_that_grows_nothing_needs_no_room() {
+    use std::sync::Arc;
+    let engine = inline_engine();
+    let statement = quad(1, 2, 3);
+    let mut tx = engine.transaction();
+    tx.insert(statement.as_ref());
+    tx.commit().expect("commit");
+    // What the removal alone holds at its peak.
+    let alone = Arc::new(nrese_exec::Budget::unlimited());
+    let mut tx = engine.transaction();
+    tx.charge_pending_to(Arc::clone(&alone)).unwrap();
+    assert!(tx.try_remove(statement.as_ref()).unwrap());
+    drop(tx);
+    let budget = Arc::new(nrese_exec::Budget::new(alone.peak()));
+    let mut tx = engine.transaction();
+    tx.charge_pending_to(Arc::clone(&budget)).unwrap();
+    assert!(
+        tx.try_remove(statement.as_ref()).unwrap(),
+        "the removal fits"
+    );
+    assert!(
+        tx.try_insert(statement.as_ref()).unwrap(),
+        "undoing it needs no room"
+    );
+    assert!(
+        !tx.try_insert(statement.as_ref()).unwrap(),
+        "nor does a statement asserted already"
+    );
+    assert_eq!(tx.pending(), (0, 0));
 }
 
 #[test]
@@ -302,12 +341,12 @@ fn distinct_counts_match_the_data() {
         ] {
             let model = ReadModel::Materialised;
             assert_eq!(
-                snapshot.distinct_in(model, &pattern, permutation),
-                Some(expected as u64)
+                snapshot.distinct_in(model, &pattern, permutation, &|_| true),
+                Ok(Some(expected as u64))
             );
             assert_eq!(
-                snapshot.distinct_estimate_in(model, &pattern, permutation),
-                Some(expected as u64)
+                snapshot.distinct_estimate_in(model, &pattern, permutation, &|_| true),
+                Ok(Some(expected as u64))
             );
         }
     }
@@ -318,7 +357,9 @@ fn distinct_counts_match_the_data() {
         graph: default,
     };
     let predicates = |snapshot: &nrese_engine::Snapshot| {
-        snapshot.distinct_estimate_in(ReadModel::Materialised, &all, Permutation::Gpso)
+        snapshot
+            .distinct_estimate_in(ReadModel::Materialised, &all, Permutation::Gpso, &|_| true)
+            .unwrap()
     };
     assert_eq!(predicates(&snapshot), Some(3));
     // More than a quarter more matches: the estimate is recomputed.
@@ -370,7 +411,7 @@ fn exists_agrees_with_count() {
             let model = ReadModel::Materialised;
             assert_eq!(
                 snapshot.exists_in(model, &pattern),
-                snapshot.count_in(model, &pattern) > 0,
+                snapshot.count_in(model, &pattern).at_least() > 0,
                 "{pattern:?}"
             );
         }
@@ -481,9 +522,9 @@ fn a_pending_snapshot_is_what_the_commit_publishes() {
 #[test]
 fn speculative_transactions_leave_the_writer_slot_free() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
-    let mut speculative = engine.speculative();
-    speculative.insert(quad(1, 2, 3).as_ref());
-    let pending = speculative.pending_snapshot();
+    let mut speculative = engine.speculative(Arc::new(nrese_exec::Budget::unlimited()));
+    speculative.try_insert(quad(1, 2, 3).as_ref()).unwrap();
+    let pending = speculative.pending_snapshot().unwrap();
     let mut writer = engine.transaction();
     writer.insert(quad(4, 5, 6).as_ref());
     writer
@@ -504,8 +545,6 @@ fn speculative_transactions_leave_the_writer_slot_free() {
         !seen.contains(&quad(4, 5, 6)),
         "its base is the snapshot it started from"
     );
-    assert!(matches!(
-        speculative.commit(),
-        Err(nrese_engine::EngineError::Speculative)
-    ));
+    // It can't commit: a private transaction has no commit, by type (its doc test).
+    drop(speculative);
 }

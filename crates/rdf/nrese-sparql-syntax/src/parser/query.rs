@@ -8,7 +8,7 @@ use nrese_rdf::{BlankNode, Iri, NamedNode, NamedOrBlankNode, Term, Triple, Varia
 use super::pattern::new_join;
 use super::{ParseResult, Parser};
 use crate::algebra::{Expression, GraphPattern, GraphTarget, OrderExpression, QueryDataset};
-use crate::query::{GraphUpdateOperation, Query, Update};
+use crate::query::{GraphUpdateOperation, Query, TransferOp, Update};
 use crate::term::{
     GraphName, GraphNamePattern, GroundQuad, GroundQuadPattern, Quad, QuadPattern, TriplePattern,
 };
@@ -352,8 +352,7 @@ impl<'a> Parser<'a> {
             };
             self.aggregates_allowed = allowed;
             result?;
-            let having = (!conditions.is_empty())
-                .then(|| super::expr::balanced(conditions, Expression::And));
+            let having = Expression::balanced(conditions, Expression::And);
             if having.is_none() {
                 return Err(self.expected("a HAVING condition"));
             }
@@ -461,11 +460,7 @@ impl<'a> Parser<'a> {
                         format!("GROUP BY binds {variable}, which is bound already"),
                     ));
                 }
-                p = GraphPattern::Extend {
-                    inner: Box::new(p),
-                    variable,
-                    expression,
-                };
+                p = p.extend(variable, expression);
             }
             p = GraphPattern::Group {
                 inner: Box::new(p),
@@ -483,6 +478,7 @@ impl<'a> Parser<'a> {
             p = new_join(p, values);
         }
         let mut projection = Vec::new();
+        let mut expressions = Vec::new();
         match selection {
             Selection::Members(members) => {
                 let mut visible = HashSet::new();
@@ -515,11 +511,7 @@ impl<'a> Parser<'a> {
                                     format!("the expression for {v} uses a variable neither grouped nor aggregated"),
                                 ));
                             }
-                            p = GraphPattern::Extend {
-                                inner: Box::new(p),
-                                variable: v.clone(),
-                                expression,
-                            };
+                            expressions.push((v.clone(), expression));
                             v
                         }
                     };
@@ -543,6 +535,9 @@ impl<'a> Parser<'a> {
                 });
                 projection.sort();
             }
+        }
+        for (variable, expression) in expressions {
+            p = p.extend(variable, expression);
         }
         if let Some(expression) = modifiers.order {
             p = GraphPattern::OrderBy {
@@ -643,36 +638,18 @@ impl<'a> Parser<'a> {
                 let from = self.graph_or_default()?;
                 self.expect_keyword("TO")?;
                 let to = self.graph_or_default()?;
-                // SPARQL 1.1 Update §3.2.3–3.2.5.
-                if from == to {
-                    Vec::new()
-                } else {
-                    let target = |g: &GraphName| match g {
-                        GraphName::NamedNode(n) => GraphTarget::NamedNode(n.clone()),
-                        GraphName::DefaultGraph => GraphTarget::DefaultGraph,
-                    };
-                    match word.as_str() {
-                        "ADD" => vec![copy_graph(&from, &to)],
-                        "MOVE" => vec![
-                            GraphUpdateOperation::Drop {
-                                silent: true,
-                                graph: target(&to),
-                            },
-                            copy_graph(&from, &to),
-                            GraphUpdateOperation::Drop {
-                                silent,
-                                graph: target(&from),
-                            },
-                        ],
-                        _ => vec![
-                            GraphUpdateOperation::Drop {
-                                silent: true,
-                                graph: target(&to),
-                            },
-                            copy_graph(&from, &to),
-                        ],
-                    }
-                }
+                // SPARQL 1.1 Update §3.2.3–3.2.5, kept whole: the executor resolves the names.
+                let op = match word.as_str() {
+                    "ADD" => TransferOp::Add,
+                    "MOVE" => TransferOp::Move,
+                    _ => TransferOp::Copy,
+                };
+                vec![GraphUpdateOperation::Transfer {
+                    op,
+                    silent,
+                    from,
+                    to,
+                }]
             }
             "INSERT" if self.data_follows("INSERT") => {
                 self.keyword("INSERT");
@@ -727,8 +704,8 @@ impl<'a> Parser<'a> {
                             },
                         }
                     })
-                    .reduce(new_join)
-                    .unwrap_or_default();
+                    .collect::<Vec<_>>();
+                let pattern = GraphPattern::join_all(pattern);
                 let delete = ground_quads(quads)
                     .map_err(|()| self.error_at(at, "DELETE WHERE can't hold blank nodes"))?;
                 vec![GraphUpdateOperation::DeleteInsert {
@@ -920,31 +897,6 @@ fn bound_in(expression: &Expression, visible: &HashSet<Variable>) -> bool {
         Expression::If(a, b, c) => {
             bound_in(a, visible) && bound_in(b, visible) && bound_in(c, visible)
         }
-    }
-}
-
-/// `ADD`'s copy of every triple of `from` into `to`.
-fn copy_graph(from: &GraphName, to: &GraphName) -> GraphUpdateOperation {
-    let [s, p, o] = ["s", "p", "o"].map(Variable::new_unchecked);
-    let bgp = GraphPattern::Bgp {
-        patterns: vec![TriplePattern::new(s.clone(), p.clone(), o.clone())],
-    };
-    GraphUpdateOperation::DeleteInsert {
-        delete: Vec::new(),
-        insert: vec![QuadPattern::new(
-            s,
-            p,
-            o,
-            GraphNamePattern::from(to.clone()),
-        )],
-        using: None,
-        pattern: Box::new(match from {
-            GraphName::NamedNode(from) => GraphPattern::Graph {
-                name: from.clone().into(),
-                inner: Box::new(bgp),
-            },
-            GraphName::DefaultGraph => bgp,
-        }),
     }
 }
 

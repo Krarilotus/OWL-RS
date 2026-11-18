@@ -16,17 +16,32 @@ pub fn capabilities(state: AppState) -> Response {
         .into_response()
 }
 
-pub fn dataset_summary(state: AppState) -> Result<Response, ApiError> {
-    Ok((StatusCode::OK, Json(build_ready_response(&state)?)).into_response())
+pub fn dataset_summary(
+    state: AppState,
+    identity: &crate::auth::Identity,
+) -> Result<Response, ApiError> {
+    Ok((
+        StatusCode::OK,
+        Json(build_ready_response(&state, identity)?),
+    )
+        .into_response())
 }
 
-pub fn extended_health(state: AppState) -> Result<Response, ApiError> {
-    let ready = build_ready_response(&state)?;
+pub fn extended_health(
+    state: AppState,
+    identity: &crate::auth::Identity,
+) -> Result<Response, ApiError> {
+    let ready = build_ready_response(&state, identity)?;
     let status = if state.is_ready() {
         StatusCode::OK
     } else {
         StatusCode::SERVICE_UNAVAILABLE
     };
 
-    Ok((status, Json(build_extended_health_response(&state, ready))).into_response())
+    Ok((
+        status,
+        axum::Extension(crate::error::Verbatim),
+        Json(build_extended_health_response(&state, ready)),
+    )
+        .into_response())
 }

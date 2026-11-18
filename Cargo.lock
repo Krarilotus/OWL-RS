@@ -396,7 +396,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1130,12 +1130,22 @@ dependencies = [
 ]
 
 [[package]]
-name = "nrese-core"
-version = "0.1.0"
+name = "nrese-dl"
+version = "1.5.0"
+dependencies = [
+ "hashbrown 0.16.1",
+ "nrese-exec",
+ "nrese-owl",
+ "nrese-rdf",
+ "nrese-rdf-io",
+ "nrese-reasoner",
+ "nrese-xsd",
+ "rayon",
+]
 
 [[package]]
 name = "nrese-engine"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "aho-corasick",
  "crc32fast",
@@ -1143,28 +1153,34 @@ dependencies = [
  "hashbrown 0.16.1",
  "memchr",
  "memmap2",
+ "nrese-exec",
  "nrese-rdf",
  "nrese-rdf-io",
+ "nrese-vector",
  "parking_lot",
  "rayon",
  "rust-stemmers",
  "tempfile",
  "thiserror 2.0.21",
  "tracing",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "nrese-exec"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash 0.2.0",
  "hashbrown 0.16.1",
+ "libc",
+ "parking_lot_core",
  "rayon",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "nrese-fuzz"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "nrese-rdf",
  "nrese-rdf-io",
@@ -1174,15 +1190,24 @@ dependencies = [
 
 [[package]]
 name = "nrese-json"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "memchr",
  "thiserror 2.0.21",
 ]
 
 [[package]]
+name = "nrese-owl"
+version = "1.5.0"
+dependencies = [
+ "foldhash 0.2.0",
+ "nrese-rdf",
+ "nrese-rdf-io",
+]
+
+[[package]]
 name = "nrese-rdf"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash 0.2.0",
  "nrese-xsd",
@@ -1193,10 +1218,11 @@ dependencies = [
 
 [[package]]
 name = "nrese-rdf-io"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "foldhash 0.2.0",
  "memchr",
+ "nrese-exec",
  "nrese-json",
  "nrese-rdf",
  "quick-xml",
@@ -1205,21 +1231,24 @@ dependencies = [
 
 [[package]]
 name = "nrese-reasoner"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "hashbrown 0.16.1",
- "nrese-core",
+ "nrese-engine",
  "nrese-exec",
+ "nrese-owl",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-reasoner",
+ "nrese-xsd",
  "rayon",
+ "smallvec",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "nrese-server"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1227,21 +1256,26 @@ dependencies = [
  "base64",
  "dotenvy",
  "futures-util",
+ "http-body",
+ "http-body-util",
  "jsonwebtoken",
+ "libc",
  "libmimalloc-sys",
  "mimalloc",
- "nrese-core",
- "nrese-engine",
+ "nrese-exec",
  "nrese-rdf",
+ "nrese-rdf-io",
  "nrese-reasoner",
  "nrese-sparql",
  "nrese-sparql-results",
  "nrese-store",
+ "nrese-xsd",
  "parking_lot",
  "reqwest",
  "serde",
  "serde_json",
  "serde_urlencoded",
+ "sha2",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -1251,13 +1285,15 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "utoipa",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "nrese-shacl"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "nrese-engine",
+ "nrese-exec",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-sparql",
@@ -1269,13 +1305,15 @@ dependencies = [
 
 [[package]]
 name = "nrese-sparql"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "geo",
+ "hashbrown 0.16.1",
  "hex",
  "md-5",
  "nrese-engine",
  "nrese-exec",
+ "nrese-owl",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-reasoner",
@@ -1287,17 +1325,17 @@ dependencies = [
  "rand 0.9.5",
  "rayon",
  "regex",
- "rstar",
  "serde_json",
  "sha1",
  "sha2",
+ "tempfile",
  "thiserror 2.0.21",
  "wkt",
 ]
 
 [[package]]
 name = "nrese-sparql-reference"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "nrese-engine",
  "nrese-rdf",
@@ -1307,9 +1345,10 @@ dependencies = [
 
 [[package]]
 name = "nrese-sparql-results"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "memchr",
+ "nrese-exec",
  "nrese-json",
  "nrese-rdf",
  "quick-xml",
@@ -1318,23 +1357,28 @@ dependencies = [
 
 [[package]]
 name = "nrese-sparql-syntax"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "nrese-rdf",
  "nrese-rdf-io",
+ "smallvec",
  "thiserror 2.0.21",
 ]
 
 [[package]]
 name = "nrese-store"
-version = "0.1.0"
+version = "1.5.0"
 dependencies = [
  "argon2",
+ "bytes",
  "getrandom 0.4.2",
+ "hashbrown 0.16.1",
  "libmimalloc-sys",
  "mimalloc",
- "nrese-core",
+ "nrese-dl",
  "nrese-engine",
+ "nrese-exec",
+ "nrese-owl",
  "nrese-rdf",
  "nrese-rdf-io",
  "nrese-reasoner",
@@ -1356,9 +1400,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "nrese-xsd"
-version = "0.1.0"
+name = "nrese-vector"
+version = "1.5.0"
 dependencies = [
+ "nrese-exec",
+ "parking_lot",
+ "rayon",
+]
+
+[[package]]
+name = "nrese-xsd"
+version = "1.5.0"
+dependencies = [
+ "iri-string",
+ "regex-syntax",
  "thiserror 2.0.21",
 ]
 
@@ -1822,7 +1877,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2047,6 +2102,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d7f45b8998ced5134fb1d75732c77842a3e888f19c1ff98481822e8fbfbf930b"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "simple_asn1"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2156,7 +2221,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2274,6 +2339,7 @@ dependencies = [
  "libc",
  "mio",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

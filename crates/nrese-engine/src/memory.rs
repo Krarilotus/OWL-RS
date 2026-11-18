@@ -12,6 +12,7 @@
 //! it, nothing happens.
 
 use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Gives back what the calling thread's allocator holds unused; `true`: all of it now.
 pub type Release = fn(force: bool);
@@ -30,11 +31,54 @@ pub fn release_thread() {
     }
 }
 
+/// Whether a materialisation also releases between its rounds ([`release_between_rounds`]).
+static BETWEEN_ROUNDS: AtomicBool = AtomicBool::new(false);
+
+/// Sets whether a materialisation releases between its rounds, after the last one and before
+/// the store builds the inferred stack (`budgets.reasoning_release`; off by default). On, its
+/// resident peak is lower and steadier: mimalloc keeps a freed large block 100 ms, about a
+/// round, so whether one round's freed buffers still count when the next allocates depends on
+/// timing. It costs time, as the memory given back is soon taken and faulted in again:
+/// LUBM 100's peak 2,074 → 1,776 MiB for 5.6 % more reasoning time, RL-1 −25 % for 6.6 %,
+/// commits-rdfs's reasoning peak −28 % for 14 % (office-pc, 13 Oct 2026). A thread of its
+/// own halves the cost and keeps most of the memory; no variant measured was free.
+pub fn set_release_between_rounds(on: bool) {
+    BETWEEN_ROUNDS.store(on, Ordering::Relaxed);
+}
+
+/// Releases what every thread holds unused, where [`set_release_between_rounds`] asks for it:
+/// between a materialisation's rounds.
+pub fn release_between_rounds() {
+    if BETWEEN_ROUNDS.load(Ordering::Relaxed) {
+        release_all();
+    }
+}
+
 /// Releases what every pool thread and the calling thread hold unused: at the end of a
 /// phase, and within one whose memory other threads freed.
 pub fn release_all() {
     if let Some(&release) = RELEASE.get() {
         rayon::broadcast(|_| release(true));
         release(true);
+    }
+}
+
+/// Offers back, unforced, what the calling thread and every pool thread hold unused: at
+/// the end of an operation that leaves the shared workers idle. Without it they keep the
+/// operation's freed memory, so the next one's peak starts above it.
+///
+/// The caller pays for its own release and for queuing the pool threads' releases, nothing
+/// more: each pool thread releases when it is next free, before or after this returns, and
+/// none is waited for, so a worker busy with other work (another request's operation, a
+/// materialisation) doesn't hold the caller up.
+///
+/// Unforced, the allocator gives back what it can without waiting. A forced release
+/// ([`release_all`]) took about 8 ms on an EL classification of 20,000 classes through the
+/// endpoint, and the memory it gave back was soon faulted in again, a few percent more time
+/// on the request.
+pub fn release_idle() {
+    if let Some(&release) = RELEASE.get() {
+        rayon::spawn_broadcast(move |_| release(false));
+        release(false);
     }
 }

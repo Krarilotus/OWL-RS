@@ -19,10 +19,14 @@ pub struct ReadyResponse {
     /// `ready`, `starting`, or `quarantined` (inconsistent data under the configured
     /// reasoning).
     pub status: &'static str,
-    /// `consistent`, `inconsistent` or `unknown` (no current reasoning state).
+    /// `consistent`, `inconsistent`, `undecided` (the rules' violations, which `owl2-dl`
+    /// doesn't decide: see `consistency_reason`) or `unknown` (no current reasoning state).
     pub consistency: &'static str,
-    /// Consistency violations in the materialised data, when inconsistent.
+    /// Consistency violations in the materialised data, when inconsistent or undecided.
     pub violations: Option<usize>,
+    /// When undecided: why, and the ways out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consistency_reason: Option<String>,
     pub revision: u64,
     pub quad_count: u64,
     pub named_graph_count: usize,
@@ -34,6 +38,26 @@ pub struct ReadyResponse {
     pub reasoning_profile: &'static str,
     pub reasoning_read_model: &'static str,
     pub reasoning_semantic_tier: &'static str,
+    /// Under `owl2-dl`: the data's consistency under OWL 2 DL, as last checked.
+    pub dl: Option<DlReady>,
+    /// The repositories that can't serve (`id: unavailable`): the server stays ready for
+    /// the others, so that a load balancer keeps it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
+}
+
+/// The `owl2-dl` mode's status.
+#[derive(Debug, Serialize)]
+pub struct DlReady {
+    /// `consistent`, `inconsistent` or `unknown` (not checked yet, not decided, or off).
+    pub consistency: &'static str,
+    /// Why it is `unknown`.
+    pub reason: Option<String>,
+    /// The engine that decided: `context-core`, `hypertableau`, or `none`.
+    pub engine: &'static str,
+    /// The revision it was checked at (older than `revision` after a write past the
+    /// pipeline).
+    pub revision: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -148,10 +172,30 @@ pub struct AdminRestoreResponse {
     pub quad_count: u64,
     pub format: &'static str,
     pub checksum_sha256: String,
+    /// The payload's closing checksum comment (`# nrese-sha256`) was there and matched.
+    pub checksum_verified: bool,
     pub replaced_existing: bool,
 }
 
-pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError> {
+/// Public readiness has no dataset diagnostics, even when authentication is off.
+pub fn build_readiness_response(state: &AppState) -> StatusResponse {
+    StatusResponse {
+        status: if !state.is_started() {
+            "starting"
+        } else if state.is_quarantined() {
+            "quarantined"
+        } else {
+            "ready"
+        },
+    }
+}
+
+/// Every consumer of global figures checks scope here, after authorizing its action.
+pub fn build_ready_response(
+    state: &AppState,
+    identity: &crate::auth::Identity,
+) -> Result<ReadyResponse, ApiError> {
+    super::guard::whole_read_scope(state.access_view(identity))?;
     let stats = state
         .store()
         .stats()
@@ -160,16 +204,17 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
 
     let consistency = state.store().consistency();
     Ok(ReadyResponse {
-        status: if !state.is_started() {
-            "starting"
-        } else if state.is_quarantined() {
-            "quarantined"
-        } else {
-            "ready"
-        },
+        status: build_readiness_response(state).status,
         consistency: consistency.as_str(),
         violations: match consistency {
-            nrese_store::ConsistencyStatus::Inconsistent { violations } => Some(violations),
+            nrese_store::ConsistencyStatus::Inconsistent { violations }
+            | nrese_store::ConsistencyStatus::Undecided { violations, .. } => Some(violations),
+            _ => None,
+        },
+        consistency_reason: match consistency {
+            nrese_store::ConsistencyStatus::Undecided { violations, why } => {
+                Some(why.text(violations))
+            }
             _ => None,
         },
         revision: state.store().current_revision(),
@@ -186,6 +231,25 @@ pub fn build_ready_response(state: &AppState) -> Result<ReadyResponse, ApiError>
         reasoning_profile: posture.reasoning_profile,
         reasoning_read_model: posture.reasoning_read_model,
         reasoning_semantic_tier: posture.reasoning_semantic_tier,
+        dl: state
+            .store()
+            .dl()
+            .active()
+            .then(|| match state.store().dl().status() {
+                Some(status) => DlReady {
+                    consistency: status.consistency.verdict.as_str(),
+                    reason: status.consistency.verdict.reason().map(str::to_owned),
+                    engine: status.consistency.engine,
+                    revision: Some(status.revision),
+                },
+                None => DlReady {
+                    consistency: "unknown",
+                    reason: Some("not checked since the start".to_owned()),
+                    engine: "none",
+                    revision: None,
+                },
+            }),
+        degraded: state.degraded(),
     })
 }
 
@@ -314,6 +378,7 @@ pub fn build_admin_restore_response(
         quad_count: report.quad_count,
         format: "n-quads",
         checksum_sha256: report.checksum_sha256.clone(),
+        checksum_verified: report.checksum_verified,
         replaced_existing: report.replaced_existing,
     }
 }

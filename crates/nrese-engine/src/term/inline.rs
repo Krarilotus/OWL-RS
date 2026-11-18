@@ -16,6 +16,8 @@
 //! Timezones are inlined when they are a multiple of 15 minutes (all real-world offsets);
 //! canonically, a zero offset is written `Z`.
 
+use std::fmt;
+
 use nrese_rdf::vocab::xsd;
 use nrese_rdf::{Literal, LiteralRef};
 
@@ -62,30 +64,79 @@ pub(crate) fn try_inline_literal(literal: LiteralRef<'_>, derived: bool) -> Opti
     Some(TermId::new(kind, payload))
 }
 
-/// Materialises an inline id back into its literal; `None` for non-inline kinds.
+/// Materialises an inline id back into its literal; `None` for non-inline kinds. It allocates
+/// exactly [`inline_bound`]: its lexical form, in a `String` of [`lexical_len`]'s capacity,
+/// written in place, and its datatype's IRI.
 pub(crate) fn inline_to_literal(id: TermId) -> Option<Literal> {
-    let payload = id.payload();
-    let (lexical, datatype) = match id.kind() {
-        TermKind::Integer => (decode_integer(payload).to_string(), xsd::INTEGER),
-        TermKind::Boolean => ((payload != 0).to_string(), xsd::BOOLEAN),
-        TermKind::Decimal => (decode_decimal(payload), xsd::DECIMAL),
-        TermKind::Date => (decode_date(payload), xsd::DATE),
-        TermKind::DateTime => (decode_date_time(payload), xsd::DATE_TIME),
-        TermKind::DerivedInteger => {
-            let (value, code) = decode_derived(payload);
-            (value.to_string(), DERIVED.get(code)?.0)
+    let datatype = inline_datatype(id)?;
+    let mut lexical = String::with_capacity(lexical_len(id)?);
+    write_lexical(id, &mut lexical)?;
+    Some(Literal::new_typed_literal(lexical, datatype))
+}
+
+/// The bytes [`inline_to_literal`] allocates for `id`, exactly, allocating nothing; `None`
+/// where it gives no literal.
+pub(crate) fn inline_bound(id: TermId) -> Option<usize> {
+    Some(inline_datatype(id)?.as_str().len() + lexical_len(id)?)
+}
+
+/// The length of the inline literal `id`'s lexical form, counted as [`write_lexical`] writes
+/// it, with nothing allocated.
+fn lexical_len(id: TermId) -> Option<usize> {
+    struct Count(usize);
+    impl fmt::Write for Count {
+        fn write_str(&mut self, s: &str) -> fmt::Result {
+            self.0 += s.len();
+            Ok(())
         }
+    }
+    let mut count = Count(0);
+    write_lexical(id, &mut count)?;
+    Some(count.0)
+}
+
+/// Writes the inline literal `id`'s lexical form to `out`, straight from its payload, through
+/// no string of its own; `None` for non-inline kinds (or where `out` fails, which a `String`
+/// and [`lexical_len`]'s count never do). The one formatting of every inline kind: its count
+/// and its text can't differ.
+fn write_lexical(id: TermId, out: &mut impl fmt::Write) -> Option<()> {
+    let payload = id.payload();
+    match id.kind() {
+        TermKind::Integer => write!(out, "{}", decode_integer(payload)),
+        TermKind::Boolean => write!(out, "{}", payload != 0),
+        TermKind::Decimal => write_decimal(payload, out),
+        TermKind::Date => write_date(payload, out),
+        TermKind::DateTime => write_date_time(payload, out),
+        TermKind::DerivedInteger => write!(out, "{}", decode_derived(payload).0),
         TermKind::DefaultGraph
         | TermKind::Iri
         | TermKind::BlankNode
         | TermKind::String
         | TermKind::LangString
         | TermKind::TypedLiteral
-        | TermKind::Triple => {
-            return None;
-        }
-    };
-    Some(Literal::new_typed_literal(lexical, datatype))
+        | TermKind::Triple => return None,
+    }
+    .ok()
+}
+
+/// The datatype of the inline literal `id`; `None` for non-inline kinds and an unknown
+/// derived datatype's code.
+fn inline_datatype(id: TermId) -> Option<nrese_rdf::NamedNodeRef<'static>> {
+    Some(match id.kind() {
+        TermKind::Integer => xsd::INTEGER,
+        TermKind::Boolean => xsd::BOOLEAN,
+        TermKind::Decimal => xsd::DECIMAL,
+        TermKind::Date => xsd::DATE,
+        TermKind::DateTime => xsd::DATE_TIME,
+        TermKind::DerivedInteger => DERIVED.get(decode_derived(id.payload()).1)?.0,
+        TermKind::DefaultGraph
+        | TermKind::Iri
+        | TermKind::BlankNode
+        | TermKind::String
+        | TermKind::LangString
+        | TermKind::TypedLiteral
+        | TermKind::Triple => return None,
+    })
 }
 
 // --- xsd:integer ------------------------------------------------------------------------
@@ -221,17 +272,26 @@ fn encode_decimal(lexical: &str) -> Option<u64> {
     Some((u64::from(scale) << DECIMAL_MANTISSA_BITS) | (mantissa as u64 & DECIMAL_MANTISSA_MASK))
 }
 
-fn decode_decimal(payload: u64) -> String {
-    let scale = (payload >> DECIMAL_MANTISSA_BITS) as usize;
+/// The mantissa's digits with a point `scale` digits from the right: its integer part (at
+/// least `0`), then its fraction, `scale` digits zero-padded (`.0` for scale 0).
+fn write_decimal(payload: u64, out: &mut impl fmt::Write) -> fmt::Result {
+    let scale = (payload >> DECIMAL_MANTISSA_BITS) as u32;
     let mantissa = sign_extend(payload & DECIMAL_MANTISSA_MASK, DECIMAL_MANTISSA_BITS);
     let sign = if mantissa < 0 { "-" } else { "" };
-    let digits = format!("{:0width$}", mantissa.unsigned_abs(), width = scale + 1);
+    let digits = mantissa.unsigned_abs();
     if scale == 0 {
-        format!("{sign}{digits}.0")
-    } else {
-        let (integer, fraction) = digits.split_at(digits.len() - scale);
-        format!("{sign}{integer}.{fraction}")
+        return write!(out, "{sign}{digits}.0");
     }
+    // The scale is 4 bits, at most 15: 10^15 fits a u64.
+    let unit = 10u64.pow(scale);
+    let width = scale as usize;
+    write!(
+        out,
+        "{sign}{}.{:0width$}",
+        digits / unit,
+        digits % unit,
+        width = width
+    )
 }
 
 // --- xsd:date and xsd:dateTime ----------------------------------------------------------
@@ -251,17 +311,16 @@ fn digits(s: &str, range: std::ops::Range<usize>) -> Option<u32> {
         .then(|| field.parse().ok())?
 }
 
-/// `YYYY-MM-DD` with a year 0000–9999 and a real calendar day; returns the date bits.
-/// A `Date` id bound one local day before (`later == false`) or after `id`, for FILTER range
-/// scans: a date with a timezone and one without compare indeterminately when their local
-/// dates are less than a day (±14 h) apart, so a range over dates is widened by a day and
-/// its edges are checked by the full comparison. The bound needn't be a real date; it only
-/// has to order correctly (fields are compared as year, month, day, timezone).
 /// The timezone field of a date or dateTime payload (the lowest bits of both).
 pub(crate) fn timezone_code(payload: u64) -> u64 {
     payload & ((1 << TIMEZONE_BITS) - 1)
 }
 
+/// A `Date` id bound one local day before (`later == false`) or after `id`, for FILTER range
+/// scans: a date with a timezone and one without compare indeterminately when their local
+/// dates are less than a day (±14 h) apart, so a range over dates is widened by a day and
+/// its edges are checked by the full comparison. The bound needn't be a real date; it only
+/// has to order correctly (fields are compared as year, month, day, timezone).
 pub(crate) fn date_widened(id: TermId, later: bool) -> Option<TermId> {
     if id.kind() != TermKind::Date {
         return None;
@@ -296,6 +355,34 @@ pub(crate) fn date_widened(id: TermId, later: bool) -> Option<TermId> {
     ))
 }
 
+/// A `DateTime` id bound two local days before (`later == false`) or after `id`, at its
+/// clock and fraction, with the smallest or largest timezone code, for FILTER range scans.
+/// Inline dateTimes sort by local date and time, then timezone code, but compare by instant
+/// (with a timezone on one side only, within ±14 h of it). Both sides can be ±14 h off UTC,
+/// so a value that passes can lie up to 28 h of local time beyond the bound: under the
+/// engine's order and under XPath's implicit timezone alike. Two days cover that, and the
+/// full comparison decides the edges. The days step as [`date_widened`]'s, across months,
+/// leap days and years; past the inline years its bound is below 0000-01-01 or in year
+/// 10000, beyond every inline dateTime.
+pub(crate) fn date_time_widened(id: TermId, later: bool) -> Option<TermId> {
+    if id.kind() != TermKind::DateTime {
+        return None;
+    }
+    let bits = id.payload() >> TIMEZONE_BITS;
+    let (date, time) = (bits >> 27, bits & ((1 << 27) - 1));
+    // The date as a `Date` id, moved a day at a time by the date code.
+    let mut day = TermId::new(TermKind::Date, date << TIMEZONE_BITS);
+    for _ in 0..2 {
+        day = date_widened(day, later)?;
+    }
+    let date = day.payload() >> TIMEZONE_BITS;
+    let timezone = if later { (1 << TIMEZONE_BITS) - 1 } else { 0 };
+    Some(TermId::new(
+        TermKind::DateTime,
+        (((date << 27) | time) << TIMEZONE_BITS) | timezone,
+    ))
+}
+
 /// Bits below the year in a date payload (month, day, timezone) and in a dateTime payload
 /// (month, day, time of day, timezone).
 const DATE_YEAR_SHIFT: u32 = 9 + TIMEZONE_BITS;
@@ -317,6 +404,7 @@ pub(crate) fn year_range(kind: TermKind, low: u32, high: u32) -> Option<(TermId,
     ))
 }
 
+/// `YYYY-MM-DD` with a year 0000–9999 and a real calendar day; returns the date bits.
 fn parse_date_part(s: &str) -> Option<u64> {
     if s.len() != 10 || s.as_bytes()[4] != b'-' || s.as_bytes()[7] != b'-' {
         return None;
@@ -328,9 +416,9 @@ fn parse_date_part(s: &str) -> Option<u64> {
     Some((u64::from(year) << 9) | (u64::from(month) << 5) | u64::from(day))
 }
 
-fn format_date_part(bits: u64) -> String {
+fn write_date_part(bits: u64, out: &mut impl fmt::Write) -> fmt::Result {
     let (year, month, day) = (bits >> 9, (bits >> 5) & 0xf, bits & 0x1f);
-    format!("{year:04}-{month:02}-{day:02}")
+    write!(out, "{year:04}-{month:02}-{day:02}")
 }
 
 /// Proleptic Gregorian calendar, as XSD uses (year 0000 is a leap year).
@@ -355,13 +443,16 @@ fn split_timezone(s: &str) -> Option<(&str, u64)> {
     let Some(split) = s.len().checked_sub(6) else {
         return Some((s, 0));
     };
-    let (rest, zone) = s.split_at(split);
-    // Only a `±hh:mm` suffix is a timezone; a date's own `-MM-DD` is not.
-    let sign = match (zone.as_bytes()[0], zone.as_bytes()[3]) {
+    // Only a `±hh:mm` suffix is a timezone; a date's own `-MM-DD` is not. The sign is
+    // read as a byte first: an ASCII sign byte is always a char boundary, so the split
+    // below cannot land inside a multi-byte character of an ill-typed lexical form.
+    let bytes = s.as_bytes();
+    let sign = match (bytes[split], bytes[split + 3]) {
         (b'+', b':') => 1,
         (b'-', b':') => -1,
         _ => return Some((s, 0)),
     };
+    let (rest, zone) = s.split_at(split);
     let (hours, minutes) = (digits(zone, 1..3)?, digits(zone, 4..6)?);
     let offset = i64::from(hours * 60 + minutes);
     if minutes >= 60 || offset == 0 || offset > 14 * 60 || offset % 15 != 0 {
@@ -370,17 +461,17 @@ fn split_timezone(s: &str) -> Option<(&str, u64)> {
     Some((rest, (1 + 56 + sign * offset / 15) as u64))
 }
 
-fn format_timezone(code: u64) -> String {
+fn write_timezone(code: u64, out: &mut impl fmt::Write) -> fmt::Result {
     if code == 0 {
-        return String::new();
+        return Ok(());
     }
     let offset = (code as i64 - 1 - 56) * 15;
     if offset == 0 {
-        return "Z".to_owned();
+        return out.write_str("Z");
     }
     let sign = if offset < 0 { '-' } else { '+' };
     let offset = offset.abs();
-    format!("{sign}{:02}:{:02}", offset / 60, offset % 60)
+    write!(out, "{sign}{:02}:{:02}", offset / 60, offset % 60)
 }
 
 fn encode_date(lexical: &str) -> Option<u64> {
@@ -388,13 +479,9 @@ fn encode_date(lexical: &str) -> Option<u64> {
     Some((parse_date_part(date)? << TIMEZONE_BITS) | timezone)
 }
 
-fn decode_date(payload: u64) -> String {
-    let timezone = payload & ((1 << TIMEZONE_BITS) - 1);
-    format!(
-        "{}{}",
-        format_date_part(payload >> TIMEZONE_BITS),
-        format_timezone(timezone)
-    )
+fn write_date(payload: u64, out: &mut impl fmt::Write) -> fmt::Result {
+    write_date_part(payload >> TIMEZONE_BITS, out)?;
+    write_timezone(payload & ((1 << TIMEZONE_BITS) - 1), out)
 }
 
 /// `YYYY-MM-DDThh:mm:ss[.f{1,3}]` plus timezone. Canonical: hour < 24 (`24:00:00` is the
@@ -431,7 +518,7 @@ fn encode_date_time(lexical: &str) -> Option<u64> {
     Some((((date << 27) | time) << TIMEZONE_BITS) | timezone)
 }
 
-fn decode_date_time(payload: u64) -> String {
+fn write_date_time(payload: u64, out: &mut impl fmt::Write) -> fmt::Result {
     let timezone = payload & ((1 << TIMEZONE_BITS) - 1);
     let bits = payload >> TIMEZONE_BITS;
     let (date, time) = (bits >> 27, bits & ((1 << 27) - 1));
@@ -441,15 +528,18 @@ fn decode_date_time(payload: u64) -> String {
         (time >> 10) & 0x3f,
         time & 0x3ff,
     );
-    let fraction = match millisecond {
-        0 => String::new(),
-        ms => format!(".{ms:03}").trim_end_matches('0').to_owned(),
-    };
-    format!(
-        "{}T{hour:02}:{minute:02}:{second:02}{fraction}{}",
-        format_date_part(date),
-        format_timezone(timezone)
-    )
+    write_date_part(date, out)?;
+    write!(out, "T{hour:02}:{minute:02}:{second:02}")?;
+    if millisecond > 0 {
+        // `.` and the milliseconds in at least three digits, their trailing zeros cut.
+        let (mut value, mut width) = (millisecond, if millisecond >= 1000 { 4 } else { 3 });
+        while value % 10 == 0 {
+            value /= 10;
+            width -= 1;
+        }
+        write!(out, ".{value:0width$}")?;
+    }
+    write_timezone(timezone, out)
 }
 
 #[cfg(test)]
@@ -717,6 +807,33 @@ mod tests {
         );
     }
 
+    /// RDF 1.1 Concepts §3.3: a literal whose lexical form is not in its datatype's
+    /// lexical space is ill-typed but still a legal term, so it stays in the dictionary
+    /// with its lexical form. In each row a multi-byte character covers the byte where a
+    /// `±hh:mm` timezone would start (`"éabcde"` is 7 bytes, `len - 6 == 1` is inside `é`).
+    #[test]
+    fn non_ascii_lexicals_stay_in_the_dictionary() {
+        let lexicals = [
+            "éabcde",
+            "2026-09-2é+5:00",
+            "x€bcdef",
+            "2026-09-25T14:03:0é+1:00",
+        ];
+        // Every row is checked, so a failure lists each wrong one (inlined or a panic).
+        let wrong: Vec<String> = [xsd::DATE, xsd::DATE_TIME]
+            .into_iter()
+            .flat_map(|datatype| lexicals.map(|lexical| (lexical, datatype)))
+            .filter_map(|(lexical, datatype)| {
+                match std::panic::catch_unwind(|| inline(lexical, datatype)) {
+                    Ok(None) => None,
+                    Ok(Some(_)) => Some(format!("{lexical} ^^ {datatype} inlined")),
+                    Err(_) => Some(format!("{lexical} ^^ {datatype} panicked")),
+                }
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{wrong:#?}");
+    }
+
     /// The invariant that matters: whatever gets inlined decodes to exactly its input.
     /// Random near-miss strings over each datatype's alphabet.
     #[test]
@@ -805,5 +922,55 @@ mod tests {
         // Ranges by value cover every datatype.
         let (low, high) = derived_range(-5, 7).unwrap();
         assert!(ids[1] >= low && ids[4] <= high && ids[0] < low && ids[5] > high);
+    }
+
+    /// Package C3: a charged decode charges [`inline_bound`] before [`inline_to_literal`]
+    /// allocates, so the bound is what the literal holds (its strings' capacities), exactly, for
+    /// every inline kind and any payload: the longest fields, each field at its largest (a year
+    /// of 14 bits, milliseconds of 10, the last timezone code, the widest mantissa and scale),
+    /// and payloads no lexical form encodes. `None` exactly where no literal is decoded.
+    #[test]
+    fn an_inline_bound_is_what_its_literal_holds() {
+        let kinds = [
+            TermKind::Integer,
+            TermKind::Boolean,
+            TermKind::Decimal,
+            TermKind::Date,
+            TermKind::DateTime,
+            TermKind::DerivedInteger,
+            TermKind::String,
+            TermKind::Triple,
+        ];
+        let all = (1u64 << super::super::PAYLOAD_BITS) - 1;
+        let mut payloads = vec![0, 1, all, all >> 1, all >> 4, 0x3ff << TIMEZONE_BITS];
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        for _ in 0..20_000 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            payloads.push(state & all);
+        }
+        let canonical = [
+            inline("-576460752303423488", xsd::INTEGER),
+            inline("-36028797018963.967", xsd::DECIMAL),
+            inline("9999-12-31-14:00", xsd::DATE),
+            inline("9999-12-31T23:59:59.999+14:00", xsd::DATE_TIME),
+            inline("-128", xsd::BYTE),
+        ];
+        let mut decoded = 0;
+        let ids = kinds
+            .iter()
+            .flat_map(|&kind| payloads.iter().map(move |&p| TermId::new(kind, p)))
+            .chain(canonical.into_iter().map(Option::unwrap));
+        for id in ids {
+            let literal = inline_to_literal(id);
+            assert_eq!(
+                inline_bound(id),
+                literal.as_ref().map(Literal::heap_bytes),
+                "{id:?}: {literal:?}"
+            );
+            decoded += usize::from(literal.is_some());
+        }
+        assert!(decoded > 100_000, "{decoded} decoded");
     }
 }

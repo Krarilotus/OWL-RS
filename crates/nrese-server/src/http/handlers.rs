@@ -19,7 +19,9 @@ use crate::http::requests::{
     SparqlOperation, accept_header_value, operation_from_post, query_from_post, query_from_url,
     update_from_post,
 };
-use crate::http::responses::{StatusResponse, build_ready_response, build_version_response};
+use crate::http::responses::{
+    StatusResponse, build_readiness_response, build_ready_response, build_version_response,
+};
 use crate::http::service_description::build_service_description;
 use crate::http::shacl;
 use crate::http::sparql;
@@ -83,16 +85,16 @@ pub async fn operator_dataset_summary(
     authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
 ) -> Result<Response, ApiError> {
-    guard::enforce_operator_read(&state, &authenticated).await?;
-    operator_api::dataset_summary(state)
+    let identity = guard::enforce_operator_read(&state, &authenticated).await?;
+    operator_api::dataset_summary(state, &identity)
 }
 
 pub async fn operator_extended_health(
     authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
 ) -> Result<Response, ApiError> {
-    guard::enforce_operator_read(&state, &authenticated).await?;
-    operator_api::extended_health(state)
+    let identity = guard::enforce_operator_read(&state, &authenticated).await?;
+    operator_api::extended_health(state, &identity)
 }
 
 pub async fn operator_runtime_diagnostics(
@@ -138,6 +140,17 @@ pub async fn admin_image_backup(
     admin_dataset::image_backup(state, repository).await
 }
 
+/// An image backup of the repository the path names, into `backups/` of the data
+/// directory.
+pub async fn repository_image_backup(
+    authenticated: crate::auth::Authenticated,
+    Repository(state): Repository,
+) -> Result<Response, ApiError> {
+    guard::enforce_admin_write(&state, &authenticated).await?;
+    let id = state.repository_id().to_owned();
+    admin_dataset::image_backup(state, &id).await
+}
+
 pub async fn admin_restore_dataset(
     authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
@@ -149,10 +162,17 @@ pub async fn admin_restore_dataset(
 }
 
 pub async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
-    match build_ready_response(&state) {
-        Ok(response) if state.is_ready() => (StatusCode::OK, Json(response)).into_response(),
-        Ok(response) => (StatusCode::SERVICE_UNAVAILABLE, Json(response)).into_response(),
-        Err(error) => error.into_response(),
+    let response = build_readiness_response(&state);
+    if response.status == "ready" {
+        (StatusCode::OK, Json(response)).into_response()
+    } else {
+        // Not ready is a status document, not an error: probes read it as written.
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            axum::Extension(crate::error::Verbatim),
+            Json(response),
+        )
+            .into_response()
     }
 }
 
@@ -160,8 +180,12 @@ pub async fn dataset_info(
     authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
 ) -> Result<Response, ApiError> {
-    guard::enforce_service_description_read(&state, &authenticated).await?;
-    Ok((StatusCode::OK, Json(build_ready_response(&state)?)).into_response())
+    let identity = guard::enforce_service_description_read(&state, &authenticated).await?;
+    Ok((
+        StatusCode::OK,
+        Json(build_ready_response(&state, &identity)?),
+    )
+        .into_response())
 }
 
 pub async fn version(State(state): State<AppState>) -> Response {
@@ -327,7 +351,7 @@ pub async fn autocomplete(
     Ok(Json(serde_json::json!({ "suggestions": suggestions })).into_response())
 }
 
-/// The OWL 2 EL class hierarchy of the asserted ontology.
+/// The OWL 2 DL class hierarchy of the asserted ontology.
 pub async fn classification_get(
     authenticated: crate::auth::Authenticated,
     Repository(state): Repository,
@@ -335,6 +359,16 @@ pub async fn classification_get(
 ) -> Result<Response, ApiError> {
     let scope = guard::enforce_whole_read(&state, &authenticated).await?;
     super::classification::classify(state, &headers, scope).await
+}
+
+/// The named individuals' types under the asserted ontology (OWL 2 DL).
+pub async fn realisation_get(
+    authenticated: crate::auth::Authenticated,
+    Repository(state): Repository,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    let scope = guard::enforce_whole_read(&state, &authenticated).await?;
+    super::classification::realise(state, &headers, scope).await
 }
 
 /// Validates the data against the repository's shapes graph.

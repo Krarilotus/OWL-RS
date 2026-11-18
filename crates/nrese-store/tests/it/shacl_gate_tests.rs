@@ -6,18 +6,22 @@ use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_store::{
-    BulkLoadRequest, DEFAULT_SHAPES_GRAPH, GateSeverity, GraphTarget, MutationCommand,
-    MutationError, MutationPipeline, MutationTicket, ShaclGate, SparqlUpdateRequest, StoreConfig,
+    BulkLoadRequest, CancellationToken, DEFAULT_SHAPES_GRAPH, GateSeverity, GraphTarget,
+    MutationCommand, MutationError, MutationPipeline, MutationTicket, QueryEvaluationError,
+    ReadScope, ShaclGate, ShaclValidationRequest, SparqlUpdateRequest, StoreConfig, StoreError,
     StoreService,
 };
 
 const PREFIXES: &str = "PREFIX ex: <http://example.com/> PREFIX sh: <http://www.w3.org/ns/shacl#> ";
 
 fn pipeline(gate: ShaclGate) -> MutationPipeline {
-    let config = StoreConfig {
+    pipeline_with(StoreConfig {
         shacl_gate: gate,
         ..StoreConfig::in_memory()
-    };
+    })
+}
+
+fn pipeline_with(config: StoreConfig) -> MutationPipeline {
     MutationPipeline::new(
         Arc::new(StoreService::new(config).expect("store")),
         Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
@@ -112,7 +116,7 @@ fn data_that_was_invalid_before_does_not_block_other_commits() {
             files: vec![file.path().to_path_buf()],
             replace: false,
             graph: GraphTarget::DefaultGraph,
-            skip_errors: false,
+            invalid: Some(nrese_store::InvalidStatements::Strict),
         })
         .expect("load");
     update(
@@ -179,4 +183,131 @@ fn shapes_that_existing_data_violates_are_rejected() {
         ),
     );
     assert!(matches!(rejected, Err(MutationError::Rejected(_))));
+}
+
+/// RSH-07: the gate validates on the write's resources, its SHACL-SPARQL queries included. A
+/// query past the write's memory (the server's query memory, 64 KiB here: forty subjects of
+/// ex:p make a 64,000-row product) stops the validation, and the write fails with that
+/// memory error, under a gate that only reports too: a stopped validation is no verdict to
+/// commit past. Nothing is committed.
+#[test]
+fn a_validation_past_the_writes_memory_fails_the_write_under_any_gate() {
+    let pipeline = pipeline_with(StoreConfig {
+        shacl_gate: ShaclGate::Report,
+        total_query_memory_bytes: 64 * 1024,
+        ..StoreConfig::in_memory()
+    });
+    let wide = "SELECT $this ?value ?b ?c WHERE { ?value <http://example.com/p> ?x .
+        ?b <http://example.com/p> ?y . ?c <http://example.com/p> ?z }";
+    update(
+        &pipeline,
+        &format!(
+            "INSERT DATA {{ GRAPH <{DEFAULT_SHAPES_GRAPH}> {{
+                ex:Wide a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:select '''{wide}''' ] .
+            }} }}"
+        ),
+    )
+    .expect("without data the query is empty");
+    let data: String = (0..40).map(|i| format!("ex:s{i} ex:p ex:o . ")).collect();
+    let refused = update(&pipeline, &format!("INSERT DATA {{ {data} }}"));
+    assert!(
+        matches!(&refused, Err(MutationError::Store { source, .. }) if source.is_memory_limit()),
+        "{refused:?}"
+    );
+    assert!(!holds(&pipeline, "ex:s0 ex:p ex:o"));
+}
+
+/// Loads `ntriples` into the shapes graph without passing the gate (a bulk load doesn't).
+fn load_shapes(pipeline: &MutationPipeline, ntriples: &str) {
+    let mut file = tempfile::Builder::new()
+        .suffix(".nt")
+        .tempfile()
+        .expect("file");
+    writeln!(file, "{ntriples}").expect("write");
+    pipeline
+        .store()
+        .bulk_load(&BulkLoadRequest {
+            files: vec![file.path().to_path_buf()],
+            replace: false,
+            graph: GraphTarget::NamedGraph(DEFAULT_SHAPES_GRAPH.to_owned()),
+            invalid: Some(nrese_store::InvalidStatements::Strict),
+        })
+        .expect("load");
+}
+
+/// SHACL §1.5: a shapes graph with `sh:entailment E` the processor doesn't support makes
+/// every validation fail, a shapes graph with nothing else included: the
+/// enforcing gate rejects a write, though no shape constrains anything.
+#[test]
+fn a_shapes_graph_asking_for_an_unsupported_entailment_fails_the_gate() {
+    let pipeline = pipeline(ShaclGate::Enforce(GateSeverity::Violation));
+    load_shapes(
+        &pipeline,
+        "<http://example.com/S> <http://www.w3.org/ns/shacl#entailment> <http://www.w3.org/ns/entailment/RDFS> .",
+    );
+    let rejected = update(&pipeline, "INSERT DATA { ex:a ex:name \"A\" }");
+    assert!(
+        matches!(rejected, Err(MutationError::Rejected(_))),
+        "{rejected:?}"
+    );
+    assert!(!holds(&pipeline, "ex:a ex:name \"A\""));
+}
+
+/// On the gate's side: a shapes graph that asks for an unsupported
+/// entailment, and holds nothing else, can be removed under the enforcing gate: the commit
+/// that clears it leaves no failure, and the state before's failures aren't the commit's.
+#[test]
+fn a_shapes_graph_asking_for_an_unsupported_entailment_can_be_removed() {
+    let pipeline = pipeline(ShaclGate::Enforce(GateSeverity::Violation));
+    load_shapes(
+        &pipeline,
+        "<http://example.com/S> <http://www.w3.org/ns/shacl#entailment> <http://www.w3.org/ns/entailment/RDFS> .",
+    );
+    update(&pipeline, &format!("CLEAR GRAPH <{DEFAULT_SHAPES_GRAPH}>"))
+        .expect("clearing the shapes graph is accepted");
+    update(&pipeline, "INSERT DATA { ex:a ex:name \"A\" }").expect("then writes are accepted");
+}
+
+/// Through the gate: a constraint whose query computes its result's path
+/// (`urn:computed-path`, which no statement uses) has that result before and after a write
+/// that stores the very IRI as an unrelated statement's predicate. The write introduces no
+/// result, so the enforcing gate accepts it.
+#[test]
+fn a_write_that_stores_a_term_a_constraint_computed_is_accepted() {
+    let pipeline = pipeline(ShaclGate::Enforce(GateSeverity::Violation));
+    load_shapes(
+        &pipeline,
+        r#"<http://example.com/S> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://www.w3.org/ns/shacl#NodeShape> .
+<http://example.com/S> <http://www.w3.org/ns/shacl#targetNode> <http://example.com/a> .
+<http://example.com/S> <http://www.w3.org/ns/shacl#sparql> _:q .
+_:q <http://www.w3.org/ns/shacl#select> "SELECT $this (IRI(CONCAT(\"urn:computed-\", \"path\")) AS ?path) WHERE { }" ."#,
+    );
+    update(&pipeline, "INSERT DATA { ex:z <urn:computed-path> ex:w }")
+        .expect("a write that introduces no result is accepted");
+    assert!(holds(&pipeline, "ex:z <urn:computed-path> ex:w"));
+}
+
+/// SS-22: a validation request runs on its caller's cancellation (the server cancels it at
+/// its deadline and when the client is gone): cancelled, it stops with that, not a report.
+#[test]
+fn a_cancelled_validation_request_stops() {
+    let pipeline = pipeline(ShaclGate::Off);
+    add_shapes(&pipeline);
+    update(&pipeline, "INSERT DATA { ex:a a ex:Person }").expect("no gate");
+    let cancellation = CancellationToken::new();
+    cancellation.cancel();
+    let outcome = pipeline.store().validate_shacl(
+        &ReadScope::All,
+        &ShaclValidationRequest::default(),
+        &cancellation,
+    );
+    assert!(
+        matches!(
+            outcome,
+            Err(StoreError::SparqlEvaluation(
+                QueryEvaluationError::Cancelled
+            ))
+        ),
+        "{outcome:?}"
+    );
 }

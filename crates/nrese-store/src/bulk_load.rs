@@ -11,10 +11,13 @@
 //! - **Gates.** A bulk load is an operator action on an offline or otherwise idle store. It
 //!   doesn't run the validation gates; SHACL and reasoning validate the result when they
 //!   next run in full (M2, M3).
-//! - **Bad statements.** A syntax error stops the load, unless `skip_errors`: then the
-//!   statement is skipped (a line of N-Triples or N-Quads, a statement of Turtle or TriG up
-//!   to its `.`), logged (the first [`LOGGED_ERRORS`]) and counted, and the load goes on.
-//!   Other formats still stop; a read error always does.
+//! - **Bad statements** ([`InvalidStatements`]). By default a statement with a syntax error
+//!   goes into the repository's quarantine ([`crate::quarantine`]) and the load goes on: a
+//!   line of N-Triples or N-Quads, a statement of Turtle or TriG up to its `.`, the rest of
+//!   an RDF/XML node element below `rdf:RDF`, a top-level node object of JSON-LD. An error
+//!   after which the parser reads no further stops the load, nothing committed: malformed
+//!   XML or JSON, any error in N3 or Binary RDF, a file that ends inside a statement (it may
+//!   be cut off), and a read error. Strict, the first error stops the load.
 
 use std::fs::File;
 use std::io::BufReader;
@@ -29,6 +32,7 @@ use rayon::prelude::*;
 
 use crate::error::{StoreError, StoreResult};
 use crate::graph_store::GraphTarget;
+use crate::quarantine::{Collector, InvalidStatements, LoadFile, Quarantine, QuarantinedStatement};
 use crate::rdf_io::file_base_iri;
 
 /// Quads per interning batch: large enough to amortise the dictionary lock, small enough
@@ -38,8 +42,6 @@ const BATCH: usize = 32 * 1024;
 /// about 256 thousand quads. Each release takes well under a millisecond; at one per two
 /// million quads per thread, freed memory reached 3 GB at the end of DBpedia's parse.
 const BATCHES_PER_RELEASE: u64 = 8;
-/// Skipped statements logged one by one (the rest are only counted).
-const LOGGED_ERRORS: u64 = 20;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BulkLoadRequest {
@@ -49,11 +51,12 @@ pub struct BulkLoadRequest {
     pub replace: bool,
     /// Graph for triple formats (N-Triples, Turtle, RDF/XML); quad formats keep their own.
     pub graph: GraphTarget,
-    /// Skip statements with syntax errors (logged and counted) instead of stopping.
-    pub skip_errors: bool,
+    /// What a statement with a syntax error does; `None`: the store's setting
+    /// (`store.invalid_statements`, quarantine by default).
+    pub invalid: Option<InvalidStatements>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BulkLoadReport {
     pub revision: u64,
     /// Quads parsed, including duplicates.
@@ -61,29 +64,32 @@ pub struct BulkLoadReport {
     /// Asserted quads added and removed.
     pub inserted: u64,
     pub deleted: u64,
-    /// Statements skipped for syntax errors (`skip_errors`).
-    pub skipped: u64,
+    /// Statements quarantined for syntax errors ([`crate::quarantine`]).
+    pub quarantined: u64,
+    /// The load's id in the quarantine, if it quarantined any.
+    pub load: Option<String>,
+    /// The first of them in the files' order (at most [`crate::quarantine::EXAMPLES`]).
+    pub examples: Vec<QuarantinedStatement>,
     pub elapsed: Duration,
 }
 
-/// What `skip_errors` makes of syntax errors: `None` to stop with one.
-struct Skipping {
-    skipped: AtomicU64,
+/// Where a syntax error goes: `None` to stop with it.
+#[derive(Clone, Copy)]
+struct Skipping<'c, 'q> {
+    collector: &'c Collector<'q>,
+    /// The file's place in the load.
+    file: usize,
 }
 
-impl Skipping {
-    /// `Ok` (counted and maybe logged) for a syntax error to skip, the error otherwise.
-    fn skip(&self, path: &Path, error: RdfParseError) -> StoreResult<()> {
-        let RdfParseError::Syntax(syntax) = error else {
-            return Err(error.into());
-        };
-        let n = self.skipped.fetch_add(1, Ordering::Relaxed);
-        if n < LOGGED_ERRORS {
-            tracing::warn!(file = %path.display(), error = %syntax, "skipped a statement");
-        } else if n == LOGGED_ERRORS {
-            tracing::warn!(file = %path.display(), "more statements skipped; only counted from here");
+impl Skipping<'_, '_> {
+    /// `Ok` (quarantined) for a syntax error the parser reads on after, the error otherwise:
+    /// skipping one that ends its document would load its first part as the whole.
+    fn skip(&self, error: RdfParseError) -> StoreResult<()> {
+        match error {
+            error if error.ends_document() => Err(error.into()),
+            RdfParseError::Syntax(syntax) => self.collector.add(self.file, &syntax),
+            error => Err(error.into()),
         }
-        Ok(())
     }
 }
 
@@ -125,6 +131,11 @@ pub(crate) fn bulk_load(
     engine: &Engine,
     request: &BulkLoadRequest,
     progress: &LoadProgress,
+    invalid: InvalidStatements,
+    quarantine: &Quarantine,
+    // Clears the reasoning certificate under the load's writer slot as it publishes: a load
+    // doesn't maintain the inferences.
+    invalidate: &dyn Fn(nrese_engine::WriterHeld<'_>) -> StoreResult<()>,
 ) -> StoreResult<BulkLoadReport> {
     let started = Instant::now();
     let sources = request
@@ -138,20 +149,42 @@ pub(crate) fn bulk_load(
         false => BulkMode::Append,
     };
     let load = engine.bulk_load(mode);
+    #[cfg(test)]
+    crate::service::hooks::run(&crate::service::hooks::BEFORE_LOAD_READS);
     let blank_nodes = BlankNodeScope::new(engine.snapshot().revision());
-    let skipping = request.skip_errors.then(|| Skipping {
-        skipped: AtomicU64::new(0),
-    });
+    let collector = match invalid {
+        InvalidStatements::Strict => None,
+        InvalidStatements::Quarantine => Some(
+            quarantine.begin(
+                sources
+                    .iter()
+                    .map(|source| LoadFile {
+                        path: source.path.to_path_buf(),
+                        format: source.format,
+                        base: file_base_iri(source.path).ok(),
+                    })
+                    .collect(),
+                &graph,
+                blank_nodes.prefix.clone(),
+            ),
+        ),
+    };
     let mut parsed = 0;
+    // Chunks are numbered in input order over all files, from 1 (the engine's own `add`
+    // numbers chunk 0): new terms take their ids in the order they first occur.
+    let mut next_chunk = 1;
     progress
         .files
         .store(sources.len() as u64, Ordering::Relaxed);
-    for source in &sources {
-        // Dropping the load unfinished aborts it: nothing is committed.
+    for (file, source) in sources.iter().enumerate() {
+        // Dropping the load unfinished aborts it: nothing is committed (nor quarantined).
         if progress.is_cancelled() {
             return Err(StoreError::LoadCancelled);
         }
-        let quads = source.load_into(&load, &graph, &blank_nodes, skipping.as_ref())?;
+        let skipping = collector
+            .as_ref()
+            .map(|collector| Skipping { collector, file });
+        let quads = source.load_into(&load, &mut next_chunk, &graph, &blank_nodes, skipping)?;
         parsed += quads;
         progress.parsed.fetch_add(quads, Ordering::Relaxed);
         progress.files_done.fetch_add(1, Ordering::Relaxed);
@@ -159,15 +192,43 @@ pub(crate) fn bulk_load(
     if progress.is_cancelled() {
         return Err(StoreError::LoadCancelled);
     }
-    let summary = load.finish();
+    // The certificate goes as part of the publication, never at the load's start: a load
+    // that stops or adds nothing keeps it. First the certificate, then the data: its marker's
+    // removal is synced before the checkpoint is written, and the marker holds no revision.
+    // A crash or a reader in between finds the old data without a certificate; never one
+    // over data it wasn't computed for. A checkpoint that then fails leaves the old data
+    // without one: the safe side (reasoning has to run again, and the store says so).
+    let summary = load.finish_with(|writer| {
+        invalidate(writer).map_err(|error| match error {
+            StoreError::Io(error) => nrese_engine::EngineError::Io(error),
+            error => nrese_engine::EngineError::Io(std::io::Error::other(error.to_string())),
+        })?;
+        #[cfg(test)]
+        crate::service::hooks::run(&crate::service::hooks::AFTER_INVALIDATION);
+        Ok(())
+    });
     memory::release_all();
     let summary = summary?;
+    // Committed: so is its quarantine.
+    let quarantined = collector
+        .map(Collector::commit)
+        .transpose()?
+        .unwrap_or_default();
+    if quarantined.count > 0 {
+        tracing::warn!(
+            count = quarantined.count,
+            load = quarantined.load.as_deref().unwrap_or_default(),
+            "the load quarantined statements it couldn't read"
+        );
+    }
     Ok(BulkLoadReport {
         revision: summary.revision,
         parsed,
         inserted: summary.inserted,
         deleted: summary.deleted,
-        skipped: skipping.map_or(0, |s| s.skipped.into_inner()),
+        quarantined: quarantined.count,
+        load: quarantined.load,
+        examples: quarantined.examples,
         elapsed: started.elapsed(),
     })
 }
@@ -192,23 +253,28 @@ impl<'a> Source<'a> {
         Ok(Self { path, format })
     }
 
-    /// Parses the file into `load`; returns the number of quads parsed.
+    /// Parses the file into `load`, its chunks numbered from `next_chunk` on (which moves
+    /// past them); returns the number of quads parsed.
     fn load_into(
         &self,
         load: &BulkLoad<'_>,
+        next_chunk: &mut u32,
         graph: &GraphName,
         blank_nodes: &BlankNodeScope,
-        skipping: Option<&Skipping>,
+        skipping: Option<Skipping<'_, '_>>,
     ) -> StoreResult<u64> {
-        let threads = rayon::current_num_threads();
         let recovering = |parser: RdfParser| match skipping {
             Some(_) => parser.recovering(),
             None => parser,
         };
         match self.format {
             // Split exactly (Turtle and TriG at statement ends, by a skim of the file) and
-            // parsed on every thread.
+            // parsed on its lanes, a thread each.
             RdfFormat::NTriples | RdfFormat::NQuads | RdfFormat::Turtle | RdfFormat::TriG => {
+                let parts = lanes(
+                    std::fs::metadata(self.path)?.len(),
+                    rayon::current_num_threads(),
+                );
                 let parser = RdfParser::from_format(self.format)
                     .with_base_iri(file_base_iri(self.path)?)
                     .map_err(|error| StoreError::Configuration(error.to_string()))?;
@@ -217,10 +283,16 @@ impl<'a> Source<'a> {
                     false => parser.with_default_graph(graph.clone()),
                 };
                 let chunks =
-                    recovering(parser).split_file_for_parallel_parsing(self.path, threads)?;
+                    recovering(parser).split_file_for_parallel_parsing(self.path, parts)?;
+                let first = *next_chunk;
+                *next_chunk += u32::try_from(chunks.len()).expect("fewer than 2^32 chunks");
                 chunks
                     .into_par_iter()
-                    .map(|chunk| feed(load, chunk, blank_nodes, skipping, self.path))
+                    .enumerate()
+                    .map(|(i, chunk)| {
+                        let chunk_number = first + i as u32;
+                        feed(load, chunk_number, chunk, blank_nodes, skipping)
+                    })
                     .sum()
             }
             format => {
@@ -232,15 +304,18 @@ impl<'a> Source<'a> {
                     false => parser.with_default_graph(graph.clone()),
                 };
                 let quads = recovering(parser).for_reader(BufReader::new(File::open(self.path)?));
-                // Parse here, intern on the pool.
+                // Parse here, intern on the pool; one chunk, its batches in order.
+                let chunk = *next_chunk;
+                *next_chunk += 1;
                 rayon::scope(|scope| {
                     let mut batch = Vec::with_capacity(BATCH);
                     let mut parsed = 0;
+                    let mut number = 0;
                     for quad in quads {
                         let quad = match (quad, skipping) {
                             (Ok(quad), _) => quad,
                             (Err(error), Some(skipping)) => {
-                                skipping.skip(self.path, error)?;
+                                skipping.skip(error)?;
                                 continue;
                             }
                             (Err(error), None) => return Err(error.into()),
@@ -249,11 +324,13 @@ impl<'a> Source<'a> {
                         if batch.len() == BATCH {
                             parsed += batch.len() as u64;
                             let full = std::mem::replace(&mut batch, Vec::with_capacity(BATCH));
-                            scope.spawn(move |_| load.add(&full));
+                            let at = number;
+                            number += 1;
+                            scope.spawn(move |_| load.add_at(chunk, at, &full));
                         }
                     }
                     parsed += batch.len() as u64;
-                    load.add(&batch);
+                    load.add_at(chunk, number, &batch);
                     Ok(parsed)
                 })
             }
@@ -268,29 +345,31 @@ impl<'a> Source<'a> {
     }
 }
 
-/// Parses `quads` (of the file `path`) in batches into `load` on the current thread;
-/// returns the count.
+/// Parses `quads` (a file's chunk `chunk`) in batches into `load` on the current thread,
+/// the batches numbered in order; returns the count.
 fn feed(
     load: &BulkLoad<'_>,
+    chunk: u32,
     quads: impl Iterator<Item = Result<Quad, RdfParseError>>,
     blank_nodes: &BlankNodeScope,
-    skipping: Option<&Skipping>,
-    path: &Path,
+    skipping: Option<Skipping<'_, '_>>,
 ) -> StoreResult<u64> {
     let mut batch = Vec::with_capacity(BATCH);
     let mut parsed = 0;
+    let mut number = 0;
     for quad in quads {
         let quad = match (quad, skipping) {
             (Ok(quad), _) => quad,
             (Err(error), Some(skipping)) => {
-                skipping.skip(path, error)?;
+                skipping.skip(error)?;
                 continue;
             }
             (Err(error), None) => return Err(error.into()),
         };
         batch.push(blank_nodes.scope(quad));
         if batch.len() == BATCH {
-            load.add(&batch);
+            load.add_at(chunk, number, &batch);
+            number += 1;
             parsed += batch.len() as u64;
             batch.clear();
             if (parsed / BATCH as u64).is_multiple_of(BATCHES_PER_RELEASE) {
@@ -298,8 +377,35 @@ fn feed(
             }
         }
     }
-    load.add(&batch);
+    load.add_at(chunk, number, &batch);
     Ok(parsed + batch.len() as u64)
+}
+
+/// The lanes a file is parsed and interned on at least, pool permitting (D16-468). Each lane
+/// is a thread heap, and the load's peak grows with the lanes: from 8 to 16 it grew by 19 to
+/// 27 MiB a lane on average (16 threads, two hosts; loads of 113, 330 and 338 MB). Our
+/// reading, not shown, is that with transparent huge pages each heap keeps its partly used
+/// huge pages until the load ends. Fewer lanes cost time instead: at 6 the 338 MB load
+/// (1.78 M triples: `benches/oxigraph-comparison/results/2026-10-01-step-5-end-to-end.md`)
+/// took 0.370 s against 0.345 on 16 lanes, and at 4 the 113 MB one (1.2 M quads) 0.300
+/// against 0.240; at 8 the first was faster than on 16 (0.320 s) and the second within 2 %
+/// (0.245 s), and the peaks of the measured loads were 28 to 45 % lower than on 16.
+const MIN_LANES: usize = 8;
+
+/// The input a lane takes past [`MIN_LANES`] before another is added. A lane added 19 to
+/// 27 MiB to the peak on average (above); what it saves in time was mixed at about 40 MiB a
+/// lane: 16 lanes instead of 8 were 9 % faster on one 330 MB load and 8 % slower on a 338 MB
+/// one. 64 MiB is a step past that, so a lane is added only where it parses more than was
+/// measured; between 338 MB and 1.1 GB the rule is not measured, and from 1.1 GB up a
+/// 16-thread pool keeps its 16.
+const BYTES_PER_LANE: u64 = 64 << 20;
+
+/// The lanes a file of `bytes` is parsed and interned on, with `threads` in the pool: a
+/// chunk of the file and a thread each. [`MIN_LANES`] up to `MIN_LANES` × [`BYTES_PER_LANE`]
+/// (512 MiB), then a lane per `BYTES_PER_LANE`, never more than the pool's threads.
+fn lanes(bytes: u64, threads: usize) -> usize {
+    let by_size = usize::try_from(bytes.div_ceil(BYTES_PER_LANE)).unwrap_or(usize::MAX);
+    threads.min(by_size.max(MIN_LANES))
 }
 
 /// Makes blank-node labels unique to one load by prefixing them. Deterministic per label,
@@ -343,13 +449,15 @@ impl BlankNodeScope {
         }
     }
 
+    /// `quad` in this load's blank-node scope, in the graph the store keeps it in
+    /// ([`crate::rdf_io::stored`]).
     fn scope(&self, quad: Quad) -> Quad {
         let Quad {
             subject,
             predicate,
             object,
             graph_name,
-        } = quad;
+        } = crate::rdf_io::stored(quad);
         Quad {
             subject: match subject {
                 NamedOrBlankNode::BlankNode(node) => self.node(&node).into(),
@@ -362,5 +470,39 @@ impl BlankNodeScope {
                 other => other,
             },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lanes;
+
+    const MIB: u64 = 1 << 20;
+
+    /// A file of up to 512 MiB is parsed on 8 lanes however many threads the pool has
+    /// beyond them: each lane's thread heap holds memory until the load ends (D16-468).
+    #[test]
+    fn a_file_up_to_512_mib_is_parsed_on_eight_lanes() {
+        for bytes in [0, 1, 113_565_549, 337_695_911, 512 * MIB] {
+            assert_eq!(lanes(bytes, 16), 8, "{bytes} bytes, 16 threads");
+            assert_eq!(lanes(bytes, 32), 8, "{bytes} bytes, 32 threads");
+        }
+    }
+
+    /// Past 512 MiB a lane is added for every further 64 MiB, up to the pool's threads.
+    #[test]
+    fn a_larger_file_takes_a_lane_per_64_mib_up_to_the_threads() {
+        assert_eq!(lanes(512 * MIB + 1, 32), 9);
+        assert_eq!(lanes(1_110_583_574, 32), 17);
+        assert_eq!(lanes(1_110_583_574, 16), 16);
+        assert_eq!(lanes(4096 * MIB, 32), 32);
+    }
+
+    /// A pool of fewer threads than 8 parses on all of them.
+    #[test]
+    fn a_small_pool_parses_on_every_thread() {
+        assert_eq!(lanes(113_565_549, 1), 1);
+        assert_eq!(lanes(113_565_549, 4), 4);
+        assert_eq!(lanes(1_110_583_574, 4), 4);
     }
 }

@@ -12,7 +12,10 @@ use super::env_names as names;
 use super::env_values::{parse_bool, parse_bytes, parse_millis, parse_u64, parse_usize};
 use super::source::ConfigSource;
 
-pub(super) fn parse_policy_config(source: &dyn ConfigSource) -> Result<PolicyConfig> {
+pub(super) fn parse_policy_config(
+    source: &dyn ConfigSource,
+    machine: nrese_exec::memory::Reading,
+) -> Result<PolicyConfig> {
     Ok(PolicyConfig {
         auth: parse_auth_config(source)?,
         limits: RequestLimits {
@@ -21,11 +24,13 @@ pub(super) fn parse_policy_config(source: &dyn ConfigSource) -> Result<PolicyCon
                 names::MAX_QUERY_BYTES,
                 crate::policy::DEFAULT_MAX_QUERY_BYTES,
             )?,
-            max_query_memory_bytes: parse_bytes(
-                source,
-                names::MAX_QUERY_MEMORY_BYTES,
-                DEFAULT_QUERY_MEMORY_BYTES,
-            )?,
+            max_query_memory_bytes: match source.get(names::MAX_QUERY_MEMORY_BYTES) {
+                Some(text) => {
+                    super::units::parse_memory_limit(&text, machine, names::MAX_QUERY_MEMORY_BYTES)?
+                        as usize
+                }
+                None => DEFAULT_QUERY_MEMORY_BYTES,
+            },
             max_update_bytes: parse_bytes(
                 source,
                 names::MAX_UPDATE_BYTES,
@@ -107,7 +112,7 @@ mod tests {
         let mut source = KeyValueSource::default();
         source.insert("NRESE_SPARQL_PARSE_ERROR_PROFILE", "plain-text");
 
-        let policy = parse_policy_config(&source).expect("policy");
+        let policy = parse_policy_config(&source, Ok(16 << 30)).expect("policy");
 
         assert_eq!(
             policy.sparql_parse_error_profile,

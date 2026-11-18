@@ -3,6 +3,7 @@
 //! the results, and kept by an on-disk store across a reopen (the dictionary keys a triple
 //! term by its components' ids, which the log replays in order).
 
+use crate::support::Writes;
 use std::fs;
 use std::path::Path;
 
@@ -48,7 +49,7 @@ fn load(service: &StoreService, dir: &Path) {
             files: vec![path],
             replace: false,
             graph: GraphTarget::DefaultGraph,
-            skip_errors: false,
+            invalid: Some(nrese_store::InvalidStatements::Strict),
         })
         .expect("load");
 }

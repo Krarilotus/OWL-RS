@@ -1,0 +1,37 @@
+//! NRESE's OWL 2 DL engines (docs/design/owl2-dl.md), over the DL-clauses `nrese-owl`
+//! normalises an ontology into, with their provenance:
+//!
+//! - [`context`]: the context-saturation core (§5), Horn stage first (package 3.1);
+//! - [`tableau`]: the hypertableau, the completeness anchor (§6, package 3.3);
+//! - [`bounds`]: the upper bound U1 compiled from the clauses (§8, package 3.2);
+//! - [`datatypes`]: the datatype theory the hypertableau calls (package 3.5);
+//! - [`classify`]: classification and realisation over the engines (§7, package 3.4);
+//! - [`islands`]: the ABox split into islands the hypertableau decides apart;
+//! - [`numbers`]: sizes of counted classes compared before any search;
+//! - [`certificate`]: models of "consistent" answers checked against the ontology by the
+//!   direct semantics, independently of the engines;
+//! - [`scope`]: the answers and certificates of the small-scope check (§11);
+//! - [`memory`]: what the engines and compiling hold, drawn from a request's envelope;
+//! - [`limits`]: the budgets, each a caller's setting, none built in;
+//! - [`beyond`]: inputs outside OWL 2 DL, decided where that is sound (§16);
+//! - [`verdict`]: consistent, inconsistent or not decided, as every engine reports it.
+//!
+//! Each module is its own package with its own gates (owl2-dl-performance.md §6).
+
+mod cancel;
+pub use cancel::Cancel;
+
+pub mod beyond;
+pub mod bounds;
+pub mod certificate;
+pub mod classify;
+pub mod context;
+pub mod datatypes;
+pub mod internal;
+pub mod islands;
+pub mod limits;
+pub mod memory;
+pub mod numbers;
+pub mod scope;
+pub mod tableau;
+pub mod verdict;

@@ -1,0 +1,660 @@
+//! The hypertableau against the semantics, on many fuzzed ontologies (`nrese_owl::fuzz`,
+//! without data): the gate of soundness first (docs/design/owl2-dl.md §11).
+//!
+//! - **Consistent** answers come with the model the graph stands for, folded at the
+//!   blocks; it is closed under the role inclusions and checked against every axiom. A
+//!   folded model can fail where number restrictions meet pairwise blocking (the
+//!   calculus's model is then the unravelling); such answers are confirmed by a search
+//!   for a small model instead, and the rest are counted as unconfirmed.
+//! - **Inconsistent** answers are checked by a search for a model with up to three
+//!   elements (exhaustive where small, sampled otherwise): finding one is a wrong answer.
+//! - **Metamorphic:** the answer is the same with each optimisation off, under renaming
+//!   and with the axioms shuffled.
+//!
+//! `NRESE_FUZZ_CASES` and `NRESE_FUZZ_SEED` widen or move a campaign;
+//! `NRESE_FUZZ_MAX_MEMORY_MB` is each run's memory budget (MiB or `unlimited`).
+
+mod ni_gen;
+mod semantics;
+
+use std::collections::HashMap;
+
+use nrese_dl::certificate::{self, Certificate};
+use nrese_dl::tableau::{Answer, Config, consistency};
+use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
+use nrese_owl::{Ontology, Term};
+use semantics::{Interp, find_model};
+
+fn env(name: &str) -> Option<u64> {
+    std::env::var(name).ok().and_then(|v| v.parse().ok())
+}
+
+/// The memory one run may hold, in bytes: `NRESE_FUZZ_MAX_MEMORY_MB` (MiB, or `unlimited`;
+/// default 1024). A case past it gives up and is counted so, rather than the host killing
+/// the campaign (seed 600026: one case held about 6 GB unbounded, the answers right).
+fn max_memory() -> Option<usize> {
+    match std::env::var("NRESE_FUZZ_MAX_MEMORY_MB").ok().as_deref() {
+        Some("unlimited") => None,
+        Some(mb) => Some(
+            mb.parse::<usize>()
+                .expect("NRESE_FUZZ_MAX_MEMORY_MB: MiB or unlimited")
+                << 20,
+        ),
+        None => Some(1024 << 20),
+    }
+}
+
+fn configs() -> Vec<(&'static str, Config)> {
+    // Every blocking pass is checked against a recomputation from scratch.
+    let base = Config {
+        max_nodes: Some(5_000),
+        max_branch_points: Some(5_000),
+        timeout: Some(std::time::Duration::from_secs(300)),
+        max_memory: max_memory(),
+        check_blocking: true,
+        ..Config::default()
+    };
+    vec![
+        ("default", base.clone()),
+        (
+            "full-blocking-passes",
+            Config {
+                incremental_blocking: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "no-semantic-branching",
+            Config {
+                semantic_branching: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "no-backjumping",
+            Config {
+                backjumping: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "ancestor-blocking",
+            Config {
+                anywhere_blocking: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "pairwise-always",
+            Config {
+                single_blocking: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "no-disjunct-learning",
+            Config {
+                disjunct_learning: false,
+                ..base.clone()
+            },
+        ),
+        (
+            "dynamic-backtracking",
+            Config {
+                dynamic_backtracking: true,
+                check_retraction: true,
+                ..base.clone()
+            },
+        ),
+        (
+            "at-most-atoms",
+            Config {
+                expand_at_most_up_to: 0,
+                ..base
+            },
+        ),
+    ]
+}
+
+#[derive(Default, Debug)]
+struct Tally {
+    consistent: u64,
+    confirmed_by_model: u64,
+    confirmed_by_search: u64,
+    unconfirmed: u64,
+    inconsistent: u64,
+    unsupported: u64,
+    gave_up: u64,
+    /// Applications of the NI rule in the default runs.
+    ni_firings: u64,
+}
+
+fn render(o: &Ontology) -> String {
+    let name = |t: Term| format!("t{t}");
+    o.axioms
+        .iter()
+        .map(|a| o.functional(a, &name))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Delta debugging: drops axioms while the default run still gives up (a blow-up's
+/// minimal witness).
+fn shrink(o: &Ontology) {
+    let config = Config {
+        max_nodes: Some(3000),
+        max_branch_points: Some(5_000),
+        timeout: Some(std::time::Duration::from_secs(300)),
+        ..Config::default()
+    };
+    let stuck = |o: &Ontology| matches!(consistency(o, &config).answer, Answer::GaveUp(_));
+    let mut cur = o.clone();
+    let mut i = 0;
+    while i < cur.axioms.len() {
+        let mut next = cur.clone();
+        next.axioms.remove(i);
+        next.sources.remove(i);
+        if stuck(&next) {
+            cur = next;
+        } else {
+            i += 1;
+        }
+    }
+    eprintln!(
+        "minimal:
+{}",
+        render(&cur)
+    );
+    let out = consistency(&cur, &config);
+    eprintln!("{:?} {}", out.answer, out.telemetry);
+}
+
+/// Every configuration's answer on `o` against the semantics and against each other;
+/// renaming and shuffling (`shuffled`) keep the answer.
+/// Whether `o` counts: a number restriction, or a functional or inverse-functional
+/// property (an at-most-one). A folded model may break those (two predecessors merged by
+/// blocking), and the small-model search is then the only confirmation.
+fn counts(o: &Ontology) -> bool {
+    use nrese_owl::{Axiom, Characteristic, ClassExpr};
+    o.axioms.iter().any(|a| {
+        matches!(
+            a,
+            Axiom::ObjectCharacteristic(Characteristic::Functional, _)
+                | Axiom::ObjectCharacteristic(Characteristic::InverseFunctional, _)
+        )
+    }) || (0..o.classes.len()).any(|i| {
+        matches!(
+            o.classes.get(i as u32),
+            ClassExpr::Max(..) | ClassExpr::Exact(..)
+        ) || matches!(o.classes.get(i as u32), ClassExpr::Min(n, ..) if *n > 1)
+    })
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the campaign's state, threaded through"
+)]
+fn check_case(
+    case: u64,
+    o: &Ontology,
+    shuffled: Ontology,
+    sig: &Signature,
+    numbers: bool,
+    tally: &mut Tally,
+    check: &mut Rng,
+    unconfirmed: &mut Vec<String>,
+) {
+    let all = configs();
+    let mut first: Option<Answer> = None;
+    // The search for a small model, once per ontology (the configurations agree).
+    let mut searched: Option<Option<Interp>> = None;
+    // A case past the default's budget: the others run on a small one, checked where they
+    // decide all the same (the default seed's case 14 spent 100 of the campaign's 130 s
+    // giving up nine times).
+    let mut beyond = false;
+    for (name, config) in &all {
+        let mut config = Config {
+            keep_model: true,
+            ..config.clone()
+        };
+        if beyond {
+            config.max_nodes = Some(config.max_nodes.map_or(1_000, |n| n.min(1_000)));
+            config.max_branch_points = Some(1_000);
+        }
+        let out = consistency(o, &config);
+        if *name == "default" {
+            beyond = matches!(out.answer, Answer::GaveUp(_));
+        }
+        if *name == "default" {
+            tally.ni_firings += out.telemetry.ni_applications;
+        }
+        if env("NRESE_FUZZ_ONLY").is_some() {
+            eprintln!("{name}: {:?} {}", out.answer, out.telemetry);
+        }
+        if let Some(f) = &first {
+            // Gave-up runs may differ by budget; answers may not.
+            let decided = |a: &Answer| matches!(a, Answer::Consistent | Answer::Inconsistent);
+            if decided(f) && decided(&out.answer) {
+                assert_eq!(
+                    f,
+                    &out.answer,
+                    "case {case}: {name} changes the answer\n{}",
+                    render(o)
+                );
+            }
+        } else {
+            first = Some(out.answer.clone());
+        }
+        // Every configuration's answer is checked against the semantics.
+        match &out.answer {
+            Answer::Consistent => {
+                // The certificate checker's verdict on the engine's model (folded,
+                // lifted, unravelled; `nrese_dl::certificate`).
+                let verdict = out.model.as_ref().map(|m| certificate::certify(o, m));
+                let ok = verdict.as_ref().is_some_and(Certificate::is_model);
+                if *name == "default" {
+                    tally.consistent += 1;
+                }
+                if ok {
+                    if *name == "default" {
+                        tally.confirmed_by_model += 1;
+                    }
+                    continue;
+                }
+                let found = searched
+                    .get_or_insert_with(|| {
+                        find_model(
+                            o,
+                            &sig.classes,
+                            &sig.object_properties,
+                            &sig.individuals,
+                            3,
+                            5_000,
+                            check,
+                        )
+                    })
+                    .clone();
+                if *name == "default" {
+                    if found.is_some() {
+                        tally.confirmed_by_search += 1;
+                    } else {
+                        tally.unconfirmed += 1;
+                        unconfirmed.push(format!("case {case}:\n{}", render(o)));
+                    }
+                }
+                assert!(
+                    found.is_some() || numbers || verdict.is_none(),
+                    "case {case} ({name}): consistent, but the folded model fails and no small \
+                     model exists, without number restrictions\n{}\nmodel: {:?}",
+                    render(o),
+                    out.model
+                );
+            }
+            Answer::Inconsistent => {
+                if *name == "default" {
+                    tally.inconsistent += 1;
+                }
+                let found = searched
+                    .get_or_insert_with(|| {
+                        find_model(
+                            o,
+                            &sig.classes,
+                            &sig.object_properties,
+                            &sig.individuals,
+                            3,
+                            5_000,
+                            check,
+                        )
+                    })
+                    .clone();
+                assert!(
+                    found.is_none(),
+                    "case {case} ({name}): inconsistent, but this is a model: {found:?}\n{}",
+                    render(o)
+                );
+            }
+            Answer::Unsupported(why) => {
+                if *name == "default" {
+                    tally.unsupported += 1;
+                    eprintln!("case {case}: unsupported: {why}");
+                }
+            }
+            Answer::GaveUp(why) => {
+                if *name == "default" {
+                    tally.gave_up += 1;
+                    eprintln!("case {case}: gave up: {why}");
+                } else if !beyond {
+                    // A variant past a budget the default kept within (the memory budget's
+                    // case, say): reported, its answer not compared.
+                    eprintln!("case {case} ({name}): gave up: {why}");
+                }
+            }
+        }
+    }
+    if beyond {
+        // The metamorphic runs compare decided answers only.
+        return;
+    }
+    // Renaming and shuffling leave the answer as it is.
+    let base = Config {
+        max_nodes: Some(5_000),
+        max_branch_points: Some(5_000),
+        timeout: Some(std::time::Duration::from_secs(300)),
+        max_memory: max_memory(),
+        ..Config::default()
+    };
+    let renamed = fuzz::rename(o, &|t| t + 1000);
+    // Complements as OWL Lite writes them, read with the rewriting (`nrese_owl`'s
+    // `complements.rs`) and without.
+    let mut next = 1_000_000;
+    let encoded = fuzz::encode_complements(o, 3, &mut || {
+        next += 1;
+        next
+    });
+    let plain = Config {
+        complements: false,
+        ..base.clone()
+    };
+    for (what, other, config) in [
+        ("renamed", renamed, &base),
+        ("shuffled", shuffled, &base),
+        ("complements encoded", encoded.clone(), &base),
+        ("complements encoded, not rewritten", encoded, &plain),
+    ] {
+        let answer = consistency(&other, config).answer;
+        if let Some(f) = &first
+            && matches!(f, Answer::Consistent | Answer::Inconsistent)
+            && matches!(answer, Answer::Consistent | Answer::Inconsistent)
+        {
+            assert_eq!(
+                f,
+                &answer,
+                "case {case}: {what} changes the answer\n{}",
+                render(o)
+            );
+        }
+    }
+}
+
+#[test]
+fn answers_agree_with_the_semantics() {
+    let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
+    let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x0020_2610_0333);
+    let only = env("NRESE_FUZZ_ONLY");
+    // Both kinds of answer; a single case asked for alone can't have both.
+    let covered = |t: &Tally| only.is_some() || (t.inconsistent > 0 && t.consistent > 0);
+    let tally = campaign(seed, cases, only, &covered);
+    assert!(covered(&tally), "{tally:?}");
+}
+
+/// Guard (the oracle): seed 94543, case 143 is consistent (a 3-cycle along a property
+/// disjoint with its inverse), and its folded model closes a loop on the blocker; lifted
+/// into three copies it is a model (`nrese_dl::certificate`'s lift). It failed the push gate's
+/// new seeds as "consistent, but no model", a confirmation the oracle couldn't make.
+#[test]
+fn a_loop_folded_onto_its_blocker_is_untied() {
+    let tally = campaign(94543, 144, Some(143), &|_| true);
+    assert_eq!(tally.consistent, 1, "{tally:?}");
+}
+
+/// Guard (the oracle): seed 182, case 19 is consistent (individuals `a`, `b` and one more
+/// element in a cycle of an asymmetric property, a reflexive one beside it). The folded
+/// model closes a loop of the asymmetric property on its blocker; the lift has to untie
+/// that loop but keep the reflexive property's, and choosing once for all properties gave
+/// neither (seeds 182, 200, 268 and 403 of the office campaign, "consistent, but the
+/// folded model fails and no small model exists").
+#[test]
+fn a_lift_keeps_some_properties_loops_and_unties_others() {
+    let tally = campaign(182, 20, Some(19), &|_| true);
+    assert_eq!(tally.consistent, 1, "{tally:?}");
+    assert_eq!(
+        tally.confirmed_by_model + tally.confirmed_by_search,
+        1,
+        "{tally:?}"
+    );
+}
+
+/// Guard (dynamic backtracking): seed 131, case 138 is inconsistent (a self-loop on a
+/// nominal whose successors need three successors with exactly two each). Retracting level
+/// 1 re-decided its disjunction on top; a later backtrack that couldn't retract (a merge
+/// since its culprit, level 2) restored level 2's checkpoint, older than the retraction:
+/// level 1's first choice stayed retracted, its new one was cut away, and the search found
+/// a model without the disjunction. Such a backtrack now starts the search again from
+/// before the first retraction. It failed the office campaign as "dynamic-backtracking
+/// changes the answer".
+#[test]
+fn a_backtrack_never_restores_a_point_older_than_a_retraction() {
+    let tally = campaign(131, 139, Some(138), &|_| true);
+    assert_eq!(tally.inconsistent, 1, "{tally:?}");
+}
+
+/// Guard (dynamic backtracking): seed 700160, case 144 is inconsistent (t0 is empty, so
+/// t2 is everything and every element needs a t3-successor, which must be t5 or t6; t3 is
+/// irreflexive and ¬t3(t6, t5) leaves t6 none). A choice retracted and re-decided on top
+/// keeps its disjunction's old place behind the scan; once it ran out of alternatives and
+/// a retraction below took the clash on, nothing reopened that disjunction, and the search
+/// found a model without it. A frame leaving the stack undecided now reopens its
+/// disjunction. It failed the phase-4 seed sweep as "dynamic-backtracking changes the
+/// answer" (D16-058).
+#[test]
+fn a_disjunction_left_undecided_by_a_retraction_is_reopened() {
+    let tally = campaign(700160, 145, Some(144), &|_| true);
+    assert_eq!(tally.inconsistent, 1, "{tally:?}");
+}
+
+/// Guard (dynamic backtracking): seed 710126, case 7 is consistent, and no model leaves a
+/// pending disjunction undecided (`check_retraction`'s check at a model's end). A choice
+/// re-decided on top kept the retraction queues of its first opening; a truncation to it
+/// restored those, and the disjunctions the retraction had reopened since were lost (one
+/// stayed undecided in the model). It failed the D16-058 seed sweep at the model-end
+/// check.
+#[test]
+fn a_truncation_to_a_redecided_choice_keeps_what_its_retraction_reopened() {
+    let tally = campaign(710126, 8, Some(7), &|_| true);
+    assert_eq!(tally.consistent, 1, "{tally:?}");
+}
+
+/// The number module's family (docs/design/owl2-dl.md#number-reasoning-layers):
+/// `(n, m, n·m)` is consistent by a validated compressed model, with no tableau node; that
+/// model, expanded to an explicit interpretation, is a model by the semantics' own check
+/// (the expansion is this test's oracle, never the answer); the search, where it decides,
+/// agrees. `(n, m, n·m ± 1)` is refuted.
+#[test]
+fn counted_products_agree_with_the_semantics() {
+    use nrese_dl::numbers::{candidate, closure, problem};
+    use nrese_owl::fuzz::multiplication;
+    let search = Config {
+        keep_model: true,
+        max_branch_points: Some(20_000),
+        timeout: Some(std::time::Duration::from_secs(300)),
+        max_memory: max_memory(),
+        ..Config::default()
+    };
+    for n in 1..=5u32 {
+        for m in 1..=5u32 {
+            let k = n * m;
+            let o = multiplication(n, m, k);
+            let out = consistency(&o, &Config::default());
+            assert_eq!(out.answer, Answer::Consistent, "({n}, {m}, {k})");
+            assert_eq!(
+                out.telemetry.nodes_created, 0,
+                "({n}, {m}, {k}): {}",
+                out.telemetry
+            );
+            let p = problem::extract(&o);
+            let counts = closure::close(&p).expect("closes");
+            let c = candidate::construct(&p, &counts).expect("a candidate");
+            let mut i = expand(&c);
+            certificate::close(&o, &mut i);
+            assert_eq!(
+                certificate::check(&o, &i),
+                Ok(()),
+                "({n}, {m}, {k}): not a model"
+            );
+            if k <= 6 {
+                let s = consistency(&o, &search);
+                assert!(
+                    matches!(s.answer, Answer::Consistent | Answer::GaveUp(_)),
+                    "({n}, {m}, {k}): the search says {:?}",
+                    s.answer
+                );
+            }
+            for wrong in [k + 1, k - 1] {
+                let out = consistency(&multiplication(n, m, wrong), &Config::default());
+                assert_eq!(out.answer, Answer::Inconsistent, "({n}, {m}, {wrong})");
+            }
+        }
+    }
+}
+
+/// A compressed model as an explicit interpretation: each proxy its elements, each block
+/// the edges `e` from element `e / out` to element `e mod |to|` (every element of `from`
+/// gets `out` distinct neighbours, every element of `to` gets `in`).
+fn expand(
+    c: &nrese_dl::numbers::candidate::CompressedModelCandidate,
+) -> certificate::Interpretation {
+    let mut start = Vec::new();
+    let mut n = 0usize;
+    for p in &c.proxies {
+        start.push(n);
+        n += usize::try_from(p.multiplicity).expect("small");
+    }
+    let mut i = certificate::Interpretation {
+        size: n,
+        ..certificate::Interpretation::default()
+    };
+    for (x, p) in c.proxies.iter().enumerate() {
+        for &class in &p.classes {
+            i.classes
+                .entry(class)
+                .or_default()
+                .extend((0..p.multiplicity as usize).map(|e| start[x] + e));
+        }
+        if let Some(a) = p.individual {
+            i.individuals.insert(a, start[x]);
+        }
+    }
+    for b in &c.blocks {
+        let (fm, tm) = (c.proxies[b.from].multiplicity, c.proxies[b.to].multiplicity);
+        let pairs = i.roles.entry(b.property).or_default();
+        for e in 0..fm * b.out_degree {
+            let from = start[b.from] + (e / b.out_degree) as usize;
+            let to = start[b.to] + (e % tm) as usize;
+            pairs.push((from, to));
+        }
+    }
+    i
+}
+
+/// The random cases of `seed` (`only`: that one alone), each checked against the semantics:
+/// `cases` of them, and more (up to ten times as many) until `covered` holds.
+fn campaign(seed: u64, cases: u64, only: Option<u64>, covered: &dyn Fn(&Tally) -> bool) -> Tally {
+    let mut rng = Rng::new(seed);
+    let mut check = Rng::new(seed ^ 0xA5A5);
+    let mut tally = Tally::default();
+    let mut unconfirmed = Vec::new();
+    for case in 0..cases * 10 {
+        if case >= cases && covered(&tally) {
+            break;
+        }
+        let mut names: HashMap<String, Term> = HashMap::new();
+        let mut intern = |n: &Name| {
+            let key = format!("{n:?}");
+            let len = names.len() as Term;
+            *names.entry(key).or_insert(len)
+        };
+        let sizes = Sizes {
+            classes: 3,
+            object_properties: 2,
+            simple: 1,
+            data_properties: 0,
+            individuals: 2,
+            literals: 0,
+        };
+        let sig = Signature::new(sizes, &mut intern);
+        let profile = Profile {
+            axioms: 4 + (case % 5) as usize,
+            depth: 2,
+            el: false,
+            data: false,
+            nominals: case.is_multiple_of(3),
+            numbers: case.is_multiple_of(2),
+            chains: case % 4 == 1,
+            abox: true,
+        };
+        let o = fuzz::ontology(&mut rng, &sig, profile);
+        let shuffled = fuzz::shuffle(&o, &mut rng);
+        if only.is_some_and(|only| only != case) {
+            continue;
+        }
+        if only.is_some() {
+            eprintln!("{}", render(&o));
+            if env("NRESE_FUZZ_SHRINK").is_some() {
+                shrink(&o);
+                return tally;
+            }
+        }
+        check_case(
+            case,
+            &o,
+            shuffled,
+            &sig,
+            profile.numbers || counts(&o),
+            &mut tally,
+            &mut check,
+            &mut unconfirmed,
+        );
+    }
+    eprintln!("{tally:?}");
+    for u in unconfirmed.iter().take(5) {
+        eprintln!("unconfirmed {u}");
+    }
+    tally
+}
+
+/// The NI rule's pattern (`ni_gen`): a nominal, a role into it, an at-most restriction on
+/// the inverse at it, chains of blockable nodes. A fixed set here; the long runs and the
+/// differential runs on HermiT are the `tableau_fuzz` example's `--profile ni --switches`.
+#[test]
+fn ni_pattern_answers_agree_with_the_semantics() {
+    let cases = env("NRESE_FUZZ_NI_CASES").unwrap_or(60);
+    let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x0020_2610_0444);
+    let mut rng = Rng::new(seed);
+    let mut check = Rng::new(seed ^ 0x5A5A);
+    let mut tally = Tally::default();
+    let mut unconfirmed = Vec::new();
+    // The pattern makes the NI rule likely, not certain: a seed can draw `cases` cases in
+    // which it never fires, or only one kind of answer. Draw on (up to ten times as many)
+    // until the run has covered both, so coverage never depends on the seed.
+    let covered = |t: &Tally| t.ni_firings > 0 && t.inconsistent > 0 && t.consistent > 0;
+    for case in 0..cases * 10 {
+        if case >= cases && covered(&tally) {
+            break;
+        }
+        let mut names: HashMap<String, Term> = HashMap::new();
+        let mut intern = |n: &Name| {
+            let key = format!("{n:?}");
+            let len = names.len() as Term;
+            *names.entry(key).or_insert(len)
+        };
+        let sig = Signature::new(ni_gen::sizes(), &mut intern);
+        let o = ni_gen::ontology(&mut rng, &sig);
+        let shuffled = fuzz::shuffle(&o, &mut rng);
+        if env("NRESE_FUZZ_ONLY").is_some_and(|only| only != case) {
+            continue;
+        }
+        check_case(
+            case,
+            &o,
+            shuffled,
+            &sig,
+            true,
+            &mut tally,
+            &mut check,
+            &mut unconfirmed,
+        );
+    }
+    eprintln!("{tally:?}");
+    assert!(tally.ni_firings > 0, "{tally:?}");
+    assert!(tally.inconsistent > 0 && tally.consistent > 0, "{tally:?}");
+}

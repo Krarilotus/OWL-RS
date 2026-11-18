@@ -1,0 +1,389 @@
+use super::*;
+use nrese_engine::{Engine, EngineConfig};
+use nrese_rdf_io::{RdfFormat, RdfParser};
+use nrese_sparql::QueryEvaluationError;
+use nrese_sparql::ql::{Closure, QlRewriting};
+use std::sync::Arc;
+
+struct CancellingWriter<'a> {
+    token: &'a CancellationToken,
+    bytes: Vec<u8>,
+}
+
+impl Write for CancellingWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes.extend_from_slice(bytes);
+        self.token.cancel();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn fixture() -> (Engine, PreparedQuery, StoreSettings) {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let data = "@prefix : <http://example.org/> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix owl: <http://www.w3.org/2002/07/owl#> .
+        :Employee rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :worksFor ;
+            owl:someValuesFrom :Organisation ] .
+        :ann a :Employee ; :worksFor :acme .";
+    let mut tx = engine.transaction();
+    for q in RdfParser::from_format(RdfFormat::Turtle).for_reader(data.as_bytes()) {
+        tx.insert(q.unwrap().as_ref());
+    }
+    tx.commit().unwrap();
+    let prepared = PreparedQuery::parse(&SparqlQueryRequest::all(
+        "SELECT ?x WHERE { ?x <http://example.org/worksFor> ?y }",
+    ))
+    .unwrap();
+    let store = crate::StoreService::new(crate::StoreConfig {
+        ..crate::StoreConfig::in_memory()
+    })
+    .unwrap();
+    let settings = store.query_settings().clone();
+    // The QL rewriting comes with the version's certificate.
+    let rl = nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl)
+        .materialised_program()
+        .expect("OWL 2 RL reasons");
+    let certificate = crate::service::Certificate {
+        state: crate::ReasoningState::of(&rl, 0),
+        ql: Some(Arc::new(QlRewriting::new(Closure { lists: true }))),
+        equality_closed: false,
+        dl: false,
+        user_rules: false,
+    };
+    engine
+        .transaction()
+        .install(None, Some(Arc::new(certificate)));
+    (engine, prepared, settings)
+}
+
+#[test]
+fn preparation_cancellation_is_an_error_and_the_original_report_is_retained() {
+    let (engine, prepared, settings) = fixture();
+    let snapshot = engine.snapshot();
+    let token = CancellationToken::new();
+    token.cancel();
+    let mut bytes = Vec::new();
+    assert!(matches!(
+        run_query(
+            &snapshot,
+            &prepared,
+            &settings,
+            &token,
+            &nrese_exec::Envelope::unlimited(),
+            &mut bytes,
+            |_| -> (Vec<u8>, fn(_) -> _) { panic!("cancelled before reporting") },
+        ),
+        Err(StoreError::SparqlEvaluation(
+            QueryEvaluationError::Cancelled
+        ))
+    ));
+    assert!(bytes.is_empty());
+    let token = CancellationToken::new();
+    let successful = run_query(
+        &snapshot,
+        &prepared,
+        &settings,
+        &token,
+        &nrese_exec::Envelope::unlimited(),
+        &mut bytes,
+        |report| {
+            assert_eq!(report.unwrap().checks, 1);
+            (Vec::new(), |_| None)
+        },
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        (successful.patterns, successful.realised, successful.checks),
+        (0, 1, 1)
+    );
+    let cached = run_query(
+        &snapshot,
+        &prepared,
+        &settings,
+        &token,
+        &nrese_exec::Envelope::unlimited(),
+        std::io::sink(),
+        |_| (Vec::new(), |_| None),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!((cached.realised, cached.checks), (1, 0));
+}
+
+#[test]
+fn reporting_keeps_its_snapshot_and_options_and_precedes_cached_bytes() {
+    let (engine, mut prepared, mut settings) = fixture();
+    settings.result_cache = Some(Arc::new(nrese_sparql::ResultCache::new(1 << 20)));
+    let snapshot = engine.snapshot();
+    let token = CancellationToken::new();
+    let mut first = Vec::new();
+    run_query(
+        &snapshot,
+        &prepared,
+        &settings,
+        &token,
+        &nrese_exec::Envelope::unlimited(),
+        &mut first,
+        |_| {
+            // Mutating the engine during reporting must not change the answers' view.
+            let mut tx = engine.transaction();
+            tx.insert(
+                nrese_rdf::Quad::new(
+                    nrese_rdf::NamedNode::new_unchecked("http://example.org/bob"),
+                    nrese_rdf::NamedNode::new_unchecked("http://example.org/worksFor"),
+                    nrese_rdf::NamedNode::new_unchecked("http://example.org/acme"),
+                    nrese_rdf::GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+            tx.commit().unwrap();
+            (b"same-context".to_vec(), |_| None)
+        },
+    )
+    .unwrap();
+    let text = std::str::from_utf8(&first).unwrap();
+    assert!(text.contains("ann") && !text.contains("bob"));
+    let options = query_options(
+        &snapshot,
+        &prepared,
+        &settings,
+        &token,
+        &nrese_exec::Envelope::unlimited(),
+    );
+    assert!(
+        matches!(
+            nrese_sparql::cached_output(
+                &snapshot,
+                &prepared.query,
+                &options,
+                prepared.media_type(),
+                b"same-context"
+            ),
+            CachedOutput::Hit(..)
+        ),
+        "original key retained"
+    );
+    let mut bytes = Vec::new();
+    let cancel = &token;
+    let error = run_query(
+        &snapshot,
+        &prepared,
+        &settings,
+        &token,
+        &nrese_exec::Envelope::unlimited(),
+        &mut bytes,
+        // A hit: the report that cancels is the one handed the kept status header.
+        move |_| {
+            (b"same-context".to_vec(), move |_| {
+                cancel.cancel();
+                None
+            })
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        error,
+        StoreError::SparqlEvaluation(QueryEvaluationError::Cancelled)
+    ));
+    assert!(
+        bytes.is_empty(),
+        "reporting cancellation precedes cached bytes"
+    );
+    // Memory limits do not change cache identity. Evaluation with zero bytes fails,
+    // but copying a cached answer needs no query operators or planning.
+    prepared.memory_limit = Some(0);
+    let mut second = Vec::new();
+    run_query(
+        &snapshot,
+        &prepared,
+        &settings,
+        &CancellationToken::new(),
+        &settings.query_envelope(&prepared),
+        &mut second,
+        |_| (b"same-context".to_vec(), |_| None),
+    )
+    .unwrap();
+    assert_eq!(first, second);
+    let token = CancellationToken::new();
+    let mut writer = CancellingWriter {
+        token: &token,
+        bytes: Vec::new(),
+    };
+    assert!(matches!(
+        run_query(
+            &snapshot,
+            &prepared,
+            &settings,
+            &token,
+            &nrese_exec::Envelope::unlimited(),
+            &mut writer,
+            |_| (b"same-context".to_vec(), |_| None),
+        ),
+        Err(StoreError::SparqlEvaluation(
+            QueryEvaluationError::Cancelled
+        ))
+    ));
+    assert_eq!(
+        writer.bytes, first,
+        "cached output was accepted by the writer"
+    );
+}
+
+#[test]
+fn generic_serialization_checks_empty_and_boolean_delivery_cancellation() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let snapshot = engine.snapshot();
+    for text in ["ASK {}", "SELECT ?x WHERE { VALUES ?x {} }"] {
+        for format in [
+            SolutionsResultFormat::Json,
+            SolutionsResultFormat::Xml,
+            SolutionsResultFormat::Tsv,
+            SolutionsResultFormat::Csv,
+        ] {
+            let mut prepared = PreparedQuery::parse(&SparqlQueryRequest::all(text)).unwrap();
+            prepared.solutions_format = format;
+            for before_output in [true, false] {
+                let answers =
+                    evaluate_query(&snapshot, &prepared.query, &QueryOptions::default()).unwrap();
+                let token = CancellationToken::new();
+                if before_output {
+                    token.cancel();
+                }
+                let mut writer = CancellingWriter {
+                    token: &token,
+                    bytes: Vec::new(),
+                };
+                assert!(matches!(
+                    serialize_answers(&prepared, answers, &mut writer, &token),
+                    Err(StoreError::SparqlEvaluation(
+                        QueryEvaluationError::Cancelled
+                    ))
+                ));
+                assert_eq!(writer.bytes.is_empty(), before_output);
+            }
+        }
+    }
+}
+
+#[test]
+fn collected_response_keeps_the_first_preparation_report() {
+    let store = crate::StoreService::new(crate::StoreConfig {
+        ql_rewriting: crate::QlRewritingMode::On,
+        ..crate::StoreConfig::in_memory()
+    })
+    .unwrap();
+    store
+        .update_str_ungated(
+            "PREFIX : <http://example.org/>
+        PREFIX owl: <http://www.w3.org/2002/07/owl#>
+        PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+        INSERT DATA { :Employee rdfs:subClassOf [ a owl:Restriction ;
+            owl:onProperty :worksFor ; owl:someValuesFrom :Organisation ] .
+            :ann a :Employee ; :worksFor :acme . }",
+        )
+        .unwrap();
+    store
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::Owl2Rl)
+        .unwrap();
+    store.use_reasoning_rules(Some(nrese_reasoner::rulesets::Ruleset::Owl2Rl.into()));
+    let request =
+        SparqlQueryRequest::all("SELECT ?x WHERE { ?x <http://example.org/worksFor> ?y }");
+    let first = store.execute_query(&request).unwrap();
+    let first_ql = first.ql.unwrap();
+    assert_eq!((first_ql.checks, first_ql.realised), (1, 1));
+    assert_eq!(first.completeness, Some(first_ql.completeness));
+    let second = store.execute_query(&request).unwrap();
+    assert_eq!(
+        second.ql.unwrap().checks,
+        0,
+        "only the later operation uses the warm probe"
+    );
+    assert_eq!(first.payload, second.payload);
+}
+
+#[test]
+fn prepared_serializers_agree_with_standalone_execution_for_every_form_and_format() {
+    // Written as a server writes, through the pipeline, so the version read carries the
+    // certificate its QL rewriting comes with.
+    let store = Arc::new(
+        crate::StoreService::new(crate::StoreConfig {
+            ql_rewriting: crate::QlRewritingMode::On,
+            ..crate::StoreConfig::in_memory()
+        })
+        .unwrap(),
+    );
+    crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(nrese_reasoner::ReasonerService::new(
+            nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Owl2Rl),
+        )),
+    )
+    .apply(
+        crate::MutationCommand::Update(crate::SparqlUpdateRequest::new(
+            "PREFIX : <http://example.org/>
+            PREFIX owl: <http://www.w3.org/2002/07/owl#>
+            PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+            INSERT DATA { :Employee rdfs:subClassOf [ a owl:Restriction ;
+                owl:onProperty :worksFor ; owl:someValuesFrom :Organisation ] .
+                :ann a :Employee ; :worksFor :acme . :bob a :Employee . }",
+        )),
+        &crate::Requester::all(),
+        &crate::MutationTicket::new(),
+    )
+    .unwrap();
+    let settings = store.query_settings().clone();
+    let snapshot = store.engine().snapshot();
+    for text in [
+        "SELECT ?x WHERE { ?x <http://example.org/worksFor> ?y } ORDER BY ?x",
+        "ASK { <http://example.org/bob> <http://example.org/worksFor> ?y }",
+        "CONSTRUCT { ?x <http://example.org/employed> true } WHERE { ?x <http://example.org/worksFor> ?y }",
+        "DESCRIBE ?x WHERE { ?x <http://example.org/worksFor> ?y }",
+    ] {
+        for format in [
+            SolutionsResultFormat::Json,
+            SolutionsResultFormat::Xml,
+            SolutionsResultFormat::Csv,
+            SolutionsResultFormat::Tsv,
+        ] {
+            let mut prepared = PreparedQuery::parse(&SparqlQueryRequest::all(text)).unwrap();
+            prepared.solutions_format = format;
+            let token = CancellationToken::new();
+            let mut expected = Vec::new();
+            serialize(
+                &snapshot,
+                &prepared,
+                &prepared.query,
+                &query_options(
+                    &snapshot,
+                    &prepared,
+                    &settings,
+                    &token,
+                    &nrese_exec::Envelope::unlimited(),
+                ),
+                &token,
+                &mut expected,
+            )
+            .unwrap();
+            let mut actual = Vec::new();
+            let report = run_query(
+                &snapshot,
+                &prepared,
+                &settings,
+                &token,
+                &nrese_exec::Envelope::unlimited(),
+                &mut actual,
+                |_| (Vec::new(), |_| None),
+            )
+            .unwrap()
+            .unwrap();
+            assert!(report.patterns > 0, "{text}");
+            assert_eq!(actual, expected, "{text} {format:?}");
+        }
+    }
+}

@@ -1,0 +1,1342 @@
+//! The hypertableau on hand-made ontologies whose answers are known: each construct the
+//! engine handles, consistent and inconsistent, with every optimisation on and off.
+
+mod build;
+mod limits;
+mod models;
+mod ni;
+mod probes;
+mod resources;
+mod sat;
+mod symmetric_chains;
+
+use build::Build;
+use nrese_dl::tableau::{Answer, Config, consistency, satisfiable};
+use nrese_owl::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, RangeId, normalise};
+
+/// The answer under every combination of the switches; they must agree.
+fn answer(o: &nrese_owl::Ontology) -> Answer {
+    let mut answers = Vec::new();
+    for bits in 0..64u32 {
+        let config = Config {
+            semantic_branching: bits & 1 != 0,
+            backjumping: bits & 2 != 0,
+            anywhere_blocking: bits & 4 != 0,
+            single_blocking: bits & 8 != 0,
+            lazy_definitions: bits & 16 != 0,
+            complements: bits & 32 != 0,
+            portfolio: false,
+            check_blocking: true,
+            ..Config::default()
+        };
+        answers.push(consistency(o, &config).answer);
+    }
+    assert!(
+        answers.windows(2).all(|w| w[0] == w[1]),
+        "switches change the answer: {answers:?}"
+    );
+    answers.remove(0)
+}
+
+#[test]
+fn shared_portfolio_matches_plain_search_without_cancelling_its_parent() {
+    let physical = nrese_exec::workers::Workers::new(4);
+    let mut b = Build::default();
+    let (a, bb, c) = (b.class(1), b.class(2), b.class(3));
+    let not_b = b.not(bb);
+    let definition = b.and(&[not_b, c]);
+    b.equivalent(a, definition);
+    b.assert(a, 100);
+    for inconsistent in [false, true] {
+        if inconsistent {
+            b.assert(bb, 100);
+        }
+        let expected = consistency(
+            &b.o,
+            &Config {
+                portfolio: false,
+                lazy_definitions: false,
+                ..Config::default()
+            },
+        )
+        .answer;
+        for width in [1, 2, 4] {
+            let parent = nrese_dl::tableau::Cancel::default();
+            let workers = physical.limited(width);
+            let config = Config {
+                workers: Some(workers.clone()),
+                cancel: Some(parent.clone()),
+                ..Config::default()
+            };
+            let actual = workers.install(|| consistency(&b.o, &config));
+            assert_eq!(actual.answer, expected, "width {width}");
+            assert!(!parent.is_cancelled());
+        }
+    }
+}
+
+/// Definitions unfolded lazily: `¬A` as `¬D` wherever it occurs (directly, under a value
+/// restriction, or through another definition); `answer` checks each with and without.
+#[test]
+fn lazily_unfolded_definitions_keep_answers() {
+    let r = ObjProp::Named(300);
+    // k_grz's shape: A ≡ ¬B ⊓ ¬C, D ≡ ∃r.A; D(a).
+    let mut b = Build::default();
+    let (a, bb, c, d) = (b.class(1), b.class(2), b.class(3), b.class(4));
+    let (nb, nc) = (b.not(bb), b.not(c));
+    let def_a = b.and(&[nb, nc]);
+    b.equivalent(a, def_a);
+    let def_d = b.some(r, a);
+    b.equivalent(d, def_d);
+    b.assert(d, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    // ... and D's successor can't be A: a clash only the forward direction finds.
+    let nd = b.all(r, bb);
+    b.assert(nd, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // A ≡ B ⊓ C with B(a), C(a): ¬A(a), A ⊑ ⊥, or E ≡ ¬A with E(a) each need B ⊓ C ⊑ A.
+    for case in 0..3 {
+        let mut b = Build::default();
+        let (a, bb, c, e) = (b.class(1), b.class(2), b.class(3), b.class(5));
+        let def_a = b.and(&[bb, c]);
+        b.equivalent(a, def_a);
+        b.assert(bb, 100);
+        b.assert(c, 100);
+        let na = b.not(a);
+        match case {
+            0 => b.assert(na, 100),
+            1 => {
+                let nothing = b.e(ClassExpr::Nothing);
+                b.sub(a, nothing);
+            }
+            _ => {
+                b.equivalent(e, na);
+                b.assert(e, 100);
+            }
+        }
+        assert_eq!(answer(&b.o), Answer::Inconsistent, "case {case}");
+    }
+}
+
+#[test]
+fn subsumption_and_disjointness() {
+    let mut b = Build::default();
+    let (a, bb) = (b.class(1), b.class(2));
+    let nb = b.not(bb);
+    b.sub(a, bb);
+    b.sub(a, nb);
+    b.assert(a, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    let mut b = Build::default();
+    let (a, bb) = (b.class(1), b.class(2));
+    b.sub(a, bb);
+    b.assert(a, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+}
+
+#[test]
+fn disjunctions_branch_and_backtrack() {
+    // A ⊑ B ⊔ C, B ⊑ ⊥, C ⊑ D ⊔ E, D ⊑ ⊥, E ⊑ ⊥: a:A is inconsistent.
+    let mut b = Build::default();
+    let [a, bb, c, d, e] = [1, 2, 3, 4, 5].map(|t| b.class(t));
+    let nothing = b.e(ClassExpr::Nothing);
+    let bc = b.or(&[bb, c]);
+    let de = b.or(&[d, e]);
+    b.sub(a, bc);
+    b.sub(bb, nothing);
+    b.sub(c, de);
+    b.sub(d, nothing);
+    b.sub(e, nothing);
+    b.assert(a, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // Without E ⊑ ⊥ it is consistent.
+    b.o.axioms.pop();
+    b.o.axioms
+        .retain(|x| !matches!(x, nrese_owl::Axiom::SubClassOf(s, _) if *s == e));
+    b.assert(a, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+}
+
+/// Backjumping: ten independent disjunctions decided first (`disjunctions_first`), then
+/// a clash that depends on none of them, refuted at once rather than after all 1,024
+/// combinations. (By default the existential comes before the choices and the clash
+/// before any branch point: the test checked nothing.)
+#[test]
+fn backjumping_skips_unrelated_choices() {
+    let mut b = Build::default();
+    let a = b.class(1);
+    for i in 0..10 {
+        let (x, y) = (b.class(10 + 2 * i), b.class(11 + 2 * i));
+        let xy = b.or(&[x, y]);
+        b.sub(a, xy);
+    }
+    let (p, q) = (b.class(50), b.class(51));
+    let some = b.some(ObjProp::Named(200), p);
+    b.sub(a, some);
+    let nq = b.not(q);
+    b.sub(p, q);
+    let all = b.all(ObjProp::Named(200), nq);
+    b.sub(a, all);
+    b.assert(a, 100);
+    let run = |backjumping| {
+        let config = Config {
+            disjunctions_first: true,
+            backjumping,
+            ..Config::default()
+        };
+        consistency(&b.o, &config)
+    };
+    let jumped = run(true);
+    assert_eq!(jumped.answer, Answer::Inconsistent);
+    assert!(jumped.telemetry.branch_points <= 10, "{}", jumped.telemetry);
+    let chronological = run(false);
+    assert_eq!(chronological.answer, Answer::Inconsistent);
+    assert!(
+        chronological.telemetry.branch_points >= 1_000,
+        "{}",
+        chronological.telemetry
+    );
+}
+
+/// Every order of `0..n`.
+fn orders(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for rest in orders(n - 1) {
+        for at in 0..=rest.len() {
+            let mut o = rest.clone();
+            o.insert(at, n - 1);
+            out.push(o);
+        }
+    }
+    out
+}
+
+/// Under dynamic backtracking, a disjunction reopened and passed
+/// over as satisfied by a newer choice is reopened again when that choice is retracted.
+///
+/// Everything is q = A ⊔ B ⊔ C (or `a` is) and everything is p = Y ⊔ X ⊔ B; `a` exists;
+/// A ⊓ Y, C ⊓ Y, C ⊓ X and C ⊓ B are empty; A ⊑ J ⊔ K with A ⊓ J and A ⊓ K empty;
+/// B ⊑ D ⊔ E and B ⊑ M ⊔ N, one of the two pairs empty with B. A and B are empty, so q
+/// needs C, and under C nothing of p is possible: inconsistent.
+///
+/// p holds everywhere (a clause without body), as the reviewer wrote it: such a clause
+/// fires only for a new node, so a retraction's re-joining of the live facts doesn't queue
+/// it again. (Asserted on `a`, p came back through its assertion's fact, and the search
+/// was right by luck.)
+///
+/// The reviewer's schedule:
+/// 1. q:A, then p:Y fails and p:X is taken.
+/// 2. A is refuted, which retracts p's frame (its failures name A) and reopens p.
+/// 3. q:B is decided again on top, and the reopened p is popped and passed over, satisfied
+///    by B.
+/// 4. B's free pair is chosen, its other pair refutes B, and the retraction of B's level
+///    (the free pair's frame above it) reopened only the disjunctions inside B's saved
+///    window, above p. The search returned a model without p.
+///
+/// The compiled order of disjuncts and clauses isn't specified: `or` orders disjuncts by
+/// expression, and the axioms' order isn't the order they were added in. So every creation
+/// order of the five classes the root disjunctions name runs, with q everywhere or asserted
+/// on `a`, and either of B's pairs empty with B (one of them is then decided first, as step
+/// 4 needs). Each must be inconsistent: with the retraction check off first (the bug's wrong
+/// answer), then on (its assertion).
+#[test]
+fn a_reopened_disjunction_passed_as_satisfied_is_reopened_when_its_satisfier_is_retracted() {
+    let mut wrong = Vec::new();
+    let mut retractions = 0;
+    for check in [false, true] {
+        for order in orders(5) {
+            for (q_everywhere, mn_empty) in
+                [(true, true), (true, false), (false, true), (false, false)]
+            {
+                let mut b = Build::default();
+                let mut root = [ExprId(0); 5];
+                for &i in &order {
+                    root[i] = b.class(1 + i as u64);
+                }
+                let [y, x, a, bb, c] = root;
+                let [j, k, d, e, m, n] = [6, 7, 8, 9, 10, 11].map(|t| b.class(t));
+                let thing = b.e(ClassExpr::Thing);
+                let q = b.or(&[a, bb, c]);
+                let p = b.or(&[y, x, bb]);
+                b.sub(thing, p);
+                if q_everywhere {
+                    b.sub(thing, q);
+                    b.assert(thing, 100);
+                } else {
+                    b.assert(q, 100);
+                }
+                b.disjoint(a, y);
+                b.disjoint(c, y);
+                b.disjoint(c, x);
+                b.disjoint(c, bb);
+                let jk = b.or(&[j, k]);
+                b.sub(a, jk);
+                b.disjoint(a, j);
+                b.disjoint(a, k);
+                let de = b.or(&[d, e]);
+                let mn = b.or(&[m, n]);
+                b.sub(bb, de);
+                b.sub(bb, mn);
+                let (empty1, empty2) = if mn_empty { (m, n) } else { (d, e) };
+                b.disjoint(bb, empty1);
+                b.disjoint(bb, empty2);
+                for dynamic in [true, false] {
+                    let config = Config {
+                        dynamic_backtracking: dynamic,
+                        check_retraction: check,
+                        disjunct_learning: false,
+                        counting: false,
+                        lazy_definitions: false,
+                        complements: false,
+                        portfolio: false,
+                        ..Config::default()
+                    };
+                    let out = consistency(&b.o, &config);
+                    if dynamic {
+                        retractions += out.telemetry.retractions;
+                    }
+                    if out.answer != Answer::Inconsistent {
+                        wrong.push(format!(
+                            "check {check}, dynamic {dynamic}, order {order:?}, q everywhere \
+                             {q_everywhere}, M and N empty with B {mn_empty}: {:?} ({})",
+                            out.answer, out.telemetry
+                        ));
+                    }
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "{} runs:\n{}",
+            wrong.len(),
+            wrong.join("\n")
+        );
+    }
+    // The schedule the case is about: choices retracted alone.
+    assert!(retractions > 0, "no run retracted a choice");
+}
+
+#[test]
+fn existentials_and_blocking() {
+    // A ⊑ ∃R.A: an infinite chain, cut by blocking.
+    let mut b = Build::default();
+    let a = b.class(1);
+    let some = b.some(ObjProp::Named(200), a);
+    b.sub(a, some);
+    b.assert(a, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    // ... and ∀R.¬A at the start: inconsistent.
+    let na = b.not(a);
+    let all = b.all(ObjProp::Named(200), na);
+    let start = b.class(2);
+    b.sub(start, all);
+    b.assert(start, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+#[test]
+fn universal_restrictions_reach_asserted_successors() {
+    let mut b = Build::default();
+    let (a, bb) = (b.class(1), b.class(2));
+    let all = b.all(ObjProp::Named(200), bb);
+    b.sub(a, all);
+    b.assert(a, 100);
+    b.role_assertion(200, 100, 101);
+    let nb = b.not(bb);
+    b.assert(nb, 101);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+#[test]
+fn inverses_propagate_back() {
+    // A ⊑ ∃R.B, B ⊑ ∀R⁻.C, C ⊓ A ⊑ ⊥: a:A inconsistent.
+    let mut b = Build::default();
+    let [a, bb, c] = [1, 2, 3].map(|t| b.class(t));
+    let some = b.some(ObjProp::Named(200), bb);
+    b.sub(a, some);
+    let back = b.all(ObjProp::Inverse(200), c);
+    b.sub(bb, back);
+    let both = b.and(&[a, c]);
+    let nothing = b.e(ClassExpr::Nothing);
+    b.sub(both, nothing);
+    b.assert(a, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+#[test]
+fn pairwise_blocking_with_inverses() {
+    // A ⊑ ∃R.A, A ⊑ ∀R⁻.B... consistent; with B ⊑ ⊥ inconsistent only below the root.
+    let mut b = Build::default();
+    let [a, bb] = [1, 2].map(|t| b.class(t));
+    let some = b.some(ObjProp::Named(200), a);
+    b.sub(a, some);
+    let back = b.all(ObjProp::Inverse(200), bb);
+    b.sub(a, back);
+    b.assert(a, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    let nb = b.not(bb);
+    b.sub(a, nb);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+#[test]
+fn functional_roles_merge() {
+    // Functional R, a: ∃R.B ⊓ ∃R.C, B ⊓ C ⊑ ⊥.
+    let mut b = Build::default();
+    let [bb, c] = [2, 3].map(|t| b.class(t));
+    let (sb, sc) = (
+        b.some(ObjProp::Named(200), bb),
+        b.some(ObjProp::Named(200), c),
+    );
+    let both = b.and(&[sb, sc]);
+    b.assert(both, 100);
+    b.characteristic(Characteristic::Functional, ObjProp::Named(200));
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.disjoint(bb, c);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+/// The ≤-rule merges successors, with every encoding of at-most restrictions (atoms, or
+/// spelled out up to 2 or 8): `≥ 3 R ⊓ ≤ 2 R` is unsatisfiable and `≥ 2 R ⊓ ≤ 2 R` isn't;
+/// `≥ 2 R.B ⊓ ≤ 1 R.B` is unsatisfiable and `≥ 2 R.B ⊓ ≤ 1 R.C` isn't.
+#[test]
+fn at_most_restrictions_merge_successors() {
+    let r = ObjProp::Named(200);
+    for expand in [0, 2, 8] {
+        let config = Config {
+            expand_at_most_up_to: expand,
+            ..Config::default()
+        };
+        for (min, max, qualified, expected) in [
+            (3, 2, None, Answer::Inconsistent),
+            (2, 2, None, Answer::Consistent),
+            (2, 1, Some(true), Answer::Inconsistent),
+            (2, 1, Some(false), Answer::Consistent),
+        ] {
+            let mut b = Build::default();
+            let [bb, c] = [2, 3].map(|t| b.class(t));
+            let thing = b.e(ClassExpr::Thing);
+            let (least, most) = match qualified {
+                None => (thing, thing),
+                Some(same) => (bb, if same { bb } else { c }),
+            };
+            let at_least = b.e(ClassExpr::Min(min, r, least));
+            let at_most = b.e(ClassExpr::Max(max, r, most));
+            let both = b.and(&[at_least, at_most]);
+            b.assert(both, 100);
+            assert_eq!(
+                consistency(&b.o, &config).answer,
+                expected,
+                "{min} {max} {qualified:?} {expand}"
+            );
+        }
+    }
+}
+
+/// Transitive roles through automata, an inverse of one too (ore_ont_15971: `after`
+/// inverse of `before`, `before` transitive, was "unsupported: an irregular role
+/// hierarchy"; the regularity is `nrese_owl`'s, in its `models` tests).
+#[test]
+fn transitive_roles_through_automata() {
+    let mut b = Build::default();
+    let [a, bb] = [1, 2].map(|t| b.class(t));
+    b.characteristic(Characteristic::Transitive, ObjProp::Named(200));
+    let all = b.all(ObjProp::Named(200), bb);
+    b.sub(a, all);
+    b.assert(a, 100);
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(200, 101, 102);
+    let nb = b.not(bb);
+    b.assert(nb, 102);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // a: ∀before.¬C, before(a, b), after(c, b) (so before(b, c)), c: C.
+    let (before, after) = (ObjProp::Named(200), ObjProp::Named(201));
+    let mut b = Build::default();
+    let c = b.class(1);
+    b.axiom(Axiom::InverseObjectProperties(before, after));
+    b.characteristic(Characteristic::Transitive, before);
+    let nc = b.not(c);
+    let all = b.all(before, nc);
+    b.assert(all, 100);
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(201, 102, 101);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.assert(c, 102);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // ... and along after: c: ∀after.¬C, before(a, b), before(b, c), a: C.
+    let mut b = Build::default();
+    let c = b.class(1);
+    b.axiom(Axiom::InverseObjectProperties(before, after));
+    b.characteristic(Characteristic::Transitive, before);
+    let nc = b.not(c);
+    let all = b.all(after, nc);
+    b.assert(all, 102);
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(200, 101, 102);
+    b.assert(c, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+#[test]
+fn individuals_and_equality() {
+    let mut b = Build::default();
+    let a = b.class(1);
+    let na = b.not(a);
+    b.assert(a, 100);
+    b.assert(na, 101);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.same(100, 101);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    let mut b = Build::default();
+    b.same(100, 101);
+    b.different(100, 101);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+#[test]
+fn nominals() {
+    // A ⊑ {o}, a:A, b:A, a ≠ b: inconsistent.
+    let mut b = Build::default();
+    let a = b.class(1);
+    let o = b.e(ClassExpr::OneOf(vec![300]));
+    b.sub(a, o);
+    b.assert(a, 100);
+    b.assert(a, 101);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.different(100, 101);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+#[test]
+fn class_satisfiability() {
+    let mut b = Build::default();
+    let [a, bb, c] = [1, 2, 3].map(|t| b.class(t));
+    let nb = b.not(bb);
+    b.sub(a, bb);
+    b.sub(c, nb);
+    let ac = b.and(&[a, c]);
+    let d = b.class(4);
+    b.equivalent(d, ac);
+    let n = normalise(&b.o);
+    let config = Config::default();
+    assert_eq!(
+        satisfiable(&b.o, &n, 4, &config).answer,
+        Answer::Inconsistent
+    );
+    assert_eq!(satisfiable(&b.o, &n, 1, &config).answer, Answer::Consistent);
+    // A class the clauses never mention.
+    assert_eq!(
+        satisfiable(&b.o, &n, 99, &config).answer,
+        Answer::Consistent
+    );
+}
+
+/// Data values are values: two literals of one value are one (`1` and `1.0`), two of
+/// different values two.
+#[test]
+fn data_values_are_decided_by_the_datatype_theory() {
+    let mut b = Build::default();
+    b.axiom(Axiom::FunctionalDataProperty(400));
+    let one = b.literal("1", "integer");
+    let also_one = b.literal("1.0", "decimal");
+    b.axiom(Axiom::DataPropertyAssertion(400, 100, one));
+    b.axiom(Axiom::DataPropertyAssertion(400, 100, also_one));
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    let float_one = b.literal("1", "float");
+    let mut c = Build { o: b.o.clone() };
+    c.axiom(Axiom::DataPropertyAssertion(400, 100, float_one));
+    assert_eq!(answer(&c.o), Answer::Inconsistent, "a float isn't a real");
+    let two = b.literal("2", "integer");
+    b.axiom(Axiom::DataPropertyAssertion(400, 100, two));
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+/// Disjoint data properties compare values, not data nodes: the literal 10 of one and the
+/// value `∃dp2.integer[10, 10]` makes for the other are two nodes with one value. W3C
+/// "Inconsistent Disjoint Dataproperties" was answered consistent while the clause
+/// shared one data variable (5 October 2026).
+#[test]
+fn disjoint_data_properties_compare_values() {
+    for (bound, expected) in [(10, Answer::Inconsistent), (11, Answer::Consistent)] {
+        let mut b = Build::default();
+        b.axiom(Axiom::DisjointDataProperties(vec![400, 401]));
+        let ten = b.literal("10", "integer");
+        b.axiom(Axiom::DataPropertyAssertion(400, 100, ten));
+        let range = b.restricted(
+            "integer",
+            &[("minInclusive", bound), ("maxInclusive", bound)],
+        );
+        let some = b.e(ClassExpr::DataSome(401, range));
+        b.assert(some, 100);
+        assert_eq!(answer(&b.o), expected, "dp2 in [{bound}, {bound}]");
+    }
+    // The same literal for both: one node, as before.
+    let mut b = Build::default();
+    b.axiom(Axiom::DisjointDataProperties(vec![400, 401]));
+    let ten = b.literal("10", "integer");
+    b.axiom(Axiom::DataPropertyAssertion(400, 100, ten));
+    b.axiom(Axiom::DataPropertyAssertion(401, 100, ten));
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+/// The W3C test "Inconsistent String Pattern with Disjoint Dataproperties": `a(b|c)` has
+/// two strings, and both are taken by the disjoint property; with one taken, the other
+/// is left.
+#[test]
+fn patterns_count_their_strings() {
+    for (taken, expected) in [
+        (&["ab", "ac"][..], Answer::Inconsistent),
+        (&["ab"][..], Answer::Consistent),
+    ] {
+        let mut b = Build::default();
+        b.axiom(Axiom::DisjointDataProperties(vec![400, 401]));
+        for s in taken {
+            let l = b.literal(s, "string");
+            b.axiom(Axiom::DataPropertyAssertion(400, 100, l));
+        }
+        let string = b.term(Some("http://www.w3.org/2001/XMLSchema#string".into()));
+        let facet = b.term(Some("http://www.w3.org/2001/XMLSchema#pattern".into()));
+        let pattern = b.literal("a(b|c)", "string");
+        let range = b.range(nrese_owl::DataRange::Restriction(
+            string,
+            vec![(facet, pattern)],
+        ));
+        let some = b.e(ClassExpr::DataSome(401, range));
+        b.assert(some, 100);
+        assert_eq!(answer(&b.o), expected, "{taken:?}");
+    }
+}
+
+/// Cardinalities against the values a range has: 256 bytes, but not 257. One individual
+/// and no choice: the search's switches don't bear on it (under all 64 it took 21 s).
+#[test]
+fn data_cardinalities_count_values() {
+    for (n, expected) in [(256, Answer::Consistent), (257, Answer::Inconsistent)] {
+        let mut b = Build::default();
+        let byte = b.datatype("byte");
+        b.axiom(Axiom::DataPropertyRange(400, byte));
+        let literal = b.range(nrese_owl::DataRange::Literal);
+        let at_least = b.e(ClassExpr::DataMin(n, 400, literal));
+        b.assert(at_least, 100);
+        assert_eq!(
+            consistency(&b.o, &Config::default()).answer,
+            expected,
+            "{n}"
+        );
+    }
+}
+
+/// A disjunction whose every branch only a facet combination refutes: the clashes carry
+/// the facts' dependencies, so the search backjumps soundly through both.
+#[test]
+fn facet_clashes_refute_each_branch() {
+    for (lo, hi, expected) in [(4, 4, Answer::Inconsistent), (3, 4, Answer::Consistent)] {
+        let mut b = Build::default();
+        let (a, bb) = (b.class(1), b.class(2));
+        let either = b.or(&[a, bb]);
+        b.assert(either, 100);
+        let big = b.restricted("integer", &[("minInclusive", 5)]);
+        let small = b.restricted("integer", &[("maxInclusive", 3)]);
+        let some_big = b.e(ClassExpr::DataSome(400, big));
+        let some_small = b.e(ClassExpr::DataSome(400, small));
+        b.sub(a, some_big);
+        b.sub(bb, some_small);
+        let range = b.restricted("integer", &[("minInclusive", lo), ("maxInclusive", hi)]);
+        b.axiom(Axiom::DataPropertyRange(400, range));
+        assert_eq!(answer(&b.o), expected, "[{lo}, {hi}]");
+    }
+}
+
+/// A datatype outside the map is approximated: a model is no answer, a clash still is.
+#[test]
+fn approximated_datatypes_are_unsupported_not_consistent() {
+    let mut b = Build::default();
+    let date = b.datatype("date");
+    b.axiom(Axiom::DataPropertyRange(400, date));
+    let some = b.e(ClassExpr::DataSome(400, date));
+    b.assert(some, 100);
+    assert!(matches!(answer(&b.o), Answer::Unsupported(_)));
+    let literal = b.range(nrese_owl::DataRange::Literal);
+    let none = b.e(ClassExpr::DataMax(0, 400, literal));
+    b.assert(none, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+/// Keys make named individuals with equal key values equal, never anonymous ones.
+#[test]
+fn keys_merge_named_individuals_only() {
+    let base = |second: &str, anonymous: bool| {
+        let mut b = Build::default();
+        let (c, d) = (b.class(1), b.class(2));
+        b.axiom(Axiom::HasKey(c, Vec::new(), vec![400]));
+        let one = b.literal("1", "integer");
+        let other = b.literal(second, "integer");
+        b.assert(c, 100);
+        b.assert(c, 101);
+        b.axiom(Axiom::DataPropertyAssertion(400, 100, one));
+        b.axiom(Axiom::DataPropertyAssertion(400, 101, other));
+        // 100 is D, 101 isn't: equal, they clash.
+        b.assert(d, 100);
+        let not_d = b.not(d);
+        b.assert(not_d, 101);
+        if anonymous {
+            b.o.anonymous.insert(101);
+        }
+        answer(&b.o)
+    };
+    assert_eq!(base("01", false), Answer::Inconsistent);
+    assert_eq!(base("2", false), Answer::Consistent);
+    assert_eq!(base("01", true), Answer::Consistent);
+}
+
+#[test]
+fn budgets_give_up() {
+    // ∃R.A with A ⊑ ∃R.B ⊓ ∃R.C ... grows; a tiny node budget gives up.
+    let mut b = Build::default();
+    let a = b.class(1);
+    let some = b.some(ObjProp::Named(200), a);
+    b.sub(a, some);
+    b.assert(a, 100);
+    let config = Config {
+        max_nodes: Some(1),
+        ..Config::default()
+    };
+    assert!(matches!(
+        consistency(&b.o, &config).answer,
+        Answer::GaveUp(why) if !why.contains("time budget")
+    ));
+}
+
+#[test]
+fn the_ni_rule_is_never_skipped_silently() {
+    // JAIR 2009's caterpillar (8): S(a, a), a: ∃R.B, B ⊑ ∃R.C, C ⊑ ∃S.D, D ⊑ {a}, S
+    // inverse-functional. Consistent; the derivation needs the NI rule (on c ≈ c).
+    let mut b = Build::default();
+    let [bb, c, d] = [2, 3, 4].map(|t| b.class(t));
+    let (r, s) = (ObjProp::Named(200), ObjProp::Named(201));
+    b.role_assertion(201, 100, 100);
+    let rb = b.some(r, bb);
+    b.assert(rb, 100);
+    let rc = b.some(r, c);
+    b.sub(bb, rc);
+    let sd = b.some(s, d);
+    b.sub(c, sd);
+    let a = b.e(ClassExpr::OneOf(vec![100]));
+    b.sub(d, a);
+    b.characteristic(Characteristic::InverseFunctional, s);
+    for expand in [0, 2] {
+        let config = Config {
+            expand_at_most_up_to: expand,
+            ..Config::default()
+        };
+        let answer = consistency(&b.o, &config).answer;
+        eprintln!("caterpillar, expand {expand}: {answer:?}");
+        assert_eq!(answer, Answer::Consistent);
+    }
+}
+
+#[test]
+fn premature_blocking_without_the_ni_rule_is_caught() {
+    // JAIR 2009's (9): A(a), a: ∃R.B, A ⊑ ∀R⁻.⊥, B ⊑ ∃R.B, B ⊑ ∃S.{a}, R
+    // inverse-functional, ⊤ ⊑ ≤3 S⁻.⊤. Inconsistent; without the NI rule a blocked chain
+    // looks like a model (Figure 9a).
+    let mut b = Build::default();
+    let [a, bb] = [1, 2].map(|t| b.class(t));
+    let (r, s) = (ObjProp::Named(200), ObjProp::Named(201));
+    let thing = b.e(ClassExpr::Thing);
+    let nothing = b.e(ClassExpr::Nothing);
+    b.assert(a, 100);
+    let rb = b.some(r, bb);
+    b.assert(rb, 100);
+    let none_back = b.all(ObjProp::Inverse(200), nothing);
+    b.sub(a, none_back);
+    b.sub(bb, rb);
+    let at_a = b.e(ClassExpr::OneOf(vec![100]));
+    let s_a = b.some(s, at_a);
+    b.sub(bb, s_a);
+    b.characteristic(Characteristic::InverseFunctional, r);
+    let at_most = b.e(ClassExpr::Max(3, ObjProp::Inverse(201), thing));
+    b.sub(thing, at_most);
+    for expand in [0, 2, 3] {
+        let config = Config {
+            expand_at_most_up_to: expand,
+            ..Config::default()
+        };
+        let answer = consistency(&b.o, &config).answer;
+        eprintln!("premature blocking, expand {expand}: {answer:?}");
+        assert_eq!(answer, Answer::Inconsistent, "{expand}");
+    }
+}
+
+#[test]
+fn the_bottom_property_relates_nothing() {
+    // 500 is owl:bottomObjectProperty. a: ∃⊥.⊤ is inconsistent; so is an edge a
+    // subproperty or a chain puts into it.
+    let bottom = 500;
+    let with_bottom = |b: &mut Build| b.o.builtin.bottom_object = Some(bottom);
+    let mut b = Build::default();
+    with_bottom(&mut b);
+    let thing = b.e(ClassExpr::Thing);
+    let some = b.some(ObjProp::Named(bottom), thing);
+    b.assert(some, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+
+    let mut b = Build::default();
+    with_bottom(&mut b);
+    b.axiom(Axiom::SubObjectPropertyOf(
+        vec![ObjProp::Named(200)],
+        ObjProp::Named(bottom),
+    ));
+    b.role_assertion(200, 100, 101);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+
+    let mut b = Build::default();
+    with_bottom(&mut b);
+    b.axiom(Axiom::SubObjectPropertyOf(
+        vec![ObjProp::Named(200), ObjProp::Named(201)],
+        ObjProp::Named(bottom),
+    ));
+    b.role_assertion(200, 100, 101);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.role_assertion(201, 101, 102);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+#[test]
+fn the_universal_property_relates_everything() {
+    // 501 is owl:topObjectProperty.
+    let top = ObjProp::Named(501);
+    let universal = |b: &mut Build| b.o.builtin.top_object = Some(501);
+    // a: ¬∃U.⊤ is inconsistent (a is a U-successor of itself; New-Feature-TopObjectProperty-001).
+    let mut b = Build::default();
+    universal(&mut b);
+    let thing = b.e(ClassExpr::Thing);
+    let some = b.some(top, thing);
+    let none = b.not(some);
+    b.assert(none, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // a: ∀U.C reaches an unrelated b: ¬C.
+    let mut b = Build::default();
+    universal(&mut b);
+    let c = b.class(1);
+    let all = b.all(top, c);
+    b.assert(all, 100);
+    let nc = b.not(c);
+    b.assert(nc, 101);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // ... but without b it holds, and a: ∃U.C with C ⊑ ∃R.C too.
+    b.o.axioms.pop();
+    b.o.sources.pop();
+    let rc = b.some(ObjProp::Named(200), c);
+    b.sub(c, rc);
+    let some_c = b.some(top, c);
+    b.assert(some_c, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    // D ⊑ ∃U.C with C ⊑ ⊥ makes D empty, not the ontology inconsistent; d: D does.
+    let mut b = Build::default();
+    universal(&mut b);
+    let [c, d] = [1, 2].map(|t| b.class(t));
+    let some_c = b.some(top, c);
+    b.sub(d, some_c);
+    let nothing = b.e(ClassExpr::Nothing);
+    b.sub(c, nothing);
+    let thing = b.e(ClassExpr::Thing);
+    b.assert(thing, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.assert(d, 100);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // ¬U(a, b) can't hold; U(a, b) always does.
+    let mut b = Build::default();
+    universal(&mut b);
+    b.role_assertion(501, 100, 101);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.axiom(Axiom::NegativeObjectPropertyAssertion(501, 100, 101));
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // A cardinality over U (OWL 2 DL forbids it: U isn't simple) is unsupported.
+    let mut b = Build::default();
+    universal(&mut b);
+    let thing = b.e(ClassExpr::Thing);
+    let two = b.e(ClassExpr::Max(2, top, thing));
+    b.assert(two, 100);
+    assert!(matches!(answer(&b.o), Answer::Unsupported(_)));
+}
+
+/// Guard: U as a subproperty (a chain, an equivalence, an inverse) and in a key is
+/// decided; each was unsupported before (OWL 2 DL allows them: §11.2 restricts only
+/// simple-role positions).
+#[test]
+fn the_universal_property_as_a_subproperty_and_in_keys() {
+    let top = ObjProp::Named(501);
+    let r = ObjProp::Named(200);
+    let s = ObjProp::Named(201);
+    let universal = |b: &mut Build| b.o.builtin.top_object = Some(501);
+    // `U ⊑ R`, written as each form: R relates everything, so `¬R(a, b)` is inconsistent
+    // and `a: ∀R.C, b: ¬C` too; without either, consistent.
+    let forms: [&dyn Fn(&mut Build); 4] = [
+        &|b| b.axiom(Axiom::SubObjectPropertyOf(vec![top], r)),
+        &|b| b.axiom(Axiom::EquivalentObjectProperties(vec![r, top])),
+        &|b| b.axiom(Axiom::EquivalentObjectProperties(vec![r, s, top])),
+        &|b| b.axiom(Axiom::InverseObjectProperties(r, top)),
+    ];
+    for (k, form) in forms.iter().enumerate() {
+        let mut b = Build::default();
+        universal(&mut b);
+        form(&mut b);
+        let c = b.class(1);
+        let all = b.all(r, c);
+        b.assert(all, 100);
+        assert_eq!(answer(&b.o), Answer::Consistent, "form {k}");
+        let nc = b.not(c);
+        b.assert(nc, 101);
+        assert_eq!(answer(&b.o), Answer::Inconsistent, "form {k}");
+        let mut b = Build::default();
+        universal(&mut b);
+        form(&mut b);
+        b.role_assertion(201, 100, 101);
+        assert_eq!(answer(&b.o), Answer::Consistent, "form {k}");
+        b.axiom(Axiom::NegativeObjectPropertyAssertion(200, 100, 101));
+        assert_eq!(answer(&b.o), Answer::Inconsistent, "form {k}");
+    }
+    // `R ∘ U ⊑ S`: what has an R-successor is S-related to everything.
+    let mut b = Build::default();
+    universal(&mut b);
+    b.axiom(Axiom::SubObjectPropertyOf(vec![r, top], s));
+    let c = b.class(1);
+    let all = b.all(s, c);
+    b.assert(all, 100);
+    let nc = b.not(c);
+    b.assert(nc, 102);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.role_assertion(200, 100, 101);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    // A key over U alone: every two named instances of C are one; a key over U and R
+    // asks R too.
+    for with_r in [false, true] {
+        let mut b = Build::default();
+        universal(&mut b);
+        let c = b.class(1);
+        let key = if with_r { vec![top, r] } else { vec![top] };
+        b.axiom(Axiom::HasKey(c, key, Vec::new()));
+        b.assert(c, 100);
+        b.assert(c, 101);
+        b.different(100, 101);
+        let expected = if with_r {
+            Answer::Consistent
+        } else {
+            Answer::Inconsistent
+        };
+        assert_eq!(answer(&b.o), expected, "with R: {with_r}");
+        if with_r {
+            b.role_assertion(200, 100, 102);
+            b.role_assertion(200, 101, 102);
+            assert_eq!(answer(&b.o), Answer::Inconsistent);
+        }
+    }
+    // What OWL 2 DL rules out stays unsupported: U is composite, not simple (§11.1).
+    let mut b = Build::default();
+    universal(&mut b);
+    b.characteristic(Characteristic::Functional, top);
+    assert!(matches!(answer(&b.o), Answer::Unsupported(_)));
+}
+
+#[test]
+fn horn_encodings_keep_their_answers() {
+    // Man ⊔ Woman ⊑ Person, Person ⊓ ∃worksFor.Org ⊑ Employee with worksFor transitive;
+    // a: Man, worksFor(a, b), worksFor(b, c), c: Org, Employee ⊑ ⊥: inconsistent, and
+    // consistent without c: Org.
+    let mut b = Build::default();
+    let [man, woman, person, org, employee] = [1, 2, 3, 4, 5].map(|t| b.class(t));
+    let works_for = ObjProp::Named(200);
+    b.characteristic(Characteristic::Transitive, works_for);
+    let either = b.or(&[man, woman]);
+    b.sub(either, person);
+    let some = b.some(works_for, org);
+    let both = b.and(&[person, some]);
+    b.sub(both, employee);
+    let nothing = b.e(ClassExpr::Nothing);
+    b.sub(employee, nothing);
+    b.assert(man, 100);
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(200, 101, 102);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.assert(org, 102);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+#[test]
+fn a_branch_too_large_to_expand_is_abandoned_not_the_run() {
+    // a: A, A ⊑ (C ⊓ ≥10⁹ R) ⊔ {o}: the first disjunct can't be expanded within a budget,
+    // the second is a model (as in DL-909, which the search order decided).
+    let mut b = Build::default();
+    let [a, c] = [1, 2].map(|t| b.class(t));
+    let thing = b.e(ClassExpr::Thing);
+    let huge = b.e(ClassExpr::Min(1_000_000_000, ObjProp::Named(200), thing));
+    let big = b.and(&[c, huge]);
+    let o = b.e(ClassExpr::OneOf(vec![300]));
+    let either = b.or(&[big, o]);
+    b.sub(a, either);
+    b.assert(a, 100);
+    let config = Config {
+        max_branch_points: Some(100_000),
+        timeout: Some(std::time::Duration::from_secs(300)),
+        max_memory: Some(256 << 20),
+        ..Config::default()
+    };
+    assert_eq!(consistency(&b.o, &config).answer, Answer::Consistent);
+    // With a ≠ o the other branch clashes: the run gives up, it doesn't refute.
+    b.different(100, 300);
+    assert!(matches!(
+        consistency(&b.o, &config).answer,
+        Answer::GaveUp(_)
+    ));
+}
+
+/// Guard (the ≤-rule's merge filter, W3C DL-903): `a: ≥k p.A ⊓ ≥k q.B ⊓ ≤(2k-1) r` with
+/// `p, q ⊑ r` and `A ⊓ B ⊑ ⊥` is inconsistent: the `p`- and the `q`-successors are
+/// pairwise unequal among themselves, and a `p`- and a `q`-successor can't merge. Every
+/// pair is ruled out before a choice, so the clash comes without a branch point
+/// (DL-903, k = 200/300: a 60 s timeout before, 9 ms after); with the filter off the
+/// ≤-rule branches over the k² mixed pairs.
+#[test]
+fn disjoint_successors_are_no_merge_candidates() {
+    let k = 40;
+    let mut b = Build::default();
+    let (p, q, r) = (200, 201, 202);
+    let [x, a, bb] = [1, 2, 3].map(|t| b.class(t));
+    let thing = b.e(ClassExpr::Thing);
+    let nothing = b.e(ClassExpr::Nothing);
+    for s in [p, q] {
+        b.axiom(Axiom::SubObjectPropertyOf(
+            vec![ObjProp::Named(s)],
+            ObjProp::Named(r),
+        ));
+    }
+    let both = b.and(&[a, bb]);
+    b.sub(both, nothing);
+    let at_least_p = b.e(ClassExpr::Min(k, ObjProp::Named(p), a));
+    let at_least_q = b.e(ClassExpr::Min(k, ObjProp::Named(q), bb));
+    let at_most_r = b.e(ClassExpr::Max(2 * k - 1, ObjProp::Named(r), thing));
+    let all = b.and(&[at_least_p, at_least_q, at_most_r]);
+    b.sub(x, all);
+    b.assert(x, 100);
+    let config = Config {
+        max_branch_points: Some(10_000),
+        ..Config::default()
+    };
+    let out = consistency(&b.o, &config);
+    assert_eq!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
+    assert_eq!(out.telemetry.branch_points, 0, "{}", out.telemetry);
+    let off = consistency(
+        &b.o,
+        &Config {
+            merge_filter: false,
+            ..config
+        },
+    );
+    assert!(off.telemetry.branch_points > 0, "{}", off.telemetry);
+}
+
+/// Guard (keyed role plans): `Aᵢ ⊑ ¬∃partOf.Bᵢ` over a transitive `partOf` with a
+/// hierarchy of subroles gives each role a transition per axiom, nearly all failing their
+/// first check; an edge tries only the plans its ends' concepts key (the fast suite's
+/// dl-roles, 5,000 axioms: saturation 1.2-2.3 s -> 18-27 ms, the same 58,724 firings).
+#[test]
+fn an_edge_tries_only_the_plans_its_ends_key() {
+    let mut b = Build::default();
+    let (roles, axioms) = (20u64, 400u64);
+    let part_of = 500;
+    b.characteristic(Characteristic::Transitive, ObjProp::Named(part_of));
+    for r in 1..roles {
+        let parent = if r < 2 { part_of } else { 500 + r / 2 };
+        if r % 2 == 0 {
+            b.characteristic(Characteristic::Transitive, ObjProp::Named(500 + r));
+        }
+        b.axiom(Axiom::SubObjectPropertyOf(
+            vec![ObjProp::Named(500 + r)],
+            ObjProp::Named(parent),
+        ));
+    }
+    for i in 0..axioms {
+        let (a, bi) = (b.class(10_000 + i), b.class(20_000 + i));
+        let some = b.some(ObjProp::Named(part_of), bi);
+        b.disjoint(a, some);
+        b.role_assertion(500 + 1 + i % (roles - 1), 30_000 + i, 40_000 + i);
+        let next = b.class(20_000 + (i + 1) % axioms);
+        b.assert(next, 40_000 + i);
+    }
+    let out = consistency(&b.o, &Config::default());
+    assert_eq!(out.answer, Answer::Consistent, "{}", out.telemetry);
+    assert!(
+        out.telemetry.plans_tried <= 2 * out.telemetry.facts,
+        "{}",
+        out.telemetry
+    );
+}
+
+/// The W3C integer-multiplication shape (DL-906, 907, 910) with `N`, `M` and the count
+/// `K` of `d`'s r-predecessors: `{d} ≡ (= N p⁻) ≡ (= K r⁻)`, `CN ≡ ∃p.{d} ≡ (= M q⁻)`,
+/// `NM ≡ ∃q.CN ≡ ∃r.{d}`; p, r and (where `q_functional`) q functional. Consistent iff
+/// `K = N·M` (with q functional).
+fn multiplication(n: u32, m: u32, k: u32, q_functional: bool) -> nrese_owl::Ontology {
+    let mut b = Build::default();
+    let (p, q, r) = (
+        ObjProp::Named(200),
+        ObjProp::Named(201),
+        ObjProp::Named(202),
+    );
+    let only_d = b.class(1);
+    let cn = b.class(2);
+    let nm = b.class(3);
+    let d = b.e(ClassExpr::OneOf(vec![100]));
+    b.equivalent(only_d, d);
+    let thing = b.e(ClassExpr::Thing);
+    let n_p = b.e(ClassExpr::Exact(n, p.inverse(), thing));
+    b.equivalent(only_d, n_p);
+    let k_r = b.e(ClassExpr::Exact(k, r.inverse(), thing));
+    b.equivalent(only_d, k_r);
+    let to_d = b.some(p, only_d);
+    b.equivalent(cn, to_d);
+    let m_q = b.e(ClassExpr::Exact(m, q.inverse(), thing));
+    b.equivalent(cn, m_q);
+    let to_cn = b.some(q, cn);
+    b.equivalent(nm, to_cn);
+    let r_d = b.some(r, only_d);
+    b.equivalent(nm, r_d);
+    b.characteristic(Characteristic::Functional, p);
+    b.characteristic(Characteristic::Functional, r);
+    if q_functional {
+        b.characteristic(Characteristic::Functional, q);
+    }
+    b.o
+}
+
+/// Guard (counted classes): `K ≠ N·M` is refuted by arithmetic before the search, with no
+/// branch point (the merge search is pigeonhole-hard: N=2, M=3, K=7 gave up after 774 k
+/// branch points in 30 s; DL-910 likewise). `K = N·M` stays consistent; without q
+/// functional the product doesn't hold and nothing is refuted.
+#[test]
+fn class_sizes_refute_a_wrong_product() {
+    let config = Config {
+        max_branch_points: Some(20_000),
+        ..Config::default()
+    };
+    let out = consistency(&multiplication(2, 3, 7, true), &config);
+    assert_eq!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
+    assert_eq!(out.telemetry.branch_points, 0, "{}", out.telemetry);
+    // Without counting the search starts (one branch point is enough to see it).
+    let off = consistency(
+        &multiplication(2, 3, 7, true),
+        &Config {
+            counting: false,
+            max_branch_points: Some(1),
+            ..config.clone()
+        },
+    );
+    assert!(off.telemetry.branch_points > 0, "{}", off.telemetry);
+    let out = consistency(&multiplication(2, 3, 6, true), &config);
+    assert_eq!(out.answer, Answer::Consistent, "{}", out.telemetry);
+    // Nothing refuted: decided consistent, or given up on a small budget.
+    let few = Config {
+        max_branch_points: Some(2_000),
+        ..config.clone()
+    };
+    let out = consistency(&multiplication(2, 3, 7, false), &few);
+    assert_ne!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
+}
+
+/// Guard (keyed role plans on a self-loop): a plan keyed by the edge's target must run
+/// for `r(x, x)` too (the brute-force campaign, seed 96, case 206: a subsumption through
+/// `∃r.Self` was missed where the keyed lookup stopped after the source). Here
+/// `A ⊓ ∃r.Self ⊓ ∀r⁻.B`: `r(x, x)` with `∀r⁻.B(x)` (keyed by the target) gives `B(x)`,
+/// which clashes with `A`. Padding universals make the role's keyed plans outnumber the
+/// labels, so the lookup path runs.
+#[test]
+fn keyed_plans_run_on_a_self_loop() {
+    let mut b = Build::default();
+    let r = ObjProp::Named(200);
+    let (a, bb) = (b.class(1), b.class(2));
+    let own = b.e(ClassExpr::HasSelf(r));
+    let back = b.all(r.inverse(), bb);
+    let x = b.and(&[a, own, back]);
+    let nothing = b.e(ClassExpr::Nothing);
+    let ab = b.and(&[a, bb]);
+    b.sub(ab, nothing);
+    for i in 0..50 {
+        let pad = b.class(100 + i);
+        let pad_to = b.class(200 + i);
+        let all = b.all(r, pad_to);
+        b.sub(pad, all);
+    }
+    b.assert(x, 1000);
+    let out = consistency(&b.o, &Config::default());
+    assert_eq!(out.answer, Answer::Inconsistent, "{}", out.telemetry);
+}
+
+/// A clause body wider than a join plan's positions (review A-1501): `C₀ ⊓ … ⊓ Cₙ₋₁ ⊑ D`
+/// with `¬D(a)`. With `a` in all but one `Cᵢ` it has a model (that `Cᵢ` and `D` empty);
+/// with `a` in every `Cᵢ` it has none. At 256 atoms, the most a plan names, both answers
+/// are decided; at 257 it is never refuted, whichever `Cᵢ` is left out, and never
+/// consistent with none left out.
+#[test]
+fn a_wide_clause_body_is_never_misread() {
+    for (n, left_outs) in [
+        (256, vec![Some(0), Some(255), None]),
+        (257, (0..257).map(Some).chain([None]).collect()),
+    ] {
+        for left_out in left_outs {
+            let mut b = Build::default();
+            let cs: Vec<ExprId> = (0..n).map(|i| b.class(1000 + i)).collect();
+            let all = b.and(&cs);
+            let d = b.class(1);
+            b.sub(all, d);
+            let not_d = b.not(d);
+            b.assert(not_d, 100);
+            for (i, &c) in cs.iter().enumerate() {
+                if left_out != Some(i as u64) {
+                    b.assert(c, 100);
+                }
+            }
+            let answer = consistency(&b.o, &Config::default()).answer;
+            match (n, left_out) {
+                (256, Some(i)) => assert_eq!(answer, Answer::Consistent, "{n}: C{i} left out"),
+                (256, None) => assert_eq!(answer, Answer::Inconsistent, "{n}: none left out"),
+                (_, Some(i)) => assert_ne!(answer, Answer::Inconsistent, "{n}: C{i} left out"),
+                (_, None) => assert_ne!(answer, Answer::Consistent, "{n}: none left out"),
+            }
+        }
+    }
+}
+
+/// A clause head wider than a plan's head positions (PR #28): `A ⊑ ≤ 1 R.B ⊔
+/// {a₁ … aₖ} ⊔ ∃d.rdfs:Literal` with `A(a)`, `R(a, b)`, `B(b)` has a model (`a` with a `d`
+/// value), with 255 individuals (a 257-atom head) as with 254.
+#[test]
+fn a_wide_clause_head_is_never_misread() {
+    for k in [254, 255] {
+        let mut b = Build::default();
+        let r = ObjProp::Named(200);
+        let (a, bb) = (b.class(1), b.class(2));
+        let at_most = b.e(ClassExpr::Max(1, r, bb));
+        let one_of = b.e(ClassExpr::OneOf((0..k).map(|i| 2000 + i).collect()));
+        let literal = b.range(DataRange::Literal);
+        let value = b.e(ClassExpr::DataSome(400, literal));
+        let head = b.or(&[at_most, one_of, value]);
+        b.sub(a, head);
+        b.assert(a, 100);
+        b.role_assertion(200, 100, 101);
+        b.assert(bb, 101);
+        let answer = consistency(&b.o, &Config::default()).answer;
+        assert_eq!(answer, Answer::Consistent, "{k} individuals");
+    }
+}
+
+/// Guard (small-scope cases 623, 677, 732, 786, 12 October 2026): operands of a
+/// disjointness that the universal property's rewriting makes equal (`∃U.{a}` and `⊤`
+/// are both `⊤`) make it empty; dropping the repeat answered "consistent".
+#[test]
+fn disjoint_operands_the_universal_property_makes_equal() {
+    let top = ObjProp::Named(501);
+    let mut b = Build::default();
+    b.o.builtin.top_object = Some(501);
+    let a_value = b.e(ClassExpr::HasValue(top, 100));
+    let thing = b.e(ClassExpr::Thing);
+    b.disjoint(a_value, thing);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+    let mut b = Build::default();
+    b.o.builtin.top_object = Some(501);
+    let b_value = b.e(ClassExpr::HasValue(top, 101));
+    let a_value = b.e(ClassExpr::HasValue(top, 100));
+    let mut parts = vec![a_value, b_value];
+    parts.sort();
+    b.axiom(Axiom::DisjointUnion(1, parts));
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+/// Guard: fourteen distinct patterns in the ontology, each range with one, are decided
+/// (the limit of patterns one set of values combines is per combination, not per
+/// ontology; past twelve in the ontology every pattern was left undecided); a variable
+/// whose own constraints combine fourteen gives up, never answers.
+#[test]
+fn many_patterns_are_decided_where_each_range_has_few() {
+    let mut b = Build::default();
+    let d = 300;
+    let string = b.term(Some("http://www.w3.org/2001/XMLSchema#string".into()));
+    let pattern = b.term(Some("http://www.w3.org/2001/XMLSchema#pattern".into()));
+    let mut ranges = Vec::new();
+    for k in 0..14 {
+        let source = b.literal(&format!("x{k}[a-z]*"), "string");
+        ranges.push(b.range(DataRange::Restriction(string, vec![(pattern, source)])));
+    }
+    for (k, &r) in ranges.iter().enumerate() {
+        let c = b.class(1 + k as u64);
+        let some = b.e(ClassExpr::DataSome(d, r));
+        b.sub(c, some);
+    }
+    let first = b.class(1);
+    b.assert(first, 100);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    // One value in all fourteen: past what a set combines, the theory gives up (it
+    // never says consistent or inconsistent on a bound).
+    let mut all = b.o.clone();
+    let and = RangeId(all.ranges.intern(DataRange::And(ranges.clone())));
+    let some = ExprId(all.classes.intern(ClassExpr::DataSome(d, and)));
+    all.axioms.push(Axiom::ClassAssertion(some, 101));
+    all.sources.push(Vec::new());
+    assert!(matches!(
+        consistency(&all, &Config::default()).answer,
+        Answer::GaveUp(_) | Answer::Inconsistent
+    ));
+}
+
+/// A key over a non-simple property reads the pairs the property's chains compose, not
+/// only the asserted edges: with `r` transitive, `r(a, b)`, `r(b, c)` and `r(d, c)`, the
+/// named individuals `a` and `d` of `C` share the `r`-value `c`, so the key makes them one.
+#[test]
+fn keys_read_the_pairs_a_transitive_property_composes() {
+    let r = ObjProp::Named(200);
+    let mut b = Build::default();
+    let c = b.class(1);
+    b.characteristic(Characteristic::Transitive, r);
+    b.axiom(Axiom::HasKey(c, vec![r], Vec::new()));
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(200, 101, 102);
+    b.role_assertion(200, 103, 102);
+    b.assert(c, 100);
+    b.assert(c, 103);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.different(100, 103);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}
+
+/// A key over two transitive properties and a simple one (review A-1205) needs a shared value
+/// of each: `a` and `d` share `c` along `r` (composed), `g` along `t`, but no `s`-value until
+/// `s(f, e)` composes `s(d, e)` with `s(a, e)`.
+#[test]
+fn a_key_over_two_transitive_properties_needs_a_value_of_each() {
+    let (r, s, t) = (
+        ObjProp::Named(200),
+        ObjProp::Named(201),
+        ObjProp::Named(202),
+    );
+    let mut b = Build::default();
+    let c = b.class(1);
+    b.characteristic(Characteristic::Transitive, r);
+    b.characteristic(Characteristic::Transitive, s);
+    b.axiom(Axiom::HasKey(c, vec![r, s, t], Vec::new()));
+    b.role_assertion(200, 100, 101);
+    b.role_assertion(200, 101, 102);
+    b.role_assertion(200, 103, 102);
+    b.role_assertion(201, 100, 104);
+    b.role_assertion(201, 103, 105);
+    b.role_assertion(202, 100, 106);
+    b.role_assertion(202, 103, 106);
+    b.assert(c, 100);
+    b.assert(c, 103);
+    b.different(100, 103);
+    assert_eq!(answer(&b.o), Answer::Consistent);
+    b.role_assertion(201, 105, 104);
+    assert_eq!(answer(&b.o), Answer::Inconsistent);
+}

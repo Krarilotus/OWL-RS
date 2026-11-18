@@ -170,6 +170,11 @@ pub async fn enforce_whole_read(
     authenticated: &Authenticated,
 ) -> Result<nrese_store::ReadScope, ApiError> {
     let access = query_access(state, authenticated).await?;
+    whole_read_scope(access)
+}
+
+/// Checks graph scope only; the caller owns action authorization and rate accounting.
+pub fn whole_read_scope(access: AccessView) -> Result<nrese_store::ReadScope, ApiError> {
     if access.reads_everything() {
         Ok(access.read_scope())
     } else {

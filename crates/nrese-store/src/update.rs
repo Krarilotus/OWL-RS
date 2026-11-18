@@ -16,6 +16,15 @@ impl SparqlUpdateRequest {
             using_named_graphs: Vec::new(),
         }
     }
+
+    /// The heap bytes it holds beside its own slot, by capacity.
+    pub fn heap_bytes(&self) -> usize {
+        let graphs = |graphs: &Vec<String>| {
+            graphs.capacity() * std::mem::size_of::<String>()
+                + graphs.iter().map(String::capacity).sum::<usize>()
+        };
+        self.update.capacity() + graphs(&self.using_graphs) + graphs(&self.using_named_graphs)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

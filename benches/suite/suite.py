@@ -6,6 +6,13 @@
     benches/suite/suite.py nrese       one system's column, with the reasons
     benches/suite/suite.py run ...     run the matrix (suite.py run --help)
     benches/suite/suite.py report ...  results as tables (suite.py report --help)
+    benches/suite/suite.py compare BASE NEW   a run against a baseline: regressions beyond noise
+    benches/suite/suite.py answers DIR...     the runs' captured answers classified per group (answers.py)
+    benches/suite/suite.py standings [--write]  NRESE against every contender (benches/STANDINGS.md)
+    benches/suite/suite.py ledger DIR...      the run records under benches/runs/ (outcomes, no numbers)
+    benches/suite/suite.py status [--write]   what is measured and what isn't (benches/STATUS.md)
+    benches/suite/suite.py coverage [--json]  which cells have a current receipt (suitekit/coverage.py)
+    benches/suite/suite.py data [freeze|verify]  the frozen datasets (benches/datasets.toml)
     benches/suite/suite.py images [systems]  the images the systems need (for build-sif.sh)
 
 A workload runs on a system if the system has every capability in the workload's `needs`
@@ -21,7 +28,9 @@ CAPABILITIES = {
     "load", "query", "update",
     "reason-rdfs", "reason-owl-horst", "reason-owl2-rl", "reason-owl2-ql",
     "reason-custom-rules", "reason-incremental", "consistency", "explain", "classify",
-    "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation",
+    "rules-nary", "rules-negation", "rules-arithmetic",
+    "shacl-core", "shacl-sparql", "fulltext", "geosparql", "federation", "rdf12", "vector",
+    "graph-access-inference",
 }
 STATES = {"ready", "partial", "planned", "blocked"}
 
@@ -55,9 +64,25 @@ def check(systems, workloads):
             errors.append(f"workloads.toml [{name}]: kit {workload.get('kit')!r} doesn't exist")
         if workload.get("state") == "blocked" and workload.get("waits-for") not in CAPABILITIES:
             errors.append(f"workloads.toml [{name}]: blocked needs waits-for = a capability")
+        if not isinstance(workload.get("tiers", []), list):
+            errors.append(f"workloads.toml [{name}]: tiers must be a list")
         for key in ("title", "kind", "tasks", "source", "licence", "check"):
             if key not in workload:
                 errors.append(f"workloads.toml [{name}]: {key} is missing")
+    # Published numbers of systems we don't measure (competitors/reported.toml).
+    from suitekit import reported
+    errors += reported.problems(systems)
+    # The order the families are measured in (schedule.toml).
+    from suitekit import schedule
+    errors += schedule.problems(workloads)
+    # The cases of every group (benches/cases/README.md).
+    from suitekit import cases
+    with open(HERE.parent / "datasets.toml", "rb") as f:
+        frozen = {d["file"] for d in tomllib.load(f).get("dataset", [])}
+    try:
+        errors += cases.problems(cases.load(), systems, workloads, frozen)
+    except ValueError as error:
+        errors.append(str(error))
     return errors
 
 
@@ -80,14 +105,39 @@ def main(argv):
     if argv[1:2] == ["run"]:
         from suitekit import driver
         return driver.main(argv[2:], systems, workloads, HERE.parent.parent)
+    if argv[1:2] == ["fleet"]:
+        from suitekit import fleet_cells
+        return fleet_cells.main(argv[2:], systems, workloads, HERE.parent.parent)
     if argv[1:2] == ["images"]:
         from suitekit import driver
         return driver.images(argv[2:], systems, HERE.parent.parent)
     if argv[1:2] == ["report"]:
         from suitekit import report
         return report.main(argv[2:])
+    if argv[1:2] == ["compare"]:
+        from suitekit import compare
+        return compare.main(argv[2:])
+    if argv[1:2] == ["standings"]:
+        from suitekit import standings
+        return standings.main(argv[2:], systems, HERE.parent.parent)
+    if argv[1:2] == ["answers"]:
+        from suitekit import answers
+        return answers.main(argv[2:])
+    if argv[1:2] == ["ledger"]:
+        from suitekit import ledger
+        return ledger.main(argv[2:], HERE.parent.parent)
+    if argv[1:2] == ["data"]:
+        from suitekit import datasets
+        return datasets.main(argv[2:], workloads, HERE.parent.parent)
+    if argv[1:2] == ["status"]:
+        from suitekit import status
+        return status.main(argv[2:], systems, workloads, HERE.parent.parent)
+    if argv[1:2] == ["coverage"]:
+        from suitekit import coverage
+        return coverage.main(argv[2:], systems, workloads, HERE.parent.parent)
     if argv[1:] == ["--check"]:
-        print(f"{len(systems)} systems, {len(workloads)} workloads: ok")
+        from suitekit import cases
+        print(f"{len(systems)} systems, {len(workloads)} workloads, {len(cases.load())} cases: ok")
         return 0
     if len(argv) == 2:
         system = systems.get(argv[1])

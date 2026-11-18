@@ -7,9 +7,11 @@
 //! subquery): [`super::exists::correlation_safe`]. Those patterns come here.
 //!
 //! A value is put in as a constant. SPARQL has no syntax for a particular blank node, so a
-//! blank node is put in as an alias IRI ([`ALIAS`] and its id), which the evaluation
-//! context reads as the node itself: in patterns ([`Context::lookup_const`]) and in
-//! expressions ([`super::expr::Evaluator`]'s aliases).
+//! blank node is put in as a made constant ([`internal::blank_constant`] of its label),
+//! which the evaluation context reads as the node itself: in patterns
+//! ([`Context::lookup_const`]) and in expressions ([`super::expr::Evaluator`]'s aliases).
+//! Triple terms use the same typed alias route, under [`internal::class_constant`] of
+//! their stored or computed id. No IRI is spelt like one.
 
 use std::collections::HashMap;
 
@@ -17,24 +19,40 @@ use nrese_rdf::{NamedNode, Term, Variable};
 use nrese_sparql_syntax::algebra::{
     AggregateExpression, Expression, GraphPattern, OrderExpression,
 };
+use nrese_sparql_syntax::internal;
 use nrese_sparql_syntax::term::{GroundTerm, NamedNodePattern, TermPattern, TriplePattern};
 
-/// The namespace of the alias IRIs that stand for blank nodes.
-pub(super) const ALIAS: &str = "urn:nrese:substituted-blank-node:";
+use super::{Context, NativeResult};
 
 /// An outer solution's values, as constants to put in.
 pub(super) struct Values<'a> {
-    pub(super) terms: &'a HashMap<Variable, Term>,
+    terms: &'a HashMap<Variable, Term>,
+    triples: HashMap<Variable, NamedNode>,
 }
 
-impl Values<'_> {
+impl<'a> Values<'a> {
+    /// Triple terms have no expression constant in the algebra. Register their typed
+    /// value under an existing made constant, using the context's charged computed ids
+    /// when the triple is not stored. The same alias works in patterns and expressions.
+    pub(super) fn new(ctx: &Context<'_>, terms: &'a HashMap<Variable, Term>) -> NativeResult<Self> {
+        let mut triples = HashMap::new();
+        for (variable, term) in terms {
+            if matches!(term, Term::Triple(_)) {
+                let id = ctx.id(term)?;
+                let name = internal::class_constant(id);
+                ctx.register_alias(name.as_str(), id);
+                triples.insert(variable.clone(), name);
+            }
+        }
+        Ok(Self { terms, triples })
+    }
+
     fn constant(&self, variable: &Variable) -> Option<Constant> {
         Some(match self.terms.get(variable)? {
             Term::NamedNode(n) => Constant::Iri(n.clone()),
             Term::Literal(l) => Constant::Literal(l.clone()),
-            Term::BlankNode(b) => Constant::Iri(alias(b.as_str())),
-            // Triple terms aren't substituted into the pattern: it stays a join.
-            Term::Triple(_) => return None,
+            Term::BlankNode(b) => Constant::Iri(internal::blank_constant(b.as_str())),
+            Term::Triple(_) => Constant::Iri(self.triples.get(variable)?.clone()),
         })
     }
 
@@ -54,7 +72,7 @@ impl Values<'_> {
             NamedNodePattern::Variable(v) => match self.constant(v) {
                 Some(Constant::Iri(n)) => NamedNodePattern::NamedNode(n),
                 // A literal where only an IRI may stand: a node no data has.
-                Some(Constant::Literal(_)) => NamedNodePattern::NamedNode(alias("literal")),
+                Some(Constant::Literal(_)) => NamedNodePattern::NamedNode(internal::no_term()),
                 None => name.clone(),
             },
             other => other.clone(),
@@ -69,8 +87,8 @@ impl Values<'_> {
         }
     }
 
-    pub(super) fn expression(&self, expression: &Expression) -> Expression {
-        let e = |x: &Expression| Box::new(self.expression(x));
+    fn expression<const PRE_BOUND: bool>(&self, expression: &Expression) -> Expression {
+        let e = |x: &Expression| Box::new(self.expression::<PRE_BOUND>(x));
         match expression {
             Expression::Variable(v) => match self.constant(v) {
                 Some(Constant::Iri(n)) => Expression::NamedNode(n),
@@ -98,56 +116,44 @@ impl Values<'_> {
             Expression::UnaryPlus(a) => Expression::UnaryPlus(e(a)),
             Expression::UnaryMinus(a) => Expression::UnaryMinus(e(a)),
             Expression::Not(a) => Expression::Not(e(a)),
-            Expression::In(a, list) => {
-                Expression::In(e(a), list.iter().map(|x| self.expression(x)).collect())
-            }
+            Expression::In(a, list) => Expression::In(
+                e(a),
+                list.iter()
+                    .map(|x| self.expression::<PRE_BOUND>(x))
+                    .collect(),
+            ),
             Expression::If(a, b, c) => Expression::If(e(a), e(b), e(c)),
-            Expression::Coalesce(list) => {
-                Expression::Coalesce(list.iter().map(|x| self.expression(x)).collect())
-            }
+            Expression::Coalesce(list) => Expression::Coalesce(
+                list.iter()
+                    .map(|x| self.expression::<PRE_BOUND>(x))
+                    .collect(),
+            ),
             Expression::FunctionCall(function, args) => Expression::FunctionCall(
                 function.clone(),
-                args.iter().map(|x| self.expression(x)).collect(),
+                args.iter()
+                    .map(|x| self.expression::<PRE_BOUND>(x))
+                    .collect(),
             ),
-            Expression::Exists(pattern) => Expression::Exists(Box::new(self.pattern(pattern))),
+            Expression::Exists(pattern) => {
+                Expression::Exists(Box::new(self.pattern_with::<PRE_BOUND>(pattern)))
+            }
         }
     }
 
-    /// A whole query's pattern with the values put in: as [`Self::pattern`], except that
-    /// the query's own projection doesn't hide them (they are pre-bound for the whole
-    /// query); it only stops listing them.
+    /// SHACL pre-binding applies throughout the query, including subqueries whose
+    /// projections leave the pre-bound variables out. Projections stop listing them.
     pub(super) fn top(&self, pattern: &GraphPattern) -> GraphPattern {
-        match pattern {
-            GraphPattern::Slice {
-                inner,
-                start,
-                length,
-            } => GraphPattern::Slice {
-                inner: Box::new(self.top(inner)),
-                start: *start,
-                length: *length,
-            },
-            GraphPattern::Distinct { inner } => GraphPattern::Distinct {
-                inner: Box::new(self.top(inner)),
-            },
-            GraphPattern::Reduced { inner } => GraphPattern::Reduced {
-                inner: Box::new(self.top(inner)),
-            },
-            GraphPattern::Project { inner, variables } => GraphPattern::Project {
-                inner: Box::new(self.pattern(inner)),
-                variables: variables
-                    .iter()
-                    .filter(|v| !self.terms.contains_key(*v))
-                    .cloned()
-                    .collect(),
-            },
-            other => self.pattern(other),
-        }
+        self.pattern_with::<true>(pattern)
     }
 
     /// `pattern` with the values put in.
     pub(super) fn pattern(&self, pattern: &GraphPattern) -> GraphPattern {
-        let p = |x: &GraphPattern| Box::new(self.pattern(x));
+        self.pattern_with::<false>(pattern)
+    }
+
+    // The caller selects the projection rule once, outside the recursive traversal.
+    fn pattern_with<const PRE_BOUND: bool>(&self, pattern: &GraphPattern) -> GraphPattern {
+        let p = |x: &GraphPattern| Box::new(self.pattern_with::<PRE_BOUND>(x));
         let kept = |variables: &[Variable]| -> Vec<Variable> {
             variables
                 .iter()
@@ -172,9 +178,8 @@ impl Values<'_> {
                 left: p(left),
                 right: p(right),
             },
-            GraphPattern::Join { left, right } => GraphPattern::Join {
-                left: p(left),
-                right: p(right),
+            GraphPattern::Join { inputs } => GraphPattern::Join {
+                inputs: inputs.iter().map(|input| *p(input)).collect(),
             },
             GraphPattern::LeftJoin {
                 left,
@@ -183,39 +188,37 @@ impl Values<'_> {
             } => GraphPattern::LeftJoin {
                 left: p(left),
                 right: p(right),
-                expression: expression.as_ref().map(|x| self.expression(x)),
+                expression: expression.as_ref().map(|x| self.expression::<PRE_BOUND>(x)),
             },
             GraphPattern::Filter { expr, inner } => GraphPattern::Filter {
-                expr: self.expression(expr),
+                expr: self.expression::<PRE_BOUND>(expr),
                 inner: p(inner),
             },
-            GraphPattern::Union { left, right } => GraphPattern::Union {
-                left: p(left),
-                right: p(right),
+            GraphPattern::Union { inputs } => GraphPattern::Union {
+                inputs: inputs.iter().map(|input| *p(input)).collect(),
             },
             GraphPattern::Graph { name, inner } => GraphPattern::Graph {
                 name: self.named_node_pattern(name),
                 inner: p(inner),
             },
             // Binding a variable the outer solution binds: the value must be the same.
-            GraphPattern::Extend {
-                inner,
-                variable,
-                expression,
-            } => match self.constant(variable) {
-                Some(constant) => GraphPattern::Filter {
-                    expr: Expression::SameTerm(
-                        Box::new(self.expression(expression)),
-                        Box::new(constant.expression()),
-                    ),
-                    inner: p(inner),
-                },
-                None => GraphPattern::Extend {
-                    inner: p(inner),
-                    variable: variable.clone(),
-                    expression: self.expression(expression),
-                },
-            },
+            GraphPattern::Extend { inner, bindings } => {
+                bindings
+                    .iter()
+                    .fold(*p(inner), |extended, (variable, expression)| {
+                        let expression = self.expression::<PRE_BOUND>(expression);
+                        match self.constant(variable) {
+                            Some(constant) => GraphPattern::Filter {
+                                expr: Expression::SameTerm(
+                                    Box::new(expression),
+                                    Box::new(constant.expression()),
+                                ),
+                                inner: Box::new(extended),
+                            },
+                            None => extended.extend(variable.clone(), expression),
+                        }
+                    })
+            }
             GraphPattern::Minus { left, right } => GraphPattern::Minus {
                 left: p(left),
                 right: p(right),
@@ -225,17 +228,19 @@ impl Values<'_> {
                 variables,
                 bindings,
             } => {
-                let put: Vec<(usize, Option<Constant>)> = variables
+                let put: Vec<(usize, &Term)> = variables
                     .iter()
                     .enumerate()
-                    .filter(|(_, v)| self.terms.contains_key(*v))
-                    .map(|(i, v)| (i, self.constant(v)))
+                    .filter_map(|(i, v)| self.terms.get(v).map(|term| (i, term)))
                     .collect();
                 let agrees = |row: &[Option<GroundTerm>]| {
-                    put.iter().all(|(i, constant)| match (&row[*i], constant) {
+                    put.iter().all(|(i, term)| match (&row[*i], *term) {
                         (None, _) => true,
-                        (Some(GroundTerm::NamedNode(n)), Some(Constant::Iri(m))) => n == m,
-                        (Some(GroundTerm::Literal(l)), Some(Constant::Literal(m))) => l == m,
+                        (Some(GroundTerm::NamedNode(n)), Term::NamedNode(m)) => n == m,
+                        (Some(GroundTerm::Literal(l)), Term::Literal(m)) => l == m,
+                        (Some(value @ GroundTerm::Triple(_)), Term::Triple(_)) => {
+                            Term::from(value.clone()) == **term
+                        }
                         _ => false,
                     })
                 };
@@ -259,21 +264,36 @@ impl Values<'_> {
                 expression: expression
                     .iter()
                     .map(|o| match o {
-                        OrderExpression::Asc(x) => OrderExpression::Asc(self.expression(x)),
-                        OrderExpression::Desc(x) => OrderExpression::Desc(self.expression(x)),
+                        OrderExpression::Asc(x) => {
+                            OrderExpression::Asc(self.expression::<PRE_BOUND>(x))
+                        }
+                        OrderExpression::Desc(x) => {
+                            OrderExpression::Desc(self.expression::<PRE_BOUND>(x))
+                        }
                     })
                     .collect(),
             },
-            // A subquery's variables are the outer ones only where it projects them.
+            // Correlation sees only projected variables; pre-binding crosses projections.
             GraphPattern::Project { inner, variables } => {
-                let visible: HashMap<Variable, Term> = self
-                    .terms
-                    .iter()
-                    .filter(|(v, _)| variables.contains(v))
-                    .map(|(v, t)| (v.clone(), t.clone()))
-                    .collect();
+                let inner = if PRE_BOUND {
+                    p(inner)
+                } else {
+                    let visible: HashMap<Variable, Term> = self
+                        .terms
+                        .iter()
+                        .filter(|(v, _)| variables.contains(v))
+                        .map(|(v, t)| (v.clone(), t.clone()))
+                        .collect();
+                    Box::new(
+                        Values {
+                            terms: &visible,
+                            triples: self.triples.clone(),
+                        }
+                        .pattern(inner),
+                    )
+                };
                 GraphPattern::Project {
-                    inner: Box::new(Values { terms: &visible }.pattern(inner)),
+                    inner,
                     variables: kept(variables),
                 }
             }
@@ -295,16 +315,13 @@ impl Values<'_> {
                 variables,
                 aggregates,
             } => GraphPattern::Group {
-                inner: Box::new(variables.iter().fold(self.pattern(inner), |grouped, v| {
-                    match self.constant(v) {
-                        Some(constant) => GraphPattern::Extend {
-                            inner: Box::new(grouped),
-                            variable: v.clone(),
-                            expression: constant.expression(),
-                        },
+                inner: Box::new(variables.iter().fold(
+                    self.pattern_with::<PRE_BOUND>(inner),
+                    |grouped, v| match self.constant(v) {
+                        Some(constant) => grouped.extend(v.clone(), constant.expression()),
                         None => grouped,
-                    }
-                })),
+                    },
+                )),
                 variables: variables.clone(),
                 aggregates: aggregates
                     .iter()
@@ -321,7 +338,7 @@ impl Values<'_> {
                                 distinct,
                             } => AggregateExpression::FunctionCall {
                                 name: name.clone(),
-                                expr: self.expression(expr),
+                                expr: self.expression::<PRE_BOUND>(expr),
                                 distinct: *distinct,
                             },
                         };
@@ -356,11 +373,6 @@ impl Constant {
     }
 }
 
-/// The alias IRI of blank node `label`.
-pub(super) fn alias(label: &str) -> NamedNode {
-    NamedNode::new_unchecked(format!("{ALIAS}{label}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -386,9 +398,17 @@ mod tests {
                 Term::from(nrese_rdf::BlankNode::new_unchecked("b7")),
             ),
         ]);
-        let text = Values { terms: &terms }.pattern(&pattern).to_string();
+        let text = Values {
+            terms: &terms,
+            triples: HashMap::new(),
+        }
+        .pattern(&pattern)
+        .to_string();
         assert!(!text.contains("?o"), "{text}");
-        assert!(text.contains(&format!("<{ALIAS}b7>")), "{text}");
+        assert!(
+            text.contains(&format!("<{}>", internal::blank_constant("b7").as_str())),
+            "{text}"
+        );
         // VALUES keeps the agreeing row and drops the column.
         assert!(!text.contains(" 2 "), "{text}");
     }

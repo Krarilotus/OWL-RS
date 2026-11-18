@@ -34,10 +34,37 @@ pub enum MutationError {
     Retired,
 }
 
+// Every write's result carries this error. Clippy's `result_large_err` stops the gate at 128
+// bytes, and a path is 8 bytes wider on Windows than on Linux: 96 holds on both, with room.
+const _: () = assert!(std::mem::size_of::<MutationError>() <= 96);
+
 /// Details of a gate rejection, shared by HTTP problem responses and operator diagnostics.
+/// A committer that may read only some graphs is told only what its own view shows
+/// (`super::evidence`, the one place that makes a rejection).
 #[derive(Debug, Clone)]
 pub struct MutationReject {
+    /// What kind of reason the committer is shown: a restricted committer is shown its own
+    /// view's first reason, whichever gate rejected (`super::evidence`).
+    pub kind: RejectKind,
     pub detail: String,
     pub explanation: Option<RejectExplanation>,
     pub attribution: Option<RejectAttribution>,
+    pub(super) _projected: super::evidence::Projected,
+}
+
+/// The kind of reason a rejected committer is shown, for a transport to label it. It is the
+/// kind of the reason shown, not of the gate that rejected: a restricted committer's own
+/// graphs can be inconsistent where the SHACL gate rejected the whole data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectKind {
+    /// The data shown is inconsistent (an OWL 2 RL consistency rule, or OWL 2 DL): the
+    /// whole data for a reader of every graph, else the committer's own graphs.
+    Inconsistent,
+    /// Under `owl2-dl`, the OWL 2 RL rules find a clash in the whole data that OWL 2 DL may
+    /// read as consistent, and the store doesn't decide which (`crate::WhyUndecided`).
+    Undecided,
+    /// The data shown has SHACL results the gate rejects for, as above.
+    ShapesViolated,
+    /// The committer's graphs show no reason by themselves: the same for every gate.
+    NotShown,
 }

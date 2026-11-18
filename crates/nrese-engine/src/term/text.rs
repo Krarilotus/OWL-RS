@@ -30,6 +30,12 @@ use std::collections::{BTreeMap, HashMap};
 use rayon::prelude::*;
 use rust_stemmers::{Algorithm, Stemmer};
 
+mod private;
+mod scope;
+pub(crate) use private::{Local, Private};
+pub(crate) use scope::Bits;
+pub use scope::Corpus;
+
 /// What to search for.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextQuery {
@@ -74,7 +80,7 @@ pub fn stemmer(language: &str) -> Option<Stemmer> {
 
 /// How a query word matches indexed words.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Match {
+pub(crate) enum Match {
     Exact,
     Prefix,
     /// Within this many edits.
@@ -134,17 +140,38 @@ pub(crate) fn local_name_text(iri: &str) -> Option<String> {
     if local.is_empty() {
         return None;
     }
-    let mut spaced = String::with_capacity(local.len() * 2);
-    let mut previous: Option<char> = None;
+    // Measured first, so the text is made in one allocation of exactly its length
+    // ([`local_name_text_bytes`] bounds it).
+    let split = |previous: Option<char>, c: char| {
+        previous.is_some_and(|p| p.is_lowercase() && c.is_uppercase())
+    };
+    let mut previous = None;
+    let mut spaces = 0;
     for c in local.chars() {
-        if previous.is_some_and(|p| p.is_lowercase() && c.is_uppercase()) {
-            spaced.push(' ');
-        }
-        spaced.push(c);
+        spaces += usize::from(split(previous, c));
         previous = Some(c);
     }
-    let whole: String = local.chars().filter(|c| c.is_alphanumeric()).collect();
-    Some(format!("{spaced} {whole}"))
+    let alphanumeric = |c: &char| c.is_alphanumeric();
+    let whole: usize = local.chars().filter(alphanumeric).map(char::len_utf8).sum();
+    let mut text = String::with_capacity(local.len() + spaces + 1 + whole);
+    let mut previous = None;
+    for c in local.chars() {
+        if split(previous, c) {
+            text.push(' ');
+        }
+        text.push(c);
+        previous = Some(c);
+    }
+    text.push(' ');
+    text.extend(local.chars().filter(alphanumeric));
+    Some(text)
+}
+
+/// The most bytes [`local_name_text`] allocates for an IRI of `iri_len` bytes: its one
+/// allocation, of the local name (at most the IRI), a space at most a byte before each of
+/// its bytes, one more, and its letters and digits (at most the local name again).
+pub(crate) const fn local_name_text_bytes(iri_len: usize) -> usize {
+    3 * iri_len + 1
 }
 
 /// The words of `text`: maximal runs of letters and digits, lower-cased.
@@ -219,6 +246,54 @@ impl Postings {
     }
 }
 
+/// What a search ranks among ([`TextIndex::search_over`]): its documents' number and words,
+/// and a word's postings restricted to its documents. Every indexed document ([`Whole`]),
+/// or a reader's corpus ([`Corpus`]); the search body is one, monomorphised per scope, so
+/// the whole index's search does the work it did before scopes existed.
+pub(crate) trait Scope {
+    fn documents(&self) -> u64;
+    fn total_words(&self) -> u64;
+    /// `list`, a word's postings in the index, restricted to this scope's documents.
+    fn postings<'l>(&self, list: Cow<'l, [(u64, u16)]>) -> Cow<'l, [(u64, u16)]>;
+}
+
+impl<T: Scope> Scope for &T {
+    #[inline(always)]
+    fn documents(&self) -> u64 {
+        (**self).documents()
+    }
+
+    #[inline(always)]
+    fn total_words(&self) -> u64 {
+        (**self).total_words()
+    }
+
+    #[inline(always)]
+    fn postings<'l>(&self, list: Cow<'l, [(u64, u16)]>) -> Cow<'l, [(u64, u16)]> {
+        (**self).postings(list)
+    }
+}
+
+/// Every document of an index: its own statistics, its postings as they are.
+pub(crate) struct Whole<'a>(pub(crate) &'a TextIndex);
+
+impl Scope for Whole<'_> {
+    #[inline]
+    fn documents(&self) -> u64 {
+        self.0.documents
+    }
+
+    #[inline]
+    fn total_words(&self) -> u64 {
+        self.0.total_words
+    }
+
+    #[inline(always)]
+    fn postings<'l>(&self, list: Cow<'l, [(u64, u16)]>) -> Cow<'l, [(u64, u16)]> {
+        list
+    }
+}
+
 /// The index. Documents are numbered by the caller (the dictionary's entry numbers), in
 /// ascending order as they are added.
 #[derive(Debug)]
@@ -272,9 +347,97 @@ fn tokens(text: &str) -> (HashMap<String, u16>, u16) {
     (counts, length)
 }
 
+/// How many words a document holding `text` has, as [`TextIndex::add`] counts them (0: it
+/// is not a document), counted in place: nothing is allocated.
+pub(crate) fn word_length(text: &str) -> u16 {
+    u16::try_from(word_count(text)).unwrap_or(u16::MAX)
+}
+
+/// The words of `text` as [`words`] splits them, counted without making them.
+pub(crate) fn word_count(text: &str) -> usize {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|word| !word.is_empty())
+        .count()
+}
+
+/// The version of [`TextIndex::write`]'s layout.
+const TEXT_FORMAT: u32 = 1;
+
+/// Lengths written per piece.
+const LENGTH_PIECE: usize = 1 << 16;
+
 impl TextIndex {
     pub(crate) fn covered(&self) -> u64 {
         self.covered
+    }
+
+    /// The index as bytes ([`super::derived`]); the stem maps are left out (built again
+    /// per language at the first stemmed search).
+    pub(crate) fn write<W: std::io::Write>(
+        &self,
+        out: &mut super::derived::Writer<W>,
+    ) -> std::io::Result<()> {
+        out.u32(TEXT_FORMAT)?;
+        out.u64(self.covered)?;
+        out.u64(self.documents)?;
+        out.u64(self.total_words)?;
+        out.u64(self.word_count as u64)?;
+        out.u64(self.lengths.len() as u64)?;
+        for piece in self.lengths.chunks(LENGTH_PIECE) {
+            let bytes: Vec<u8> = piece.iter().flat_map(|l| l.to_le_bytes()).collect();
+            out.bytes(&bytes)?;
+        }
+        for shard in &self.shards {
+            out.u64(shard.len() as u64)?;
+            for (word, postings) in shard {
+                out.blob(word.as_bytes())?;
+                out.u64(postings.last)?;
+                out.u32(postings.len)?;
+                out.blob(&postings.bytes)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The index [`Self::write`] wrote; `None` if the bytes aren't one.
+    pub(crate) fn read(input: &mut super::derived::Reader<'_>) -> Option<Self> {
+        if input.u32()? != TEXT_FORMAT {
+            return None;
+        }
+        let covered = input.u64()?;
+        let documents = input.u64()?;
+        let total_words = input.u64()?;
+        let word_count = usize::try_from(input.u64()?).ok()?;
+        let n = input.len(2)?;
+        let lengths: Vec<u16> = input
+            .bytes(n * 2)?
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| u16::from_le_bytes(*b))
+            .collect();
+        let mut shards = Vec::with_capacity(SHARDS);
+        for _ in 0..SHARDS {
+            let words = input.len(1)?;
+            let mut shard = BTreeMap::new();
+            for _ in 0..words {
+                let word = std::str::from_utf8(input.blob()?).ok()?;
+                let last = input.u64()?;
+                let len = input.u32()?;
+                let bytes = input.blob()?.to_vec();
+                shard.insert(Box::from(word), Postings { bytes, last, len });
+            }
+            shards.push(shard);
+        }
+        input.is_done().then_some(Self {
+            covered,
+            shards,
+            lengths,
+            documents,
+            total_words,
+            word_count,
+            stems: HashMap::new(),
+        })
     }
 
     fn record_length(&mut self, document: u64, length: u16) {
@@ -462,28 +625,138 @@ impl TextIndex {
     }
 
     /// The literals matching `query`, best first (ties by id); `text_of` gives a literal's
-    /// text, to check phrases.
+    /// text, to check phrases. Ranked among every indexed document ([`Whole`]).
     pub(crate) fn search(
         &self,
         query: &TextQuery,
         text_of: &dyn Fn(u64) -> Option<String>,
     ) -> Vec<TextMatch> {
-        let documents = self.documents as f64;
+        self.search_over(query, text_of, &Whole(self))
+    }
+
+    /// The documents of `scope` matching `query`, best first (ties by id), scored by BM25
+    /// with `scope`'s statistics alone: its document count and mean length, each word's
+    /// frequency among its documents, the best match among them ([`Scope`]: every indexed
+    /// document, or a reader's corpus). `text_of` gives a document's text, to check phrases.
+    pub(crate) fn search_over<S: Scope>(
+        &self,
+        query: &TextQuery,
+        text_of: &dyn Fn(u64) -> Option<String>,
+        scope: &S,
+    ) -> Vec<TextMatch> {
+        search_with(
+            query,
+            text_of,
+            &Indexed::new(self, scope, query.stem.as_deref()),
+        )
+    }
+}
+
+/// Where a search reads its documents' statistics, a word's postings among them and a
+/// document's length from ([`search_with`]): one index and a scope of it ([`Indexed`]), or
+/// a private snapshot's shared index below its own terms and the index of its own documents
+/// ([`Private`]; one search body over one document domain).
+pub(crate) trait Source {
+    fn documents(&self) -> u64;
+    fn total_words(&self) -> u64;
+    /// The postings of `word` among the source's documents: of the words it starts as a
+    /// prefix, within the edits of a fuzzy match, with its stem where stemming, else its
+    /// own; merged by document, ascending.
+    fn postings(&self, word: &str, matching: Match) -> Cow<'_, [(u64, u16)]>;
+    /// The documents with `word` (its stem where stemming), of the whole of each index the
+    /// source reads: what an exclusion takes out of the matches.
+    fn excluding(&self, word: &str) -> Vec<u64>;
+    /// Words of `document` (1 where unknown).
+    fn length(&self, document: u64) -> f64;
+    /// The stemmer, where the query stems and its stems are prepared.
+    fn stemmer(&self) -> Option<&Stemmer>;
+}
+
+/// An index and a scope of it, with the query's stems where prepared: the global search
+/// ([`Whole`]) and a reader's ([`Corpus`]).
+pub(crate) struct Indexed<'a, S> {
+    index: &'a TextIndex,
+    scope: S,
+    stems: Option<(Stemmer, &'a Stems)>,
+}
+
+impl<'a, S: Scope> Indexed<'a, S> {
+    /// Stemming in `language` where it has a stemmer and `index` has its stems prepared.
+    pub(crate) fn new(index: &'a TextIndex, scope: S, language: Option<&str>) -> Self {
+        let stems = language
+            .and_then(|language| Some((stemmer(language)?, index.stems.get(&stem_key(language))?)));
+        Self {
+            index,
+            scope,
+            stems,
+        }
+    }
+
+    fn stems(&self) -> Option<(&Stemmer, &Stems)> {
+        self.stems
+            .as_ref()
+            .map(|(stemmer, stems)| (stemmer, *stems))
+    }
+}
+
+impl<S: Scope> Source for Indexed<'_, S> {
+    #[inline]
+    fn documents(&self) -> u64 {
+        self.scope.documents()
+    }
+
+    #[inline]
+    fn total_words(&self) -> u64 {
+        self.scope.total_words()
+    }
+
+    #[inline]
+    fn postings(&self, word: &str, matching: Match) -> Cow<'_, [(u64, u16)]> {
+        self.scope
+            .postings(self.index.postings_of(word, matching, self.stems()))
+    }
+
+    fn excluding(&self, word: &str) -> Vec<u64> {
+        self.index
+            .postings_of(word, Match::Exact, self.stems())
+            .iter()
+            .map(|&(id, _)| id)
+            .collect()
+    }
+
+    #[inline]
+    fn length(&self, document: u64) -> f64 {
+        self.index.length(document)
+    }
+
+    #[inline]
+    fn stemmer(&self) -> Option<&Stemmer> {
+        self.stems.as_ref().map(|(stemmer, _)| stemmer)
+    }
+}
+
+/// The literals or IRI names of `source` matching `query`, best first (ties by id), scored
+/// by BM25 with `source`'s statistics alone: its document count and mean length, each
+/// word's frequency among its documents, the best match among them. `text_of` gives a
+/// document's text, to check phrases. One body for every source, monomorphised per source,
+/// so the global search does the work it did before scopes existed.
+pub(crate) fn search_with<R: Source>(
+    query: &TextQuery,
+    text_of: &dyn Fn(u64) -> Option<String>,
+    source: &R,
+) -> Vec<TextMatch> {
+    {
+        let documents = source.documents() as f64;
         if documents == 0.0 {
             return Vec::new();
         }
-        let average = self.total_words as f64 / documents;
+        let average = source.total_words() as f64 / documents;
         let (k1, b) = (1.2, 0.75);
-        // Stemming, where the language has a stemmer and its stems are prepared.
-        let stemming = query
-            .stem
-            .as_deref()
-            .and_then(|language| Some((stemmer(language)?, self.stems.get(&stem_key(language))?)));
-        let stems = stemming.as_ref().map(|(stemmer, stems)| (stemmer, *stems));
         // Words compared in phrases: their stems when stemming.
+        let stemmer = source.stemmer();
         let normal = |word: &str| -> String {
-            match &stemming {
-                Some((stemmer, _)) => stemmer.stem(word).into_owned(),
+            match stemmer {
+                Some(stemmer) => stemmer.stem(word).into_owned(),
                 None => word.to_owned(),
             }
         };
@@ -530,7 +803,7 @@ impl TextIndex {
             let frequency = list.len() as f64;
             let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
             for &(id, count) in list {
-                let length = self.length(id);
+                let length = source.length(id);
                 let tf = f64::from(count);
                 *out.entry(id).or_default() +=
                     idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * length / average));
@@ -539,7 +812,7 @@ impl TextIndex {
         for phrase in &phrases {
             let lists: Vec<Cow<'_, [(u64, u16)]>> = phrase
                 .iter()
-                .map(|word| self.postings_of(word, Match::Exact, stems))
+                .map(|word| source.postings(word, Match::Exact))
                 .collect();
             if lists.iter().any(|list| list.is_empty()) {
                 continue;
@@ -572,11 +845,11 @@ impl TextIndex {
             }
         }
         for (word, matching) in &terms {
-            let found = self.postings_of(word, *matching, stems);
+            let found = source.postings(word, *matching);
             let frequency = found.len() as f64;
             let idf = (1.0 + (documents - frequency + 0.5) / (frequency + 0.5)).ln();
             for &(id, count) in found.iter() {
-                let length = self.length(id);
+                let length = source.length(id);
                 let tf = f64::from(count);
                 let score = idf * tf * (k1 + 1.0) / (tf + k1 * (1.0 - b + b * length / average));
                 let entry = scores.entry(id).or_default();
@@ -591,12 +864,7 @@ impl TextIndex {
         };
         let excluded: std::collections::HashSet<u64> = excluded
             .iter()
-            .flat_map(|word| {
-                self.postings_of(word, Match::Exact, stems)
-                    .iter()
-                    .map(|&(id, _)| id)
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(|word| source.excluding(word))
             .collect();
         let mut matches: Vec<TextMatch> = scores
             .into_iter()
@@ -754,6 +1022,30 @@ mod tests {
         );
         assert_eq!(local_name_text("urn:isbn:123").as_deref(), Some("123 123"));
         assert_eq!(local_name_text("http://example.com/"), None);
+    }
+
+    /// `local_name_text` makes its text in one allocation of its
+    /// length, within `local_name_text_bytes` of the IRI. The IRIs: a long one (`urn:`
+    /// and 1,025 `a`s), camel case at every letter, non-ASCII letters, a local name of
+    /// separators only.
+    #[test]
+    fn local_name_text_is_one_allocation_within_its_bound() {
+        let iris = [
+            format!("urn:{}", "a".repeat(1025)),
+            "http://example.com/aBaBaBaBaB".to_owned(),
+            "http://example.com/überÄpfel_Ölß".to_owned(),
+            "http://example.com/x#-_-".to_owned(),
+            "http://dbpedia.org/resource/Albert_Einstein".to_owned(),
+        ];
+        for iri in &iris {
+            let text = local_name_text(iri).unwrap();
+            assert_eq!(text.capacity(), text.len(), "{iri}");
+            assert!(text.capacity() <= local_name_text_bytes(iri.len()), "{iri}");
+        }
+        assert_eq!(
+            local_name_text("http://example.com/aBaB").as_deref(),
+            Some("a Ba B aBaB")
+        );
     }
 
     /// `-word` excludes the literals that have it; `word~` matches words within two edits,

@@ -14,26 +14,49 @@
 //! policy (L3 `nrese-store`), transport (L4). Fix storage-layout, visibility and durability
 //! bugs here and nowhere else.
 
+/// The unit tests' allocator: the system's, counting what measured operations hold
+/// against their budgets ([`nrese_exec::measure`]), so that an allocation not charged to its
+/// budget fails a test.
+#[cfg(test)]
+#[global_allocator]
+static MEASURED: nrese_exec::measure::Measured<std::alloc::System> =
+    nrese_exec::measure::Measured(std::alloc::System);
 pub mod cpu;
 mod durability;
 pub mod engine;
 pub mod error;
+#[cfg(feature = "fault-points")]
+pub mod fault_points;
 mod index;
 mod mapped;
 pub mod memory;
 pub mod quad;
 pub mod term;
+pub mod visit;
+#[cfg(any(test, all(feature = "witness", debug_assertions)))]
+pub mod witness;
 
-pub use durability::{DurabilityConfig, SyncPolicy};
+pub use durability::checkpoint::image_revision;
+pub use durability::{DurabilityConfig, SyncPolicy, WalDamage, place};
+pub use engine::Certificate;
 pub use engine::{
-    BulkLoad, BulkMode, CommitSummary, Engine, EngineConfig, EngineStats, ImageInfo, ReadModel,
-    Rematerialisation, Snapshot, Transaction,
+    Admission, Applied, AssertedIdentity, BulkLoad, BulkMode, CommitNote, CommitSummary, Content,
+    CorpusTuning, Count, CountedSnapshot, DEFAULT_READER_CORPUS_BYTES, Engine, EngineConfig,
+    EngineStats, EqualityClasses, Finished, GroupCounts, HeavyGroups, ImageInfo, InferredMask,
+    InferredSubset, LogBatch, LogExpectation, NoteError, OwnState, PendingView, PendingWrite,
+    PrivateTransaction, ProbeCursor, ReadModel, Rematerialisation, ScanColumns, SearchRefused,
+    Seek, SharedState, Snapshot, SnapshotIdentity, TextCorpusStats, TextScope, Transaction,
+    WriterHeld,
 };
 pub use error::{EngineError, EngineResult};
+pub use index::cursor::SeekStats;
 pub use index::{CompactionPolicy, IndexEncoding, set_index_encoding};
+/// Vector literals, metrics and indexes ([`Snapshot::vector_search`]).
+pub use nrese_vector as vector;
 pub use quad::{EncodedQuad, EncodedTriple, GraphSelector, QuadPattern};
 pub use term::vocabulary::{VocabularyEncoding, set_vocabulary_encoding};
 pub use term::{
-    Dictionary, DictionaryStats, Placement, StringTest, TermId, TermKind, TermView, TextMatch,
-    TextQuery,
+    Dictionary, DictionaryStats, Placement, StringScan, StringTest, TermId, TermKind, TermView,
+    TextMatch, TextQuery, VectorQuery, VectorSearchReport, VectorStrategy,
 };
+pub use visit::{Stopped, Visitor};

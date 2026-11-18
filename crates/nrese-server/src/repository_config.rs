@@ -15,7 +15,9 @@
 //!   (`nrc:rules`, Notation3 unless `nrc:rulesFormat "pie"`, with `nrc:` =
 //!   `https://nrese.dev/ns/config#`). A `.pie` file is the whole program (mode `custom`);
 //!   inline rules add to the ruleset named beside them, or are the whole program without
-//!   one. They are checked when the repository is created and kept with its settings.
+//!   one. They are checked when the repository is created and kept with its settings;
+//! - what a classification answers outside OWL 2 DL: `nrc:outsideProfile` (`proven`,
+//!   `dl-part`), else the server's `dl.outside_profile`.
 //!
 //! The repository id it names (`rep.id`, `repositoryID`) must be the one in the path.
 //! Everything else (the store type, its persistence and indexes) is NRESE's own: a
@@ -30,6 +32,8 @@ const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
 /// User rules in a repository's configuration (NRESE's own vocabulary).
 const CONFIG_RULES: &str = "https://nrese.dev/ns/config#rules";
 const CONFIG_RULES_FORMAT: &str = "https://nrese.dev/ns/config#rulesFormat";
+/// What a classification answers outside OWL 2 DL (NRESE's own vocabulary).
+const CONFIG_OUTSIDE_PROFILE: &str = "https://nrese.dev/ns/config#outsideProfile";
 
 /// The part of a configuration IRI after its namespace: `rep.id`, `repositoryID`.
 fn local_name(iri: &str) -> &str {
@@ -74,6 +78,7 @@ pub fn from_config(id: &str, quads: &[Quad]) -> Result<RepositorySettings, Strin
         match quad.predicate.as_str() {
             CONFIG_RULES => inline_rules = Some(value),
             CONFIG_RULES_FORMAT => rules_format = Some(value),
+            CONFIG_OUTSIDE_PROFILE => settings.outside_profile = Some(value.to_owned()),
             _ => {}
         }
         match local_name(quad.predicate.as_str()) {
@@ -287,5 +292,16 @@ mod tests {
             literal("/no/such/file.pie"),
         )];
         assert!(from_config("x", &missing).is_err());
+    }
+
+    /// `nrc:outsideProfile` chooses what the repository's classifications answer outside
+    /// OWL 2 DL.
+    #[test]
+    fn the_outside_profile_in_the_configuration() {
+        let config = vec![quad("r", CONFIG_OUTSIDE_PROFILE, literal("dl-part"))];
+        assert_eq!(
+            from_config("x", &config).unwrap().outside_profile_mode(),
+            Some(nrese_store::OutsideProfile::DlPart)
+        );
     }
 }

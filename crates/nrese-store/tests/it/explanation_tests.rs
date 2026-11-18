@@ -1,9 +1,10 @@
 //! Why an inferred statement holds (`StoreService::explain_statement`): a derivation from
 //! asserted statements, each step naming its rule and premises.
 
+use crate::support::Writes;
 use crate::support::in_memory_store_config;
 use nrese_rdf::{NamedNode, Term};
-use nrese_reasoner::v2::rulesets::Ruleset;
+use nrese_reasoner::rulesets::Ruleset;
 use nrese_store::{SparqlUpdateRequest, StoreService};
 
 const EX: &str = "http://example.com/";
@@ -31,13 +32,15 @@ fn inferences_are_explained_by_their_derivations() {
         .unwrap();
     store.rematerialise(Ruleset::Owl2Rl).unwrap();
     let explain = |s: &str, p: &str, o: &str| {
-        store.explain_statement(
-            Ruleset::Owl2Rl,
-            &nrese_store::ReadScope::All,
-            iri(s).as_ref(),
-            iri(p).as_ref(),
-            iri(o).as_ref(),
-        )
+        store
+            .explain_statement(
+                Ruleset::Owl2Rl,
+                &nrese_store::ReadScope::All,
+                iri(s).as_ref(),
+                iri(p).as_ref(),
+                iri(o).as_ref(),
+            )
+            .unwrap()
     };
 
     // Two subclass steps down to the asserted statements: `a` is a D, and D is a subclass
@@ -113,6 +116,7 @@ fn explanations_stay_within_the_readers_graphs() {
         )))
         .unwrap();
     store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
     let scope = |inferred: bool| {
         nrese_store::ReadScope::Graphs(Arc::new(nrese_sparql::GraphAccess {
             graphs: vec![format!("{EX}open")],
@@ -121,13 +125,15 @@ fn explanations_stay_within_the_readers_graphs() {
         }))
     };
     let explain = |scope: &nrese_store::ReadScope, s: &str, p: &str, o: &str| {
-        store.explain_statement(
-            Ruleset::Owl2Rl,
-            scope,
-            iri(s).as_ref(),
-            iri(p).as_ref(),
-            iri(o).as_ref(),
-        )
+        store
+            .explain_statement(
+                Ruleset::Owl2Rl,
+                scope,
+                iri(s).as_ref(),
+                iri(p).as_ref(),
+                iri(o).as_ref(),
+            )
+            .unwrap()
     };
     // `a` is a D: the open premise shown, the secret one hidden.
     let steps =
@@ -147,4 +153,113 @@ fn explanations_stay_within_the_readers_graphs() {
     // Unrestricted, everything is shown.
     let all = explain(&nrese_store::ReadScope::All, "a", TYPE, "D").unwrap();
     assert!(all.iter().all(|s| s.origin != "hidden"));
+}
+
+/// Justifications (`StoreService::justify_statement`): the minimal sets of asserted
+/// statements an inference follows from, smallest first, with their core and union, each
+/// listed one backed by a proof the checker accepts.
+#[test]
+fn inferences_are_justified_by_minimal_sets() {
+    use nrese_store::reasoning::JustificationMode;
+    let store = StoreService::new(in_memory_store_config()).unwrap();
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#>
+             INSERT DATA {{ ex:a a ex:C . ex:C rdfs:subClassOf ex:D . ex:D rdfs:subClassOf ex:E .
+                            ex:C rdfs:subClassOf ex:E . ex:a a ex:B . ex:B rdfs:subClassOf ex:E }}"
+        )))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    let justify = |mode| {
+        store
+            .justify_statement(
+                Ruleset::Owl2Rl,
+                &nrese_store::ReadScope::All,
+                [iri("a").as_ref(), iri(TYPE).as_ref(), iri("E").as_ref()],
+                mode,
+            )
+            .unwrap()
+            .expect("a is an E")
+    };
+    let text = |set: &[nrese_store::reasoning::JustifiedStatement]| {
+        let mut lines: Vec<String> = set
+            .iter()
+            .map(|s| {
+                let local = |t: &str| t.rsplit(['/', '#']).next().unwrap().to_owned();
+                format!(
+                    "{} {} {}",
+                    local(&s.subject),
+                    local(&s.predicate),
+                    local(&s.object)
+                )
+            })
+            .collect();
+        lines.sort();
+        lines.join(", ")
+    };
+    let all = justify(JustificationMode::All);
+    assert!(all.complete);
+    assert_eq!(all.verified, Some(true));
+    let found: Vec<String> = all.sets.iter().map(|s| text(s)).collect();
+    // Two of two statements, then the one of three; nothing else (no ruleset axiom is
+    // needed for subclass reasoning).
+    assert_eq!(found.len(), 3, "{found:#?}");
+    assert!(all.sets[0].len() == 2 && all.sets[1].len() == 2 && all.sets[2].len() == 3);
+    assert!(
+        found.contains(&"B subClassOf E, a type B".to_owned()),
+        "{found:#?}"
+    );
+    assert!(
+        found.contains(&"C subClassOf E, a type C".to_owned()),
+        "{found:#?}"
+    );
+    assert!(
+        found.contains(&"C subClassOf D, D subClassOf E, a type C".to_owned()),
+        "{found:#?}"
+    );
+
+    let one = justify(JustificationMode::One);
+    assert_eq!(one.sets.len(), 1);
+    assert!(found.contains(&text(&one.sets[0])));
+    assert_eq!(one.verified, Some(true));
+    // No statement is in all three; all six are in one.
+    assert_eq!(justify(JustificationMode::Core).sets, vec![Vec::new()]);
+    let union = justify(JustificationMode::Union);
+    assert!(union.complete);
+    assert_eq!(union.sets[0].len(), 6);
+    let top = justify(JustificationMode::Top(2));
+    assert_eq!(top.sets.len(), 2);
+    assert!(top.complete && top.sets.iter().all(|s| s.len() == 2));
+
+    // Remove the direct route through B: `a type C` is then in every justification.
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> DELETE DATA {{ ex:a a ex:B }}"
+        )))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    assert_eq!(text(&justify(JustificationMode::Core).sets[0]), "a type C");
+    // An asserted statement is its own justification.
+    let asserted = store
+        .justify_statement(
+            Ruleset::Owl2Rl,
+            &nrese_store::ReadScope::All,
+            [iri("a").as_ref(), iri(TYPE).as_ref(), iri("C").as_ref()],
+            JustificationMode::One,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(text(&asserted.sets[0]), "a type C");
+    // A statement that doesn't hold has none.
+    assert!(
+        store
+            .justify_statement(
+                Ruleset::Owl2Rl,
+                &nrese_store::ReadScope::All,
+                [iri("a").as_ref(), iri(TYPE).as_ref(), iri("B").as_ref()],
+                JustificationMode::One,
+            )
+            .unwrap()
+            .is_none()
+    );
 }

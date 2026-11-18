@@ -101,11 +101,10 @@ impl Context<'_> {
             let keep: Vec<bool> = by_id.iter().map(|&joined| !joined).collect();
             rows_where(&result, &keep)
         });
-        self.consumed(&result);
+        self.consumed(result);
         let left = self.produced(left)?;
         let shared = [b.clone()];
-        let probe = self.merge_set.is_none()
-            && (left.table.len() as u64).saturating_mul(PROBE_FACTOR) < count;
+        let probe = self.index_join(left.table.len(), count);
         let joined = if probe {
             self.probe_join(left, scan, &shared)?
         } else {

@@ -1,8 +1,10 @@
 //! SPARQL Query Results XML: written as bytes (the layout `sparesults` writes), read from
 //! `quick-xml` events one solution at a time.
 //!
-//! Reading goes by local names, so the results namespace may be the default one or have a
-//! prefix; `its:dir` is any attribute named `dir` with a prefix.
+//! Reading goes by namespace and local name (Namespaces in XML), so the results namespace
+//! may be the default one or have any prefix, elements of other namespaces are never the
+//! format's, and a literal's direction is `dir` in the ITS namespace alone. The document
+//! is `sparql` holding one `head`, then one `results` or `boolean`, and nothing else.
 
 use std::io::BufRead;
 use std::sync::Arc;
@@ -12,10 +14,11 @@ use nrese_rdf::{
     BlankNode, Literal, NamedNode, NamedOrBlankNode, NamedOrBlankNodeRef, Term, TermRef, Triple,
     Variable,
 };
-use quick_xml::Reader;
+use quick_xml::NsReader;
 use quick_xml::events::{BytesStart, Event};
+use quick_xml::name::{Namespace, NamespaceResolver, ResolveResult};
 
-use crate::error::{QueryResultsParseError, QueryResultsSyntaxError};
+use crate::error::{QueryResultsParseError, QueryResultsSyntaxError, XmlUnrepresentable};
 
 const NAMESPACE: &str = "http://www.w3.org/2005/sparql-results#";
 const ITS: &str = "http://www.w3.org/2005/11/its";
@@ -23,28 +26,40 @@ const ITS: &str = "http://www.w3.org/2005/11/its";
 // ---------------------------------------------------------------------------------------
 // Writing
 
-/// `text` with `& < > ' "` escaped.
-fn escaped(out: &mut Vec<u8>, text: &str) {
+/// `text` with `& < > ' "` escaped and CR as a reference (a raw CR reads as LF, XML 1.0
+/// §2.11); a character XML 1.0 can't hold at all (§2.2) is refused.
+fn escaped(out: &mut Vec<u8>, text: &str) -> Result<(), XmlUnrepresentable> {
+    let bytes = text.as_bytes();
     let mut run = 0;
-    for (i, b) in text.bytes().enumerate() {
+    for (i, &b) in bytes.iter().enumerate() {
         let entity: &[u8] = match b {
             b'&' => b"&amp;",
             b'<' => b"&lt;",
             b'>' => b"&gt;",
             b'\'' => b"&apos;",
             b'"' => b"&quot;",
+            b'\r' => b"&#13;",
+            b'\t' | b'\n' => continue,
+            0..=0x1F => return Err(XmlUnrepresentable(char::from(b))),
+            // U+FFFE and U+FFFF are EF BF BE and EF BF BF.
+            0xEF => match bytes.get(i + 1..i + 3) {
+                Some([0xBF, 0xBE]) => return Err(XmlUnrepresentable('\u{FFFE}')),
+                Some([0xBF, 0xBF]) => return Err(XmlUnrepresentable('\u{FFFF}')),
+                _ => continue,
+            },
             _ => continue,
         };
-        out.extend_from_slice(&text.as_bytes()[run..i]);
+        out.extend_from_slice(&bytes[run..i]);
         out.extend_from_slice(entity);
         run = i + 1;
     }
-    out.extend_from_slice(&text.as_bytes()[run..]);
+    out.extend_from_slice(&bytes[run..]);
+    Ok(())
 }
 
 /// A literal's text: escaped, and whitespace at either end as character references, so
 /// that no reader takes it for layout.
-fn literal_text(out: &mut Vec<u8>, text: &str) {
+fn literal_text(out: &mut Vec<u8>, text: &str) -> Result<(), XmlUnrepresentable> {
     let blank = |c: char| matches!(c, '\t' | '\n' | '\r' | ' ');
     let trimmed = text.trim_matches(blank);
     let reference = |out: &mut Vec<u8>, c: char| {
@@ -57,11 +72,12 @@ fn literal_text(out: &mut Vec<u8>, text: &str) {
     };
     let leading = text.len() - text.trim_start_matches(blank).len();
     text[..leading].chars().for_each(|c| reference(out, c));
-    escaped(out, trimmed);
+    escaped(out, trimmed)?;
     if !trimmed.is_empty() {
         let end = leading + trimmed.len();
         text[end..].chars().for_each(|c| reference(out, c));
     }
+    Ok(())
 }
 
 pub(crate) fn write_boolean(out: &mut Vec<u8>, value: bool) {
@@ -72,52 +88,63 @@ pub(crate) fn write_boolean(out: &mut Vec<u8>, value: bool) {
     out.extend_from_slice(b"</boolean></sparql>");
 }
 
-pub(crate) fn write_head(out: &mut Vec<u8>, variables: &[Variable]) {
+pub(crate) fn write_head(
+    out: &mut Vec<u8>,
+    variables: &[Variable],
+) -> Result<(), XmlUnrepresentable> {
     out.extend_from_slice(b"<?xml version=\"1.0\"?><sparql xmlns=\"");
     out.extend_from_slice(NAMESPACE.as_bytes());
     out.extend_from_slice(b"\"><head>");
     for variable in variables {
         out.extend_from_slice(b"<variable name=\"");
-        escaped(out, variable.as_str());
+        escaped(out, variable.as_str())?;
         out.extend_from_slice(b"\"/>");
     }
     out.extend_from_slice(b"</head><results>");
+    Ok(())
 }
 
-pub(crate) fn write_row(out: &mut Vec<u8>, variables: &[Variable], row: &[Option<TermRef<'_>>]) {
+/// One `<result>`; on a refusal `out` may hold part of it, which the caller drops.
+pub(crate) fn write_row(
+    out: &mut Vec<u8>,
+    variables: &[Variable],
+    row: &[Option<TermRef<'_>>],
+) -> Result<(), XmlUnrepresentable> {
     out.extend_from_slice(b"<result>");
     for (variable, value) in variables.iter().zip(row) {
         let Some(value) = value else { continue };
         out.extend_from_slice(b"<binding name=\"");
-        escaped(out, variable.as_str());
+        escaped(out, variable.as_str())?;
         out.extend_from_slice(b"\">");
-        write_term(out, *value);
+        write_term(out, *value)?;
         out.extend_from_slice(b"</binding>");
     }
     out.extend_from_slice(b"</result>");
+    Ok(())
 }
 
 pub(crate) fn write_end(out: &mut Vec<u8>) {
     out.extend_from_slice(b"</results></sparql>");
 }
 
-pub(crate) fn write_term(out: &mut Vec<u8>, term: TermRef<'_>) {
+/// One term element; on a refusal `out` may hold part of it, which the caller drops.
+pub(crate) fn write_term(out: &mut Vec<u8>, term: TermRef<'_>) -> Result<(), XmlUnrepresentable> {
     match term {
         TermRef::NamedNode(iri) => {
             out.extend_from_slice(b"<uri>");
-            escaped(out, iri.as_str());
+            escaped(out, iri.as_str())?;
             out.extend_from_slice(b"</uri>");
         }
         TermRef::BlankNode(b) => {
             out.extend_from_slice(b"<bnode>");
-            escaped(out, b.as_str());
+            escaped(out, b.as_str())?;
             out.extend_from_slice(b"</bnode>");
         }
         TermRef::Literal(literal) => {
             out.extend_from_slice(b"<literal");
             if let Some(language) = literal.language() {
                 out.extend_from_slice(b" xml:lang=\"");
-                escaped(out, language);
+                escaped(out, language)?;
                 out.push(b'"');
                 if let Some(direction) = literal.direction() {
                     out.extend_from_slice(b" its:dir=\"");
@@ -128,23 +155,24 @@ pub(crate) fn write_term(out: &mut Vec<u8>, term: TermRef<'_>) {
                 }
             } else if literal.datatype() != xsd::STRING {
                 out.extend_from_slice(b" datatype=\"");
-                escaped(out, literal.datatype().as_str());
+                escaped(out, literal.datatype().as_str())?;
                 out.push(b'"');
             }
             out.push(b'>');
-            literal_text(out, literal.value());
+            literal_text(out, literal.value())?;
             out.extend_from_slice(b"</literal>");
         }
         TermRef::Triple(triple) => {
             out.extend_from_slice(b"<triple><subject>");
-            write_term(out, NamedOrBlankNodeRef::from(&triple.subject).into());
+            write_term(out, NamedOrBlankNodeRef::from(&triple.subject).into())?;
             out.extend_from_slice(b"</subject><predicate>");
-            write_term(out, (&triple.predicate).into());
+            write_term(out, (&triple.predicate).into())?;
             out.extend_from_slice(b"</predicate><object>");
-            write_term(out, (&triple.object).into());
+            write_term(out, (&triple.object).into())?;
             out.extend_from_slice(b"</object></triple>");
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------------------
@@ -161,7 +189,28 @@ fn local(name: &[u8]) -> &[u8] {
         .map_or(name, |i| &name[i + 1..])
 }
 
-/// The elements of the format, by local name.
+/// Whether a resolved name is in `namespace`. A declaration's value is as written, so a
+/// reference in it (`&#x23;` for `#`) is resolved before comparing.
+fn in_namespace(resolved: &ResolveResult<'_>, namespace: &str) -> bool {
+    let ResolveResult::Bound(Namespace(value)) = resolved else {
+        return false;
+    };
+    *value == namespace
+        || (value.contains('&')
+            && quick_xml::escape::unescape(value).is_ok_and(|value| value == namespace))
+}
+
+/// A name with an undeclared prefix: not XML with namespaces (Namespaces in XML §5).
+fn undeclared(resolved: &ResolveResult<'_>) -> Result<(), QueryResultsParseError> {
+    match resolved {
+        ResolveResult::Unknown(prefix) => Err(syntax(format!(
+            "the undeclared namespace prefix {prefix:?}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// The elements of the format, by local name in the results namespace.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tag {
     Sparql,
@@ -182,8 +231,8 @@ enum Tag {
 }
 
 impl Tag {
-    fn of(name: &[u8]) -> Self {
-        match local(name) {
+    fn of(local: &str) -> Self {
+        match local.as_bytes() {
             b"sparql" => Self::Sparql,
             b"head" => Self::Head,
             b"variable" => Self::Variable,
@@ -228,6 +277,8 @@ struct Attributes {
     values: String,
     /// The end of each key in `keys` and of each value in `values`.
     ends: Vec<(usize, usize)>,
+    /// Which one is `dir` in the ITS namespace, if any.
+    direction: Option<usize>,
 }
 
 impl Attributes {
@@ -235,6 +286,14 @@ impl Attributes {
         self.keys.clear();
         self.values.clear();
         self.ends.clear();
+        self.direction = None;
+    }
+
+    /// The value of `dir` in the ITS namespace.
+    fn direction(&self) -> Option<&str> {
+        let i = self.direction?;
+        let start = i.checked_sub(1).map_or(0, |j| self.ends[j].1);
+        Some(&self.values[start..self.ends[i].1])
     }
 
     fn iter(&self) -> impl Iterator<Item = (&[u8], &str)> {
@@ -252,15 +311,31 @@ impl Attributes {
             .map(|(_, value)| value)
     }
 
-    fn read(&mut self, start: &BytesStart<'_>) -> Result<(), QueryResultsParseError> {
+    fn read(
+        &mut self,
+        start: &BytesStart<'_>,
+        resolver: &NamespaceResolver,
+    ) -> Result<(), QueryResultsParseError> {
         self.clear();
         for attribute in start.attributes().with_checks(true) {
             let attribute = attribute.map_err(|e| syntax(format!("a malformed attribute: {e}")))?;
             let value = attribute
                 .normalized_value(quick_xml::XmlVersion::Implicit1_0)
                 .map_err(|e| syntax(format!("an invalid attribute value: {e}")))?;
-            self.keys
-                .extend_from_slice(attribute.key.as_ref().as_bytes());
+            let key = attribute.key.as_ref().as_bytes();
+            // Unprefixed attributes are in no namespace, and `xml:`/`xmlns:` are fixed:
+            // only the other prefixed ones are resolved.
+            if key.contains(&b':') && !key.starts_with(b"xml:") && !key.starts_with(b"xmlns:") {
+                let (namespace, name) = resolver.resolve_attribute(attribute.key);
+                undeclared(&namespace)?;
+                if name.as_ref() == "dir" && in_namespace(&namespace, ITS) {
+                    if self.direction.is_some() {
+                        return Err(syntax("its:dir twice on one element"));
+                    }
+                    self.direction = Some(self.ends.len());
+                }
+            }
+            self.keys.extend_from_slice(key);
             self.values.push_str(&value);
             self.ends.push((self.keys.len(), self.values.len()));
         }
@@ -270,7 +345,7 @@ impl Attributes {
 
 /// Solutions read from an XML document.
 pub(crate) struct XmlSolutions<R: BufRead> {
-    reader: Reader<R>,
+    reader: NsReader<R>,
     buffer: Vec<u8>,
     /// The name of the last element start.
     name: Vec<u8>,
@@ -282,7 +357,7 @@ pub(crate) struct XmlSolutions<R: BufRead> {
 impl<R: BufRead> XmlSolutions<R> {
     /// Reads up to the first result (or the whole document, for a boolean).
     pub(crate) fn start(input: R) -> Result<(Start, Self), QueryResultsParseError> {
-        let mut reader = Reader::from_reader(input);
+        let mut reader = NsReader::from_reader(input);
         let config = reader.config_mut();
         config.expand_empty_elements = true;
         config.check_end_names = true;
@@ -295,51 +370,49 @@ impl<R: BufRead> XmlSolutions<R> {
             done: false,
         };
         if !matches!(this.item()?, Item::Start(Tag::Sparql)) {
-            return Err(syntax("expected <sparql>"));
+            return Err(syntax("expected <sparql> in the results namespace"));
+        }
+        if !matches!(this.item()?, Item::Start(Tag::Head)) {
+            return Err(syntax("expected <head> first in <sparql>"));
         }
         let mut variables = Vec::new();
         loop {
             match this.item()? {
-                Item::Start(Tag::Head) => loop {
-                    match this.item()? {
-                        Item::Start(tag) => {
-                            if tag == Tag::Variable {
-                                let name = this
-                                    .attributes
-                                    .get(b"name")
-                                    .ok_or_else(|| syntax("<variable> without name"))?;
-                                let variable = Variable::new(name)
-                                    .map_err(|e| syntax(format!("an invalid variable: {e}")))?;
-                                if variables.contains(&variable) {
-                                    return Err(syntax(format!("the variable {variable} twice")));
-                                }
-                                variables.push(variable);
-                            }
-                            this.skip()?;
+                Item::Start(tag) => {
+                    if tag == Tag::Variable {
+                        let name = this
+                            .attributes
+                            .get(b"name")
+                            .ok_or_else(|| syntax("<variable> without name"))?;
+                        let variable = Variable::new(name)
+                            .map_err(|e| syntax(format!("an invalid variable: {e}")))?;
+                        if variables.contains(&variable) {
+                            return Err(syntax(format!("the variable {variable} twice")));
                         }
-                        Item::End => break,
-                        Item::Eof => return Err(syntax("the document ends in <head>")),
+                        variables.push(variable);
                     }
-                },
-                Item::Start(Tag::Boolean) => {
-                    let text = this.text()?;
-                    let value = match text.trim() {
-                        "true" | "1" => true,
-                        "false" | "0" => false,
-                        other => return Err(syntax(format!("not a boolean: {other:?}"))),
-                    };
-                    this.finish()?;
-                    return Ok((Start::Boolean(value), this));
+                    this.skip()?;
                 }
-                Item::Start(Tag::Results) => {
-                    this.variables = variables.into();
-                    return Ok((Start::Solutions, this));
-                }
-                Item::Start(_) => this.skip()?,
-                Item::End | Item::Eof => {
-                    return Err(syntax("neither <boolean> nor <results>"));
-                }
+                Item::End => break,
+                Item::Eof => return Err(syntax("the document ends in <head>")),
             }
+        }
+        match this.item()? {
+            Item::Start(Tag::Boolean) => {
+                let text = this.text()?;
+                let value = match text.trim() {
+                    "true" | "1" => true,
+                    "false" | "0" => false,
+                    other => return Err(syntax(format!("not a boolean: {other:?}"))),
+                };
+                this.finish()?;
+                Ok((Start::Boolean(value), this))
+            }
+            Item::Start(Tag::Results) => {
+                this.variables = variables.into();
+                Ok((Start::Solutions, this))
+            }
+            _ => Err(syntax("expected <results> or <boolean> after <head>")),
         }
     }
 
@@ -421,13 +494,7 @@ impl<R: BufRead> XmlSolutions<R> {
                 // The attributes before the text: reading it doesn't touch them, but they
                 // are needed owned anyway.
                 let language = self.attributes.get(b"xml:lang").map(str::to_owned);
-                let direction = self
-                    .attributes
-                    .iter()
-                    .find(|(key, _)| {
-                        *key != b"xml:lang" && key.contains(&b':') && local(key) == b"dir"
-                    })
-                    .map(|(_, value)| value.parse());
+                let direction = self.attributes.direction().map(str::parse);
                 let datatype = self.attributes.get(b"datatype").map(str::to_owned);
                 let value = self.text()?;
                 match (language, direction, datatype) {
@@ -506,8 +573,16 @@ impl<R: BufRead> XmlSolutions<R> {
                     self.name.clear();
                     self.name
                         .extend_from_slice(start.name().as_ref().as_bytes());
-                    self.attributes.read(&start)?;
-                    return Ok(Item::Start(Tag::of(&self.name)));
+                    let resolver = self.reader.resolver();
+                    let (namespace, local) = resolver.resolve_element(start.name());
+                    undeclared(&namespace)?;
+                    let tag = if in_namespace(&namespace, NAMESPACE) {
+                        Tag::of(local.as_ref())
+                    } else {
+                        Tag::Other
+                    };
+                    self.attributes.read(&start, resolver)?;
+                    return Ok(Item::Start(tag));
                 }
                 Event::End(_) => return Ok(Item::End),
                 Event::Eof => return Ok(Item::Eof),
@@ -583,15 +658,13 @@ impl<R: BufRead> XmlSolutions<R> {
         }
     }
 
-    /// The rest of the document after the results: the end of `<sparql>` and nothing
-    /// more.
+    /// The rest of the document after `<results>` or `<boolean>`: the end of `<sparql>`
+    /// and nothing more.
     fn finish(&mut self) -> Result<(), QueryResultsParseError> {
-        loop {
-            match self.item()? {
-                Item::Start(_) => self.skip()?,
-                Item::End => break,
-                Item::Eof => return Err(syntax("the document ends inside <sparql>")),
-            }
+        match self.item()? {
+            Item::End => {}
+            Item::Start(_) => return Err(syntax("an element after <results> or <boolean>")),
+            Item::Eof => return Err(syntax("the document ends inside <sparql>")),
         }
         match self.item()? {
             Item::Eof => Ok(()),

@@ -1,0 +1,35 @@
+# The reasoning home-turf jobs
+
+> Superseded on 2 Nov 2026: these job files were written for `suite/measurement_queue.py`, the queue before the fleet; they name hosts and aren't submitted any more. A run of this kit is a fleet job ([../../README.md](../../README.md#on-the-fleet)); porting them is a follow-up.
+
+Measurement-queue jobs ([../../suite/measurement_queue.py](../../suite/measurement_queue.py)) for this week's reasoning
+families: `lubm` (RDFox's L and LE programs), `claros`, `ldbc-spb`, `datalog-graphs`,
+`commit-latency`. Every system of a job runs on the checks host (the timed host has no Docker), one job
+at a time.
+
+```sh
+python benches/suite/measurement_queue.py submit benches/reasoning/jobs/qualify-lubm-rdfox.toml
+```
+
+- `qualify-*` (window `any`: they count, they don't time) prepare the data and run each
+  engine once with `--qualify`: every derived relation counted and checked. They write
+  `~/owlrs/results/<id>/qualify/qualified.json`, the totals the timed runs must reproduce.
+- `timed-*` (window `quiet`: nights, or while the host is freed for it) refuse to start
+  without that file (`--qualified`), then run three interleaved repetitions at 4 CPUs and
+  the same memory cap for every engine. Each command runs under `scripts/quiet-slot.sh`:
+  the kits' timed steps refuse to run outside the slot (`suitekit/quiet.py`, which replaced
+  `hostguard.py`), and the slot's watcher pauses other heavy work meanwhile. The queue takes
+  a timed job in chunks of about 30 minutes, one command each (`hosts.toml` `chunk_min`), and
+  refuses longer ones: split a series by case, system or repetition.
+- `suite.py run --workloads claros,datalog-graphs,commit-latency,ldbc-spb` runs the same
+  kits as `driver` plans (`suitekit/reasoning_plans.py`): qualification, then the timed
+  repetitions, their rows in the run's results.csv and in the standings.
+- The binaries: `NRESE_BIN` is the server built from `16c3bfb` (the server's sources are
+  unchanged on this branch since), SHA-256 in `~/nrese-reasoning-suite/bin/16c3bfb/SHA256SUMS`
+  on the host.
+
+- RDFox runs nowhere: we hold no licence for it. Its home
+  turf is NRESE against VLog and GLog on RDFox's own programs, at the setups RDFox's papers
+  report, beside the papers' numbers as reported rows ([../reported](../reported/README.md)).
+- `profile-cspa` (the timed host, where profiling is allowed): perf over NRESE's CSPA
+  materialisation, the attribution of its loss to Soufflé.

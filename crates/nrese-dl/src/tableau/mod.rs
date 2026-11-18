@@ -1,0 +1,486 @@
+//! The hypertableau (docs/design/owl2-dl.md §6): the complete engine for SROIQ(D), the
+//! correctness anchor (package 3.3).
+//!
+//! The calculus is Motik, Shearer and Horrocks's (*Hypertableau Reasoning for Description
+//! Logics*, JAIR 2009) over `nrese-owl`'s DL-clauses: the Hyp-rule as compiled
+//! hyperresolution joins, the ≥-rule, the ≈-rule with pruning, clashes, and pairwise
+//! anywhere blocking (single blocking where the clauses are simple). The engineering is
+//! report D's: append-only fact tables with dependency sets and proofs kept apart,
+//! 64-byte hot nodes, a trail instead of copies, interned dependency sets, semantic
+//! branching and dependency-directed backjumping, each optimisation with a switch.
+//!
+//! **Answers are three-valued** ([`Answer`]): consistent, inconsistent, or why not
+//! (`unsupported`, `gave-up`). Never a wrong answer: what the engine can't take
+//! (datatypes, keys, the NI rule) is left out only where that weakens the ontology, so an
+//! inconsistency found without it stands and a model found without it is `unsupported`;
+//! a budget ends a run as `gave-up`.
+//!
+//! Datatypes (package 3.5) are concrete nodes checked by the datatype theory
+//! (`data.rs`, `crate::datatypes`); keys are DL-safe rules over the named individuals
+//! (`keys.rs`). [`Base`] reuses deterministic completion state and models with rollback
+//! and fresh probe controls. General cross-probe satisfiability caching is not yet built.
+
+mod blocking;
+pub(crate) mod budget;
+mod data;
+pub(crate) mod depset;
+mod engine;
+mod expand;
+mod graph;
+mod hyper;
+mod keys;
+mod merge;
+mod model;
+mod ni;
+mod portfolio;
+mod probe;
+mod program;
+mod retract;
+mod search;
+mod telemetry;
+
+use std::borrow::Cow;
+use std::time::{Duration, Instant};
+
+use nrese_owl::{Concept, Normalised, Ontology, Options, Term, normalise_with};
+
+pub use crate::Cancel;
+pub use model::Model;
+pub use probe::{At, Base, From, Label, Labels, Prepared, Probe, ProbeOutcome, Want};
+pub(crate) use program::leaves_out;
+pub(crate) use program::non_simple;
+pub use program::{Omissions, left_out};
+pub use telemetry::Telemetry;
+
+use engine::Engine;
+use program::{ConceptName, Head, Program};
+use search::{End, Seed, Site};
+
+/// What a run may use, and which optimisations are on (each has a switch: "on" and
+/// "off" must give the same answers).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Config {
+    /// After an alternative failed, take the later ones with its negation.
+    pub semantic_branching: bool,
+    /// Jump back to the newest branch point a clash depends on (else chronologically).
+    pub backjumping: bool,
+    /// Any earlier node may block (else only ancestors).
+    pub anywhere_blocking: bool,
+    /// Single blocking where the clauses allow it (else pairwise always).
+    pub single_blocking: bool,
+    /// Decide disjunctions before the ≥-rule expands (else the design's order: the
+    /// ≥-rule first, disjunctions when nothing else is left).
+    pub disjunctions_first: bool,
+    /// Recheck only the nodes a change can affect for blocking (else every node from the
+    /// lowest changed one).
+    pub incremental_blocking: bool,
+    /// Compare every blocking pass with a recomputation from scratch, and panic on a
+    /// difference (for tests: the oracle of the incremental pass).
+    pub check_blocking: bool,
+    /// Try a clause's disjuncts that failed less often first, the clause's order on ties
+    /// (else always in the clause's order). Known search variance (A/B, 5 October 2026):
+    /// the learned order can lead a search to larger models, DL-663 (47 ms vs 21 ms,
+    /// 37,000 branch points vs 13,000) and ore_ont_2901 (30 ms vs 27 ms, 8% more nodes);
+    /// against those, the W3C suite and the ORE development set take half the time and 13
+    /// tests are faster, DL-202, 206 and 664 within the budget they ran out of.
+    pub disjunct_learning: bool,
+    /// The most nodes a run may create at once (`None`: no limit), a deterministic bound
+    /// like the next two ([`crate::limits`]: none is built in).
+    pub max_nodes: Option<usize>,
+    /// The most branch points a run may open (`None`: no limit): a deterministic bound
+    /// on the search, for tests that must not depend on the machine's speed.
+    pub max_branch_points: Option<u64>,
+    /// The most merges a run may make (`None`: no limit), the same kind of bound for a
+    /// search whose work is merging rather than branching (W3C DL-906: 1.6 M merges and
+    /// 3,381 branch points in 30 s).
+    pub max_merges: Option<u64>,
+    /// The ≤-rule leaves out merges that would clash at once (a concept against its
+    /// negation, a disjointness clause), with their reasons in its premise: a
+    /// pigeonhole of disjoint successors is a clash, not a branch per pair.
+    pub merge_filter: bool,
+    /// Conflict-guided choice order: each clash raises the activity of the clauses whose
+    /// choices it depended on, and the open disjunction of the most active clause is
+    /// decided first (else the oldest open one).
+    pub conflict_order: bool,
+    /// Dynamic backtracking: a clash retracts its culprit level alone and re-decides it on
+    /// top, keeping the levels above (docs/design/owl2-dl-dynamic-backtracking.md).
+    pub dynamic_backtracking: bool,
+    /// After each retraction, assert that nothing alive depends on the retracted level
+    /// (on in debug builds; the campaigns set it).
+    pub check_retraction: bool,
+    /// Sizes of counted classes compared before the search ([`crate::numbers`]): a class
+    /// with two sizes refutes the program without a branch.
+    pub counting: bool,
+    /// The time an operation may take from its start, preparation, compilation and
+    /// queueing included: at its start it becomes [`Config::deadline`].
+    pub timeout: Option<Duration>,
+    /// The deadline the operation's parts share (an embedding operation's, or the one
+    /// `timeout` gave). Each solver checks it before it starts and while it runs.
+    pub deadline: Option<Instant>,
+    /// The most memory a run may hold (its tables, indexes and arenas), in bytes (`None`:
+    /// no limit of its own; the envelope's, if there is one).
+    pub max_memory: Option<usize>,
+    /// The request's memory envelope: what a run holds is reserved from it as it grows
+    /// (shared by the runs of a batch, a portfolio or islands), and a run it has no room
+    /// for gives up as past `max_memory`. `None`: only `max_memory` bounds a run.
+    pub memory: Option<nrese_exec::Envelope>,
+    /// Keep the model a consistent run found ([`Outcome::model`]).
+    pub keep_model: bool,
+    /// `≤ n` up to this `n` is spelled out in clauses; above it, at-most atoms
+    /// (`nrese_owl::Options`).
+    pub expand_at_most_up_to: u32,
+    /// Unfold a class's only, acyclic Boolean definition lazily
+    /// (`nrese_owl::Options::lazy_definitions`); never when the model is kept, as it
+    /// under-approximates such classes. Which clauses decide sooner depends on the
+    /// ontology: with [`Config::portfolio`] both run side by side.
+    pub lazy_definitions: bool,
+    /// Rewrite complementary definitions to one class and its negation
+    /// (`nrese_owl::Options::complements`); never when the model is kept.
+    pub complements: bool,
+    /// Where lazy unfolding changes the clauses and two cores are free, race the plain and
+    /// the unfolded clauses (`portfolio`), each with half the memory budget; else the
+    /// unfolded clauses alone if this is off, the plain ones if cores are short.
+    pub portfolio: bool,
+    /// Reusable physical workers and this operation's allowance. Portfolio variants
+    /// share them; without an owner, a standalone race creates its own workers.
+    pub workers: Option<nrese_exec::workers::Workers>,
+    /// Stops the run at its next budget check, answering `GaveUp`.
+    pub cancel: Option<Cancel>,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            semantic_branching: true,
+            backjumping: true,
+            anywhere_blocking: true,
+            single_blocking: true,
+            disjunctions_first: false,
+            disjunct_learning: true,
+            incremental_blocking: true,
+            check_blocking: false,
+            max_nodes: None,
+            max_branch_points: None,
+            max_merges: None,
+            merge_filter: true,
+            conflict_order: false,
+            dynamic_backtracking: false,
+            check_retraction: cfg!(debug_assertions),
+            counting: true,
+            timeout: None,
+            deadline: None,
+            max_memory: None,
+            memory: None,
+            keep_model: false,
+            lazy_definitions: true,
+            complements: true,
+            portfolio: true,
+            workers: None,
+            cancel: None,
+            expand_at_most_up_to: Options::default().expand_at_most_up_to,
+        }
+    }
+}
+
+impl Config {
+    /// The configuration of an operation starting now: `timeout` folded into the
+    /// deadline its parts share.
+    pub(crate) fn started(&self) -> Cow<'_, Self> {
+        let Some(timeout) = self.timeout else {
+            return Cow::Borrowed(self);
+        };
+        let end = Instant::now() + timeout;
+        Cow::Owned(Self {
+            timeout: None,
+            deadline: Some(self.deadline.map_or(end, |d| d.min(end))),
+            ..self.clone()
+        })
+    }
+
+    /// Why a started operation must not run on, if it must not: cancelled, or past its
+    /// deadline.
+    pub(crate) fn stopped(&self) -> Option<&'static str> {
+        if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+            Some("cancelled")
+        } else if self.deadline.is_some_and(|d| Instant::now() >= d) {
+            Some(TIME_BUDGET.as_str())
+        } else {
+            None
+        }
+    }
+
+    /// Whether the two run the same search: they may differ in their deadlines,
+    /// cancellation and workers.
+    pub(crate) fn same_search(&self, other: &Self) -> bool {
+        let mut this = self.clone();
+        this.timeout = other.timeout;
+        this.deadline = other.deadline;
+        this.cancel.clone_from(&other.cancel);
+        this.workers.clone_from(&other.workers);
+        this == *other
+    }
+}
+
+/// Why a run gave up when its deadline passed ([`crate::limits::Limit::Time`]).
+pub static TIME_BUDGET: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| crate::limits::Limit::Time.reached("the deadline passed"));
+
+/// The answer of a consistency or satisfiability test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Answer {
+    Consistent,
+    Inconsistent,
+    /// No inconsistency found, but parts of the ontology were left out (why).
+    Unsupported(String),
+    /// A budget ran out, or a rule the engine lacks is needed (why).
+    GaveUp(String),
+}
+
+impl Answer {
+    /// The answer's class as the DL lab writes it.
+    pub fn class(&self) -> &'static str {
+        match self {
+            Answer::Consistent => "consistent",
+            Answer::Inconsistent => "inconsistent",
+            Answer::Unsupported(_) => "unsupported",
+            Answer::GaveUp(_) => "gave-up",
+        }
+    }
+}
+
+/// What the clauses use, for reports by fragment.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Features {
+    /// Edges towards `x` or inverse roles in number restrictions.
+    pub inverses: bool,
+    /// Equalities, at-most atoms or at-least restrictions above one.
+    pub numbers: bool,
+    pub nominals: bool,
+    /// Disjunctive clauses.
+    pub disjunctions: bool,
+    /// Data values (the datatype theory) or keys.
+    pub datatypes: bool,
+    /// Something was left out.
+    pub weakened: bool,
+}
+
+/// A run's answer with its telemetry (and model, if asked for).
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub answer: Answer,
+    pub telemetry: Telemetry,
+    pub model: Option<Model>,
+    pub features: Features,
+}
+
+impl Outcome {
+    /// A run stopped before it started (`why`).
+    pub(crate) fn stopped(why: &str) -> Self {
+        Self {
+            answer: Answer::GaveUp(why.into()),
+            telemetry: Telemetry::default(),
+            model: None,
+            features: Features::default(),
+        }
+    }
+}
+
+/// Whether `ontology` is consistent.
+pub fn consistency(ontology: &Ontology, config: &Config) -> Outcome {
+    let config = &*config.started();
+    if let Some(why) = config.stopped() {
+        return Outcome::stopped(why);
+    }
+    let ontology = prepared(ontology);
+    // The engine reads no provenance: minimal automata.
+    let options = |lazy_definitions| Options {
+        expand_at_most_up_to: config.expand_at_most_up_to,
+        lazy_definitions,
+        complements: config.complements && !config.keep_model,
+        exact_provenance: false,
+    };
+    // The request's compilation scratch, held until the runs end: its copy of the
+    // ontology, where preparing made one, and the clauses.
+    let mut scratch = crate::memory::Scratch::new(config.memory.as_ref());
+    let copied = || match &ontology {
+        std::borrow::Cow::Owned(copy) => crate::memory::ontology_bytes(copy),
+        std::borrow::Cow::Borrowed(_) => 0,
+    };
+    if scratch.charge(copied).is_err() {
+        return Outcome::stopped(crate::memory::EXHAUSTED);
+    }
+    let mut normalise = |lazy_definitions| {
+        let normalised = normalise_with(&ontology, options(lazy_definitions));
+        let bytes = || crate::memory::normalised_bytes(&normalised);
+        scratch.charge(bytes).is_ok().then_some(normalised)
+    };
+    if !config.lazy_definitions || config.keep_model {
+        return match normalise(false) {
+            Some(plain) => consistency_of(&ontology, &plain, config),
+            None => Outcome::stopped(crate::memory::EXHAUSTED),
+        };
+    }
+    let Some(unfolded) = normalise(true) else {
+        return Outcome::stopped(crate::memory::EXHAUSTED);
+    };
+    if unfolded.unfolded == 0 || !config.portfolio {
+        return consistency_of(&ontology, &unfolded, config);
+    }
+    let Some(plain) = normalise(false) else {
+        return Outcome::stopped(crate::memory::EXHAUSTED);
+    };
+    let workers = budget::workers(config, 2);
+    if workers.width() < 2 {
+        return consistency_of(&ontology, &plain, config);
+    }
+    portfolio::race(&ontology, &[&plain, &unfolded], config, &workers)
+}
+
+/// `ontology` with each negative assertion over a non-simple property `¬R(a, b)` as the
+/// equivalent `a : ∀R.¬{b}`, which the normalisation takes through `R`'s automaton.
+pub fn prepared(ontology: &Ontology) -> std::borrow::Cow<'_, Ontology> {
+    use nrese_owl::{Axiom, ClassExpr, ExprId, ObjProp};
+    let non_simple = program::non_simple(ontology);
+    let affected = |a: &Axiom| matches!(a, Axiom::NegativeObjectPropertyAssertion(p, _, _) if non_simple.contains(p));
+    if !ontology.axioms.iter().any(affected) {
+        return std::borrow::Cow::Borrowed(ontology);
+    }
+    let mut o = ontology.clone();
+    for i in 0..o.axioms.len() {
+        if let Axiom::NegativeObjectPropertyAssertion(p, a, b) = o.axioms[i] {
+            if !non_simple.contains(&p) {
+                continue;
+            }
+            let one = ExprId(o.classes.intern(ClassExpr::OneOf(vec![b])));
+            let not = ExprId(o.classes.intern(ClassExpr::Not(one)));
+            let all = ExprId(o.classes.intern(ClassExpr::All(ObjProp::Named(p), not)));
+            o.axioms[i] = Axiom::ClassAssertion(all, a);
+        }
+    }
+    std::borrow::Cow::Owned(o)
+}
+
+/// Whether `ontology`, normalised into `normalised`, is consistent.
+pub fn consistency_of(ontology: &Ontology, normalised: &Normalised, config: &Config) -> Outcome {
+    run(ontology, normalised, None, config)
+}
+
+/// Whether the class `class` is satisfiable in `ontology` (with its ABox): `Consistent`
+/// means satisfiable.
+pub fn satisfiable(
+    ontology: &Ontology,
+    normalised: &Normalised,
+    class: Term,
+    config: &Config,
+) -> Outcome {
+    run(ontology, normalised, Some(Concept::Named(class)), config)
+}
+
+pub(crate) fn features(p: &Program) -> Features {
+    let mut f = Features {
+        inverses: !p.simple,
+        numbers: !p.at_most.is_empty() || p.at_least.iter().any(|n| n.n > 1),
+        nominals: p.nominals,
+        disjunctions: false,
+        datatypes: p.data.is_some() || !p.keys.is_empty(),
+        weakened: !p.weakened.is_empty(),
+    };
+    for c in &p.clauses {
+        f.disjunctions |= c.head.len() > 1;
+        f.numbers |= c.head.iter().any(|h| matches!(h, Head::Equal(..)));
+    }
+    f
+}
+
+/// The answer a run's end gives: a model is an answer only if nothing was left out.
+pub(crate) fn answer_of(end: End, program: &Program, engine: &Engine<'_>) -> Answer {
+    match end {
+        End::Refuted => Answer::Inconsistent,
+        End::GaveUp(why) => Answer::GaveUp(why),
+        End::Model
+            if program.weakened.is_empty()
+                && engine.data_approximate.is_none()
+                && engine.data_limited.is_none() =>
+        {
+            Answer::Consistent
+        }
+        End::Model if program.weakened.is_empty() && engine.data_approximate.is_none() => {
+            Answer::GaveUp(format!(
+                "datatypes: {}",
+                engine.data_limited.as_deref().unwrap_or_default()
+            ))
+        }
+        End::Model => {
+            let mut why = program.weakened.clone();
+            if let Some(a) = &engine.data_approximate {
+                why.push(format!("datatypes approximated: {a}"));
+            }
+            Answer::Unsupported(why.join("; "))
+        }
+    }
+}
+
+fn run(
+    ontology: &Ontology,
+    normalised: &Normalised,
+    test: Option<Concept>,
+    config: &Config,
+) -> Outcome {
+    let started = Instant::now();
+    let config = &*config.started();
+    if let Some(why) = config.stopped() {
+        return Outcome::stopped(why);
+    }
+    // A model from the counts (docs/design/owl2-dl.md#number-reasoning-layers), checked
+    // against every axiom, answers before any search; it is compressed, so not where the
+    // caller wants the model.
+    if test.is_none() && !config.keep_model && crate::numbers::model(ontology).is_some() {
+        return Outcome {
+            answer: Answer::Consistent,
+            telemetry: Telemetry {
+                total: started.elapsed(),
+                ..Telemetry::default()
+            },
+            model: None,
+            features: Features::default(),
+        };
+    }
+    let mut program = Program::compile(ontology, normalised);
+    let test = test.map(|c| program.concept(ConceptName::Clause(c)));
+    program.ensure_tables();
+    // The program is the run's compilation scratch, held from the request's envelope.
+    let mut scratch = crate::memory::Scratch::new(config.memory.as_ref());
+    if scratch.charge(|| program.bytes()).is_err() {
+        return Outcome::stopped(crate::memory::EXHAUSTED);
+    }
+    let compiled = started.elapsed();
+    let features = features(&program);
+    let mut engine = Engine::new(&program, config);
+    engine.stats.compile = compiled;
+    let seed = match test {
+        Some(c) => Seed {
+            site: Site::Fresh,
+            positive: vec![c],
+            negative: Vec::new(),
+        },
+        None => Seed::none(),
+    };
+    let end = engine.run(&seed);
+    let answer = answer_of(end, &program, &engine);
+    let model = (config.keep_model && end_is_model(&answer, &program)).then(|| engine.model());
+    let mut telemetry = engine.stats.clone();
+    telemetry.total = started.elapsed();
+    telemetry.bytes_per_hot_node = std::mem::size_of::<graph::HotNode>() as u64;
+    telemetry.bytes_per_node = (engine.g.bytes() as u64) / telemetry.peak_nodes.max(1);
+    telemetry.dependency_sets = engine.deps.len() as u64;
+    Outcome {
+        answer,
+        telemetry,
+        model,
+        features,
+    }
+}
+
+fn end_is_model(answer: &Answer, _program: &Program) -> bool {
+    matches!(answer, Answer::Consistent | Answer::Unsupported(_))
+}

@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 92: numeric-filter-bin-search-seventy-thirty
+# Numeric FILTER that filters out 70 percent of the values
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (COUNT(?s) AS ?count) { ?s dblp:numberOfCreators ?o . FILTER (?o >= 3) }

@@ -1,0 +1,227 @@
+//! The RDF, RDFS, OWL and XSD terms the mapping reads, by their ids in the source (absent
+//! ones never match).
+
+/// A namespace's IRI as a literal, so `concat!` joins IRIs at compile time.
+macro_rules! namespace {
+    (RDF) => {
+        "http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+    };
+    (RDFS) => {
+        "http://www.w3.org/2000/01/rdf-schema#"
+    };
+    (OWL) => {
+        "http://www.w3.org/2002/07/owl#"
+    };
+    (XSD) => {
+        "http://www.w3.org/2001/XMLSchema#"
+    };
+}
+
+pub const RDF: &str = namespace!(RDF);
+pub const RDFS: &str = namespace!(RDFS);
+pub const OWL: &str = namespace!(OWL);
+pub const XSD: &str = namespace!(XSD);
+
+/// The IRIs of the OWL 2 datatype map's datatypes and facets, `rdfs:Literal` and
+/// `rdf:langString`: those a source's ids are looked up by when it can't give an IRI's
+/// text. Joined at compile time, so a caller that looks them up pays no allocation for
+/// them (I24c-2: "fixed IRIs cost nothing at run time").
+pub const DATA_IRIS: &[&str] = &[
+    concat!(namespace!(XSD), "decimal"),
+    concat!(namespace!(XSD), "integer"),
+    concat!(namespace!(XSD), "nonNegativeInteger"),
+    concat!(namespace!(XSD), "nonPositiveInteger"),
+    concat!(namespace!(XSD), "positiveInteger"),
+    concat!(namespace!(XSD), "negativeInteger"),
+    concat!(namespace!(XSD), "long"),
+    concat!(namespace!(XSD), "int"),
+    concat!(namespace!(XSD), "short"),
+    concat!(namespace!(XSD), "byte"),
+    concat!(namespace!(XSD), "unsignedLong"),
+    concat!(namespace!(XSD), "unsignedInt"),
+    concat!(namespace!(XSD), "unsignedShort"),
+    concat!(namespace!(XSD), "unsignedByte"),
+    concat!(namespace!(XSD), "float"),
+    concat!(namespace!(XSD), "double"),
+    concat!(namespace!(XSD), "string"),
+    concat!(namespace!(XSD), "normalizedString"),
+    concat!(namespace!(XSD), "token"),
+    concat!(namespace!(XSD), "language"),
+    concat!(namespace!(XSD), "Name"),
+    concat!(namespace!(XSD), "NCName"),
+    concat!(namespace!(XSD), "NMTOKEN"),
+    concat!(namespace!(XSD), "boolean"),
+    concat!(namespace!(XSD), "hexBinary"),
+    concat!(namespace!(XSD), "base64Binary"),
+    concat!(namespace!(XSD), "anyURI"),
+    concat!(namespace!(XSD), "dateTime"),
+    concat!(namespace!(XSD), "dateTimeStamp"),
+    concat!(namespace!(XSD), "minInclusive"),
+    concat!(namespace!(XSD), "maxInclusive"),
+    concat!(namespace!(XSD), "minExclusive"),
+    concat!(namespace!(XSD), "maxExclusive"),
+    concat!(namespace!(XSD), "length"),
+    concat!(namespace!(XSD), "minLength"),
+    concat!(namespace!(XSD), "maxLength"),
+    concat!(namespace!(XSD), "pattern"),
+    concat!(namespace!(OWL), "real"),
+    concat!(namespace!(OWL), "rational"),
+    concat!(namespace!(RDF), "PlainLiteral"),
+    concat!(namespace!(RDF), "langString"),
+    concat!(namespace!(RDF), "XMLLiteral"),
+    concat!(namespace!(RDF), "langRange"),
+    concat!(namespace!(RDFS), "Literal"),
+];
+
+/// [`DATA_IRIS`], owned.
+pub fn data_iris() -> Vec<String> {
+    DATA_IRIS.iter().map(|&iri| iri.to_owned()).collect()
+}
+
+/// Whether `a` and `b` are the same text (in a `const`).
+const fn same(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < a.len() {
+        if a[i] != b[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+macro_rules! vocabulary {
+    ($($field:ident = $ns:ident $local:literal),* $(,)?) => {
+        /// The ids of the terms the mapping reads.
+        #[derive(Debug, Clone, Copy)]
+        pub struct Vocabulary {
+            $(pub $field: Option<u64>,)*
+        }
+
+        impl Vocabulary {
+            /// Every term, by its field's name, with its IRI, joined at compile time: what a
+            /// caller choosing input for the mapping reads by, at no run-time cost
+            /// (I24c-2).
+            pub const IRIS: &'static [(&'static str, &'static str)] =
+                &[$((stringify!($field), concat!(namespace!($ns), $local)),)*];
+
+            /// Looks every term up through `id_of`, by IRIs joined at compile time: no
+            /// allocation per term (the QL reader builds one per
+            /// fresh read, the mapping one per read).
+            pub fn new(id_of: &dyn Fn(&str) -> Option<u64>) -> Self {
+                Self {
+                    $($field: id_of(concat!(namespace!($ns), $local)),)*
+                }
+            }
+
+            /// The IRI of field `field`, for a `const`: a field the vocabulary lacks fails
+            /// the build there.
+            pub const fn iri(field: &str) -> &'static str {
+                let mut i = 0;
+                while i < Self::IRIS.len() {
+                    if same(Self::IRIS[i].0, field) {
+                        return Self::IRIS[i].1;
+                    }
+                    i += 1;
+                }
+                panic!("not a field of nrese_owl::Vocabulary")
+            }
+
+            /// Every term with its IRI (for writing): [`Self::IRIS`], owned.
+            pub fn iris() -> Vec<(&'static str, String)> {
+                Self::IRIS.iter().map(|&(f, iri)| (f, iri.to_owned())).collect()
+            }
+        }
+    };
+}
+
+vocabulary! {
+    rdf_type = RDF "type",
+    first = RDF "first",
+    rest = RDF "rest",
+    nil = RDF "nil",
+    rdfs_sub_class_of = RDFS "subClassOf",
+    rdfs_sub_property_of = RDFS "subPropertyOf",
+    rdfs_domain = RDFS "domain",
+    rdfs_range = RDFS "range",
+    rdfs_datatype = RDFS "Datatype",
+    rdfs_literal = RDFS "Literal",
+    rdfs_class = RDFS "Class",
+    rdf_property = RDF "Property",
+    rdf_list = RDF "List",
+    owl_data_range = OWL "DataRange",
+    owl_top_object_property = OWL "topObjectProperty",
+    owl_bottom_object_property = OWL "bottomObjectProperty",
+    owl_top_data_property = OWL "topDataProperty",
+    owl_bottom_data_property = OWL "bottomDataProperty",
+    owl_class = OWL "Class",
+    owl_restriction = OWL "Restriction",
+    owl_thing = OWL "Thing",
+    owl_nothing = OWL "Nothing",
+    owl_object_property = OWL "ObjectProperty",
+    owl_datatype_property = OWL "DatatypeProperty",
+    owl_annotation_property = OWL "AnnotationProperty",
+    owl_named_individual = OWL "NamedIndividual",
+    owl_ontology = OWL "Ontology",
+    owl_imports = OWL "imports",
+    owl_functional = OWL "FunctionalProperty",
+    owl_inverse_functional = OWL "InverseFunctionalProperty",
+    owl_reflexive = OWL "ReflexiveProperty",
+    owl_irreflexive = OWL "IrreflexiveProperty",
+    owl_symmetric = OWL "SymmetricProperty",
+    owl_asymmetric = OWL "AsymmetricProperty",
+    owl_transitive = OWL "TransitiveProperty",
+    owl_intersection_of = OWL "intersectionOf",
+    owl_union_of = OWL "unionOf",
+    owl_complement_of = OWL "complementOf",
+    owl_one_of = OWL "oneOf",
+    owl_on_property = OWL "onProperty",
+    owl_on_properties = OWL "onProperties",
+    owl_some_values_from = OWL "someValuesFrom",
+    owl_all_values_from = OWL "allValuesFrom",
+    owl_has_value = OWL "hasValue",
+    owl_has_self = OWL "hasSelf",
+    owl_min_cardinality = OWL "minCardinality",
+    owl_max_cardinality = OWL "maxCardinality",
+    owl_cardinality = OWL "cardinality",
+    owl_min_qualified = OWL "minQualifiedCardinality",
+    owl_max_qualified = OWL "maxQualifiedCardinality",
+    owl_qualified = OWL "qualifiedCardinality",
+    owl_on_class = OWL "onClass",
+    owl_on_data_range = OWL "onDataRange",
+    owl_inverse_of = OWL "inverseOf",
+    owl_datatype_complement_of = OWL "datatypeComplementOf",
+    owl_on_datatype = OWL "onDatatype",
+    owl_with_restrictions = OWL "withRestrictions",
+    owl_equivalent_class = OWL "equivalentClass",
+    owl_disjoint_with = OWL "disjointWith",
+    owl_all_disjoint_classes = OWL "AllDisjointClasses",
+    owl_members = OWL "members",
+    owl_disjoint_union_of = OWL "disjointUnionOf",
+    owl_property_chain_axiom = OWL "propertyChainAxiom",
+    owl_equivalent_property = OWL "equivalentProperty",
+    owl_property_disjoint_with = OWL "propertyDisjointWith",
+    owl_all_disjoint_properties = OWL "AllDisjointProperties",
+    owl_has_key = OWL "hasKey",
+    owl_same_as = OWL "sameAs",
+    owl_different_from = OWL "differentFrom",
+    owl_all_different = OWL "AllDifferent",
+    owl_distinct_members = OWL "distinctMembers",
+    owl_negative_property_assertion = OWL "NegativePropertyAssertion",
+    owl_source_individual = OWL "sourceIndividual",
+    owl_assertion_property = OWL "assertionProperty",
+    owl_target_individual = OWL "targetIndividual",
+    owl_target_value = OWL "targetValue",
+    owl_axiom = OWL "Axiom",
+    owl_annotation = OWL "Annotation",
+    owl_annotated_source = OWL "annotatedSource",
+    owl_annotated_property = OWL "annotatedProperty",
+    owl_annotated_target = OWL "annotatedTarget",
+    owl_deprecated_class = OWL "DeprecatedClass",
+    owl_deprecated_property = OWL "DeprecatedProperty",
+    owl_ontology_property = OWL "OntologyProperty",
+}

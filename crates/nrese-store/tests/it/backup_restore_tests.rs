@@ -1,3 +1,4 @@
+use crate::support::Writes;
 use nrese_store::{
     DatasetBackupFormat, DatasetRestoreRequest, GraphReadRequest, GraphResultFormat, GraphTarget,
     GraphWriteRequest, QueryResultKind, SparqlUpdateRequest, StoreConfig, StoreService,
@@ -25,7 +26,9 @@ fn export_snapshot_serializes_default_and_named_graphs() -> Result<(), Box<dyn s
         target: GraphTarget::NamedGraph("http://example.com/graph/backup".to_owned()),
         format: GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:named-s ex:p ex:named-o .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:named-s ex:p ex:named-o ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
 
@@ -53,7 +56,9 @@ fn restore_replaces_existing_dataset_and_resets_contents_to_backup()
         target: GraphTarget::NamedGraph("http://example.com/graph/source".to_owned()),
         format: GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:source-named ex:p ex:value .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:source-named ex:p ex:value ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
     let artifact =
@@ -203,5 +208,59 @@ fn on_disk_restore_then_reopen_preserves_restored_dataset() -> Result<(), Box<dy
     )?;
     assert!(String::from_utf8(ask.payload)?.contains("true"));
 
+    Ok(())
+}
+
+/// An export ends with the checksum of every byte before it (`# nrese-sha256 <hex>`). A
+/// restore checks it where present: an intact export is restored and reported verified; a
+/// changed or truncated one is refused before the dataset is touched; a dump without the
+/// comment (another store's) is restored unchecked.
+#[test]
+fn a_restore_checks_the_exports_closing_checksum() -> Result<(), Box<dyn std::error::Error>> {
+    let source = new_in_memory_service()?;
+    source.execute_update_str(
+        "INSERT DATA { <http://example.com/s1> <http://example.com/p> <http://example.com/o1> . \
+         <http://example.com/s2> <http://example.com/p> <http://example.com/o2> }",
+    )?;
+    let export =
+        source.export_dataset(&nrese_store::ReadScope::All, DatasetBackupFormat::NQuads)?;
+    let text = String::from_utf8(export.payload)?;
+    let (body, comment) = text.trim_end().rsplit_once('\n').ok_or("one line")?;
+    assert_eq!(
+        comment,
+        format!("{}{}", nrese_store::DIGEST_PREFIX, export.checksum_sha256)
+    );
+    let (first, _) = body.split_once('\n').ok_or("two statements")?;
+    let cases = [
+        ("intact", text.clone(), Some(true)),
+        ("changed", text.replacen("o1>", "o9>", 1), None),
+        ("truncated", format!("{first}\n{comment}\n"), None),
+        ("without the comment", format!("{body}\n"), Some(false)),
+    ];
+    for (case, payload, verified) in cases {
+        let target = new_in_memory_service()?;
+        target.execute_update_str(
+            "INSERT DATA { <http://example.com/live> <http://example.com/p> <http://example.com/o> }",
+        )?;
+        let result = target.restore_dataset(&DatasetRestoreRequest {
+            format: DatasetBackupFormat::NQuads,
+            payload: payload.into_bytes(),
+        });
+        let live = target.execute_query_str(
+            "ASK { <http://example.com/live> <http://example.com/p> <http://example.com/o> }",
+        )?;
+        let live = String::from_utf8(live.payload)?.contains("true");
+        match verified {
+            Some(verified) => {
+                assert_eq!(result?.checksum_verified, verified, "{case}");
+                assert!(!live, "{case}: restored over the live data");
+            }
+            None => {
+                let error = result.expect_err(case).to_string();
+                assert!(error.contains("checksum doesn't match"), "{case}: {error}");
+                assert!(live, "{case}: the live data was replaced");
+            }
+        }
+    }
     Ok(())
 }

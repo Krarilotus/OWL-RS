@@ -14,6 +14,13 @@
 #   wikidata-lexemes  Wikidata lexemes dump, latest (1.5 GB gz)
 # Full Wikidata truthy (72 GB gz, ~8 B triples) needs a large server and isn't included.
 set -euo pipefail
+# This job's names (scripts/lib/ns.sh): its containers and volumes; the shared datasets' volume.
+NS_ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+. "$NS_ROOT/scripts/lib/ns.sh"
+DATA_VOLUME=$(ns_shared data)
+# Shared datasets are prepared one at a time per host (their staging, the .part and .parts
+# files, and their publication): this script runs again under the host's datasets lock.
+ns_serialize datasets "$0" "$@"
 
 # Datasets, store files and images take tens of GB: don't start on a nearly full disk.
 . "$(dirname "$0")/../../scripts/lib/disk.sh"
@@ -22,7 +29,7 @@ require_free_gb "${NRESE_MIN_FREE_GB:-40}" "$(basename "$0")" "$(dirname "$0")"
 # which the scorecards run when they exit.
 export MSYS_NO_PATHCONV=1
 
-OXIGRAPH_IMAGE=${OXIGRAPH_IMAGE:-ghcr.io/oxigraph/oxigraph:0.5.11}
+OXIGRAPH_IMAGE=${OXIGRAPH_IMAGE:-ghcr.io/oxigraph/oxigraph:0.5.13}
 PYTHON_IMAGE=${PYTHON_IMAGE:-python:3.13-alpine}
 HERE=$(cd "$(dirname "$0")" && pwd)
 HERE=$(cygpath -m "$HERE" 2>/dev/null || echo "$HERE")
@@ -30,11 +37,22 @@ NAMES=${*:-olympics yago-tiny dbpedia-core wikidata-lexemes}
 
 # Runs a shell command in /data/real of the data volume.
 in_volume() {
-  docker run --rm -v nrese-bench-data:/data -w /data/real alpine sh -euc "$1"
+  docker run --rm -v "$DATA_VOLUME":/data -w /data/real alpine sh -euc "$1"
 }
 
+# The Wikidata lexeme dump: the newest, or a dated one (WIKIDATA_LEXEMES_DUMP=YYYYMMDD;
+# Wikimedia keeps dated dumps for a few weeks), so that a rerun can measure the same data.
+if [ -n "${WIKIDATA_LEXEMES_DUMP:-}" ]; then
+  LEXEMES_URL="https://dumps.wikimedia.org/wikidatawiki/entities/$WIKIDATA_LEXEMES_DUMP/wikidata-$WIKIDATA_LEXEMES_DUMP-lexemes.nt.gz"
+else
+  LEXEMES_URL=https://dumps.wikimedia.org/wikidatawiki/entities/latest-lexemes.nt.gz
+fi
+
+# Each download leaves FILE.source beside it: the URL and the server's Last-Modified, so a
+# run's manifest says which release of a "latest" dump it measured.
 download() { # url file
-  in_volume "[ -s '$2' ] || { apk add -q curl >/dev/null; curl -sSfL --retry 3 -o '$2.part' '$1'; mv '$2.part' '$2'; }"
+  in_volume "[ -s '$2' ] || { apk add -q curl >/dev/null; curl -sSfL --retry 3 -o '$2.part' '$1'; mv '$2.part' '$2';
+    echo \"$1 \$(curl -sSfLI '$1' | grep -i '^last-modified:' | tail -1 | cut -d' ' -f2- | tr -d '\r')\" > '$2.source'; }"
 }
 
 # Converts the files matched by a glob (relative to /data/real) into /data/<name>.nt.
@@ -48,7 +66,7 @@ convert() { # name glob [filter]
     source=$file
     if [ -n "$filter" ]; then
       source=$name.parts/$(basename "$file").filtered
-      docker run --rm -v nrese-bench-data:/data -v "$HERE:/scripts:ro" "$PYTHON_IMAGE" \
+      docker run --rm -v "$DATA_VOLUME":/data -v "$HERE:/scripts:ro" "$PYTHON_IMAGE" \
         sh -c "python /scripts/nt-filter.py < '/data/real/$file' > '/data/real/$source'"
     fi
     # The source's syntax by its extension (YAGO ships Turtle).
@@ -57,7 +75,7 @@ convert() { # name glob [filter]
       *.nq) format=nq ;;
       *) format=nt ;;
     esac
-    docker run --rm -v nrese-bench-data:/data "$OXIGRAPH_IMAGE" convert --from-format "$format" \
+    docker run --rm -v "$DATA_VOLUME":/data "$OXIGRAPH_IMAGE" convert --from-format "$format" \
       --from-file "/data/real/$source" --to-file "/data/real/$name.parts/$(basename "$file").nt"
     [ -z "$filter" ] || in_volume "rm -f '$source'"
   done
@@ -68,7 +86,7 @@ convert() { # name glob [filter]
 }
 
 for name in $NAMES; do
-  if docker run --rm -v nrese-bench-data:/data alpine test -s "/data/$name.nt"; then
+  if docker run --rm -v "$DATA_VOLUME":/data alpine test -s "/data/$name.nt"; then
     echo "$name: ready"
     continue
   fi
@@ -98,19 +116,19 @@ for name in $NAMES; do
       # (the full dump is ~229 M triples and ~31 GB).
       millions=${name#wikidata-lexemes-}
       millions=${millions%m}
-      download https://dumps.wikimedia.org/wikidatawiki/entities/latest-lexemes.nt.gz wikidata-lexemes.nt.gz
+      download "$LEXEMES_URL" wikidata-lexemes.nt.gz
       in_volume "rm -rf '$name.parts' && mkdir '$name.parts'"
-      docker run --rm -v nrese-bench-data:/data -v "$HERE:/scripts:ro" "$PYTHON_IMAGE" sh -c \
+      docker run --rm -v "$DATA_VOLUME":/data -v "$HERE:/scripts:ro" "$PYTHON_IMAGE" sh -c \
         "gunzip -c /data/real/wikidata-lexemes.nt.gz | python /scripts/nt-filter.py \
          | head -n $(( millions * 1000000 )) > /data/real/$name.parts/slice.filtered"
-      docker run --rm -v nrese-bench-data:/data "$OXIGRAPH_IMAGE" convert --from-format nt \
+      docker run --rm -v "$DATA_VOLUME":/data "$OXIGRAPH_IMAGE" convert --from-format nt \
         --from-file "/data/real/$name.parts/slice.filtered" --to-file "/data/real/$name.parts/slice.nt"
       in_volume "rm -f '$name.parts/slice.filtered'"
       in_volume "mv '$name.parts/slice.nt' '/data/$name.nt' && rm -rf '$name.parts'
         echo \"$name: \$(wc -l < '/data/$name.nt') triples, \$(du -h '/data/$name.nt' | cut -f1)\""
       ;;
     wikidata-lexemes)
-      download https://dumps.wikimedia.org/wikidatawiki/entities/latest-lexemes.nt.gz wikidata-lexemes.nt.gz
+      download "$LEXEMES_URL" wikidata-lexemes.nt.gz
       in_volume "[ -s wikidata-lexemes.nt ] || gunzip -k wikidata-lexemes.nt.gz"
       convert wikidata-lexemes "wikidata-lexemes.nt" filter
       ;;

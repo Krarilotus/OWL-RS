@@ -1,0 +1,1624 @@
+//! The reverse OWL 2 RDF mapping (W3C *OWL 2 Mapping to RDF Graphs*, §3): the structural
+//! model of an ontology from its triples, every axiom with the triples (and graphs) it
+//! was read from, and a diagnostic for everything that isn't well-formed OWL 2 DL, never
+//! a silent drop.
+//!
+//! The source's terms are read by id; only literals that carry numbers the mapping needs
+//! (cardinalities, `owl:hasSelf`) are decoded ([`Terms`]).
+//!
+//! Properties are object or data properties by their declarations; an undeclared one by
+//! its use (a literal object makes it a data property), with a diagnostic. Blank nodes
+//! that build expressions are read once; one used by two expressions is reported.
+
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+use crate::diagnostics::Diagnostic;
+use crate::model::{
+    Axiom, Characteristic, ClassExpr, DataRange, DataTerms, Disjoint, EntityKind, ExprId, Interner,
+    Literal, ObjProp, RangeId, Term, canonical,
+};
+use crate::vocab::Vocabulary;
+
+/// What a term of the source is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TermKind {
+    Iri,
+    Blank,
+    Literal,
+}
+
+/// The source's terms, as far as the mapping needs them.
+pub trait Terms {
+    fn kind(&self, term: Term) -> TermKind;
+    /// A literal's lexical form.
+    fn lexical(&self, term: Term) -> Option<String>;
+    /// The id of an IRI, if the source has it.
+    fn iri(&self, iri: &str) -> Option<Term>;
+
+    /// A literal's datatype IRI (`rdf:langString` for a language-tagged one), or `None`
+    /// where the source doesn't know it (every RDF literal has one). The datatype theory
+    /// needs it for the literal's value; the profile check admits to OWL 2 RL a literal whose
+    /// datatype isn't known (`crate::profile`), so each source says which it is.
+    fn datatype(&self, term: Term) -> Option<String>;
+
+    /// A literal's language tag, if it has one and the source gives it.
+    fn language(&self, _term: Term) -> Option<String> {
+        None
+    }
+
+    /// The text of an IRI, if the source gives it (datatypes and facets beyond those the
+    /// vocabulary knows).
+    fn iri_text(&self, _term: Term) -> Option<String> {
+        None
+    }
+}
+
+/// A statement of the source: a triple and its graph.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Statement {
+    pub triple: [Term; 3],
+    pub graph: Term,
+}
+
+/// Where an axiom was read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Source {
+    pub graph: Term,
+    /// The triples of its RDF form: its own and those of the expressions it was the first
+    /// to read.
+    pub triples: Vec<[Term; 3]>,
+}
+
+/// An ontology read from RDF.
+#[derive(Debug, Clone, Default)]
+pub struct Ontology {
+    pub classes: Interner<ClassExpr>,
+    pub ranges: Interner<DataRange>,
+    /// Every axiom once, sorted.
+    pub axioms: Vec<Axiom>,
+    /// Per axiom (parallel to `axioms`): where it was read from (once per graph and form).
+    pub sources: Vec<Vec<Source>>,
+    pub diagnostics: Vec<Diagnostic>,
+    /// Annotation statements and the ontology header, read past.
+    pub annotations: usize,
+    /// The annotation properties (declared or built in) given a domain, a range, a
+    /// super-property, or a sub-property of another kind (no OWL 2 DL axiom), read past
+    /// among [`Self::annotations`]: OWL 2 DL gives these axioms no meaning, while the OWL 2
+    /// RL rules over the triples (prp-dom, prp-rng, prp-spo1) read them. Sorted, each once.
+    pub annotation_schema: Vec<Term>,
+    /// The source's ids of the properties with a fixed meaning.
+    pub builtin: BuiltinProperties,
+    /// The literals, datatypes and facets of the data axioms, as the source gives them.
+    pub data: DataTerms,
+    /// The individuals that are blank nodes (anonymous: keys don't apply to them).
+    pub anonymous: BTreeSet<Term>,
+    /// DL-safe rules (`crate::rules`; not OWL 2), each with a [`Diagnostic::Rule`].
+    pub rules: Vec<crate::rules::Rule>,
+    /// The first restriction whose max cardinality (qualified or not; the only ones the RL
+    /// rules read) isn't written as the RDF mapping writes it,
+    /// `"n"^^xsd:nonNegativeInteger` with `n` canonical (`1`, not `01`; Turtle's `1` is an
+    /// xsd:integer): read here by its value, but OWL 2 RL's rules (cls-maxc1/2,
+    /// cls-maxqc1-4) name the mapping's literal, so they don't read it.
+    pub noncanonical_cardinality: Option<Term>,
+    /// The first empty `owl:intersectionOf` or `owl:unionOf` list, `owl:Thing` or
+    /// `owl:Nothing` (OWL 2 Mapping to RDF, Tables 15 and 18), which OWL 2 RL's rules don't
+    /// read: they build no rule from it, so no clash from an instance of the empty union, and
+    /// where a rule names `owl:Thing` they see a blank node.
+    pub empty_list: Option<Term>,
+    /// The first data property with a maximum written with a data range (`owl:onDataRange`,
+    /// `rdfs:Literal` too), which OWL 2 RL's rules don't read: its range can't tell it from
+    /// an unqualified maximum.
+    pub qualified_data_max: Option<Term>,
+}
+
+/// The properties OWL 2 gives a fixed meaning, by their ids in the source (`None` where
+/// the source doesn't have the IRI): the normalisation gives them their semantics or
+/// reports what uses them as unsupported, never reads them as ordinary properties.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct BuiltinProperties {
+    /// `owl:topObjectProperty`: every pair of individuals.
+    pub top_object: Option<Term>,
+    /// `owl:bottomObjectProperty`: no pair.
+    pub bottom_object: Option<Term>,
+    /// `owl:topDataProperty`: every individual with every data value.
+    pub top_data: Option<Term>,
+    /// `owl:bottomDataProperty`: no pair.
+    pub bottom_data: Option<Term>,
+}
+
+impl BuiltinProperties {
+    /// Their ids in a source, by its vocabulary.
+    pub fn of(v: &Vocabulary) -> Self {
+        Self {
+            top_object: v.owl_top_object_property,
+            bottom_object: v.owl_bottom_object_property,
+            top_data: v.owl_top_data_property,
+            bottom_data: v.owl_bottom_data_property,
+        }
+    }
+}
+
+impl Ontology {
+    pub fn class(&self, id: ExprId) -> &ClassExpr {
+        self.classes.get(id.0)
+    }
+
+    pub fn range(&self, id: RangeId) -> &DataRange {
+        self.ranges.get(id.0)
+    }
+
+    /// The named individuals: declared, asserted about, or in a nominal (blank nodes, the
+    /// anonymous individuals, left out). Sorted. O(axioms + class expressions).
+    pub fn named_individuals(&self) -> Vec<Term> {
+        let mut out: Vec<Term> = Vec::new();
+        for a in &self.axioms {
+            if let Axiom::Declaration(crate::model::EntityKind::NamedIndividual, t) = a {
+                out.push(*t);
+            }
+            out.extend(individuals(a));
+        }
+        out.extend(in_expressions(self));
+        out.retain(|t| !self.anonymous.contains(t));
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    /// The axioms of a kind, by a test.
+    pub fn axioms_where(&self, test: impl Fn(&Axiom) -> bool) -> impl Iterator<Item = &Axiom> {
+        self.axioms.iter().filter(move |a| test(a))
+    }
+}
+
+/// Reads the ontology of `statements` (any graphs, the union of them).
+pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
+    let vocabulary = Vocabulary::new(&|iri| terms.iri(iri));
+    let mut reader = Reader::new(statements, terms, vocabulary);
+    reader.declarations();
+    reader.axioms();
+    reader.finish()
+}
+
+/// What makes a blank node a class expression to [`read`], by the source's ids: its types,
+/// or a statement with one of its properties. Such a node in a class's place is read, or
+/// reported when it can't be (malformed, unsupported).
+///
+/// `Reader::blank_class` reads exactly these, and a caller choosing input (the store's QL
+/// reader, by memberships) finds class expressions by the same definition.
+/// Both take it apart field by field, so a marker added here doesn't compile
+/// until each of them handles it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClassExpressionMarkers {
+    /// `owl:Class`, `rdfs:Class`, `owl:Restriction`.
+    pub types: [Option<Term>; 3],
+    /// `owl:intersectionOf`, `owl:unionOf`, `owl:complementOf`, `owl:oneOf`.
+    pub set_operators: [Option<Term>; 4],
+    /// `owl:onProperties`: an n-ary data restriction, reported as unsupported.
+    pub on_properties: Option<Term>,
+    /// `owl:onProperty`: a restriction.
+    pub on_property: Option<Term>,
+}
+
+impl ClassExpressionMarkers {
+    pub fn of(v: &Vocabulary) -> Self {
+        Self {
+            types: [v.owl_class, v.rdfs_class, v.owl_restriction],
+            set_operators: [
+                v.owl_intersection_of,
+                v.owl_union_of,
+                v.owl_complement_of,
+                v.owl_one_of,
+            ],
+            on_properties: v.owl_on_properties,
+            on_property: v.owl_on_property,
+        }
+    }
+
+    /// [`Self::of`] the source's vocabulary, looking up only these terms, by their
+    /// compile-time IRIs: a caller needing nothing else of the vocabulary looks nothing else
+    /// up. The QL reader does this once per fresh read, where a whole [`Vocabulary::new`]
+    /// cost 0.6 % of a compile (count i24c-attrib2-f6ec07c9).
+    pub fn lookup(id_of: &dyn Fn(&str) -> Option<Term>) -> Self {
+        Self {
+            types: [
+                id_of(const { Vocabulary::iri("owl_class") }),
+                id_of(const { Vocabulary::iri("rdfs_class") }),
+                id_of(const { Vocabulary::iri("owl_restriction") }),
+            ],
+            set_operators: [
+                id_of(const { Vocabulary::iri("owl_intersection_of") }),
+                id_of(const { Vocabulary::iri("owl_union_of") }),
+                id_of(const { Vocabulary::iri("owl_complement_of") }),
+                id_of(const { Vocabulary::iri("owl_one_of") }),
+            ],
+            on_properties: id_of(const { Vocabulary::iri("owl_on_properties") }),
+            on_property: id_of(const { Vocabulary::iri("owl_on_property") }),
+        }
+    }
+
+    /// The properties, those the source has.
+    pub fn properties(&self) -> Vec<Term> {
+        let Self {
+            types: _,
+            set_operators,
+            on_properties,
+            on_property,
+        } = *self;
+        set_operators
+            .into_iter()
+            .chain([on_properties, on_property])
+            .flatten()
+            .collect()
+    }
+}
+
+/// What every reader adds to the axioms it read: the literals' parts, the anonymous
+/// individuals, and the diagnostics of OWL 2 DL's global restrictions.
+pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
+    crate::diagnostics::leave_out_reserved(ontology, terms);
+    ontology.data = data_terms(ontology, terms);
+    // Wherever a blank node stands for an individual, it is an anonymous one.
+    ontology.anonymous = (ontology.axioms.iter())
+        .flat_map(individuals)
+        .chain(in_expressions(ontology))
+        .filter(|&t| terms.kind(t) == TermKind::Blank)
+        .collect();
+    crate::diagnostics::check_global_restrictions(ontology);
+}
+
+/// The individuals class expressions name: in nominals and `hasValue`.
+pub(crate) fn in_expressions(ontology: &Ontology) -> impl Iterator<Item = Term> + '_ {
+    (0..ontology.classes.len() as u32).flat_map(|id| match ontology.classes.get(id) {
+        ClassExpr::OneOf(v) => v.clone(),
+        ClassExpr::HasValue(_, t) => vec![*t],
+        _ => Vec::new(),
+    })
+}
+
+/// The individuals an assertion is about.
+fn individuals(axiom: &Axiom) -> Vec<Term> {
+    match axiom {
+        Axiom::ClassAssertion(_, a)
+        | Axiom::DataPropertyAssertion(_, a, _)
+        | Axiom::NegativeDataPropertyAssertion(_, a, _) => vec![*a],
+        Axiom::ObjectPropertyAssertion(_, a, b)
+        | Axiom::NegativeObjectPropertyAssertion(_, a, b) => vec![*a, *b],
+        Axiom::SameIndividual(xs) | Axiom::DifferentIndividuals(xs) => xs.clone(),
+        _ => Vec::new(),
+    }
+}
+
+/// The literals and datatype and facet IRIs the ontology's data axioms and ranges use,
+/// with their parts as `terms` gives them.
+fn data_terms(o: &Ontology, terms: &dyn Terms) -> DataTerms {
+    let mut literals: BTreeSet<Term> = BTreeSet::new();
+    let mut iris: BTreeSet<Term> = BTreeSet::new();
+    for id in 0..o.ranges.len() as u32 {
+        match o.ranges.get(id) {
+            DataRange::Datatype(t) => {
+                iris.insert(*t);
+            }
+            DataRange::OneOf(xs) => literals.extend(xs),
+            DataRange::Restriction(t, facets) => {
+                iris.insert(*t);
+                for &(f, v) in facets {
+                    iris.insert(f);
+                    literals.insert(v);
+                }
+            }
+            _ => {}
+        }
+    }
+    for id in 0..o.classes.len() as u32 {
+        if let ClassExpr::DataHasValue(_, v) = o.classes.get(id) {
+            literals.insert(*v);
+        }
+    }
+    for a in &o.axioms {
+        match a {
+            Axiom::DataPropertyAssertion(_, _, v)
+            | Axiom::NegativeDataPropertyAssertion(_, _, v) => {
+                literals.insert(*v);
+            }
+            Axiom::DatatypeDefinition(t, _) => {
+                iris.insert(*t);
+            }
+            _ => {}
+        }
+    }
+    // The rules' literals and built-ins.
+    for atom in o.rules.iter().flat_map(|r| r.body.iter().chain(&r.head)) {
+        use crate::rules::{Atom, DArg};
+        let mut args: Vec<DArg> = Vec::new();
+        match atom {
+            Atom::Range(_, v) | Atom::Data(_, _, v) => args.push(*v),
+            Atom::BuiltIn(b, xs) => {
+                iris.insert(*b);
+                args.extend(xs);
+            }
+            _ => {}
+        }
+        for a in args {
+            if let DArg::Literal(l) = a {
+                literals.insert(l);
+            }
+        }
+    }
+    // IRIs: as the source writes them, else those of the datatype map it has ids for.
+    let mut known: HashMap<Term, String> = HashMap::new();
+    for iri in crate::vocab::data_iris() {
+        if let Some(t) = terms.iri(&iri) {
+            known.insert(t, iri);
+        }
+    }
+    let mut out = DataTerms::default();
+    for t in literals {
+        if terms.kind(t) != TermKind::Literal {
+            continue;
+        }
+        if let Some(lexical) = terms.lexical(t) {
+            out.literals.insert(
+                t,
+                Literal {
+                    lexical,
+                    datatype: terms.datatype(t),
+                    language: terms.language(t),
+                },
+            );
+        }
+    }
+    for t in iris {
+        if let Some(iri) = terms.iri_text(t).or_else(|| known.get(&t).cloned()) {
+            out.iris.insert(t, iri);
+        }
+    }
+    out
+}
+
+struct Reader<'a> {
+    v: Vocabulary,
+    /// [`DECLARATION_KINDS`] by the source's ids.
+    declaration_kinds: [(Option<Term>, EntityKind); 9],
+    /// [`BUILTIN_ANNOTATIONS`] and `owl:versionIRI` by the source's ids, looked up once per
+    /// read: [`Self::is_builtin_annotation`] meets them on every assertion.
+    builtin_annotations: ([Option<Term>; 9], Option<Term>),
+    annotation_properties: AnnotationProperties,
+    terms: &'a dyn Terms,
+    statements: &'a [Statement],
+    /// Per subject: (predicate, object, graph).
+    by_subject: HashMap<Term, Vec<(Term, Term, Term)>>,
+    declared: BTreeMap<Term, Vec<EntityKind>>,
+    /// Properties used with literal objects.
+    used_with_literals: HashSet<Term>,
+    used_with_nodes: HashSet<Term>,
+    qualified_data_max: Option<Term>,
+    class_memo: HashMap<Term, Option<ExprId>>,
+    range_memo: HashMap<Term, Option<RangeId>>,
+    /// Blank nodes read as operands, and how often.
+    uses: HashMap<Term, u32>,
+    /// Triples that belong to a structure (an expression, a list, an n-ary axiom).
+    structural: HashSet<[Term; 3]>,
+    /// The structural triples read for the axiom being read.
+    collected: Vec<[Term; 3]>,
+    graph: Term,
+    classes: Interner<ClassExpr>,
+    ranges: Interner<DataRange>,
+    axioms: BTreeMap<Axiom, Vec<Source>>,
+    diagnostics: Vec<Diagnostic>,
+    reported: HashSet<(Term, &'static str)>,
+    annotations: usize,
+    noncanonical_cardinality: Option<Term>,
+    empty_list: Option<Term>,
+    annotation_schema: Vec<Term>,
+}
+
+/// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
+/// OWL 1 synonyms the mapping reads as them (`rdfs:Class`, `owl:DataRange`, and
+/// `owl:OntologyProperty` by Table 6 of §3.1.2). [`read`]
+/// declares by this table, and a reader of RDF elsewhere that tells what a name is from its
+/// declarations reads by it too, so that both read a declaration as the same kind.
+pub const DECLARATION_KINDS: [(&str, EntityKind); 9] = [
+    (Vocabulary::iri("owl_class"), EntityKind::Class),
+    (Vocabulary::iri("rdfs_class"), EntityKind::Class),
+    (
+        Vocabulary::iri("owl_object_property"),
+        EntityKind::ObjectProperty,
+    ),
+    (
+        Vocabulary::iri("owl_datatype_property"),
+        EntityKind::DataProperty,
+    ),
+    (
+        Vocabulary::iri("owl_annotation_property"),
+        EntityKind::AnnotationProperty,
+    ),
+    (
+        Vocabulary::iri("owl_ontology_property"),
+        EntityKind::AnnotationProperty,
+    ),
+    (Vocabulary::iri("rdfs_datatype"), EntityKind::Datatype),
+    (Vocabulary::iri("owl_data_range"), EntityKind::Datatype),
+    (
+        Vocabulary::iri("owl_named_individual"),
+        EntityKind::NamedIndividual,
+    ),
+];
+
+/// The annotation properties OWL 2 builds in (Structural Specification §5.5): the reader
+/// reads a statement of one as an annotation, which gives its terms no kind.
+pub const BUILTIN_ANNOTATIONS: [&str; 9] = [
+    "http://www.w3.org/2000/01/rdf-schema#label",
+    "http://www.w3.org/2000/01/rdf-schema#comment",
+    "http://www.w3.org/2000/01/rdf-schema#seeAlso",
+    "http://www.w3.org/2000/01/rdf-schema#isDefinedBy",
+    "http://www.w3.org/2002/07/owl#deprecated",
+    "http://www.w3.org/2002/07/owl#versionInfo",
+    "http://www.w3.org/2002/07/owl#priorVersion",
+    "http://www.w3.org/2002/07/owl#backwardCompatibleWith",
+    "http://www.w3.org/2002/07/owl#incompatibleWith",
+];
+
+/// The annotation properties as [`read`] reads them (§5.8), for every reader of the RDF: the
+/// built-in ones, and each IRI declared one by [`DECLARATION_KINDS`] (no blank node). Holds
+/// the declarations' `rdf:type` and class, and the properties.
+#[derive(Debug, Clone)]
+pub struct AnnotationProperties(Vec<[Option<Term>; 2]>, HashSet<Term>);
+
+impl AnnotationProperties {
+    /// The built-in ones, by the source's ids (`iri`).
+    pub fn new(iri: &mut dyn FnMut(&str) -> Option<Term>) -> Self {
+        let ty = iri(Vocabulary::iri("rdf_type"));
+        let kinds = DECLARATION_KINDS.iter();
+        let annotation = kinds.filter(|d| d.1 == EntityKind::AnnotationProperty);
+        let declaring = annotation.map(|d| [ty, iri(d.0)]).collect();
+        let properties = BUILTIN_ANNOTATIONS.iter().filter_map(|b| iri(b)).collect();
+        Self(declaring, properties)
+    }
+
+    /// Reads a statement, whose subject is an IRI where `named`.
+    pub fn read(&mut self, [s, p, o]: [Term; 3], named: bool) {
+        if named && self.0.contains(&[Some(p), Some(o)]) {
+            self.1.insert(s);
+        }
+    }
+
+    pub fn contains(&self, term: Term) -> bool {
+        self.1.contains(&term)
+    }
+}
+
+/// `Some(id) == Some(x)` without matching an absent term.
+fn is(id: Term, term: Option<Term>) -> bool {
+    term == Some(id)
+}
+
+impl<'a> Reader<'a> {
+    fn new(statements: &'a [Statement], terms: &'a dyn Terms, v: Vocabulary) -> Self {
+        let mut by_subject: HashMap<Term, Vec<(Term, Term, Term)>> = HashMap::new();
+        let mut used_with_literals = HashSet::new();
+        let mut used_with_nodes = HashSet::new();
+        for statement in statements {
+            let [s, p, o] = statement.triple;
+            by_subject
+                .entry(s)
+                .or_default()
+                .push((p, o, statement.graph));
+            match terms.kind(o) {
+                TermKind::Literal => used_with_literals.insert(p),
+                _ => used_with_nodes.insert(p),
+            };
+        }
+        Self {
+            v,
+            declaration_kinds: DECLARATION_KINDS.map(|(iri, kind)| (terms.iri(iri), kind)),
+            builtin_annotations: (
+                BUILTIN_ANNOTATIONS.map(|iri| terms.iri(iri)),
+                terms.iri("http://www.w3.org/2002/07/owl#versionIRI"),
+            ),
+            annotation_properties: AnnotationProperties::new(&mut |iri| terms.iri(iri)),
+            terms,
+            statements,
+            by_subject,
+            declared: BTreeMap::new(),
+            used_with_literals,
+            used_with_nodes,
+            qualified_data_max: None,
+            class_memo: HashMap::new(),
+            range_memo: HashMap::new(),
+            uses: HashMap::new(),
+            structural: HashSet::new(),
+            collected: Vec::new(),
+            graph: 0,
+            classes: Interner::default(),
+            ranges: Interner::default(),
+            axioms: BTreeMap::new(),
+            diagnostics: Vec::new(),
+            reported: HashSet::new(),
+            annotations: 0,
+            noncanonical_cardinality: None,
+            empty_list: None,
+            annotation_schema: Vec::new(),
+        }
+    }
+
+    fn report(&mut self, diagnostic: Diagnostic) {
+        let key = diagnostic.key();
+        if self.reported.insert(key) {
+            self.diagnostics.push(diagnostic);
+        }
+    }
+
+    fn kind(&self, term: Term) -> TermKind {
+        self.terms.kind(term)
+    }
+
+    /// The objects of `subject`'s `predicate` statements, each once: the ontology is the
+    /// union of the graphs, where a statement in two graphs is one.
+    fn objects(&self, subject: Term, predicate: Option<Term>) -> Vec<Term> {
+        let Some(predicate) = predicate else {
+            return Vec::new();
+        };
+        let mut objects = Vec::new();
+        for &(p, o, _) in self.by_subject.get(&subject).into_iter().flatten() {
+            if p == predicate && !objects.contains(&o) {
+                objects.push(o);
+            }
+        }
+        objects
+    }
+
+    /// The single object of `subject`'s `predicate`, collected as structural.
+    fn one(&mut self, subject: Term, predicate: Option<Term>) -> Option<Term> {
+        let objects = self.objects(subject, predicate);
+        let &object = objects.first()?;
+        if objects.len() > 1 {
+            self.report(Diagnostic::Malformed {
+                node: subject,
+                what: "a structure property given twice",
+            });
+        }
+        self.collect([subject, predicate?, object]);
+        Some(object)
+    }
+
+    fn has_type(&self, subject: Term, class: Option<Term>) -> bool {
+        class.is_some_and(|class| self.objects(subject, self.v.rdf_type).contains(&class))
+    }
+
+    fn collect(&mut self, triple: [Term; 3]) {
+        self.structural.insert(triple);
+        self.collected.push(triple);
+    }
+
+    fn declared_as(&self, term: Term, kind: EntityKind) -> bool {
+        self.declared
+            .get(&term)
+            .is_some_and(|kinds| kinds.contains(&kind))
+    }
+
+    // Declarations ---------------------------------------------------------------------
+
+    fn declarations(&mut self) {
+        let v = self.v;
+        let kinds = self.declaration_kinds;
+        // Characteristics other than functional make an object property.
+        let object_only = [
+            v.owl_inverse_functional,
+            v.owl_reflexive,
+            v.owl_irreflexive,
+            v.owl_symmetric,
+            v.owl_asymmetric,
+            v.owl_transitive,
+        ];
+        let statements = self.statements;
+        for statement in statements {
+            let [s, p, o] = statement.triple;
+            if !is(p, v.rdf_type) || self.kind(s) != TermKind::Iri {
+                continue;
+            }
+            self.annotation_properties.read(statement.triple, true);
+            for &(class, kind) in &kinds {
+                if is(o, class) {
+                    let entry = self.declared.entry(s).or_default();
+                    if !entry.contains(&kind) {
+                        entry.push(kind);
+                    }
+                }
+            }
+            if object_only.iter().any(|&c| is(o, c)) {
+                let entry = self.declared.entry(s).or_default();
+                if !entry.contains(&EntityKind::ObjectProperty) {
+                    entry.push(EntityKind::ObjectProperty);
+                }
+            }
+        }
+        // The built-in properties are declared by OWL 2 itself.
+        for (property, kind) in [
+            (v.owl_top_object_property, EntityKind::ObjectProperty),
+            (v.owl_bottom_object_property, EntityKind::ObjectProperty),
+            (v.owl_top_data_property, EntityKind::DataProperty),
+            (v.owl_bottom_data_property, EntityKind::DataProperty),
+        ] {
+            if let Some(property) = property {
+                let entry = self.declared.entry(property).or_default();
+                if !entry.contains(&kind) {
+                    entry.push(kind);
+                }
+            }
+        }
+        for (&term, kinds) in &self.declared {
+            if kinds.contains(&EntityKind::ObjectProperty)
+                && kinds.contains(&EntityKind::DataProperty)
+            {
+                self.diagnostics
+                    .push(Diagnostic::AmbiguousProperty { property: term });
+            }
+        }
+    }
+
+    /// Whether `property` is a data property: declared so, or undeclared and used with
+    /// literals.
+    fn is_data_property(&mut self, property: Term) -> bool {
+        if self.declared_as(property, EntityKind::DataProperty) {
+            return !self.declared_as(property, EntityKind::ObjectProperty);
+        }
+        if self.declared_as(property, EntityKind::ObjectProperty)
+            || self.kind(property) != TermKind::Iri
+        {
+            return false;
+        }
+        self.report(Diagnostic::UndeclaredProperty { property });
+        self.used_with_literals.contains(&property) && !self.used_with_nodes.contains(&property)
+    }
+
+    // Lists ----------------------------------------------------------------------------
+
+    /// The members of the list starting at `head`.
+    fn list(&mut self, head: Term) -> Option<Vec<Term>> {
+        let mut members = Vec::new();
+        let mut seen = HashSet::new();
+        let mut cell = head;
+        loop {
+            if is(cell, self.v.nil) {
+                return Some(members);
+            }
+            if self.kind(cell) != TermKind::Blank || !seen.insert(cell) {
+                self.report(Diagnostic::BrokenList { head });
+                return None;
+            }
+            let (Some(first), Some(rest)) =
+                (self.one(cell, self.v.first), self.one(cell, self.v.rest))
+            else {
+                self.report(Diagnostic::BrokenList { head });
+                return None;
+            };
+            members.push(first);
+            cell = rest;
+        }
+    }
+
+    // Expressions ----------------------------------------------------------------------
+
+    fn used(&mut self, blank: Term) {
+        let uses = self.uses.entry(blank).or_default();
+        *uses += 1;
+        if *uses == 2 {
+            self.report(Diagnostic::SharedBlankNode { node: blank });
+        }
+    }
+
+    fn intern_class(&mut self, expr: ClassExpr) -> ExprId {
+        ExprId(self.classes.intern(expr))
+    }
+
+    fn intern_range(&mut self, range: DataRange) -> RangeId {
+        RangeId(self.ranges.intern(range))
+    }
+
+    /// The object property expression `term` stands for.
+    fn object_property(&mut self, term: Term) -> Option<ObjProp> {
+        match self.kind(term) {
+            TermKind::Iri => Some(ObjProp::Named(term)),
+            TermKind::Blank => {
+                let Some(inverse) = self.one(term, self.v.owl_inverse_of) else {
+                    self.report(Diagnostic::Malformed {
+                        node: term,
+                        what: "a blank node where a property belongs, without owl:inverseOf",
+                    });
+                    return None;
+                };
+                if self.kind(inverse) != TermKind::Iri {
+                    self.report(Diagnostic::Malformed {
+                        node: term,
+                        what: "an inverse of an inverse",
+                    });
+                    return None;
+                }
+                Some(ObjProp::Inverse(inverse))
+            }
+            TermKind::Literal => {
+                self.report(Diagnostic::Malformed {
+                    node: term,
+                    what: "a literal where a property belongs",
+                });
+                None
+            }
+        }
+    }
+
+    /// The class expression `term` stands for.
+    fn class(&mut self, term: Term) -> Option<ExprId> {
+        match self.kind(term) {
+            TermKind::Iri => Some(if is(term, self.v.owl_thing) {
+                self.intern_class(ClassExpr::Thing)
+            } else if is(term, self.v.owl_nothing) {
+                self.intern_class(ClassExpr::Nothing)
+            } else {
+                self.intern_class(ClassExpr::Class(term))
+            }),
+            TermKind::Literal => {
+                self.report(Diagnostic::Malformed {
+                    node: term,
+                    what: "a literal where a class expression belongs",
+                });
+                None
+            }
+            TermKind::Blank => {
+                self.used(term);
+                if let Some(&known) = self.class_memo.get(&term) {
+                    return known;
+                }
+                // Guards against a cycle through this node.
+                self.class_memo.insert(term, None);
+                let found = self.blank_class(term);
+                if found.is_none() {
+                    // Whatever made it unreadable may not have been reported; the axiom
+                    // it belongs to is left out, never silently.
+                    self.report(Diagnostic::Malformed {
+                        node: term,
+                        what: "a class expression that can't be read",
+                    });
+                }
+                self.class_memo.insert(term, found);
+                found
+            }
+        }
+    }
+
+    fn classes(&mut self, terms: &[Term]) -> Option<Vec<ExprId>> {
+        terms.iter().map(|&t| self.class(t)).collect()
+    }
+
+    /// A blank class expression, by [`ClassExpressionMarkers`].
+    fn blank_class(&mut self, node: Term) -> Option<ExprId> {
+        let v = self.v;
+        let ClassExpressionMarkers {
+            types,
+            set_operators,
+            on_properties,
+            on_property,
+        } = ClassExpressionMarkers::of(&v);
+        for class_type in types {
+            if self.has_type(node, class_type) {
+                self.collect([node, v.rdf_type?, class_type?]);
+            }
+        }
+        for operator in set_operators {
+            if let Some(operand) = self.one(node, operator) {
+                return self.set_operator(operator?, operand);
+            }
+        }
+        if !self.objects(node, on_properties).is_empty() {
+            self.report(Diagnostic::Unsupported {
+                node,
+                what: "n-ary data restrictions (owl:onProperties)",
+            });
+            return None;
+        }
+        let Some(property) = self.one(node, on_property) else {
+            self.report(Diagnostic::Malformed {
+                node,
+                what: "a class expression without an operator",
+            });
+            return None;
+        };
+        self.restriction(node, property)
+    }
+
+    /// The expression of a set operator (`owl:intersectionOf`, `owl:unionOf`,
+    /// `owl:complementOf`, `owl:oneOf`) applied to `operand`.
+    fn set_operator(&mut self, operator: Term, operand: Term) -> Option<ExprId> {
+        let v = self.v;
+        if is(operator, v.owl_complement_of) {
+            let operand = self.class(operand)?;
+            return Some(self.intern_class(ClassExpr::Not(operand)));
+        }
+        let members = self.list(operand)?;
+        if is(operator, v.owl_one_of) {
+            return Some(self.intern_class(ClassExpr::OneOf(canonical(members))));
+        }
+        let operands = canonical(self.classes(&members)?);
+        let union = is(operator, v.owl_union_of);
+        if operands.is_empty() {
+            // An empty intersection is `owl:Thing`, an empty union `owl:Nothing` (OWL 2
+            // Mapping to RDF, Tables 15 and 18), which the rules don't read
+            // ([`Ontology::empty_list`]). The other short lists keep their form, which no
+            // OWL 2 RL check takes.
+            self.empty_list.get_or_insert(operand);
+            if !union {
+                return Some(self.intern_class(ClassExpr::Thing));
+            }
+        }
+        Some(self.intern_class(if union {
+            ClassExpr::Or(operands)
+        } else {
+            ClassExpr::And(operands)
+        }))
+    }
+
+    /// Whether the restriction `node` says its undeclared property is a data property, where
+    /// no literal use does (a schema read alone): its value a literal, or its filler a data
+    /// range ([`Self::is_data_range`]).
+    fn says_data(&mut self, node: Term) -> bool {
+        let first = |reader: &Self, p| reader.objects(node, p).first().copied();
+        if let Some(value) = first(self, self.v.owl_has_value) {
+            return self.kind(value) == TermKind::Literal;
+        }
+        let filler = first(self, self.v.owl_some_values_from);
+        let Some(filler) = filler.or_else(|| first(self, self.v.owl_all_values_from)) else {
+            return false;
+        };
+        self.is_data_range(filler, &mut HashMap::new())
+    }
+
+    /// Whether `term` is a data range by its own statements: a datatype (declared, or of
+    /// OWL 2's datatype map, whose names no class may take), or a blank node typed
+    /// `rdfs:Datatype` (`owl:DataRange` in OWL 1), restricting a datatype, a datatype's
+    /// complement, an enumeration of literals, or an intersection or union of data ranges.
+    /// A mix with classes, an empty list or a cycle is no evidence: read as before. `seen`
+    /// holds each operator node's answer, `false` while on the path (a shared one is read once).
+    fn is_data_range(&mut self, term: Term, seen: &mut HashMap<Term, bool>) -> bool {
+        let v = self.v;
+        match self.kind(term) {
+            TermKind::Iri => {
+                self.declared_as(term, EntityKind::Datatype)
+                    || crate::vocab::DATA_IRIS
+                        .iter()
+                        .any(|&iri| self.terms.iri(iri) == Some(term))
+            }
+            TermKind::Blank => {
+                let first = |reader: &Self, p| reader.objects(term, p).first().copied();
+                if self.has_type(term, v.rdfs_datatype)
+                    || self.has_type(term, v.owl_data_range)
+                    || first(self, v.owl_on_datatype).is_some()
+                    || first(self, v.owl_datatype_complement_of).is_some()
+                {
+                    return true;
+                }
+                if let Some(list) = first(self, v.owl_one_of) {
+                    let members = self.list(list).unwrap_or_default();
+                    return !members.is_empty()
+                        && members.iter().all(|&m| self.kind(m) == TermKind::Literal);
+                }
+                if let Some(&data) = seen.get(&term) {
+                    return data;
+                }
+                seen.insert(term, false);
+                let operands =
+                    first(self, v.owl_intersection_of).or_else(|| first(self, v.owl_union_of));
+                let members = operands
+                    .and_then(|list| self.list(list))
+                    .unwrap_or_default();
+                let data =
+                    !members.is_empty() && members.iter().all(|&m| self.is_data_range(m, seen));
+                seen.insert(term, data);
+                data
+            }
+            _ => false,
+        }
+    }
+
+    /// A restriction on `property`.
+    fn restriction(&mut self, node: Term, property: Term) -> Option<ExprId> {
+        let v = self.v;
+        let data = self.kind(property) == TermKind::Iri
+            && (self.is_data_property(property)
+                || (!self.declared_as(property, EntityKind::ObjectProperty)
+                    && self.says_data(node)));
+        let number = |reader: &mut Self, predicate: Option<Term>| -> Option<Option<u32>> {
+            let literal = reader.one(node, predicate)?;
+            let text = reader.terms.lexical(literal);
+            let parsed = text.as_deref().and_then(|t| t.trim().parse::<u32>().ok());
+            if parsed.is_none() {
+                reader.report(Diagnostic::Malformed {
+                    node,
+                    what: "a cardinality that isn't a non-negative integer",
+                });
+            }
+            // The source may not give the datatype: then the lexical form alone decides.
+            let datatype = reader.terms.datatype(literal);
+            let mapped = parsed.is_some_and(|n| text == Some(n.to_string()))
+                && datatype
+                    .is_none_or(|d| d == "http://www.w3.org/2001/XMLSchema#nonNegativeInteger");
+            // The rules read only a max cardinality: an exact or min one's spelling matters
+            // to none.
+            let max = [reader.v.owl_max_cardinality, reader.v.owl_max_qualified];
+            if max.contains(&predicate) && !mapped {
+                reader.noncanonical_cardinality.get_or_insert(node);
+            }
+            Some(parsed)
+        };
+        if data {
+            // `rdfs:Literal`, whether or not the source has a term for its IRI (a
+            // cardinality over a data property was dropped where it hadn't).
+            let literal_range = |reader: &mut Self| -> Option<RangeId> {
+                Some(reader.intern_range(DataRange::Literal))
+            };
+            if let Some(filler) = self.one(node, v.owl_some_values_from) {
+                let range = self.range(filler)?;
+                return Some(self.intern_class(ClassExpr::DataSome(property, range)));
+            }
+            if let Some(filler) = self.one(node, v.owl_all_values_from) {
+                let range = self.range(filler)?;
+                return Some(self.intern_class(ClassExpr::DataAll(property, range)));
+            }
+            if let Some(value) = self.one(node, v.owl_has_value) {
+                return Some(self.intern_class(ClassExpr::DataHasValue(property, value)));
+            }
+            for (predicate, qualified, make) in [
+                (
+                    v.owl_min_cardinality,
+                    v.owl_min_qualified,
+                    ClassExpr::DataMin as fn(u32, Term, RangeId) -> ClassExpr,
+                ),
+                (
+                    v.owl_max_cardinality,
+                    v.owl_max_qualified,
+                    ClassExpr::DataMax,
+                ),
+                (v.owl_cardinality, v.owl_qualified, ClassExpr::DataExact),
+            ] {
+                if let Some(n) = number(self, predicate) {
+                    let range = literal_range(self)?;
+                    return Some(self.intern_class(make(n?, property, range)));
+                }
+                if let Some(n) = number(self, qualified) {
+                    let filler = self.one(node, v.owl_on_data_range)?;
+                    let range = self.range(filler)?;
+                    if qualified == v.owl_max_qualified {
+                        self.qualified_data_max.get_or_insert(property);
+                    }
+                    return Some(self.intern_class(make(n?, property, range)));
+                }
+            }
+        } else {
+            let property = self.object_property(property)?;
+            if let Some(filler) = self.one(node, v.owl_some_values_from) {
+                let class = self.class(filler)?;
+                return Some(self.intern_class(ClassExpr::Some(property, class)));
+            }
+            if let Some(filler) = self.one(node, v.owl_all_values_from) {
+                let class = self.class(filler)?;
+                return Some(self.intern_class(ClassExpr::All(property, class)));
+            }
+            if let Some(value) = self.one(node, v.owl_has_value) {
+                return Some(self.intern_class(ClassExpr::HasValue(property, value)));
+            }
+            if let Some(flag) = self.one(node, v.owl_has_self) {
+                let yes = self
+                    .terms
+                    .lexical(flag)
+                    .is_some_and(|t| t == "true" || t == "1");
+                if !yes {
+                    self.report(Diagnostic::Malformed {
+                        node,
+                        what: "owl:hasSelf other than true",
+                    });
+                    return None;
+                }
+                return Some(self.intern_class(ClassExpr::HasSelf(property)));
+            }
+            for (predicate, qualified, make) in [
+                (
+                    v.owl_min_cardinality,
+                    v.owl_min_qualified,
+                    ClassExpr::Min as fn(u32, ObjProp, ExprId) -> ClassExpr,
+                ),
+                (v.owl_max_cardinality, v.owl_max_qualified, ClassExpr::Max),
+                (v.owl_cardinality, v.owl_qualified, ClassExpr::Exact),
+            ] {
+                if let Some(n) = number(self, predicate) {
+                    let thing = self.intern_class(ClassExpr::Thing);
+                    return Some(self.intern_class(make(n?, property, thing)));
+                }
+                if let Some(n) = number(self, qualified) {
+                    let filler = self.one(node, v.owl_on_class)?;
+                    let class = self.class(filler)?;
+                    return Some(self.intern_class(make(n?, property, class)));
+                }
+            }
+        }
+        self.report(Diagnostic::Malformed {
+            node,
+            what: "a restriction without a restriction property",
+        });
+        None
+    }
+
+    /// The data range `term` stands for.
+    fn range(&mut self, term: Term) -> Option<RangeId> {
+        match self.kind(term) {
+            TermKind::Iri if is(term, self.v.rdfs_literal) => {
+                Some(self.intern_range(DataRange::Literal))
+            }
+            TermKind::Iri => Some(self.intern_range(DataRange::Datatype(term))),
+            TermKind::Literal => {
+                self.report(Diagnostic::Malformed {
+                    node: term,
+                    what: "a literal where a data range belongs",
+                });
+                None
+            }
+            TermKind::Blank => {
+                self.used(term);
+                if let Some(&known) = self.range_memo.get(&term) {
+                    return known;
+                }
+                self.range_memo.insert(term, None);
+                let found = self.blank_range(term);
+                if found.is_none() {
+                    self.report(Diagnostic::Malformed {
+                        node: term,
+                        what: "a data range that can't be read",
+                    });
+                }
+                self.range_memo.insert(term, found);
+                found
+            }
+        }
+    }
+
+    fn blank_range(&mut self, node: Term) -> Option<RangeId> {
+        let v = self.v;
+        for range_type in [v.rdfs_datatype, v.owl_data_range] {
+            if self.has_type(node, range_type) {
+                self.collect([node, v.rdf_type?, range_type?]);
+            }
+        }
+        let ranges = |reader: &mut Self, list: Term| -> Option<Vec<RangeId>> {
+            let members = reader.list(list)?;
+            members.iter().map(|&m| reader.range(m)).collect()
+        };
+        if let Some(list) = self.one(node, v.owl_intersection_of) {
+            let operands = ranges(self, list)?;
+            return Some(self.intern_range(DataRange::And(canonical(operands))));
+        }
+        if let Some(list) = self.one(node, v.owl_union_of) {
+            let operands = ranges(self, list)?;
+            return Some(self.intern_range(DataRange::Or(canonical(operands))));
+        }
+        if let Some(operand) = self.one(node, v.owl_datatype_complement_of) {
+            let operand = self.range(operand)?;
+            return Some(self.intern_range(DataRange::Not(operand)));
+        }
+        if let Some(list) = self.one(node, v.owl_one_of) {
+            let literals = self.list(list)?;
+            return Some(self.intern_range(DataRange::OneOf(canonical(literals))));
+        }
+        if let Some(datatype) = self.one(node, v.owl_on_datatype) {
+            let list = self.one(node, v.owl_with_restrictions)?;
+            let mut facets = Vec::new();
+            for restriction in self.list(list)? {
+                let mut pairs = self
+                    .by_subject
+                    .get(&restriction)
+                    .cloned()
+                    .unwrap_or_default();
+                // Each statement once, in whichever graphs (`objects`).
+                pairs.sort_unstable();
+                pairs.dedup_by_key(|&mut (p, o, _)| (p, o));
+                let [(facet, value, _)] = pairs[..] else {
+                    self.report(Diagnostic::Malformed {
+                        node: restriction,
+                        what: "a facet restriction with other than one facet",
+                    });
+                    return None;
+                };
+                self.collect([restriction, facet, value]);
+                facets.push((facet, value));
+            }
+            return Some(self.intern_range(DataRange::Restriction(datatype, canonical(facets))));
+        }
+        self.report(Diagnostic::Malformed {
+            node,
+            what: "a data range without an operator",
+        });
+        None
+    }
+
+    // Axioms ---------------------------------------------------------------------------
+
+    /// A disjointness's axioms (`Disjoint::axioms`): a repeated operand reported.
+    fn disjoint(&mut self, d: Disjoint, triple: [Term; 3]) {
+        let (axioms, repeated) = d.axioms(&mut self.classes, &mut self.ranges);
+        if repeated {
+            self.report(Diagnostic::RepeatedOperand);
+        }
+        for a in axioms {
+            self.add(a, triple);
+        }
+    }
+
+    fn add(&mut self, axiom: Axiom, triple: [Term; 3]) {
+        let mut triples = vec![triple];
+        triples.append(&mut self.collected);
+        let source = Source {
+            graph: self.graph,
+            triples,
+        };
+        let sources = self.axioms.entry(axiom).or_default();
+        if !sources.contains(&source) {
+            sources.push(source);
+        }
+    }
+
+    fn axioms(&mut self) {
+        let statements = self.statements;
+        // n-ary axioms on blank nodes first, so that their structure is known when the
+        // statements are walked.
+        for statement in statements {
+            let [s, p, o] = statement.triple;
+            if is(p, self.v.rdf_type) && self.kind(s) == TermKind::Blank {
+                self.graph = statement.graph;
+                self.nary(s, o, statement.triple);
+            }
+        }
+        // Then: statements on IRIs; axioms on blank nodes (a complex left-hand side);
+        // the rest on blank nodes (anonymous individuals), once every structure has
+        // taken its statements.
+        let v = self.v;
+        let axiom_predicates = [
+            v.rdfs_sub_class_of,
+            v.owl_equivalent_class,
+            v.owl_disjoint_with,
+            v.rdfs_sub_property_of,
+            v.owl_property_chain_axiom,
+            v.owl_equivalent_property,
+            v.owl_property_disjoint_with,
+            v.rdfs_domain,
+            v.rdfs_range,
+            v.owl_has_key,
+        ];
+        for pass in 0..3 {
+            for statement in statements {
+                let triple = statement.triple;
+                let blank = self.kind(triple[0]) == TermKind::Blank;
+                let axiom = axiom_predicates.contains(&Some(triple[1]));
+                let now = match pass {
+                    0 => !blank,
+                    1 => blank && axiom,
+                    _ => blank && !axiom,
+                };
+                if !now || self.structural.contains(&triple) {
+                    continue;
+                }
+                self.graph = statement.graph;
+                self.collected.clear();
+                self.statement(triple);
+                self.collected.clear();
+            }
+        }
+        // Structure statements on blank nodes that no axiom took.
+        for statement in statements {
+            let [s, p, _] = statement.triple;
+            if self.kind(s) == TermKind::Blank
+                && !self.structural.contains(&statement.triple)
+                && (self.is_vocabulary(p) || is(p, self.v.owl_inverse_of))
+                && !is(p, self.v.owl_imports)
+            {
+                self.report(Diagnostic::Unused { node: s });
+            }
+        }
+    }
+
+    /// An n-ary axiom whose node `node` has type `class`.
+    fn nary(&mut self, node: Term, class: Term, triple: [Term; 3]) {
+        let v = self.v;
+        self.collected.clear();
+        let without = |what| Diagnostic::Malformed { node, what };
+        if is(class, v.owl_all_disjoint_classes) {
+            self.collect(triple);
+            let Some(list) = self.one(node, v.owl_members) else {
+                return self.report(without("an n-ary axiom without its members"));
+            };
+            if let Some(members) = self.list(list)
+                && let Some(classes) = self.classes(&members)
+            {
+                self.disjoint(Disjoint::Classes(classes), triple);
+            }
+        } else if is(class, v.owl_all_disjoint_properties) {
+            self.collect(triple);
+            let Some(list) = self.one(node, v.owl_members) else {
+                return self.report(without("an n-ary axiom without its members"));
+            };
+            if let Some(members) = self.list(list) {
+                if members.iter().all(|&p| self.kind(p) == TermKind::Iri)
+                    && members.iter().all(|&p| self.is_data_property(p))
+                {
+                    self.disjoint(Disjoint::Data(members), triple);
+                } else if let Some(properties) = members
+                    .iter()
+                    .map(|&p| self.object_property(p))
+                    .collect::<Option<Vec<_>>>()
+                {
+                    self.disjoint(Disjoint::Objects(properties), triple);
+                }
+            }
+        } else if is(class, v.owl_all_different) {
+            self.collect(triple);
+            let list = self
+                .one(node, v.owl_members)
+                .or_else(|| self.one(node, v.owl_distinct_members));
+            let Some(list) = list else {
+                return self.report(without("an n-ary axiom without its members"));
+            };
+            if let Some(members) = self.list(list) {
+                self.disjoint(Disjoint::Individuals(members), triple);
+            }
+        } else if is(class, v.owl_negative_property_assertion) {
+            self.collect(triple);
+            let (Some(source), Some(property)) = (
+                self.one(node, v.owl_source_individual),
+                self.one(node, v.owl_assertion_property),
+            ) else {
+                self.report(Diagnostic::Malformed {
+                    node,
+                    what: "a negative property assertion without its parts",
+                });
+                return;
+            };
+            if let Some(value) = self.one(node, v.owl_target_value) {
+                self.add(
+                    Axiom::NegativeDataPropertyAssertion(property, source, value),
+                    triple,
+                );
+            } else if let Some(target) = self.one(node, v.owl_target_individual) {
+                let axiom = match self.object_property(property) {
+                    Some(ObjProp::Named(p)) => {
+                        Axiom::NegativeObjectPropertyAssertion(p, source, target)
+                    }
+                    Some(ObjProp::Inverse(p)) => {
+                        Axiom::NegativeObjectPropertyAssertion(p, target, source)
+                    }
+                    None => return,
+                };
+                self.add(axiom, triple);
+            } else {
+                self.report(without("a negative property assertion without its target"));
+            }
+        } else if is(class, v.owl_axiom) || is(class, v.owl_annotation) {
+            // An annotated axiom's reification (the axiom itself is stated as well), or an
+            // annotation's annotation: no logical meaning.
+            for (p, o, _) in self.by_subject.get(&node).cloned().unwrap_or_default() {
+                self.structural.insert([node, p, o]);
+                self.annotations += 1;
+            }
+        }
+    }
+
+    /// The axiom (or declaration, or annotation) one statement makes.
+    fn statement(&mut self, triple: [Term; 3]) {
+        let [s, p, o] = triple;
+        let v = self.v;
+        if is(p, v.rdf_type) {
+            self.typing(s, o, triple);
+        } else if is(p, v.rdfs_sub_class_of) {
+            if let (Some(sub), Some(sup)) = (self.class(s), self.class(o)) {
+                self.add(Axiom::SubClassOf(sub, sup), triple);
+            }
+        } else if is(p, v.owl_equivalent_class) {
+            if self.declared_as(s, EntityKind::Datatype) || self.has_type(o, v.rdfs_datatype) {
+                if let Some(range) = self.range(o) {
+                    self.add(Axiom::DatatypeDefinition(s, range), triple);
+                }
+            } else if let (Some(a), Some(b)) = (self.class(s), self.class(o)) {
+                self.add(Axiom::EquivalentClasses(canonical(vec![a, b])), triple);
+            }
+        } else if is(p, v.owl_disjoint_with) {
+            if let (Some(a), Some(b)) = (self.class(s), self.class(o)) {
+                self.disjoint(Disjoint::Classes(vec![a, b]), triple);
+            }
+        } else if is(p, v.owl_disjoint_union_of) {
+            if let Some(members) = self.list(o)
+                && let Some(classes) = self.classes(&members)
+            {
+                self.add(Axiom::DisjointUnion(s, canonical(classes)), triple);
+            }
+        } else if is(p, v.rdfs_sub_property_of) {
+            let subject = self.annotation_property(s);
+            if subject || self.annotation_property(o) {
+                self.annotations += 1;
+                self.annotation_schema.push(if subject { s } else { o });
+            } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
+                self.add(Axiom::SubDataPropertyOf(s, o), triple);
+            } else if let (Some(sub), Some(sup)) =
+                (self.object_property(s), self.object_property(o))
+            {
+                self.add(Axiom::SubObjectPropertyOf(vec![sub], sup), triple);
+            }
+        } else if is(p, v.owl_property_chain_axiom) {
+            let chain = self.list(o).and_then(|members| {
+                members
+                    .iter()
+                    .map(|&m| self.object_property(m))
+                    .collect::<Option<Vec<_>>>()
+            });
+            if chain.as_ref().is_some_and(Vec::is_empty) {
+                self.report(Diagnostic::Malformed {
+                    node: s,
+                    what: "a property chain without a property",
+                });
+            } else if let (Some(chain), Some(sup)) = (chain, self.object_property(s)) {
+                self.add(Axiom::SubObjectPropertyOf(chain, sup), triple);
+            }
+        } else if is(p, v.owl_equivalent_property) || is(p, v.owl_property_disjoint_with) {
+            let equivalent = is(p, v.owl_equivalent_property);
+            if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
+                if equivalent {
+                    self.add(
+                        Axiom::EquivalentDataProperties(canonical(vec![s, o])),
+                        triple,
+                    );
+                } else {
+                    self.disjoint(Disjoint::Data(vec![s, o]), triple);
+                }
+            } else if let (Some(a), Some(b)) = (self.object_property(s), self.object_property(o)) {
+                if equivalent {
+                    self.add(
+                        Axiom::EquivalentObjectProperties(canonical(vec![a, b])),
+                        triple,
+                    );
+                } else {
+                    self.disjoint(Disjoint::Objects(vec![a, b]), triple);
+                }
+            }
+        } else if is(p, v.owl_inverse_of) {
+            if self.kind(s) == TermKind::Iri
+                && let (Some(a), Some(b)) = (self.object_property(s), self.object_property(o))
+            {
+                let (a, b) = if a <= b { (a, b) } else { (b, a) };
+                self.add(Axiom::InverseObjectProperties(a, b), triple);
+            }
+        } else if is(p, v.rdfs_domain) || is(p, v.rdfs_range) {
+            let domain = is(p, v.rdfs_domain);
+            if self.annotation_property(s) {
+                self.annotations += 1;
+                self.annotation_schema.push(s);
+            } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
+                if domain {
+                    if let Some(class) = self.class(o) {
+                        self.add(Axiom::DataPropertyDomain(s, class), triple);
+                    }
+                } else if let Some(range) = self.range(o) {
+                    self.add(Axiom::DataPropertyRange(s, range), triple);
+                }
+            } else if let (Some(property), Some(class)) = (self.object_property(s), self.class(o)) {
+                self.add(
+                    if domain {
+                        Axiom::ObjectPropertyDomain(property, class)
+                    } else {
+                        Axiom::ObjectPropertyRange(property, class)
+                    },
+                    triple,
+                );
+            }
+        } else if is(p, v.owl_has_key) {
+            if let (Some(class), Some(members)) = (self.class(s), self.list(o)) {
+                // A key has a property (*Structural Specification* §9.5). The empty key the
+                // universal-property rewriting makes of one on the top property comes later.
+                if members.is_empty() {
+                    self.report(Diagnostic::Malformed {
+                        node: s,
+                        what: "a key without a property",
+                    });
+                    return;
+                }
+                let (mut objects, mut datas) = (Vec::new(), Vec::new());
+                for member in members {
+                    if self.kind(member) == TermKind::Iri && self.is_data_property(member) {
+                        datas.push(member);
+                    } else if let Some(property) = self.object_property(member) {
+                        objects.push(property);
+                    }
+                }
+                self.add(
+                    Axiom::HasKey(class, canonical(objects), canonical(datas)),
+                    triple,
+                );
+            }
+        } else if is(p, v.owl_same_as) {
+            self.add(Axiom::SameIndividual(canonical(vec![s, o])), triple);
+        } else if is(p, v.owl_different_from) {
+            self.disjoint(Disjoint::Individuals(vec![s, o]), triple);
+        } else if self.kind(s) == TermKind::Iri
+            && [
+                v.owl_intersection_of,
+                v.owl_union_of,
+                v.owl_complement_of,
+                v.owl_one_of,
+            ]
+            .contains(&Some(p))
+            && !self.declared_as(s, EntityKind::Datatype)
+        {
+            // OWL 1's class axioms on a named class: the class is equivalent to the
+            // expression (read so by the OWL 2 mapping, for backward compatibility).
+            if let (Some(named), Some(expr)) = (self.class(s), self.set_operator(p, o)) {
+                self.add(
+                    Axiom::EquivalentClasses(canonical(vec![named, expr])),
+                    triple,
+                );
+            }
+        } else if self.is_vocabulary(p) || is(p, v.owl_inverse_of) {
+            // OWL vocabulary outside the forms above. On a blank node it is structure an
+            // axiom may still read (judged after all of them); on an IRI it isn't OWL.
+            if is(p, v.owl_imports) {
+                self.annotations += 1;
+            } else if self.kind(s) != TermKind::Blank {
+                self.report(Diagnostic::NotOwl { triple });
+            }
+        } else if self.declared_as(p, EntityKind::AnnotationProperty)
+            || self.is_builtin_annotation(p)
+            || self.has_type(s, v.owl_ontology)
+        {
+            // An annotation, or a statement about the ontology: its header's annotations
+            // (an anonymous ontology's too: its node is a blank node).
+            self.annotations += 1;
+        } else if self.kind(o) == TermKind::Literal || self.is_data_property(p) {
+            self.add(Axiom::DataPropertyAssertion(p, s, o), triple);
+        } else {
+            self.add(Axiom::ObjectPropertyAssertion(p, s, o), triple);
+        }
+    }
+
+    /// An `rdf:type` statement: a declaration, a characteristic, or a class assertion.
+    fn typing(&mut self, s: Term, o: Term, triple: [Term; 3]) {
+        let v = self.v;
+        if let Some(&(_, kind)) = self.declaration_kinds.iter().find(|(c, _)| is(o, *c)) {
+            if self.kind(s) == TermKind::Iri {
+                self.add(Axiom::Declaration(kind, s), triple);
+            }
+            return;
+        }
+        let characteristics = [
+            (v.owl_inverse_functional, Characteristic::InverseFunctional),
+            (v.owl_reflexive, Characteristic::Reflexive),
+            (v.owl_irreflexive, Characteristic::Irreflexive),
+            (v.owl_symmetric, Characteristic::Symmetric),
+            (v.owl_asymmetric, Characteristic::Asymmetric),
+            (v.owl_transitive, Characteristic::Transitive),
+        ];
+        if is(o, v.owl_functional) {
+            if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
+                self.add(Axiom::FunctionalDataProperty(s), triple);
+            } else if let Some(property) = self.object_property(s) {
+                self.add(
+                    Axiom::ObjectCharacteristic(Characteristic::Functional, property),
+                    triple,
+                );
+            }
+            return;
+        }
+        if let Some(&(_, characteristic)) = characteristics.iter().find(|(c, _)| is(o, *c)) {
+            if let Some(property) = self.object_property(s) {
+                self.add(
+                    Axiom::ObjectCharacteristic(characteristic, property),
+                    triple,
+                );
+            }
+            return;
+        }
+        let header = [
+            v.owl_ontology,
+            v.owl_restriction,
+            v.owl_all_disjoint_classes,
+            v.owl_all_disjoint_properties,
+            v.owl_all_different,
+            v.owl_negative_property_assertion,
+            v.owl_axiom,
+            v.owl_annotation,
+            v.owl_deprecated_class,
+            v.owl_deprecated_property,
+            // The typing of properties and list cells in RDF: nothing under the direct
+            // semantics (a property is typed by its declaration or its use).
+            v.rdf_property,
+            v.rdf_list,
+        ];
+        if header.iter().any(|&c| is(o, c)) {
+            self.annotations += 1;
+            return;
+        }
+        if let Some(class) = self.class(o) {
+            self.add(Axiom::ClassAssertion(class, s), triple);
+        }
+    }
+
+    fn is_vocabulary(&self, predicate: Term) -> bool {
+        let v = self.v;
+        [
+            v.first,
+            v.rest,
+            v.owl_intersection_of,
+            v.owl_union_of,
+            v.owl_complement_of,
+            v.owl_one_of,
+            v.owl_on_property,
+            v.owl_on_properties,
+            v.owl_some_values_from,
+            v.owl_all_values_from,
+            v.owl_has_value,
+            v.owl_has_self,
+            v.owl_min_cardinality,
+            v.owl_max_cardinality,
+            v.owl_cardinality,
+            v.owl_min_qualified,
+            v.owl_max_qualified,
+            v.owl_qualified,
+            v.owl_on_class,
+            v.owl_on_data_range,
+            v.owl_datatype_complement_of,
+            v.owl_on_datatype,
+            v.owl_with_restrictions,
+            v.owl_members,
+            v.owl_distinct_members,
+            v.owl_source_individual,
+            v.owl_assertion_property,
+            v.owl_target_individual,
+            v.owl_target_value,
+            v.owl_annotated_source,
+            v.owl_annotated_property,
+            v.owl_annotated_target,
+            v.owl_imports,
+        ]
+        .contains(&Some(predicate))
+    }
+
+    /// Declared an annotation property, or one OWL 2 builds in (declared implicitly: §5.8).
+    fn annotation_property(&self, term: Term) -> bool {
+        self.annotation_properties.contains(term)
+    }
+
+    /// `rdfs:label` and the other annotation properties OWL 2 builds in.
+    fn is_builtin_annotation(&self, predicate: Term) -> bool {
+        let (builtin, version_iri) = &self.builtin_annotations;
+        builtin.contains(&Some(predicate)) || *version_iri == Some(predicate)
+    }
+
+    fn finish(mut self) -> Ontology {
+        let mut axioms = Vec::with_capacity(self.axioms.len());
+        let mut sources = Vec::with_capacity(self.axioms.len());
+        for (axiom, from) in std::mem::take(&mut self.axioms) {
+            axioms.push(axiom);
+            sources.push(from);
+        }
+        self.annotation_schema.sort_unstable();
+        self.annotation_schema.dedup();
+        let mut ontology = Ontology {
+            classes: self.classes,
+            ranges: self.ranges,
+            axioms,
+            sources,
+            diagnostics: self.diagnostics,
+            annotations: self.annotations,
+            annotation_schema: self.annotation_schema,
+            builtin: BuiltinProperties::of(&self.v),
+            data: DataTerms::default(),
+            anonymous: BTreeSet::new(),
+            rules: Vec::new(),
+            noncanonical_cardinality: self.noncanonical_cardinality,
+            empty_list: self.empty_list,
+            qualified_data_max: self.qualified_data_max,
+        };
+        complete(&mut ontology, self.terms);
+        ontology
+    }
+}

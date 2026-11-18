@@ -313,13 +313,42 @@ fn parallel_parsing_is_exact() {
     }
 }
 
+/// A document that starts with RDF 1.2's `VERSION "1.2"` parses in parallel: each chunk
+/// gets the prefixes declared after it (the skim took the version for a statement and
+/// lost the next directive, so later chunks didn't know `prov:`; found loading a
+/// provenance-rich RDF 1.2 graph).
+#[test]
+fn a_versioned_document_parses_in_parallel() {
+    let mut text = String::from(
+        "VERSION \"1.2\"\n@prefix prov: <http://www.w3.org/ns/prov#> .\n@prefix ex: <http://e/> .\n",
+    );
+    for i in 0..400 {
+        text.push_str(&format!("ex:s{i} prov:wasGeneratedBy ex:run{i} .\n"));
+    }
+    let sequential: BTreeSet<Quad> = parse(RdfFormat::Turtle, &text)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(sequential.len(), 400);
+    for parts in [2, 4, 9] {
+        let parsers = RdfParser::from_format(RdfFormat::Turtle)
+            .split_slice_for_parallel_parsing(text.as_bytes(), parts)
+            .unwrap();
+        assert!(parsers.len() > 1);
+        let quads: BTreeSet<Quad> = parsers.into_iter().flatten().map(|q| q.unwrap()).collect();
+        assert_eq!(quads, sequential, "in {parts} parts");
+    }
+}
+
 /// Recovering: a statement with a syntax error is reported and skipped up to its `.` (or
-/// the `}` ending its TriG block), and parsing goes on; without, it stops there.
+/// the `}` ending its TriG block), and parsing goes on; without, it stops there. (`ex:b`'s
+/// statement held a quote never closed; the document now ends inside that string, which ends
+/// it, as in `reader_contract_tests::recovery_resumes_after_the_failing_statements_own_end`.)
 #[test]
 fn recovering_parsers_skip_bad_statements_and_go_on() {
     let turtle = "@prefix ex: <http://example.com/> .\n\
                   ex:a ex:p 1 .\n\
-                  ex:b ex:p [ ex:q \"open ; ex:r ( 1 2 ] .\n\
+                  ex:b ex:p [ ex:q ; ex:r ( 1 2 ] .\n\
                   ex:c ex:p 3 .\n\
                   ex:d ex:p ex:e ex:f .\n\
                   ex:g ex:p 7 .\n";
@@ -376,6 +405,96 @@ fn recovering_parsers_skip_bad_statements_and_go_on() {
     );
 }
 
+/// A syntax error names the statement it is in: its span in the document (the text a
+/// quarantine keeps verbatim), the directives in effect and its TriG block, so that a fixed
+/// copy reads on its own. In N-Triples the statement is its line, also in parallel chunks.
+#[test]
+fn an_error_names_its_statement_verbatim_with_what_reading_it_again_needs() {
+    // Claros: one IRI with a `%` that starts no escape, among valid lines.
+    let lines: Vec<String> = (0..50)
+        .map(|i| match i {
+            37 => "<http://example.com/s37> <http://example.com/p> <http://example.com/x?genre=%&a=1> .".to_owned(),
+            _ => format!("<http://example.com/s{i}> <http://example.com/p> \"{i}\" ."),
+        })
+        .collect();
+    let text = lines.join("\n") + "\n";
+    let check = |results: Vec<Result<Quad, RdfParseError>>| {
+        let errors: Vec<_> = results
+            .iter()
+            .filter_map(|r| match r {
+                Err(RdfParseError::Syntax(error)) => Some(error.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(errors.len(), 1, "{results:?}");
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 49);
+        let statement = errors[0].statement().expect("the line");
+        let span = &statement.span;
+        assert_eq!((span.start.line, span.end.line), (37, 37));
+        let verbatim = &text[span.start.offset as usize..span.end.offset as usize];
+        assert_eq!(verbatim, lines[37]);
+        assert!(statement.context.is_empty() && statement.graph.is_none());
+    };
+    check(
+        RdfParser::from_format(RdfFormat::NTriples)
+            .recovering()
+            .for_slice(text.as_bytes())
+            .collect(),
+    );
+    let parsers = RdfParser::from_format(RdfFormat::NTriples)
+        .recovering()
+        .split_slice_for_parallel_parsing(text.as_bytes(), 4)
+        .unwrap();
+    assert!(parsers.len() > 1);
+    check(parsers.into_iter().flatten().collect());
+
+    // Turtle: the statement up to its `.`, with the prefixes it needs.
+    let turtle = "@prefix ex: <http://example.com/> .\n\
+                  ex:a ex:p 1 .\n\
+                  ex:b ex:p <http://example.com/x?genre=%&a=1> .\n\
+                  ex:c ex:p 3 .\n";
+    let results: Vec<_> = RdfParser::from_format(RdfFormat::Turtle)
+        .recovering()
+        .for_slice(turtle.as_bytes())
+        .collect();
+    let Some(Err(RdfParseError::Syntax(error))) = results.iter().find(|r| r.is_err()) else {
+        panic!("{results:?}")
+    };
+    let statement = error.statement().expect("the statement");
+    let span = &statement.span;
+    assert_eq!(span.start.line, 2);
+    let verbatim = &turtle[span.start.offset as usize..span.end.offset as usize];
+    assert_eq!(verbatim, "ex:b ex:p <http://example.com/x?genre=%&a=1> .");
+    assert!(
+        statement
+            .context
+            .contains("@prefix ex: <http://example.com/> .")
+    );
+    // Fixed, with its context, it reads on its own.
+    let fixed = format!("{}{}", statement.context, verbatim.replace("%&", "%25&"));
+    let quads: Vec<Quad> = RdfParser::from_format(RdfFormat::Turtle)
+        .for_slice(fixed.as_bytes())
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(quads.len(), 1);
+    assert_eq!(quads[0].subject.to_string(), "<http://example.com/b>");
+
+    // TriG: the block's graph.
+    let trig =
+        "<http://example.com/g> { <http://example.com/a> <http://example.com/p> <bad iri> . }\n";
+    let results: Vec<_> = RdfParser::from_format(RdfFormat::TriG)
+        .recovering()
+        .for_slice(trig.as_bytes())
+        .collect();
+    let Some(Err(RdfParseError::Syntax(error))) = results.iter().find(|r| r.is_err()) else {
+        panic!("{results:?}")
+    };
+    assert_eq!(
+        error.statement().and_then(|s| s.graph.as_deref()),
+        Some("<http://example.com/g>")
+    );
+}
+
 /// An error inside a token that spans lines (an IRI with a space and a line break) gets a
 /// position, not a panic.
 #[test]
@@ -384,4 +503,71 @@ fn an_error_inside_a_multi_line_token_has_a_position() {
         "<http://example.com/a> <http://example.com/p> <oops . }\n<http://example.com/c> .\n";
     let error = parse(RdfFormat::Turtle, text).unwrap_err();
     assert!(error.to_string().contains("line"), "{error}");
+}
+
+/// A reader that gives at most `.1` bytes per call.
+struct Chunks<'a>(&'a [u8], usize);
+
+impl Read for Chunks<'_> {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.len().min(self.1).min(out.len());
+        out[..n].copy_from_slice(&self.0[..n]);
+        self.0 = &self.0[n..];
+        Ok(n)
+    }
+}
+
+/// Recovering, a malformed string is skipped to its closing quote only within
+/// `MAX_STATEMENT_TEXT` bytes, counted from its opening quote through its closing one: at the
+/// limit and below it, one error and parsing goes on; one byte past it, the error ends the
+/// document, whatever the input already holds. For both quote characters, from a slice and
+/// from readers giving chunks smaller than the parser's buffer, equal to it and larger than
+/// the window. Short strings only (broken by a line end): a long string is lexed whole before
+/// its escapes are read, so it reaches the search only when it is open at the input's end,
+/// where the error ends the document at any length.
+#[test]
+fn a_malformed_string_is_skipped_within_the_window_only() {
+    use nrese_rdf_io::MAX_STATEMENT_TEXT as MAX;
+    let readers: [usize; 3] = [4096, 65_536, 3 << 20];
+    for format in [RdfFormat::Turtle, RdfFormat::TriG] {
+        for (quote, bad) in [("\"", "\n"), ("'", "\n")] {
+            for length in [MAX - 1, MAX, MAX + 1] {
+                // The string from its opening quote through its closing one is `length` bytes;
+                // nothing between it and the predicate, so the skip starts at its quote.
+                let body = length - 2 * quote.len() - bad.len();
+                let string = format!("{quote}{bad}{}{quote}", "x".repeat(body));
+                assert_eq!(string.len(), length);
+                let text = format!(
+                    "<urn:a> <urn:p> <urn:o> .\n<urn:s> <urn:p>{string} .\n<urn:b> <urn:p> <urn:o> .\n"
+                );
+                let within = length <= MAX;
+                let parser = RdfParser::from_format(format).recovering();
+                let mut inputs: Vec<(String, Vec<Result<Quad, RdfParseError>>)> = vec![(
+                    "slice".into(),
+                    parser.clone().for_slice(text.as_bytes()).collect(),
+                )];
+                for chunk in readers {
+                    let reader = Chunks(text.as_bytes(), chunk);
+                    let results = parser.clone().for_reader(reader).collect();
+                    inputs.push((format!("chunks of {chunk}"), results));
+                }
+                for (input, results) in inputs {
+                    let row = format!("{format:?} {quote:?} {length} ({input})");
+                    let shape: Vec<&str> = results
+                        .iter()
+                        .map(|r| match r {
+                            Ok(_) => "Ok",
+                            Err(e) if e.ends_document() => "Err ending",
+                            Err(_) => "Err",
+                        })
+                        .collect();
+                    let expected: &[&str] = match within {
+                        true => &["Ok", "Err", "Ok"],
+                        false => &["Ok", "Err ending"],
+                    };
+                    assert_eq!(shape, expected, "{row}");
+                }
+            }
+        }
+    }
 }

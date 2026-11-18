@@ -18,8 +18,18 @@ use axum::http::HeaderMap;
 pub struct AppState {
     /// The repository's write path; a reconfiguration replaces it.
     pipeline: crate::repositories::PipelineSlot,
-    ready: Arc<AtomicBool>,
     policy: Arc<PolicyConfig>,
+    /// The repository this state serves.
+    repository: Arc<str>,
+    /// What every repository's state shares, behind one count: each layer and the handler
+    /// of every request clone the state.
+    shared: Arc<Shared>,
+}
+
+/// What [`AppState`] shares with its clones and every repository's state.
+#[derive(Clone)]
+struct Shared {
+    ready: Arc<AtomicBool>,
     ai: Arc<AiSuggestionService>,
     deployment_posture: DeploymentPosture,
     rate_limiter: Arc<RateLimiter>,
@@ -27,11 +37,23 @@ pub struct AppState {
     repositories: Arc<Catalog>,
     /// Users, workspaces and graph policies ([`crate::access`]), server-wide.
     access: Arc<nrese_store::access::AccessControl>,
-    /// The repository this state serves.
-    repository: Arc<str>,
     /// Long operations (imports) running or finished ([`nrese_store::jobs`]).
     jobs: Arc<nrese_store::jobs::Jobs>,
+    /// This server's part in replication ([`crate::replication`]).
+    replication: Arc<crate::replication::ReplicationState>,
+    /// Why the default repository can't serve until a restart, if it can't
+    /// ([`nrese_store::StoreService::unavailable`]): read on every request
+    /// ([`crate::app`]'s `screen`), one atomic load.
+    default_unavailable: Arc<std::sync::OnceLock<String>>,
 }
+
+/// What a repository that didn't open at start ([`Catalog::unavailable`]) answers to all
+/// but operators, who see why in the repository list: not the server's paths.
+pub(crate) const UNAVAILABLE: &str = "is unavailable: it didn't open at start, or a change to it failed and its state couldn't be confirmed; operators see why and how to repair it in the repository list";
+
+/// What a repository a failed change left in no known state answers to all but operators
+/// (who see the file and the repair in the repository list): a restart repairs it.
+pub(crate) const UNAVAILABLE_UNTIL_RESTART: &str = "is unavailable until the server restarts: a change to it failed and its state couldn't be confirmed; operators see why and how to repair it in the repository list";
 
 impl AppState {
     /// [`Self::try_new`]; panics if the access state can't be opened (for tests).
@@ -55,22 +77,48 @@ impl AppState {
         ai: AiSuggestionService,
         deployment_posture: DeploymentPosture,
     ) -> anyhow::Result<Self> {
-        let access = Arc::new(open_access(store.config(), &policy)?);
+        let access = Arc::new(open_access(store.config(), store.runtime(), &policy)?);
         let repositories =
             Arc::new(Catalog::open(store, reasoner).map_err(|error| anyhow::anyhow!(error))?);
-        Ok(Self {
-            pipeline: Arc::clone(&repositories.default_repository().pipeline),
-            ready: Arc::new(AtomicBool::new(false)),
+        let default_unavailable = repositories
+            .default_repository()
+            .pipeline
+            .read()
+            .store()
+            .unavailable_flag();
+        let state = Self {
+            pipeline: repositories.default_repository().pipeline.clone(),
             policy: Arc::new(policy),
-            ai: Arc::new(ai),
-            deployment_posture,
-            rate_limiter: Arc::new(RateLimiter::default()),
-            request_metrics: Arc::default(),
-            repositories,
-            access,
             repository: Arc::from(DEFAULT_REPOSITORY),
-            jobs: Arc::default(),
-        })
+            shared: Arc::new(Shared {
+                default_unavailable,
+                ready: Arc::new(AtomicBool::new(false)),
+                ai: Arc::new(ai),
+                deployment_posture,
+                rate_limiter: Arc::new(RateLimiter::default()),
+                request_metrics: Arc::default(),
+                repositories,
+                access,
+                jobs: Arc::default(),
+                replication: Arc::default(),
+            }),
+        };
+        state.prepare_support_sets();
+        Ok(state)
+    }
+
+    /// With `inferred = "supported"` in the access state, every repository's support
+    /// graph sets computed in the background, so first reads don't wait for them.
+    pub fn prepare_support_sets(&self) {
+        if self.shared.access.state().settings.inferred != nrese_store::access::Inferred::Supported
+        {
+            return;
+        }
+        for (id, _) in self.shared.repositories.list() {
+            if let Some(repository) = self.shared.repositories.get(&id) {
+                repository.pipeline.read().store().prepare_support_sets();
+            }
+        }
     }
 
     /// The identity of a local login the request carries: `Basic` credentials of a user
@@ -101,7 +149,7 @@ impl AppState {
             .map(str::trim)
             .filter(|token| token.starts_with(nrese_store::access::SESSION_PREFIX))
         {
-            return match self.access.session(token) {
+            return match self.shared.access.session(token) {
                 Some(principal) => Ok(principal.user.map(identity)),
                 None => Err(ApiError::unauthorized(
                     "the session has ended; log in again",
@@ -120,7 +168,7 @@ impl AppState {
             .split_once(':')
             .ok_or_else(|| ApiError::unauthorized("malformed Basic credentials"))?;
         let (user, password) = (user.to_owned(), password.to_owned());
-        let access = Arc::clone(&self.access);
+        let access = Arc::clone(&self.shared.access);
         let principal = tokio::task::spawn_blocking(move || access.login(&user, &password, client))
             .await
             .map_err(|error| ApiError::internal(error.to_string()))?;
@@ -129,18 +177,19 @@ impl AppState {
             Err(nrese_store::access::AccessError::Throttled(message)) => {
                 Err(ApiError::too_many_requests(message))
             }
+            Err(nrese_store::access::AccessError::Busy(message)) => Err(ApiError::busy(message)),
             Err(_) => Err(ApiError::unauthorized("wrong user name or password")),
         }
     }
 
     /// Long operations (imports), server-wide.
     pub fn jobs(&self) -> &Arc<nrese_store::jobs::Jobs> {
-        &self.jobs
+        &self.shared.jobs
     }
 
     /// The access state ([`crate::access`]).
     pub fn access(&self) -> &nrese_store::access::AccessControl {
-        &self.access
+        &self.shared.access
     }
 
     /// The id of the repository this state serves.
@@ -151,7 +200,7 @@ impl AppState {
     /// What `identity` may read and write in this state's repository.
     pub fn access_view(&self, identity: &crate::auth::Identity) -> crate::access::AccessView {
         let principal = crate::access::principal(identity);
-        let mut view = self.access.view(&principal, &self.repository);
+        let mut view = self.shared.access.view(&principal, &self.repository);
         view.origin = Some(principal.display());
         view
     }
@@ -169,29 +218,90 @@ impl AppState {
 
     /// The repositories ([`nrese_store::catalog`]).
     pub fn repositories(&self) -> &Catalog {
-        &self.repositories
+        &self.shared.repositories
+    }
+
+    /// Why the default repository can't serve until a restart, if it can't.
+    pub fn default_unavailable(&self) -> Option<&str> {
+        self.shared.default_unavailable.get().map(String::as_str)
+    }
+
+    /// The repositories that can't serve: `id: unavailable` each, the default first (for
+    /// `/readyz`, which stays ready for the others).
+    pub fn degraded(&self) -> Vec<String> {
+        self.default_unavailable()
+            .map(|_| DEFAULT_REPOSITORY.to_owned())
+            .into_iter()
+            .chain(
+                self.shared
+                    .repositories
+                    .unavailable_list()
+                    .into_iter()
+                    .map(|(id, _)| id),
+            )
+            .map(|id| format!("{id}: unavailable"))
+            .collect()
     }
 
     /// This server's state as repository `id` sees it: the default repository's own, or a
     /// copy with that repository's store and RDF4J state. Called on the default's state.
     pub fn for_repository(&self, id: &str) -> Result<Self, ApiError> {
+        // The id as the route decoded it (`%6Erese` is the default repository too).
         if id == DEFAULT_REPOSITORY {
+            if self.default_unavailable().is_some() {
+                return Err(ApiError::unavailable(format!(
+                    "repository '{id}' {UNAVAILABLE_UNTIL_RESTART}"
+                )));
+            }
             return Ok(self.clone());
         }
-        let repository = self
-            .repositories
-            .get(id)
-            .ok_or_else(|| ApiError::not_found(format!("no repository '{id}'")))?;
+        let Some(repository) = self.shared.repositories.get(id) else {
+            return Err(match self.shared.repositories.unavailable(id) {
+                Some(_) => ApiError::unavailable(format!("repository '{id}' {UNAVAILABLE}")),
+                None => ApiError::not_found(format!("no repository '{id}'")),
+            });
+        };
+        // A repository with its own query budget answers with it; the rest of the policy
+        // is the server's.
+        let policy = match repository.settings.read().query_timeout() {
+            Some(timeout) => {
+                let mut policy = (*self.policy).clone();
+                policy.timeouts.query = timeout;
+                Arc::new(policy)
+            }
+            None => Arc::clone(&self.policy),
+        };
         Ok(Self {
             pipeline: repository.pipeline,
             repository: Arc::from(id),
+            policy,
             ..self.clone()
         })
     }
 
     /// Request outcomes and latencies, for `/metrics`.
     pub fn request_metrics(&self) -> &RequestMetrics {
-        &self.request_metrics
+        &self.shared.request_metrics
+    }
+
+    /// This state with `replication` as its part in replication (set once at start).
+    ///
+    /// Panics if `replication`'s role (a replica or not) isn't the one its store was opened
+    /// with (`StoreConfig::replica`): a replica's store takes no certificate, and interns no
+    /// term, from its open on, so a replica's state over a store opened as a primary would
+    /// serve that store's certificate, and a primary's over a replica's store none. The
+    /// server's start sets the role before the open (`main.rs`).
+    pub fn with_replication(mut self, replication: crate::replication::ReplicationConfig) -> Self {
+        let replica = replication.mode == crate::replication::ReplicationMode::Replica;
+        assert_eq!(replica, self.store().config().replica, "the store's role");
+        Arc::make_mut(&mut self.shared).replication =
+            Arc::new(crate::replication::ReplicationState::new(replication));
+        self
+    }
+
+    /// This server's part in replication ([`crate::replication`]).
+    pub fn replication(&self) -> &crate::replication::ReplicationState {
+        &self.shared.replication
     }
 
     pub fn store(&self) -> Arc<StoreService> {
@@ -206,24 +316,44 @@ impl AppState {
     /// The repository's settings: those it was created with, or for the default
     /// repository those changed through the engine API (empty: the server's).
     pub fn repository_settings(&self) -> crate::repository_config::RepositorySettings {
-        self.repositories
+        self.shared
+            .repositories
             .settings(self.repository_id())
             .unwrap_or_default()
     }
 
-    /// Changes this state's repository's settings: its title, and its reasoning, which
-    /// takes effect at once (the inferences are recomputed). The default repository's are
-    /// kept in the data directory (on disk) and override the configuration's reasoning
-    /// at the next start.
-    pub fn change_repository_settings(
+    /// The repository's settings and the reasoning mode in effect, as the catalogue
+    /// published them together ([`crate::repositories::Repository::observe`]): never a
+    /// change's new settings beside its old reasoning, or the reverse. `None` once it is
+    /// removed (or can't serve).
+    pub fn observe_repository(
         &self,
-        settings: crate::repository_config::RepositorySettings,
+    ) -> Option<(crate::repository_config::RepositorySettings, &'static str)> {
+        self.shared
+            .repositories
+            .observe(self.repository_id())
+            .map(|(settings, pipeline)| (settings, pipeline.reasoner().mode_name()))
+    }
+
+    /// Changes this state's repository's settings to what `edit` makes of those current
+    /// when the change applies ([`crate::repositories::Catalog::patch`]): its title, and
+    /// its reasoning, which takes effect at once (the inferences are recomputed). The
+    /// default repository's are kept in the data directory (on disk) and are in effect for it
+    /// after a restart too; the configured reasoning stays the other repositories'.
+    pub fn patch_repository_settings(
+        &self,
+        edit: impl FnOnce(
+            &crate::repository_config::RepositorySettings,
+        ) -> Result<
+            crate::repository_config::RepositorySettings,
+            crate::repositories::CatalogError,
+        >,
     ) -> Result<(), ApiError> {
-        Ok(self.repositories.change(self.repository_id(), settings)?)
+        Ok(self.shared.repositories.patch(self.repository_id(), edit)?)
     }
 
     pub fn mark_ready(&self) {
-        self.ready.store(true, Ordering::Release);
+        self.shared.ready.store(true, Ordering::Release);
     }
 
     /// Started and serving strictly: not in reasoning quarantine (see
@@ -234,7 +364,7 @@ impl AppState {
 
     /// Startup has finished (the server accepts requests).
     pub fn is_started(&self) -> bool {
-        self.ready.load(Ordering::Acquire)
+        self.shared.ready.load(Ordering::Acquire)
     }
 
     /// Requests are served once startup has finished, also in quarantine: reads there
@@ -248,13 +378,10 @@ impl AppState {
         }
     }
 
-    /// The data is inconsistent under the configured reasoning: readable and repairable,
-    /// but not ready.
+    /// The store is in quarantine ([`nrese_store::StoreService::is_quarantined`]): readable
+    /// and repairable, but not ready.
     pub fn is_quarantined(&self) -> bool {
-        matches!(
-            self.store().consistency(),
-            nrese_store::ConsistencyStatus::Inconsistent { .. }
-        )
+        self.store().is_quarantined()
     }
 
     pub fn reasoner_profile_name(&self) -> &'static str {
@@ -278,11 +405,11 @@ impl AppState {
     }
 
     pub fn ai(&self) -> Arc<AiSuggestionService> {
-        Arc::clone(&self.ai)
+        Arc::clone(&self.shared.ai)
     }
 
     pub fn deployment_posture(&self) -> DeploymentPosture {
-        self.deployment_posture
+        self.shared.deployment_posture
     }
 
     pub fn runtime_posture(&self) -> RuntimePosture {
@@ -292,7 +419,7 @@ impl AppState {
     /// Who the request is ([`crate::auth::Authenticated`]): a local login (`Basic`
     /// credentials of a user with a password, or a session token), else the
     /// authentication mode's credentials. 401 for missing or wrong ones. `client` is the
-    /// client's address ([`crate::http::authentication::client_address`]), which failed
+    /// client's address (`crate::http::authentication::client_address`), which failed
     /// logins are counted by.
     pub async fn authenticate(
         &self,
@@ -302,7 +429,7 @@ impl AppState {
         match self.local_identity(headers, client).await? {
             Some(mut identity) => {
                 let principal = crate::access::principal(&identity);
-                identity.admin = self.access.state().is_admin(&principal);
+                identity.admin = self.shared.access.state().is_admin(&principal);
                 let mut grants = std::collections::BTreeSet::from([crate::auth::AccessGrant::Read]);
                 if identity.admin {
                     grants.insert(crate::auth::AccessGrant::Admin);
@@ -326,7 +453,7 @@ impl AppState {
         action: PolicyAction,
         authenticated: &crate::auth::Authenticated,
     ) -> Result<crate::auth::Identity, ApiError> {
-        let state = self.access.state();
+        let state = self.shared.access.state();
         let also = |identity: &crate::auth::Identity| {
             let principal = crate::access::principal(identity);
             match action {
@@ -342,7 +469,9 @@ impl AppState {
             }
         };
         let identity = authenticated.check(action, &also)?;
-        self.rate_limiter.enforce(action, self.policy.rate_limits)?;
+        self.shared
+            .rate_limiter
+            .enforce(action, self.policy.rate_limits)?;
         Ok(identity)
     }
 
@@ -373,15 +502,13 @@ impl AppState {
 /// policy file of `policy` imported if the state is new.
 fn open_access(
     template: &nrese_store::StoreConfig,
+    runtime: &Arc<nrese_store::Runtime>,
     policy: &PolicyConfig,
 ) -> anyhow::Result<nrese_store::access::AccessControl> {
     use anyhow::Context;
     use nrese_store::access::{AccessControl, Change, Principal};
-    let config = match template.mode {
-        StoreMode::OnDisk => nrese_store::StoreConfig::on_disk(template.data_dir.join("system")),
-        StoreMode::InMemory => nrese_store::StoreConfig::in_memory(),
-    };
-    let store = StoreService::new(config).context("the system store (access state)")?;
+    let store = StoreService::with_runtime(access_config(template), Arc::clone(runtime))
+        .context("the system store (access state)")?;
     let access = AccessControl::open(store, &policy.workspace_base)
         .map_err(|error| anyhow::anyhow!("the access state: {error}"))?;
     if let Some(file) = &policy.access {
@@ -406,4 +533,67 @@ fn open_access(
         }
     }
     Ok(access)
+}
+
+/// The system store's settings beside a default store with `template`'s: its memory policy
+/// is the default store's (the operator's setting, resolved as it opened), never a default
+/// of its own that no setting reaches.
+fn access_config(template: &nrese_store::StoreConfig) -> nrese_store::StoreConfig {
+    let config = match template.mode {
+        StoreMode::OnDisk => nrese_store::StoreConfig::on_disk(template.data_dir.join("system")),
+        StoreMode::InMemory => nrese_store::StoreConfig::in_memory(),
+    };
+    nrese_store::StoreConfig {
+        process_memory_bytes: template.process_memory_bytes,
+        ..config
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use nrese_store::memory::Unread;
+    use nrese_store::{ProcessMemory, StoreConfig};
+
+    /// The states of one server share what the server holds: every request's layers and
+    /// handler hold a clone of the state, and the start marked through one is seen through a
+    /// clone made before it and through the default repository's state.
+    #[test]
+    fn a_states_clones_share_the_servers_start() {
+        let state = super::AppState::new(
+            nrese_store::StoreService::new(StoreConfig::in_memory()).unwrap(),
+            nrese_reasoner::ReasonerService::new(nrese_reasoner::ReasonerConfig::default()),
+            crate::policy::PolicyConfig::default(),
+            crate::ai::AiSuggestionService::disabled(),
+            super::DeploymentPosture::OpenWorkbench,
+        );
+        let clone = state.clone();
+        let default = state.for_repository(super::DEFAULT_REPOSITORY).unwrap();
+        assert!(!clone.is_started() && !default.is_started());
+        state.mark_ready();
+        assert!(clone.is_started(), "a clone");
+        assert!(default.is_started(), "the default repository's state");
+    }
+
+    /// DC-07: the system store takes the default store's memory policy.
+    /// With the limit switched off (0) it needs no reading, so a server whose memory can't
+    /// be read, and whose limits are all 0, opens its system store too.
+    #[test]
+    fn the_system_store_takes_the_default_stores_memory_policy() {
+        for template in [
+            StoreConfig::in_memory(),
+            StoreConfig::on_disk(std::path::PathBuf::from("unused")),
+        ] {
+            let template = StoreConfig {
+                process_memory_bytes: ProcessMemory::Bytes(0),
+                ..template
+            };
+            let policy = super::access_config(&template).process_memory_bytes;
+            assert_eq!(policy, ProcessMemory::Bytes(0), "{:?}", template.mode);
+            assert_eq!(
+                policy.resolve_with(true, || Err(Unread::Failed)).ok(),
+                Some(0),
+                "opens where memory isn't read"
+            );
+        }
+    }
 }

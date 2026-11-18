@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 
 pub mod algebra;
+pub mod internal;
 mod parser;
 mod query;
 pub mod term;
@@ -15,4 +16,4 @@ pub mod visit;
 mod writer;
 
 pub use parser::{DEFAULT_MAX_NESTING, SparqlParser, SparqlSyntaxError, TextPosition};
-pub use query::{GraphUpdateOperation, Query, Update};
+pub use query::{GraphUpdateOperation, Query, TransferOp, Update};

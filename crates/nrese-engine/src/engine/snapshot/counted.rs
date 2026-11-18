@@ -1,0 +1,556 @@
+//! A snapshot's counted reads ([`CountedSnapshot`]; their contract: [`crate::visit`]).
+//!
+//! Each read here is the twin of a [`Snapshot`] read, its scans, probes, equality copies and
+//! class builds counted on the reader's visitor where the work is done (REAS-3). The
+//! uncounted reads are left as they were: what an
+//! uncounted reader runs is not this code.
+
+use std::ops::ControlFlow;
+use std::sync::Arc;
+
+use super::{CopyVisibility, Either, Snapshot};
+use crate::engine::equality::{Classes as EqualityClasses, Expand, Merged, OnMeter, Read, Step};
+use crate::engine::{ReadModel, Stack};
+use crate::index::{IndexVersion, Layout, QuadScan};
+use crate::quad::{AccessPlan, EncodedQuad, GraphSelector, Permutation, QuadPattern};
+use crate::visit::{Account, Ledger, Stopped, Visitor};
+use crate::{Count, SnapshotIdentity, TermId};
+
+/// A snapshot whose data is read only counted: each read takes its reader's visitor and
+/// counts the work it does on it ([`crate::visit`]), and answers [`Stopped`] once the
+/// visitor has stopped. Readers whose stop must see their reads (the reasoner's and the
+/// store's adapters) hold one instead of a [`Snapshot`], so an uncounted read of its data
+/// doesn't compile there; [`Self::uncounted`] is the one way back, for the callers
+/// `clippy.toml` names (REAS-3).
+#[derive(Clone)]
+pub struct CountedSnapshot {
+    snapshot: Snapshot,
+}
+
+impl Snapshot {
+    /// This snapshot, read only counted.
+    pub fn counted(&self) -> CountedSnapshot {
+        CountedSnapshot {
+            snapshot: self.clone(),
+        }
+    }
+}
+
+impl CountedSnapshot {
+    /// The snapshot itself, its reads uncounted: only for a reader that runs to its end or
+    /// hands the snapshot on unread (a cache's admission, a view). Disallowed by clippy outside
+    /// the callers `clippy.toml` names.
+    pub fn uncounted(&self) -> &Snapshot {
+        &self.snapshot
+    }
+
+    /// [`Snapshot::len_in`]: O(1).
+    pub fn len_in(&self, model: ReadModel) -> u64 {
+        self.snapshot.len_in(model)
+    }
+
+    /// [`Snapshot::revision`].
+    pub fn revision(&self) -> u64 {
+        self.snapshot.revision()
+    }
+
+    /// [`Snapshot::identity`].
+    pub fn identity(&self) -> SnapshotIdentity {
+        self.snapshot.identity()
+    }
+
+    /// [`Snapshot::scan_bytes`]: what a scan holds while it runs.
+    pub fn scan_bytes(&self, model: ReadModel) -> usize {
+        self.snapshot.scan_bytes(model)
+    }
+
+    /// [`Snapshot::same_version`].
+    pub fn same_version(&self, other: &Snapshot) -> bool {
+        self.snapshot.same_version(other)
+    }
+
+    /// [`Snapshot::quads_for_pattern_in`], counted: its quads, then [`Stopped`] if `visit`
+    /// stopped it (and nothing after that).
+    pub fn quads<'a>(
+        &'a self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: Visitor<'a>,
+    ) -> impl Iterator<Item = Result<EncodedQuad, Stopped>> + use<'a> {
+        Ended::new(self.snapshot.quads_visited(model, pattern, visit), visit)
+    }
+
+    /// [`Snapshot::scan_sorted_in`], counted as [`Self::quads`]; `None` as there.
+    pub fn scan_sorted<'a>(
+        &'a self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        visit: Visitor<'a>,
+    ) -> Option<impl Iterator<Item = Result<EncodedQuad, Stopped>> + use<'a>> {
+        let quads = self
+            .snapshot
+            .scan_sorted_visited(model, pattern, permutation, visit)?;
+        Some(Ended::new(quads, visit))
+    }
+
+    /// The graphs of the quads of `[s, p, o]`, as [`Self::quads`] answers them, each handed to
+    /// `each` in that order.
+    /// One ask of whether the read expands equality classes chooses its path:
+    /// - where it does, the graphs of [`Self::quads`]'s expanded read of those classes
+    ///   (Asserted reads never expand);
+    /// - else each stack in `model`, by its own layout, on one account on `visit`:
+    ///   - a default-graph stack: each run's bound search for the statement counted before it
+    ///     is made, the key found a unit, and the runs' signs summed
+    ///     (`IndexVersion::point_sum`); the default graph handed on where the sum is positive;
+    ///   - a quads stack: the counted merge of its runs' ranges, made and stepped as
+    ///     `IndexVersion::scan_plan_with` and `QuadScan::step_with` count them, the graph of
+    ///     each visible quad handed on as the merge reaches it.
+    ///
+    ///   What the account has left is dropped at each graph handed on, so no units one visit
+    ///   allowed are spent after `each` has run.
+    ///
+    /// Where `each` answers `Break`, the read answers it at once, and where `each` refuses,
+    /// [`Stopped`] at once: nothing more is counted or read. Every refusal of `visit` answers
+    /// [`Stopped`]; a read with no run to search asks `visit` once whether it has stopped.
+    pub fn point_graphs(
+        &self,
+        model: ReadModel,
+        [s, p, o]: [TermId; 3],
+        visit: Visitor<'_>,
+        mut each: impl FnMut(TermId) -> Result<ControlFlow<()>, Stopped>,
+    ) -> Result<ControlFlow<()>, Stopped> {
+        let snapshot = &self.snapshot;
+        let pattern = QuadPattern {
+            subject: Some(s),
+            predicate: Some(p),
+            object: Some(o),
+            graph: GraphSelector::Any,
+        };
+        let pattern = *snapshot.read_pattern(model, &pattern);
+        if let Some(classes) = snapshot.expanding_with(model, &pattern, visit)? {
+            let expanded = snapshot.expanded_visited(classes, model, &pattern, visit);
+            for quad in Ended::new(expanded, visit) {
+                if each(quad?.graph)?.is_break() {
+                    return Ok(ControlFlow::Break(()));
+                }
+            }
+            return Ok(ControlFlow::Continue(()));
+        }
+        #[cfg(any(test, all(feature = "witness", debug_assertions)))]
+        crate::witness::add(crate::witness::Site::PointReads, 1);
+        let plan = AccessPlan::for_pattern(&pattern);
+        let data = snapshot.data(model);
+        let mut ledger = Ledger::new(visit);
+        let mut searched = false;
+        for stack in Stack::ALL
+            .into_iter()
+            .filter(|&stack| model.includes(stack))
+        {
+            let index = data.stack(stack);
+            searched |= !index.runs().is_empty();
+            match index.layout() {
+                Layout::DefaultGraph => {
+                    if index.point_sum(&plan, &mut ledger)? > 0 {
+                        if each(TermId::DEFAULT_GRAPH)?.is_break() {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        ledger = Ledger::new(visit);
+                    }
+                }
+                Layout::Quads => {
+                    let mut scan = index.scan_plan_with(&plan, &mut ledger)?;
+                    while let Some(graph) = scan.step_graph_with(&mut ledger)? {
+                        if each(graph)?.is_break() {
+                            return Ok(ControlFlow::Break(()));
+                        }
+                        ledger = Ledger::new(visit);
+                    }
+                }
+            }
+        }
+        match !searched && crate::visit::stopped(visit) {
+            true => Err(Stopped),
+            false => Ok(ControlFlow::Continue(())),
+        }
+    }
+
+    /// [`Snapshot::contains_in`], counted.
+    pub fn contains(
+        &self,
+        model: ReadModel,
+        quad: &EncodedQuad,
+        visit: Visitor<'_>,
+    ) -> Result<bool, Stopped> {
+        self.snapshot.contains_visited(model, quad, visit)
+    }
+
+    /// [`Snapshot::exists_in`], counted.
+    pub fn exists(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: Visitor<'_>,
+    ) -> Result<bool, Stopped> {
+        self.snapshot.exists_visited(model, pattern, visit)
+    }
+
+    /// [`Snapshot::count_in`], counted.
+    pub fn count(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: Visitor<'_>,
+    ) -> Result<Count, Stopped> {
+        self.snapshot
+            .count_visited(model, pattern, visit)
+            .ok_or(Stopped)
+    }
+
+    /// [`Self::count`], asked only up to `limit`: at least `min(count, limit)`, never more
+    /// than the count, and [`Count::AtLeast`] where an expanded count stopped at `limit` (a
+    /// held count answers exactly). For a caller that needs only whether the count reaches
+    /// `limit`.
+    pub fn count_up_to(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        limit: u64,
+        visit: Visitor<'_>,
+    ) -> Result<Count, Stopped> {
+        self.snapshot
+            .count_with(model, pattern, limit, visit)
+            .ok_or(Stopped)
+    }
+
+    /// [`Snapshot::estimate_in`], counted.
+    pub fn estimate(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: Visitor<'_>,
+    ) -> Result<u64, Stopped> {
+        self.snapshot.estimate_visited(model, pattern, visit)
+    }
+}
+
+/// A counted read's quads: [`Stopped`] where its producers ended because the visitor had
+/// stopped, never the end of the data.
+struct Ended<'v, I> {
+    quads: I,
+    visit: Visitor<'v>,
+    done: bool,
+}
+
+impl<'v, I> Ended<'v, I> {
+    fn new(quads: I, visit: Visitor<'v>) -> Self {
+        Self {
+            quads,
+            visit,
+            done: false,
+        }
+    }
+}
+
+impl<I: Iterator<Item = EncodedQuad>> Iterator for Ended<'_, I> {
+    type Item = Result<EncodedQuad, Stopped>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.quads.next() {
+            Some(quad) => Some(Ok(quad)),
+            None => {
+                self.done = true;
+                crate::visit::stopped(self.visit).then_some(Err(Stopped))
+            }
+        }
+    }
+}
+
+impl Snapshot {
+    /// [`Snapshot::quads_for_pattern_in`]'s work, counted ([`Ended`] tells a stop).
+    fn quads_visited<'a>(
+        &'a self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: Visitor<'a>,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
+        let pattern = *self.read_pattern(model, pattern);
+        // A class build that stopped reads nothing more: the stack scans below find their
+        // visitor stopped and end at once.
+        if let Ok(Some(classes)) = self.expanding_with(model, &pattern, visit) {
+            return Either::Left(self.expanded_visited(classes, model, &pattern, visit));
+        }
+        Either::Right(self.stacks_visited(model, pattern, visit))
+    }
+
+    /// [`Self::quads_visited`]'s expanded read of `classes`, in its access plan's permutation.
+    fn expanded_visited<'a>(
+        &'a self,
+        classes: Arc<EqualityClasses>,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: Visitor<'a>,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
+        let permutation = AccessPlan::for_pattern(&classes.normalised(pattern)).permutation;
+        self.expanded_sorted_visited(classes, model, pattern, permutation, visit)
+            .expect("every layout keeps the permutation of a pattern's access plan")
+    }
+
+    /// [`Self::quads_visited`]'s read of the stacks, a counted scan each.
+    fn stacks_visited<'a>(
+        &'a self,
+        model: ReadModel,
+        pattern: QuadPattern,
+        visit: Visitor<'a>,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a> {
+        let data = self.data(model);
+        Stack::ALL
+            .into_iter()
+            .filter(move |&stack| model.includes(stack))
+            .flat_map(move |stack| data.stack(stack).scan_counted(&pattern, visit))
+    }
+
+    /// [`Snapshot::scan_sorted_in`]'s work, counted.
+    fn scan_sorted_visited<'a>(
+        &'a self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        visit: Visitor<'a>,
+    ) -> Option<impl Iterator<Item = EncodedQuad> + use<'a>> {
+        let pattern = *self.read_pattern(model, pattern);
+        if let Ok(Some(classes)) = self.expanding_with(model, &pattern, visit) {
+            return self
+                .expanded_sorted_visited(classes, model, &pattern, permutation, visit)
+                .map(Either::Left);
+        }
+        let plan = AccessPlan::in_permutation(&pattern, permutation)?;
+        let supported = Stack::ALL.into_iter().all(|stack| {
+            !model.includes(stack) || self.data(model).stack(stack).layout().supports(permutation)
+        });
+        if !supported {
+            return None;
+        }
+        // One account for both stacks' scans, which the merge interleaves (with a ledger
+        // each, each allowed a run after the same yes).
+        let mut account = Ledger::new(visit);
+        let mut scan = |stack: Stack| {
+            model
+                .includes(stack)
+                .then(|| scan_on(self.data(model).stack(stack), &plan, &mut account))
+        };
+        let step = Merged::new(scan(Stack::Asserted), scan(Stack::Inferred), permutation);
+        Some(Either::Right(Read { step, account }))
+    }
+
+    /// `Snapshot::expanded_sorted`'s work, counted: its stored scans, their merge, its copies,
+    /// its visibility probes and its named graphs' scan on the read's one account (REAS-3,
+    /// sweeps SW013–SW015; with a ledger each and a credit for the expansion, each
+    /// allowed a run after the same yes).
+    fn expanded_sorted_visited<'a>(
+        &'a self,
+        classes: Arc<EqualityClasses>,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        permutation: Permutation,
+        visit: Visitor<'a>,
+    ) -> Option<impl Iterator<Item = EncodedQuad> + use<'a>> {
+        let data = self.data(model);
+        let normalised = classes.normalised(pattern);
+        let plan = AccessPlan::in_permutation(&normalised, permutation)?;
+        let supported = Stack::ALL
+            .into_iter()
+            .all(|stack| data.stack(stack).layout().supports(permutation));
+        if !supported {
+            return None;
+        }
+        let named = model == ReadModel::Materialised && pattern.graph == GraphSelector::Any;
+        let renamed = normalised != *pattern && !self.canonical;
+        let named_plan = match named && renamed {
+            true => Some(AccessPlan::in_permutation(pattern, permutation)?),
+            false => None,
+        };
+        let mut account = OnMeter::new(visit);
+        let stored = Merged::new(
+            scan_on(&data.asserted, &plan, &mut account),
+            scan_on(&data.inferred, &plan, &mut account),
+            permutation,
+        );
+        let expanded = Expand::of(
+            stored,
+            classes,
+            *pattern,
+            permutation,
+            named && !renamed,
+            model,
+            data,
+        )
+        .charging(self.reads.clone());
+        let named =
+            NamedGraphs(named_plan.map(|plan| scan_on(&data.asserted, &plan, &mut account)));
+        let step = Merged::new(expanded, named, permutation);
+        Some(Read { step, account })
+    }
+
+    /// [`Snapshot::contains_in`]'s work, counted: its run probes, and under equality its
+    /// class build and visibility probes.
+    fn contains_visited(
+        &self,
+        model: ReadModel,
+        quad: &EncodedQuad,
+        visit: Visitor<'_>,
+    ) -> Result<bool, Stopped> {
+        let named = self
+            .read_pattern(
+                model,
+                &QuadPattern {
+                    subject: Some(quad.subject),
+                    predicate: Some(quad.predicate),
+                    object: Some(quad.object),
+                    graph: GraphSelector::Exact(quad.graph),
+                },
+            )
+            .into_owned();
+        let GraphSelector::Exact(graph) = named.graph else {
+            unreachable!("an exact graph stays exact")
+        };
+        let quad = &EncodedQuad::new(
+            named.subject.unwrap_or(quad.subject),
+            named.predicate.unwrap_or(quad.predicate),
+            named.object.unwrap_or(quad.object),
+            graph,
+        );
+        if quad.graph.is_default_graph()
+            && let Some(classes) =
+                self.expanding_with(model, &QuadPattern::in_graph(TermId::DEFAULT_GRAPH), visit)?
+        {
+            let canonical = EncodedQuad::new(
+                classes.representative(quad.subject),
+                classes.representative(quad.predicate),
+                classes.representative(quad.object),
+                quad.graph,
+            );
+            let mut stored = false;
+            for stack in Stack::ALL {
+                stored = stored
+                    || self
+                        .data(model)
+                        .stack(stack)
+                        .contains_counted(&canonical, visit)?;
+            }
+            let shown = stored
+                && CopyVisibility::new(self.data(model), model).shows_with(
+                    quad,
+                    classes.touches(&canonical),
+                    &mut OnMeter::new(visit),
+                )?;
+            return Ok(shown);
+        }
+        for stack in Stack::ALL {
+            if model.includes(stack)
+                && self
+                    .data(model)
+                    .stack(stack)
+                    .contains_counted(quad, visit)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// [`Snapshot::exists_in`]'s work, counted.
+    fn exists_visited(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: Visitor<'_>,
+    ) -> Result<bool, Stopped> {
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
+        if let Some(classes) = self.expanding_with(model, pattern, visit)? {
+            let count = self
+                .expanded_count(&classes, model, pattern, 1, visit)
+                .ok_or(Stopped)?;
+            return Ok(count.at_least() > 0);
+        }
+        if pattern.graph == GraphSelector::AnyNamed {
+            let count = self.count_visited(model, pattern, visit).ok_or(Stopped)?;
+            return Ok(count.at_least() > 0);
+        }
+        let plan = AccessPlan::for_pattern(pattern);
+        for stack in Stack::ALL {
+            if model.includes(stack)
+                && self
+                    .data(model)
+                    .stack(stack)
+                    .any_plan_counted(&plan, visit)?
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// [`Snapshot::estimate_in`]'s work, counted.
+    fn estimate_visited(
+        &self,
+        model: ReadModel,
+        pattern: &QuadPattern,
+        visit: Visitor<'_>,
+    ) -> Result<u64, Stopped> {
+        let pattern = self.read_pattern(model, pattern);
+        let pattern = &*pattern;
+        let Some(classes) = self.expanding_with(model, pattern, visit)? else {
+            let count = self.count_visited(model, pattern, visit).ok_or(Stopped)?;
+            return Ok(count.at_least());
+        };
+        let stored = Snapshot {
+            version: Arc::clone(self.data(model)),
+            ..self.stored()
+        };
+        let normalised = classes.normalised(pattern);
+        let mut estimate = stored
+            .count_visited(ReadModel::Materialised, &normalised, visit)
+            .ok_or(Stopped)?
+            .at_least();
+        if normalised != *pattern && pattern.graph == GraphSelector::Any && !self.canonical {
+            estimate += stored
+                .count_visited(ReadModel::Asserted, pattern, visit)
+                .ok_or(Stopped)?
+                .at_least();
+        }
+        Ok(estimate)
+    }
+}
+
+/// A scan of `index` for `plan` on a read's one account: nothing where the read stopped while it
+/// was being made. The account's refusal is final, so the read's next step answers [`Stopped`]
+/// too, whatever the account had left.
+fn scan_on<'a>(
+    index: &'a IndexVersion,
+    plan: &AccessPlan,
+    account: &mut impl Account,
+) -> QuadScan<'a> {
+    index
+        .scan_plan_with(plan, account)
+        .unwrap_or_else(|Stopped| QuadScan::empty(plan.permutation))
+}
+
+/// An expanded read's named graphs where its classes rename the pattern's constants: read as
+/// stored, with the pattern's own constants, their default graph left out.
+struct NamedGraphs<'a>(Option<QuadScan<'a>>);
+
+impl Step for NamedGraphs<'_> {
+    fn step(&mut self, account: &mut impl Account) -> Result<Option<EncodedQuad>, Stopped> {
+        loop {
+            match self.0.step(account)? {
+                Some(quad) if quad.graph.is_default_graph() => continue,
+                other => return Ok(other),
+            }
+        }
+    }
+}

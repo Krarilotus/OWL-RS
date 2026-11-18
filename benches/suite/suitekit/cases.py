@@ -1,0 +1,209 @@
+"""The case registry (benches/cases/README.md, the schema's one owner): every case of every
+group, read from benches/cases/*.toml, and its validation.
+
+    load()                       every case, each with `group` (its file's stem), names unique; with
+                                 `family` or NRESE_FAMILY (an A-B-B-A family, benches/suite/abba.py)
+                                 its own cases too, group "family"
+    problems(cases, ...)         what is wrong with them, one line each (empty: valid)
+
+`suite.py --check` and the gate's suite contracts run the validation over the repository.
+"""
+from __future__ import annotations
+
+import os
+import re
+import tomllib
+from pathlib import Path
+
+CASES = Path(__file__).resolve().parents[2] / "cases"
+ROOT = Path(__file__).resolve().parents[3]
+
+
+def family_cases(path: str | Path) -> list[dict]:
+    """A family file's own cases (its [[case]] entries that aren't `catalog = NAME`), in the
+    catalogue's schema; a relative path is the repository's."""
+    path = Path(path)
+    path = path if path.is_absolute() else ROOT / path
+    entries = tomllib.loads(path.read_text(encoding="utf-8")).get("case", [])
+    return [{k: v for k, v in e.items() if k not in ("dimensions", "min_samples")}
+            for e in entries if "catalog" not in e]
+
+# The vocabulary (benches/cases/README.md explains each).
+AREAS = {"access", "cache", "concurrency", "dl", "kernel", "layout", "load", "maintenance", "memory", "operator",
+         "parse", "plan", "query", "reasoning", "rules", "service", "shacl", "geo", "text", "vector", "federation",
+         "rdf12"}
+SEMANTICS = {"none", "rdfs", "rdfs-full", "rdfs-plus", "owl-horst", "owl2-ql", "owl2-rl", "owl2-el", "owl2-dl",
+             "custom", "el", "dl", "canonical"}
+# What a comparator computes: the same data without reasoning (plain), NRESE's closure, NRESE's
+# rewritten queries, or its own reasoner or service under that name.
+COMPARATOR_SEMANTICS = {"plain", "closure", "rewritten", "rdfs", "rdfs-plus", "owl-horst", "owl2-rl", "owl2-ql",
+                        "custom", "el", "dl", "shacl", "text", "geosparql", "federation", "vector"}
+TOOLS = {"perf_lab", "tableau", "classify-el", "classify-horn", "endpoint-classify"}
+OUTCOMES = {"ok", "memory-limit", "gave-up", "timeout", "unsupported", "wrong"}
+
+# A run held at its memory cap until its time limit stopped at that cap: with no swap the kernel can
+# postpone the OOM kill for many minutes while it reclaims and faults back the binary's own pages
+# (D16-563, sparqloscope-dblp at 28 GiB: one binary killed at 46 s once and at 1,237 s once; held
+# 1 to 3 MiB under the cap, all tasks stalled on memory 54 to 86 % of the time, no user code running).
+# Held, read when the time limit came (fast.py scope_at_timeout): the scope's anon + kernel memory
+# within AT_THE_CAP of its cap, so nothing but a few file pages fits beside it, and its tasks all
+# stalled on memory at least AT_THE_CAP_STALL % of the last 10 s (PSI `full avg10`), so the cap
+# is what holds it, not a slow run that happens to sit near it.
+AT_THE_CAP = 0.01
+AT_THE_CAP_STALL = 10.0
+
+
+def held_at_cap(record: dict) -> bool:
+    """The run's scope was held at its memory cap when its time limit came. No reading (a Docker or
+    Windows run, a scope that couldn't be read then, an older record) is not held."""
+    end = record.get("at_timeout") or {}
+    used, cap, stall = end.get("anon_kernel_bytes"), end.get("max_bytes"), end.get("memory_full_avg10")
+    return (bool(used and cap) and stall is not None and cap - used <= AT_THE_CAP * cap
+            and stall >= AT_THE_CAP_STALL)
+
+
+def as_declared(record: dict) -> bool:
+    """The run ended as its case declares (`outcome`): that status; or, for a declared memory limit,
+    its time limit with its scope held at the cap (held_at_cap()). The one match of a run against its
+    declaration (fast.py, release_gate.py, compare.py); the record keeps its own status."""
+    status, wanted = record.get("status"), record.get("expected_outcome", "ok")
+    return status == wanted or (wanted == "memory-limit" and status == "timeout" and held_at_cap(record))
+LEVELS = {"focused", "full"}
+NEEDS = {"docker", "java", "apptainer"}
+SCENARIOS = {"native", "matched", "frontier"}
+REWRITES = {"expressible", "per-query", "not-expressible"}
+PAGE_CACHE = {"warm", "cold"}
+DATA = re.compile(r"^(none|volume:\S+|ore:\S+|concat:\S+|[a-z][a-z0-9-]*( \S+=\S+)*)$")
+KEYS = {
+    # identity and what it measures
+    "name", "area", "what", "group", "workload", "tier", "levels", "est_min", "needs", "scenario",
+    # what NRESE computes and on what
+    "semantics", "data", "data_alt", "extra", "setup", "queries", "tool", "args", "env", "repeat", "sweep",
+    "tool_loads", "page_cache", "timeout_s", "cap_gb", "metric", "counters",
+    # what a right answer and the right route are
+    "check", "pinned", "route", "expect", "reference", "outcome", "known", "frontier",
+    # the comparators
+    "systems", "home_turf", "rewrite", "hangs", "tracks", "guards",
+    # a release-gate baseline whose product lacks what the case needs (release_gate.py family_of)
+    "absent",
+    # a classifier tool's phases the case is compared by, where the tool can't resolve the others
+    "phases",
+}
+# The phases each classifier tool prints in its profile (fast.py samples(): its series). A case
+# declares fewer (`phases`) where the tool can't resolve one on the baseline (README.md), and then
+# `wall`, the harness's time of the whole process (fast.py PROCESS_WALL), in which it still counts.
+TOOL_PHASES = {"classify-el": ("read", "normalise", "prepare", "saturate", "assemble", "write"),
+               "classify-horn": ("read", "owl", "write"),
+               # The server's answer to GET /dataset/classification (fast.py endpoint_script).
+               "endpoint-classify": ("request",)}
+WHOLE_RUN = "wall"
+REQUIRED = ("name", "area", "what", "semantics", "data", "metric", "cap_gb", "systems")
+
+
+def load(directory: Path = CASES, family: str | Path | None = None) -> list[dict]:
+    """Every case of every group file, in file and then entry order; each gets its `group`."""
+    out = []
+    for path in sorted(directory.glob("*.toml")):
+        for case in tomllib.loads(path.read_text(encoding="utf-8")).get("case", []):
+            out.append({**case, "group": path.stem})
+    family = family or os.environ.get("NRESE_FAMILY")
+    if family:
+        out += [{**case, "group": "family"} for case in family_cases(family)]
+    names = [c["name"] for c in out]
+    duplicate = sorted({n for n in names if names.count(n) > 1})
+    if duplicate:
+        raise ValueError(f"case names must be unique across benches/cases/: {', '.join(duplicate)}")
+    return out
+
+
+def load_at(repo: str | Path, rev: str) -> list[dict]:
+    """Every case as the commit `rev` of the checkout `repo` holds them (benches/cases/*.toml there,
+    read by git): the registry a job at that revision runs, whatever this tree holds."""
+    import subprocess
+    git = lambda *a: subprocess.run(["git", "-C", str(repo), *a], capture_output=True, text=True,  # noqa: E731
+                                    encoding="utf-8", check=True).stdout
+    out = []
+    for name in sorted(git("ls-tree", "--name-only", rev, "benches/cases/").split()):
+        if name.endswith(".toml"):
+            for case in tomllib.loads(git("show", f"{rev}:{name}")).get("case", []):
+                out.append({**case, "group": Path(name).stem})
+    names = [c["name"] for c in out]
+    duplicate = sorted({n for n in names if names.count(n) > 1})
+    if duplicate:
+        raise ValueError(f"case names must be unique across benches/cases/ at {rev}: {', '.join(duplicate)}")
+    return out
+
+
+def problems(cases: list[dict], systems: dict, workloads: dict | None = None,
+             datasets: set[str] | None = None) -> list[str]:
+    """One line per problem: unknown keys or values, a comparator that isn't a system, a
+    reference that isn't one of the case's systems, a full-level dataset that isn't frozen."""
+    out = []
+    for c in cases:
+        where = f"{c.get('group', '?')}.toml [{c.get('name', '?')}]"
+        missing = [k for k in REQUIRED if k not in c]
+        if missing:
+            out.append(f"{where}: missing {', '.join(missing)}")
+            continue
+        out += [f"{where}: unknown key {k!r}" for k in sorted(set(c) - KEYS)]
+        for key, allowed in (("area", AREAS), ("semantics", SEMANTICS), ("tool", TOOLS), ("outcome", OUTCOMES),
+                             ("scenario", SCENARIOS), ("rewrite", REWRITES)):
+            if key in c and c[key] not in allowed:
+                out.append(f"{where}: {key} {c[key]!r} is not one of {', '.join(sorted(allowed))}")
+        for key, allowed in (("levels", LEVELS), ("needs", NEEDS), ("page_cache", PAGE_CACHE)):
+            if key in c and not set(c[key]) <= allowed:
+                out.append(f"{where}: {key} {sorted(set(c[key]) - allowed)} not in {', '.join(sorted(allowed))}")
+        if not DATA.match(c["data"]):
+            out.append(f"{where}: data {c['data']!r} is none, volume:FILE, ore:ID, concat:A+B or a generator spec")
+        if datasets is not None and "full" in c.get("levels", []) and c["data"].startswith("volume:"):
+            if c["data"][len("volume:"):] not in datasets:
+                out.append(f"{where}: a full-level case reads a frozen dataset: {c['data']} isn't in "
+                           "benches/datasets.toml")
+        if c.get("outcome", "ok") != "ok" and not c.get("known"):
+            out.append(f"{where}: an expected outcome ({c['outcome']}) names its issue in `known`")
+        compared = set()
+        for entry in c["systems"]:
+            system, _, semantics = entry.partition(":")
+            if system not in systems:
+                out.append(f"{where}: comparator {system!r} is not in suite/systems.toml")
+            elif systems[system].get("refused"):
+                out.append(f"{where}: comparator {system!r} is never measured ({systems[system]['refused']})")
+            if semantics not in COMPARATOR_SEMANTICS:
+                out.append(f"{where}: comparator {entry!r}: semantics {semantics!r} is not one of "
+                           f"{', '.join(sorted(COMPARATOR_SEMANTICS))}")
+            compared.add(system)
+        for entry in c.get("hangs") or {}:
+            if entry not in c["systems"]:
+                out.append(f"{where}: hangs names {entry!r}, which isn't among its systems")
+        turf = c.get("home_turf")
+        if turf and turf not in systems and turf not in OTHER_TURF:
+            out.append(f"{where}: home_turf {turf!r} is not in suite/systems.toml")
+        references = (c.get("expect") or {}).get("answers", [])
+        for system in references if isinstance(references, list) else [references]:
+            if system == "nrese" or system not in compared:
+                out.append(f"{where}: expect.answers {system!r} must be one of the case's comparators (never NRESE)")
+        if workloads is not None and c.get("workload") and c["workload"] not in workloads:
+            out.append(f"{where}: workload {c['workload']!r} is not in suite/workloads.toml")
+        absent = c.get("absent", {})
+        if not (isinstance(absent, dict) and set(absent) <= BASELINES
+                and all(isinstance(v, str) and v.strip() for v in absent.values())):
+            out.append(f"{where}: absent: a baseline (base, main) and the capability its product lacks")
+        if "phases" in c:
+            printed = TOOL_PHASES.get(c.get("tool", "perf_lab"))
+            if printed is None:
+                out.append(f"{where}: phases: only a classifier tool's case declares them ({', '.join(sorted(TOOL_PHASES))})")
+            elif not (isinstance(c["phases"], list) and c["phases"] and set(c["phases"]) <= {*printed, WHOLE_RUN}):
+                out.append(f"{where}: phases: a non-empty list of what {c['tool']} prints ({', '.join(printed)})"
+                           f" and {WHOLE_RUN}")
+            elif set(printed) - set(c["phases"]) and WHOLE_RUN not in c["phases"]:
+                out.append(f"{where}: phases: leaving out {', '.join(sorted(set(printed) - set(c['phases'])))}, it "
+                           f"declares {WHOLE_RUN} (the whole process), where the phase still counts")
+    return out
+
+
+# The release gate's baselines a case may declare absent (`absent`: the product lacks the capability).
+BASELINES = {"base", "main"}
+
+
+# Home turfs of systems without a runner here, named for the catalog (fast.py TURF).
+OTHER_TURF = {"glog-vlog"}

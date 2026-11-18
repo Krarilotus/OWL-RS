@@ -4,6 +4,7 @@
 //! (inferred statements, a session's pending changes, cancellation) comes with it in a
 //! `ReadContext`.
 
+use crate::support::Writes;
 use std::sync::Arc;
 
 use crate::support::in_memory_store_config;
@@ -11,9 +12,9 @@ use nrese_rdf::GraphName;
 use nrese_sparql::GraphAccess;
 use nrese_store::{
     DatasetBackupFormat, DatasetRestoreRequest, GraphReadRequest, GraphResultFormat, GraphTarget,
-    GraphWriteRequest, MutationCommand, ReadContext, ReadScope, Refusal, Requester,
-    SparqlQueryRequest, SparqlUpdateRequest, StatementOp, StatementPattern, StatementsRequest,
-    StoreService, TellRequest, WriteScope,
+    GraphWriteRequest, MutationCommand, MutationPipeline, ReadContext, ReadScope, Refusal,
+    Requester, SparqlQueryRequest, SparqlUpdateRequest, StatementOp, StatementPattern,
+    StatementsRequest, StoreService, TellRequest, WriteScope,
 };
 
 fn store() -> StoreService {
@@ -141,7 +142,7 @@ fn reads_in_a_session_keep_its_data_until_the_session_or_the_store_changes() {
             "INSERT { <urn:x> <urn:p> ?u } WHERE { BIND(STRUUID() AS ?u) }",
         ))
     };
-    assert!(sessions.add(&id, None, vec![fresh()]));
+    assert!(sessions.add(&id, None, vec![fresh()]).unwrap());
     let pending = |session: Option<&str>| StatementsRequest {
         ops: sessions.pending(&id, None).unwrap(),
         session: session.map(str::to_owned),
@@ -170,7 +171,7 @@ fn reads_in_a_session_keep_its_data_until_the_session_or_the_store_changes() {
     assert_eq!(after_commit.len(), 2, "{after_commit:?}");
     assert!(!after_commit.contains(&first[0]));
     // More operations: replayed too.
-    assert!(sessions.add(&id, None, vec![fresh()]));
+    assert!(sessions.add(&id, None, vec![fresh()]).unwrap());
     let longer = pending(Some(&id));
     assert_eq!(
         objects(&store, &ReadContext::all().on(Some(&longer))).len(),
@@ -233,8 +234,16 @@ fn public_writer() -> Requester {
     )
 }
 
-fn forbidden(result: nrese_store::StoreResult<nrese_store::MutationCommitReport>) -> bool {
-    matches!(result, Err(nrese_store::StoreError::Forbidden(_)))
+fn forbidden(
+    result: Result<nrese_store::MutationCommitReport, nrese_store::MutationError>,
+) -> bool {
+    matches!(
+        result,
+        Err(nrese_store::MutationError::Store {
+            source: nrese_store::StoreError::Forbidden(_),
+            ..
+        })
+    )
 }
 
 #[test]
@@ -246,7 +255,7 @@ fn every_write_is_checked_against_its_requesters_scope() {
             target: GraphTarget::NamedGraph(graph.to_owned()),
             format: GraphResultFormat::NTriples,
             base_iri: None,
-            payload: b"<urn:n> <urn:p> \"4\" .".to_vec(),
+            payload: b"<urn:n> <urn:p> \"4\" .".to_vec().into(),
             replace: true,
         })
     };
@@ -257,8 +266,11 @@ fn every_write_is_checked_against_its_requesters_scope() {
     assert!(store.apply(&graph_write("urn:g:public"), &writer).is_ok());
     let delete = MutationCommand::GraphDelete(GraphTarget::DefaultGraph);
     // Refusals name what they refuse.
-    let refusal = |result: nrese_store::StoreResult<_>| match result {
-        Err(nrese_store::StoreError::Forbidden(refusal)) => refusal,
+    let refusal = |result: Result<_, nrese_store::MutationError>| match result {
+        Err(nrese_store::MutationError::Store {
+            source: nrese_store::StoreError::Forbidden(refusal),
+            ..
+        }) => refusal,
         other => panic!("not refused: {other:?}"),
     };
     assert_eq!(
@@ -277,6 +289,32 @@ fn every_write_is_checked_against_its_requesters_scope() {
             "urn:g:secret"
         )))
     );
+    // A write that would change nothing is refused all the same: it succeeding where a new
+    // statement fails would tell what the graph holds (the review of 3 October 2026, A3).
+    let existing = |command: fn(GraphWriteRequest) -> MutationCommand| {
+        command(GraphWriteRequest {
+            target: GraphTarget::NamedGraph("urn:g:secret".to_owned()),
+            format: GraphResultFormat::NTriples,
+            base_iri: None,
+            payload: b"<urn:c> <urn:p> \"3\"^^<http://www.w3.org/2001/XMLSchema#integer> ."
+                .to_vec()
+                .into(),
+            replace: false,
+        })
+    };
+    assert!(forbidden(
+        store.apply(&existing(MutationCommand::GraphWrite), &writer)
+    ));
+    let tell = MutationCommand::Tell(TellRequest {
+        target: GraphTarget::NamedGraph("urn:g:secret".to_owned()),
+        format: GraphResultFormat::NTriples,
+        base_iri: None,
+        payload: b"<urn:c> <urn:p> \"3\"^^<http://www.w3.org/2001/XMLSchema#integer> .".to_vec(),
+    });
+    assert!(forbidden(store.apply(&tell, &writer)));
+    // Deleting a graph that is empty, or absent, likewise.
+    let absent = MutationCommand::GraphDelete(GraphTarget::NamedGraph("urn:g:other".to_owned()));
+    assert!(forbidden(store.apply(&absent, &writer)));
     // A restore changes every graph.
     let restore = MutationCommand::Restore(DatasetRestoreRequest {
         format: DatasetBackupFormat::NQuads,
@@ -381,5 +419,369 @@ fn service_is_a_privilege_of_its_own() {
     assert!(
         refused.contains("may not call other endpoints"),
         "{refused}"
+    );
+}
+
+/// EXPLAIN and EXPLAIN ANALYZE tell a restricted reader nothing of the graphs it may not
+/// read: two stores that differ only in a secret graph answer its plan and its run alike
+/// (times aside). The planner's estimates, the order they choose and the operators' rows
+/// read every graph, so a restricted reader gets no operators; a reader
+/// of every graph still gets them all.
+#[test]
+fn explain_tells_a_restricted_reader_nothing_of_hidden_graphs() {
+    let with_secret = |secret: usize| {
+        let store = store();
+        let quads: String = (0..secret)
+            .map(|i| format!("<urn:s{i}> <urn:p> {i} . <urn:s{i}> <urn:q> <urn:o{i}> . "))
+            .collect();
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ GRAPH <urn:g:secret> {{ {quads} }} }}"
+            )))
+            .unwrap();
+        store
+    };
+    let query = "SELECT * WHERE { GRAPH ?g { ?s <urn:p> ?v . ?s <urn:q> ?o } }";
+    let explain = |store: &StoreService, scope: ReadScope| {
+        let prepared = store
+            .prepare_query(&SparqlQueryRequest::new(query, scope))
+            .unwrap();
+        let token = nrese_store::CancellationToken::new();
+        let plan = store.plan_query(&prepared, &token).unwrap();
+        store.clear_query_cache();
+        let mut run = store.explain_query(&prepared, &token).unwrap();
+        run.micros = 0;
+        for step in &mut run.steps {
+            step.micros = 0;
+        }
+        (plan, run)
+    };
+    let (small, large) = (with_secret(1), with_secret(2_000));
+    assert_eq!(explain(&small, public()), explain(&large, public()));
+    let (plan, run) = explain(&large, ReadScope::All);
+    assert!(!plan.steps.is_empty() && !run.steps.is_empty());
+}
+
+/// Nor do the rewrites: eager aggregation is chosen by an estimate, and a restricted reader's
+/// merged default graph is estimated over every graph. Hidden
+/// prices make it pay in one store and not in the other; the answer, the plan and the run the
+/// reader is told are the same.
+#[test]
+fn restricted_rewrites_tell_nothing_of_hidden_statistics() {
+    let with_hidden_prices = |hidden: usize| {
+        let mut config = in_memory_store_config();
+        config.union_default_graph = true;
+        let store = StoreService::new(config).unwrap();
+        let visible: String = (0..10)
+            .map(|i| {
+                format!("<urn:product{i}> <urn:team> <urn:t> . <urn:offer{i}> <urn:product> <urn:product{i}> . ")
+            })
+            .collect();
+        let secret: String = (0..hidden)
+            .map(|i| format!("<urn:hidden{i}> <urn:price> {} . ", i + 2))
+            .collect();
+        store
+            .execute_update(&SparqlUpdateRequest::new(format!(
+                "INSERT DATA {{ {visible} <urn:visible-price> <urn:price> 1 .
+                   GRAPH <urn:g:public> {{ <urn:marker> <urn:present> 1 }}
+                   GRAPH <urn:g:secret> {{ <urn:hidden-marker> <urn:present> 1 . {secret} }} }}"
+            )))
+            .unwrap();
+        store
+    };
+    let query = "SELECT ?team (SUM(?price) AS ?total) WHERE { ?product <urn:team> ?team .
+                 ?offer <urn:product> ?product . ?x <urn:price> ?price } GROUP BY ?team";
+    let observe = |store: &StoreService| {
+        let request = SparqlQueryRequest::new(query, public());
+        let payload = store.execute_query(&request).unwrap().payload;
+        let prepared = store.prepare_query(&request).unwrap();
+        let token = nrese_store::CancellationToken::new();
+        let plan = store.plan_query(&prepared, &token).unwrap();
+        store.clear_query_cache();
+        let run = store.explain_query(&prepared, &token).unwrap();
+        (payload, plan.rewrites, run.rewrites)
+    };
+    assert_eq!(
+        observe(&with_hidden_prices(0)),
+        observe(&with_hidden_prices(20))
+    );
+}
+
+/// Nor does a memory refusal, at any entry point that reads: a scan or a view sized by a
+/// graph the requester may not read runs out of the query memory, and the refusal it is told
+/// keeps its kind and limit, not the bytes held and asked for. A requester of every graph is
+/// told the bytes where it is refused (it makes no view). One row per entry point of the
+/// boundary (`EntryPoint`, `ReadScope::told`), chosen by a match over them, so that a new one
+/// without a row doesn't compile. The rows: an EXPLAIN's, a run's and an update's WHERE;
+/// PR #39: a run with operations pending, and the
+/// Graph Store's and RDF4J's reads; PR #45: EXPLAIN without running, and each
+/// row's kind and limit; PR #50: an update's WHERE reads a supported reader's
+/// view, refused while it is made.
+#[test]
+fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
+    use nrese_reasoner::rulesets::Ruleset;
+    use nrese_sparql::QueryEvaluationError;
+    use nrese_store::{EntryPoint, StoreError, StoreResult};
+    let query = "SELECT * WHERE { GRAPH ?g { ?s <urn:p> ?o } }";
+    let prepare = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        pipeline
+            .store()
+            .prepare_query(&SparqlQueryRequest::new(query, scope.clone()))
+            .unwrap()
+    };
+    let token = nrese_store::CancellationToken::new;
+    let run = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        let prepared = prepare(pipeline, scope);
+        pipeline
+            .store()
+            .run_query(&prepared, &token(), std::io::sink())
+            .map(|_| ())
+    };
+    let pending_run = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        let prepared = prepare(pipeline, scope);
+        let add = StatementOp::Add {
+            data: nrese_store::RdfPayload {
+                payload: b"<urn:pending> <urn:p> \"2\" .".to_vec().into(),
+                format: GraphResultFormat::NTriples,
+                base_iri: None,
+            },
+            contexts: Vec::new(),
+        };
+        let pending = StatementsRequest::new(vec![add]);
+        pipeline
+            .store()
+            .run_query_pending(&pending, &prepared, &token(), std::io::sink())
+            .map(|_| ())
+    };
+    let explain = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        let prepared = prepare(pipeline, scope);
+        pipeline
+            .store()
+            .explain_query(&prepared, &token())
+            .map(|_| ())
+    };
+    let plan = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        let prepared = prepare(pipeline, scope);
+        pipeline.store().plan_query(&prepared, &token()).map(|_| ())
+    };
+    // A reader of what its graphs support asks for a statement they derive: its WHERE reads
+    // its view of them, which the secret graph sizes (PR #50). Another copies
+    // what it scans.
+    let update_where = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        let scan = "INSERT { GRAPH <urn:g:public> { ?s <urn:copy> ?o } }
+                    WHERE { GRAPH ?g { ?s <urn:p> ?o } }";
+        let derived = "INSERT { GRAPH <urn:g:public> { <urn:visible> <urn:marked> true } }
+                       WHERE { <urn:visible> <urn:q> <urn:o> }";
+        let (requester, update) = match scope {
+            ReadScope::All => (Requester::all(), scan),
+            ReadScope::Graphs(access) => (
+                Requester::new(scope.clone(), public_writer().write),
+                if access.inferred_by_support {
+                    derived
+                } else {
+                    scan
+                },
+            ),
+        };
+        let update = SparqlUpdateRequest::new(update);
+        let ticket = nrese_store::MutationTicket::new();
+        match pipeline.apply(MutationCommand::Update(update), &requester, &ticket) {
+            Ok(_) => Ok(()),
+            Err(nrese_store::MutationError::Store { source, .. }) => Err(source),
+            Err(other) => panic!("a store error, not {other}"),
+        }
+    };
+    let public_graph = || GraphTarget::NamedGraph("urn:g:public".to_owned());
+    let graph_read = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        let request = GraphReadRequest {
+            target: public_graph(),
+            format: GraphResultFormat::NTriples,
+        };
+        pipeline
+            .store()
+            .execute_graph_read(&ReadContext::new(scope.clone()), &request)
+            .map(|_| ())
+    };
+    let graph_exists = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        pipeline
+            .store()
+            .graph_exists(&ReadContext::new(scope.clone()), &public_graph())
+            .map(|_| ())
+    };
+    let statements = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        pipeline
+            .store()
+            .write_statements(
+                &ReadContext::new(scope.clone()),
+                &StatementPattern::default(),
+                GraphResultFormat::NQuads,
+                std::io::sink(),
+            )
+            .map(|_| ())
+    };
+    let size = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        pipeline
+            .store()
+            .count(
+                &ReadContext::new(scope.clone()),
+                &StatementPattern::default(),
+            )
+            .map(|_| ())
+    };
+    // `<urn:visible> <urn:q> <urn:o>`, which the public graph derives alone.
+    let derived: [nrese_rdf::Term; 3] = ["urn:visible", "urn:q", "urn:o"]
+        .map(|iri| nrese_rdf::NamedNode::new_unchecked(iri).into());
+    let explain_statement = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        let [s, p, o] = derived.each_ref().map(nrese_rdf::Term::as_ref);
+        pipeline
+            .store()
+            .explain_statement(Ruleset::Owl2Rl, scope, s, p, o)
+            .map(|_| ())
+    };
+    let justify_statement = |pipeline: &MutationPipeline, scope: &ReadScope| {
+        let statement = derived.each_ref().map(nrese_rdf::Term::as_ref);
+        let mode = nrese_store::reasoning::JustificationMode::One;
+        pipeline
+            .store()
+            .justify_statement(Ruleset::Owl2Rl, scope, statement, mode)
+            .map(|_| ())
+    };
+    // Two stores each that differ only in how many statements the secret graph holds, with
+    // `memory` bytes of query memory.
+    let store_with = |memory: usize, hidden: usize, public: &str| {
+        let mut config = in_memory_store_config();
+        config.process_memory_bytes = nrese_store::ProcessMemory::Bytes(0);
+        config.total_query_memory_bytes = memory;
+        let pipeline = MutationPipeline::new(
+            Arc::new(StoreService::new(config).unwrap()),
+            Arc::new(nrese_reasoner::ReasonerService::new(
+                nrese_reasoner::ReasonerConfig::for_mode(nrese_reasoner::ReasoningMode::Disabled),
+            )),
+        );
+        let secret: String = (0..hidden)
+            .map(|i| format!("<urn:hidden{i}> <urn:p> {i} . "))
+            .collect();
+        // Loaded past the pipeline: a write's pending changes draw on the same 64 KiB
+        // (D16-039), and the data is the refusals', not what this tests.
+        crate::support::load_past_the_pipeline(
+            pipeline.store(),
+            &format!("<urn:g:public> {{ {public} }} <urn:g:secret> {{ {secret} }}"),
+        );
+        pipeline
+    };
+    let store = |hidden: usize, public: &str| store_with(64 << 10, hidden, public);
+    // Scanned: a query of `?s <urn:p> ?o` in every graph reads the secret graph's.
+    let scans = [100_000, 200_000].map(|hidden| store(hidden, "<urn:visible> <urn:p> 1"));
+    // Viewed: the rules derive `?s <urn:q> ?o` from each with the public graph's
+    // `<urn:p> rdfs:subPropertyOf <urn:q>`, and a view of what the public graph supports hides
+    // them.
+    let views = [2_000, 4_000].map(|hidden| {
+        let pipeline = store(
+            hidden,
+            "<urn:visible> <urn:p> <urn:o> .
+             <urn:p> <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <urn:q>",
+        );
+        pipeline.store().rematerialise(Ruleset::Owl2Rl).unwrap();
+        pipeline
+            .store()
+            .use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+        pipeline
+    });
+    let supported = ReadScope::Graphs(Arc::new(GraphAccess {
+        prefixes: vec!["urn:g:public".to_owned()],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    }));
+    // A refusal's kind and limit, told with its bytes or without.
+    let kind_and_limit = |error: &StoreError| match error {
+        StoreError::MemoryLimitWithoutAmounts { limit, shared } => Some((*shared, *limit)),
+        StoreError::SparqlEvaluation(QueryEvaluationError::MemoryLimit(exceeded))
+        | StoreError::SparqlUpdate(nrese_sparql::UpdateError::Evaluation(
+            QueryEvaluationError::MemoryLimit(exceeded),
+        )) => Some((exceeded.shared, exceeded.limit)),
+        _ => None,
+    };
+    // The server's query memory (no request here has a limit of its own): 64 KiB.
+    let server_memory = Some((true, 64 << 10));
+    // What the secret graph sizes in a row: the scan of a reader of the public graphs, or the
+    // view of one that sees the inferred statements they support (`inferred = "supported"`),
+    // which a reader of every graph doesn't make. An update's WHERE has both.
+    #[derive(Debug)]
+    enum By {
+        Scan,
+        View,
+    }
+    type Entry<'a> = &'a dyn Fn(&MutationPipeline, &ReadScope) -> StoreResult<()>;
+    let mut told = Vec::new();
+    for &entry in EntryPoint::ALL {
+        let (bys, read): (&[By], Entry<'_>) = match entry {
+            // A view row each as well: a scan's refusal no longer tells the hidden size to
+            // anyone (D16-039), so only a view's still would, if this entry point told it.
+            EntryPoint::Run => (&[By::Scan, By::View], &run),
+            EntryPoint::RunPending => (&[By::Scan, By::View], &pending_run),
+            EntryPoint::Explain => (&[By::Scan, By::View], &explain),
+            EntryPoint::Plan => (&[By::View], &plan),
+            EntryPoint::UpdateWhere => (&[By::Scan, By::View], &update_where),
+            EntryPoint::GraphRead => (&[By::View], &graph_read),
+            EntryPoint::GraphExists => (&[By::View], &graph_exists),
+            EntryPoint::Statements => (&[By::View], &statements),
+            EntryPoint::Size => (&[By::View], &size),
+            EntryPoint::ExplainStatement => (&[By::View], &explain_statement),
+            EntryPoint::JustifyStatement => (&[By::View], &justify_statement),
+        };
+        for by in bys {
+            let (stores, restricted) = match by {
+                By::Scan => (&scans, public()),
+                By::View => (&views, supported.clone()),
+            };
+            let refused = |scope: &ReadScope| {
+                stores
+                    .each_ref()
+                    .map(|pipeline| match read(pipeline, scope) {
+                        Err(error) => {
+                            assert_eq!(
+                                kind_and_limit(&error),
+                                server_memory,
+                                "{entry:?} by {by:?}: {error}"
+                            );
+                            error
+                        }
+                        Ok(()) => panic!("{entry:?} by {by:?}: not refused"),
+                    })
+            };
+            // Told alike in every field, the bytes held and asked for included.
+            let [small, large] = refused(&restricted);
+            if format!("{small:?}") != format!("{large:?}") {
+                told.push(format!("{entry:?} by {by:?}: {small:?} against {large:?}"));
+            }
+            if matches!(by, By::Scan) {
+                // A reader of every graph is refused there too, with the server's limit.
+                refused(&ReadScope::All);
+            }
+        }
+    }
+    assert!(told.is_empty(), "told the hidden sizes: {told:#?}");
+    // The channel is live: a reader of every graph tells two such stores apart, so that the
+    // rows above telling a restricted requester nothing mean something. A scan's columns are
+    // charged before they grow, so they are refused at their first growth past the limit, with
+    // the same amounts whatever the secret graph holds (D16-039: before, the whole table was
+    // charged at once, and the amounts asked for told its size). An answer from one store
+    // against a refusal from the other still tells it, under a limit between what the two
+    // scans need: 20,000 secret rows of three ids fit 4 MiB, 400,000 (9.6 MB) don't.
+    let between = 4 << 20;
+    let [fits, outgrows] =
+        [20_000, 400_000].map(|hidden| store_with(between, hidden, "<urn:visible> <urn:p> 1"));
+    assert_eq!(
+        run(&fits, &ReadScope::All).map_err(|e| e.to_string()),
+        Ok(()),
+        "every graph: the smaller store answers"
+    );
+    let refusal = run(&outgrows, &ReadScope::All).expect_err("every graph: the larger is refused");
+    assert_eq!(
+        kind_and_limit(&refusal),
+        Some((true, between)),
+        "every graph: the larger is refused by the server's limit: {refusal}"
     );
 }

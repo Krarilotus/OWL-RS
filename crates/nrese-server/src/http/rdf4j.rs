@@ -22,8 +22,11 @@
 //! `subj`, `pred`, `obj` and `context` are written as in N-Triples (`<iri>`, `_:b`,
 //! `"text"@en`, `"1"^^<…#int>`); `context=null` is the default graph. A transaction's
 //! operations are kept on the server and applied in one commit; reads inside one
-//! (`action=QUERY`, `GET`, `SIZE`) see its changes: its operations are applied to an engine
-//! transaction that is never committed, holding the writer slot while they read. Namespaces
+//! (`action=QUERY`, `GET`, `SIZE`) see its changes: its operations are applied to a
+//! speculative engine transaction over the latest revision, never committed, so it takes no
+//! writer slot and other clients commit meanwhile (`StoreService::with_pending`). That is
+//! RDF4J's SNAPSHOT_READ: a transaction asking for a stronger level is refused at its begin
+//! ([`transaction_begin`]). Namespaces
 //! are kept in `rdf4j-namespaces.json` in an on-disk store's directory (in memory
 //! otherwise), written whole at every change.
 
@@ -31,7 +34,7 @@ use axum::body::Bytes;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use nrese_rdf::{BlankNode, GraphName, Literal, NamedNode, Term};
+use nrese_rdf::{GraphName, Literal, Term};
 
 use crate::access::AccessView;
 use nrese_store::{
@@ -49,6 +52,7 @@ use crate::http::requests::{
     accept_header_value, query_from_post, query_from_url, update_from_post,
 };
 use crate::http::sparql;
+use crate::policy::PolicyConfig;
 use crate::repositories::DEFAULT_REPOSITORY;
 use crate::state::AppState;
 
@@ -67,80 +71,12 @@ fn param<'a>(pairs: &'a [(String, String)], name: &str) -> Option<&'a str> {
         .map(|(_, value)| value.as_str())
 }
 
-/// A term written as in N-Triples.
+/// A term written as in N-Triples, the whole parameter (spaces and line ends around it
+/// aside), read by the N-Triples reader ([`nrese_rdf_io::parse_term`]).
 pub(crate) fn term(text: &str) -> Result<Term, ApiError> {
-    let bad = || ApiError::bad_request(format!("'{text}' is not an N-Triples term"));
-    let text = text.trim();
-    if let Some(iri) = text.strip_prefix('<').and_then(|t| t.strip_suffix('>')) {
-        return NamedNode::new(unescape(iri).ok_or_else(bad)?)
-            .map(Term::from)
-            .map_err(|_| bad());
-    }
-    if let Some(label) = text.strip_prefix("_:") {
-        return BlankNode::new(label).map(Term::from).map_err(|_| bad());
-    }
-    let rest = text.strip_prefix('"').ok_or_else(bad)?;
-    // The closing quote: the last one not escaped.
-    let mut end = None;
-    let mut escaped = false;
-    for (i, c) in rest.char_indices() {
-        match c {
-            '\\' if !escaped => escaped = true,
-            '"' if !escaped => end = Some(i),
-            _ => escaped = false,
-        }
-        if c != '\\' {
-            escaped = false;
-        }
-    }
-    let end = end.ok_or_else(bad)?;
-    let value = unescape(&rest[..end]).ok_or_else(bad)?;
-    let suffix = &rest[end + 1..];
-    if suffix.is_empty() {
-        return Ok(Literal::new_simple_literal(value).into());
-    }
-    if let Some(language) = suffix.strip_prefix('@') {
-        return Literal::new_language_tagged_literal(value, language)
-            .map(Term::from)
-            .map_err(|_| bad());
-    }
-    let datatype = suffix
-        .strip_prefix("^^<")
-        .and_then(|d| d.strip_suffix('>'))
-        .ok_or_else(bad)?;
-    let datatype = NamedNode::new(unescape(datatype).ok_or_else(bad)?).map_err(|_| bad())?;
-    Ok(Literal::new_typed_literal(value, datatype).into())
-}
-
-/// N-Triples string escapes undone.
-fn unescape(text: &str) -> Option<String> {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next()? {
-            't' => out.push('\t'),
-            'b' => out.push('\u{8}'),
-            'n' => out.push('\n'),
-            'r' => out.push('\r'),
-            'f' => out.push('\u{c}'),
-            '"' => out.push('"'),
-            '\'' => out.push('\''),
-            '\\' => out.push('\\'),
-            'u' => out.push(hex(&mut chars, 4)?),
-            'U' => out.push(hex(&mut chars, 8)?),
-            _ => return None,
-        }
-    }
-    Some(out)
-}
-
-fn hex(chars: &mut std::str::Chars<'_>, digits: usize) -> Option<char> {
-    let code: String = chars.take(digits).collect();
-    char::from_u32(u32::from_str_radix(&code, 16).ok()?)
+    nrese_rdf_io::parse_term(text.trim()).map_err(|error| {
+        ApiError::bad_request(format!("'{text}' is not an N-Triples term: {error}"))
+    })
 }
 
 /// The graphs of the `context` parameters (`null`: the default graph).
@@ -181,25 +117,18 @@ fn infer(pairs: &[(String, String)]) -> bool {
     param(pairs, "infer") != Some("false")
 }
 
-/// An RDF request body.
+/// An RDF request body, shared, not copied.
 pub(crate) fn payload(headers: &HeaderMap, body: &Bytes) -> Result<RdfPayload, ApiError> {
     Ok(RdfPayload {
-        payload: body.to_vec(),
+        payload: body.clone(),
         format: parse_graph_content_format(header_value_str(headers.get(header::CONTENT_TYPE)))?,
         base_iri: parse_rdf_base_iri(headers),
     })
 }
 
-/// `sesame:wildcard`: in a transaction's `DELETE` payload, any value at that position.
-const WILDCARD: &str = "http://www.openrdf.org/schema/sesame#wildcard";
-/// `rdf4j:nil`: in a `DELETE` payload's graph position, the default graph.
-const NIL: &str = "http://rdf4j.org/schema/rdf4j#nil";
-
 /// A transaction's `DELETE`: each statement of the payload a pattern, as RDF4J's server
-/// reads it (its client removes this way, `clear()` too): `sesame:wildcard` matches any
-/// value, a statement without a graph removes from every graph (or from the `context`
-/// parameters), one in `rdf4j:nil` from the default graph. With `preserveNodeId=true`,
-/// blank nodes refer to the store's.
+/// reads it ([`StatementOp::RemovePatterns`]: `sesame:wildcard`, `rdf4j:nil`, the `context`
+/// parameters, `preserveNodeId`). The payload is checked now and kept as it came.
 fn removals(
     pairs: &[(String, String)],
     headers: &HeaderMap,
@@ -207,32 +136,9 @@ fn removals(
 ) -> Result<Vec<StatementOp>, ApiError> {
     let data = payload(headers, body)?;
     let preserve = param(pairs, "preserveNodeId").is_some_and(|v| v.eq_ignore_ascii_case("true"));
-    let parse = match preserve {
-        true => nrese_store::parse_payload_preserving_blank_nodes,
-        false => nrese_store::parse_payload,
-    };
-    let quads = parse(data.format, data.base_iri.as_deref(), &data.payload)
+    let op = StatementOp::remove_patterns(data, contexts(pairs)?, preserve)
         .map_err(|error| ApiError::bad_request(error.to_string()))?;
-    let given = contexts(pairs)?;
-    let wildcard = |term: &Term| matches!(term, Term::NamedNode(node) if node.as_str() == WILDCARD);
-    Ok(quads
-        .into_iter()
-        .map(|quad| {
-            let subject: Term = quad.subject.into();
-            let predicate = (quad.predicate.as_str() != WILDCARD).then_some(quad.predicate);
-            let contexts = match quad.graph_name {
-                GraphName::DefaultGraph => given.clone(),
-                GraphName::NamedNode(node) if node.as_str() == NIL => vec![GraphName::DefaultGraph],
-                graph => vec![graph],
-            };
-            StatementOp::RemoveMatching(StatementPattern {
-                subject: (!wildcard(&subject)).then_some(subject),
-                predicate,
-                object: (!wildcard(&quad.object)).then_some(quad.object),
-                contexts,
-            })
-        })
-        .collect())
+    Ok(vec![op])
 }
 
 /// Whether the body is a SPARQL update (a form with `update`, or `sparql-update`).
@@ -242,12 +148,16 @@ fn is_update(headers: &HeaderMap) -> bool {
         || media_type_matches(content_type, "application/sparql-update")
 }
 
+/// The SPARQL update of a request, within the policy's update limit (its decoded text, as
+/// `/dataset/update` counts it): every RDF4J path that takes one comes here.
 pub(crate) fn update(
+    policy: &PolicyConfig,
     raw: &RawQuery,
     headers: &HeaderMap,
     body: &Bytes,
 ) -> Result<SparqlUpdateRequest, ApiError> {
     let operation = update_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), body)?;
+    policy.enforce_update_bytes(operation.update.len())?;
     Ok(SparqlUpdateRequest {
         update: operation.update,
         using_graphs: operation.using_graphs,
@@ -260,17 +170,18 @@ fn store_error(error: nrese_store::StoreError) -> ApiError {
     ApiError::internal(error.to_string())
 }
 
-/// A store error of a read: 403 for a forbidden one.
+/// A store error of a read: 403 for a forbidden one, 503 for one refused until the store is
+/// rematerialised.
 fn read_error(error: nrese_store::StoreError) -> ApiError {
     match error {
         error @ nrese_store::StoreError::Forbidden(_) => ApiError::forbidden(error.to_string()),
-        error => ApiError::internal(error.to_string()),
+        error => crate::http::sparql::refused_or(error, ApiError::internal),
     }
 }
 
 pub(crate) async fn apply(
     state: &AppState,
-    ops: Vec<StatementOp>,
+    ops: impl Into<nrese_store::StatementOps>,
     access: &AccessView,
 ) -> Result<(), ApiError> {
     mutation::run(
@@ -393,16 +304,34 @@ pub async fn repositories(
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &authenticated).await?;
     let writable = state.runtime_posture().sparql_update_enabled;
-    let ids = std::iter::once((DEFAULT_REPOSITORY.to_owned(), Some("NRESE".to_owned())))
-        .chain(state.repositories().list());
+    // Those that didn't open at start are listed neither readable nor writable.
+    let ids = std::iter::once((
+        DEFAULT_REPOSITORY.to_owned(),
+        Some("NRESE".to_owned()),
+        state.default_unavailable().is_none(),
+    ))
+    .chain(
+        state
+            .repositories()
+            .list()
+            .into_iter()
+            .map(|(id, title)| (id, title, true)),
+    )
+    .chain(
+        state
+            .repositories()
+            .unavailable_list()
+            .into_iter()
+            .map(|(id, _)| (id, None, false)),
+    );
     let rows = ids
-        .map(|(id, title)| {
+        .map(|(id, title, open)| {
             vec![
                 literal(format!("/repositories/{id}")),
                 literal(id.as_str()),
                 literal(title.unwrap_or_else(|| format!("NRESE: {id}"))),
-                Some(Literal::from(true).into()),
-                Some(Literal::from(writable).into()),
+                Some(Literal::from(open).into()),
+                Some(Literal::from(open && writable).into()),
             ]
         })
         .collect();
@@ -431,9 +360,10 @@ pub async fn repository_put(
                 None => nrese_store::GraphResultFormat::Turtle,
                 Some(_) => parse_graph_content_format(content_type)?,
             };
-            let quads = nrese_store::parse_payload(format, None, &body).map_err(|error| {
-                ApiError::bad_request(format!("repository configuration: {error}"))
-            })?;
+            let quads = state
+                .repositories()
+                .parse_configuration(format, &body)
+                .map_err(|error| configuration_error(&state.policy(), error))?;
             crate::repository_config::from_config(&id, &quads).map_err(ApiError::bad_request)?
         }
     };
@@ -487,7 +417,7 @@ pub async fn query_post(
             .is_ok_and(|pairs| pairs.iter().any(|(key, _)| key == "update"));
     if form_update || media_type_matches(content_type, "application/sparql-update") {
         let access = guard::update_access(&state, &authenticated).await?;
-        let request = update(&raw, &headers, &body)?;
+        let request = update(&state.policy(), &raw, &headers, &body)?;
         apply(&state, vec![StatementOp::Update(request)], &access).await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
@@ -527,12 +457,13 @@ async fn statements(
     let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let store = state.store();
     let (scope, infer) = (access.read_scope(), infer(&pairs));
-    // Streamed as read: a whole repository in constant memory.
-    let deadline = tokio::time::Instant::now() + state.policy().timeouts.graph_read;
+    // Streamed as read: a whole repository in constant memory, for as long as the client
+    // keeps reading.
+    let pace = super::result_stream::Pace::stalled_after(state.policy().timeouts.graph_read);
     let cancellation = nrese_store::CancellationToken::new();
     let token = cancellation.clone();
     super::result_stream::stream_blocking(
-        deadline,
+        pace,
         cancellation,
         format.media_type(),
         "reading the statements exceeded the policy timeout",
@@ -563,7 +494,7 @@ pub async fn statements_post(
     let state = state.for_repository(&id)?;
     let access = guard::view(&state, &identity);
     let op = if is_update(&headers) {
-        StatementOp::Update(update(&raw, &headers, &body)?)
+        StatementOp::Update(update(&state.policy(), &raw, &headers, &body)?)
     } else {
         state.policy().enforce_rdf_upload_bytes(body.len())?;
         StatementOp::Add {
@@ -824,15 +755,81 @@ fn absolute(headers: &HeaderMap, path: &str) -> String {
     format!("{scheme}://{host}{path}")
 }
 
+/// The isolation levels a transaction may ask for (RDF4J's `IsolationLevels`) and whether
+/// this server's transactions meet each. Each of their reads sees the latest commit with
+/// the transaction's own operations applied, one snapshot per read: SNAPSHOT_READ, and so
+/// every weaker level. SNAPSHOT (one snapshot for the whole transaction) and SERIALIZABLE
+/// (conflicting commits refused) they don't give; holding a revision is v1.6's.
+const ISOLATION_LEVELS: [(&str, bool); 6] = [
+    ("NONE", true),
+    ("READ_UNCOMMITTED", true),
+    ("READ_COMMITTED", true),
+    ("SNAPSHOT_READ", true),
+    ("SNAPSHOT", false),
+    ("SERIALIZABLE", false),
+];
+/// Where a begin names its isolation level: RDF4J's client since 3.3 (a transaction setting,
+/// in the form body), and the older parameter (graphdb.js, in the URL), whose value may carry
+/// the Sesame namespace.
+const ISOLATION_SETTING: &str =
+    "transaction-setting__org.eclipse.rdf4j.common.transaction.IsolationLevel";
+const ISOLATION_LEGACY: &str = "isolation-level";
+const SESAME: &str = "http://www.openrdf.org/schema/sesame#";
+
+/// Refuses a begin that names an isolation level this server's transactions don't meet, or
+/// one RDF4J doesn't know, looking in the URL and a form body under either name, as RDF4J's
+/// server does. The reason is plain text, which RDF4J's client shows as its exception's
+/// message (its Workbench then leaves the level out of its list). A refused level is never
+/// given weaker in silence; no level named means the server's own.
+fn check_isolation(raw: &RawQuery, headers: &HeaderMap, body: &Bytes) -> Result<(), ApiError> {
+    let mut named = pairs(raw)?;
+    let content_type = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok());
+    if media_type_matches(content_type, "application/x-www-form-urlencoded") {
+        named.extend(
+            serde_urlencoded::from_bytes::<Vec<(String, String)>>(body)
+                .map_err(|error| ApiError::bad_request_plain_text(error.to_string()))?,
+        );
+    }
+    for (name, value) in named {
+        let level = match name.as_str() {
+            ISOLATION_SETTING => value.as_str(),
+            ISOLATION_LEGACY => value.strip_prefix(SESAME).unwrap_or(value.as_str()),
+            _ => continue,
+        };
+        match ISOLATION_LEVELS.iter().find(|(known, _)| *known == level) {
+            Some((_, true)) => {}
+            Some((known, false)) => {
+                return Err(ApiError::bad_request_plain_text(format!(
+                    "isolation level {known} isn't supported: a transaction here reads the \
+                     latest commit with its own changes, one snapshot per read (SNAPSHOT_READ); \
+                     ask for NONE, READ_UNCOMMITTED, READ_COMMITTED or SNAPSHOT_READ"
+                )));
+            }
+            None => {
+                return Err(ApiError::bad_request_plain_text(format!(
+                    "unknown isolation level '{value}' in {name}; the levels are NONE, \
+                     READ_UNCOMMITTED, READ_COMMITTED, SNAPSHOT_READ, SNAPSHOT and SERIALIZABLE"
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub async fn transaction_begin(
     authenticated: crate::auth::Authenticated,
     State(state): State<AppState>,
     Path(id): Path<String>,
+    raw: RawQuery,
     headers: HeaderMap,
+    body: Bytes,
 ) -> Result<Response, ApiError> {
     // Authenticated first; the view is the repository's (workspaces are per repository).
     let identity = guard::enforce_update_write(&state, &authenticated).await?;
     let state = state.for_repository(&id)?;
+    check_isolation(&raw, &headers, &body)?;
     let access = guard::view(&state, &identity);
     let txid = state
         .store()
@@ -870,20 +867,29 @@ pub async fn transaction_action(
     if !sessions.ping(&txid, owner) {
         return Err(ApiError::not_found(format!("no transaction '{txid}'")));
     }
+    // A payload past the upload limit is refused before it is read.
+    if matches!(action.as_str(), "ADD" | "DELETE" | "UPDATE") {
+        state.policy().enforce_rdf_upload_bytes(body.len())?;
+    }
     let ops = match action.as_str() {
         "ADD" => Some(vec![StatementOp::Add {
             data: payload(&headers, &body)?,
             contexts: contexts(&pairs)?,
         }]),
         "DELETE" => Some(removals(&pairs, &headers, &body)?),
-        "UPDATE" => Some(vec![StatementOp::Update(update(&raw, &headers, &body)?)]),
+        "UPDATE" => Some(vec![StatementOp::Update(update(
+            &state.policy(),
+            &raw,
+            &headers,
+            &body,
+        )?)]),
         _ => None,
     };
     if let Some(ops) = ops {
-        state.policy().enforce_rdf_upload_bytes(body.len())?;
         return match sessions.add(&txid, owner, ops) {
-            true => Ok(StatusCode::OK.into_response()),
-            false => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
+            Ok(true) => Ok(StatusCode::OK.into_response()),
+            Ok(false) => Err(ApiError::not_found(format!("no transaction '{txid}'"))),
+            Err(refused) => Err(sparql::map_query_error(&state.policy(), refused.into())),
         };
     }
     match action.as_str() {
@@ -944,8 +950,59 @@ pub async fn transaction_rollback(
     }
 }
 
+/// A repository configuration's parse error: malformed RDF is the request's (400); anything
+/// else as a query's is (memory refused: 503 or 413; the process's limit unread: 500).
+fn configuration_error(
+    policy: &crate::policy::PolicyConfig,
+    error: nrese_store::StoreError,
+) -> ApiError {
+    match error.is_request_error() {
+        true => ApiError::bad_request(format!("repository configuration: {error}")),
+        false => sparql::map_query_error(policy, error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use nrese_rdf::NamedNode;
+
+    /// A repository configuration that doesn't parse is the request's (400); a refusal
+    /// because the process's memory limit couldn't be read is the server's (500), never
+    /// blamed on the configuration.
+    #[test]
+    fn a_configuration_refused_for_an_unread_limit_is_the_servers_error() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+        let policy = crate::policy::PolicyConfig::default();
+        let unread = nrese_store::StoreError::from(nrese_exec::BudgetExceeded {
+            limit: 0,
+            requested: 4096,
+            used: 0,
+            shared: true,
+            unread: true,
+        });
+        let status = |error| {
+            super::configuration_error(&policy, error)
+                .into_response()
+                .status()
+        };
+        assert_eq!(status(unread), StatusCode::INTERNAL_SERVER_ERROR);
+        // What `parse_configuration` returns for configuration RDF that doesn't parse.
+        let malformed = nrese_store::parse_payload(
+            nrese_store::GraphResultFormat::Turtle,
+            None,
+            b"<urn:a> <urn:b> .",
+            &nrese_exec::Envelope::unlimited(),
+        )
+        .map(|_| ())
+        .expect_err("malformed Turtle");
+        assert!(
+            matches!(malformed, nrese_store::StoreError::RdfParse(_)),
+            "{malformed:?}"
+        );
+        assert_eq!(status(malformed), StatusCode::BAD_REQUEST);
+    }
+
     use super::*;
 
     #[test]
@@ -972,6 +1029,39 @@ mod tests {
         assert!(matches!(term("_:b1").unwrap(), Term::BlankNode(_)));
         assert!(term("plain").is_err());
         assert!(term("\"open").is_err());
+        // A truncated or signed `\u` escape is refused, never read as another character
+        // (a DELETE with it would remove a different statement).
+        assert!(term("\"\\u12\"").is_err());
+        assert!(term("\"\\u+041\"").is_err());
+        assert!(term("<http://e/\\U0001F98>").is_err());
+    }
+
+    /// A term that isn't one N-Triples term (an unescaped quote inside a literal, a raw line
+    /// break, a second term) is refused, never read as a different value: a DELETE pattern
+    /// with it would remove other statements. Every row is checked; the failures are
+    /// reported together.
+    #[test]
+    fn malformed_terms_are_refused_not_read_as_others() {
+        let mut wrong = Vec::new();
+        for text in [
+            "\"a\"\"",
+            "\"a\"b\"",
+            "\"a\" \"b\"",
+            "\"a\nb\"",
+            "\"a\rb\"@en",
+        ] {
+            if let Ok(read) = term(text) {
+                wrong.push(format!("{text:?} read as {read:?}"));
+            }
+        }
+        // Guards: an escaped quote, surrounding spaces.
+        for (text, value) in [("\"a\\\"b\"", "a\"b"), ("  \"a\"  ", "a")] {
+            let expected = Term::from(Literal::new_simple_literal(value));
+            if term(text).ok().as_ref() != Some(&expected) {
+                wrong.push(format!("{text:?}: {:?}", term(text)));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
     #[test]

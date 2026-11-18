@@ -1,7 +1,8 @@
 //! `store.index_encoding` (`nrese_engine::IndexEncoding`): checkpoints are written as format
 //! 11 with either encoding and reopen with the same statements; checkpoints of formats 9
-//! (no palettes) and 10 (palettes), written by the engine before format 11, still open. A
-//! process of its own: the encoding is set for the process.
+//! (no palettes) and 10 (palettes), written by the engine before format 11, still open. The
+//! encoding is set for the process, which these tests share with the other integration
+//! tests (`main.rs`): theirs build blocks with whichever encoding is set meanwhile.
 
 use std::fs;
 use std::path::Path;
@@ -49,10 +50,10 @@ fn magic(dir: &Path) -> Vec<u8> {
 }
 
 #[test]
-fn checkpoints_of_either_encoding_are_format_11() {
+fn checkpoints_of_either_encoding_are_format_12() {
     for (encoding, expected) in [
-        (IndexEncoding::Fast, b"NRESECKB"),
-        (IndexEncoding::Compact, b"NRESECKB"),
+        (IndexEncoding::Fast, b"NRESECKC"),
+        (IndexEncoding::Compact, b"NRESECKC"),
     ] {
         set_index_encoding(encoding);
         let dir = tempfile::tempdir().unwrap();
@@ -76,7 +77,7 @@ fn checkpoints_of_either_encoding_are_format_11() {
 }
 
 /// Checkpoints the engine wrote before format 11 (the statements of [`quads`]; format 9
-/// without palettes, format 10 with) open, and their next checkpoint is format 11.
+/// without palettes, format 10 with) open, and their next checkpoint is format 12.
 #[test]
 fn checkpoints_before_format_11_open() {
     for name in ["checkpoint-format-9.nck", "checkpoint-format-10.nck"] {
@@ -123,7 +124,7 @@ fn checkpoints_before_format_11_open() {
             .filter(|path| path.extension().is_some_and(|e| e == "nck"))
             .collect();
         let newest = checkpoints.iter().max().unwrap();
-        assert_eq!(&fs::read(newest).unwrap()[..8], b"NRESECKB", "{name}");
+        assert_eq!(&fs::read(newest).unwrap()[..8], b"NRESECKC", "{name}");
         let engine = Engine::open(dir.path(), config()).unwrap();
         assert_eq!(
             engine

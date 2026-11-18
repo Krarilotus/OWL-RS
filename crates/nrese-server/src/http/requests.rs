@@ -12,12 +12,15 @@ pub struct QueryOperation {
     pub named_graphs: Vec<String>,
     /// GraphDB's `infer` parameter: `false` reads asserted statements only.
     pub infer: Option<bool>,
-    /// `explain=true`: run the query and return how it ran (JSON) instead of its results.
-    pub explain: bool,
+    /// `explain=true`: run the query and return how it ran (JSON) instead of its results;
+    /// `explain=plan`: return the plan it would run as, with estimates, without running it.
+    pub explain: Explain,
     /// The graphs the requester may read (graph-level access control); `None`: every graph.
     pub access: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
     /// Who sent it (shown in the running queries).
     pub origin: Option<String>,
+    /// `dl-answers=certain-where-complete|sound|exact`: under `owl2-dl`, which answers.
+    pub dl_answers: Option<nrese_store::DlAnswers>,
 }
 
 impl QueryOperation {
@@ -43,12 +46,41 @@ impl QueryOperation {
                 "default-graph-uri" => self.default_graphs.push(value),
                 "named-graph-uri" => self.named_graphs.push(value),
                 "infer" => self.infer = Some(boolean("infer", &value)?),
-                "explain" => self.explain = boolean("explain", &value)?,
+                "dl-answers" => {
+                    self.dl_answers =
+                        Some(nrese_store::DlAnswers::from_name(&value).ok_or_else(|| {
+                            ApiError::bad_request(format!(
+                                "dl-answers must be 'certain-where-complete', 'sound' or \
+                                 'exact', not '{value}'"
+                            ))
+                        })?);
+                }
+                "explain" => {
+                    self.explain = match value.as_str() {
+                        "plan" => Explain::Plan,
+                        other => match boolean("explain", other)? {
+                            true => Explain::Analyze,
+                            false => Explain::No,
+                        },
+                    }
+                }
                 _ => {}
             }
         }
         Ok(())
     }
+}
+
+/// What a query request asks for instead of results.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum Explain {
+    /// The results.
+    #[default]
+    No,
+    /// Run it and report how it ran (`explain=true`).
+    Analyze,
+    /// The plan with estimates, without running it (`explain=plan`).
+    Plan,
 }
 
 /// A SPARQL 1.1 Protocol update operation: the update and its dataset parameters.
@@ -232,8 +264,8 @@ mod tests {
     use axum::http::HeaderValue;
 
     use super::{
-        QueryOperation, SparqlOperation, operation_from_post, query_from_post, query_from_url,
-        update_from_post,
+        Explain, QueryOperation, SparqlOperation, operation_from_post, query_from_post,
+        query_from_url, update_from_post,
     };
 
     const SELECT: &str = "SELECT%20*%20WHERE%20%7B%20%3Fs%20%3Fp%20%3Fo%20%7D";
@@ -252,9 +284,10 @@ mod tests {
                 default_graphs: Vec::new(),
                 named_graphs: vec!["http://ex/a".to_owned(), "http://ex/b".to_owned()],
                 infer: None,
-                explain: false,
+                explain: Explain::No,
                 access: None,
                 origin: None,
+                dl_answers: None,
             }
         );
     }
@@ -277,7 +310,11 @@ mod tests {
         assert!(query_from_url(Some(&format!("query={SELECT}&infer=no"))).is_err());
         let operation =
             query_from_url(Some(&format!("query={SELECT}&explain=true"))).expect("query");
-        assert!(operation.explain);
+        assert_eq!(operation.explain, Explain::Analyze);
+        let operation =
+            query_from_url(Some(&format!("query={SELECT}&explain=plan"))).expect("query");
+        assert_eq!(operation.explain, Explain::Plan);
+        assert!(query_from_url(Some(&format!("query={SELECT}&explain=maybe"))).is_err());
     }
 
     #[test]

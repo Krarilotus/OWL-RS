@@ -1,0 +1,666 @@
+//! The engine's state and its deterministic part: asserting facts with their clash
+//! checks, and saturation, which runs the queues (the unprocessed suffixes of the fact
+//! tables) to a fixpoint: merges first, then the clauses that hold everywhere, then the
+//! clauses a new concept or edge can trigger (docs/design/owl2-dl.md §6, "queues by
+//! kind, deterministic first").
+
+use std::time::Instant;
+
+use super::Config;
+use super::depset::{DepSetId, DepSets};
+use super::graph::{Annot, Graph, Mark, NONE};
+use super::hyper::{Firing, join_concept, join_edge};
+use super::program::{ConceptId, Head, Program, RoleId};
+use super::telemetry::Telemetry;
+use crate::limits::Limit;
+
+/// Proofs of facts not made by a clause.
+pub mod proof {
+    pub const ASSERTED: u32 = u32::MAX - 1;
+    pub const EXPANSION: u32 = u32::MAX - 2;
+    pub const MERGE: u32 = u32::MAX - 3;
+    pub const CHOICE: u32 = u32::MAX - 4;
+    pub const NEGATION: u32 = u32::MAX - 5;
+}
+
+/// Why a run stops going forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Stop {
+    /// A clash, with the branch points it depends on.
+    Clash(DepSetId),
+    /// A budget ran out, or a rule this engine doesn't have is needed.
+    GaveUp(String),
+    /// This branch can't be completed within the budgets (an at-least restriction too
+    /// large to expand), by what it depends on: the search goes on with the others, and
+    /// a model found there is an answer, a refutation of all of them is not.
+    Abandon(DepSetId, String),
+}
+
+pub type Step<T> = Result<T, Stop>;
+
+/// The stop where the NI rule would be needed but the equality's at-most restriction
+/// isn't known (a clause whose equalities don't spell one out).
+pub fn ni_stop() -> Stop {
+    Stop::GaveUp("the NI rule on an equality without its at-most restriction".into())
+}
+
+/// A head atom with its variables bound to nodes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Lit {
+    Concept(ConceptId, u32),
+    Role(RoleId, u32, u32),
+    Number {
+        at_most: bool,
+        number: u32,
+        node: u32,
+    },
+    /// `a ≈ b` with its annotation (the at-most restriction at a root that raised it).
+    Equal(u32, u32, Annot),
+    /// `a ≉ b` (a key's alternative: two data values differ).
+    Unequal(u32, u32),
+}
+
+/// A disjunction waiting for a choice: the clause and its binding.
+#[derive(Debug, Clone, Copy)]
+pub struct Pending {
+    pub clause: u32,
+    pub bind: u32,
+    pub dep: DepSetId,
+}
+
+/// A branch point.
+#[derive(Debug, Clone)]
+pub struct Frame {
+    /// The level its choices' dependency sets name: stable, and increasing along the
+    /// stack (a frame is only ever pushed on top, with the next id), so a level's frame is
+    /// found by binary search and the largest level is the most recent decision
+    /// (docs/design/owl2-dl-dynamic-backtracking.md §3).
+    pub id: u32,
+    pub mark: Mark,
+    pub pending: u32,
+    pub bindings: u32,
+    pub pending_open: u32,
+    pub ni_pending: u32,
+    pub ni_open: u32,
+    /// Take later alternatives with the failed ones' negations (not for the NI rule's
+    /// choice, which picks among fresh individuals rather than a disjunction that holds).
+    pub semantic: bool,
+    pub alternatives: Vec<Lit>,
+    /// For a disjunction of a clause: the clause (else `NONE`) and each alternative's
+    /// head atom, to count its failures.
+    pub clause: u32,
+    pub heads: Vec<u8>,
+    /// The pending disjunction it decides (else `NONE`: the ≤-rule's and the NI rule's
+    /// choices, whose rules look at the graph again each step). A frame that leaves the
+    /// stack undecided puts it back on `Engine::reopen` ([`Engine::abandon_frame`]): a
+    /// re-decided frame's disjunction lies behind its own saved scan position.
+    pub disjunction: u32,
+    pub next: usize,
+    /// What the disjunction itself depends on.
+    pub premise: DepSetId,
+    /// What the failed alternatives' clashes depended on, besides this branch point.
+    pub failed: DepSetId,
+    /// The retraction queues as they were (`Engine::reopen`, `Engine::refire`): a
+    /// backtrack to this point restores them, the work they held with them.
+    pub reopen: Vec<u32>,
+    pub refire: Vec<u32>,
+}
+
+/// How far each queue is processed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Done {
+    pub nodes: u32,
+    pub unary: u32,
+    pub edges: u32,
+    pub equalities: u32,
+}
+
+#[derive(Clone)]
+pub struct Engine<'a> {
+    pub p: &'a Program,
+    pub config: Config,
+    /// What the run holds, reserved from the request's envelope ([`Config::memory`]);
+    /// shared with its checkpoints, which a restored run continues from.
+    pub memory: Option<std::sync::Arc<nrese_exec::Gauge<nrese_exec::Envelope>>>,
+    pub g: Graph,
+    pub deps: DepSets,
+    pub done: Done,
+    pub pending: Vec<Pending>,
+    /// Pending disjunctions retracted with their level (dynamic backtracking).
+    pub pending_dead: Vec<bool>,
+    /// Nodes whose live facts are joined again after a retraction.
+    pub refire: Vec<u32>,
+    /// Pending disjunctions behind the scan that a retraction may have opened again.
+    pub reopen: Vec<u32>,
+    /// The lowest pending index ever taken from `reopen` in the run (`u32::MAX`: none). The
+    /// scan only looks at its cursor or beyond, but `reopen` brings back older disjunctions,
+    /// which a later choice may then satisfy: a retraction's window reaches down to here
+    /// (`retract.rs`).
+    pub reopened_low: u32,
+    pub bindings: Vec<u32>,
+    pub pending_open: u32,
+    pub frames: Vec<Frame>,
+    /// The root node of each individual (follow merges with `find`).
+    pub roots: Vec<u32>,
+    pub stats: Telemetry,
+    pub firings: Vec<Firing>,
+    pub blocking: super::blocking::Blocking,
+    pub ni: super::ni::Ni,
+    /// Per clause and head atom: how often that disjunct failed (disjunct learning).
+    pub failures: Vec<Vec<u32>>,
+    /// How far the datatype stage has read the fact tables.
+    pub data_done: super::data::DataDone,
+    pub theory: crate::datatypes::DatatypeTheory,
+    /// Why a datatype check was only approximate, if one was: a model is then no answer
+    /// (the input isn't OWL 2 DL there: unsupported).
+    pub data_approximate: Option<String>,
+    /// Which resource limit bounded a datatype check, if one did: a model is then no
+    /// answer either (gave up).
+    pub data_limited: Option<String>,
+    /// The root the test's concepts were asserted on (`NONE`: no test).
+    pub probe: u32,
+    /// Per clause: how many clashes depended on a choice of it ([`Config::conflict_order`]).
+    pub activity: Vec<u32>,
+    /// Branch levels at or below this belong to a base the run was resumed from
+    /// ([`super::probe::Base`]): a backtrack that would go there stops the run instead
+    /// (`GaveUp` with [`super::search::FLOOR`]).
+    pub floor: u32,
+    /// The next branch point's level ([`Frame::id`]); never reused within a run.
+    pub next_level: u32,
+    /// When the last retraction happened, on the levels' clock (`next_level` then): a
+    /// checkpoint older than that can't be restored (`search.rs`, `backtrack`).
+    pub last_retraction: u32,
+    /// Dynamic backtracking switched off for the rest of the run, after a restart.
+    pub dynamic_off: bool,
+    /// The first branch point above the floor as it was before the run's first
+    /// retraction: the point a restart goes back to (no retraction reaches its
+    /// checkpoint; a re-decided frame's own checkpoint is newer).
+    pub restart_point: Option<Frame>,
+}
+
+impl<'a> Engine<'a> {
+    pub fn new(p: &'a Program, config: &Config) -> Self {
+        Self {
+            p,
+            config: config.started().into_owned(),
+            memory: config
+                .memory
+                .as_ref()
+                .and_then(nrese_exec::Envelope::bounded)
+                .map(|envelope| std::sync::Arc::new(nrese_exec::Gauge::new(envelope.clone()))),
+            g: Graph::default(),
+            deps: DepSets::default(),
+            done: Done::default(),
+            pending: Vec::new(),
+            pending_dead: Vec::new(),
+            refire: Vec::new(),
+            reopen: Vec::new(),
+            reopened_low: u32::MAX,
+            bindings: Vec::new(),
+            pending_open: 0,
+            frames: Vec::new(),
+            next_level: 1,
+            last_retraction: 0,
+            dynamic_off: false,
+            restart_point: None,
+            roots: Vec::new(),
+            stats: Telemetry::default(),
+            firings: Vec::new(),
+            blocking: super::blocking::Blocking::default(),
+            ni: super::ni::Ni::default(),
+            failures: Vec::new(),
+            data_done: super::data::DataDone::default(),
+            theory: crate::datatypes::DatatypeTheory::default(),
+            data_approximate: None,
+            data_limited: None,
+            probe: NONE,
+            activity: Vec::new(),
+            floor: 0,
+        }
+    }
+
+    pub fn new_node(&mut self, parent: u32, named: u32) -> Step<u32> {
+        if let Some(most) = self.config.max_nodes
+            && self.g.nodes.len() >= most
+        {
+            return Err(Stop::GaveUp(Limit::Nodes.reached(most)));
+        }
+        let id = self.g.new_node(parent, named);
+        self.stats.nodes_created += 1;
+        self.stats.peak_nodes = self.stats.peak_nodes.max(self.g.nodes.len() as u64);
+        Ok(id)
+    }
+
+    /// The node of an individual now.
+    pub fn root(&self, individual: u32) -> u32 {
+        self.g.find(self.roots[individual as usize])
+    }
+
+    /// The node `node` stands for now, and what the merges that made it so depend on.
+    pub fn canonical(&mut self, node: u32) -> (u32, DepSetId) {
+        let mut dep = DepSetId::EMPTY;
+        let deps = &mut self.deps;
+        let n = self.g.find_with(node, |d| dep = deps.union(dep, d));
+        (n, dep)
+    }
+
+    /// `a ≈ b` between the nodes `a` and `b` stand for now, with `dep` and what those
+    /// merges depend on.
+    pub fn canonical_pair(&mut self, a: u32, b: u32, dep: DepSetId) -> (u32, u32, DepSetId) {
+        let (a, da) = self.canonical(a);
+        let (b, db) = self.canonical(b);
+        let d = self.deps.union(da, db);
+        (a, b, self.deps.union(dep, d))
+    }
+
+    /// Asserts `lit` with `dep`; a clash if its negation holds.
+    pub fn assert(&mut self, lit: Lit, dep: DepSetId, proof: u32) -> Step<()> {
+        match lit {
+            Lit::Concept(c, n) => {
+                if let Some(neg) = self.g.negative(n, c) {
+                    let d = self.g.negatives[neg as usize].dep;
+                    return Err(self.clash(dep, d));
+                }
+                if self.g.add_concept(n, c, dep, proof) {
+                    self.stats.facts += 1;
+                }
+            }
+            Lit::Role(r, a, b) => {
+                if self.g.add_edge(r, a, b, dep, proof) {
+                    self.stats.facts += 1;
+                }
+            }
+            Lit::Number {
+                at_most,
+                number,
+                node,
+            } => {
+                if self.g.add_number(node, at_most, number, dep, proof) {
+                    self.stats.facts += 1;
+                }
+            }
+            Lit::Equal(a, b, annot) => {
+                let (a, b, dep) = self.canonical_pair(a, b, dep);
+                if let Some(i) = self.g.unequal(a, b) {
+                    let d = self.g.inequalities[i as usize].dep;
+                    return Err(self.clash(dep, d));
+                }
+                if self.needs_ni(Lit::Equal(a, b, annot)) {
+                    // The NI rule's, before the ≈-rule (rule precedence), even if a = b.
+                    self.ni_defer(a, b, dep, annot);
+                    return Ok(());
+                }
+                if a == b {
+                    return Ok(());
+                }
+                self.g
+                    .equalities
+                    .push(super::graph::Equality { a, b, dep, annot });
+            }
+            Lit::Unequal(a, b) => {
+                let (a, b, dep) = self.canonical_pair(a, b, dep);
+                return self.add_inequality(a, b, dep, proof);
+            }
+        }
+        Ok(())
+    }
+
+    /// Asserts the negation of `lit` where the engine has one (semantic branching).
+    pub fn negate(&mut self, lit: Lit, dep: DepSetId) -> Step<()> {
+        match lit {
+            Lit::Concept(c, n) => self.add_negative(n, c, dep, proof::NEGATION),
+            Lit::Equal(a, b, _) => {
+                let (a, b, dep) = self.canonical_pair(a, b, dep);
+                self.add_inequality(a, b, dep, proof::NEGATION)
+            }
+            Lit::Unequal(a, b) => self.assert(Lit::Equal(a, b, Annot::NONE), dep, proof::NEGATION),
+            Lit::Role(..) | Lit::Number { .. } => Ok(()),
+        }
+    }
+
+    pub fn add_negative(&mut self, n: u32, c: ConceptId, dep: DepSetId, proof: u32) -> Step<()> {
+        if let Some(pos) = self.g.concept(n, c) {
+            let d = self.g.unary[pos as usize].dep;
+            return Err(self.clash(dep, d));
+        }
+        if self.g.add_negative(n, c, dep, proof) {
+            self.stats.facts += 1;
+        }
+        Ok(())
+    }
+
+    pub fn add_inequality(&mut self, a: u32, b: u32, dep: DepSetId, proof: u32) -> Step<()> {
+        if a == b {
+            return Err(self.clash(dep, DepSetId::EMPTY));
+        }
+        if self.g.add_inequality(a, b, dep, proof) {
+            self.stats.facts += 1;
+        }
+        Ok(())
+    }
+
+    pub fn clash(&mut self, a: DepSetId, b: DepSetId) -> Stop {
+        self.stats.clashes += 1;
+        Stop::Clash(self.deps.union(a, b))
+    }
+
+    /// Whether `lit` holds; `Err(dep)` if it is refuted (with what refutes it).
+    pub fn holds(&mut self, lit: Lit) -> Result<bool, DepSetId> {
+        Ok(match lit {
+            Lit::Concept(c, n) => {
+                if self.g.concept(n, c).is_some() {
+                    return Ok(true);
+                }
+                if let Some(neg) = self.g.negative(n, c) {
+                    return Err(self.g.negatives[neg as usize].dep);
+                }
+                false
+            }
+            Lit::Role(r, a, b) => self.g.edge(r, a, b).is_some(),
+            Lit::Number {
+                at_most,
+                number,
+                node,
+            } => self.g.number(node, at_most, number).is_some(),
+            Lit::Equal(a, b, annot) => {
+                let (s, t) = (self.g.find(a), self.g.find(b));
+                let ni = self.needs_ni(lit);
+                if (s == t && !ni) || (ni && self.ni_pending(a, b, annot)) {
+                    return Ok(true);
+                }
+                if let Some(i) = self.g.unequal(s, t) {
+                    // Refuted between the nodes `a` and `b` were merged into: by the
+                    // inequality and those merges.
+                    let d = self.g.inequalities[i as usize].dep;
+                    let (_, _, d) = self.canonical_pair(a, b, d);
+                    return Err(d);
+                }
+                false
+            }
+            Lit::Unequal(a, b) => {
+                let (s, t, d) = self.canonical_pair(a, b, DepSetId::EMPTY);
+                if s == t {
+                    return Err(d);
+                }
+                self.g.unequal(s, t).is_some()
+            }
+        })
+    }
+
+    /// Whether `lit` is an annotated equality the NI rule governs (JAIR 2009, Table 5):
+    /// raised by an at-most restriction at a root, between blockable nodes of which one
+    /// isn't the root's successor. The rule applies even where both sides are one node,
+    /// so such an equality never counts as holding.
+    pub fn needs_ni(&self, lit: Lit) -> bool {
+        let Lit::Equal(a, b, annot) = lit else {
+            return false;
+        };
+        if annot.root == NONE {
+            return false;
+        }
+        let root = self.g.find(annot.root);
+        let (a, b) = (self.g.find(a), self.g.find(b));
+        let node = |n: u32| &self.g.nodes[n as usize];
+        use super::graph::flag::{CONCRETE, ROOT};
+        let blockable = |n: u32| node(n).flags & (ROOT | CONCRETE) == 0;
+        blockable(a) && blockable(b) && !(node(a).parent == root && node(b).parent == root)
+    }
+
+    /// The head atom `h` under `bind`, of a clause whose equalities have the annotation
+    /// `annotation` (`NONE` if none).
+    pub fn lit(&self, h: Head, bind: &[u32], annotation: u32) -> Lit {
+        let b = |v: u8| bind[v as usize];
+        match h {
+            Head::Concept(c, v) => Lit::Concept(c, b(v)),
+            Head::Role(r, x, y) => Lit::Role(r, b(x), b(y)),
+            Head::AtLeast(number, v) => Lit::Number {
+                at_most: false,
+                number,
+                node: b(v),
+            },
+            Head::AtMost(number, v) => Lit::Number {
+                at_most: true,
+                number,
+                node: b(v),
+            },
+            Head::Equal(x, y) => {
+                let at = b(0);
+                let root = if self.g.nodes[at as usize].flags & super::graph::flag::ROOT != 0 {
+                    at
+                } else {
+                    NONE
+                };
+                Lit::Equal(
+                    b(x),
+                    b(y),
+                    Annot {
+                        root,
+                        number: annotation,
+                    },
+                )
+            }
+            // The individual's own node: whoever asserts or tests the equality follows it
+            // to its representative with the merges' dependencies.
+            Head::Nominal(i, v) => Lit::Equal(b(v), self.roots[i as usize], Annot::NONE),
+            Head::Unequal(x, y) => Lit::Unequal(b(x), b(y)),
+        }
+    }
+
+    /// Applies a clause instance: nothing if its head holds, a clash if every head atom is
+    /// refuted, the one atom left if only one is, else a disjunction for later.
+    pub fn fire(&mut self, clause: u32, bind: &[u32], mut dep: DepSetId) -> Step<()> {
+        let c = &self.p.clauses[clause as usize];
+        let mut open: [Option<Lit>; 2] = [None, None];
+        let mut count = 0;
+        for &h in &c.head {
+            let lit = self.lit(h, bind, c.annotation);
+            match self.holds(lit) {
+                Ok(true) => return Ok(()),
+                Ok(false) => {
+                    if count < 2 {
+                        open[count] = Some(lit);
+                    }
+                    count += 1;
+                }
+                Err(refuted) => dep = self.deps.union(dep, refuted),
+            }
+        }
+        self.stats.clauses_fired += 1;
+        match (count, open[0]) {
+            (0, _) => Err(self.clash(dep, DepSetId::EMPTY)),
+            (1, Some(lit)) => self.assert(lit, dep, c.source),
+            _ => {
+                let at = self.bindings.len() as u32;
+                self.bindings.extend_from_slice(&bind[..c.vars as usize]);
+                self.pending.push(Pending {
+                    clause,
+                    bind: at,
+                    dep,
+                });
+                self.pending_dead.push(false);
+                Ok(())
+            }
+        }
+    }
+
+    // Saturation ---------------------------------------------------------------------------
+
+    /// Runs every queue to a fixpoint.
+    pub fn saturate(&mut self) -> Step<()> {
+        let started = Instant::now();
+        let out = self.saturate_inner();
+        self.stats.saturate += started.elapsed();
+        out
+    }
+
+    fn saturate_inner(&mut self) -> Step<()> {
+        let mut steps = 0u32;
+        loop {
+            steps = steps.wrapping_add(1);
+            if steps.is_multiple_of(4096) {
+                self.check_time()?;
+                self.check_memory()?;
+            }
+            if (self.done.equalities as usize) < self.g.equalities.len() {
+                let i = self.done.equalities;
+                let e = self.g.equalities[i as usize];
+                self.done.equalities += 1;
+                if !self.g.equality_dead(i) {
+                    self.merge(e.a, e.b, e.dep, e.annot)?;
+                }
+                continue;
+            }
+            if let Some(step) = self.refire_one() {
+                step?;
+                continue;
+            }
+            if (self.done.nodes as usize) < self.g.nodes.len() {
+                let n = self.done.nodes;
+                self.done.nodes += 1;
+                if self.g.live(n)
+                    && self.g.nodes[n as usize].flags & super::graph::flag::CONCRETE == 0
+                {
+                    for i in 0..self.p.everywhere.len() {
+                        let clause = self.p.everywhere[i];
+                        self.fire(clause, &[n], DepSetId::EMPTY)?;
+                    }
+                }
+                continue;
+            }
+            if (self.done.unary as usize) < self.g.unary.len() {
+                let i = self.done.unary;
+                self.done.unary += 1;
+                let f = self.g.unary[i as usize];
+                if self.g.live(f.node) && !self.g.dead.unary[i as usize] {
+                    let room = self.firing_room();
+                    join_concept(
+                        self.p,
+                        &self.g,
+                        &mut self.deps,
+                        i,
+                        &mut self.firings,
+                        room,
+                        &mut self.stats.plans_tried,
+                    );
+                    self.apply_firings(room)?;
+                }
+                continue;
+            }
+            if (self.done.edges as usize) < self.g.edges.len() {
+                let i = self.done.edges;
+                self.done.edges += 1;
+                let e = self.g.edges[i as usize];
+                if self.g.live(e.from) && self.g.live(e.to) && !self.g.dead.edges[i as usize] {
+                    let room = self.firing_room();
+                    join_edge(
+                        self.p,
+                        &self.g,
+                        &mut self.deps,
+                        i,
+                        &mut self.firings,
+                        room,
+                        &mut self.stats.plans_tried,
+                    );
+                    self.apply_firings(room)?;
+                }
+                continue;
+            }
+            return Ok(());
+        }
+    }
+
+    /// The clause instances a join may collect: what the run's memory leaves beside what
+    /// it holds ([`Config::max_memory`], the envelope), unlimited without either.
+    pub(super) fn firing_room(&self) -> usize {
+        if self.config.max_memory.is_none() && self.memory.is_none() {
+            return usize::MAX;
+        }
+        let held = self.bytes();
+        let own = self
+            .config
+            .max_memory
+            .map_or(usize::MAX, |most| most.saturating_sub(held));
+        let envelope = self.memory.as_ref().map_or(usize::MAX, |g| g.room(held));
+        own.min(envelope) / std::mem::size_of::<Firing>()
+    }
+
+    /// Applies the instances a join collected; gives up where they filled `room` (the
+    /// join stopped there, so instances may be missing).
+    pub(super) fn apply_firings(&mut self, room: usize) -> Step<()> {
+        if self.firings.len() >= room {
+            self.firings.clear();
+            // The one of the two that left less.
+            let held = self.bytes();
+            let own = self
+                .config
+                .max_memory
+                .map_or(usize::MAX, |most| most.saturating_sub(held));
+            let envelope = self.memory.as_ref().map_or(usize::MAX, |g| g.room(held));
+            let limit = match own <= envelope {
+                true => Limit::Memory,
+                false => Limit::Envelope,
+            };
+            return Err(Stop::GaveUp(
+                limit.reached(format_args!("a join's {room} clause instances")),
+            ));
+        }
+        let firings = std::mem::take(&mut self.firings);
+        let mut out = Ok(());
+        for f in &firings {
+            if let Err(stop) = self.fire(f.clause, &f.bind[..], f.dep) {
+                out = Err(stop);
+                break;
+            }
+        }
+        self.firings = firings;
+        self.firings.clear();
+        out
+    }
+
+    /// The engine's memory now: every table, index and arena, by capacity.
+    pub fn bytes(&self) -> usize {
+        use std::mem::size_of;
+        self.g.bytes()
+            + self.deps.len() * 24
+            + self.pending.capacity() * size_of::<Pending>()
+            + self.bindings.capacity() * 4
+            + self.firings.capacity() * size_of::<Firing>()
+            + self.frames.capacity() * size_of::<Frame>()
+            + self.blocking.bytes
+            + self.ni.bytes()
+    }
+
+    pub fn check_memory(&self) -> Step<()> {
+        self.check_memory_with(0)
+    }
+
+    /// The memory check with `scratch` bytes a rule holds beside the engine (a key's names
+    /// and candidates, `keys.rs`).
+    pub(super) fn check_memory_with(&self, scratch: usize) -> Step<()> {
+        let used = self.bytes().saturating_add(scratch);
+        if let Some(most) = self.config.max_memory
+            && used > most
+        {
+            return Err(Stop::GaveUp(
+                Limit::Memory.reached(format_args!("{} MiB", most >> 20)),
+            ));
+        }
+        if !self.reserve(used) {
+            return Err(Stop::GaveUp(crate::memory::EXHAUSTED.to_owned()));
+        }
+        Ok(())
+    }
+
+    /// Reserves `bytes` for the run from the request's envelope, if it has one; false if
+    /// the envelope has no room for them.
+    pub fn reserve(&self, bytes: usize) -> bool {
+        self.memory.as_ref().is_none_or(|gauge| gauge.follow(bytes))
+    }
+
+    pub fn check_time(&self) -> Step<()> {
+        match self.config.stopped() {
+            Some(why) => Err(Stop::GaveUp(why.into())),
+            None => Ok(()),
+        }
+    }
+}

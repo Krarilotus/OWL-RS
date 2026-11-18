@@ -26,9 +26,20 @@ export function readConsoleRuntimeConfig(): ConsoleRuntimeConfig {
   return window.__NRESE_CONSOLE_CONFIG__ ?? {};
 }
 
+/** The API base URL: the runtime configuration's if it sets one (an empty one means the
+ * console's own origin), else the build's, else the console's own origin. The stock
+ * `console-config.js` sets none, so a build-time URL holds unless a deployment overrides
+ * it (the review of 3 October 2026, C5). */
+export function resolveApiBaseUrl(
+  runtimeConfig: ConsoleRuntimeConfig,
+  buildTimeUrl?: string,
+): string {
+  return normalizeApiBaseUrl(runtimeConfig.apiBaseUrl ?? buildTimeUrl ?? "");
+}
+
 export function resolveBrowserApiBaseUrl(): string {
-  const runtimeConfig = readConsoleRuntimeConfig();
-  return normalizeApiBaseUrl(
-    runtimeConfig.apiBaseUrl ?? import.meta.env.VITE_NRESE_API_BASE_URL ?? "",
+  return resolveApiBaseUrl(
+    readConsoleRuntimeConfig(),
+    import.meta.env.VITE_NRESE_API_BASE_URL,
   );
 }

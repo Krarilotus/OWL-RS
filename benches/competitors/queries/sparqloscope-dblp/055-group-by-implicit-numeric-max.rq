@@ -1,0 +1,3 @@
+# Sparqloscope 61ad92f, DBLP, query 55: group-by-implicit-numeric-max
+# Implicit GROUP BY with MAX on numeric predicate
+PREFIX dblp: <https://dblp.org/rdf/schema#> SELECT (MAX(?o) AS ?max) { ?s dblp:numberOfCreators ?o. }

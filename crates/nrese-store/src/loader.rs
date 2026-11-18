@@ -9,12 +9,15 @@ use tracing::info;
 use crate::config::StoreConfig;
 use crate::error::{StoreError, StoreResult};
 use crate::query::GraphResultFormat;
-use crate::rdf_io::{BlankNodes, file_base_iri, parse_graph};
+use crate::rdf_io::{BlankNodes, each_graph_quad_once, file_base_iri};
 
 /// Loads the configured ontology file into the default graph, if one is configured. A
 /// configured but missing file is an error. Idempotent: the file's own blank-node labels
 /// are kept, so loading it again after a restart adds nothing.
-pub fn preload_ontology(engine: &Engine, config: &StoreConfig) -> StoreResult<Option<PathBuf>> {
+pub(crate) fn preload_ontology(
+    engine: &Engine,
+    config: &StoreConfig,
+) -> StoreResult<Option<PathBuf>> {
     let Some(ontology_path) = config.ontology_path.clone() else {
         return Ok(None);
     };
@@ -23,16 +26,28 @@ pub fn preload_ontology(engine: &Engine, config: &StoreConfig) -> StoreResult<Op
             path: ontology_path,
         });
     }
-    let quads = parse_graph(
+    // Each statement into the transaction as it is read, in one pass; committed only once
+    // the file is read to its end. An error fails the store's opening, which drops this
+    // engine with its dictionary: the terms a failed file interned go with it.
+    let mut tx = engine.transaction();
+    each_graph_quad_once(
         infer_ontology_format(&ontology_path)?,
         Some(&file_base_iri(&ontology_path)?),
         BufReader::new(File::open(&ontology_path)?),
         GraphName::DefaultGraph,
         BlankNodes::AsWritten,
+        |quad| {
+            tx.insert(quad);
+            Ok(())
+        },
     )?;
-    let mut tx = engine.transaction();
-    for quad in &quads {
-        tx.insert(quad.as_ref());
+    // A preload that adds statements drops the reasoning certificate before it publishes them,
+    // as a bulk load does: an open that fails after this commit leaves none for data it never
+    // described.
+    if config.mode == crate::StoreMode::OnDisk
+        && tx.asserted_identity_after() != tx.base().asserted_identity()
+    {
+        crate::metadata::remove(&config.data_dir.join(crate::service::REASONING_MARKER))?;
     }
     let summary = tx.commit()?;
     info!(

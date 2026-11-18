@@ -17,7 +17,10 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use nrese_engine::quad::Permutation;
-use nrese_engine::{GraphSelector, QuadPattern, ReadModel, Snapshot, TermId};
+use nrese_engine::{
+    GraphSelector, HeavyGroups, ProbeCursor, QuadPattern, ReadModel, Seek, Snapshot, TermId,
+};
+use nrese_exec::search::partition_point_from;
 use rayon::prelude::*;
 
 /// A pattern position: a constant id, or a variable (index into the query's variables).
@@ -38,6 +41,8 @@ pub(super) struct Query<'a> {
     /// The value lists of patterns with a single variable, read once: the same under any
     /// bindings (LUBM q2 intersected the 2007 departments for each of 1000 universities).
     lists: Vec<OnceLock<Option<Vec<u64>>>>,
+    /// Per pattern and position ([`Query::heavy`]), found once: the snapshot's list, borrowed.
+    heavy: Vec<OnceLock<Option<HeavyGroups>>>,
 }
 
 /// Why a join stopped early.
@@ -56,6 +61,33 @@ const CHUNKS_PER_THREAD: usize = 4;
 /// Solutions a thread produces between two checks of the shared row count.
 const ROW_STEP: usize = 4096;
 
+/// A child's message to its parent in a counted forest ([`Query::weights`]) is built from
+/// the child's values; where it passes this many times the shortest list of the parent's
+/// values (at least [`MESSAGE_MIN`]), or one value's matches would alone, the parent's
+/// values in that list are counted one by one against the child's weights instead, if that
+/// reads fewer entries than the gather has left. On hub-skewed data the message gathers
+/// every neighbour of every hub only to be cut down to a dozen values (kernel-intersect's
+/// skewed triangles: 107 ms against main's 85 ms enumerating them, 18 Oct 2026).
+const MESSAGE_FACTOR: usize = 64;
+
+/// The least message built before [`MESSAGE_FACTOR`] applies.
+const MESSAGE_MIN: usize = 64;
+
+/// Child values a message counts ahead per parent value, to show that its gather has more
+/// left to read than counting it per parent ([`Query::per_parent`]). Counted only once the
+/// gather has read, or a value is shown to hold, [`MESSAGE_FACTOR`] entries per parent
+/// value: at most one count per 16 entries.
+const COUNT_AHEAD: usize = 4;
+
+/// Candidates of the first variable a sampled estimate joins ([`Query::estimate`]).
+const SAMPLES: usize = 128;
+
+/// Lookups after which a sampled estimate scales what it has.
+const SAMPLE_LOOKUPS: usize = 100_000;
+
+/// Solutions after which a sampled estimate stops ([`Query::max_rows`] of its query).
+pub(super) const SAMPLE_ROWS: usize = 1 << 20;
+
 /// State shared by the threads of one join.
 struct Shared<'t> {
     cancelled: AtomicBool,
@@ -70,8 +102,58 @@ pub(super) struct Stats {
     pub order: Vec<usize>,
     /// Candidate values produced, per depth.
     pub candidates: Vec<AtomicUsize>,
-    /// Index lookups (counts) made to check candidates.
+    /// Checks of candidates (leapfrog seeks).
     pub lookups: AtomicUsize,
+    /// The runs' seeks those checks made, and how many of them searched from the root.
+    pub seeks: AtomicUsize,
+    pub roots: AtomicUsize,
+    /// Candidates skipped: a check named a next value past them.
+    pub skipped: AtomicUsize,
+    /// For a count ([`Query::count_solutions`]): the variables bound before the rest was counted as
+    /// a forest, a prefix of the order.
+    pub counted_after: Option<usize>,
+    /// Whether its messages were budgeted ([`Forest::budgeted`]).
+    pub budgeted: Option<bool>,
+    /// The entries of the forest's messages gathered from children's values.
+    pub messages: AtomicUsize,
+}
+
+/// Where a join's solutions go.
+enum Sink<'f> {
+    /// Rows of all the variables (row-major).
+    Rows(Vec<u64>),
+    /// Their number. With a forest, the bindings of the order's prefix it leaves are
+    /// enumerated and the rest counted; without, every solution.
+    Count {
+        forest: Option<&'f Forest>,
+        total: u64,
+    },
+}
+
+/// The variables a count leaves after a prefix of the order: patterns over one or two of
+/// them (the others bound or constant), no two over the same pair, and no cycle, so a
+/// forest whose solutions are counted from the leaves up ([`Query::count_forest`]).
+struct Forest {
+    /// The prefix of the order bound before counting.
+    depth: usize,
+    /// Per variable: its patterns with no other variable of the forest.
+    unary: Vec<Vec<usize>>,
+    /// Per variable: its children, each with the pattern joining it to them.
+    children: Vec<Vec<(usize, usize)>>,
+    /// A root per tree: its center.
+    roots: Vec<usize>,
+    /// Whether its messages are counted against a budget ([`Query::weights`]): not where
+    /// every child's pattern is known to have no heavy value, so no message can pass its
+    /// budget at once.
+    budgeted: bool,
+}
+
+impl Forest {
+    /// A variable with neither a pattern of its own nor children: its parent counts its
+    /// values per value of its own instead of joining them.
+    fn lazy(&self, var: usize) -> bool {
+        self.unary[var].is_empty() && self.children[var].is_empty()
+    }
 }
 
 /// Whether the variable graph of `patterns` has a cycle: patterns connect the variables
@@ -122,6 +204,7 @@ impl<'a> Query<'a> {
         max_rows: usize,
     ) -> Self {
         let lists = patterns.iter().map(|_| OnceLock::new()).collect();
+        let heavy = (0..patterns.len() * 3).map(|_| OnceLock::new()).collect();
         Self {
             snapshot,
             model,
@@ -129,6 +212,7 @@ impl<'a> Query<'a> {
             variables,
             max_rows,
             lists,
+            heavy,
         }
     }
 
@@ -143,6 +227,48 @@ impl<'a> Query<'a> {
             object: value(pattern[2]),
             graph: GraphSelector::Exact(TermId::DEFAULT_GRAPH),
         }
+    }
+
+    /// The values at `position` of pattern `index` that match it more than [`MESSAGE_MIN`]
+    /// times with only its constants bound, with their matches, in value order: the
+    /// snapshot's, kept for its version (a walk of the index's groups per query made
+    /// uniform triangles 0.3 % more instructions than without them; fleet pm-p2-count-2,
+    /// 31 Oct 2026). `None` where the index can't walk them. Where the pattern has a
+    /// variable outside the forest, these counts have it free: under the order's prefix
+    /// they bound the matches from above only ([`Query::weights`] counts them there).
+    fn heavy(&self, index: usize, position: usize) -> Option<&[(TermId, u64)]> {
+        self.heavy[index * 3 + position]
+            .get_or_init(|| {
+                let quad = self.quad_pattern(&self.patterns[index], &vec![None; self.variables]);
+                let bound = |c: usize| match c {
+                    0 => quad.subject.is_some(),
+                    1 => quad.predicate.is_some(),
+                    2 => quad.object.is_some(),
+                    _ => matches!(quad.graph, GraphSelector::Exact(_)),
+                };
+                // An order with every bound component first (the graph too: a bound graph
+                // after the prefix is no range of it) and `position` next.
+                let bound_count = (0..4).filter(|&c| bound(c)).count();
+                let permutation = Permutation::ALL.into_iter().find(|permutation| {
+                    let order = permutation.order();
+                    order[..bound_count].iter().all(|&c| bound(c))
+                        && order.get(bound_count) == Some(&position)
+                })?;
+                self.snapshot
+                    .heavy_groups_in(self.model, &quad, permutation, MESSAGE_MIN as u64)
+            })
+            .as_deref()
+            .map(|groups| &groups[..])
+    }
+
+    /// [`Query::heavy`] as found before the join: inside it a list is only read. Found
+    /// there, its group walk (on the pool) waited for workers that had taken up other
+    /// parts of the count and asked for the list being found, its `OnceLock` entered again
+    /// on their own thread: kernel-intersect's count never ended (pm-qprof-13, 19 Oct 2026).
+    fn found_heavy(&self, index: usize, position: usize) -> Option<&[(TermId, u64)]> {
+        let found = self.heavy[index * 3 + position].get();
+        debug_assert!(found.is_some(), "heavy values found before the join");
+        found?.as_deref().map(|groups| &groups[..])
     }
 
     fn count(&self, pattern: &[Pos; 3], bindings: &[Option<u64>]) -> u64 {
@@ -190,14 +316,20 @@ impl<'a> Query<'a> {
     /// larger is intersected as a sorted index range (leapfrog style): a sequential scan
     /// costs a few nanoseconds per value, a lookup per candidate far more. The remaining
     /// patterns are checked per candidate ([`consistent`](Self::consistent)).
-    fn candidates(&self, var: usize, bindings: &[Option<u64>]) -> Option<(Vec<u64>, Vec<bool>)> {
+    fn candidates(
+        &self,
+        var: usize,
+        depth: usize,
+        work: &mut Work<'a>,
+    ) -> Option<(Vec<u64>, Vec<bool>)> {
         let mut counts: Vec<Option<u64>> = vec![None; self.patterns.len()];
         let mut best: Option<(u64, usize)> = None;
         for (i, pattern) in self.patterns.iter().enumerate() {
             if !pattern.contains(&Pos::Var(var)) {
                 continue;
             }
-            let count = self.count(pattern, bindings);
+            let quad = self.quad_pattern(pattern, &work.bindings);
+            let count = work.cursor(depth, i, Use::Count, self).count(&quad);
             if count == 0 {
                 return None;
             }
@@ -209,7 +341,7 @@ impl<'a> Query<'a> {
         let (smallest, driver) = best?;
         let mut enforced = vec![false; self.patterns.len()];
         enforced[driver] = true;
-        let mut values = match self.sorted_values(driver, var, bindings) {
+        let mut values = match self.sorted_values(driver, var, depth, work) {
             Some(values) => values.into_owned(),
             None => {
                 let pattern = &self.patterns[driver];
@@ -218,7 +350,7 @@ impl<'a> Query<'a> {
                 let mut values: Vec<u64> = Vec::new();
                 for quad in self
                     .snapshot
-                    .quads_for_pattern_in(self.model, &self.quad_pattern(pattern, bindings))
+                    .quads_for_pattern_in(self.model, &self.quad_pattern(pattern, &work.bindings))
                 {
                     let components = [quad.subject.raw(), quad.predicate.raw(), quad.object.raw()];
                     let value = components[positions[0]];
@@ -243,7 +375,7 @@ impl<'a> Query<'a> {
             if values.is_empty() {
                 break;
             }
-            if let Some(list) = self.sorted_values(i, var, bindings) {
+            if let Some(list) = self.sorted_values(i, var, depth, work) {
                 values = intersect(&values, &list);
                 enforced[i] = true;
             }
@@ -252,13 +384,28 @@ impl<'a> Query<'a> {
     }
 
     /// The values of `var` in pattern `index`'s matches, in id order, if `var` is its only
-    /// unbound position (then an index range lists them sorted and distinct). A pattern
-    /// with no other variable gives the same list under any bindings: read once.
+    /// unbound position (then an index range lists them sorted and distinct), read by the
+    /// pattern's listing cursor at `depth`. A pattern with no other variable gives the
+    /// same list under any bindings: read once.
     fn sorted_values(
         &self,
         index: usize,
         var: usize,
-        bindings: &[Option<u64>],
+        depth: usize,
+        work: &mut Work<'a>,
+    ) -> Option<Cow<'_, [u64]>> {
+        self.sorted_values_by(index, var, depth, Use::Values, work)
+    }
+
+    /// [`Self::sorted_values`] read through the cursor kept for `what`: a pattern read in
+    /// two orders at one depth keeps a cursor per order, each reading forward.
+    fn sorted_values_by(
+        &self,
+        index: usize,
+        var: usize,
+        depth: usize,
+        what: Use,
+        work: &mut Work<'a>,
     ) -> Option<Cow<'_, [u64]>> {
         let pattern = &self.patterns[index];
         let only_var = pattern
@@ -266,24 +413,37 @@ impl<'a> Query<'a> {
             .all(|&p| matches!(p, Pos::Const(_)) || p == Pos::Var(var));
         if only_var {
             return self.lists[index]
-                .get_or_init(|| self.read_values(index, var, bindings))
+                .get_or_init(|| self.read_values(index, var, &work.bindings))
                 .as_deref()
                 .map(Cow::Borrowed);
         }
-        self.read_values(index, var, bindings).map(Cow::Owned)
+        let position = self.free_position(index, var, &work.bindings)?;
+        let quad = self.quad_pattern(pattern, &work.bindings);
+        let mut values = Vec::new();
+        if work
+            .cursor(depth, index, what, self)
+            .values(&quad, position, &mut values)
+        {
+            return Some(Cow::Owned(values));
+        }
+        self.read_values(index, var, &work.bindings).map(Cow::Owned)
     }
 
-    /// [`Self::sorted_values`], read from the index.
-    fn read_values(&self, index: usize, var: usize, bindings: &[Option<u64>]) -> Option<Vec<u64>> {
+    /// The position of `var` in pattern `index` if it is its only unbound position.
+    fn free_position(&self, index: usize, var: usize, bindings: &[Option<u64>]) -> Option<usize> {
         let pattern = &self.patterns[index];
         let mut free = (0..3).filter(|&c| match pattern[c] {
             Pos::Var(v) => bindings[v].is_none(),
             Pos::Const(_) => false,
         });
         let position = free.next()?;
-        if free.next().is_some() || pattern[position] != Pos::Var(var) {
-            return None;
-        }
+        (free.next().is_none() && pattern[position] == Pos::Var(var)).then_some(position)
+    }
+
+    /// [`Self::sorted_values`], read from the index.
+    fn read_values(&self, index: usize, var: usize, bindings: &[Option<u64>]) -> Option<Vec<u64>> {
+        let pattern = &self.patterns[index];
+        let position = self.free_position(index, var, bindings)?;
         // A graph-first order with the free component last.
         let permutation = match position {
             0 => Permutation::Gpos,
@@ -302,65 +462,515 @@ impl<'a> Query<'a> {
         )
     }
 
-    /// Whether every pattern with `var` not in `enforced` still matches once `var` is
-    /// bound (exact for the patterns this binding completes).
-    fn consistent(
+    /// Calls `extend` deeper for each of `values` (ascending) of `var` with which every
+    /// pattern containing `var` and not in `enforced` still matches (exact for the
+    /// patterns the binding completes). Each check is a leapfrog seek of the pattern's
+    /// cursor ([`ProbeCursor::seek`]): the candidates ascend, so it reads forward, and a
+    /// pattern that fails names the next value of `var` that can match it, so the
+    /// candidates below are skipped (or all the rest, where none can).
+    #[allow(clippy::too_many_arguments)]
+    fn extend_values(
         &self,
-        var: usize,
-        bindings: &[Option<u64>],
+        order: &[usize],
+        depth: usize,
+        values: &[u64],
         enforced: &[bool],
+        work: &mut Work<'a>,
+        sink: &mut Sink<'_>,
+        shared: &Shared<'_>,
         stats: &Stats,
-    ) -> bool {
-        self.patterns
-            .iter()
-            .zip(enforced)
-            .filter(|(p, done)| !**done && p.contains(&Pos::Var(var)))
-            .all(|(p, _)| {
-                if repeats_unbound(p, bindings) {
+    ) -> Result<(), Stop> {
+        let var = order[depth];
+        let mut i = 0;
+        let mut seen = 0usize;
+        while i < values.len() {
+            seen += 1;
+            if seen.is_multiple_of(1024)
+                && (shared.cancelled.load(Ordering::Relaxed) || (shared.token)())
+            {
+                shared.cancelled.store(true, Ordering::Relaxed);
+                return Err(Stop::Cancelled);
+            }
+            let value = values[i];
+            work.bindings[var] = Some(value);
+            let mut skip_to = 0u64;
+            let mut passed = true;
+            let mut exhausted = false;
+            for (p, pattern) in self.patterns.iter().enumerate() {
+                // The patterns with `var` not enforced, and where `var` sits in each
+                // (`None`: more than once, so no next value can be named).
+                if enforced[p] {
+                    continue;
+                }
+                let mut places = (0..3).filter(|&c| pattern[c] == Pos::Var(var));
+                let Some(first) = places.next() else {
+                    continue;
+                };
+                let at = places.next().is_none().then_some(first);
+                if repeats_unbound(pattern, &work.bindings) {
                     // Checked exactly once its last variable is bound.
-                    return true;
+                    continue;
                 }
                 stats.lookups.fetch_add(1, Ordering::Relaxed);
-                self.snapshot
-                    .exists_in(self.model, &self.quad_pattern(p, bindings))
-            })
+                let quad = self.quad_pattern(pattern, &work.bindings);
+                let cursor = work.cursor(depth, p, Use::Seek, self);
+                let seek = match at {
+                    Some(c) => cursor.seek(&quad, c),
+                    None => match cursor.exists(&quad) {
+                        true => Seek::Found,
+                        false => Seek::Missing,
+                    },
+                };
+                match seek {
+                    Seek::Found => {}
+                    Seek::Next(next) => {
+                        passed = false;
+                        skip_to = skip_to.max(next);
+                    }
+                    Seek::Missing => passed = false,
+                    Seek::Exhausted => {
+                        // No larger value of `var` matches this pattern.
+                        exhausted = true;
+                        break;
+                    }
+                }
+            }
+            if exhausted {
+                stats
+                    .skipped
+                    .fetch_add(values.len() - i - 1, Ordering::Relaxed);
+                break;
+            }
+            if passed {
+                self.extend(order, depth + 1, work, sink, shared, stats)?;
+                i += 1;
+            } else if skip_to > value {
+                let next = i + 1 + values[i + 1..].partition_point(|&v| v < skip_to);
+                stats.skipped.fetch_add(next - i - 1, Ordering::Relaxed);
+                i = next;
+            } else {
+                i += 1;
+            }
+        }
+        work.bindings[var] = None;
+        Ok(())
     }
 
     fn extend(
         &self,
         order: &[usize],
         depth: usize,
-        bindings: &mut Vec<Option<u64>>,
-        rows: &mut Vec<u64>,
+        work: &mut Work<'a>,
+        sink: &mut Sink<'_>,
         shared: &Shared<'_>,
         stats: &Stats,
     ) -> Result<(), Stop> {
-        let Some(&var) = order.get(depth) else {
-            rows.extend(bindings.iter().map(|b| b.expect("every variable is bound")));
-            if (rows.len() / self.variables.max(1)).is_multiple_of(ROW_STEP) {
-                let total = shared.rows.fetch_add(ROW_STEP, Ordering::Relaxed) + ROW_STEP;
-                if total > self.max_rows {
-                    return Err(Stop::TooManyRows);
+        if let Sink::Count {
+            forest: Some(forest),
+            total,
+        } = sink
+            && depth == forest.depth
+        {
+            match self.count_forest(forest, work) {
+                Some(n) => *total = total.saturating_add(n),
+                // A list the index couldn't give: the rest enumerated instead.
+                None => {
+                    let mut rest = Sink::Count {
+                        forest: None,
+                        total: 0,
+                    };
+                    self.extend(order, depth, work, &mut rest, shared, stats)?;
+                    if let Sink::Count { total: n, .. } = rest {
+                        *total = total.saturating_add(n);
+                    }
                 }
             }
             return Ok(());
+        }
+        let Some(&var) = order.get(depth) else {
+            match sink {
+                Sink::Rows(rows) => {
+                    rows.extend(
+                        work.bindings
+                            .iter()
+                            .map(|b| b.expect("every variable is bound")),
+                    );
+                    if (rows.len() / self.variables.max(1)).is_multiple_of(ROW_STEP) {
+                        let total = shared.rows.fetch_add(ROW_STEP, Ordering::Relaxed) + ROW_STEP;
+                        if total > self.max_rows {
+                            return Err(Stop::TooManyRows);
+                        }
+                    }
+                }
+                Sink::Count { total, .. } => *total = total.saturating_add(1),
+            }
+            return Ok(());
         };
-        let Some((values, enforced)) = self.candidates(var, bindings) else {
+        let Some((values, enforced)) = self.candidates(var, depth, work) else {
             return Ok(());
         };
         stats.candidates[depth].fetch_add(values.len(), Ordering::Relaxed);
-        for (n, value) in values.into_iter().enumerate() {
-            if n % 1024 == 0 && (shared.cancelled.load(Ordering::Relaxed) || (shared.token)()) {
-                shared.cancelled.store(true, Ordering::Relaxed);
-                return Err(Stop::Cancelled);
+        self.extend_values(order, depth, &values, &enforced, work, sink, shared, stats)
+    }
+
+    /// The forest the variables after `depth` of `order` form, if they do ([`Forest`]).
+    fn forest(&self, order: &[usize], depth: usize) -> Option<Forest> {
+        let mut free = vec![false; self.variables];
+        for &v in &order[depth..] {
+            free[v] = true;
+        }
+        let mut unary = vec![Vec::new(); self.variables];
+        let mut adjacent: Vec<Vec<(usize, usize)>> = vec![Vec::new(); self.variables];
+        for (i, pattern) in self.patterns.iter().enumerate() {
+            let mut vars: Vec<usize> = pattern
+                .iter()
+                .filter_map(|p| match *p {
+                    Pos::Var(v) if free[v] => Some(v),
+                    _ => None,
+                })
+                .collect();
+            let positions = vars.len();
+            vars.sort_unstable();
+            vars.dedup();
+            if vars.len() != positions {
+                // A variable twice: its positions must bind one term.
+                return None;
             }
-            bindings[var] = Some(value);
-            if self.consistent(var, bindings, &enforced, stats) {
-                self.extend(order, depth + 1, bindings, rows, shared, stats)?;
+            match *vars.as_slice() {
+                [] => {}
+                [x] => unary[x].push(i),
+                [x, y] => {
+                    if adjacent[x].iter().any(|&(other, _)| other == y) {
+                        return None;
+                    }
+                    adjacent[x].push((y, i));
+                    adjacent[y].push((x, i));
+                }
+                _ => return None,
             }
         }
-        bindings[var] = None;
-        Ok(())
+        // Hops from `from` to each variable of its tree.
+        let hops = |from: usize| {
+            let mut hops = vec![usize::MAX; self.variables];
+            hops[from] = 0;
+            let mut queue = std::collections::VecDeque::from([from]);
+            while let Some(x) = queue.pop_front() {
+                for &(y, _) in &adjacent[x] {
+                    if hops[y] == usize::MAX {
+                        hops[y] = hops[x] + 1;
+                        queue.push_back(y);
+                    }
+                }
+            }
+            hops
+        };
+        let mut children = vec![Vec::new(); self.variables];
+        let mut roots = Vec::new();
+        let mut seen = vec![false; self.variables];
+        for &first in &order[depth..] {
+            if seen[first] {
+                continue;
+            }
+            let reached = hops(first);
+            let tree: Vec<usize> = order[depth..]
+                .iter()
+                .copied()
+                .filter(|&v| reached[v] != usize::MAX)
+                .collect();
+            if tree.len() != tree.iter().map(|&v| adjacent[v].len()).sum::<usize>() / 2 + 1 {
+                return None;
+            }
+            // The root: the tree's center (fewest hops to its farthest variable), first in
+            // the order on ties. What a child sends grows with each hop: rooted at the
+            // 4-cycle's `?b`, `?c` received 64 values per `?a` and read the patterns
+            // into each; rooted at `?c`, both sides read 8.
+            let root = *tree
+                .iter()
+                .min_by_key(|&&v| hops(v).iter().filter(|&&h| h != usize::MAX).max().copied())
+                .expect("a tree has its first variable");
+            roots.push(root);
+            let mut stack = vec![(root, usize::MAX)];
+            seen[root] = true;
+            while let Some((x, parent)) = stack.pop() {
+                for &(y, pattern) in &adjacent[x] {
+                    if y != parent {
+                        seen[y] = true;
+                        children[x].push((y, pattern));
+                        stack.push((y, x));
+                    }
+                }
+            }
+        }
+        let forest = Forest {
+            depth,
+            unary,
+            children,
+            roots,
+            budgeted: true,
+        };
+        // Each variable read needs values from a pattern of its own or from a child that
+        // reads them.
+        let sourced = |v: usize| {
+            !forest.unary[v].is_empty() || forest.children[v].iter().any(|&(c, _)| !forest.lazy(c))
+        };
+        order[depth..]
+            .iter()
+            .all(|&v| forest.lazy(v) || sourced(v))
+            .then_some(forest)
+    }
+
+    /// The solutions of the forest's variables under the bindings of the order's prefix:
+    /// the product over its trees of each root's weights. `None` if a list the counting
+    /// reads isn't an index range.
+    fn count_forest(&self, forest: &Forest, work: &mut Work<'a>) -> Option<u64> {
+        if forest.budgeted {
+            self.forest_total::<true>(forest, work)
+        } else {
+            self.forest_total::<false>(forest, work)
+        }
+    }
+
+    /// [`Self::count_forest`], its messages budgeted where `BUDGETED`.
+    fn forest_total<const BUDGETED: bool>(
+        &self,
+        forest: &Forest,
+        work: &mut Work<'a>,
+    ) -> Option<u64> {
+        let mut total = 1u64;
+        for &root in &forest.roots {
+            let sum = self
+                .weights::<BUDGETED>(forest, root, work)?
+                .iter()
+                .fold(0u64, |sum, &(_, w)| sum.saturating_add(w));
+            if sum == 0 {
+                return Some(0);
+            }
+            total = total.saturating_mul(sum);
+        }
+        Some(total)
+    }
+
+    /// The values `var` can take and, per value, the solutions of its subtree with `var`
+    /// bound to it, sorted by value: its own patterns' values joined with what each child
+    /// sends (per value of `var`, the sum of the child's weights over the values the
+    /// joining pattern pairs with it), each lazy child's matches counted per value.
+    /// Without `BUDGETED` (a forest none of whose children has a heavy value) the budget
+    /// is compiled out: kept in the code, unused, it made uniform triangles 2.7 % slower
+    /// (fleet pm-abba-k4-confirm, 20 Oct 2026). A message is then at most [`MESSAGE_MIN`]
+    /// times the child's values, as before the budget.
+    fn weights<const BUDGETED: bool>(
+        &self,
+        forest: &Forest,
+        var: usize,
+        work: &mut Work<'a>,
+    ) -> Option<Vec<(u64, u64)>> {
+        // The cursors' depth past the order's: a count's work has one more.
+        let slot = self.variables;
+        let mut lists: Vec<Vec<(u64, u64)>> = Vec::new();
+        for &pattern in &forest.unary[var] {
+            let values = self.sorted_values(pattern, var, slot, work)?;
+            lists.push(values.iter().map(|&v| (v, 1)).collect());
+        }
+        let mut lazy = Vec::new();
+        for &(child, pattern) in &forest.children[var] {
+            if forest.lazy(child) {
+                lazy.push((child, pattern));
+                continue;
+            }
+            let sent = self.weights::<BUDGETED>(forest, child, work)?;
+            let shortest = lists.iter().min_by_key(|list| list.len());
+            let budget = shortest
+                .filter(|_| BUDGETED)
+                .map(|list| (list.len() * MESSAGE_FACTOR).max(MESSAGE_MIN));
+            let mut message = Vec::new();
+            let mut over = false;
+            // Counting per parent is decided once per gather: when what it has read passes the
+            // budget, or before a value whose matches alone would. It is taken only where it
+            // reads fewer entries than the gather has yet to read, shown by counting what is
+            // left: what is read is spent. A
+            // value's matches are known before they are read for the pattern's heavy values,
+            // found once per query (a count per value made uniform triangles 29 % more
+            // instructions, 19 Oct 2026).
+            let position = (0..3).find(|&c| self.patterns[pattern][c] == Pos::Var(child));
+            let heavy = budget
+                .and(position)
+                .and_then(|position| self.found_heavy(pattern, position));
+            // Whether a heavy count is the gather's read: not where the pattern has a variable
+            // the order's prefix binds (the count has it free).
+            let exact = self.patterns[pattern]
+                .iter()
+                .all(|&p| !matches!(p, Pos::Var(v) if v != child && v != var));
+            let mut next_heavy = 0;
+            // Per parent value of the shortest list, its matches (`None` once the gather is
+            // found cheaper and goes on without the budget).
+            let mut budget = budget;
+            let mut per_parent = None;
+            for (at, &(value, weight)) in sent.iter().enumerate() {
+                work.bindings[child] = Some(value);
+                if let Some(limit) = budget {
+                    // This value's matches where its heavy count passes the budget: that count
+                    // where it is the read's, else counted under the prefix (`None` where
+                    // counts don't bound reads).
+                    let mut next = None;
+                    let mut refined = false;
+                    if let Some(heavy) = heavy {
+                        next_heavy +=
+                            heavy[next_heavy..].partition_point(|&(v, _)| v.raw() < value);
+                        if let Some(&(v, n)) = heavy.get(next_heavy)
+                            && v.raw() == value
+                            && n as usize > limit
+                        {
+                            next = match exact {
+                                true => Some(n as usize),
+                                false => self.read_count(pattern, slot, work),
+                            };
+                            refined = !exact;
+                        }
+                    }
+                    if message.len() > limit || next.is_some_and(|n| n > limit) {
+                        // One decision per gather: after it the gather goes on unbudgeted.
+                        budget = None;
+                        work.bindings[child] = None;
+                        let parents = shortest.expect("a budget comes from a list");
+                        per_parent =
+                            self.per_parent(pattern, var, child, parents, &sent, at, next, work);
+                        if per_parent.is_some() {
+                            over = true;
+                            break;
+                        }
+                        work.bindings[child] = Some(value);
+                    } else if refined {
+                        // The heavy count over-states this value's matches under the prefix:
+                        // one such count per gather, which goes on unbudgeted.
+                        budget = None;
+                    }
+                }
+                let values = self.sorted_values(pattern, var, slot, work);
+                work.bindings[child] = None;
+                let values = values?;
+                work.messages += values.len();
+                message.extend(values.iter().map(|&v| (v, weight)));
+            }
+            if let Some(matches) = per_parent.filter(|_| over) {
+                // The parent's values in its shortest list, each counted against the
+                // child's weights: what the join with that list keeps of the message. A
+                // parent with fewer matches than the child has values reads its matches;
+                // one with more probes the child's values instead, so no parent reads more
+                // than either; where its matches are no bound, it probes.
+                message.clear();
+                let parents = shortest.expect("a budget comes from a list");
+                let bound = self.counts_bound_reads();
+                for (&(value, _), matches) in parents.iter().zip(matches) {
+                    if matches == 0 {
+                        continue;
+                    }
+                    work.bindings[var] = Some(value);
+                    let weight = if bound && matches <= sent.len() as u64 {
+                        // The other order of the pattern: the cursor otherwise kept for
+                        // checks, which a count's last depth makes none of.
+                        let values = self.sorted_values_by(pattern, child, slot, Use::Seek, work);
+                        let values = match values {
+                            Some(values) => values,
+                            None => {
+                                work.bindings[var] = None;
+                                return None;
+                            }
+                        };
+                        work.messages += values.len();
+                        weight_of(&values, &sent)
+                    } else {
+                        work.messages += sent.len();
+                        let mut weight = 0u64;
+                        for &(c, w) in &sent {
+                            work.bindings[child] = Some(c);
+                            let quad = self.quad_pattern(&self.patterns[pattern], &work.bindings);
+                            // Whether the read shows a match: a count is for planning, and
+                            // under equality classes an estimate of stored statements.
+                            if work.cursor(slot, pattern, Use::Count, self).exists(&quad) {
+                                weight = weight.saturating_add(w);
+                            }
+                        }
+                        work.bindings[child] = None;
+                        weight
+                    };
+                    work.bindings[var] = None;
+                    if weight > 0 {
+                        message.push((value, weight));
+                    }
+                }
+            } else {
+                message.sort_unstable_by_key(|&(v, _)| v);
+                message.dedup_by(|later, kept| {
+                    let same = later.0 == kept.0;
+                    if same {
+                        kept.1 = kept.1.saturating_add(later.1);
+                    }
+                    same
+                });
+            }
+            lists.push(message);
+        }
+        let mut weights = join_weighted(lists);
+        // A lazy child's matches per value, read (an index count can over-approximate
+        // where equality classes are expanded).
+        for (child, pattern) in lazy {
+            let mut kept = Vec::with_capacity(weights.len());
+            for (value, weight) in weights {
+                work.bindings[var] = Some(value);
+                let n = self
+                    .sorted_values(pattern, child, slot, work)
+                    .map(|values| values.len() as u64);
+                work.bindings[var] = None;
+                match n? {
+                    0 => {}
+                    n => kept.push((value, weight.saturating_mul(n))),
+                }
+            }
+            weights = kept;
+        }
+        Some(weights)
+    }
+
+    /// The solutions estimated by sampling (index-based join sampling, Leis et al., CIDR
+    /// 2017): the join run for up to [`SAMPLES`] candidates of the first variable, evenly
+    /// spaced over them, scaled by their number. Deterministic; stops early past
+    /// [`SAMPLE_LOOKUPS`] lookups or the query's `max_rows`, scaling what it has.
+    pub(super) fn estimate(&self) -> f64 {
+        let order = self.order();
+        let mut work = Work::new(self, order.len());
+        let Some((first, enforced)) = self.candidates(order[0], 0, &mut work) else {
+            return 0.0;
+        };
+        if first.is_empty() {
+            return 0.0;
+        }
+        let stats = Stats {
+            candidates: (0..order.len()).map(|_| AtomicUsize::new(0)).collect(),
+            ..Stats::default()
+        };
+        let never = || false;
+        let shared = Shared {
+            cancelled: AtomicBool::new(false),
+            rows: AtomicUsize::new(0),
+            token: &never,
+        };
+        let picked = first.len().min(SAMPLES);
+        let (mut sink, mut sampled) = (Sink::Rows(Vec::new()), 0);
+        for k in 0..picked {
+            let value = [first[k * first.len() / picked]];
+            sampled += 1;
+            let done = self.extend_values(
+                &order, 0, &value, &enforced, &mut work, &mut sink, &shared, &stats,
+            );
+            if done.is_err() || stats.lookups.load(Ordering::Relaxed) > SAMPLE_LOOKUPS {
+                break;
+            }
+        }
+        let Sink::Rows(rows) = sink else {
+            unreachable!("the sample collects rows")
+        };
+        let found = rows.len() / self.variables.max(1);
+        found as f64 * first.len() as f64 / sampled as f64
     }
 
     /// Every solution, as rows of `variables` ids (row-major).
@@ -370,11 +980,83 @@ impl<'a> Query<'a> {
         stats: &mut Stats,
     ) -> Result<Vec<u64>, Stop> {
         let order = self.order();
-        stats.order.clone_from(&order);
+        let depths = order.len();
+        let sinks = self.drive(&order, depths, token, stats, || Sink::Rows(Vec::new()))?;
+        let mut rows = Vec::new();
+        for sink in sinks {
+            if let Sink::Rows(chunk) = sink {
+                rows.extend(chunk);
+            }
+        }
+        if rows.len() / self.variables.max(1) > self.max_rows {
+            return Err(Stop::TooManyRows);
+        }
+        Ok(rows)
+    }
+
+    /// The number of solutions, without producing them. The variables are bound in the
+    /// join's order only until the rest form a [`Forest`]; under each binding of that
+    /// prefix the forest's solutions are counted from its leaves up (variable
+    /// elimination: per value of a variable, the product of what its children send).
+    /// The 4-cycle `a→b→c→d→a` binds `a` and counts `Σ_c #{b: a→b→c} · #{d: c→d→a}`:
+    /// two lists of 2-paths per `a`, where enumerating it checked every 2-path's
+    /// `c→d` against `d→a`. A forest is found at the latest when one variable is left.
+    /// The sums and products saturate, so the total reads `u64::MAX` exactly where there
+    /// are that many solutions or more: [`Count::AtLeast`](nrese_engine::Count::AtLeast).
+    pub(super) fn count_solutions(
+        &self,
+        token: &(dyn Fn() -> bool + Sync),
+        stats: &mut Stats,
+    ) -> Result<nrese_engine::Count, Stop> {
+        let order = self.order();
+        let forest = (1..=order.len()).find_map(|depth| self.forest(&order, depth));
+        stats.counted_after = forest.as_ref().map(|f| f.depth);
+        // The heavy values the messages check against, found before the join's threads
+        // start ([`Query::found_heavy`]).
+        let mut forest = forest;
+        if let Some(forest) = &mut forest {
+            let mut heavy = false;
+            for &(child, pattern) in forest.children.iter().flatten() {
+                if let Some(position) =
+                    (0..3).find(|&c| self.patterns[pattern][c] == Pos::Var(child))
+                {
+                    heavy |= self.heavy(pattern, position).is_none_or(|h| !h.is_empty());
+                }
+            }
+            forest.budgeted = heavy;
+        }
+        stats.budgeted = forest.as_ref().map(|f| f.budgeted);
+        let sinks = self.drive(&order, order.len() + 1, token, stats, || Sink::Count {
+            forest: forest.as_ref(),
+            total: 0,
+        })?;
+        let total = sinks.iter().fold(0u64, |sum, sink| match sink {
+            Sink::Count { total, .. } => sum.saturating_add(*total),
+            Sink::Rows(_) => sum,
+        });
+        Ok(match total {
+            u64::MAX => nrese_engine::Count::AtLeast(total),
+            exact => nrese_engine::Count::Exact(exact),
+        })
+    }
+
+    /// The join over `order`: the first variable's candidates split across threads, each
+    /// share extended into its own sink. `depths` is the cursors' per thread.
+    fn drive<'f>(
+        &self,
+        order: &[usize],
+        depths: usize,
+        token: &(dyn Fn() -> bool + Sync),
+        stats: &mut Stats,
+        sink: impl Fn() -> Sink<'f> + Sync,
+    ) -> Result<Vec<Sink<'f>>, Stop> {
+        stats.order = order.to_vec();
         stats.candidates = (0..order.len()).map(|_| AtomicUsize::new(0)).collect();
         let stats = &*stats;
-        let bindings = vec![None; self.variables];
-        let Some((first, enforced)) = self.candidates(order[0], &bindings) else {
+        let mut work = Work::new(self, depths);
+        let first = self.candidates(order[0], 0, &mut work);
+        work.finish(stats);
+        let Some((first, enforced)) = first else {
             return Ok(Vec::new());
         };
         stats.candidates[0].fetch_add(first.len(), Ordering::Relaxed);
@@ -389,45 +1071,212 @@ impl<'a> Query<'a> {
             .len()
             .div_ceil(rayon::current_num_threads() * CHUNKS_PER_THREAD)
             .clamp(1, 256);
-        let chunks: Vec<Result<Vec<u64>, Stop>> = first
+        first
             .par_chunks(chunk)
             .map(|chunk| {
-                let mut bindings = vec![None; self.variables];
-                let mut rows = Vec::new();
-                for &value in chunk {
-                    bindings[order[0]] = Some(value);
-                    if self.consistent(order[0], &bindings, &enforced, stats) {
-                        self.extend(&order, 1, &mut bindings, &mut rows, &shared, stats)?;
-                    }
-                }
-                Ok(rows)
+                let mut work = Work::new(self, depths);
+                let mut sink = sink();
+                let done = self.extend_values(
+                    order, 0, chunk, &enforced, &mut work, &mut sink, &shared, stats,
+                );
+                work.finish(stats);
+                done.map(|()| sink)
             })
-            .collect();
-        let mut rows = Vec::new();
-        for chunk in chunks {
-            rows.extend(chunk?);
+            .collect()
+    }
+}
+
+impl<'a> Query<'a> {
+    /// Per value of `parents`, its matches in pattern `index` with `var` bound to it (the
+    /// child free; zero only where there is none), where counting the message per parent
+    /// reads fewer entries than its gather has yet to read from `sent[at..]`: each parent
+    /// reads its matches or probes the `sent` child values, whichever is fewer, and probes
+    /// them where the matches are no bound ([`Self::counts_bound_reads`]). What the gather
+    /// has left is shown by `next`, `sent[at]`'s matches where known, and the matches of the
+    /// values after it, counted one by one where counts bound reads, at most
+    /// [`COUNT_AHEAD`] per parent value. `None` where it isn't shown (the gather goes on).
+    /// With the entries read before, the message then takes fewer than the gather.
+    #[allow(clippy::too_many_arguments)]
+    fn per_parent(
+        &self,
+        index: usize,
+        var: usize,
+        child: usize,
+        parents: &[(u64, u64)],
+        sent: &[(u64, u64)],
+        at: usize,
+        next: Option<usize>,
+        work: &mut Work<'a>,
+    ) -> Option<Vec<u64>> {
+        let slot = self.variables;
+        let bound = self.counts_bound_reads();
+        if !bound && next.is_none() {
+            return None;
         }
-        if rows.len() / self.variables.max(1) > self.max_rows {
-            return Err(Stop::TooManyRows);
+        let mut matches = Vec::with_capacity(parents.len());
+        let mut reads = 0usize;
+        for &(value, _) in parents {
+            work.bindings[var] = Some(value);
+            let quad = self.quad_pattern(&self.patterns[index], &work.bindings);
+            let n = work.cursor(slot, index, Use::Count, self).count(&quad);
+            work.bindings[var] = None;
+            let read = match (n, bound) {
+                (0, _) => 0,
+                (n, true) => (n as usize).min(sent.len()),
+                (_, false) => sent.len(),
+            };
+            reads = reads.saturating_add(read);
+            matches.push(n);
         }
-        Ok(rows)
+        let (mut left, mut rest) = match next {
+            Some(n) => (n, at + 1),
+            None => (0, at),
+        };
+        let mut counts = COUNT_AHEAD * parents.len().max(1);
+        while left <= reads && bound && counts > 0 {
+            let Some(&(value, _)) = sent.get(rest) else {
+                break;
+            };
+            work.bindings[child] = Some(value);
+            let quad = self.quad_pattern(&self.patterns[index], &work.bindings);
+            let n = work.cursor(slot, index, Use::Count, self).count(&quad);
+            work.bindings[child] = None;
+            left = left.saturating_add(n as usize);
+            rest += 1;
+            counts -= 1;
+        }
+        (left > reads).then_some(matches)
+    }
+
+    /// The matches of pattern `index` under `work`'s bindings, where they are what reading
+    /// them gives ([`Self::counts_bound_reads`]); `None` where the count is no bound.
+    fn read_count(&self, index: usize, slot: usize, work: &mut Work<'a>) -> Option<usize> {
+        if !self.counts_bound_reads() {
+            return None;
+        }
+        let quad = self.quad_pattern(&self.patterns[index], &work.bindings);
+        Some(work.cursor(slot, index, Use::Count, self).count(&quad) as usize)
+    }
+
+    /// Whether a cursor's match count bounds what reading the matches gives: not where
+    /// equality classes may expand the read ([`ProbeCursor::count`] is then an estimate of
+    /// the stored statements, which a class of M aliases reads M times).
+    fn counts_bound_reads(&self) -> bool {
+        self.model == ReadModel::Asserted
+            || self
+                .snapshot
+                .equality_classes()
+                .is_none_or(|classes| classes.is_empty())
+    }
+}
+
+/// The sum of the weights of the entries of `weighted` (sorted by value, distinct) whose
+/// value is in `values` (sorted, distinct), each found by a search forward from the last.
+fn weight_of(values: &[u64], weighted: &[(u64, u64)]) -> u64 {
+    let mut rest = weighted;
+    let mut sum = 0u64;
+    for &value in values {
+        rest = &rest[rest.partition_point(|&(v, _)| v < value)..];
+        match rest.first() {
+            Some(&(v, w)) if v == value => sum = sum.saturating_add(w),
+            Some(_) => {}
+            None => break,
+        }
+    }
+    sum
+}
+
+/// The values in all of `lists` (each sorted by value, distinct), with the product of
+/// their weights.
+fn join_weighted(mut lists: Vec<Vec<(u64, u64)>>) -> Vec<(u64, u64)> {
+    lists.sort_by_key(Vec::len);
+    let mut lists = lists.into_iter();
+    let mut joined = lists.next().unwrap_or_default();
+    for list in lists {
+        let mut rest = list.as_slice();
+        joined.retain_mut(|(value, weight)| {
+            rest = &rest[rest.partition_point(|&(v, _)| v < *value)..];
+            match rest.first() {
+                Some(&(v, w)) if v == *value => {
+                    *weight = weight.saturating_mul(w);
+                    true
+                }
+                _ => false,
+            }
+        });
+    }
+    joined
+}
+
+/// A thread's state in a join: its bindings, and a probe cursor per depth and pattern,
+/// kept across all the candidates it checks (each reads its runs forward from where the
+/// last check of the same pattern at the same depth landed).
+struct Work<'a> {
+    bindings: Vec<Option<u64>>,
+    /// Per depth, pattern and use: counting, listing and checking read different
+    /// orders and ranges, each ascending in its own sequence.
+    cursors: Vec<[Option<ProbeCursor<'a>>; 3]>,
+    patterns: usize,
+    /// Message entries gathered ([`Stats::messages`]).
+    messages: usize,
+}
+
+/// What a cursor of a [`Work`] is for.
+#[derive(Clone, Copy)]
+enum Use {
+    Count = 0,
+    Values = 1,
+    Seek = 2,
+}
+
+impl<'a> Work<'a> {
+    fn new(query: &Query<'a>, depths: usize) -> Self {
+        Self {
+            bindings: vec![None; query.variables],
+            cursors: (0..depths * query.patterns.len())
+                .map(|_| [None, None, None])
+                .collect(),
+            patterns: query.patterns.len(),
+            messages: 0,
+        }
+    }
+
+    fn cursor(
+        &mut self,
+        depth: usize,
+        pattern: usize,
+        what: Use,
+        query: &Query<'a>,
+    ) -> &mut ProbeCursor<'a> {
+        self.cursors[depth * self.patterns + pattern][what as usize]
+            .get_or_insert_with(|| query.snapshot.probe_cursor(query.model))
+    }
+
+    /// Adds the cursors' seeks to `stats`.
+    fn finish(&self, stats: &Stats) {
+        stats.messages.fetch_add(self.messages, Ordering::Relaxed);
+        for cursor in self.cursors.iter().flatten().flatten() {
+            let seeks = cursor.stats();
+            stats
+                .seeks
+                .fetch_add(seeks.seeks as usize, Ordering::Relaxed);
+            stats
+                .roots
+                .fetch_add(seeks.root_searches as usize, Ordering::Relaxed);
+        }
     }
 }
 
 /// Whether `pattern` has a variable at two positions that `bindings` leave unbound: its
 /// count then over-approximates (the positions must bind one term).
 fn repeats_unbound(pattern: &[Pos; 3], bindings: &[Option<u64>]) -> bool {
-    let unbound: Vec<usize> = pattern
-        .iter()
-        .filter_map(|p| match p {
-            Pos::Var(v) if bindings[*v].is_none() => Some(*v),
-            _ => None,
-        })
-        .collect();
-    unbound
-        .iter()
-        .enumerate()
-        .any(|(i, v)| unbound[i + 1..].contains(v))
+    let unbound = |c: usize| match pattern[c] {
+        Pos::Var(v) if bindings[v].is_none() => Some(v),
+        _ => None,
+    };
+    [(0, 1), (0, 2), (1, 2)]
+        .into_iter()
+        .any(|(a, b)| unbound(a).is_some() && unbound(a) == unbound(b))
 }
 
 /// The values in both sorted, distinct lists: a merge that gallops over the longer one.
@@ -440,12 +1289,7 @@ fn intersect(small: &[u64], large: &[u64]) -> Vec<u64> {
     let mut out = Vec::with_capacity(small.len());
     let mut rest = large;
     for &value in small {
-        // Exponential then binary search for the first element >= value.
-        let mut step = 1;
-        while step < rest.len() && rest[step - 1] < value {
-            step *= 2;
-        }
-        let skip = rest[..step.min(rest.len())].partition_point(|&x| x < value);
+        let skip = partition_point_from(rest, 0, |&x| x < value);
         rest = &rest[skip..];
         match rest.first() {
             Some(&x) if x == value => out.push(value),
@@ -459,6 +1303,397 @@ fn intersect(small: &[u64], large: &[u64]) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::intersect;
+
+    /// Triangles are counted as many as enumerating them finds. Over hubs, messages are
+    /// bounded by the parents' own lists: each of 600 nodes links to 4 of 8 hubs and each
+    /// hub to 40 nodes, and a message from a node's predecessors gathered every predecessor
+    /// of every hub among them (97,280 entries; 1,280 now, 18 Oct 2026). Without a heavy
+    /// value (each node to 4 others) no budget is compiled in: uniform triangles ran 2.7 %
+    /// slower with it (pm-abba-k4-confirm, 20 Oct 2026).
+    #[test]
+    fn forest_messages_over_hubs_stay_within_the_parents_lists() {
+        use super::{Pos, Query, Stats};
+        use nrese_engine::ReadModel;
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        let hubs: Vec<(u32, u32)> = (8..608)
+            .flat_map(|n| (0..4).map(move |k| (n, (n * 3 + k) % 8)))
+            .chain(
+                (0..8).flat_map(|hub| (0..40).map(move |k| (hub, 8 + (hub * 71 + k * 13) % 600))),
+            )
+            .collect();
+        let uniform: Vec<(u32, u32)> = (0..608)
+            .flat_map(|n| (1..5).map(move |k| (n, (n * 37 + k * 101) % 608)))
+            .collect();
+        for (edges, budgeted) in [(hubs, true), (uniform, false)] {
+            let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+            let node = |n: u32| NamedNode::new_unchecked(format!("http://e/n{n}"));
+            let edge = NamedNode::new_unchecked("http://e/s");
+            let mut tx = engine.transaction();
+            for (a, b) in edges {
+                let quad = Quad::new(node(a), edge.clone(), node(b), GraphName::DefaultGraph);
+                tx.insert(quad.as_ref());
+            }
+            tx.commit().unwrap();
+            let snapshot = engine.snapshot();
+            let s = snapshot.lookup(edge.as_ref().into()).unwrap().raw();
+            let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
+            let patterns = vec![
+                [a, Pos::Const(s), b],
+                [b, Pos::Const(s), c],
+                [c, Pos::Const(s), a],
+            ];
+            let query = Query::new(&snapshot, ReadModel::Asserted, patterns, 3, usize::MAX);
+            let mut stats = Stats::default();
+            let counted = query
+                .count_solutions(&|| false, &mut stats)
+                .ok()
+                .unwrap()
+                .exact()
+                .unwrap();
+            let enumerated = query
+                .run(&|| false, &mut Stats::default())
+                .ok()
+                .unwrap()
+                .len()
+                / 3;
+            // The hubs' graph is bipartite (its point is the messages); the uniform one has
+            // triangles to count.
+            assert!(
+                budgeted || enumerated > 0,
+                "the uniform graph has triangles"
+            );
+            assert_eq!(counted as usize, enumerated, "budgeted {budgeted}");
+            assert_eq!(stats.budgeted, Some(budgeted));
+            let messages = stats.messages.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(messages < 10_000, "{messages} message entries");
+        }
+    }
+
+    /// A message counted per parent value instead reads no more than gathering it would:
+    /// K triangles A_i -> B -> C -> A_i, 64 more predecessors of C (so C is heavy) and M
+    /// more successors of B. Per prefix A_i the gather reads C's 65 predecessors; reading
+    /// B's M + 1 successors for every A_i instead turned 66,560 entries into 67,109,888 at
+    /// K = 1,024, M = 65,536 (PR #81). The count is exact (3K, three
+    /// rotations each), and the entries read in either direction grow with K + M, not K M.
+    #[test]
+    fn a_message_counted_per_parent_reads_no_more_than_gathering_it() {
+        use super::{Pos, Query, Stats};
+        use nrese_engine::ReadModel;
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        const K: usize = 64;
+        let node = |name: String| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let edge = NamedNode::new_unchecked("http://e/p");
+        let mut entries = Vec::new();
+        for m in [1_024, 4_096] {
+            let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+            let mut tx = engine.transaction();
+            let mut add = |a: String, b: String| {
+                let quad = Quad::new(node(a), edge.clone(), node(b), GraphName::DefaultGraph);
+                tx.insert(quad.as_ref());
+            };
+            for i in 0..K {
+                add(format!("a{i}"), "b".into());
+                add("c".into(), format!("a{i}"));
+            }
+            add("b".into(), "c".into());
+            for j in 0..64 {
+                add(format!("x{j}"), "c".into());
+            }
+            for t in 0..m {
+                add("b".into(), format!("d{t}"));
+            }
+            tx.commit().unwrap();
+            let snapshot = engine.snapshot();
+            let p = snapshot.lookup(edge.as_ref().into()).unwrap().raw();
+            let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
+            let patterns = vec![
+                [a, Pos::Const(p), b],
+                [b, Pos::Const(p), c],
+                [c, Pos::Const(p), a],
+            ];
+            let query = Query::new(&snapshot, ReadModel::Asserted, patterns, 3, usize::MAX);
+            let mut stats = Stats::default();
+            let counted = query
+                .count_solutions(&|| false, &mut stats)
+                .ok()
+                .unwrap()
+                .exact()
+                .unwrap();
+            assert_eq!(counted as usize, 3 * K, "M = {m}");
+            entries.push(stats.messages.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        // Four times the successors of B: at most four times the entries, not K times.
+        assert!(
+            entries[1] <= 4 * entries[0] + 66 * K,
+            "message entries {entries:?} at M = 1,024 and 4,096"
+        );
+        assert!(entries[1] < 16 * 4_096, "message entries {entries:?}");
+    }
+
+    /// A message counted per parent value reads no more than gathering it where the joining
+    /// pattern has a variable the order's prefix binds: the heavy count, every variable
+    /// free, then only bounds the matches from above. A p B_j (P), C_i p A (T), A B_0 C_0,
+    /// A B_j D_i (P T) and 2 P T statements Z_k q C_0: `?a p ?b . ?a ?b ?c . ?c p ?a` has
+    /// one solution, (A, B_0, C_0), and under a = A the gather reads one entry, C_0's
+    /// 2 P T + 1 matches being one there. Taking the heavy count for the gather's cost
+    /// counted per B_j instead: P T entries (PR #81). Numbered and read as
+    /// the COUNT caller does (`cyclic_count`: variables in subject, predicate, object order).
+    #[test]
+    fn a_message_counted_per_parent_reads_no_more_than_the_gather_under_a_bound_prefix() {
+        use super::{Pos, Query, Stats};
+        use nrese_engine::ReadModel;
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        let node = |name: String| NamedNode::new_unchecked(format!("http://e/{name}"));
+        for (p, t) in [(16usize, 128usize), (32, 256)] {
+            let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+            let mut tx = engine.transaction();
+            let mut add = |s: String, predicate: String, o: String| {
+                let quad = Quad::new(node(s), node(predicate), node(o), GraphName::DefaultGraph);
+                tx.insert(quad.as_ref());
+            };
+            // C_0 first: the first child value.
+            for i in 0..t {
+                add(format!("c{i}"), "p".into(), "a".into());
+            }
+            for j in 0..p {
+                add("a".into(), "p".into(), format!("b{j}"));
+            }
+            add("a".into(), "b0".into(), "c0".into());
+            for j in 0..p {
+                for i in 0..t {
+                    add("a".into(), format!("b{j}"), format!("d{i}"));
+                }
+            }
+            for k in 0..2 * p * t {
+                add(format!("z{k}"), "q".into(), "c0".into());
+            }
+            tx.commit().unwrap();
+            let snapshot = engine.snapshot();
+            let edge = snapshot
+                .lookup(node("p".into()).as_ref().into())
+                .unwrap()
+                .raw();
+            let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
+            let patterns = vec![
+                [a, Pos::Const(edge), b],
+                [a, b, c],
+                [c, Pos::Const(edge), a],
+            ];
+            let query = Query::new(&snapshot, ReadModel::Asserted, patterns, 3, usize::MAX);
+            let mut stats = Stats::default();
+            let counted = query
+                .count_solutions(&|| false, &mut stats)
+                .ok()
+                .unwrap()
+                .exact()
+                .unwrap();
+            assert_eq!(counted, 1, "P = {p}, T = {t}");
+            assert_eq!(stats.order, [0, 1, 2]);
+            assert_eq!(stats.counted_after, Some(1), "counted by a forest under a");
+            let messages = stats.messages.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(
+                messages <= 1,
+                "{messages} message entries at P = {p}, T = {t}"
+            );
+        }
+    }
+
+    /// A message of light values only is counted per parent once what it has read passes
+    /// its budget and the values left are counted to hold more than counting per parent
+    /// reads: A -> B_j -> C_j -> A (4 triangles), S more C_s -> A, and 8 X -> C_s per C_s.
+    /// Under a = A the gather reads every C_s's 8 predecessors, 8 S + 4 entries, as hubs
+    /// bound first did in kernel-intersect's skewed triangles; per parent, B_j's 4 matches.
+    /// The count is exact (3 per triangle), and the entries stay within the budget (64 per
+    /// B_j) and what one count and per parent read, at any S.
+    #[test]
+    fn a_message_of_light_values_is_counted_per_parent_once_past_its_budget() {
+        use super::{Pos, Query, Stats};
+        use nrese_engine::ReadModel;
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        let node = |name: String| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let edge = NamedNode::new_unchecked("http://e/p");
+        for s in [1_024usize, 4_096] {
+            let engine = nrese_engine::Engine::new(Default::default()).unwrap();
+            let mut tx = engine.transaction();
+            let mut add = |a: String, b: String| {
+                let quad = Quad::new(node(a), edge.clone(), node(b), GraphName::DefaultGraph);
+                tx.insert(quad.as_ref());
+            };
+            for j in 0..4 {
+                add("a".into(), format!("b{j}"));
+                add(format!("b{j}"), format!("c{j}"));
+            }
+            for i in 0..s {
+                add(format!("c{i}"), "a".into());
+                for t in 0..8 {
+                    add(format!("x{i}-{t}"), format!("c{i}"));
+                }
+            }
+            tx.commit().unwrap();
+            let snapshot = engine.snapshot();
+            let p = snapshot.lookup(edge.as_ref().into()).unwrap().raw();
+            let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
+            let patterns = vec![
+                [a, Pos::Const(p), b],
+                [b, Pos::Const(p), c],
+                [c, Pos::Const(p), a],
+            ];
+            let query = Query::new(&snapshot, ReadModel::Asserted, patterns, 3, usize::MAX);
+            let mut stats = Stats::default();
+            let counted = query
+                .count_solutions(&|| false, &mut stats)
+                .ok()
+                .unwrap()
+                .exact()
+                .unwrap();
+            assert_eq!(counted, 12, "S = {s}");
+            assert_eq!(stats.budgeted, Some(true), "A's S predecessors are heavy");
+            let messages = stats.messages.load(std::sync::atomic::Ordering::Relaxed);
+            assert!(messages < 1_000, "{messages} message entries at S = {s}");
+        }
+    }
+
+    /// A parent counted per value probes the child's values for matches the read shows,
+    /// not for a planning count's: an inferred read with equality classes estimates from
+    /// the stored statements, asserted ones too. A_i -> B, C -> A_i, 65 X_j -> C and
+    /// B -> D_t inferred, B -> C asserted only: the inferred read has no triangle, while
+    /// the estimate of B -> C is 1 (the probe of C from B, as in the hub test above).
+    #[test]
+    fn a_parent_probed_per_value_counts_only_what_the_read_shows() {
+        use super::{Pos, Query, Stats};
+        use nrese_engine::{EncodedTriple, ReadModel};
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        let node = |name: &str| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let engine = nrese_engine::Engine::new(nrese_engine::EngineConfig {
+            background_maintenance: false,
+            ..Default::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let p = tx.intern(node("p").as_ref().into());
+        let same_as = tx.intern(node("sameAs").as_ref().into());
+        let mut infer = |a: &str, b: &str, predicate| {
+            let subject = tx.intern(node(a).as_ref().into());
+            let object = tx.intern(node(b).as_ref().into());
+            tx.insert_inferred(EncodedTriple {
+                subject,
+                predicate,
+                object,
+            });
+        };
+        for i in 0..8 {
+            infer(&format!("a{i}"), "b", p);
+            infer("c", &format!("a{i}"), p);
+        }
+        for j in 0..65 {
+            infer(&format!("x{j}"), "c", p);
+        }
+        for t in 0..2 {
+            infer("b", &format!("d{t}"), p);
+        }
+        infer("alias", "rep", same_as);
+        tx.insert(Quad::new(node("b"), node("p"), node("c"), GraphName::DefaultGraph).as_ref());
+        tx.commit().unwrap();
+        engine.transaction().install(Some(same_as), None);
+        let snapshot = engine.snapshot();
+        let p = p.raw();
+        let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
+        let patterns = vec![
+            [a, Pos::Const(p), b],
+            [b, Pos::Const(p), c],
+            [c, Pos::Const(p), a],
+        ];
+        let query = Query::new(&snapshot, ReadModel::Inferred, patterns, 3, usize::MAX);
+        let mut stats = Stats::default();
+        let counted = query
+            .count_solutions(&|| false, &mut stats)
+            .ok()
+            .unwrap()
+            .exact()
+            .unwrap();
+        assert_eq!(
+            stats.budgeted,
+            Some(true),
+            "no heavy groups: the budget stays"
+        );
+        assert!(stats.counted_after.is_some(), "counted by a forest");
+        assert_eq!(counted, 0, "B -> C is asserted, not inferred");
+    }
+
+    /// Where equality classes expand a read, a match count is an estimate of the stored
+    /// statements, no bound of what the read gives: per parent the child's values are then
+    /// probed, never the parent's matches read. K triangles A_i -> B -> C1 -> A_i, C2 -> A_i,
+    /// 65 more predecessors of C1, and B -> D0 with D0 standing for M aliases: B's
+    /// matches estimate as 2 (C1, D0) against two child values, while the read gives
+    /// M + 2. Reading them per A_i made K (M + 2) entries (PR #81's repair); the count is
+    /// exact (3K) and the entries grow with K + M.
+    #[test]
+    fn a_parent_counted_per_value_reads_no_expanded_matches() {
+        use super::{Pos, Query, Stats};
+        use nrese_engine::{EncodedTriple, ReadModel};
+        use nrese_rdf::{GraphName, NamedNode, Quad};
+        const K: usize = 64;
+        let node = |name: &str| NamedNode::new_unchecked(format!("http://e/{name}"));
+        let mut entries = Vec::new();
+        for m in [1_024, 4_096] {
+            let engine = nrese_engine::Engine::new(nrese_engine::EngineConfig {
+                background_maintenance: false,
+                ..Default::default()
+            })
+            .unwrap();
+            let mut tx = engine.transaction();
+            let same_as = tx.intern(node("sameAs").as_ref().into());
+            // D0 first: the least id of its class, its representative.
+            let d0 = tx.intern(node("d0").as_ref().into());
+            for t in 0..m {
+                let alias = tx.intern(node(&format!("d0-{t}")).as_ref().into());
+                tx.insert_inferred(EncodedTriple {
+                    subject: alias,
+                    predicate: same_as,
+                    object: d0,
+                });
+            }
+            let mut add = |a: &str, b: &str| {
+                tx.insert(Quad::new(node(a), node("p"), node(b), GraphName::DefaultGraph).as_ref());
+            };
+            for i in 0..K {
+                add(&format!("a{i}"), "b");
+                add("c1", &format!("a{i}"));
+                add("c2", &format!("a{i}"));
+            }
+            add("b", "c1");
+            add("b", "d0");
+            for j in 0..65 {
+                add(&format!("x{j}"), "c1");
+            }
+            tx.commit().unwrap();
+            engine.transaction().install(Some(same_as), None);
+            let snapshot = engine.snapshot();
+            let p = snapshot.lookup(node("p").as_ref().into()).unwrap().raw();
+            let (a, b, c) = (Pos::Var(0), Pos::Var(1), Pos::Var(2));
+            let patterns = vec![
+                [a, Pos::Const(p), b],
+                [b, Pos::Const(p), c],
+                [c, Pos::Const(p), a],
+            ];
+            let query = Query::new(&snapshot, ReadModel::Materialised, patterns, 3, usize::MAX);
+            let mut stats = Stats::default();
+            let counted = query
+                .count_solutions(&|| false, &mut stats)
+                .ok()
+                .unwrap()
+                .exact()
+                .unwrap();
+            assert!(stats.counted_after.is_some(), "counted by a forest");
+            assert_eq!(counted as usize, 3 * K, "M = {m}");
+            entries.push(stats.messages.load(std::sync::atomic::Ordering::Relaxed));
+        }
+        // 3,072 more aliases: a few reads of them, not one per A_i.
+        assert!(
+            entries[1].saturating_sub(entries[0]) <= 4 * 3_072,
+            "message entries {entries:?} at M = 1,024 and 4,096"
+        );
+    }
 
     #[test]
     fn intersect_matches_a_set_intersection() {
@@ -480,5 +1715,10 @@ mod tests {
             assert_eq!(intersect(&a, &b), expected);
             assert_eq!(intersect(&b, &a), expected);
         }
+        // Though callers supply distinct lists, the merge keeps a matching repeated
+        // candidate and does not consume the longer side's match between probes.
+        assert_eq!(intersect(&[1, 1, 3], &[1, 2, 3, 3]), [1, 1, 3]);
+        assert_eq!(intersect(&[1, 2, 3, 3], &[1, 1, 3]), [1, 1, 3]);
+        assert_eq!(intersect(&[0, u64::MAX], &[0, 1, u64::MAX]), [0, u64::MAX]);
     }
 }

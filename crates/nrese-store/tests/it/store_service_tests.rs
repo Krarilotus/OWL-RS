@@ -1,3 +1,4 @@
+use crate::support::Writes;
 use std::fs;
 use std::path::PathBuf;
 
@@ -11,10 +12,6 @@ fn test_ontology() -> &'static str {
     "@prefix ex: <http://example.com/> .
 ex:s ex:p ex:o .
 "
-}
-
-fn minimal_fixture_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../fixtures/ontologies/minimal_services.ttl")
 }
 
 fn new_in_memory_service() -> Result<StoreService, Box<dyn std::error::Error>> {
@@ -62,29 +59,6 @@ fn preload_ontology_and_query_roundtrip() -> Result<(), Box<dyn std::error::Erro
 }
 
 #[test]
-fn preload_minimal_ttl_fixture_supports_real_query_surface()
--> Result<(), Box<dyn std::error::Error>> {
-    let config = StoreConfig::in_memory().with_ontology(minimal_fixture_path());
-
-    let service = StoreService::new(config)?;
-    let stats = service.stats()?;
-    assert_eq!(stats.quad_count, 8);
-
-    let ask = service.execute_query_str(
-        "ASK WHERE { <http://example.com/alice> <http://example.com/likes> <http://example.com/spec> }",
-    )?;
-    assert_eq!(ask.kind, QueryResultKind::Boolean);
-    assert!(String::from_utf8(ask.payload)?.contains("true"));
-
-    let construct = service.execute_query_str("CONSTRUCT { ?s ?p ?o } WHERE { ?s ?p ?o }")?;
-    assert_eq!(construct.kind, QueryResultKind::Graph);
-    let graph_text = String::from_utf8(construct.payload)?;
-    assert!(graph_text.contains("http://example.com/alice"));
-
-    Ok(())
-}
-
-#[test]
 fn ontology_preload_requires_existing_file() -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempdir()?;
     let missing_path: PathBuf = temp.path().join("missing.ttl");
@@ -99,31 +73,6 @@ fn ontology_preload_requires_existing_file() -> Result<(), Box<dyn std::error::E
 }
 
 #[test]
-fn sparql_update_inserts_data() -> Result<(), Box<dyn std::error::Error>> {
-    let temp = tempdir()?;
-    let ontology_path = temp.path().join("test_ontology.ttl");
-    fs::write(&ontology_path, test_ontology())?;
-
-    let config = StoreConfig::in_memory().with_ontology(ontology_path);
-
-    let service = StoreService::new(config)?;
-    let report = service.execute_update(&SparqlUpdateRequest::new(
-        "INSERT DATA { <http://example.com/a> <http://example.com/p> <http://example.com/b> }",
-    ))?;
-    assert!(report.applied);
-    assert_eq!(report.revision, 2);
-    assert_eq!(service.current_revision(), 2);
-
-    let ask = service.execute_query_str(
-        "ASK WHERE { <http://example.com/a> <http://example.com/p> <http://example.com/b> }",
-    )?;
-    assert_eq!(ask.kind, QueryResultKind::Boolean);
-    assert!(String::from_utf8(ask.payload)?.contains("true"));
-
-    Ok(())
-}
-
-#[test]
 fn graph_store_named_graph_roundtrip() -> Result<(), Box<dyn std::error::Error>> {
     let config = StoreConfig::in_memory();
     let service = StoreService::new(config)?;
@@ -133,7 +82,9 @@ fn graph_store_named_graph_roundtrip() -> Result<(), Box<dyn std::error::Error>>
         target: named_graph.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:s ex:p ex:o .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:s ex:p ex:o ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
     assert!(write_report.modified);
@@ -184,7 +135,9 @@ fn revision_increments_monotonically_across_mutations() -> Result<(), Box<dyn st
         target: GraphTarget::DefaultGraph,
         format: nrese_store::GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:s ex:p ex:o .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:s ex:p ex:o ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
     assert_eq!(write_report.revision, 2);
@@ -206,21 +159,27 @@ fn graph_write_replace_true_replaces_only_target_graph() -> Result<(), Box<dyn s
         target: named_graph.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:old ex:p ex:one .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:old ex:p ex:one ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
     service.execute_graph_write(&GraphWriteRequest {
         target: named_graph.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:new ex:p ex:two .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:new ex:p ex:two ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
     service.execute_graph_write(&GraphWriteRequest {
         target: GraphTarget::DefaultGraph,
         format: nrese_store::GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:default ex:p ex:v .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:default ex:p ex:v ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
 
@@ -249,14 +208,18 @@ fn graph_write_reports_existing_named_graph_replacements_as_not_created()
         target: named_graph.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:first ex:p ex:one .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:first ex:p ex:one ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
     let second = service.execute_graph_write(&GraphWriteRequest {
         target: named_graph,
         format: nrese_store::GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:second ex:p ex:two .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:second ex:p ex:two ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
 
@@ -276,7 +239,7 @@ fn graph_write_accepts_relative_iris_when_base_iri_is_provided()
         format: nrese_store::GraphResultFormat::Turtle,
         base_iri: Some("https://www.w3.org/ns/prov.ttl".to_owned()),
         payload: b"@prefix : <#> . :generated <http://www.w3.org/2002/07/owl#inverseOf> :wasGeneratedBy ."
-            .to_vec(),
+            .to_vec().into(),
         replace: true,
     })?;
 
@@ -300,14 +263,18 @@ fn graph_write_replace_false_appends_to_existing_graph() -> Result<(), Box<dyn s
         target: named_graph.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:a ex:p ex:one .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:a ex:p ex:one ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
     service.execute_graph_write(&GraphWriteRequest {
         target: named_graph.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:b ex:p ex:two .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:b ex:p ex:two ."
+            .to_vec()
+            .into(),
         replace: false,
     })?;
 
@@ -335,14 +302,18 @@ fn graph_delete_only_affects_target_named_graph() -> Result<(), Box<dyn std::err
         target: graph_one.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:g1 ex:p ex:o .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:g1 ex:p ex:o ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
     service.execute_graph_write(&GraphWriteRequest {
         target: graph_two.clone(),
         format: nrese_store::GraphResultFormat::Turtle,
         base_iri: None,
-        payload: b"@prefix ex: <http://example.com/> . ex:g2 ex:p ex:o .".to_vec(),
+        payload: b"@prefix ex: <http://example.com/> . ex:g2 ex:p ex:o ."
+            .to_vec()
+            .into(),
         replace: true,
     })?;
 
@@ -391,5 +362,88 @@ fn on_disk_mode_persists_data_and_revision_across_reopen() -> Result<(), Box<dyn
     assert_eq!(ask.kind, QueryResultKind::Boolean);
     assert!(String::from_utf8(ask.payload)?.contains("true"));
 
+    Ok(())
+}
+
+/// A reasoning marker whose removal failed is removed by the next invalidation (the
+/// review of 3 October 2026, A4): it was considered gone, so a later write left the stale
+/// marker claiming the inferences were current.
+#[test]
+fn a_failed_marker_removal_is_retried() -> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempdir()?;
+    let store = StoreService::new(StoreConfig::on_disk(dir.path()))?;
+    store.execute_update_str("INSERT DATA { <http://e/a> <http://e/p> <http://e/b> }")?;
+    store.rematerialise(nrese_reasoner::rulesets::Ruleset::Rdfs)?;
+    let marker = dir.path().join("reasoning.state");
+    let recorded = fs::read_to_string(&marker)?;
+    // A directory in its place: removing the file fails on every platform.
+    fs::remove_file(&marker)?;
+    fs::create_dir(&marker)?;
+    fs::write(marker.join("in-the-way"), "")?;
+    assert!(store.invalidate_reasoning().is_err());
+    // The fault is repaired, and the stale marker is back on disk.
+    fs::remove_dir_all(&marker)?;
+    fs::write(&marker, recorded)?;
+    store.invalidate_reasoning()?;
+    assert!(!marker.exists(), "the stale marker survived");
+    assert!(store.reasoning_state().is_none());
+    Ok(())
+}
+
+/// A graph read stops when its token is cancelled (the HTTP timeout cancels it), instead of
+/// running on for a response that gave up (the review of 3 October 2026, P5).
+#[test]
+fn a_cancelled_graph_read_stops() -> Result<(), Box<dyn std::error::Error>> {
+    let service = StoreService::new(StoreConfig::in_memory())?;
+    service.execute_update_str("INSERT DATA { <http://e/a> <http://e/p> <http://e/b> }")?;
+    let request = GraphReadRequest {
+        target: nrese_store::GraphTarget::DefaultGraph,
+        format: nrese_store::GraphResultFormat::NTriples,
+    };
+    let read = nrese_store::ReadContext::all();
+    assert!(service.execute_graph_read(&read, &request).is_ok());
+    read.cancel.cancel();
+    let error = service.execute_graph_read(&read, &request).unwrap_err();
+    assert!(!error.is_request_error(), "{error}");
+    Ok(())
+}
+
+/// A materialisation stops at the process's memory limit with its own error and changes
+/// nothing, instead of taking the machine (a test of the U1 bound grew to 128 GB on a
+/// 64 GB machine on 3 October 2026).
+#[test]
+fn a_materialisation_stops_at_the_process_memory_limit() -> Result<(), Box<dyn std::error::Error>> {
+    let config = StoreConfig {
+        process_memory_bytes: nrese_store::ProcessMemory::Bytes(1),
+        ..StoreConfig::in_memory()
+    };
+    let store = StoreService::new(config)?;
+    // Loaded past the pipeline: a write's pending changes draw on the process's memory, 1 byte
+    // here (D16-039), and the data is the materialisation's, not what this tests.
+    crate::support::load_past_the_pipeline(
+        &store,
+        "<http://e/C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> <http://e/D> .
+         <http://e/a> a <http://e/C> .",
+    );
+    let error = store
+        .rematerialise(nrese_reasoner::rulesets::Ruleset::Rdfs)
+        .unwrap_err();
+    assert!(
+        matches!(
+            error,
+            nrese_store::StoreError::ProcessMemoryLimit { limit: 1 }
+        ),
+        "{error}"
+    );
+    assert!(!error.is_request_error());
+    assert!(store.reasoning_state().is_none(), "nothing was applied");
+    // By default the limit is three quarters of what the process may use, read at its
+    // first need.
+    assert_eq!(
+        StoreConfig::in_memory().process_memory_bytes,
+        nrese_store::ProcessMemory::Default
+    );
+    let store = StoreService::new(StoreConfig::in_memory())?;
+    assert!(store.process_memory_bytes().expect("the limit reads here") > 0);
     Ok(())
 }

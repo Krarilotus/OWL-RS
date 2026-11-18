@@ -11,7 +11,7 @@ use nrese_engine::{GraphSelector, TermId, TermKind};
 use nrese_rdf::{Term, Variable};
 use nrese_sparql::ReadView;
 use nrese_sparql::value::{Value, compile_regex};
-use nrese_sparql_syntax::Query;
+use nrese_sparql_syntax::{Query, SparqlParser};
 
 use crate::graph::{GraphView, Selection};
 use crate::model::{
@@ -81,6 +81,11 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
     for root in roots {
         compiler.shape(root);
     }
+    // Any triple with `sh:entailment` in the shapes graph, whatever its subject (SHACL §1.5).
+    let entailments = compiler
+        .sh("entailment")
+        .map(|predicate| compiler.graph.objects_of(predicate))
+        .unwrap_or_default();
     if compiler.errors.is_empty() {
         Ok(Shapes {
             shapes: compiler.shapes,
@@ -89,6 +94,7 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
                 GraphSelector::Exact(graph) if !graph.is_default_graph() => Some(graph),
                 _ => None,
             },
+            entailments,
         })
     } else {
         Err(compiler.errors)
@@ -641,8 +647,8 @@ impl<V: ReadView> Compiler<'_, V> {
     }
 
     /// The query of `source` (a SPARQL constraint or validator) from `text`: its prefixes,
-    /// `$PATH` replaced by `path`, parsed, of the expected form, and pre-bindable with
-    /// `pre_bound`. `None` (and an error on `shape`) if not.
+    /// `$PATH` as a predicate read as `path`, parsed, of the expected form, and pre-bindable
+    /// with `pre_bound`. `None` (and an error on `shape`) if not.
     fn sparql_query(
         &mut self,
         shape: TermId,
@@ -652,29 +658,37 @@ impl<V: ReadView> Compiler<'_, V> {
         pre_bound: &[String],
         ask: bool,
     ) -> Option<Query> {
-        let mut text = text.to_owned();
-        if text.contains("$PATH") {
-            let graph = &self.graph;
-            let iri = |id: TermId| match graph.decode(id) {
-                Some(Term::NamedNode(iri)) => Some(iri.into_string()),
-                _ => None,
-            };
-            match path.and_then(|path| sparql::path_text(path, &iri)) {
-                Some(path) => text = text.replace("$PATH", &path),
-                None => {
-                    self.error(shape, "a SPARQL query uses $PATH outside a property shape");
-                    return None;
-                }
-            }
+        let mut parser = SparqlParser::new();
+        let graph = &self.graph;
+        let iri = |id: TermId| match graph.decode(id) {
+            Some(Term::NamedNode(iri)) => Some(iri),
+            _ => None,
+        };
+        if let Some(path) = path.and_then(|path| sparql::path_expression(path, &iri)) {
+            parser = parser.with_path_variable(Variable::new_unchecked(sparql::PATH), path);
         }
         let text = format!("{}{text}", self.prefixes(source));
-        let query = match Query::parse(&text, None) {
+        let query = match parser.parse_query(&text) {
             Ok(query) => query,
             Err(error) => {
                 self.error(shape, format!("a SPARQL query doesn't parse: {error}"));
                 return None;
             }
         };
+        // What is left of `$PATH` after parsing stands elsewhere than as a predicate, or in a
+        // node shape's query, which has no path (SHACL §5.2: ill-formed).
+        let mut uses_path = false;
+        query.pattern().on_used_variable(&mut |variable| {
+            uses_path |= variable.as_str() == sparql::PATH;
+        });
+        if uses_path {
+            let problem = match path {
+                Some(_) => "a SPARQL query uses $PATH other than as a predicate",
+                None => "a SPARQL query uses $PATH outside a property shape",
+            };
+            self.error(shape, problem);
+            return None;
+        }
         let pattern = match (&query, ask) {
             (Query::Ask { pattern, .. }, true) | (Query::Select { pattern, .. }, false) => pattern,
             _ => {
@@ -710,7 +724,7 @@ impl<V: ReadView> Compiler<'_, V> {
                 continue;
             };
             out.push(Constraint::Sparql(Box::new(SparqlCheck {
-                source: constraint,
+                source: Some(constraint),
                 component: Component::Sparql,
                 query,
                 ask: false,
@@ -836,30 +850,16 @@ impl<V: ReadView> Compiler<'_, V> {
                 messages if messages.is_empty() => component.messages.clone(),
                 messages => messages,
             };
-            // Every combination of the parameters' values.
-            let mut combinations: Vec<Vec<(Variable, TermId)>> = vec![Vec::new()];
-            for (variable, found) in &values {
-                combinations = combinations
-                    .into_iter()
-                    .flat_map(|chosen| {
-                        found.iter().map(move |&value| {
-                            let mut chosen = chosen.clone();
-                            chosen.push((variable.clone(), value));
-                            chosen
-                        })
-                    })
-                    .collect();
-            }
-            for parameters in combinations {
-                out.push(Constraint::Sparql(Box::new(SparqlCheck {
-                    source: validator,
-                    component: Component::Custom(component.node),
-                    query: query.clone(),
-                    ask,
-                    parameters,
-                    messages: messages.clone(),
-                })));
-            }
+            // One check for every combination of the parameters' values, which validation
+            // runs in turn: the values are kept, not multiplied out.
+            out.push(Constraint::Sparql(Box::new(SparqlCheck {
+                source: None,
+                component: Component::Custom(component.node),
+                query,
+                ask,
+                parameters: values,
+                messages,
+            })));
         }
     }
 }
