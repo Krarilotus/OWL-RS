@@ -12,7 +12,7 @@ d:petition-2 a ex:Petition ;
   ex:petitioner d:person-2 ;
   ex:submittedOn "1453-11-02"^^xsd:date ;
   prov:wasGeneratedBy d:extraction-1 .
-d:person-1 a ex:Person ; ex:name "Johannes Textor" .
+d:person-1 a ex:Person ; ex:name "Konrad Textor" .
 d:person-2 a ex:Person ; ex:name "Margarethe Weber"@de .
 
 d:extraction-1 a prov:Activity ;

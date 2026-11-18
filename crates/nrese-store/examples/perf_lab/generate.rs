@@ -1517,11 +1517,11 @@ fn sameas_giant(p: &Params, nt: &mut Nt, commits: &str) -> std::io::Result<Expec
     Ok(e)
 }
 
-/// A first commit into an empty store, as DMW loads its ontologies (its A/B harness's
-/// subclass chain, 21 Oct 2026): `classes` classes in a `rdfs:subClassOf` chain and
-/// `individuals` members of the last, as one INSERT DATA; with `ranged=1`, also a property
-/// with a range and one literal value, whose conclusion (the literal's type) no store holds
-/// (PR #46). The data file stays empty.
+/// A first commit into an empty store, as a data-modelling application loads its
+/// ontologies (its A/B harness's subclass chain, 21 Oct 2026): `classes` classes in a
+/// `rdfs:subClassOf` chain and `individuals` members of the last, as one INSERT DATA; with
+/// `ranged=1`, also a property with a range and one literal value, whose conclusion (the
+/// literal's type) no store holds (PR #46). The data file stays empty.
 fn first_load(p: &Params, commits: &str) -> std::io::Result<Expect> {
     let (classes, individuals) = (p.get("classes", 250), p.get("individuals", 400));
     let t = |s: &str, p: &str, o: &str| format!("{s} {p} {o} .");

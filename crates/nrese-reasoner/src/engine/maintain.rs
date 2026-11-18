@@ -311,8 +311,8 @@ pub fn maintain_with(
     // ([`delta::introduced_violations`]): an axiom's violation from before stays tolerated.
     // The delta executor built one job per ground rule and copied each job's matches
     // before the round ran: a 250-class subclass chain with 400 individuals held 757 MiB in
-    // a round that derived nothing, where a materialisation holds about 140 (DMW's A/B,
-    // fleet pm-dmwab-3, 21 Oct 2026). Not over a compact stack: its closure lists
+    // a round that derived nothing, where a materialisation holds about 140 (a downstream
+    // application's A/B, 21 Oct 2026). Not over a compact stack: its closure lists
     // equalities over representatives, which the datatype checks don't read as the delta's
     // expanded ones. A fact no store holds (a literal subject) is new to the
     // state where the axioms' own closure concludes none, as the state before held only
@@ -1529,7 +1529,7 @@ mod tests {
             let rdf_type = iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
             let subclass = iri("http://www.w3.org/2000/01/rdf-schema#subClassOf");
             let disjoint = iri("http://www.w3.org/2002/07/owl#disjointWith");
-            // A subclass chain of 20 with 10 individuals at the bottom (DMW's chain, small).
+            // A subclass chain of 20 with 10 individuals at the bottom (an A/B's, small).
             let class = |n: usize| iri(&format!("http://example.com/C{n}"));
             let mut facts: Vec<Triple> = (1..20)
                 .map(|n| [class(n), subclass, class(n - 1)])

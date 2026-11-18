@@ -27,7 +27,7 @@ Ontology reasoning is what NRESE is built to be best at. Load, storage and plain
 | **Wikidata classes** (P31/P279 slice) | Real | server-scale | The largest real class hierarchy; needs the big machine |
 | **ORE 2015 corpus** (1,920 ontologies; EL and DL tracks) | Real ontologies | subsets by size | Classification and consistency across what people actually build (BioPortal, the Oxford library, web crawl) |
 | **Large biomedical TBoxes** (GO, ChEBI, UBERON, NCIt) | Real | 10⁴–10⁵ classes | EL classification at scale (the ELK use case); SNOMED CT only if a licence is available |
-| **Our own ontologies** (the RG ontology, DMW models) | Real | small, rich | The editing workflows NRESE serves; used for RT4, RT5 and RT7 |
+| **Our own ontologies** (the RG ontology, a data-modelling application's models) | Real | small, rich | The editing workflows NRESE serves; used for RT4, RT5 and RT7 |
 | **RG × GS × GND integration** (HisQu; §7) | Real: three sources linked by `owl:sameAs`, aligned on the GND ontology, ten competency questions | example (21 k statements), cohort, full (83 k GS persons and the complete GND person and place files) | Identity reasoning over real links, where the closure and the answers grow with the identity groups. The project needed a large heap on Fuseki for it |
 
 ## 3. Systems

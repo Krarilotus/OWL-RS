@@ -221,8 +221,8 @@ def write_scaling(root: Path, tier: str, settings: dict) -> Plan:
 
 def clients(root: Path, tier: str, settings: dict) -> Plan:
     return Plan("clients", tier, kind="kit", systems={"nrese"},
-                unavailable="needs the ResearchSpace stack (ops/researchspace) and a DMW instance: "
-                            "run scripts/smoke-researchspace.sh and scripts/smoke-dmw-export.sh by hand")
+                unavailable="needs the ResearchSpace stack (ops/researchspace) and a data-modelling application: "
+                            "run scripts/smoke-researchspace.sh and scripts/smoke-module-export.sh by hand")
 
 
 def fast_data_name(spec: str) -> str:

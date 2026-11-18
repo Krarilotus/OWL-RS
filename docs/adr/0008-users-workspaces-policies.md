@@ -19,7 +19,7 @@ evaluation, but:
   installation has no users at all.
 
 The use cases ahead: ResearchSpace (projects of researchers, drafts, review, publication),
-the datamodel workflow (reviewed data written by a service account), research groups
+a data-modelling application (reviewed data written by a service account), research groups
 sharing a server, and single users on a desktop.
 
 How others do it: GraphDB grants per repository (read/write) and, since 10.x, per graph
@@ -38,7 +38,7 @@ API and the UI manage, with an audit log.
   whoever they share it with. Drafts live there until they are moved (an update) into a
   shared workspace.
 - **Roles stay for organisation-wide rules** (as the policy file has them today):
-  readers of the public graphs, the datamodel workflow's service account, auditors. A
+  readers of the public graphs, the data-modelling application's service account, auditors. A
   user's rights are the union of its roles' and its memberships'; an explicit deny in a
   role still wins.
 - **Policies are store state:** users, workspaces, memberships and role rules are kept
@@ -62,7 +62,7 @@ API and the UI manage, with an audit log.
 - A policy change takes effect for the next request, without a restart; cached query
   results are keyed by the access they were computed for (already the case).
 - ResearchSpace's own users and groups map onto these (by token claims or by
-  provisioning through the API); the datamodel workflow gets a service account with a
+  provisioning through the API); the data-modelling application gets a service account with a
   role.
 
 ## Implementation (2 October)

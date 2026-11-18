@@ -79,7 +79,7 @@ The order the families are measured in ([suite/schedule.toml](suite/schedule.tom
 | 3 | w3c-sparql11 | ready | 2026-10-09 | W3C SPARQL 1.1 test suite: query, update, syntax, result formats |
 | 4 | w3c-shacl | ready | 2026-10-09 | W3C SHACL test suite |
 | 5 | geosparql | partial | 2026-10-09 | GeoSPARQL compliance benchmark (206 queries); Geographica 2 for performance |
-| 6 | clients | ready | - | ResearchSpace on the store; the Datamodel Workflow's export protocol |
+| 6 | clients | ready | - | ResearchSpace on the store; a data-modelling application's export protocol |
 
 ## Coverage
 
@@ -470,7 +470,7 @@ partial, performance; tasks basics, RT1, RT3; kit `benches/fast` (suite driver);
 | rl-clique~owl-horst (extra) | · | · | · | · | · | · | part 10-06† | · | · | · | · | · |
 | rule cases~owl2-rl (extra) | · | · | · | · | · | · | · | · | · | · | · | · |
 
-### clients: ResearchSpace on the store; the Datamodel Workflow's export protocol
+### clients: ResearchSpace on the store; a data-modelling application's export protocol
 
 ready, conformance; tasks integration; kit `scripts` (suite driver); checked by: the scripts' assertions.
 

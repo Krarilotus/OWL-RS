@@ -97,7 +97,7 @@ fn the_configured_settings_hold_through_start_up_and_a_draft_check() {
     let reply = runtime.block_on(async {
         let declared = call(&app, Method::GET, "/api/v1/draft-check/capabilities", None).await;
         let request = json!({
-            "protocol": "dmw-store-check/1",
+            "protocol": "store-check/1",
             "operation": "shacl",
             "request_sha256": "a".repeat(64),
             "scope": {"project_id": "project", "owner_id": "owner"},
