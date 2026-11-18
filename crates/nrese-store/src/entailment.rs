@@ -165,15 +165,16 @@ impl StoreService {
             .by_representatives(config.equality_by_representatives)
             .storing_representatives(config.equality_compact);
         let report = self.operation_memory();
-        let done =
-            nrese_reasoner::engine::maintain_with(&compiled, None, &mut tx, &operation, &report)
-                .map_err(|interrupted| {
-                    memory
-                        .error(interrupted)
-                        .unwrap_or(StoreError::ProcessMemoryLimit {
-                            limit: nrese_exec::memory::process_limit().unwrap_or(0),
-                        })
-                })?;
+        let done = nrese_reasoner::engine::maintain_with(
+            &compiled, None, &mut tx, &operation, &report, false,
+        )
+        .map_err(|interrupted| {
+            memory
+                .error(interrupted)
+                .unwrap_or(StoreError::ProcessMemoryLimit {
+                    limit: nrese_exec::memory::process_limit().unwrap_or(0),
+                })
+        })?;
         Ok(!done.violations.consistent())
     }
 }

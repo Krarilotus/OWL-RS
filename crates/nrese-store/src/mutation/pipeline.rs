@@ -283,13 +283,24 @@ impl MutationPipeline {
             // The violations' list draws on the request's envelope: past it, the list stops
             // and the commit is still rejected (the change is inconsistent either way).
             let report_memory = Arc::new(envelope.part());
-            let (violations, materialisation, changed) =
-                crate::reasoning::apply_delta(program, cached, &mut tx, &operation, &report_memory)
-                    .map_err(|interrupted| {
-                        memory
-                            .error(interrupted)
-                            .map_or(MutationError::Cancelled, &store_error)
-                    })?;
+            // A rebuild's own report judges only over a state assessed consistent.
+            let base_consistent = matches!(
+                self.store.consistency(),
+                crate::ConsistencyStatus::Consistent
+            );
+            let (violations, materialisation, changed) = crate::reasoning::apply_delta(
+                program,
+                cached,
+                &mut tx,
+                &operation,
+                &report_memory,
+                base_consistent,
+            )
+            .map_err(|interrupted| {
+                memory
+                    .error(interrupted)
+                    .map_or(MutationError::Cancelled, &store_error)
+            })?;
             tracing::debug!(?materialisation, "commit-path materialisation");
             // Whether the closure the commit leaves leaves out a list axiom: its program's
             // whole list diagnostics (the report's are only the new ones). With no program at

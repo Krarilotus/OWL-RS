@@ -3,7 +3,8 @@
 //! Spec: README ("with reasoning on, it infers with every write and refuses a write found to
 //! make the data inconsistent") and OWL 2 RL's consistency rules (`cax-adc`, `cax-dw`,
 //! `prp-pdw`, OWL 2 Profiles §4.3): a write whose result breaks one is refused, and the store is
-//! left as it was; a write that breaks none, or only one that stood before it, commits.
+//! left as it was; a write that brings no clash commits, and in quarantine one that brings no
+//! new clash.
 //!
 //! Each case's commit is maintained by a rebuild (a split over a compact stack, a store with an
 //! inverse property expression, whose facts with a blank predicate no store holds, or a split
@@ -139,7 +140,7 @@ _:m2 <{RDF}rest> <{RDF}nil> .
         &pipeline(&store),
         "DELETE DATA { ex:alias owl:sameAs owl:AllDisjointClasses . }",
     );
-    let said = assert_refused_for(result, "cax-adc", "the alias delete");
+    assert_refused_for(result, "cax-adc", "the alias delete");
     assert_eq!(
         state(&store),
         before,
@@ -148,12 +149,6 @@ _:m2 <{RDF}rest> <{RDF}nil> .
     assert!(
         holds(&store, "ex:alias owl:sameAs owl:AllDisjointClasses"),
         "the equality the refused write deleted is still there"
-    );
-    // The rebuild reads the whole store, so the refusal names the way on where the clash
-    // stood before the write (as here: the base's rebuild missed it).
-    assert!(
-        said.contains("rematerialise the repository"),
-        "the refusal says how to go on: {said}"
     );
 }
 
@@ -250,7 +245,7 @@ fn a_change_through_an_inverse_that_leaves_no_clash_commits() {
 /// Valid OWL 2 DL: `DifferentIndividuals(ex:m1 ex:m2 ex:m3)` with `ex:m1 owl:sameAs ex:m2` is
 /// inconsistent (`eq-diff2`). As a store's first write under equality by representatives, with
 /// aliases that give the members' list 4 * 4 * 5 = 80 walks over every identity (past the
-/// 64-walk cap), the write is refused, as it is with fewer aliases or as a later write.
+/// 64-walk cap), the write is refused, as it is with fewer aliases.
 #[test]
 fn a_first_write_past_the_list_cap_is_judged_by_its_rebuild() {
     let store = store(false);
