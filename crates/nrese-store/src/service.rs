@@ -1541,6 +1541,8 @@ impl StoreService {
             .register(prepared.text(), prepared.origin(), cancellation);
         let memory = self.settings.query_envelope(prepared);
         let snapshot = self.query_view(prepared, &memory, cancellation)?;
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_DECIDED);
         let mut explanation =
             explain_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         if let Some(mode) = self.dl_mode(prepared, &snapshot) {
@@ -1597,6 +1599,8 @@ impl StoreService {
     ) -> StoreResult<crate::PlannedQuery> {
         let memory = self.settings.query_envelope(prepared);
         let snapshot = self.query_view(prepared, &memory, cancellation)?;
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_DECIDED);
         let mut planned =
             plan_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         let at = Revision::Committed(&snapshot);
