@@ -26,6 +26,7 @@ mod implicit_prefix_tests;
 mod inferred_access_tests;
 mod mutation_pipeline_tests;
 mod mutation_safety_tests;
+mod ql_assertion_tests;
 mod ql_rewriting_tests;
 mod quarantine_tests;
 mod query_cache_tests;
