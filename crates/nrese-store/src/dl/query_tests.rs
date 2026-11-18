@@ -1540,6 +1540,95 @@ fn a_read_whose_deadline_has_passed_gives_the_labels_no_time() {
     assert_eq!(counts(&read(true, hour).1).2, 12, "under the hour, all 12");
 }
 
+/// The unions' store of 24 individuals with a candidate limit of 4 and no `dl.timeout`, its
+/// view built.
+fn capped_unions_store() -> Arc<StoreService> {
+    let dl = crate::DlConfig {
+        max_candidates: Some(4),
+        timeout: None,
+        ..crate::DlConfig::default()
+    };
+    let store = unions_store_with(dl, 24, 0);
+    let _ = crate::dl::bounds::view(&store);
+    store
+}
+
+/// `SELECT ?x { ?x a :U0 }` with the request's `deadline`.
+fn request_until(deadline: Option<std::time::Instant>) -> crate::SparqlQueryRequest {
+    let mut request = crate::SparqlQueryRequest::all("SELECT ?x { ?x a <urn:test:U0> }");
+    request.deadline = deadline;
+    request
+}
+
+/// Spec: at the request's deadline a read is told incomplete with the rows it has, never an
+/// error. Over [`capped_unions_store`], a read whose request's deadline has passed returns
+/// the rows the read with no deadline returns (L's), decides none of its candidates (none
+/// refuted, 12 unresolved) and is not `complete`; with no deadline, 4 are refuted. Nothing
+/// waits; no time is measured.
+#[test]
+fn a_read_past_its_requests_deadline_is_told_incomplete_with_its_rows() {
+    let store = capped_unions_store();
+    let read = |deadline| {
+        let prepared = store.prepare_query(&request_until(deadline)).unwrap();
+        let mut out = Vec::new();
+        let status = store.run_query_dl(&prepared, &CancellationToken::new(), &mut out);
+        let status = status.expect("an answer, not an error");
+        (out, status.expect("a DL status"))
+    };
+    let (rows, (status, detail)) = read(Some(std::time::Instant::now()));
+    let (free_rows, (free, free_detail)) = read(None);
+    println!("passed {status:?} {detail:?}; no deadline {free:?} {free_detail:?}");
+    let bounds =
+        |s: &nrese_sparql::Completeness| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
+    let counts = |d: &crate::dl::DlDetail| (d.proved, d.refuted);
+    assert_eq!(
+        (bounds(&status), counts(&detail), status.complete),
+        (Some((12, 24, 12)), (0, 0), false)
+    );
+    assert_eq!(
+        (bounds(&free), counts(&free_detail)),
+        (Some((12, 24, 8)), (0, 4)),
+        "with no deadline"
+    );
+    assert_eq!(rows, free_rows, "the rows in hand");
+}
+
+/// Spec: the cancellation stays the operator's stop and an error, whether the request's
+/// deadline has passed or not: a read cancelled once its answers are decided ends
+/// `Cancelled`, never as an incomplete answer.
+#[test]
+fn an_operators_cancel_is_an_error_past_the_deadline_too() {
+    let store = capped_unions_store();
+    for deadline in [None, Some(std::time::Instant::now())] {
+        let prepared = store.prepare_query(&request_until(deadline)).unwrap();
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || cancel.cancel())));
+        let outcome = answer(
+            &store,
+            &store.engine().snapshot(),
+            &prepared,
+            &token,
+            &nrese_exec::Envelope::unlimited(),
+            DlAnswers::default(),
+        )
+        .err();
+        assert!(
+            token.is_cancelled(),
+            "{deadline:?}: the read was never cancelled"
+        );
+        assert!(
+            matches!(
+                outcome,
+                Some(StoreError::SparqlEvaluation(
+                    nrese_sparql::QueryEvaluationError::Cancelled
+                ))
+            ),
+            "{deadline:?}: {outcome:?}"
+        );
+    }
+}
+
 /// Spec: where the labels refute the rows the capped read would admit first, the read with
 /// them on admits no later row whose batch costs more, so it never needs more memory than the
 /// read with them off. Under `?x a :U0 . ?x a :U1`, the candidate limit 4: eight individuals

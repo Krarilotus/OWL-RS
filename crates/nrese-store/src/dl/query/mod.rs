@@ -297,7 +297,8 @@ impl Status {
 
 /// What can be said before running `prepared`: complete where every predicate it reads
 /// is closed; otherwise the bounds decide when it runs. `Cancelled` where the request stopped
-/// while it waited for another request's build of the bounds' view, which runs on and is kept.
+/// while it waited for another request's build of the bounds' view, which runs on and is kept;
+/// sound-only ([`DEADLINE`]) where the request's time was up instead.
 pub(crate) fn plan_status(
     store: &StoreService,
     snapshot: &Snapshot,
@@ -325,6 +326,11 @@ const PART: &str = "the reader sees part of the data: answers are checked agains
 const LATER: &str = "a later commit's bounds replaced this revision's while it was read: \
                      answers over the RL closure, not checked against the bounds";
 
+/// A read whose request's time was up before the view of its revision was built reads its RL
+/// closure: the build, another read's or none begun, isn't waited for.
+const DEADLINE: &str = "the request's time was up before the bounds' view of this revision was \
+                        built: answers over the RL closure, not checked against the bounds";
+
 /// [`Decided`] of `snapshot` for `prepared`.
 fn decided(
     store: &StoreService,
@@ -335,9 +341,28 @@ fn decided(
     if prepared.access().is_some() {
         return Ok(Err(PART));
     }
-    let view = super::bounds::view_until(store, snapshot, Some(&|| cancellation.is_cancelled()))
-        .ok_or(crate::QueryEvaluationError::Cancelled)?;
+    let up = || {
+        prepared
+            .deadline()
+            .is_some_and(|at| Deadline::at(at).passed())
+    };
+    let stop = || cancellation.is_cancelled() || up();
+    let Some(view) = super::bounds::view_until(store, snapshot, Some(&stop)) else {
+        // The operator's stop is the read's error; the request's time is a reason.
+        cancellation.check()?;
+        return Ok(Err(DEADLINE));
+    };
     Ok(view.map(|view| (snapshot.clone(), view)).ok_or(LATER))
+}
+
+/// The exact services' deadline for `prepared`: `dl.timeout` from now, or the request's own
+/// where that comes first.
+fn deadline_of(store: &StoreService, prepared: &PreparedQuery) -> Deadline {
+    let dl = Deadline::after(store.config().dl.timeout);
+    let sooner = prepared
+        .deadline()
+        .filter(|at| dl.instant().is_none_or(|by| *at < by));
+    sooner.map_or(dl, Deadline::at)
 }
 
 /// `status` composed once (`StoreService::assess`) on the data it was decided on: the
@@ -989,8 +1014,9 @@ pub(crate) fn answer(
     let analysis = analyse(prepared.query());
     // One view for the answers and their status: a commit in between changes neither.
     let decided = decided(store, snapshot, prepared, cancellation)?;
-    // The exact services' one deadline, the every-name question's included.
-    let read = (cancellation, Deadline::after(store.config().dl.timeout));
+    // The exact services' one deadline, the every-name question's included: at the request's,
+    // what they haven't decided is told undecided, and the checks below see only a stop.
+    let read = (cancellation, deadline_of(store, prepared));
     let mut outcome = match decided.as_ref() {
         Ok(at) => decide_answers(store, prepared, &analysis, at, read, memory, mode)?,
         Err(why) => Status::sound_only(*why).stream(Read::At(snapshot.clone())),

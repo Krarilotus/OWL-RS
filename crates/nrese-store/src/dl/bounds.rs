@@ -787,21 +787,19 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
     }
 }
 
-/// [`view`] of `snapshot` for a request, never another snapshot's (T3 (a)): given up
-/// (`None`) once `stop` fires, before it claims a build or while it waits for another
-/// read's, polled as `nrese_exec::cell::Build::wait_until` says; `Some(None)` where the
-/// bounds describe a later revision than `snapshot`, or the build failed. The build runs on
-/// and is kept; one this read claimed runs to its end whatever its stop says, as others may
-/// wait for it (a classification waiter's way, `classification::cached`).
+/// [`view`] of `snapshot` for a request, never another snapshot's (T3 (a)): one already
+/// built whatever `stop` says; else given up (`None`) once `stop` fires, before it claims a
+/// build or while it waits for another read's, polled as `nrese_exec::cell::Build::wait_until`
+/// says; `Some(None)` where the bounds describe a later revision than `snapshot`, or the build
+/// failed. The build runs on and is kept; one this read claimed runs to its end whatever its
+/// stop says, as others may wait for it (a classification waiter's way,
+/// `classification::cached`).
 pub(crate) fn view_until(
     store: &StoreService,
     snapshot: &Snapshot,
     stop: Option<&dyn Fn() -> bool>,
 ) -> Option<Option<Arc<View>>> {
     let bounds = &store.dl().bounds;
-    if stop.is_some_and(|stop| stop()) {
-        return None;
-    }
     let revision = snapshot.revision();
     let cached = || {
         lock(&bounds.view)
@@ -811,6 +809,9 @@ pub(crate) fn view_until(
     };
     if let Some(view) = cached() {
         return Some(Some(view));
+    }
+    if stop.is_some_and(|stop| stop()) {
+        return None;
     }
     let built = match bounds
         .views
