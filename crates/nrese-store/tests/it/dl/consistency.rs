@@ -281,3 +281,93 @@ fn a_disjoint_union_whose_operands_read_as_one_empties_its_class() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// The neighbours of [`a_disjoint_union_whose_operands_read_as_one_empties_its_class`]. Spec
+/// (*OWL 2 Direct Semantics* Table 6): a disjoint union of two classes keeps them disjoint, so
+/// an individual of both has no model and the commit is rejected. Spec (*OWL 2 Profiles* §4.3,
+/// theorem PR1, and table 9's cax-dw, which reads `:E owl:disjointWith :E` as written): an
+/// OWL 2 RL ontology whose one repeat is that binary disjointness stays on the rules' route,
+/// and an `:E` is still refused there. Each case's outcome printed.
+#[test]
+fn the_neighbours_of_a_repeated_disjoint_union_keep_their_refusal_and_their_route() {
+    let mut wrong = Vec::new();
+    let dl = pipeline();
+    insert(&dl, ":C owl:disjointUnionOf ( :A :B ) .").expect("schema");
+    let outcome = match insert(&dl, ":c a :A , :B .") {
+        Err(MutationError::Rejected(reject)) => format!("rejected: {}", reject.detail),
+        other => format!("not rejected: {other:?}"),
+    };
+    eprintln!("UNION NEIGHBOUR an individual of both operands: {outcome}");
+    if !outcome.starts_with("rejected") {
+        wrong.push(format!("an individual of both operands: {outcome}"));
+    }
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":Dog rdfs:subClassOf :Animal . :E owl:disjointWith :E . :rex a :Dog .",
+    )
+    .expect("an RL ontology");
+    let route = dl.store().dl_bounds().last;
+    let outcome = match insert(&dl, ":e a :E .") {
+        Err(MutationError::Rejected(reject)) => format!("rejected: {}", reject.detail),
+        other => format!("not rejected: {other:?}"),
+    };
+    eprintln!("UNION NEIGHBOUR the RL ontology: route {route:?}; an :E {outcome}");
+    if route != "rules" || !outcome.starts_with("rejected") {
+        wrong.push(format!("the RL ontology: route {route:?}; an :E {outcome}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (*OWL 2 Direct Semantics* Table 6; *Mapping to RDF* Table 16, every member of
+/// `owl:members` read): an `owl:AllDisjointClasses` naming `:A` twice among 101 classes
+/// empties `:A`, and an `owl:AllDisjointProperties` naming `:p` twice among 101 object
+/// properties empties `:p`, so an `:A`, or a `:p` edge, has no model and the commit is
+/// rejected. (A list this long is checked by the rules through an index of its members, not
+/// a rule per pair.) Each case's outcome printed.
+#[test]
+fn a_long_pairwise_disjointness_naming_a_member_twice_empties_it() {
+    let names = |prefix: &str| {
+        (0..100)
+            .map(|i| format!(":{prefix}{i}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let declared = (0..100)
+        .map(|i| format!(":q{i} a owl:ObjectProperty ."))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let mut wrong = Vec::new();
+    for (what, schema, data) in [
+        (
+            "classes",
+            format!(
+                "[] a owl:AllDisjointClasses ; owl:members ( :A {} :A ) .",
+                names("K")
+            ),
+            ":c a :A .",
+        ),
+        (
+            "properties",
+            format!(
+                ":p a owl:ObjectProperty . {declared} \
+                 [] a owl:AllDisjointProperties ; owl:members ( :p {} :p ) .",
+                names("q")
+            ),
+            ":a :p :b .",
+        ),
+    ] {
+        let dl = pipeline();
+        insert(&dl, &schema).expect("schema");
+        let route = dl.store().dl_bounds().last;
+        let outcome = match insert(&dl, data) {
+            Err(MutationError::Rejected(reject)) => format!("rejected: {}", reject.detail),
+            other => format!("not rejected: {other:?}"),
+        };
+        eprintln!("LONG REPEAT {what} (route {route:?}) then {data}: {outcome}");
+        if !outcome.starts_with("rejected") {
+            wrong.push(format!("{what} then {data}: {outcome}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
