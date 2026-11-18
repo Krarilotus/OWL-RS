@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use super::{Program, encode, pattern, storable, triple};
 use crate::delta::{self, Base, MemoryBase, VisitsBase};
 use crate::eval::{GroundProgram, OperationStop, Poller, Probe, Stopped, Visit};
-use crate::ir::{Triple, Violations};
+use crate::ir::{Head, Term, Triple, Violations};
 use crate::lists::ListDiagnostic;
 
 /// A transaction's state as the delta executor reads it: the committed indexes (asserted
@@ -220,6 +220,18 @@ pub struct Maintenance {
     pub work: delta::policy::Counts,
 }
 
+/// Whether a rule of `ground` concludes a fact whose predicate is no IRI, which no store
+/// holds ([`storable`]).
+fn concludes_unstorable(ground: &GroundProgram) -> bool {
+    // A predicate `p` is stored as a predicate only as an IRI, whatever the other terms.
+    ground.rules.iter().any(|rule| match &rule.head {
+        Head::Facts(atoms) => atoms
+            .iter()
+            .any(|atom| matches!(atom.0[1], Term::Const(p) if !storable([p, p, p]))),
+        Head::Inconsistent => false,
+    })
+}
+
 /// Keeps the transaction's inferred stack equal to the closure of its asserted state,
 /// given that it was before the transaction's changes: runs the delta executor and applies
 /// its result.
@@ -372,13 +384,23 @@ pub fn maintain_with(
         }
         deleted.sort_unstable();
         deleted.dedup();
+        // A rule of the base's program that concludes a fact with a blank node as its
+        // predicate (an inverse property expression's): no store holds that fact, so the
+        // stored closure lacks it and a delta can't read it. Such a change is rebuilt: the
+        // closure after it is the one a rebuild gives.
+        let unkept = !(first_load || inserted.is_empty() && deleted.is_empty())
+            && match ground {
+                Some(ground) => concludes_unstorable(ground),
+                None => concludes_unstorable(&program.ground_program(tx.base())),
+            };
         // A rebuild reads the asserted facts and writes the closure, both about the size
         // of the stored state; the policy offers it to a change that inserts nothing
         // ([`delta::policy::Plan::Rebuild`]).
         let policy = delta::policy::Policy {
-            force: program.plan,
-            rebuild: inserted
-                .is_empty()
+            force: unkept
+                .then_some(delta::policy::Plan::Rebuild)
+                .or(program.plan),
+            rebuild: (inserted.is_empty() || unkept)
                 .then(|| tx.base().len_in(ReadModel::Materialised)),
             split_rebuilds: program.stores_representatives(),
         };
