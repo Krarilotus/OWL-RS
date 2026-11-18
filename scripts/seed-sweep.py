@@ -5,6 +5,7 @@ seeded tests once per seed (NRESE_FUZZ_SEED), seed after seed, in the working tr
 
     python scripts/seed-sweep.py build [--targets FILE]
     python scripts/seed-sweep.py run OUT [--seeds 1-100000] [--first 52580,...] [--budget-min 27]
+    python scripts/seed-sweep.py verdict OUT [--seeds 1-100000] [--first 52580,...]
 
 `build` compiles every target's tests (release with debug assertions and overflow checks:
 release speed, the checks a debug build has). Each test run sits under its target's own memory
@@ -19,7 +20,8 @@ latest row stands is skipped: ok, FAILED, or CAP-REACHED at the target's current
 INTERRUPTED or BUILD-FAILED run, or a cap reached below a raised memory_mib, runs again. No
 new seed starts past the budget. A failure is data, never the chunk's end: the chunk exits 0
 and says FAILED with the seed, and every chunk's summary counts the sweep's findings so far,
-the earlier chunks' included (the queue goes on with the sweep).
+the earlier chunks' included (the queue goes on with the sweep). A sweep's job ends with `verdict`
+on each chunk: red for a finding or a seed not passed (18 Nov 2026: six failing seeds ended done).
 
 A failure found on a host under diagnosis (hosts.toml [[host.<key>.unstable]], the development machine since
 12 Oct 2026) is reproduced on another host before anyone acts on it.
@@ -188,19 +190,35 @@ def run(args) -> int:
     return 0
 
 
+def verdict(args) -> int:
+    """Red (1) for a finding, for a seed and target whose latest row doesn't stand as a pass (never run,
+    interrupted, unbuilt, no test, a cap below the target's), or for no seed or no target to judge."""
+    chosen, ts = seeds(args.seeds, args.first), targets(args.targets)
+    latest, red = recorded(Path(args.out) / "results.tsv"), [] if chosen and ts else ["no seed or no target"]
+    for seed in chosen:
+        for t in ts:
+            row = latest.get((str(seed), name(t)), ["", "", "not run"])
+            cap = row[4] if len(row) > 4 else ""
+            if row[2].startswith("FAILED(") or not final(row[2], cap, t.get("memory_mib", args.memory_mib)):
+                red.append(f"seed {seed} {name(t)}: {row[2]}")
+    print("; ".join(red) if red else "every seed and target passed", flush=True)
+    return 1 if red else 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--targets", type=Path, default=ROOT / "benches" / "seed-sweeps.toml")
     sub = p.add_subparsers(dest="command", required=True)
     sub.add_parser("build")
     r = sub.add_parser("run")
-    r.add_argument("out")
-    r.add_argument("--seeds", default="1-100000")
-    r.add_argument("--first", default="", help="seeds to run before the range, comma-separated")
+    for q in (r, sub.add_parser("verdict")):
+        q.add_argument("out")
+        q.add_argument("--seeds", default="1-100000")
+        q.add_argument("--first", default="", help="seeds to run before the range, comma-separated")
+        q.add_argument("--memory-mib", type=int, default=4000, help="a target's cap unless it sets memory_mib")
     r.add_argument("--budget-min", type=float, default=27)
-    r.add_argument("--memory-mib", type=int, default=4000, help="a target's cap unless it sets memory_mib")
     args = p.parse_args()
-    return {"build": build, "run": run}[args.command](args)
+    return {"build": build, "run": run, "verdict": verdict}[args.command](args)
 
 
 if __name__ == "__main__":
