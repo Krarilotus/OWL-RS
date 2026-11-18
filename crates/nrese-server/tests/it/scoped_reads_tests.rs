@@ -166,6 +166,66 @@ fn bindings(values: &[&str]) -> Rows {
 }
 
 #[tokio::test]
+async fn review_unscoped_search_and_scan_keep_separate_cached_answers() -> TestResult {
+    // Spec: A cached ordinary list scan cannot answer a later text search
+    // that uses the same projected variable and a blank argument list.
+    let app = app(
+        StoreConfig {
+            query_cache_bytes: 1024 * 1024,
+            ..StoreConfig::default()
+        },
+        false,
+    )?;
+    insert(
+        &app,
+        r#"ex:a <http://jena.apache.org/text#query> ex:args .
+           ex:args <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> "alpha" ;
+                   <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest>
+                   <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .
+           ex:b ex:q "alpha" ."#,
+    )
+    .await?;
+    for (argument, expected) in [
+        ("?l", bindings(&[A])),
+        ("_:l", bindings(&["<urn:ex:args>", "<urn:ex:b>"])),
+    ] {
+        let pattern = format!(
+            r#"{{ ?s <http://jena.apache.org/text#query> {argument} .
+                {argument} <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> "alpha" ;
+                           <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest>
+                           <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> }}"#
+        );
+        let answer = select(&app, &[], "", "?s", "", &pattern).await?;
+        assert_eq!(answer.rows(), expected, "list argument {argument}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_unscoped_path_keeps_the_mixed_text_group_a_scan() -> TestResult {
+    // Spec: Ordering a property path beside a mixed text group preserves
+    // the ordinary scan's result. A literal in another property gives no match.
+    use std::fmt::Write as _;
+
+    let app = app(StoreConfig::default(), false)?;
+    let mut data = r#"ex:a <http://jena.apache.org/text#query> "alpha" ;
+                           ex:p ex:target .
+                      ex:z ex:q "alpha" ; ex:p ex:target . "#
+        .to_owned();
+    // Increase matches of the unconstrained text predicate at one subject.
+    for value in 0..128 {
+        write!(data, "ex:z <http://jena.apache.org/text#query> {value} . ")?;
+    }
+    insert(&app, &data).await?;
+    let pattern = r#"{ ?s <http://jena.apache.org/text#query> [] .
+                       ?s <http://jena.apache.org/text#query> "alpha" .
+                       ?s ex:p+ ?o }"#;
+    let answer = select(&app, &[], "", "?s", "", pattern).await?;
+    assert_eq!(answer.rows(), bindings(&[A]), "path join");
+    Ok(())
+}
+
+#[tokio::test]
 async fn derivation_uses_only_dataset_graphs() -> TestResult {
     // Spec: Dataset-scoped inference derives a conclusion only when both premises are in
     // the dataset.
@@ -1106,6 +1166,43 @@ async fn scoped_preparation_preserves_an_ordinary_text_predicate() -> TestResult
         assert_eq!(reply.rows(), bindings(&[A]), "{pattern}");
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn review_scoped_joined_text_groups_keep_the_scan_rows() -> TestResult {
+    // Spec: When preparation joins two Jena-shaped groups into an ordinary
+    // BGP, a scoped request returns the same scan rows as an unscoped read.
+    let app = app(StoreConfig::default(), false)?;
+    insert(
+        &app,
+        r#"GRAPH :g1 { ex:a <http://jena.apache.org/text#query> "alpha" }"#,
+    )
+    .await?;
+    for between in ["", "VALUES ?unused { 1 }"] {
+        // The one-row VALUES keeps the groups separate through parsing.
+        let pattern = format!(
+            r#"{{ {{ ?s <http://jena.apache.org/text#query> "alpha" }}
+                   {between}
+                   {{ ?t <http://jena.apache.org/text#query> [] }} }}"#
+        );
+        let plain = select(&app, &[], "", "?s", G1, &pattern).await?.rows();
+        assert_eq!(plain, bindings(&[A]), "unscoped scan {pattern}");
+        let scoped = select(&app, &[], SCOPED, "?s", G1, &pattern).await?;
+        assert_eq!(scoped.rows(), plain, "scoped scan {pattern}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_scoped_graphdb_text_operator_is_refused() -> TestResult {
+    // Spec: Dataset-scoped GraphDB text search returns 501 and names the
+    // same problem type as other text search forms.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ ?s <http://www.ontotext.com/owlim/lucene#anyIndex> "alpha" }"#,
+        "store.search_scope",
+    )
+    .await
 }
 
 async fn scoped_preparation_refusal(options: &str, pattern: &str, problem: &str) -> TestResult {
