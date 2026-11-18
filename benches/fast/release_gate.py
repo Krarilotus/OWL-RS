@@ -785,9 +785,10 @@ def decide(parts: list[list[dict]]) -> dict:
 # The one file that accepts what the bar forbids, read at the candidate's commit by `verdict`
 # (release_verdict()), never from a report: a report holds what its harness tree held.
 POLICY_FILE = "benches/release-tradeoffs.toml"
-# Bar exceptions and trade-offs are the owner's alone; an entry carries the owner's words and
-# where they were said.
-OWNER = "Johannes"
+# Bar exceptions and trade-offs are the approver's alone, whom the candidate's policy file names
+# (`approver`), as it names the entries; the gate's code, the launching commit's, names nobody, so a
+# newer gate judges an older candidate by that candidate's file. An entry carries the approver's
+# words and where they were said.
 AUTHORITY_KEYS = {"approved", "by", "reason", "quote", "source"}
 TRADEOFF_KEYS = {"case", "dimension", "max_ratio", "pays_with"} | AUTHORITY_KEYS
 EXCEPTION_KEYS = {"case", "outcome"} | AUTHORITY_KEYS
@@ -807,17 +808,18 @@ class Policy(NamedTuple):
     errors: list[str]
     absences: tuple[dict, ...] = ()
     emerged: tuple[dict, ...] = ()
+    approver: str = ""
 
 
 NO_POLICY = Policy([], [], [])
 
 
-def authority_error(what: str, e: dict) -> str | None:
-    if e["by"] != OWNER:
-        return f"{what}: by {e['by']!r}: only {OWNER} approves what the bar forbids"
+def authority_error(what: str, e: dict, approver: str) -> str | None:
+    if e["by"] != approver:
+        return f"{what}: by {e['by']!r}: only the file's approver, {approver!r}, approves what the bar forbids"
     if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(e["approved"])) or not all(
             isinstance(e[k], str) and e[k].strip() for k in ("reason", "quote", "source")):
-        return f"{what}: an approval date (YYYY-MM-DD), a reason, {OWNER}'s quote and its source are required"
+        return f"{what}: an approval date (YYYY-MM-DD), a reason, the approver's quote and its source are required"
     return None
 
 
@@ -829,14 +831,16 @@ def load_policy(text: str) -> Policy:
     the cases (`cases`, or a `pattern` of their names) a baseline (`side`) isn't compared on, why,
     and the `port` planned to compare them. An emerged entry names a case, a dimension, optionally
     the baseline (`against`), and the largest candidate median (`max`, in the dimension's unit) a
-    cost appearing from below the counter's step may reach. Each carries the owner's approval:
-    `approved` (date), `by`, `reason`, `quote` (his words) and `source`."""
+    cost appearing from below the counter's step may reach. Each carries the approval of the file's
+    `approver`: `approved` (date), `by`, `reason`, `quote` (the approver's words) and `source`. A file
+    from before `approver` is read as approved by its entries' one name; two names are an error."""
     try:
         data = tomllib.loads(text)
     except tomllib.TOMLDecodeError as error:
         return Policy([], [], [f"not TOML: {error}"])
     tables = {"tradeoff", "exception", "absence", "emerged"}
-    errors = [f"unknown table {k!r} (tradeoff, exception, absence, emerged)" for k in sorted(set(data) - tables)]
+    errors = [f"unknown table {k!r} (tradeoff, exception, absence, emerged)"
+              for k in sorted(set(data) - tables - {"approver"})]
     tradeoffs, exceptions = data.get("tradeoff", []), data.get("exception", [])
     absences, emerged = data.get("absence", []), data.get("emerged", [])
     for key, entries in (("tradeoff", tradeoffs), ("exception", exceptions), ("absence", absences),
@@ -845,10 +849,15 @@ def load_policy(text: str) -> Policy:
             errors.append(f"{key}: an array of tables ([[{key}]]), not {type(entries).__name__}")
     if errors:
         return Policy([], [], errors)
+    names = {e["by"] for e in tradeoffs + exceptions + absences + emerged if isinstance(e.get("by"), str)}
+    approver = data.get("approver", next(iter(names)) if len(names) == 1 else None)
+    if (names or "approver" in data) and not (isinstance(approver, str) and approver.strip()):
+        return Policy([], [], ["the file's approver: an `approver` name, or in a file from before it its entries' "
+                               f"one name, not {data.get('approver')!r} and {sorted(names)}"])
     for i, e in enumerate(tradeoffs, start=1):
         if missing := TRADEOFF_KEYS - set(e):
             errors.append(f"trade-off {i}: missing {', '.join(sorted(missing))}")
-        elif error := authority_error(f"trade-off {i}", e):
+        elif error := authority_error(f"trade-off {i}", e, approver):
             errors.append(error)
         elif not (isinstance(e["max_ratio"], (int, float)) and e["max_ratio"] > 1):
             errors.append(f"trade-off {i}: max_ratio must be a number above 1")
@@ -857,7 +866,7 @@ def load_policy(text: str) -> Policy:
     for i, e in enumerate(exceptions, start=1):
         if missing := EXCEPTION_KEYS - set(e):
             errors.append(f"exception {i}: missing {', '.join(sorted(missing))}")
-        elif error := authority_error(f"exception {i}", e):
+        elif error := authority_error(f"exception {i}", e, approver):
             errors.append(error)
         elif e["outcome"] not in BAR_OUTCOMES:
             errors.append(f"exception {i}: outcome {e['outcome']!r}: an exception accepts "
@@ -866,7 +875,7 @@ def load_policy(text: str) -> Policy:
         scope = [k for k in ("cases", "pattern") if k in e]
         if missing := ABSENCE_KEYS - set(e):
             errors.append(f"absence {i}: missing {', '.join(sorted(missing))}")
-        elif error := authority_error(f"absence {i}", e):
+        elif error := authority_error(f"absence {i}", e, approver):
             errors.append(error)
         elif not (isinstance(e["side"], str) and e["side"] in cases_registry.BASELINES
                   and isinstance(e["port"], str) and e["port"].strip()):
@@ -878,14 +887,15 @@ def load_policy(text: str) -> Policy:
     for i, e in enumerate(emerged, start=1):
         if missing := EMERGED_KEYS - set(e):
             errors.append(f"emerged {i}: missing {', '.join(sorted(missing))}")
-        elif error := authority_error(f"emerged {i}", e):
+        elif error := authority_error(f"emerged {i}", e, approver):
             errors.append(error)
         elif (isinstance(e["max"], bool) or not isinstance(e["max"], (int, float))
               or not (math.isfinite(e["max"]) and e["max"] > 0)):   # TOML true is no limit
             errors.append(f"emerged {i}: max must be a finite number above 0")
         elif "against" in e and e["against"] not in cases_registry.BASELINES:
             errors.append(f"emerged {i}: against: a baseline (base, main)")
-    return Policy([], [], errors) if errors else Policy(tradeoffs, exceptions, [], tuple(absences), tuple(emerged))
+    return Policy([], [], errors) if errors else Policy(tradeoffs, exceptions, [], tuple(absences), tuple(emerged),
+                                                        approver or "")
 
 
 def emerged_accepted(policy: Policy, e: dict) -> dict | None:
@@ -3004,7 +3014,9 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
               f"{', '.join(s)}" for h, s in d["outside"].items()]
     evidence = list(evidence or [])
     lines += [f"- **not the candidate's**: {e}" for e in evidence]
-    lines += [f"- **policy**: {POLICY_FILE}: {e}" for e in policy.errors]
+    lines += [f"- **policy**: {POLICY_FILE}: {e}" for e in policy.errors] or [
+        f"- policy: {POLICY_FILE}: approver {policy.approver or 'none named'!r}; {len(policy.tradeoffs)} trade-offs, "
+        f"{len(policy.exceptions)} exceptions, {len(policy.absences)} absences, {len(policy.emerged)} emerged"]
     known, wrong = known_lines(timed, policy)
     lines += [f"- **wrong answer**: {w}" for w in wrong] + known
     errors = [e for rounds in parts for r in rounds for e in r["errors"]]
