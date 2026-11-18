@@ -620,17 +620,15 @@ fn update_body<B: Base + ?Sized>(
             backward = false;
         }
         overdeleted.extend(region_facts.iter().copied());
-        let mut seed = deleted.to_vec();
-        seed.extend(region_facts.iter().copied());
-        let mut extra = Store::new(seed.clone());
+        let mut extra = Store::new(deleted.iter().chain(&region_facts).copied().collect());
         let fact_schema_rules: Vec<Rule> = rules
             .schema_rules()
             .into_iter()
             .filter(|r| r.head != Head::Inconsistent)
             .collect();
         // The list rules of the pass's old state, read only when the delta holds a list
-        // fact: built then, over the state the pass started from (`seed`), as they follow
-        // the store's lists.
+        // fact: built then, over the state the pass started from (its deleted and region
+        // facts), as they follow the store's lists.
         let mut old_lists: Option<Vec<Rule>> = None;
         let mut vanished_done: HashSet<RuleKey> = HashSet::new();
         loop {
@@ -674,8 +672,11 @@ fn update_body<B: Base + ?Sized>(
                 };
                 let current: HashSet<RuleKey> =
                     rules.list_rules(&now).iter().map(rule_key).collect();
+                // A stop asked during that extraction is seen before the next one.
+                check_stop()?;
                 let old_lists = old_lists.get_or_insert_with(|| {
-                    let at_start = Store::new(seed.clone());
+                    let at_start =
+                        Store::new(deleted.iter().chain(&region_facts).copied().collect());
                     let old = Overlay {
                         base,
                         hidden: &inserted_set,
@@ -687,6 +688,8 @@ fn update_body<B: Base + ?Sized>(
                         .filter(|r| r.head != Head::Inconsistent)
                         .collect()
                 });
+                // And one asked during the second before its rules are walked.
+                check_stop()?;
                 for rule in old_lists.iter() {
                     let key = rule_key(rule);
                     if current.contains(&key) || !vanished_done.insert(key) {
