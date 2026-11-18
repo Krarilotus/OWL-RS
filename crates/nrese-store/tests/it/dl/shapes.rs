@@ -205,85 +205,86 @@ fn shacl_paths_and_lists_make_no_pun() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// The answer to a conclusion stating SHACL content, first by `sh:{name}`, over a consistent
-/// premise: undecided, saying what isn't decided and that the premise's reading stands.
-fn undecided(name: &str) -> Entailed {
-    Entailed::Unknown(format!(
-        "the conclusion states SHACL content (<http://www.w3.org/ns/shacl#{name}>): whether it \
-         is read as SHACL content or as OWL together with the premise isn't decided yet; the \
-         premise's own reading is unaffected"
-    ))
-}
-
-/// Spec (OWL 2 Direct Semantics: an ontology entails a conclusion only if it entails each of
-/// its axioms; SHACL content has no OWL meaning only where no other statement of premise and
-/// conclusion together names its property, a reading of the two together not decided yet): a
-/// conclusion of SHACL statements only, `:s sh:path :q`, is left undecided over a premise that
-/// doesn't name `sh:path`, not answered as one of annotations.
+/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
+/// conclusion together, the premise keeping its own reading; SHACL content, like an annotation,
+/// has no OWL meaning; OWL 2 Direct Semantics: an ontology entails a conclusion only if it
+/// entails each of its axioms): nothing in `:a a :C` names `sh:path`, so the conclusion's
+/// `:s sh:path :q` is SHACL content and adds no axiom: entailed.
 #[test]
-fn a_conclusion_of_shacl_statements_only_is_left_undecided() {
+fn a_conclusion_of_shacl_statements_is_answered_as_one_of_annotations() {
     let shacl = entailed(":a a :C .", ":s <http://www.w3.org/ns/shacl#path> :q .");
-    assert_eq!(shacl, undecided("path"));
+    assert_eq!(shacl, Entailed::Yes);
 }
 
-/// Spec (OWL 2 Direct Semantics: an ontology entails a conclusion only if it entails each of
-/// its axioms; whether a conclusion's SHACL content adds an axiom turns on premise and
-/// conclusion read together, not decided yet): a conclusion of `:s sh:path :q` and the entailed
-/// `:a a :C` is left undecided, not decided by the axiom alone.
+/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
+/// conclusion together; SHACL content has no OWL meaning; OWL 2 Direct Semantics: an ontology
+/// entails a conclusion only if it entails each of its axioms): with nothing naming `sh:path`,
+/// the conclusion's `:s sh:path :q` adds no axiom, so `:a a :C`, entailed, decides it. Read as a
+/// property assertion, `:s sh:path :q` wouldn't be entailed.
 #[test]
-fn a_conclusion_mixing_shacl_content_with_an_entailed_axiom_is_left_undecided() {
+fn a_conclusion_mixing_shacl_content_with_an_axiom_is_decided_by_the_axiom() {
     let conclusion = ":s <http://www.w3.org/ns/shacl#path> :q . :a a :C .";
-    assert_eq!(entailed(":a a :C .", conclusion), undecided("path"));
+    assert_eq!(entailed(":a a :C .", conclusion), Entailed::Yes);
 }
 
-/// Spec (OWL 2 Direct Semantics: a premise entails a conclusion only if each of the
-/// conclusion's axioms holds in every model of it; whether a conclusion's SHACL content is
-/// content or a statement read as any other turns on premise and conclusion read together, not
-/// decided yet, while the premise is read as on its own): `:s sh:path :q` is left undecided
-/// however the premise reads `sh:path`: given an OWL meaning (a declaration; a use as an
-/// individual; its SHACL content read as any other by an OWL axiom on `sh:class`), or held as
-/// SHACL content too.
+/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
+/// conclusion together, the premise keeping its own reading; SHACL content has no OWL meaning
+/// only where no statement that is neither SHACL content nor an annotation names a SHACL
+/// property of the content; OWL 2 Direct Semantics: a premise entails a conclusion only if each
+/// of its axioms holds in every model of the premise): where the premise names `sh:path` (a
+/// declaration; a use as an individual) or `sh:class`, which its own SHACL content uses (an OWL
+/// axiom on it), premise and conclusion together read every SHACL statement as any other, and
+/// `:s sh:path :q` is a property assertion the premise doesn't entail; where the premise holds
+/// `sh:path` only as SHACL content, nothing names it, and the conclusion is entailed.
 #[test]
-fn a_conclusion_stating_shacl_content_is_undecided_however_the_premise_reads_its_own() {
+fn a_conclusion_reads_shacl_content_as_its_premise_does() {
     let (path, class) = (
         "<http://www.w3.org/ns/shacl#path>",
         "<http://www.w3.org/ns/shacl#class>",
     );
     let rows = [
-        ("declaration", format!("{path} a owl:ObjectProperty .")),
+        (
+            "declaration",
+            format!("{path} a owl:ObjectProperty ."),
+            Entailed::No,
+        ),
         (
             "individual",
             format!(":p a owl:ObjectProperty . :x :p {path} ."),
+            Entailed::No,
         ),
         (
             "read as any other",
             format!(":a {path} :b ; {class} :C . {class} a owl:ObjectProperty ."),
+            Entailed::No,
         ),
-        ("SHACL content", format!(":a {path} :b .")),
+        ("SHACL content", format!(":a {path} :b ."), Entailed::Yes),
     ];
     let mut wrong = Vec::new();
-    for (what, premise) in rows {
+    for (what, premise, want) in rows {
         let answer = entailed(&premise, &format!(":s {path} :q ."));
         eprintln!("{what}: {answer:?}");
-        if answer != undecided("path") {
-            wrong.push(format!("{what}: {answer:?}"));
+        if answer != want {
+            wrong.push(format!("{what}: {answer:?}, not {want:?}"));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// Spec (OWL 2 Direct Semantics: a premise entails a conclusion only if each of the
-/// conclusion's axioms holds in every model of it; SHACL content has no OWL meaning only where
-/// no statement of premise and conclusion together that is neither SHACL content nor an
-/// annotation names a SHACL property of the content, a reading of the two together not decided
-/// yet): a conclusion stating SHACL content is left undecided whatever else it states and the
-/// premise names, the reason naming its first SHACL property: with the premise declaring
-/// `sh:path` and the conclusion stating `sh:path` and `sh:class`, declaring `sh:path` too or
-/// not; with the premise reading its own content as any other and the conclusion stating
-/// `sh:datatype`; with the premise declaring `sh:path` and the conclusion stating only
-/// `sh:class`.
+/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
+/// conclusion together, the premise keeping its own reading; SHACL content has no OWL meaning
+/// only where no statement that is neither SHACL content nor an annotation names a SHACL
+/// property of the content, else every statement is read as any other; OWL 2 Direct Semantics:
+/// a premise entails a conclusion only if each of its axioms holds in every model of the
+/// premise): where the premise declares `sh:path` and the conclusion states `sh:path`, all of
+/// the conclusion's SHACL content is read as any other, so `:s sh:class :q`, a property
+/// assertion the premise doesn't entail, leaves it unentailed, with the declaration in the
+/// conclusion or not; so where the premise reads its own SHACL content as any other and the
+/// conclusion states another SHACL property (`sh:datatype`). Where the premise declares
+/// `sh:path` and the conclusion states only `sh:class`, nothing names `sh:class`: its statement
+/// is SHACL content and the conclusion is entailed.
 #[test]
-fn a_conclusion_stating_shacl_content_is_undecided_whatever_else_it_states() {
+fn a_conclusion_reads_shacl_content_as_one_store_with_its_premise() {
     let sh = |name: &str| format!("<http://www.w3.org/ns/shacl#{name}>");
     let (path, class, datatype) = (sh("path"), sh("class"), sh("datatype"));
     let declared = format!("{path} a owl:ObjectProperty .");
@@ -292,25 +293,25 @@ fn a_conclusion_stating_shacl_content_is_undecided_whatever_else_it_states() {
             "declared, the conclusion declaring it too",
             format!("{declared} :s {path} :q ."),
             format!("{declared} :s {path} :q . :s {class} :q ."),
-            undecided("path"),
+            Entailed::No,
         ),
         (
             "declared",
             format!("{declared} :s {path} :q ."),
             format!(":s {path} :q . :s {class} :q ."),
-            undecided("path"),
+            Entailed::No,
         ),
         (
             "the premise's content read as any other",
             format!("{declared} :a {path} :b ."),
             format!(":s {datatype} :q ."),
-            undecided("datatype"),
+            Entailed::No,
         ),
         (
             "another property declared",
             declared.clone(),
             format!(":s {class} :q ."),
-            undecided("class"),
+            Entailed::Yes,
         ),
     ];
     let mut wrong = Vec::new();
