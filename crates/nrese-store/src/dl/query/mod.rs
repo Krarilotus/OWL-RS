@@ -1247,10 +1247,15 @@ fn decide_answers(
                 ),
                 false => nrese_exec::ChargedVec::new(memory.clone()),
             };
-            // No row past the capped read's first ones is admitted where its batches cost more.
+            // The capped read's costliest batch, in bytes: no batch past its rows costs more.
             let most = |b: &[usize]| b.chunks(64).map(|c| c.iter().sum::<usize>()).max();
-            let prefix = most(&gap.bytes[..limit.min(gap.bytes.len())]);
-            let own = refuted.iter().take(limit).filter(|&&r| !r).count();
+            let first = limit.min(gap.bytes.len());
+            let prefix = most(&gap.bytes[..first]).unwrap_or(0);
+            // The capped read's batches first, each as the rows the labels leave of it.
+            let kept = |s| (s..first.min(s + 64)).filter(|&i| refuted.get(i) != Some(&true));
+            let mut chunks: Vec<_> = (0..first).step_by(64).map(|s| kept(s).count()).collect();
+            chunks.retain(|&k| k > 0);
+            chunks.reverse();
             let (mut rows, mut bytes) = (refuted.iter(), refuted.iter());
             gap.rows.retain(|_| rows.next() != Some(&true));
             gap.bytes.retain(|_| bytes.next() != Some(&true));
@@ -1260,25 +1265,40 @@ fn decide_answers(
                 gap.keep(limit.saturating_add(super::UNRESOLVED_SHOWN));
             }
             let left = gap.total - by_labels;
-            let (admitted, width) = match limit.min(gap.rows.len()) {
-                n if most(&gap.bytes[..n]) > prefix => (own, 1),
-                n => (n, 64),
-            };
+            let n = limit.min(gap.rows.len());
             let mut counts = Counts {
                 lower: gap.lower,
                 upper: Some(gap.lower + gap.total),
                 refuted: by_labels,
                 by_labels,
-                unresolved: left.saturating_sub(admitted as u64),
                 ..Counts::default()
             };
-            let mut why = None;
-            pair.reserve_appends(admitted)?;
+            let (mut why, mut stop, mut start) = (None, None, 0);
+            pair.reserve_appends(n)?;
             // Bounds, candidate production and all batches share the entry deadline.
-            for start in (0..admitted).step_by(width) {
-                let end = (start + width).min(admitted);
+            while start < n {
+                // Past the capped read's batches: up to 64 rows within its costliest one's bytes,
+                // ending the tests where the next row doesn't fit or the request has no room.
+                let past = chunks.is_empty();
+                let end = match chunks.pop() {
+                    Some(kept) => start + kept,
+                    None => (start..=n.min(start + 64))
+                        .rfind(|&e| gap.bytes[start..e].iter().sum::<usize>() <= prefix)
+                        .unwrap_or(start),
+                };
+                if end == start {
+                    stop = Some(format!(
+                        "the next candidate's row costs more than {prefix} bytes"
+                    ));
+                    break;
+                }
                 let mut batch_memory = nrese_exec::Reservation::new(&*budget);
-                batch_memory.charge(gap.bytes[start..end].iter().sum())?;
+                let charged = batch_memory.charge(gap.bytes[start..end].iter().sum());
+                if past && let Err(e) = &charged {
+                    stop = Some(Limit::Envelope.reached(e));
+                    break;
+                }
+                charged?;
                 let rows: Vec<_> = gap.rows[start..end]
                     .iter()
                     .map(|&i| pair.upper_row(i))
@@ -1312,9 +1332,16 @@ fn decide_answers(
                         }
                     }
                 }
+                start = end;
             }
+            let admitted = start;
+            counts.unresolved += left.saturating_sub(admitted as u64);
             if left > admitted as u64 {
-                why.get_or_insert_with(|| Limit::Candidates.reached(limit));
+                // A stop is named beside an earlier batch's reason; without one, the limit is.
+                why = match (why, stop) {
+                    (Some(w), Some(s)) if w != s => Some(format!("{w}; {s}")),
+                    (w, s) => w.or(s).or_else(|| Some(Limit::Candidates.reached(limit))),
+                };
                 for &index in &gap.rows[admitted..] {
                     if status.detail.unresolved.len() == super::UNRESOLVED_SHOWN {
                         break;

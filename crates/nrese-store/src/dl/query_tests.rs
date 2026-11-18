@@ -1688,6 +1688,248 @@ fn rows_the_labels_leave_are_batched_no_costlier_than_the_capped_read() {
     assert!(!reached.is_empty(), "no limit reaches the case");
 }
 
+/// The pattern of [`promoted_store`]'s and [`past_prefix_store`]'s reads.
+const PROMOTED: &str = "?x a <urn:test:U0> . ?x a <urn:test:U1>";
+
+/// The unions store under [`PROMOTED`], a candidate limit of 64 and the labels on or off, with
+/// its gap in commit order (term-id order is the admission order): 60 short-named individuals
+/// with `v0` (`:a{k}`, each keeping one class assertion, which the labels refute), 4 with `v3`
+/// (`:b{k}`), then 100 with `v3` named a byte longer (`:c{k}x`). The capped read's first 64
+/// rows are the `a`s and `b`s; the labels leave the 4 `b`s of them, then the `c`s, whose rows
+/// cost more than the `a`s they follow. Each `v3` row's own test refutes it.
+fn promoted_store(model_labels: bool) -> Arc<StoreService> {
+    let mut data = String::new();
+    for k in 0..60 {
+        data.push_str(&format!(":a{k} :val :v0 .\n"));
+    }
+    for k in 0..4 {
+        data.push_str(&format!(":b{k} :val :v3 .\n"));
+    }
+    for k in 0..100 {
+        data.push_str(&format!(":c{k}x :val :v3 .\n"));
+    }
+    let dl = crate::DlConfig {
+        max_candidates: Some(64),
+        model_labels,
+        ..crate::DlConfig::default()
+    };
+    unions_store_of(dl, &data)
+}
+
+/// [`promoted_store`]'s read with the labels on and no memory limit: what decided it, its status.
+fn promoted_read() -> (crate::dl::DlDetail, nrese_sparql::Completeness) {
+    let (_, status) = unions_read_of(&promoted_store(true), PROMOTED, None).unwrap();
+    let (status, detail) = status.expect("a status");
+    println!("{status:?} {detail:?}");
+    (detail, status)
+}
+
+/// Spec: a read says the candidate limit stopped it only where that many candidates went to
+/// their tests. In [`promoted_read`] the labels refute 60 of the capped read's first 64 rows,
+/// and 104 candidates survive them: a reason names `dl.max_candidates` (64), and 64 of the
+/// survivors were tested (here each refuted by its test, so refuted less refuted by labels).
+#[test]
+fn the_candidate_limit_is_named_only_where_that_many_were_tested() {
+    let (detail, status) = promoted_read();
+    assert_eq!(detail.refuted_by_labels, 60, "the 60 `a`s");
+    let tested = detail.proved + detail.refuted - detail.refuted_by_labels;
+    for reason in status.reasons.iter().map(|r| &r.text) {
+        if reason.contains("dl.max_candidates reached") {
+            assert_eq!(tested, 64, "{reason}, with {tested} tested");
+        }
+    }
+    let named = |r: &String| r.contains("dl.max_candidates reached (64)");
+    assert!(
+        status.reasons.iter().map(|r| &r.text).any(named),
+        "the limit named: {:?}",
+        status.reasons
+    );
+}
+
+/// Spec: the survivors of the labels past the capped read's first rows are tested, in batches
+/// no costlier than its own, and fail no read: in [`promoted_read`] the labels leave 4 of the
+/// capped read's first 64 rows, and 64 survivors are tested, those 4 and 60 past them. Under
+/// each request memory limit from 16 KiB to 4 MiB (steps of a fiftieth), and in steps of 256
+/// bytes over the 16 KiB from the least limit the read is answered under with the labels off
+/// (found to 256 bytes), every read the first of a store just committed, a read answered with
+/// the labels off is answered with them on.
+#[test]
+fn survivors_past_the_capped_prefix_are_tested_and_fail_no_read() {
+    let (detail, _) = promoted_read();
+    let tested = detail.proved + detail.refuted - detail.refuted_by_labels;
+    assert_eq!(tested, 64, "the 4 left of the first 64, and 60 past them");
+    let first =
+        |labels: bool, limit: usize| unions_read_of(&promoted_store(labels), PROMOTED, Some(limit));
+    let (mut low, mut high) = (16usize << 10, 4usize << 20);
+    while high - low > 256 {
+        let middle = low + (high - low) / 2;
+        match first(false, middle) {
+            Ok(_) => high = middle,
+            Err(_) => low = middle,
+        }
+    }
+    let mut limits: Vec<usize> = (0..64).map(|k| high + k * 256).collect();
+    let mut limit = 16usize << 10;
+    while limit <= 4 << 20 {
+        limits.push(limit);
+        limit += limit / 50;
+    }
+    let mut answered = 0;
+    for limit in limits {
+        if first(false, limit).is_ok() {
+            answered += 1;
+            let with = first(true, limit);
+            assert!(
+                with.is_ok(),
+                "{limit} bytes: off answered, on {:?}",
+                with.err()
+            );
+        }
+    }
+    println!("off answered from {high} bytes, under {answered} limits; on under each");
+    assert!(answered > 0, "off answers under some limit");
+}
+
+/// The unions store under [`PROMOTED`] with a candidate limit of 4 and the labels on, its gap
+/// in commit order: 3 individuals with `v0` (`:a{k}`, refuted by the labels) and `:b0` with
+/// `v3`, the capped read's first 4 rows, then `past` with `v3` past them (`:c{k}`). The `a`s
+/// are named by IRIs longer by `pads.0` bytes, the `c`s by `pads.1`: with both 100000, the
+/// `c`s' rows together cost no more than the first 4 rows' batch, but each more than `:b0`'s,
+/// the one row the labels leave of them.
+fn past_prefix_store(pads: (usize, usize), past: usize) -> Arc<StoreService> {
+    let (pad, long) = ("x".repeat(pads.0), "x".repeat(pads.1));
+    let mut data = String::new();
+    for k in 0..3 {
+        data.push_str(&format!(":a{k}{pad} :val :v0 .\n"));
+    }
+    data.push_str(":b0 :val :v3 .\n");
+    for k in 0..past {
+        data.push_str(&format!(":c{k}{long} :val :v3 .\n"));
+    }
+    let dl = crate::DlConfig {
+        max_candidates: Some(4),
+        model_labels: true,
+        ..crate::DlConfig::default()
+    };
+    unions_store_of(dl, &data)
+}
+
+/// Spec: rows past the capped read's first ones never fail a read answered without them: a
+/// batch of them the request has no room for ends the tests there, its rows left unresolved for
+/// the request's memory. Over [`past_prefix_store`] with IRIs longer by 100000 bytes, without
+/// `c`s and with 3 (their one batch costing more than any one row), under each request memory
+/// limit from 64 KiB to 2 MiB (steps of a fiftieth), every read the first of a store just
+/// committed: where the read without the `c`s is answered, the read with them is answered. And
+/// the case is reached: some such read leaves the 3 `c`s unresolved, with the 3 `a`s refuted by
+/// the labels and `:b0` by its test, and a reason naming the request's memory envelope.
+#[test]
+fn a_batch_past_the_capped_prefix_without_room_leaves_its_rows_unresolved() {
+    use nrese_dl::limits::Limit;
+    let read = |past: usize, limit: usize| {
+        unions_read_of(
+            &past_prefix_store((100_000, 100_000), past),
+            PROMOTED,
+            Some(limit),
+        )
+    };
+    let (mut limit, mut reached) = (64usize << 10, Vec::new());
+    while limit <= 2 << 20 {
+        if read(0, limit).is_err() {
+            println!("{limit}: failed without the `c`s");
+            limit += limit / 50;
+            continue;
+        }
+        let (status, detail) = match read(3, limit) {
+            Ok((_, Some(status))) => status,
+            other => panic!(
+                "{limit} bytes: answered without the `c`s, with them {:?}",
+                other.err()
+            ),
+        };
+        let reasons: Vec<_> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+        let counts = (detail.refuted_by_labels, detail.refuted, detail.proved);
+        let unresolved = &detail.unresolved;
+        println!(
+            "{limit}: {counts:?}, {} unresolved, {reasons:?}",
+            unresolved.len()
+        );
+        if counts == (3, 4, 0)
+            && unresolved.len() == 3
+            && unresolved.iter().all(|r| r.contains("urn:test:c"))
+            && reasons
+                .iter()
+                .any(|r| Limit::named_in(r) == Some(Limit::Envelope))
+        {
+            reached.push(limit);
+        }
+        limit += limit / 50;
+    }
+    println!("the `c`s without room, the read answered, under {reached:?}");
+    assert!(!reached.is_empty(), "no limit reaches the case");
+}
+
+/// Spec: a candidate past the capped read's first rows whose row alone costs more than its
+/// costliest batch is in no batch: the tests end there, the read is answered, told incomplete,
+/// and says why by name. Over [`past_prefix_store`] with short-named `a`s and one `c` named by
+/// an IRI longer by 100000 bytes, with no memory limit: the 3 `a`s refuted by the labels,
+/// `:b0` by its test, `:c0` unresolved, and the reason "the next candidate's row costs more
+/// than" the batch's bytes.
+#[test]
+fn a_row_costlier_than_the_capped_batches_is_left_unresolved_and_named() {
+    let store = past_prefix_store((0, 100_000), 1);
+    let (_, status) = unions_read_of(&store, PROMOTED, None).unwrap();
+    let (status, detail) = status.expect("a status");
+    let reasons: Vec<_> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+    let counts = (detail.refuted_by_labels, detail.refuted, detail.proved);
+    println!(
+        "{counts:?}, {} unresolved, {reasons:?}",
+        detail.unresolved.len()
+    );
+    assert_eq!(counts, (3, 4, 0), "the `a`s by labels, `:b0` by its test");
+    assert!(detail.unresolved.len() == 1 && detail.unresolved[0].contains("urn:test:c0"));
+    assert!(!status.complete, "told incomplete");
+    let named = |r: &&str| r.contains("the next candidate's row costs more than");
+    assert!(
+        reasons.iter().any(named),
+        "the reason by name, in {reasons:?}"
+    );
+}
+
+/// Spec: where the tests past the capped read's first rows end, the read says why, beside what
+/// an earlier batch said: a stop is named even where a batch before it was left unresolved for
+/// a reason of its own. Over [`past_prefix_store`] with short-named `a`s and one `c` named by an
+/// IRI longer by 100000 bytes, under each request memory limit from 4 KiB to 2 MiB (steps of a
+/// fiftieth), every read the first of a store just committed: where the read is answered with
+/// the 3 `a`s refuted by the labels and both `:b0` and `:c0` unresolved (`:b0`'s batch without
+/// room for its run), its reasons name the request's memory envelope and "the next candidate's
+/// row costs more than". And the case is reached.
+#[test]
+fn a_stop_past_the_capped_rows_is_named_beside_an_earlier_reason() {
+    let (mut limit, mut reached) = (4usize << 10, Vec::new());
+    while limit <= 2 << 20 {
+        let store = past_prefix_store((0, 100_000), 1);
+        if let Ok((_, Some((status, detail)))) = unions_read_of(&store, PROMOTED, Some(limit)) {
+            let reasons: Vec<_> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+            let counts = (detail.refuted_by_labels, detail.refuted, detail.proved);
+            println!(
+                "{limit}: {counts:?}, {} unresolved, {reasons:?}",
+                detail.unresolved.len()
+            );
+            if counts == (3, 3, 0) && detail.unresolved.len() == 2 {
+                let both = |r: &&str| {
+                    r.contains("budgets.query_memory")
+                        && r.contains("the next candidate's row costs more than")
+                };
+                assert!(reasons.iter().any(both), "{limit} bytes: {reasons:?}");
+                reached.push(limit);
+            }
+        }
+        limit += limit / 50;
+    }
+    println!("`:b0` unresolved, then `:c0` stopped, both named, under {reached:?}");
+    assert!(!reached.is_empty(), "no limit reaches the case");
+}
+
 /// Four individuals `:m0`..`:m3`, each in `:C` and with `:p` to the literal `"v{k}"`, and the
 /// rows of `?x :p ?l` (`?x`, `?l`) over them.
 fn labels_store() -> (Arc<StoreService>, Vec<Vec<Option<Term>>>) {
