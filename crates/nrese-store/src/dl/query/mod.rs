@@ -1209,6 +1209,9 @@ fn decide_answers(
             // A query's candidate budget, unlimited where none is set.
             let config = &store.config().dl;
             let limit = config.max_candidates.unwrap_or(usize::MAX);
+            // The labels' one deadline, a quarter of what the read has left, fixed before their
+            // own work, the whole selection included.
+            let labels_deadline = Deadline::after(deadline.within(config.timeout).map(|t| t / 4));
             // The model's labels decide every gap row before the limit, so they read the whole
             // gap; where it has no room, the capped selection, with no labels.
             let whole = match config.model_labels {
@@ -1241,7 +1244,7 @@ fn decide_answers(
                     gap.rows.len(),
                     &|i| pair.upper_row(gap.rows[i]),
                     cancellation,
-                    deadline,
+                    labels_deadline,
                     memory,
                 ),
                 false => Vec::new(),
@@ -1251,6 +1254,9 @@ fn decide_answers(
             gap.rows.retain(|_| rows.next() != Some(&true));
             gap.bytes.retain(|_| bytes.next() != Some(&true));
             let by_labels = refuted.iter().filter(|&&r| r).count() as u64;
+            // From here the read holds what the capped selection would.
+            drop(refuted);
+            gap.keep(limit.saturating_add(super::UNRESOLVED_SHOWN));
             let left = gap.total - by_labels;
             let mut counts = Counts {
                 lower: gap.lower,

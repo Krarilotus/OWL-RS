@@ -19,7 +19,19 @@ pub(super) struct Gap<'a> {
     pub rows: Vec<usize>,
     /// Conservative decoded-row bytes, for reserving each decision batch before decoding.
     pub bytes: Vec<usize>,
-    _memory: Reservation<&'a Budget>,
+    memory: Reservation<&'a Budget>,
+}
+
+impl Gap<'_> {
+    /// Keeps the first `n` rows and gives back what the others held.
+    pub fn keep(&mut self, n: usize) {
+        self.rows.truncate(n);
+        self.bytes.truncate(n);
+        self.rows.shrink_to_fit();
+        self.bytes.shrink_to_fit();
+        let held = (self.rows.capacity() + self.bytes.capacity()) * size_of::<usize>();
+        self.memory.release(self.memory.bytes() - held);
+    }
 }
 
 fn row_hash(table: &IdTable, row: usize, state: &impl BuildHasher) -> u64 {
@@ -165,6 +177,6 @@ pub(super) fn select<'a>(
         total,
         rows,
         bytes,
-        _memory: memory,
+        memory,
     })
 }

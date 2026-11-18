@@ -210,8 +210,8 @@ fn row_tests(
 /// refutes: a row whose one test is `C(a)`, `C` a named class, with `C` not in `a`'s label (a
 /// model with `a` outside `C` is a countermodel of `C(a)`, *Direct Semantics* §2.5). The
 /// model is the consistency test's over the premise the tests read, within the store's DL
-/// limits and one deadline, a quarter of what the read has left (none where it has no
-/// limit); it refutes nothing unless it ended in a model, `Consistent`, nothing left out.
+/// limits and `deadline`, the labels' own, fixed before their work began; it refutes nothing
+/// unless it ended in a model, `Consistent`, nothing left out. Nothing refuted: no mask.
 #[expect(
     clippy::too_many_arguments,
     reason = "the request's limits travel with the rows"
@@ -229,14 +229,14 @@ pub(super) fn refuted_by_labels(
 ) -> Vec<bool> {
     use nrese_dl::tableau::{Answer, Cancel, Label, Want};
     let config = &store.config().dl;
-    let deadline = Deadline::after(deadline.within(config.timeout).map(|t| t / 4));
     let stop = || cancellation.is_cancelled() || deadline.passed();
-    let none = || vec![false; n];
+    let none = Vec::new;
     let (Some(shape), Ok(base)) = (&analysis.shape, ontology_at(store, snapshot)) else {
         return none();
     };
     let mut scratch = nrese_dl::memory::Scratch::new(Some(memory));
-    let atoms_bytes = n * std::mem::size_of::<Option<(u64, u64)>>();
+    // Per row: its atom, its class and individual (unzipped below), and its place in the mask.
+    let atoms_bytes = n * (size_of::<Option<(u64, u64)>>() + 2 * size_of::<u64>() + 1);
     let premise = || nrese_dl::memory::ontology_bytes(base.value()) + atoms_bytes;
     if scratch.charge(premise).is_err() {
         return none();
@@ -277,12 +277,16 @@ pub(super) fn refuted_by_labels(
     let Some(program) = entailment::compile(&ontology, &classes, &individuals, &mut scratch) else {
         return none();
     };
-    // The labels' storage while they are held: at most each class twice an individual.
-    let labels = individuals.len() * (std::mem::size_of::<Option<Label>>() + 8 * classes.len());
+    // The labels while they are held. A label's two `Vec<u32>`s each hold a class at most once
+    // (a node's label holds a concept once), so each allocates at most the next power of two
+    // of the classes, and at least 4 of them: a vector's least allocation.
+    let vector = 4 * classes.len().next_power_of_two().max(4);
+    let labels = individuals.len() * (size_of::<Option<Label>>() + 2 * vector);
     if stop() || scratch.charge(|| labels).is_err() {
         return none();
     }
-    let mut run = config.tableau(deadline.remaining(), config.memory_per_worker(1));
+    let mut run = config.tableau(None, config.memory_per_worker(1));
+    run.deadline = deadline.instant();
     run.memory = Some(memory.clone());
     run.cancel = Some(Cancel::from_flag(cancellation.flag()));
     run.workers = Some(nrese_exec::workers::Workers::current().limited(1));
@@ -297,7 +301,7 @@ pub(super) fn refuted_by_labels(
     if stop() || consistency::left_out(&ontology).is_some() {
         return none();
     }
-    let mut refuted = none();
+    let mut refuted = vec![false; n];
     for (r, atom) in atoms.iter().enumerate() {
         if r % 1024 == 0 && stop() {
             return none();
@@ -309,6 +313,9 @@ pub(super) fn refuted_by_labels(
         if let Some(label) = &labels.individuals[ai] {
             refuted[r] = label.classes.binary_search(&(ci as u32)).is_err();
         }
+    }
+    if stop() {
+        return none();
     }
     refuted
 }
