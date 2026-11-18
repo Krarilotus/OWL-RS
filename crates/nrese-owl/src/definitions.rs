@@ -59,7 +59,9 @@ pub(crate) fn unfolded(ontology: &Ontology) -> Unfolded {
                 }
             }
             Axiom::DisjointUnion(a, _) => {
-                excluded.insert(*a);
+                if let ClassExpr::Class(a) = ontology.class(*a) {
+                    excluded.insert(*a);
+                }
             }
             Axiom::HasKey(x, _, _) => names(ontology, *x, &mut |a| {
                 excluded.insert(a);
@@ -137,9 +139,8 @@ fn propositional(ontology: &Ontology, d: ExprId) -> bool {
 fn expressions(axiom: &Axiom) -> Vec<ExprId> {
     match axiom {
         Axiom::SubClassOf(a, b) => vec![*a, *b],
-        Axiom::EquivalentClasses(xs) | Axiom::DisjointClasses(xs) | Axiom::DisjointUnion(_, xs) => {
-            xs.clone()
-        }
+        Axiom::EquivalentClasses(xs) | Axiom::DisjointClasses(xs) => xs.clone(),
+        Axiom::DisjointUnion(c, xs) => std::iter::once(*c).chain(xs.iter().copied()).collect(),
         Axiom::ObjectPropertyDomain(_, x)
         | Axiom::ObjectPropertyRange(_, x)
         | Axiom::DataPropertyDomain(_, x)

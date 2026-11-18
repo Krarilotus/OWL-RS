@@ -585,12 +585,23 @@ impl Builder {
                 }
             }
             Axiom::DisjointUnion(class, parts) => {
-                let class = self.basic(Basic::Class(*class));
+                // Each part is in the class, read as a right side is: a named class included,
+                // `⊤` nothing to read, `⊥` unread as any `A ⊑ ⊥` is (`superclass`).
+                let class = match o.class(*class) {
+                    ClassExpr::Class(c) => Some(self.basic(Basic::Class(*c))),
+                    ClassExpr::Nothing => {
+                        self.unread.insert((*class, true));
+                        None
+                    }
+                    _ => None,
+                };
                 for &part in parts {
                     // A part the TBox reads only in part concludes the class only: nothing to
                     // record.
-                    for (left, _) in self.lefts(o, part, &mut true) {
-                        self.include(left, class, false);
+                    if let Some(class) = class {
+                        for (left, _) in self.lefts(o, part, &mut true) {
+                            self.include(left, class, false);
+                        }
                     }
                     // The direction from the class to the union isn't read:
                     // the union's existentials are each part's.

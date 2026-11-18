@@ -1251,7 +1251,8 @@ fn disjoint_operands_the_universal_property_makes_equal() {
     let a_value = b.e(ClassExpr::HasValue(top, 100));
     let mut parts = vec![a_value, b_value];
     parts.sort();
-    b.axiom(Axiom::DisjointUnion(1, parts));
+    let class = b.e(ClassExpr::Class(1));
+    b.axiom(Axiom::DisjointUnion(class, parts));
     assert_eq!(answer(&b.o), Answer::Inconsistent);
 }
 

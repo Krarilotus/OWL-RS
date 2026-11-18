@@ -283,7 +283,10 @@ fn push_expressions(axiom: &Axiom, out: &mut Vec<u32>) {
         Axiom::EquivalentClasses(xs) | Axiom::DisjointClasses(xs) => {
             out.extend(xs.iter().map(|x| x.0))
         }
-        Axiom::DisjointUnion(_, xs) => out.extend(xs.iter().map(|x| x.0)),
+        Axiom::DisjointUnion(c, xs) => {
+            out.push(c.0);
+            out.extend(xs.iter().map(|x| x.0));
+        }
         Axiom::ObjectPropertyDomain(_, x)
         | Axiom::ObjectPropertyRange(_, x)
         | Axiom::DataPropertyDomain(_, x)
@@ -447,7 +450,6 @@ fn entities_of<'w>(o: &Ontology, axiom: &Axiom, walk: &'w mut Walk) -> &'w [Term
                 out.push(*t);
             }
         }
-        Axiom::DisjointUnion(c, _) => out.push(*c),
         Axiom::SubObjectPropertyOf(chain, sup) => {
             out.extend(chain.iter().map(p));
             out.push(sup.named());

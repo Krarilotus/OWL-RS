@@ -194,7 +194,7 @@ impl Rw<'_> {
             Axiom::SubClassOf(a, b) => Axiom::SubClassOf(self.expr(*a)?, self.expr(*b)?),
             Axiom::EquivalentClasses(xs) => Axiom::EquivalentClasses(self.exprs(xs)?),
             Axiom::DisjointClasses(xs) => Axiom::DisjointClasses(self.disjoint(xs)?),
-            Axiom::DisjointUnion(c, xs) => Axiom::DisjointUnion(*c, self.disjoint(xs)?),
+            Axiom::DisjointUnion(c, xs) => Axiom::DisjointUnion(self.expr(*c)?, self.disjoint(xs)?),
             Axiom::ClassAssertion(c, a) => Axiom::ClassAssertion(self.expr(*c)?, *a),
             Axiom::DataPropertyDomain(d, c) => Axiom::DataPropertyDomain(*d, self.expr(*c)?),
             Axiom::HasKey(c, rs, ds) => {
