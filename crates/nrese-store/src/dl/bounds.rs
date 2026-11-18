@@ -558,18 +558,19 @@ pub(crate) fn prepare(
 }
 
 /// Whether a statement's subject or object is a reserved name, which the reader leaves out,
-/// or a SHACL property (`nrese_owl::shacl_properties`), whose naming can make the reader read
-/// SHACL content as any other statement, or naming no more, read it as SHACL content again
+/// or it names a SHACL property (`nrese_owl::shacl_properties`) anywhere, which can change
+/// whether the reader reads SHACL content as content or as any other statement
 /// (`Ontology::shacl`).
-fn reserved_named(tx: &Transaction<'_>, [s, _, o]: Triple) -> bool {
-    let reserved = |t| match tx.decode(TermId::from_raw(t)) {
+fn reserved_named(tx: &Transaction<'_>, [s, p, o]: Triple) -> bool {
+    let named = |t, reserved: bool| match tx.decode(TermId::from_raw(t)) {
         Some(nrese_rdf::Term::NamedNode(n)) => {
             let iri = n.as_str();
-            nrese_owl::diagnostics::reserved_name(iri) || nrese_owl::is_shacl_property(iri)
+            nrese_owl::is_shacl_property(iri)
+                || (reserved && nrese_owl::diagnostics::reserved_name(iri))
         }
         _ => false,
     };
-    reserved(s) || reserved(o)
+    named(s, true) || named(o, true) || named(p, false)
 }
 
 /// Whether deleting a statement may change its property's kind for the reader: a literal

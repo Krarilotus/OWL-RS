@@ -175,10 +175,16 @@ impl Ontology {
 
 /// Reads the ontology of `statements` (any graphs, the union of them).
 pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
+    read_beside(statements, &[], terms)
+}
+
+/// [`read`], its SHACL rule ([`Ontology::shacl`]) over `beside` and `statements` as one source:
+/// a conclusion's read beside its premise's statements, which are read for nothing else.
+pub fn read_beside(statements: &[Statement], beside: &[Statement], terms: &dyn Terms) -> Ontology {
     let vocabulary = Vocabulary::new(&|iri| terms.iri(iri));
     let mut reader = Reader::new(statements, terms, vocabulary);
     reader.declarations();
-    reader.shacl();
+    reader.shacl(beside);
     reader.axioms();
     reader.finish()
 }
@@ -709,25 +715,33 @@ impl<'a> Reader<'a> {
 
     /// The terms of the SHACL content ([`Ontology::shacl`]): none where a statement that is
     /// neither SHACL content nor an annotation names one, which gives it an OWL meaning, so
-    /// the source reads as any other.
-    fn shacl(&mut self) {
+    /// the source reads as any other. The rule is over `beside` and the source as one: the
+    /// properties either uses as content, and either's annotation declarations (of an IRI, as
+    /// [`Self::declarations`] reads them).
+    fn shacl(&mut self, beside: &[Statement]) {
         let (terms, statements) = (self.terms, self.statements);
         let vocabulary: HashSet<Term> = shacl_properties().filter_map(|i| terms.iri(&i)).collect();
         let content = |[_, p, _]: [Term; 3]| vocabulary.contains(&p).then_some(p);
-        let found: BTreeSet<Term> = statements
-            .iter()
-            .filter_map(|s| content(s.triple))
-            .collect();
+        let all = || statements.iter().chain(beside);
+        let found: BTreeSet<Term> = all().filter_map(|s| content(s.triple)).collect();
+        let mut declared = AnnotationProperties::new(&mut |i| terms.iri(i));
+        for s in beside {
+            declared.read(s.triple, self.kind(s.triple[0]) == TermKind::Iri);
+        }
         let named = !found.is_empty()
-            && statements.iter().any(|s| {
+            && all().any(|s| {
                 let [subject, p, o] = s.triple;
                 content(s.triple).is_none()
                     && !self.declared_as(p, EntityKind::AnnotationProperty)
+                    && !declared.contains(p)
                     && !self.is_builtin_annotation(p)
                     && (found.contains(&subject) || found.contains(&o))
             });
         if !named {
-            self.shacl = found;
+            self.shacl = statements
+                .iter()
+                .filter_map(|s| content(s.triple))
+                .collect();
         }
     }
 

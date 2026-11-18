@@ -381,7 +381,7 @@ impl StoreService {
         let snapshot = self.engine().snapshot();
         let memory = self.envelope(None);
         // Undecided where the request's envelope can't take reading the premise (SYN-61).
-        let Ok(premise) = source::read_snapshot(&snapshot, memory.clone()) else {
+        let Ok((premise, read_statements)) = source::read_premise(&snapshot, memory.clone()) else {
             let why = source::refused("the premise");
             return Ok(DlEntailment {
                 answer: Entailed::Unknown(format!("the premise: {why}")),
@@ -390,21 +390,9 @@ impl StoreService {
         };
         let budget = gate::budget(self, None, &memory);
         let checked = consistency::check(&premise, &budget);
-        // Over a consistent premise, a conclusion stating SHACL content is left undecided: whether
-        // it reads as SHACL content or as any other statement turns on the premise and the
-        // conclusion read together (`nrese_owl::Ontology::shacl`), which isn't decided yet.
-        let shacl = conclusion
-            .iter()
-            .find(|t| nrese_owl::is_shacl_property(t.predicate.as_str()));
-        if checked.verdict != Verdict::Consistent || shacl.is_some() {
-            let answer = match (&checked.verdict, shacl) {
-                (Verdict::Unknown(why), _) => Entailed::Unknown(format!("the premise: {why}")),
-                (Verdict::Consistent, Some(t)) => Entailed::Unknown(format!(
-                    "the conclusion states SHACL content ({}): whether it is read as SHACL \
-                     content or as OWL together with the premise isn't decided yet; the \
-                     premise's own reading is unaffected",
-                    t.predicate
-                )),
+        if checked.verdict != Verdict::Consistent {
+            let answer = match &checked.verdict {
+                Verdict::Unknown(why) => Entailed::Unknown(format!("the premise: {why}")),
                 _ => Entailed::Yes,
             };
             return Ok(DlEntailment {
@@ -455,8 +443,11 @@ impl StoreService {
         };
         let decode = |term| tx.decode(term);
         let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
-        let read = nrese_owl::read(
+        // The conclusion reads SHACL content as one source of it and the premise would
+        // (`nrese_owl::read_beside`); the premise keeps its own reading.
+        let read = nrese_owl::read_beside(
             &statements,
+            &read_statements,
             &source::StoreTerms {
                 decode: &decode,
                 lookup: &lookup,
