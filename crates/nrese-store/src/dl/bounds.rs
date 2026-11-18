@@ -498,7 +498,9 @@ pub(crate) fn prepare(
                     }
                 }
             }
-            Err(_) if !asserted().any(|t| changes_schema(tx, t)) => {
+            // A change naming a reserved name or a SHACL property may change what the reader
+            // reads (`reserved_named`): U1 is built again.
+            Err(_) if !asserted().any(|t| changes_schema(tx, t) || reserved_named(tx, t)) => {
                 return Preparation {
                     base,
                     prepared: Prepared::Unavailable,

@@ -442,20 +442,20 @@ impl StoreService {
             });
         };
         let decode = |term| tx.decode(term);
-        // The conclusion reads SHACL content as the premise does: a SHACL property it states
-        // that an axiom of the premise names has an OWL meaning, so its statements are read as
-        // any other's (the reader looks the SHACL vocabulary up only to find its content).
+        // The conclusion reads SHACL content as one store of it and the premise would
+        // (`nrese_owl::Ontology::shacl`): where it states SHACL content and the premise reads its
+        // own as any other (a SHACL property as an axiom's predicate), or an axiom of the premise
+        // names a SHACL property it states, every statement of it is read as any other (the
+        // reader looks the SHACL vocabulary up only to find its content); else as it reads alone.
         let id = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
-        let stated = |t: u64| statements.iter().any(|s| s.triple[1] == t);
-        let named = |t: u64| {
-            premise
-                .sources
-                .iter()
-                .flatten()
-                .any(|s| s.triples.iter().any(|x| x.contains(&t)))
-        };
-        let owl = |iri: &str, t: u64| nrese_owl::is_shacl_property(iri) && stated(t) && named(t);
-        let lookup = |iri: &str| id(iri).filter(|t| !owl(iri, t.raw()));
+        let shacl: Vec<u64> = nrese_owl::shacl_properties()
+            .filter_map(|i| Some(id(&i)?.raw()))
+            .collect();
+        let stated = |t: &u64| shacl.contains(t) && statements.iter().any(|s| s.triple[1] == *t);
+        let names = |&[s, p, o]: &[u64; 3]| shacl.contains(&p) || stated(&s) || stated(&o);
+        let mut triples = premise.sources.iter().flatten().flat_map(|s| &s.triples);
+        let owl = shacl.iter().any(stated) && triples.any(names);
+        let lookup = |iri: &str| id(iri).filter(|_| !(owl && nrese_owl::is_shacl_property(iri)));
         let read = nrese_owl::read(
             &statements,
             &source::StoreTerms {
