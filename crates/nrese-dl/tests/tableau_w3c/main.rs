@@ -598,9 +598,10 @@ fn consistent_answers_are_certified() {
 /// Spec (*OWL 2 Direct Semantics* Table 6: `DisjointUnion(C C1 … Cn)` holds where `C`'s
 /// extension is the union of the `Ci`'s and they are pairwise disjoint; Table 2: `owl:Thing` is
 /// the domain, `owl:Nothing` empty): the certificate checker accepts a model of a disjoint union
-/// on `owl:Thing` whose parts cover the domain, and refuses one whose parts leave an element
-/// out, and one with an element of a part of a disjoint union on `owl:Nothing`, whatever a class
-/// named by those IRIs holds in the interpretation. Each case's failing axioms printed.
+/// on `owl:Thing` whose parts cover the domain, and one on `owl:Nothing` whose parts are empty
+/// in a domain that isn't; it refuses one whose parts leave an element out, and one with an
+/// element of a part of a disjoint union on `owl:Nothing`, whatever a class named by those IRIs
+/// holds in the interpretation. Each case's failing axioms printed.
 #[test]
 fn the_certificate_reads_a_disjoint_union_on_the_top_or_bottom_class_as_that_class() {
     const OWL: &str = "http://www.w3.org/2002/07/owl#";
@@ -616,6 +617,11 @@ fn the_certificate_reads_a_disjoint_union_on_the_top_or_bottom_class_as_that_cla
             "DisjointUnion(owl:Thing ex:A ex:B)",
             format!("2 elements; <{EX}A> = {{0}}; <{EX}B> = {{}}; <{OWL}Thing> = {{0}}"),
             false,
+        ),
+        (
+            "DisjointUnion(owl:Nothing ex:A ex:B)",
+            format!("2 elements; <{EX}A> = {{}}; <{EX}B> = {{}}"),
+            true,
         ),
         (
             "DisjointUnion(owl:Nothing ex:A ex:B)",

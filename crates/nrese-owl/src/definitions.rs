@@ -139,8 +139,10 @@ fn propositional(ontology: &Ontology, d: ExprId) -> bool {
 fn expressions(axiom: &Axiom) -> Vec<ExprId> {
     match axiom {
         Axiom::SubClassOf(a, b) => vec![*a, *b],
-        Axiom::EquivalentClasses(xs) | Axiom::DisjointClasses(xs) => xs.clone(),
-        Axiom::DisjointUnion(c, xs) => std::iter::once(*c).chain(xs.iter().copied()).collect(),
+        // A disjoint union's class is no filler, and a named one is excluded above.
+        Axiom::EquivalentClasses(xs) | Axiom::DisjointClasses(xs) | Axiom::DisjointUnion(_, xs) => {
+            xs.clone()
+        }
         Axiom::ObjectPropertyDomain(_, x)
         | Axiom::ObjectPropertyRange(_, x)
         | Axiom::DataPropertyDomain(_, x)
