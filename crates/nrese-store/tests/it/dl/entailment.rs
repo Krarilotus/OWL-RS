@@ -7,7 +7,7 @@ use nrese_store::dl::entailment::Entailed;
 
 use super::{PREFIXES, pipeline};
 
-fn turtle(text: &str) -> Vec<Triple> {
+pub(super) fn turtle(text: &str) -> Vec<Triple> {
     let prefixes = PREFIXES
         .split("PREFIX ")
         .filter(|p| !p.trim().is_empty())
