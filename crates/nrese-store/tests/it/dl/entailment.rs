@@ -151,3 +151,22 @@ fn a_conclusions_anonymous_individual_is_some_individual() {
         Entailed::Yes
     );
 }
+
+/// Spec (OWL 2 Direct Semantics: a declaration carries no meaning, an annotation property's
+/// none either; premise and conclusion are each read on their own): a conclusion declaring
+/// `:note` an annotation property, which the premise uses as an object property, is decided by
+/// its other statement: `:x a :A`, which holds in every model of the premise, is entailed;
+/// `:x a :B` is not.
+#[test]
+fn a_conclusions_annotation_declaration_of_a_premises_property_carries_no_meaning() {
+    let premise = ":x :note :y . :x a :A .";
+    let declared = ":note a owl:AnnotationProperty .";
+    assert_eq!(
+        entailed(premise, &format!("{declared} :x a :A .")),
+        Entailed::Yes
+    );
+    assert_eq!(
+        entailed(premise, &format!("{declared} :x a :B .")),
+        Entailed::No
+    );
+}
