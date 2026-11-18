@@ -1414,7 +1414,10 @@ impl<'a> Reader<'a> {
         if repeated {
             self.report(Diagnostic::RepeatedOperand);
         }
+        // Each axiom comes from the whole form: each gets its list's statements.
+        let collected = std::mem::take(&mut self.collected);
         for a in axioms {
+            self.collected.clone_from(&collected);
             self.add(a, triple);
         }
         repeated
