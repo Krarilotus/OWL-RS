@@ -16,7 +16,8 @@ type TestResult<T = ()> = Result<T, Box<dyn std::error::Error>>;
 
 const PREFIXES: &str = "PREFIX ex: <urn:ex:> PREFIX : <urn:graph:>
     PREFIX owl: <http://www.w3.org/2002/07/owl#>
-    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
+    PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
 const POLICY: &str = r#"
 default = "deny"
 inferred = "supported"
@@ -72,17 +73,17 @@ async fn insert(app: &Router, data: &str) -> TestResult {
     Ok(())
 }
 
-/// What `roles` are told of [`ASK`]: the answer and the whole header, with EXPLAIN's
+/// What `roles` are told of `ask`: the answer and the whole header, with EXPLAIN's
 /// `completeness` and `ql` printed as `SEEN` under `label`.
-async fn told(app: &Router, roles: &[&str], label: &str) -> TestResult<(bool, String)> {
+async fn told(app: &Router, roles: &[&str], ask: &str, label: &str) -> TestResult<(bool, String)> {
     let (code, header, body) =
-        send(app, roles, Method::POST, "/dataset/query", ASK.to_owned()).await?;
+        send(app, roles, Method::POST, "/dataset/query", ask.to_owned()).await?;
     assert_eq!(code, StatusCode::OK, "{body}");
     let answer = serde_json::from_str::<serde_json::Value>(&body)?["boolean"]
         .as_bool()
         .ok_or("no boolean")?;
     let uri = "/dataset/query?explain=true";
-    let (code, _, body) = send(app, roles, Method::POST, uri, ASK.to_owned()).await?;
+    let (code, _, body) = send(app, roles, Method::POST, uri, ask.to_owned()).await?;
     assert_eq!(code, StatusCode::OK, "{body}");
     let explanation: serde_json::Value = serde_json::from_str(&body)?;
     let member = |name: &str| {
@@ -143,8 +144,8 @@ async fn a_reader_by_support_missing_a_chain_its_graphs_close_is_never_told_comp
     insert(&app, &chain()).await?;
     let mut seen = vec![(
         "A",
-        told(&app, ADMIN, "A every graph").await?,
-        told(&app, READER, "A reader").await?,
+        told(&app, ADMIN, ASK, "A every graph").await?,
+        told(&app, READER, ASK, "A reader").await?,
     )];
     let same: String = (1..=7)
         .map(|i| format!(" ex:p{i} owl:sameAs ex:a{i} ."))
@@ -152,15 +153,15 @@ async fn a_reader_by_support_missing_a_chain_its_graphs_close_is_never_told_comp
     insert(&app, &format!("GRAPH :g2 {{ {same} }}")).await?;
     seen.push((
         "B (commit)",
-        told(&app, ADMIN, "B (commit) every graph").await?,
-        told(&app, READER, "B (commit) reader").await?,
+        told(&app, ADMIN, ASK, "B (commit) every graph").await?,
+        told(&app, READER, ASK, "B (commit) reader").await?,
     ));
     let (code, _, body) = send(&app, ADMIN, Method::POST, REMATERIALISE, String::new()).await?;
     assert_eq!(code, StatusCode::OK, "{body}");
     seen.push((
         "B (rematerialised)",
-        told(&app, ADMIN, "B (rematerialised) every graph").await?,
-        told(&app, READER, "B (rematerialised) reader").await?,
+        told(&app, ADMIN, ASK, "B (rematerialised) every graph").await?,
+        told(&app, READER, ASK, "B (rematerialised) reader").await?,
     ));
     let wrong: Vec<String> = seen
         .iter()
@@ -171,6 +172,46 @@ async fn a_reader_by_support_missing_a_chain_its_graphs_close_is_never_told_comp
         .map(|(at, _, reader)| format!("{at}: reader false, told {:?}", reader.1))
         .collect();
     assert!(wrong.is_empty(), "told complete:\n{}", wrong.join("\n"));
+    Ok(())
+}
+
+/// Spec: docs/spec/reasoning-semantics.md (access): "adding or removing an assertion the
+/// reader can't see changes none of its answers (its status may change)". Under `owl2-rl`,
+/// `representatives`, the QL rewriting on and the default graph the union of every graph,
+/// `:g1` holds `ex:x a ex:A` and `ex:A rdfs:subClassOf [ owl:onProperty ex:p ;
+/// owl:someValuesFrom ex:B ]`, which entail `ASK { ex:x ex:p ?y }`. Store 2 also holds, in
+/// `:g2`, which a reader by support of `:g1` can't read, a chain axiom on a list with no
+/// `rdf:rest`. That reader answers `true` in both stores. Each header and EXPLAIN's
+/// `completeness` and `ql` are printed (`SEEN …`).
+#[tokio::test]
+async fn a_list_left_out_in_a_graph_the_reader_cant_read_changes_none_of_its_answers() -> TestResult
+{
+    let readable = "GRAPH :g1 { ex:x a ex:A . ex:p a owl:ObjectProperty . ex:A rdfs:subClassOf \
+                    [ a owl:Restriction ; owl:onProperty ex:p ; owl:someValuesFrom ex:B ] }";
+    let hidden = "GRAPH :g2 { ex:q owl:propertyChainAxiom _:l . _:l rdf:first ex:r }";
+    let mut answers = Vec::new();
+    for (store, data) in [
+        ("store 1", readable.to_owned()),
+        ("store 2", format!("{readable} {hidden}")),
+    ] {
+        let app = test_app_with_store_config(
+            StoreConfig {
+                ql_rewriting: QlRewritingMode::On,
+                union_default_graph: true,
+                equality_by_representatives: true,
+                equality_compact: false,
+                ..StoreConfig::default()
+            },
+            policy_of(POLICY)?,
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+        )?;
+        insert(&app, &data).await?;
+        let ask = "ASK { ex:x ex:p ?y }";
+        let (answer, _) = told(&app, READER, ask, &format!("{store} reader")).await?;
+        answers.push(format!("{store}: {answer}"));
+    }
+    let expected = ["store 1: true", "store 2: true"];
+    assert_eq!(answers, expected, "the reader's answers");
     Ok(())
 }
 
