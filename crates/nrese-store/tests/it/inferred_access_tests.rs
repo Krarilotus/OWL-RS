@@ -989,49 +989,165 @@ fn a_planned_read_charges_its_view_to_the_query() {
     );
 }
 
-/// Under compact equality no view is a reader's closure, so a reader who sees every inference
-/// reads the publication's stacks with nothing of its own to charge: its `ASK {}` is answered
-/// within the smallest total query budget that answers a reader of every graph. Each read is
-/// on a fresh store, `ex:open` holding one fact.
-#[test]
-fn a_compact_visible_read_is_answered_within_a_budget_that_answers_every_graph() {
-    let answered = |scope: &ReadScope, total: usize| {
-        let mut config = nrese_store::StoreConfig {
-            equality_compact: true,
-            query_cache_bytes: 0,
-            total_query_memory_bytes: total,
-            ..in_memory_store_config()
-        };
-        config.process_memory_bytes = nrese_store::ProcessMemory::Bytes(0);
-        let store = StoreService::new(config).unwrap();
-        crate::support::load_past_the_pipeline(
-            &store,
-            &format!("<{EX}open> {{ <{EX}a> <{EX}p> <{EX}b> }}"),
-        );
-        store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
-        store.rematerialise(Ruleset::Owl2Rl).is_ok()
-            && store
-                .execute_query(&SparqlQueryRequest::new("ASK {}", scope.clone()))
-                .is_ok()
+/// What `scope` is told of `ASK {}` on a fresh store under compact equality, its server query
+/// memory `total` (0: unlimited) and the request's limit `limit`: `true` or `false`, `refused
+/// (memory)` or another refusal; `setup` where the fixture wasn't made. `ex:open` holds 200
+/// facts; `ex:secret`, which [`reader`] can't read, one where `secret`.
+fn compact_ask(scope: &ReadScope, secret: bool, total: usize, limit: Option<usize>) -> String {
+    let mut config = nrese_store::StoreConfig {
+        equality_compact: true,
+        query_cache_bytes: 0,
+        total_query_memory_bytes: total,
+        ..in_memory_store_config()
     };
-    // The smallest, by doubling and then halving the gap: below it the read is refused.
+    config.process_memory_bytes = nrese_store::ProcessMemory::Bytes(0);
+    let store = StoreService::new(config).unwrap();
+    let facts: String = (0..200)
+        .map(|i| format!("<{EX}s{i}> <{EX}p> <{EX}o{i}> . "))
+        .collect();
+    let hidden = match secret {
+        true => format!("<{EX}secret> {{ <{EX}a> <{EX}p> <{EX}b> }}"),
+        false => String::new(),
+    };
+    crate::support::load_past_the_pipeline(&store, &format!("<{EX}open> {{ {facts} }} {hidden}"));
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    if let Err(error) = store.rematerialise(Ruleset::Owl2Rl) {
+        return format!("setup: {error}");
+    }
+    let mut request = SparqlQueryRequest::new("ASK {}", scope.clone());
+    request.memory_limit = limit;
+    match store.execute_query(&request) {
+        Ok(result) => String::from_utf8_lossy(&result.payload)
+            .contains("true")
+            .to_string(),
+        Err(error) if error.is_memory_limit() => "refused (memory)".to_owned(),
+        Err(error) => format!("refused: {error}"),
+    }
+}
+
+/// The smallest of `1..2^30` that `answered` holds for, by doubling and then halving the gap:
+/// it doesn't hold just below it.
+fn smallest(answered: impl Fn(usize) -> bool) -> usize {
     let mut high = 1;
-    while !answered(&ReadScope::All, high) {
-        assert!(high < 1 << 30, "a reader of every graph is never answered");
+    while !answered(high) {
+        assert!(high < 1 << 30, "never answered");
         high *= 2;
     }
     let mut low = high / 2;
     while high - low > 1 {
         let mid = low + (high - low) / 2;
-        match answered(&ReadScope::All, mid) {
+        match answered(mid) {
             true => high = mid,
             false => low = mid,
         }
     }
-    assert!(
-        answered(&reader(false), high),
-        "refused within {high} bytes"
+    high
+}
+
+/// Spec: crates/nrese-store/src/support.rs (`Reading::committed`): under compact equality a
+/// reader who sees every inference is charged as before the withheld claim. Where every
+/// populated graph is its own it reads the publication itself: `true` within the smallest
+/// total query memory that answers the reader of every graph. Where it can't read a populated
+/// graph it takes its graph-dependent route, which scans the asserted statements within the
+/// request's limit: refused within the smallest limit that answers the reader of every graph,
+/// below that scan, and `true` without one.
+#[test]
+fn a_compact_visible_read_is_charged_as_the_publications_read_is() {
+    let every = ReadScope::All;
+    let total = smallest(|bytes| compact_ask(&every, false, bytes, None) == "true");
+    let read = compact_ask(&reader(false), false, total, None);
+    assert_eq!(read, "true", "within {total} bytes");
+    let limit = smallest(|bytes| compact_ask(&every, true, 0, Some(bytes)) == "true");
+    let told = [Some(limit), None].map(|limit| compact_ask(&reader(false), true, 0, limit));
+    assert_eq!(
+        told,
+        ["refused (memory)", "true"],
+        "within {limit} bytes, then none"
     );
+}
+
+/// A compact store whose `ex:open` holds `data`, rematerialised under `owl2-rl`, the default
+/// graph the union of every graph.
+fn compact_store(data: &str) -> StoreService {
+    let store = StoreService::new(nrese_store::StoreConfig {
+        equality_compact: true,
+        union_default_graph: true,
+        ..in_memory_store_config()
+    })
+    .unwrap();
+    store
+        .execute_update(&SparqlUpdateRequest::new(format!(
+            "PREFIX ex: <{EX}> INSERT DATA {{ GRAPH ex:open {{ {data} }} }}"
+        )))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    store
+}
+
+/// Spec: crates/nrese-store/src/service.rs (`status_for_its_reader`): under compact equality
+/// [`reader`], who sees every inference, reads the publication, its answers in the store's
+/// result cache beside the reader of every graph's. Each typed answer carries its own reader's
+/// status, read cold and from the cache, whichever of them read first: the reader of every
+/// graph its certified one, the other `not-certified`. `ex:open` holds 500 facts, read by one
+/// SELECT.
+#[test]
+fn a_typed_answer_from_the_cache_carries_its_own_readers_status() {
+    let facts: String = (0..500)
+        .map(|i| format!("ex:s{i} ex:p ex:o{i} . "))
+        .collect();
+    let select = format!("PREFIX ex: <{EX}> SELECT ?s ?o WHERE {{ ?s ex:p ?o }}");
+    for (first, second) in [
+        (ReadScope::All, reader(false)),
+        (reader(false), ReadScope::All),
+    ] {
+        let store = compact_store(&facts);
+        let mut told = Vec::new();
+        for scope in [&first, &second, &first, &second] {
+            let hits = store.query_cache_stats().hits;
+            let request = SparqlQueryRequest::new(select.clone(), scope.clone());
+            let result = store.execute_query(&request).unwrap();
+            let rows = String::from_utf8_lossy(&result.payload)
+                .matches(&format!("{EX}o"))
+                .count();
+            let status = result
+                .completeness
+                .map_or("none".to_owned(), |c| c.header());
+            let hit = store.query_cache_stats().hits > hits;
+            told.push((*scope == ReadScope::All, status, rows, hit));
+        }
+        let certified = told.iter().find(|t| t.0).map(|t| t.1.clone()).unwrap();
+        let own = |every: bool| {
+            if every {
+                certified.as_str()
+            } else {
+                "not-certified"
+            }
+        };
+        let right = certified != "not-certified"
+            && told.iter().all(|t| (t.1.as_str(), t.2) == (own(t.0), 500))
+            && told[2].3
+            && told[3].3;
+        assert!(right, "{told:?}");
+    }
+}
+
+/// Spec: crates/nrese-store/src/service.rs (`pin_query`): under compact equality [`reader`]
+/// reads the publication, which admits into the store's result cache, so its SELECT of the
+/// one fact in `ex:open` is pinned; read again, it keeps its row, told `not-certified`.
+#[test]
+fn a_compact_visible_reader_pins_its_select() {
+    let store = compact_store("ex:a ex:p ex:b");
+    let select = format!("PREFIX ex: <{EX}> SELECT ?o WHERE {{ ex:a ex:p ?o }}");
+    let request = SparqlQueryRequest::new(select, reader(false));
+    let pinned = store.pin_query("one", &request, &nrese_store::CancellationToken::new());
+    let read = store.execute_query(&request).unwrap();
+    let told = (
+        pinned.as_ref().err().map(ToString::to_string),
+        String::from_utf8_lossy(&read.payload).contains(&format!("{EX}b")),
+        read.completeness.map(|c| c.header()),
+    );
+    assert_eq!(told, (None, true, Some("not-certified".to_owned())));
 }
 
 /// With the rules switched off and the store not rematerialised, its stack is OWL 2 RL's

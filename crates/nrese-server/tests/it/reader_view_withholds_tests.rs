@@ -289,6 +289,78 @@ async fn a_compact_visible_reader_is_told_the_same_whether_a_graph_it_cant_read_
     Ok(())
 }
 
+/// The result cache's hits, as `/api/v1/repositories/nrese/cache` counts them.
+async fn cache_hits(app: &Router) -> TestResult<u64> {
+    let request = Request::builder()
+        .uri("/api/v1/repositories/nrese/cache")
+        .header(header::AUTHORIZATION, format!("Bearer {}", token(ADMIN)))
+        .body(Body::empty())?;
+    let view: serde_json::Value =
+        serde_json::from_str(&body_text(app.clone().oneshot(request).await?).await?)?;
+    Ok(view["hits"].as_u64().ok_or("no hits")?)
+}
+
+/// Spec: crates/nrese-store/src/service.rs (`status_for_its_reader`) and
+/// crates/nrese-server/src/http/sparql.rs (a cached answer's header): under compact equality
+/// a reader of `:g1` who sees every inference reads the publication, so its answers and the
+/// reader of every graph's share the store's result cache. Each is told its own status with
+/// an answer from it: the reader of every graph its certified one, the other `not-certified`,
+/// whichever of them read first. `:g1` holds 500 facts read by one SELECT, read by each
+/// twice, the second read a hit.
+#[tokio::test]
+async fn a_cached_answer_is_told_with_its_own_readers_status() -> TestResult {
+    let facts: String = (0..500)
+        .map(|i| format!("ex:s{i} ex:p ex:o{i} . "))
+        .collect();
+    let select = "SELECT ?s ?o WHERE { ?s ex:p ?o }";
+    for (first, second) in [(ADMIN, READER), (READER, ADMIN)] {
+        let app = test_app_with_store_config(
+            StoreConfig {
+                ql_rewriting: QlRewritingMode::Off,
+                union_default_graph: true,
+                equality_compact: true,
+                ..StoreConfig::default()
+            },
+            policy_of(VISIBLE_POLICY)?,
+            ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+        )?;
+        insert(&app, &format!("GRAPH :g1 {{ {facts} }}")).await?;
+        let mut told = Vec::new();
+        for roles in [first, second, first, second] {
+            let hits = cache_hits(&app).await?;
+            let (code, header, body) = send(
+                &app,
+                roles,
+                Method::POST,
+                "/dataset/query",
+                select.to_owned(),
+            )
+            .await?;
+            assert_eq!(code, StatusCode::OK, "{body}");
+            let rows = body.matches("urn:ex:o").count();
+            told.push((
+                header.unwrap_or_default(),
+                rows,
+                cache_hits(&app).await? > hits,
+            ));
+        }
+        let (every, some) = match first == ADMIN {
+            true => ([&told[0], &told[2]], [&told[1], &told[3]]),
+            false => ([&told[1], &told[3]], [&told[0], &told[2]]),
+        };
+        let certified = &every[0].0;
+        let right = certified != "not-certified"
+            && every.iter().all(|t| (&t.0, t.1) == (certified, 500))
+            && some
+                .iter()
+                .all(|t| (t.0.as_str(), t.1) == ("not-certified", 500))
+            && told[2].2
+            && told[3].2;
+        assert!(right, "first {first:?}: {told:?}");
+    }
+    Ok(())
+}
+
 /// The reader of the pending rows: it reads and writes `:g1` and reads the default graph.
 const WRITER_POLICY: &str = r#"
 default = "deny"

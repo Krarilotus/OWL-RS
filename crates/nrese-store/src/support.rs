@@ -1762,8 +1762,6 @@ pub(crate) struct Supports {
     in_use: std::sync::atomic::AtomicBool,
     /// What the sets and views keep is charged to.
     kept: Arc<Budget>,
-    /// The latest publication a compact `visible` reader read, and its view ([`Self::withheld`]).
-    withheld: Mutex<Option<(Snapshot, Snapshot)>>,
 }
 
 #[derive(Debug, Default)]
@@ -1970,13 +1968,11 @@ impl Reading {
         (model, reading)
     }
 
-    /// Whether this reader reads `snapshot` through a view of its own: by support; under
-    /// compact equality, where no view is its closure (so it is told so whatever the graphs
-    /// it can't read hold); or seeing every inference while a named graph is out of its
-    /// reach (a fact asserted only there, and derived, is shown to it as inferred).
+    /// Whether this reader reads `snapshot` through a view of its own: by support, or
+    /// seeing every inference while a named graph is out of its reach (a fact asserted only
+    /// there, and derived, is shown to it as inferred).
     fn through_view(&self, snapshot: &Snapshot) -> bool {
         self.access.inferred_by_support
-            || self.compilation.compact
             || snapshot
                 .named_graphs()
                 .any(|graph| !self.access.allows_id(snapshot, graph))
@@ -1991,11 +1987,6 @@ impl Reading {
             return Err(Unavailable::OtherProgram(self.compilation.replica));
         }
         match self.through_view(snapshot) {
-            // Compact restores nothing a reader who sees every inference can't read: not its
-            // closure.
-            true if self.compilation.compact && !self.access.inferred_by_support => {
-                self.supports.withheld(snapshot)
-            }
             true => self.supports.view(
                 snapshot,
                 &self.access,
@@ -2138,25 +2129,7 @@ impl Supports {
             counters: Counters::default(),
             in_use: std::sync::atomic::AtomicBool::default(),
             kept,
-            withheld: Mutex::default(),
         }
-    }
-
-    /// `snapshot`'s stacks behind the empty withheld mask: under compact equality, the view
-    /// of a reader who sees every inference, who reads none of the closure. Kept for the
-    /// latest publication read, so its own result cache and QL schema carry across reads, and
-    /// charged to nothing: it reads no support state.
-    fn withheld(&self, snapshot: &Snapshot) -> Result<Snapshot, Unavailable> {
-        let mut kept = self.withheld.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some((_, view)) = kept.as_ref().filter(|(of, _)| of.same_version(snapshot)) {
-            return Ok(view.clone());
-        }
-        let unlimited = Arc::new(Budget::unlimited());
-        let view = snapshot
-            .with_inferred_mask(&InferredMask::default(), false, &unlimited)?
-            .expect("an empty mask");
-        *kept = Some((snapshot.clone(), view.clone()));
-        Ok(view)
     }
 
     pub(crate) fn use_rules(&self, rules: Option<RuleProgram>) {

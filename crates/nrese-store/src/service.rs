@@ -1285,7 +1285,7 @@ impl StoreService {
             use crate::dl::query::{Outcome, Read};
             let detail = match answer(self, &snapshot, prepared, cancellation, &memory, mode)? {
                 Outcome::Answers(answers, status, detail) => {
-                    report(status_for_its_reader(prepared, Some(status), false), None);
+                    report(self.told(prepared, Some(status), false), None);
                     crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
                     detail
                 }
@@ -1305,7 +1305,7 @@ impl StoreService {
                         &memory,
                         out,
                         |_| {
-                            let told = status_for_its_reader(prepared, Some(status), false);
+                            let told = self.told(prepared, Some(status), false);
                             (context, move |kept| report(told, kept))
                         },
                     )?;
@@ -1334,7 +1334,7 @@ impl StoreService {
                 let status = self.status_outside_dl(prepared, ql, at);
                 // The cache's context is the whole assessment, not what the reader is told.
                 let context = context_outside_dl(status.as_ref(), ql.is_some());
-                let told = status_for_its_reader(prepared, status, ql.is_some());
+                let told = self.told(prepared, status, ql.is_some());
                 withheld = withholds_report(prepared, told.as_ref());
                 (context, move |kept| report(told, kept))
             },
@@ -1426,7 +1426,17 @@ impl StoreService {
     ) -> Option<nrese_sparql::Completeness> {
         let status =
             self.status_outside_dl(prepared, None, Revision::Committed(&self.engine.snapshot()));
-        status_for_its_reader(prepared, status, false)
+        self.told(prepared, status, false)
+    }
+
+    /// [`status_for_its_reader`] under this store's equality.
+    fn told(
+        &self,
+        prepared: &PreparedQuery,
+        status: Option<nrese_sparql::Completeness>,
+        rewritten: bool,
+    ) -> Option<nrese_sparql::Completeness> {
+        status_for_its_reader(prepared, status, rewritten, self.config.equality_compact)
     }
 
     /// [`Self::status_without_dl`] of a read of the data `at`.
@@ -1534,6 +1544,7 @@ impl StoreService {
                     prepared,
                     &mut explanation.completeness,
                     &mut explanation.ql,
+                    self.config.equality_compact,
                 );
             },
         )
@@ -1595,7 +1606,12 @@ impl StoreService {
             |planned| {
                 planned.steps.clear();
                 planned.rewrites.clear();
-                certification_for_its_reader(prepared, &mut planned.completeness, &mut planned.ql);
+                certification_for_its_reader(
+                    prepared,
+                    &mut planned.completeness,
+                    &mut planned.ql,
+                    self.config.equality_compact,
+                );
             },
         )
     }
@@ -1849,7 +1865,7 @@ impl StoreService {
                 |ql| {
                     // A transaction's pending state: never answered from the cache.
                     let status = self.status_outside_dl(prepared, ql, at);
-                    report(status_for_its_reader(prepared, status, ql.is_some()), None);
+                    report(self.told(prepared, status, ql.is_some()), None);
                     (Vec::new(), |_| None)
                 },
             )
@@ -2665,14 +2681,18 @@ fn read_model(infer: bool) -> crate::ReadModel {
 /// on the schema, so the token tells nothing of hidden data. So is every reader of some
 /// graphs told it for a status under `owl2-dl`: whether OWL 2 DL reads the data
 /// otherwise than the rules is a question of every graph's axioms
-/// ([`crate::dl::query::mark`]), and the regime is the configuration's.
+/// ([`crate::dl::query::mark`]), and the regime is the configuration's. Under compact
+/// equality (`compact`) that reader reads the publication, whose closure isn't its own: it
+/// is told `not-certified` for every status, the data and its assessment the publication's.
 fn status_for_its_reader(
     prepared: &PreparedQuery,
     status: Option<nrese_sparql::Completeness>,
     rewritten: bool,
+    compact: bool,
 ) -> Option<nrese_sparql::Completeness> {
     let dl = status.as_ref().and_then(|s| s.regime) == Some(nrese_sparql::Regime::Owl2Dl);
-    match (rewritten && withholds_certification(prepared)) || (dl && prepared.access().is_some()) {
+    let withheld = rewritten || (compact && status.is_some());
+    match (withheld && withholds_certification(prepared)) || (dl && prepared.access().is_some()) {
         true => Some(nrese_sparql::Completeness::not_certified()),
         false => status,
     }
@@ -2684,7 +2704,8 @@ fn refusal_for_its_reader(prepared: &PreparedQuery, error: crate::StoreError) ->
     let crate::StoreError::Incomplete(mut answer) = error else {
         return error;
     };
-    let told = status_for_its_reader(prepared, Some(answer.status.clone()), false);
+    // An exact answer is refused under `owl2-dl` alone: told as every `owl2-dl` status is.
+    let told = status_for_its_reader(prepared, Some(answer.status.clone()), false, false);
     if let Some(told) = told.filter(|told| *told != answer.status) {
         answer.status = told;
         answer.unresolved.clear();
@@ -2698,8 +2719,9 @@ fn certification_for_its_reader(
     prepared: &PreparedQuery,
     completeness: &mut Option<nrese_sparql::Completeness>,
     ql: &mut Option<nrese_sparql::ql::QlReport>,
+    compact: bool,
 ) {
-    *completeness = status_for_its_reader(prepared, completeness.take(), ql.is_some());
+    *completeness = status_for_its_reader(prepared, completeness.take(), ql.is_some(), compact);
     if withholds_report(prepared, completeness.as_ref()) {
         *ql = None;
     }
