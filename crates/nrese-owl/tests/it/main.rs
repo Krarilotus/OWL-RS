@@ -607,8 +607,8 @@ fn reserved_vocabulary_is_read_by_its_meaning() {
 }
 
 /// An IRI of the reserved vocabulary as a class, property or individual is OWL 2 Full
-/// (Structural Specification §2.4): the axioms that use it are left out, each reported
-/// (the W3C tests WebOnt-I5.3-014, WebOnt-Class-001, WebOnt-I5.5-001 were answered as if
+/// (Structural Specification §2.4): the axioms that use it are left out, each reserved name
+/// they use reported (`rdf:type`, `rdfs:Class`, `owl:Class`, `rdf:first`) (the W3C tests WebOnt-I5.3-014, WebOnt-Class-001, WebOnt-I5.5-001 were answered as if
 /// they were fresh names).
 #[test]
 fn reserved_vocabulary_as_an_entity_is_left_out() {
@@ -635,7 +635,7 @@ fn reserved_vocabulary_as_an_entity_is_left_out() {
         .iter()
         .filter(|d| matches!(d, Diagnostic::Reserved { .. }))
         .count();
-    assert_eq!(reserved, 3, "{:?}", ontology.diagnostics);
+    assert_eq!(reserved, 4, "{:?}", ontology.diagnostics);
     assert!(
         ontology
             .diagnostics

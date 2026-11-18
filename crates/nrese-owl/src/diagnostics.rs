@@ -351,9 +351,11 @@ pub fn reserved_vocabulary(iri: &str) -> bool {
 /// Leaves out the axioms that use an IRI of the reserved vocabulary (`rdf:`, `rdfs:`,
 /// `xsd:`, `owl:`; *OWL 2 Structural Specification* §2.4) as a class, a property or an
 /// individual, but for those §2.4 gives OWL 2 DL (`owl:Thing`, `owl:Nothing`, the top and
-/// bottom properties; datatypes are data ranges, not touched here): each with a
-/// [`Diagnostic::Reserved`]. Such a name means in OWL 2 DL nothing of what it means in
-/// RDF (`rdfs:Class`, `rdf:type`, `rdf:first` as entities belong to OWL 2 Full), so
+/// bottom properties; datatypes are data ranges, not touched here): every such name an
+/// axiom uses, each with a [`Diagnostic::Reserved`] (not only its first: what is reported
+/// doesn't depend on the order the statements are read in). Such a name means in OWL 2
+/// DL nothing of what it means in RDF (`rdfs:Class`, `rdf:type`, `rdf:first` as entities
+/// belong to OWL 2 Full), so
 /// reading it as a fresh name would decide what the input doesn't say; left out, what
 /// follows from the rest still follows. Terms whose IRI the source doesn't give
 /// ([`Terms::iri_text`]) aren't checked.
@@ -372,17 +374,17 @@ pub(crate) fn leave_out_reserved(ontology: &mut Ontology, terms: &dyn Terms) {
     let all_sources = std::mem::take(&mut ontology.sources);
     for (axiom, source) in axioms.into_iter().zip(all_sources) {
         let names = entities_of(ontology, &axiom, &mut walk);
-        match names.iter().copied().find(|&t| reserved(t)) {
-            Some(term) => found.push(Diagnostic::Reserved { term }),
-            None => {
-                kept.push(axiom);
-                sources.push(source);
-            }
+        let before = found.len();
+        found.extend(names.iter().copied().filter(|&t| reserved(t)));
+        if found.len() == before {
+            kept.push(axiom);
+            sources.push(source);
         }
     }
     ontology.axioms = kept;
     ontology.sources = sources;
-    for d in found {
+    for term in found {
+        let d = Diagnostic::Reserved { term };
         if !ontology.diagnostics.contains(&d) {
             ontology.diagnostics.push(d);
         }
