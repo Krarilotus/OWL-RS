@@ -857,6 +857,16 @@ fn a_run_past_its_deadline_is_inconclusive() {
     assert!(!judge(&counts, past).is_empty(), "passed past its deadline");
 }
 
+/// An inconsistent case is no undecided verdict: owl2-dl decided it, and it says nothing of
+/// `complete`. A family of ten verdicts, three of them inconsistent and seven compared,
+/// compares enough to be judged, and passes.
+#[test]
+fn inconsistent_cases_are_not_counted_as_undecided() {
+    let counts: Counts = [("disjoint", [7, 0, 0, 0, 0, 3])].into_iter().collect();
+    let later = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    assert_eq!(judge(&counts, later), Vec::<String>::new());
+}
+
 /// - Input: case 95 of the generated run with `NRESE_FUZZ_SEED=158`, inconsistent in
 ///   its first four draws (D16-460): kept so, it was 8 of its family's 34 verdicts, over
 ///   the family's fifth, and the run was inconclusive on a draw. Then a family whose every
