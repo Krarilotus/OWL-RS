@@ -1,5 +1,5 @@
 //! A class assertion of an anonymous class expression under the OWL 2 QL rewriting: OWL 2 QL
-//! allows only a named class there (OWL 2 Profiles §3.2.4), so a read whose answer it can
+//! allows only a named class there (OWL 2 Profiles §3.2.5), so a read whose answer it can
 //! change is told complete only where the closure's rules apply it.
 
 use std::sync::Arc;
@@ -17,7 +17,8 @@ const PREFIXES: &str = "PREFIX : <http://example.com/> \
     PREFIX xsd: <http://www.w3.org/2001/XMLSchema#> ";
 
 /// The answer to `ASK { question }` after one commit of `data`, and whether the read is
-/// told complete; `None` where the commit is refused.
+/// told complete; `None` where the commit is refused as inconsistent (any other refusal
+/// fails the cell).
 fn ask(
     mode: ReasoningMode,
     ql: QlRewritingMode,
@@ -37,13 +38,15 @@ fn ask(
         Arc::new(ReasonerService::new(ReasonerConfig::for_mode(mode))),
     );
     let update = format!("{PREFIXES}INSERT DATA {{ {data} }}");
-    pipeline
-        .apply(
-            MutationCommand::Update(SparqlUpdateRequest::new(update)),
-            &Requester::all(),
-            &MutationTicket::new(),
-        )
-        .ok()?;
+    if let Err(e) = pipeline.apply(
+        MutationCommand::Update(SparqlUpdateRequest::new(update)),
+        &Requester::all(),
+        &MutationTicket::new(),
+    ) {
+        let e = format!("{e:?}");
+        assert!(e.contains("Inconsistent"), "refused: {e}");
+        return None;
+    }
     let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ {question} }}"));
     let result = store.execute_query(&request).expect("query");
     let text: String = String::from_utf8_lossy(&result.payload)

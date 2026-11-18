@@ -498,7 +498,7 @@ fn existentials_in_right_sides_the_tbox_reads_as_nothing_are_hazards() {
         (
             format!("ClassAssertion(ObjectAllValuesFrom(:R {some}) :c)\nObjectPropertyAssertion(:R :c :x)"),
             "S(?x ?y), A(?y)",
-            asserted("c", &["S", "A"]),
+            asserted("R", &["S", "A"]),
         ),
         (
             format!("SubClassOf(ObjectIntersectionOf(:A :B) {some})"),
