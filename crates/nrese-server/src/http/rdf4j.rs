@@ -980,6 +980,7 @@ mod tests {
             used: 0,
             shared: true,
             unread: true,
+            rows: None,
         });
         let status = |error| {
             super::configuration_error(&policy, error)

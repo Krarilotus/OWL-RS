@@ -48,6 +48,8 @@ const LIMIT_STEP: usize = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TooManyRows {
     pub max_rows: usize,
+    /// The rows it would produce, where known before producing them (a cross product).
+    pub rows: Option<usize>,
 }
 
 impl std::fmt::Display for TooManyRows {
@@ -164,6 +166,7 @@ impl Limit {
         if total > self.max_rows || self.stopped() {
             return Err(TooManyRows {
                 max_rows: self.max_rows,
+                rows: None,
             });
         }
         Ok(())
@@ -218,6 +221,7 @@ impl<'a> Sink<'a> {
     fn refused(&self) -> TooManyRows {
         TooManyRows {
             max_rows: self.limit.max_rows,
+            rows: None,
         }
     }
 }
@@ -335,6 +339,7 @@ fn cross_product(left: &IdTable, right: &IdTable, limit: &Limit) -> Result<IdTab
     if rows > limit.max_rows {
         return Err(TooManyRows {
             max_rows: limit.max_rows,
+            rows: Some(rows),
         });
     }
     let width = left.width() + right.width();
@@ -355,6 +360,7 @@ fn cross_product(left: &IdTable, right: &IdTable, limit: &Limit) -> Result<IdTab
             if limit.stopped() {
                 return Err(TooManyRows {
                     max_rows: limit.max_rows,
+                    rows: None,
                 });
             }
         }
@@ -1484,12 +1490,16 @@ mod tests {
         assert!(full.len() > 1_000_000);
         assert_eq!(
             join(&left, &right, &[0], &[0], 100_000),
-            Err(JoinStop::Rows(TooManyRows { max_rows: 100_000 }))
+            Err(JoinStop::Rows(TooManyRows {
+                max_rows: 100_000,
+                rows: None
+            }))
         );
         assert_eq!(
             join(&left, &right, &[], &[], 1_000_000).map(|t| t.len()),
             Err(JoinStop::Rows(TooManyRows {
-                max_rows: 1_000_000
+                max_rows: 1_000_000,
+                rows: Some(left.len() * right.len())
             }))
         );
         assert_eq!(
@@ -1522,7 +1532,8 @@ mod tests {
         assert_eq!(
             scanned,
             Err(TooManyRows {
-                max_rows: usize::MAX
+                max_rows: usize::MAX,
+                rows: None
             })
         );
         // Stopped after 2 × POLL_UNITS of the 4 × 1.5 × POLL_UNITS rows to scan.
@@ -1569,7 +1580,8 @@ mod tests {
             assert_eq!(
                 merge_join(&left, &right, &[0], &[0], &Limit::new(pairs - 1)).map(|t| t.len()),
                 Err(JoinStop::Rows(TooManyRows {
-                    max_rows: pairs - 1
+                    max_rows: pairs - 1,
+                    rows: None
                 })),
                 "{runs:?}"
             );

@@ -351,6 +351,7 @@ mod unread_tests {
             used: 1 << 20,
             shared: true,
             unread: true,
+            rows: None,
         });
         assert!(!unread.is_memory_limit());
         assert!(!unread.is_server_memory_limit());

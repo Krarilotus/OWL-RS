@@ -1940,12 +1940,13 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// The error of a join stopped by its row limit: the query was cancelled, or the join
-    /// would outgrow the budget.
-    fn too_large(&self, rows: usize, width: usize) -> NativeError {
+    /// The error of a join stopped by its row limit of `max_rows`: the query was cancelled,
+    /// or the join would outgrow the budget with its `rows` (past `max_rows` where unknown).
+    fn too_large(&self, max_rows: usize, rows: Option<usize>, width: usize) -> NativeError {
         if let Err(cancelled) = self.check() {
             return cancelled;
         }
+        let rows = rows.unwrap_or(max_rows.saturating_add(1));
         let requested = rows.saturating_mul(width.max(1) * 8);
         // No room because the process's limit can't be read: that, not a full budget, even
         // where a reading since has found it.
@@ -1957,16 +1958,21 @@ impl<'a> Context<'a> {
                 used: self.budget.used(),
                 shared: true,
                 unread: true,
+                rows: None,
             })
             .into();
         };
         QueryEvaluationError::MemoryLimit(BudgetExceeded {
             limit: self.budget.used().saturating_add(room),
-            // A table may grow to half of what is left (`max_rows`).
-            requested: requested.saturating_mul(2),
+            requested,
             used: self.budget.used(),
             shared: self.budget.bounded_by_shared(),
             unread: false,
+            rows: Some(nrese_exec::RowsPast {
+                rows,
+                width,
+                room: max_rows,
+            }),
         })
         .into()
     }
@@ -1975,7 +1981,7 @@ impl<'a> Context<'a> {
     /// ([`Self::too_large`]), or an input with more rows than the join's row numbers name.
     fn join_stopped(&self, stop: JoinStop, width: usize) -> NativeError {
         match stop {
-            JoinStop::Rows(rows) => self.too_large(rows.max_rows.saturating_add(1), width),
+            JoinStop::Rows(stop) => self.too_large(stop.max_rows, stop.rows, width),
             JoinStop::TooLarge(limit) => QueryEvaluationError::TooLarge(limit).into(),
         }
     }
@@ -4447,7 +4453,7 @@ impl<'a> Context<'a> {
             Ok(rows) => rows,
             Err(wcoj::Stop::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
             Err(wcoj::Stop::TooManyRows) => {
-                return Err(self.too_large(query.max_rows.saturating_add(1), width));
+                return Err(self.too_large(query.max_rows, None, width));
             }
         };
         let mut table = IdTable::new(width);
@@ -5127,7 +5133,7 @@ impl<'a> Context<'a> {
             Ok(out) => out,
             Err(ProbeStop::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
             Err(ProbeStop::TooManyRows) => {
-                return Err(self.too_large(probe.max_rows.saturating_add(1), vars.len()));
+                return Err(self.too_large(probe.max_rows, None, vars.len()));
             }
             Err(ProbeStop::Memory(exceeded)) => {
                 return Err(QueryEvaluationError::MemoryLimit(exceeded).into());
