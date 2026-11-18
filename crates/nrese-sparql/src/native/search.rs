@@ -145,31 +145,41 @@ pub(super) fn is_search(triple: &TriplePattern, triples: &[TriplePattern]) -> bo
 /// Whether a query is evaluated as written: asked so in `options`, or its pattern may hold a
 /// search anywhere, in an `EXISTS` too. A search reads the group it is written in whole,
 /// which the rewrites and routes that move triple patterns between groups don't know.
-/// "May": a search vocabulary's IRI as a triple pattern's predicate, whatever its object,
-/// or where a binding can put it in a predicate later: a `VALUES` row, an expression's
-/// constant, `pre_bound`. A predicate read from the data is not seen.
+/// "May": a triple pattern whose predicate is a search vocabulary's IRI, whatever its
+/// object, or a variable a value is put in for at evaluation, whatever that value's source
+/// (the query, the data, an expression): a pre-bound one, or one in a `LATERAL`'s right
+/// side or an `EXISTS`, which evaluation substitutes. Elsewhere a variable predicate is
+/// joined, never put in, so it reads stored statements however the query is planned.
 pub(super) fn as_written(
     pattern: &nrese_sparql_syntax::algebra::GraphPattern,
     options: &crate::QueryOptions,
 ) -> bool {
     use nrese_sparql_syntax::{
         algebra::{Expression, GraphPattern},
-        term::GroundTerm,
         visit::Node,
     };
-    let searches = |iri: &str| iri == JENA_QUERY || iri.starts_with(BDS) || iri.starts_with(LUC);
-    let named = |term: &Option<GroundTerm>| matches!(term, Some(GroundTerm::NamedNode(n)) if searches(n.as_str()));
-    let mut pre_bound = options.pre_bound.iter().flat_map(|values| values.values());
-    options.as_written
-        || pre_bound.any(|term| matches!(term, Term::NamedNode(n) if searches(n.as_str())))
-        || pattern.find(&mut |node| match node {
-            Node::Pattern(GraphPattern::Bgp { patterns }) => patterns.iter().any(
-                |t| matches!(&t.predicate, NamedNodePattern::NamedNode(n) if searches(n.as_str())),
-            ),
-            Node::Pattern(GraphPattern::Values { bindings, .. }) => {
-                bindings.iter().flatten().any(named)
+    let pre_bound = options.pre_bound.as_deref();
+    let may_search = |patterns: &[TriplePattern], substituted: bool| {
+        patterns.iter().any(|t| match &t.predicate {
+            NamedNodePattern::NamedNode(n) => {
+                let iri = n.as_str();
+                iri == JENA_QUERY || iri.starts_with(BDS) || iri.starts_with(LUC)
             }
-            Node::Expression(Expression::NamedNode(n)) => searches(n.as_str()),
+            NamedNodePattern::Variable(v) => {
+                substituted || pre_bound.is_some_and(|values| values.contains_key(v))
+            }
+        })
+    };
+    let substituted = |inner: &GraphPattern| {
+        inner.find(&mut |node| {
+            matches!(node, Node::Pattern(GraphPattern::Bgp { patterns }) if may_search(patterns, true))
+        })
+    };
+    options.as_written
+        || pattern.find(&mut |node| match node {
+            Node::Pattern(GraphPattern::Bgp { patterns }) => may_search(patterns, false),
+            Node::Pattern(GraphPattern::Lateral { right, .. }) => substituted(right),
+            Node::Expression(Expression::Exists(inner)) => substituted(inner),
             _ => false,
         })
 }
