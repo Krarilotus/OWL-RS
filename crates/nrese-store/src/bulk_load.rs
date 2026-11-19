@@ -209,10 +209,14 @@ pub(crate) fn bulk_load(
     });
     memory::release_all();
     let summary = summary?;
-    // Committed: so is its quarantine.
+    // The load is published before its quarantine is recorded.
     let quarantined = collector
         .map(Collector::commit)
-        .transpose()?
+        .transpose()
+        .map_err(|reason| StoreError::LoadPublished {
+            revision: summary.revision,
+            reason,
+        })?
         .unwrap_or_default();
     if quarantined.count > 0 {
         tracing::warn!(

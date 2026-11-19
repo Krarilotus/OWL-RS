@@ -87,6 +87,14 @@ pub enum StoreError {
     /// committed.
     #[error("the load was cancelled; nothing of it was committed")]
     LoadCancelled,
+    #[error(
+        "the load completed at published revision {revision}. Its quarantine record couldn't be kept: {reason}. Don't send it again."
+    )]
+    LoadPublished {
+        revision: u64,
+        #[source]
+        reason: std::io::Error,
+    },
     /// A classification or realisation request gave up waiting for the computation under
     /// way for its revision, which runs on and is kept.
     #[error("the classification request was cancelled while it waited")]
@@ -279,6 +287,7 @@ impl StoreError {
             | Self::MemoryUnreadable { .. }
             | Self::MemoryLimitWithoutAmounts { .. }
             | Self::LoadCancelled
+            | Self::LoadPublished { .. }
             | Self::Undecided(_)
             | Self::ClassificationCancelled
             | Self::NotRematerialised { .. }

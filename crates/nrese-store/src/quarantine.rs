@@ -1073,11 +1073,11 @@ impl Collector<'_> {
     }
 
     /// The load committed: its statements join the quarantine. Returns what it quarantined.
-    pub(crate) fn commit(self) -> StoreResult<Quarantined> {
+    pub(crate) fn commit(self) -> io::Result<Quarantined> {
         let count = self.count.load(Ordering::Relaxed);
         #[cfg(feature = "fault-points")]
         if count > 0 && self.quarantine.fail_commit.swap(false, Ordering::Relaxed) {
-            return Err(std::io::Error::other("simulated failure").into());
+            return Err(io::Error::other("simulated failure"));
         }
         let mut inner =
             std::mem::take(&mut *self.inner.lock().unwrap_or_else(PoisonError::into_inner));
