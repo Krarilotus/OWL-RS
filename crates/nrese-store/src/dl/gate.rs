@@ -352,7 +352,8 @@ fn rejection(
 
 const CONSTRAINT: &str = "owl2-dl-consistency";
 
-/// A justification's axioms, each by its source triples.
+/// A justification's axioms by their source triples: each once, in the order of their
+/// decoded terms, as [`view_reason`] shows them (one the dictionary doesn't know first).
 fn axiom_evidence(
     tx: &Transaction<'_>,
     ontology: &nrese_owl::Ontology,
@@ -362,11 +363,15 @@ fn axiom_evidence(
         tx.decode(nrese_engine::TermId::from_raw(t))
             .map_or_else(|| format!("#{t}"), |term| term.to_string())
     };
-    justification
-        .axioms
-        .iter()
+    let mut triples: Vec<(Option<DecodedTriple>, [u64; 3])> = (justification.axioms.iter())
         .flat_map(|&i| &ontology.sources[i])
-        .flat_map(|source| source.triples.iter().map(|t| t.map(decode)))
+        .flat_map(|source| source.triples.iter().map(|&t| (decoded_triple(tx, t), t)))
+        .collect();
+    triples.sort_unstable();
+    triples.dedup();
+    triples
+        .into_iter()
+        .map(|(_, t)| t.map(decode))
         .map(|[s, p, o]| nrese_reasoner::RejectEvidence {
             role: "axiom",
             subject: s,
