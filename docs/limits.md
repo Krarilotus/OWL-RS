@@ -198,6 +198,14 @@ leave something out.
   the rules apply. An inclusion into an intersection
   (`:C rdfs:subClassOf [ owl:intersectionOf ( :A :B ) ]`), which OWL 2 QL allows, is answered
   and `complete`.
+- Under `owl2-ql`, an ontology with an axiom the OWL reader leaves out or alters (a reserved
+  name used as a class, property or individual, a structure it can't read, a property declared
+  as two kinds, SWRL rules) gets no `complete` answer from the rewriting: the reads it answers
+  are told `sound-only` at best, with the reader's reason, since conclusions of that axiom may
+  be missing. For one: with `:A rdfs:subClassOf [ owl:intersectionOf ( rdf:List :C ) ] .
+  :a a :A`, `SELECT ?x { ?x a :C }` returns no row, told `sound-only`, the reason naming
+  `rdf:List` as reserved vocabulary used as an entity; under the Direct Semantics `:a` is a
+  `:C`. With `:D` in place of `rdf:List`, the same read returns `:a`, `complete`.
 - Under `owl2-rl` with `reasoner.ql_rewriting = "on"`, a universal restriction on
   `owl:topObjectProperty` puts every individual into its filler, which the rules don't derive:
   the read answers `false` and is told `complete`. For one:
