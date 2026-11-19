@@ -737,9 +737,11 @@ impl<'t, 'm> Parser<'t, 'm> {
                 let property = self.entity()?;
                 self.model.annotation_schema.push(property);
                 self.model.annotation_uses.insert(property);
+                self.model.annotation_axioms.insert(property);
                 if keyword == "SubAnnotationPropertyOf" {
                     let sup = self.entity()?;
                     self.model.annotation_uses.insert(sup);
+                    self.model.annotation_axioms.insert(sup);
                 } else {
                     self.iri_text()?;
                 }

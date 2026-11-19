@@ -162,11 +162,15 @@ impl Dl {
     }
 }
 
+/// Why the rules' clash in the data `read` is no verdict of OWL 2 DL's: they read it otherwise
+/// ([`nrese_owl::profile::rules_read_differently`]), or the reader left out a part whose
+/// statements they still read ([`nrese_owl::Diagnostic::leaves_out`]), from which their clash
+/// may come.
 fn why<E>(read: Result<nrese_owl::Ontology, E>) -> Option<WhyUndecided> {
     match read {
-        Ok(o) => {
-            nrese_owl::profile::rules_read_differently(&o).then_some(WhyUndecided::ReadsDifferently)
-        }
+        Ok(o) => (nrese_owl::profile::rules_read_differently(&o)
+            || o.diagnostics.iter().any(nrese_owl::Diagnostic::leaves_out))
+        .then_some(WhyUndecided::ReadsDifferently),
         Err(_) => Some(WhyUndecided::Unchecked),
     }
 }

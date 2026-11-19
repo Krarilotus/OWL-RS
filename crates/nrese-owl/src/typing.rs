@@ -3,7 +3,8 @@
 //! three, and a class is no datatype. Each kind a name has comes from its declarations (and
 //! the built-in ones of Table 5) and from every place an axiom, a class expression, a data
 //! range or a rule atom puts it, each named below by an exhaustive match; an annotation
-//! property's from the statements read past as annotations ([`Ontology::annotation_uses`]).
+//! property's from the statements read past as annotations ([`Ontology::annotation_uses`]),
+//! by an axiom where an annotation axiom names it ([`Ontology::annotation_axioms`]).
 //! Individuals take part in no constraint: a name may be an individual and anything else
 //! (punning).
 //!
@@ -57,7 +58,7 @@ pub fn two_kinds(ontology: &Ontology) -> Vec<TwoKinds> {
     for &t in &ontology.annotation_uses {
         check.mark(t, EntityKind::AnnotationProperty, false);
     }
-    for &t in &ontology.annotation_schema {
+    for &t in &ontology.annotation_axioms {
         check.mark(t, EntityKind::AnnotationProperty, true);
     }
     // The built-in properties are declared by OWL 2 itself (Table 5), where they are used.

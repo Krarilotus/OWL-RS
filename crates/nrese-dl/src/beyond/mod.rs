@@ -118,10 +118,12 @@ fn restriction(d: &Diagnostic) -> Option<(&'static str, bool)> {
             "OWL 2 Structural Specification §11.2: a named individual in a nominal or hasValue",
             true,
         ),
-        // The reader leaves nothing out: each axiom stays in the model.
+        // The reader leaves nothing out, and a model checks each axiom; but where an axiom
+        // reads the name, the engines read its two kinds as one name, so no model of theirs
+        // speaks of the input ([`Diagnostic::joins_kinds`]): undecided, as left out.
         Diagnostic::TwoKinds { .. } => (
             "OWL 2 Structural Specification §5.8.1: typing constraints (one name as two kinds)",
-            true,
+            !d.joins_kinds(),
         ),
         Diagnostic::Syntax { .. } => (
             "OWL 2 Structural Specification §3: the functional-style grammar",
@@ -449,6 +451,18 @@ pub fn consistency(o: &Ontology, options: &Options) -> Decision {
             dropped[0].restriction
         )
     });
+    // A name an axiom reads as two kinds is one name to the engines: neither verdict of theirs
+    // speaks of the input.
+    if let Some(two) = o.diagnostics.iter().find(|x| x.joins_kinds()) {
+        let name = |t: nrese_owl::Term| o.data.iris.get(&t).cloned();
+        let name = |t| name(t).unwrap_or_else(|| format!("#{t}"));
+        let why = format!(
+            "{}: the engines read the name's two kinds as one, so no verdict of theirs speaks \
+             of the input",
+            two.describe(&name)
+        );
+        return d.undecided(why);
+    }
     let mut work = o.clone();
     work.diagnostics
         .retain(|x| !matches!(x, Diagnostic::Rule { .. }));

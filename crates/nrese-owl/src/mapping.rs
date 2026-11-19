@@ -92,6 +92,10 @@ pub struct Ontology {
     /// (Table 4), nor SHACL content. Where a logical axiom or an assertion also uses one, it is
     /// a name used as two kinds (`crate::typing`).
     pub annotation_uses: BTreeSet<Term>,
+    /// The properties the annotation axioms read past name (Table 17): a domain's or range's
+    /// property, a sub-property axiom's two. Among [`Self::annotation_uses`]; each is named an
+    /// annotation property by an axiom (`crate::typing`).
+    pub annotation_axioms: BTreeSet<Term>,
     /// The properties of the SHACL vocabulary ([`shacl_properties`]) whose statements were read
     /// as SHACL content, which has no OWL meaning (read past as an annotation is).
     pub shacl: BTreeSet<Term>,
@@ -472,6 +476,11 @@ struct Reader<'a> {
     rules_unread: Option<Term>,
     annotation_schema: Vec<Term>,
     annotation_uses: BTreeSet<Term>,
+    annotation_axioms: BTreeSet<Term>,
+    /// The properties declared object or data properties (`owl:ObjectProperty`,
+    /// `owl:DatatypeProperty`), not typed so by a characteristic: what makes a statement about
+    /// the ontology no annotation (Table 10).
+    logical: HashSet<Term>,
     shacl: BTreeSet<Term>,
     /// The cells of the lists read to `rdf:nil` ([`Self::cells_outside_their_lists`]).
     cells: HashSet<Term>,
@@ -663,6 +672,8 @@ impl<'a> Reader<'a> {
             rules_unread: None,
             annotation_schema: Vec::new(),
             annotation_uses: BTreeSet::new(),
+            annotation_axioms: BTreeSet::new(),
+            logical: HashSet::new(),
             shacl: BTreeSet::new(),
             cells: HashSet::new(),
             list_cell_outside: None,
@@ -901,6 +912,9 @@ impl<'a> Reader<'a> {
                     let entry = self.declared.entry(s).or_default();
                     if !entry.contains(&kind) {
                         entry.push(kind);
+                    }
+                    if matches!(kind, EntityKind::ObjectProperty | EntityKind::DataProperty) {
+                        self.logical.insert(s);
                     }
                 }
             }
@@ -1764,6 +1778,7 @@ impl<'a> Reader<'a> {
                 self.annotations += 1;
                 self.annotation_schema.push(if subject { s } else { o });
                 self.annotation_uses.extend([s, o]);
+                self.annotation_axioms.extend([s, o]);
             } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
                 self.add(Axiom::SubDataPropertyOf(s, o), triple);
             } else if let (Some(sub), Some(sup)) =
@@ -1820,6 +1835,7 @@ impl<'a> Reader<'a> {
                 self.annotations += 1;
                 self.annotation_schema.push(s);
                 self.annotation_uses.insert(s);
+                self.annotation_axioms.insert(s);
             } else if self.kind(s) == TermKind::Iri && self.is_data_property(s) {
                 if domain {
                     if let Some(class) = self.class(o) {
@@ -1905,16 +1921,15 @@ impl<'a> Reader<'a> {
         } else if self.declared_as(p, EntityKind::AnnotationProperty)
             || self.is_builtin_annotation(p)
             || self.shacl.contains(&p)
-            || (self.has_type(s, v.owl_ontology)
-                && !self.declared_as(p, EntityKind::ObjectProperty)
-                && !self.declared_as(p, EntityKind::DataProperty))
+            || (self.has_type(s, v.owl_ontology) && !self.logical.contains(&p))
         {
             // An annotation, SHACL content, or a statement about the ontology: its header's
             // annotations (an anonymous ontology's too: its node is a blank node). A header
             // statement of a declared object or data property is no annotation (*Mapping to
             // RDF* Table 10 reads one only where the property is an annotation property) and is
             // read as any other below; one of an undeclared property is, as the W3C test cases
-            // read it (FS2RDF-ontology-annotation-annotation-ar).
+            // read it (FS2RDF-ontology-annotation-annotation-ar), and so is one of a property
+            // only a characteristic types, which declares nothing.
             self.annotations += 1;
             if !self.shacl.contains(&p) && !is(p, self.builtin_annotations.1) {
                 self.annotation_uses.insert(p);
@@ -2158,6 +2173,7 @@ impl<'a> Reader<'a> {
             annotations: self.annotations,
             annotation_schema: self.annotation_schema,
             annotation_uses: self.annotation_uses,
+            annotation_axioms: self.annotation_axioms,
             shacl: self.shacl,
             builtin: BuiltinProperties::of(&self.v),
             data: DataTerms::default(),

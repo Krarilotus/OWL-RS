@@ -515,7 +515,7 @@ const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, 
 /// which both leave (`routed_to_rules` needs neither): what the store's indexes decide
 /// ([`by_index`]), else one read of the ontology `at` ([`ontology_at`], a pending one's of
 /// its own), whose refusal leaves it unknown. First [`left_out`], as recorded (pending: the
-/// base's).
+/// base's, taken where it tells something; a pending read never takes its clean record).
 fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
     let (snapshot, pending) = match at {
         Revision::Decided((_, view)) if view.rules => return None,
@@ -529,9 +529,11 @@ fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
     let left_out = (store.dl().status())
         .filter(|s| s.revision == snapshot.revision())
         .and_then(|s| s.left_out);
+    // A pending read's record is its base's: one that tells nothing says nothing of the pending
+    // changes (a node typed the ontology reads its statements otherwise), so it reads its own.
     match (left_out, by_index(snapshot)) {
         (Some(Some(why)), _) | (_, Some(Some(why))) => return Some(why),
-        (Some(None), Some(None)) => return None,
+        (Some(None), Some(None)) if !pending => return None,
         _ => {}
     }
     let marked = &store.dl().query_ontology.1;
@@ -913,22 +915,57 @@ fn copied<'a>(
     // SHACL content (`nrese_owl::shacl_properties`) is copied only through an equality of two
     // different terms (OWL 2 Profiles §4.3, Table 4: eq-rep-s, eq-rep-p, eq-rep-o): an OWL axiom
     // on a SHACL term makes the reader read the store as any other, and a copy is then entailed.
-    // So with no equality its properties aren't probed.
+    // So with no equality its properties aren't probed. Nor are the properties of statements
+    // about the ontology's node ([`header_properties`]), which the reader reads as annotations
+    // where they are declared no object or data property: undeclared, they name no annotation
+    // property by a declaration, and an equality copies them.
     read.iter().find(|p| match p.as_deref() {
         None => {
             annotation_properties(snapshot, readable).any(copies)
                 || (equal()
-                    && nrese_owl::shacl_properties()
+                    && (nrese_owl::shacl_properties())
                         .filter_map(|i| id(&i))
+                        .chain(header_properties(snapshot, readable))
                         .any(copies))
         }
         Some(iri) => id(iri).is_some_and(|p| {
             let typed = id(RDF_TYPE).map(|ty| asserted(any_graph(Some(p), Some(ty), None)));
             let shacl = nrese_owl::is_shacl_property(iri) && equal();
+            let header = || equal() && header_properties(snapshot, readable).any(|h| h == p);
             let declared = || typed.into_iter().flatten().any(declares);
-            (BUILTIN.contains(&iri) || shacl || (nrese_owl::may_name_annotation(iri) && declared()))
+            (BUILTIN.contains(&iri)
+                || shacl
+                || (nrese_owl::may_name_annotation(iri) && declared())
+                || header())
                 && copies(p)
         }),
+    })
+}
+
+/// The properties of the asserted statements about a node typed `owl:Ontology` (the
+/// ontology's header), each statement and typing in a graph `readable` takes; lazily, a node
+/// at a time.
+fn header_properties(
+    snapshot: &Snapshot,
+    readable: impl Fn(TermId) -> bool + Copy,
+) -> impl Iterator<Item = TermId> {
+    let id = move |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
+    let (ty, ontology) = (
+        id(RDF_TYPE),
+        id(&format!("{}Ontology", nrese_owl::vocab::OWL)),
+    );
+    let asserted =
+        move |s, p, o| snapshot.quads_for_pattern_in(ReadModel::Asserted, &any_graph(s, p, o));
+    let nodes = ty
+        .zip(ontology)
+        .into_iter()
+        .flat_map(move |(ty, ontology)| {
+            asserted(None, Some(ty), Some(ontology)).filter(move |q| readable(q.graph))
+        });
+    nodes.flat_map(move |node| {
+        (asserted(Some(node.subject), None, None))
+            .filter(move |q| readable(q.graph) && Some(q.predicate) != ty)
+            .map(|q| q.predicate)
     })
 }
 

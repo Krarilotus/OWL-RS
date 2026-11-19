@@ -73,7 +73,8 @@ pub enum WhyUndecided {
     /// The ontology has annotation-property axioms or a punned name, or an empty
     /// intersection or union, or a list's cell used outside its list, or a structure no
     /// axiom uses or a name used as two kinds that the rules read otherwise
-    /// (`nrese_owl::profile::rules_read_differently`).
+    /// (`nrese_owl::profile::rules_read_differently`), or a part the reader left out whose
+    /// statements the rules still read (`nrese_owl::Diagnostic::leaves_out`).
     ReadsDifferently,
     /// The check whether it has didn't finish within its budget.
     Unchecked,
@@ -86,7 +87,8 @@ impl WhyUndecided {
             Self::ReadsDifferently => {
                 "the ontology has annotation-property axioms or a punned name, or an empty \
                  intersection or union, or a list's cell used outside its list, or a \
-                 structure no axiom uses, or a name used as two kinds, which OWL 2 DL reads \
+                 structure no axiom uses, or a name used as two kinds, or a part not read as \
+                 OWL 2 DL whose statements the rules still read, which OWL 2 DL reads \
                  differently"
             }
             Self::Unchecked => {

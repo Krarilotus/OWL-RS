@@ -261,7 +261,8 @@ impl Kinds {
     /// property). A deleted literal needs a declared data property: one that is data only
     /// by its literals may lose the last one, and its other axioms then read it as an
     /// object property. A statement that names a list's cell ([`Self::cell`]), an annotation
-    /// too, is read.
+    /// too, is read, and so is one about the ontology's node ([`header`]) but a known
+    /// annotation property's.
     fn keep(&self, tx: &Transaction<'_>, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
         let k = &self.signature;
         if self.cell(tx, s) || self.cell(tx, o) {
@@ -270,7 +271,11 @@ impl Kinds {
         if self.shacl.contains(&p) || (k.annotations.contains(&p) && !named(tx, p, false)) {
             return true;
         }
-        if changes_schema(tx, triple) || k.names.contains(&s) || reserved_named(tx, triple) {
+        if changes_schema(tx, triple)
+            || k.names.contains(&s)
+            || reserved_named(tx, triple)
+            || header(tx, s)
+        {
             return false;
         }
         let iri = TermId::from_raw(o).kind() == nrese_engine::TermKind::Iri;
@@ -286,6 +291,26 @@ impl Kinds {
             !k.names.contains(&o) && (Some(p) == self.same_as || property)
         }
     }
+}
+
+/// Whether `s` is the ontology's node at `tx`'s base: typed `owl:Ontology` there (one probe
+/// of the committed index). A statement about it is an annotation or an assertion by its
+/// property's declarations (*Mapping to RDF* Table 10), which only the reader tells: so it is
+/// read. A node typed so in the commit itself is read by that statement, OWL's vocabulary.
+fn header(tx: &Transaction<'_>, s: u64) -> bool {
+    let id = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
+    let (Some(ty), Some(ontology)) = (
+        id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
+        id("http://www.w3.org/2002/07/owl#Ontology"),
+    ) else {
+        return false;
+    };
+    let mut pattern = nrese_engine::QuadPattern::all();
+    (pattern.subject, pattern.predicate, pattern.object) =
+        (Some(TermId::from_raw(s)), Some(ty), Some(ontology));
+    let base = tx.base();
+    let mut found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+    found.next().is_some()
 }
 
 /// Whether OWL 2 RL admits the literal `o`'s datatype (`nrese_owl::profile::rl_datatype`):
@@ -503,7 +528,9 @@ pub(crate) fn prepare(
             // A U1 with equality classes is evaluated afresh (`Upper`'s module docs).
             Ok(upper)
                 if upper.classes().is_empty()
-                    && asserted().all(|t| upper.is_assertion(t) && !reserved_named(tx, t))
+                    && asserted().all(|t| {
+                        upper.is_assertion(t) && !reserved_named(tx, t) && !header(tx, t[0])
+                    })
                     && !tx.deleted().any(|q| may_retype(tx, quad_triple(q))) =>
             {
                 let before = tx.base();
