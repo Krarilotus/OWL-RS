@@ -1677,6 +1677,63 @@ fn a_commit_that_names_a_list_cell_is_read_and_leaves_the_rl_route() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A clean ontology committed first, on the rules' route; then one commit that writes a chain's
+/// list and an annotation on its head cell together. The cell is new in that commit, and the
+/// commit is read: the reader reports the cell, the ontology leaves the rules' route, and the
+/// read's status names the report.
+#[test]
+fn a_commit_that_writes_a_list_cell_and_names_it_is_read() {
+    let dl = pipeline();
+    let clean = ":C a owl:Class . :x a :C . :a0 :q1 :a1 . :a1 :q2 :a2 .";
+    insert(&dl, clean).expect("clean");
+    let first = dl.store().dl_bounds().last;
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let data = format!(
+        ":p owl:propertyChainAxiom _:l1 . _:l1 <{RDF}first> :q1 ; <{RDF}rest> _:l2 . \
+         _:l2 <{RDF}first> :q2 ; <{RDF}rest> <{RDF}nil> . _:l1 rdfs:comment \"outside\" ."
+    );
+    insert(&dl, &data).expect("committed");
+    let (rows, status) = query(&dl, "ASK { :a0 :p :a2 }");
+    let route = dl.store().dl_bounds().last;
+    let reasons = status.reasons();
+    let line = format!("route {first}, then {route}; {rows:?}, {reasons:?}");
+    eprintln!("CELL SAME COMMIT {line}");
+    let named = (reasons.iter()).any(|r| r.contains("a list's cell used outside its list"));
+    assert!(first == "rules" && route != "rules" && named, "{line}");
+}
+
+/// The route check's cost on blank nodes: after a clean chain on the rules' route, one commit
+/// of 10 000 annotations, each on a fresh blank node that is no list's cell, keeps the route,
+/// and takes no more than three times what the same commit on 10 000 IRIs takes, and 2 s
+/// besides: a check that grows with the commit's other statements per blank node (quadratic
+/// in all) shows here. Both times printed.
+#[test]
+fn a_commit_of_many_blank_node_annotations_keeps_the_rl_route_at_linear_cost() {
+    const N: usize = 10_000;
+    let clean = ":p owl:propertyChainAxiom ( :q1 :q2 ) . :C a owl:Class . :x a :C . \
+                 :a0 :q1 :a1 . :a1 :q2 :a2 .";
+    let mut times = Vec::new();
+    for subject in ["_:b", ":s"] {
+        let dl = pipeline();
+        insert(&dl, clean).expect("a clean chain");
+        let data: String = (0..N)
+            .map(|i| format!("{subject}{i} rdfs:comment \"{i}\" . "))
+            .collect();
+        let started = std::time::Instant::now();
+        insert(&dl, &data).expect("committed");
+        let took = started.elapsed();
+        let route = dl.store().dl_bounds().last;
+        eprintln!("CELL COST {subject}: {N} annotations committed in {took:?}, route {route}");
+        assert_eq!(route, "rules", "{subject}: an annotation keeps the route");
+        times.push(took);
+    }
+    let (blank, iri) = (times[0], times[1]);
+    assert!(
+        blank <= iri * 3 + std::time::Duration::from_secs(2),
+        "blank nodes {blank:?}, IRIs {iri:?}"
+    );
+}
+
 /// The chain `:p ← :q1 ∘ :q2` written cell by cell, its tail cell the same as `_:m`, a cell
 /// whose member is `:q3` (`_:l2 owl:sameAs _:m`): no cycle, and two member sequences, which
 /// the rules build (`eq-rep-s` gives `_:l2` the `rdf:first` `:q3`). The path `:b0 :q1 :b1 :q3
