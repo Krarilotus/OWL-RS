@@ -6,4 +6,5 @@ mod generator;
 mod properties;
 mod routes;
 mod sweep;
+mod tree;
 mod twin;

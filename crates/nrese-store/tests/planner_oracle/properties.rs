@@ -62,11 +62,15 @@ fn without(rows: &Rows, column: &str) -> Rows {
 }
 
 fn values<'a>(rows: &'a Rows, column: &str, keys: &[&str]) -> BTreeMap<Key, BTreeSet<&'a str>> {
+    // Only rows that passed the drawing site carry its value; rows from a
+    // UNION arm without the site carry none and are not the site's.
     let mut groups = BTreeMap::<_, BTreeSet<_>>::new();
     for row in rows {
-        let group = groups.entry(key(row, keys)).or_default();
         if let Some(value) = row.get(column) {
-            group.insert(value.as_str());
+            groups
+                .entry(key(row, keys))
+                .or_default()
+                .insert(value.as_str());
         }
     }
     groups
@@ -86,15 +90,23 @@ pub fn check(
             let sites = values(twin, column, keys);
             let multiplicity = scope.map(|rows| counts(rows, keys));
             let mut owner = BTreeMap::new();
-            if found.iter().any(|r| !r.contains_key(column)) {
-                return Err(("P1", format!("missing drawn value in ?{column}")));
+            let drawn = |rows: &Rows| rows.iter().filter(|r| r.contains_key(column)).count();
+            if drawn(found) != drawn(twin) {
+                return Err((
+                    "P1",
+                    format!(
+                        "{} rows carry a drawn ?{column}, the twin's {}",
+                        drawn(found),
+                        drawn(twin)
+                    ),
+                ));
             }
             for (key, values) in values(found, column, keys) {
                 let m = multiplicity
                     .as_ref()
                     .and_then(|counts| counts.get(&key).copied())
                     .unwrap_or_else(|| sites[&key].len());
-                if values.is_empty() || values.len() > m {
+                if values.len() > m {
                     return Err((
                         "P1",
                         format!(

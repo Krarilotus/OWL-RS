@@ -70,7 +70,7 @@ impl Query {
     }
 }
 
-fn key_expression(site: &str, keys: &[&str]) -> String {
+pub fn key_expression(site: &str, keys: &[&str]) -> String {
     // A length prefix distinguishes even strings that contain separators.
     // Generated keys use fixed RDF term types within each column.
     let mut args = vec![format!("\"{site}\"")];

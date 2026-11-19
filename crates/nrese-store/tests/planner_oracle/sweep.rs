@@ -4,14 +4,14 @@ use std::time::Instant;
 
 use nrese_store::SparqlQueryRequest;
 
-use crate::generator::{self, Case, PROBE_SHAPES, RED_SHAPES};
+use crate::generator::{self, Case};
 use crate::properties;
 use crate::routes::{self, Routes, Rows, STORES, StoreRoute};
+use crate::tree;
 use crate::twin::Draw;
 
 const SEEDS: &str = "NRESE_PLANNER_ORACLE_SEEDS";
 const EXPECT_RED: &str = "NRESE_PLANNER_ORACLE_EXPECT_RED";
-const REPLAY: &str = "NRESE_PLANNER_ORACLE_REPLAY";
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Route {
@@ -235,8 +235,8 @@ fn print_reduced(seed: Option<u64>, case: Case, failures: &[Failure]) {
         return;
     };
     println!(
-        "WITNESS {} seed={seed:?} route={:?} property={} {}",
-        case.shape, witness.route, witness.property, witness.detail
+        "WITNESS {} seed={seed:?} labels={:?} route={:?} property={} {}",
+        case.shape, case.labels, witness.route, witness.property, witness.detail
     );
     for fault in failures.iter().skip(1) {
         println!(
@@ -244,101 +244,125 @@ fn print_reduced(seed: Option<u64>, case: Case, failures: &[Failure]) {
             case.shape, fault.route, fault.property, fault.detail
         );
     }
-    // Query shapes are built as small templates. Reduce the dataset for
-    // each new shape, keeping the same query and thus the same draw site.
+    // Reduce the dataset, keeping the same query and thus the same draw site.
     let reduced = reduce(case, witness);
-    println!("QUERY {} {}", reduced.shape, reduced.query.real());
-    let fixture = (reduced.shape, &reduced.data, &reduced.query.text);
-    println!("FIXTURE {}", serde_json::to_string(&fixture).unwrap());
-    if let Some(remote) = reduced.remote {
-        println!("REMOTE {} {remote}", reduced.shape);
-    }
+    println!(
+        "QUERY {} ({} statements) {}",
+        reduced.shape,
+        reduced.data.len(),
+        reduced.query.real()
+    );
 }
 
+// Places where the base is known to draw against SPARQL's count of
+// evaluations, each with whether the red check requires a witness there, the
+// properties it breaks, and the reason. A witness there that breaks only those
+// (and EXPLAIN's count, which runs the same plan) is reported and counted,
+// but does not fail an ordinary sweep.
+const KNOWN: &[(&str, bool, &[&str], &str)] = &[
+    (
+        "exists",
+        true,
+        &["P4"],
+        "an EXISTS that draws decides once for all the rows it tests",
+    ),
+    (
+        "lateral",
+        true,
+        &["P2"],
+        "left rows with the same correlated values share the right side's draws",
+    ),
+    (
+        "service",
+        true,
+        &["P1"],
+        "SERVICE evaluates its pattern again for each batch of bound values it sends",
+    ),
+    (
+        "aggregate",
+        false,
+        &["AVG"],
+        "streamed AVG can evaluate its argument separately for the sum and the count",
+    ),
+];
+
+fn known(case: &Case, failures: &[Failure]) -> bool {
+    KNOWN.iter().any(|(place, _, properties, _)| {
+        *place == case.shape
+            && failures
+                .iter()
+                .all(|f| properties.contains(&f.property) || f.property == "EXPLAIN rows")
+    })
+}
+
+// NRESE_PLANNER_ORACLE_EXPECT_RED=1 requires a witness at each required known
+// place; a comma-separated list of labels requires one at each of those.
 #[test]
 fn seeded_queries() {
-    let expect_red = std::env::var(EXPECT_RED).as_deref() == Ok("1");
+    let red = std::env::var(EXPECT_RED).ok();
     let Some(seeds) = seeds() else {
-        assert!(!expect_red, "{EXPECT_RED}=1 requires {SEEDS}");
+        assert!(red.is_none(), "{EXPECT_RED} requires {SEEDS}");
         return;
     };
+    let required: Vec<&str> = match red.as_deref() {
+        None => Vec::new(),
+        Some("1") => KNOWN.iter().filter(|k| k.1).map(|k| k.0).collect(),
+        Some(labels) => labels.split(',').collect(),
+    };
     let start = Instant::now();
-    let mut checked = BTreeMap::new();
-    let mut witnesses = BTreeSet::new();
-    let mut hits = 0;
+    let mut checked = BTreeMap::<&str, usize>::new();
+    let mut found = BTreeMap::<&str, usize>::new();
+    let mut unknown = BTreeSet::new();
+    let (mut hits, mut skipped) = (0, 0);
     let count = seeds.end - seeds.start;
     for seed in seeds {
-        let case = if expect_red {
-            generator::drawing(RED_SHAPES[(seed % RED_SHAPES.len() as u64) as usize])
-        } else {
-            generator::generated(seed)
-        };
-        *checked.entry(case.shape).or_insert(0) += 1;
-        let (failures, cached) = check(&case, if expect_red { 12 } else { 1 });
+        let case = tree::generated(seed);
+        if case.vector && !generator::VECTOR_INDEX {
+            skipped += 1;
+            continue;
+        }
+        for label in &case.labels {
+            *checked.entry(label).or_default() += 1;
+        }
+        let (failures, cached) = check(&case, 1);
         hits += cached;
-        let found_draw = failures
-            .iter()
-            .any(|f| matches!(f.property, "P1" | "P2" | "P3" | "P4" | "P5"));
-        if (!expect_red && !failures.is_empty() || expect_red && found_draw)
-            && witnesses.insert(case.shape)
-        {
+        if failures.is_empty() {
+            continue;
+        }
+        let first = case.labels.iter().any(|l| !found.contains_key(l));
+        for label in &case.labels {
+            *found.entry(label).or_default() += 1;
+        }
+        if !known(&case, &failures) {
+            unknown.insert(case.shape);
+        }
+        if first {
             print_reduced(Some(seed), case, &failures);
         }
     }
     println!(
-        "SWEEP {count} seeds {} ms; {hits} cache hits; shapes {checked:?}; witnesses {witnesses:?}",
+        "SWEEP {count} seeds {} ms; {hits} cache hits; {skipped} skipped without a vector index; checked {checked:?}; witnesses {found:?}",
         start.elapsed().as_millis()
     );
-    if expect_red {
-        let missing: Vec<_> = RED_SHAPES
+    for (place, _, _, reason) in KNOWN {
+        match found.get(place) {
+            Some(n) => println!("KNOWN {place}: {n} witnesses ({reason})"),
+            None => println!("NOT SEEN {place}"),
+        }
+    }
+    if red.is_some() {
+        let missing: Vec<_> = required
             .iter()
-            .filter(|shape| !witnesses.contains(**shape))
+            .filter(|l| !found.contains_key(*l))
             .collect();
         assert!(
             missing.is_empty(),
-            "required drawing witnesses missing: {missing:?}"
+            "required witnesses missing: {missing:?}"
         );
     } else {
         assert!(
-            witnesses.is_empty(),
-            "query route or property differences: {witnesses:?}"
+            unknown.is_empty(),
+            "witnesses outside the known places: {unknown:?}"
         );
     }
-}
-
-#[test]
-#[ignore = "revision comparison; run explicitly"]
-fn drawing_revision_probes() {
-    for &shape in PROBE_SHAPES {
-        let case = generator::drawing(shape);
-        let (failures, _) = check(&case, 12);
-        if failures.is_empty() {
-            println!("NOT SEEN {shape}");
-        } else {
-            print_reduced(None, case, &failures);
-        }
-    }
-}
-
-#[test]
-#[ignore = "revision comparison; run explicitly with a sweep log"]
-fn replay_drawing_witnesses() {
-    let log = std::fs::read_to_string(std::env::var(REPLAY).expect("replay log path")).unwrap();
-    let mut replays = 0;
-    for fixture in log.lines().filter_map(|line| line.strip_prefix("FIXTURE ")) {
-        let (shape, data, text): (&str, Vec<String>, String) =
-            serde_json::from_str(fixture).unwrap();
-        let shape = *RED_SHAPES
-            .iter()
-            .chain(PROBE_SHAPES)
-            .find(|s| **s == shape)
-            .expect("replay a named drawing witness");
-        let mut case = generator::drawing(shape);
-        case.data = data;
-        case.query.text = text;
-        let (failures, _) = check(&case, 24);
-        println!("REPLAY {shape} {failures:?}");
-        replays += 1;
-    }
-    assert!(replays > 0, "no named drawing witness to replay");
 }

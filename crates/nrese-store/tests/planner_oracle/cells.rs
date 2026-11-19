@@ -11,73 +11,63 @@ fn drawing(shape: &'static str) {
 
 // Each group evaluates its own expressions before its solutions join.
 #[test]
-#[ignore = "the planned join draws a new blank node for each VALUES row"]
 fn one_blank_node_for_one_group_solution() {
     drawing("site-1");
 }
 
 #[test]
-#[ignore = "the planned group filter draws separately for joined copies"]
 fn a_drawing_filter_keeps_all_copies_or_none() {
     drawing("site-2");
 }
 
 #[test]
-#[ignore = "the planned join decides a drawing OPTIONAL condition again for each joined row"]
 fn an_optional_condition_decides_once_for_its_group() {
     drawing("optional-condition");
 }
 
 #[test]
-#[ignore = "duplicate VALUES rows get separate draws from a single group solution"]
 fn duplicate_keys_copy_the_same_draw() {
     drawing("duplicate-keys");
 }
 
 #[test]
-#[ignore = "the nested drawing filter is re-evaluated from sibling keys"]
 fn a_sibling_binding_does_not_repeat_a_nested_draw() {
     drawing("nested-sibling");
 }
 
 #[test]
-#[ignore = "the unrelated filter draws again for separate joined rows"]
 fn an_unrelated_filter_draws_once() {
     drawing("unrelated-group");
 }
 
 #[test]
-#[ignore = "an unbound seed repeats a draw already matched by the bound seed"]
 fn an_unbound_seed_meets_solutions_already_drawn() {
     drawing("undef");
 }
 
 #[test]
-#[ignore = "duplicate seeds inside GRAPH get separate blank nodes"]
 fn a_named_graph_copies_a_group_draw() {
     drawing("graph-duplicates");
 }
 
 #[test]
-#[ignore = "the union arms draw again for duplicate seed rows"]
 fn each_union_arm_draws_before_its_join() {
     drawing("union-arms");
 }
 
 #[test]
-#[ignore = "an inner VALUES group draws separately for duplicate outer seeds"]
 fn values_inside_a_group_count_only_at_that_site() {
     drawing("group-values");
 }
 
 #[test]
-#[ignore = "EXISTS shares one filter draw across separately tested rows"]
+#[ignore = "an EXISTS that draws decides once for all the rows it tests"]
 fn exists_draws_independently_for_each_tested_row() {
     drawing("exists-independent");
 }
 
 #[test]
-#[ignore = "LATERAL shares a right-side draw between rows with the same correlated key"]
+#[ignore = "left rows with the same correlated values share one right-side draw"]
 fn lateral_draws_for_each_left_row() {
     drawing("lateral-draw");
 }
@@ -93,13 +83,13 @@ fn vector_hits_copy_the_draw_from_an_unrelated_group() {
 }
 
 #[test]
-#[ignore = "a remote solution with an unbound join key can draw again in another batch"]
+#[ignore = "SERVICE evaluates its pattern again for each batch of bound values it sends"]
 fn a_remote_solution_draws_once_even_if_joined_in_batches() {
     drawing("service-batches");
 }
 
 #[test]
-#[ignore = "streamed AVG can evaluate the drawing argument separately for sum and count"]
+#[ignore = "streamed AVG can evaluate its argument separately for the sum and the count"]
 fn streamed_average_uses_the_same_arguments_for_sum_and_count() {
     drawing("average-draw");
 }
