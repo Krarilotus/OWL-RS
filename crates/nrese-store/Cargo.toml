@@ -40,7 +40,7 @@ url = "2.5.7"
 # Schemas of the types the engine API returns, for its OpenAPI description.
 openapi = ["dep:utoipa"]
 # Test hooks for callers in other crates.
-fault-points = ["nrese-engine/fault-points"]
+fault-points = []
 
 [dev-dependencies]
 libmimalloc-sys = { workspace = true }

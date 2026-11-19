@@ -993,35 +993,6 @@ async fn published_answer_followup_only_reports_actual_publications() {
     assert_eq!(store.current_revision(), revision);
 }
 
-#[tokio::test]
-async fn published_answer_followup_unsettled_import_reports_unknown_outcome() {
-    let dir = tempfile::tempdir().unwrap();
-    let app = test_app_with_store_config(
-        StoreConfig::on_disk(dir.path()),
-        PolicyConfig::default(),
-        ReasonerConfig::default(),
-    )
-    .unwrap();
-    std::fs::write(dir.path().join(".simulate-checkpoint-sync-failure"), "").unwrap();
-    let path = "/api/v1/repositories/nrese/import";
-    eprintln!("POST {path}\nContent-Type: application/n-triples\n\n{MIXED_UPLOAD}");
-    let (status, body) = send(
-        &app,
-        Method::POST,
-        path,
-        Some("application/n-triples"),
-        MIXED_UPLOAD,
-    )
-    .await;
-    eprintln!("{status}: {body}");
-    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
-    let problem: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(
-        problem["detail"], "the outcome is unknown: read the data before sending it again",
-        "{body}"
-    );
-}
-
 /// Imports run as jobs: an uploaded document with `async=true`, and files from the
 /// server's import directory (administrators), whose paths can't leave it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

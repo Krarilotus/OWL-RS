@@ -887,9 +887,6 @@ pub async fn import(
     .map_err(|error| ApiError::internal(error.to_string()))?
     .map_err(|error| match error {
         nrese_store::StoreError::LoadPublished { .. } => ApiError::internal(error.to_string()),
-        nrese_store::StoreError::Engine(nrese_store::EngineError::CommitUnsettled { .. }) => {
-            ApiError::internal("the outcome is unknown: read the data before sending it again")
-        }
         _ => ApiError::bad_request(error.to_string()),
     })?;
     let reasoning = rematerialised(&state).await?;
