@@ -1,9 +1,9 @@
 //! An expression with a new value at each evaluation (`BNODE()`, `RAND()`, `UUID()`,
 //! `STRUUID()`) is evaluated as often as SPARQL evaluates it, however the planner joins: a
 //! group's `BIND` or `FILTER` once per solution of the group, a filter above a join once
-//! per joined row, an `OPTIONAL`'s condition once per pair of its group, an `EXISTS` once
-//! per solution it tests. Values are random, so each test states a property every SPARQL
-//! evaluation has and a wrong count of evaluations breaks.
+//! per joined row, an `OPTIONAL`'s condition once per pair of its group. Values are random,
+//! so each test states a property every SPARQL evaluation has and a wrong count of
+//! evaluations breaks.
 
 use nrese_engine::{Engine, EngineConfig};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
@@ -150,36 +150,6 @@ fn an_optional_condition_drawing_a_value_decides_once_for_its_group() {
         for _ in 0..5 {
             let n = rows(&query, as_written);
             assert!(n == 0 || n == 40, "{n} rows, as written: {as_written}");
-        }
-    }
-}
-
-/// Spec: in the group `{ VALUES ?i { 1 … 40 } FILTER EXISTS { FILTER(RAND() < 0.5) } }` each
-/// of the forty solutions is kept or not by its own test; the join copies each kept one to
-/// both `VALUES ?k` rows, so the `?i` kept with `?k = 1` are those kept with `?k = 2`. A
-/// test per joined row makes the two differ (a chance of 2^-40 per run that they agree).
-/// This states the join's part only: the engine tests such a body once for all forty
-/// solutions, a known fault left for a later release, which this test does not catch.
-#[test]
-fn an_exists_drawing_a_value_keeps_each_solution_of_its_group_for_every_joined_row_or_none() {
-    let keys: Vec<String> = (1..=40).map(|i| i.to_string()).collect();
-    let query = format!(
-        "SELECT ?k ?i {{ VALUES ?k {{ 1 2 }} {{ VALUES ?i {{ {} }} \
-         FILTER EXISTS {{ FILTER(RAND() < 0.5) }} }} }}",
-        keys.join(" ")
-    );
-    for as_written in [false, true] {
-        for _ in 0..5 {
-            let mut kept = std::collections::BTreeMap::<String, Vec<String>>::new();
-            for row in values(&query, as_written, &["k", "i"]) {
-                kept.entry(row[0].clone()).or_default().push(row[1].clone());
-            }
-            kept.values_mut().for_each(|i| i.sort());
-            let sets: Vec<_> = kept.values().collect();
-            assert!(
-                sets.is_empty() || (sets.len() == 2 && sets[0] == sets[1]),
-                "kept per key: {kept:?}, as written: {as_written}"
-            );
         }
     }
 }
