@@ -119,7 +119,7 @@ impl Comparison<'_> {
     fn compare(
         &mut self,
         (mode, judge, write): (&'static str, &'static str, usize),
-        store: &StoreService,
+        store: Option<&StoreService>,
         (accepted, wanted): (bool, bool),
         (step, (expected, without_deviation)): (&Step, &(Publication, Facts)),
     ) -> Option<bool> {
@@ -157,6 +157,7 @@ impl Comparison<'_> {
         if accepted != wanted {
             report(Answer::Accept(wanted), format!("accepted={accepted}"));
         }
+        let store = store?;
         let (rows, select_status) = judges::rows(store);
         for row in expected.required.difference(&rows) {
             if without_deviation.contains(row) {
@@ -223,14 +224,15 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
             let mut previous = None;
             for (index, (step, expected)) in steps.iter().zip(&projected).enumerate() {
                 let (store, accepted) = judges::first_and_rebuild(mode, &step.ordered, rebuild);
-                let state = if accepted {
+                let state = if accepted || rebuild {
                     (step, expected)
                 } else {
                     (&empty, &initial)
                 };
                 let answer = compare.compare(
                     (mode, judge, index),
-                    &store,
+                    // Rematerialisation reports consistency without a transactional write.
+                    (!rebuild).then_some(store.as_ref()),
                     (accepted, !step.model.inconsistent),
                     state,
                 );
@@ -278,7 +280,12 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
                     committed
                 };
                 if compare.enabled(mode, judge) {
-                    compare.compare((mode, judge, index), &store, (accepted, wanted), visible);
+                    compare.compare(
+                        (mode, judge, index),
+                        Some(store.as_ref()),
+                        (accepted, wanted),
+                        visible,
+                    );
                 }
                 if restart {
                     drop(pipeline);
@@ -288,7 +295,7 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
                     if reopened {
                         compare.compare(
                             (mode, "reopened", index),
-                            &store,
+                            Some(store.as_ref()),
                             (accepted, accepted),
                             visible,
                         );
