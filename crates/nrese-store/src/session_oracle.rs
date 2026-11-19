@@ -99,7 +99,7 @@ pub(super) struct ClientRecord {
 }
 
 impl ClientRecord {
-    pub fn key(&self) -> impl Ord + Hash {
+    pub fn key(&self) -> impl Ord + std::hash::Hash {
         (
             self.owed,
             self.first_shown,
