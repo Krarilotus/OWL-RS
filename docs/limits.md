@@ -361,14 +361,25 @@ leave something out.
   contradicts, isn't caught by the OWL 2 RL rules' incremental check.
 - Under `owl2-dl`, an OWL 2 RL clash in an ontology with an empty intersection or union is
   stated as undecided, not as an inconsistency.
-- Under `owl2-dl`, a blank node that no axiom uses but that carries two class structures at
-  once (an `owl:intersectionOf` beside an `owl:allValuesFrom` restriction, or an `owl:hasValue`
-  beside an `owl:allValuesFrom`) isn't OWL 2 DL. The OWL reader leaves it unused and the commit is taken, but the
-  OWL 2 RL rules still apply both structures, so an answer can be told `complete` that OWL 2 DL
-  doesn't entail. For one: with `_:x owl:intersectionOf ( :A :B ) ; owl:onProperty :p ;
-  owl:allValuesFrom :D` and `:x a :A , :B . :x :p :y`, `ASK { :y a :D }` is `true`, told
-  `complete`; the earlier `main` gives the same answer, with no status. Structures of this
-  kind can do the same.
+- Under `owl2-dl`, the status an answer is told (`complete`, `sound-only`) is a promise for data
+  that is an OWL 2 DL ontology, and this release doesn't yet check all of OWL 2 DL's conditions
+  on the data. Data that breaks one it doesn't check isn't refused for it, and the OWL 2 RL
+  rules still read it, so an answer can be told `complete` or `sound-only` where OWL 2 DL
+  doesn't entail it. Remove structures the OWL reader leaves unused and use each name as one
+  kind only, declared as that kind, or use `owl2-rl`, whose promise is the rules' reading. Two
+  kinds are known, and other structures and names of these kinds can do the same:
+  - A structure the OWL reader can't read as OWL 2 DL and leaves unused, such as a blank node
+    that no axiom uses but that carries two class structures at once. With its classes and its
+    property declared, and with
+    `_:x owl:intersectionOf ( :A :B ) ; owl:onProperty :p ; owl:allValuesFrom :D` and
+    `:x a :A , :B . :x :p :y`, `ASK { :y a :D }` is `true`, told `complete`; the earlier `main`
+    gives the same answer, with no status. An `owl:hasValue` beside an `owl:allValuesFrom` does
+    the same.
+  - A name used as two kinds of entity, such as a property never declared and used both with a
+    literal and with a resource. With `:C a owl:Class . :p rdfs:domain :C . :a :p "x" .
+    :b :p :c`, `ASK { :a a :C }` is `true`, told `complete`; the earlier `main` gives the same
+    answer, with no status. An annotation property also declared functional can make two
+    names equal, told `sound-only`.
 - Labels and notes on a store with `owl:sameAs` read as `unsound`. Under `owl2-dl`, and under `owl2-ql`
   and `owl2-rl` where the QL rewriting answers, a query that reads an annotation property
   (`rdfs:label`, `rdfs:comment`, or one the data declares) or any predicate (a variable
