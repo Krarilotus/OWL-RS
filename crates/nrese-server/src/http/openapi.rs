@@ -329,7 +329,8 @@ const QUERY_413: &str =
 const QUERY_422: &str = "`dl-answers=exact`, and the answers can't be proven complete";
 const QUERY_501: &str = "`inference-scope=dataset` where this server can't serve it: \
     `reasoner.equality = \"compact\"`, `reasoner.unnamed_classes = \"skip\"`, no support sets \
-    for the rules in force, a text or vector search, or a computed spatial relation";
+    for the rules in force, a text or vector search, ranked globally or by the reader \
+    (`store.search_scope`), or a computed spatial relation";
 const SCOPE: &str = "`dataset`: the inferred statements are those that follow from the \
     dataset's graphs alone (`FROM` and `FROM NAMED`, or `default-graph-uri` and \
     `named-graph-uri`), without the store's default graph; answers are `not-certified`";
