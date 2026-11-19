@@ -357,6 +357,8 @@ pub fn maintain_with(
         )?);
     }
     let unkept: bool;
+    let delta_ran: bool;
+    let deletes: bool;
     let update = {
         let base = EngineBase::new(tx, &program.axioms);
         // The change's own probes of the base (a deleted fact still asserted elsewhere, a
@@ -412,8 +414,9 @@ pub fn maintain_with(
         // Facts with an inverse expression as their predicate: the stored closure lacks the
         // base's, so a delta can't read them. Such a change runs its delta, whose consistency
         // check stands, and is then rebuilt: the closure after it is the one a rebuild gives.
-        unkept = !(first_load || inserted.is_empty() && deleted.is_empty())
-            && has_inverse_expression(tx.base(), &prep).map_err(interrupted)?;
+        delta_ran = !(first_load || inserted.is_empty() && deleted.is_empty());
+        deletes = !deleted.is_empty();
+        unkept = delta_ran && has_inverse_expression(tx.base(), &prep).map_err(interrupted)?;
         // A rebuild reads the asserted facts and writes the closure, both about the size
         // of the stored state; the policy offers it to a change that inserts nothing
         // ([`delta::policy::Plan::Rebuild`]).
@@ -472,6 +475,18 @@ pub fn maintain_with(
         }
     };
     let mut update = update;
+    // A list past the cap ([`crate::lists::MAX_VARIANTS`]) in the program after the delta,
+    // whether the state before held it or this change's rounds read it: the rules it gave
+    // while within the cap are in no program made over the state, so the delta derived
+    // nothing from it. Such a change runs its delta, whose checks (the list read as
+    // written) stand, and is then rebuilt: the batch's rounds make the list's rules again
+    // as they reach it.
+    let capped = delta_ran
+        && update.policy.plan != delta::policy::Plan::Rebuild
+        && (update.program.as_ref().or(ground)).is_some_and(|program| {
+            (program.list_diagnostics.iter())
+                .any(|d| d.problem == crate::lists::ListProblem::TooManyVariants)
+        });
     // A list that already stopped at its budget makes the change inconsistent: the
     // datatype checks would add nothing to that. A first load judged by its rebuild has
     // them in the batch's report already.
@@ -489,7 +504,8 @@ pub fn maintain_with(
     let (mut inserted, mut removed) = (0, 0);
     // Over representatives, a change that may split a class is rebuilt (B3a: the
     // translation can't follow it; the representative view for the delta executor is B3b).
-    let mut rebuild = revived || unkept || update.policy.plan == delta::policy::Plan::Rebuild;
+    let mut rebuild =
+        revived || unkept || capped || update.policy.plan == delta::policy::Plan::Rebuild;
     if !rebuild && program.stores_representatives() {
         match store_over_representatives(program, &update, &missing_axioms, tx) {
             Some((added, dropped)) => (inserted, removed) = (added, dropped),
@@ -525,7 +541,20 @@ pub fn maintain_with(
         if operation.fired() {
             return Err(operation.interrupted());
         }
-        rebuilt_violations = uses_rebuilt_report.then(|| std::mem::take(&mut closure.violations));
+        rebuilt_violations = uses_rebuilt_report.then(|| {
+            let found = std::mem::take(&mut closure.violations);
+            // A change rebuilt for a list past the cap that deletes nothing is refused if
+            // either report refuses it: the rebuild reads the list from its asserted cells
+            // in its rounds, the delta from the cells as written over every name. Without a
+            // clash of its own, the rebuild's report gives way to the delta's. One that
+            // deletes is judged by the rebuild's alone: the delta's program lacks the list's
+            // rules, so its overdeletion can't follow what they derived, and a fact the
+            // change took the support of can still clash there.
+            match capped && !deletes && found.consistent() {
+                true => std::mem::take(&mut update.violations),
+                false => found,
+            }
+        });
         // Only the difference is applied: O(stored + rebuilt closure) to sort and walk,
         // and a transaction update per fact that changed. A stored snapshot shares the old
         // runs and avoids expanding compact equality.
@@ -578,7 +607,7 @@ pub fn maintain_with(
         }
     }
     // The delta ran (its violations and diagnostics stand), and the closure is a rebuild's.
-    if unkept {
+    if unkept || capped {
         update.policy.plan = delta::policy::Plan::Rebuild;
     }
     Ok(Maintenance {
