@@ -12,10 +12,11 @@
 //! | `P1 UNION P2` | the union of both, each from the seed |
 //! | `OPTIONAL`, `BIND`, `FILTER` | inside, when every seed variable the part reads is certainly bound by the part it applies to (else the seed's value would change what it computes) |
 //!
-//! Anything else is evaluated alone and joined, and so is a `FILTER`, `BIND` or OPTIONAL
-//! condition that draws a new value per evaluation (`RAND`, `BNODE`, …, in an `EXISTS`
-//! too): from the seed it would draw once per seed row, where SPARQL draws once per
-//! solution of its pattern. A subquery is evaluated alone anyway. A join of
+//! Anything else is evaluated alone and joined. A `FILTER`, `BIND` or OPTIONAL condition
+//! that draws a new value per evaluation (`RAND`, `BNODE`, …, in an `EXISTS` too) would
+//! draw once per seed row, where SPARQL draws once per solution of its pattern: its part
+//! is evaluated from the seed's distinct values of the variables the part certainly binds
+//! (each solution meets one), or alone where there are none. A join of
 //! two groups starts with the one the statistics say is smaller, unless an ORDER BY inside
 //! either fixes the row order. The right side of an OPTIONAL is evaluated from the left
 //! side's distinct values of the variables the right side certainly binds.
@@ -191,14 +192,19 @@ impl Context<'_> {
         }
         // An expression that draws a value per evaluation (`RAND`, `BNODE`, …) runs once per
         // solution of its pattern, or per pair of its OPTIONAL, not once per seed row: its
-        // part is evaluated alone. The walk for the variables it reads tells that too.
+        // part is evaluated from the seed's distinct keys, or alone ([`Self::drawn_from_keys`]).
+        // The walk for the variables it reads tells whether it draws.
         match pattern {
             GraphPattern::Bgp { patterns } if self.probes_pay(&seed, patterns) => {
                 self.bgp_from(seed, patterns, &mut Vec::new())
             }
             GraphPattern::Filter { expr, inner } => {
                 let (read, draws) = reads_and_draws(expr);
-                if draws || !reads_only_bound(&read, &pushdown::certain(inner), &seed) {
+                if draws {
+                    return self
+                        .drawn_from_keys(seed, pattern, inner, |rows| self.filter(rows, expr));
+                }
+                if !reads_only_bound(&read, &pushdown::certain(inner), &seed) {
                     return self.join_alone(seed, pattern);
                 }
                 if let GraphPattern::Bgp { patterns } = &**inner
@@ -264,25 +270,39 @@ impl Context<'_> {
                     read.extend(variables);
                     draws = drawn;
                 }
-                if draws || !reads_only_bound(&read, &pushdown::certain(left), &seed) {
+                if draws {
+                    return self.drawn_from_keys(seed, pattern, left, |rows| {
+                        self.optional(rows, right, expression.as_ref())
+                    });
+                }
+                if !reads_only_bound(&read, &pushdown::certain(left), &seed) {
                     return self.join_alone(seed, pattern);
                 }
                 let left = self.eval_from(seed, left)?;
                 self.optional(left, right, expression.as_ref())
             }
-            GraphPattern::Extend { inner, bindings }
-                if bindings.iter().all(|(variable, expression)| {
+            GraphPattern::Extend { inner, bindings } => {
+                let mut draws = false;
+                let inside = bindings.iter().all(|(variable, expression)| {
                     seed.column(variable).is_none() && {
-                        let (read, draws) = reads_and_draws(expression);
-                        !draws && reads_only_bound(&read, &pushdown::certain(inner), &seed)
+                        let (read, drawn) = reads_and_draws(expression);
+                        draws = drawn;
+                        !drawn && reads_only_bound(&read, &pushdown::certain(inner), &seed)
                     }
-                }) =>
-            {
-                let mut solutions = self.eval_from(seed, inner)?;
-                for (variable, expression) in bindings {
-                    solutions = self.extend(solutions, variable, expression)?;
+                });
+                let extend = |mut solutions: Solutions| -> NativeResult<Solutions> {
+                    for (variable, expression) in bindings {
+                        solutions = self.extend(solutions, variable, expression)?;
+                    }
+                    Ok(solutions)
+                };
+                if inside {
+                    extend(self.eval_from(seed, inner)?)
+                } else if draws {
+                    self.drawn_from_keys(seed, pattern, inner, extend)
+                } else {
+                    self.join_alone(seed, pattern)
                 }
-                Ok(solutions)
             }
             _ => self.join_alone(seed, pattern),
         }
@@ -291,6 +311,26 @@ impl Context<'_> {
     fn join_alone(&self, seed: Solutions, pattern: &GraphPattern) -> NativeResult<Solutions> {
         let alone = self.eval(pattern)?;
         self.join(seed, alone)
+    }
+
+    /// `Join(seed, pattern)`, where `pattern` applies an expression that draws a value per
+    /// evaluation (`apply`) to the rows of `inner`. `inner` is evaluated from the seed's
+    /// distinct values of the variables it certainly binds, so each of its solutions meets
+    /// one key and is drawn for once, as SPARQL draws; the join then copies it to every
+    /// seed row it fits. Without such keys (none shared, or one unbound somewhere)
+    /// `pattern` is evaluated alone.
+    fn drawn_from_keys(
+        &self,
+        seed: Solutions,
+        pattern: &GraphPattern,
+        inner: &GraphPattern,
+        apply: impl FnOnce(Solutions) -> NativeResult<Solutions>,
+    ) -> NativeResult<Solutions> {
+        let Some(keys) = self.keys(&seed, &pushdown::certain(inner)) else {
+            return self.join_alone(seed, pattern);
+        };
+        let rows = apply(self.eval_from(keys, inner)?)?;
+        self.join(seed, rows)
     }
 
     /// Whether joining `seed` pattern by pattern will probe the index: the seed is small
