@@ -478,8 +478,8 @@ struct Reader<'a> {
     annotation_uses: BTreeSet<Term>,
     annotation_axioms: BTreeSet<Term>,
     /// The properties declared object or data properties (`owl:ObjectProperty`,
-    /// `owl:DatatypeProperty`), not typed so by a characteristic: what makes a statement about
-    /// the ontology no annotation (Table 10).
+    /// `owl:DatatypeProperty`) or by OWL 2 itself (the four built-in ones), not typed so by a
+    /// characteristic: what makes a statement about the ontology no annotation (Table 10).
     logical: HashSet<Term>,
     shacl: BTreeSet<Term>,
     /// The cells of the lists read to `rdf:nil` ([`Self::cells_outside_their_lists`]).
@@ -937,6 +937,7 @@ impl<'a> Reader<'a> {
                 if !entry.contains(&kind) {
                     entry.push(kind);
                 }
+                self.logical.insert(property);
             }
         }
     }

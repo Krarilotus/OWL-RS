@@ -1,7 +1,7 @@
 # Ontologies a W3C test case gives in RDF/XML and in the functional syntax whose two
 # readings differ: "name (Role)<TAB>why". The run fails on a difference not listed here
 # and on a listed one that no longer differs.
-FS2RDF-domain-range-expression-ar (Premise)	test data: the functional syntax declares p3 and p4 data properties and uses them in object property axioms (ObjectPropertyRange, ObjectPropertyDomain), not OWL 2 DL (reported: TwoKinds); the RDF/XML reads them as data property axioms
+FS2RDF-domain-range-expression-ar (Premise)	test data: the functional syntax declares p3 to p7 data properties and uses them in object property axioms (ObjectPropertyRange, ObjectPropertyDomain; p5 to p7 under ObjectInverseOf), not OWL 2 DL (reported: TwoKinds); the RDF/XML reads p3 and p4 as data property axioms
 FS2RDF-domain-range-simple-ar (Premise)	test data: the functional syntax declares p3 to p6 data properties and uses them in object and annotation property axioms, not OWL 2 DL (reported: TwoKinds); the RDF/XML reads them as data property axioms
 New-Feature-Keys-007 (NonConclusion)	test data: the RDF/XML declares Man a class, the functional syntax doesn't
 New-Feature-Keys-007 (Premise)	test data: the functional syntax has SubClassOf(Man Person), the RDF/XML doesn't

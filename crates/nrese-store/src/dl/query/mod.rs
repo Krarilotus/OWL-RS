@@ -943,19 +943,32 @@ fn copied<'a>(
 }
 
 /// The properties of the asserted statements about a node typed `owl:Ontology` (the
-/// ontology's header), each statement and typing in a graph `readable` takes; lazily, a node
+/// ontology's header), each statement and typing in a graph `readable` takes, but an object
+/// or data property's, whose statement there is an assertion (*Mapping to RDF* Table 10; the
+/// reader's rule): one declared so in a graph `readable` takes, or built in; lazily, a node
 /// at a time.
 fn header_properties(
     snapshot: &Snapshot,
     readable: impl Fn(TermId) -> bool + Copy,
 ) -> impl Iterator<Item = TermId> {
+    use nrese_owl::vocab::OWL;
     let id = move |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
-    let (ty, ontology) = (
-        id(RDF_TYPE),
-        id(&format!("{}Ontology", nrese_owl::vocab::OWL)),
-    );
+    let (ty, ontology) = (id(RDF_TYPE), id(&format!("{OWL}Ontology")));
     let asserted =
         move |s, p, o| snapshot.quads_for_pattern_in(ReadModel::Asserted, &any_graph(s, p, o));
+    let declaring = ["ObjectProperty", "DatatypeProperty"].map(|k| id(&format!("{OWL}{k}")));
+    let built_in = [
+        "topObjectProperty",
+        "bottomObjectProperty",
+        "topDataProperty",
+        "bottomDataProperty",
+    ]
+    .map(|p| id(&format!("{OWL}{p}")));
+    let logical = move |p: TermId| {
+        built_in.contains(&Some(p))
+            || (declaring.into_iter().flatten())
+                .any(|k| asserted(Some(p), ty, Some(k)).any(|q| readable(q.graph)))
+    };
     let nodes = ty
         .zip(ontology)
         .into_iter()
@@ -966,6 +979,7 @@ fn header_properties(
         (asserted(Some(node.subject), None, None))
             .filter(move |q| readable(q.graph) && Some(q.predicate) != ty)
             .map(|q| q.predicate)
+            .filter(move |&p| !logical(p))
     })
 }
 
