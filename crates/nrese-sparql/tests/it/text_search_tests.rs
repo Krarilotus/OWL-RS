@@ -1066,3 +1066,109 @@ fn a_pre_bound_blank_node_a_search_names_reads_stored_statements() {
         answers_as_written_with(&engine, shape, query, options.clone(), want);
     }
 }
+
+/// `a` and `b` labelled "alpha one" and "alpha two", `c` labelled "gamma" with a statement
+/// under each search predicate whose object is "alpha", and `ex:x` naming the two search
+/// predicates as data. No statement's object is "one", which only `a`'s label matches.
+fn routes_engine() -> Engine {
+    engine_of(
+        "@prefix ex: <http://example.com/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         ex:a rdfs:label \"alpha one\" . ex:b rdfs:label \"alpha two\" . ex:c rdfs:label \"gamma\" .
+         ex:c <http://jena.apache.org/text#query> \"alpha\" .
+         ex:c <http://www.bigdata.com/rdf/search#search> \"alpha\" .
+         ex:x ex:jena <http://jena.apache.org/text#query> ;
+             ex:bds <http://www.bigdata.com/rdf/search#search> .",
+    )
+}
+
+/// The rewrites EXPLAIN reports for `query`, optimised: none where it is evaluated as written.
+fn rewrites(engine: &Engine, query: &str) -> Vec<&'static str> {
+    explain_query(&engine.snapshot(), &parsed(query), &QueryOptions::default())
+        .unwrap()
+        .rewrites
+}
+
+/// Spec: an `EXISTS` puts an outer row's predicate into its pattern only where evaluating
+/// the pattern once and joining it could answer otherwise: a subquery with a `LIMIT`, an
+/// `OPTIONAL` read by a filter. There a search IRI from outside is a search, and the query
+/// is evaluated as written. Evaluated once and joined (a plain group, a filter reading the
+/// row, an `EXISTS` inside an expression), the predicate reads the stored statements, and
+/// the query keeps its plan: join-groups makes one pattern of the two groups before it.
+/// "one" matches `a`'s label and no statement's object, so a search keeps the row under
+/// `EXISTS` and the stored statements drop it; `NOT EXISTS` the other way round.
+#[test]
+fn an_exists_puts_a_search_predicate_in_only_per_value() {
+    let engine = routes_engine();
+    for (vocabulary, iri, full) in [
+        ("jena", "text:query", "http://jena.apache.org/text#query"),
+        (
+            "bds",
+            "bds:search",
+            "http://www.bigdata.com/rdf/search#search",
+        ),
+    ] {
+        let outside = format!(
+            "{{ ex:x ex:{vocabulary} ?p }} VALUES ?y {{ 1 }} {{ ex:x ex:{vocabulary} ?p }}"
+        );
+        for (polarity, not) in [("EXISTS", ""), ("NOT EXISTS", "NOT ")] {
+            for (shape, filter, per_value) in [
+                (
+                    "joined",
+                    format!("FILTER {not}EXISTS {{ ?s ?p \"one\" }}"),
+                    false,
+                ),
+                (
+                    "correlated",
+                    format!("BIND(1 AS ?k) FILTER {not}EXISTS {{ ?s ?p \"one\" FILTER(?k = 1) }}"),
+                    false,
+                ),
+                (
+                    "in an expression",
+                    format!("BIND(1 AS ?k) FILTER({not}EXISTS {{ ?s ?p \"one\" }} || ?k = 2)"),
+                    false,
+                ),
+                (
+                    "a LIMIT subquery",
+                    format!(
+                        "VALUES ?p {{ {iri} }} \
+                         FILTER {not}EXISTS {{ SELECT ?p ?s WHERE {{ ?s ?p \"one\" }} LIMIT 1 }}"
+                    ),
+                    true,
+                ),
+                (
+                    "an OPTIONAL read by BOUND",
+                    format!(
+                        "FILTER {not}EXISTS {{ VALUES ?tag {{ 1 }} OPTIONAL {{ ?s ?p \"one\" }} \
+                         FILTER(BOUND(?s)) }}"
+                    ),
+                    true,
+                ),
+            ] {
+                let query = format!("SELECT ?p {{ {outside} {filter} }}");
+                let kept = per_value == not.is_empty();
+                let want: &[&[&str]] = if kept { &[&[full]] } else { &[] };
+                let name = format!("{polarity}, {shape}, {vocabulary}");
+                answers_as_written(&engine, &name, &query, want);
+                let fired = rewrites(&engine, &query);
+                match per_value {
+                    true => assert!(fired.is_empty(), "{name}: as written, {fired:?}"),
+                    false => assert!(fired.contains(&"join-groups"), "{name}: planned, {fired:?}"),
+                }
+            }
+        }
+    }
+}
+
+/// Spec: a query without a search keeps its plan beside a plain `NOT EXISTS` over a
+/// variable predicate, which is joined: `c`'s statements under the search predicates drop
+/// it, and `a` and `b` stay.
+#[test]
+fn a_query_without_a_search_keeps_its_plan_beside_a_joined_exists() {
+    let engine = routes_engine();
+    let query = "SELECT ?s { { ?s rdfs:label ?l } VALUES ?y { 1 } { ?s rdfs:label ?l } \
+                 FILTER NOT EXISTS { ?s ?any \"alpha\" } }";
+    answers_as_written(&engine, "a joined NOT EXISTS", query, &[&["a"], &["b"]]);
+    let fired = rewrites(&engine, query);
+    assert!(fired.contains(&"join-groups"), "planned: {fired:?}");
+}
