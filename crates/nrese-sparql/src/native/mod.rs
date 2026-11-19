@@ -795,7 +795,11 @@ fn native_pattern<'q>(
         .pre_bound
         .as_ref()
         .map(|values| match &ctx.canonical {
-            Some(names) => Cow::Owned(names.values(values)),
+            Some(names) => Cow::Owned(names.values(values, |id| {
+                let alias = internal::class_constant(id);
+                ctx.register_alias(alias.as_str(), id);
+                alias
+            })),
             None => Cow::Borrowed(&**values),
         });
     let pattern = match &pre_bound {

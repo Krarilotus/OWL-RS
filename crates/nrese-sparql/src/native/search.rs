@@ -142,6 +142,13 @@ pub(super) fn is_search(triple: &TriplePattern, triples: &[TriplePattern]) -> bo
             }))
 }
 
+/// Whether `iri` is a search vocabulary's: a predicate the query writes with it is a search
+/// (or its option). Only the query, the request or evaluation puts one in a predicate:
+/// preparation's rewrites (QL, canonical names) never make or unmake one.
+pub(super) fn names_search(iri: &str) -> bool {
+    iri == JENA_QUERY || iri.starts_with(BDS) || iri.starts_with(LUC)
+}
+
 /// Whether a query is evaluated as written: asked so in `options`, or its pattern may hold a
 /// search anywhere, in an `EXISTS` too. A search reads the group it is written in whole,
 /// which the rewrites and routes that move triple patterns between groups don't know.
@@ -161,10 +168,7 @@ pub(super) fn as_written(
     let pre_bound = options.pre_bound.as_deref();
     let may_search = |patterns: &[TriplePattern], substituted: bool| {
         patterns.iter().any(|t| match &t.predicate {
-            NamedNodePattern::NamedNode(n) => {
-                let iri = n.as_str();
-                iri == JENA_QUERY || iri.starts_with(BDS) || iri.starts_with(LUC)
-            }
+            NamedNodePattern::NamedNode(n) => names_search(n.as_str()),
             NamedNodePattern::Variable(v) => {
                 substituted || pre_bound.is_some_and(|values| values.contains_key(v))
             }
