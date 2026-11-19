@@ -196,13 +196,13 @@ impl Context<'_> {
     ) -> NativeResult<Solutions> {
         self.check()?;
         let search = parse(inner)?;
-        // The candidates the rest of the query allows, if it binds the matched variable.
+        // The candidates the rest of the query allows, if it binds the matched variable in
+        // every row: a row that leaves it unbound joins any hit, so then none is ruled out.
         let candidates: Option<HashSet<u64>> = bound
             .and_then(|b| Some((b, b.column(&search.matched)?)))
-            .map(|(b, column)| {
+            .and_then(|(b, column)| {
                 (0..b.table.len())
-                    .map(|row| b.table.get(row, column))
-                    .filter(|&id| id != UNDEF)
+                    .map(|row| Some(b.table.get(row, column)).filter(|&id| id != UNDEF))
                     .collect()
             });
         // The query vectors, each with the id it is bound to (for a `nrv:near` variable).
