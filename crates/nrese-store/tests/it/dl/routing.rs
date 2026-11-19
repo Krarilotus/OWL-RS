@@ -1624,6 +1624,101 @@ fn a_list_cell_outside_its_list_leaves_the_rl_route_and_is_told() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// A clean chain `:p ← :q1 ∘ :q2` committed first, on the rules' route; then a second commit
+/// that names its head cell outside its list, by each form a commit could keep the route on:
+/// an annotation (`rdfs:comment`), a typing with a class the store knows, an `owl:sameAs` to
+/// a new IRI. Each such commit is read again: the reader reports the cell, the ontology leaves
+/// the rules' route, and the read's status names the report. The control, an annotation on a
+/// named class, keeps the route and its complete `true`.
+#[test]
+fn a_commit_that_names_a_list_cell_is_read_and_leaves_the_rl_route() {
+    let data = ":p owl:propertyChainAxiom ( :q1 :q2 ) . :C a owl:Class . :x a :C . \
+                :a0 :q1 :a1 . :a1 :q2 :a2 .";
+    let cell = "WHERE { :p owl:propertyChainAxiom ?cell }";
+    let rows = [
+        (
+            "annotation",
+            format!("INSERT {{ ?cell rdfs:comment \"outside\" }} {cell}"),
+            false,
+        ),
+        ("typed", format!("INSERT {{ ?cell a :C }} {cell}"), false),
+        (
+            "alias",
+            format!("INSERT {{ ?cell owl:sameAs :n }} {cell}"),
+            false,
+        ),
+        (
+            "control",
+            "INSERT DATA { :C rdfs:comment \"a class\" }".to_owned(),
+            true,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, write, kept) in rows {
+        let dl = pipeline();
+        insert(&dl, data).expect("a clean chain");
+        let first = dl.store().dl_bounds().last;
+        super::update(&dl, &write).expect("committed");
+        let (rows, status) = query(&dl, "ASK { :a0 :p :a2 }");
+        let route = dl.store().dl_bounds().last;
+        let reasons = status.reasons();
+        let line = format!("{what}: route {first}, then {route}; {rows:?}, {reasons:?}");
+        eprintln!("CELL COMMIT {line}");
+        let named = (reasons.iter()).any(|r| r.contains("a list's cell used outside its list"));
+        let honest = if kept {
+            route == "rules" && rows == ["true"] && status.is_complete()
+        } else {
+            route != "rules" && named
+        };
+        if first != "rules" || !honest {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The chain `:p ← :q1 ∘ :q2` written cell by cell, its tail cell the same as `_:m`, a cell
+/// whose member is `:q3` (`_:l2 owl:sameAs _:m`): no cycle, and two member sequences, which
+/// the rules build (`eq-rep-s` gives `_:l2` the `rdf:first` `:q3`). The path `:b0 :q1 :b1 :q3
+/// :b2` follows only the sequence the graph doesn't write, so OWL 2 DL doesn't entail `:b0 :p
+/// :b2`, which the rules derive. On a commit and on a read of data that came past the gates,
+/// the reader reports the cell: the ontology leaves the rules' route, the read's status names
+/// the report, and `:b0 :p :b2` is never a sound `true`. Each reading printed (on the rules'
+/// route, before the report, the read answered the rules' `true`).
+#[test]
+fn a_list_cell_aliased_to_another_member_leaves_the_rl_route_and_is_told() {
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let data = format!(
+        ":p owl:propertyChainAxiom _:l1 . _:l1 <{RDF}first> :q1 ; <{RDF}rest> _:l2 . \
+         _:l2 <{RDF}first> :q2 ; <{RDF}rest> <{RDF}nil> . _:l2 owl:sameAs _:m . \
+         _:m <{RDF}first> :q3 ; <{RDF}rest> <{RDF}nil> . :b0 :q1 :b1 . :b1 :q3 :b2 ."
+    );
+    let mut wrong = Vec::new();
+    for path in ["commit", "read"] {
+        let dl = pipeline();
+        if path == "commit" {
+            insert(&dl, &data).expect("committed");
+        } else {
+            let turtle = format!("{}{data}", super::PREFIXES);
+            crate::support::load_past_the_pipeline(dl.store(), &turtle);
+            dl.store().rematerialise(rl_rules()).expect("rebuilt");
+        }
+        let (rows, status) = query(&dl, "ASK { :b0 :p :b2 }");
+        let route = dl.store().dl_bounds().last;
+        let reasons = status.reasons();
+        let (sound, complete) = (status.shared.sound, status.shared.complete);
+        let line = format!(
+            "{path}: route {route}, {rows:?} sound {sound} complete {complete}, {reasons:?}"
+        );
+        eprintln!("CELL ALIAS {line}");
+        let named = (reasons.iter()).any(|r| r.contains("a list's cell used outside its list"));
+        if route == "rules" || !named || (rows == ["true"] && sound) {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// prp-spo2, prp-rng and cax-dw: `:a0 :p :an` through the chain puts `:an` in `:p`'s
 /// range `:R`, which is disjoint from `:S`; with `:an a :S` the data has no model, and the
 /// commit that adds the clash is rejected. (A range on a chain's super-property is OWL 2 DL

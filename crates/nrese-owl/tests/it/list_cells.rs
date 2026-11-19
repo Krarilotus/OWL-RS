@@ -74,11 +74,47 @@ fn a_cell_a_statement_outside_its_list_names_is_reported() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Spec (*Mapping to RDF* §2.3.1, Table 17: an annotated axiom's reification is a blank node
+/// typed `owl:Axiom`, its one source, property and target the axiom's main triple): only such
+/// a reification of a list's axiom may name the list's head as its `owl:annotatedTarget`. Each
+/// case names a cell otherwise, and the cell is reported, by its member:
+/// - the annotated chain's reification typed `owl:Annotation`: the head;
+/// - the same untyped: the head;
+/// - a reification of `_:l1 rdf:rest _:l2`, a predecessor's `rdf:rest`, not an axiom: `_:l2`,
+///   its target, and `_:l1`, its source.
+#[test]
+fn an_annotated_target_names_a_cell_only_as_its_axioms_reification() {
+    let chain = "owl:annotatedSource ex:p ; owl:annotatedProperty owl:propertyChainAxiom ; \
+                 owl:annotatedTarget _:l1 ; rdfs:comment \"why\" .";
+    let cases = [
+        (format!("[] a owl:Annotation ; {chain}"), &["ex:q1"][..]),
+        (format!("[] {chain}"), &["ex:q1"]),
+        (
+            "[] a owl:Axiom ; owl:annotatedSource _:l1 ; owl:annotatedProperty rdf:rest ; \
+             owl:annotatedTarget _:l2 ; rdfs:comment \"why\" ."
+                .to_owned(),
+            &["ex:q1", "ex:q2"],
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (outside, expected) in &cases {
+        let (cells, differently, diagnostics) =
+            reported(&format!("{PROPERTIES} {CHAIN} {outside}"));
+        eprintln!("CELL TARGET {outside:?}: reported {cells:?}; read differently {differently}");
+        if cells != *expected || !differently {
+            wrong.push(format!(
+                "{outside}: {cells:?} {differently}; {diagnostics:?}"
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// The valid neighbours get no report at all, and the rules read them as OWL 2 DL does: two
 /// chains with a list each; `owl:sameAs` between named individuals beside a chain; an
-/// annotated axiom whose main triple's object is a union (not a cell); an annotated chain,
-/// whose reification names the list's head as its `owl:annotatedTarget` (*Mapping to RDF*
-/// §2.3.2: the reification repeats the main triple); a list whose cells are typed `rdf:List`
+/// annotated axiom whose main triple's object is a union (not a cell); an annotated chain, key
+/// and disjoint union, whose reifications name the list's head as their `owl:annotatedTarget`
+/// (*Mapping to RDF* §2.3.2: the reification repeats the main triple); a list whose cells are typed `rdf:List`
 /// (as RDF/XML's `rdf:List` elements write it, W3C test WebOnt-I5.5-005); a list of 300
 /// members.
 #[test]
@@ -100,6 +136,16 @@ fn the_valid_neighbours_of_a_cell_outside_its_list_get_no_report() {
              owl:annotatedProperty owl:propertyChainAxiom ; owl:annotatedTarget _:l1 ; \
              rdfs:comment \"why\" ."
         ),
+        format!(
+            "{PROPERTIES} ex:K owl:hasKey _:k1 . _:k1 rdf:first ex:q1 ; rdf:rest rdf:nil . \
+             [] a owl:Axiom ; owl:annotatedSource ex:K ; owl:annotatedProperty owl:hasKey ; \
+             owl:annotatedTarget _:k1 ; rdfs:comment \"why\" ."
+        ),
+        "ex:U owl:disjointUnionOf _:d1 . _:d1 rdf:first ex:A ; rdf:rest _:d2 . \
+         _:d2 rdf:first ex:B ; rdf:rest rdf:nil . [] a owl:Axiom ; owl:annotatedSource ex:U ; \
+         owl:annotatedProperty owl:disjointUnionOf ; owl:annotatedTarget _:d1 ; \
+         rdfs:comment \"why\" ."
+            .to_owned(),
         "ex:C owl:equivalentClass [ owl:unionOf _:l1 ] . _:l1 a rdf:List ; rdf:first ex:A ; \
          rdf:rest _:l2 . _:l2 a rdf:List ; rdf:first ex:B ; rdf:rest rdf:nil ."
             .to_owned(),
