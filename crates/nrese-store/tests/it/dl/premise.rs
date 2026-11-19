@@ -373,6 +373,24 @@ fn a_copy_of_a_header_annotation_is_never_told_sound() {
     true_never_sound(&dl, ":alias :note :b");
 }
 
+/// A header statement of a declared object property is an assertion (*Mapping to RDF* Table
+/// 10), and the equality of the ontology's node copies it as OWL 2 DL does (SameIndividual):
+/// the copy is entailed, and the copy check doesn't mark it.
+#[test]
+fn a_copy_of_a_declared_property_on_the_header_is_no_annotation_copy() {
+    let (dl, _, _) =
+        committed(":p a owl:ObjectProperty . :ont a owl:Ontology ; :p :b ; owl:sameAs :alias .");
+    let (answers, status) = query(&dl, "ASK { :alias :p :b }");
+    assert_eq!(answers, ["true"], "the copy is in the closure");
+    let reasons = status.reasons();
+    assert!(
+        !reasons
+            .iter()
+            .any(|r| r.contains("copies of annotation statements")),
+        "{reasons:?}"
+    );
+}
+
 /// A read inside a transaction whose pending statement types a node `owl:Ontology` reads
 /// `:ont :p :b` as an annotation, which makes `:p` a name of two kinds beside its domain:
 /// the committed record ("nothing read otherwise") says nothing of the pending data, and

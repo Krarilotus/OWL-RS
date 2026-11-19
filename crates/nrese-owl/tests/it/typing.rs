@@ -335,6 +335,18 @@ fn a_characteristic_declares_no_property_for_the_header() {
     );
 }
 
+/// Spec (Structural Specification §5.8, Table 5: OWL 2 declares `owl:topObjectProperty` an
+/// object property; *Mapping to RDF* Table 10: a statement about the ontology whose property
+/// is an object property is no annotation): a header statement of the built-in object
+/// property is an assertion, and no name is of two kinds.
+#[test]
+fn a_built_in_property_on_the_header_is_no_annotation() {
+    assert_eq!(
+        turtle("ex:ont a owl:Ontology ; owl:topObjectProperty ex:b ."),
+        Vec::<Report>::new()
+    );
+}
+
 /// Spec (§5.8.1 constrains properties, classes and datatypes only; §5.9: a name may be an
 /// individual and a class or a property, and a class and an object property): no name of a
 /// valid OWL 2 DL ontology is reported. Every construct of the functional syntax; a class and
