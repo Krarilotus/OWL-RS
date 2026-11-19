@@ -19,7 +19,7 @@ BEGIN {
     allow["http/api_v1.rs|tokio::task::spawn_blocking(move || repositories.repositories().create(&created, settings))"] = "v1.6 repository creation"
     allow["http/rdf4j.rs|tokio::task::spawn_blocking(move || repositories.repositories().create(&id, settings))"] = "v1.6 RDF4J repository creation"
     allow["http/api_v1.rs|tokio::task::spawn_blocking(move || store.rematerialise(program))"] = "v1.6 rematerialisation"
-    allow["http/api_v1.rs|tokio::task::spawn_blocking(move || std::fs::write(&file, &body))"] = "v1.6 import upload staging"
+    allow["http/api_v1.rs|let file = tokio::task::spawn_blocking(move || {"] = "v1.6 import upload staging"
     allow["http/api_v1.rs|tokio::task::spawn_blocking(move || {"] = "v1.6 async import, rule upload and rule removal"
     count["http/api_v1.rs|tokio::task::spawn_blocking(move || {"] = 3
     allow["http/api_v1.rs|tokio::task::spawn_blocking(move || changing.patch_repository_settings(merge))"] = "v1.6 settings patch"
