@@ -2053,6 +2053,57 @@ fn schema_the_reader_or_the_mapping_leaves_out_is_reported() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
+/// An axiom the reader leaves out lowers the rewriting's claim under owl2-ql (I24c-2). With
+/// `A ⊑ List ⊓ C` and `a : A`, `a` is a `C` (OWL 2 Direct Semantics §2.3; the RL tables'
+/// cls-int2 and cax-sco). The reader leaves the whole axiom out, `rdf:List` being a reserved
+/// name used as a class, so the rewriting can't reach `a`: whatever it returns is told not
+/// `complete`, with the reader's reason. The control, `D` in `rdf:List`'s place, is read:
+/// `a`, `complete`.
+#[test]
+fn an_axiom_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n"
+    );
+    let query = format!("SELECT ?x WHERE {{ ?x a <{E}C> }}");
+    let read = |second: &str| {
+        let turtle =
+            format!("{head}:A rdfs:subClassOf [ owl:intersectionOf ( {second} :C ) ] . :a a :A .");
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(&turtle, dir.path(), Ruleset::Owl2Ql, true);
+        let result = store
+            .execute_query(&SparqlQueryRequest::all(query.as_str()))
+            .unwrap();
+        let completeness = result.completeness.unwrap_or_default();
+        (select_rows(&result.payload), completeness)
+    };
+    let a = vec![format!("x={E}a")];
+    let (rows, status) = read("rdf:List");
+    let reasons: Vec<&str> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+    assert!(
+        rows.is_empty() || rows == a,
+        "the witness: {rows:?}, only certain answers"
+    );
+    assert!(
+        status.as_str() != "complete"
+            && reasons.iter().any(|r| {
+                r.contains("reserved vocabulary used as an entity")
+                    && r.contains("http://www.w3.org/1999/02/22-rdf-syntax-ns#List")
+            }),
+        "the witness: {rows:?}, {}, {reasons:?}",
+        status.as_str()
+    );
+    let (rows, status) = read(":D");
+    assert_eq!(rows, a, "the control");
+    assert_eq!(
+        status.as_str(),
+        "complete",
+        "the control: {:?}",
+        status.reasons
+    );
+}
+
 /// A SELECT's rows (SPARQL JSON results), each `var=value` sorted by variable, sorted.
 fn select_rows(payload: &[u8]) -> Vec<String> {
     let json: serde_json::Value = serde_json::from_slice(payload).unwrap();
