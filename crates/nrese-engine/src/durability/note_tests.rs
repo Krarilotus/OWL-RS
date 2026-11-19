@@ -35,6 +35,7 @@ fn durable_publication_is_visible_before_commit_tail_failure() {
     let engine = Engine::open(dir.path(), config()).unwrap();
     let (published, report) = std::sync::mpsc::channel();
     let (release, gate) = std::sync::mpsc::channel();
+    let gate = std::sync::Mutex::new(gate);
     let wrote = std::thread::scope(|scope| {
         let writer = engine.clone();
         let commit = scope.spawn(move || {
@@ -49,7 +50,10 @@ fn durable_publication_is_visible_before_commit_tail_failure() {
             tx.insert(quad(1).as_ref());
             tx.note_publication(Box::new(move |revision| {
                 published.send(revision).unwrap();
-                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+                gate.into_inner()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap();
             }));
             tx.commit()
         });
