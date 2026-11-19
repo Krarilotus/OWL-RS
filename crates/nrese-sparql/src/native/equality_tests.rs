@@ -729,7 +729,7 @@ fn a_late_build_of_an_older_version_leaves_the_newer_entry() {
     let entry = Arc::new(Representatives::new());
     let slot = std::sync::Mutex::new(Some((newer.clone(), Arc::clone(&entry))));
     let state = older.shared_state().expect("a published snapshot");
-    let got = admit(&slot, &state);
+    let got = admit(&slot, &state, &budget()).expect("room for them").0;
 
     let kept = slot.lock().unwrap();
     let (at, held) = kept.as_ref().expect("an entry");
@@ -760,7 +760,7 @@ fn a_build_that_ends_second_gets_the_published_entry() {
     let entry = Arc::new(Representatives::new());
     let slot = std::sync::Mutex::new(Some((snapshot.clone(), Arc::clone(&entry))));
     let state = snapshot.shared_state().expect("a published snapshot");
-    let got = admit(&slot, &state);
+    let got = admit(&slot, &state, &budget()).expect("room for them").0;
 
     assert!(
         Arc::ptr_eq(&got, &entry),
