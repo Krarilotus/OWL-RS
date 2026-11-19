@@ -752,7 +752,9 @@ fn a_late_build_of_an_older_version_leaves_the_newer_entry() {
 ///
 /// - Input: a slot holding an entry for a published version (a stand-in, told apart by its
 ///   pointer); that version's classes admitted again.
-/// - Expected: the reader gets the published entry, and the slot still holds it.
+/// - Expected: the reader gets the published entry, holding no charge: its own build was
+///   charged to its budget and dropped with the charge, which is back where it was. The slot
+///   still holds the entry.
 #[test]
 fn a_build_that_ends_second_gets_the_published_entry() {
     let engine = ordinary();
@@ -760,12 +762,17 @@ fn a_build_that_ends_second_gets_the_published_entry() {
     let entry = Arc::new(Representatives::new());
     let slot = std::sync::Mutex::new(Some((snapshot.clone(), Arc::clone(&entry))));
     let state = snapshot.shared_state().expect("a published snapshot");
-    let got = admit(&slot, &state, &budget()).expect("room for them").0;
+    let charged = budget();
+    let before = charged.used();
+    let (got, held) = admit(&slot, &state, &charged).expect("room for them");
 
     assert!(
         Arc::ptr_eq(&got, &entry),
         "the reader gets the published entry"
     );
+    assert!(held.is_none(), "the reader holds no charge");
+    assert!(charged.peak() > before, "its own build was charged");
+    assert_eq!(charged.used(), before, "and its charge released");
     let kept = slot.lock().unwrap();
     let (_, held) = kept.as_ref().expect("an entry");
     assert!(Arc::ptr_eq(held, &entry), "the slot still holds it");

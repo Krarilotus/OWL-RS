@@ -604,6 +604,9 @@ leave something out.
   part has no stated bound in this release.
 - Near the memory limit, a cached decoding can cause a refusal while memory the cache could give back is still
   held. The output is never wrong.
+- A published snapshot's `owl:sameAs` classes are built by the first query that needs them, charged to its memory.
+  Where they don't fit, that query runs without them and nothing is kept, until a query with room builds them: the
+  answer is the same, only slower. Earlier versions built them in the first query whatever its budget.
 - A cancel, a deadline or a refusal takes effect at the work's next poll, which bounds work, not time. Under
   nested reads in reasoning, more work runs between two polls ([the bound](architecture/contracts.md#cancellation)).
   A stop never gives a partial or wrong answer.
