@@ -217,7 +217,7 @@ impl<V: ReadView> Compiler<'_, V> {
         let mut node = head;
         while Some(node) != self.rdf_nil {
             if self.graph.cancelled() {
-                break;
+                return Err("compilation cancelled".to_owned());
             }
             if !seen.insert(node) {
                 return Err("is a cyclic list".to_owned());
@@ -543,7 +543,16 @@ impl<V: ReadView> Compiler<'_, V> {
         );
         for head in self.values(node, "in") {
             match self.list(head) {
-                Ok(members) => out.push(Constraint::In(members.into_iter().collect())),
+                Ok(members) => {
+                    let allowed = members
+                        .into_iter()
+                        .take_while(|_| !self.graph.cancelled())
+                        .collect();
+                    if self.graph.cancelled() {
+                        break;
+                    }
+                    out.push(Constraint::In(allowed));
+                }
                 Err(problem) => self.error(node, format!("sh:in {problem}")),
             }
         }

@@ -390,7 +390,7 @@ impl MutationPipeline {
                 };
                 let view = evidence::EvidenceView::new(&requester.read, &tx);
                 let reject = view.reject(full, |view| {
-                    self.view_reason(view, &dl_own_budget, &resources)
+                    self.view_reason(view, None, &dl_own_budget, &resources)
                 });
                 return Err(MutationError::Rejected(Box::new(reject)));
             }
@@ -409,7 +409,9 @@ impl MutationPipeline {
                     &stop,
                     &mut bounds,
                     &evidence::EvidenceView::new(&requester.read, &tx),
-                    &|view, dl_gate_budget| self.view_reason(view, dl_gate_budget, &resources),
+                    &|view, dl_gate_budget| {
+                        self.view_reason(view, None, dl_gate_budget, &resources)
+                    },
                     &envelope,
                 );
                 if let Some(reject) = gate.reject.take() {
@@ -443,7 +445,7 @@ impl MutationPipeline {
                 &resources,
                 store_error,
                 &evidence::EvidenceView::new(&requester.read, &tx),
-                &|view| self.view_reason(view, &dl_own_budget, &resources),
+                |view, after| self.view_reason(view, Some(after), &dl_own_budget, &resources),
             )?;
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
@@ -541,7 +543,7 @@ impl MutationPipeline {
             &resources,
             store_error,
             &evidence::EvidenceView::new(&requester.read, &tx),
-            &|view| self.view_reason(view, &|_| None, &resources),
+            |view, after| self.view_reason(view, Some(after), &|_| None, &resources),
         )?;
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
@@ -571,7 +573,10 @@ impl MutationPipeline {
         resources: &nrese_sparql::Resources,
         stopped: impl FnOnce(StoreError) -> MutationError,
         view: &evidence::EvidenceView<'_, '_>,
-        restricted: &dyn Fn(&evidence::EvidenceView<'_, '_>) -> evidence::Draft,
+        restricted: impl FnOnce(
+            &evidence::EvidenceView<'_, '_>,
+            &nrese_engine::Snapshot,
+        ) -> evidence::Draft,
     ) -> Result<(), MutationError> {
         let gate = self.store.config().shacl_gate;
         if gate == ShaclGate::Off {
@@ -588,7 +593,7 @@ impl MutationPipeline {
                 return Err(MutationError::Gate(error.to_string()));
             }
         };
-        let Some(report) = report else {
+        let Some((report, pending)) = report else {
             return Ok(());
         };
         if report.results.is_empty() && report.failures.is_empty() {
@@ -621,7 +626,7 @@ impl MutationPipeline {
                 explanation: None,
                 attribution: None,
             };
-            let reject = view.reject(full, restricted);
+            let reject = view.reject(full, |view| restricted(view, &pending));
             Err(MutationError::Rejected(Box::new(reject)))
         } else {
             tracing::warn!("{detail} (SHACL gate: not rejected)");
@@ -637,13 +642,14 @@ impl MutationPipeline {
     fn view_reason(
         &self,
         view: &evidence::EvidenceView<'_, '_>,
+        pending: Option<&nrese_engine::Snapshot>,
         dl: &dyn Fn(&evidence::EvidenceView<'_, '_>) -> Option<evidence::Draft>,
         resources: &nrese_sparql::Resources,
     ) -> evidence::Draft {
         if resources.check().is_err() {
             return evidence::nothing_shown();
         }
-        dl(view).unwrap_or_else(|| self.view_reason_after_dl(view, resources))
+        dl(view).unwrap_or_else(|| self.view_reason_after_dl(view, pending, resources))
     }
 
     /// What a restricted committer is told after the OWL 2 DL reason ([`evidence`]): the
@@ -652,6 +658,7 @@ impl MutationPipeline {
     fn view_reason_after_dl(
         &self,
         view: &evidence::EvidenceView<'_, '_>,
+        pending: Option<&nrese_engine::Snapshot>,
         resources: &nrese_sparql::Resources,
     ) -> evidence::Draft {
         if resources.check().is_err() {
@@ -662,8 +669,14 @@ impl MutationPipeline {
         };
         let rejects =
             |result: &nrese_shacl::ValidationResult| severity(result.severity.as_str()) >= least;
-        crate::shacl::view_reason(view, &self.store.config().shapes_graph, rejects, resources)
-            .unwrap_or_else(evidence::nothing_shown)
+        crate::shacl::view_reason(
+            view,
+            pending,
+            &self.store.config().shapes_graph,
+            rejects,
+            resources,
+        )
+        .unwrap_or_else(evidence::nothing_shown)
     }
 
     fn record_run(&self, run: ReasoningRunRecord) {

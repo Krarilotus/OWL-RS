@@ -253,7 +253,7 @@ pub(crate) fn introduced(
     shapes_graph: &str,
     resources: &Resources,
     ticket: &MutationTicket,
-) -> StoreResult<Option<ValidationReport>> {
+) -> StoreResult<Option<(ValidationReport, Snapshot)>> {
     let iri = graph_iri(shapes_graph)?;
     let Some(shapes_id) = tx.lookup(iri.as_ref().into()) else {
         return Ok(None);
@@ -269,15 +269,17 @@ pub(crate) fn introduced(
             .take_while(|_| resources.check().is_ok())
             .collect()
     };
-    introduced_in(
+    let after = tx.pending_snapshot();
+    let report = introduced_in(
         tx,
         tx.base(),
-        &tx.pending_snapshot(),
+        &after,
         (shapes_id, Some(ticket)),
         changed,
         |_| true,
         resources,
-    )
+    )?;
+    Ok(report.map(|report| (report, after)))
 }
 
 /// [`introduced`] over the views `before` and `after` of the commit in `tx`, with the
@@ -347,6 +349,7 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
 /// queries the view can't confine (D16-065).
 pub(crate) fn view_reason(
     view: &crate::mutation::evidence::EvidenceView<'_, '_>,
+    pending: Option<&Snapshot>,
     shapes_graph: &str,
     rejects: impl Fn(&nrese_shacl::ValidationResult) -> bool,
     resources: &Resources,
@@ -356,8 +359,7 @@ pub(crate) fn view_reason(
     if !view.graph(shapes_id) {
         return None;
     }
-    let after = tx.pending_snapshot();
-    let (before, after) = (view.readable(tx.base())?, view.readable(&after)?);
+    let before = view.readable(tx.base(), resources)?;
     let changed = || {
         tx.inserted()
             .chain(tx.deleted())
@@ -365,39 +367,49 @@ pub(crate) fn view_reason(
             .filter(|quad| view.graph(quad.graph))
             .collect()
     };
-    let report = introduced_in(
-        tx,
-        &before,
-        &after,
-        (shapes_id, None),
-        changed,
-        |shapes| !shapes.uses_sparql(),
-        resources,
-    )
+    let core = |shapes: &Shapes| !shapes.uses_sparql();
+    // The SHACL gate already built an indexed pending snapshot. An earlier gate
+    // may have refused without one, so read its transaction directly.
+    let shapes = (shapes_id, None);
+    let report = match pending {
+        Some(pending) => {
+            let after = view.readable(pending, resources)?;
+            introduced_in(tx, &before, &after, shapes, changed, core, resources)
+        }
+        None => {
+            let after = view.readable(tx, resources)?;
+            introduced_in(tx, &before, &after, shapes, changed, core, resources)
+        }
+    }
     .ok()??;
-    let rejecting: Vec<_> = report.results.iter().filter(|r| rejects(r)).collect();
     // The first by what the view's statements say, never by the results' order, which is
     // the dictionary's: term ids follow what was interned first, in any graph.
     // Every field, as decoded terms (`nrese_rdf::Term`'s order: the kind, then the value; a
     // blank node by its label, the store's name for it in the committer's view), never
     // their text: equal keys are equal results, so either is shown the same.
-    let first = rejecting.iter().min_by_key(|result| {
-        (
-            result.focus_node.clone(),
-            result.component.clone(),
-            result.path.clone(),
-            result.value.clone(),
-            result.source_shape.clone(),
-            result.severity.clone(),
-            result.source_constraint.clone(),
-            result.messages.clone(),
-        )
-    })?;
+    let mut count = 0;
+    let first = report
+        .results
+        .iter()
+        .take_while(|_| resources.check().is_ok())
+        .filter(|result| rejects(result))
+        .inspect(|_| count += 1)
+        .min_by_key(|result| {
+            (
+                result.focus_node.clone(),
+                result.component.clone(),
+                result.path.clone(),
+                result.value.clone(),
+                result.source_shape.clone(),
+                result.severity.clone(),
+                result.source_constraint.clone(),
+                result.messages.clone(),
+            )
+        })?;
+    resources.check().ok()?;
     let reason = format!(
         "the commit introduces {} SHACL result(s) the gate rejects; first: focus node {}, {}",
-        rejecting.len(),
-        first.focus_node,
-        first.component
+        count, first.focus_node, first.component
     );
     Some(crate::mutation::evidence::shown(
         crate::RejectKind::ShapesViolated,

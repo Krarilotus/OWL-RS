@@ -56,15 +56,32 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     resources: &Resources,
 ) -> Result<ValidationReport, QueryEvaluationError> {
     resources.check()?;
-    let changed: Vec<EncodedQuad> = changed
-        .iter()
-        .copied()
-        .filter(|quad| in_selection(data, quad.graph))
-        .collect();
-    let graph_before = GraphView::new(before, data);
-    let graph_after = GraphView::new(after, data);
+    let mut selected = Vec::new();
+    for chunk in changed.chunks(CHECK_EVERY) {
+        resources.check()?;
+        selected.extend(
+            chunk
+                .iter()
+                .copied()
+                .filter(|quad| in_selection(data, quad.graph)),
+        );
+    }
+    let changed = selected;
+    let graph_before =
+        GraphView::new(before, data).with_cancellation(resources.cancellation.as_ref());
+    let graph_after =
+        GraphView::new(after, data).with_cancellation(resources.cancellation.as_ref());
     let sub_class_of = graph_after.iri(RDFS_SUB_CLASS_OF);
-    let classes_moved = sub_class_of.is_some_and(|p| changed.iter().any(|q| q.predicate == p));
+    let mut classes_moved = false;
+    if let Some(predicate) = sub_class_of {
+        for chunk in changed.chunks(CHECK_EVERY) {
+            resources.check()?;
+            if chunk.iter().any(|q| q.predicate == predicate) {
+                classes_moved = true;
+                break;
+            }
+        }
+    }
     // Both states tell a query's terms stored or computed by the state after's dictionary:
     // one term, one form in both ([`ResultTerm`]).
     let frontier = |term: &Term| graph_after.lookup(term);
@@ -84,7 +101,7 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             let affected = if classes_moved {
                 None
             } else {
-                let seeds = seeds(shapes, shape, &changed, rdf_type);
+                let seeds = seeds(shapes, shape, &changed, rdf_type, resources)?;
                 affected(
                     shapes,
                     shape,
@@ -95,15 +112,21 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
                 )
                 .filter(|nodes| nodes.len() <= MAX_AFFECTED)
             };
+            resources.check()?;
             let focus = |validator_focus: Vec<TermId>| match &affected {
                 Some(nodes) => validator_focus
                     .into_iter()
+                    .take_while(|_| resources.check().is_ok())
                     .filter(|node| nodes.contains(node))
                     .collect::<Vec<_>>(),
                 None => validator_focus,
             };
             let work = |nodes: Vec<TermId>| -> Vec<(ShapeRef, TermId)> {
-                nodes.into_iter().map(|node| (shape, node)).collect()
+                nodes
+                    .into_iter()
+                    .take_while(|_| resources.check().is_ok())
+                    .map(|node| (shape, node))
+                    .collect()
             };
             let after_results = validator_after.validate_all(&work(focus(
                 validator_after.focus_nodes(&shapes.shapes[shape]),
@@ -142,6 +165,7 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
     let (failures, held_after) = validator_after.into_failures()?;
     let (earlier_failures, held_before) = validator_before.into_failures()?;
     drop(earlier_failures);
+    resources.check()?;
     let raw: Vec<RawResult> = introduced.into_iter().collect();
     // The raw results are freed as they are decoded, then their charges returned.
     let report = decode(after, shapes, raw, failures, resources);
@@ -308,20 +332,28 @@ fn seeds(
     shape: ShapeRef,
     changed: &[EncodedQuad],
     rdf_type: Option<TermId>,
-) -> Vec<TermId> {
+    resources: &Resources,
+) -> Result<Vec<TermId>, QueryEvaluationError> {
     let mut read = BTreeSet::new();
     let bounded = predicates(shapes, shape, &mut read, &mut Vec::new());
     if let Some(rdf_type) = rdf_type {
         read.insert(rdf_type);
     }
-    let mut nodes: Vec<TermId> = changed
-        .iter()
-        .filter(|quad| !bounded || read.contains(&quad.predicate))
-        .flat_map(|quad| [quad.subject, quad.object])
-        .collect();
-    nodes.sort_unstable();
-    nodes.dedup();
-    nodes
+    let mut nodes = BTreeSet::new();
+    for chunk in changed.chunks(CHECK_EVERY) {
+        resources.check()?;
+        nodes.extend(
+            chunk
+                .iter()
+                .filter(|quad| !bounded || read.contains(&quad.predicate))
+                .flat_map(|quad| [quad.subject, quad.object]),
+        );
+        // Every seed is itself affected, so this shape will be validated whole.
+        if nodes.len() > MAX_AFFECTED {
+            break;
+        }
+    }
+    Ok(nodes.into_iter().collect())
 }
 
 /// Adds the predicates `shape` reads (paths, property pairs, targets) to `read`, through
@@ -405,6 +437,9 @@ fn affected<A: ReadView, B: ReadView>(
     after: &GraphView<'_, B>,
     stack: &mut Vec<ShapeRef>,
 ) -> Option<BTreeSet<TermId>> {
+    if seeds.len() > MAX_AFFECTED || before.cancelled() {
+        return None;
+    }
     if stack.contains(&shape) {
         // A recursive reference: the shape's own walk covers it.
         return Some(BTreeSet::new());
@@ -445,6 +480,9 @@ fn affected<A: ReadView, B: ReadView>(
             // Value nodes affected, and the seeds anywhere along the path: back along every
             // prefix of it, in both states.
             for prefix in prefixes(&normalised(path)) {
+                if before.cancelled() {
+                    return None;
+                }
                 for graph_nodes in [
                     path::back(before, &prefix, &reached),
                     path::back(after, &prefix, &reached),
