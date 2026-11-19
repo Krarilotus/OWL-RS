@@ -290,6 +290,11 @@ pub struct Update {
     /// List axioms the change left uninstantiable (malformed, cyclic, oversized) that
     /// weren't before.
     pub diagnostics: Vec<super::lists::ListDiagnostic>,
+    /// Whether the change reads an axiom's list otherwise: one left out after it that was
+    /// read before, read after it that was left out before, or left out for another reason
+    /// ([`super::lists::ListProblem::kind`]). The rules such a list gives, or gave, aren't
+    /// the ones the program before held, so the delta can't follow them.
+    pub lists_read_otherwise: bool,
     pub rounds: usize,
     /// Time per phase: program, overdelete, rederive, insert, consistency.
     pub phases: [std::time::Duration; 5],
@@ -307,6 +312,7 @@ impl std::fmt::Debug for Update {
             .field("remove", &self.remove.len())
             .field("violations", &self.violations)
             .field("diagnostics", &self.diagnostics)
+            .field("lists_read_otherwise", &self.lists_read_otherwise)
             .field("rounds", &self.rounds)
             .field("phases", &self.phases)
             .field("program_changed", &self.program.is_some())
@@ -1374,6 +1380,13 @@ fn update_body<B: Base + ?Sized>(
         .filter(|d| !old_program.list_diagnostics.contains(d))
         .copied()
         .collect();
+    let reading = |p: &GroundProgram| -> HashSet<(u64, u64, u64, &'static str)> {
+        (p.list_diagnostics.iter())
+            .map(|d| (d.subject, d.predicate, d.head, d.problem.kind()))
+            .collect()
+    };
+    result.lists_read_otherwise =
+        matches!(program, Cow::Owned(_)) && reading(&program) != reading(old_program);
     result.program = match program {
         Cow::Owned(program) => Some(program),
         Cow::Borrowed(_) => None,

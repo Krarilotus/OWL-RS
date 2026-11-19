@@ -487,6 +487,14 @@ pub fn maintain_with(
             (program.list_diagnostics.iter())
                 .any(|d| d.problem == crate::lists::ListProblem::TooManyVariants)
         });
+    // A change after which an axiom's list is read otherwise (left out where it was read,
+    // read where it was left out, or left out for another reason): the delta can't follow
+    // the rules it gave or gives, so the change is rebuilt and judged by the rebuild's
+    // report. A list left out before and after, for the same reason, gives no rules either
+    // way and leaves the change to its delta.
+    let relisted = delta_ran
+        && update.policy.plan != delta::policy::Plan::Rebuild
+        && update.lists_read_otherwise;
     // A list that already stopped at its budget makes the change inconsistent: the
     // datatype checks would add nothing to that. A first load judged by its rebuild has
     // them in the batch's report already.
@@ -504,8 +512,11 @@ pub fn maintain_with(
     let (mut inserted, mut removed) = (0, 0);
     // Over representatives, a change that may split a class is rebuilt (B3a: the
     // translation can't follow it; the representative view for the delta executor is B3b).
-    let mut rebuild =
-        revived || unkept || capped || update.policy.plan == delta::policy::Plan::Rebuild;
+    let mut rebuild = revived
+        || unkept
+        || capped
+        || relisted
+        || update.policy.plan == delta::policy::Plan::Rebuild;
     if !rebuild && program.stores_representatives() {
         match store_over_representatives(program, &update, &missing_axioms, tx) {
             Some((added, dropped)) => (inserted, removed) = (added, dropped),
@@ -543,14 +554,16 @@ pub fn maintain_with(
         }
         rebuilt_violations = uses_rebuilt_report.then(|| {
             let found = std::mem::take(&mut closure.violations);
-            // A change rebuilt for a list past the cap that deletes nothing is refused if
-            // either report refuses it: the rebuild reads the list from its asserted cells
-            // in its rounds, the delta from the cells as written over every name. Without a
-            // clash of its own, the rebuild's report gives way to the delta's. One that
-            // deletes is judged by the rebuild's alone: the delta's program lacks the list's
-            // rules, so its overdeletion can't follow what they derived, and a fact the
-            // change took the support of can still clash there.
-            match capped && !deletes && found.consistent() {
+            // A change rebuilt for a list past the cap, or for a list read otherwise, that
+            // deletes nothing is refused if either report refuses it. For the cap, the
+            // rebuild reads the list from its asserted cells in its rounds, the delta from
+            // the cells as written over every name. For a list read otherwise, a change that
+            // only inserts takes no list path away, so what the delta found is still
+            // entailed even where the list is now left out. Without a clash of its own, the
+            // rebuild's report gives way to the delta's. One that deletes is judged by the
+            // rebuild's alone: the delta can't follow what the list's rules derived, and a
+            // fact the change took the support of can still clash there.
+            match (capped || relisted) && !deletes && found.consistent() {
                 true => std::mem::take(&mut update.violations),
                 false => found,
             }
@@ -607,7 +620,7 @@ pub fn maintain_with(
         }
     }
     // The delta ran (its violations and diagnostics stand), and the closure is a rebuild's.
-    if unkept || capped {
+    if unkept || capped || relisted {
         update.policy.plan = delta::policy::Plan::Rebuild;
     }
     Ok(Maintenance {
@@ -1311,7 +1324,10 @@ mod tests {
     }
 
     /// A rebuild runs no delta, and still reports the list axioms a deletion leaves
-    /// unusable, as the delta does.
+    /// unusable, as the delta does. A deletion that leaves a list unread is rebuilt whatever
+    /// plan is asked for (reasoning-semantics.md: a change after which an axiom's list is
+    /// read otherwise), so both runs are rebuilt and report the same; the run asked for
+    /// `Dred` reports what its delta found, the other what the rebuild's own reading found.
     #[test]
     fn a_rebuild_reports_the_list_axioms_a_deletion_breaks() {
         use crate::delta::policy::Plan;
@@ -1351,10 +1367,13 @@ mod tests {
             let mut tx = engine.transaction();
             tx.remove_encoded(encode(tail).in_default_graph());
             let done = maintain(&program, Some(&ground), &mut tx, crate::eval::NEVER).unwrap();
-            assert_eq!(done.work.plan, plan);
+            assert_eq!(done.work.plan, Plan::Rebuild, "asked for {plan:?}");
+            assert!(
+                !done.diagnostics.is_empty(),
+                "asked for {plan:?}: the list lost its end"
+            );
             reported.push(done.diagnostics);
         }
-        assert!(!reported[0].is_empty(), "the list lost its end");
         assert_eq!(reported[0], reported[1]);
     }
 
