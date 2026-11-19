@@ -204,6 +204,7 @@ fn validate_view<V: ReadView + Sync>(
 pub(crate) fn check_shapes(
     tx: &Transaction<'_>,
     shapes_graph: &str,
+    ticket: &crate::MutationTicket,
     view: &crate::mutation::evidence::EvidenceView<'_, '_>,
 ) -> StoreResult<()> {
     let iri = graph_iri(shapes_graph)?;
@@ -222,7 +223,12 @@ pub(crate) fn check_shapes(
         Selection::asserted(GraphSelector::Exact(shapes_id)),
     )
     .map(drop)
-    .map_err(|errors| view.shapes_error(shapes_graph, shapes_error(errors)))
+    .map_err(|errors| {
+        if ticket.end_pending() == crate::mutation::MutationState::Cancelled {
+            return nrese_sparql::QueryEvaluationError::Cancelled.into();
+        }
+        view.shapes_error(shapes_graph, shapes_error(errors))
+    })
 }
 
 /// What the commit in `tx` introduces against the shapes in the graph `shapes_graph` (the

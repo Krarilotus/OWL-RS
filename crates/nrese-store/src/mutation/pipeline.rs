@@ -422,6 +422,7 @@ impl MutationPipeline {
             crate::shacl::check_shapes(
                 &tx,
                 &self.store.config().shapes_graph,
+                ticket,
                 &evidence::EvidenceView::new(&requester.read, &tx),
             )
             .map_err(store_error)?;
@@ -520,6 +521,7 @@ impl MutationPipeline {
         crate::shacl::check_shapes(
             &tx,
             &self.store.config().shapes_graph,
+            ticket,
             &evidence::EvidenceView::new(&requester.read, &tx),
         )
         .map_err(store_error)?;
