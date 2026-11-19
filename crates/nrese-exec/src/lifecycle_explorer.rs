@@ -238,3 +238,87 @@ pub fn explore<M: Model>(depth: usize, max_worlds: usize) -> Result<Stats, Trace
     }
     Ok(search.stats)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Model, explore};
+
+    // Two routes converge on the same layer. The last vertex can be made bad.
+    struct Graph<const BAD: bool>;
+
+    impl<const BAD: bool> Model for Graph<BAD> {
+        type World = u8;
+        type Move = u8;
+        const DRAIN_BOUND: usize = 0;
+
+        fn start() -> u8 {
+            0
+        }
+
+        fn moves(world: &u8) -> Vec<u8> {
+            match world {
+                0 => vec![1, 2],
+                1 | 2 => vec![3, 4],
+                3 => vec![5],
+                _ => vec![],
+            }
+        }
+
+        fn apply(_world: &u8, edge: &u8) -> u8 {
+            *edge
+        }
+
+        fn check(world: &u8) -> Result<(), String> {
+            if BAD && *world == 5 {
+                return Err("reached vertex 5".into());
+            }
+            Ok(())
+        }
+
+        fn quiet(_world: &u8) -> bool {
+            true
+        }
+
+        fn drain_move(_world: &u8) -> Option<u8> {
+            None
+        }
+
+        fn answer(world: &u8, _edge: &u8, next: &u8) -> String {
+            format!("{world} -> {next}")
+        }
+    }
+
+    // A reachable failure carries the full shortest schedule and each answer.
+    #[test]
+    fn finds_bad_vertex_with_its_schedule() {
+        let trace = explore::<Graph<true>>(3, 10).unwrap_err();
+        assert_eq!(trace.violation, "reached vertex 5");
+        assert_eq!(
+            trace.schedule,
+            [
+                (1, "0 -> 1".to_owned()),
+                (3, "1 -> 3".to_owned()),
+                (5, "3 -> 5".to_owned()),
+            ]
+        );
+        assert!(trace.drain.is_empty());
+    }
+
+    // The four layers contain 1, 2, 2, 1 unique vertices, then no new vertices.
+    #[test]
+    fn counts_unique_vertices_by_complete_layer() {
+        for (depth, worlds) in [(0, 1), (1, 3), (2, 5), (3, 6), (8, 6)] {
+            let stats = explore::<Graph<false>>(depth, 6).unwrap();
+            assert_eq!((stats.completed_depth, stats.worlds), (depth, worlds));
+            assert!(!stats.budget_hit);
+        }
+    }
+
+    // A cap reached partway through layer two leaves only layer one complete.
+    #[test]
+    fn budget_reports_the_last_complete_layer() {
+        let stats = explore::<Graph<false>>(3, 4).unwrap();
+        assert_eq!((stats.completed_depth, stats.worlds), (1, 4));
+        assert!(stats.budget_hit);
+    }
+}

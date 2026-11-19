@@ -14,6 +14,12 @@ const UNKNOWN_ROLLBACK: u8 = 1;
 const JOIN_ANSWER: u8 = 2;
 const EARLY_RELEASE: u8 = 3;
 const STALE_LOOKUP: u8 = 4;
+const REPLAY_OBSERVED: u8 = 5;
+const ACK_WITHOUT_APPEND: u8 = 6;
+const PUBLISHED_WITHOUT_RECORD: u8 = 7;
+const REMOVED_WITHOUT_GONE: u8 = 8;
+const DROP_TO_U: u8 = 9;
+const NO_IDLE_EXPIRY: u8 = 10;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Op {
@@ -120,6 +126,8 @@ struct Repeat {
 struct Session {
     state: State,
     mapped: bool,
+    // The map entry exposes this slot without taking the session lock.
+    ticket: Option<usize>,
     waiting: Option<Request>,
     rollback_waiting: Option<Request>,
     repeat: Option<Repeat>,
@@ -128,10 +136,11 @@ struct Session {
     commit: Option<Commit>,
     terminal: Option<Outcome>,
     pin: Option<Pin>,
+    observed: bool,
     evidence_rights: bool,
     pending: u8,
-    expected: u8,
     acknowledged: u8,
+    refused: u8,
     issued: u8,
     past_idle_limit: bool,
     expired: bool,
@@ -143,6 +152,7 @@ impl Session {
         Self {
             state,
             mapped: state == State::U,
+            ticket: None,
             waiting: None,
             rollback_waiting: None,
             repeat: None,
@@ -151,10 +161,11 @@ impl Session {
             commit: None,
             terminal: None,
             pin: None,
+            observed: false,
             evidence_rights: false,
             pending: 0,
-            expected: 0,
             acknowledged: 0,
+            refused: 0,
             issued: 0,
             past_idle_limit: false,
             expired: false,
@@ -192,6 +203,15 @@ impl Session {
     fn can_settle(&self) -> bool {
         self.terminal.is_some() && matches!(self.state, State::S | State::Pw | State::C)
     }
+
+    fn note_write_answer(&mut self, bit: u8, answer: Answer) {
+        match answer {
+            Answer::WriteOk => self.acknowledged |= bit,
+            Answer::Error(Problem::WorkInProgress) => {}
+            Answer::Error(_) | Answer::TaskError { .. } => self.refused |= bit,
+            _ => {}
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -200,7 +220,7 @@ enum Violation {
     DetachedChange,
     DetachedAnswer,
     ReleasedEarly,
-    BusyAnswer,
+    TimeoutChangedSession,
     RecordAnswer,
     Unsettled,
     InvalidTransition,
@@ -217,7 +237,6 @@ enum Violation {
 struct World<const N: usize> {
     sessions: [Session; N],
     store: Store,
-    serial: Store,
     external_commit: bool,
     rights: bool,
     rights_changed: bool,
@@ -231,18 +250,12 @@ impl<const N: usize> World<N> {
     fn identity(&self) -> impl Eq + Hash {
         // A tag belongs to its client. Sort those together, keeping the IDs in
         // the actual world so a trace still names the same client at every step.
-        let mut clients = std::array::from_fn::<_, N, _>(|id| {
-            (
-                &self.sessions[id],
-                self.store.tags[id],
-                self.serial.tags[id],
-            )
-        });
+        let mut clients =
+            std::array::from_fn::<_, N, _>(|id| (&self.sessions[id], self.store.tags[id]));
         clients.sort_unstable();
         (
             clients,
             (self.store.revision, self.store.epoch),
-            (self.serial.revision, self.serial.epoch),
             self.external_commit,
             self.rights,
             self.rights_changed,
@@ -275,7 +288,7 @@ enum Move {
     RollbackLock(usize),
     WaitTimeout(usize),
     RollbackTimeout(usize),
-    CancelForRollback(usize, usize),
+    CancelForRollback(usize),
     DropWaiting(usize),
     DropRollback(usize),
     DropTaskRequest(usize, usize),
@@ -306,7 +319,7 @@ enum Move {
     Restart,
 }
 
-struct Sessions<const N: usize, const MUTATION: u8>;
+struct Sessions<const N: usize, const MUTATION: u8, const FOCUS: u8 = GOOD>;
 
 impl<const N: usize> World<N> {
     fn normal_commit_move(&self, id: usize, commit: Commit) -> Move {
@@ -332,10 +345,22 @@ impl<const N: usize> World<N> {
             JOIN_ANSWER => Some(Violation::PublishedFailure),
             EARLY_RELEASE => Some(Violation::LostWrite),
             STALE_LOOKUP => Some(Violation::StaleSuccess),
+            REPLAY_OBSERVED => Some(Violation::InvalidPlacement),
+            ACK_WITHOUT_APPEND => Some(Violation::LostWrite),
+            PUBLISHED_WITHOUT_RECORD => Some(Violation::PublishedFailure),
+            REMOVED_WITHOUT_GONE => Some(Violation::DetachedAnswer),
+            DROP_TO_U => Some(Violation::ReleasedEarly),
             _ => None,
         };
         if target.is_none_or(|expected| expected == violation) {
             self.violation.get_or_insert(violation);
+        }
+    }
+
+    fn check_writes<const MUTATION: u8>(&mut self, id: usize, writes: u8) {
+        let session = self.sessions[id];
+        if session.acknowledged & !writes != 0 || writes & session.refused != 0 {
+            self.violate::<MUTATION>(Violation::LostWrite);
         }
     }
 }
@@ -356,6 +381,24 @@ fn transition<const MUTATION: u8>(state: State, event: Event) -> Step {
         (STALE_LOOKUP, State::Gone, Event::Action(Action::Write { .. })) => {
             result.answer = Answer::WriteOk;
         }
+        (REPLAY_OBSERVED, State::P, Event::Action(Action::Commit { .. }))
+            if result.cell == Cell::P9 =>
+        {
+            result.effect = Effect::ReplayIntents;
+        }
+        (ACK_WITHOUT_APPEND, State::U, Event::Action(Action::Write { .. })) => {
+            result.effect = Effect::None;
+        }
+        (PUBLISHED_WITHOUT_RECORD, State::C, Event::WorkerExit(Exit::Published { .. })) => {
+            result.answer = Answer::Error(Problem::Status(500));
+            result.effect = Effect::None;
+        }
+        (REMOVED_WITHOUT_GONE, State::U, Event::IdleLimit) => result.next = State::U,
+        (DROP_TO_U, State::Pw, Event::Dropped) => result.next = State::U,
+        (NO_IDLE_EXPIRY, State::P, Event::IdleLimit) => {
+            result.next = State::P;
+            result.effect = Effect::None;
+        }
         _ => {}
     }
     result
@@ -375,7 +418,7 @@ impl<const N: usize> World<N> {
             if !locked {
                 self.violate::<MUTATION>(Violation::OutsideLock);
             }
-            if !before.mapped || self.retired || before.state == State::Gone {
+            if !before.mapped || self.retired {
                 self.violate::<MUTATION>(Violation::DetachedChange);
             }
         }
@@ -383,8 +426,9 @@ impl<const N: usize> World<N> {
             self.violate::<MUTATION>(Violation::InvalidTransition);
         }
         let detached_action = match event {
-            Event::Action(action) if before.state == State::Gone => Some(action),
-            Event::Detached(action) => Some(action),
+            Event::Action(action) | Event::Detached(action) if !before.mapped || self.retired => {
+                Some(action)
+            }
             _ => None,
         };
         if let Some(action) = detached_action {
@@ -412,10 +456,15 @@ impl<const N: usize> World<N> {
         let session = self.sessions[id];
         if let Some(outcome) = session.terminal.filter(|_| session.can_settle()) {
             let result = self.event::<MUTATION>(id, Event::Settled(outcome), true, report);
+            if session.state == State::C && self.sessions[id].state != State::E(outcome) {
+                self.violate::<MUTATION>(Violation::RecordAnswer);
+            }
             let session = &mut self.sessions[id];
             session.terminal = None;
-            if result.effect == Effect::StampEnd {
+            if matches!(result.effect, Effect::StampEnd | Effect::RestoreIntents) {
                 session.pin = None;
+            }
+            if result.effect == Effect::StampEnd {
                 session.past_idle_limit = false;
                 session.expired = false;
             }
@@ -435,48 +484,75 @@ impl<const N: usize> World<N> {
         report: &mut impl FnMut(ReportedAnswer),
     ) {
         let rights = request.map_or(self.rights, |request| request.rights);
-        let action = request.map(|request| self.sessions[id].action(request.op, rights));
         if self.retired {
-            if let Some(action) = action {
+            if let Some(request) = request {
+                let action = self.sessions[id].action(request.op, rights);
                 self.event::<MUTATION>(id, Event::Detached(action), true, report);
             }
             return;
         }
         self.settle::<MUTATION>(id, report);
         let before = self.sessions[id];
-        let event = if before.expired && before.state == State::P {
-            Event::LongestLife
+        let expiry = if before.expired && before.state == State::P {
+            Some(Event::LongestLife)
         } else if before.past_idle_limit
             && matches!(before.state, State::U | State::P | State::E(_))
+            && before.mapped
         {
-            let result = self.event::<MUTATION>(id, Event::IdleLimit, true, report);
-            if result.effect == Effect::Remove {
-                self.sessions[id].mapped = false;
-                self.sessions[id].pin = None;
-            }
-            if let Some(action) = action {
-                self.event::<MUTATION>(id, Event::Action(action), true, report);
-            }
-            return;
-        } else if let Some(request) = request {
-            Event::Action(before.action(request.op, rights))
+            Some(Event::IdleLimit)
         } else {
-            return;
+            None
         };
-        let result = self.event::<MUTATION>(id, event, true, report);
+        if let Some(expiry) = expiry {
+            let result = self.event::<MUTATION>(id, expiry, true, report);
+            let session = &mut self.sessions[id];
+            match result.effect {
+                Effect::Remove => {
+                    session.mapped = false;
+                    session.pin = None;
+                }
+                Effect::StampEnd => {
+                    session.pin = None;
+                    session.expired = false;
+                    session.past_idle_limit = false;
+                }
+                _ => {}
+            }
+        }
+        let Some(request) = request else { return };
+        let before = self.sessions[id];
+        let action = before.action(request.op, rights);
+        let result = self.event::<MUTATION>(id, Event::Action(action), true, report);
         if let Answer::Recorded { evidence: true, .. } = result.answer
-            && before.evidence_rights
-            && !rights
+            && matches!(before.state, State::E(_))
+            && before.evidence_rights != rights
         {
             self.violate::<MUTATION>(Violation::Disclosure);
         }
+        if matches!(
+            result.answer,
+            Answer::Recorded {
+                outcome: Outcome::Committed,
+                ..
+            }
+        ) && matches!(before.state, State::P)
+        {
+            self.check_writes::<MUTATION>(id, before.pending);
+        }
         let session = &mut self.sessions[id];
+        let bit = if request.op == Op::Write
+            && before.mapped
+            && matches!(before.state, State::U | State::P)
+        {
+            let bit = session.next_write();
+            session.note_write_answer(bit, result.answer);
+            bit
+        } else {
+            0
+        };
         match result.effect {
             Effect::Append => {
-                let bit = session.next_write();
                 session.pending |= bit;
-                session.expected |= bit;
-                session.acknowledged |= bit;
                 session.past_idle_limit = false;
             }
             Effect::Touch => session.past_idle_limit = false,
@@ -485,13 +561,9 @@ impl<const N: usize> World<N> {
                 if switch {
                     session.pin = Some(Pin::capture(self.store, rights));
                 }
-                let bit = if switch { 0 } else { session.next_write() };
-                let slot = session
-                    .tasks
-                    .iter_mut()
-                    .find(|slot| slot.is_none())
-                    .unwrap();
-                *slot = Some(Task {
+                let slot = session.tasks.iter().position(Option::is_none).unwrap();
+                session.ticket = Some(slot);
+                session.tasks[slot] = Some(Task {
                     switch,
                     bit,
                     scratch: session.pending | bit,
@@ -589,8 +661,11 @@ impl<const N: usize> World<N> {
         {
             self.violate::<MUTATION>(Violation::RecordAnswer);
         }
-        if result.answer == Answer::WriteOk && self.sessions[id].pending & task.bit == 0 {
-            self.violate::<MUTATION>(Violation::LostWrite);
+        self.sessions[id].note_write_answer(task.bit, result.answer);
+        if result.answer == Answer::WriteOk
+            || matches!(result.answer, Answer::TaskError { .. } | Answer::Error(_))
+        {
+            self.check_writes::<MUTATION>(id, self.sessions[id].pending);
         }
         let session = &mut self.sessions[id];
         if result.effect == Effect::TakeSnapshot {
@@ -601,9 +676,6 @@ impl<const N: usize> World<N> {
                 private: task.scratch,
                 request_rights: pin.rights,
             });
-        }
-        if result.answer == Answer::WriteOk {
-            session.acknowledged |= task.bit;
         }
         session.tasks[slot] = if matches!(task.phase, Phase::Recorded(_)) {
             None
@@ -662,47 +734,38 @@ impl<const N: usize> World<N> {
                 } else {
                     self.sessions[id].waiting = None;
                 }
-                let answer = lock_timeout();
-                report((None, answer));
-                if answer != Answer::Error(Problem::LockBusy) {
-                    self.violate::<MUTATION>(Violation::BusyAnswer);
+                report((None, lock_timeout()));
+            }
+            Move::CancelForRollback(id) => {
+                let session = &mut self.sessions[id];
+                let task = session.tasks[session.ticket.unwrap()].as_mut().unwrap();
+                if task.phase == Phase::Pending {
+                    task.phase = Phase::Ended(Outcome::Failed(Problem::Status(408)));
                 }
             }
-            Move::CancelForRollback(id, slot) | Move::DropTaskRequest(id, slot) => {
-                let dropped = matches!(action, Move::DropTaskRequest(..));
-                if dropped
-                    && matches!(
-                        self.sessions[id].tasks[slot].unwrap().phase,
-                        Phase::Recorded(_)
-                    )
-                {
+            Move::DropTaskRequest(id, slot) => {
+                let task = self.sessions[id].tasks[slot].unwrap();
+                if matches!(task.phase, Phase::Recorded(_)) {
                     self.sessions[id].tasks[slot] = None;
                     return;
                 }
-                let event = if dropped {
-                    Event::Dropped
-                } else {
-                    Event::Action(Action::Rollback)
-                };
-                let result = self.event::<MUTATION>(id, event, false, &mut report);
-                let task = self.sessions[id].tasks[slot].as_mut().unwrap();
-                if dropped {
-                    task.awaiting = false;
+                let result = self.event::<MUTATION>(id, Event::Dropped, false, &mut report);
+                let released_early = task.guard
+                    && matches!(task.phase, Phase::Pending | Phase::Claimed)
+                    && !matches!(self.sessions[id].state, State::S | State::Pw);
+                if released_early {
+                    self.violate::<MUTATION>(Violation::ReleasedEarly);
                 }
-                if matches!(
-                    result.effect,
-                    Effect::TryCancel | Effect::CancelThenWaitLock
-                ) && task.phase == Phase::Pending
-                {
+                let session = &mut self.sessions[id];
+                let task = session.tasks[slot].as_mut().unwrap();
+                task.awaiting = false;
+                if result.effect == Effect::TryCancel && task.phase == Phase::Pending {
                     task.phase = Phase::Ended(Outcome::Failed(Problem::Status(408)));
                 }
-                if result.next == State::P
-                    && task.guard
-                    && !task.switch
-                    && !matches!(task.phase, Phase::Ended(_))
-                {
+                if released_early && MUTATION == EARLY_RELEASE {
+                    // Let the old scratch run on to expose the lost second write.
                     task.guard = false;
-                    self.violate::<MUTATION>(Violation::ReleasedEarly);
+                    session.ticket = None;
                 }
             }
             Move::DropWaiting(id) => self.sessions[id].waiting = None,
@@ -745,23 +808,26 @@ impl<const N: usize> World<N> {
                 let session = &mut self.sessions[id];
                 // The lifecycle state and publish mark change in this one move.
                 session.tasks[slot].as_mut().unwrap().phase = Phase::Ended(outcome);
-                if task.guard && result.effect == Effect::StampEnd {
+                if task.guard && matches!(result.effect, Effect::StampEnd | Effect::RestoreIntents)
+                {
                     session.pin = None;
+                }
+                if task.guard && result.effect == Effect::StampEnd {
                     session.past_idle_limit = false;
                     session.expired = false;
                 }
                 if matches!(result.effect, Effect::Swap | Effect::SwapAndRead) {
                     session.pending = task.scratch;
-                    session.expected |= task.bit;
-                    if session.acknowledged & !session.pending != 0 {
-                        self.violate::<MUTATION>(Violation::LostWrite);
-                    }
                 }
+                self.check_writes::<MUTATION>(id, self.sessions[id].pending);
             }
             Move::DropGuard(id, slot, outcome) => {
                 let session = &mut self.sessions[id];
                 let task = session.tasks[slot].unwrap();
                 session.terminal = Some(outcome);
+                if session.ticket == Some(slot) {
+                    session.ticket = None;
+                }
                 if task.guard && matches!(session.state, State::U | State::S | State::P | State::Pw)
                 {
                     session.past_idle_limit = false;
@@ -784,16 +850,15 @@ impl<const N: usize> World<N> {
             Move::PublishCommit(id) => {
                 let session = self.sessions[id];
                 let commit = session.commit.unwrap();
-                if commit.pinned && session.pin.is_none_or(|pin| !pin.is_current(self.store)) {
+                if session.observed && session.pin.is_none_or(|pin| !pin.is_current(self.store)) {
                     self.violate::<MUTATION>(Violation::InvalidPlacement);
                 }
                 if commit.published || self.store.tags[id] != 0 {
                     self.violate::<MUTATION>(Violation::DoublePublish);
                 }
+                self.check_writes::<MUTATION>(id, session.pending);
                 self.store.tags[id] = session.pending;
-                self.serial.tags[id] = session.expected;
                 self.store.revision += u8::from(session.pending != 0);
-                self.serial.revision += u8::from(session.expected != 0);
                 let session = &mut self.sessions[id];
                 session.commit.as_mut().unwrap().published = true;
                 if let Some(repeat) = &mut session.repeat {
@@ -804,23 +869,44 @@ impl<const N: usize> World<N> {
                 let commit = self.sessions[id].commit.unwrap();
                 let result =
                     self.event::<MUTATION>(id, Event::WorkerExit(exit), false, &mut report);
-                if let Effect::Record(outcome) = result.effect {
-                    if (outcome == Outcome::Committed) != commit.published
-                        || (commit.published
-                            && commit.awaiting
-                            && result.answer
-                                != (Answer::Recorded {
-                                    outcome,
-                                    evidence: true,
-                                }))
-                    {
-                        self.violate::<MUTATION>(Violation::PublishedFailure);
+                let published_answer = Answer::Recorded {
+                    outcome: Outcome::Committed,
+                    evidence: true,
+                };
+                let answered_committed = matches!(
+                    result.answer,
+                    Answer::Recorded {
+                        outcome: Outcome::Committed,
+                        ..
                     }
+                );
+                if commit.awaiting
+                    && (answered_committed != commit.published
+                        || (commit.published && result.answer != published_answer))
+                {
+                    self.violate::<MUTATION>(Violation::PublishedFailure);
+                }
+                if let Effect::Record(outcome) = result.effect {
                     let session = &mut self.sessions[id];
                     session.terminal = Some(outcome);
                     if let Some(repeat) = &mut session.repeat {
                         repeat.record = Observation::Ended(outcome);
                     }
+                }
+                let terminal = self.sessions[id].terminal;
+                if terminal.is_some_and(|end| (end == Outcome::Committed) != commit.published) {
+                    self.violate::<MUTATION>(Violation::PublishedFailure);
+                }
+                if matches!(exit, Exit::Entered)
+                    && (terminal != Some(Outcome::Unknown)
+                        || (commit.awaiting
+                            && result.answer
+                                != (Answer::Recorded {
+                                    outcome: Outcome::Unknown,
+                                    evidence: true,
+                                })))
+                {
+                    self.violate::<MUTATION>(Violation::RecordAnswer);
                 }
                 self.sessions[id].commit = None;
             }
@@ -857,17 +943,19 @@ impl<const N: usize> World<N> {
                     &mut report,
                 );
                 let expected = match repeat.record {
-                    Observation::Published => Some(Outcome::Committed),
-                    Observation::Ended(outcome) => Some(outcome),
-                    Observation::InProgress => None,
+                    Observation::Published => Answer::Recorded {
+                        outcome: Outcome::Committed,
+                        evidence: same_rights,
+                    },
+                    Observation::Ended(outcome) => Answer::Recorded {
+                        outcome,
+                        evidence: same_rights,
+                    },
+                    Observation::InProgress => {
+                        Answer::Error(Problem::CommitInProgress { retry: true })
+                    }
                 };
-                if let Some(outcome) = expected
-                    && result.answer
-                        != (Answer::Recorded {
-                            outcome,
-                            evidence: same_rights,
-                        })
-                {
+                if result.answer != expected {
                     self.violate::<MUTATION>(Violation::RecordAnswer);
                 }
             }
@@ -886,6 +974,7 @@ impl<const N: usize> World<N> {
                     result.answer,
                     Answer::Read(StreamEnd::Data | StreamEnd::Aborted)
                 ) {
+                    self.sessions[id].observed = true;
                     // The top bit represents a protected statement in this abstract store.
                     let may_disclose_protected =
                         (read.pin.protected || read.private & 2 != 0) && read.pin.rights;
@@ -915,11 +1004,9 @@ impl<const N: usize> World<N> {
             Move::OtherCommit => {
                 self.external_commit = true;
                 self.store.revision += 1;
-                self.serial.revision += 1;
             }
             Move::RulesChange => {
                 self.store.epoch += 1;
-                self.serial.epoch += 1;
             }
             Move::RightsChange => {
                 self.rights_changed = true;
@@ -952,7 +1039,7 @@ impl<const N: usize> World<N> {
     }
 }
 
-impl<const N: usize, const MUTATION: u8> Model for Sessions<N, MUTATION> {
+impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, MUTATION, FOCUS> {
     type World = World<N>;
     type Move = Move;
     const DRAIN_BOUND: usize = 16 * N;
@@ -962,7 +1049,6 @@ impl<const N: usize, const MUTATION: u8> Model for Sessions<N, MUTATION> {
         let mut world = World {
             sessions: [Session::new(begin.next); N],
             store: Store::default(),
-            serial: Store::default(),
             external_commit: false,
             rights: true,
             rights_changed: false,
@@ -992,10 +1078,19 @@ impl<const N: usize, const MUTATION: u8> Model for Sessions<N, MUTATION> {
         if world.restarted {
             return moves;
         }
-        if MUTATION == GOOD {
+        if FOCUS == GOOD {
             moves.push(Move::Restart);
         }
-        if MUTATION == GOOD && !world.retired {
+        if FOCUS == REPLAY_OBSERVED && !world.external_commit {
+            moves.push(Move::OtherCommit);
+        }
+        if FOCUS == REMOVED_WITHOUT_GONE
+            && world.sessions[0].mapped
+            && !world.sessions[0].past_idle_limit
+        {
+            moves.push(Move::IdleLimitPassed);
+        }
+        if FOCUS == GOOD && !world.retired {
             moves.extend([Move::ReplaceRepository, Move::NoOpChange]);
             if !world.external_commit {
                 moves.push(Move::OtherCommit);
@@ -1025,8 +1120,22 @@ impl<const N: usize, const MUTATION: u8> Model for Sessions<N, MUTATION> {
         for (id, s) in world.sessions.iter().enumerate() {
             // Red runs cover the affected client's request interleavings.
             // Other clients and unrelated stimuli run in the green search.
-            if MUTATION != GOOD && id != if MUTATION == EARLY_RELEASE { N - 1 } else { 0 } {
+            let focused_client = match FOCUS {
+                EARLY_RELEASE | REPLAY_OBSERVED | DROP_TO_U | NO_IDLE_EXPIRY => N - 1,
+                _ => 0,
+            };
+            if FOCUS != GOOD && id != focused_client {
                 continue;
+            }
+            if s.mapped
+                && !world.retired
+                && s.ticket.is_some_and(|slot| {
+                    s.tasks[slot].is_some_and(|task| task.phase == Phase::Pending)
+                })
+                && (s.waiting.is_some_and(|request| request.op == Op::Rollback)
+                    || s.rollback_waiting.is_some())
+            {
+                moves.push(Move::CancelForRollback(id));
             }
             if s.rollback_waiting.is_some() {
                 moves.extend([Move::DropRollback(id), Move::RollbackTimeout(id)]);
@@ -1085,11 +1194,6 @@ impl<const N: usize, const MUTATION: u8> Model for Sessions<N, MUTATION> {
                             Move::DropGuard(id, slot, panic),
                             Move::DropGuard(id, slot, Outcome::Failed(Problem::NotRun)),
                         ]);
-                        if s.waiting.is_some_and(|request| request.op == Op::Rollback)
-                            || s.rollback_waiting.is_some()
-                        {
-                            moves.push(Move::CancelForRollback(id, slot));
-                        }
                         if task.awaiting {
                             moves.push(Move::TaskDeadline(id, slot));
                         }
@@ -1152,15 +1256,23 @@ impl<const N: usize, const MUTATION: u8> Model for Sessions<N, MUTATION> {
     fn apply(world: &World<N>, action: &Move) -> World<N> {
         let mut next = world.clone();
         next.do_move::<MUTATION>(*action, |_| {});
+        if let Move::WaitTimeout(id) | Move::RollbackTimeout(id) = *action {
+            let mut expected = world.sessions[id];
+            if matches!(action, Move::WaitTimeout(_)) {
+                expected.waiting = None;
+            } else {
+                expected.rollback_waiting = None;
+            }
+            if next.sessions[id] != expected {
+                next.violate::<MUTATION>(Violation::TimeoutChangedSession);
+            }
+        }
         next
     }
 
     fn check(world: &World<N>) -> Result<(), String> {
         if let Some(violation) = world.violation {
             return Err(format!("{violation:?}"));
-        }
-        if MUTATION == GOOD && world.store != world.serial {
-            return Err("published store differs from the serial execution".into());
         }
         Ok(())
     }
@@ -1175,7 +1287,9 @@ impl<const N: usize, const MUTATION: u8> Model for Sessions<N, MUTATION> {
                 && s.commit.is_none()
                 && (world.retired
                     || !s.mapped
-                    || !matches!(s.state, State::S | State::Pw | State::C))
+                    || (s.pin.is_none()
+                        && !s.past_idle_limit
+                        && !matches!(s.state, State::S | State::Pw | State::C)))
         })
     }
 
@@ -1208,11 +1322,12 @@ impl<const N: usize, const MUTATION: u8> Model for Sessions<N, MUTATION> {
             if s.rollback_waiting.is_some() {
                 return Some(Move::RollbackLock(id));
             }
-            if !world.retired && s.can_settle() {
+            if !world.retired && s.mapped && (s.can_settle() || s.past_idle_limit || s.expired) {
                 return Some(Move::Sweep(id));
             }
         }
-        None
+        (!world.retired && world.sessions.iter().any(|s| s.mapped && s.pin.is_some()))
+            .then_some(Move::IdleLimitPassed)
     }
 
     fn answer(world: &World<N>, action: &Move, _next: &World<N>) -> String {
@@ -1247,7 +1362,7 @@ fn print_stats(clients: usize, limit: usize, stats: Stats, elapsed: Duration) {
 
 fn red<const MUTATION: u8>(expected: &str) {
     let start = Instant::now();
-    let outcome = explore::<Sessions<2, MUTATION>>(WITNESS_DEPTH, ORDINARY_WORLDS);
+    let outcome = explore::<Sessions<2, MUTATION, MUTATION>>(WITNESS_DEPTH, ORDINARY_WORLDS);
     let elapsed = start.elapsed();
     let trace = match outcome {
         Err(trace) => trace,
@@ -1259,6 +1374,10 @@ fn red<const MUTATION: u8>(expected: &str) {
     print_stats(2, WITNESS_DEPTH, trace.stats, elapsed);
     print_trace(&trace);
     assert_eq!(trace.violation.trim_start_matches("drain: "), expected);
+    let stats = explore::<Sessions<2, GOOD, MUTATION>>(WITNESS_DEPTH, ORDINARY_WORLDS)
+        .expect("the same stimulus passes with the real step");
+    assert_eq!(stats.completed_depth, WITNESS_DEPTH);
+    eprintln!("real step: {expected} absent through depth {WITNESS_DEPTH}");
 }
 
 // Spec §2b E3b: ROLLBACK after an unknown publication must not claim a rollback.
@@ -1283,6 +1402,42 @@ fn explorer_rejects_lost_second_write() {
 #[test]
 fn explorer_rejects_success_after_removal() {
     red::<STALE_LOOKUP>("StaleSuccess");
+}
+
+// Spec §2b P9: a client that has read data can publish only at its current pin.
+#[test]
+fn explorer_rejects_replaying_observed_writes() {
+    red::<REPLAY_OBSERVED>("InvalidPlacement");
+}
+
+// Spec §2b U1, invariant 3: a successful write survives a later publication.
+#[test]
+fn explorer_rejects_acknowledging_without_append() {
+    red::<ACK_WITHOUT_APPEND>("LostWrite");
+}
+
+// Spec §2b C1: publication answers success even if a worker omits the record.
+#[test]
+fn explorer_rejects_unrecorded_published_failure() {
+    red::<PUBLISHED_WITHOUT_RECORD>("PublishedFailure");
+}
+
+// Spec §2b U8/X7: a request waiting on an unmapped session gets the missing answer.
+#[test]
+fn explorer_rejects_idle_removal_without_gone() {
+    red::<REMOVED_WITHOUT_GONE>("DetachedAnswer");
+}
+
+// Spec §2b P16/Pw3: dropping the handler cannot take an unfinished write out of Pw.
+#[test]
+fn explorer_rejects_drop_returning_to_unobserved() {
+    red::<DROP_TO_U>("ReleasedEarly");
+}
+
+// Spec §2b P12: the server alone must release an abandoned pin after idle expiry.
+#[test]
+fn explorer_rejects_sweep_retaining_an_abandoned_pin() {
+    red::<NO_IDLE_EXPIRY>("server drain exceeded 32 moves");
 }
 
 // Spec §2c v8 N3: a request that arrives with the pinned view keeps it while waiting.
@@ -1332,12 +1487,35 @@ fn sweep_uses_idle_deadline_after_guard_release() {
     assert!(!expired.sessions[1].mapped);
 }
 
+// Spec §2b v9 P13/E3: a ROLLBACK after longest life succeeds with or without a sweep.
+#[test]
+fn rollback_after_longest_life_uses_the_tombstone() {
+    let mut world = Sessions::<2, GOOD>::start();
+    world.do_move::<GOOD>(Move::LifeClock, |_| {});
+    for sweep_first in [false, true] {
+        let mut session = world.clone();
+        if sweep_first {
+            session.do_move::<GOOD>(Move::Sweep(1), |_| {});
+        }
+        session.do_move::<GOOD>(Move::Lookup(1, Op::Rollback), |_| {});
+        let mut answers = Vec::new();
+        session.do_move::<GOOD>(Move::SessionLock(1), |(_, answer)| {
+            if answer != Answer::None {
+                answers.push(answer);
+            }
+        });
+        assert_eq!(answers, [Answer::NoContent]);
+        assert!(session.sessions[1].mapped);
+    }
+}
+
 fn deep_limit(name: &str, default: usize) -> usize {
     std::env::var(name).map_or(default, |value| value.parse().expect(name))
 }
 
 fn green<const N: usize>() {
     let deep = std::env::var_os("NRESE_SESSION_EXPLORER_DEEP").is_some();
+    let required_depth = if N == 2 { 12 } else { 10 };
     let (depth, worlds) = if deep {
         (
             deep_limit("NRESE_SESSION_EXPLORER_DEEP_DEPTH", DEEP_DEPTH),
@@ -1347,7 +1525,7 @@ fn green<const N: usize>() {
         (ORDINARY_DEPTH, ORDINARY_WORLDS)
     };
     eprintln!(
-        "Stimulus budget: one of each server change and one sweep per path, two admitted writes per client, one waiting request per session plus one racing ROLLBACK. Depth N means every schedule of N moves within this budget, not every schedule of N events."
+        "Stimulus budget: one of each server change and one sweep per path, two write attempts under the lock per live session, one waiting request per session plus one racing ROLLBACK. Depth N means every schedule of N moves within this budget, not every schedule of N events."
     );
     eprintln!(
         "Server drain may go beyond search depth, up to {} moves.",
@@ -1365,6 +1543,12 @@ fn green<const N: usize>() {
                     stats.completed_depth + 1
                 );
                 assert!(deep, "ordinary search hit its world budget");
+            }
+            if deep {
+                assert!(
+                    stats.completed_depth >= required_depth,
+                    "{N}-client deep run requires depth {required_depth}"
+                );
             }
         }
         Err(trace) => {

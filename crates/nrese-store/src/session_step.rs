@@ -188,8 +188,6 @@ pub(crate) enum Effect {
     Remove,
     Forget,
     RetireMap,
-    WaitLock,
-    CancelThenWaitLock,
     TryCancel,
     WaitOutcome,
     LogBadTransition,
@@ -222,6 +220,7 @@ pub(crate) enum Cell {
     U15,
     U16,
     U17,
+    U18,
     S1,
     S2,
     S3,
@@ -236,6 +235,8 @@ pub(crate) enum Cell {
     S12,
     S13,
     S14,
+    S15,
+    S16,
     P1,
     P2,
     P3,
@@ -257,6 +258,9 @@ pub(crate) enum Cell {
     P18,
     P19,
     P20,
+    P21,
+    P22,
+    P23,
     Pw1,
     Pw2,
     Pw3,
@@ -267,6 +271,8 @@ pub(crate) enum Cell {
     Pw8,
     Pw9,
     Pw10,
+    Pw11,
+    Pw12,
     C1,
     C2,
     C3,
@@ -286,6 +292,7 @@ pub(crate) enum Cell {
     C16,
     C17,
     C18,
+    C19,
     E1,
     E2,
     E3,
@@ -296,9 +303,14 @@ pub(crate) enum Cell {
     E7,
     E8,
     E9,
+    E10,
+    E11,
+    E12,
+    E13,
     G1,
     G2,
     G3,
+    G4,
     X1,
     X2,
     X3,
@@ -306,6 +318,8 @@ pub(crate) enum Cell {
     X5,
     X6,
     X7,
+    X8,
+    X9,
 }
 
 fn missing(action: Action) -> (Cell, Answer) {
@@ -342,9 +356,9 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
     use Answer::{Created, Error, NoContent, Pending, PingOk, WriteOk};
     use Cell::*;
     use Effect::{
-        Append, CancelThenWaitLock, CommitDelta, Create, Forget, Record, Remove, ReplayIntents,
-        RestoreIntents, RetireMap, StampEnd, StartSwitch, StartWrite, Swap, SwapAndRead,
-        TakeSnapshot, Touch, TryCancel, WaitLock, WaitOutcome,
+        Append, CommitDelta, Create, Forget, Record, Remove, ReplayIntents, RestoreIntents,
+        RetireMap, StampEnd, StartSwitch, StartWrite, Swap, SwapAndRead, TakeSnapshot, Touch,
+        TryCancel, WaitOutcome,
     };
     use Event::{
         Action as Request, Begin, Changed, CommitGrace, DefaultUnavailable, Detached, Dropped,
@@ -365,7 +379,6 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
     let reply = |cell, answer| stay(cell, answer, Effect::None);
     let noop = |cell| reply(cell, Answer::None);
     let bug = |cell| stay(cell, Error(Problem::Status(500)), Effect::LogBadTransition);
-    let end = |cell, problem| go(cell, Error(problem), StampEnd, E(Failed(problem)));
     let rights = |cell| {
         let problem = Problem::RightsChanged;
         go(cell, Error(problem), StampEnd, E(Refused(problem)))
@@ -385,13 +398,18 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
         OrphanEnded => stay(X4, Answer::None, Record(Failed(Problem::NoSession))),
         NativeWriteRefused(problem) => reply(X5, Error(problem)),
         DefaultUnavailable => reply(X6, Error(Problem::Status(503))),
-        Detached(action) => reply(X7, missing(action).1),
+        Detached(action) => reply(X4, missing(action).1),
         ReadEnded { first, end } => reply(
-            match (first, end) {
-                (true, StreamEnd::Data) => S1,
-                (true, StreamEnd::Error(_) | StreamEnd::Aborted) => S3,
-                (false, StreamEnd::Data) => P5,
-                (false, StreamEnd::Error(_) | StreamEnd::Aborted) => P7,
+            if first {
+                match end {
+                    StreamEnd::Data => S1,
+                    StreamEnd::Error(_) | StreamEnd::Aborted => S3,
+                }
+            } else {
+                match end {
+                    StreamEnd::Data => P5,
+                    StreamEnd::Error(_) | StreamEnd::Aborted => P7,
+                }
             },
             Answer::Read(end),
         ),
@@ -424,83 +442,69 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
                 Observation::InProgress => reply(cell, Error(Problem::WorkInProgress)),
             }
         }
-        Request(action) => match (*state, action) {
-            (U, Action::Write { .. }) => stay(U1, WriteOk, Append),
-            (U, Action::WriteRefused(problem)) => stay(U2, Error(problem), Touch),
-            (U, Action::Read { .. }) => go(U3, Pending, StartSwitch, S),
-            (U, Action::ReadRefused(problem)) => reply(U4, Error(problem)),
-            (U, Action::Ping) => stay(U5, PingOk, Touch),
-            (U, Action::Commit { .. }) => go(U6, Pending, ReplayIntents, C),
-            (U, Action::Rollback) => remove(U7, NoContent),
-            (U | P, Action::Unknown) => stay(X3, Error(Problem::Status(400)), Touch),
-            (S, Action::Rollback) => stay(S13, Pending, CancelThenWaitLock),
-            (Pw, Action::Rollback) => stay(Pw9, Pending, CancelThenWaitLock),
-            (
-                S | Pw,
-                Action::Write { .. }
-                | Action::WriteRefused(_)
-                | Action::Read { .. }
-                | Action::ReadRefused(_)
-                | Action::Ping
-                | Action::Commit { .. }
-                | Action::Unknown,
-            ) => stay(if *state == S { S4 } else { Pw2 }, Pending, WaitLock),
-            (P, Action::Write { same_rights: true }) => go(P1, Pending, StartWrite, Pw),
-            (P, Action::Write { same_rights: false }) => rights(P2),
-            (P, Action::WriteRefused(problem)) => stay(P3, Error(problem), Touch),
-            (P, Action::Read { same_rights: true }) => stay(P5, Pending, TakeSnapshot),
-            (P, Action::Read { same_rights: false }) => rights(P6),
-            (P, Action::ReadRefused(problem)) => reply(P7, Error(problem)),
-            (P, Action::Ping) => stay(P8, PingOk, Touch),
-            (
-                P,
+        Request(action) => match *state {
+            U => match action {
+                Action::Write { .. } => stay(U1, WriteOk, Append),
+                Action::WriteRefused(problem) => stay(U2, Error(problem), Touch),
+                Action::Read { .. } => go(U3, Pending, StartSwitch, S),
+                Action::ReadRefused(problem) => reply(U4, Error(problem)),
+                Action::Ping => stay(U5, PingOk, Touch),
+                Action::Commit { .. } => go(U6, Pending, ReplayIntents, C),
+                Action::Rollback => remove(U7, NoContent),
+                Action::Unknown => stay(X3, Error(Problem::Status(400)), Touch),
+            },
+            // Lock wait and pre-lock cancel never enter step. With the lock held,
+            // the caller must settle an ended task before dispatching its request.
+            S => bug(S16),
+            Pw => bug(Pw12),
+            P => match action {
+                Action::Write { same_rights: true } => go(P1, Pending, StartWrite, Pw),
+                Action::Write { same_rights: false } => rights(P2),
+                Action::WriteRefused(problem) => stay(P3, Error(problem), Touch),
+                Action::Read { same_rights: true } => stay(P5, Pending, TakeSnapshot),
+                Action::Read { same_rights: false } => rights(P6),
+                Action::ReadRefused(problem) => reply(P7, Error(problem)),
+                Action::Ping => stay(P8, PingOk, Touch),
                 Action::Commit {
                     same_rights: true,
                     empty: true,
-                },
-            ) => go(P9a, recorded(Committed, true), StampEnd, E(Committed)),
-            (
-                P,
+                } => go(P9a, recorded(Committed, true), StampEnd, E(Committed)),
                 Action::Commit {
                     same_rights: true,
                     empty: false,
-                },
-            ) => go(P9, Pending, CommitDelta, C),
-            (
-                P,
+                } => go(P9, Pending, CommitDelta, C),
                 Action::Commit {
                     same_rights: false, ..
+                } => rights(P10),
+                Action::Rollback => remove(P11, NoContent),
+                Action::Unknown => stay(X3, Error(Problem::Status(400)), Touch),
+            },
+            C => match action {
+                Action::Commit { .. } => stay(C8, Pending, WaitOutcome),
+                Action::Rollback => reply(C9, Error(Problem::CommitInProgress { retry: false })),
+                Action::Write { .. }
+                | Action::WriteRefused(_)
+                | Action::Read { .. }
+                | Action::ReadRefused(_)
+                | Action::Ping
+                | Action::Unknown => reply(C10, Error(Problem::EndedWhileCommitting)),
+            },
+            E(outcome) => match action {
+                Action::Commit { same_rights, .. } => reply(E1, recorded(outcome, same_rights)),
+                Action::Rollback => match outcome {
+                    Committed => reply(E2, Error(Problem::Committed)),
+                    Refused(_) | Failed(_) => reply(E3, NoContent),
+                    Outcome::Unknown => reply(E3b, Error(Problem::OutcomeUnknown)),
                 },
-            ) => rights(P10),
-            (P, Action::Rollback) => remove(P11, NoContent),
-            (C, Action::Commit { .. }) => stay(C8, Pending, WaitOutcome),
-            (C, Action::Rollback) => reply(C9, Error(Problem::CommitInProgress { retry: false })),
-            (
-                C,
                 Action::Write { .. }
                 | Action::WriteRefused(_)
                 | Action::Read { .. }
                 | Action::ReadRefused(_)
                 | Action::Ping
-                | Action::Unknown,
-            ) => reply(C10, Error(Problem::EndedWhileCommitting)),
-            (E(outcome), Action::Commit { same_rights, .. }) => {
-                reply(E1, recorded(outcome, same_rights))
-            }
-            (E(Committed), Action::Rollback) => reply(E2, Error(Problem::Committed)),
-            (E(Refused(_) | Failed(_)), Action::Rollback) => reply(E3, NoContent),
-            (E(Outcome::Unknown), Action::Rollback) => reply(E3b, Error(Problem::OutcomeUnknown)),
-            (
-                E(outcome),
-                Action::Write { .. }
-                | Action::WriteRefused(_)
-                | Action::Read { .. }
-                | Action::ReadRefused(_)
-                | Action::Ping
-                | Action::Unknown,
-            ) => reply(E4, Error(Problem::Ended(outcome.kind()))),
-            (Gone, action) => reply(X7, missing(action).1),
-            (G, action) => {
+                | Action::Unknown => reply(E4, Error(Problem::Ended(outcome.kind()))),
+            },
+            Gone => reply(X7, missing(action).1),
+            G => {
                 let (cell, answer) = missing(action);
                 reply(cell, answer)
             }
@@ -513,8 +517,7 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
                 Pw => Pw6,
                 C => C14,
                 E(_) => E7,
-                Gone => X7,
-                G => missing(action).0,
+                Gone | G => missing(action).0,
             };
             reply(cell, missing(action).1)
         }
@@ -525,18 +528,18 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
             Pw => bug(Pw8),
             C => bug(C11),
             E(_) => remove(E5, Answer::None),
-            Gone => noop(X7),
-            G => noop(G2),
+            Gone => noop(X9),
+            G => noop(G4),
         },
         LongestLife => match state {
             U => bug(U9),
             S => bug(S10),
-            P => end(P13, Problem::LongestLife),
+            P => go(P13, Answer::None, StampEnd, E(Failed(Problem::LongestLife))),
             Pw => go(Pw4, Answer::None, StampEnd, E(Failed(Problem::LongestLife))),
             C => bug(C11),
-            E(_) => noop(E8),
-            Gone => noop(X7),
-            G => noop(G2),
+            E(_) => noop(E10),
+            Gone => noop(X9),
+            G => noop(G4),
         },
         Changed(change) => noop(match state {
             U => match change {
@@ -550,23 +553,24 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
             },
             P => match change {
                 Change::RevisionOrRules => P14,
-                Change::Rights | Change::NoOp => P15,
+                Change::Rights => P21,
+                Change::NoOp => P15,
             },
             Pw => Pw5,
             C => C16,
             E(_) => E8,
-            Gone => X7,
-            G => G2,
+            Gone => X9,
+            G => G4,
         }),
         Dropped => match state {
             U => noop(U12),
             S => stay(S6, Answer::None, TryCancel),
-            P => noop(P7),
+            P => noop(P23),
             Pw => stay(P16, Answer::None, TryCancel),
             C => noop(C12),
-            E(_) => noop(E8),
-            Gone => noop(X7),
-            G => noop(G2),
+            E(_) => noop(E11),
+            Gone => noop(X9),
+            G => noop(G4),
         },
         Restart => match state {
             U => forget(U13),
@@ -575,8 +579,8 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
             Pw => forget(Pw7),
             C => forget(C13),
             E(_) => forget(E6),
-            Gone => noop(X7),
-            G => noop(G2),
+            Gone => forget(X8),
+            G => noop(G4),
         },
         Settled(outcome) => match state {
             S if outcome == Committed => bug(S12),
@@ -584,31 +588,31 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
             S => go(S12, Answer::None, RestoreIntents, U),
             Pw => go(Pw1, Answer::None, StampEnd, E(outcome)),
             C => go(C18, Answer::None, StampEnd, E(outcome)),
-            U => bug(U17),
-            P => bug(P20),
-            E(_) => noop(E8),
-            Gone => noop(X7),
-            G => noop(G2),
+            U => bug(U18),
+            P => bug(P22),
+            E(_) => noop(E12),
+            Gone => noop(X9),
+            G => noop(G4),
         },
         Swapped => match state {
             S => go(S1, Answer::None, SwapAndRead, P),
             Pw => go(Pw3, Answer::None, Swap, P),
-            U => bug(U17),
-            P => bug(P20),
-            C => bug(C11),
-            E(_) => noop(E8),
-            Gone => noop(X7),
-            G => noop(G2),
+            U => bug(U18),
+            P => bug(P22),
+            C => bug(C19),
+            E(_) => noop(E12),
+            Gone => noop(X9),
+            G => noop(G4),
         },
         EvaluationFailed(problem) => match state {
             S => go(S2, Answer::None, RestoreIntents, U),
             Pw => go(Pw3, Answer::None, StampEnd, E(Failed(problem))),
-            U => bug(U17),
-            P => bug(P20),
-            C => bug(C11),
-            E(_) => noop(E8),
-            Gone => noop(X7),
-            G => noop(G2),
+            U => bug(U18),
+            P => bug(P22),
+            C => bug(C19),
+            E(_) => noop(E12),
+            Gone => noop(X9),
+            G => noop(G4),
         },
         WorkerExit(exit) => match state {
             C => {
@@ -627,11 +631,11 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
             }
             U => bug(U17),
             P => bug(P20),
-            S => bug(S8),
-            Pw => bug(Pw8),
-            E(_) => noop(E8),
-            Gone => noop(X7),
-            G => noop(G2),
+            S => bug(S15),
+            Pw => bug(Pw11),
+            E(_) => noop(E13),
+            Gone => noop(X9),
+            G => noop(G4),
         },
     }
 }
