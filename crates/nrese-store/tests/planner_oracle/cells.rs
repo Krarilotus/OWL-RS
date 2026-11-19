@@ -23,8 +23,8 @@ fn a_drawing_filter_keeps_all_copies_or_none() {
 }
 
 #[test]
-#[ignore = "the outer seed supplies a variable outside the OPTIONAL condition's scope"]
-fn optional_condition_reads_its_own_left_and_right() {
+#[ignore = "the planned join decides a drawing OPTIONAL condition again for each joined row"]
+fn an_optional_condition_decides_once_for_its_group() {
     drawing("optional-condition");
 }
 
@@ -88,7 +88,6 @@ fn a_path_filter_keeps_or_drops_both_copies_of_each_path() {
 }
 
 #[test]
-#[ignore = "probing the vector index may repeat a draw for each hit"]
 fn vector_hits_copy_the_draw_from_an_unrelated_group() {
     drawing("vector-draw");
 }

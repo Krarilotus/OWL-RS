@@ -12,7 +12,6 @@ pub enum Draw {
         keys: &'static [&'static str],
         independent: bool,
     },
-    Condition,
     Average,
 }
 
@@ -51,7 +50,6 @@ impl Query {
                 let call = match draw {
                     Draw::Value { call, .. } => call,
                     Draw::Filter { .. } => "RAND() < 0.5",
-                    Draw::Condition => "RAND() < 2",
                     Draw::Average => "IF(RAND() < 0.5, 1, 1 / 0)",
                 };
                 self.text.replace("$DRAW", call).replace("$OTHER", call)
@@ -62,7 +60,7 @@ impl Query {
     pub fn twin(&self) -> String {
         let (first, other) = match self.draw {
             None => return self.text.clone(),
-            Some(Draw::Filter { .. } | Draw::Condition) => ("true".into(), "true".into()),
+            Some(Draw::Filter { .. }) => ("true".into(), "true".into()),
             Some(Draw::Average) => ("1".into(), "1".into()),
             Some(Draw::Value { keys, .. }) => {
                 (key_expression("first", keys), key_expression("other", keys))

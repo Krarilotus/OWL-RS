@@ -108,9 +108,11 @@ pub fn drawing(shape: &'static str) -> Case {
             format!("SELECT ?k {{ VALUES ?k {{ {many} }} {{ ?x {LABEL} ?l FILTER($DRAW) }} }}"),
             filter(&[], false),
         ),
+        // The group's one OPTIONAL pair is decided by one draw, which the join
+        // copies to every key: FILTER(BOUND(?o)) keeps all forty rows or none.
         "optional-condition" => (
-            format!("SELECT ?s ?z {{ VALUES (?s ?x) {{ (<urn:a> 1) (<urn:b> 2) }} {{ {FEW} OPTIONAL {{ ?s <urn:q> ?z FILTER($DRAW && !BOUND(?x)) }} }} }}"),
-            Draw::Condition,
+            format!("SELECT ?k {{ VALUES ?k {{ {many} }} {{ <urn:a> {LABEL} ?l OPTIONAL {{ <urn:a> {LABEL} ?o FILTER($DRAW) }} }} FILTER(BOUND(?o)) }}"),
+            filter(&[], false),
         ),
         "duplicate-keys" => (
             format!("SELECT ?s ?o ?d {{ {VALUES} {{ {FEW} BIND($DRAW AS ?d) }} }}"),

@@ -197,7 +197,10 @@ pub fn execute(store: &StoreService, request: &SparqlQueryRequest) -> Rows {
         .collect()
 }
 
+// EXPLAIN after a run of the same query would report a cache read; clear the
+// cache so it plans and evaluates the query.
 pub fn explain(store: &StoreService, request: &SparqlQueryRequest) -> Explanation {
+    store.clear_query_cache();
     let prepared = store.prepare_query(request).unwrap();
     store
         .explain_query(&prepared, &CancellationToken::new())

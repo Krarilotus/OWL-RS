@@ -177,7 +177,8 @@ pub fn check(case: &Case, repeats: usize) -> (Vec<Failure>, usize) {
 }
 
 pub fn assert_case(case: &Case) {
-    let (failures, _) = check(case, 2);
+    // Twelve runs, as in the probes: a fault in one run of a few is missed.
+    let (failures, _) = check(case, 12);
     assert!(
         failures.is_empty(),
         "{}: {}\n{failures:#?}",

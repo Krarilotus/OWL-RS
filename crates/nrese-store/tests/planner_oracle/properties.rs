@@ -146,7 +146,6 @@ pub fn check(
             }
             Ok(())
         }
-        Draw::Condition => same(twin, found, false).map_err(|e| ("P5", e)),
         Draw::Average => {
             same(&without(twin, "avg"), &without(found, "avg"), false).map_err(|e| ("P5", e))?;
             for value in found.iter().filter_map(|r| r.get("avg")) {
