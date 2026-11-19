@@ -211,3 +211,8 @@ pub fn try_explain(
 pub fn explain(store: &StoreService, request: &SparqlQueryRequest) -> Explanation {
     try_explain(store, request).unwrap_or_else(|e| panic!("{e}: {}", request.query))
 }
+
+// The rewrites an EXPLAIN reports.
+pub fn rewrites(explanation: &Explanation) -> &[&'static str] {
+    &explanation.rewrites
+}

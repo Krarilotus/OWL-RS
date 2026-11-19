@@ -9,6 +9,17 @@ fn drawing(shape: &'static str) {
     assert_case(&generator::drawing(shape));
 }
 
+// A cell that the tree under test cannot run says so instead of failing.
+fn unsupported(available: bool, reason: &str) -> bool {
+    if !available {
+        println!("UNSUPPORTED: {reason}");
+    }
+    !available
+}
+
+const NO_VECTORS: &str = "the tree has no vector index";
+const NO_REWRITES: &str = "the tree's EXPLAIN reports no rewrites";
+
 // Each group evaluates its own expressions before its solutions join.
 #[test]
 fn one_blank_node_for_one_group_solution() {
@@ -79,12 +90,18 @@ fn a_path_filter_keeps_or_drops_both_copies_of_each_path() {
 
 #[test]
 fn vector_hits_copy_the_draw_from_an_unrelated_group() {
+    if unsupported(generator::VECTOR_INDEX, NO_VECTORS) {
+        return;
+    }
     drawing("vector-draw");
 }
 
 #[test]
 #[ignore = "a vector search that goes first evaluates a group sharing no variable with the hit once per hit"]
 fn a_group_beside_a_vector_search_draws_once_for_all_hits() {
+    if unsupported(generator::VECTOR_INDEX, NO_VECTORS) {
+        return;
+    }
     drawing("vector-disjoint");
 }
 
@@ -125,6 +142,9 @@ fn an_optional_filter_with_an_unbound_input_preserves_left_rows() {
 
 #[test]
 fn explain_distinguishes_a_rewrite_from_the_as_written_plan() {
+    if unsupported(generator::EXPLAIN_REWRITES, NO_REWRITES) {
+        return;
+    }
     // The join-groups rewrite joins a group holding an OPTIONAL to the triple
     // pattern beside it (the parser merges plain adjacent patterns itself).
     // Planned, EXPLAIN reports it; as written, nothing is rewritten. The one
@@ -149,7 +169,7 @@ fn explain_distinguishes_a_rewrite_from_the_as_written_plan() {
         let explanation = routes::explain(store, &request);
         assert_eq!(explanation.rows, 1);
         assert_eq!(
-            explanation.rewrites.contains(&"join-groups"),
+            routes::rewrites(&explanation).contains(&"join-groups"),
             !as_written,
             "{explanation:?}"
         );
@@ -158,6 +178,9 @@ fn explain_distinguishes_a_rewrite_from_the_as_written_plan() {
 
 #[test]
 fn explain_agrees_with_the_mode_of_a_cold_ql_request() {
+    if unsupported(generator::EXPLAIN_REWRITES, NO_REWRITES) {
+        return;
+    }
     // ASK carries an ask-limit rewrite only in planned mode. Under a 1 MiB
     // cap the disjoint chain is too large to close as written; planned, the
     // path reachable from a single starting node gives the one solution.
@@ -196,7 +219,7 @@ fn explain_agrees_with_the_mode_of_a_cold_ql_request() {
         .unwrap_or_else(|e| panic!("EXPLAIN of the capped request reports no mode: {e}"));
     assert_eq!(explained.rows, 1);
     assert!(
-        explained.rewrites.contains(&"ask-limit"),
+        routes::rewrites(&explained).contains(&"ask-limit"),
         "EXPLAIN reports as written for a run only the planned mode fits: {explained:?}"
     );
 }

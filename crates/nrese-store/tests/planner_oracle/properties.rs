@@ -86,6 +86,23 @@ fn split(rows: &Rows, keys: &[&str]) -> (Bag, BTreeMap<Key, Bag>) {
     (outside, inside)
 }
 
+// Properties whose witness is an outcome of small chance under SPARQL: a
+// second run must give it too.
+pub const RARE: &[&str] = &["P4", "AVG unbound"];
+
+fn number(value: Option<&String>) -> Option<f64> {
+    value?.split('"').nth(1)?.parse().ok()
+}
+
+// Beside a drawing AVG, a mean whose volatile argument is 1 on both branches:
+// SPARQL binds it to 1 in every group.
+pub fn bound_one(rows: &Rows) -> Result<(), String> {
+    match rows.iter().find(|r| number(r.get("bound")) != Some(1.0)) {
+        Some(row) => Err(format!("?bound is not 1 in {row:?}")),
+        None => Ok(()),
+    }
+}
+
 // What SPARQL allows at a drawing site, taken from the twin.
 pub struct Model {
     draw: Draw,
@@ -240,14 +257,30 @@ impl Model {
                 Ok(())
             }
             Draw::Average => {
+                bound_one(found).map_err(|e| ("AVG bound", e))?;
                 same(&without(twin, "avg"), &without(found, "avg"), false)
                     .map_err(|e| ("P5", e))?;
                 for value in found.iter().filter_map(|r| r.get("avg")) {
                     // The only numeric argument is 1. AVG may be unbound after
                     // an error, or 0 for empty input, but never another mean.
-                    let numeric = value.split('"').nth(1).and_then(|s| s.parse::<f64>().ok());
-                    if !matches!(numeric, Some(0.0 | 1.0)) {
+                    if !matches!(number(Some(value)), Some(0.0 | 1.0)) {
                         return Err(("AVG", format!("unexpected mean {value}")));
+                    }
+                }
+                // A group's mean is bound when all its n arguments are 1, a
+                // chance of 2^-n each; every mean unbound has the chance of
+                // the product of 1 - 2^-n over the groups (n from ?rows).
+                if found.iter().all(|r| !r.contains_key("avg")) {
+                    let unbound = |r: &Row| {
+                        let n = number(r.get("rows")).unwrap_or(0.0) as i32;
+                        (1.0 - 0.5f64.powi(n.min(1000))).log2()
+                    };
+                    let log2: f64 = found.iter().map(unbound).sum();
+                    if log2 < -20.0 {
+                        let groups = found.len();
+                        let detail =
+                            format!("all {groups} means unbound: 2^{log2:.1} under SPARQL");
+                        return Err(("AVG unbound", detail));
                     }
                 }
                 Ok(())

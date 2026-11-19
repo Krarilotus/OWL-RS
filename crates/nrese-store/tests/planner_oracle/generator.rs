@@ -32,8 +32,9 @@ const FEW: &str = "?s <urn:few> ?o";
 const VECTOR: &str = "urn:nrese:vector:";
 pub const REMOTE: &str = "<urn:a> <urn:remote> 1 .";
 // Beside a drawing AVG: a volatile argument whose branches are both 1, so
-// its mean is bound and 1 on every run and route, whatever is drawn.
-pub const BOUND: &str = "(AVG(IF(RAND() < 0.5, 1, 1)) AS ?bound)";
+// its mean is bound and 1 on every run and route, whatever is drawn; and
+// each group's size, the arguments the drawing mean needs all to be 1.
+pub const BOUND: &str = "(AVG(IF(RAND() < 0.5, 1, 1)) AS ?bound) (COUNT(*) AS ?rows)";
 
 // Where a generated query draws. "none" draws nothing and is compared as a bag.
 pub const PLACES: &[&str] = &[
@@ -50,8 +51,10 @@ pub const PLACES: &[&str] = &[
 ];
 
 // Whether the engine under test has a vector index; a tree without one
-// skips the seeds that search it.
+// skips the seeds that search it. And whether its EXPLAIN reports rewrites;
+// without either, the cells that need it say they are unsupported.
 pub const VECTOR_INDEX: bool = true;
+pub const EXPLAIN_REWRITES: bool = true;
 
 pub fn keys(n: usize) -> String {
     (0..n).map(|i| i.to_string()).collect::<Vec<_>>().join(" ")

@@ -13,6 +13,8 @@ use crate::twin::Draw;
 
 const SEEDS: &str = "NRESE_PLANNER_ORACLE_SEEDS";
 const EXPECT_RED: &str = "NRESE_PLANNER_ORACLE_EXPECT_RED";
+const CELLS_RED: &str = "NRESE_PLANNER_ORACLE_CELLS_RED";
+const RECORD: &str = "NRESE_PLANNER_ORACLE_RECORD";
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Route {
@@ -20,11 +22,27 @@ enum Route {
     Streamed,
     Cold(StoreRoute),
     Repeat(StoreRoute),
-    Explain(StoreRoute),
+}
+
+// The query a failure is about: the drawing one, or its deterministic twin.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Request {
+    Real,
+    Twin,
+}
+
+// What failed: the rows a route answered, or EXPLAIN's report of its run
+// (on a store, from a cleared cache).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Kind {
+    Answer,
+    Explain,
 }
 
 #[derive(Debug)]
 pub struct Failure {
+    request: Request,
+    kind: Kind,
     route: Route,
     property: &'static str,
     detail: String,
@@ -32,18 +50,48 @@ pub struct Failure {
 
 impl Failure {
     fn same_kind(&self, other: &Self) -> bool {
-        (self.route, self.property) == (other.route, other.property)
+        self.label() == other.label() && self.property == other.property
+    }
+
+    fn label(&self) -> String {
+        format!("{:?} {:?} {:?}", self.request, self.kind, self.route)
+    }
+
+    // Whether it can meet a red requirement: the real query's answer on
+    // native planned, or on a store route cold or repeated. As written and
+    // streamed never do.
+    fn red(&self) -> bool {
+        self.request == Request::Real
+            && self.kind == Kind::Answer
+            && matches!(
+                self.route,
+                Route::Native(false) | Route::Cold(_) | Route::Repeat(_)
+            )
     }
 }
 
-fn report(
-    failures: &mut Vec<Failure>,
-    route: Route,
-    property: &'static str,
-    result: Result<(), String>,
-) {
-    if let Err(detail) = result {
-        failures.push(Failure {
+struct Report<'a>(&'a mut Vec<Failure>, Request);
+
+impl Report<'_> {
+    fn answer(&mut self, route: Route, property: &'static str, result: Result<(), String>) {
+        if let Err(detail) = result {
+            let (request, kind) = (self.1, Kind::Answer);
+            self.0.push(Failure {
+                request,
+                kind,
+                route,
+                property,
+                detail,
+            });
+        }
+    }
+
+    // EXPLAIN runs on a store from a cleared cache.
+    fn explain(&mut self, store: StoreRoute, property: &'static str, detail: String) {
+        let (request, kind, route) = (self.1, Kind::Explain, Route::Cold(store));
+        self.0.push(Failure {
+            request,
+            kind,
             route,
             property,
             detail,
@@ -60,24 +108,27 @@ fn compare_twin(
     expected: &Rows,
     failures: &mut Vec<Failure>,
 ) -> usize {
+    let mut report = Report(failures, Request::Twin);
     let request = SparqlQueryRequest::all(case.query.twin());
     let reduced = case.query.reduced;
     let check = |rows: &Rows| properties::same(expected, rows, reduced);
     let planned = routes.native(&request.query, false);
-    report(failures, Route::Native(false), "twin bag", check(&planned));
+    report.answer(Route::Native(false), "twin bag", check(&planned));
     if matches!(case.query.draw, Some(Draw::Average)) {
-        // An argument that never errs gives a bound mean, streamed too.
+        // The mean beside the draw never errs: bound to 1, as written too.
+        let bound = properties::bound_one(expected);
+        report.answer(Route::Native(true), "AVG bound", bound);
         let streamed = routes.native_with(&request.query, false, Some(2));
-        report(failures, Route::Streamed, "twin bag", check(&streamed));
+        report.answer(Route::Streamed, "twin bag", check(&streamed));
     }
     let mut hits = 0;
     for route in STORES {
         let store = routes.store(route);
         let cold = routes::execute(store, &request);
-        report(failures, Route::Cold(route), "twin bag", check(&cold));
+        report.answer(Route::Cold(route), "twin bag", check(&cold));
         let before = store.query_cache_stats().hits;
         let warm = routes::execute(store, &request);
-        report(failures, Route::Repeat(route), "twin bag", check(&warm));
+        report.answer(Route::Repeat(route), "twin bag", check(&warm));
         hits += usize::from(store.query_cache_stats().hits > before);
 
         let explanation = routes::explain(store, &request);
@@ -85,17 +136,10 @@ fn compare_twin(
             let root = explanation
                 .steps
                 .first()
-                .map(|step| (&step.operator, step.rows, &step.detail));
-            report(
-                failures,
-                Route::Explain(route),
-                "EXPLAIN rows",
-                Err(format!(
-                    "explained {}, executed {} (root {root:?})",
-                    explanation.rows,
-                    cold.len()
-                )),
-            );
+                .map(|s| (&s.operator, s.rows, &s.detail));
+            let (explained, executed) = (explanation.rows, cold.len());
+            let detail = format!("explained {explained}, executed {executed} (root {root:?})");
+            report.explain(route, "EXPLAIN rows", detail);
         }
     }
     hits
@@ -115,6 +159,7 @@ fn compare_draws(
     let Some(draw) = case.query.draw else {
         return Vec::new();
     };
+    let mut report = Report(failures, Request::Real);
     let request = SparqlQueryRequest::all(case.query.real());
     let scope = |body: &str| {
         let text = case.query.scope.as_ref()?;
@@ -127,12 +172,25 @@ fn compare_draws(
             let Err((property, detail)) = model.check(&run()) else {
                 continue;
             };
-            // An outcome of chance at most 2^-20 under SPARQL is a witness
-            // only if an independent second run gives one too.
-            if property == "P4" && !matches!(model.check(&run()), Err(("P4", _))) {
-                continue;
+            if !properties::RARE.contains(&property) {
+                report.answer(route, property, Err(detail));
+                break;
             }
-            report(failures, route, property, Err(detail));
+            // An outcome of chance at most 2^-20 under SPARQL is a witness
+            // when an independent second run gives it too. Whatever else
+            // the second run breaks is a failure of its own.
+            match model.check(&run()) {
+                Ok(()) => continue,
+                Err((again, more)) if again == property => {
+                    let detail = format!("{detail}; again: {more}");
+                    report.answer(route, property, Err(detail));
+                }
+                Err((other, more)) => {
+                    let detail =
+                        format!("{more} (the run after an unconfirmed {property}: {detail})");
+                    report.answer(route, other, Err(detail));
+                }
+            }
             break;
         }
     };
@@ -157,27 +215,17 @@ fn compare_draws(
         });
     }
     // EXPLAIN executes the drawing request again: its total is checked
-    // against the totals SPARQL allows. It never stands for an answer route.
+    // against the totals SPARQL allows, as an EXPLAIN failure.
     let mut reached = Vec::new();
     for route in STORES {
         let explanation = routes::explain(routes.store(route), &request);
-        let scans = explanation.steps.iter();
-        if scans
-            .filter(|s| s.detail.contains("<urn:embedding>"))
-            .count()
-            > 1
-        {
-            reached.push(route);
-        }
+        let steps = explanation.steps.iter();
+        let scans = steps.filter(|s| s.detail.contains("<urn:embedding>"));
+        reached.extend((scans.count() > 1).then_some(route));
         let explained = explanation.rows;
         if !model.explains(explained as usize) {
             let detail = format!("explained {explained} rows, a total SPARQL cannot give");
-            report(
-                failures,
-                Route::Explain(route),
-                model.property(),
-                Err(detail),
-            );
+            report.explain(route, model.property(), detail);
         }
     }
     reached
@@ -194,13 +242,16 @@ pub fn check(case: &Case, repeats: usize) -> (Vec<Failure>, usize, Vec<StoreRout
     (failures, hits, reached)
 }
 
+fn print_cell(shape: &str, failures: &[Failure]) {
+    for f in failures {
+        println!("CELL {shape} {} {}", f.label(), f.property);
+    }
+}
+
 pub fn assert_case(case: &Case) {
     // Twelve runs, as in the probes: a fault in one run of a few is missed.
     let (failures, _, _) = check(case, 12);
-    // One line per failure, for the red driver's record of each cell.
-    for f in &failures {
-        println!("CELL {} {:?} {}", case.shape, f.route, f.property);
-    }
+    print_cell(case.shape, &failures);
     assert!(
         failures.is_empty(),
         "{}: {}\n{failures:#?}",
@@ -216,6 +267,13 @@ fn seeds() -> Option<Range<u64>> {
     let end = end.parse().expect("invalid end seed");
     assert!(start < end, "the seed range must be non-empty");
     Some(start..end)
+}
+
+// A red requirement: comma-separated place:property pairs.
+fn pairs(text: &str) -> Vec<(&str, &str)> {
+    text.split(',')
+        .map(|pair| pair.split_once(':').expect("expected place:property"))
+        .collect()
 }
 
 // Remove independently parseable data chunks while preserving the same
@@ -254,14 +312,15 @@ fn reduce(mut case: Case, witness: &Failure) -> Case {
 
 // The witness, reduced to a case that can be typed from this output alone:
 // its query, data and remote data, checked again as a cell would.
-fn print_reduced(seed: u64, case: Case, failures: &[Failure], witness: &Failure) {
+fn print_reduced(seed: u64, case: Case, witness: &Failure) {
     println!(
-        "WITNESS {} seed={seed} labels={:?} route={:?} property={} {}",
-        case.shape, case.labels, witness.route, witness.property, witness.detail
+        "WITNESS {} seed={seed} labels={:?} {} property={} {}",
+        case.shape,
+        case.labels,
+        witness.label(),
+        witness.property,
+        witness.detail
     );
-    for fault in failures.iter().filter(|f| !std::ptr::eq(*f, witness)) {
-        println!("ALSO {:?} {} {}", fault.route, fault.property, fault.detail);
-    }
     let reduced = reduce(case, witness);
     println!("QUERY {}", reduced.query.real());
     for statement in &reduced.data {
@@ -273,32 +332,52 @@ fn print_reduced(seed: u64, case: Case, failures: &[Failure], witness: &Failure)
     let (again, _, _) = check(&reduced, 12);
     let again = again.iter().any(|f| witness.same_kind(f));
     println!(
-        "RECHECK seed={seed} {} {:?} {}: {}",
+        "RECHECK seed={seed} {} {} {}: {}",
         reduced.shape,
-        witness.route,
+        witness.label(),
         witness.property,
         if again { "fails again" } else { "passed" }
     );
 }
 
+// NRESE_PLANNER_ORACLE_CELLS_RED, comma-separated shape:property pairs of
+// named cells: each must break that property in the real query's answer on
+// a red route. Without it, the test does nothing.
+#[test]
+fn named_cells_red() {
+    let Ok(text) = std::env::var(CELLS_RED) else {
+        return;
+    };
+    let mut missing = Vec::new();
+    for (shape, property) in pairs(&text) {
+        let shape: &'static str = Box::leak(shape.to_owned().into_boxed_str());
+        let (failures, _, _) = check(&generator::drawing(shape), 12);
+        print_cell(shape, &failures);
+        if !failures.iter().any(|f| f.red() && f.property == property) {
+            missing.push((shape, property));
+        }
+    }
+    assert!(
+        missing.is_empty(),
+        "named cells without their red on a red route: {missing:?}"
+    );
+}
+
 // A sweep prints a SEED line for each seed that fails, with the draw site
 // and the properties broken there, so a tree's result for every seed is in
-// its output. It counts witnesses by (site, property, route) and excuses
-// none. NRESE_PLANNER_ORACLE_EXPECT_RED, a comma-separated list of
-// site:property pairs, requires a witness for each on an answer route (not
-// EXPLAIN alone) instead of failing on witnesses.
+// its output. It counts witnesses by site, property, query, kind and route,
+// and fails on any. NRESE_PLANNER_ORACLE_EXPECT_RED (site:property pairs)
+// instead requires each pair from a red witness. NRESE_PLANNER_ORACLE_RECORD
+// only records: for typing on another tree.
 #[test]
 fn seeded_queries() {
     let red = std::env::var(EXPECT_RED).ok();
+    let record = std::env::var(RECORD).is_ok();
     let Some(seeds) = seeds() else {
         assert!(red.is_none(), "{EXPECT_RED} requires {SEEDS}");
         return;
     };
-    let required: Vec<(&str, &str)> = red
-        .iter()
-        .flat_map(|pairs| pairs.split(','))
-        .map(|pair| pair.split_once(':').expect("expected site:property"))
-        .collect();
+    let required = red.as_deref().map(pairs).unwrap_or_default();
     let start = Instant::now();
     let mut checked = BTreeMap::<&str, usize>::new();
     let mut found = BTreeMap::<(&str, &str, String), usize>::new();
@@ -339,48 +418,38 @@ fn seeded_queries() {
             properties.join(","),
             case.labels
         );
-        let mut new = None;
+        // Each triple this seed brings first gets its own reduced witness.
+        let mut new = Vec::new();
         for failure in &failures {
-            let key = (case.shape, failure.property, format!("{:?}", failure.route));
-            if !found.contains_key(&key) && new.is_none() {
-                new = Some(failure);
-            }
-            if !matches!(failure.route, Route::Explain(_)) {
+            let key = (case.shape, failure.property, failure.label());
+            if failure.red() {
                 answered.insert((case.shape, failure.property));
             }
+            let count = found.entry(key).or_default();
+            if *count == 0 {
+                new.push(failure);
+            }
+            *count += 1;
         }
-        let keys: BTreeSet<_> = failures
-            .iter()
-            .map(|f| (case.shape, f.property, format!("{:?}", f.route)))
-            .collect();
-        for key in keys {
-            *found.entry(key).or_default() += 1;
-        }
-        // Reduce and recheck the failure that brought a new triple.
-        let Some(witness) = new else { continue };
-        let reduced = || print_reduced(seed, case.clone(), &failures, witness);
-        if catch_unwind(AssertUnwindSafe(reduced)).is_err() {
-            println!("RECHECK seed={seed}: the reduction panicked");
+        for witness in new {
+            let reduced = || print_reduced(seed, case.clone(), witness);
+            if catch_unwind(AssertUnwindSafe(reduced)).is_err() {
+                println!("RECHECK seed={seed}: the reduction panicked");
+            }
         }
     }
     println!(
         "SWEEP {count} seeds {} ms; {hits} cache hits; {skipped} skipped without a vector index; checked {checked:?}",
         start.elapsed().as_millis()
     );
-    for ((site, property, route), n) in &found {
-        println!("WITNESSES {site} {property} {route}: {n} seeds");
+    for ((site, property, label), n) in &found {
+        println!("WITNESSES {site} {property} {label}: {n}");
     }
     if generator::VECTOR_INDEX {
-        let of = format!("of {disjoint} seeds whose drawing group shares no variable with the hit");
-        if reach.is_empty() {
-            println!(
-                "NOT COVERED vector: no drawing request's EXPLAIN shows the search first, {of}"
-            );
-        } else {
-            println!(
-                "VECTOR the drawing request's own EXPLAIN shows the search first: {reach:?} {of}"
-            );
-        }
+        // Seeds whose drawing request's own EXPLAIN shows the search first,
+        // per store route, of those whose group shares no variable with the hit.
+        let head = ["VECTOR", "NOT COVERED vector:"][usize::from(reach.is_empty())];
+        println!("{head} search first by EXPLAIN in {reach:?} of {disjoint} seeds");
     }
     if red.is_some() {
         let missing: Vec<_> = required
@@ -389,9 +458,9 @@ fn seeded_queries() {
             .collect();
         assert!(
             missing.is_empty(),
-            "required witnesses missing on an answer route: {missing:?}"
+            "required witnesses missing on a red route: {missing:?}"
         );
-    } else {
+    } else if !record {
         assert!(found.is_empty(), "witnesses: {:?}", found.keys());
     }
 }
