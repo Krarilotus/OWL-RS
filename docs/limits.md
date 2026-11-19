@@ -53,24 +53,25 @@ come with. What is in is on
   emptied graph answers 404 ([Graph Store Protocol](ops/http-api.md#graph-store-protocol)).
   Read that 404 as an empty graph.
 - A reader of only some graphs gets no plan steps in `EXPLAIN`.
-- A value drawn at each evaluation (`RAND()`, `UUID()`, `STRUUID()`, `BNODE()`) is drawn once
-  per solution of its group, as SPARQL says.
-- A part of a query that draws such a value gives up some faster plans, so it costs more
+- A part of a query that draws a value at each evaluation (`RAND()`, `UUID()`, `STRUUID()`,
+  `BNODE()`) is evaluated as follows, and gives up some faster plans for it, so it costs more
   than one that draws nothing:
-  - an `EXISTS` or a `LATERAL` right side that draws is evaluated once per row, so its cost
-    grows with the rows, not with their distinct values;
-  - a `SERVICE` pattern that draws is sent once, without the joined rows' values, and joined
-    here;
-  - a group that draws, beside a vector search, is evaluated first, and the search ranks its
-    values: the search doesn't go first;
+  - an `EXISTS` that draws is evaluated once per tested row, and in an `OPTIONAL`'s condition
+    once per compatible pair: its cost grows with the rows, not with their distinct values;
+  - a `LATERAL` right side that draws is evaluated once per left row;
+  - a `SERVICE` pattern that draws is sent once per endpoint it resolves to, per evaluation of
+    the `SERVICE`, without the joined rows' values, and joined here;
+  - a group that draws, beside a vector search, is evaluated first: the search doesn't go
+    first. Where every row of the group binds the matched vector, the search ranks only those
+    vectors; otherwise it ranks every vector of the active graph;
   - a `GROUP BY` with an `AVG` over a drawn value is never computed in parts: where its rows
     don't fit the query's memory, the query is refused.
-- A group that draws such a value is evaluated from the distinct values of the rows joined
-  to it, not from the rows themselves, which costs a little more than a group that draws
-  nothing. Where those rows share no variable the group binds in every solution, or leave
-  such a variable unbound in a row, the group is evaluated alone and then joined: a
-  `FILTER(RAND() < …)` over a `UNION` in which only some arms bind the joined variable reads
-  all of those arms' data, not only the rows' values.
+- In a plan that passes rows sideways into a group, a group that draws is evaluated from the
+  distinct values of the rows joined to it, not from the rows themselves, which costs a little
+  more than a group that draws nothing. Where those rows share no variable the group binds in
+  every solution, or leave such a variable unbound in a row, the group is evaluated alone and
+  then joined: a `FILTER(RAND() < …)` over a `UNION` in which only some arms bind the joined
+  variable reads all of those arms' data, not only the rows' values.
   The answer is right, but slower, or refused under a tight memory budget.
 - Directional strings in the data alone don't make a result announce RDF 1.2, but a query that
   makes or matches them, or triple terms, does ([announcing](ops/http-api.md#requests-in-detail)).
