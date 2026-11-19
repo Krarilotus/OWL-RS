@@ -748,8 +748,10 @@ fn marks_and_passes(
 }
 
 /// A read off the rules route of a store with neither an annotation-property axiom nor an
-/// equality is told no mark, committed and inside a transaction, and its mark doesn't go to
-/// the whole ontology: the store's indexes show there is neither.
+/// equality is told no mark, committed and inside a transaction. The committed read's mark
+/// doesn't go to the whole ontology: the store's indexes and the commit's record show there
+/// is neither. The pending read's goes once to its own: its base's record says nothing of
+/// the pending changes.
 #[test]
 fn a_store_without_annotation_axioms_or_equality_is_marked_without_the_ontology() {
     let (reads, _) = marks_and_passes(
@@ -759,7 +761,7 @@ fn a_store_without_annotation_axioms_or_equality_is_marked_without_the_ontology(
     );
     assert_eq!(
         reads,
-        [(vec![], 0), (vec![], 0)],
+        [(vec![], 0), (vec![], 1)],
         "[committed, pending]: (the mark's reasons, passes over the whole ontology)"
     );
 }

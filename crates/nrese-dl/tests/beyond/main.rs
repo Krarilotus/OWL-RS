@@ -5,6 +5,9 @@
 use nrese_dl::beyond::{Options, Verdict, consistency};
 use nrese_dl::scope::{answer_beyond, read_with_rules};
 
+#[path = "../../examples/support/read.rs"]
+mod read;
+
 const PREFIXES: &str = "Prefix(:=<http://example.org/scope#>) \
     Prefix(owl:=<http://www.w3.org/2002/07/owl#>) \
     Prefix(xsd:=<http://www.w3.org/2001/XMLSchema#>) \
@@ -25,13 +28,23 @@ fn is_consistent(d: &nrese_dl::beyond::Decision) -> bool {
 
 /// A name declared an object and a data property is a name of two kinds an axiom reads
 /// (Structural Specification §5.8.1), which the DL engines read as one name: no model of
-/// theirs speaks of the input, which is undecided, never certified consistent.
+/// theirs speaks of the input, which is undecided, never certified consistent. Read as
+/// the reader gives it, diagnostic and all, to `consistency` itself (`decide`'s reading
+/// refuses any diagnostic but the rules').
 #[test]
 fn a_name_declared_two_kinds_is_never_certified() {
-    let d = decide(
-        "Declaration(ObjectProperty(:p)) Declaration(DataProperty(:p)) \
-         ObjectPropertyAssertion(:p :a :b)",
+    let mut table = read::Table::default();
+    let text = format!(
+        "{PREFIXES}Ontology(Declaration(ObjectProperty(:p)) Declaration(DataProperty(:p)) \
+         ObjectPropertyAssertion(:p :a :b))"
     );
+    let (o, _) = nrese_owl::read_functional(&text, &mut table);
+    assert!(
+        o.diagnostics.iter().any(|x| x.joins_kinds()),
+        "{:?}",
+        o.diagnostics
+    );
+    let d = consistency(&o, &Options::default());
     assert!(
         matches!(d.verdict, Verdict::Undecided(_)),
         "{:?}\n{:#?}",

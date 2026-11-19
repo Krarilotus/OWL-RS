@@ -323,11 +323,11 @@ fn every_path_that_reports_a_status_tells_the_left_out_axiom() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A pending addition of such an axiom over a store without one: the read inside the
-/// transaction is told from its base, and its own additions aren't reasoned over before the
-/// commit, which the transaction's reason says: `sound-only`, not `unsound`, a limit of a
-/// read in a transaction (the commit's gate judges the addition). Committed, the store's
-/// reads are `unsound`.
+/// A pending addition of such an axiom over a store without one: its own additions aren't
+/// reasoned over before the commit, which the transaction's reason says, and the read takes
+/// no clean record from its base (one says nothing of the pending changes): it reads its own
+/// ontology, which leaves the addition out, and is `unsound` with that reason. Committed,
+/// the store's reads are `unsound` too.
 #[test]
 fn a_pending_addition_of_a_left_out_axiom_is_told_at_its_commit() {
     let dl = pipeline();
@@ -344,7 +344,7 @@ fn a_pending_addition_of_a_left_out_axiom_is_told_at_its_commit() {
     let status = status.expect("a status");
     let reasons: Vec<String> = status.reasons.iter().map(|r| r.text.clone()).collect();
     assert!(
-        status.as_str() == "sound-only" && !says_left_out(&reasons),
+        status.as_str() == "unsound" && says_left_out(&reasons),
         "pending: {rows} {status:?}"
     );
     insert(&dl, &axiom).expect("committed");

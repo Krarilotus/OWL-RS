@@ -974,9 +974,10 @@ const BUILTIN_ANNOTATIONS: [&str; 9] = [
 /// 16) reads the first three as annotation axioms, which the Direct Semantics give no
 /// meaning (1), and matches the fourth to no pattern, so its graph is no OWL 2 DL ontology.
 /// No read is entailed: an answer `true` is told `unsound` with the annotation reason, on
-/// the RL route and off it; where `:p` is declared a data or object property, the
-/// sub-property axiom also reads it as an annotation property, a name of two kinds an axiom
-/// reads (Structural Specification 5.8.1), and the reason is that one.
+/// the RL route and off it. The sub-property axiom names both its properties, so it reads
+/// `:p` as an annotation property, and `:p`'s assertion as a data or object property,
+/// declared or not: a name of two kinds an axiom reads (Structural Specification 5.8.1),
+/// and the reason is that one.
 #[test]
 fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
     let common = ":C a owl:Class . :x a owl:NamedIndividual . :v a owl:NamedIndividual .";
@@ -1019,14 +1020,14 @@ fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
         } else {
             ""
         };
-        for (kind, value, reason) in [
-            ("", "2", annotation),
-            ("", ":v", annotation),
-            (":p a owl:DatatypeProperty . ", "2", two_kinds),
-            (":p a owl:ObjectProperty . ", ":v", two_kinds),
+        for (kind, value) in [
+            ("", "2"),
+            ("", ":v"),
+            (":p a owl:DatatypeProperty . ", "2"),
+            (":p a owl:ObjectProperty . ", ":v"),
         ] {
             let data = format!("{note}{kind}:p rdfs:subPropertyOf {a} . :x :p {value} .");
-            cases.push((data, format!("ASK {{ :x {a} {value} }}"), reason));
+            cases.push((data, format!("ASK {{ :x {a} {value} }}"), two_kinds));
         }
     }
     let mut wrong = Vec::new();
