@@ -164,6 +164,15 @@ pub fn drawing(shape: &'static str) -> Case {
                 value("BNODE()", &[]),
             )
         }
+        // The group shares no variable with the hit: it is evaluated once,
+        // and each of its solutions joins both hits with one blank node.
+        "vector-disjoint" => {
+            vectors(&mut data, 120);
+            (
+                format!("SELECT ?x ?w ?v ?d {{ {{ ?x <urn:embedding> ?w BIND($DRAW AS ?d) }} {} }}", vector_search()),
+                value("BNODE()", &["x", "w"]),
+            )
+        }
         "service-batches" => (
             format!("SELECT ?k ?d {{ VALUES ?k {{ {} }} SERVICE <{ENDPOINT}> {{ {{ <urn:a> <urn:remote> ?z BIND($DRAW AS ?d) }} UNION {{ ?k <urn:missing> ?z BIND($OTHER AS ?d) }} }} }}", keys(201)),
             value("UUID()", &[]),

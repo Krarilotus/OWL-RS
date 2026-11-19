@@ -119,7 +119,10 @@ impl Model {
                     .as_ref()
                     .map_or(m, |c| c.get(&key).copied().unwrap_or(0));
                 assert!(
-                    m > 0 && n >= m && n % m == 0 && rows.values().all(|c| c % m == 0),
+                    m > 0
+                        && n >= m
+                        && n.is_multiple_of(m)
+                        && rows.values().all(|c| c.is_multiple_of(m)),
                     "uneven copies in the fixture for {key:?}"
                 );
                 let one = rows.into_iter().map(|(row, c)| (row, c / m)).collect();

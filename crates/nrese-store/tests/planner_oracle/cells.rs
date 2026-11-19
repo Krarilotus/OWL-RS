@@ -83,6 +83,12 @@ fn vector_hits_copy_the_draw_from_an_unrelated_group() {
 }
 
 #[test]
+#[ignore = "a vector search that goes first evaluates a group sharing no variable with the hit once per hit"]
+fn a_group_beside_a_vector_search_draws_once_for_all_hits() {
+    drawing("vector-disjoint");
+}
+
+#[test]
 #[ignore = "SERVICE evaluates its pattern again for each batch of bound values it sends"]
 fn a_remote_solution_draws_once_even_if_joined_in_batches() {
     drawing("service-batches");
