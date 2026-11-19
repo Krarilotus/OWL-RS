@@ -568,17 +568,17 @@ impl MutationPipeline {
         if gate == ShaclGate::Off {
             return Ok(());
         }
-        let report =
-            match crate::shacl::introduced(tx, &self.store.config().shapes_graph, resources) {
-                Ok(report) => report,
-                Err(error @ StoreError::SparqlEvaluation(_)) => return Err(stopped(error)),
-                // The stored shapes' problems, as the committer may be told them.
-                Err(error) => {
-                    ticket.claim_error()?;
-                    let error = view.shapes_error(&self.store.config().shapes_graph, error);
-                    return Err(MutationError::Gate(error.to_string()));
-                }
-            };
+        let shapes_graph = &self.store.config().shapes_graph;
+        let report = match crate::shacl::introduced(tx, shapes_graph, resources, ticket) {
+            Ok(report) => report,
+            Err(error @ StoreError::SparqlEvaluation(_)) => return Err(stopped(error)),
+            // The stored shapes' problems, as the committer may be told them.
+            Err(error) => {
+                ticket.claim_error()?;
+                let error = view.shapes_error(shapes_graph, error);
+                return Err(MutationError::Gate(error.to_string()));
+            }
+        };
         let Some(report) = report else {
             return Ok(());
         };

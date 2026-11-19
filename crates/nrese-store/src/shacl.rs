@@ -15,6 +15,7 @@ use nrese_shacl::{
 use nrese_sparql::{CancellationToken, ReadView, Resources};
 
 use crate::error::{StoreError, StoreResult};
+use crate::mutation::{MutationState, MutationTicket};
 use crate::query::GraphResultFormat;
 use crate::rdf_io::{BlankNodes, each_graph_quad, serialize_triples};
 use crate::service::StoreService;
@@ -159,6 +160,18 @@ fn shapes_error(errors: Vec<ShapeError>) -> StoreError {
     StoreError::ShaclShapes(errors.iter().map(ToString::to_string).collect())
 }
 
+fn commit_shapes_error(
+    ticket: &MutationTicket,
+    errors: Vec<ShapeError>,
+    format: impl FnOnce(Vec<ShapeError>) -> StoreError,
+) -> StoreError {
+    if ticket.end_pending() == MutationState::Cancelled {
+        nrese_sparql::QueryEvaluationError::Cancelled.into()
+    } else {
+        format(errors)
+    }
+}
+
 /// Validates `view` against the shapes in the graph `shapes` (none, if the graph holds
 /// nothing), leaving `also_excluded` out of the data as well, on `resources`.
 fn validate_view<V: ReadView + Sync>(
@@ -204,7 +217,7 @@ fn validate_view<V: ReadView + Sync>(
 pub(crate) fn check_shapes(
     tx: &Transaction<'_>,
     shapes_graph: &str,
-    ticket: &crate::MutationTicket,
+    ticket: &MutationTicket,
     view: &crate::mutation::evidence::EvidenceView<'_, '_>,
 ) -> StoreResult<()> {
     let iri = graph_iri(shapes_graph)?;
@@ -224,10 +237,9 @@ pub(crate) fn check_shapes(
     )
     .map(drop)
     .map_err(|errors| {
-        if ticket.end_pending() == crate::mutation::MutationState::Cancelled {
-            return nrese_sparql::QueryEvaluationError::Cancelled.into();
-        }
-        view.shapes_error(shapes_graph, shapes_error(errors))
+        commit_shapes_error(ticket, errors, |errors| {
+            view.shapes_error(shapes_graph, shapes_error(errors))
+        })
     })
 }
 
@@ -240,6 +252,7 @@ pub(crate) fn introduced(
     tx: &Transaction<'_>,
     shapes_graph: &str,
     resources: &Resources,
+    ticket: &MutationTicket,
 ) -> StoreResult<Option<ValidationReport>> {
     let iri = graph_iri(shapes_graph)?;
     let Some(shapes_id) = tx.lookup(iri.as_ref().into()) else {
@@ -259,7 +272,7 @@ pub(crate) fn introduced(
         tx,
         tx.base(),
         &tx.pending_snapshot(),
-        shapes_id,
+        (shapes_id, Some(ticket)),
         changed,
         |_| true,
         resources,
@@ -272,11 +285,16 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
     tx: &Transaction<'_>,
     before: &A,
     after: &B,
-    shapes_id: TermId,
+    shapes: (TermId, Option<&MutationTicket>),
     changed: impl FnOnce() -> Vec<EncodedQuad>,
     validated: impl Fn(&Shapes) -> bool,
     resources: &Resources,
 ) -> StoreResult<Option<ValidationReport>> {
+    let (shapes_id, ticket) = shapes;
+    let compile_error = |errors| match ticket {
+        Some(ticket) => commit_shapes_error(ticket, errors, shapes_error),
+        None => shapes_error(errors),
+    };
     let data = Selection::of(GraphSelector::Any).excluding(shapes_id);
     let shapes_selection = Selection::asserted(GraphSelector::Exact(shapes_id));
     let shapes_changed = tx
@@ -284,7 +302,7 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
         .chain(tx.deleted())
         .any(|quad| quad.graph == shapes_id);
     if shapes_changed {
-        let shapes_after = compile(after, shapes_selection).map_err(shapes_error)?;
+        let shapes_after = compile(after, shapes_selection).map_err(compile_error)?;
         // Shapes that didn't compile before had no results.
         let shapes_before = compile(before, shapes_selection).ok();
         if !validated(&shapes_after) || shapes_before.as_ref().is_some_and(|s| !validated(s)) {
@@ -300,7 +318,7 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
         )?;
         return Ok(Some(report));
     }
-    let shapes = compile(before, shapes_selection).map_err(shapes_error)?;
+    let shapes = compile(before, shapes_selection).map_err(compile_error)?;
     // A shapes graph with only `sh:entailment` still makes every validation fail.
     if shapes.is_vacuous() || !validated(&shapes) {
         return Ok(None);
@@ -343,7 +361,7 @@ pub(crate) fn view_reason(
         tx,
         &before,
         &after,
-        shapes_id,
+        (shapes_id, None),
         changed,
         |shapes| !shapes.uses_sparql(),
         resources,
