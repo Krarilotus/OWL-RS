@@ -368,19 +368,28 @@ pub(crate) fn view_reason(
             .collect()
     };
     let core = |shapes: &Shapes| !shapes.uses_sparql();
-    // The SHACL gate already built an indexed pending snapshot. An earlier gate
-    // may have refused without one, so read its transaction directly.
-    let shapes = (shapes_id, None);
-    let report = match pending {
-        Some(pending) => {
-            let after = view.readable(pending, resources)?;
-            introduced_in(tx, &before, &after, shapes, changed, core, resources)
-        }
+    // Reuse the SHACL gate's indexed snapshot. After an earlier refusal, build one
+    // for the whole evidence pass so each pattern read can use its indexes.
+    let built;
+    let pending = match pending {
+        Some(pending) => pending,
         None => {
-            let after = view.readable(tx, resources)?;
-            introduced_in(tx, &before, &after, shapes, changed, core, resources)
+            resources.check().ok()?;
+            built = tx.pending_snapshot();
+            &built
         }
-    }
+    };
+    resources.check().ok()?;
+    let after = view.readable(pending, resources)?;
+    let report = introduced_in(
+        tx,
+        &before,
+        &after,
+        (shapes_id, None),
+        changed,
+        core,
+        resources,
+    )
     .ok()??;
     // The first by what the view's statements say, never by the results' order, which is
     // the dictionary's: term ids follow what was interned first, in any graph.
