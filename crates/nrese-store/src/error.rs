@@ -95,6 +95,9 @@ pub enum StoreError {
         #[source]
         reason: std::io::Error,
     },
+    /// The quarantine record could not be kept and the load published no changes.
+    #[error("i/o error: {0}")]
+    LoadQuarantineNotRecorded(#[source] std::io::Error),
     /// A classification or realisation request gave up waiting for the computation under
     /// way for its revision, which runs on and is kept.
     #[error("the classification request was cancelled while it waited")]
@@ -271,13 +274,15 @@ impl StoreError {
             Self::SparqlSyntax(_)
             | Self::SparqlUpdate(_)
             | Self::InvalidGraphIri(_)
-            | Self::RdfParse(_)
+            | Self::RdfParse(RdfParseError::Syntax(_))
             | Self::ShaclShapes(_)
             | Self::Forbidden(_)
             | Self::Quarantine(_)
-            | Self::FileParse { .. } => true,
+            | Self::FileParse { source: RdfParseError::Syntax(_), .. } => true,
             Self::SparqlEvaluation(_) => unreachable!("classified above"),
             Self::Configuration(_)
+            | Self::RdfParse(RdfParseError::Io(_))
+            | Self::FileParse { source: RdfParseError::Io(_), .. }
             | Self::Io(_)
             | Self::Engine(_)
             | Self::OntologyFileNotFound { .. }
@@ -288,6 +293,7 @@ impl StoreError {
             | Self::MemoryLimitWithoutAmounts { .. }
             | Self::LoadCancelled
             | Self::LoadPublished { .. }
+            | Self::LoadQuarantineNotRecorded(_)
             | Self::Undecided(_)
             | Self::ClassificationCancelled
             | Self::NotRematerialised { .. }
@@ -324,6 +330,25 @@ mod tests {
     use nrese_sparql::UpdateError;
 
     use super::*;
+
+    // Spec R2: a parser's I/O failure is a server error, including for a staged upload.
+    #[test]
+    fn parser_io_is_not_a_request_error() {
+        let io = || RdfParseError::Io(std::io::Error::other("simulated failure reading RDF"));
+        let errors = [
+            StoreError::FileParse {
+                path: PathBuf::from("upload.jsonld"),
+                source: io(),
+            },
+            StoreError::RdfParse(io()),
+        ];
+        for error in errors {
+            assert!(
+                !error.is_request_error(),
+                "parser I/O was misclassified: {error}"
+            );
+        }
+    }
 
     #[test]
     fn an_update_s_evaluation_error_is_classified_as_a_query_s() {

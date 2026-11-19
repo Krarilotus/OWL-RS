@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use super::tests::{commit, config, contents, quad};
 use super::{fault, wal};
@@ -24,6 +25,55 @@ fn logged(dir: &std::path::Path) -> u64 {
 /// The note's revision, or `u64::MAX` while it isn't called.
 fn noted() -> Arc<AtomicU64> {
     Arc::new(AtomicU64::new(u64::MAX))
+}
+
+// Spec: a durable commit reports its visible revision even if later storage maintenance
+// fails. A no-op reports the existing revision without adding a log record.
+#[test]
+fn durable_publication_is_visible_before_commit_tail_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = Engine::open(dir.path(), config()).unwrap();
+    let (published, report) = std::sync::mpsc::channel();
+    let (release, gate) = std::sync::mpsc::channel();
+    let wrote = std::thread::scope(|scope| {
+        let writer = engine.clone();
+        let commit = scope.spawn(move || {
+            let tail = writer.clone();
+            fault::COMMIT_TAIL.set(Some(Box::new(move || {
+                fault::FAIL_DIR_SYNC.set(true);
+                let result = tail.checkpoint().map(drop);
+                fault::FAIL_DIR_SYNC.set(false);
+                result
+            })));
+            let mut tx = writer.transaction();
+            tx.insert(quad(1).as_ref());
+            tx.note_publication(Box::new(move |revision| {
+                published.send(revision).unwrap();
+                gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            }));
+            tx.commit()
+        });
+        let reported = report.recv_timeout(Duration::from_secs(5)).ok();
+        let visible = engine.snapshot().revision();
+        let _ = release.send(());
+        assert_eq!(
+            (reported, visible),
+            (Some(1), 1),
+            "durable publication report"
+        );
+        commit.join().unwrap()
+    });
+    assert!(wrote.is_err(), "simulated failure in the commit tail");
+
+    let bytes = logged(dir.path());
+    let noop = noted();
+    let mut tx = engine.transaction();
+    tx.note_publication(Box::new(|revision| {
+        noop.store(revision, Ordering::SeqCst);
+    }));
+    tx.commit().unwrap();
+    assert_eq!(noop.load(Ordering::SeqCst), 1, "no-op publication report");
+    assert_eq!(logged(dir.path()), bytes);
 }
 
 /// The note is called once, with the revision the commit then publishes, while nothing of its

@@ -960,6 +960,10 @@ impl Inner {
         }
         // After the commit's own compaction slot (a conversion's): compacting takes it.
         drop(_compaction);
+        #[cfg(test)]
+        if let Some(tail) = crate::durability::fault::COMMIT_TAIL.take() {
+            tail()?;
+        }
         self.after_commit(wal_bytes);
         Ok(asserted_identity)
     }

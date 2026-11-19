@@ -192,7 +192,7 @@ impl MutationPipeline {
             if let Some(rules) = &rules
                 && !self.store.reasoning_is_current(rules)
             {
-                let stop = || ticket.is_cancelled() || self.is_retired();
+                let stop = || ticket.stop_requested() || self.is_retired();
                 match self.store.rematerialise_until(rules, &stop) {
                     Ok(_) => {}
                     Err(StoreError::MaterialisationCancelled) if self.is_retired() => {
@@ -272,7 +272,7 @@ impl MutationPipeline {
             // the asserted and the inferred changes, and releases the writer.
             // So does the process's memory limit: the commit is refused, not the machine.
             let memory = self.store.memory_stop();
-            let stop = || ticket.is_cancelled() || memory.exceeded();
+            let stop = || ticket.stop_requested() || memory.exceeded();
             let room = || memory.room();
             let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
             // The violations' list draws on the request's envelope: past it, the list stops
@@ -331,12 +331,20 @@ impl MutationPipeline {
                 // A list that stopped at its budget before its first entry has none to
                 // explain; the change is rejected all the same. The operator's record
                 // holds the whole first violation, whoever committed.
-                let explanation = violations.first().map(|violation| {
-                    crate::reasoning::explain_violation(program, &violation, &tx, None)
-                });
-                let attribution = explanation.as_ref().and_then(|explanation| {
-                    attribute_reject_delta(explanation, &MutationDeltaPreview::of(&tx))
-                });
+                let explanation = if stop() {
+                    None
+                } else {
+                    violations.first().map(|violation| {
+                        crate::reasoning::explain_violation(program, &violation, &tx, None)
+                    })
+                };
+                let attribution = if stop() {
+                    None
+                } else {
+                    explanation.as_ref().and_then(|explanation| {
+                        attribute_reject_delta(explanation, &MutationDeltaPreview::of(&tx))
+                    })
+                };
                 self.record_run(ReasoningRunRecord::from_report(
                     &materialisation,
                     explanation.clone(),
@@ -632,6 +640,9 @@ impl MutationPipeline {
         dl: &dyn Fn(&evidence::EvidenceView<'_, '_>) -> Option<evidence::Draft>,
         resources: &nrese_sparql::Resources,
     ) -> evidence::Draft {
+        if resources.check().is_err() {
+            return evidence::nothing_shown();
+        }
         dl(view).unwrap_or_else(|| self.view_reason_after_dl(view, resources))
     }
 
@@ -643,6 +654,9 @@ impl MutationPipeline {
         view: &evidence::EvidenceView<'_, '_>,
         resources: &nrese_sparql::Resources,
     ) -> evidence::Draft {
+        if resources.check().is_err() {
+            return evidence::nothing_shown();
+        }
         let ShaclGate::Enforce(least) = self.store.config().shacl_gate else {
             return evidence::nothing_shown();
         };

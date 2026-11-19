@@ -35,8 +35,8 @@ struct Record {
 /// Records the race between a cancellation, a known error and the claim to commit,
 /// and records publication before the pipeline starts its post-commit work.
 ///
-/// A successful cancel also cancels the ticket's evaluation token, so a long-running
-/// `WHERE` clause stops early instead of running to completion unobserved.
+/// The evaluation token is the separate stop flag. Even a losing cancel stops work
+/// that still polls it, such as the evidence for a known refusal.
 #[derive(Clone, Default)]
 pub struct MutationTicket {
     record: Arc<Record>,
@@ -77,18 +77,21 @@ impl MutationTicket {
     /// Cancels a pending mutation. A previous cancellation stays in force.
     /// Returns `true` if the mutation is (now) guaranteed not to be committed.
     pub fn cancel(&self) -> bool {
-        match self.record.state.compare_exchange(
+        let cancelled = match self.record.state.compare_exchange(
             PENDING,
             CANCELLED,
             Ordering::AcqRel,
             Ordering::Acquire,
         ) {
-            Ok(_) => {
-                self.evaluation.cancel();
-                true
-            }
+            Ok(_) => true,
             Err(current) => current == CANCELLED,
-        }
+        };
+        self.evaluation.cancel();
+        cancelled
+    }
+
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.evaluation.is_cancelled()
     }
 
     /// Token checked by the SPARQL evaluator while the mutation is planned.

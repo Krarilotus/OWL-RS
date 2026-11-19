@@ -39,15 +39,27 @@ fn spawn<T: Clone + Send + Sync + 'static, H: Send + 'static>(
     end
 }
 
-fn unknown() -> ApiError {
+pub(super) fn unknown() -> ApiError {
     ApiError::internal("whether it was applied is unknown: read the data before sending it again")
 }
 
 pub(super) enum LostCancel<'a> {
     AwaitEnd,
-    // M1 will select this for requests whose retries can look up the same operation.
+    /// Only M1 transaction cells may use this. ENDED gets 503 after grace because
+    /// the worker may still be building the error body. A retry of the same cell
+    /// reaches the recorded error.
     #[allow(dead_code)]
     Grace(Duration, &'a str),
+}
+
+struct CancelOnDrop<'a>(Option<&'a MutationTicket>);
+
+impl Drop for CancelOnDrop<'_> {
+    fn drop(&mut self) {
+        if let Some(ticket) = self.0 {
+            ticket.cancel();
+        }
+    }
 }
 
 pub(super) async fn run<H: Send + 'static>(
@@ -66,16 +78,23 @@ pub(super) async fn run<H: Send + 'static>(
     let end = spawn(
         held,
         move || End::Fallback(Some(fallback.end_pending())),
-        move |held| {
-            let result = work(&worker, held);
-            if result.is_err() && worker.end_pending() == MutationState::Cancelled {
-                End::Cancelled
-            } else {
-                End::Returned(result)
-            }
+        move |held| match work(&worker, held) {
+            Ok(report) => End::Returned(Ok(report)),
+            Err(error) => match worker.end_pending() {
+                MutationState::Cancelled => End::Cancelled,
+                state @ (MutationState::Entered | MutationState::Published) => {
+                    End::Fallback(Some(state))
+                }
+                _ => End::Returned(Err(error)),
+            },
         },
     );
-    let record = match end.wait_or(sleep_until(deadline)).await {
+    let mut cancel_on_drop = CancelOnDrop(Some(&ticket));
+    let first = end.wait_or(sleep_until(deadline)).await;
+    // At the deadline the explicit cancel below asks the worker to stop even if it
+    // already claimed an answer. A finished worker needs no stop request.
+    cancel_on_drop.0 = None;
+    let record = match first {
         Some(record) => Some(record),
         None if ticket.cancel() => Some(End::Cancelled),
         None => match after_cancel {

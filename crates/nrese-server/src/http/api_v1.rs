@@ -882,7 +882,12 @@ pub async fn import(
         let _file = file;
         store.bulk_load(&request).map_err(|error| match error {
             nrese_store::StoreError::LoadPublished { .. } => ApiError::internal(error.to_string()),
-            _ => ApiError::bad_request(error.to_string()),
+            // Keep the released answer when only the quarantine record could have changed.
+            nrese_store::StoreError::LoadQuarantineNotRecorded(_) => {
+                ApiError::bad_request(error.to_string())
+            }
+            error if error.is_request_error() => ApiError::bad_request(error.to_string()),
+            _ => super::effect::unknown(),
         })
     })
     .await?;

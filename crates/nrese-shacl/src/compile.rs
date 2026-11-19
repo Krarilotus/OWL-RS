@@ -9,8 +9,8 @@ use std::str::FromStr;
 
 use nrese_engine::{GraphSelector, TermId, TermKind};
 use nrese_rdf::{Term, Variable};
-use nrese_sparql::ReadView;
 use nrese_sparql::value::{Value, compile_regex};
+use nrese_sparql::{CancellationToken, ReadView};
 use nrese_sparql_syntax::{Query, SparqlParser};
 
 use crate::graph::{GraphView, Selection};
@@ -51,7 +51,16 @@ impl std::error::Error for ShapeError {}
 
 /// Compiles the shapes in `shapes_graph`.
 pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes, Vec<ShapeError>> {
-    let graph = GraphView::new(view, shapes_graph);
+    compile_until(view, shapes_graph, None).expect("no cancellation")
+}
+
+/// Compiles the shapes, returning `None` if cancelled. Incomplete shapes are discarded.
+pub fn compile_until<V: ReadView>(
+    view: &V,
+    shapes_graph: Selection,
+    cancellation: Option<&CancellationToken>,
+) -> Option<Result<Shapes, Vec<ShapeError>>> {
+    let graph = GraphView::new(view, shapes_graph).with_cancellation(cancellation);
     let mut compiler = Compiler {
         rdf_type: graph.iri(&format!("{RDF}type")),
         rdf_first: graph.iri(&format!("{RDF}first")),
@@ -79,6 +88,9 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
         roots.extend(compiler.instances(&format!("{SH}{class}")));
     }
     for root in roots {
+        if compiler.graph.cancelled() {
+            return None;
+        }
         compiler.shape(root);
     }
     // Any triple with `sh:entailment` in the shapes graph, whatever its subject (SHACL §1.5).
@@ -86,8 +98,10 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
         .sh("entailment")
         .map(|predicate| compiler.graph.objects_of(predicate))
         .unwrap_or_default();
-    if compiler.errors.is_empty() {
-        Ok(Shapes {
+    if compiler.graph.cancelled() {
+        None
+    } else if compiler.errors.is_empty() {
+        Some(Ok(Shapes {
             shapes: compiler.shapes,
             index: compiler.index,
             graph: match shapes_graph.graphs {
@@ -95,9 +109,9 @@ pub fn compile<V: ReadView>(view: &V, shapes_graph: Selection) -> Result<Shapes,
                 _ => None,
             },
             entailments,
-        })
+        }))
     } else {
-        Err(compiler.errors)
+        Some(Err(compiler.errors))
     }
 }
 
@@ -202,6 +216,9 @@ impl<V: ReadView> Compiler<'_, V> {
         let mut seen = BTreeSet::new();
         let mut node = head;
         while Some(node) != self.rdf_nil {
+            if self.graph.cancelled() {
+                break;
+            }
             if !seen.insert(node) {
                 return Err("is a cyclic list".to_owned());
             }
@@ -742,6 +759,9 @@ impl<V: ReadView> Compiler<'_, V> {
         };
         let mut out = Vec::new();
         for node in self.graph.subjects_of(parameter) {
+            if self.graph.cancelled() {
+                break;
+            }
             let (validator, node_validator, property_validator) = (
                 self.one(node, "validator"),
                 self.one(node, "nodeValidator"),
@@ -793,6 +813,9 @@ impl<V: ReadView> Compiler<'_, V> {
         out: &mut Vec<Constraint>,
     ) {
         for component in components {
+            if self.graph.cancelled() {
+                break;
+            }
             let mut values: Vec<(Variable, Vec<TermId>)> = Vec::new();
             let mut applies = true;
             for (predicate, variable, optional) in &component.parameters {

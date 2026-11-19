@@ -9,10 +9,10 @@
 use nrese_engine::{EncodedQuad, GraphSelector, ReadModel, Snapshot, TermId, Transaction};
 use nrese_rdf::{GraphName, NamedNode, Term};
 use nrese_shacl::{
-    PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, validate,
-    validate_changes, validate_shapes_change,
+    PropertyPath, Selection, ShapeError, Shapes, ValidationReport, compile, compile_until,
+    validate, validate_changes, validate_shapes_change,
 };
-use nrese_sparql::{CancellationToken, ReadView, Resources};
+use nrese_sparql::{CancellationToken, QueryEvaluationError, ReadView, Resources};
 
 use crate::error::{StoreError, StoreResult};
 use crate::mutation::{MutationState, MutationTicket};
@@ -266,6 +266,7 @@ pub(crate) fn introduced(
                     .chain(tx.inferred_deleted())
                     .map(nrese_engine::EncodedTriple::in_default_graph),
             )
+            .take_while(|_| resources.check().is_ok())
             .collect()
     };
     introduced_in(
@@ -297,14 +298,21 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
     };
     let data = Selection::of(GraphSelector::Any).excluding(shapes_id);
     let shapes_selection = Selection::asserted(GraphSelector::Exact(shapes_id));
+    let cancellation = resources.cancellation.as_ref();
     let shapes_changed = tx
         .inserted()
         .chain(tx.deleted())
+        .take_while(|_| resources.check().is_ok())
         .any(|quad| quad.graph == shapes_id);
+    resources.check()?;
     if shapes_changed {
-        let shapes_after = compile(after, shapes_selection).map_err(compile_error)?;
+        let shapes_after = compile_until(after, shapes_selection, cancellation)
+            .ok_or(QueryEvaluationError::Cancelled)?
+            .map_err(compile_error)?;
         // Shapes that didn't compile before had no results.
-        let shapes_before = compile(before, shapes_selection).ok();
+        let shapes_before = compile_until(before, shapes_selection, cancellation)
+            .ok_or(QueryEvaluationError::Cancelled)?
+            .ok();
         if !validated(&shapes_after) || shapes_before.as_ref().is_some_and(|s| !validated(s)) {
             return Ok(None);
         }
@@ -318,18 +326,17 @@ fn introduced_in<A: ReadView + Sync, B: ReadView + Sync>(
         )?;
         return Ok(Some(report));
     }
-    let shapes = compile(before, shapes_selection).map_err(compile_error)?;
+    let shapes = compile_until(before, shapes_selection, cancellation)
+        .ok_or(QueryEvaluationError::Cancelled)?
+        .map_err(compile_error)?;
     // A shapes graph with only `sh:entailment` still makes every validation fail.
     if shapes.is_vacuous() || !validated(&shapes) {
         return Ok(None);
     }
+    let changed = changed();
+    resources.check()?;
     Ok(Some(validate_changes(
-        before,
-        after,
-        &shapes,
-        data,
-        &changed(),
-        resources,
+        before, after, &shapes, data, &changed, resources,
     )?))
 }
 
@@ -354,6 +361,7 @@ pub(crate) fn view_reason(
     let changed = || {
         tx.inserted()
             .chain(tx.deleted())
+            .take_while(|_| resources.check().is_ok())
             .filter(|quad| view.graph(quad.graph))
             .collect()
     };

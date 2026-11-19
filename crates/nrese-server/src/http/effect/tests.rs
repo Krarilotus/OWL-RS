@@ -39,6 +39,54 @@ fn publish_at_gate(
     report
 }
 
+// Spec: lifecycle rule 3 says a disconnect before the worker claims the write cancels it.
+#[tokio::test]
+async fn a_disconnected_request_does_not_publish() {
+    let store = Arc::new(StoreService::new(StoreConfig::in_memory()).unwrap());
+    let before = store.current_revision();
+    let reasoner = Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+        ReasoningMode::Disabled,
+    )));
+    let pipeline = MutationPipeline::new(Arc::clone(&store), reasoner);
+    let (arrived, waiting) = tokio::sync::oneshot::channel();
+    let (release, gate) = mpsc::channel();
+    let (finished, result) = tokio::sync::oneshot::channel();
+    let mut request = Box::pin(run(
+        MutationTicket::new(),
+        Duration::from_secs(30),
+        "timeout",
+        LostCancel::AwaitEnd,
+        None::<()>,
+        move |ticket, _| {
+            let _ = arrived.send(());
+            gate.recv_timeout(Duration::from_secs(5)).unwrap();
+            let applied = pipeline.apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(
+                    "INSERT DATA { <urn:s> <urn:p> <urn:o> }",
+                )),
+                &Requester::all(),
+                ticket,
+            );
+            let _ = finished.send(applied);
+            Err(ApiError::internal("test worker finished"))
+        },
+    ));
+    let _ = poll_fn(|cx| Poll::Ready(request.as_mut().poll(cx))).await;
+    waiting.await.unwrap();
+    drop(request);
+    release.send(()).unwrap();
+    let applied = result.await.unwrap();
+    assert_eq!(
+        store.current_revision(),
+        before,
+        "disconnected write published"
+    );
+    assert!(matches!(
+        applied,
+        Err(nrese_store::MutationError::Cancelled)
+    ));
+}
+
 // Spec: lifecycle rule 5 says that even a simulated failure records its end before release.
 #[tokio::test]
 async fn held_value_is_dropped_after_the_end_is_recorded() {
