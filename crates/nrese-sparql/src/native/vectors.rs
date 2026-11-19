@@ -284,8 +284,9 @@ impl Context<'_> {
     ) -> NativeResult<Solutions> {
         let search = parse(inner)?;
         let estimate = self.estimate(local);
+        // A `local` that draws goes first: probed per hit, it would draw once per hit.
         let probe_first = match &search.near {
-            Near::Vector(_) => estimate >= (PROBE_ABOVE * search.k) as f64,
+            Near::Vector(_) => estimate >= (PROBE_ABOVE * search.k) as f64 && !self.draws_in(local),
             Near::Variable(_) => false,
         };
         if !probe_first {

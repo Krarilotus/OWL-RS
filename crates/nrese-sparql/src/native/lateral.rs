@@ -5,7 +5,9 @@
 //! distinct value of the left variables it mentions, not once per row: each result gets
 //! a private group key as a column, the results are put together, and one join with `left` gives
 //! every row the results of its values. A `LIMIT`, an aggregate or an `ORDER BY` inside
-//! `right` therefore applies per left solution, which is what `LATERAL` is for. A left
+//! `right` therefore applies per left solution, which is what `LATERAL` is for. A `right`
+//! that draws a value (`RAND()`, `BNODE()`, …) is evaluated once per row instead, so rows
+//! with the same values draw apart. A left
 //! variable that is unbound in a row isn't put in: `right` binds it freely there, and the
 //! join takes its value.
 
@@ -32,11 +34,13 @@ impl Context<'_> {
             GraphScope::Variable(v) => left.column(v),
             _ => None,
         };
-        if columns.is_empty() && graph_column.is_none() {
+        // A right side that draws is evaluated once per row, as SEP-0006 says, not per key.
+        let per_row = self.draws_in(right);
+        if !per_row && columns.is_empty() && graph_column.is_none() {
             let right = self.eval(right)?;
             return self.join(left, right);
         }
-        // Each distinct key once, in the order the rows first have it.
+        // Each distinct key once, in the order the rows first have it; or each row once.
         let mut seen: HashMap<Vec<u64>, u64> = HashMap::new();
         let mut keys: Vec<Vec<u64>> = Vec::new();
         let group_variable = self.synthetic("lateral-key");
@@ -52,10 +56,16 @@ impl Context<'_> {
                     .collect();
                 key.push(graph_column.map_or(UNDEF, |c| left.table.get(row, c)));
                 let next = keys.len() as u64;
-                let group = *seen.entry(key.clone()).or_insert_with(|| {
-                    keys.push(key);
-                    next
-                });
+                let group = match per_row {
+                    true => {
+                        keys.push(key);
+                        next
+                    }
+                    false => *seen.entry(key.clone()).or_insert_with(|| {
+                        keys.push(key);
+                        next
+                    }),
+                };
                 groups.push(group);
             }
             left.table.push_column(groups);

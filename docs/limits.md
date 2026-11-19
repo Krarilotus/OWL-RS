@@ -54,10 +54,17 @@ come with. What is in is on
   Read that 404 as an empty graph.
 - A reader of only some graphs gets no plan steps in `EXPLAIN`.
 - A value drawn at each evaluation (`RAND()`, `UUID()`, `STRUUID()`, `BNODE()`) is drawn once
-  per solution of its group, as SPARQL says, except where the engine shares one evaluation
-  between rows or repeats it: in an `EXISTS` (once per distinct value it reads, not once per
-  row), a `LATERAL`, a property path, a group beside a vector search probed first, a
-  `SERVICE` call sent in batches, and an `AVG` over a drawn value.
+  per solution of its group, as SPARQL says.
+- A part of a query that draws such a value gives up some faster plans, so it costs more
+  than one that draws nothing:
+  - an `EXISTS` or a `LATERAL` right side that draws is evaluated once per row, so its cost
+    grows with the rows, not with their distinct values;
+  - a `SERVICE` pattern that draws is sent once, without the joined rows' values, and joined
+    here;
+  - a group that draws, beside a vector search, is evaluated first, and the search ranks its
+    values: the search doesn't go first;
+  - a `GROUP BY` with an `AVG` over a drawn value is never computed in parts: where its rows
+    don't fit the query's memory, the query is refused.
 - A group that draws such a value is evaluated from the distinct values of the rows joined
   to it, not from the rows themselves, which costs a little more than a group that draws
   nothing. Where those rows share no variable the group binds in every solution, or leave
