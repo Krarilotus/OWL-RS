@@ -606,3 +606,284 @@ fn a_clash_the_rule_tables_give_from_a_list_as_written_is_refused_past_the_cap()
     }
     assert!(accepted.is_empty(), "each clash is refused: {accepted:#?}");
 }
+
+/// An intersection of seven classes, each the same as an alias of its own (`ex:Ck owl:sameAs
+/// ex:Dk`, as when two vocabularies are aligned): over every identity its list has
+/// 2^7 = 128 member sequences, past the 64 a list axiom is instantiated for.
+const INTERSECTION: &str = "ex:I owl:intersectionOf (ex:C1 ex:C2 ex:C3 ex:C4 ex:C5 ex:C6 ex:C7) . ";
+
+fn intersection_aliases() -> String {
+    (1..=7)
+        .map(|k| format!("ex:C{k} owl:sameAs ex:D{k} . "))
+        .collect()
+}
+
+/// `ex:x` in each of the intersection's seven classes.
+const IN_EVERY_OPERAND: &str =
+    "ex:x rdf:type ex:C1 , ex:C2 , ex:C3 , ex:C4 , ex:C5 , ex:C6 , ex:C7 . ";
+
+/// The judges of a later write: the pipeline that wrote the setup (its ground program
+/// cached), and a new one over the same store (as after a restart: the program made again
+/// from the state).
+const LATER: [&str; 2] = ["later write", "later write after a restart"];
+
+/// `setup`, then `change` by `how` ([`LATER`]), on a new store under `mode`: the change's
+/// result and the store.
+fn later(
+    setup: &str,
+    change: &str,
+    how: &str,
+    mode: &str,
+) -> (Result<(), MutationError>, Arc<StoreService>) {
+    let (store, first) = store_and_pipeline(mode);
+    apply(&first, &format!("INSERT DATA {{ {setup} }}"))
+        .unwrap_or_else(|e| panic!("{how} ({mode}): the setup commits: {e}"));
+    let commits = match how {
+        "later write" => first,
+        _ => {
+            drop(first);
+            pipeline(&store)
+        }
+    };
+    (apply(&commits, change), store)
+}
+
+/// A later write over a list past the cap gets the list's inferences, as the list's rules
+/// give them from its cells as written. Spec: OWL 2 Profiles §4.3, Table 6, `cls-int1`: `ex:I
+/// owl:intersectionOf (ex:C1 … ex:C7)` and `ex:x` in each `ex:Ck` give `ex:x rdf:type ex:I`,
+/// whatever other names the classes have (their aliases add sequences, never take one away).
+/// The instances come later, or the axiom does (its list past the cap from the write that
+/// brings it), at a later write and after a restart, in every equality mode.
+#[test]
+fn a_later_write_over_a_list_past_the_cap_gets_its_inference() {
+    let aliases = intersection_aliases();
+    let cases = [
+        (
+            "the instance later",
+            format!("{INTERSECTION}{aliases}"),
+            IN_EVERY_OPERAND.to_owned(),
+        ),
+        (
+            "the axiom later",
+            format!("{aliases}{IN_EVERY_OPERAND}"),
+            INTERSECTION.to_owned(),
+        ),
+        (
+            "the axiom and the instance later",
+            aliases.clone(),
+            format!("{INTERSECTION}{IN_EVERY_OPERAND}"),
+        ),
+    ];
+    let mut missing = Vec::new();
+    for (name, setup, change) in &cases {
+        for mode in MODES {
+            for how in LATER {
+                let (result, store) =
+                    later(setup, &format!("INSERT DATA {{ {change} }}"), how, mode);
+                let case = format!("{name}, {how} ({mode})");
+                match result {
+                    Ok(()) if holds(&store, "ex:x rdf:type ex:I") => {}
+                    Ok(()) => missing.push(format!("{case}: no ex:x rdf:type ex:I")),
+                    Err(e) => missing.push(format!("{case}: refused: {e}")),
+                }
+            }
+        }
+    }
+    assert!(missing.is_empty(), "each inference is made: {missing:#?}");
+}
+
+/// A clash a later write gives through a list past the cap is refused, at a later write and
+/// after a restart, in every equality mode. Spec: OWL 2 Profiles §4.3, each clash worked out
+/// from the list as written:
+/// - `cls-int1` then `cax-dw` (Table 7): `ex:x` in the intersection's seven classes is in
+///   `ex:I`, which is disjoint with `ex:E`, and `ex:x` is in `ex:E`;
+/// - `cax-adc` (Table 7), with `prp-spo1` for `ex:alt rdfs:subPropertyOf rdf:first`: the
+///   second cell's members come only through `ex:alt` (65 of them), then `ex:c2 rdf:first
+///   ex:B` and `ex:x rdf:type ex:B` are written with `ex:x` in `ex:A`: `(ex:A ex:B)`;
+/// - `cax-adc`: the second cell holds 65 written members, `ex:x` in `ex:A` and `ex:B`, and a
+///   delete of one member leaves `(ex:A ex:B)` with both;
+/// - `cax-adc` with `eq-rep-o`: the axiom's head `ex:c1` is the same as `ex:h`, whose list is
+///   `(ex:C ex:B)`; the tail is equal to a node with 64 more members (through a subproperty of
+///   `owl:sameAs`, `prp-spo1`); `ex:x` in `ex:C`, and later in `ex:B`;
+/// - `cax-adc`: `(ex:A ex:B)` from the head `ex:c1`, 64 aliases of the head each with a member
+///   of its own, and 64 one-member lists more on the same axiom node; `ex:x` in `ex:A`, and
+///   later in `ex:B`.
+#[test]
+fn a_clash_a_later_write_gives_through_a_list_past_the_cap_is_refused() {
+    let alt = "ex:alt rdfs:subPropertyOf rdf:first . ";
+    let head = "_:ad rdf:type owl:AllDisjointClasses ; owl:members ex:c1 . \
+                ex:c1 rdf:first ex:A ; rdf:rest ex:c2 . ";
+    let b = |from: usize| -> String {
+        (from..=64)
+            .map(|k| format!("ex:B{k}"))
+            .collect::<Vec<_>>()
+            .join(" , ")
+    };
+    let mut alias_head = String::from(
+        "ex:ad rdf:type owl:AllDisjointClasses ; owl:members ex:c1 . \
+         ex:c1 owl:sameAs ex:h ; rdf:first ex:A ; rdf:rest ex:c2 . \
+         ex:h rdf:first ex:C ; rdf:rest ex:c2 . \
+         ex:c2 rdf:first ex:B ; rdf:rest rdf:nil . \
+         ex:n rdf:rest rdf:nil . ex:x rdf:type ex:C . \
+         ex:c2 ex:eq ex:n . ex:eq rdfs:subPropertyOf owl:sameAs . ",
+    );
+    let mut other_lists = String::from(
+        "ex:ad rdf:type owl:AllDisjointClasses ; owl:members ex:c1 . \
+         ex:c1 rdf:first ex:A ; rdf:rest ex:c2 . \
+         ex:c2 rdf:first ex:B ; rdf:rest rdf:nil . ex:x rdf:type ex:A . ",
+    );
+    for k in 1..=64 {
+        alias_head.push_str(&format!("ex:n rdf:first ex:N{k} . "));
+        other_lists.push_str(&format!(
+            "ex:h{k} owl:sameAs ex:c1 ; rdf:first ex:N{k} ; rdf:rest ex:c2 . \
+             ex:ad owl:members ex:s{k} . ex:s{k} rdf:first ex:Z{k} ; rdf:rest rdf:nil . "
+        ));
+    }
+    let cases = [
+        (
+            "an instance of the intersection in a class disjoint with it",
+            format!(
+                "{INTERSECTION}{} ex:I owl:disjointWith ex:E . ex:x rdf:type ex:E .",
+                intersection_aliases()
+            ),
+            format!("INSERT DATA {{ {IN_EVERY_OPERAND} }}"),
+            "cax-dw",
+        ),
+        (
+            "a promoted cell",
+            format!(
+                "{alt}{head}ex:c2 rdf:rest rdf:nil ; ex:alt ex:B , {} . ex:x rdf:type ex:A .",
+                b(1)
+            ),
+            "INSERT DATA { ex:c2 rdf:first ex:B . ex:x rdf:type ex:B . }".to_owned(),
+            "cax-adc",
+        ),
+        (
+            "a delete that brings the written cell to 64",
+            format!(
+                "{alt}{head}ex:c2 rdf:first ex:B , {} ; rdf:rest rdf:nil ; \
+                 ex:alt ex:Z1 , ex:Z2 . ex:x rdf:type ex:A , ex:B .",
+                b(1)
+            ),
+            "DELETE DATA { ex:c2 rdf:first ex:B1 . }".to_owned(),
+            "cax-adc",
+        ),
+        (
+            "an alias of the head",
+            alias_head,
+            "INSERT DATA { ex:x rdf:type ex:B . }".to_owned(),
+            "cax-adc",
+        ),
+        (
+            "other lists of the axiom node",
+            other_lists,
+            "INSERT DATA { ex:x rdf:type ex:B . }".to_owned(),
+            "cax-adc",
+        ),
+    ];
+    let mut accepted = Vec::new();
+    for (name, setup, change, rule) in &cases {
+        for mode in MODES {
+            for how in LATER {
+                let (result, _store) = later(setup, change, how, mode);
+                if let Err(e) = refused_for(result, rule) {
+                    accepted.push(format!("{name}, {how} ({mode}): {e}"));
+                }
+            }
+        }
+    }
+    assert!(accepted.is_empty(), "each clash is refused: {accepted:#?}");
+}
+
+/// A negative statement over a store with a list past the cap is decided by refutation as
+/// over any other store. Spec: OWL 2 Profiles §4.3, `prp-fp` (Table 5) and `eq-diff1` (Table
+/// 4): `ex:a` and `ex:b` have different values (`ex:m1 owl:differentFrom ex:m2`) of a
+/// functional property, so `ex:a owl:sameAs ex:b` is inconsistent and `ex:a
+/// owl:differentFrom ex:b` is entailed; `ex:a owl:differentFrom ex:m1` is not (the control).
+/// The store also holds the intersection of seven aliased classes, past the cap. In every
+/// equality mode.
+#[test]
+fn a_difference_over_a_store_with_a_list_past_the_cap_is_decided_by_refutation() {
+    use nrese_rdf::{NamedNode, NamedOrBlankNode, Triple};
+    use nrese_store::Entailment;
+    let named = |local: &str| NamedNode::new_unchecked(format!("{EX}{local}"));
+    let different = |a: &str, b: &str| {
+        vec![Triple::new(
+            NamedOrBlankNode::NamedNode(named(a)),
+            NamedNode::new_unchecked(format!("{OWL}differentFrom")),
+            named(b),
+        )]
+    };
+    let mut wrong = Vec::new();
+    for mode in MODES {
+        let (store, commits) = store_and_pipeline(mode);
+        apply(
+            &commits,
+            &format!(
+                "INSERT DATA {{ {INTERSECTION}{} ex:hasMother rdf:type owl:FunctionalProperty . \
+                 ex:a ex:hasMother ex:m1 . ex:b ex:hasMother ex:m2 . \
+                 ex:m1 owl:differentFrom ex:m2 . }}",
+                intersection_aliases()
+            ),
+        )
+        .unwrap_or_else(|e| panic!("{mode}: the data commits: {e}"));
+        let entailed = store.entails(program(), &different("a", "b"));
+        if !matches!(entailed, Ok(Entailment::Entailed)) {
+            wrong.push(format!("{mode}: a differentFrom b: {entailed:?}"));
+        }
+        let control = store.entails(program(), &different("a", "m1"));
+        if !matches!(control, Ok(Entailment::NotEntailed)) {
+            wrong.push(format!("{mode}: a differentFrom m1: {control:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A write that deletes the last support of a fact a list past the cap derived, and asserts
+/// what would clash with that fact, commits, and the fact goes. Spec: OWL 2 Profiles §4.3,
+/// Table 5, `prp-spo2` and `prp-pdw`: `ex:p owl:propertyChainAxiom (ex:q ex:r)` with `ex:a ex:q
+/// ex:b` and `ex:b ex:r ex:c` gives `ex:a ex:p ex:c`; once `ex:b ex:r ex:c` is deleted nothing
+/// gives it (the chain's other members, through `ex:alt rdfs:subPropertyOf rdf:first`, link no
+/// fact), so `ex:a ex:s ex:c` beside `ex:p owl:propertyDisjointWith ex:s` is consistent. The
+/// chain's second cell has 65 members over the closure (past the cap), one as written. At a
+/// later write and after a restart, in every equality mode.
+#[test]
+fn a_write_that_takes_a_list_inference_away_is_judged_without_it() {
+    let others: String = (1..=64)
+        .map(|k| format!("ex:R{k}"))
+        .collect::<Vec<_>>()
+        .join(" , ");
+    let setup = format!(
+        "ex:alt rdfs:subPropertyOf rdf:first . ex:p owl:propertyChainAxiom ex:k1 . \
+         ex:k1 rdf:first ex:q ; rdf:rest ex:k2 . \
+         ex:k2 rdf:first ex:r ; rdf:rest rdf:nil ; ex:alt {others} . \
+         ex:p owl:propertyDisjointWith ex:s . ex:a ex:q ex:b . ex:b ex:r ex:c ."
+    );
+    let change = "DELETE DATA { ex:b ex:r ex:c . } ; INSERT DATA { ex:a ex:s ex:c . }";
+    let mut wrong = Vec::new();
+    for mode in MODES {
+        for how in LATER {
+            let case = format!("{how} ({mode})");
+            let (store, first) = store_and_pipeline(mode);
+            apply(&first, &format!("INSERT DATA {{ {setup} }}"))
+                .unwrap_or_else(|e| panic!("{case}: the setup commits: {e}"));
+            if !holds(&store, "ex:a ex:p ex:c") {
+                wrong.push(format!("{case}: the setup lacks ex:a ex:p ex:c"));
+                continue;
+            }
+            let commits = match how {
+                "later write" => first,
+                _ => {
+                    drop(first);
+                    pipeline(&store)
+                }
+            };
+            match apply(&commits, change) {
+                Ok(()) if !holds(&store, "ex:a ex:p ex:c") => {}
+                Ok(()) => wrong.push(format!("{case}: ex:a ex:p ex:c still holds")),
+                Err(e) => wrong.push(format!("{case}: refused: {e}")),
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
