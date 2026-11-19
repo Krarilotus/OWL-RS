@@ -1970,10 +1970,14 @@ impl<'a> Reader<'a> {
     /// Reports each cell of [`Self::cells`] that a statement outside its list names (*Mapping
     /// to RDF* §3: a sequence's blank nodes occur only in that sequence), once. Allowed: as
     /// subject, its `rdf:first`, `rdf:rest` and `rdf:type rdf:List`; as object, the one
-    /// statement that points to it (its axiom's, or its predecessor's `rdf:rest`) and that
-    /// statement's reification's `owl:annotatedTarget`. Read over every statement, so the
-    /// order they come in changes nothing.
+    /// statement that points to it (its axiom's, or its predecessor's `rdf:rest`) and, where
+    /// that is its axiom's, the `owl:annotatedTarget` of that axiom's reification
+    /// ([`Self::reified_axiom`]). Read over every statement, so the order they come in changes
+    /// nothing; not at all where no list was read.
     fn cells_outside_their_lists(&mut self) {
+        if self.cells.is_empty() {
+            return;
+        }
         let v = self.v;
         let mut outside = BTreeSet::new();
         let mut owners: HashMap<Term, [Term; 3]> = HashMap::new();
@@ -1993,10 +1997,13 @@ impl<'a> Reader<'a> {
                 outside.insert(o);
             }
         }
+        // Each reification read once, however many targets it gives.
+        let mut mains: HashMap<Term, Option<[Term; 2]>> = HashMap::new();
         for (reification, cell) in targets {
-            let main = [v.owl_annotated_source, v.owl_annotated_property]
-                .map(|p| self.single(reification, p));
-            if owners.get(&cell).map(|&[s, p, _]| [Some(s), Some(p)]) != Some(main) {
+            let main =
+                *(mains.entry(reification)).or_insert_with(|| self.reified_axiom(reification));
+            let axiom = owners.get(&cell).filter(|&&[_, p, _]| !is(p, v.rest));
+            if main.is_none() || axiom.map(|&[s, p, _]| [s, p]) != main {
                 outside.insert(cell);
             }
         }
@@ -2004,6 +2011,37 @@ impl<'a> Reader<'a> {
             self.list_cell_outside.get_or_insert(node);
             let what = "a list's cell used outside its list";
             self.report(Diagnostic::Malformed { node, what });
+        }
+    }
+
+    /// The source and property of the main triple `node` reifies, where it is an annotated
+    /// axiom's reification (*Mapping to RDF* §2.3.1, Table 17): a blank node typed `owl:Axiom`
+    /// with one `owl:annotatedSource`, one `owl:annotatedProperty` and one
+    /// `owl:annotatedTarget`. Its statements read once.
+    fn reified_axiom(&self, node: Term) -> Option<[Term; 2]> {
+        let v = self.v;
+        if self.kind(node) != TermKind::Blank {
+            return None;
+        }
+        let roles = [
+            v.owl_annotated_source,
+            v.owl_annotated_property,
+            v.owl_annotated_target,
+        ];
+        let (mut typed, mut parts) = (false, [Vec::new(), Vec::new(), Vec::new()]);
+        for &(p, o, _) in self.by_subject.get(&node).into_iter().flatten() {
+            typed |= is(p, v.rdf_type) && is(o, v.owl_axiom);
+            if let Some(i) = roles.iter().position(|&r| is(p, r))
+                && !parts[i].contains(&o)
+            {
+                parts[i].push(o);
+            }
+        }
+        match parts {
+            [s, p, t] if typed && s.len() == 1 && p.len() == 1 && t.len() == 1 => {
+                Some([s[0], p[0]])
+            }
+            _ => None,
         }
     }
 
