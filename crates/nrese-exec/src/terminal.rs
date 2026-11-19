@@ -5,12 +5,17 @@
 //! or wait for it, always with a deadline of their own.
 //!
 //! It owns no state machine: each owner keeps its own steps; the guard only makes the end
-//! total. A panic while the end is recorded or read leaves it readable (the lock recovers).
+//! total. No code of the caller's runs under the lock: the end is kept as an `Arc`, and `O`
+//! is cloned after the lock is released.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-type Shared<O> = Arc<(Mutex<Option<O>>, Condvar)>;
+type Shared<O> = Arc<(Mutex<Option<Arc<O>>>, Condvar)>;
+
+/// The longest single wait underneath `wait_until`: a far deadline becomes several finite
+/// waits, never one the platform reads as untimed (Windows does above about 49.7 days).
+const WAIT_CAP: Duration = Duration::from_secs(3600);
 
 type Fallback<O> = Box<dyn FnOnce() -> O + Send>;
 
@@ -37,7 +42,8 @@ where
     (guard.terminal(), guard)
 }
 
-/// The reading side: cheap to clone, `Send + Sync + 'static`.
+/// The reading side: cheap to clone, `Send + Sync + 'static` for an `O` that is `Send + Sync`
+/// (the end is shared as an `Arc<O>`).
 #[derive(Clone)]
 pub struct Terminal<O> {
     shared: Shared<O>,
@@ -46,17 +52,25 @@ pub struct Terminal<O> {
 impl<O: Clone> Terminal<O> {
     /// The recorded end, if there is one.
     pub fn get(&self) -> Option<O> {
-        lock(&self.shared.0).clone()
+        let end = lock(&self.shared.0).clone();
+        end.as_deref().cloned()
     }
 
-    /// Waits for the end until `deadline`. Returns `None` if the deadline passed first.
-    /// It never waits without a deadline.
+    /// Waits for the end until `deadline`. Returns the end if one is recorded when the wait
+    /// stops, whether at or after its deadline; `None` only if none is recorded by then. The
+    /// deadline bounds the waiting, not the end's age, and covers readiness only: `O::clone`
+    /// runs after the wait, on the caller's thread. It never waits without a deadline.
     pub fn wait_until(&self, deadline: Instant) -> Option<O> {
         let (end, ended) = &*self.shared;
-        let wait = deadline.saturating_duration_since(Instant::now());
-        let waited = ended.wait_timeout_while(lock(end), wait, |end| end.is_none());
-        let (end, _) = waited.unwrap_or_else(PoisonError::into_inner);
-        end.clone()
+        let mut held = lock(end);
+        while held.is_none() && Instant::now() < deadline {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let waited = ended.wait_timeout(held, left.min(WAIT_CAP));
+            held = waited.unwrap_or_else(PoisonError::into_inner).0;
+        }
+        let end = held.clone();
+        drop(held);
+        end.as_deref().cloned()
     }
 }
 
@@ -77,7 +91,7 @@ impl<O> Guard<O> {
         if end.is_some() {
             return false;
         }
-        *end = Some(outcome);
+        *end = Some(Arc::new(outcome));
         drop(end);
         ended.notify_all();
         true
@@ -204,6 +218,37 @@ mod tests {
             waited < Duration::from_secs(10),
             "the waiter slept to its deadline: {waited:?}"
         );
+    }
+
+    /// An end wakes every waiter, not one: two waiters enter the wait together, the end comes
+    /// once both are past the barrier and have had time to park, and both wake long before
+    /// their deadlines.
+    #[test]
+    fn an_end_wakes_every_waiter() {
+        let (reader, guard) = terminal(|| Outcome::Unknown);
+        let all_started = Arc::new(Barrier::new(3));
+        let waiters: Vec<_> = (0..2)
+            .map(|_| {
+                let (reader, all_started) = (reader.clone(), Arc::clone(&all_started));
+                thread::spawn(move || {
+                    all_started.wait();
+                    let started = Instant::now();
+                    let end = reader.wait_until(started + Duration::from_secs(20));
+                    (end, started.elapsed())
+                })
+            })
+            .collect();
+        all_started.wait();
+        thread::sleep(Duration::from_millis(200));
+        assert!(guard.end(Outcome::Committed));
+        for waiter in waiters {
+            let (end, waited) = waiter.join().expect("a waiter does not panic");
+            assert_eq!(end, Some(Outcome::Committed));
+            assert!(
+                waited < Duration::from_secs(10),
+                "a waiter slept to its deadline: {waited:?}"
+            );
+        }
     }
 
     /// `wait_until` gives up at its deadline, not before, when no end comes; and returns the
