@@ -509,7 +509,8 @@ fn restricted_rewrites_tell_nothing_of_hidden_statistics() {
 
 /// Nor does a memory refusal, at any entry point that reads: a scan or a view sized by a
 /// graph the requester may not read runs out of the query memory, and the refusal it is told
-/// keeps its kind and limit, not the bytes held and asked for. A requester of every graph is
+/// keeps its kind and limit, not the bytes held and asked for; a view's keeps its kind alone.
+/// A requester of every graph is
 /// told the bytes where it is refused (it makes no view). One row per entry point of the
 /// boundary (`EntryPoint`, `ReadScope::told`), chosen by a match over them, so that a new one
 /// without a row doesn't compile. The rows: an EXPLAIN's, a run's and an update's WHERE;
@@ -694,17 +695,21 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
         inferred_by_support: true,
         ..GraphAccess::default()
     }));
-    // A refusal's kind and limit, told with its bytes or without.
+    // A refusal's kind and limit (`None`: none told), told with its bytes or without.
     let kind_and_limit = |error: &StoreError| match error {
         StoreError::MemoryLimitWithoutAmounts { limit, shared } => Some((*shared, *limit)),
         StoreError::SparqlEvaluation(QueryEvaluationError::MemoryLimit(exceeded))
         | StoreError::SparqlUpdate(nrese_sparql::UpdateError::Evaluation(
             QueryEvaluationError::MemoryLimit(exceeded),
-        )) => Some((exceeded.shared, exceeded.limit)),
+        )) => Some((exceeded.shared, Some(exceeded.limit))),
         _ => None,
     };
-    // The server's query memory (no request here has a limit of its own): 64 KiB.
-    let server_memory = Some((true, 64 << 10));
+    // The server's query memory (no request here has a limit of its own): 64 KiB. A view's
+    // refusal is told its kind alone: which budget refused it, and so its limit, may depend
+    // on the graphs the reader can't read
+    // (`a_reader_of_some_graphs_is_told_the_same_whichever_budget_refused_its_view`).
+    let server_memory = Some((true, Some(64 << 10)));
+    let server_class = Some((true, None));
     // What the secret graph sizes in a row: the scan of a reader of the public graphs, or the
     // view of one that sees the inferred statements they support (`inferred = "supported"`),
     // which a reader of every graph doesn't make. An update's WHERE has both.
@@ -732,9 +737,9 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
             EntryPoint::JustifyStatement => (&[By::View], &justify_statement),
         };
         for by in bys {
-            let (stores, restricted) = match by {
-                By::Scan => (&scans, public()),
-                By::View => (&views, supported.clone()),
+            let (stores, restricted, told_as) = match by {
+                By::Scan => (&scans, public(), server_memory),
+                By::View => (&views, supported.clone(), server_class),
             };
             let refused = |scope: &ReadScope| {
                 stores
@@ -743,7 +748,7 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
                         Err(error) => {
                             assert_eq!(
                                 kind_and_limit(&error),
-                                server_memory,
+                                told_as,
                                 "{entry:?} by {by:?}: {error}"
                             );
                             error
@@ -781,7 +786,7 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
     let refusal = run(&outgrows, &ReadScope::All).expect_err("every graph: the larger is refused");
     assert_eq!(
         kind_and_limit(&refusal),
-        Some((true, between)),
+        Some((true, Some(between))),
         "every graph: the larger is refused by the server's limit: {refusal}"
     );
 }

@@ -140,6 +140,9 @@ pub enum Unavailable {
     /// The memory it needs is past a budget: the store's support budget (what is kept)
     /// or the reading query's (what computing it reads and builds).
     Memory(BudgetExceeded),
+    /// [`Self::Memory`] as a reader of some graphs is told it ([`Reading::committed`]): the
+    /// server's query memory is in use, and nothing more.
+    QueryMemoryInUse,
     /// The process held more than its memory limit.
     ProcessMemory,
     /// The process's memory couldn't be read for its limit, which then can't be enforced.
@@ -162,6 +165,10 @@ impl From<Unavailable> for crate::StoreError {
     fn from(unavailable: Unavailable) -> Self {
         match unavailable {
             Unavailable::Memory(exceeded) => exceeded.into(),
+            Unavailable::QueryMemoryInUse => crate::StoreError::MemoryLimitWithoutAmounts {
+                limit: None,
+                shared: true,
+            },
             Unavailable::ProcessMemory => crate::StoreError::ProcessMemoryLimit {
                 limit: nrese_exec::memory::process_limit().unwrap_or(0),
             },
@@ -1980,29 +1987,56 @@ impl Reading {
 
     /// `snapshot`, a committed revision, as this reader reads it. Refused while the rules in
     /// place aren't its certificate's, with a view or without one: a refusal only where a
-    /// graph is out of the reader's reach would tell it that one is.
+    /// graph is out of the reader's reach would tell it that one is. Its view refused for
+    /// memory is told as the server's query memory in use, and nothing more: the view is
+    /// built from every graph (its sets, the facts it adds), so which budget refused it,
+    /// the reading query's or the one all queries share, and that budget's limit, depend on
+    /// graphs it can't read. A refusal because the process's memory couldn't be read depends
+    /// on no graph, and is told as it is.
     pub(crate) fn committed(&self, snapshot: &Snapshot) -> Result<Snapshot, Unavailable> {
+        self.committed_told(snapshot, true)
+    }
+
+    /// [`Self::committed`], its view's memory refusal told as the class only where
+    /// `class_only`: a dataset's selector ([`Self::scoped`]) reads as a reader of some graphs
+    /// does, for whichever reader asked.
+    fn committed_told(
+        &self,
+        snapshot: &Snapshot,
+        class_only: bool,
+    ) -> Result<Snapshot, Unavailable> {
         let generation = self.supports.state().generation.clone();
         if made_with_other_rules(&generation, snapshot, self.compilation.hide_unnamed_classes) {
             return Err(Unavailable::OtherProgram(self.compilation.replica));
         }
         match self.through_view(snapshot) {
-            true => self.supports.view(
-                snapshot,
-                &self.access,
-                self.compilation,
-                &self.memory,
-                self.cancellation.as_ref(),
-            ),
+            true => self
+                .supports
+                .view(
+                    snapshot,
+                    &self.access,
+                    self.compilation,
+                    &self.memory,
+                    self.cancellation.as_ref(),
+                )
+                .map_err(|unavailable| match unavailable {
+                    Unavailable::Memory(exceeded) if class_only && !exceeded.unread => {
+                        Unavailable::QueryMemoryInUse
+                    }
+                    unavailable => unavailable,
+                }),
             false => Ok(snapshot.clone()),
         }
     }
 
-    /// A dataset's view may use only a supported, certified closure.
+    /// A dataset's view may use only a supported, certified closure. Its memory refusal is
+    /// told as the class only to a reader of some graphs (`reader_of_some_graphs`), not to
+    /// a reader of every graph: the selector is the query's, not the reader's.
     pub(crate) fn scoped(
         &self,
         snapshot: &Snapshot,
         model: ReadModel,
+        reader_of_some_graphs: bool,
     ) -> crate::StoreResult<Snapshot> {
         use crate::{StoreError, service::Certificate};
         use nrese_sparql::QueryEvaluationError::ScopedInferenceUnavailable;
@@ -2034,7 +2068,7 @@ impl Reading {
         if generation.rules.is_none() {
             return Err(ScopedInferenceUnavailable("reasoner.mode").into());
         }
-        Ok(self.committed(snapshot)?)
+        Ok(self.committed_told(snapshot, reader_of_some_graphs)?)
     }
 
     /// What `tx` holds, its base and its pending changes, as this reader reads it: with

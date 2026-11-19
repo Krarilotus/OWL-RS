@@ -977,7 +977,11 @@ impl StoreService {
         let view = self
             .reading(Some(scope), memory, Some(cancel))
             .expect("the dataset's selector requests inferred statements")
-            .scoped(&snapshot, prepared.read_model())?;
+            .scoped(
+                &snapshot,
+                prepared.read_model(),
+                prepared.access().is_some(),
+            )?;
         self.refuse_exact(prepared, &snapshot, || {
             self.status_outside_dl(prepared, None, Revision::Committed(&view))
         })?;

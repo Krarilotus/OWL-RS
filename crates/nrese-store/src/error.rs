@@ -113,13 +113,14 @@ pub enum StoreError {
     #[error(transparent)]
     Forbidden(#[from] Refusal),
     /// A query's memory refusal as a reader of some graphs is told it
-    /// (`Self::without_amounts`): the limit, not the bytes held and asked for.
+    /// (`Self::without_amounts`): the limit, not the bytes held and asked for. Its view's
+    /// refusal, no limit either (`None`, `shared`: `crate::support::Reading::committed`).
     #[error(
-        "{}: limit {} (what the query held and asked for is not reported to a reader of some graphs)",
+        "{}{} (what the query held and asked for is not reported to a reader of some graphs)",
         memory_refusal(.shared),
-        nrese_exec::limit_text(*.limit)
+        limit_told(.limit)
     )]
-    MemoryLimitWithoutAmounts { limit: usize, shared: bool },
+    MemoryLimitWithoutAmounts { limit: Option<usize>, shared: bool },
     /// A reader of some graphs who sees inferences, refused while nothing vouches that the
     /// inferred statements are the closure of the rules in place: until the store is
     /// rematerialised, which a read replica isn't (`replica`).
@@ -186,8 +187,14 @@ impl StoreError {
                 .into();
             }
             Some(QueryEvaluationError::MemoryLimit(exceeded)) => {
-                Some((exceeded.limit, exceeded.shared))
+                Some((Some(exceeded.limit), exceeded.shared))
             }
+            // A view's refusal, which an update's `WHERE` carries as its dataset's failure
+            // (`crate::support::as_evaluation`): told as it is.
+            Some(QueryEvaluationError::Dataset(error)) => match error.downcast_ref::<Self>() {
+                Some(&Self::MemoryLimitWithoutAmounts { limit, shared }) => Some((limit, shared)),
+                _ => None,
+            },
             _ => None,
         };
         match refused {
@@ -297,6 +304,14 @@ fn memory_refusal(shared: &bool) -> &'static str {
         true => "the server's query memory is in use",
         false => "query memory budget exceeded",
     }
+}
+
+/// A memory refusal's limit as a reader of some graphs is told it, after its class; none
+/// where the class alone is told.
+fn limit_told(limit: &Option<usize>) -> String {
+    limit.map_or_else(String::new, |limit| {
+        format!(": limit {}", nrese_exec::limit_text(limit))
+    })
 }
 
 /// What a refusal before rematerialisation says, on a primary and on a read replica.
