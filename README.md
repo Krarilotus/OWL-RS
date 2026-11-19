@@ -3,15 +3,15 @@
 NRESE is an RDF database with OWL reasoning, written in Rust as a hobby project. Most work with
 data comes down to organising and standardising it, and an ontology is where that is written
 down, so NRESE is built to follow the ontology itself. Its inferences are committed with the
-write they follow from and kept apart from what you stored, and every query answer carries a
-status that says whether rows may be missing.
+write they follow from and kept apart from what you stored, and every query answer over HTTP
+carries a status that says whether rows may be missing.
 
 - You get one server, built from source or as a Docker image: SPARQL 1.1, the Graph Store
   Protocol and RDF4J's protocol over HTTP, and a browser console.
 - It takes one writer at a time, and the data must fit one machine: read replicas follow it,
   but nothing fails over or partitions the data ([limits](docs/limits.md)).
-- These pages describe the 1.5 prerelease, tagged `v1.5.0-pre.1`, which the
-  [quick start](#quick-start) builds.
+- These pages describe release 1.5.0, tagged `v1.5.0`, which the [quick start](#quick-start)
+  builds.
 
 ## What it does
 
@@ -23,10 +23,13 @@ status that says whether rows may be missing.
   ([what a commit does](docs/what-it-covers.md#what-a-commit-does)).
 - **Asserted and inferred are kept apart.** A query reads both, or only one of them
   ([queries](docs/ops/http-api.md#queries)).
-- **Writes that break the data are refused.** With reasoning on, a SPARQL update, Graph Store
+- **Writes found to break the data are refused.** With reasoning on, a SPARQL update, Graph Store
   write or transaction is refused as a whole when the reasoner finds it would make the data
   inconsistent, and with the SHACL gate set to `enforce`, when it introduces a violation. The
-  response gives the reason, as far as the writer may read the data behind it.
+  response gives the reason, as far as the writer may read the data behind it. Not every such
+  write is found: for instance, under `owl2-dl` a consistency check that isn't decided within its
+  budget lets the write through, marked `unknown` ([reasoning limits](docs/limits.md#reasoning)),
+  and the gate can miss a violation deep in a recursive shape ([SHACL limits](docs/limits.md#shacl)).
 - **Every answer carries a status.** `complete`, `sound-only` (rows may be missing), `unsound`
   (rows may be missing or wrong) or `not-certified`, in a header on every query answer over HTTP
   ([what an answer promises](docs/what-it-covers.md#what-an-answer-promises)).
@@ -49,14 +52,17 @@ Around that, what a database needs:
 - several repositories per server
 
 It follows the W3C standards for RDF, SPARQL, SHACL and OWL 2, and runs their test suites in its
-checks. Everything it does, with the [standards and their tests](docs/what-it-covers.md#standards),
-is in [features and standards](docs/what-it-covers.md), and where it stops is in
+checks. Its builds and tests run on the project's own machines; the hosted CI workflow runs at
+milestones and on merges to `main`. Everything it does, with the
+[standards and their tests](docs/what-it-covers.md#standards), is in
+[features and standards](docs/what-it-covers.md), and where it stops is in
 [limits](docs/limits.md).
 
 We wanted a store in which a write is checked against the ontology, an inference changes with
-the data, and an answer says how far it can be trusted. NRESE is built part by part from the
-research literature, with the W3C test suites as its floor, and where a standard could go
-further for a use case, we want to help move it.
+the data, and an answer says whether, against what follows from the stored data, rows may be
+missing or wrong. NRESE is built part by part from the research literature, with the W3C test
+suites as its floor, and where a standard could go further for a use case, we want to help move
+it.
 
 ## Quick start
 
@@ -66,7 +72,7 @@ no Rust or Node.js, and the first build takes several minutes. The image targets
 Neoverse N1 CPUs; on an older CPU, add `--build-arg NRESE_TARGET_CPU=portable` to `docker build`.
 
 ```bash
-git clone https://github.com/Krarilotus/OWL-RS.git
+git clone --branch v1.5.0 https://github.com/Krarilotus/OWL-RS.git
 cd OWL-RS
 docker build -t nrese .
 docker run -d --name nrese -p 127.0.0.1:8080:8080 -v nrese-data:/var/lib/nrese/data \

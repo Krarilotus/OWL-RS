@@ -107,10 +107,11 @@ Beside the modes:
 
 ### What an answer promises
 
-Every SPARQL query answer carries its status in an `NRESE-Completeness` header, whatever the
-query form and the protocol. `EXPLAIN` shows the same status, and classification and realisation
-carry it too ([details](ops/http-api.md#sparql)). Graph and statement downloads (Graph Store,
-RDF4J `/statements`) carry none.
+Every SPARQL query answer over HTTP carries its status in an `NRESE-Completeness` header,
+whatever the query form and the protocol. `EXPLAIN` shows the same status, and classification
+and realisation carry it too ([details](ops/http-api.md#sparql)). Graph and statement downloads
+(Graph Store, RDF4J `/statements`) carry none, and neither does the local `nrese-server query`
+command, which prints the answer alone.
 
 What each status promises under each mode is in
 [the reasoning contract](spec/reasoning-semantics.md#what-complete-refers-to), and the header's
