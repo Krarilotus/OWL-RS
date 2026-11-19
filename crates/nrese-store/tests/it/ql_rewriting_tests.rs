@@ -3100,3 +3100,58 @@ fn the_same_readers_class_read_stays_complete() {
     let (status, _) = rewritten_read(&store, "SELECT ?x { ?x a :A }", reader_by_support());
     assert_eq!(status_class(&status), "complete", "status: {status}");
 }
+
+/// Spec: a query without a search answers the same through the store whatever the rewriting
+/// has learnt of the data: cold, from the result cache, and fresh. Sixteen arms of a union
+/// each spend one of the questions the rewriting may ask of the data (no `:qK` statement
+/// under `:dK`), so the cold request folds the last arm's witness unasked, and its bag form
+/// copies that arm's own pattern, a variable predicate included, into a `NOT EXISTS`. Once
+/// that witness is asked (the next request), the data has its tree and the fold goes.
+/// Hand answer: `:x :t :y` is the one statement under `:t`, the predicate whose `:r`
+/// successor `:t` shares, so one row.
+#[test]
+fn a_query_without_a_search_answers_alike_cold_cached_and_fresh() {
+    let mut turtle = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         :C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:someValuesFrom owl:Thing ] .
+         :t a :C ; :r :w . :x :t :y .\n"
+    );
+    let mut arms = Vec::new();
+    for k in 0..16 {
+        turtle.push_str(&format!(
+            ":D{k} rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :q{k} ; owl:someValuesFrom owl:Thing ] .
+             :d{k} a :D{k} .\n"
+        ));
+        arms.push(format!("{{ :d{k} :q{k} ?z . ?s :absent ?o }}"));
+    }
+    arms.push("{ :t :r ?anon . ?p :r ?anon . ?s ?p ?o }".to_owned());
+    let query = format!(
+        "PREFIX : <{E}> SELECT ?s ?o WHERE {{ {} }}",
+        arms.join(" UNION ")
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let store = store(&turtle, dir.path(), Ruleset::Owl2Ql, true);
+    let ask = || {
+        let result = store
+            .execute_query(&SparqlQueryRequest::all(&query))
+            .unwrap_or_else(|e| panic!("{query}: {e}"));
+        let realised = result.ql.as_ref().expect("rewritten").realised;
+        (select_rows(&result.payload), realised)
+    };
+    let hand = vec![format!("o={E}y s={E}x")];
+    let (cold, cold_realised) = ask();
+    assert_eq!(cold, hand, "cold");
+    assert_eq!(cold_realised, 0, "the cold request folded every witness");
+    let hits = store.query_cache_stats().hits;
+    let (cached, cached_realised) = ask();
+    assert!(store.query_cache_stats().hits > hits, "from the cache");
+    assert_eq!(cached, hand, "cached");
+    assert!(
+        cached_realised > 0,
+        "the next request found the last arm's tree"
+    );
+    store.clear_query_cache();
+    let (fresh, _) = ask();
+    assert_eq!(fresh, hand, "fresh, without the cache");
+}
