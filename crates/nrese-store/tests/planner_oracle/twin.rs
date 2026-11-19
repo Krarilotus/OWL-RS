@@ -27,6 +27,8 @@ pub struct Query {
     // solutions each of which may pass a draw. By default one.
     pub body: Option<String>,
     pub reduced: bool,
+    // The number of result rows when the shape fixes it whatever is drawn.
+    pub rows: Option<usize>,
 }
 
 impl Query {
@@ -37,6 +39,7 @@ impl Query {
             scope: None,
             body: None,
             reduced: false,
+            rows: None,
         }
     }
 

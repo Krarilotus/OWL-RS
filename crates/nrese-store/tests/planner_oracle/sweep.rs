@@ -118,6 +118,8 @@ fn compare_twin(
         // The mean beside the draw never errs: bound to 1, as written too.
         let bound = properties::bound_one(expected);
         report.answer(Route::Native(true), "AVG bound", bound);
+        let rows = properties::row_count(expected, case.query.rows);
+        report.answer(Route::Native(true), "row count", rows);
         let streamed = routes.native_with(&request.query, false, Some(2));
         report.answer(Route::Streamed, "twin bag", check(&streamed));
     }
@@ -167,9 +169,16 @@ fn compare_draws(
     };
     let body = case.query.body.as_ref().and_then(|body| scope(body));
     let model = Model::new(draw, expected, scope("").as_ref(), body.as_ref());
+    // A fixed row count is checked apart from the bags, which a fault shared
+    // with the twin leaves equal.
+    let check = |rows: &Rows| {
+        let count = properties::row_count(rows, case.query.rows);
+        count.map_err(|e| ("row count", e))?;
+        model.check(rows)
+    };
     let mut judge = |route, run: &mut dyn FnMut() -> Rows| {
         for _ in 0..repeats {
-            let Err((property, detail)) = model.check(&run()) else {
+            let Err((property, detail)) = check(&run()) else {
                 continue;
             };
             if !properties::RARE.contains(&property) {
@@ -179,7 +188,7 @@ fn compare_draws(
             // An outcome of chance at most 2^-20 under SPARQL is a witness
             // when an independent second run gives it too. Whatever else
             // the second run breaks is a failure of its own.
-            match model.check(&run()) {
+            match check(&run()) {
                 Ok(()) => continue,
                 Err((again, more)) if again == property => {
                     let detail = format!("{detail}; again: {more}");

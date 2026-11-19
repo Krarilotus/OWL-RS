@@ -190,8 +190,11 @@ pub fn drawing(shape: &'static str) -> Case {
         _ => panic!("unknown drawing shape {shape}"),
     };
     let mut case = Case::new(shape, data, Query::drawing(text, draw));
-    if shape == "service-batches" {
-        case.remote = Some(REMOTE);
+    match shape {
+        "service-batches" => case.remote = Some(REMOTE),
+        // Its implicit group is one row on every route, drawn or not.
+        "average-draw" => case.query.rows = Some(1),
+        _ => {}
     }
     case
 }

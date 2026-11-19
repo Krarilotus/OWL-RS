@@ -94,12 +94,41 @@ fn number(value: Option<&String>) -> Option<f64> {
     value?.split('"').nth(1)?.parse().ok()
 }
 
+// A numeric literal whose value is exactly 1. An integer or decimal is an
+// exact numeral; a double or float has the value its numeral rounds to.
+fn one(term: Option<&String>) -> bool {
+    let typed = term.and_then(|t| t.strip_prefix('"')?.rsplit_once("\"^^<"));
+    let Some((numeral, datatype)) = typed else {
+        return false;
+    };
+    let datatype = datatype.strip_suffix('>').unwrap_or_default();
+    let digits = numeral.strip_prefix('+').unwrap_or(numeral);
+    let (whole, fraction) = digits.split_once('.').unwrap_or((digits, ""));
+    let zeros = fraction.bytes().all(|b| b == b'0');
+    match datatype.strip_prefix("http://www.w3.org/2001/XMLSchema#") {
+        Some("integer") => digits.trim_start_matches('0') == "1",
+        Some("decimal") => whole.trim_start_matches('0') == "1" && zeros,
+        Some("double") => numeral.parse::<f64>() == Ok(1.0),
+        Some("float") => numeral.parse::<f32>() == Ok(1.0),
+        _ => false,
+    }
+}
+
 // Beside a drawing AVG, a mean whose volatile argument is 1 on both branches:
-// SPARQL binds it to 1 in every group.
+// SPARQL binds it to the number 1 in every group.
 pub fn bound_one(rows: &Rows) -> Result<(), String> {
-    match rows.iter().find(|r| number(r.get("bound")) != Some(1.0)) {
-        Some(row) => Err(format!("?bound is not 1 in {row:?}")),
+    match rows.iter().find(|r| !one(r.get("bound"))) {
+        Some(row) => Err(format!("?bound is not the number 1 in {row:?}")),
         None => Ok(()),
+    }
+}
+
+// A shape whose result has a fixed number of rows whatever is drawn, as one
+// implicit group has one.
+pub fn row_count(rows: &Rows, expected: Option<usize>) -> Result<(), String> {
+    match expected {
+        Some(n) if rows.len() != n => Err(format!("{} rows where SPARQL gives {n}", rows.len())),
+        _ => Ok(()),
     }
 }
 
@@ -267,9 +296,17 @@ impl Model {
                         return Err(("AVG", format!("unexpected mean {value}")));
                     }
                 }
-                // A group's mean is bound when all its n arguments are 1, a
-                // chance of 2^-n each; every mean unbound has the chance of
-                // the product of 1 - 2^-n over the groups (n from ?rows).
+                // SPARQL drops erring arguments from the count: a group of n
+                // rows has mean 1 when all are numeric, 0 when all err, and
+                // is unbound otherwise, a chance of 1 - 2 * 2^-n under fair
+                // independent draws. The product below takes 1 - 2^-n per
+                // group (n from ?rows), at least that chance. SPARQL does not
+                // promise independent RAND draws, so the cutoff rests on the
+                // generated shapes: at most 42 groups, so groups of two or
+                // more alone never cross it (0.75^42 > 2^-20); a crossing
+                // needs single-row groups unbound, which SPARQL never leaves
+                // unbound (an engine that leaves an all-erring mean unbound
+                // can cross on chance).
                 if found.iter().all(|r| !r.contains_key("avg")) {
                     let unbound = |r: &Row| {
                         let n = number(r.get("rows")).unwrap_or(0.0) as i32;

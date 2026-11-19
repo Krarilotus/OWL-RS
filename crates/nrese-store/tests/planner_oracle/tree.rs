@@ -440,6 +440,7 @@ pub fn generated(seed: u64) -> Case {
         scope,
         body: tree.body,
         reduced,
+        rows: None,
     };
     case
 }
