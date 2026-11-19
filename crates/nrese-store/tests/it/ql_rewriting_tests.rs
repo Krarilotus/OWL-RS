@@ -2108,10 +2108,12 @@ fn an_axiom_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
 /// left-out axiom does (I24c-2). `rdf:List a [ owl:intersectionOf ( :C :D ) ]` makes
 /// `rdf:List` a `C` (OWL 2 Direct Semantics §2.3; the RL tables' cls-int2), but `rdf:List`
 /// is a reserved name, which the reader leaves out with its membership. Where it is the
-/// expression's only member, the members of `C` are told `sound-only`, with the reader's
-/// reason, and include the asserted `c`: on a fresh read, and on a read after the
-/// membership is added to a store whose schema was read with the expression memberless
-/// (`complete` then, nothing being in it).
+/// expression's only member, the members of `C` include the asserted `c` and are never
+/// told `complete`: on a fresh read `sound-only`, with the reader's reason; on a read
+/// after the membership is added to a store whose schema was read with the expression
+/// memberless (`complete` then, nothing being in it), not `complete` and not without a
+/// status (the store tells such a commit `not-certified`; nrese-sparql's QL tests drive
+/// the kept schema's own path, a fresh read's equal at each commit).
 #[test]
 fn a_membership_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
     use nrese_store::SparqlUpdateRequest;
@@ -2139,15 +2141,22 @@ fn a_membership_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
     let c = format!("x={E}c");
     let certain = [c.clone(), format!("x={list}")];
     let mut wrong = Vec::new();
-    let mut check = |case: &str, (rows, status, reasons): (Vec<String>, String, Vec<String>)| {
+    // `fresh`: told `sound-only` with the reader's reason; otherwise told a status, never
+    // `complete`.
+    let mut check = |case: &str, fresh: bool, told: (Vec<String>, String, Vec<String>)| {
+        let (rows, status, reasons) = told;
         let reason = reasons
             .iter()
             .any(|r| r.contains("reserved vocabulary used as an entity") && r.contains(list));
+        let held = match fresh {
+            true => status == "sound-only" && reason,
+            false => !matches!(status.as_str(), "complete" | "none"),
+        };
         if !rows.contains(&c) || rows.iter().any(|r| !certain.contains(r)) {
             wrong.push(format!(
                 "{case}: {rows:?}, only certain answers, c among them"
             ));
-        } else if status != "sound-only" || !reason {
+        } else if !held {
             wrong.push(format!("{case}: {rows:?}, {status}, {reasons:?}"));
         }
     };
@@ -2158,7 +2167,7 @@ fn a_membership_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
         Ruleset::Owl2Ql,
         true,
     );
-    check("fresh", told(&fresh));
+    check("fresh", true, told(&fresh));
     let dir = tempfile::tempdir().unwrap();
     let cached = store(
         &format!("{head}:c a :C . [ owl:intersectionOf ( :C :D ) ] ."),
@@ -2182,7 +2191,7 @@ fn a_membership_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
              INSERT { rdf:List a ?e } WHERE { ?e owl:intersectionOf ?l }",
         ))
         .unwrap();
-    check("after the membership is added", told(&cached));
+    check("after the membership is added", false, told(&cached));
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
