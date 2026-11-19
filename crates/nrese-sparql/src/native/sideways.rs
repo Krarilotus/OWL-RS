@@ -201,31 +201,14 @@ impl Context<'_> {
             GraphPattern::Filter { expr, inner } => {
                 let (read, draws) = reads_and_draws(expr);
                 if draws {
-                    return self
-                        .drawn_from_keys(seed, pattern, inner, |rows| self.filter(rows, expr));
+                    return self.drawn_from_keys(seed, pattern, inner, |keys| {
+                        self.filter_from(keys, expr, inner)
+                    });
                 }
                 if !reads_only_bound(&read, &pushdown::certain(inner), &seed) {
                     return self.join_alone(seed, pattern);
                 }
-                if let GraphPattern::Bgp { patterns } = &**inner
-                    && self.probes_pay(&seed, patterns)
-                {
-                    let mut all = Vec::new();
-                    pushdown::conjuncts_of(expr, &mut all);
-                    let (early, late): (Vec<_>, Vec<_>) =
-                        all.into_iter().partition(|c| pushdown::movable(c));
-                    let mut early: Vec<(&Expression, Vec<Variable>)> = early
-                        .into_iter()
-                        .map(|c| (c, super::expression_variables(c)))
-                        .collect();
-                    let mut solutions = self.bgp_from(seed, patterns, &mut early)?;
-                    for conjunct in early.into_iter().map(|(c, _)| c).chain(late) {
-                        solutions = self.filter(solutions, conjunct)?;
-                    }
-                    return Ok(solutions);
-                }
-                let solutions = self.eval_from(seed, inner)?;
-                self.filter(solutions, expr)
+                self.filter_from(seed, expr, inner)
             }
             GraphPattern::Join { inputs } => {
                 let mut solutions = seed;
@@ -271,8 +254,9 @@ impl Context<'_> {
                     draws = drawn;
                 }
                 if draws {
-                    return self.drawn_from_keys(seed, pattern, left, |rows| {
-                        self.optional(rows, right, expression.as_ref())
+                    return self.drawn_from_keys(seed, pattern, left, |keys| {
+                        let left = self.eval_from(keys, left)?;
+                        self.optional(left, right, expression.as_ref())
                     });
                 }
                 if !reads_only_bound(&read, &pushdown::certain(left), &seed) {
@@ -290,14 +274,16 @@ impl Context<'_> {
                         !drawn && reads_only_bound(&read, &pushdown::certain(inner), &seed)
                     }
                 });
-                let extend = |mut solutions: Solutions| -> NativeResult<Solutions> {
+                // `inner` from `from`, then the bindings.
+                let extend = |from: Solutions| -> NativeResult<Solutions> {
+                    let mut solutions = self.eval_from(from, inner)?;
                     for (variable, expression) in bindings {
                         solutions = self.extend(solutions, variable, expression)?;
                     }
                     Ok(solutions)
                 };
                 if inside {
-                    extend(self.eval_from(seed, inner)?)
+                    extend(seed)
                 } else if draws {
                     self.drawn_from_keys(seed, pattern, inner, extend)
                 } else {
@@ -313,12 +299,14 @@ impl Context<'_> {
         self.join(seed, alone)
     }
 
-    /// `Join(seed, pattern)`, where `pattern` applies an expression that draws a value per
-    /// evaluation (`apply`) to the rows of `inner`. `inner` is evaluated from the seed's
-    /// distinct values of the variables it certainly binds, so each of its solutions meets
-    /// one key and is drawn for once, as SPARQL draws; the join then copies it to every
-    /// seed row it fits. Without such keys (none shared, or one unbound somewhere)
-    /// `pattern` is evaluated alone.
+    /// `Join(seed, pattern)`, where `pattern` evaluates `inner` and applies an expression
+    /// that draws a value per evaluation to its rows; `apply` does both, from the rows it is
+    /// given. It is given the seed's distinct values of the variables `inner` certainly
+    /// binds, so each solution of `inner` meets one key and is drawn for once, as SPARQL
+    /// draws; the join then copies it to every seed row it fits. If those keys are the
+    /// seed itself (every seed variable among them, no row repeated), `apply` is given the
+    /// seed and there is nothing to join. Without such keys (none shared, or one unbound
+    /// somewhere) `pattern` is evaluated alone.
     fn drawn_from_keys(
         &self,
         seed: Solutions,
@@ -329,8 +317,42 @@ impl Context<'_> {
         let Some(keys) = self.keys(&seed, &pushdown::certain(inner)) else {
             return self.join_alone(seed, pattern);
         };
-        let rows = apply(self.eval_from(keys, inner)?)?;
+        if keys.vars.len() == seed.vars.len() && keys.table.len() == seed.table.len() {
+            self.consumed(keys);
+            return apply(seed);
+        }
+        let rows = apply(keys)?;
         self.join(seed, rows)
+    }
+
+    /// `Join(seed, Filter(expr, inner))` with `inner` evaluated from the seed: a basic
+    /// graph pattern applies the conjuncts that can move while it joins (never one that
+    /// draws or reads an `EXISTS`), the rest after it.
+    fn filter_from(
+        &self,
+        seed: Solutions,
+        expr: &Expression,
+        inner: &GraphPattern,
+    ) -> NativeResult<Solutions> {
+        if let GraphPattern::Bgp { patterns } = inner
+            && self.probes_pay(&seed, patterns)
+        {
+            let mut all = Vec::new();
+            pushdown::conjuncts_of(expr, &mut all);
+            let (early, late): (Vec<_>, Vec<_>) =
+                all.into_iter().partition(|c| pushdown::movable(c));
+            let mut early: Vec<(&Expression, Vec<Variable>)> = early
+                .into_iter()
+                .map(|c| (c, super::expression_variables(c)))
+                .collect();
+            let mut solutions = self.bgp_from(seed, patterns, &mut early)?;
+            for conjunct in early.into_iter().map(|(c, _)| c).chain(late) {
+                solutions = self.filter(solutions, conjunct)?;
+            }
+            return Ok(solutions);
+        }
+        let solutions = self.eval_from(seed, inner)?;
+        self.filter(solutions, expr)
     }
 
     /// Whether joining `seed` pattern by pattern will probe the index: the seed is small
