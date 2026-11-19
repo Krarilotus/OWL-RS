@@ -106,12 +106,16 @@ impl MutationTicket {
             .is_ok()
     }
 
-    pub(crate) fn end_error(&self, error: MutationError) -> MutationError {
+    pub(super) fn claim_error(&self) -> Result<(), MutationError> {
         if self.end_pending() == MutationState::Cancelled {
-            MutationError::Cancelled
+            Err(MutationError::Cancelled)
         } else {
-            error
+            Ok(())
         }
+    }
+
+    pub(super) fn end_error(&self, error: MutationError) -> MutationError {
+        self.claim_error().err().unwrap_or(error)
     }
 
     /// Settles a known failure or a fallback that could not have published. Returns
