@@ -578,6 +578,7 @@ pub(crate) fn delete_insert(
         true => pattern.clone(),
         false => optimise(pattern.clone(), &mut Vec::new(), &ctx),
     };
+    ctx.check_scoped_operators(&pattern)?;
     let solutions = ctx.eval(&pattern)?;
     let mut changes = QuadChanges::new(&ctx.budget);
     let memory = QueryEvaluationError::MemoryLimit;
@@ -823,6 +824,7 @@ fn native_pattern<'q>(
     if let Some(refused) = ctx.aliases_refused.get() {
         return Err(QueryEvaluationError::MemoryLimit(refused));
     }
+    ctx.check_scoped_operators(&pattern)?;
     Ok((pattern, form, rewrites, ql_report))
 }
 
@@ -3587,12 +3589,6 @@ impl<'a> Context<'a> {
         triples: &[TriplePattern],
         filters: &mut Vec<(&Expression, Vec<Variable>)>,
     ) -> NativeResult<Solutions> {
-        if matches!(self.merge_set, Some(crate::dataset::GraphSet::Scoped(_)))
-            && triples.iter().any(|t| search::is_search(t, triples))
-            && search::split(triples).is_some()
-        {
-            self.search_in()?;
-        }
         // GeoSPARQL relations (`spatial`) join after the other patterns.
         if let Some((first, later, rest)) = self.spatial_split(triples) {
             let mut result = if rest.is_empty() {

@@ -166,6 +166,66 @@ fn bindings(values: &[&str]) -> Rows {
 }
 
 #[tokio::test]
+async fn review_unscoped_search_and_scan_keep_separate_cached_answers() -> TestResult {
+    // Spec: A cached ordinary list scan cannot answer a later text search
+    // that uses the same projected variable and a blank argument list.
+    let app = app(
+        StoreConfig {
+            query_cache_bytes: 1024 * 1024,
+            ..StoreConfig::default()
+        },
+        false,
+    )?;
+    insert(
+        &app,
+        r#"ex:a <http://jena.apache.org/text#query> ex:args .
+           ex:args <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> "alpha" ;
+                   <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest>
+                   <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> .
+           ex:b ex:q "alpha" ."#,
+    )
+    .await?;
+    for (argument, expected) in [
+        ("?l", bindings(&[A])),
+        ("_:l", bindings(&["<urn:ex:args>", "<urn:ex:b>"])),
+    ] {
+        let pattern = format!(
+            r#"{{ ?s <http://jena.apache.org/text#query> {argument} .
+                {argument} <http://www.w3.org/1999/02/22-rdf-syntax-ns#first> "alpha" ;
+                           <http://www.w3.org/1999/02/22-rdf-syntax-ns#rest>
+                           <http://www.w3.org/1999/02/22-rdf-syntax-ns#nil> }}"#
+        );
+        let answer = select(&app, &[], "", "?s", "", &pattern).await?;
+        assert_eq!(answer.rows(), expected, "list argument {argument}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_unscoped_path_keeps_the_mixed_text_group_a_scan() -> TestResult {
+    // Spec: Ordering a property path beside a mixed text group preserves
+    // the ordinary scan's result. A literal in another property gives no match.
+    use std::fmt::Write as _;
+
+    let app = app(StoreConfig::default(), false)?;
+    let mut data = r#"ex:a <http://jena.apache.org/text#query> "alpha" ;
+                           ex:p ex:target .
+                      ex:z ex:q "alpha" ; ex:p ex:target . "#
+        .to_owned();
+    // Increase matches of the unconstrained text predicate at one subject.
+    for value in 0..128 {
+        write!(data, "ex:z <http://jena.apache.org/text#query> {value} . ")?;
+    }
+    insert(&app, &data).await?;
+    let pattern = r#"{ ?s <http://jena.apache.org/text#query> [] .
+                       ?s <http://jena.apache.org/text#query> "alpha" .
+                       ?s ex:p+ ?o }"#;
+    let answer = select(&app, &[], "", "?s", "", pattern).await?;
+    assert_eq!(answer.rows(), bindings(&[A]), "path join");
+    Ok(())
+}
+
+#[tokio::test]
 async fn derivation_uses_only_dataset_graphs() -> TestResult {
     // Spec: Dataset-scoped inference derives a conclusion only when both premises are in
     // the dataset.
@@ -1034,6 +1094,281 @@ async fn scoped_reads_refuse_text_search_before_shortcuts() -> TestResult {
         );
     }
     Ok(())
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_search_in_an_empty_optional() -> TestResult {
+    // Spec: An empty OPTIONAL seed does not exempt its local text search from 501.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ VALUES ?s {} OPTIONAL {
+            ?s <http://www.bigdata.com/rdf/search#search> "alpha"
+        } }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_search_in_an_unselected_graph() -> TestResult {
+    // Spec: A local vector search returns 501 even when its GRAPH IRI is
+    // absent from FROM NAMED.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ GRAPH :g2 { SERVICE <urn:nrese:vector:search> {
+             ?s <urn:nrese:vector:near> "[1,0]"^^<urn:nrese:vector:vector>
+         } } }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_computed_spatial_over_no_named_graphs() -> TestResult {
+    // Spec: A computed spatial relation returns 501 even when GRAPH ?g has
+    // no named graphs to visit.
+    scoped_preparation_refusal(
+        SCOPED,
+        "{ GRAPH ?g { ?s <http://www.opengis.net/ont/geosparql#sfWithin> ex:box } }",
+        "computed-spatial-relation",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_search_in_an_empty_minus_operand() -> TestResult {
+    // Spec: MINUS with empty operands still refuses a local text search in its
+    // right operand, even though BIND has no rows on which to run it.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ VALUES ?s {} MINUS { VALUES ?s {} BIND(EXISTS {
+            ?s <http://www.bigdata.com/rdf/search#search> "alpha"
+        } AS ?found) } }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_search_in_exists_over_empty_input() -> TestResult {
+    // Spec: A correlated EXISTS filter with no incoming rows still refuses its
+    // local text search.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ VALUES ?outer {} FILTER EXISTS {
+            ?s <http://www.bigdata.com/rdf/search#search> "alpha"
+            FILTER (?s = ?outer)
+        } }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_search_in_a_subquery_joined_to_empty_input() -> TestResult {
+    // Spec: A subquery's local text search returns 501 even when the other join
+    // operand has no rows.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ VALUES ?s {} { SELECT ?s WHERE {
+            ?s <http://www.bigdata.com/rdf/search#search> "alpha"
+        } } }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_search_in_a_plan_request() -> TestResult {
+    // Spec: A plan request refuses a local search before evaluating it.
+    scoped_preparation_refusal(
+        "?inference-scope=dataset&explain=plan",
+        r#"{ ?s <http://www.bigdata.com/rdf/search#search> "alpha" }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn scoped_preparation_preserves_an_ordinary_text_predicate() -> TestResult {
+    // Spec: A Jena-shaped group with a bare blank argument uses ordinary
+    // triple scans, including when another triple has a valid query argument.
+    let app = app(StoreConfig::default(), false)?;
+    insert(
+        &app,
+        r#"GRAPH :g1 { ex:a <http://jena.apache.org/text#query> "alpha" }"#,
+    )
+    .await?;
+    for pattern in [
+        "{ ?s <http://jena.apache.org/text#query> [] }",
+        r#"{ ?s <http://jena.apache.org/text#query> [] .
+             ?s <http://jena.apache.org/text#query> "alpha" }"#,
+    ] {
+        let reply = select(&app, &[], SCOPED, "?s", G1, pattern).await?;
+        assert_eq!(reply.rows(), bindings(&[A]), "{pattern}");
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_scoped_joined_text_groups_keep_the_scan_rows() -> TestResult {
+    // Spec: When the parser joins two Jena-shaped groups into an ordinary
+    // BGP, a scoped request returns the same scan rows as an unscoped read.
+    // Kept apart by a one-row VALUES, the first group is a search as written,
+    // which a scoped request refuses as it refuses every text search form.
+    let app = app(StoreConfig::default(), false)?;
+    insert(
+        &app,
+        r#"GRAPH :g1 { ex:a <http://jena.apache.org/text#query> "alpha" }"#,
+    )
+    .await?;
+    let pattern = |between: &str| {
+        format!(
+            r#"{{ {{ ?s <http://jena.apache.org/text#query> "alpha" }}
+                   {between}
+                   {{ ?t <http://jena.apache.org/text#query> [] }} }}"#
+        )
+    };
+    let joined = pattern("");
+    let plain = select(&app, &[], "", "?s", G1, &joined).await?.rows();
+    assert_eq!(plain, bindings(&[A]), "unscoped scan {joined}");
+    let scoped = select(&app, &[], SCOPED, "?s", G1, &joined).await?;
+    assert_eq!(scoped.rows(), plain, "scoped scan {joined}");
+    let apart = pattern("VALUES ?unused { 1 }");
+    let plain = select(&app, &[], "", "?s", G1, &apart).await?.rows();
+    assert_eq!(plain, bindings(&[A]), "unscoped search {apart}");
+    let scoped = select(&app, &[], SCOPED, "?s", G1, &apart).await?;
+    assert_eq!(scoped.code, StatusCode::NOT_IMPLEMENTED, "{scoped:?}");
+    assert_eq!(
+        scoped.json()["type"],
+        "https://nrese.dev/problems/store.search_scope",
+        "{scoped:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn review_scoped_graphdb_text_operator_is_refused() -> TestResult {
+    // Spec: Dataset-scoped GraphDB text search returns 501 and names the
+    // same problem type as other text search forms.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ ?s <http://www.ontotext.com/owlim/lucene#anyIndex> "alpha" }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+async fn scoped_preparation_refusal(options: &str, pattern: &str, problem: &str) -> TestResult {
+    let app = app(StoreConfig::default(), false)?;
+    insert(&app, SPLIT).await?;
+    let reply = select(&app, &[], options, "?s", G1, pattern).await?;
+    assert_eq!(reply.code, StatusCode::NOT_IMPLEMENTED, "{reply:?}");
+    assert_eq!(
+        reply.json()["type"],
+        format!("https://nrese.dev/problems/{problem}"),
+        "{reply:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_preparation_leaves_remote_service_bodies_to_the_endpoint() -> TestResult {
+    // Spec: A scoped plan leaves the remote SERVICE body to its endpoint, even
+    // when the body contains search or spatial algebra.
+    let app = app(StoreConfig::default(), false)?;
+    insert(&app, G1_FACT).await?;
+    let reply = select(
+        &app,
+        &[],
+        "?inference-scope=dataset&explain=plan",
+        "?s",
+        G1,
+        r#"{ SERVICE <urn:ex:remote> {
+            ?s <http://www.bigdata.com/rdf/search#search> "alpha" .
+            ?s <http://www.opengis.net/ont/geosparql#sfWithin> ex:box .
+            SERVICE <urn:nrese:vector:search> {
+                ?v <urn:nrese:vector:near> "[1,0]"^^<urn:nrese:vector:vector>
+            }
+        } }"#,
+    )
+    .await?;
+    assert_eq!(reply.code, StatusCode::OK, "{reply:?}");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn scoped_preparation_leaves_self_service_to_the_http_endpoint() -> TestResult {
+    // Spec: An allowed SERVICE to this server's own HTTP endpoint delegates
+    // search in its body. The outbound query has its endpoint's dataset.
+    use nrese_server::federation::HttpServiceClient;
+    use nrese_store::FederationConfig;
+    use std::sync::Arc;
+
+    let state = test_state_with_store_config(
+        StoreConfig::default(),
+        Default::default(),
+        ReasonerConfig::for_mode(ReasoningMode::Owl2Rl),
+    )?;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let endpoint = format!("http://{}/dataset/query", listener.local_addr()?);
+    state
+        .store()
+        .set_service_client(Arc::new(HttpServiceClient::new(
+            FederationConfig {
+                allow: vec![endpoint.clone()],
+                ..FederationConfig::default()
+            },
+            tokio::runtime::Handle::current(),
+        )?));
+    let app = build_app(state);
+    insert(&app, &format!("{G1_FACT} ex:c ex:p \"alpha\" .")).await?;
+    let server = tokio::spawn(axum::serve(listener, app.clone()).into_future());
+    let pattern = format!(
+        "{{ SERVICE <{endpoint}> {{ ?text <http://www.bigdata.com/rdf/search#search> \"alpha\" }} }}"
+    );
+    let result = select(&app, &[], SCOPED, "?text", G1, &pattern).await;
+    server.abort();
+    let reply = result?;
+    assert_eq!(reply.rows(), bindings(&["\"alpha\""]));
+    Ok(())
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_a_spatial_relation_after_lateral_binding() -> TestResult {
+    // Spec: A spatial relation specialised by LATERAL still returns the same 501.
+    scoped_preparation_refusal(
+        SCOPED,
+        "{ VALUES ?p { <http://www.opengis.net/ont/geosparql#sfWithin> }
+           LATERAL { ?s ?p ex:box } }",
+        "computed-spatial-relation",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_search_after_exists_binding() -> TestResult {
+    // Spec: Search specialised by correlated EXISTS still returns the same 501.
+    scoped_preparation_refusal(
+        SCOPED,
+        r#"{ VALUES ?p { <http://www.bigdata.com/rdf/search#search> }
+            FILTER EXISTS { SELECT ?p ?s WHERE { ?s ?p "alpha" } LIMIT 1 } }"#,
+        "store.search_scope",
+    )
+    .await
+}
+
+#[tokio::test]
+async fn scoped_preparation_refuses_search_before_explain_analyze() -> TestResult {
+    // Spec: EXPLAIN ANALYZE refuses local search even behind an empty OPTIONAL.
+    scoped_preparation_refusal(
+        "?inference-scope=dataset&explain=true",
+        r#"{ VALUES ?s {} OPTIONAL {
+            ?s <http://www.bigdata.com/rdf/search#search> "alpha"
+        } }"#,
+        "store.search_scope",
+    )
+    .await
 }
 
 #[tokio::test]

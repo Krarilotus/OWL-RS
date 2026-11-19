@@ -4,6 +4,33 @@ use nrese_rdf_io::{RdfFormat, RdfParser};
 use std::sync::Arc;
 
 #[test]
+fn scoped_update_preparation_refuses_search() {
+    // Spec: Library callers supplying a scoped USING dataset get the typed
+    // refusal from DELETE/INSERT WHERE before it can evaluate local search.
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut transaction = engine.transaction();
+    let mut dataset = crate::QueryDatasetSpecification::new();
+    dataset.set_default_graph(vec![nrese_rdf::NamedNode::new_unchecked("urn:ex:g").into()]);
+    dataset.include_scoped_inference();
+    let update = nrese_sparql_syntax::SparqlParser::new()
+        .parse_update(
+            r#"INSERT { <urn:ex:a> <urn:ex:p> ?o }
+               WHERE { ?o <http://www.bigdata.com/rdf/search#search> "alpha" }"#,
+        )
+        .unwrap();
+    let options = crate::UpdateOptions {
+        using: Some(dataset),
+        ..Default::default()
+    };
+    assert!(matches!(
+        crate::apply_update(&mut transaction, &update, &options),
+        Err(crate::UpdateError::Evaluation(
+            QueryEvaluationError::ScopedInferenceUnavailable("store.search_scope")
+        ))
+    ));
+}
+
+#[test]
 fn preparation_uses_the_executors_equality_view_at_the_probe_row_limit() {
     use nrese_engine::{EncodedTriple, QuadPattern};
     use nrese_rdf::NamedNodeRef;

@@ -153,7 +153,13 @@ impl GraphPattern {
     /// Whether `f` holds for this pattern or any node in it (depth first, `EXISTS`
     /// patterns included).
     pub fn find(&self, f: &mut impl FnMut(Node<'_>) -> bool) -> bool {
-        find(Node::Pattern(self), f)
+        find(Node::Pattern(self), |node| f(node).then_some(()), true).is_some()
+    }
+
+    /// Finds the first result in the local algebra, visiting SERVICE nodes
+    /// themselves while leaving their bodies to the endpoints.
+    pub fn find_local<'a, T>(&'a self, f: impl FnMut(Node<'a>) -> Option<T>) -> Option<T> {
+        find(Node::Pattern(self), f, false)
     }
 }
 
@@ -240,7 +246,7 @@ impl Expression {
     /// Whether `f` holds for this expression or any node in it (depth first, the patterns
     /// of `EXISTS` included).
     pub fn find(&self, f: &mut impl FnMut(Node<'_>) -> bool) -> bool {
-        find(Node::Expression(self), f)
+        find(Node::Expression(self), |node| f(node).then_some(()), true).is_some()
     }
 }
 
@@ -250,17 +256,24 @@ impl Expression {
 const FIND_INLINE: usize = 32;
 
 /// Depth first and left to right, with a stack of its own: any tree can be searched.
-fn find(node: Node<'_>, f: &mut impl FnMut(Node<'_>) -> bool) -> bool {
-    let mut stack: smallvec::SmallVec<[Node<'_>; FIND_INLINE]> = smallvec::smallvec![node];
+fn find<'a, T>(
+    node: Node<'a>,
+    mut f: impl FnMut(Node<'a>) -> Option<T>,
+    service_bodies: bool,
+) -> Option<T> {
+    let mut stack: smallvec::SmallVec<[Node<'a>; FIND_INLINE]> = smallvec::smallvec![node];
     while let Some(node) = stack.pop() {
-        if f(node) {
-            return true;
+        if let Some(found) = f(node) {
+            return Some(found);
+        }
+        if !service_bodies && matches!(node, Node::Pattern(GraphPattern::Service { .. })) {
+            continue;
         }
         let first = stack.len();
         node.each_child(|child| stack.push(child));
         stack[first..].reverse();
     }
-    false
+    None
 }
 
 impl<'a> Node<'a> {

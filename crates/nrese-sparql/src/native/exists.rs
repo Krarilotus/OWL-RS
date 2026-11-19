@@ -538,6 +538,7 @@ impl Context<'_> {
                 }
             }
             let substituted = super::substitute::Values::new(self, &terms)?.pattern(pattern);
+            self.check_scoped_operators(&substituted)?;
             let found = match graph {
                 Some(id) => self.in_graph(
                     GraphScope::Named(nrese_engine::TermId::from_raw(id)),

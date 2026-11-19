@@ -135,10 +135,7 @@ pub(super) fn is_search(triple: &TriplePattern, triples: &[TriplePattern]) -> bo
         || luc(triple) == Some("score")
         || (bds(triple).is_some()
             && triples.iter().any(|t| {
-                bds(t) == Some("search")
-                    && matches!(t.object, TermPattern::Literal(_))
-                    && subject_variable(&t.subject).is_some()
-                    && subject_variable(&t.subject) == subject_variable(&triple.subject)
+                bds_search(t).is_some_and(|(v, _)| Some(v) == subject_variable(&triple.subject))
             }))
 }
 
@@ -189,10 +186,21 @@ pub(super) fn as_written(
 }
 
 /// A `text:query`, or a GraphDB `luc:` search (`?x luc:index "query"`).
-fn is_jena(triple: &TriplePattern) -> bool {
+pub(super) fn is_jena(triple: &TriplePattern) -> bool {
     matches!(&triple.predicate, NamedNodePattern::NamedNode(n) if n.as_str() == JENA_QUERY)
         || (luc(triple).is_some_and(|name| !matches!(name, "score" | "snippet"))
             && matches!(triple.object, TermPattern::Literal(_)))
+}
+
+pub(super) fn invokes_search(triples: &[TriplePattern]) -> bool {
+    jena(triples).is_some() || triples.iter().any(|triple| bds_search(triple).is_some())
+}
+
+fn bds_search(triple: &TriplePattern) -> Option<(Variable, &Literal)> {
+    let (Some("search"), TermPattern::Literal(text)) = (bds(triple), &triple.object) else {
+        return None;
+    };
+    Some((subject_variable(&triple.subject)?, text))
 }
 
 /// The local name of a `luc:` predicate.
@@ -212,11 +220,7 @@ pub(super) fn split(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<Tripl
     };
     let jena_searches = searches.len();
     for triple in &triples {
-        if let (Some("search"), TermPattern::Literal(text), Some(matched)) = (
-            bds(triple),
-            &triple.object,
-            subject_variable(&triple.subject),
-        ) {
+        if let Some((matched, text)) = bds_search(triple) {
             searches.push(Search::new(matched, text.value().to_owned()));
         }
     }
@@ -338,9 +342,6 @@ fn lucene(text: &str) -> (String, bool) {
 /// that joins its literal to the subject (`?s <property> ?literal`), and the other triple
 /// patterns; `None` if there is none.
 fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> {
-    if !triples.iter().any(is_jena) {
-        return None;
-    }
     let (mut searches, mut joins, mut consumed) = (Vec::new(), Vec::new(), Vec::new());
     for (index, triple) in triples.iter().enumerate().filter(|(_, t)| is_jena(t)) {
         let n = searches.len();
@@ -351,28 +352,20 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
             _ => None,
         };
         // The subject: ?s, or (?s ?score ?literal ?graph ?property).
-        let (outputs, used) = match list(&triple.subject, triples) {
-            Some(found) => found,
-            None => (vec![triple.subject.clone()], Vec::new()),
-        };
+        let (outputs, used) = list(&triple.subject, triples)
+            .unwrap_or_else(|| (vec![triple.subject.clone()], Vec::new()));
         consumed.extend(used);
         let subject = outputs.first().cloned()?;
         // The object: "query", or (property? "query" limit? "name:value"*).
-        let (arguments, used) = match list(&triple.object, triples) {
-            Some(found) => found,
-            None => (vec![triple.object.clone()], Vec::new()),
-        };
+        let (arguments, used) = list(&triple.object, triples)
+            .unwrap_or_else(|| (vec![triple.object.clone()], Vec::new()));
         consumed.extend(used);
-        let mut arguments = arguments.into_iter().peekable();
-        let property = match arguments.peek() {
-            Some(TermPattern::NamedNode(p)) => {
-                let p = p.clone();
-                arguments.next();
-                Some(p)
-            }
-            _ => None,
+        let mut arguments = arguments.into_iter();
+        let (property, query) = match arguments.next()? {
+            TermPattern::NamedNode(property) => (Some(property), arguments.next()?),
+            query => (None, query),
         };
-        let Some(TermPattern::Literal(text)) = arguments.next() else {
+        let TermPattern::Literal(text) = query else {
             return None;
         };
         let (text, all_words) = lucene(text.value());
@@ -418,6 +411,7 @@ fn jena(triples: &[TriplePattern]) -> Option<(Vec<Search>, Vec<TriplePattern>)> 
         consumed.push(index);
         searches.push(search);
     }
+    let searches = (!searches.is_empty()).then_some(searches)?;
     let rest = triples
         .iter()
         .enumerate()
@@ -444,7 +438,7 @@ impl Context<'_> {
     /// once per search, before its scan; both [`Self::search`] and the per-graph search read
     /// it.
     fn found(&self, search: &Search, known: bool) -> NativeResult<Vec<nrese_engine::TextMatch>> {
-        if !known && !matches!(self.merge_set, Some(GraphSet::Scoped(_))) {
+        if !known {
             return Ok(Vec::new());
         }
         Ok(match self.search_in()? {
@@ -508,7 +502,10 @@ impl Context<'_> {
         };
         let plain = |scope| Ok(Some((None, scope)));
         match (&*self.graph.borrow(), &self.merge_set) {
-            (_, Some(GraphSet::Scoped(_))) => unreachable!("search_in refuses scoped searches"),
+            (_, Some(GraphSet::Scoped(_))) => Err(
+                crate::QueryEvaluationError::ScopedInferenceUnavailable("store.search_scope")
+                    .into(),
+            ),
             (GraphScope::Default, _) => plain(TextScope::Graphs(GraphSelector::Exact(
                 TermId::DEFAULT_GRAPH,
             ))),
