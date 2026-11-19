@@ -40,7 +40,7 @@ use nrese_sparql_syntax::term::{NamedNodePattern, TermPattern};
 
 use crate::results::QueryEvaluationError;
 
-use super::{Context, NativeResult, Solutions};
+use super::{Context, NativeResult, Solutions, pushdown};
 
 /// The virtual endpoint.
 pub(super) const SEARCH: &str = "urn:nrese:vector:search";
@@ -271,7 +271,8 @@ impl Context<'_> {
     }
 
     /// `Join(local, SERVICE nrv:search { inner })`. Where `local` is estimated to bind
-    /// many rows and the query vector is given, the search goes first: its hits, nearest
+    /// many rows, draws no value per evaluation (`RAND`, `BNODE`, …) and the query vector is
+    /// given, the search goes first: its hits, nearest
     /// first, are kept while `local` evaluated from the hit has rows (a probe per hit
     /// through the indexes), until `k` are kept; `local` is then the rows of those
     /// probes. The index is given `local`'s estimated rows as the vectors it accepts, so
@@ -284,8 +285,12 @@ impl Context<'_> {
     ) -> NativeResult<Solutions> {
         let search = parse(inner)?;
         let estimate = self.estimate(local);
+        // A `local` that draws a value per evaluation is evaluated once, as SPARQL does; per
+        // hit it would draw per hit.
         let probe_first = match &search.near {
-            Near::Vector(_) => estimate >= (PROBE_ABOVE * search.k) as f64,
+            Near::Vector(_) => {
+                estimate >= (PROBE_ABOVE * search.k) as f64 && !pushdown::draws_in(local)
+            }
             Near::Variable(_) => false,
         };
         if !probe_first {

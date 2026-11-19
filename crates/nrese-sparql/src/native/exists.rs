@@ -138,24 +138,32 @@ pub(super) fn correlation_safe(pattern: &GraphPattern, outer: &[Variable]) -> bo
 /// Every variable `pattern` mentions where the outside can see it (a subquery's own
 /// variables only if it projects them).
 pub(super) fn mentioned(pattern: &GraphPattern) -> Vec<Variable> {
-    let mut out = Vec::new();
+    let mut out = Walk::default();
     walk_pattern(pattern, &mut out);
-    out
+    out.variables
 }
 
-fn push(out: &mut Vec<Variable>, variable: &Variable) {
-    if !out.contains(variable) {
-        out.push(variable.clone());
+/// What a walk collects: the variables, and, where asked (`Some`), whether it met a call
+/// that draws a new value per evaluation.
+#[derive(Default)]
+struct Walk {
+    variables: Vec<Variable>,
+    draws: Option<bool>,
+}
+
+fn push(out: &mut Walk, variable: &Variable) {
+    if !out.variables.contains(variable) {
+        out.variables.push(variable.clone());
     }
 }
 
-fn walk_term(term: &TermPattern, out: &mut Vec<Variable>) {
+fn walk_term(term: &TermPattern, out: &mut Walk) {
     if let TermPattern::Variable(v) = term {
         push(out, v);
     }
 }
 
-fn walk_pattern(pattern: &GraphPattern, out: &mut Vec<Variable>) {
+fn walk_pattern(pattern: &GraphPattern, out: &mut Walk) {
     match pattern {
         GraphPattern::Bgp { patterns } => {
             for triple in patterns {
@@ -221,9 +229,13 @@ fn walk_pattern(pattern: &GraphPattern, out: &mut Vec<Variable>) {
                 walk_expression(e, out);
             }
         }
-        GraphPattern::Project { variables, .. } => {
+        GraphPattern::Project { variables, inner } => {
             for v in variables {
                 push(out, v);
+            }
+            // A subquery's own variables are hidden, but not what it draws.
+            if out.draws == Some(false) {
+                out.draws = Some(pushdown::draws_in(inner));
             }
         }
         GraphPattern::Distinct { inner }
@@ -256,12 +268,24 @@ fn walk_pattern(pattern: &GraphPattern, out: &mut Vec<Variable>) {
 
 /// The variables `expression` reads, those of its `EXISTS` patterns included.
 pub(super) fn deep_variables(expression: &Expression) -> Vec<Variable> {
-    let mut out = Vec::new();
+    let mut out = Walk::default();
     walk_expression(expression, &mut out);
-    out
+    out.variables
 }
 
-fn walk_expression(expression: &Expression, out: &mut Vec<Variable>) {
+/// [`deep_variables`], and whether `expression` draws a new value per evaluation
+/// (`RAND`, `UUID`, `STRUUID`, `BNODE`) anywhere, in an `EXISTS` and a subquery in one too:
+/// one walk for both.
+pub(super) fn reads_and_draws(expression: &Expression) -> (Vec<Variable>, bool) {
+    let mut out = Walk {
+        variables: Vec::new(),
+        draws: Some(false),
+    };
+    walk_expression(expression, &mut out);
+    (out.variables, out.draws == Some(true))
+}
+
+fn walk_expression(expression: &Expression, out: &mut Walk) {
     match expression {
         Expression::Variable(v) | Expression::Bound(v) => push(out, v),
         Expression::NamedNode(_) | Expression::Literal(_) => {}
@@ -293,7 +317,11 @@ fn walk_expression(expression: &Expression, out: &mut Vec<Variable>) {
             walk_expression(b, out);
             walk_expression(c, out);
         }
-        Expression::Coalesce(list) | Expression::FunctionCall(_, list) => {
+        Expression::Coalesce(list) => list.iter().for_each(|e| walk_expression(e, out)),
+        Expression::FunctionCall(function, list) => {
+            if let Some(draws) = &mut out.draws {
+                *draws = *draws || pushdown::draws(function);
+            }
             list.iter().for_each(|e| walk_expression(e, out));
         }
     }
@@ -586,7 +614,9 @@ impl Context<'_> {
         let mut read = Vec::new();
         for conjunct in &correlated {
             for v in deep_variables(conjunct) {
-                push(&mut read, &v);
+                if !read.contains(&v) {
+                    read.push(v);
+                }
             }
         }
         let keys: Vec<usize> = solutions

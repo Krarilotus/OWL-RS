@@ -12,9 +12,10 @@
 //! | `P1 UNION P2` | the union of both, each from the seed |
 //! | `OPTIONAL`, `BIND`, `FILTER` | inside, when every seed variable the part reads is certainly bound by the part it applies to (else the seed's value would change what it computes) |
 //!
-//! Anything else is evaluated alone and joined, and so is a pattern that draws a new value
-//! per evaluation anywhere (`RAND`, `BNODE`, …, in an `EXISTS` too): from the seed it would
-//! draw once per seed row, where SPARQL draws once per solution of the pattern. A join of
+//! Anything else is evaluated alone and joined, and so is a `FILTER`, `BIND` or OPTIONAL
+//! condition that draws a new value per evaluation (`RAND`, `BNODE`, …, in an `EXISTS`
+//! too): from the seed it would draw once per seed row, where SPARQL draws once per
+//! solution of its pattern. A subquery is evaluated alone anyway. A join of
 //! two groups starts with the one the statistics say is smaller, unless an ORDER BY inside
 //! either fixes the row order. The right side of an OPTIONAL is evaluated from the left
 //! side's distinct values of the variables the right side certainly binds.
@@ -25,8 +26,8 @@ use nrese_exec::{IdTable, UNDEF};
 use nrese_rdf::Variable;
 use nrese_sparql_syntax::algebra::{Expression, GraphPattern};
 
-use super::exists::deep_variables;
 use super::exists::mentioned;
+use super::exists::reads_and_draws;
 use super::{Context, NativeResult, PROBE_FACTOR, Solutions, as_path, bound_variables, pushdown};
 
 /// Whether an ORDER BY inside `pattern` fixes the order of its rows.
@@ -188,18 +189,16 @@ impl Context<'_> {
             let reached = self.path_from(&seed, &path)?;
             return self.join(seed, reached);
         }
-        // A value drawn per evaluation (`RAND`, `BNODE`, …) is drawn once per solution of
-        // the pattern, or per pair of its OPTIONAL, not once per seed row.
-        if pushdown::draws_in(pattern) {
-            return self.join_alone(seed, pattern);
-        }
+        // An expression that draws a value per evaluation (`RAND`, `BNODE`, …) runs once per
+        // solution of its pattern, or per pair of its OPTIONAL, not once per seed row: its
+        // part is evaluated alone. The walk for the variables it reads tells that too.
         match pattern {
             GraphPattern::Bgp { patterns } if self.probes_pay(&seed, patterns) => {
                 self.bgp_from(seed, patterns, &mut Vec::new())
             }
             GraphPattern::Filter { expr, inner } => {
-                let read = deep_variables(expr);
-                if !reads_only_bound(&read, &pushdown::certain(inner), &seed) {
+                let (read, draws) = reads_and_draws(expr);
+                if draws || !reads_only_bound(&read, &pushdown::certain(inner), &seed) {
                     return self.join_alone(seed, pattern);
                 }
                 if let GraphPattern::Bgp { patterns } = &**inner
@@ -259,10 +258,13 @@ impl Context<'_> {
                 expression,
             } => {
                 let mut read = mentioned(right);
+                let mut draws = false;
                 if let Some(expression) = expression {
-                    read.extend(deep_variables(expression));
+                    let (variables, drawn) = reads_and_draws(expression);
+                    read.extend(variables);
+                    draws = drawn;
                 }
-                if !reads_only_bound(&read, &pushdown::certain(left), &seed) {
+                if draws || !reads_only_bound(&read, &pushdown::certain(left), &seed) {
                     return self.join_alone(seed, pattern);
                 }
                 let left = self.eval_from(seed, left)?;
@@ -270,12 +272,10 @@ impl Context<'_> {
             }
             GraphPattern::Extend { inner, bindings }
                 if bindings.iter().all(|(variable, expression)| {
-                    seed.column(variable).is_none()
-                        && reads_only_bound(
-                            &deep_variables(expression),
-                            &pushdown::certain(inner),
-                            &seed,
-                        )
+                    seed.column(variable).is_none() && {
+                        let (read, draws) = reads_and_draws(expression);
+                        !draws && reads_only_bound(&read, &pushdown::certain(inner), &seed)
+                    }
                 }) =>
             {
                 let mut solutions = self.eval_from(seed, inner)?;
