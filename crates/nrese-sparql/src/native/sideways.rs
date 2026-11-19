@@ -10,12 +10,14 @@
 //! | property path | followed from the seed's values of its ends |
 //! | `P1 . P2` | `eval_from(eval_from(seed, P1), P2)` |
 //! | `P1 UNION P2` | the union of both, each from the seed |
-//! | `OPTIONAL`, `BIND`, `FILTER` | inside, when every seed variable the part reads is certainly bound by the part it applies to (else the seed's value would change what it computes), and a `BIND` or `FILTER` draws no new value per evaluation (`RAND`, `BNODE`, …: once per seed row would draw for each, where the group draws once per solution) |
+//! | `OPTIONAL`, `BIND`, `FILTER` | inside, when every seed variable the part reads is certainly bound by the part it applies to (else the seed's value would change what it computes) |
 //!
-//! Anything else is evaluated alone and joined. A join of two groups starts with the one
-//! the statistics say is smaller, unless an ORDER BY inside either fixes the row order.
-//! The right side of an OPTIONAL is evaluated from the left side's distinct values of the
-//! variables the right side certainly binds.
+//! Anything else is evaluated alone and joined, and so is a pattern that draws a new value
+//! per evaluation anywhere (`RAND`, `BNODE`, …, in an `EXISTS` too): from the seed it would
+//! draw once per seed row, where SPARQL draws once per solution of the pattern. A join of
+//! two groups starts with the one the statistics say is smaller, unless an ORDER BY inside
+//! either fixes the row order. The right side of an OPTIONAL is evaluated from the left
+//! side's distinct values of the variables the right side certainly binds.
 
 use std::collections::HashSet;
 
@@ -186,15 +188,18 @@ impl Context<'_> {
             let reached = self.path_from(&seed, &path)?;
             return self.join(seed, reached);
         }
+        // A value drawn per evaluation (`RAND`, `BNODE`, …) is drawn once per solution of
+        // the pattern, or per pair of its OPTIONAL, not once per seed row.
+        if pushdown::draws_in(pattern) {
+            return self.join_alone(seed, pattern);
+        }
         match pattern {
             GraphPattern::Bgp { patterns } if self.probes_pay(&seed, patterns) => {
                 self.bgp_from(seed, patterns, &mut Vec::new())
             }
             GraphPattern::Filter { expr, inner } => {
                 let read = deep_variables(expr);
-                if pushdown::draws(expr)
-                    || !reads_only_bound(&read, &pushdown::certain(inner), &seed)
-                {
+                if !reads_only_bound(&read, &pushdown::certain(inner), &seed) {
                     return self.join_alone(seed, pattern);
                 }
                 if let GraphPattern::Bgp { patterns } = &**inner
@@ -266,7 +271,6 @@ impl Context<'_> {
             GraphPattern::Extend { inner, bindings }
                 if bindings.iter().all(|(variable, expression)| {
                     seed.column(variable).is_none()
-                        && !pushdown::draws(expression)
                         && reads_only_bound(
                             &deep_variables(expression),
                             &pushdown::certain(inner),

@@ -330,12 +330,14 @@ pub(crate) fn per_solution(expression: &Expression) -> bool {
         .find(&mut |node| matches!(node, Node::Expression(Expression::Exists(_))) || draw(node))
 }
 
-/// Whether the expression gives a new value at each evaluation (`RAND`, `UUID`, `STRUUID`,
-/// `BNODE`): evaluated more or less often, it answers otherwise.
-pub(super) fn draws(expression: &Expression) -> bool {
-    expression.find(&mut draw)
+/// Whether `pattern` evaluates an expression that gives a new value at each evaluation
+/// (`RAND`, `UUID`, `STRUUID`, `BNODE`), in an `EXISTS` too: evaluated more or less often,
+/// it answers otherwise.
+pub(super) fn draws_in(pattern: &GraphPattern) -> bool {
+    pattern.find(&mut draw)
 }
 
+/// Whether `node` is a call that gives a new value at each evaluation.
 fn draw(node: Node<'_>) -> bool {
     matches!(
         node,
