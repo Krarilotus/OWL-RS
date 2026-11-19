@@ -888,7 +888,7 @@ pub async fn import(
     .await?;
     let reasoning = rematerialised(&state).await.map_err(|reason| {
         ApiError::internal(format!(
-            "the load was published at revision {}. Reasoning failed: {reason}. Don't send it again.",
+            "the load completed at published revision {}. Reasoning failed: {reason}. Don't send it again.",
             loaded.revision
         ))
     })?;
