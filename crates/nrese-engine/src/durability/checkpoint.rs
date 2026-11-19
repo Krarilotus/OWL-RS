@@ -737,6 +737,10 @@ pub(crate) fn write_parts<'a>(
     super::place::rename(&tmp, &path)?;
     #[cfg(test)]
     super::fault::check(&super::fault::FAIL_DIR_SYNC, "directory sync")?;
+    #[cfg(feature = "fault-points")]
+    if dir.join(".simulate-checkpoint-sync-failure").is_file() {
+        return Err(std::io::Error::other("simulated checkpoint sync failure").into());
+    }
     super::sync_dir(dir)?;
     tracing::debug!(
         revision,

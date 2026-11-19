@@ -6,6 +6,10 @@ rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+# Enables the CLI test hook for integration tests that run the binary.
+fault-points = ["nrese-store/fault-points"]
+
 [dependencies]
 # Replication's image transfer (src/replication.rs).
 tempfile = { workspace = true }

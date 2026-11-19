@@ -601,6 +601,10 @@ fn print_query(store: &StoreService, command: PrintQueryCommand) -> Result<()> {
 
 /// `nrese-server load`: bulk-loads files into the configured store and exits.
 fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
+    #[cfg(feature = "fault-points")]
+    if std::env::var_os("NRESE_TEST_FAIL_QUARANTINE_COMMIT").is_some() {
+        store.quarantine().fail_next_commit();
+    }
     let request = BulkLoadRequest {
         files: load.files,
         replace: load.replace,
