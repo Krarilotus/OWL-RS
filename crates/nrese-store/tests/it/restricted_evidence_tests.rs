@@ -231,6 +231,68 @@ fn dl_inconsistency_of_the_readable_graphs_is_explained() {
     assert!(reject.detail.contains("5 axiom(s)"), "{}", reject.detail);
 }
 
+/// A disjointness of three classes that names `:A` and `:B` twice, so each of them is
+/// empty, and `:U` their union; the commit puts `:x` in `:U`. The one justification has
+/// four axioms, two of them read from the disjointness, each with the whole list's
+/// statements among its sources.
+const DL_REPEAT_DATA: &str = "GRAPH :open { _:d a owl:AllDisjointClasses ; \
+     owl:members ( :A :B :C :A :B ) . :U owl:unionOf ( :A :B ) }";
+const DL_REPEAT_COMMIT: &str = "GRAPH :open { :x a :U }";
+
+/// The evidence each of `requesters` is shown for the inconsistency `DL_REPEAT_COMMIT`
+/// makes, on one store (its blank nodes' labels are the store's).
+fn dl_repeat_evidence(requesters: &[Requester]) -> Vec<Vec<nrese_reasoner::RejectEvidence>> {
+    let p = MutationPipeline::new(
+        Arc::new(StoreService::new(StoreConfig::in_memory()).expect("store")),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    );
+    p.apply(
+        update(DL_REPEAT_DATA),
+        &Requester::all(),
+        &MutationTicket::new(),
+    )
+    .expect("setup commits");
+    let evidence = |requester: &Requester| {
+        let reject = reject_on(&p, DL_REPEAT_COMMIT, requester);
+        assert!(reject.detail.contains("4 axiom(s)"), "{}", reject.detail);
+        reject.explanation.expect("explained").evidence
+    };
+    requesters.iter().map(evidence).collect()
+}
+
+/// Each source triple at most once, and the disjointness's own statement among them.
+fn each_triple_once(evidence: &[nrese_reasoner::RejectEvidence]) {
+    let mut seen = std::collections::BTreeSet::new();
+    for e in evidence {
+        let triple = (&e.subject, &e.predicate, &e.object);
+        assert!(seen.insert(triple), "{triple:?} twice in {evidence:#?}");
+    }
+    assert!(
+        evidence
+            .iter()
+            .any(|e| e.object.contains("AllDisjointClasses")),
+        "{evidence:#?}"
+    );
+}
+
+/// A committer who may read every graph is shown each source triple of the justification
+/// once, as one who may read only `:open` (where all of it is) is shown them, in the same
+/// order.
+#[test]
+fn dl_rejection_full_reader_shows_each_source_triple_once() {
+    let shown = dl_repeat_evidence(&[Requester::all(), open_reader()]);
+    each_triple_once(&shown[0]);
+    assert_eq!(shown[0], shown[1]);
+}
+
+/// Neighbour: the restricted committer is shown each source triple once.
+#[test]
+fn dl_rejection_restricted_reader_shows_each_source_triple_once() {
+    each_triple_once(&dl_repeat_evidence(&[open_reader()])[0]);
+}
+
 /// May read `:open` and the shapes graph.
 fn shapes_reader() -> Requester {
     let access = Arc::new(GraphAccess {
