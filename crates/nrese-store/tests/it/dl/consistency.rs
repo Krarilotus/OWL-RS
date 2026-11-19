@@ -14,7 +14,7 @@ use super::{ask, insert, pipeline, pipeline_with};
 
 /// `A ⊑ B ⊔ C`, `B` and `C` disjoint from `D`: an `A` that is a `D` has no model. RL
 /// can't use a union on the right, so only the DL engines see it.
-pub(crate) const UNION: &str = ":A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . \
+const UNION: &str = ":A owl:equivalentClass [ owl:unionOf ( :B :C ) ] . \
      :B owl:disjointWith :D . :C owl:disjointWith :D .";
 
 /// `A ⊑ ∃r.B ⊓ ∀r.C` with `B`, `C` disjoint: no `A` can exist. Horn; RL needs an `r`

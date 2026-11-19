@@ -166,18 +166,18 @@ fn open_only() -> Arc<GraphAccess> {
 /// A reserved name in a graph the reader can't read, the one part left out: a reader of
 /// `open` only is told no name of it anywhere, and no left-out sentence that names a term,
 /// through its read, its exact read and its own commit's rejection (which shows its own
-/// graphs' statements). A reader of every graph is told it, named, by both reads.
+/// graphs' statements). A reader of every graph is told it by each, in the same text.
 #[test]
 fn a_reader_of_some_graphs_is_told_no_name_from_the_left_out_sentence() {
     let dl = pipeline();
     insert(
         &dl,
-        "GRAPH :secret { rdfs:member rdfs:domain :Hidden . :h rdfs:member :hv . } \
+        "GRAPH :secret { rdfs:member rdfs:domain :Hidden ; owl:propertyDisjointWith :q . \
+         :q a owl:ObjectProperty . :h rdfs:member :hv . } \
          GRAPH :open { :A a owl:Class . :x a :A . }",
     )
     .expect("committed");
     let store = dl.store();
-    let member = format!("<{RDFS}member>");
     // A left-out sentence's first part, up to the text's next quote, naming a term.
     let names = |text: &str| {
         let parts = text.split("left out; first: ").skip(1);
@@ -186,53 +186,46 @@ fn a_reader_of_some_graphs_is_told_no_name_from_the_left_out_sentence() {
             .any(|s| s.contains('<'))
     };
     let leaks = |text: &str| text.contains("rdf-schema#member") || names(text);
-    let mut told = Vec::new();
-    for mode in [None, Some(DlAnswers::Exact)] {
-        let mut request = SparqlQueryRequest::new(
-            format!("{PREFIXES}ASK {{ :x a :C }}"),
-            ReadScope::Graphs(open_only()),
+    // Its read, its exact read, and its commit's rejection (an `rdfs:member` statement the
+    // secret graph makes disjoint from the commit's `:q`), as `requester` is told them.
+    let told = |requester: &Requester| {
+        let mut told = Vec::new();
+        for mode in [None, Some(DlAnswers::Exact)] {
+            let query = format!("{PREFIXES}ASK {{ :x a :C }}");
+            let mut request = SparqlQueryRequest::new(query, requester.read.clone());
+            request.dl_answers = mode;
+            let prepared = store.prepare_query(&request).expect("prepared");
+            let mut out = Vec::new();
+            told.push(match super::run_dl(store, &prepared, &mut out) {
+                Ok(status) => format!("{status:?}"),
+                Err(error) => error.to_string(),
+            });
+        }
+        let rejected = dl.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "{PREFIXES}INSERT DATA {{ GRAPH :open {{ :h :q :hv }} }}"
+            ))),
+            requester,
+            &MutationTicket::new(),
         );
-        request.dl_answers = mode;
-        let prepared = store.prepare_query(&request).expect("prepared");
-        let mut out = Vec::new();
-        told.push(match super::run_dl(store, &prepared, &mut out) {
-            Ok(status) => format!("{status:?}"),
-            Err(error) => error.to_string(),
-        });
-    }
+        let Err(MutationError::Rejected(reject)) = rejected else {
+            panic!("expected a rejection, got {rejected:?}");
+        };
+        told.push(format!("{reject:?}"));
+        told
+    };
     let committer = Requester::new(
         ReadScope::Graphs(open_only()),
         WriteScope::Graphs(open_only()),
     );
-    let rejected = dl.apply(
-        MutationCommand::Update(SparqlUpdateRequest::new(format!(
-            "{PREFIXES}INSERT DATA {{ GRAPH :open {{ :C owl:disjointWith :D . :y a :C , :D }} }}"
-        ))),
-        &committer,
-        &MutationTicket::new(),
-    );
-    let Err(MutationError::Rejected(reject)) = rejected else {
-        panic!("expected a rejection, got {rejected:?}");
-    };
-    told.push(format!("{reject:?}"));
-    let wrong: Vec<_> = told.iter().filter(|t| leaks(t)).collect();
+    let shown = told(&committer);
+    let wrong: Vec<_> = shown.iter().filter(|t| leaks(t)).collect();
     assert!(wrong.is_empty(), "{wrong:#?}");
-    // The control on the same words: a reader of every graph is told the reserved name, in
-    // each left-out sentence of its read and of its exact read.
-    let read = query_with(&dl, "ASK { :x a :C }", None).expect("read").1;
-    let exact = match query_with(&dl, "ASK { :x a :C }", Some(DlAnswers::Exact)) {
-        Err(StoreError::Incomplete(answer)) => answer.status.reasons,
-        other => panic!("the exact read is refused, not {other:?}"),
-    };
-    let exact: Vec<String> = exact.into_iter().map(|r| r.text).collect();
-    for all in [read.reasons(), exact] {
-        let told = firsts(all.iter().map(String::as_str));
-        let named = told.len() >= 2
-            && told
-                .iter()
-                .all(|s| in_words(s) && s.contains(member.as_str()));
-        assert!(named, "a reader of every graph: {all:?}");
-    }
+    // The controls, on the same texts by the same predicate: a reader of every graph is told
+    // the reserved name by each.
+    let full = told(&Requester::all());
+    let unnamed: Vec<_> = full.iter().filter(|t| !leaks(t)).collect();
+    assert!(unnamed.is_empty(), "{unnamed:#?}");
 }
 
 /// A read that makes the sentence itself (a revision no commit here recorded: the store
