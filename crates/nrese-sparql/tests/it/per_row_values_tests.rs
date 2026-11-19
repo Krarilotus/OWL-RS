@@ -142,7 +142,7 @@ fn an_exists_drawing_a_value_draws_once_per_solution_of_its_group() {
     for as_written in [false, true] {
         for _ in 0..5 {
             let n = rows(&query, as_written);
-            assert!(n % 2 == 0, "{n} rows, as written: {as_written}");
+            assert!(n.is_multiple_of(2), "{n} rows, as written: {as_written}");
         }
     }
 }
