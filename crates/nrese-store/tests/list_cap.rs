@@ -250,7 +250,7 @@ fn aliases() -> String {
 #[test]
 fn a_list_follows_its_member_when_an_alias_goes() {
     for mode in MODES {
-        let case = format!("{mode}");
+        let case = mode.to_string();
         let (store, commits) = store_and_pipeline(mode);
         for body in [
             "INSERT DATA { ex:a0 ex:r ex:z . }".to_owned(),
