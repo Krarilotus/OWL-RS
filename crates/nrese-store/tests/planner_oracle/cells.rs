@@ -72,13 +72,11 @@ fn values_inside_a_group_count_only_at_that_site() {
 }
 
 #[test]
-#[ignore = "an EXISTS that draws decides once for all the rows it tests"]
 fn exists_draws_independently_for_each_tested_row() {
     drawing("exists-independent");
 }
 
 #[test]
-#[ignore = "left rows with the same correlated values share one right-side draw"]
 fn lateral_draws_for_each_left_row() {
     drawing("lateral-draw");
 }
@@ -97,7 +95,6 @@ fn vector_hits_copy_the_draw_from_an_unrelated_group() {
 }
 
 #[test]
-#[ignore = "a vector search that goes first evaluates a group sharing no variable with the hit once per hit"]
 fn a_group_beside_a_vector_search_draws_once_for_all_hits() {
     if unsupported(generator::VECTOR_INDEX, NO_VECTORS) {
         return;
@@ -106,13 +103,11 @@ fn a_group_beside_a_vector_search_draws_once_for_all_hits() {
 }
 
 #[test]
-#[ignore = "SERVICE evaluates its pattern again for each batch of bound values it sends"]
 fn a_remote_solution_draws_once_even_if_joined_in_batches() {
     drawing("service-batches");
 }
 
 #[test]
-#[ignore = "streamed AVG can evaluate its argument separately for the sum and the count"]
 fn streamed_average_uses_the_same_arguments_for_sum_and_count() {
     drawing("average-draw");
 }
