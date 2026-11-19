@@ -1551,7 +1551,7 @@ fn a_list_axiom_the_rules_leave_out_leaves_the_rl_route() {
         ),
         (
             "chain 7",
-            aliased_chain(false).replace("owl:sameAs", ":alias"),
+            aliased_chain(false).replace("owl:sameAs _:l", ":alias _:n"),
             "ASK { :a0 :p :a7 }",
             true,
         ),
@@ -1580,6 +1580,45 @@ fn a_list_axiom_the_rules_leave_out_leaves_the_rl_route() {
             if !honest {
                 wrong.push(line);
             }
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The chain `:p ← :q1 ∘ :q2` written cell by cell, its second cell the same as its first
+/// (`_:l2 owl:sameAs _:l1`), and the paths `:a0 :q1 :a1 :q2 :a2` and `:b0 :q1 :b1`. OWL 2 DL
+/// reads no such ontology (*Mapping to RDF* §3: a cell is named only by its list); the rules
+/// equate the cells (`eq-rep-s`, `eq-rep-o`) and read the chain as every word of `:q1` and
+/// `:q2`, so they derive `:b0 :p :b1`, which the chain as written doesn't give. On a commit and
+/// on a read of data that came past the gates, the reader reports the cell: the ontology
+/// leaves the rules' route, the read's status names the report, and `:b0 :p :b1` is never a
+/// sound `true`.
+#[test]
+fn a_list_cell_outside_its_list_leaves_the_rl_route_and_is_told() {
+    const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
+    let data = format!(
+        ":p owl:propertyChainAxiom _:l1 . _:l1 <{RDF}first> :q1 ; <{RDF}rest> _:l2 . \
+         _:l2 <{RDF}first> :q2 ; <{RDF}rest> <{RDF}nil> . _:l2 owl:sameAs _:l1 . \
+         :a0 :q1 :a1 . :a1 :q2 :a2 . :b0 :q1 :b1 ."
+    );
+    let mut wrong = Vec::new();
+    for path in ["commit", "read"] {
+        let dl = pipeline();
+        if path == "commit" {
+            insert(&dl, &data).expect("committed");
+        } else {
+            let turtle = format!("{}{data}", super::PREFIXES);
+            crate::support::load_past_the_pipeline(dl.store(), &turtle);
+            dl.store().rematerialise(rl_rules()).expect("rebuilt");
+        }
+        let (rows, status) = query(&dl, "ASK { :b0 :p :b1 }");
+        let route = dl.store().dl_bounds().last;
+        let reasons = status.reasons();
+        let line = format!("{path}: route {route}, {rows:?}, {reasons:?}");
+        eprintln!("CELL {line}");
+        let named = (reasons.iter()).any(|r| r.contains("a list's cell used outside its list"));
+        if route == "rules" || !named || (rows == ["true"] && status.shared.sound) {
+            wrong.push(line);
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
