@@ -226,11 +226,13 @@ impl Kinds {
         })
     }
 
-    /// Whether `t` is a list's cell in `tx`'s view: a blank node with an asserted `rdf:first`
-    /// (one probe of the index, pending changes included). The reader reports a cell that a
+    /// Whether `t` is a list's cell at `tx`'s base: a blank node with an asserted `rdf:first`
+    /// there (one probe of the committed index; the pending changes aren't scanned, so a
+    /// commit's cost stays linear in its statements). The reader reports a cell that a
     /// statement outside its list names (`Ontology::list_cell_outside`), so such a statement
-    /// is read. Without `rdf:first` in the dictionary at the route's revision there was no
-    /// cell then, and a pending one's own `rdf:first` statement isn't kept.
+    /// is read. A cell new in the commit has its own pending `rdf:first`, which
+    /// [`changes_schema`] already sends to the reader; without `rdf:first` in the dictionary
+    /// at the route's revision there was no cell at the base.
     fn cell(&self, tx: &Transaction<'_>, t: u64) -> bool {
         let id = TermId::from_raw(t);
         let Some(first) = self.first else {
@@ -241,9 +243,9 @@ impl Kinds {
         }
         let mut pattern = nrese_engine::QuadPattern::all();
         (pattern.subject, pattern.predicate) = (Some(id), Some(TermId::from_raw(first)));
-        (tx.quads_for_pattern_in(ReadModel::Asserted, &pattern))
-            .next()
-            .is_some()
+        let base = tx.base();
+        let mut found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+        found.next().is_some()
     }
 
     /// Whether an asserted triple, inserted or deleted, leaves every term the kinds the

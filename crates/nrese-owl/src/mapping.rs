@@ -2017,7 +2017,7 @@ impl<'a> Reader<'a> {
     /// The source and property of the main triple `node` reifies, where it is an annotated
     /// axiom's reification (*Mapping to RDF* §2.3.1, Table 17): a blank node typed `owl:Axiom`
     /// with one `owl:annotatedSource`, one `owl:annotatedProperty` and one
-    /// `owl:annotatedTarget`. Its statements read once.
+    /// `owl:annotatedTarget`. Its statements read once, none past a role's second value.
     fn reified_axiom(&self, node: Term) -> Option<[Term; 2]> {
         let v = self.v;
         if self.kind(node) != TermKind::Blank {
@@ -2028,19 +2028,18 @@ impl<'a> Reader<'a> {
             v.owl_annotated_property,
             v.owl_annotated_target,
         ];
-        let (mut typed, mut parts) = (false, [Vec::new(), Vec::new(), Vec::new()]);
+        let (mut typed, mut parts) = (false, [None; 3]);
         for &(p, o, _) in self.by_subject.get(&node).into_iter().flatten() {
             typed |= is(p, v.rdf_type) && is(o, v.owl_axiom);
-            if let Some(i) = roles.iter().position(|&r| is(p, r))
-                && !parts[i].contains(&o)
-            {
-                parts[i].push(o);
+            if let Some(i) = roles.iter().position(|&r| is(p, r)) {
+                // A second value: no reification of one main triple.
+                if parts[i].replace(o).is_some_and(|before| before != o) {
+                    return None;
+                }
             }
         }
         match parts {
-            [s, p, t] if typed && s.len() == 1 && p.len() == 1 && t.len() == 1 => {
-                Some([s[0], p[0]])
-            }
+            [Some(s), Some(p), Some(_)] if typed => Some([s, p]),
             _ => None,
         }
     }
