@@ -295,6 +295,7 @@ pub(super) struct StoreRecord<const N: usize> {
     pub delivery: Option<Delivery>,
     pub terminal_write: Option<TerminalWrite>,
     pub at_swap: Option<(Id, Id)>,
+    pub preclaim_drop: Option<(Id, bool)>,
     pub idle_removal: Option<Id>,
     pub write: Option<(bool, bool, bool)>,
 }
@@ -310,6 +311,7 @@ impl<const N: usize> Default for StoreRecord<N> {
             delivery: None,
             terminal_write: None,
             at_swap: None,
+            preclaim_drop: None,
             idle_removal: None,
             write: None,
         }
@@ -588,7 +590,9 @@ pub(super) fn i9<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
 pub(super) fn i10<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) -> bool {
     let txn = store.transaction(client);
     let written = txn.applied | txn.publication.map_or(0, |publication| publication.tags);
-    if client.abandoned & txn.dropped_unclaimed & written != 0 {
+    if store.preclaim_drop == Some((client.transaction, false))
+        || client.abandoned & txn.dropped_unclaimed & written != 0
+    {
         return false;
     }
     if let Some(slot) = txn.cancelled_switch.filter(|_| client.abandoned_read) {

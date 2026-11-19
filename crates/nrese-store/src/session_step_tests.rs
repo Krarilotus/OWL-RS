@@ -49,6 +49,7 @@ const CHANGE_REMOVES: u8 = 27;
 const READ_DROP_WITHOUT_CANCEL: u8 = 28;
 const PING_WITHOUT_TOUCH: u8 = 29;
 const SWAP_ANSWERS_WRITE: u8 = 30;
+const PING_APPENDS: u8 = 31;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Request {
@@ -419,7 +420,8 @@ impl<const N: usize> World<N> {
             REPLACEMENT_WITHOUT_RETIRE
             | COMMIT_DROP_CANCELS
             | CHANGE_REMOVES
-            | SWAP_ANSWERS_WRITE => Some(Invariant::InvalidTransition),
+            | SWAP_ANSWERS_WRITE
+            | PING_APPENDS => Some(Invariant::InvalidTransition),
             UNKNOWN_ROLLBACK
             | JOIN_ANSWER
             | STALE_LOOKUP
@@ -532,6 +534,13 @@ impl StepUse {
         use Effect::*;
         match self {
             Self::Begin => effect == Create,
+            Self::Request if event == Event::Action(Action::Ping) => {
+                if matches!(input, State::U | State::P) {
+                    effect == Touch
+                } else {
+                    effect == None
+                }
+            }
             Self::Request => matches!(
                 effect,
                 None | Touch
@@ -729,6 +738,7 @@ fn transition<const MUTATION: u8>(state: State, event: Event) -> Transition {
         (READ_DROP_WITHOUT_CANCEL, State::S, Event::Dropped) => result.effect = Effect::None,
         (PING_WITHOUT_TOUCH, State::U, Event::Action(Action::Ping)) => result.effect = Effect::None,
         (SWAP_ANSWERS_WRITE, State::Pw, Event::Swapped) => result.answer = Answer::WriteOk,
+        (PING_APPENDS, State::U, Event::Action(Action::Ping)) => result.effect = Effect::Append,
         _ => {}
     }
     Transition {
@@ -1119,6 +1129,7 @@ impl<const N: usize> World<N> {
         mut report: impl FnMut(ReportedAnswer),
     ) {
         self.store.at_swap = None;
+        self.store.preclaim_drop = None;
         match action {
             Move::Lookup(id, op) => {
                 let rights = self.rights;
@@ -1202,6 +1213,11 @@ impl<const N: usize> World<N> {
                 session.tasks[slot].as_mut().unwrap().awaiting = false;
                 if result.effect == Effect::TryCancel {
                     session.try_cancel(slot);
+                }
+                if task.phase == Phase::Pending {
+                    let cancelled = session.tasks[slot].unwrap().phase
+                        == Phase::Ended(End::Failed(Failure::Status(408)));
+                    self.store.preclaim_drop = Some((id, cancelled));
                 }
             }
             Move::DropWaiting(id) => {
@@ -1790,6 +1806,7 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
             }
         }
         next.store.at_swap = None;
+        next.store.preclaim_drop = None;
         next
     }
 
@@ -2048,6 +2065,18 @@ fn explorer_rejects_rollback_removing_a_failed_tombstone() {
 #[test]
 fn explorer_rejects_an_unclaimed_write_after_handler_drop() {
     red::<DROP_WITHOUT_CANCEL>("I10");
+
+    // A pending drop must win even on a schedule that never swaps the write.
+    type MissingCancel = Sessions<2, DROP_WITHOUT_CANCEL, DROP_WITHOUT_CANCEL>;
+    let mut world = MissingCancel::start();
+    for action in [
+        Move::Lookup(1, Op::Write),
+        Move::SessionLock(1),
+        Move::DropTaskRequest(1, 0),
+    ] {
+        world = MissingCancel::apply(&world, &action);
+    }
+    assert_eq!(world.violation, Some(Invariant::I10));
 }
 
 // X4: replacement retires the old map through its returned effect.
@@ -2113,6 +2142,12 @@ fn explorer_rejects_ping_without_idle_refresh() {
 #[test]
 fn explorer_rejects_write_reply_on_worker_swap() {
     red::<SWAP_ANSWERS_WRITE>("InvalidTransition");
+}
+
+// Review R3-S1, U5: PING refreshes the deadline without appending an intent.
+#[test]
+fn explorer_rejects_append_on_ping() {
+    red::<PING_APPENDS>("InvalidTransition");
 }
 
 #[test]
