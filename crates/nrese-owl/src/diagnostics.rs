@@ -17,7 +17,8 @@ pub enum Treatment {
     Fatal,
     /// Off the rules route with its reason ([`Diagnostic::reads_otherwise`]): no answer drawn
     /// from the rules told sound, and a clash only the rules find undecided; the read
-    /// ontology's consistency stays decided.
+    /// ontology's consistency stays decided, but for a name of two kinds an axiom reads
+    /// ([`Diagnostic::joins_kinds`]).
     OffRoute,
     /// Counted, the route kept.
     Counted,
@@ -43,8 +44,12 @@ impl From<Strict> for Treatment {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Treatments {
     /// A name of two kinds that an axiom other than an assertion names in one of them
-    /// ([`Diagnostic::TwoKinds`] `by_axiom`). Default fatal: the rules apply that axiom to the
-    /// other kind's statements, so a model of the read axioms certifies nothing of the source.
+    /// ([`Diagnostic::TwoKinds`] `by_axiom`). Either way off the route, with its consistency
+    /// unknown: the DL engines read the name as one ([`Diagnostic::joins_kinds`]), so no
+    /// verdict of theirs, consistent or inconsistent, speaks of the source. `Fatal` adds what
+    /// [`Diagnostic::is_fatal`] adds: a part counted as left out, which no task certifies.
+    /// Default fatal: the rules apply that axiom to the other kind's statements, so a model of
+    /// the read axioms certifies nothing of the source.
     pub two_kinds_by_axiom: Strict,
     /// A name of two kinds used only in assertions and statements read past. Default counted:
     /// only the rules for equality read the name, and they copy an object or a data assertion
@@ -257,6 +262,14 @@ impl Diagnostic {
             | Self::Reserved { .. }
             | Self::Rule { .. } => false,
         }
+    }
+
+    /// Whether the DL engines read one name where OWL 2 DL keeps two kinds apart: a name of two
+    /// kinds an axiom reads ([`Diagnostic::TwoKinds`] `by_axiom`), whatever its [`Treatment`].
+    /// The engines then read its uses of both kinds as one name's, so no verdict of theirs on
+    /// the read ontology's consistency speaks of the source.
+    pub fn joins_kinds(&self) -> bool {
+        matches!(self, Self::TwoKinds { by_axiom: true, .. })
     }
 
     /// What it is, in words, its terms as `name` writes them (the reader has no dictionary).
