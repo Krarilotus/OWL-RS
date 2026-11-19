@@ -362,7 +362,8 @@ impl Context<'_> {
 /// for a SELECT, the names its answer shows, in order: the pattern numbers its variables
 /// (parts of renamed queries share answers), but these bytes hold the names in their header.
 /// `None` if the query isn't cached (no cache, a volatile query, pre-bound variables). These
-/// are its part bytes: the cache keys them by the admission's snapshot.
+/// are its part bytes: the cache keys them by the admission's snapshot. The mode the query is
+/// evaluated in ([`Context::for_query`]) is not among them: it follows from them.
 pub(crate) fn output_key(
     snapshot: &nrese_engine::Snapshot,
     query: &nrese_sparql_syntax::Query,
@@ -374,11 +375,12 @@ pub(crate) fn output_key(
     if options.pre_bound.is_some() {
         return None;
     }
-    let ctx = Context::new(
+    let ctx = Context::in_mode(
         snapshot,
         options,
         super::query_dataset(query),
         super::query_base(query),
+        options.as_written,
     );
     // A canonical view the budgets refused: the answer is that refusal, never a cached one
     // (the context reads the snapshot as given meanwhile).

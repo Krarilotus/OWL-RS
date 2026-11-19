@@ -142,6 +142,52 @@ pub(super) fn is_search(triple: &TriplePattern, triples: &[TriplePattern]) -> bo
             }))
 }
 
+/// Whether `iri` is a search vocabulary's: a predicate the query writes with it is a search
+/// (or its option). Only the query, the request or evaluation puts one in a predicate:
+/// preparation's rewrites (QL, canonical names) never make or unmake one.
+pub(super) fn names_search(iri: &str) -> bool {
+    iri == JENA_QUERY || iri.starts_with(BDS) || iri.starts_with(LUC)
+}
+
+/// Whether a query is evaluated as written: asked so in `options`, or its pattern may hold a
+/// search anywhere, in an `EXISTS` too. A search reads the group it is written in whole,
+/// which the rewrites and routes that move triple patterns between groups don't know.
+/// "May": a triple pattern whose predicate is a search vocabulary's IRI, whatever its
+/// object, or a variable a value is put in for at evaluation, whatever that value's source
+/// (the query, the data, an expression): a pre-bound one, or one in a `LATERAL`'s right
+/// side or an `EXISTS`, which evaluation substitutes. Elsewhere a variable predicate is
+/// joined, never put in, so it reads stored statements however the query is planned.
+pub(super) fn as_written(
+    pattern: &nrese_sparql_syntax::algebra::GraphPattern,
+    options: &crate::QueryOptions,
+) -> bool {
+    use nrese_sparql_syntax::{
+        algebra::{Expression, GraphPattern},
+        visit::Node,
+    };
+    let pre_bound = options.pre_bound.as_deref();
+    let may_search = |patterns: &[TriplePattern], substituted: bool| {
+        patterns.iter().any(|t| match &t.predicate {
+            NamedNodePattern::NamedNode(n) => names_search(n.as_str()),
+            NamedNodePattern::Variable(v) => {
+                substituted || pre_bound.is_some_and(|values| values.contains_key(v))
+            }
+        })
+    };
+    let substituted = |inner: &GraphPattern| {
+        inner.find(&mut |node| {
+            matches!(node, Node::Pattern(GraphPattern::Bgp { patterns }) if may_search(patterns, true))
+        })
+    };
+    options.as_written
+        || pattern.find(&mut |node| match node {
+            Node::Pattern(GraphPattern::Bgp { patterns }) => may_search(patterns, false),
+            Node::Pattern(GraphPattern::Lateral { right, .. }) => substituted(right),
+            Node::Expression(Expression::Exists(inner)) => substituted(inner),
+            _ => false,
+        })
+}
+
 /// A `text:query`, or a GraphDB `luc:` search (`?x luc:index "query"`).
 fn is_jena(triple: &TriplePattern) -> bool {
     matches!(&triple.predicate, NamedNodePattern::NamedNode(n) if n.as_str() == JENA_QUERY)

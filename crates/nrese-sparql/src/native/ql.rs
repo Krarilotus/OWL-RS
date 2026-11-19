@@ -855,7 +855,10 @@ impl Rewriter<'_> {
             // class atoms still read the schema (`⊤ ⊑ A`, no data).
             let typed = matches!(&triple.predicate,
                 NamedNodePattern::NamedNode(p) if p.as_str() == RDF_TYPE);
+            // A search the query writes is kept as written, whatever the schema says of its
+            // predicate (`search::names_search`).
             let predicate = match &triple.predicate {
+                NamedNodePattern::NamedNode(p) if super::search::names_search(p.as_str()) => None,
                 NamedNodePattern::NamedNode(p) => {
                     self.snapshot.lookup(p.as_ref().into()).map(TermId::raw)
                 }
@@ -921,8 +924,18 @@ impl Rewriter<'_> {
         let merged = |v: u32| branch.merged.iter().find(|(m, _)| *m == v).map(|(_, t)| *t);
         let mut triples = Vec::new();
         let mut unions = Vec::new();
-        // Terms that must be individuals: no literal (`Part::Top`).
+        // Terms that must be individuals: no literal (`Part::Top`); and the predicates kept
+        // as variables bound to a search vocabulary's IRI ([`stored`]).
         let mut individuals: Vec<Expression> = Vec::new();
+        let mut kept = Vec::new();
+        let count = std::cell::Cell::new(0);
+        let made = || {
+            count.set(count.get() + 1);
+            nrese_sparql_syntax::internal::variable(
+                "ql-predicate",
+                format_args!("{}.{}", names.pattern, count.get()),
+            )
+        };
         for part in &branch.parts {
             match part {
                 Part::Top(t) => match self.term(*t, names) {
@@ -949,7 +962,8 @@ impl Rewriter<'_> {
                         }
                     };
                     let triple = &patterns[*n];
-                    triples.push(TriplePattern {
+                    let written = triple.predicate.clone();
+                    let triple = TriplePattern {
                         subject: replace(&triple.subject),
                         predicate: match &triple.predicate {
                             NamedNodePattern::Variable(v) => {
@@ -962,15 +976,42 @@ impl Rewriter<'_> {
                             p => p.clone(),
                         },
                         object: replace(&triple.object),
-                    });
+                    };
+                    // Only a predicate the rewriting put in: one the query writes stays.
+                    match written {
+                        NamedNodePattern::Variable(v) => match stored(triple, || v.clone()) {
+                            (triple, Some(bound)) => {
+                                // The query's own variable, kept: bound here, not after.
+                                individuals.push(bound);
+                                kept.push(v);
+                                triples.push(triple);
+                            }
+                            (triple, None) => triples.push(triple),
+                        },
+                        _ => triples.push(triple),
+                    }
                 }
-                Part::Atom(atom) => triples.push(self.triple(atom, names)),
+                Part::Atom(atom) => {
+                    let (triple, bound) = stored(self.triple(atom, names), made);
+                    individuals.extend(bound);
+                    triples.push(triple);
+                }
                 Part::Any(alternatives) => {
                     let union = GraphPattern::union_all(
                         alternatives
                             .iter()
-                            .map(|a| GraphPattern::Bgp {
-                                patterns: vec![self.triple(a, names)],
+                            .map(|a| {
+                                let (triple, bound) = stored(self.triple(a, names), made);
+                                let bgp = GraphPattern::Bgp {
+                                    patterns: vec![triple],
+                                };
+                                match bound {
+                                    Some(expr) => GraphPattern::Filter {
+                                        expr,
+                                        inner: Box::new(bgp),
+                                    },
+                                    None => bgp,
+                                }
                             })
                             .collect(),
                     );
@@ -997,6 +1038,9 @@ impl Rewriter<'_> {
             let TermPattern::Variable(variable) = &names.terms[v as usize] else {
                 continue;
             };
+            if kept.contains(variable) {
+                continue;
+            }
             let expression = match self.term(to, names) {
                 TermPattern::Variable(w) => Expression::Variable(w),
                 TermPattern::NamedNode(n) => Expression::NamedNode(n),
@@ -1037,6 +1081,28 @@ impl Rewriter<'_> {
                 _ => unreachable!("constants are the query's terms"),
             },
         }
+    }
+}
+
+/// `triple` as a read of stored statements where the rewriting put a search vocabulary's
+/// IRI in its predicate: the predicate becomes a variable (`made`) bound to that IRI, as a
+/// variable predicate is joined, so the rewriting never makes a search the query doesn't
+/// write (`search::names_search`). The binding to filter the triple's group by, if any.
+fn stored(
+    mut triple: TriplePattern,
+    made: impl FnOnce() -> Variable,
+) -> (TriplePattern, Option<Expression>) {
+    match &triple.predicate {
+        NamedNodePattern::NamedNode(n) if super::search::names_search(n.as_str()) => {
+            let variable = made();
+            let bound = Expression::SameTerm(
+                Box::new(Expression::Variable(variable.clone())),
+                Box::new(Expression::NamedNode(n.clone())),
+            );
+            triple.predicate = NamedNodePattern::Variable(variable);
+            (triple, Some(bound))
+        }
+        _ => (triple, None),
     }
 }
 
