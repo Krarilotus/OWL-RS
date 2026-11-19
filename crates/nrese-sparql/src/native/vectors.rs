@@ -298,6 +298,7 @@ impl Context<'_> {
             unreachable!("checked above")
         };
         self.check()?;
+        let start = std::time::Instant::now();
         // The hits are probed against `local` after the search, so the index sees no
         // filter; it is told how many vectors `local` is estimated to accept, so that its
         // beam is widened by the inverse share as for a filter it applies itself. Without
@@ -367,6 +368,14 @@ impl Context<'_> {
                 return Err(error);
             }
         };
+        let detail = "the search first, the pattern beside it probed per hit".to_owned();
+        self.note(
+            "vector search first",
+            detail,
+            None,
+            local.table.len(),
+            start,
+        );
         self.join(local, found)
     }
 
