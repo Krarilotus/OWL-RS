@@ -2,16 +2,44 @@
 //! `spawn_blocking` task, a store's build thread); its first [`Guard::end`] is the end, and a
 //! guard dropped before any end records what its fallback returns then, so a panic, a
 //! cancelled task or an early return still ends the operation. Readers ([`Terminal`]) read it
-//! or wait for it, always with a deadline of their own.
+//! or wait for it, on a thread or in a task, always with a deadline of their own.
 //!
 //! It owns no state machine: each owner keeps its own steps; the guard only makes the end
-//! total. No code of the caller's runs under the lock: the end is kept as an `Arc`, and `O`
-//! is cloned after the lock is released.
+//! total. No code of the caller's runs under the lock: the end is kept as an `Arc`, `O` is
+//! cloned after the lock is released, and wakers are woken after it.
 
+use std::future::poll_fn;
+use std::pin::pin;
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::task::{Poll, Waker, ready};
 use std::time::{Duration, Instant};
 
-type Shared<O> = Arc<(Mutex<Option<Arc<O>>>, Condvar)>;
+type Shared<O> = Arc<(Mutex<State<O>>, Condvar)>;
+
+/// The end, once recorded, and until then the async waiters' wakers, each under the id of the
+/// `wait_or` future that registered it.
+struct State<O> {
+    end: Option<Arc<O>>,
+    wakers: Vec<(u64, Waker)>,
+    next: u64,
+}
+
+/// A `wait_or` future's place in the waker list, emptied when the future completes or is
+/// dropped, so waits given up leave nothing behind.
+struct Slot<'a, O> {
+    shared: &'a Shared<O>,
+    id: Option<u64>,
+}
+
+impl<O> Drop for Slot<'_, O> {
+    fn drop(&mut self) {
+        let Some(id) = self.id else { return };
+        let mut state = lock(&self.shared.0);
+        let at = state.wakers.iter().position(|(slot, _)| *slot == id);
+        let _removed = at.map(|at| state.wakers.swap_remove(at));
+        drop(state); // The waker is dropped after the lock is released.
+    }
+}
 
 /// The longest single wait underneath `wait_until`: a far deadline becomes several finite
 /// waits, never one the platform reads as untimed (Windows does above about 49.7 days).
@@ -36,7 +64,14 @@ where
     F: FnOnce() -> O + Send + 'static,
 {
     let guard = Guard {
-        shared: Arc::new((Mutex::new(None), Condvar::new())),
+        shared: Arc::new((
+            Mutex::new(State {
+                end: None,
+                wakers: Vec::new(),
+                next: 0,
+            }),
+            Condvar::new(),
+        )),
         fallback: Some(Box::new(fallback)),
     };
     (guard.terminal(), guard)
@@ -52,7 +87,7 @@ pub struct Terminal<O> {
 impl<O: Clone> Terminal<O> {
     /// The recorded end, if there is one.
     pub fn get(&self) -> Option<O> {
-        let end = lock(&self.shared.0).clone();
+        let end = lock(&self.shared.0).end.clone();
         end.as_deref().cloned()
     }
 
@@ -63,13 +98,44 @@ impl<O: Clone> Terminal<O> {
     pub fn wait_until(&self, deadline: Instant) -> Option<O> {
         let (end, ended) = &*self.shared;
         let mut held = lock(end);
-        while held.is_none() && Instant::now() < deadline {
+        while held.end.is_none() && Instant::now() < deadline {
             let left = deadline.saturating_duration_since(Instant::now());
             let waited = ended.wait_timeout(held, left.min(WAIT_CAP));
             held = waited.unwrap_or_else(PoisonError::into_inner).0;
         }
-        let end = held.clone();
+        let end = held.end.clone();
         drop(held);
+        end.as_deref().cloned()
+    }
+
+    /// Waits for the end without holding a thread, until `timer` completes: the caller's
+    /// deadline, for example `tokio::time::sleep_until(deadline.into())`. The same answer rule
+    /// as `wait_until`: the end if one is recorded when the wait stops, `None` only if none is
+    /// recorded by then. A wait dropped before it completes takes its waker out of the list.
+    pub async fn wait_or<T: Future<Output = ()>>(&self, timer: T) -> Option<O> {
+        let mut timer = pin!(timer);
+        let mut slot = Slot {
+            shared: &self.shared,
+            id: None,
+        };
+        let end = poll_fn(|cx| {
+            let mut state = lock(&self.shared.0);
+            if state.end.is_none() {
+                // The first poll takes a fresh id; later ones refresh that id's waker.
+                let id = *slot.id.get_or_insert(state.next);
+                if let Some((_, waker)) = state.wakers.iter_mut().find(|(at, _)| *at == id) {
+                    waker.clone_from(cx.waker());
+                } else {
+                    state.next += 1;
+                    state.wakers.push((id, cx.waker().clone()));
+                }
+                drop(state);
+                ready!(timer.as_mut().poll(cx));
+                state = lock(&self.shared.0);
+            }
+            Poll::Ready(state.end.clone())
+        })
+        .await;
         end.as_deref().cloned()
     }
 }
@@ -86,14 +152,16 @@ impl<O> Guard<O> {
     /// Records `outcome` if nothing is recorded yet, and wakes the waiters. Returns whether
     /// this end was the one recorded.
     pub fn end(&self, outcome: O) -> bool {
-        let (end, ended) = &*self.shared;
-        let mut end = lock(end);
-        if end.is_some() {
+        let (state, ended) = &*self.shared;
+        let mut state = lock(state);
+        if state.end.is_some() {
             return false;
         }
-        *end = Some(Arc::new(outcome));
-        drop(end);
+        state.end = Some(Arc::new(outcome));
+        let wakers = std::mem::take(&mut state.wakers);
+        drop(state);
         ended.notify_all();
+        wakers.into_iter().for_each(|(_, waker)| waker.wake());
         true
     }
 
@@ -112,7 +180,7 @@ impl<O> Drop for Guard<O> {
         let Some(fallback) = self.fallback.take() else {
             return;
         };
-        if lock(&self.shared.0).is_none() {
+        if lock(&self.shared.0).end.is_none() {
             self.end(fallback());
         }
     }
@@ -120,12 +188,35 @@ impl<O> Drop for Guard<O> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::future::{pending, ready as ready_now};
+    use std::pin::pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
+    use std::task::{Context, Poll, Wake, Waker};
     use std::thread;
     use std::time::{Duration, Instant};
 
-    use super::terminal;
+    use super::{Terminal, lock, terminal};
+
+    /// The waker of the tests' single-threaded executor (a task polled by hand): it counts
+    /// its wakes.
+    struct Wakes(AtomicUsize);
+
+    impl Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    fn counting_waker() -> (Arc<Wakes>, Waker) {
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        (Arc::clone(&wakes), Waker::from(wakes))
+    }
+
+    /// How many wakers wait on `reader`'s end.
+    fn wakers_of(reader: &Terminal<Outcome>) -> usize {
+        lock(&reader.shared.0).wakers.len()
+    }
 
     #[derive(Debug, Clone, PartialEq)]
     enum Outcome {
@@ -292,5 +383,89 @@ mod tests {
             Some(Outcome::Committed)
         );
         assert_eq!(reader.get(), Some(Outcome::Committed));
+    }
+
+    /// An end wakes a task waiting in `wait_or` with a timer that never fires, and the task's
+    /// next poll returns the end.
+    #[test]
+    fn an_end_wakes_an_async_waiter() {
+        let (reader, guard) = terminal(|| Outcome::Unknown);
+        let (wakes, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut wait = pin!(reader.wait_or(pending()));
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+        assert!(guard.end(Outcome::Committed));
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "the end did not wake the task"
+        );
+        assert_eq!(
+            wait.as_mut().poll(&mut cx),
+            Poll::Ready(Some(Outcome::Committed))
+        );
+    }
+
+    /// A timer that fires first ends the wait with `None`; an end recorded before the final
+    /// read, here by the timer itself as it fires, is returned.
+    #[test]
+    fn a_timer_first_returns_none_and_an_end_before_the_final_read() {
+        let (_wakes, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let (reader, _guard) = terminal(|| Outcome::Unknown);
+        let mut wait = pin!(reader.wait_or(ready_now(())));
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Ready(None));
+
+        let (late_reader, late_guard) = terminal(|| Outcome::Unknown);
+        let mut late = pin!(late_reader.wait_or(async move {
+            late_guard.end(Outcome::Committed);
+        }));
+        assert_eq!(
+            late.as_mut().poll(&mut cx),
+            Poll::Ready(Some(Outcome::Committed))
+        );
+    }
+
+    /// A guard dropped before any end wakes a task waiting in `wait_or`, with its fallback.
+    #[test]
+    fn a_drops_fallback_wakes_an_async_waiter() {
+        let (reader, guard) = terminal(|| Outcome::Unknown);
+        let (wakes, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut wait = pin!(reader.wait_or(pending()));
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+        drop(guard);
+        assert_eq!(
+            wakes.0.load(Ordering::SeqCst),
+            1,
+            "the drop did not wake the task"
+        );
+        assert_eq!(
+            wait.as_mut().poll(&mut cx),
+            Poll::Ready(Some(Outcome::Unknown))
+        );
+    }
+
+    /// Waits polled once and then dropped take their wakers with them, so given-up waits don't
+    /// pile up on a long operation's end; the end still wakes a live waiter afterwards.
+    #[test]
+    fn dropped_async_waits_leave_no_waker_and_a_live_one_still_wakes() {
+        let (reader, guard) = terminal(|| Outcome::Unknown);
+        let (wakes, waker) = counting_waker();
+        let mut cx = Context::from_waker(&waker);
+        for _ in 0..100 {
+            let mut wait = pin!(reader.wait_or(pending()));
+            assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+        }
+        assert_eq!(wakers_of(&reader), 0, "dropped waits left their wakers");
+        let mut wait = pin!(reader.wait_or(pending()));
+        assert_eq!(wait.as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(wakers_of(&reader), 1);
+        assert!(guard.end(Outcome::Committed));
+        assert_eq!(wakes.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            wait.as_mut().poll(&mut cx),
+            Poll::Ready(Some(Outcome::Committed))
+        );
     }
 }
