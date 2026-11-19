@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use nrese_reasoner::ReasoningMode;
 use nrese_store::StoreService;
@@ -11,7 +11,7 @@ use crate::{
     publication::{self, Publication},
 };
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Answer {
     Accept(bool),
     Row(Triple, bool),
@@ -93,6 +93,7 @@ struct Comparison<'a> {
     focus: Option<&'a Difference>,
     differences: Vec<Difference>,
     counts: [usize; publication::ITEMS.len()],
+    known: usize,
 }
 
 impl Comparison<'_> {
@@ -115,7 +116,7 @@ impl Comparison<'_> {
         store: &StoreService,
         accepted: bool,
         step: &Step,
-        expected: &Publication,
+        (expected, without_deviation): &(Publication, Facts),
     ) -> Option<bool> {
         let mut report = |expected, detail| {
             self.differences.push(Difference {
@@ -131,45 +132,42 @@ impl Comparison<'_> {
                 Answer::Accept(!step.model.inconsistent),
                 format!("accepted={accepted}"),
             );
-            return None;
         }
-        if !accepted {
+        if !accepted && step.model.inconsistent {
             return None;
         }
         let (rows, select_status) = judges::rows(store);
-        let preferred = match self.focus.map(|focus| &focus.expected) {
-            Some(Answer::Row(row, _)) => row,
-            _ => &self.case.watch,
-        };
-        let missing = |row: &Triple| expected.required.contains(row) && !rows.contains(row);
-        let extra = |row: &Triple| !step.model.facts.contains(row);
-        if let Some(row) = Some(preferred)
-            .filter(|row| missing(row))
-            .or_else(|| expected.required.difference(&rows).next())
-        {
-            report(
-                Answer::Row(row.clone(), true),
-                format!("row absent (SELECT {select_status})"),
-            );
+        for row in expected.required.difference(&rows) {
+            if without_deviation.contains(row) {
+                report(
+                    Answer::Row(row.clone(), true),
+                    format!("row absent (SELECT {select_status})"),
+                );
+            } else {
+                self.known += 1;
+            }
         }
-        if let Some(row) = rows
-            .get(preferred)
-            .filter(|row| extra(row))
-            .or_else(|| rows.iter().find(|row| extra(row)))
-        {
+        for row in rows.difference(&step.model.facts) {
             report(
                 Answer::Row(row.clone(), false),
                 format!("row present (SELECT {select_status})"),
             );
         }
 
+        if !accepted || step.model.inconsistent {
+            return None;
+        }
         let (answer, status) = judges::ask(store, &self.case.watch);
         let wanted = step.model.facts.contains(&self.case.watch);
         if status == "complete" && answer != wanted {
-            report(
-                Answer::CompleteRead(self.case.watch.clone(), wanted),
-                format!("ASK={answer} ({status})"),
-            );
+            if wanted && !without_deviation.contains(&self.case.watch) {
+                self.known += 1;
+            } else {
+                report(
+                    Answer::CompleteRead(self.case.watch.clone(), wanted),
+                    format!("ASK={answer} ({status})"),
+                );
+            }
         }
         Some(answer)
     }
@@ -183,7 +181,7 @@ impl Comparison<'_> {
         before: &Facts,
     ) {
         let (after, _) = judges::rows(store);
-        if let Some(row) = before.symmetric_difference(&after).next() {
+        for row in before.symmetric_difference(&after) {
             self.differences.push(Difference {
                 mode,
                 judge,
@@ -201,12 +199,18 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
         focus,
         differences: Vec::new(),
         counts: [0; publication::ITEMS.len()],
+        known: 0,
     };
     let projected: Vec<_> = steps
         .iter()
-        .map(|step| publication::project(&step.asserted, &step.model))
+        .map(|step| {
+            (
+                publication::project(&step.asserted, &step.model),
+                oracle::without_known_deviation(&step.asserted),
+            )
+        })
         .collect();
-    for publication in &projected {
+    for (publication, _) in &projected {
         for (sum, count) in compare.counts.iter_mut().zip(publication.counts) {
             *sum += count;
         }
@@ -305,6 +309,9 @@ fn required_red<'a>(case: &Case, differences: &'a [Difference]) -> Option<&'a Di
             ("cycle" | "long-chain", Answer::Row(row, true)) => {
                 difference.write == 1 && row == &case.watch
             }
+            ("nil-head" | "nil-cell", Answer::Row(row, true)) => {
+                difference.write == 0 && row == &case.watch
+            }
             ("schema-insert" | "literal-functional", Answer::Row(row, true)) => {
                 delta && difference.write == 1 && row == &case.watch
             }
@@ -317,16 +324,6 @@ fn required_red<'a>(case: &Case, differences: &'a [Difference]) -> Option<&'a Di
     })
 }
 
-fn report_red_seed(seed: u64, case: &Case, result: &Comparison<'_>) -> bool {
-    let required = required_red(case, &result.differences);
-    let known = required.is_some();
-    println!("SEED {seed} shape={} required-red={known}", case.shape);
-    result.print("RESULT ");
-    let witness = required.unwrap_or(&result.differences[0]);
-    print_reduced(seed, case.clone(), witness);
-    known
-}
-
 fn persists(case: &Case, witness: &Difference) -> bool {
     let steps = steps(case);
     let plausible = match &witness.expected {
@@ -335,7 +332,7 @@ fn persists(case: &Case, witness: &Difference) -> bool {
             .any(|step| step.model.inconsistent != *accepted),
         Answer::Row(row, present) | Answer::CompleteRead(row, present) => steps
             .iter()
-            .any(|step| !step.model.inconsistent && step.model.facts.contains(row) == *present),
+            .any(|step| step.model.facts.contains(row) == *present),
         Answer::Redundant => steps
             .windows(2)
             .any(|pair| pair[0].model.facts == pair[1].model.facts),
@@ -400,9 +397,10 @@ fn reduce(case: &mut Case, witness: &Difference) {
 fn print_reduced(seed: u64, mut case: Case, witness: &Difference) {
     reduce(&mut case, witness);
     println!(
-        "REDUCED seed={seed} shape={} watch={}",
+        "REDUCED seed={seed} shape={} watch={} witness={:?}",
         case.shape,
-        case.watch.join(" ")
+        case.watch.join(" "),
+        witness.expected,
     );
     for (index, write) in case.writes.iter().enumerate() {
         println!("WRITE {}", index + 1);
@@ -412,7 +410,11 @@ fn print_reduced(seed: u64, mut case: Case, witness: &Difference) {
             }
         }
     }
-    run(&case, &steps(&case), None).print("RED RESULT ");
+    for difference in run(&case, &steps(&case), None).differences {
+        if difference.expected == witness.expected {
+            println!("RED RESULT {}", difference.line());
+        }
+    }
     println!("END REDUCED seed={seed}");
 }
 
@@ -433,6 +435,8 @@ fn seeds() {
     let mut drawn = 0;
     let mut covered = BTreeSet::new();
     let mut red = BTreeSet::new();
+    let mut witnesses = BTreeMap::new();
+    let mut deviations = 0;
     let mut disagreements = 0;
     let mut counts = [0; publication::ITEMS.len()];
     while generator::draws_on(
@@ -446,6 +450,7 @@ fn seeds() {
         covered.insert(case.shape);
         let steps = steps(&case);
         let result = run(&case, &steps, None);
+        deviations += result.known;
         for (sum, count) in counts.iter_mut().zip(result.counts) {
             *sum += count;
         }
@@ -453,13 +458,38 @@ fn seeds() {
             continue;
         }
         disagreements += 1;
-        if report_red_seed(seed, &case, &result) {
+        let known = required_red(&case, &result.differences).is_some();
+        if known {
             red.insert(case.shape);
         }
+        println!("SEED {seed} shape={} required-red={known}", case.shape);
+        result.print("RESULT ");
+        for difference in result.differences {
+            // Verdict and redundancy mismatches have no row key. Keep their
+            // originating write so different inconsistency inputs stay distinct.
+            let origin = matches!(difference.expected, Answer::Accept(_) | Answer::Redundant)
+                .then_some((seed, difference.write));
+            let judge = (difference.mode, difference.judge);
+            let (_, _, judges) = witnesses
+                .entry((origin, difference.expected.clone()))
+                .or_insert_with(|| (seed, difference, BTreeSet::new()));
+            judges.insert(judge);
+        }
+    }
+    for (_, (seed, witness, judges)) in witnesses {
+        println!(
+            "WITNESS {:?} seed={seed} observed={judges:?}",
+            witness.expected
+        );
+        print_reduced(seed, generator::generated(seed, plain), &witness);
     }
     for (item, count) in publication::ITEMS.iter().zip(counts) {
         println!("PUBLICATION {item} => {count}");
     }
+    println!(
+        "KNOWN DEVIATION {} => {deviations}",
+        oracle::KNOWN_DEVIATION
+    );
     println!(
         "SWEEP plain={plain} seeds={drawn} red={disagreements} shapes={covered:?} required-red={red:?}"
     );

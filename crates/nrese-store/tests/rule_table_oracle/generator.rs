@@ -85,6 +85,8 @@ pub const RED_SHAPES: &[&str] = &[
     "long-chain",
     "equality-schema",
     "literal-functional",
+    "nil-head",
+    "nil-cell",
 ];
 
 pub const SHAPES: &[&str] = &[
@@ -119,6 +121,15 @@ const CHAIN: &str = "
     ex:a ex:p ex:b
     ex:b ex:q ex:z
 ";
+
+pub fn nil_walk(shape: &'static str) -> Case {
+    let cell = if shape == "nil-head" { "ex:h" } else { "ex:t" };
+    case(
+        shape,
+        ["ex:a", "ex:out", "ex:z"],
+        vec![insert(&CHAIN.replace(cell, "rdf:nil"))],
+    )
+}
 
 pub fn long_chain(length: usize) -> Case {
     let mut setup = insert("ex:out owl:propertyChainAxiom ex:c0");
@@ -272,14 +283,16 @@ pub fn generated(seed: u64, plain: bool) -> Case {
             delete("ex:t rdf:first ex:q"),
             insert("ex:t rdf:first ex:q"),
         ]),
-        "nil-head" => make_chain(vec![
-            insert(&CHAIN.replace("ex:h", "rdf:nil")),
-            delete("rdf:nil rdf:first ex:p"),
-        ]),
-        "nil-cell" => make_chain(vec![
-            insert(&CHAIN.replace("ex:t", "rdf:nil")),
-            delete("rdf:nil rdf:rest rdf:nil"),
-        ]),
+        "nil-head" | "nil-cell" => {
+            let mut fixture = nil_walk(shape);
+            let removed = if shape == "nil-head" {
+                "rdf:nil rdf:first ex:p"
+            } else {
+                "rdf:nil rdf:rest rdf:nil"
+            };
+            fixture.writes.push(delete(removed));
+            fixture
+        }
         "head-alias" | "cell-alias" | "member-alias" => {
             let (term, line) = match shape {
                 "head-alias" => ("ex:h", "ex:out owl:propertyChainAxiom ex:h"),

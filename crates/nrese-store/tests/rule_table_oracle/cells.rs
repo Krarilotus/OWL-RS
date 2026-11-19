@@ -3,6 +3,20 @@ use crate::{
     sweep,
 };
 
+#[test]
+#[ignore = "a chain starting at rdf:nil drops its explicit first and rest"]
+fn nil_head_starts_an_explicit_walk() {
+    // Spec: Table 3 matches the head's first and rest. Table 5 prp-spo2 derives the endpoint.
+    check(generator::nil_walk("nil-head"), &[true], &[true]);
+}
+
+#[test]
+#[ignore = "a chain stops at rdf:nil before reading its explicit continuation"]
+fn nil_cell_continues_an_explicit_walk() {
+    // Spec: Table 3 also matches explicit first and rest on an interior cell.
+    check(generator::nil_walk("nil-cell"), &[true], &[true]);
+}
+
 fn check(cell: Case, accepted: &[bool], present: &[bool]) {
     assert!(
         matches_oracle(&cell, accepted, present),

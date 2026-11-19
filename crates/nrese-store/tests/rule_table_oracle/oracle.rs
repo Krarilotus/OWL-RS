@@ -22,6 +22,10 @@ pub enum Datatypes {
     Published,
 }
 
+// reasoning-semantics.md:47 counts 58 fixed rules. The omitted table names neither rule.
+pub const KNOWN_DEVIATION: &str = "Table 6 cls-thing and cls-nothing1 are not derived";
+const OMITTED_RULES: &[&str] = &["6 cls-thing", "6 cls-nothing1"];
+
 #[derive(Clone, Copy)]
 enum Term {
     Constant(Id),
@@ -66,7 +70,7 @@ struct Program {
 }
 
 impl Program {
-    fn read() -> Self {
+    fn read(omit: &[&str]) -> Self {
         let mut symbols = Symbols::default();
         let padding = symbols.id("");
         let mut relations = Symbols::default();
@@ -83,6 +87,9 @@ impl Program {
             .filter(|line| !line.is_empty() && !line.starts_with('#'))
         {
             let (name, clauses) = line.split_once('|').unwrap();
+            if omit.contains(&name.trim()) {
+                continue;
+            }
             let (body, heads) = clauses.split_once('|').unwrap_or_else(|| panic!("{name}"));
             let mut variables = Symbols::default();
             let body = body
@@ -208,7 +215,15 @@ impl Rule {
 }
 
 pub fn evaluate(asserted: &Facts, datatypes: Datatypes) -> Model {
-    let mut program = Program::read();
+    evaluate_with(asserted, datatypes, &[])
+}
+
+pub fn without_known_deviation(asserted: &Facts) -> Facts {
+    evaluate_with(asserted, Datatypes::Standard, OMITTED_RULES).facts
+}
+
+fn evaluate_with(asserted: &Facts, datatypes: Datatypes, omit: &[&str]) -> Model {
+    let mut program = Program::read(omit);
     let mut initial = asserted.clone();
     let bad_types = datatype_facts(asserted, datatypes, &mut initial);
     // Table 5, prp-ap. OWL 2 Structural Specification §5.5 gives the built-in properties.
