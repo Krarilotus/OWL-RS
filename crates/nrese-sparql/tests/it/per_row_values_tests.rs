@@ -158,6 +158,8 @@ fn an_optional_condition_drawing_a_value_decides_once_for_its_group() {
 /// of the forty solutions is kept or not by its own test; the join copies each kept one to
 /// both `VALUES ?k` rows, so the `?i` kept with `?k = 1` are those kept with `?k = 2`. A
 /// test per joined row makes the two differ (a chance of 2^-40 per run that they agree).
+/// This states the join's part only: the engine tests such a body once for all forty
+/// solutions, a known fault left for a later release, which this test does not catch.
 #[test]
 fn an_exists_drawing_a_value_keeps_each_solution_of_its_group_for_every_joined_row_or_none() {
     let keys: Vec<String> = (1..=40).map(|i| i.to_string()).collect();
@@ -205,4 +207,46 @@ fn a_group_drawing_only_in_a_subquery_is_still_matched_from_the_joined_rows() {
     options.resources.memory = nrese_exec::Envelope::new(Some(256 * 1024), None);
     let found = values_in(&engine, query, &options, &["s"]);
     assert_eq!(found, [["<urn:s:0>"]]);
+}
+
+/// Spec: in `?s a <urn:Rare> OPTIONAL { ?s <urn:label> ?l BIND(STRUUID() AS ?u) }`, and in
+/// the same with the group joined instead, each solution of the group draws one `?u`, so
+/// the two rare subjects get one row each with distinct values. Only the rare subjects'
+/// labels can meet a row, so drawing for them alone gives SPARQL's answer, against 65,536
+/// labelled subjects within a memory budget (256 KiB) that holds two rows but not the
+/// 65,536 labels.
+#[test]
+fn a_drawing_group_met_by_distinct_keys_is_matched_from_them() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let label = NamedNode::new_unchecked("urn:label");
+    for i in 0..65_536 {
+        let s = NamedNode::new_unchecked(format!("urn:s:{i}"));
+        let o = Literal::new_simple_literal(format!("label {i}"));
+        tx.insert(Quad::new(s, label.clone(), o, GraphName::DefaultGraph).as_ref());
+    }
+    let a = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    for s in ["urn:s:7", "urn:s:9"] {
+        let s = NamedNode::new_unchecked(s);
+        let rare = NamedNode::new_unchecked("urn:Rare");
+        tx.insert(Quad::new(s, a.clone(), rare, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let mut options = QueryOptions::default();
+    options.resources.memory = nrese_exec::Envelope::new(Some(256 * 1024), None);
+    for query in [
+        "SELECT ?s ?u { ?s a <urn:Rare> \
+         OPTIONAL { ?s <urn:label> ?l BIND(STRUUID() AS ?u) } }",
+        "SELECT ?s ?u { ?s a <urn:Rare> { ?s <urn:label> ?l BIND(STRUUID() AS ?u) } }",
+    ] {
+        let mut found = values_in(&engine, query, &options, &["s", "u"]);
+        found.sort();
+        assert_eq!(found.len(), 2, "{found:?}: {query}");
+        assert_eq!(found[0][0], "<urn:s:7>", "{query}");
+        assert_eq!(found[1][0], "<urn:s:9>", "{query}");
+        assert!(
+            !found[0][1].is_empty() && found[0][1] != found[1][1],
+            "{found:?}: {query}"
+        );
+    }
 }
