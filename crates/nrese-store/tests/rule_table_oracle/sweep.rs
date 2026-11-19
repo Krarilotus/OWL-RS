@@ -262,8 +262,8 @@ pub fn check_cell(case: &Case, steps: &[Step]) -> bool {
     result.differences.is_empty()
 }
 
-fn required_red(case: &Case, result: &Comparison<'_>) -> bool {
-    result.differences.iter().any(|difference| {
+fn required_red<'a>(case: &Case, differences: &'a [Difference]) -> Option<&'a Difference> {
+    differences.iter().find(|difference| {
         let delta = matches!(difference.judge, "warm" | "cold");
         match (case.shape, &difference.expected) {
             ("redundant", Answer::Redundant) => true,
@@ -280,6 +280,16 @@ fn required_red(case: &Case, result: &Comparison<'_>) -> bool {
             _ => false,
         }
     })
+}
+
+fn report_red_seed(seed: u64, case: &Case, result: &Comparison<'_>) -> bool {
+    let required = required_red(case, &result.differences);
+    let known = required.is_some();
+    println!("SEED {seed} shape={} required-red={known}", case.shape);
+    result.print("RESULT ");
+    let witness = required.unwrap_or(&result.differences[0]);
+    print_reduced(seed, case.clone(), witness);
+    known
 }
 
 fn persists(case: &Case, witness: &Difference) -> bool {
@@ -407,23 +417,9 @@ fn seeds() {
             continue;
         }
         disagreements += 1;
-        let known = required_red(&case, &result);
-        if known {
+        if report_red_seed(seed, &case, &result) {
             red.insert(case.shape);
         }
-        println!("SEED {seed} shape={} required-red={known}", case.shape);
-        result.print("RESULT ");
-        let preferred = result.differences.iter().find(|difference| {
-            matches!(difference.expected, Answer::Redundant)
-                || difference.write == 1
-                    && match &difference.expected {
-                        Answer::Row(row, _) => row == &case.watch,
-                        Answer::Accept(false) => true,
-                        _ => false,
-                    }
-        });
-        let witness = preferred.unwrap_or(&result.differences[0]);
-        print_reduced(seed, case, witness);
     }
     for (item, count) in publication::ITEMS.iter().zip(counts) {
         println!("PUBLICATION {item} => {count}");

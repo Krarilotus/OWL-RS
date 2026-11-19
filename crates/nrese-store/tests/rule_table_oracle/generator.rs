@@ -232,8 +232,7 @@ pub fn generated(seed: u64, plain: bool) -> Case {
                 insert: rows("ex:u rdf:type ex:Marker"),
             },
         ]),
-        "schema-insert" => schema_operand(true),
-        "schema-delete" => schema_operand(false),
+        "schema-insert" | "schema-delete" => schema_operand(shape == "schema-insert"),
         "equality-member" => make_chain(vec![
             insert(
                 "
