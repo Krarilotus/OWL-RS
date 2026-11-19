@@ -866,6 +866,133 @@ async fn finished(app: &Router, path: &str) -> serde_json::Value {
     panic!("the job didn't end");
 }
 
+const MIXED_UPLOAD: &str =
+    "<urn:a> <urn:p> \"one\" .\nthis is not a statement\n_:b <urn:p> \"two\" .\n";
+
+fn import_with_quarantine_failure() -> (Router, std::sync::Arc<StoreService>) {
+    let state = crate::support::test_state_with_store_config(
+        StoreConfig::in_memory(),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    let store = state.store();
+    store.quarantine().fail_next_commit();
+    (nrese_server::build_app(state), store)
+}
+
+#[tokio::test]
+async fn quarantine_commit_failure_sync_import_names_published_revision() {
+    let (app, store) = import_with_quarantine_failure();
+    let revision = store.current_revision() + 1;
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/import",
+        Some("application/n-triples"),
+        MIXED_UPLOAD,
+    )
+    .await;
+    assert!(
+        status == StatusCode::INTERNAL_SERVER_ERROR
+            && body.contains(&format!(
+                "the load completed at published revision {revision}. Its quarantine record couldn't be kept: simulated failure. Don't send it again."
+            )),
+        "{status}: {body}"
+    );
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/query",
+        Some("application/sparql-query"),
+        "ASK { <urn:a> <urn:p> \"one\" . ?b <urn:p> \"two\" . FILTER(isBlank(?b)) }",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["boolean"],
+        true
+    );
+}
+
+#[tokio::test]
+async fn quarantine_commit_failure_async_import_completes_with_warning() {
+    let (app, store) = import_with_quarantine_failure();
+    let revision = store.current_revision() + 1;
+    let (_, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/import?async=true",
+        Some("application/n-triples"),
+        MIXED_UPLOAD,
+    )
+    .await;
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let job = finished(&app, started["path"].as_str().expect(&body)).await;
+    assert_eq!(job["state"], "done", "{job}");
+    assert_eq!(
+        job["report"]["warning"], "the quarantine record couldn't be kept: simulated failure",
+        "{job}"
+    );
+    assert_eq!(job["report"]["revision"], revision, "{job}");
+}
+
+#[tokio::test]
+async fn published_answer_followup_only_reports_actual_publications() {
+    let (app, store) = import_with_quarantine_failure();
+    let upload = "this is not a statement\n";
+    let path = "/api/v1/repositories/nrese/import";
+    eprintln!("POST {path}\nContent-Type: application/n-triples\n\n{upload}");
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        path,
+        Some("application/n-triples"),
+        upload,
+    )
+    .await;
+    eprintln!("{status}: {body}");
+    assert!(
+        status == StatusCode::BAD_REQUEST
+            && body.contains("i/o error: simulated failure")
+            && !body.contains("published"),
+        "{status}: {body}"
+    );
+
+    let seed = "<urn:a> <urn:p> \"one\" .\n";
+    eprintln!("POST {path}\nContent-Type: application/n-triples\n\n{seed}");
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        path,
+        Some("application/n-triples"),
+        seed,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let revision = store.current_revision() + 1;
+    store.quarantine().fail_next_commit();
+    let path = "/api/v1/repositories/nrese/import?replace=true";
+    eprintln!("POST {path}\nContent-Type: application/n-triples\n\n{upload}");
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        path,
+        Some("application/n-triples"),
+        upload,
+    )
+    .await;
+    eprintln!("{status}: {body}");
+    assert!(
+        status == StatusCode::INTERNAL_SERVER_ERROR
+            && body.contains(&format!(
+                "the load completed at published revision {revision}."
+            )),
+        "{status}: {body}"
+    );
+    assert_eq!(store.current_revision(), revision);
+}
+
 /// Imports run as jobs: an uploaded document with `async=true`, and files from the
 /// server's import directory (administrators), whose paths can't leave it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
