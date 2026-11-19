@@ -308,6 +308,13 @@ const KNOWN: &[(&str, &str, &str, bool, &str)] = &[
         false,
         "streamed AVG can evaluate its argument separately for the sum and the count",
     ),
+    (
+        "vector",
+        "P1",
+        "disjoint",
+        false,
+        "a vector search that goes first evaluates a group sharing no variable with the hit once per hit",
+    ),
 ];
 
 fn known(case: &Case, failure: &Failure) -> bool {
