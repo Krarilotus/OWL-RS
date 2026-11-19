@@ -8,7 +8,7 @@ use crate::mapping::{Ontology, Terms};
 use crate::model::{Axiom, Characteristic, ClassExpr, ObjProp, Term};
 
 /// A problem found while reading.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Diagnostic {
     /// A structure that doesn't match the mapping.
     Malformed { node: Term, what: &'static str },
@@ -121,6 +121,44 @@ impl Diagnostic {
                 | Self::BrokenList { .. }
                 | Self::Unsupported { .. }
         )
+    }
+
+    /// Whether the reader leaves out or alters an axiom for it. Then a reasoner over what it
+    /// read may miss conclusions of the source, so a claim that rests on reading all of
+    /// them, the QL rewriting's `complete`, is lowered, with this diagnostic as its reason
+    /// ([`crate::ql::Hazard::LeftOut`]). Each kind is decided in its own arm, with no
+    /// catch-all, so a new kind is decided here; one that isn't a hazard says why.
+    pub fn alters_axioms(&self) -> bool {
+        match self {
+            // Left out: the axiom, the statement or the text isn't read.
+            Self::Malformed { .. }
+            | Self::BrokenList { .. }
+            | Self::Unsupported { .. }
+            | Self::NotOwl { .. }
+            | Self::Syntax { .. }
+            | Self::Reserved { .. } => true,
+            // Altered: declared both, the property is read as an object property only, so
+            // what the source says of it as a data property is read as something else.
+            Self::AmbiguousProperty { .. } => true,
+            // Kept beside the ontology (`Ontology::rules`), which a reasoner of OWL 2 alone
+            // doesn't apply.
+            Self::Rule { .. } => true,
+            // Read as the source states it: the expression two axioms share is the same one
+            // in each.
+            Self::SharedBlankNode { .. } => false,
+            // Read as the source states it: typed by its use, as a declaration would type it.
+            Self::UndeclaredProperty { .. } => false,
+            // No axiom: a structure no axiom uses says nothing under the Direct Semantics.
+            Self::Unused { .. } => false,
+            // Read as written: only a global restriction of OWL 2 DL is broken (what keeps
+            // reasoning decidable), not what the axiom says; what a reasoner doesn't follow
+            // of it is that reasoner's own hazard.
+            Self::NonSimpleProperty { .. } => false,
+            // Read as written: the Direct Semantics reads it (§2.3.7–2.4), as above.
+            Self::AnonymousIndividual { .. } => false,
+            // Read as what being disjoint from itself means (`crate::model::Disjoint`).
+            Self::RepeatedOperand => false,
+        }
     }
 
     /// What it is, in words, its terms as `name` writes them (the reader has no dictionary).

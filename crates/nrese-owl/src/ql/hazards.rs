@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::tbox::{Basic, Type};
+use crate::diagnostics::Diagnostic;
 use crate::mapping::Ontology;
 use crate::model::{Axiom, Characteristic, ClassExpr, ExprId, Term};
 
@@ -57,9 +58,9 @@ pub enum Hazard {
     /// An axiom outside the profile, as [`Self::OutsideProfile`], that equates individuals
     /// and names no term: global, which needs none.
     Equating,
-    /// A structure the mapping drops (malformed, unsupported, a broken list), at the node
-    /// it reports: the axiom it was part of isn't read at all (I24c-2).
-    Dropped(Term),
+    /// An axiom the reader leaves out or alters ([`Diagnostic::alters_axioms`]), with its
+    /// diagnostic: any term may miss the axiom's conclusions (I24c-2): global.
+    LeftOut(Diagnostic),
     /// A data property whose values OWL 2 RL's rules would compare or type
     /// ([`reads_data_values`]), or a property not declared an object property in a key or
     /// a disjointness, which may be one: global.
@@ -117,10 +118,9 @@ impl Hazard {
             | Self::Untyped(t)
             | Self::OpenLeft(t)
             | Self::OutsideProfile(t)
-            | Self::Dropped(t)
             | Self::DataValues(t)
             | Self::Unread(t) => t,
-            Self::Equating => return None,
+            Self::Equating | Self::LeftOut(_) => return None,
         })
     }
 
@@ -168,7 +168,10 @@ impl Hazard {
                 format!("an axiom on {t} outside the profile whose rules the closure applies")
             }
             Self::Equating => "an axiom outside the profile equates individuals".to_owned(),
-            Self::Dropped(_) => format!("a schema structure at {t} that can't be read"),
+            Self::LeftOut(d) => format!(
+                "the reader leaves out or alters an axiom: {}",
+                d.describe(name)
+            ),
             Self::DataValues(_) => format!(
                 "an axiom may compare or type values of {t}, and the rule set leaves out dt-eq \
                  and dt-type2: one value in two lexical forms isn't matched, nor a value's \

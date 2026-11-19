@@ -524,7 +524,8 @@ impl QlRewriting {
         // forward by the noted changes, in place (P2-C1 probes, 8 Nov: rebuilding every
         // expression's took 188 us a snapshot, rescanning each touched one 1 us). What the
         // schema keeps of an expression is that it has a member, one the reader may see
-        // and the OWL reader keeps: an added statement stands in where there was none, and
+        // and the OWL reader keeps, else a reserved name's, which it reports ([`Kept`]): an
+        // added statement stands in where there was none or only a reserved name's, and
         // only the removal of the kept one is read again.
         if let Some(i) = at {
             let c = &mut cached[i];
@@ -684,13 +685,23 @@ impl QlRewriting {
             #[cfg(test)]
             count(&EXPRESSIONS_WALKED, 1);
             let next = match (member, change.added) {
-                (None, true) => {
-                    eligible(snapshot, &change.statement, &keep).then_some(change.statement)
+                (None, true) if keep(change.statement.graph) => {
+                    Some(Kept::of(snapshot, change.statement))
                 }
-                (Some(kept), false) if kept == change.statement => member_of(snapshot, node, &keep),
+                // A reserved name's, kept for want of another: one the reader reads replaces it.
+                (Some(kept), true)
+                    if !kept.read
+                        && keep(change.statement.graph)
+                        && !reserved_individual(snapshot, &change.statement) =>
+                {
+                    Some(Kept::of(snapshot, change.statement))
+                }
+                (Some(kept), false) if kept.statement == change.statement => {
+                    member_of(snapshot, node, &keep)
+                }
                 _ => continue,
             };
-            changed |= next.is_some() != member.is_some();
+            changed |= next.map(|k| k.read_as()) != member.map(|k| k.read_as());
             c.members.of.insert(node, next);
         }
         c.key = snapshot.identity();
@@ -841,7 +852,8 @@ impl Schema {
     }
 
     /// Whether entry `c`'s TBox is this schema's with `members`: what the TBox reads of
-    /// them is which expressions have one (design §7).
+    /// them is which expressions have one, and the name of one the reader leaves out
+    /// (design §7, [`Kept`]).
     fn reuses(&self, c: &Cached, members: &Members) -> bool {
         c.thing == self.thing
             && c.equality == self.equality
@@ -971,12 +983,12 @@ fn has_equality(snapshot: &Snapshot) -> bool {
     })
 }
 
-/// The expressions with a member in `of`, sorted: what the TBox reads of the memberships.
-fn present(of: &HashMap<u64, Member>) -> Vec<u64> {
-    let mut out: Vec<u64> = of
+/// The expressions with a member in `of`, sorted, each with [`Kept::read_as`]: what the
+/// TBox reads of the memberships.
+fn present(of: &HashMap<u64, Member>) -> Vec<(u64, Option<u64>)> {
+    let mut out: Vec<(u64, Option<u64>)> = of
         .iter()
-        .filter(|(_, m)| m.is_some())
-        .map(|(&e, _)| e)
+        .filter_map(|(&e, m)| m.map(|k| (e, k.read_as())))
         .collect();
     out.sort_unstable();
     out
@@ -1065,7 +1077,30 @@ fn building() {
 }
 
 /// What an expression's membership is ([`schema_statements`]): one statement, or none.
-type Member = Option<nrese_owl::Statement>;
+type Member = Option<Kept>;
+
+/// An expression's kept membership: its statement, and whether the OWL reader reads it. One
+/// it leaves out, a reserved name's, is kept only where the expression has no other, so
+/// that the reader reports it (`Reserved`) and what rests on the expression is not claimed
+/// complete.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Kept {
+    statement: nrese_owl::Statement,
+    read: bool,
+}
+
+impl Kept {
+    fn of(snapshot: &Snapshot, statement: nrese_owl::Statement) -> Self {
+        let read = !reserved_individual(snapshot, &statement);
+        Self { statement, read }
+    }
+
+    /// What the TBox reads of it (design §7): that the expression has a member, and of one
+    /// the reader leaves out, the name it reports.
+    fn read_as(&self) -> Option<u64> {
+        (!self.read).then_some(self.statement.triple[0])
+    }
+}
 
 /// The schema without its memberships, sorted, in every graph; and the class expressions
 /// its statements make (blank subjects of a restriction's or a set operator's property),
@@ -1171,14 +1206,15 @@ fn expressions_of(snapshot: &Snapshot, core: &[nrese_owl::Statement]) -> Vec<u64
 
 /// The membership the schema reads of class expression `node` (design §7: individuals
 /// asserted to be in it have anonymous individuals of their own): one `rdf:type`
-/// statement, the first in a graph `keep` admits whose individual the OWL reader keeps (it
-/// leaves out a reserved name, `rdf:type a _:e`); `None` without one. What the
-/// hazards read of it is the expression, not who is in it.
+/// statement in a graph `keep` admits, the first whose individual the OWL reader keeps;
+/// failing that, the first, a reserved name's (`rdf:type a _:e`), which the reader leaves
+/// out and reports ([`Kept`]); `None` without one. What the hazards read of it is the
+/// expression, not who is in it.
 fn member_of(snapshot: &Snapshot, node: u64, keep: &dyn Fn(u64) -> bool) -> Member {
     #[cfg(test)]
     count(&MEMBER_SCANS, 1);
     let rdf_type = iri(snapshot, RDF, "type")?;
-    snapshot
+    let mut kept = snapshot
         .quads_for_pattern_in(
             ReadModel::Asserted,
             &QuadPattern {
@@ -1192,19 +1228,20 @@ fn member_of(snapshot: &Snapshot, node: u64, keep: &dyn Fn(u64) -> bool) -> Memb
             triple: [q.subject.raw(), q.predicate.raw(), q.object.raw()],
             graph: q.graph.raw(),
         })
-        .find(|s| eligible(snapshot, s, keep))
+        .filter(|s| keep(s.graph))
+        .map(|s| Kept::of(snapshot, s));
+    let first = kept.next()?;
+    match first.read {
+        true => Some(first),
+        false => Some(kept.find(|k| k.read).unwrap_or(first)),
+    }
 }
 
-/// Whether membership `statement` is one the schema may keep for its reader: in a graph
-/// `keep` admits, its individual a name the OWL reader keeps (not a reserved one).
-fn eligible(
-    snapshot: &Snapshot,
-    statement: &nrese_owl::Statement,
-    keep: &dyn Fn(u64) -> bool,
-) -> bool {
-    keep(statement.graph)
-        && !matches!(snapshot.decode(TermId::from_raw(statement.triple[0])),
-            Some(Term::NamedNode(n)) if nrese_owl::diagnostics::reserved_name(n.as_str()))
+/// Whether membership `statement`'s individual is a reserved name, which the OWL reader
+/// leaves out with the membership (`Reserved`).
+fn reserved_individual(snapshot: &Snapshot, statement: &nrese_owl::Statement) -> bool {
+    matches!(snapshot.decode(TermId::from_raw(statement.triple[0])),
+        Some(Term::NamedNode(n)) if nrese_owl::diagnostics::reserved_name(n.as_str()))
 }
 
 /// `core` with the memberships `members`, sorted: the schema the TBox is compiled from.
@@ -1214,7 +1251,7 @@ fn with_members<'a>(
 ) -> Vec<nrese_owl::Statement> {
     let mut out = core.to_vec();
     let before = out.len();
-    out.extend(members.flatten().copied());
+    out.extend(members.flatten().map(|k| k.statement));
     #[cfg(test)]
     count(&MEMBERS_WRITTEN, out.len() - before);
     #[cfg(not(test))]

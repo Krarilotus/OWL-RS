@@ -1029,6 +1029,85 @@ fn a_note_of_a_commit_that_never_published_leaves_the_next_noted() {
     assert_eq!(counted, [0, 1, 0], "(scanned, walked, written)");
 }
 
+/// A reserved name's membership the reader leaves out reaches it where it is the
+/// expression's only one, through noted commits as on a fresh read (I24c-2). With the
+/// intersection `_:e` of `:C` and `:D` and no member, the schema is read; then, each a
+/// commit through [`QlRewriting::commit`]: `rdf:List a _:e` added; `:m a _:e` added;
+/// `:m a _:e` removed. Expected after each: the kept schema's global hazard is a fresh
+/// read's, and names the reserved name exactly where `rdf:List` is the only member.
+#[test]
+fn a_reserved_names_only_membership_lowers_the_kept_schema_as_a_fresh_read() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let text = "@prefix : <http://example.org/> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+        :c a :C . [ owl:intersectionOf ( :C :D ) ] .";
+    let mut tx = engine.transaction();
+    for q in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+        tx.insert(q.unwrap().as_ref());
+    }
+    tx.commit().unwrap();
+    let ql = QlRewriting::new(Closure { lists: false });
+    let global = |ql: &QlRewriting| {
+        let snapshot = engine.snapshot();
+        let name = |t: nrese_owl::Term| {
+            (snapshot.decode(TermId::from_raw(t)))
+                .map(|t| t.to_string())
+                .unwrap_or_default()
+        };
+        let tbox = ql.tbox(&snapshot, None);
+        tbox.global_hazard().map(|h| h.describe(&name))
+    };
+    assert_eq!(global(&ql), None, "memberless");
+    let snapshot = engine.snapshot();
+    let operator = iri(&snapshot, OWL, "intersectionOf").unwrap();
+    let e = snapshot
+        .quads_for_pattern_in(
+            ReadModel::Asserted,
+            &QuadPattern {
+                subject: None,
+                predicate: Some(operator),
+                object: None,
+                graph: GraphSelector::Any,
+            },
+        )
+        .next()
+        .unwrap()
+        .subject;
+    let rdf_type = iri(&snapshot, RDF, "type").unwrap();
+    drop(snapshot);
+    let member = |name: &str| {
+        let tx = engine.transaction();
+        let s = tx.intern(NamedNodeRef::new_unchecked(name).into());
+        drop(tx);
+        EncodedQuad::new(s, rdf_type, e, TermId::DEFAULT_GRAPH)
+    };
+    let list = member(&format!("{RDF}List"));
+    let m = member(&format!("{EX}m"));
+    let mut wrong = Vec::new();
+    for (step, quad, added, reserved) in [
+        ("rdf:List added", list, true, true),
+        (":m added", m, true, false),
+        (":m removed", m, false, true),
+    ] {
+        let mut tx = engine.transaction();
+        match added {
+            true => assert!(tx.insert_encoded(quad), "{step}"),
+            false => assert!(tx.remove_encoded(quad), "{step}"),
+        }
+        ql.commit(tx).unwrap();
+        let (kept, fresh) = (
+            global(&ql),
+            global(&QlRewriting::new(Closure { lists: false })),
+        );
+        let names = kept.as_ref().is_some_and(|h| {
+            h.contains("reserved vocabulary used as an entity") && h.contains(&format!("{RDF}List"))
+        });
+        if kept != fresh || names != reserved {
+            wrong.push(format!("{step}: kept {kept:?}, fresh {fresh:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
 #[test]
 fn introducing_owl_thing_without_changing_the_schema_matches_fresh_preparation() {
     let engine = engine("");
