@@ -464,8 +464,8 @@ fn transition<const MUTATION: u8>(state: State, event: Event) -> Transition {
             WRONG_STREAM_ANSWER,
             _,
             Event::ReadEnded {
+                first: true,
                 end: StreamEnd::Aborted,
-                ..
             },
         ) => result.answer = Answer::Read(StreamEnd::Data),
         _ => {}
@@ -1558,7 +1558,7 @@ fn explorer_rejects_read_without_a_snapshot() {
     red::<READ_WITHOUT_SNAPSHOT>("MissingSnapshot");
 }
 
-// Spec §2b S3/P7: an aborted stream reports its abort even after it has shown data.
+// Spec §2b S3: an aborted first read reports its abort even after showing data.
 #[test]
 fn explorer_rejects_completed_answer_for_an_aborted_stream() {
     red::<WRONG_STREAM_ANSWER>("StreamAnswer");
@@ -1643,29 +1643,29 @@ fn rollback_cancels_only_the_ticket_visible_at_lookup() {
             world.do_move::<GOOD>(Move::Lookup(1, Op::Rollback), |_| {});
         }
         world.do_move::<GOOD>(Move::SessionLock(1), |_| {});
-        let (outcome, writer_answer, rollback_lock) = if sees_ticket {
+        let writer_answer = if sees_ticket {
             world.do_move::<GOOD>(Move::Lookup(1, Op::Rollback), |_| {});
-            (
-                Outcome::Failed(Problem::Status(408)),
-                Answer::TaskError {
-                    problem: Problem::Status(408),
-                    source: Cell::P4,
-                },
-                Move::SessionLock(1),
-            )
-        } else {
-            world.do_move::<GOOD>(Move::Swap(1, 0), |_| {});
-            (Outcome::Committed, Answer::WriteOk, Move::RollbackLock(1))
-        };
-        world.do_move::<GOOD>(Move::DropGuard(1, 0, outcome), |_| {});
-        let mut answers = Vec::new();
-        world.do_move::<GOOD>(Move::TaskReady(1, 0), |(_, answer)| answers.push(answer));
-        world.do_move::<GOOD>(rollback_lock, |(_, answer)| {
-            if answer != Answer::None {
-                answers.push(answer);
+            Answer::TaskError {
+                problem: Problem::Status(408),
+                source: Cell::P4,
             }
-        });
+        } else {
+            Answer::WriteOk
+        };
+        let mut answers = Vec::new();
+        for _ in 0..Sessions::<2, GOOD>::DRAIN_BOUND {
+            if Sessions::<2, GOOD>::quiet(&world) {
+                break;
+            }
+            let action = Sessions::<2, GOOD>::drain_move(&world).expect("a server exit");
+            world.do_move::<GOOD>(action, |(_, answer)| {
+                if answer != Answer::None {
+                    answers.push(answer);
+                }
+            });
+        }
         assert_eq!(answers, [writer_answer, Answer::NoContent]);
+        assert!(Sessions::<2, GOOD>::quiet(&world));
     }
 }
 
