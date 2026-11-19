@@ -7,8 +7,8 @@ use std::time::{Duration, Instant};
 #[path = "session_oracle.rs"]
 mod session_oracle;
 use session_oracle::{
-    ClientRecord, Delivery, End, Failure, Id, Invariant, Op, Producer, Seen, Sent, StoreRecord,
-    Stream, TerminalWrite, Version,
+    ClientRecord, Delivery, End, Failure, IDLE_TICKS, Id, Invariant, Op, Producer, Seen, Sent,
+    StoreRecord, Stream, TerminalWrite, Version,
 };
 
 const ORDINARY_DEPTH: usize = 5;
@@ -43,6 +43,11 @@ const WRITE_DURING_COMMIT: u8 = 21;
 const STALE_REPEAT_EFFECT: u8 = 22;
 const FAILED_ROLLBACK_REMOVES: u8 = 23;
 const DROP_WITHOUT_CANCEL: u8 = 24;
+const REPLACEMENT_WITHOUT_RETIRE: u8 = 25;
+const COMMIT_DROP_CANCELS: u8 = 26;
+const CHANGE_REMOVES: u8 = 27;
+const READ_DROP_WITHOUT_CANCEL: u8 = 28;
+const PING_WITHOUT_TOUCH: u8 = 29;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Request {
@@ -319,6 +324,7 @@ impl<const N: usize> World<N> {
         (
             clients,
             self.store.version,
+            self.store.tick,
             self.store.external_publication,
             self.rights,
             self.rights_changed,
@@ -370,8 +376,8 @@ enum Move {
     Stream(usize, Stream),
     // One try_lock visit by the periodic sweep, whose interval derives from the idle limit.
     Sweep(usize),
-    // Jump past the idle deadline, independent of the sweep cadence.
-    IdleLimitPassed,
+    // Advance idle time independently of the sweep cadence.
+    IdleTick,
     LifeClock,
     OtherCommit,
     RulesChange,
@@ -407,8 +413,11 @@ impl<const N: usize> World<N> {
             REPLAY_OBSERVED | WRITE_STARTS_SWITCH => Some(Invariant::I1),
             DROP_TO_U | STALE_REPEAT_EFFECT => Some(Invariant::I8),
             READ_WITHOUT_SNAPSHOT | LOST_REPEAT => Some(Invariant::I5),
-            NO_IDLE_EXPIRY => Some(Invariant::I6),
-            DROP_WITHOUT_CANCEL => Some(Invariant::I10),
+            NO_IDLE_EXPIRY | PING_WITHOUT_TOUCH => Some(Invariant::I6),
+            DROP_WITHOUT_CANCEL | READ_DROP_WITHOUT_CANCEL => Some(Invariant::I10),
+            REPLACEMENT_WITHOUT_RETIRE | COMMIT_DROP_CANCELS | CHANGE_REMOVES => {
+                Some(Invariant::InvalidTransition)
+            }
             UNKNOWN_ROLLBACK
             | JOIN_ANSWER
             | STALE_LOOKUP
@@ -497,6 +506,116 @@ impl<const N: usize> World<N> {
 struct Transition {
     step: Step,
     release_guard: bool,
+}
+
+#[derive(Clone, Copy)]
+enum StepUse {
+    Begin,
+    Request,
+    Detached,
+    Settle,
+    Expiry,
+    TaskDrop,
+    TaskEnd,
+    TaskReady,
+    CommitExit { without_waiter: Option<End> },
+    Reply,
+    Notice,
+    Replace,
+    Restart,
+}
+
+impl StepUse {
+    fn handles_effect(self, input: State, event: Event, effect: Effect) -> bool {
+        use Effect::*;
+        match self {
+            Self::Begin => effect == Create,
+            Self::Request => matches!(
+                effect,
+                None | Touch
+                    | Append
+                    | StartSwitch
+                    | StartWrite
+                    | TakeSnapshot
+                    | ReplayIntents
+                    | CommitDelta
+                    | Remove
+                    | StampEnd
+                    | WaitOutcome
+            ),
+            // The detached handler rejects any requested effect through I8.
+            Self::Detached => true,
+            Self::Settle => match input {
+                State::S => effect == RestoreIntents,
+                State::Pw | State::C => effect == StampEnd,
+                State::U | State::P | State::E(_) | State::G | State::Gone => false,
+            },
+            Self::Expiry => match event {
+                Event::IdleLimit => matches!(effect, Remove | None),
+                Event::LongestLife => matches!(effect, StampEnd | None),
+                _ => false,
+            },
+            Self::TaskDrop => {
+                effect == None || (effect == TryCancel && matches!(input, State::S | State::Pw))
+            }
+            Self::TaskEnd => match (input, event) {
+                (State::S, Event::Swapped) => effect == SwapAndRead,
+                (State::Pw, Event::Swapped) => effect == Swap,
+                (State::S, Event::EvaluationFailed(_)) => effect == RestoreIntents,
+                (State::Pw, Event::EvaluationFailed(_) | Event::LongestLife) => effect == StampEnd,
+                (_, Event::OrphanEnded) => matches!(effect, Record(_) | None),
+                _ => false,
+            },
+            Self::TaskReady => {
+                effect == None
+                    || (effect == TakeSnapshot
+                        && matches!(
+                            event,
+                            Event::TaskReady {
+                                switch: true,
+                                record: Observation::Published
+                                    | Observation::Ended(Outcome::Committed),
+                            }
+                        ))
+            }
+            Self::CommitExit { .. } => matches!(effect, Record(_) | None),
+            Self::Reply | Self::Notice => effect == None,
+            Self::Replace => effect == RetireMap,
+            Self::Restart => {
+                if input == State::G {
+                    effect == None
+                } else {
+                    effect == Forget
+                }
+            }
+        }
+    }
+
+    fn handles_answer(self, answer: Answer) -> bool {
+        match self {
+            Self::Begin => answer == Answer::Created,
+            Self::Request
+            | Self::Detached
+            | Self::TaskReady
+            | Self::Reply
+            | Self::CommitExit {
+                without_waiter: None,
+            } => true,
+            Self::CommitExit {
+                without_waiter: Some(end),
+            } => {
+                // The exit still presents the terminal outcome even after its waiter leaves.
+                seen(&answer) == Seen::Commit(end, true)
+            }
+            Self::Settle
+            | Self::Expiry
+            | Self::TaskDrop
+            | Self::TaskEnd
+            | Self::Notice
+            | Self::Replace
+            | Self::Restart => answer == Answer::None,
+        }
+    }
 }
 
 fn transition<const MUTATION: u8>(state: State, event: Event) -> Transition {
@@ -600,6 +719,13 @@ fn transition<const MUTATION: u8>(state: State, event: Event) -> Transition {
             Event::Action(Action::Rollback),
         ) => result.effect = Effect::Remove,
         (DROP_WITHOUT_CANCEL, State::Pw, Event::Dropped) => result.effect = Effect::None,
+        (REPLACEMENT_WITHOUT_RETIRE, _, Event::RepositoryReplaced) => result.effect = Effect::None,
+        (COMMIT_DROP_CANCELS, State::C, Event::Dropped) => result.effect = Effect::TryCancel,
+        (CHANGE_REMOVES, State::U, Event::Changed(Change::RevisionOrRules)) => {
+            result.effect = Effect::Remove;
+        }
+        (READ_DROP_WITHOUT_CANCEL, State::S, Event::Dropped) => result.effect = Effect::None,
+        (PING_WITHOUT_TOUCH, State::U, Event::Action(Action::Ping)) => result.effect = Effect::None,
         _ => {}
     }
     Transition {
@@ -609,23 +735,37 @@ fn transition<const MUTATION: u8>(state: State, event: Event) -> Transition {
 }
 
 impl<const N: usize> World<N> {
+    fn checked_transition<const MUTATION: u8>(
+        &mut self,
+        input: State,
+        event: Event,
+        site: StepUse,
+    ) -> Transition {
+        let result = transition::<MUTATION>(input, event);
+        if result.step.effect == Effect::LogBadTransition
+            || !site.handles_effect(input, event, result.step.effect)
+            || !site.handles_answer(result.step.answer)
+        {
+            self.violate::<MUTATION>(Invariant::InvalidTransition);
+        }
+        result
+    }
+
     fn event<const MUTATION: u8>(
         &mut self,
         id: usize,
         event: Event,
         locked: bool,
+        site: StepUse,
         report: &mut impl FnMut(ReportedAnswer),
     ) -> Step {
         let before = self.sessions[id];
         let Transition {
             step: result,
             release_guard,
-        } = transition::<MUTATION>(before.state, event);
+        } = self.checked_transition::<MUTATION>(before.state, event, site);
         if result.next != before.state || release_guard {
             self.session_write::<MUTATION>(id, locked);
-        }
-        if result.effect == Effect::LogBadTransition {
-            self.violate::<MUTATION>(Invariant::InvalidTransition);
         }
         self.sessions[id].state = result.next;
         if release_guard && let Some(slot) = before.ticket {
@@ -668,7 +808,8 @@ impl<const N: usize> World<N> {
             && !self.store.retired
             && txn.end.is_none()
         {
-            txn.idle = false;
+            txn.touched_at = self.store.tick;
+            txn.activity_at = self.store.tick;
         }
         txn.guards &= !(1 << slot);
         session.release_guard(slot);
@@ -680,6 +821,14 @@ impl<const N: usize> World<N> {
         self.store.transactions[id].pin_rights = None;
     }
 
+    fn restore_intents(&mut self, id: usize) {
+        self.release_pin(id);
+        let txn = &mut self.store.transactions[id];
+        txn.first_capture = None;
+        txn.cancelled_switch = None;
+        txn.settling = false;
+    }
+
     fn finish(&mut self, id: usize, end: End, rights: bool) {
         self.release_pin(id);
         self.sessions[id].expired = false;
@@ -687,7 +836,8 @@ impl<const N: usize> World<N> {
         txn.end = Some(end);
         txn.evidence_rights = rights;
         txn.pending = 0;
-        txn.idle = false;
+        txn.touched_at = self.store.tick;
+        txn.activity_at = self.store.tick;
         txn.settling = false;
     }
 
@@ -701,15 +851,13 @@ impl<const N: usize> World<N> {
     fn settle<const MUTATION: u8>(&mut self, id: usize, report: &mut impl FnMut(ReportedAnswer)) {
         let session = self.sessions[id];
         if let Some(outcome) = session.terminal.filter(|_| session.can_settle()) {
-            let result = self.event::<MUTATION>(id, Event::Settled(outcome), true, report);
+            let result =
+                self.event::<MUTATION>(id, Event::Settled(outcome), true, StepUse::Settle, report);
             self.sessions[id].terminal = None;
             match result.effect {
                 Effect::RestoreIntents => {
                     self.session_write::<MUTATION>(id, true);
-                    self.release_pin(id);
-                    let txn = &mut self.store.transactions[id];
-                    txn.first_capture = None;
-                    txn.settling = false;
+                    self.restore_intents(id);
                 }
                 Effect::StampEnd => {
                     self.session_write::<MUTATION>(id, true);
@@ -717,7 +865,8 @@ impl<const N: usize> World<N> {
                     self.sessions[id].expired = false;
                     let txn = &mut self.store.transactions[id];
                     txn.pending = 0;
-                    txn.idle = false;
+                    txn.touched_at = self.store.tick;
+                    txn.activity_at = self.store.tick;
                     txn.settling = false;
                 }
                 _ => {}
@@ -736,7 +885,13 @@ impl<const N: usize> World<N> {
             if let Some(request) = request {
                 let txn = self.store.transactions[id];
                 let action = self.sessions[id].action(request.op, rights, &txn);
-                let result = self.event::<MUTATION>(id, Event::Detached(action), true, report);
+                let result = self.event::<MUTATION>(
+                    id,
+                    Event::Detached(action),
+                    true,
+                    StepUse::Detached,
+                    report,
+                );
                 self.answer_detached::<MUTATION>(id, request, result, true);
             }
             return;
@@ -745,17 +900,24 @@ impl<const N: usize> World<N> {
         let session = self.sessions[id];
         let txn = self.store.transactions[id];
         if session.expired && session.state == State::P {
-            let result = self.event::<MUTATION>(id, Event::LongestLife, true, report);
+            let result =
+                self.event::<MUTATION>(id, Event::LongestLife, true, StepUse::Expiry, report);
             if result.effect == Effect::StampEnd {
                 self.session_write::<MUTATION>(id, true);
                 self.finish(id, End::Failed(Failure::LongestLife), rights);
             }
-        } else if txn.idle
+        } else if txn.idle_due(self.store.tick)
             && txn.mapped
             && matches!(session.state, State::U | State::P | State::E(_))
         {
-            let result = self.event::<MUTATION>(id, Event::IdleLimit, true, report);
+            let result =
+                self.event::<MUTATION>(id, Event::IdleLimit, true, StepUse::Expiry, report);
             if result.effect == Effect::Remove {
+                self.store.idle_removal = Some(id);
+                if !session_oracle::i6(&self.clients[id], &self.store) {
+                    self.violate::<MUTATION>(Invariant::I6);
+                }
+                self.store.idle_removal = None;
                 self.session_write::<MUTATION>(id, true);
                 self.remove(id);
             }
@@ -764,12 +926,16 @@ impl<const N: usize> World<N> {
         let txn = self.store.transactions[id];
         let action = self.sessions[id].action(request.op, rights, &txn);
         if !txn.mapped {
-            let result = self.event::<MUTATION>(id, Event::Action(action), true, report);
+            let result =
+                self.event::<MUTATION>(id, Event::Action(action), true, StepUse::Detached, report);
             self.answer_detached::<MUTATION>(id, request, result, true);
             return;
         }
         let delivery = txn.request_delivery(false, rights);
         self.store.transactions[id].producers[request.id] = None;
+        if !txn.worker && txn.end.is_none() {
+            self.store.transactions[id].activity_at = self.store.tick;
+        }
         let bit = if request.op == Op::Write {
             let bit = if !txn.worker && txn.end.is_none() {
                 self.sessions[id].next_write()
@@ -781,7 +947,8 @@ impl<const N: usize> World<N> {
         } else {
             0
         };
-        let result = self.event::<MUTATION>(id, Event::Action(action), true, report);
+        let result =
+            self.event::<MUTATION>(id, Event::Action(action), true, StepUse::Request, report);
         if matches!(
             result.effect,
             Effect::Append
@@ -804,9 +971,9 @@ impl<const N: usize> World<N> {
             Effect::Append => {
                 txn.pending |= bit;
                 txn.applied |= bit;
-                txn.idle = false;
+                txn.touched_at = self.store.tick;
             }
-            Effect::Touch => txn.idle = false,
+            Effect::Touch => txn.touched_at = self.store.tick,
             Effect::StartSwitch | Effect::StartWrite => {
                 let switch = result.effect == Effect::StartSwitch;
                 if switch {
@@ -831,7 +998,7 @@ impl<const N: usize> World<N> {
                 });
                 txn.guards |= 1 << slot;
                 txn.producers[request.id] = Some(Producer::Task { slot, switch });
-                txn.idle = false;
+                txn.touched_at = self.store.tick;
             }
             Effect::TakeSnapshot => {
                 session.read = session.pin.map(|pin| Read {
@@ -843,7 +1010,7 @@ impl<const N: usize> World<N> {
                 if session.read.is_some() {
                     txn.producers[request.id] = Some(Producer::Read);
                 }
-                txn.idle = false;
+                txn.touched_at = self.store.tick;
             }
             Effect::ReplayIntents | Effect::CommitDelta => {
                 session.commit = Some(Commit {
@@ -911,6 +1078,7 @@ impl<const N: usize> World<N> {
                 record: task.observe(),
             },
             false,
+            StepUse::TaskReady,
             report,
         );
         let session = &mut self.sessions[id];
@@ -972,11 +1140,14 @@ impl<const N: usize> World<N> {
                         session.waiting = Some(request);
                     }
                 } else {
-                    let result = transition::<MUTATION>(
-                        State::G,
-                        Event::Action(session.action(op, rights, txn)),
-                    )
-                    .step;
+                    let action = session.action(op, rights, txn);
+                    let result = self
+                        .checked_transition::<MUTATION>(
+                            State::G,
+                            Event::Action(action),
+                            StepUse::Detached,
+                        )
+                        .step;
                     if result.next != State::G {
                         self.session_write::<MUTATION>(id, false);
                     }
@@ -1006,14 +1177,24 @@ impl<const N: usize> World<N> {
             Move::DropTaskRequest(id, slot) => {
                 let task = self.sessions[id].tasks[slot].unwrap();
                 if task.phase == Phase::Pending {
-                    self.store.transactions[id].dropped_unclaimed |= task.bit;
+                    let txn = &mut self.store.transactions[id];
+                    txn.dropped_unclaimed |= task.bit;
+                    if task.switch {
+                        txn.cancelled_switch = Some(slot);
+                    }
                 }
                 self.abandon(id, task.request);
                 if matches!(task.phase, Phase::Recorded(_)) {
                     self.sessions[id].tasks[slot] = None;
                     return;
                 }
-                let result = self.event::<MUTATION>(id, Event::Dropped, false, &mut report);
+                let result = self.event::<MUTATION>(
+                    id,
+                    Event::Dropped,
+                    false,
+                    StepUse::TaskDrop,
+                    &mut report,
+                );
                 let session = &mut self.sessions[id];
                 session.tasks[slot].as_mut().unwrap().awaiting = false;
                 if result.effect == Effect::TryCancel {
@@ -1037,7 +1218,7 @@ impl<const N: usize> World<N> {
                 self.abandon(id, repeat.request);
             }
             Move::DropCommitRequest(id) => {
-                self.event::<MUTATION>(id, Event::Dropped, false, &mut report);
+                self.event::<MUTATION>(id, Event::Dropped, false, StepUse::Notice, &mut report);
                 let commit = self.sessions[id].commit.as_mut().unwrap();
                 commit.awaiting = false;
                 let request = commit.request;
@@ -1063,10 +1244,11 @@ impl<const N: usize> World<N> {
                     (Event::Swapped, End::Committed)
                 };
                 let result = if task.guard {
-                    self.event::<MUTATION>(id, event, true, &mut report)
+                    self.event::<MUTATION>(id, event, true, StepUse::TaskEnd, &mut report)
                 } else {
                     // The lost-write mutation leaves an older scratch buffer running.
-                    transition::<MUTATION>(State::Pw, event).step
+                    self.checked_transition::<MUTATION>(State::Pw, event, StepUse::TaskEnd)
+                        .step
                 };
                 if orphaned {
                     if let Some((_, recorded)) =
@@ -1088,15 +1270,14 @@ impl<const N: usize> World<N> {
                     }
                     Effect::RestoreIntents => {
                         self.session_write::<MUTATION>(id, task.guard);
-                        self.release_pin(id);
-                        self.store.transactions[id].first_capture = None;
+                        self.restore_intents(id);
                     }
                     Effect::Swap | Effect::SwapAndRead => {
                         self.session_write::<MUTATION>(id, task.guard);
                         let txn = &mut self.store.transactions[id];
                         txn.pending = task.scratch;
                         txn.applied |= task.scratch;
-                        self.store.at_swap = Some(id);
+                        self.store.at_swap = Some((id, slot));
                     }
                     _ => {}
                 }
@@ -1147,12 +1328,19 @@ impl<const N: usize> World<N> {
                     Exit::NeverRan => End::Failed(Failure::NotRun),
                     Exit::Claimed => End::Failed(Failure::Unpublished),
                 };
-                let result =
-                    self.event::<MUTATION>(id, Event::WorkerExit(exit), false, &mut |reply| {
+                let result = self.event::<MUTATION>(
+                    id,
+                    Event::WorkerExit(exit),
+                    false,
+                    StepUse::CommitExit {
+                        without_waiter: (!commit.awaiting).then_some(end),
+                    },
+                    &mut |reply| {
                         if commit.awaiting {
                             report(reply);
                         }
-                    });
+                    },
+                );
                 let recorded = self.record_terminal::<MUTATION>(id, end, result.effect);
                 let txn = &mut self.store.transactions[id];
                 txn.end = Some(end);
@@ -1182,8 +1370,13 @@ impl<const N: usize> World<N> {
                 } else {
                     Observation::InProgress
                 };
-                let result =
-                    self.event::<MUTATION>(id, Event::CommitGrace(record), false, &mut report);
+                let result = self.event::<MUTATION>(
+                    id,
+                    Event::CommitGrace(record),
+                    false,
+                    StepUse::Reply,
+                    &mut report,
+                );
                 self.sessions[id].commit.as_mut().unwrap().awaiting = false;
                 self.receive::<MUTATION>(id, commit.request, result.answer, Delivery::CommitGrace);
             }
@@ -1197,6 +1390,7 @@ impl<const N: usize> World<N> {
                         same_rights,
                     },
                     false,
+                    StepUse::Reply,
                     &mut report,
                 );
                 self.receive::<MUTATION>(id, repeat.request, result.answer, Delivery::Repeat);
@@ -1215,6 +1409,7 @@ impl<const N: usize> World<N> {
                         end: stream_end,
                     },
                     false,
+                    StepUse::Reply,
                     &mut report,
                 );
                 let tags = if read.pin.rights && matches!(end, Stream::Data | Stream::Aborted) {
@@ -1235,26 +1430,19 @@ impl<const N: usize> World<N> {
             }
             Move::Sweep(id) => {
                 let txn = &self.store.transactions[id];
-                let idle_pin = txn.mapped
+                let idle_due = txn.mapped
                     && !self.store.retired
-                    && txn.idle
-                    && txn.pinned
+                    && txn.expected_idle_due(self.store.tick)
                     && !txn.settling
                     && !txn.worker
                     && txn.guards == 0;
                 self.swept = true;
                 self.section::<MUTATION>(id, None, &mut report);
-                if idle_pin && !session_oracle::i6(&self.clients[id], &self.store) {
+                if idle_due && !session_oracle::i6(&self.clients[id], &self.store) {
                     self.violate::<MUTATION>(Invariant::I6);
                 }
             }
-            Move::IdleLimitPassed => {
-                for txn in &mut self.store.transactions {
-                    if txn.mapped {
-                        txn.idle = true;
-                    }
-                }
-            }
+            Move::IdleTick => self.store.tick += 1,
             Move::LifeClock => {
                 for session in &mut self.sessions {
                     if matches!(session.state, State::P | State::Pw) {
@@ -1270,18 +1458,41 @@ impl<const N: usize> World<N> {
             }
             Move::NoOpChange => {}
             Move::ReplaceRepository => {
+                let mut retire = true;
                 for id in 0..N {
-                    self.event::<MUTATION>(id, Event::RepositoryReplaced, false, &mut report);
+                    let result = self.event::<MUTATION>(
+                        id,
+                        Event::RepositoryReplaced,
+                        false,
+                        StepUse::Replace,
+                        &mut report,
+                    );
+                    retire &= result.effect == Effect::RetireMap;
                 }
-                self.store.retired = true;
-                for txn in &mut self.store.transactions {
-                    txn.settling = false;
+                if retire {
+                    self.store.retired = true;
+                    for txn in &mut self.store.transactions {
+                        txn.settling = false;
+                    }
                 }
             }
             Move::Restart => {
                 self.restarted = true;
-                self.sessions.fill(Session::new(State::G));
-                for (client, txn) in self.clients.iter_mut().zip(&mut self.store.transactions) {
+                for id in 0..N {
+                    let result = self
+                        .checked_transition::<MUTATION>(
+                            self.sessions[id].state,
+                            Event::Restart,
+                            StepUse::Restart,
+                        )
+                        .step;
+                    report((Some(result.cell), result.answer));
+                    if result.effect != Effect::Forget {
+                        continue;
+                    }
+                    self.sessions[id] = Session::new(result.next);
+                    let client = &mut self.clients[id];
+                    let txn = &mut self.store.transactions[id];
                     client.owed.fill(None);
                     txn.mapped = false;
                     txn.pinned = false;
@@ -1302,7 +1513,13 @@ impl<const N: usize> World<N> {
         };
         if let Some(change) = change {
             for id in 0..N {
-                self.event::<MUTATION>(id, Event::Changed(change), false, &mut report);
+                self.event::<MUTATION>(
+                    id,
+                    Event::Changed(change),
+                    false,
+                    StepUse::Notice,
+                    &mut report,
+                );
             }
         }
     }
@@ -1314,9 +1531,8 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
     const DRAIN_BOUND: usize = 16 * N;
 
     fn start() -> World<N> {
-        let begin = step(&State::G, &Event::Begin { valid_level: true });
         let mut world = World {
-            sessions: [Session::new(begin.next); N],
+            sessions: [Session::new(State::G); N],
             clients: std::array::from_fn(|id| ClientRecord {
                 transaction: id,
                 ..ClientRecord::default()
@@ -1328,6 +1544,17 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
             restarted: false,
             violation: None,
         };
+        let begin = world
+            .checked_transition::<GOOD>(
+                State::G,
+                Event::Begin { valid_level: true },
+                StepUse::Begin,
+            )
+            .step;
+        if begin.effect != Effect::Create || world.violation.is_some() {
+            return world;
+        }
+        world.sessions.fill(Session::new(begin.next));
         // Begin and one completed first read are fixture setup. This leaves an
         // observed client for the two-write witness and U clients for the switch.
         let pinned = N - 1;
@@ -1352,8 +1579,10 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
         if FOCUS == GOOD {
             moves.push(Move::Restart);
         }
-        if matches!(FOCUS, REPLAY_OBSERVED | WRITE_STARTS_SWITCH)
-            && world.store.external_publication.is_none()
+        if matches!(
+            FOCUS,
+            REPLAY_OBSERVED | WRITE_STARTS_SWITCH | CHANGE_REMOVES
+        ) && world.store.external_publication.is_none()
         {
             moves.push(Move::OtherCommit);
         }
@@ -1363,11 +1592,16 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
         {
             moves.push(Move::LifeClock);
         }
-        if matches!(FOCUS, REMOVED_WITHOUT_GONE | STALE_REPEAT_EFFECT)
-            && world.store.transactions[0].mapped
-            && !world.store.transactions[0].idle
+        if matches!(
+            FOCUS,
+            REMOVED_WITHOUT_GONE | STALE_REPEAT_EFFECT | PING_WITHOUT_TOUCH
+        ) && world.store.transactions[0].mapped
+            && world.store.tick < IDLE_TICKS
         {
-            moves.push(Move::IdleLimitPassed);
+            moves.push(Move::IdleTick);
+        }
+        if FOCUS == REPLACEMENT_WITHOUT_RETIRE && !world.store.retired {
+            moves.push(Move::ReplaceRepository);
         }
         if FOCUS == GOOD && !world.store.retired {
             moves.extend([Move::ReplaceRepository, Move::NoOpChange]);
@@ -1380,13 +1614,10 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
             if !world.rights_changed {
                 moves.push(Move::RightsChange);
             }
-            if world
-                .store
-                .transactions
-                .iter()
-                .any(|txn| txn.mapped && !txn.idle)
+            if world.store.tick < IDLE_TICKS
+                && world.store.transactions.iter().any(|txn| txn.mapped)
             {
-                moves.push(Move::IdleLimitPassed);
+                moves.push(Move::IdleTick);
             }
             if world
                 .sessions
@@ -1456,7 +1687,10 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
                 && txn.mapped
                 && !world.store.retired
                 && !s.held()
-                && (txn.idle || s.expired || s.can_settle())
+                && (txn.idle_due(world.store.tick)
+                    || txn.expected_idle_due(world.store.tick)
+                    || s.expired
+                    || s.can_settle())
             {
                 moves.push(Move::Sweep(id));
             }
@@ -1599,7 +1833,13 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
                 return Some(Move::RollbackLock(id));
             }
             let txn = &world.store.transactions[id];
-            if !world.store.retired && txn.mapped && (s.can_settle() || txn.idle || s.expired) {
+            if !world.store.retired
+                && txn.mapped
+                && (s.can_settle()
+                    || txn.idle_due(world.store.tick)
+                    || txn.expected_idle_due(world.store.tick)
+                    || s.expired)
+            {
                 return Some(Move::Sweep(id));
             }
         }
@@ -1609,7 +1849,7 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
                 .transactions
                 .iter()
                 .any(|txn| txn.mapped && txn.pinned))
-        .then_some(Move::IdleLimitPassed)
+        .then_some(Move::IdleTick)
     }
 
     fn answer(world: &World<N>, action: &Move, _next: &World<N>) -> String {
@@ -1806,6 +2046,36 @@ fn explorer_rejects_an_unclaimed_write_after_handler_drop() {
     red::<DROP_WITHOUT_CANCEL>("I10");
 }
 
+// X4: replacement retires the old map through its returned effect.
+#[test]
+fn explorer_rejects_replacement_without_retirement() {
+    red::<REPLACEMENT_WITHOUT_RETIRE>("InvalidTransition");
+}
+
+// C12: dropping the COMMIT handler leaves the worker running.
+#[test]
+fn explorer_rejects_commit_handler_cancel() {
+    red::<COMMIT_DROP_CANCELS>("InvalidTransition");
+}
+
+// U10: a revision notification leaves the session alone.
+#[test]
+fn explorer_rejects_removal_on_revision_notice() {
+    red::<CHANGE_REMOVES>("InvalidTransition");
+}
+
+// S6: dropping the first read before claim cannot leave its pin in use.
+#[test]
+fn explorer_rejects_unclaimed_read_after_handler_drop() {
+    red::<READ_DROP_WITHOUT_CANCEL>("I10");
+}
+
+// U5: PING advances the idle deadline, so the next tick cannot expire the session.
+#[test]
+fn explorer_rejects_ping_without_idle_refresh() {
+    red::<PING_WITHOUT_TOUCH>("I6");
+}
+
 #[test]
 fn oracle_source_uses_only_its_records() {
     let source = include_str!("session_oracle.rs");
@@ -1925,7 +2195,8 @@ fn sweep_uses_idle_deadline_after_guard_release() {
     for action in [
         Move::Lookup(1, Op::Write),
         Move::SessionLock(1),
-        Move::IdleLimitPassed,
+        Move::IdleTick,
+        Move::IdleTick,
         Move::Swap(1, 0),
         Move::DropGuard(1, 0, End::Committed),
     ] {
@@ -1934,7 +2205,10 @@ fn sweep_uses_idle_deadline_after_guard_release() {
     let mut expired = live.clone();
     live.do_move::<GOOD>(Move::Sweep(1), |_| {});
     assert!(live.store.transactions[1].mapped);
-    expired.do_move::<GOOD>(Move::IdleLimitPassed, |_| {});
+    expired.do_move::<GOOD>(Move::IdleTick, |_| {});
+    expired.do_move::<GOOD>(Move::Sweep(1), |_| {});
+    assert!(expired.store.transactions[1].mapped);
+    expired.do_move::<GOOD>(Move::IdleTick, |_| {});
     expired.do_move::<GOOD>(Move::Sweep(1), |_| {});
     assert!(!expired.store.transactions[1].mapped);
 }
@@ -2033,7 +2307,7 @@ fn green<const N: usize>() {
         (ORDINARY_DEPTH, ORDINARY_WORLDS)
     };
     eprintln!(
-        "Stimulus budget: one of each server change and one sweep per path, two write attempts under the lock per live session, one waiting request per session plus one racing ROLLBACK. Depth N means every schedule of N moves within this budget, not every schedule of N events."
+        "Stimulus budget: one of each server change and one sweep per path, two idle ticks per search path, two write attempts under the lock per live session, one waiting request per session plus one racing ROLLBACK. Depth N means every schedule of N moves within this budget, not every schedule of N events."
     );
     eprintln!(
         "Server drain may go beyond search depth, up to {} moves.",

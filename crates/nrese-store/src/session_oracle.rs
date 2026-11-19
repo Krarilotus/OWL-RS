@@ -15,6 +15,7 @@ use names::{Action, Cell, Effect, Event, Outcome, State, Step};
 
 pub(super) type Version = (u8, u8);
 pub(super) type Id = usize;
+pub(super) const IDLE_TICKS: u8 = 2;
 const SLOTS: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -95,6 +96,7 @@ pub(super) struct ClientRecord {
     pub acknowledged: u8,
     pub refused: u8,
     pub abandoned: u8,
+    pub abandoned_read: bool,
     pub receipt: Option<Receipt>,
 }
 
@@ -106,6 +108,7 @@ impl ClientRecord {
             self.acknowledged,
             self.refused,
             self.abandoned,
+            self.abandoned_read,
         )
     }
 
@@ -141,10 +144,12 @@ impl ClientRecord {
     }
 
     pub fn abandon(&mut self, id: Id) {
-        if let Some(sent) = self.owed[id].take()
-            && sent.op == Op::Write
-        {
-            self.abandoned |= sent.tag;
+        if let Some(sent) = self.owed[id].take() {
+            match sent.op {
+                Op::Write => self.abandoned |= sent.tag,
+                Op::Read => self.abandoned_read = true,
+                Op::Commit | Op::Rollback | Op::Ping => {}
+            }
         }
     }
 }
@@ -216,10 +221,12 @@ pub(super) struct Transaction {
     pub pinned: bool,
     pub pin_rights: Option<bool>,
     pub first_capture: Option<Version>,
-    pub idle: bool,
+    pub touched_at: u8,
+    pub activity_at: u8,
     pub pending: u8,
     pub applied: u8,
     pub dropped_unclaimed: u8,
+    pub cancelled_switch: Option<Id>,
     pub publication: Option<Publication>,
     pub published_twice: bool,
     pub read_only: bool,
@@ -239,10 +246,12 @@ impl Default for Transaction {
             pinned: false,
             pin_rights: None,
             first_capture: None,
-            idle: false,
+            touched_at: 0,
+            activity_at: 0,
             pending: 0,
             applied: 0,
             dropped_unclaimed: 0,
+            cancelled_switch: None,
             publication: None,
             published_twice: false,
             read_only: false,
@@ -258,6 +267,14 @@ impl Default for Transaction {
 }
 
 impl Transaction {
+    pub fn idle_due(self, tick: u8) -> bool {
+        tick - self.touched_at >= IDLE_TICKS
+    }
+
+    pub fn expected_idle_due(self, tick: u8) -> bool {
+        tick - self.activity_at >= IDLE_TICKS
+    }
+
     pub fn request_delivery(self, retired: bool, rights: bool) -> Delivery {
         Delivery::Request {
             missing: retired || !self.mapped,
@@ -272,11 +289,13 @@ impl Transaction {
 pub(super) struct StoreRecord<const N: usize> {
     pub transactions: [Transaction; N],
     pub version: Version,
+    pub tick: u8,
     pub retired: bool,
     pub external_publication: Option<Publication>,
     pub delivery: Option<Delivery>,
     pub terminal_write: Option<TerminalWrite>,
-    pub at_swap: Option<Id>,
+    pub at_swap: Option<(Id, Id)>,
+    pub idle_removal: Option<Id>,
     pub write: Option<(bool, bool, bool)>,
 }
 
@@ -285,11 +304,13 @@ impl<const N: usize> Default for StoreRecord<N> {
         Self {
             transactions: [Transaction::default(); N],
             version: (0, 0),
+            tick: 0,
             retired: false,
             external_publication: None,
             delivery: None,
             terminal_write: None,
             at_swap: None,
+            idle_removal: None,
             write: None,
         }
     }
@@ -467,7 +488,9 @@ pub(super) fn i4<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
     let txn = store.transaction(client);
     let valid = |tags: u8| client.acknowledged & !tags == 0 && client.refused & tags == 0;
     !txn.published_twice
-        && (!(store.at_swap == Some(client.transaction)
+        && (!(store
+            .at_swap
+            .is_some_and(|(id, _)| id == client.transaction)
             || (txn.mapped && !store.retired && txn.end.is_none() && !txn.worker))
             || valid(txn.pending))
         && txn
@@ -505,10 +528,15 @@ pub(super) fn no_work_owed<const N: usize>(client: &ClientRecord, store: &StoreR
     client.owed.iter().all(Option::is_none) && txn.guards == 0 && !txn.worker && !txn.settling
 }
 
-// Round 7 F1 and lifecycle rule 6: idle expiry releases abandoned private state.
+// Round 7 F1 and rule 6: activity refreshes the deadline, and expiry releases private state.
 pub(super) fn i6<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) -> bool {
     let txn = store.transaction(client);
-    store.retired || !txn.mapped || (!txn.pinned && !txn.idle)
+    let due = txn.expected_idle_due(store.tick);
+    if store.idle_removal == Some(client.transaction) {
+        due
+    } else {
+        store.retired || !txn.mapped || (!txn.pinned && !due)
+    }
 }
 
 // §2 invariant 4 and N3: protected data and evidence respect the rights on arrival.
@@ -560,5 +588,17 @@ pub(super) fn i9<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
 pub(super) fn i10<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) -> bool {
     let txn = store.transaction(client);
     let written = txn.applied | txn.publication.map_or(0, |publication| publication.tags);
-    client.abandoned & txn.dropped_unclaimed & written == 0
+    if client.abandoned & txn.dropped_unclaimed & written != 0 {
+        return false;
+    }
+    if let Some(slot) = txn.cancelled_switch.filter(|_| client.abandoned_read) {
+        let swapped = store.at_swap == Some((client.transaction, slot));
+        let kept_pin = txn.mapped
+            && !store.retired
+            && txn.guards == 0
+            && !txn.settling
+            && (txn.pinned || txn.first_capture.is_some());
+        return !swapped && !kept_pin;
+    }
+    true
 }
