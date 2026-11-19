@@ -68,7 +68,7 @@ awk '
         if ($0 ~ /\(self\.store\.lists\)\.commit\(before, summary\.revision, lists_left_out\);$/ && ++lists == 1) next
     }
     line = $0
-    sub(/(^|[^[:alnum:]_#])publishing\(ticket, report, \|\| (tx\.commit\(\)|ql\.commit\(tx\))\)/, "", line)
+    sub(/(^|[^[:alnum:]_#])publishing\(ticket, report, tx, \|tx\| (tx\.commit\(\)|ql\.commit\(tx\))\)/, "", line)
     if (line ~ /(\.|::)[[:space:]]*(r#)?(commit|rematerialise(_until)?)([^[:alnum:]_]|$)/) {
         print "unwrapped transaction publication: " $0
         failed = 1

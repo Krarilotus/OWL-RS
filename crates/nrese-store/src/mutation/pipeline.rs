@@ -466,8 +466,8 @@ impl MutationPipeline {
                 tx.vouch(certificate);
             }
             let (summary, report) = match ql {
-                Some(ql) => publishing(ticket, report, || ql.commit(tx)),
-                None => publishing(ticket, report, || tx.commit()),
+                Some(ql) => publishing(ticket, report, tx, |tx| ql.commit(tx)),
+                None => publishing(ticket, report, tx, |tx| tx.commit()),
             }
             .map_err(|error| MutationError::Store {
                 kind,
@@ -511,7 +511,7 @@ impl MutationPipeline {
             if quarantined && let Err(error) = self.store.rematerialise(&rules) {
                 tracing::error!(%error, "revalidation after a commit in quarantine failed");
             }
-            return Ok(report.clone());
+            return Ok(report);
         }
 
         // Without reasoning, commits don't maintain the inferred stack.
@@ -539,13 +539,14 @@ impl MutationPipeline {
             return Err(MutationError::Cancelled);
         }
         let rights = ticket.hold_rights()?;
-        let (_, report) =
-            publishing(ticket, report, || tx.commit()).map_err(|error| MutationError::Store {
+        let (_, report) = publishing(ticket, report, tx, |tx| tx.commit()).map_err(|error| {
+            MutationError::Store {
                 kind,
                 source: StoreError::Engine(error),
-            })?;
+            }
+        })?;
         drop(rights);
-        Ok(report.clone())
+        Ok(report)
     }
 
     /// The SHACL commit gate (C2): validates what the transaction's changes can affect,

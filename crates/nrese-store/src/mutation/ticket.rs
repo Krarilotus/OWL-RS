@@ -1,7 +1,7 @@
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 
-use nrese_engine::{CommitSummary, EngineError};
+use nrese_engine::{CommitSummary, EngineError, Transaction};
 use nrese_sparql::CancellationToken;
 
 use super::{MutationCommitReport, MutationError};
@@ -13,6 +13,7 @@ const COMMITTING: u8 = 1;
 const CANCELLED: u8 = 2;
 const ENTERED: u8 = 3;
 const ENDED: u8 = 4;
+const PUBLISHED: u8 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MutationState {
@@ -27,7 +28,8 @@ pub enum MutationState {
 #[derive(Default)]
 struct Record {
     state: AtomicU8,
-    published: OnceLock<MutationCommitReport>,
+    report: OnceLock<MutationCommitReport>,
+    revision: AtomicU64,
 }
 
 /// Records the race between a cancellation, a known error and the claim to commit,
@@ -139,32 +141,43 @@ impl MutationTicket {
             PENDING => MutationState::Pending,
             CANCELLED => MutationState::Cancelled,
             COMMITTING => MutationState::Committing,
-            ENTERED if self.published().is_some() => MutationState::Published,
             ENTERED => MutationState::Entered,
+            PUBLISHED => MutationState::Published,
             _ => MutationState::Ended,
         }
     }
 
     /// The original report, including the revision published by this mutation.
-    pub fn published(&self) -> Option<&MutationCommitReport> {
-        self.record.published.get()
+    pub fn published(&self) -> Option<MutationCommitReport> {
+        if self.record.state.load(Ordering::Acquire) != PUBLISHED {
+            return None;
+        }
+        let revision = self.record.revision.load(Ordering::Relaxed);
+        self.record
+            .report
+            .get()
+            .cloned()
+            .map(|report| report.committed(revision))
     }
 }
 
-/// The caller holds the commit claim. Store the report as soon as the commit returns Ok,
-/// before the caller can run any maintenance.
-pub(super) fn publishing(
+/// The caller holds the commit claim. Prepare the report before entering the engine so
+/// the publication note only has to store the revision and state.
+pub(super) fn publishing<'e>(
     ticket: &MutationTicket,
     report: MutationCommitReport,
-    commit: impl FnOnce() -> Result<CommitSummary, EngineError>,
-) -> Result<(CommitSummary, &MutationCommitReport), EngineError> {
+    mut tx: Transaction<'e>,
+    commit: impl FnOnce(Transaction<'e>) -> Result<CommitSummary, EngineError>,
+) -> Result<(CommitSummary, MutationCommitReport), EngineError> {
+    let report = ticket.record.report.get_or_init(|| report);
+    let record = Arc::clone(&ticket.record);
+    tx.note_publication(Box::new(move |revision| {
+        record.revision.store(revision, Ordering::Relaxed);
+        record.state.store(PUBLISHED, Ordering::Release);
+    }));
     ticket.record.state.store(ENTERED, Ordering::Release);
-    let summary = commit()?;
-    let report = ticket
-        .record
-        .published
-        .get_or_init(|| report.committed(summary.revision));
-    Ok((summary, report))
+    let summary = commit(tx)?;
+    Ok((summary, report.clone().committed(summary.revision)))
 }
 
 #[cfg(test)]

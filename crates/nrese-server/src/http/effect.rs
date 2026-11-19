@@ -84,10 +84,7 @@ pub(super) async fn run<H: Send + 'static>(
                 match end.wait_or(sleep_until(Instant::now() + duration)).await {
                     Some(record) => Some(record),
                     None => {
-                        return ticket
-                            .published()
-                            .cloned()
-                            .ok_or_else(|| ApiError::busy(message));
+                        return ticket.published().ok_or_else(|| ApiError::busy(message));
                     }
                 }
             }
@@ -105,7 +102,7 @@ pub(super) async fn run<H: Send + 'static>(
             Err(ApiError::internal("nothing of this write was published"))
         }
         Some(End::Fallback(Some(MutationState::Published))) => {
-            ticket.published().cloned().ok_or_else(unknown)
+            ticket.published().ok_or_else(unknown)
         }
         Some(End::Fallback(Some(MutationState::Entered) | None)) | None => Err(unknown()),
     }
