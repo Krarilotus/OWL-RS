@@ -1,0 +1,111 @@
+# W3C OWL 2 Profiles §4.3. Each row gives its table, name, premises and conclusions.
+# T is implicit. @ relations expand Table 3 with least-fixed-point recurrences.
+# A variable starts with ?; commas separate atoms, semicolons separate conclusions.
+
+# Table 4
+4 eq-ref | ?s ?p ?o | ?s owl:sameAs ?s; ?p owl:sameAs ?p; ?o owl:sameAs ?o
+4 eq-sym | ?x owl:sameAs ?y | ?y owl:sameAs ?x
+4 eq-trans | ?x owl:sameAs ?y, ?y owl:sameAs ?z | ?x owl:sameAs ?z
+4 eq-rep-s | ?s owl:sameAs ?u, ?s ?p ?o | ?u ?p ?o
+4 eq-rep-p | ?p owl:sameAs ?q, ?s ?p ?o | ?s ?q ?o
+4 eq-rep-o | ?o owl:sameAs ?v, ?s ?p ?o | ?s ?p ?v
+4 eq-diff1 | ?x owl:sameAs ?y, ?x owl:differentFrom ?y | @false
+4 eq-diff2 | ?x rdf:type owl:AllDifferent, ?x owl:members ?h, @pair ?h ?a ?b, ?a owl:sameAs ?b | @false
+4 eq-diff3 | ?x rdf:type owl:AllDifferent, ?x owl:distinctMembers ?h, @pair ?h ?a ?b, ?a owl:sameAs ?b | @false
+
+# Table 5 (prp-ap is seeded in oracle.rs)
+5 prp-dom | ?p rdfs:domain ?c, ?x ?p ?y | ?x rdf:type ?c
+5 prp-rng | ?p rdfs:range ?c, ?x ?p ?y | ?y rdf:type ?c
+5 prp-fp | ?p rdf:type owl:FunctionalProperty, ?x ?p ?y, ?x ?p ?z | ?y owl:sameAs ?z
+5 prp-ifp | ?p rdf:type owl:InverseFunctionalProperty, ?x ?p ?z, ?y ?p ?z | ?x owl:sameAs ?y
+5 prp-irp | ?p rdf:type owl:IrreflexiveProperty, ?x ?p ?x | @false
+5 prp-symp | ?p rdf:type owl:SymmetricProperty, ?x ?p ?y | ?y ?p ?x
+5 prp-asyp | ?p rdf:type owl:AsymmetricProperty, ?x ?p ?y, ?y ?p ?x | @false
+5 prp-trp | ?p rdf:type owl:TransitiveProperty, ?x ?p ?y, ?y ?p ?z | ?x ?p ?z
+5 prp-spo1 | ?p rdfs:subPropertyOf ?q, ?x ?p ?y | ?x ?q ?y
+5 prp-spo2 | ?p owl:propertyChainAxiom ?h, @chain ?h ?x ?y | ?x ?p ?y
+5 prp-eqp1 | ?p owl:equivalentProperty ?q, ?x ?p ?y | ?x ?q ?y
+5 prp-eqp2 | ?p owl:equivalentProperty ?q, ?x ?q ?y | ?x ?p ?y
+5 prp-pdw | ?p owl:propertyDisjointWith ?q, ?x ?p ?y, ?x ?q ?y | @false
+5 prp-adp | ?x rdf:type owl:AllDisjointProperties, ?x owl:members ?h, @pair ?h ?p ?q, ?u ?p ?v, ?u ?q ?v | @false
+5 prp-inv1 | ?p owl:inverseOf ?q, ?x ?p ?y | ?y ?q ?x
+5 prp-inv2 | ?p owl:inverseOf ?q, ?x ?q ?y | ?y ?p ?x
+5 prp-key | ?c owl:hasKey ?h, @key ?h ?x ?y, ?x rdf:type ?c, ?y rdf:type ?c | ?x owl:sameAs ?y
+5 prp-npa1 | ?a owl:sourceIndividual ?x, ?a owl:assertionProperty ?p, ?a owl:targetIndividual ?y, ?x ?p ?y | @false
+5 prp-npa2 | ?a owl:sourceIndividual ?x, ?a owl:assertionProperty ?p, ?a owl:targetValue ?y, ?x ?p ?y | @false
+
+# Table 6
+6 cls-thing | | owl:Thing rdf:type owl:Class
+6 cls-nothing1 | | owl:Nothing rdf:type owl:Class
+6 cls-nothing2 | ?x rdf:type owl:Nothing | @false
+6 cls-int1 | ?c owl:intersectionOf ?h, @intersection ?h ?x | ?x rdf:type ?c
+6 cls-int2 | ?c owl:intersectionOf ?h, ?x rdf:type ?c, @member ?h ?m | ?x rdf:type ?m
+6 cls-uni | ?c owl:unionOf ?h, @member ?h ?m, ?x rdf:type ?m | ?x rdf:type ?c
+6 cls-com | ?c owl:complementOf ?d, ?x rdf:type ?c, ?x rdf:type ?d | @false
+6 cls-svf1 | ?c owl:someValuesFrom ?d, ?c owl:onProperty ?p, ?x ?p ?y, ?y rdf:type ?d | ?x rdf:type ?c
+6 cls-svf2 | ?c owl:someValuesFrom owl:Thing, ?c owl:onProperty ?p, ?x ?p ?y | ?x rdf:type ?c
+6 cls-avf | ?c owl:allValuesFrom ?d, ?c owl:onProperty ?p, ?x rdf:type ?c, ?x ?p ?y | ?y rdf:type ?d
+6 cls-hv1 | ?c owl:hasValue ?y, ?c owl:onProperty ?p, ?x rdf:type ?c | ?x ?p ?y
+6 cls-hv2 | ?c owl:hasValue ?y, ?c owl:onProperty ?p, ?x ?p ?y | ?x rdf:type ?c
+6 cls-maxc1 | ?c owl:maxCardinality "0"^^xsd:nonNegativeInteger, ?c owl:onProperty ?p, ?x rdf:type ?c, ?x ?p ?y | @false
+6 cls-maxc2 | ?c owl:maxCardinality "1"^^xsd:nonNegativeInteger, ?c owl:onProperty ?p, ?x rdf:type ?c, ?x ?p ?y, ?x ?p ?z | ?y owl:sameAs ?z
+6 cls-maxqc1 | ?c owl:maxQualifiedCardinality "0"^^xsd:nonNegativeInteger, ?c owl:onProperty ?p, ?c owl:onClass ?d, ?x rdf:type ?c, ?x ?p ?y, ?y rdf:type ?d | @false
+6 cls-maxqc2 | ?c owl:maxQualifiedCardinality "0"^^xsd:nonNegativeInteger, ?c owl:onProperty ?p, ?c owl:onClass owl:Thing, ?x rdf:type ?c, ?x ?p ?y | @false
+6 cls-maxqc3 | ?c owl:maxQualifiedCardinality "1"^^xsd:nonNegativeInteger, ?c owl:onProperty ?p, ?c owl:onClass ?d, ?x rdf:type ?c, ?x ?p ?y, ?y rdf:type ?d, ?x ?p ?z, ?z rdf:type ?d | ?y owl:sameAs ?z
+6 cls-maxqc4 | ?c owl:maxQualifiedCardinality "1"^^xsd:nonNegativeInteger, ?c owl:onProperty ?p, ?c owl:onClass owl:Thing, ?x rdf:type ?c, ?x ?p ?y, ?x ?p ?z | ?y owl:sameAs ?z
+6 cls-oo | ?c owl:oneOf ?h, @member ?h ?x | ?x rdf:type ?c
+
+# Table 7
+7 cax-sco | ?c rdfs:subClassOf ?d, ?x rdf:type ?c | ?x rdf:type ?d
+7 cax-eqc1 | ?c owl:equivalentClass ?d, ?x rdf:type ?c | ?x rdf:type ?d
+7 cax-eqc2 | ?c owl:equivalentClass ?d, ?x rdf:type ?d | ?x rdf:type ?c
+7 cax-dw | ?c owl:disjointWith ?d, ?x rdf:type ?c, ?x rdf:type ?d | @false
+7 cax-adc | ?x rdf:type owl:AllDisjointClasses, ?x owl:members ?h, @pair ?h ?c ?d, ?z rdf:type ?c, ?z rdf:type ?d | @false
+
+# Table 8 is in oracle.rs. The five rules use datatype and literal value-space tests.
+
+# Table 9
+9 scm-cls | ?c rdf:type owl:Class | ?c rdfs:subClassOf ?c; ?c owl:equivalentClass ?c; ?c rdfs:subClassOf owl:Thing; owl:Nothing rdfs:subClassOf ?c
+9 scm-sco | ?c rdfs:subClassOf ?d, ?d rdfs:subClassOf ?e | ?c rdfs:subClassOf ?e
+9 scm-eqc1 | ?c owl:equivalentClass ?d | ?c rdfs:subClassOf ?d; ?d rdfs:subClassOf ?c
+9 scm-eqc2 | ?c rdfs:subClassOf ?d, ?d rdfs:subClassOf ?c | ?c owl:equivalentClass ?d
+9 scm-op | ?p rdf:type owl:ObjectProperty | ?p rdfs:subPropertyOf ?p; ?p owl:equivalentProperty ?p
+9 scm-dp | ?p rdf:type owl:DatatypeProperty | ?p rdfs:subPropertyOf ?p; ?p owl:equivalentProperty ?p
+9 scm-spo | ?p rdfs:subPropertyOf ?q, ?q rdfs:subPropertyOf ?r | ?p rdfs:subPropertyOf ?r
+9 scm-eqp1 | ?p owl:equivalentProperty ?q | ?p rdfs:subPropertyOf ?q; ?q rdfs:subPropertyOf ?p
+9 scm-eqp2 | ?p rdfs:subPropertyOf ?q, ?q rdfs:subPropertyOf ?p | ?p owl:equivalentProperty ?q
+9 scm-dom1 | ?p rdfs:domain ?c, ?c rdfs:subClassOf ?d | ?p rdfs:domain ?d
+9 scm-dom2 | ?q rdfs:domain ?c, ?p rdfs:subPropertyOf ?q | ?p rdfs:domain ?c
+9 scm-rng1 | ?p rdfs:range ?c, ?c rdfs:subClassOf ?d | ?p rdfs:range ?d
+9 scm-rng2 | ?q rdfs:range ?c, ?p rdfs:subPropertyOf ?q | ?p rdfs:range ?c
+9 scm-hv | ?c owl:hasValue ?i, ?c owl:onProperty ?p, ?d owl:hasValue ?i, ?d owl:onProperty ?q, ?p rdfs:subPropertyOf ?q | ?c rdfs:subClassOf ?d
+9 scm-svf1 | ?c owl:someValuesFrom ?a, ?c owl:onProperty ?p, ?d owl:someValuesFrom ?b, ?d owl:onProperty ?p, ?a rdfs:subClassOf ?b | ?c rdfs:subClassOf ?d
+9 scm-svf2 | ?c owl:someValuesFrom ?a, ?c owl:onProperty ?p, ?d owl:someValuesFrom ?a, ?d owl:onProperty ?q, ?p rdfs:subPropertyOf ?q | ?c rdfs:subClassOf ?d
+9 scm-avf1 | ?c owl:allValuesFrom ?a, ?c owl:onProperty ?p, ?d owl:allValuesFrom ?b, ?d owl:onProperty ?p, ?a rdfs:subClassOf ?b | ?c rdfs:subClassOf ?d
+9 scm-avf2 | ?c owl:allValuesFrom ?a, ?c owl:onProperty ?p, ?d owl:allValuesFrom ?a, ?d owl:onProperty ?q, ?p rdfs:subPropertyOf ?q | ?d rdfs:subClassOf ?c
+9 scm-int | ?c owl:intersectionOf ?h, @member ?h ?m | ?c rdfs:subClassOf ?m
+9 scm-uni | ?c owl:unionOf ?h, @member ?h ?m | ?m rdfs:subClassOf ?c
+
+# Table 3: a walk ends on an explicit rest-to-nil; a step may also be extended.
+3 list-step | ?c rdf:first ?m, ?c rdf:rest ?t | @step ?c ?m ?t
+3 list-end | @step ?c ?m rdf:nil | @end ?c ?m
+3 list-accept | @end ?c ?m | @accept ?c
+3 list-accept | @step ?c ?m ?t, @accept ?t | @accept ?c
+3 list-member | @end ?c ?m | @member ?c ?m
+3 list-member | @step ?c ?m ?t, @member ?t ?n | @member ?c ?m; @member ?c ?n
+3 list-pair | @step ?c ?m ?t, @member ?t ?n | @pair ?c ?m ?n
+3 list-pair | @step ?c ?m ?t, @pair ?t ?a ?b | @pair ?c ?a ?b
+
+# Reachability limits the three dependent helpers to cells of the relevant kind.
+5 prp-spo2 | ?p owl:propertyChainAxiom ?c, @accept ?c | @chain-cell ?c
+5 prp-spo2 | @chain-cell ?c, @step ?c ?m ?t, @accept ?t | @chain-cell ?t
+5 prp-spo2 | @chain-cell ?c, @end ?c ?m, ?x ?m ?y | @chain ?c ?x ?y
+5 prp-spo2 | @chain-cell ?c, @step ?c ?m ?t, @chain ?t ?y ?z, ?x ?m ?y | @chain ?c ?x ?z
+5 prp-key | ?p owl:hasKey ?c, @accept ?c | @key-cell ?c
+5 prp-key | @key-cell ?c, @step ?c ?m ?t, @accept ?t | @key-cell ?t
+5 prp-key | @key-cell ?c, @end ?c ?m, ?x ?m ?v, ?y ?m ?v | @key ?c ?x ?y
+5 prp-key | @key-cell ?c, @step ?c ?m ?t, @key ?t ?x ?y, ?x ?m ?v, ?y ?m ?v | @key ?c ?x ?y
+6 cls-int1 | ?p owl:intersectionOf ?c, @accept ?c | @int-cell ?c
+6 cls-int1 | @int-cell ?c, @step ?c ?m ?t, @accept ?t | @int-cell ?t
+6 cls-int1 | @int-cell ?c, @end ?c ?m, ?x rdf:type ?m | @intersection ?c ?x
+6 cls-int1 | @int-cell ?c, @step ?c ?m ?t, @intersection ?t ?x, ?x rdf:type ?m | @intersection ?c ?x
