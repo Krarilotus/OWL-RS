@@ -44,31 +44,11 @@ pub(crate) enum Problem {
     EndedWhileCommitting,
     Committed,
     OutcomeUnknown,
-    Ended(EndKind),
     NoSession,
     ReadBeforeRetry,
     /// HTTP 503 with Retry-After: 1.
     LockBusy,
     WorkInProgress,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) enum EndKind {
-    Committed,
-    Refused,
-    Failed,
-    Unknown,
-}
-
-impl Outcome {
-    fn kind(self) -> EndKind {
-        match self {
-            Self::Committed => EndKind::Committed,
-            Self::Refused(_) => EndKind::Refused,
-            Self::Failed(_) => EndKind::Failed,
-            Self::Unknown => EndKind::Unknown,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -107,6 +87,7 @@ pub(crate) enum Observation {
 pub(crate) enum StreamEnd {
     Data,
     Error(Problem),
+    Ended(Outcome),
     Aborted,
 }
 
@@ -237,6 +218,8 @@ pub(crate) enum Cell {
     S14,
     S15,
     S16,
+    S17,
+    S18,
     P1,
     P2,
     P3,
@@ -273,6 +256,8 @@ pub(crate) enum Cell {
     Pw10,
     Pw11,
     Pw12,
+    Pw13,
+    Pw14,
     C1,
     C2,
     C3,
@@ -438,7 +423,7 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
                         source: if switch { S2 } else { P4 },
                     },
                 ),
-                Observation::Ended(Outcome::Unknown) => bug(cell),
+                Observation::Ended(Outcome::Unknown) => bug(if switch { S18 } else { Pw14 }),
                 Observation::InProgress => reply(cell, Error(Problem::WorkInProgress)),
             }
         }
@@ -501,7 +486,7 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
                 | Action::Read { .. }
                 | Action::ReadRefused(_)
                 | Action::Ping
-                | Action::Unknown => reply(E4, Error(Problem::Ended(outcome.kind()))),
+                | Action::Unknown => reply(E4, Answer::Ended(outcome)),
             },
             Gone => reply(X7, missing(action).1),
             G => {
@@ -583,8 +568,8 @@ pub(crate) fn step(state: &State, event: &Event) -> Step {
             G => noop(G4),
         },
         Settled(outcome) => match state {
-            S if outcome == Committed => bug(S12),
-            Pw if outcome == Committed => bug(Pw1),
+            S if outcome == Committed => bug(S17),
+            Pw if outcome == Committed => bug(Pw13),
             S => go(S12, Answer::None, RestoreIntents, U),
             Pw => go(Pw1, Answer::None, StampEnd, E(outcome)),
             C => go(C18, Answer::None, StampEnd, E(outcome)),
