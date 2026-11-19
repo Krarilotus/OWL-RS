@@ -205,20 +205,25 @@ fn a_rejection_shows_no_axiom_of_a_graph_the_committer_cannot_read() {
         };
         reject
     };
-    let reject = rejection(&committer);
+    // Each beside its control: the same words, where a committer that may read every graph
+    // is told them.
+    let (reject, full) = (rejection(&committer), rejection(&Requester::all()));
     // Not the secret union or disjointness, nor which of the committer's statements they
-    // take part in, nor how many axioms or statements it took.
+    // take part in: in the whole rejection, its evidence too.
     assert!(reject.explanation.is_none(), "{reject:?}");
-    let leaks = [
+    let (shown, told) = (format!("{reject:?}"), format!("{full:?}"));
+    for term in [
         "unionOf",
         "disjointWith",
         "equivalentClass",
         "example.com/x",
-        "axiom",
-    ];
-    for leak in leaks {
-        assert!(!reject.detail.contains(leak), "{leak}: {}", reject.detail);
+    ] {
+        assert!(!shown.contains(term), "{term}: {shown}");
+        assert!(told.contains(term), "{term} not in {told}");
     }
+    // Nor how many axioms it took: in the detail.
+    assert!(!reject.detail.contains("axiom"), "{}", reject.detail);
+    assert!(full.detail.contains("axiom"), "{}", full.detail);
     assert!(
         reject
             .detail
@@ -226,11 +231,6 @@ fn a_rejection_shows_no_axiom_of_a_graph_the_committer_cannot_read() {
         "{}",
         reject.detail
     );
-    // The control on the same words: a committer that may read every graph is told them.
-    let full = format!("{:?}", rejection(&Requester::all()));
-    for leak in leaks {
-        assert!(full.contains(leak), "{leak} not in {full}");
-    }
 }
 
 /// U1 with representatives under graph access: what U1's classes give (both departments

@@ -49,7 +49,7 @@ fn decided(o: &Ontology, quick: bool) -> Answer {
     );
     // The control on the same words: past its deadline, a run gives up on the clock.
     let late = consistency(o, &late).answer;
-    assert!(on_the_clock(&late), "{late:?}");
+    assert_eq!(budget(&late), Some(Limit::Time), "{late:?}");
     let expansions: &[u32] = if quick { &[0, 2] } else { &[0, 2, 8] };
     for &expand in expansions {
         for config in configs().filter(|c| !quick || c.backjumping) {
@@ -58,10 +58,14 @@ fn decided(o: &Ontology, quick: bool) -> Answer {
                 ..config
             };
             let answer = consistency(o, &config).answer;
-            // Giving up is allowed on the deterministic budget only, never on the clock.
+            // Giving up is allowed on the deterministic budgets the configs set only, never
+            // on the clock.
             assert!(
                 answer == default
-                    || (matches!(answer, Answer::GaveUp(_)) && !on_the_clock(&answer)),
+                    || matches!(
+                        budget(&answer),
+                        Some(Limit::BranchPoints | Limit::Nodes | Limit::Memory)
+                    ),
                 "{answer:?}, not {default:?}, under {config:?}"
             );
         }
@@ -69,9 +73,12 @@ fn decided(o: &Ontology, quick: bool) -> Answer {
     default
 }
 
-/// Whether `answer` gives up on the clock, by the budget its reason names.
-fn on_the_clock(answer: &Answer) -> bool {
-    matches!(answer, Answer::GaveUp(why) if Limit::named_in(why) == Some(Limit::Time))
+/// The budget a give-up's reason names; `None` for any other answer.
+fn budget(answer: &Answer) -> Option<Limit> {
+    match answer {
+        Answer::GaveUp(why) => Limit::named_in(why),
+        _ => None,
+    }
 }
 
 fn inverse_pair(b: &mut Build, p: u64, q: u64) {

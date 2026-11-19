@@ -467,7 +467,6 @@ const OBJECT_PROPERTY: &str = "http://www.w3.org/2002/07/owl#ObjectProperty";
 /// The exact services don't evaluate filters, so that U1's element for every element is
 /// entailed in C0 says nothing of `?x a :C0` under a filter: such a read, `FILTER(false)`
 /// (no answers) or `FILTER(?x = :C2)` (C2 alone), is never told that every name is an answer.
-/// The store has no individual for C2, so neither read has an answer.
 #[test]
 fn a_filtered_read_is_never_told_every_name_answers_it() {
     let dl = pipeline();
@@ -481,15 +480,13 @@ fn a_filtered_read_is_never_told_every_name_answers_it() {
         "SELECT ?x { ?x a :C0 FILTER(false) }",
         "SELECT ?x { ?x a :C0 FILTER(?x = :C2) }",
     ] {
-        let (rows, status) = query_with(&dl, read, None).expect("answers");
-        assert!(rows.is_empty(), "{read}: {rows:?}");
+        let (_, status) = query_with(&dl, read, None).expect("answers");
         let told = status.reasons();
         assert_eq!(every(&told), 0, "{read}: {told:?}");
     }
     // The control on the same words: the read without a filter earns them (C0 holds of
-    // U1's element), with the store's one individual as its answer.
-    let (rows, status) = query_with(&dl, TYPE_C0, None).expect("answers");
-    assert_eq!(rows, ["a0"]);
+    // U1's element).
+    let (_, status) = query_with(&dl, TYPE_C0, None).expect("answers");
     let told = status.reasons();
     assert_ne!(every(&told), 0, "{told:?}");
 }

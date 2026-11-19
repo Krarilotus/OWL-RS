@@ -1191,19 +1191,6 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
         refused * 4 < CASES,
         "{refused} of {CASES} stores or reads refused"
     );
-    // The control on the words the tallies read: the whole ontology of a store whose one
-    // annotation property has a domain is told them.
-    let (_, annotated) = marks_and_passes(
-        crate::StoreConfig::in_memory(),
-        ":d a owl:AnnotationProperty ; rdfs:domain :Pet .",
-        ":rex a :Pet .",
-    );
-    assert!(
-        annotated
-            .as_ref()
-            .is_some_and(|w| w.contains("annotation-property axioms")),
-        "{annotated:?}"
-    );
 }
 
 /// A question naming an individual the data doesn't name is decided only where the

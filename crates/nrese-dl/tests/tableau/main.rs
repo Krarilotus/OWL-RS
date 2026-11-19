@@ -712,7 +712,7 @@ fn budgets_give_up() {
         Answer::GaveUp(why) => Limit::named_in(&why),
         other => panic!("gave up, not {other:?}"),
     };
-    assert_ne!(gave_up(&config), Some(Limit::Time));
+    assert_eq!(gave_up(&config), Some(Limit::Nodes));
     // The control on the same words: past its deadline, the same run names the clock.
     let late = Config {
         timeout: Some(Duration::ZERO),

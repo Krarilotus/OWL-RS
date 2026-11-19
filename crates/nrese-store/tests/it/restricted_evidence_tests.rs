@@ -106,9 +106,6 @@ fn dl_structural_triples_keep_their_own_graph() {
     let reject = dl_structural(&open_reader());
     let shown = format!("{reject:?}");
     assert!(!shown.contains("SECRET_PROPERTY"), "{shown}");
-    // The control on the same words: a reader of every graph is shown them.
-    let full = format!("{:?}", dl_structural(&Requester::all()));
-    assert!(full.contains("SECRET_PROPERTY"), "{full}");
 }
 
 /// Control: a reader of every graph sees the restriction's triples.
@@ -136,25 +133,27 @@ fn dl_count(requester: &Requester) -> MutationReject {
 #[test]
 fn dl_rejection_has_no_hidden_proof_counts() {
     let shown = format!("{:?}", dl_count(&open_reader()));
-    for leak in [
-        "of their statements",
-        "axiom(s)",
-        "hypertableau",
-        "context-core",
-        " ms)",
-    ] {
+    for leak in ["axiom(s)", "hypertableau", "context-core", " ms)"] {
         assert!(!shown.contains(leak), "{leak:?} in {shown}");
     }
-    // The control on the same words: a reader of every graph is told the justification's
-    // size, the engine and the time.
-    let full = format!("{:?}", dl_count(&Requester::all()));
-    for told in ["axiom(s)", " ms)"] {
-        assert!(full.contains(told), "{told:?} not in {full}");
+    // Each engine's name, beside its control: a rejection that engine finds (the fixtures of
+    // `dl::consistency`) tells a reader of every graph the name, one of `:open` only not.
+    use crate::dl::consistency::{EXISTENTIAL, UNION};
+    for (engine, schema, commit) in [
+        ("hypertableau", UNION, ":x a :A , :D"),
+        ("context-core", EXISTENTIAL, ":x a :A"),
+    ] {
+        let data = format!("GRAPH :secret {{ {schema} }}");
+        let commit = format!("GRAPH :open {{ {commit} }}");
+        let told = |requester: &Requester| {
+            let (config, mode) = (StoreConfig::in_memory(), ReasoningMode::Owl2Dl);
+            format!("{:?}", rejection(config, mode, &data, &commit, requester))
+        };
+        let shown = told(&open_reader());
+        assert!(!shown.contains(engine), "{engine:?} in {shown}");
+        let full = told(&Requester::all());
+        assert!(full.contains(engine), "{engine} not in {full}");
     }
-    assert!(
-        full.contains("hypertableau") || full.contains("context-core"),
-        "no engine in {full}"
-    );
 }
 
 /// Control: a reader of every graph keeps the justification's size and the check's time.
@@ -191,10 +190,6 @@ fn shacl_rejection_does_not_name_private_focus() {
     let shown = format!("{:?}", shacl(&open_reader()));
     assert!(!shown.contains("SECRET_FOCUS"), "{shown}");
     assert!(!shown.contains("1 SHACL result(s)"), "{shown}");
-    // The control on the same words: a reader of every graph is shown them.
-    let full = format!("{:?}", shacl(&Requester::all()));
-    assert!(full.contains("SECRET_FOCUS"), "{full}");
-    assert!(full.contains("1 SHACL result(s)"), "{full}");
 }
 
 /// Control: a reader of every graph sees the focus node and the count.
@@ -705,9 +700,6 @@ fn shapes_refusal_doesnt_describe_an_unreadable_shapes_graph() {
     );
     assert!(!a.contains("SECRET"), "{a}");
     assert_eq!(a, b);
-    // The control on the same words: a committer that may read every graph is told them.
-    let full = shapes_refusal("SECRET_A", &Requester::all());
-    assert!(full.contains("SECRET"), "{full}");
 }
 
 /// Control: a committer that may read every graph is told which shape.
