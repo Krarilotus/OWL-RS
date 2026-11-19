@@ -1018,3 +1018,51 @@ fn a_pre_bound_search_is_one_and_its_class_s_name_elsewhere() {
         answers_as_written_with(&engine, shape, query, options.clone(), want);
     }
 }
+
+/// Spec: under canonical answers, a pre-bound blank node whose class's representative is
+/// `bds:search` is not a search, as an IRI alias is not: `?s ?p "alpha"` reads stored
+/// statements (none has that object), `?s ?p "stored"` reads the class's one (`c`), and in a
+/// filter the value is its class's name (`a`, by its label).
+#[test]
+fn a_pre_bound_blank_node_a_search_names_reads_stored_statements() {
+    use nrese_engine::EncodedTriple;
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let search = NamedNode::new_unchecked("http://www.bigdata.com/rdf/search#search");
+    let node = nrese_rdf::BlankNode::new("search-alias").unwrap();
+    let representative = tx.intern(search.as_ref().into());
+    let alias = tx.intern(node.as_ref().into());
+    let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+    let same_as = tx.intern(same_as.as_ref().into());
+    tx.insert_inferred(EncodedTriple::new(alias, same_as, representative));
+    let label = NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#label");
+    let one = Literal::new_simple_literal("alpha one");
+    tx.insert(Quad::new(ex("a"), label, one, GraphName::DefaultGraph).as_ref());
+    let stored = Literal::new_simple_literal("stored");
+    tx.insert(Quad::new(ex("c"), search, stored, GraphName::DefaultGraph).as_ref());
+    tx.commit().unwrap();
+    engine.transaction().install(Some(same_as), None);
+    let values = std::collections::HashMap::from([(
+        nrese_rdf::Variable::new_unchecked("p"),
+        Term::from(node),
+    )]);
+    let options = QueryOptions {
+        pre_bound: Some(std::sync::Arc::new(values)),
+        ..canonical()
+    };
+    for (shape, query, want) in [
+        ("no search", "SELECT ?s { ?s ?p \"alpha\" }", &[][..]),
+        (
+            "its stored statement",
+            "SELECT ?s { ?s ?p \"stored\" }",
+            &[&["c"][..]][..],
+        ),
+        (
+            "its name in a filter",
+            "SELECT ?s { ?s rdfs:label ?l FILTER(sameTerm(?p, bds:search)) }",
+            &[&["a"][..]][..],
+        ),
+    ] {
+        answers_as_written_with(&engine, shape, query, options.clone(), want);
+    }
+}
