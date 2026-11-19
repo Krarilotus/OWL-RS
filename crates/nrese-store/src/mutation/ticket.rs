@@ -1,27 +1,43 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, OnceLock};
 
+use nrese_engine::{CommitSummary, EngineError};
 use nrese_sparql::CancellationToken;
+
+use super::MutationCommitReport;
 
 type RightsHeld<'a> = std::sync::RwLockReadGuard<'a, Arc<crate::access::AccessState>>;
 
 const PENDING: u8 = 0;
 const COMMITTING: u8 = 1;
 const CANCELLED: u8 = 2;
+const ENTERED: u8 = 3;
+const ENDED: u8 = 4;
 
-/// Decides the race between "the caller gives up" and "the pipeline commits".
-///
-/// Exactly one of [`cancel`](Self::cancel) and the pipeline's commit step wins. A caller
-/// that gets `true` from `cancel` knows the mutation will never be committed and may report
-/// a timeout. A caller that gets `false` knows the commit is already underway and must wait
-/// for the result instead of reporting a timeout. This closes the v1 defect where a 408
-/// response could be followed by a successful commit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MutationState {
+    Pending,
+    Cancelled,
+    Committing,
+    Entered,
+    Published,
+    Ended,
+}
+
+#[derive(Default)]
+struct Record {
+    state: AtomicU8,
+    published: OnceLock<MutationCommitReport>,
+}
+
+/// Records the race between a cancellation, a known error and the claim to commit,
+/// and records publication before the pipeline starts its post-commit work.
 ///
 /// A successful cancel also cancels the ticket's evaluation token, so a long-running
 /// `WHERE` clause stops early instead of running to completion unobserved.
 #[derive(Clone, Default)]
 pub struct MutationTicket {
-    state: Arc<AtomicU8>,
+    record: Arc<Record>,
     evaluation: CancellationToken,
     /// The write's rights, checked again where it publishes (none: the store's owner's).
     rights: Option<crate::access::RightsCheck>,
@@ -30,7 +46,7 @@ pub struct MutationTicket {
 impl std::fmt::Debug for MutationTicket {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MutationTicket")
-            .field("state", &self.state.load(Ordering::Acquire))
+            .field("state", &self.state())
             .finish()
     }
 }
@@ -56,13 +72,15 @@ impl MutationTicket {
             .transpose()
     }
 
-    /// Cancels the mutation unless its commit has already started.
+    /// Cancels a pending mutation. A previous cancellation stays in force.
     /// Returns `true` if the mutation is (now) guaranteed not to be committed.
     pub fn cancel(&self) -> bool {
-        match self
-            .state
-            .compare_exchange(PENDING, CANCELLED, Ordering::AcqRel, Ordering::Acquire)
-        {
+        match self.record.state.compare_exchange(
+            PENDING,
+            CANCELLED,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             Ok(_) => {
                 self.evaluation.cancel();
                 true
@@ -77,15 +95,56 @@ impl MutationTicket {
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.state.load(Ordering::Acquire) == CANCELLED
+        self.record.state.load(Ordering::Acquire) == CANCELLED
     }
 
-    /// Claims the right to commit. Returns `false` if the caller cancelled first.
-    pub(crate) fn begin_commit(&self) -> bool {
-        self.state
+    /// Claims the right to commit. Returns `false` if the ticket is no longer pending.
+    pub fn begin_commit(&self) -> bool {
+        self.record
+            .state
             .compare_exchange(PENDING, COMMITTING, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
+
+    pub(crate) fn end_error(&self) {
+        let _ =
+            self.record
+                .state
+                .compare_exchange(PENDING, ENDED, Ordering::AcqRel, Ordering::Acquire);
+    }
+
+    /// The record at this instant, readable without taking a lock.
+    pub fn state(&self) -> MutationState {
+        match self.record.state.load(Ordering::Acquire) {
+            PENDING => MutationState::Pending,
+            CANCELLED => MutationState::Cancelled,
+            COMMITTING => MutationState::Committing,
+            ENTERED if self.published().is_some() => MutationState::Published,
+            ENTERED => MutationState::Entered,
+            _ => MutationState::Ended,
+        }
+    }
+
+    /// The original report, including the revision published by this mutation.
+    pub fn published(&self) -> Option<&MutationCommitReport> {
+        self.record.published.get()
+    }
+}
+
+/// The caller holds the commit claim. Store the report as soon as the commit returns Ok,
+/// before the caller can run any maintenance.
+pub(super) fn publishing(
+    ticket: &MutationTicket,
+    report: MutationCommitReport,
+    commit: impl FnOnce() -> Result<CommitSummary, EngineError>,
+) -> Result<(CommitSummary, &MutationCommitReport), EngineError> {
+    ticket.record.state.store(ENTERED, Ordering::Release);
+    let summary = commit()?;
+    let report = ticket
+        .record
+        .published
+        .get_or_init(|| report.committed(summary.revision));
+    Ok((summary, report))
 }
 
 #[cfg(test)]
@@ -106,5 +165,21 @@ mod tests {
         assert!(ticket.begin_commit());
         assert!(!ticket.cancel());
         assert!(!ticket.is_cancelled());
+    }
+
+    // Spec: lifecycle rule 3 says a cancel and a claim have exactly one winner.
+    #[test]
+    fn cancel_and_commit_racing_have_one_winner() {
+        let ticket = MutationTicket::new();
+        let gate = std::sync::Barrier::new(2);
+        let (claimed, cancelled) = std::thread::scope(|threads| {
+            let cancel = threads.spawn(|| {
+                gate.wait();
+                ticket.cancel()
+            });
+            gate.wait();
+            (ticket.begin_commit(), cancel.join().unwrap())
+        });
+        assert_ne!(claimed, cancelled);
     }
 }

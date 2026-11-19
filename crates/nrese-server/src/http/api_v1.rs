@@ -878,17 +878,15 @@ pub async fn import(
         return Ok(job.into_response());
     }
     let store = state.store();
-    let loaded = tokio::task::spawn_blocking(move || {
+    let loaded = super::effect::untracked(move || {
         let report = store.bulk_load(&request);
         let _ = std::fs::remove_file(&file);
-        report
+        report.map_err(|error| match error {
+            nrese_store::StoreError::LoadPublished { .. } => ApiError::internal(error.to_string()),
+            _ => ApiError::bad_request(error.to_string()),
+        })
     })
-    .await
-    .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| match error {
-        nrese_store::StoreError::LoadPublished { .. } => ApiError::internal(error.to_string()),
-        _ => ApiError::bad_request(error.to_string()),
-    })?;
+    .await?;
     let reasoning = rematerialised(&state).await?;
     Ok(Json(import_report(&loaded, reasoning.as_ref())).into_response())
 }

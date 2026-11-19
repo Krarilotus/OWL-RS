@@ -7,7 +7,7 @@ use super::command::{MutationCommand, MutationCommitReport};
 use super::error::{MutationError, RejectKind};
 use super::evidence;
 use super::record::ReasoningRunRecord;
-use super::ticket::MutationTicket;
+use super::ticket::{MutationTicket, publishing};
 use crate::config::{GateSeverity, ShaclGate};
 use crate::delta::MutationDeltaPreview;
 use crate::error::StoreError;
@@ -160,6 +160,20 @@ impl MutationPipeline {
     /// [`Self::apply`], its commit noted in a journal beside the store's log by `note`
     /// ([`nrese_engine::Transaction::note_commit`]): a quarantine readmission's resolution.
     pub(crate) fn apply_noted<'p>(
+        &'p self,
+        command: MutationCommand,
+        requester: &crate::Requester,
+        ticket: &MutationTicket,
+        note: Option<nrese_engine::CommitNote<'p>>,
+    ) -> Result<MutationCommitReport, MutationError> {
+        let result = self.apply_inner(command, requester, ticket, note);
+        if result.is_err() {
+            ticket.end_error();
+        }
+        result
+    }
+
+    fn apply_inner<'p>(
         &'p self,
         command: MutationCommand,
         requester: &crate::Requester,
@@ -464,9 +478,9 @@ impl MutationPipeline {
             if let Some(certificate) = tx.base().certificate().cloned() {
                 tx.vouch(certificate);
             }
-            let summary = match ql {
-                Some(ql) => ql.commit(tx),
-                None => tx.commit(),
+            let (summary, report) = match ql {
+                Some(ql) => publishing(ticket, report, || ql.commit(tx)),
+                None => publishing(ticket, report, || tx.commit()),
             }
             .map_err(|error| MutationError::Store {
                 kind,
@@ -510,7 +524,7 @@ impl MutationPipeline {
             if quarantined && let Err(error) = self.store.rematerialise(&rules) {
                 tracing::error!(%error, "revalidation after a commit in quarantine failed");
             }
-            return Ok(report.committed(summary.revision));
+            return Ok(report.clone());
         }
 
         // Without reasoning, commits don't maintain the inferred stack.
@@ -536,12 +550,13 @@ impl MutationPipeline {
             return Err(MutationError::Cancelled);
         }
         let rights = ticket.hold_rights()?;
-        let summary = tx.commit().map_err(|error| MutationError::Store {
-            kind,
-            source: StoreError::Engine(error),
-        })?;
+        let (_, report) =
+            publishing(ticket, report, || tx.commit()).map_err(|error| MutationError::Store {
+                kind,
+                source: StoreError::Engine(error),
+            })?;
         drop(rights);
-        Ok(report.committed(summary.revision))
+        Ok(report.clone())
     }
 
     /// The SHACL commit gate (C2): validates what the transaction's changes can affect,
