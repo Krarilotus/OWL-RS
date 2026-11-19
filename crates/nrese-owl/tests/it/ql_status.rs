@@ -15,13 +15,23 @@ enum Source {
     Functional(&'static str),
 }
 
-/// A cell: the kind it raises (its name and a test for it), its source, and whether the
-/// rule makes it a hazard.
+/// What the TBox's global hazard is for a cell.
+enum Expect {
+    /// The reader's: it names one of the cell's diagnostics.
+    LeftOut,
+    /// None: the claim stands.
+    Complete,
+    /// The TBox's own for the construct the kind needs (its words), never the reader's.
+    Own(&'static str),
+}
+
+/// A cell: the kind it raises (its name and a test for it), its source, and what the rule
+/// makes of it.
 struct Cell {
     kind: &'static str,
     is: fn(&Diagnostic) -> bool,
     source: Source,
-    hazard: bool,
+    expect: Expect,
 }
 
 fn cells() -> Vec<Cell> {
@@ -34,7 +44,7 @@ fn cells() -> Vec<Cell> {
                 "ex:p a owl:ObjectProperty .
                  ex:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p ] .",
             ),
-            hazard: true,
+            expect: Expect::LeftOut,
         },
         Cell {
             kind: "SharedBlankNode",
@@ -44,7 +54,7 @@ fn cells() -> Vec<Cell> {
                  _:s a owl:Restriction ; owl:onProperty ex:r ; owl:someValuesFrom ex:C .
                  ex:E rdfs:subClassOf _:s . ex:F rdfs:subClassOf _:s .",
             ),
-            hazard: false,
+            expect: Expect::Complete,
         },
         Cell {
             kind: "BrokenList",
@@ -52,13 +62,13 @@ fn cells() -> Vec<Cell> {
             source: Turtle(
                 "ex:B rdfs:subClassOf [ a owl:Class ; owl:unionOf _:l ] . _:l rdf:first ex:C .",
             ),
-            hazard: true,
+            expect: Expect::LeftOut,
         },
         Cell {
             kind: "UndeclaredProperty",
             is: |d| matches!(d, Diagnostic::UndeclaredProperty { .. }),
             source: Turtle("ex:x ex:undeclared ex:y ."),
-            hazard: false,
+            expect: Expect::Complete,
         },
         Cell {
             kind: "AmbiguousProperty",
@@ -66,7 +76,7 @@ fn cells() -> Vec<Cell> {
             source: Turtle(
                 "ex:p a owl:ObjectProperty , owl:DatatypeProperty . ex:p rdfs:domain ex:C .",
             ),
-            hazard: true,
+            expect: Expect::LeftOut,
         },
         Cell {
             kind: "Unsupported",
@@ -76,13 +86,13 @@ fn cells() -> Vec<Cell> {
                  ex:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperties ( ex:d ) ;
                      owl:someValuesFrom rdfs:Literal ] .",
             ),
-            hazard: true,
+            expect: Expect::LeftOut,
         },
         Cell {
             kind: "NotOwl",
             is: |d| matches!(d, Diagnostic::NotOwl { .. }),
             source: Turtle("ex:p a owl:ObjectProperty . ex:H owl:onProperty ex:p ."),
-            hazard: true,
+            expect: Expect::LeftOut,
         },
         Cell {
             kind: "Unused",
@@ -91,7 +101,7 @@ fn cells() -> Vec<Cell> {
                 "ex:p a owl:ObjectProperty .
                  [ a owl:Restriction ; owl:onProperty ex:p ; owl:someValuesFrom ex:C ] .",
             ),
-            hazard: false,
+            expect: Expect::Complete,
         },
         Cell {
             kind: "NonSimpleProperty",
@@ -99,7 +109,7 @@ fn cells() -> Vec<Cell> {
             source: Turtle(
                 "ex:t a owl:ObjectProperty , owl:TransitiveProperty , owl:IrreflexiveProperty .",
             ),
-            hazard: false,
+            expect: Expect::Complete,
         },
         Cell {
             kind: "AnonymousIndividual",
@@ -109,25 +119,27 @@ fn cells() -> Vec<Cell> {
                  ex:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p ;
                      owl:hasValue _:b ] .",
             ),
-            hazard: false,
+            // `hasValue` is outside OWL 2 QL, and with an anonymous individual it may
+            // equate: the TBox's own global hazard, whatever the reader reports.
+            expect: Expect::Own("outside the profile"),
         },
         Cell {
             kind: "Syntax",
             is: |d| matches!(d, Diagnostic::Syntax { .. }),
             source: Functional("SubClassOf(:A :B) SubClassOf(:C"),
-            hazard: true,
+            expect: Expect::LeftOut,
         },
         Cell {
             kind: "RepeatedOperand",
             is: |d| matches!(d, Diagnostic::RepeatedOperand),
             source: Turtle("ex:A a owl:Class ; owl:disjointWith ex:A ."),
-            hazard: false,
+            expect: Expect::Complete,
         },
         Cell {
             kind: "Reserved",
             is: |d| matches!(d, Diagnostic::Reserved { .. }),
             source: Turtle("ex:A rdfs:subClassOf [ owl:intersectionOf ( rdf:List ex:C ) ] ."),
-            hazard: true,
+            expect: Expect::LeftOut,
         },
         Cell {
             kind: "Rule",
@@ -135,7 +147,7 @@ fn cells() -> Vec<Cell> {
             source: Functional(
                 "DLSafeRule(Body(ClassAtom(:A Variable(:x))) Head(ClassAtom(:B Variable(:x))))",
             ),
-            hazard: true,
+            expect: Expect::LeftOut,
         },
     ]
 }
@@ -162,8 +174,9 @@ fn ontology(table: &mut Table, source: &Source) -> Ontology {
 /// object and a data property, a rule beside the ontology), the TBox's hazard is global and
 /// says the reader's own words for one of them. Where it reads every axiom as the source
 /// states it (a shared blank node, an undeclared property typed by its use, a structure no
-/// axiom uses, a non-simple property, an anonymous individual in `hasValue`, a disjointness
-/// repeating an operand), it raises no global hazard.
+/// axiom uses, a non-simple property, a disjointness repeating an operand), it raises no
+/// global hazard. An anonymous individual stands only in `hasValue` or `oneOf`, outside
+/// OWL 2 QL, whose global hazard is the TBox's own: never the reader's.
 #[test]
 fn every_axiom_the_reader_leaves_out_or_alters_lowers_the_rewritings_claim() {
     let mut wrong = Vec::new();
@@ -179,13 +192,18 @@ fn every_axiom_the_reader_leaves_out_or_alters_lowers_the_rewritings_claim() {
         let tbox = Tbox::compile(&o, Closure { lists: false }, thing);
         let name = |t| table.name(t);
         let global = tbox.global_hazard().map(|h| h.describe(&name));
-        match (cell.hazard, &global) {
-            (true, Some(why)) if raised.iter().any(|d| why.contains(&d.describe(&name))) => {}
-            (false, None) => {}
-            _ => wrong.push(format!(
-                "{}: expected a hazard: {}, the global one: {global:?}, the reader's: {:?}",
-                cell.kind, cell.hazard, o.diagnostics
-            )),
+        let readers = |why: &str| raised.iter().any(|d| why.contains(&d.describe(&name)));
+        let held = match (&cell.expect, &global) {
+            (Expect::LeftOut, Some(why)) => readers(why),
+            (Expect::Complete, None) => true,
+            (Expect::Own(words), Some(why)) => why.contains(*words) && !readers(why),
+            _ => false,
+        };
+        if !held {
+            wrong.push(format!(
+                "{}: the global hazard {global:?}, the reader's diagnostics {:?}",
+                cell.kind, o.diagnostics
+            ));
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
