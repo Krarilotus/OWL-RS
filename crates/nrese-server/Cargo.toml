@@ -57,6 +57,8 @@ libc = "0.2"
 windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }
 
 [dev-dependencies]
+# Simulated failures at the store's quarantine commit.
+nrese-store = { path = "../nrese-store", features = ["fault-points"] }
 # Measured memory tests (tests/process_memory.rs).
 nrese-exec = { path = "../nrese-exec", features = ["measure"] }
 # The export's checksum computed independently (tests/it/admin_backup_api_tests.rs).

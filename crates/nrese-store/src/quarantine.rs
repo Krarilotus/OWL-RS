@@ -236,6 +236,8 @@ pub struct Quarantine {
     /// The log may end in bytes an append wrote and couldn't take back: nothing more is
     /// appended (it would join them, and both be lost at open) until the next open repairs it.
     unknown: std::sync::atomic::AtomicBool,
+    #[cfg(feature = "fault-points")]
+    fail_commit: std::sync::atomic::AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -350,7 +352,15 @@ impl Quarantine {
             state: Mutex::new(state),
             resolving: Mutex::new(()),
             unknown: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(feature = "fault-points")]
+            fail_commit: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Test hook for a simulated failure committing this repository's next nonempty quarantine.
+    #[cfg(feature = "fault-points")]
+    pub fn fail_next_commit(&self) {
+        self.fail_commit.store(true, Ordering::Relaxed);
     }
 
     fn state(&self) -> std::sync::MutexGuard<'_, State> {
@@ -1065,6 +1075,10 @@ impl Collector<'_> {
     /// The load committed: its statements join the quarantine. Returns what it quarantined.
     pub(crate) fn commit(self) -> StoreResult<Quarantined> {
         let count = self.count.load(Ordering::Relaxed);
+        #[cfg(feature = "fault-points")]
+        if count > 0 && self.quarantine.fail_commit.swap(false, Ordering::Relaxed) {
+            return Err(std::io::Error::other("simulated failure").into());
+        }
         let mut inner =
             std::mem::take(&mut *self.inner.lock().unwrap_or_else(PoisonError::into_inner));
         if count == 0 {
