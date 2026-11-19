@@ -785,3 +785,194 @@ fn memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes() {
         "every graph: the larger is refused by the server's limit: {refusal}"
     );
 }
+
+/// A store whose public graph says `<urn:p> rdfs:subPropertyOf <urn:q>` and holds one `<urn:p>`
+/// statement, and whose secret graph holds `hidden` more, from which the rules derive
+/// `<urn:q>` statements; `pool` bytes of memory for all queries together (0: no such budget),
+/// and no process limit. Loaded past the pipeline (a write's pending changes draw on the shared
+/// budget too, D16-039), its inferences made and the rules registered.
+fn store_with_hidden(hidden: usize, pool: usize) -> StoreService {
+    use nrese_reasoner::rulesets::Ruleset;
+    let mut config = in_memory_store_config();
+    config.process_memory_bytes = nrese_store::ProcessMemory::Bytes(0);
+    config.total_query_memory_bytes = pool;
+    let store = StoreService::new(config).unwrap();
+    let secret: String = (0..hidden)
+        .map(|i| format!("<urn:hidden{i}> <urn:p> {i} . "))
+        .collect();
+    crate::support::load_past_the_pipeline(
+        &store,
+        &format!(
+            "<urn:g:public> {{ <urn:visible> <urn:p> <urn:o> .
+               <urn:p> <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <urn:q> }}
+             <urn:g:secret> {{ {secret} }}"
+        ),
+    );
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    store
+}
+
+/// `query` read in `scope` from `store`, with `limit` bytes of query memory of its own (`None`:
+/// none).
+fn read_within(
+    store: &StoreService,
+    scope: &ReadScope,
+    query: &str,
+    limit: Option<usize>,
+) -> nrese_store::StoreResult<()> {
+    let mut request = SparqlQueryRequest::new(query, scope.clone());
+    request.memory_limit = limit;
+    let prepared = store.prepare_query(&request).unwrap();
+    store.run_query(
+        &prepared,
+        &nrese_store::CancellationToken::new(),
+        std::io::sink(),
+    )
+}
+
+/// A reader of the public graph who sees the inferred statements its graphs support: its read
+/// makes its view, built from the support sets of every graph.
+fn supported_reader() -> ReadScope {
+    ReadScope::Graphs(Arc::new(GraphAccess {
+        prefixes: vec!["urn:g:public".to_owned()],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    }))
+}
+
+/// What a refusal tells its reader: whether it is the server's (503), whether it is for memory,
+/// and its text.
+fn told_of(refused: &nrese_store::StoreError) -> (bool, bool, String) {
+    (
+        refused.is_server_memory_limit(),
+        refused.is_memory_limit(),
+        refused.to_string(),
+    )
+}
+
+/// What a reader of some graphs is told of its view refused for memory (docs/ops/http-api.md,
+/// 503): the server's query memory is in use, and nothing more.
+fn the_class_only() -> (bool, bool, String) {
+    let text = "the server's query memory is in use \
+                (what the query held and asked for is not reported to a reader of some graphs)";
+    (true, true, text.to_owned())
+}
+
+/// A reader of some graphs whose view is refused for memory is told only that the server's query
+/// memory is in use (docs/ops/http-api.md, 503): no limit and no amount ([`the_class_only`]). The
+/// view is built from every graph, so which budget refused it, and that budget's limit, may
+/// depend on graphs the reader can't read. Here the reader's own limit is 1 byte, past which
+/// any view's first charge goes: refused on any host. A reader of every graph makes no view:
+/// its own query, past the same limit, is told as before, with its limit and amounts.
+#[test]
+fn a_view_refused_for_memory_tells_a_reader_of_some_graphs_the_class_only() {
+    use nrese_sparql::QueryEvaluationError;
+    use nrese_store::StoreError;
+    let store = store_with_hidden(1, 0);
+    let refused = read_within(&store, &supported_reader(), "ASK { ?s ?p ?o }", Some(1))
+        .expect_err("past its limit");
+    assert_eq!(
+        told_of(&refused),
+        the_class_only(),
+        "the reader of some graphs is told the class only"
+    );
+    let every = "SELECT ?s ?o WHERE { GRAPH ?g { ?s ?p ?o } } ORDER BY ?o";
+    let refused = read_within(&store, &ReadScope::All, every, Some(1)).expect_err("past its limit");
+    match &refused {
+        StoreError::SparqlEvaluation(QueryEvaluationError::MemoryLimit(exceeded)) => {
+            assert_eq!((exceeded.shared, exceeded.limit), (false, 1), "{refused}")
+        }
+        other => panic!("every graph: refused for its own memory, not {other:?}"),
+    }
+    assert!(
+        refused.is_memory_limit()
+            && !refused.is_server_memory_limit()
+            && refused.to_string().contains("MiB in use"),
+        "every graph: told as before: {refused}"
+    );
+    // A reader of some graphs who sees no inferred statement makes no view: its own query, past
+    // its own limit, is still the request's to change, told its limit.
+    let refused = read_within(&store, &public(), every, Some(1)).expect_err("past its limit");
+    assert!(
+        refused.is_memory_limit()
+            && !refused.is_server_memory_limit()
+            && refused
+                .to_string()
+                .contains("query memory budget exceeded: limit"),
+        "no view: {refused}"
+    );
+}
+
+/// The same, end to end: a reader of some graphs is told the same status and body whichever
+/// budget refused its view, its own query memory or the memory all queries share, and whatever
+/// the graphs it can't read hold. Each budget is 64 KiB, far below what these views need
+/// (`memory_refusals_tell_a_restricted_requester_nothing_of_hidden_sizes` relies on it too), so
+/// each refuses on any host. Before, the reader was told 413 with the query's limit by the one
+/// and 503 with the shared budget's by the other.
+#[test]
+fn a_reader_of_some_graphs_is_told_the_same_whichever_budget_refused_its_view() {
+    let budget = 64 << 10;
+    let ask = "ASK { ?s ?p ?o }";
+    let refusals = [
+        ("its own limit", store_with_hidden(2_000, 0), Some(budget)),
+        ("the shared budget", store_with_hidden(2_000, budget), None),
+        (
+            "the shared budget, more hidden",
+            store_with_hidden(4_000, budget),
+            None,
+        ),
+    ]
+    .map(|(by, store, limit)| {
+        let refused = read_within(&store, &supported_reader(), ask, limit)
+            .err()
+            .unwrap_or_else(|| panic!("{by}: not refused"));
+        (by, told_of(&refused))
+    });
+    let class = the_class_only();
+    let differ: Vec<_> = refusals.iter().filter(|(_, told)| *told != class).collect();
+    assert!(differ.is_empty(), "told apart from {class:?}: {differ:#?}");
+}
+
+/// A dataset's view (`inference-scope=dataset`) refused for memory is told by who reads it, not
+/// by the graphs the query selects: a reader of every graph is told as before, 413 with its
+/// limit, and a reader of some graphs the class only, as of its own view. The selector is the
+/// query's, the restriction the reader's.
+#[test]
+fn a_dataset_scoped_view_refused_for_memory_is_told_as_its_reader_is() {
+    use nrese_sparql::QueryEvaluationError;
+    use nrese_store::StoreError;
+    let store = store_with_hidden(1, 0);
+    let read = |scope: &ReadScope| {
+        let mut request =
+            SparqlQueryRequest::new("ASK FROM <urn:g:public> { ?s ?p ?o }", scope.clone());
+        request.inference_scope_dataset = true;
+        request.memory_limit = Some(1);
+        let prepared = store.prepare_query(&request).unwrap();
+        store
+            .run_query(
+                &prepared,
+                &nrese_store::CancellationToken::new(),
+                std::io::sink(),
+            )
+            .expect_err("past its limit")
+    };
+    let refused = read(&ReadScope::All);
+    match &refused {
+        StoreError::SparqlEvaluation(QueryEvaluationError::MemoryLimit(exceeded)) => {
+            assert_eq!((exceeded.shared, exceeded.limit), (false, 1), "{refused}")
+        }
+        other => panic!("every graph: refused for its own memory, not {other:?}"),
+    }
+    assert!(
+        refused.is_memory_limit() && !refused.is_server_memory_limit(),
+        "every graph, a dataset's view: told as before, 413: {refused}"
+    );
+    assert_eq!(
+        told_of(&read(&supported_reader())),
+        the_class_only(),
+        "a reader of some graphs, a dataset's view: the class only"
+    );
+}

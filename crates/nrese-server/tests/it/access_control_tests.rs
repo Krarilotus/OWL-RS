@@ -1237,6 +1237,61 @@ async fn a_readers_view_refused_for_memory_is_the_servers_503()
     Ok(())
 }
 
+/// A reader of some graphs whose view has no room is told the class only, the server's 503
+/// (docs/ops/http-api.md), whether it queried or read a graph (Graph Store `GET`): the
+/// server's query memory is in use, with no limit. The memory all queries share is 64 KiB, far
+/// below what a view of 20,000 hidden statements needs, so the view is refused on any host.
+/// The data is loaded past the pipeline, as a bulk load does: a write draws on that memory
+/// too. Before, the query was told the budget's limit, and the graph read was answered 400,
+/// as if the request were wrong.
+#[tokio::test]
+async fn a_readers_view_with_no_room_is_the_class_only_to_a_query_and_a_graph_read()
+-> Result<(), Box<dyn std::error::Error>> {
+    let policy = POLICY.replace("inferred = \"hidden\"", "inferred = \"supported\"");
+    let facts: String = (0..20_000)
+        .map(|i| format!("<{EX}s{i}> <{EX}says> <{EX}o{i}> . "))
+        .collect();
+    let dir = tempfile::tempdir()?;
+    let data = dir.path().join("data.trig");
+    std::fs::write(
+        &data,
+        format!(
+            "<{EX}g/secret> {{ {facts} }} <{EX}g/pub/1> {{
+               <{EX}says> <http://www.w3.org/2000/01/rdf-schema#subPropertyOf> <{EX}claims> }}"
+        ),
+    )?;
+    let store = nrese_store::StoreService::new(StoreConfig {
+        total_query_memory_bytes: 64 << 10,
+        ..StoreConfig::default()
+    })?;
+    store.bulk_load(&nrese_store::BulkLoadRequest {
+        files: vec![data],
+        replace: false,
+        graph: nrese_store::GraphTarget::DefaultGraph,
+        invalid: None,
+    })?;
+    let reasoner = ReasonerConfig::for_mode(ReasoningMode::Rdfs);
+    store.rematerialise(&reasoner.materialised_program().ok_or("setup: no program")?)?;
+    let app = crate::support::test_app_with_store(store, policy_of(&policy)?, reasoner)?;
+    let reader = &["nrese.read", "analyst"][..];
+    let graph = format!("/dataset/data?graph={EX}g/pub/1");
+    let query = sparql_query(&app, reader, "ASK { ?s ?p ?o }").await?;
+    let graph_read = send(&app, reader, Method::GET, &graph, None, "").await?;
+    let class = "the server's query memory is in use (what the query held and asked for is not \
+                 reported to a reader of some graphs) (budgets.total_query_memory, \
+                 NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)";
+    for (read, (status, body)) in [("a query", query), ("a graph read", graph_read)] {
+        let problem = serde_json::from_str::<serde_json::Value>(&body).ok();
+        let detail = problem.as_ref().and_then(|p| p["detail"].as_str());
+        assert_eq!(
+            (status, detail),
+            (StatusCode::SERVICE_UNAVAILABLE, Some(class)),
+            "{read}: the class only, as the server's 503: {body}"
+        );
+    }
+    Ok(())
+}
+
 /// `request` sent by a requester with `roles` (none: anonymous), its response recorded: the
 /// status line, every header in the order the response holds them, a blank line, the body;
 /// with the number of frames the body came in.
