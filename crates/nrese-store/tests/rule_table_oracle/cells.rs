@@ -5,7 +5,7 @@ use crate::{
 };
 
 #[test]
-#[ignore = "an empty store omits the datatype declarations until its first write attempt"]
+#[ignore = "undocumented: an empty store omits the datatype declarations until its first write attempt"]
 fn empty_store_publishes_datatype_axioms() {
     // Spec: Table 8 dt-type1 and reasoning-semantics.md:57 require these on an empty graph.
     let required: Facts = oracle::evaluate(&Facts::new(), oracle::Datatypes::Standard)
@@ -35,17 +35,34 @@ fn empty_store_publishes_datatype_axioms() {
 }
 
 #[test]
-#[ignore = "a chain starting at rdf:nil drops its explicit first and rest"]
+#[ignore = "undocumented: a chain starting at rdf:nil drops its explicit first and rest"]
 fn nil_head_starts_an_explicit_walk() {
     // Spec: Table 3 matches the head's first and rest. Table 5 prp-spo2 derives the endpoint.
     check(generator::nil_walk("nil-head"), &[true], &[true]);
 }
 
 #[test]
-#[ignore = "a chain stops at rdf:nil before reading its explicit continuation"]
+#[ignore = "undocumented: a chain stops at rdf:nil before reading its explicit continuation"]
 fn nil_cell_continues_an_explicit_walk() {
     // Spec: Table 3 also matches explicit first and rest on an interior cell.
     check(generator::nil_walk("nil-cell"), &[true], &[true]);
+}
+
+#[test]
+fn unnamed_union_membership_is_visible_when_consumed() {
+    // Spec: reasoning-semantics.md:27 hides memberships of unused unnamed unions.
+    let membership = crate::triple(["ex:a", "rdf:type", "_:union"]);
+    for consumed in [false, true] {
+        let fixture = generator::unnamed_union(consumed);
+        for &mode in judges::MODES {
+            let (store, accepted) =
+                judges::first_and_rebuild(mode, &fixture.writes[0].insert, false);
+            assert!(accepted);
+            let rows = judges::rows(&store).0;
+            assert_eq!(rows.contains(&membership), consumed, "{mode}");
+            assert_eq!(rows.contains(&fixture.watch), consumed, "{mode}");
+        }
+    }
 }
 
 fn check(cell: Case, accepted: &[bool], present: &[bool]) {
@@ -75,7 +92,7 @@ fn matches_oracle(cell: &Case, accepted: &[bool], present: &[bool]) -> bool {
 }
 
 #[test]
-#[ignore = "asserting an entailed shortcut changes the first load's chain answer"]
+#[ignore = "documented limit reasoning-semantics.md:63-65: asserting an entailed shortcut changes the first load's chain answer"]
 fn redundant_list_premise_leaves_chain_unchanged() {
     // Spec: Table 9 scm-spo and Table 5 prp-spo1 and prp-spo2 give the same
     // chain row with or without the entailed subproperty.
@@ -87,7 +104,7 @@ fn redundant_list_premise_leaves_chain_unchanged() {
 }
 
 #[test]
-#[ignore = "a back edge hides an accepting list walk until the chain is rebuilt correctly"]
+#[ignore = "documented limit reasoning-semantics.md:68: a back edge hides an accepting list walk until the chain is rebuilt correctly"]
 fn cycle_keeps_its_exiting_walk() {
     // Spec: Table 3 and Table 5 prp-spo2 give a chain consequence while the
     // exiting walk and both data edges exist, including with a back edge.
@@ -117,7 +134,7 @@ fn cycle_keeps_its_exiting_walk() {
 }
 
 #[test]
-#[ignore = "a chain over rdfs:subClassOf misses a new subclass edge"]
+#[ignore = "undocumented: a chain over rdfs:subClassOf misses a new subclass edge"]
 fn schema_operand_insert_derives_chain_row() {
     // Spec: Table 5 prp-spo2 uses rdfs:subClassOf just like any other list operand.
     check(
@@ -128,7 +145,7 @@ fn schema_operand_insert_derives_chain_row() {
 }
 
 #[test]
-#[ignore = "a chain over rdfs:subClassOf keeps the result of a deleted subclass edge"]
+#[ignore = "undocumented: a chain over rdfs:subClassOf keeps the result of a deleted subclass edge"]
 fn schema_operand_delete_retracts_chain_row() {
     // Spec: Table 5 prp-spo2 cannot derive the chain row once its only first edge is gone.
     check(
@@ -139,7 +156,7 @@ fn schema_operand_delete_retracts_chain_row() {
 }
 
 #[test]
-#[ignore = "the diagonal is missed in an owl:sameAs chain operand"]
+#[ignore = "undocumented: the diagonal is missed in an owl:sameAs chain operand"]
 fn same_as_operand_makes_a_disjoint_chain_inconsistent() {
     // Spec: Table 4 eq-ref and Table 5 prp-spo2 copy ex:p through the chain;
     // Table 5 prp-pdw rejects the copied row because the properties are disjoint.
@@ -167,14 +184,14 @@ fn same_as_operand_makes_a_disjoint_chain_inconsistent() {
 }
 
 #[test]
-#[ignore = "a 251-cell property chain loses its endpoint row"]
+#[ignore = "documented limit reasoning-semantics.md:63-65: a 251-cell property chain loses its endpoint row"]
 fn long_property_chain_reaches_its_endpoint() {
     // Spec: Table 3 and Table 5 prp-spo2 derive the row for a 251-member walk.
     check(generator::long_chain(251), &[true, true], &[false, true]);
 }
 
 #[test]
-#[ignore = "declaring owl:sameAs irreflexive is accepted despite its diagonal"]
+#[ignore = "undocumented: declaring owl:sameAs irreflexive is accepted despite its diagonal"]
 fn irreflexive_same_as_is_inconsistent() {
     // Spec: Table 4 eq-ref gives the diagonal, which Table 5 prp-irp forbids.
     check(
@@ -192,7 +209,7 @@ fn irreflexive_same_as_is_inconsistent() {
 }
 
 #[test]
-#[ignore = "a later write loses equality derived by a functional property between literal forms"]
+#[ignore = "documented limit reasoning-semantics.md:74: a later write loses equality derived by a functional property between literal forms"]
 fn functional_literal_equality_reaches_later_writes() {
     // Spec: Table 5 prp-fp equates the two forms; Table 4 eq-rep-o copies
     // either one into the later row. Table 8 dt-diff sees one data value.

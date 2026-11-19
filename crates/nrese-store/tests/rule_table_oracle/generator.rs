@@ -110,6 +110,7 @@ pub const SHAPES: &[&str] = &[
     "rest-subproperty",
     "literal-value",
     "literal-distinct",
+    "unnamed-union",
 ];
 
 const CHAIN: &str = "
@@ -128,6 +129,28 @@ pub fn nil_walk(shape: &'static str) -> Case {
         shape,
         ["ex:a", "ex:out", "ex:z"],
         vec![insert(&CHAIN.replace(cell, "rdf:nil"))],
+    )
+}
+
+pub fn unnamed_union(consumed: bool) -> Case {
+    let mut write = insert(
+        "
+        _:union owl:unionOf ex:h
+        ex:h rdf:first ex:C
+        ex:h rdf:rest rdf:nil
+        ex:p rdfs:domain _:union
+        ex:a ex:p ex:b
+    ",
+    );
+    if consumed {
+        write
+            .insert
+            .extend(rows("_:union rdfs:subClassOf ex:Super"));
+    }
+    case(
+        "unnamed-union",
+        ["ex:a", "rdf:type", "ex:Super"],
+        vec![write],
     )
 }
 
@@ -268,6 +291,7 @@ pub fn generated(seed: u64, plain: bool) -> Case {
         ),
         "literal-functional" | "literal-value" => literal(shape, INTEGER, DECIMAL, next(2) == 0),
         "literal-distinct" => literal(shape, INTEGER, "\"1.25\"^^xsd:decimal", next(2) == 0),
+        "unnamed-union" => unnamed_union(next(2) == 0),
         "branch" => make_chain(vec![
             insert(CHAIN),
             insert("ex:t rdf:first ex:p\nex:h rdf:rest rdf:nil"),

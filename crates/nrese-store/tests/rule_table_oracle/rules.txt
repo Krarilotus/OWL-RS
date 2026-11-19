@@ -13,7 +13,16 @@
 4 eq-diff2 | ?x rdf:type owl:AllDifferent, ?x owl:members ?h, @pair ?h ?a ?b, ?a owl:sameAs ?b | @false
 4 eq-diff3 | ?x rdf:type owl:AllDifferent, ?x owl:distinctMembers ?h, @pair ?h ?a ?b, ?a owl:sameAs ?b | @false
 
-# Table 5 (prp-ap is seeded in oracle.rs)
+# Table 5 (annotation properties from OWL 2 Structural Specification §5.5)
+5 prp-ap | | rdfs:label rdf:type owl:AnnotationProperty
+5 prp-ap | | rdfs:comment rdf:type owl:AnnotationProperty
+5 prp-ap | | rdfs:seeAlso rdf:type owl:AnnotationProperty
+5 prp-ap | | rdfs:isDefinedBy rdf:type owl:AnnotationProperty
+5 prp-ap | | owl:deprecated rdf:type owl:AnnotationProperty
+5 prp-ap | | owl:versionInfo rdf:type owl:AnnotationProperty
+5 prp-ap | | owl:priorVersion rdf:type owl:AnnotationProperty
+5 prp-ap | | owl:backwardCompatibleWith rdf:type owl:AnnotationProperty
+5 prp-ap | | owl:incompatibleWith rdf:type owl:AnnotationProperty
 5 prp-dom | ?p rdfs:domain ?c, ?x ?p ?y | ?x rdf:type ?c
 5 prp-rng | ?p rdfs:range ?c, ?x ?p ?y | ?y rdf:type ?c
 5 prp-fp | ?p rdf:type owl:FunctionalProperty, ?x ?p ?y, ?x ?p ?z | ?y owl:sameAs ?z
@@ -97,15 +106,15 @@
 3 list-pair | @step ?c ?m ?t, @pair ?t ?a ?b | @pair ?c ?a ?b
 
 # Reachability limits the three dependent helpers to cells of the relevant kind.
-5 prp-spo2 | ?p owl:propertyChainAxiom ?c, @accept ?c | @chain-cell ?c
+5 prp-spo2 | ?p owl:propertyChainAxiom ?h, @accept ?h | @chain-cell ?h
 5 prp-spo2 | @chain-cell ?c, @step ?c ?m ?t, @accept ?t | @chain-cell ?t
 5 prp-spo2 | @chain-cell ?c, @end ?c ?m, ?x ?m ?y | @chain ?c ?x ?y
 5 prp-spo2 | @chain-cell ?c, @step ?c ?m ?t, @chain ?t ?y ?z, ?x ?m ?y | @chain ?c ?x ?z
-5 prp-key | ?p owl:hasKey ?c, @accept ?c | @key-cell ?c
+5 prp-key | ?p owl:hasKey ?h, @accept ?h | @key-cell ?h
 5 prp-key | @key-cell ?c, @step ?c ?m ?t, @accept ?t | @key-cell ?t
 5 prp-key | @key-cell ?c, @end ?c ?m, ?x ?m ?v, ?y ?m ?v | @key ?c ?x ?y
 5 prp-key | @key-cell ?c, @step ?c ?m ?t, @key ?t ?x ?y, ?x ?m ?v, ?y ?m ?v | @key ?c ?x ?y
-6 cls-int1 | ?p owl:intersectionOf ?c, @accept ?c | @int-cell ?c
+6 cls-int1 | ?p owl:intersectionOf ?h, @accept ?h | @int-cell ?h
 6 cls-int1 | @int-cell ?c, @step ?c ?m ?t, @accept ?t | @int-cell ?t
 6 cls-int1 | @int-cell ?c, @end ?c ?m, ?x rdf:type ?m | @intersection ?c ?x
 6 cls-int1 | @int-cell ?c, @step ?c ?m ?t, @intersection ?t ?x, ?x rdf:type ?m | @intersection ?c ?x

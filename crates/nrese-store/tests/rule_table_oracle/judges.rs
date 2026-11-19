@@ -133,10 +133,28 @@ pub fn rows(store: &StoreService) -> (Facts, String) {
     let rows = answer["results"]["bindings"]
         .as_array()
         .expect("SELECT results");
-    let facts = rows
+    let mut facts: Facts = rows
         .iter()
         .map(|row| ["s", "p", "o"].map(|name| term(&row[name])))
         .collect();
+    // The unnamed-union fixtures contain one blank node. INSERT DATA assigns
+    // a fresh ID, while the oracle calls that node _:union.
+    let mut blanks = facts.iter().flatten().filter(|term| term.starts_with("_:"));
+    if let Some(first) = blanks.next() {
+        assert!(blanks.all(|term| term == first), "one fixture blank node");
+        facts = facts
+            .into_iter()
+            .map(|row| {
+                row.map(|term| {
+                    if term.starts_with("_:") {
+                        "_:union".to_owned()
+                    } else {
+                        term
+                    }
+                })
+            })
+            .collect();
+    }
     (facts, status)
 }
 

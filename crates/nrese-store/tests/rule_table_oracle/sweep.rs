@@ -19,28 +19,35 @@ enum Answer {
     Redundant,
 }
 
+const UNDOCUMENTED: &str = "undocumented";
+const CAPPED: &str = "documented limit reasoning-semantics.md:63-65";
+const GENERALISED: &str = "documented limit reasoning-semantics.md:74";
+
 #[derive(Clone, Debug)]
 pub struct Difference {
     mode: &'static str,
     judge: &'static str,
     write: usize,
     expected: Answer,
+    limit: &'static str,
     detail: String,
 }
 
 impl Difference {
     fn same_witness(&self, other: &Self) -> bool {
-        (self.mode, self.judge, &self.expected) == (other.mode, other.judge, &other.expected)
+        (self.mode, self.judge, &self.expected, self.limit)
+            == (other.mode, other.judge, &other.expected, other.limit)
     }
 
     fn line(&self) -> String {
         format!(
-            "{} {} write {} oracle {:?}; judge {}",
+            "{} {} write {} oracle {:?}; judge {} [{}]",
             self.mode,
             self.judge,
             self.write + 1,
             self.expected,
-            self.detail
+            self.detail,
+            self.limit,
         )
     }
 }
@@ -93,7 +100,7 @@ struct Comparison<'a> {
     case: &'a Case,
     focus: Option<&'a Difference>,
     differences: Vec<Difference>,
-    counts: [usize; publication::ITEMS.len()],
+    counts: BTreeMap<&'static str, usize>,
     known: usize,
 }
 
@@ -111,27 +118,45 @@ impl Comparison<'_> {
 
     fn compare(
         &mut self,
-        mode: &'static str,
-        judge: &'static str,
-        write: usize,
+        (mode, judge, write): (&'static str, &'static str, usize),
         store: &StoreService,
-        accepted: bool,
-        wanted: bool,
-        state: Option<(&Step, &(Publication, Facts))>,
+        (accepted, wanted): (bool, bool),
+        (step, (expected, without_deviation)): (&Step, &(Publication, Facts)),
     ) -> Option<bool> {
         let mut report = |expected, detail| {
+            let limit = match &expected {
+                Answer::Accept(false) if !oracle::published_clash(&step.asserted, false) => {
+                    "documented limit reasoning-semantics.md:57"
+                }
+                Answer::Accept(false)
+                    if write > 0
+                        && matches!(judge, "warm" | "cold")
+                        && !oracle::published_clash(&step.asserted, true) =>
+                {
+                    GENERALISED
+                }
+                Answer::Row(row, true) if row == &self.case.watch => match self.case.shape {
+                    "redundant" | "long-chain" => CAPPED,
+                    "cycle" => "documented limit reasoning-semantics.md:68",
+                    "literal-functional" if matches!(judge, "warm" | "cold" | "reopened") => {
+                        GENERALISED
+                    }
+                    _ => UNDOCUMENTED,
+                },
+                _ => UNDOCUMENTED,
+            };
             self.differences.push(Difference {
                 mode,
                 judge,
                 write,
                 expected,
+                limit,
                 detail,
             })
         };
         if accepted != wanted {
             report(Answer::Accept(wanted), format!("accepted={accepted}"));
         }
-        let (step, (expected, without_deviation)) = state?;
         let (rows, select_status) = judges::rows(store);
         for row in expected.required.difference(&rows) {
             if without_deviation.contains(row) {
@@ -174,7 +199,7 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
         case,
         focus,
         differences: Vec::new(),
-        counts: [0; publication::ITEMS.len()],
+        counts: BTreeMap::new(),
         known: 0,
     };
     let projected: Vec<_> = steps.iter().map(projection).collect();
@@ -185,8 +210,8 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
     };
     let initial = projection(&empty);
     for (publication, _) in &projected {
-        for (sum, count) in compare.counts.iter_mut().zip(publication.counts) {
-            *sum += count;
+        for (&reason, count) in &publication.counts {
+            *compare.counts.entry(reason).or_default() += count;
         }
     }
 
@@ -199,17 +224,14 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
             for (index, (step, expected)) in steps.iter().zip(&projected).enumerate() {
                 let (store, accepted) = judges::first_and_rebuild(mode, &step.ordered, rebuild);
                 let state = if accepted {
-                    Some((step, expected))
+                    (step, expected)
                 } else {
-                    (!rebuild).then_some((&empty, &initial))
+                    (&empty, &initial)
                 };
                 let answer = compare.compare(
-                    mode,
-                    judge,
-                    index,
+                    (mode, judge, index),
                     &store,
-                    accepted,
-                    !step.model.inconsistent,
+                    (accepted, !step.model.inconsistent),
                     state,
                 );
                 if case.shape == "redundant"
@@ -226,6 +248,7 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
                         judge,
                         write: index,
                         expected: Answer::Redundant,
+                        limit: CAPPED,
                         detail: format!("watch {:?} changed from {before} to {after}", case.watch),
                     });
                 }
@@ -249,24 +272,26 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
             {
                 let accepted = judges::apply(&pipeline, write);
                 let wanted = !step.model.inconsistent;
-                let visible = Some(if accepted {
+                let visible = if accepted {
                     (step, expected)
                 } else {
                     committed
-                });
-                let compare_store = |compare: &mut Comparison<'_>, judge, store: &StoreService| {
-                    compare.compare(mode, judge, index, store, accepted, wanted, visible);
                 };
                 if compare.enabled(mode, judge) {
-                    compare_store(&mut compare, judge, &store);
+                    compare.compare((mode, judge, index), &store, (accepted, wanted), visible);
                 }
                 if restart {
                     drop(pipeline);
                     drop(store);
                     store = open();
                     pipeline = judges::pipeline(&store, rl);
-                    if reopened && accepted == wanted {
-                        compare_store(&mut compare, "reopened", &store);
+                    if reopened {
+                        compare.compare(
+                            (mode, "reopened", index),
+                            &store,
+                            (accepted, accepted),
+                            visible,
+                        );
                     }
                 }
                 if wanted {
@@ -317,6 +342,9 @@ fn required_red<'a>(case: &Case, differences: &'a [Difference]) -> Option<&'a Di
 }
 
 fn persists(case: &Case, witness: &Difference) -> bool {
+    if (case.writes.len() == 1) != (witness.write == 0) {
+        return false;
+    }
     let steps = steps(case);
     let plausible = match &witness.expected {
         Answer::Accept(accepted) => steps
@@ -333,19 +361,22 @@ fn persists(case: &Case, witness: &Difference) -> bool {
         && run(case, &steps, Some(witness))
             .differences
             .iter()
-            .any(|difference| difference.same_witness(witness))
+            .any(|difference| {
+                difference.write + 1 == steps.len() && difference.same_witness(witness)
+            })
 }
 
 fn reduce(case: &mut Case, witness: &Difference) {
+    case.writes.truncate(witness.write + 1);
     // Try contiguous block removals first. End with single removals to get a
     // 1-minimal reproducer for this answer, judge and equality mode.
     let mut changed = true;
     while changed {
         changed = false;
-        for index in (0..case.writes.len()).rev() {
+        for index in (0..case.writes.len() - 1).rev() {
             let mut smaller = case.clone();
             smaller.writes.remove(index);
-            if !smaller.writes.is_empty() && persists(&smaller, witness) {
+            if persists(&smaller, witness) {
                 *case = smaller;
                 changed = true;
             }
@@ -385,7 +416,11 @@ fn reduce(case: &mut Case, witness: &Difference) {
     }
 }
 
-fn print_reduced(seed: u64, mut case: Case, witness: &Difference) {
+fn print_reduced(
+    seed: u64,
+    mut case: Case,
+    witness: &Difference,
+) -> BTreeSet<(&'static str, &'static str)> {
     reduce(&mut case, witness);
     println!(
         "REDUCED seed={seed} shape={} watch={} witness={:?}",
@@ -401,12 +436,21 @@ fn print_reduced(seed: u64, mut case: Case, witness: &Difference) {
             }
         }
     }
-    for difference in run(&case, &steps(&case), None).differences {
-        if difference.expected == witness.expected {
+    let judges = run(&case, &steps(&case), None)
+        .differences
+        .into_iter()
+        .filter(|difference| {
+            difference.write + 1 == case.writes.len()
+                && difference.expected == witness.expected
+                && difference.limit == witness.limit
+        })
+        .map(|difference| {
             println!("RED RESULT {}", difference.line());
-        }
-    }
+            (difference.mode, difference.judge)
+        })
+        .collect();
     println!("END REDUCED seed={seed}");
+    judges
 }
 
 #[test]
@@ -429,7 +473,7 @@ fn seeds() {
     let mut witnesses = BTreeMap::new();
     let mut deviations = 0;
     let mut disagreements = 0;
-    let mut counts = [0; publication::ITEMS.len()];
+    let mut counts = BTreeMap::new();
     while generator::draws_on(
         drawn,
         cases,
@@ -442,8 +486,8 @@ fn seeds() {
         let steps = steps(&case);
         let result = run(&case, &steps, None);
         deviations += result.known;
-        for (sum, count) in counts.iter_mut().zip(result.counts) {
-            *sum += count;
+        for (reason, count) in &result.counts {
+            *counts.entry(*reason).or_default() += count;
         }
         if result.differences.is_empty() {
             continue;
@@ -460,22 +504,31 @@ fn seeds() {
             // originating write so different inconsistency inputs stay distinct.
             let origin = matches!(difference.expected, Answer::Accept(_) | Answer::Redundant)
                 .then_some((seed, difference.write));
-            let judge = (difference.mode, difference.judge);
-            let (_, _, judges) = witnesses
-                .entry((origin, difference.expected.clone()))
-                .or_insert_with(|| (seed, difference, BTreeSet::new()));
-            judges.insert(judge);
+            let judge = (difference.mode, difference.judge, difference.write + 1);
+            witnesses
+                .entry((origin, difference.expected.clone(), difference.limit))
+                .or_insert_with(BTreeMap::new)
+                .entry(judge)
+                .or_insert((seed, difference));
         }
     }
-    for (_, (seed, witness, judges)) in witnesses {
+    for ((_, answer, limit), mut sightings) in witnesses {
         println!(
-            "WITNESS {:?} seed={seed} observed={judges:?}",
-            witness.expected
+            "WITNESS {answer:?} [{limit}] observed={:?}",
+            sightings.keys().collect::<Vec<_>>()
         );
-        print_reduced(seed, generator::generated(seed, plain), &witness);
+        while let Some((_, (seed, witness))) = sightings.pop_first() {
+            let matched = print_reduced(seed, generator::generated(seed, plain), &witness);
+            sightings.retain(|&(mode, judge, write), _| {
+                write != witness.write + 1 || !matched.contains(&(mode, judge))
+            });
+        }
     }
-    for (item, count) in publication::ITEMS.iter().zip(counts) {
-        println!("PUBLICATION {item} => {count}");
+    for item in publication::ITEMS {
+        println!(
+            "PUBLICATION {item} => {}",
+            counts.get(item).copied().unwrap_or(0)
+        );
     }
     println!(
         "KNOWN DEVIATION {} => {deviations}",

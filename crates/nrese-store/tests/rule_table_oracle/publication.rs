@@ -1,48 +1,66 @@
 //! Publication exceptions to the model, from docs/spec/reasoning-semantics.md.
 
+use std::collections::BTreeMap;
+
 use crate::{
     Facts, Triple,
     oracle::{self, Datatypes},
 };
 
+const DIAGONAL: &str = "eq-ref diagonal (56)";
+const SUBJECT: &str = "literal subject (73–74)";
+const PREDICATE: &str = "non-IRI predicate (73–74)";
+const HIDDEN_UNION: &str = "hidden unnamed union membership (27)";
+const DATATYPE_TYPE: &str = "dt-type2 (57)";
+const DATATYPE_EQ: &str = "dt-eq without another derivation (57)";
+const REFLEXIVITY: &str = "eq-ref-dependent row (56)";
 pub const ITEMS: &[&str] = &[
-    "eq-ref diagonal (56)",
-    "literal subject (73–74)",
-    "non-IRI predicate (73–74)",
-    "hidden unnamed union membership (27)",
-    "dt-type2 (57)",
-    "dt-eq without another derivation (57)",
+    DIAGONAL,
+    SUBJECT,
+    PREDICATE,
+    HIDDEN_UNION,
+    DATATYPE_TYPE,
+    DATATYPE_EQ,
+    REFLEXIVITY,
+    // Zero by construction. The oracle contains no RDF/RDFS axiomatic triples outside Tables 4–9.
     "axiomatic triples outside Tables 4–9 (58)",
 ];
 
 pub struct Publication {
     pub required: Facts,
-    pub counts: [usize; ITEMS.len()],
+    pub counts: BTreeMap<&'static str, usize>,
 }
 
 pub fn project(asserted: &Facts, model: &oracle::Model) -> Publication {
     let mut result = Publication {
         required: Facts::new(),
-        counts: [0; ITEMS.len()],
+        counts: BTreeMap::new(),
     };
     let has_literals = asserted.iter().flatten().any(|term| term.starts_with('"'));
     let without_type2 = has_literals.then(|| oracle::evaluate(asserted, Datatypes::WithoutType2));
     let without_dt_eq = has_literals.then(|| oracle::evaluate(asserted, Datatypes::Published));
+    let without_eq_ref = oracle::without_eq_ref(asserted);
     for row in &model.facts {
-        let exclusion = excluded(row, asserted);
-        if without_type2
+        let reason = if without_type2
             .as_ref()
             .is_some_and(|m| !m.facts.contains(row))
         {
-            result.counts[4] += 1;
-        } else if let Some(reason) = exclusion {
-            result.counts[reason] += 1;
+            Some(DATATYPE_TYPE)
+        } else if let Some(reason) = excluded(row, asserted) {
+            Some(reason)
         } else if without_dt_eq
             .as_ref()
             .is_some_and(|m| !m.facts.contains(row))
         {
             // An equality or consequence also supported by prp-fp stays required.
-            result.counts[5] += 1;
+            Some(DATATYPE_EQ)
+        } else if !without_eq_ref.contains(row) {
+            Some(REFLEXIVITY)
+        } else {
+            None
+        };
+        if let Some(reason) = reason {
+            *result.counts.entry(reason).or_default() += 1;
         } else {
             result.required.insert(row.clone());
         }
@@ -52,22 +70,22 @@ pub fn project(asserted: &Facts, model: &oracle::Model) -> Publication {
     result
 }
 
-fn excluded(row: &Triple, asserted: &Facts) -> Option<usize> {
+fn excluded(row: &Triple, asserted: &Facts) -> Option<&'static str> {
     let [s, p, o] = row;
     if asserted.contains(row) {
         return None;
     }
     if p == "owl:sameAs" && s == o {
-        return Some(0);
+        return Some(DIAGONAL);
     }
     if s.starts_with('"') {
-        return Some(1);
+        return Some(SUBJECT);
     }
     if p.starts_with('"') || p.starts_with("_:") {
-        return Some(2);
+        return Some(PREDICATE);
     }
     if p == "rdf:type" && o.starts_with("_:") && hidden_union(o, asserted) {
-        return Some(3);
+        return Some(HIDDEN_UNION);
     }
     None
 }

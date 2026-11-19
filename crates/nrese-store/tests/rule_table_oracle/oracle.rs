@@ -22,9 +22,10 @@ pub enum Datatypes {
     Published,
 }
 
-// reasoning-semantics.md:47 counts 58 fixed rules. The omitted table names neither rule.
-pub const KNOWN_DEVIATION: &str = "Table 6 cls-thing and cls-nothing1 are not derived";
-const OMITTED_RULES: &[&str] = &["6 cls-thing", "6 cls-nothing1"];
+// reasoning-semantics.md:47 counts 58 fixed rules. The omitted table names none of these.
+pub const KNOWN_DEVIATION: &str =
+    "Table 5 prp-ap and Table 6 cls-thing and cls-nothing1 are not derived";
+const OMITTED_RULES: &[&str] = &["5 prp-ap", "6 cls-thing", "6 cls-nothing1"];
 
 #[derive(Clone, Copy)]
 enum Term {
@@ -215,35 +216,30 @@ impl Rule {
 }
 
 pub fn evaluate(asserted: &Facts, datatypes: Datatypes) -> Model {
-    evaluate_with(asserted, datatypes, &[])
+    evaluate_with(asserted, datatypes, &[], false)
 }
 
 pub fn without_known_deviation(asserted: &Facts) -> Facts {
-    evaluate_with(asserted, Datatypes::Standard, OMITTED_RULES).facts
+    evaluate_with(asserted, Datatypes::Standard, OMITTED_RULES, false).facts
 }
 
-fn evaluate_with(asserted: &Facts, datatypes: Datatypes, omit: &[&str]) -> Model {
+pub fn without_eq_ref(asserted: &Facts) -> Facts {
+    evaluate_with(asserted, Datatypes::Standard, &["4 eq-ref"], false).facts
+}
+
+pub fn published_clash(asserted: &Facts, persisted_only: bool) -> bool {
+    evaluate_with(asserted, Datatypes::Published, &[], persisted_only).inconsistent
+}
+
+fn evaluate_with(
+    asserted: &Facts,
+    datatypes: Datatypes,
+    omit: &[&str],
+    persisted_only: bool,
+) -> Model {
     let mut program = Program::read(omit);
     let mut initial = asserted.clone();
     let bad_types = datatype_facts(asserted, datatypes, &mut initial);
-    // Table 5, prp-ap. OWL 2 Structural Specification §5.5 gives the built-in properties.
-    for annotation in [
-        "rdfs:label",
-        "rdfs:comment",
-        "rdfs:seeAlso",
-        "rdfs:isDefinedBy",
-        "owl:deprecated",
-        "owl:versionInfo",
-        "owl:priorVersion",
-        "owl:backwardCompatibleWith",
-        "owl:incompatibleWith",
-    ] {
-        initial.insert(crate::triple([
-            annotation,
-            "rdf:type",
-            "owl:AnnotationProperty",
-        ]));
-    }
     // Table 8, dt-not-type: a type stating a value is outside that datatype derives false.
     let mut variables = Symbols::default();
     let body = ["?literal rdf:type ?dt", "@outside ?literal ?dt"]
@@ -296,6 +292,12 @@ fn evaluate_with(asserted: &Facts, datatypes: Datatypes, omit: &[&str]) -> Model
         }
         let mut changed = false;
         for (relation, row) in derived {
+            if persisted_only && relation == TRIPLE {
+                let [s, p, _] = row.map(|id| program.symbols.name(id));
+                if s.starts_with('"') || p.starts_with(['"', '_']) {
+                    continue;
+                }
+            }
             changed |= database[relation].insert(row);
         }
         if !changed {
@@ -312,69 +314,24 @@ fn evaluate_with(asserted: &Facts, datatypes: Datatypes, omit: &[&str]) -> Model
     }
 }
 
-struct Space {
-    datatype: &'static str,
-    bounds: Option<(i128, i128)>,
-}
+type IntegerBounds = (i128, i128);
 
-// Numeric value spaces in Table 8. Bounds apply only to integral values.
-const NUMERIC: &[Space] = &[
-    Space {
-        datatype: "xsd:decimal",
-        bounds: None,
-    },
-    Space {
-        datatype: "xsd:integer",
-        bounds: Some((i128::MIN, i128::MAX)),
-    },
-    Space {
-        datatype: "xsd:nonNegativeInteger",
-        bounds: Some((0, i128::MAX)),
-    },
-    Space {
-        datatype: "xsd:nonPositiveInteger",
-        bounds: Some((i128::MIN, 0)),
-    },
-    Space {
-        datatype: "xsd:positiveInteger",
-        bounds: Some((1, i128::MAX)),
-    },
-    Space {
-        datatype: "xsd:negativeInteger",
-        bounds: Some((i128::MIN, -1)),
-    },
-    Space {
-        datatype: "xsd:long",
-        bounds: Some((i64::MIN as i128, i64::MAX as i128)),
-    },
-    Space {
-        datatype: "xsd:int",
-        bounds: Some((i32::MIN as i128, i32::MAX as i128)),
-    },
-    Space {
-        datatype: "xsd:short",
-        bounds: Some((i16::MIN as i128, i16::MAX as i128)),
-    },
-    Space {
-        datatype: "xsd:byte",
-        bounds: Some((i8::MIN as i128, i8::MAX as i128)),
-    },
-    Space {
-        datatype: "xsd:unsignedLong",
-        bounds: Some((0, u64::MAX as i128)),
-    },
-    Space {
-        datatype: "xsd:unsignedInt",
-        bounds: Some((0, u32::MAX as i128)),
-    },
-    Space {
-        datatype: "xsd:unsignedShort",
-        bounds: Some((0, u16::MAX as i128)),
-    },
-    Space {
-        datatype: "xsd:unsignedByte",
-        bounds: Some((0, u8::MAX as i128)),
-    },
+// Numeric value spaces from the OWL 2 datatype map. Bounds apply only to integral values.
+const NUMERIC: &[(&str, Option<IntegerBounds>)] = &[
+    ("xsd:decimal", None),
+    ("xsd:integer", Some((i128::MIN, i128::MAX))),
+    ("xsd:nonNegativeInteger", Some((0, i128::MAX))),
+    ("xsd:nonPositiveInteger", Some((i128::MIN, 0))),
+    ("xsd:positiveInteger", Some((1, i128::MAX))),
+    ("xsd:negativeInteger", Some((i128::MIN, -1))),
+    ("xsd:long", Some((i64::MIN as i128, i64::MAX as i128))),
+    ("xsd:int", Some((i32::MIN as i128, i32::MAX as i128))),
+    ("xsd:short", Some((i16::MIN as i128, i16::MAX as i128))),
+    ("xsd:byte", Some((i8::MIN as i128, i8::MAX as i128))),
+    ("xsd:unsignedLong", Some((0, u64::MAX as i128))),
+    ("xsd:unsignedInt", Some((0, u32::MAX as i128))),
+    ("xsd:unsignedShort", Some((0, u16::MAX as i128))),
+    ("xsd:unsignedByte", Some((0, u8::MAX as i128))),
 ];
 
 const OTHER_DATATYPES: &[&str] = &[
@@ -443,9 +400,9 @@ impl<'a> Number<'a> {
 
     fn in_space(&self, datatype: &str) -> bool {
         datatype == "rdfs:Literal"
-            || NUMERIC.iter().any(|space| {
-                space.datatype == datatype
-                    && space.bounds.is_none_or(|(min, max)| {
+            || NUMERIC.iter().any(|&(name, bounds)| {
+                name == datatype
+                    && bounds.is_none_or(|(min, max)| {
                         self.fraction.is_empty() && (min..=max).contains(&self.integer)
                     })
             })
@@ -468,7 +425,7 @@ fn datatype_facts(
     let mut bad_types = Vec::new();
     for datatype in NUMERIC
         .iter()
-        .map(|space| space.datatype)
+        .map(|&(datatype, _)| datatype)
         .chain(OTHER_DATATYPES.iter().copied())
     {
         // Table 8, dt-type1
