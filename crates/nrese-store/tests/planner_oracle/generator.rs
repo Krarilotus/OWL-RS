@@ -31,6 +31,9 @@ const VALUES: &str = "VALUES ?s { <urn:a> <urn:a> <urn:b> }";
 const FEW: &str = "?s <urn:few> ?o";
 const VECTOR: &str = "urn:nrese:vector:";
 pub const REMOTE: &str = "<urn:a> <urn:remote> 1 .";
+// Beside a drawing AVG: a volatile argument whose branches are both 1, so
+// its mean is bound and 1 on every run and route, whatever is drawn.
+pub const BOUND: &str = "(AVG(IF(RAND() < 0.5, 1, 1)) AS ?bound)";
 
 // Where a generated query draws. "none" draws nothing and is compared as a bag.
 pub const PLACES: &[&str] = &[
@@ -178,7 +181,7 @@ pub fn drawing(shape: &'static str) -> Case {
             value("UUID()", &[]),
         ),
         "average-draw" => (
-            "SELECT (AVG($DRAW) AS ?avg) { ?s <urn:few> ?o . ?s <urn:q> ?z }".into(),
+            format!("SELECT (AVG($DRAW) AS ?avg) {BOUND} {{ ?s <urn:few> ?o . ?s <urn:q> ?z }}"),
             Draw::Average,
         ),
         _ => panic!("unknown drawing shape {shape}"),

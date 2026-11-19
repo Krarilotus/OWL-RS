@@ -419,7 +419,8 @@ pub fn generated(seed: u64) -> Case {
         }
         "aggregate" => {
             let (body, _) = tree.tree(depth);
-            let text = format!("SELECT ?s (AVG($DRAW) AS ?avg) {{ {body} }} GROUP BY ?s");
+            let bound = generator::BOUND;
+            let text = format!("SELECT ?s (AVG($DRAW) AS ?avg) {bound} {{ {body} }} GROUP BY ?s");
             (text, Some(Draw::Average), None)
         }
         _ => {

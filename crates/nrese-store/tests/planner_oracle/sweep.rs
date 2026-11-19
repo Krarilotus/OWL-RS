@@ -53,15 +53,13 @@ fn report(
 
 // The twin on every route, and EXPLAIN of the same request on each store,
 // which must report the rows its execution gives. Returns the repeated
-// requests served from the cache, and whether EXPLAIN shows a vector search
-// that went first: it probes the local group from each hit, so the group's
-// scan runs more than once.
+// requests served from the cache.
 fn compare_twin(
     routes: &Routes,
     case: &Case,
     expected: &Rows,
     failures: &mut Vec<Failure>,
-) -> (usize, bool) {
+) -> usize {
     let request = SparqlQueryRequest::all(case.query.twin());
     let reduced = case.query.reduced;
     let check = |rows: &Rows| properties::same(expected, rows, reduced);
@@ -72,7 +70,7 @@ fn compare_twin(
         let streamed = routes.native_with(&request.query, false, Some(2));
         report(failures, Route::Streamed, "twin bag", check(&streamed));
     }
-    let (mut hits, mut probed) = (0, false);
+    let mut hits = 0;
     for route in STORES {
         let store = routes.store(route);
         let cold = routes::execute(store, &request);
@@ -83,11 +81,6 @@ fn compare_twin(
         hits += usize::from(store.query_cache_stats().hits > before);
 
         let explanation = routes::explain(store, &request);
-        let scans = explanation.steps.iter();
-        probed |= scans
-            .filter(|s| s.detail.contains("<urn:embedding>"))
-            .count()
-            > 1;
         if !reduced && explanation.rows != cold.len() as u64 {
             let root = explanation
                 .steps
@@ -105,17 +98,23 @@ fn compare_twin(
             );
         }
     }
-    (hits, probed)
+    hits
 }
 
+// Judges the drawing request on every answer route. Returns the store
+// routes on which its own EXPLAIN shows a vector search that went first: it
+// probes the local group from each hit, so the group's scan runs more than
+// once.
 fn compare_draws(
     routes: &Routes,
     case: &Case,
     expected: &Rows,
     repeats: usize,
     failures: &mut Vec<Failure>,
-) {
-    let Some(draw) = case.query.draw else { return };
+) -> Vec<StoreRoute> {
+    let Some(draw) = case.query.draw else {
+        return Vec::new();
+    };
     let request = SparqlQueryRequest::all(case.query.real());
     let scope = |body: &str| {
         let text = case.query.scope.as_ref()?;
@@ -157,10 +156,20 @@ fn compare_draws(
             routes::execute(store, &request)
         });
     }
-    // EXPLAIN executes the drawing request again: its total is an answer,
-    // judged as the other routes' row counts are.
+    // EXPLAIN executes the drawing request again: its total is checked
+    // against the totals SPARQL allows. It never stands for an answer route.
+    let mut reached = Vec::new();
     for route in STORES {
-        let explained = routes::explain(routes.store(route), &request).rows;
+        let explanation = routes::explain(routes.store(route), &request);
+        let scans = explanation.steps.iter();
+        if scans
+            .filter(|s| s.detail.contains("<urn:embedding>"))
+            .count()
+            > 1
+        {
+            reached.push(route);
+        }
+        let explained = explanation.rows;
         if !model.explains(explained as usize) {
             let detail = format!("explained {explained} rows, a total SPARQL cannot give");
             report(
@@ -171,22 +180,27 @@ fn compare_draws(
             );
         }
     }
+    reached
 }
 
-// The failures, the repeated requests served from the cache, and whether a
-// vector search went first.
-pub fn check(case: &Case, repeats: usize) -> (Vec<Failure>, usize, bool) {
+// The failures, the repeated requests served from the cache, and the store
+// routes on which the drawing request's vector search went first.
+pub fn check(case: &Case, repeats: usize) -> (Vec<Failure>, usize, Vec<StoreRoute>) {
     let routes = Routes::open(case);
     let expected = routes.native(&case.query.twin(), true);
     let mut failures = Vec::new();
-    let (hits, probed) = compare_twin(&routes, case, &expected, &mut failures);
-    compare_draws(&routes, case, &expected, repeats, &mut failures);
-    (failures, hits, probed)
+    let hits = compare_twin(&routes, case, &expected, &mut failures);
+    let reached = compare_draws(&routes, case, &expected, repeats, &mut failures);
+    (failures, hits, reached)
 }
 
 pub fn assert_case(case: &Case) {
     // Twelve runs, as in the probes: a fault in one run of a few is missed.
     let (failures, _, _) = check(case, 12);
+    // One line per failure, for the red driver's record of each cell.
+    for f in &failures {
+        println!("CELL {} {:?} {}", case.shape, f.route, f.property);
+    }
     assert!(
         failures.is_empty(),
         "{}: {}\n{failures:#?}",
@@ -240,13 +254,12 @@ fn reduce(mut case: Case, witness: &Failure) -> Case {
 
 // The witness, reduced to a case that can be typed from this output alone:
 // its query, data and remote data, checked again as a cell would.
-fn print_reduced(seed: u64, case: Case, failures: &[Failure]) {
-    let witness = &failures[0];
+fn print_reduced(seed: u64, case: Case, failures: &[Failure], witness: &Failure) {
     println!(
         "WITNESS {} seed={seed} labels={:?} route={:?} property={} {}",
         case.shape, case.labels, witness.route, witness.property, witness.detail
     );
-    for fault in &failures[1..] {
+    for fault in failures.iter().filter(|f| !std::ptr::eq(*f, witness)) {
         println!("ALSO {:?} {} {}", fault.route, fault.property, fault.detail);
     }
     let reduced = reduce(case, witness);
@@ -268,67 +281,12 @@ fn print_reduced(seed: u64, case: Case, failures: &[Failure]) {
     );
 }
 
-// Known faults of the head's base: a draw site, the property its witnesses
-// break there, a label they must carry (if any), whether the red check
-// requires one, and the reason. Only answers are known: a twin's mismatch
-// and EXPLAIN's disagreement with its own execution never are.
-const KNOWN: &[(&str, &str, &str, bool, &str)] = &[
-    (
-        "exists",
-        "P4",
-        "",
-        true,
-        "an EXISTS that draws decides once for all the rows it tests",
-    ),
-    (
-        "lateral",
-        "P2",
-        "",
-        true,
-        "left rows with the same correlated values share the right side's draws",
-    ),
-    (
-        "service",
-        "P1",
-        "batched",
-        true,
-        "SERVICE evaluates its pattern again for each batch of bound values it sends",
-    ),
-    (
-        "service",
-        "P3",
-        "batched",
-        false,
-        "SERVICE evaluates its pattern again for each batch of bound values it sends",
-    ),
-    (
-        "aggregate",
-        "AVG",
-        "",
-        false,
-        "streamed AVG can evaluate its argument separately for the sum and the count",
-    ),
-    (
-        "vector",
-        "P1",
-        "disjoint",
-        false,
-        "a vector search that goes first evaluates a group sharing no variable with the hit once per hit",
-    ),
-];
-
-fn known(case: &Case, failure: &Failure) -> bool {
-    KNOWN.iter().any(|&(site, property, label, _, _)| {
-        (site, property) == (case.shape, failure.property)
-            && (label.is_empty() || case.labels.contains(&label))
-    })
-}
-
 // A sweep prints a SEED line for each seed that fails, with the draw site
 // and the properties broken there, so a tree's result for every seed is in
-// its output. NRESE_PLANNER_ORACLE_EXPECT_RED=1 requires a witness for each
-// required known (site, property); a comma-separated list of site:property
-// pairs requires one for each of those.
+// its output. It counts witnesses by (site, property, route) and excuses
+// none. NRESE_PLANNER_ORACLE_EXPECT_RED, a comma-separated list of
+// site:property pairs, requires a witness for each on an answer route (not
+// EXPLAIN alone) instead of failing on witnesses.
 #[test]
 fn seeded_queries() {
     let red = std::env::var(EXPECT_RED).ok();
@@ -336,19 +294,17 @@ fn seeded_queries() {
         assert!(red.is_none(), "{EXPECT_RED} requires {SEEDS}");
         return;
     };
-    let required: Vec<(&str, &str)> = match red.as_deref() {
-        None => Vec::new(),
-        Some("1") => KNOWN.iter().filter(|k| k.3).map(|k| (k.0, k.1)).collect(),
-        Some(pairs) => pairs
-            .split(',')
-            .map(|pair| pair.split_once(':').expect("expected site:property"))
-            .collect(),
-    };
+    let required: Vec<(&str, &str)> = red
+        .iter()
+        .flat_map(|pairs| pairs.split(','))
+        .map(|pair| pair.split_once(':').expect("expected site:property"))
+        .collect();
     let start = Instant::now();
     let mut checked = BTreeMap::<&str, usize>::new();
-    let mut found = BTreeMap::<(&str, &str), usize>::new();
-    let mut unknown = BTreeSet::new();
-    let (mut hits, mut skipped, mut disjoint, mut probed) = (0, 0, 0, 0);
+    let mut found = BTreeMap::<(&str, &str, String), usize>::new();
+    let mut answered = BTreeSet::<(&str, &str)>::new();
+    let mut reach = BTreeMap::<String, usize>::new();
+    let (mut hits, mut skipped, mut disjoint) = (0, 0, 0);
     let count = seeds.end - seeds.start;
     for seed in seeds {
         let case = tree::generated(seed);
@@ -362,70 +318,80 @@ fn seeded_queries() {
         let Ok((failures, cached, reached)) = catch_unwind(AssertUnwindSafe(|| check(&case, 1)))
         else {
             println!("SEED {seed} {} panic labels={:?}", case.shape, case.labels);
-            *found.entry((case.shape, "panic")).or_default() += 1;
-            unknown.insert((case.shape, "panic"));
+            *found.entry((case.shape, "panic", "-".into())).or_default() += 1;
             continue;
         };
         hits += cached;
         if case.labels.contains(&"disjoint") {
             disjoint += 1;
-            probed += usize::from(reached);
+            for route in reached {
+                *reach.entry(format!("{route:?}")).or_default() += 1;
+            }
         }
         if failures.is_empty() {
             continue;
         }
-        let pairs: BTreeSet<_> = failures.iter().map(|f| (case.shape, f.property)).collect();
-        let properties: Vec<_> = pairs.iter().map(|p| p.1).collect();
+        let properties: BTreeSet<_> = failures.iter().map(|f| f.property).collect();
+        let properties: Vec<_> = properties.into_iter().collect();
         println!(
             "SEED {seed} {} {} labels={:?}",
             case.shape,
             properties.join(","),
             case.labels
         );
-        let first = pairs.iter().any(|pair| !found.contains_key(pair));
-        for pair in &pairs {
-            *found.entry(*pair).or_default() += 1;
+        let mut new = None;
+        for failure in &failures {
+            let key = (case.shape, failure.property, format!("{:?}", failure.route));
+            if !found.contains_key(&key) && new.is_none() {
+                new = Some(failure);
+            }
+            if !matches!(failure.route, Route::Explain(_)) {
+                answered.insert((case.shape, failure.property));
+            }
         }
-        for failure in failures.iter().filter(|f| !known(&case, f)) {
-            unknown.insert((case.shape, failure.property));
+        let keys: BTreeSet<_> = failures
+            .iter()
+            .map(|f| (case.shape, f.property, format!("{:?}", f.route)))
+            .collect();
+        for key in keys {
+            *found.entry(key).or_default() += 1;
         }
-        if first && catch_unwind(AssertUnwindSafe(|| print_reduced(seed, case, &failures))).is_err()
-        {
+        // Reduce and recheck the failure that brought a new triple.
+        let Some(witness) = new else { continue };
+        let reduced = || print_reduced(seed, case.clone(), &failures, witness);
+        if catch_unwind(AssertUnwindSafe(reduced)).is_err() {
             println!("RECHECK seed={seed}: the reduction panicked");
         }
     }
     println!(
-        "SWEEP {count} seeds {} ms; {hits} cache hits; {skipped} skipped without a vector index; checked {checked:?}; witnesses {found:?}",
+        "SWEEP {count} seeds {} ms; {hits} cache hits; {skipped} skipped without a vector index; checked {checked:?}",
         start.elapsed().as_millis()
     );
-    if generator::VECTOR_INDEX {
-        let reach = format!(
-            "{probed} of {disjoint} seeds whose drawing group shares no variable with the hit"
-        );
-        match probed {
-            0 => println!("NOT COVERED vector: EXPLAIN shows the search first in {reach}"),
-            _ => println!("VECTOR the search went first by EXPLAIN in {reach}"),
-        }
+    for ((site, property, route), n) in &found {
+        println!("WITNESSES {site} {property} {route}: {n} seeds");
     }
-    for (site, property, _, _, reason) in KNOWN {
-        match found.get(&(*site, *property)) {
-            Some(n) => println!("KNOWN {site} {property}: {n} seeds ({reason})"),
-            None => println!("NOT SEEN {site} {property}"),
+    if generator::VECTOR_INDEX {
+        let of = format!("of {disjoint} seeds whose drawing group shares no variable with the hit");
+        if reach.is_empty() {
+            println!(
+                "NOT COVERED vector: no drawing request's EXPLAIN shows the search first, {of}"
+            );
+        } else {
+            println!(
+                "VECTOR the drawing request's own EXPLAIN shows the search first: {reach:?} {of}"
+            );
         }
     }
     if red.is_some() {
         let missing: Vec<_> = required
             .iter()
-            .filter(|pair| !found.contains_key(*pair))
+            .filter(|pair| !answered.contains(*pair))
             .collect();
         assert!(
             missing.is_empty(),
-            "required witnesses missing: {missing:?}"
+            "required witnesses missing on an answer route: {missing:?}"
         );
     } else {
-        assert!(
-            unknown.is_empty(),
-            "witnesses outside the known (site, property) pairs: {unknown:?}"
-        );
+        assert!(found.is_empty(), "witnesses: {:?}", found.keys());
     }
 }

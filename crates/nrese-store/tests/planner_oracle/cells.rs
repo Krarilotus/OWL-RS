@@ -185,25 +185,18 @@ fn explain_agrees_with_the_mode_of_a_cold_ql_request() {
     let forced = routes::execute_bool(store, &request).unwrap_err();
     assert!(forced.is_memory_limit(), "as-written control: {forced}");
 
+    // Planned, the same capped request must fit: only then does the run show
+    // its mode (planned, as the control could not fit) and EXPLAIN report one.
     request.as_written = false;
-    // An EXPLAIN that runs out of the cap ran as written.
-    let explanation = routes::try_explain(store, &request);
-    let reports_planned = match &explanation {
-        Ok(explained) => {
-            assert_eq!(explained.rows, 1);
-            explained.rewrites.contains(&"ask-limit")
-        }
-        Err(error) if error.is_memory_limit() => false,
-        Err(error) => panic!("EXPLAIN: {error}"),
-    };
     store.clear_query_cache();
-    let ran_planned = match routes::execute_bool(store, &request) {
-        Ok(answer) => {
-            assert!(answer, "the bounded request lost the solution");
-            true
-        }
-        Err(error) if error.is_memory_limit() => false,
-        Err(error) => panic!("bounded request: {error}"),
-    };
-    assert_eq!(ran_planned, reports_planned, "EXPLAIN: {explanation:?}");
+    let answer = routes::execute_bool(store, &request)
+        .unwrap_or_else(|e| panic!("the planned request did not fit the cap: {e}"));
+    assert!(answer, "the capped request lost the solution");
+    let explained = routes::try_explain(store, &request)
+        .unwrap_or_else(|e| panic!("EXPLAIN of the capped request reports no mode: {e}"));
+    assert_eq!(explained.rows, 1);
+    assert!(
+        explained.rewrites.contains(&"ask-limit"),
+        "EXPLAIN reports as written for a run only the planned mode fits: {explained:?}"
+    );
 }
