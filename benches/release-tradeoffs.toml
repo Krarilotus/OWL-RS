@@ -3,14 +3,16 @@
 # gate tolerates no loss in time or memory and no wrong answer. A loss is accepted only when a
 # trade-off here covers it; a wrong answer only when an exception here names its case and outcome;
 # a baseline left uncompared only when an absence here names its cases; a cost appearing where the
-# baseline read below the counter's step only when an emerged entry here names it. Each is then reported in the verdict. Nothing else waives either: a case's declared `outcome` and
+# baseline read below the counter's step only when an emerged entry here names it. Each is then reported in the verdict.
+# An accepted entry waives nothing: it records rows accepted for a release, and the verdict prints the
+# reading accepted beside the row's flag. Nothing else waives either: a case's declared `outcome` and
 # `known` issue explain evidence, they grant nothing.
 #
 # `release-gate.sh verdict CAND ...` reads this file at the candidate's commit, never from a timed
 # report: an entry counts for the candidates whose tree holds it.
 #
-# Only Johannes approves an entry (role.owners). Each carries `by = "Johannes"`, the `approved`
-# date, a `reason`, his words (`quote`, verbatim) and where he said them (`source`). An entry
+# Only the file's `approver` approves an entry (role.owners). Each carries `by` with that name, the
+# `approved` date, a `reason`, his words (`quote`, verbatim) and where he said them (`source`). An entry
 # without them makes the file an error, and the verdict NOT PASSED.
 #
 # A trade-off covers a loss when its case and dimension match (and its baseline, if `against` names
@@ -25,7 +27,7 @@
 # against = "main"                      # optional: base or main; omitted, either
 # max_ratio = 1.10                      # the loss's interval may reach at most this ratio
 # approved = "2026-10-20"
-# by = "Johannes"
+# by = "the maintainer"
 # reason = "the string interner's shards: 10 % more memory at load for loads 27 % faster"
 # quote = "<his words, verbatim>"
 # source = "<the thread and time, or the intent entry>"
@@ -38,7 +40,7 @@
 # case = "<a case of benches/cases>"
 # outcome = "wrong"
 # approved = "2026-11-09"
-# by = "Johannes"
+# by = "the maintainer"
 # reason = "<why it ships>"
 # quote = "<his words, verbatim>"
 # source = "<the thread and time, or the intent entry>"
@@ -54,7 +56,7 @@
 # reason = "main's measurement build has no commits mode"
 # port = "<the package planned to compare them>"
 # approved = "2026-11-11"
-# by = "Johannes"
+# by = "the maintainer"
 # quote = "<his words, verbatim>"
 # source = "<the thread and time, or the intent entry>"
 #
@@ -69,10 +71,18 @@
 # against = "base"                      # optional: base or main; omitted, either
 # max = 2.0                             # ms
 # approved = "2026-11-14"
-# by = "Johannes"
+# by = "the maintainer"
 # reason = "<the check that costs it, and why it ships>"
 # quote = "<his words, verbatim>"
 # source = "<the thread and time, or the intent entry>"
+#
+# An accepted entry lists rows the approver accepted for a release (`release`) against a baseline
+# (`against`, at `baseline_commit`: the baseline moves, so the reading names the one it was read
+# against) with no win to pay for them: each row's number in the table accepted, its case and
+# dimension, and its ratio with the 95 % interval read on `tree`. The verdict prints that reading
+# beside the row's flag, with this run's; it derives nothing from it, so the flag blocks as before.
+
+approver = "the maintainer"
 
 # The DBpedia core store load's memory peak (reopen-dbpedia's setup: 67 M quads loaded into a store on
 # disk), measured apart in the gate's form: a 10 GB scope, anon + kernel every 50 ms, on the gate's host,
@@ -97,7 +107,7 @@ dimension = "memory/anon_kernel"
 against = "main"
 max_ratio = 1.20
 approved = "2026-11-14"
-by = "Johannes"
+by = "the maintainer"
 reason = "the DBpedia core store load peaks about 0.75 GiB above main (5.95 against 5.20 GiB, x1.14) and is 1.8 times as fast; the remainder is resident in the allocator's arenas, not memory freed lazily. The ceiling of 1.20 is the lowest the landed code's measured runs pass reliably as the gate reads them (comment above)"
 quote = "Ok"
 source = "his answer of 14 Nov 2026, 20:26 Berlin, accepting the recommendation \"DBpedia load is 5.95 GiB against main's 5.20 at 1.8× the speed … I recommend accepting it, with the spill budget and the huge-pages setting named in the release notes\""
@@ -106,7 +116,7 @@ pays_with = { case = "load-entities", dimension = "time/_" }
 # EL classification through the endpoint (el-classify-endpoint: el-classify's 20,000 classes loaded into a fresh
 # server, then GET /dataset/classification). The row is the server scope's anon + kernel peak, the load included.
 # Measured 14 Nov 2026 in the gate's form: its own runner, 12 blocks of the three sides in whole Latin squares, on
-# engine-v2 e0745e067 (the code this case runs is unchanged since).
+# engine-v2 372cf8d06 (the code this case runs is unchanged since).
 # - Memory: 720 MiB against main's 196, x3.60 (interval 3.50-3.71). The runs spread by 3.6 % (sd), main's by 4.4 %.
 # - Time: the request takes 0.53 s against main's 5.4 s, x0.096 (interval 0.094-0.098). This is the win the owner
 #   traded for, the same case's time/request; it shows as better against main in every round drawn from the blocks.
@@ -120,7 +130,7 @@ dimension = "memory/anon_kernel"
 against = "main"
 max_ratio = 4.49
 approved = "2026-11-14"
-by = "Johannes"
+by = "the maintainer"
 reason = "classifying el-classify's ontology through the endpoint peaks at 720 MiB against main's 196 (x3.6) and answers ten times as fast (0.53 against 5.4 s); the memory is the DL classifier's working state, needed to the end. The ceiling of 4.49 is the lowest the measured blocks pass reliably in the 3-block rounds the gate runs; it lets about 10 % growth through in half of them and stops only about 25 % reliably (comment above)"
 quote = "Accepted and put on list for optimization efforts later with better caching design maybe we can trim down the memory further"
 source = "his answer of 14 Nov 2026, 21:31 Berlin, accepting the EL endpoint's memory against its time (727 against main's 208 MiB at 0.42 against 4.67 s)"
@@ -136,7 +146,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --checkpoint-after-wal-bytes"
 port = "the measurement tool's checkpoint trigger ported to base's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -146,7 +156,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --held-views --staggered-views"
 port = "the measurement tool's held views ported to base's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -156,7 +166,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --memory-mib"
 port = "the DL consistency tool's shared memory limit ported to base's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -166,7 +176,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --parse-turtle"
 port = "the measurement tool's Turtle parsing mode ported to base's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -176,7 +186,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --prepare-vector-graph"
 port = "the measurement tool's vector graph preparation ported to base's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -186,7 +196,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --read-graphs"
 port = "the measurement tool's named-graph reader mode ported to base's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -196,7 +206,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --recovery --recovery-prepare"
 port = "the measurement tool's recovery mode ported to base's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -206,7 +216,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --split-turtle"
 port = "the measurement tool's Turtle splitting mode ported to base's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -216,7 +226,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --support-reader --support-commits --support-sets"
 port = "the measurement tool's supported-inference modes ported to base's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -226,7 +236,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --support-sets --support-reader --support-commits"
 port = "the measurement tool's supported-inference modes ported to base's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -236,7 +246,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --support-sets --support-reader --support-commits --support-updates"
 port = "the measurement tool's supported-inference modes ported to base's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -246,7 +256,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --upload --upload-format"
 port = "the measurement tool's upload mode ported to base's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -256,7 +266,7 @@ side = "base"
 reason = "base's measurement build doesn't parse --upload --upload-format --upload-as"
 port = "the measurement tool's upload mode ported to base's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -266,7 +276,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --cache-bytes"
 port = "the measurement tool's cache size setting ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -276,7 +286,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --canonicalize"
 port = "the measurement tool's canonicalization mode ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -286,7 +296,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --clients --duration-s"
 port = "the measurement tool's concurrent clients mode ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -296,7 +306,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --commits"
 port = "the measurement tool's commits mode ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -306,7 +316,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --commits --readers"
 port = "the measurement tool's commits mode and concurrent readers ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -316,7 +326,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --commits --readers --checkpoint-after-wal-bytes"
 port = "the measurement tool's commits mode, concurrent readers and checkpoint trigger ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -326,7 +336,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --commits --readers --checkpoint-after-wal-bytes --threads"
 port = "the measurement tool's commits mode, concurrent readers, checkpoint trigger and thread setting ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -336,7 +346,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --count-allocations"
 port = "the measurement tool's allocation counting ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -346,7 +356,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --held-views --staggered-views"
 port = "the measurement tool's held views ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -356,7 +366,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --kernel"
 port = "the measurement tool's kernel mode ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -366,7 +376,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --parse-only"
 port = "the measurement tool's parse-only mode ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -376,7 +386,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --parse-turtle"
 port = "the measurement tool's Turtle parsing mode ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -386,7 +396,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --qerror"
 port = "the measurement tool's estimate-error mode ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -396,7 +406,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --read-graphs"
 port = "the measurement tool's named-graph reader mode ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -406,7 +416,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --recovery --recovery-prepare"
 port = "the measurement tool's recovery mode ported to main's build, planned right after v1.5; partial: porting the tool alone can't reproduce it unchanged"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -416,7 +426,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --repeat"
 port = "the EL classifier tool's repeat setting ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -426,7 +436,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --rules"
 port = "the measurement tool's rules mode ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -436,7 +446,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --split-turtle"
 port = "the measurement tool's Turtle splitting mode ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -446,7 +456,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --threads"
 port = "the measurement tool's thread setting ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -456,7 +466,7 @@ side = "main"
 reason = "main's measurement build doesn't parse --upload --upload-format"
 port = "the measurement tool's upload mode ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
@@ -466,6 +476,71 @@ side = "main"
 reason = "main's measurement build doesn't parse --upload --upload-format --upload-as"
 port = "the measurement tool's upload mode ported to main's build, planned right after v1.5"
 approved = "2026-11-11"
-by = "Johannes"
+by = "the maintainer"
 quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
+
+# The rows slower than main in the third cut that the approver accepted for 1.5 (49 of 56: 5 were fixed,
+# 2 accepted on their own). Rows 5, 17, 18, 40, 41, 48-51 and 53-56 differ by a few microseconds on a 1 µs
+# timer step: their ratios rest on one to four steps.
+[[accepted]]
+release = "1.5"
+against = "main"
+baseline_commit = "928100bdc095195ae515c9c9befe843c2e908b4c"
+tree = "180860fbadc7"
+approved = "2026-11-15"
+by = "the maintainer"
+reason = "the rows slower than main in the third cut, each read in two consecutive rounds with both intervals on the loss side, that the approver accepted for 1.5 without a win to pay for them"
+quote = "Yes let's do them all"
+source = "his answer of 15 Nov 2026, about 21:00 Berlin, accepting the recommendation \"accept all 49 for v1.5 … All figures are measured on the third cut against main, same answers on both sides\""
+rows = [
+  { row = 4, case = "lab-entities-10m", dimension = "time/q06-label-prefix", ratio = 1.007, interval = [1.004, 1.009] },
+  { row = 5, case = "lab-yago-tiny", dimension = "time/q01-label-lookup", ratio = 1.817, interval = [1.203, 2.745] },
+  { row = 6, case = "op-aggregates", dimension = "time/score-by-tag", ratio = 1.028, interval = [1.022, 1.035] },
+  { row = 7, case = "op-strings", dimension = "time/contains", ratio = 1.037, interval = [1.026, 1.047] },
+  { row = 8, case = "op-strings", dimension = "time/strstarts", ratio = 1.075, interval = [1.060, 1.090] },
+  { row = 9, case = "open-first-query", dimension = "time/cold/followers/first", ratio = 1.445, interval = [1.312, 1.591] },
+  { row = 10, case = "open-first-query", dimension = "time/cold/followers/repeat", ratio = 1.445, interval = [1.312, 1.591] },
+  { row = 11, case = "open-first-query", dimension = "time/cold/open", ratio = 1.737, interval = [1.597, 1.888] },
+  { row = 12, case = "open-first-query", dimension = "time/cold/post/first", ratio = 1.225, interval = [1.137, 1.319] },
+  { row = 13, case = "open-first-query", dimension = "time/cold/post/repeat", ratio = 1.225, interval = [1.137, 1.319] },
+  { row = 14, case = "open-first-query", dimension = "time/warm/followers/first", ratio = 2.917, interval = [2.785, 3.055] },
+  { row = 15, case = "open-first-query", dimension = "time/warm/followers/repeat", ratio = 2.917, interval = [2.785, 3.055] },
+  { row = 16, case = "open-first-query", dimension = "time/warm/open", ratio = 1.275, interval = [1.180, 1.378] },
+  { row = 17, case = "ql-memberships-reuse", dimension = "time/knows", ratio = 4.827, interval = [4.150, 5.615] },
+  { row = 18, case = "ql-memberships-reuse", dimension = "time/people", ratio = 3.744, interval = [2.163, 6.482] },
+  { row = 20, case = "reopen-dbpedia", dimension = "time/cold/open", ratio = 1.688, interval = [1.234, 2.311] },
+  { row = 21, case = "reopen-dbpedia", dimension = "time/cold/q01-point-lookup/first", ratio = 1.558, interval = [1.285, 1.889] },
+  { row = 22, case = "reopen-dbpedia", dimension = "time/cold/q03-top-birthplaces/first", ratio = 1.528, interval = [1.374, 1.700] },
+  { row = 23, case = "reopen-dbpedia", dimension = "time/cold/q04-date-range/first", ratio = 1.296, interval = [1.001, 1.679] },
+  { row = 24, case = "reopen-dbpedia", dimension = "time/cold/q05-population/first", ratio = 1.719, interval = [1.677, 1.762] },
+  { row = 25, case = "reopen-dbpedia", dimension = "time/cold/q06-film-cast/first", ratio = 1.177, interval = [1.153, 1.202] },
+  { row = 26, case = "reopen-dbpedia", dimension = "time/cold/q07-subdivision-path/first", ratio = 1.412, interval = [1.327, 1.503] },
+  { row = 27, case = "reopen-dbpedia", dimension = "time/cold/q09-optional-death/first", ratio = 1.086, interval = [1.036, 1.138] },
+  { row = 29, case = "reopen-dbpedia", dimension = "time/cold/q12-goals-per-team/repeat", ratio = 1.075, interval = [1.007, 1.148] },
+  { row = 30, case = "reopen-dbpedia", dimension = "time/warm/open", ratio = 1.314, interval = [1.089, 1.586] },
+  { row = 31, case = "reopen-dbpedia", dimension = "time/warm/q01-point-lookup/first", ratio = 2.355, interval = [2.239, 2.477] },
+  { row = 33, case = "reopen-dbpedia", dimension = "time/warm/q03-top-birthplaces/first", ratio = 1.164, interval = [1.042, 1.300] },
+  { row = 34, case = "reopen-dbpedia", dimension = "time/warm/q05-population/first", ratio = 1.402, interval = [1.307, 1.503] },
+  { row = 35, case = "reopen-dbpedia", dimension = "time/warm/q07-subdivision-path/first", ratio = 1.361, interval = [1.189, 1.557] },
+  { row = 36, case = "reopen-dbpedia", dimension = "time/warm/q09-optional-death/first", ratio = 1.055, interval = [1.035, 1.076] },
+  { row = 38, case = "rl-sameas-replicate", dimension = "time/_", ratio = 1.035, interval = [1.024, 1.047] },
+  { row = 39, case = "text-search", dimension = "time/docs-prefix-w12", ratio = 1.083, interval = [1.051, 1.116] },
+  { row = 40, case = "watdiv-100m", dimension = "time/L1-5", ratio = 1.182, interval = [1.122, 1.245] },
+  { row = 41, case = "watdiv-100m", dimension = "time/L1-7", ratio = 1.128, interval = [1.023, 1.244] },
+  { row = 42, case = "watdiv-100m", dimension = "time/S3-1", ratio = 1.105, interval = [1.066, 1.144] },
+  { row = 43, case = "watdiv-100m", dimension = "time/S3-2", ratio = 1.133, interval = [1.120, 1.147] },
+  { row = 44, case = "watdiv-100m", dimension = "time/S3-3", ratio = 1.138, interval = [1.129, 1.148] },
+  { row = 45, case = "watdiv-100m", dimension = "time/S3-5", ratio = 1.125, interval = [1.115, 1.135] },
+  { row = 46, case = "watdiv-100m", dimension = "time/S3-6", ratio = 1.113, interval = [1.045, 1.185] },
+  { row = 47, case = "watdiv-100m", dimension = "time/S3-7", ratio = 1.117, interval = [1.063, 1.174] },
+  { row = 48, case = "watdiv-100m", dimension = "time/S7-1", ratio = 1.298, interval = [1.157, 1.456] },
+  { row = 49, case = "watdiv-100m", dimension = "time/S7-10", ratio = 1.305, interval = [1.190, 1.432] },
+  { row = 50, case = "watdiv-100m", dimension = "time/S7-4", ratio = 1.234, interval = [1.134, 1.343] },
+  { row = 51, case = "watdiv-100m", dimension = "time/S7-6", ratio = 1.166, interval = [1.036, 1.312] },
+  { row = 52, case = "watdiv-10m", dimension = "memory/anon_kernel", ratio = 1.091, interval = [1.040, 1.145] },
+  { row = 53, case = "watdiv-10m", dimension = "time/S5-1", ratio = 1.205, interval = [1.151, 1.261] },
+  { row = 54, case = "watdiv-10m", dimension = "time/S5-2", ratio = 1.201, interval = [1.087, 1.326] },
+  { row = 55, case = "watdiv-10m", dimension = "time/S5-3", ratio = 1.201, interval = [1.087, 1.326] },
+  { row = 56, case = "watdiv-10m", dimension = "time/S5-4", ratio = 1.201, interval = [1.087, 1.326] },
+]

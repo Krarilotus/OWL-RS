@@ -1,0 +1,755 @@
+//! SHACL content under `owl2-dl`: a triple whose predicate is a property of the SHACL
+//! vocabulary carries no OWL meaning, so the OWL reader reads it as SHACL content, as it reads
+//! an annotation. A store whose only punning comes from such triples stays on the OWL 2 RL
+//! rules' route. A store that gives a SHACL term an OWL meaning (an axiom on it, or a use of it
+//! as an individual) is read as any other, off the route; so is a class that is also a node
+//! shape, whose type triple is a class assertion. Each test names the route,
+//! `dl_bounds().last`, as the routing tests do.
+
+use nrese_store::dl::entailment::Entailed;
+
+use super::entailment::entailed;
+use super::queries::query;
+use super::{insert, pipeline};
+
+pub(super) const SH: &str = "PREFIX sh: <http://www.w3.org/ns/shacl#> \
+     PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> ";
+
+/// An OWL 2 RL ontology the shapes stand beside: `:bob` is a `:Person` and `:ann`, a
+/// `:Student`, is one by the subclass axiom.
+const ONTOLOGY: &str = ":Student rdfs:subClassOf :Person . :knows a owl:ObjectProperty . \
+     :likes a owl:ObjectProperty . :ann a :Student ; :knows :bob . :bob a :Person .";
+
+/// Shapes with explicit targets, in the store's shapes graph: a node shape whose target is
+/// the class `:Person`, and a property shape on `:knows` whose values are `:Person`s.
+fn explicit_shapes() -> String {
+    format!(
+        "GRAPH <{}> {{ :PersonShape a sh:NodeShape ; sh:targetClass :Person ; \
+         sh:property :knowsShape . :knowsShape sh:path :knows ; sh:class :Person . }}",
+        nrese_store::DEFAULT_SHAPES_GRAPH
+    )
+}
+
+/// Commits `INSERT DATA { data }`, with the SHACL and RDF prefixes besides the usual ones.
+pub(super) fn shapes_insert(
+    dl: &nrese_store::MutationPipeline,
+    data: &str,
+) -> Result<u64, nrese_store::MutationError> {
+    super::update(dl, &format!("{SH}INSERT DATA {{ {data} }}"))
+}
+
+/// Spec (OWL 2 Profiles §4.3, theorem PR1; SHACL content, like an annotation, carries no OWL
+/// meaning): explicit-target shapes (`sh:NodeShape`, `sh:targetClass`, `sh:property`,
+/// `sh:path`, `sh:class`) beside an OWL 2 RL ontology give no name an OWL kind, so nothing is
+/// punned, the store stays on the rules' route, and a read of the ontology is answered as
+/// without them. Read as property assertions, `sh:targetClass :Person` and `sh:path :knows`
+/// would pun `:Person` and `:knows` and take it off.
+#[test]
+fn explicit_target_shapes_beside_an_rl_ontology_stay_on_the_rules_route() {
+    let dl = pipeline();
+    insert(&dl, ONTOLOGY).expect("an RL ontology");
+    shapes_insert(&dl, &explicit_shapes()).expect("shapes");
+    let route = dl.store().dl_bounds().last;
+    let (rows, status) = query(&dl, "SELECT ?x { ?x a :Person }");
+    eprintln!(
+        "route {route}: {rows:?}, {} {:?}",
+        status.shared.as_str(),
+        status.reasons()
+    );
+    assert_eq!(rows, ["ann", "bob"]);
+    assert!(status.is_complete(), "{:?}", status.reasons());
+    assert_eq!(route, "rules", "shapes took the store off the rules' route");
+}
+
+/// Spec (OWL 2 Structural Specification §5.9, punning; OWL 2 Profiles §4.3, theorem PR1, needs
+/// none): an implicit class target, a class that is also a node shape (`:Person a
+/// sh:NodeShape, owl:Class`), states a class assertion of `sh:NodeShape` about `:Person`, which
+/// makes the class `:Person` an individual too, so the store is off the rules' route; a read of
+/// the ontology is answered as without the shape.
+#[test]
+fn an_implicit_class_target_stays_off_the_route() {
+    let dl = pipeline();
+    insert(&dl, ONTOLOGY).expect("an RL ontology");
+    shapes_insert(
+        &dl,
+        ":Person a sh:NodeShape , owl:Class ; sh:property [ sh:path :knows ; sh:class :Person ] .",
+    )
+    .expect("an implicit class target");
+    let route = dl.store().dl_bounds().last;
+    let (rows, status) = query(&dl, "SELECT ?x { ?x a :Person }");
+    eprintln!("route {route}: {rows:?}, {}", status.shared.as_str());
+    assert_eq!(rows, ["ann", "bob"]);
+    assert_ne!(route, "rules", "a punned class stayed on the rules' route");
+}
+
+/// Spec (OWL 2 Structural Specification: a term an axiom uses has that axiom's kind): a SHACL
+/// term given an OWL meaning is read as any other term, so its shapes' statements are property
+/// and class assertions that pun, and the store is off the rules' route. Each row adds one to
+/// the explicit-target shapes: a declaration of `sh:path` as an object property; a
+/// sub-property axiom on `sh:class`. (An equality on `sh:path` and the W3C vocabulary's
+/// content have tests of their own, below.)
+#[test]
+fn a_shacl_term_given_an_owl_meaning_is_read_as_any_term_off_the_route() {
+    let rows = [
+        ("declaration", "sh:path a owl:ObjectProperty ."),
+        ("sub-property", "sh:class rdfs:subPropertyOf :related ."),
+    ];
+    let mut wrong = Vec::new();
+    for (what, extra) in rows {
+        let dl = pipeline();
+        insert(&dl, ONTOLOGY).expect("an RL ontology");
+        shapes_insert(&dl, &format!("{} {extra}", explicit_shapes())).expect(what);
+        let route = dl.store().dl_bounds().last;
+        eprintln!("{what}: route {route}");
+        if route == "rules" {
+            wrong.push(format!("{what}: stayed on the rules' route"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (OWL 2 Structural Specification §5.9, punning; OWL 2 RL's eq-rep-p; under the OWL 2
+/// Direct Semantics an equality of the individual `sh:path` with `:p` doesn't equate the
+/// properties): with `sh:path owl:sameAs :p`, the rules' eq-rep-p
+/// derives `:knowsShape :p :knows` from `:knowsShape sh:path :knows`, which OWL 2 DL doesn't
+/// entail. A read of it may return that row only labelled `unsound`, as for any punned
+/// equality (`routing.rs`, `an_equality_of_punned_property_names_does_not_equate_their_properties`).
+#[test]
+fn an_equality_on_a_shacl_predicate_gives_no_row_told_sound() {
+    let dl = pipeline();
+    insert(&dl, ONTOLOGY).expect("an RL ontology");
+    shapes_insert(
+        &dl,
+        &format!(
+            "{} sh:path owl:sameAs :p . :p a owl:ObjectProperty .",
+            explicit_shapes()
+        ),
+    )
+    .expect("an equality on sh:path");
+    let route = dl.store().dl_bounds().last;
+    let (rows, status) = query(&dl, "SELECT ?x { ?x :p :knows }");
+    let line = format!(
+        "route {route}: {rows:?}, {} {:?}",
+        status.shared.as_str(),
+        status.reasons()
+    );
+    eprintln!("{line}");
+    assert!(
+        rows.is_empty() || status.shared.as_str() == "unsound",
+        "a row OWL 2 DL doesn't entail, not labelled unsound: {line}"
+    );
+    assert_ne!(route, "rules", "{line}");
+}
+
+/// Spec (the W3C SHACL vocabulary, `shacl.ttl`, declares `sh:` properties `rdf:Property`, with
+/// domains and ranges, `rdfs:Class` among them): that content gives SHACL terms an OWL
+/// reading, so the store is read as any other: off the rules' route, and told that parts of
+/// the data aren't OWL 2 DL and were left out (`dl::consistency`, `left_out_by`), as for any
+/// reserved name used as an entity.
+#[test]
+fn the_shacl_vocabulary_loaded_is_read_as_any_term() {
+    let dl = pipeline();
+    insert(&dl, ONTOLOGY).expect("an RL ontology");
+    let vocabulary = "sh:path a rdf:Property ; rdfs:domain sh:PropertyShape . \
+         sh:class a rdf:Property ; rdfs:range rdfs:Class . \
+         sh:targetClass a rdf:Property ; rdfs:range rdfs:Class .";
+    let committed = shapes_insert(&dl, &format!("{} {vocabulary}", explicit_shapes()));
+    let route = dl.store().dl_bounds().last;
+    let words = match &committed {
+        Ok(_) => dl
+            .store()
+            .dl()
+            .status()
+            .and_then(|s| s.consistency.verdict.reason().map(str::to_owned))
+            .unwrap_or_default(),
+        Err(e) => format!("{e:?}"),
+    };
+    eprintln!("route {route}; committed {}; {words}", committed.is_ok());
+    assert!(
+        words.contains("aren't OWL 2 DL and were left out"),
+        "{words}"
+    );
+    assert_ne!(route, "rules");
+}
+
+/// Spec (OWL 2 Mapping to RDF Graphs: list triples no axiom reads are structure, not
+/// assertions; SHACL content carries no OWL meaning): the lists of SHACL (a sequence path,
+/// `sh:in`, `sh:or`) are structure no axiom uses, and an inverse path is SHACL content, so
+/// none of them makes a name an individual: the store stays on the rules' route. Read as
+/// property assertions, `sh:inversePath :knows` and `sh:class :Person` inside `sh:or` would
+/// pun `:knows` and `:Person`.
+#[test]
+fn shacl_paths_and_lists_make_no_pun() {
+    let rows = [
+        ("sequence path", "sh:path ( :knows :likes )"),
+        ("inverse path", "sh:path [ sh:inversePath :knows ]"),
+        ("sh:in", "sh:path :likes ; sh:in ( :bob :ann )"),
+        (
+            "sh:or",
+            "sh:path :likes ; sh:or ( [ sh:class :Person ] [ sh:class :Student ] )",
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, property) in rows {
+        let dl = pipeline();
+        insert(&dl, ONTOLOGY).expect("an RL ontology");
+        let shape =
+            format!(":S a sh:NodeShape ; sh:targetNode :ann ; sh:property [ {property} ] .");
+        shapes_insert(&dl, &shape).expect(what);
+        let route = dl.store().dl_bounds().last;
+        eprintln!("{what}: route {route}");
+        if route != "rules" {
+            wrong.push(format!("{what}: route {route}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
+/// conclusion together, the premise keeping its own reading; SHACL content, like an annotation,
+/// has no OWL meaning; OWL 2 Direct Semantics: an ontology entails a conclusion only if it
+/// entails each of its axioms): nothing in `:a a :C` names `sh:path`, so the conclusion's
+/// `:s sh:path :q` is SHACL content and adds no axiom: entailed.
+#[test]
+fn a_conclusion_of_shacl_statements_is_answered_as_one_of_annotations() {
+    let shacl = entailed(":a a :C .", ":s <http://www.w3.org/ns/shacl#path> :q .");
+    assert_eq!(shacl, Entailed::Yes);
+}
+
+/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
+/// conclusion together; SHACL content has no OWL meaning; OWL 2 Direct Semantics: an ontology
+/// entails a conclusion only if it entails each of its axioms): with nothing naming `sh:path`,
+/// the conclusion's `:s sh:path :q` adds no axiom, so `:a a :C`, entailed, decides it. Read as a
+/// property assertion, `:s sh:path :q` wouldn't be entailed.
+#[test]
+fn a_conclusion_mixing_shacl_content_with_an_axiom_is_decided_by_the_axiom() {
+    let conclusion = ":s <http://www.w3.org/ns/shacl#path> :q . :a a :C .";
+    assert_eq!(entailed(":a a :C .", conclusion), Entailed::Yes);
+}
+
+/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
+/// conclusion together, the premise keeping its own reading; SHACL content has no OWL meaning
+/// only where no statement that is neither SHACL content nor an annotation names a SHACL
+/// property of the content; OWL 2 Direct Semantics: a premise entails a conclusion only if each
+/// of its axioms holds in every model of the premise): where the premise names `sh:path` (a
+/// declaration; a use as an individual) or `sh:class`, which its own SHACL content uses (an OWL
+/// axiom on it), premise and conclusion together read every SHACL statement as any other, and
+/// `:s sh:path :q` is a property assertion the premise doesn't entail; where the premise holds
+/// `sh:path` only as SHACL content, nothing names it, and the conclusion is entailed.
+#[test]
+fn a_conclusion_reads_shacl_content_as_its_premise_does() {
+    let (path, class) = (
+        "<http://www.w3.org/ns/shacl#path>",
+        "<http://www.w3.org/ns/shacl#class>",
+    );
+    let rows = [
+        (
+            "declaration",
+            format!("{path} a owl:ObjectProperty ."),
+            Entailed::No,
+        ),
+        (
+            "individual",
+            format!(":p a owl:ObjectProperty . :x :p {path} ."),
+            Entailed::No,
+        ),
+        (
+            "read as any other",
+            format!(":a {path} :b ; {class} :C . {class} a owl:ObjectProperty ."),
+            Entailed::No,
+        ),
+        ("SHACL content", format!(":a {path} :b ."), Entailed::Yes),
+    ];
+    let mut wrong = Vec::new();
+    for (what, premise, want) in rows {
+        let answer = entailed(&premise, &format!(":s {path} :q ."));
+        eprintln!("{what}: {answer:?}");
+        if answer != want {
+            wrong.push(format!("{what}: {answer:?}, not {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
+/// conclusion together, the premise keeping its own reading; SHACL content has no OWL meaning
+/// only where no statement that is neither SHACL content nor an annotation names a SHACL
+/// property of the content, else every statement is read as any other; OWL 2 Direct Semantics:
+/// a premise entails a conclusion only if each of its axioms holds in every model of the
+/// premise): where the premise declares `sh:path` and the conclusion states `sh:path`, all of
+/// the conclusion's SHACL content is read as any other, so `:s sh:class :q`, a property
+/// assertion the premise doesn't entail, leaves it unentailed, with the declaration in the
+/// conclusion or not; so where the premise reads its own SHACL content as any other and the
+/// conclusion states another SHACL property (`sh:datatype`). Where the premise declares
+/// `sh:path` and the conclusion states only `sh:class`, nothing names `sh:class`: its statement
+/// is SHACL content and the conclusion is entailed.
+#[test]
+fn a_conclusion_reads_shacl_content_as_one_store_with_its_premise() {
+    let sh = |name: &str| format!("<http://www.w3.org/ns/shacl#{name}>");
+    let (path, class, datatype) = (sh("path"), sh("class"), sh("datatype"));
+    let declared = format!("{path} a owl:ObjectProperty .");
+    let rows = [
+        (
+            "declared, the conclusion declaring it too",
+            format!("{declared} :s {path} :q ."),
+            format!("{declared} :s {path} :q . :s {class} :q ."),
+            Entailed::No,
+        ),
+        (
+            "declared",
+            format!("{declared} :s {path} :q ."),
+            format!(":s {path} :q . :s {class} :q ."),
+            Entailed::No,
+        ),
+        (
+            "the premise's content read as any other",
+            format!("{declared} :a {path} :b ."),
+            format!(":s {datatype} :q ."),
+            Entailed::No,
+        ),
+        (
+            "another property declared",
+            declared.clone(),
+            format!(":s {class} :q ."),
+            Entailed::Yes,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, premise, conclusion, want) in rows {
+        let answer = entailed(&premise, &conclusion);
+        eprintln!("{what}: {answer:?}");
+        if answer != want {
+            wrong.push(format!("{what}: {answer:?}, not {want:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (OWL 2 Direct Semantics: an inconsistent ontology has no model, so it entails every
+/// conclusion): from an inconsistent premise a conclusion stating SHACL content follows, however
+/// that content would be read.
+#[test]
+fn from_an_inconsistent_premise_a_conclusion_stating_shacl_content_follows() {
+    let dl = super::pipeline_with(nrese_store::DlConfig {
+        consistency: nrese_store::DlConsistency::Off,
+        ..nrese_store::DlConfig::default()
+    });
+    insert(&dl, super::entailment::INCONSISTENT).expect("premise, unchecked");
+    let conclusion = super::entailment::turtle(":s <http://www.w3.org/ns/shacl#path> :q .");
+    let answer = dl.store().entails_dl(&conclusion).expect("entailment");
+    assert_eq!(answer.premise.as_str(), "inconsistent");
+    assert_eq!(answer.answer, Entailed::Yes);
+}
+
+/// Spec (OWL 2 Direct Semantics: a premise entails a conclusion only if each of the
+/// conclusion's axioms holds in every model of it; SHACL content has no OWL meaning only where
+/// no statement that is neither SHACL content nor an annotation names a SHACL property of the
+/// content): the premise holds `sh:path` only as SHACL content, and its axiom `owl:Thing ⊑
+/// ∃:r.{:x}` makes every individual `:r`-related to `:x`, so it entails `sh:path :r :x`
+/// without naming `sh:path`. In a conclusion `sh:path :r :x . :s sh:class :q`, read as one
+/// store with the premise, `sh:path :r :x` names `sh:path`, a property of the content, so every
+/// statement is read as any other: `:s sh:class :q` is a property assertion the premise doesn't
+/// entail, and the conclusion isn't entailed.
+#[test]
+fn a_conclusion_naming_a_property_of_the_premises_content_reads_its_content_as_any_other() {
+    let (path, class) = (
+        "<http://www.w3.org/ns/shacl#path>",
+        "<http://www.w3.org/ns/shacl#class>",
+    );
+    let premise = format!(
+        ":a {path} :b . :r a owl:ObjectProperty . \
+         owl:Thing rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r ; owl:hasValue :x ] ."
+    );
+    let naming = entailed(&premise, &format!("{path} :r :x ."));
+    assert_eq!(naming, Entailed::Yes, "the premise entails `sh:path :r :x`");
+    let answer = entailed(&premise, &format!("{path} :r :x . :s {class} :q ."));
+    assert_eq!(
+        answer,
+        Entailed::No,
+        "`:s sh:class :q` is read as an assertion"
+    );
+}
+
+/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
+/// conclusion together, the premise keeping its own reading; SHACL content has no OWL meaning
+/// only where no statement that is neither SHACL content nor an annotation names a SHACL property
+/// of the content; OWL 2 Direct Semantics: a premise entails a conclusion only if each of its
+/// axioms holds in every model of the premise): each premise names `sh:path` or another
+/// property the union holds as content, through `rdf:type`, so premise and conclusion together
+/// read every SHACL statement as any other, and `:s sh:path :q` is a property assertion the
+/// premise doesn't entail. The premise declares `sh:message` an annotation property and gives a
+/// message (an annotation, which no axiom keeps), or it types `sh:path` an RDF property (which
+/// the Direct Semantics reads as nothing).
+#[test]
+fn a_premise_typing_a_shacl_property_reads_the_conclusions_content_as_any_other() {
+    let sh = |name: &str| format!("<http://www.w3.org/ns/shacl#{name}>");
+    let (path, message) = (sh("path"), sh("message"));
+    let rows = [
+        (
+            "an annotation declaration",
+            format!("{message} a owl:AnnotationProperty . :shape {message} \"hint\" ."),
+        ),
+        (
+            "an RDF typing",
+            format!("{path} a <http://www.w3.org/1999/02/22-rdf-syntax-ns#Property> ."),
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (what, premise) in rows {
+        let answer = entailed(&premise, &format!(":s {path} :q ."));
+        eprintln!("{what}: {answer:?}");
+        if answer != Entailed::No {
+            wrong.push(format!("{what}: {answer:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (one source, one reading: a conclusion is read by the SHACL rule over premise and
+/// conclusion together; a statement whose predicate is an annotation property names nothing;
+/// OWL 2 Direct Semantics: declarations and SHACL content hold no axiom to entail): the premise's
+/// `:x :note sh:path` names `sh:path`, but the conclusion declares `:note` an annotation
+/// property, so premise and conclusion together hold `:s sh:path :q` as SHACL content and the
+/// conclusion, with nothing else, is entailed. The premise keeps its own reading.
+#[test]
+fn a_conclusion_declaring_an_annotation_property_holds_its_shacl_statements_as_content() {
+    let path = "<http://www.w3.org/ns/shacl#path>";
+    let conclusion = format!(":note a owl:AnnotationProperty . :s {path} :q .");
+    assert_eq!(
+        entailed(&format!(":x :note {path} ."), &conclusion),
+        Entailed::Yes
+    );
+}
+
+/// Spec (OWL 2 Direct Semantics: SHACL content, like an annotation, has no meaning, so an
+/// equality entails no copy of it): on the rules' route, `:s owl:sameAs :t` lets eq-rep-s copy
+/// `:s sh:path :q` to `:t`, which OWL 2 DL doesn't entail. A read that returns `:t`, through the
+/// predicate `sh:path` or through any predicate, may not be told `complete` or `sound-only`.
+#[test]
+fn a_copied_shacl_row_is_not_told_sound() {
+    let dl = pipeline();
+    insert(&dl, ONTOLOGY).expect("an RL ontology");
+    shapes_insert(&dl, ":s sh:path :q . :s owl:sameAs :t .").expect("a copied shape row");
+    let route = dl.store().dl_bounds().last;
+    let mut wrong = Vec::new();
+    for read in ["SELECT ?x { ?x sh:path ?o }", "SELECT ?x { ?x ?p :q }"] {
+        let (rows, status) = query(&dl, &format!("{SH}{read}"));
+        let told = status.shared.as_str();
+        let line = format!(
+            "route {route}: {read}: {rows:?}, {told} {:?}",
+            status.reasons()
+        );
+        eprintln!("{line}");
+        assert!(
+            rows.iter().any(|r| r == "t"),
+            "{line}: the rules' copy is not returned"
+        );
+        if matches!(told, "complete" | "sound-only") {
+            wrong.push(line);
+        }
+    }
+    assert!(wrong.is_empty(), "copied rows told sound: {wrong:#?}");
+    assert_eq!(route, "rules");
+}
+
+/// Spec (OWL 2 Profiles §4.3, Table 4: eq-rep-s, eq-rep-p and eq-rep-o copy a statement only
+/// through an equality of two different terms): with no equality, the rules make no copy of
+/// SHACL content, so a read of it keeps its status: `?x sh:path ?o` is answered `complete` on
+/// the rules' route, and a read of any predicate isn't told `unsound`.
+#[test]
+fn shacl_content_without_an_equality_keeps_its_status() {
+    let dl = pipeline();
+    insert(&dl, ONTOLOGY).expect("an RL ontology");
+    shapes_insert(&dl, ":s sh:path :q .").expect("a shape row");
+    let route = dl.store().dl_bounds().last;
+    let (rows, constant) = query(&dl, &format!("{SH}SELECT ?x {{ ?x sh:path ?o }}"));
+    let (any, variable) = query(&dl, &format!("{SH}SELECT ?x {{ ?x ?p :q }}"));
+    let line = format!(
+        "route {route}: sh:path {rows:?} {}; any {any:?} {} {:?}",
+        constant.shared.as_str(),
+        variable.shared.as_str(),
+        variable.reasons()
+    );
+    eprintln!("{line}");
+    assert_eq!(
+        (rows, any),
+        (vec!["s".to_owned()], vec!["s".to_owned()]),
+        "{line}"
+    );
+    assert!(constant.is_complete(), "{line}");
+    assert_ne!(variable.shared.as_str(), "unsound", "{line}");
+    assert_eq!(route, "rules", "{line}");
+}
+
+/// The reads [`later_is_fresh`] compares: through `sh:path`, of `owl:Thing`, through any
+/// predicate.
+const READS: [&str; 3] = [
+    "SELECT ?x { ?x sh:path ?o }",
+    "SELECT ?x { ?x a owl:Thing }",
+    "SELECT ?x { ?x ?p :q }",
+];
+
+/// The answers of a one-variable `read` (with [`SH`]), sorted, and their status: an IRI written
+/// whole (`<…>`), a literal quoted, and each blank node `_:` with the number of answers it is.
+/// Two stores' answers are equal so exactly when they are equal up to a renaming of blank
+/// nodes: each store labels a list's blank node its own way, and RDF graphs are equal up to
+/// that renaming (RDF 1.1 Concepts §3.6).
+pub(super) fn up_to_blank_nodes(
+    dl: &nrese_store::MutationPipeline,
+    read: &str,
+) -> (Vec<String>, super::Status) {
+    let store = dl.store();
+    let request = nrese_store::SparqlQueryRequest::all(format!("{}{SH}{read}", super::PREFIXES));
+    let prepared = store.prepare_query(&request).expect("query");
+    let mut out = Vec::new();
+    let status = super::run_dl(store, &prepared, &mut out)
+        .expect("query")
+        .expect("a status under owl2-dl");
+    let json: serde_json::Value = serde_json::from_slice(&out).expect("json results");
+    let answers: Vec<(&str, &str)> = json["results"]["bindings"]
+        .as_array()
+        .expect("bindings")
+        .iter()
+        .map(|row| {
+            let x = &row["x"];
+            (
+                x["type"].as_str().unwrap_or("-"),
+                x["value"].as_str().unwrap_or("-"),
+            )
+        })
+        .collect();
+    let mut rows: Vec<String> = answers
+        .iter()
+        .map(|&(kind, value)| match kind {
+            "bnode" => {
+                let n = answers.iter().filter(|&&a| a == (kind, value)).count();
+                format!("_:{n}")
+            }
+            "uri" => format!("<{value}>"),
+            _ => format!("{value:?}"),
+        })
+        .collect();
+    rows.sort();
+    (rows, status)
+}
+
+/// U1's facts beyond L, sorted: U1's own terms (Skolem constants, fresh classes) as one name,
+/// as `bounds.rs`'s `canonical` writes them (their numbering follows the clauses'), each blank
+/// node (`_:…`) `_:` with the number of facts it is in, so that stores equal up to a renaming
+/// of blank nodes compare equal (RDF 1.1 Concepts §3.6). `None` where U1 isn't built.
+pub(super) fn u1_facts(dl: &nrese_store::MutationPipeline) -> Option<Vec<[String; 3]>> {
+    let facts = dl.store().dl_upper_facts(false)?;
+    let in_facts = |b: &str| facts.iter().filter(|f| f.iter().any(|t| t == b)).count();
+    let own = |t: &str| t.strip_prefix('<').is_some_and(nrese_dl::internal::is_made);
+    let name = |t: String| {
+        if own(&t) {
+            "<U1's own>".to_owned()
+        } else if t.starts_with("_:") {
+            format!("_:{}", in_facts(&t))
+        } else {
+            t
+        }
+    };
+    let mut named: Vec<[String; 3]> = facts.iter().map(|f| f.clone().map(name)).collect();
+    named.sort();
+    Some(named)
+}
+
+/// A store given `first`, then `then`, in two commits, against a store given both in one,
+/// each after `ontology`: the route before the later commit, and what differs: the route
+/// after it and, for each of [`READS`], the answers and their status (the reasons printed).
+fn later_is_fresh(ontology: &str, first: &str, then: &str) -> (&'static str, Vec<String>) {
+    let then_update = format!("INSERT DATA {{ {then} }}");
+    let (before, _, wrong) =
+        after_is_fresh(ontology, first, &then_update, &format!("{first} {then}"));
+    (before, wrong)
+}
+
+/// [`later_is_fresh`] for any later update `then` (an insert or a deletion), against a store
+/// given `ontology` and `statements`, its result, in one commit: the route before `then`, the
+/// fresh store's route, and what differs.
+fn after_is_fresh(
+    ontology: &str,
+    first: &str,
+    then: &str,
+    statements: &str,
+) -> (&'static str, &'static str, Vec<String>) {
+    let (later, fresh) = (pipeline(), pipeline());
+    insert(&later, ontology).expect("the ontology");
+    shapes_insert(&later, first).expect("the first commit");
+    let bounds = later.store().dl_bounds();
+    let before = bounds.last;
+    super::update(&later, &format!("{SH}{then}")).expect("the later commit");
+    insert(&fresh, ontology).expect("the ontology");
+    shapes_insert(&fresh, statements).expect("one commit");
+    let routes = [
+        later.store().dl_bounds().last,
+        fresh.store().dl_bounds().last,
+    ];
+    eprintln!("route {before}, then {routes:?} (later, fresh)");
+    let mut wrong = Vec::new();
+    // Off the rules' route, the state before `then` is the one these cases claim: the upper
+    // bound built (the unavailable one is the unit tests', `bounds_shapes_tests.rs`).
+    if before != "rules" && bounds.unavailable.is_some() {
+        wrong.push(format!("before the later commit: {:?}", bounds.unavailable));
+    }
+    // On the rules' route or off it: off it, a bound changed and one rebuilt are one route.
+    if (routes[0] == "rules") != (routes[1] == "rules") {
+        wrong.push(format!("routes {routes:?}"));
+    }
+    // Off the rules' route the answers rest on U1: the fresh store has it built, and the later
+    // store holds its facts (two unbuilt ones don't pass).
+    if routes[1] != "rules" {
+        let [kept, built] = [&later, &fresh].map(u1_facts);
+        if built.is_none() || kept != built {
+            wrong.push(format!("U1's facts: later {kept:?}; fresh {built:?}"));
+        }
+    }
+    for read in READS {
+        let [a, b] = [&later, &fresh].map(|dl| up_to_blank_nodes(dl, read));
+        // The status whole: soundness, completeness, the reasons' texts, the bounds' counts.
+        let told = |(rows, status): &(Vec<String>, super::Status)| {
+            format!("{rows:?}, {:?}", status.shared)
+        };
+        eprintln!("{read}: later {}; fresh {}", told(&a), told(&b));
+        if told(&a) != told(&b) {
+            wrong.push(format!("{read}: later {}; fresh {}", told(&a), told(&b)));
+        }
+    }
+    (before, routes[1], wrong)
+}
+
+/// The SHACL property a prior state already names before its first content, and that first
+/// content, for the family below: (a) declared an annotation property, beside other SHACL
+/// content (`:s sh:path :knows`); (b) declared another kind; (c) used as an individual; (d)
+/// named in a SHACL list; (e) named by an axiom. Each statement names `:knows`, an object
+/// property. The last field is the route the reading rule gives a fresh read of the store
+/// after the content (`true`: the rules'): the content's property, or in (a) `sh:message`,
+/// is then named, so every SHACL statement is read as any other, which puns `:knows`: off the
+/// route in each case.
+const NAMED_BEFORE: [(&str, &str, &str, bool); 5] = [
+    (
+        "(a) declared an annotation property",
+        "sh:message a owl:AnnotationProperty . :s sh:path :knows .",
+        ":s sh:message \"hint\" .",
+        false,
+    ),
+    (
+        "(b) declared another kind",
+        "sh:path a owl:ObjectProperty .",
+        ":s sh:path :knows .",
+        false,
+    ),
+    (
+        "(c) used as an individual",
+        ":x :knows sh:path .",
+        ":s sh:path :knows .",
+        false,
+    ),
+    (
+        "(d) named in a list",
+        ":s sh:in ( sh:path ) .",
+        ":s sh:path :knows .",
+        false,
+    ),
+    (
+        "(e) named by an axiom",
+        "sh:path rdfs:subPropertyOf :knows .",
+        ":s sh:path :knows .",
+        false,
+    ),
+];
+
+/// Runs [`NAMED_BEFORE`] after `ontology` on the route `route`: each case's route before its
+/// content commit (`rules` or off it, as `before`), a fresh read's route as its case gives
+/// it, and the commit's route and reads against a fresh read of the same statements.
+fn named_before_is_fresh(ontology: &str, route: &str, before: bool) -> Vec<String> {
+    let mut wrong = Vec::new();
+    for (what, prior, content, fresh) in NAMED_BEFORE {
+        let then = format!("INSERT DATA {{ {content} }}");
+        let (was, after, differs) =
+            after_is_fresh(ontology, prior, &then, &format!("{prior} {content}"));
+        let case = format!("{what}, {route}");
+        if (was == "rules") != before {
+            wrong.push(format!("{case}: before the content, route {was}"));
+        }
+        if (after == "rules") != fresh {
+            wrong.push(format!(
+                "{case}: a fresh read's route {after}, not as the rule gives"
+            ));
+        }
+        wrong.extend(differs.into_iter().map(|d| format!("{case}: {d}")));
+    }
+    wrong
+}
+
+/// Spec (a store's reading after any history equals a fresh read of its statements: one
+/// source, one reading, by the SHACL rule over the whole store): on the rules' route, a commit
+/// giving a SHACL property its first content, where the store already names that property
+/// ([`NAMED_BEFORE`]), takes the route and the reading a fresh read of the same statements
+/// takes: off the route, each read the same answers with the same status.
+#[test]
+fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_on_the_route() {
+    let wrong = named_before_is_fresh(ONTOLOGY, "on the rules' route", true);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (a store's reading after any history equals a fresh read of its statements): off
+/// the rules' route with the upper bound built, a commit giving a SHACL property its first
+/// content, where the store already names it ([`NAMED_BEFORE`]), takes the route and the
+/// reading a fresh read of the same statements takes.
+#[test]
+fn a_later_shacl_content_of_a_named_property_reads_as_a_fresh_store_off_the_route() {
+    let ontology = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet . \
+         :knows a owl:ObjectProperty . :a :knows :b .";
+    let wrong = named_before_is_fresh(ontology, "off the route, the upper bound built", false);
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (a store's reading after any history equals a fresh read of its statements): off
+/// the rules' route with the upper bound built and SHACL content read as any other (`:x
+/// :knows sh:path` names `sh:path`), deleting the last statement with `sh:path` as predicate
+/// leaves `sh:path` named but no longer found, so `:t sh:class :q` is SHACL content again: the
+/// route and the reading are a fresh read's of the same statements. Its ends are IRIs.
+#[test]
+fn deleting_the_last_content_of_a_named_property_reads_as_a_fresh_store() {
+    let ontology = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet . \
+         :knows a owl:ObjectProperty . :a :knows :b .";
+    let named = ":x :knows sh:path . :t sh:class :q .";
+    let first = format!("{named} :s sh:path :q .");
+    let then = "DELETE DATA { :s sh:path :q . }";
+    let (before, _, wrong) = after_is_fresh(ontology, &first, then, named);
+    assert_ne!(before, "rules", "off the rules' route");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (OWL 2 Structural Specification: a term an axiom uses has that axiom's kind; OWL 2
+/// Profiles §4.3, theorem PR1): on the rules' route, SHACL content `:s sh:path :q` and then a
+/// declaration of `sh:path` as an object property: `:s sh:path :q` is then a property
+/// assertion, with no name punned, as in a store given both at once: the same route, and each
+/// read the same answers with the same status.
+#[test]
+fn a_later_declaration_of_a_shacl_property_reads_as_one_commit_of_both() {
+    let (before, wrong) = later_is_fresh(
+        ONTOLOGY,
+        ":s sh:path :q .",
+        "sh:path a owl:ObjectProperty .",
+    );
+    assert_eq!(before, "rules", "SHACL content beside an RL ontology");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (OWL 2 Structural Specification §5.9: a SHACL term used as an individual is one, and
+/// its SHACL content is then read as any other; the upper bound holds every entailed
+/// assertion): off the rules' route, with SHACL content `:s sh:path :q`, a later `:x :p
+/// sh:path` through a known object property makes `:s sh:path :q` a property assertion, whose
+/// ends are individuals, as in a store given both at once: the same route, and each read the
+/// same answers with the same status.
+#[test]
+fn a_later_use_of_a_shacl_property_as_an_individual_reads_as_one_commit_of_both() {
+    let outside = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet . \
+         :p a owl:ObjectProperty . :a :p :b .";
+    let (before, wrong) = later_is_fresh(outside, ":s sh:path :q .", ":x :p sh:path .");
+    assert_ne!(before, "rules", "off the rules' route");
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}

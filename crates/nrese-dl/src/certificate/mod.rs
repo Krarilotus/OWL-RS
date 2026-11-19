@@ -438,16 +438,11 @@ impl<'a> View<'a> {
             }
             Axiom::DisjointClasses(xs) => pairwise_disjoint(xs)?,
             Axiom::DisjointUnion(class, xs) => {
-                let named = self
-                    .classes
-                    .get(class)
-                    .cloned()
-                    .unwrap_or_else(|| Set::empty(n));
                 let mut union = Set::empty(n);
                 for &x in xs {
                     union = union.or(&c(x)?);
                 }
-                named == union && pairwise_disjoint(xs)?
+                c(*class)? == union && pairwise_disjoint(xs)?
             }
             Axiom::SubObjectPropertyOf(chain, sup) => {
                 let (got, have) = (self.compose(chain), self.relation(*sup));

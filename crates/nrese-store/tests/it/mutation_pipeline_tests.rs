@@ -1316,14 +1316,14 @@ fn ranged_commits_are_judged_by_the_whole_lexical_space() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// The reasoning marker engine-v2 621bf318 (`SEMANTICS_VERSION` 3) wrote for the store of
+/// The reasoning marker engine-v2 9a41df47 (`SEMANTICS_VERSION` 3) wrote for the store of
 /// [`a_marker_from_older_datatype_semantics_is_rechecked`] after rematerialising it under
 /// owl2-rl: 0 violations (fleet probe xsdval-probe-marker-56fd5f94).
 const OLD_MARKER: &str =
     "ruleset owl2-rl\nfingerprint a94cf90230548146\nviolations 0\nlists nil-class\n";
 
 /// A store whose reasoning marker a build with older datatype semantics wrote (engine-v2
-/// 621bf318, which didn't judge an ill-typed literal under a range, so recorded this data
+/// 9a41df47, which didn't judge an ill-typed literal under a range, so recorded this data
 /// consistent) isn't current once the semantics change (rulesets::SEMANTICS_VERSION): on
 /// reopen it is rechecked, and the inconsistency is reported.
 #[test]
@@ -1346,7 +1346,7 @@ fn a_marker_from_older_datatype_semantics_is_rechecked() {
             )))
             .expect("import");
     }
-    // The marker 621bf318 wrote for this store after rematerialising it (fleet probe
+    // The marker 9a41df47 wrote for this store after rematerialising it (fleet probe
     // xsdval-probe-marker-56fd5f94).
     std::fs::write(dir.path().join("reasoning.state"), OLD_MARKER).expect("write marker");
     let store = StoreService::new(config).expect("reopen");
@@ -2057,8 +2057,11 @@ fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
 /// as written. The read of `owl:hasKey` reads `:hk` and expands it, so the list scan sees a
 /// key of `:head`'s 128 properties, more than the rules build. `:x` and `:z` agree on all of
 /// them, so `:x :name :Z` is entailed: the pending read answers it, or is told the list is
-/// left out (any pending read is not `complete`). A restricted reader of the same data, whose
-/// pending read always scans its own view, shows what the scan sees. The store is filled with
+/// left out (any pending read is not `complete`). A restricted reader of the same data by
+/// support sees no inferred statement under compact equality and is told `not-certified`,
+/// no regime, no reason; the scan of its own pending view is checked in the crate's own test
+/// (`certificate_lifecycle_tests::a_readers_pending_view_scans_a_key_through_an_alias_of_has_key`).
+/// The store is filled with
 /// reasoning off and then closed under `owl2-rl`, as a store is whose user IRIs were interned
 /// before the rules' first compile (one filled with reasoning off, or preloaded): written
 /// through the `owl2-rl` pipeline first, `owl:hasKey` would be the older id and `:hk` the
@@ -2066,9 +2069,10 @@ fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
 #[test]
 fn a_pending_fact_through_an_alias_of_has_key_leaves_out_a_list_under_compact_equality() {
     let (answer, status, scanned) = alias_of_has_key(true);
-    assert!(
-        scanned.as_ref().is_some_and(list_left_out),
-        "the scan doesn't see the key: {scanned:?}"
+    assert_eq!(
+        scanned.map(|s| s.header()).as_deref(),
+        Some("not-certified"),
+        "the restricted reader"
     );
     if !answer.contains("true") {
         assert!(status.as_ref().is_some_and(list_left_out), "{status:?}");

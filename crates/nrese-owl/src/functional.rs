@@ -245,7 +245,7 @@ impl Functional<'_> {
             Axiom::SubClassOf(a, b) => format!("SubClassOf({} {})", self.c(*a), self.c(*b)),
             Axiom::EquivalentClasses(xs) => format!("EquivalentClasses({})", self.cs(xs)),
             Axiom::DisjointClasses(xs) => format!("DisjointClasses({})", self.cs(xs)),
-            Axiom::DisjointUnion(c, xs) => format!("DisjointUnion({} {})", self.n(*c), self.cs(xs)),
+            Axiom::DisjointUnion(c, xs) => format!("DisjointUnion({} {})", self.c(*c), self.cs(xs)),
             Axiom::SubObjectPropertyOf(chain, sup) => match chain[..] {
                 [sub] => format!("SubObjectPropertyOf({} {})", self.p(sub), self.p(*sup)),
                 _ => format!(

@@ -440,20 +440,22 @@ pub(crate) fn hazards(
                 edges.push((all.clone(), all));
             }
             Axiom::DisjointUnion(class, parts) => {
-                found.push(Hazard::Union(*class));
+                // A named class's term; on `⊤` or `⊥` none, as `⊤ ⊑ A ⊔ B` has none.
+                let class = expr_terms(*class);
+                found.extend(class.iter().map(|&c| Hazard::Union(c)));
                 // A part is a left side of the class, which the TBox reads (a class).
                 if parts
                     .iter()
                     .any(|&p| needs_no_term(o, p) && !read_as_top(o, p))
                 {
-                    open.push(*class);
+                    open.extend(&class);
                 }
                 let mut all: Vec<Term> = parts.iter().flat_map(|&c| expr_terms(c)).collect();
                 for &p in parts {
                     collect.walk(p, Place::LeftTop);
                     collect.walk(p, Place::Right(None));
                 }
-                all.push(*class);
+                all.extend(class);
                 edges.push((all.clone(), all));
             }
             Axiom::SubObjectPropertyOf(chain, sup) => {
@@ -802,7 +804,12 @@ fn directed_edges(o: &Ontology, axiom: &Axiom) -> Vec<(Vec<Term>, Vec<Term>)> {
         Axiom::DisjointClasses(v) => pairs(v, false),
         Axiom::DisjointUnion(class, parts) => parts
             .iter()
-            .flat_map(|&p| [(t(&[p]), vec![*class]), (with(vec![*class], p), c(p, true))])
+            .flat_map(|&p| {
+                [
+                    (t(&[p]), c(*class, true)),
+                    (with(t(&[*class]), p), c(p, true)),
+                ]
+            })
             .collect(),
         Axiom::ObjectPropertyDomain(p, e) | Axiom::ObjectPropertyRange(p, e) => {
             vec![(with(vec![p.named()], *e), c(*e, true))]

@@ -2859,6 +2859,10 @@ mod tests {
             fn datatype(&self, _: u64) -> Option<String> {
                 None
             }
+            fn iri_text(&self, term: u64) -> Option<String> {
+                let text = self.0.text(term).strip_prefix('<')?;
+                Some(text.strip_suffix('>')?.to_owned())
+            }
         }
         let mut v = LocalVocabulary::default();
         let known = nrese_owl::Vocabulary::iris()

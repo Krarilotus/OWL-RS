@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
-use nrese_store::{DlConfig, DlConsistency, MutationError, MutationPipeline, StoreService};
+use nrese_store::{
+    DlConfig, DlConsistency, MutationError, MutationPipeline, RejectKind, StoreService,
+};
 
 use super::{ask, insert, pipeline, pipeline_with};
 
@@ -222,4 +224,119 @@ fn a_left_out_part_leaves_consistency_unknown_whoever_decides() {
         wrong.push(format!("U1's path {upper:?}, the engine's {engine:?}"));
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (*OWL 2 Structural Specification* §5.1 and §9.1.4: `owl:Thing` and `owl:Nothing` are
+/// classes, and a disjoint union's first argument is a class): a disjoint union of `:A` and
+/// `:B` on `owl:Thing`, with both under `:C`, makes everything a `:C`, so an individual
+/// outside `:C` has no model; one on `owl:Nothing` makes `:A` empty, so an `:A` has none. Each
+/// such commit is rejected; each case's outcome printed.
+#[test]
+fn a_disjoint_union_on_the_top_or_bottom_class_is_read_as_that_class() {
+    let mut wrong = Vec::new();
+    for (schema, data) in [
+        (
+            "owl:Thing owl:disjointUnionOf ( :A :B ) . :A rdfs:subClassOf :C . \
+             :B rdfs:subClassOf :C .",
+            ":x a [ owl:complementOf :C ] .",
+        ),
+        ("owl:Nothing owl:disjointUnionOf ( :A :B ) .", ":a a :A ."),
+    ] {
+        let dl = pipeline();
+        insert(&dl, schema).expect("schema");
+        let outcome = match insert(&dl, data) {
+            Err(MutationError::Rejected(reject)) => format!("rejected: {}", reject.detail),
+            other => format!("not rejected: {other:?}"),
+        };
+        eprintln!("DISJOINT UNION {schema} then {data}: {outcome}");
+        if !outcome.starts_with("rejected") || !outcome.contains("OWL 2 DL") {
+            wrong.push(format!("{schema} then {data}: {outcome}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (*OWL 2 Direct Semantics* Table 6: a disjoint union's operands are pairwise disjoint;
+/// *Mapping to RDF* Table 16 reads each list member): `owl:disjointUnionOf ( :A :A )`, or of
+/// `≥ 1 :p` and `≥ 1 :p.⊤` (one expression twice), empties that operand and so `:C`; an
+/// individual in `:C` has no model, and the commit is rejected. Each case's outcome printed.
+#[test]
+fn a_disjoint_union_whose_operands_read_as_one_empties_its_class() {
+    let mut wrong = Vec::new();
+    for schema in [
+        ":C owl:disjointUnionOf ( :A :A ) .",
+        ":p a owl:ObjectProperty . :C owl:disjointUnionOf ( \
+         [ a owl:Restriction ; owl:onProperty :p ; owl:minCardinality \"1\"^^xsd:nonNegativeInteger ] \
+         [ a owl:Restriction ; owl:onProperty :p ; \
+           owl:minQualifiedCardinality \"1\"^^xsd:nonNegativeInteger ; owl:onClass owl:Thing ] ) .",
+    ] {
+        let dl = pipeline();
+        insert(&dl, schema).expect("schema");
+        let outcome = match insert(&dl, ":c a :C .") {
+            Err(MutationError::Rejected(reject)) => format!("rejected: {}", reject.detail),
+            other => format!("not rejected: {other:?}"),
+        };
+        eprintln!("REPEATED DISJOINT UNION {schema}: {outcome}");
+        if !outcome.starts_with("rejected") || !outcome.contains("OWL 2 DL") {
+            wrong.push(format!("{schema}: {outcome}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// The neighbours of [`a_disjoint_union_whose_operands_read_as_one_empties_its_class`]. Spec
+/// (*OWL 2 Direct Semantics* Table 6): a disjoint union of two classes keeps them disjoint, so
+/// an individual of both has no model and the commit is rejected. Spec (*OWL 2 Profiles* §4.3,
+/// theorem PR1, and table 9's cax-dw, which reads `:E owl:disjointWith :E` as written): an
+/// OWL 2 RL ontology whose one repeat is that binary disjointness stays on the rules' route,
+/// and an `:E` is still refused there. Each case's outcome printed.
+#[test]
+fn the_neighbours_of_a_repeated_disjoint_union_keep_their_refusal_and_their_route() {
+    let mut wrong = Vec::new();
+    let dl = pipeline();
+    insert(&dl, ":C owl:disjointUnionOf ( :A :B ) .").expect("schema");
+    let outcome = match insert(&dl, ":c a :A , :B .") {
+        Err(MutationError::Rejected(reject)) => format!("rejected: {}", reject.detail),
+        other => format!("not rejected: {other:?}"),
+    };
+    eprintln!("UNION NEIGHBOUR an individual of both operands: {outcome}");
+    if !outcome.starts_with("rejected") {
+        wrong.push(format!("an individual of both operands: {outcome}"));
+    }
+    let dl = pipeline();
+    insert(
+        &dl,
+        ":Dog rdfs:subClassOf :Animal . :E owl:disjointWith :E . :rex a :Dog .",
+    )
+    .expect("an RL ontology");
+    let route = dl.store().dl_bounds().last;
+    let outcome = match insert(&dl, ":e a :E .") {
+        Err(MutationError::Rejected(reject)) => format!("rejected: {}", reject.detail),
+        other => format!("not rejected: {other:?}"),
+    };
+    eprintln!("UNION NEIGHBOUR the RL ontology: route {route:?}; an :E {outcome}");
+    if route != "rules" || !outcome.starts_with("rejected") {
+        wrong.push(format!("the RL ontology: route {route:?}; an :E {outcome}"));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (*OWL 2 Direct Semantics* §2.3: `owl:Nothing` has no instance; *OWL 2 Profiles* §4.3,
+/// table 6's cls-nothing2): beside a disjoint union whose operands read as one, an individual
+/// of `owl:Nothing` is a clash the OWL 2 RL rules find and OWL 2 DL shares, so the commit is
+/// refused as an inconsistency, not as undecided. Its outcome printed.
+#[test]
+fn a_separate_clash_beside_a_read_as_one_union_is_refused_as_an_inconsistency() {
+    let dl = pipeline();
+    insert(&dl, ":C owl:disjointUnionOf ( :A :A ) .").expect("schema");
+    let result = insert(&dl, ":x a owl:Nothing .");
+    let outcome = match &result {
+        Err(MutationError::Rejected(reject)) => format!("{:?}: {}", reject.kind, reject.detail),
+        other => format!("not rejected: {other:?}"),
+    };
+    eprintln!("SEPARATE CLASH :x a owl:Nothing: {outcome}");
+    let Err(MutationError::Rejected(reject)) = &result else {
+        panic!("{outcome}");
+    };
+    assert_eq!(reject.kind, RejectKind::Inconsistent, "{outcome}");
 }

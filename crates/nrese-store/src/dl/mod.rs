@@ -45,13 +45,15 @@ pub use consistency::{Checked, Verdict};
 /// What decided a DL answer's status, beside the shared status
 /// ([`nrese_sparql::Completeness`]): the paths that decided (`closed-predicates`,
 /// `skolem-only-gap`, `bounds-equal`, `exact-ground-entailment`,
-/// `exact-internalisable-cq`), and the
-/// candidates of the gap the exact services proved and refuted.
+/// `exact-internalisable-cq`; `capped-gap` where the gap had no room for the model's labels),
+/// and the candidates of the gap the exact services proved and refuted.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DlDetail {
     pub paths: Vec<&'static str>,
     pub proved: u64,
     pub refuted: u64,
+    /// Of `refuted`, those one model of the premise refuted by its labels, with no test.
+    pub refuted_by_labels: u64,
     /// The first candidates neither proved nor refuted, as `?x=<…> ?y=<…>` (`ASK` for a
     /// boolean query), at most [`UNRESOLVED_SHOWN`].
     pub unresolved: Vec<String>,
@@ -135,11 +137,17 @@ impl Dl {
         ))
     }
 
-    /// [`Self::undecided`] for the data a commit `tx` leaves.
+    /// [`Self::undecided`] for the data a commit `tx` leaves (`lists_left_out`: whether its
+    /// closure leaves out a list axiom). Where `tx` keeps its base's RL route, no read: the
+    /// kinds the route was decided on prove the rules read the data as OWL 2 DL does.
     pub(crate) fn undecided_after(
         &self,
         tx: &nrese_engine::Transaction<'_>,
+        lists_left_out: bool,
     ) -> Option<WhyUndecided> {
+        if self.bounds.keeps_route(tx, lists_left_out) {
+            return None;
+        }
         why(source::read_pending(
             tx,
             std::sync::Arc::clone(self.bounds.kept()),

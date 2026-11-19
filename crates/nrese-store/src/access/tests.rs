@@ -5,6 +5,7 @@ use nrese_rdf::{GraphName, NamedNode};
 use super::*;
 use crate::{StoreConfig, StoreService};
 
+mod publication;
 mod sessions;
 
 fn named(iri: &str) -> GraphName {

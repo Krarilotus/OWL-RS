@@ -5,7 +5,7 @@
 //! them in the default graph, never under an alias.
 //!
 //! Each row is one input; it fails as a whole if any check after it does. All failed on
-//! engine-v2 58af963dc, where the statements were stored in a named graph of the alias's IRI.
+//! engine-v2 fa4fe73d3, where the statements were stored in a named graph of the alias's IRI.
 
 use crate::support::Writes;
 use std::fs;
@@ -222,7 +222,7 @@ fn with_context(op: &str, writes: &str) -> String {
 
 /// An explicit context naming another store's default graph (RDF4J `context=`, a
 /// quarantine replay's target) is the default graph, for writes, removals and reads, and so
-/// are its write rights (the rows failed on slice 3's 119f32bc).
+/// are its write rights (the rows failed on slice 3's e1bd8a12).
 #[test]
 fn an_explicit_context_naming_the_default_graph_is_the_default_graph() {
     let rows = [
@@ -292,7 +292,7 @@ fn graph_target(target: &str) -> String {
 /// A graph target naming another store's default graph is the default graph for what a
 /// graph result says too: a write to it creates no graph, and it exists while empty. An
 /// ordinary named graph is created and is gone once empty (guard). The rows failed on
-/// slice 3's 6794ab22.
+/// slice 3's cc8f78d8.
 #[test]
 fn a_graph_target_naming_the_default_graph_answers_as_the_default_graph() {
     let rows = [

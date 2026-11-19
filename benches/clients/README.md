@@ -7,11 +7,11 @@ Real clients against NRESE, end to end: the connectors' contract.
 | `rdf4j/` | RDF4J's Java client: `HTTPRepository`, `RemoteRepositoryManager`, statements, contexts, transactions. This is what ResearchSpace and other RDF4J applications do. It runs once against the store's default graph and once against the union. |
 | `jena/` | Apache Jena 6.2's `RDFConnection`: updates; SELECT, ASK, CONSTRUCT and DESCRIBE; results in XML, JSON and TSV; literals (language tags, datatypes, non-ASCII text); the Graph Store Protocol (PUT, GET, POST, DELETE). |
 | `rdflib/` | rdflib's `SPARQLUpdateStore` under a `Graph` and a `Dataset`: writes, queries, the default graph by rdflib's own name, named graphs, and the Graph Store Protocol over plain HTTP. |
-| `dmw` | An application's export, questions, updates and validation (`scripts/smoke-dmw-export.sh`). |
+| `module-export` | An application's export, questions, updates and validation (`scripts/smoke-module-export.sh`). |
 
 ```bash
 cargo build --release -p nrese-server
-benches/clients/run-all.sh [target/release/nrese-server] [rdf4j|jena|rdflib|dmw ...]
+benches/clients/run-all.sh [target/release/nrese-server] [rdf4j|jena|rdflib|module-export ...]
 ```
 
 Each kit gets a fresh in-memory server of its own. The kits need Java 21 or later and

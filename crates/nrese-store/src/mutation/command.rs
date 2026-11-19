@@ -245,7 +245,11 @@ pub(crate) fn apply_sparql_update<T: nrese_sparql::UpdateTarget>(
         Ok(update) => update,
         Err(error) => {
             let mut parser = SparqlParser::new();
-            for (prefix, namespace) in &context.namespaces {
+            let captured = request.staged.as_deref();
+            let live = captured.is_none().then_some(context.namespaces());
+            let staged = captured.into_iter().flat_map(|set| &*set.namespaces);
+            let entries = staged.map(|(prefix, iri)| (prefix, iri));
+            for (prefix, namespace) in live.into_iter().flatten().chain(entries) {
                 parser = match parser
                     .clone()
                     .with_prefix(prefix.clone(), namespace.clone())
@@ -262,7 +266,10 @@ pub(crate) fn apply_sparql_update<T: nrese_sparql::UpdateTarget>(
         &request.using_graphs,
         &request.using_named_graphs,
     )?;
-    let options = context.update_options(requester, using);
+    let mut options = context.update_options(requester, using);
+    if let Some(staged) = &request.staged {
+        options.search_scope = staged.search_scope;
+    }
     // Its WHERE's memory refusal as its reader may be told it (`ReadScope::told`).
     requester.read.told(
         crate::EntryPoint::UpdateWhere,

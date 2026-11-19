@@ -510,7 +510,7 @@ impl Gen<'_> {
                 if parts.len() < 2 {
                     return None;
                 }
-                Axiom::DisjointUnion(class, parts)
+                Axiom::DisjointUnion(self.e(ClassExpr::Class(class)), parts)
             }
             8 => Axiom::ObjectPropertyDomain(self.any_role(), self.class(1)),
             9 => Axiom::ObjectPropertyRange(self.any_role(), self.class(1)),
@@ -800,8 +800,9 @@ fn map_axiom(
         Axiom::DisjointClasses(v) => {
             Axiom::DisjointClasses(canonical(v.iter().map(|&x| c(x, out)).collect()))
         }
-        Axiom::DisjointUnion(t, v) => {
-            Axiom::DisjointUnion(f(*t), canonical(v.iter().map(|&x| c(x, out)).collect()))
+        Axiom::DisjointUnion(x, v) => {
+            let x = c(*x, out);
+            Axiom::DisjointUnion(x, canonical(v.iter().map(|&x| c(x, out)).collect()))
         }
         Axiom::SubObjectPropertyOf(chain, sup) => {
             Axiom::SubObjectPropertyOf(props(chain), map_prop(*sup, f))

@@ -1,5 +1,5 @@
 //! Draft checks: isolated SHACL, query and reasoning answers over pinned N-Triples, with
-//! the semantics of DMW's offline checks.
+//! the semantics of a data-modelling application's offline checks.
 
 use nrese_store::{
     CancellationToken, DraftInputs, DraftLimits, DraftOperation, DraftOutcome, DraftStatus,
@@ -150,7 +150,7 @@ fn an_ill_formed_shapes_graph_fails() {
 }
 
 #[test]
-fn ask_and_select_answer_with_dmw_terms() {
+fn ask_and_select_answer_with_protocol_terms() {
     let data = format!(
         "{a} {name} \"Alice\"@en .\n{a} {born} \"1452\"^^<http://www.w3.org/2001/XMLSchema#gYear> .\n",
         a = ex("alice"),

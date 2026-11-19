@@ -47,6 +47,10 @@ impl Terms for Table {
     fn datatype(&self, _: Term) -> Option<String> {
         None
     }
+
+    fn iri_text(&self, term: Term) -> Option<String> {
+        (self.kind(term) == TermKind::Iri).then(|| self.names[term as usize].clone())
+    }
 }
 
 impl Intern for Table {

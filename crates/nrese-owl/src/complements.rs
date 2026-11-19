@@ -96,9 +96,11 @@ pub(crate) fn rewrite(ontology: &Ontology) -> Option<Ontology> {
     let mut named: HashSet<Term> = HashSet::new();
     let mut by_key: HashMap<Key, (Vec<Definition>, Vec<Definition>)> = HashMap::new();
     for (index, axiom) in ontology.axioms.iter().enumerate() {
-        if let Axiom::DisjointUnion(a, _) = axiom {
-            // Its class is a term, not an expression `¬A` could replace.
-            named.insert(*a);
+        if let Axiom::DisjointUnion(a, _) = axiom
+            && let Some(a) = class(*a)
+        {
+            // Its class stays a class (§9.1.4), not `¬A`.
+            named.insert(a);
         }
         let Axiom::EquivalentClasses(xs) = axiom else {
             continue;
@@ -232,6 +234,7 @@ fn map_axiom(axiom: &Axiom, f: &mut dyn FnMut(ExprId) -> ExprId) -> Axiom {
             Axiom::EquivalentClasses(xs.iter().map(|&x| f(x)).collect())
         }
         Axiom::DisjointClasses(xs) => Axiom::DisjointClasses(xs.iter().map(|&x| f(x)).collect()),
+        // The class is left as it is: a class is never replaced by `¬A` (`named`).
         Axiom::DisjointUnion(a, xs) => Axiom::DisjointUnion(*a, xs.iter().map(|&x| f(x)).collect()),
         Axiom::ObjectPropertyDomain(r, x) => Axiom::ObjectPropertyDomain(*r, f(*x)),
         Axiom::ObjectPropertyRange(r, x) => Axiom::ObjectPropertyRange(*r, f(*x)),

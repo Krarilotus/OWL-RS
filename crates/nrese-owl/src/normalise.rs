@@ -567,10 +567,10 @@ impl<'a> Normaliser<'a> {
                 }
             }
             Axiom::DisjointUnion(class, xs) => {
-                let named = self.e(ClassExpr::Class(*class));
+                // The class as read: a named class, `⊤` or `⊥`.
                 let union = self.e(ClassExpr::Or(xs.clone()));
-                self.sub(named, union, index);
-                self.sub(union, named, index);
+                self.sub(*class, union, index);
+                self.sub(union, *class, index);
                 for (i, &a) in xs.iter().enumerate() {
                     for &b in &xs[i + 1..] {
                         let (Some(na), Some(nb)) = (self.nnf_not(a), self.nnf_not(b)) else {
@@ -1544,21 +1544,27 @@ impl<'a> Normaliser<'a> {
             // its superrole `role` (the member's own); equal words with other inclusions
             // are two proofs, both kept.
             let needed = |sup: ObjProp| {
-                members.iter().find(|(m, _)| *m == sup).map(|(_, via)| {
-                    let mut needed = via.clone();
+                let member = members.iter().find(|(m, _)| *m == sup);
+                member.map(|(_, via)| via.clone())
+            };
+            // A body label read as `role` (or `role⁻`) also needs the inclusions that make
+            // `role` (or `role⁻`) a subrole of it: `role`'s own in the label's class.
+            let read =
+                |labels: Vec<ObjProp>, mut needed: Vec<usize>| -> (Vec<ObjProp>, Vec<usize>) {
                     needed.push(*axiom);
+                    for &x in labels.iter().filter(|&&x| canonical(x) != x) {
+                        let of = if canonical(x) == r { x } else { x.inverse() };
+                        let into = self.equivalents(of).into_iter().find(|(m, _)| *m == r);
+                        needed.extend(into.into_iter().flat_map(|(_, via)| via));
+                    }
                     needed.sort_unstable();
                     needed.dedup();
-                    needed
-                })
-            };
-            let word: Option<(Vec<ObjProp>, Vec<usize>)> = needed(ObjProp::Named(*sup))
-                .map(|needed| (chain.iter().map(|&x| canonical(x)).collect(), needed));
+                    (labels.into_iter().map(&canonical).collect(), needed)
+                };
+            let word: Option<(Vec<ObjProp>, Vec<usize>)> =
+                needed(ObjProp::Named(*sup)).map(|needed| read(chain.clone(), needed));
             let inverse: Option<(Vec<ObjProp>, Vec<usize>)> = needed(ObjProp::Inverse(*sup))
-                .map(|needed| {
-                    let w = chain.iter().rev().map(|&x| canonical(x.inverse()));
-                    (w.collect(), needed)
-                })
+                .map(|needed| read(chain.iter().rev().map(|&x| x.inverse()).collect(), needed))
                 .filter(|w| word.as_ref() != Some(w));
             for (chain, needed) in word.into_iter().chain(inverse) {
                 if chain[..] == [r] {

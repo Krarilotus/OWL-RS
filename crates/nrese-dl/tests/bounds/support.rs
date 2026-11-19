@@ -120,6 +120,13 @@ impl Terms for Table {
             _ => None,
         }
     }
+
+    fn iri_text(&self, term: Term) -> Option<String> {
+        match &self.terms[term as usize] {
+            RdfTerm::NamedNode(n) => Some(n.as_str().to_owned()),
+            _ => None,
+        }
+    }
 }
 
 impl Make for Table {

@@ -504,6 +504,61 @@ fn an_irregular_ontology_with_an_axiom_the_el_classifier_skips_is_not_answered_b
     assert_lower_bound(&irregular(":F owl:equivalentClass [ owl:oneOf ( :o ) ] ."));
 }
 
+/// [`irregular`] with `extra`, its time left out: two reports of the same ontology are equal.
+fn irregular_untimed(extra: &str) -> nrese_store::ClassificationReport {
+    let mut report = irregular(extra);
+    report.micros = 0;
+    report
+}
+
+/// Spec (Structural Specification §5.5: of the reserved vocabulary only the nine built-in
+/// annotation properties are annotation properties, so `owl:bottomObjectProperty` declared one,
+/// in either spelling (Mapping to RDF Graphs, Table 6), is none, and `:r4 rdfs:subPropertyOf
+/// owl:bottomObjectProperty` stays a property inclusion: with `:H ⊑ ∃r4.B` it makes `:H`
+/// unsatisfiable (Direct Semantics: the bottom property's extension is empty)): the irregular
+/// ontology with that inclusion and the declaration classifies as one without the
+/// declaration: the same engine, the same answer and the same reasons.
+#[test]
+fn owl_bottom_object_property_declared_an_annotation_property_classifies_as_without_the_declaration()
+ {
+    let rest = ":r4 a owl:ObjectProperty . :r4 rdfs:subPropertyOf owl:bottomObjectProperty . \
+                :H a owl:Class . \
+                :H rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :r4 ; owl:someValuesFrom :B ] .";
+    let without = irregular_untimed(rest);
+    let mut wrong = Vec::new();
+    for spelling in super::reserved_names::SPELLINGS {
+        let declared =
+            irregular_untimed(&format!("owl:bottomObjectProperty a {spelling} . {rest}"));
+        if declared != without {
+            wrong.push(format!("{spelling}: {declared:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}\nwithout: {without:?}");
+}
+
+/// Spec (Structural Specification §5.5 and §10: a user IRI declared an annotation property, in
+/// either spelling (Mapping to RDF Graphs, Table 6), is one; its assertions, its range and its
+/// sub-property axioms are annotation axioms, which OWL 2 Direct Semantics gives no meaning):
+/// the irregular ontology with such a property, an annotation of a class, a range and a
+/// sub-property of `rdfs:comment` keeps the EL classifier's answer, as without them: the same
+/// engine, the same answer and the same reasons.
+#[test]
+fn an_irregular_el_ontology_with_a_declared_annotation_property_keeps_the_el_classifiers_answer() {
+    let plain = irregular_untimed("");
+    assert_eq!(plain.engine, "el");
+    let mut wrong = Vec::new();
+    for spelling in super::reserved_names::SPELLINGS {
+        let annotated = irregular_untimed(&format!(
+            ":note a {spelling} . :A :note \"a note\" . :note rdfs:range xsd:string . \
+             :note rdfs:subPropertyOf rdfs:comment ."
+        ));
+        if annotated != plain {
+            wrong.push(format!("{spelling}: {annotated:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}\nwithout: {plain:?}");
+}
+
 /// A class the EL classifier reads nothing about (named only as a data property's domain)
 /// is still classified: below a class equivalent to `owl:Thing`, as every class is.
 #[test]
@@ -553,7 +608,8 @@ fn an_irregular_el_answer_leaves_an_annotation_propertys_domain_out() {
 /// An axiom's reification (`owl:Axiom`) states no axiom for the DL engines, but the EL
 /// classifier reads the class axiom its node carries (`X ⊓ Y ⊑ Z`): its answer names
 /// classes the DL engines' signature lacks, so neither reading is trusted, and the answer
-/// stays the DL engines' marked lower bound.
+/// stays the DL engines' marked lower bound. The reification has no main triple
+/// (*Mapping to RDF* Table 17), so the reader reports it, and the bound says so too.
 #[test]
 fn an_irregular_ontology_whose_classes_the_two_readers_read_differently_is_not_answered_by_the_el_classifier()
  {
@@ -567,7 +623,16 @@ fn an_irregular_ontology_whose_classes_the_two_readers_read_differently_is_not_a
         "{:?}",
         report.subsumptions
     );
-    assert_lower_bound(&report);
+    assert_eq!(report.engine, "tableau");
+    assert!(!report.complete());
+    assert!(
+        report.incomplete.contains(&format!(
+            "consistency not decided (unsupported): {LEFT_OUT}; \
+             1 reader diagnostics (not OWL 2 DL, left out)"
+        )),
+        "{:?}",
+        report.incomplete
+    );
 }
 
 /// The EL classifier skips a datatype declared `owl:DataRange` where it reads a class (a

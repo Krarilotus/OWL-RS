@@ -17,7 +17,7 @@ from . import adapters, cases, driver, ledger, manifest, schema, status, workloa
 from .runtime import Mount
 
 
-# A cell step's memory beside its containers: its release and harness builds of f255c0d0 at 2 jobs peaked (slice memory.peak)
+# A cell step's memory beside its containers: its release and harness builds of cbca36e7 at 2 jobs peaked (slice memory.peak)
 # at 3.77 GiB in suite-fleet-slice-measure-1#3cabc677 and 3.60 GiB clean in suite-fleet-slice-measure-2#e2093634: the larger.
 SLICE_GB = 3.77
 

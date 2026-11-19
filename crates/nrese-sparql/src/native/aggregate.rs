@@ -688,7 +688,7 @@ pub(super) fn groups_of(
             keys: IdTable::from_rows(0, std::iter::repeat_n(&[][..], usize::from(rows > 0))),
             group_of: vec![0; rows],
         },
-        // Group ids past u32 are refused (engine-v2 d8bb60b2, EEV-20).
+        // Group ids past u32 are refused (engine-v2 5c6b6ff2, EEV-20).
         false => group_rows(&solutions.table, &keys).map_err(QueryEvaluationError::from)?,
     };
     Ok((groups, positions))

@@ -467,14 +467,18 @@ fn a_commit_that_makes_or_ends_a_left_out_axiom_changes_the_status() {
         (
             "a node value deleted beside another",
             format!("{NAMES} {range} :v :p :x ."),
+            "DELETE DATA { :x :p :v . }",
+            "INSERT DATA { :x :p :v . }",
         ),
         (
-            "a declared object property's node value deleted",
-            format!("{NAMES} {range} :p a owl:ObjectProperty ."),
+            // The sequence "a data property's last value deleted" but for its declaration.
+            "a declared data property's last value deleted",
+            format!("{NAMES} :p a owl:DatatypeProperty ; rdfs:range rdfs:Literal . :x :p \"v\" ."),
+            "DELETE DATA { :x :p \"v\" . }",
+            "INSERT DATA { :x :p \"v\" . }",
         ),
     ]
-    .map(|(name, data)| {
-        let (change, undo) = ("DELETE DATA { :x :p :v . }", "INSERT DATA { :x :p :v . }");
+    .map(|(name, data, change, undo)| {
         (
             name,
             data,

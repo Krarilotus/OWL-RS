@@ -15,7 +15,9 @@ come with. What is in is on
   reasoned reads say `not-certified`, and a primary under `reasoner.equality = "compact"`
   serves no replica ([replication](ops/replication.md#limits-of-this-first-step)).
 - You need named graphs as separate reasoning contexts. Rules read every graph, and
-  inferences go to the default graph ([graph scope](spec/reasoning-semantics.md#graph-scope)).
+  inferences go to the default graph ([graph scope](spec/reasoning-semantics.md#graph-scope)); a
+  query can take its inferences from its own graphs alone
+  ([`inference-scope=dataset`](ops/http-api.md#inference-scope)), at a cost (below).
 - You need every OWL 2 DL answer proven complete. Some answers are `sound-only`, which
   means rows may be missing, and if you ask for exact answers, a request whose answer can't be
   proven complete fails with an error ([owl2-dl](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
@@ -268,18 +270,21 @@ leave something out.
   `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
   annotation property's domain, range, super-property or sub-property or the empty list, or give
   the individual its own IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
-- On a store in quarantine, a delete of a schema statement that the remaining statements derive
-  again can be refused as introducing the violation that was already there, though a full
-  rebuild finds the same violation after it (under `owl2-rl`, for one). The delete changes
-  nothing, and the store stays as it was. Repair the existing violation first.
+- On a store in quarantine, a commit can be refused as introducing a violation that was
+  already there, though a full rebuild finds the same violation after it (under `owl2-rl`, for
+  one): a commit that deletes a statement the remaining statements still entail, that deletes a
+  schema statement they derive again, or that edits the list of an axiom together with other
+  statements. The commit changes nothing, and the store stays as it was. Repair the existing
+  violation first; the commit is then accepted.
 - Labels and notes on a store with `owl:sameAs` read as `unsound`. Under `owl2-dl`, and under `owl2-ql`
   and `owl2-rl` where the QL rewriting answers, a query that reads an annotation property
   (`rdfs:label`, `rdfs:comment`, or one the data declares) or any predicate (a variable
   predicate, `DESCRIBE`) is `unsound` where the store holds `owl:sameAs` between two different
   terms, or an inferred annotation statement: the rules copy annotations across equal names, and
-  OWL 2 DL doesn't. The copies are still among the rows. Read the annotations as stated with
-  `infer=false`; under a ruleset's own closure without the rewriting the same reads stay
-  `sound-only`, since there the copies are right
+  OWL 2 DL doesn't. The same holds for statements of a SHACL property (`sh:path`, say) where the
+  store holds such an equality: SHACL content has no OWL meaning either. The copies are still
+  among the rows. Read the annotations as stated with `infer=false`; under a ruleset's own
+  closure without the rewriting the same reads stay `sound-only`, since there the copies are right
   ([the rule](spec/reasoning-semantics.md#annotation-copies)).
 - Under `owl2-dl`, an ontology with a part the reader leaves out is never told consistent:
   every verdict but an inconsistency is `unknown`. Where that part is one the OWL 2 RL rules
@@ -363,6 +368,30 @@ leave something out.
   `sound-only`, and each such read spends up to `dl.timeout` again.
   [`dl.threads`](ops/config-reference.md#dl.threads) doesn't confine this work. A store with
   heavy `owl2-dl` data on a server of its own avoids it.
+- <a id="inference-scoped-to-a-dataset"></a>A read with `inference-scope=dataset` is never certified
+  (`not-certified`). The first such read at a revision costs like computing the support graph
+  sets for the whole store, not for its graphs. Measured once on one machine, in an optimised
+  build at `918b1bd75`, on a generated store of 64 graphs with 1,000,000 asserted and 2,000,029
+  inferred statements under OWL 2 RL, held in memory, with the result cache off and 9 GiB of
+  query memory: the first scoped read of a revision took 23.4 s and 822 MB of query memory; the
+  same read again 204 ms and 10.5 MB; a read of another set of graphs 802 ms and 111 MB; the
+  read after a commit of one statement 215 ms, after one of 1,000 statements 415 ms. Their memory comes from the shared query budget, and
+  they aren't kept across a restart: with `inferred = "supported"` in the access policy they
+  are computed in the background at start, else the first scoped read after one computes them.
+  A commit updates them for what it changes; a bulk load, a rebuild of the inferences or a
+  schema change computes them again in full.
+- With `inference-scope=dataset`, text search, vector search and computed spatial relations
+  are refused (`501`).
+- An OWL list (of an intersection, a union, a property chain or a key, say) is read over the
+  whole store. Where statements in other graphs make it malformed (an `rdf:rest` back to one of
+  its nodes, or more than 64 member sequences), its rules are left out, so a read with
+  `inference-scope=dataset`, or a reader of some graphs who sees inferred statements by support,
+  can miss rows that the list's own graphs give.
+- A query whose dataset is named (`FROM`, or `default-graph-uri`) without
+  `inference-scope=dataset` reads the asserted statements of those graphs and none of the
+  inferred ones, which are in the default graph. Under `owl2-rl` its status is `sound-only`
+  with the reason of a read over the closure, which doesn't say that the inferred statements
+  are outside its dataset. For what follows from those graphs, add `inference-scope=dataset`.
 
 ## SHACL
 
@@ -467,7 +496,12 @@ leave something out.
   ([access control](ops/http-api.md#graph-level-access-control)).
 - A reader of some graphs who sees inferred statements by support (`inferred = "supported"`) is
   told `not-certified` for every read at a revision where a statement it can derive is also
-  asserted in a graph it can't read. Its answers are right, and so is the status, but the status
-  tells that reader that such an assertion exists.
+  asserted in a graph it can't read. The status tells that reader that such an assertion exists.
+  Its rows are right, but under the QL rewriting (`owl2-ql`, or `owl2-rl` with
+  `reasoner.ql_rewriting = "on"`) the rewriting doesn't run for it at such a revision, so a row
+  only the rewriting gives (one an existential leads to) can be missing there. Where the
+  rewriting runs for it, its limits under `owl2-rl` ([reasoning](#reasoning): a universal
+  restriction on `owl:topObjectProperty`, a store inconsistent only through an existential) hold
+  for this reader alike, `complete` included.
 - A refusal for memory or work can hint at how much data a reader of only some graphs may not see. v2.0 admits
   requests by what the reader sees.

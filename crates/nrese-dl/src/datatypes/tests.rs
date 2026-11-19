@@ -336,3 +336,47 @@ fn counting_clashes_need_every_unequal_variable() {
         assert_eq!(matches!(verdict, Verdict::Sat { .. }), sat, "{n}");
     }
 }
+
+/// Spec (*Structural Specification* §4: the facets are the datatype map's): the facets the
+/// reader accepts in a facet restriction ([`nrese_owl::mapping::FACETS`]) are exactly those the
+/// theory reads ([`Facet`]), each a data IRI of the reader's crate
+/// ([`nrese_owl::vocab::DATA_IRIS`]). A tenth facet fails to compile `position` here.
+#[test]
+fn the_reader_accepts_exactly_the_facets_the_theory_reads() {
+    use nrese_owl::{mapping::FACETS, vocab::DATA_IRIS};
+    use nrese_xsd::owl::Facet;
+    const EVERY: [Facet; 9] = [
+        Facet::MinInclusive,
+        Facet::MaxInclusive,
+        Facet::MinExclusive,
+        Facet::MaxExclusive,
+        Facet::Length,
+        Facet::MinLength,
+        Facet::MaxLength,
+        Facet::Pattern,
+        Facet::LangRange,
+    ];
+    let position = |facet: Facet| match facet {
+        Facet::MinInclusive => 0,
+        Facet::MaxInclusive => 1,
+        Facet::MinExclusive => 2,
+        Facet::MaxExclusive => 3,
+        Facet::Length => 4,
+        Facet::MinLength => 5,
+        Facet::MaxLength => 6,
+        Facet::Pattern => 7,
+        Facet::LangRange => 8,
+    };
+    assert!(EVERY.iter().enumerate().all(|(i, &f)| position(f) == i));
+    let mut read: Vec<usize> = (FACETS.iter())
+        .map(|iri| position(Facet::from_iri(iri).unwrap_or_else(|| panic!("{iri}: no facet"))))
+        .collect();
+    read.sort_unstable();
+    assert_eq!(read, (0..EVERY.len()).collect::<Vec<_>>(), "{FACETS:?}");
+    for facet in EVERY {
+        assert!(FACETS.contains(&facet.iri().as_str()), "{facet:?} not read");
+    }
+    for iri in FACETS {
+        assert!(DATA_IRIS.contains(&iri), "{iri} not among the data IRIs");
+    }
+}

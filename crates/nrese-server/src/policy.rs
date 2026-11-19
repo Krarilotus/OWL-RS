@@ -54,6 +54,35 @@ impl Default for PolicyConfig {
 }
 
 impl PolicyConfig {
+    pub fn challenge(&self, headers: &axum::http::HeaderMap) -> Option<&'static str> {
+        const BASIC: &str = "Basic realm=\"nrese\", charset=\"UTF-8\"";
+        // Certificate-only refusals retain their status without naming an HTTP scheme.
+        if !self.local_logins && matches!(self.auth, AuthConfig::Mtls(_)) {
+            return None;
+        }
+        let scheme = headers
+            .get("authorization")
+            .and_then(|h| {
+                h.as_bytes()
+                    .split(u8::is_ascii_whitespace)
+                    .find(|s| !s.is_empty())
+            })
+            .unwrap_or_default();
+        if scheme.eq_ignore_ascii_case(b"Basic") {
+            return Some(BASIC);
+        }
+        let fetch = headers
+            .get("sec-fetch-mode")
+            .is_some_and(|h| h != "navigate");
+        Some(
+            if scheme.eq_ignore_ascii_case(b"Bearer") || fetch || !self.local_logins {
+                "Bearer"
+            } else {
+                "Basic realm=\"nrese\", charset=\"UTF-8\", Bearer"
+            },
+        )
+    }
+
     pub fn enforce_query_bytes(&self, size: usize) -> Result<(), ApiError> {
         enforce_size_limit("query", size, self.limits.max_query_bytes)
     }

@@ -1,4 +1,4 @@
-# A datamodel module as the Datamodel Workflow exports it: classes and properties of one
+# A data-model module as a data-modelling application exports it: classes and properties of one
 # module version, in a graph of its own.
 @prefix ex: <https://example.org/model/petitions#> .
 @prefix owl: <http://www.w3.org/2002/07/owl#> .

@@ -78,6 +78,11 @@ impl Terms for Table {
     fn datatype(&self, _: Term) -> Option<String> {
         None
     }
+
+    fn iri_text(&self, term: Term) -> Option<String> {
+        let text = self.terms[term as usize].strip_prefix('<')?;
+        Some(text.strip_suffix('>')?.to_owned())
+    }
 }
 
 impl nrese_reasoner::ir::Vocabulary for Table {

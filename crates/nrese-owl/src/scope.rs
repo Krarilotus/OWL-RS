@@ -1900,7 +1900,7 @@ impl Builder<'_> {
                 Axiom::DisjointClasses(sorted(vec![self.class(*x), self.class(*y)]))
             }
             Ax::DisjointUnion(k, x, y) => Axiom::DisjointUnion(
-                u.classes[*k as usize],
+                self.e(ClassExpr::Class(u.classes[*k as usize])),
                 sorted(vec![self.class(*x), self.class(*y)]),
             ),
             Ax::SubObjectPropertyOf(chain, sup) => {

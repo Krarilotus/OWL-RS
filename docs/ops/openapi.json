@@ -238,8 +238,15 @@
             "type": "array"
           },
           "protocol": {
-            "description": "`dmw-store-check/1`.",
+            "description": "The protocol's earlier name, named here until clients read `protocols`.",
             "type": "string"
+          },
+          "protocols": {
+            "description": "Every name a request may give the protocol by, the preferred (`store-check/1`) first.",
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
           },
           "semantics": {
             "description": "What the checks mean; a change of meaning gets a new identifier.",
@@ -251,6 +258,7 @@
         },
         "required": [
           "protocol",
+          "protocols",
           "operations",
           "profiles",
           "semantics",
@@ -6896,7 +6904,7 @@
       "name": "queries"
     },
     {
-      "description": "Isolated checks of pinned inputs for the Datamodel Workflow (dmw-store-check/1); no repository is read or written",
+      "description": "Isolated checks of pinned inputs for a data-modelling application (store-check/1); no repository is read or written",
       "name": "draft-check"
     },
     {

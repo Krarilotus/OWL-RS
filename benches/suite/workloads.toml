@@ -458,11 +458,11 @@ note = "Tier = CASE~SEMANTICS (benches/fast/compete.py prepares the data in the 
 # --- the consumers ---------------------------------------------------------------------------
 
 [clients]
-title = "ResearchSpace on the store; the Datamodel Workflow's export protocol"
+title = "ResearchSpace on the store; a data-modelling application's export protocol"
 kind = "conformance"
 tasks = ["integration"]
 needs = ["query", "update"]
-source = "scripts/smoke-researchspace.sh, scripts/smoke-dmw-export.sh"
+source = "scripts/smoke-researchspace.sh, scripts/smoke-module-export.sh"
 licence = "ours"
 tiers = ["-"]
 state = "ready"

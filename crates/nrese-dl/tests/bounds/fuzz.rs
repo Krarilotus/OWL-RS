@@ -130,8 +130,7 @@ impl Interp {
             Axiom::DisjointClasses(xs) => disjoint(&xs.iter().map(|&x| c(x)).collect::<Vec<_>>()),
             Axiom::DisjointUnion(class, xs) => {
                 let parts: Vec<u128> = xs.iter().map(|&x| c(x)).collect();
-                let named = self.concepts.get(class).copied().unwrap_or(0);
-                named == parts.iter().fold(0, |m, p| m | p) && disjoint(&parts)
+                c(*class) == parts.iter().fold(0, |m, p| m | p) && disjoint(&parts)
             }
             Axiom::SubObjectPropertyOf(chain, sup) => {
                 let (got, have) = (self.compose(chain), self.rel(*sup));

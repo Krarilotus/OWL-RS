@@ -12,7 +12,7 @@ NRESE is an RDF database and ontology platform that reads like QLever and govern
 - Hardware-aware and scalable: it uses every core, the memory, the CPU features and GPUs of the machine it runs on, and scales out to clusters where a use case gains from it; each derived setting can be overridden.
 - One consolidated engine API: the protocols and the one frontend are thin translations of the core's operations.
 
-Its first users are ResearchSpace (adapted to NRESE, ADR-0006) and the datamodel workflow, which exports reviewed, provenance-carrying data into it; both must work end to end. Beyond them, the connectors reach as many users as possible (GraphDB Workbench and RDF4J clients, Jena, rdflib, Protégé).
+Its first users are ResearchSpace (adapted to NRESE, ADR-0006) and a data-modelling application, which exports reviewed, provenance-carrying data into it; both must work end to end. Beyond them, the connectors reach as many users as possible (GraphDB Workbench and RDF4J clients, Jena, rdflib, Protégé).
 
 ## In scope
 

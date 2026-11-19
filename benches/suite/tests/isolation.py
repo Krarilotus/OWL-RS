@@ -8,7 +8,7 @@ commits emptied and a branch moved by tests under the hook). A caller's configur
 test repository too (GIT_CONFIG_GLOBAL, GIT_CONFIG_SYSTEM, GIT_CONFIG_COUNT: a core.hooksPath ran
 an outside hook in a test's own repository). And a test that read this
 repository's history passed where the history was kept and failed where it wasn't (27 Oct 2026:
-commit ids from before a rewrite, on fleet hosts that had pruned them). So importing this module,
+commit ids that fleet hosts had pruned). So importing this module,
 once for the whole run, for the tests and every process they start:
 
 - removes every GIT_* variable but ALLOWED (none: a test sets what it needs itself), and the

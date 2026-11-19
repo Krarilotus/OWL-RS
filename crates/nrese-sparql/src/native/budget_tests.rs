@@ -570,7 +570,7 @@ fn rows_of(rows: Result<usize, String>, n: usize) -> Result<(), String> {
 /// Cases, each at two sizes:
 /// - `<h> (p|missing) ?y` over 2^k + 1 statements (T1): the union's vector has room for 2^(k+1)
 ///   ends; moved into its column, its whole capacity stays charged (it was released down to
-///   its length, then charged again, at 6449d5cd).
+///   its length, then charged again, at 2510b6e0).
 /// - `?x (p|missing) ?y` (T2): the pairs' columns are made beside the pairs, whose charge
 ///   goes only once they are freed.
 /// - T2 under a limit of its answer's two columns alone, n ids each (T3), which the pairs

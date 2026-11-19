@@ -28,6 +28,9 @@ use super::{Context, NativeResult};
 pub(super) struct Values<'a> {
     terms: &'a HashMap<Variable, Term>,
     triples: HashMap<Variable, NamedNode>,
+    /// What a variable puts in a triple's predicate where that is not its value
+    /// ([`super::canonical::Names::values`]).
+    predicates: Option<&'a HashMap<Variable, NamedNode>>,
 }
 
 impl<'a> Values<'a> {
@@ -44,7 +47,20 @@ impl<'a> Values<'a> {
                 triples.insert(variable.clone(), name);
             }
         }
-        Ok(Self { terms, triples })
+        Ok(Self {
+            terms,
+            triples,
+            predicates: None,
+        })
+    }
+
+    /// These values, a variable in a triple's predicate put in as `predicates` gives it
+    /// where it gives one.
+    pub(super) fn with_predicates(self, predicates: &'a HashMap<Variable, NamedNode>) -> Self {
+        Self {
+            predicates: Some(predicates),
+            ..self
+        }
     }
 
     fn constant(&self, variable: &Variable) -> Option<Constant> {
@@ -82,7 +98,14 @@ impl<'a> Values<'a> {
     fn triple(&self, triple: &TriplePattern) -> TriplePattern {
         TriplePattern {
             subject: self.term_pattern(&triple.subject),
-            predicate: self.named_node_pattern(&triple.predicate),
+            predicate: match &triple.predicate {
+                NamedNodePattern::Variable(v)
+                    if let Some(n) = self.predicates.and_then(|p| p.get(v)) =>
+                {
+                    NamedNodePattern::NamedNode(n.clone())
+                }
+                predicate => self.named_node_pattern(predicate),
+            },
             object: self.term_pattern(&triple.object),
         }
     }
@@ -288,6 +311,7 @@ impl<'a> Values<'a> {
                         Values {
                             terms: &visible,
                             triples: self.triples.clone(),
+                            predicates: self.predicates,
                         }
                         .pattern(inner),
                     )
@@ -401,6 +425,7 @@ mod tests {
         let text = Values {
             terms: &terms,
             triples: HashMap::new(),
+            predicates: None,
         }
         .pattern(&pattern)
         .to_string();

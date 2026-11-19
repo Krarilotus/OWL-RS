@@ -229,19 +229,26 @@ pub(crate) fn read_snapshot<B: std::ops::Deref<Target = nrese_exec::Budget>>(
     snapshot: &Snapshot,
     budget: B,
 ) -> Result<Ontology, nrese_exec::BudgetExceeded> {
+    Ok(read_premise(snapshot, budget)?.0)
+}
+
+/// [`read_snapshot`], with the statements it read, which a conclusion is read beside
+/// (`nrese_owl::read_beside`).
+pub(crate) fn read_premise<B: std::ops::Deref<Target = nrese_exec::Budget>>(
+    snapshot: &Snapshot,
+    budget: B,
+) -> Result<(Ontology, nrese_exec::ChargedVec<Statement, B>), nrese_exec::BudgetExceeded> {
     let statements = statements(
         snapshot.quads_for_pattern_in(ReadModel::Asserted, &ANY),
         budget,
     )?;
     let decode = |id| snapshot.decode(id);
     let lookup = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
-    Ok(nrese_owl::read(
-        &statements,
-        &StoreTerms {
-            decode: &decode,
-            lookup: &lookup,
-        },
-    ))
+    let terms = StoreTerms {
+        decode: &decode,
+        lookup: &lookup,
+    };
+    Ok((nrese_owl::read(&statements, &terms), statements))
 }
 
 /// Why an ontology wasn't read: its statements didn't fit `budget`'s memory.

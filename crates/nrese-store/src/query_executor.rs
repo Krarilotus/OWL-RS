@@ -118,6 +118,8 @@ pub struct PreparedQuery {
     holds_rdf12: std::sync::Arc<OnceLock<bool>>,
     /// Under `owl2-dl`: which answers this query asks for (`None`: `dl.answers`).
     dl_answers: Option<crate::DlAnswers>,
+    /// Under `owl2-dl`: when the request's time is up (`None`: `dl.timeout` alone).
+    deadline: Option<std::time::Instant>,
     /// Told when the query is handed to the executor ([`Self::on_evaluation`]).
     on_evaluation: Option<OnEvaluation>,
     /// What the status's composition reads of the query, found once ([`Self::reads`]).
@@ -199,6 +201,7 @@ impl PreparedQuery {
             rdf12: false,
             holds_rdf12: Default::default(),
             dl_answers: request.dl_answers,
+            deadline: request.deadline,
             on_evaluation: None,
             reads: crate::dl::query::Reads::new(request.scope.access().cloned()),
         })
@@ -317,6 +320,11 @@ impl PreparedQuery {
     /// Under `owl2-dl`: which answers the query asks for (`None`: the store's setting).
     pub fn dl_answers(&self) -> Option<crate::DlAnswers> {
         self.dl_answers
+    }
+
+    /// Under `owl2-dl`: when the request's time is up (`None`: `dl.timeout` alone).
+    pub(crate) fn deadline(&self) -> Option<std::time::Instant> {
+        self.deadline
     }
 
     /// The graphs the query may read; `None`: every graph.
@@ -748,8 +756,9 @@ pub(crate) fn plan_prepared(
 
 /// The options `prepared` runs with, for execution and explanation alike, drawing from
 /// the request's envelope `memory` ([`StoreSettings::envelope`]). The QL rewriting and
-/// whether the stack is closed under `owl:sameAs` are `view`'s certificate's: none without
-/// one, so a read never takes them from another version.
+/// whether the stack is closed under `owl:sameAs` are how `view`'s rows are produced: its
+/// certificate's for rows ([`crate::service::Certificate::for_rows`]), kept by a view whose
+/// claim is withheld; none without one, so a read never takes them from another version.
 fn query_options(
     view: &impl ReadView,
     prepared: &PreparedQuery,
@@ -757,7 +766,9 @@ fn query_options(
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
 ) -> QueryOptions {
-    let certificate = view.snapshot().and_then(crate::service::Certificate::of);
+    let certificate = view
+        .snapshot()
+        .and_then(crate::service::Certificate::for_rows);
     QueryOptions {
         dataset: prepared.dataset.clone(),
         resources: nrese_sparql::Resources {

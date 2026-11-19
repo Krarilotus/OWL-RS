@@ -203,7 +203,8 @@ impl Signature {
         for axiom in &ontology.axioms {
             let mut role = |ps: &[ObjProp]| roles.extend(ps.iter().map(|p| p.named()));
             match axiom {
-                Axiom::Declaration(EntityKind::Class, t) | Axiom::DisjointUnion(t, _) => {
+                // A disjoint union's named class is among the expressions above.
+                Axiom::Declaration(EntityKind::Class, t) => {
                     classes.insert(*t);
                 }
                 Axiom::Declaration(EntityKind::ObjectProperty, t) => role(&[ObjProp::Named(*t)]),

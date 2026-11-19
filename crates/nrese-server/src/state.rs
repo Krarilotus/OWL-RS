@@ -29,6 +29,8 @@ pub struct AppState {
 /// What [`AppState`] shares with its clones and every repository's state.
 #[derive(Clone)]
 struct Shared {
+    /// The server URL clients reach, including its proxy path prefix, if configured.
+    public_url: Option<String>,
     ready: Arc<AtomicBool>,
     ai: Arc<AiSuggestionService>,
     deployment_posture: DeploymentPosture,
@@ -91,6 +93,7 @@ impl AppState {
             policy: Arc::new(policy),
             repository: Arc::from(DEFAULT_REPOSITORY),
             shared: Arc::new(Shared {
+                public_url: None,
                 default_unavailable,
                 ready: Arc::new(AtomicBool::new(false)),
                 ai: Arc::new(ai),
@@ -140,9 +143,9 @@ impl AppState {
             return Ok(None);
         };
         let identity = |user: String| crate::auth::Identity {
-            admin: false,
-            roles: std::collections::BTreeSet::new(),
             user: Some(user),
+            local: true,
+            ..Default::default()
         };
         if let Some(token) = value
             .strip_prefix("Bearer ")
@@ -200,7 +203,12 @@ impl AppState {
     /// What `identity` may read and write in this state's repository.
     pub fn access_view(&self, identity: &crate::auth::Identity) -> crate::access::AccessView {
         let principal = crate::access::principal(identity);
-        let mut view = self.shared.access.view(&principal, &self.repository);
+        // The state admits local logins' writes, and others' unless credentials (admin, none) do.
+        use nrese_store::access::Grant::{Login, Write};
+        let credentials = identity.admin || self.policy.auth == crate::auth::AuthConfig::None;
+        let by_state = identity.local || !credentials;
+        let grant = by_state.then_some(if identity.local { Login } else { Write });
+        let mut view = (self.shared.access).view_checked(&principal, &self.repository, grant);
         view.origin = Some(principal.display());
         view
     }
@@ -302,6 +310,18 @@ impl AppState {
     /// This server's part in replication ([`crate::replication`]).
     pub fn replication(&self) -> &crate::replication::ReplicationState {
         &self.shared.replication
+    }
+
+    /// Sets the externally reachable URL once at server startup.
+    /// Startup passes ServerConfig's validated URL; in-process callers are trusted.
+    pub fn with_public_url(mut self, public_url: Option<String>) -> Self {
+        Arc::make_mut(&mut self.shared).public_url = public_url;
+        self
+    }
+
+    /// The externally reachable server URL, if configured.
+    pub fn public_url(&self) -> Option<&str> {
+        self.shared.public_url.as_deref()
     }
 
     pub fn store(&self) -> Arc<StoreService> {
@@ -426,12 +446,17 @@ impl AppState {
         headers: &HeaderMap,
         client: Option<std::net::IpAddr>,
     ) -> Result<crate::auth::Authenticated, ApiError> {
-        match self.local_identity(headers, client).await? {
-            Some(mut identity) => {
+        let challenged = |error: ApiError| error.with_challenge(self.policy.challenge(headers));
+        match self
+            .local_identity(headers, client)
+            .await
+            .map_err(challenged)?
+        {
+            Some(identity) => {
                 let principal = crate::access::principal(&identity);
-                identity.admin = self.shared.access.state().is_admin(&principal);
+                let admin = self.shared.access.state().is_admin(&principal);
                 let mut grants = std::collections::BTreeSet::from([crate::auth::AccessGrant::Read]);
-                if identity.admin {
+                if admin {
                     grants.insert(crate::auth::AccessGrant::Admin);
                 }
                 Ok(crate::auth::Authenticated {
@@ -441,7 +466,12 @@ impl AppState {
                     refusal: "the local login does not grant access to this endpoint",
                 })
             }
-            None => self.policy.auth.authenticate(headers).await,
+            None => self
+                .policy
+                .auth
+                .authenticate(headers)
+                .await
+                .map_err(challenged),
         }
     }
 

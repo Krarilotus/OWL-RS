@@ -41,6 +41,7 @@ mod restricted_evidence_tests;
 mod rule_names_tests;
 mod scope_tests;
 mod search_scope_tests;
+mod session_schedule_tests;
 mod shacl_gate_tests;
 mod shacl_request_shapes_tests;
 mod speculative_tests;

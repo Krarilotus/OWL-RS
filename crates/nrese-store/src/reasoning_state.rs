@@ -348,7 +348,7 @@ mod tests {
         use nrese_rdf::NamedNode;
         use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
         use std::sync::Arc;
-        /// The marker of an on-disk OWL 2 RL store under semantics version 2 (dfe8b71f,
+        /// The marker of an on-disk OWL 2 RL store under semantics version 2 (b36d7316,
         /// fleet lane-m-g2-w1-marker-probe).
         const VERSION_2: &str =
             "ruleset owl2-rl\nfingerprint 9ba81328ee5cf5c7\nviolations 0\nlists nil-class\n";

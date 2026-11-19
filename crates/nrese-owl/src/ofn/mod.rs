@@ -120,6 +120,7 @@ impl<'a> FunctionalReader<'a> {
         model.annotation_schema.dedup();
         let mut ontology = Ontology {
             annotation_schema: model.annotation_schema,
+            shacl: BTreeSet::new(),
             classes: model.classes,
             ranges: model.ranges,
             sources: vec![Vec::new(); axioms.len()],
@@ -133,6 +134,8 @@ impl<'a> FunctionalReader<'a> {
             // Functional syntax writes a cardinality as a number: no spelling to mark.
             noncanonical_cardinality: None,
             empty_list: None,
+            // The route reads triples only, through the RDF reader.
+            rules_unread: None,
             qualified_data_max: model.qualified_data_max,
         };
         crate::mapping::complete(&mut ontology, terms);

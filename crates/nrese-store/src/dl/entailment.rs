@@ -13,7 +13,7 @@ use nrese_owl::{Axiom, Characteristic, ClassExpr, DataRange, ExprId, ObjProp, On
 use super::consistency::{self, Budget, Verdict};
 
 mod batch;
-pub(crate) use batch::{Batch, Test};
+pub(crate) use batch::{Batch, Test, compile};
 
 /// Whether an axiom (or every axiom of a set) is entailed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,7 +106,7 @@ impl Import<'_> {
             Axiom::SubClassOf(a, b) => Axiom::SubClassOf(self.class(*a), self.class(*b)),
             Axiom::EquivalentClasses(v) => Axiom::EquivalentClasses(classes(v, self)),
             Axiom::DisjointClasses(v) => Axiom::DisjointClasses(classes(v, self)),
-            Axiom::DisjointUnion(c, v) => Axiom::DisjointUnion(*c, classes(v, self)),
+            Axiom::DisjointUnion(c, v) => Axiom::DisjointUnion(self.class(*c), classes(v, self)),
             Axiom::ObjectPropertyDomain(p, c) => Axiom::ObjectPropertyDomain(*p, self.class(*c)),
             Axiom::ObjectPropertyRange(p, c) => Axiom::ObjectPropertyRange(*p, self.class(*c)),
             Axiom::DataPropertyDomain(d, c) => Axiom::DataPropertyDomain(*d, self.class(*c)),

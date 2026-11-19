@@ -12,7 +12,7 @@
 #   fleet_results                 the directory its results were fetched to
 #   fleet_cancel                  cancels it (also on an interrupt)
 #   q TEXT                        TEXT as a TOML string
-fleet_bin=${NRESE_FLEET_BIN:-$(git config --get nrese.fleetBin || echo C:/Users/Johannes/Documents/fleet-scheduler/state/owlrs/bin/fleet.exe)}
+fleet_bin=${NRESE_FLEET_BIN:-$(git config --get nrese.fleetBin || echo ${HOME:+"$HOME"/Documents/fleet-scheduler/state/owlrs/bin/fleet.exe})}
 fleet_id=""
 fleet_state=""
 # The fleet's name for the host the job last ran on (fleet_follow).

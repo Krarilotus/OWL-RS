@@ -1,8 +1,9 @@
-//! Draft checks over HTTP (`dmw-store-check/1`): the capabilities, an answered check that
-//! echoes the request's identity, and the requests the server refuses.
+//! Draft checks over HTTP (`store-check/1`, and its earlier name): the capabilities, an
+//! answered check that echoes the request's identity, and the requests the server refuses.
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
+use nrese_store::DRAFT_CHECK_PROTOCOL_EARLIER;
 use serde_json::{Value, json};
 use tower::util::ServiceExt;
 
@@ -41,7 +42,7 @@ async fn capabilities(app: &axum::Router) -> Result<Value, Box<dyn std::error::E
 
 fn request(capabilities: &Value) -> Value {
     json!({
-        "protocol": "dmw-store-check/1",
+        "protocol": "store-check/1",
         "operation": "shacl",
         "request_sha256": "a".repeat(64),
         "scope": {"project_id": "project", "owner_id": "owner"},
@@ -64,7 +65,12 @@ async fn check(app: &axum::Router, body: Value) -> Result<Value, Box<dyn std::er
 async fn the_capabilities_name_the_protocol_operations_and_build() -> TestResult {
     let app = test_app()?;
     let declared = capabilities(&app).await?;
-    assert_eq!(declared["protocol"], "dmw-store-check/1");
+    // `protocol` keeps the earlier name, which today's clients compare and send back.
+    assert_eq!(declared["protocol"], DRAFT_CHECK_PROTOCOL_EARLIER);
+    assert_eq!(
+        declared["protocols"],
+        json!(["store-check/1", DRAFT_CHECK_PROTOCOL_EARLIER])
+    );
     assert_eq!(
         declared["operations"],
         json!(["shacl", "query", "reasoning"])
@@ -176,6 +182,41 @@ async fn requests_the_server_cannot_answer_as_asked_are_refused_in_the_reply() -
             .as_str()
             .is_some_and(|detail| detail.contains("@active_data"))
     );
+    Ok(())
+}
+
+/// Today's client reads the capabilities, checks that `protocol` is the earlier name and
+/// sends `protocol`, `build_id` and the first `semantics` back, with every input given (the
+/// unused ones empty). It gets the answer a request under `store-check/1` gets, byte for
+/// byte, for its reasoning check and for a query.
+#[tokio::test]
+async fn the_earlier_protocol_name_gets_the_same_answer() -> TestResult {
+    let app = test_app()?;
+    let declared = capabilities(&app).await?;
+    assert_eq!(declared["protocol"], DRAFT_CHECK_PROTOCOL_EARLIER);
+    let schema = format!("<{EX}Impossible> <{RDFS}subClassOf> <{OWL}Nothing> .\n");
+    let mut reasoning = request(&declared);
+    reasoning["operation"] = json!("reasoning");
+    reasoning["inputs"] = json!({"data": "", "schema": schema, "shapes": "", "query": ""});
+    let mut query = request(&declared);
+    query["operation"] = json!("query");
+    let ask = format!("ASK {{ ?s a <{EX}Person> }}");
+    query["inputs"] = json!({"data": DATA, "schema": "", "shapes": "", "query": ask});
+    for asked in [reasoning, query] {
+        let mut earlier = asked.clone();
+        earlier["protocol"] = declared["protocol"].clone();
+        let (status, by_earlier) =
+            call(&app, Method::POST, "/api/v1/draft-check", Some(earlier)).await?;
+        assert_eq!(status, StatusCode::OK, "{by_earlier}");
+        let (status, by_name) =
+            call(&app, Method::POST, "/api/v1/draft-check", Some(asked)).await?;
+        assert_eq!(status, StatusCode::OK, "{by_name}");
+        assert_eq!(by_earlier, by_name);
+        assert!(
+            by_name.contains("\"terminal_status\":\"completed\""),
+            "{by_name}"
+        );
+    }
     Ok(())
 }
 

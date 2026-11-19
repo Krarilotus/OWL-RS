@@ -57,7 +57,7 @@ times.
 - The server crate shrinks to routing, authentication, request limits and protocol
   translation; its tests become protocol conformance tests, the semantics' tests move to
   the store.
-- The DMW and ResearchSpace flows are tested end to end against the protocols they use,
-  and every management operation through `/api/v1`.
+- A data-modelling application's and ResearchSpace's flows are tested end to end against
+  the protocols they use, and every management operation through `/api/v1`.
 - A generated OpenAPI description needs a schema crate (`utoipa`, MIT/Apache-2.0) in the
   server; its types are the contract, so changing them is an API change.
