@@ -709,7 +709,7 @@ fn a_late_build_of_an_older_version_leaves_the_newer_entry() {
     let entry = Arc::new(Representatives::new());
     let slot = std::sync::Mutex::new(Some((newer.clone(), Arc::clone(&entry))));
     let state = older.shared_state().expect("a published snapshot");
-    let got = admit(&mut slot.lock().unwrap(), &state);
+    let got = admit(&slot, &state);
 
     let kept = slot.lock().unwrap();
     let (at, held) = kept.as_ref().expect("an entry");

@@ -157,17 +157,30 @@ fn build(snapshot: &Snapshot) -> Representatives {
     out
 }
 
-/// `state`'s representatives admitted to the process-wide entry, replacing what it held: the
-/// entry's only writer, for published state alone. They are built from the token's own
-/// snapshot and kept with it.
+/// `state`'s representatives admitted to the process-wide entry `cache`: the entry's only
+/// writer, for published state alone. They are built from the token's own snapshot without
+/// the lock, so no other query waits for this build, and kept with it. Builds that race for
+/// one version each build; the first to publish wins and the others are dropped. An entry
+/// for a later revision of the same engine stays: published snapshots of one engine share
+/// its dictionary, and no two engines share one.
 pub(super) fn admit(
-    cache: &mut Option<(Snapshot, Arc<Representatives>)>,
+    cache: &Mutex<Option<(Snapshot, Arc<Representatives>)>>,
     state: &SharedState<'_>,
 ) -> Arc<Representatives> {
     let snapshot = state.snapshot();
-    let representatives = Arc::new(build(snapshot));
-    *cache = Some((snapshot.clone(), Arc::clone(&representatives)));
-    representatives
+    let built = Arc::new(build(snapshot));
+    let mut cache = cache.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some((kept, representatives)) = cache.as_ref() {
+        if kept.same_version(snapshot) {
+            return Arc::clone(representatives);
+        }
+        if kept.shares_dictionary_with(snapshot) && kept.revision() > snapshot.revision() {
+            return built;
+        }
+    }
+    // A tie on revision can't be ordered (no public commit time): the last writer wins.
+    *cache = Some((snapshot.clone(), Arc::clone(&built)));
+    built
 }
 
 impl Context<'_> {
@@ -198,16 +211,16 @@ impl Context<'_> {
     /// The published entry's representatives for this query's version; else, for a published
     /// snapshot, its own admitted; else built for this query alone.
     fn find_representatives(&self) -> Option<(Arc<Representatives>, Option<Reservation>)> {
-        let mut cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
+        let cache = CACHE.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some((kept, representatives)) = cache.as_ref()
             && kept.same_version(&self.snapshot)
         {
             return Some((Arc::clone(representatives), None));
         }
-        if let Some(state) = self.snapshot.shared_state() {
-            return Some((admit(&mut cache, &state), None));
-        }
         drop(cache);
+        if let Some(state) = self.snapshot.shared_state() {
+            return Some((admit(&CACHE, &state), None));
+        }
         // Unpublished: built for this query alone and kept nowhere else, what they hold
         // charged to the query's budget before it is allocated. Where the budget has no room
         // for them, the query goes on without: they only let a join run on one identity per
