@@ -465,7 +465,7 @@ pub(super) fn i3<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
 // §2 invariant 3, Pw3 and P16: the applied or published tags agree with write receipts.
 pub(super) fn i4<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) -> bool {
     let txn = store.transaction(client);
-    let valid = |tags| client.acknowledged & !tags == 0 && client.refused & tags == 0;
+    let valid = |tags: u8| client.acknowledged & !tags == 0 && client.refused & tags == 0;
     !txn.published_twice
         && (!(store.at_swap == Some(client.transaction)
             || (txn.mapped && !store.retired && txn.end.is_none() && !txn.worker))
