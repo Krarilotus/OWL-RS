@@ -361,6 +361,14 @@ leave something out.
   contradicts, isn't caught by the OWL 2 RL rules' incremental check.
 - Under `owl2-dl`, an OWL 2 RL clash in an ontology with an empty intersection or union is
   stated as undecided, not as an inconsistency.
+- Under `owl2-dl`, a blank node that no axiom uses but that carries two class structures at
+  once (an `owl:intersectionOf` beside an `owl:allValuesFrom` restriction, or an `owl:hasValue`
+  beside an `owl:allValuesFrom`) isn't OWL 2 DL. The OWL reader leaves it unused and the commit is taken, but the
+  OWL 2 RL rules still apply both structures, so an answer can be told `complete` that OWL 2 DL
+  doesn't entail. For one: with `_:x owl:intersectionOf ( :A :B ) ; owl:onProperty :p ;
+  owl:allValuesFrom :D` and `:x a :A , :B . :x :p :y`, `ASK { :y a :D }` is `true`, told
+  `complete`; the earlier `main` gives the same answer, with no status. Structures of this
+  kind can do the same.
 - Labels and notes on a store with `owl:sameAs` read as `unsound`. Under `owl2-dl`, and under `owl2-ql`
   and `owl2-rl` where the QL rewriting answers, a query that reads an annotation property
   (`rdfs:label`, `rdfs:comment`, or one the data declares) or any predicate (a variable
