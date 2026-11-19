@@ -983,3 +983,38 @@ fn a_written_search_stays_one_under_canonical_names() {
         hits,
     );
 }
+
+/// Spec: under canonical answers, a search the request puts in stays a search, and the
+/// pre-bound value is its class's elsewhere. `?p` is pre-bound to `bds:search`, whose class's
+/// representative is `ex:find`: `?o ?p "alpha"` is the search (its two hits), and
+/// `sameTerm(?p, ex:find)` holds in a filter, alone (`a` and `b`, by their labels) and beside
+/// the search.
+#[test]
+fn a_pre_bound_search_is_one_and_its_class_s_name_elsewhere() {
+    let engine = equal_names_engine(false);
+    let search = NamedNode::new_unchecked("http://www.bigdata.com/rdf/search#search");
+    let values = std::collections::HashMap::from([(
+        nrese_rdf::Variable::new_unchecked("p"),
+        Term::from(search),
+    )]);
+    let options = QueryOptions {
+        pre_bound: Some(std::sync::Arc::new(values)),
+        ..canonical()
+    };
+    let hits: &[&[&str]] = &[&["alpha one"], &["alpha two"]];
+    for (shape, query, want) in [
+        ("the search", "SELECT ?o { ?o ?p \"alpha\" }", hits),
+        (
+            "its name in a filter",
+            "SELECT ?s { ?s rdfs:label ?l FILTER(sameTerm(?p, ex:find)) }",
+            &[&["a"], &["b"]],
+        ),
+        (
+            "both",
+            "SELECT ?o { ?o ?p \"alpha\" FILTER(sameTerm(?p, ex:find)) }",
+            hits,
+        ),
+    ] {
+        answers_as_written_with(&engine, shape, query, options.clone(), want);
+    }
+}
