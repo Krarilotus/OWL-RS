@@ -23,6 +23,23 @@ fn is_consistent(d: &nrese_dl::beyond::Decision) -> bool {
     }
 }
 
+/// A name declared an object and a data property is a name of two kinds an axiom reads
+/// (Structural Specification §5.8.1), which the DL engines read as one name: no model of
+/// theirs speaks of the input, which is undecided, never certified consistent.
+#[test]
+fn a_name_declared_two_kinds_is_never_certified() {
+    let d = decide(
+        "Declaration(ObjectProperty(:p)) Declaration(DataProperty(:p)) \
+         ObjectPropertyAssertion(:p :a :b)",
+    );
+    assert!(
+        matches!(d.verdict, Verdict::Undecided(_)),
+        "{:?}\n{:#?}",
+        d.verdict,
+        d.tried
+    );
+}
+
 /// A rule whose body the assertions state: its head is added outright (the chase), and
 /// contradicts the DL part.
 #[test]

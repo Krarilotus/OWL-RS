@@ -298,6 +298,43 @@ fn a_name_used_as_two_kinds_is_reported_with_whether_an_axiom_names_it() {
     }
 }
 
+/// Spec (§5.8.1; *Mapping to RDF* Table 17: `*:a rdfs:subPropertyOf *:b` of an annotation
+/// property is `SubAnnotationPropertyOf(*:a *:b)`, its two operands annotation properties): an
+/// annotation axiom names both its properties, so its super-property, an object property's
+/// assertion's too, is a name of two kinds an axiom reads; in RDF and in the functional
+/// syntax.
+#[test]
+fn an_annotation_axiom_names_both_its_properties() {
+    let expected = [("p".to_owned(), OBJECT_ANNOTATION, true)];
+    assert_eq!(
+        turtle("ex:note a owl:AnnotationProperty ; rdfs:subPropertyOf ex:p . ex:a ex:p ex:b ."),
+        expected,
+        "RDF"
+    );
+    assert_eq!(
+        functional(
+            "",
+            "AnnotationProperty",
+            "SubAnnotationPropertyOf(:x :p) ObjectPropertyAssertion(:p :a :b)"
+        ),
+        expected,
+        "the functional syntax"
+    );
+}
+
+/// Spec (*Mapping to RDF* Table 10: a statement about the ontology is an annotation unless its
+/// property is an object or data property; a characteristic such as `owl:TransitiveProperty`
+/// reads its subject as an object property but declares nothing, Structural Specification
+/// §5.8): a header statement of a property only made transitive is an annotation, so the
+/// property is a name of two kinds, which its characteristic, an axiom, reads.
+#[test]
+fn a_characteristic_declares_no_property_for_the_header() {
+    assert_eq!(
+        turtle("ex:p a owl:TransitiveProperty . ex:ont a owl:Ontology ; ex:p ex:b ."),
+        [("p".to_owned(), OBJECT_ANNOTATION, true)]
+    );
+}
+
 /// Spec (§5.8.1 constrains properties, classes and datatypes only; §5.9: a name may be an
 /// individual and a class or a property, and a class and an object property): no name of a
 /// valid OWL 2 DL ontology is reported. Every construct of the functional syntax; a class and

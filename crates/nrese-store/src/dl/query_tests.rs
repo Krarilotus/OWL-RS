@@ -1162,11 +1162,11 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
                 // Pending: the base's record, where it has one.
                 ("pending", Some(Some(why))) => Some(why.clone()),
                 ("committed", Some(_)) => full.clone(),
-                // The limit: a part left out that no record tells (a pending addition, a
-                // revision the store didn't check) comes after the indexes' decision.
-                _ if left => match (by_index(read), &record) {
-                    (Some(Some(why)), _) => Some(why),
-                    (Some(None), Some(None)) => None,
+                // The limit: a part left out that no record tells (a revision the store
+                // didn't check) comes after the indexes' decision. A pending read takes no
+                // clean record from its base: it reads its own data.
+                _ if left => match by_index(read) {
+                    Some(Some(why)) => Some(why),
                     _ => full.clone(),
                 },
                 _ => full.clone(),

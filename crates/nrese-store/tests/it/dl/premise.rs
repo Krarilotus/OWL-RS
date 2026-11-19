@@ -237,6 +237,20 @@ fn a_kept_upper_bound_takes_the_premise_from_the_gates_read() {
     );
     insert(&dl, ":a :p \"x\" .").expect("admitted");
     assert_eq!(dl.store().dl_bounds().last, "kept", "setup: the bound kept");
+    // The record is the gate's, of the commit's revision: without one a read would read the
+    // ontology again and tell the same.
+    let status = dl.store().dl().status().expect("a DL status");
+    assert_eq!(
+        status.revision,
+        dl.store().current_revision(),
+        "the commit's record"
+    );
+    let recorded = status.left_out.clone().flatten().unwrap_or_default();
+    assert!(
+        recorded.contains("two kinds"),
+        "the record names the pair: {:?}",
+        status.left_out
+    );
     true_never_sound(&dl, ":a a :C");
 }
 
@@ -310,4 +324,73 @@ fn valid_neighbours_keep_the_rules_route() {
         assert_eq!(route, "rules", "{data}: keeps the rules route");
         exact(&dl, pattern, answer);
     }
+}
+
+/// A statement about the ontology's node is an annotation where its property is declared no
+/// object or data property (Mapping Table 10, as the W3C cases read it): `:ont :p :b` added
+/// beside `:p`'s domain makes `:p` a name of two kinds an axiom reads, which the rules apply
+/// (prp-dom types `:ont`). Neither the rules' route nor the upper bound's delta keeps it: on
+/// the route and off it (a union), the read isn't told sound.
+#[test]
+fn a_statement_about_the_ontology_added_later_is_read_as_the_reader_reads_it() {
+    for extra in ["", ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] ."] {
+        let (dl, _, _) = committed(&format!(
+            ":ont a owl:Ontology . :p rdfs:domain :C . :a :p :b . {extra}"
+        ));
+        insert(&dl, ":ont :p :b .").expect("admitted");
+        let route = dl.store().dl_bounds().last;
+        assert_ne!((extra, route), ("", "rules"), "the rules route left");
+        true_never_sound(&dl, ":ont a :C");
+    }
+}
+
+/// A clash the rules find through a part the reader left out (a data property's IRI values,
+/// which prp-fp equates against `owl:differentFrom`) is the rules' alone: the commit is refused
+/// as undecided, never as inconsistent.
+#[test]
+fn a_clash_through_a_part_left_out_is_refused_as_undecided() {
+    let refused = insert(
+        &pipeline(),
+        ":d a owl:DatatypeProperty , owl:FunctionalProperty . :a :d :x , :y . \
+         :x owl:differentFrom :y .",
+    );
+    match refused {
+        Err(MutationError::Rejected(reject)) => {
+            assert_eq!(reject.kind, RejectKind::Undecided, "{}", reject.detail);
+        }
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A header statement's undeclared property is an annotation property there and an object
+/// property in an assertion: a bare pair, counted. An equality of the ontology's node copies
+/// the header's statement (eq-rep-s), which OWL 2 DL doesn't entail of an annotation: the
+/// copy isn't told sound.
+#[test]
+fn a_copy_of_a_header_annotation_is_never_told_sound() {
+    let (dl, _, _) =
+        committed(":ont a owl:Ontology . :ont :note :b . :ont owl:sameAs :alias . :a :note :c .");
+    true_never_sound(&dl, ":alias :note :b");
+}
+
+/// A read inside a transaction whose pending statement types a node `owl:Ontology` reads
+/// `:ont :p :b` as an annotation, which makes `:p` a name of two kinds beside its domain:
+/// the committed record ("nothing read otherwise") says nothing of the pending data, and
+/// `:ont a :C`, which the closure keeps, isn't told sound.
+#[test]
+fn a_pending_read_takes_no_clean_record_from_its_base() {
+    use nrese_store::StatementOp;
+    let (dl, route, _) = committed(":p rdfs:domain :C . :ont :p :b .");
+    assert_eq!(route, "rules", "setup: on the rules route");
+    let header = StatementOp::Add {
+        data: super::versions::ntriples(
+            "<http://example.com/ont> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> \
+             <http://www.w3.org/2002/07/owl#Ontology> .",
+        ),
+        contexts: Vec::new(),
+    };
+    let (text, status) = super::versions::in_transaction(&dl, vec![header], "ASK { :ont a :C }");
+    assert!(text.contains("true"), "the closure holds it: {text}");
+    let status = status.expect("a status");
+    assert!(!status.sound, "told sound: {:?}", status.reasons);
 }
