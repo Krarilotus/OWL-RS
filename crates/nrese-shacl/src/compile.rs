@@ -544,10 +544,10 @@ impl<V: ReadView> Compiler<'_, V> {
         for head in self.values(node, "in") {
             match self.list(head) {
                 Ok(members) => {
-                    let allowed = members
-                        .into_iter()
-                        .take_while(|_| !self.graph.cancelled())
-                        .collect();
+                    let mut allowed = BTreeSet::new();
+                    for member in members.into_iter().take_while(|_| !self.graph.cancelled()) {
+                        allowed.insert(member);
+                    }
                     if self.graph.cancelled() {
                         break;
                     }

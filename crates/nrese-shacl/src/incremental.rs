@@ -131,19 +131,31 @@ pub fn validate_changes<A: ReadView + Sync, B: ReadView + Sync>(
             let after_results = validator_after.validate_all(&work(focus(
                 validator_after.focus_nodes(&shapes.shapes[shape]),
             )));
+            resources.check()?;
             if after_results.is_empty() {
                 continue;
             }
             let before_results = validator_before.validate_all(&work(focus(
                 validator_before.focus_nodes(&shapes.shapes[shape]),
             )));
+            resources.check()?;
             // Charged per result found, so counted before the set drops repeated ones.
-            let before_bytes: usize = before_results.iter().map(RawResult::retained_bytes).sum();
-            let before: BTreeSet<RawResult> = before_results.into_iter().collect();
+            let mut before_bytes = 0;
+            let mut before = BTreeSet::new();
+            for (i, result) in before_results.into_iter().enumerate() {
+                if i % CHECK_EVERY == 0 {
+                    resources.check()?;
+                }
+                before_bytes += result.retained_bytes();
+                before.insert(result);
+            }
             // Results kept are charged to their state's validator; those dropped here are
             // returned to it once freed.
             let mut dropped = 0;
-            for result in after_results {
+            for (i, result) in after_results.into_iter().enumerate() {
+                if i % CHECK_EVERY == 0 {
+                    resources.check()?;
+                }
                 if before.contains(&result) || introduced.contains(&result) {
                     dropped += result.retained_bytes();
                 } else {

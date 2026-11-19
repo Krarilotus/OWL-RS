@@ -505,6 +505,16 @@ impl<'e> Transaction<'e> {
         self.pending.quads_for_pattern_in(model, pattern)
     }
 
+    /// Asserted quads matching `pattern`, stopping before matching further candidates.
+    pub fn asserted_quads_for_pattern_until<'a, F: Fn() -> bool + Copy + 'a>(
+        &'a self,
+        pattern: &QuadPattern,
+        stop: F,
+    ) -> impl Iterator<Item = EncodedQuad> + use<'a, 'e, F> {
+        self.pending
+            .quads_for_pattern_until(ReadModel::Asserted, pattern, stop)
+    }
+
     /// True if the named graph `graph` contains at least one quad, including pending changes.
     pub fn contains_named_graph(&self, graph: TermId) -> bool {
         self.pending.contains_named_graph(graph)
