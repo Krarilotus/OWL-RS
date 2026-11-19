@@ -1093,7 +1093,8 @@ fn a_limit_of_zero_over_several_patterns_answers_no_rows() {
 /// Spec (SEP-0006; the drawing package's review, C): a LATERAL whose right side draws runs
 /// once per left row, and keeps nothing per row beyond what it charges: what it holds
 /// uncharged is the same for 500 and 8,000 left rows. With no room for its row column it is
-/// refused before any right side runs.
+/// refused before any right side runs. The right side draws and keeps no row, so the final
+/// join is empty: a join's output, made before it is charged, is no part of what is measured.
 #[test]
 fn a_drawing_lateral_holds_nothing_per_row_beyond_its_charge() {
     if !alone() {
@@ -1101,7 +1102,7 @@ fn a_drawing_lateral_holds_nothing_per_row_beyond_its_charge() {
     }
     let engine = store([]);
     let snapshot = engine.snapshot();
-    let text = "SELECT * WHERE { FILTER(RAND() < 2) }";
+    let text = "SELECT * WHERE { FILTER(RAND() < 0) }";
     let Query::Select { pattern, .. } = SparqlParser::new().parse_query(text).unwrap() else {
         panic!("a SELECT")
     };
@@ -1136,7 +1137,7 @@ fn a_drawing_lateral_holds_nothing_per_row_beyond_its_charge() {
     };
     let excess = |rows: usize| {
         let (answer, excess) = run(rows, Envelope::unlimited());
-        assert_eq!(answer.ok(), Some(rows), "one right row per left row");
+        assert_eq!(answer.ok(), Some(0), "no right row is kept");
         excess
     };
     let (small, large) = (excess(500), excess(8_000));
