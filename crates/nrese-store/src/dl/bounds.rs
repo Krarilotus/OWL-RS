@@ -564,7 +564,9 @@ pub(crate) fn prepare(
     source::intern_vocabulary(tx);
     #[cfg(test)]
     seam::at(&store.dl().bounds, seam::Point::Read);
-    let Ok(ontology) = source::read_pending(tx, Arc::clone(store.dl().bounds.kept())) else {
+    let treatments = &store.config().dl.treatments;
+    let Ok(ontology) = source::read_pending(tx, Arc::clone(store.dl().bounds.kept()), treatments)
+    else {
         return Preparation {
             base,
             prepared: Prepared::Rebuilt(Box::new(Err(GaveUp::refused(source::refused(
@@ -1019,7 +1021,8 @@ fn afresh(
         );
     }
     let latest = store.engine().snapshot();
-    let ontology = match source::read_snapshot(snapshot, Arc::clone(store.dl().bounds.kept())) {
+    let kept = Arc::clone(store.dl().bounds.kept());
+    let ontology = match source::read_snapshot(snapshot, kept, &store.config().dl.treatments) {
         Ok(ontology) => ontology,
         Err(_) => return (Err(GaveUp::refused(source::refused("the revision"))), None),
     };
@@ -1473,8 +1476,9 @@ pub(crate) fn upper_facts(store: &StoreService, afresh: bool) -> Option<Vec<[Str
         }
         let engine = store.engine();
         let latest = engine.snapshot();
+        let kept = Arc::clone(store.dl().bounds.kept());
         let ontology =
-            source::read_snapshot(&snapshot, Arc::clone(store.dl().bounds.kept())).ok()?;
+            source::read_snapshot(&snapshot, kept, &store.config().dl.treatments).ok()?;
         let normalised = nrese_owl::normalise(&ontology);
         let memory = store.memory_stop();
         let deadline = Deadline::after(store.config().dl.timeout);

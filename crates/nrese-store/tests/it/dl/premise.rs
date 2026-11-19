@@ -220,6 +220,35 @@ fn a_kept_upper_bound_takes_the_premise_from_the_gates_read() {
     true_never_sound(&dl, ":a a :C");
 }
 
+/// The treatment of each kind is a setting (`dl.treatments`): F2's name of two kinds taken
+/// off the route instead of fatal leaves the consistency decided, and its answer still isn't
+/// told sound; case (b)'s unused structure taken as fatal leaves it unknown.
+#[test]
+fn the_treatment_of_each_kind_is_a_setting() {
+    use nrese_owl::{Strict, Treatments};
+    let config = |treatments| DlConfig {
+        treatments,
+        ..DlConfig::default()
+    };
+    let off = Treatments {
+        two_kinds_by_axiom: Strict::OffRoute,
+        ..Treatments::default()
+    };
+    let (dl, route, verdict) = committed_with(
+        config(off),
+        ":C a owl:Class . :p rdfs:domain :C . :a :p \"x\" . :b :p :c .",
+    );
+    assert_eq!((route, verdict.as_str()), ("rebuilt", "consistent"));
+    true_never_sound(&dl, ":a a :C");
+    let fatal = Treatments {
+        unused_reads_more: Strict::Fatal,
+        ..Treatments::default()
+    };
+    let (dl, route, verdict) = committed_with(config(fatal), TWO_FORMS);
+    assert_eq!((route, verdict.as_str()), ("rebuilt", "unknown"));
+    true_never_sound(&dl, ":y a :D");
+}
+
 /// Neighbours of the reds that keep the route, each read sound and complete: a header
 /// statement of an object property (read as an assertion, Mapping Table 10), a one-form
 /// restriction no axiom uses, and a property given a literal and an IRI with no axiom on it

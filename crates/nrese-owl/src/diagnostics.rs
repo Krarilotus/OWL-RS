@@ -5,7 +5,94 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 use crate::mapping::{Ontology, Terms};
-use crate::model::{Axiom, Characteristic, ClassExpr, ObjProp, Term};
+use crate::model::{Axiom, Characteristic, ClassExpr, EntityKind, ObjProp, Term};
+
+/// What the store does with a part of the data that breaks the premise of the OWL 2 RL rules'
+/// closure (theorem PR1, OWL 2 Profiles §4.3: the graph is exactly the mapping of the ontology
+/// read), per kind ([`Treatments`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Treatment {
+    /// No model of the read ontology says anything of the source ([`Diagnostic::is_fatal`]):
+    /// off the rules route, no answer drawn from the rules told sound, consistency unknown.
+    Fatal,
+    /// Off the rules route with its reason ([`Diagnostic::reads_otherwise`]): no answer drawn
+    /// from the rules told sound, and a clash only the rules find undecided; the read
+    /// ontology's consistency stays decided.
+    OffRoute,
+    /// Counted, the route kept.
+    Counted,
+}
+
+/// A [`Treatment`] that never keeps the route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Strict {
+    Fatal,
+    OffRoute,
+}
+
+impl From<Strict> for Treatment {
+    fn from(strict: Strict) -> Self {
+        match strict {
+            Strict::Fatal => Self::Fatal,
+            Strict::OffRoute => Self::OffRoute,
+        }
+    }
+}
+
+/// The [`Treatment`] of each kind that breaks the rules' premise and needn't be fatal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Treatments {
+    /// A name of two kinds that an axiom other than an assertion names in one of them
+    /// ([`Diagnostic::TwoKinds`] `by_axiom`). Default fatal: the rules apply that axiom to the
+    /// other kind's statements, so a model of the read axioms certifies nothing of the source.
+    pub two_kinds_by_axiom: Strict,
+    /// A name of two kinds used only in assertions and statements read past. Default counted:
+    /// only the rules for equality read the name, and they copy an object or a data assertion
+    /// as OWL 2 DL entails it.
+    pub two_kinds_bare: Treatment,
+    /// A structure no axiom uses that the rules may read more of than one structure says
+    /// ([`Diagnostic::Unused`] `reads_more`). Default off the route: under OWL 2 DL an unused
+    /// structure says nothing, so the read ontology's consistency stands.
+    pub unused_reads_more: Strict,
+}
+
+impl Default for Treatments {
+    fn default() -> Self {
+        Self {
+            two_kinds_by_axiom: Strict::Fatal,
+            two_kinds_bare: Treatment::Counted,
+            unused_reads_more: Strict::OffRoute,
+        }
+    }
+}
+
+impl Ontology {
+    /// Gives each name of two kinds and each unused structure its kind's treatment (the readers
+    /// give the defaults).
+    pub fn treat(&mut self, treatments: &Treatments) {
+        for d in &mut self.diagnostics {
+            if let Diagnostic::TwoKinds {
+                by_axiom,
+                treatment,
+                ..
+            } = d
+            {
+                *treatment = if *by_axiom {
+                    treatments.two_kinds_by_axiom.into()
+                } else {
+                    treatments.two_kinds_bare
+                };
+            } else if let Diagnostic::Unused {
+                reads_more: true,
+                treatment,
+                ..
+            } = d
+            {
+                *treatment = treatments.unused_reads_more.into();
+            }
+        }
+    }
+}
 
 /// A problem found while reading.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,8 +106,16 @@ pub enum Diagnostic {
     BrokenList { head: Term },
     /// A property used without a declaration (typed by its use).
     UndeclaredProperty { property: Term },
-    /// Declared both an object and a data property.
-    AmbiguousProperty { property: Term },
+    /// A name used as two kinds OWL 2 DL keeps apart (*OWL 2 Structural Specification* §5.8.1:
+    /// two of object, data and annotation property, or class and datatype;
+    /// [`crate::typing::two_kinds`]). `by_axiom`: an axiom other than an assertion names it in
+    /// one of them. `treatment`: what the store does with it ([`Treatments`]).
+    TwoKinds {
+        term: Term,
+        kinds: [EntityKind; 2],
+        by_axiom: bool,
+        treatment: Treatment,
+    },
     /// OWL 2 syntax NRESE doesn't read yet.
     Unsupported { node: Term, what: &'static str },
     /// OWL vocabulary used outside any form of the mapping.
@@ -29,8 +124,13 @@ pub enum Diagnostic {
     /// direct semantics (OWL 1 conclusions state expressions so). `reads_more`: the OWL 2 RL
     /// rules may read more of it than one structure says: it has two forms, a negative
     /// property assertion's statements untyped, or is also an individual of an axiom (which
-    /// an equality can give a second structure's statements).
-    Unused { node: Term, reads_more: bool },
+    /// an equality can give a second structure's statements). `treatment`: what the store does
+    /// with it ([`Treatments`]); counted where it doesn't read more.
+    Unused {
+        node: Term,
+        reads_more: bool,
+        treatment: Treatment,
+    },
     /// A global restriction of OWL 2 DL broken: a non-simple property where only simple
     /// ones may be (cardinalities, `Self`, functional, inverse-functional, irreflexive,
     /// asymmetric, disjoint properties). `axiom` indexes [`Ontology::axioms`].
@@ -74,7 +174,7 @@ impl Diagnostic {
             Self::SharedBlankNode { node } => (node, "shared"),
             Self::BrokenList { head } => (head, "list"),
             Self::UndeclaredProperty { property } => (property, "undeclared"),
-            Self::AmbiguousProperty { property } => (property, "ambiguous"),
+            Self::TwoKinds { term, .. } => (term, "two kinds"),
             Self::Unsupported { node, what } => (node, what),
             Self::NotOwl { triple } => return (triple, "not owl"),
             Self::Unused { node, .. } => (node, "unused"),
@@ -93,8 +193,9 @@ impl Diagnostic {
     /// Whether reasoning over the ontology may go wrong because of it. Not for what OWL 2
     /// DL forbids but whose meaning is unambiguous: an undeclared property (typed by its
     /// use), a blank node shared by expressions (OWL 1 ontologies do it; the expression
-    /// is the same), a structure no axiom uses (it says nothing), an anonymous individual
-    /// in a nominal or `hasValue`.
+    /// is the same), an anonymous individual in a nominal or `hasValue`. A name of two kinds
+    /// and a structure no axiom uses are fatal where their [`Treatment`] says so (a structure
+    /// no axiom uses says nothing; by default a name of two kinds an axiom reads is fatal).
     ///
     /// *OWL 2 Structural Specification* §11.2 keeps anonymous individuals out of OWL 2 DL in
     /// more places: in a nominal or `hasValue` (flagged here) and, unflagged, in
@@ -103,14 +204,23 @@ impl Diagnostic {
     /// answers on such input stay those of the Direct Semantics, and what witnesses it, is in
     /// docs/design/owl2-dl.md §16 ("Anonymous individuals where §11.2 keeps them out").
     pub fn is_fatal(&self) -> bool {
-        !matches!(
-            self,
+        match self {
             Self::UndeclaredProperty { .. }
-                | Self::SharedBlankNode { .. }
-                | Self::Unused { .. }
-                | Self::RepeatedOperand
-                | Self::AnonymousIndividual { .. }
-        )
+            | Self::SharedBlankNode { .. }
+            | Self::RepeatedOperand
+            | Self::AnonymousIndividual { .. } => false,
+            Self::TwoKinds { treatment, .. } | Self::Unused { treatment, .. } => {
+                *treatment == Treatment::Fatal
+            }
+            Self::Malformed { .. }
+            | Self::BrokenList { .. }
+            | Self::Unsupported { .. }
+            | Self::NotOwl { .. }
+            | Self::NonSimpleProperty { .. }
+            | Self::Syntax { .. }
+            | Self::Reserved { .. }
+            | Self::Rule { .. } => true,
+        }
     }
 
     /// Whether the reader left an axiom out whose statements the OWL 2 RL rules may still
@@ -126,6 +236,29 @@ impl Diagnostic {
         )
     }
 
+    /// Whether the OWL 2 RL rules read the part otherwise than OWL 2 DL reads the ontology,
+    /// which breaks the premise of their closure (theorem PR1, OWL 2 Profiles §4.3): a name
+    /// of two kinds or a structure no axiom uses, unless its [`Treatment`] only counts it.
+    pub fn reads_otherwise(&self) -> bool {
+        match self {
+            Self::TwoKinds { treatment, .. } | Self::Unused { treatment, .. } => {
+                *treatment != Treatment::Counted
+            }
+            Self::Malformed { .. }
+            | Self::SharedBlankNode { .. }
+            | Self::BrokenList { .. }
+            | Self::UndeclaredProperty { .. }
+            | Self::Unsupported { .. }
+            | Self::NotOwl { .. }
+            | Self::NonSimpleProperty { .. }
+            | Self::AnonymousIndividual { .. }
+            | Self::Syntax { .. }
+            | Self::RepeatedOperand
+            | Self::Reserved { .. }
+            | Self::Rule { .. } => false,
+        }
+    }
+
     /// What it is, in words, its terms as `name` writes them (the reader has no dictionary).
     pub fn describe(&self, name: &dyn Fn(Term) -> String) -> String {
         let at = |what: &str, term| format!("{what}: {}", name(term));
@@ -134,7 +267,11 @@ impl Diagnostic {
             Self::SharedBlankNode { node } => at("a blank node two expressions use", node),
             Self::BrokenList { head } => at("a list not ending in rdf:nil, or a bad cell", head),
             Self::UndeclaredProperty { property } => at("a property used undeclared", property),
-            Self::AmbiguousProperty { property } => at("both object and data property", property),
+            Self::TwoKinds {
+                term,
+                kinds: [a, b],
+                ..
+            } => at(&format!("a name used as two kinds ({a:?} and {b:?})"), term),
             Self::Unsupported { node, what } => at(&format!("{what}, not read yet"), node),
             Self::NotOwl { triple } => {
                 let statement = triple.map(name).join(" ");

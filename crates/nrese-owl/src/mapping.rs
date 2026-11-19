@@ -12,7 +12,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
-use crate::diagnostics::Diagnostic;
+use crate::diagnostics::{Diagnostic, Treatment, Treatments};
 use crate::model::{
     Axiom, Characteristic, ClassExpr, DataRange, DataTerms, Disjoint, EntityKind, ExprId, Interner,
     Literal, ObjProp, RangeId, Term, canonical,
@@ -288,6 +288,26 @@ pub(crate) fn complete(ontology: &mut Ontology, terms: &dyn Terms) {
         .filter(|&t| terms.kind(t) == TermKind::Blank)
         .collect();
     crate::diagnostics::check_global_restrictions(ontology);
+    // An unused structure that is also an individual: an equality the rules derive may give
+    // it a second structure's statements (`Reader::reads_more`).
+    for d in &mut ontology.diagnostics {
+        if let Diagnostic::Unused {
+            node, reads_more, ..
+        } = d
+        {
+            *reads_more |= ontology.anonymous.contains(node);
+        }
+    }
+    let two_kinds = crate::typing::two_kinds(ontology).into_iter();
+    ontology
+        .diagnostics
+        .extend(two_kinds.map(|t| Diagnostic::TwoKinds {
+            term: t.term,
+            kinds: t.kinds,
+            by_axiom: t.by_axiom,
+            treatment: Treatment::Counted,
+        }));
+    ontology.treat(&Treatments::default());
 }
 
 /// The individuals class expressions name: in nominals and `hasValue`.
@@ -903,14 +923,6 @@ impl<'a> Reader<'a> {
                 if !entry.contains(&kind) {
                     entry.push(kind);
                 }
-            }
-        }
-        for (&term, kinds) in &self.declared {
-            if kinds.contains(&EntityKind::ObjectProperty)
-                && kinds.contains(&EntityKind::DataProperty)
-            {
-                self.diagnostics
-                    .push(Diagnostic::AmbiguousProperty { property: term });
             }
         }
     }
@@ -1562,7 +1574,11 @@ impl<'a> Reader<'a> {
         }
         for node in unused {
             let reads_more = self.reads_more(node);
-            self.report(Diagnostic::Unused { node, reads_more });
+            self.report(Diagnostic::Unused {
+                node,
+                reads_more,
+                treatment: Treatment::Counted,
+            });
         }
     }
 
@@ -1910,8 +1926,15 @@ impl<'a> Reader<'a> {
             // An object property's assertion (Table 16, `*:x` or `_:x`): a literal there is
             // malformed. A property declared both ways is read as a data property, as before.
             self.individual(o);
-        } else if self.kind(o) == TermKind::Literal || self.is_data_property(p) {
+        } else if self.kind(o) == TermKind::Literal {
             self.add(Axiom::DataPropertyAssertion(p, s, o), triple);
+        } else if self.is_data_property(p) {
+            // A data property's assertion has a literal (Table 16): an IRI or a blank node there
+            // is malformed, and the statement left out.
+            self.report(Diagnostic::Malformed {
+                node: o,
+                what: "an IRI where a data value belongs",
+            });
         } else {
             self.add(Axiom::ObjectPropertyAssertion(p, s, o), triple);
         }
@@ -2147,13 +2170,6 @@ impl<'a> Reader<'a> {
             list_cell_outside: self.list_cell_outside,
         };
         complete(&mut ontology, self.terms);
-        // An unused structure that is also an individual: an equality the rules derive may
-        // give it a second structure's statements ([`Self::reads_more`]).
-        for d in &mut ontology.diagnostics {
-            if let Diagnostic::Unused { node, reads_more } = d {
-                *reads_more |= ontology.anonymous.contains(node);
-            }
-        }
         ontology
     }
 }

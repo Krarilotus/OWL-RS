@@ -272,6 +272,14 @@ leave something out.
   ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
   Remove such axioms, give the individual its own IRI, or use `owl2-rl`, whose promise
   is the rules' reading.
+- Under `owl2-dl`, a name used as two kinds OWL 2 DL keeps apart (an object and a data
+  property, either and an annotation property, a class and a datatype) leaves the rules-only
+  route where an axiom other than an assertion names it: every answer is `unsound` and the
+  consistency `unknown`. So does a structure no axiom uses that the rules may read more of
+  (a blank node with two forms, a negative assertion's statements without its type, or one
+  that is also an individual): every answer is `unsound`, the consistency decided. A name
+  only assertions use as two kinds (`dc:creator "N"` beside `dc:creator :n`) keeps the route.
+  Declare each name as one kind, or remove the unused structure.
 - Under `owl2-dl`, where the OWL 2 RL rules find a clash in such an ontology, this release
   doesn't decide whether the data is consistent under OWL 2 DL: the commit is refused,
   saying so, and data loaded with such a clash is `undecided` and quarantined, with the
@@ -280,8 +288,9 @@ leave something out.
   verdict at a query doesn't change readiness. In quarantine, each commit rebuilds the
   inferences in full, and under `owl2-dl` reads the asserted ontology once more to tell
   `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
-  annotation property's domain, range, super-property or sub-property or the empty list, or give
-  the individual its own IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
+  annotation property's domain, range, super-property or sub-property or the empty list, give
+  the individual its own IRI, remove the unused structure, or declare each name as one kind.
+  Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
 - On a store in quarantine, a commit can be refused as introducing a violation that was
   already there, though a full rebuild finds the same violation after it (under `owl2-rl`, for
   one): a commit that deletes a statement the remaining statements still entail, that deletes a

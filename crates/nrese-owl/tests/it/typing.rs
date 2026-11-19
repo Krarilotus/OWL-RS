@@ -336,6 +336,7 @@ fn unused(turtle: &str, property: &str) -> Option<bool> {
         Diagnostic::Unused {
             node: n,
             reads_more,
+            ..
         } if n == node => Some(reads_more),
         _ => None,
     })
@@ -409,4 +410,68 @@ fn an_unused_structure_reads_more_by_its_forms_or_as_an_individual() {
     ] {
         assert_eq!(unused(statements, property), Some(expected), "{what}");
     }
+}
+
+/// Each name of two kinds and each kind of unused structure of `ontology` (one that reads
+/// more, one that doesn't): the name, whether an axiom names it (or the structure reads more),
+/// whether it is fatal and whether the rules read it otherwise.
+fn treated(ontology: &Ontology, table: &Table) -> Vec<(String, bool, bool, bool)> {
+    let name = |t: Term| table.iri_text(t).unwrap_or_default().replace(super::EX, "");
+    let mut found: Vec<_> = (ontology.diagnostics.iter())
+        .filter_map(|d| {
+            let (n, more) = match *d {
+                Diagnostic::TwoKinds { term, by_axiom, .. } => (name(term), by_axiom),
+                Diagnostic::Unused { reads_more, .. } => ("unused".to_owned(), reads_more),
+                _ => return None,
+            };
+            Some((n, more, d.is_fatal(), d.reads_otherwise()))
+        })
+        .collect();
+    found.sort();
+    found.dedup();
+    found
+}
+
+/// Spec (the treatment of each kind, `nrese_owl::Treatments`; theorem PR1 of OWL 2 Profiles
+/// §4.3 needs the graph to be the mapping of the ontology read): by default a name of two kinds
+/// an axiom names is fatal; one only assertions name is counted, neither fatal nor read
+/// otherwise; a structure no axiom uses that reads more is read otherwise and not fatal, and
+/// one that doesn't is counted. A setting gives each kind its own treatment.
+#[test]
+fn each_kind_takes_its_treatment() {
+    use nrese_owl::{Strict, Treatment, Treatments};
+    let mut table = Table::default();
+    let statements = load(
+        &mut table,
+        "ex:C a owl:Class . ex:p rdfs:domain ex:C . ex:a ex:p \"x\" . ex:b ex:p ex:c . \
+         ex:a ex:creator \"N\" . ex:b ex:creator ex:n . \
+         _:x owl:intersectionOf ( ex:A ex:B ) ; owl:onProperty ex:p ; owl:allValuesFrom ex:D . \
+         _:y owl:unionOf ( ex:A ex:B ) .",
+    );
+    let mut ontology = read(&statements, &table);
+    assert_eq!(
+        treated(&ontology, &table),
+        [
+            ("creator".to_owned(), false, false, false),
+            ("p".to_owned(), true, true, true),
+            ("unused".to_owned(), false, false, false),
+            ("unused".to_owned(), true, false, true),
+        ],
+        "the defaults"
+    );
+    ontology.treat(&Treatments {
+        two_kinds_by_axiom: Strict::OffRoute,
+        two_kinds_bare: Treatment::Fatal,
+        unused_reads_more: Strict::Fatal,
+    });
+    assert_eq!(
+        treated(&ontology, &table),
+        [
+            ("creator".to_owned(), false, true, true),
+            ("p".to_owned(), true, false, true),
+            ("unused".to_owned(), false, false, false),
+            ("unused".to_owned(), true, true, true),
+        ],
+        "as set"
+    );
 }

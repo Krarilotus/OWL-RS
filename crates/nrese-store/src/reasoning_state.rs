@@ -71,7 +71,8 @@ impl ConsistencyStatus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WhyUndecided {
     /// The ontology has annotation-property axioms or a punned name, or an empty
-    /// intersection or union, or a list's cell used outside its list
+    /// intersection or union, or a list's cell used outside its list, or a structure no
+    /// axiom uses or a name used as two kinds that the rules read otherwise
     /// (`nrese_owl::profile::rules_read_differently`).
     ReadsDifferently,
     /// The check whether it has didn't finish within its budget.
@@ -84,8 +85,9 @@ impl WhyUndecided {
         let why = match self {
             Self::ReadsDifferently => {
                 "the ontology has annotation-property axioms or a punned name, or an empty \
-                 intersection or union, or a list's cell used outside its list, which OWL 2 \
-                 DL reads differently"
+                 intersection or union, or a list's cell used outside its list, or a \
+                 structure no axiom uses, or a name used as two kinds, which OWL 2 DL reads \
+                 differently"
             }
             Self::Unchecked => {
                 "the check whether OWL 2 DL reads this ontology differently did not finish \
@@ -96,7 +98,8 @@ impl WhyUndecided {
             "the OWL 2 RL rules find {violations} clash(es), and {why}; this release doesn't \
              decide whether the data is consistent under OWL 2 DL. Remove the statements \
              behind the clash, remove the annotation property's domain, range or \
-             super-property, or give the individual its own IRI"
+             super-property, give the individual its own IRI, remove the unused structure, \
+             or declare each name as one kind"
         )
     }
 }

@@ -121,7 +121,12 @@ fn read_ontology(
     snapshot: &Snapshot,
 ) -> Result<KeptOntology, nrese_exec::BudgetExceeded> {
     let kept = store.dl().bounds.kept();
-    let ontology = Arc::new(source::read_snapshot(snapshot, Arc::clone(kept))?);
+    let treatments = &store.config().dl.treatments;
+    let ontology = Arc::new(source::read_snapshot(
+        snapshot,
+        Arc::clone(kept),
+        treatments,
+    )?);
     let bytes = nrese_dl::memory::ontology_bytes(&ontology);
     Ok(Arc::new(nrese_exec::cell::Kept::charge(
         ontology,
@@ -512,25 +517,18 @@ const ONLY: &str = "OWL 2 DL may not entail what the OWL 2 RL rules found here, 
 /// its own), whose refusal leaves it unknown. First [`left_out`], as recorded (pending: the
 /// base's).
 fn reads_differently(store: &StoreService, at: Revision<'_>) -> Option<String> {
-    let (snapshot, pending, proved) = match at {
+    let (snapshot, pending) = match at {
         Revision::Decided((_, view)) if view.rules => return None,
-        Revision::Decided((snapshot, view)) => (snapshot, false, view.proves_consistency),
-        Revision::Committed(snapshot) => (snapshot, false, false),
-        Revision::Pending(snapshot, _) => (snapshot, true, false),
-    };
-    let status = || {
-        store
-            .dl()
-            .status()
-            .filter(|s| s.revision == snapshot.revision())
+        Revision::Decided((snapshot, _)) => (snapshot, false),
+        Revision::Committed(snapshot) => (snapshot, false),
+        Revision::Pending(snapshot, _) => (snapshot, true),
     };
     // Named where its commit wrote it: only a reader of every graph is given the status this
-    // reason is in (`status_for_its_reader`, service.rs).
-    let left_out = if proved {
-        Some(None)
-    } else {
-        status().and_then(|s| s.left_out)
-    };
+    // reason is in (`status_for_its_reader`, service.rs). U1's proof of consistency is no
+    // record: it says nothing of what the rules read beyond the ontology (an unused structure).
+    let left_out = (store.dl().status())
+        .filter(|s| s.revision == snapshot.revision())
+        .and_then(|s| s.left_out);
     match (left_out, by_index(snapshot)) {
         (Some(Some(why)), _) | (_, Some(Some(why))) => return Some(why),
         (Some(None), Some(None)) => return None,
@@ -645,12 +643,24 @@ fn annotation_reason(snapshot: &Snapshot, property: u64) -> String {
     )
 }
 
-/// [`reads_differently`]'s reason where the reader left out what the rules may read, its
-/// terms as `name` writes them.
+/// [`reads_differently`]'s reason where the reader left out what the rules may read, or the
+/// rules read a part otherwise than OWL 2 DL does (a name of two kinds, a structure no axiom
+/// uses: `nrese_owl::Diagnostic::reads_otherwise`), its terms as `name` writes them: what
+/// the premise of the rules' closure tells, `None` where it holds.
 pub(crate) fn left_out(ontology: &Ontology, name: &dyn Fn(u64) -> String) -> Option<String> {
-    let why = consistency::left_out_by(ontology, nrese_owl::Diagnostic::leaves_out, name)?;
+    if let Some(why) = consistency::left_out_by(ontology, nrese_owl::Diagnostic::leaves_out, name) {
+        return Some(format!(
+            "{why}, whose statements the OWL 2 RL rules may still read: {ONLY}, or remove them"
+        ));
+    }
+    let otherwise: Vec<_> = (ontology.diagnostics.iter())
+        .filter(|d| d.reads_otherwise())
+        .collect();
+    let first = otherwise.first()?.describe(name);
     Some(format!(
-        "{why}, whose statements the OWL 2 RL rules may still read: {ONLY}, or remove them"
+        "{} part(s) of the data aren't OWL 2 DL, and the OWL 2 RL rules read them otherwise; \
+         first: {first}: {ONLY}, or remove them, or declare each name as one kind",
+        otherwise.len()
     ))
 }
 

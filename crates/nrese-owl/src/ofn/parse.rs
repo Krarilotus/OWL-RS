@@ -259,14 +259,11 @@ impl<'t, 'm> Parser<'t, 'm> {
         } else {
             ObjProp::Named(self.entity()?)
         };
-        self.model.uses.entry(p.named()).or_default().object = true;
         Ok(p)
     }
 
     fn data_property(&mut self) -> R<Term> {
-        let p = self.entity()?;
-        self.model.uses.entry(p).or_default().data = true;
-        Ok(p)
+        self.entity()
     }
 
     /// A literal: `"…"`, `"…"^^datatype`, `"…"@tag`.
@@ -600,13 +597,6 @@ impl<'t, 'm> Parser<'t, 'm> {
                 self.open()?;
                 let t = self.entity()?;
                 self.close()?;
-                let uses = self.model.uses.entry(t).or_default();
-                match kind {
-                    EntityKind::ObjectProperty => uses.object = true,
-                    EntityKind::DataProperty => uses.data = true,
-                    EntityKind::AnnotationProperty => uses.annotation = true,
-                    _ => {}
-                }
                 Some(Axiom::Declaration(kind, t))
             }
             "SubClassOf" => {
@@ -745,12 +735,10 @@ impl<'t, 'm> Parser<'t, 'm> {
             }
             "SubAnnotationPropertyOf" | "AnnotationPropertyDomain" | "AnnotationPropertyRange" => {
                 let property = self.entity()?;
-                self.model.uses.entry(property).or_default().annotation = true;
                 self.model.annotation_schema.push(property);
                 self.model.annotation_uses.insert(property);
                 if keyword == "SubAnnotationPropertyOf" {
                     let sup = self.entity()?;
-                    self.model.uses.entry(sup).or_default().annotation = true;
                     self.model.annotation_uses.insert(sup);
                 } else {
                     self.iri_text()?;

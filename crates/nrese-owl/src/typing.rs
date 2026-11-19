@@ -7,8 +7,8 @@
 //! Individuals take part in no constraint: a name may be an individual and anything else
 //! (punning).
 //!
-//! The check reports; what a name used as two kinds does to reasoning is decided where its
-//! report is read.
+//! The readers report each name found as a [`crate::Diagnostic::TwoKinds`]; what it does to
+//! reasoning is its [`crate::Treatment`].
 
 use std::collections::{BTreeMap, HashSet};
 

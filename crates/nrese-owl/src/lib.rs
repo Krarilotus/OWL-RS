@@ -33,7 +33,7 @@ pub mod write;
 pub use clauses::{
     BodyAtom, Clause, Concept, Facts, Filler, FreshOf, HeadAtom, Normalised, SafeRule, Var,
 };
-pub use diagnostics::Diagnostic;
+pub use diagnostics::{Diagnostic, Strict, Treatment, Treatments};
 pub use functional::{iri_text, literal_text};
 pub use mapping::{
     BUILTIN_ANNOTATIONS, BuiltinProperties, DECLARATION_KINDS, Ontology, Source, Statement,

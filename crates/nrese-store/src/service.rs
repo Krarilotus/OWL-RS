@@ -1042,8 +1042,9 @@ impl StoreService {
         // A state with violations (read at open, or recorded before): whether `owl2-dl`
         // decides them, derived under the mode now set (`ReasoningState::undecided`).
         if let Some(mut state) = self.reasoning_state().filter(|s| s.violations > 0) {
+            let treatments = &self.config.dl.treatments;
             state.undecided = active
-                .then(|| self.dl.undecided(&self.engine.snapshot()))
+                .then(|| self.dl.undecided(&self.engine.snapshot(), treatments))
                 .flatten();
             *self.materialised.lock().unwrap_or_else(|p| p.into_inner()) = Some(state);
         }
@@ -2554,7 +2555,7 @@ impl StoreService {
         );
         // Under `owl2-dl`, whether it decides the violations (`ReasoningState::undecided`).
         let undecided = (violations > 0 && self.dl.active())
-            .then(|| self.dl.undecided(base))
+            .then(|| self.dl.undecided(base, &self.config.dl.treatments))
             .flatten();
         // The last word under the writer slot: a caller whose claim ended meanwhile (a
         // retired pipeline, a cancelled request) changes nothing.

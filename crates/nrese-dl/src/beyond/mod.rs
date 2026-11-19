@@ -118,9 +118,10 @@ fn restriction(d: &Diagnostic) -> Option<(&'static str, bool)> {
             "OWL 2 Structural Specification §11.2: a named individual in a nominal or hasValue",
             true,
         ),
-        Diagnostic::AmbiguousProperty { .. } => (
-            "OWL 2 Structural Specification §5.8.1: typing constraints (one IRI as two kinds of property)",
-            false,
+        // The reader leaves nothing out: each axiom stays in the model.
+        Diagnostic::TwoKinds { .. } => (
+            "OWL 2 Structural Specification §5.8.1: typing constraints (one name as two kinds)",
+            true,
         ),
         Diagnostic::Syntax { .. } => (
             "OWL 2 Structural Specification §3: the functional-style grammar",
