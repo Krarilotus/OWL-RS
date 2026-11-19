@@ -438,3 +438,73 @@ fn a_first_load_whose_axioms_conclude_an_unstorable_fact_takes_the_delta() {
         }
     }
 }
+
+/// A first load holding an `owl:AllDisjointClasses` list past the cap, with `ex:x` in two of
+/// its classes, reports `cax-adc` under every plan, by replication and by representatives.
+/// Spec: `docs/spec/reasoning-semantics.md`, past the cap a list's clash checks are also read
+/// from the list as written; this file's first test, a first load's verdict is the delta
+/// executor's. The list has 101 cells; seven of them have a second member through `ex:alt
+/// rdfs:subPropertyOf rdf:first`, so the closure gives it 128 member sequences. Where the plan
+/// lets a first load be materialised once (none, or `Rebuild`), the report is the one the
+/// introduced violations give (`maintain`: the caller doesn't use the rebuild's own).
+#[test]
+fn a_first_load_checks_a_list_past_the_cap_as_written() {
+    let mut data = String::from(
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> . \
+         ex:alt rdfs:subPropertyOf rdf:first . \
+         [] a owl:AllDisjointClasses ; owl:members ex:l1 . ex:x a ex:P1 , ex:P2 . ",
+    );
+    for i in 1..=101 {
+        let rest = match i {
+            101 => "rdf:nil".to_owned(),
+            _ => format!("ex:l{}", i + 1),
+        };
+        data.push_str(&format!("ex:l{i} rdf:first ex:P{i} ; rdf:rest {rest} . "));
+        if i > 94 {
+            data.push_str(&format!("ex:l{i} ex:alt ex:Q{i} . "));
+        }
+    }
+    let mut missed = Vec::new();
+    let mut plans = Vec::new();
+    for representatives in [false, true] {
+        for plan in [
+            None,
+            Some(Plan::Dred),
+            Some(Plan::Recompute),
+            Some(Plan::Rebuild),
+        ] {
+            let engine = Engine::new(EngineConfig {
+                background_maintenance: false,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let mut tx = engine.transaction();
+            let program = Program::compile(&Ruleset::Owl2Rl.into(), &|t| tx.intern(t))
+                .by_representatives(representatives)
+                .maintaining_by(plan);
+            let text = format!("{PREFIX}{data}");
+            for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+                tx.insert(quad.unwrap().as_ref());
+            }
+            let done = maintain(&program, None, &mut tx, &|| false).unwrap();
+            let case = format!("reps={representatives} plan={plan:?}");
+            if !done.violations.iter().any(|(rule, _)| rule == "cax-adc") {
+                missed.push(format!(
+                    "{case}: {:?}",
+                    done.violations.iter().collect::<Vec<_>>()
+                ));
+            }
+            if matches!(plan, None | Some(Plan::Rebuild)) {
+                plans.push((case, done.work.plan));
+            }
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "each first load reports cax-adc: {missed:#?}"
+    );
+    assert!(
+        plans.iter().all(|(_, plan)| *plan == Plan::Rebuild),
+        "a first load is materialised once: {plans:?}"
+    );
+}
