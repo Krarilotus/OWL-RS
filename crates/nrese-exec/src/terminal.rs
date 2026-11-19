@@ -32,7 +32,7 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// that a waiter of this cell may hold. A fixed fallback is `move || value`.
 pub fn terminal<O, F>(fallback: F) -> (Terminal<O>, Guard<O>)
 where
-    O: Clone + Send + 'static,
+    O: Clone + Send + Sync + 'static,
     F: FnOnce() -> O + Send + 'static,
 {
     let guard = Guard {
@@ -42,8 +42,8 @@ where
     (guard.terminal(), guard)
 }
 
-/// The reading side: cheap to clone, `Send + Sync + 'static` for an `O` that is `Send + Sync`
-/// (the end is shared as an `Arc<O>`).
+/// The reading side: cheap to clone, `Send + Sync + 'static` (the end is shared as an
+/// `Arc<O>`, so `O` is `Send + Sync`).
 #[derive(Clone)]
 pub struct Terminal<O> {
     shared: Shared<O>,
