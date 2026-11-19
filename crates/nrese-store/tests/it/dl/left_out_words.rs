@@ -31,6 +31,12 @@ fn firsts<'a>(texts: impl IntoIterator<Item = &'a str>) -> Vec<&'a str> {
     parts.collect()
 }
 
+/// The first parts of `text`'s left-out sentences, each up to the text's next quote.
+fn first_parts(text: &str) -> Vec<&str> {
+    let parts = text.split("left out; first: ").skip(1);
+    parts.filter_map(|rest| rest.split('"').next()).collect()
+}
+
 /// Whether `text` holds neither a debug form nor a term's id.
 fn in_words(text: &str) -> bool {
     !text.contains('{') && !text.contains("term ")
@@ -180,13 +186,8 @@ fn a_reader_of_some_graphs_is_told_no_name_from_the_left_out_sentence() {
     let store = dl.store();
     // The reserved name, in any text.
     let member = |text: &String| text.contains("rdf-schema#member");
-    // A left-out sentence's first part, up to the text's next quote, naming a term.
-    let names = |text: &String| {
-        let parts = text.split("left out; first: ").skip(1);
-        parts
-            .filter_map(|rest| rest.split('"').next())
-            .any(|s| s.contains('<'))
-    };
+    // A left-out sentence's first part naming a term.
+    let names = |text: &String| first_parts(text).iter().any(|s| s.contains('<'));
     // Its read's status, its exact read's refusal, and its commit's rejection (an
     // `rdfs:member` statement the secret graph makes disjoint from the commit's `:q`), as
     // `requester` is told them.
@@ -228,11 +229,20 @@ fn a_reader_of_some_graphs_is_told_no_name_from_the_left_out_sentence() {
     let reads = shown[..2].iter().filter(|t| names(t));
     let wrong: Vec<_> = shown.iter().filter(|t| member(t)).chain(reads).collect();
     assert!(wrong.is_empty(), "{wrong:#?}");
-    // The controls, on the same texts by the same predicates: a reader of every graph is told
-    // each.
+    // The controls, on the same texts: a reader of every graph is told the reserved name
+    // itself. Each read's left-out sentences name it as the data writes it, `<…#member>`; its
+    // commit's rejection names it as reject reports show an IRI, plainly, a premise's whole
+    // term (`"…#member"` in the rejection's Debug form).
     let full = told(&Requester::all());
-    let reads = full[..2].iter().filter(|t| !names(t));
-    let missing: Vec<_> = full.iter().filter(|t| !member(t)).chain(reads).collect();
+    let iri = format!("<{RDFS}member>");
+    let named = |text: &String| {
+        let parts = first_parts(text);
+        !parts.is_empty() && parts.iter().all(|s| s.contains(iri.as_str()))
+    };
+    let premise = format!("\"{RDFS}member\"");
+    let reads = full[..2].iter().filter(|t| !named(t));
+    let commit = full[2..].iter().filter(|t| !t.contains(premise.as_str()));
+    let missing: Vec<_> = reads.chain(commit).collect();
     assert!(missing.is_empty(), "{missing:#?}");
 }
 

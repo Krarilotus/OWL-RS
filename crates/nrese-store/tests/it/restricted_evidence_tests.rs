@@ -168,12 +168,11 @@ fn dl_rejection_full_reader_keeps_counts_and_time() {
     let missing = told.iter().filter(|(text, words)| !text.contains(words));
     let missing: Vec<_> = missing.map(|(_, words)| words).collect();
     assert!(missing.is_empty(), "{missing:?} not in {full}\n{horn}");
-    // The justification's size itself.
+    // The justification's size itself: the whole number before the words, 5.
     let detail = &reject.detail;
-    assert!(
-        detail.contains("5 axiom(s) have no model together"),
-        "{detail}"
-    );
+    let size = detail.split_once(" axiom(s) have no model together");
+    let size = size.and_then(|(before, _)| before.rsplit(' ').next());
+    assert_eq!(size, Some("5"), "{detail}");
 }
 
 /// A shape requiring `:p` of every `:B`; `:SECRET_FOCUS a :A` is in `:secret`, and the
