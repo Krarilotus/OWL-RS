@@ -122,9 +122,9 @@ impl Names {
 
     /// Pre-bound values as canonical answers name them, and what each puts in a predicate
     /// where that differs: a search kept as the request gives it. A search vocabulary's IRI
-    /// stays a search there; a value whose representative is one is put in there as the
-    /// constant `alias` makes for the representative ([`Rewrite::predicate`]). Elsewhere each
-    /// value is its class's representative.
+    /// stays a search there; any other value whose representative is one (an IRI or a blank
+    /// node) is put in there as the constant `alias` makes for the representative
+    /// ([`Rewrite::predicate`]). Elsewhere each value is its class's representative.
     pub(super) fn values(
         &self,
         values: &HashMap<Variable, Term>,
@@ -132,16 +132,14 @@ impl Names {
     ) -> (HashMap<Variable, Term>, HashMap<Variable, NamedNode>) {
         let mut predicates = HashMap::new();
         for (v, t) in values {
-            let Term::NamedNode(n) = t else { continue };
-            let predicate = if super::search::names_search(n.as_str()) {
-                n.clone()
-            } else {
-                match self.representative(t.as_ref()) {
+            let predicate = match t {
+                Term::NamedNode(n) if super::search::names_search(n.as_str()) => n.clone(),
+                _ => match self.representative(t.as_ref()) {
                     Some((id, Term::NamedNode(r))) if super::search::names_search(r.as_str()) => {
                         alias(id)
                     }
                     _ => continue,
-                }
+                },
             };
             predicates.insert(v.clone(), predicate);
         }
