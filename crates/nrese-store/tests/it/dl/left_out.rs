@@ -440,21 +440,11 @@ fn a_commit_that_makes_or_ends_a_left_out_axiom_changes_the_status() {
             "ASK { :x a :C }",
         ),
         (
-            // An assertion only, deleted: an undeclared property with literal and node
-            // values is an object property; with no node value left, a data property, and
-            // its range, a class expression, is then no data range.
-            "a property's last node value deleted beside a literal one",
-            format!("{NAMES} :p rdfs:range [ owl:complementOf owl:Nothing ] . :x :p \"v\", :v ."),
-            "DELETE DATA { :x :p :v . }".to_owned(),
-            "INSERT DATA { :x :p :v . }".to_owned(),
-            "ASK { :x a :C }",
-        ),
-        (
             // An assertion only, inserted: a node value for a property that is a data
-            // property by its literal value (an inverse names it, which declares nothing)
-            // makes it an object property, whose range `rdfs:Literal` is a reserved name.
+            // property by its literal value makes it an object property, whose range
+            // `rdfs:Literal` is a reserved name.
             "a node value inserted beside a data property's literal",
-            format!("{NAMES} :p rdfs:range rdfs:Literal . :x :p \"v\" . :q owl:inverseOf :p ."),
+            format!("{NAMES} :p rdfs:range rdfs:Literal . :x :p \"v\" ."),
             "INSERT DATA { :x :p :v . }".to_owned(),
             "DELETE DATA { :x :p :v . }".to_owned(),
             "ASK { :x a :C }",
@@ -462,7 +452,7 @@ fn a_commit_that_makes_or_ends_a_left_out_axiom_changes_the_status() {
     ];
     // The controls: the property's kind stays, by a node value left or by its declaration,
     // so no step leaves anything out.
-    let range = ":p rdfs:range [ owl:complementOf owl:Nothing ] . :x :p \"v\", :v .";
+    let range = ":p rdfs:range [ owl:complementOf owl:Nothing ] . :x :p :v .";
     let kept = [
         (
             "a node value deleted beside another",
@@ -528,11 +518,12 @@ fn a_commit_that_makes_or_ends_a_left_out_axiom_changes_the_status() {
 
 /// A property's kind decides what its axioms say (*OWL 2 Mapping to RDF Graphs* §3.2.1):
 /// with a node value beside three literals, a property `:x`'s class allows at most two
-/// values of is an object property, which the literals don't bear on; with the node value
-/// deleted, it is a data property with three values, which no model has, though nothing is
-/// left out. Deleting an assertion changes the schema here, so the commit is checked whole
-/// and rejected; declared an object property, it keeps its kind, and the deletion is
-/// committed. The cardinality is outside OWL 2 RL, whose rules read statements, not kinds.
+/// values of is a name of two kinds that an axiom reads (Structural Specification §5.8.1),
+/// so the data isn't OWL 2 DL and is committed with its consistency unknown; with the node
+/// value deleted, it is a data property with three values, which no model has. Deleting an
+/// assertion changes the schema here, so the commit is checked whole and rejected; declared
+/// an object property, it stays a name of two kinds beside the literals, and the deletion
+/// is committed. The cardinality is outside OWL 2 RL, whose rules read statements, not kinds.
 #[test]
 fn deleting_the_value_that_gave_a_property_its_kind_is_checked_as_a_schema_change() {
     let two = "\"2\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger>";

@@ -1178,9 +1178,12 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
                 None => 2,
             }] += 1;
             // The indexes decide annotation-property axioms and punning, which the whole
-            // ontology tells after what it left out.
+            // ontology tells after what it left out and what the rules read otherwise (a name
+            // of two kinds, a structure no axiom uses): the indexes never see those, and
+            // decide only beside a record that tells them.
             let mut kept = nrese_owl::Ontology::clone(whole.value());
-            kept.diagnostics.retain(|d| !d.leaves_out());
+            kept.diagnostics
+                .retain(|d| !d.leaves_out() && !d.reads_otherwise());
             let past = by_ontology(read, &kept);
             if let Some(reason) = &past {
                 past_found[usize::from(!reason.contains("annotation-property axioms"))] += 1;

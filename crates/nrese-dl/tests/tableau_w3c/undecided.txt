@@ -1,4 +1,7 @@
 # W3C tests of species DL the run doesn't decide, with the reason: one per line,
-# "name (TestType)<TAB>why". The v2 gate decides every one (docs/plan/2026-10-05-v2-merge-checklist.md
-# §4, the DL scope; over-budget tests are decided on their small budget), so the list is empty:
-# the run fails on an open test not listed here, and on a listed one that is decided.
+# "name (TestType)<TAB>why". The v2 gate decides every one it reads as OWL 2 DL
+# (docs/plan/2026-10-05-v2-merge-checklist.md §4, the DL scope; over-budget tests are decided on
+# their small budget); the two below aren't OWL 2 DL as written, so the reader leaves them out.
+# The run fails on an open test not listed here, and on a listed one that is decided.
+FS2RDF-domain-range-expression-ar (ConsistencyTest)	not OWL 2 DL, as the WG's test notes: p5, p6 and p7 are named as object and as data properties, u2 and c2 as classes and as datatypes, each by an axiom (Structural Specification 5.8.1; fatal, Diagnostic::TwoKinds); see nrese-owl's expected-failures.txt and functional-differences.txt
+FS2RDF-domain-range-simple-ar (ConsistencyTest)	not OWL 2 DL, as the WG's test notes: c3 and c6 are named as classes and as datatypes, each by an axiom (Structural Specification 5.8.1; fatal, Diagnostic::TwoKinds); see nrese-owl's expected-failures.txt and functional-differences.txt

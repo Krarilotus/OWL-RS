@@ -66,6 +66,26 @@ fn a_property_used_with_literals_and_resources_is_two_kinds() {
     true_never_sound(&dl, ":a a :C");
 }
 
+/// F2's consistency is unknown by its own cause: the engines read the name of two kinds as one
+/// name. Nothing of the data was left out, and the reason doesn't say so.
+#[test]
+fn a_name_of_two_kinds_leaves_the_consistency_unknown_by_its_own_cause() {
+    let (dl, _, verdict) =
+        committed(":C a owl:Class . :p rdfs:domain :C . :a :p \"x\" . :b :p :c .");
+    assert_eq!(verdict, "unknown");
+    let status = dl.store().dl().status().expect("a DL status");
+    let why = status
+        .consistency
+        .verdict
+        .reason()
+        .unwrap_or("none")
+        .to_owned();
+    assert!(
+        why.contains("two kinds") && why.contains("one name") && !why.contains("left out"),
+        "{why}"
+    );
+}
+
 /// The witness (i): `:q` is declared an annotation property and given a characteristic of
 /// an object property. prp-fp equates `:a`'s two annotation values, which OWL 2 DL never
 /// reads as property values; a statement copied along that equality is no more entailed.
@@ -207,7 +227,7 @@ fn unused_structures_equated_as_individuals_leave_the_rules_route() {
 #[test]
 fn a_kept_upper_bound_takes_the_premise_from_the_gates_read() {
     let config = DlConfig {
-        timeout: Some(Duration::ZERO),
+        timeout: Some(Duration::from_nanos(1)),
         ..DlConfig::default()
     };
     let (dl, _, _) = committed_with(
@@ -221,8 +241,11 @@ fn a_kept_upper_bound_takes_the_premise_from_the_gates_read() {
 }
 
 /// The treatment of each kind is a setting (`dl.treatments`): F2's name of two kinds taken
-/// off the route instead of fatal leaves the consistency decided, and its answer still isn't
-/// told sound; case (b)'s unused structure taken as fatal leaves it unknown.
+/// off the route instead of fatal is off the route all the same, its answer still isn't told
+/// sound, and its consistency stays unknown, as no verdict of engines that read the name as
+/// one speaks of the source: neither a model (F2) nor a clash (a cardinality the two kinds'
+/// values together break, which the data property's values alone keep); case (b)'s unused
+/// structure taken as fatal leaves it unknown.
 #[test]
 fn the_treatment_of_each_kind_is_a_setting() {
     use nrese_owl::{Strict, Treatments};
@@ -238,8 +261,17 @@ fn the_treatment_of_each_kind_is_a_setting() {
         config(off),
         ":C a owl:Class . :p rdfs:domain :C . :a :p \"x\" . :b :p :c .",
     );
-    assert_eq!((route, verdict.as_str()), ("rebuilt", "consistent"));
+    assert_eq!((route, verdict.as_str()), ("rebuilt", "unknown"));
     true_never_sound(&dl, ":a a :C");
+    let two = "\"2\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger>";
+    let (_, route, verdict) = committed_with(
+        config(off),
+        &format!(
+            ":C rdfs:subClassOf [ owl:onProperty :p ; owl:maxCardinality {two} ] . \
+             :x a :C ; :p \"u\", \"v\", :v ."
+        ),
+    );
+    assert_eq!((route, verdict.as_str()), ("rebuilt", "unknown"));
     let fatal = Treatments {
         unused_reads_more: Strict::Fatal,
         ..Treatments::default()
