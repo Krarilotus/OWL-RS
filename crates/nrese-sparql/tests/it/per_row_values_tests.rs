@@ -257,3 +257,70 @@ fn a_drawing_filter_keeps_its_other_conditions_applied_early() {
     options.resources.memory = nrese_exec::Envelope::new(Some(256 * 1024), None);
     assert!(values_in(&engine, query, &options, &["wide"]).is_empty());
 }
+
+/// A store holding `quads`, each `(graph, subject, predicate, object)` with the default
+/// graph where `graph` is `None`.
+fn store(quads: &[(Option<&str>, &str, &str, Literal)]) -> Engine {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for (graph, s, p, o) in quads {
+        let graph = graph.map_or(GraphName::DefaultGraph, |g| {
+            GraphName::NamedNode(NamedNode::new_unchecked(g))
+        });
+        let s = NamedNode::new_unchecked(*s);
+        let p = NamedNode::new_unchecked(*p);
+        tx.insert(Quad::new(s, p, o.clone(), graph).as_ref());
+    }
+    tx.commit().unwrap();
+    engine
+}
+
+/// Spec: `{ ?s <urn:few> ?o BIND(BNODE() AS ?c) }` has two solutions, `<urn:a>` and
+/// `<urn:b>`, each with its own blank node. Joined with `VALUES ?s { <urn:a> UNDEF }`, the
+/// `<urn:a>` row meets the first and the unbound row meets both: three rows, two distinct
+/// blank nodes, the two `<urn:a>` rows sharing one. A draw per joined row gives three.
+#[test]
+fn a_joined_row_with_the_key_unbound_meets_the_groups_solutions_as_drawn() {
+    let engine = store(&[
+        (None, "urn:a", "urn:few", Literal::from(1)),
+        (None, "urn:b", "urn:few", Literal::from(2)),
+    ]);
+    let query = "SELECT ?s ?c { VALUES ?s { <urn:a> UNDEF } \
+                 { ?s <urn:few> ?o BIND(BNODE() AS ?c) } }";
+    for as_written in [false, true] {
+        let options = QueryOptions {
+            as_written,
+            ..QueryOptions::default()
+        };
+        let mut found = values_in(&engine, query, &options, &["s", "c"]);
+        found.sort();
+        assert_eq!(found.len(), 3, "{found:?}, as written: {as_written}");
+        let a: Vec<_> = found.iter().filter(|r| r[0] == "<urn:a>").collect();
+        assert_eq!(a.len(), 2, "{found:?}, as written: {as_written}");
+        assert_eq!(a[0][1], a[1][1], "{found:?}, as written: {as_written}");
+        let b = found.iter().find(|r| r[0] == "<urn:b>").unwrap();
+        assert_ne!(b[1], a[0][1], "{found:?}, as written: {as_written}");
+    }
+}
+
+/// Spec: in `GRAPH <urn:g>`, `{ ?s <urn:p> ?o BIND(BNODE() AS ?c) }` has one solution, the
+/// graph's one statement, so one blank node, which the join copies to both of the
+/// duplicate `VALUES ?s { <urn:a> <urn:a> }` rows: two rows, one blank node.
+#[test]
+fn a_drawing_group_in_a_named_graph_draws_once_for_duplicate_joined_rows() {
+    let engine = store(&[(Some("urn:g"), "urn:a", "urn:p", Literal::from(1))]);
+    let query = "SELECT ?s ?c { GRAPH <urn:g> { VALUES ?s { <urn:a> <urn:a> } \
+                 { ?s <urn:p> ?o BIND(BNODE() AS ?c) } } }";
+    for as_written in [false, true] {
+        let options = QueryOptions {
+            as_written,
+            ..QueryOptions::default()
+        };
+        let found = values_in(&engine, query, &options, &["s", "c"]);
+        assert_eq!(found.len(), 2, "{found:?}, as written: {as_written}");
+        assert!(
+            !found[0][1].is_empty() && found[0][1] == found[1][1],
+            "{found:?}, as written: {as_written}"
+        );
+    }
+}
