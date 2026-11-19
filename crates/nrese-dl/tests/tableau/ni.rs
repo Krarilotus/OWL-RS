@@ -5,6 +5,7 @@
 use std::time::Duration;
 
 use super::build::Build;
+use nrese_dl::limits::Limit;
 use nrese_dl::tableau::{Answer, Config, consistency, satisfiable};
 use nrese_owl::{Axiom, Characteristic, ClassExpr, ObjProp, Ontology, normalise};
 
@@ -37,11 +38,18 @@ fn decided(o: &Ontology, quick: bool) -> Answer {
         max_branch_points: Some(2_000_000),
         ..configs().last().expect("16 configs")
     };
+    let late = Config {
+        timeout: Some(Duration::ZERO),
+        ..default.clone()
+    };
     let default = consistency(o, &default).answer;
     assert!(
         matches!(default, Answer::Consistent | Answer::Inconsistent),
         "{default:?}"
     );
+    // The control on the same words: past its deadline, a run gives up on the clock.
+    let late = consistency(o, &late).answer;
+    assert!(on_the_clock(&late), "{late:?}");
     let expansions: &[u32] = if quick { &[0, 2] } else { &[0, 2, 8] };
     for &expand in expansions {
         for config in configs().filter(|c| !quick || c.backjumping) {
@@ -53,12 +61,17 @@ fn decided(o: &Ontology, quick: bool) -> Answer {
             // Giving up is allowed on the deterministic budget only, never on the clock.
             assert!(
                 answer == default
-                    || matches!(&answer, Answer::GaveUp(why) if !why.contains("time budget")),
+                    || (matches!(answer, Answer::GaveUp(_)) && !on_the_clock(&answer)),
                 "{answer:?}, not {default:?}, under {config:?}"
             );
         }
     }
     default
+}
+
+/// Whether `answer` gives up on the clock, by the budget its reason names.
+fn on_the_clock(answer: &Answer) -> bool {
+    matches!(answer, Answer::GaveUp(why) if Limit::named_in(why) == Some(Limit::Time))
 }
 
 fn inverse_pair(b: &mut Build, p: u64, q: u64) {

@@ -192,26 +192,31 @@ fn a_rejection_shows_no_axiom_of_a_graph_the_committer_cannot_read() {
         ReadScope::Graphs(Arc::clone(&access)),
         WriteScope::Graphs(access),
     );
-    let rejected = dl.apply(
-        MutationCommand::Update(SparqlUpdateRequest::new(format!(
-            "{PREFIXES}INSERT DATA {{ GRAPH :open {{ :x a :A , :D }} }}"
-        ))),
-        &committer,
-        &MutationTicket::new(),
-    );
-    let Err(MutationError::Rejected(reject)) = rejected else {
-        panic!("expected a rejection, got {rejected:?}");
+    let rejection = |committer: &Requester| {
+        let rejected = dl.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(format!(
+                "{PREFIXES}INSERT DATA {{ GRAPH :open {{ :x a :A , :D }} }}"
+            ))),
+            committer,
+            &MutationTicket::new(),
+        );
+        let Err(MutationError::Rejected(reject)) = rejected else {
+            panic!("expected a rejection, got {rejected:?}");
+        };
+        reject
     };
+    let reject = rejection(&committer);
     // Not the secret union or disjointness, nor which of the committer's statements they
     // take part in, nor how many axioms or statements it took.
     assert!(reject.explanation.is_none(), "{reject:?}");
-    for leak in [
+    let leaks = [
         "unionOf",
         "disjointWith",
         "equivalentClass",
         "example.com/x",
         "axiom",
-    ] {
+    ];
+    for leak in leaks {
         assert!(!reject.detail.contains(leak), "{leak}: {}", reject.detail);
     }
     assert!(
@@ -221,6 +226,11 @@ fn a_rejection_shows_no_axiom_of_a_graph_the_committer_cannot_read() {
         "{}",
         reject.detail
     );
+    // The control on the same words: a committer that may read every graph is told them.
+    let full = format!("{:?}", rejection(&Requester::all()));
+    for leak in leaks {
+        assert!(full.contains(leak), "{leak} not in {full}");
+    }
 }
 
 /// U1 with representatives under graph access: what U1's classes give (both departments

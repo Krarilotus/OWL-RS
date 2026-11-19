@@ -266,7 +266,10 @@ fn an_rl_rejection_shows_no_premise_of_a_graph_the_committer_cannot_read() {
                 .map(|e| format!("{} {} {}", e.subject, e.predicate, e.object))
                 .collect();
             assert_eq!(shown.len(), 3, "{shown:#?}");
+            // The controls on the same words as the restricted committer's checks.
             assert!(shown.iter().any(|s| secret(s)), "{shown:#?}");
+            let a = format!("{EX}A");
+            assert!(shown.iter().any(|s| s.contains(&a)), "{shown:#?}");
         }
     }
 }
