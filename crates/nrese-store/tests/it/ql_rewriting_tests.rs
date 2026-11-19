@@ -2126,13 +2126,15 @@ fn a_membership_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
         let result = store
             .execute_query(&SparqlQueryRequest::all(query.as_str()))
             .unwrap();
-        let status = result.completeness.unwrap_or_default();
-        let reasons: Vec<String> = status.reasons.iter().map(|r| r.text.clone()).collect();
-        (
-            select_rows(&result.payload),
-            status.as_str().to_owned(),
-            reasons,
-        )
+        // No status is "none", never `complete`: an answer without reasoning claims nothing.
+        let (status, reasons) = match &result.completeness {
+            Some(c) => (
+                c.as_str().to_owned(),
+                c.reasons.iter().map(|r| r.text.clone()).collect(),
+            ),
+            None => ("none".to_owned(), Vec::new()),
+        };
+        (select_rows(&result.payload), status, reasons)
     };
     let c = format!("x={E}c");
     let certain = [c.clone(), format!("x={list}")];
@@ -2164,6 +2166,8 @@ fn a_membership_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
         Ruleset::Owl2Ql,
         true,
     );
+    // Its commits keep the owl2-ql closure, and so the rewriting, after the update.
+    cached.use_reasoning_rules(Some(Ruleset::Owl2Ql.into()));
     let before = told(&cached);
     assert_eq!(
         (&before.0, before.1.as_str()),
