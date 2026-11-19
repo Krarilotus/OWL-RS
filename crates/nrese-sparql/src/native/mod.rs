@@ -795,15 +795,18 @@ fn native_pattern<'q>(
         .pre_bound
         .as_ref()
         .map(|values| match &ctx.canonical {
-            Some(names) => Cow::Owned(names.values(values, |id| {
-                let alias = internal::class_constant(id);
-                ctx.register_alias(alias.as_str(), id);
-                alias
-            })),
-            None => Cow::Borrowed(&**values),
+            Some(names) => {
+                let (values, predicates) = names.values(values, |id| {
+                    let alias = internal::class_constant(id);
+                    ctx.register_alias(alias.as_str(), id);
+                    alias
+                });
+                (Cow::Owned(values), predicates)
+            }
+            None => (Cow::Borrowed(&**values), HashMap::new()),
         });
     let pattern = match &pre_bound {
-        Some(values) => {
+        Some((values, predicates)) => {
             // A blank node is put in as a made constant that stands for the node.
             for term in values.values() {
                 if let Term::BlankNode(b) = term
@@ -812,7 +815,8 @@ fn native_pattern<'q>(
                     ctx.register_alias(internal::blank_constant(b.as_str()).as_str(), id.raw());
                 }
             }
-            Cow::Owned(substitute::Values::new(ctx, values)?.top(&pattern))
+            let values = substitute::Values::new(ctx, values)?.with_predicates(predicates);
+            Cow::Owned(values.top(&pattern))
         }
         None => pattern,
     };
