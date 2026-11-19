@@ -48,6 +48,23 @@ thread_local! {
     /// its caller's thread.
     static BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static REFUSED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// What the next build on this thread runs first: a guard's hold on a build in progress.
+    static ON_BUILD: std::cell::Cell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Runs `hold` at the start of the next build on this thread ([`ON_BUILD`]), once.
+#[cfg(test)]
+pub(super) fn on_build(hold: impl FnOnce() + 'static) {
+    ON_BUILD.set(Some(Box::new(hold)));
+}
+
+/// Runs the hold a guard set for this thread's build ([`on_build`]), if any.
+#[cfg(test)]
+fn held() {
+    if let Some(hold) = ON_BUILD.take() {
+        hold();
+    }
 }
 
 /// Builds begun on this thread ([`BUILDS`]).
@@ -110,6 +127,8 @@ fn bound(snapshot: &Snapshot) -> usize {
 fn build(snapshot: &Snapshot) -> Representatives {
     #[cfg(test)]
     BUILDS.with(|builds| builds.set(builds.get() + 1));
+    #[cfg(test)]
+    held();
     let mut out = HashMap::new();
     // A store kept over representatives knows its classes; its `sameAs` relation, read
     // expanded, would list every pair of each class.
@@ -141,7 +160,7 @@ fn build(snapshot: &Snapshot) -> Representatives {
 /// `state`'s representatives admitted to the process-wide entry, replacing what it held: the
 /// entry's only writer, for published state alone. They are built from the token's own
 /// snapshot and kept with it.
-fn admit(
+pub(super) fn admit(
     cache: &mut Option<(Snapshot, Arc<Representatives>)>,
     state: &SharedState<'_>,
 ) -> Arc<Representatives> {

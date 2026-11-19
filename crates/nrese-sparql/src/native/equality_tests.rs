@@ -20,7 +20,9 @@ use nrese_exec::{Budget, Envelope};
 use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
 use nrese_sparql_syntax::Query;
 
-use super::equality::{builds, kept_for, kept_is_published, refused};
+use super::equality::{
+    Representatives, admit, builds, kept_for, kept_is_published, on_build, refused, representative,
+};
 use crate::{QueryOptions, QueryResults, ReadView};
 
 const EX: &str = "http://example.com/";
@@ -627,4 +629,100 @@ fn a_refused_request_build_answers_without_classes() {
     );
     assert!(!kept_for(&pending), "nothing kept for the pending version");
     assert!(kept_is_published(), "only published state kept");
+}
+
+/// A published build doesn't stop another repository's query.
+///
+/// - Input: one engine's published query held inside the build of its classes; while it is
+///   held, a query on another engine's published snapshot (another repository).
+/// - Expected: the second query answers, with classes it built itself, before the first is
+///   let go ([`ORDINARY`], as written); then the first answers [`ORDINARY`] too.
+#[test]
+fn a_held_published_build_does_not_stop_another_repositorys_query() {
+    use std::sync::mpsc::channel;
+    use std::time::Duration;
+
+    let first = ordinary();
+    let held = first.snapshot();
+    let (entered, began) = channel();
+    let (release, released) = channel::<()>();
+    let holder = std::thread::spawn(move || {
+        on_build(move || {
+            entered.send(()).unwrap();
+            // Bounded: a guard that fails drops its sender and ends the hold at once.
+            let _ = released.recv_timeout(Duration::from_secs(60));
+        });
+        answers(&held, &closed())
+    });
+    began
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the first query's build began");
+
+    let second = ordinary();
+    let other = second.snapshot();
+    let (sent, answered) = channel();
+    let reader = std::thread::spawn(move || {
+        let before = builds();
+        let got = answers(&other, &closed());
+        sent.send((got, builds() - before)).unwrap();
+    });
+    let during = answered.recv_timeout(Duration::from_secs(5));
+    release.send(()).unwrap();
+    let first_answer = holder.join().unwrap();
+    reader.join().unwrap();
+
+    let (got, built) = during.expect("another repository's query answered during the build");
+    assert_eq!(got, ORDINARY, "another repository's answers");
+    assert_eq!(
+        built, 1,
+        "another repository's classes, built for its own version"
+    );
+    assert_eq!(first_answer, ORDINARY, "the held query's answers");
+}
+
+/// A late build of an older version leaves a newer version's entry in place.
+///
+/// - Input: an engine's version, then a commit's later one, whose entry the slot holds; the
+///   older version's classes admitted after it (a build that began before the commit and
+///   ended after the newer entry was made).
+/// - Expected: the slot still holds the newer version's entry, the same one; the older
+///   version's query still gets its own classes (`a` and `b` one identity, `a` the least).
+#[test]
+fn a_late_build_of_an_older_version_leaves_the_newer_entry() {
+    let engine = ordinary();
+    let older = engine.snapshot();
+    let i = ids(&engine);
+    let mut writer = engine.transaction();
+    change(&mut writer, &i);
+    writer.commit().unwrap();
+    let newer = engine.snapshot();
+    assert!(
+        newer.revision() > older.revision(),
+        "the fixture: a later revision"
+    );
+    assert!(
+        i.a.raw() < i.b.raw(),
+        "the fixture: `a` the least of its class"
+    );
+
+    // The newer version's entry: a stand-in, told apart by its pointer.
+    let entry = Arc::new(Representatives::new());
+    let slot = std::sync::Mutex::new(Some((newer.clone(), Arc::clone(&entry))));
+    let state = older.shared_state().expect("a published snapshot");
+    let got = admit(&mut slot.lock().unwrap(), &state);
+
+    let kept = slot.lock().unwrap();
+    let (at, held) = kept.as_ref().expect("an entry");
+    assert!(at.same_version(&newer), "the newer version's entry is kept");
+    assert!(Arc::ptr_eq(held, &entry), "the same entry");
+    assert_eq!(
+        representative(&got, i.b.raw()),
+        i.a.raw(),
+        "the older query's classes"
+    );
+    assert_eq!(
+        representative(&got, i.a.raw()),
+        i.a.raw(),
+        "the older query's classes"
+    );
 }
