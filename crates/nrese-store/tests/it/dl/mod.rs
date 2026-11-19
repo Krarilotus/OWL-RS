@@ -21,6 +21,7 @@ mod mode;
 mod model_labels;
 mod outside;
 mod plans;
+mod premise;
 mod queries;
 mod representatives;
 mod reserved_names;

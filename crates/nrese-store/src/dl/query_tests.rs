@@ -814,6 +814,44 @@ fn committed_reads_without_a_record_pass_over_the_ontology_at_most_once() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Off the route, `:p` has a domain and is given a literal and an IRI: a name of two kinds,
+/// which breaks the premise of the rules' closure. With no record of the revision (as a
+/// reopened store has none), the consistency check a read runs records what the premise
+/// tells, never "nothing left out", and a committed read is told it.
+#[test]
+fn a_consistency_check_records_what_the_premise_tells() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
+    let pipeline = crate::MutationPipeline::new(
+        Arc::clone(&store),
+        Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+            ReasoningMode::Owl2Dl,
+        ))),
+    );
+    let two_kinds = ":C a owl:Class . :p rdfs:domain :C . :a :p \"x\" . :b :p :c .";
+    commit(
+        &pipeline,
+        &format!("INSERT DATA {{ {OFF_ROUTE}{two_kinds} }}"),
+    );
+    *store.dl().status.lock().unwrap() = None;
+    let snapshot = store.engine().snapshot();
+    let _ = consistency_at(
+        &store,
+        &snapshot,
+        &unproved_view(&snapshot),
+        &CancellationToken::new(),
+        Deadline::after(store.config().dl.timeout),
+        &nrese_exec::Envelope::unlimited(),
+    );
+    let recorded = store.dl().status().expect("a record").left_out;
+    assert!(
+        matches!(&recorded, Some(Some(why)) if why.contains("two kinds")),
+        "the record names the two kinds: {recorded:?}"
+    );
+    let told = reads_differently(&store, Revision::Committed(&snapshot));
+    assert!(told.is_some(), "a committed read is told it");
+}
+
 const PREF_LABEL: &str = "<http://www.w3.org/2004/02/skos/core#prefLabel>";
 
 /// A store with an annotation-property axiom of each kind (a domain, a range, a
