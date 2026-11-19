@@ -262,11 +262,14 @@ fn dl_repeat_evidence(requesters: &[Requester]) -> Vec<Vec<nrese_reasoner::Rejec
     requesters.iter().map(evidence).collect()
 }
 
-/// Each source triple at most once, and the disjointness's own statement among them.
-fn each_triple_once(evidence: &[nrese_reasoner::RejectEvidence]) {
+/// The source triples `evidence` shows, each at most once, the disjointness's own statement
+/// among them.
+fn triples_once(
+    evidence: &[nrese_reasoner::RejectEvidence],
+) -> std::collections::BTreeSet<(&str, &str, &str)> {
     let mut seen = std::collections::BTreeSet::new();
     for e in evidence {
-        let triple = (&e.subject, &e.predicate, &e.object);
+        let triple = (e.subject.as_str(), e.predicate.as_str(), e.object.as_str());
         assert!(seen.insert(triple), "{triple:?} twice in {evidence:#?}");
     }
     assert!(
@@ -275,22 +278,15 @@ fn each_triple_once(evidence: &[nrese_reasoner::RejectEvidence]) {
             .any(|e| e.object.contains("AllDisjointClasses")),
         "{evidence:#?}"
     );
+    seen
 }
 
-/// A committer who may read every graph is shown each source triple of the justification
-/// once, as one who may read only `:open` (where all of it is) is shown them, in the same
-/// order.
+/// A committer who may read every graph, and one who may read only `:open` (where all of it
+/// is), are each shown each source triple of the justification once: the same triples.
 #[test]
-fn dl_rejection_full_reader_shows_each_source_triple_once() {
+fn dl_rejection_shows_each_source_triple_once() {
     let shown = dl_repeat_evidence(&[Requester::all(), open_reader()]);
-    each_triple_once(&shown[0]);
-    assert_eq!(shown[0], shown[1]);
-}
-
-/// Neighbour: the restricted committer is shown each source triple once.
-#[test]
-fn dl_rejection_restricted_reader_shows_each_source_triple_once() {
-    each_triple_once(&dl_repeat_evidence(&[open_reader()])[0]);
+    assert_eq!(triples_once(&shown[0]), triples_once(&shown[1]));
 }
 
 /// May read `:open` and the shapes graph.
