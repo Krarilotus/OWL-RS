@@ -249,4 +249,41 @@ fn a_drawing_group_met_by_distinct_keys_is_matched_from_them() {
             "{found:?}: {query}"
         );
     }
+    // Two joined rows with the same key meet the one solution of the group, which draws
+    // once: both rows get the same value.
+    let query = "SELECT ?s ?u { VALUES (?s ?k) { (<urn:s:7> 1) (<urn:s:7> 2) } \
+                 { ?s <urn:label> ?l BIND(STRUUID() AS ?u) } }";
+    let found = values_in(&engine, query, &options, &["s", "u"]);
+    assert_eq!(found.len(), 2, "{found:?}");
+    assert!(
+        !found[0][1].is_empty() && found[0][1] == found[1][1],
+        "{found:?}"
+    );
+}
+
+/// Spec: `FILTER(STRLEN(?gate) > 8 && RAND() < 0.5)` over `?s <urn:gate> ?gate ;
+/// <urn:wide> ?wide` keeps no row whatever is drawn, since the one `?gate` is "no". The
+/// condition that draws nothing may be applied as soon as `?gate` is bound, before the
+/// 65,536 `?wide` statements are joined, so the empty answer comes within a memory budget
+/// (256 KiB) that does not hold them.
+#[test]
+fn a_drawing_filter_keeps_its_other_conditions_applied_early() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let s = NamedNode::new_unchecked("urn:s");
+    let gate = NamedNode::new_unchecked("urn:gate");
+    let no = Literal::new_simple_literal("no");
+    tx.insert(Quad::new(s.clone(), gate, no, GraphName::DefaultGraph).as_ref());
+    let wide = NamedNode::new_unchecked("urn:wide");
+    for i in 0..65_536 {
+        let o = Literal::new_simple_literal(format!("wide {i}"));
+        tx.insert(Quad::new(s.clone(), wide.clone(), o, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let query = "SELECT ?wide { VALUES ?s { <urn:s> } \
+                 { ?s <urn:gate> ?gate ; <urn:wide> ?wide \
+                   FILTER(STRLEN(?gate) > 8 && RAND() < 0.5) } }";
+    let mut options = QueryOptions::default();
+    options.resources.memory = nrese_exec::Envelope::new(Some(256 * 1024), None);
+    assert!(values_in(&engine, query, &options, &["wide"]).is_empty());
 }
