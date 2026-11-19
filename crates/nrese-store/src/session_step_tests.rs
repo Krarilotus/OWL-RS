@@ -41,6 +41,8 @@ const MISSING_COMMIT: u8 = 19;
 const LOST_REPEAT: u8 = 20;
 const WRITE_DURING_COMMIT: u8 = 21;
 const STALE_REPEAT_EFFECT: u8 = 22;
+const FAILED_ROLLBACK_REMOVES: u8 = 23;
+const DROP_WITHOUT_CANCEL: u8 = 24;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Request {
@@ -406,6 +408,7 @@ impl<const N: usize> World<N> {
             DROP_TO_U | STALE_REPEAT_EFFECT => Some(Invariant::I8),
             READ_WITHOUT_SNAPSHOT | LOST_REPEAT => Some(Invariant::I5),
             NO_IDLE_EXPIRY => Some(Invariant::I6),
+            DROP_WITHOUT_CANCEL => Some(Invariant::I10),
             UNKNOWN_ROLLBACK
             | JOIN_ANSWER
             | STALE_LOOKUP
@@ -417,6 +420,7 @@ impl<const N: usize> World<N> {
             | WRONG_STREAM_ANSWER
             | FAILED_TOMBSTONE_COMMITS
             | COMMITTED_ROLLBACK
+            | FAILED_ROLLBACK_REMOVES
             | MISSING_COMMIT => Some(Invariant::I3),
             _ => None,
         };
@@ -456,7 +460,7 @@ impl<const N: usize> World<N> {
     }
 
     fn abandon(&mut self, id: usize, request: Id) {
-        self.clients[id].owed[request] = None;
+        self.clients[id].abandon(request);
         self.store.transactions[id].producers[request] = None;
     }
 
@@ -590,6 +594,12 @@ fn transition<const MUTATION: u8>(state: State, event: Event) -> Transition {
         (STALE_REPEAT_EFFECT, State::Gone, Event::Action(Action::Commit { .. })) => {
             result.effect = Effect::WaitOutcome;
         }
+        (
+            FAILED_ROLLBACK_REMOVES,
+            State::E(Outcome::Failed(_) | Outcome::Refused(_)),
+            Event::Action(Action::Rollback),
+        ) => result.effect = Effect::Remove,
+        (DROP_WITHOUT_CANCEL, State::Pw, Event::Dropped) => result.effect = Effect::None,
         _ => {}
     }
     Transition {
@@ -995,6 +1005,9 @@ impl<const N: usize> World<N> {
             }
             Move::DropTaskRequest(id, slot) => {
                 let task = self.sessions[id].tasks[slot].unwrap();
+                if task.phase == Phase::Pending {
+                    self.store.transactions[id].dropped_unclaimed |= task.bit;
+                }
                 self.abandon(id, task.request);
                 if matches!(task.phase, Phase::Recorded(_)) {
                     self.sessions[id].tasks[slot] = None;
@@ -1344,7 +1357,7 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
         {
             moves.push(Move::OtherCommit);
         }
-        if FOCUS == FAILED_TOMBSTONE_COMMITS
+        if matches!(FOCUS, FAILED_TOMBSTONE_COMMITS | FAILED_ROLLBACK_REMOVES)
             && !world.sessions[N - 1].expired
             && world.store.transactions[N - 1].end.is_none()
         {
@@ -1397,6 +1410,8 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
                 | READ_WITHOUT_SNAPSHOT
                 | WRITE_STARTS_SWITCH
                 | FAILED_TOMBSTONE_COMMITS
+                | FAILED_ROLLBACK_REMOVES
+                | DROP_WITHOUT_CANCEL
                 | COMMITTED_ROLLBACK => N - 1,
                 _ => 0,
             };
@@ -1528,6 +1543,7 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
                 (session_oracle::i1(client, &next.store), Invariant::I1),
                 (session_oracle::i4(client, &next.store), Invariant::I4),
                 (session_oracle::i5(client, &next.store), Invariant::I5),
+                (session_oracle::i10(client, &next.store), Invariant::I10),
             ];
             for (holds, invariant) in checks {
                 if !holds {
@@ -1778,6 +1794,18 @@ fn explorer_rejects_repeat_started_after_idle_removal() {
     red::<STALE_REPEAT_EFFECT>("I8");
 }
 
+// §2b E3 and E1: a successful rollback leaves a failed end available to COMMIT.
+#[test]
+fn explorer_rejects_rollback_removing_a_failed_tombstone() {
+    red::<FAILED_ROLLBACK_REMOVES>("I3");
+}
+
+// Rule 3 and P16: a handler drop before claim prevents the write from applying.
+#[test]
+fn explorer_rejects_an_unclaimed_write_after_handler_drop() {
+    red::<DROP_WITHOUT_CANCEL>("I10");
+}
+
 #[test]
 fn oracle_source_uses_only_its_records() {
     let source = include_str!("session_oracle.rs");
@@ -1928,8 +1956,23 @@ fn rollback_after_longest_life_uses_the_tombstone() {
                 answers.push(answer);
             }
         });
-        assert_eq!(answers, [Answer::NoContent]);
-        assert!(session.store.transactions[1].mapped);
+        for action in [Move::Lookup(1, Op::Commit), Move::SessionLock(1)] {
+            session.do_move::<GOOD>(action, |(_, answer)| {
+                if answer != Answer::None {
+                    answers.push(answer);
+                }
+            });
+        }
+        assert_eq!(
+            answers,
+            [
+                Answer::NoContent,
+                Answer::Recorded {
+                    outcome: Outcome::Failed(Problem::LongestLife),
+                    evidence: true,
+                },
+            ]
+        );
     }
 }
 

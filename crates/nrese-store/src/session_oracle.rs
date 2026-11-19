@@ -94,12 +94,19 @@ pub(super) struct ClientRecord {
     pub first_shown: Option<Version>,
     pub acknowledged: u8,
     pub refused: u8,
+    pub abandoned: u8,
     pub receipt: Option<Receipt>,
 }
 
 impl ClientRecord {
     pub fn key(&self) -> impl Ord + Hash {
-        (self.owed, self.first_shown, self.acknowledged, self.refused)
+        (
+            self.owed,
+            self.first_shown,
+            self.acknowledged,
+            self.refused,
+            self.abandoned,
+        )
     }
 
     pub fn send(&mut self, sent: Sent) -> Id {
@@ -131,6 +138,14 @@ impl ClientRecord {
             self.owed[id] = None;
         }
         self.receipt = Some(Receipt { id, sent, seen });
+    }
+
+    pub fn abandon(&mut self, id: Id) {
+        if let Some(sent) = self.owed[id].take()
+            && sent.op == Op::Write
+        {
+            self.abandoned |= sent.tag;
+        }
     }
 }
 
@@ -204,6 +219,7 @@ pub(super) struct Transaction {
     pub idle: bool,
     pub pending: u8,
     pub applied: u8,
+    pub dropped_unclaimed: u8,
     pub publication: Option<Publication>,
     pub published_twice: bool,
     pub read_only: bool,
@@ -226,6 +242,7 @@ impl Default for Transaction {
             idle: false,
             pending: 0,
             applied: 0,
+            dropped_unclaimed: 0,
             publication: None,
             published_twice: false,
             read_only: false,
@@ -327,6 +344,7 @@ pub(super) enum Invariant {
     I7,
     I8,
     I9,
+    I10,
     InvalidTransition,
 }
 
@@ -391,13 +409,14 @@ pub(super) fn i3<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
             if let Some(end) = prior_end {
                 return match sent.op {
                     Op::Commit => matches!(seen, Seen::Commit(answer, _) if answer == end),
-                    Op::Rollback => {
-                        seen == match end {
-                            End::Committed => Seen::Error(Failure::AlreadyCommitted),
-                            End::Unknown => Seen::Error(Failure::OutcomeUnknown),
-                            End::Refused(_) | End::Failed(_) => Seen::RolledBack,
+                    Op::Rollback => match end {
+                        End::Committed => seen == Seen::Error(Failure::AlreadyCommitted),
+                        End::Unknown => seen == Seen::Error(Failure::OutcomeUnknown),
+                        // E3 acknowledges rollback and retains the recorded end for E1.
+                        End::Refused(_) | End::Failed(_) => {
+                            seen == Seen::RolledBack && txn.mapped && txn.end == Some(end)
                         }
-                    }
+                    },
                     _ => seen == Seen::Ended(end),
                 };
             }
@@ -535,4 +554,11 @@ pub(super) fn i9<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
         (None, Seen::Error(Failure::CommitBusy(true))) => txn.worker,
         _ => false,
     }
+}
+
+// Lifecycle rule 3, Pw9 and S13: a drop before the ticket's claim wins cancellation.
+pub(super) fn i10<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) -> bool {
+    let txn = store.transaction(client);
+    let written = txn.applied | txn.publication.map_or(0, |publication| publication.tags);
+    client.abandoned & txn.dropped_unclaimed & written == 0
 }
