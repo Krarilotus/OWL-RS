@@ -938,8 +938,8 @@ async fn quarantine_commit_failure_async_import_completes_with_warning() {
 }
 
 #[tokio::test]
-async fn published_answer_followup_noop_keeps_the_io_answer() {
-    let (app, _) = import_with_quarantine_failure();
+async fn published_answer_followup_only_reports_actual_publications() {
+    let (app, store) = import_with_quarantine_failure();
     let upload = "this is not a statement\n";
     let path = "/api/v1/repositories/nrese/import";
     eprintln!("POST {path}\nContent-Type: application/n-triples\n\n{upload}");
@@ -958,6 +958,39 @@ async fn published_answer_followup_noop_keeps_the_io_answer() {
             && !body.contains("published"),
         "{status}: {body}"
     );
+
+    let seed = "<urn:a> <urn:p> \"one\" .\n";
+    eprintln!("POST {path}\nContent-Type: application/n-triples\n\n{seed}");
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        path,
+        Some("application/n-triples"),
+        seed,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let revision = store.current_revision() + 1;
+    store.quarantine().fail_next_commit();
+    let path = "/api/v1/repositories/nrese/import?replace=true";
+    eprintln!("POST {path}\nContent-Type: application/n-triples\n\n{upload}");
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        path,
+        Some("application/n-triples"),
+        upload,
+    )
+    .await;
+    eprintln!("{status}: {body}");
+    assert!(
+        status == StatusCode::INTERNAL_SERVER_ERROR
+            && body.contains(&format!(
+                "the load completed at published revision {revision}."
+            )),
+        "{status}: {body}"
+    );
+    assert_eq!(store.current_revision(), revision);
 }
 
 #[tokio::test]
@@ -981,10 +1014,11 @@ async fn published_answer_followup_unsettled_import_reports_unknown_outcome() {
     )
     .await;
     eprintln!("{status}: {body}");
-    assert!(
-        status == StatusCode::INTERNAL_SERVER_ERROR
-            && body.contains("the outcome is unknown: read the data before sending it again"),
-        "{status}: {body}"
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
+    let problem: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(
+        problem["detail"], "the outcome is unknown: read the data before sending it again",
+        "{body}"
     );
 }
 
