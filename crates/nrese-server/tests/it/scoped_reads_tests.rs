@@ -1212,26 +1212,38 @@ async fn scoped_preparation_preserves_an_ordinary_text_predicate() -> TestResult
 
 #[tokio::test]
 async fn review_scoped_joined_text_groups_keep_the_scan_rows() -> TestResult {
-    // Spec: When preparation joins two Jena-shaped groups into an ordinary
+    // Spec: When the parser joins two Jena-shaped groups into an ordinary
     // BGP, a scoped request returns the same scan rows as an unscoped read.
+    // Kept apart by a one-row VALUES, the first group is a search as written,
+    // which a scoped request refuses as it refuses every text search form.
     let app = app(StoreConfig::default(), false)?;
     insert(
         &app,
         r#"GRAPH :g1 { ex:a <http://jena.apache.org/text#query> "alpha" }"#,
     )
     .await?;
-    for between in ["", "VALUES ?unused { 1 }"] {
-        // The one-row VALUES keeps the groups separate through parsing.
-        let pattern = format!(
+    let pattern = |between: &str| {
+        format!(
             r#"{{ {{ ?s <http://jena.apache.org/text#query> "alpha" }}
                    {between}
                    {{ ?t <http://jena.apache.org/text#query> [] }} }}"#
-        );
-        let plain = select(&app, &[], "", "?s", G1, &pattern).await?.rows();
-        assert_eq!(plain, bindings(&[A]), "unscoped scan {pattern}");
-        let scoped = select(&app, &[], SCOPED, "?s", G1, &pattern).await?;
-        assert_eq!(scoped.rows(), plain, "scoped scan {pattern}");
-    }
+        )
+    };
+    let joined = pattern("");
+    let plain = select(&app, &[], "", "?s", G1, &joined).await?.rows();
+    assert_eq!(plain, bindings(&[A]), "unscoped scan {joined}");
+    let scoped = select(&app, &[], SCOPED, "?s", G1, &joined).await?;
+    assert_eq!(scoped.rows(), plain, "scoped scan {joined}");
+    let apart = pattern("VALUES ?unused { 1 }");
+    let plain = select(&app, &[], "", "?s", G1, &apart).await?.rows();
+    assert_eq!(plain, bindings(&[A]), "unscoped search {apart}");
+    let scoped = select(&app, &[], SCOPED, "?s", G1, &apart).await?;
+    assert_eq!(scoped.code, StatusCode::NOT_IMPLEMENTED, "{scoped:?}");
+    assert_eq!(
+        scoped.json()["type"],
+        "https://nrese.dev/problems/store.search_scope",
+        "{scoped:?}"
+    );
     Ok(())
 }
 
