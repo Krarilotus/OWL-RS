@@ -129,13 +129,19 @@ fn an_optional_filter_with_an_unbound_input_preserves_left_rows() {
 
 #[test]
 fn explain_distinguishes_a_rewrite_from_the_as_written_plan() {
-    // A nested join has a group rewrite in planned mode. An explicitly written
-    // request evaluates the groups as written, with the same two solutions.
+    // The join-groups rewrite joins a group holding an OPTIONAL to the triple
+    // pattern beside it (the parser merges plain adjacent patterns itself).
+    // Planned, EXPLAIN reports it; as written, nothing is rewritten. The one
+    // subject has every statement: one solution either way.
     let case = Case::new(
         "explain-join",
-        vec!["<urn:a> <urn:p> 1 .".into()],
+        vec![
+            "<urn:a> <urn:p> 1 .".into(),
+            "<urn:a> <urn:q> \"z\" .".into(),
+            "<urn:a> <urn:r> 2 .".into(),
+        ],
         Query::plain(
-            "SELECT ?s ?x { { ?s <urn:p> ?o . VALUES ?x { 1 2 } } VALUES ?y { 3 } }".into(),
+            "SELECT ?s ?z { { ?s <urn:p> ?o OPTIONAL { ?s <urn:q> ?z } } ?s <urn:r> ?w }".into(),
         ),
     );
     let routes = Routes::open(&case);
@@ -143,9 +149,9 @@ fn explain_distinguishes_a_rewrite_from_the_as_written_plan() {
     for as_written in [false, true] {
         let mut request = SparqlQueryRequest::all(&case.query.text);
         request.as_written = as_written;
-        assert_eq!(routes::execute(store, &request).len(), 2);
+        assert_eq!(routes::execute(store, &request).len(), 1);
         let explanation = routes::explain(store, &request);
-        assert_eq!(explanation.rows, 2);
+        assert_eq!(explanation.rows, 1);
         assert_eq!(
             explanation.rewrites.contains(&"join-groups"),
             !as_written,
@@ -155,7 +161,6 @@ fn explain_distinguishes_a_rewrite_from_the_as_written_plan() {
 }
 
 #[test]
-#[ignore = "the QL Store route can choose its mode on the rewritten query while EXPLAIN uses the original"]
 fn explain_agrees_with_the_mode_of_a_cold_ql_request() {
     // ASK carries an ask-limit rewrite only in planned mode. To observe the
     // cold run independently, a path reachable from a single starting node
