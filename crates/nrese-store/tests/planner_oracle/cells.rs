@@ -77,6 +77,11 @@ fn exists_draws_independently_for_each_tested_row() {
 }
 
 #[test]
+fn a_drawing_subquery_in_exists_decides_once_per_group_solution() {
+    drawing("exists-subquery-seed");
+}
+
+#[test]
 fn lateral_draws_for_each_left_row() {
     drawing("lateral-draw");
 }
