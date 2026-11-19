@@ -19,6 +19,7 @@ mod internal_identity_tests;
 mod lateral_tests;
 mod native_differential_tests;
 mod native_facets_tests;
+mod per_row_values_tests;
 mod plan_guard_tests;
 mod pre_bound_delivery_tests;
 mod private_view_tests;
