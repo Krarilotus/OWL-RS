@@ -48,6 +48,7 @@ pub(super) enum Failure {
 pub(super) enum End {
     Committed,
     Unknown,
+    Refused(Failure),
     Failed(Failure),
 }
 
@@ -136,8 +137,7 @@ impl ClientRecord {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) enum Producer {
     Lock,
-    Write,
-    Switch,
+    Task { slot: usize, switch: bool },
     Read,
     Commit,
     Repeat,
@@ -153,16 +153,38 @@ pub(super) enum Delivery {
     },
     LockTimeout,
     Task {
+        slot: usize,
         answer: Seen,
     },
     Read {
-        request: Id,
         version: Version,
         tags: u8,
         end: Stream,
     },
     CommitExit,
-    CommitObserver,
+    CommitGrace,
+    Repeat,
+}
+
+impl Delivery {
+    fn answers(self, producer: Option<Producer>) -> bool {
+        match self {
+            Self::Request { .. } => true,
+            Self::LockTimeout => producer == Some(Producer::Lock),
+            Self::Task { slot, .. } => {
+                matches!(producer, Some(Producer::Task { slot: owner, .. }) if owner == slot)
+            }
+            Self::Read { .. } => producer == Some(Producer::Read),
+            Self::CommitExit | Self::CommitGrace => producer == Some(Producer::Commit),
+            Self::Repeat => producer == Some(Producer::Repeat),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct TerminalWrite {
+    pub expected: End,
+    pub recorded: Option<End>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -236,6 +258,7 @@ pub(super) struct StoreRecord<const N: usize> {
     pub retired: bool,
     pub external_publication: Option<Publication>,
     pub delivery: Option<Delivery>,
+    pub terminal_write: Option<TerminalWrite>,
     pub at_swap: Option<Id>,
     pub write: Option<(bool, bool, bool)>,
 }
@@ -248,6 +271,7 @@ impl<const N: usize> Default for StoreRecord<N> {
             retired: false,
             external_publication: None,
             delivery: None,
+            terminal_write: None,
             at_swap: None,
             write: None,
         }
@@ -328,7 +352,7 @@ pub(super) fn i2<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
     !client.receipt.is_some_and(|receipt| {
         matches!(
             receipt.seen,
-            Seen::Commit(End::Failed(Failure::Conflict), _)
+            Seen::Commit(End::Refused(Failure::Conflict), _)
         )
     }) || client
         .first_shown
@@ -342,13 +366,11 @@ pub(super) fn i3<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
         return true;
     };
     let txn = store.transaction(client);
-    let Receipt { sent, seen, id } = receipt;
+    let Receipt { sent, seen, .. } = receipt;
     match delivery {
         Delivery::LockTimeout => return seen == Seen::Error(Failure::LockBusy),
-        Delivery::Read { request, end, .. } => {
-            return id == request && seen == Seen::Stream(end) && sent.op == Op::Read;
-        }
-        Delivery::Task { answer } if seen != answer => return false,
+        Delivery::Read { end, .. } => return seen == Seen::Stream(end) && sent.op == Op::Read,
+        Delivery::Task { answer, .. } if seen != answer => return false,
         Delivery::Request {
             missing,
             running,
@@ -373,7 +395,7 @@ pub(super) fn i3<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
                         seen == match end {
                             End::Committed => Seen::Error(Failure::AlreadyCommitted),
                             End::Unknown => Seen::Error(Failure::OutcomeUnknown),
-                            End::Failed(_) => Seen::RolledBack,
+                            End::Refused(_) | End::Failed(_) => Seen::RolledBack,
                         }
                     }
                     _ => seen == Seen::Ended(end),
@@ -381,7 +403,7 @@ pub(super) fn i3<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
             }
             if !rights_equal && matches!(sent.op, Op::Commit | Op::Write | Op::Read) {
                 return seen == Seen::Error(Failure::Rights)
-                    && txn.end == Some(End::Failed(Failure::Rights));
+                    && txn.end == Some(End::Refused(Failure::Rights));
             }
             return match sent.op {
                 Op::Write => {
@@ -406,7 +428,9 @@ pub(super) fn i3<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
                 && match end {
                     End::Committed => txn.publication.is_some() || txn.read_only,
                     End::Unknown => txn.end == Some(End::Unknown),
-                    End::Failed(_) => matches!(txn.end, Some(End::Failed(_))),
+                    End::Refused(_) | End::Failed(_) => {
+                        matches!(txn.end, Some(End::Refused(_) | End::Failed(_)))
+                    }
                 }
         }
         Seen::Error(Failure::Missing(read_first)) => {
@@ -435,16 +459,22 @@ pub(super) fn i4<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
 
 // Lifecycle rule 8 and §2d: every outstanding request can be answered by its own work.
 pub(super) fn i5<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) -> bool {
+    let txn = store.transaction(client);
+    if let (Some(receipt), Some(delivery)) = (client.receipt, store.delivery)
+        && !delivery.answers(txn.producers[receipt.id])
+    {
+        return false;
+    }
     client
         .owed
         .iter()
-        .zip(store.transaction(client).producers)
+        .zip(txn.producers)
         .all(|(owed, producer)| match owed {
             None => true,
             Some(sent) => match producer {
                 Some(Producer::Lock) => true,
-                Some(Producer::Write) => sent.op == Op::Write,
-                Some(Producer::Switch | Producer::Read) => sent.op == Op::Read,
+                Some(Producer::Task { switch: false, .. }) => sent.op == Op::Write,
+                Some(Producer::Task { switch: true, .. } | Producer::Read) => sent.op == Op::Read,
                 Some(Producer::Commit | Producer::Repeat) => sent.op == Op::Commit,
                 None => false,
             },
@@ -469,10 +499,12 @@ pub(super) fn i7<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) 
     };
     match delivery {
         Delivery::Read { tags, .. } if tags & 2 != 0 => receipt.sent.rights,
-        _ if matches!(receipt.seen, Seen::Commit(_, true)) => {
-            receipt.sent.rights == store.transaction(client).evidence_rights
-        }
-        _ => true,
+        _ => match receipt.seen {
+            Seen::Commit(_, evidence) => {
+                evidence == (receipt.sent.rights == store.transaction(client).evidence_rights)
+            }
+            _ => true,
+        },
     }
 }
 
@@ -485,12 +517,15 @@ pub(super) fn i8<const N: usize>(_client: &ClientRecord, store: &StoreRecord<N>)
 
 // C2-C6, C15, C17: a final COMMIT answer agrees with the worker's independently observed exit.
 pub(super) fn i9<const N: usize>(client: &ClientRecord, store: &StoreRecord<N>) -> bool {
+    if let Some(write) = store.terminal_write {
+        return write.recorded == Some(write.expected);
+    }
     let Some(receipt) = client.receipt else {
         return true;
     };
     if !matches!(
         store.delivery,
-        Some(Delivery::CommitExit | Delivery::CommitObserver)
+        Some(Delivery::CommitExit | Delivery::CommitGrace | Delivery::Repeat)
     ) {
         return true;
     }

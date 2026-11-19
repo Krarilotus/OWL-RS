@@ -87,7 +87,6 @@ pub(crate) enum Observation {
 pub(crate) enum StreamEnd {
     Data,
     Error(Problem),
-    Ended(Outcome),
     Aborted,
 }
 
@@ -146,8 +145,16 @@ pub(crate) enum Answer {
     PingOk,
     NoContent,
     Error(Problem),
-    TaskError { problem: Problem, source: Cell },
-    Recorded { outcome: Outcome, evidence: bool },
+    /// An ended-session answer carries the recorded reason for its 404.
+    Ended(Outcome),
+    TaskError {
+        problem: Problem,
+        source: Cell,
+    },
+    Recorded {
+        outcome: Outcome,
+        evidence: bool,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

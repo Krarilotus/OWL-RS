@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 mod session_oracle;
 use session_oracle::{
     ClientRecord, Delivery, End, Failure, Id, Invariant, Op, Producer, Seen, Sent, StoreRecord,
-    Stream, Version,
+    Stream, TerminalWrite, Version,
 };
 
 const ORDINARY_DEPTH: usize = 5;
@@ -70,7 +70,8 @@ fn seen(answer: &Answer) -> Seen {
     };
     let end = |outcome| match outcome {
         Outcome::Committed => End::Committed,
-        Outcome::Refused(problem) | Outcome::Failed(problem) => End::Failed(failure(problem)),
+        Outcome::Refused(problem) => End::Refused(failure(problem)),
+        Outcome::Failed(problem) => End::Failed(failure(problem)),
         Outcome::Unknown => End::Unknown,
     };
     match *answer {
@@ -138,6 +139,7 @@ fn task_outcome(end: End) -> Outcome {
     match end {
         End::Committed => Outcome::Committed,
         End::Unknown => Outcome::Unknown,
+        End::Refused(failure) => Outcome::Refused(model_problem(failure)),
         End::Failed(failure) => Outcome::Failed(model_problem(failure)),
     }
 }
@@ -145,6 +147,8 @@ fn task_outcome(end: End) -> Outcome {
 fn model_problem(failure: Failure) -> Problem {
     match failure {
         Failure::Status(code) => Problem::Status(code),
+        Failure::Rights => Problem::RightsChanged,
+        Failure::Conflict => Problem::Conflict,
         Failure::LongestLife => Problem::LongestLife,
         Failure::Unpublished => Problem::Unpublished,
         Failure::NotRun => Problem::NotRun,
@@ -434,6 +438,7 @@ impl<const N: usize> World<N> {
             (session_oracle::i1(client, &self.store), Invariant::I1),
             (session_oracle::i2(client, &self.store), Invariant::I2),
             (session_oracle::i3(client, &self.store), Invariant::I3),
+            (session_oracle::i5(client, &self.store), Invariant::I5),
             (session_oracle::i7(client, &self.store), Invariant::I7),
             (session_oracle::i9(client, &self.store), Invariant::I9),
         ];
@@ -452,6 +457,35 @@ impl<const N: usize> World<N> {
     fn abandon(&mut self, id: usize, request: Id) {
         self.clients[id].owed[request] = None;
         self.store.transactions[id].producers[request] = None;
+    }
+
+    fn record_terminal<const MUTATION: u8>(
+        &mut self,
+        id: usize,
+        expected: End,
+        effect: Effect,
+    ) -> Option<(Outcome, End)> {
+        let recorded = if let Effect::Record(outcome) = effect {
+            // Inspect the installed terminal using the same outcome view as a reply.
+            let Seen::Commit(recorded, _) = seen(&Answer::Recorded {
+                outcome,
+                evidence: false,
+            }) else {
+                unreachable!("a terminal uses the recorded reply representation");
+            };
+            Some((outcome, recorded))
+        } else {
+            None
+        };
+        self.store.terminal_write = Some(TerminalWrite {
+            expected,
+            recorded: recorded.map(|(_, end)| end),
+        });
+        if !session_oracle::i9(&self.clients[id], &self.store) {
+            self.violate::<MUTATION>(Invariant::I9);
+        }
+        self.store.terminal_write = None;
+        recorded
     }
 }
 
@@ -673,6 +707,9 @@ impl<const N: usize> World<N> {
                 let txn = self.store.transactions[id];
                 let action = self.sessions[id].action(request.op, rights, &txn);
                 let result = self.event::<MUTATION>(id, Event::Detached(action), true, report);
+                if result.effect != Effect::None {
+                    self.session_write::<MUTATION>(id, true);
+                }
                 self.store.transactions[id].producers[request.id] = None;
                 self.receive::<MUTATION>(
                     id,
@@ -767,11 +804,7 @@ impl<const N: usize> World<N> {
                     phase: Phase::Pending,
                 });
                 txn.guards |= 1 << slot;
-                txn.producers[request.id] = Some(if switch {
-                    Producer::Switch
-                } else {
-                    Producer::Write
-                });
+                txn.producers[request.id] = Some(Producer::Task { slot, switch });
                 txn.idle = false;
             }
             Effect::TakeSnapshot => {
@@ -820,7 +853,7 @@ impl<const N: usize> World<N> {
                 {
                     End::Committed
                 } else {
-                    End::Failed(Failure::Rights)
+                    End::Refused(Failure::Rights)
                 };
                 txn.read_only = end == End::Committed;
                 self.finish(id, end, rights);
@@ -841,7 +874,7 @@ impl<const N: usize> World<N> {
         let answer = match task.visible_end() {
             Some(End::Committed) if sent.op == Op::Read => Seen::Pending,
             Some(End::Committed) => Seen::WriteOk,
-            Some(End::Failed(failure)) => Seen::Error(failure),
+            Some(End::Refused(failure) | End::Failed(failure)) => Seen::Error(failure),
             Some(End::Unknown) => Seen::Error(Failure::Status(500)),
             None => Seen::Error(Failure::WriteBusy),
         };
@@ -855,19 +888,17 @@ impl<const N: usize> World<N> {
             report,
         );
         let session = &mut self.sessions[id];
-        let producer = &mut self.store.transactions[id].producers[task.request];
-        *producer = None;
-        if result.effect == Effect::TakeSnapshot {
+        let producer = if result.effect == Effect::TakeSnapshot {
             session.read = task.pin.map(|pin| Read {
                 request: task.request,
                 first: true,
                 pin,
                 private: task.scratch,
             });
-            if session.read.is_some() {
-                *producer = Some(Producer::Read);
-            }
-        }
+            session.read.map(|_| Producer::Read)
+        } else {
+            None
+        };
         session.tasks[slot] = if matches!(task.phase, Phase::Recorded(_)) {
             None
         } else {
@@ -876,7 +907,13 @@ impl<const N: usize> World<N> {
                 ..task
             })
         };
-        self.receive::<MUTATION>(id, task.request, result.answer, Delivery::Task { answer });
+        self.receive::<MUTATION>(
+            id,
+            task.request,
+            result.answer,
+            Delivery::Task { slot, answer },
+        );
+        self.store.transactions[id].producers[task.request] = producer;
     }
 
     fn do_move<const MUTATION: u8>(
@@ -915,6 +952,9 @@ impl<const N: usize> World<N> {
                         Event::Action(session.action(op, rights, txn)),
                     )
                     .step;
+                    if result.effect != Effect::None || result.next != State::G {
+                        self.session_write::<MUTATION>(id, false);
+                    }
                     report((Some(result.cell), result.answer));
                     self.receive::<MUTATION>(id, request.id, result.answer, delivery);
                 }
@@ -981,7 +1021,8 @@ impl<const N: usize> World<N> {
             Move::Swap(id, slot) | Move::Fail(id, slot) => {
                 let session = self.sessions[id];
                 let task = session.tasks[slot].unwrap();
-                let (event, end) = if self.store.retired {
+                let orphaned = self.store.retired;
+                let (event, end) = if orphaned {
                     (Event::OrphanEnded, End::Failed(Failure::Missing(false)))
                 } else if matches!(action, Move::Fail(..)) {
                     (
@@ -999,6 +1040,16 @@ impl<const N: usize> World<N> {
                     // The lost-write mutation leaves an older scratch buffer running.
                     transition::<MUTATION>(State::Pw, event).step
                 };
+                if orphaned {
+                    if let Some((_, recorded)) =
+                        self.record_terminal::<MUTATION>(id, end, result.effect)
+                    {
+                        let task = self.sessions[id].tasks[slot].as_mut().unwrap();
+                        task.phase = Phase::Ended(recorded);
+                        task.needs_settle = false;
+                    }
+                    return;
+                }
                 let task_slot = self.sessions[id].tasks[slot].as_mut().unwrap();
                 task_slot.phase = Phase::Ended(end);
                 task_slot.needs_settle = false;
@@ -1058,8 +1109,8 @@ impl<const N: usize> World<N> {
                 let commit = self.sessions[id].commit.take().unwrap();
                 let end = match exit {
                     Exit::Published { .. } => End::Committed,
-                    Exit::Conflict => End::Failed(Failure::Conflict),
-                    Exit::RightsChanged => End::Failed(Failure::Rights),
+                    Exit::Conflict => End::Refused(Failure::Conflict),
+                    Exit::RightsChanged => End::Refused(Failure::Rights),
                     Exit::Failed(Problem::Status(code)) => End::Failed(Failure::Status(code)),
                     Exit::Failed(other) => panic!("unexpected model commit failure: {other:?}"),
                     Exit::Cancelled => End::Failed(Failure::Status(408)),
@@ -1074,10 +1125,11 @@ impl<const N: usize> World<N> {
                             report(reply);
                         }
                     });
+                let recorded = self.record_terminal::<MUTATION>(id, end, result.effect);
                 let txn = &mut self.store.transactions[id];
                 txn.end = Some(end);
                 txn.checked_at = Some(self.store.version);
-                if let Effect::Record(outcome) = result.effect {
+                if let Some((outcome, _)) = recorded {
                     txn.worker = false;
                     txn.settling = txn.mapped && !self.store.retired;
                     let session = &mut self.sessions[id];
@@ -1105,12 +1157,7 @@ impl<const N: usize> World<N> {
                 let result =
                     self.event::<MUTATION>(id, Event::CommitGrace(record), false, &mut report);
                 self.sessions[id].commit.as_mut().unwrap().awaiting = false;
-                self.receive::<MUTATION>(
-                    id,
-                    commit.request,
-                    result.answer,
-                    Delivery::CommitObserver,
-                );
+                self.receive::<MUTATION>(id, commit.request, result.answer, Delivery::CommitGrace);
             }
             Move::RepeatReady(id) => {
                 let repeat = self.sessions[id].repeat.take().unwrap();
@@ -1124,12 +1171,7 @@ impl<const N: usize> World<N> {
                     false,
                     &mut report,
                 );
-                self.receive::<MUTATION>(
-                    id,
-                    repeat.request,
-                    result.answer,
-                    Delivery::CommitObserver,
-                );
+                self.receive::<MUTATION>(id, repeat.request, result.answer, Delivery::Repeat);
             }
             Move::Stream(id, end) => {
                 let read = self.sessions[id].read.take().unwrap();
@@ -1157,7 +1199,6 @@ impl<const N: usize> World<N> {
                     read.request,
                     result.answer,
                     Delivery::Read {
-                        request: read.request,
                         version: read.pin.version(),
                         tags,
                         end,
@@ -1725,6 +1766,72 @@ fn oracle_source_uses_only_its_records() {
             "unexpected lifecycle reference: {name}"
         );
     }
+}
+
+// C2 and X4: the terminal must record the observed end even after the client left.
+#[test]
+fn oracle_requires_the_terminal_record_without_a_waiter() {
+    for (observed, written) in [
+        (
+            End::Refused(Failure::Conflict),
+            Effect::Record(Outcome::Failed(Problem::Conflict)),
+        ),
+        (End::Failed(Failure::Missing(false)), Effect::None),
+    ] {
+        let mut world = Sessions::<2, GOOD>::start();
+        world.record_terminal::<GOOD>(0, observed, written);
+        assert_eq!(world.violation, Some(Invariant::I9));
+    }
+}
+
+// C1 and C8: identical outcomes do not make two waiting requests interchangeable.
+#[test]
+fn oracle_rejects_a_commit_answer_delivered_to_the_repeat() {
+    let mut world = Sessions::<2, GOOD>::start();
+    for action in [
+        Move::Lookup(0, Op::Commit),
+        Move::SessionLock(0),
+        Move::Lookup(0, Op::Commit),
+        Move::SessionLock(0),
+        Move::PublishCommit(0),
+    ] {
+        world.do_move::<GOOD>(action, |_| {});
+    }
+    let repeat = world.sessions[0].repeat.unwrap();
+    world.receive::<GOOD>(
+        0,
+        repeat.request,
+        Answer::Recorded {
+            outcome: Outcome::Committed,
+            evidence: true,
+        },
+        Delivery::CommitExit,
+    );
+    assert_eq!(world.violation, Some(Invariant::I5));
+}
+
+// C1 and E1: the evidence bit reports whether the request holds the recorded rights.
+#[test]
+fn oracle_requires_evidence_for_the_commit_requester() {
+    let mut world = Sessions::<2, GOOD>::start();
+    for action in [
+        Move::Lookup(0, Op::Commit),
+        Move::SessionLock(0),
+        Move::PublishCommit(0),
+    ] {
+        world.do_move::<GOOD>(action, |_| {});
+    }
+    let request = world.sessions[0].commit.unwrap().request;
+    world.receive::<GOOD>(
+        0,
+        request,
+        Answer::Recorded {
+            outcome: Outcome::Committed,
+            evidence: false,
+        },
+        Delivery::CommitExit,
+    );
+    assert_eq!(world.violation, Some(Invariant::I7));
 }
 
 // Spec §2c v8 N3: a request that arrives with the pinned view keeps it while waiting.
