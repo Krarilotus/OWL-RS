@@ -852,27 +852,4 @@ mod tests {
         assert!(short > 0, "the prefixes were keyed");
         assert!(long < 5 * short, "100 steps: {short} bytes, 400: {long}");
     }
-
-    /// Spec: an answer is keyed by the mode it is evaluated in. A query holding a search is
-    /// evaluated as written whether or not it asks to be, so both requests share one key; a
-    /// query without one is planned unless it asks, so the two keys differ.
-    #[test]
-    fn a_query_is_keyed_by_the_mode_it_is_evaluated_in() {
-        let engine = nrese_engine::Engine::new(Default::default()).unwrap();
-        let snapshot = engine.snapshot();
-        let cache = std::sync::Arc::new(ResultCache::new(1 << 20));
-        let key = |text: &str, as_written: bool| {
-            let query = SparqlParser::new().parse_query(text).unwrap();
-            let options = QueryOptions {
-                as_written,
-                result_cache: Some(std::sync::Arc::clone(&cache)),
-                ..QueryOptions::default()
-            };
-            super::output_key(&snapshot, &query, &options, "text/csv", b"").expect("cached")
-        };
-        let search = "SELECT ?o WHERE { ?o <http://www.bigdata.com/rdf/search#search> \"a\" }";
-        assert_eq!(key(search, false), key(search, true), "{search}");
-        let plain = "SELECT ?o WHERE { ?o <http://e/p> \"a\" }";
-        assert_ne!(key(plain, false), key(plain, true), "{plain}");
-    }
 }

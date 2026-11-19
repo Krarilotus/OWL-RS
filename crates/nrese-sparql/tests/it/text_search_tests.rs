@@ -610,13 +610,20 @@ fn engine_of(turtle: &str) -> Engine {
 
 /// The query's answers, optimised and as written; each must be `want`.
 fn answers_as_written(engine: &Engine, shape: &str, query: &str, want: &[&[&str]]) {
-    let as_written = QueryOptions {
-        as_written: true,
-        ..QueryOptions::default()
-    };
-    for options in [&QueryOptions::default(), &as_written] {
-        let got = sorted(rows(engine, query, options));
-        let written = options.as_written;
+    answers_as_written_with(engine, shape, query, QueryOptions::default(), want);
+}
+
+/// [`answers_as_written`] with these options besides.
+fn answers_as_written_with(
+    engine: &Engine,
+    shape: &str,
+    query: &str,
+    mut options: QueryOptions,
+    want: &[&[&str]],
+) {
+    for written in [false, true] {
+        options.as_written = written;
+        let got = sorted(rows(engine, query, &options));
         assert_eq!(got, table(want), "{shape}, as_written={written}: {query}");
     }
 }
@@ -846,4 +853,133 @@ fn a_search_whose_predicates_an_expression_builds_keeps_its_groups() {
                  BIND(IRI(CONCAT(\"http://www.bigdata.com/rdf/search\", \"#relevance\")) AS ?q) \
                  LATERAL { { ?o ?p \"alpha\" } VALUES ?x { 1 } { ?o ?q ?r } } }";
     answers_as_written(&named_in_data_engine(), "an option apart", query, &[]);
+}
+
+/// `QueryOptions` with OWL 2 QL rewriting on.
+fn ql_on() -> QueryOptions {
+    use nrese_sparql::ql::{Closure, QlRewriting};
+    QueryOptions {
+        ql: Some(std::sync::Arc::new(QlRewriting::new(Closure {
+            lists: true,
+        }))),
+        ..QueryOptions::default()
+    }
+}
+
+/// `text:query` is an `ex:C`, and every `ex:C` has an `ex:r` successor; `a` and `b` are
+/// labelled "alpha one" and "alpha two", and `c`, labelled "gamma", has one statement
+/// under `text:query` itself.
+fn ql_engine() -> Engine {
+    engine_of(
+        "@prefix ex: <http://example.com/> .
+         @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+         @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         ex:a rdfs:label \"alpha one\" . ex:b rdfs:label \"alpha two\" . ex:c rdfs:label \"gamma\" .
+         ex:c <http://jena.apache.org/text#query> \"alpha\" .
+         ex:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:r ; owl:someValuesFrom owl:Thing ] .
+         <http://jena.apache.org/text#query> a ex:C .",
+    )
+}
+
+/// Spec: a search is what the query writes, never what OWL 2 QL rewriting makes. The
+/// shared `ex:r` successor makes `?p` `text:query`, and the triple with it still reads the
+/// stored statements, as a joined variable predicate does: `c`'s one, not the search's
+/// hits `a` and `b`. A search the query writes stays one under the rewriting: "one" is
+/// `a`'s.
+#[test]
+fn a_predicate_ql_rewriting_binds_to_a_search_iri_reads_stored_statements() {
+    let engine = ql_engine();
+    let query = "SELECT DISTINCT ?s ?p { text:query ex:r ?anon . ?p ex:r ?anon . \
+                 ?s ?p \"alpha\" . ?s rdfs:label ?l }";
+    let jena = "http://jena.apache.org/text#query";
+    answers_as_written_with(
+        &engine,
+        "bound by the rewriting",
+        query,
+        ql_on(),
+        &[&["c", jena]],
+    );
+    let written = "SELECT ?s { ?s text:query \"one\" . ?s rdfs:label ?l }";
+    answers_as_written_with(&engine, "written", written, ql_on(), &[&["a"]]);
+}
+
+/// An engine whose `bds:search` and `ex:find`, and `bds:relevance` and `ex:score`, are each
+/// one `owl:sameAs` class, the search vocabulary's IRIs the representatives if
+/// `search_first` (interned first), else the `ex:` ones. `a` and `b` are labelled
+/// "alpha one" and "alpha two", and `c`'s statement `ex:find "gamma"` is held over the
+/// class's representative, as a reasoner by representatives leaves it.
+fn equal_names_engine(search_first: bool) -> Engine {
+    use nrese_engine::EncodedTriple;
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let mut id = |iri: &str| tx.intern(NamedNode::new_unchecked(iri).as_ref().into());
+    let (search, relevance, find, score) = if search_first {
+        let [s, r, f, c] = [
+            "http://www.bigdata.com/rdf/search#search",
+            "http://www.bigdata.com/rdf/search#relevance",
+            "http://example.com/find",
+            "http://example.com/score",
+        ]
+        .map(&mut id);
+        (s, r, f, c)
+    } else {
+        let [f, c, s, r] = [
+            "http://example.com/find",
+            "http://example.com/score",
+            "http://www.bigdata.com/rdf/search#search",
+            "http://www.bigdata.com/rdf/search#relevance",
+        ]
+        .map(&mut id);
+        (s, r, f, c)
+    };
+    let same_as = id("http://www.w3.org/2002/07/owl#sameAs");
+    tx.insert_inferred(EncodedTriple::new(find, same_as, search));
+    tx.insert_inferred(EncodedTriple::new(score, same_as, relevance));
+    let label = NamedNode::new_unchecked("http://www.w3.org/2000/01/rdf-schema#label");
+    for (subject, text) in [("a", "alpha one"), ("b", "alpha two")] {
+        let text = Literal::new_simple_literal(text);
+        tx.insert(Quad::new(ex(subject), label.clone(), text, GraphName::DefaultGraph).as_ref());
+    }
+    let c = tx.intern(ex("c").as_ref().into());
+    let gamma = tx.intern(Literal::new_simple_literal("gamma").as_ref().into());
+    let representative = if search_first { search } else { find };
+    tx.insert_inferred(EncodedTriple::new(c, representative, gamma));
+    tx.commit().unwrap();
+    engine.transaction().install(Some(same_as), None);
+    engine
+}
+
+fn canonical() -> QueryOptions {
+    QueryOptions {
+        equality_canonical: true,
+        ..QueryOptions::default()
+    }
+}
+
+/// Spec: a predicate whose class's representative is a search predicate is not a search
+/// under canonical answers: `ex:find` reads the stored statements of its class, alone (`c`)
+/// and beside an option in another group (no `ex:score` statement, so no answer).
+#[test]
+fn an_alias_of_a_search_predicate_reads_stored_statements() {
+    let engine = equal_names_engine(true);
+    let alone = "SELECT ?o { ?o ex:find \"gamma\" }";
+    answers_as_written_with(&engine, "alone", alone, canonical(), &[&["c"]]);
+    let apart = "SELECT ?o ?r { { ?o ex:find \"gamma\" } VALUES ?x { 1 } { ?o ex:score ?r } }";
+    answers_as_written_with(&engine, "an option apart", apart, canonical(), &[]);
+}
+
+/// Spec: a search written by its own IRI stays a search under canonical answers, whatever
+/// its class's representative: here `ex:find`. Its two hits.
+#[test]
+fn a_written_search_stays_one_under_canonical_names() {
+    let engine = equal_names_engine(false);
+    let query = "SELECT ?o { ?o bds:search \"alpha\" }";
+    let hits: &[&[&str]] = &[&["alpha one"], &["alpha two"]];
+    answers_as_written_with(
+        &engine,
+        "its representative ex:find",
+        query,
+        canonical(),
+        hits,
+    );
 }

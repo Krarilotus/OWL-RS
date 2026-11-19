@@ -622,3 +622,209 @@ fn a_refused_canonical_view_is_never_answered_from_the_expanded_bytes() {
         "a canonical request read the expanded answer's bytes"
     );
 }
+
+/// An engine with these Turtle statements.
+fn engine_of(turtle: &str) -> Engine {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    for quad in nrese_rdf_io::RdfParser::from_format(nrese_rdf_io::RdfFormat::Turtle)
+        .for_reader(turtle.as_bytes())
+    {
+        tx.insert(quad.unwrap().as_ref());
+    }
+    tx.commit().unwrap();
+    engine
+}
+
+const LABELS: &str = "@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+    <http://example.com/a> rdfs:label \"alpha one\" . <http://example.com/b> rdfs:label \"alpha two\" .";
+
+/// A whole answer is keyed by what its request asked for: the mode a query is evaluated in
+/// follows from the request and the snapshot, both in the key.
+///
+/// - Input: a search, read as written whether or not it asks to be, asked without and then
+///   with `as_written`, each through the cache twice.
+/// - Expected: the second request is not answered from the first's entry; each request's
+///   second read is its entry, and each is the answer without the cache.
+#[test]
+fn a_search_asked_both_ways_has_an_entry_for_each_both_right() {
+    let engine = engine_of(LABELS);
+    let snapshot = engine.snapshot();
+    let cache = Arc::new(ResultCache::new(1 << 20).admitting_all());
+    let text = "SELECT ?o WHERE { ?o <http://www.bigdata.com/rdf/search#search> \"alpha\" }";
+    let asked = |as_written| QueryOptions {
+        as_written,
+        ..with_cache(&cache)
+    };
+    let want = tsv(&snapshot, text, &QueryOptions::default());
+    assert_eq!(tsv_through_the_cache(&snapshot, text, &asked(false)), want);
+    let CachedOutput::Miss(slot) = cached_output(&snapshot, &parse(text), &asked(true), TSV, b"")
+    else {
+        panic!("as written, answered from the entry of a request that did not ask");
+    };
+    let written = QueryOptions {
+        as_written: true,
+        ..QueryOptions::default()
+    };
+    slot.offer(
+        tsv(&snapshot, text, &written),
+        None,
+        std::time::Duration::from_millis(1),
+    );
+    for as_written in [false, true] {
+        match cached_output(&snapshot, &parse(text), &asked(as_written), TSV, b"") {
+            CachedOutput::Hit(bytes, _) => assert_eq!(*bytes, *want, "as_written={as_written}"),
+            _ => panic!("as_written={as_written}: no entry"),
+        }
+    }
+}
+
+/// Turtle statements committed in one transaction.
+fn commit(engine: &Engine, turtle: &str) {
+    let mut tx = engine.transaction();
+    for quad in nrese_rdf_io::RdfParser::from_format(nrese_rdf_io::RdfFormat::Turtle)
+        .for_reader(turtle.as_bytes())
+    {
+        tx.insert(quad.unwrap().as_ref());
+    }
+    tx.commit().unwrap();
+}
+
+/// The snapshot is part of a whole answer's key, so a schema that changes what QL rewriting
+/// answers is not answered from before it.
+///
+/// - Input: `?x ex:r ?y` through the cache with QL rewriting on, over `ex:a a ex:C`; then
+///   `ex:C ⊑ ∃ex:r` committed.
+/// - Expected: before it, no answer; after it, `ex:a`, not the cached empty answer; each the
+///   answer without the cache.
+#[test]
+fn a_schema_committed_after_an_answer_is_cached_is_not_answered_from_before_it() {
+    use nrese_sparql::ql::{Closure, QlRewriting};
+    let engine = engine_of("<http://example.com/a> a <http://example.com/C> .");
+    let cache = Arc::new(ResultCache::new(1 << 20).admitting_all());
+    let options = QueryOptions {
+        ql: Some(Arc::new(QlRewriting::new(Closure { lists: true }))),
+        ..with_cache(&cache)
+    };
+    let uncached = QueryOptions {
+        ql: options.ql.clone(),
+        ..QueryOptions::default()
+    };
+    let text = "SELECT ?x WHERE { ?x <http://example.com/r> ?y }";
+    let before = engine.snapshot();
+    let old = tsv_through_the_cache(&before, text, &options);
+    assert_eq!(old, tsv(&before, text, &uncached));
+    commit(
+        &engine,
+        "@prefix ex: <http://example.com/> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix owl: <http://www.w3.org/2002/07/owl#> .
+        ex:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:r ; owl:someValuesFrom owl:Thing ] .",
+    );
+    let after = engine.snapshot();
+    let new = tsv(&after, text, &uncached);
+    let has = |bytes: &[u8]| String::from_utf8_lossy(bytes).contains("<http://example.com/a>");
+    assert!(!has(&old) && has(&new));
+    assert_eq!(tsv_through_the_cache(&after, text, &options), new);
+}
+
+/// The answer's rows, sorted, without the header.
+fn rows(bytes: &[u8]) -> Vec<String> {
+    let mut rows: Vec<String> = String::from_utf8_lossy(bytes)
+        .lines()
+        .skip(1)
+        .map(str::to_owned)
+        .collect();
+    rows.sort_unstable();
+    rows
+}
+
+/// A whole answer is the answer of its request whatever QL rewriting has learnt of the data
+/// between two requests: preparation never makes a search, so what a tree witness's
+/// fold puts in a predicate reads stored statements, folded or not.
+///
+/// - Input: `text:query` an `ex:C` with a stored `ex:r` successor, every `ex:C` one, and no
+///   stored statement under `text:query`; labels "alpha one" and "alpha two". A union whose
+///   left arm spends the one check QL rewriting may ask of the data, and whose right arm
+///   makes `?p` `text:query` through `ex:r` and reads `?s ?p "alpha"`, with and without a
+///   label; asked without and with `as_written`. It is answered cold through the cache, then
+///   the right arm alone is asked (its check finds the tree, which the rewriting keeps), then
+///   the union is asked again through the cache and without it.
+/// - Expected: in each of the four cells the cold answer, the cached one and the one without
+///   the cache are equal and empty: no stored statement reads `?s text:query "alpha"`.
+#[test]
+fn a_whole_answer_is_its_request_s_whatever_the_rewriting_learnt_since() {
+    use nrese_sparql::ql::{Closure, Limits, QlRewriting};
+    let engine = engine_of(
+        "@prefix ex: <http://example.com/> .
+        @prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+        @prefix owl: <http://www.w3.org/2002/07/owl#> .
+        ex:a rdfs:label \"alpha one\" . ex:b rdfs:label \"alpha two\" .
+        ex:C rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:r ; owl:someValuesFrom owl:Thing ] .
+        ex:D rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:q ; owl:someValuesFrom owl:Thing ] .
+        <http://jena.apache.org/text#query> a ex:C ; ex:r ex:stored .
+        ex:d a ex:D .",
+    );
+    let snapshot = engine.snapshot();
+    let prefixes = "PREFIX ex: <http://example.com/> PREFIX text: <http://jena.apache.org/text#> \
+                    PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ";
+    let right = "text:query ex:r ?anon . ?p ex:r ?anon . ?s ?p \"alpha\"";
+    let ql = || {
+        Arc::new(
+            QlRewriting::new(Closure { lists: true }).with_limits(Limits {
+                checks: 1,
+                ..Limits::default()
+            }),
+        )
+    };
+    for label in ["", ". ?s rdfs:label ?label"] {
+        let target = format!(
+            "{prefixes}SELECT DISTINCT ?s WHERE {{ {{ ex:d ex:q ?z . ?s ex:absent 1 }} \
+             UNION {{ {right} {label} }} }}"
+        );
+        let warm = format!("{prefixes}SELECT DISTINCT ?s WHERE {{ {right} {label} }}");
+        for as_written in [false, true] {
+            let cell = format!("label: {}, as_written: {as_written}", !label.is_empty());
+            let options = QueryOptions {
+                ql: Some(ql()),
+                as_written,
+                result_cache: Some(Arc::new(ResultCache::new(1 << 20).admitting_all())),
+                ..QueryOptions::default()
+            };
+            let uncached = QueryOptions {
+                result_cache: None,
+                ..options.clone()
+            };
+            let realised = |options: &QueryOptions| {
+                let (_, report) =
+                    nrese_sparql::prepare_ql_query(&snapshot, &parse(&target), options).unwrap();
+                report.expect("rewritten").realised
+            };
+            let cold_realised = realised(&QueryOptions {
+                ql: Some(ql()),
+                ..uncached.clone()
+            });
+            let CachedOutput::Miss(slot) =
+                cached_output(&snapshot, &parse(&target), &options, TSV, b"")
+            else {
+                panic!("{cell}: nothing cached yet");
+            };
+            let cold = tsv(&snapshot, &target, &options);
+            slot.offer(cold.clone(), None, std::time::Duration::from_millis(1));
+            tsv(&snapshot, &warm, &uncached);
+            let CachedOutput::Hit(hit, _) =
+                cached_output(&snapshot, &parse(&target), &options, TSV, b"")
+            else {
+                panic!("{cell}: not cached");
+            };
+            let fresh = tsv(&snapshot, &target, &uncached);
+            assert!(
+                realised(&uncached) > cold_realised,
+                "{cell}: the right arm's tree is now kept"
+            );
+            assert_eq!(rows(&cold), Vec::<String>::new(), "{cell}: cold");
+            assert_eq!(rows(&hit), rows(&cold), "{cell}: cached");
+            assert_eq!(rows(&fresh), rows(&cold), "{cell}: without the cache");
+        }
+    }
+}
