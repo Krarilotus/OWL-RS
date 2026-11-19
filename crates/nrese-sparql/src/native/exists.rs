@@ -229,13 +229,9 @@ fn walk_pattern(pattern: &GraphPattern, out: &mut Walk) {
                 walk_expression(e, out);
             }
         }
-        GraphPattern::Project { variables, inner } => {
+        GraphPattern::Project { variables, .. } => {
             for v in variables {
                 push(out, v);
-            }
-            // A subquery's own variables are hidden, but not what it draws.
-            if out.draws == Some(false) {
-                out.draws = Some(pushdown::draws_in(inner));
             }
         }
         GraphPattern::Distinct { inner }
@@ -274,8 +270,11 @@ pub(super) fn deep_variables(expression: &Expression) -> Vec<Variable> {
 }
 
 /// [`deep_variables`], and whether `expression` draws a new value per evaluation
-/// (`RAND`, `UUID`, `STRUUID`, `BNODE`) anywhere, in an `EXISTS` and a subquery in one too:
-/// one walk for both.
+/// (`RAND`, `UUID`, `STRUUID`, `BNODE`), in an `EXISTS` too: one walk for both, so a query
+/// that draws nothing walks nothing more. A subquery in an `EXISTS` is not looked into, as
+/// for its variables: an `EXISTS` is evaluated once per distinct value of the row's
+/// variables it mentions ([`Context::exists`]), so rows passed in from outside cannot
+/// make its body draw more often.
 pub(super) fn reads_and_draws(expression: &Expression) -> (Vec<Variable>, bool) {
     let mut out = Walk {
         variables: Vec::new(),
