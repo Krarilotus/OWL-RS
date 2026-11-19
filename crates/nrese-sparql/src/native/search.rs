@@ -58,6 +58,10 @@
 //! `?x luc:score ?s` binds the relevance. The index name is not looked up: there is one
 //! index, over every string literal.
 
+#[cfg(test)]
+#[path = "search_tests.rs"]
+mod tests;
+
 use std::collections::HashMap;
 
 use nrese_engine::{GraphSelector, QuadPattern, TermId, TextQuery, TextScope};
