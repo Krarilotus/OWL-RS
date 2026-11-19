@@ -18,6 +18,17 @@ fn engine_of(turtle: &str) -> Engine {
     engine
 }
 
+/// Whether `pattern` has a triple pattern with a variable predicate.
+fn variable_predicate(pattern: &GraphPattern) -> bool {
+    pattern.find(&mut |node| {
+        matches!(
+            node,
+            Node::Pattern(GraphPattern::Bgp { patterns })
+                if patterns.iter().any(|t| matches!(t.predicate, NamedNodePattern::Variable(_)))
+        )
+    })
+}
+
 /// The pattern of the first `EXISTS` in `pattern`.
 fn exists_in(pattern: &GraphPattern) -> Option<&GraphPattern> {
     pattern.find_local(|node| match node {
@@ -68,15 +79,6 @@ fn a_query_without_a_search_is_planned_after_ql_preparation() {
     let (parsed, _) = crate::native::pattern_and_form(&query);
     let (prepared, _) = crate::native::pattern_and_form(&prepared);
     assert!(exists_in(parsed).is_none(), "the query has no EXISTS");
-    let variable_predicate = |pattern: &GraphPattern| {
-        pattern.find(&mut |node| {
-            matches!(
-                node,
-                Node::Pattern(GraphPattern::Bgp { patterns })
-                    if patterns.iter().any(|t| matches!(t.predicate, NamedNodePattern::Variable(_)))
-            )
-        })
-    };
     assert!(
         prepared.find(&mut |node| matches!(
             node,
@@ -85,12 +87,18 @@ fn a_query_without_a_search_is_planned_after_ql_preparation() {
         "a NOT EXISTS of the bag form copies the variable predicate: {prepared:?}"
     );
     assert!(!as_written(parsed, &options), "parsed");
-    assert!(!as_written(prepared, &options), "prepared: {prepared:?}");
+    // The store evaluates the prepared query with the rewriting done, so off.
+    let evaluated = crate::QueryOptions {
+        ql: None,
+        ..options
+    };
+    assert!(!as_written(prepared, &evaluated), "prepared: {prepared:?}");
 }
 
-/// The pattern of `SELECT * { ex:x ex:v ?p . BIND(1 AS ?k) FILTER EXISTS { body } }`'s
-/// `EXISTS`, and that query's pattern.
-fn exists_of(body: &str) -> (GraphPattern, GraphPattern) {
+/// Of `SELECT * { ex:x ex:v ?p . BIND(1 AS ?k) FILTER EXISTS { body } }`: its `EXISTS`'s
+/// pattern as parsed, where the mode is decided; the query's pattern; and the `EXISTS`'s
+/// pattern as evaluation reads it, after preparation's rewrites.
+fn exists_of(engine: &Engine, body: &str) -> (GraphPattern, GraphPattern, GraphPattern) {
     let text = format!(
         "PREFIX ex: <{E}> SELECT * {{ ex:x ex:v ?p . BIND(1 AS ?k) FILTER EXISTS {body} }}"
     );
@@ -99,7 +107,15 @@ fn exists_of(body: &str) -> (GraphPattern, GraphPattern) {
         .unwrap_or_else(|e| panic!("{e}: {text}"));
     let (pattern, _) = crate::native::pattern_and_form(&query);
     let inner = exists_in(pattern).expect("the EXISTS").clone();
-    (inner, pattern.clone())
+    let (evaluated, _) = crate::native::preparation::semantic_pattern(
+        &engine.snapshot(),
+        &query,
+        &crate::QueryOptions::default(),
+        &mut Vec::new(),
+    )
+    .unwrap();
+    let evaluated = exists_in(&evaluated).expect("the evaluated EXISTS").clone();
+    (inner, pattern.clone(), evaluated)
 }
 
 /// `pattern` below the filters at its top, as `exists` evaluates it.
@@ -110,15 +126,19 @@ fn below_filters(mut pattern: &GraphPattern) -> &GraphPattern {
     pattern
 }
 
-/// Spec: an `EXISTS` the rule leaves out (`joined`) is one evaluation joins, whatever its
-/// rows bind: each construct the rule allows, and their nestings, below any top filters,
-/// passes `exists::correlation_safe` for every set of row variables. And an `EXISTS`
-/// evaluation puts values in per value, which some row makes unsafe, still counts: a
-/// subquery with a `LIMIT`, or an `OPTIONAL`, `MINUS`, inner `FILTER` or `BIND` reading the
-/// row. A change to either definition that breaks this inclusion fails here.
+/// Spec: an `EXISTS` the rule leaves out (`joined`, decided on the parsed pattern) is one
+/// evaluation joins, whatever its rows bind: each construct the rule allows, and their
+/// nestings, as preparation's rewrites leave it, below any top filters, passes
+/// `exists::correlation_safe` for every set of row variables. And an `EXISTS` evaluation
+/// puts values in per value, which some row makes unsafe, still counts: a subquery with a
+/// `LIMIT`; an `OPTIONAL`, `MINUS`, inner `FILTER` or `BIND` reading the row; a triple term
+/// with variables in a union or under `GRAPH`, which preparation takes apart into a `BIND`
+/// and a `FILTER` below the top. With OWL 2 QL rewriting on, which reshapes an `EXISTS`
+/// after the mode is decided, every `EXISTS` a value may be put in counts. A change to
+/// either definition, or a rewrite, that breaks this inclusion fails here.
 #[test]
 fn an_exists_the_rule_leaves_out_is_one_evaluation_joins() {
-    let names = ["s", "p", "o", "g", "z", "k", "x", "tag"];
+    let names = ["s", "p", "o", "g", "z", "k", "x", "tag", "a"];
     let rows: Vec<Vec<Variable>> = (0..1u32 << names.len())
         .map(|set| {
             (0..names.len())
@@ -127,7 +147,14 @@ fn an_exists_the_rule_leaves_out_is_one_evaluation_joins() {
                 .collect()
         })
         .collect();
+    let engine = engine_of("");
     let options = crate::QueryOptions::default();
+    let ql = crate::QueryOptions {
+        ql: Some(std::sync::Arc::new(crate::ql::QlRewriting::new(
+            crate::ql::Closure { lists: true },
+        ))),
+        ..crate::QueryOptions::default()
+    };
     for body in [
         "{ ?s ?p ?o }",
         "{ ?s ex:r+ ?o }",
@@ -138,16 +165,22 @@ fn an_exists_the_rule_leaves_out_is_one_evaluation_joins() {
         "{ GRAPH ?g { { ?s ?p ?o } UNION { VALUES ?o { 1 } } } ?s ex:r ?z }",
         "{ ?s ?p ?o FILTER(?k = 1) }",
         "{ ?s ?p ?o FILTER(?k = 1) FILTER(?o != ?s) }",
+        "{ ?s ?p <<( ex:a ex:b ex:c )>> }",
     ] {
-        let (inner, query) = exists_of(body);
+        let (inner, query, evaluated) = exists_of(&engine, body);
         assert!(joined(&inner), "left out: {body}");
         for row in &rows {
             assert!(
-                crate::native::exists::correlation_safe(below_filters(&inner), row),
-                "{body} joins with the row {row:?}"
+                crate::native::exists::correlation_safe(below_filters(&evaluated), row),
+                "{body} joins with the row {row:?}: {evaluated:?}"
             );
         }
         assert!(!as_written(&query, &options), "planned: {body}");
+        assert_eq!(
+            as_written(&query, &ql),
+            variable_predicate(&inner),
+            "with QL on: {body}"
+        );
     }
     for body in [
         "{ SELECT ?p ?s WHERE { ?s ?p \"one\" } LIMIT 1 }",
@@ -155,14 +188,29 @@ fn an_exists_the_rule_leaves_out_is_one_evaluation_joins() {
         "{ ?o ex:r ?z MINUS { ?s ?p ?o } }",
         "{ ?o ex:r ?z { ?s ?p ?o FILTER(?k = 1) } }",
         "{ BIND(?k AS ?q) ?s ?p ?q }",
+        "{ { ?s ?p <<( ?a ex:b ?a )>> } UNION { ?s ?p ?o } }",
+        "{ GRAPH ?g { ?s ?p <<( ?a ex:b ?a )>> } }",
     ] {
-        let (inner, query) = exists_of(body);
+        let (inner, query, evaluated) = exists_of(&engine, body);
         assert!(!joined(&inner), "counted: {body}");
         assert!(
             rows.iter()
-                .any(|row| !crate::native::exists::correlation_safe(below_filters(&inner), row)),
-            "{body} is put in per value for some row"
+                .any(|row| !crate::native::exists::correlation_safe(
+                    below_filters(&evaluated),
+                    row
+                )),
+            "{body} is put in per value for some row: {evaluated:?}"
         );
         assert!(as_written(&query, &options), "as written: {body}");
+        assert!(as_written(&query, &ql), "as written with QL on: {body}");
     }
+    // A triple term with variables counts wherever it stands: alone at the top, its
+    // rewrite's `FILTER` is a top one and the `EXISTS` is still joined, but the rule
+    // decides before the rewrite and doesn't follow it.
+    let (inner, query, _) = exists_of(&engine, "{ ?s ?p <<( ?a ex:b ?a )>> }");
+    assert!(!joined(&inner), "an open triple term counts");
+    assert!(
+        as_written(&query, &options),
+        "as written beside an open triple term"
+    );
 }
