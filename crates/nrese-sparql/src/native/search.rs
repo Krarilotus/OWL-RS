@@ -156,8 +156,9 @@ pub(super) fn names_search(iri: &str) -> bool {
 /// "May": a triple pattern whose predicate is a search vocabulary's IRI, whatever its
 /// object, or a variable a value is put in for at evaluation, whatever that value's source
 /// (the query, the data, an expression): a pre-bound one, or one in a `LATERAL`'s right
-/// side or an `EXISTS`, which evaluation substitutes. Elsewhere a variable predicate is
-/// joined, never put in, so it reads stored statements however the query is planned.
+/// side or an `EXISTS` that evaluation substitutes ([`joined`]: not one it joins).
+/// Elsewhere a variable predicate is joined, never put in, so it reads stored statements
+/// however the query is planned.
 pub(super) fn as_written(
     pattern: &nrese_sparql_syntax::algebra::GraphPattern,
     options: &crate::QueryOptions,
@@ -184,9 +185,33 @@ pub(super) fn as_written(
         || pattern.find(&mut |node| match node {
             Node::Pattern(GraphPattern::Bgp { patterns }) => may_search(patterns, false),
             Node::Pattern(GraphPattern::Lateral { right, .. }) => substituted(right),
-            Node::Expression(Expression::Exists(inner)) => substituted(inner),
+            Node::Expression(Expression::Exists(inner)) => !joined(inner) && substituted(inner),
             _ => false,
         })
+}
+
+/// Whether evaluation joins `EXISTS { pattern }` to its rows, whatever they bind, instead of
+/// putting each row's values in: below its filters only triple patterns, paths, `VALUES`,
+/// joins, unions and `GRAPH`, which `exists::correlation_safe` always passes, and which the
+/// rewrites keep so.
+fn joined(pattern: &nrese_sparql_syntax::algebra::GraphPattern) -> bool {
+    use nrese_sparql_syntax::algebra::GraphPattern;
+    fn plain(pattern: &GraphPattern) -> bool {
+        match pattern {
+            GraphPattern::Bgp { .. } | GraphPattern::Path { .. } | GraphPattern::Values { .. } => {
+                true
+            }
+            GraphPattern::Join { inputs } | GraphPattern::Union { inputs } => {
+                inputs.iter().all(plain)
+            }
+            GraphPattern::Graph { inner, .. } => plain(inner),
+            _ => false,
+        }
+    }
+    match pattern {
+        GraphPattern::Filter { inner, .. } => joined(inner),
+        pattern => plain(pattern),
+    }
 }
 
 /// A `text:query`, or a GraphDB `luc:` search (`?x luc:index "query"`).

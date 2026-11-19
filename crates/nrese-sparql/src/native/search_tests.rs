@@ -87,3 +87,82 @@ fn a_query_without_a_search_is_planned_after_ql_preparation() {
     assert!(!as_written(parsed, &options), "parsed");
     assert!(!as_written(prepared, &options), "prepared: {prepared:?}");
 }
+
+/// The pattern of `SELECT * { ex:x ex:v ?p . BIND(1 AS ?k) FILTER EXISTS { body } }`'s
+/// `EXISTS`, and that query's pattern.
+fn exists_of(body: &str) -> (GraphPattern, GraphPattern) {
+    let text = format!(
+        "PREFIX ex: <{E}> SELECT * {{ ex:x ex:v ?p . BIND(1 AS ?k) FILTER EXISTS {body} }}"
+    );
+    let query = nrese_sparql_syntax::SparqlParser::new()
+        .parse_query(&text)
+        .unwrap_or_else(|e| panic!("{e}: {text}"));
+    let (pattern, _) = crate::native::pattern_and_form(&query);
+    let inner = exists_in(pattern).expect("the EXISTS").clone();
+    (inner, pattern.clone())
+}
+
+/// `pattern` below the filters at its top, as `exists` evaluates it.
+fn below_filters(mut pattern: &GraphPattern) -> &GraphPattern {
+    while let GraphPattern::Filter { inner, .. } = pattern {
+        pattern = inner;
+    }
+    pattern
+}
+
+/// Spec: an `EXISTS` the rule leaves out (`joined`) is one evaluation joins, whatever its
+/// rows bind: each construct the rule allows, and their nestings, below any top filters,
+/// passes `exists::correlation_safe` for every set of row variables. And an `EXISTS`
+/// evaluation puts values in per value, which some row makes unsafe, still counts: a
+/// subquery with a `LIMIT`, or an `OPTIONAL`, `MINUS`, inner `FILTER` or `BIND` reading the
+/// row. A change to either definition that breaks this inclusion fails here.
+#[test]
+fn an_exists_the_rule_leaves_out_is_one_evaluation_joins() {
+    let names = ["s", "p", "o", "g", "z", "k", "x", "tag"];
+    let rows: Vec<Vec<Variable>> = (0..1u32 << names.len())
+        .map(|set| {
+            (0..names.len())
+                .filter(|i| set & (1 << i) != 0)
+                .map(|i| Variable::new_unchecked(names[i]))
+                .collect()
+        })
+        .collect();
+    let options = crate::QueryOptions::default();
+    for body in [
+        "{ ?s ?p ?o }",
+        "{ ?s ex:r+ ?o }",
+        "{ VALUES (?s ?o) { (ex:a ex:b) } }",
+        "{ { ?s ?p ?o } UNION { ?o ?p ?s } }",
+        "{ GRAPH ?g { ?s ?p ?o } }",
+        "{ ?s ?p ?o . ?o ex:r* ?z }",
+        "{ GRAPH ?g { { ?s ?p ?o } UNION { VALUES ?o { 1 } } } ?s ex:r ?z }",
+        "{ ?s ?p ?o FILTER(?k = 1) }",
+        "{ ?s ?p ?o FILTER(?k = 1) FILTER(?o != ?s) }",
+    ] {
+        let (inner, query) = exists_of(body);
+        assert!(joined(&inner), "left out: {body}");
+        for row in &rows {
+            assert!(
+                crate::native::exists::correlation_safe(below_filters(&inner), row),
+                "{body} joins with the row {row:?}"
+            );
+        }
+        assert!(!as_written(&query, &options), "planned: {body}");
+    }
+    for body in [
+        "{ SELECT ?p ?s WHERE { ?s ?p \"one\" } LIMIT 1 }",
+        "{ VALUES ?tag { 1 } OPTIONAL { ?s ?p \"one\" } FILTER(BOUND(?s)) }",
+        "{ ?o ex:r ?z MINUS { ?s ?p ?o } }",
+        "{ ?o ex:r ?z { ?s ?p ?o FILTER(?k = 1) } }",
+        "{ BIND(?k AS ?q) ?s ?p ?q }",
+    ] {
+        let (inner, query) = exists_of(body);
+        assert!(!joined(&inner), "counted: {body}");
+        assert!(
+            rows.iter()
+                .any(|row| !crate::native::exists::correlation_safe(below_filters(&inner), row)),
+            "{body} is put in per value for some row"
+        );
+        assert!(as_written(&query, &options), "as written: {body}");
+    }
+}
