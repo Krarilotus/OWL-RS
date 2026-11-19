@@ -24,6 +24,7 @@ mod properties;
 pub mod ql;
 pub mod rules;
 pub mod scope;
+pub mod typing;
 mod universal;
 mod unsupported;
 pub mod vocab;

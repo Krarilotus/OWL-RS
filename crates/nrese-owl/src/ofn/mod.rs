@@ -68,6 +68,8 @@ pub(super) struct Model {
     pub diagnostics: Vec<Diagnostic>,
     pub annotations: usize,
     pub annotation_schema: Vec<Term>,
+    /// [`Ontology::annotation_uses`].
+    pub annotation_uses: BTreeSet<Term>,
     pub uses: HashMap<Term, Uses>,
     pub rules: Vec<crate::rules::Rule>,
     pub qualified_data_max: Option<Term>,
@@ -120,6 +122,7 @@ impl<'a> FunctionalReader<'a> {
         model.annotation_schema.dedup();
         let mut ontology = Ontology {
             annotation_schema: model.annotation_schema,
+            annotation_uses: model.annotation_uses,
             shacl: BTreeSet::new(),
             classes: model.classes,
             ranges: model.ranges,

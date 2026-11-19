@@ -26,8 +26,11 @@ pub enum Diagnostic {
     /// OWL vocabulary used outside any form of the mapping.
     NotOwl { triple: [Term; 3] },
     /// A structure (an expression, a list) no axiom uses: it says nothing under the
-    /// direct semantics (OWL 1 conclusions state expressions so).
-    Unused { node: Term },
+    /// direct semantics (OWL 1 conclusions state expressions so). `reads_more`: the OWL 2 RL
+    /// rules may read more of it than one structure says: it has two forms, a negative
+    /// property assertion's statements untyped, or is also an individual of an axiom (which
+    /// an equality can give a second structure's statements).
+    Unused { node: Term, reads_more: bool },
     /// A global restriction of OWL 2 DL broken: a non-simple property where only simple
     /// ones may be (cardinalities, `Self`, functional, inverse-functional, irreflexive,
     /// asymmetric, disjoint properties). `axiom` indexes [`Ontology::axioms`].
@@ -74,7 +77,7 @@ impl Diagnostic {
             Self::AmbiguousProperty { property } => (property, "ambiguous"),
             Self::Unsupported { node, what } => (node, what),
             Self::NotOwl { triple } => return (triple, "not owl"),
-            Self::Unused { node } => (node, "unused"),
+            Self::Unused { node, .. } => (node, "unused"),
             Self::NonSimpleProperty { property, what, .. } => (property, what),
             Self::AnonymousIndividual { node } => (node, "anonymous individual"),
             Self::Syntax { line, column, what } => {
@@ -137,7 +140,7 @@ impl Diagnostic {
                 let statement = triple.map(name).join(" ");
                 format!("OWL vocabulary outside the mapping: {statement}")
             }
-            Self::Unused { node } => at("a structure no axiom uses", node),
+            Self::Unused { node, .. } => at("a structure no axiom uses", node),
             Self::NonSimpleProperty { property, what, .. } => {
                 at(&format!("a non-simple property in {what}"), property)
             }

@@ -5,6 +5,7 @@
 mod functional;
 mod list_cells;
 mod order;
+mod typing;
 
 use std::collections::HashMap;
 

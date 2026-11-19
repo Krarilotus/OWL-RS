@@ -314,13 +314,14 @@ impl<'t, 'm> Parser<'t, 'm> {
 
     // Annotations -----------------------------------------------------------------------
 
-    /// `Annotation(…)*`, counted.
+    /// `Annotation(…)*`, counted, each property an annotation property's use.
     fn annotations(&mut self) -> R<()> {
         while matches!(self.peek(), Tok::Name("Annotation")) {
             self.take();
             self.open()?;
             self.annotations()?;
-            self.iri_text()?;
+            let property = self.entity()?;
+            self.model.annotation_uses.insert(property);
             self.annotation_value()?;
             self.close()?;
             self.model.annotations += 1;
@@ -736,7 +737,8 @@ impl<'t, 'm> Parser<'t, 'm> {
                 })
             }
             "AnnotationAssertion" => {
-                self.iri_text()?;
+                let property = self.entity()?;
+                self.model.annotation_uses.insert(property);
                 self.annotation_value()?;
                 self.annotation_value()?;
                 None
@@ -745,9 +747,11 @@ impl<'t, 'm> Parser<'t, 'm> {
                 let property = self.entity()?;
                 self.model.uses.entry(property).or_default().annotation = true;
                 self.model.annotation_schema.push(property);
+                self.model.annotation_uses.insert(property);
                 if keyword == "SubAnnotationPropertyOf" {
                     let sup = self.entity()?;
                     self.model.uses.entry(sup).or_default().annotation = true;
+                    self.model.annotation_uses.insert(sup);
                 } else {
                     self.iri_text()?;
                 }
