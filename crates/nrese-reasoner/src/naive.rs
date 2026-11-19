@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::eval::Poller;
 use super::ir::{Atom, Head, Rule, Term};
-use super::lists::{Facts, ListVocabulary, instantiate};
+use super::lists::{Facts, ListVocabulary, instantiate_written};
 
 pub use super::ir::{Triple, Violation};
 
@@ -67,12 +67,16 @@ impl Index {
     }
 }
 
+/// In id order, as the executors read ([`crate::eval::AllFacts`]): a list walk's outcome
+/// can depend on the order it meets a node's values.
 impl Facts for Index {
     fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
-        self.candidates(Some(subject), Some(predicate), None)
+        let mut objects: Vec<u64> = (self.candidates(Some(subject), Some(predicate), None))
             .iter()
             .map(|t| t[2])
-            .collect()
+            .collect();
+        objects.sort_unstable();
+        objects
     }
 
     fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
@@ -156,12 +160,16 @@ pub fn materialise(input: &[Triple], rules: &[Rule], lists: Option<&ListVocabula
     let input_set: HashSet<Triple> = input.iter().copied().collect();
     let mut facts: HashSet<Triple> = input_set.clone();
     let mut closure = Closure::default();
+    // The input as written: past the cap, a list's clash checks are read from it too, as
+    // every executor reads them ([`super::lists::instantiate_written`]).
+    let written = Index::new(input.iter().copied());
     loop {
         closure.rounds += 1;
         let index = Index::new(facts.iter().copied());
         let mut program: Vec<Rule> = rules.to_vec();
         if let Some(vocabulary) = lists {
-            let (list_rules, diagnostics) = instantiate(vocabulary, &index);
+            let (list_rules, _, diagnostics) =
+                instantiate_written(vocabulary, &index, Some(&written));
             program.extend(list_rules);
             closure.diagnostics = diagnostics;
         }

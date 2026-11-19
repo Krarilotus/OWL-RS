@@ -52,7 +52,7 @@ use super::eval::{
 };
 use super::ir::Triple;
 use super::ir::{Head, Rule};
-use super::lists::{ListVocabulary, instantiate};
+use super::lists::{ListDiagnostic, ListVocabulary, instantiate};
 use super::violations::{Violations, unlimited};
 
 /// The materialised state: asserted facts after the change, and inferred facts before it.
@@ -211,12 +211,12 @@ pub struct Rules<'a> {
 impl Rules<'_> {
     /// The ground program over `source`; its bodiless facts count as handed out. List
     /// rules carry the list facts they come from as premises.
-    fn program<S: Source + ?Sized>(&self, source: &S) -> GroundProgram {
+    fn program<B: Base + ?Sized>(&self, source: &Overlay<'_, B>) -> GroundProgram {
         let mut program = GroundProgram::default();
         program.ground(source, self.schema, self.rules);
-        if let Some(vocabulary) = self.lists {
-            let (rules, premises, diagnostics) =
-                super::lists::instantiate_with_premises(vocabulary, &AllFacts(source));
+        // The overlays a program is ground over hold in `extra` only the facts a change
+        // deleted (the state before it), never inferred ones.
+        if let Some((rules, premises, diagnostics)) = self.read_lists(source, Some(source.extra)) {
             program.ground_with_premises(source, self.schema, &rules, &premises);
             program.list_diagnostics = diagnostics;
         }
@@ -224,13 +224,38 @@ impl Rules<'_> {
         program
     }
 
-    /// The list rules (both kinds) instantiated over `source`.
+    /// The list rules (both kinds) instantiated over `source`. Overdeletion compares the
+    /// inference rules alone: the closure's reading, which a reading as written adds nothing
+    /// to ([`Self::read_lists`]).
     fn list_rules<S: Source + ?Sized>(&self, source: &S) -> Vec<Rule> {
         #[cfg(test)]
         crate::witness::add(crate::witness::Site::ListRules, 1);
         self.lists
             .map(|vocabulary| instantiate(vocabulary, &AllFacts(source)).0)
             .unwrap_or_default()
+    }
+
+    /// The list rules over `source`, with the list facts each comes from, and the lists left
+    /// out ([`super::lists::instantiate_written`]). A list past the cap over `source` is read
+    /// as written as well: over the asserted facts of `source.base` that `source` doesn't
+    /// hide, and `deleted`, asserted before a change where `source` is the state before it.
+    /// Every grounding of list rules reads them here, so all read them alike.
+    fn read_lists<B: Base + ?Sized>(
+        &self,
+        source: &Overlay<'_, B>,
+        deleted: Option<&Store>,
+    ) -> Option<ListRules> {
+        let written = Written {
+            base: source.base,
+            hidden: source.hidden,
+            deleted,
+        };
+        let vocabulary = self.lists?;
+        Some(super::lists::instantiate_written(
+            vocabulary,
+            &AllFacts(source),
+            Some(&written),
+        ))
     }
 
     fn is_list_fact(&self, fact: Triple) -> bool {
@@ -300,6 +325,48 @@ struct Overlay<'a, B: Base + ?Sized> {
 impl<B: Base + ?Sized> Overlay<'_, B> {
     fn in_base(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
         Ok(!self.hidden.contains(&fact) && !self.extra.contains(fact, poll)?)
+    }
+}
+
+/// List rules, the list facts each comes from, and the lists left out.
+type ListRules = (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>);
+
+/// The asserted facts of a state over `base`, for list instantiation, which is grounding: run
+/// to its end. The base's asserted facts (after the change) it doesn't hide, and `deleted`.
+struct Written<'a, B: Base + ?Sized> {
+    base: &'a B,
+    hidden: &'a HashSet<Triple>,
+    deleted: Option<&'a Store>,
+}
+
+impl<B: Base + ?Sized> Written<'_, B> {
+    fn matching(&self, pattern: [Option<u64>; 3]) -> Vec<Triple> {
+        let poll = Poller::never();
+        let mut out = Vec::new();
+        if let Some(deleted) = self.deleted {
+            (deleted.scan(pattern, Seg::All, &poll, &mut |t| out.push(t))).expect("never stopped");
+        }
+        let scanned = self.base.scan_asserted(pattern, &poll, &mut |t| {
+            if !self.hidden.contains(&t) {
+                out.push(t);
+            }
+        });
+        scanned.expect("never stopped");
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+impl<B: Base + ?Sized> super::lists::Facts for Written<'_, B> {
+    fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
+        let found = self.matching([Some(subject), Some(predicate), None]);
+        found.into_iter().map(|t| t[2]).collect()
+    }
+
+    fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
+        let found = self.matching([None, Some(predicate), None]);
+        found.into_iter().map(|t| (t[0], t[2])).collect()
     }
 }
 
@@ -1151,10 +1218,8 @@ fn update_body<B: Base + ?Sized>(
             program.to_mut().ground_delta(&state, schema, &schema_rules);
         }
         if delta_facts.iter().any(|&f| rules.is_list_fact(f))
-            && let Some(vocabulary) = rules.lists
+            && let Some((list_rules, premises, diagnostics)) = rules.read_lists(&state, None)
         {
-            let (list_rules, premises, diagnostics) =
-                super::lists::instantiate_with_premises(vocabulary, &AllFacts(&state));
             let program = program.to_mut();
             program.ground_with_premises(&state, schema, &list_rules, &premises);
             program.list_diagnostics = diagnostics;
@@ -1394,10 +1459,8 @@ fn introduced_violations_body<B: Base + ?Sized>(
             .ground_delta(&state, rules.schema, &rules.schema_rules());
     }
     if delta_facts.iter().any(|&f| rules.is_list_fact(f))
-        && let Some(vocabulary) = rules.lists
+        && let Some((list_rules, premises, diagnostics)) = rules.read_lists(&state, None)
     {
-        let (list_rules, premises, diagnostics) =
-            super::lists::instantiate_with_premises(vocabulary, &AllFacts(&state));
         let program = program.to_mut();
         program.ground_with_premises(&state, rules.schema, &list_rules, &premises);
         program.list_diagnostics = diagnostics;
