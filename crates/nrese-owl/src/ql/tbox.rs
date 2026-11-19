@@ -158,17 +158,14 @@ impl Tbox {
         };
         tbox.hazards =
             super::hazards::hazards(ontology, &tbox.types, &read, &|id| tbox.basics[id as usize]);
-        // An axiom the mapping drops supports no claim: any term may miss its conclusions
-        // (I24c-2). An existing global hazard's reason is the more specific.
+        // An axiom the reader leaves out or alters supports no claim: any term may miss its
+        // conclusions (I24c-2). Which diagnostics are one is the reader's rule
+        // (`Diagnostic::alters_axioms`), never a list here. An existing global hazard's
+        // reason is the more specific.
         if tbox.hazards.global.is_none() {
-            use crate::diagnostics::Diagnostic;
-            tbox.hazards.global = ontology.diagnostics.iter().find_map(|d| match *d {
-                Diagnostic::Malformed { node, .. } | Diagnostic::Unsupported { node, .. } => {
-                    Some(Hazard::Dropped(node))
-                }
-                Diagnostic::BrokenList { head } => Some(Hazard::Dropped(head)),
-                _ => None,
-            });
+            tbox.hazards.global = (ontology.diagnostics.iter())
+                .find(|d| d.alters_axioms())
+                .map(|&d| Hazard::LeftOut(d));
         }
         // Over RL's closure, an axiom that compares data values: its conclusions may be
         // missing for any term, named individuals included. The Tbox reads no assertions, so
