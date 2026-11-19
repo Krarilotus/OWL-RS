@@ -116,6 +116,9 @@ pub struct Ontology {
     /// `owl:disjointUnionOf`), read as an equivalence and an empty operand. Every later
     /// rewrite of that kind sets it too.
     pub rules_unread: Option<Term>,
+    /// The first list cell a statement outside its list names; the OWL 2 RL rules may equate
+    /// it and read sequences the graph doesn't write.
+    pub list_cell_outside: Option<Term>,
 }
 
 /// The properties OWL 2 gives a fixed meaning, by their ids in the source (`None` where
@@ -442,6 +445,9 @@ struct Reader<'a> {
     rules_unread: Option<Term>,
     annotation_schema: Vec<Term>,
     shacl: BTreeSet<Term>,
+    /// The cells of the lists read to `rdf:nil` ([`Self::cells_outside_their_lists`]).
+    cells: HashSet<Term>,
+    list_cell_outside: Option<Term>,
 }
 
 /// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
@@ -629,6 +635,8 @@ impl<'a> Reader<'a> {
             rules_unread: None,
             annotation_schema: Vec::new(),
             shacl: BTreeSet::new(),
+            cells: HashSet::new(),
+            list_cell_outside: None,
         }
     }
 
@@ -896,13 +904,15 @@ impl<'a> Reader<'a> {
 
     // Lists ----------------------------------------------------------------------------
 
-    /// The members of the list starting at `head`.
+    /// The members of the list starting at `head`. Its cells are checked once every statement
+    /// is read ([`Self::cells_outside_their_lists`]).
     fn list(&mut self, head: Term) -> Option<Vec<Term>> {
         let mut members = Vec::new();
         let mut seen = HashSet::new();
         let mut cell = head;
         loop {
             if is(cell, self.v.nil) {
+                self.cells.extend(seen);
                 return Some(members);
             }
             if self.kind(cell) != TermKind::Blank || !seen.insert(cell) {
@@ -1957,7 +1967,48 @@ impl<'a> Reader<'a> {
         builtin.contains(&Some(predicate)) || *version_iri == Some(predicate)
     }
 
+    /// Reports each cell of [`Self::cells`] that a statement outside its list names (*Mapping
+    /// to RDF* §3: a sequence's blank nodes occur only in that sequence), once. Allowed: as
+    /// subject, its `rdf:first`, `rdf:rest` and `rdf:type rdf:List`; as object, the one
+    /// statement that points to it (its axiom's, or its predecessor's `rdf:rest`) and that
+    /// statement's reification's `owl:annotatedTarget`. Read over every statement, so the
+    /// order they come in changes nothing.
+    fn cells_outside_their_lists(&mut self) {
+        let v = self.v;
+        let mut outside = BTreeSet::new();
+        let mut owners: HashMap<Term, [Term; 3]> = HashMap::new();
+        let mut targets = Vec::new();
+        for statement in self.statements {
+            let [s, p, o] = statement.triple;
+            let typed_list = is(p, v.rdf_type) && is(o, v.rdf_list);
+            if self.cells.contains(&s) && !is(p, v.first) && !is(p, v.rest) && !typed_list {
+                outside.insert(s);
+            }
+            if !self.cells.contains(&o) {
+                continue;
+            }
+            if is(p, v.owl_annotated_target) {
+                targets.push((s, o));
+            } else if *owners.entry(o).or_insert(statement.triple) != statement.triple {
+                outside.insert(o);
+            }
+        }
+        for (reification, cell) in targets {
+            let main = [v.owl_annotated_source, v.owl_annotated_property]
+                .map(|p| self.single(reification, p));
+            if owners.get(&cell).map(|&[s, p, _]| [Some(s), Some(p)]) != Some(main) {
+                outside.insert(cell);
+            }
+        }
+        for node in outside {
+            self.list_cell_outside.get_or_insert(node);
+            let what = "a list's cell used outside its list";
+            self.report(Diagnostic::Malformed { node, what });
+        }
+    }
+
     fn finish(mut self) -> Ontology {
+        self.cells_outside_their_lists();
         let mut axioms = Vec::with_capacity(self.axioms.len());
         let mut sources = Vec::with_capacity(self.axioms.len());
         for (axiom, from) in std::mem::take(&mut self.axioms) {
@@ -1983,6 +2034,7 @@ impl<'a> Reader<'a> {
             empty_list: self.empty_list,
             qualified_data_max: self.qualified_data_max,
             rules_unread: self.rules_unread,
+            list_cell_outside: self.list_cell_outside,
         };
         complete(&mut ontology, self.terms);
         ontology

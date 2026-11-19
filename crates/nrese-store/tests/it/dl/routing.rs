@@ -1472,8 +1472,8 @@ fn intersection(n: usize) -> String {
 /// the same as the first list's. The closure gives each of the chain's nodes two members
 /// and two rests: 2^7 member sequences, more than the reasoner reads (`MAX_VARIANTS`, 64).
 /// With `cycle`, the last node is instead the same as the first: the chain's list returns
-/// to its head through `owl:sameAs`, which the reader, reading the statements as written,
-/// doesn't see.
+/// to its head through `owl:sameAs`. Either way a statement outside the list names its
+/// cells, which the reader reports.
 fn aliased_chain(cycle: bool) -> String {
     const RDF: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#";
     let node = |list: &str, i: usize, member: &str| {
