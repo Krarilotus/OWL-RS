@@ -344,6 +344,16 @@ leave something out.
 - A store holding `owl:sameAs` on OWL's own vocabulary isn't OWL 2 DL. A rebuild of it can miss
   a clash the equality hides, and a write that removes the equality is then refused with the
   clash it reveals.
+- In the cases run under `owl2-rl`, data that makes `rdf:rest` or `rdf:nil` `owl:sameAs` a term
+  of its own misses a property chain's inference; the read is told `sound-only`, as every read
+  over the `owl2-rl` closure is. `:out owl:propertyChainAxiom ( :p :q )` with
+  `:a :p :b . :b :q :z` isn't applied when its list goes on through a name made equal to
+  `rdf:rest` (the list written with
+  `:r`, then `rdf:rest owl:sameAs :r`; under the default equality setting) or ends in a name made
+  equal to `rdf:nil` (under compact equality): `ASK { :a :out :z }` stays `false`. The earlier
+  `main` infers both, with no status. In another case run, a key written with a property made
+  equal to `owl:hasKey` (under compact equality), it is the earlier `main` that misses the
+  equality this release infers. Don't make the standard vocabulary equal to terms of your own.
 - A write refused by a list rule (`eq-diff2` of an `owl:AllDifferent`, `cax-adc` of an
   `owl:AllDisjointClasses`) can be named by the rule and an individual, or by the rule alone with
   no member, without the statements behind it.
