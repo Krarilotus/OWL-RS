@@ -15,25 +15,15 @@ pub const ITEMS: &[&str] = &[
     "axiomatic triples outside Tables 4–9 (58)",
 ];
 
-pub struct Publication<'a> {
+pub struct Publication {
     pub required: Facts,
-    pub optional: Facts,
     pub counts: [usize; ITEMS.len()],
-    asserted: &'a Facts,
 }
 
-impl Publication<'_> {
-    pub fn visible(&self, row: &Triple) -> bool {
-        excluded(row, self.asserted).is_none()
-    }
-}
-
-pub fn project<'a>(asserted: &'a Facts, model: &oracle::Model) -> Publication<'a> {
+pub fn project(asserted: &Facts, model: &oracle::Model) -> Publication {
     let mut result = Publication {
         required: Facts::new(),
-        optional: Facts::new(),
         counts: [0; ITEMS.len()],
-        asserted,
     };
     let has_literals = asserted.iter().flatten().any(|term| term.starts_with('"'));
     let without_type2 = has_literals.then(|| oracle::evaluate(asserted, Datatypes::WithoutType2));
@@ -45,9 +35,6 @@ pub fn project<'a>(asserted: &'a Facts, model: &oracle::Model) -> Publication<'a
             .is_some_and(|m| !m.facts.contains(row))
         {
             result.counts[4] += 1;
-            if exclusion.is_none() {
-                result.optional.insert(row.clone());
-            }
         } else if let Some(reason) = exclusion {
             result.counts[reason] += 1;
         } else if without_dt_eq
@@ -56,7 +43,6 @@ pub fn project<'a>(asserted: &'a Facts, model: &oracle::Model) -> Publication<'a
         {
             // An equality or consequence also supported by prp-fp stays required.
             result.counts[5] += 1;
-            result.optional.insert(row.clone());
         } else {
             result.required.insert(row.clone());
         }
