@@ -10,7 +10,7 @@
 //! | property path | followed from the seed's values of its ends |
 //! | `P1 . P2` | `eval_from(eval_from(seed, P1), P2)` |
 //! | `P1 UNION P2` | the union of both, each from the seed |
-//! | `OPTIONAL`, `BIND`, `FILTER` | inside, when every seed variable the part reads is certainly bound by the part it applies to (else the seed's value would change what it computes) |
+//! | `OPTIONAL`, `BIND`, `FILTER` | inside, when every seed variable the part reads is certainly bound by the part it applies to (else the seed's value would change what it computes), and a `BIND` or `FILTER` draws no new value per evaluation (`RAND`, `BNODE`, …: once per seed row would draw for each, where the group draws once per solution) |
 //!
 //! Anything else is evaluated alone and joined. A join of two groups starts with the one
 //! the statistics say is smaller, unless an ORDER BY inside either fixes the row order.
@@ -192,7 +192,9 @@ impl Context<'_> {
             }
             GraphPattern::Filter { expr, inner } => {
                 let read = deep_variables(expr);
-                if !reads_only_bound(&read, &pushdown::certain(inner), &seed) {
+                if pushdown::draws(expr)
+                    || !reads_only_bound(&read, &pushdown::certain(inner), &seed)
+                {
                     return self.join_alone(seed, pattern);
                 }
                 if let GraphPattern::Bgp { patterns } = &**inner
@@ -264,6 +266,7 @@ impl Context<'_> {
             GraphPattern::Extend { inner, bindings }
                 if bindings.iter().all(|(variable, expression)| {
                     seed.column(variable).is_none()
+                        && !pushdown::draws(expression)
                         && reads_only_bound(
                             &deep_variables(expression),
                             &pushdown::certain(inner),

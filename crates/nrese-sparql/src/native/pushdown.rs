@@ -326,18 +326,24 @@ pub(super) fn movable(conjunct: &Expression) -> bool {
 /// Whether the expression reads the whole solution (`EXISTS`) or draws a value per row: a
 /// search, so by the shared walker (ADR-0012), which stops at the first.
 pub(crate) fn per_solution(expression: &Expression) -> bool {
-    expression.find(&mut |node| {
-        matches!(
-            node,
-            Node::Expression(
-                Expression::Exists(_)
-                    | Expression::FunctionCall(
-                        Function::Rand | Function::Uuid | Function::StrUuid | Function::BNode,
-                        _,
-                    )
-            )
-        )
-    })
+    expression
+        .find(&mut |node| matches!(node, Node::Expression(Expression::Exists(_))) || draw(node))
+}
+
+/// Whether the expression gives a new value at each evaluation (`RAND`, `UUID`, `STRUUID`,
+/// `BNODE`): evaluated more or less often, it answers otherwise.
+pub(super) fn draws(expression: &Expression) -> bool {
+    expression.find(&mut draw)
+}
+
+fn draw(node: Node<'_>) -> bool {
+    matches!(
+        node,
+        Node::Expression(Expression::FunctionCall(
+            Function::Rand | Function::Uuid | Function::StrUuid | Function::BNode,
+            _,
+        ))
+    )
 }
 
 /// Whether `pattern` binds all of `variables` in every solution.
