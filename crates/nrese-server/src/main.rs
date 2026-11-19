@@ -613,7 +613,12 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
             .map_or(GraphTarget::DefaultGraph, GraphTarget::NamedGraph),
         invalid: load.invalid,
     };
-    let report = store.bulk_load(&request).context("bulk load failed")?;
+    let report = store.bulk_load(&request).map_err(|error| match error {
+        nrese_store::StoreError::LoadPublished { revision, reason } => anyhow::anyhow!(
+            "the load completed at published revision {revision}. Its quarantine record couldn't be kept: {reason}. Don't load it again."
+        ),
+        error => anyhow::Error::new(error).context("bulk load failed"),
+    })?;
     let seconds = report.elapsed.as_secs_f64();
     tracing::info!(
         revision = report.revision,

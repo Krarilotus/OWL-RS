@@ -209,13 +209,17 @@ pub(crate) fn bulk_load(
     });
     memory::release_all();
     let summary = summary?;
-    // The load is published before its quarantine is recorded.
+    // A no-op load can still have a quarantine to record.
+    let published = summary.inserted + summary.deleted + summary.inferred_deleted > 0;
     let quarantined = collector
         .map(Collector::commit)
         .transpose()
-        .map_err(|reason| StoreError::LoadPublished {
-            revision: summary.revision,
-            reason,
+        .map_err(|reason| match published {
+            true => StoreError::LoadPublished {
+                revision: summary.revision,
+                reason,
+            },
+            false => reason.into(),
         })?
         .unwrap_or_default();
     if quarantined.count > 0 {
