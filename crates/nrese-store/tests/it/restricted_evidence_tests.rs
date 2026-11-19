@@ -156,7 +156,8 @@ fn dl_rejection_has_no_hidden_proof_counts() {
 /// check's time, in the same text.
 #[test]
 fn dl_rejection_full_reader_keeps_counts_and_time() {
-    let full = format!("{:?}", dl_count(&Requester::all()));
+    let reject = dl_count(&Requester::all());
+    let full = format!("{reject:?}");
     let horn = format!("{:?}", dl_horn(&Requester::all()));
     let told = [
         (&full, "axiom(s)"),
@@ -167,6 +168,12 @@ fn dl_rejection_full_reader_keeps_counts_and_time() {
     let missing = told.iter().filter(|(text, words)| !text.contains(words));
     let missing: Vec<_> = missing.map(|(_, words)| words).collect();
     assert!(missing.is_empty(), "{missing:?} not in {full}\n{horn}");
+    // The justification's size itself.
+    let detail = &reject.detail;
+    assert!(
+        detail.contains("5 axiom(s) have no model together"),
+        "{detail}"
+    );
 }
 
 /// A shape requiring `:p` of every `:B`; `:SECRET_FOCUS a :A` is in `:secret`, and the
