@@ -1,7 +1,8 @@
 //! An expression with a new value at each evaluation (`BNODE()`, `RAND()`, `UUID()`,
 //! `STRUUID()`) is evaluated as often as SPARQL evaluates it, however the planner joins: a
 //! group's `BIND` or `FILTER` once per solution of the group, a filter above a join once
-//! per joined row. Values are random, so each test states a property every SPARQL
+//! per joined row, an `OPTIONAL`'s condition once per pair of its group, an `EXISTS` once
+//! per solution it tests. Values are random, so each test states a property every SPARQL
 //! evaluation has and a wrong count of evaluations breaks.
 
 use nrese_engine::{Engine, EngineConfig};
@@ -105,5 +106,43 @@ fn optional_sides_and_pushed_filters_evaluate_as_often_as_sparql_does() {
             0 < n && n < 40,
             "{n} rows of the joined filter, as written: {as_written}"
         );
+    }
+}
+
+/// Spec: the group `{ <urn:a> rdfs:label ?l OPTIONAL { <urn:a> rdfs:label ?o
+/// FILTER(RAND() < 0.5) } }` has one pair for its `OPTIONAL`, decided by one draw; the
+/// join copies the outcome to all forty `VALUES` rows, so `FILTER(BOUND(?o))` keeps 0 or
+/// 40 of them.
+#[test]
+fn an_optional_condition_drawing_a_value_decides_once_for_its_group() {
+    let query = format!(
+        "SELECT ?k {{ {} {{ <urn:a> {LABEL} ?l OPTIONAL {{ <urn:a> {LABEL} ?o \
+         FILTER(RAND() < 0.5) }} }} FILTER(BOUND(?o)) }}",
+        forty()
+    );
+    for as_written in [false, true] {
+        for _ in 0..5 {
+            let n = rows(&query, as_written);
+            assert!(n == 0 || n == 40, "{n} rows, as written: {as_written}");
+        }
+    }
+}
+
+/// Spec: in the group `{ VALUES ?i { 1 … 40 } FILTER EXISTS { FILTER(RAND() < 0.5) } }` each
+/// of the forty solutions draws once; the join copies each kept one to both `VALUES ?k`
+/// rows, so the answer has an even number of rows (2 per kept solution).
+#[test]
+fn an_exists_drawing_a_value_draws_once_per_solution_of_its_group() {
+    let keys: Vec<String> = (1..=40).map(|i| i.to_string()).collect();
+    let query = format!(
+        "SELECT ?k ?i {{ VALUES ?k {{ 1 2 }} {{ VALUES ?i {{ {} }} \
+         FILTER EXISTS {{ FILTER(RAND() < 0.5) }} }} }}",
+        keys.join(" ")
+    );
+    for as_written in [false, true] {
+        for _ in 0..5 {
+            let n = rows(&query, as_written);
+            assert!(n % 2 == 0, "{n} rows, as written: {as_written}");
+        }
     }
 }
