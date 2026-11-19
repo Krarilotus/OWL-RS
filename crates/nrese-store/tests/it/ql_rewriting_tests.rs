@@ -2056,8 +2056,8 @@ fn schema_the_reader_or_the_mapping_leaves_out_is_reported() {
 /// An axiom the reader leaves out lowers the rewriting's claim under owl2-ql (I24c-2). With
 /// `A ⊑ List ⊓ C` and `a : A`, `a` is a `C` (OWL 2 Direct Semantics §2.3; the RL tables'
 /// cls-int2 and cax-sco). The reader leaves the whole axiom out, `rdf:List` being a reserved
-/// name used as a class, so the rewriting can't reach `a`: whatever it returns is told not
-/// `complete`, with the reader's reason. The control, `D` in `rdf:List`'s place, is read:
+/// name used as a class, so the rewriting can't reach `a`: whatever it returns is told
+/// `sound-only`, with the reader's reason. The control, `D` in `rdf:List`'s place, is read:
 /// `a`, `complete`.
 #[test]
 fn an_axiom_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
@@ -2086,7 +2086,7 @@ fn an_axiom_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
         "the witness: {rows:?}, only certain answers"
     );
     assert!(
-        status.as_str() != "complete"
+        status.as_str() == "sound-only"
             && reasons.iter().any(|r| {
                 r.contains("reserved vocabulary used as an entity")
                     && r.contains("http://www.w3.org/1999/02/22-rdf-syntax-ns#List")
@@ -2102,6 +2102,84 @@ fn an_axiom_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
         "the control: {:?}",
         status.reasons
     );
+}
+
+/// A membership the reader leaves out lowers the rewriting's claim under owl2-ql, as a
+/// left-out axiom does (I24c-2). `rdf:List a [ owl:intersectionOf ( :C :D ) ]` makes
+/// `rdf:List` a `C` (OWL 2 Direct Semantics §2.3; the RL tables' cls-int2), but `rdf:List`
+/// is a reserved name, which the reader leaves out with its membership. Where it is the
+/// expression's only member, the members of `C` are told `sound-only`, with the reader's
+/// reason, and include the asserted `c`: on a fresh read, and on a read after the
+/// membership is added to a store whose schema was read with the expression memberless
+/// (`complete` then, nothing being in it).
+#[test]
+fn a_membership_the_reader_leaves_out_is_never_told_complete_under_owl2_ql() {
+    use nrese_store::SparqlUpdateRequest;
+
+    let head = format!(
+        "@prefix : <{E}> . @prefix owl: <http://www.w3.org/2002/07/owl#> .
+         @prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> .\n"
+    );
+    let list = "http://www.w3.org/1999/02/22-rdf-syntax-ns#List";
+    let query = format!("SELECT ?x WHERE {{ ?x a <{E}C> }}");
+    let told = |store: &StoreService| {
+        let result = store
+            .execute_query(&SparqlQueryRequest::all(query.as_str()))
+            .unwrap();
+        let status = result.completeness.unwrap_or_default();
+        let reasons: Vec<String> = status.reasons.iter().map(|r| r.text.clone()).collect();
+        (
+            select_rows(&result.payload),
+            status.as_str().to_owned(),
+            reasons,
+        )
+    };
+    let c = format!("x={E}c");
+    let certain = [c.clone(), format!("x={list}")];
+    let mut wrong = Vec::new();
+    let mut check = |case: &str, (rows, status, reasons): (Vec<String>, String, Vec<String>)| {
+        let reason = reasons
+            .iter()
+            .any(|r| r.contains("reserved vocabulary used as an entity") && r.contains(list));
+        if !rows.contains(&c) || rows.iter().any(|r| !certain.contains(r)) {
+            wrong.push(format!(
+                "{case}: {rows:?}, only certain answers, c among them"
+            ));
+        } else if status != "sound-only" || !reason {
+            wrong.push(format!("{case}: {rows:?}, {status}, {reasons:?}"));
+        }
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let fresh = store(
+        &format!("{head}:c a :C . rdf:List a [ owl:intersectionOf ( :C :D ) ] ."),
+        dir.path(),
+        Ruleset::Owl2Ql,
+        true,
+    );
+    check("fresh", told(&fresh));
+    let dir = tempfile::tempdir().unwrap();
+    let cached = store(
+        &format!("{head}:c a :C . [ owl:intersectionOf ( :C :D ) ] ."),
+        dir.path(),
+        Ruleset::Owl2Ql,
+        true,
+    );
+    let before = told(&cached);
+    assert_eq!(
+        (&before.0, before.1.as_str()),
+        (&vec![c.clone()], "complete"),
+        "before the membership: {:?}",
+        before.2
+    );
+    cached
+        .execute_update(&SparqlUpdateRequest::new(
+            "PREFIX owl: <http://www.w3.org/2002/07/owl#>
+             PREFIX rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#>
+             INSERT { rdf:List a ?e } WHERE { ?e owl:intersectionOf ?l }",
+        ))
+        .unwrap();
+    check("after the membership is added", told(&cached));
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
 /// A SELECT's rows (SPARQL JSON results), each `var=value` sorted by variable, sorted.

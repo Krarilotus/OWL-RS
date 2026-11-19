@@ -21,7 +21,9 @@ enum Expect {
     LeftOut,
     /// None: the claim stands.
     Complete,
-    /// The TBox's own for the construct the kind needs (its words), never the reader's.
+    /// The TBox's own for the construct the kind needs (its words), never the reader's,
+    /// though the cell also raises one the reader's rule makes a hazard: an existing
+    /// global hazard comes first.
     Own(&'static str),
 }
 
@@ -117,10 +119,13 @@ fn cells() -> Vec<Cell> {
             source: Turtle(
                 "ex:p a owl:ObjectProperty .
                  ex:A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty ex:p ;
-                     owl:hasValue _:b ] .",
+                     owl:hasValue _:b ] .
+                 ex:R rdfs:subClassOf [ owl:intersectionOf ( rdf:List ex:C ) ] .",
             ),
             // `hasValue` is outside OWL 2 QL, and with an anonymous individual it may
-            // equate: the TBox's own global hazard, whatever the reader reports.
+            // equate: the TBox's own global hazard, whatever the reader reports. The
+            // axiom on `ex:R` the reader leaves out (`Reserved`): the more specific reason
+            // still wins.
             expect: Expect::Own("outside the profile"),
         },
         Cell {
@@ -176,7 +181,8 @@ fn ontology(table: &mut Table, source: &Source) -> Ontology {
 /// states it (a shared blank node, an undeclared property typed by its use, a structure no
 /// axiom uses, a non-simple property, a disjointness repeating an operand), it raises no
 /// global hazard. An anonymous individual stands only in `hasValue` or `oneOf`, outside
-/// OWL 2 QL, whose global hazard is the TBox's own: never the reader's.
+/// OWL 2 QL, whose global hazard is the TBox's own: never the reader's, even beside an
+/// axiom the reader leaves out (the more specific reason comes first).
 #[test]
 fn every_axiom_the_reader_leaves_out_or_alters_lowers_the_rewritings_claim() {
     let mut wrong = Vec::new();
@@ -193,10 +199,15 @@ fn every_axiom_the_reader_leaves_out_or_alters_lowers_the_rewritings_claim() {
         let name = |t| table.name(t);
         let global = tbox.global_hazard().map(|h| h.describe(&name));
         let readers = |why: &str| raised.iter().any(|d| why.contains(&d.describe(&name)));
+        let any_readers =
+            |why: &str| (o.diagnostics.iter()).any(|d| why.contains(&d.describe(&name)));
+        let left_out = o.diagnostics.iter().any(Diagnostic::alters_axioms);
         let held = match (&cell.expect, &global) {
             (Expect::LeftOut, Some(why)) => readers(why),
             (Expect::Complete, None) => true,
-            (Expect::Own(words), Some(why)) => why.contains(*words) && !readers(why),
+            (Expect::Own(words), Some(why)) => {
+                left_out && why.contains(*words) && !any_readers(why)
+            }
             _ => false,
         };
         if !held {
