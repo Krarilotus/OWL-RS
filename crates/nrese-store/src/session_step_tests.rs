@@ -48,6 +48,7 @@ const COMMIT_DROP_CANCELS: u8 = 26;
 const CHANGE_REMOVES: u8 = 27;
 const READ_DROP_WITHOUT_CANCEL: u8 = 28;
 const PING_WITHOUT_TOUCH: u8 = 29;
+const SWAP_ANSWERS_WRITE: u8 = 30;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Request {
@@ -415,9 +416,10 @@ impl<const N: usize> World<N> {
             READ_WITHOUT_SNAPSHOT | LOST_REPEAT => Some(Invariant::I5),
             NO_IDLE_EXPIRY | PING_WITHOUT_TOUCH => Some(Invariant::I6),
             DROP_WITHOUT_CANCEL | READ_DROP_WITHOUT_CANCEL => Some(Invariant::I10),
-            REPLACEMENT_WITHOUT_RETIRE | COMMIT_DROP_CANCELS | CHANGE_REMOVES => {
-                Some(Invariant::InvalidTransition)
-            }
+            REPLACEMENT_WITHOUT_RETIRE
+            | COMMIT_DROP_CANCELS
+            | CHANGE_REMOVES
+            | SWAP_ANSWERS_WRITE => Some(Invariant::InvalidTransition),
             UNKNOWN_ROLLBACK
             | JOIN_ANSWER
             | STALE_LOOKUP
@@ -726,6 +728,7 @@ fn transition<const MUTATION: u8>(state: State, event: Event) -> Transition {
         }
         (READ_DROP_WITHOUT_CANCEL, State::S, Event::Dropped) => result.effect = Effect::None,
         (PING_WITHOUT_TOUCH, State::U, Event::Action(Action::Ping)) => result.effect = Effect::None,
+        (SWAP_ANSWERS_WRITE, State::Pw, Event::Swapped) => result.answer = Answer::WriteOk,
         _ => {}
     }
     Transition {
@@ -1643,6 +1646,7 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
                 | FAILED_TOMBSTONE_COMMITS
                 | FAILED_ROLLBACK_REMOVES
                 | DROP_WITHOUT_CANCEL
+                | SWAP_ANSWERS_WRITE
                 | COMMITTED_ROLLBACK => N - 1,
                 _ => 0,
             };
@@ -2068,12 +2072,47 @@ fn explorer_rejects_removal_on_revision_notice() {
 #[test]
 fn explorer_rejects_unclaimed_read_after_handler_drop() {
     red::<READ_DROP_WITHOUT_CANCEL>("I10");
+
+    // S6 and S12 release the abandoned capture. U6 can replay the write
+    // after a different transaction advances the revision.
+    let mut world = Sessions::<2, GOOD, GOOD>::start();
+    for action in [
+        Move::Lookup(0, Op::Write),
+        Move::SessionLock(0),
+        Move::Lookup(0, Op::Read),
+        Move::SessionLock(0),
+        Move::DropTaskRequest(0, 0),
+        Move::DropGuard(0, 0, End::Failed(Failure::Status(408))),
+        Move::OtherCommit,
+        Move::Lookup(0, Op::Commit),
+        Move::SessionLock(0),
+    ] {
+        world.do_move::<GOOD>(action, |_| {});
+    }
+    let txn = world.store.transactions[0];
+    assert!(!txn.pinned && txn.first_capture.is_none());
+    let commit = world.sessions[0].commit.unwrap();
+    let publish = world.normal_commit_move(0, commit);
+    assert!(matches!(publish, Move::PublishCommit(0)), "{publish:?}");
+    world.do_move::<GOOD>(publish, |_| {});
+    let mut reply = Answer::None;
+    let exit = world.normal_commit_move(0, world.sessions[0].commit.unwrap());
+    world.do_move::<GOOD>(exit, |(_, answer)| reply = answer);
+    assert_eq!(seen(&reply), Seen::Commit(End::Committed, true));
+    assert!(world.store.transactions[0].publication.is_some());
+    assert_eq!(world.violation, None);
 }
 
 // U5: PING advances the idle deadline, so the next tick cannot expire the session.
 #[test]
 fn explorer_rejects_ping_without_idle_refresh() {
     red::<PING_WITHOUT_TOUCH>("I6");
+}
+
+// Review T1, Pw3: the worker swaps the write and leaves the reply to TaskReady.
+#[test]
+fn explorer_rejects_write_reply_on_worker_swap() {
+    red::<SWAP_ANSWERS_WRITE>("InvalidTransition");
 }
 
 #[test]
