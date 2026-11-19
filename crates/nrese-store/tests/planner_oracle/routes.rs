@@ -199,10 +199,15 @@ pub fn execute(store: &StoreService, request: &SparqlQueryRequest) -> Rows {
 
 // EXPLAIN after a run of the same query would report a cache read; clear the
 // cache so it plans and evaluates the query.
-pub fn explain(store: &StoreService, request: &SparqlQueryRequest) -> Explanation {
+pub fn try_explain(
+    store: &StoreService,
+    request: &SparqlQueryRequest,
+) -> Result<Explanation, nrese_store::StoreError> {
     store.clear_query_cache();
-    let prepared = store.prepare_query(request).unwrap();
-    store
-        .explain_query(&prepared, &CancellationToken::new())
-        .unwrap_or_else(|e| panic!("{e}: {}", request.query))
+    let prepared = store.prepare_query(request)?;
+    store.explain_query(&prepared, &CancellationToken::new())
+}
+
+pub fn explain(store: &StoreService, request: &SparqlQueryRequest) -> Explanation {
+    try_explain(store, request).unwrap_or_else(|e| panic!("{e}: {}", request.query))
 }

@@ -10,7 +10,6 @@ pub enum Draw {
     },
     Filter {
         keys: &'static [&'static str],
-        independent: bool,
     },
     Average,
 }
@@ -22,7 +21,11 @@ pub struct Query {
     pub draw: Option<Draw>,
     // A separate SELECT over the input of the site counts occurrences before
     // joins can copy them. By default each key names one input solution.
+    // $BODY in it marks where a drawing EXISTS tests its body.
     pub scope: Option<String>,
+    // That body: the scope joined to it counts, per evaluation, the body
+    // solutions each of which may pass a draw. By default one.
+    pub body: Option<String>,
     pub reduced: bool,
 }
 
@@ -32,6 +35,7 @@ impl Query {
             text,
             draw: None,
             scope: None,
+            body: None,
             reduced: false,
         }
     }

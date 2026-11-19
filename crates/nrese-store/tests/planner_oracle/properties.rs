@@ -16,11 +16,6 @@ fn bag(rows: &Rows, reduced: bool) -> Bag {
     bag
 }
 
-fn subbag(part: &Bag, full: &Bag) -> bool {
-    part.iter()
-        .all(|(row, n)| full.get(row).is_some_and(|m| n <= m))
-}
-
 pub fn same(expected: &Rows, found: &Rows, reduced: bool) -> Result<(), String> {
     let expected = bag(expected, reduced);
     let found = bag(found, reduced);
@@ -76,128 +71,210 @@ fn values<'a>(rows: &'a Rows, column: &str, keys: &[&str]) -> BTreeMap<Key, BTre
     groups
 }
 
-pub fn check(
+// The rows that descend from no evaluation of the site (no key column bound,
+// as in another UNION arm), and the others by key.
+fn split(rows: &Rows, keys: &[&str]) -> (Bag, BTreeMap<Key, Bag>) {
+    let (mut outside, mut inside) = (Bag::new(), BTreeMap::<Key, Bag>::new());
+    for row in rows {
+        let bag = if !keys.is_empty() && keys.iter().all(|k| !row.contains_key(*k)) {
+            &mut outside
+        } else {
+            inside.entry(key(row, keys)).or_default()
+        };
+        *bag.entry(row.clone()).or_default() += 1;
+    }
+    (outside, inside)
+}
+
+// What SPARQL allows at a drawing site, taken from the twin.
+pub struct Model {
     draw: Draw,
-    twin: &Rows,
-    found: &Rows,
-    scope: Option<&Rows>,
-) -> Result<(), (&'static str, String)> {
-    match draw {
-        Draw::Value { column, keys, .. } => {
-            same(&without(twin, column), &without(found, column), false).map_err(|e| ("P5", e))?;
-            // Distinct stand-ins include the site, so the two UNION arms may
-            // independently draw for the same projected key.
-            let sites = values(twin, column, keys);
-            let multiplicity = scope.map(|rows| counts(rows, keys));
-            let mut owner = BTreeMap::new();
-            let drawn = |rows: &Rows| rows.iter().filter(|r| r.contains_key(column)).count();
-            if drawn(found) != drawn(twin) {
-                return Err((
-                    "P1",
-                    format!(
-                        "{} rows carry a drawn ?{column}, the twin's {}",
-                        drawn(found),
-                        drawn(twin)
-                    ),
+    twin: Rows,
+    scope: Option<Counts>,
+    outside: Bag,
+    // Per key of a drawing filter: its evaluations, the rows one evaluation
+    // leaves in the result, and the body solutions that may each pass a draw.
+    evaluations: BTreeMap<Key, (usize, Bag, usize)>,
+}
+
+impl Model {
+    pub fn new(draw: Draw, twin: &Rows, scope: Option<&Rows>, body: Option<&Rows>) -> Self {
+        let keys = match draw {
+            Draw::Value { keys, .. } | Draw::Filter { keys } => keys,
+            Draw::Average => &[],
+        };
+        let scope = scope.map(|rows| counts(rows, keys));
+        let body = body.map(|rows| counts(rows, keys));
+        let (outside, inside) = match draw {
+            Draw::Filter { .. } => split(twin, keys),
+            _ => Default::default(),
+        };
+        let evaluations = inside
+            .into_iter()
+            .map(|(key, rows)| {
+                let m = scope
+                    .as_ref()
+                    .map_or(1, |c| c.get(&key).copied().unwrap_or(0));
+                let n = body
+                    .as_ref()
+                    .map_or(m, |c| c.get(&key).copied().unwrap_or(0));
+                assert!(
+                    m > 0 && n >= m && n % m == 0 && rows.values().all(|c| c % m == 0),
+                    "uneven copies in the fixture for {key:?}"
+                );
+                let one = rows.into_iter().map(|(row, c)| (row, c / m)).collect();
+                (key, (m, one, n / m))
+            })
+            .collect();
+        Self {
+            draw,
+            twin: twin.clone(),
+            scope,
+            outside,
+            evaluations,
+        }
+    }
+
+    // Per key: its evaluations, how many of them kept their rows, and the
+    // body solutions per evaluation; or why the rows are not whole copies.
+    fn kept(&self, found: &Rows, keys: &[&str]) -> Result<Vec<(usize, usize, usize)>, String> {
+        let (outside, inside) = split(found, keys);
+        if outside != self.outside {
+            return Err("the rows outside the drawing site are not the twin's".into());
+        }
+        if let Some(key) = inside.keys().find(|k| !self.evaluations.contains_key(*k)) {
+            return Err(format!("key {key:?} is not the twin's"));
+        }
+        let mut kept = Vec::new();
+        for (key, (m, one, n)) in &self.evaluations {
+            let rows = inside.get(key).cloned().unwrap_or_default();
+            let size: usize = one.values().sum();
+            let j = rows.values().sum::<usize>() / size;
+            let copies: Bag = one.iter().map(|(row, c)| (row.clone(), c * j)).collect();
+            if j > *m || rows != copies.into_iter().filter(|(_, c)| *c > 0).collect() {
+                return Err(format!(
+                    "key {key:?}: the kept rows are not whole copies of one evaluation's {size}"
                 ));
             }
-            for (key, values) in values(found, column, keys) {
-                let m = multiplicity
-                    .as_ref()
-                    .and_then(|counts| counts.get(&key).copied())
-                    .unwrap_or_else(|| sites[&key].len());
-                if values.len() > m {
+            kept.push((*m, j, *n));
+        }
+        Ok(kept)
+    }
+
+    pub fn check(&self, found: &Rows) -> Result<(), (&'static str, String)> {
+        let twin = &self.twin;
+        match self.draw {
+            Draw::Value { column, keys, .. } => {
+                same(&without(twin, column), &without(found, column), false)
+                    .map_err(|e| ("P5", e))?;
+                let drawn = |rows: &Rows| rows.iter().filter(|r| r.contains_key(column)).count();
+                if drawn(found) != drawn(twin) {
                     return Err((
                         "P1",
                         format!(
-                            "key {key:?}: {} distinct draws, allowed 1..={m}",
-                            values.len()
+                            "{} rows carry a drawn ?{column}, the twin's {}",
+                            drawn(found),
+                            drawn(twin)
                         ),
                     ));
                 }
-                for value in values {
-                    if let Some(first) = owner.insert(value, key.clone()) {
-                        return Err(("P2", format!("one draw shared by {first:?} and {key:?}")));
+                // Each call gives a fresh value: exactly one per evaluation.
+                // Distinct stand-ins include the site, so the two UNION arms
+                // may each draw for the same projected key.
+                let found = values(found, column, keys);
+                let mut owner = BTreeMap::new();
+                for (key, sites) in values(twin, column, keys) {
+                    let m = self
+                        .scope
+                        .as_ref()
+                        .and_then(|counts| counts.get(&key).copied())
+                        .unwrap_or(sites.len());
+                    let drawn = found.get(&key).cloned().unwrap_or_default();
+                    if drawn.len() != m {
+                        return Err((
+                            "P1",
+                            format!(
+                                "key {key:?}: {} distinct draws, SPARQL gives {m}",
+                                drawn.len()
+                            ),
+                        ));
+                    }
+                    for value in drawn {
+                        if let Some(first) = owner.insert(value, key.clone()) {
+                            return Err((
+                                "P2",
+                                format!("one draw shared by {first:?} and {key:?}"),
+                            ));
+                        }
                     }
                 }
+                Ok(())
             }
-            Ok(())
-        }
-        Draw::Filter { keys, independent } => {
-            let wanted = counts(twin, keys);
-            let kept = counts(found, keys);
-            if !subbag(&bag(found, false), &bag(twin, false)) {
-                return Err(("P3", "the kept rows are not a sub-bag of the twin".into()));
-            }
-            let multiplicity = scope.map(|rows| counts(rows, keys));
-            for (key, n) in &wanted {
-                let m = multiplicity
-                    .as_ref()
-                    .and_then(|counts| counts.get(key).copied())
-                    .unwrap_or(1);
-                let actual = kept.get(key).copied().unwrap_or_default();
-                assert!(
-                    m > 0 && n.is_multiple_of(m),
-                    "uneven copies in the fixture for {key:?}"
-                );
-                let copies = n / m;
-                if !actual.is_multiple_of(copies) {
+            Draw::Filter { keys } => {
+                let kept = self.kept(found, keys).map_err(|e| ("P3", e))?;
+                // The chance under SPARQL that every evaluation made the
+                // choice it did, if all made the same.
+                let all = |f: fn(&(usize, usize, usize)) -> bool| kept.iter().all(f);
+                let log2 = if kept.is_empty() {
+                    0.0
+                } else if all(|&(m, j, _)| j == m) {
+                    let pass = |n: usize| (1.0 - 0.5f64.powi(n.min(1000) as i32)).log2();
+                    kept.iter().map(|&(m, _, n)| m as f64 * pass(n)).sum()
+                } else if all(|&(_, j, _)| j == 0) {
+                    -kept.iter().map(|&(m, _, n)| (m * n) as f64).sum::<f64>()
+                } else {
+                    0.0
+                };
+                if log2 < -20.0 {
+                    let evaluations: usize = kept.iter().map(|k| k.0).sum();
                     return Err((
-                        "P3",
+                        "P4",
                         format!(
-                            "key {key:?}: {actual} of {n} rows kept; copies come in groups of {copies}"
+                            "all {evaluations} evaluations made the same choice: 2^{log2:.1} under SPARQL"
                         ),
                     ));
                 }
+                Ok(())
             }
-            if independent && wanted.len() >= 40 && (kept.is_empty() || kept == wanted) {
-                return Err((
-                    "P4",
-                    format!("all {} independent keys made the same choice", wanted.len()),
-                ));
+            Draw::Average => {
+                same(&without(twin, "avg"), &without(found, "avg"), false)
+                    .map_err(|e| ("P5", e))?;
+                for value in found.iter().filter_map(|r| r.get("avg")) {
+                    // The only numeric argument is 1. AVG may be unbound after
+                    // an error, or 0 for empty input, but never another mean.
+                    let numeric = value.split('"').nth(1).and_then(|s| s.parse::<f64>().ok());
+                    if !matches!(numeric, Some(0.0 | 1.0)) {
+                        return Err(("AVG", format!("unexpected mean {value}")));
+                    }
+                }
+                Ok(())
             }
-            Ok(())
         }
-        Draw::Average => {
-            same(&without(twin, "avg"), &without(found, "avg"), false).map_err(|e| ("P5", e))?;
-            for value in found.iter().filter_map(|r| r.get("avg")) {
-                // The only numeric argument is 1. AVG may be unbound after an
-                // error, or 0 for empty input, but never a different mean.
-                let numeric = value.split('"').nth(1).and_then(|s| s.parse::<f64>().ok());
-                if !matches!(numeric, Some(0.0 | 1.0)) {
-                    return Err(("AVG", format!("unexpected mean {value}")));
+    }
+
+    // EXPLAIN runs the query again and reports only its total: one the
+    // site's evaluations can give, each keeping or dropping all its rows.
+    pub fn explains(&self, explained: usize) -> bool {
+        if !matches!(self.draw, Draw::Filter { .. }) {
+            return explained == self.twin.len();
+        }
+        let mut possible = vec![false; self.twin.len() + 1];
+        possible[self.outside.values().sum::<usize>()] = true;
+        for (m, one, _) in self.evaluations.values() {
+            let size: usize = one.values().sum();
+            for _ in 0..*m {
+                for total in (size..possible.len()).rev() {
+                    possible[total] |= possible[total - size];
                 }
             }
-            Ok(())
         }
+        possible.get(explained).copied().unwrap_or(false)
     }
-}
 
-pub fn explain_count(
-    draw: Option<Draw>,
-    twin: &Rows,
-    scope: Option<&Rows>,
-    explained: usize,
-) -> bool {
-    let Some(Draw::Filter { keys, .. }) = draw else {
-        return explained == twin.len();
-    };
-    // EXPLAIN runs the query again and reports only the total. Enumerate the
-    // possible totals of whole evaluations, without comparing separate draws.
-    let mut possible = vec![false; twin.len() + 1];
-    possible[0] = true;
-    let multiplicity = scope.map(|rows| counts(rows, keys));
-    for (key, n) in counts(twin, keys) {
-        let m = multiplicity
-            .as_ref()
-            .and_then(|counts| counts.get(&key).copied())
-            .unwrap_or(1);
-        let copies = n / m;
-        for _ in 0..m {
-            for total in (copies..possible.len()).rev() {
-                possible[total] |= possible[total - copies];
-            }
+    pub fn property(&self) -> &'static str {
+        match self.draw {
+            Draw::Filter { .. } => "P3",
+            _ => "P5",
         }
     }
-    possible.get(explained).copied().unwrap_or(false)
 }

@@ -62,8 +62,8 @@ pub fn value(call: &'static str, keys: &'static [&'static str]) -> Draw {
     }
 }
 
-pub fn filter(keys: &'static [&'static str], independent: bool) -> Draw {
-    Draw::Filter { keys, independent }
+pub fn filter(keys: &'static [&'static str]) -> Draw {
+    Draw::Filter { keys }
 }
 
 pub fn drawing(shape: &'static str) -> Case {
@@ -83,13 +83,13 @@ pub fn drawing(shape: &'static str) -> Case {
         ),
         "site-2" => (
             format!("SELECT ?k {{ VALUES ?k {{ {many} }} {{ ?x {LABEL} ?l FILTER($DRAW) }} }}"),
-            filter(&[], false),
+            filter(&[]),
         ),
         // The group's one OPTIONAL pair is decided by one draw, which the join
         // copies to every key: FILTER(BOUND(?o)) keeps all forty rows or none.
         "optional-condition" => (
             format!("SELECT ?k {{ VALUES ?k {{ {many} }} {{ <urn:a> {LABEL} ?l OPTIONAL {{ <urn:a> {LABEL} ?o FILTER($DRAW) }} }} FILTER(BOUND(?o)) }}"),
-            filter(&[], false),
+            filter(&[]),
         ),
         "duplicate-keys" => (
             format!("SELECT ?s ?o ?d {{ {VALUES} {{ {FEW} BIND($DRAW AS ?d) }} }}"),
@@ -102,7 +102,7 @@ pub fn drawing(shape: &'static str) -> Case {
             }).collect::<Vec<_>>().join(" ");
             (
                 format!("SELECT ?s {{ VALUES ?s {{ {subjects} }} {{ {{ ?x {LABEL} ?l FILTER($DRAW) }} ?s <urn:sibling> ?o BIND(1 AS ?one) }} }}"),
-                filter(&[], false),
+                filter(&[]),
             )
         }
         "unrelated-group" => {
@@ -117,7 +117,7 @@ pub fn drawing(shape: &'static str) -> Case {
             }
             (
                 format!("SELECT ?s {{ {{ ?s <urn:many> ?i . ?s <urn:wide> ?j }} VALUES ?s {{ <urn:a> <urn:b> }} {{ ?t {LABEL} ?tag FILTER($DRAW) }} }}"),
-                filter(&[], false),
+                filter(&[]),
             )
         }
         "undef" => (
@@ -144,7 +144,7 @@ pub fn drawing(shape: &'static str) -> Case {
         ),
         "exists-independent" => (
             format!("SELECT ?i {{ VALUES ?i {{ {many} }} <urn:a> <urn:few> ?k FILTER EXISTS {{ ?s <urn:q> ?z FILTER($DRAW && ?s = <urn:a> && ?k = 1) }} }}"),
-            filter(&["i"], true),
+            filter(&["i"]),
         ),
         "lateral-draw" => (
             "SELECT ?i ?d { VALUES (?s ?i) { (<urn:a> 1) (<urn:a> 2) } LATERAL { ?s <urn:few> ?o BIND($DRAW AS ?d) } }".into(),
@@ -154,7 +154,7 @@ pub fn drawing(shape: &'static str) -> Case {
             data.extend(["<urn:a> <urn:step> <urn:b> .".into(), "<urn:b> <urn:step> <urn:c> .".into()]);
             (
                 "SELECT ?s ?o { VALUES ?s { <urn:a> <urn:a> } { ?s <urn:step>+ ?o FILTER($DRAW) } }".into(),
-                filter(&["s", "o"], false),
+                filter(&["s", "o"]),
             )
         }
         "vector-draw" => {

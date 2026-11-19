@@ -152,9 +152,10 @@ fn explain_distinguishes_a_rewrite_from_the_as_written_plan() {
 
 #[test]
 fn explain_agrees_with_the_mode_of_a_cold_ql_request() {
-    // ASK carries an ask-limit rewrite only in planned mode. To observe the
-    // cold run independently, a path reachable from a single starting node
-    // has one row. The disjoint chain is too large to close as written.
+    // ASK carries an ask-limit rewrite only in planned mode. Under a 1 MiB
+    // cap the disjoint chain is too large to close as written; planned, the
+    // path reachable from a single starting node gives the one solution.
+    // EXPLAIN explains the very request that ran: same query, cap, options.
     let mut data = vec![
         "<urn:C> <http://www.w3.org/2000/01/rdf-schema#subClassOf> [
             a <http://www.w3.org/2002/07/owl#Restriction> ;
@@ -172,12 +173,6 @@ fn explain_agrees_with_the_mode_of_a_cold_ql_request() {
     let routes = Routes::open(&Case::new("explain-ql-mode", data, query.clone()));
     let store = routes.store(StoreRoute::QlOn);
     let mut request = SparqlQueryRequest::all(query.text);
-    let unrestricted = routes::execute_bool(store, &request).unwrap();
-    assert!(unrestricted, "the reachable path supplies one solution");
-    let explanation = routes::explain(store, &request);
-    assert_eq!(explanation.rows, 1);
-    let reports_planned = explanation.rewrites.contains(&"ask-limit");
-
     request.memory_limit = Some(1 << 20);
     request.as_written = true;
     store.clear_query_cache();
@@ -185,6 +180,16 @@ fn explain_agrees_with_the_mode_of_a_cold_ql_request() {
     assert!(forced.is_memory_limit(), "as-written control: {forced}");
 
     request.as_written = false;
+    // An EXPLAIN that runs out of the cap ran as written.
+    let explanation = routes::try_explain(store, &request);
+    let reports_planned = match &explanation {
+        Ok(explained) => {
+            assert_eq!(explained.rows, 1);
+            explained.rewrites.contains(&"ask-limit")
+        }
+        Err(error) if error.is_memory_limit() => false,
+        Err(error) => panic!("EXPLAIN: {error}"),
+    };
     store.clear_query_cache();
     let ran_planned = match routes::execute_bool(store, &request) {
         Ok(answer) => {

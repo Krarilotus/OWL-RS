@@ -35,6 +35,9 @@ struct Tree {
     // never an OPTIONAL's right side: a removed right side would bring back
     // the left row alone, which the twin never has.
     removes: bool,
+    // A drawing EXISTS's body; and the ordinary BINDs made so far.
+    body: Option<String>,
+    binds: usize,
 }
 
 impl Tree {
@@ -139,9 +142,10 @@ impl Tree {
     }
 
     // One operator above `node`. The node is always a group of its own, so a
-    // draw in it stays in its group. GRAPH also moves the scope query.
+    // draw in it stays in its group. GRAPH also moves the scope query. Only a
+    // node without a draw (no scope) goes into a subquery with a LIMIT.
     fn wrap(&mut self, (text, vars): Node, scope: &mut Option<String>) -> Node {
-        match self.rng.below(9) {
+        match self.rng.below(12) {
             0 => (
                 format!("{{ {text} }} VALUES ?copy {{ 0 1 }}"),
                 merge(vars, &["copy"]),
@@ -192,6 +196,31 @@ impl Tree {
                 let test = format!("!BOUND(?{var}) || !sameTerm(?{var}, 3)");
                 (format!("{{ {text} }} FILTER({test})"), vars)
             }
+            8 => {
+                let not = self.pick(&["", "NOT "]);
+                let test = format!("FILTER {not}EXISTS {{ ?s <urn:few> ?e }}");
+                (format!("{{ {text} }} {test}"), vars)
+            }
+            9 => {
+                // STR of a drawn blank node errs where its twin's string
+                // would not: no BIND reads ?d.
+                let read: Vec<_> = vars.iter().copied().filter(|v| *v != "d").collect();
+                let var = self.pick(&read);
+                let name = ["b0", "b1", "b2", "b3"][self.binds];
+                self.binds += 1;
+                let bind = format!("BIND(STR(?{var}) AS ?{name})");
+                (format!("{{ {text} }} {bind}"), merge(vars, &[name]))
+            }
+            10 if scope.is_none() => {
+                // Sorted by every projected variable, the LIMIT takes a
+                // determined bag.
+                let vars = vars[..1 + self.rng.below(vars.len())].to_vec();
+                let order: Vec<_> = vars.iter().map(|v| format!("?{v}")).collect();
+                let order = order.join(" ");
+                let limit = 1 + self.rng.below(20);
+                let query = format!("SELECT {order} {{ {text} }} ORDER BY {order} LIMIT {limit}");
+                (format!("{{ {query} }}"), vars)
+            }
             _ => (format!("{{ SELECT * {{ {text} }} }}"), vars),
         }
     }
@@ -217,11 +246,7 @@ impl Tree {
             let vars = merge(vars, &["dk", "d"]);
             ("BIND($DRAW AS ?d)", generator::value(call, DK), vars)
         } else {
-            (
-                "FILTER($DRAW)",
-                generator::filter(DK, false),
-                merge(vars, &["dk"]),
-            )
+            ("FILTER($DRAW)", generator::filter(DK), merge(vars, DK))
         }
     }
 
@@ -242,10 +267,21 @@ impl Tree {
                     }
                 };
                 let key = key(&vars);
-                let body = self.pick(&["?x <urn:few> ?y", "?s <urn:few> ?y"]);
+                // One candidate per tested row (<urn:s:0>'s one <urn:few>, or
+                // the tested subject's), or every <urn:few> statement.
+                let body = self.pick(&[
+                    "<urn:s:0> <urn:few> ?y",
+                    "?s <urn:few> ?y",
+                    "?x <urn:few> ?y",
+                ]);
+                self.body = Some(body.into());
                 let text = format!("{tested} {key} FILTER EXISTS {{ {body} FILTER($DRAW) }}");
-                let draw = generator::filter(DK, true);
-                ((text, merge(vars, DK)), draw, format!("{tested} {key}"))
+                let draw = generator::filter(DK);
+                (
+                    (text, merge(vars, DK)),
+                    draw,
+                    format!("{tested} {key} $BODY"),
+                )
             }
             "lateral" => {
                 let rows: Vec<_> = (0..1 + self.rng.below(8))
@@ -269,7 +305,12 @@ impl Tree {
                 case.remote = Some(REMOTE);
                 let site = format!("<urn:a> <urn:remote> ?z {}", key(&["z"]));
                 let (draw_text, draw, vars) = self.draw(vec!["k", "z"], true);
-                let rows = generator::keys(1 + self.rng.below(300));
+                let n = 1 + self.rng.below(300);
+                if n > nrese_sparql::service::BIND_CHUNK {
+                    // Bound values go to the endpoint in more than one batch.
+                    self.label("batched");
+                }
+                let rows = generator::keys(n);
                 let text = format!(
                     "VALUES ?k {{ {rows} }} SERVICE <{ENDPOINT}> {{ {{ {site} {draw_text} }} UNION {{ ?k <urn:missing> ?z }} }}"
                 );
@@ -281,11 +322,17 @@ impl Tree {
             }
             "vector" => {
                 case.vector = true;
-                generator::vectors(&mut case.data, 4 + self.rng.below(16));
+                // At least 100 local rows, fifty per hit wanted: the search
+                // goes first and probes the group from each hit.
+                generator::vectors(&mut case.data, 100 + self.rng.below(40));
                 let (pattern, vars) = self.pick(&[
                     ("?s <urn:embedding> ?v", &["s", "v"][..]),
                     ("?x <urn:embedding> ?w", &["x", "w"][..]),
                 ]);
+                if vars[0] == "x" {
+                    // The drawing group shares no variable with the hit.
+                    self.label("disjoint");
+                }
                 let key = key(vars);
                 // A k-nearest search probed from the group's rows answers
                 // other hits for fewer rows, so only a BIND draws here.
@@ -324,6 +371,8 @@ pub fn generated(seed: u64) -> Case {
         predicates,
         labels: vec![place],
         removes: false,
+        body: None,
+        binds: 0,
     };
     let mut case = Case::new(place, tree.data(), Query::plain(String::new()));
     let depth = 1 + tree.rng.below(3);
@@ -336,7 +385,13 @@ pub fn generated(seed: u64) -> Case {
                     reduced = true;
                     format!("SELECT REDUCED * {{ {body} }}")
                 }
-                1 => format!("SELECT ?s (COUNT(*) AS ?n) {{ {body} }} GROUP BY ?s"),
+                1 => {
+                    let v = tree.pick(&vars);
+                    let sums = format!("(SUM(?{v}) AS ?sum) (SUM(DISTINCT ?{v}) AS ?sd)");
+                    let ends = format!("(MIN(?{v}) AS ?min) (MAX(?{v}) AS ?max)");
+                    let count = format!("(COUNT(*) AS ?n) (COUNT(DISTINCT ?{v}) AS ?nd)");
+                    format!("SELECT ?s {count} {sums} {ends} {{ {body} }} GROUP BY ?s")
+                }
                 // DISTINCT over all its columns, sorted by all of them: the
                 // LIMIT then takes a determined part.
                 2 => {
@@ -382,6 +437,7 @@ pub fn generated(seed: u64) -> Case {
         text,
         draw,
         scope,
+        body: tree.body,
         reduced,
     };
     case
