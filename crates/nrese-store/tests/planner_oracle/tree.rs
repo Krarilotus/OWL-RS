@@ -31,6 +31,10 @@ struct Tree {
     subjects: usize,
     predicates: usize,
     labels: Vec<&'static str>,
+    // The draw removes rows (a drawing FILTER or EXISTS). Then the site is
+    // never an OPTIONAL's right side: a removed right side would bring back
+    // the left row alone, which the twin never has.
+    removes: bool,
 }
 
 impl Tree {
@@ -48,8 +52,8 @@ impl Tree {
         format!("<urn:s:{}>", self.rng.below(self.subjects))
     }
 
-    // A ring over <urn:p:0>, integers on the other predicates, a few
-    // <urn:few> statements and one wide subject; all of it again in <urn:g>.
+    // A ring over <urn:p:0>, integers on the other predicates and a few
+    // <urn:few> statements, all of it again in <urn:g>; and one wide subject.
     fn data(&mut self) -> Vec<String> {
         let mut data = Vec::new();
         for s in 0..self.subjects {
@@ -64,9 +68,9 @@ impl Tree {
                 data.push(format!("<urn:s:{s}> <urn:few> {s} ."));
             }
         }
-        data.extend((0..100).map(|o| format!("<urn:wide> <urn:p:1> {o} .")));
         let named: Vec<_> = data.iter().map(|t| format!("<urn:g> {{ {t} }}")).collect();
         data.extend(named);
+        data.extend((0..100).map(|o| format!("<urn:wide> <urn:p:1> {o} .")));
         data
     }
 
@@ -86,18 +90,15 @@ impl Tree {
     }
 
     fn path(&mut self) -> Node {
-        let path = self.pick(&[
-            "?s <urn:p:0>+ ?o",
-            "<urn:s:0> <urn:p:0>* ?o",
-            "?s <urn:p:0>/<urn:p:1> ?o",
-            "?s ^<urn:p:0> ?o",
+        // One end of a closure is bound: free at both ends, the ring's
+        // closure has subjects² rows.
+        let (path, vars) = self.pick(&[
+            ("?s <urn:p:0>+ <urn:s:0>", &["s"][..]),
+            ("<urn:s:0> <urn:p:0>* ?o", &["o"][..]),
+            ("?s <urn:p:0>/<urn:p:1> ?o", &["s", "o"][..]),
+            ("?s ^<urn:p:0> ?o", &["s", "o"][..]),
         ]);
-        let vars = if path.starts_with('?') {
-            vec!["s", "o"]
-        } else {
-            vec!["o"]
-        };
-        (path.into(), vars)
+        (path.into(), vars.to_vec())
     }
 
     // VALUES over ?s, or ?s and ?tag, with duplicate rows and UNDEF cells.
@@ -158,6 +159,13 @@ impl Tree {
                 };
                 (format!("{{ {arms} }}"), merge(vars, &more))
             }
+            4 if self.removes => {
+                let (right, more) = self.leaf();
+                (
+                    format!("{{ {text} }} OPTIONAL {{ {right} }}"),
+                    merge(vars, &more),
+                )
+            }
             4 => {
                 let (left, more) = self.leaf();
                 (
@@ -196,9 +204,15 @@ impl Tree {
         node
     }
 
-    // A drawing BIND or FILTER, to follow the key's BIND in the site's group.
-    fn draw(&mut self, vars: Vec<&'static str>) -> (&'static str, Draw, Vec<&'static str>) {
-        if self.rng.below(2) == 0 {
+    // A drawing BIND, or where `may_filter`, a drawing FILTER, to follow the
+    // key's BIND in the site's group.
+    fn draw(
+        &mut self,
+        vars: Vec<&'static str>,
+        may_filter: bool,
+    ) -> (&'static str, Draw, Vec<&'static str>) {
+        self.removes = may_filter && self.rng.below(2) == 1;
+        if !self.removes {
             let call = self.pick(&["BNODE()", "UUID()", "STRUUID()"]);
             let vars = merge(vars, &["dk", "d"]);
             ("BIND($DRAW AS ?d)", generator::value(call, DK), vars)
@@ -216,10 +230,17 @@ impl Tree {
     fn site(&mut self, place: &str, case: &mut Case) -> (Node, Draw, String) {
         match place {
             "exists" => {
-                let (inner, vars) = self.leaf();
-                let rows = generator::keys(1 + self.rng.below(60));
-                let tested = format!("VALUES ?i {{ {rows} }} {inner}");
-                let vars = merge(vars, &["i"]);
+                self.removes = true;
+                // Either a leaf's rows, or up to sixty keys on one subject,
+                // enough for the independence of their draws to show.
+                let (tested, vars) = match self.rng.below(2) {
+                    0 => self.leaf(),
+                    _ => {
+                        let rows = generator::keys(1 + self.rng.below(60));
+                        let tested = format!("VALUES ?i {{ {rows} }} <urn:s:0> <urn:p:0> ?s");
+                        (tested, vec!["i", "s"])
+                    }
+                };
                 let key = key(&vars);
                 let body = self.pick(&["?x <urn:few> ?y", "?s <urn:few> ?y"]);
                 let text = format!("{tested} {key} FILTER EXISTS {{ {body} FILTER($DRAW) }}");
@@ -236,7 +257,7 @@ impl Tree {
                     key(&["s", "i"])
                 );
                 let (right, more) = self.bgp();
-                let (draw_text, draw, vars) = self.draw(merge(vec!["s", "i"], &more));
+                let (draw_text, draw, vars) = self.draw(merge(vec!["s", "i"], &more), true);
                 let text = format!("{{ {left} }} LATERAL {{ {{ {right} {draw_text} }} }}");
                 (
                     (text, vars),
@@ -247,7 +268,7 @@ impl Tree {
             "service" => {
                 case.remote = Some(REMOTE);
                 let site = format!("<urn:a> <urn:remote> ?z {}", key(&["z"]));
-                let (draw_text, draw, vars) = self.draw(vec!["k", "z"]);
+                let (draw_text, draw, vars) = self.draw(vec!["k", "z"], true);
                 let rows = generator::keys(1 + self.rng.below(300));
                 let text = format!(
                     "VALUES ?k {{ {rows} }} SERVICE <{ENDPOINT}> {{ {{ {site} {draw_text} }} UNION {{ ?k <urn:missing> ?z }} }}"
@@ -266,7 +287,9 @@ impl Tree {
                     ("?x <urn:embedding> ?w", &["x", "w"][..]),
                 ]);
                 let key = key(vars);
-                let (draw_text, draw, vars) = self.draw(merge(vars.to_vec(), &["v"]));
+                // A k-nearest search probed from the group's rows answers
+                // other hits for fewer rows, so only a BIND draws here.
+                let (draw_text, draw, vars) = self.draw(merge(vars.to_vec(), &["v"]), false);
                 let search = generator::vector_search();
                 let text = format!("{{ {pattern} {key} {draw_text} }} {search}");
                 ((text, vars), draw, format!("{pattern} {key}"))
@@ -279,7 +302,7 @@ impl Tree {
                     self.leaf()
                 };
                 let key = key(&vars);
-                let (draw_text, draw, vars) = self.draw(vars);
+                let (draw_text, draw, vars) = self.draw(vars, true);
                 (
                     (format!("{inner} {key} {draw_text}"), vars),
                     draw,
@@ -300,6 +323,7 @@ pub fn generated(seed: u64) -> Case {
         subjects,
         predicates,
         labels: vec![place],
+        removes: false,
     };
     let mut case = Case::new(place, tree.data(), Query::plain(String::new()));
     let depth = 1 + tree.rng.below(3);
@@ -329,7 +353,7 @@ pub fn generated(seed: u64) -> Case {
         "outer" => {
             let (body, vars) = tree.tree(depth);
             let key = key(&vars);
-            let (draw_text, draw, _) = tree.draw(vars);
+            let (draw_text, draw, _) = tree.draw(vars, true);
             let text =
                 format!("SELECT * {{ {{ {body} {key} {draw_text} }} VALUES ?copy {{ 0 1 }} }}");
             (
