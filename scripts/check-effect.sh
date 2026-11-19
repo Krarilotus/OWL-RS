@@ -7,7 +7,8 @@ sites() {
     git grep --untracked --no-recurse-submodules -nE "$@" || test "$?" -eq 1
 }
 
-sites '\bspawn_blocking\b' -- crates/nrese-server/src/http crates/nrese-server/src/replication.rs \
+sites '\bspawn_blocking\b|\bblocking[[:space:]]*::[[:space:]]*within\b' -- \
+    crates/nrese-server/src/http crates/nrese-server/src/replication.rs \
     crates/nrese-server/src/state.rs ':(exclude)crates/nrese-server/src/http/effect.rs' |
 awk '
 BEGIN {
@@ -33,6 +34,7 @@ BEGIN {
     allow["http/api_v1.rs|let files = tokio::task::spawn_blocking(move || {"] = "import directory listing"
     allow["http/api_v1.rs|let sizes = tokio::task::spawn_blocking(move || store.graph_sizes(&scope))"] = "graph sizes read"
     allow["http/blocking.rs|tokio::time::timeout(deadline, tokio::task::spawn_blocking(work))"] = "read helper"
+    allow["http/classification.rs|super::blocking::within("] = "classification read"
     allow["http/draft_check.rs|let task = tokio::task::spawn_blocking(move || {"] = "draft check"
     allow["http/graph_store.rs|tokio::task::spawn_blocking(move || store.graph_exists(&read, &target)),"] = "graph existence read"
     allow["http/handlers.rs|tokio::task::spawn_blocking(move || store.autocomplete(&scope, &typed, limit, infer))"] = "autocomplete read"
@@ -41,6 +43,7 @@ BEGIN {
     allow["http/result_stream.rs|let stopped = tokio::task::spawn_blocking(move || {"] = "stream cancellation test"
     allow["http/result_stream.rs||ms| tokio::task::spawn_blocking(move || std::thread::sleep(Duration::from_millis(ms)));"] = "stream timeout test"
     allow["http/result_stream.rs|tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(1)))"] = "stream timing test"
+    allow["http/shacl.rs|let validation = super::blocking::within("] = "SHACL validation read"
     allow["replication.rs|let batch = tokio::task::spawn_blocking(move || store.replication_log(query.after, max))"] = "replication log read"
 }
 {
@@ -55,18 +58,18 @@ BEGIN {
 END { exit failed }
 '
 
-sites '(\.|::)[[:space:]]*(commit|rematerialise(_until)?)\b' -- crates/nrese-store/src/mutation |
+sites '(\.|::)[[:space:]]*(r#)?(commit|rematerialise(_until)?)\b' -- crates/nrese-store/src/mutation |
 awk '
 {
     if ($0 ~ /^crates\/nrese-store\/src\/mutation\/pipeline\.rs:/) {
         # v1.6 rematerialise preflight and quarantine revalidation.
-        if ($0 ~ /match self\.store\.rematerialise_until\(rules, &stop\) \{/ && ++preflight == 1) next
-        if ($0 ~ /if quarantined && let Err\(error\) = self\.store\.rematerialise\(&rules\) \{/ && ++revalidation == 1) next
-        if ($0 ~ /\(self\.store\.lists\)\.commit\(before, summary\.revision, lists_left_out\);/ && ++lists == 1) next
+        if ($0 ~ /match self\.store\.rematerialise_until\(rules, &stop\) \{$/ && ++preflight == 1) next
+        if ($0 ~ /if quarantined && let Err\(error\) = self\.store\.rematerialise\(&rules\) \{$/ && ++revalidation == 1) next
+        if ($0 ~ /\(self\.store\.lists\)\.commit\(before, summary\.revision, lists_left_out\);$/ && ++lists == 1) next
     }
     line = $0
-    sub(/publishing\(ticket, report, \|\| (tx\.commit\(\)|ql\.commit\(tx\))\)/, "", line)
-    if (line ~ /(\.|::)[[:space:]]*(commit|rematerialise(_until)?)([^a-zA-Z_]|$)/) {
+    sub(/(^|[^[:alnum:]_#])publishing\(ticket, report, \|\| (tx\.commit\(\)|ql\.commit\(tx\))\)/, "", line)
+    if (line ~ /(\.|::)[[:space:]]*(r#)?(commit|rematerialise(_until)?)([^[:alnum:]_]|$)/) {
         print "unwrapped transaction publication: " $0
         failed = 1
     }

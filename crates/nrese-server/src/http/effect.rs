@@ -12,6 +12,7 @@ use crate::error::ApiError;
 #[derive(Clone)]
 enum End<T> {
     Returned(Result<T, ApiError>),
+    Cancelled,
     Fallback(Option<MutationState>),
 }
 
@@ -64,12 +65,19 @@ pub(super) async fn run<H: Send + 'static>(
     let worker = ticket.clone();
     let end = spawn(
         held,
-        move || End::Fallback(Some(fallback.state())),
-        move |held| End::Returned(work(&worker, held)),
+        move || End::Fallback(Some(fallback.end_pending())),
+        move |held| {
+            let result = work(&worker, held);
+            if result.is_err() && worker.end_pending() == MutationState::Cancelled {
+                End::Cancelled
+            } else {
+                End::Returned(result)
+            }
+        },
     );
     let record = match end.wait_or(sleep_until(deadline)).await {
         Some(record) => Some(record),
-        None if ticket.cancel() => Some(End::Fallback(Some(MutationState::Cancelled))),
+        None if ticket.cancel() => Some(End::Cancelled),
         None => match after_cancel {
             LostCancel::AwaitEnd => end.wait_or(pending()).await,
             LostCancel::Grace(duration, message) => {
@@ -87,7 +95,7 @@ pub(super) async fn run<H: Send + 'static>(
     };
     match record {
         Some(End::Returned(result)) => result,
-        Some(End::Fallback(Some(MutationState::Cancelled))) => {
+        Some(End::Cancelled | End::Fallback(Some(MutationState::Cancelled))) => {
             Err(ApiError::timeout(timeout_message))
         }
         Some(End::Fallback(Some(MutationState::Pending))) => Err(ApiError::internal(

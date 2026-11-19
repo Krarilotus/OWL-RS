@@ -166,33 +166,14 @@ impl MutationPipeline {
         ticket: &MutationTicket,
         note: Option<nrese_engine::CommitNote<'p>>,
     ) -> Result<MutationCommitReport, MutationError> {
-        let result = self.apply_inner(command, requester, ticket, note);
-        if result.is_err() {
-            ticket.end_error();
-        }
-        result
-    }
-
-    fn apply_inner<'p>(
-        &'p self,
-        command: MutationCommand,
-        requester: &crate::Requester,
-        ticket: &MutationTicket,
-        note: Option<nrese_engine::CommitNote<'p>>,
-    ) -> Result<MutationCommitReport, MutationError> {
         let kind = command.kind();
-        let store_error = |source| {
-            if ticket.is_cancelled() {
-                MutationError::Cancelled
-            } else {
-                MutationError::Store { kind, source }
-            }
-        };
+        let known_error = |error| ticket.end_error(error);
+        let store_error = |source| known_error(MutationError::Store { kind, source });
         if ticket.is_cancelled() {
             return Err(MutationError::Cancelled);
         }
         if self.is_retired() {
-            return Err(MutationError::Retired);
+            return Err(known_error(MutationError::Retired));
         }
 
         // Reasoner v2 maintains the inferred stack from a correct one: materialise it first
@@ -215,10 +196,10 @@ impl MutationPipeline {
                 match self.store.rematerialise_until(rules, &stop) {
                     Ok(_) => {}
                     Err(StoreError::MaterialisationCancelled) if self.is_retired() => {
-                        return Err(MutationError::Retired);
+                        return Err(known_error(MutationError::Retired));
                     }
                     Err(StoreError::MaterialisationCancelled) => {
-                        return Err(MutationError::Cancelled);
+                        return Err(known_error(MutationError::Cancelled));
                     }
                     Err(error) => return Err(store_error(error)),
                 }
@@ -239,7 +220,7 @@ impl MutationPipeline {
         // rematerialises after retiring this one, so a write that got the slot before
         // commits first and is recomputed, and one after is refused here.
         if self.is_retired() {
-            return Err(MutationError::Retired);
+            return Err(known_error(MutationError::Retired));
         }
         if ticket.is_cancelled() {
             return Err(MutationError::Cancelled);
@@ -313,7 +294,7 @@ impl MutationPipeline {
             .map_err(|interrupted| {
                 memory
                     .error(interrupted)
-                    .map_or(MutationError::Cancelled, &store_error)
+                    .map_or_else(|| known_error(MutationError::Cancelled), &store_error)
             })?;
             tracing::debug!(?materialisation, "commit-path materialisation");
             // Whether the closure the commit leaves leaves out a list axiom: its program's
@@ -399,7 +380,7 @@ impl MutationPipeline {
                 let reject = view.reject(full, |view| {
                     self.view_reason(view, &dl_own_budget, &resources)
                 });
-                return Err(MutationError::Rejected(Box::new(reject)));
+                return Err(known_error(MutationError::Rejected(Box::new(reject))));
             }
             self.record_run(ReasoningRunRecord::from_report(
                 &materialisation,
@@ -432,7 +413,7 @@ impl MutationPipeline {
             if let Some((gate, _, _)) = &mut dl
                 && let Some(reject) = gate.reject.take()
             {
-                return Err(MutationError::Rejected(Box::new(reject)));
+                return Err(known_error(MutationError::Rejected(Box::new(reject))));
             }
             crate::shacl::check_shapes(
                 &tx,
@@ -449,7 +430,8 @@ impl MutationPipeline {
                 store_error,
                 &evidence::EvidenceView::new(&requester.read, &tx),
                 &|view| self.view_reason(view, &dl_own_budget, &resources),
-            )?;
+            )
+            .map_err(known_error)?;
             if !ticket.begin_commit() {
                 return Err(MutationError::Cancelled);
             }
@@ -545,7 +527,8 @@ impl MutationPipeline {
             store_error,
             &evidence::EvidenceView::new(&requester.read, &tx),
             &|view| self.view_reason(view, &|_| None, &resources),
-        )?;
+        )
+        .map_err(known_error)?;
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
         }

@@ -4,7 +4,7 @@ use std::sync::{Arc, OnceLock};
 use nrese_engine::{CommitSummary, EngineError};
 use nrese_sparql::CancellationToken;
 
-use super::MutationCommitReport;
+use super::{MutationCommitReport, MutationError};
 
 type RightsHeld<'a> = std::sync::RwLockReadGuard<'a, Arc<crate::access::AccessState>>;
 
@@ -99,22 +99,38 @@ impl MutationTicket {
     }
 
     /// Claims the right to commit. Returns `false` if the ticket is no longer pending.
-    pub fn begin_commit(&self) -> bool {
+    pub(crate) fn begin_commit(&self) -> bool {
         self.record
             .state
             .compare_exchange(PENDING, COMMITTING, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
     }
 
-    pub(crate) fn end_error(&self) {
-        let _ =
-            self.record
-                .state
-                .compare_exchange(PENDING, ENDED, Ordering::AcqRel, Ordering::Acquire);
+    pub(crate) fn end_error(&self, error: MutationError) -> MutationError {
+        if self.end_pending() == MutationState::Cancelled {
+            MutationError::Cancelled
+        } else {
+            error
+        }
+    }
+
+    /// Settles a known failure or a fallback that could not have published. Returns
+    /// the state that determines the answer, including a cancel that settled it first.
+    pub fn end_pending(&self) -> MutationState {
+        if self
+            .record
+            .state
+            .compare_exchange(PENDING, ENDED, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            MutationState::Pending
+        } else {
+            self.state()
+        }
     }
 
     /// The record at this instant, readable without taking a lock.
-    pub fn state(&self) -> MutationState {
+    fn state(&self) -> MutationState {
         match self.record.state.load(Ordering::Acquire) {
             PENDING => MutationState::Pending,
             CANCELLED => MutationState::Cancelled,
@@ -149,7 +165,7 @@ pub(super) fn publishing(
 
 #[cfg(test)]
 mod tests {
-    use super::MutationTicket;
+    use super::{MutationState, MutationTicket};
 
     #[test]
     fn cancel_before_commit_wins() {
@@ -181,5 +197,28 @@ mod tests {
             (ticket.begin_commit(), cancel.join().unwrap())
         });
         assert_ne!(claimed, cancelled);
+    }
+
+    // Spec: lifecycle rule 3 says a fallback and a racing cancel agree on the recorded end.
+    #[test]
+    fn pending_fallback_and_cancel_agree_on_the_winner() {
+        let ticket = MutationTicket::new();
+        let gate = std::sync::Barrier::new(2);
+        let (state, cancelled) = std::thread::scope(|threads| {
+            let cancel = threads.spawn(|| {
+                gate.wait();
+                ticket.cancel()
+            });
+            gate.wait();
+            (ticket.end_pending(), cancel.join().unwrap())
+        });
+        assert_eq!(
+            state,
+            if cancelled {
+                MutationState::Cancelled
+            } else {
+                MutationState::Pending
+            }
+        );
     }
 }
