@@ -8,7 +8,8 @@ const ORDINARY_DEPTH: usize = 5;
 const ORDINARY_WORLDS: usize = 100_000;
 const WITNESS_DEPTH: usize = 8;
 const DEEP_DEPTH: usize = 16;
-const DEEP_WORLDS: usize = 50_000_000;
+const DEEP_WORLDS_TWO: usize = 50_000_000;
+const DEEP_WORLDS_THREE: usize = 57_919_939;
 const GOOD: u8 = 0;
 const UNKNOWN_ROLLBACK: u8 = 1;
 const JOIN_ANSWER: u8 = 2;
@@ -20,6 +21,11 @@ const PUBLISHED_WITHOUT_RECORD: u8 = 7;
 const REMOVED_WITHOUT_GONE: u8 = 8;
 const DROP_TO_U: u8 = 9;
 const NO_IDLE_EXPIRY: u8 = 10;
+const IMMEDIATE_COMMIT: u8 = 11;
+const GRACE_BEFORE_PUBLISH: u8 = 12;
+const ROLLBACK_STAYS_LIVE: u8 = 13;
+const READ_WITHOUT_SNAPSHOT: u8 = 14;
+const WRONG_STREAM_ANSWER: u8 = 15;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Op {
@@ -177,6 +183,24 @@ impl Session {
         self.tasks.iter().flatten().any(|task| task.guard)
     }
 
+    fn try_cancel(&mut self, slot: usize) {
+        let task = self.tasks[slot].as_mut().unwrap();
+        if task.phase == Phase::Pending {
+            task.phase = Phase::Ended(Outcome::Failed(Problem::Status(408)));
+        }
+    }
+
+    fn release_guard(&mut self, slot: usize) {
+        let task = self.tasks[slot].as_mut().unwrap();
+        if task.guard && matches!(self.state, State::U | State::S | State::P | State::Pw) {
+            self.past_idle_limit = false;
+        }
+        task.guard = false;
+        if self.ticket == Some(slot) {
+            self.ticket = None;
+        }
+    }
+
     fn next_write(&mut self) -> u8 {
         let bit = 1 << self.issued;
         self.issued += 1;
@@ -229,7 +253,10 @@ enum Violation {
     LostWrite,
     DoublePublish,
     RollbackUnknown,
+    RollbackStillLive,
     PublishedFailure,
+    MissingSnapshot,
+    StreamAnswer,
     StaleSuccess,
 }
 
@@ -288,7 +315,6 @@ enum Move {
     RollbackLock(usize),
     WaitTimeout(usize),
     RollbackTimeout(usize),
-    CancelForRollback(usize),
     DropWaiting(usize),
     DropRollback(usize),
     DropTaskRequest(usize, usize),
@@ -350,6 +376,10 @@ impl<const N: usize> World<N> {
             PUBLISHED_WITHOUT_RECORD => Some(Violation::PublishedFailure),
             REMOVED_WITHOUT_GONE => Some(Violation::DetachedAnswer),
             DROP_TO_U => Some(Violation::ReleasedEarly),
+            IMMEDIATE_COMMIT | GRACE_BEFORE_PUBLISH => Some(Violation::PublishedFailure),
+            ROLLBACK_STAYS_LIVE => Some(Violation::RollbackStillLive),
+            READ_WITHOUT_SNAPSHOT => Some(Violation::MissingSnapshot),
+            WRONG_STREAM_ANSWER => Some(Violation::StreamAnswer),
             _ => None,
         };
         if target.is_none_or(|expected| expected == violation) {
@@ -365,8 +395,14 @@ impl<const N: usize> World<N> {
     }
 }
 
-fn transition<const MUTATION: u8>(state: State, event: Event) -> Step {
+struct Transition {
+    step: Step,
+    release_guard: bool,
+}
+
+fn transition<const MUTATION: u8>(state: State, event: Event) -> Transition {
     let mut result = step(&state, &event);
+    let mut release_guard = false;
     match (MUTATION, state, event) {
         (UNKNOWN_ROLLBACK, State::E(Outcome::Unknown), Event::Action(Action::Rollback)) => {
             result.answer = Answer::NoContent;
@@ -377,6 +413,7 @@ fn transition<const MUTATION: u8>(state: State, event: Event) -> Step {
         (EARLY_RELEASE, State::Pw, Event::Dropped) => {
             result.effect = Effect::None;
             result.next = State::P;
+            release_guard = true;
         }
         (STALE_LOOKUP, State::Gone, Event::Action(Action::Write { .. })) => {
             result.answer = Answer::WriteOk;
@@ -399,9 +436,44 @@ fn transition<const MUTATION: u8>(state: State, event: Event) -> Step {
             result.next = State::P;
             result.effect = Effect::None;
         }
+        (IMMEDIATE_COMMIT, State::P, Event::Action(Action::Commit { .. }))
+            if result.cell == Cell::P9 =>
+        {
+            result = step(
+                &state,
+                &Event::Action(Action::Commit {
+                    same_rights: true,
+                    empty: true,
+                }),
+            );
+        }
+        (GRACE_BEFORE_PUBLISH, State::C, Event::CommitGrace(Observation::InProgress)) => {
+            result.answer = Answer::Recorded {
+                outcome: Outcome::Committed,
+                evidence: true,
+            };
+        }
+        (ROLLBACK_STAYS_LIVE, State::U, Event::Action(Action::Rollback)) => {
+            result.next = State::U;
+            result.effect = Effect::None;
+        }
+        (READ_WITHOUT_SNAPSHOT, State::P, Event::Action(Action::Read { same_rights: true })) => {
+            result.effect = Effect::None;
+        }
+        (
+            WRONG_STREAM_ANSWER,
+            _,
+            Event::ReadEnded {
+                end: StreamEnd::Aborted,
+                ..
+            },
+        ) => result.answer = Answer::Read(StreamEnd::Data),
         _ => {}
     }
-    result
+    Transition {
+        step: result,
+        release_guard,
+    }
 }
 
 impl<const N: usize> World<N> {
@@ -413,7 +485,10 @@ impl<const N: usize> World<N> {
         report: &mut impl FnMut(ReportedAnswer),
     ) -> Step {
         let before = self.sessions[id];
-        let result = transition::<MUTATION>(before.state, event);
+        let Transition {
+            step: result,
+            release_guard,
+        } = transition::<MUTATION>(before.state, event);
         if result.next != before.state || matches!(result.effect, Effect::Append | Effect::Swap) {
             if !locked {
                 self.violate::<MUTATION>(Violation::OutsideLock);
@@ -448,6 +523,9 @@ impl<const N: usize> World<N> {
             self.violate::<MUTATION>(Violation::RollbackUnknown);
         }
         self.sessions[id].state = result.next;
+        if release_guard && let Some(slot) = before.ticket {
+            self.sessions[id].release_guard(slot);
+        }
         report((Some(result.cell), result.answer));
         result
     }
@@ -529,15 +607,21 @@ impl<const N: usize> World<N> {
         {
             self.violate::<MUTATION>(Violation::Disclosure);
         }
-        if matches!(
-            result.answer,
-            Answer::Recorded {
-                outcome: Outcome::Committed,
-                ..
-            }
-        ) && matches!(before.state, State::P)
+        if before.mapped
+            && matches!(before.state, State::U | State::P)
+            && request.op == Op::Commit
+            && matches!(
+                result.answer,
+                Answer::Recorded {
+                    outcome: Outcome::Committed,
+                    ..
+                }
+            )
         {
-            self.check_writes::<MUTATION>(id, before.pending);
+            if before.state != State::P || before.pending != 0 {
+                self.violate::<MUTATION>(Violation::PublishedFailure);
+            }
+            self.check_writes::<MUTATION>(id, self.store.tags[id]);
         }
         let session = &mut self.sessions[id];
         let bit = if request.op == Op::Write
@@ -575,9 +659,9 @@ impl<const N: usize> World<N> {
                 session.past_idle_limit = false;
             }
             Effect::TakeSnapshot => {
-                session.read = Some(Read {
+                session.read = session.pin.map(|pin| Read {
                     first: false,
-                    pin: session.pin.unwrap(),
+                    pin,
                     private: session.pending,
                     request_rights: rights,
                 });
@@ -611,6 +695,31 @@ impl<const N: usize> World<N> {
                 session.evidence_rights = rights;
             }
             _ => {}
+        }
+        if request.op == Op::Rollback
+            && before.mapped
+            && matches!(before.state, State::U | State::P)
+            && result.answer == Answer::NoContent
+            && (session.mapped || session.state != State::Gone || session.pin.is_some())
+        {
+            self.violate::<MUTATION>(Violation::RollbackStillLive);
+        }
+        if before.mapped
+            && before.state == State::P
+            && matches!(action, Action::Read { same_rights: true })
+        {
+            let expected = before.pin.map(|pin| Read {
+                first: false,
+                pin,
+                private: before.pending,
+                request_rights: rights,
+            });
+            if result.answer != Answer::Pending
+                || expected.is_none()
+                || self.sessions[id].read != expected
+            {
+                self.violate::<MUTATION>(Violation::MissingSnapshot);
+            }
         }
     }
 
@@ -700,6 +809,11 @@ impl<const N: usize> World<N> {
                 };
                 let session = self.sessions[id];
                 if session.mapped && !self.retired {
+                    if op == Op::Rollback
+                        && let Some(slot) = session.ticket
+                    {
+                        self.sessions[id].try_cancel(slot);
+                    }
                     if session.waiting.is_some() {
                         debug_assert_eq!(op, Op::Rollback);
                         self.sessions[id].rollback_waiting = Some(request);
@@ -710,7 +824,8 @@ impl<const N: usize> World<N> {
                     let result = transition::<MUTATION>(
                         State::G,
                         Event::Action(session.action(op, request.rights)),
-                    );
+                    )
+                    .step;
                     report((Some(result.cell), result.answer));
                     if op == Op::Commit
                         && session.stale_success
@@ -736,13 +851,6 @@ impl<const N: usize> World<N> {
                 }
                 report((None, lock_timeout()));
             }
-            Move::CancelForRollback(id) => {
-                let session = &mut self.sessions[id];
-                let task = session.tasks[session.ticket.unwrap()].as_mut().unwrap();
-                if task.phase == Phase::Pending {
-                    task.phase = Phase::Ended(Outcome::Failed(Problem::Status(408)));
-                }
-            }
             Move::DropTaskRequest(id, slot) => {
                 let task = self.sessions[id].tasks[slot].unwrap();
                 if matches!(task.phase, Phase::Recorded(_)) {
@@ -752,20 +860,15 @@ impl<const N: usize> World<N> {
                 let result = self.event::<MUTATION>(id, Event::Dropped, false, &mut report);
                 let released_early = task.guard
                     && matches!(task.phase, Phase::Pending | Phase::Claimed)
-                    && !matches!(self.sessions[id].state, State::S | State::Pw);
+                    && (!self.sessions[id].tasks[slot].unwrap().guard
+                        || !matches!(self.sessions[id].state, State::S | State::Pw));
                 if released_early {
                     self.violate::<MUTATION>(Violation::ReleasedEarly);
                 }
                 let session = &mut self.sessions[id];
-                let task = session.tasks[slot].as_mut().unwrap();
-                task.awaiting = false;
-                if result.effect == Effect::TryCancel && task.phase == Phase::Pending {
-                    task.phase = Phase::Ended(Outcome::Failed(Problem::Status(408)));
-                }
-                if released_early && MUTATION == EARLY_RELEASE {
-                    // Let the old scratch run on to expose the lost second write.
-                    task.guard = false;
-                    session.ticket = None;
+                session.tasks[slot].as_mut().unwrap().awaiting = false;
+                if result.effect == Effect::TryCancel {
+                    session.try_cancel(slot);
                 }
             }
             Move::DropWaiting(id) => self.sessions[id].waiting = None,
@@ -798,7 +901,7 @@ impl<const N: usize> World<N> {
                     self.event::<MUTATION>(id, event, true, &mut report)
                 } else {
                     // A stale task in the old implementation still has its scratch transaction.
-                    transition::<MUTATION>(State::Pw, event)
+                    transition::<MUTATION>(State::Pw, event).step
                 };
                 if result.answer != Answer::None
                     || (self.retired && result.effect != Effect::Record(outcome))
@@ -825,13 +928,7 @@ impl<const N: usize> World<N> {
                 let session = &mut self.sessions[id];
                 let task = session.tasks[slot].unwrap();
                 session.terminal = Some(outcome);
-                if session.ticket == Some(slot) {
-                    session.ticket = None;
-                }
-                if task.guard && matches!(session.state, State::U | State::S | State::P | State::Pw)
-                {
-                    session.past_idle_limit = false;
-                }
+                session.release_guard(slot);
                 session.tasks[slot] = task.awaiting.then_some(Task {
                     guard: false,
                     phase: Phase::Recorded(outcome),
@@ -919,13 +1016,15 @@ impl<const N: usize> World<N> {
                 };
                 let result =
                     self.event::<MUTATION>(id, Event::CommitGrace(record), false, &mut report);
-                if commit.published
-                    && result.answer
-                        != (Answer::Recorded {
-                            outcome: Outcome::Committed,
-                            evidence: true,
-                        })
-                {
+                let expected = if commit.published {
+                    Answer::Recorded {
+                        outcome: Outcome::Committed,
+                        evidence: true,
+                    }
+                } else {
+                    Answer::Error(Problem::CommitInProgress { retry: true })
+                };
+                if result.answer != expected {
                     self.violate::<MUTATION>(Violation::PublishedFailure);
                 }
                 self.sessions[id].commit.as_mut().unwrap().awaiting = false;
@@ -970,10 +1069,10 @@ impl<const N: usize> World<N> {
                     false,
                     &mut report,
                 );
-                if matches!(
-                    result.answer,
-                    Answer::Read(StreamEnd::Data | StreamEnd::Aborted)
-                ) {
+                if result.answer != Answer::Read(end) {
+                    self.violate::<MUTATION>(Violation::StreamAnswer);
+                }
+                if matches!(end, StreamEnd::Data | StreamEnd::Aborted) {
                     self.sessions[id].observed = true;
                     // The top bit represents a protected statement in this abstract store.
                     let may_disclose_protected =
@@ -1121,21 +1220,16 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
             // Red runs cover the affected client's request interleavings.
             // Other clients and unrelated stimuli run in the green search.
             let focused_client = match FOCUS {
-                EARLY_RELEASE | REPLAY_OBSERVED | DROP_TO_U | NO_IDLE_EXPIRY => N - 1,
+                EARLY_RELEASE
+                | REPLAY_OBSERVED
+                | DROP_TO_U
+                | NO_IDLE_EXPIRY
+                | IMMEDIATE_COMMIT
+                | READ_WITHOUT_SNAPSHOT => N - 1,
                 _ => 0,
             };
             if FOCUS != GOOD && id != focused_client {
                 continue;
-            }
-            if s.mapped
-                && !world.retired
-                && s.ticket.is_some_and(|slot| {
-                    s.tasks[slot].is_some_and(|task| task.phase == Phase::Pending)
-                })
-                && (s.waiting.is_some_and(|request| request.op == Op::Rollback)
-                    || s.rollback_waiting.is_some())
-            {
-                moves.push(Move::CancelForRollback(id));
             }
             if s.rollback_waiting.is_some() {
                 moves.extend([Move::DropRollback(id), Move::RollbackTimeout(id)]);
@@ -1440,6 +1534,36 @@ fn explorer_rejects_sweep_retaining_an_abandoned_pin() {
     red::<NO_IDLE_EXPIRY>("server drain exceeded 32 moves");
 }
 
+// Spec §2b P9/P9a: only an empty pinned delta can commit without publication.
+#[test]
+fn explorer_rejects_immediate_success_for_a_nonempty_commit() {
+    red::<IMMEDIATE_COMMIT>("PublishedFailure");
+}
+
+// Spec §2b C5b: the grace answer stays retryable until publication.
+#[test]
+fn explorer_rejects_success_during_unpublished_grace() {
+    red::<GRACE_BEFORE_PUBLISH>("PublishedFailure");
+}
+
+// Spec §2b U7/P11: success removes the session and releases its pin.
+#[test]
+fn explorer_rejects_rollback_retaining_a_live_session() {
+    red::<ROLLBACK_STAYS_LIVE>("RollbackStillLive");
+}
+
+// Spec §2b P5: the accepted read captures a snapshot and runs outside the lock.
+#[test]
+fn explorer_rejects_read_without_a_snapshot() {
+    red::<READ_WITHOUT_SNAPSHOT>("MissingSnapshot");
+}
+
+// Spec §2b S3/P7: an aborted stream reports its abort even after it has shown data.
+#[test]
+fn explorer_rejects_completed_answer_for_an_aborted_stream() {
+    red::<WRONG_STREAM_ANSWER>("StreamAnswer");
+}
+
 // Spec §2c v8 N3: a request that arrives with the pinned view keeps it while waiting.
 #[test]
 fn read_uses_arrival_rights_after_lock_wait() {
@@ -1509,6 +1633,42 @@ fn rollback_after_longest_life_uses_the_tombstone() {
     }
 }
 
+// Spec §2b Pw9: ROLLBACK can cancel only the ticket present at its lookup.
+#[test]
+fn rollback_cancels_only_the_ticket_visible_at_lookup() {
+    for sees_ticket in [false, true] {
+        let mut world = Sessions::<2, GOOD>::start();
+        world.do_move::<GOOD>(Move::Lookup(1, Op::Write), |_| {});
+        if !sees_ticket {
+            world.do_move::<GOOD>(Move::Lookup(1, Op::Rollback), |_| {});
+        }
+        world.do_move::<GOOD>(Move::SessionLock(1), |_| {});
+        let (outcome, writer_answer, rollback_lock) = if sees_ticket {
+            world.do_move::<GOOD>(Move::Lookup(1, Op::Rollback), |_| {});
+            (
+                Outcome::Failed(Problem::Status(408)),
+                Answer::TaskError {
+                    problem: Problem::Status(408),
+                    source: Cell::P4,
+                },
+                Move::SessionLock(1),
+            )
+        } else {
+            world.do_move::<GOOD>(Move::Swap(1, 0), |_| {});
+            (Outcome::Committed, Answer::WriteOk, Move::RollbackLock(1))
+        };
+        world.do_move::<GOOD>(Move::DropGuard(1, 0, outcome), |_| {});
+        let mut answers = Vec::new();
+        world.do_move::<GOOD>(Move::TaskReady(1, 0), |(_, answer)| answers.push(answer));
+        world.do_move::<GOOD>(rollback_lock, |(_, answer)| {
+            if answer != Answer::None {
+                answers.push(answer);
+            }
+        });
+        assert_eq!(answers, [writer_answer, Answer::NoContent]);
+    }
+}
+
 fn deep_limit(name: &str, default: usize) -> usize {
     std::env::var(name).map_or(default, |value| value.parse().expect(name))
 }
@@ -1516,10 +1676,15 @@ fn deep_limit(name: &str, default: usize) -> usize {
 fn green<const N: usize>() {
     let deep = std::env::var_os("NRESE_SESSION_EXPLORER_DEEP").is_some();
     let required_depth = if N == 2 { 12 } else { 10 };
+    let deep_worlds = if N == 2 {
+        DEEP_WORLDS_TWO
+    } else {
+        DEEP_WORLDS_THREE
+    };
     let (depth, worlds) = if deep {
         (
             deep_limit("NRESE_SESSION_EXPLORER_DEEP_DEPTH", DEEP_DEPTH),
-            deep_limit("NRESE_SESSION_EXPLORER_DEEP_WORLDS", DEEP_WORLDS),
+            deep_limit("NRESE_SESSION_EXPLORER_DEEP_WORLDS", deep_worlds),
         )
     } else {
         (ORDINARY_DEPTH, ORDINARY_WORLDS)
