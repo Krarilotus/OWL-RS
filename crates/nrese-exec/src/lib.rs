@@ -42,6 +42,8 @@ pub mod graph;
 pub mod group;
 pub mod heap;
 pub mod join;
+#[cfg(feature = "lifecycle-explorer")]
+pub mod lifecycle_explorer;
 #[cfg(any(test, feature = "measure"))]
 pub mod measure;
 pub mod memory;

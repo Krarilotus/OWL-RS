@@ -8,6 +8,8 @@ publish.workspace = true
 license.workspace = true
 
 [features]
+# The shared lifecycle model explorer, enabled by test builds that use it.
+lifecycle-explorer = []
 # The counting allocator and measurements (src/measure.rs), for other crates' tests: a
 # dev-dependency with this feature. Never in product builds.
 measure = ["dep:parking_lot_core"]
