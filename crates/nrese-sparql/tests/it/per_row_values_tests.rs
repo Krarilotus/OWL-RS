@@ -6,6 +6,7 @@
 //! evaluation has and a wrong count of evaluations breaks.
 
 use nrese_engine::{Engine, EngineConfig};
+use nrese_rdf::{GraphName, Literal, NamedNode, Quad};
 use nrese_rdf_io::{RdfFormat, RdfParser};
 use nrese_sparql::{QueryOptions, QueryResults, evaluate_query};
 use nrese_sparql_syntax::SparqlParser;
@@ -24,22 +25,47 @@ fn engine() -> Engine {
     engine
 }
 
-/// The number of rows `text` gives on [`engine`]'s data, optimised or as written.
-fn rows(text: &str, as_written: bool) -> usize {
-    let engine = engine();
+/// The rows `text` gives on `engine`'s data under `options`, each as its values of
+/// `variables` (empty where unbound).
+fn values_in(
+    engine: &Engine,
+    text: &str,
+    options: &QueryOptions,
+    variables: &[&str],
+) -> Vec<Vec<String>> {
     let snapshot = engine.snapshot();
     let query = SparqlParser::new()
         .parse_query(text)
         .unwrap_or_else(|e| panic!("{e}: {text}"));
+    let QueryResults::Solutions(solutions) =
+        evaluate_query(&snapshot, &query, options).unwrap_or_else(|e| panic!("{e}: {text}"))
+    else {
+        panic!("solutions: {text}");
+    };
+    solutions
+        .map(|row| {
+            let row = row.unwrap();
+            variables
+                .iter()
+                .map(|v| row.get(*v).map_or_else(String::new, ToString::to_string))
+                .collect()
+        })
+        .collect()
+}
+
+/// The rows `text` gives on [`engine`]'s data, optimised or as written, each as its values
+/// of `variables`.
+fn values(text: &str, as_written: bool, variables: &[&str]) -> Vec<Vec<String>> {
     let options = QueryOptions {
         as_written,
         ..QueryOptions::default()
     };
-    let QueryResults::Solutions(solutions) = evaluate_query(&snapshot, &query, &options).unwrap()
-    else {
-        panic!("solutions: {text}");
-    };
-    solutions.collect::<Result<Vec<_>, _>>().unwrap().len()
+    values_in(&engine(), text, &options, variables)
+}
+
+/// The number of rows `text` gives on [`engine`]'s data, optimised or as written.
+fn rows(text: &str, as_written: bool) -> usize {
+    values(text, as_written, &[]).len()
 }
 
 /// `VALUES ?k { 1 2 … 40 }`.
@@ -129,10 +155,11 @@ fn an_optional_condition_drawing_a_value_decides_once_for_its_group() {
 }
 
 /// Spec: in the group `{ VALUES ?i { 1 … 40 } FILTER EXISTS { FILTER(RAND() < 0.5) } }` each
-/// of the forty solutions draws once; the join copies each kept one to both `VALUES ?k`
-/// rows, so the answer has an even number of rows (2 per kept solution).
+/// of the forty solutions is kept or not by its own test; the join copies each kept one to
+/// both `VALUES ?k` rows, so the `?i` kept with `?k = 1` are those kept with `?k = 2`. A
+/// test per joined row makes the two differ (a chance of 2^-40 per run that they agree).
 #[test]
-fn an_exists_drawing_a_value_draws_once_per_solution_of_its_group() {
+fn an_exists_drawing_a_value_keeps_each_solution_of_its_group_for_every_joined_row_or_none() {
     let keys: Vec<String> = (1..=40).map(|i| i.to_string()).collect();
     let query = format!(
         "SELECT ?k ?i {{ VALUES ?k {{ 1 2 }} {{ VALUES ?i {{ {} }} \
@@ -141,8 +168,41 @@ fn an_exists_drawing_a_value_draws_once_per_solution_of_its_group() {
     );
     for as_written in [false, true] {
         for _ in 0..5 {
-            let n = rows(&query, as_written);
-            assert!(n.is_multiple_of(2), "{n} rows, as written: {as_written}");
+            let mut kept = std::collections::BTreeMap::<String, Vec<String>>::new();
+            for row in values(&query, as_written, &["k", "i"]) {
+                kept.entry(row[0].clone()).or_default().push(row[1].clone());
+            }
+            kept.values_mut().for_each(|i| i.sort());
+            let sets: Vec<_> = kept.values().collect();
+            assert!(
+                sets.is_empty() || (sets.len() == 2 && sets[0] == sets[1]),
+                "kept per key: {kept:?}, as written: {as_written}"
+            );
         }
     }
+}
+
+/// Spec: a subquery is evaluated once, alone, whatever joins it, so in the group
+/// `{ ?s <urn:p> ?v . { SELECT (UUID() AS ?u) {} LIMIT 1 } FILTER(isIRI(?u)) }` it draws
+/// once wherever the group is evaluated, and the group's triple pattern may still be
+/// matched from the one `VALUES` row. Against 65,536 statements of the predicate the
+/// answer is one row, within a memory budget (256 KiB) that holds it but not the 65,536.
+#[test]
+fn a_group_drawing_only_in_a_subquery_is_still_matched_from_the_joined_rows() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let mut tx = engine.transaction();
+    let p = NamedNode::new_unchecked("urn:p");
+    for i in 0..65_536 {
+        let s = NamedNode::new_unchecked(format!("urn:s:{i}"));
+        let o = Literal::new_simple_literal("needle");
+        tx.insert(Quad::new(s, p.clone(), o, GraphName::DefaultGraph).as_ref());
+    }
+    tx.commit().unwrap();
+    let query = "SELECT ?s ?v ?u { VALUES ?s { <urn:s:0> } \
+                 { ?s <urn:p> ?v . { SELECT (UUID() AS ?u) WHERE {} LIMIT 1 } \
+                   FILTER(isIRI(?u)) } }";
+    let mut options = QueryOptions::default();
+    options.resources.memory = nrese_exec::Envelope::new(Some(256 * 1024), None);
+    let found = values_in(&engine, query, &options, &["s"]);
+    assert_eq!(found, [["<urn:s:0>"]]);
 }
