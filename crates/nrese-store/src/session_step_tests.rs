@@ -40,6 +40,7 @@ const COMMITTED_ROLLBACK: u8 = 18;
 const MISSING_COMMIT: u8 = 19;
 const LOST_REPEAT: u8 = 20;
 const WRITE_DURING_COMMIT: u8 = 21;
+const STALE_REPEAT_EFFECT: u8 = 22;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct Request {
@@ -402,7 +403,7 @@ impl<const N: usize> World<N> {
         let target = match MUTATION {
             EARLY_RELEASE | ACK_WITHOUT_APPEND | WRITE_DURING_COMMIT => Some(Invariant::I4),
             REPLAY_OBSERVED | WRITE_STARTS_SWITCH => Some(Invariant::I1),
-            DROP_TO_U => Some(Invariant::I8),
+            DROP_TO_U | STALE_REPEAT_EFFECT => Some(Invariant::I8),
             READ_WITHOUT_SNAPSHOT | LOST_REPEAT => Some(Invariant::I5),
             NO_IDLE_EXPIRY => Some(Invariant::I6),
             UNKNOWN_ROLLBACK
@@ -586,6 +587,9 @@ fn transition<const MUTATION: u8>(state: State, event: Event) -> Transition {
             result.answer = Answer::WriteOk;
             result.effect = Effect::Append;
         }
+        (STALE_REPEAT_EFFECT, State::Gone, Event::Action(Action::Commit { .. })) => {
+            result.effect = Effect::WaitOutcome;
+        }
         _ => {}
     }
     Transition {
@@ -628,6 +632,22 @@ impl<const N: usize> World<N> {
             self.violate::<MUTATION>(Invariant::I8);
         }
         self.store.write = None;
+    }
+
+    fn answer_detached<const MUTATION: u8>(
+        &mut self,
+        id: usize,
+        request: Request,
+        result: Step,
+        locked: bool,
+    ) {
+        if result.effect != Effect::None {
+            self.session_write::<MUTATION>(id, locked);
+        }
+        let txn = &mut self.store.transactions[id];
+        let delivery = txn.request_delivery(self.store.retired, request.rights);
+        txn.producers[request.id] = None;
+        self.receive::<MUTATION>(id, request.id, result.answer, delivery);
     }
 
     fn release_guard(&mut self, id: usize, slot: usize) {
@@ -707,16 +727,7 @@ impl<const N: usize> World<N> {
                 let txn = self.store.transactions[id];
                 let action = self.sessions[id].action(request.op, rights, &txn);
                 let result = self.event::<MUTATION>(id, Event::Detached(action), true, report);
-                if result.effect != Effect::None {
-                    self.session_write::<MUTATION>(id, true);
-                }
-                self.store.transactions[id].producers[request.id] = None;
-                self.receive::<MUTATION>(
-                    id,
-                    request.id,
-                    result.answer,
-                    txn.request_delivery(true, rights),
-                );
+                self.answer_detached::<MUTATION>(id, request, result, true);
             }
             return;
         }
@@ -741,11 +752,16 @@ impl<const N: usize> World<N> {
         }
         let Some(request) = request else { return };
         let txn = self.store.transactions[id];
-        let delivery = txn.request_delivery(false, rights);
         let action = self.sessions[id].action(request.op, rights, &txn);
+        if !txn.mapped {
+            let result = self.event::<MUTATION>(id, Event::Action(action), true, report);
+            self.answer_detached::<MUTATION>(id, request, result, true);
+            return;
+        }
+        let delivery = txn.request_delivery(false, rights);
         self.store.transactions[id].producers[request.id] = None;
         let bit = if request.op == Op::Write {
-            let bit = if txn.mapped && !txn.worker && txn.end.is_none() {
+            let bit = if !txn.worker && txn.end.is_none() {
                 self.sessions[id].next_write()
             } else {
                 4
@@ -946,17 +962,16 @@ impl<const N: usize> World<N> {
                         session.waiting = Some(request);
                     }
                 } else {
-                    let delivery = txn.request_delivery(self.store.retired, rights);
                     let result = transition::<MUTATION>(
                         State::G,
                         Event::Action(session.action(op, rights, txn)),
                     )
                     .step;
-                    if result.effect != Effect::None || result.next != State::G {
+                    if result.next != State::G {
                         self.session_write::<MUTATION>(id, false);
                     }
                     report((Some(result.cell), result.answer));
-                    self.receive::<MUTATION>(id, request.id, result.answer, delivery);
+                    self.answer_detached::<MUTATION>(id, request, result, false);
                 }
             }
             Move::SessionLock(id) => {
@@ -1335,7 +1350,7 @@ impl<const N: usize, const MUTATION: u8, const FOCUS: u8> Model for Sessions<N, 
         {
             moves.push(Move::LifeClock);
         }
-        if FOCUS == REMOVED_WITHOUT_GONE
+        if matches!(FOCUS, REMOVED_WITHOUT_GONE | STALE_REPEAT_EFFECT)
             && world.store.transactions[0].mapped
             && !world.store.transactions[0].idle
         {
@@ -1755,6 +1770,12 @@ fn explorer_rejects_pending_repeat_without_producer() {
 #[test]
 fn explorer_rejects_write_acknowledged_during_commit() {
     red::<WRITE_DURING_COMMIT>("I4");
+}
+
+// X7 and rule 12: a queued COMMIT still gets the missing answer without starting work.
+#[test]
+fn explorer_rejects_repeat_started_after_idle_removal() {
+    red::<STALE_REPEAT_EFFECT>("I8");
 }
 
 #[test]
