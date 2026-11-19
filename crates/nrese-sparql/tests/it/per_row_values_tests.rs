@@ -38,7 +38,7 @@ fn rows(text: &str, as_written: bool) -> usize {
     else {
         panic!("solutions: {text}");
     };
-    solutions.map(|row| row.unwrap()).count()
+    solutions.collect::<Result<Vec<_>, _>>().unwrap().len()
 }
 
 /// `VALUES ?k { 1 2 … 40 }`.
