@@ -16,7 +16,6 @@ enum Answer {
     Accept(bool),
     Row(Triple, bool),
     CompleteRead(Triple, bool),
-    Rollback(Triple, bool),
     Redundant,
 }
 
@@ -35,13 +34,8 @@ impl Difference {
     }
 
     fn line(&self) -> String {
-        let source = if matches!(self.expected, Answer::Rollback(..)) {
-            "before refusal"
-        } else {
-            "oracle"
-        };
         format!(
-            "{} {} write {} {source} {:?}; judge {}",
+            "{} {} write {} oracle {:?}; judge {}",
             self.mode,
             self.judge,
             self.write + 1,
@@ -88,6 +82,13 @@ pub fn steps(case: &Case) -> Vec<Step> {
         .collect()
 }
 
+fn projection(step: &Step) -> (Publication, Facts) {
+    (
+        publication::project(&step.asserted, &step.model),
+        oracle::without_known_deviation(&step.asserted),
+    )
+}
+
 struct Comparison<'a> {
     case: &'a Case,
     focus: Option<&'a Difference>,
@@ -115,8 +116,8 @@ impl Comparison<'_> {
         write: usize,
         store: &StoreService,
         accepted: bool,
-        step: &Step,
-        (expected, without_deviation): &(Publication, Facts),
+        wanted: bool,
+        state: Option<(&Step, &(Publication, Facts))>,
     ) -> Option<bool> {
         let mut report = |expected, detail| {
             self.differences.push(Difference {
@@ -127,15 +128,10 @@ impl Comparison<'_> {
                 detail,
             })
         };
-        if accepted == step.model.inconsistent {
-            report(
-                Answer::Accept(!step.model.inconsistent),
-                format!("accepted={accepted}"),
-            );
+        if accepted != wanted {
+            report(Answer::Accept(wanted), format!("accepted={accepted}"));
         }
-        if !accepted && step.model.inconsistent {
-            return None;
-        }
+        let (step, (expected, without_deviation)) = state?;
         let (rows, select_status) = judges::rows(store);
         for row in expected.required.difference(&rows) {
             if without_deviation.contains(row) {
@@ -154,7 +150,7 @@ impl Comparison<'_> {
             );
         }
 
-        if !accepted || step.model.inconsistent {
+        if step.model.inconsistent {
             return None;
         }
         let (answer, status) = judges::ask(store, &self.case.watch);
@@ -169,27 +165,7 @@ impl Comparison<'_> {
                 );
             }
         }
-        Some(answer)
-    }
-
-    fn rollback(
-        &mut self,
-        mode: &'static str,
-        judge: &'static str,
-        write: usize,
-        store: &StoreService,
-        before: &Facts,
-    ) {
-        let (after, _) = judges::rows(store);
-        for row in before.symmetric_difference(&after) {
-            self.differences.push(Difference {
-                mode,
-                judge,
-                write,
-                expected: Answer::Rollback(row.clone(), before.contains(row)),
-                detail: format!("row present after refusal={}", after.contains(row)),
-            });
-        }
+        accepted.then_some(answer)
     }
 }
 
@@ -201,15 +177,13 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
         counts: [0; publication::ITEMS.len()],
         known: 0,
     };
-    let projected: Vec<_> = steps
-        .iter()
-        .map(|step| {
-            (
-                publication::project(&step.asserted, &step.model),
-                oracle::without_known_deviation(&step.asserted),
-            )
-        })
-        .collect();
+    let projected: Vec<_> = steps.iter().map(projection).collect();
+    let empty = Step {
+        model: oracle::evaluate(&Facts::new(), Datatypes::Standard),
+        asserted: Facts::new(),
+        ordered: Vec::new(),
+    };
+    let initial = projection(&empty);
     for (publication, _) in &projected {
         for (sum, count) in compare.counts.iter_mut().zip(publication.counts) {
             *sum += count;
@@ -224,7 +198,20 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
             let mut previous = None;
             for (index, (step, expected)) in steps.iter().zip(&projected).enumerate() {
                 let (store, accepted) = judges::first_and_rebuild(mode, &step.ordered, rebuild);
-                let answer = compare.compare(mode, judge, index, &store, accepted, step, expected);
+                let state = if accepted {
+                    Some((step, expected))
+                } else {
+                    (!rebuild).then_some((&empty, &initial))
+                };
+                let answer = compare.compare(
+                    mode,
+                    judge,
+                    index,
+                    &store,
+                    accepted,
+                    !step.model.inconsistent,
+                    state,
+                );
                 if case.shape == "redundant"
                     && !rebuild
                     && index > 0
@@ -256,17 +243,19 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
             let rl = ReasoningMode::Owl2Rl;
             let mut store = open();
             let mut pipeline = judges::pipeline(&store, rl);
+            let mut committed = (&empty, &initial);
             for (index, ((write, step), expected)) in
                 case.writes.iter().zip(steps).zip(&projected).enumerate()
             {
-                let before = step.model.inconsistent.then(|| judges::rows(&store).0);
                 let accepted = judges::apply(&pipeline, write);
+                let wanted = !step.model.inconsistent;
+                let visible = Some(if accepted {
+                    (step, expected)
+                } else {
+                    committed
+                });
                 let compare_store = |compare: &mut Comparison<'_>, judge, store: &StoreService| {
-                    if !accepted && let Some(before) = &before {
-                        compare.rollback(mode, judge, index, store, before);
-                    } else {
-                        compare.compare(mode, judge, index, store, accepted, step, expected);
-                    }
+                    compare.compare(mode, judge, index, store, accepted, wanted, visible);
                 };
                 if compare.enabled(mode, judge) {
                     compare_store(&mut compare, judge, &store);
@@ -276,9 +265,12 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
                     drop(store);
                     store = open();
                     pipeline = judges::pipeline(&store, rl);
-                    if reopened && accepted != step.model.inconsistent {
+                    if reopened && accepted == wanted {
                         compare_store(&mut compare, "reopened", &store);
                     }
+                }
+                if wanted {
+                    committed = (step, expected);
                 }
             }
         }
@@ -292,7 +284,7 @@ pub fn check_cell(case: &Case, steps: &[Step]) -> bool {
         .differences
         .retain(|difference| match &difference.expected {
             Answer::Row(row, _) | Answer::CompleteRead(row, _) => row == &case.watch,
-            Answer::Accept(_) | Answer::Redundant | Answer::Rollback(..) => true,
+            Answer::Accept(_) | Answer::Redundant => true,
         });
     result.print("");
     if let Some(witness) = required_red(case, &result.differences) {
@@ -330,13 +322,12 @@ fn persists(case: &Case, witness: &Difference) -> bool {
         Answer::Accept(accepted) => steps
             .iter()
             .any(|step| step.model.inconsistent != *accepted),
-        Answer::Row(row, present) | Answer::CompleteRead(row, present) => steps
-            .iter()
-            .any(|step| step.model.facts.contains(row) == *present),
+        Answer::Row(row, present) | Answer::CompleteRead(row, present) => {
+            !present || steps.iter().any(|step| step.model.facts.contains(row))
+        }
         Answer::Redundant => steps
             .windows(2)
             .any(|pair| pair[0].model.facts == pair[1].model.facts),
-        Answer::Rollback(..) => steps.iter().any(|step| step.model.inconsistent),
     };
     plausible
         && run(case, &steps, Some(witness))
