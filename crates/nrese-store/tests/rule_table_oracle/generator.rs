@@ -124,12 +124,14 @@ const CHAIN: &str = "
 ";
 
 pub fn nil_walk(shape: &'static str) -> Case {
-    let cell = if shape == "nil-head" { "ex:h" } else { "ex:t" };
-    case(
-        shape,
-        ["ex:a", "ex:out", "ex:z"],
-        vec![insert(&CHAIN.replace(cell, "rdf:nil"))],
-    )
+    let (cell, continuation) = if shape == "nil-head" {
+        ("ex:h", "ex:z ex:p ex:y\nex:y ex:q ex:w")
+    } else {
+        ("ex:t", "ex:z ex:q ex:w")
+    };
+    let mut setup = insert(&CHAIN.replace(cell, "rdf:nil"));
+    setup.insert.extend(rows(continuation));
+    case(shape, ["ex:a", "ex:out", "ex:z"], vec![setup])
 }
 
 pub fn unnamed_union(consumed: bool) -> Case {

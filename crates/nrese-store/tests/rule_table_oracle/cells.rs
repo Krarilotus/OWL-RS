@@ -37,15 +37,34 @@ fn empty_store_publishes_datatype_axioms() {
 #[test]
 #[ignore = "undocumented: a chain starting at rdf:nil drops its explicit first and rest"]
 fn nil_head_starts_an_explicit_walk() {
-    // Spec: Table 3 matches the head's first and rest. Table 5 prp-spo2 derives the endpoint.
-    check(generator::nil_walk("nil-head"), &[true], &[true]);
+    // Spec: Table 3 matches the head again, so prp-spo2 gives both p,q and p,q,p,q.
+    check_nil_walk("nil-head");
 }
 
 #[test]
 #[ignore = "undocumented: a chain stops at rdf:nil before reading its explicit continuation"]
 fn nil_cell_continues_an_explicit_walk() {
-    // Spec: Table 3 also matches explicit first and rest on an interior cell.
-    check(generator::nil_walk("nil-cell"), &[true], &[true]);
+    // Spec: Table 3 matches the interior cell again, so prp-spo2 gives both p,q and p,q,q.
+    check_nil_walk("nil-cell");
+}
+
+fn check_nil_walk(shape: &'static str) {
+    let mut fixture = generator::nil_walk(shape);
+    let steps = sweep::steps(&fixture);
+    let model = &steps[0].model;
+    let continued = crate::triple(["ex:a", "ex:out", "ex:w"]);
+    assert!(!model.inconsistent, "the oracle accepts {shape}");
+    for row in [&fixture.watch, &continued] {
+        assert!(model.facts.contains(row), "the oracle derives {row:?}");
+    }
+    println!("ORACLE NIL {shape} derives both ex:a ex:out ex:z and ex:a ex:out ex:w");
+    let first_matches = sweep::check_cell(&fixture, &steps);
+    fixture.watch = continued;
+    let later_matches = sweep::check_cell(&fixture, &steps);
+    assert!(
+        first_matches && later_matches,
+        "{shape} differs from the oracle"
+    );
 }
 
 #[test]
