@@ -119,21 +119,28 @@ impl<O: Clone> Terminal<O> {
             id: None,
         };
         let end = poll_fn(|cx| {
+            // A waker is the runtime's code: it is cloned and dropped outside the lock.
+            let waker = cx.waker().clone();
             let mut state = lock(&self.shared.0);
-            if state.end.is_none() {
-                // The first poll takes a fresh id; later ones refresh that id's waker.
-                let id = *slot.id.get_or_insert(state.next);
-                if let Some((_, waker)) = state.wakers.iter_mut().find(|(at, _)| *at == id) {
-                    waker.clone_from(cx.waker());
-                } else {
-                    state.next += 1;
-                    state.wakers.push((id, cx.waker().clone()));
-                }
-                drop(state);
-                ready!(timer.as_mut().poll(cx));
-                state = lock(&self.shared.0);
+            if state.end.is_some() {
+                let recorded = state.end.clone();
+                drop(state); // The unused clone is dropped after the lock is released.
+                return Poll::Ready(recorded);
             }
-            Poll::Ready(state.end.clone())
+            // The first poll takes a fresh id; later ones replace that id's waker.
+            let id = *slot.id.get_or_insert(state.next);
+            let replaced = match state.wakers.iter_mut().find(|(at, _)| *at == id) {
+                Some((_, old)) => Some(std::mem::replace(old, waker)),
+                None => {
+                    state.next += 1;
+                    state.wakers.push((id, waker));
+                    None
+                }
+            };
+            drop(state);
+            drop(replaced);
+            ready!(timer.as_mut().poll(cx));
+            Poll::Ready(lock(&self.shared.0).end.clone())
         })
         .await;
         end.as_deref().cloned()
@@ -191,7 +198,7 @@ mod tests {
     use std::future::{pending, ready as ready_now};
     use std::pin::pin;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Barrier};
+    use std::sync::{Arc, Barrier, mpsc};
     use std::task::{Context, Poll, Wake, Waker};
     use std::thread;
     use std::time::{Duration, Instant};
@@ -467,5 +474,53 @@ mod tests {
             wait.as_mut().poll(&mut cx),
             Poll::Ready(Some(Outcome::Committed))
         );
+    }
+
+    /// A waker is the runtime's code: one whose drop reads the terminal, replaced by a second
+    /// poll with another waker, is dropped after the lock is released, so the read completes.
+    /// The polls run on their own thread, with the guard, so a deadlock fails the test at its
+    /// bound and nothing on the test's thread waits for the lock after it. The second poll
+    /// itself must drop the replaced waker, not the wait's cleanup after it.
+    #[test]
+    fn a_replaced_wakers_drop_may_read_the_terminal() {
+        struct Reads(Terminal<Outcome>, Arc<AtomicBool>);
+        impl Wake for Reads {
+            fn wake(self: Arc<Self>) {
+                let _ = self.0.get();
+            }
+        }
+        impl Drop for Reads {
+            fn drop(&mut self) {
+                let _ = self.0.get();
+                self.1.store(true, Ordering::SeqCst);
+            }
+        }
+        let (reader, guard) = terminal(|| Outcome::Unknown);
+        let (polled, done) = mpsc::channel();
+        let polls = thread::spawn(move || {
+            let _guard = guard;
+            let read_at_drop = Arc::new(AtomicBool::new(false));
+            let reads = Reads(reader.clone(), Arc::clone(&read_at_drop));
+            let reading = Waker::from(Arc::new(reads));
+            let mut wait = pin!(reader.wait_or(pending()));
+            let first = wait.as_mut().poll(&mut Context::from_waker(&reading));
+            drop(reading); // The list now holds its last reference.
+            let (_wakes, other) = counting_waker();
+            let second = wait.as_mut().poll(&mut Context::from_waker(&other));
+            assert!(
+                read_at_drop.load(Ordering::SeqCst),
+                "the second poll did not drop the replaced waker"
+            );
+            polled
+                .send((first, second))
+                .expect("the test waits for the polls");
+        });
+        let polls_ended = done.recv_timeout(Duration::from_secs(5));
+        assert_eq!(
+            polls_ended,
+            Ok((Poll::Pending, Poll::Pending)),
+            "the replaced waker's drop did not complete"
+        );
+        polls.join().expect("the polls do not panic");
     }
 }
