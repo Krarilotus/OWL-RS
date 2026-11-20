@@ -781,8 +781,13 @@ async fn from_dataset_omitting_default_graph_explains_omitted_inferences() -> Te
     )
     .await?;
 
-    let expected_omitted = "this read's dataset leaves out the default graph, where the \
-                            inferred statements are: answers over its asserted statements";
+    let expected_materialised = "this read's dataset leaves out the store's default graph from \
+                                 its default graph, where inferred statements are stored; \
+                                 default-graph patterns see only the selected graphs' asserted \
+                                 statements";
+    let expected_inferred = "this read's dataset leaves out the store's default graph from its \
+                             default graph, where inferred statements are stored; default-graph \
+                             patterns read no inferred statements";
     let pattern = "{ ?x a ex:Animal }";
 
     // No FROM: reads the materialised default graph (2 inferred rows, closure reason).
@@ -803,9 +808,31 @@ async fn from_dataset_omitting_default_graph_explains_omitted_inferences() -> Te
     let from_g2_header = from_g2.completeness.as_deref().unwrap_or("");
     assert!(
         from_g2_header.starts_with("sound-only; regime=owl2-rl;")
-            && from_g2_header.contains(expected_omitted)
+            && from_g2_header.contains(expected_materialised)
             && !from_g2_header.contains("answers over the owl2-rl closure"),
         "FROM :g2 header: {from_g2_header}"
+    );
+
+    // FROM :g2 with explicit GRAPH <urn:x-arq:DefaultGraph>: still returns inferred rows via
+    // the compatibility alias, and the header scopes its asserted-only statement to
+    // default-graph patterns rather than claiming the whole answer is asserted-only.
+    let alias_graph = select(
+        &app,
+        &[],
+        "",
+        "?x",
+        "FROM :g2",
+        "{ GRAPH <urn:x-arq:DefaultGraph> { ?x a ex:Animal } }",
+    )
+    .await?;
+    assert_eq!(alias_graph.code, StatusCode::OK);
+    assert_eq!(alias_graph.rows().unwrap().len(), 2);
+    let alias_header = alias_graph.completeness.as_deref().unwrap_or("");
+    assert!(
+        alias_header.starts_with("sound-only; regime=owl2-rl;")
+            && alias_header.contains(expected_materialised)
+            && !alias_header.contains("answers over its asserted statements"),
+        "FROM :g2 + GRAPH default alias header: {alias_header}"
     );
 
     // FROM NAMED :g2 (empty default graph): omits default graph too.
@@ -815,7 +842,7 @@ async fn from_dataset_omitting_default_graph_explains_omitted_inferences() -> Te
     let from_named_header = from_named.completeness.as_deref().unwrap_or("");
     assert!(
         from_named_header.starts_with("sound-only; regime=owl2-rl;")
-            && from_named_header.contains(expected_omitted)
+            && from_named_header.contains(expected_materialised)
             && !from_named_header.contains("answers over the owl2-rl closure"),
         "FROM NAMED :g2 header: {from_named_header}"
     );
@@ -835,7 +862,7 @@ async fn from_dataset_omitting_default_graph_explains_omitted_inferences() -> Te
     let proto_header = proto_from.completeness.as_deref().unwrap_or("");
     assert!(
         proto_header.starts_with("sound-only; regime=owl2-rl;")
-            && proto_header.contains(expected_omitted)
+            && proto_header.contains(expected_materialised)
             && !proto_header.contains("answers over the owl2-rl closure"),
         "protocol default-graph-uri header: {proto_header}"
     );
@@ -856,12 +883,14 @@ async fn from_dataset_omitting_default_graph_explains_omitted_inferences() -> Te
     assert!(
         with_default_header.starts_with("sound-only; regime=owl2-rl;")
             && with_default_header.contains("answers over the owl2-rl closure")
-            && !with_default_header.contains(expected_omitted),
+            && !with_default_header.contains(expected_materialised),
         "FROM :g2 + default graph header: {with_default_header}"
     );
 
-    // Under owl2-dl without the DL bounds (FROM :g2 FROM onto:implicit): sound-only under
-    // owl2-dl with the dataset-omission reason rather than the rules' closure wording.
+    // Under owl2-dl: both ordinary materialised FROM :g2 (DL bounds route) and inferred-only
+    // FROM :g2 FROM onto:implicit (status_without_dl route) explain the omitted default graph
+    // accurately for their read model; including the default graph keeps the generic dataset
+    // reason on the DL route.
     let dl_app = test_app_with_store_config(
         StoreConfig::default(),
         Default::default(),
@@ -873,23 +902,58 @@ async fn from_dataset_omitting_default_graph_explains_omitted_inferences() -> Te
          GRAPH :g2 { ex:tom a ex:Cat }",
     )
     .await?;
-    let dl_from_g2 = select(
+    let dl_materialised_from_g2 = select(&dl_app, &[], "", "?x", "FROM :g2", pattern).await?;
+    assert_eq!(dl_materialised_from_g2.code, StatusCode::OK);
+    assert!(dl_materialised_from_g2.rows().unwrap().is_empty());
+    let dl_mat_header = dl_materialised_from_g2
+        .completeness
+        .as_deref()
+        .unwrap_or("");
+    assert!(
+        dl_mat_header.starts_with("sound-only; regime=owl2-dl;")
+            && dl_mat_header.contains(expected_materialised)
+            && !dl_mat_header.contains("the query names its dataset")
+            && !dl_mat_header.contains("answers over the RL closure"),
+        "owl2-dl materialised FROM :g2 header: {dl_mat_header}"
+    );
+
+    let dl_with_default = select(
+        &dl_app,
+        &[],
+        "",
+        "?x",
+        "FROM :g2 FROM <urn:x-arq:DefaultGraph>",
+        pattern,
+    )
+    .await?;
+    assert_eq!(dl_with_default.code, StatusCode::OK);
+    assert_eq!(dl_with_default.rows().unwrap().len(), 1);
+    let dl_default_header = dl_with_default.completeness.as_deref().unwrap_or("");
+    assert!(
+        dl_default_header.starts_with("sound-only; regime=owl2-dl;")
+            && dl_default_header.contains("the query names its dataset")
+            && !dl_default_header.contains(expected_materialised),
+        "owl2-dl FROM :g2 + default graph header: {dl_default_header}"
+    );
+
+    let dl_inferred_from_g2 = select(
         &dl_app,
         &[],
         "",
         "?x",
         "FROM :g2 FROM onto:implicit",
-        pattern,
+        "{ ?x a ex:Cat }",
     )
     .await?;
-    assert_eq!(dl_from_g2.code, StatusCode::OK);
-    assert!(dl_from_g2.rows().unwrap().is_empty());
-    let dl_header = dl_from_g2.completeness.as_deref().unwrap_or("");
+    assert_eq!(dl_inferred_from_g2.code, StatusCode::OK);
+    assert!(dl_inferred_from_g2.rows().unwrap().is_empty());
+    let dl_inf_header = dl_inferred_from_g2.completeness.as_deref().unwrap_or("");
     assert!(
-        dl_header.starts_with("sound-only; regime=owl2-dl;")
-            && dl_header.contains(expected_omitted)
-            && !dl_header.contains("a read of the rules' closure alone"),
-        "owl2-dl FROM :g2 header: {dl_header}"
+        dl_inf_header.starts_with("sound-only; regime=owl2-dl;")
+            && dl_inf_header.contains(expected_inferred)
+            && !dl_inf_header.contains("asserted statements")
+            && !dl_inf_header.contains("a read of the rules' closure alone"),
+        "owl2-dl inferred FROM :g2 header: {dl_inf_header}"
     );
     Ok(())
 }
