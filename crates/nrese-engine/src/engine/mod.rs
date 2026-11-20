@@ -1,4 +1,4 @@
-//! The engine façade (E3/E4): MVCC snapshots, a single writer slot, durability, and
+//! The engine faÃ§ade (E3/E4): MVCC snapshots, a single writer slot, durability, and
 //! background maintenance.
 //!
 //! Concurrency model:
@@ -740,6 +740,8 @@ impl Shared {
     /// is to be done again because it couldn't be done now (on a pool thread nothing waits
     /// for a running merge or checkpoint); the requests stay set for it.
     fn maintain(&self) -> Again {
+        #[cfg(test)]
+        maintenance_tests::on_maintain();
         let mut again = Again::default();
         if self.wants_compaction.swap(false, Ordering::AcqRel)
             && self.versions.compact(false) == CompactionOutcome::Deferred
@@ -1358,5 +1360,114 @@ impl Engine {
                 .load(Ordering::Relaxed),
             checkpoints: self.inner.shared.checkpoints.load(Ordering::Relaxed),
         }
+    }
+}
+
+#[cfg(test)]
+mod maintenance_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    use super::*;
+    use nrese_rdf::{GraphNameRef, Literal, NamedNodeRef, QuadRef};
+
+    type MaintainHook = Box<dyn FnMut() + Send>;
+
+    static ON_MAINTAIN: Mutex<Option<MaintainHook>> = Mutex::new(None);
+    static SERIAL: Mutex<()> = Mutex::new(());
+
+    pub(super) fn on_maintain() {
+        let mut guard = ON_MAINTAIN.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hook) = guard.as_mut() {
+            hook();
+        }
+    }
+
+    fn commit_one(engine: &Engine, n: i64) {
+        let mut tx = engine.transaction();
+        tx.insert(QuadRef::new(
+            NamedNodeRef::new_unchecked("http://example.com/s"),
+            NamedNodeRef::new_unchecked("http://example.com/p"),
+            Literal::from(n).as_ref(),
+            GraphNameRef::DefaultGraph,
+        ));
+        tx.commit().unwrap();
+    }
+
+    /// A panic inside a background maintenance task must clear `maintaining`, let
+    /// `Engine::settle` return promptly, keep the maintenance worker alive so subsequent
+    /// commits still run maintenance, and let `Engine::drop` finish cleanly.
+    #[test]
+    fn maintenance_worker_recovers_from_panic_and_settle_does_not_hang() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_hook = Arc::clone(&calls);
+        *ON_MAINTAIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
+            let n = calls_hook.fetch_add(1, Ordering::SeqCst);
+            if n == 0 {
+                panic!("injected maintenance panic");
+            }
+        }));
+        struct ClearHook;
+        impl Drop for ClearHook {
+            fn drop(&mut self) {
+                *ON_MAINTAIN.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            }
+        }
+        let _clear = ClearHook;
+
+        let engine = Arc::new(
+            Engine::new(EngineConfig {
+                background_maintenance: true,
+                compaction: CompactionPolicy {
+                    fanout: 2,
+                    inline_entry_limit: 0,
+                },
+                ..EngineConfig::default()
+            })
+            .unwrap(),
+        );
+        // Trigger a background maintenance wakeup that panics on the first call.
+        commit_one(&engine, 1);
+        commit_one(&engine, 2);
+
+        let started = Instant::now();
+        while calls.load(Ordering::SeqCst) < 1 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "maintenance never ran"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        // `settle` must return promptly (not spin forever on a stuck `maintaining` flag).
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let settler = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                engine.settle();
+                let _ = done_tx.send(());
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "Engine::settle hung after maintenance panic"
+        );
+        settler.join().unwrap();
+
+        // A later commit must still wake and run on the surviving maintenance worker.
+        let before = calls.load(Ordering::SeqCst);
+        commit_one(&engine, 3);
+        commit_one(&engine, 4);
+        let started = Instant::now();
+        while calls.load(Ordering::SeqCst) <= before {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "maintenance worker died permanently after panic"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        engine.settle();
     }
 }
