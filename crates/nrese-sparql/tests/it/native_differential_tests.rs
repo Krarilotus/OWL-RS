@@ -4885,7 +4885,10 @@ fn numeric_values_keep_their_sparql_semantics() {
         ),
         ("9223372036854775807 1", None, None),
         ("1 UNDEF", None, None),
+        ("UNDEF", None, Some(("0", xsd::INTEGER))),
+        ("UNDEF UNDEF", None, Some(("0", xsd::INTEGER))),
         ("1 \"text\"", None, None),
+        ("\"text\" \"other\"", None, None),
         (
             "\"P1M\"^^xsd:yearMonthDuration \"P3M\"^^xsd:yearMonthDuration",
             Some(("P4M", xsd::YEAR_MONTH_DURATION)),
@@ -4908,6 +4911,168 @@ fn numeric_values_keep_their_sparql_semantics() {
                 expected,
             );
         }
+    }
+}
+
+/// SPARQL 1.1 §18.5.1.4: AVG(M) = "0"^^xsd:integer whenever Count(M) = 0, including when
+/// every row in the group evaluates the argument to an error (unbound variable, division
+/// by zero, type error). Mixed value + error and bound non-numeric literals stay unbound,
+/// and every aggregation route (id fast path, one-pass, numeric pass, general, streamed,
+/// eager aggregation, and reference) agrees.
+#[test]
+fn avg_over_all_error_arguments_returns_zero_integer() {
+    let engine = Engine::new(EngineConfig::default()).unwrap();
+    let ex = |name: &str| NamedNode::new_unchecked(format!("{EX}{name}"));
+    {
+        let mut tx = engine.transaction();
+        for (s, g, v) in [("s1", "g1", 1_i64), ("s2", "g1", 2), ("s3", "g2", 3)] {
+            tx.insert(Quad::new(ex(s), ex("group"), ex(g), GraphName::DefaultGraph).as_ref());
+            tx.insert(
+                Quad::new(ex(s), ex("val"), Literal::from(v), GraphName::DefaultGraph).as_ref(),
+            );
+            tx.insert(
+                Quad::new(
+                    ex(s),
+                    ex("label"),
+                    Literal::new_simple_literal(s),
+                    GraphName::DefaultGraph,
+                )
+                .as_ref(),
+            );
+        }
+        tx.commit().unwrap();
+    }
+    let snapshot = engine.snapshot();
+    let zero = Some(Term::from(Literal::new_typed_literal("0", xsd::INTEGER)));
+    let one_point_five = Some(Term::from(Literal::new_typed_literal("1.5", xsd::DECIMAL)));
+
+    let eval_with = |text: &str, options: &QueryOptions| -> Vec<Option<Term>> {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        let QueryResults::Solutions(solutions) =
+            evaluate_query(&snapshot, &query, options).unwrap()
+        else {
+            panic!("expected solutions: {text}");
+        };
+        let mut out: Vec<Option<Term>> = solutions
+            .map(|row| row.unwrap().get("a").cloned())
+            .collect();
+        out.sort_by_key(|term| term.as_ref().map(ToString::to_string));
+        out
+    };
+
+    let check = |text: &str, expected: &[Option<Term>]| {
+        let query = SparqlParser::new().parse_query(text).unwrap();
+        let native = eval_with(text, &QueryOptions::default());
+        assert_eq!(native, expected, "native: {text}");
+        let reference =
+            nrese_sparql_reference::evaluate_query(&snapshot, &query, &QueryOptions::default())
+                .unwrap();
+        let QueryResults::Solutions(solutions) = reference else {
+            panic!("expected reference solutions: {text}");
+        };
+        let mut ref_out: Vec<Option<Term>> = solutions
+            .map(|row| row.unwrap().get("a").cloned())
+            .collect();
+        ref_out.sort_by_key(|term| term.as_ref().map(ToString::to_string));
+        assert_eq!(ref_out, expected, "reference: {text}");
+    };
+
+    // Unbound variable (aggregate_ids / one-pass), DISTINCT, grouped, expression errors
+    // (numeric_total / numeric_pass / general), and multi-variable expression error.
+    for text in [
+        "SELECT (AVG(?u) AS ?a) WHERE { VALUES ?x { 1 2 } }",
+        "SELECT (AVG(DISTINCT ?u) AS ?a) WHERE { VALUES ?x { 1 2 } }",
+        "SELECT (AVG(?x / 0) AS ?a) WHERE { VALUES ?x { 1 2 } }",
+        "SELECT (AVG(DISTINCT (?x / 0)) AS ?a) WHERE { VALUES ?x { 1 2 } }",
+        r#"SELECT (AVG(?x * 1) AS ?a) WHERE { VALUES ?x { "a" "b" } }"#,
+        "SELECT (AVG(?x / ?y) AS ?a) WHERE { VALUES (?x ?y) { (1 0) (2 0) } }",
+        "SELECT (AVG(?v) AS ?a) WHERE { VALUES ?v { } }",
+    ] {
+        check(text, std::slice::from_ref(&zero));
+    }
+
+    // Grouped unbound & grouped division-by-zero across multiple groups.
+    check(
+        "SELECT ?g (AVG(?u) AS ?a) WHERE { VALUES (?g ?x) { (1 1) (1 2) (2 3) } } GROUP BY ?g",
+        &[zero.clone(), zero.clone()],
+    );
+    check(
+        "SELECT ?g (AVG(?x / 0) AS ?a) WHERE { VALUES (?g ?x) { (1 1) (1 2) (2 3) } } GROUP BY ?g",
+        &[zero.clone(), zero.clone()],
+    );
+
+    // Controls: mixed value + error, non-numeric literals, SUM of all-error stay unbound;
+    // normal numbers keep their decimal average.
+    for text in [
+        "SELECT (AVG(?x) AS ?a) WHERE { VALUES ?x { 1 UNDEF } }",
+        "SELECT (AVG(1 / ?x) AS ?a) WHERE { VALUES ?x { 1 0 } }",
+        r#"SELECT (AVG(?x) AS ?a) WHERE { VALUES ?x { "a" "b" } }"#,
+        "SELECT (SUM(?u) AS ?a) WHERE { VALUES ?x { 1 2 } }",
+        "SELECT (SUM(?x / 0) AS ?a) WHERE { VALUES ?x { 1 2 } }",
+    ] {
+        check(text, &[None]);
+    }
+    check(
+        "SELECT (AVG(?x) AS ?a) WHERE { VALUES ?x { 1 2 } }",
+        std::slice::from_ref(&one_point_five),
+    );
+
+    // Streamed GROUP BY path (morsels of 1 row) over a multi-pattern BGP.
+    let streamed = QueryOptions {
+        stream_rows: Some(1),
+        ..QueryOptions::default()
+    };
+    for (text, expected) in [
+        (
+            format!(
+                "SELECT ?g (AVG(?u) AS ?a) WHERE {{ ?s <{EX}group> ?g . ?s <{EX}val> ?v }} GROUP BY ?g"
+            ),
+            vec![zero.clone(), zero.clone()],
+        ),
+        (
+            format!(
+                "SELECT ?g (AVG(?v / 0) AS ?a) WHERE {{ ?s <{EX}group> ?g . ?s <{EX}val> ?v }} GROUP BY ?g"
+            ),
+            vec![zero.clone(), zero.clone()],
+        ),
+        (
+            format!(
+                "SELECT ?g (AVG(?l) AS ?a) WHERE {{ ?s <{EX}group> ?g . ?s <{EX}label> ?l }} GROUP BY ?g"
+            ),
+            vec![None, None],
+        ),
+    ] {
+        assert_eq!(eval_with(&text, &streamed), expected, "streamed: {text}");
+    }
+
+    // Eager aggregation rewrite over a join where every row errors.
+    for expr in ["?u", "?v / 0"] {
+        let text = format!(
+            "SELECT ?g (AVG({expr}) AS ?a) WHERE {{ ?s <{EX}group> ?g . ?s <{EX}val> ?v }} GROUP BY ?g"
+        );
+        let parsed = SparqlParser::new().parse_query(&text).unwrap();
+        let nrese_sparql_syntax::Query::Select {
+            dataset,
+            pattern,
+            base_iri,
+        } = parsed
+        else {
+            panic!("expected SELECT");
+        };
+        let rewritten = nrese_sparql_syntax::Query::Select {
+            dataset,
+            pattern: nrese_sparql::plan::eager_aggregation(&pattern),
+            base_iri,
+        };
+        let QueryResults::Solutions(solutions) =
+            evaluate_query(&snapshot, &rewritten, &QueryOptions::default()).unwrap()
+        else {
+            panic!("expected solutions");
+        };
+        let out: Vec<Option<Term>> = solutions
+            .map(|row| row.unwrap().get("a").cloned())
+            .collect();
+        assert_eq!(out, vec![zero.clone(), zero.clone()], "eager: {text}");
     }
 }
 
