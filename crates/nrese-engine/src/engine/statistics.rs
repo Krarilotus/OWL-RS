@@ -1255,4 +1255,65 @@ mod tests {
         assert!(Arc::ptr_eq(&planned, &built));
         assert_eq!(statistics.scans(), 1);
     }
+
+    /// A panic inside the background characteristic-sets rebuild thread must clear the
+    /// rebuilding claim on unwind so a later drifted read can trigger a fresh rebuild
+    /// instead of leaving the model permanently stuck on stale sets.
+    #[test]
+    fn a_panicking_rebuild_clears_rebuilding_so_later_reads_retry() {
+        let model = ReadModel::default();
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        add(&engine, 0..300);
+        let statistics = Arc::clone(&engine.inner.shared.statistics);
+        let first = engine
+            .snapshot()
+            .characteristic_sets_in(model)
+            .expect("initial sets");
+        assert_eq!(statistics.scans(), 1);
+
+        // Drift beyond 25% and inject a panic inside the background rebuild thread.
+        add(&engine, 300..900);
+        let snapshot = engine.snapshot();
+        *statistics.hook.lock() = Some(Box::new(|_| panic!("injected rebuild panic")));
+        let stale = snapshot
+            .characteristic_sets_in(model)
+            .expect("drifted read returns old sets while rebuild runs");
+        assert!(Arc::ptr_eq(&stale, &first));
+
+        // Wait for the panicking rebuild to enter scan_sets and unwind its BuildCell claim.
+        let started = std::time::Instant::now();
+        while statistics.scans() < 2 || !statistics.building.is_idle() {
+            assert!(
+                started.elapsed().as_secs() < 15,
+                "injected panic rebuild never ran or left BuildCell busy"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+
+        // Wait briefly for the panicking thread's unwind drop guards to run, then trigger
+        // another drifted read: a fresh rebuild must start and replace the sets.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::time::Instant::now() < deadline {
+            let _ = snapshot.characteristic_sets_in(model);
+            if statistics
+                .sets
+                .lock()
+                .get(&model)
+                .is_some_and(|s| s.at >= 900)
+            {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(
+            statistics.scans() >= 3,
+            "rebuilding stayed stuck after panic (scans={})",
+            statistics.scans()
+        );
+        let rebuilt = snapshot
+            .characteristic_sets_in(model)
+            .expect("rebuilt after retry");
+        assert!(!Arc::ptr_eq(&rebuilt, &first));
+        assert_eq!(rebuilt.subjects(), 900);
+    }
 }
