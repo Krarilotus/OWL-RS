@@ -136,18 +136,21 @@ impl Plan {
     /// - `MIN` and `MAX` (with or without `DISTINCT`, which changes no extreme): the
     ///   extreme of the partial extremes. `ORDER BY`'s order is total over distinct terms
     ///   (`value::order`), so the extreme is the same term either way.
-    /// - `AVG`: a `SUM` and a `COUNT(*)` per partial group, summed by the group and divided
-    ///   after it. SPARQL's division is `AVG`'s own: integers and decimals give a decimal,
-    ///   a float or double total its type, a duration total a duration of its type. An
-    ///   error, an unbound value or mixed kinds (numbers and durations) make the partial
-    ///   sum unbound, and with it the sum of the partial sums and the quotient, as one
-    ///   error makes `AVG` unbound. A group is never empty (it has a key), so the count is
-    ///   at least one.
+    /// - `AVG`: a `SUM` and a `COUNT(expr)` per partial group, summed by the group and
+    ///   divided after it (`0` when the total count of non-error values is zero, per SPARQL
+    ///   1.1 §18.5.1.4). SPARQL's division is `AVG`'s own: integers and decimals give a
+    ///   decimal, a float or double total its type, a duration total a duration of its type.
+    ///   An error in a group that also has a bound value, or mixed kinds (numbers and
+    ///   durations), makes the partial sum unbound while keeping the count positive, so the
+    ///   quotient stays unbound. When every argument in the group errors, the count is zero
+    ///   and the quotient yields `"0"^^xsd:integer`.
     ///
-    /// Not with `DISTINCT` for the others, not over expressions with `EXISTS` or values
-    /// drawn per row (`RAND`, `BNODE`: the partial rows would draw fewer), and only where
-    /// `A` and `B` share a variable (with none, an empty `B` would still leave one partial
-    /// row). Other aggregates (`SAMPLE`, `GROUP_CONCAT`) leave the group as it is.
+    /// Not with `DISTINCT` for the others, not over expressions that read variables shared
+    /// with `A` (which could be unbound in `B` and bound by the join), not over expressions
+    /// with `EXISTS` or values drawn per row (`RAND`, `BNODE`: the partial rows would draw
+    /// fewer), and only where `A` and `B` share a variable (with none, an empty `B` would
+    /// still leave one partial row). Other aggregates (`SAMPLE`, `GROUP_CONCAT`) leave the
+    /// group as it is.
     pub fn eager_aggregation(self) -> Self {
         self.eager_aggregation_where(&|_, _| true)
     }
@@ -250,11 +253,12 @@ fn pre_aggregated(
     }
     let a_vars: Vec<Variable> = with_keys.iter().flat_map(|p| p.variables()).collect();
     let b_vars: Vec<Variable> = without.iter().flat_map(|p| p.variables()).collect();
-    // The aggregates read only B's variables.
+    // The aggregates read only B's own variables, never variables of A (a variable shared
+    // with A could be unbound in B and receive a binding from the join after pre-aggregation).
     let mut reads_a = false;
     for (_, aggregate) in aggregates {
         if let AggregateExpression::FunctionCall { expr, .. } = aggregate {
-            expr.on_used_variable(&mut |v| reads_a |= !b_vars.contains(v));
+            expr.on_used_variable(&mut |v| reads_a |= !b_vars.contains(v) || a_vars.contains(v));
         }
     }
     if reads_a {
@@ -333,7 +337,11 @@ fn pre_aggregated(
                 ));
                 partials.push((
                     partial_count.clone(),
-                    AggregateExpression::CountSolutions { distinct: false },
+                    AggregateExpression::FunctionCall {
+                        name: AggregateFunction::Count,
+                        expr: expr.clone(),
+                        distinct: false,
+                    },
                 ));
                 let (total, count) = (fresh(), fresh());
                 finals.push((total.clone(), over(AggregateFunction::Sum, &partial)));
@@ -366,9 +374,17 @@ fn pre_aggregated(
         bindings: quotients
             .into_iter()
             .map(|(variable, total, count)| {
-                let quotient = Expression::Divide(
-                    Box::new(Expression::Variable(total)),
-                    Box::new(Expression::Variable(count)),
+                let zero = Expression::Literal(nrese_rdf::Literal::from(0i64));
+                let quotient = Expression::If(
+                    Box::new(Expression::Equal(
+                        Box::new(Expression::Variable(count.clone())),
+                        Box::new(zero.clone()),
+                    )),
+                    Box::new(zero),
+                    Box::new(Expression::Divide(
+                        Box::new(Expression::Variable(total)),
+                        Box::new(Expression::Variable(count)),
+                    )),
                 );
                 (variable, quotient)
             })

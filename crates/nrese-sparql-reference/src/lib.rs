@@ -994,6 +994,11 @@ impl<'d> Context<'d> {
                 for (i, m) in members.iter().enumerate() {
                     values.push(self.value(expr, m, graph, outer, i as u64)?);
                 }
+                // SPARQL 1.1 §18.5.1.4: Avg(M) = "0"^^xsd:integer whenever Count(M) = 0,
+                // including when every row evaluated to an error.
+                if *name == AggregateFunction::Avg && values.iter().all(Option::is_none) {
+                    return Ok(integer(0));
+                }
                 // COUNT skips errors and SAMPLE takes the first value; one error makes the
                 // others unbound (the executor's choice, as §18.5.1 leaves errors open).
                 let tolerant = matches!(name, AggregateFunction::Count | AggregateFunction::Sample);

@@ -6714,9 +6714,9 @@ impl<'a> Context<'a> {
                         }
                         Plan::Total { column, .. } => {
                             let id = table.get(row, *column);
-                            state.count += 1;
                             match known[a].and_then(|known| known.get(&id)) {
                                 Some(Number::Value(number)) => {
+                                    state.count += 1;
                                     state.total = state.total.and_then(|total| total.add(*number));
                                 }
                                 Some(Number::Error) => state.error = true,
