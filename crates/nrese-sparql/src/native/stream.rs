@@ -5,10 +5,14 @@
 //! and the groups, not the join.
 //!
 //! The aggregates must merge: `COUNT` (partial counts summed), `SUM`, `MIN`, `MAX`,
-//! `SAMPLE`, and `AVG` as a sum and a count divided at the end; not `DISTINCT` ones nor
-//! `GROUP_CONCAT`. An error in a group's values leaves its partial unbound, and an unbound
-//! partial makes the merged `SUM`, `AVG`, `MIN` and `MAX` unbound as the sequential
-//! evaluation does. Floating-point sums may round differently: SPARQL fixes no order.
+//! `SAMPLE`, and `AVG` as a `SUM(expr)` and `COUNT(expr)` divided at the end (returning
+//! `"0"^^xsd:integer` when the count of non-error values is zero, per SPARQL 1.1 §18.5.1.4);
+//! not `DISTINCT` ones, not `GROUP_CONCAT`, and not `AVG` over an argument that draws
+//! (`RAND`, `UUID`, `STRUUID`, `BNODE`, in an `EXISTS` too), which splitting into sum and
+//! count would evaluate twice. An error in a group with at least one bound value leaves its
+//! partial sum unbound while keeping the count positive, so the merged `SUM`, `AVG`, `MIN`
+//! and `MAX` stay unbound as the sequential evaluation does. Floating-point sums may round
+//! differently: SPARQL fixes no order.
 //!
 //! It runs when the direct evaluation of the group runs out of memory (the attempt's
 //! memory released first), or always with [`crate::QueryOptions::stream_rows`] (tests).
