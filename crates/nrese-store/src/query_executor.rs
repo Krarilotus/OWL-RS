@@ -317,38 +317,64 @@ impl PreparedQuery {
         self.dataset.is_some() || self.query.dataset().is_some()
     }
 
-    /// Whether the query names a dataset that leaves out the store's default graph (where
-    /// inferred statements live): plain `FROM <g>`, `FROM NAMED <g>`, or protocol dataset
-    /// parameters without the default graph. Scoped inference (`inference-scope=dataset`)
-    /// includes its scoped inferred layer, so returns `false`.
+    /// Whether the query's effective dataset (protocol parameters taking precedence over
+    /// query `FROM` / `FROM NAMED`, matching `nrese_sparql::dataset::ResolvedDataset::resolve`)
+    /// leaves out the store's default graph (where inferred statements live). Scoped
+    /// inference (`inference-scope=dataset`) builds its own inferred layer, so returns `false`.
     pub(crate) fn omits_default_graph(&self) -> bool {
         if self.inference_scope.is_some() {
             return false;
         }
+        let effective = self
+            .dataset
+            .as_ref()
+            .cloned()
+            .or_else(|| self.query.dataset().cloned().map(Into::into))
+            .filter(|dataset| !dataset.is_default_dataset());
+        let Some(dataset) = effective else {
+            return false;
+        };
         let is_default = |graph: &GraphName| match graph {
             GraphName::DefaultGraph => true,
             GraphName::NamedNode(node) => nrese_sparql::compat::names_default_graph(node.as_str()),
             GraphName::BlankNode(_) => false,
         };
-        if let Some(dataset) = self
-            .dataset
-            .as_ref()
-            .filter(|dataset| !dataset.is_default_dataset())
-        {
-            return match dataset.default_graph_graphs() {
-                Some(graphs) => !graphs.iter().any(is_default),
-                None => dataset
-                    .excluded_default_graphs()
-                    .is_some_and(|excluded| excluded.iter().any(is_default)),
-            };
+        match dataset.default_graph_graphs() {
+            Some(graphs) => !graphs.iter().any(is_default),
+            None => dataset
+                .excluded_default_graphs()
+                .is_some_and(|excluded| excluded.iter().any(is_default)),
         }
-        if let Some(dataset) = self.query.dataset() {
-            return !dataset
-                .default
-                .iter()
-                .any(|node| nrese_sparql::compat::names_default_graph(node.as_str()));
+    }
+
+    /// Explanation when the query's dataset omits the store's default graph from its default
+    /// graph, tailored to the read model so compatibility `GRAPH` aliases and inferred-only
+    /// reads are never misdescribed as asserted-only answers.
+    pub(crate) fn dataset_omission_reason(&self) -> Option<&'static str> {
+        if !self.omits_default_graph() {
+            return None;
         }
-        false
+        match self.read_model() {
+            ReadModel::Asserted => None,
+            ReadModel::Materialised => Some(
+                "this read's dataset leaves out the store's default graph from its default \
+                 graph, where inferred statements are stored; default-graph patterns see only \
+                 the selected graphs' asserted statements",
+            ),
+            ReadModel::Inferred => Some(
+                "this read's dataset leaves out the store's default graph from its default \
+                 graph, where inferred statements are stored; default-graph patterns read no \
+                 inferred statements",
+            ),
+        }
+    }
+
+    /// Explanation under `owl2-dl` when the query names an explicit dataset (`has_dataset`).
+    pub(crate) fn dl_dataset_reason(&self) -> &'static str {
+        self.dataset_omission_reason().unwrap_or(
+            "the query names its dataset: answers are over those graphs, not checked against \
+             the bounds",
+        )
     }
 
     /// Under `owl2-dl`: which answers the query asks for (`None`: the store's setting).

@@ -309,9 +309,21 @@ pub(crate) fn plan_status(
     let decided = decided(store, snapshot, prepared, cancellation)?;
     let completeness = match decided.as_ref() {
         Ok(at) => plan_status_built(store, prepared, &analysis, at).completeness,
-        Err(why) => Status::sound_only(*why).completeness,
+        Err(why) => Status::sound_only(fallback_reason(prepared, why)).completeness,
     };
     Ok(composed(store, prepared, snapshot, &decided, completeness))
+}
+
+/// Reason when the DL bounds view isn't used (`PART`, `LATER`, `DEADLINE`): a whole-dataset
+/// reader whose query dataset leaves out the store's default graph is not reading the RL
+/// closure, so the dataset-omission explanation replaces `LATER` / `DEADLINE`.
+fn fallback_reason(prepared: &PreparedQuery, why: &'static str) -> &'static str {
+    if prepared.access().is_none()
+        && let Some(reason) = prepared.dataset_omission_reason()
+    {
+        return reason;
+    }
+    why
 }
 
 /// The bounds' view of `snapshot` its answers and their status are decided on, or
@@ -950,9 +962,7 @@ fn plan_status_built(
     (snapshot, view): &(Snapshot, Arc<View>),
 ) -> Status {
     if prepared.has_dataset() {
-        return Status::sound_only(
-            "the query reads part of the data: not checked against the bounds",
-        );
+        return Status::sound_only(prepared.dl_dataset_reason());
     }
     // What the run adds whatever path decides ([`decide_answers`]); a consistency the run
     // would check is not known yet.
@@ -1019,7 +1029,9 @@ pub(crate) fn answer(
     let read = (cancellation, deadline_of(store, prepared));
     let mut outcome = match decided.as_ref() {
         Ok(at) => decide_answers(store, prepared, &analysis, at, read, memory, mode)?,
-        Err(why) => Status::sound_only(*why).stream(Read::At(snapshot.clone())),
+        Err(why) => {
+            Status::sound_only(fallback_reason(prepared, why)).stream(Read::At(snapshot.clone()))
+        }
     };
     #[cfg(test)]
     crate::service::hooks::run(&crate::service::hooks::AFTER_DECIDED);
@@ -1100,11 +1112,9 @@ fn decide_answers(
     let settings = store.query_settings();
     if prepared.has_dataset() {
         // Over the decided snapshot, every graph's for this reader: the status's.
-        return Ok(Status::sound_only(
-            "the query names its dataset: answers are over those graphs, not checked \
-             against the bounds",
-        )
-        .stream(Read::At(snapshot.clone())));
+        return Ok(
+            Status::sound_only(prepared.dl_dataset_reason()).stream(Read::At(snapshot.clone()))
+        );
     }
     let mut status = Status::complete();
     // A version no certificate vouches for is told `not-certified` whatever its consistency
