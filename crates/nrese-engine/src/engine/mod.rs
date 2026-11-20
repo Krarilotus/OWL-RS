@@ -1,4 +1,4 @@
-//! The engine faÃ§ade (E3/E4): MVCC snapshots, a single writer slot, durability, and
+//! The engine façade (E3/E4): MVCC snapshots, a single writer slot, durability, and
 //! background maintenance.
 //!
 //! Concurrency model:
@@ -570,6 +570,8 @@ struct Shared {
     wants_checkpoint: AtomicBool,
     /// The background worker is running requested maintenance ([`Engine::settle`]).
     maintaining: AtomicBool,
+    /// The background worker thread is still alive and taking requests ([`Engine::settle`]).
+    worker_alive: AtomicBool,
     /// Checkpoints written.
     checkpoints: AtomicU64,
     /// What the canonical views versions keep are charged to
@@ -740,16 +742,16 @@ impl Shared {
     /// is to be done again because it couldn't be done now (on a pool thread nothing waits
     /// for a running merge or checkpoint); the requests stay set for it.
     fn maintain(&self) -> Again {
+        let do_compaction = self.wants_compaction.swap(false, Ordering::AcqRel);
+        let do_checkpoint = self.wants_checkpoint.swap(false, Ordering::AcqRel);
         #[cfg(test)]
         maintenance_tests::on_maintain();
         let mut again = Again::default();
-        if self.wants_compaction.swap(false, Ordering::AcqRel)
-            && self.versions.compact(false) == CompactionOutcome::Deferred
-        {
+        if do_compaction && self.versions.compact(false) == CompactionOutcome::Deferred {
             self.wants_compaction.store(true, Ordering::Release);
             again.merge = true;
         }
-        if self.wants_checkpoint.swap(false, Ordering::AcqRel) {
+        if do_checkpoint {
             match self.checkpoint() {
                 Ok(_) => {}
                 // Another checkpoint is being written; it may be of an older revision than
@@ -824,6 +826,48 @@ struct Worker {
     life: Arc<Lifecycle>,
 }
 
+/// Clears `maintaining` on drop regardless of how `Worker::task` exits.
+struct Maintaining<'a>(&'a AtomicBool);
+
+impl Drop for Maintaining<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Clears `worker_alive` when the maintenance thread exits so `Engine::settle` never spins
+/// on a dead worker.
+struct WorkerAlive(Arc<Shared>);
+
+impl Drop for WorkerAlive {
+    fn drop(&mut self) {
+        self.0.worker_alive.store(false, Ordering::SeqCst);
+    }
+}
+
+fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("non-string panic payload")
+}
+
+/// Runs `shared.maintain()` catching panics so a single maintenance failure is logged
+/// without killing the background worker thread or wedging `Engine::settle`.
+fn run_maintain_caught(shared: &Shared) -> Again {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shared.maintain())) {
+        Ok(again) => again,
+        Err(panic) => {
+            tracing::error!(
+                panic = %panic_message(&*panic),
+                "background maintenance task panicked; worker stays alive"
+            );
+            Again::default()
+        }
+    }
+}
+
 impl Worker {
     fn spawn(shared: Arc<Shared>) -> std::io::Result<Self> {
         let (wake, wakeups) = mpsc::sync_channel::<()>(1);
@@ -831,11 +875,14 @@ impl Worker {
             state: Mutex::new((Task::None, None)),
             changed: Condvar::new(),
         });
+        shared.worker_alive.store(true, Ordering::SeqCst);
         let thread = {
             let life = Arc::clone(&life);
+            let alive = WorkerAlive(Arc::clone(&shared));
             std::thread::Builder::new()
                 .name("nrese-maintenance".to_owned())
                 .spawn(move || {
+                    let _alive = alive;
                     while wakeups.recv().is_ok() {
                         loop {
                             let again = Self::task(&shared, &life);
@@ -874,12 +921,12 @@ impl Worker {
                 }
             }
         };
-        // Before the requests are taken, so that one is always visible ([`Engine::settle`]).
+        // Before the requests are taken, so that one is always visible ([`Engine::settle`]),
+        // and cleared by a drop guard on every exit path.
         shared.maintaining.store(true, Ordering::SeqCst);
+        let _maintaining = Maintaining(&shared.maintaining);
         if here {
-            let again = shared.maintain();
-            shared.maintaining.store(false, Ordering::SeqCst);
-            return again;
+            return run_maintain_caught(shared);
         }
         {
             // Weak: a job taken back by a drop stays queued until the pool runs it, and must
@@ -893,8 +940,8 @@ impl Worker {
                     }
                     state.0 = Task::Running;
                 }
-                // Caught here: a panic in a Rayon job would abort the process. It is resumed
-                // on the worker's thread, which ends with it.
+                // Caught here: a panic in a Rayon job would abort the process. Returned to
+                // the worker thread so it logs and keeps serving future maintenance.
                 let ended = match shared.upgrade() {
                     Some(shared) => {
                         let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -917,15 +964,19 @@ impl Worker {
             }
             std::mem::replace(&mut state.0, Task::None)
         };
-        let again = match task {
+        match task {
             Task::Ended(Ok(again)) => again,
-            Task::Ended(Err(panic)) => std::panic::resume_unwind(panic),
+            Task::Ended(Err(panic)) => {
+                tracing::error!(
+                    panic = %panic_message(&*panic),
+                    "background maintenance task panicked; worker stays alive"
+                );
+                Again::default()
+            }
             // The pool may have no thread free to start it (base ran it on this thread).
-            Task::Reclaimed => shared.maintain(),
-            _ => Again::default(),
-        };
-        shared.maintaining.store(false, Ordering::SeqCst);
-        again
+            Task::Reclaimed => run_maintain_caught(shared),
+            Task::Abandoned | Task::None | Task::Queued | Task::Running => Again::default(),
+        }
     }
 
     fn wake(&self) {
@@ -1079,6 +1130,7 @@ impl Engine {
             wants_compaction: AtomicBool::new(false),
             wants_checkpoint: AtomicBool::new(false),
             maintaining: AtomicBool::new(false),
+            worker_alive: AtomicBool::new(false),
             checkpoints: AtomicU64::new(0),
             views: RwLock::new(Arc::new(nrese_exec::Budget::unlimited())),
             admission: config.admission,
@@ -1281,9 +1333,10 @@ impl Engine {
             return;
         }
         let shared = &self.inner.shared;
-        while shared.wants_compaction.load(Ordering::SeqCst)
-            || shared.wants_checkpoint.load(Ordering::SeqCst)
-            || shared.maintaining.load(Ordering::SeqCst)
+        while shared.worker_alive.load(Ordering::SeqCst)
+            && (shared.wants_compaction.load(Ordering::SeqCst)
+                || shared.wants_checkpoint.load(Ordering::SeqCst)
+                || shared.maintaining.load(Ordering::SeqCst))
         {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
