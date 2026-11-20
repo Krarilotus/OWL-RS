@@ -25,8 +25,8 @@ use nrese_xsd::{
 use super::calendar;
 use super::numeric::{Numeric, Operator};
 use super::value::{
-    Value, boolean_term, canonical, compare, effective_boolean, equals, is_lang_string,
-    parse_integer,
+    Comparison, Value, boolean_term, canonical, compare_rel, effective_boolean, equals,
+    is_lang_string, parse_integer,
 };
 
 /// True if the native evaluator implements every node of `expr`.
@@ -246,19 +246,23 @@ impl Evaluator {
             Expression::SameTerm(a, b) => boolean(self.eval(a, binding)? == self.eval(b, binding)?),
             Expression::Greater(a, b) => {
                 let (x, y) = values(a, b)?;
-                compare(&x, &y).map(|o| boolean_term(o.is_gt()))
+                compare_rel(&x, &y)
+                    .map(|c| boolean_term(matches!(c, Comparison::Ordered(o) if o.is_gt())))
             }
             Expression::GreaterOrEqual(a, b) => {
                 let (x, y) = values(a, b)?;
-                compare(&x, &y).map(|o| boolean_term(o.is_ge()))
+                compare_rel(&x, &y)
+                    .map(|c| boolean_term(matches!(c, Comparison::Ordered(o) if o.is_ge())))
             }
             Expression::Less(a, b) => {
                 let (x, y) = values(a, b)?;
-                compare(&x, &y).map(|o| boolean_term(o.is_lt()))
+                compare_rel(&x, &y)
+                    .map(|c| boolean_term(matches!(c, Comparison::Ordered(o) if o.is_lt())))
             }
             Expression::LessOrEqual(a, b) => {
                 let (x, y) = values(a, b)?;
-                compare(&x, &y).map(|o| boolean_term(o.is_le()))
+                compare_rel(&x, &y)
+                    .map(|c| boolean_term(matches!(c, Comparison::Ordered(o) if o.is_le())))
             }
             Expression::In(a, list) => {
                 let needle = Value::of(&self.eval(a, binding)?);
@@ -939,11 +943,16 @@ fn cast(name: &str, term: Term) -> Option<Term> {
                 }
             },
             Value::Boolean(b) => typed(Integer::from(Boolean::from(b)).to_string(), xsd::INTEGER),
-            Value::String(s) => match parse_integer(&s, None, None)? {
-                Value::Integer(v) => typed(v.to_string(), xsd::INTEGER),
-                Value::BigInteger(v) => typed(v.to_string(), xsd::INTEGER),
-                _ => None,
-            },
+            Value::String(s) => {
+                // XPath string-to-integer casting applies XML whitespace normalization
+                // before lexical parsing (raw RDF literals remain strictly validated).
+                let trimmed = s.trim_matches(|c| matches!(c, ' ' | '\t' | '\r' | '\n'));
+                match parse_integer(trimmed, None, None)? {
+                    Value::Integer(v) => typed(v.to_string(), xsd::INTEGER),
+                    Value::BigInteger(v) => typed(v.to_string(), xsd::INTEGER),
+                    _ => None,
+                }
+            }
             _ => None,
         };
     }

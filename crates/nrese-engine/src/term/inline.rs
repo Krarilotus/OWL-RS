@@ -121,7 +121,7 @@ fn write_lexical(id: TermId, out: &mut impl fmt::Write) -> Option<()> {
 
 /// The datatype of the inline literal `id`; `None` for non-inline kinds and an unknown
 /// derived datatype's code.
-fn inline_datatype(id: TermId) -> Option<nrese_rdf::NamedNodeRef<'static>> {
+pub(crate) fn inline_datatype(id: TermId) -> Option<nrese_rdf::NamedNodeRef<'static>> {
     Some(match id.kind() {
         TermKind::Integer => xsd::INTEGER,
         TermKind::Boolean => xsd::BOOLEAN,

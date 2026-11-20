@@ -196,6 +196,11 @@ impl TermId {
         }
     }
 
+    /// The datatype IRI of an inline literal term; `None` for non-inline terms.
+    pub fn inline_datatype_iri(self) -> Option<&'static str> {
+        inline::inline_datatype(self).map(|dt| dt.as_str())
+    }
+
     /// The ids of inline integer-derived literals ([`TermKind::DerivedInteger`]) with a
     /// value in `low..=high`, as one range (the value leads the payload); values beyond
     /// the inline range are clamped to it.

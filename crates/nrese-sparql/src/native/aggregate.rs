@@ -242,14 +242,18 @@ impl Aggregator<'_> {
                 } else {
                     values
                 };
-                // By value: xsd:integer and derived ids are of different kinds.
-                let value = |id: &u64| TermId::from_raw(*id).as_inline_integer();
+                // By value, breaking numeric ties by inline datatype IRI to match `value::order`
+                // (`"1"^^xsd:integer` < `"1"^^xsd:nonNegativeInteger`).
+                let key = |id: &u64| {
+                    let tid = TermId::from_raw(*id);
+                    (tid.as_inline_integer(), tid.inline_datatype_iri())
+                };
                 Some(match name {
                     AggregateFunction::Min => {
-                        Agg::Id(ids.iter().copied().min_by_key(value).unwrap_or(UNDEF))
+                        Agg::Id(ids.iter().copied().min_by_key(key).unwrap_or(UNDEF))
                     }
                     AggregateFunction::Max => {
-                        Agg::Id(ids.iter().copied().max_by_key(value).unwrap_or(UNDEF))
+                        Agg::Id(ids.iter().copied().max_by_key(key).unwrap_or(UNDEF))
                     }
                     _ => {
                         let Some(sum) = values.iter().try_fold(0i64, |acc, &v| acc.checked_add(v))
@@ -578,10 +582,22 @@ impl Running {
             Some(sum) => self.sum = sum,
             None => self.overflow = true,
         }
-        if self.min.is_none_or(|(m, _)| value < m) {
+        if self.min.is_none_or(|(m, mid)| {
+            value < m
+                || (value == m
+                    && id != mid
+                    && TermId::from_raw(id).inline_datatype_iri()
+                        < TermId::from_raw(mid).inline_datatype_iri())
+        }) {
             self.min = Some((value, id));
         }
-        if self.max.is_none_or(|(m, _)| value > m) {
+        if self.max.is_none_or(|(m, mid)| {
+            value > m
+                || (value == m
+                    && id != mid
+                    && TermId::from_raw(id).inline_datatype_iri()
+                        > TermId::from_raw(mid).inline_datatype_iri())
+        }) {
             self.max = Some((value, id));
         }
     }

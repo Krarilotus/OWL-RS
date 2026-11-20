@@ -366,7 +366,28 @@ fn to_double(value: &Value) -> Option<Double> {
     }
 }
 
-/// `<`, `>`, `<=`, `>=`: `None` is a type error (the FILTER is then false).
+/// Result of a SPARQL relational comparison (`<`, `<=`, `>`, `>=`) when the operand types
+/// are compatible: either a total [`Ordering`] or [`Comparison::Unordered`] (numeric `NaN`,
+/// where every relational operator returns `false` rather than a type error).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Comparison {
+    Ordered(Ordering),
+    Unordered,
+}
+
+/// Relational comparison distinguishing numeric `NaN` ([`Comparison::Unordered`]) from
+/// incompatible operand types (`None`).
+pub fn compare_rel(a: &Value, b: &Value) -> Option<Comparison> {
+    if a.is_numeric() && b.is_numeric() {
+        return Some(match compare_numeric(a, b) {
+            Some(ordering) => Comparison::Ordered(ordering),
+            None => Comparison::Unordered,
+        });
+    }
+    compare(a, b).map(Comparison::Ordered)
+}
+
+/// `<`, `>`, `<=`, `>=`: `None` is a type error (or unordered `NaN`).
 pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
     if a.is_numeric() && b.is_numeric() {
         return compare_numeric(a, b);
@@ -390,7 +411,9 @@ pub fn compare(a: &Value, b: &Value) -> Option<Ordering> {
 /// `=` (RDFterm-equal extended by value equality): `None` is a type error.
 pub fn equals(a: &Value, b: &Value) -> Option<bool> {
     if a.is_numeric() && b.is_numeric() {
-        return compare_numeric(a, b).map(|o| o == Ordering::Equal);
+        // Per XPath op:numeric-equal, NaN compares unequal to every numeric value (false,
+        // never a type error), so `!=` evaluates to true.
+        return Some(compare_numeric(a, b) == Some(Ordering::Equal));
     }
     match (a, b) {
         (Value::Iri(x), Value::Iri(y)) | (Value::Blank(x), Value::Blank(y)) => Some(x == y),
