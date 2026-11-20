@@ -1665,6 +1665,8 @@ impl<B: Base + ?Sized> Prover<'_, '_, B> {
             .derivation_bodies(state, fact, PROOF_BRANCHES, poll)?;
         let mut cut = false;
         self.budget -= 1;
+        #[cfg(test)]
+        budget_tests::record_expansion();
         self.active.insert(fact);
         let found = self.prove_bodies(state, gone, bodies, depth, &mut cut);
         self.active.remove(&fact);
@@ -1793,5 +1795,127 @@ impl VisitsBase for MemoryBase {
 
     fn asserts(&self, fact: Triple, _: Probe<'_, '_>) -> Result<bool, Stopped> {
         Ok(self.asserted.contains(&fact))
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use super::*;
+    use crate::batch::{self, Schema};
+    use crate::delta::policy::{Plan, Policy};
+    use crate::ir::Vocabulary;
+    use crate::vocabulary::LocalVocabulary;
+
+    static EXPANSIONS: AtomicUsize = AtomicUsize::new(0);
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(super) fn record_expansion() {
+        EXPANSIONS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A cyclic graph with many independent overdelete candidates in one pass must bound
+    /// total proof expansions across all parallel Rayon workers to `PROOF_BUDGET` (not
+    /// `workers * PROOF_BUDGET`), while still producing the exact same maintained closure
+    /// as a full rematerialisation across pool widths.
+    #[test]
+    fn shared_proof_budget_caps_total_expansions_and_matches_rematerialisation() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let mut vocab = LocalVocabulary::default();
+        // Two mutually recursive rules over a cyclic graph so each candidate triggers a
+        // deep proof search when its root support is deleted.
+        let rules_text = concat!(
+            "r1: (?x rdfs:e ?y), (?y rdfs:p ?z) -> (?x rdfs:p ?z)\n",
+            "r2: (?x rdfs:seed ?y) -> (?x rdfs:p ?y)\n",
+        );
+        let rules = crate::ir::parse_rules(rules_text, &mut vocab).unwrap();
+        let schema = Schema::owl(&mut vocab);
+        let e = vocab.iri("http://www.w3.org/2000/01/rdf-schema#e");
+        let seed = vocab.iri("http://www.w3.org/2000/01/rdf-schema#seed");
+        let nodes = 40usize;
+        let targets = 60usize;
+        let mut asserted = Vec::new();
+        // Dense small cycle among nodes so proof searches branch heavily.
+        for i in 0..nodes {
+            let a = vocab.iri(&format!("http://example.com/n{i}"));
+            for step in [1usize, 2, 3, 5] {
+                let b = vocab.iri(&format!("http://example.com/n{}", (i + step) % nodes));
+                asserted.push([a, e, b]);
+            }
+        }
+        let root = vocab.iri("http://example.com/n0");
+        let mut deleted = Vec::new();
+        for t in 0..targets {
+            let target = vocab.iri(&format!("http://example.com/t{t}"));
+            let fact = [root, seed, target];
+            asserted.push(fact);
+            deleted.push(fact);
+        }
+        asserted.sort_unstable();
+        asserted.dedup();
+
+        let before = batch::materialise(&asserted, &rules, None, &schema).derived;
+        let after_asserted: Vec<Triple> = asserted
+            .iter()
+            .copied()
+            .filter(|f| !deleted.contains(f))
+            .collect();
+        let expected = batch::materialise(&after_asserted, &rules, None, &schema).derived;
+        let stack: Vec<Triple> = before
+            .iter()
+            .copied()
+            .filter(|f| after_asserted.binary_search(f).is_err())
+            .collect();
+
+        for threads in [1usize, 4, 8] {
+            let pool = rayon::ThreadPoolBuilder::new()
+                .num_threads(threads)
+                .build()
+                .unwrap();
+            let base = MemoryBase::new(&after_asserted, &stack);
+            let compiled = Rules {
+                rules: &rules,
+                lists: None,
+                schema: &schema,
+                equality: None,
+            };
+            let policy = Policy {
+                force: Some(Plan::Dred),
+                ..Policy::default()
+            };
+            EXPANSIONS.store(0, Ordering::SeqCst);
+            let result = pool
+                .install(|| {
+                    update_with(
+                        &base,
+                        &[],
+                        &deleted,
+                        compiled,
+                        None,
+                        crate::eval::NEVER,
+                        policy,
+                    )
+                })
+                .expect("never stopped");
+            let used = EXPANSIONS.load(Ordering::SeqCst);
+            assert!(
+                used <= PROOF_BUDGET,
+                "threads={threads}: proof expansions {used} exceeded shared pass budget {PROOF_BUDGET}"
+            );
+            let removed: HashSet<Triple> = result.remove.iter().copied().collect();
+            let mut maintained: Vec<Triple> = stack
+                .iter()
+                .copied()
+                .filter(|f| !removed.contains(f))
+                .chain(result.insert)
+                .collect();
+            maintained.sort_unstable();
+            maintained.dedup();
+            assert_eq!(
+                maintained, expected,
+                "threads={threads}: maintained closure diverged from full rematerialisation"
+            );
+        }
     }
 }
