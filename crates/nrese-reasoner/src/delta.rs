@@ -41,6 +41,7 @@ use hashbrown::HashSet;
 use rayon::prelude::*;
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use nrese_exec::Budget;
 
@@ -681,6 +682,7 @@ fn update_body<B: Base + ?Sized>(
     let mut region_facts: Vec<Triple> = Vec::new();
     let mut region_asserted: HashSet<Triple> = HashSet::new();
     'overdelete: while !deleted.is_empty() {
+        let proof_budget = AtomicUsize::new(PROOF_BUDGET);
         overdeleted.clear();
         recloses.clear();
         // The region's facts, overdeleted at once: every inferred fact that mentions one
@@ -991,15 +993,14 @@ fn update_body<B: Base + ?Sized>(
                 }
                 candidates.sort_unstable();
                 candidates.dedup();
-                // Each worker its own prover (its own caches and budget): candidates in
-                // parallel.
+                // Each worker gets its own memo caches while sharing one pass budget.
                 let fresh_prover = || Prover {
                     base,
                     program: old_program,
                     proved: HashSet::new(),
                     failed: HashSet::new(),
                     active: HashSet::new(),
-                    budget: PROOF_BUDGET,
+                    budget: &proof_budget,
                     poll: super::eval::Poller::new(stop),
                 };
                 // The first proof a stop ended ends them all (a stopped
@@ -1610,15 +1611,15 @@ struct Prover<'a, 'p, B: Base + ?Sized> {
     proved: HashSet<Triple>,
     failed: HashSet<Triple>,
     active: HashSet<Triple>,
-    budget: usize,
+    budget: &'a AtomicUsize,
     /// The update's stop, one poller per parallel task: each alternative, producer, search
     /// and scanned fact of a proof is attempted work. `None`: stopped before
     /// the task began.
     poll: Option<super::eval::Poller<'p>>,
 }
 
-/// Proof steps a prover takes at most before it gives up (the candidate is then overdeleted
-/// and rederived if it holds).
+/// Proof expansions shared by all provers in one overdelete pass (when exhausted, remaining
+/// candidates are overdeleted and rederived if still entailed).
 const PROOF_BUDGET: usize = 10_000;
 
 /// Derivations tried per fact, and the proof depth.
@@ -1656,17 +1657,25 @@ impl<B: Base + ?Sized> Prover<'_, '_, B> {
         if self.program.transitive.contains(&fact[1]) {
             return Ok((false, false));
         }
-        if self.active.contains(&fact) || self.budget == 0 || depth > PROOF_DEPTH {
+        if self.active.contains(&fact) || depth > PROOF_DEPTH {
             return Ok((false, true));
         }
+        if self
+            .budget
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |left| {
+                left.checked_sub(1)
+            })
+            .is_err()
+        {
+            return Ok((false, true));
+        }
+        #[cfg(test)]
+        budget_tests::record_expansion();
         // Stopped: the bodies are a part of them, so the search ends here.
         let bodies = self
             .program
             .derivation_bodies(state, fact, PROOF_BRANCHES, poll)?;
         let mut cut = false;
-        self.budget -= 1;
-        #[cfg(test)]
-        budget_tests::record_expansion();
         self.active.insert(fact);
         let found = self.prove_bodies(state, gone, bodies, depth, &mut cut);
         self.active.remove(&fact);
