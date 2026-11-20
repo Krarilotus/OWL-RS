@@ -311,6 +311,16 @@ quote = "i take the recommendations on both the decisions thank you"
 source = "his answer of 11 Nov 2026, 21:10 Berlin, accepting the recommendation to approve these absence entries as drafted"
 
 [[absence]]
+cases = ["commits-large-schema"]
+side = "main"
+reason = "main's measurement build doesn't parse --commits"
+port = "the measurement tool's commits mode ported to main's build, planned right after v1.5"
+approved = "2026-11-20"
+by = "the maintainer"
+quote = "If i am not missing sth this is standard procedure for any new capabilities that are for the spec to be done"
+source = "his answer of 20 Nov 2026, 02:18 Berlin, approving the absence of commits-large-schema against main, whose measurement build has no --commits option"
+
+[[absence]]
 cases = ["commits-plain", "commits-readers", "eq-merge-compact", "ql-memberships-data-commits", "ql-memberships-type-commits-deep", "ql-memberships-type-commits-wide", "writes-under-readers"]
 side = "main"
 reason = "main's measurement build doesn't parse --commits --readers"
