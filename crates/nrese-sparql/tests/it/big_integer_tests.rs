@@ -504,3 +504,153 @@ fn big_integer_operators_and_casts_never_panic() {
         assert_eq!(single_term(run_both(&snapshot, &query, &opts, false)), None);
     }
 }
+
+#[test]
+fn inline_subtype_tie_in_streamed_and_eager_extrema() {
+    let p_seed = node("seed");
+    let p_v = node("v");
+
+    // Fixture A (MAX): inline xsd:integer("1") and xsd:nonNegativeInteger("1") tie numerically;
+    // the total term order ranks xsd:nonNegativeInteger after xsd:integer, so MAX must pick
+    // "1"^^xsd:nonNegativeInteger even when partial streamed/inline reductions see integer first.
+    let engine_max = load(vec![
+        (node("g"), p_seed.clone(), Term::from(node("s1"))),
+        (node("g"), p_seed.clone(), Term::from(node("s2"))),
+        (node("s1"), p_v.clone(), Term::from(typed("1", "integer"))),
+        (
+            node("s1"),
+            p_v.clone(),
+            Term::from(typed("1", "nonNegativeInteger")),
+        ),
+        (
+            node("s2"),
+            p_v.clone(),
+            Term::from(typed("-9223372036854775809", "integer")),
+        ),
+    ]);
+    let snap_max = engine_max.snapshot();
+
+    // Fixture B (MIN): same inline pair with a positive big integer; MIN must pick "1"^^xsd:integer
+    // even when partial reductions encounter xsd:nonNegativeInteger first.
+    let engine_min = load(vec![
+        (node("g"), p_seed.clone(), Term::from(node("s1"))),
+        (node("g"), p_seed.clone(), Term::from(node("s2"))),
+        (
+            node("s1"),
+            p_v.clone(),
+            Term::from(typed("1", "nonNegativeInteger")),
+        ),
+        (node("s1"), p_v.clone(), Term::from(typed("1", "integer"))),
+        (
+            node("s2"),
+            p_v.clone(),
+            Term::from(typed("9223372036854775809", "integer")),
+        ),
+    ]);
+    let snap_min = engine_min.snapshot();
+
+    let direct = QueryOptions::default();
+    let streamed = QueryOptions {
+        stream_rows: Some(1),
+        ..QueryOptions::default()
+    };
+
+    let q_max = "SELECT (MAX(?v) AS ?vmax) { :g :seed ?s . ?s :v ?v }";
+    let expected_max = vec![vec![Some(Term::from(typed("1", "nonNegativeInteger")))]];
+    assert_eq!(run_both(&snap_max, q_max, &direct, false), expected_max);
+    assert_eq!(run_both(&snap_max, q_max, &streamed, false), expected_max);
+
+    let q_min = "SELECT (MIN(?v) AS ?vmin) { :g :seed ?s . ?s :v ?v }";
+    let expected_min = vec![vec![Some(Term::from(typed("1", "integer")))]];
+    assert_eq!(run_both(&snap_min, q_min, &direct, false), expected_min);
+    assert_eq!(run_both(&snap_min, q_min, &streamed, false), expected_min);
+
+    // Grouped eager-eligible query with inline subtype tie.
+    let q_grouped =
+        "SELECT ?g (MIN(?v) AS ?lo) (MAX(?v) AS ?hi) { ?g :seed ?s . ?s :v ?v } GROUP BY ?g";
+    let expected_grouped = vec![vec![
+        Some(Term::from(node("g"))),
+        Some(Term::from(typed("-9223372036854775809", "integer"))),
+        Some(Term::from(typed("1", "nonNegativeInteger"))),
+    ]];
+    assert_eq!(
+        run_both(&snap_max, q_grouped, &direct, false),
+        expected_grouped
+    );
+    assert_eq!(
+        run_both(&snap_max, q_grouped, &streamed, false),
+        expected_grouped
+    );
+}
+
+#[test]
+fn big_integer_comparisons_with_nan_return_booleans() {
+    let engine = load(Vec::new());
+    let snapshot = engine.snapshot();
+    let opts = QueryOptions::default();
+    let t_true = Some(Term::from(Literal::from(true)));
+    let t_false = Some(Term::from(Literal::from(false)));
+
+    for nan_lit in [r#""NaN"^^xsd:double"#, r#""NaN"^^xsd:float"#] {
+        for num in ["9223372036854775808", "-9223372036854775809", "1"] {
+            let query = format!(
+                "SELECT ((?n = ?nan) AS ?eq) ((?n != ?nan) AS ?ne) \
+                        ((?n < ?nan) AS ?lt) ((?n <= ?nan) AS ?le) \
+                        ((?n > ?nan) AS ?gt) ((?n >= ?nan) AS ?ge) \
+                        ((?nan = ?n) AS ?req) ((?nan != ?n) AS ?rne) \
+                        ((?nan < ?n) AS ?rlt) ((?nan <= ?n) AS ?rle) \
+                 WHERE {{ VALUES (?n ?nan) {{ ({num} {nan_lit}) }} }}"
+            );
+            let rows = run_both(&snapshot, &query, &opts, false);
+            assert_eq!(
+                rows,
+                vec![vec![
+                    t_false.clone(),
+                    t_true.clone(),
+                    t_false.clone(),
+                    t_false.clone(),
+                    t_false.clone(),
+                    t_false.clone(),
+                    t_false.clone(),
+                    t_true.clone(),
+                    t_false.clone(),
+                    t_false.clone(),
+                ]],
+                "NaN comparison mismatch for {num} vs {nan_lit}"
+            );
+        }
+    }
+}
+
+#[test]
+fn big_integer_string_constructor_normalizes_xml_whitespace() {
+    let engine = load(Vec::new());
+    let snapshot = engine.snapshot();
+    let opts = QueryOptions::default();
+    let check = |expr: &str, expected: Option<Term>| {
+        let query = format!("SELECT ({expr} AS ?r) {{}}");
+        let got = single_term(run_both(&snapshot, &query, &opts, false));
+        assert_eq!(got, expected, "expr: {expr}");
+    };
+
+    check(
+        r#"xsd:integer("  +09223372036854775808  ")"#,
+        Some(Term::from(typed("9223372036854775808", "integer"))),
+    );
+    check(
+        "xsd:integer(\"\t\n -0009223372036854775809 \r\n\")",
+        Some(Term::from(typed("-9223372036854775809", "integer"))),
+    );
+    check(
+        r#"xsd:integer("  +00042  ")"#,
+        Some(Term::from(typed("42", "integer"))),
+    );
+    // Internal whitespace or whitespace between sign and digits must still fail.
+    check(r#"xsd:integer("922337203685 4775808")"#, None);
+    check(r#"xsd:integer("+ 9223372036854775808")"#, None);
+    // Raw RDF literals preserve strict lexical space (not normalized).
+    check(
+        r#"isNumeric("  9223372036854775808  "^^xsd:integer)"#,
+        Some(Term::from(Literal::from(false))),
+    );
+}
