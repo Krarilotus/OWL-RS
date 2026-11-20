@@ -1452,16 +1452,21 @@ impl StoreService {
         prepared: &PreparedQuery,
         at: Revision<'_>,
     ) -> Option<nrese_sparql::Completeness> {
+        const DATASET_OMITS_DEFAULT: &str = "this read's dataset leaves out the default graph, \
+            where the inferred statements are: answers over its asserted statements";
         if prepared.read_model() == ReadModel::Asserted {
             return None;
         }
         let certificate = Certificate::of(at.snapshot())?;
+        let omits_default = prepared.omits_default_graph();
         if certificate.dl {
             // A read of every statement inside a transaction lacks only the pending
             // operations' reasoning (`Self::assess`); any other read, the DL bounds.
             let mut status = nrese_sparql::Completeness::under(nrese_sparql::Regime::Owl2Dl);
             let pending = matches!(at, Revision::Pending(..));
-            if prepared.read_model() != ReadModel::Materialised || !pending {
+            if omits_default {
+                status.incomplete("dl", DATASET_OMITS_DEFAULT.to_owned());
+            } else if prepared.read_model() != ReadModel::Materialised || !pending {
                 status.incomplete(
                     "dl",
                     "a read of the rules' closure alone, without the DL \
@@ -1475,14 +1480,16 @@ impl StoreService {
         let ruleset = certificate.state.ruleset.clone();
         let mut status =
             nrese_sparql::Completeness::under(nrese_sparql::Regime::of_ruleset(&ruleset));
-        status.incomplete(
-            "rules",
+        let reason = if omits_default {
+            DATASET_OMITS_DEFAULT.to_owned()
+        } else {
             format!(
                 "answers over the {ruleset} closure: what its rules derive, complete for \
                  the ontologies of their profile, which isn't checked per query; not every \
                  certain answer under OWL 2 DL (reasoner.mode = \"owl2-dl\" gives those)"
-            ),
-        );
+            )
+        };
+        status.incomplete("rules", reason);
         certify_closure(&mut status, prepared.reads(), "rules", Some(at.snapshot()));
         Some(status)
     }

@@ -317,6 +317,40 @@ impl PreparedQuery {
         self.dataset.is_some() || self.query.dataset().is_some()
     }
 
+    /// Whether the query names a dataset that leaves out the store's default graph (where
+    /// inferred statements live): plain `FROM <g>`, `FROM NAMED <g>`, or protocol dataset
+    /// parameters without the default graph. Scoped inference (`inference-scope=dataset`)
+    /// includes its scoped inferred layer, so returns `false`.
+    pub(crate) fn omits_default_graph(&self) -> bool {
+        if self.inference_scope.is_some() {
+            return false;
+        }
+        let is_default = |graph: &GraphName| match graph {
+            GraphName::DefaultGraph => true,
+            GraphName::NamedNode(node) => nrese_sparql::compat::names_default_graph(node.as_str()),
+            GraphName::BlankNode(_) => false,
+        };
+        if let Some(dataset) = self
+            .dataset
+            .as_ref()
+            .filter(|dataset| !dataset.is_default_dataset())
+        {
+            return match dataset.default_graph_graphs() {
+                Some(graphs) => !graphs.iter().any(is_default),
+                None => dataset
+                    .excluded_default_graphs()
+                    .is_some_and(|excluded| excluded.iter().any(is_default)),
+            };
+        }
+        if let Some(dataset) = self.query.dataset() {
+            return !dataset
+                .default
+                .iter()
+                .any(|node| nrese_sparql::compat::names_default_graph(node.as_str()));
+        }
+        false
+    }
+
     /// Under `owl2-dl`: which answers the query asks for (`None`: the store's setting).
     pub fn dl_answers(&self) -> Option<crate::DlAnswers> {
         self.dl_answers
