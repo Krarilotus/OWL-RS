@@ -375,13 +375,16 @@ home_turf = "rdf4j"
 [[case]]
 name = "commits-large-schema"
 area = "maintenance"
-what = "50,000 one-person inserts under OWL 2 RL over 30,000 classes that no commit touches: a commit's cost follows its change, not the schema's size"
+what = "5,000 one-person inserts under OWL 2 RL over 30,000 classes that no commit touches: a commit's cost follows its change, not the schema's size"
 semantics = "owl2-rl"
-data = "churn people=20000 changes=50000 schema=30000 delete=0"
+# 5,000 commits, not 50,000: sized so that a side that pays for the untouched schema on every
+# commit still finishes inside the case's timeout. At 50,000 such a side needed 51 minutes a
+# pass (a median of 54.7 ms a commit, against 3.8 ms where a commit doesn't pay for it).
+data = "churn people=20000 changes=5000 schema=30000 delete=0"
 args = ["--reason", "owl2-rl", "--commits", "{data}.commits.ru"]
 queries = "churn"
 metric = "commits.p50_ms"
-check = { "closure_after_commits.equal" = "true", "commits.commits" = 50000 }
+check = { "closure_after_commits.equal" = "true", "commits.commits" = 5000 }
 route = { "commits.incremental" = "== true" }
 cap_gb = 4
 systems = []
