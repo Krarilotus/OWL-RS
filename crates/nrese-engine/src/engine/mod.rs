@@ -751,30 +751,50 @@ impl Shared {
     /// Runs whatever maintenance was requested: a task of the background worker. Returns what
     /// is to be done again because it couldn't be done now (on a pool thread nothing waits
     /// for a running merge or checkpoint); the requests stay set for it.
+    ///
+    /// Each operation runs inside its own panic boundary so a panic in one neither kills the
+    /// worker nor discards the other's request or deferral retry.
     fn maintain(&self) -> Again {
-        let do_compaction = self.wants_compaction.swap(false, Ordering::AcqRel);
-        let do_checkpoint = self.wants_checkpoint.swap(false, Ordering::AcqRel);
+        let do_compaction = self.wants_compaction.swap(false, Ordering::SeqCst);
+        let do_checkpoint = self.wants_checkpoint.swap(false, Ordering::SeqCst);
         let mut again = Again::default();
         if do_compaction {
-            #[cfg(test)]
-            self.run_test_hook(maintenance_tests::Phase::Compaction);
-            if self.versions.compact(false) == CompactionOutcome::Deferred {
-                self.wants_compaction.store(true, Ordering::Release);
-                again.merge = true;
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                self.run_test_hook(maintenance_tests::Phase::Compaction);
+                self.versions.compact(false)
+            })) {
+                Ok(CompactionOutcome::Deferred) => {
+                    self.wants_compaction.store(true, Ordering::SeqCst);
+                    again.merge = true;
+                }
+                Ok(CompactionOutcome::Stable) => {}
+                Err(panic) => handle_maintenance_panic("compaction", panic),
             }
         }
         if do_checkpoint {
-            #[cfg(test)]
-            self.run_test_hook(maintenance_tests::Phase::Checkpoint);
-            match self.checkpoint() {
-                Ok(_) => {}
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                #[cfg(test)]
+                self.run_test_hook(maintenance_tests::Phase::Checkpoint);
+                self.checkpoint()
+            })) {
+                Ok(Ok(_)) => {}
                 // Another checkpoint is being written; it may be of an older revision than
                 // the one this request is for: again once it is written.
-                Err(crate::EngineError::SlotBusy(_)) => {
-                    self.wants_checkpoint.store(true, Ordering::Release);
+                Ok(Err(crate::EngineError::SlotBusy(_))) => {
+                    self.wants_checkpoint.store(true, Ordering::SeqCst);
                     again.checkpoint = true;
                 }
-                Err(error) => tracing::error!(%error, "background checkpoint failed"),
+                Ok(Err(error)) => {
+                    if let Err(nested) =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            tracing::error!(%error, "background checkpoint failed");
+                        }))
+                    {
+                        drop_payload_safely(nested);
+                    }
+                }
+                Err(panic) => handle_maintenance_panic("checkpoint", panic),
             }
         }
         again
@@ -805,8 +825,8 @@ enum Task {
     /// Spawned on the pool, not started yet.
     Queued,
     Running,
-    /// Done: what is to be done again, or the panic the task ended in.
-    Ended(std::thread::Result<Again>),
+    /// Done: what is to be done again.
+    Ended(Again),
     /// Never started: a drop on a pool thread took it back, to leave it undone.
     Abandoned,
     /// Never started: a drop off the pool took it back, for the worker's thread to run.
@@ -859,24 +879,47 @@ impl Drop for WorkerAlive {
     }
 }
 
-fn panic_message(payload: &(dyn std::any::Any + Send)) -> &str {
-    payload
-        .downcast_ref::<&str>()
-        .copied()
-        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
-        .unwrap_or("non-string panic payload")
+/// Drops a caught panic payload inside its own `catch_unwind` so a panicking destructor
+/// cannot unwind out of maintenance recovery and kill the worker.
+fn drop_payload_safely(payload: Box<dyn std::any::Any + Send>) {
+    if let Err(nested) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        drop(payload);
+    })) {
+        std::mem::forget(nested);
+    }
 }
 
-/// Runs `shared.maintain()` catching panics so a single maintenance failure is logged
-/// without killing the background worker thread or wedging `Engine::settle`.
+/// Reports a caught maintenance panic and disposes of its payload without allowing either
+/// payload destruction or a tracing subscriber panic to unwind out of the recovery path.
+fn handle_maintenance_panic(operation: &'static str, panic: Box<dyn std::any::Any + Send>) {
+    let message = match panic.downcast::<&'static str>() {
+        Ok(s) => Some((*s).to_owned()),
+        Err(panic) => match panic.downcast::<String>() {
+            Ok(s) => Some(*s),
+            Err(panic) => {
+                drop_payload_safely(panic);
+                None
+            }
+        },
+    };
+    if let Err(nested) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        tracing::error!(
+            operation,
+            panic = message.as_deref().unwrap_or("non-string panic payload"),
+            "background maintenance task panicked; worker stays alive"
+        );
+    })) {
+        drop_payload_safely(nested);
+    }
+}
+
+/// Runs `shared.maintain()` catching any unwinding panic so a single maintenance failure is
+/// logged without killing the background worker thread or wedging `Engine::settle`.
 fn run_maintain_caught(shared: &Shared) -> Again {
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| shared.maintain())) {
         Ok(again) => again,
         Err(panic) => {
-            tracing::error!(
-                panic = %panic_message(&*panic),
-                "background maintenance task panicked; worker stays alive"
-            );
+            handle_maintenance_panic("maintenance", panic);
             Again::default()
         }
     }
@@ -898,6 +941,11 @@ impl Worker {
                 .spawn(move || {
                     let _alive = alive;
                     while wakeups.recv().is_ok() {
+                        // Set before any request is taken and held across deferral retries
+                        // so `Engine::settle` never sees an idle gap between a rearmed flag
+                        // and the worker waiting for the holding merge or checkpoint.
+                        shared.maintaining.store(true, Ordering::SeqCst);
+                        let _maintaining = Maintaining(&shared.maintaining);
                         loop {
                             let again = Self::task(&shared, &life);
                             // Again once what held it up has ended (this thread may wait).
@@ -935,10 +983,6 @@ impl Worker {
                 }
             }
         };
-        // Before the requests are taken, so that one is always visible ([`Engine::settle`]),
-        // and cleared by a drop guard on every exit path.
-        shared.maintaining.store(true, Ordering::SeqCst);
-        let _maintaining = Maintaining(&shared.maintaining);
         if here {
             return run_maintain_caught(shared);
         }
@@ -954,18 +998,15 @@ impl Worker {
                     }
                     state.0 = Task::Running;
                 }
-                // Caught here: a panic in a Rayon job would abort the process. Returned to
-                // the worker thread so it logs and keeps serving future maintenance.
+                // Caught here: a panic in a Rayon job would abort the process.
                 let ended = match shared.upgrade() {
                     Some(shared) => {
-                        let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            shared.maintain()
-                        }));
+                        let again = run_maintain_caught(&shared);
                         // Let go of the store before the drop waiting for this task can return.
                         drop(shared);
-                        ended
+                        again
                     }
-                    None => Ok(Again::default()),
+                    None => Again::default(),
                 };
                 life.state.lock().0 = Task::Ended(ended);
                 life.changed.notify_all();
@@ -979,14 +1020,7 @@ impl Worker {
             std::mem::replace(&mut state.0, Task::None)
         };
         match task {
-            Task::Ended(Ok(again)) => again,
-            Task::Ended(Err(panic)) => {
-                tracing::error!(
-                    panic = %panic_message(&*panic),
-                    "background maintenance task panicked; worker stays alive"
-                );
-                Again::default()
-            }
+            Task::Ended(again) => again,
             // The pool may have no thread free to start it (base ran it on this thread).
             Task::Reclaimed => run_maintain_caught(shared),
             Task::Abandoned | Task::None | Task::Queued | Task::Running => Again::default(),
@@ -1050,13 +1084,13 @@ impl Inner {
         };
         let mut wake = false;
         if shared.versions.compact(true) == CompactionOutcome::Deferred {
-            shared.wants_compaction.store(true, Ordering::Release);
+            shared.wants_compaction.store(true, Ordering::SeqCst);
             wake = true;
         }
         if let Some(durable) = &shared.durable
             && wal_bytes_since_checkpoint >= durable.config.checkpoint_after_wal_bytes
         {
-            shared.wants_checkpoint.store(true, Ordering::Release);
+            shared.wants_checkpoint.store(true, Ordering::SeqCst);
             wake = true;
         }
         if wake {
