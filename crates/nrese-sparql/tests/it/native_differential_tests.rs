@@ -5074,6 +5074,130 @@ fn avg_over_all_error_arguments_returns_zero_integer() {
             .collect();
         assert_eq!(out, vec![zero.clone(), zero.clone()], "eager: {text}");
     }
+
+    // Eager aggregation must NOT pre-aggregate a variable shared with the outer join side,
+    // because the outer side can bind a variable that was UNDEF on the inner side and turn
+    // an all-error partial into a mixed value/error group.
+    let shared_var_query = "\
+        SELECT ?g (AVG(?x) AS ?a) WHERE { \
+            VALUES (?g ?s ?x) { (1 10 2) (1 20 UNDEF) } \
+            VALUES (?s ?x) { (10 UNDEF) (20 UNDEF) } \
+        } GROUP BY ?g";
+    let eval_pairs = |query: &nrese_sparql_syntax::Query,
+                      options: &QueryOptions|
+     -> Vec<(Option<Term>, Option<Term>)> {
+        let QueryResults::Solutions(solutions) = evaluate_query(&snapshot, query, options).unwrap()
+        else {
+            panic!("expected solutions");
+        };
+        let mut out: Vec<(Option<Term>, Option<Term>)> = solutions
+            .map(|row| {
+                let row = row.unwrap();
+                (row.get("g").cloned(), row.get("a").cloned())
+            })
+            .collect();
+        out.sort_by_key(|(g, a)| {
+            (
+                g.as_ref().map(ToString::to_string),
+                a.as_ref().map(ToString::to_string),
+            )
+        });
+        out
+    };
+    let parsed = SparqlParser::new().parse_query(shared_var_query).unwrap();
+    let nrese_sparql_syntax::Query::Select {
+        dataset,
+        pattern,
+        base_iri,
+    } = parsed.clone()
+    else {
+        panic!("expected SELECT");
+    };
+    let rewritten = nrese_sparql_syntax::Query::Select {
+        dataset,
+        pattern: nrese_sparql::plan::eager_aggregation(&pattern),
+        base_iri,
+    };
+    let as_written = QueryOptions {
+        as_written: true,
+        ..QueryOptions::default()
+    };
+    let expected_pairs = eval_pairs(&parsed, &as_written);
+    assert_eq!(
+        expected_pairs,
+        vec![(Some(Term::from(Literal::from(1_i64))), None)],
+        "as-written mixed group over shared join variable must stay unbound"
+    );
+    assert_eq!(
+        eval_pairs(&rewritten, &QueryOptions::default()),
+        expected_pairs,
+        "eager aggregation must match as-written on shared join variable"
+    );
+    let having_query = "\
+        SELECT ?g (AVG(?x) AS ?a) WHERE { \
+            VALUES (?g ?s ?x) { (1 10 2) (1 20 UNDEF) } \
+            VALUES (?s ?x) { (10 UNDEF) (20 UNDEF) } \
+        } GROUP BY ?g HAVING (AVG(?x) = 0)";
+    let parsed_having = SparqlParser::new().parse_query(having_query).unwrap();
+    let nrese_sparql_syntax::Query::Select {
+        dataset,
+        pattern,
+        base_iri,
+    } = parsed_having
+    else {
+        panic!("expected SELECT");
+    };
+    let rewritten_having = nrese_sparql_syntax::Query::Select {
+        dataset,
+        pattern: nrese_sparql::plan::eager_aggregation(&pattern),
+        base_iri,
+    };
+    assert!(
+        eval_pairs(&rewritten_having, &QueryOptions::default()).is_empty(),
+        "HAVING (AVG(?x) = 0) must not match a mixed value/error group under eager aggregation"
+    );
+
+    // Streamed GROUP BY must not split AVG over a per-row volatile expression into separate
+    // SUM(expr) and COUNT(expr) evaluations: on a single-row group, AVG(IF(RAND() < 0.5, 1,
+    // ?missing)) must always return either 1.0 (decimal) or 0 (integer), never unbound.
+    let single_engine = Engine::new(EngineConfig::default()).unwrap();
+    {
+        let mut tx = single_engine.transaction();
+        tx.insert(Quad::new(ex("s1"), ex("group"), ex("g1"), GraphName::DefaultGraph).as_ref());
+        tx.insert(
+            Quad::new(
+                ex("s1"),
+                ex("val"),
+                Literal::from(1_i64),
+                GraphName::DefaultGraph,
+            )
+            .as_ref(),
+        );
+        tx.commit().unwrap();
+    }
+    let single_snap = single_engine.snapshot();
+    let volatile_avg = format!(
+        "SELECT ?g (AVG(IF(RAND() < 0.5, 1, ?missing)) AS ?a) \
+         WHERE {{ ?s <{EX}group> ?g . ?s <{EX}val> ?v }} GROUP BY ?g"
+    );
+    let volatile_query = SparqlParser::new().parse_query(&volatile_avg).unwrap();
+    let one_decimal = Some(Term::from(Literal::new_typed_literal("1", xsd::DECIMAL)));
+    for run in 0..64 {
+        let QueryResults::Solutions(solutions) =
+            evaluate_query(&single_snap, &volatile_query, &streamed).unwrap()
+        else {
+            panic!("expected solutions");
+        };
+        let rows: Vec<Option<Term>> = solutions
+            .map(|row| row.unwrap().get("a").cloned())
+            .collect();
+        assert_eq!(rows.len(), 1, "run {run}: one group");
+        assert!(
+            rows[0] == zero || rows[0] == one_decimal,
+            "run {run}: volatile streamed AVG produced unexpected {:?} (must be 0^^xsd:integer or 1^^xsd:decimal)",
+            rows[0]
+        );
+    }
 }
 
 /// TIMEZONE and TZ of dates and times of every kind, the hashes, and IRI() resolved against
