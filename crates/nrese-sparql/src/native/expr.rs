@@ -26,6 +26,7 @@ use super::calendar;
 use super::numeric::{Numeric, Operator};
 use super::value::{
     Value, boolean_term, canonical, compare, effective_boolean, equals, is_lang_string,
+    parse_integer,
 };
 
 /// True if the native evaluator implements every node of `expr`.
@@ -733,12 +734,7 @@ impl Evaluator {
                 })
                 .flatten()
             }
-            Function::IsNumeric => arg(0).map(|t| {
-                boolean_term(matches!(
-                    Value::of(&t),
-                    Value::Integer(_) | Value::Decimal(_) | Value::Float(_) | Value::Double(_)
-                ))
-            }),
+            Function::IsNumeric => arg(0).map(|t| boolean_term(Value::of(&t).is_numeric())),
         }
     }
 }
@@ -895,6 +891,7 @@ fn cast(name: &str, term: Term) -> Option<Term> {
             Value::Float(v) => Boolean::from(v).into(),
             Value::Double(v) => Boolean::from(v).into(),
             Value::Integer(v) => Boolean::from(v).into(),
+            Value::BigInteger(_) => true,
             Value::Decimal(v) => Boolean::from(v).into(),
             Value::String(s) => s.parse::<Boolean>().ok()?.into(),
             _ => return None,
@@ -906,6 +903,7 @@ fn cast(name: &str, term: Term) -> Option<Term> {
             Value::Float(v) => v.into(),
             Value::Double(v) => v,
             Value::Integer(v) => v.into(),
+            Value::BigInteger(v) => v.to_double(),
             Value::Decimal(v) => v.into(),
             Value::Boolean(b) => Boolean::from(b).into(),
             Value::String(s) => s.parse().ok()?,
@@ -918,6 +916,7 @@ fn cast(name: &str, term: Term) -> Option<Term> {
             Value::Float(v) => v,
             Value::Double(v) => v.into(),
             Value::Integer(v) => v.into(),
+            Value::BigInteger(v) => v.to_float(),
             Value::Decimal(v) => v.into(),
             Value::Boolean(b) => Boolean::from(b).into(),
             Value::String(s) => s.parse().ok()?,
@@ -926,22 +925,34 @@ fn cast(name: &str, term: Term) -> Option<Term> {
         return typed(v.to_string(), xsd::FLOAT);
     }
     if name == xsd::INTEGER.as_str() {
-        let v: Integer = match value {
-            Value::Float(v) => v.try_into().ok()?,
-            Value::Double(v) => v.try_into().ok()?,
-            Value::Integer(v) => v,
-            Value::Decimal(v) => v.try_into().ok()?,
-            Value::Boolean(b) => Boolean::from(b).into(),
-            Value::String(s) => s.parse().ok()?,
-            _ => return None,
+        return match value {
+            Value::Float(v) => typed(Integer::try_from(v).ok()?.to_string(), xsd::INTEGER),
+            Value::Double(v) => typed(Integer::try_from(v).ok()?.to_string(), xsd::INTEGER),
+            Value::Integer(v) => typed(v.to_string(), xsd::INTEGER),
+            Value::BigInteger(v) => typed(v.to_string(), xsd::INTEGER),
+            Value::Decimal(v) => match Integer::try_from(v) {
+                Ok(i) => typed(i.to_string(), xsd::INTEGER),
+                Err(_) => {
+                    let s = v.to_string();
+                    let whole = s.split('.').next().unwrap_or(&s);
+                    typed(whole.to_owned(), xsd::INTEGER)
+                }
+            },
+            Value::Boolean(b) => typed(Integer::from(Boolean::from(b)).to_string(), xsd::INTEGER),
+            Value::String(s) => match parse_integer(&s, None, None)? {
+                Value::Integer(v) => typed(v.to_string(), xsd::INTEGER),
+                Value::BigInteger(v) => typed(v.to_string(), xsd::INTEGER),
+                _ => None,
+            },
+            _ => None,
         };
-        return typed(v.to_string(), xsd::INTEGER);
     }
     if name == xsd::DECIMAL.as_str() {
         let v: Decimal = match value {
             Value::Float(v) => v.try_into().ok()?,
             Value::Double(v) => v.try_into().ok()?,
             Value::Integer(v) => v.into(),
+            Value::BigInteger(v) => v.to_decimal()?,
             Value::Decimal(v) => v,
             Value::Boolean(b) => Boolean::from(b).into(),
             Value::String(s) => s.parse().ok()?,

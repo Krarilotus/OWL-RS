@@ -3,19 +3,96 @@
 //! reference evaluator shares these functions, and the choices are named where made.
 
 use std::cmp::Ordering;
+use std::fmt;
 use std::str::FromStr;
 
 use nrese_rdf::vocab::{rdf, xsd};
 use nrese_rdf::{Literal, Term};
+use nrese_xsd::owl::Datatype;
 use nrese_xsd::{
     Boolean, Date, DateTime, DayTimeDuration, Decimal, Double, Duration, Float, GDay, GMonth,
     GMonthDay, GYear, GYearMonth, Integer, Time, TimezoneOffset, YearMonthDuration,
 };
 
+/// A valid XSD integer strictly outside signed 64-bit range (`< i64::MIN` or `> i64::MAX`),
+/// stored canonically as a sign and non-empty ASCII decimal digits with no leading zeros.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct BigInteger {
+    negative: bool,
+    digits: String,
+}
+
+impl BigInteger {
+    /// Converts to `xsd:decimal` if the value fits in `Decimal`'s 128-bit scaled range.
+    pub fn to_decimal(&self) -> Option<Decimal> {
+        let value = parse_signed_i128(self.negative, self.digits.as_bytes())?;
+        Decimal::try_from(value).ok()
+    }
+
+    /// Rounds to `xsd:float` using IEEE 754 round-to-nearest-even (`±INF` past `f32::MAX`).
+    pub fn to_float(&self) -> Float {
+        // `f32::MAX` is ~3.40e38 (39 digits), so 40+ canonical digits always overflow.
+        let magnitude = if self.digits.len() > 39 {
+            f32::INFINITY
+        } else {
+            self.digits.parse::<f32>().unwrap_or(f32::INFINITY)
+        };
+        Float::from(if self.negative { -magnitude } else { magnitude })
+    }
+
+    /// Rounds to `xsd:double` using IEEE 754 round-to-nearest-even (`±INF` past `f64::MAX`).
+    pub fn to_double(&self) -> Double {
+        // `f64::MAX` is ~1.80e308 (309 digits), so 310+ canonical digits always overflow.
+        let magnitude = if self.digits.len() > 309 {
+            f64::INFINITY
+        } else {
+            self.digits.parse::<f64>().unwrap_or(f64::INFINITY)
+        };
+        Double::from(if self.negative { -magnitude } else { magnitude })
+    }
+}
+
+impl Ord for BigInteger {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (self.negative, other.negative) {
+            (true, false) => Ordering::Less,
+            (false, true) => Ordering::Greater,
+            (false, false) => self
+                .digits
+                .len()
+                .cmp(&other.digits.len())
+                .then_with(|| self.digits.cmp(&other.digits)),
+            (true, true) => other
+                .digits
+                .len()
+                .cmp(&self.digits.len())
+                .then_with(|| other.digits.cmp(&self.digits)),
+        }
+    }
+}
+
+impl PartialOrd for BigInteger {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl fmt::Display for BigInteger {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.negative {
+            f.write_str("-")?;
+        }
+        f.write_str(&self.digits)
+    }
+}
+
 /// A term's value, as far as operators distinguish them.
 #[derive(Debug, Clone)]
 pub enum Value {
     Integer(Integer),
+    /// An integer outside signed 64-bit range (any unbounded XSD integer subtype, or
+    /// `xsd:unsignedLong` in `i64::MAX + 1..=u64::MAX`).
+    BigInteger(BigInteger),
     Decimal(Decimal),
     Float(Float),
     Double(Double),
@@ -42,77 +119,63 @@ pub enum Value {
     Triple(Box<nrese_rdf::Triple>),
 }
 
-/// Datatypes derived from `xsd:integer` that SPARQL treats as integers, with their value
-/// ranges (XSD 1.1 Datatypes §3.4). A lexical form outside its datatype's range is
-/// ill-typed: not a number, but a literal compared by identity, and an error in
-/// arithmetic (`"300"^^xsd:byte * 2`), as the standard and Jena have it.
-const INTEGER_TYPES: [(&str, i128, i128); 13] = [
-    (
-        "http://www.w3.org/2001/XMLSchema#integer",
-        i128::MIN,
-        i128::MAX,
-    ),
-    (
-        "http://www.w3.org/2001/XMLSchema#long",
-        i64::MIN as i128,
-        i64::MAX as i128,
-    ),
-    (
-        "http://www.w3.org/2001/XMLSchema#int",
-        i32::MIN as i128,
-        i32::MAX as i128,
-    ),
-    (
-        "http://www.w3.org/2001/XMLSchema#short",
-        i16::MIN as i128,
-        i16::MAX as i128,
-    ),
-    (
-        "http://www.w3.org/2001/XMLSchema#byte",
-        i8::MIN as i128,
-        i8::MAX as i128,
-    ),
-    (
-        "http://www.w3.org/2001/XMLSchema#nonNegativeInteger",
-        0,
-        i128::MAX,
-    ),
-    (
-        "http://www.w3.org/2001/XMLSchema#nonPositiveInteger",
-        i128::MIN,
-        0,
-    ),
-    (
-        "http://www.w3.org/2001/XMLSchema#negativeInteger",
-        i128::MIN,
-        -1,
-    ),
-    (
-        "http://www.w3.org/2001/XMLSchema#positiveInteger",
-        1,
-        i128::MAX,
-    ),
-    (
-        "http://www.w3.org/2001/XMLSchema#unsignedLong",
-        0,
-        u64::MAX as i128,
-    ),
-    (
-        "http://www.w3.org/2001/XMLSchema#unsignedInt",
-        0,
-        u32::MAX as i128,
-    ),
-    (
-        "http://www.w3.org/2001/XMLSchema#unsignedShort",
-        0,
-        u16::MAX as i128,
-    ),
-    (
-        "http://www.w3.org/2001/XMLSchema#unsignedByte",
-        0,
-        u8::MAX as i128,
-    ),
-];
+/// Parses canonical ASCII decimal digits with a sign into `i128`, returning `None` on
+/// overflow. Accumulates negatively so `i128::MIN` parses without special casing.
+fn parse_signed_i128(negative: bool, digits: &[u8]) -> Option<i128> {
+    let mut value: i128 = 0;
+    for &b in digits {
+        value = value.checked_mul(10)?.checked_sub(i128::from(b - b'0'))?;
+    }
+    if negative {
+        Some(value)
+    } else {
+        value.checked_neg()
+    }
+}
+
+/// Parses an XSD integer lexical form (`[+-]?[0-9]+`) subject to inclusive `(min, max)`
+/// bounds (`None` = unbounded on that side). Values within `i64` stay on the zero-alloc
+/// `Value::Integer` fast path; valid values outside `i64` become `Value::BigInteger`.
+pub(crate) fn parse_integer(lexical: &str, min: Option<i128>, max: Option<i128>) -> Option<Value> {
+    if let Ok(integer) = Integer::from_str(lexical) {
+        let value = i128::from(i64::from(integer));
+        if min.is_none_or(|lo| value >= lo) && max.is_none_or(|hi| value <= hi) {
+            return Some(Value::Integer(integer));
+        }
+        return None;
+    }
+    let bytes = lexical.as_bytes();
+    let (negative, rest) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(b'+') => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if rest.is_empty() || !rest.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let stripped = rest
+        .iter()
+        .position(|&b| b != b'0')
+        .map_or(&b"0"[..], |i| &rest[i..]);
+    debug_assert!(stripped != b"0" && stripped.len() >= 19);
+    let in_bounds = match parse_signed_i128(negative, stripped) {
+        Some(value) => min.is_none_or(|lo| value >= lo) && max.is_none_or(|hi| value <= hi),
+        None => {
+            if negative {
+                min.is_none()
+            } else {
+                max.is_none()
+            }
+        }
+    };
+    if !in_bounds {
+        return None;
+    }
+    let digits = std::str::from_utf8(stripped)
+        .expect("validated ASCII digits")
+        .to_owned();
+    Some(Value::BigInteger(BigInteger { negative, digits }))
+}
 
 impl Value {
     pub fn of(term: &Term) -> Self {
@@ -172,24 +235,26 @@ impl Value {
             GMonthDay::from_str(value).ok().map(Self::GMonthDay)
         } else if datatype == xsd::G_DAY {
             GDay::from_str(value).ok().map(Self::GDay)
-        } else if let Some(&(_, min, max)) = INTEGER_TYPES
-            .iter()
-            .find(|(iri, ..)| *iri == datatype.as_str())
+        } else if datatype == xsd::INTEGER {
+            parse_integer(value, None, None)
+        } else if let Some((min, max)) =
+            Datatype::from_iri(datatype.as_str()).and_then(Datatype::integer_bounds)
         {
-            Integer::from_str(value)
-                .ok()
-                .filter(|integer| (min..=max).contains(&i128::from(i64::from(*integer))))
-                .map(Self::Integer)
+            parse_integer(value, min, max)
         } else {
             None
         };
         parsed.unwrap_or_else(|| Self::Other(literal.clone()))
     }
 
-    fn is_numeric(&self) -> bool {
+    pub(crate) fn is_numeric(&self) -> bool {
         matches!(
             self,
-            Self::Integer(_) | Self::Decimal(_) | Self::Float(_) | Self::Double(_)
+            Self::Integer(_)
+                | Self::BigInteger(_)
+                | Self::Decimal(_)
+                | Self::Float(_)
+                | Self::Double(_)
         )
     }
 
@@ -204,28 +269,86 @@ impl Value {
     }
 }
 
-/// Numeric comparison with SPARQL type promotion (integer → decimal → float → double).
-fn compare_numeric(a: &Value, b: &Value) -> Option<Ordering> {
-    use Value::{Decimal as D, Float as F, Integer as I};
-    match (a, b) {
-        (I(x), I(y)) => x.partial_cmp(y),
-        (I(_) | D(_), I(_) | D(_)) => to_decimal(a)?.partial_cmp(&to_decimal(b)?),
-        (I(_) | D(_) | F(_), I(_) | D(_) | F(_)) => to_float(a)?.partial_cmp(&to_float(b)?),
-        _ => to_double(a)?.partial_cmp(&to_double(b)?),
+/// An exact numeric value (`xsd:integer` / `xsd:decimal`), ordered by its exact
+/// mathematical value on the real line.
+#[derive(Debug, Clone, Copy)]
+enum Exact<'a> {
+    Decimal(Decimal),
+    Big(&'a BigInteger),
+}
+
+impl<'a> Exact<'a> {
+    fn of(value: &'a Value) -> Option<Self> {
+        match value {
+            Value::Integer(i) => Some(Self::Decimal(Decimal::from(*i))),
+            Value::BigInteger(b) => Some(Self::Big(b)),
+            Value::Decimal(d) => Some(Self::Decimal(*d)),
+            _ => None,
+        }
     }
 }
 
-fn to_decimal(value: &Value) -> Option<Decimal> {
-    match value {
-        Value::Integer(i) => Some(Decimal::from(*i)),
-        Value::Decimal(d) => Some(*d),
-        _ => None,
+impl PartialEq for Exact<'_> {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Exact<'_> {}
+
+impl PartialOrd for Exact<'_> {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Exact<'_> {
+    fn cmp(&self, other: &Self) -> Ordering {
+        match (*self, *other) {
+            (Self::Decimal(x), Self::Decimal(y)) => x.cmp(&y),
+            (Self::Big(x), Self::Big(y)) => x.cmp(y),
+            (Self::Decimal(d), Self::Big(b)) => match b.to_decimal() {
+                Some(bd) => d.cmp(&bd),
+                // `b` lies strictly outside Decimal's range: negative < every Decimal < positive.
+                None => {
+                    if b.negative {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
+            },
+            (Self::Big(b), Self::Decimal(d)) => match b.to_decimal() {
+                Some(bd) => bd.cmp(&d),
+                None => {
+                    if b.negative {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+            },
+        }
+    }
+}
+
+/// Numeric comparison with SPARQL type promotion (integer → decimal → float → double).
+fn compare_numeric(a: &Value, b: &Value) -> Option<Ordering> {
+    use Value::{BigInteger as B, Decimal as D, Float as F, Integer as I};
+    match (a, b) {
+        (I(x), I(y)) => x.partial_cmp(y),
+        (I(_) | B(_) | D(_), I(_) | B(_) | D(_)) => Some(Exact::of(a)?.cmp(&Exact::of(b)?)),
+        (I(_) | B(_) | D(_) | F(_), I(_) | B(_) | D(_) | F(_)) => {
+            to_float(a)?.partial_cmp(&to_float(b)?)
+        }
+        _ => to_double(a)?.partial_cmp(&to_double(b)?),
     }
 }
 
 fn to_float(value: &Value) -> Option<Float> {
     match value {
         Value::Integer(i) => Some(Float::from(*i)),
+        Value::BigInteger(b) => Some(b.to_float()),
         Value::Decimal(d) => Some(Float::from(*d)),
         Value::Float(f) => Some(*f),
         _ => None,
@@ -235,6 +358,7 @@ fn to_float(value: &Value) -> Option<Float> {
 fn to_double(value: &Value) -> Option<Double> {
     match value {
         Value::Integer(i) => Some(Double::from(*i)),
+        Value::BigInteger(b) => Some(b.to_double()),
         Value::Decimal(d) => Some(Double::from(*d)),
         Value::Float(f) => Some(Double::from(*f)),
         Value::Double(d) => Some(*d),
@@ -329,6 +453,8 @@ pub(crate) fn effective_boolean(value: &Value) -> Option<bool> {
         Value::Boolean(b) => Some(*b),
         Value::String(s) => Some(!s.is_empty()),
         Value::Integer(i) => Some(*i != Integer::from(0)),
+        // BigInteger is strictly outside i64, so never zero.
+        Value::BigInteger(_) => Some(true),
         Value::Decimal(d) => Some(*d != Decimal::from(0)),
         Value::Float(f) => Some(!(f.is_nan() || *f == Float::from(0.))),
         Value::Double(d) => Some(!(d.is_nan() || *d == Double::from(0.))),
@@ -438,7 +564,11 @@ fn order_literals(xv: &Value, x: &Literal, yv: &Value, y: &Literal) -> Ordering 
 /// The kinds of literal value `ORDER BY` ranks apart ([`order`]).
 fn kind(value: &Value) -> u8 {
     match value {
-        Value::Integer(_) | Value::Decimal(_) | Value::Float(_) | Value::Double(_) => 0,
+        Value::Integer(_)
+        | Value::BigInteger(_)
+        | Value::Decimal(_)
+        | Value::Float(_)
+        | Value::Double(_) => 0,
         Value::Boolean(_) => 1,
         Value::String(_) => 2,
         Value::LangString(..) => 3,
@@ -490,15 +620,23 @@ fn utc<T: PartialOrd + Copy>(x: T, y: T, or_timezone: fn(T, TimezoneOffset) -> T
 }
 
 /// A number's key for [`within_kind`]: whether it is a number at all (NaN isn't), its
-/// double value (-0 as 0), whether it is binary floating point, and the exact value of an
-/// integer or decimal.
-fn numeric_key(value: &Value) -> (bool, OrderedDouble, bool, Option<Decimal>) {
+/// double value (-0 as 0), its exact-vs-floating bucket (`-INF` floats before negative
+/// integers past `-f64::MAX`, exact values in the middle, other floats/doubles including
+/// `+INF` after), and the exact value of an integer or decimal.
+fn numeric_key(value: &Value) -> (bool, OrderedDouble, u8, Option<Exact<'_>>) {
     let double = to_double(value).map_or(f64::NAN, f64::from);
-    let exact = to_decimal(value);
+    let exact = Exact::of(value);
+    let bucket = if exact.is_some() {
+        1
+    } else if double == f64::NEG_INFINITY {
+        0
+    } else {
+        2
+    };
     (
         !double.is_nan(),
         OrderedDouble(if double == 0. { 0. } else { double }),
-        exact.is_none(),
+        bucket,
         exact,
     )
 }
@@ -549,6 +687,7 @@ pub fn canonical(term: Term) -> Term {
     match Value::of_literal(literal) {
         // Every integer type becomes xsd:integer.
         Value::Integer(i) => Literal::new_typed_literal(i.to_string(), xsd::INTEGER).into(),
+        Value::BigInteger(b) => Literal::new_typed_literal(b.to_string(), xsd::INTEGER).into(),
         Value::Decimal(d) => canonical(d.to_string()),
         Value::Double(d) => canonical(d.to_string()),
         Value::Float(f) => canonical(f.to_string()),
@@ -621,6 +760,104 @@ mod tests {
         }
     }
 
+    #[test]
+    fn big_integer_bounds_and_canonical_forms() {
+        let huge_pos = format!("1{}", "0".repeat(400));
+        let huge_neg = format!("-1{}", "0".repeat(400));
+        // Values fitting in i64 stay on the Value::Integer fast path.
+        for (lexical, datatype) in [
+            ("9223372036854775807", "integer"),
+            ("-9223372036854775808", "integer"),
+            ("9223372036854775807", "long"),
+            ("9223372036854775807", "unsignedLong"),
+            ("+0000000000000000000000000001", "positiveInteger"),
+            ("-0000000000000000000000000000", "nonNegativeInteger"),
+        ] {
+            assert!(
+                matches!(Value::of(&typed(lexical, datatype)), Value::Integer(_)),
+                "expected Value::Integer for {lexical}^^xsd:{datatype}"
+            );
+        }
+        // Valid integers outside i64 become Value::BigInteger with canonical Display.
+        for (lexical, datatype, expected) in [
+            ("9223372036854775808", "integer", "9223372036854775808"),
+            (
+                "+0009223372036854775808",
+                "nonNegativeInteger",
+                "9223372036854775808",
+            ),
+            (
+                "9223372036854775808",
+                "positiveInteger",
+                "9223372036854775808",
+            ),
+            ("9223372036854775808", "unsignedLong", "9223372036854775808"),
+            (
+                "18446744073709551615",
+                "unsignedLong",
+                "18446744073709551615",
+            ),
+            ("18446744073709551616", "integer", "18446744073709551616"),
+            ("-9223372036854775809", "integer", "-9223372036854775809"),
+            (
+                "-009223372036854775809",
+                "negativeInteger",
+                "-9223372036854775809",
+            ),
+            (
+                "-9223372036854775809",
+                "nonPositiveInteger",
+                "-9223372036854775809",
+            ),
+            (huge_pos.as_str(), "integer", huge_pos.as_str()),
+            (huge_pos.as_str(), "nonNegativeInteger", huge_pos.as_str()),
+            (huge_pos.as_str(), "positiveInteger", huge_pos.as_str()),
+            (huge_neg.as_str(), "integer", huge_neg.as_str()),
+            (huge_neg.as_str(), "nonPositiveInteger", huge_neg.as_str()),
+            (huge_neg.as_str(), "negativeInteger", huge_neg.as_str()),
+        ] {
+            let term = typed(lexical, datatype);
+            match Value::of(&term) {
+                Value::BigInteger(b) => {
+                    assert_eq!(b.to_string(), expected, "{lexical}^^xsd:{datatype}")
+                }
+                other => panic!(
+                    "expected Value::BigInteger for {lexical}^^xsd:{datatype}, got {other:?}"
+                ),
+            }
+            assert_eq!(
+                canonical(term),
+                typed(expected, "integer"),
+                "canonical({lexical}^^xsd:{datatype})"
+            );
+        }
+        // Out-of-range bounded subtypes and malformed big integer forms stay Value::Other.
+        for (lexical, datatype) in [
+            ("9223372036854775808", "long"),
+            ("-9223372036854775809", "long"),
+            ("18446744073709551616", "unsignedLong"),
+            ("-9223372036854775809", "unsignedLong"),
+            (huge_pos.as_str(), "unsignedLong"),
+            (huge_neg.as_str(), "unsignedLong"),
+            (huge_neg.as_str(), "nonNegativeInteger"),
+            (huge_neg.as_str(), "positiveInteger"),
+            (huge_pos.as_str(), "nonPositiveInteger"),
+            (huge_pos.as_str(), "negativeInteger"),
+            ("9223372036854775808a", "integer"),
+            (" 9223372036854775808", "integer"),
+            ("9223372036854775808.0", "integer"),
+            ("1e30", "integer"),
+            ("", "integer"),
+            ("+", "integer"),
+            ("-", "integer"),
+        ] {
+            assert!(
+                matches!(Value::of(&typed(lexical, datatype)), Value::Other(_)),
+                "expected Value::Other for {lexical}^^xsd:{datatype}"
+            );
+        }
+    }
+
     /// Literals whose values `<` orders only partly: numbers of every type (NaN, -0, an
     /// integer and a float of nearly the same value), strings, language strings, dates
     /// with and without timezones close to each other, durations of months and of days,
@@ -645,6 +882,40 @@ mod tests {
             typed("1e300", "double"),
             typed("9007199254740993", "integer"),
             typed("9007199254740992", "double"),
+            typed("9223372036854775807", "integer"),
+            typed("9223372036854775808", "integer"),
+            typed("9223372036854775808", "unsignedLong"),
+            typed("+09223372036854775808", "nonNegativeInteger"),
+            typed("18446744073709551615", "unsignedLong"),
+            typed("18446744073709551616", "unsignedLong"),
+            typed("18446744073709551616", "double"),
+            typed("100000000000000000000", "integer"),
+            typed("100000000000000000000.0", "decimal"),
+            typed("100000000000000000002", "positiveInteger"),
+            typed("170141183460469231731", "integer"),
+            typed("170141183460469231731.687303715884105727", "decimal"),
+            typed("170141183460469231732", "integer"),
+            typed("-170141183460469231731", "integer"),
+            typed("-170141183460469231731.687303715884105728", "decimal"),
+            typed("-170141183460469231732", "integer"),
+            typed("3.4028235E38", "float"),
+            typed("-3.4028235E38", "float"),
+            typed("340282356779733661637539395458142568447", "integer"),
+            typed("340282356779733661637539395458142568448", "integer"),
+            typed("-340282356779733661637539395458142568448", "integer"),
+            typed("-9223372036854775808", "integer"),
+            typed("-9223372036854775809", "integer"),
+            typed("-9223372036854775809", "negativeInteger"),
+            typed("-1e300", "double"),
+            typed("-INF", "double"),
+            typed("-INF", "float"),
+            typed("INF", "double"),
+            typed(&format!("1{}", "0".repeat(40)), "integer"),
+            typed(&format!("-1{}", "0".repeat(40)), "integer"),
+            typed(&format!("1{}", "0".repeat(400)), "integer"),
+            typed(&format!("1{}", "0".repeat(401)), "integer"),
+            typed(&format!("-1{}", "0".repeat(400)), "integer"),
+            typed(&format!("-1{}", "0".repeat(401)), "integer"),
             typed("true", "boolean"),
             typed("2000-01-01T00:00:00", "dateTime"),
             typed("2000-01-01T10:00:00Z", "dateTime"),
