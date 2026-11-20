@@ -720,10 +720,10 @@ async fn ordinary_datasets_keep_their_rows_and_completeness() -> TestResult {
     );
     let omitted = concat!(
         r#"sound-only; regime=owl2-rl; reasons="rules: this read's dataset leaves out the "#,
-        "default graph, where the inferred statements are: answers over its asserted ",
-        "statements; rules: the query reads a variable predicate: OWL 2 entails statements ",
-        "of the rdf:, rdfs: and owl: vocabulary that no closure, rewriting or bound holds in ",
-        r#"full""#,
+        "store's default graph from its default graph, where inferred statements are stored; ",
+        "default-graph patterns see only the selected graphs' asserted statements; rules: the ",
+        "query reads a variable predicate: OWL 2 entails statements of the rdf:, rdfs: and ",
+        r#"owl: vocabulary that no closure, rewriting or bound holds in full""#,
     );
     let mut compared = Vec::new();
     for (options, dataset, expected, completeness) in [
