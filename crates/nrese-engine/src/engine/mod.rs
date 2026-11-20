@@ -589,6 +589,8 @@ struct Shared {
     /// a commit) that read a base in the quad layout: their bytes, counted in the index memory
     /// ([`Engine::stats`]) while any holder keeps one (DUR-6).
     forms: crate::index::Forms,
+    #[cfg(test)]
+    on_maintain: Mutex<Option<maintenance_tests::MaintainHook>>,
 }
 
 impl Drop for Shared {
@@ -738,20 +740,32 @@ impl Shared {
         }
     }
 
+    #[cfg(test)]
+    fn run_test_hook(&self, phase: maintenance_tests::Phase) {
+        let mut guard = self.on_maintain.lock();
+        if let Some(hook) = guard.as_mut() {
+            hook(phase);
+        }
+    }
+
     /// Runs whatever maintenance was requested: a task of the background worker. Returns what
     /// is to be done again because it couldn't be done now (on a pool thread nothing waits
     /// for a running merge or checkpoint); the requests stay set for it.
     fn maintain(&self) -> Again {
         let do_compaction = self.wants_compaction.swap(false, Ordering::AcqRel);
         let do_checkpoint = self.wants_checkpoint.swap(false, Ordering::AcqRel);
-        #[cfg(test)]
-        maintenance_tests::on_maintain();
         let mut again = Again::default();
-        if do_compaction && self.versions.compact(false) == CompactionOutcome::Deferred {
-            self.wants_compaction.store(true, Ordering::Release);
-            again.merge = true;
+        if do_compaction {
+            #[cfg(test)]
+            self.run_test_hook(maintenance_tests::Phase::Compaction);
+            if self.versions.compact(false) == CompactionOutcome::Deferred {
+                self.wants_compaction.store(true, Ordering::Release);
+                again.merge = true;
+            }
         }
         if do_checkpoint {
+            #[cfg(test)]
+            self.run_test_hook(maintenance_tests::Phase::Checkpoint);
             match self.checkpoint() {
                 Ok(_) => {}
                 // Another checkpoint is being written; it may be of an older revision than
@@ -1136,6 +1150,8 @@ impl Engine {
             admission: config.admission,
             clock: AtomicU64::new(clock),
             forms: Default::default(),
+            #[cfg(test)]
+            on_maintain: Mutex::new(None),
         });
         let worker = config
             .background_maintenance
@@ -1418,22 +1434,55 @@ impl Engine {
 
 #[cfg(test)]
 mod maintenance_tests {
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::durability::{DurabilityConfig, SyncPolicy};
     use nrese_rdf::{GraphNameRef, Literal, NamedNodeRef, QuadRef};
 
-    type MaintainHook = Box<dyn FnMut() + Send>;
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Phase {
+        Compaction,
+        Checkpoint,
+    }
 
-    static ON_MAINTAIN: Mutex<Option<MaintainHook>> = Mutex::new(None);
-    static SERIAL: Mutex<()> = Mutex::new(());
+    pub(super) type MaintainHook = Box<dyn FnMut(Phase) + Send>;
 
-    pub(super) fn on_maintain() {
-        let mut guard = ON_MAINTAIN.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hook) = guard.as_mut() {
-            hook();
+    struct PanickingDrop;
+
+    impl Drop for PanickingDrop {
+        fn drop(&mut self) {
+            panic!("injected payload destructor panic");
+        }
+    }
+
+    fn set_hook(engine: &Engine, hook: impl FnMut(Phase) + Send + 'static) {
+        *engine.inner.shared.on_maintain.lock() = Some(Box::new(hook));
+    }
+
+    fn settle_bounded(engine: &Arc<Engine>, timeout: Duration, context: &str) {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let settler = {
+            let engine = Arc::clone(engine);
+            std::thread::spawn(move || {
+                engine.settle();
+                let _ = done_tx.send(());
+            })
+        };
+        assert!(
+            done_rx.recv_timeout(timeout).is_ok(),
+            "Engine::settle hung: {context}"
+        );
+        settler.join().unwrap();
+    }
+
+    fn wait_for(deadline: Duration, cond: impl Fn() -> bool, context: &str) {
+        let started = Instant::now();
+        while !cond() {
+            assert!(started.elapsed() < deadline, "timed out waiting: {context}");
+            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -1450,25 +1499,11 @@ mod maintenance_tests {
 
     /// A panic inside a background maintenance task must clear `maintaining`, let
     /// `Engine::settle` return promptly, keep the maintenance worker alive so subsequent
-    /// commits still run maintenance, and let `Engine::drop` finish cleanly.
+    /// commits still complete observable maintenance, and let `Engine::drop` finish cleanly.
     #[test]
     fn maintenance_worker_recovers_from_panic_and_settle_does_not_hang() {
-        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_hook = Arc::clone(&calls);
-        *ON_MAINTAIN.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(move || {
-            let n = calls_hook.fetch_add(1, Ordering::SeqCst);
-            if n == 0 {
-                panic!("injected maintenance panic");
-            }
-        }));
-        struct ClearHook;
-        impl Drop for ClearHook {
-            fn drop(&mut self) {
-                *ON_MAINTAIN.lock().unwrap_or_else(|e| e.into_inner()) = None;
-            }
-        }
-        let _clear = ClearHook;
 
         let engine = Arc::new(
             Engine::new(EngineConfig {
@@ -1481,46 +1516,264 @@ mod maintenance_tests {
             })
             .unwrap(),
         );
-        // Trigger a background maintenance wakeup that panics on the first call.
+        set_hook(&engine, move |phase| {
+            if phase == Phase::Compaction && calls_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+                panic!("injected maintenance panic");
+            }
+        });
+
         commit_one(&engine, 1);
         commit_one(&engine, 2);
 
-        let started = Instant::now();
-        while calls.load(Ordering::SeqCst) < 1 {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "maintenance never ran"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-
-        // `settle` must return promptly (not spin forever on a stuck `maintaining` flag).
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let settler = {
-            let engine = Arc::clone(&engine);
-            std::thread::spawn(move || {
-                engine.settle();
-                let _ = done_tx.send(());
-            })
-        };
-        assert!(
-            done_rx.recv_timeout(Duration::from_secs(3)).is_ok(),
-            "Engine::settle hung after maintenance panic"
+        wait_for(
+            Duration::from_secs(5),
+            || calls.load(Ordering::SeqCst) >= 1,
+            "first maintenance compaction attempt",
         );
-        settler.join().unwrap();
+        settle_bounded(&engine, Duration::from_secs(3), "after compaction panic");
 
-        // A later commit must still wake and run on the surviving maintenance worker.
-        let before = calls.load(Ordering::SeqCst);
+        let before_compactions = engine.stats().compactions;
         commit_one(&engine, 3);
         commit_one(&engine, 4);
-        let started = Instant::now();
-        while calls.load(Ordering::SeqCst) <= before {
-            assert!(
-                started.elapsed() < Duration::from_secs(5),
-                "maintenance worker died permanently after panic"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        engine.settle();
+        settle_bounded(
+            &engine,
+            Duration::from_secs(5),
+            "follow-on compaction after panic",
+        );
+        assert!(
+            engine.stats().compactions > before_compactions,
+            "maintenance worker failed to complete follow-on compaction after panic"
+        );
+    }
+
+    /// If compaction defers because a foreground merge holds the merge claim and the
+    /// subsequent checkpoint in the same maintenance turn panics, the deferred compaction
+    /// retry must not be stranded: releasing the merge claim must let compaction complete
+    /// and `Engine::settle` return promptly with no additional commit.
+    #[test]
+    fn checkpoint_panic_after_deferred_compaction_still_completes_compaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            Engine::open(
+                dir.path(),
+                EngineConfig {
+                    background_maintenance: true,
+                    compaction: CompactionPolicy {
+                        fanout: 2,
+                        inline_entry_limit: 0,
+                    },
+                    durability: DurabilityConfig {
+                        sync: SyncPolicy::OsBuffered,
+                        checkpoint_after_wal_bytes: 1,
+                        ..DurabilityConfig::default()
+                    },
+                    ..EngineConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        // Establish run #1 and finish its initial checkpoint so the next single commit
+        // requests both compaction and checkpoint on one wakeup.
+        commit_one(&engine, 1);
+        settle_bounded(&engine, Duration::from_secs(5), "initial run setup");
+
+        let panicked = Arc::new(AtomicBool::new(false));
+        let panicked_hook = Arc::clone(&panicked);
+        set_hook(&engine, move |phase| {
+            if phase == Phase::Checkpoint && !panicked_hook.swap(true, Ordering::SeqCst) {
+                panic!("injected checkpoint panic after deferred compaction");
+            }
+        });
+
+        let before_compactions = engine.stats().compactions;
+        let claim = engine
+            .inner
+            .shared
+            .versions
+            .claim(false)
+            .expect("merge claim free");
+        commit_one(&engine, 2);
+
+        wait_for(
+            Duration::from_secs(5),
+            || panicked.load(Ordering::SeqCst),
+            "checkpoint panic while merge claim held",
+        );
+        drop(claim);
+
+        settle_bounded(
+            &engine,
+            Duration::from_secs(5),
+            "after checkpoint panic with deferred compaction",
+        );
+        assert!(
+            engine.stats().compactions > before_compactions,
+            "deferred compaction was stranded after checkpoint panic"
+        );
+    }
+
+    /// A panic during background compaction must not discard a checkpoint request that was
+    /// consumed upfront in the same maintenance turn.
+    #[test]
+    fn compaction_panic_does_not_discard_pending_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = Arc::new(
+            Engine::open(
+                dir.path(),
+                EngineConfig {
+                    background_maintenance: true,
+                    compaction: CompactionPolicy {
+                        fanout: 2,
+                        inline_entry_limit: 0,
+                    },
+                    durability: DurabilityConfig {
+                        sync: SyncPolicy::OsBuffered,
+                        checkpoint_after_wal_bytes: 1,
+                        ..DurabilityConfig::default()
+                    },
+                    ..EngineConfig::default()
+                },
+            )
+            .unwrap(),
+        );
+        commit_one(&engine, 1);
+        settle_bounded(&engine, Duration::from_secs(5), "initial run setup");
+
+        let panicked = Arc::new(AtomicBool::new(false));
+        let panicked_hook = Arc::clone(&panicked);
+        set_hook(&engine, move |phase| {
+            if phase == Phase::Compaction && !panicked_hook.swap(true, Ordering::SeqCst) {
+                panic!("injected compaction panic before checkpoint");
+            }
+        });
+
+        let before_checkpoints = engine.stats().checkpoints;
+        commit_one(&engine, 2);
+        wait_for(
+            Duration::from_secs(5),
+            || panicked.load(Ordering::SeqCst),
+            "compaction panic fired",
+        );
+        settle_bounded(
+            &engine,
+            Duration::from_secs(5),
+            "after compaction panic with pending checkpoint",
+        );
+        assert!(
+            engine.stats().checkpoints > before_checkpoints,
+            "pending checkpoint was discarded after compaction panic"
+        );
+    }
+
+    /// A panic payload whose `Drop` implementation itself panics must not unwind out of the
+    /// recovery path and kill the maintenance worker thread.
+    #[test]
+    fn panicking_payload_destructor_does_not_kill_maintenance_worker() {
+        let engine = Arc::new(
+            Engine::new(EngineConfig {
+                background_maintenance: true,
+                compaction: CompactionPolicy {
+                    fanout: 2,
+                    inline_entry_limit: 0,
+                },
+                ..EngineConfig::default()
+            })
+            .unwrap(),
+        );
+        let panicked = Arc::new(AtomicBool::new(false));
+        let panicked_hook = Arc::clone(&panicked);
+        set_hook(&engine, move |phase| {
+            if phase == Phase::Compaction && !panicked_hook.swap(true, Ordering::SeqCst) {
+                std::panic::panic_any(PanickingDrop);
+            }
+        });
+
+        commit_one(&engine, 1);
+        commit_one(&engine, 2);
+        wait_for(
+            Duration::from_secs(5),
+            || panicked.load(Ordering::SeqCst),
+            "panicking payload fired",
+        );
+        settle_bounded(
+            &engine,
+            Duration::from_secs(3),
+            "after panicking payload destructor",
+        );
+
+        let before_compactions = engine.stats().compactions;
+        commit_one(&engine, 3);
+        commit_one(&engine, 4);
+        settle_bounded(
+            &engine,
+            Duration::from_secs(5),
+            "follow-on commit after panicking payload",
+        );
+        assert!(
+            engine.stats().compactions > before_compactions,
+            "maintenance worker died when dropping caught panic payload"
+        );
+    }
+
+    /// A panic (including a panicking payload destructor) on the off-pool shutdown path must
+    /// not kill the worker or hang `Engine::drop`.
+    #[test]
+    fn off_pool_shutdown_panic_does_not_hang_drop() {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: true,
+            compaction: CompactionPolicy {
+                fanout: 2,
+                inline_entry_limit: 0,
+            },
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let deferred = Arc::new(AtomicBool::new(false));
+        let deferred_hook = Arc::clone(&deferred);
+        let retry_panicked = Arc::new(AtomicBool::new(false));
+        let retry_hook = Arc::clone(&retry_panicked);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_hook = Arc::clone(&calls);
+        set_hook(&engine, move |phase| {
+            if phase == Phase::Compaction {
+                let n = calls_hook.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    deferred_hook.store(true, Ordering::SeqCst);
+                } else {
+                    retry_hook.store(true, Ordering::SeqCst);
+                    std::panic::panic_any(PanickingDrop);
+                }
+            }
+        });
+
+        let shared = Arc::clone(&engine.inner.shared);
+        let claim = shared.versions.claim(false).expect("merge claim free");
+        commit_one(&engine, 1);
+        commit_one(&engine, 2);
+        wait_for(
+            Duration::from_secs(5),
+            || deferred.load(Ordering::SeqCst),
+            "initial compaction deferred on merge claim",
+        );
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let dropper = std::thread::spawn(move || {
+            drop(engine);
+            let _ = done_tx.send(());
+        });
+        // Give drop a moment to mark Shutdown::OffPool before releasing the merge claim so
+        // the worker's retry executes on the OffPool path.
+        std::thread::sleep(Duration::from_millis(50));
+        drop(claim);
+
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "Engine::drop hung on off-pool shutdown panic"
+        );
+        dropper.join().unwrap();
+        assert!(
+            retry_panicked.load(Ordering::SeqCst),
+            "off-pool shutdown retry never ran"
+        );
     }
 }
