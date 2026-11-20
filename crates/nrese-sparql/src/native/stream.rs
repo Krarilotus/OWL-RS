@@ -274,14 +274,21 @@ impl Context<'_> {
                 Final::Copy(target, column) => {
                     self.extend(solutions, target, &Expression::Variable(column.clone()))?
                 }
-                Final::Average { target, sum, count } => self.extend(
-                    solutions,
-                    target,
-                    &Expression::Divide(
-                        Box::new(Expression::Variable(sum.clone())),
-                        Box::new(Expression::Variable(count.clone())),
-                    ),
-                )?,
+                Final::Average { target, sum, count } => {
+                    let zero = Expression::Literal(nrese_rdf::Literal::from(0i64));
+                    let average = Expression::If(
+                        Box::new(Expression::Equal(
+                            Box::new(Expression::Variable(count.clone())),
+                            Box::new(zero.clone()),
+                        )),
+                        Box::new(zero),
+                        Box::new(Expression::Divide(
+                            Box::new(Expression::Variable(sum.clone())),
+                            Box::new(Expression::Variable(count.clone())),
+                        )),
+                    );
+                    self.extend(solutions, target, &average)?
+                }
             };
         }
         let mut wanted = variables.to_vec();

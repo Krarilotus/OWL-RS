@@ -333,7 +333,11 @@ fn pre_aggregated(
                 ));
                 partials.push((
                     partial_count.clone(),
-                    AggregateExpression::CountSolutions { distinct: false },
+                    AggregateExpression::FunctionCall {
+                        name: AggregateFunction::Count,
+                        expr: expr.clone(),
+                        distinct: false,
+                    },
                 ));
                 let (total, count) = (fresh(), fresh());
                 finals.push((total.clone(), over(AggregateFunction::Sum, &partial)));
@@ -366,9 +370,17 @@ fn pre_aggregated(
         bindings: quotients
             .into_iter()
             .map(|(variable, total, count)| {
-                let quotient = Expression::Divide(
-                    Box::new(Expression::Variable(total)),
-                    Box::new(Expression::Variable(count)),
+                let zero = Expression::Literal(nrese_rdf::Literal::from(0i64));
+                let quotient = Expression::If(
+                    Box::new(Expression::Equal(
+                        Box::new(Expression::Variable(count.clone())),
+                        Box::new(zero.clone()),
+                    )),
+                    Box::new(zero),
+                    Box::new(Expression::Divide(
+                        Box::new(Expression::Variable(total)),
+                        Box::new(Expression::Variable(count)),
+                    )),
                 );
                 (variable, quotient)
             })
