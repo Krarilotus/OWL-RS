@@ -58,11 +58,31 @@ use crate::term::{TermId, TermKind};
 use crate::visit::{Stopped, Visitor};
 
 /// The characteristic sets of one read model as built at a size (`None`: there were too
-/// many to keep, or the budget couldn't take them), and whether a rebuild is under way.
+/// many to keep, or the budget couldn't take them), and the token of the rebuild under way,
+/// if any ([`Rebuilding`]).
 struct Sets {
     built: Option<cell::Kept<CharacteristicSets>>,
     at: u64,
-    rebuilding: bool,
+    rebuilding: Option<u64>,
+}
+
+/// Owns one background characteristic-sets rebuild claim: clears `Sets::rebuilding` on drop
+/// (spawn failure, early return, normal completion, or panic) iff the entry still holds this
+/// rebuild's token. Never dropped while `Statistics::sets` is held.
+struct Rebuilding {
+    statistics: Arc<Statistics>,
+    model: ReadModel,
+    token: u64,
+}
+
+impl Drop for Rebuilding {
+    fn drop(&mut self) {
+        if let Some(kept) = self.statistics.sets.lock().get_mut(&self.model)
+            && kept.rebuilding == Some(self.token)
+        {
+            kept.rebuilding = None;
+        }
+    }
 }
 
 impl Sets {
@@ -120,6 +140,8 @@ pub(crate) struct Statistics {
     heavy_walks: AtomicU64,
     /// Per read model, the default graph's characteristic sets.
     sets: Mutex<HashMap<ReadModel, Sets>>,
+    /// Monotone token generator for [`Rebuilding`] guards.
+    rebuild_seq: AtomicU64,
     /// Per read model, the build of its sets under way: one at a time, and planners that
     /// need the sets meanwhile help it and wait for it.
     building: BuildCell<ReadModel, CharacteristicSets>,
@@ -141,6 +163,10 @@ pub(crate) struct Statistics {
     /// tests hold a build with.
     #[cfg(test)]
     hook: Mutex<Option<Hook>>,
+    /// When set to `true` in tests, makes the next [`Self::rebuild`] fail as if thread spawn
+    /// returned an OS error, exercising the start-failure path without holding `self.sets`.
+    #[cfg(test)]
+    fail_next_rebuild_spawn: std::sync::atomic::AtomicBool,
 }
 
 /// What a test runs at the next build's first scan ([`Statistics::hook`]).
@@ -395,26 +421,41 @@ impl Statistics {
     /// The sets of `model` kept, or read from their file if none are; drifted ones by more
     /// than a quarter from `size` too, with one rebuild started for them.
     fn kept_sets(self: &Arc<Self>, state: &SharedState<'_>, model: ReadModel, size: u64) -> Kept {
-        let mut sets = self.sets.lock();
-        let kept = match sets.entry(model) {
-            std::collections::hash_map::Entry::Occupied(kept) => kept.into_mut(),
-            std::collections::hash_map::Entry::Vacant(vacant) => {
-                let Some((built, at)) = self.load_sets(state, model) else {
-                    return Kept::Cold;
-                };
-                // Over the budget: none until the next build (there were none before).
-                vacant.insert(Sets {
-                    built: built.and_then(|sets| self.keep(sets).ok()),
-                    at,
-                    rebuilding: false,
+        let (result, guard) = {
+            let mut sets = self.sets.lock();
+            let kept = match sets.entry(model) {
+                std::collections::hash_map::Entry::Occupied(kept) => kept.into_mut(),
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    let Some((built, at)) = self.load_sets(state, model) else {
+                        return Kept::Cold;
+                    };
+                    // Over the budget: none until the next build (there were none before).
+                    vacant.insert(Sets {
+                        built: built.and_then(|sets| self.keep(sets).ok()),
+                        at,
+                        rebuilding: None,
+                    })
+                }
+            };
+            let guard = if !kept.fits(size) && kept.rebuilding.is_none() {
+                let token = self.rebuild_seq.fetch_add(1, Ordering::Relaxed) + 1;
+                kept.rebuilding = Some(token);
+                Some(Rebuilding {
+                    statistics: Arc::clone(self),
+                    model,
+                    token,
                 })
-            }
+            } else {
+                None
+            };
+            (Kept::Sets(kept.sets()), guard)
         };
-        if !kept.fits(size) && !kept.rebuilding {
-            kept.rebuilding = true;
-            self.rebuild(state, model);
+        // Spawn after releasing `self.sets`: if spawning fails and drops `guard` on this
+        // thread, `Rebuilding::drop` acquires `self.sets` cleanly without deadlocking.
+        if let Some(guard) = guard {
+            self.rebuild(state, model, guard);
         }
-        Kept::Sets(kept.sets())
+        result
     }
 
     /// `sets` as kept, built into vectors charged to the budget ([`Gathered::kept`]); an
@@ -430,19 +471,20 @@ impl Statistics {
 
     /// Rebuilds the drifted sets of `model` on a thread of its own, scanning on that
     /// thread alone, and replaces them when done; planners go on with the old ones. The
-    /// thread owns a clone of the token's snapshot and takes its own token from it for
-    /// every later stage: the sets are that snapshot's, whatever
-    /// is published meanwhile.
-    fn rebuild(self: &Arc<Self>, state: &SharedState<'_>, model: ReadModel) {
+    /// thread owns a clone of the token's snapshot and `guard`, so spawn failure, early
+    /// return, normal completion, and panic all clear the rebuilding claim on drop.
+    fn rebuild(self: &Arc<Self>, state: &SharedState<'_>, model: ReadModel, guard: Rebuilding) {
+        #[cfg(test)]
+        if self.fail_next_rebuild_spawn.swap(false, Ordering::SeqCst) {
+            drop(guard);
+            return;
+        }
         let (statistics, snapshot) = (Arc::clone(self), state.snapshot().clone());
-        let started = std::thread::Builder::new()
+        let _ = std::thread::Builder::new()
             .name("nrese-statistics".to_owned())
             .spawn(move || {
-                // A clone keeps its publication: never `None`, so never left asked for.
+                let _guard = guard;
                 let Some(state) = snapshot.shared_state() else {
-                    if let Some(kept) = statistics.sets.lock().get_mut(&model) {
-                        kept.rebuilding = false;
-                    }
                     return;
                 };
                 let builder = statistics.claim_anyway(model);
@@ -450,12 +492,6 @@ impl Statistics {
                 let size = state.snapshot().count_in(model, &pattern).at_least();
                 statistics.build_sets(&builder, &state, model, size, false);
             });
-        if started.is_err()
-            && let Some(kept) = self.sets.lock().get_mut(&model)
-        {
-            // Asked again at the next drifted use.
-            kept.rebuilding = false;
-        }
     }
 
     /// Builds the characteristic sets of `model` now, whatever the size, keeps and saves
@@ -502,17 +538,14 @@ impl Statistics {
                 tracing::warn!(%error, ?model, "characteristic sets not replaced: over the budget");
                 let mut sets = self.sets.lock();
                 let old = match sets.get_mut(&model) {
-                    Some(old) => {
-                        old.rebuilding = false;
-                        old.sets()
-                    }
+                    Some(old) => old.sets(),
                     None => {
                         sets.insert(
                             model,
                             Sets {
                                 built: None,
                                 at: size,
-                                rebuilding: false,
+                                rebuilding: None,
                             },
                         );
                         None
@@ -523,14 +556,18 @@ impl Statistics {
             }
         };
         let built = kept.as_ref().map(|kept| Arc::clone(kept.value()));
-        let replaced = self.sets.lock().insert(
-            model,
-            Sets {
-                built: kept,
-                at: size,
-                rebuilding: false,
-            },
-        );
+        let replaced = {
+            let mut sets = self.sets.lock();
+            let rebuilding = sets.get(&model).and_then(|old| old.rebuilding);
+            sets.insert(
+                model,
+                Sets {
+                    built: kept,
+                    at: size,
+                    rebuilding,
+                },
+            )
+        };
         // The old sets let go after the swap, outside the lock.
         drop(replaced);
         builder.finish(built.clone());
@@ -1313,6 +1350,61 @@ mod tests {
         let rebuilt = snapshot
             .characteristic_sets_in(model)
             .expect("rebuilt after retry");
+        assert!(!Arc::ptr_eq(&rebuilt, &first));
+        assert_eq!(rebuilt.subjects(), 900);
+    }
+
+    /// A failed thread spawn when starting a background rebuild must not deadlock on
+    /// `Statistics::sets` and must clear the rebuilding claim so the next drifted read
+    /// starts a rebuild cleanly.
+    #[test]
+    fn spawn_failure_clears_rebuilding_without_deadlocking() {
+        let model = ReadModel::default();
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        add(&engine, 0..300);
+        let statistics = Arc::clone(&engine.inner.shared.statistics);
+        let first = engine
+            .snapshot()
+            .characteristic_sets_in(model)
+            .expect("initial sets");
+        assert_eq!(statistics.scans(), 1);
+
+        add(&engine, 300..900);
+        let snapshot = engine.snapshot();
+        statistics
+            .fail_next_rebuild_spawn
+            .store(true, Ordering::SeqCst);
+        let stale = snapshot
+            .characteristic_sets_in(model)
+            .expect("returns old sets without deadlocking on spawn failure");
+        assert!(Arc::ptr_eq(&stale, &first));
+        assert!(
+            statistics
+                .sets
+                .lock()
+                .get(&model)
+                .is_some_and(|s| s.rebuilding.is_none()),
+            "rebuilding claim must be cleared when spawn fails"
+        );
+
+        // Next drifted read triggers a real rebuild and replaces the sets.
+        let _ = snapshot.characteristic_sets_in(model);
+        let started = std::time::Instant::now();
+        while statistics
+            .sets
+            .lock()
+            .get(&model)
+            .is_none_or(|s| s.at < 900)
+        {
+            assert!(
+                started.elapsed().as_secs() < 15,
+                "rebuild did not run after earlier spawn failure"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let rebuilt = snapshot
+            .characteristic_sets_in(model)
+            .expect("rebuilt after spawn failure");
         assert!(!Arc::ptr_eq(&rebuilt, &first));
         assert_eq!(rebuilt.subjects(), 900);
     }

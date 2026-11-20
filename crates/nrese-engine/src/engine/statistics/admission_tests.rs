@@ -252,7 +252,10 @@ fn an_unpublished_snapshot_starts_no_rebuild() {
     {
         let kept_sets = statistics.sets.lock();
         let sets = kept_sets.get(&MODEL).unwrap();
-        assert!(!sets.rebuilding, "no rebuild asked for by a pending read");
+        assert!(
+            sets.rebuilding.is_none(),
+            "no rebuild asked for by a pending read"
+        );
         assert_eq!(sets.at, 600);
     }
     assert_eq!(statistics.scans(), 1);
@@ -264,7 +267,13 @@ fn an_unpublished_snapshot_starts_no_rebuild() {
         .expect("kept");
     assert!(Arc::ptr_eq(&drifted, &kept));
     assert!(
-        statistics.sets.lock().get(&MODEL).unwrap().rebuilding,
+        statistics
+            .sets
+            .lock()
+            .get(&MODEL)
+            .unwrap()
+            .rebuilding
+            .is_some(),
         "a published drift asks for one"
     );
     drop(held);
