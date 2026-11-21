@@ -124,8 +124,10 @@ the snapshot and its other slots. The engine takes it under none of its own lock
 The `owl2-dl` bounds (U1) are `Bounds` in `crates/nrese-store/src/dl/bounds.rs:145`. Its `state` and `view` mutexes guard
 serial work only: taking what a read or a commit needs, a revision check, publishing, applying a computed change. The engine's writer slot and
 the mutation pipeline's ground cache (`crates/nrese-store/src/mutation/pipeline.rs:227`) come before the mutation-side `state`, which `install`
-takes after the commit returns (:363). A build cell's `building` mutex (`crates/nrese-exec/src/cell.rs:145`) comes before the `state`/`view`
-check its `kept` closure makes. No path that holds a bounds guard enters the Rayon pool, the engine or the dictionary: U1's change, its
+takes after the commit returns (:363). A build cell's `building` mutex (`crates/nrese-exec/src/cell.rs:382`) comes before the `state`/`view`
+check its `kept` closure makes. Inside a build cell, the end of a build nests the cell's `building` mutex → the build's `state` mutex → its
+terminal's lock; nothing takes an outer one of these while holding an inner one.
+No path that holds a bounds guard enters the Rayon pool, the engine or the dictionary: U1's change, its
 builds, the taxonomy and a view's runs hold none, and a revision's builds go through the `BuildCell` under the bounded rule (a Rayon worker
 builds its own instead of waiting). "Before the dictionary" is the guards' place in the hierarchy, not permission to call the dictionary or a
 dictionary callback under one. Until it was changed, `state` was held across that parallel work. At pool widths 1 and 2 the cycle with pool readers

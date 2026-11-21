@@ -19,7 +19,7 @@
 use nrese_dl::classify::Taxonomy;
 use nrese_dl::limits::Deadline;
 use nrese_exec::ChargedVec;
-use nrese_exec::cell::{BuildCell, Claim, Kind};
+use nrese_exec::cell::{BuildCell, Claim, End, Ended, Joined, Kind};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
@@ -291,7 +291,9 @@ fn not_compiled() -> GaveUp {
 /// [`BuildCell`]: a reader off the pool waits for it; one on a Rayon worker builds its
 /// own (the bounded rule, `research-designs.md` §8). Lock order: the engine's writer slot,
 /// the pipeline's ground cache, then `state` (a leaf); a cell's own lock, then `view` or
-/// `state`; every dictionary lock after them.
+/// `state`; every dictionary lock after them. Inside a build cell, the end of a build nests
+/// the cell's `building` mutex → the build's `state` mutex → its terminal's lock; nothing
+/// takes an outer one of these while holding an inner one.
 #[derive(Default)]
 pub(crate) struct Bounds {
     state: Mutex<Slot>,
@@ -783,24 +785,49 @@ pub(crate) fn install(store: &StoreService, preparation: Preparation, revision: 
 pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
     loop {
         let snapshot = store.engine().snapshot();
-        if let Some(view) = view_until(store, &snapshot, None).expect("no stop never gives up") {
-            return (snapshot, view);
+        match view_until(store, &snapshot, None, None) {
+            Some(Ok(view)) => return (snapshot, view),
+            // Again, at the latest snapshot: a build that ended for a later revision or
+            // failed left no entry, so this claim builds.
+            Some(Err(Missing::Later | Missing::Failed)) => {}
+            // Never: no deadline and no stop.
+            None => {}
         }
     }
 }
 
+/// Why a read has no view of its revision ([`view_until`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Missing {
+    /// The bounds describe a later revision than the read's.
+    Later,
+    /// The build of the view failed: it ended with no view (a panic, an early return).
+    Failed,
+}
+
+/// How a view build ended ([`read`]).
+enum ViewEnd {
+    /// Published, and kept for later reads of its revision.
+    Kept(Arc<View>),
+    /// Given to this read and its waiters, not kept: the next read of the revision tries again.
+    Unkept(Arc<View>),
+    /// The bounds describe a later revision.
+    Later,
+}
+
 /// [`view`] of `snapshot` for a request, never another snapshot's (T3 (a)): one already
-/// built whatever `stop` says; else given up (`None`) once `stop` fires, before it claims a
-/// build or while it waits for another read's, polled as `nrese_exec::cell::Build::wait_until`
-/// says; `Some(None)` where the bounds describe a later revision than `snapshot`, or the build
+/// built whatever `stop` says; else given up (`None`) once `deadline` passes or `stop`
+/// fires, before it claims a build or while it waits for another read's (the build's
+/// `join`); `Err` where the bounds describe a later revision than `snapshot`, or the build
 /// failed. The build runs on and is kept; one this read claimed runs to its end whatever its
 /// stop says, as others may wait for it (a classification waiter's way,
 /// `classification::cached`).
 pub(crate) fn view_until(
     store: &StoreService,
     snapshot: &Snapshot,
+    deadline: Option<std::time::Instant>,
     stop: Option<&dyn Fn() -> bool>,
-) -> Option<Option<Arc<View>>> {
+) -> Option<Result<Arc<View>, Missing>> {
     let bounds = &store.dl().bounds;
     let revision = snapshot.revision();
     let cached = || {
@@ -810,33 +837,53 @@ pub(crate) fn view_until(
             .map(Arc::clone)
     };
     if let Some(view) = cached() {
-        return Some(Some(view));
+        return Some(Ok(view));
     }
-    if stop.is_some_and(|stop| stop()) {
+    let stopped = || stop.is_some_and(|stop| stop());
+    if deadline.is_some_and(|at| std::time::Instant::now() >= at) || stopped() {
         return None;
     }
+    let own = || match read(store, snapshot) {
+        ViewEnd::Kept(view) | ViewEnd::Unkept(view) => Ok(view),
+        ViewEnd::Later => Err(Missing::Later),
+    };
     let built = match bounds
         .views
         .claim(revision, Kind::Opaque, || cached().map(Some))
     {
-        Claim::Build(builder) => {
-            let built = read(store, snapshot);
-            builder.finish(built.clone());
-            built
-        }
-        Claim::Wait(flight) => match flight.wait_until(stop)? {
-            Ok(built) => built,
-            Err(nrese_exec::cell::Busy) => read(store, snapshot),
+        Claim::Build(builder) => match read(store, snapshot) {
+            ViewEnd::Kept(view) => {
+                builder.end(End::Kept(Arc::clone(&view)));
+                Ok(view)
+            }
+            ViewEnd::Unkept(view) => {
+                builder.end(End::Unkept(Some(Arc::clone(&view))));
+                Ok(view)
+            }
+            ViewEnd::Later => {
+                builder.end(End::Later);
+                Err(Missing::Later)
+            }
+        },
+        Claim::Wait(flight) => match flight.join(deadline, &stopped) {
+            Joined::Told(Ended::End(End::Kept(view) | End::Unkept(Some(view)))) => Ok(view),
+            Joined::Told(Ended::End(End::Later)) => Err(Missing::Later),
+            // Never told for a view but a panic's or an early return's.
+            Joined::Told(Ended::End(End::Empty | End::Unkept(None)) | Ended::Abandoned) => {
+                Err(Missing::Failed)
+            }
+            Joined::Busy => own(),
+            Joined::Left => return None,
         },
     };
     Some(built)
 }
 
-/// The view of `snapshot`'s revision, published; `None` if the bounds describe a later
-/// revision. U1 is the bounds' where they describe the revision, read under their state;
-/// else built afresh here and published. No lock is held across U1's build, its taxonomy
-/// or the view's runs (U1-I).
-fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
+/// The view of `snapshot`'s revision, published and kept, or given to this read only;
+/// [`ViewEnd::Later`] if the bounds describe a later revision. U1 is the bounds' where they
+/// describe the revision, read under their state; else built afresh here and published. No
+/// lock is held across U1's build, its taxonomy or the view's runs (U1-I).
+fn read(store: &StoreService, snapshot: &Snapshot) -> ViewEnd {
     let bounds = &store.dl().bounds;
     let revision = snapshot.revision();
     // An older revision's view the cache keeps holds its charges: let it go before building
@@ -854,7 +901,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
     let found = {
         let state = lock(&bounds.state);
         match state.as_ref() {
-            Some(s) if s.revision > revision => return None,
+            Some(s) if s.revision > revision => return ViewEnd::Later,
             Some(s) if s.revision == revision => Some((
                 s.compiled,
                 s.kinds.is_some(),
@@ -886,9 +933,12 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
                 // may change U1 in place once it is let go).
                 Some(lower) => {
                     let state = lock(&bounds.state);
-                    let s = state
+                    let Some(s) = state
                         .as_ref()
-                        .filter(|s| s.revision == revision && s.compiled == compiled)?;
+                        .filter(|s| s.revision == revision && s.compiled == compiled)
+                    else {
+                        return ViewEnd::Later;
+                    };
                     parts(
                         snapshot,
                         s.revision,
@@ -949,7 +999,7 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
         }
     };
     let Some(parts) = parts else {
-        return Some(Arc::new(refused(snapshot, revision)));
+        return ViewEnd::Unkept(Arc::new(refused(snapshot, revision)));
     };
     #[cfg(test)]
     seam::at(bounds, seam::Point::View);
@@ -957,13 +1007,13 @@ fn read(store: &StoreService, snapshot: &Snapshot) -> Option<Arc<View>> {
     let view = Arc::new(view);
     if !(charged && keep) {
         // Not kept: the next read of the revision tries again.
-        return Some(view);
+        return ViewEnd::Unkept(view);
     }
     let mut cached = lock(&bounds.view);
     if cached.as_ref().is_none_or(|v| v.revision < view.revision) {
         *cached = Some(Arc::clone(&view));
     }
-    Some(view)
+    ViewEnd::Kept(view)
 }
 
 /// Whether the RL rules prove `snapshot`'s data consistent: its version's certificate says
@@ -1082,7 +1132,8 @@ fn taxonomy(
             Claim::Build(builder) => {
                 let built = build();
                 let Ok(charge) = built else {
-                    // Given to nobody waiting: they read again (the builder's drop wakes them).
+                    // Given to nobody waiting: they read again.
+                    builder.end(End::Unkept(None));
                     return built;
                 };
                 if let Some(s) = lock(&bounds.state).get_mut()
@@ -1090,15 +1141,20 @@ fn taxonomy(
                 {
                     s.taxonomy.get_or_insert_with(|| Arc::clone(&charge));
                 }
-                builder.finish(Some(Arc::clone(&charge)));
+                builder.end(End::Kept(Arc::clone(&charge)));
                 return Ok(charge);
             }
-            Claim::Wait(flight) => match flight.wait() {
+            // The view build it runs in goes to its end: no deadline, no stop.
+            Claim::Wait(flight) => match flight.join(None, &|| false) {
                 // The taxonomy with its charge: kept while this read holds it.
-                Ok(Some(charge)) => return Ok(charge),
-                // The build failed: again.
-                Ok(None) => {}
-                Err(nrese_exec::cell::Busy) => return build(),
+                Joined::Told(Ended::End(End::Kept(charge) | End::Unkept(Some(charge)))) => {
+                    return Ok(charge);
+                }
+                // The build failed, or kept nothing: again.
+                Joined::Told(
+                    Ended::End(End::Empty | End::Later | End::Unkept(None)) | Ended::Abandoned,
+                ) => {}
+                Joined::Busy | Joined::Left => return build(),
             },
         }
     }

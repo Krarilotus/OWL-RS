@@ -315,7 +315,8 @@ pub(crate) fn plan_status(
 }
 
 /// The bounds' view of `snapshot` its answers and their status are decided on, or
-/// why there is none ([`PART`], [`LATER`]). Never another snapshot's view.
+/// why there is none ([`PART`], [`LATER`], [`FAILED`], [`DEADLINE`]). Never another
+/// snapshot's view.
 type Decided = Result<(Snapshot, Arc<View>), &'static str>;
 
 /// A reader of some graphs reads its own view of the snapshot, not the bounds'.
@@ -331,6 +332,11 @@ const LATER: &str = "a later commit's bounds replaced this revision's while it w
 const DEADLINE: &str = "the request's time was up before the bounds' view of this revision was \
                         built: answers over the RL closure, not checked against the bounds";
 
+/// A read whose wait ended with the build of its revision's view failed (a panic, an early
+/// return) reads its RL closure.
+const FAILED: &str = "the bounds' build of this revision's view failed: answers over the RL \
+                      closure, not checked against the bounds";
+
 /// [`Decided`] of `snapshot` for `prepared`.
 fn decided(
     store: &StoreService,
@@ -341,18 +347,19 @@ fn decided(
     if prepared.access().is_some() {
         return Ok(Err(PART));
     }
-    let up = || {
-        prepared
-            .deadline()
-            .is_some_and(|at| Deadline::at(at).passed())
-    };
-    let stop = || cancellation.is_cancelled() || up();
-    let Some(view) = super::bounds::view_until(store, snapshot, Some(&stop)) else {
+    use super::bounds::Missing;
+    let stop = || cancellation.is_cancelled();
+    let Some(view) = super::bounds::view_until(store, snapshot, prepared.deadline(), Some(&stop))
+    else {
         // The operator's stop is the read's error; the request's time is a reason.
         cancellation.check()?;
         return Ok(Err(DEADLINE));
     };
-    Ok(view.map(|view| (snapshot.clone(), view)).ok_or(LATER))
+    Ok(match view {
+        Ok(view) => Ok((snapshot.clone(), view)),
+        Err(Missing::Later) => Err(LATER),
+        Err(Missing::Failed) => Err(FAILED),
+    })
 }
 
 /// The exact services' deadline for `prepared`: `dl.timeout` from now, or the request's own
