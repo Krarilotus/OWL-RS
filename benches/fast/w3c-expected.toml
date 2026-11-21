@@ -76,10 +76,14 @@ passed = 22
 passed = 86
 skipped = 3
 
-# DL (tableau_w3c): every case decided; WebOnt-description-logic-909 disputed.
+# DL (tableau_w3c): WebOnt-description-logic-909 disputed; 2 open since the reader's two-kinds
+# refusal (after 1.5.0, which decided 410): FS2RDF-domain-range-expression-ar and -simple-ar, whose
+# texts aren't OWL 2 DL (crates/nrese-dl/tests/tableau_w3c/undecided.txt, which the runner holds to
+# both ways). `open` changes here with that list.
 [suite."OWL 2 DL"]
-passed = 410
+passed = 408
 disputed = 1
+open = 2
 
 # GeoSPARQL compliance benchmark: 18 of 212 disputed with the reference.
 [suite."GeoSPARQL"]
