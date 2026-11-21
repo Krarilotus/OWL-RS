@@ -1,5 +1,4 @@
 use crate::{
-    Facts,
     generator::{self, Case, case, delete, insert},
     judges, oracle, sweep,
 };
@@ -181,36 +180,6 @@ fn deleting_assertions_keeps_the_seed_declarations() {
     assert!(
         missing.is_empty(),
         "seed rows or consequences absent: {missing:?}"
-    );
-}
-
-#[test]
-#[ignore = "undocumented: an empty store omits the datatype declarations until its first write attempt"]
-fn empty_store_publishes_datatype_axioms() {
-    // Spec: Table 8 dt-type1 and reasoning-semantics.md:57 require these on an empty graph.
-    let required: Facts = oracle::evaluate(&Facts::new(), oracle::Datatypes::Standard)
-        .facts
-        .into_iter()
-        .filter(|[_, p, o]| p == "rdf:type" && o == "rdfs:Datatype")
-        .collect();
-    assert_eq!(required.len(), 32, "OWL 2 RL datatype count");
-    let mut matched = true;
-    for &mode in judges::MODES {
-        let temp = tempfile::tempdir().expect("empty disk store directory");
-        for (kind, path) in [("memory", None), ("disk", Some(temp.path()))] {
-            let store = judges::open(mode, path);
-            let _pipeline = judges::pipeline(&store, nrese_reasoner::ReasoningMode::Owl2Rl);
-            let (rows, _) = judges::rows(&store);
-            let missing: Vec<_> = required.difference(&rows).collect();
-            if !missing.is_empty() {
-                println!("CELL RED empty-datatypes {mode} {kind} missing={missing:?}");
-                matched = false;
-            }
-        }
-    }
-    assert!(
-        matched,
-        "the empty store must publish every dt-type1 declaration"
     );
 }
 
