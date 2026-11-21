@@ -61,8 +61,12 @@ pub fn apply(pipeline: &MutationPipeline, write: &Write) -> bool {
             operation("INSERT", &write.insert)
         ),
     };
+    apply_update(pipeline, &body)
+}
+
+pub fn apply_update(pipeline: &MutationPipeline, body: &str) -> bool {
     match pipeline.apply(
-        MutationCommand::Update(SparqlUpdateRequest::new(sparql(&body))),
+        MutationCommand::Update(SparqlUpdateRequest::new(sparql(body))),
         &Requester::all(),
         &MutationTicket::new(),
     ) {

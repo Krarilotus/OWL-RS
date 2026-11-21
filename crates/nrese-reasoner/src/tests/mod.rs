@@ -453,13 +453,14 @@ fn profiles_derive_what_they_define() {
             .len(),
         50
     );
-    // dt-type1: the 32 datatypes OWL 2 RL supports.
+    // OWL 2 Profiles §4.3: dt-type1 declares 32 datatypes, prp-ap declares nine
+    // annotation properties, and cls-thing and cls-nothing1 declare two classes.
     assert_eq!(
         Ruleset::Owl2Rl
             .axiom_triples(&mut vocabulary)
             .unwrap()
             .len(),
-        32
+        32 + 9 + 2
     );
 
     let data = "ex:Cat rdfs:subClassOf ex:Animal

@@ -534,8 +534,9 @@ fn reasoning_state_tracks_whether_inferences_are_current() {
         store.consistency(),
         nrese_store::ConsistencyStatus::Consistent
     );
-    // The inferred subclass statement and OWL 2 RL's 32 datatype axioms (dt-type1).
-    assert_eq!(store.clear_inferred().expect("clear"), 1 + 32);
+    // OWL 2 Profiles §4.3: the inferred subclass membership, 32 datatype declarations,
+    // 11 annotation property and class declarations, and five distinct scm-cls rows.
+    assert_eq!(store.clear_inferred().expect("clear"), 1 + 32 + 11 + 5);
     assert!(!current(&store));
     drop(store);
     // A state file from a build with other semantics (another fingerprint) isn't current.

@@ -89,11 +89,8 @@ pub fn steps(case: &Case) -> Vec<Step> {
         .collect()
 }
 
-fn projection(step: &Step) -> (Publication, Facts) {
-    (
-        publication::project(&step.asserted, &step.model),
-        oracle::without_known_deviation(&step.asserted),
-    )
+fn projection(step: &Step) -> Publication {
+    publication::project(&step.asserted, &step.model)
 }
 
 struct Comparison<'a> {
@@ -101,7 +98,6 @@ struct Comparison<'a> {
     focus: Option<&'a Difference>,
     differences: Vec<Difference>,
     counts: BTreeMap<&'static str, usize>,
-    known: usize,
 }
 
 impl Comparison<'_> {
@@ -121,7 +117,7 @@ impl Comparison<'_> {
         (mode, judge, write): (&'static str, &'static str, usize),
         store: Option<&StoreService>,
         (accepted, wanted): (bool, bool),
-        (step, (expected, without_deviation)): (&Step, &(Publication, Facts)),
+        (step, expected): (&Step, &Publication),
     ) -> Option<bool> {
         let mut report = |expected, detail| {
             let limit = match &expected {
@@ -160,14 +156,10 @@ impl Comparison<'_> {
         let store = store?;
         let (rows, select_status) = judges::rows(store);
         for row in expected.required.difference(&rows) {
-            if without_deviation.contains(row) {
-                report(
-                    Answer::Row(row.clone(), true),
-                    format!("row absent (SELECT {select_status})"),
-                );
-            } else {
-                self.known += 1;
-            }
+            report(
+                Answer::Row(row.clone(), true),
+                format!("row absent (SELECT {select_status})"),
+            );
         }
         for row in rows.difference(&step.model.facts) {
             report(
@@ -182,14 +174,10 @@ impl Comparison<'_> {
         let (answer, status) = judges::ask(store, &self.case.watch);
         let wanted = step.model.facts.contains(&self.case.watch);
         if status == "complete" && answer != wanted {
-            if wanted && !without_deviation.contains(&self.case.watch) {
-                self.known += 1;
-            } else {
-                report(
-                    Answer::CompleteRead(self.case.watch.clone(), wanted),
-                    format!("ASK={answer} ({status})"),
-                );
-            }
+            report(
+                Answer::CompleteRead(self.case.watch.clone(), wanted),
+                format!("ASK={answer} ({status})"),
+            );
         }
         accepted.then_some(answer)
     }
@@ -201,7 +189,6 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
         focus,
         differences: Vec::new(),
         counts: BTreeMap::new(),
-        known: 0,
     };
     let projected: Vec<_> = steps.iter().map(projection).collect();
     let empty = Step {
@@ -210,7 +197,7 @@ fn run<'a>(case: &'a Case, steps: &[Step], focus: Option<&'a Difference>) -> Com
         ordered: Vec::new(),
     };
     let initial = projection(&empty);
-    for (publication, _) in &projected {
+    for publication in &projected {
         for (&reason, count) in &publication.counts {
             *compare.counts.entry(reason).or_default() += count;
         }
@@ -478,7 +465,6 @@ fn seeds() {
     let mut covered = BTreeSet::new();
     let mut red = BTreeSet::new();
     let mut witnesses = BTreeMap::new();
-    let mut deviations = 0;
     let mut disagreements = 0;
     let mut counts = BTreeMap::new();
     while generator::draws_on(
@@ -492,7 +478,6 @@ fn seeds() {
         covered.insert(case.shape);
         let steps = steps(&case);
         let result = run(&case, &steps, None);
-        deviations += result.known;
         for (reason, count) in &result.counts {
             *counts.entry(*reason).or_default() += count;
         }
@@ -537,10 +522,6 @@ fn seeds() {
             counts.get(item).copied().unwrap_or(0)
         );
     }
-    println!(
-        "KNOWN DEVIATION {} => {deviations}",
-        oracle::KNOWN_DEVIATION
-    );
     println!(
         "SWEEP plain={plain} seeds={drawn} red={disagreements} shapes={covered:?} required-red={red:?}"
     );

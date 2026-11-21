@@ -1774,6 +1774,10 @@ impl MemoryBase {
             asserted: asserted.iter().copied().collect(),
         }
     }
+
+    pub(crate) fn add_inferred(&mut self, facts: Vec<Triple>) {
+        self.facts.advance(facts);
+    }
 }
 
 /// Reads count on the store's (`Source for Store`); a probe of the asserted set is
