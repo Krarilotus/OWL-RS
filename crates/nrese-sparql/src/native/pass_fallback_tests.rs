@@ -635,11 +635,11 @@ fn a_point_kept_inside_another_lets_go_of_numbers_past_the_limit() {
     let pass = ctx.save();
     remember(2, half..NUMBER_MEMO_ENTRIES + 1);
     ctx.keep(pass);
-    ctx.keep(inner);
     assert_eq!(
         counters(&ctx),
         before,
-        "[kept bytes, computed terms, remembered numbers, budget used]"
+        "[kept bytes, computed terms, remembered numbers, budget used] once the pass's point is kept"
     );
+    ctx.keep(inner);
     ctx.keep(outer);
 }
