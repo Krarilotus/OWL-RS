@@ -122,7 +122,9 @@ pub(crate) fn named(tx: &impl PendingView, term: u64) -> String {
 
 /// Whether `ontology` is consistent: the context core's Horn stage where it takes the
 /// ontology, else the hypertableau within `budget`. `Consistent` only if nothing of the
-/// source was left out ([`left_out`]), else `Unknown` says so; an inconsistency stands.
+/// source was left out ([`left_out`]), else `Unknown` says so; an inconsistency stands. Where
+/// an axiom reads a name as two kinds, which the engines read as one name ([`joined_kinds`]),
+/// every verdict is `Unknown`, saying so.
 pub fn check(ontology: &Ontology, budget: &Budget) -> Checked {
     check_naming(ontology, budget, &nameless)
 }
@@ -136,12 +138,34 @@ pub(crate) fn check_naming(
     let started = Instant::now();
     let mut checked = check_read(ontology, budget);
     checked.elapsed = started.elapsed();
-    if checked.verdict != Verdict::Inconsistent
-        && let Some(why) = left_out_by(ontology, nrese_owl::Diagnostic::is_fatal, name)
-    {
+    // A name an axiom reads as two kinds is one name to the engines, so no verdict of theirs
+    // speaks of the source; a part left out can't make the rest inconsistent, so an
+    // inconsistency found stands.
+    let why = joined_kinds(ontology, name).or_else(|| match checked.verdict {
+        Verdict::Inconsistent => None,
+        Verdict::Consistent | Verdict::Unknown(_) => {
+            left_out_by(ontology, nrese_owl::Diagnostic::is_fatal, name)
+        }
+    });
+    if let Some(why) = why {
         checked.verdict = Verdict::Unknown(why);
     }
     checked
+}
+
+/// Why no verdict of the engines on `ontology` speaks of the source, whatever the
+/// treatment: names an axiom reads as two kinds, which they read as one
+/// ([`nrese_owl::Diagnostic::joins_kinds`]); its terms as `name` writes them.
+fn joined_kinds(ontology: &Ontology, name: &dyn Fn(u64) -> String) -> Option<String> {
+    let found: Vec<_> = (ontology.diagnostics.iter())
+        .filter(|d| d.joins_kinds())
+        .collect();
+    let first = found.first()?.describe(name);
+    Some(format!(
+        "{} name(s) of the data are used as two kinds, which OWL 2 DL keeps apart and the DL \
+         engines read as one name; first: {first}",
+        found.len()
+    ))
 }
 
 /// Whether `ontology` is consistent, given that it was before a change that removed
@@ -155,7 +179,7 @@ pub(crate) fn check_after_assertions(
     budget: &Budget,
 ) -> Option<Checked> {
     let started = Instant::now();
-    if left_out(ontology).is_some() {
+    if left_out(ontology).is_some() || joined_kinds(ontology, &nameless).is_some() {
         return None;
     }
     let outcome = nrese_dl::islands::after_assertions(ontology, touched, &tableau_config(budget))?;

@@ -191,6 +191,16 @@ const NOT_BUDGETS: &[(&str, &str, &str)] = &[
     ("tableau/graph.rs", "pub const", "a node's flag bits"),
     ("tableau/search.rs", "WINDOW", "the restart window"),
     (
+        "dl/bounds.rs",
+        "REIFIED_CANDIDATES",
+        "nodes a commit's reification check walks per changed triple, past which it reads",
+    ),
+    (
+        "dl/bounds.rs",
+        "RETYPE_VALUES",
+        "a property's values a deleted value's retyping check looks through, past which it reads",
+    ),
+    (
         "dl/source.rs",
         "FRESH",
         "fresh individuals the entailment tests use",

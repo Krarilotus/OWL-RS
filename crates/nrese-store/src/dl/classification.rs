@@ -241,7 +241,7 @@ fn run<T>(
     }
     let mut options = options(store);
     let memory = options.tableau.memory.clone().unwrap_or_default();
-    let read = source::read_snapshot(snapshot, memory);
+    let read = source::read_snapshot(snapshot, memory, &store.config().dl.treatments);
     options.timeout = options
         .timeout
         .map(|limit| limit.saturating_sub(started.elapsed()));
@@ -444,7 +444,8 @@ pub(crate) fn el_answer(
     }
     let options = options(store);
     let memory = options.tableau.memory.clone().unwrap_or_default();
-    let ontology = source::read_snapshot(snapshot, memory.clone()).ok()?;
+    let treatments = &store.config().dl.treatments;
+    let ontology = source::read_snapshot(snapshot, memory.clone(), treatments).ok()?;
     if !el_complete_for(&ontology) {
         return None;
     }

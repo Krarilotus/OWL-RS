@@ -259,14 +259,11 @@ impl<'t, 'm> Parser<'t, 'm> {
         } else {
             ObjProp::Named(self.entity()?)
         };
-        self.model.uses.entry(p.named()).or_default().object = true;
         Ok(p)
     }
 
     fn data_property(&mut self) -> R<Term> {
-        let p = self.entity()?;
-        self.model.uses.entry(p).or_default().data = true;
-        Ok(p)
+        self.entity()
     }
 
     /// A literal: `"…"`, `"…"^^datatype`, `"…"@tag`.
@@ -314,13 +311,14 @@ impl<'t, 'm> Parser<'t, 'm> {
 
     // Annotations -----------------------------------------------------------------------
 
-    /// `Annotation(…)*`, counted.
+    /// `Annotation(…)*`, counted, each property an annotation property's use.
     fn annotations(&mut self) -> R<()> {
         while matches!(self.peek(), Tok::Name("Annotation")) {
             self.take();
             self.open()?;
             self.annotations()?;
-            self.iri_text()?;
+            let property = self.entity()?;
+            self.model.annotation_uses.insert(property);
             self.annotation_value()?;
             self.close()?;
             self.model.annotations += 1;
@@ -599,13 +597,6 @@ impl<'t, 'm> Parser<'t, 'm> {
                 self.open()?;
                 let t = self.entity()?;
                 self.close()?;
-                let uses = self.model.uses.entry(t).or_default();
-                match kind {
-                    EntityKind::ObjectProperty => uses.object = true,
-                    EntityKind::DataProperty => uses.data = true,
-                    EntityKind::AnnotationProperty => uses.annotation = true,
-                    _ => {}
-                }
                 Some(Axiom::Declaration(kind, t))
             }
             "SubClassOf" => {
@@ -736,18 +727,21 @@ impl<'t, 'm> Parser<'t, 'm> {
                 })
             }
             "AnnotationAssertion" => {
-                self.iri_text()?;
+                let property = self.entity()?;
+                self.model.annotation_uses.insert(property);
                 self.annotation_value()?;
                 self.annotation_value()?;
                 None
             }
             "SubAnnotationPropertyOf" | "AnnotationPropertyDomain" | "AnnotationPropertyRange" => {
                 let property = self.entity()?;
-                self.model.uses.entry(property).or_default().annotation = true;
                 self.model.annotation_schema.push(property);
+                self.model.annotation_uses.insert(property);
+                self.model.annotation_axioms.insert(property);
                 if keyword == "SubAnnotationPropertyOf" {
                     let sup = self.entity()?;
-                    self.model.uses.entry(sup).or_default().annotation = true;
+                    self.model.annotation_uses.insert(sup);
+                    self.model.annotation_axioms.insert(sup);
                 } else {
                     self.iri_text()?;
                 }

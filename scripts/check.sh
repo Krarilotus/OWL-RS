@@ -26,6 +26,18 @@
 #                                  release branch refs/heads/release/<name>, which makes its
 #                                  job a merge gate on the fleet). A value the
 #                                  caller's environment already holds is that caller's word.
+#        scripts/check.sh quick    before a review, in minutes, on the fleet only
+#                                  (scripts/lib/fleet-gate.sh quick): one commit (NRESE_PUSH_COMMIT,
+#                                  else HEAD) on its branch's files, from where it left origin's
+#                                  refactor/engine-v2 (else NRESE_PUSH_BASE), the crates by
+#                                  changed_crates as push. The push tier's own steps, fewer: fmt;
+#                                  clippy on them; their unit tests and probes (their `it` binary's
+#                                  probes:: module); the generated-views drift tests, always; one
+#                                  seed of their random tests (push's first); the state explorer's
+#                                  targets (scripts/lib/explorer-targets.txt); the guards that need
+#                                  no build. Its pass is its own tier's (scripts/lib/gate-key.sh):
+#                                  it never stands for a push pass, lands nothing, and says nothing
+#                                  of the crates depending on them.
 #        scripts/check.sh windows [COMMIT]
 #                                  the merge check's Windows part, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
@@ -147,26 +159,52 @@ workspace_packages() {
 if [ "$mode" = crates ]; then shift; changed_crates "$@"; exit; fi
 
 # The workspace crates depending on any of the given ones (directly or not, dev-
-# dependencies included: their tests must still compile), the given ones excluded.
+# dependencies included: their tests must still compile), the given ones excluded. Prints every one
+# found, then fails (2) where cargo couldn't tell for one of them: never "none" for a lookup that
+# failed (quick fails on it; push runs the ones found).
 dependents_of() {
-  local name
+  local name found="" tree code=0
   declare -A given=()
   for name in "$@"; do given[$name]=1; done
   for name in "$@"; do
-    cargo tree -i "$name" --workspace --prefix none -e normal,build,dev --offline 2>/dev/null \
-      | sed 's/ (\*)//; s/ .*//'
-  done | sort -u | while read -r dep; do
+    if tree=$(cargo tree -i "$name" --workspace --prefix none -e normal,build,dev --offline 2>/dev/null); then
+      found+=$tree$'\n'
+    else
+      echo "cargo tree can't tell what depends on $name" >&2
+      code=2
+    fi
+  done
+  printf '%s' "$found" | sed 's/ (\*)//; s/ .*//' | sort -u | while read -r dep; do
     [ -n "$dep" ] && [ -z "${given[$dep]:-}" ] && echo "$dep"
   done
+  return $code
 }
 
 package_args() { local name; for name in "$@"; do printf -- '-p %s ' "$name"; done; }
 
+# Clippy on every target of the given crates: the push and quick tiers' one line. A dependent's code
+# didn't change, so its lints can't either.
+lint() {
+  # shellcheck disable=SC2046
+  "$guarded" clippy --locked $(package_args "$@") --all-targets
+}
+
 # Tests of `all` crates, with the slow binaries of `fast_only` left out. Python's output is
 # read without carriage returns: Windows writes them, and cargo rejects names with them.
+# The quick tier's narrower runs, named first: `--lib`, the crates' unit tests alone; `--in TARGET
+# FILTER`, the tests of their test binary TARGET whose names hold FILTER; `--empty pass|fail`, what
+# a run that selects no test is, the same under nextest (--no-tests) and cargo test.
 run_tests() {
-  local -a all=() fast_only=()
-  local into=all arg
+  local -a all=() fast_only=() only=()
+  local into=all arg target="" name="" empty=""
+  while :; do
+    case ${1:-} in
+      --lib) only=(--lib); shift ;;
+      --in) target=$2 name=$3; shift 3 ;;
+      --empty) empty=$2; shift 2 ;;
+      *) break ;;
+    esac
+  done
   for arg in "$@"; do
     if [ "$arg" = -- ]; then into=fast_only; continue; fi
     if [ $into = all ]; then all+=("$arg"); else fast_only+=("$arg"); fi
@@ -175,15 +213,24 @@ run_tests() {
   if nextest; then
     local filter=""
     [ ${#fast_only[@]} -gt 0 ] && filter=$(python scripts/lib/test-targets.py exclude "${fast_only[@]}" | tr -d '\r')
+    if [ -n "$target" ]; then
+      local -a binaries=()
+      for arg in "${all[@]}"; do binaries+=("binary_id($arg::$target)"); done
+      filter="($(IFS='|'; echo "${binaries[*]}")) & test($name)"
+    fi
     # shellcheck disable=SC2046
-    "$guarded" nextest run --locked --no-fail-fast $(package_args "${all[@]}") \
-      ${filter:+-E "$filter"}
+    "$guarded" nextest run --locked --no-fail-fast ${empty:+--no-tests=$empty} $(package_args "${all[@]}") \
+      "${only[@]}" ${filter:+-E "$filter"}
   else
     local code=0 line
     declare -A fast=()
     for arg in "${fast_only[@]}"; do fast[$arg]=1; done
     for arg in "${all[@]}"; do
-      if [ -n "${fast[$arg]:-}" ]; then
+      if [ -n "$target" ]; then
+        cargo_test "$empty" --locked --no-fail-fast -p "$arg" --test "$target" -- "$name" || code=$?
+      elif [ ${#only[@]} -gt 0 ]; then
+        cargo_test "$empty" --locked --no-fail-fast -p "$arg" "${only[@]}" || code=$?
+      elif [ -n "${fast[$arg]:-}" ]; then
         line=$(python scripts/lib/test-targets.py fast "$arg") || return 2
         line=$(printf '%s' "$line" | tr -d '\r')
         [ -n "$line" ] || continue
@@ -197,53 +244,108 @@ run_tests() {
   fi
 }
 
+# EMPTY ARGS...: cargo test ARGS; with EMPTY fail, a run in which no test ran fails (4, as nextest's).
+cargo_test() {
+  local empty=$1 out code=0
+  shift
+  [ "$empty" = fail ] || { "$guarded" test "$@"; return; }
+  out=$("$guarded" test "$@" 2>&1) || code=$?
+  printf '%s\n' "$out"
+  [ $code -ne 0 ] || grep -qE '^test result: [A-Za-z]+\. [1-9]' <<< "$out" \
+    || { echo "no test ran: cargo test $*" >&2; code=4; }
+  return $code
+}
+
 # The random tests of the given crates (scripts/lib/fuzz-targets.txt) with a few more seeds
-# than the one they run with otherwise: seeds drawn from the commit, so each push tries new
-# ones and a failure replays (NRESE_FUZZ_SEED=<seed>). The fuzz campaign runs many more.
+# than the one they run with otherwise: COUNT of them (push 3; quick 1, the first of push's), drawn
+# from the commit, so each push tries new ones and a failure replays (NRESE_FUZZ_SEED=<seed>). The
+# fuzz campaign runs many more.
 run_seeds() {
-  local -A wanted=()
-  local -a crates=() exprs=()
-  local name crate target filter seed binary code=0
-  for name in "$@"; do wanted[$name]=1; done
+  local count=$1 n seeds="" head
+  shift
   # The first six hex digits of the full id: an abbreviation (--short) grows where another object
-  # shares the prefix, so the same commit would draw other seeds on another host.
-  local head
+  # shares the prefix, so the same commit would draw other seeds on another host (stable_seeds_at
+  # reads this line).
   head=$(git rev-parse HEAD) || return 2
   local base=$(( 16#${head:0:6} % 100000 + 1000 ))
+  for ((n = 0; n < count; n++)); do seeds+=" $((base + n))"; done
+  run_targets "random tests" scripts/lib/fuzz-targets.txt "$seeds" "$@"
+}
+
+# The tests a target list names (LIST: crate:target:filter, target `lib` for the unit tests) of the
+# given crates: once for each seed of SEEDS, or once as they are for none. WHAT names them in a failure.
+run_targets() {
+  local what=$1 list=$2 seeds=$3
+  shift 3
+  local -A wanted=()
+  local -a crates=() targets=() filters=() exprs=()
+  local name crate target filter seed binary code=0 expr out i how content
+  # A list that can't be read fails: it never selects nothing.
+  content=$(cat -- "$list") || { echo "$what: can't read the list $list" >&2; return 2; }
+  for name in "$@"; do wanted[$name]=1; done
   while IFS=: read -r crate target filter; do
     [ -n "${wanted[$crate]:-}" ] || continue
-    crates+=("$crate")
+    crates+=("$crate") targets+=("$target") filters+=("$filter")
     binary=$crate
     [ "$target" = lib ] || binary="$crate::$target"
     exprs+=("(binary_id($binary)${filter:+ & test($filter)})")
-  done < <(grep -v '^#' scripts/lib/fuzz-targets.txt | tr -d '\r' | grep .)
+  done < <(printf '%s\n' "$content" | grep -v '^#' | tr -d '\r' | grep .)
   [ ${#exprs[@]} -gt 0 ] || return 0
-  local expr
   expr=$(IFS='|'; echo "${exprs[*]}")
-  for seed in $base $((base + 1)) $((base + 2)); do
+  for seed in ${seeds:-none}; do
+    local -a with=()
+    how=""
+    [ "$seed" = none ] || { with=("NRESE_FUZZ_SEED=$seed"); how="NRESE_FUZZ_SEED=$seed "; }
     if nextest; then
-      # One run per seed: every random test of every changed crate in parallel.
+      # One run per seed: every listed test of every given crate in parallel.
       # shellcheck disable=SC2046
-      local out
-      if ! out=$(NRESE_FUZZ_SEED=$seed "$guarded" nextest run --locked --no-fail-fast \
+      if ! out=$(env "${with[@]}" "$guarded" nextest run --locked --no-fail-fast \
           $(package_args "${crates[@]}") -E "$expr" 2>&1); then
-        echo "random tests fail with NRESE_FUZZ_SEED=$seed:"
+        echo "$what fail${how:+ with ${how% }}:"
         printf '%s\n' "$out" | grep -E '^ +FAIL|panicked at' -A1 | grep -v '^--' | sort -u | head -20
         code=1
       fi
       continue
     fi
-    while IFS=: read -r crate target filter; do
-      [ -n "${wanted[$crate]:-}" ] || continue
-      local kind=(--test "$target")
-      [ "$target" = lib ] && kind=(--lib)
-      if ! NRESE_FUZZ_SEED=$seed "$guarded" test --locked -q -p "$crate" "${kind[@]}" -- $filter > /dev/null 2>&1; then
-        echo "random tests fail: NRESE_FUZZ_SEED=$seed cargo test -p $crate ${kind[*]} -- $filter"
+    for i in "${!crates[@]}"; do
+      local kind=(--test "${targets[i]}")
+      [ "${targets[i]}" = lib ] && kind=(--lib)
+      # shellcheck disable=SC2086
+      if ! env "${with[@]}" "$guarded" test --locked -q -p "${crates[i]}" "${kind[@]}" -- ${filters[i]} > /dev/null 2>&1; then
+        echo "$what fail: ${how}cargo test -p ${crates[i]} ${kind[*]} -- ${filters[i]}"
         code=1
       fi
-    done < <(grep -v '^#' scripts/lib/fuzz-targets.txt | tr -d '\r' | grep .)
+    done
   done
   return $code
+}
+
+# The crates whose state-explorer targets (scripts/lib/explorer-targets.txt) a change of the given
+# crates runs: each listed crate that is one of them or depends on one (dependents_of). Fails (2)
+# where the list can't be read or the dependents can't be told.
+explorer_crates() {
+  local list=scripts/lib/explorer-targets.txt dependents content
+  local -a listed=()
+  content=$(cat -- "$list") || { echo "can't read the list $list" >&2; return 2; }
+  mapfile -t listed < <(printf '%s\n' "$content" | grep -v '^#' | tr -d '\r' | grep . | cut -d: -f1 | sort -u)
+  [ ${#listed[@]} -gt 0 ] || return 0
+  dependents=$(dependents_of "$@") || return 2
+  printf '%s\n' "$@" "$dependents" | sort -u | grep -Fx -f <(printf '%s\n' "${listed[@]}")
+  return 0
+}
+
+# The given crates with probes: a `probes` module in their `it` test binary (tests/it/probes/ or
+# tests/it/probes.rs), where a reviewer's probe that found a fault is filed as the crate's test. A
+# crate at any depth under crates/, as crates_of finds them.
+probe_crates() {
+  local manifest dir name
+  while IFS= read -r manifest; do
+    dir=${manifest%/Cargo.toml}
+    [ -d "$dir/tests/it/probes" ] || [ -f "$dir/tests/it/probes.rs" ] || continue
+    name=$(sed -n 's/^name = "\(.*\)"/\1/p' "$manifest" | head -1)
+    printf '%s\n' "$@" | grep -qFx -- "$name" && echo "$name"
+  done < <(find crates -name Cargo.toml)
+  return 0
 }
 
 # The W3C suites' data, required unless NRESE_W3C_OPTIONAL (the release gate's first W3C part,
@@ -258,18 +360,29 @@ w3c_data() {
   fi
 }
 
-# The steps for files outside the Rust workspace.
+# The steps for files outside the Rust workspace: the guards, then what tests them.
 side_steps() {
+  local files=("$@")
+  guards "${files[@]}"
+  # The suite contracts test the gate's own scripts and hooks too (test_push_gate, test_full_gate,
+  # test_commit_tier, ...): a change to them runs the contracts.
+  if printf '%s\n' "${files[@]}" | grep -qE '^(benches/suite/|scripts/|\.githooks/)'; then
+    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+  fi
+  if printf '%s\n' "${files[@]}" | grep -qE '^benches/nrese-bench-harness/'; then
+    harness
+  fi
+  if printf '%s\n' "${files[@]}" | grep -qE '^apps/nrese-console/'; then
+    console
+  fi
+}
+# Of those, the guards that build nothing (the quick tier's too).
+guards() {
   local files=("$@")
   if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
     step locks bash scripts/check-locks.sh
     # No test-only feature in a product build (scripts/check-features.sh, DUR-4).
     step features bash scripts/check-features.sh
-  fi
-  # The suite contracts test the gate's own scripts and hooks too (test_push_gate, test_full_gate,
-  # test_commit_tier, ...): a change to them runs the contracts.
-  if printf '%s\n' "${files[@]}" | grep -qE '^(benches/suite/|scripts/|\.githooks/)'; then
-    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
   fi
   # Names the changed Python can't resolve, which a test replacing a whole function never runs
   # (scripts/check-python-names.py).
@@ -282,13 +395,10 @@ side_steps() {
   if printf '%s\n' "${files[@]}" | grep -qE '^(benches|scripts)/'; then
     step names bash scripts/check-names.sh
   fi
-  if printf '%s\n' "${files[@]}" | grep -qE '^benches/nrese-bench-harness/'; then
-    harness
-  fi
-  if printf '%s\n' "${files[@]}" | grep -qE '^apps/nrese-console/'; then
-    console
-  fi
 }
+# No run of spaces inside a product string: a string continued on the next line without its `\`
+# keeps that line's indentation, and the message reaches its reader with it.
+message_strings() { ! git grep -n -E "^\s*\"[^\"]*[a-z,;:)] {6,}[a-z(]" -- "crates/*/src/*.rs" ":!*tests*"; }
 harness() {
   local manifest=benches/nrese-bench-harness/Cargo.toml
   step "fmt (bench harness)" cargo fmt --manifest-path $manifest --all --check
@@ -369,6 +479,20 @@ if [ "$mode" = push ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
     exit $?
   fi
 fi
+# The quick check checks one commit too (NRESE_PUSH_COMMIT, else HEAD), on its branch's files: from
+# NRESE_PUSH_BASE, else from where it left origin's refactor/engine-v2, never from its upstream: a
+# review reads the branch's earlier commits too, pushed or not.
+if [ "$mode" = quick ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+  push_commit=$(git rev-parse -q --verify "${NRESE_PUSH_COMMIT:-HEAD}^{commit}") \
+    || { echo "no commit ${NRESE_PUSH_COMMIT:-HEAD} to check" >&2; exit 2; }
+  push_base=${NRESE_PUSH_BASE:-$(git merge-base "$push_commit" refs/remotes/origin/refactor/engine-v2 2> /dev/null)}
+  [ -n "$push_base" ] || { echo "no base for the branch: no origin/refactor/engine-v2 (fetch it)" >&2; exit 2; }
+  # Its job runs the commit's own gate-job.sh: one from before its quick mode (its entries under the
+  # cache's quick/, out of every older sweep) would run push's in its place, or have them swept.
+  git show "$push_commit:scripts/lib/gate-job.sh" 2> /dev/null | grep -qF 'home=$cache/quick' \
+    || { echo "$(git rev-parse --short "$push_commit") has no quick check (scripts/lib/gate-job.sh): it can't be checked" >&2
+         exit 2; }
+fi
 # The Windows part checks one commit, whole: COMMIT, else HEAD, by its own tier, so a commit from
 # before the tier can't be checked.
 if [ "$mode" = windows ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
@@ -377,19 +501,19 @@ if [ "$mode" = windows ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
     || { echo "$(git rev-parse --short "$push_commit") has no Windows tier (scripts/lib/windows-job.ps1): it can't be checked" >&2; exit 2; }
 fi
 
-# The push tier and the Windows part run on the fleet only (scripts/lib/fleet-gate.sh), for the
-# commit's own tree and the pushed range's files (Windows: none, everything runs). A pass is a
-# verified fleet result, remembered by content (scripts/lib/gate-key.sh: the tier, the tree, the
-# files, the toolchain), and only check.sh writes it. No verdict, no pass (no push): nothing runs
-# here instead.
-if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
+# The push tier, the quick check and the Windows part run on the fleet only
+# (scripts/lib/fleet-gate.sh), for the commit's own tree and the range's files (Windows: none,
+# everything runs). A pass is a verified fleet result, remembered by content
+# (scripts/lib/gate-key.sh: the tier, the tree, the files, the toolchain), and only check.sh writes
+# it. No verdict, no pass (no push): nothing runs here instead.
+if { [ "$mode" = windows ] || [ "$mode" = push ] || [ "$mode" = quick ]; } && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
   # shellcheck source=lib/gate-key.sh
   . scripts/lib/gate-key.sh
   list=$(mktemp)
   where=$(mktemp)
   trap 'rm -f "$list" "$where"' EXIT
-  if [ "$mode" = push ]; then
-    changed_files push > "$list" || { echo "the push range $push_base..$push_commit isn't all here: fetch, then push" >&2; exit 2; }
+  if [ "$mode" != windows ]; then
+    changed_files push > "$list" || { echo "the range $push_base..$push_commit isn't all here: fetch first" >&2; exit 2; }
   fi
   tree=$(git rev-parse "$push_commit^{tree}")
   list_hash=$(git hash-object "$list")
@@ -478,9 +602,7 @@ case "$mode" in
     # windows_inputs; process review 20 Oct 2026, §3A).
     mapfile -t files < <(changed_files commit)
     step fmt cargo fmt --all --check
-    # No run of spaces inside a product string: a string continued on the next line without its
-    # `\` keeps that line's indentation, and the message reaches its reader with it.
-    step "message strings" bash -c '! git grep -n -E "^\s*\"[^\"]*[a-z,;:)] {6,}[a-z(]" -- "crates/*/src/*.rs" ":!*tests*"'
+    step "message strings" message_strings
     if printf '%s\n' "${files[@]}" | grep -qE '(^|/)Cargo\.(toml|lock)$'; then
       step locks bash scripts/check-locks.sh
       step features bash scripts/check-features.sh
@@ -506,14 +628,13 @@ case "$mode" in
     echo "=== changed: ${changed[*]:-none}; depending on them: ${dependents[*]:-none}"
     step fmt cargo fmt --all --check
     if [ ${#changed[@]} -gt 0 ]; then
-      # Lints where code changed: every target of the changed crates. A dependent's code didn't
-      # change, so its lints can't either; what can break there is compiling against the new
-      # API, and the dependents' tests are built and run, which checks every target of theirs.
-      # shellcheck disable=SC2046
-      step clippy "$guarded" clippy --locked $(package_args "${changed[@]}") --all-targets
+      # Lints where code changed: every target of the changed crates. What can break in a
+      # dependent is compiling against the new API, and the dependents' tests are built and run,
+      # which checks every target of theirs.
+      step clippy lint "${changed[@]}"
       w3c_data
       step test run_tests "${changed[@]}" "${dependents[@]}" -- "${dependents[@]}"
-      step seeds run_seeds "${changed[@]}"
+      step seeds run_seeds 3 "${changed[@]}"
       step locks bash scripts/check-locks.sh
       step features bash scripts/check-features.sh
     fi
@@ -524,6 +645,42 @@ case "$mode" in
       step "doc tests (nrese-exec)" "$guarded" test --locked --doc -p nrese-exec
     fi
     side_steps "${files[@]}"
+    ;;
+  quick)
+    # The push tier's own steps on the gate's file list, fewer (the header): what finds a mechanical
+    # fault of the changed crates in minutes. Not the dependents' tests, the changed crates' other
+    # integration tests, Miri, the W3C suites, the suite contracts, the bench harness or the console.
+    if [ -z "${NRESE_FILES_FROM:-}" ]; then
+      echo "check.sh quick on a build host needs the gate's file list (NRESE_FILES_FROM): not run" >&2
+      exit 2
+    fi
+    mapfile -t files < "$NRESE_FILES_FROM"
+    mapfile -t changed < <(changed_crates "${files[@]}")
+    echo "=== changed: ${changed[*]:-none}"
+    step fmt cargo fmt --all --check
+    step "message strings" message_strings
+    # A crate without unit tests or probes passes those steps (nothing selected); a build or test
+    # failure fails them.
+    if [ ${#changed[@]} -gt 0 ]; then
+      step clippy lint "${changed[@]}"
+      step "unit tests" run_tests --empty pass --lib "${changed[@]}"
+      mapfile -t probed < <(probe_crates "${changed[@]}")
+      [ ${#probed[@]} -eq 0 ] || step probes run_tests --empty pass --in it probes:: "${probed[@]}"
+    fi
+    # The committed generated views against the code that generates them (nrese-server's
+    # generated_views_tests.rs): always, as a changed document can drift as well as the code; and
+    # failing where that test is gone.
+    step "generated views" run_tests --empty fail --in it generated_views nrese-server
+    if [ ${#changed[@]} -gt 0 ]; then
+      step seeds run_seeds 1 "${changed[@]}"
+      if ! found=$(explorer_crates "${changed[@]}"); then
+        step explorer false  # its targets couldn't be told (above): never a pass that ran none
+      elif [ -n "$found" ]; then
+        mapfile -t explored <<< "$found"
+        step explorer run_targets "explorer tests" scripts/lib/explorer-targets.txt "" "${explored[@]}"
+      fi
+    fi
+    guards "${files[@]}"
     ;;
   windows)
     # Inside its fleet job only, which readies the Windows host (scripts/lib/windows-job.sh).
@@ -561,7 +718,7 @@ case "$mode" in
     console
     ;;
   *)
-    echo "usage: scripts/check.sh commit|push|windows [COMMIT]|all" >&2
+    echo "usage: scripts/check.sh commit|push|quick|windows [COMMIT]|all" >&2
     exit 2
     ;;
 esac

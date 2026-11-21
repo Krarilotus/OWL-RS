@@ -176,7 +176,7 @@ fn deleting_the_literal_that_makes_a_property_data_valued_leaves_the_route() {
     assert_ne!(store.dl_bounds().last, "rules");
     let snapshot = store.read_snapshot(None).unwrap();
     let budget = Arc::new(nrese_exec::Budget::unlimited());
-    let read = super::source::read_snapshot(&snapshot, budget).unwrap();
+    let read = super::source::read_snapshot(&snapshot, budget, &Default::default()).unwrap();
     assert!(
         read.diagnostics
             .iter()

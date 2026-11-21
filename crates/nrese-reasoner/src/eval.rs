@@ -19,6 +19,9 @@ use super::ir::Triple;
 use super::ir::{Atom, Guard, Head, OWL, RDF, RDFS, Rule, Term, Vocabulary};
 use super::lists::{Facts, ListVocabulary};
 
+mod witness_index;
+pub(crate) use witness_index::WitnessIndex;
+
 /// Driver matches per parallel work unit.
 pub(crate) const MORSEL: usize = 4096;
 
@@ -2585,6 +2588,16 @@ impl GroundProgram {
             .push(self.consistency.len(), &grounded.rule);
         self.consistency.push((source.clone(), grounded));
         Some(self.consistency.len() - 1)
+    }
+
+    /// Whether this program already contains the exact same ground consistency rule.
+    pub(crate) fn has_consistency(&self, source: &Rule, grounded: &Grounded) -> bool {
+        let key = (
+            source.name.clone(),
+            grounded.substitution.clone(),
+            rule_key(&grounded.rule),
+        );
+        self.consistency_known.contains(&key)
     }
 
     /// Grounds `rules` (fact and consistency rules) over all of `source`.

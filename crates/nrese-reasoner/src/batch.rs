@@ -3650,6 +3650,7 @@ fn run_body(
         &[],
         &mut found,
         stop,
+        None,
     )?;
     result.violations = found;
     result.counters.lookups_without_order = store
@@ -3923,9 +3924,13 @@ impl Reads {
     }
 }
 
+pub(crate) type WitnessFilter<'a> =
+    dyn Fn(&str, &[Option<u64>], &Poller<'_>) -> Result<bool, Stopped> + 'a;
+
 /// Evaluates consistency instances into `found`: those in `full` over all facts, and the
 /// `(instance, atom)` semi-naive variants in `variants` through the delta; then finishes
-/// it (sorted, without duplicates). Polls `stop` between morsels of driver matches, and a
+/// it (sorted, without duplicates). The optional filter excludes witnesses before they
+/// are charged to the report. Polls `stop` between morsels of driver matches, and a
 /// fired `stop` ends it with [`Interrupted`]: a stopped check is never a report. Once the
 /// report refuses (its budget has no room), no further morsel runs: the state is
 /// inconsistent whatever the rest would add.
@@ -3936,6 +3941,7 @@ pub(crate) fn check<S: Source + ?Sized>(
     variants: &[(usize, usize)],
     found: &mut Violations,
     stop: super::eval::Stop<'_>,
+    exclude: Option<&WitnessFilter<'_>>,
 ) -> Result<(), Interrupted> {
     // The record's words: the job's bindings are sized for the grounded instance, which
     // lacks the schema variables when one of them has the highest index.
@@ -3951,10 +3957,6 @@ pub(crate) fn check<S: Source + ?Sized>(
                 .unwrap_or(0)
         })
     }
-    let group_of = |c: usize, found: &mut Violations| {
-        let rule = &program.consistency[c].0;
-        found.group(&rule.name, rule.variables())
-    };
     // One driver can have very many bindings (a rule over independent atoms), firing or
     // not, so the morsel alone is too coarse: the walk's reads poll `stop` per fact they
     // visit, and so do the jobs' constructions (sweep M01).
@@ -3964,6 +3966,28 @@ pub(crate) fn check<S: Source + ?Sized>(
     // A stopped read ends the job list; each rule is a unit of work,
     // a bodiless one recorded included.
     let stopped = |Stopped| Interrupted::default();
+    let record =
+        |c: usize, bindings: &[Option<u64>], id: &mut Option<_>, found: &mut Violations| {
+            let (rule, _) = &program.consistency[c];
+            if let Some(exclude) = exclude {
+                // Variable indices are bytes, so reconstructing a witness needs no heap.
+                let mut witness = [None; u8::MAX as usize + 1];
+                for (slot, word) in witness.iter_mut().zip(words(program, c, bindings)) {
+                    *slot = Some(word);
+                }
+                if exclude(&rule.name, &witness[..rule.variables()], &poll)? {
+                    return Ok(false);
+                }
+            }
+            let group = match *id {
+                Some(group) => group,
+                None => match found.group(&rule.name, rule.variables()) {
+                    Some(group) => *id.insert(group),
+                    None => return Ok(true),
+                },
+            };
+            Ok(!found.record(group, words(program, c, bindings)))
+        };
     let mut jobs: Vec<(usize, Job<'_>)> = Vec::new();
     for c in full {
         let ground_rule = &program.consistency[c].1.rule;
@@ -3972,9 +3996,10 @@ pub(crate) fn check<S: Source + ?Sized>(
                 return Err(Interrupted::default());
             }
             let substitution = &program.consistency[c].1.substitution;
-            if guards_hold(&ground_rule.guards, substitution, &poll) {
-                let Some(id) = group_of(c, found) else { break };
-                found.record(id, words(program, c, &[]));
+            if guards_hold(&ground_rule.guards, substitution, &poll)
+                && record(c, &[], &mut None, found).map_err(stopped)?
+            {
+                break;
             }
         } else {
             let job = Job::full(source, ground_rule, &poll).map_err(stopped)?;
@@ -3998,16 +4023,9 @@ pub(crate) fn check<S: Source + ?Sized>(
         for start in (0..job.drivers()).step_by(MORSEL) {
             let range = start..(start + MORSEL).min(job.drivers());
             let stopped = job.run_until(source, range, &poll, &mut |bindings| {
-                // A refused report stops the walk: the state is inconsistent whatever
-                // the rest would add.
-                let group = match id {
-                    Some(group) => group,
-                    None => match group_of(c, found) {
-                        Some(group) => *id.insert(group),
-                        None => return true,
-                    },
-                };
-                !found.record(group, words(program, c, bindings))
+                // A refusal stops the walk. A stopped witness probe is reported by
+                // run_until on the same poller.
+                record(c, bindings, &mut id, found).unwrap_or(true)
             });
             let stopped = stopped.map_err(|Stopped| Interrupted::default())?;
             if stopped {

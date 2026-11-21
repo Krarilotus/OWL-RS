@@ -70,17 +70,25 @@ come with. What is in is on
   emptied graph answers 404 ([Graph Store Protocol](ops/http-api.md#graph-store-protocol)).
   Read that 404 as an empty graph.
 - A reader of only some graphs gets no plan steps in `EXPLAIN`.
-- A value drawn at each evaluation (`RAND()`, `UUID()`, `STRUUID()`, `BNODE()`) is drawn once
-  per solution of its group, as SPARQL says, except where the engine shares one evaluation
-  between rows or repeats it: in an `EXISTS` (once per distinct value it reads, not once per
-  row), a `LATERAL`, a property path, a group beside a vector search probed first, a
-  `SERVICE` call sent in batches, and an `AVG` over a drawn value.
-- A group that draws such a value is evaluated from the distinct values of the rows joined
-  to it, not from the rows themselves, which costs a little more than a group that draws
-  nothing. Where those rows share no variable the group binds in every solution, or leave
-  such a variable unbound in a row, the group is evaluated alone and then joined: a
-  `FILTER(RAND() < …)` over a `UNION` in which only some arms bind the joined variable reads
-  all of those arms' data, not only the rows' values.
+- A part of a query that draws a value at each evaluation (`RAND()`, `UUID()`, `STRUUID()`,
+  `BNODE()`) is evaluated as follows, and gives up some faster plans for it, so it costs more
+  than one that draws nothing:
+  - an `EXISTS` that draws is evaluated once per tested row, and in an `OPTIONAL`'s condition
+    once per compatible pair: its cost grows with the rows, not with their distinct values;
+  - a `LATERAL` right side that draws is evaluated once per left row;
+  - a `SERVICE` pattern that draws is sent once per endpoint it resolves to, per evaluation of
+    the `SERVICE`, without the joined rows' values, and joined here;
+  - a group that draws, beside a vector search, is evaluated first: the search doesn't go
+    first. Where every row of the group binds the matched vector, the search ranks only those
+    vectors; otherwise it ranks every vector of the active graph;
+  - a `GROUP BY` with an `AVG` over a drawn value is never computed in parts: where its rows
+    don't fit the query's memory, the query is refused.
+- In a plan that passes rows sideways into a group, a group that draws is evaluated from the
+  distinct values of the rows joined to it, not from the rows themselves, which costs a little
+  more than a group that draws nothing. Where those rows share no variable the group binds in
+  every solution, or leave such a variable unbound in a row, the group is evaluated alone and
+  then joined: a `FILTER(RAND() < …)` over a `UNION` in which only some arms bind the joined
+  variable reads all of those arms' data, not only the rows' values.
   The answer is right, but slower, or refused under a tight memory budget.
 - Directional strings in the data alone don't make a result announce RDF 1.2, but a query that
   makes or matches them, or triple terms, does ([announcing](ops/http-api.md#requests-in-detail)).
@@ -332,6 +340,14 @@ leave something out.
   ([`owl2-dl`](spec/reasoning-semantics.md#owl2-dl-owl-2-dl-answers-with-their-completeness)).
   Remove such axioms, give the individual its own IRI, or use `owl2-rl`, whose promise
   is the rules' reading.
+- Under `owl2-dl`, a name used as two kinds OWL 2 DL keeps apart (an object and a data
+  property, either and an annotation property, a class and a datatype) leaves the rules-only
+  route where an axiom other than an assertion names it: every answer is `unsound` and the
+  consistency `unknown`. So does a structure no axiom uses that the rules may read more of
+  (a blank node with two forms, a negative assertion's statements without its type, or one
+  that is also an individual): every answer is `unsound`, the consistency decided. A name
+  only assertions use as two kinds (`dc:creator "N"` beside `dc:creator :n`) keeps the route.
+  Declare each name as one kind, or remove the unused structure.
 - Under `owl2-dl`, where the OWL 2 RL rules find a clash in such an ontology, this release
   doesn't decide whether the data is consistent under OWL 2 DL: the commit is refused,
   saying so, and data loaded with such a clash is `undecided` and quarantined, with the
@@ -340,8 +356,9 @@ leave something out.
   verdict at a query doesn't change readiness. In quarantine, each commit rebuilds the
   inferences in full, and under `owl2-dl` reads the asserted ontology once more to tell
   `undecided` from `inconsistent`. Remove the statements behind the clash, remove the
-  annotation property's domain, range, super-property or sub-property or the empty list, or give
-  the individual its own IRI. Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
+  annotation property's domain, range, super-property or sub-property or the empty list, give
+  the individual its own IRI, remove the unused structure, or declare each name as one kind.
+  Under `owl2-rl`, which takes the rules' reading, the clash is an inconsistency.
 - On a store in quarantine, a commit can be refused as introducing a violation that was
   already there, though a full rebuild finds the same violation after it (under `owl2-rl`, for
   one): a commit that deletes a statement the remaining statements still entail, that deletes a
@@ -627,6 +644,9 @@ leave something out.
   part has no stated bound in this release.
 - Near the memory limit, a cached decoding can cause a refusal while memory the cache could give back is still
   held. The output is never wrong.
+- A published snapshot's `owl:sameAs` classes are built by the first query that needs them, charged to its memory.
+  Where they don't fit, that query runs without them and nothing is kept, until a query with room builds them: the
+  answer is the same, only slower. Earlier versions built them in the first query whatever its budget.
 - A cancel, a deadline or a refusal takes effect at the work's next poll, which bounds work, not time. Under
   nested reads in reasoning, more work runs between two polls ([the bound](architecture/contracts.md#cancellation)).
   A stop never gives a partial or wrong answer.

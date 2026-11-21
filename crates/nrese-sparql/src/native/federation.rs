@@ -272,6 +272,9 @@ impl Context<'_> {
             )
             .into());
         };
+        // A pattern that draws is sent once, without bindings, and joined here: sent per
+        // batch, a remote solution meeting several batches would be drawn again in each.
+        let bound = bound.filter(|_| !self.draws_in(inner));
         // Under canonical answers a bound value stands for its class, and the endpoint names
         // each identity as stored ([`super::canonical`]).
         let (chunks, _held) = match (bound, &self.canonical) {

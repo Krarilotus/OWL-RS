@@ -30,10 +30,12 @@ pub(crate) enum Site {
     HeadGroup,
     /// Merges of a fact's derivations into its sets started (`merge`).
     Merge,
+    /// Old consistency instances inspected in a delete's witness lookup.
+    OldWitnessInstance,
 }
 
 thread_local! {
-    static COUNTS: [Cell<u64>; 10] = const { [const { Cell::new(0) }; 10] };
+    static COUNTS: [Cell<u64>; 11] = const { [const { Cell::new(0) }; 11] };
 }
 
 /// Counts `n` units at `site` on this thread.

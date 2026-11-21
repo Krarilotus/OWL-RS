@@ -7,7 +7,7 @@ use nrese_engine::{
 };
 
 use crate::StoreResult;
-use nrese_owl::{Ontology, Statement, TermKind, Terms};
+use nrese_owl::{Ontology, Statement, TermKind, Terms, Treatments};
 use nrese_rdf::{NamedNodeRef, Term};
 
 /// The individuals entailment tests add to an ontology (`¬(C ⊑ D)` as `(C ⊓ ¬D)(x)`):
@@ -182,22 +182,29 @@ fn statements<B: std::ops::Deref<Target = nrese_exec::Budget>>(
     Ok(statements)
 }
 
+/// `statements` read, each name of two kinds and each unused structure given its kind's
+/// treatment (`dl.treatments`).
+fn read(statements: &[Statement], terms: &dyn Terms, treatments: &Treatments) -> Ontology {
+    let mut ontology = nrese_owl::read(statements, terms);
+    ontology.treat(treatments);
+    ontology
+}
+
 /// The ontology of a transaction's asserted statements, after its changes, its scratch
 /// charged to `budget` (refused: `Err`, nothing kept). O(asserted).
 pub(crate) fn read_pending<B: std::ops::Deref<Target = nrese_exec::Budget>>(
     tx: &Transaction<'_>,
     budget: B,
+    treatments: &Treatments,
 ) -> Result<Ontology, nrese_exec::BudgetExceeded> {
     let statements = statements(tx.quads_for_pattern_in(ReadModel::Asserted, &ANY), budget)?;
     let decode = |id| tx.decode(id);
     let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
-    Ok(nrese_owl::read(
-        &statements,
-        &StoreTerms {
-            decode: &decode,
-            lookup: &lookup,
-        },
-    ))
+    let terms = StoreTerms {
+        decode: &decode,
+        lookup: &lookup,
+    };
+    Ok(read(&statements, &terms, treatments))
 }
 
 /// The ontology of a transaction's statements asserted in the graphs `readable` admits,
@@ -207,6 +214,7 @@ pub(crate) fn read_pending_where<B: std::ops::Deref<Target = nrese_exec::Budget>
     tx: &Transaction<'_>,
     budget: B,
     readable: impl Fn(nrese_engine::TermId) -> bool,
+    treatments: &Treatments,
 ) -> Result<Ontology, nrese_exec::BudgetExceeded> {
     let quads = tx
         .quads_for_pattern_in(ReadModel::Asserted, &ANY)
@@ -214,13 +222,11 @@ pub(crate) fn read_pending_where<B: std::ops::Deref<Target = nrese_exec::Budget>
     let statements = statements(quads, budget)?;
     let decode = |id| tx.decode(id);
     let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
-    Ok(nrese_owl::read(
-        &statements,
-        &StoreTerms {
-            decode: &decode,
-            lookup: &lookup,
-        },
-    ))
+    let terms = StoreTerms {
+        decode: &decode,
+        lookup: &lookup,
+    };
+    Ok(read(&statements, &terms, treatments))
 }
 
 /// The ontology of a snapshot's asserted statements, its scratch charged to `budget`
@@ -228,8 +234,9 @@ pub(crate) fn read_pending_where<B: std::ops::Deref<Target = nrese_exec::Budget>
 pub(crate) fn read_snapshot<B: std::ops::Deref<Target = nrese_exec::Budget>>(
     snapshot: &Snapshot,
     budget: B,
+    treatments: &Treatments,
 ) -> Result<Ontology, nrese_exec::BudgetExceeded> {
-    Ok(read_premise(snapshot, budget)?.0)
+    Ok(read_premise(snapshot, budget, treatments)?.0)
 }
 
 /// [`read_snapshot`], with the statements it read, which a conclusion is read beside
@@ -237,6 +244,7 @@ pub(crate) fn read_snapshot<B: std::ops::Deref<Target = nrese_exec::Budget>>(
 pub(crate) fn read_premise<B: std::ops::Deref<Target = nrese_exec::Budget>>(
     snapshot: &Snapshot,
     budget: B,
+    treatments: &Treatments,
 ) -> Result<(Ontology, nrese_exec::ChargedVec<Statement, B>), nrese_exec::BudgetExceeded> {
     let statements = statements(
         snapshot.quads_for_pattern_in(ReadModel::Asserted, &ANY),
@@ -248,7 +256,7 @@ pub(crate) fn read_premise<B: std::ops::Deref<Target = nrese_exec::Budget>>(
         decode: &decode,
         lookup: &lookup,
     };
-    Ok((nrese_owl::read(&statements, &terms), statements))
+    Ok((read(&statements, &terms, treatments), statements))
 }
 
 /// Why an ontology wasn't read: its statements didn't fit `budget`'s memory.

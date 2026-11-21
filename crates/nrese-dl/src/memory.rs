@@ -131,6 +131,8 @@ pub fn ontology_bytes(ontology: &Ontology) -> usize {
         + literals
         + iris
         + ontology.anonymous.len() * (size_of::<nrese_owl::Term>() + 8)
+        + (ontology.annotation_uses.len() + ontology.annotation_axioms.len())
+            * (size_of::<nrese_owl::Term>() + 8)
 }
 
 /// The lists an axiom holds besides itself.
