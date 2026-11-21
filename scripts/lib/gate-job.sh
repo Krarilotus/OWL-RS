@@ -13,6 +13,11 @@
 # scripts/cargo-guarded.sh), each entry's last use recorded, one sweep for the whole cache
 # (NRESE_HOST_CACHE_GB).
 #
+# MODE quick (scripts/check.sh quick) has a worktree, target and lock of its own (wt-quick,
+# target-quick-<release>, lock-quick), so it never waits behind a push gate, nor a push gate behind
+# it. The sweep then runs only while the host's other gate doesn't, so neither removes what the
+# other builds in.
+#
 # Its tools: the tree's toolchain (rust-toolchain.toml), the pinned cargo-nextest and Miri
 # nightly (scripts/lib/gate-tools.txt), the suite's Python packages and, for a push that changes
 # the console, the pinned Node (scripts/lib/gate-node.sh), all installed once, nextest, Python's
@@ -46,7 +51,10 @@ quiet() {
   rm -f "$log"
 }
 
-exec 9> "$cache/lock"
+# The push gate's cache entries, or the quick check's (their names' suffix), and the other's lock.
+own="" other=$cache/lock-quick
+[ "$mode" = quick ] && own=-quick other=$cache/lock
+exec 9> "$cache/lock$own"
 if ! flock -n 9; then
   echo "another gate runs on this host: waiting for it"
   flock 9 || infra "no lock"
@@ -57,7 +65,7 @@ fi
 tool=$PWD
 repo=$(git rev-parse --path-format=absolute --git-common-dir) || infra "not in the job's checkout"
 sha=$(git rev-parse "HEAD^{commit}") || infra "no commit HEAD"
-wt=$cache/wt
+wt=$cache/wt$own
 if ! git -C "$wt" checkout -q -f --detach "$sha" 2> /dev/null; then
   rm -rf -- "$wt"
   git --git-dir="$repo" worktree prune
@@ -65,7 +73,7 @@ if ! git -C "$wt" checkout -q -f --detach "$sha" 2> /dev/null; then
 fi
 git -C "$wt" clean -q -fd
 [ "$(git -C "$wt" rev-parse 'HEAD^{tree}')" = "$tree" ] || infra "the checkout isn't tree $tree"
-files=$cache/files
+files=$cache/files$own
 if [ $# -gt 0 ]; then
   printf '%s\n' "$@" > "$files"
 else
@@ -79,10 +87,10 @@ cd "$wt" || infra "no worktree"
 linker=${NRESE_GATE_CC:-cc}
 command -v "$linker" > /dev/null || infra "no C compiler and linker ($linker) on this host: its owner installs one (build-essential)"
 # ... and one that links: a tiny program, built.
-printf 'int main(void) { return 0; }\n' > "$cache/link-probe.c"
-quiet "$linker" "$cache/link-probe.c" -o "$cache/link-probe" \
+printf 'int main(void) { return 0; }\n' > "$cache/link-probe$own.c"
+quiet "$linker" "$cache/link-probe$own.c" -o "$cache/link-probe$own" \
   || infra "the C compiler here ($linker) doesn't link a program: its owner repairs it (build-essential)"
-rm -f -- "$cache/link-probe.c" "$cache/link-probe"
+rm -f -- "$cache/link-probe$own.c" "$cache/link-probe$own"
 # A host without rustup (the development machine's WSL VM, 20 Oct 2026) gets one of the gate's own, under the cache:
 # the host's own home and PATH stay as they are.
 if ! command -v rustup > /dev/null; then
@@ -130,7 +138,7 @@ export PATH="$pybin:$PATH"
 # The console's Node (scripts/lib/gate-node.sh), first on PATH, where the push changes the console:
 # its step runs with the pinned build, never the host's.
 node=""
-if grep -q '^apps/nrese-console/' "$files"; then
+if [ "$mode" = push ] && grep -q '^apps/nrese-console/' "$files"; then
   # shellcheck source=gate-node.sh
   . "$tool/scripts/lib/gate-node.sh"
   nodebin=$(gate_node "$cache" "$tool/scripts/lib/gate-tools.txt") || infra "no Node for the console"
@@ -148,7 +156,9 @@ identity=$(gate_identity HEAD) || infra "no rustc"
 # freshness by mtimes, so a build from another checkout in it (/verify's, which wrote
 # target-<release> until 26 Oct 2026) could stand in for the tree's own code.
 release=$(rustc -vV | sed -n 's/^release: //p')
-export CARGO_TARGET_DIR="$cache/target-gate-$release"
+tag=gate
+[ "$mode" = quick ] && tag=quick
+export CARGO_TARGET_DIR="$cache/target-$tag-$release"
 export NRESE_TARGET_BUDGET_GB=${NRESE_GATE_BUDGET_GB:-40}
 used=("$CARGO_TARGET_DIR" "$py" ${node:+"$node"})
 for entry in "${used[@]}"; do mkdir -p "$entry" && echo "$EPOCHSECONDS" > "$entry/.last-used"; done
@@ -210,5 +220,11 @@ GATE_TIER=$mode GATE_TREE=$tree GATE_LIST=$list_hash GATE_IDENTITY=$identity GAT
   GATE_CHANGED=$(git status --porcelain --untracked-files=no) GATE_SECONDS=$((SECONDS - began)) GATE_PEAK=$peak \
   GATE_JOB=${FLEET_JOB:-} GATE_FLEET_HOST=${FLEET_HOST:-} GATE_ATTEMPT=$attempt \
   python3 "$tool/scripts/lib/gate-record.py" "$out"
-sweep
+# Only while the host's other gate (push or quick) isn't running: its entries are in use.
+exec 8> "$other"
+if flock -n 8; then
+  sweep
+else
+  echo "the host's other gate runs: no sweep this time"
+fi
 exit $code
