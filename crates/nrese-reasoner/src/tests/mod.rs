@@ -18,6 +18,15 @@ mod sources;
 mod stops;
 mod support_refusal;
 
+/// The check tier (`NRESE_CHECK_TIER`): `landing` (the default) or `nightly`.
+pub(crate) fn nightly() -> bool {
+    match std::env::var("NRESE_CHECK_TIER").as_deref() {
+        Err(_) | Ok("landing") => false,
+        Ok("nightly") => true,
+        Ok(other) => panic!("NRESE_CHECK_TIER={other:?}: expected `landing` or `nightly`"),
+    }
+}
+
 /// A `sameAs` class of a blank node and an IRI is represented by the IRI, whatever their
 /// numbers within their kinds: the largest IRI id against the smallest blank node's. The
 /// key rule's exemption over representatives rests on it (`owl2-dl`'s `prp-key` keeps
@@ -376,17 +385,6 @@ fn both_with(
         }
     }
     let grouped = batch::materialise_grouped(groups, &rules, lists, &schema);
-    // Derived facts never include asserted ones (the schema pre-closure must filter).
-    let asserted: HashSet<Triple> = input.iter().copied().collect();
-    assert!(
-        batch.derived.iter().all(|t| !asserted.contains(t)),
-        "asserted fact reported as derived"
-    );
-    assert_eq!(grouped.derived, batch.derived, "grouped input");
-    // The relations kept without their object order are never looked up by object.
-    assert_eq!(batch.counters.lookups_without_order, 0);
-    assert_eq!(grouped.counters.lookups_without_order, 0);
-    assert_eq!(grouped.violations, batch.violations, "grouped input");
     let mut expected: Vec<Triple> = naive.derived.iter().copied().collect();
     expected.sort_unstable();
     if expected != batch.derived {
@@ -413,6 +411,17 @@ fn both_with(
     let mut violations = naive.violations;
     violations.sort_by(|a, b| (&a.rule, &a.bindings).cmp(&(&b.rule, &b.bindings)));
     assert_eq!(violations, batch.violations.to_vec(), "violations differ");
+    // Derived facts never include asserted ones (the schema pre-closure must filter).
+    let asserted: HashSet<Triple> = input.iter().copied().collect();
+    assert!(
+        batch.derived.iter().all(|t| !asserted.contains(t)),
+        "asserted fact reported as derived"
+    );
+    assert_eq!(grouped.derived, batch.derived, "grouped input");
+    // The relations kept without their object order are never looked up by object.
+    assert_eq!(batch.counters.lookups_without_order, 0);
+    assert_eq!(grouped.counters.lookups_without_order, 0);
+    assert_eq!(grouped.violations, batch.violations, "grouped input");
     assert!(batch.violations.complete(), "an unlimited list is complete");
     (naive.derived, violations)
 }
@@ -549,17 +558,32 @@ fn a_reflexive_property_relates_every_individual_to_itself_under_ql() {
 
 /// Random small ontologies: the batch executor equals the naive one under every
 /// profile.
+/// By default, this test replays fixed derivations in every profile. With `NRESE_CHECK_TIER=nightly`, it draws 60 per profile.
 #[test]
 fn every_profile_batch_equals_naive() {
     let mut next = rng(0x5851_F42D_4C95_7F2D);
+    let cases = test_cases(20, 60);
+    let pinned = pinned_cases();
+    let mut families = OntologyFamilies::default();
     for ruleset in super::rulesets::ALL {
         let mut derived = 0;
-        let covered = |derived: usize| derived > 120;
+        let planned = if pinned {
+            ONTOLOGY_WITNESSES.len() as u64
+        } else {
+            cases
+        };
+        let covered = |derived: usize| derived as u64 > planned.saturating_mul(2);
         for case in 0.. {
-            if !draws_on(case, 60, covered(derived)) {
+            if (pinned && case == cases) || (!pinned && !draws_on(case, cases, covered(derived))) {
                 break;
             }
-            let lines = random_ontology(&mut next);
+            let lines = families.input(
+                &mut next,
+                pinned && ONTOLOGY_WITNESSES.contains(&(case as usize)),
+            );
+            if pinned && !ONTOLOGY_WITNESSES.contains(&(case as usize)) {
+                continue;
+            }
             let mut vocabulary = LocalVocabulary::default();
             let input = load(&mut vocabulary, &lines.join("\n"));
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -573,6 +597,9 @@ fn every_profile_batch_equals_naive() {
         // The cases must derive something (a fair share: 60 small ontologies give
         // 200 or more under the fixed seed, down to about 150 under others).
         assert!(covered(derived), "{}: {derived}", ruleset.name());
+    }
+    if pinned {
+        families.assert_complete();
     }
 }
 
@@ -1167,6 +1194,24 @@ fn equality_gives_lists_several_member_sequences() {
     assert!(violations.is_empty(), "{violations:?}");
 }
 
+pub(super) fn test_cases(default: u64, full: u64) -> u64 {
+    let cases = if nightly() { full } else { default };
+    std::env::var("NRESE_FUZZ_CASES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(cases)
+}
+
+fn pinned_cases() -> bool {
+    !nightly()
+        && std::env::var_os("NRESE_FUZZ_CASES").is_none()
+        && std::env::var_os("NRESE_FUZZ_SEED").is_none()
+}
+
+// Case 0 gave the profile, hidden-class and representative reds; case 17
+// gave the listing red. Each profile or listing uses these fixed positions.
+const ONTOLOGY_WITNESSES: [usize; 14] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 16, 17, 19];
+
 /// A xorshift generator: `next(n)` is in `0..n`.
 fn rng(seed: u64) -> impl FnMut(usize) -> usize {
     // Varied by `NRESE_FUZZ_SEED` (a number) for bug hunts over many seeds.
@@ -1195,6 +1240,49 @@ fn draws_on(drawn: u64, cases: u64, covered: bool) -> bool {
 /// rule table: hierarchies, property axioms and characteristics, restrictions,
 /// cardinalities, equality, lists and the consistency rules.
 fn random_ontology(next: &mut dyn FnMut(usize) -> usize) -> Vec<String> {
+    ontology_with(next, |_, _, _| {})
+}
+
+#[derive(Default)]
+struct OntologyFamilies(std::collections::BTreeMap<&'static str, (usize, u16)>);
+
+impl OntologyFamilies {
+    fn input(&mut self, next: &mut dyn FnMut(usize) -> usize, witness: bool) -> Vec<String> {
+        if !witness {
+            return random_ontology(next);
+        }
+        ontology_with(next, |name, size, choice| {
+            self.0.entry(name).or_insert((size, 0)).1 |= 1 << choice;
+        })
+    }
+
+    fn extend(&mut self, other: Self) {
+        for (name, (size, observed)) in other.0 {
+            self.0.entry(name).or_insert((size, 0)).1 |= observed;
+        }
+    }
+
+    fn assert_complete(&self) {
+        assert_eq!(self.0.len(), 8);
+        for (&name, &(size, observed)) in &self.0 {
+            assert_eq!(
+                observed.count_ones() as usize,
+                size,
+                "missing {name} witness: {observed:b}"
+            );
+        }
+    }
+}
+
+fn ontology_with(
+    next: &mut dyn FnMut(usize) -> usize,
+    mut witness: impl FnMut(&'static str, usize, usize),
+) -> Vec<String> {
+    let mut choose = |next: &mut dyn FnMut(usize) -> usize, name, size| {
+        let choice = next(size);
+        witness(name, size, choice);
+        choice
+    };
     const CLASS_AXIOMS: [&str; 5] = [
         "rdfs:subClassOf",
         "owl:equivalentClass",
@@ -1235,34 +1323,34 @@ fn random_ontology(next: &mut dyn FnMut(usize) -> usize) -> Vec<String> {
         format!("_:{name}a")
     };
     for n in 0..(10 + next(30)) {
-        let line = match next(12) {
+        let line = match choose(next, "statement", 12) {
             0 | 1 => format!(
                 "{} {} {}",
                 class(next(5)),
-                CLASS_AXIOMS[next(5)],
+                CLASS_AXIOMS[choose(next, "class axiom", CLASS_AXIOMS.len())],
                 class(next(5))
             ),
             2 => format!(
                 "{} {} {}",
                 property(next(4)),
-                PROPERTY_AXIOMS[next(5)],
+                PROPERTY_AXIOMS[choose(next, "property axiom", PROPERTY_AXIOMS.len())],
                 property(next(4))
             ),
             3 => {
-                let axiom = ["rdfs:domain", "rdfs:range"][next(2)];
+                let axiom = ["rdfs:domain", "rdfs:range"][choose(next, "domain or range", 2)];
                 format!("{} {axiom} {}", property(next(4)), class(next(5)))
             }
             4 => format!(
                 "{} rdf:type {}",
                 property(next(4)),
-                CHARACTERISTICS[next(7)]
+                CHARACTERISTICS[choose(next, "characteristic", CHARACTERISTICS.len())]
             ),
             5 | 6 => format!("{} rdf:type {}", individual(next(6)), class(next(5))),
             7 => {
                 // A restriction: onProperty plus a filler.
                 let c = class(next(5));
                 lines.push(format!("{c} owl:onProperty {}", property(next(4))));
-                match next(5) {
+                match choose(next, "restriction", CARDINALITY.len() + 3) {
                     0 => format!("{c} owl:someValuesFrom {}", class(next(5))),
                     1 => format!("{c} owl:allValuesFrom {}", class(next(5))),
                     2 => format!("{c} owl:hasValue {}", individual(next(6))),
@@ -1270,7 +1358,8 @@ fn random_ontology(next: &mut dyn FnMut(usize) -> usize) -> Vec<String> {
                 }
             }
             8 => {
-                let relation = ["owl:sameAs", "owl:differentFrom", "rdf:type"][next(3)];
+                let relation = ["owl:sameAs", "owl:differentFrom", "rdf:type"]
+                    [choose(next, "equality or bottom", 3)];
                 if relation == "rdf:type" {
                     format!("{} rdf:type owl:Nothing", class(next(5)))
                 } else {
@@ -1279,7 +1368,7 @@ fn random_ontology(next: &mut dyn FnMut(usize) -> usize) -> Vec<String> {
             }
             9 => {
                 let name = format!("l{n}");
-                match next(4) {
+                match choose(next, "list axiom", 4) {
                     0 => {
                         let head = list(&mut lines, &name, [class(next(5)), class(next(5))]);
                         format!("{} owl:intersectionOf {head}", class(next(5)))
@@ -1315,22 +1404,33 @@ fn random_ontology(next: &mut dyn FnMut(usize) -> usize) -> Vec<String> {
 /// anonymous unions, some also used where memberships are consumed, the closure with
 /// the hidden classes' memberships left out is the full closure without them, under
 /// every ruleset; classes that are consumed are never hidden.
+/// By default, this test replays fixed hidden-class witnesses in each profile. With `NRESE_CHECK_TIER=nightly`, it draws 60 per ruleset.
 #[test]
 fn hidden_unnamed_classes_leave_the_rest_of_the_closure() {
     use super::unnamed::{UnnamedVocabulary, hidden_classes_in};
     let mut next = rng(0x000D_DBA1_1C1A_55E5);
     let (mut hidden_total, mut dropped_total) = (0, 0);
+    let cases = test_cases(20, 60) as usize;
+    let pinned = pinned_cases();
+    let mut families = OntologyFamilies::default();
+    let planned = if pinned {
+        ONTOLOGY_WITNESSES.len()
+    } else {
+        cases
+    };
+    let floor = planned.saturating_mul(5);
     let covered =
-        |hidden_total: usize, dropped_total: usize| hidden_total > 300 && dropped_total > 300;
+        |hidden_total: usize, dropped_total: usize| hidden_total > floor && dropped_total > floor;
     // Rounds over the rulesets until their cases cover enough, at most ten: coverage
     // never depends on the seed.
     for round in 0.. {
-        if !draws_on(round, 1, covered(hidden_total, dropped_total)) {
+        if (pinned && round > 0) || !draws_on(round, 1, covered(hidden_total, dropped_total)) {
             break;
         }
         for ruleset in super::rulesets::ALL {
-            for case in 0..60 {
-                let mut lines = random_ontology(&mut next);
+            for case in 0..cases {
+                let mut lines =
+                    families.input(&mut next, pinned && ONTOLOGY_WITNESSES.contains(&case));
                 for u in 0..1 + next(4) {
                     let head = format!("_:u{u}l0");
                     lines.push(format!("_:u{u} owl:unionOf {head}"));
@@ -1357,6 +1457,9 @@ fn hidden_unnamed_classes_leave_the_rest_of_the_closure() {
                 }
                 for _ in 0..next(8) {
                     lines.push(format!("ex:i{} ex:p{} ex:i{}", next(6), next(4), next(6)));
+                }
+                if pinned && !ONTOLOGY_WITNESSES.contains(&case) {
+                    continue;
                 }
                 let mut vocabulary = LocalVocabulary::default();
                 let input = load(
@@ -1438,26 +1541,40 @@ fn hidden_unnamed_classes_leave_the_rest_of_the_closure() {
         covered(hidden_total, dropped_total),
         "{hidden_total} {dropped_total}"
     );
+    if pinned {
+        families.assert_complete();
+    }
 }
 
 /// Equality by representatives: on random ontologies with extra `sameAs` and data,
 /// under every ruleset with equality, the representative closure expanded is exactly
 /// the replicated closure, and the same consistency rules fire.
+/// By default, this test replays fixed witnesses in each equality profile. With `NRESE_CHECK_TIER=nightly`, it draws 120 per equality ruleset.
 #[test]
 fn representatives_expand_to_the_replicated_closure() {
     use super::representatives;
     let mut next = rng(0x1234_5678_9ABC_DEF1);
     let (mut classes_seen, mut merges) = (0, 0);
-    let covered = |classes_seen: usize, merges: usize| classes_seen > 150 && merges > 150;
+    let cases = test_cases(20, 120) as usize;
+    let pinned = pinned_cases();
+    let mut families = OntologyFamilies::default();
+    let planned = if pinned {
+        ONTOLOGY_WITNESSES.len()
+    } else {
+        cases
+    };
+    let floor = planned.saturating_mul(5) / 4;
+    let covered = |classes_seen: usize, merges: usize| classes_seen > floor && merges > floor;
     // Rounds over the rulesets until their cases cover enough, at most ten: coverage
     // never depends on the seed.
     for round in 0.. {
-        if !draws_on(round, 1, covered(classes_seen, merges)) {
+        if (pinned && round > 0) || !draws_on(round, 1, covered(classes_seen, merges)) {
             break;
         }
         for ruleset in [Ruleset::Owl2Rl, Ruleset::RdfsPlus, Ruleset::OwlHorst] {
-            for case in 0..120 {
-                let mut lines = random_ontology(&mut next);
+            for case in 0..cases {
+                let mut lines =
+                    families.input(&mut next, pinned && ONTOLOGY_WITNESSES.contains(&case));
                 for _ in 0..next(6) {
                     lines.push(format!("ex:i{} owl:sameAs ex:i{}", next(6), next(6)));
                 }
@@ -1470,6 +1587,9 @@ fn representatives_expand_to_the_replicated_closure() {
                 }
                 if next(4) == 0 {
                     lines.push(format!("ex:C{} owl:sameAs ex:C{}", next(5), next(5)));
+                }
+                if pinned && !ONTOLOGY_WITNESSES.contains(&case) {
+                    continue;
                 }
                 let mut vocabulary = LocalVocabulary::default();
                 let input = load(
@@ -1533,6 +1653,9 @@ fn representatives_expand_to_the_replicated_closure() {
         }
     }
     assert!(covered(classes_seen, merges), "{classes_seen} {merges}");
+    if pinned {
+        families.assert_complete();
+    }
 }
 
 /// The facts an equality merge makes stale are collected one of two ways (batch.rs,
@@ -1543,13 +1666,22 @@ fn representatives_expand_to_the_replicated_closure() {
 /// predicates and rule constants lose their place), each listing's facts, the classes, the
 /// violations and the merges are the same both ways, and no listing holds a fact twice (a
 /// held fact let into a round's new facts is listed again). Varied by `NRESE_FUZZ_SEED`.
+/// By default, this test replays fixed merger witnesses in all three listing modes. With `NRESE_CHECK_TIER=nightly`, it checks 150.
 #[test]
 fn a_merge_s_rewrites_answer_the_same_scanned_or_looked_up() {
     use super::eval::NEVER;
     let mut next = rng(0x5ca7_7e57_2026_1112);
     let mut merges = 0;
-    for case in 0..150 {
-        let mut lines = random_ontology(&mut next);
+    let cases = test_cases(20, 150) as usize;
+    let pinned = pinned_cases();
+    let mut families = OntologyFamilies::default();
+    let planned = if pinned {
+        ONTOLOGY_WITNESSES.len()
+    } else {
+        cases
+    };
+    for case in 0..cases {
+        let mut lines = families.input(&mut next, pinned && ONTOLOGY_WITNESSES.contains(&case));
         lines.push("ex:f rdf:type owl:FunctionalProperty".to_owned());
         for _ in 0..next(6) {
             lines.push(format!("ex:i{} owl:sameAs ex:i{}", next(6), next(6)));
@@ -1565,6 +1697,9 @@ fn a_merge_s_rewrites_answer_the_same_scanned_or_looked_up() {
         }
         if next(4) == 0 {
             lines.push(format!("ex:C{} owl:sameAs ex:C{}", next(5), next(5)));
+        }
+        if pinned && !ONTOLOGY_WITNESSES.contains(&case) {
+            continue;
         }
         let mut vocabulary = LocalVocabulary::default();
         let input = load(&mut vocabulary, &lines.join("\n"));
@@ -1598,19 +1733,22 @@ fn a_merge_s_rewrites_answer_the_same_scanned_or_looked_up() {
                 (result.derived, classes, violations, result.merges)
             });
             let context = || format!("case {case}, {listing:?}\n{}", lines.join("\n"));
+            assert_eq!(scanned, looked_up, "{}", context());
             assert!(
                 scanned.0.windows(2).all(|pair| pair[0] != pair[1]),
                 "a fact listed twice: {}",
                 context()
             );
-            assert_eq!(scanned, looked_up, "{}", context());
             merges += looked_up.3;
         }
     }
     assert!(
-        merges > 150,
+        merges > planned,
         "{merges} merges: too few to tell the ways apart"
     );
+    if pinned {
+        families.assert_complete();
+    }
 }
 
 /// Equality by representatives ends when a rule head names a constant that isn't its
@@ -2143,6 +2281,7 @@ fn equality_module_equals_the_generic_rules() {
 /// equality-heavy ontology: equal to rematerialisation after every change, under each
 /// plan of the maintenance policy (B3a: classes a deletion splits recomputed, or DRed
 /// over them).
+/// By default, this test replays 20 fixed edits under each policy. With `NRESE_CHECK_TIER=nightly`, it draws 60 per policy.
 #[test]
 fn delta_equality_equals_rematerialisation() {
     use super::delta::policy::{Plan, Policy};
@@ -2187,6 +2326,11 @@ fn delta_equality_equals_rematerialisation() {
     };
     let closure =
         |asserted: &[Triple]| batch::materialise(asserted, &rules, Some(&lists), &schema).derived;
+    // The edits of seed 7 that split and join classes under each policy.
+    let edits = [
+        15, 6, 15, 13, 4, 1, 1, 12, 9, 17, 7, 4, 6, 3, 6, 16, 1, 16, 17, 3,
+    ];
+    let pinned = pinned_cases();
     for policy in [
         Policy::default(),
         Policy::forcing(Plan::Dred),
@@ -2197,8 +2341,14 @@ fn delta_equality_equals_rematerialisation() {
         asserted.sort_unstable();
         let mut inferred = closure(&asserted);
         let mut recomputed = 0;
-        for step in 0..60 {
-            let fact = pool[next(pool.len())];
+        let mut kinds = HashSet::new();
+        for step in 0..test_cases(edits.len() as u64, 60) {
+            let index = if pinned {
+                edits[step as usize]
+            } else {
+                next(pool.len())
+            };
+            let fact = pool[index];
             let deleting = asserted.binary_search(&fact).is_ok();
             let mut after: Vec<Triple> = asserted.iter().copied().filter(|&t| t != fact).collect();
             if !deleting {
@@ -2231,12 +2381,20 @@ fn delta_equality_equals_rematerialisation() {
             maintained.sort_unstable();
             maintained.dedup();
             assert_eq!(maintained, closure(&after), "{policy:?}, step {step}");
+            kinds.insert((fact[1] == schema.same_as(), deleting));
             inferred = maintained;
             asserted = after;
         }
         match policy.force {
             Some(Plan::Dred) => assert_eq!(recomputed, 0),
             _ => assert!(recomputed > 0, "{policy:?}: no change recomputed a class"),
+        }
+        if pinned {
+            assert_eq!(
+                kinds,
+                HashSet::from([(false, false), (false, true), (true, false), (true, true)]),
+                "{policy:?} must replay both edits of equality and other facts",
+            );
         }
     }
 }
@@ -2297,14 +2455,17 @@ fn materialisation_stops_when_asked() {
 }
 
 /// Random small ontologies: the batch executor equals the naive one.
+/// By default, this test replays fixed witnesses for eight consistency rules. With `NRESE_CHECK_TIER=nightly`, it draws 400 ontologies.
 #[test]
 fn batch_equals_naive_on_random_ontologies() {
     let mut next = rng(0x9E37_79B9_7F4A_7C15);
     let (mut derived, mut violations, mut rules) =
         (0, 0, std::collections::BTreeSet::<String>::new());
-    let covered = |derived: usize, rules: usize| derived > 15_000 && rules >= 8;
+    let cases = test_cases(100, 400);
+    let floor = (cases.saturating_mul(75) / 2) as usize;
+    let covered = |derived: usize, rules: usize| derived > floor && rules >= 8;
     for case in 0.. {
-        if !draws_on(case, 400, covered(derived, rules.len())) {
+        if !draws_on(case, cases, covered(derived, rules.len())) {
             break;
         }
         let lines = random_ontology(&mut next);
@@ -2326,6 +2487,23 @@ fn batch_equals_naive_on_random_ontologies() {
         covered(derived, rules.len()),
         "{derived} derived, {violations} violations of {rules:?}"
     );
+    if pinned_cases() {
+        for rule in [
+            "cax-dw",
+            "cls-com",
+            "cls-maxc1",
+            "cls-nothing2",
+            "eq-diff1",
+            "prp-asyp",
+            "prp-irp",
+            "prp-pdw",
+        ] {
+            assert!(
+                rules.contains(rule),
+                "missing consistency witness for {rule}"
+            );
+        }
+    }
 }
 
 /// List axioms edited under the delta executor: its list
@@ -2637,7 +2815,10 @@ fn check_supports(
 ///   bodiless facts and recursion, and the closure decides what they leave open.
 pub(super) fn support_sets_against_closures() {
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
-    let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
+    let cases = test_cases(30, 150);
+    let pinned = pinned_cases();
+    let mut families = OntologyFamilies::default();
+    let witnesses = [0, 2, 5, 6, 8, 10, 15, 21, 24, 28];
     let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x6a5e_7c0d_2026_1003));
     let add = |counts: &mut [u64; 3], found: [u64; 3]| {
         for (count, more) in counts.iter_mut().zip(found) {
@@ -2681,7 +2862,7 @@ pub(super) fn support_sets_against_closures() {
         if !draws_on(case, cases, covered(&counts)) {
             break;
         }
-        let lines = random_ontology(&mut next);
+        let lines = families.input(&mut next, pinned && witnesses.contains(&case));
         let mut vocabulary = LocalVocabulary::default();
         let pool = load(&mut vocabulary, &lines.join("\n"));
         let (rules, lists, schema) = rules_of(&mut vocabulary);
@@ -2692,6 +2873,9 @@ pub(super) fn support_sets_against_closures() {
             if next(6) == 0 {
                 placed.push((fact, next(3) as u32));
             }
+        }
+        if pinned && !witnesses.contains(&case) {
+            continue;
         }
         let readers: Vec<u64> = (0..8).collect();
         let found = check_supports(
@@ -2707,6 +2891,9 @@ pub(super) fn support_sets_against_closures() {
         add(&mut counts, found);
     }
     assert!(covered(&counts), "{counts:?}");
+    if pinned {
+        families.assert_complete();
+    }
 }
 
 /// The oracle of `graph_sets::update_support_sets` (its test calls it): random
@@ -2723,17 +2910,31 @@ pub(super) fn support_set_updates_against_recomputation() {
         support_sets, update_support_sets,
     };
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
-    let cases = env("NRESE_FUZZ_CASES").unwrap_or(150);
+    let cases = test_cases(30, 150);
+    let pinned = pinned_cases();
+    let witnesses = [
+        0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 19, 20, 21, 22, 24, 26, 28, 29,
+    ];
+    let mut kinds = HashSet::new();
+    let mut families = OntologyFamilies::default();
     let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x5e75_d1ff_2026_1003));
     let (mut updated, mut refused, mut remarked, mut decided) = (0, 0, 0, 0);
     let covered = |updated: u64, remarked: u64, decided: u64| {
-        updated > cases / 4 && remarked > 0 && decided > 0
+        let planned = if pinned {
+            witnesses.len() as u64
+        } else {
+            cases
+        };
+        updated > planned / 4 && remarked > 0 && decided > 0
     };
     for case in 0.. {
-        if !draws_on(case, cases, covered(updated, remarked, decided)) {
+        if (pinned && case == cases)
+            || (!pinned && !draws_on(case, cases, covered(updated, remarked, decided)))
+        {
             break;
         }
-        let lines = random_ontology(&mut next);
+        let mut case_families = OntologyFamilies::default();
+        let lines = case_families.input(&mut next, pinned && witnesses.contains(&case));
         let mut vocabulary = LocalVocabulary::default();
         let pool = load(&mut vocabulary, &lines.join("\n"));
         let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
@@ -2787,18 +2988,25 @@ pub(super) fn support_set_updates_against_recomputation() {
             continue;
         }
         let old_placed = placed.clone();
+        let mut edits = HashSet::new();
         for _ in 0..=next(3) {
             let i = movable[next(movable.len())];
             if placed[i].1 == u32::MAX {
                 continue;
             }
-            match next(3) {
+            const EDITS: usize = 3;
+            let kind = next(EDITS);
+            edits.insert(kind);
+            match kind {
                 0 => placed[i].1 = (placed[i].1 + 1) % 3,
                 1 => placed.push((placed[i].0, next(3) as u32)),
                 _ => placed[i].1 = u32::MAX,
             }
         }
         placed.retain(|&(_, g)| g != u32::MAX);
+        if pinned && !witnesses.contains(&case) {
+            continue;
+        }
         let (after, ground_after) = state(&placed);
         if ground_after.schema_premises() != premises {
             continue;
@@ -2977,7 +3185,11 @@ pub(super) fn support_set_updates_against_recomputation() {
             }
         }
         match served {
-            true => updated += 1,
+            true => {
+                updated += 1;
+                kinds.extend(edits);
+                families.extend(case_families);
+            }
             false => refused += 1,
         }
     }
@@ -2985,11 +3197,20 @@ pub(super) fn support_set_updates_against_recomputation() {
         covered(updated, remarked, decided),
         "updated {updated}, refused {refused}, remarked {remarked}, decided {decided}"
     );
+    if pinned {
+        families.assert_complete();
+        assert_eq!(
+            kinds,
+            HashSet::from([0, 1, 2]),
+            "missing a graph edit witness"
+        );
+    }
 }
 
 /// Random ontologies under random insert/delete sequences: after every change, the
 /// inferred facts the delta executor maintains equal a rematerialisation, and the
 /// violations it reports are exactly the new ones.
+/// By default, this test replays the failing case and witnesses for each profile, policy and cache choice. With `NRESE_CHECK_TIER=nightly`, it draws 300.
 #[test]
 fn delta_equals_rematerialisation_under_random_changes() {
     use super::delta::policy::{Plan, Policy};
@@ -2997,23 +3218,45 @@ fn delta_equals_rematerialisation_under_random_changes() {
 
     // NRESE_FUZZ_CASES and NRESE_FUZZ_SEED widen the sweep locally.
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
-    let cases = env("NRESE_FUZZ_CASES").unwrap_or(300);
-    let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(0x2545_F491_4F6C_DD1D));
-    let (mut changes, mut inserted, mut removed) = (0, 0, 0);
-    let covered = |inserted: usize, removed: usize| inserted > 1000 && removed > 1000;
-    for case in 0.. {
-        if !draws_on(case, cases, covered(inserted, removed)) {
-            break;
-        }
-        let lines = random_ontology(&mut next);
-        let mut vocabulary = LocalVocabulary::default();
-        let pool = load(&mut vocabulary, &lines.join("\n"));
+    const SEED: u64 = 0x2545_F491_4F6C_DD1D;
+    // Case 0 exposed stale memberships. The remaining seeds exercise the same
+    // recipe for each profile, with both policies and both cache paths.
+    let witnesses = [0, 1, 2, 3, 4, 5, 6, 9, 12, 13, 15, 18, 21, 24, 27];
+    let pinned = pinned_cases();
+    let mut families = OntologyFamilies::default();
+    let cases = test_cases(witnesses.len() as u64, 300);
+    let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(SEED));
+    let mut witnessed = HashSet::new();
+    let recipe = |case: u64| {
         // A third of the cases run the other rulesets in turn.
         let ruleset = if case % 3 == 0 {
-            super::rulesets::ALL[(case as usize / 3) % 5]
+            super::rulesets::ALL[(case as usize / 3) % (super::rulesets::ALL.len() - 1)]
         } else {
             Ruleset::Owl2Rl
         };
+        (ruleset, (case / 3) % 2 == 1, case % 2 == 1)
+    };
+    let (mut changes, mut inserted, mut removed) = (0, 0, 0);
+    let floor = cases.saturating_mul(10) / 3;
+    let covered = |inserted: u64, removed: u64| inserted > floor && removed > floor;
+    for draw in 0.. {
+        if (pinned && draw == cases)
+            || (!pinned && !draws_on(draw, cases, covered(inserted, removed)))
+        {
+            break;
+        }
+        let case = if pinned {
+            witnesses[draw as usize]
+        } else {
+            draw
+        };
+        if pinned {
+            next = rng(SEED ^ case);
+        }
+        let lines = families.input(&mut next, pinned);
+        let mut vocabulary = LocalVocabulary::default();
+        let pool = load(&mut vocabulary, &lines.join("\n"));
+        let (ruleset, recompute, cached) = recipe(case);
         let rules = ruleset.rules(&mut vocabulary).unwrap();
         let lists = ListVocabulary::new(&mut vocabulary);
         let lists = ruleset.has_list_rules().then_some(&lists);
@@ -3061,9 +3304,10 @@ fn delta_equals_rematerialisation_under_random_changes() {
                 .collect();
             let base = MemoryBase::new(&after, &stack);
             // Every other run of rulesets recomputes each class a deletion touches.
-            let policy = match (case / 3) % 2 {
-                0 => Policy::default(),
-                _ => Policy::forcing(Plan::Recompute),
+            let policy = if recompute {
+                Policy::forcing(Plan::Recompute)
+            } else {
+                Policy::default()
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 update_with(
@@ -3095,7 +3339,7 @@ fn delta_equals_rematerialisation_under_random_changes() {
             };
             changes += 1;
             let expected = closure(&after);
-            if case % 2 == 1 {
+            if cached {
                 if let Some(program) = &result.program {
                     cache = Some(program.clone());
                 }
@@ -3130,8 +3374,8 @@ fn delta_equals_rematerialisation_under_random_changes() {
                         .collect();
                     panic!("{}\nmissing {missing:#?}\nextra {extra:#?}", context());
                 }
-                inserted += result.insert.len();
-                removed += result.remove.len();
+                inserted += result.insert.len() as u64;
+                removed += result.remove.len() as u64;
                 // Reported violations: all of them are violations of the new state,
                 // and every violation the old state didn't have is reported.
                 let new_state: HashSet<(&str, &[u64])> = expected.violations.iter().collect();
@@ -3156,6 +3400,7 @@ fn delta_equals_rematerialisation_under_random_changes() {
             asserted = after;
             before = expected;
         }
+        witnessed.insert((ruleset.name(), recompute, cached));
     }
     // Four changes a case, for every case drawn (at least the planned ones).
     assert!(
@@ -3166,6 +3411,15 @@ fn delta_equals_rematerialisation_under_random_changes() {
         covered(inserted, removed),
         "{inserted} inserted, {removed} removed"
     );
+    if pinned {
+        for case in 0..6 * (super::rulesets::ALL.len() as u64 - 1) {
+            let (ruleset, recompute, cached) = recipe(case);
+            assert!(witnessed.contains(&(ruleset.name(), recompute, cached)));
+        }
+    }
+    if pinned {
+        families.assert_complete();
+    }
 }
 
 /// The batch store's in-place drivers ([`Source::scan_range`]) visit exactly what a scan

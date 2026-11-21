@@ -1161,6 +1161,7 @@ mod tests {
     /// functional and inverse-functional properties) leave the inferred stack equal to a
     /// fresh closure, under each plan of the maintenance policy forced and the cheapest, in
     /// both store modes (every copy, or over representatives). Varied by `NRESE_FUZZ_SEED`.
+    /// By default, this test checks 2 seeds for each mode and plan. With `NRESE_CHECK_TIER=nightly`, it checks 6.
     #[test]
     fn every_maintenance_plan_keeps_the_stack_equal_to_recomputation() {
         use crate::delta::policy::Plan;
@@ -1174,11 +1175,13 @@ mod tests {
             Some(Plan::Recompute),
             Some(Plan::Rebuild),
         ];
+        let cases = crate::tests::test_cases(2, 6);
         let mut failures: Vec<String> = Vec::new();
+        let mut untaken = Vec::new();
         for compact in [false, true] {
             for plan in plans {
                 let mut taken: HashSet<Plan> = HashSet::new();
-                for seed in 1..=6u64 {
+                for seed in 1..=cases {
                     let mut state = (seed ^ fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15)).max(1);
                     let mut below = move |n: usize| {
                         state ^= state << 13;
@@ -1269,7 +1272,6 @@ mod tests {
                         }
                         let done =
                             maintain(&program, Some(&ground), &mut tx, crate::eval::NEVER).unwrap();
-                        assert!(done.violations.consistent(), "no inconsistency is possible");
                         let took = done.work.plan;
                         taken.insert(took);
                         tx.commit().unwrap();
@@ -1314,13 +1316,13 @@ mod tests {
                             ));
                             break;
                         }
+                        assert!(done.violations.consistent(), "no inconsistency is possible");
                     }
                 }
-                if let Some(plan) = plan {
-                    assert!(
-                        taken.contains(&plan),
-                        "compact {compact}: {plan:?} never taken"
-                    );
+                if let Some(plan) = plan
+                    && !taken.contains(&plan)
+                {
+                    untaken.push((compact, plan));
                 }
             }
         }
@@ -1332,6 +1334,7 @@ mod tests {
 "
             )
         );
+        assert!(untaken.is_empty(), "forced plans never taken: {untaken:?}");
     }
 
     /// A rebuild runs no delta, and still reports the list axioms a deletion leaves
