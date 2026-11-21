@@ -76,8 +76,8 @@ impl StoreSettings {
         nrese_exec::Envelope::new(limit, self.runtime.query_memory())
     }
 
-    /// The envelope of a query request: the one its transport gave it
-    /// ([`PreparedQuery::draw_from`]), else its memory limit within the catalog's budget.
+    /// The envelope of a query request: the one opened when the store prepared it
+    /// ([`PreparedQuery::memory`]), else its memory limit within the catalog's budget.
     pub(crate) fn query_envelope(&self, prepared: &PreparedQuery) -> nrese_exec::Envelope {
         prepared
             .memory
@@ -103,8 +103,9 @@ pub struct PreparedQuery {
     pub(crate) inference_scope: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
     read_model: ReadModel,
     memory_limit: Option<usize>,
-    /// The envelope its runs draw from, if its transport gave one ([`Self::draw_from`]).
-    memory: Option<nrese_exec::Envelope>,
+    /// The envelope its runs draw from, opened by the store that prepared it
+    /// ([`Self::memory`]).
+    pub(crate) memory: Option<nrese_exec::Envelope>,
     as_written: bool,
     solutions_format: SolutionsResultFormat,
     graph_format: GraphResultFormat,
@@ -213,11 +214,13 @@ impl PreparedQuery {
         })
     }
 
-    /// Its runs draw on `memory` ([`StoreService::envelope`](crate::StoreService::envelope)),
-    /// not on an envelope of their own: what its transport holds for the request (an answer
-    /// held whole) shares the request's limit with them.
-    pub fn draw_from(&mut self, memory: nrese_exec::Envelope) {
-        self.memory = Some(memory);
+    /// The envelope its runs draw on, opened by the store that prepared it
+    /// ([`StoreService::prepare_query`](crate::StoreService::prepare_query)): its memory
+    /// limit within the store's budget. What its transport holds for the request (an answer
+    /// held whole) is charged to it too, so that both share the request's limit. `None`
+    /// for a query parsed without a store ([`Self::parse`]).
+    pub fn memory(&self) -> Option<&nrese_exec::Envelope> {
+        self.memory.as_ref()
     }
 
     /// Calls `entered` whenever the store hands this query to the executor, past the

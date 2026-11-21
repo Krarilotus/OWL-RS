@@ -76,9 +76,12 @@ pub async fn execute_query_in(
         prepared.media_type()
     };
     let store = state.store();
-    // The request's one envelope: its runs draw on it, and so does an answer held whole.
-    let memory = store.envelope(request.memory_limit);
-    prepared.draw_from(memory.clone());
+    // The request's one envelope, opened as the store prepared it: its runs draw on it, and
+    // so does an answer held whole.
+    let memory = prepared
+        .memory()
+        .cloned()
+        .ok_or_else(|| ApiError::internal("a query the store prepared has no envelope"))?;
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
     // The completeness goes with the answers, in a header: the store reports it on the

@@ -882,6 +882,7 @@ impl StoreService {
     /// of some graphs, by its first run on what it reads.
     pub fn prepare_query(&self, request: &SparqlQueryRequest) -> StoreResult<PreparedQuery> {
         let mut prepared = PreparedQuery::parse_with(request, Some(&self.namespaces.all()))?;
+        prepared.memory = Some(self.envelope(request.memory_limit));
         if PreparedQuery::uses_rdf12(prepared.query()) {
             prepared.announce_rdf12();
         }
@@ -1539,8 +1540,8 @@ impl StoreService {
     }
 
     /// A request's memory envelope within the catalog's budget: `limit` bytes of its
-    /// own, or none. A transport opens one for what it holds for a request, and hands it to
-    /// the request's query ([`PreparedQuery::draw_from`]).
+    /// own, or none: for a read a transport holds memory for without a query of its own (a
+    /// query's is opened when it is prepared, [`PreparedQuery::memory`]).
     pub fn envelope(&self, limit: Option<usize>) -> nrese_exec::Envelope {
         self.settings.envelope(limit)
     }
