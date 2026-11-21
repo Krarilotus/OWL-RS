@@ -2151,7 +2151,7 @@ mod tests {
 
     /// A commit holds the state lock from placing its file to taking it back, and a listing
     /// reads the directory under it: a listing taken while a commit is between the two waits
-    /// for it, and never shows the file taken back.
+    /// for it, and then neither shows the file taken back nor fails on it.
     #[test]
     fn a_listing_waits_for_a_commit_taking_its_file_back() {
         let dir = tempfile::tempdir().unwrap();
@@ -2166,7 +2166,7 @@ mod tests {
         quarantine.fail_next_placement_sync();
         quarantine.pause_next_placement_failure(std::sync::Arc::clone(&pause));
 
-        let (load, during, listed) = std::thread::scope(|scope| {
+        let (load, waited, listed) = std::thread::scope(|scope| {
             let load = scope.spawn(|| {
                 store.bulk_load(&crate::BulkLoadRequest {
                     files: vec![file],
@@ -2179,23 +2179,21 @@ mod tests {
             pause.wait();
             let (sender, receiver) = std::sync::mpsc::channel();
             scope.spawn(move || {
-                let _ = sender.send(quarantine.list(&QuarantineFilter::default()).unwrap());
+                let _ = sender.send(quarantine.list(&QuarantineFilter::default()));
             });
             let during = receiver.recv_timeout(std::time::Duration::from_millis(500));
             pause.wait();
-            let listed = match &during {
-                Ok(listed) => listed.clone(),
-                Err(_) => receiver.recv().unwrap(),
-            };
-            (load.join().unwrap(), during, listed)
+            let waited = during.is_err();
+            let listed = during.or_else(|_| receiver.recv()).unwrap();
+            (load.join().unwrap(), waited, listed)
         });
 
         assert!(load.is_err(), "{load:?}");
+        assert!(waited, "listed while the commit held its file: {listed:#?}");
         assert!(
-            during.is_err(),
-            "listed while the commit held its file: {during:#?}"
+            matches!(&listed, Ok(items) if *items == before),
+            "{listed:#?}"
         );
-        assert_eq!(listed, before);
     }
 
     /// The log a start reads is the one a power loss keeps: a start that
