@@ -5,6 +5,60 @@ use crate::{
 };
 
 #[test]
+fn first_write_publishes_annotation_and_class_seeds() {
+    // Spec: OWL 2 Profiles §4.3, prp-ap, cls-thing, cls-nothing1 and scm-cls
+    // require these rows after a first write, including after a disk reopen.
+    let required = insert(
+        "
+        rdfs:label rdf:type owl:AnnotationProperty
+        rdfs:comment rdf:type owl:AnnotationProperty
+        rdfs:seeAlso rdf:type owl:AnnotationProperty
+        rdfs:isDefinedBy rdf:type owl:AnnotationProperty
+        owl:deprecated rdf:type owl:AnnotationProperty
+        owl:versionInfo rdf:type owl:AnnotationProperty
+        owl:priorVersion rdf:type owl:AnnotationProperty
+        owl:backwardCompatibleWith rdf:type owl:AnnotationProperty
+        owl:incompatibleWith rdf:type owl:AnnotationProperty
+        owl:Thing rdf:type owl:Class
+        owl:Nothing rdf:type owl:Class
+        owl:Thing rdfs:subClassOf owl:Thing
+        owl:Thing owl:equivalentClass owl:Thing
+        owl:Nothing rdfs:subClassOf owl:Thing
+        owl:Nothing rdfs:subClassOf owl:Nothing
+        owl:Nothing owl:equivalentClass owl:Nothing
+        ",
+    )
+    .insert;
+    let write = insert("ex:a ex:p ex:b");
+    let mut missing = Vec::new();
+    for &mode in judges::MODES {
+        let temp = tempfile::tempdir().expect("seed test disk store directory");
+        let rl = nrese_reasoner::ReasoningMode::Owl2Rl;
+        for (stage, path) in [
+            ("memory", None),
+            ("disk", Some(temp.path())),
+            ("reopened", Some(temp.path())),
+        ] {
+            let store = judges::open(mode, path);
+            let pipeline = judges::pipeline(&store, rl);
+            if stage != "reopened" {
+                assert!(
+                    judges::apply(&pipeline, &write),
+                    "{mode} {stage} first write"
+                );
+            }
+            let (rows, _) = judges::rows(&store);
+            for row in &required {
+                if !rows.contains(row) {
+                    missing.push((mode, stage, row));
+                }
+            }
+        }
+    }
+    assert!(missing.is_empty(), "OWL 2 RL seed rows absent: {missing:?}");
+}
+
+#[test]
 #[ignore = "undocumented: an empty store omits the datatype declarations until its first write attempt"]
 fn empty_store_publishes_datatype_axioms() {
     // Spec: Table 8 dt-type1 and reasoning-semantics.md:57 require these on an empty graph.
