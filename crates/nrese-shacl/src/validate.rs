@@ -705,9 +705,23 @@ impl<'a, V: ReadView> Validator<'a, V> {
     /// Keeps `result` in `results`, charged first to the task's own reservation (no lock); a
     /// refusal is the validation's stop.
     fn keep(&self, results: &mut TaskResults, result: RawResult) {
-        match results.held.charge(result.retained_bytes()) {
-            Ok(()) => results.list.push(result),
+        self.keep_prepaid(results, result, 0);
+    }
+
+    /// [`Validator::keep`] of a result `prepaid` of whose bytes the task's reservation holds
+    /// already (texts charged as they were made): the rest is charged, so the result is
+    /// charged once as a whole, with no moment uncharged. A refusal drops the result, then
+    /// returns `prepaid`.
+    fn keep_prepaid(&self, results: &mut TaskResults, result: RawResult, prepaid: usize) {
+        let bytes = result.retained_bytes();
+        match results.held.charge(bytes.saturating_sub(prepaid)) {
+            Ok(()) => {
+                results.list.push(result);
+                results.held.release(prepaid.saturating_sub(bytes));
+            }
             Err(refused) => {
+                drop(result);
+                results.held.release(prepaid);
                 let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
             }
         }
@@ -1177,7 +1191,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 Ok(sparql::Outcome::Failed(failed)) => {
                     // An ASK validator's solution is `$this` and `$value` (SHACL §6.3).
                     for value in failed {
-                        let Ok((messages, charged)) = self.sparql_messages(
+                        let Ok((messages, prepaid)) = self.sparql_messages(
                             check,
                             None,
                             Vec::new(),
@@ -1189,15 +1203,15 @@ impl<'a, V: ReadView> Validator<'a, V> {
                         ) else {
                             return ControlFlow::Break(());
                         };
-                        self.keep(
+                        self.keep_prepaid(
                             results,
                             raw(
                                 Some(ResultTerm::Stored(value)),
                                 shape.path.clone().map(ResultPath::Path),
                                 messages,
                             ),
+                            prepaid,
                         );
-                        results.held.release(charged);
                     }
                 }
                 Ok(sparql::Outcome::Solutions(solutions)) => {
@@ -1239,7 +1253,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                             .path
                             .map(|path| self.result_path(path))
                             .or_else(|| shape.path.clone().map(ResultPath::Path));
-                        let Ok((messages, charged)) = self.sparql_messages(
+                        let Ok((messages, prepaid)) = self.sparql_messages(
                             check,
                             found.message,
                             found.bindings,
@@ -1251,8 +1265,7 @@ impl<'a, V: ReadView> Validator<'a, V> {
                         ) else {
                             return ControlFlow::Break(());
                         };
-                        self.keep(results, raw(value, path, messages));
-                        results.held.release(charged);
+                        self.keep_prepaid(results, raw(value, path, messages), prepaid);
                     }
                 }
             }
@@ -1269,10 +1282,11 @@ impl<'a, V: ReadView> Validator<'a, V> {
     /// In one form for one set of messages, so that results compare by the messages in
     /// effect ([`RawResult`]'s order, the changes' comparisons): sorted, each once, and None
     /// where they are the `shape`'s (whose ids are sorted and distinct, as every node's values
-    /// are). A filled-in text is charged to `held` before it is made, twice its length (for
-    /// its dictionary lookup too); that charge, returned with the messages, is the caller's to
-    /// return once the result is kept (and charged as a whole) or dropped. A refusal is the
-    /// validation's stop: `Err`.
+    /// are). A filled-in text is charged to `held` before it is made, and its dictionary
+    /// lookup before that runs ([`Validator::result_message`]); the charge of the texts the
+    /// messages keep is returned with them, for [`Validator::keep_prepaid`] to carry into the
+    /// result's. A refusal is the validation's stop: `Err`, with what was made dropped and its
+    /// charge returned.
     #[expect(
         clippy::too_many_arguments,
         reason = "one result's message sources: the check, the solution's message and bindings, the pre-bound terms, the shape's messages and the task's charge"
@@ -1301,7 +1315,13 @@ impl<'a, V: ReadView> Validator<'a, V> {
             (!the_shape_s).then_some(messages)
         };
         if let Some(message) = bound {
-            return Ok((canonical(vec![self.result_term(message.into())]), 0));
+            return match self.result_message(message, held) {
+                Ok(message) => Ok((canonical(vec![message]), 0)),
+                Err(refused) => {
+                    let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
+                    Err(())
+                }
+            };
         }
         if check.messages.is_empty() {
             return Ok((None, 0));
@@ -1329,25 +1349,72 @@ impl<'a, V: ReadView> Validator<'a, V> {
                 .map(|(_, term)| term)
         };
         let mut messages = Vec::with_capacity(check.messages.len());
-        let mut charged = 0;
+        // What the computed texts kept in `messages` hold, charged: the result's charge.
+        let mut prepaid = 0;
         for message in &check.messages {
-            messages.push(match &message.template {
-                None => ResultTerm::Stored(message.id),
-                Some(template) => {
-                    // The text, and as much again for the dictionary lookup of it
-                    // ([`Validator::result_term`]), which may copy it.
-                    let len = 2 * template.filled_len(&value_of);
-                    if let Err(refused) = held.charge(len) {
-                        held.release(charged);
-                        let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
-                        return Err(());
+            let Some(template) = &message.template else {
+                messages.push(ResultTerm::Stored(message.id));
+                continue;
+            };
+            let len = template.filled_len(&value_of);
+            let made = match held.charge(len) {
+                Ok(()) => {
+                    let made = self.result_message(template.fill(&value_of), held);
+                    // A stored message, or a refusal, has dropped the text.
+                    if !matches!(made, Ok(ResultTerm::Computed(_))) {
+                        held.release(len);
                     }
-                    charged += len;
-                    self.result_term(template.fill(&value_of).into())
+                    made
                 }
-            });
+                Err(refused) => Err(refused),
+            };
+            match made {
+                Ok(made) => {
+                    if matches!(made, ResultTerm::Computed(_)) {
+                        prepaid += len;
+                    }
+                    messages.push(made);
+                }
+                Err(refused) => {
+                    // What was made is dropped before its charge is returned.
+                    drop(messages);
+                    held.release(prepaid);
+                    let _ = self.stop.set(QueryEvaluationError::MemoryLimit(refused));
+                    return Err(());
+                }
+            }
         }
-        Ok((canonical(messages), charged))
+        Ok((canonical(messages), prepaid))
+    }
+
+    /// A filled-in message as a result holds it ([`Validator::result_term`] of a literal,
+    /// which holds no blank node): its id where the frontier (else this view) knows it, else
+    /// owned. What the lookup allocates is charged to `held` first and returned after it.
+    fn result_message(
+        &self,
+        message: nrese_rdf::Literal,
+        held: &mut Reservation,
+    ) -> Result<ResultTerm, nrese_exec::BudgetExceeded> {
+        let term = Term::Literal(message);
+        let mut scratch = 0;
+        let id = match self.frontier {
+            Some(frontier) => {
+                let bound = crate::graph::literal_lookup_bound(&term);
+                held.charge(bound)?;
+                scratch = bound;
+                frontier(&term)
+            }
+            None => self.graph.lookup_literal_charged(&term, |bytes| {
+                held.charge(bytes)?;
+                scratch = bytes;
+                Ok::<(), nrese_exec::BudgetExceeded>(())
+            })?,
+        };
+        held.release(scratch);
+        Ok(match id {
+            Some(id) => ResultTerm::Stored(id),
+            None => ResultTerm::Computed(Box::new(Computed { term, key: None })),
+        })
     }
 }
 
