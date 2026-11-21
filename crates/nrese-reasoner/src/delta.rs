@@ -1534,6 +1534,7 @@ fn update_body<B: Base + ?Sized>(
             base,
             hidden: &inserted_set,
             extra: deleted_facts.get_or_init(|| Store::new(deleted.to_vec())),
+            table,
         };
         index.contains(&before, name, bindings, poll)
     };
