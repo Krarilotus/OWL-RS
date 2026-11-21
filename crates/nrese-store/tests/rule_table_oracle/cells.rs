@@ -59,6 +59,36 @@ fn first_write_publishes_annotation_and_class_seeds() {
 }
 
 #[test]
+fn deleting_assertions_keeps_the_seed_declarations() {
+    // Spec: reasoning-semantics.md, OWL 2 RL seeds are inferred and never retracted.
+    let declarations = "owl:Thing rdf:type owl:Class\nrdfs:label rdf:type owl:AnnotationProperty";
+    let asserted = insert(declarations);
+    let removed = delete(declarations);
+    for &mode in judges::MODES {
+        let temp = tempfile::tempdir().expect("seed deletion store directory");
+        let open = || judges::open(mode, Some(temp.path()));
+        let check = |store: &nrese_store::StoreService, stage: &str| {
+            assert_eq!(store.stats().expect("asserted count").quad_count, 0);
+            let (rows, _) = judges::rows(store);
+            for row in &asserted.insert {
+                assert!(rows.contains(row), "{mode} {stage}: missing {row:?}");
+            }
+        };
+        {
+            let store = open();
+            let pipeline = judges::pipeline(&store, nrese_reasoner::ReasoningMode::Owl2Rl);
+            assert!(judges::apply(&pipeline, &asserted), "{mode} insert");
+            assert_eq!(store.stats().expect("asserted count").quad_count, 2);
+            assert!(judges::apply(&pipeline, &removed), "{mode} delete");
+            check(&store, "warm");
+        }
+        let store = open();
+        let _pipeline = judges::pipeline(&store, nrese_reasoner::ReasoningMode::Owl2Rl);
+        check(&store, "reopened");
+    }
+}
+
+#[test]
 #[ignore = "undocumented: an empty store omits the datatype declarations until its first write attempt"]
 fn empty_store_publishes_datatype_axioms() {
     // Spec: Table 8 dt-type1 and reasoning-semantics.md:57 require these on an empty graph.
