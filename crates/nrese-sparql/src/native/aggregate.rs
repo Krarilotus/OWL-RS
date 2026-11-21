@@ -584,6 +584,29 @@ impl Running {
             self.max = Some((value, id));
         }
     }
+
+    /// After [`Self::add`] of `id`, in a column of several datatypes: of equal values of two
+    /// datatypes (two terms), the extremes `value::order` puts first and last.
+    fn add_tie(&mut self, id: u64) {
+        if id == UNDEF {
+            return;
+        }
+        let Some(value) = TermId::from_raw(id).as_inline_integer() else {
+            return;
+        };
+        if let Some((m, mid)) = self.min
+            && m == value
+            && inline_order(&id, &mid).is_lt()
+        {
+            self.min = Some((value, id));
+        }
+        if let Some((m, mid)) = self.max
+            && m == value
+            && inline_order(&id, &mid).is_gt()
+        {
+            self.max = Some((value, id));
+        }
+    }
 }
 
 /// `value::order` of two inline integers: by value, then (one value
@@ -597,9 +620,9 @@ fn inline_order(a: &u64, b: &u64) -> Ordering {
 
 /// Every aggregate of every group in one pass over the rows, where each is `COUNT(*)`,
 /// or `COUNT`, `SUM`, `AVG`, `MIN` or `MAX` (without DISTINCT) of a variable holding only
-/// inline integers (`COUNT`: any terms; `MIN` and `MAX`: of one datatype): the results
-/// [`Aggregator::aggregate_ids`] gives, without a list of rows per group. `None` for other
-/// aggregates. DBpedia q12 summed 1 M goals into 35 k teams.
+/// inline integers (`COUNT`: any terms): the results [`Aggregator::aggregate_ids`] gives,
+/// without a list of rows per group. `None` for other aggregates. DBpedia q12 summed 1 M
+/// goals into 35 k teams.
 /// Once it applies, and before it allocates, it calls `reserve` with what it holds at most
 /// ([`pass_bytes`]); a refusal ends it.
 pub(super) fn aggregate_in_one_pass(
@@ -609,18 +632,22 @@ pub(super) fn aggregate_in_one_pass(
     aggregates: &[(Variable, AggregateExpression)],
     reserve: &mut dyn FnMut(usize) -> Result<(), BudgetExceeded>,
 ) -> Result<Option<Vec<Vec<Agg>>>, BudgetExceeded> {
-    let Some(plan) = one_pass_plan(solutions, aggregates) else {
+    let Some((plan, mixed)) = one_pass_plan(solutions, aggregates) else {
         return Ok(None);
     };
     reserve(pass_bytes(groups, plan.len()))?;
     let mut running = vec![Running::default(); groups * plan.len()];
     let mut rows = vec![0u64; groups];
-    for (row, &group) in group_of.iter().enumerate() {
-        let group = group as usize;
-        rows[group] += 1;
-        for (a, (column, _)) in plan.iter().enumerate() {
-            if let Some(column) = column {
-                running[group * plan.len() + a].add(solutions.table.get(row, *column));
+    if mixed {
+        mixed_pass(solutions, group_of, &plan, &mut running, &mut rows);
+    } else {
+        for (row, &group) in group_of.iter().enumerate() {
+            let group = group as usize;
+            rows[group] += 1;
+            for (a, (column, _)) in plan.iter().enumerate() {
+                if let Some(column) = column {
+                    running[group * plan.len() + a].add(solutions.table.get(row, *column));
+                }
             }
         }
     }
@@ -838,9 +865,10 @@ impl Context<'_> {
 fn one_pass_plan(
     solutions: &Solutions,
     aggregates: &[(Variable, AggregateExpression)],
-) -> Option<Vec<(Option<usize>, AggregateFunction)>> {
+) -> Option<(Vec<(Option<usize>, AggregateFunction)>, bool)> {
     // Per aggregate: the column it reads (`None`: the rows) and its function.
     let mut plan: Vec<(Option<usize>, AggregateFunction)> = Vec::new();
+    let mut mixed = false;
     for (_, aggregate) in aggregates {
         match aggregate {
             AggregateExpression::CountSolutions { distinct: false } => {
@@ -871,18 +899,41 @@ fn one_pass_plan(
                 }
                 // Running keeps the first of equal values, the term `value::order` picks only
                 // where equal values are one term: one datatype ("1"^^xsd:integer sorts before
-                // "1"^^xsd:nonNegativeInteger). Mixed datatypes take `aggregate_ids`.
-                if matches!(name, AggregateFunction::Min | AggregateFunction::Max)
-                    && !one_datatype(solutions.table.column(column))
-                {
-                    return None;
-                }
+                // "1"^^xsd:nonNegativeInteger). Several datatypes take [`mixed_pass`].
+                mixed |= matches!(name, AggregateFunction::Min | AggregateFunction::Max)
+                    && !one_datatype(solutions.table.column(column));
                 plan.push((Some(column), name.clone()));
             }
             _ => return None,
         }
     }
-    Some(plan)
+    Some((plan, mixed))
+}
+
+/// [`aggregate_in_one_pass`]'s pass over the rows where a MIN or MAX column holds several
+/// datatypes: [`Running::add`], then [`Running::add_tie`]. Out of line and cold, so the
+/// ordinary pass keeps its code; its state is per group, like that pass's, never per row.
+#[cold]
+#[inline(never)]
+fn mixed_pass(
+    solutions: &Solutions,
+    group_of: &[u32],
+    plan: &[(Option<usize>, AggregateFunction)],
+    running: &mut [Running],
+    rows: &mut [u64],
+) {
+    for (row, &group) in group_of.iter().enumerate() {
+        let group = group as usize;
+        rows[group] += 1;
+        for (a, (column, _)) in plan.iter().enumerate() {
+            if let Some(column) = column {
+                let id = solutions.table.get(row, *column);
+                let running = &mut running[group * plan.len() + a];
+                running.add(id);
+                running.add_tie(id);
+            }
+        }
+    }
 }
 
 /// Whether the inline integers `ids` (unbound ones aside) are of one datatype.
