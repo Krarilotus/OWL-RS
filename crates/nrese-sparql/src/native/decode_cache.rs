@@ -115,6 +115,13 @@ impl DecodeCache {
     pub(super) fn keeps(&self) -> bool {
         self.kept.is_some()
     }
+
+    #[cfg(test)]
+    pub(super) fn bytes_for_test(&self) -> usize {
+        self.kept
+            .as_ref()
+            .map_or(0, |kept| kept.terms.charged() + kept.text.bytes())
+    }
 }
 
 /// A cache charges what it keeps, lets all of it go where the budget is full, and its charge is

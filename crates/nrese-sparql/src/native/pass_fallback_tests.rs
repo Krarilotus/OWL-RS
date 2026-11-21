@@ -179,14 +179,13 @@ fn group_in(
 
 /// `query`'s groups aggregated through `route` under `limit`, in a context of their own: per
 /// group its key and values as text (sorted), or the refusal; and what the context holds
-/// once the input is consumed and its cache of decoded terms let go (a cache is never
-/// needed for an answer, and holds what room its last term found).
+/// once the input is consumed, before reading the answer or clearing any cache.
 fn aggregated(
     snapshot: &Snapshot,
     query: &Query,
     limit: Option<usize>,
     route: Route,
-) -> (Result<Vec<String>, String>, usize) {
+) -> (Result<Vec<String>, String>, [usize; 3]) {
     let Query::Select { pattern, .. } = query else {
         panic!("a SELECT")
     };
@@ -197,9 +196,16 @@ fn aggregated(
         QueryEvaluationError::MemoryLimit(refused) => format!("{refused:?}"),
         other => panic!("{other:?}"),
     };
+    let charges = || {
+        [
+            ctx.budget.used(),
+            ctx.kept.borrow().bytes(),
+            ctx.decoded.borrow().bytes_for_test(),
+        ]
+    };
     let solutions = match ctx.eval(inner) {
         Ok(solutions) => solutions,
-        Err(error) => return (Err(refused(error)), ctx.budget.used()),
+        Err(error) => return (Err(refused(error)), charges()),
     };
     let (groups, positions) = aggregate::groups_of(&solutions, variables).ok().unwrap();
     let columns = match route {
@@ -217,7 +223,10 @@ fn aggregated(
                 .collect()
         }
     };
-    let text = |id: u64| ctx.term(id).map_or("-".to_owned(), |term| term.to_string());
+    let text = |id: u64| {
+        decode(&ctx.snapshot, &ctx.computed.borrow(), id)
+            .map_or("-".to_owned(), |term| term.to_string())
+    };
     let answer = columns.map_err(refused).map(|columns| {
         let keys = aggregate::key_columns(&groups, &positions, None);
         let mut rows: Vec<String> = (0..groups.len())
@@ -230,9 +239,51 @@ fn aggregated(
         rows
     });
     ctx.consumed(solutions);
-    *ctx.decoded.borrow_mut() =
-        decode_cache::DecodeCache::new(&ctx.budget, DECODE_CACHE_ENTRIES, 1);
-    (answer, ctx.budget.used())
+    (answer, charges())
+}
+
+/// Spec: the failed one-pass SUM leaves the per-column interning peak the same room
+/// as the forced per-column route. Both give the double g for each group g.
+#[test]
+fn a_refused_pass_releases_decoded_inputs_before_the_per_column_route() {
+    let snapshot = snapshot();
+    let values: Vec<_> = (0..4_096)
+        .flat_map(|g| [g % 512, 512 * (g / 512), 0, 0, 0].map(|v| (g, v)))
+        .collect();
+    let text = grouped(&values, &format!("(SUM({XSD_DOUBLE}(?v)) AS ?t)"));
+    let query = SparqlParser::new().parse_query(&text).unwrap();
+    let run = |limit, route| aggregated(&snapshot, &query, Some(limit), route);
+    let (mut low, mut high) = (1_000_000, 4_500_000);
+    assert!(run(low, Route::PerColumn).0.is_err());
+    assert!(run(high, Route::PerColumn).0.is_ok());
+    while high - low > 1 {
+        let mid = (low + high) / 2;
+        if run(mid, Route::PerColumn).0.is_ok() {
+            high = mid;
+        } else {
+            low = mid;
+        }
+    }
+    let mut expected: Vec<_> = (0..4_096)
+        .map(|g| format!("{} {}", Literal::from(g as i64), Literal::from(g as f64)))
+        .collect();
+    expected.sort();
+    let (serial, alone) = run(high, Route::PerColumn);
+    let (general, after) = run(high, Route::General);
+    assert_eq!(
+        serial.ok().as_ref(),
+        Some(&expected),
+        "per-column SUM answers"
+    );
+    assert!(
+        general.as_ref() == Ok(&expected),
+        "fallback SUM answers at the per-column limit {high}: {:?}, charges {after:?}, per-column {alone:?}",
+        general.err()
+    );
+    assert_eq!(
+        after, alone,
+        "fallback SUM leaves only the per-column charges"
+    );
 }
 
 /// 20,480 rows in 4,096 groups over 8,192 distinct integers: value `i % 8192` in group
@@ -336,74 +387,12 @@ fn a_pass_that_falls_back_leaves_nothing_charged() {
                 wrong.push(format!("{shape} at {limit}: the routes answer differently"));
             }
             Ok(_) if after != alone => wrong.push(format!(
-                "{shape} at {limit}: {after} bytes held afterwards, the per-column route {alone}"
+                "{shape} at {limit}: charges {after:?} afterwards, the per-column route {alone:?}"
             )),
             Ok(_) => {}
         }
     }
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-}
-
-/// 20,000 subjects, each with `p0` its number modulo 100 and `p1` its number modulo 2,000:
-/// their join is 20,000 rows in 2,000 groups of `?y`.
-fn joined() -> Snapshot {
-    let config = EngineConfig {
-        background_maintenance: false,
-        ..EngineConfig::default()
-    };
-    let engine = Engine::new(config).unwrap();
-    let node = |name: &str| nrese_rdf::NamedNode::new_unchecked(format!("urn:{name}"));
-    let mut tx = engine.transaction();
-    for i in 0..20_000u32 {
-        for (p, o) in [("p0", i % 100), ("p1", i % 2_000)] {
-            let o = Literal::new_typed_literal(o.to_string(), xsd::INTEGER);
-            let quad = nrese_rdf::Quad::new(
-                node(&format!("s{i}")),
-                node(p),
-                o,
-                nrese_rdf::GraphName::DefaultGraph,
-            );
-            tx.insert(quad.as_ref());
-        }
-    }
-    tx.commit().unwrap();
-    engine.snapshot()
-}
-
-/// `query` under `options` in a context of its own: its rows as text (sorted), or the
-/// refusal; and what the context holds once the rows are let go and its cache of decoded
-/// terms too.
-fn evaluated(
-    snapshot: &Snapshot,
-    query: &Query,
-    options: &QueryOptions,
-) -> (Result<Vec<String>, String>, usize) {
-    let Query::Select { pattern, .. } = query else {
-        panic!("a SELECT")
-    };
-    let ctx = Context::new(snapshot, options, None, None);
-    let answer = match ctx.eval(pattern) {
-        Ok(solutions) => {
-            let table = &solutions.table;
-            let text = |id: u64| ctx.term(id).map_or("-".to_owned(), |term| term.to_string());
-            let mut rows: Vec<String> = (0..table.len())
-                .map(|r| {
-                    let row = (0..table.width()).map(|c| text(table.get(r, c)));
-                    row.collect::<Vec<_>>().join(" ")
-                })
-                .collect();
-            rows.sort();
-            ctx.consumed(solutions);
-            Ok(rows)
-        }
-        Err(error) => match QueryEvaluationError::from(error) {
-            QueryEvaluationError::MemoryLimit(refused) => Err(format!("{refused:?}")),
-            other => panic!("{other:?}"),
-        },
-    };
-    *ctx.decoded.borrow_mut() =
-        decode_cache::DecodeCache::new(&ctx.budget, DECODE_CACHE_ENTRIES, 1);
-    (answer, ctx.budget.used())
 }
 
 /// 16 subjects with `k`, each with 512 rows (`has`); row `i` has `g` `i % 1,024` and `v`
@@ -441,81 +430,179 @@ fn seeded() -> Snapshot {
     engine.snapshot()
 }
 
-/// Spec: a GROUP BY refused directly and answered in morsels instead ([`Context::group`])
-/// is answered from what the query held before the direct attempt: where both answer, as
-/// the streamed route alone answers (4,096-row morsels); where the query as written (direct
-/// only, no retry) is refused, the budget then reads what the streamed route alone leaves,
-/// not that and what the direct attempt kept. Over limits from 200 kB to 4 MB, two shapes:
-/// - `AVG(?x * 2)` over [`joined`]: the direct attempt is refused at its join, before it
-///   makes a number or a term. At least one limit must retry: the direct attempt refused,
-///   the query answered.
-/// - `AVG(xsd:double(?v))` over [`seeded`]: the direct attempt's pass finds 8,192 numbers
-///   (933,888 bytes) and can be refused after them, at its results' 1,024 doubles: numbers
-///   the streamed route never makes (it aggregates the expression's `COUNT` a column at a
-///   time). Its one morsel is the same under either sizing, so the retry is refused only
-///   where the streamed route alone is.
+#[derive(Clone, Copy)]
+enum RefuseDirect {
+    AfterGrouping,
+    CacheGrowth,
+    CacheEviction,
+}
+
+thread_local! {
+    static REFUSE_DIRECT: Cell<Option<RefuseDirect>> = const { Cell::new(None) };
+}
+
+/// Trigger the real, typed budget refusal at a repeatable point of the normal direct plan.
+/// The streamed plan never enters these hooks.
+fn refuse_direct(ctx: &Context<'_>) -> NativeError {
+    let refused = ctx.budget.charge(ctx.budget.remaining() + 1).unwrap_err();
+    QueryEvaluationError::MemoryLimit(refused).into()
+}
+
+const FIRST_CACHED: u64 = 17;
+const ADDED_CACHED: u64 = 18;
+
+fn seed_cache(ctx: &Context<'_>) {
+    let term = Some(Literal::from("x".repeat(8_192)).into());
+    ctx.decoded.borrow_mut().keep(FIRST_CACHED, &term);
+}
+
+fn evict_cache(ctx: &Context<'_>) {
+    let mut holds_room = Reservation::new(&*ctx.budget);
+    holds_room.charge(ctx.budget.remaining() - 1).unwrap();
+    ctx.decoded.borrow_mut().keep(ADDED_CACHED, &None);
+}
+
+fn plan_count(ctx: &Context<'_>) {
+    ctx.distinct_counts
+        .borrow_mut()
+        .get_or_insert_with(
+            (nrese_engine::QuadPattern::all(), Permutation::Spog),
+            || Some(16),
+        )
+        .ok()
+        .unwrap();
+}
+
+pub(super) fn direct_input(ctx: &Context<'_>) -> NativeResult<()> {
+    if matches!(REFUSE_DIRECT.get(), Some(RefuseDirect::CacheEviction)) {
+        REFUSE_DIRECT.set(None);
+        evict_cache(ctx);
+        return Err(refuse_direct(ctx));
+    }
+    Ok(())
+}
+
+pub(super) fn direct_output(
+    ctx: &Context<'_>,
+    solutions: NativeResult<Solutions>,
+) -> NativeResult<Solutions> {
+    let solutions = solutions?;
+    let Some(refusal) = REFUSE_DIRECT.take() else {
+        return Ok(solutions);
+    };
+    if matches!(refusal, RefuseDirect::CacheGrowth) {
+        plan_count(ctx);
+        ctx.decoded.borrow_mut().keep(ADDED_CACHED, &None);
+    }
+    ctx.consumed(solutions);
+    Err(refuse_direct(ctx))
+}
+
+/// The direct plan and retry both use normal planning. Force a refusal after the direct
+/// group has produced terms and kept its inner point, or after its input has been charged.
+fn streamed_retry(refusal: RefuseDirect, message: &str) {
+    let snapshot = seeded();
+    let text = format!(
+        "SELECT ?g (AVG({XSD_DOUBLE}(?v)) AS ?a) WHERE {{ ?c <urn:k> ?k . \
+         ?c <urn:has> ?r . ?r <urn:g> ?g . ?r <urn:v> ?v }} GROUP BY ?g"
+    );
+    let Query::Select { pattern, .. } = SparqlParser::new().parse_query(&text).unwrap() else {
+        panic!("a SELECT")
+    };
+    let (inner, keys, aggregates) = group_in(&pattern);
+    let plan = stream::Plan::of(inner, aggregates, false).expect("streamable group");
+    let options = QueryOptions {
+        as_written: false,
+        ..options(Some(12_000_000))
+    };
+    let run = |retry| {
+        let ctx = Context::new(&snapshot, &options, None, None);
+        let mut live = Reservation::new(&*ctx.budget);
+        live.charge(65_536).unwrap();
+        seed_cache(&ctx);
+        let result = if retry {
+            REFUSE_DIRECT.set(Some(refusal));
+            let result = ctx.group(inner, keys, aggregates, None);
+            REFUSE_DIRECT.set(None);
+            result
+        } else {
+            match refusal {
+                RefuseDirect::AfterGrouping => {}
+                RefuseDirect::CacheGrowth => plan_count(&ctx),
+                RefuseDirect::CacheEviction => evict_cache(&ctx),
+            }
+            ctx.group_streamed(&plan, keys, aggregates)
+        };
+        let solutions = result.ok().expect("the adaptive route answers");
+        let mut rows: Vec<_> = (0..solutions.table.len())
+            .map(|row| {
+                let term = |c| {
+                    decode(
+                        &ctx.snapshot,
+                        &ctx.computed.borrow(),
+                        solutions.table.get(row, c),
+                    )
+                };
+                let group = integer_of(&term(0).unwrap());
+                let Some(Term::Literal(avg)) = term(1) else {
+                    panic!("group {group} has no average");
+                };
+                (group, avg.value().parse::<f64>().unwrap())
+            })
+            .collect();
+        rows.sort_by_key(|(key, _)| *key);
+        ctx.consumed(solutions);
+        let state = (counters(&ctx), ctx.distinct_counts.borrow().charged());
+        // Releasing a live cache must leave the other holders' charge untouched.
+        let before = ctx.budget.used();
+        let decoded = ctx.decoded.borrow().bytes_for_test();
+        *ctx.decoded.borrow_mut() =
+            decode_cache::DecodeCache::new(&ctx.budget, DECODE_CACHE_ENTRIES, 1);
+        let remaining = (before, decoded, ctx.budget.used());
+        assert!(
+            remaining.2 >= live.bytes(),
+            "the live reservation remains charged"
+        );
+        (rows, state, remaining)
+    };
+    let expected: Vec<_> = (0..1_024).map(|g| (g, g as f64 + 3_584.0)).collect();
+    let alone = run(false);
+    let retried = run(true);
+    assert_eq!(alone.0, expected, "adaptive streaming answers AVG");
+    assert_eq!(
+        retried.0, expected,
+        "retried adaptive streaming answers AVG"
+    );
+    assert_eq!((retried.1, retried.2), (alone.1, alone.2), "{message}");
+}
+
 #[test]
 fn a_streamed_retry_holds_nothing_of_the_refused_direct_attempt() {
-    let shapes = [
-        (
-            "joined",
-            joined(),
-            "SELECT ?y (AVG(?x * 2) AS ?a) \
-             WHERE { ?s <urn:p0> ?x . ?s <urn:p1> ?y } GROUP BY ?y"
-                .to_owned(),
-        ),
-        (
-            "seeded",
-            seeded(),
-            format!(
-                "SELECT ?g (AVG({XSD_DOUBLE}(?v)) AS ?a) WHERE {{ ?c <urn:k> ?k . \
-                 ?c <urn:has> ?r . ?r <urn:g> ?g . ?r <urn:v> ?v }} GROUP BY ?g"
-            ),
-        ),
-    ];
-    let with = |limit: usize, as_written: bool, stream_rows: Option<usize>| QueryOptions {
-        as_written,
-        stream_rows,
-        ..options(Some(limit))
-    };
-    let (mut wrong, mut retried) = (Vec::new(), 0);
-    for (shape, snapshot, text) in &shapes {
-        let query = SparqlParser::new().parse_query(text).unwrap();
-        for limit in (2..=40).map(|k| k * 100_000) {
-            let (general, after) = evaluated(snapshot, &query, &with(limit, false, None));
-            let (streamed, alone) = evaluated(snapshot, &query, &with(limit, false, Some(4_096)));
-            let (direct, _) = evaluated(snapshot, &query, &with(limit, true, None));
-            match (&general, &streamed) {
-                (Err(refused), Ok(_)) if *shape == "seeded" => wrong.push(format!(
-                    "{shape} at {limit}: refused ({refused}) where the streamed route answers"
-                )),
-                (Ok(general), Ok(streamed)) if general != streamed => {
-                    wrong.push(format!("{shape} at {limit}: the routes answer differently"));
-                }
-                (Ok(_), Ok(_)) if direct.is_err() && after != alone => wrong.push(format!(
-                    "{shape} at {limit}: {after} bytes held after the retry, the streamed \
-                     route {alone}"
-                )),
-                _ => {}
-            }
-            if *shape == "joined" {
-                retried += usize::from(general.is_ok() && direct.is_err());
-            }
-        }
-    }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
-    assert!(
-        retried > 0,
-        "no limit had the direct attempt refused and the query answered"
+    streamed_retry(
+        RefuseDirect::AfterGrouping,
+        "the retry keeps no terms or numbers from the direct attempt",
+    );
+}
+
+#[test]
+fn a_streamed_retry_leaves_live_cache_growth_charged() {
+    streamed_retry(
+        RefuseDirect::CacheGrowth,
+        "the retry leaves the live planner cache charged",
+    );
+}
+
+#[test]
+fn a_streamed_retry_releases_abandoned_tables_after_cache_eviction() {
+    streamed_retry(
+        RefuseDirect::CacheEviction,
+        "the retry releases the abandoned input in full after cache eviction",
     );
 }
 
 /// What the context keeps to the query's end, by counter: its charge, its computed terms,
-/// its remembered numbers (since any open save point too) and the budget's use, its decode
-/// cache let go first (never needed for an answer, and not covered by a save point).
-fn counters(ctx: &Context<'_>) -> [usize; 4] {
-    *ctx.decoded.borrow_mut() =
-        decode_cache::DecodeCache::new(&ctx.budget, DECODE_CACHE_ENTRIES, 1);
+/// its remembered numbers (since any open save point too), and its live budget and cache.
+fn counters(ctx: &Context<'_>) -> [usize; 5] {
     let since = ctx.since.borrow();
     let remembered = ctx
         .numbers
@@ -533,6 +620,7 @@ fn counters(ctx: &Context<'_>) -> [usize; 4] {
         ctx.computed.borrow().len(),
         remembered,
         ctx.budget.used(),
+        ctx.decoded.borrow().bytes_for_test(),
     ]
 }
 
@@ -567,6 +655,8 @@ fn a_restored_save_point_leaves_the_context_as_it_was() {
         let text = format!("a term made before the point, number {i}");
         assert!(ctx.id(&Literal::new_simple_literal(text).into()).is_ok());
     }
+    let older: Term = Literal::from("a term made before the point, number 512").into();
+    let older_id = ctx.id(&older).ok().unwrap();
     let before = counters(&ctx);
     assert!(before[1] >= 1_025, "the terms are computed: {before:?}");
     let point = ctx.save();
@@ -585,8 +675,10 @@ fn a_restored_save_point_leaves_the_context_as_it_was() {
     assert_eq!(
         counters(&ctx),
         before,
-        "[kept bytes, computed terms, remembered numbers, budget used]"
+        "[kept bytes, computed terms, remembered numbers, budget used, decode bytes]"
     );
+    assert_eq!(ctx.term(older_id), Some(older.clone()));
+    assert_eq!(ctx.id(&older).ok(), Some(older_id));
     // What stays allocated is what the charge of the terms kept covers: two slots of the
     // list and two of the map per term ([`computed_bytes`]; a small table has three).
     let (terms, ids) = (ctx.computed.borrow(), ctx.computed_ids.borrow());
@@ -607,6 +699,45 @@ fn triple(object: Term) -> Term {
         object,
     )
     .into()
+}
+
+/// Spec: rollback removes a computed ID's first-use alias registered since the mark
+/// while the older term and pre-existing aliases keep their identity and charge.
+#[test]
+fn a_restore_releases_a_new_alias_for_an_older_computed_term() {
+    let snapshot = snapshot();
+    let ctx = Context::new(&snapshot, &options(None), None, None);
+    let term = triple(Literal::from("interned before the point").into());
+    let retained = triple(Literal::from("aliased before the point").into());
+    let id = ctx.id(&term).ok().unwrap();
+    let retained_id = ctx.id(&retained).ok().unwrap();
+    let alias = internal::class_constant(id);
+    let retained_alias = internal::class_constant(retained_id);
+    let evaluate = |alias: &nrese_rdf::NamedNode| {
+        ctx.evaluator
+            .eval(&Expression::NamedNode(alias.clone()), &|_| None)
+    };
+    ctx.register_alias(retained_alias.as_str(), retained_id);
+    let before = counters(&ctx);
+    let point = ctx.save();
+    let values = HashMap::from([(Variable::new_unchecked("v"), term.clone())]);
+    assert!(substitute::Values::new(&ctx, &values).is_ok());
+    assert_eq!(evaluate(&alias), Some(term.clone()));
+    ctx.restore(point);
+    assert_eq!(
+        evaluate(&alias),
+        None,
+        "the older term's first-use alias is gone"
+    );
+    assert_eq!(
+        ctx.lookup_const(alias.as_ref().into()),
+        None,
+        "the context alias is gone"
+    );
+    assert_eq!(evaluate(&retained_alias), Some(retained));
+    assert_eq!(counters(&ctx), before, "only pre-existing charges stay");
+    assert_eq!(ctx.term(id), Some(term.clone()));
+    assert_eq!(ctx.id(&term).ok(), Some(id), "the older term keeps its ID");
 }
 
 /// Spec: a restore lets go of the aliases of the terms it lets go, with their charge

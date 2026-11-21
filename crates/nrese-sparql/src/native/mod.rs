@@ -6523,7 +6523,12 @@ impl<'a> Context<'a> {
             }
             _ => self.eval(inner)?,
         };
-        self.group_solutions(solutions, variables, aggregates)
+        #[cfg(test)]
+        self::pass_fallback_tests::direct_input(self)?;
+        let grouped = self.group_solutions(solutions, variables, aggregates);
+        #[cfg(test)]
+        let grouped = self::pass_fallback_tests::direct_output(self, grouped);
+        grouped
     }
 
     /// GROUP BY over a cross product: (filters over) a join of two patterns that share no
