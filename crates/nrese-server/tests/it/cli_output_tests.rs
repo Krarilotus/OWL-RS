@@ -100,6 +100,34 @@ fn published_answer_followup_cli_reports_quarantine_failure()
     Ok(())
 }
 
+#[cfg(feature = "fault-points")]
+#[test]
+fn quarantine_failure_without_publication_says_load_again() -> Result<(), Box<dyn std::error::Error>>
+{
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("invalid.nt");
+    std::fs::write(&file, "this is not a statement\n")?;
+    let mut command = nrese(dir.path(), &dir.path().join("data"));
+    command
+        .env("NRESE_TEST_FAIL_QUARANTINE_COMMIT", "1")
+        .arg("load")
+        .arg(&file);
+    let output = run(&mut command)?;
+    let detail = "Error: the load published nothing. The quarantine record couldn't be kept: simulated failure. It's safe to load it again once the cause is resolved.";
+    assert_eq!(
+        output
+            .stderr
+            .lines()
+            .filter(|line| line.contains("simulated failure"))
+            .collect::<Vec<_>>(),
+        [detail],
+        "{}",
+        output.stderr
+    );
+    assert!(!output.status.success(), "{}", output.status);
+    Ok(())
+}
+
 /// `query --format json`: standard output is one SPARQL 1.1 JSON results document (`ASK {}`
 /// is true), nothing before or after it; the INFO lines are on standard error.
 #[test]

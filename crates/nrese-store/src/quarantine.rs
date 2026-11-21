@@ -1532,6 +1532,35 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
+    #[test]
+    fn failed_quarantine_directory_sync_leaves_no_listed_records() {
+        use nrese_engine::fault_points::fail_dir_sync_of;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store_dir = dir.path().join("store");
+        quarantined(&store_dir, dir.path());
+        let store = crate::StoreService::new(crate::StoreConfig::on_disk(&store_dir)).unwrap();
+        let quarantine = store.quarantine();
+        let filter = QuarantineFilter::default();
+        let before = quarantine.list(&filter).unwrap();
+        let open = quarantine.open_count();
+        let file = dir.path().join("invalid.nt");
+        fs::write(&file, "_:b <urn:p> \"invalid\" extra .\n").unwrap();
+
+        fail_dir_sync_of(Some((&store_dir.join(DIR), io::ErrorKind::Other)));
+        let result = store.bulk_load(&crate::BulkLoadRequest {
+            files: vec![file],
+            replace: false,
+            graph: crate::GraphTarget::DefaultGraph,
+            invalid: None,
+        });
+        fail_dir_sync_of(None);
+
+        assert!(result.is_err(), "{result:?}");
+        assert_eq!(quarantine.list(&filter).unwrap(), before);
+        assert_eq!(quarantine.open_count(), open);
+    }
+
     /// The log a start reads is the one a power loss keeps: a start that
     /// rewrote the log without a readmission past the store's revision renamed it into place,
     /// and the quarantine directory's sync then failed (`fault_points`). The next start, that

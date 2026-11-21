@@ -869,7 +869,7 @@ async fn finished(app: &Router, path: &str) -> serde_json::Value {
 const MIXED_UPLOAD: &str =
     "<urn:a> <urn:p> \"one\" .\nthis is not a statement\n_:b <urn:p> \"two\" .\n";
 const INVALID_UPLOAD: &str = "this is not a statement\n";
-const UNPUBLISHED_QUARANTINE_FAILURE: &str = "the load published nothing. The quarantine record couldn't be kept: simulated failure. It's safe to send it again.";
+const UNPUBLISHED_QUARANTINE_FAILURE: &str = "the load published nothing. The quarantine record couldn't be kept: simulated failure. It's safe to send it again once the cause is resolved.";
 
 fn import_with_quarantine_failure() -> (Router, std::sync::Arc<StoreService>) {
     let state = crate::support::test_state_with_store_config(
@@ -1012,6 +1012,40 @@ async fn quarantine_commit_failure_without_publication_fails_import_job() {
     assert_eq!(job["state"], "failed", "{job}");
     assert_eq!(job["error"], UNPUBLISHED_QUARANTINE_FAILURE, "{job}");
     assert_eq!(store.current_revision(), initial_revision);
+}
+
+#[tokio::test]
+async fn quarantine_failure_in_server_file_import_says_load_again() {
+    let files = tempfile::tempdir().unwrap();
+    std::fs::write(files.path().join("invalid.nt"), INVALID_UPLOAD).unwrap();
+    let state = crate::support::test_state_with_store_config(
+        StoreConfig::in_memory(),
+        PolicyConfig {
+            import_directory: Some(files.path().to_path_buf()),
+            ..PolicyConfig::default()
+        },
+        ReasonerConfig::default(),
+    )
+    .unwrap();
+    state.store().quarantine().fail_next_commit();
+    let app = nrese_server::build_app(state);
+    let (status, body) = send(
+        &app,
+        Method::POST,
+        "/api/v1/repositories/nrese/import/files",
+        Some("application/json"),
+        r#"{"files":["invalid.nt"]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+    let started: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let job = finished(&app, started["path"].as_str().expect(&body)).await;
+    assert_eq!(job["state"], "failed", "{job}");
+    assert_eq!(
+        job["error"],
+        "the load published nothing. The quarantine record couldn't be kept: simulated failure. It's safe to load it again once the cause is resolved.",
+        "{job}"
+    );
 }
 
 /// Imports run as jobs: an uploaded document with `async=true`, and files from the
