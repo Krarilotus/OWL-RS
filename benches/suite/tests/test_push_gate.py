@@ -1205,9 +1205,10 @@ class WindowsJob(Repo):
         lacks = ('  [ "$RUSTUP_AUTO_INSTALL" != 0 ] || exit 1\n'
                  '  : > "$STUB_NO_TOOLCHAIN"\n'
                  'fi\n')
-        # One workspace package, and no cargo-nextest: cargo test, crate by crate.
+        # One workspace package; `cargo nextest` runs the cargo-nextest on PATH, as cargo finds it.
         (stubs / "cargo").write_text(
             '#!/bin/sh\nif [ "$1" = metadata ]; then echo \'{"packages": [{"name": "x"}]}\'; exit 0; fi\n'
+            '[ "$1" != nextest ] || exec cargo-nextest "$@"\n'
             '[ "$1" = clippy ] || exit 1\n'
             'if [ -n "$STUB_MISSING" ] && [ ! -e "$STUB_INSTALLED" ]; then\n' + lacks
             + 'echo "clippy 0.1.98"\n', newline="\n")
@@ -1220,10 +1221,11 @@ class WindowsJob(Repo):
         for name in ("cargo", "rustc", "rustup"):
             (stubs / name).chmod(0o755)
         # The tree's cargo-guarded.sh: needs a usable stdin, as Python's subprocess and coreutils do,
-        # says where it builds, and fails as STUB_FAIL says (<its first argument>:<exit>).
+        # says where it builds and what it ran, and fails as STUB_FAIL says (<its first argument>:<exit>).
         guarded = ('#!/bin/sh\ncase "$1" in --print-rustflags) echo "-C target-cpu=native"; exit 0 ;; esac\n'
                    f'"{Path(sys.executable).as_posix()}" -c "import os; os.fstat(0)" || exit 9\n'
                    'printf %s "$CARGO_TARGET_DIR" > "$FLEET_OUT/target-dir"\n'
+                   'echo "$*" >> "$FLEET_OUT/guarded"\n'
                    # clippy as cargo runs it: not without the component.
                    '[ "$1" != clippy ] || [ -z "$STUB_MISSING" ] || [ -e "$STUB_INSTALLED" ] || exit 101\n'
                    '[ "${STUB_FAIL%%:*}" != "$1" ] || exit "${STUB_FAIL#*:}"\n')
@@ -1286,29 +1288,47 @@ class WindowsJob(Repo):
         # The toolchain: there; missing, or there without clippy (another job installed the release with
         # a minimal profile), and rustup installs it; or missing and rustup can't install it.
         there, missing, no_clippy, uninstallable = None, ("toolchain", ""), ("clippy", ""), ("toolchain", "1")
-        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain, Python gone -> exit, a record, stdin
-            (tree, "", False, there, False, 0, True, "valid"),
-            ("0" * 40, "", False, there, False, 3, False, None),         # another tree checked out: no verdict
-            (tree, "build:101", False, there, False, 1, True, "valid"),  # a step fails: the tree fails
+        # The cargo-nextest the tree pins (scripts/lib/gate-tools.txt), in the host's cache as the job lays
+        # it out (tools/nextest-<version>): its version command names the pinned version; another; the
+        # pinned one, but the command fails; or none there. Only the first may run: none other can be had.
+        pinned_nextest = re.search(r"^cargo-nextest (\S+)$", (self.repo / "scripts/lib/gate-tools.txt").read_text(),
+                                   re.M).group(1)
+        nextest_entry = cache / "tools" / f"nextest-{pinned_nextest}"
+        pinned, other = f'echo "cargo-nextest {pinned_nextest} (stand-in)"', 'echo "cargo-nextest 0.9.1 (stand-in)"'
+        failing, absent = f'echo "cargo-nextest {pinned_nextest}"; exit 1', None
+        cases = [  # tree sent, STUB_FAIL, stdin closed, toolchain, Python gone, nextest -> exit, a record, stdin
+            (tree, "", False, there, False, pinned, 0, True, "valid"),
+            ("0" * 40, "", False, there, False, pinned, 3, False, None),         # another tree checked out: no verdict
+            (tree, "build:101", False, there, False, pinned, 1, True, "valid"),  # a step fails: the tree fails
             # A lint of code only Windows compiles (cfg(windows)) fails the tree there (PR #68:
             # the Windows tier built and tested it, and linted nothing).
-            (tree, "clippy:101", False, there, False, 1, True, "valid"),
-            (tree, "build:75", False, there, False, 75, True, "valid"),  # the PC guard stopped a build: no verdict
-            (tree, "", True, there, False, 0, True, "invalid"),          # no usable stdin (fleet I14): said, steps get /dev/null
+            (tree, "clippy:101", False, there, False, pinned, 1, True, "valid"),
+            (tree, "build:75", False, there, False, pinned, 75, True, "valid"),  # the PC guard stopped a build: no verdict
+            (tree, "", True, there, False, pinned, 0, True, "invalid"),          # no usable stdin (fleet I14): said, steps get /dev/null
             # A host the fleet places it on by `rust` (rustup) without the tree's pinned release: the job
             # installs that release through rustup, and runs.
-            (tree, "", False, missing, False, 0, True, "valid"),
+            (tree, "", False, missing, False, pinned, 0, True, "valid"),
             # The release there without clippy: installed too, never a failed tree.
-            (tree, "", False, no_clippy, False, 0, True, "valid"),
-            (tree, "", False, uninstallable, False, 3, False, None),     # and if it can't be had: no verdict
+            (tree, "", False, no_clippy, False, pinned, 0, True, "valid"),
+            (tree, "", False, uninstallable, False, pinned, 3, False, None),     # and if it can't be had: no verdict
+            # No pinned cargo-nextest, and none can be had: no verdict, never cargo test crate by crate.
+            (tree, "", False, there, False, absent, 3, False, None),
+            # One of another version, or one whose version command fails: not used, fetched again: no verdict.
+            (tree, "", False, there, False, other, 3, False, None),
+            (tree, "", False, there, False, failing, 3, False, None),
             # The declared Python isn't here and can't be had (the host's own ran the suite): no verdict.
-            (tree, "", False, there, True, 3, False, None),
+            (tree, "", False, there, True, pinned, 3, False, None),
         ]
-        for case, (sent, fail, closed, toolchain, gone, code, recorded, stdin) in enumerate(cases):
+        for case, (sent, fail, closed, toolchain, gone, nextest, code, recorded, stdin) in enumerate(cases):
             out = self.root / f"out-{case}"
             out.mkdir()
             if gone:
                 shutil.rmtree(base.parent)
+            shutil.rmtree(nextest_entry, ignore_errors=True)
+            if nextest:
+                nextest_entry.mkdir(parents=True)
+                (nextest_entry / "cargo-nextest").write_text(f"#!/bin/sh\n{nextest}\n", newline="\n")
+                (nextest_entry / "cargo-nextest").chmod(0o755)
             proxied, rustup = self.root / f"proxied-{case}", self.root / f"rustup-{case}"
             lacking, rustup_fails = toolchain or ("", "")
             run = ("exec 0<&-; " if closed else "") + 'exec bash "$@"'
@@ -1350,6 +1370,13 @@ class WindowsJob(Repo):
                               ("suite contracts", 0), ("console dependencies", 0), ("console typecheck", 0),
                               ("console tests", 0)],
                              f"SPEC windows-run: case {case}")
+            ran_tests = [(c.split()[0], "--doc" in c.split()) for c in (out / "guarded").read_text().splitlines()
+                         if c.split()[0] in ("test", "nextest")]
+            self.assertEqual(ran_tests, [("nextest", False), ("test", True)],
+                             f"SPEC windows-nextest: the tests ran under cargo nextest, cargo test only for the doc"
+                             f" tests: case {case}")
+            self.assertEqual(result["nextest"].split()[:2], ["cargo-nextest", pinned_nextest],
+                             f"SPEC windows-nextest: the record names the nextest it ran: case {case}")
             self.assertEqual(result["attempt"], (out / "attempt").read_text().strip())
             self.assertRegex(result["identity"],
                              rf"^rustc-1\.98\.1-abcdef123456 flags=-C_target-cpu=native tools=[0-9a-f]{{12}} {name}$",

@@ -17,7 +17,10 @@
 # (scripts/lib/gate-key.sh gate_runtime), or there is no verdict; the record states the runtime it
 # ran with, which scripts/lib/fleet-gate.sh checks against the declared one. The console's Node is
 # the pinned one (scripts/lib/gate-tools.txt node), installed under the cache by
-# scripts/lib/gate-node.sh, never the host's.
+# scripts/lib/gate-node.sh, never the host's. The tests run under the pinned cargo-nextest
+# (scripts/lib/gate-tools.txt cargo-nextest), installed under the cache (windows_job_nextest_*), as the
+# Linux gate's: every crate's tests in one run with the workspace's features, never cargo test crate by
+# crate; without it there is no verdict.
 #
 # The fleet starts a Windows step without a usable stdin (fleet backlog I14): Python's subprocess
 # and coreutils fail on it. The job says so after check.sh's summary, records it (`stdin` in
@@ -49,6 +52,23 @@ windows_job_toolchain() {
   windows_job_toolchain_ready && return
   timeout "${NRESE_RUSTUP_DEADLINE_S:-900}" \
     rustup toolchain install "$1" --no-self-update --profile minimal --component rustfmt,clippy
+}
+
+# DIR VERSION: DIR, if its cargo-nextest's version command succeeds and names VERSION.
+windows_job_nextest_is() {
+  local runner
+  runner=$("$1/cargo-nextest" nextest --version 2> /dev/null) || return 1
+  [ "$(printf '%s\n' "$runner" | tr -d '\r' | awk 'NR == 1 { print $2 }')" = "$2" ] || return 1
+  echo "$1"
+}
+
+# PART VERSION: nexte.st's Windows build of cargo-nextest VERSION, unpacked at PART. The cache's one
+# entry maker (scripts/lib/suite-python.sh suite_python_entry) runs it under the cache's lock, aside,
+# and moves PART into place whole once windows_job_nextest_is passes on it; curl's deadline bounds it.
+windows_job_nextest_unpack() {
+  curl -fsSL --max-time 300 -o "$1/nextest.tar.gz" "https://get.nexte.st/$2/windows-tar" \
+    || { echo "get.nexte.st's cargo-nextest $2 didn't download" >&2; return 1; }
+  tar -xzf "$1/nextest.tar.gz" -C "$1" && rm -f -- "$1/nextest.tar.gz"
 }
 
 run() {
@@ -111,6 +131,18 @@ run() {
   nodebin=$(NRESE_PYTHON=python gate_node "$cache" scripts/lib/gate-tools.txt) || infra "no Node for the console"
   echo "$EPOCHSECONDS" > "$nodebin/.last-used"
   export PATH="$nodebin:$PATH"
+  # The pinned cargo-nextest, each version in a directory of its own under the cache, first on PATH.
+  # Then the one the tier gets: cargo looks in $CARGO_HOME/bin before PATH, where a host's own would
+  # stand in. Its version counts only from a version command that succeeded.
+  local want nextest runner
+  want=$(sed -n 's/^cargo-nextest //p' scripts/lib/gate-tools.txt | tr -d '\r')
+  [ -n "$want" ] || infra "the tree pins no cargo-nextest (scripts/lib/gate-tools.txt)"
+  nextest=$(NRESE_PYTHON=python suite_python_entry "$cache/tools/nextest-$want" windows_job_nextest_is \
+    windows_job_nextest_unpack "$want") || infra "no cargo-nextest $want"
+  export PATH="$nextest:$PATH"
+  runner=$(cargo nextest --version 2> /dev/null) || runner=""
+  [ "$(printf '%s\n' "$runner" | tr -d '\r' | awk 'NR == 1 { print $2 }')" = "$want" ] \
+    || infra "cargo nextest is ${runner:-none}, not the pinned cargo-nextest $want (\$CARGO_HOME/bin first)"
 
   local temp
   mkdir -p tmp/windows-job/temp
@@ -131,7 +163,7 @@ run() {
   GATE_RUNTIME=$(suite_python_runtime "$pybin/python") \
     GATE_TIER=windows GATE_TREE=$tree GATE_LIST=$(git hash-object --stdin < /dev/null) GATE_IDENTITY=$identity \
     GATE_CODE=$code GATE_CPU=$(gate_cpu) GATE_HOST=$(hostname) \
-    GATE_NEXTEST=$(cargo nextest --version 2> /dev/null | head -1) \
+    GATE_NEXTEST=${runner%%$'\n'*} \
     GATE_CHANGED=$(git status --porcelain --untracked-files=no) GATE_SECONDS=$((SECONDS - began)) \
     GATE_JOB=${FLEET_JOB:-} GATE_FLEET_HOST=${FLEET_HOST:-} GATE_ATTEMPT=$attempt GATE_STDIN=$stdin \
     python scripts/lib/gate-record.py "$out" || infra "no record of the run"

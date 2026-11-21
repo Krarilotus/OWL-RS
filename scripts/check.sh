@@ -44,9 +44,11 @@
 #                                  the workspace crates the push tier lints and tests for
 #                                  these changed files, one per line; nothing else runs.
 #
-# Tests run under cargo-nextest when it is installed (every test of every binary in
-# parallel; `cargo install --locked cargo-nextest`), else under cargo test, crate by
-# crate. Builds go through scripts/cargo-guarded.sh. Every step runs; the summary lists
+# Tests run under cargo-nextest (every test of every binary in parallel, with the features of
+# the crates the run selects): the fleet's gate jobs install the pinned one
+# (scripts/lib/gate-tools.txt; scripts/lib/gate-job.sh, scripts/lib/windows-job.sh) and give
+# no verdict without it. A local run without it uses cargo test, crate by crate.
+# Builds go through scripts/cargo-guarded.sh. Every step runs; the summary lists
 # each one's exit code.
 #
 # Exit: 0 passed, 1 failed; 75 no verdict: the fleet gave none (push, windows), or the PC's
