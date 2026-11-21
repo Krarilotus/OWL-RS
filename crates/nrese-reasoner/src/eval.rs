@@ -538,6 +538,11 @@ impl<S: Source + ?Sized> Facts for AllFacts<'_, '_, S> {
     fn stopped(&self) -> bool {
         self.1.tick()
     }
+
+    fn charge(&self, units: usize) -> bool {
+        self.1.counted(0..units).for_each(drop);
+        self.1.stopped()
+    }
 }
 
 /// The TBox vocabulary. Atoms over these predicates, and `rdf:type` atoms with these
