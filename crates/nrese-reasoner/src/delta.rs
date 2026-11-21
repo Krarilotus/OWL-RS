@@ -49,7 +49,7 @@ use nrese_exec::Budget;
 use super::batch::{Equality, Store, check, is_replacement};
 use super::eval::{
     AllFacts, GroundProgram, Job, NEVER, Poller, Probe, RuleKey, Schema, Seg, Source, Stop,
-    Stopped, Visit, Visits, instantiate_head, rule_key, run_jobs, run_jobs_acyclic,
+    Stopped, Visit, Visits, WitnessIndex, instantiate_head, rule_key, run_jobs, run_jobs_acyclic,
     transitive_predicate,
 };
 use super::ir::Triple;
@@ -1360,32 +1360,48 @@ fn update_body<B: Base + ?Sized>(
         hidden: &hidden,
         extra: &fresh,
     };
-    let mut full_consistency: Vec<usize> = Vec::new();
-    let mut is_full = vec![false; program.consistency.len()];
-    if matches!(program, Cow::Owned(_)) {
-        for (c, (rule, grounded)) in program.consistency.iter().enumerate() {
-            if !old_program.has_consistency(rule, grounded) {
-                full_consistency.push(c);
-                is_full[c] = true;
+    // When phase 2 borrows the old program, phase 3 only appends instances.
+    let first_full = if program_changed {
+        0
+    } else {
+        old_program.consistency.len()
+    };
+    let rebuilt = if program_changed {
+        let mut full = Vec::with_capacity(program.consistency.len());
+        for (rule, grounded) in &program.consistency {
+            if stage.tick() {
+                return Err(Interrupted::default());
             }
+            full.push(!old_program.has_consistency(rule, grounded));
         }
-    }
+        Some(full)
+    } else {
+        None
+    };
+    let is_full = |c| rebuilt.as_ref().map_or(c >= first_full, |full| full[c]);
+    let full_consistency = (first_full..program.consistency.len()).filter(|&c| is_full(c));
     let variants: Vec<(usize, usize)> = program
         .consistency_variants(&fresh, &stage)
         .map_err(|Stopped| Interrupted::default())?
         .into_iter()
-        .filter(|&(c, _)| !is_full[c])
+        .filter(|&(c, _)| !is_full(c))
         .collect();
     // An instance with a changed guard can still give the same witness. Test each
     // candidate against the old state before recording it in the report.
     let deleted_facts = OnceCell::new();
+    let old_witnesses = OnceCell::new();
     let was_present = |name: &str, bindings: &[Option<u64>], poll: &Poller<'_>| {
+        let Some(index) = old_witnesses
+            .get_or_init(|| WitnessIndex::new(old_program, memory, operation, poll).ok())
+        else {
+            return Err(Stopped);
+        };
         let before = Overlay {
             base,
             hidden: &inserted_set,
             extra: deleted_facts.get_or_init(|| Store::new(deleted.to_vec())),
         };
-        old_program.has_witness(&before, name, bindings, poll)
+        index.contains(&before, name, bindings, poll)
     };
     let exclude_old = (!deleted.is_empty() && !old_program.consistency.is_empty())
         .then_some(&was_present as &super::batch::WitnessFilter<'_>);
@@ -1399,6 +1415,8 @@ fn update_body<B: Base + ?Sized>(
         stop,
         exclude_old,
     )?;
+    // The index borrows the old program, which may be moved into the result below.
+    drop(old_witnesses);
     check_stop()?;
     result.violations = found;
     lap(4, &mut result);
