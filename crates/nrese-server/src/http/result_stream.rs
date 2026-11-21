@@ -982,6 +982,82 @@ mod tests {
         assert_eq!(memory.used(), 0);
     }
 
+    /// Over HTTP/1.0, the answer held by a producer whose own work (a query's) draws on the
+    /// same envelope as the hold, and which is refused there after writing `CHUNK_BYTES * 2`
+    /// and ending with what its refusal is mapped to (`stopped`): the response; the envelope
+    /// is checked to hold nothing after it.
+    async fn refused_beside_its_held_answer(memory: Envelope, stopped: ApiError) -> Response {
+        let work = memory.clone();
+        let held = memory.clone();
+        let answer = WHOLE
+            .scope(
+                true,
+                stream_blocking(
+                    Pace::Total(Instant::now() + Duration::from_secs(120)),
+                    CancellationToken::new(),
+                    move || held,
+                    "text/plain",
+                    "timeout",
+                    move |writer| {
+                        io::Write::write_all(writer, &vec![b'x'; 2 * CHUNK_BYTES])
+                            .and_then(|()| io::Write::flush(writer))
+                            .map_err(|error| ApiError::internal(error.to_string()))?;
+                        // Its work grows once the hold holds what it wrote, and is refused.
+                        for _ in 0..60_000 {
+                            if work.used() >= 2 * CHUNK_BYTES {
+                                break;
+                            }
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        let part = work.part();
+                        assert!(part.charge(2 << 20).is_err(), "its work fits after all");
+                        Err(stopped)
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(memory.used(), 0, "the refused answer still holds memory");
+        answer
+            .expect_err("its work refused, no answer")
+            .into_response()
+    }
+
+    /// Over HTTP/1.0, a query's work and its answer held whole draw on one envelope: refused
+    /// there while part of the answer is held, the query was refused for holding it. It gets
+    /// the 413 of an answer too large for HTTP/1.0, which tells the client to stream it, not
+    /// the query's own, which tells it to raise the query's memory (over HTTP/1.1 the same
+    /// query in the same envelope would be answered); or, where the memory all queries share
+    /// refused it, the 503 that may be retried.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_producers_work_refused_beside_its_held_answer_is_the_answers_refusal() {
+        let own = refused_beside_its_held_answer(
+            Envelope::new(Some(1 << 20), None),
+            ApiError::payload_too_large("the query's own (budgets.query_memory)"),
+        )
+        .await;
+        assert_eq!(own.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        let body = axum::body::to_bytes(own.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let problem: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let detail = problem["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.starts_with("This answer is larger than the 1 MiB an HTTP/1.0 request"),
+            "{detail}"
+        );
+
+        let shared = refused_beside_its_held_answer(
+            Envelope::new(Some(1 << 30), Some(nrese_exec::SharedBudget::new(1 << 20))),
+            ApiError::unavailable("the query's own (budgets.total_query_memory)"),
+        )
+        .await;
+        assert_eq!(shared.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            shared.headers().get(header::RETRY_AFTER),
+            Some(&HeaderValue::from_static("1"))
+        );
+    }
+
     /// Over HTTP/1.0, a client that takes part of a held answer and then stops reading,
     /// without leaving, keeps none of it once the stall bound has passed: what was held goes
     /// back, and the body ends with an error, short of its length, never cleanly.
