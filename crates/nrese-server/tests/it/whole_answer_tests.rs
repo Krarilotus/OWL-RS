@@ -8,7 +8,7 @@ use std::error::Error;
 use std::time::Duration;
 
 use axum::body::{Body, to_bytes};
-use axum::http::{Request, StatusCode, Version, header};
+use axum::http::{HeaderValue, Request, StatusCode, Version, header};
 use nrese_reasoner::ReasonerConfig;
 use nrese_server::auth::{AuthConfig, StaticBearerConfig};
 use nrese_server::policy::PolicyConfig;
@@ -98,6 +98,34 @@ async fn an_http10_answer_past_its_envelope_is_refused_and_its_memory_released()
          whole. Ask over HTTP/1.1 or HTTP/2, which stream it. Behind a reverse proxy, set the \
          proxy's upstream HTTP version to 1.1 (for nginx: `proxy_http_version 1.1;`)."
     );
+    released_to(&store, before).await;
+    Ok(())
+}
+
+/// While the memory all queries share is taken, an HTTP/1.0 answer that outgrows it is turned
+/// away for now, as any request that can't have its memory: 503 with `Retry-After: 1`, and
+/// what it held goes back. Its own envelope (4 GiB) has room; the shared total (1 MiB) not.
+#[tokio::test]
+async fn an_http10_answer_past_the_shared_memory_is_turned_away_for_now()
+-> Result<(), Box<dyn Error>> {
+    let store = StoreService::new(StoreConfig {
+        total_query_memory_bytes: 1 << 20,
+        ..StoreConfig::in_memory()
+    })?;
+    let app = test_app_with_store(
+        store.clone(),
+        PolicyConfig::default(),
+        ReasonerConfig::default(),
+    )?;
+    let before = held(&store);
+    let response = app.oneshot(query_request(Version::HTTP_10)?).await?;
+    let status = response.status();
+    let retry = response.headers().get(header::RETRY_AFTER).cloned();
+    let problem: serde_json::Value =
+        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await?)?;
+    eprintln!("{status}; retry-after {retry:?}; {problem}");
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(retry, Some(HeaderValue::from_static("1")));
     released_to(&store, before).await;
     Ok(())
 }
