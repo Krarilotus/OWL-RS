@@ -193,7 +193,7 @@ def quiet_label() -> list[str]:
     """The quiet slot's token as a container label: the measurement's own containers."""
     token = ENV.get("NRESE_QUIET_TOKEN") or os.environ.get("NRESE_QUIET_TOKEN")
     labels = ["--label", f"nrese.quiet={token}"] if token else []
-    # A queue job's containers: its host's guard stops them with the job (benches/suite/measurement_queue.py).
+    # A queue job's containers: its host's guard stops them with the job (the measurement queue before the fleet).
     if os.environ.get("QUEUE_JOB"):
         labels += ["--label", f"nrese.queue={os.environ['QUEUE_JOB']}"]
     return labels

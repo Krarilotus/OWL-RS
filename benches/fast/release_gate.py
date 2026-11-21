@@ -2073,7 +2073,7 @@ def measured_at(repo: str, rev: str, sides: dict[str, str] | None = None) -> str
 
 
 def stop_tree(process) -> str | None:
-    """Stops `process` and everything it started, at once (benches/suite/measurement_queue.py's stop, without its
+    """Stops `process` and everything it started, at once (the pre-fleet measurement queue's stop, without its
     grace): on Windows taskkill /T, elsewhere its process group, which it must lead; then the
     process itself, whatever the tree's stop did. What may still run, or None."""
     import subprocess

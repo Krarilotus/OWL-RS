@@ -58,7 +58,7 @@ ROOT = HERE.parents[2]
 sys.path.insert(0, str(ROOT / "benches/suite"))
 sys.path.insert(0, str(HERE.parent))
 
-from suitekit import quiet  # noqa: E402
+from suitekit import hosts, quiet  # noqa: E402
 from suitekit.adapters import Context, Nrese, adapter, images_for  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec, memory_fields  # noqa: E402
@@ -83,10 +83,11 @@ def changes_dir(tier: str) -> Path:
 
 
 def bench_data() -> Path:
-    if setting("BENCH_DATA"):
-        return Path(setting("BENCH_DATA"))
-    hosts = tomllib.loads((ROOT / "benches/hosts.toml").read_text(encoding="utf-8"))
-    return Path(hosts["assets"]["root"]) / hosts["inputs"]["data"]["path"]
+    """The suite's datasets: BENCH_DATA, else the verified inputs' copy on a host that holds them."""
+    found = hosts.input_path("data")
+    if found is None:
+        sys.exit("no datasets here: set BENCH_DATA (benches/hosts.toml inputs.data)")
+    return found
 
 
 # --- prepare: the change sets ---------------------------------------------------------------------

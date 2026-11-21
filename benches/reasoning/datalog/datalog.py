@@ -53,7 +53,7 @@ sys.path.insert(0, str(HERE.parent))
 sys.path.insert(0, str(ROOT / "benches/suite"))
 
 import program as P  # noqa: E402
-from suitekit import ns, quiet  # noqa: E402
+from suitekit import hosts, ns, quiet  # noqa: E402
 from suitekit.manifest import Manifest  # noqa: E402
 from suitekit.runtime import DockerRuntime, Mount, Spec, memory_fields  # noqa: E402
 from suitekit.schema import Result, Writer  # noqa: E402
@@ -189,7 +189,10 @@ def prepare(case: dict):
         prepare_lubm(case, target)
     elif kind == "frozen":
         # A frozen dataset of benches/datasets.toml (BENCH_DATA), linked, never copied.
-        source = Path(setting("BENCH_DATA", "/home/krarilotus/nrese-assets/kraris-gptler-20261009/snapshots/windows/nrese-data")) / case["file"]
+        data = hosts.input_path("data")
+        if data is None:
+            raise SystemExit("no frozen datasets here: set BENCH_DATA (benches/hosts.toml inputs.data)")
+        source = data / case["file"]
         got = sha256(source) if not (target / "facts.nt").exists() else case["sha256"]
         if got != case["sha256"]:
             raise SystemExit(f"{source}: SHA-256 {got}, the registry pins {case['sha256']}")

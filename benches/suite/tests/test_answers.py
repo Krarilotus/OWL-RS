@@ -732,11 +732,64 @@ class Hosts(unittest.TestCase):
                          {"host": "timed-a", "config": "2026-10-09", "governor": None})
         self.assertEqual(hosts.run_identity({"host": "laptop"}, "2026-10-12", registry)["config"], "-")
 
-    def test_the_repository_registry_reads(self):
-        registry = hosts.load()
-        self.assertIn("build", registry["host"]["office-pc"]["roles"])
-        for entry in registry["inputs"].values():
-            self.assertFalse(entry["path"].startswith("/"), "inputs are relative to assets.root")
+    # The private overlay (benches/hosts.toml's header): NRESE_BENCH_PRIVATE names a folder whose
+    # hosts.toml is merged over the public one, table by table, a key in both taking the overlay's value.
+    PUBLIC = ('[inputs]\nore = { env = "NRESE_ORE_DIR", what = "ORE 2015" }\n'
+              '[volumes]\nfast = { name = "nrese-fast-data", env = "NRESE_FAST_VOLUME", what = "the fast data" }\n'
+              'data = { name = "nrese-bench-data", env = "NRESE_BENCH_VOLUME" }\n')
+    OVERLAY = ('[assets]\nroot = "/assets"\n[inputs]\nore = { path = "ore/files" }\n'
+               '[volumes]\nfast = { name = "private-fast" }\n'
+               '[host.timed-a]\nhostname = "Timed-A"\nassets = true\nhas = []\n'
+               '[[host.timed-a.config]]\nsince = "2026-10-12T13:00"\ngovernor = "performance"\n')
+
+    def fixture(self) -> tuple[Path, Path]:
+        """A public hosts.toml and an overlay folder holding its own, each the test's own."""
+        tmp = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        (tmp / "overlay").mkdir()
+        (tmp / "hosts.toml").write_text(self.PUBLIC, encoding="utf-8")
+        (tmp / "overlay" / "hosts.toml").write_text(self.OVERLAY, encoding="utf-8")
+        return tmp / "hosts.toml", tmp / "overlay"
+
+    def test_without_an_overlay_the_repository_registry_registers_no_host(self):
+        # Spec: benches/hosts.toml holds what holds on any machine; without the overlay
+        # current() is None, configuration() None, input_path() the variable or None.
+        with patch.dict("os.environ", {"NRESE_BENCH_PRIVATE": ""}):
+            registry = hosts.load()
+        self.assertNotIn("host", registry)
+        self.assertNotIn("assets", registry)
+        for kind, entry in registry["inputs"].items():
+            self.assertNotIn("path", entry, f"inputs.{kind}: a path belongs to the overlay")
+        self.assertIsNone(hosts.current(registry, "Timed-A"))
+        self.assertIsNone(hosts.configuration("timed-a", "2026-10-12", registry))
+        self.assertIsNone(hosts.input_path("ore", registry, "Timed-A", {}))
+        self.assertEqual(hosts.input_path("ore", registry, "Timed-A", {"NRESE_ORE_DIR": "/x"}), Path("/x"))
+
+    def test_the_overlay_named_by_its_variable_registers_its_hosts(self):
+        public, overlay = self.fixture()
+        with patch.dict("os.environ", {"NRESE_BENCH_PRIVATE": str(overlay)}):
+            registry = hosts.load(public)
+        found = hosts.current(registry, "Timed-A")
+        self.assertEqual(found and found[0], "timed-a")
+        self.assertEqual(hosts.configuration("timed-a", "2026-10-12T14:00", registry)["governor"], "performance")
+        self.assertEqual(hosts.input_path("ore", registry, "Timed-A", {}), Path("/assets/ore/files"))
+        self.assertEqual(hosts.input_path("ore", registry, "Timed-A", {"NRESE_ORE_DIR": "/x"}), Path("/x"))
+        with patch.dict("os.environ", {"NRESE_BENCH_PRIVATE": ""}):
+            self.assertIsNone(hosts.current(hosts.load(public), "Timed-A"), "unset, the overlay isn't read")
+
+    def test_a_key_in_both_takes_the_overlays_value_and_the_rest_of_its_table_stays(self):
+        public, overlay = self.fixture()
+        with patch.dict("os.environ", {"NRESE_BENCH_PRIVATE": str(overlay)}):
+            registry = hosts.load(public)
+        self.assertEqual(hosts.volume("fast", registry, {}), "private-fast")
+        self.assertEqual(hosts.volume("fast", registry, {"NRESE_FAST_VOLUME": "mine"}), "mine")
+        self.assertEqual(registry["volumes"]["fast"]["what"], "the fast data")
+        self.assertEqual(hosts.volume("data", registry, {}), "nrese-bench-data")
+
+    def test_a_variable_naming_no_overlay_is_an_error(self):
+        public, overlay = self.fixture()
+        with patch.dict("os.environ", {"NRESE_BENCH_PRIVATE": str(overlay / "missing")}), \
+                self.assertRaises(FileNotFoundError):
+            hosts.load(public)
 
 
 if __name__ == "__main__":

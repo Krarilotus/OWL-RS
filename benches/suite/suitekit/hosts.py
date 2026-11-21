@@ -1,6 +1,8 @@
-"""benches/hosts.toml: the benchmark hosts, their roles and what they have, and the verified
-shared inputs on hosts that hold the preserved assets.
+"""benches/hosts.toml: what the bench drivers read about a host (inputs, volumes, caches), and,
+from a private overlay, the hosts themselves and the verified inputs on those that hold them.
 
+    load()               benches/hosts.toml, with the overlay's hosts.toml merged over it when
+                         NRESE_BENCH_PRIVATE names an overlay folder
     current()            the host this process runs on: (key, entry), or None
     input_path(kind)     an input's path here: its environment variable, else hosts.toml
     lacking(needs)       what of `needs` this registered host doesn't have (an unregistered
@@ -19,11 +21,32 @@ import tomllib
 from pathlib import Path
 
 HOSTS = Path(__file__).resolve().parents[2] / "hosts.toml"
+# The private overlay's folder: its hosts.toml adds the hosts, [assets] and the inputs' paths.
+# Unset, no host is registered, as for an unregistered host.
+PRIVATE = "NRESE_BENCH_PRIVATE"
 
 
-def load(path: Path = HOSTS) -> dict:
+def merged(public: dict, overlay: dict) -> dict:
+    """`overlay` over `public`, table by table: a key in both takes the overlay's value, except
+    that two tables merge the same way."""
+    out = dict(public)
+    for key, value in overlay.items():
+        out[key] = merged(out[key], value) if isinstance(value, dict) and isinstance(out.get(key), dict) else value
+    return out
+
+
+def load(path: Path = HOSTS, environ: dict | None = None) -> dict:
+    environ = os.environ if environ is None else environ
     with open(path, "rb") as f:
-        return tomllib.load(f)
+        registry = tomllib.load(f)
+    if not environ.get(PRIVATE):
+        return registry
+    overlay = Path(environ[PRIVATE]) / "hosts.toml"
+    try:
+        with open(overlay, "rb") as f:
+            return merged(registry, tomllib.load(f))
+    except FileNotFoundError:
+        raise FileNotFoundError(f"{PRIVATE} names {environ[PRIVATE]}, which has no hosts.toml") from None
 
 
 def current(registry: dict | None = None, name: str | None = None) -> tuple[str, dict] | None:
@@ -48,7 +71,7 @@ def input_path(kind: str, registry: dict | None = None, name: str | None = None,
     if entry.get("env") and environ.get(entry["env"]):
         return Path(environ[entry["env"]])
     found = current(registry, name)
-    if found and found[1].get("assets"):
+    if found and found[1].get("assets") and entry.get("path"):
         return Path(registry["assets"]["root"]) / entry["path"]
     return None
 
