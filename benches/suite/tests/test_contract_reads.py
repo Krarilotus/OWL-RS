@@ -3,6 +3,7 @@
 Spec (the order for pkg/contracts-by-reads, 21 Nov 2026): "each contract declares what it reads, the
 gate runs it when one of those changed, and a contract that declares nothing always runs". A change
 to what every contract reads (the runner, the selector, the suite's Python and packages) runs them all.
+The push tier (scripts/check.sh) runs what its files reach, the crate scan as its own step.
 
 Honesty, here, by reading the contracts' sources: every declared read names a file this repository
 tracks, and every repository file a contract names (`ROOT / "a" / "b"`, the paths it copies into a
@@ -14,6 +15,8 @@ Run: python benches/suite/tests/isolation.py test_contract_reads
 An assertion tagged `SPEC <tag>` states the behaviour its test is for.
 """
 import ast
+import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +26,7 @@ from itertools import combinations
 from pathlib import Path, PurePosixPath
 
 import contracts
+import isolation  # the suite's git environment policy (inherit())
 
 ROOT = Path(__file__).resolve().parents[3]
 TESTS = contracts.TESTS
@@ -136,6 +140,91 @@ class Command(unittest.TestCase):
         done = subprocess.run([sys.executable, f"{TESTS}/contracts.py", "pick"], cwd=self.repo, capture_output=True,
                               text=True, input="", timeout=60)
         self.assertEqual((done.returncode, done.stdout), (2, ""), "SPEC command: a failure selects nothing itself")
+
+
+# The push tier's stand-ins, each call one line in $FAKE/calls: cargo (metadata: no package), the
+# guards it runs for files under benches/ and scripts/, and the suite's runner, which records the
+# contracts it was given.
+CARGO = '#!/bin/sh\necho "cargo $*" >> "$FAKE/calls"\n[ "$1" != metadata ] || echo \'{"packages":[]}\'\nexit 0\n'
+STUBS = {
+    "scripts/fetch-w3c-tests.sh": "#!/bin/sh\nexit 0\n",
+    "scripts/check-names.sh": "#!/bin/sh\nexit 0\n",
+    f"{TESTS}/isolation.py": 'import os, sys\nopen(os.environ["FAKE"] + "/calls", "a")'
+                             '.write("suite " + " ".join(sys.argv[1:]) + "\\n")\n',
+    f"{TESTS}/test_a.py": 'READS = ("docs/a.txt",)\n',
+    f"{TESTS}/crate_scan.py": 'READS = ("crates/**/src/**/*.rs",)\n',
+    f"{TESTS}/test_c.py": "import os\n",
+}
+
+
+@unittest.skipUnless(shutil.which("bash") and shutil.which("git"), "the push tier is a bash script")
+class PushTier(unittest.TestCase):
+    """scripts/check.sh push, as a build host runs it over the gate's file list, in a repository of
+    its own with this selector, a declaring contract, the crate scan and a contract that declares
+    nothing."""
+
+    def setUp(self):
+        temp =tempfile.TemporaryDirectory(prefix="contract-reads-tier-")
+        self.addCleanup(temp.cleanup)
+        root = Path(temp.name)
+        self.fake, self.repo, self.files = root / "fake", root / "repo", root / "files"
+        (self.fake / "bin").mkdir(parents=True)
+        (self.fake / "bin" / "cargo").write_text(CARGO, newline="\n")
+        (self.fake / "bin" / "cargo").chmod(0o755)
+        gitconfig = root / "gitconfig"
+        gitconfig.write_text("[user]\n\tname = t\n\temail = t@t\n[core]\n\tautocrlf = false\n")
+        self.env = isolation.inherit(
+            "NRESE_", "FLEET_", "CARGO_BUILD_", "CARGO_TARGET_DIR",
+            git={"GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": gitconfig.as_posix()},
+            PATH=(self.fake / "bin").as_posix() + os.pathsep + os.environ.get("PATH", ""),
+            FAKE=self.fake.as_posix(), NRESE_ON_BUILD_HOST="1", NRESE_FILES_FROM=self.files.as_posix())
+        (self.repo / "scripts").mkdir(parents=True)
+        shutil.copy(ROOT / "scripts/check.sh", self.repo / "scripts/check.sh")
+        (self.repo / TESTS).mkdir(parents=True)
+        shutil.copy(ROOT / TESTS / "contracts.py", self.repo / TESTS / "contracts.py")
+        for rel, text in STUBS.items():
+            (self.repo / rel).write_text(text, newline="\n")
+        for args in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "base"],
+                     ["update-ref", "refs/remotes/origin/refactor/engine-v2", "HEAD"]):
+            subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True, env=self.env,
+                           timeout=60)
+
+    def tier(self, *changed):
+        """The runner's calls and the summary's contract steps of a push tier over CHANGED."""
+        (self.fake / "calls").unlink(missing_ok=True)
+        self.files.write_text("".join(f"{f}\n" for f in changed), newline="\n")
+        done = subprocess.run([shutil.which("bash"), "scripts/check.sh", "push"], cwd=self.repo, capture_output=True,
+                              text=True, env=self.env, timeout=120, stdin=subprocess.DEVNULL)
+        out = done.stdout + done.stderr
+        self.assertEqual(done.returncode, 0, out)
+        calls = (self.fake / "calls").read_text().splitlines() if (self.fake / "calls").exists() else []
+        steps = re.findall(r"(?m)^  0  (crate scan|suite contracts) \(", done.stdout)
+        return [c for c in calls if c.startswith("suite")], steps, out
+
+    def test_it_runs_the_contracts_the_change_reaches_and_the_crate_scan_as_its_own_step(self):
+        cases = [  # changed files -> the runner's calls, the summary's steps
+            (["docs/a.txt"], ["suite test_a test_c"], ["suite contracts"]),
+            (["crates/x/src/lib.rs"], ["suite crate_scan", "suite test_c"], ["crate scan", "suite contracts"]),
+            (["docs/b.txt"], ["suite test_c"], ["suite contracts"]),
+            (["benches/suite/requirements.txt"], ["suite crate_scan", f"suite discover -s {TESTS}"],
+             ["crate scan", "suite contracts"]),
+        ]
+        for changed, calls, steps in cases:
+            with self.subTest(changed=changed):
+                ran, named, out = self.tier(*changed)
+                self.assertEqual(ran, calls, f"SPEC push-select: what {changed} reaches, once each:\n{out}")
+                self.assertEqual(named, steps, f"SPEC push-select: the crate scan its own step:\n{out}")
+
+    def test_where_no_contract_is_reached_none_runs(self):
+        (self.repo / TESTS / "test_c.py").write_text('READS = ("docs/c.txt",)\n', newline="\n")
+        ran, named, out = self.tier("docs/b.txt")
+        self.assertEqual((ran, named), ([], []), f"SPEC push-select: none reached, none run:\n{out}")
+
+    def test_where_the_selector_fails_every_contract_runs(self):
+        (self.repo / TESTS / "contracts.py").write_text("import sys\nsys.exit(1)\n", newline="\n")
+        ran, named, out = self.tier("docs/a.txt")
+        self.assertEqual(ran, ["suite crate_scan", f"suite discover -s {TESTS}"],
+                         f"SPEC push-select: a failing selector runs every contract:\n{out}")
 
 
 # What a contract names, read from its source: the module-level names bound to a directory of this

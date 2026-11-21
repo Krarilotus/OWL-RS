@@ -68,6 +68,11 @@ STUBS = {
                                      '.write("names " + " ".join(sys.argv[1:]) + "\\n")\n'
                                      'sys.exit(os.path.exists(os.environ["FAKE"] + "/undefined"))\n',
     "benches/suite/tests/isolation.py": 'import os\nopen(os.environ["FAKE"] + "/calls", "a").write("suite\\n")\n',
+    # A contract of the gate's scripts and hooks, which the push tier selects by what it reads
+    # (benches/suite/tests/contracts.py, copied in as it is).
+    "benches/suite/tests/test_gate.py": 'READS = ("scripts/", ".githooks/")\n',
+    # And one they don't reach: reaching every contract, a change would run them all.
+    "benches/suite/tests/test_other.py": 'READS = ("docs/other.md",)\n',
 }
 
 
@@ -99,6 +104,7 @@ class PushTier(unittest.TestCase):
         for rel, text in STUBS.items():
             (self.repo / rel).parent.mkdir(parents=True, exist_ok=True)
             (self.repo / rel).write_text(text, newline="\n")
+        shutil.copy(ROOT / "benches/suite/tests/contracts.py", self.repo / "benches/suite/tests/contracts.py")
         for args in (["add", "-A"], ["commit", "-q", "-m", "base"],
                      ["update-ref", "refs/remotes/origin/refactor/engine-v2", "HEAD"]):
             subprocess.run(["git", "-C", str(self.repo), *args], check=True, capture_output=True, env=self.env)
