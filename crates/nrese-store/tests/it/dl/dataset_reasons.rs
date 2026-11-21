@@ -130,6 +130,31 @@ fn a_read_of_the_default_graph_by_graph_keeps_the_fallbacks_reason() {
     );
 }
 
+/// A read by a variable graph that its dataset (`FROM NAMED :g2`) binds only to `:g2`: it
+/// never reaches the store's default graph.
+const BY_VARIABLE: &str = "SELECT ?x FROM :g2 FROM NAMED :g2 WHERE { GRAPH ?g { ?x a :Animal } }";
+
+/// The end of the fallback's cause for a read that may leave the RL closure out.
+const NOT_CHECKED: &str = ": not checked against the bounds";
+
+/// Spec: a read that may reach the store's default graph only by a variable graph
+/// (`GRAPH ?g`) isn't told it answers over the RL closure, which it may not read: without the
+/// bounds' view it is told why (the request's time was up) and that its answers aren't
+/// checked against the bounds.
+#[test]
+fn a_read_by_a_variable_graph_names_no_rl_closure() {
+    let dl = store();
+    let header = told(dl.store(), &ReadScope::All, BY_VARIABLE, true);
+    println!("DATASET variable graph, no view: {header}");
+    assert!(
+        header.starts_with("sound-only; regime=owl2-dl;")
+            && header.contains(TIME_UP)
+            && header.contains(NOT_CHECKED)
+            && !header.contains(OVER_THE_CLOSURE),
+        "{header}"
+    );
+}
+
 /// The `NRESE-Completeness` header of `query` (over [`PREFIXES`]) read inside a transaction
 /// with one operation pending, an unrelated addition.
 fn pending(store: &StoreService, query: &str) -> String {
@@ -188,4 +213,18 @@ fn a_pending_read_of_the_default_graph_by_graph_keeps_the_pending_cause() {
     let header = pending(dl.store(), query);
     println!("DATASET pending alias: {header}");
     assert!(header.contains(PENDING_CLOSURE), "{header}");
+}
+
+/// Spec: inside a transaction, a read that may reach the store's default graph only by a
+/// variable graph (`GRAPH ?g`) is told that its pending operations aren't reasoned over and
+/// that it has no DL bounds; nothing of a committed closure it may not read.
+#[test]
+fn a_pending_read_by_a_variable_graph_names_no_committed_closure() {
+    let dl = store();
+    let header = pending(dl.store(), BY_VARIABLE);
+    println!("DATASET pending variable graph: {header}");
+    assert!(
+        header.contains(PENDING_NO_BOUNDS) && !header.contains("committed closure"),
+        "{header}"
+    );
 }
