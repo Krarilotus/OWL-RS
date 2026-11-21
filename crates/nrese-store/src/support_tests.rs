@@ -660,11 +660,13 @@ fn read(
     answered
 }
 
-/// Holds the caller until a reader waits on the latch at `point` (for a view, `access`'s).
-/// A `OnceLock` counts no waiters: the reader is given the 1 s of row 12's run to get there.
+/// Holds the caller until a reader waits on the latch at `point` (for a view, `access`'s):
+/// polled, as a waiter's count dips between its sleeps.
 fn until_joined(supports: &Supports, point: gate::Point, access: Option<&GraphAccess>) {
-    let _ = (supports, point, access);
-    std::thread::sleep(std::time::Duration::from_secs(1));
+    until(
+        || supports.waiting(point, access) >= 1,
+        "no reader waited on the latch",
+    );
 }
 
 /// Spec (`Supports::view`: `Err` when the reading query is cancelled): a reader waiting on a

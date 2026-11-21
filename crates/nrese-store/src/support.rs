@@ -49,6 +49,7 @@ use nrese_engine::{
     CountedSnapshot, EncodedQuad, EngineError, GraphSelector, InferredMask, PendingView,
     PrivateTransaction, QuadPattern, ReadModel, Snapshot, TermId, Transaction,
 };
+use nrese_exec::cell::{BuildCell, Claim, End, Ended, Joined, Kind};
 use nrese_exec::{Budget, BudgetExceeded, ChargedVec, Envelope, Reservation};
 use nrese_reasoner::RuleProgram;
 use nrese_reasoner::eval::{Poller, Probe, Seg, Stopped as ReadStopped, Visit, Visits};
@@ -1699,8 +1700,78 @@ fn bound_pattern([s, p, o]: [Option<u64>; 3]) -> QuadPattern {
     }
 }
 
-/// One revision's sets, computed once (or not: a failure is kept by no one).
-type Cell = Shared<OnceLock<Result<Option<Shared<SupportSets>>, Unavailable>>>;
+/// A value computed once and kept (a failure too, until [`Supports::drop_failed`] forgets
+/// its slot), and its computation under way: one at a time, and a reader that waits for
+/// another's leaves at its own cancellation ([`get_or_build`]).
+struct Slot<V> {
+    /// Set once, by the builder only.
+    kept: OnceLock<Arc<V>>,
+    build: BuildCell<(), V>,
+}
+
+impl<V> Default for Slot<V> {
+    fn default() -> Self {
+        Self {
+            kept: OnceLock::new(),
+            build: BuildCell::default(),
+        }
+    }
+}
+
+impl<V> Slot<V> {
+    /// The value kept, if computed.
+    fn get(&self) -> Option<&V> {
+        self.kept.get().map(|value| &**value)
+    }
+}
+
+impl<V> std::fmt::Debug for Slot<V> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Slot")
+            .field("kept", &self.kept.get().is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// `slot`'s value: kept, built here by `build`, or another's build joined until `stop`
+/// fires (`None`: this caller left; that build goes on and keeps its value). A builder keeps
+/// its value, a failure too, before its waiters are told it. One that ends with none (a
+/// panic) leaves the next claim to build. On a Rayon worker, which never waits, it builds
+/// its own and keeps nothing.
+fn get_or_build<T: Clone + Send + Sync + 'static>(
+    slot: &Slot<T>,
+    stop: &dyn Fn() -> bool,
+    build: impl FnOnce() -> T,
+) -> Option<T> {
+    let builder = loop {
+        let kept = || slot.kept.get().map(|value| Some(Arc::clone(value)));
+        match slot.build.claim((), Kind::Opaque, kept) {
+            Claim::Build(builder) => break Some(builder),
+            Claim::Wait(flight) => match flight.join(None, stop) {
+                Joined::Told(Ended::End(End::Kept(value) | End::Unkept(Some(value)))) => {
+                    return Some(T::clone(&value));
+                }
+                // Its builder named no end (a panic), or one these builders never name: the
+                // next claim builds.
+                Joined::Told(
+                    Ended::End(End::Empty | End::Later | End::Unkept(None)) | Ended::Abandoned,
+                ) => {}
+                Joined::Busy => break None,
+                Joined::Left => return None,
+            },
+        }
+    };
+    let value = build();
+    if let Some(builder) = builder {
+        let value = Arc::new(value.clone());
+        let _ = slot.kept.set(Arc::clone(&value));
+        builder.end(End::Kept(value));
+    }
+    Some(value)
+}
+
+/// One revision's sets, computed once (a failure kept until it is forgotten).
+type Cell = Shared<Slot<Result<Option<Shared<SupportSets>>, Unavailable>>>;
 
 /// The asserted facts of a revision that follow from its other facts without their own
 /// assertion ([`nrese_reasoner::graph_sets::rederived`]; a cycle through the fact supports
@@ -1734,11 +1805,11 @@ impl Rederived {
     }
 }
 
-/// One revision's re-derived facts, computed once (or not: a failure is kept by no one).
-type Rederiving = Shared<OnceLock<Result<Shared<Rederived>, Unavailable>>>;
+/// One revision's re-derived facts, computed once (a failure kept until it is forgotten).
+type Rederiving = Shared<Slot<Result<Shared<Rederived>, Unavailable>>>;
 
 /// A reader's view of one revision, computed once.
-type ViewCell = Shared<OnceLock<Result<Snapshot, Unavailable>>>;
+type ViewCell = Shared<Slot<Result<Snapshot, Unavailable>>>;
 
 /// The views of one revision, by access.
 type View = (Arc<GraphAccess>, ViewCell);
@@ -1808,6 +1879,30 @@ mod gate {
     impl std::fmt::Debug for Gate {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.debug_struct("Gate").finish_non_exhaustive()
+        }
+    }
+
+    impl super::Supports {
+        /// Readers asleep on the latest revision's latch at `point` (a view's: `access`'s).
+        /// A waiter's count dips between its sleeps: poll it.
+        pub(super) fn waiting(
+            &self,
+            point: Point,
+            access: Option<&nrese_sparql::GraphAccess>,
+        ) -> usize {
+            let state = self.state();
+            let Some((_, cell, rederiving, views)) = state.latest.as_ref() else {
+                return 0;
+            };
+            match point {
+                Point::Sets => cell.build.waiting(&()),
+                Point::Rederived => rederiving.build.waiting(&()),
+                Point::View => views
+                    .iter()
+                    .filter(|(seen, _)| access.is_some_and(|access| **seen == *access))
+                    .map(|(_, view)| view.build.waiting(&()))
+                    .sum(),
+            }
         }
     }
 }
@@ -1923,8 +2018,8 @@ impl State {
         {
             self.latest = Some((
                 snapshot.clone(),
-                Shared::new(OnceLock::new(), kept)?,
-                Shared::new(OnceLock::new(), kept)?,
+                Shared::new(Slot::default(), kept)?,
+                Shared::new(Slot::default(), kept)?,
                 ChargedVec::new(Arc::clone(kept)),
             ));
         }
@@ -2245,10 +2340,12 @@ impl Supports {
                     budget: Arc::new(memory.part()),
                     cancellation: None,
                 };
-                let sets = cell.get_or_init(|| {
+                // A reader's build under way is joined, with no stop: it ends at that
+                // builder's drop, and one that named no end leaves this thread to build.
+                let sets = get_or_build(&cell, &|| false, || {
                     supports.compute(&snapshot, &generation, compilation, &working)
                 });
-                if let Err(error) = sets {
+                if let Some(Err(error)) = sets {
                     tracing::warn!(?error, "support graph sets not prepared");
                     supports.drop_failed(&snapshot, &cell, None, None);
                 }
@@ -2393,7 +2490,7 @@ impl Supports {
                     if views.len() >= VIEWS {
                         without_first(views);
                     }
-                    let view = Shared::new(OnceLock::new(), &self.kept)?;
+                    let view = Shared::new(Slot::default(), &self.kept)?;
                     views.push((Arc::clone(access), view.clone()))?;
                     view
                 }
@@ -2404,42 +2501,44 @@ impl Supports {
             budget: Arc::new(memory.part()),
             cancellation: cancellation.cloned(),
         };
-        let made = view
-            .get_or_init(|| match access.inferred_by_support {
-                true => {
-                    let sets = cell
-                        .get_or_init(|| self.compute(snapshot, &generation, compilation, &working));
-                    // The cell's sets were computed under its state's rules, `generation`'s:
-                    // the closure deciding what they leave open is by the same rules.
-                    match (sets, &generation.rules) {
-                        (Ok(Some(sets)), Some(rules)) => {
-                            let within =
-                                || self.within(snapshot, access, rules, compilation, &working);
-                            self.build_view(
-                                snapshot,
-                                access,
-                                sets,
-                                within,
-                                generation.epoch,
-                                &working,
-                            )
-                        }
-                        // No sets (compact equality, or no rules): not the reader's closure.
-                        (Ok(_), _) => Ok(snapshot.with_inferred_only(&[], false, &self.kept)?),
-                        (Err(unavailable), _) => Err(*unavailable),
+        // A build this read waits for, another reader's or the background's, is left at this
+        // read's cancellation: it goes on, and keeps what it makes.
+        let stop = || working.cancelled();
+        let made = get_or_build(&view, &stop, || match access.inferred_by_support {
+            true => {
+                let Some(sets) = get_or_build(&cell, &stop, || {
+                    self.compute(snapshot, &generation, compilation, &working)
+                }) else {
+                    return Err(Unavailable::Cancelled);
+                };
+                // The cell's sets were computed under its state's rules, `generation`'s:
+                // the closure deciding what they leave open is by the same rules.
+                match (&sets, &generation.rules) {
+                    (Ok(Some(sets)), Some(rules)) => {
+                        let within = || self.within(snapshot, access, rules, compilation, &working);
+                        self.build_view(snapshot, access, sets, within, generation.epoch, &working)
                     }
+                    // No sets (compact equality, or no rules): not the reader's closure.
+                    (Ok(_), _) => Ok(snapshot.with_inferred_only(&[], false, &self.kept)?),
+                    (Err(unavailable), _) => Err(*unavailable),
                 }
-                false => {
-                    let found = rederiving.get_or_init(|| {
-                        self.compute_rederived(snapshot, &generation, compilation, &working)
-                    });
-                    match found {
-                        Ok(found) => self.visible_view(snapshot, access, found, &working),
-                        Err(unavailable) => Err(*unavailable),
-                    }
+            }
+            false => {
+                let Some(found) = get_or_build(&rederiving, &stop, || {
+                    self.compute_rederived(snapshot, &generation, compilation, &working)
+                }) else {
+                    return Err(Unavailable::Cancelled);
+                };
+                match &found {
+                    Ok(found) => self.visible_view(snapshot, access, found, &working),
+                    Err(unavailable) => Err(*unavailable),
                 }
-            })
-            .clone();
+            }
+        });
+        let Some(made) = made else {
+            // Left another reader's build of this view: it goes on, so nothing is forgotten.
+            return Err(Unavailable::Cancelled);
+        };
         if made.is_err() {
             self.drop_failed(snapshot, &cell, Some(&rederiving), Some(&view));
         }
