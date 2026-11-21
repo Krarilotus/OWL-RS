@@ -603,3 +603,37 @@ fn a_restore_lets_go_of_an_alias_refused_since_the_point() {
     ctx.restore(point);
     assert!(ctx.check().is_ok(), "refused within the point only");
 }
+
+/// Spec: an expression's numbers past the memo's limit ([`NUMBER_MEMO_ENTRIES`]) are let go
+/// with their charge when a pass's point is kept, inside an outer point (a streamed GROUP
+/// BY's direct attempt) as outside one: a pass holds no more numbers within an attempt than
+/// without it. The pass is the one a point holds: one number more than the limit, charged as
+/// [`Context::numeric_pass`] charges them.
+#[test]
+fn a_point_kept_inside_another_lets_go_of_numbers_past_the_limit() {
+    let snapshot = snapshot();
+    let options = options(None);
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let v = Variable::new_unchecked("v");
+    let before = counters(&ctx);
+    let outer = ctx.save();
+    let pass = ctx.save();
+    {
+        let mut since = ctx.since.borrow_mut();
+        let layer = since.last_mut().expect("open");
+        let count = NUMBER_MEMO_ENTRIES + 1;
+        assert!(layer.held.charge(count * number_bytes()).is_ok());
+        layer
+            .numbers
+            .entry((Expression::Variable(v.clone()), v))
+            .or_default()
+            .extend((0..count as u64).map(|id| (id, Number::Error)));
+    }
+    ctx.keep(pass);
+    assert_eq!(
+        counters(&ctx),
+        before,
+        "[kept bytes, computed terms, remembered numbers, budget used]"
+    );
+    ctx.keep(outer);
+}
