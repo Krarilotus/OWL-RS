@@ -46,7 +46,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     continue
   fi
   if landing_ref "$remote_ref"; then
-    env -u NRESE_ON_BUILD_HOST -u NRESE_FILES_FROM NRESE_PUSH_REF="$remote_ref" \
+    env -u NRESE_ON_BUILD_HOST -u NRESE_FILES_FROM NRESE_PUSH_REF="$remote_ref" NRESE_PUSH_BASE="$base" \
       bash scripts/check.sh windows "$local_sha" < /dev/null || code=1
   fi
 done

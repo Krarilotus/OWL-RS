@@ -129,7 +129,7 @@ run() {
 
   # The runtime as the run left it: a run that changed its environment ran with no declared one.
   GATE_RUNTIME=$(suite_python_runtime "$pybin/python") \
-    GATE_TIER=windows GATE_TREE=$tree GATE_LIST=$(git hash-object --stdin < /dev/null) GATE_IDENTITY=$identity \
+    GATE_TIER=windows GATE_TREE=$tree GATE_LIST=$(gate_contracts_list | git hash-object --stdin) GATE_IDENTITY=$identity \
     GATE_CODE=$code GATE_CPU=$(gate_cpu) GATE_HOST=$(hostname) \
     GATE_NEXTEST=$(cargo nextest --version 2> /dev/null | head -1) \
     GATE_CHANGED=$(git status --porcelain --untracked-files=no) GATE_SECONDS=$((SECONDS - began)) \

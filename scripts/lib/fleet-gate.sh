@@ -12,9 +12,9 @@
 # target and lock of its own on the host, so it never waits behind a push gate. Sized by measurement
 # (1 to 5 minutes a changed crate on a warm target): est_min 10, a step deadline of 30 minutes. Never
 # a merge gate: it lands nothing.
-# MODE windows (LIST empty): a job of kind owlrs.any on any Windows host with what the tier uses
-# there (below, `has`, in the fleet config's names), which runs the commit's own
-# scripts/lib/windows-job.ps1 and through it its scripts/check.sh windows.
+# MODE windows (LIST: the suite contracts it runs, none listed for all): a job of kind owlrs.any on
+# any Windows host with what the tier uses there (below, `has`, in the fleet config's names), which
+# runs the commit's own scripts/lib/windows-job.ps1 and through it its scripts/check.sh windows.
 # NRESE_GATE_HOSTS: only these hosts. It follows the job and reads its result: valid only when it
 # is for TREE, LIST_HASH, this tier and IDENTITY (the toolchain and the flags,
 # scripts/lib/gate-key.sh) and left no tracked file changed; for windows also only when the suite
@@ -158,6 +158,8 @@ gate() {
     echo "RUST_TEST_THREADS = $(q "$cores")"
     # Windows has no slice: the build's own job object holds it to the ask.
     [ "$mode" != windows ] || echo "NRESE_MEMORY_CAP_GB = $(q "$ram")"
+    # The suite contracts the Windows part runs: LIST's (scripts/check.sh windows_contracts); none, all.
+    [ "$mode" != windows ] || [ ! -s "$list" ] || echo "NRESE_CONTRACTS = $(q "$(paste -sd ' ' "$list")")"
     for var in NRESE_TARGET_CPU RUSTFLAGS NRESE_W3C_OPTIONAL NRESE_GATE_BUDGET_GB; do
       [ -z "${!var:-}" ] || echo "$var = $(q "${!var}")"
     done

@@ -18,7 +18,10 @@
 #                                  (scripts/lib/fleet-gate.sh). fmt; clippy on them; all their
 #                                  tests, the dependents' fast tests; random tests on new
 #                                  seeds; the lock check; nrese-exec's unsafe code under Miri
-#                                  and its doc tests when it changed (scripts/miri.sh). By
+#                                  and its doc tests when it changed (scripts/miri.sh); the
+#                                  suite contracts the files reach, by what each declares it
+#                                  reads (benches/suite/tests/contracts.py), the crate scan its
+#                                  own step. By
 #                                  hand: HEAD, from its upstream (else from where it left
 #                                  origin's refactor/engine-v2), so a push then finds the pass;
 #                                  NRESE_PUSH_REF names the ref it will go to, as the hook's
@@ -42,11 +45,14 @@
 #                                  the merge check's Windows part, on the fleet only
 #                                  (scripts/lib/fleet-gate.sh windows): COMMIT (default HEAD)
 #                                  built whole, clippy on it all, all its tests and doc tests,
-#                                  the suite contracts, the console, by its own tier here, which its own
-#                                  scripts/lib/windows-job.sh runs on a Windows host. A commit
-#                                  whose inputs (scripts/lib/gate-key.sh windows_inputs)
-#                                  passed before, under the Python runtime it declares
-#                                  (gate_runtime), carries that pass: "carried from <commit>".
+#                                  the suite contracts its range reaches (from NRESE_PUSH_BASE,
+#                                  else from where it left origin's refactor/engine-v2; all of
+#                                  them without one: windows_contracts), the console, by its own
+#                                  tier here, which its own scripts/lib/windows-job.sh runs on a
+#                                  Windows host. A commit whose inputs (scripts/lib/gate-key.sh
+#                                  windows_inputs) passed before with the same contracts or all
+#                                  of them, under the Python runtime it declares (gate_runtime),
+#                                  carries that pass: "carried from <commit>".
 #                                  NRESE_PUSH_REF as for push: the merge check's Windows part
 #                                  for refactor/engine-v2 or a release branch is a merge gate,
 #                                  a package's isn't.
@@ -364,17 +370,61 @@ w3c_data() {
 side_steps() {
   local files=("$@")
   guards "${files[@]}"
-  # The suite contracts test the gate's own scripts and hooks too (test_push_gate, test_full_gate,
-  # test_commit_tier, ...): a change to them runs the contracts.
-  if printf '%s\n' "${files[@]}" | grep -qE '^(benches/suite/|scripts/|\.githooks/)'; then
-    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
-  fi
+  # The suite contracts these files reach, by what each declares it reads (the gate's own scripts
+  # and hooks too: test_push_gate, test_full_gate, test_commit_tier, ...).
+  local -a reached
+  mapfile -t reached < <(printf '%s\n' "${files[@]}" | reached_contracts)
+  suite_contracts "${reached[@]}"
   if printf '%s\n' "${files[@]}" | grep -qE '^benches/nrese-bench-harness/'; then
     harness
   fi
   if printf '%s\n' "${files[@]}" | grep -qE '^apps/nrese-console/'; then
     console
   fi
+}
+# The suite contracts of the given module names, the crate scan (crate_scan) its own step: every
+# contract when none is given, none for `none` (benches/suite/tests/contracts.py select's answers).
+suite_contracts() {
+  local name
+  local -a rest=()
+  if [ $# -eq 0 ]; then
+    step "crate scan" python benches/suite/tests/isolation.py crate_scan
+    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+    return
+  fi
+  for name in "$@"; do
+    case $name in
+      none) ;;
+      crate_scan) step "crate scan" python benches/suite/tests/isolation.py crate_scan ;;
+      *) rest+=("$name") ;;
+    esac
+  done
+  [ ${#rest[@]} -eq 0 ] || step "suite contracts" python benches/suite/tests/isolation.py "${rest[@]}"
+}
+# The suite contracts the files on stdin (one per line) reach, one per line, by what each declares it
+# reads (benches/suite/tests/contracts.py; with COMMIT, COMMIT's own declarations): nothing for every
+# contract, which is also the answer where the selector fails.
+reached_contracts() {
+  local out
+  out=$(python benches/suite/tests/contracts.py select ${1:+--commit "$1"}) || return 0
+  printf '%s\n' "$out" | tr -d '\r' | grep .
+  return 0
+}
+# The suite contracts the Windows part of COMMIT runs: those its range reaches, by COMMIT's own
+# selector and declarations, from NRESE_PUSH_BASE, else from where it left origin's
+# refactor/engine-v2 (as push). Nothing, so every contract, without a base, where COMMIT has no
+# selector, or where the range or the selector fails.
+windows_contracts() {
+  local commit=$1 base files selector out
+  base=${NRESE_PUSH_BASE:-$(git merge-base "$commit" refs/remotes/origin/refactor/engine-v2 2> /dev/null)}
+  [ -n "$base" ] && files=$(git diff --name-only "$base" "$commit" 2> /dev/null) || return 0
+  selector=$(mktemp) || return 0
+  if git show "$commit:benches/suite/tests/contracts.py" > "$selector" 2> /dev/null \
+      && out=$(printf '%s\n' "$files" | python "$selector" select --commit "$commit"); then
+    printf '%s\n' "$out" | tr -d '\r' | grep .
+  fi
+  rm -f -- "$selector"
+  return 0
 }
 # Of those, the guards that build nothing (the quick tier's too).
 guards() {
@@ -502,8 +552,8 @@ if [ "$mode" = windows ] && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
 fi
 
 # The push tier, the quick check and the Windows part run on the fleet only
-# (scripts/lib/fleet-gate.sh), for the commit's own tree and the range's files (Windows: none,
-# everything runs). A pass is a verified fleet result, remembered by content
+# (scripts/lib/fleet-gate.sh), for the commit's own tree and the range's files (Windows: the suite
+# contracts it runs; none listed, all, and everything else runs). A pass is a verified fleet result, remembered by content
 # (scripts/lib/gate-key.sh: the tier, the tree, the files, the toolchain), and only check.sh writes
 # it. No verdict, no pass (no push): nothing runs here instead.
 if { [ "$mode" = windows ] || [ "$mode" = push ] || [ "$mode" = quick ]; } && [ -z "${NRESE_ON_BUILD_HOST:-}" ]; then
@@ -514,6 +564,9 @@ if { [ "$mode" = windows ] || [ "$mode" = push ] || [ "$mode" = quick ]; } && [ 
   trap 'rm -f "$list" "$where"' EXIT
   if [ "$mode" != windows ]; then
     changed_files push > "$list" || { echo "the range $push_base..$push_commit isn't all here: fetch first" >&2; exit 2; }
+  else
+    # The Windows part's list is the suite contracts it runs (windows_contracts): none listed, all.
+    windows_contracts "$push_commit" > "$list"
   fi
   tree=$(git rev-parse "$push_commit^{tree}")
   list_hash=$(git hash-object "$list")
@@ -532,7 +585,9 @@ if { [ "$mode" = windows ] || [ "$mode" = push ] || [ "$mode" = quick ]; } && [ 
     identity="$identity $(gate_python "$runtime")"
   fi
   key=$(gate_key "$mode" "$keyed" "$list_hash" "$identity")
-  if record=$(gate_pass "$key"); then
+  # A Windows pass that ran every suite contract (its list empty) stands for any selection of them.
+  if record=$(gate_pass "$key") || { [ "$mode" = windows ] && [ -s "$list" ] \
+      && record=$(gate_pass "$(gate_key "$mode" "$keyed" "$(git hash-object --stdin < /dev/null)" "$identity")"); }; then
     if [ "$mode" = windows ]; then
       echo "=== windows: $(git rev-parse --short "$push_commit") carried from $record (the same inputs)"
     else
@@ -694,7 +749,12 @@ case "$mode" in
     step clippy "$guarded" clippy --locked --workspace --all-targets
     step test run_tests "${everything[@]}"
     step "doc tests" "$guarded" test --locked --workspace --doc --no-fail-fast
-    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+    # The suite contracts its range reaches, as its gate sent them (NRESE_CONTRACTS, from
+    # windows_contracts; scripts/lib/gate-key.sh gate_contracts_list); none sent: all of them.
+    # shellcheck source=lib/gate-key.sh
+    . scripts/lib/gate-key.sh
+    mapfile -t reached < <(gate_contracts_list)
+    suite_contracts "${reached[@]}"
     # The console's typecheck and tests, with the gate's own Node (scripts/lib/windows-job.sh).
     console
     ;;
@@ -709,7 +769,7 @@ case "$mode" in
     harness
     step locks bash scripts/check-locks.sh
     step features bash scripts/check-features.sh
-    step "suite contracts" python benches/suite/tests/isolation.py discover -s benches/suite/tests
+    suite_contracts
     step names bash scripts/check-names.sh
     step "cargo-deny version" deny_version
     step deny cargo deny --all-features check
