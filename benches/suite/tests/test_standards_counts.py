@@ -79,14 +79,15 @@ def list_links(kit, suite: str) -> dict[str, str]:
 
 def link_errors(row: str, suite: str, want: dict, links: dict[str, str]) -> list[str]:
     """A count with a list of its own is the text a link to that list starts with (`[2 not decided](…/undecided.txt)`),
-    so no other number in the row (`OWL 2`) can stand for it."""
+    so no other number in the row (`OWL 2`) can stand for it; a count of 0 has no link, so none outlives its list."""
     errors = []
     for key, path in links.items():
-        count = want.get(key)
-        if key not in KEYS or not count:
+        if key not in KEYS:
             continue
-        found = [int(n.replace(",", "")) for n in re.findall(r"\[(\d[\d,]*)\b[^\]]*\]\(" + re.escape(path) + r"\)", row)]
-        if found != [count]:
+        count = want.get(key, 0)
+        found = [int(n.replace(",", "")) if n else None
+                 for n in re.findall(r"\[(?:(\d[\d,]*)\b)?[^\]]*\]\(" + re.escape(path) + r"\)", row)]
+        if found != ([count] if count else []):
             errors.append(f"{suite}: the gate requires {key} = {count}, as the start of the link to {path}; "
                           f"the row's links to it start with {found}")
     return errors
@@ -196,8 +197,11 @@ class StandardsTable(unittest.TestCase):
         self.assertEqual(link_errors(row, "OWL 2 DL", want, links), [])
         self.assertEqual(len(link_errors(cut, "OWL 2 DL", want, links)), 1)
         self.assertEqual(len(link_errors(moved, "OWL 2 DL", want, links)), 1)
-        # A list's count stated as 0 needs no link.
+        # A list's count stated as 0 has no link: the fix check's witness, `undecided.txt` emptied and `open = 0`
+        # with the `[2 not decided]` link left, fails.
         self.assertEqual(link_errors(cut, "OWL 2 DL", {**want, "open": 0}, links), [])
+        self.assertEqual(len(link_errors(row, "OWL 2 DL", {**want, "open": 0}, links)), 1)
+        self.assertEqual(len(link_errors(row, "OWL 2 DL", {"passed": 408, "disputed": 1}, links)), 1)
 
     def test_a_suite_with_no_stated_count_is_no_check(self):
         row = "| SPARQL 1.1 | x | 531 tests |"

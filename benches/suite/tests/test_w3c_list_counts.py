@@ -117,7 +117,11 @@ class ListCounts(unittest.TestCase):
                     "OWL 2 QL": {"passed": 51, "known": 2}}
         fixed = {("tableau_w3c", "undecided.txt"): "# head\nA (ConsistencyTest)\twhy\nB (ConsistencyTest)\twhy\n",
                  ("tableau_w3c", "disputed.txt"): "D (InconsistencyTest)\tmodel\n",
+                 ("tableau_w3c", "expected-wrong.txt"): "# none\n",
                  ("w3c_owl2_ql", "expected-failures.txt"): "One # why\nTwo # why\nThree # why\n"}
+        # Every counted list of the two runners is a fixture here; only the others are read from the tree.
+        self.assertEqual({(k.split(":")[1], name) for k, name in COUNTED if k.split(":")[1] in ("tableau_w3c",
+                                                                                               "w3c_owl2_ql")}, set(fixed))
 
         def read(path):
             return fixed.get((path.parent.name, path.name), read_file(path))

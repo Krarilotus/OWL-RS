@@ -2007,6 +2007,7 @@ class Parts(unittest.TestCase):
         footer = "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.25s"
         self.assertEqual(gate_module.log_counts(footer + "\n")["test results"], {"passed": 0, "failed": 1})
         self.assertNotIn("test results", gate_module.log_counts("test result: ok. 0 passed; 0 failed;\n"))
+        self.assertNotIn("test results", gate_module.log_counts(footer.removesuffix("s") + "\n"))
         one_missing = gate_module.log_counts("W3C JSON-LD 1.1 suites: passed / failed / not run\n"
                                              "  toRdf-manifest.jsonld: 900 / 0 / 12\n"
                                              "  expand-manifest.jsonld: 376 / 0 / 9\n")

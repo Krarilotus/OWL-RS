@@ -1465,7 +1465,7 @@ def log_counts(text: str) -> dict[str, dict]:
             else:
                 put("GeoSPARQL", "summary", passed=int(m[1]), failed=int(m[3]) - int(m[4]), disputed=int(m[4]))
         elif m := re.match(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; \d+ ignored; \d+ measured; "
-                           r"\d+ filtered out; finished in \S+$", line):
+                           r"\d+ filtered out; finished in \d+(?:\.\d+)?s$", line):
             out.setdefault("test results", {"passed": 0, "failed": 0})
             out["test results"]["passed"] += int(m[2])
             out["test results"]["failed"] += int(m[3])
