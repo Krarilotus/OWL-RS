@@ -2491,30 +2491,118 @@ fn a_change_that_keeps_the_messages_in_effect_introduces_nothing() {
     );
 }
 
-/// A template's expansion counts against the validation's memory: 2,000 blocks naming a
-/// 4 KiB value expand to 8 MB, which a 1 MiB envelope refuses, so the validation stops with
-/// the envelope's refusal instead of a report.
+/// The change of one transaction on `store` in `graph` (`None`: the default graph): `remove`
+/// then `insert` (turtle); the state before, the quads changed and the state after.
+fn changing(
+    store: &Engine,
+    remove: &str,
+    insert: &str,
+    graph: Option<&str>,
+) -> (Snapshot, Vec<nrese_engine::EncodedQuad>, Snapshot) {
+    let before = store.snapshot();
+    let graph = graph
+        .map(NamedNodeRef::new_unchecked)
+        .map_or(GraphNameRef::DefaultGraph, GraphNameRef::from);
+    let quads = |turtle: &str| -> Vec<nrese_rdf::Quad> {
+        RdfParser::from_format(RdfFormat::Turtle)
+            .for_slice(format!("{PREFIXES}{turtle}").as_bytes())
+            .map(|quad| quad.expect("turtle"))
+            .collect()
+    };
+    let mut tx = store.transaction();
+    for quad in quads(remove) {
+        tx.remove(QuadRef::new(
+            &quad.subject,
+            &quad.predicate,
+            &quad.object,
+            graph,
+        ));
+    }
+    for quad in quads(insert) {
+        tx.insert(QuadRef::new(
+            &quad.subject,
+            &quad.predicate,
+            &quad.object,
+            graph,
+        ));
+    }
+    let changed: Vec<_> = tx.inserted().chain(tx.deleted()).collect();
+    let after = tx.pending_snapshot();
+    (before, changed, after)
+}
+
+/// A result's messages are a set (SHACL 1.0 §3.6.2.7: `sh:resultMessage` "may have multiple
+/// values"): a data change that swaps the values two message templates name leaves the same
+/// messages, "1" and "2", on the same result, so nothing is introduced.
 #[test]
-fn a_template_expansion_past_the_envelope_stops_the_validation() {
-    let blocks = "{?x}".repeat(2000);
-    let value = "v".repeat(4096);
+fn a_data_change_that_swaps_two_filled_messages_introduces_nothing() {
     let store = engine(
-        &format!("ex:a ex:p \"{value}\" ."),
+        "ex:a ex:x \"1\" ; ex:y \"2\" .",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql ex:Q .
+         ex:Q sh:message \"{?x}\" , \"{?y}\" ;
+           sh:select '''SELECT $this ?x ?y WHERE {
+             $this <http://example.com/x> ?x . $this <http://example.com/y> ?y }''' .",
+    );
+    let (before, changed, after) = changing(
+        &store,
+        "ex:a ex:x \"1\" ; ex:y \"2\" .",
+        "ex:a ex:x \"2\" ; ex:y \"1\" .",
+        None,
+    );
+    let introduced = nrese_shacl::validate_changes(
+        &before,
+        &after,
+        &compiled(&before),
+        DEFAULT,
+        &changed,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
+    assert!(
+        introduced.results.is_empty(),
+        "the same messages, swapped: {:?}",
+        introduced.results
+    );
+}
+
+/// As for a data change, a change of the shapes that swaps the values two message templates
+/// name leaves the same messages on the same result: nothing is introduced.
+#[test]
+fn a_shapes_change_that_swaps_two_filled_messages_introduces_nothing() {
+    let select = |x: &str, y: &str| {
+        format!(
+            "ex:Q sh:select '''SELECT $this ?x ?y WHERE {{
+               $this <http://example.com/p> ?o . BIND (\"{x}\" AS ?x) BIND (\"{y}\" AS ?y) }}''' ."
+        )
+    };
+    let store = engine(
+        "ex:a ex:p 1 .",
         &format!(
             "ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql ex:Q .
-             ex:Q sh:message \"{blocks}\" ;
-               sh:select '''SELECT $this ?x WHERE {{ $this <http://example.com/p> ?x }}''' ."
+             ex:Q sh:message \"{{?x}}\" , \"{{?y}}\" . {}",
+            select("1", "2")
         ),
     );
-    let snapshot = store.snapshot();
-    let resources = Resources {
-        memory: nrese_exec::Envelope::new(Some(1 << 20), None),
-        ..Resources::default()
-    };
-    let outcome = nrese_shacl::validate(&snapshot, &compiled(&snapshot), DEFAULT, &resources);
+    let (before, _, after) = changing(
+        &store,
+        &select("1", "2"),
+        &select("2", "1"),
+        Some(SHAPES_GRAPH),
+    );
+    let shapes_before = compiled(&before);
+    let shapes_after = compile(&after, shapes_selection(&before)).expect("shapes");
+    let introduced = nrese_shacl::validate_shapes_change(
+        &before,
+        Some(&shapes_before),
+        &after,
+        &shapes_after,
+        DEFAULT,
+        &Resources::default(),
+    )
+    .expect("nothing stops it");
     assert!(
-        matches!(outcome, Err(QueryEvaluationError::MemoryLimit(_))),
-        "{:?}",
-        outcome.map(|report| report.results.len())
+        introduced.results.is_empty(),
+        "the same messages, swapped: {:?}",
+        introduced.results
     );
 }

@@ -416,7 +416,8 @@ async fn a_commit_the_shacl_gate_rejects_is_a_shacl_reject() -> TestResult {
 const SPARQL_SHAPES: &str = "ex:FullName a sh:NodeShape ; sh:targetClass ex:Person ;
   sh:sparql [ sh:message \"{?name} is not a full name\" ;
     sh:select '''SELECT $this ?name WHERE {
-      $this <http://example.com/name> ?name . FILTER (!CONTAINS(?name, \" \")) }''' ] ;
+      $this <http://example.com/name> ?name . FILTER (!CONTAINS(?name, \" \")) }''' ] .
+ex:Surname a sh:NodeShape ; sh:targetClass ex:Person ;
   sh:sparql [ sh:message \"never shown\" ;
     sh:select '''SELECT $this ?message WHERE {
       $this <http://example.com/name> ?name . FILTER (!CONTAINS(?name, \" \"))
@@ -436,26 +437,37 @@ async fn the_report_carries_sparql_constraint_messages() -> TestResult {
     )
     .await?;
     let report = report(&app, "/dataset/shacl").await?;
-    // Each result's own messages: one result per constraint, each with its one message.
-    let mut messages: Vec<Vec<String>> = report["results"]
+    // Each result's own messages, by its source shape: one result per shape.
+    let mut messages: Vec<(String, Vec<String>)> = report["results"]
         .as_array()
         .expect("results")
         .iter()
         .map(|result| {
-            result["resultMessage"]
+            let shape = result["sourceShape"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned();
+            let messages = result["resultMessage"]
                 .as_array()
                 .into_iter()
                 .flatten()
                 .filter_map(|message| message.as_str().map(str::to_owned))
-                .collect()
+                .collect();
+            (shape, messages)
         })
         .collect();
     messages.sort();
     assert_eq!(
         messages,
         [
-            vec!["Bob is not a full name".to_owned()],
-            vec!["add a surname to Bob".to_owned()]
+            (
+                "http://example.com/FullName".to_owned(),
+                vec!["Bob is not a full name".to_owned()]
+            ),
+            (
+                "http://example.com/Surname".to_owned(),
+                vec!["add a surname to Bob".to_owned()]
+            )
         ],
         "{report}"
     );

@@ -335,3 +335,47 @@ fn compiling_a_component_holds_memory_linear_in_its_parameter_values() {
         "doubling each parameter's values took compiling from {small} to {large} bytes"
     );
 }
+
+/// A message template's text is charged before it is made. 2000 `{?x}` blocks naming a
+/// 4 KiB value would fill in to 8 MB of text. Under a 1 MiB envelope the validation is
+/// refused, and what it held at most stays below half of that text, so a run that made the
+/// text before charging it fails here.
+#[test]
+fn a_refused_message_template_holds_less_than_its_text() {
+    if !measure::alone() {
+        return;
+    }
+    let turtle = format!(
+        "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+         ex:a ex:p \"{}\" .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:message \"{}\" ;
+           sh:select \"SELECT $this ?x WHERE {{ $this <http://example.com/p> ?x }}\" ] .",
+        "v".repeat(4096),
+        "{?x}".repeat(2000)
+    );
+    let snapshot = load(&turtle);
+    let graph = snapshot
+        .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+        .expect("the shapes graph");
+    let shapes =
+        compile(&snapshot, Selection::asserted(GraphSelector::Exact(graph))).expect("shapes");
+    // The data is the same graph as the shapes.
+    let data = Selection::of(GraphSelector::Exact(graph));
+    let resources = nrese_sparql::Resources {
+        memory: nrese_exec::Envelope::new(Some(1 << 20), None),
+        ..nrese_sparql::Resources::default()
+    };
+    let (outcome, bytes) = measure::measure(|| {
+        nrese_shacl::validate(&snapshot, &shapes, data, &resources)
+            .map(|report| report.results.len())
+    });
+    eprintln!("refused template validation held at most {bytes} bytes: {outcome:?}");
+    assert!(
+        matches!(
+            outcome,
+            Err(nrese_sparql::QueryEvaluationError::MemoryLimit(_))
+        ),
+        "{outcome:?}"
+    );
+    assert!(bytes < 4 << 20, "held {bytes} bytes");
+}
