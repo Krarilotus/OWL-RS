@@ -235,10 +235,26 @@ fn aggregated(
     (answer, ctx.budget.used())
 }
 
-/// The shapes the sweep runs: the three above, and others of either pass.
+/// 20,480 rows in 4,096 groups over 8,192 distinct integers: value `i % 8192` in group
+/// `i % 4096`. Enough rows that the per-column route aggregates in parallel, each worker
+/// decoding into a cache of its own ([`Decoder`]); few enough distinct values that the
+/// numeric pass decodes them into the query's ([`Context::term`]).
+fn repeated() -> Vec<(u32, u32)> {
+    (0..20_480).map(|i| (i % 4_096, i % 8_192)).collect()
+}
+
+/// The shapes the sweep runs: the three above, and others of either pass; over
+/// [`repeated`], the pass leaves what it decoded in the query's cache where the per-column
+/// route alone would not.
 fn shapes() -> Vec<String> {
-    let (wide, single) = (wide(), single());
+    let (wide, single, repeated) = (wide(), single(), repeated());
     vec![
+        grouped(&repeated, &format!("(SUM({XSD_DOUBLE}(?v)) AS ?t)")),
+        grouped(&repeated, "(AVG(?v * 2) AS ?t)"),
+        grouped(
+            &repeated,
+            &format!("(SUM(IF(?v = 0, \"bad\", {XSD_DOUBLE}(?v))) AS ?t)"),
+        ),
         grouped(&wide, "(SUM(IF(?v = 0, \"bad\", ?v)) AS ?t)"),
         grouped(&single, "(SUM(?v + 0) AS ?t)"),
         grouped(&single, &format!("(SUM({XSD_DOUBLE}(?v)) AS ?t)")),
@@ -255,7 +271,7 @@ fn shapes() -> Vec<String> {
     ]
 }
 
-/// Spec: under every limit of a sweep from 200 kB to 4.5 MB, the general route answers as the
+/// Spec: under every limit of a sweep from 200 kB to 6 MB, the general route answers as the
 /// per-column route does under the same limit; where the per-column route is refused, the
 /// general one is refused too or answers as the per-column route does without a limit.
 #[test]
@@ -267,7 +283,7 @@ fn a_pass_is_refused_only_where_the_per_column_route_is() {
         let shape = &text[text.find("?g (").unwrap()..text.find(" WHERE").unwrap()];
         let (unlimited, _) = aggregated(&snapshot, &query, None, Route::PerColumn);
         let unlimited = unlimited.expect("no limit");
-        for limit in (2..=45).map(|k| k * 100_000) {
+        for limit in (2..=60).map(|k| k * 100_000) {
             let (general, _) = aggregated(&snapshot, &query, Some(limit), Route::General);
             let (per_column, _) = aggregated(&snapshot, &query, Some(limit), Route::PerColumn);
             match (general, per_column) {
