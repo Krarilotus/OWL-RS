@@ -26,9 +26,9 @@ use std::sync::Arc;
 
 use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
 use nrese_store::{
-    ConsistencyStatus, MutationCommand, MutationError, MutationPipeline, MutationTicket,
-    QlRewritingMode, RejectKind, Requester, SparqlQueryRequest, SparqlUpdateRequest, StoreConfig,
-    StoreService,
+    CancellationToken, ConsistencyStatus, MutationCommand, MutationError, MutationPipeline,
+    MutationTicket, QlRewritingMode, RejectKind, Requester, SparqlQueryRequest,
+    SparqlUpdateRequest, StatementOp, StatementsRequest, StoreConfig, StoreService,
 };
 
 const PREFIXES: &str = "PREFIX : <http://example.com/> \
@@ -347,6 +347,151 @@ fn other_properties_domains_keep_their_meaning() {
         let committed = commit(&pipeline(&store, ReasoningMode::Owl2Rl), data);
         if committed != "refused" {
             wrong.push(format!("owl2-rl, {name}, committed: {committed}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A property's domain, with `:alice` using it: `:alice a :Doc` follows while `:note` isn't
+/// declared an annotation property (the OWL reader reads the domain as an object property's),
+/// and doesn't once it is.
+const UNDECLARED_DOMAIN: &str = ":note rdfs:domain :Doc . :alice :note :x .";
+const DECLARATION: &str = ":note a owl:AnnotationProperty .";
+
+/// Whether `ASK { question }` holds with `pending` (an update) pending in a client transaction.
+fn ask_pending(store: &StoreService, pending: &str, question: &str) -> bool {
+    let request = SparqlQueryRequest::all(format!("{PREFIXES}ASK {{ {question} }}"));
+    let prepared = store.prepare_query(&request).expect("prepared");
+    let ops = vec![StatementOp::Update(SparqlUpdateRequest::new(format!(
+        "{PREFIXES}{pending}"
+    )))];
+    let mut out = Vec::new();
+    store
+        .run_query_pending(
+            &StatementsRequest::new(ops),
+            &prepared,
+            &CancellationToken::new(),
+            &mut out,
+        )
+        .expect("pending query");
+    String::from_utf8_lossy(&out)
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>()
+        .contains("\"boolean\":true")
+}
+
+/// Spec (module docs; the reader's rule, under which a declaration makes `:note` an annotation
+/// property): a read inside a transaction answers by the transaction's own state. Under
+/// `owl2-ql`, over committed [`UNDECLARED_DOMAIN`], a pending declaration of `:note` makes
+/// `:alice a :Doc` `false` inside the transaction while the committed state still answers
+/// `true`; over the declaration committed too, a pending retraction of it makes the read
+/// `true` inside, while the committed state answers `false`.
+#[test]
+fn a_transaction_reads_by_its_own_declarations() {
+    let mut wrong = Vec::new();
+    let store = store(QlRewritingMode::Auto);
+    let reasoning = pipeline(&store, ReasoningMode::Owl2Ql);
+    let committed = commit(&reasoning, UNDECLARED_DOMAIN);
+    let (outside, inside) = (
+        read(&store, ":alice a :Doc"),
+        ask_pending(
+            &store,
+            &format!("INSERT DATA {{ {DECLARATION} }}"),
+            ":alice a :Doc",
+        ),
+    );
+    if committed != "applied" || !outside.starts_with("true, ") || inside {
+        wrong.push(format!(
+            "declaration pending: committed {committed}, outside {outside}, inside {inside}"
+        ));
+    }
+    let committed = commit(&reasoning, DECLARATION);
+    let (outside, inside) = (
+        read(&store, ":alice a :Doc"),
+        ask_pending(
+            &store,
+            &format!("DELETE DATA {{ {DECLARATION} }}"),
+            ":alice a :Doc",
+        ),
+    );
+    if committed != "applied" || !outside.starts_with("false, ") || !inside {
+        wrong.push(format!(
+            "retraction pending: committed {committed}, outside {outside}, inside {inside}"
+        ));
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// Spec (module docs; the reader's rule): a replica answers as its primary at each revision it
+/// has taken. Under `owl2-ql` a primary commits [`UNDECLARED_DOMAIN`] (`:alice a :Doc` is
+/// `true`), then the declaration of `:note` (`false`), then its retraction (`true`); a replica
+/// that takes the primary's records after each commit answers as the primary each time.
+#[test]
+fn a_replica_follows_its_primary_across_a_declaration() {
+    let (at, follows) = (
+        tempfile::tempdir().expect("dir"),
+        tempfile::tempdir().expect("dir"),
+    );
+    let on_disk = |dir: &std::path::Path, replica: bool| {
+        let store = Arc::new(
+            StoreService::new(StoreConfig {
+                replica,
+                ..StoreConfig::on_disk(dir)
+            })
+            .expect("store"),
+        );
+        let reasoning = pipeline(&store, ReasoningMode::Owl2Ql);
+        (store, reasoning)
+    };
+    let (primary, reasoning) = on_disk(at.path(), false);
+    let (replica, _following) = on_disk(follows.path(), true);
+    let mut wrong = Vec::new();
+    for (step, data, expected) in [
+        (
+            "the domain",
+            format!("INSERT DATA {{ {UNDECLARED_DOMAIN} }}"),
+            "true, ",
+        ),
+        (
+            "the declaration",
+            format!("INSERT DATA {{ {DECLARATION} }}"),
+            "false, ",
+        ),
+        (
+            "its retraction",
+            format!("DELETE DATA {{ {DECLARATION} }}"),
+            "true, ",
+        ),
+    ] {
+        reasoning
+            .apply(
+                MutationCommand::Update(SparqlUpdateRequest::new(format!("{PREFIXES}{data}"))),
+                &Requester::all(),
+                &MutationTicket::new(),
+            )
+            .unwrap_or_else(|error| panic!("{step}: {error}"));
+        let after = replica.current_revision();
+        let batch = primary.replication_log(after, 1 << 20).expect("log");
+        let expected_log = nrese_store::LogExpectation {
+            after,
+            records: batch.records as u64,
+            last: batch.last,
+        };
+        let stop = nrese_exec::stop::StopSource::new(None, None);
+        replica
+            .apply_replication_log(&batch.frames, &expected_log, &stop)
+            .unwrap_or_else(|error| panic!("{step}, taken: {error}"));
+        let (on_primary, on_replica) = (
+            read(&primary, ":alice a :Doc"),
+            read(&replica, ":alice a :Doc"),
+        );
+        let same_revision = replica.current_revision() == primary.current_revision();
+        let same_answer = on_primary.split(',').next() == on_replica.split(',').next();
+        if !on_primary.starts_with(expected) || !same_answer || !same_revision {
+            wrong.push(format!(
+                "after {step}: primary {on_primary}, replica {on_replica}, same revision {same_revision}"
+            ));
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
