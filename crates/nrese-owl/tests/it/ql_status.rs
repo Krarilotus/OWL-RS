@@ -90,6 +90,39 @@ fn cells() -> Vec<Cell> {
             expect: Expect::LeftOut,
         },
         Cell {
+            kind: "TwoKinds (class and datatype, by an axiom)",
+            is: |d| {
+                matches!(
+                    d,
+                    Diagnostic::TwoKinds {
+                        kinds: [EntityKind::Class, EntityKind::Datatype],
+                        by_axiom: true,
+                        ..
+                    }
+                )
+            },
+            source: Turtle(
+                "ex:T a owl:Class , rdfs:Datatype .
+                 ex:p a owl:DatatypeProperty ; rdfs:range ex:T .",
+            ),
+            expect: Expect::LeftOut,
+        },
+        Cell {
+            kind: "TwoKinds (object and data property, assertions only)",
+            is: |d| {
+                matches!(
+                    d,
+                    Diagnostic::TwoKinds {
+                        kinds: [EntityKind::ObjectProperty, EntityKind::DataProperty],
+                        by_axiom: false,
+                        ..
+                    }
+                )
+            },
+            source: Turtle("ex:a ex:creator \"N\" . ex:b ex:creator ex:n ."),
+            expect: Expect::Complete,
+        },
+        Cell {
             kind: "Unsupported",
             is: |d| matches!(d, Diagnostic::Unsupported { .. }),
             source: Turtle(
@@ -111,6 +144,23 @@ fn cells() -> Vec<Cell> {
             source: Turtle(
                 "ex:p a owl:ObjectProperty .
                  [ a owl:Restriction ; owl:onProperty ex:p ; owl:someValuesFrom ex:C ] .",
+            ),
+            expect: Expect::Complete,
+        },
+        Cell {
+            kind: "Unused (the rules may read more of it)",
+            is: |d| {
+                matches!(
+                    d,
+                    Diagnostic::Unused {
+                        reads_more: true,
+                        ..
+                    }
+                )
+            },
+            source: Turtle(
+                "_:x owl:intersectionOf ( ex:A ex:B ) ; owl:onProperty ex:p ;
+                     owl:allValuesFrom ex:D .",
             ),
             expect: Expect::Complete,
         },
@@ -184,12 +234,13 @@ fn ontology(table: &mut Table, source: &Source) -> Ontology {
 /// Spec (the rule, `nrese_owl::Diagnostic` and the QL TBox, I24c-2): every diagnostic kind
 /// the reader has, raised by a small ontology under `owl2-ql`'s closure. Where the reader
 /// leaves an axiom out or alters it (a structure it can't read, OWL vocabulary outside the
-/// mapping, text not read, a reserved name used as an entity, a property declared both an
-/// object and a data property, a rule beside the ontology), the TBox's hazard is global and
-/// says the reader's own words for one of them. Where it reads every axiom as the source
-/// states it (a shared blank node, an undeclared property typed by its use, a structure no
-/// axiom uses, a non-simple property, a disjointness repeating an operand), it raises no
-/// global hazard. An anonymous individual stands only in `hasValue` or `oneOf`, outside
+/// mapping, text not read, a reserved name used as an entity, a name of two kinds an axiom
+/// names in one of them, which the reader reads as one name, a rule beside the ontology),
+/// the TBox's hazard is global and says the reader's own words for one of them. Where it
+/// reads every axiom as the source states it (a shared blank node, an undeclared property
+/// typed by its use, a name of two kinds only assertions use, each read by its value, a
+/// structure no axiom uses, whatever the OWL 2 RL rules read of it, a non-simple property,
+/// a disjointness repeating an operand), it raises no global hazard. An anonymous individual stands only in `hasValue` or `oneOf`, outside
 /// OWL 2 QL, whose global hazard is the TBox's own: never the reader's, even beside an
 /// axiom the reader leaves out (the more specific reason comes first).
 #[test]
