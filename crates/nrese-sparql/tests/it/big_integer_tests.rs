@@ -701,3 +701,24 @@ fn big_integer_string_constructor_normalizes_xml_whitespace() {
         Some(Term::from(Literal::from(false))),
     );
 }
+
+/// XPath F&O §17.1.3 (casting to xs:integer): a decimal casts to the integer it truncates
+/// to, toward zero, whatever its size; SPARQL's `xsd:integer()` is that cast.
+#[test]
+fn decimal_to_integer_cast_keeps_integers_beyond_64_bits() {
+    let engine = load(Vec::new());
+    let snapshot = engine.snapshot();
+    let opts = QueryOptions::default();
+    for (decimal, integer) in [
+        ("100000000000000000000.75", "100000000000000000000"),
+        ("-100000000000000000000.75", "-100000000000000000000"),
+        ("42.9", "42"),
+    ] {
+        let query = format!("SELECT (xsd:integer({decimal}) AS ?r) {{}}");
+        assert_eq!(
+            single_term(run_both(&snapshot, &query, &opts, false)),
+            Some(Term::from(typed(integer, "integer"))),
+            "xsd:integer({decimal})"
+        );
+    }
+}
