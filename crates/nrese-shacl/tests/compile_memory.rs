@@ -379,3 +379,48 @@ fn a_refused_message_template_holds_less_than_its_text() {
     );
     assert!(bytes < 4 << 20, "held {bytes} bytes");
 }
+
+/// A filled message's dictionary lookup is charged before it runs. 96 `{?x}` blocks naming
+/// a 4 KiB value fill in to 384 KiB, whose lookup copies the text into a key grown by
+/// doubling. Under a 1 MiB envelope the validation is refused before it makes the text or
+/// its key: it holds at most well under the text's 384 KiB beside its key, so a run that
+/// charged less than the lookup takes (and made both) fails here.
+#[test]
+fn a_refused_message_lookup_holds_less_than_its_text_and_key() {
+    if !measure::alone() {
+        return;
+    }
+    let turtle = format!(
+        "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+         ex:a ex:p \"{}\" .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:message \"{}\" ;
+           sh:select \"SELECT $this ?x WHERE {{ $this <http://example.com/p> ?x }}\" ] .",
+        "v".repeat(4096),
+        "{?x}".repeat(96)
+    );
+    let snapshot = load(&turtle);
+    let graph = snapshot
+        .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+        .expect("the shapes graph");
+    let shapes =
+        compile(&snapshot, Selection::asserted(GraphSelector::Exact(graph))).expect("shapes");
+    // The data is the same graph as the shapes.
+    let data = Selection::of(GraphSelector::Exact(graph));
+    let resources = nrese_sparql::Resources {
+        memory: nrese_exec::Envelope::new(Some(1 << 20), None),
+        ..nrese_sparql::Resources::default()
+    };
+    let (outcome, bytes) = measure::measure(|| {
+        nrese_shacl::validate(&snapshot, &shapes, data, &resources)
+            .map(|report| report.results.len())
+    });
+    eprintln!("refused lookup validation held at most {bytes} bytes: {outcome:?}");
+    assert!(
+        matches!(
+            outcome,
+            Err(nrese_sparql::QueryEvaluationError::MemoryLimit(_))
+        ),
+        "{outcome:?}"
+    );
+    assert!(bytes < 640 << 10, "held {bytes} bytes");
+}
