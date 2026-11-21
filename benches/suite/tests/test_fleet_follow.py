@@ -8,13 +8,15 @@ An assertion tagged `SPEC <tag>` states the behaviour its test is for.
 """
 
 import json
+import time
 import unittest
 
 import test_push_gate as push  # the scratch repository and the gate's job records (a module: its tests aren't rerun here)
 
 # A stand-in for the fleet's CLI whose status and results play $FAKE/<command>-<job>.seq, one reply
 # a call, the last again once they are used up: "~N" waits N s and answers nothing (a call that
-# times out), "!TEXT" prints TEXT and fails (a CLI error on stdout), any other line is the answer.
+# times out), "+N TEXT" waits N s and then answers TEXT (a slow answer), "!TEXT" prints TEXT and
+# fails (a CLI error on stdout), any other line is the answer.
 SCRIPTED = """#!/bin/sh
 case "$1" in
   submit) n=$(( $(cat "$FAKE/n" 2> /dev/null || echo 0) + 1 )); echo $n > "$FAKE/n"
@@ -27,6 +29,7 @@ case "$1" in
     reply=$(sed -n "${n}p" "$seq")
     case $reply in
       "~"*) sleep "${reply#"~"}" ;;
+      "+"*) wait=${reply#"+"}; sleep "${wait%% *}"; printf '%s\\n' "${reply#* }" ;;
       "!"*) echo "${reply#"!"}"; exit 1 ;;
       *) printf '%s\\n' "$reply" ;;
     esac ;;
@@ -93,7 +96,8 @@ class FleetFollow(push.Repo):
                 code, where, _, err = self.gate()
                 self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
                                  f"SPEC silence-cap: not one cancel at the cap\n{err}")
-                self.assertIn("gate-1: the fleet didn't answer for", err, "SPEC silence-cap: the job isn't named")
+                self.assertRegex(err, r"gate-1: (the fleet didn't answer for|past) \d+ s",
+                                 "SPEC silence-cap: the job isn't named with the end of its wait")
 
     def test_no_fleet_call_starts_after_the_cap_or_the_gates_limit(self):
         """A poll longer than what is left of the wait: the next status or results call would start
@@ -110,6 +114,37 @@ class FleetFollow(push.Repo):
                 code, where, _, err = self.gate()
                 self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
                                  f"SPEC no-call-after-deadline: a call after the deadline gave the verdict\n{err}")
+
+    def test_no_results_call_starts_after_the_gates_limit(self):
+        """The job's `done` comes from a status call that started inside MAX_S and answered after it:
+        the results aren't asked for after MAX_S, so no verdict, with one cancel."""
+        self.env["NRESE_GATE_MAX_S"] = "1"
+        self.play("status", f"+2 {state('done')}")
+        self.play("results", self.results())
+        code, where, _, err = self.gate()
+        self.assertEqual((code, where, self.cancels(), (self.fake / "results-gate-1.n").exists()),
+                         (75, "", ["gate-1"], False),
+                         f"SPEC no-call-after-deadline: results were asked for after MAX_S\n{err}")
+
+    def test_a_wait_past_its_deadline_ends_without_another_poll(self):
+        """A call that comes back after a deadline has passed ends the wait at once: a status
+        `running` answered after MAX_S, or a silent results call that outlasts the silence's cap. No
+        verdict, one cancel, and no further poll interval slept first. The poll is 30 s, so a wait that
+        slept it once more takes over 30 s; the bound of 25 s leaves room for a slow host's start-up."""
+        self.env.update(NRESE_GATE_POLL_S="30", NRESE_FLEET_SILENT_S="1")
+        for name, max_s, status, results in (("status", "1", [f"+2 {state('running')}"], []),
+                                             ("results", "10800", [state("done")], ["~2"])):
+            with self.subTest(call=name):
+                self.reset()
+                self.env["NRESE_GATE_MAX_S"] = max_s
+                self.play("status", *status)
+                self.play("results", *results, self.results())
+                began = time.monotonic()
+                code, where, _, err = self.gate()
+                took = time.monotonic() - began
+                self.assertEqual((code, where, self.cancels()), (75, "", ["gate-1"]),
+                                 f"SPEC cap-at-once: not no verdict with one cancel\n{err}")
+                self.assertLess(took, 25, f"SPEC cap-at-once: it slept a poll after the deadline ({took:.1f} s)\n{err}")
 
     def test_a_job_that_ended_while_the_fleet_was_silent_is_judged_by_its_result(self):
         """The job fails on its host while the fleet doesn't answer; once it answers again, inside

@@ -16,14 +16,18 @@
 # Silence is a call with no answer: no reply, an error, a timeout or no state. It is unknown, not an
 # end: the job is neither judged nor cancelled for it, and a pending job's start window doesn't run
 # meanwhile. A spell of it ends the wait only once it has lasted NRESE_FLEET_SILENT_S seconds
-# (default 600) or MAX_S has passed; then the job is cancelled. A job is never submitted again.
+# (default 600) or MAX_S has passed; then the job is cancelled. Both are checked before every fleet
+# call and before every sleep: no call starts and no sleep begins after either. A job is never
+# submitted again.
 fleet_bin=${NRESE_FLEET_BIN:-$(git config --get nrese.fleetBin || echo ${HOME:+"$HOME"/Documents/fleet-scheduler/state/owlrs/bin/fleet.exe})}
 fleet_id=""
 fleet_state=""
 # The fleet's name for the host the job last ran on (fleet_follow).
 fleet_host=""
-# fleet_follow's end (MAX_S) in SECONDS, which also bounds fleet_results; the job last cancelled.
+# fleet_follow's end (MAX_S) in SECONDS, which also bounds fleet_results, and MAX_S itself; the job
+# last cancelled.
 fleet_end_by=0
+fleet_max_s=0
 fleet_cancelled=""
 fleet_label=${fleet_label:-fleet job}
 
@@ -69,8 +73,9 @@ fleet_submit() {
 fleet_follow() {
   local start_s=$1 max_s=$2 poll_s=${NRESE_FLEET_POLL_S:-10}
   local start_by=$((SECONDS + start_s)) last="" quiet="" asked now
-  fleet_end_by=$((SECONDS + max_s))
+  fleet_end_by=$((SECONDS + max_s)) fleet_max_s=$max_s
   while :; do
+    fleet_may_wait "$quiet" || { fleet_cancel; return 75; }
     asked=$SECONDS
     now=$(timeout --kill-after=10 30 "$fleet_bin" status "$fleet_id" --json 2> /dev/null | python -c '
 import json, sys
@@ -79,7 +84,6 @@ if j.get("state"):
     print(j["state"], j.get("host") or "-", j.get("reason") or "")' 2> /dev/null | tr -d '\r')
     if [ -z "$now" ]; then
       quiet=${quiet:-$asked}
-      fleet_silent "$quiet" || { fleet_cancel; return 75; }
     else
       [ -z "$quiet" ] || start_by=$((start_by + SECONDS - quiet))
       quiet=""
@@ -95,26 +99,33 @@ if j.get("state"):
         cancelled | blocked) fleet_say "it was $fleet_state"; fleet_id=""; return 75 ;;
       esac
     fi
+    fleet_may_wait "$quiet" || { fleet_cancel; return 75; }
     sleep "$poll_s"
-    # No call starts after a deadline: the silence's cap or MAX_S passed while it slept ends the wait.
-    [ -z "$quiet" ] || fleet_silent "$quiet" || { fleet_cancel; return 75; }
-    [ $SECONDS -lt $fleet_end_by ] || { fleet_say "past $max_s s"; fleet_cancel; return 75; }
   done
 }
 
-# fleet_silent SINCE: whether a silence since SINCE (in SECONDS) may go on.
-fleet_silent() {
-  [ $((SECONDS - $1)) -lt "${NRESE_FLEET_SILENT_S:-600}" ] && [ $SECONDS -lt $fleet_end_by ] && return
-  fleet_say "the fleet didn't answer for $((SECONDS - $1)) s"
+# fleet_may_wait [SINCE]: whether the wait may go on: MAX_S not passed and, where a silence began at
+# SINCE (in SECONDS), that silence still under its cap. Asked before every fleet call and every sleep.
+fleet_may_wait() {
+  local since=${1:-}
+  [ $SECONDS -lt $fleet_end_by ] && { [ -z "$since" ] || [ $((SECONDS - since)) -lt "${NRESE_FLEET_SILENT_S:-600}" ]; } \
+    && return
+  if [ -n "$since" ]; then fleet_say "the fleet didn't answer for $((SECONDS - since)) s"; else fleet_say "past $fleet_max_s s"; fi
   return 1
 }
 
 fleet_results() {
-  local quiet=$SECONDS dir
-  until dir=$(timeout --kill-after=10 300 "$fleet_bin" results "$fleet_id" 2> /dev/null) && dir=${dir//$'\r'/} &&
-    [ -n "${dir##*$'\n'}" ]; do
+  local quiet="" asked dir
+  while fleet_may_wait "$quiet"; do
+    asked=$SECONDS
+    if dir=$(timeout --kill-after=10 300 "$fleet_bin" results "$fleet_id" 2> /dev/null) && dir=${dir//$'\r'/} &&
+      [ -n "${dir##*$'\n'}" ]; then
+      echo "${dir##*$'\n'}"
+      return
+    fi
+    quiet=${quiet:-$asked}
+    fleet_may_wait "$quiet" || return 75
     sleep "${NRESE_FLEET_POLL_S:-10}"
-    fleet_silent "$quiet" || return 75
   done
-  echo "${dir##*$'\n'}"
+  return 75
 }
