@@ -113,6 +113,13 @@ changed_crates() {
 # (scripts/lib/gate-key.sh gate_covering; benches/suite/tests/test_push_tier_monotone.py).
 reaches_no_crate() { ! printf '%s\n' "$@" | grep -qE "$EVERY_CRATE|^crates/"; }
 
+# Whether COMMIT's own check.sh, which its fleet gate runs, draws its seeds from the full commit id
+# (run_seeds), so its pass names the same random cases on every host. Its pass may cover a narrower
+# push; a commit whose runner abbreviates the id keeps exact reuse only.
+stable_seeds_at() {
+  git show "$1:scripts/check.sh" 2> /dev/null | grep -qE '^[[:space:]]+local base=\$\(\( 16#\$\{head:0:6\} '
+}
+
 # The workspace crates (directories with a Cargo.toml under crates/) that `files` touch.
 crates_of() {
   local file dir name
@@ -411,8 +418,9 @@ if { [ "$mode" = windows ] || [ "$mode" = push ]; } && [ -z "${NRESE_ON_BUILD_HO
   fi
   # A pass of this commit on more files covers these when its other files reach no crate: its
   # workspace builds, lints and tests were these files' own, and the other files only added steps
-  # (scripts/lib/gate-key.sh gate_covering, reaches_no_crate above).
-  if [ "$mode" = push ] && record=$(gate_covering "$mode" "$keyed" "$list" "$identity" "$push_commit" reaches_no_crate); then
+  # (scripts/lib/gate-key.sh gate_covering, reaches_no_crate above), and its runner's seeds are the
+  # same on every host (stable_seeds_at).
+  if [ "$mode" = push ] && stable_seeds_at "$push_commit" && record=$(gate_covering "$mode" "$keyed" "$list" "$identity" "$push_commit" reaches_no_crate); then
     echo "=== $mode: $(git rev-parse --short "$push_commit") passed on the fleet before (this commit, these files and others reaching no crate)"
     exit 0
   fi

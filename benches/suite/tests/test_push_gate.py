@@ -411,6 +411,26 @@ class PushGate(Repo):
         self.assertEqual((again.returncode != 0, [rev for rev, _, _ in self.jobs()]), (True, [tip, twin]),
                          f"SPEC covering-commit: another commit of the tree passed on the pass\n{again.stderr}")
 
+    def test_a_pass_of_a_commit_with_an_older_runner_covers_nothing_narrower(self):
+        """Review r3 (21 Nov 2026): the fleet gate runs the pushed commit's own check.sh. A commit
+        whose check.sh draws its seeds from the abbreviated id (which grows where another object
+        shares its prefix) may have tried other random cases than another host would. Gated from an
+        updated checkout, its pass still counts for its exact files, but covers no narrower push:
+        that is gated on its own (here refused: no verdict)."""
+        current = (self.repo / "scripts/check.sh").read_text()
+        older = current.replace("16#${head:0:6} ", "16#$(git rev-parse --short=6 HEAD) ")
+        self.assertNotEqual(older, current, "the fixture's runner draws its seeds from the full id")
+        first = self.commit("scripts/check.sh", older)  # an older runner, committed with the change
+        tip = self.commit("b.txt", "b changed\n")
+        (self.repo / "scripts/check.sh").write_text(current, newline="\n")  # the pusher's checkout: updated
+        self.fleet("done", self.tree(tip), ["b.txt", "scripts/check.sh"])
+        done = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", ZERO))
+        self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
+        self.fleet("pending")
+        narrower = self.push(("refs/heads/pkg/x", tip, "refs/heads/pkg/x", first))
+        self.assertEqual((narrower.returncode != 0, len(self.jobs())), (True, 2),
+                         f"SPEC covering-runner: a pass of an older runner covered a narrower push\n{narrower.stderr}")
+
     def test_a_record_without_its_provenance_covers_nothing(self):
         """Review r1 (21 Nov 2026): a line in the pass file that is a bare key, with no record of
         where it ran, is no pass, though its file list is kept: the push is gated on its own."""
