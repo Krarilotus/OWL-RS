@@ -40,8 +40,8 @@ pub struct ReadyResponse {
     pub reasoning_semantic_tier: &'static str,
     /// Under `owl2-dl`: the data's consistency under OWL 2 DL, as last checked.
     pub dl: Option<DlReady>,
-    /// The repositories that can't serve (`id: unavailable`): the server stays ready for
-    /// the others, so that a load balancer keeps it.
+    /// Unavailable repositories and stopped maintenance workers. The server stays ready
+    /// for stores that can serve.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub degraded: Vec<String>,
 }
@@ -163,6 +163,8 @@ pub struct ExtendedHealthResponse {
     pub reasoning_mode: &'static str,
     pub reasoning_profile: &'static str,
     pub ontology_path: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub degraded: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -366,6 +368,7 @@ pub fn build_extended_health_response(
         reasoning_mode: ready.reasoning_mode,
         reasoning_profile: ready.reasoning_profile,
         ontology_path: ready.ontology_path,
+        degraded: ready.degraded,
     }
 }
 

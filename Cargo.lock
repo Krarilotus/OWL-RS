@@ -1262,6 +1262,7 @@ dependencies = [
  "libc",
  "libmimalloc-sys",
  "mimalloc",
+ "nrese-engine",
  "nrese-exec",
  "nrese-rdf",
  "nrese-rdf-io",

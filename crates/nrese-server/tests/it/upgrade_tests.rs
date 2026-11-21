@@ -430,11 +430,12 @@ fn expected(repo: &str, name: &str) -> Vec<String> {
         .lines()
         .filter(|l| !l.starts_with('#') && !l.is_empty())
     {
-        let parts: Vec<&str> = line.split('\t').collect();
+        let parts: Vec<&str> = line.splitn(3, '\t').collect();
         if parts[0] != repo || parts[1] != name {
             continue;
         }
-        match parts[2].split_at(1) {
+        let (change, _) = parts[2].rsplit_once('\t').expect("row and reason");
+        match change.split_at(1) {
             ("+", row) => rows.push(row.to_owned()),
             ("-", row) => rows.retain(|r| r != row),
             _ => panic!("v2-differences.tsv: {line}"),
@@ -520,12 +521,10 @@ async fn a_store_written_by_main_opens_with_its_data_answers_and_settings()
     let main_ready: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(
         fixture().join("expected/readyz.json"),
     )?)?;
-    for key in [
-        "revision",
-        "quad_count",
-        "named_graph_count",
-        "reasoning_mode",
-    ] {
+    // The semantics version step rematerialises once at startup, changing the inferred stack.
+    let main_revision = main_ready["revision"].as_u64().expect("main's revision");
+    assert_eq!(ready["revision"].as_u64(), Some(main_revision + 1));
+    for key in ["quad_count", "named_graph_count", "reasoning_mode"] {
         assert_eq!(ready[key], main_ready[key], "{key}");
     }
     // Every answer, in every repository (those with ids new ones can't take included).

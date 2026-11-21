@@ -771,10 +771,16 @@ impl StoreService {
     }
 
     /// Waits until the engine's background maintenance has nothing requested or running
-    /// ([`Engine::settle`]): for measurements of what the store holds.
+    /// ([`Engine::settle`]), or reports that the worker ended: for measurements of what the
+    /// store holds.
     #[doc(hidden)]
-    pub fn settle(&self) {
-        self.engine.settle();
+    pub fn settle(&self) -> StoreResult<()> {
+        self.engine.settle().map_err(Into::into)
+    }
+
+    /// The background maintenance worker's recorded error, once it has ended.
+    pub fn maintenance_error(&self) -> Option<EngineError> {
+        self.engine.maintenance_error()
     }
 
     pub(crate) fn engine(&self) -> &Engine {
@@ -1335,7 +1341,9 @@ impl StoreService {
             cancellation,
             &memory,
             out,
-            |ql| {
+            |mut ql| {
+                self.certify_ql(ql.as_deref_mut(), prepared, &snapshot);
+                let ql = ql.as_deref();
                 let status = self.status_outside_dl(prepared, ql, at);
                 // The cache's context is the whole assessment, not what the reader is told.
                 let context = context_outside_dl(status.as_ref(), ql.is_some());
@@ -1348,9 +1356,9 @@ impl StoreService {
     }
 
     /// The status of answers outside the DL bounds: the QL rewriting's report where it ran,
-    /// as it left the rewriting with what neither it nor the closure answers composed onto
-    /// it ([`crate::dl::query::certify_report`]) and the list mark ([`Self::ql_status`]);
-    /// else [`Self::status_without_dl`], marked for the data `at` the answers were read from.
+    /// certified ([`Self::certify_ql`]: what neither it nor the closure answers, the list
+    /// mark among it, composed onto it); else [`Self::status_without_dl`], marked for the
+    /// data `at` the answers were read from.
     fn status_outside_dl(
         &self,
         prepared: &PreparedQuery,
@@ -1362,7 +1370,7 @@ impl StoreService {
                 .then(nrese_sparql::Completeness::not_certified);
         }
         let route = match ql {
-            Some(ql) => Some(self.ql_status(ql, at.snapshot())),
+            Some(ql) => Some(ql.completeness.clone()),
             None => self.status_without_dl_at(prepared, at),
         };
         self.assess(prepared, at, route)
@@ -1572,6 +1580,7 @@ impl StoreService {
         hooks::run(&hooks::AFTER_DECIDED);
         let mut explanation =
             explain_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
+        self.certify_ql(explanation.ql.as_mut(), prepared, &snapshot);
         if let Some(mode) = self.dl_mode(prepared, &snapshot) {
             // The status as the query would answer, never failing for it.
             let mode = match mode {
@@ -1636,6 +1645,7 @@ impl StoreService {
         hooks::run(&hooks::AFTER_DECIDED);
         let mut planned =
             plan_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
+        self.certify_ql(planned.ql.as_mut(), prepared, &snapshot);
         let at = Revision::Committed(&snapshot);
         planned.completeness = match self.dl_mode(prepared, &snapshot) {
             Some(_) => Some(plan_status(self, &snapshot, prepared, cancellation)?),
@@ -1667,11 +1677,14 @@ impl StoreService {
         let snapshot = self.engine.snapshot();
         let mut printed = nrese_sparql::ql::print(&snapshot, &query, form)?;
         // The status this store gives the same answers ([`Self::status_outside_dl`]): its
-        // regime, as the rewriting's run sets it for the RL closure, and its composition.
+        // regime, as the rewriting's run sets it for the RL closure, and its composition, the
+        // list mark included.
         if let nrese_sparql::ql::Printed::Query { completeness, .. } = &mut printed {
             completeness.regime = Some(nrese_sparql::Regime::Owl2Rl);
             let reads = crate::dl::query::Reads::default();
-            certify_closure(completeness, (&query, &reads), "ql", Some(&snapshot));
+            let lists = || self.lists_left_out(&snapshot);
+            let query = (&query, &reads);
+            crate::dl::query::certify_report(Some(completeness), query, Some(&snapshot), lists);
         }
         Ok(printed)
     }
@@ -1895,8 +1908,10 @@ impl StoreService {
                     cancellation,
                     &memory,
                     out,
-                    |ql| {
+                    |mut ql| {
                         // A transaction's pending state: never answered from the cache.
+                        self.certify_ql(ql.as_deref_mut(), prepared, snapshot);
+                        let ql = ql.as_deref();
                         let status = self.status_outside_dl(prepared, ql, at);
                         report(self.told(prepared, status, ql.is_some()), None);
                         (Vec::new(), |_| None)
@@ -2413,21 +2428,19 @@ impl StoreService {
             && (self.lists).own(snapshot, || Program::leaves_out_a_list(snapshot)))
     }
 
-    /// The QL rewriting's status at `snapshot`: under `owl2-rl`, not `complete` where the
-    /// closure leaves out a list axiom, whose conclusions an answer may miss.
-    fn ql_status(
+    /// The QL rewriting's report of `prepared`'s read of `snapshot`, certified
+    /// ([`crate::dl::query::certify_report`]) with this store's record of the lists its
+    /// closure leaves out.
+    fn certify_ql(
         &self,
-        ql: &nrese_sparql::ql::QlReport,
+        ql: Option<&mut nrese_sparql::ql::QlReport>,
+        prepared: &PreparedQuery,
         snapshot: &nrese_engine::Snapshot,
-    ) -> nrese_sparql::Completeness {
-        let mut status = ql.completeness.clone();
-        let rl = status.regime == Some(nrese_sparql::Regime::Owl2Rl);
-        if status.complete && rl && self.lists_left_out(snapshot) {
-            let why =
-                "a list axiom the rules can't build is left out of the closure (a list diagnostic)";
-            status.incomplete("rules", why.to_owned());
-        }
-        status
+    ) {
+        let completeness = ql.map(|r| &mut r.completeness);
+        crate::dl::query::certify_report(completeness, prepared.reads(), Some(snapshot), || {
+            self.lists_left_out(snapshot)
+        });
     }
 
     /// A statement by the snapshot's ids; `None` if a term isn't in the store.

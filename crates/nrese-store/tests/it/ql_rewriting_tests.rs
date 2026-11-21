@@ -2967,6 +2967,31 @@ fn a_rewritten_read_over_a_store_in_quarantine_under_owl2_rl_is_not_complete() {
     assert_ne!(status_class(&status), "complete", "status: {status}");
 }
 
+/// Spec: a read of a store in quarantine is never `complete`, whoever reads it
+/// (docs/spec/reasoning-semantics.md, "A store in quarantine"), and a cause once given is never
+/// replaced by another (the DL lead's P0 round 2, S3): under `owl2-rl` with the QL rewriting on,
+/// a store both in quarantine and holding an intersection of 257 classes, which the rules leave
+/// out, still names the quarantine, as v1.5.0 did.
+#[test]
+fn a_rewritten_read_in_quarantine_names_it_with_a_list_left_out() {
+    let members: Vec<String> = (1..=257).map(|i| format!(":M{i}")).collect();
+    let more = format!(
+        ":x a :A , :B . :C owl:intersectionOf ( {} ) .",
+        members.join(" ")
+    );
+    let store = quarantine_store(Ruleset::Owl2Rl, QlRewritingMode::On, &more);
+    assert_quarantined(&store);
+    let read = "SELECT ?x { ?x a :A }";
+    let (status, reasons) = rewritten_read(&store, read, nrese_store::ReadScope::All);
+    let quarantine = reasons
+        .iter()
+        .any(|r| r.starts_with("the store is in quarantine"));
+    assert!(
+        status_class(&status) != "complete" && quarantine,
+        "{status}: {reasons:#?}"
+    );
+}
+
 /// Spec (docs/spec/reasoning-semantics.md, "What `complete` refers to"): on clean data under
 /// `owl2-ql`, a read the QL rewriting ran on, of a named class of the data's own, is `complete`.
 /// The control of the `owl2-ql` quarantine cell.

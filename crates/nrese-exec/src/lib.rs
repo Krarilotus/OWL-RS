@@ -15,6 +15,8 @@
 //!   reservations and vectors charged before they grow
 //! - [`cell`]: a value built once per key while those who need it wait (helping with its
 //!   slices), never a Rayon worker waiting on parallel work it may hold
+//! - [`terminal`]: one operation's end, recorded once: the first end wins, and a guard
+//!   dropped before any end (a panic, a cancelled task) records its fallback
 //! - `measure` (tests, and the `measure` feature): holds what an operation allocates
 //!   against what it reserved
 //! - [`memory`]: the process's memory, and a watch for limits on long operations
@@ -42,6 +44,8 @@ pub mod graph;
 pub mod group;
 pub mod heap;
 pub mod join;
+#[cfg(feature = "lifecycle-explorer")]
+pub mod lifecycle_explorer;
 #[cfg(any(test, feature = "measure"))]
 pub mod measure;
 pub mod memory;
@@ -52,6 +56,7 @@ pub mod slices;
 pub mod sort;
 pub mod stop;
 pub mod table;
+pub mod terminal;
 pub mod workers;
 
 pub use budget::{

@@ -1,6 +1,6 @@
 //! Maintenance of a transaction's inferred stack on a commit ([`super::maintain`]).
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::ops::ControlFlow;
 use std::sync::Arc;
 
@@ -294,7 +294,7 @@ pub fn maintain_with(
     memory: &Arc<Budget>,
     uses_rebuilt_report: bool,
 ) -> Result<Maintenance, delta::Interrupted> {
-    // Axioms the state lacks (a store that never rematerialised): added with this commit.
+    // Axioms that need an inferred copy published by this commit.
     let mut missing_axioms: Vec<Triple> = Vec::new();
     // Unnamed classes left out: as the commit leaves them; one it makes consumable
     // needs a rematerialisation for the memberships left out so far.
@@ -360,7 +360,7 @@ pub fn maintain_with(
     let delta_ran: bool;
     let deletes: bool;
     let update = {
-        let base = EngineBase::new(tx, &program.axioms);
+        let mut base = EngineBase::new(tx, &program.axioms);
         // The change's own probes of the base (a deleted fact still asserted elsewhere, a
         // derived one known before) count on the commit's stop, as the update's do.
         let stop: crate::eval::Stop<'_> = &|| operation.fired();
@@ -403,14 +403,25 @@ pub fn maintain_with(
         // A triple deleted from one graph but still asserted in another stays a fact. The
         // first probe that finds `prep` stopped ends the maintenance.
         let mut deleted: Vec<Triple> = Vec::new();
+        let mut republished = BTreeSet::new();
         for fact in tx.deleted().map(triple) {
             let asserted = base.is_asserted(fact, &prep);
             if !asserted.map_err(|Stopped| delta::Interrupted::default())? {
                 deleted.push(fact);
+            } else if program.axioms.binary_search(&fact).is_ok()
+                && !base.contains(fact, &prep).map_err(interrupted)?
+            {
+                republished.insert(fact);
             }
         }
         deleted.sort_unstable();
         deleted.dedup();
+        if !republished.is_empty() {
+            // The asserted copy went away, but the axiom is a premise in both states.
+            // Make it readable during the delta and publish it as inferred.
+            missing_axioms.extend(republished.iter().copied());
+            base.inserts.add_inferred(republished.into_iter().collect());
+        }
         // Facts with an inverse expression as their predicate: the stored closure lacks the
         // base's, so a delta can't read them. Such a change runs its delta, whose consistency
         // check stands, and is then rebuilt: the closure after it is the one a rebuild gives.
