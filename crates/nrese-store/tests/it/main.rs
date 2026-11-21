@@ -25,6 +25,7 @@ mod graph_alias_input_tests;
 mod image_backup_tests;
 mod implicit_prefix_tests;
 mod inferred_access_tests;
+mod literal_equality_status_tests;
 mod mutation_pipeline_tests;
 mod mutation_safety_tests;
 mod ql_assertion_tests;
