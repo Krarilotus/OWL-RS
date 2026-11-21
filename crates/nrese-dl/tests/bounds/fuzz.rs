@@ -6,16 +6,21 @@
 //!   brute force over its elements. Then U1 contains every certain answer, class and role
 //!   atoms alike: an atom U1 lacks is false in this model (PAGOdA, Theorem 5.10's
 //!   argument for str(K)).
-//! - **L ⊆ U1** on the answers, where L has no violation (an inconsistent ontology entails
-//!   everything, and RL then derives every class at an `owl:Nothing` member).
+//! - **L ⊆ U1** on the answers, unless the ontology is shown to have no model (it then
+//!   entails everything): where L has a violation (RL then derives every class at an
+//!   `owl:Nothing` member), or where U1 clashes and the hypertableau proves that this same
+//!   ontology, as read back from its RDF, has no model. A model, an answer it can't give or
+//!   a budget stop leaves the gap a failure; a U1 clash alone excuses nothing.
 //! - **An OWL 2 RL violation means a clash in U1** (L is sound, so the ontology is
 //!   inconsistent, and Theorem 5.5 (i) says U1 derives `⊥s`).
 //!
 //! `NRESE_FUZZ_CASES` and `NRESE_FUZZ_SEED` change the run.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use nrese_dl::bounds::{Bounds, Program};
+use nrese_dl::tableau::{self, Answer, Config};
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
 use nrese_owl::{Axiom, Characteristic, ClassExpr, ExprId, ObjProp, Ontology, Term, Vocabulary};
 
@@ -246,13 +251,18 @@ struct Tally {
     clashes: u64,
     violations: u64,
     too_large: u64,
+    /// L beyond U1 with no L violation, excused: U1 clashes and the case has no model.
+    excused: u64,
 }
+
+/// The fuzz test's seed where `NRESE_FUZZ_SEED` gives none.
+const DEFAULT_SEED: u64 = 0x2026_1003_0322;
 
 #[test]
 fn u1_is_a_model_when_clash_free_and_contains_l() {
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
     let cases = env("NRESE_FUZZ_CASES").unwrap_or(300);
-    let seed = env("NRESE_FUZZ_SEED").unwrap_or(0x2026_1003_0322);
+    let seed = env("NRESE_FUZZ_SEED").unwrap_or(DEFAULT_SEED);
     let mut tally = Tally::default();
     let mut failures = Vec::new();
     let covered = |t: &Tally| t.models * 3 >= t.cases;
@@ -287,9 +297,183 @@ fn facts_a_merge_rewrites_in_the_last_round_are_evaluated() {
     );
 }
 
+/// `NRESE_FUZZ_SEED=26163`, case 142 (a PR gate, 21 November 2026). Its smallest ontology,
+/// `C2 ≡ ∃p1.C1` and `a1 : ∃p1.(C2 ⊓ ⊥)`, has no model. L holds `a1 : C2`, soundly:
+/// `⊥ ⊑ C1` (scm-cls), so `C2 ⊓ ⊥ ⊑ C1` (scm-sco) and `∃p1.(C2 ⊓ ⊥) ⊑ ∃p1.C1` (scm-svf1),
+/// which is `C2`, and `a1` is in it (cax-sco); the rules derive no `owl:Nothing` member, so
+/// L has no violation. U1 gives `a1` a `p1`-successor, a Skolem constant in `C2` and not in
+/// `C1`, and marks `⊥` there by a clash: it lacks `a1 : C2`. An ontology with no model
+/// entails every statement, so L may exceed U1 there.
+#[test]
+fn l_beyond_u1_on_an_ontology_with_no_model_is_no_failure() {
+    let (mut tally, mut failures) = (Tally::default(), Vec::new());
+    check(26163, 142, &mut tally, &mut failures);
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    assert_eq!(tally.clashes, 1, "a case whose U1 clashes: {tally:?}");
+}
+
+/// A U1 clash alone excuses no gap. The case is the first of the fuzz test's default seed
+/// that has a model (the hypertableau finds one), no L violation, a clash-free U1 holding
+/// L, and a fact of L the bounds compare. Given a spurious U1 clash at that fact's subject,
+/// and with the fact taken from U1's, the judgement must report it as L not in U1,
+/// unexcused.
+#[test]
+fn l_beyond_u1_with_a_clash_on_a_case_with_a_model_is_a_failure() {
+    let (case, c, taken) = (0..300)
+        .find_map(|case| {
+            let c = generate(DEFAULT_SEED, case);
+            let lower = || c.lower.facts.clone();
+            let bounds = Bounds::new(&c.program, &c.table, lower(), c.upper.facts.clone());
+            let held = bounds.clashes().is_empty() && bounds.lower_not_in_upper().is_empty();
+            if !held || !c.lower.violations.is_empty() {
+                return None;
+            }
+            // L's facts the bounds compare, as against an empty U1; the first is taken.
+            let compared = Bounds::new(&c.program, &c.table, lower(), []);
+            let taken = *compared.lower_not_in_upper().first()?;
+            (hypertableau(&c.ontology) == Answer::Consistent).then_some((case, c, taken))
+        })
+        .expect(
+            "among the default seed's first 300 cases, one with a model, no L violation, \
+             a clash-free U1 holding L and a fact of L the bounds compare",
+        );
+    let clash = c.program.names.clash;
+    let upper = c
+        .upper
+        .facts
+        .iter()
+        .copied()
+        .filter(|&t| t != taken)
+        .chain([[taken[0], clash, clash]]);
+    let bounds = Bounds::new(&c.program, &c.table, c.lower.facts.clone(), upper);
+    assert_eq!(bounds.clashes(), [taken[0]], "the spurious clash");
+    assert_eq!(bounds.lower_not_in_upper(), [taken], "the gap");
+    let (mut tally, mut failures) = (Tally::default(), Vec::new());
+    l_in_u1(case, &c, &bounds, &mut tally, &mut failures);
+    assert_eq!(tally.excused, 0, "{tally:?}");
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+        failures[0].starts_with(&format!("case {case}: L not in U1: ")),
+        "{}",
+        failures[0]
+    );
+}
+
+/// The hypertableau's answer on `ontology`, bounded as the classification tests bound it
+/// (nodes and branch points; the clock only as a safety net).
+fn hypertableau(ontology: &Ontology) -> Answer {
+    let config = Config {
+        max_nodes: Some(20_000),
+        max_branch_points: Some(100_000),
+        timeout: Some(Duration::from_secs(300)),
+        max_memory: Some(256 << 20),
+        ..Config::default()
+    };
+    tableau::consistency(ontology, &config).answer
+}
+
+/// Whether the hypertableau proves `ontology` has no model. An answer it can't give (a
+/// budget, a part left out) is no proof.
+fn no_model(ontology: &Ontology) -> bool {
+    hypertableau(ontology) == Answer::Inconsistent
+}
+
+/// A fuzzed case, read back from its RDF as the store reads it: the ontology, U1's
+/// program, L and U1.
+struct Case {
+    table: Table,
+    ontology: Ontology,
+    program: Program,
+    lower: support::Closure,
+    upper: support::Closure,
+}
+
 /// The fuzzed case `case` of `seed`: U1 checked as a model, against L and its violations;
 /// what it came to counted in `tally`, what failed pushed to `failures`.
 fn check(seed: u64, case: u64, tally: &mut Tally, failures: &mut Vec<String>) {
+    let c = generate(seed, case);
+    let (table, ontology, program, lower, upper) =
+        (&c.table, &c.ontology, &c.program, &c.lower, &c.upper);
+    let bounds = Bounds::new(program, table, lower.facts.clone(), upper.facts.clone());
+    tally.cases += 1;
+    let render = |a: &Axiom| ontology.functional(a, &|t| table.text(t));
+    l_in_u1(case, &c, &bounds, tally, failures);
+    if !lower.violations.is_empty() {
+        tally.violations += 1;
+        if bounds.clashes().is_empty() {
+            failures.push(format!(
+                "case {case}: L violates {:?} but U1 has no clash",
+                lower.violations
+            ));
+        }
+    }
+    if !bounds.clashes().is_empty() {
+        tally.clashes += 1;
+        return;
+    }
+    if !program.incomplete.is_empty() {
+        failures.push(format!("case {case}: incomplete {:?}", program.incomplete));
+    }
+    // The closure over representatives, with each individual tied to its own.
+    let mut closure = upper.representatives.clone();
+    for &a in &program.signature.individuals {
+        closure.push([a, program.names.same_as, upper.classes.representative(a)]);
+    }
+    let Some(model) = interpretation(program, &closure) else {
+        tally.too_large += 1;
+        return;
+    };
+    tally.models += 1;
+    let broken: Vec<String> = ontology
+        .axioms
+        .iter()
+        .filter(|a| !model.holds(ontology, a))
+        .map(render)
+        .collect();
+    if !broken.is_empty() {
+        let axioms: Vec<String> = ontology
+            .axioms
+            .iter()
+            .filter(|a| !matches!(a, Axiom::Declaration(..)))
+            .map(render)
+            .collect();
+        failures.push(format!(
+            "case {case}: U1 is no model; fails {broken:?}\n  in {axioms:?}"
+        ));
+    }
+}
+
+/// L against U1 on case `case`. L beyond U1 is a failure unless L has a violation, or U1
+/// clashes and the hypertableau finds no model: an ontology with no model entails
+/// everything. A U1 clash alone proves nothing (U1 over-approximates), so a clash on a case
+/// with a model, or one the hypertableau can't decide, excuses nothing.
+fn l_in_u1(case: u64, c: &Case, bounds: &Bounds, tally: &mut Tally, failures: &mut Vec<String>) {
+    let missing = bounds.lower_not_in_upper();
+    if !missing.is_empty() && c.lower.violations.is_empty() {
+        if !bounds.clashes().is_empty() && no_model(&c.ontology) {
+            tally.excused += 1;
+            eprintln!("case {case}: L not in U1, excused: U1 clashes and there is no model");
+        } else {
+            let render = |a: &Axiom| c.ontology.functional(a, &|t| c.table.text(t));
+            failures.push(format!(
+                "case {case}: L not in U1: {:?}\n  in {:?}",
+                missing
+                    .iter()
+                    .map(|t| t.map(|x| c.table.text(x)))
+                    .collect::<Vec<_>>(),
+                c.ontology
+                    .axioms
+                    .iter()
+                    .filter(|a| !matches!(a, Axiom::Declaration(..)))
+                    .map(render)
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
+}
+
+/// The fuzzed case `case` of `seed`.
+fn generate(seed: u64, case: u64) -> Case {
     let mut rng = Rng::new(seed.wrapping_add(case));
     let mut table = Table::default();
     let sizes = Sizes {
@@ -323,67 +507,11 @@ fn check(seed: u64, case: u64, tally: &mut Tally, failures: &mut Vec<String>) {
     let program = support::compile(&mut table, &ontology, &normalised);
     let lower = support::lower(&mut table, &triples);
     let upper = support::upper(&mut table, &program, &triples);
-    let bounds = Bounds::new(&program, &table, lower.facts.clone(), upper.facts.clone());
-    tally.cases += 1;
-    let render = |a: &Axiom| ontology.functional(a, &|t| table.text(t));
-    // An inconsistent ontology (an RL violation) entails everything, so L may exceed U1.
-    let missing = bounds.lower_not_in_upper();
-    if !missing.is_empty() && lower.violations.is_empty() {
-        failures.push(format!(
-            "case {case}: L not in U1: {:?}\n  in {:?}",
-            missing
-                .iter()
-                .map(|t| t.map(|x| table.text(x)))
-                .collect::<Vec<_>>(),
-            ontology
-                .axioms
-                .iter()
-                .filter(|a| !matches!(a, Axiom::Declaration(..)))
-                .map(render)
-                .collect::<Vec<_>>()
-        ));
-    }
-    if !lower.violations.is_empty() {
-        tally.violations += 1;
-        if bounds.clashes().is_empty() {
-            failures.push(format!(
-                "case {case}: L violates {:?} but U1 has no clash",
-                lower.violations
-            ));
-        }
-    }
-    if !bounds.clashes().is_empty() {
-        tally.clashes += 1;
-        return;
-    }
-    if !program.incomplete.is_empty() {
-        failures.push(format!("case {case}: incomplete {:?}", program.incomplete));
-    }
-    // The closure over representatives, with each individual tied to its own.
-    let mut closure = upper.representatives.clone();
-    for &a in &program.signature.individuals {
-        closure.push([a, program.names.same_as, upper.classes.representative(a)]);
-    }
-    let Some(model) = interpretation(&program, &closure) else {
-        tally.too_large += 1;
-        return;
-    };
-    tally.models += 1;
-    let broken: Vec<String> = ontology
-        .axioms
-        .iter()
-        .filter(|a| !model.holds(&ontology, a))
-        .map(render)
-        .collect();
-    if !broken.is_empty() {
-        let axioms: Vec<String> = ontology
-            .axioms
-            .iter()
-            .filter(|a| !matches!(a, Axiom::Declaration(..)))
-            .map(render)
-            .collect();
-        failures.push(format!(
-            "case {case}: U1 is no model; fails {broken:?}\n  in {axioms:?}"
-        ));
+    Case {
+        table,
+        ontology,
+        program,
+        lower,
+        upper,
     }
 }
