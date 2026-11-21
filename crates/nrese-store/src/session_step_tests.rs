@@ -1938,7 +1938,54 @@ fn explorer_rejects_published_failure() {
 // Spec §2b Pw3/P16: a dropped handler cannot let an older scratch overwrite an acknowledged write.
 #[test]
 fn explorer_rejects_lost_second_write() {
-    // With pre-claim cancellation checked by I10, the shortest witness is a stuck read.
+    type EarlyRelease = Sessions<2, EARLY_RELEASE, EARLY_RELEASE>;
+    type Real = Sessions<2, GOOD, EARLY_RELEASE>;
+    let mut slipped = EarlyRelease::start();
+    let mut real = Real::start();
+    for action in [
+        Move::Lookup(1, Op::Write),
+        Move::SessionLock(1),
+        Move::Claim(1, 0),
+        Move::DropTaskRequest(1, 0),
+        Move::Lookup(1, Op::Write),
+    ] {
+        slipped = EarlyRelease::apply(&slipped, &action);
+        real = Real::apply(&real, &action);
+    }
+
+    // The prematurely released guard lets the second write finish first.
+    for action in [
+        Move::SessionLock(1),
+        Move::Swap(1, 1),
+        Move::DropGuard(1, 1, End::Committed),
+        Move::TaskReady(1, 1),
+    ] {
+        slipped = EarlyRelease::apply(&slipped, &action);
+    }
+    assert_eq!(slipped.clients[1].acknowledged, 0b10);
+    assert_eq!(slipped.violation, None);
+    slipped = EarlyRelease::apply(&slipped, &Move::Swap(1, 0));
+    assert_eq!(slipped.violation, Some(Invariant::I4));
+    assert_eq!(slipped.store.transactions[1].pending, 0b01);
+    eprintln!("early release: the old scratch overwrites the acknowledged write (I4)");
+
+    // The real guard makes the second write start from the first write's result.
+    for action in [
+        Move::Swap(1, 0),
+        Move::DropGuard(1, 0, End::Committed),
+        Move::SessionLock(1),
+        Move::Swap(1, 0),
+        Move::DropGuard(1, 0, End::Committed),
+        Move::TaskReady(1, 0),
+    ] {
+        real = Real::apply(&real, &action);
+    }
+    assert_eq!(real.clients[1].acknowledged, 0b10);
+    assert_eq!(real.store.transactions[1].pending, 0b11);
+    assert_eq!(real.violation, None);
+    eprintln!("real guard: serialized writes retain the acknowledged write");
+
+    // An unguarded failure clears the pin while leaving P, so the shortest trace stalls at P5.
     red::<EARLY_RELEASE>("server drain has no enabled move");
 }
 
