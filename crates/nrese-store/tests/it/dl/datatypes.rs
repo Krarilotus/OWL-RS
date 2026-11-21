@@ -324,6 +324,7 @@ fn an_ill_typed_literal_of_the_maps_datatypes_is_told_as_the_rules_tell_it() {
 fn a_literal_of_the_ontologys_own_datatype_is_kept_as_written() {
     const OWN: &str = r#":a :born "x"^^:T ."#;
     let functional = ":born a owl:FunctionalProperty .";
+    let equated = [DATA, functional, r#":a :born "x"^^:T , "y"^^:T ."#];
     let cells: Vec<(&str, Vec<&str>, &[&str])> = vec![
         (
             "a literal of the ontology's own datatype",
@@ -332,7 +333,7 @@ fn a_literal_of_the_ontologys_own_datatype_is_kept_as_written() {
         ),
         (
             "two literals of the ontology's own datatype under a functional property",
-            vec![DATA, functional, r#":a :born "x"^^:T , "y"^^:T ."#],
+            equated.to_vec(),
             RULES_EQUATED,
         ),
         (
@@ -346,6 +347,15 @@ fn a_literal_of_the_ontologys_own_datatype_is_kept_as_written() {
             .into_iter()
             .map(|(name, parts, want)| (name, told_after(name, &parts), want))
             .collect(),
+    );
+    // The equated cell's read is withheld for the literal equality, not some other reason.
+    let dl = pipeline();
+    insert(&dl, &equated.join(" ")).expect("the equated cell's commit");
+    let (_, read) = query(&dl, "SELECT ?s ?v { ?s :born ?v }");
+    assert!(
+        (read.reasons().iter()).any(|r| r.contains("an owl:sameAs between literals")),
+        "the equated cell's read isn't withheld for the literal equality: {:?}",
+        read.reasons()
     );
 }
 
