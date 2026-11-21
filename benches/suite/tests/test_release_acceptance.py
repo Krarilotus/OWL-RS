@@ -452,10 +452,12 @@ class KitOutcomes(Scratch):
         self.assertIn("nrese-owl:w3c_owl2: its log isn't the one its launch recorded", again.stdout)
 
     def test_a_suite_s_counts_come_from_its_own_kit_s_log(self):
-        # Spec: the design's attack 8: the RL counts printed by another kit's log don't stand for the RL kit.
-        done, result = self.run_kits({"w3c_owl2_rl": self.OK, "w3c_owl2": self.RL_OK, "w3c_n3_reasoner": self.N3_OK})
+        # Spec: the design's attack 8: the RL counts printed by another kit's log (whose own counts are
+        # whole) don't stand for the RL kit: RL alone has no counts.
+        borrowed = f"printf '%s' '{RL_LOG}{OWL_LOG}'; exit 0"
+        done, result = self.run_kits({"w3c_owl2_rl": self.OK, "w3c_owl2": borrowed, "w3c_n3_reasoner": self.N3_OK})
         self.assertEqual(done.returncode, 1, done.stdout + done.stderr)
-        self.assertIn("OWL 2 RL", " ".join(result["errors"]))
+        self.assertEqual(result["errors"], ["OWL 2 RL: no counts (its kit didn't run, or its data was missing)"])
 
     def local(self, checkout: Path, *extra: str) -> subprocess.CompletedProcess:
         expected = self.tmp / "w3c-expected.toml"
@@ -472,22 +474,31 @@ class KitOutcomes(Scratch):
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("not a verdict", done.stdout)
         self.assertEqual(sorted(p.name for p in (self.tmp / "out-w3c").iterdir()),
-                         ["w3c_n3_reasoner.log", "w3c_owl2.log", "w3c_owl2_rl.log"])
+                         ["local-check.txt", "w3c_n3_reasoner.log", "w3c_owl2.log", "w3c_owl2_rl.log"])
         self.assertFalse((self.tmp / "w3c.json").exists())
-        # One kit, by name: only its suites are checked.
-        shutil.rmtree(self.tmp / "out-w3c")
+        # The gate never reads a local check's directory, as a re-check or a run.
+        self.assertEqual(self.w3c(self.tmp / "out-w3c").returncode, 2)
+        # One kit, by name, in the directory the local check marked: only its suites are checked.
         done = self.local(checkout, "--kits", "nrese-store:w3c_owl2_rl")
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertEqual([p.name for p in (self.tmp / "out-w3c").iterdir()], ["w3c_owl2_rl.log"])
+        self.assertNotIn("OWL 2 profiles", done.stdout)
         self.assertEqual(self.local(checkout, "--kits", "nrese-store:w3c_owl2_qq").returncode, 2)
-        # A gate's flags are refused before the gate's earlier result or receipt is touched, and a gate's
-        # log directory (its receipt) is never a local check's: a re-check there would read its tables.
+        # A gate's flags, even empty, are refused before the gate's earlier result or receipt is touched.
         receipt, result = self.tmp / "out-w3c" / "receipt.json", self.tmp / "w3c.json"
-        receipt.write_text("{}", encoding="utf-8")
         result.write_text("{}", encoding="utf-8")
-        for flags in (("--json", str(result)), ("--run",), ()):
+        receipt.write_text("{}", encoding="utf-8")
+        for flags in (("--json", str(result)), ("--run",), ("--identity=",), ("--attempt=",), ()):
             self.assertEqual(self.local(checkout, *flags).returncode, 2, flags)
             self.assertTrue(receipt.exists() and result.exists(), flags)
+        # A gate's directory, done or running (a run removes its receipt first), is never a local check's.
+        gate_logs = self.tmp / "gate-w3c"
+        gate_logs.mkdir()
+        (gate_logs / "w3c_owl2_rl.log").write_text(RL_LOG, encoding="utf-8")
+        done = subprocess.run([sys.executable, str(GATE), "w3c", str(gate_logs), "--expected",
+                               str(self.tmp / "w3c-expected.toml"), "--local"], cwd=checkout, capture_output=True,
+                              text=True, timeout=120, env=isolation.inherit("NRESE_", "FLEET_", "CARGO_"))
+        self.assertEqual(done.returncode, 2, done.stdout + done.stderr)
+        self.assertEqual([p.name for p in gate_logs.iterdir()], ["w3c_owl2_rl.log"])
 
     def test_the_local_check_fails_a_count_or_a_kit_as_the_gate_does(self):
         # Spec: RL passes fewer than stated, w3c_owl2 doesn't compile: exit 1, both named.

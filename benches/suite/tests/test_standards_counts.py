@@ -74,14 +74,15 @@ def row_errors(row: str, suite: str, suites: tuple[str, ...], expected: dict) ->
     words = set(suite.split()) - {w for s in others for w in s.split()}
     stops = {expected[s].get(key) for s in expected if s != suite and names(row, s) for key in KEYS} - {None, 0}
     want = expected.get(suite, {})
+    tests = row.split("|")[1:-1][-1]  # the counts stand in the tests column, never in the standard's name
     stated = [key for key in KEYS if want.get(key)]
     errors = [] if stated else [f"{suite}: the gate states no count for its row ({', '.join(KEYS)})"]
     for key in stated:
         count = want[key]
         if others and not stands_before(row, count, words, stops):
             errors.append(f"{suite}: the gate requires {key} = {count}, before one of {sorted(words)}")
-        elif not others and count not in numbers(row):
-            errors.append(f"{suite}: the gate requires {key} = {count}; its row says {sorted(numbers(row))}")
+        elif not others and count not in numbers(tests):
+            errors.append(f"{suite}: the gate requires {key} = {count}; its tests column says {sorted(numbers(tests))}")
     return errors
 
 
@@ -144,6 +145,15 @@ class StandardsTable(unittest.TestCase):
                  "295 in the OWL 2 profiles check |")
         self.assertEqual(row_errors(row, "OWL 2 RDF/XML round trip", suites, expected), [])
         self.assertEqual(len(row_errors(moved, "OWL 2 RDF/XML round trip", suites, expected)), 1)
+
+    def test_a_count_is_read_from_the_tests_column_only(self):
+        # Spec: S7's second witness: `2 skipped` deleted from the OWL 2 QL row must fail, though the
+        # standard's name holds a 2.
+        expected = {"OWL 2 QL": {"passed": 51, "known": 9, "skipped": 2}}
+        row = "| [OWL 2 QL](x) | Rules | 51 W3C test cases, 9 known failures, and 2 skipped |"
+        cut = "| [OWL 2 QL](x) | Rules | 51 W3C test cases, 9 known failures |"
+        self.assertEqual(row_errors(row, "OWL 2 QL", ("OWL 2 QL",), expected), [])
+        self.assertEqual(len(row_errors(cut, "OWL 2 QL", ("OWL 2 QL",), expected)), 1)
 
     def test_a_suite_with_no_stated_count_is_no_check(self):
         row = "| SPARQL 1.1 | x | 531 tests |"

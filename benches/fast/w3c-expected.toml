@@ -8,7 +8,8 @@
 # Per suite at least `passed` (or `checked`, for a runner that counts what it checked, its listed
 # failures among them), no failure beyond `failed` (0), at most the known `skipped` and `disputed`,
 # and exactly `known` listed failures (the runner's expected-failures list; 0 when not given): a list
-# that grows or shrinks changes `known` here in the same commit. A suite without counts (its data
+# that grows or shrinks changes `known` here in the same commit. A suite its runner reports per
+# manifest also states how many manifests (`groups`): a line missing fails. A suite without counts (its data
 # missing, its kit not run) fails. The numbers are the v2 merge gate's
 # (docs/plan/2026-10-05-v2-merge-checklist.md §4: no wrong answers), as measured on the shared host
 # on 14 Oct 2026 (v15-gate-w3c-3, v15-gate-w3c-dl); the kits after OWL 2 DL as measured on 21 Nov 2026
@@ -111,13 +112,16 @@ skipped = 2
 
 [suite."RDF 1.1 syntax"]
 passed = 993
+groups = 5
 
 [suite."RDF 1.2 syntax"]
 passed = 351
+groups = 9
 
 # JSON-LD 1.1 (toRdf, expand, fromRdf): 22 not run (JSON-LD 1.0-only tests and generalized RDF).
 [suite."JSON-LD 1.1"]
 passed = 884
+groups = 3
 skipped = 22
 
 [suite."RDFC-1.0"]
@@ -126,8 +130,10 @@ passed = 86
 # N3 parser: 1 listed failure (crates/rdf/nrese-rdf-io/tests/w3c_n3/expected-failures.txt).
 [suite."N3 parser"]
 passed = 1084
+groups = 2
 known = 1
 
 # SPARQL 1.0, 1.1 and 1.2 syntax tests, one per query file and kind.
 [suite."SPARQL syntax"]
 passed = 1318
+groups = 10

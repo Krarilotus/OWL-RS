@@ -1368,8 +1368,10 @@ def load_w3c_expected(text: str) -> tuple[dict, list[Kit], list[str]]:
         kits.append(Kit(name, tuple(names), entry.get("table")))
     errors += [f"{suite}: no kit reports it" for suite in suites if suite not in owners]
     errors += [f"{suite}: {owners[suite]}'s, with no expectation" for suite in owners if suite not in suites]
-    errors += [f"{suite}: no passed or checked count" for suite, want in suites.items()
-               if "passed" not in want and "checked" not in want]
+    # A floor of 0 would pass a run that read nothing (`0 of 0 passed`).
+    errors += [f"{suite}: no passed or checked count above 0" for suite, want in suites.items()
+               if not (isinstance(want.get("passed", want.get("checked")), int)
+                       and want.get("passed", want.get("checked")) > 0)]
     if not kits:
         errors.append("no kit declared")
     return suites, kits, errors
@@ -1396,9 +1398,10 @@ def kit_counts(logs: Path, kits: list[Kit]) -> dict[str, dict]:
 def log_counts(text: str) -> dict[str, dict]:
     """The suites' counts one kit's log reports, and its libtest summaries' sums ("test results").
     `known` is a runner's listed failures (its expected-failures list), counted apart from `failed`;
-    a runner that reports per manifest is summed under its suite. A suite whose summary contradicts
-    itself (a part larger than its whole) or names one manifest twice is `unreadable`, which
-    w3c_check fails; a manifest line missing leaves the sum short of its stated count."""
+    a runner that reports per manifest is summed under its suite, with how many manifests (`groups`).
+    Each pattern takes a whole line. A suite whose summary contradicts itself (a part larger than its
+    whole, parts that don't add up) or names one manifest twice is `unreadable`, which w3c_check
+    fails; a manifest line missing leaves `groups` short of its stated number."""
     out: dict[str, dict] = {}
     title, section, seen = None, None, set()
 
@@ -1411,25 +1414,27 @@ def log_counts(text: str) -> dict[str, dict]:
             out[suite] = {"unreadable": why}
             return
         seen.add((suite, group))
+        if group not in ("summary", "total"):
+            got = {**got, "groups": 1}
         for key, n in got.items():
             out.setdefault(suite, {})[key] = out.get(suite, {}).get(key, 0) + n
 
     for raw in text.splitlines():
         # A test run serially (RUST_TEST_THREADS=1) prints `test NAME ... ` before its first output line.
         line = re.sub(r"^test \S+ \.\.\. ", "", raw)
-        if m := re.match(r"W3C (.+) on engine v2: passed / failed / skipped", line):
+        if m := re.match(r"W3C (.+) on engine v2: passed / failed / skipped(?: \(.*\))?$", line):
             title = m.group(1)
-        elif (m := re.match(r"\s+total: (\d+) / (\d+) / (\d+)", line)) and title:
+        elif (m := re.match(r"\s+total: (\d+) / (\d+) / (\d+) \(\d+\)$", line)) and title:
             put(title, "total", passed=int(m[1]), failed=int(m[2]), skipped=int(m[3]))
             title = None
-        elif m := re.match(r"(W3C SHACL[^:]*): (\d+) of (\d+) pass", line):
+        elif m := re.match(r"(W3C SHACL[^:]*): (\d+) of (\d+) pass$", line):
             put(m[1].removeprefix("W3C "), "summary", passed=int(m[2]), failed=int(m[3]) - int(m[2]), skipped=0)
-        elif m := re.match(r"W3C (OWL 2 (?:RL|QL))[^:]*: (\d+) passed, (\d+) failed \((\d+) expected\), (\d+) skipped",
-                           line):
+        elif m := re.match(r"W3C (OWL 2 (?:RL|QL))[^:]*: (\d+) passed, (\d+) failed \((\d+) expected\), (\d+) skipped"
+                           r"(?:; .*)?$", line):
             put(m[1], "summary", passed=int(m[2]), failed=int(m[3]) - int(m[4]), known=int(m[4]), skipped=int(m[5]))
         elif m := re.match(r"W3C RDFC-1\.0: (\d+) of (\d+) passed$", line):
             put("RDFC-1.0", "summary", passed=int(m[1]), failed=int(m[2]) - int(m[1]))
-        elif m := re.match(r"N3 reasoner tests: (\d+) in scope, (\d+) passed; (\d+) out of scope:", line):
+        elif m := re.match(r"N3 reasoner tests: (\d+) in scope, (\d+) passed; (\d+) out of scope:$", line):
             put("N3 reasoner", "summary", passed=int(m[2]), failed=int(m[1]) - int(m[2]), skipped=int(m[3]))
         # The runner fails on any failure its list doesn't name, so what it counts as failed is listed.
         elif m := re.match(r"(sparql1\d (?:Positive|Negative)(?:Query|Update)): (\d+)/(\d+)$", line):
@@ -1438,7 +1443,7 @@ def log_counts(text: str) -> dict[str, dict]:
             put("OWL 2 RDF/XML round trip", "summary", checked=int(m[1]))
         elif m := re.match(r"(\d+) test cases compared$", line):
             put("OWL 2 profiles", "summary", checked=int(m[1]))
-        elif m := re.match(r"(\d+) ontologies in both syntaxes compared", line):
+        elif m := re.match(r"(\d+) ontologies in both syntaxes compared, \d+ axioms$", line):
             put("OWL 2 functional syntax", "summary", checked=int(m[1]))
         elif re.match(r"W3C RDF syntax suites: passed / failed$", line):
             section = "rdf"
@@ -1454,9 +1459,12 @@ def log_counts(text: str) -> dict[str, dict]:
         elif section == "n3" and (m := re.match(r"  (\S+\.ttl): (\d+) / (\d+) \((\d+)\)$", line)):
             put("N3 parser", m[1], passed=int(m[2]), failed=int(m[3]) - int(m[4]), known=int(m[4]))
         elif m := re.match(r"GeoSPARQL compliance benchmark: (\d+) of (\d+) queries match the reference, "
-                           r"(\d+) don't \((\d+) disputed\)", line):
-            put("GeoSPARQL", "summary", passed=int(m[1]), failed=int(m[3]) - int(m[4]), disputed=int(m[4]))
-        elif m := re.match(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed", line):
+                           r"(\d+) don't \((\d+) disputed\)$", line):
+            if int(m[1]) + int(m[3]) != int(m[2]):  # those that match and those that don't are every query
+                out["GeoSPARQL"] = {"unreadable": "summary: the parts don't add up to the whole"}
+            else:
+                put("GeoSPARQL", "summary", passed=int(m[1]), failed=int(m[3]) - int(m[4]), disputed=int(m[4]))
+        elif m := re.match(r"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed;", line):
             out.setdefault("test results", {"passed": 0, "failed": 0})
             out["test results"]["passed"] += int(m[2])
             out["test results"]["failed"] += int(m[3])
@@ -1494,6 +1502,8 @@ def w3c_check(counts: dict, expected: dict) -> list[str]:
         for key in ("skipped", "disputed", "open"):
             if got.get(key, 0) > want.get(key, 0):
                 errors.append(f"{suite}: {got[key]} {key}, at most {want.get(key, 0)} known")
+        if "groups" in want and got.get("groups", 0) != want["groups"]:
+            errors.append(f"{suite}: {got.get('groups', 0)} manifests reported, {want['groups']} stated")
         if got.get("known", 0) != want.get("known", 0):
             errors.append(f"{suite}: {got.get('known', 0)} listed failures, {want.get('known', 0)} stated "
                           "(w3c-expected.toml changes with the list)")
@@ -1729,6 +1739,10 @@ def publish(path: Path, data: dict) -> None:
 def run_w3c(logs: Path, kits: list[Kit], identity: str, attempt: str) -> CheckReceipt:
     """launch_kits(), with the receipt that binds the outcomes to this checkout's tree and build."""
     return checkout_receipt("w3c", identity, attempt, launch_kits(logs, kits))
+
+
+# The file a local W3C check (`w3c --local`) leaves in its directory, which the gate refuses.
+LOCAL_MARK = "local-check.txt"
 
 
 def launch_kits(logs: Path, kits: list[Kit]) -> list[Outcome]:
@@ -3633,9 +3647,13 @@ def main() -> int:
         print(f"{out}: {sum(len(d) for d in floor['cases'].values())} dimensions of {len(floor['cases'])} cases, "
               f"{floor['blocks']} blocks")
         return 0
-    if args.command == "w3c" and args.local and (args.run or args.json or args.identity or args.attempt):
+    if args.command == "w3c" and args.local and (args.run or any(v is not None for v in
+                                                                 (args.json, args.identity, args.attempt))):
         # Before anything below removes a gate's earlier result: a local check touches none.
         p.error("w3c --local: LOGDIR for the kits' logs, without --run, --identity, --attempt or --json")
+    if args.command == "w3c" and not args.local and args.logs and (args.logs / LOCAL_MARK).exists():
+        # A local check's directory is never a gate's: its logs and tables were never receipted.
+        p.error(f"w3c: {args.logs} is a local check's directory ({LOCAL_MARK}); the gate uses its own")
     if args.command in ("w3c", "guards") and args.run:
         # A run's earlier result (and the W3C receipt) goes before anything that can fail, its setup
         # included: a run stopped at any point leaves none, never one that speaks for what it didn't run.
@@ -3667,9 +3685,14 @@ def main() -> int:
             # file, so nothing the gate's verdict could ever read.
             if args.logs is None:
                 p.error("w3c --local: LOGDIR for the kits' logs")
-            # Never a gate's logs: a re-check there would read the tables this run writes beside them.
-            if (args.logs / "receipt.json").exists():
-                p.error(f"w3c --local: {args.logs} holds a gate run's receipt; give a directory of its own")
+            # Never a gate's logs, done or running (a run removes its receipt first): a re-check there would
+            # read the tables this run writes. A local check's directory is new, empty, or one it marked.
+            if (args.logs / "receipt.json").exists() or (
+                    args.logs.is_dir() and any(args.logs.iterdir()) and not (args.logs / LOCAL_MARK).exists()):
+                p.error(f"w3c --local: {args.logs} holds files no local check wrote; give a new or empty directory")
+            args.logs.mkdir(parents=True, exist_ok=True)
+            (args.logs / LOCAL_MARK).write_text("Written by release_gate.py w3c --local: not a verdict; the gate "
+                                                "refuses this directory.\n", encoding="utf-8")
             names = args.kits.split(",") if args.kits else [kit.name for kit in kits]
             if unknown := sorted(set(names) - {kit.name for kit in kits}):
                 p.error(f"w3c --local --kits: {', '.join(unknown)} not declared in {args.expected}")

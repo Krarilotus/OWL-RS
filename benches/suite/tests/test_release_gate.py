@@ -1940,13 +1940,13 @@ class Parts(unittest.TestCase):
         ])
         counts = gate_module.log_counts(log)
         self.assertEqual(counts["OWL 2 QL"], {"passed": 120, "failed": 0, "known": 9, "skipped": 4})
-        self.assertEqual(counts["RDF 1.1 syntax"], {"passed": 450, "known": 1})
-        self.assertEqual(counts["RDF 1.2 syntax"], {"passed": 80, "known": 0})
-        self.assertEqual(counts["JSON-LD 1.1"], {"passed": 750, "failed": 0, "skipped": 70})
+        self.assertEqual(counts["RDF 1.1 syntax"], {"passed": 450, "known": 1, "groups": 2})
+        self.assertEqual(counts["RDF 1.2 syntax"], {"passed": 80, "known": 0, "groups": 1})
+        self.assertEqual(counts["JSON-LD 1.1"], {"passed": 750, "failed": 0, "skipped": 70, "groups": 2})
         self.assertEqual(counts["RDFC-1.0"], {"passed": 82, "failed": 0})
-        self.assertEqual(counts["N3 parser"], {"passed": 500, "failed": 0, "known": 1})
+        self.assertEqual(counts["N3 parser"], {"passed": 500, "failed": 0, "known": 1, "groups": 2})
         self.assertEqual(counts["N3 reasoner"], {"passed": 90, "failed": 0, "skipped": 30})
-        self.assertEqual(counts["SPARQL syntax"], {"passed": 340, "known": 1})
+        self.assertEqual(counts["SPARQL syntax"], {"passed": 340, "known": 1, "groups": 2})
         self.assertEqual(counts["OWL 2 RDF/XML round trip"], {"checked": 400})
         self.assertEqual(counts["OWL 2 profiles"], {"checked": 280})
         self.assertEqual(counts["OWL 2 functional syntax"], {"checked": 75})
@@ -1988,9 +1988,27 @@ class Parts(unittest.TestCase):
         counts["OWL 2 profiles"]["checked"] = 279
         self.assertEqual(gate_module.w3c_check(counts, expected),
                          ["OWL 2 profiles: 279 checked, at least 280 required"])
-        # A suite that states neither a pass nor a check count is refused when the file is read.
-        _, _, bad = gate_module.load_w3c_expected('[kit."a:b"]\nsuites = ["S"]\n[suite."S"]\nskipped = 1\n')
-        self.assertEqual(bad, ["S: no passed or checked count"])
+        # A suite that states neither a pass nor a check count above 0 is refused when the file is read:
+        # `0 of 0 passed` would meet it.
+        for counts in ("skipped = 1", "passed = 0", "checked = 0"):
+            _, _, bad = gate_module.load_w3c_expected(f'[kit."a:b"]\nsuites = ["S"]\n[suite."S"]\n{counts}\n')
+            self.assertEqual(bad, ["S: no passed or checked count above 0"], counts)
+
+    def test_a_summary_is_read_whole_and_every_manifest_is_reported(self):
+        """Each summary pattern takes the whole line (a trailing `0bad` is no count), a suite reported per
+        manifest is held to its stated number of manifests, and GeoSPARQL's parts add up to its whole."""
+        garbled = gate_module.log_counts("W3C SPARQL 1.1 on engine v2: passed / failed / skipped\n"
+                                         "  total: 531 / 0 / 0bad (0)\n")
+        self.assertNotIn("SPARQL 1.1", garbled)
+        one_missing = gate_module.log_counts("W3C JSON-LD 1.1 suites: passed / failed / not run\n"
+                                             "  toRdf-manifest.jsonld: 900 / 0 / 12\n"
+                                             "  expand-manifest.jsonld: 376 / 0 / 9\n")
+        self.assertEqual(gate_module.w3c_check(one_missing, {"JSON-LD 1.1": {"passed": 884, "groups": 3,
+                                                                             "skipped": 22}}),
+                         ["JSON-LD 1.1: 2 manifests reported, 3 stated"])
+        geo = gate_module.log_counts("GeoSPARQL compliance benchmark: 194 of 193 queries match the reference, "
+                                     "18 don't (18 disputed)\n")
+        self.assertIn("unreadable", geo["GeoSPARQL"])
 
     def test_the_jobs_run_the_whole_gate_in_blocks_asking_by_capability_one_set(self):
         """The gate asks by capability, never a host, and goes as one set.
