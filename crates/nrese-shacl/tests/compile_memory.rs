@@ -502,3 +502,87 @@ fn a_refused_message_holds_less_than_its_language_tag() {
     );
     assert!(bytes < 1 << 20, "held {bytes} bytes");
 }
+
+/// A change's validation looks a filled message up in the state after's dictionary (its
+/// frontier), there a transaction's overlay on a compressed base: the worst case the
+/// lookup's charge must cover. A 1 MiB message that neither state stores, the same before
+/// and after the change, is looked up in both validations. What they hold beyond their
+/// charge stays under half the message, so a lookup charged less than it allocates (its key
+/// alone is the message's length) fails here.
+#[test]
+fn a_message_looked_up_through_the_frontier_holds_no_more_than_its_charge() {
+    if !measure::alone() {
+        return;
+    }
+    /// The test's own data directory, removed when the test ends, also by a panic.
+    struct Dir(std::path::PathBuf);
+    impl Drop for Dir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let dir = Dir(std::env::temp_dir().join(format!(
+        "nrese-shacl-frontier-measure-{}",
+        std::process::id()
+    )));
+    std::fs::create_dir_all(&dir.0).expect("the test's directory");
+    nrese_engine::set_vocabulary_encoding(nrese_engine::VocabularyEncoding::Fsst);
+    let config = EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    };
+    let engine = Engine::open(&dir.0, config).expect("engine");
+    let shapes = format!(
+        "@prefix ex: <http://example.com/> . @prefix sh: <http://www.w3.org/ns/shacl#> .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ; sh:sparql [ sh:message \"{}{{?x}}\" ;
+           sh:select \"SELECT $this ?x WHERE {{ $this <http://example.com/p> ?x }}\" ] .",
+        "m".repeat(1 << 20)
+    );
+    let insert = |tx: &mut nrese_engine::Transaction<'_>, turtle: &str, graph: GraphNameRef<'_>| {
+        for quad in RdfParser::from_format(RdfFormat::Turtle).for_slice(turtle.as_bytes()) {
+            let quad = quad.expect("turtle");
+            tx.insert(QuadRef::new(
+                &quad.subject,
+                &quad.predicate,
+                &quad.object,
+                graph,
+            ));
+        }
+    };
+    let shapes_graph = GraphNameRef::from(NamedNodeRef::new_unchecked(SHAPES));
+    let data_turtle = |turtle: &str| format!("@prefix ex: <http://example.com/> . {turtle}");
+    let mut tx = engine.transaction();
+    insert(&mut tx, &shapes, shapes_graph);
+    insert(
+        &mut tx,
+        &data_turtle("ex:a ex:p \"v\" ."),
+        GraphNameRef::DefaultGraph,
+    );
+    tx.commit().expect("commit");
+    // The dictionary's base, compressed from here on.
+    engine.checkpoint().expect("checkpoint");
+    let before = engine.snapshot();
+    let graph = before
+        .lookup(NamedNodeRef::new_unchecked(SHAPES).into())
+        .expect("the shapes graph");
+    let shapes =
+        compile(&before, Selection::asserted(GraphSelector::Exact(graph))).expect("shapes");
+    // A change of the focus node that keeps its result, and so its message.
+    let mut tx = engine.transaction();
+    insert(
+        &mut tx,
+        &data_turtle("ex:a ex:q \"w\" ."),
+        GraphNameRef::DefaultGraph,
+    );
+    let changed: Vec<_> = tx.inserted().collect();
+    let after = tx.pending_snapshot();
+    let data = Selection::of(GraphSelector::Exact(nrese_engine::TermId::DEFAULT_GRAPH));
+    let resources = nrese_sparql::Resources::default();
+    let (outcome, excess) = measure::measure_within(&resources.memory, || {
+        nrese_shacl::validate_changes(&before, &after, &shapes, data, &changed, &resources)
+            .map(|report| report.results.len())
+    });
+    eprintln!("a change's validation held at most {excess} bytes beyond its charge: {outcome:?}");
+    assert!(matches!(outcome, Ok(0)), "{outcome:?}");
+    assert!(excess < 512 << 10, "held {excess} bytes beyond its charge");
+}
