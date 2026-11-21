@@ -504,4 +504,95 @@ fn a_restored_save_point_leaves_the_context_as_it_was() {
         before,
         "[kept bytes, computed terms, remembered numbers, budget used]"
     );
+    // What stays allocated is what the charge of the terms kept covers: two slots of the
+    // list and two of the map per term ([`computed_bytes`]), a hash table's capacity
+    // rounded up to a power of two.
+    let (terms, ids) = (ctx.computed.borrow(), ctx.computed_ids.borrow());
+    assert!(
+        terms.capacity() <= 2 * terms.len() && ids.capacity() <= 4 * ids.len() + 7,
+        "{} terms in a list of {} and a map of {}",
+        terms.len(),
+        terms.capacity(),
+        ids.capacity()
+    );
+}
+
+/// A triple term new to the store: `<urn:s> <urn:p> object`.
+fn triple(object: Term) -> Term {
+    nrese_rdf::Triple::new(
+        nrese_rdf::NamedNode::new_unchecked("urn:s"),
+        nrese_rdf::NamedNode::new_unchecked("urn:p"),
+        object,
+    )
+    .into()
+}
+
+/// Spec: a restore lets go of the aliases of the terms it lets go, with their charge
+/// ([`Context::save`]). A substituted triple term's alias is named by its id; an id made
+/// again after the restore, under the same alias, stands for its new term in expressions.
+#[test]
+fn a_restore_lets_go_of_the_aliases_of_the_terms_it_lets_go() {
+    let snapshot = snapshot();
+    let options = options(None);
+    let ctx = Context::new(&snapshot, &options, None, None);
+    let named = |iri: &str| -> Term { nrese_rdf::NamedNode::new_unchecked(iri).into() };
+    let alias_of = |alias: &nrese_rdf::NamedNode| {
+        ctx.evaluator
+            .eval(&Expression::NamedNode(alias.clone()), &|_| None)
+    };
+    let before = (counters(&ctx), ctx.aliases.borrow().clone());
+    let point = ctx.save();
+    let id = ctx.id(&triple(named("urn:attempt"))).ok().unwrap();
+    let alias = internal::class_constant(id);
+    ctx.register_alias(alias.as_str(), id);
+    assert_eq!(alias_of(&alias), Some(triple(named("urn:attempt"))));
+    ctx.restore(point);
+    assert_eq!(alias_of(&alias), None, "the alias after the restore");
+    assert_eq!(
+        (counters(&ctx), ctx.aliases.borrow().clone()),
+        before,
+        "[kept bytes, computed terms, remembered numbers, budget used], aliases"
+    );
+    let again = ctx.id(&triple(named("urn:retry"))).ok().unwrap();
+    assert_eq!(again, id, "the witness needs the id made again");
+    ctx.register_alias(alias.as_str(), again);
+    assert_eq!(alias_of(&alias), Some(triple(named("urn:retry"))));
+}
+
+/// Spec: an alias refused since a save point is let go with it: the query is no longer
+/// refused for it after a restore ([`Context::check`]). The triple is stored, so its alias
+/// alone is charged: its copied payload, more than the limit.
+#[test]
+fn a_restore_lets_go_of_an_alias_refused_since_the_point() {
+    let payload = "x".repeat(65_536);
+    let term = triple(Literal::from(payload.as_str()).into());
+    let engine = Engine::new(EngineConfig {
+        background_maintenance: false,
+        ..EngineConfig::default()
+    })
+    .unwrap();
+    let mut tx = engine.transaction();
+    let subject = nrese_rdf::NamedNode::new_unchecked("urn:r");
+    let predicate = nrese_rdf::NamedNode::new_unchecked("urn:p");
+    tx.insert(
+        nrese_rdf::Quad::new(
+            subject,
+            predicate,
+            term.clone(),
+            nrese_rdf::GraphName::DefaultGraph,
+        )
+        .as_ref(),
+    );
+    tx.commit().unwrap();
+    let snapshot = engine.snapshot();
+    let options = options(Some(payload.len() - 1));
+    let ctx = Context::new(&snapshot, &options, None, None);
+    assert!(ctx.check().is_ok(), "the reader fits before the alias");
+    let point = ctx.save();
+    let id = ctx.id(&term).ok().unwrap();
+    assert_eq!(computed_index(id), None, "a stored term");
+    ctx.register_alias(internal::class_constant(id).as_str(), id);
+    assert!(ctx.check().is_err(), "the alias does not fit");
+    ctx.restore(point);
+    assert!(ctx.check().is_ok(), "refused within the point only");
 }
