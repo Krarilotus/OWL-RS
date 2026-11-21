@@ -537,10 +537,12 @@ impl Bounds {
 /// take its base's clean record ([`Bounds::keeps_record`], beside the commit's own tests):
 /// `s a C` with `C` declared `owl:Class`, `s p o` with `p` declared `owl:ObjectProperty`
 /// and `o` an IRI, `s p "v"` with `p` declared `owl:DatatypeProperty`; each declared so and
-/// as no other kind (class, object, data or annotation property, datatype), its subject
-/// (and its object, an IRI) named, no reserved or SHACL name ([`reserved_named`]), not the
-/// ontology's node ([`header`]) and not a reification's node (no `owl:annotatedSource`).
-/// The commit's tests already refuse a reified triple ([`changes_reified`]).
+/// as no other kind by the reader's own table (`nrese_owl::DECLARATION_KINDS`: `rdfs:Class`
+/// is a class, `owl:NamedIndividual` an individual), its subject (and its object, an IRI)
+/// named and outside RDF's, RDFS's, OWL's, XSD's and SHACL's namespaces, no reserved or SHACL
+/// name ([`reserved_named`]), not the ontology's node ([`header`]) and not a reification's
+/// node (no `owl:annotatedSource`). The commit's tests already refuse a reified triple
+/// ([`changes_reified`]).
 ///
 /// Why a list: the commit's tests prove "the reader reads the data as before" from guards
 /// over the syntax, for any change the RL route or the delta takes, and each review of them
@@ -549,6 +551,7 @@ impl Bounds {
 /// kind the base declares; any other reads its own ontology, the cost before the record
 /// was taken at all, never another record.
 fn listed(tx: &impl PendingView) -> bool {
+    use nrese_owl::EntityKind;
     let base = tx.base();
     let id = |iri: &str| base.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
     let owl = |local: &str| id(&format!("http://www.w3.org/2002/07/owl#{local}"));
@@ -556,14 +559,10 @@ fn listed(tx: &impl PendingView) -> bool {
         return false;
     };
     let source = owl("annotatedSource");
-    // Class, object, data and annotation property, datatype, as `kind` below counts them.
-    let kinds = [
-        owl("Class"),
-        owl("ObjectProperty"),
-        owl("DatatypeProperty"),
-        owl("AnnotationProperty"),
-        id("http://www.w3.org/2000/01/rdf-schema#Datatype"),
-    ];
+    // The reader's declaring classes, by id, each with the kind it declares.
+    let declaring: Vec<(TermId, EntityKind)> = (nrese_owl::DECLARATION_KINDS.iter())
+        .filter_map(|&(iri, kind)| id(iri).map(|t| (t, kind)))
+        .collect();
     let has = |s: u64, p: TermId, o: Option<TermId>| {
         let mut pattern = nrese_engine::QuadPattern::all();
         (pattern.subject, pattern.predicate, pattern.object) =
@@ -571,26 +570,37 @@ fn listed(tx: &impl PendingView) -> bool {
         let mut found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
         found.next().is_some()
     };
-    // Whether `t` is declared the `at`th kind and as no other.
-    let only = |t: u64, at: usize| {
-        let declared = kinds.map(|k| k.is_some_and(|k| has(t, rdf_type, Some(k))));
-        declared[at] && declared.iter().filter(|&&d| d).count() == 1
+    // Whether `t` is declared `kind` by `admitting` and by no class of another kind.
+    let only = |t: u64, admitting: Option<TermId>, kind: EntityKind| {
+        admitting.is_some_and(|a| has(t, rdf_type, Some(a)))
+            && (declaring.iter()).all(|&(d, k)| k == kind || !has(t, rdf_type, Some(d)))
     };
-    let named = |t: u64| TermId::from_raw(t).kind() == nrese_engine::TermKind::Iri;
+    let named = |t: u64| {
+        TermId::from_raw(t).kind() == nrese_engine::TermKind::Iri
+            && !iri(tx, t).is_some_and(|i| vocabulary(&i) || own_namespace(&i))
+    };
     let plain = |t: u64| !header(tx, t) && !source.is_some_and(|source| has(t, source, None));
+    let (class, object, data) = (owl("Class"), owl("ObjectProperty"), owl("DatatypeProperty"));
     let mut changed = tx.inserted().chain(tx.deleted()).map(quad_triple);
     changed.all(|triple @ [s, p, o]| {
+        let iri_object = TermId::from_raw(o).kind() == nrese_engine::TermKind::Iri;
         let kind = || {
             if TermId::from_raw(p) == rdf_type {
-                named(o) && only(o, 0)
-            } else if named(o) {
-                only(p, 1)
+                named(o) && only(o, class, EntityKind::Class)
+            } else if iri_object {
+                named(o) && only(p, object, EntityKind::ObjectProperty)
             } else {
-                TermId::from_raw(o).kind().is_literal() && only(p, 2)
+                TermId::from_raw(o).kind().is_literal() && only(p, data, EntityKind::DataProperty)
             }
         };
-        named(s) && kind() && plain(s) && (!named(o) || plain(o)) && !reserved_named(tx, triple)
+        named(s) && kind() && plain(s) && (!iri_object || plain(o)) && !reserved_named(tx, triple)
     })
+}
+
+/// Whether `iri` is in XSD's or SHACL's namespace (beside [`vocabulary`]'s three).
+fn own_namespace(iri: &str) -> bool {
+    iri.starts_with("http://www.w3.org/2001/XMLSchema#")
+        || iri.starts_with("http://www.w3.org/ns/shacl#")
 }
 
 impl std::fmt::Debug for Bounds {
