@@ -1682,13 +1682,7 @@ impl Store {
     fn relations_of(&self, p: Option<u64>) -> Box<dyn Iterator<Item = (u64, &Relation)> + '_> {
         match p {
             Some(p) => Box::new(self.relation(p).map(|r| (p, r)).into_iter()),
-            None => Box::new(
-                self.predicates
-                    .iter()
-                    .copied()
-                    .zip(&self.relations)
-                    .filter(|&(p, _)| !internal(p)),
-            ),
+            None => Box::new(self.predicates.iter().copied().zip(&self.relations)),
         }
     }
 
@@ -2094,6 +2088,7 @@ impl Visits for Store {
             Some(p) => self.relation(p).map_or(0, |r| r.estimate(s, o, seg, probe)),
             None => probe
                 .counted(self.relations_of(None))
+                .filter(|&(p, _)| !internal(p))
                 .map(|(_, r)| r.estimate(s, o, seg, probe))
                 .sum(),
         };
@@ -2117,6 +2112,7 @@ impl Visits for Store {
         // is `Err`.
         let positions = probe
             .counted(self.relations_of(p))
+            .filter(|&(predicate, _)| p.is_some() || !internal(predicate))
             .map(|(_, relation)| {
                 let slices = relation.matching(s, o, seg)?;
                 Some(
@@ -2144,7 +2140,10 @@ impl Visits for Store {
         // range far into one key's chunks passes every slice before it).
         let poll = visit.poller();
         let mut at = 0;
-        'relations: for (p, relation) in poll.counted(self.relations_of(p)) {
+        'relations: for (predicate, relation) in poll.counted(self.relations_of(p)) {
+            if p.is_none() && internal(predicate) {
+                continue;
+            }
             let slices = relation
                 .matching(s, o, seg)
                 .expect("matches_len gave slices");
@@ -2178,7 +2177,7 @@ impl Visits for Store {
                     }
                     going = match slice.old && relation.delta.contains(s, o) {
                         true => visit.skip(),
-                        false => visit.fact([s, p, o]),
+                        false => visit.fact([s, predicate, o]),
                     };
                 });
                 if !going {
@@ -2834,6 +2833,7 @@ pub(crate) fn fact_rules<S: Source + ?Sized>(
     lists: Option<&ListVocabulary>,
     diagnostics: &mut Vec<super::lists::ListDiagnostic>,
     predicates: &mut Predicates,
+    poll: &Poller<'_>,
 ) -> (Vec<Rule>, usize) {
     let mut out: Vec<Rule> = rules
         .iter()
@@ -2844,7 +2844,7 @@ pub(crate) fn fact_rules<S: Source + ?Sized>(
     if let Some(vocabulary) = lists {
         let (list_rules, _, found) = super::lists::compile(
             vocabulary,
-            &AllFacts(source),
+            &AllFacts(source, poll),
             predicates,
             RuleKind::Inference,
         );
@@ -2865,6 +2865,7 @@ pub(crate) fn consistency_rules<S: Source + ?Sized>(
     lists: Option<&ListVocabulary>,
     projection: Option<&ListVocabulary>,
     diagnostics: &mut Vec<super::lists::ListDiagnostic>,
+    poll: &Poller<'_>,
 ) -> Vec<Rule> {
     let mut out: Vec<Rule> = rules
         .iter()
@@ -2874,7 +2875,7 @@ pub(crate) fn consistency_rules<S: Source + ?Sized>(
     if let Some(vocabulary) = lists {
         let (list_rules, _, found) = super::lists::compile(
             projection.unwrap_or(vocabulary),
-            &AllFacts(source),
+            &AllFacts(source, poll),
             &mut Predicates::default(),
             RuleKind::Consistency,
         );
@@ -3315,7 +3316,9 @@ fn run_body(
                 schema.list_projection().or(lists),
                 &mut result.diagnostics,
                 &mut program.list_predicates,
+                &stage,
             );
+            stage.ended().map_err(|Stopped| Interrupted::default())?;
             // Replacement-rule removal can change the template prefix only without a projection.
             debug_assert!(equality.is_none() || schema.list_projection().is_none());
             if let Some(equality) = &equality {
@@ -3584,6 +3587,7 @@ fn run_body(
             lists,
             schema.list_projection(),
             &mut result.diagnostics,
+            &poll,
         );
         poll.ended().map_err(|Stopped| Interrupted::default())?;
         if let Some(reps) = &representatives {

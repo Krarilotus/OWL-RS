@@ -14,6 +14,7 @@ mod attempted;
 mod boundaries;
 mod commit_cost;
 mod equality_shapes;
+mod list_tables;
 mod sources;
 mod stops;
 mod support_refusal;

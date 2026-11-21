@@ -213,12 +213,17 @@ pub struct Rules<'a> {
 impl Rules<'_> {
     /// The ground program over `source`; its bodiless facts count as handed out. List
     /// rules carry the list facts they come from as premises.
-    fn program<S: Source + ?Sized>(&self, source: &S, predicates: Predicates) -> GroundProgram {
+    fn program<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        predicates: Predicates,
+        poll: &Poller<'_>,
+    ) -> GroundProgram {
         let mut program = GroundProgram::default();
         program.list_predicates = predicates;
         program.ground(source, self.schema, self.rules);
         if let Some((rules, premises, diagnostics)) =
-            self.read_lists(source, &mut program.list_predicates)
+            self.read_lists(source, &mut program.list_predicates, poll)
         {
             program.ground_with_premises(source, self.schema, &rules, &premises);
             program.list_diagnostics = diagnostics;
@@ -228,10 +233,15 @@ impl Rules<'_> {
     }
 
     /// The list rules instantiated over `source` for overdeletion.
-    fn list_rules<S: Source + ?Sized>(&self, source: &S, mut predicates: Predicates) -> Vec<Rule> {
+    fn list_rules<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        mut predicates: Predicates,
+        poll: &Poller<'_>,
+    ) -> Vec<Rule> {
         #[cfg(test)]
         crate::witness::add(crate::witness::Site::ListRules, 1);
-        self.read_lists(source, &mut predicates)
+        self.read_lists(source, &mut predicates, poll)
             .map(|(rules, _, _)| rules)
             .unwrap_or_default()
     }
@@ -241,11 +251,12 @@ impl Rules<'_> {
         &self,
         source: &S,
         predicates: &mut Predicates,
+        poll: &Poller<'_>,
     ) -> Option<ListRules> {
         let vocabulary = self.lists?;
         Some(super::lists::compile(
             vocabulary,
-            &AllFacts(source),
+            &AllFacts(source, poll),
             predicates,
             RuleKind::All,
         ))
@@ -420,7 +431,9 @@ pub(crate) fn program_until<B: Base + ?Sized>(
         extra: &extra,
         table: None,
     };
-    let mut program = rules.program(&source, Predicates::default());
+    let stage = Poller::new(stop).ok_or(Stopped)?;
+    let mut program = rules.program(&source, Predicates::default(), &stage);
+    stage.ended()?;
     program.table = rebuild_table(&program, &source, stop)?;
     Ok(program)
 }
@@ -720,7 +733,8 @@ fn update_body<B: Base + ?Sized>(
                 extra: &extra,
                 table: None,
             };
-            let mut program = rules.program(&before, Predicates::default());
+            let mut program = rules.program(&before, Predicates::default(), &stage);
+            stage.ended()?;
             program.table = rebuild_table(&program, &before, stop)?;
             Ok(program)
         })
@@ -836,7 +850,7 @@ fn update_body<B: Base + ?Sized>(
                     table,
                 };
                 let current: HashSet<RuleKey> = rules
-                    .list_rules(&now, predicates())
+                    .list_rules(&now, predicates(), &stage)
                     .iter()
                     .map(rule_key)
                     .collect();
@@ -852,7 +866,7 @@ fn update_body<B: Base + ?Sized>(
                         table,
                     };
                     rules
-                        .list_rules(&old, predicates())
+                        .list_rules(&old, predicates(), &stage)
                         .into_iter()
                         .filter(|r| r.head != Head::Inconsistent)
                         .collect()
@@ -1159,6 +1173,7 @@ fn update_body<B: Base + ?Sized>(
                     table,
                 },
                 predicates(),
+                &stage,
             ))
         } else {
             Cow::Borrowed(old_program)
@@ -1335,8 +1350,9 @@ fn update_body<B: Base + ?Sized>(
             lists_changed = true;
             let program = program.to_mut();
             let (list_rules, premises, diagnostics) = rules
-                .read_lists(&state, &mut program.list_predicates)
+                .read_lists(&state, &mut program.list_predicates, &stage)
                 .expect("list vocabulary");
+            stage.ended().map_err(stopped)?;
             program.ground_with_premises(&state, schema, &list_rules, &premises);
             program.list_diagnostics = diagnostics;
         }
@@ -1555,7 +1571,8 @@ fn update_body<B: Base + ?Sized>(
             extra: &extra,
             table: None,
         };
-        let mut current = rules.program(&state, program.list_predicates.clone());
+        let mut current = rules.program(&state, program.list_predicates.clone(), &stage);
+        stage.ended().map_err(stopped)?;
         current.table = rebuild_table(&current, &state, stop).map_err(stopped)?;
         program = Cow::Owned(current);
     } else if !internal_added.is_empty() || overdeleted.iter().any(|fact| internal(fact[1])) {
@@ -1619,6 +1636,7 @@ fn introduced_violations_body<B: Base + ?Sized>(
     stop: Stop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Violations, Interrupted> {
+    let stage = Poller::new(stop).ok_or_else(Interrupted::default)?;
     let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
     let empty = Store::default();
     let computed: Option<GroundProgram> = cache.is_none().then(|| {
@@ -1630,6 +1648,7 @@ fn introduced_violations_body<B: Base + ?Sized>(
                 table: None,
             },
             Predicates::default(),
+            &stage,
         )
     });
     let old_program: &GroundProgram = cache.or(computed.as_ref()).expect("one of them");
@@ -1647,7 +1666,6 @@ fn introduced_violations_body<B: Base + ?Sized>(
         table: old_program.table.as_deref(),
     };
     let mut program: Cow<'_, GroundProgram> = Cow::Borrowed(old_program);
-    let stage = Poller::new(stop).ok_or_else(Interrupted::default)?;
     let mut delta_facts = Vec::new();
     fresh
         .scan([None, None, None], Seg::Delta, &stage, &mut |f| {
@@ -1665,8 +1683,9 @@ fn introduced_violations_body<B: Base + ?Sized>(
     if rules.lists.is_some() && delta_facts.iter().any(|&f| rules.is_list_fact(f)) {
         let program = program.to_mut();
         let (list_rules, premises, diagnostics) = rules
-            .read_lists(&state, &mut program.list_predicates)
+            .read_lists(&state, &mut program.list_predicates, &stage)
             .expect("list vocabulary");
+        stage.ended().map_err(|Stopped| Interrupted::default())?;
         program.ground_with_premises(&state, rules.schema, &list_rules, &premises);
         program.list_diagnostics = diagnostics;
     }

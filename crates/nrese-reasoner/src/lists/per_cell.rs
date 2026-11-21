@@ -12,6 +12,15 @@ const CHAIN: u64 = 13 << PAYLOAD_BITS;
 const KEY: u64 = 14 << PAYLOAD_BITS;
 const INTERSECTION: u64 = 15 << PAYLOAD_BITS;
 
+#[derive(Clone, Copy)]
+pub(crate) enum TableKind {
+    Internal,
+}
+
+pub(crate) fn table_kind([_, predicate, _]: Triple) -> Option<TableKind> {
+    internal(predicate).then_some(TableKind::Internal)
+}
+
 pub(crate) fn internal(predicate: u64) -> bool {
     predicate >= CHAIN
 }
@@ -47,6 +56,7 @@ pub(super) fn compile(
     axiom @ [subject, _, head]: Triple,
     cells: &HashMap<u64, Cell>,
     predicates: &mut Predicates,
+    stop: &dyn Fn() -> bool,
     mut emit: impl FnMut(Rule, Vec<Triple>),
 ) {
     let (x, y, z) = (v(0), v(1), v(2));
@@ -94,6 +104,9 @@ pub(super) fn compile(
                 continue;
             }
             for &rest in &cell.rests {
+                if stop() {
+                    return;
+                }
                 let (body, guards, current, tail) = match kind {
                     ListKind::Chain => (
                         vec![Atom([x, c(member), y])],

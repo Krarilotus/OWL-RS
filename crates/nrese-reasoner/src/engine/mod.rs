@@ -115,7 +115,8 @@ impl Program {
             snapshot,
             axioms: &[],
         };
-        let facts = crate::eval::AllFacts(&crate::explain::Whole(&base));
+        let facts =
+            crate::eval::AllFacts(&crate::explain::Whole(&base), &crate::eval::Poller::never());
         lists.leaves_out(&facts)
     }
 

@@ -499,21 +499,22 @@ impl<'v, 'p> Probe<'v, 'p> {
     }
 }
 
-/// A [`Source`]'s facts (all segments) for list instantiation, which is grounding: it runs
-/// to its end ([`Poller::never`]; a program grounded part-way would be kept as if whole).
-pub struct AllFacts<'a, S: ?Sized>(pub &'a S);
+/// A [`Source`]'s facts (all segments) for list instantiation. The caller checks
+/// the poller before using a program that may have been interrupted.
+pub struct AllFacts<'a, 'p, S: ?Sized>(pub &'a S, pub &'a Poller<'p>);
 
-impl<S: Source + ?Sized> Facts for AllFacts<'_, S> {
+impl<S: Source + ?Sized> Facts for AllFacts<'_, '_, S> {
     fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
         let mut out = Vec::new();
-        self.0
-            .scan(
-                [Some(subject), Some(predicate), None],
-                Seg::All,
-                &Poller::never(),
-                &mut |t| out.push(t[2]),
-            )
-            .expect("never stopped");
+        let read = self.0.scan(
+            [Some(subject), Some(predicate), None],
+            Seg::All,
+            self.1,
+            &mut |t| out.push(t[2]),
+        );
+        if read.is_err() {
+            return Vec::new();
+        }
         out.sort_unstable();
         out.dedup();
         out
@@ -521,17 +522,21 @@ impl<S: Source + ?Sized> Facts for AllFacts<'_, S> {
 
     fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
         let mut out = Vec::new();
-        self.0
-            .scan(
-                [None, Some(predicate), None],
-                Seg::All,
-                &Poller::never(),
-                &mut |t| out.push((t[0], t[2])),
-            )
-            .expect("never stopped");
+        let read = self
+            .0
+            .scan([None, Some(predicate), None], Seg::All, self.1, &mut |t| {
+                out.push((t[0], t[2]))
+            });
+        if read.is_err() {
+            return Vec::new();
+        }
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    fn stopped(&self) -> bool {
+        self.1.tick()
     }
 }
 
