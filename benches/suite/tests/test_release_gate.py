@@ -575,13 +575,13 @@ class Rounds(unittest.TestCase):
         """`release_gate.py jobs --plan` returned 0 when the
         fleet check refused the set, as abba.py run --plan did. It exits 1; a taken plan 0."""
         with tempfile.TemporaryDirectory() as tmp:
-            subprocess.run(["git", "init", "-q", tmp], check=True, capture_output=True)
-            subprocess.run(["git", "-C", tmp, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q",
-                            "--allow-empty", "-m", "x"], check=True, capture_output=True)
+            checkout = Path(tmp) / "checkout"
+            isolation.repo(checkout, 1)
             for code, expected in ((1, 1), (0, 0)):
                 with self.subTest(fleet_check=code), \
                         patch.object(sys, "argv", ["release_gate.py", "jobs", "HEAD", "--base", "HEAD", "--main", "HEAD",
-                                                   "--checkout", tmp, "--out", str(Path(tmp) / "out"), "--plan"]), \
+                                                   "--checkout", str(checkout), "--out", str(Path(tmp) / "out"),
+                                                   "--plan"]), \
                         patch.object(gate_module, "jobs", return_value={"rg-x": {"id": "rg-x"}}), \
                         patch.object(gate_module, "set_plan", return_value="plan"), \
                         patch.object(gate_module, "toml_set", return_value=""), \

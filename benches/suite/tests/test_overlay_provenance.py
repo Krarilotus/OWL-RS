@@ -117,7 +117,7 @@ class OverlayProvenance(unittest.TestCase):
             (folder / "hosts.toml").write_text(REGISTRY + f'cpus = "{cpus}"\n', encoding="utf-8")
             with patch.dict(os.environ, {"NRESE_BENCH_PRIVATE": str(folder)}):
                 machine = manifest.machine("native")
-            report = suite_fixture.LoadedInputs().report(100, {})
+            report = suite_fixture.LoadedInputs().report(100, {}, case="rl-hierarchy")
             report["machine"].update(machine)
             return report
 
@@ -130,9 +130,13 @@ class OverlayProvenance(unittest.TestCase):
         dirty = recorded(repo / "overlay", "0"), recorded(repo / "overlay", "1")
         for case, pair in [("folders", plain), ("dirty edits", dirty)]:
             for allow in (False, True):
-                with self.subTest(case=case, allow=allow), contextlib.redirect_stdout(io.StringIO()):
-                    self.assertEqual(compare.compare_reports(*pair, allow_host_change=allow), 2)
-                    self.assertEqual(compare.compare_reports(pair[0], pair[0], allow_host_change=allow), 0)
+                with self.subTest(case=case, allow=allow):
+                    with contextlib.redirect_stdout(io.StringIO()) as said:
+                        code = compare.compare_reports(*pair, allow_host_change=allow)
+                    self.assertEqual(code, 2, said.getvalue())
+                    with contextlib.redirect_stdout(io.StringIO()) as said:
+                        code = compare.compare_reports(pair[0], pair[0], allow_host_change=allow)
+                    self.assertEqual(code, 0, said.getvalue())
 
     def test_partial_and_conflicting_envelopes_refuse_registry_and_floor_reads(self):
         # Spec: the job's three channels are one checked input, and an explicit folder is another.
