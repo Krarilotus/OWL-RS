@@ -286,13 +286,13 @@ impl Diagnostic {
             | Self::NotOwl { .. }
             | Self::Syntax { .. }
             | Self::Reserved { .. } => true,
-            // Altered: declared both, the property is read as an object property only, so
-            // what the source says of it as a data property is read as something else.
-            Self::TwoKinds {
-                kinds: [EntityKind::ObjectProperty, EntityKind::DataProperty],
-                ..
-            } => true,
-            Self::TwoKinds { .. } => false,
+            // Altered where an axiom names it (`by_axiom`): the reader reads the name as one
+            // (`joins_kinds`), so an axiom on one kind is read of the other kind's uses too,
+            // and a property declared both is read as an object property only. Read as the
+            // source states it where only assertions and statements read past use it: each
+            // assertion by its value, a literal's as a data one, an individual's as an object
+            // one. Its `treatment` is what the store does with it, not what is read.
+            Self::TwoKinds { by_axiom, .. } => *by_axiom,
             // Kept beside the ontology (`Ontology::rules`), which a reasoner of OWL 2 alone
             // doesn't apply.
             Self::Rule { .. } => true,
@@ -301,7 +301,9 @@ impl Diagnostic {
             Self::SharedBlankNode { .. } => false,
             // Read as the source states it: typed by its use, as a declaration would type it.
             Self::UndeclaredProperty { .. } => false,
-            // No axiom: a structure no axiom uses says nothing under the Direct Semantics.
+            // No axiom: a structure no axiom uses says nothing under the Direct Semantics,
+            // whatever the OWL 2 RL rules may read more of it (`reads_more`: their premise,
+            // `reads_otherwise`). Its `treatment` is the store's, not the reader's.
             Self::Unused { .. } => false,
             // Read as written: only a global restriction of OWL 2 DL is broken (what keeps
             // reasoning decidable), not what the axiom says; what a reasoner doesn't follow
