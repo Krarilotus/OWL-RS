@@ -1312,6 +1312,125 @@ fn the_mark_by_the_indexes_is_the_mark_of_the_whole_ontology_on_random_stores() 
     );
 }
 
+/// Spec (a pending read takes its base's record of what the reader left out only where its
+/// changes keep it, as their commit would: `Bounds::keeps_record`): on random stores off the
+/// rules route over a small vocabulary (declared classes, an object property with a domain, a
+/// data property, an undeclared property with a range), and random transactions of
+/// statements about its individuals that may add or delete (a class membership, a name of the
+/// vocabulary as an individual, a property's value of either kind, an equality), the mark a
+/// pending read is told is the mark it is told where it takes no record and reads its own
+/// ontology. `NRESE_FUZZ_SEED` (default 0) varies them; each run prints how many
+/// transactions kept the record and how many of those the base's clean record answered.
+#[test]
+fn a_kept_record_marks_a_pending_read_as_its_own_ontology_does() {
+    use crate::{MutationCommand, MutationTicket, Requester, SparqlUpdateRequest};
+    use nrese_rdf::{GraphName, Literal, NamedNode, Quad, Term};
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    const CASES: usize = 40;
+    let ex = |local: &str| NamedNode::new_unchecked(format!("urn:test:{local}"));
+    let schema = ":A a owl:Class . :B a owl:Class . :p a owl:ObjectProperty ; rdfs:domain :A . \
+                  :d a owl:DatatypeProperty . :q rdfs:range :B . ";
+    let individuals: Vec<NamedNode> = ["a", "b", "c", "tib"].map(ex).into();
+    // Classes, and names of the vocabulary as an individual's class or its equal.
+    let types: Vec<NamedNode> = ["A", "B", "Pet", "Dog", "p"].map(ex).into();
+    let properties: Vec<NamedNode> = ["p", "d", "q", "owner"].map(ex).into();
+    let same_as = NamedNode::new_unchecked("http://www.w3.org/2002/07/owl#sameAs");
+    let rdf_type = NamedNode::new_unchecked("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
+    // `equal`: whether an equality may be drawn (the base has none: U1 then has no classes).
+    let statement = |r: &mut Draw, equal: bool| {
+        let s = r.pick(&individuals);
+        let (p, o): (NamedNode, Term) = match r.below(if equal { 5 } else { 4 }) {
+            0 => (rdf_type.clone(), r.pick(&types).into()),
+            1 => (r.pick(&properties), r.pick(&individuals).into()),
+            2 => (r.pick(&properties), Literal::new_simple_literal("v").into()),
+            3 => (r.pick(&properties), r.pick(&types).into()),
+            _ => (same_as.clone(), r.pick(&individuals).into()),
+        };
+        Quad::new(s, p, o, GraphName::DefaultGraph)
+    };
+    let fuzz: u64 = std::env::var("NRESE_FUZZ_SEED")
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+        .unwrap_or(0);
+    let mut r = Draw(fuzz.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x6b65_6570);
+    let (mut wrong, mut refused, mut keeping, mut answered) = (Vec::new(), 0, 0, 0);
+    for case in 0..CASES {
+        let store = Arc::new(StoreService::new(crate::StoreConfig::in_memory()).unwrap());
+        let pipeline = crate::MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Dl,
+            ))),
+        );
+        let data: String = (0..2 + r.below(6))
+            .map(|_| {
+                let q = statement(&mut r, false);
+                format!("{} {} {} . ", q.subject, q.predicate, q.object)
+            })
+            .collect();
+        let insert = format!("{MARK_PREFIXES}INSERT DATA {{ {OFF_ROUTE}{schema}{data} }}");
+        let committed = pipeline.apply(
+            MutationCommand::Update(SparqlUpdateRequest::new(insert)),
+            &Requester::all(),
+            &MutationTicket::new(),
+        );
+        if committed.is_err() {
+            refused += 1;
+            continue;
+        }
+        let snapshot = store.engine().snapshot();
+        let mut tx = store
+            .engine()
+            .speculative(Arc::new(nrese_exec::Budget::unlimited()));
+        let added: Vec<String> = (0..1 + r.below(3))
+            .map(|_| {
+                let quad = statement(&mut r, true);
+                tx.try_insert(quad.as_ref()).unwrap();
+                quad.to_string()
+            })
+            .collect();
+        let asserted: Vec<_> = snapshot
+            .quads_for_pattern_in(ReadModel::Asserted, &nrese_engine::QuadPattern::all())
+            .collect();
+        let removed: Vec<String> = (0..r.below(2))
+            .map(|_| {
+                let quad = asserted[r.below(asserted.len())];
+                tx.try_remove_encoded(quad).unwrap();
+                format!("{:?}", snapshot.decode_quad(quad))
+            })
+            .collect();
+        let pending = tx.pending_snapshot().unwrap();
+        let keeps_record = store.dl().bounds.keeps_record(&tx);
+        let at = |keeps_record| Revision::Pending {
+            snapshot: &pending,
+            deletes: !removed.is_empty(),
+            keeps_record,
+        };
+        let told = reads_differently(&store, at(keeps_record));
+        let own = reads_differently(&store, at(false));
+        keeping += usize::from(keeps_record);
+        let record = (store.dl().status())
+            .filter(|s| s.revision == snapshot.revision())
+            .and_then(|s| s.left_out);
+        // The base's clean record and the indexes decided it, without the ontology.
+        let by_record = keeps_record && record == Some(None) && by_index(&pending) == Some(None);
+        answered += usize::from(by_record);
+        if told != own {
+            wrong.push(format!(
+                "case {case}: told {told:?}, its own ontology {own:?}\n  committed: {data}\n  \
+                 pending: + {added:?} - {removed:?}"
+            ));
+        }
+    }
+    eprintln!(
+        "NRESE_FUZZ_SEED={fuzz}: {CASES} stores, {refused} refused, {keeping} transactions that \
+         keep their base's record, {answered} answered clean by it"
+    );
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert!(refused * 4 < CASES, "{refused} of {CASES} stores refused");
+    assert!(answered > 0, "no transaction took its base's clean record");
+}
+
 /// A question naming an individual the data doesn't name is decided only where the
 /// ontology has no key. Where the ontology can't be read within its budget (nothing cached
 /// for the revision and the bounds' memory spent, between the decision and the status), it
