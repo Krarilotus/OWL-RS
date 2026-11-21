@@ -1064,21 +1064,14 @@ fn import_on_disk(
     (nrese_server::build_app(state), store)
 }
 
-/// The load ID a quarantine answer names, and the records the store lists under it.
-fn named_load<'a>(store: &StoreService, text: &'a str) -> (&'a str, usize) {
-    let load = text
-        .split_once("under load ID ")
-        .and_then(|(_, rest)| rest.split_once([',', '.']))
-        .map(|(load, _)| load)
-        .expect(text);
+/// The load of the one record the store's quarantine lists.
+fn listed_load(store: &StoreService) -> String {
     let listed = store
         .quarantine()
-        .list(&nrese_store::QuarantineFilter {
-            load: Some(load.to_owned()),
-            ..nrese_store::QuarantineFilter::default()
-        })
+        .list(&nrese_store::QuarantineFilter::default())
         .unwrap();
-    (load, listed.len())
+    assert_eq!(listed.len(), 1, "{listed:#?}");
+    listed[0].statement.load.clone()
 }
 
 /// An upload that published nothing, whose quarantine file was placed but couldn't be made
@@ -1102,14 +1095,13 @@ async fn kept_quarantine_without_publication_says_when_to_send_again() {
     assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body}");
     let problem: serde_json::Value = serde_json::from_str(&body).unwrap();
     let detail = problem["detail"].as_str().expect(&body);
-    let (load, listed) = named_load(&store, detail);
+    let load = listed_load(&store);
     assert_eq!(
         detail,
         format!(
             "the load published nothing. The quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records may be listed under load ID {load}. If they are, its quarantine is kept: don't send it again. If they aren't, sending it again is safe."
         )
     );
-    assert_eq!(listed, 1, "{body}");
 }
 
 /// An import job that published, whose quarantine file was placed but not made durable:
@@ -1132,14 +1124,13 @@ async fn published_import_job_warning_names_the_kept_quarantine() {
     let job = finished(&app, started["path"].as_str().expect(&body)).await;
     assert_eq!(job["state"], "done", "{job}");
     let warning = job["report"]["warning"].as_str().expect("a warning");
-    let (load, listed) = named_load(&store, warning);
+    let load = listed_load(&store);
     assert_eq!(
         warning,
         format!(
             "the quarantine record couldn't be kept: the quarantine's directory sync failed (a test's). This load's records are listed under load ID {load}, but a power loss may lose them."
         )
     );
-    assert_eq!(listed, 1, "{job}");
 }
 
 /// Imports run as jobs: an uploaded document with `async=true`, and files from the
