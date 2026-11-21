@@ -3161,14 +3161,17 @@ fn sees_classes(rule: &Rule) -> bool {
     matches!(rule.guards.as_slice(), [Guard::OverClasses { .. }])
 }
 
-/// List constants in a round's fact view use the same names as its facts.
-fn projected_lists(
+/// Grounding and schema recognition see the same vocabulary after a merge.
+fn project_list_schema(
+    schema: &mut std::borrow::Cow<'_, Schema>,
     lists: Option<&ListVocabulary>,
-    representatives: Option<&Representatives>,
-) -> Option<ListVocabulary> {
-    let (lists, representatives) = lists.zip(representatives)?;
-    (!representatives.stale.is_empty())
-        .then(|| lists.projected(|id| representatives.classes.representative(id)))
+    representatives: &Representatives,
+) {
+    if let Some(vocabulary) =
+        lists.and_then(|lists| lists.projected(|id| representatives.classes.representative(id)))
+    {
+        schema.to_mut().set_list_projection(vocabulary);
+    }
 }
 
 /// Semi-naive evaluation to the fixpoint, from a store holding the input as its delta;
@@ -3273,6 +3276,7 @@ fn run_body(
     // Facts to add in the first round, already checked against the store: the input's stale
     // facts rewritten, where the input asserts equalities.
     let mut pending: Segments = Vec::new();
+    let mut schema = std::borrow::Cow::Borrowed(schema);
     if let Some(reps) = &mut representatives {
         // The input's equalities, read as the rounds' sequential stages read: on a poller
         // of the operation's stop, its result checked before use.
@@ -3293,6 +3297,7 @@ fn run_body(
         check_stop()?;
         let lost = reps.merge(&pairs);
         if !lost.is_empty() {
+            project_list_schema(&mut schema, lists, reps);
             pending = reps
                 .rewrites(&store, &lost, Vec::new(), stop)
                 .map_err(|Stopped| Interrupted::default())?;
@@ -3326,11 +3331,10 @@ fn run_body(
                 store: &store,
                 stale,
             };
-            let projected = projected_lists(lists, representatives.as_ref());
             let mut source = fact_rules(
                 &current,
                 &rules,
-                projected.as_ref().or(lists),
+                schema.list_projection().or(lists),
                 &mut result.diagnostics,
             );
             if let Some(equality) = &equality {
@@ -3342,14 +3346,14 @@ fn run_body(
             // The first round grounds everything; later ones through new schema facts
             // only (list rules in full, deduplicated).
             if result.rounds == 1 || reground_all {
-                program.ground(&current, schema, &source);
+                program.ground(&current, &schema, &source);
             } else {
-                program.ground_delta(&current, schema, &source);
+                program.ground_delta(&current, &schema, &source);
                 if reevaluate {
                     // After a merge, a guard that sees the classes can hold for an instance
                     // grounding left out: those rules ground again in full.
                     source.retain(sees_classes);
-                    program.ground(&current, schema, &source);
+                    program.ground(&current, &schema, &source);
                 }
             }
             reground_all = false;
@@ -3514,6 +3518,7 @@ fn run_body(
                 .collect();
             let lost = reps.merge(&pairs);
             if !lost.is_empty() {
+                project_list_schema(&mut schema, lists, reps);
                 let mut moved: Vec<Triple> = Vec::new();
                 for (_, list) in &mut candidates {
                     for (p, pairs) in list.iter_mut() {
@@ -3556,7 +3561,7 @@ fn run_body(
         heap::phase("reasoner: merge");
         let clock = std::time::Instant::now();
         // Every candidate was checked against the store, which a round doesn't change.
-        let (new, schema_facts) = store.advance_new(candidates, schema);
+        let (new, schema_facts) = store.advance_new(candidates, &schema);
         phases.merge += clock.elapsed();
         phases.new_facts += new as u64;
         result.counters.store_bytes.push(store.bytes());
@@ -3588,18 +3593,17 @@ fn run_body(
             classes: representatives.as_ref().map(|reps| &reps.classes),
             poll: &poll,
         };
-        let projected = projected_lists(lists, representatives.as_ref());
         let mut checks = consistency_rules(
             &current,
             &rules,
-            projected.as_ref().or(lists),
+            schema.list_projection().or(lists),
             Some(&written),
         );
         poll.ended().map_err(|Stopped| Interrupted::default())?;
         if let Some(reps) = &representatives {
             give_classes(&mut checks, reps, &mut guard_classes, &mut guarded);
         }
-        program.ground(&current, schema, &checks);
+        program.ground(&current, &schema, &checks);
     }
     let reads = Reads::of(
         program.rules.iter().chain(

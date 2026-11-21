@@ -63,6 +63,7 @@ impl Facts for Cells<'_> {
 }
 
 /// The vocabulary ids the list rules use.
+#[derive(Clone, PartialEq, Eq)]
 pub struct ListVocabulary {
     rdf_type: u64,
     first: u64,
@@ -122,8 +123,8 @@ impl ListVocabulary {
     }
 
     /// The vocabulary as named by a fact source that has renamed equal terms.
-    pub(crate) fn projected(&self, named: impl Fn(u64) -> u64) -> Self {
-        Self {
+    pub(crate) fn projected(&self, named: impl Fn(u64) -> u64) -> Option<Self> {
+        let vocabulary = Self {
             rdf_type: named(self.rdf_type),
             first: named(self.first),
             rest: named(self.rest),
@@ -141,11 +142,11 @@ impl ListVocabulary {
             all_disjoint_properties: named(self.all_disjoint_properties),
             all_different: named(self.all_different),
             named_keys: self.named_keys,
-        }
+        };
+        (vocabulary != *self).then_some(vocabulary)
     }
 
-    /// Whether `fact` is list structure or a list axiom: the facts [`instantiate`] reads.
-    pub fn is_list_fact(&self, [_, p, o]: [u64; 3]) -> bool {
+    pub(crate) fn is_list_predicate(&self, p: u64) -> bool {
         [
             self.first,
             self.rest,
@@ -158,6 +159,15 @@ impl ListVocabulary {
             self.distinct_members,
         ]
         .contains(&p)
+    }
+
+    pub(crate) fn reads_predicate(&self, p: u64) -> bool {
+        p == self.rdf_type || self.is_list_predicate(p)
+    }
+
+    /// Whether `fact` is list structure or a list axiom: the facts [`instantiate`] reads.
+    pub fn is_list_fact(&self, [_, p, o]: [u64; 3]) -> bool {
+        self.is_list_predicate(p)
             || (p == self.rdf_type
                 && [
                     self.all_disjoint_classes,
@@ -841,26 +851,29 @@ pub fn instantiate_written(
         &mut |node, members, rules| {
             if members.len() > PAIRWISE_MEMBERS {
                 let mut long = long.borrow_mut();
-                for (kind, index, premises) in [
-                    (voc.all_disjoint_classes, 0, 0),
-                    (voc.all_different, 1, 1),
-                    (voc.all_disjoint_properties, 2, 2),
-                ] {
+                for (index, kind) in [
+                    voc.all_disjoint_classes,
+                    voc.all_different,
+                    voc.all_disjoint_properties,
+                ]
+                .into_iter()
+                .enumerate()
+                {
                     if typed(node, kind) {
                         long.indexes[index].add(members);
-                        long.premises[premises].push([node, ty, kind]);
-                        if kind == voc.all_different {
+                        long.premises[index].push([node, ty, kind]);
+                        if index == 1 {
                             duplicates(members, node, voc, rules, "eq-diff2");
                         }
                         // A class or property it names twice, which the index pairs with no
                         // other: the rule a short list makes of that pair.
                         for &a in &repeated(members) {
-                            if kind == voc.all_disjoint_classes {
+                            if index == 0 {
                                 let body =
                                     vec![Atom([v(0), c(ty), c(a)]), Atom([v(0), c(ty), c(a)])];
                                 rules.push(rule("cax-adc", body, vec![], Head::Inconsistent));
                             }
-                            if kind == voc.all_disjoint_properties {
+                            if index == 2 {
                                 let body = vec![Atom([v(0), c(a), v(1)]), Atom([v(0), c(a), v(1)])];
                                 rules.push(rule("prp-adp", body, vec![], Head::Inconsistent));
                             }
