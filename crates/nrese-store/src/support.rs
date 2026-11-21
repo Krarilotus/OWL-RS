@@ -1762,6 +1762,54 @@ pub(crate) struct Supports {
     in_use: std::sync::atomic::AtomicBool,
     /// What the sets and views keep is charged to.
     kept: Arc<Budget>,
+    /// Where the latch tests hold a build ([`gate`]).
+    #[cfg(test)]
+    gate: gate::Gate,
+}
+
+/// Where the latch tests hold a build: a hook run once, on the thread that builds, at the
+/// start of the sets', the re-derived facts' or a view's build. Kept per `Supports`, not per
+/// process: the other tests reach these builds too.
+#[cfg(test)]
+mod gate {
+    use std::sync::Mutex;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) enum Point {
+        Sets,
+        Rederived,
+        View,
+    }
+
+    type Hook = Box<dyn FnOnce() + Send>;
+
+    #[derive(Default)]
+    pub(super) struct Gate(Mutex<Vec<(Point, Hook)>>);
+
+    impl Gate {
+        pub(super) fn set(&self, point: Point, hook: impl FnOnce() + Send + 'static) {
+            let mut hooks = self.0.lock().unwrap_or_else(|p| p.into_inner());
+            hooks.retain(|(at, _)| *at != point);
+            hooks.push((point, Box::new(hook)));
+        }
+
+        pub(super) fn at(&self, point: Point) {
+            let hook = {
+                let mut hooks = self.0.lock().unwrap_or_else(|p| p.into_inner());
+                let at = hooks.iter().position(|(at, _)| *at == point);
+                at.map(|at| hooks.swap_remove(at))
+            };
+            if let Some((_, hook)) = hook {
+                hook();
+            }
+        }
+    }
+
+    impl std::fmt::Debug for Gate {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("Gate").finish_non_exhaustive()
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2129,6 +2177,8 @@ impl Supports {
             counters: Counters::default(),
             in_use: std::sync::atomic::AtomicBool::default(),
             kept,
+            #[cfg(test)]
+            gate: gate::Gate::default(),
         }
     }
 
@@ -2452,6 +2502,8 @@ impl Supports {
         compilation: Compilation,
         working: &Work,
     ) -> Result<Shared<Rederived>, Unavailable> {
+        #[cfg(test)]
+        self.gate.at(gate::Point::Rederived);
         let Some(rules) = &generation.rules else {
             return Ok(Shared::new(Rederived::empty(&self.kept), &self.kept)?);
         };
@@ -2694,6 +2746,8 @@ impl Supports {
         epoch: u64,
         working: &Work,
     ) -> Result<Snapshot, Unavailable> {
+        #[cfg(test)]
+        self.gate.at(gate::Point::View);
         working.go_on()?;
         let started = std::time::Instant::now();
         let earlier = {
@@ -2874,6 +2928,8 @@ impl Supports {
         compilation: Compilation,
         working: &Work,
     ) -> Result<Option<Shared<SupportSets>>, Unavailable> {
+        #[cfg(test)]
+        self.gate.at(gate::Point::Sets);
         let Some(rules) = &generation.rules else {
             return Ok(None);
         };
