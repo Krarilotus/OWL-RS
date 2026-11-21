@@ -5141,6 +5141,7 @@ fn a_one_pass_that_does_not_fit_leaves_the_groups_to_the_per_column_path() {
     let engine = Engine::new(EngineConfig::default()).unwrap();
     let snapshot = engine.snapshot();
     let int = |n: usize| format!("\"{n}\"^^<http://www.w3.org/2001/XMLSchema#integer>");
+    let mut failed = Vec::new();
     for (groups, per_group, limit) in [(4_096_usize, 1_usize, 1 << 20), (64, 128, 5 << 18)] {
         let values: String = (0..groups * per_group)
             .map(|i| match per_group {
@@ -5176,11 +5177,15 @@ fn a_one_pass_that_does_not_fit_leaves_the_groups_to_the_per_column_path() {
             Ok(results) => {
                 let mut found = rows(results, false);
                 found.sort();
-                assert_eq!(found, expected, "{case}");
+                if found != expected {
+                    failed.push(format!("{case}: not SPARQL's answer"));
+                }
             }
-            Err(error) => panic!("{case}: {error:?}"),
+            Err(error) => failed.push(format!("{case}: {error:?}")),
         }
     }
+    // Every case's outcome, not only the first one's.
+    assert!(failed.is_empty(), "{failed:#?}");
 }
 
 /// Eager aggregation (the early group over B, the join's input without the group's keys)
