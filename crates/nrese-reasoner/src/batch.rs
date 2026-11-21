@@ -2782,12 +2782,13 @@ pub(crate) fn fact_rules<S: Source + ?Sized>(
     rules: &[Rule],
     lists: Option<&ListVocabulary>,
     diagnostics: &mut Vec<super::lists::ListDiagnostic>,
-) -> Vec<Rule> {
+) -> (Vec<Rule>, usize) {
     let mut out: Vec<Rule> = rules
         .iter()
         .filter(|r| r.head != Head::Inconsistent)
         .cloned()
         .collect();
+    let templates = out.len();
     if let Some(vocabulary) = lists {
         let (list_rules, found) = instantiate(vocabulary, &AllFacts(source));
         out.extend(
@@ -2797,7 +2798,7 @@ pub(crate) fn fact_rules<S: Source + ?Sized>(
         );
         *diagnostics = found;
     }
-    out
+    (out, templates)
 }
 
 /// The input's list cells as written: the runs the store started with, which no round
@@ -3332,7 +3333,7 @@ fn run_body(
                 store: &store,
                 stale,
             };
-            let mut source = fact_rules(
+            let (mut source, templates) = fact_rules(
                 &current,
                 &rules,
                 schema.list_projection().or(lists),
@@ -3349,7 +3350,16 @@ fn run_body(
             if result.rounds == 1 || reground_all {
                 program.ground(&current, &schema, &source);
             } else {
-                program.ground_delta(&current, &schema, &source);
+                // A projected list operand can be a schema predicate with older facts.
+                // The projection is present only when a representative rewrote its vocabulary.
+                let prefix = if schema.list_projection().is_some() {
+                    templates
+                } else {
+                    source.len()
+                };
+                let (templates, list_rules) = source.split_at(prefix);
+                program.ground_delta(&current, &schema, templates);
+                program.ground(&current, &schema, list_rules);
                 if reevaluate {
                     // After a merge, a guard that sees the classes can hold for an instance
                     // grounding left out: those rules ground again in full.
