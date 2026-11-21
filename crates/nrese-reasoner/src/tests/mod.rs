@@ -3497,17 +3497,21 @@ fn a_chain_with_many_aliased_walks_composes_its_edges() {
          _:l2 rdf:first ex:p2
          _:l2 rdf:rest _:l3
          _:l3 rdf:first ex:p3
-         _:l3 rdf:rest rdf:nil
-         ex:a ex:p1 ex:b
-         ex:b ex:p2 ex:c
-         ex:c ex:p3 ex:d",
+         _:l3 rdf:rest rdf:nil",
     );
     for p in 1..=3 {
         for i in 1..=4 {
             text.push_str(&format!("\nex:p{p} owl:sameAs ex:p{p}-alias{i}"));
         }
     }
-    let (mut v, derived, _) = closure(&text);
+    let mut v = LocalVocabulary::default();
+    let (_, mut facts) = replicated_closure(&mut v, &text);
+    // Add the path after equality has copied the cells' firsts.
+    facts.extend(load(
+        &mut v,
+        "ex:a ex:p1 ex:b\nex:b ex:p2 ex:c\nex:c ex:p3 ex:d",
+    ));
+    let (derived, _) = both(&mut v, &facts);
     assert!(has(&mut v, &derived, "ex:a ex:p ex:d"));
 }
 

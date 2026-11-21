@@ -1652,14 +1652,7 @@ fn legal_long_lists_give_complete_answers_under_owl2_rl() {
     for (row, data, ask) in rows {
         let check = || {
             let pipeline = ql_pipeline(in_memory_store_config());
-            pipeline
-                .apply(
-                    insert(&data),
-                    &nrese_store::Requester::all(),
-                    &MutationTicket::new(),
-                )
-                .expect("the data");
-            complete_list_answer(pipeline.store(), &ask);
+            commit_list_and_check_answer(&pipeline, &data, &ask);
         };
         if std::panic::catch_unwind(check).is_err() {
             wrong.push(row);
@@ -1668,13 +1661,9 @@ fn legal_long_lists_give_complete_answers_under_owl2_rl() {
     assert!(wrong.is_empty(), "{wrong:?}");
 }
 
-/// The aliased key built by a first commit, and a later one that adds any list fact: that
-/// commit grounds the lists again, over a closure that holds equality's copies of the key's
-/// cells (`rdf:first` to each alias: 2^7 member sequences, past 64). The later commit's key
-/// match (`:z` with `:x`'s values) entails `:x :name "Z"`, so the answer is true or not
-/// `complete`, however the list is read: a guard against an answer wrongly `complete`.
+/// Table 5 prp-key classifies the instance added with an unrelated list fact.
 #[test]
-fn a_later_list_fact_over_an_aliased_key_leaves_no_answer_wrongly_complete() {
+fn a_later_list_fact_keeps_the_aliased_key_answer_complete() {
     let pipeline = ql_pipeline(in_memory_store_config());
     let write = |data: &str| {
         let ticket = MutationTicket::new();
@@ -1689,7 +1678,7 @@ fn a_later_list_fact_over_an_aliased_key_leaves_no_answer_wrongly_complete() {
         later.push_str(&format!(" <{EX}z> <{EX}k{i}> <{EX}v{i}> ."));
     }
     write(&later);
-    left_out_answer(pipeline.store(), &format!("<{EX}x> <{EX}name> \"Z\""));
+    complete_list_answer(pipeline.store(), &format!("<{EX}x> <{EX}name> \"Z\""));
 }
 
 /// Aliases (`owl:sameAs`) of a key's 7 properties leave the key built by the commit that
@@ -1720,29 +1709,24 @@ fn aliases_leave_a_key_built() {
     }
 }
 
-/// A store holding a key the rules leave out, opened again with its closure current (so
-/// not rebuilt): its answers aren't `complete` either.
+/// A reopen with current reasoning retains the complete prp-key answer.
 #[test]
-fn a_reopened_store_with_an_unbuilt_key_leaves_no_answer_complete() {
+fn a_reopened_store_keeps_its_long_key_answer_complete() {
     let dir = tempfile::tempdir().expect("dir");
     let ask = format!("<{EX}x> <{EX}name> \"Y\"");
-    left_out_status(
+    commit_list_and_check_answer(
         &ql_pipeline(nrese_store::StoreConfig::on_disk(dir.path())),
         &long_key(128),
         &ask,
     );
-    left_out_answer(
+    complete_list_answer(
         ql_pipeline(nrese_store::StoreConfig::on_disk(dir.path())).store(),
         &ask,
     );
 }
 
-/// A read inside a transaction whose pending operations delete a key's `owl:hasKey` fact finds
-/// no list left out in its own data, and its snapshot carries the committed revision's number.
-/// The transaction ends without a commit, so the committed revision is as it was: its key of
-/// 128 properties, past what one rule holds, is left out, and `:x :name "Y"` is entailed (the
-/// key makes `:x` and `:y` one; `:y :name "Y"`). A plain read of it after the transaction is
-/// therefore true or not `complete`, whatever the pending read found.
+/// A pending read that deletes the key shares the committed revision number.
+/// The committed prp-key answer stays true and complete after the transaction.
 #[test]
 fn a_pending_read_leaves_the_committed_revisions_mark() {
     let pipeline = ql_pipeline(in_memory_store_config());
@@ -1776,16 +1760,12 @@ fn a_pending_read_leaves_the_committed_revisions_mark() {
         )
         .expect("the pending read");
     println!("pending read: {pending:?}");
-    left_out_answer(store, &ask);
+    complete_list_answer(store, &ask);
 }
 
-/// A revision read first with nothing left out is recorded clean. A commit on it then adds a
-/// key of 128 properties, past what one rule holds: the commit itself must record the key left
-/// out, as the record would otherwise carry the clean range on to the new revision unscanned.
-/// `:x :name "Y"` is entailed (the key makes `:x` and `:y` one), so a read after the commit is
-/// true or not `complete`.
+/// A clean read of the earlier revision does not affect the new prp-key answer.
 #[test]
-fn a_commit_after_a_clean_read_records_its_key_left_out() {
+fn a_long_key_commit_after_a_clean_read_changes_the_answer() {
     let pipeline = ql_pipeline(in_memory_store_config());
     let write = |data: &str| {
         let ticket = MutationTicket::new();
@@ -1805,15 +1785,14 @@ fn a_commit_after_a_clean_read_records_its_key_left_out() {
         "the first read must be complete, so that it records its revision clean: {clean:?}"
     );
     write(&long_key(128));
-    left_out_answer(pipeline.store(), &ask);
+    complete_list_answer(pipeline.store(), &ask);
 }
 
 /// [`long_key`] of 128 properties, its `owl:hasKey` fact and list in `:secret`. A reader of
-/// the default graph only (inferences by support) reads the revision first; a reader of every
-/// graph then reads it too. Its key is left out, and `:x :name "Y"` entailed, so the second
-/// read is true or not `complete`, whatever the first reader's view found.
+/// the default graph only reads the revision first. The unrestricted read still sees
+/// the complete prp-key answer.
 #[test]
-fn a_restricted_read_leaves_a_hidden_keys_mark() {
+fn a_restricted_read_leaves_the_hidden_key_answer_complete_for_an_admin() {
     let pipeline = ql_pipeline(in_memory_store_config());
     let key = long_key(128);
     let (axiom, rest) = key.split_once(" .").expect("the key's axiom first");
@@ -1826,7 +1805,7 @@ fn a_restricted_read_leaves_a_hidden_keys_mark() {
     .expect("the data");
     let ask = format!("<{EX}x> <{EX}name> \"Y\"");
     restricted_read(pipeline.store(), &ask);
-    left_out_answer(pipeline.store(), &ask);
+    complete_list_answer(pipeline.store(), &ask);
 }
 
 /// Table 5 prp-key makes `:x` the same as `:y` and then as `:z`, so the
@@ -2339,7 +2318,7 @@ fn ql_pipeline(config: nrese_store::StoreConfig) -> MutationPipeline {
 }
 
 /// `data` written, then `ASK { ask }` either true or not `complete`.
-fn left_out_status(pipeline: &MutationPipeline, data: &str, ask: &str) {
+fn commit_list_and_check_answer(pipeline: &MutationPipeline, data: &str, ask: &str) {
     pipeline
         .apply(
             insert(data),
@@ -2347,22 +2326,7 @@ fn left_out_status(pipeline: &MutationPipeline, data: &str, ask: &str) {
             &MutationTicket::new(),
         )
         .expect("the data");
-    left_out_answer(pipeline.store(), ask);
-}
-
-fn left_out_answer(store: &StoreService, ask: &str) {
-    let answer = store
-        .execute_query(&nrese_store::SparqlQueryRequest::all(format!(
-            "ASK {{ {ask} }}"
-        )))
-        .expect("answered");
-    let payload = String::from_utf8(answer.payload).expect("utf8");
-    let status = answer.completeness.as_ref();
-    println!("plain read: {ask}: {payload} with {status:?}");
-    assert!(
-        payload.contains("true") || status.is_some_and(|c| !c.complete),
-        "{ask}: {payload} with {status:?}"
-    );
+    complete_list_answer(pipeline.store(), ask);
 }
 
 fn complete_list_answer(store: &StoreService, ask: &str) {
