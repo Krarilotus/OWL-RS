@@ -6858,11 +6858,7 @@ impl<'a> Context<'a> {
             error: bool,
         }
         const { assert!(std::mem::size_of::<State>() <= aggregate::STATE_BYTES) };
-        // Where the pass's states or numbers don't fit, it declines before it holds any: the
-        // per-column path holds one group's values at a time.
-        if reserve(aggregate::pass_bytes(groups, plans.len())).is_err() {
-            return Ok(None);
-        }
+        reserve(aggregate::pass_bytes(groups, plans.len()))?;
         let width = plans.len();
         let table = &solutions.table;
         fn missing_numbers(
@@ -6879,9 +6875,6 @@ impl<'a> Context<'a> {
         }
         // Every id's number, found once per query: the chunks of a cross product
         // ([`Self::group_crossed`]) share their values.
-        // Per expression and variable, the ids without a number yet, each with a row of it.
-        type Missing<'e> = ((Expression, Variable), &'e Expression, Vec<(u64, usize)>);
-        let mut work: Vec<Missing<'_>> = Vec::new();
         for plan in &plans {
             let (Plan::Total { column, expr, .. } | Plan::Counted { column, expr }) = plan else {
                 continue;
@@ -6889,9 +6882,6 @@ impl<'a> Context<'a> {
             // The expression and the variable it reads here: with another one bound, the
             // same id may give another value.
             let key = ((*expr).clone(), solutions.vars[*column].clone());
-            if work.iter().any(|(known, ..)| *known == key) {
-                continue;
-            }
             let missing = {
                 let (numbers, since) = (self.numbers.borrow(), self.since.borrow());
                 let mut known = remembered(&numbers, &since, &key);
@@ -6909,30 +6899,15 @@ impl<'a> Context<'a> {
             if missing.is_empty() {
                 continue;
             }
-            work.push((
-                key,
-                *expr,
-                missing.into_iter().collect::<Vec<(u64, usize)>>(),
-            ));
-        }
-        // Each number found is remembered: charged before (`number_bytes`), however many
-        // expressions the query sums, all at once.
-        let wanted = work
-            .iter()
-            .map(|(.., missing)| missing.len())
-            .sum::<usize>();
-        if self
-            .since
-            .borrow_mut()
-            .last_mut()
-            .expect("a numeric pass runs in a save point")
-            .held
-            .charge(wanted.saturating_mul(number_bytes()))
-            .is_err()
-        {
-            return Ok(None);
-        }
-        for (key, expr, missing) in work {
+            let missing: Vec<(u64, usize)> = missing.into_iter().collect();
+            // Each number found is remembered: charged before (`number_bytes`), however many
+            // expressions the query sums.
+            self.since
+                .borrow_mut()
+                .last_mut()
+                .expect("a numeric pass runs in a save point")
+                .held
+                .charge(missing.len().saturating_mul(number_bytes()))?;
             let number = |aggregator: &Aggregator<'_>, row: usize| {
                 let binding = aggregator.binding(solutions, row);
                 match aggregator.evaluator.eval(expr, &binding) {
