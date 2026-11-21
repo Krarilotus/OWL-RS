@@ -41,7 +41,7 @@ class DriverKind(unittest.TestCase):
             suite = SimpleNamespace(results=results, stamp="s", date="d", host="h", say=lambda *a: None, written=[],
                                     args=SimpleNamespace(dry_run=False, runs=3), root=ROOT, publish=lambda k: "free")
             suite.writer = Writer(results / "results.csv")
-            suite.host_command = lambda command, log=None: Suite.host_command(suite, command, log)
+            suite.host_command = lambda command, log=None, **kw: Suite.host_command(suite, command, log, **kw)
             suite.emit = lambda base, **fields: Suite.emit(suite, base, **fields)
             (results / "driver/claros-l/timed").mkdir(parents=True)
             Suite.driver(suite, plan, ["souffle"])
@@ -71,7 +71,7 @@ class DriverKind(unittest.TestCase):
                                         written=[], args=SimpleNamespace(dry_run=False, runs=1), root=ROOT,
                                         publish=lambda k: "free")
                 suite.writer = Writer(results / "results.csv")
-                suite.host_command = lambda command, log=None, suite=suite: Suite.host_command(suite, command, log)
+                suite.host_command = lambda command, log=None, suite=suite, **kw: Suite.host_command(suite, command, log, **kw)
                 suite.emit = lambda base, suite=suite, **fields: Suite.emit(suite, base, **fields)
                 Suite.driver(suite, plan, ["souffle"])
             self.assertEqual(len(read(results / "results.csv")), 2)

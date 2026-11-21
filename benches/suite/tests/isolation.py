@@ -14,6 +14,8 @@ once for the whole run, for the tests and every process they start:
 - removes every GIT_* variable but ALLOWED (none: a test sets what it needs itself), and the
   scope settings a calling suite run passes its workers (SUITE_SCOPE_*: runtime.scope_argv
   reads them by default, so a caller's SUITE_SCOPE_STOP_S=bad failed every scoped runtime test);
+- removes the proof host and any real overlay sources. Tests of private evidence supply their
+  own synthetic provenance. FLEET_OUT stays available as a place for test-owned scratch;
 - gives git a configuration of the suite's own: no system file (GIT_CONFIG_NOSYSTEM), an empty
   global file this module owns (GIT_CONFIG_GLOBAL), and through GIT_CONFIG_COUNT a test identity
   and core.hooksPath on an empty directory it owns, so no test repository runs our hooks or the
@@ -46,16 +48,19 @@ import unittest
 from pathlib import Path
 
 ALLOWED: frozenset[str] = frozenset()
+HOST_SETTINGS = {"FLEET_HOST", "BENCH_INPUTS_GIT", "NRESE_BENCH_PRIVATE", "NRESE_BENCH_HOSTS",
+                 "NRESE_BENCH_FLOORS", "NRESE_BENCH_OVERLAY_REV"}
 CONFIG = (("user.name", "suite test"), ("user.email", "suite-test@localhost"))
 ROOT = Path(__file__).resolve().parents[3]
 START = Path.cwd()
 
 
 def isolate(environ=os.environ) -> Path:
-    """The caller's GIT_* and SUITE_SCOPE_* variables out, the suite's git configuration and ceilings in; the
+    """Remove caller git, scope and host settings, configure the suite's git and ceilings, and return the
     directory holding that configuration (its global file and its empty hooks directory) and
     the scratch directory the tests run in."""
-    for name in [k for k in environ if k.startswith(("GIT_", "SUITE_SCOPE_")) and k not in ALLOWED]:
+    for name in [k for k in environ if k in HOST_SETTINGS or
+                 (k.startswith(("GIT_", "SUITE_SCOPE_")) and k not in ALLOWED)]:
         del environ[name]
     own = Path(tempfile.mkdtemp(prefix="suite-git-"))
     (own / "gitconfig").write_text("", encoding="utf-8")
