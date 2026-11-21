@@ -2587,6 +2587,16 @@ impl GroundProgram {
         Some(self.consistency.len() - 1)
     }
 
+    /// Whether this program already contains the exact same ground consistency rule.
+    pub(crate) fn has_consistency(&self, source: &Rule, grounded: &Grounded) -> bool {
+        let key = (
+            source.name.clone(),
+            grounded.substitution.clone(),
+            rule_key(&grounded.rule),
+        );
+        self.consistency_known.contains(&key)
+    }
+
     /// Grounds `rules` (fact and consistency rules) over all of `source`.
     pub fn ground<S: Source + ?Sized>(&mut self, source: &S, schema: &Schema, rules: &[Rule]) {
         for rule in rules {

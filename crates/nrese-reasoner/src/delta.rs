@@ -1186,7 +1186,6 @@ fn update_body<B: Base + ?Sized>(
         .map_err(stopped)?;
     rederived.extend(others.into_iter().flatten());
     check_stop()?;
-    let settled_consistency = program.consistency.len();
 
     lap(2, &mut result);
     // 3. Insert: semi-naive from the rederived and inserted facts.
@@ -1357,17 +1356,27 @@ fn update_body<B: Base + ?Sized>(
         hidden: &hidden,
         extra: &fresh,
     };
+    let mut full_consistency: Vec<usize> = Vec::new();
+    let mut is_full = vec![false; program.consistency.len()];
+    if matches!(program, Cow::Owned(_)) {
+        for (c, (rule, grounded)) in program.consistency.iter().enumerate() {
+            if !old_program.has_consistency(rule, grounded) {
+                full_consistency.push(c);
+                is_full[c] = true;
+            }
+        }
+    }
     let variants: Vec<(usize, usize)> = program
         .consistency_variants(&fresh, &stage)
         .map_err(|Stopped| Interrupted::default())?
         .into_iter()
-        .filter(|&(c, _)| c < settled_consistency)
+        .filter(|&(c, _)| !is_full[c])
         .collect();
     let mut found = Violations::new(Arc::clone(memory));
     check(
         &state,
         &program,
-        settled_consistency..program.consistency.len(),
+        full_consistency,
         &variants,
         &mut found,
         stop,
