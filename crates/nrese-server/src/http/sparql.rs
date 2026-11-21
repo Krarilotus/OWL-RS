@@ -296,9 +296,7 @@ pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiEr
             )
         }
         // Other queries hold the memory this one asked for: it may succeed later.
-        error if error.is_server_memory_limit() => ApiError::unavailable(format!(
-            "{error} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)"
-        )),
+        error if error.is_server_memory_limit() => server_memory_in_use(error),
         // The query needs more memory than the policy allows: the client's to change.
         error if error.is_memory_limit() => ApiError::payload_too_large(format!(
             "{error} (budgets.query_memory, NRESE_MAX_QUERY_MEMORY_BYTES)"
@@ -317,16 +315,27 @@ pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiEr
     }
 }
 
+/// The 503 of a read refused for the memory all queries share: it may succeed later.
+fn server_memory_in_use(error: StoreError) -> ApiError {
+    ApiError::unavailable(format!(
+        "{error} (budgets.total_query_memory, NRESE_MAX_TOTAL_QUERY_MEMORY_BYTES)"
+    ))
+}
+
 /// A store error of a read (query, RDF4J, Graph Store), `otherwise` unless it is a refusal
 /// until the store is rematerialised ([`StoreError::NotRematerialised`]): that is 503, with the
 /// store's sentence and, on a primary, the administrator's route. A replica refuses that route
-/// (`guard::enforce_admin_write`), so its answer adds nothing.
+/// (`guard::enforce_admin_write`), so its answer adds nothing. A reader of some graphs whose
+/// view had no room, told the class only (no limit), gets the 503 a query gets.
 pub(crate) fn refused_or(error: StoreError, otherwise: fn(String) -> ApiError) -> ApiError {
     match error {
         StoreError::NotRematerialised { replica: false } => ApiError::unavailable(format!(
             "{error} (an administrator: POST /api/v1/repositories/{{id}}/reasoning/rematerialise)"
         )),
         error @ StoreError::NotRematerialised { .. } => ApiError::unavailable(error.to_string()),
+        error @ StoreError::MemoryLimitWithoutAmounts { limit: None, .. } => {
+            server_memory_in_use(error)
+        }
         error => otherwise(error.to_string()),
     }
 }
