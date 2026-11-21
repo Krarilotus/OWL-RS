@@ -533,25 +533,27 @@ class QuickGateJob(fixture.Repo):
                          f"{(self.root / 'job-1.log').read_text()}{(self.root / 'job-2.log').read_text()}")
 
     def test_a_job_whose_cargo_runs_another_nextest_than_the_pinned_one_has_no_verdict(self):
-        # Spec (review r2, 1): real Cargo runs `cargo nextest` from $CARGO_HOME/bin before PATH. With another
-        # version there the job ends with no verdict (3) before its check; with the pinned one it runs it.
+        # Spec (review r2, 1; r3, 1): real Cargo runs `cargo nextest` from $CARGO_HOME/bin before PATH. With
+        # another version there, or the pinned one's text from a version command that fails (check.sh
+        # would fall back to cargo test), the job ends with no verdict (3) before its check; with the
+        # pinned one it runs it.
         cargo = real_cargo()
         if cargo is None:
             self.skipTest("no Cargo here")
         (self.stubs / "cargo").write_text(f'#!/bin/sh\n[ "$1" = nextest ] && exec "{cargo}" "$@"\nexit 0\n')
         (self.repo / "scripts/lib/gate-tools.txt").write_text("cargo-nextest 0.9.2\n")
         got = {}
-        for version in ("0.9.1", "0.9.2"):
-            home = self.root / f"cargo-home-{version}"
+        for case, version, status in (("other", "0.9.1", 0), ("failing", "0.9.2", 1), ("pinned", "0.9.2", 0)):
+            home = self.root / f"cargo-home-{case}"
             (home / "bin").mkdir(parents=True)
-            (home / "bin" / "cargo-nextest").write_text(f'#!/bin/sh\necho "cargo-nextest {version}"\n')
+            (home / "bin" / "cargo-nextest").write_text(f'#!/bin/sh\necho "cargo-nextest {version}"\nexit {status}\n')
             (home / "bin" / "cargo-nextest").chmod(0o755)
             Path(f"{self.seen}-quick").unlink(missing_ok=True)
             job = self.start("quick", CARGO_HOME=str(home))
-            got[version] = (self.ended(job), self.said("quick").get("nextest"))
-        self.assertEqual(got, {"0.9.1": (3, None), "0.9.2": (0, "0.9.2")},
+            got[case] = (self.ended(job), self.said("quick").get("nextest"))
+        self.assertEqual(got, {"other": (3, None), "failing": (3, None), "pinned": (0, "0.9.2")},
                          f"SPEC cargo-runs-the-pinned-nextest ({cargo})\n"
-                         f"{(self.root / 'job-1.log').read_text()}{(self.root / 'job-2.log').read_text()}")
+                         + "".join((self.root / f"job-{n}.log").read_text() for n in (1, 2, 3)))
 
 
 if __name__ == "__main__":

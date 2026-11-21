@@ -149,8 +149,10 @@ if [ "$mode" = push ] && grep -q 'cargo +nightly' scripts/miri.sh 2> /dev/null; 
   export PATH="$cache/shim:$PATH"
 fi
 # ... and the one the checks get: cargo looks for `cargo nextest` in $CARGO_HOME/bin before PATH, where a
-# host's own cargo-nextest would stand in for the pinned one.
-got=$(cargo nextest --version 2> /dev/null | awk 'NR == 1 { print $2 }')
+# host's own cargo-nextest would stand in for the pinned one. A version command that fails counts as
+# none, whatever it printed: check.sh would then fall back to cargo test.
+runner=$(cargo nextest --version 2> /dev/null) || runner=
+got=$(printf '%s\n' "$runner" | awk 'NR == 1 { print $2 }')
 [ "$got" = "$want" ] || infra "cargo nextest is cargo-nextest ${got:-none}, not the pinned $want (\$CARGO_HOME/bin first)"
 exec 7>&-
 # The suite contracts' Python packages, in an environment of their own (scripts/lib/suite-python.sh).
@@ -239,7 +241,7 @@ done
 [ -r "$cgroup/memory.peak" ] && peak=$(cat "$cgroup/memory.peak")
 
 GATE_TIER=$mode GATE_TREE=$tree GATE_LIST=$list_hash GATE_IDENTITY=$identity GATE_CODE=$code \
-  GATE_CPU=$(gate_cpu) GATE_HOST=$(hostname) GATE_NEXTEST=$(cargo nextest --version 2> /dev/null | head -1) \
+  GATE_CPU=$(gate_cpu) GATE_HOST=$(hostname) GATE_NEXTEST=$(printf '%s\n' "$runner" | head -1) \
   GATE_CHANGED=$(git status --porcelain --untracked-files=no) GATE_SECONDS=$((SECONDS - began)) GATE_PEAK=$peak \
   GATE_JOB=${FLEET_JOB:-} GATE_FLEET_HOST=${FLEET_HOST:-} GATE_ATTEMPT=$attempt \
   python3 "$tool/scripts/lib/gate-record.py" "$out"
