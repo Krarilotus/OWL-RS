@@ -3224,7 +3224,7 @@ fn delta_equals_rematerialisation_under_random_changes() {
     let mut witnessed = HashSet::new();
     let recipe = |case: u64| {
         // A third of the cases run the other rulesets in turn.
-        let ruleset = if case % 3 == 0 {
+        let ruleset = if case.is_multiple_of(3) {
             super::rulesets::ALL[(case as usize / 3) % (super::rulesets::ALL.len() - 1)]
         } else {
             Ruleset::Owl2Rl
