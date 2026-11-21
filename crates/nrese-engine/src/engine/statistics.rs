@@ -141,6 +141,12 @@ pub(crate) struct Statistics {
     /// tests hold a build with.
     #[cfg(test)]
     hook: Mutex<Option<Hook>>,
+    /// Rebuild threads asked for ([`Self::spawn`]): what the tests count.
+    #[cfg(test)]
+    spawns: AtomicU64,
+    /// Fails every rebuild thread's spawn as the OS fails one: what the tests set.
+    #[cfg(test)]
+    fail_spawns: std::sync::atomic::AtomicBool,
 }
 
 /// What a test runs at the next build's first scan ([`Statistics::hook`]).
@@ -435,27 +441,42 @@ impl Statistics {
     /// is published meanwhile.
     fn rebuild(self: &Arc<Self>, state: &SharedState<'_>, model: ReadModel) {
         let (statistics, snapshot) = (Arc::clone(self), state.snapshot().clone());
-        let started = std::thread::Builder::new()
-            .name("nrese-statistics".to_owned())
-            .spawn(move || {
-                // A clone keeps its publication: never `None`, so never left asked for.
-                let Some(state) = snapshot.shared_state() else {
-                    if let Some(kept) = statistics.sets.lock().get_mut(&model) {
-                        kept.rebuilding = false;
-                    }
-                    return;
-                };
-                let builder = statistics.claim_anyway(model);
-                let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
-                let size = state.snapshot().count_in(model, &pattern).at_least();
-                statistics.build_sets(&builder, &state, model, size, false);
-            });
+        let started = self.spawn(move || {
+            // A clone keeps its publication: never `None`, so never left asked for.
+            let Some(state) = snapshot.shared_state() else {
+                if let Some(kept) = statistics.sets.lock().get_mut(&model) {
+                    kept.rebuilding = false;
+                }
+                return;
+            };
+            let builder = statistics.claim_anyway(model);
+            let pattern = QuadPattern::in_graph(TermId::DEFAULT_GRAPH);
+            let size = state.snapshot().count_in(model, &pattern).at_least();
+            statistics.build_sets(&builder, &state, model, size, false);
+        });
         if started.is_err()
             && let Some(kept) = self.sets.lock().get_mut(&model)
         {
             // Asked again at the next drifted use.
             kept.rebuilding = false;
         }
+    }
+
+    /// Starts `run` on a thread of its own: the rebuild's. In the tests it is counted, and
+    /// fails where they ask as the OS fails one: the closure dropped unrun, as std drops it.
+    fn spawn(&self, run: impl FnOnce() + Send + 'static) -> std::io::Result<()> {
+        #[cfg(test)]
+        {
+            self.spawns.fetch_add(1, Ordering::SeqCst);
+            if self.fail_spawns.load(Ordering::SeqCst) {
+                drop(run);
+                return Err(std::io::Error::other("the test's failed spawn"));
+            }
+        }
+        std::thread::Builder::new()
+            .name("nrese-statistics".to_owned())
+            .spawn(run)
+            .map(drop)
     }
 
     /// Builds the characteristic sets of `model` now, whatever the size, keeps and saves
@@ -989,6 +1010,132 @@ mod tests {
         assert_eq!(statistics.heavy_walks(), 2);
     }
 
+    /// Holds the caller until `event`; past 15 s the test fails with `what`.
+    fn until(event: impl Fn() -> bool, what: &str) {
+        let started = std::time::Instant::now();
+        while !event() {
+            assert!(started.elapsed().as_secs() < 15, "{what}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// Whether a rebuild of `model`'s sets is asked for.
+    fn rebuilding(statistics: &Statistics, model: ReadModel) -> bool {
+        statistics
+            .sets
+            .lock()
+            .get(&model)
+            .is_some_and(|kept| kept.rebuilding)
+    }
+
+    /// The default graph's statements in `model` at `snapshot`: what sets built of it are at.
+    fn size(snapshot: &Snapshot, model: ReadModel) -> u64 {
+        snapshot
+            .count_in(model, &QuadPattern::in_graph(TermId::DEFAULT_GRAPH))
+            .at_least()
+    }
+
+    /// Spec (the module docs: drifted sets get one rebuild on a thread of its own): a rebuild
+    /// whose thread panics leaves no rebuild asked for, so the next drifted planner starts one
+    /// again and it replaces the sets. Before, the flag stayed set and the model was never
+    /// rebuilt again until a restart (D16-1039).
+    #[test]
+    fn a_panicking_rebuild_clears_rebuilding_so_later_reads_retry() {
+        let model = ReadModel::default();
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        add(&engine, 0..300);
+        let statistics = Arc::clone(&engine.inner.shared.statistics);
+        let first = engine
+            .snapshot()
+            .characteristic_sets_in(model)
+            .expect("built");
+        assert_eq!(statistics.scans(), 1);
+        add(&engine, 300..900);
+        let snapshot = engine.snapshot();
+        *statistics.hook.lock() = Some(Box::new(|_| panic!("the rebuild's injected panic")));
+        let stale = snapshot
+            .characteristic_sets_in(model)
+            .expect("the old sets while the rebuild runs");
+        assert!(Arc::ptr_eq(&stale, &first));
+        // The reset runs on the rebuild's thread as it unwinds: polled, never read once.
+        until(
+            || !rebuilding(&statistics, model),
+            "the panicked rebuild left its rebuild asked for",
+        );
+        let _ = snapshot.characteristic_sets_in(model);
+        assert_eq!(
+            statistics.spawns.load(Ordering::SeqCst),
+            2,
+            "the next drifted planner started no rebuild"
+        );
+        let at = size(&snapshot, model);
+        until(
+            || {
+                statistics
+                    .sets
+                    .lock()
+                    .get(&model)
+                    .is_some_and(|s| s.at == at)
+            },
+            "the second rebuild replaced nothing",
+        );
+        let rebuilt = snapshot.characteristic_sets_in(model).expect("rebuilt");
+        assert_eq!(rebuilt.subjects(), 900);
+    }
+
+    /// Spec (the module docs: planners go on with the old sets while a rebuild runs): a rebuild
+    /// whose thread can't be started leaves its planner, and the next, with the old sets, and
+    /// no rebuild asked for: each drifted planner asks again, and once a thread starts it
+    /// replaces them. Before, the failed spawn took the sets' lock its caller held, and every
+    /// planner hung (D16-1039). Planned on a thread of its own with a bounded receive, so the
+    /// hang fails this test, not the run.
+    #[test]
+    fn spawn_failure_clears_rebuilding_without_deadlocking() {
+        let model = ReadModel::default();
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        add(&engine, 0..300);
+        let statistics = Arc::clone(&engine.inner.shared.statistics);
+        let first = engine
+            .snapshot()
+            .characteristic_sets_in(model)
+            .expect("built");
+        add(&engine, 300..900);
+        let snapshot = engine.snapshot();
+        statistics.fail_spawns.store(true, Ordering::SeqCst);
+        let (planned, returned) = std::sync::mpsc::channel();
+        {
+            let snapshot = snapshot.clone();
+            std::thread::spawn(move || {
+                let one = snapshot.characteristic_sets_in(model);
+                let two = snapshot.characteristic_sets_in(model);
+                let _ = planned.send((one, two));
+            });
+        }
+        let (one, two) = returned
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect("the planners never returned from a failed spawn");
+        assert!(one.is_some_and(|sets| Arc::ptr_eq(&sets, &first)));
+        assert!(two.is_some_and(|sets| Arc::ptr_eq(&sets, &first)));
+        assert!(!rebuilding(&statistics, model));
+        assert_eq!(statistics.spawns.load(Ordering::SeqCst), 2);
+        statistics.fail_spawns.store(false, Ordering::SeqCst);
+        let _ = snapshot.characteristic_sets_in(model);
+        let at = size(&snapshot, model);
+        until(
+            || {
+                statistics
+                    .sets
+                    .lock()
+                    .get(&model)
+                    .is_some_and(|s| s.at == at)
+            },
+            "no rebuild after the failed spawns",
+        );
+        let rebuilt = snapshot.characteristic_sets_in(model).expect("rebuilt");
+        assert!(!Arc::ptr_eq(&rebuilt, &first));
+        assert_eq!(rebuilt.subjects(), 900);
+    }
+
     /// Holds the next build once its first scan is published: `planners` start, and the
     /// build goes on once `asleep` of them sleep on it.
     fn holding(statistics: &Statistics, asleep: usize, planners: impl FnOnce() + Send + 'static) {
@@ -1063,6 +1210,14 @@ mod tests {
         let held = statistics.claim_anyway(model);
         assert!(same(&planners(&workers, &snapshot), &first));
         assert!(same(&[snapshot.characteristic_sets_in(model)], &first));
+        // One rebuild asked for, and still asked for while its thread waits for `held`:
+        // its reset goes with that thread, never with the call that started it.
+        assert_eq!(statistics.spawns.load(Ordering::SeqCst), 1);
+        assert!(rebuilding(&statistics, model));
+        until(
+            || held.build().waiting() >= 1,
+            "the rebuild never waited for the held build",
+        );
         drop(held);
         // One rebuild replaces them.
         let started = std::time::Instant::now();
