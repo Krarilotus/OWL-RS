@@ -181,6 +181,7 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
     cases, the clean harness revision at start and end, its side's verified binaries (the same
     in every pass of the side), the same prepared data unchanged, one host and configuration."""
     errors, binaries, prepared, identities, options, layouts = [], {}, set(), set(), {}, {}
+    registry = hosts_registry.public_registry() if passes else {}
     for p in passes:
         r, name = p["report"], p["path"]
         if r.get("reps") != 1:
@@ -220,7 +221,7 @@ def provenance_errors(passes: list[dict], sides: dict[str, str], harness: str, p
             errors.append(f"{name}: prepared data changed during the pass: {info['changed'][:3]}")
         prepared.add(info.get("manifest_sha256"))
         options.setdefault(p["side"], set()).add(json.dumps(r.get("options"), sort_keys=True))
-        identities.add(json.dumps({**run_identity(r.get("machine") or {}, r.get("started", "")),
+        identities.add(json.dumps({**run_identity(r.get("machine") or {}, r.get("started", ""), registry),
                                    "runtime": r.get("runtime")}, sort_keys=True))
     errors += [f"{side}: different binaries in its passes" + (f" of layout {layout}" if layout > 1 else "")
                for (side, layout), shas in binaries.items() if len(shas) > 1]

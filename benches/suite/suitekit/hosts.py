@@ -339,8 +339,8 @@ def run_identity(machine: dict, started: str | None, registry: dict | None = Non
     overlay = {"overlay": machine["overlay"]} if "overlay" in machine else {}
     key, config = machine.get("host_key"), machine.get("host_config")
     if key is None or config is None:
-        # Older reports can consult the public registry without taking inputs from the replay shell.
-        registry = public_registry() if registry is None else registry
+        # Reports from before host configurations were saved use the registry's dated entries.
+        registry = load() if registry is None else registry
         name = machine.get("host") or "?"
         found = current(registry, name)
         key = found[0] if found else name
