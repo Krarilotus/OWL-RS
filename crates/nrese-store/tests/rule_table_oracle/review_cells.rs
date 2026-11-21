@@ -358,10 +358,9 @@ fn later_writes_agree_with_a_cold_per_cell_intersection() {
     );
 }
 
-#[test]
-fn deleting_the_sixty_fifth_walk_preserves_an_older_clash() {
-    // Design row 3, Table 5 prp-adp. Both raw graphs (before and after
-    // the deletion) relate the same pair by two properties of one walk.
+/// Table 5 prp-adp over 65 walks: `ex:a` relates to `ex:b` by `ex:m0` and `ex:q`,
+/// two properties of one walk.
+fn sixty_five_walks_with_a_clash() -> Write {
     let mut write = insert(
         "ex:ax rdf:type owl:AllDisjointProperties
          ex:ax owl:members ex:h
@@ -376,6 +375,32 @@ fn deleting_the_sixty_fifth_walk_preserves_an_older_clash() {
             .insert
             .push(triple(["ex:h", "rdf:first", &format!("ex:m{i}")]));
     }
+    write
+}
+
+#[test]
+fn a_delete_under_sixty_four_walks_keeps_an_older_clash() {
+    // Design row 3, Table 5 prp-adp: a store loaded past the gates holds
+    // the clash at 65 walks. Deleting the 65th first leaves 64 walks and
+    // the same clash, so the delete is refused.
+    let mut load = sixty_five_walks_with_a_clash();
+    load.past_gates = true;
+    check(
+        case(
+            "older-clash-delete",
+            ["ex:a", "ex:m0", "ex:b"],
+            vec![load, delete("ex:h rdf:first ex:m64")],
+        ),
+        &[false; 2],
+        &[true; 2],
+    );
+}
+
+#[test]
+fn deleting_the_sixty_fifth_walk_preserves_an_older_clash() {
+    // Design row 3, Table 5 prp-adp. Both raw graphs (before and after
+    // the deletion) relate the same pair by two properties of one walk.
+    let mut write = sixty_five_walks_with_a_clash();
     check(
         case(
             "older-clash-at-65-walks",
