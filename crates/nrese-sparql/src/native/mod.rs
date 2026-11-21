@@ -6764,12 +6764,16 @@ impl<'a> Context<'a> {
                 expr: &'e Expression,
                 average: bool,
             },
-            /// `COUNT` of an expression: its values that aren't errors, from the numbers a
-            /// `SUM` or `AVG` of the same expression finds (eager AVG's partial pair).
+            /// `COUNT` of an expression: its values that aren't errors, from the per-id
+            /// numbers a `SUM` or `AVG` finds.
             Counted {
                 column: usize,
                 expr: &'e Expression,
             },
+            /// `COUNT` of an expression beside a `SUM` or `AVG` of it (that plan's index):
+            /// that one's count, as a term that is no number ends the pass and an error
+            /// counts in neither.
+            CountOf(usize),
         }
         // The one column `expr` reads, if it reads one.
         let one_column = |expr: &Expression| {
@@ -6826,6 +6830,16 @@ impl<'a> Context<'a> {
         // Only worth it where a total is computed; counts alone take the other paths.
         if totals == 0 {
             return Ok(None);
+        }
+        for a in 0..plans.len() {
+            if let Plan::Counted { column, expr } = plans[a] {
+                let twin = plans.iter().position(|plan| {
+                    matches!(plan, Plan::Total { column: c, expr: e, .. } if *c == column && **e == *expr)
+                });
+                if let Some(twin) = twin {
+                    plans[a] = Plan::CountOf(twin);
+                }
+            }
         }
         #[derive(Clone, Copy)]
         struct State {
@@ -6993,6 +7007,7 @@ impl<'a> Context<'a> {
                                     None => return None,
                                 }
                             }
+                            Plan::CountOf(_) => {}
                         }
                     }
                 }
@@ -7054,6 +7069,9 @@ impl<'a> Context<'a> {
                             match plan {
                                 Plan::Rows | Plan::Bound(_) | Plan::Counted { .. } => {
                                     integer_agg(state.count as i64)
+                                }
+                                Plan::CountOf(total) => {
+                                    integer_agg(states[group * width + total].count as i64)
                                 }
                                 Plan::Total { average, .. } => {
                                     finish_total(state.total, state.error, state.count, *average)
