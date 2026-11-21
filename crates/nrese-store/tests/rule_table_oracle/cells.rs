@@ -313,17 +313,47 @@ fn nil_alias_terminates_a_list() {
             ),
         ],
     );
-    let (store, accepted) = judges::first_and_rebuild("compact", &fixture.writes[0].insert, false);
-    assert!(accepted);
-    let snapshot = store.read_snapshot(None).expect("read term dictionary");
-    let x = nrese_rdf::NamedNodeRef::new("http://example.org/x").unwrap();
-    let x = snapshot.lookup(x.into()).expect("the alias is interned");
-    let nil = snapshot.lookup(nrese_rdf::vocab::rdf::NIL.into());
+    let steps = sweep::steps(&fixture);
+    let expected = &steps[1].model;
+    assert!(!expected.inconsistent);
+    assert!(expected.facts.contains(&fixture.watch));
+
+    use nrese_reasoner::{ReasonerConfig, ReasoningMode};
+    let rl = ReasoningMode::Owl2Rl;
+    let mut missing = Vec::new();
+    for &mode in judges::MODES {
+        for rebuild in [false, true] {
+            let store = judges::open(mode, None);
+            let raw = judges::pipeline(&store, ReasoningMode::Disabled);
+            // An RL pipeline interns its rule vocabulary before the first write.
+            assert!(judges::apply(&raw, &fixture.writes[0]));
+            let reasoned = judges::pipeline(&store, rl);
+            if rebuild {
+                assert!(judges::apply(&raw, &fixture.writes[1]));
+                let program = ReasonerConfig::for_mode(rl).materialised_program().unwrap();
+                assert_eq!(store.rematerialise(program).unwrap().violations, 0);
+            } else {
+                assert!(judges::apply(&reasoned, &fixture.writes[1]));
+            }
+            let snapshot = store.read_snapshot(None).expect("read term dictionary");
+            let x = nrese_rdf::NamedNodeRef::new("http://example.org/x").unwrap();
+            let x = snapshot.lookup(x.into()).expect("the alias is interned");
+            let nil = snapshot
+                .lookup(nrese_rdf::vocab::rdf::NIL.into())
+                .expect("the terminator is interned");
+            assert!(
+                x.raw() < nil.raw(),
+                "{mode} rebuild={rebuild}: {x:?} >= {nil:?}"
+            );
+            if !judges::rows(&store).0.contains(&fixture.watch) {
+                missing.push((mode, rebuild));
+            }
+        }
+    }
     assert!(
-        nil.is_none_or(|nil| x.raw() < nil.raw()),
-        "the alias was interned first"
+        missing.is_empty(),
+        "the chain row differs from the oracle in {missing:?} (mode, rebuild)"
     );
-    check(fixture, &[true, true], &[false, true]);
 }
 
 #[test]
