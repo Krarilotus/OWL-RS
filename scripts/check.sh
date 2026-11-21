@@ -198,7 +198,11 @@ run_seeds() {
   local -a crates=() exprs=()
   local name crate target filter seed binary code=0
   for name in "$@"; do wanted[$name]=1; done
-  local base=$(( 16#$(git rev-parse --short=6 HEAD) % 100000 + 1000 ))
+  # The first six hex digits of the full id: an abbreviation (--short) grows where another object
+  # shares the prefix, so the same commit would draw other seeds on another host.
+  local head
+  head=$(git rev-parse HEAD) || return 2
+  local base=$(( 16#${head:0:6} % 100000 + 1000 ))
   while IFS=: read -r crate target filter; do
     [ -n "${wanted[$crate]:-}" ] || continue
     crates+=("$crate")

@@ -379,9 +379,12 @@ class PushGate(Repo):
         crate. A pass whose files beyond the push's reach a crate (under crates/, or workspace-wide)
         doesn't cover it: the push is gated on its own (here refused: no verdict)."""
         cases = (("crates/alpha/src/lib.rs", "b.txt"), ("Cargo.lock", "c.txt"))
-        start = self.base
         for n, (other, own) in enumerate(cases):
             with self.subTest(other=other):
+                # Each case's range starts where the last one's commits end, whatever its outcome.
+                start = self.git(self.repo, "rev-parse", "HEAD")
+                for job in self.fake.glob("job-*.toml"):
+                    job.unlink()
                 first = self.add(other, f"{other} changed\n")
                 tip = self.commit(own, f"{own} changed\n")
                 self.fleet("done", self.tree(tip), sorted([other, own]))
@@ -389,10 +392,9 @@ class PushGate(Repo):
                 self.assertEqual(done.returncode, 0, f"SPEC verified: {done.stderr}")
                 self.fleet("pending")
                 narrower = self.push((f"refs/heads/pkg/x{n}", tip, f"refs/heads/pkg/x{n}", first))
-                self.assertEqual((narrower.returncode != 0, len(self.jobs())), (True, 2 * n + 2),
+                self.assertEqual((narrower.returncode != 0, len(self.jobs())), (True, 2),
                                  f"SPEC covering-crates: a pass whose {other} reaches a crate covered "
                                  f"[{own}]\n{narrower.stderr}")
-                start = tip
 
     def test_a_pass_covers_only_its_own_commit(self):
         """Review r1 (21 Nov 2026): the push tier draws its random seeds from the commit, and the

@@ -45,7 +45,7 @@ exit 0
 """
 RECORD = '#!/bin/sh\necho "{name} $*" >> "$CALLS"\nexit 0\n'
 STUBS = {
-    "scripts/cargo-guarded.sh": '#!/bin/sh\necho "guarded ${NRESE_FUZZ_SEED:+seed }$*" >> "$CALLS"\nexit 0\n',
+    "scripts/cargo-guarded.sh": '#!/bin/sh\necho "guarded ${NRESE_FUZZ_SEED:+seed=$NRESE_FUZZ_SEED }$*" >> "$CALLS"\nexit 0\n',
     "scripts/fetch-w3c-tests.sh": RECORD.format(name="w3c"),
     "scripts/check-locks.sh": RECORD.format(name="locks"),
     "scripts/check-features.sh": RECORD.format(name="features"),
@@ -61,6 +61,15 @@ STUBS = {
     "apps/nrese-console/package.json": "{}\n",
 }
 TOOLS = {"cargo": CARGO, "npm": RECORD.format(name="npm"), "npx": RECORD.format(name="npx")}
+# git on a host whose repository holds another object sharing the commit's first six hex digits:
+# `rev-parse --short=6 HEAD` gives seven; anything else, git itself (REAL_GIT, filled in by the test).
+AMBIGUOUS_GIT = """#!/bin/sh
+if [ "$*" = "rev-parse --short=6 HEAD" ]; then
+  "REAL_GIT" rev-parse HEAD | cut -c1-7
+  exit
+fi
+exec "REAL_GIT" "$@"
+"""
 # The crate part of a list, fixed within a comparison: none, a crate others depend on, the crate
 # depending on it, a workspace-wide file (every crate).
 CRATE_PARTS = (frozenset(), frozenset({"crates/alpha/src/lib.rs"}), frozenset({"crates/beta/src/lib.rs"}),
@@ -106,7 +115,7 @@ def facts(stdout, calls):
             done |= {("python names", f) for f in words[1:]}
         elif words[0] != "guarded" or "--manifest-path" in words:
             continue
-        elif words[1] == "seed":
+        elif words[1].startswith("seed="):
             done |= {("seeds", c) for c in crates}
         elif words[1] == "clippy":
             done |= {("clippy", c) for c in crates}
@@ -153,13 +162,16 @@ class PushTierMonotone(unittest.TestCase):
             cls.runs = dict(zip(TABLE, pool.map(cls.tier, range(len(TABLE)), TABLE)))
 
     @classmethod
-    def tier(cls, n, files):
-        """The tier's run over FILES: (exit code, its facts, its output)."""
+    def tier(cls, n, files, first=None):
+        """The tier's run over FILES, with FIRST's tools first on PATH: (exit code, its standard output,
+        its calls, all its output)."""
         own = cls.root / f"run-{n}"
         own.mkdir()
         (own / "files").write_text("".join(f"{f}\n" for f in sorted(files)), newline="\n")
         calls = own / "calls"
         env = {**cls.env, "CALLS": calls.as_posix(), "NRESE_FILES_FROM": (own / "files").as_posix()}
+        if first:
+            env["PATH"] = first.as_posix() + os.pathsep + env["PATH"]
         done = subprocess.run([BASH, "scripts/check.sh", "push"], cwd=cls.repo, capture_output=True, text=True,
                               env=env, timeout=120, stdin=subprocess.DEVNULL)
         lines = calls.read_text().splitlines() if calls.exists() else []
@@ -179,6 +191,26 @@ class PushTierMonotone(unittest.TestCase):
                                                    ("test", "alpha", "fast"), ("test", "beta", "fast"),
                                                    ("seeds", "alpha")}
         self.assertEqual(facts(stdout, calls), expected, f"SPEC push-tier-selection: the run as read\n{out}")
+
+    def test_the_seeds_come_from_the_full_commit_id(self):
+        """Review r2 (21 Nov 2026): the random tests' seeds are drawn from the commit, its id's first six
+        hex digits, the same on every host. A host whose repository holds another object sharing those
+        six digits abbreviates the id longer (`git rev-parse --short=6` gives seven); the seeds don't
+        change with it. Here git stands in for such a host: it answers that abbreviation with seven
+        digits and runs everything else as git does."""
+        ambiguous = self.root / "ambiguous"
+        ambiguous.mkdir(exist_ok=True)
+        (ambiguous / "git").write_text(AMBIGUOUS_GIT.replace("REAL_GIT", shutil.which("git").replace("\\", "/")),
+                                       newline="\n")
+        (ambiguous / "git").chmod(0o755)
+        head = subprocess.run(["git", "-C", str(self.repo), "rev-parse", "HEAD"], capture_output=True, text=True,
+                              env=self.env, check=True).stdout.strip()
+        base = int(head[:6], 16) % 100000 + 1000
+        code, _, calls, out = self.tier(len(TABLE), {"crates/alpha/src/lib.rs"}, first=ambiguous)
+        self.assertEqual(code, 0, out)
+        seeds = [w.split("=", 1)[1] for line in calls for w in line.split()[1:2] if w.startswith("seed=")]
+        self.assertEqual(seeds, [str(base), str(base + 1), str(base + 2)],
+                         f"SPEC seeds-from-the-commit: seeds not drawn from the id's first six digits\n{out}")
 
     def test_files_reaching_no_crate_only_add_checks(self):
         for smaller, larger in ((s, t) for s in TABLE for t in TABLE if s < t):
