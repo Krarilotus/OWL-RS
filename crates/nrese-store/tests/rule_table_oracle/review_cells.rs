@@ -171,6 +171,29 @@ fn a_large_branched_all_different_stays_within_the_memory_limit() {
     use nrese_store::{ProcessMemory, StoreConfig, StoreService};
     use std::sync::Arc;
 
+    // The ceiling covers the entire process. Give this workload its own
+    // process so other oracle cases cannot spend part of its allowance.
+    const CHILD: &str = "NRESE_TEST_PAIRWISE_MEMORY_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let result =
+            std::process::Command::new(std::env::current_exe().expect("oracle test binary"))
+                .args([
+                    "--exact",
+                    "review_cells::a_large_branched_all_different_stays_within_the_memory_limit",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .expect("run the pairwise memory cell");
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert!(
+            result.status.success() && stdout.contains("1 passed;"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        return;
+    }
+
     // Table 4 eq-diff2 accepts a list of distinct terms and refuses
     // equality between its first and last members. Seven shortcuts
     // give 128 walks with more than 3,000 members apiece.
