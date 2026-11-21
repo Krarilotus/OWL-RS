@@ -24,6 +24,7 @@ static ALLOCATOR: measure::Measured<std::alloc::System> = measure::Measured(std:
 fn operators() -> ServerConfig {
     ServerConfig {
         bind_address: "127.0.0.1:0".parse().unwrap(),
+        public_url: None,
         deployment_posture: DeploymentPosture::OpenWorkbench,
         store: StoreConfig {
             index_encoding: IndexEncoding::Compact,
@@ -96,7 +97,7 @@ fn the_configured_settings_hold_through_start_up_and_a_draft_check() {
     let reply = runtime.block_on(async {
         let declared = call(&app, Method::GET, "/api/v1/draft-check/capabilities", None).await;
         let request = json!({
-            "protocol": "dmw-store-check/1",
+            "protocol": "store-check/1",
             "operation": "shacl",
             "request_sha256": "a".repeat(64),
             "scope": {"project_id": "project", "owner_id": "owner"},

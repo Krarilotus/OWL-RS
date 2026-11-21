@@ -1273,3 +1273,979 @@ fn a_question_naming_an_individual_the_data_doesnt_is_not_complete_when_the_onto
         "the answer, evaluated afresh: {answer}"
     );
 }
+
+/// The unions store of `tests/it/dl/model_labels.rs` with `n` individuals, the `k`-th with
+/// the value `v(k mod 4)`, a candidate limit of 4, and the model's refutations on or off.
+fn unions_store(model_labels: bool, n: usize) -> Arc<StoreService> {
+    padded_unions_store(model_labels, n, 0)
+}
+
+/// [`unions_store`], the names of the individuals with `v2` and `v3` (the gap of `?x a :U0`)
+/// longer by `pad` bytes.
+fn padded_unions_store(model_labels: bool, n: usize, pad: usize) -> Arc<StoreService> {
+    let dl = crate::DlConfig {
+        max_candidates: Some(4),
+        model_labels,
+        ..crate::DlConfig::default()
+    };
+    unions_store_with(dl, n, pad)
+}
+
+/// [`padded_unions_store`] under the DL settings `dl`.
+fn unions_store_with(dl: crate::DlConfig, n: usize, pad: usize) -> Arc<StoreService> {
+    let mut data = String::new();
+    for k in 0..n {
+        let pad = "x".repeat(if k % 4 < 2 { 0 } else { pad });
+        data.push_str(&format!(":i{k}{pad} :val :v{} .\n", k % 4));
+    }
+    unions_store_of(dl, &data)
+}
+
+/// The unions of `tests/it/dl/model_labels_unions.ttl` with the individuals `data` states,
+/// committed in that order, under the DL settings `dl`.
+fn unions_store_of(dl: crate::DlConfig, data: &str) -> Arc<StoreService> {
+    let data = format!(
+        "{}{data}",
+        include_str!("../../tests/it/dl/model_labels_unions.ttl")
+    );
+    let config = crate::StoreConfig {
+        dl,
+        ..crate::StoreConfig::in_memory()
+    };
+    lower_true_store_with(config, &data)
+}
+
+/// A read's answers' bytes and its status with what decided it.
+type Read = (
+    Vec<u8>,
+    Option<(nrese_sparql::Completeness, crate::dl::DlDetail)>,
+);
+
+/// `SELECT ?x { ?x a :U0 }` over `store` within `memory` bytes.
+fn unions_read(store: &StoreService, memory: Option<usize>) -> crate::StoreResult<Read> {
+    unions_read_of(store, "?x a <urn:test:U0>", memory)
+}
+
+/// `SELECT ?x { pattern }` over `store` within `memory` bytes.
+fn unions_read_of(
+    store: &StoreService,
+    pattern: &str,
+    memory: Option<usize>,
+) -> crate::StoreResult<Read> {
+    let mut request = crate::SparqlQueryRequest::all(format!("SELECT ?x {{ {pattern} }}"));
+    request.memory_limit = memory;
+    let prepared = store.prepare_query(&request)?;
+    let mut out = Vec::new();
+    let status = store.run_query_dl(&prepared, &CancellationToken::new(), &mut out)?;
+    Ok((out, status))
+}
+
+/// Spec: a setting turns the model's refutations on, off by default, and off a read is decided
+/// by each candidate's own test as before: over the 24 individuals with a candidate limit of 4,
+/// the 4 admitted refuted, 8 unresolved, the read not `complete`, none refuted by labels. On,
+/// the model refutes all 12 (*Direct Semantics* §2.5: one model with the candidate outside the
+/// class), the read is `complete`, and its rows are the same 12.
+#[test]
+fn without_model_labels_a_read_is_decided_by_its_tests_alone() {
+    let default = crate::DlConfig::default().model_labels;
+    assert!(!default, "off by default");
+    let (off, on) = (unions_store(default, 24), unions_store(true, 24));
+    let (off_rows, off_status) = unions_read(&off, None).unwrap();
+    let (on_rows, on_status) = unions_read(&on, None).unwrap();
+    let ((off_status, off_detail), (on_status, on_detail)) =
+        (off_status.unwrap(), on_status.unwrap());
+    println!("off {off_status:?} {off_detail:?}; on {on_status:?} {on_detail:?}");
+    let bounds =
+        |s: &nrese_sparql::Completeness| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
+    assert_eq!(bounds(&off_status), Some((12, 24, 8)));
+    assert_eq!(
+        (
+            off_detail.proved,
+            off_detail.refuted,
+            off_detail.refuted_by_labels
+        ),
+        (0, 4, 0)
+    );
+    assert!(!off_status.complete);
+    assert_eq!(off_rows, on_rows, "the same rows");
+    assert_eq!(bounds(&on_status), Some((12, 24, 0)));
+    assert_eq!(
+        (
+            on_detail.proved,
+            on_detail.refuted,
+            on_detail.refuted_by_labels
+        ),
+        (0, 12, 12)
+    );
+    assert!(on_status.complete, "{:?}", on_status.reasons);
+}
+
+/// Spec: the model's refutations need the whole gap selected, but never fail a read: under
+/// each request memory limit from 16 KiB to 64 MiB (steps of a tenth), over 400 individuals,
+/// a read answered with the refutations off is answered with them on. And the fallback is
+/// reached: at the least limit the read is answered under with them off (found to 256 bytes),
+/// or within 16 KiB above it, the whole gap (400 rows) has no room beside what the capped
+/// selection needs, and the read with them on says so (`capped-gap`) and is answered. Every
+/// read, on both sides, is the first of a store just committed: a store's first read holds
+/// more than its later ones, so only first reads compare like with like.
+#[test]
+fn a_read_answered_without_model_labels_is_answered_with_them_under_every_memory_limit() {
+    let first = |labels: bool, limit: usize| unions_read(&unions_store(labels, 400), Some(limit));
+    let (mut limit, mut answered, mut failed) = (16usize << 10, 0, 0);
+    while limit <= 64 << 20 {
+        match first(false, limit) {
+            Ok(_) => {
+                answered += 1;
+                let with = first(true, limit);
+                assert!(
+                    with.is_ok(),
+                    "{limit} bytes: off answered, on {:?}",
+                    with.err()
+                );
+            }
+            Err(_) => failed += 1,
+        }
+        limit += limit / 10;
+    }
+    println!("off answered under {answered} limits and failed under {failed}");
+    assert!(
+        answered > 0 && failed > 0,
+        "the limits cross the read's need"
+    );
+    let (mut low, mut high) = (16usize << 10, 64usize << 20);
+    while high - low > 256 {
+        let middle = low + (high - low) / 2;
+        match first(false, middle) {
+            Ok(_) => high = middle,
+            Err(_) => low = middle,
+        }
+    }
+    let capped = |limit: usize| match first(true, limit) {
+        Ok((_, Some((_, detail)))) => detail.paths.contains(&"capped-gap"),
+        _ => false,
+    };
+    let fallback = (0..64).map(|k| high + k * 256).find(|&limit| capped(limit));
+    println!("off answered from {high} bytes; on fell back to the capped gap at {fallback:?}");
+    assert!(
+        fallback.is_some(),
+        "no fallback within 16 KiB of {high} bytes"
+    );
+}
+
+/// Spec: where the whole gap's selection fits but the labels' own run has no room, the read
+/// with them on refutes none by labels, and it needs no more than the read with them off. With
+/// the gap's 200 candidates named by 8000-byte IRIs, the decoded rows of a batch, not the
+/// selection's fixed size per term, set a read's need. Under each request memory limit from
+/// 16 KiB to 4 MiB (steps of a fiftieth), and in steps of 256 bytes over the 16 KiB from the
+/// least limit the read is answered under with them off (found to 256 bytes), every read the
+/// first of a store just committed, a read answered with the refutations off is answered with
+/// them on. And the case is reached: under some limit the read with them on selects the whole
+/// gap (no `capped-gap`), refutes none by labels, and is answered; and under the largest limit
+/// the same store's read refutes all 200 by labels, so no room is why none were.
+#[test]
+fn a_read_whose_labels_have_no_room_needs_no_more_memory_than_without_them() {
+    let first = |labels: bool, limit: usize| {
+        unions_read(&padded_unions_store(labels, 400, 8000), Some(limit))
+    };
+    let (mut low, mut high) = (16usize << 10, 4usize << 20);
+    while high - low > 256 {
+        let middle = low + (high - low) / 2;
+        match first(false, middle) {
+            Ok(_) => high = middle,
+            Err(_) => low = middle,
+        }
+    }
+    let mut limits: Vec<usize> = (0..64).map(|k| high + k * 256).collect();
+    let mut limit = 16usize << 10;
+    while limit <= 4 << 20 {
+        limits.push(limit);
+        limit += limit / 50;
+    }
+    let largest = *limits.iter().max().unwrap();
+    let mut reached = Vec::new();
+    for limit in limits {
+        if first(false, limit).is_ok() {
+            let with = first(true, limit);
+            assert!(
+                with.is_ok(),
+                "{limit} bytes: off answered, on {:?}",
+                with.err()
+            );
+            if let Ok((_, Some((_, detail)))) = &with
+                && !detail.paths.contains(&"capped-gap")
+                && detail.refuted_by_labels == 0
+            {
+                reached.push(limit);
+            }
+        }
+    }
+    println!(
+        "off answered from {high} bytes; the whole gap selected, none refuted by labels, answered under {reached:?}"
+    );
+    assert!(!reached.is_empty(), "no limit reaches the case");
+    let (_, status) = first(true, largest).unwrap();
+    let detail = status.expect("a status").1;
+    println!("under {largest} bytes: {detail:?}");
+    assert_eq!(detail.refuted_by_labels, 200, "with room, all 200");
+}
+
+/// Spec: the labels' quarter is taken from what the read has left, never from a fresh clock: a
+/// read whose deadline has passed when it begins gives them no time, so no model is run. With
+/// `dl.timeout` an hour (a fresh quarter: 15 minutes) and a deadline passed before the read,
+/// over the 24 individuals with a candidate limit of 4: the read with the labels on is decided
+/// exactly as with them off, by its tests alone, which the deadline leaves undecided: none
+/// proved or refuted, none by labels, 12 unresolved, not `complete`, the same status and
+/// detail. And the labels are live: the same read under the hour refutes all 12 by labels.
+/// Nothing waits; no time is measured.
+// By reading only: the labels' deadline is fixed before `gap::select`, and `run.deadline` is set.
+#[test]
+fn a_read_whose_deadline_has_passed_gives_the_labels_no_time() {
+    let read = |model_labels: bool, deadline: Deadline| {
+        let dl = crate::DlConfig {
+            max_candidates: Some(4),
+            model_labels,
+            timeout: Some(std::time::Duration::from_secs(3600)),
+            ..crate::DlConfig::default()
+        };
+        let store = unions_store_with(dl, 24, 0);
+        let request = crate::SparqlQueryRequest::all("SELECT ?x { ?x a <urn:test:U0> }");
+        let prepared = PreparedQuery::parse(&request).unwrap();
+        let outcome = decide_answers(
+            &store,
+            &prepared,
+            &analyse(prepared.query()),
+            &crate::dl::bounds::view(&store),
+            (&CancellationToken::new(), deadline),
+            &nrese_exec::Envelope::unlimited(),
+            DlAnswers::default(),
+        )
+        .unwrap();
+        let (Outcome::Stream(status, _, detail) | Outcome::Answers(_, status, detail)) = outcome;
+        println!("labels {model_labels}: {status:?} {detail:?}");
+        (status, detail)
+    };
+    let passed = Deadline::at(std::time::Instant::now());
+    let (off, off_detail) = read(false, passed);
+    let bounds = off.bounds.map(|b| (b.lower, b.upper, b.unresolved));
+    assert_eq!(bounds, Some((12, 24, 12)));
+    let counts = |d: &crate::dl::DlDetail| (d.proved, d.refuted, d.refuted_by_labels);
+    assert_eq!((counts(&off_detail), off.complete), ((0, 0, 0), false));
+    let (on, on_detail) = read(true, passed);
+    assert_eq!(
+        format!("{on:?} {on_detail:?}"),
+        format!("{off:?} {off_detail:?}"),
+        "status and detail as with them off"
+    );
+    let hour = Deadline::after(Some(std::time::Duration::from_secs(3600)));
+    assert_eq!(counts(&read(true, hour).1).2, 12, "under the hour, all 12");
+}
+
+/// The unions' store of 24 individuals with a candidate limit of 4 and no `dl.timeout`, its
+/// view built.
+fn capped_unions_store() -> Arc<StoreService> {
+    let dl = crate::DlConfig {
+        max_candidates: Some(4),
+        timeout: None,
+        ..crate::DlConfig::default()
+    };
+    let store = unions_store_with(dl, 24, 0);
+    let _ = crate::dl::bounds::view(&store);
+    store
+}
+
+/// `SELECT ?x { ?x a :U0 }` with the request's `deadline`.
+fn request_until(deadline: Option<std::time::Instant>) -> crate::SparqlQueryRequest {
+    let mut request = crate::SparqlQueryRequest::all("SELECT ?x { ?x a <urn:test:U0> }");
+    request.deadline = deadline;
+    request
+}
+
+/// Spec: at the request's deadline a read is told incomplete with the rows it has, never an
+/// error. Over [`capped_unions_store`], a read whose request's deadline has passed returns
+/// the rows the read with no deadline returns (L's), decides none of its candidates (none
+/// refuted, 12 unresolved) and is not `complete`; with no deadline, 4 are refuted. Nothing
+/// waits; no time is measured.
+#[test]
+fn a_read_past_its_requests_deadline_is_told_incomplete_with_its_rows() {
+    let store = capped_unions_store();
+    let read = |deadline| {
+        let prepared = store.prepare_query(&request_until(deadline)).unwrap();
+        let mut out = Vec::new();
+        let status = store.run_query_dl(&prepared, &CancellationToken::new(), &mut out);
+        let status = status.expect("an answer, not an error");
+        (out, status.expect("a DL status"))
+    };
+    let (rows, (status, detail)) = read(Some(std::time::Instant::now()));
+    let (free_rows, (free, free_detail)) = read(None);
+    println!("passed {status:?} {detail:?}; no deadline {free:?} {free_detail:?}");
+    let bounds =
+        |s: &nrese_sparql::Completeness| s.bounds.map(|b| (b.lower, b.upper, b.unresolved));
+    let counts = |d: &crate::dl::DlDetail| (d.proved, d.refuted);
+    assert_eq!(
+        (bounds(&status), counts(&detail), status.complete),
+        (Some((12, 24, 12)), (0, 0), false)
+    );
+    assert_eq!(
+        (bounds(&free), counts(&free_detail)),
+        (Some((12, 24, 8)), (0, 4)),
+        "with no deadline"
+    );
+    assert_eq!(rows, free_rows, "the rows in hand");
+}
+
+/// Spec: the cancellation stays the operator's stop and an error, whether the request's
+/// deadline has passed or not: a read cancelled once its answers are decided ends
+/// `Cancelled`, never as an incomplete answer.
+#[test]
+fn an_operators_cancel_is_an_error_past_the_deadline_too() {
+    let store = capped_unions_store();
+    for deadline in [None, Some(std::time::Instant::now())] {
+        let prepared = store.prepare_query(&request_until(deadline)).unwrap();
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        crate::service::hooks::AFTER_DECIDED.set(Some(Box::new(move || cancel.cancel())));
+        let outcome = answer(
+            &store,
+            &store.engine().snapshot(),
+            &prepared,
+            &token,
+            &nrese_exec::Envelope::unlimited(),
+            DlAnswers::default(),
+        )
+        .err();
+        assert!(
+            token.is_cancelled(),
+            "{deadline:?}: the read was never cancelled"
+        );
+        assert!(
+            matches!(
+                outcome,
+                Some(StoreError::SparqlEvaluation(
+                    nrese_sparql::QueryEvaluationError::Cancelled
+                ))
+            ),
+            "{deadline:?}: {outcome:?}"
+        );
+    }
+}
+
+/// Spec: where the labels refute the rows the capped read would admit first, the read with
+/// them on admits no later row whose batch costs more, so it never needs more memory than the
+/// read with them off. Under `?x a :U0 . ?x a :U1`, the candidate limit 4: eight individuals
+/// each with `v0`, `v1` and `v2`, short-named and committed first, and six with `v3`, named by
+/// IRIs longer by 64000 bytes and committed last (term-id order is the admission order). The
+/// rows with `v0` and `v2` keep one class assertion, which the labels refute; the six with
+/// `v3` keep both. Under each request memory limit from 16 KiB to 8 MiB (steps of a fiftieth),
+/// and in steps of 256 bytes over the 16 KiB from the least limit the read is answered under
+/// with them off, every read the first of a store just committed, a read answered with them off
+/// is answered with them on. And the case is reached: under some limit the read with them on
+/// refutes all 16 by labels and is answered.
+#[test]
+fn rows_the_labels_promote_past_the_capped_prefix_cost_no_more_memory() {
+    let mut data = String::new();
+    for k in 0..24 {
+        data.push_str(&format!(":i{k} :val :v{} .\n", k % 3));
+    }
+    let pad = "x".repeat(64000);
+    for k in 0..6 {
+        data.push_str(&format!(":j{k}{pad} :val :v3 .\n"));
+    }
+    let first = |model_labels: bool, limit: usize| {
+        let dl = crate::DlConfig {
+            max_candidates: Some(4),
+            model_labels,
+            ..crate::DlConfig::default()
+        };
+        let store = unions_store_of(dl, &data);
+        unions_read_of(
+            &store,
+            "?x a <urn:test:U0> . ?x a <urn:test:U1>",
+            Some(limit),
+        )
+    };
+    let (mut low, mut high) = (16usize << 10, 8usize << 20);
+    while high - low > 256 {
+        let middle = low + (high - low) / 2;
+        match first(false, middle) {
+            Ok(_) => high = middle,
+            Err(_) => low = middle,
+        }
+    }
+    let mut limits: Vec<usize> = (0..64).map(|k| high + k * 256).collect();
+    let mut limit = 16usize << 10;
+    while limit <= 8 << 20 {
+        limits.push(limit);
+        limit += limit / 50;
+    }
+    let mut reached = Vec::new();
+    for limit in limits {
+        if first(false, limit).is_ok() {
+            let with = first(true, limit);
+            assert!(
+                with.is_ok(),
+                "{limit} bytes: off answered, on {:?}",
+                with.err()
+            );
+            if let Ok((_, Some((_, detail)))) = &with
+                && detail.refuted_by_labels == 16
+            {
+                reached.push(limit);
+            }
+        }
+    }
+    println!(
+        "off answered from {high} bytes; all 16 refuted by labels, answered under {reached:?}"
+    );
+    assert!(!reached.is_empty(), "no limit reaches the case");
+}
+
+/// Spec: where the labels refute rows the capped read would admit and its batches would mix
+/// with others, the read with them on puts the rows they leave in no batch that costs more than
+/// the capped read's did. Under `?x a :U0 . ?x a :U1`, the default candidate limit: twice 32
+/// short-named individuals with `v0`, which the labels refute, each followed by 32 with `v3`,
+/// named by IRIs longer by 8000 bytes, committed in that order (term-id order is the admission
+/// order). With them off each batch of 64 holds 32 of each; with them on the 64 long rows are
+/// left. Under each request memory limit from 16 KiB to 4 MiB (steps of a tenth), and in
+/// steps of 256 bytes over the 16 KiB from the least limit the read is answered under with them
+/// off, every read the first of a store just committed, a read answered with them off is
+/// answered with them on. And the case is reached: under some limit below the least one a read
+/// of the 64 long rows alone (with them off: one batch) is answered under, the read with them on
+/// refutes the 64 short rows by labels and is answered.
+#[test]
+fn rows_the_labels_leave_are_batched_no_costlier_than_the_capped_read() {
+    let pad = "x".repeat(8000);
+    let (mut data, mut long) = (String::new(), String::new());
+    for g in 0..2 {
+        for k in g * 32..(g + 1) * 32 {
+            data.push_str(&format!(":a{k} :val :v0 .\n"));
+        }
+        for k in g * 32..(g + 1) * 32 {
+            long.push_str(&format!(":b{k}{pad} :val :v3 .\n"));
+            data.push_str(&format!(":b{k}{pad} :val :v3 .\n"));
+        }
+    }
+    let first = |model_labels: bool, data: &str, limit: usize| {
+        let dl = crate::DlConfig {
+            model_labels,
+            ..crate::DlConfig::default()
+        };
+        let store = unions_store_of(dl, data);
+        unions_read_of(
+            &store,
+            "?x a <urn:test:U0> . ?x a <urn:test:U1>",
+            Some(limit),
+        )
+    };
+    let least = |data: &str| {
+        let (mut low, mut high) = (16usize << 10, 4usize << 20);
+        while high - low > 256 {
+            let middle = low + (high - low) / 2;
+            match first(false, data, middle) {
+                Ok(_) => high = middle,
+                Err(_) => low = middle,
+            }
+        }
+        high
+    };
+    let (high, one_batch) = (least(&data), least(&long));
+    let mut limits: Vec<usize> = (0..64).map(|k| high + k * 256).collect();
+    let mut limit = 16usize << 10;
+    while limit <= 4 << 20 {
+        limits.push(limit);
+        limit += limit / 10;
+    }
+    let mut reached = Vec::new();
+    for limit in limits {
+        if first(false, &data, limit).is_ok() {
+            let with = first(true, &data, limit);
+            assert!(
+                with.is_ok(),
+                "{limit} bytes: off answered, on {:?}",
+                with.err()
+            );
+            if let Ok((_, Some((_, detail)))) = &with
+                && detail.refuted_by_labels == 64
+                && limit < one_batch
+            {
+                reached.push(limit);
+            }
+        }
+    }
+    println!(
+        "off answered from {high} bytes, the 64 long rows alone from {one_batch}; all 64 short refuted by labels, answered under {reached:?}"
+    );
+    assert!(!reached.is_empty(), "no limit reaches the case");
+}
+
+/// The pattern of [`promoted_store`]'s and [`past_prefix_store`]'s reads.
+const PROMOTED: &str = "?x a <urn:test:U0> . ?x a <urn:test:U1>";
+
+/// The unions store under [`PROMOTED`], a candidate limit of 64 and the labels on or off, with
+/// its gap in commit order (term-id order is the admission order): 60 short-named individuals
+/// with `v0` (`:a{k}`, each keeping one class assertion, which the labels refute), 4 with `v3`
+/// (`:b{k}`), then 100 with `v3` named a byte longer (`:c{k}x`). The capped read's first 64
+/// rows are the `a`s and `b`s; the labels leave the 4 `b`s of them, then the `c`s, whose rows
+/// cost more than the `a`s they follow. Each `v3` row's own test refutes it.
+fn promoted_store(model_labels: bool) -> Arc<StoreService> {
+    let mut data = String::new();
+    for k in 0..60 {
+        data.push_str(&format!(":a{k} :val :v0 .\n"));
+    }
+    for k in 0..4 {
+        data.push_str(&format!(":b{k} :val :v3 .\n"));
+    }
+    for k in 0..100 {
+        data.push_str(&format!(":c{k}x :val :v3 .\n"));
+    }
+    let dl = crate::DlConfig {
+        max_candidates: Some(64),
+        model_labels,
+        ..crate::DlConfig::default()
+    };
+    unions_store_of(dl, &data)
+}
+
+/// [`promoted_store`]'s read with the labels on and no memory limit: what decided it, its status.
+fn promoted_read() -> (crate::dl::DlDetail, nrese_sparql::Completeness) {
+    let (_, status) = unions_read_of(&promoted_store(true), PROMOTED, None).unwrap();
+    let (status, detail) = status.expect("a status");
+    println!("{status:?} {detail:?}");
+    (detail, status)
+}
+
+/// Spec: a read says the candidate limit stopped it only where that many candidates went to
+/// their tests. In [`promoted_read`] the labels refute 60 of the capped read's first 64 rows,
+/// and 104 candidates survive them: a reason names `dl.max_candidates` (64), and 64 of the
+/// survivors were tested (here each refuted by its test, so refuted less refuted by labels).
+#[test]
+fn the_candidate_limit_is_named_only_where_that_many_were_tested() {
+    let (detail, status) = promoted_read();
+    assert_eq!(detail.refuted_by_labels, 60, "the 60 `a`s");
+    let tested = detail.proved + detail.refuted - detail.refuted_by_labels;
+    for reason in status.reasons.iter().map(|r| &r.text) {
+        if reason.contains("dl.max_candidates reached") {
+            assert_eq!(tested, 64, "{reason}, with {tested} tested");
+        }
+    }
+    let named = |r: &String| r.contains("dl.max_candidates reached (64)");
+    assert!(
+        status.reasons.iter().map(|r| &r.text).any(named),
+        "the limit named: {:?}",
+        status.reasons
+    );
+}
+
+/// Spec: the survivors of the labels past the capped read's first rows are tested, in batches
+/// no costlier than its own, and fail no read: in [`promoted_read`] the labels leave 4 of the
+/// capped read's first 64 rows, and 64 survivors are tested, those 4 and 60 past them. Under
+/// each request memory limit from 16 KiB to 4 MiB (steps of a fiftieth), and in steps of 256
+/// bytes over the 16 KiB from the least limit the read is answered under with the labels off
+/// (found to 256 bytes), every read the first of a store just committed, a read answered with
+/// the labels off is answered with them on.
+#[test]
+fn survivors_past_the_capped_prefix_are_tested_and_fail_no_read() {
+    let (detail, _) = promoted_read();
+    let tested = detail.proved + detail.refuted - detail.refuted_by_labels;
+    assert_eq!(tested, 64, "the 4 left of the first 64, and 60 past them");
+    let first =
+        |labels: bool, limit: usize| unions_read_of(&promoted_store(labels), PROMOTED, Some(limit));
+    let (mut low, mut high) = (16usize << 10, 4usize << 20);
+    while high - low > 256 {
+        let middle = low + (high - low) / 2;
+        match first(false, middle) {
+            Ok(_) => high = middle,
+            Err(_) => low = middle,
+        }
+    }
+    let mut limits: Vec<usize> = (0..64).map(|k| high + k * 256).collect();
+    let mut limit = 16usize << 10;
+    while limit <= 4 << 20 {
+        limits.push(limit);
+        limit += limit / 50;
+    }
+    let mut answered = 0;
+    for limit in limits {
+        if first(false, limit).is_ok() {
+            answered += 1;
+            let with = first(true, limit);
+            assert!(
+                with.is_ok(),
+                "{limit} bytes: off answered, on {:?}",
+                with.err()
+            );
+        }
+    }
+    println!("off answered from {high} bytes, under {answered} limits; on under each");
+    assert!(answered > 0, "off answers under some limit");
+}
+
+/// The unions store under [`PROMOTED`] with a candidate limit of 4 and the labels on, its gap
+/// in commit order: 3 individuals with `v0` (`:a{k}`, refuted by the labels) and `:b0` with
+/// `v3`, the capped read's first 4 rows, then `past` with `v3` past them (`:c{k}`). The `a`s
+/// are named by IRIs longer by `pads.0` bytes, the `c`s by `pads.1`: with both 100000, the
+/// `c`s' rows together cost no more than the first 4 rows' batch, but each more than `:b0`'s,
+/// the one row the labels leave of them.
+fn past_prefix_store(pads: (usize, usize), past: usize) -> Arc<StoreService> {
+    let (pad, long) = ("x".repeat(pads.0), "x".repeat(pads.1));
+    let mut data = String::new();
+    for k in 0..3 {
+        data.push_str(&format!(":a{k}{pad} :val :v0 .\n"));
+    }
+    data.push_str(":b0 :val :v3 .\n");
+    for k in 0..past {
+        data.push_str(&format!(":c{k}{long} :val :v3 .\n"));
+    }
+    let dl = crate::DlConfig {
+        max_candidates: Some(4),
+        model_labels: true,
+        ..crate::DlConfig::default()
+    };
+    unions_store_of(dl, &data)
+}
+
+/// Spec: rows past the capped read's first ones never fail a read answered without them: a
+/// batch of them the request has no room for ends the tests there, its rows left unresolved for
+/// the request's memory. Over [`past_prefix_store`] with IRIs longer by 100000 bytes, without
+/// `c`s and with 3 (their one batch costing more than any one row), under each request memory
+/// limit from 64 KiB to 2 MiB (steps of a fiftieth), every read the first of a store just
+/// committed: where the read without the `c`s is answered, the read with them is answered. And
+/// the case is reached: some such read leaves the 3 `c`s unresolved, with the 3 `a`s refuted by
+/// the labels and `:b0` by its test, and a reason naming the request's memory envelope.
+#[test]
+fn a_batch_past_the_capped_prefix_without_room_leaves_its_rows_unresolved() {
+    use nrese_dl::limits::Limit;
+    let read = |past: usize, limit: usize| {
+        unions_read_of(
+            &past_prefix_store((100_000, 100_000), past),
+            PROMOTED,
+            Some(limit),
+        )
+    };
+    let (mut limit, mut reached) = (64usize << 10, Vec::new());
+    while limit <= 2 << 20 {
+        if read(0, limit).is_err() {
+            println!("{limit}: failed without the `c`s");
+            limit += limit / 50;
+            continue;
+        }
+        let (status, detail) = match read(3, limit) {
+            Ok((_, Some(status))) => status,
+            other => panic!(
+                "{limit} bytes: answered without the `c`s, with them {:?}",
+                other.err()
+            ),
+        };
+        let reasons: Vec<_> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+        let counts = (detail.refuted_by_labels, detail.refuted, detail.proved);
+        let unresolved = &detail.unresolved;
+        println!(
+            "{limit}: {counts:?}, {} unresolved, {reasons:?}",
+            unresolved.len()
+        );
+        if counts == (3, 4, 0)
+            && unresolved.len() == 3
+            && unresolved.iter().all(|r| r.contains("urn:test:c"))
+            && reasons
+                .iter()
+                .any(|r| Limit::named_in(r) == Some(Limit::Envelope))
+        {
+            reached.push(limit);
+        }
+        limit += limit / 50;
+    }
+    println!("the `c`s without room, the read answered, under {reached:?}");
+    assert!(!reached.is_empty(), "no limit reaches the case");
+}
+
+/// Spec: a candidate past the capped read's first rows whose row alone costs more than its
+/// costliest batch is in no batch: the tests end there, the read is answered, told incomplete,
+/// and says why by name. Over [`past_prefix_store`] with short-named `a`s and one `c` named by
+/// an IRI longer by 100000 bytes, with no memory limit: the 3 `a`s refuted by the labels,
+/// `:b0` by its test, `:c0` unresolved, and the reason "the next candidate's row costs more
+/// than" the batch's bytes.
+#[test]
+fn a_row_costlier_than_the_capped_batches_is_left_unresolved_and_named() {
+    let store = past_prefix_store((0, 100_000), 1);
+    let (_, status) = unions_read_of(&store, PROMOTED, None).unwrap();
+    let (status, detail) = status.expect("a status");
+    let reasons: Vec<_> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+    let counts = (detail.refuted_by_labels, detail.refuted, detail.proved);
+    println!(
+        "{counts:?}, {} unresolved, {reasons:?}",
+        detail.unresolved.len()
+    );
+    assert_eq!(counts, (3, 4, 0), "the `a`s by labels, `:b0` by its test");
+    assert!(detail.unresolved.len() == 1 && detail.unresolved[0].contains("urn:test:c0"));
+    assert!(!status.complete, "told incomplete");
+    let named = |r: &&str| r.contains("the next candidate's row costs more than");
+    assert!(
+        reasons.iter().any(named),
+        "the reason by name, in {reasons:?}"
+    );
+}
+
+/// Spec: where the tests past the capped read's first rows end, the read says why, beside what
+/// an earlier batch said: a stop is named even where a batch before it was left unresolved for
+/// a reason of its own. Over [`past_prefix_store`] with short-named `a`s and one `c` named by an
+/// IRI longer by 100000 bytes, under each request memory limit from 4 KiB to 2 MiB (steps of a
+/// fiftieth), every read the first of a store just committed: where the read is answered with
+/// the 3 `a`s refuted by the labels and both `:b0` and `:c0` unresolved (`:b0`'s batch without
+/// room for its run), its reasons name the request's memory envelope and "the next candidate's
+/// row costs more than". And the case is reached.
+#[test]
+fn a_stop_past_the_capped_rows_is_named_beside_an_earlier_reason() {
+    let (mut limit, mut reached) = (4usize << 10, Vec::new());
+    while limit <= 2 << 20 {
+        let store = past_prefix_store((0, 100_000), 1);
+        if let Ok((_, Some((status, detail)))) = unions_read_of(&store, PROMOTED, Some(limit)) {
+            let reasons: Vec<_> = status.reasons.iter().map(|r| r.text.as_str()).collect();
+            let counts = (detail.refuted_by_labels, detail.refuted, detail.proved);
+            println!(
+                "{limit}: {counts:?}, {} unresolved, {reasons:?}",
+                detail.unresolved.len()
+            );
+            if counts == (3, 3, 0) && detail.unresolved.len() == 2 {
+                let both = |r: &&str| {
+                    r.contains("budgets.query_memory")
+                        && r.contains("the next candidate's row costs more than")
+                };
+                assert!(reasons.iter().any(both), "{limit} bytes: {reasons:?}");
+                reached.push(limit);
+            }
+        }
+        limit += limit / 50;
+    }
+    println!("`:b0` unresolved, then `:c0` stopped, both named, under {reached:?}");
+    assert!(!reached.is_empty(), "no limit reaches the case");
+}
+
+/// Four individuals `:m0`..`:m3`, each in `:C` and with `:p` to the literal `"v{k}"`, and the
+/// rows of `?x :p ?l` (`?x`, `?l`) over them.
+fn labels_store() -> (Arc<StoreService>, Vec<Vec<Option<Term>>>) {
+    use nrese_rdf::{Literal, NamedNode};
+    let mut data = String::new();
+    let mut rows = Vec::new();
+    for k in 0..4 {
+        data.push_str(&format!(":m{k} a :C ; :p \"v{k}\" .\n"));
+        rows.push(vec![
+            Some(NamedNode::new_unchecked(format!("urn:test:m{k}")).into()),
+            Some(Literal::new_simple_literal(format!("v{k}")).into()),
+        ]);
+    }
+    let store = lower_true_store_with(crate::StoreConfig::in_memory(), &data);
+    (store, rows)
+}
+
+/// The model's refutations over `rows` of `SELECT * { pattern }` in `store`, under `token` and
+/// `deadline`, with a fresh envelope of `limit` bytes: the mask; what the envelope held while the
+/// mask the call returned lived, then once it was dropped; the most it held; and whether it was
+/// marked refused.
+fn labels_of(
+    store: &StoreService,
+    pattern: &str,
+    rows: &[Vec<Option<Term>>],
+    token: &CancellationToken,
+    deadline: Deadline,
+    limit: usize,
+) -> (Vec<bool>, (usize, usize), usize, bool) {
+    let request = crate::SparqlQueryRequest::all(format!("SELECT * {{ {pattern} }}"));
+    let analysis = analyse(PreparedQuery::parse(&request).unwrap().query());
+    let variables = analysis.shape.as_ref().unwrap().projected.clone();
+    let memory = nrese_exec::Envelope::new(Some(limit), None);
+    let mask = super::exact::refuted_by_labels(
+        store,
+        &store.engine().snapshot(),
+        &analysis,
+        &variables,
+        rows.len(),
+        &|i| rows[i].clone(),
+        token,
+        deadline,
+        &memory,
+    );
+    let (alive, copy) = (memory.used(), mask.to_vec());
+    drop(mask);
+    (
+        copy,
+        (alive, memory.used()),
+        memory.peak(),
+        memory.refused(),
+    )
+}
+
+/// Spec: the model refutes only rows whose one test is `C(a)`, so a query whose atoms aren't all
+/// `?x a C` (an answer variable, a named class) gets no mask, and the premise is neither loaded
+/// nor charged for it: its rows' tests could otherwise add to the premise's copy, uncharged
+/// (a literal's text, an existential's expression). Over four rows of `?x :p ?l`, a fresh
+/// envelope holds nothing at any time. And the measure is live: over the same store, `?x a :C`
+/// charges the premise.
+#[test]
+fn a_query_the_labels_cant_read_loads_and_charges_nothing() {
+    let (store, rows) = labels_store();
+    let (token, deadline) = (CancellationToken::new(), Deadline::after(None));
+    let (mask, _, peak, _) = labels_of(
+        &store,
+        "?x <urn:test:p> ?l",
+        &rows,
+        &token,
+        deadline,
+        1 << 30,
+    );
+    println!("?x :p ?l: mask {mask:?}, the envelope's peak {peak}");
+    assert!(mask.is_empty(), "no mask");
+    assert_eq!(peak, 0, "nothing charged");
+    let typed: Vec<_> = rows.iter().map(|r| r[..1].to_vec()).collect();
+    let (_, _, peak, _) = labels_of(
+        &store,
+        "?x a <urn:test:C>",
+        &typed,
+        &token,
+        deadline,
+        1 << 30,
+    );
+    println!("?x a :C: the envelope's peak {peak}");
+    assert!(peak > 0, "the premise charged");
+}
+
+/// Spec: labels whose deadline has passed, or whose read is cancelled, load and charge nothing:
+/// no mask, and a fresh envelope holds nothing at any time, over four rows of `?x a :C` (a shape
+/// the labels read, which charges the premise when neither has happened).
+#[test]
+fn labels_past_their_deadline_or_cancelled_load_and_charge_nothing() {
+    let (store, rows) = labels_store();
+    let rows: Vec<_> = rows.iter().map(|r| r[..1].to_vec()).collect();
+    let expired = Deadline::at(std::time::Instant::now());
+    let cancelled = CancellationToken::new();
+    cancelled.cancel();
+    for (token, deadline) in [
+        (CancellationToken::new(), expired),
+        (cancelled, Deadline::after(None)),
+    ] {
+        let (mask, _, peak, _) = labels_of(
+            &store,
+            "?x a <urn:test:C>",
+            &rows,
+            &token,
+            deadline,
+            1 << 30,
+        );
+        assert!(mask.is_empty(), "no mask");
+        assert_eq!(peak, 0, "nothing charged");
+    }
+}
+
+/// Spec: the mask the labels return is charged for as long as it lives, not only while it is
+/// built: over the unions store's 12 gap rows of `?x a :U0` (the individuals with `v2` and
+/// `v3`), all refuted by one model, the request's envelope holds at least the mask's 12 bytes
+/// while the caller holds it, and nothing once the caller drops it.
+#[test]
+fn the_labels_mask_is_charged_while_it_lives() {
+    use nrese_rdf::NamedNode;
+    let store = unions_store_with(crate::DlConfig::default(), 24, 0);
+    let iri = |k: usize| -> Term { NamedNode::new_unchecked(format!("urn:test:i{k}")).into() };
+    let rows: Vec<_> = (0..24)
+        .filter(|k| k % 4 >= 2)
+        .map(|k| vec![Some(iri(k))])
+        .collect();
+    let (token, deadline) = (CancellationToken::new(), Deadline::after(None));
+    let (mask, (alive, dropped), _, _) = labels_of(
+        &store,
+        "?x a <urn:test:U0>",
+        &rows,
+        &token,
+        deadline,
+        1 << 30,
+    );
+    println!("mask {mask:?}; the envelope held {alive} bytes with it, {dropped} without");
+    assert_eq!(mask, vec![true; 12], "all 12 refuted by the model");
+    assert!(alive >= 12, "the mask's 12 bytes charged while it lives");
+    assert_eq!(dropped, 0, "nothing once it is dropped");
+}
+
+/// Spec: the labels' work is work the read can do without, so a charge they are refused inside
+/// it marks only their own part: the envelope the caller passed is never marked refused (which
+/// would keep the request's result from being published beyond it), whether the labels had
+/// room or not. Over the unions store's 12 gap rows of `?x a :U0`, all refuted by one model,
+/// under each limit from 64 bytes up (steps of a tenth) to the least that gives the whole mask:
+/// the envelope isn't marked refused. And the case is reached: some limit gives no mask (the
+/// labels refused), and the last gives all 12 refuted.
+#[test]
+fn labels_refused_their_memory_leave_the_request_unmarked() {
+    use nrese_rdf::NamedNode;
+    let store = unions_store_with(crate::DlConfig::default(), 24, 0);
+    let iri = |k: usize| -> Term { NamedNode::new_unchecked(format!("urn:test:i{k}")).into() };
+    let rows: Vec<_> = (0..24)
+        .filter(|k| k % 4 >= 2)
+        .map(|k| vec![Some(iri(k))])
+        .collect();
+    let (token, deadline) = (CancellationToken::new(), Deadline::after(None));
+    let (mut limit, mut empty) = (64usize, 0);
+    let mask = loop {
+        let (mask, _, _, refused) =
+            labels_of(&store, "?x a <urn:test:U0>", &rows, &token, deadline, limit);
+        println!("{limit}: mask of {} rows, refused {refused}", mask.len());
+        assert!(
+            !refused,
+            "{limit} bytes: the labels' refusal marked the caller's envelope"
+        );
+        if mask.len() == rows.len() || limit > 1 << 30 {
+            break mask;
+        }
+        empty += usize::from(mask.is_empty());
+        limit += limit / 10;
+    };
+    println!("the whole mask from {limit} bytes; {empty} limits gave none");
+    assert!(empty > 0, "no limit refuses the labels");
+    assert_eq!(mask, vec![true; 12], "all 12 refuted under the last limit");
+}
+
+/// The store of [`lower_true_store_with`] with `:x` in `:A` or `:E`: `:A` below `≥ 200 :r` (200
+/// successors, about a megabyte with their inequalities), `:E` a class of nothing else. `:A`
+/// is first in the union if `a_first.0`, and committed before `:E` if `a_first.1`.
+fn at_least_or_e_store(a_first: (bool, bool)) -> Arc<StoreService> {
+    let union = if a_first.0 { "( :A :E )" } else { "( :E :A )" };
+    let a = ":A <http://www.w3.org/2000/01/rdf-schema#subClassOf> [ a owl:Restriction ; \
+             owl:onProperty :r ; owl:minCardinality \
+             \"200\"^^<http://www.w3.org/2001/XMLSchema#nonNegativeInteger> ] .";
+    let classes = if a_first.1 {
+        format!("{a} :E a owl:Class .")
+    } else {
+        format!(":E a owl:Class . {a}")
+    };
+    let data = format!(":r a owl:ObjectProperty . {classes} :x a [ owl:unionOf {union} ] .");
+    lower_true_store_with(crate::StoreConfig::in_memory(), &data)
+}
+
+/// Spec: the labels give a mask only from a run none of their charges was refused in: a model
+/// found after a branch was abandoned for want of room is no mask (the optional part's terms:
+/// no call goes on past a refusal). Over [`at_least_or_e_store`] in each union and commit
+/// order, the rows of `?x a :E` (`:x`), under each limit from 4 KiB to 16 MiB (steps of a
+/// tenth): the labels give no mask or the one they give under 1 GiB. And the case is reached:
+/// in an order whose model under 1 GiB takes the `≥ 200` branch (`:x` refuted), some limit
+/// gives no mask though the labels' premise was charged (the envelope's peak above 0).
+#[test]
+fn labels_whose_run_abandoned_a_branch_give_no_mask() {
+    use nrese_rdf::NamedNode;
+    let rows = vec![vec![Some(NamedNode::new_unchecked("urn:test:x").into())]];
+    let (token, deadline) = (CancellationToken::new(), Deadline::after(None));
+    let mut reached = false;
+    for order in [(true, true), (false, true), (true, false), (false, false)] {
+        let store = at_least_or_e_store(order);
+        let of = |limit| labels_of(&store, "?x a <urn:test:E>", &rows, &token, deadline, limit);
+        let (whole, ..) = of(1 << 30);
+        let (mut limit, mut none) = (4usize << 10, 0);
+        while limit <= 16 << 20 {
+            let (mask, _, peak, _) = of(limit);
+            println!("order {order:?}, {limit}: mask {mask:?}, peak {peak}");
+            assert!(
+                mask.is_empty() || mask == whole,
+                "{limit} bytes: {mask:?}, not {whole:?}, from a run past a refusal"
+            );
+            none += usize::from(mask.is_empty() && peak > 0);
+            limit += limit / 10;
+        }
+        println!("order {order:?}: {whole:?} under 1 GiB, {none} gave none past the premise");
+        reached |= whole == [true] && none > 0;
+    }
+    assert!(reached, "no order reaches the case");
+}

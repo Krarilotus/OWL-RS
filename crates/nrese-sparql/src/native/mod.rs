@@ -254,7 +254,7 @@ fn run(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<(Outcome, Reservation), QueryEvaluationError> {
-    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let ctx = Context::for_query(snapshot, query, options);
     let (solutions, form) = match index_answer(&ctx, query, options) {
         Some(solutions) => (solutions?, Form::Select),
         None => {
@@ -336,7 +336,7 @@ pub(crate) fn explain(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<ExplainParts, QueryEvaluationError> {
-    let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let mut ctx = Context::for_query(snapshot, query, options);
     let begun = Instant::now();
     if let Some(solutions) = index_answer(&ctx, query, options) {
         let rows = solutions?.table.len();
@@ -380,7 +380,7 @@ pub(crate) fn plan(
     query: &Query,
     options: &QueryOptions,
 ) -> Result<PlanParts, QueryEvaluationError> {
-    let mut ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let mut ctx = Context::for_query(snapshot, query, options);
     let (pattern, _, rewrites, ql) = native_pattern(query, options, &ctx)?;
     // Traced for the BGPs planned without the characteristic sets ([`Context::with_sets`]):
     // their notes follow the plan's nodes, in the order planned.
@@ -452,7 +452,7 @@ pub(crate) fn write_results(
         Query::Ask { .. } if format != ResultsFormat::Json => return None,
         _ => {}
     }
-    let ctx = Context::new(snapshot, options, query_dataset(query), query_base(query));
+    let ctx = Context::for_query(snapshot, query, options);
     let evaluated = match index_answer(&ctx, query, options) {
         Some(solutions) => solutions.map(|solutions| (solutions, Form::Select)),
         None => match native_pattern(query, options, &ctx) {
@@ -572,8 +572,13 @@ pub(crate) fn delete_insert(
     if let Some(what) = unsupported_part(pattern) {
         return Err(QueryEvaluationError::Unsupported(what));
     }
-    let ctx = Context::new(snapshot, options, using, base);
-    let pattern = optimise(pattern.clone(), &mut Vec::new(), &ctx);
+    let as_written = search::as_written(pattern, options);
+    let ctx = Context::in_mode(snapshot, options, using, base, as_written);
+    let pattern = match as_written {
+        true => pattern.clone(),
+        false => optimise(pattern.clone(), &mut Vec::new(), &ctx),
+    };
+    ctx.check_scoped_operators(&pattern)?;
     let solutions = ctx.eval(&pattern)?;
     let mut changes = QuadChanges::new(&ctx.budget);
     let memory = QueryEvaluationError::MemoryLimit;
@@ -679,7 +684,7 @@ fn index_answer(
     let Query::Select { pattern, .. } = query else {
         return None;
     };
-    if options.as_written
+    if ctx.as_written
         || options.pre_bound.is_some()
         || options.pin.is_some()
         || ctx.canonical_answers()
@@ -770,14 +775,14 @@ fn native_pattern<'q>(
     } else {
         (pattern, form)
     };
-    let pattern = if options.as_written {
+    let pattern = if ctx.as_written {
         pattern
     } else {
         optimised(pattern, &mut rewrites, ctx)
     };
     // ASK needs one solution: LIMIT 1 lets the evaluation stop at it.
     let pattern = match form {
-        Form::Ask if !options.as_written => {
+        Form::Ask if !ctx.as_written => {
             rewrites.push("ask-limit");
             Cow::Owned(GraphPattern::Slice {
                 inner: Box::new(pattern.into_owned()),
@@ -791,11 +796,18 @@ fn native_pattern<'q>(
         .pre_bound
         .as_ref()
         .map(|values| match &ctx.canonical {
-            Some(names) => Cow::Owned(names.values(values)),
-            None => Cow::Borrowed(&**values),
+            Some(names) => {
+                let (values, predicates) = names.values(values, |id| {
+                    let alias = internal::class_constant(id);
+                    ctx.register_alias(alias.as_str(), id);
+                    alias
+                });
+                (Cow::Owned(values), predicates)
+            }
+            None => (Cow::Borrowed(&**values), HashMap::new()),
         });
     let pattern = match &pre_bound {
-        Some(values) => {
+        Some((values, predicates)) => {
             // A blank node is put in as a made constant that stands for the node.
             for term in values.values() {
                 if let Term::BlankNode(b) = term
@@ -804,13 +816,15 @@ fn native_pattern<'q>(
                     ctx.register_alias(internal::blank_constant(b.as_str()).as_str(), id.raw());
                 }
             }
-            Cow::Owned(substitute::Values::new(ctx, values)?.top(&pattern))
+            let values = substitute::Values::new(ctx, values)?.with_predicates(predicates);
+            Cow::Owned(values.top(&pattern))
         }
         None => pattern,
     };
     if let Some(refused) = ctx.aliases_refused.get() {
         return Err(QueryEvaluationError::MemoryLimit(refused));
     }
+    ctx.check_scoped_operators(&pattern)?;
     Ok((pattern, form, rewrites, ql_report))
 }
 
@@ -1672,12 +1686,32 @@ impl<'a> Context<'a> {
         }
     }
 
+    /// The context for `query`, in the mode it is evaluated in ([`search::as_written`]).
+    fn for_query(snapshot: &'a Snapshot, query: &Query, options: &QueryOptions) -> Self {
+        let as_written = search::as_written(pattern_and_form(query).0, options);
+        let (dataset, base) = (query_dataset(query), query_base(query));
+        Self::in_mode(snapshot, options, dataset, base, as_written)
+    }
+
     /// `dataset` is the query's own (`FROM`); the protocol's, in `options`, replaces it.
+    #[cfg(test)]
     fn new(
         snapshot: &'a Snapshot,
         options: &QueryOptions,
         dataset: Option<&nrese_sparql_syntax::algebra::QueryDataset>,
         base: Option<&nrese_rdf::Iri<String>>,
+    ) -> Self {
+        Self::in_mode(snapshot, options, dataset, base, options.as_written)
+    }
+
+    /// [`Self::new`], evaluating as written if `as_written`: decided before the result
+    /// cache's scope is, which keys by it.
+    fn in_mode(
+        snapshot: &'a Snapshot,
+        options: &QueryOptions,
+        dataset: Option<&nrese_sparql_syntax::algebra::QueryDataset>,
+        base: Option<&nrese_rdf::Iri<String>>,
+        as_written: bool,
     ) -> Self {
         use crate::dataset::{DefaultGraph, ResolvedDataset};
         let resolved = ResolvedDataset::resolve(
@@ -1738,7 +1772,7 @@ impl<'a> Context<'a> {
             merge_set,
             named,
             store_default,
-            as_written: options.as_written,
+            as_written,
             spatial_rewrite: !options.geosparql_stated_only,
             cross_chunk_rows: options.cross_chunk_rows.unwrap_or(CROSS_CHUNK_ROWS).max(1),
             stream_rows: options.stream_rows,
@@ -1940,12 +1974,13 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// The error of a join stopped by its row limit: the query was cancelled, or the join
-    /// would outgrow the budget.
-    fn too_large(&self, rows: usize, width: usize) -> NativeError {
+    /// The error of a join stopped by its row limit of `max_rows`: the query was cancelled,
+    /// or the join would outgrow the budget with its `rows` (past `max_rows` where unknown).
+    fn too_large(&self, max_rows: usize, rows: Option<usize>, width: usize) -> NativeError {
         if let Err(cancelled) = self.check() {
             return cancelled;
         }
+        let rows = rows.unwrap_or(max_rows.saturating_add(1));
         let requested = rows.saturating_mul(width.max(1) * 8);
         // No room because the process's limit can't be read: that, not a full budget, even
         // where a reading since has found it.
@@ -1957,16 +1992,21 @@ impl<'a> Context<'a> {
                 used: self.budget.used(),
                 shared: true,
                 unread: true,
+                rows: None,
             })
             .into();
         };
         QueryEvaluationError::MemoryLimit(BudgetExceeded {
             limit: self.budget.used().saturating_add(room),
-            // A table may grow to half of what is left (`max_rows`).
-            requested: requested.saturating_mul(2),
+            requested,
             used: self.budget.used(),
             shared: self.budget.bounded_by_shared(),
             unread: false,
+            rows: Some(nrese_exec::RowsPast {
+                rows,
+                width,
+                room: max_rows,
+            }),
         })
         .into()
     }
@@ -1975,7 +2015,7 @@ impl<'a> Context<'a> {
     /// ([`Self::too_large`]), or an input with more rows than the join's row numbers name.
     fn join_stopped(&self, stop: JoinStop, width: usize) -> NativeError {
         match stop {
-            JoinStop::Rows(rows) => self.too_large(rows.max_rows.saturating_add(1), width),
+            JoinStop::Rows(stop) => self.too_large(stop.max_rows, stop.rows, width),
             JoinStop::TooLarge(limit) => QueryEvaluationError::TooLarge(limit).into(),
         }
     }
@@ -2298,13 +2338,18 @@ impl<'a> Context<'a> {
                 else {
                     unreachable!("matched above")
                 };
-                let others: Vec<GraphPattern> = inputs
+                let mut others: Vec<GraphPattern> = inputs
                     .iter()
                     .enumerate()
                     .filter(|&(i, _)| i != at)
                     .map(|(_, input)| input.clone())
                     .collect();
-                let local = GraphPattern::join_all(others);
+                // As written, the groups stay apart (`join_all` flattens and merges them).
+                let local = match (self.as_written, others.len()) {
+                    (true, 1) => others.remove(0),
+                    (true, 2..) => GraphPattern::Join { inputs: others },
+                    _ => GraphPattern::join_all(others),
+                };
                 if vectors::is_search(name) {
                     return self.vector_join(&local, inner);
                 }
@@ -4447,7 +4492,7 @@ impl<'a> Context<'a> {
             Ok(rows) => rows,
             Err(wcoj::Stop::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
             Err(wcoj::Stop::TooManyRows) => {
-                return Err(self.too_large(query.max_rows.saturating_add(1), width));
+                return Err(self.too_large(query.max_rows, None, width));
             }
         };
         let mut table = IdTable::new(width);
@@ -4755,7 +4800,7 @@ impl<'a> Context<'a> {
             let components = quad.components();
             if merged {
                 if let Some(graphs) = &self.merge_set
-                    && !graphs.contains(&quad.graph)
+                    && !graphs.contains(&self.snapshot, self.model, &quad)
                 {
                     continue;
                 }
@@ -4815,7 +4860,7 @@ impl<'a> Context<'a> {
             }
             if merged {
                 if let Some(graphs) = &self.merge_set
-                    && !graphs.contains(&quad.graph)
+                    && !graphs.contains(&self.snapshot, self.model, &quad)
                 {
                     continue;
                 }
@@ -5127,7 +5172,7 @@ impl<'a> Context<'a> {
             Ok(out) => out,
             Err(ProbeStop::Cancelled) => return Err(QueryEvaluationError::Cancelled.into()),
             Err(ProbeStop::TooManyRows) => {
-                return Err(self.too_large(probe.max_rows.saturating_add(1), vars.len()));
+                return Err(self.too_large(probe.max_rows, None, vars.len()));
             }
             Err(ProbeStop::Memory(exceeded)) => {
                 return Err(QueryEvaluationError::MemoryLimit(exceeded).into());
@@ -5343,7 +5388,7 @@ impl<'a> Context<'a> {
             let mut previous: Option<[u64; 3]> = None;
             let graphs = self.merge_set.as_ref();
             sorted.filter(move |quad| {
-                if graphs.is_some_and(|graphs| !graphs.contains(&quad.graph)) {
+                if graphs.is_some_and(|graphs| !graphs.contains(&self.snapshot, self.model, quad)) {
                     return false;
                 }
                 let components = quad.components();
@@ -7041,9 +7086,9 @@ impl<'b> Probe<'_, 'b> {
                 }
                 cursor.for_each(&bound.quad_pattern(), |quad| {
                     if refused.is_some()
-                        || self
-                            .graphs
-                            .is_some_and(|graphs| !graphs.contains(&quad.graph))
+                        || self.graphs.is_some_and(|graphs| {
+                            !graphs.contains(self.snapshot, self.model, &quad)
+                        })
                     {
                         return;
                     }

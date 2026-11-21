@@ -2,9 +2,9 @@
 //! its deltas' bounds are charged before the build only where the budget's room
 //! covers them; elsewhere every delta is charged exactly as it is built, the reference. A
 //! budget the reference fits is answered, and not recorded as refused, though the bounds don't
-//! fit it. Red on the bounds charged unconditionally (2f91a6d3's rule): that budget refused.
+//! fit it. Red on the bounds charged unconditionally (b77e57d8's rule): that budget refused.
 //! A delta at or above the parallel threshold beside one below it is built exactly throughout:
-//! red on fe517a03, whose bounded path held the small delta's slack
+//! red on cf6fa844, whose bounded path held the small delta's slack
 //! beside the large one's exact charges.
 
 use std::sync::Arc;

@@ -28,6 +28,36 @@ pub trait Facts {
     fn objects(&self, subject: u64, predicate: u64) -> Vec<u64>;
     /// `(subject, object)` pairs of `(?, predicate, ?)`.
     fn pairs(&self, predicate: u64) -> Vec<(u64, u64)>;
+    /// The same cells with no two names merged, where these facts merge equal names
+    /// ([`instantiate_written`]: a list whose merged cells are past the cap too).
+    fn unmerged(&self) -> Option<&dyn Unmerged> {
+        None
+    }
+}
+
+/// List cells as asserted, each node its own ([`Facts::unmerged`]).
+pub trait Unmerged {
+    /// The objects of `(node, predicate, ?)` as asserted, unrenamed.
+    fn cells(&self, node: u64, predicate: u64) -> Vec<u64>;
+    /// The names equal to `x`, `x` among them, if `x` is the same as another name.
+    fn equal(&self, x: u64) -> Option<&[u64]>;
+    /// The name the closure gives `x`.
+    fn named(&self, x: u64) -> u64;
+    /// Whether the run has stopped: then nothing more is read.
+    fn stopped(&self) -> bool;
+}
+
+/// [`Unmerged`] cells read as [`Facts`] for a walk.
+struct Cells<'a>(&'a dyn Unmerged);
+
+impl Facts for Cells<'_> {
+    fn objects(&self, node: u64, predicate: u64) -> Vec<u64> {
+        self.0.cells(node, predicate)
+    }
+
+    fn pairs(&self, _: u64) -> Vec<(u64, u64)> {
+        Vec::new()
+    }
 }
 
 /// The vocabulary ids the list rules use.
@@ -119,7 +149,7 @@ impl ListVocabulary {
     /// pattern matches each resulting path, so every path is a variant, up to
     /// [`MAX_VARIANTS`]. A node without `rdf:first` or `rdf:rest`, or a cycle, is malformed.
     /// Each variant comes with the `rdf:first`/`rdf:rest` facts of its path.
-    fn list(&self, facts: &impl Facts, head: u64) -> Result<Vec<Variant>, ListProblem> {
+    fn list(&self, facts: &(impl Facts + ?Sized), head: u64) -> Result<Vec<Variant>, ListProblem> {
         let mut variants = Vec::new();
         let mut path = Vec::new();
         let mut nodes = Vec::new();
@@ -128,9 +158,53 @@ impl ListVocabulary {
         Ok(variants)
     }
 
+    /// The member sequences of the list of the axiom `(subject predicate head)` over
+    /// `unmerged`: walked from the heads the axiom was asserted with, or, where none of them
+    /// starts a list, from each name equal to `head`; its members named as the closure names
+    /// them; past [`MAX_VARIANTS`] distinct ones, none.
+    fn unmerged_list(
+        &self,
+        unmerged: &dyn Unmerged,
+        [subject, predicate, head]: [u64; 3],
+    ) -> Result<Vec<Variant>, ListProblem> {
+        let (one, other) = ([subject], [head]);
+        let subjects = unmerged.equal(subject).unwrap_or(&one);
+        let asserted: Vec<u64> = subjects
+            .iter()
+            .flat_map(|&s| unmerged.cells(s, predicate))
+            .collect();
+        let variants = self.walks(unmerged, &asserted)?;
+        match variants.is_empty() {
+            true => self.walks(unmerged, unmerged.equal(head).unwrap_or(&other)),
+            false => Ok(variants),
+        }
+    }
+
+    /// The distinct member sequences of the lists from `starts` over `unmerged`, named as the
+    /// closure names them; past [`MAX_VARIANTS`], none. A start that is no list adds none.
+    fn walks(&self, unmerged: &dyn Unmerged, starts: &[u64]) -> Result<Vec<Variant>, ListProblem> {
+        let mut variants: Vec<Variant> = Vec::new();
+        for &start in starts {
+            if unmerged.stopped() {
+                return Ok(Vec::new());
+            }
+            for (members, used) in self.list(&Cells(unmerged), start).unwrap_or_default() {
+                let members: Vec<u64> = members.iter().map(|&m| unmerged.named(m)).collect();
+                if variants.iter().any(|(seen, _)| *seen == members) {
+                    continue;
+                }
+                if variants.len() == MAX_VARIANTS {
+                    return Err(ListProblem::TooManyVariants);
+                }
+                variants.push((members, used));
+            }
+        }
+        Ok(variants)
+    }
+
     fn walk(
         &self,
-        facts: &impl Facts,
+        facts: &(impl Facts + ?Sized),
         node: u64,
         nodes: &mut Vec<u64>,
         path: &mut Vec<u64>,
@@ -298,6 +372,20 @@ pub fn instantiate_with_premises(
     vocabulary: &ListVocabulary,
     facts: &impl Facts,
 ) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>) {
+    instantiate_written(vocabulary, facts, None)
+}
+
+/// [`instantiate_with_premises`], and a list past [`MAX_VARIANTS`] over `facts` (equality's
+/// `rdf:first` copies multiply its member sequences) read from `written` as well: the facts
+/// as written, a subset of `facts`. Its checks from that reading (rules whose head is
+/// [`Head::Inconsistent`]) are added, never an inference, and it is reported past the cap
+/// all the same: what the rules derive is what they derive over `facts`, the checks only
+/// add to those, and every list left out over `facts` is reported.
+pub fn instantiate_written(
+    vocabulary: &ListVocabulary,
+    facts: &impl Facts,
+    written: Option<&dyn Facts>,
+) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>) {
     let voc = vocabulary;
     let mut rules = Vec::new();
     let mut premises: Vec<Vec<[u64; 3]>> = Vec::new();
@@ -318,7 +406,28 @@ pub fn instantiate_with_premises(
                         diagnostics.push(diagnostic);
                     }
                 };
-                match voc.list(facts, head) {
+                // Only `owl:members` and `owl:distinctMembers` lists are read as written: their
+                // rules are checks alone, never an inference, and never too long for a rule.
+                let checks = predicate == voc.members || predicate == voc.distinct_members;
+                let read = match (voc.list(facts, head), written) {
+                    (Err(ListProblem::TooManyVariants), Some(written)) if checks => {
+                        diagnose(ListProblem::TooManyVariants);
+                        // Where equality merges cells as written past the cap too, each
+                        // node's own cells, as the list was asserted.
+                        let unmerged = |problem: ListProblem| match written.unmerged() {
+                            Some(unmerged) if problem == ListProblem::TooManyVariants => {
+                                voc.unmerged_list(unmerged, [subject, predicate, head])
+                            }
+                            _ => Err(problem),
+                        };
+                        match voc.list(written, head).or_else(unmerged) {
+                            Ok(variants) => Ok(variants),
+                            Err(_) => continue,
+                        }
+                    }
+                    (read, _) => read,
+                };
+                match read {
                     Ok(variants) => {
                         for (members, used) in variants {
                             let most = match predicate == voc.has_key {
@@ -523,6 +632,19 @@ pub fn instantiate_with_premises(
                         if kind == voc.all_different {
                             duplicates(members, node, voc, rules, "eq-diff2");
                         }
+                        // A class or property it names twice, which the index pairs with no
+                        // other: the rule a short list makes of that pair.
+                        for &a in &repeated(members) {
+                            if kind == voc.all_disjoint_classes {
+                                let body =
+                                    vec![Atom([v(0), c(ty), c(a)]), Atom([v(0), c(ty), c(a)])];
+                                rules.push(rule("cax-adc", body, vec![], Head::Inconsistent));
+                            }
+                            if kind == voc.all_disjoint_properties {
+                                let body = vec![Atom([v(0), c(a), v(1)]), Atom([v(0), c(a), v(1)])];
+                                rules.push(rule("prp-adp", body, vec![], Head::Inconsistent));
+                            }
+                        }
                     }
                 }
                 return;
@@ -647,6 +769,17 @@ struct Long {
 
 /// A long `owl:AllDifferent` list that names an individual twice is inconsistent by
 /// itself (`a sameAs a` holds by eq-ref, which isn't materialised): the axiom's rule.
+/// The members `members` names more than once, each once.
+fn repeated(members: &[u64]) -> Vec<u64> {
+    let mut seen = std::collections::HashSet::new();
+    let mut twice: Vec<u64> = (members.iter().copied())
+        .filter(|&m| !seen.insert(m))
+        .collect();
+    twice.sort_unstable();
+    twice.dedup();
+    twice
+}
+
 fn duplicates(members: &[u64], node: u64, voc: &ListVocabulary, rules: &mut Vec<Rule>, name: &str) {
     let mut seen = std::collections::HashSet::new();
     for &member in members {

@@ -327,9 +327,11 @@ impl Writer<'_> {
                 }
             }
             Axiom::DisjointUnion(class, xs) => {
+                // A named class, `owl:Thing` or `owl:Nothing`: its own IRI.
+                let class = self.class(*class);
                 let members: Vec<Term> = xs.iter().map(|&x| self.class(x)).collect();
                 let list = self.list(&members);
-                self.push(*class, term!(self.owl_disjoint_union_of), list);
+                self.push(class, term!(self.owl_disjoint_union_of), list);
             }
             Axiom::SubObjectPropertyOf(chain, sup) => {
                 let sup = self.property(*sup);

@@ -13,7 +13,6 @@ import csv
 import errno
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -39,23 +38,20 @@ def done(rc=0, out="", err=""):
     return subprocess.CompletedProcess(["fake"], rc, out, err)
 
 
-def retrying(action, *args):
-    """An action on a file a sampler may hold open this instant (Windows refuses it then)."""
-    deadline = time.monotonic() + 5
-    while True:
-        try:
-            return action(*args)
-        except PermissionError:
-            if time.monotonic() > deadline:
-                raise
-            time.sleep(0.001)
+def readings(stat: Path, *texts):
+    """memory.stat as the sampler's reads find it, one per read and the last from then on: a text,
+    or a function the read calls (it returns the text or raises the read's fault). The kernel
+    serves each read of it whole; a file changed under a reader polling every millisecond can't
+    promise that on Windows, which refuses a read that meets the change."""
+    real, left = Path.read_text, list(texts)
 
+    def read_text(path, *args, **kwargs):
+        if Path(path) != stat:
+            return real(path, *args, **kwargs)
+        text = left.pop(0) if len(left) > 1 else left[0]
+        return text() if callable(text) else text
 
-def put(stat: Path, text: str):
-    """memory.stat replaced whole, as the kernel's reads never see it half-written."""
-    new = stat.with_name("memory.stat.new")
-    new.write_text(text, encoding="utf-8")
-    retrying(os.replace, new, stat)
+    return patch.object(Path, "read_text", read_text)
 
 
 class CgroupOfAProcess(unittest.TestCase):
@@ -86,16 +82,13 @@ class ContainerMemoryPeak(unittest.TestCase):
         = 350, then 10 + 1 = 11. The peak is 350 bytes, though the file cache was largest first."""
         with tempfile.TemporaryDirectory() as tmp:
             stat = Path(tmp) / "memory.stat"
-            stat.write_text("anon 100\nfile 9000\nkernel 20\n", encoding="utf-8")
-            sampler = runtime.ContainerMemory("c", locate=lambda: Path(tmp), period_s=0.001)
-            try:
-                self.wait_for(sampler, 1)
-                put(stat, "anon 300\nfile 1\nkernel 50\n")
-                self.wait_for(sampler, sampler.reads + 2)
-                put(stat, "anon 10\nfile 1\nkernel 1\n")
-                self.wait_for(sampler, sampler.reads + 2)
-            finally:
-                peak = sampler.stop()
+            with readings(stat, "anon 100\nfile 9000\nkernel 20\n", "anon 300\nfile 1\nkernel 50\n",
+                          "anon 10\nfile 1\nkernel 1\n"):
+                sampler = runtime.ContainerMemory("c", locate=lambda: Path(tmp), period_s=0.001)
+                try:
+                    self.wait_for(sampler, 4)
+                finally:
+                    peak = sampler.stop()
         self.assertEqual(peak, 350)
 
     def test_a_container_without_a_readable_cgroup_has_no_peak_and_says_why(self):
@@ -103,8 +96,12 @@ class ContainerMemoryPeak(unittest.TestCase):
             raise OSError("no /proc here")
 
         sampler = runtime.ContainerMemory("c", locate=locate, period_s=0.001)
-        time.sleep(0.02)
-        self.assertIsNone(sampler.stop())
+        try:
+            sampler.thread.join(timeout=5)
+            self.assertFalse(sampler.thread.is_alive())  # it ended on its own fault, not stopped first
+        finally:
+            peak = sampler.stop()
+        self.assertIsNone(peak)
         self.assertIn("no /proc here", sampler.why)
 
     def test_a_sampler_that_breaks_mid_run_has_no_peak_and_says_why(self):
@@ -113,38 +110,35 @@ class ContainerMemoryPeak(unittest.TestCase):
         first are missing, so 120 is no peak; there is none, and why names the fault."""
         with tempfile.TemporaryDirectory() as tmp:
             stat = Path(tmp) / "memory.stat"
-            stat.write_text("anon 100\nkernel 20\n", encoding="utf-8")
-            sampler = runtime.ContainerMemory("c", locate=lambda: Path(tmp), period_s=0.001)
-            try:
-                self.wait_for(sampler, 1)
-                put(stat, "anon 300\nkernel x\n")
-                sampler.thread.join(timeout=5)
-            finally:
-                peak = sampler.stop()
+            with readings(stat, "anon 100\nkernel 20\n", "anon 300\nkernel x\n"):
+                sampler = runtime.ContainerMemory("c", locate=lambda: Path(tmp), period_s=0.001)
+                try:
+                    sampler.thread.join(timeout=5)
+                finally:
+                    peak = sampler.stop()
         self.assertIsNone(peak)
         self.assertIn("ValueError", sampler.why)
 
     def test_a_reading_that_fails_while_the_cgroup_stands_leaves_no_peak(self):
         """Spec: no quiet fallback. A reading of 120 by hand, then, while
         the cgroup's directory still stands (the container runs on), a memory.stat that is gone or reads
-        without `anon`: the readings after the first are missing, so 120 is no peak."""
-        for broken in ("gone", "no anon"):
+        without `anon`: the readings after the first are missing, so 120 is no peak, and why names it."""
+        def gone():
+            raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), "memory.stat")
+
+        for broken, then, named in (("gone", gone, os.strerror(errno.ENOENT)),
+                                    ("no anon", "file 5\n", "no anon field")):
             with self.subTest(broken=broken), tempfile.TemporaryDirectory() as tmp:
                 group = Path(tmp)
-                stat = group / "memory.stat"
-                stat.write_text("anon 100\nkernel 20\n", encoding="utf-8")
-                sampler = runtime.ContainerMemory("c", locate=lambda: group, period_s=0.001)
-                try:
-                    self.wait_for(sampler, 1)
-                    if broken == "gone":
-                        retrying(stat.unlink)
-                    else:
-                        put(stat, "file 5\n")
-                    sampler.thread.join(timeout=5)
-                finally:
-                    peak = sampler.stop()
+                with readings(group / "memory.stat", "anon 100\nkernel 20\n", then):
+                    sampler = runtime.ContainerMemory("c", locate=lambda: group, period_s=0.001)
+                    try:
+                        sampler.thread.join(timeout=5)
+                        self.assertFalse(sampler.thread.is_alive())
+                    finally:
+                        peak = sampler.stop()
                 self.assertIsNone(peak)
-                self.assertTrue(sampler.why)
+                self.assertIn(named, sampler.why)
 
     def test_a_cgroup_it_cannot_inspect_is_no_evidence_that_the_container_ended(self):
         """Only a cgroup directory that is gone (ENOENT) ends the readings with their peak standing. A
@@ -180,18 +174,21 @@ class ContainerMemoryPeak(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             group = Path(tmp) / "docker-0a1b.scope"
             group.mkdir()
-            (group / "memory.stat").write_text("anon 100\nkernel 20\n", encoding="utf-8")
-            sampler = runtime.ContainerMemory("c", locate=lambda: group, period_s=0.001)
-            try:
-                self.wait_for(sampler, 1)
-                # Gone at once, as Linux removes it: a removal file by file would let a read find
-                # memory.stat gone while its directory still stands, a cgroup that isn't removed.
-                gone = Path(tmp) / "removed"
-                retrying(group.rename, gone)
-                sampler.thread.join(timeout=5)
-                retrying(shutil.rmtree, gone)
-            finally:
-                peak = sampler.stop()
+            stat = group / "memory.stat"
+
+            def removed():
+                # Gone at once, as Linux removes it, before the read that finds it gone: a removal
+                # file by file would let a read find memory.stat gone while its directory stands.
+                group.rename(Path(tmp) / "removed")
+                raise FileNotFoundError(errno.ENOENT, os.strerror(errno.ENOENT), str(stat))
+
+            with readings(stat, "anon 100\nkernel 20\n", removed):
+                sampler = runtime.ContainerMemory("c", locate=lambda: group, period_s=0.001)
+                try:
+                    sampler.thread.join(timeout=5)
+                    self.assertFalse(sampler.thread.is_alive())  # it saw the removal, not stopped first
+                finally:
+                    peak = sampler.stop()
         self.assertEqual(peak, 120)
 
 

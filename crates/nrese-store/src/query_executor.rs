@@ -97,6 +97,7 @@ pub struct PreparedQuery {
     /// randomly, so the parsed form differs between parses of the same text).
     text: String,
     dataset: Option<QueryDatasetSpecification>,
+    pub(crate) inference_scope: Option<std::sync::Arc<nrese_sparql::GraphAccess>>,
     read_model: ReadModel,
     memory_limit: Option<usize>,
     as_written: bool,
@@ -117,6 +118,8 @@ pub struct PreparedQuery {
     holds_rdf12: std::sync::Arc<OnceLock<bool>>,
     /// Under `owl2-dl`: which answers this query asks for (`None`: `dl.answers`).
     dl_answers: Option<crate::DlAnswers>,
+    /// Under `owl2-dl`: when the request's time is up (`None`: `dl.timeout` alone).
+    deadline: Option<std::time::Instant>,
     /// Told when the query is handed to the executor ([`Self::on_evaluation`]).
     on_evaluation: Option<OnEvaluation>,
     /// What the status's composition reads of the query, found once ([`Self::reads`]).
@@ -158,34 +161,35 @@ impl PreparedQuery {
                 }
             },
         };
-        let mut default_graphs = request.default_graphs.clone();
-        let from_protocol = pseudo_graph_strings(&mut default_graphs);
-        let from_query = query_dataset(&mut query)
-            .as_mut()
-            .and_then(pseudo_graph_iris);
-        // A query whose `FROM` held only pseudo-graphs reads the store's default dataset.
-        if let Some(dataset) = query_dataset(&mut query)
-            && dataset.default.is_empty()
-            && dataset.named.as_ref().is_none_or(Vec::is_empty)
-        {
-            *query_dataset(&mut query) = None;
-        }
-        let request = SparqlQueryRequest {
-            default_graphs,
-            ..request.clone()
+        let (dataset, model, inference_scope) = if request.inference_scope_dataset {
+            let (dataset, scope) = scoped_dataset(request, &mut query)?;
+            (Some(dataset), None, Some(std::sync::Arc::new(scope)))
+        } else {
+            let mut defaults = request.default_graphs.clone();
+            let from_protocol = pseudo_graph_strings(&mut defaults);
+            let own = query_dataset(&mut query);
+            let from_query = own.as_mut().and_then(pseudo_graph_iris);
+            // Pseudo-graphs alone select a model over the store's default dataset.
+            if own.as_ref().is_some_and(|dataset| {
+                dataset.default.is_empty() && dataset.named.as_ref().is_none_or(Vec::is_empty)
+            }) {
+                *own = None;
+            }
+            (
+                protocol_dataset(&defaults, &request.named_graphs)?,
+                from_protocol.or(from_query),
+                None,
+            )
         };
         Ok(Self {
             query,
             text: request.query.clone(),
-            dataset: protocol_dataset(&request.default_graphs, &request.named_graphs)?,
+            dataset,
+            inference_scope,
             read_model: match request.scope.model() {
                 // Without the inferred statements: what was asserted, whatever was asked.
                 ReadModel::Asserted => ReadModel::Asserted,
-                _ => request
-                    .read_model
-                    .or(from_protocol)
-                    .or(from_query)
-                    .unwrap_or_default(),
+                _ => request.read_model.or(model).unwrap_or_default(),
             },
             memory_limit: request.memory_limit,
             as_written: request.as_written,
@@ -197,6 +201,7 @@ impl PreparedQuery {
             rdf12: false,
             holds_rdf12: Default::default(),
             dl_answers: request.dl_answers,
+            deadline: request.deadline,
             on_evaluation: None,
             reads: crate::dl::query::Reads::new(request.scope.access().cloned()),
         })
@@ -317,6 +322,11 @@ impl PreparedQuery {
         self.dl_answers
     }
 
+    /// Under `owl2-dl`: when the request's time is up (`None`: `dl.timeout` alone).
+    pub(crate) fn deadline(&self) -> Option<std::time::Instant> {
+        self.deadline
+    }
+
     /// The graphs the query may read; `None`: every graph.
     pub fn access(&self) -> Option<&std::sync::Arc<nrese_sparql::GraphAccess>> {
         self.access.as_ref()
@@ -368,6 +378,59 @@ impl PreparedQuery {
 /// `FROM onto:implicit` inferred ones, both together everything.
 const EXPLICIT: &str = "http://www.ontotext.com/explicit";
 const IMPLICIT: &str = "http://www.ontotext.com/implicit";
+
+fn scoped_dataset(
+    request: &SparqlQueryRequest,
+    query: &mut Query,
+) -> StoreResult<(QueryDatasetSpecification, nrese_sparql::GraphAccess)> {
+    use nrese_sparql::{GraphAccess, QueryEvaluationError::Argument};
+    let bad = |reason: &str| StoreError::from(Argument(reason.into()));
+    if request.read_model.unwrap_or_default() != ReadModel::Materialised {
+        return Err(bad("inference-scope=dataset conflicts with infer=false"));
+    }
+    let mut dataset = protocol_dataset(&request.default_graphs, &request.named_graphs)?
+        .or_else(|| query_dataset(query).take().map(Into::into))
+        .unwrap_or_default();
+    let defaults = dataset.default_graph_graphs().unwrap_or_default();
+    if dataset.available_named_graphs().is_some_and(|named| {
+        named
+            .iter()
+            .any(|g| !defaults.iter().any(|d| d.as_ref() == g.as_ref().into()))
+    }) {
+        return Err(bad("every FROM NAMED graph must also be a FROM graph"));
+    }
+    let mut graphs: Vec<_> = defaults
+        .iter()
+        .filter_map(|graph| match graph {
+            GraphName::NamedNode(iri) => Some(iri.as_str().to_owned()),
+            _ => None,
+        })
+        .collect();
+    if graphs.is_empty() {
+        return Err(bad("inference-scope=dataset requires at least one graph"));
+    }
+    if graphs.iter().any(|iri| {
+        matches!(iri.as_str(), EXPLICIT | IMPLICIT)
+            || nrese_sparql::compat::names_default_graph(iri)
+    }) {
+        return Err(bad(
+            "a pseudo-graph or default graph name cannot scope inference",
+        ));
+    }
+    if let Some(access) = request.scope.access() {
+        graphs.retain(|iri| access.allows(iri));
+    }
+    graphs.sort_unstable();
+    graphs.dedup();
+    dataset.include_scoped_inference();
+    let scope = GraphAccess {
+        graphs,
+        inferred: true,
+        inferred_by_support: true,
+        ..Default::default()
+    };
+    Ok((dataset, scope))
+}
 
 fn pseudo_graph_model(explicit: bool, implicit: bool) -> Option<ReadModel> {
     match (explicit, implicit) {
@@ -693,8 +756,9 @@ pub(crate) fn plan_prepared(
 
 /// The options `prepared` runs with, for execution and explanation alike, drawing from
 /// the request's envelope `memory` ([`StoreSettings::envelope`]). The QL rewriting and
-/// whether the stack is closed under `owl:sameAs` are `view`'s certificate's: none without
-/// one, so a read never takes them from another version.
+/// whether the stack is closed under `owl:sameAs` are how `view`'s rows are produced: its
+/// certificate's for rows ([`crate::service::Certificate::for_rows`]), kept by a view whose
+/// claim is withheld; none without one, so a read never takes them from another version.
 fn query_options(
     view: &impl ReadView,
     prepared: &PreparedQuery,
@@ -702,7 +766,9 @@ fn query_options(
     cancellation: &CancellationToken,
     memory: &nrese_exec::Envelope,
 ) -> QueryOptions {
-    let certificate = view.snapshot().and_then(crate::service::Certificate::of);
+    let certificate = view
+        .snapshot()
+        .and_then(crate::service::Certificate::for_rows);
     QueryOptions {
         dataset: prepared.dataset.clone(),
         resources: nrese_sparql::Resources {

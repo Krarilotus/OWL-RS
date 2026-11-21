@@ -1,11 +1,11 @@
 //! Draft checks: one SHACL, query or reasoning check over pinned inputs, in a throwaway
 //! in-memory store. Nothing reads or writes a stored repository.
 //!
-//! The protocol is the Datamodel Workflow's backend-agnostic store check
-//! ([`DRAFT_CHECK_PROTOCOL`]); any store can implement it. Inputs are N-Triples, as DMW
-//! pins them. The semantics ([`DRAFT_CHECK_SEMANTICS`]) are NRESE's: SHACL and queries
-//! as DMW's offline checks run them; reasoning decided by the OWL 2 RL rules and the OWL 2
-//! DL engines, which may say more than DMW's offline rules:
+//! The protocol is a data-modelling application's backend-agnostic store check
+//! ([`DRAFT_CHECK_PROTOCOL`]); any store can implement it. Inputs are N-Triples, as the
+//! application pins them. The semantics ([`DRAFT_CHECK_SEMANTICS`]) are NRESE's: SHACL and
+//! queries as the application's offline checks run them; reasoning decided by the OWL 2 RL
+//! rules and the OWL 2 DL engines, which may say more than the application's offline rules:
 //!
 //! - **SHACL**: data and schema in the default graph, asserted statements only, SHACL
 //!   Core. SHACL-SPARQL, SHACL-AF and `sh:entailment` are reported unsupported rather
@@ -34,7 +34,13 @@ use crate::{
 };
 
 /// The protocol a draft-check request and reply follow.
-pub const DRAFT_CHECK_PROTOCOL: &str = "dmw-store-check/1";
+pub const DRAFT_CHECK_PROTOCOL: &str = "store-check/1";
+/// The same protocol's earlier name: a request may still give it, and the capabilities'
+/// `protocol` still names it, until clients send [`DRAFT_CHECK_PROTOCOL`] and read
+/// `protocols`.
+pub const DRAFT_CHECK_PROTOCOL_EARLIER: &str = "dmw-store-check/1";
+/// Every name a request may give the protocol by, the preferred first.
+pub const DRAFT_CHECK_PROTOCOLS: &[&str] = &[DRAFT_CHECK_PROTOCOL, DRAFT_CHECK_PROTOCOL_EARLIER];
 /// What this store's draft checks mean: the module documentation above. A change of
 /// meaning gets a new identifier, so old evidence stays interpretable.
 /// `/2`: `logical_consistent` became the RL and DL verdict, `null` where undecided (it was
@@ -113,7 +119,7 @@ pub enum DraftStatus {
     Unsupported,
 }
 
-/// An answer term: `uri`, `literal` or `bnode`, as DMW records terms.
+/// An answer term: `uri`, `literal` or `bnode`, as the protocol records terms.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DraftTerm {
     pub kind: String,
@@ -377,7 +383,7 @@ fn check_query(
     })
 }
 
-/// One SPARQL JSON solution as DMW terms; triple terms have no DMW form yet.
+/// One SPARQL JSON solution as the protocol's terms; triple terms have no form there yet.
 fn solution(binding: &serde_json::Value) -> Result<BTreeMap<String, DraftTerm>, DraftOutcome> {
     let object = binding
         .as_object()

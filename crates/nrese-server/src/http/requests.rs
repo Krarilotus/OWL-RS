@@ -12,6 +12,7 @@ pub struct QueryOperation {
     pub named_graphs: Vec<String>,
     /// GraphDB's `infer` parameter: `false` reads asserted statements only.
     pub infer: Option<bool>,
+    pub inference_scope_dataset: bool,
     /// `explain=true`: run the query and return how it ran (JSON) instead of its results;
     /// `explain=plan`: return the plan it would run as, with estimates, without running it.
     pub explain: Explain,
@@ -46,6 +47,10 @@ impl QueryOperation {
                 "default-graph-uri" => self.default_graphs.push(value),
                 "named-graph-uri" => self.named_graphs.push(value),
                 "infer" => self.infer = Some(boolean("infer", &value)?),
+                "inference-scope" if value == "dataset" => self.inference_scope_dataset = true,
+                "inference-scope" => {
+                    return Err(ApiError::bad_request("inference-scope must be 'dataset'"));
+                }
                 "dl-answers" => {
                     self.dl_answers =
                         Some(nrese_store::DlAnswers::from_name(&value).ok_or_else(|| {
@@ -284,6 +289,7 @@ mod tests {
                 default_graphs: Vec::new(),
                 named_graphs: vec!["http://ex/a".to_owned(), "http://ex/b".to_owned()],
                 infer: None,
+                inference_scope_dataset: false,
                 explain: Explain::No,
                 access: None,
                 origin: None,

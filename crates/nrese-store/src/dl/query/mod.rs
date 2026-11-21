@@ -226,6 +226,7 @@ struct Counts {
     upper: Option<u64>,
     proved: u64,
     refuted: u64,
+    by_labels: u64,
     unresolved: u64,
 }
 
@@ -277,6 +278,7 @@ impl Status {
     fn set_counts(&mut self, c: Counts) {
         self.detail.proved = c.proved;
         self.detail.refuted = c.refuted;
+        self.detail.refuted_by_labels = c.by_labels;
         self.completeness.bounds = c.upper.map(|upper| Bounds {
             lower: c.lower,
             upper,
@@ -295,7 +297,8 @@ impl Status {
 
 /// What can be said before running `prepared`: complete where every predicate it reads
 /// is closed; otherwise the bounds decide when it runs. `Cancelled` where the request stopped
-/// while it waited for another request's build of the bounds' view, which runs on and is kept.
+/// while it waited for another request's build of the bounds' view, which runs on and is kept;
+/// sound-only ([`DEADLINE`]) where the request's time was up instead.
 pub(crate) fn plan_status(
     store: &StoreService,
     snapshot: &Snapshot,
@@ -323,6 +326,11 @@ const PART: &str = "the reader sees part of the data: answers are checked agains
 const LATER: &str = "a later commit's bounds replaced this revision's while it was read: \
                      answers over the RL closure, not checked against the bounds";
 
+/// A read whose request's time was up before the view of its revision was built reads its RL
+/// closure: the build, another read's or none begun, isn't waited for.
+const DEADLINE: &str = "the request's time was up before the bounds' view of this revision was \
+                        built: answers over the RL closure, not checked against the bounds";
+
 /// [`Decided`] of `snapshot` for `prepared`.
 fn decided(
     store: &StoreService,
@@ -333,9 +341,28 @@ fn decided(
     if prepared.access().is_some() {
         return Ok(Err(PART));
     }
-    let view = super::bounds::view_until(store, snapshot, Some(&|| cancellation.is_cancelled()))
-        .ok_or(crate::QueryEvaluationError::Cancelled)?;
+    let up = || {
+        prepared
+            .deadline()
+            .is_some_and(|at| Deadline::at(at).passed())
+    };
+    let stop = || cancellation.is_cancelled() || up();
+    let Some(view) = super::bounds::view_until(store, snapshot, Some(&stop)) else {
+        // The operator's stop is the read's error; the request's time is a reason.
+        cancellation.check()?;
+        return Ok(Err(DEADLINE));
+    };
     Ok(view.map(|view| (snapshot.clone(), view)).ok_or(LATER))
+}
+
+/// The exact services' deadline for `prepared`: `dl.timeout` from now, or the request's own
+/// where that comes first.
+fn deadline_of(store: &StoreService, prepared: &PreparedQuery) -> Deadline {
+    let dl = Deadline::after(store.config().dl.timeout);
+    let sooner = prepared
+        .deadline()
+        .filter(|at| dl.instant().is_none_or(|by| *at < by));
+    sooner.map_or(dl, Deadline::at)
 }
 
 /// `status` composed once (`StoreService::assess`) on the data it was decided on: the
@@ -562,14 +589,13 @@ fn by_index(snapshot: &Snapshot) -> Option<Option<String>> {
 }
 
 /// The annotation properties by the reader's rule: declared by its table (OWL 1's
-/// `owl:OntologyProperty` too) in a graph `readable` takes, IRIs only and not `rdf:type`,
-/// whose declaration the reader leaves out as reserved, then the built-ins the store knows;
-/// lazily, a declaring type at a time.
+/// `owl:OntologyProperty` too) in a graph `readable` takes, IRIs that may name one only
+/// ([`may_name_annotation`]), then the built-ins the store knows; lazily, a declaring type at
+/// a time.
 fn annotation_properties(
     snapshot: &Snapshot,
     readable: impl Fn(TermId) -> bool,
 ) -> impl Iterator<Item = TermId> {
-    use nrese_engine::TermKind;
     use nrese_owl::{BUILTIN_ANNOTATIONS as BUILTIN, EntityKind};
     let id = move |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
     let (ty, kinds) = (id(RDF_TYPE), nrese_owl::DECLARATION_KINDS.into_iter());
@@ -580,8 +606,15 @@ fn annotation_properties(
     let named = typed.flat_map(quads).filter(move |q| readable(q.graph));
     let named = named
         .map(|q| q.subject)
-        .filter(move |&s| s.kind() == TermKind::Iri && Some(s) != ty);
+        .filter(move |&s| may_name_annotation(snapshot, s));
     named.chain(BUILTIN.into_iter().filter_map(id))
+}
+
+/// Whether `term` is an IRI that may name an annotation property, by the reader's rule
+/// ([`nrese_owl::may_name_annotation`]).
+pub(crate) fn may_name_annotation(snapshot: &Snapshot, term: TermId) -> bool {
+    let iri = snapshot.decode(term);
+    matches!(iri, Some(Term::NamedNode(n)) if nrese_owl::may_name_annotation(n.as_str()))
 }
 
 /// Whether `snapshot` holds `owl:sameAs` between two different terms: the first found
@@ -835,10 +868,12 @@ const COPIES: &str = "and the closure may hold the rules' copies of annotation s
                       an equality or an annotation axiom), which OWL 2 DL doesn't entail";
 
 /// The first of `read` that may return a copy in `snapshot`: an annotation property (one of
-/// [`annotation_properties`], for `None`; a constant by its own declarations or as built in,
-/// none where the store doesn't know the IRI) with statements held where an equality between
-/// two different terms is, or inferred ones. For a reader by support (`access`), held only in
-/// the graphs it reads: a copy it sees has its support there, or copies an inferred statement.
+/// [`annotation_properties`], for `None`; a constant by its own declarations where it may name
+/// one, or as built in,
+/// none where the store doesn't know the IRI), or, under an equality, a SHACL property, with
+/// statements held where an equality between two different terms is, or inferred ones. For a
+/// reader by support (`access`), held only in the graphs it reads: a copy it sees has its
+/// support there, or copies an inferred statement.
 fn copied<'a>(
     snapshot: &Snapshot,
     access: Option<&nrese_sparql::GraphAccess>,
@@ -851,9 +886,10 @@ fn copied<'a>(
     let id = |iri: &str| snapshot.lookup(NamedNodeRef::new_unchecked(iri).into());
     let asserted = |pattern| snapshot.quads_for_pattern_in(ReadModel::Asserted, &pattern);
     let equal = std::cell::OnceCell::new();
+    let equal = || *equal.get_or_init(|| equal_terms(snapshot));
     // A reader by support sees the copy of a statement in its own graphs, or of an inferred one.
     let copies = |p| {
-        let equal = *equal.get_or_init(|| equal_terms(snapshot));
+        let equal = equal();
         let (of, held) = (any_graph(None, Some(p), None), equal && !by_support);
         let model = if held { Materialised } else { Inferred };
         let seen = equal && by_support && asserted(of).any(|q| readable(q.graph));
@@ -864,11 +900,24 @@ fn copied<'a>(
         let object = snapshot.decode(q.object);
         readable(q.graph) && matches!(object, Some(Term::NamedNode(k)) if kind(k.as_str()))
     };
+    // SHACL content (`nrese_owl::shacl_properties`) is copied only through an equality of two
+    // different terms (OWL 2 Profiles §4.3, Table 4: eq-rep-s, eq-rep-p, eq-rep-o): an OWL axiom
+    // on a SHACL term makes the reader read the store as any other, and a copy is then entailed.
+    // So with no equality its properties aren't probed.
     read.iter().find(|p| match p.as_deref() {
-        None => annotation_properties(snapshot, readable).any(copies),
+        None => {
+            annotation_properties(snapshot, readable).any(copies)
+                || (equal()
+                    && nrese_owl::shacl_properties()
+                        .filter_map(|i| id(&i))
+                        .any(copies))
+        }
         Some(iri) => id(iri).is_some_and(|p| {
             let typed = id(RDF_TYPE).map(|ty| asserted(any_graph(Some(p), Some(ty), None)));
-            (BUILTIN.contains(&iri) || typed.into_iter().flatten().any(declares)) && copies(p)
+            let shacl = nrese_owl::is_shacl_property(iri) && equal();
+            let declared = || typed.into_iter().flatten().any(declares);
+            (BUILTIN.contains(&iri) || shacl || (nrese_owl::may_name_annotation(iri) && declared()))
+                && copies(p)
         }),
     })
 }
@@ -965,8 +1014,9 @@ pub(crate) fn answer(
     let analysis = analyse(prepared.query());
     // One view for the answers and their status: a commit in between changes neither.
     let decided = decided(store, snapshot, prepared, cancellation)?;
-    // The exact services' one deadline, the every-name question's included.
-    let read = (cancellation, Deadline::after(store.config().dl.timeout));
+    // The exact services' one deadline, the every-name question's included: at the request's,
+    // what they haven't decided is told undecided, and the checks below see only a stop.
+    let read = (cancellation, deadline_of(store, prepared));
     let mut outcome = match decided.as_ref() {
         Ok(at) => decide_answers(store, prepared, &analysis, at, read, memory, mode)?,
         Err(why) => Status::sound_only(*why).stream(Read::At(snapshot.clone())),
@@ -1183,28 +1233,98 @@ fn decide_answers(
             let budget = Arc::new(memory.part());
             let mut pair = lower.align(upper, Arc::clone(&budget))?;
             // A query's candidate budget, unlimited where none is set.
-            let limit = store.config().dl.max_candidates.unwrap_or(usize::MAX);
-            let gap = gap::select(
-                &mut pair,
-                limit.saturating_add(super::UNRESOLVED_SHOWN),
-                &budget,
-                cancellation,
-            )?;
+            let config = &store.config().dl;
+            let limit = config.max_candidates.unwrap_or(usize::MAX);
+            // The labels' one deadline: a quarter of what the read has left, the selection included.
+            let labels_deadline = Deadline::after(deadline.within(config.timeout).map(|t| t / 4));
+            // The labels read the whole gap; where it has no room, the capped one, with no labels.
+            let whole = match config.model_labels {
+                true => match gap::select(&mut pair, usize::MAX, &budget, cancellation) {
+                    Err(e) if e.is_memory_limit() || e.is_server_memory_limit() => None,
+                    other => Some(other?),
+                },
+                false => None,
+            };
+            if config.model_labels && whole.is_none() {
+                status.path("capped-gap");
+            }
+            let labelled = whole.is_some();
+            let mut gap = match whole {
+                Some(gap) => gap,
+                None => gap::select(
+                    &mut pair,
+                    limit.saturating_add(super::UNRESOLVED_SHOWN),
+                    &budget,
+                    cancellation,
+                )?,
+            };
+            let variables = pair.variables().to_vec();
+            let refuted = match labelled {
+                true => exact::refuted_by_labels(
+                    store,
+                    &view.lower,
+                    analysis,
+                    &variables,
+                    gap.rows.len(),
+                    &|i| pair.upper_row(gap.rows[i]),
+                    cancellation,
+                    labels_deadline,
+                    memory,
+                ),
+                false => nrese_exec::ChargedVec::new(memory.clone()),
+            };
+            // The capped read's costliest batch, in bytes: no batch past its rows costs more.
+            let most = |b: &[usize]| b.chunks(64).map(|c| c.iter().sum::<usize>()).max();
+            let first = limit.min(gap.bytes.len());
+            let prefix = most(&gap.bytes[..first]).unwrap_or(0);
+            // The capped read's batches first, each as the rows the labels leave of it.
+            let kept = |s| (s..first.min(s + 64)).filter(|&i| refuted.get(i) != Some(&true));
+            let mut chunks: Vec<_> = (0..first).step_by(64).map(|s| kept(s).count()).collect();
+            chunks.retain(|&k| k > 0);
+            chunks.reverse();
+            let (mut rows, mut bytes) = (refuted.iter(), refuted.iter());
+            gap.rows.retain(|_| rows.next() != Some(&true));
+            gap.bytes.retain(|_| bytes.next() != Some(&true));
+            let by_labels = refuted.iter().filter(|&&r| r).count() as u64;
+            drop(refuted);
+            if labelled {
+                gap.keep(limit.saturating_add(super::UNRESOLVED_SHOWN));
+            }
+            let left = gap.total - by_labels;
+            let n = limit.min(gap.rows.len());
             let mut counts = Counts {
                 lower: gap.lower,
                 upper: Some(gap.lower + gap.total),
-                unresolved: gap.total.saturating_sub(limit as u64),
+                refuted: by_labels,
+                by_labels,
                 ..Counts::default()
             };
-            let variables = pair.variables().to_vec();
-            let mut why = None;
-            let admitted = limit.min(gap.rows.len());
-            pair.reserve_appends(admitted)?;
+            let (mut why, mut stop, mut start) = (None, None, 0);
+            pair.reserve_appends(n)?;
             // Bounds, candidate production and all batches share the entry deadline.
-            for start in (0..admitted).step_by(64) {
-                let end = (start + 64).min(admitted);
+            while start < n {
+                // Past the capped read's batches: up to 64 rows within its costliest one's bytes,
+                // ending the tests where the next row doesn't fit or the request has no room.
+                let past = chunks.is_empty();
+                let end = match chunks.pop() {
+                    Some(kept) => start + kept,
+                    None => (start..=n.min(start + 64))
+                        .rfind(|&e| gap.bytes[start..e].iter().sum::<usize>() <= prefix)
+                        .unwrap_or(start),
+                };
+                if end == start {
+                    stop = Some(format!(
+                        "the next candidate's row costs more than {prefix} bytes"
+                    ));
+                    break;
+                }
                 let mut batch_memory = nrese_exec::Reservation::new(&*budget);
-                batch_memory.charge(gap.bytes[start..end].iter().sum())?;
+                let charged = batch_memory.charge(gap.bytes[start..end].iter().sum());
+                if past && let Err(e) = &charged {
+                    stop = Some(Limit::Envelope.reached(e));
+                    break;
+                }
+                charged?;
                 let rows: Vec<_> = gap.rows[start..end]
                     .iter()
                     .map(|&i| pair.upper_row(i))
@@ -1238,9 +1358,16 @@ fn decide_answers(
                         }
                     }
                 }
+                start = end;
             }
-            if gap.total > limit as u64 {
-                why.get_or_insert_with(|| Limit::Candidates.reached(limit));
+            let admitted = start;
+            counts.unresolved += left.saturating_sub(admitted as u64);
+            if left > admitted as u64 {
+                // A stop is named beside an earlier batch's reason; without one, the limit is.
+                why = match (why, stop) {
+                    (Some(w), Some(s)) if w != s => Some(format!("{w}; {s}")),
+                    (w, s) => w.or(s).or_else(|| Some(Limit::Candidates.reached(limit))),
+                };
                 for &index in &gap.rows[admitted..] {
                     if status.detail.unresolved.len() == super::UNRESOLVED_SHOWN {
                         break;

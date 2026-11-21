@@ -7,7 +7,7 @@ Amended 14 Nov 2026: shapes are compiled for each validation, not kept per shape
 
 ## Context
 
-GraphDB validates SHACL on commit. The main downstream user, the datamodel workflow feeding ResearchSpace, versions SHACL shapes next to its ontology modules and needs a store-side safety net. QLever has no SHACL.
+GraphDB validates SHACL on commit. The main downstream user, a data-modelling application feeding ResearchSpace, versions SHACL shapes next to its ontology modules and needs a store-side safety net. QLever has no SHACL.
 
 ## Decision
 

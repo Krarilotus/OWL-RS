@@ -42,6 +42,8 @@ use store_env::parse_store_config;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerConfig {
     pub bind_address: SocketAddr,
+    /// The externally reachable server URL, including a reverse proxy's path prefix.
+    pub public_url: Option<String>,
     pub deployment_posture: DeploymentPosture,
     pub store: StoreConfig,
     pub reasoner: ReasonerConfig,
@@ -94,6 +96,12 @@ impl ServerConfig {
         };
         let lines = [
             ("server.bind_address", self.bind_address.to_string()),
+            (
+                "server.public_url",
+                self.public_url
+                    .clone()
+                    .unwrap_or_else(|| "(none)".to_owned()),
+            ),
             (
                 "server.deployment_posture",
                 self.deployment_posture.as_str().to_owned(),
@@ -283,6 +291,10 @@ impl ServerConfig {
 
         Ok(Self {
             bind_address,
+            public_url: source
+                .get(names::PUBLIC_URL)
+                .map(parse_public_url)
+                .transpose()?,
             deployment_posture,
             store,
             reasoner,
@@ -291,6 +303,22 @@ impl ServerConfig {
             replication,
         })
     }
+}
+
+/// Validates the external base before it can enter logs or response headers.
+fn parse_public_url(value: String) -> Result<String> {
+    let invalid = "server.public_url must be an absolute HTTP(S) base URL without userinfo, controls, query or fragment";
+    let url = reqwest::Url::parse(&value).map_err(|_| anyhow::anyhow!(invalid))?;
+    anyhow::ensure!(
+        matches!(url.scheme(), "http" | "https")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && !value.chars().any(char::is_control)
+            && url.query().is_none()
+            && url.fragment().is_none(),
+        invalid
+    );
+    Ok(url.to_string())
 }
 
 fn parse_deployment_posture(input: Option<&str>) -> Result<DeploymentPosture> {

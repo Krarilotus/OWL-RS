@@ -412,8 +412,8 @@ arises, the same for every side:
   the checks host's powersave with energy preference balance_performance (a shared host).
 
 **Trade-offs and exceptions.** [release-tradeoffs.toml](release-tradeoffs.toml) is the only thing
-that accepts what the bar forbids, and only the project's owner adds to it. Each entry carries the approval:
-the date, `by` (the gate accepts the owner's name alone), the reason, the approval's words verbatim
+that accepts what the bar forbids, and only its `approver` adds to it. Each entry carries the approval:
+the date, `by` (the file's `approver`; in a file from before that key, its entries' one name), the reason, the approval's words verbatim
 and their source. A *trade-off*
 accepts a loss: it names a case, a dimension, optionally the baseline, the largest ratio the
 loss's interval may reach, and the win that pays for it, which must show as *better* in the same
@@ -427,7 +427,8 @@ stand, even where the case declares the outcome and every baseline is wrong too;
 losses as now, needs a named exception. A declared `memory-limit`, `gave-up`, `timeout`
 or `unsupported` blocks where a baseline completes. Where every side stops, it's listed in the
 verdict and doesn't block: only wrong answers disqualify, and the bar's time and memory loss
-rule. The verdict reads
+rule. An *accepted* entry waives nothing: it lists rows accepted for a release with the reading
+accepted (ratio and interval, on its tree), which the verdict prints beside the row's flag. The verdict reads
 the file at the candidate's commit, never from a report, and lists every entry it applied and
 every exception the candidate didn't need. The list starts empty.
 

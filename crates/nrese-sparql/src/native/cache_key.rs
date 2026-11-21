@@ -85,6 +85,7 @@ impl Encoder {
             TermPattern::NamedNode(n) => self.iri(n.as_str())?,
             // A blank node of a pattern is the variable the executor makes for it.
             TermPattern::BlankNode(b) => {
+                self.tag(b'_');
                 self.var(&nrese_sparql_syntax::internal::blank_variable(b));
             }
             TermPattern::Literal(l) => self.display(b'"', l),

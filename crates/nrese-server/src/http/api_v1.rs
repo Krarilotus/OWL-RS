@@ -398,7 +398,7 @@ pub async fn session_commit(
         .sessions()
         .take(&session, access.origin.as_deref())
         .ok_or_else(|| no_session(&session))?;
-    super::rdf4j::apply(&state, request.ops, &access).await?;
+    super::rdf4j::commit(&state, request.ops, &access).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -881,11 +881,14 @@ pub async fn import(
     let loaded = tokio::task::spawn_blocking(move || {
         let report = store.bulk_load(&request);
         let _ = std::fs::remove_file(&file);
-        report.map_err(|error| std::io::Error::other(error.to_string()))
+        report
     })
     .await
     .map_err(|error| ApiError::internal(error.to_string()))?
-    .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    .map_err(|error| match error {
+        nrese_store::StoreError::LoadPublished { .. } => ApiError::internal(error.to_string()),
+        _ => ApiError::bad_request(error.to_string()),
+    })?;
     let reasoning = rematerialised(&state).await?;
     Ok(Json(import_report(&loaded, reasoning.as_ref())).into_response())
 }
@@ -948,6 +951,12 @@ fn start_import(
         let loaded = store.bulk_load_with(&request, job.progress());
         if let Some(file) = remove {
             let _ = std::fs::remove_file(file);
+        }
+        if let Err(nrese_store::StoreError::LoadPublished { revision, reason }) = &loaded {
+            let warning = format!("the quarantine record couldn't be kept: {reason}");
+            let report = serde_json::json!({ "revision": revision, "warning": warning });
+            job.finish(Ok(report));
+            return;
         }
         let outcome = loaded
             .map_err(|error| error.to_string())

@@ -207,7 +207,9 @@ impl VisitsBase for EngineBase<'_> {
 /// What [`maintain`] did to a transaction's inferred stack.
 #[derive(Debug, Default)]
 pub struct Maintenance {
-    /// The consistency violations the change introduced, charged to its budget.
+    /// The consistency violations the change introduced, charged to its budget. A first load
+    /// whose caller uses the rebuild's report has its verdict in
+    /// [`Self::rebuilt_violations`] alone, and this is empty.
     pub violations: Violations,
     pub inserted: u64,
     pub removed: u64,
@@ -218,6 +220,10 @@ pub struct Maintenance {
     pub program: Option<GroundProgram>,
     /// What the maintenance policy weighed and did ([`delta::policy`]).
     pub work: delta::policy::Counts,
+    /// Where the change installed a rebuilt closure and the caller uses its report
+    /// ([`maintain_with`]'s `uses_rebuilt_report`): the rebuild's own violations, charged to
+    /// the same budget. Over a state that had none, they are the change's new ones.
+    pub rebuilt_violations: Option<Violations>,
 }
 
 /// Whether `base` holds an inverse property expression (`_:x owl:inverseOf :p`), OWL 2's
@@ -264,18 +270,29 @@ pub fn maintain_within(
     stop: crate::eval::Stop<'_>,
     memory: &Arc<Budget>,
 ) -> Result<Maintenance, delta::Interrupted> {
-    maintain_with(program, ground, tx, &OperationStop::new(stop), memory)
+    maintain_with(
+        program,
+        ground,
+        tx,
+        &OperationStop::new(stop),
+        memory,
+        false,
+    )
 }
 
 /// [`maintain_within`] as one operation under `operation`, whose memory limit and room its
 /// caller chose ([`OperationStop::within`]): the equality copies are admitted by its room,
 /// and once it fires, every part of the maintenance stops.
+///
+/// `uses_rebuilt_report`: the caller judges a rebuilt change by the rebuild's own report
+/// ([`Maintenance::rebuilt_violations`]), so a first load makes no other.
 pub fn maintain_with(
     program: &Program,
     ground: Option<&GroundProgram>,
     tx: &mut Transaction<'_>,
     operation: &OperationStop<'_>,
     memory: &Arc<Budget>,
+    uses_rebuilt_report: bool,
 ) -> Result<Maintenance, delta::Interrupted> {
     // Axioms the state lacks (a store that never rematerialised): added with this commit.
     let mut missing_axioms: Vec<Triple> = Vec::new();
@@ -311,8 +328,8 @@ pub fn maintain_with(
     // ([`delta::introduced_violations`]): an axiom's violation from before stays tolerated.
     // The delta executor built one job per ground rule and copied each job's matches
     // before the round ran: a 250-class subclass chain with 400 individuals held 757 MiB in
-    // a round that derived nothing, where a materialisation holds about 140 (DMW's A/B,
-    // fleet pm-dmwab-3, 21 Oct 2026). Not over a compact stack: its closure lists
+    // a round that derived nothing, where a materialisation holds about 140 (a downstream
+    // application's A/B, 21 Oct 2026). Not over a compact stack: its closure lists
     // equalities over representatives, which the datatype checks don't read as the delta's
     // expanded ones. A fact no store holds (a literal subject) is new to the
     // state where the axioms' own closure concludes none, as the state before held only
@@ -340,6 +357,8 @@ pub fn maintain_with(
         )?);
     }
     let unkept: bool;
+    let delta_ran: bool;
+    let deletes: bool;
     let update = {
         let base = EngineBase::new(tx, &program.axioms);
         // The change's own probes of the base (a deleted fact still asserted elsewhere, a
@@ -395,8 +414,9 @@ pub fn maintain_with(
         // Facts with an inverse expression as their predicate: the stored closure lacks the
         // base's, so a delta can't read them. Such a change runs its delta, whose consistency
         // check stands, and is then rebuilt: the closure after it is the one a rebuild gives.
-        unkept = !(first_load || inserted.is_empty() && deleted.is_empty())
-            && has_inverse_expression(tx.base(), &prep).map_err(interrupted)?;
+        delta_ran = !(first_load || inserted.is_empty() && deleted.is_empty());
+        deletes = !deleted.is_empty();
+        unkept = delta_ran && has_inverse_expression(tx.base(), &prep).map_err(interrupted)?;
         // A rebuild reads the asserted facts and writes the closure, both about the size
         // of the stored state; the policy offers it to a change that inserts nothing
         // ([`delta::policy::Plan::Rebuild`]).
@@ -410,10 +430,12 @@ pub fn maintain_with(
         if inserted.is_empty() && deleted.is_empty() {
             delta::Update::default()
         } else if let Some(closure) = rebuilt.as_mut().filter(|_| first_load) {
-            // The batch's own report isn't the one given (it holds an axiom's old violations
-            // too): let go of its charge before the introduced-only report takes the same
-            // budget, which then holds what the delta executor's single report would.
-            drop(std::mem::take(&mut closure.violations));
+            // One report is held: the batch's, where the caller uses it (the rebuild below
+            // gives it); else the introduced-only one, the batch's let go first (it holds an
+            // axiom's old violations too): it fits where the delta executor's single one would.
+            if !uses_rebuilt_report {
+                drop(std::mem::take(&mut closure.violations));
+            }
             // The new inferred facts, as the delta executor reports them (its `insert`): the
             // state tells which storable ones it held before, and none it can't hold (above).
             let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
@@ -433,9 +455,12 @@ pub fn maintain_with(
             }
             derived.append(&mut unstorable);
             delta::Update {
-                violations: delta::introduced_violations(
-                    &base, &inserted, &derived, rules, ground, operation, memory,
-                )?,
+                violations: match uses_rebuilt_report {
+                    true => Violations::default(),
+                    false => delta::introduced_violations(
+                        &base, &inserted, &derived, rules, ground, operation, memory,
+                    )?,
+                },
                 insert: derived,
                 policy: delta::policy::Counts {
                     plan: delta::policy::Plan::Rebuild,
@@ -450,9 +475,30 @@ pub fn maintain_with(
         }
     };
     let mut update = update;
+    // A list past the cap ([`crate::lists::MAX_VARIANTS`]) in the program after the delta,
+    // whether the state before held it or this change's rounds read it: the rules it gave
+    // while within the cap are in no program made over the state, so the delta derived
+    // nothing from it. Such a change runs its delta, whose checks (the list read as
+    // written) stand, and is then rebuilt: the batch's rounds make the list's rules again
+    // as they reach it.
+    let capped = delta_ran
+        && update.policy.plan != delta::policy::Plan::Rebuild
+        && (update.program.as_ref().or(ground)).is_some_and(|program| {
+            (program.list_diagnostics.iter())
+                .any(|d| d.problem == crate::lists::ListProblem::TooManyVariants)
+        });
+    // A change after which an axiom's list is read otherwise (left out where it was read,
+    // read where it was left out, or left out for another reason): the delta can't follow
+    // the rules it gave or gives, so the change is rebuilt and judged by the rebuild's
+    // report. A list left out before and after, for the same reason, gives no rules either
+    // way and leaves the change to its delta.
+    let relisted = delta_ran
+        && update.policy.plan != delta::policy::Plan::Rebuild
+        && update.lists_read_otherwise;
     // A list that already stopped at its budget makes the change inconsistent: the
-    // datatype checks would add nothing to that.
-    if update.violations.complete() {
+    // datatype checks would add nothing to that. A first load judged by its rebuild has
+    // them in the batch's report already.
+    if update.violations.complete() && !(first_load && uses_rebuilt_report) {
         let datatypes = super::datatypes::violations(
             &update.insert,
             program.rdf_type,
@@ -466,7 +512,11 @@ pub fn maintain_with(
     let (mut inserted, mut removed) = (0, 0);
     // Over representatives, a change that may split a class is rebuilt (B3a: the
     // translation can't follow it; the representative view for the delta executor is B3b).
-    let mut rebuild = revived || unkept || update.policy.plan == delta::policy::Plan::Rebuild;
+    let mut rebuild = revived
+        || unkept
+        || capped
+        || relisted
+        || update.policy.plan == delta::policy::Plan::Rebuild;
     if !rebuild && program.stores_representatives() {
         match store_over_representatives(program, &update, &missing_axioms, tx) {
             Some((added, dropped)) => (inserted, removed) = (added, dropped),
@@ -492,6 +542,7 @@ pub fn maintain_with(
             }
         }
     }
+    let mut rebuilt_violations = None;
     if rebuild {
         let mut closure = match rebuilt.take() {
             Some(closure) => closure,
@@ -501,6 +552,22 @@ pub fn maintain_with(
         if operation.fired() {
             return Err(operation.interrupted());
         }
+        rebuilt_violations = uses_rebuilt_report.then(|| {
+            let found = std::mem::take(&mut closure.violations);
+            // A change rebuilt for a list past the cap, or for a list read otherwise, that
+            // deletes nothing is refused if either report refuses it. For the cap, the
+            // rebuild reads the list from its asserted cells in its rounds, the delta from
+            // the cells as written over every name. For a list read otherwise, a change that
+            // only inserts takes no list path away, so what the delta found is still
+            // entailed even where the list is now left out. Without a clash of its own, the
+            // rebuild's report gives way to the delta's. One that deletes is judged by the
+            // rebuild's alone: the delta can't follow what the list's rules derived, and a
+            // fact the change took the support of can still clash there.
+            match (capped || relisted) && !deletes && found.consistent() {
+                true => std::mem::take(&mut update.violations),
+                false => found,
+            }
+        });
         // Only the difference is applied: O(stored + rebuilt closure) to sort and walk,
         // and a transaction update per fact that changed. A stored snapshot shares the old
         // runs and avoids expanding compact equality.
@@ -553,7 +620,7 @@ pub fn maintain_with(
         }
     }
     // The delta ran (its violations and diagnostics stand), and the closure is a rebuild's.
-    if unkept {
+    if unkept || capped || relisted {
         update.policy.plan = delta::policy::Plan::Rebuild;
     }
     Ok(Maintenance {
@@ -564,6 +631,7 @@ pub fn maintain_with(
         diagnostics: update.diagnostics,
         program: update.program,
         work: update.policy,
+        rebuilt_violations,
     })
 }
 
@@ -1256,7 +1324,10 @@ mod tests {
     }
 
     /// A rebuild runs no delta, and still reports the list axioms a deletion leaves
-    /// unusable, as the delta does.
+    /// unusable, as the delta does. A deletion that leaves a list unread is rebuilt whatever
+    /// plan is asked for (reasoning-semantics.md: a change after which an axiom's list is
+    /// read otherwise), so both runs are rebuilt and report the same; the run asked for
+    /// `Dred` reports what its delta found, the other what the rebuild's own reading found.
     #[test]
     fn a_rebuild_reports_the_list_axioms_a_deletion_breaks() {
         use crate::delta::policy::Plan;
@@ -1296,10 +1367,13 @@ mod tests {
             let mut tx = engine.transaction();
             tx.remove_encoded(encode(tail).in_default_graph());
             let done = maintain(&program, Some(&ground), &mut tx, crate::eval::NEVER).unwrap();
-            assert_eq!(done.work.plan, plan);
+            assert_eq!(done.work.plan, Plan::Rebuild, "asked for {plan:?}");
+            assert!(
+                !done.diagnostics.is_empty(),
+                "asked for {plan:?}: the list lost its end"
+            );
             reported.push(done.diagnostics);
         }
-        assert!(!reported[0].is_empty(), "the list lost its end");
         assert_eq!(reported[0], reported[1]);
     }
 
@@ -1529,7 +1603,7 @@ mod tests {
             let rdf_type = iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#type");
             let subclass = iri("http://www.w3.org/2000/01/rdf-schema#subClassOf");
             let disjoint = iri("http://www.w3.org/2002/07/owl#disjointWith");
-            // A subclass chain of 20 with 10 individuals at the bottom (DMW's chain, small).
+            // A subclass chain of 20 with 10 individuals at the bottom (an A/B's, small).
             let class = |n: usize| iri(&format!("http://example.com/C{n}"));
             let mut facts: Vec<Triple> = (1..20)
                 .map(|n| [class(n), subclass, class(n - 1)])

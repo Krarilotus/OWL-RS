@@ -74,6 +74,32 @@ fn run(command: &mut Command) -> Result<Output, Box<dyn std::error::Error>> {
     })
 }
 
+#[cfg(feature = "fault-points")]
+#[test]
+fn published_answer_followup_cli_reports_quarantine_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let dir = tempfile::tempdir()?;
+    let file = dir.path().join("mixed.nt");
+    let upload = "<urn:a> <urn:p> \"one\" .\nthis is not a statement\n_:b <urn:p> \"two\" .\n";
+    std::fs::write(&file, upload)?;
+    let mut command = nrese(dir.path(), &dir.path().join("data"));
+    command
+        .env("NRESE_TEST_FAIL_QUARANTINE_COMMIT", "1")
+        .arg("load")
+        .arg(&file);
+    eprintln!("{command:?}\nUpload:\n{upload}");
+    let output = run(&mut command)?;
+    eprintln!("{}\n{}", output.status, output.stderr);
+    let detail = "Error: the load completed at published revision 1. Its quarantine record couldn't be kept: simulated failure. Don't load it again.";
+    assert!(
+        output.stderr.lines().any(|line| line == detail),
+        "{}",
+        output.stderr
+    );
+    assert!(!output.status.success(), "{}", output.status);
+    Ok(())
+}
+
 /// `query --format json`: standard output is one SPARQL 1.1 JSON results document (`ASK {}`
 /// is true), nothing before or after it; the INFO lines are on standard error.
 #[test]

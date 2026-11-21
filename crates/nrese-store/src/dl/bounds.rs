@@ -49,6 +49,10 @@ mod lock_tests;
 #[path = "bounds_kinds_tests.rs"]
 mod kinds_tests;
 
+#[cfg(test)]
+#[path = "bounds_shapes_tests.rs"]
+mod shapes_tests;
+
 /// Where the lock tests hold U1's work mid-way: a hook run once, on the thread doing that
 /// work, for the store whose bounds it names.
 #[cfg(test)]
@@ -180,21 +184,25 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 /// PR1 doesn't hold, which needs no punning and no annotation-property axioms
 /// (`query::reads_differently` says what that costs); or unless a cardinality is spelled
 /// otherwise than the rules name it (`Ontology::noncanonical_cardinality`), so they
-/// wouldn't read it. Its callers also leave the route where the closure leaves out a list
-/// axiom (`StoreService::lists_left_out`): the rules lack that axiom's conclusions, and PR1's
-/// premise doesn't hold.
+/// wouldn't read it, or a statement the rules don't read was read as axioms they would
+/// (`Ontology::rules_unread`). Its callers also leave the route where the closure leaves out
+/// a list axiom (`StoreService::lists_left_out`): the rules lack that axiom's conclusions,
+/// and PR1's premise doesn't hold.
 fn routed_to_rules(ontology: &Ontology) -> bool {
     nrese_owl::profile::of_ontology(ontology).rl
         && nrese_owl::ql::reads_data_values(ontology).is_none()
         && !nrese_owl::profile::rules_read_differently(ontology)
         && ontology.noncanonical_cardinality.is_none()
+        && ontology.rules_unread.is_none()
 }
 
 /// What the RL route was decided on: the TBox signature as the reader typed it, the
-/// built-in annotation properties among its annotation properties, and the ids of
+/// built-in annotation properties among its annotation properties, the SHACL properties
+/// whose statements were read as SHACL content (`Ontology::shacl`), and the ids of
 /// `rdf:type` and `owl:sameAs` (`None`: not in the dictionary then).
 pub(crate) struct Kinds {
     signature: nrese_owl::profile::Signature,
+    shacl: std::collections::BTreeSet<u64>,
     rdf_type: Option<u64>,
     same_as: Option<u64>,
 }
@@ -210,14 +218,18 @@ impl Kinds {
         );
         Arc::new(Self {
             signature,
+            shacl: ontology.shacl.clone(),
             rdf_type: id("http://www.w3.org/1999/02/22-rdf-syntax-ns#type"),
             same_as: id("http://www.w3.org/2002/07/owl#sameAs"),
         })
     }
 
     /// Whether an asserted triple, inserted or deleted, leaves every term the kinds the
-    /// reader gave it, which it gives by use (`nrese_owl::profile::Signature`): a known
-    /// annotation property's statement gives none; any other leaves the schema as it is,
+    /// reader gave it, which it gives by use (`nrese_owl::profile::Signature`): a statement of
+    /// a SHACL property the reader read as SHACL content gives none (it has no OWL meaning),
+    /// nor one of a known annotation property that is no SHACL property; a SHACL property's
+    /// first content may change how the reader reads the whole source (`Ontology::shacl`), so
+    /// it reads again, whatever the property is declared; any other leaves the schema as it is,
     /// names no class or property, and no name of the reserved vocabulary, which the reader
     /// leaves out (`nrese_owl::diagnostics::reserved_name`), as subject or IRI object, and
     /// its predicate is `rdf:type` with a known class, `owl:sameAs`, or a property known
@@ -227,7 +239,7 @@ impl Kinds {
     /// object property.
     fn keep(&self, tx: &Transaction<'_>, triple @ [s, p, o]: Triple, deleted: bool) -> bool {
         let k = &self.signature;
-        if k.annotations.contains(&p) {
+        if self.shacl.contains(&p) || (k.annotations.contains(&p) && !named(tx, p, false)) {
             return true;
         }
         if changes_schema(tx, triple) || k.names.contains(&s) || reserved_named(tx, triple) {
@@ -311,6 +323,25 @@ impl Bounds {
         self.kept
             .get_or_init(|| Arc::new(nrese_exec::Budget::unlimited()))
     }
+
+    /// Whether the commit `tx` keeps the RL route its base is on ([`route_kept`]), by the kinds
+    /// kept at the base's revision; taken under the state, checked without it.
+    pub(crate) fn keeps_route(&self, tx: &Transaction<'_>, lists_left_out: bool) -> bool {
+        let base = tx.base().revision();
+        let kinds = lock(&self.state)
+            .as_ref()
+            .filter(|s| s.revision == base)
+            .and_then(|s| s.kinds.clone());
+        kinds.is_some_and(|kinds| route_kept(&kinds, tx, lists_left_out))
+    }
+}
+
+/// Whether the commit `tx` keeps the RL route `kinds` was decided on: the closure it leaves
+/// leaves out no list axiom, and no asserted change gives a term a new kind ([`Kinds::keep`]).
+fn route_kept(kinds: &Kinds, tx: &Transaction<'_>, lists_left_out: bool) -> bool {
+    !lists_left_out
+        && tx.inserted().all(|q| kinds.keep(tx, quad_triple(q), false))
+        && tx.deleted().all(|q| kinds.keep(tx, quad_triple(q), true))
 }
 
 impl std::fmt::Debug for Bounds {
@@ -427,9 +458,7 @@ pub(crate) fn prepare(
     // On the RL route, a commit that gives no term a new kind leaves what the reader reads,
     // and so the route, as they were; any other is read again below.
     if let Some((Some(kinds), _)) = &current
-        && !lists_left_out
-        && tx.inserted().all(|q| kinds.keep(tx, quad_triple(q), false))
-        && tx.deleted().all(|q| kinds.keep(tx, quad_triple(q), true))
+        && route_kept(kinds, tx, lists_left_out)
     {
         return Preparation {
             base,
@@ -490,7 +519,9 @@ pub(crate) fn prepare(
                     }
                 }
             }
-            Err(_) if !asserted().any(|t| changes_schema(tx, t)) => {
+            // A change naming a reserved name or a SHACL property may change what the reader
+            // reads (`reserved_named`): U1 is built again.
+            Err(_) if !asserted().any(|t| changes_schema(tx, t) || reserved_named(tx, t)) => {
                 return Preparation {
                     base,
                     prepared: Prepared::Unavailable,
@@ -547,13 +578,25 @@ pub(crate) fn prepare(
     }
 }
 
-/// Whether a statement's subject or object is a reserved name, which the reader leaves out.
-fn reserved_named(tx: &Transaction<'_>, [s, _, o]: Triple) -> bool {
-    let reserved = |t| match tx.decode(TermId::from_raw(t)) {
-        Some(nrese_rdf::Term::NamedNode(n)) => nrese_owl::diagnostics::reserved_name(n.as_str()),
+/// Whether a statement's subject or object is a reserved name, which the reader leaves out,
+/// or it names a SHACL property (`nrese_owl::shacl_properties`) anywhere, which can change
+/// whether the reader reads SHACL content as content or as any other statement
+/// (`Ontology::shacl`).
+fn reserved_named(tx: &Transaction<'_>, [s, p, o]: Triple) -> bool {
+    named(tx, s, true) || named(tx, o, true) || named(tx, p, false)
+}
+
+/// Whether the term `t` is a SHACL property (`nrese_owl::shacl_properties`) or, with
+/// `reserved`, a reserved name (`nrese_owl::diagnostics::reserved_name`).
+fn named(tx: &Transaction<'_>, t: u64, reserved: bool) -> bool {
+    match tx.decode(TermId::from_raw(t)) {
+        Some(nrese_rdf::Term::NamedNode(n)) => {
+            let iri = n.as_str();
+            nrese_owl::is_shacl_property(iri)
+                || (reserved && nrese_owl::diagnostics::reserved_name(iri))
+        }
         _ => false,
-    };
-    reserved(s) || reserved(o)
+    }
 }
 
 /// Whether deleting a statement may change its property's kind for the reader: a literal
@@ -746,21 +789,19 @@ pub(crate) fn view(store: &StoreService) -> (Snapshot, Arc<View>) {
     }
 }
 
-/// [`view`] of `snapshot` for a request, never another snapshot's (T3 (a)): given up
-/// (`None`) once `stop` fires, before it claims a build or while it waits for another
-/// read's, polled as `nrese_exec::cell::Build::wait_until` says; `Some(None)` where the
-/// bounds describe a later revision than `snapshot`, or the build failed. The build runs on
-/// and is kept; one this read claimed runs to its end whatever its stop says, as others may
-/// wait for it (a classification waiter's way, `classification::cached`).
+/// [`view`] of `snapshot` for a request, never another snapshot's (T3 (a)): one already
+/// built whatever `stop` says; else given up (`None`) once `stop` fires, before it claims a
+/// build or while it waits for another read's, polled as `nrese_exec::cell::Build::wait_until`
+/// says; `Some(None)` where the bounds describe a later revision than `snapshot`, or the build
+/// failed. The build runs on and is kept; one this read claimed runs to its end whatever its
+/// stop says, as others may wait for it (a classification waiter's way,
+/// `classification::cached`).
 pub(crate) fn view_until(
     store: &StoreService,
     snapshot: &Snapshot,
     stop: Option<&dyn Fn() -> bool>,
 ) -> Option<Option<Arc<View>>> {
     let bounds = &store.dl().bounds;
-    if stop.is_some_and(|stop| stop()) {
-        return None;
-    }
     let revision = snapshot.revision();
     let cached = || {
         lock(&bounds.view)
@@ -770,6 +811,9 @@ pub(crate) fn view_until(
     };
     if let Some(view) = cached() {
         return Some(Some(view));
+    }
+    if stop.is_some_and(|stop| stop()) {
+        return None;
     }
     let built = match bounds
         .views

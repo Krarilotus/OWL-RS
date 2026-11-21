@@ -134,18 +134,23 @@ impl Certificate {
         snapshot.certificate()?.downcast_ref()
     }
 
-    /// Whether `snapshot` was never reasoned over: no inferred statement, no certificate, and
-    /// no rules in place (`rules`). Anything else without a certificate is a stack nothing
-    /// vouches for.
+    /// The one `snapshot`'s rows are produced under ([`Snapshot::certificate_for_rows`]).
+    pub(crate) fn for_rows(snapshot: &Snapshot) -> Option<&Self> {
+        snapshot.certificate_for_rows()?.downcast_ref()
+    }
+
+    /// Whether `snapshot` was never reasoned over: no inferred statement, no certificate (not
+    /// even one a withheld view keeps for its rows), and no rules in place (`rules`). Anything
+    /// else without a certificate is a stack nothing vouches for.
     pub(crate) fn bare(snapshot: &Snapshot, rules: bool) -> bool {
-        snapshot.len_in(ReadModel::Inferred) == 0 && !rules && Self::of(snapshot).is_none()
+        snapshot.len_in(ReadModel::Inferred) == 0 && !rules && Self::for_rows(snapshot).is_none()
     }
 
     /// Whether `snapshot` reads under `owl2-dl`, and whether user rules run with it: as its
-    /// certificate says, else as the mode `dl` is now (a read without one is told
+    /// certificate for rows says, else as the mode `dl` is now (a read without one is told
     /// `not-certified` all the same).
     pub(crate) fn route(snapshot: &Snapshot, dl: &crate::dl::Dl) -> (bool, bool) {
-        Self::of(snapshot).map_or((dl.active(), dl.user_rules()), |c| (c.dl, c.user_rules))
+        Self::for_rows(snapshot).map_or((dl.active(), dl.user_rules()), |c| (c.dl, c.user_rules))
     }
 }
 
@@ -316,27 +321,31 @@ impl StoreService {
             )),
         };
         let unavailable = std::sync::Arc::<std::sync::OnceLock<String>>::default();
-        let namespaces = crate::namespaces::Namespaces::open(
+        let namespaces = std::sync::Arc::new(crate::namespaces::Namespaces::open(
             (config.mode == StoreMode::OnDisk).then(|| config.data_dir.clone()),
             std::sync::Arc::clone(&unavailable),
-        )?;
+        )?);
         // The support graph sets and restricted views draw on the memory the queries do,
         // as the canonical views.
         let supports = crate::support::Supports::new(std::sync::Arc::new(
             nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
         ));
         // So does what client transactions keep between requests.
-        let sessions = crate::sessions::Sessions::within(
+        let mut sessions = crate::sessions::Sessions::within(
             std::sync::Arc::new(
                 nrese_exec::Budget::unlimited().within(settings.runtime.query_memory()),
             ),
             crate::sessions::SESSION_IDLE,
         );
+        sessions.update_settings = Some((
+            std::sync::Arc::clone(&namespaces),
+            std::sync::Arc::clone(&settings.search_scope),
+        ));
         let service = Self {
             process_memory,
             capacity: nrese_exec::memory::capacity,
             settings,
-            namespaces: std::sync::Arc::new(namespaces),
+            namespaces,
             quarantine: std::sync::Arc::new(quarantine),
             sessions: std::sync::Arc::new(sessions),
             running: std::sync::Arc::default(),
@@ -955,6 +964,26 @@ impl StoreService {
         .1
     }
 
+    fn query_view(
+        &self,
+        prepared: &PreparedQuery,
+        memory: &nrese_exec::Envelope,
+        cancel: &CancellationToken,
+    ) -> StoreResult<Snapshot> {
+        let snapshot = self.engine.snapshot();
+        let Some(scope) = &prepared.inference_scope else {
+            return self.view_of(&snapshot, prepared.access(), memory, Some(cancel));
+        };
+        let view = self
+            .reading(Some(scope), memory, Some(cancel))
+            .expect("the dataset's selector requests inferred statements")
+            .scoped(&snapshot, prepared.read_model())?;
+        self.refuse_exact(prepared, &snapshot, || {
+            self.status_outside_dl(prepared, None, Revision::Committed(&view))
+        })?;
+        Ok(view)
+    }
+
     pub(crate) fn support_compilation(&self) -> crate::support::Compilation {
         crate::support::Compilation {
             hide_unnamed_classes: self.config.hide_unnamed_classes,
@@ -1254,14 +1283,13 @@ impl StoreService {
         // the request draws from it.
         let memory = self.settings.query_envelope(prepared);
         // One snapshot the route, the answers and their status are all of (T3, N5).
-        let latest = &self.engine.snapshot();
-        let snapshot = self.view_of(latest, prepared.access(), &memory, Some(cancellation))?;
+        let snapshot = self.query_view(prepared, &memory, cancellation)?;
         prepared.announce_on(&snapshot);
         if let Some(mode) = self.dl_mode(prepared, &snapshot) {
             use crate::dl::query::{Outcome, Read};
             let detail = match answer(self, &snapshot, prepared, cancellation, &memory, mode)? {
                 Outcome::Answers(answers, status, detail) => {
-                    report(status_for_its_reader(prepared, Some(status), false), None);
+                    report(self.told(prepared, Some(status), false), None);
                     crate::query_executor::write_answers(prepared, answers, cancellation, out)?;
                     detail
                 }
@@ -1281,7 +1309,7 @@ impl StoreService {
                         &memory,
                         out,
                         |_| {
-                            let told = status_for_its_reader(prepared, Some(status), false);
+                            let told = self.told(prepared, Some(status), false);
                             (context, move |kept| report(told, kept))
                         },
                     )?;
@@ -1294,7 +1322,11 @@ impl StoreService {
         hooks::run(&hooks::AFTER_DECIDED);
         let at = Revision::Committed(&snapshot);
         let status = || self.status_outside_dl(prepared, None, at);
-        self.refuse_exact(prepared, &snapshot, status)?;
+        if prepared.inference_scope.is_none() {
+            self.refuse_exact(prepared, &snapshot, status)?;
+        }
+        // Set where the status is decided, before the answer, a cached one too.
+        let mut withheld = true;
         let ql = run_query(
             &snapshot,
             prepared,
@@ -1306,11 +1338,12 @@ impl StoreService {
                 let status = self.status_outside_dl(prepared, ql, at);
                 // The cache's context is the whole assessment, not what the reader is told.
                 let context = context_outside_dl(status.as_ref(), ql.is_some());
-                let told = status_for_its_reader(prepared, status, ql.is_some());
+                let told = self.told(prepared, status, ql.is_some());
+                withheld = withholds_report(prepared, told.as_ref());
                 (context, move |kept| report(told, kept))
             },
         )?;
-        Ok((None, ql.filter(|_| !withholds_certification(prepared))))
+        Ok((None, ql.filter(|_| !withheld)))
     }
 
     /// The status of answers outside the DL bounds: the QL rewriting's report where it ran,
@@ -1323,6 +1356,10 @@ impl StoreService {
         ql: Option<&nrese_sparql::ql::QlReport>,
         at: Revision<'_>,
     ) -> Option<nrese_sparql::Completeness> {
+        if prepared.inference_scope.is_some() {
+            return (!Certificate::bare(at.snapshot(), false))
+                .then(nrese_sparql::Completeness::not_certified);
+        }
         let route = match ql {
             Some(ql) => Some(self.ql_status(ql, at.snapshot())),
             None => self.status_without_dl_at(prepared, at),
@@ -1376,24 +1413,37 @@ impl StoreService {
         Some(status)
     }
 
-    /// The status of answers that don't go through the DL bounds; known before the query
-    /// runs. `None` only where no reasoning path can leave answers out: asserted statements
-    /// alone, or no reasoning. Over a ruleset's closure: sound, and complete only for what
-    /// the ruleset derives, never certain answers under OWL 2 DL. Under `owl2-dl`, a read
-    /// told its status here reads the rules' closure without the bounds: the inferred
-    /// statements alone (`onto:implicit`, `Self::dl_mode`), or every
-    /// statement outside a transaction; sound only, never complete. A read of every
-    /// statement inside one lacks only its pending operations' reasoning (`Self::assess`).
-    /// Either is unsound where a missing row can make a returned one wrong (`NOT EXISTS`,
-    /// `MINUS`, …: [`crate::dl::query::certify_closure`]). As
-    /// `prepared`'s reader is told it (`status_for_its_reader`).
+    /// The status of answers that don't go through the DL bounds, of the committed closure before
+    /// the QL rewriting and a transaction's pending operations. `None` only where no reasoning path
+    /// can leave answers out: asserted statements alone, or no reasoning. Over a ruleset's closure:
+    /// sound, complete only for what it derives, never certain answers under OWL 2 DL. Under
+    /// `owl2-dl`, the rules' closure without the bounds, the inferred statements alone or every
+    /// statement (`Self::dl_mode`): sound only, unsound where a missing row can make a returned one
+    /// wrong (`NOT EXISTS`, …: [`crate::dl::query::certify_closure`]). As `prepared`'s reader is
+    /// told it (`status_for_its_reader`), but where reasoning is on a reader by support is told
+    /// `not-certified` whatever its read tells: its status is its view's, known only as the read
+    /// runs. The read's status is the authority; `not-certified` here says nothing of the data.
     pub fn status_without_dl(
         &self,
         prepared: &PreparedQuery,
     ) -> Option<nrese_sparql::Completeness> {
-        let status =
-            self.status_outside_dl(prepared, None, Revision::Committed(&self.engine.snapshot()));
-        status_for_its_reader(prepared, status, false)
+        let snapshot = self.engine.snapshot();
+        let status = self.status_outside_dl(prepared, None, Revision::Committed(&snapshot));
+        let reasoned = !Certificate::bare(&snapshot, self.supports.has_rules());
+        if reasoned && prepared.access().is_some_and(|a| a.inferred_by_support) {
+            return Some(nrese_sparql::Completeness::not_certified());
+        }
+        self.told(prepared, status, false)
+    }
+
+    /// [`status_for_its_reader`] under this store's equality.
+    fn told(
+        &self,
+        prepared: &PreparedQuery,
+        status: Option<nrese_sparql::Completeness>,
+        rewritten: bool,
+    ) -> Option<nrese_sparql::Completeness> {
+        status_for_its_reader(prepared, status, rewritten, self.config.equality_compact)
     }
 
     /// [`Self::status_without_dl`] of a read of the data `at`.
@@ -1440,7 +1490,9 @@ impl StoreService {
     /// Under `owl2-dl`, the answers a query reading the inferred statements asks for;
     /// `None` for any other query (or mode).
     fn dl_mode(&self, prepared: &PreparedQuery, at: &Snapshot) -> Option<crate::DlAnswers> {
-        (Certificate::route(at, &self.dl).0 && prepared.read_model() == ReadModel::Materialised)
+        (prepared.inference_scope.is_none()
+            && Certificate::route(at, &self.dl).0
+            && prepared.read_model() == ReadModel::Materialised)
             .then(|| prepared.dl_answers().unwrap_or(self.config.dl.answers))
     }
 
@@ -1499,6 +1551,7 @@ impl StoreService {
                     prepared,
                     &mut explanation.completeness,
                     &mut explanation.ql,
+                    self.config.equality_compact,
                 );
             },
         )
@@ -1513,7 +1566,9 @@ impl StoreService {
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
         let memory = self.settings.query_envelope(prepared);
-        let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
+        let snapshot = self.query_view(prepared, &memory, cancellation)?;
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_DECIDED);
         let mut explanation =
             explain_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         if let Some(mode) = self.dl_mode(prepared, &snapshot) {
@@ -1532,6 +1587,7 @@ impl StoreService {
             explanation.candidates = Some(nrese_sparql::Candidates {
                 proved: detail.proved,
                 refuted: detail.refuted,
+                refuted_by_labels: detail.refuted_by_labels,
             });
         } else {
             let at = Revision::Committed(&snapshot);
@@ -1558,7 +1614,12 @@ impl StoreService {
             |planned| {
                 planned.steps.clear();
                 planned.rewrites.clear();
-                certification_for_its_reader(prepared, &mut planned.completeness, &mut planned.ql);
+                certification_for_its_reader(
+                    prepared,
+                    &mut planned.completeness,
+                    &mut planned.ql,
+                    self.config.equality_compact,
+                );
             },
         )
     }
@@ -1569,7 +1630,9 @@ impl StoreService {
         cancellation: &CancellationToken,
     ) -> StoreResult<crate::PlannedQuery> {
         let memory = self.settings.query_envelope(prepared);
-        let snapshot = self.read_snapshot_within(prepared.access(), &memory, cancellation)?;
+        let snapshot = self.query_view(prepared, &memory, cancellation)?;
+        #[cfg(test)]
+        hooks::run(&hooks::AFTER_DECIDED);
         let mut planned =
             plan_prepared(&snapshot, prepared, &self.settings, cancellation, &memory)?;
         let at = Revision::Committed(&snapshot);
@@ -1774,6 +1837,12 @@ impl StoreService {
         if pending.ops.is_empty() {
             return self.run_query_reporting(prepared, cancellation, out, report);
         }
+        if prepared.inference_scope.is_some() {
+            return Err(nrese_sparql::QueryEvaluationError::Argument(
+                "inference-scope=dataset is unavailable with operations pending".into(),
+            )
+            .into());
+        }
         let _running = self
             .running
             .register(prepared.text(), prepared.origin(), cancellation);
@@ -1804,7 +1873,7 @@ impl StoreService {
                 |ql| {
                     // A transaction's pending state: never answered from the cache.
                     let status = self.status_outside_dl(prepared, ql, at);
-                    report(status_for_its_reader(prepared, status, ql.is_some()), None);
+                    report(self.told(prepared, status, ql.is_some()), None);
                     (Vec::new(), |_| None)
                 },
             )
@@ -2620,14 +2689,18 @@ fn read_model(infer: bool) -> crate::ReadModel {
 /// on the schema, so the token tells nothing of hidden data. So is every reader of some
 /// graphs told it for a status under `owl2-dl`: whether OWL 2 DL reads the data
 /// otherwise than the rules is a question of every graph's axioms
-/// ([`crate::dl::query::mark`]), and the regime is the configuration's.
+/// ([`crate::dl::query::mark`]), and the regime is the configuration's. Under compact
+/// equality (`compact`) that reader reads the publication, whose closure isn't its own: it
+/// is told `not-certified` for every status, the data and its assessment the publication's.
 fn status_for_its_reader(
     prepared: &PreparedQuery,
     status: Option<nrese_sparql::Completeness>,
     rewritten: bool,
+    compact: bool,
 ) -> Option<nrese_sparql::Completeness> {
     let dl = status.as_ref().and_then(|s| s.regime) == Some(nrese_sparql::Regime::Owl2Dl);
-    match (rewritten && withholds_certification(prepared)) || (dl && prepared.access().is_some()) {
+    let withheld = rewritten || (compact && status.is_some());
+    match (withheld && withholds_certification(prepared)) || (dl && prepared.access().is_some()) {
         true => Some(nrese_sparql::Completeness::not_certified()),
         false => status,
     }
@@ -2639,7 +2712,8 @@ fn refusal_for_its_reader(prepared: &PreparedQuery, error: crate::StoreError) ->
     let crate::StoreError::Incomplete(mut answer) = error else {
         return error;
     };
-    let told = status_for_its_reader(prepared, Some(answer.status.clone()), false);
+    // An exact answer is refused under `owl2-dl` alone: told as every `owl2-dl` status is.
+    let told = status_for_its_reader(prepared, Some(answer.status.clone()), false, false);
     if let Some(told) = told.filter(|told| *told != answer.status) {
         answer.status = told;
         answer.unresolved.clear();
@@ -2653,11 +2727,19 @@ fn certification_for_its_reader(
     prepared: &PreparedQuery,
     completeness: &mut Option<nrese_sparql::Completeness>,
     ql: &mut Option<nrese_sparql::ql::QlReport>,
+    compact: bool,
 ) {
-    *completeness = status_for_its_reader(prepared, completeness.take(), ql.is_some());
-    if withholds_certification(prepared) {
+    *completeness = status_for_its_reader(prepared, completeness.take(), ql.is_some(), compact);
+    if withholds_report(prepared, completeness.as_ref()) {
         *ql = None;
     }
+}
+
+/// Whether `prepared`'s reader, told `told`, is shown no report of the rewriting: where its
+/// assessment is withheld ([`withholds_certification`]), and where its status is. Rows a
+/// withheld view's rewriting gives stand; its report, a claim, doesn't.
+fn withholds_report(prepared: &PreparedQuery, told: Option<&nrese_sparql::Completeness>) -> bool {
+    withholds_certification(prepared) || told.is_some_and(|c| c.certification_withheld)
 }
 
 /// Whether `prepared`'s reader is told no assessment of the rewriting, neither its status
@@ -2724,7 +2806,7 @@ fn for_its_reader<T>(
 ) -> StoreResult<T> {
     let scope = crate::ReadScope::of(prepared.access().cloned());
     let mut whole = scope.told(entry, whole)?;
-    if !scope.reads_everything() {
+    if !scope.reads_everything() || prepared.inference_scope.is_some() {
         redact(&mut whole);
     }
     Ok(whole)

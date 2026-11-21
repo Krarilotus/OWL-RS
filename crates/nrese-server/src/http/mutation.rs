@@ -17,14 +17,15 @@ use crate::state::AppState;
 pub async fn run(
     state: &AppState,
     command: MutationCommand,
-    requester: nrese_store::Requester,
+    access: &crate::access::AccessView,
     timeout: Duration,
     timeout_message: &'static str,
 ) -> Result<MutationCommitReport, ApiError> {
     state.ensure_serving()?;
     let pipeline = state.pipeline();
     let policy = state.policy();
-    let ticket = MutationTicket::new();
+    let requester = access.requester();
+    let ticket = MutationTicket::checking(access.rights.clone());
     let worker_ticket = ticket.clone();
     let mut task =
         tokio::task::spawn_blocking(move || pipeline.apply(command, &requester, &worker_ticket));
@@ -75,6 +76,7 @@ fn map_error(policy: &PolicyConfig, error: MutationError, timeout_message: &str)
         }
         MutationError::Cancelled => ApiError::timeout(timeout_message.to_owned()),
         error @ MutationError::Retired => ApiError::busy(error.to_string()),
+        error @ MutationError::RightsChanged => ApiError::RightsChanged(error.to_string()),
         error @ (MutationError::Gate(_) | MutationError::Poisoned) => {
             ApiError::internal(error.to_string())
         }

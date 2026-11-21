@@ -1,5 +1,6 @@
 pub const CONFIG_PATH: &str = "NRESE_CONFIG_PATH";
 pub const BIND_ADDR: &str = "NRESE_BIND_ADDR";
+pub const PUBLIC_URL: &str = "NRESE_PUBLIC_URL";
 pub const DEPLOYMENT_POSTURE: &str = "NRESE_DEPLOYMENT_POSTURE";
 pub const DATA_DIR: &str = "NRESE_DATA_DIR";
 pub const STORE_MODE: &str = "NRESE_STORE_MODE";
@@ -24,6 +25,7 @@ pub const DL_OUTSIDE_PROFILE: &str = "NRESE_DL_OUTSIDE_PROFILE";
 pub const DL_TIMEOUT_MS: &str = "NRESE_DL_TIMEOUT_MS";
 pub const DL_MEMORY: &str = "NRESE_DL_MEMORY";
 pub const DL_MAX_CANDIDATES: &str = "NRESE_DL_MAX_CANDIDATES";
+pub const DL_MODEL_LABELS: &str = "NRESE_DL_MODEL_LABELS";
 pub const DL_THREADS: &str = "NRESE_DL_THREADS";
 pub const DL_MAX_NODES: &str = "NRESE_DL_MAX_NODES";
 pub const DL_MAX_BRANCH_POINTS: &str = "NRESE_DL_MAX_BRANCH_POINTS";

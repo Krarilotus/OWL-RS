@@ -729,7 +729,7 @@ fn inferred_masks_stack_across_commits() {
     // Hide 6, 7, 8.
     let first_mask = InferredMask::hiding(&first, &[quad(6), quad(7), quad(8)], &budget).unwrap();
     let view = first
-        .with_inferred_mask(&first_mask, &budget)
+        .with_inferred_mask(&first_mask, true, &budget)
         .unwrap()
         .expect("same layout");
     let seen = |view: &Snapshot| -> Vec<u64> {
@@ -757,7 +757,7 @@ fn inferred_masks_stack_across_commits() {
     assert_eq!(mask.runs(), 2);
     drop((first_mask, view));
     let view = second
-        .with_inferred_mask(&mask, &budget)
+        .with_inferred_mask(&mask, true, &budget)
         .unwrap()
         .expect("same layout");
     assert_eq!(seen(&view), [5, 8, 9, 10]);

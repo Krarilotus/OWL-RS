@@ -4,8 +4,8 @@
 #            tooling, ResearchSpace and other RDF4J applications
 #   jena     Apache Jena's RDFConnection, result formats, the Graph Store Protocol
 #   rdflib   rdflib's SPARQLUpdateStore and Dataset, the Graph Store Protocol
-#   dmw      a downstream client's export, questions, updates and validation
-#            (scripts/smoke-dmw-export.sh)
+#   module-export  a data-modelling application's export, questions, updates and validation
+#                  (scripts/smoke-module-export.sh)
 #
 #   benches/clients/run-all.sh [path/to/nrese-server] [kit...]
 #
@@ -18,7 +18,7 @@ root=$(cd "$here/../.." && pwd)
 server=${1:-$root/target/release/nrese-server}
 shift || true
 kits=("$@")
-[ ${#kits[@]} -eq 0 ] && kits=(rdf4j jena rdflib dmw)
+[ ${#kits[@]} -eq 0 ] && kits=(rdf4j jena rdflib module-export)
 tools=${TOOLS:-$HOME/.cache/nrese-tools}
 port=${PORT:-18093}
 base="http://127.0.0.1:$port"
@@ -59,8 +59,8 @@ for kit in "${kits[@]}"; do
       start && (cd "$here/jena" && java -cp "lib/*" JenaClientTest.java "$base") ;;
     rdflib)
       start && python "$here/rdflib/rdflib_client_test.py" "$base" ;;
-    dmw)
-      start NRESE_DEFAULT_GRAPH=union && "$root/scripts/smoke-dmw-export.sh" "$base" ;;
+    module-export)
+      start NRESE_DEFAULT_GRAPH=union && "$root/scripts/smoke-module-export.sh" "$base" ;;
     *)
       echo "unknown kit $kit"; false ;;
   esac

@@ -131,16 +131,16 @@ impl<'a> Range<'a> {
 /// What to send: the offer the client weights highest, where the most specific range
 /// that names an offer decides its weight. Ties go to the earlier offer. Without an
 /// `Accept` header the first offer is sent. `None`: the client accepts none of them.
-pub fn negotiate<T: Copy>(accept: Option<&str>, offers: Offers<T>) -> Option<T> {
+pub fn negotiate<T: Copy>(accept: Option<&str>, offers: Offers<T>) -> Option<(&'static str, T)> {
     let ranges: Vec<Range<'_>> = accept
         .unwrap_or_default()
         .split(',')
         .filter_map(Range::parse)
         .collect();
     if ranges.is_empty() {
-        return offers.first().map(|&(_, format)| format);
+        return offers.first().copied();
     }
-    let mut best: Option<(u16, T)> = None;
+    let mut best = None;
     for &(media_type, format) in offers {
         let quality = ranges
             .iter()
@@ -149,14 +149,17 @@ pub fn negotiate<T: Copy>(accept: Option<&str>, offers: Offers<T>) -> Option<T> 
             .max_by_key(|&(specificity, _)| specificity)
             .map_or(0, |(_, quality)| quality);
         if quality > 0 && best.is_none_or(|(best, _)| quality > best) {
-            best = Some((quality, format));
+            best = Some((quality, (media_type, format)));
         }
     }
     best.map(|(_, format)| format)
 }
 
 /// [`negotiate`], or 406 naming what the endpoint can send.
-pub fn negotiated<T: Copy>(accept: Option<&str>, offers: Offers<T>) -> Result<T, ApiError> {
+pub fn negotiated<T: Copy>(
+    accept: Option<&str>,
+    offers: Offers<T>,
+) -> Result<(&'static str, T), ApiError> {
     negotiate(accept, offers).ok_or_else(|| {
         let mut names: Vec<&str> = offers.iter().map(|(media_type, _)| *media_type).collect();
         names.dedup();
@@ -172,9 +175,11 @@ mod tests {
     use axum::http::HeaderValue;
     use nrese_store::{GraphResultFormat, SolutionsResultFormat};
 
-    use super::{
-        BOOLEAN, GRAPHS, SOLUTIONS, content_format, header_value_str, media_type_matches, negotiate,
-    };
+    use super::{BOOLEAN, GRAPHS, SOLUTIONS, content_format, header_value_str, media_type_matches};
+
+    fn negotiate<T: Copy>(accept: Option<&str>, offers: super::Offers<T>) -> Option<T> {
+        super::negotiate(accept, offers).map(|(_, format)| format)
+    }
 
     #[test]
     fn media_type_match_ignores_parameters() {

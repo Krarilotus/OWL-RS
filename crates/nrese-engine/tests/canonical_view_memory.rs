@@ -217,10 +217,10 @@ fn inferred_views_are_charged_for_all_they_hold() {
         let (seen, missed) = quads.split_at(size / 2);
         let budget = Arc::new(Budget::unlimited());
         let (used, excess) = measure::measure_within(&budget, || {
-            let only = snapshot.with_inferred_only(seen, &budget).unwrap();
+            let only = snapshot.with_inferred_only(seen, true, &budget).unwrap();
             let mask = InferredMask::hiding(&snapshot, missed, &budget).unwrap();
             let masked = snapshot
-                .with_inferred_mask(&mask, &budget)
+                .with_inferred_mask(&mask, true, &budget)
                 .unwrap()
                 .expect("the stack's layout");
             assert_eq!(only.len_in(ReadModel::Inferred), seen.len() as u64);
@@ -274,11 +274,11 @@ fn inferred_views_refused_anywhere_free_before_they_release() {
     // The masks a later one stacks on and a view reads, charged elsewhere.
     let first = InferredMask::hiding(&snapshot, earlier, &unlimited).unwrap();
     let second = first.changed(&snapshot, later, &[], &unlimited).unwrap();
-    let only = |budget: &Arc<Budget>| snapshot.with_inferred_only(seen, budget).map(drop);
+    let only = |budget: &Arc<Budget>| snapshot.with_inferred_only(seen, true, budget).map(drop);
     let stacked = |budget: &Arc<Budget>| first.changed(&snapshot, later, &[], budget).map(drop);
     let viewed = |budget: &Arc<Budget>| {
         snapshot
-            .with_inferred_mask(&second, budget)
+            .with_inferred_mask(&second, true, budget)
             .map(|view| drop(view.expect("the stack's layout")))
     };
     type Make<'a> = &'a dyn Fn(&Arc<Budget>) -> Result<(), nrese_exec::BudgetExceeded>;

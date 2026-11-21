@@ -207,12 +207,14 @@ fn views_keep_or_clear_eligibility_by_the_matrix() {
             ),
             (
                 "inferred only",
-                source.with_inferred_only(&all[1..], &budget()).unwrap(),
+                source
+                    .with_inferred_only(&all[1..], true, &budget())
+                    .unwrap(),
             ),
             (
                 "mask",
                 source
-                    .with_inferred_mask(&mask, &budget())
+                    .with_inferred_mask(&mask, true, &budget())
                     .unwrap()
                     .unwrap(),
             ),
@@ -386,7 +388,7 @@ fn a_kept_list_beyond_the_inferred_statements_loses_eligibility() {
     for (kept, eligible) in [(&real, true), (&asserted, false), (&nowhere, false)] {
         let subset = published.with_inferred_subset(InferredSubset::Only(kept.clone()));
         assert_eq!(token(&subset), eligible, "Only({kept:?})");
-        let only = published.with_inferred_only(kept, &budget()).unwrap();
+        let only = published.with_inferred_only(kept, true, &budget()).unwrap();
         assert_eq!(token(&only), eligible, "with_inferred_only({kept:?})");
     }
 }
@@ -411,7 +413,7 @@ fn a_mask_that_shows_an_extra_statement_loses_eligibility() {
         .collect();
     let view = |mask: &InferredMask| {
         published
-            .with_inferred_mask(mask, &budget())
+            .with_inferred_mask(mask, true, &budget())
             .unwrap()
             .expect("the stack's layout")
     };

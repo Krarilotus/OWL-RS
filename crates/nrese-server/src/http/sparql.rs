@@ -16,6 +16,11 @@ use crate::state::AppState;
 
 const QUERY_TIMEOUT_MESSAGE: &str = "query execution exceeded policy timeout";
 
+/// How long before the policy deadline an `owl2-dl` read stops deciding, so that its answer,
+/// told incomplete with the rows it has, is written before the deadline's 408: twice the largest
+/// time measured from that stop to the first frame, 0.135 s (57,000 individuals, a 10 s limit).
+const DL_ANSWER_MARGIN: std::time::Duration = std::time::Duration::from_millis(300);
+
 /// Evaluates a query and streams its results. The policy timeout is a real deadline: when
 /// it passes, evaluation is cancelled, whether or not results have started streaming.
 pub async fn execute_query(
@@ -52,6 +57,8 @@ pub async fn execute_query_in(
     let mut request = build_query_request(operation);
     let memory = policy.limits.max_query_memory_bytes;
     request.memory_limit = (memory > 0).then_some(memory);
+    let at = deadline.into_std();
+    request.deadline = Some(at.checked_sub(DL_ANSWER_MARGIN).unwrap_or(at));
     // Prefixes it doesn't declare mean what the repository's namespaces say.
     let mut prepared = state
         .store()
@@ -61,48 +68,16 @@ pub async fn execute_query_in(
         prepared.set_origin(origin);
     }
     // The query form decides which formats exist; an EXPLAIN is always JSON.
-    if explain == Explain::No {
-        let (solutions, graph) = negotiate_formats(prepared.kind(), accept)?;
+    let media_type = if explain == Explain::No {
+        let (solutions, graph, media_type) = negotiate_formats(prepared.kind(), accept)?;
         prepared.set_formats(solutions, graph);
-    }
-    let media_type = prepared.media_type();
+        media_type
+    } else {
+        prepared.media_type()
+    };
     let store = state.store();
     let cancellation = CancellationToken::new();
     let token = cancellation.clone();
-    if explain == Explain::Plan {
-        // Statistics only, nothing evaluated; under the deadline as evaluation is: planning
-        // a large pattern stops when the deadline cancels it.
-        return stream_blocking(
-            Pace::Total(deadline),
-            cancellation,
-            "application/json",
-            QUERY_TIMEOUT_MESSAGE,
-            move |out| {
-                let planned = store
-                    .plan_query(&prepared, &token)
-                    .map_err(|error| map_query_error(&policy, error))?;
-                serde_json::to_writer(out, &plan_json(&planned))
-                    .map_err(|error| ApiError::internal(error.to_string()))
-            },
-        )
-        .await;
-    }
-    if explain == Explain::Analyze {
-        return stream_blocking(
-            Pace::Total(deadline),
-            cancellation,
-            "application/json",
-            QUERY_TIMEOUT_MESSAGE,
-            move |out| {
-                let explanation = store
-                    .explain_query(&prepared, &token)
-                    .map_err(|error| map_query_error(&policy, error))?;
-                serde_json::to_writer(out, &explanation_json(&explanation))
-                    .map_err(|error| ApiError::internal(error.to_string()))
-            },
-        )
-        .await;
-    }
     // The completeness goes with the answers, in a header: the store reports it on the
     // snapshot it reads before writing any answer, and the response starts after that.
     // Every reported status is sent, `complete` where no reasoning path can leave answers
@@ -122,12 +97,35 @@ pub async fn execute_query_in(
         made
     };
     let announced = prepared.clone();
+    let scoped = request.inference_scope_dataset;
     let mut response = stream_blocking(
         Pace::Total(deadline),
         cancellation,
-        media_type,
+        if explain == Explain::No {
+            media_type
+        } else {
+            "application/json"
+        },
         QUERY_TIMEOUT_MESSAGE,
         move |out| {
+            if explain != Explain::No {
+                let (body, completeness) = if explain == Explain::Plan {
+                    let plan = store
+                        .plan_query(&prepared, &token)
+                        .map_err(|error| map_query_error(&policy, error))?;
+                    (plan_json(&plan), plan.completeness)
+                } else {
+                    let explanation = store
+                        .explain_query(&prepared, &token)
+                        .map_err(|error| map_query_error(&policy, error))?;
+                    (explanation_json(&explanation), explanation.completeness)
+                };
+                if scoped {
+                    report(completeness, None);
+                }
+                return serde_json::to_writer(out, &body)
+                    .map_err(|error| ApiError::internal(error.to_string()));
+            }
             match &pending {
                 None => store.run_query_reporting(&prepared, &token, out, report),
                 Some(pending) => {
@@ -140,8 +138,13 @@ pub async fn execute_query_in(
     .await?;
     // The run decided the announcement on what its reader reads before its first byte, which
     // `stream_blocking` waits for: the media type is the run's (its place among the headers kept).
-    let media_type = HeaderValue::from_static(announced.media_type());
-    response.headers_mut().insert(CONTENT_TYPE, media_type);
+    if explain == Explain::No {
+        let announcement = announced.media_type();
+        let parameters = announcement.find(';').map_or("", |i| &announcement[i..]);
+        let media_type = HeaderValue::from_str(&format!("{media_type}{parameters}"))
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        response.headers_mut().insert(CONTENT_TYPE, media_type);
+    }
     let reported = status.lock().unwrap_or_else(|p| p.into_inner()).take();
     if let Some(value) = reported {
         let headers = response.headers_mut();
@@ -225,6 +228,7 @@ fn explanation_json(explanation: &nrese_store::Explanation) -> serde_json::Value
         "candidates": explanation.candidates.map(|c| serde_json::json!({
             "proved": c.proved,
             "refuted": c.refuted,
+            "refuted_by_labels": c.refuted_by_labels,
         })),
         "ql": ql_json(explanation.ql.as_ref()),
         "steps": steps,
@@ -306,6 +310,9 @@ pub(crate) fn map_query_error(policy: &PolicyConfig, error: StoreError) -> ApiEr
         }
         // Exact answers asked for under owl2-dl, and the store can't prove them complete.
         StoreError::Incomplete(answer) => ApiError::IncompleteAnswer(answer),
+        error @ StoreError::SparqlEvaluation(
+            nrese_store::QueryEvaluationError::ScopedInferenceUnavailable(setting),
+        ) => ApiError::NotImplemented(setting, error.to_string()),
         error => refused_or(error, ApiError::internal),
     }
 }
@@ -327,7 +334,7 @@ pub(crate) fn refused_or(error: StoreError, otherwise: fn(String) -> ApiError) -
 pub async fn execute_update(
     state: AppState,
     operation: UpdateOperation,
-    requester: nrese_store::Requester,
+    access: &crate::access::AccessView,
 ) -> Result<StatusCode, ApiError> {
     state
         .policy()
@@ -338,7 +345,7 @@ pub async fn execute_update(
     mutation::run(
         &state,
         MutationCommand::Update(request),
-        requester,
+        access,
         state.policy().timeouts.update,
         "update execution exceeded policy timeout",
     )
@@ -351,12 +358,24 @@ pub async fn execute_update(
 fn negotiate_formats(
     kind: QueryResultKind,
     accept: Option<&str>,
-) -> Result<(SolutionsResultFormat, GraphResultFormat), ApiError> {
+) -> Result<(SolutionsResultFormat, GraphResultFormat, &'static str), ApiError> {
     let (solutions, graph) = (SolutionsResultFormat::Json, GraphResultFormat::NTriples);
     Ok(match kind {
-        QueryResultKind::Solutions => (negotiated(accept, SOLUTIONS)?, graph),
-        QueryResultKind::Boolean => (negotiated(accept, BOOLEAN)?, graph),
-        QueryResultKind::Graph => (solutions, negotiated(accept, GRAPHS)?),
+        QueryResultKind::Solutions | QueryResultKind::Boolean => {
+            let (_, format) = negotiated(
+                accept,
+                if kind == QueryResultKind::Boolean {
+                    BOOLEAN
+                } else {
+                    SOLUTIONS
+                },
+            )?;
+            (format, graph, format.media_type())
+        }
+        QueryResultKind::Graph => {
+            let (media_type, format) = negotiated(accept, GRAPHS)?;
+            (solutions, format, media_type)
+        }
     })
 }
 
@@ -367,6 +386,7 @@ fn build_query_request(operation: QueryOperation) -> SparqlQueryRequest {
     );
     request.default_graphs = operation.default_graphs;
     request.named_graphs = operation.named_graphs;
+    request.inference_scope_dataset = operation.inference_scope_dataset;
     // GraphDB's `infer=false`: explicit statements only.
     if operation.infer == Some(false) {
         request.read_model = Some(nrese_store::ReadModel::Asserted);
@@ -383,7 +403,7 @@ mod tests {
 
     #[test]
     fn the_query_form_decides_which_formats_are_negotiated() {
-        let formats = |kind, accept| negotiate_formats(kind, accept).ok();
+        let formats = |kind, accept| negotiate_formats(kind, accept).ok().map(|(s, g, _)| (s, g));
         assert_eq!(
             formats(
                 QueryResultKind::Solutions,

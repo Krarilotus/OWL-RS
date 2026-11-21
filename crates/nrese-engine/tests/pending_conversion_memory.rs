@@ -206,7 +206,7 @@ fn pending_versions_converting_one_base_at_once_share_one_form() {
 /// asserted identity, its own per version made, is the same); a write in between, or another
 /// budget, gets a new one (DICT2's memo, keyed by the change generation and the budget). A
 /// write transaction's commit lets its kept snapshot go: the budget is back where it was
-/// before the read (merge with engine-v2 e2e29dd2: `Pending::into_parts` drops the memo).
+/// before the read (merge with engine-v2 b86faeb4: `Pending::into_parts` drops the memo).
 #[test]
 fn an_unchanged_transaction_keeps_its_pending_snapshot_per_budget() {
     let engine = store(10);

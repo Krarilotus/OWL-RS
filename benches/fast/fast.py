@@ -1322,7 +1322,7 @@ def timed_metric(case: dict) -> str:
 # the planner statistics the load command builds before it returns (perf_lab's `statistics_ms`,
 # timed apart from `load_s`, which stays as it is), where the side reports such a build; a side
 # without one (main's has no such step) is ready when loaded. Compared against main only: base's
-# perf_lab never builds them while base's server does (a7ef46649), so its `ready` through perf_lab
+# perf_lab never builds them while base's server does (0dcc8e70f), so its `ready` through perf_lab
 # would leave out a step its product runs (release_gate.py family_of, compare_case).
 READY = "ready"
 READY_SIDES = ("main",)
@@ -1492,8 +1492,10 @@ def closed(pairs: list) -> list:
 # its amounts or, to a reader of some graphs, without; nrese-store `ProcessMemoryLimit`). Not the
 # message that the process's memory couldn't be read: no limit was reached (nrese-store
 # `is_memory_limit`).
-QUERY_REFUSAL = re.compile(r"(?:query memory budget exceeded|the server's query memory is in use): "
-                           r"(?:\d+ MiB in use, \d+ MiB more requested, )?limit \d+ MiB"
+QUERY_REFUSAL = re.compile(r"(?:query memory budget exceeded|the server's query memory is in use): (?:"
+                           r"(?:\d+ MiB in use, (?:\d+ MiB more requested|more requested than memory can address), )?"
+                           r"limit (?:\d+ MiB|unlimited)"
+                           r"|(?:more than )?\d+ rows of \d+ columns asked for, room for \d+ rows \(\d+ MiB in use, limit)"
                            r"|stopped at the process's memory limit \(\d+ MiB\)")
 # A run in which the engine refused a query at its memory limit (D16-596): no wrong answer, and no
 # case's declared outcome (suitekit/cases.py OUTCOMES), so it fails wherever a wrong answer does.

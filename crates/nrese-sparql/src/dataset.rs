@@ -4,7 +4,7 @@
 //! graphs, as in Jena, GraphDB and Oxigraph: a deliberate deviation from the RDF merge of
 //! SPARQL 1.1 §13.2, which keeps them apart (docs/ops/http-api.md, the owner's decision).
 
-use nrese_engine::TermId;
+use nrese_engine::{EncodedQuad, ReadModel, Snapshot, TermId};
 use nrese_rdf::{GraphName, GraphNameRef, NamedOrBlankNodeRef, Term};
 use nrese_sparql_syntax::algebra::QueryDataset;
 
@@ -98,16 +98,26 @@ pub(crate) enum DefaultGraph {
 pub(crate) enum GraphSet {
     Only(Vec<TermId>),
     AllBut(Vec<TermId>),
+    /// Named assertions with the scoped inferred layer in the default graph.
+    Scoped(Vec<TermId>),
 }
 
 /// No graph at all: the merge of `GRAPH <g>` for a graph the store doesn't know.
 pub(crate) static NO_GRAPHS: GraphSet = GraphSet::Only(Vec::new());
 
 impl GraphSet {
-    pub(crate) fn contains(&self, graph: &TermId) -> bool {
+    pub(crate) fn contains(
+        &self,
+        snapshot: &Snapshot,
+        model: ReadModel,
+        quad: &EncodedQuad,
+    ) -> bool {
         match self {
-            Self::Only(graphs) => graphs.contains(graph),
-            Self::AllBut(graphs) => !graphs.contains(graph),
+            Self::Scoped(_) if quad.graph.is_default_graph() => {
+                model != ReadModel::Asserted && snapshot.contains_in(ReadModel::Inferred, quad)
+            }
+            Self::Only(graphs) | Self::Scoped(graphs) => graphs.contains(&quad.graph),
+            Self::AllBut(graphs) => !graphs.contains(&quad.graph),
         }
     }
 }
@@ -182,6 +192,9 @@ impl ResolvedDataset {
                 left_out if left_out.is_empty() => DefaultGraph::Merge(None),
                 left_out => DefaultGraph::Merge(Some(GraphSet::AllBut(left_out))),
             },
+            Some(graphs) if specification.scoped_inference => {
+                DefaultGraph::Merge(Some(GraphSet::Scoped(ids_of(graphs))))
+            }
             Some(graphs) => only(ids_of(graphs)),
         };
         let named = specification.available_named_graphs().map(|graphs| {
@@ -196,7 +209,7 @@ impl ResolvedDataset {
         Self {
             default,
             named,
-            store_default: true,
+            store_default: !specification.scoped_inference,
         }
     }
 
@@ -230,6 +243,13 @@ impl ResolvedDataset {
                     .filter(|&g| access.allows_id(view, g))
                     .collect(),
             ),
+            DefaultGraph::Merge(Some(GraphSet::Scoped(ids))) => {
+                DefaultGraph::Merge(Some(GraphSet::Scoped(
+                    ids.into_iter()
+                        .filter(|&g| access.allows_id(view, g))
+                        .collect(),
+                )))
+            }
             DefaultGraph::Merge(Some(GraphSet::AllBut(left_out))) => {
                 let mut ids = readable_named();
                 if access.default_graph {

@@ -12,6 +12,7 @@ use super::vocabulary::LocalVocabulary;
 
 mod attempted;
 mod boundaries;
+mod commit_cost;
 mod equality_shapes;
 mod sources;
 mod stops;
@@ -3394,4 +3395,374 @@ fn equality_copies_keep_no_room_for_copies_not_made() {
         copies.len(),
         copies.capacity()
     );
+}
+
+/// [`super::lists::Facts`] over a slice of facts, in their order.
+struct SliceFacts<'a>(&'a [Triple]);
+
+impl super::lists::Facts for SliceFacts<'_> {
+    fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
+        let at = |t: &&Triple| t[0] == subject && t[1] == predicate;
+        self.0.iter().filter(at).map(|t| t[2]).collect()
+    }
+    fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
+        let at = |t: &&Triple| t[1] == predicate;
+        self.0.iter().filter(at).map(|t| (t[0], t[2])).collect()
+    }
+}
+
+/// The closure of `text` under OWL 2 RL (replicated: every identity), with the input first.
+fn replicated_closure(vocabulary: &mut LocalVocabulary, text: &str) -> (Vec<Triple>, Vec<Triple>) {
+    let input = load(vocabulary, text);
+    let rules = Ruleset::Owl2Rl.rules(vocabulary).unwrap();
+    let lists = ListVocabulary::new(vocabulary);
+    let schema = Schema::owl(vocabulary);
+    let derived = batch::materialise(&input, &rules, Some(&lists), &schema).derived;
+    let every = input.iter().chain(&derived).copied().collect();
+    (input, every)
+}
+
+/// A list past the cap over its closure is read as written as well, and still reported.
+/// Spec: OWL 2 Profiles §4.3, `eq-diff2` over an `owl:AllDifferent` list's members;
+/// equality's `rdf:first` copies (`eq-rep-o`) name the same members again. Each of three
+/// members has four aliases, so over the replicated closure the list has 5 * 5 * 5 member
+/// sequences, past the cap: no rules, `too-many-list-variants`. Read as written as well, it
+/// gives the rules of the list as written, one `eq-diff2` check per pair of members, and the
+/// same report: the closure's sequences aren't all read.
+#[test]
+fn a_list_past_the_cap_over_its_closure_is_read_as_written_too_and_still_reported() {
+    let mut text = String::from(
+        "_:d rdf:type owl:AllDifferent
+         _:d owl:members _:l1
+         _:l1 rdf:first ex:m1
+         _:l1 rdf:rest _:l2
+         _:l2 rdf:first ex:m2
+         _:l2 rdf:rest _:l3
+         _:l3 rdf:first ex:m3
+         _:l3 rdf:rest rdf:nil",
+    );
+    for m in 1..=3 {
+        for i in 1..=4 {
+            text.push_str(&format!("\nex:m{m} owl:sameAs ex:m{m}-alias{i}"));
+        }
+    }
+    let mut vocabulary = LocalVocabulary::default();
+    let (input, every) = replicated_closure(&mut vocabulary, &text);
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let kinds = |d: &[super::lists::ListDiagnostic]| -> Vec<&str> {
+        d.iter().map(|d| d.problem.kind()).collect()
+    };
+    let (rules, diagnostics) = super::lists::instantiate(&lists, &SliceFacts(&every));
+    assert!(rules.is_empty(), "the base's reading: {rules:?}");
+    assert_eq!(kinds(&diagnostics), ["too-many-list-variants"]);
+    let (rules, _, diagnostics) =
+        super::lists::instantiate_written(&lists, &SliceFacts(&every), Some(&SliceFacts(&input)));
+    let checks = rules.iter().filter(|r| r.name == "eq-diff2").count();
+    assert_eq!(
+        checks, 3,
+        "one eq-diff2 check per pair of members: {rules:?}"
+    );
+    assert_eq!(
+        kinds(&diagnostics),
+        ["too-many-list-variants"],
+        "still reported"
+    );
+}
+
+/// A list within the cap over its closure is read as the closure gives it, the written
+/// facts aside. Spec: OWL 2 Profiles §4.3, `prp-spo1` and `eq-diff2`: with
+/// `ex:altFirst rdfs:subPropertyOf rdf:first`, the `owl:AllDifferent` list `(ex:a ex:b)`
+/// whose second cell is `ex:altFirst ex:c` is `(ex:a ex:c)` as well, so the list has two
+/// member sequences and two `eq-diff2` checks (`ex:a`, `ex:b`) and (`ex:a`, `ex:c`); the
+/// facts as written hold one sequence.
+#[test]
+fn a_list_within_the_cap_is_read_as_its_closure_gives_it() {
+    let text = "ex:altFirst rdfs:subPropertyOf rdf:first
+         _:d rdf:type owl:AllDifferent
+         _:d owl:members _:l1
+         _:l1 rdf:first ex:a
+         _:l1 rdf:rest _:l2
+         _:l2 rdf:first ex:b
+         _:l2 rdf:rest rdf:nil
+         _:l2 ex:altFirst ex:c";
+    let mut vocabulary = LocalVocabulary::default();
+    let (input, every) = replicated_closure(&mut vocabulary, text);
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let (rules, _, diagnostics) =
+        super::lists::instantiate_written(&lists, &SliceFacts(&every), Some(&SliceFacts(&input)));
+    let checks = rules.iter().filter(|r| r.name == "eq-diff2").count();
+    assert_eq!(
+        checks, 2,
+        "one eq-diff2 check per member sequence: {rules:?}"
+    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+}
+
+/// A list past the cap over its closure gives, read as written, its checks alone: no
+/// inference. Spec: OWL 2 Profiles §4.3, `prp-spo2` over the property chain
+/// `(ex:p1 ex:p2 ex:p3)`, each property with four aliases: over the replicated closure the
+/// chain has 5 * 5 * 5 member sequences, past the cap, so it is left out and reported, as
+/// before; read as written it would infer, so nothing is added and the report stays.
+#[test]
+fn a_chain_past_the_cap_over_its_closure_adds_no_inference() {
+    let mut text = String::from(
+        "ex:p owl:propertyChainAxiom _:l1
+         _:l1 rdf:first ex:p1
+         _:l1 rdf:rest _:l2
+         _:l2 rdf:first ex:p2
+         _:l2 rdf:rest _:l3
+         _:l3 rdf:first ex:p3
+         _:l3 rdf:rest rdf:nil",
+    );
+    for p in 1..=3 {
+        for i in 1..=4 {
+            text.push_str(&format!("\nex:p{p} owl:sameAs ex:p{p}-alias{i}"));
+        }
+    }
+    let mut vocabulary = LocalVocabulary::default();
+    let (input, every) = replicated_closure(&mut vocabulary, &text);
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let written = super::lists::instantiate(&lists, &SliceFacts(&input)).0;
+    assert!(
+        written.iter().any(|r| r.name == "prp-spo2"),
+        "as written alone, the chain infers: {written:?}"
+    );
+    let (rules, _, diagnostics) =
+        super::lists::instantiate_written(&lists, &SliceFacts(&every), Some(&SliceFacts(&input)));
+    assert!(rules.is_empty(), "no inference added: {rules:?}");
+    let kinds: Vec<&str> = diagnostics.iter().map(|d| d.problem.kind()).collect();
+    assert_eq!(kinds, ["too-many-list-variants"], "still reported");
+}
+
+/// A list past the cap over its closure and as written too gets nothing added, and is
+/// reported, as before. Spec: the reading as written adds a list's checks only where it
+/// reads the list within the cap: an `owl:AllDifferent` list of seven cells, each with two
+/// `rdf:first` as written, has 2^7 member sequences as written, past 64, and more over its
+/// closure.
+#[test]
+fn a_list_past_the_cap_as_written_too_gets_nothing_added() {
+    let mut text = String::from("_:d rdf:type owl:AllDifferent\n_:d owl:members _:l1");
+    for k in 1..=7 {
+        let rest = match k {
+            7 => "rdf:nil".to_owned(),
+            _ => format!("_:l{}", k + 1),
+        };
+        text.push_str(&format!(
+            "\n_:l{k} rdf:first ex:m{k}a\n_:l{k} rdf:first ex:m{k}b\n_:l{k} rdf:rest {rest}"
+        ));
+    }
+    let mut vocabulary = LocalVocabulary::default();
+    let (input, every) = replicated_closure(&mut vocabulary, &text);
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let (rules, _, diagnostics) =
+        super::lists::instantiate_written(&lists, &SliceFacts(&every), Some(&SliceFacts(&input)));
+    assert!(rules.is_empty(), "nothing added: {rules:?}");
+    let kinds: Vec<&str> = diagnostics.iter().map(|d| d.problem.kind()).collect();
+    assert_eq!(kinds, ["too-many-list-variants"], "reported");
+}
+
+/// A list past the cap is checked alike by the batch executor and the naive reference, from
+/// its cells as written. Spec: OWL 2 Profiles §4.3, `eq-diff2`: `owl:AllDifferent` over
+/// `(ex:m1 ex:m2 ex:m3)` and `ex:m1 owl:sameAs ex:m2` is inconsistent, however many aliases
+/// the members have (four each: 125 member sequences over the replicated closure). Both
+/// report it, and the same violations ([`closure`] compares them).
+#[test]
+fn a_list_past_the_cap_is_checked_alike_by_batch_and_naive() {
+    let mut text = String::from(
+        "_:d rdf:type owl:AllDifferent
+         _:d owl:members _:l1
+         _:l1 rdf:first ex:m1
+         _:l1 rdf:rest _:l2
+         _:l2 rdf:first ex:m2
+         _:l2 rdf:rest _:l3
+         _:l3 rdf:first ex:m3
+         _:l3 rdf:rest rdf:nil
+         ex:m1 owl:sameAs ex:m2",
+    );
+    for m in 1..=3 {
+        for i in 1..=4 {
+            text.push_str(&format!("\nex:m{m} owl:sameAs ex:m{m}-alias{i}"));
+        }
+    }
+    let (_, _, violations) = closure(&text);
+    assert!(violations.iter().any(|v| v == "eq-diff2"), "{violations:?}");
+}
+
+/// Over representatives, a list past the cap is checked from its cells as written, named by
+/// the final classes. Spec: OWL 2 Profiles §4.3, `prp-spo1` and `eq-diff2`: with
+/// `ex:alt rdfs:subPropertyOf rdf:first`, each of seven cells of an `owl:AllDifferent` list has
+/// a second member (2^7 member sequences, past the cap); `ex:m1 owl:sameAs ex:m2` makes two
+/// of its members, as written, the same: inconsistent. The members' aliases are named first,
+/// so they are the classes' representatives, not the names as written; and the same with the
+/// list's first cell, or its third, an alias's (`eq-rep-s`), whose cells as written are then a
+/// member's.
+#[test]
+fn a_list_past_the_cap_over_representatives_is_checked_by_its_classes() {
+    for head in ["", "ex:h owl:sameAs _:l1", "ex:h owl:sameAs _:l3"] {
+        let mut text = format!(
+            "{head}
+         ex:a1 owl:sameAs ex:m1
+         ex:a2 owl:sameAs ex:m2
+         ex:alt rdfs:subPropertyOf rdf:first
+         _:d rdf:type owl:AllDifferent
+         _:d owl:members _:l1
+         ex:m1 owl:sameAs ex:m2",
+        );
+        for k in 1..=7 {
+            let rest = match k {
+                7 => "rdf:nil".to_owned(),
+                _ => format!("_:l{}", k + 1),
+            };
+            text.push_str(&format!(
+                "\n_:l{k} rdf:first ex:m{k}\n_:l{k} rdf:rest {rest}\n_:l{k} ex:alt ex:o{k}"
+            ));
+        }
+        let mut vocabulary = LocalVocabulary::default();
+        let input = load(&mut vocabulary, &text);
+        let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let closure = super::representatives::materialise(&input, &rules, Some(&lists), &schema);
+        let kinds: Vec<&str> = closure
+            .diagnostics
+            .iter()
+            .map(|d| d.problem.kind())
+            .collect();
+        assert_eq!(kinds, ["too-many-list-variants"], "past the cap, {head}");
+        let rules: Vec<&str> = closure.violations.iter().map(|(rule, _)| rule).collect();
+        assert!(rules.contains(&"eq-diff2"), "{head}{rules:?}");
+    }
+}
+
+/// A long list past the cap is checked as written by the long lists' index, and a class it names
+/// twice as a short list's rules check it. Spec: OWL 2 Profiles §4.3, `cax-adc` (with
+/// `prp-spo1` and `eq-rep-o`): an `owl:AllDisjointClasses` list of 101 classes (past the 100
+/// checked pair by pair), seven of its cells with a second member through
+/// `ex:alt rdfs:subPropertyOf rdf:first` (2^7 member sequences, past the cap); `ex:x` in its
+/// 1st and 50th classes is inconsistent, and so is `ex:x` in `ex:A` where
+/// `ex:A owl:sameAs ex:B` makes its 1st and 50th classes one; by replication and by
+/// representatives.
+#[test]
+fn a_long_list_past_the_cap_is_checked_as_written_by_its_index() {
+    let cases = [
+        (
+            "ex:C1",
+            "ex:C50",
+            "ex:x rdf:type ex:C1\nex:x rdf:type ex:C50",
+        ),
+        ("ex:A", "ex:B", "ex:x rdf:type ex:A\nex:A owl:sameAs ex:B"),
+    ];
+    for (first, fiftieth, data) in cases {
+        let mut text = format!(
+            "ex:alt rdfs:subPropertyOf rdf:first
+             _:d rdf:type owl:AllDisjointClasses
+             _:d owl:members _:l1
+             {data}"
+        );
+        for k in 1..=101 {
+            let member = match k {
+                1 => first.to_owned(),
+                50 => fiftieth.to_owned(),
+                _ => format!("ex:C{k}"),
+            };
+            let rest = match k {
+                101 => "rdf:nil".to_owned(),
+                _ => format!("_:l{}", k + 1),
+            };
+            text.push_str(&format!(
+                "\n_:l{k} rdf:first {member}\n_:l{k} rdf:rest {rest}"
+            ));
+            if k > 94 {
+                text.push_str(&format!("\n_:l{k} ex:alt ex:Z{k}"));
+            }
+        }
+        let (_, _, violations) = closure(&text);
+        assert!(
+            violations.iter().any(|v| v == "cax-adc"),
+            "{first}: {violations:?}"
+        );
+        let mut vocabulary = LocalVocabulary::default();
+        let input = load(&mut vocabulary, &text);
+        let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let reps = super::representatives::materialise(&input, &rules, Some(&lists), &schema);
+        let kinds: Vec<&str> = reps.diagnostics.iter().map(|d| d.problem.kind()).collect();
+        assert_eq!(kinds, ["too-many-list-variants"], "{first}: past the cap");
+        let rules: Vec<&str> = reps.violations.iter().map(|(rule, _)| rule).collect();
+        assert!(rules.contains(&"cax-adc"), "{first}: {rules:?}");
+    }
+}
+
+/// A list past the cap over its closure reports the cap alone, whatever its reading as
+/// written would report. Spec: a key of 128 properties is past the 127 a rule holds
+/// (`list-too-long`), and seven of its properties with an alias each give it 2^7 member
+/// sequences over the replicated closure, past the cap: it is reported past the cap, as
+/// before, and nothing else.
+#[test]
+fn a_list_past_the_cap_reports_the_cap_alone() {
+    let mut text = String::from("ex:C owl:hasKey _:l1");
+    for k in 1..=128 {
+        let rest = match k {
+            128 => "rdf:nil".to_owned(),
+            _ => format!("_:l{}", k + 1),
+        };
+        text.push_str(&format!(
+            "\n_:l{k} rdf:first ex:k{k}\n_:l{k} rdf:rest {rest}"
+        ));
+    }
+    for k in 1..=7 {
+        text.push_str(&format!("\nex:k{k} owl:sameAs ex:k{k}-alias"));
+    }
+    let mut vocabulary = LocalVocabulary::default();
+    let (input, every) = replicated_closure(&mut vocabulary, &text);
+    let lists = ListVocabulary::new(&mut vocabulary);
+    let (rules, _, diagnostics) =
+        super::lists::instantiate_written(&lists, &SliceFacts(&every), Some(&SliceFacts(&input)));
+    assert!(rules.is_empty(), "{rules:?}");
+    let kinds: Vec<&str> = diagnostics.iter().map(|d| d.problem.kind()).collect();
+    assert_eq!(kinds, ["too-many-list-variants"]);
+}
+
+/// Over representatives, a list whose cells as written are past the cap once equality merges
+/// two of them is checked from its cells as asserted, each node its own, its members named by
+/// the final classes. Spec: OWL 2 Profiles §4.3, `cax-adc`: an `owl:AllDisjointClasses` list
+/// written `(ex:A ex:B)` and `ex:x` in both is inconsistent, whatever else the graph holds.
+/// Its second cell is the same as `ex:n`, which holds 64 more `rdf:first` values, so the
+/// merged cell is past the cap as written too. The members' aliases are named first, so they
+/// are the classes' representatives, not the names as written, and `ex:x` is typed by the
+/// aliases; and the same with the axiom written with an alias of the list's first cell, which
+/// has no cells of its own (the walk starts at a name equal to that head).
+#[test]
+fn a_list_whose_merged_cells_are_past_the_cap_is_checked_as_asserted() {
+    for (alias, head) in [("", "_:l1"), ("ex:h owl:sameAs _:l1", "ex:h")] {
+        let mut text = format!(
+            "{alias}
+             ex:a1 owl:sameAs ex:A
+             ex:b1 owl:sameAs ex:B
+             _:d rdf:type owl:AllDisjointClasses
+             _:d owl:members {head}
+             _:l1 rdf:first ex:A
+             _:l1 rdf:rest _:l2
+             _:l2 rdf:first ex:B
+             _:l2 rdf:rest rdf:nil
+             _:l2 owl:sameAs ex:n
+             ex:n rdf:rest rdf:nil
+             ex:x rdf:type ex:a1
+             ex:x rdf:type ex:b1",
+        );
+        for k in 1..=64 {
+            text.push_str(&format!("\nex:n rdf:first ex:N{k}"));
+        }
+        let mut vocabulary = LocalVocabulary::default();
+        let input = load(&mut vocabulary, &text);
+        let rules = Ruleset::Owl2Rl.rules(&mut vocabulary).unwrap();
+        let lists = ListVocabulary::new(&mut vocabulary);
+        let schema = Schema::owl(&mut vocabulary);
+        let reps = super::representatives::materialise(&input, &rules, Some(&lists), &schema);
+        let rules: Vec<&str> = reps.violations.iter().map(|(rule, _)| rule).collect();
+        assert!(rules.contains(&"cax-adc"), "{head}: {rules:?}");
+        let kinds: Vec<&str> = reps.diagnostics.iter().map(|d| d.problem.kind()).collect();
+        assert_eq!(kinds, ["too-many-list-variants"], "{head}: past the cap");
+    }
 }

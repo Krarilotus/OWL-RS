@@ -145,7 +145,7 @@ fn a_private_search_without_room_is_refused() {
 /// an IRI whose local name splits into 10,000 words, cold. Rows: a reader within 256 KiB or
 /// a transaction within 1 MiB refuse, before they build; within 64 MiB each finds its
 /// document, and its budget holds the kept corpus and index while the snapshot lives and
-/// has its charge back when it is dropped. Red on `a2873720`: the global entry points
+/// has its charge back when it is dropped. Red on `4b4f144a`: the global entry points
 /// charged an unlimited budget of their own, and answered.
 #[test]
 fn a_private_global_search_charges_its_readers_or_its_transactions_budget() {

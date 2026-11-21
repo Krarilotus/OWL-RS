@@ -233,11 +233,11 @@ impl Rules {
                         }
                     }
                 }
+                // Each part is in the class: on `⊤` or `⊥`, nothing derived, as on the right
+                // of any axiom.
                 Axiom::DisjointUnion(class, parts) => {
                     for &part in parts {
-                        if !ql_left(o, part) {
-                            r.bodies.entry(*class).or_default().push(part);
-                        }
+                        r.conclude(o, Some(part), *class, name);
                     }
                 }
                 Axiom::ObjectPropertyDomain(_, c)

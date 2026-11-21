@@ -55,8 +55,11 @@ impl<'q> PathJoin<'q> {
         if join.triples.len() + join.paths.len() < 2 {
             return None;
         }
-        // Full-text searches and GeoSPARQL relations order themselves.
-        if search::split(&join.triples).is_some() || super::spatial::split(&join.triples).is_some()
+        // Full-text searches and GeoSPARQL relations order themselves. Reordering
+        // Jena candidates could change which triples supply their argument lists.
+        if join.triples.iter().any(search::is_jena)
+            || search::split(&join.triples).is_some()
+            || super::spatial::split(&join.triples).is_some()
         {
             return None;
         }

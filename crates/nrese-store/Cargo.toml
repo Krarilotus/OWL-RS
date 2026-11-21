@@ -39,6 +39,8 @@ url = "2.5.7"
 [features]
 # Schemas of the types the engine API returns, for its OpenAPI description.
 openapi = ["dep:utoipa"]
+# Test hooks for callers in other crates.
+fault-points = []
 
 [dev-dependencies]
 libmimalloc-sys = { workspace = true }

@@ -34,6 +34,14 @@ REFUSALS = (
     "the server's query memory is in use: limit 4608 MiB (what the query held and asked for is not reported to a "
     "reader of some graphs)",
     "stopped at the process's memory limit (3072 MiB); nothing was applied",
+    # A join past its row limit, its rows counted or only past the room; sizes past counting.
+    "SPARQL evaluation error: query memory budget exceeded: 3000000 rows of 4 columns asked for, room for 1048576 "
+    "rows (0 MiB in use, limit 64 MiB)",
+    "SPARQL evaluation error: the server's query memory is in use: more than 1048576 rows of 4 columns asked for, "
+    "room for 1048576 rows (12 MiB in use, limit 76 MiB)",
+    "SPARQL evaluation error: query memory budget exceeded: 0 MiB in use, more requested than memory can address, "
+    "limit 64 MiB",
+    "SPARQL evaluation error: query memory budget exceeded: 0 MiB in use, 512 MiB more requested, limit unlimited",
 )
 # Errors that are no memory limit reached: the unread memory (budget.rs, `unread`: no limit known,
 # nrese-store `is_memory_limit` false), perf_lab's own timeout, and a name that merely contains the words.

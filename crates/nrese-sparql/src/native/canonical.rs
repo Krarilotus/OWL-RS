@@ -120,12 +120,34 @@ impl Names {
         }
     }
 
-    /// Pre-bound values as canonical answers name them.
-    pub(super) fn values(&self, values: &HashMap<Variable, Term>) -> HashMap<Variable, Term> {
-        values
+    /// Pre-bound values as canonical answers name them, and what each puts in a predicate
+    /// where that differs: a search kept as the request gives it. A search vocabulary's IRI
+    /// stays a search there; any other value whose representative is one (an IRI or a blank
+    /// node) is put in there as the constant `alias` makes for the representative
+    /// ([`Rewrite::predicate`]). Elsewhere each value is its class's representative.
+    pub(super) fn values(
+        &self,
+        values: &HashMap<Variable, Term>,
+        alias: impl Fn(u64) -> NamedNode,
+    ) -> (HashMap<Variable, Term>, HashMap<Variable, NamedNode>) {
+        let mut predicates = HashMap::new();
+        for (v, t) in values {
+            let predicate = match t {
+                Term::NamedNode(n) if super::search::names_search(n.as_str()) => n.clone(),
+                _ => match self.representative(t.as_ref()) {
+                    Some((id, Term::NamedNode(r))) if super::search::names_search(r.as_str()) => {
+                        alias(id)
+                    }
+                    _ => continue,
+                },
+            };
+            predicates.insert(v.clone(), predicate);
+        }
+        let terms = values
             .iter()
             .map(|(v, t)| (v.clone(), self.term(t.clone())))
-            .collect()
+            .collect();
+        (terms, predicates)
     }
 
     /// Graphs by the names canonical reads give them, each once.
@@ -253,6 +275,27 @@ impl Rewrite<'_, '_> {
         }
     }
 
+    /// A pattern's predicate over representatives, a search kept as the query writes it: a
+    /// search vocabulary's IRI stays, and another IRI whose representative is one is put in
+    /// as a made constant that stands for the representative, a read of stored statements.
+    /// Names never make or unmake a search (`search::names_search`).
+    fn predicate(&self, name: &NamedNodePattern) -> NamedNodePattern {
+        let NamedNodePattern::NamedNode(n) = name else {
+            return name.clone();
+        };
+        if super::search::names_search(n.as_str()) {
+            return name.clone();
+        }
+        match self.names.representative(n.as_ref().into()) {
+            Some((id, Term::NamedNode(r))) if super::search::names_search(r.as_str()) => {
+                let alias = nrese_sparql_syntax::internal::class_constant(id);
+                self.ctx.register_alias(alias.as_str(), id);
+                NamedNodePattern::NamedNode(alias)
+            }
+            _ => NamedNodePattern::NamedNode(self.iri(n)),
+        }
+    }
+
     fn triple(&self, triple: &TriplePattern) -> TriplePattern {
         TriplePattern {
             subject: self.term_pattern(&triple.subject),
@@ -354,7 +397,13 @@ impl Rewrite<'_, '_> {
         let p = |x: &GraphPattern| Box::new(self.pattern(x));
         match pattern {
             GraphPattern::Bgp { patterns } => GraphPattern::Bgp {
-                patterns: patterns.iter().map(|t| self.triple(t)).collect(),
+                patterns: patterns
+                    .iter()
+                    .map(|t| TriplePattern {
+                        predicate: self.predicate(&t.predicate),
+                        ..self.triple(t)
+                    })
+                    .collect(),
             },
             GraphPattern::Path {
                 subject,

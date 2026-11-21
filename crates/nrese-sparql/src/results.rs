@@ -32,6 +32,8 @@ pub enum QueryEvaluationError {
     /// The query uses something the evaluator doesn't implement.
     #[error("not supported: {0}")]
     Unsupported(String),
+    #[error("dataset-scoped inference is unavailable for {0}")]
+    ScopedInferenceUnavailable(&'static str),
     /// A part of the query has a value it can't take (an extension's option, a malformed
     /// literal it needs).
     #[error("{0}")]
@@ -99,6 +101,7 @@ impl CancellationToken {
 /// or a query's `FROM` and `FROM NAMED`): `None` leaves that part as the store has it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QueryDatasetSpecification {
+    pub(crate) scoped_inference: bool,
     default: Option<Vec<GraphName>>,
     named: Option<Vec<NamedOrBlankNode>>,
     /// With `default` unset: the default graph as the merge of every graph but these
@@ -108,6 +111,11 @@ pub struct QueryDatasetSpecification {
 }
 
 impl QueryDatasetSpecification {
+    /// Add the snapshot's scoped inferred layer to the default graph's asserted merge.
+    pub fn include_scoped_inference(&mut self) {
+        self.scoped_inference = true;
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -154,6 +162,7 @@ impl QueryDatasetSpecification {
 impl From<QueryDataset> for QueryDatasetSpecification {
     fn from(dataset: QueryDataset) -> Self {
         Self {
+            scoped_inference: false,
             default: Some(dataset.default.into_iter().map(Into::into).collect()),
             named: dataset
                 .named

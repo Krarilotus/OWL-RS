@@ -303,3 +303,65 @@ fn a_chain_into_a_symmetric_role_needs_the_symmetry_for_its_first_end() {
     ];
     assert_rows(&n, &[x, b, z, u, v, w], &rows);
 }
+
+/// A body label read as the role it is equivalent to (*OWL 2 Direct Semantics* §2.3.2,
+/// Table 6), mirrored: with `Symmetric(R)` (0), `S ⊑ R` (1), `R ⊑ S` (2), `S P ⊑ S` (3),
+/// `P(b, x)` (4), `R(b, z)` (5) and `x : ∀R.C` (6), `C(z)` follows: `R(z, b)`, `S(z, b)`,
+/// `S(z, x)` by the chain, `R(z, x)`, `R(x, z)`. Without `R ⊑ S`, `S = ∅`,
+/// `R = {(b, z), (z, b)}` and `C = ∅` make a model.
+#[test]
+fn a_mirrored_chain_through_an_equivalent_role_needs_the_inclusion_into_it() {
+    let (cc, r, s, p) = (1, 10, 11, 12);
+    let (x, b, z) = (100, 101, 102);
+    let mut o = Ontology::default();
+    let ec = class(&mut o, cc);
+    let all = expr(&mut o, ClassExpr::All(ObjProp::Named(r), ec));
+    let n = normalised(
+        o,
+        vec![
+            Axiom::ObjectCharacteristic(Characteristic::Symmetric, ObjProp::Named(r)),
+            Axiom::SubObjectPropertyOf(vec![ObjProp::Named(s)], ObjProp::Named(r)),
+            Axiom::SubObjectPropertyOf(vec![ObjProp::Named(r)], ObjProp::Named(s)),
+            Axiom::SubObjectPropertyOf(
+                vec![ObjProp::Named(s), ObjProp::Named(p)],
+                ObjProp::Named(s),
+            ),
+            Axiom::ObjectPropertyAssertion(p, b, x),
+            Axiom::ObjectPropertyAssertion(r, b, z),
+            Axiom::ClassAssertion(all, x),
+        ],
+    );
+    let fact = Fact::Concept(Concept::Named(cc), z);
+    let rows: [Row; 1] = [(&[0, 1, 2, 3, 4, 5, 6], &[0, 1, 3, 4, 5, 6], fact)];
+    assert_rows(&n, &[x, b, z], &rows);
+}
+
+/// The same forward, without symmetry (Table 6): with `S ⊑ R` (0), `R ⊑ S` (1),
+/// `S P ⊑ S` (2), `R(u, b)` (3), `P(b, x)` (4) and `u : ∀R.C` (5), `C(x)` follows:
+/// `S(u, b)`, `S(u, x)` by the chain, `R(u, x)`. Without `R ⊑ S`, `S = ∅`, `R = {(u, b)}`
+/// and `C = {b}` make a model.
+#[test]
+fn a_chain_through_an_equivalent_role_needs_the_inclusion_into_it() {
+    let (cc, r, s, p) = (1, 10, 11, 12);
+    let (u, b, x) = (103, 101, 100);
+    let mut o = Ontology::default();
+    let ec = class(&mut o, cc);
+    let all = expr(&mut o, ClassExpr::All(ObjProp::Named(r), ec));
+    let n = normalised(
+        o,
+        vec![
+            Axiom::SubObjectPropertyOf(vec![ObjProp::Named(s)], ObjProp::Named(r)),
+            Axiom::SubObjectPropertyOf(vec![ObjProp::Named(r)], ObjProp::Named(s)),
+            Axiom::SubObjectPropertyOf(
+                vec![ObjProp::Named(s), ObjProp::Named(p)],
+                ObjProp::Named(s),
+            ),
+            Axiom::ObjectPropertyAssertion(r, u, b),
+            Axiom::ObjectPropertyAssertion(p, b, x),
+            Axiom::ClassAssertion(all, u),
+        ],
+    );
+    let fact = Fact::Concept(Concept::Named(cc), x);
+    let rows: [Row; 1] = [(&[0, 1, 2, 3, 4, 5], &[0, 2, 3, 4, 5], fact)];
+    assert_rows(&n, &[u, b, x], &rows);
+}

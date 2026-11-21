@@ -375,7 +375,9 @@ async fn run() -> Result<()> {
         ai,
         config.deployment_posture,
     )?;
-    let state = state.with_replication(config.replication.clone());
+    let state = state
+        .with_replication(config.replication.clone())
+        .with_public_url(config.public_url.clone());
     // Held for as long as the server serves; stopped when it ends.
     let follower = if replica {
         let follower = nrese_server::replication::follow(state.clone())?;
@@ -599,6 +601,10 @@ fn print_query(store: &StoreService, command: PrintQueryCommand) -> Result<()> {
 
 /// `nrese-server load`: bulk-loads files into the configured store and exits.
 fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
+    #[cfg(feature = "fault-points")]
+    if std::env::var_os("NRESE_TEST_FAIL_QUARANTINE_COMMIT").is_some() {
+        store.quarantine().fail_next_commit();
+    }
     let request = BulkLoadRequest {
         files: load.files,
         replace: load.replace,
@@ -607,7 +613,12 @@ fn bulk_load(store: &StoreService, load: LoadCommand) -> Result<()> {
             .map_or(GraphTarget::DefaultGraph, GraphTarget::NamedGraph),
         invalid: load.invalid,
     };
-    let report = store.bulk_load(&request).context("bulk load failed")?;
+    let report = store.bulk_load(&request).map_err(|error| match error {
+        nrese_store::StoreError::LoadPublished { revision, reason } => anyhow::anyhow!(
+            "the load completed at published revision {revision}. Its quarantine record couldn't be kept: {reason}. Don't load it again."
+        ),
+        error => anyhow::Error::new(error).context("bulk load failed"),
+    })?;
     let seconds = report.elapsed.as_secs_f64();
     tracing::info!(
         revision = report.revision,

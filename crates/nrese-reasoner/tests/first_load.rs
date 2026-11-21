@@ -181,6 +181,75 @@ fn a_first_loads_report_fits_the_budget_the_deltas_fits() {
     assert_eq!(first_load, delta, "the same violations, bindings included");
 }
 
+/// A first load whose caller uses the rebuild's report (`maintain_with`'s
+/// `uses_rebuilt_report`, as a store assessed consistent does) holds that one report: it lists
+/// the delta executor's violations, the rules' and the datatype checks', bindings included,
+/// and the operation's peak is no higher than the delta's own on the same load. Holding an
+/// introduced-only report, or a second datatype section, beside it raised the peak.
+#[test]
+fn a_first_load_judged_by_its_rebuild_holds_one_report() {
+    use nrese_exec::Budget;
+    use nrese_reasoner::engine::maintain_with;
+    use nrese_reasoner::eval::OperationStop;
+    let load: String = (0..200)
+        .map(|i| format!("ex:i{i} a owl:Nothing . ex:i{i} ex:age -{} . ", i + 1))
+        .chain(["ex:age rdfs:range xsd:nonNegativeInteger . ".to_owned()])
+        .collect();
+    let run = |plan: Option<Plan>, uses_rebuilt_report: bool, budget: &std::sync::Arc<Budget>| {
+        let engine = Engine::new(EngineConfig {
+            background_maintenance: false,
+            ..EngineConfig::default()
+        })
+        .unwrap();
+        let mut tx = engine.transaction();
+        let program =
+            Program::compile(&Ruleset::Owl2Rl.into(), &|t| tx.intern(t)).maintaining_by(plan);
+        let text = format!("{PREFIX}{load}");
+        for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+            tx.insert(quad.unwrap().as_ref());
+        }
+        let stop = OperationStop::new(&|| false);
+        let mut done =
+            maintain_with(&program, None, &mut tx, &stop, budget, uses_rebuilt_report).unwrap();
+        let report = match uses_rebuilt_report {
+            true => done
+                .rebuilt_violations
+                .take()
+                .expect("the rebuild's report"),
+            false => std::mem::take(&mut done.violations),
+        };
+        let listed: Vec<String> = report
+            .iter()
+            .map(|(rule, bindings)| format!("{rule}:{bindings:?}"))
+            .collect();
+        (done.work.plan, report.complete(), listed)
+    };
+    let delta_peak = std::sync::Arc::new(Budget::new(usize::MAX));
+    let (plan, complete, delta) = run(Some(Plan::Dred), false, &delta_peak);
+    assert_ne!(plan, Plan::Rebuild, "the control takes the delta executor");
+    let datatype = delta.iter().filter(|v| v.starts_with("dt-")).count();
+    assert!(
+        complete && datatype >= 200 && delta.len() - datatype >= 200,
+        "the delta's report, the rules' and the datatype checks': {delta:?}"
+    );
+    let judged_peak = std::sync::Arc::new(Budget::new(usize::MAX));
+    let (plan, complete, judged) = run(None, true, &judged_peak);
+    assert_eq!(plan, Plan::Rebuild, "the first load is materialised once");
+    assert!(complete);
+    assert_eq!(judged, delta, "the same violations, bindings included");
+    println!(
+        "peaks: {} bytes judged by the rebuild, {} the delta's",
+        judged_peak.peak(),
+        delta_peak.peak()
+    );
+    assert!(
+        judged_peak.peak() <= delta_peak.peak(),
+        "one report held: {} bytes at the peak, the delta's {}",
+        judged_peak.peak(),
+        delta_peak.peak()
+    );
+}
+
 /// A user rule's fact makes the empty state inconsistent; an unrelated insert introduces
 /// nothing and is reported as the delta reports it.
 #[test]
@@ -368,4 +437,74 @@ fn a_first_load_whose_axioms_conclude_an_unstorable_fact_takes_the_delta() {
             );
         }
     }
+}
+
+/// A first load holding an `owl:AllDisjointClasses` list past the cap, with `ex:x` in two of
+/// its classes, reports `cax-adc` under every plan, by replication and by representatives.
+/// Spec: `docs/spec/reasoning-semantics.md`, past the cap a list's clash checks are also read
+/// from the list as written; this file's first test, a first load's verdict is the delta
+/// executor's. The list has 101 cells; seven of them have a second member through `ex:alt
+/// rdfs:subPropertyOf rdf:first`, so the closure gives it 128 member sequences. Where the plan
+/// lets a first load be materialised once (none, or `Rebuild`), the report is the one the
+/// introduced violations give (`maintain`: the caller doesn't use the rebuild's own).
+#[test]
+fn a_first_load_checks_a_list_past_the_cap_as_written() {
+    let mut data = String::from(
+        "@prefix rdf: <http://www.w3.org/1999/02/22-rdf-syntax-ns#> . \
+         ex:alt rdfs:subPropertyOf rdf:first . \
+         [] a owl:AllDisjointClasses ; owl:members ex:l1 . ex:x a ex:P1 , ex:P2 . ",
+    );
+    for i in 1..=101 {
+        let rest = match i {
+            101 => "rdf:nil".to_owned(),
+            _ => format!("ex:l{}", i + 1),
+        };
+        data.push_str(&format!("ex:l{i} rdf:first ex:P{i} ; rdf:rest {rest} . "));
+        if i > 94 {
+            data.push_str(&format!("ex:l{i} ex:alt ex:Q{i} . "));
+        }
+    }
+    let mut missed = Vec::new();
+    let mut plans = Vec::new();
+    for representatives in [false, true] {
+        for plan in [
+            None,
+            Some(Plan::Dred),
+            Some(Plan::Recompute),
+            Some(Plan::Rebuild),
+        ] {
+            let engine = Engine::new(EngineConfig {
+                background_maintenance: false,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let mut tx = engine.transaction();
+            let program = Program::compile(&Ruleset::Owl2Rl.into(), &|t| tx.intern(t))
+                .by_representatives(representatives)
+                .maintaining_by(plan);
+            let text = format!("{PREFIX}{data}");
+            for quad in RdfParser::from_format(RdfFormat::Turtle).for_reader(text.as_bytes()) {
+                tx.insert(quad.unwrap().as_ref());
+            }
+            let done = maintain(&program, None, &mut tx, &|| false).unwrap();
+            let case = format!("reps={representatives} plan={plan:?}");
+            if !done.violations.iter().any(|(rule, _)| rule == "cax-adc") {
+                missed.push(format!(
+                    "{case}: {:?}",
+                    done.violations.iter().collect::<Vec<_>>()
+                ));
+            }
+            if matches!(plan, None | Some(Plan::Rebuild)) {
+                plans.push((case, done.work.plan));
+            }
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "each first load reports cax-adc: {missed:#?}"
+    );
+    assert!(
+        plans.iter().all(|(_, plan)| *plan == Plan::Rebuild),
+        "a first load is materialised once: {plans:?}"
+    );
 }

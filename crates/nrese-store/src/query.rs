@@ -93,6 +93,8 @@ pub struct SparqlQueryRequest {
     /// Which statements the query reads; `None` = asserted and inferred, unless the query
     /// names GraphDB's pseudo-graphs `onto:explicit` / `onto:implicit` in `FROM`.
     pub read_model: Option<nrese_engine::ReadModel>,
+    /// Use only the effective dataset's named graphs as inference premises.
+    pub inference_scope_dataset: bool,
     /// Bytes of intermediate results the query may hold; `None` is unlimited. A query that
     /// needs more fails ([`StoreError::is_memory_limit`](crate::StoreError::is_memory_limit)).
     pub memory_limit: Option<usize>,
@@ -104,6 +106,9 @@ pub struct SparqlQueryRequest {
     pub scope: crate::ReadScope,
     /// Under `owl2-dl`: which answers this query asks for, over `dl.answers`.
     pub dl_answers: Option<crate::DlAnswers>,
+    /// Under `owl2-dl`: when the request's time is up (`None`: `dl.timeout` alone). At it a
+    /// read is told incomplete with the rows it has, not stopped: a stop is the cancellation.
+    pub deadline: Option<std::time::Instant>,
 }
 
 impl SparqlQueryRequest {
@@ -120,10 +125,12 @@ impl SparqlQueryRequest {
             default_graphs: Vec::new(),
             named_graphs: Vec::new(),
             read_model: None,
+            inference_scope_dataset: false,
             memory_limit: None,
             as_written: false,
             scope,
             dl_answers: None,
+            deadline: None,
         }
     }
 }

@@ -343,7 +343,7 @@ fn views_of_unpublished_state_keep_no_classes() {
         (
             "mask",
             pending
-                .with_inferred_mask(&mask, &budget())
+                .with_inferred_mask(&mask, true, &budget())
                 .unwrap()
                 .expect("a mask over the pending state"),
         ),

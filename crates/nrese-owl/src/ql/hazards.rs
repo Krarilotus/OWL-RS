@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use super::tbox::{Basic, Type};
+use crate::diagnostics::Diagnostic;
 use crate::mapping::Ontology;
 use crate::model::{Axiom, Characteristic, ClassExpr, ExprId, Term};
 
@@ -57,9 +58,9 @@ pub enum Hazard {
     /// An axiom outside the profile, as [`Self::OutsideProfile`], that equates individuals
     /// and names no term: global, which needs none.
     Equating,
-    /// A structure the mapping drops (malformed, unsupported, a broken list), at the node
-    /// it reports: the axiom it was part of isn't read at all (I24c-2).
-    Dropped(Term),
+    /// An axiom the reader leaves out or alters ([`Diagnostic::alters_axioms`]), with its
+    /// diagnostic: any term may miss the axiom's conclusions (I24c-2): global.
+    LeftOut(Diagnostic),
     /// A data property whose values OWL 2 RL's rules would compare or type
     /// ([`reads_data_values`]), or a property not declared an object property in a key or
     /// a disjointness, which may be one: global.
@@ -117,10 +118,9 @@ impl Hazard {
             | Self::Untyped(t)
             | Self::OpenLeft(t)
             | Self::OutsideProfile(t)
-            | Self::Dropped(t)
             | Self::DataValues(t)
             | Self::Unread(t) => t,
-            Self::Equating => return None,
+            Self::Equating | Self::LeftOut(_) => return None,
         })
     }
 
@@ -168,7 +168,10 @@ impl Hazard {
                 format!("an axiom on {t} outside the profile whose rules the closure applies")
             }
             Self::Equating => "an axiom outside the profile equates individuals".to_owned(),
-            Self::Dropped(_) => format!("a schema structure at {t} that can't be read"),
+            Self::LeftOut(d) => format!(
+                "the reader leaves out or alters an axiom: {}",
+                d.describe(name)
+            ),
             Self::DataValues(_) => format!(
                 "an axiom may compare or type values of {t}, and the rule set leaves out dt-eq \
                  and dt-type2: one value in two lexical forms isn't matched, nor a value's \
@@ -440,20 +443,22 @@ pub(crate) fn hazards(
                 edges.push((all.clone(), all));
             }
             Axiom::DisjointUnion(class, parts) => {
-                found.push(Hazard::Union(*class));
+                // A named class's term; on `⊤` or `⊥` none, as `⊤ ⊑ A ⊔ B` has none.
+                let class = expr_terms(*class);
+                found.extend(class.iter().map(|&c| Hazard::Union(c)));
                 // A part is a left side of the class, which the TBox reads (a class).
                 if parts
                     .iter()
                     .any(|&p| needs_no_term(o, p) && !read_as_top(o, p))
                 {
-                    open.push(*class);
+                    open.extend(&class);
                 }
                 let mut all: Vec<Term> = parts.iter().flat_map(|&c| expr_terms(c)).collect();
                 for &p in parts {
                     collect.walk(p, Place::LeftTop);
                     collect.walk(p, Place::Right(None));
                 }
-                all.push(*class);
+                all.extend(class);
                 edges.push((all.clone(), all));
             }
             Axiom::SubObjectPropertyOf(chain, sup) => {
@@ -802,7 +807,12 @@ fn directed_edges(o: &Ontology, axiom: &Axiom) -> Vec<(Vec<Term>, Vec<Term>)> {
         Axiom::DisjointClasses(v) => pairs(v, false),
         Axiom::DisjointUnion(class, parts) => parts
             .iter()
-            .flat_map(|&p| [(t(&[p]), vec![*class]), (with(vec![*class], p), c(p, true))])
+            .flat_map(|&p| {
+                [
+                    (t(&[p]), c(*class, true)),
+                    (with(t(&[*class]), p), c(p, true)),
+                ]
+            })
             .collect(),
         Axiom::ObjectPropertyDomain(p, e) | Axiom::ObjectPropertyRange(p, e) => {
             vec![(with(vec![p.named()], *e), c(*e, true))]

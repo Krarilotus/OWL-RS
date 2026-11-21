@@ -150,6 +150,13 @@ pub const SETTINGS: &[Setting] = &[
          needs authentication, replacement-grade also on-disk storage and problem+json parse \
          errors.",
     ),
+    setting(
+        "server.public_url",
+        names::PUBLIC_URL,
+        Text,
+        Unset::Nothing("unset, use the request host and forwarded headers"),
+        "Externally reachable server URL, including a reverse proxy path prefix.",
+    ),
     // [store]
     setting(
         "store.mode",
@@ -439,6 +446,14 @@ pub const SETTINGS: &[Setting] = &[
         Unset::Number(1000),
         "Under owl2-dl, the candidate answers a query checks with the exact services at \
          most; the rest are reported unresolved (0 or unlimited: none).",
+    ),
+    setting(
+        "dl.model_labels",
+        names::DL_MODEL_LABELS,
+        Bool,
+        Unset::Flag(false),
+        "Under owl2-dl, an exact read first refutes its candidates by one model of the \
+         premise, before the candidate limit; off, each candidate goes to its own test.",
     ),
     setting(
         "dl.threads",
@@ -1089,7 +1104,7 @@ fn walk(
 /// A file value as the environment would hold it.
 fn file_value(setting: &Setting, key: &str, value: &toml::Value) -> Result<String> {
     use toml::Value as V;
-    let wrong = |expected: &str| anyhow::anyhow!("'{key}' must be {expected}, not {value}");
+    let wrong = |expected: &str| anyhow::anyhow!("'{key}' must be {expected}");
     Ok(match (setting.kind, value) {
         (Text | Choice(_), V::String(text)) => text.clone(),
         (Text | Choice(_), _) => return Err(wrong("text")),

@@ -3,7 +3,7 @@ the gate passes only the exact candidate, with every required outcome present an
 exceptions.
 
 The audit of 8 Nov 2026 (tests-tooling T01-T03; catalogue D16-130, D16-126, D16-125) found the
-final join pass a candidate it must refuse, each reproduced on engine-v2 3a4e0a21e:
+final join pass a candidate it must refuse, each reproduced on engine-v2 03e17fb96:
 - checks of another candidate, or naming none, joined to a candidate's timed parts (D16-130);
 - a launched W3C kit that died without a libtest summary left no trace in the verdict (D16-126);
 - a wrong answer the case catalogue declares as known passed without any owner exception, and the
@@ -883,7 +883,11 @@ def wrong_everywhere(side, n):
     return [fixtures.record(status="wrong", expected="wrong")]
 
 
-def exception(case: str = "lab-olympics", outcome: str = "wrong", by: str = "Johannes", extra: str = QUOTE) -> str:
+# The policy file names its approver, and an entry by another name is refused.
+APPROVER = 'approver = "the maintainer"\n'
+
+
+def exception(case: str = "lab-olympics", outcome: str = "wrong", by: str = "the maintainer", extra: str = QUOTE) -> str:
     return (f'[[exception]]\ncase = "{case}"\noutcome = "{outcome}"\napproved = "2026-11-09"\nby = "{by}"\n'
             f'reason = "the fixture\'s inherited answer"\n{extra}')
 
@@ -906,7 +910,7 @@ class Authority(Scratch):
         a = self.repo.commit(policy=exception())
         done = verdict(self.repo.path, a, rounds(a, wrong_everywhere), *checks(a, self.repo.tree(a)))
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
-        self.assertIn("owner exception: lab-olympics wrong, approved 2026-11-09 by Johannes", done.stdout)
+        self.assertIn("owner exception: lab-olympics wrong, approved 2026-11-09 by the maintainer", done.stdout)
         for policy in (exception(case="kernel-intersect"), exception(outcome="memory-limit")):
             b = self.repo.commit(policy=policy)
             done = verdict(self.repo.path, b, rounds(b, wrong_everywhere), *checks(b, self.repo.tree(b)))
@@ -928,14 +932,24 @@ class Authority(Scratch):
         done = verdict(self.repo.path, b, rounds(b, records_of), *checks(b, self.repo.tree(b)))
         self.assertEqual(done.returncode, 0, f"SPEC the exception governs its wrong answer\n{done.stdout}")
 
-    def test_an_entry_without_johannes_s_word_is_refused(self):
+    def test_an_entry_without_the_maintainers_word_is_refused(self):
         # Spec: bar exceptions are the owner's, in the owner's recorded words: an entry
         # by anyone else, or without the quote and its source, is a policy error: NOT PASSED.
-        for policy in (exception(by="the owner"), exception(extra="")):
+        for policy in (APPROVER + exception(by="the owner"), exception(extra="")):
             a = self.repo.commit(policy=policy)
             done = verdict(self.repo.path, a, rounds(a, wrong_everywhere), *checks(a, self.repo.tree(a)))
             self.assertEqual(done.returncode, 1, f"SPEC {policy}\n{done.stdout}")
             self.assertIn("release-tradeoffs.toml", done.stdout)
+
+    def test_the_approver_is_the_policy_files_own_so_an_older_candidate_keeps_its_policy(self):
+        # Spec (18 Nov 2026): the approver's name is read with the policy at the candidate's commit and
+        # the code names nobody, so a re-verdict of a candidate from before `approver` keeps its entries.
+        old = exception(by="the owner")
+        kept = gate_module.load_policy(old)
+        self.assertEqual((len(kept.exceptions), kept.errors), (1, []), "SPEC an older file: its entries' one name")
+        self.assertTrue(gate_module.load_policy(APPROVER + old).errors, "SPEC a name other than the approver's")
+        two = gate_module.load_policy(old + exception(case="lab-x", by="the maintainer"))
+        self.assertEqual((two.exceptions, len(two.errors)), ([], 1), "SPEC two names and no approver")
 
     def test_the_policy_is_the_candidate_tree_s_never_a_report_s_or_another_tree_s(self):
         # Spec: the design's attack 4: a timed report carries what its harness tree held; the verdict reads
@@ -944,7 +958,7 @@ class Authority(Scratch):
         a = self.repo.commit(message="the candidate, without it")
         timed = rounds(a, wrong_everywhere)
         for summary in timed:
-            summary["exceptions"] = [{"case": "lab-olympics", "outcome": "wrong", "by": "Johannes"}]
+            summary["exceptions"] = [{"case": "lab-olympics", "outcome": "wrong", "by": "the maintainer"}]
         done = verdict(self.repo.path, a, timed, *checks(a, self.repo.tree(a)))
         self.assertEqual(done.returncode, 1, f"SPEC {other[:8]}'s exception doesn't cover {a[:8]}\n{done.stdout}")
 
@@ -978,7 +992,7 @@ def refused(*sides):
     return records_of
 
 
-def absence(side: str = "main", scope: str = 'cases = ["lab-olympics"]', by: str = "Johannes",
+def absence(side: str = "main", scope: str = 'cases = ["lab-olympics"]', by: str = "the maintainer",
             extra: str = QUOTE, side_toml: str | None = None) -> str:
     """An [[absence]] entry; `side_toml`: its side's TOML value as written (a malformed one)."""
     side_toml = side_toml if side_toml is not None else f'"{side}"'
@@ -1015,7 +1029,7 @@ class DeclaredAbsence(Scratch):
         self.assertIn("base: 1 compared, 0 absent by product, 0 absent by the owner's decision", done.stdout)
         self.assertIn("main: 0 compared, 1 absent by product, 0 absent by the owner's decision", done.stdout)
 
-    def test_a_harness_gap_blocks_unless_johannes_s_entry_names_its_case_and_side(self):
+    def test_a_harness_gap_blocks_unless_the_maintainers_entry_names_its_case_and_side(self):
         # Spec: decisions 1b and 2: main refuses the case's arguments; with no entry the hypothesis stays
         # not compared and blocks, as before; the owner's [[absence]] entry naming the case (or a pattern
         # matching it) and main lists it "not compared by the owner's decision" and passes; an entry for
@@ -1030,7 +1044,7 @@ class DeclaredAbsence(Scratch):
             done = verdict(self.repo.path, b, self.rounds(b, refused("main"), catalog), *checks(b, self.repo.tree(b)))
             self.assertEqual(done.returncode, 0, f"SPEC {scope}: the owner's decision\n{done.stdout}{done.stderr}")
             self.assertIn("- not compared by the owner's decision: lab-olympics against main: its perf lab has no "
-                          "commits mode (port: the commits port, after v1.5; approved 2026-11-11 by Johannes",
+                          "commits mode (port: the commits port, after v1.5; approved 2026-11-11 by the maintainer",
                           done.stdout)
             self.assertNotIn("**not compared**", done.stdout)
             self.assertIn("main: 0 compared, 0 absent by product, 1 absent by the owner's decision", done.stdout)
@@ -1049,7 +1063,7 @@ class DeclaredAbsence(Scratch):
         a = self.repo.commit()
         done = verdict(self.repo.path, a, self.rounds(a, refused(), catalog), *checks(a, self.repo.tree(a)))
         self.assertEqual(done.returncode, 0, f"the rounds pass without a policy\n{done.stdout}{done.stderr}")
-        for policy in (absence(by="the owner"), absence(extra=""), absence().replace('port = "the commits port, '
+        for policy in (APPROVER + absence(by="the owner"), absence(extra=""), absence().replace('port = "the commits port, '
                                                                                      'after v1.5"\n', ""),
                        absence(scope='cases = ["lab-olympics"]\npattern = "lab-*"'),
                        *(absence(side_toml=v) for v in ("[]", "{}", "1", "true", '"cand"'))):
@@ -1111,7 +1125,7 @@ class Tradeoffs(Scratch):
 
     def entry(self, **changes) -> str:
         fields = {"case": "lab-olympics", "dimension": "time/q06", "max_ratio": 1.12, "approved": "2026-10-20",
-                  "by": "Johannes", "reason": "text index: 8 % slower filters for 2.8x faster triangles",
+                  "by": "the maintainer", "reason": "text index: 8 % slower filters for 2.8x faster triangles",
                   "quote": "accept the filters' loss for the triangles", "source": "OWL-RS master thread, 20 Oct 2026",
                   "pays_with": {"case": "kernel-intersect", "dimension": "time/triangles"}, **changes}
         lines = ["[[tradeoff]]"]
@@ -1168,14 +1182,108 @@ class Tradeoffs(Scratch):
                 self.assertEqual((policy.tradeoffs, policy.exceptions), ([], []))
                 self.assertTrue(any("an array of tables" in e for e in policy.errors), policy.errors)
 
+    def test_an_entry_whose_value_has_another_type_is_refused_one_message_per_fault_never_raised(self):
+        # Spec (18 Nov 2026): every key of every kind is read by its type before any use, so a malformed
+        # entry makes the file an error with one message per fault and never raises (this loader also
+        # decides fast.py's absences). Each case raised, or loaded what it shouldn't, before, but the
+        # side's and the approval's, checked already and kept as the one read for every kind.
+        auth = 'approved = "2026-11-09"\nby = "the maintainer"\nreason = "r"\n' + QUOTE
+        win = 'pays_with = { case = "kernel-intersect", dimension = "time/triangles" }\n'
+        loss = '[[tradeoff]]\ncase = "lab-olympics"\ndimension = "time/q06"\n'
+        for label, text, faults in (
+                ("an outcome that is a list", exception().replace('"wrong"', '["wrong"]'), 1),
+                ("a case that is a list, and an outcome too", exception().replace('"lab-olympics"', '["x"]')
+                 .replace('"wrong"', '["wrong"]'), 2),
+                ("a max no float holds", '[[emerged]]\ncase = "x"\ndimension = "time/a"\nmax = 1' + "0" * 400 + "\n" + auth, 1),
+                ("a baseline that is a list", '[[emerged]]\ncase = "x"\ndimension = "time/a"\nmax = 2.0\nagainst = ["main"]\n'
+                 + auth, 1),
+                ("a win named by a list", loss + "max_ratio = 1.1\n" + win.replace('"kernel-intersect"', '["k"]') + auth, 1),
+                ("a bound that bounds nothing", loss + "max_ratio = inf\n" + win + auth, 1),
+                ("a baseline misspelt", loss + 'against = "mian"\nmax_ratio = 1.1\n' + win + auth, 1),
+                ("a side that is a table", absence(side_toml="{ a = 1 }"), 1),
+                ("a bound past the digit limit", loss + "max_ratio = 0x" + "f" * 4000 + "\n" + win + auth, 1),
+                ("an integer the TOML reader can't convert", loss + "max_ratio = 1" + "0" * 4300 + "\n" + win + auth, 1),
+                ("a case missing and an outcome that is a list",
+                 exception().replace('case = "lab-olympics"\n', "").replace('"wrong"', '["wrong"]'), 2),
+                ("an approval that is a time", exception().replace('approved = "2026-11-09"', "approved = 2026-11-09T10:00:00"), 1)):
+            with self.subTest(label):
+                # a valid exception beside it: discarded with the file
+                policy = gate_module.load_policy(APPROVER + text + exception(case="lab-sibling"))
+                self.assertEqual((policy.tradeoffs, policy.exceptions, policy.absences, policy.emerged, len(policy.errors)),
+                                 ([], [], (), (), faults), policy.errors)
+
     def test_a_confirmed_loss_blocks_unless_an_approved_trade_off_with_its_win_covers_it(self):
         self.assertEqual(self.verdict().returncode, 1)
         done = self.verdict(self.entry())
         self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
         self.assertIn("accepted trade-off", done.stdout)
         for entry in (self.entry(max_ratio=1.05), self.entry(pays_with={"case": "lab-olympics", "dimension": "time/q01"}),
-                      self.entry(dimension="time/q01"), self.entry(by="the owner")):
+                      self.entry(dimension="time/q01"), APPROVER + self.entry(by="the owner")):
             self.assertEqual(self.verdict(entry).returncode, 1, entry)
+
+    def test_the_verdict_names_the_approver_it_read_from_the_candidates_policy(self):
+        # Spec: a changed approver can't pass unseen: the verdict's report names the approver the
+        # candidate's policy file gives, whichever name that is.
+        for name in ("the maintainer", "a new approver"):
+            with self.subTest(name):
+                done = self.verdict(f'approver = "{name}"\n' + self.entry(by=name))
+                self.assertIn(f"approver {name!r};", done.stdout)
+
+    # An accepted row: the reading the approver accepted for it.
+    ROW = '{ row = 17, case = "lab-olympics", dimension = "time/q06", ratio = 1.08, interval = [1.05, 1.11] }'
+
+    def known(self, rows: str = ROW) -> str:
+        return ('[[accepted]]\nrelease = "1.5"\nagainst = "main"\nbaseline_commit = "928100bdc095195ae515"\n'
+                'tree = "180860fbadc7"\napproved = "2026-11-17"\n'
+                f'by = "the maintainer"\nreason = "r"\nquote = "q"\nsource = "s"\nrows = [{rows}]\n')
+
+    def test_an_accepted_row_is_named_beside_its_flag_and_the_flag_still_blocks(self):
+        # Spec (18 Nov 2026): beside a row accepted for a release the report prints the reading
+        # accepted and this run's; the gate derives nothing from it (no tolerance), and it names the row
+        # only against its baseline.
+        done = self.verdict(self.known())
+        self.assertEqual(done.returncode, 1, f"SPEC an accepted row waived its loss\n{done.stdout}")
+        flag = {side: next(line for line in done.stdout.splitlines()
+                           if line.startswith(f"- **confirmed loss**: lab-olympics against {side}"))
+                for side in ("main", "base")}
+        self.assertIn("; known, accepted for 1.5, row 17: 1.08 [1.05, 1.11] on tree 180860fbadc7 against main at "
+                      "928100bdc095", flag["main"])
+        self.assertRegex(flag["main"], r"; now 1\.0[6-9]\d \[")
+        self.assertNotIn("known", flag["base"])
+
+    def test_an_accepted_row_below_the_step_shows_this_runs_medians_beside_the_reading_accepted(self):
+        # Spec (review r1, finding 2): below the counter's step the ratio is the step's midpoint on both
+        # sides, so the note shows the medians, unit and step this run read, beside the reading accepted.
+        r = {"status": "below resolution", "base": 0.0006, "new": 0.0007, "unit": "ms", "step": 0.001, "ratio": 1.0,
+             "ci": [1.0, 1.0]}
+        policy = gate_module.load_policy(APPROVER + self.known())
+        note = gate_module.known_note(policy, "main", "lab-olympics", "time/q06", r)
+        self.assertIn("; now below resolution: 0.0006 -> 0.0007 ms, step 0.001; known, accepted for 1.5, row 17", note)
+        self.assertIn("now no reading in the report;", gate_module.known_note(policy, "main", "lab-olympics",
+                                                                              "time/q06", {"ratio": "x", "ci": [1]}))
+
+    def test_an_accepted_entry_lists_its_rows_and_one_of_another_shape_is_refused(self):
+        # Spec: a row needs its number, case, dimension, and its ratio within its interval; a case and
+        # dimension listed twice against one baseline is ambiguous. Each makes the file an error, so
+        # it lists nothing (and accepts nothing else).
+        policy = gate_module.load_policy(APPROVER + self.known())
+        self.assertEqual(([k["row"] for k in getattr(policy, "accepted", ())], policy.errors), ([17], []))
+        for label, rows in (("a ratio outside its interval", self.ROW.replace("1.08", "1.2")),
+                            ("no interval", self.ROW.replace(", interval = [1.05, 1.11]", "")),
+                            ("a row listed twice", f"{self.ROW}, {self.ROW.replace('17', '18')}"),
+                            ("no rows", "")):
+            with self.subTest(label):
+                policy = gate_module.load_policy(APPROVER + self.known(rows))
+                self.assertEqual((policy.accepted, len(policy.errors)), ((), 1), policy.errors)
+        # The entry itself: a baseline that is no name (TOML gives a list), a ratio no float holds, a
+        # release over two lines, a key it doesn't have (a tolerance). Each is refused, never raised.
+        for label, text in (("a list as the baseline", self.known().replace('against = "main"', 'against = ["main"]')),
+                            ("a ratio no float holds", self.known(self.ROW.replace("ratio = 1.08", "ratio = 1" + "0" * 400))),
+                            ("a release over two lines", self.known().replace('release = "1.5"', 'release = "1.5\\nx"')),
+                            ("a key it doesn't have", self.known() + "max_ratio = 1.1\n")):
+            with self.subTest(label):
+                policy = gate_module.load_policy(APPROVER + text + exception())
+                self.assertEqual((policy.accepted, policy.exceptions, len(policy.errors)), ((), [], 1), policy.errors)
 
     def test_the_trees_policy_names_gated_rows_and_a_malformed_entry_is_refused(self):
         # A malformed file makes every verdict NOT PASSED; a trade-off whose loss or win names no
@@ -1189,6 +1297,13 @@ class Tradeoffs(Scratch):
                 family = gate_module.family_of(catalog, [case])
                 self.assertTrue(any(gate_module.hypothesis(s, case, dimension_) in family for s in sides),
                                 f"{case} {dimension_}: no row the gate judges ({t['reason']})")
+        # An accepted row names a case the gate runs, and one of its rows where the catalogue declares
+        # them (a workload's, as watdiv's, come from its query set when it runs: `time/_` here).
+        for k in policy.accepted:
+            family = gate_module.family_of(catalog, [k["case"]])
+            self.assertTrue(family, f"row {k['row']}: {k['case']} is no case the gate runs")
+            if not (k["dimension"].startswith("time/") and gate_module.hypothesis(k["against"], k["case"], "time/_") in family):
+                self.assertIn(gate_module.hypothesis(k["against"], k["case"], k["dimension"]), family, f"row {k['row']}")
         bad = gate_module.load_policy('[[tradeoff]]\ncase = "x"\ndimension = "time/q"\nmax_ratio = 1.1\n')
         self.assertEqual(bad.tradeoffs, [])
         self.assertIn("missing approved, by, pays_with, quote, reason, source", bad.errors[0])

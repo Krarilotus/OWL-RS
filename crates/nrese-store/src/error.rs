@@ -87,6 +87,14 @@ pub enum StoreError {
     /// committed.
     #[error("the load was cancelled; nothing of it was committed")]
     LoadCancelled,
+    #[error(
+        "the load completed at published revision {revision}. Its quarantine record couldn't be kept: {reason}. Don't send it again."
+    )]
+    LoadPublished {
+        revision: u64,
+        #[source]
+        reason: std::io::Error,
+    },
     /// A classification or realisation request gave up waiting for the computation under
     /// way for its revision, which runs on and is kept.
     #[error("the classification request was cancelled while it waited")]
@@ -115,9 +123,9 @@ pub enum StoreError {
     /// A query's memory refusal as a reader of some graphs is told it
     /// (`Self::without_amounts`): the limit, not the bytes held and asked for.
     #[error(
-        "{}: limit {} MiB (what the query held and asked for is not reported to a reader of some graphs)",
+        "{}: limit {} (what the query held and asked for is not reported to a reader of some graphs)",
         memory_refusal(.shared),
-        .limit >> 20
+        nrese_exec::limit_text(*.limit)
     )]
     MemoryLimitWithoutAmounts { limit: usize, shared: bool },
     /// A reader of some graphs who sees inferences, refused while nothing vouches that the
@@ -254,6 +262,7 @@ impl StoreError {
                 QueryEvaluationError::Dataset(_)
                     | QueryEvaluationError::MemoryLimit(_)
                     | QueryEvaluationError::Unexpected(_)
+                    | QueryEvaluationError::ScopedInferenceUnavailable(_)
                     | QueryEvaluationError::Cancelled
             );
         }
@@ -278,6 +287,7 @@ impl StoreError {
             | Self::MemoryUnreadable { .. }
             | Self::MemoryLimitWithoutAmounts { .. }
             | Self::LoadCancelled
+            | Self::LoadPublished { .. }
             | Self::Undecided(_)
             | Self::ClassificationCancelled
             | Self::NotRematerialised { .. }
@@ -351,6 +361,7 @@ mod unread_tests {
             used: 1 << 20,
             shared: true,
             unread: true,
+            rows: None,
         });
         assert!(!unread.is_memory_limit());
         assert!(!unread.is_server_memory_limit());

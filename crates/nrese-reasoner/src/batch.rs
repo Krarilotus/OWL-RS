@@ -2800,11 +2800,99 @@ pub(crate) fn fact_rules<S: Source + ?Sized>(
     out
 }
 
-/// The consistency rules of `rules`, plus the list ones instantiated over `source`.
+/// The input's list cells as written: the runs the store started with, which no round
+/// merges ([`Relation::advance`]), read only for a list past the cap. Named by the final
+/// classes' representatives where the run keeps them: a representative's cells are its
+/// members' (a name that represents nothing has none). Each member read counts on `poll`;
+/// past its stop nothing is read, and the run is interrupted.
+struct Written<'a, 'p> {
+    store: &'a Store,
+    classes: Option<&'a EqualityClasses>,
+    poll: &'a Poller<'p>,
+}
+
+impl Written<'_, '_> {
+    /// `predicate`'s pairs the store started with: apart since the first round, which every
+    /// run has ([`Relation::advance`]).
+    fn run(&self, predicate: u64) -> Option<&Pairs> {
+        let relation = self.store.relation(predicate)?;
+        debug_assert!(!relation.fresh, "a round has run");
+        Some(&*relation.input.so)
+    }
+
+    fn named(&self, x: u64) -> u64 {
+        self.classes.map_or(x, |classes| classes.representative(x))
+    }
+}
+
+impl super::lists::Facts for Written<'_, '_> {
+    fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
+        let (Some(run), true) = (self.run(predicate), self.named(subject) == subject) else {
+            return Vec::new();
+        };
+        let one = [subject];
+        let members = (self.classes).and_then(|c| c.class_of(subject));
+        let mut objects = Vec::new();
+        for &member in members.unwrap_or(&one) {
+            if self.poll.tick() {
+                return Vec::new();
+            }
+            let cells = run.range(member).flatten();
+            objects.extend(cells.map(|&(_, o)| self.named(o)));
+        }
+        objects.sort_unstable();
+        objects.dedup();
+        objects
+    }
+
+    fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
+        let pairs = self.run(predicate).into_iter().flat_map(Pairs::iter);
+        let named = pairs.map(|&(s, o)| (self.named(s), self.named(o)));
+        let mut pairs: Vec<(u64, u64)> = named.collect();
+        pairs.sort_unstable();
+        pairs.dedup();
+        pairs
+    }
+
+    fn unmerged(&self) -> Option<&dyn super::lists::Unmerged> {
+        self.classes.map(|_| self as &dyn super::lists::Unmerged)
+    }
+}
+
+/// The input's cells by the names the store started with: each node its own, its objects
+/// unrenamed, for a list whose cells as written the final classes merge past the cap.
+impl super::lists::Unmerged for Written<'_, '_> {
+    fn cells(&self, node: u64, predicate: u64) -> Vec<u64> {
+        let Some(run) = self.run(predicate).filter(|_| !self.poll.tick()) else {
+            return Vec::new();
+        };
+        let mut objects: Vec<u64> = run.range(node).flatten().map(|&(_, o)| o).collect();
+        objects.sort_unstable();
+        objects.dedup();
+        objects
+    }
+
+    fn equal(&self, x: u64) -> Option<&[u64]> {
+        (self.classes).and_then(|c| c.class_of(x))
+    }
+
+    fn named(&self, x: u64) -> u64 {
+        Written::named(self, x)
+    }
+
+    fn stopped(&self) -> bool {
+        self.poll.tick()
+    }
+}
+
+/// The consistency rules of `rules`, plus the list ones instantiated over `source`, and
+/// those of a list past the cap over `source` read from `written`, its cells as written
+/// ([`super::lists::instantiate_written`]).
 pub(crate) fn consistency_rules<S: Source + ?Sized>(
     source: &S,
     rules: &[Rule],
     lists: Option<&ListVocabulary>,
+    written: Option<&dyn super::lists::Facts>,
 ) -> Vec<Rule> {
     let mut out: Vec<Rule> = rules
         .iter()
@@ -2812,7 +2900,8 @@ pub(crate) fn consistency_rules<S: Source + ?Sized>(
         .cloned()
         .collect();
     if let Some(vocabulary) = lists {
-        let (list_rules, _) = instantiate(vocabulary, &AllFacts(source));
+        let (list_rules, _, _) =
+            super::lists::instantiate_written(vocabulary, &AllFacts(source), written);
         out.extend(
             list_rules
                 .into_iter()
@@ -3477,7 +3566,14 @@ fn run_body(
             store: &store,
             stale,
         };
-        let mut checks = consistency_rules(&current, &rules, lists);
+        let poll = Poller::new(stop).ok_or_else(Interrupted::default)?;
+        let written = Written {
+            store: &store,
+            classes: representatives.as_ref().map(|reps| &reps.classes),
+            poll: &poll,
+        };
+        let mut checks = consistency_rules(&current, &rules, lists, Some(&written));
+        poll.ended().map_err(|Stopped| Interrupted::default())?;
         if let Some(reps) = &representatives {
             give_classes(&mut checks, reps, &mut guard_classes, &mut guarded);
         }

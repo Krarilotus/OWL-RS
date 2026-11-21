@@ -201,6 +201,28 @@ impl AccessControl {
         self.state().view(principal, repository)
     }
 
+    /// [`Self::view`] with its [`RightsCheck`]: the view and the rights it checks again come
+    /// from one reading of the state; `grant`, the state's that admitted a write, if any.
+    pub fn view_checked(
+        self: &Arc<Self>,
+        principal: &Principal,
+        repository: &str,
+        grant: Option<Grant>,
+    ) -> AccessView {
+        let state = self.state();
+        let mut view = state.view(principal, repository);
+        let rights = view.requester();
+        view.rights = Some(RightsCheck {
+            access: Arc::clone(self),
+            principal: principal.clone(),
+            repository: repository.to_owned(),
+            state,
+            rights,
+            grant,
+        });
+        view
+    }
+
     /// Applies `change` by `by`, with `reason` (required): the state and its history change
     /// in one commit. Returns the change's record.
     pub fn apply(
@@ -416,6 +438,50 @@ impl AccessControl {
             .collect();
         records.sort_by_key(|record| std::cmp::Reverse(record.number));
         Ok((records, changes.len()))
+    }
+}
+
+/// A write's rights, checked again where it publishes: who asked, where, the state its view
+/// came from, the requester that state gave, and the grant that admitted it.
+#[derive(Debug, Clone)]
+pub struct RightsCheck {
+    access: Arc<AccessControl>,
+    principal: Principal,
+    repository: String,
+    state: Arc<AccessState>,
+    rights: crate::Requester,
+    grant: Option<Grant>,
+}
+
+/// The state's right that admitted a write where credentials didn't: [`AccessState::grants_write`]
+/// (`Write`), [`AccessState::is_admin`] (`Admin`), or either (a local login's).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Grant {
+    Write,
+    Admin,
+    Login,
+}
+
+impl RightsCheck {
+    /// The check of a write that administrators alone may make (a restore).
+    pub fn administering(mut self) -> Self {
+        self.grant = self.grant.map(|_| Grant::Admin);
+        self
+    }
+
+    /// The state's read guard, while it gives the write its rights (contracts.md, lock order).
+    pub(crate) fn hold(&self) -> Option<std::sync::RwLockReadGuard<'_, Arc<AccessState>>> {
+        let now = self.access.state.read().expect("state");
+        let (principal, admin) = (&self.principal, now.is_admin(&self.principal));
+        let granted = match self.grant {
+            None => true,
+            Some(Grant::Write) => now.grants_write(principal),
+            Some(Grant::Admin) => admin,
+            Some(Grant::Login) => admin || now.grants_write(principal),
+        };
+        let rights = || now.view(principal, &self.repository).requester();
+        let same = Arc::ptr_eq(&*now, &self.state) || rights() == self.rights;
+        (granted && same).then_some(now)
     }
 }
 

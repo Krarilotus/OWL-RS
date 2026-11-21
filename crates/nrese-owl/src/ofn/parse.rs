@@ -364,17 +364,20 @@ impl<'t, 'm> Parser<'t, 'm> {
         RangeId(self.model.ranges.intern(range))
     }
 
+    /// A class named by an IRI: `owl:Thing` and `owl:Nothing` as themselves.
+    fn named_class(&mut self) -> R<ExprId> {
+        let (term, special) = self.named()?;
+        Ok(match special {
+            Special::Thing => self.e(ClassExpr::Thing),
+            Special::Nothing => self.e(ClassExpr::Nothing),
+            _ => self.e(ClassExpr::Class(term)),
+        })
+    }
+
     fn class(&mut self) -> R<ExprId> {
         let (keyword, at) = match *self.peek() {
             Tok::Name(name) if !is_prefixed(name) => (name, self.here()),
-            _ => {
-                let (term, special) = self.named()?;
-                return Ok(match special {
-                    Special::Thing => self.e(ClassExpr::Thing),
-                    Special::Nothing => self.e(ClassExpr::Nothing),
-                    _ => self.e(ClassExpr::Class(term)),
-                });
-            }
+            _ => return self.named_class(),
         };
         self.take();
         self.open()?;
@@ -615,8 +618,13 @@ impl<'t, 'm> Parser<'t, 'm> {
                 return self.disjoint(d);
             }
             "DisjointUnion" => {
-                let class = self.entity()?;
-                Some(Axiom::DisjointUnion(class, canonical(self.classes()?)))
+                let class = self.named_class()?;
+                let classes = self.classes()?;
+                // `disjointClassExpressions`: two at least (*Structural Specification* §9.1.4).
+                if classes.len() < 2 {
+                    return fail(at, "a disjoint union of fewer than two classes");
+                }
+                return self.disjoint(Disjoint::Union(class, classes));
             }
             "SubObjectPropertyOf" => {
                 let chain = if matches!(self.peek(), Tok::Name("ObjectPropertyChain")) {

@@ -1316,14 +1316,14 @@ fn ranged_commits_are_judged_by_the_whole_lexical_space() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// The reasoning marker engine-v2 621bf318 (`SEMANTICS_VERSION` 3) wrote for the store of
+/// The reasoning marker engine-v2 9a41df47 (`SEMANTICS_VERSION` 3) wrote for the store of
 /// [`a_marker_from_older_datatype_semantics_is_rechecked`] after rematerialising it under
 /// owl2-rl: 0 violations (fleet probe xsdval-probe-marker-56fd5f94).
 const OLD_MARKER: &str =
     "ruleset owl2-rl\nfingerprint a94cf90230548146\nviolations 0\nlists nil-class\n";
 
 /// A store whose reasoning marker a build with older datatype semantics wrote (engine-v2
-/// 621bf318, which didn't judge an ill-typed literal under a range, so recorded this data
+/// 9a41df47, which didn't judge an ill-typed literal under a range, so recorded this data
 /// consistent) isn't current once the semantics change (rulesets::SEMANTICS_VERSION): on
 /// reopen it is rechecked, and the inconsistency is reported.
 #[test]
@@ -1346,7 +1346,7 @@ fn a_marker_from_older_datatype_semantics_is_rechecked() {
             )))
             .expect("import");
     }
-    // The marker 621bf318 wrote for this store after rematerialising it (fleet probe
+    // The marker 9a41df47 wrote for this store after rematerialising it (fleet probe
     // xsdval-probe-marker-56fd5f94).
     std::fs::write(dir.path().join("reasoning.state"), OLD_MARKER).expect("write marker");
     let store = StoreService::new(config).expect("reopen");
@@ -1659,13 +1659,13 @@ fn an_unbuilt_key_leaves_no_answer_complete_under_owl2_rl() {
     assert!(wrong.is_empty(), "{wrong:?}");
 }
 
-/// The aliased key built by a first commit is left out by a later one that adds any list fact:
-/// that commit grounds the lists again over the stored closure, which holds equality's copies
-/// of the key's cells (`rdf:first` to each alias), so the key's list has 2^7 member sequences,
-/// past 64 (`too-many-list-variants`). The later commit's key match (`:z` with `:x`'s values)
-/// is then not concluded: `:x :name "Z"` is entailed, so the answer is true or not `complete`.
+/// The aliased key built by a first commit, and a later one that adds any list fact: that
+/// commit grounds the lists again, over a closure that holds equality's copies of the key's
+/// cells (`rdf:first` to each alias: 2^7 member sequences, past 64). The later commit's key
+/// match (`:z` with `:x`'s values) entails `:x :name "Z"`, so the answer is true or not
+/// `complete`, however the list is read: a guard against an answer wrongly `complete`.
 #[test]
-fn a_later_list_fact_leaves_an_aliased_key_out_and_no_answer_complete() {
+fn a_later_list_fact_over_an_aliased_key_leaves_no_answer_wrongly_complete() {
     let pipeline = ql_pipeline(in_memory_store_config());
     let write = |data: &str| {
         let ticket = MutationTicket::new();
@@ -1684,39 +1684,43 @@ fn a_later_list_fact_leaves_an_aliased_key_out_and_no_answer_complete() {
 }
 
 /// Aliases (`owl:sameAs`) of a key's 7 properties leave the key built by the commit that
-/// writes it: equality by representatives, the default, reads each cell of its list as one
-/// member, not 2^7 member sequences. Its answer is true. It isn't `complete`, one commit
-/// early: the commit's program, ground over the closure it stored (expanded, with equality's
-/// `rdf:first` copies), leaves the key out for the next commit, and the mark follows that
-/// program. A sound mark, less precise than the closure; grounding the commit's lists over
-/// representatives too would make it exact. The other way is guarded elsewhere: were the mark
-/// ever missing where a list is left out,
-/// `a_later_list_fact_leaves_an_aliased_key_out_and_no_answer_complete` (this key, left out by
-/// the next commit) and every row of
-/// `an_unbuilt_key_leaves_no_answer_complete_under_owl2_rl` would answer `complete` and turn red.
+/// writes it. Spec: OWL 2 Profiles §4.3, `prp-key` makes `:x` the same as `:y`, and
+/// `eq-rep-s` gives `:x` the name of `:y`: `:x :name ?o` answers `"Y"` alone, as the
+/// replicated closure does, by representatives (the default) and by replication alike. It
+/// isn't `complete`: the next program is ground over the closure the commit stored, where
+/// equality's `rdf:first` copies give the key's list 2^7 member sequences, past 64. That
+/// program leaves the key out and reports it (a key gives no check to read as written), and
+/// the mark follows the report, naming the list axiom: a sound mark, less precise than the
+/// closure.
 #[test]
 fn aliases_leave_a_key_built() {
-    let pipeline = ql_pipeline(in_memory_store_config());
-    let ask = format!("ASK {{ <{EX}x> <{EX}name> \"Y\" }}");
-    pipeline
-        .apply(
-            insert(&aliased_key(7)),
-            &nrese_store::Requester::all(),
-            &MutationTicket::new(),
-        )
-        .expect("the data");
-    let answer = (pipeline.store())
-        .execute_query(&nrese_store::SparqlQueryRequest::all(ask))
-        .expect("answered");
-    let (payload, status) = (String::from_utf8(answer.payload), answer.completeness);
-    println!("aliased key: {payload:?} with {status:?}");
-    assert!(payload.expect("utf8").contains("true"));
-    let status = status.expect("a status");
-    assert!(!status.complete, "{status:?}");
-    assert!(
-        (status.reasons.iter()).any(|r| r.text.contains("list axiom")),
-        "{status:?}"
-    );
+    for representatives in [true, false] {
+        let pipeline = ql_pipeline(nrese_store::StoreConfig {
+            equality_by_representatives: representatives,
+            ..in_memory_store_config()
+        });
+        pipeline
+            .apply(
+                insert(&aliased_key(7)),
+                &nrese_store::Requester::all(),
+                &MutationTicket::new(),
+            )
+            .expect("the data");
+        assert_eq!(
+            names_of_x(pipeline.store()),
+            (vec!["Y".to_owned()], Some(false)),
+            "by representatives: {representatives}"
+        );
+        let ask = format!("ASK {{ <{EX}x> <{EX}name> \"Y\" }}");
+        let answer = (pipeline.store())
+            .execute_query(&nrese_store::SparqlQueryRequest::all(ask))
+            .expect("answered");
+        let status = answer.completeness.expect("a status");
+        assert!(
+            (status.reasons.iter()).any(|r| r.text.contains("list axiom")),
+            "by representatives: {representatives}: {status:?}"
+        );
+    }
 }
 
 /// A store holding a key the rules leave out, opened again with its closure current (so
@@ -1828,31 +1832,41 @@ fn a_restricted_read_leaves_a_hidden_keys_mark() {
     left_out_answer(pipeline.store(), &ask);
 }
 
-/// The aliased key of [`a_later_list_fact_leaves_an_aliased_key_out_and_no_answer_complete`],
-/// its `owl:sameAs` facts in `:secret`: the later commit leaves the key out through equality's
-/// `rdf:first` copies, derived through `:secret`. A reader of the default graph only
-/// (inferences by support) reads that revision first; a reader of every graph then reads it
-/// too: `:x :name "Z"` is entailed, so the second read is true or not `complete`. The control,
-/// a store of its own with the same data read by a reader of every graph alone, is not
-/// `complete`: what differs is the restricted read first.
+/// The aliased key of [`a_later_list_fact_over_an_aliased_key_leaves_no_answer_wrongly_complete`],
+/// its `owl:sameAs` facts in `:secret`: the later commit grounds the lists again, over a
+/// closure where equality's `rdf:first` copies (derived through `:secret`) give the key's list
+/// more than 64 member sequences, and it reports the list past the cap. A reader of the
+/// default graph only (inferences by support) reads that revision first; a reader of every
+/// graph then reads it too. Spec: OWL 2 Profiles §4.3, `prp-key` makes `:x` the same as `:y`
+/// (the first commit) and as `:z` (the later one), so `:x :name ?o` answers `"Y"` and `"Z"`:
+/// the answer holds `"Y"`, nothing outside the two, and isn't `complete`, since the report
+/// says the key may be left out. Two answers are right: `"Y"` alone, where the later key
+/// match is left out (an incomplete answer, so marked), and `"Y"` and `"Z"`, where it is
+/// made; neither is `complete` while the list is reported. After the restricted read, and on
+/// the control, a store of its own with the same data read by a reader of every graph alone;
+/// by representatives (the default) and by replication alike.
 #[test]
 fn a_restricted_read_leaves_an_aliased_keys_mark() {
-    let ask = format!("<{EX}x> <{EX}name> \"Z\"");
-    let control = aliased_key_with_hidden_aliases();
-    let answer = (control.store())
-        .execute_query(&nrese_store::SparqlQueryRequest::all(format!(
-            "ASK {{ {ask} }}"
-        )))
-        .expect("answered");
-    println!("control read: {:?}", answer.completeness);
-    assert!(
-        answer.completeness.as_ref().is_some_and(|c| !c.complete),
-        "control: a reader of every graph alone must be told not complete: {:?}",
-        answer.completeness
-    );
-    let pipeline = aliased_key_with_hidden_aliases();
-    restricted_read(pipeline.store(), &ask);
-    left_out_answer(pipeline.store(), &ask);
+    let entailed = ["Y".to_owned(), "Z".to_owned()];
+    let sound_and_marked = |(names, complete): (Vec<String>, Option<bool>)| {
+        names.contains(&entailed[0])
+            && names.iter().all(|n| entailed.contains(n))
+            && complete == Some(false)
+    };
+    for representatives in [true, false] {
+        let control = aliased_key_with_hidden_aliases(representatives);
+        let case = format!("by representatives: {representatives}");
+        assert!(
+            sound_and_marked(names_of_x(control.store())),
+            "{case}: control"
+        );
+        let pipeline = aliased_key_with_hidden_aliases(representatives);
+        restricted_read(pipeline.store(), &format!("<{EX}x> <{EX}name> \"Z\""));
+        assert!(
+            sound_and_marked(names_of_x(pipeline.store())),
+            "{case}: after the restricted read"
+        );
+    }
 }
 
 /// A transaction inserts a key of 128 properties and reads inside it: its pending operations
@@ -2057,8 +2071,11 @@ fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
 /// as written. The read of `owl:hasKey` reads `:hk` and expands it, so the list scan sees a
 /// key of `:head`'s 128 properties, more than the rules build. `:x` and `:z` agree on all of
 /// them, so `:x :name :Z` is entailed: the pending read answers it, or is told the list is
-/// left out (any pending read is not `complete`). A restricted reader of the same data, whose
-/// pending read always scans its own view, shows what the scan sees. The store is filled with
+/// left out (any pending read is not `complete`). A restricted reader of the same data by
+/// support sees no inferred statement under compact equality and is told `not-certified`,
+/// no regime, no reason; the scan of its own pending view is checked in the crate's own test
+/// (`certificate_lifecycle_tests::a_readers_pending_view_scans_a_key_through_an_alias_of_has_key`).
+/// The store is filled with
 /// reasoning off and then closed under `owl2-rl`, as a store is whose user IRIs were interned
 /// before the rules' first compile (one filled with reasoning off, or preloaded): written
 /// through the `owl2-rl` pipeline first, `owl:hasKey` would be the older id and `:hk` the
@@ -2066,9 +2083,10 @@ fn a_pending_equality_change_that_leaves_out_a_list_is_not_complete() {
 #[test]
 fn a_pending_fact_through_an_alias_of_has_key_leaves_out_a_list_under_compact_equality() {
     let (answer, status, scanned) = alias_of_has_key(true);
-    assert!(
-        scanned.as_ref().is_some_and(list_left_out),
-        "the scan doesn't see the key: {scanned:?}"
+    assert_eq!(
+        scanned.map(|s| s.header()).as_deref(),
+        Some("not-certified"),
+        "the restricted reader"
     );
     if !answer.contains("true") {
         assert!(status.as_ref().is_some_and(list_left_out), "{status:?}");
@@ -2260,10 +2278,14 @@ fn list_left_out(status: &nrese_sparql::Completeness) -> bool {
     !status.complete && (status.reasons.iter()).any(|r| r.text.contains("list axiom"))
 }
 
-/// [`a_restricted_read_leaves_an_aliased_keys_mark`]'s store: the aliased key of 7 properties,
-/// its `owl:sameAs` facts in `:secret`, then the later commit that leaves it out.
-fn aliased_key_with_hidden_aliases() -> MutationPipeline {
-    let pipeline = ql_pipeline(in_memory_store_config());
+/// [`a_restricted_read_leaves_an_aliased_keys_mark`]'s store, equality by
+/// `representatives` or by replication: the aliased key of 7 properties, its `owl:sameAs`
+/// facts in `:secret`, then the later commit that grounds its list again.
+fn aliased_key_with_hidden_aliases(representatives: bool) -> MutationPipeline {
+    let pipeline = ql_pipeline(nrese_store::StoreConfig {
+        equality_by_representatives: representatives,
+        ..in_memory_store_config()
+    });
     let write = |data: &str| {
         let ticket = MutationTicket::new();
         (pipeline.apply(insert(data), &nrese_store::Requester::all(), &ticket)).expect("the data");
@@ -2306,6 +2328,24 @@ fn restricted_read(store: &StoreService, ask: &str) {
         "restricted read: {ask}: {payload} with {:?}",
         answer.completeness
     );
+}
+
+/// `SELECT ?o { :x :name ?o }` by a reader of every graph: the names, sorted, and whether
+/// the answer is `complete`, printed.
+fn names_of_x(store: &StoreService) -> (Vec<String>, Option<bool>) {
+    let answer = (store.execute_query(&nrese_store::SparqlQueryRequest::all(format!(
+        "SELECT ?o WHERE {{ <{EX}x> <{EX}name> ?o }}"
+    ))))
+    .expect("answered");
+    let json: serde_json::Value = serde_json::from_slice(&answer.payload).expect("json");
+    let mut names: Vec<String> = (json["results"]["bindings"].as_array().expect("rows"))
+        .iter()
+        .map(|row| row["o"]["value"].as_str().expect("a name").to_owned())
+        .collect();
+    names.sort();
+    let complete = answer.completeness.map(|c| c.complete);
+    println!(":x's names: {names:?}, complete: {complete:?}");
+    (names, complete)
 }
 
 /// `owl2-rl` with the QL rewriting on, over a store of `config`.

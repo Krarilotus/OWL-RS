@@ -46,11 +46,10 @@ pub trait Terms {
         None
     }
 
-    /// The text of an IRI, if the source gives it (datatypes and facets beyond those the
-    /// vocabulary knows).
-    fn iri_text(&self, _term: Term) -> Option<String> {
-        None
-    }
+    /// The text of an IRI, `None` for any other term: datatypes and facets beyond those the
+    /// vocabulary knows, and the reserved vocabulary's names, which the reader tells by it.
+    /// Required, with no default: a source that gave none would pass every reserved name.
+    fn iri_text(&self, term: Term) -> Option<String>;
 }
 
 /// A statement of the source: a triple and its graph.
@@ -86,6 +85,9 @@ pub struct Ontology {
     /// among [`Self::annotations`]: OWL 2 DL gives these axioms no meaning, while the OWL 2
     /// RL rules over the triples (prp-dom, prp-rng, prp-spo1) read them. Sorted, each once.
     pub annotation_schema: Vec<Term>,
+    /// The properties of the SHACL vocabulary ([`shacl_properties`]) whose statements were read
+    /// as SHACL content, which has no OWL meaning (read past as an annotation is).
+    pub shacl: BTreeSet<Term>,
     /// The source's ids of the properties with a fixed meaning.
     pub builtin: BuiltinProperties,
     /// The literals, datatypes and facets of the data axioms, as the source gives them.
@@ -109,6 +111,11 @@ pub struct Ontology {
     /// `rdfs:Literal` too), which OWL 2 RL's rules don't read: its range can't tell it from
     /// an unqualified maximum.
     pub qualified_data_max: Option<Term>,
+    /// The first statement OWL 2 RL's rules don't read, by its subject, that the reader read
+    /// as axioms they would read: a disjoint union whose operands read as one (no rule reads
+    /// `owl:disjointUnionOf`), read as an equivalence and an empty operand. Every later
+    /// rewrite of that kind sets it too.
+    pub rules_unread: Option<Term>,
 }
 
 /// The properties OWL 2 gives a fixed meaning, by their ids in the source (`None` where
@@ -172,9 +179,16 @@ impl Ontology {
 
 /// Reads the ontology of `statements` (any graphs, the union of them).
 pub fn read(statements: &[Statement], terms: &dyn Terms) -> Ontology {
+    read_beside(statements, &[], terms)
+}
+
+/// [`read`], its SHACL rule ([`Ontology::shacl`]) over `beside` and `statements` as one source:
+/// a conclusion's read beside its premise's statements, which are read for nothing else.
+pub fn read_beside(statements: &[Statement], beside: &[Statement], terms: &dyn Terms) -> Ontology {
     let vocabulary = Vocabulary::new(&|iri| terms.iri(iri));
     let mut reader = Reader::new(statements, terms, vocabulary);
     reader.declarations();
+    reader.shacl(beside);
     reader.axioms();
     reader.finish()
 }
@@ -375,10 +389,26 @@ fn data_terms(o: &Ontology, terms: &dyn Terms) -> DataTerms {
     out
 }
 
+/// The facets of the OWL 2 datatype map (*Structural Specification* §4): what a facet
+/// restriction's one statement may say.
+pub const FACETS: [&str; 9] = [
+    "http://www.w3.org/2001/XMLSchema#minInclusive",
+    "http://www.w3.org/2001/XMLSchema#maxInclusive",
+    "http://www.w3.org/2001/XMLSchema#minExclusive",
+    "http://www.w3.org/2001/XMLSchema#maxExclusive",
+    "http://www.w3.org/2001/XMLSchema#length",
+    "http://www.w3.org/2001/XMLSchema#minLength",
+    "http://www.w3.org/2001/XMLSchema#maxLength",
+    "http://www.w3.org/2001/XMLSchema#pattern",
+    "http://www.w3.org/1999/02/22-rdf-syntax-ns#langRange",
+];
+
 struct Reader<'a> {
     v: Vocabulary,
     /// [`DECLARATION_KINDS`] by the source's ids.
     declaration_kinds: [(Option<Term>, EntityKind); 9],
+    /// [`FACETS`] by the source's ids.
+    facets: [Option<Term>; 9],
     /// [`BUILTIN_ANNOTATIONS`] and `owl:versionIRI` by the source's ids, looked up once per
     /// read: [`Self::is_builtin_annotation`] meets them on every assertion.
     builtin_annotations: ([Option<Term>; 9], Option<Term>),
@@ -405,11 +435,13 @@ struct Reader<'a> {
     ranges: Interner<DataRange>,
     axioms: BTreeMap<Axiom, Vec<Source>>,
     diagnostics: Vec<Diagnostic>,
-    reported: HashSet<(Term, &'static str)>,
+    reported: HashSet<([Term; 3], &'static str)>,
     annotations: usize,
     noncanonical_cardinality: Option<Term>,
     empty_list: Option<Term>,
+    rules_unread: Option<Term>,
     annotation_schema: Vec<Term>,
+    shacl: BTreeSet<Term>,
 }
 
 /// The classes whose instances are declared entities, by IRI: OWL 2's, and the RDFS and
@@ -458,6 +490,57 @@ pub const BUILTIN_ANNOTATIONS: [&str; 9] = [
     "http://www.w3.org/2002/07/owl#incompatibleWith",
 ];
 
+/// SHACL's namespace.
+const SHACL: &str = "http://www.w3.org/ns/shacl#";
+
+/// The properties of the SHACL vocabulary, by local name in [`SHACL`]'s namespace: a statement
+/// of one is SHACL content, with no OWL meaning ([`Ontology::shacl`]). From W3C, *Shapes
+/// Constraint Language (SHACL)*, 2017: §2 (targets, severity, messages, deactivation, property
+/// shapes and their paths, the non-validating characteristics), §1.5 and §3 (shapes graphs,
+/// entailment, the validation report), §4 (the core constraint components' parameters), §5 and
+/// §6 (SPARQL-based constraints and constraint components). A term of the namespace not listed
+/// is read as any other term, by its use: conservative, as it keeps the kind OWL 2 gives it.
+#[rustfmt::skip]
+const SHACL_PROPERTIES: [&str; 78] = [
+    // §2
+    "targetNode", "targetClass", "targetSubjectsOf", "targetObjectsOf",
+    "property", "path", "severity", "message", "deactivated",
+    "inversePath", "alternativePath", "zeroOrMorePath", "oneOrMorePath", "zeroOrOnePath",
+    "name", "description", "order", "group", "defaultValue",
+    // §1.5 and §3
+    "shapesGraph", "suggestedShapesGraph", "entailment",
+    "conforms", "result", "focusNode", "resultPath", "value", "sourceShape",
+    "sourceConstraintComponent", "sourceConstraint", "detail", "resultMessage", "resultSeverity",
+    // §4
+    "class", "datatype", "nodeKind", "minCount", "maxCount",
+    "minExclusive", "minInclusive", "maxExclusive", "maxInclusive",
+    "minLength", "maxLength", "pattern", "flags", "languageIn", "uniqueLang",
+    "equals", "disjoint", "lessThan", "lessThanOrEquals",
+    "not", "and", "or", "xone", "node",
+    "qualifiedValueShape", "qualifiedMinCount", "qualifiedMaxCount", "qualifiedValueShapesDisjoint",
+    "closed", "ignoredProperties", "hasValue", "in",
+    // §5 and §6
+    "sparql", "select", "ask", "prefixes", "declare", "prefix", "namespace",
+    "parameter", "optional", "labelTemplate", "validator", "nodeValidator", "propertyValidator",
+];
+
+/// [`SHACL_PROPERTIES`]' IRIs.
+pub fn shacl_properties() -> impl Iterator<Item = String> {
+    SHACL_PROPERTIES.iter().map(|name| format!("{SHACL}{name}"))
+}
+
+/// Whether `iri` is one of [`shacl_properties`].
+pub fn is_shacl_property(iri: &str) -> bool {
+    iri.strip_prefix(SHACL)
+        .is_some_and(|name| SHACL_PROPERTIES.contains(&name))
+}
+
+/// Whether `iri` may name an annotation property (Structural Specification §5.5): of the
+/// reserved vocabulary only the nine built-in ones, [`BUILTIN_ANNOTATIONS`].
+pub fn may_name_annotation(iri: &str) -> bool {
+    BUILTIN_ANNOTATIONS.contains(&iri) || !crate::diagnostics::reserved_vocabulary(iri)
+}
+
 /// The annotation properties as [`read`] reads them (§5.8), for every reader of the RDF: the
 /// built-in ones, and each IRI declared one by [`DECLARATION_KINDS`] (no blank node). Holds
 /// the declarations' `rdf:type` and class, and the properties.
@@ -477,9 +560,14 @@ impl AnnotationProperties {
 
     /// Reads a statement, whose subject is an IRI where `named`.
     pub fn read(&mut self, [s, p, o]: [Term; 3], named: bool) {
-        if named && self.0.contains(&[Some(p), Some(o)]) {
+        if named && self.declares([s, p, o]) {
             self.1.insert(s);
         }
+    }
+
+    /// Whether a statement declares its subject an annotation property, in either spelling.
+    pub fn declares(&self, [_, p, o]: [Term; 3]) -> bool {
+        self.0.contains(&[Some(p), Some(o)])
     }
 
     pub fn contains(&self, term: Term) -> bool {
@@ -511,6 +599,7 @@ impl<'a> Reader<'a> {
         Self {
             v,
             declaration_kinds: DECLARATION_KINDS.map(|(iri, kind)| (terms.iri(iri), kind)),
+            facets: FACETS.map(|iri| terms.iri(iri)),
             builtin_annotations: (
                 BUILTIN_ANNOTATIONS.map(|iri| terms.iri(iri)),
                 terms.iri("http://www.w3.org/2002/07/owl#versionIRI"),
@@ -537,7 +626,9 @@ impl<'a> Reader<'a> {
             annotations: 0,
             noncanonical_cardinality: None,
             empty_list: None,
+            rules_unread: None,
             annotation_schema: Vec::new(),
+            shacl: BTreeSet::new(),
         }
     }
 
@@ -567,18 +658,111 @@ impl<'a> Reader<'a> {
         objects
     }
 
-    /// The single object of `subject`'s `predicate`, collected as structural.
+    /// The object of `subject`'s `predicate` where it has exactly one, not collected: evidence
+    /// for how to read, never a reading.
+    fn single(&self, subject: Term, predicate: Option<Term>) -> Option<Term> {
+        match self.objects(subject, predicate)[..] {
+            [object] => Some(object),
+            _ => None,
+        }
+    }
+
+    /// The single object of `subject`'s `predicate`, collected as structural; none where it
+    /// has two ([`Self::twice`]).
     fn one(&mut self, subject: Term, predicate: Option<Term>) -> Option<Term> {
         let objects = self.objects(subject, predicate);
-        let &object = objects.first()?;
         if objects.len() > 1 {
+            self.twice(subject);
+            return None;
+        }
+        let &object = objects.first()?;
+        self.collect([subject, predicate?, object]);
+        Some(object)
+    }
+
+    /// Whether `node` gives a structure property ([`Self::is_vocabulary`], `owl:inverseOf`)
+    /// two objects: then it is no structure, since which one a reading took would follow the
+    /// order the statements come in. Reported, and every statement of such a property taken.
+    fn twice(&mut self, node: Term) -> bool {
+        let pairs = self.by_subject.get(&node).cloned().unwrap_or_default();
+        let structure = |p| {
+            (self.is_vocabulary(p) || is(p, self.v.owl_inverse_of)) && !is(p, self.v.owl_imports)
+        };
+        let given_twice: Vec<[Term; 3]> = (pairs.iter())
+            .filter(|&&(p, o, _)| structure(p) && pairs.iter().any(|&(q, x, _)| q == p && x != o))
+            .map(|&(p, o, _)| [node, p, o])
+            .collect();
+        for &triple in &given_twice {
+            self.collect(triple);
+        }
+        if !given_twice.is_empty() {
             self.report(Diagnostic::Malformed {
-                node: subject,
+                node,
                 what: "a structure property given twice",
             });
         }
-        self.collect([subject, predicate?, object]);
-        Some(object)
+        !given_twice.is_empty()
+    }
+
+    /// The properties that each make a blank node one class expression or one data range
+    /// (*Mapping to RDF* Tables 12 and 13), the forms [`Self::forms`] takes for both: a node
+    /// has one form, whichever it is read as.
+    fn expression_forms(&self) -> [Option<Term>; 8] {
+        let v = self.v;
+        let ClassExpressionMarkers {
+            types: _,
+            set_operators: [intersection, union, complement, one_of],
+            on_properties,
+            on_property,
+        } = ClassExpressionMarkers::of(&v);
+        // A data range's `owl:intersectionOf`, `owl:unionOf` and `owl:oneOf` are a class
+        // expression's too.
+        [
+            intersection,
+            union,
+            complement,
+            one_of,
+            on_properties,
+            on_property,
+            v.owl_datatype_complement_of,
+            v.owl_on_datatype,
+        ]
+    }
+
+    /// Whether the blank node `node` gives more than one of `forms`, the properties that each
+    /// make it one structure (*Mapping to RDF* Tables 12 and 13: a node has one form): then it
+    /// is no structure, as with a structure property given twice ([`Self::twice`]). Reported,
+    /// and every statement of those properties taken.
+    fn forms(&mut self, node: Term, forms: &[Option<Term>]) -> bool {
+        let given: Vec<Term> = (forms.iter().flatten().copied())
+            .filter(|&p| !self.objects(node, Some(p)).is_empty())
+            .collect();
+        if given.len() < 2 {
+            return false;
+        }
+        for p in given {
+            for o in self.objects(node, Some(p)) {
+                self.collect([node, p, o]);
+            }
+        }
+        self.report(Diagnostic::Malformed {
+            node,
+            what: "a node with more than one form",
+        });
+        true
+    }
+
+    /// `term` as an individual (*Mapping to RDF* Tables 13 and 16: `*:x` or `_:x`); a literal
+    /// there is malformed. Every place an individual is read takes it here.
+    fn individual(&mut self, term: Term) -> Option<Term> {
+        if self.kind(term) == TermKind::Literal {
+            self.report(Diagnostic::Malformed {
+                node: term,
+                what: "a literal where an individual belongs",
+            });
+            return None;
+        }
+        Some(term)
     }
 
     fn has_type(&self, subject: Term, class: Option<Term>) -> bool {
@@ -614,6 +798,11 @@ impl<'a> Reader<'a> {
         for statement in statements {
             let [s, p, o] = statement.triple;
             if !is(p, v.rdf_type) || self.kind(s) != TermKind::Iri {
+                continue;
+            }
+            // Either spelling of an annotation property's declaration (Table 6).
+            let annotation = kinds.contains(&(Some(o), EntityKind::AnnotationProperty));
+            if annotation && self.reserved_annotation(s) {
                 continue;
             }
             self.annotation_properties.read(statement.triple, true);
@@ -656,6 +845,40 @@ impl<'a> Reader<'a> {
         }
     }
 
+    /// The terms of the SHACL content ([`Ontology::shacl`]): none where a statement that is
+    /// neither SHACL content nor an annotation names one, which gives it an OWL meaning, so
+    /// the source reads as any other. The rule is over `beside` and the source as one: the
+    /// properties either uses as content, and either's annotation declarations (of an IRI, as
+    /// [`Self::declarations`] reads them).
+    fn shacl(&mut self, beside: &[Statement]) {
+        let (terms, statements) = (self.terms, self.statements);
+        let vocabulary: HashSet<Term> = shacl_properties().filter_map(|i| terms.iri(&i)).collect();
+        let content = |[_, p, _]: [Term; 3]| vocabulary.contains(&p).then_some(p);
+        let all = || statements.iter().chain(beside);
+        let found: BTreeSet<Term> = all().filter_map(|s| content(s.triple)).collect();
+        let mut declared = AnnotationProperties::new(&mut |i| terms.iri(i));
+        for s in beside {
+            let [subject, ..] = s.triple;
+            let declares = self.kind(subject) == TermKind::Iri && declared.declares(s.triple);
+            declared.read(s.triple, declares && !self.reserved_annotation(subject));
+        }
+        let named = !found.is_empty()
+            && all().any(|s| {
+                let [subject, p, o] = s.triple;
+                content(s.triple).is_none()
+                    && !self.declared_as(p, EntityKind::AnnotationProperty)
+                    && !declared.contains(p)
+                    && !self.is_builtin_annotation(p)
+                    && (found.contains(&subject) || found.contains(&o))
+            });
+        if !named {
+            self.shacl = statements
+                .iter()
+                .filter_map(|s| content(s.triple))
+                .collect();
+        }
+    }
+
     /// Whether `property` is a data property: declared so, or undeclared and used with
     /// literals.
     fn is_data_property(&mut self, property: Term) -> bool {
@@ -684,6 +907,9 @@ impl<'a> Reader<'a> {
             }
             if self.kind(cell) != TermKind::Blank || !seen.insert(cell) {
                 self.report(Diagnostic::BrokenList { head });
+                return None;
+            }
+            if self.twice(cell) {
                 return None;
             }
             let (Some(first), Some(rest)) =
@@ -720,6 +946,9 @@ impl<'a> Reader<'a> {
         match self.kind(term) {
             TermKind::Iri => Some(ObjProp::Named(term)),
             TermKind::Blank => {
+                if self.twice(term) {
+                    return None;
+                }
                 let Some(inverse) = self.one(term, self.v.owl_inverse_of) else {
                     self.report(Diagnostic::Malformed {
                         node: term,
@@ -803,6 +1032,9 @@ impl<'a> Reader<'a> {
                 self.collect([node, v.rdf_type?, class_type?]);
             }
         }
+        if self.twice(node) || self.forms(node, &self.expression_forms()) {
+            return None;
+        }
         for operator in set_operators {
             if let Some(operand) = self.one(node, operator) {
                 return self.set_operator(operator?, operand);
@@ -835,7 +1067,10 @@ impl<'a> Reader<'a> {
         }
         let members = self.list(operand)?;
         if is(operator, v.owl_one_of) {
-            return Some(self.intern_class(ClassExpr::OneOf(canonical(members))));
+            let individuals = (members.iter())
+                .map(|&m| self.individual(m))
+                .collect::<Option<Vec<_>>>()?;
+            return Some(self.intern_class(ClassExpr::OneOf(canonical(individuals))));
         }
         let operands = canonical(self.classes(&members)?);
         let union = is(operator, v.owl_union_of);
@@ -860,7 +1095,7 @@ impl<'a> Reader<'a> {
     /// no literal use does (a schema read alone): its value a literal, or its filler a data
     /// range ([`Self::is_data_range`]).
     fn says_data(&mut self, node: Term) -> bool {
-        let first = |reader: &Self, p| reader.objects(node, p).first().copied();
+        let first = |reader: &Self, p| reader.single(node, p);
         if let Some(value) = first(self, self.v.owl_has_value) {
             return self.kind(value) == TermKind::Literal;
         }
@@ -887,7 +1122,7 @@ impl<'a> Reader<'a> {
                         .any(|&iri| self.terms.iri(iri) == Some(term))
             }
             TermKind::Blank => {
-                let first = |reader: &Self, p| reader.objects(term, p).first().copied();
+                let first = |reader: &Self, p| reader.single(term, p);
                 if self.has_type(term, v.rdfs_datatype)
                     || self.has_type(term, v.owl_data_range)
                     || first(self, v.owl_on_datatype).is_some()
@@ -921,6 +1156,21 @@ impl<'a> Reader<'a> {
     /// A restriction on `property`.
     fn restriction(&mut self, node: Term, property: Term) -> Option<ExprId> {
         let v = self.v;
+        let fillers = [
+            v.owl_some_values_from,
+            v.owl_all_values_from,
+            v.owl_has_value,
+            v.owl_has_self,
+            v.owl_min_cardinality,
+            v.owl_min_qualified,
+            v.owl_max_cardinality,
+            v.owl_max_qualified,
+            v.owl_cardinality,
+            v.owl_qualified,
+        ];
+        if self.forms(node, &fillers) {
+            return None;
+        }
         let data = self.kind(property) == TermKind::Iri
             && (self.is_data_property(property)
                 || (!self.declared_as(property, EntityKind::ObjectProperty)
@@ -1002,6 +1252,7 @@ impl<'a> Reader<'a> {
                 return Some(self.intern_class(ClassExpr::All(property, class)));
             }
             if let Some(value) = self.one(node, v.owl_has_value) {
+                let value = self.individual(value)?;
                 return Some(self.intern_class(ClassExpr::HasValue(property, value)));
             }
             if let Some(flag) = self.one(node, v.owl_has_self) {
@@ -1085,6 +1336,9 @@ impl<'a> Reader<'a> {
                 self.collect([node, v.rdf_type?, range_type?]);
             }
         }
+        if self.twice(node) || self.forms(node, &self.expression_forms()) {
+            return None;
+        }
         let ranges = |reader: &mut Self, list: Term| -> Option<Vec<RangeId>> {
             let members = reader.list(list)?;
             members.iter().map(|&m| reader.range(m)).collect()
@@ -1109,6 +1363,14 @@ impl<'a> Reader<'a> {
             let list = self.one(node, v.owl_with_restrictions)?;
             let mut facets = Vec::new();
             for restriction in self.list(list)? {
+                // Blank (Mapping to RDF, Table 12): a named node's statements are its own.
+                if self.kind(restriction) != TermKind::Blank {
+                    self.report(Diagnostic::Malformed {
+                        node: restriction,
+                        what: "a facet restriction not on a blank node",
+                    });
+                    return None;
+                }
                 let mut pairs = self
                     .by_subject
                     .get(&restriction)
@@ -1124,6 +1386,13 @@ impl<'a> Reader<'a> {
                     });
                     return None;
                 };
+                if !self.facets.contains(&Some(facet)) {
+                    self.report(Diagnostic::Malformed {
+                        node: restriction,
+                        what: "a facet restriction without a facet",
+                    });
+                    return None;
+                }
                 self.collect([restriction, facet, value]);
                 facets.push((facet, value));
             }
@@ -1138,15 +1407,20 @@ impl<'a> Reader<'a> {
 
     // Axioms ---------------------------------------------------------------------------
 
-    /// A disjointness's axioms (`Disjoint::axioms`): a repeated operand reported.
-    fn disjoint(&mut self, d: Disjoint, triple: [Term; 3]) {
+    /// A disjointness's axioms (`Disjoint::axioms`): a repeated operand reported. Whether
+    /// one was.
+    fn disjoint(&mut self, d: Disjoint, triple: [Term; 3]) -> bool {
         let (axioms, repeated) = d.axioms(&mut self.classes, &mut self.ranges);
         if repeated {
             self.report(Diagnostic::RepeatedOperand);
         }
+        // Each axiom comes from the whole form: each gets its list's statements.
+        let collected = std::mem::take(&mut self.collected);
         for a in axioms {
+            self.collected.clone_from(&collected);
             self.add(a, triple);
         }
+        repeated
     }
 
     fn add(&mut self, axiom: Axiom, triple: [Term; 3]) {
@@ -1173,10 +1447,12 @@ impl<'a> Reader<'a> {
                 self.nary(s, o, statement.triple);
             }
         }
-        // Then: statements on IRIs; axioms on blank nodes (a complex left-hand side);
-        // the rest on blank nodes (anonymous individuals), once every structure has
+        // Then: statements on IRIs; axioms on blank nodes (a complex left-hand side); the
+        // blank nodes' other statements that read a structure (an anonymous individual's
+        // typing, a disjoint union); the rest on blank nodes, once every structure has
         // taken its statements.
         let v = self.v;
+        let reads_structure = [v.rdf_type, v.owl_disjoint_union_of];
         let axiom_predicates = [
             v.rdfs_sub_class_of,
             v.owl_equivalent_class,
@@ -1189,15 +1465,17 @@ impl<'a> Reader<'a> {
             v.rdfs_range,
             v.owl_has_key,
         ];
-        for pass in 0..3 {
+        for pass in 0..4 {
             for statement in statements {
                 let triple = statement.triple;
                 let blank = self.kind(triple[0]) == TermKind::Blank;
                 let axiom = axiom_predicates.contains(&Some(triple[1]));
+                let reads = reads_structure.contains(&Some(triple[1]));
                 let now = match pass {
                     0 => !blank,
                     1 => blank && axiom,
-                    _ => blank && !axiom,
+                    2 => blank && reads,
+                    _ => blank && !axiom && !reads,
                 };
                 if !now || self.structural.contains(&triple) {
                     continue;
@@ -1226,6 +1504,15 @@ impl<'a> Reader<'a> {
         let v = self.v;
         self.collected.clear();
         let without = |what| Diagnostic::Malformed { node, what };
+        let forms = [
+            v.owl_all_disjoint_classes,
+            v.owl_all_disjoint_properties,
+            v.owl_all_different,
+            v.owl_negative_property_assertion,
+        ];
+        if forms.contains(&Some(class)) && self.twice(node) {
+            return self.collect(triple);
+        }
         if is(class, v.owl_all_disjoint_classes) {
             self.collect(triple);
             let Some(list) = self.one(node, v.owl_members) else {
@@ -1262,8 +1549,12 @@ impl<'a> Reader<'a> {
             let Some(list) = list else {
                 return self.report(without("an n-ary axiom without its members"));
             };
-            if let Some(members) = self.list(list) {
-                self.disjoint(Disjoint::Individuals(members), triple);
+            if let Some(members) = self.list(list)
+                && let Some(individuals) = (members.iter())
+                    .map(|&m| self.individual(m))
+                    .collect::<Option<Vec<_>>>()
+            {
+                self.disjoint(Disjoint::Individuals(individuals), triple);
             }
         } else if is(class, v.owl_negative_property_assertion) {
             self.collect(triple);
@@ -1277,12 +1568,18 @@ impl<'a> Reader<'a> {
                 });
                 return;
             };
+            let Some(source) = self.individual(source) else {
+                return;
+            };
             if let Some(value) = self.one(node, v.owl_target_value) {
                 self.add(
                     Axiom::NegativeDataPropertyAssertion(property, source, value),
                     triple,
                 );
             } else if let Some(target) = self.one(node, v.owl_target_individual) {
+                let Some(target) = self.individual(target) else {
+                    return;
+                };
                 let axiom = match self.object_property(property) {
                     Some(ObjProp::Named(p)) => {
                         Axiom::NegativeObjectPropertyAssertion(p, source, target)
@@ -1297,8 +1594,25 @@ impl<'a> Reader<'a> {
                 self.report(without("a negative property assertion without its target"));
             }
         } else if is(class, v.owl_axiom) || is(class, v.owl_annotation) {
-            // An annotated axiom's reification (the axiom itself is stated as well), or an
-            // annotation's annotation: no logical meaning.
+            // An annotated axiom's reification, or an annotation's annotation: no logical
+            // meaning. It annotates its main triple, which the graph states (Table 17); one
+            // whose main triple is absent annotates nothing.
+            let main = [
+                self.single(node, v.owl_annotated_source),
+                self.single(node, v.owl_annotated_property),
+                self.single(node, v.owl_annotated_target),
+            ];
+            let stated = match main {
+                [Some(s), Some(p), Some(o)] => (self.by_subject.get(&s))
+                    .is_some_and(|pairs| pairs.iter().any(|&(q, x, _)| q == p && x == o)),
+                _ => false,
+            };
+            if !stated {
+                self.report(Diagnostic::Malformed {
+                    node,
+                    what: "a reified axiom or annotation whose main triple is absent",
+                });
+            }
             for (p, o, _) in self.by_subject.get(&node).cloned().unwrap_or_default() {
                 self.structural.insert([node, p, o]);
                 self.annotations += 1;
@@ -1329,10 +1643,33 @@ impl<'a> Reader<'a> {
                 self.disjoint(Disjoint::Classes(vec![a, b]), triple);
             }
         } else if is(p, v.owl_disjoint_union_of) {
+            // The subject is a class (Table 16, `CE(*:x)`): an IRI, `owl:Thing` and
+            // `owl:Nothing` read as such; a blank node, a class expression or not, is none.
+            let class = if self.kind(s) == TermKind::Iri {
+                self.class(s)
+            } else {
+                self.report(Diagnostic::Malformed {
+                    node: s,
+                    what: "a disjoint union of no named class",
+                });
+                None
+            };
             if let Some(members) = self.list(o)
                 && let Some(classes) = self.classes(&members)
+                && let Some(class) = class
             {
-                self.add(Axiom::DisjointUnion(s, canonical(classes)), triple);
+                // Two members at least (Table 16, `n ≥ 2`): of none the class would be read
+                // empty, of one equal to it.
+                if members.len() < 2 {
+                    self.report(Diagnostic::Malformed {
+                        node: s,
+                        what: "a disjoint union of fewer than two classes",
+                    });
+                } else if self.disjoint(Disjoint::Union(class, classes), triple) {
+                    // A repeat, or one distinct operand left: read as axioms the rules would
+                    // read ([`Ontology::rules_unread`]).
+                    self.rules_unread.get_or_insert(s);
+                }
             }
         } else if is(p, v.rdfs_sub_property_of) {
             let subject = self.annotation_property(s);
@@ -1429,6 +1766,12 @@ impl<'a> Reader<'a> {
                         datas.push(member);
                     } else if let Some(property) = self.object_property(member) {
                         objects.push(property);
+                    } else {
+                        // On its other members it would be a stronger key than stated.
+                        return self.report(Diagnostic::Malformed {
+                            node: s,
+                            what: "a key with a member that can't be read",
+                        });
                     }
                 }
                 self.add(
@@ -1437,9 +1780,13 @@ impl<'a> Reader<'a> {
                 );
             }
         } else if is(p, v.owl_same_as) {
-            self.add(Axiom::SameIndividual(canonical(vec![s, o])), triple);
+            if let Some(o) = self.individual(o) {
+                self.add(Axiom::SameIndividual(canonical(vec![s, o])), triple);
+            }
         } else if is(p, v.owl_different_from) {
-            self.disjoint(Disjoint::Individuals(vec![s, o]), triple);
+            if let Some(o) = self.individual(o) {
+                self.disjoint(Disjoint::Individuals(vec![s, o]), triple);
+            }
         } else if self.kind(s) == TermKind::Iri
             && [
                 v.owl_intersection_of,
@@ -1468,11 +1815,19 @@ impl<'a> Reader<'a> {
             }
         } else if self.declared_as(p, EntityKind::AnnotationProperty)
             || self.is_builtin_annotation(p)
+            || self.shacl.contains(&p)
             || self.has_type(s, v.owl_ontology)
         {
-            // An annotation, or a statement about the ontology: its header's annotations
-            // (an anonymous ontology's too: its node is a blank node).
+            // An annotation, SHACL content, or a statement about the ontology: its header's
+            // annotations (an anonymous ontology's too: its node is a blank node).
             self.annotations += 1;
+        } else if self.kind(o) == TermKind::Literal
+            && self.declared_as(p, EntityKind::ObjectProperty)
+            && !self.declared_as(p, EntityKind::DataProperty)
+        {
+            // An object property's assertion (Table 16, `*:x` or `_:x`): a literal there is
+            // malformed. A property declared both ways is read as a data property, as before.
+            self.individual(o);
         } else if self.kind(o) == TermKind::Literal || self.is_data_property(p) {
             self.add(Axiom::DataPropertyAssertion(p, s, o), triple);
         } else {
@@ -1484,7 +1839,7 @@ impl<'a> Reader<'a> {
     fn typing(&mut self, s: Term, o: Term, triple: [Term; 3]) {
         let v = self.v;
         if let Some(&(_, kind)) = self.declaration_kinds.iter().find(|(c, _)| is(o, *c)) {
-            if self.kind(s) == TermKind::Iri {
+            if self.declared_as(s, kind) {
                 self.add(Axiom::Declaration(kind, s), triple);
             }
             return;
@@ -1587,6 +1942,15 @@ impl<'a> Reader<'a> {
         self.annotation_properties.contains(term)
     }
 
+    /// Whether `term` is of the reserved vocabulary (`rdf:`, `rdfs:`, `xsd:`, `owl:`) and not
+    /// one of the nine annotation properties OWL 2 builds in: no declaration makes it one
+    /// (§5.5), `rdf:type`, `owl:sameAs`, `owl:Thing` and the top and bottom properties alike.
+    fn reserved_annotation(&self, term: Term) -> bool {
+        self.terms
+            .iri_text(term)
+            .is_some_and(|i| !may_name_annotation(&i))
+    }
+
     /// `rdfs:label` and the other annotation properties OWL 2 builds in.
     fn is_builtin_annotation(&self, predicate: Term) -> bool {
         let (builtin, version_iri) = &self.builtin_annotations;
@@ -1610,6 +1974,7 @@ impl<'a> Reader<'a> {
             diagnostics: self.diagnostics,
             annotations: self.annotations,
             annotation_schema: self.annotation_schema,
+            shacl: self.shacl,
             builtin: BuiltinProperties::of(&self.v),
             data: DataTerms::default(),
             anonymous: BTreeSet::new(),
@@ -1617,6 +1982,7 @@ impl<'a> Reader<'a> {
             noncanonical_cardinality: self.noncanonical_cardinality,
             empty_list: self.empty_list,
             qualified_data_max: self.qualified_data_max,
+            rules_unread: self.rules_unread,
         };
         complete(&mut ontology, self.terms);
         ontology

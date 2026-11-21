@@ -52,7 +52,7 @@ use super::eval::{
 };
 use super::ir::Triple;
 use super::ir::{Head, Rule};
-use super::lists::{ListVocabulary, instantiate};
+use super::lists::{ListDiagnostic, ListVocabulary, instantiate};
 use super::violations::{Violations, unlimited};
 
 /// The materialised state: asserted facts after the change, and inferred facts before it.
@@ -211,12 +211,12 @@ pub struct Rules<'a> {
 impl Rules<'_> {
     /// The ground program over `source`; its bodiless facts count as handed out. List
     /// rules carry the list facts they come from as premises.
-    fn program<S: Source + ?Sized>(&self, source: &S) -> GroundProgram {
+    fn program<B: Base + ?Sized>(&self, source: &Overlay<'_, B>) -> GroundProgram {
         let mut program = GroundProgram::default();
         program.ground(source, self.schema, self.rules);
-        if let Some(vocabulary) = self.lists {
-            let (rules, premises, diagnostics) =
-                super::lists::instantiate_with_premises(vocabulary, &AllFacts(source));
+        // The overlays a program is ground over hold in `extra` only the facts a change
+        // deleted (the state before it), never inferred ones.
+        if let Some((rules, premises, diagnostics)) = self.read_lists(source, Some(source.extra)) {
             program.ground_with_premises(source, self.schema, &rules, &premises);
             program.list_diagnostics = diagnostics;
         }
@@ -224,11 +224,38 @@ impl Rules<'_> {
         program
     }
 
-    /// The list rules (both kinds) instantiated over `source`.
+    /// The list rules (both kinds) instantiated over `source`. Overdeletion compares the
+    /// inference rules alone: the closure's reading, which a reading as written adds nothing
+    /// to ([`Self::read_lists`]).
     fn list_rules<S: Source + ?Sized>(&self, source: &S) -> Vec<Rule> {
+        #[cfg(test)]
+        crate::witness::add(crate::witness::Site::ListRules, 1);
         self.lists
             .map(|vocabulary| instantiate(vocabulary, &AllFacts(source)).0)
             .unwrap_or_default()
+    }
+
+    /// The list rules over `source`, with the list facts each comes from, and the lists left
+    /// out ([`super::lists::instantiate_written`]). A list past the cap over `source` is read
+    /// as written as well: over the asserted facts of `source.base` that `source` doesn't
+    /// hide, and `deleted`, asserted before a change where `source` is the state before it.
+    /// Every grounding of list rules reads them here, so all read them alike.
+    fn read_lists<B: Base + ?Sized>(
+        &self,
+        source: &Overlay<'_, B>,
+        deleted: Option<&Store>,
+    ) -> Option<ListRules> {
+        let written = Written {
+            base: source.base,
+            hidden: source.hidden,
+            deleted,
+        };
+        let vocabulary = self.lists?;
+        Some(super::lists::instantiate_written(
+            vocabulary,
+            &AllFacts(source),
+            Some(&written),
+        ))
     }
 
     fn is_list_fact(&self, fact: Triple) -> bool {
@@ -263,6 +290,11 @@ pub struct Update {
     /// List axioms the change left uninstantiable (malformed, cyclic, oversized) that
     /// weren't before.
     pub diagnostics: Vec<super::lists::ListDiagnostic>,
+    /// Whether the change reads an axiom's list otherwise: one left out after it that was
+    /// read before, read after it that was left out before, or left out for another reason
+    /// ([`super::lists::ListProblem::kind`]). The rules such a list gives, or gave, aren't
+    /// the ones the program before held, so the delta can't follow them.
+    pub lists_read_otherwise: bool,
     pub rounds: usize,
     /// Time per phase: program, overdelete, rederive, insert, consistency.
     pub phases: [std::time::Duration; 5],
@@ -280,6 +312,7 @@ impl std::fmt::Debug for Update {
             .field("remove", &self.remove.len())
             .field("violations", &self.violations)
             .field("diagnostics", &self.diagnostics)
+            .field("lists_read_otherwise", &self.lists_read_otherwise)
             .field("rounds", &self.rounds)
             .field("phases", &self.phases)
             .field("program_changed", &self.program.is_some())
@@ -298,6 +331,48 @@ struct Overlay<'a, B: Base + ?Sized> {
 impl<B: Base + ?Sized> Overlay<'_, B> {
     fn in_base(&self, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
         Ok(!self.hidden.contains(&fact) && !self.extra.contains(fact, poll)?)
+    }
+}
+
+/// List rules, the list facts each comes from, and the lists left out.
+type ListRules = (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>);
+
+/// The asserted facts of a state over `base`, for list instantiation, which is grounding: run
+/// to its end. The base's asserted facts (after the change) it doesn't hide, and `deleted`.
+struct Written<'a, B: Base + ?Sized> {
+    base: &'a B,
+    hidden: &'a HashSet<Triple>,
+    deleted: Option<&'a Store>,
+}
+
+impl<B: Base + ?Sized> Written<'_, B> {
+    fn matching(&self, pattern: [Option<u64>; 3]) -> Vec<Triple> {
+        let poll = Poller::never();
+        let mut out = Vec::new();
+        if let Some(deleted) = self.deleted {
+            (deleted.scan(pattern, Seg::All, &poll, &mut |t| out.push(t))).expect("never stopped");
+        }
+        let scanned = self.base.scan_asserted(pattern, &poll, &mut |t| {
+            if !self.hidden.contains(&t) {
+                out.push(t);
+            }
+        });
+        scanned.expect("never stopped");
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+}
+
+impl<B: Base + ?Sized> super::lists::Facts for Written<'_, B> {
+    fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
+        let found = self.matching([Some(subject), Some(predicate), None]);
+        found.into_iter().map(|t| t[2]).collect()
+    }
+
+    fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
+        let found = self.matching([None, Some(predicate), None]);
+        found.into_iter().map(|t| (t[0], t[2])).collect()
     }
 }
 
@@ -574,8 +649,11 @@ fn update_body<B: Base + ?Sized>(
     // that derivation (its premises are below it: if one goes later in the commit, its
     // loss brings the candidate back), without a proof search. Bodiless instances aren't
     // among them: their schema facts may come from the candidate (scm-eqc1 and scm-eqc2
-    // derive each other's).
-    let non_recursive = {
+    // derive each other's). Its size follows the schema, so it is built when a candidate
+    // first asks for it: a commit that deletes nothing never does. It reads the state
+    // before the commit, which nothing in the update changes.
+    let mut non_recursive: Option<Vec<bool>> = None;
+    let build_non_recursive = || {
         let before = Overlay {
             base,
             hidden: &inserted_set,
@@ -588,7 +666,7 @@ fn update_body<B: Base + ?Sized>(
         super::recursion::non_recursive(ground, equality, schema.rdf_type(), same_as, &|term| {
             super::recursion::same_as_partners(&before, same_as, term, &stage)
         })
-        .map_err(stopped)?
+        .map_err(stopped)
     };
 
     lap(0, &mut result);
@@ -615,27 +693,16 @@ fn update_body<B: Base + ?Sized>(
             backward = false;
         }
         overdeleted.extend(region_facts.iter().copied());
-        let mut seed = deleted.to_vec();
-        seed.extend(region_facts.iter().copied());
-        let mut extra = Store::new(seed);
-        let (fact_schema_rules, old_lists) = {
-            let old = Overlay {
-                base,
-                hidden: &inserted_set,
-                extra: &extra,
-            };
-            let lists: Vec<Rule> = rules
-                .list_rules(&old)
-                .into_iter()
-                .filter(|r| r.head != Head::Inconsistent)
-                .collect();
-            let schema_rules: Vec<Rule> = rules
-                .schema_rules()
-                .into_iter()
-                .filter(|r| r.head != Head::Inconsistent)
-                .collect();
-            (schema_rules, lists)
-        };
+        let mut extra = Store::new(deleted.iter().chain(&region_facts).copied().collect());
+        let fact_schema_rules: Vec<Rule> = rules
+            .schema_rules()
+            .into_iter()
+            .filter(|r| r.head != Head::Inconsistent)
+            .collect();
+        // The list rules of the pass's old state, read only when the delta holds a list
+        // fact: built then, over the state the pass started from (its deleted and region
+        // facts), as they follow the store's lists.
+        let mut old_lists: Option<Vec<Rule>> = None;
         let mut vanished_done: HashSet<RuleKey> = HashSet::new();
         loop {
             check_stop()?;
@@ -678,7 +745,25 @@ fn update_body<B: Base + ?Sized>(
                 };
                 let current: HashSet<RuleKey> =
                     rules.list_rules(&now).iter().map(rule_key).collect();
-                for rule in &old_lists {
+                // A stop asked during that extraction is seen before the next one.
+                check_stop()?;
+                let old_lists = old_lists.get_or_insert_with(|| {
+                    let at_start =
+                        Store::new(deleted.iter().chain(&region_facts).copied().collect());
+                    let old = Overlay {
+                        base,
+                        hidden: &inserted_set,
+                        extra: &at_start,
+                    };
+                    rules
+                        .list_rules(&old)
+                        .into_iter()
+                        .filter(|r| r.head != Head::Inconsistent)
+                        .collect()
+                });
+                // And one asked during the second before its rules are walked.
+                check_stop()?;
+                for rule in old_lists.iter() {
                     let key = rule_key(rule);
                     if current.contains(&key) || !vanished_done.insert(key) {
                         continue;
@@ -870,6 +955,10 @@ fn update_body<B: Base + ?Sized>(
                 }
             }
             if backward {
+                if !candidates.is_empty() && non_recursive.is_none() {
+                    non_recursive = Some(build_non_recursive()?);
+                }
+                let non_recursive = non_recursive.as_deref().unwrap_or_default();
                 let mut gone: HashSet<Triple> = inserted_set.clone();
                 gone.extend(overdeleted.iter().copied());
                 let left = Overlay {
@@ -885,7 +974,7 @@ fn update_body<B: Base + ?Sized>(
                     .into_par_iter()
                     .map(|f| {
                         old_program
-                            .derivable_by(&left, f, &non_recursive, false, stop)
+                            .derivable_by(&left, f, non_recursive, false, stop)
                             .map(|derivable| (!derivable).then_some(f))
                     })
                     .collect::<Result<_, Stopped>>()
@@ -1135,10 +1224,8 @@ fn update_body<B: Base + ?Sized>(
             program.to_mut().ground_delta(&state, schema, &schema_rules);
         }
         if delta_facts.iter().any(|&f| rules.is_list_fact(f))
-            && let Some(vocabulary) = rules.lists
+            && let Some((list_rules, premises, diagnostics)) = rules.read_lists(&state, None)
         {
-            let (list_rules, premises, diagnostics) =
-                super::lists::instantiate_with_premises(vocabulary, &AllFacts(&state));
             let program = program.to_mut();
             program.ground_with_premises(&state, schema, &list_rules, &premises);
             program.list_diagnostics = diagnostics;
@@ -1293,6 +1380,13 @@ fn update_body<B: Base + ?Sized>(
         .filter(|d| !old_program.list_diagnostics.contains(d))
         .copied()
         .collect();
+    let reading = |p: &GroundProgram| -> HashSet<(u64, u64, u64, &'static str)> {
+        (p.list_diagnostics.iter())
+            .map(|d| (d.subject, d.predicate, d.head, d.problem.kind()))
+            .collect()
+    };
+    result.lists_read_otherwise =
+        matches!(program, Cow::Owned(_)) && reading(&program) != reading(old_program);
     result.program = match program {
         Cow::Owned(program) => Some(program),
         Cow::Borrowed(_) => None,
@@ -1378,10 +1472,8 @@ fn introduced_violations_body<B: Base + ?Sized>(
             .ground_delta(&state, rules.schema, &rules.schema_rules());
     }
     if delta_facts.iter().any(|&f| rules.is_list_fact(f))
-        && let Some(vocabulary) = rules.lists
+        && let Some((list_rules, premises, diagnostics)) = rules.read_lists(&state, None)
     {
-        let (list_rules, premises, diagnostics) =
-            super::lists::instantiate_with_premises(vocabulary, &AllFacts(&state));
         let program = program.to_mut();
         program.ground_with_premises(&state, rules.schema, &list_rules, &premises);
         program.list_diagnostics = diagnostics;

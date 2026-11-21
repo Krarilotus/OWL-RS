@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Replays what the Datamodel Workflow does to a triple store (its WP15 export and its
-# validation question D18) against a running server, with curl:
+# Replays what a data-modelling application does to a triple store (its module export and
+# its validation question) against a running server, with curl:
 #   1. export a module and its data with provenance, each into a graph of its own
 #   2. export the same version again and get identical graphs
 #   3. query across the graphs: a competency question and a provenance question
@@ -8,8 +8,8 @@
 #   5. store the shapes and validate: conforming data, then data that breaks them
 #   6. remove what it created
 #
-# Usage: scripts/smoke-dmw-export.sh [server URL]   (default http://127.0.0.1:8080)
-#        DMW_GATE=enforce scripts/smoke-dmw-export.sh …   for a server with
+# Usage: scripts/smoke-module-export.sh [server URL]   (default http://127.0.0.1:8080)
+#        MODULE_EXPORT_GATE=enforce scripts/smoke-module-export.sh …   for a server with
 #        `shacl.gate = "enforce"`: the breaking export is then refused at its commit.
 # Needs a server with writes enabled, `store.default_graph = "union"` (the exports go into
 # named graphs and the questions are asked without naming them), and an empty or
@@ -17,7 +17,7 @@
 set -euo pipefail
 
 SERVER="${1:-http://127.0.0.1:8080}"
-FIXTURES="$(cd "$(dirname "$0")/../fixtures/integration/dmw" && pwd)"
+FIXTURES="$(cd "$(dirname "$0")/../fixtures/integration/module-export" && pwd)"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -84,7 +84,7 @@ SELECT ?name ?date WHERE {
   GRAPH <$MODULE_GRAPH> { ?class rdfs:subClassOf ex:Document }
   GRAPH <$DATA_GRAPH> { ?p a ?class ; ex:petitioner/ex:name ?name ; ex:submittedOn ?date }
 } ORDER BY ?date"
-printf 'name,date\nJohannes Textor,1452-03-14\nMargarethe Weber,1453-11-02\n' > "$WORK/expected"
+printf 'name,date\nKonrad Textor,1452-03-14\nMargarethe Weber,1453-11-02\n' > "$WORK/expected"
 cmp -s "$WORK/rows" "$WORK/expected" || fail "competency question: $(cat "$WORK/rows")"
 
 say "a provenance question: which source does each petition come from"
@@ -99,9 +99,9 @@ cmp -s "$WORK/rows" "$WORK/expected" || fail "provenance question: $(cat "$WORK/
 say "change data with SPARQL Update on the combined endpoint"
 request 204 --data-urlencode "update=PREFIX ex: <https://example.org/model/petitions#>
 DELETE { GRAPH <$DATA_GRAPH> { ?person ex:name ?old } }
-INSERT { GRAPH <$DATA_GRAPH> { ?person ex:name \"Johannes Textor der Ältere\" } }
-WHERE { GRAPH <$DATA_GRAPH> { ?person ex:name ?old FILTER(?old = \"Johannes Textor\") } }" "$SERVER/dataset/sparql"
-request 200 -H 'Accept: application/sparql-results+json' --data-urlencode "query=ASK { GRAPH <$DATA_GRAPH> { ?s ?p \"Johannes Textor der Ältere\" } }" "$SERVER/dataset/sparql"
+INSERT { GRAPH <$DATA_GRAPH> { ?person ex:name \"Konrad Textor der Ältere\" } }
+WHERE { GRAPH <$DATA_GRAPH> { ?person ex:name ?old FILTER(?old = \"Konrad Textor\") } }" "$SERVER/dataset/sparql"
+request 200 -H 'Accept: application/sparql-results+json' --data-urlencode "query=ASK { GRAPH <$DATA_GRAPH> { ?s ?p \"Konrad Textor der Ältere\" } }" "$SERVER/dataset/sparql"
 body_has true
 put_graph "$DATA_GRAPH" data.ttl 200
 read_graph "$DATA_GRAPH" "$WORK/data-third.nt"
@@ -113,7 +113,7 @@ request 200 -H 'Accept: application/json' "$SERVER/dataset/shacl"
 body_has '"conforms":true'
 body_has '"shapes":4'
 
-if [ "${DMW_GATE:-off}" = enforce ]; then
+if [ "${MODULE_EXPORT_GATE:-off}" = enforce ]; then
   say "data that breaks the shapes is refused at the commit (shacl.gate = enforce), with what is wrong"
   put_graph "$INVALID_GRAPH" invalid.ttl 400
   body_has 'petition-3'

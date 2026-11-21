@@ -38,7 +38,7 @@ use nrese_rdf::{GraphName, Literal, Term};
 
 use crate::access::AccessView;
 use nrese_store::{
-    MutationCommand, RdfPayload, SparqlUpdateRequest, StatementOp, StatementPattern,
+    MutationCommand, RdfPayload, SparqlUpdateRequest, StatementOp, StatementOps, StatementPattern,
     StatementsRequest,
 };
 
@@ -158,11 +158,10 @@ pub(crate) fn update(
 ) -> Result<SparqlUpdateRequest, ApiError> {
     let operation = update_from_post(raw.0.as_deref(), headers.get(header::CONTENT_TYPE), body)?;
     policy.enforce_update_bytes(operation.update.len())?;
-    Ok(SparqlUpdateRequest {
-        update: operation.update,
-        using_graphs: operation.using_graphs,
-        using_named_graphs: operation.using_named_graphs,
-    })
+    let mut request = SparqlUpdateRequest::new(operation.update);
+    request.using_graphs = operation.using_graphs;
+    request.using_named_graphs = operation.using_named_graphs;
+    Ok(request)
 }
 
 /// A store error of a namespace change: the store's fault.
@@ -187,13 +186,25 @@ pub(crate) async fn apply(
     mutation::run(
         state,
         MutationCommand::Statements(StatementsRequest::new(ops)),
-        access.requester(),
+        access,
         state.policy().timeouts.update,
         "statement operation exceeded policy timeout",
     )
     .await
     .map(|_| ())
 }
+
+/// [`apply`] of a client transaction's commit, which ends it: so changed rights answer 409.
+pub(crate) async fn commit(state: &AppState, ops: StatementOps, access: &AccessView) -> Ended {
+    match apply(state, ops, access).await {
+        Err(ApiError::RightsChanged(_)) => Err(ApiError::conflict(
+            "the requester's rights changed while the transaction committed, and nothing was written: begin a new transaction",
+        )),
+        other => other,
+    }
+}
+
+type Ended = Result<(), ApiError>;
 
 /// A table of terms as SPARQL results, JSON unless the client prefers XML.
 fn table(headers: &HeaderMap, vars: &[&str], rows: Vec<Vec<Option<Term>>>) -> Response {
@@ -454,7 +465,7 @@ async fn statements(
     state.ensure_serving()?;
     let pairs = pairs(&raw)?;
     let pattern = pattern(&pairs)?;
-    let format = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
+    let (media_type, format) = negotiated(header_value_str(headers.get(header::ACCEPT)), GRAPHS)?;
     let store = state.store();
     let (scope, infer) = (access.read_scope(), infer(&pairs));
     // Streamed as read: a whole repository in constant memory, for as long as the client
@@ -465,7 +476,7 @@ async fn statements(
     super::result_stream::stream_blocking(
         pace,
         cancellation,
-        format.media_type(),
+        media_type,
         "reading the statements exceeded the policy timeout",
         move |out| {
             let read = nrese_store::ReadContext::new(scope)
@@ -739,7 +750,10 @@ pub async fn graph_store_delete(
 /// or a proxy's `X-Forwarded-Host` and `X-Forwarded-Proto`): RDF4J's client follows a new
 /// transaction's `Location` as given and fails on a relative one ("Target host is not
 /// specified"). Without a host, the path alone.
-fn absolute(headers: &HeaderMap, path: &str) -> String {
+fn absolute(state: &AppState, headers: &HeaderMap, path: &str) -> String {
+    if let Some(url) = state.public_url() {
+        return format!("{}{path}", url.strip_suffix('/').unwrap_or(url));
+    }
     let value = |name: &str| {
         headers
             .get(name)
@@ -836,7 +850,11 @@ pub async fn transaction_begin(
         .sessions()
         .begin(access.origin.as_deref())
         .map_err(|error| ApiError::internal(error.to_string()))?;
-    let location = absolute(&headers, &format!("/repositories/{id}/transactions/{txid}"));
+    let location = absolute(
+        &state,
+        &headers,
+        &format!("/repositories/{id}/transactions/{txid}"),
+    );
     let mut response = StatusCode::CREATED.into_response();
     response.headers_mut().insert(
         header::LOCATION,
@@ -897,7 +915,7 @@ pub async fn transaction_action(
             let pending = sessions
                 .take(&txid, owner)
                 .ok_or_else(|| ApiError::not_found(format!("no transaction '{txid}'")))?;
-            apply(&state, pending.ops, &access).await?;
+            commit(&state, pending.ops, &access).await?;
             Ok(StatusCode::OK.into_response())
         }
         "PING" => Ok(text(sessions.idle().as_millis().to_string())),
@@ -980,6 +998,7 @@ mod tests {
             used: 0,
             shared: true,
             unread: true,
+            rows: None,
         });
         let status = |error| {
             super::configuration_error(&policy, error)

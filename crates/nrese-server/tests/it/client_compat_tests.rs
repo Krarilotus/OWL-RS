@@ -1,6 +1,6 @@
 //! The HTTP surface as real clients use it (plan step U1): RDF4J's SPARQL repository (which
 //! ResearchSpace connects through), exporters that use SPARQL Update and the Graph Store
-//! Protocol (the Datamodel Workflow), browsers and scripts.
+//! Protocol (a data-modelling application), browsers and scripts.
 
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};

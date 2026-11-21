@@ -2433,3 +2433,81 @@ fn a_readers_status_follows_the_triple_terms_they_may_read() {
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
+
+/// Spec: crates/nrese-store/src/service.rs (`certification_for_its_reader`): where a reader's
+/// status is withheld, so is the QL rewriting's report, a claim; its rows stand. Under
+/// `owl2-rl`, `representatives`, the QL rewriting on and the default graph the union of every
+/// graph, `:g1` holds `:x a :A` and `:A rdfs:subClassOf [ owl:onProperty :p ;
+/// owl:someValuesFrom :B ]`; `:g2`, which a reader by support of `:g1` and the default graph
+/// can't read, a chain axiom on a list with no `rdf:rest`, which its support grounding leaves
+/// out. That reader's typed `ASK { :x :p ?y }` is `true`, told `not-certified`, with no QL
+/// report: read cold, and again from the view's own result cache.
+#[test]
+fn a_typed_read_whose_claim_is_withheld_carries_no_ql_report() {
+    use std::sync::Arc;
+
+    use nrese_sparql::GraphAccess;
+    use nrese_store::{ReadScope, SparqlUpdateRequest};
+
+    use crate::support::Writes;
+
+    let store = StoreService::new(StoreConfig {
+        ql_rewriting: QlRewritingMode::On,
+        union_default_graph: true,
+        ..StoreConfig::in_memory()
+    })
+    .unwrap();
+    let first = "<http://www.w3.org/1999/02/22-rdf-syntax-ns#first>";
+    let update = format!(
+        "{PREFIXES}INSERT DATA {{ GRAPH :g1 {{ :x a :A . :p a owl:ObjectProperty . \
+         :A rdfs:subClassOf [ a owl:Restriction ; owl:onProperty :p ; owl:someValuesFrom :B ] }} \
+         GRAPH :g2 {{ :q owl:propertyChainAxiom _:l . _:l {first} :r }} }}"
+    );
+    store
+        .execute_update(&SparqlUpdateRequest::new(update))
+        .unwrap();
+    store.rematerialise(Ruleset::Owl2Rl).unwrap();
+    store.use_reasoning_rules(Some(Ruleset::Owl2Rl.into()));
+    let access = Arc::new(GraphAccess {
+        graphs: vec!["http://example.com/g1".to_owned()],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: true,
+        ..GraphAccess::default()
+    });
+    let request = SparqlQueryRequest::new(
+        format!("{PREFIXES}ASK {{ :x :p ?y }}"),
+        ReadScope::Graphs(Arc::clone(&access)),
+    );
+    // The hits of the view's own result cache (it is unpublished), if it has one.
+    let hits = || {
+        let view = store.read_snapshot(Some(&access)).expect("view");
+        match view.admission() {
+            nrese_engine::Admission::Own(own) => own
+                .get::<nrese_sparql::ResultCache>()
+                .map_or(0, |cache| cache.stats().hits),
+            nrese_engine::Admission::Shared(_) => 0,
+        }
+    };
+    let mut told = Vec::new();
+    for read in ["cold", "again"] {
+        let before = hits();
+        let result = store.execute_query(&request).expect("answered");
+        told.push(format!(
+            "{read}: {}, {}, ql {}, cache hit {}",
+            String::from_utf8(result.payload).unwrap().contains("true"),
+            result
+                .completeness
+                .map_or("none".to_owned(), |c| c.header()),
+            result.ql.is_some(),
+            hits() > before
+        ));
+    }
+    assert_eq!(
+        told,
+        [
+            "cold: true, not-certified, ql false, cache hit false",
+            "again: true, not-certified, ql false, cache hit true"
+        ]
+    );
+}

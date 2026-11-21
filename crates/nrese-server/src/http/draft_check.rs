@@ -1,5 +1,5 @@
-//! Draft checks over HTTP: the Datamodel Workflow's backend-agnostic store-check
-//! protocol (`dmw-store-check/1`, see `docs/ops/http-api.md`, "Draft checks").
+//! Draft checks over HTTP: a data-modelling application's backend-agnostic store-check
+//! protocol (`store-check/1`, see `docs/ops/http-api.md`, "Draft checks").
 //!
 //! `GET /api/v1/draft-check/capabilities` declares what this server checks;
 //! `POST /api/v1/draft-check` runs one SHACL, query or reasoning check over the inputs in
@@ -19,9 +19,9 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::response::{IntoResponse, Response};
 use nrese_store::{
-    CancellationToken, DRAFT_CHECK_PROFILES, DRAFT_CHECK_PROTOCOL, DRAFT_CHECK_SEMANTICS,
-    DraftInputs, DraftLimits, DraftOperation, DraftOutcome, DraftStatus, input_hash_mismatch,
-    run_draft_check,
+    CancellationToken, DRAFT_CHECK_PROFILES, DRAFT_CHECK_PROTOCOL_EARLIER, DRAFT_CHECK_PROTOCOLS,
+    DRAFT_CHECK_SEMANTICS, DraftInputs, DraftLimits, DraftOperation, DraftOutcome, DraftStatus,
+    input_hash_mismatch, run_draft_check,
 };
 use serde::{Deserialize, Serialize};
 
@@ -45,8 +45,10 @@ pub(crate) fn build_id() -> String {
 /// What this server's draft checks offer.
 #[derive(Debug, Serialize, utoipa::ToSchema)]
 pub(crate) struct DraftCapabilities {
-    /// `dmw-store-check/1`.
+    /// The protocol's earlier name, named here until clients read `protocols`.
     protocol: &'static str,
+    /// Every name a request may give the protocol by, the preferred (`store-check/1`) first.
+    protocols: Vec<&'static str>,
     /// `shacl`, `query`, `reasoning`.
     operations: Vec<&'static str>,
     profiles: Vec<&'static str>,
@@ -108,7 +110,8 @@ pub async fn capabilities(
 ) -> Result<Response, ApiError> {
     guard::enforce_query_read(&state, &authenticated).await?;
     Ok(Json(DraftCapabilities {
-        protocol: DRAFT_CHECK_PROTOCOL,
+        protocol: DRAFT_CHECK_PROTOCOL_EARLIER,
+        protocols: DRAFT_CHECK_PROTOCOLS.to_vec(),
         operations: vec!["shacl", "query", "reasoning"],
         profiles: DRAFT_CHECK_PROFILES.to_vec(),
         semantics: vec![DRAFT_CHECK_SEMANTICS],
@@ -135,10 +138,11 @@ pub async fn check(
     policy.enforce_rdf_upload_bytes(body.len())?;
     let request: DraftCheckRequest = serde_json::from_slice(&body)
         .map_err(|error| ApiError::bad_request(format!("not a draft-check request: {error}")))?;
-    if request.protocol != DRAFT_CHECK_PROTOCOL {
+    if !DRAFT_CHECK_PROTOCOLS.contains(&request.protocol.as_str()) {
         return Err(ApiError::bad_request(format!(
-            "unknown protocol '{}', expected '{DRAFT_CHECK_PROTOCOL}'",
-            request.protocol
+            "unknown protocol '{}', expected one of '{}'",
+            request.protocol,
+            DRAFT_CHECK_PROTOCOLS.join("', '")
         )));
     }
     let server_max = policy.timeouts.query;

@@ -18,13 +18,16 @@ mod left_out;
 mod left_out_words;
 mod long_chain;
 mod mode;
+mod model_labels;
 mod outside;
 mod plans;
 mod queries;
 mod representatives;
+mod reserved_names;
 mod review;
 mod routing;
 mod safety;
+mod shapes;
 mod speculative;
 mod symmetric_chains;
 mod u1_limits;
@@ -104,6 +107,10 @@ pub struct Status {
     pub shared: nrese_sparql::Completeness,
     pub paths: Vec<&'static str>,
     pub bounds: Option<Counts>,
+    /// Of the refuted, those one model of the premise refuted by its labels.
+    pub by_labels: u64,
+    /// The first unresolved candidates, as `?x=<…>`.
+    pub unresolved: Vec<String>,
 }
 
 /// The bounds' counts: the shared status's, with the candidates proved and refuted.
@@ -144,6 +151,8 @@ pub fn run_dl(
             unresolved: b.unresolved,
         }),
         paths: detail.paths,
+        by_labels: detail.refuted_by_labels,
+        unresolved: detail.unresolved,
         shared,
     }))
 }

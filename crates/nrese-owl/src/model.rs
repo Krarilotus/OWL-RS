@@ -144,8 +144,9 @@ pub enum Axiom {
     SubClassOf(ExprId, ExprId),
     EquivalentClasses(Vec<ExprId>),
     DisjointClasses(Vec<ExprId>),
-    /// The class is the disjoint union of the expressions.
-    DisjointUnion(Term, Vec<ExprId>),
+    /// The class is the disjoint union of the expressions. The class is a named class,
+    /// `owl:Thing` or `owl:Nothing` (*Structural Specification* §9.1.4); the readers keep it so.
+    DisjointUnion(ExprId, Vec<ExprId>),
     /// The chain (one property: a plain subproperty axiom) is a subproperty of the last.
     SubObjectPropertyOf(Vec<ObjProp>, ObjProp),
     EquivalentObjectProperties(Vec<ObjProp>),
@@ -235,10 +236,12 @@ impl<T: Clone + Eq + Hash> Interner<T> {
     }
 }
 
-/// The operands of a disjointness as read: classes, object or data properties, or
-/// individuals (`DifferentIndividuals`).
+/// The operands of a disjointness as read: classes, a class's disjoint union, object or
+/// data properties, or individuals (`DifferentIndividuals`).
 pub(crate) enum Disjoint {
     Classes(Vec<ExprId>),
+    /// The class and its union's operands.
+    Union(ExprId, Vec<ExprId>),
     Objects(Vec<ObjProp>),
     Data(Vec<Term>),
     Individuals(Vec<Term>),
@@ -274,6 +277,19 @@ impl Disjoint {
                 let (xs, rep) = split(xs);
                 if xs.len() > 1 {
                     out.push(Axiom::DisjointClasses(xs));
+                }
+                out.extend(rep.iter().map(|&x| Axiom::SubClassOf(x, nothing)));
+                !rep.is_empty()
+            }
+            // The class is the union of its operands, which are pairwise disjoint: a repeated
+            // one is empty, as in `Disjoint::Classes`; of one left without repeats the class
+            // is equal to it.
+            Disjoint::Union(class, xs) => {
+                let (xs, rep) = split(xs);
+                match xs[..] {
+                    [x] if x == class => {}
+                    [x] => out.push(Axiom::EquivalentClasses(canonical(vec![class, x]))),
+                    _ => out.push(Axiom::DisjointUnion(class, xs)),
                 }
                 out.extend(rep.iter().map(|&x| Axiom::SubClassOf(x, nothing)));
                 !rep.is_empty()

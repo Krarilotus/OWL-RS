@@ -235,17 +235,9 @@ impl MutationPipeline {
         let envelope = self.store.envelope(None);
         tx.charge_pending_to(Arc::new(envelope.part()))
             .map_err(|error| store_error(error.into()))?;
-        let context = crate::mutation::command::UpdateContext {
-            memory: envelope.clone(),
-            cancellation: ticket.evaluation_token(),
-            union_default_graph: self.store.config().union_default_graph,
-            geosparql_stated_only: self.store.config().geosparql_stated_only,
-            search_scope: self.store.search_scope(),
-            services: self.store.services(),
-            namespaces: self.store.namespaces().all(),
-            supports: Arc::clone(self.store.supports()),
-            compilation: self.store.support_compilation(),
-        };
+        let context = self
+            .store
+            .update_context(envelope.clone(), ticket.evaluation_token());
         let report = command
             .apply(&mut tx, requester, &context)
             .map_err(store_error)?;
@@ -291,13 +283,24 @@ impl MutationPipeline {
             // The violations' list draws on the request's envelope: past it, the list stops
             // and the commit is still rejected (the change is inconsistent either way).
             let report_memory = Arc::new(envelope.part());
-            let (violations, materialisation, changed) =
-                crate::reasoning::apply_delta(program, cached, &mut tx, &operation, &report_memory)
-                    .map_err(|interrupted| {
-                        memory
-                            .error(interrupted)
-                            .map_or(MutationError::Cancelled, &store_error)
-                    })?;
+            // A rebuild's own report judges only over a state assessed consistent.
+            let base_consistent = matches!(
+                self.store.consistency(),
+                crate::ConsistencyStatus::Consistent
+            );
+            let (violations, materialisation, changed) = crate::reasoning::apply_delta(
+                program,
+                cached,
+                &mut tx,
+                &operation,
+                &report_memory,
+                base_consistent,
+            )
+            .map_err(|interrupted| {
+                memory
+                    .error(interrupted)
+                    .map_or(MutationError::Cancelled, &store_error)
+            })?;
             tracing::debug!(?materialisation, "commit-path materialisation");
             // Whether the closure the commit leaves leaves out a list axiom: its program's
             // whole list diagnostics (the report's are only the new ones). With no program at
@@ -343,7 +346,10 @@ impl MutationPipeline {
                 // Under `owl2-dl`, where OWL 2 DL may read the data otherwise, the rules'
                 // clash isn't stated as an inconsistency (`WhyUndecided`).
                 let dl = self.store.dl();
-                let undecided = dl.active().then(|| dl.undecided_after(&tx)).flatten();
+                let undecided = dl
+                    .active()
+                    .then(|| dl.undecided_after(&tx, lists_left_out))
+                    .flatten();
                 let full = || {
                     let count = match violations.complete() {
                         true => violations.at_least().to_string(),
@@ -443,6 +449,8 @@ impl MutationPipeline {
             // the commit changes of individuals' memberships of class expressions, before the
             // commit publishes.
             let ql = crate::service::Certificate::of(tx.base()).and_then(|c| c.ql.clone());
+            // Its rights hold from here through the publication (contracts.md, lock order).
+            let rights = ticket.hold_rights()?;
             // In quarantine the commit checks only its own facts: its version keeps no
             // assessment of its consistency. The mark rises first (odd: unassessed), then the
             // old assessment and its marker go, before the commit publishes: a removal that
@@ -464,6 +472,7 @@ impl MutationPipeline {
                 kind,
                 source: StoreError::Engine(error),
             })?;
+            drop(rights);
             if let Some(touched) = touched {
                 supports.note_commit(before, summary.revision, touched);
             }
@@ -526,10 +535,12 @@ impl MutationPipeline {
         if !ticket.begin_commit() {
             return Err(MutationError::Cancelled);
         }
+        let rights = ticket.hold_rights()?;
         let summary = tx.commit().map_err(|error| MutationError::Store {
             kind,
             source: StoreError::Engine(error),
         })?;
+        drop(rights);
         Ok(report.committed(summary.revision))
     }
 

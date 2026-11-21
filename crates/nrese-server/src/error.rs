@@ -24,7 +24,7 @@ pub enum ApiError {
         reject: Box<Option<RejectExplanationView>>,
     },
     #[error("unauthorized: {0}")]
-    Unauthorized(String),
+    Unauthorized(String, Option<&'static str>),
     #[error("forbidden: {0}")]
     Forbidden(String),
     #[error("not found: {0}")]
@@ -34,6 +34,8 @@ pub enum ApiError {
     /// Exact answers asked for (`dl-answers=exact`) that can't be proven complete (422).
     #[error("incomplete answer: {0}")]
     IncompleteAnswer(Box<nrese_store::IncompleteAnswer>),
+    #[error("{1}")]
+    NotImplemented(&'static str, String),
     /// What was asked for is gone for good (a replica's log a checkpoint covered).
     #[error("gone: {0}")]
     Gone(String),
@@ -52,6 +54,9 @@ pub enum ApiError {
     /// Busy for now: 503 with `Retry-After`, to be tried again shortly.
     #[error("busy: {0}")]
     Busy(String),
+    /// The requester's rights changed while its write waited: 503, `Retry-After`, `rights-changed`.
+    #[error("rights changed: {0}")]
+    RightsChanged(String),
     #[error("internal server error: {0}")]
     Internal(String),
 }
@@ -66,7 +71,14 @@ impl ApiError {
     }
 
     pub fn unauthorized(message: impl Into<String>) -> Self {
-        Self::Unauthorized(message.into())
+        Self::Unauthorized(message.into(), Some("Bearer"))
+    }
+
+    pub fn with_challenge(mut self, challenge: Option<&'static str>) -> Self {
+        if let Self::Unauthorized(_, value) = &mut self {
+            *value = challenge;
+        }
+        self
     }
 
     pub fn rejected(
@@ -152,6 +164,18 @@ impl IntoResponse for ApiError {
         if let Self::IncompleteAnswer(answer) = self {
             return incomplete_answer(&answer);
         }
+        if let Self::NotImplemented(setting, detail) = self {
+            return problem(
+                StatusCode::NOT_IMPLEMENTED,
+                &serde_json::json!({
+                    "type": format!("https://nrese.dev/problems/{setting}"),
+                    "title": "Not Implemented",
+                    "status": 501,
+                    "detail": detail,
+                }),
+            );
+        }
+        let rights_changed = matches!(self, Self::RightsChanged(_));
         if let Self::Busy(detail) = self {
             let mut response = Self::ServiceUnavailable(detail).into_response();
             response
@@ -159,6 +183,10 @@ impl IntoResponse for ApiError {
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
             return response;
         }
+        let challenge = match &self {
+            Self::Unauthorized(_, challenge) => *challenge,
+            _ => None,
+        };
         let (status, detail, reasoner_reject) = match self {
             Self::BadRequest(detail) => (StatusCode::BAD_REQUEST, detail, None),
             Self::BadRequestPlainText(detail) => {
@@ -170,11 +198,13 @@ impl IntoResponse for ApiError {
                 return response;
             }
             Self::Rejected { detail, reject, .. } => (StatusCode::BAD_REQUEST, detail, *reject),
-            Self::Unauthorized(detail) => (StatusCode::UNAUTHORIZED, detail, None),
+            Self::Unauthorized(detail, _) => (StatusCode::UNAUTHORIZED, detail, None),
             Self::Forbidden(detail) => (StatusCode::FORBIDDEN, detail, None),
             Self::NotFound(detail) => (StatusCode::NOT_FOUND, detail, None),
             Self::Conflict(detail) => (StatusCode::CONFLICT, detail, None),
-            Self::IncompleteAnswer(_) | Self::Busy(_) => unreachable!("answered above"),
+            Self::IncompleteAnswer(_) | Self::Busy(_) | Self::NotImplemented(..) => {
+                unreachable!("answered above")
+            }
             Self::Gone(detail) => (StatusCode::GONE, detail, None),
             Self::NotAcceptable(detail) => (StatusCode::NOT_ACCEPTABLE, detail, None),
             Self::UnsupportedMediaType(detail) => {
@@ -183,7 +213,9 @@ impl IntoResponse for ApiError {
             Self::PayloadTooLarge(detail) => (StatusCode::PAYLOAD_TOO_LARGE, detail, None),
             Self::TooManyRequests(detail) => (StatusCode::TOO_MANY_REQUESTS, detail, None),
             Self::Timeout(detail) => (StatusCode::REQUEST_TIMEOUT, detail, None),
-            Self::ServiceUnavailable(detail) => (StatusCode::SERVICE_UNAVAILABLE, detail, None),
+            Self::ServiceUnavailable(detail) | Self::RightsChanged(detail) => {
+                (StatusCode::SERVICE_UNAVAILABLE, detail, None)
+            }
             Self::Internal(detail) => (StatusCode::INTERNAL_SERVER_ERROR, detail, None),
         };
         let (problem_type, title) = match rejected {
@@ -194,9 +226,13 @@ impl IntoResponse for ApiError {
                     Cow::Borrowed(title),
                 )
             }
+            None if rights_changed => (
+                Cow::Borrowed("https://nrese.dev/problems/rights-changed"),
+                Cow::Borrowed("Rights Changed"),
+            ),
             None => kind(status),
         };
-        problem(
+        let mut response = problem(
             status,
             &ProblemJson {
                 r#type: problem_type,
@@ -205,7 +241,18 @@ impl IntoResponse for ApiError {
                 detail,
                 reasoner_reject,
             },
-        )
+        );
+        if let Some(challenge) = challenge {
+            response.headers_mut().insert(
+                header::WWW_AUTHENTICATE,
+                HeaderValue::from_static(challenge),
+            );
+        }
+        if rights_changed {
+            let retry = HeaderValue::from_static("1");
+            response.headers_mut().insert(header::RETRY_AFTER, retry);
+        }
+        response
     }
 }
 

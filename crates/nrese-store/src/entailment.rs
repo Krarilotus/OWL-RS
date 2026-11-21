@@ -165,15 +165,16 @@ impl StoreService {
             .by_representatives(config.equality_by_representatives)
             .storing_representatives(config.equality_compact);
         let report = self.operation_memory();
-        let done =
-            nrese_reasoner::engine::maintain_with(&compiled, None, &mut tx, &operation, &report)
-                .map_err(|interrupted| {
-                    memory
-                        .error(interrupted)
-                        .unwrap_or(StoreError::ProcessMemoryLimit {
-                            limit: nrese_exec::memory::process_limit().unwrap_or(0),
-                        })
-                })?;
+        let done = nrese_reasoner::engine::maintain_with(
+            &compiled, None, &mut tx, &operation, &report, false,
+        )
+        .map_err(|interrupted| {
+            memory
+                .error(interrupted)
+                .unwrap_or(StoreError::ProcessMemoryLimit {
+                    limit: nrese_exec::memory::process_limit().unwrap_or(0),
+                })
+        })?;
         Ok(!done.violations.consistent())
     }
 }
@@ -381,7 +382,7 @@ impl StoreService {
         let snapshot = self.engine().snapshot();
         let memory = self.envelope(None);
         // Undecided where the request's envelope can't take reading the premise (SYN-61).
-        let Ok(premise) = source::read_snapshot(&snapshot, memory.clone()) else {
+        let Ok((premise, read_statements)) = source::read_premise(&snapshot, memory.clone()) else {
             let why = source::refused("the premise");
             return Ok(DlEntailment {
                 answer: Entailed::Unknown(format!("the premise: {why}")),
@@ -443,13 +444,19 @@ impl StoreService {
         };
         let decode = |term| tx.decode(term);
         let lookup = |iri: &str| tx.lookup(NamedNodeRef::new_unchecked(iri).into());
-        let read = nrese_owl::read(
+        // The conclusion reads SHACL content as one source of it and the premise would
+        // (`nrese_owl::read_beside`); the premise keeps its own reading.
+        let read = nrese_owl::read_beside(
             &statements,
+            &read_statements,
             &source::StoreTerms {
                 decode: &decode,
                 lookup: &lookup,
             },
         );
+        // The premise's statements are read: their charge goes back to the envelope before
+        // the check draws on it.
+        drop(read_statements);
         // A structure no axiom uses says nothing under the Direct Semantics (OWL 1
         // conclusions state expressions so); anything else unread leaves it undecided.
         // Named by the conclusion's IRIs and literals, as the requester wrote them; its blank

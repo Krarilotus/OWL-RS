@@ -48,6 +48,8 @@ const LIMIT_STEP: usize = 1024;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TooManyRows {
     pub max_rows: usize,
+    /// The rows it would produce, where known before producing them (a cross product).
+    pub rows: Option<usize>,
 }
 
 impl std::fmt::Display for TooManyRows {
@@ -164,6 +166,7 @@ impl Limit {
         if total > self.max_rows || self.stopped() {
             return Err(TooManyRows {
                 max_rows: self.max_rows,
+                rows: None,
             });
         }
         Ok(())
@@ -218,6 +221,7 @@ impl<'a> Sink<'a> {
     fn refused(&self) -> TooManyRows {
         TooManyRows {
             max_rows: self.limit.max_rows,
+            rows: None,
         }
     }
 }
@@ -335,6 +339,7 @@ fn cross_product(left: &IdTable, right: &IdTable, limit: &Limit) -> Result<IdTab
     if rows > limit.max_rows {
         return Err(TooManyRows {
             max_rows: limit.max_rows,
+            rows: (rows < usize::MAX).then_some(rows),
         });
     }
     let width = left.width() + right.width();
@@ -355,6 +360,7 @@ fn cross_product(left: &IdTable, right: &IdTable, limit: &Limit) -> Result<IdTab
             if limit.stopped() {
                 return Err(TooManyRows {
                     max_rows: limit.max_rows,
+                    rows: None,
                 });
             }
         }
@@ -665,6 +671,10 @@ pub fn left_join(
     {
         let out = sorted_left_join(left, right, *lk, *rk, &limit)?;
         return Ok(out.assume_sorted_by(left_keys.to_vec()));
+    }
+    // No key and no filter: every left row with every right row, a counted cross product.
+    if left_keys.is_empty() && accept.is_none() && !right.is_empty() {
+        return Ok(cross_product(left, right, &limit)?);
     }
     let table = match left_keys.is_empty() {
         true => None,
@@ -1405,6 +1415,46 @@ mod tests {
         assert!(outer_join_with_undef(&many, &many, &[0], &[0], None, true, 99).is_err());
     }
 
+    /// An OPTIONAL that shares no variable and has no filter (`left_join` without keys) gives
+    /// the table the keyless pairing gives (`left_join_rows` without a hash table): the same
+    /// rows in the same order, the same columns and sort order. With an empty right side
+    /// that is every left row once, its right columns unbound. Small tables with unbound
+    /// values, empty right sides among them, and one left side past a parallel part.
+    #[test]
+    fn a_left_join_without_keys_gives_the_keyless_pairing() {
+        let mut rng = Rng(11);
+        for case in 0..300 {
+            let (lw, rw) = (1 + case % 3, 1 + (case / 3) % 3);
+            let (lrows, rrows) = match case {
+                0 => (2 * PARALLEL_ROWS + 3, 2),
+                _ => (rng.below(7) as usize, rng.below(4) as usize),
+            };
+            let left = random_table(&mut rng, lw, lrows, 4, true);
+            let right = random_table(&mut rng, rw, rrows, 4, true);
+            let keyless = LeftJoin {
+                left: &left,
+                right: &right,
+                left_keys: &[],
+                right_keys: &[],
+                table: None,
+            };
+            let all = Limit::new(usize::MAX);
+            let paired = left_join_rows(&keyless, 0..left.len(), None, &all).unwrap();
+            let joined = left_join(&left, &right, &[], &[], None, usize::MAX).unwrap();
+            assert_eq!(joined, paired, "case {case}: {lrows} x {rrows} rows");
+            if right.is_empty() {
+                let unbound: Vec<Vec<u64>> = left
+                    .rows()
+                    .map(|mut row| {
+                        row.extend(std::iter::repeat_n(UNDEF, rw));
+                        row
+                    })
+                    .collect();
+                assert_eq!(joined.rows().collect::<Vec<_>>(), unbound, "case {case}");
+            }
+        }
+    }
+
     #[test]
     fn left_and_anti_joins() {
         let left = IdTable::from_rows(2, [&[1, 10][..], &[2, 20], &[3, 30]]);
@@ -1484,12 +1534,16 @@ mod tests {
         assert!(full.len() > 1_000_000);
         assert_eq!(
             join(&left, &right, &[0], &[0], 100_000),
-            Err(JoinStop::Rows(TooManyRows { max_rows: 100_000 }))
+            Err(JoinStop::Rows(TooManyRows {
+                max_rows: 100_000,
+                rows: None
+            }))
         );
         assert_eq!(
             join(&left, &right, &[], &[], 1_000_000).map(|t| t.len()),
             Err(JoinStop::Rows(TooManyRows {
-                max_rows: 1_000_000
+                max_rows: 1_000_000,
+                rows: Some(left.len() * right.len())
             }))
         );
         assert_eq!(
@@ -1522,7 +1576,8 @@ mod tests {
         assert_eq!(
             scanned,
             Err(TooManyRows {
-                max_rows: usize::MAX
+                max_rows: usize::MAX,
+                rows: None
             })
         );
         // Stopped after 2 × POLL_UNITS of the 4 × 1.5 × POLL_UNITS rows to scan.
@@ -1569,7 +1624,8 @@ mod tests {
             assert_eq!(
                 merge_join(&left, &right, &[0], &[0], &Limit::new(pairs - 1)).map(|t| t.len()),
                 Err(JoinStop::Rows(TooManyRows {
-                    max_rows: pairs - 1
+                    max_rows: pairs - 1,
+                    rows: None
                 })),
                 "{runs:?}"
             );

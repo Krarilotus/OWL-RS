@@ -178,16 +178,30 @@ impl MaterialisationReport {
 
 /// [`nrese_reasoner::engine::maintain_with`] on a commit, with its report: the violations the
 /// change introduced (charged to `memory`, the request's part), what it did, and the
-/// ground program to reuse.
+/// ground program to reuse. Where maintenance installed a rebuilt closure over a state
+/// assessed consistent (`base_consistent`), the rebuild's own violations judge the change
+/// alone: the delta reads less than the rebuilt state holds. Otherwise the delta's report
+/// stands, as before.
 pub(crate) fn apply_delta(
     program: &Program,
     ground: Option<&GroundProgram>,
     tx: &mut Transaction<'_>,
     operation: &nrese_reasoner::eval::OperationStop<'_>,
     memory: &Arc<nrese_exec::Budget>,
+    base_consistent: bool,
 ) -> Result<(Violations, MaterialisationReport, Option<GroundProgram>), delta::Interrupted> {
     let started = Instant::now();
-    let done = nrese_reasoner::engine::maintain_with(program, ground, tx, operation, memory)?;
+    let mut done = nrese_reasoner::engine::maintain_with(
+        program,
+        ground,
+        tx,
+        operation,
+        memory,
+        base_consistent,
+    )?;
+    if let Some(rebuilt) = done.rebuilt_violations.take() {
+        done.violations = rebuilt;
+    }
     let report = MaterialisationReport {
         ruleset: program.program.name(),
         revision: tx.base().revision() + 1,
@@ -307,7 +321,7 @@ mod tests {
             let operation = nrese_reasoner::eval::OperationStop::new(&poll);
             let memory = Arc::new(nrese_exec::Budget::unlimited());
             let (violations, report, _) =
-                apply_delta(&program, None, &mut tx, &operation, &memory).unwrap();
+                apply_delta(&program, None, &mut tx, &operation, &memory, true).unwrap();
             assert!(violations.consistent());
             let pending = tx.pending_snapshot();
             let stored: HashSet<EncodedTriple> = pending

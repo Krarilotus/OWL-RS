@@ -5,7 +5,7 @@ Run: python benches/suite/tests/isolation.py discover -s benches/suite/tests -p 
 An assertion tagged `SPEC <tag>` states the behaviour its test is for.
 
 Spec: D16-637 (15 Nov 2026). The push tier for engine-v2's commit "workspace: version 1.5.0"
-(ca1146da8, gate-push-a6b45993a7-1794750320) printed "changed: none" and ran no crate's clippy or
+(3627ec9f6, gate-push-a6b45993a7-1794750320) printed "changed: none" and ran no crate's clippy or
 tests, though the commit changed the root Cargo.toml's [workspace.package]. A change to the root
 manifest, the root lock file or the toolchain file reaches every crate: the selection names every
 crate of the workspace. A file inside one crate still selects that crate alone.
@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parents[3]
 # By its PATH entry: Windows looks in System32 (WSL's bash) before PATH for a bare name.
 BASH = shutil.which("bash")
 EVERY = {"alpha", "beta"}
-# ca1146da8's files, as its push tier got them (git show --stat ca1146da8^2).
+# 3627ec9f6's files, as its push tier got them (git show --stat 3627ec9f6^2).
 VERSION_BUMP = [".github/workflows/images.yml", "Cargo.lock", "Cargo.toml",
                 "benches/nrese-bench-harness/Cargo.lock", "benches/oxigraph-comparison/Cargo.lock",
                 "benches/term-reads-count/Cargo.lock", "docs/ops/openapi.json", "fuzz/Cargo.lock"]

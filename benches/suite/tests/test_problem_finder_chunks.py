@@ -225,6 +225,21 @@ class SweepResume(unittest.TestCase):
             sweep.run(self.args)
         self.assertEqual(sorted(ran), ["1", "3"])
 
+    def test_a_chunks_verdict_is_red_for_a_finding_or_a_seed_not_passed(self):
+        """18 Nov 2026: a sweep's job found six failing seeds and ended done, its chunks exiting 0 by
+        design. A chunk's verdict, the job's last step, exits 1 then, and 0 only when every seed passed
+        (a cap reached at the target's cap is the sweep's setting, not a finding)."""
+        def verdict(rows, chosen="1-2"):
+            (self.out / "results.tsv").write_text(rows, encoding="utf-8")
+            return subprocess.run([sys.executable, str(ROOT / "scripts/seed-sweep.py"), "--targets",
+                                   str(self.args.targets), "verdict", str(self.out), "--seeds", chosen],
+                                  capture_output=True, text=True).returncode
+        self.assertEqual(verdict("1\tc:t\tok\t1.0\t8192\n2\tc:t\tFAILED(101)\t1.0\t8192\n"), 1)
+        self.assertEqual(verdict("1\tc:t\tok\t1.0\t8192\n2\tc:t\tINTERRUPTED\t1.0\t8192\n"), 1)
+        self.assertEqual(verdict("1\tc:t\tok\t1.0\t8192\n"), 1)  # seed 2 never ran
+        self.assertEqual(verdict("1\tc:t\tok\t1.0\t8192\n", "2-1"), 1)  # no seed: nothing judged
+        self.assertEqual(verdict("1\tc:t\tok\t1.0\t8192\n2\tc:t\tCAP-REACHED\t3.0\t8192\n"), 0)
+
 
 if __name__ == "__main__":
     unittest.main()

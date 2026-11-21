@@ -175,9 +175,8 @@ impl<'a> Negator<'a> {
                 })
                 .collect(),
             Axiom::DisjointUnion(class, xs) => {
-                let named = self.e(ClassExpr::Class(*class));
                 let union = self.e(ClassExpr::Or(xs.clone()));
-                let mut out = vec![self.sub(named, union), self.sub(union, named)];
+                let mut out = vec![self.sub(*class, union), self.sub(union, *class)];
                 for (a, b) in pairs(xs) {
                     let both = self.e(ClassExpr::And(sorted(vec![a, b])));
                     out.push(vec![Axiom::ClassAssertion(both, self.fresh())]);
@@ -336,7 +335,10 @@ pub fn import(from: &Ontology, axiom: &Axiom, to: &mut Ontology) -> Axiom {
         Axiom::DisjointClasses(xs) => {
             Axiom::DisjointClasses(sorted(xs.iter().map(|&x| c(x)).collect()))
         }
-        Axiom::DisjointUnion(k, xs) => Axiom::DisjointUnion(*k, xs.iter().map(|&x| c(x)).collect()),
+        Axiom::DisjointUnion(k, xs) => {
+            let k = c(*k);
+            Axiom::DisjointUnion(k, xs.iter().map(|&x| c(x)).collect())
+        }
         Axiom::ObjectPropertyDomain(r, x) => Axiom::ObjectPropertyDomain(*r, c(*x)),
         Axiom::ObjectPropertyRange(r, x) => Axiom::ObjectPropertyRange(*r, c(*x)),
         Axiom::DataPropertyDomain(p, x) => Axiom::DataPropertyDomain(*p, c(*x)),
