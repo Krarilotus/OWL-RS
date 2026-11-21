@@ -603,3 +603,327 @@ fn a_cached_rederived_fallback_ends_at_its_cancellation() {
         "a cancelled read fails as cancelled"
     );
 }
+
+const PATIENCE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Holds the caller until `event`; past `PATIENCE` the test fails with `what`.
+fn until(event: impl Fn() -> bool, what: &str) {
+    let started = std::time::Instant::now();
+    while !event() {
+        assert!(started.elapsed() < PATIENCE, "{what}");
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// Holds the build that reaches `point` next, until the returned sender is dropped (at most
+/// 20 s); the receiver hears once it is held.
+fn hold(
+    supports: &Supports,
+    point: gate::Point,
+) -> (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>) {
+    let (held, holding) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    supports.gate.set(point, move || {
+        let _ = held.send(());
+        let _ = released.recv_timeout(std::time::Duration::from_secs(20));
+    });
+    (release, holding)
+}
+
+/// A reader of `graph` who sees what its graphs support (`by_support`), or every inference.
+fn reader_of(graph: &str, by_support: bool) -> Arc<GraphAccess> {
+    Arc::new(GraphAccess {
+        graphs: vec![format!("{EX}{graph}")],
+        default_graph: true,
+        inferred: true,
+        inferred_by_support: by_support,
+        ..GraphAccess::default()
+    })
+}
+
+/// `access`'s read of `snapshot` through its view, on a thread of its own, under `token`:
+/// what it answers, sent once it returns.
+fn read(
+    store: &crate::StoreService,
+    snapshot: &Snapshot,
+    access: &Arc<GraphAccess>,
+    token: &CancellationToken,
+) -> std::sync::mpsc::Receiver<Result<Snapshot, Unavailable>> {
+    let supports = Arc::clone(store.supports());
+    let (snapshot, access, token) = (snapshot.clone(), Arc::clone(access), token.clone());
+    let (compilation, memory) = (store.support_compilation(), store.envelope(None));
+    let (answer, answered) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let made = supports.view(&snapshot, &access, compilation, &memory, Some(&token));
+        let _ = answer.send(made);
+    });
+    answered
+}
+
+/// Holds the caller until a reader waits on the latch at `point` (for a view, `access`'s):
+/// polled, as a waiter's count dips between its sleeps.
+fn until_joined(supports: &Supports, point: gate::Point, access: Option<&GraphAccess>) {
+    until(
+        || supports.waiting(point, access) >= 1,
+        "no reader waited on the latch",
+    );
+}
+
+/// Spec (`Supports::view`: `Err` when the reading query is cancelled): a reader waiting on a
+/// build another started leaves at its own cancellation, `Cancelled`, while that build is
+/// held; the build goes on, is kept, and answers the next read. Three latches, a case each:
+/// the sets, built by the background thread (D16-1046, row 12); the re-derived facts, built
+/// by reader A for a reader of other graphs B; a view, built by A for B of the same access.
+/// Before, B waited in the latch's `get_or_init` until the build ended.
+#[test]
+fn a_reader_waiting_on_anothers_build_leaves_at_its_cancellation_and_the_build_goes_on() {
+    // The latches whose cancelled reader stayed: every case runs, then the test answers.
+    let mut stayed = Vec::new();
+    // Case 1: the sets, held in the background build.
+    {
+        let store = past_the_cap();
+        let supports = store.supports();
+        let snapshot = store.read_snapshot(None).unwrap();
+        let (release, holding) = hold(supports, gate::Point::Sets);
+        supports.prepare(
+            snapshot.clone(),
+            store.support_compilation(),
+            store.envelope(None),
+        );
+        holding
+            .recv_timeout(PATIENCE)
+            .expect("the background build is held");
+        let g16 = reader_of("g16", true);
+        let token = CancellationToken::new();
+        let answered = read(&store, &snapshot, &g16, &token);
+        until_joined(supports, gate::Point::Sets, None);
+        token.cancel();
+        let left = answered.recv_timeout(std::time::Duration::from_secs(10));
+        drop(release);
+        if !matches!(left, Ok(Err(Unavailable::Cancelled))) {
+            stayed.push("the sets");
+        }
+        until(
+            || store.support_statistics().computed == 1,
+            "the background build never ended",
+        );
+        let view = supports
+            .view(
+                &snapshot,
+                &g16,
+                store.support_compilation(),
+                &store.envelope(None),
+                None,
+            )
+            .expect("g16's read after the build");
+        assert!(view.contains_in(ReadModel::Inferred, &w_a_d(&snapshot)));
+        assert_eq!(
+            store.support_statistics().computed,
+            1,
+            "the sets computed again"
+        );
+    }
+    // Case 2: the re-derived facts, held in A's build.
+    {
+        let store = past_the_cap();
+        let supports = store.supports();
+        let snapshot = store.read_snapshot(None).unwrap();
+        let (release, holding) = hold(supports, gate::Point::Rederived);
+        let a = read(
+            &store,
+            &snapshot,
+            &reader_of("g16", false),
+            &CancellationToken::new(),
+        );
+        holding
+            .recv_timeout(PATIENCE)
+            .expect("A's re-derived facts are held");
+        let token = CancellationToken::new();
+        let b = read(&store, &snapshot, &reader_of("g15", false), &token);
+        until_joined(supports, gate::Point::Rederived, None);
+        token.cancel();
+        let left = b.recv_timeout(std::time::Duration::from_secs(10));
+        drop(release);
+        if !matches!(left, Ok(Err(Unavailable::Cancelled))) {
+            stayed.push("the re-derived facts");
+        }
+        assert!(
+            a.recv_timeout(PATIENCE).is_ok_and(|made| made.is_ok()),
+            "A's read, its build let go"
+        );
+    }
+    // Case 3: a view, held in A's build, B of the same access.
+    {
+        let store = past_the_cap();
+        let supports = store.supports();
+        let snapshot = store.read_snapshot(None).unwrap();
+        let (release, holding) = hold(supports, gate::Point::View);
+        let g16 = reader_of("g16", true);
+        let a = read(&store, &snapshot, &g16, &CancellationToken::new());
+        holding.recv_timeout(PATIENCE).expect("A's view is held");
+        let token = CancellationToken::new();
+        let b = read(&store, &snapshot, &g16, &token);
+        until_joined(supports, gate::Point::View, Some(&g16));
+        token.cancel();
+        let left = b.recv_timeout(std::time::Duration::from_secs(10));
+        drop(release);
+        if !matches!(left, Ok(Err(Unavailable::Cancelled))) {
+            stayed.push("a view");
+        }
+        assert!(
+            a.recv_timeout(PATIENCE).is_ok_and(|made| made.is_ok()),
+            "A's read, its build let go"
+        );
+    }
+    assert!(
+        stayed.is_empty(),
+        "a cancelled reader stayed for another's build, at: {stayed:?}"
+    );
+}
+
+/// Spec (`get_or_build`: a kept value is answered; `None` once `stop` has fired, the caller
+/// then building nothing): with a slot's build held by the test, a reader whose stop has
+/// fired builds nothing where that build is busy to its pool thread, or ends with no value
+/// while it waits; and a kept value is answered without joining a build under way. On a
+/// cold slot, a reader whose stop fired before its claim, or once it claimed, builds and
+/// keeps nothing. Five cases, each run before the test answers.
+#[test]
+fn a_reader_whose_stop_fired_builds_nothing_and_a_kept_value_joins_no_build() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let mut wrong = Vec::new();
+    // Case 1: on a pool thread, its stop fired: the build under way is busy to it.
+    {
+        let slot: Slot<u64> = Slot::default();
+        let Claim::Build(_held) = slot.build.claim((), Kind::Opaque, || None) else {
+            panic!("the first claim builds");
+        };
+        let built = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let got = pool.install(|| {
+            get_or_build(&slot, &|| true, || {
+                built.fetch_add(1, SeqCst);
+                3
+            })
+        });
+        if got.is_some() || built.load(SeqCst) > 0 {
+            wrong.push("busy to a pool thread");
+        }
+    }
+    // Case 2: off the pool, the build it waits for ends with no value (abandoned), and its
+    // stop fires with it: the stop reads the cell, so no timing tells the two apart.
+    {
+        let slot: Arc<Slot<u64>> = Arc::default();
+        let built = Arc::new(AtomicUsize::new(0));
+        let Claim::Build(held) = slot.build.claim((), Kind::Opaque, || None) else {
+            panic!("the first claim builds");
+        };
+        let (answer, answered) = std::sync::mpsc::channel();
+        {
+            let (slot, built) = (Arc::clone(&slot), Arc::clone(&built));
+            std::thread::spawn(move || {
+                let stop = || slot.build.is_idle();
+                let got = get_or_build(&slot, &stop, || {
+                    built.fetch_add(1, SeqCst);
+                    3
+                });
+                let _ = answer.send(got);
+            });
+        }
+        until(|| slot.build.waiting(&()) >= 1, "the reader never waited");
+        drop(held);
+        let got = answered.recv_timeout(PATIENCE);
+        if !matches!(got, Ok(None)) || built.load(SeqCst) > 0 {
+            wrong.push("abandoned while it waited");
+        }
+    }
+    // Case 3: a value kept while its build is still under way (kept, not yet ended), off
+    // the pool, its stop fired: the kept value.
+    {
+        let slot: Slot<u64> = Slot::default();
+        let Claim::Build(_held) = slot.build.claim((), Kind::Opaque, || None) else {
+            panic!("the first claim builds");
+        };
+        let _ = slot.kept.set(Arc::new(5));
+        if get_or_build(&slot, &|| true, || 3) != Some(5) {
+            wrong.push("kept, a build under way");
+        }
+    }
+    // Case 4: a cold slot, its stop fired before the claim: nothing built, kept or claimed
+    // (a claim let go at once would end abandoned).
+    {
+        let slot: Slot<u64> = Slot::default();
+        let built = AtomicUsize::new(0);
+        let got = get_or_build(&slot, &|| true, || {
+            built.fetch_add(1, SeqCst);
+            3
+        });
+        if got.is_some()
+            || built.load(SeqCst) > 0
+            || slot.get().is_some()
+            || !slot.build.is_idle()
+            || slot.build.ends().abandoned != 0
+        {
+            wrong.push("cold, stopped before the claim");
+        }
+    }
+    // Case 5: a cold slot, its stop firing once the claim is made: the claimed build is let
+    // go unrun, nothing kept, and it ends abandoned (its waiters claim again).
+    {
+        let slot: Slot<u64> = Slot::default();
+        let (asked, built) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let stop = || asked.fetch_add(1, SeqCst) >= 1;
+        let got = get_or_build(&slot, &stop, || {
+            built.fetch_add(1, SeqCst);
+            3
+        });
+        if got.is_some()
+            || built.load(SeqCst) > 0
+            || slot.get().is_some()
+            || !slot.build.is_idle()
+            || slot.build.ends().abandoned != 1
+        {
+            wrong.push("cold, stopped once claimed");
+        }
+    }
+    assert!(wrong.is_empty(), "wrong at: {wrong:?}");
+}
+
+/// Spec (`Supports::view`: a computation it waited for that another reader's cancellation
+/// stopped is made again, by this read): B, joined to A's build of the re-derived facts,
+/// reads again once A's cancellation ends that build, and answers.
+#[test]
+fn a_reader_whose_builder_was_cancelled_builds_again_and_answers() {
+    let store = past_the_cap();
+    let supports = store.supports();
+    let snapshot = store.read_snapshot(None).unwrap();
+    let (release, holding) = hold(supports, gate::Point::Rederived);
+    let token = CancellationToken::new();
+    let a = read(&store, &snapshot, &reader_of("g16", false), &token);
+    holding
+        .recv_timeout(PATIENCE)
+        .expect("A's re-derived facts are held");
+    let b = read(
+        &store,
+        &snapshot,
+        &reader_of("g15", false),
+        &CancellationToken::new(),
+    );
+    until_joined(supports, gate::Point::Rederived, None);
+    token.cancel();
+    drop(release);
+    assert!(
+        matches!(a.recv_timeout(PATIENCE), Ok(Err(Unavailable::Cancelled))),
+        "A, cancelled, fails as cancelled"
+    );
+    let view = b
+        .recv_timeout(PATIENCE)
+        .expect("B returned")
+        .expect("B read again and answered");
+    assert!(
+        view.contains_in(ReadModel::Inferred, &w_a_d(&snapshot)),
+        "g15's reader derives w a D"
+    );
+}
