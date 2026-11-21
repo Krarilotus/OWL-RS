@@ -54,7 +54,7 @@ use super::eval::{
 };
 use super::ir::Triple;
 use super::ir::{Head, Rule};
-use super::lists::{ListDiagnostic, ListVocabulary, instantiate};
+use super::lists::{ListDiagnostic, ListVocabulary, Predicates, RuleKind, internal};
 use super::violations::{Violations, unlimited};
 
 /// The materialised state: asserted facts after the change, and inferred facts before it.
@@ -213,12 +213,13 @@ pub struct Rules<'a> {
 impl Rules<'_> {
     /// The ground program over `source`; its bodiless facts count as handed out. List
     /// rules carry the list facts they come from as premises.
-    fn program<B: Base + ?Sized>(&self, source: &Overlay<'_, B>) -> GroundProgram {
+    fn program<S: Source + ?Sized>(&self, source: &S, predicates: Predicates) -> GroundProgram {
         let mut program = GroundProgram::default();
+        program.list_predicates = predicates;
         program.ground(source, self.schema, self.rules);
-        // The overlays a program is ground over hold in `extra` only the facts a change
-        // deleted (the state before it), never inferred ones.
-        if let Some((rules, premises, diagnostics)) = self.read_lists(source, Some(source.extra)) {
+        if let Some((rules, premises, diagnostics)) =
+            self.read_lists(source, &mut program.list_predicates)
+        {
             program.ground_with_premises(source, self.schema, &rules, &premises);
             program.list_diagnostics = diagnostics;
         }
@@ -226,37 +227,27 @@ impl Rules<'_> {
         program
     }
 
-    /// The list rules (both kinds) instantiated over `source`. Overdeletion compares the
-    /// inference rules alone: the closure's reading, which a reading as written adds nothing
-    /// to ([`Self::read_lists`]).
-    fn list_rules<S: Source + ?Sized>(&self, source: &S) -> Vec<Rule> {
+    /// The list rules instantiated over `source` for overdeletion.
+    fn list_rules<S: Source + ?Sized>(&self, source: &S, mut predicates: Predicates) -> Vec<Rule> {
         #[cfg(test)]
         crate::witness::add(crate::witness::Site::ListRules, 1);
-        self.lists
-            .map(|vocabulary| instantiate(vocabulary, &AllFacts(source)).0)
+        self.read_lists(source, &mut predicates)
+            .map(|(rules, _, _)| rules)
             .unwrap_or_default()
     }
 
-    /// The list rules over `source`, with the list facts each comes from, and the lists left
-    /// out ([`super::lists::instantiate_written`]). A list past the cap over `source` is read
-    /// as written as well: over the asserted facts of `source.base` that `source` doesn't
-    /// hide, and `deleted`, asserted before a change where `source` is the state before it.
-    /// Every grounding of list rules reads them here, so all read them alike.
-    fn read_lists<B: Base + ?Sized>(
+    /// The list rules over `source`, their premises, and the lists left out.
+    fn read_lists<S: Source + ?Sized>(
         &self,
-        source: &Overlay<'_, B>,
-        deleted: Option<&Store>,
+        source: &S,
+        predicates: &mut Predicates,
     ) -> Option<ListRules> {
-        let written = Written {
-            base: source.base,
-            hidden: source.hidden,
-            deleted,
-        };
         let vocabulary = self.lists?;
-        Some(super::lists::instantiate_written(
+        Some(super::lists::compile(
             vocabulary,
             &AllFacts(source),
-            Some(&written),
+            predicates,
+            RuleKind::All,
         ))
     }
 
@@ -292,10 +283,7 @@ pub struct Update {
     /// List axioms the change left uninstantiable (malformed, cyclic, oversized) that
     /// weren't before.
     pub diagnostics: Vec<super::lists::ListDiagnostic>,
-    /// Whether the change reads an axiom's list otherwise: one left out after it that was
-    /// read before, read after it that was left out before, or left out for another reason
-    /// ([`super::lists::ListProblem::kind`]). The rules such a list gives, or gave, aren't
-    /// the ones the program before held, so the delta can't follow them.
+    /// Whether any list goes between having an accepting walk and having none.
     pub lists_read_otherwise: bool,
     pub rounds: usize,
     /// Time per phase: program, overdelete, rederive, insert, consistency.
@@ -328,6 +316,7 @@ struct Overlay<'a, B: Base + ?Sized> {
     base: &'a B,
     hidden: &'a HashSet<Triple>,
     extra: &'a Store,
+    table: Option<&'a Store>,
 }
 
 impl<B: Base + ?Sized> Overlay<'_, B> {
@@ -339,45 +328,6 @@ impl<B: Base + ?Sized> Overlay<'_, B> {
 /// List rules, the list facts each comes from, and the lists left out.
 type ListRules = (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>);
 
-/// The asserted facts of a state over `base`, for list instantiation, which is grounding: run
-/// to its end. The base's asserted facts (after the change) it doesn't hide, and `deleted`.
-struct Written<'a, B: Base + ?Sized> {
-    base: &'a B,
-    hidden: &'a HashSet<Triple>,
-    deleted: Option<&'a Store>,
-}
-
-impl<B: Base + ?Sized> Written<'_, B> {
-    fn matching(&self, pattern: [Option<u64>; 3]) -> Vec<Triple> {
-        let poll = Poller::never();
-        let mut out = Vec::new();
-        if let Some(deleted) = self.deleted {
-            (deleted.scan(pattern, Seg::All, &poll, &mut |t| out.push(t))).expect("never stopped");
-        }
-        let scanned = self.base.scan_asserted(pattern, &poll, &mut |t| {
-            if !self.hidden.contains(&t) {
-                out.push(t);
-            }
-        });
-        scanned.expect("never stopped");
-        out.sort_unstable();
-        out.dedup();
-        out
-    }
-}
-
-impl<B: Base + ?Sized> super::lists::Facts for Written<'_, B> {
-    fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
-        let found = self.matching([Some(subject), Some(predicate), None]);
-        found.into_iter().map(|t| t[2]).collect()
-    }
-
-    fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
-        let found = self.matching([None, Some(predicate), None]);
-        found.into_iter().map(|t| (t[0], t[2])).collect()
-    }
-}
-
 /// Reads count on the base's and the extra store's (each position they visit), and each
 /// base fact's check against the overlay on the extra store's probe.
 impl<B: Base + ?Sized> Visits for Overlay<'_, B> {
@@ -386,6 +336,15 @@ impl<B: Base + ?Sized> Visits for Overlay<'_, B> {
         self.extra.visit(pattern, seg, visit);
         if seg != Seg::Delta && !visit.stopped() {
             let poll = visit.poller();
+            if pattern[1].is_some_and(internal) {
+                if let Some(table) = self.table {
+                    visit.kept(
+                        |fact| self.in_base(fact, poll) == Ok(true),
+                        |inner| table.visit(pattern, Seg::All, inner),
+                    );
+                }
+                return;
+            }
             // The base's scan counts each position it visits on this visit's poller; a check
             // its poller stopped delivers nothing, and the scan ends at its next position.
             // Stopped, the read around this visit answers `Stopped` (the poller is latched).
@@ -417,6 +376,13 @@ impl<B: Base + ?Sized> Visits for Overlay<'_, B> {
     ) -> Result<usize, Stopped> {
         let seg = seg.plain();
         let extra = self.extra.size(pattern, seg, probe)?;
+        if pattern[1].is_some_and(internal) {
+            let held = match self.table.filter(|_| seg != Seg::Delta) {
+                Some(table) => table.size(pattern, Seg::All, probe)?,
+                None => 0,
+            };
+            return Ok(extra.saturating_add(held));
+        }
         Ok(match seg {
             // The base's estimate saturates (`Snapshot::count_in`), so the sum does too.
             Seg::Old | Seg::All => {
@@ -428,18 +394,125 @@ impl<B: Base + ?Sized> Visits for Overlay<'_, B> {
 
     fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
         Ok(self.extra.holds(fact, probe)?
-            || (!self.hidden.contains(&fact) && self.base.contains(fact, probe.poller())?))
+            || (!self.hidden.contains(&fact)
+                && if internal(fact[1]) {
+                    table_contains(self.table, fact, probe.poller())?
+                } else {
+                    self.base.contains(fact, probe.poller())?
+                }))
     }
 }
 
 /// The ground program of the materialised state `base`: the cache [`update`] takes.
 pub fn program<B: Base + ?Sized>(base: &B, rules: Rules<'_>) -> GroundProgram {
+    program_until(base, rules, NEVER).expect("unbounded grounding")
+}
+
+pub(crate) fn program_until<B: Base + ?Sized>(
+    base: &B,
+    rules: Rules<'_>,
+    stop: Stop<'_>,
+) -> Result<GroundProgram, Stopped> {
     let (hidden, extra) = (HashSet::new(), Store::default());
-    rules.program(&Overlay {
+    let source = Overlay {
         base,
         hidden: &hidden,
         extra: &extra,
-    })
+        table: None,
+    };
+    let mut program = rules.program(&source, Predicates::default());
+    program.table = rebuild_table(&program, &source, stop)?;
+    Ok(program)
+}
+
+fn table_contains(table: Option<&Store>, fact: Triple, poll: &Poller<'_>) -> Result<bool, Stopped> {
+    table.map_or(Ok(false), |table| table.contains(fact, poll))
+}
+
+/// Ground rules can read private relations by their reserved predicate. A
+/// variable-predicate read over RDF facts never ranges over them.
+pub(crate) struct TableSource<'a, S: ?Sized> {
+    pub(crate) source: &'a S,
+    pub(crate) table: Option<&'a Store>,
+}
+
+impl<S: Source + ?Sized> Visits for TableSource<'_, S> {
+    fn visit(&self, pattern: [Option<u64>; 3], seg: Seg, visit: &mut Visit<'_, '_>) {
+        if pattern[1].is_some_and(internal) {
+            if let Some(table) = self.table {
+                table.visit(pattern, seg, visit);
+            }
+        } else {
+            let read = self.source.scan(pattern, seg, visit.poller(), &mut |fact| {
+                visit.counted(fact)
+            });
+            debug_assert!(read.is_ok() || visit.stopped());
+        }
+    }
+
+    fn size(
+        &self,
+        pattern: [Option<u64>; 3],
+        seg: Seg,
+        probe: Probe<'_, '_>,
+    ) -> Result<usize, Stopped> {
+        if pattern[1].is_some_and(internal) {
+            self.table
+                .map_or(Ok(0), |table| table.size(pattern, seg, probe))
+        } else {
+            self.source.estimate(pattern, seg, probe.poller())
+        }
+    }
+
+    fn holds(&self, fact: Triple, probe: Probe<'_, '_>) -> Result<bool, Stopped> {
+        if internal(fact[1]) {
+            table_contains(self.table, fact, probe.poller())
+        } else {
+            self.source.contains(fact, probe.poller())
+        }
+    }
+}
+
+fn rebuild_table<S: Source + ?Sized>(
+    program: &GroundProgram,
+    source: &S,
+    stop: Stop<'_>,
+) -> Result<Option<Arc<Store>>, Stopped> {
+    if program.table_rules.is_empty() {
+        return Ok(None);
+    }
+    let stage = Poller::new(stop).ok_or(Stopped)?;
+    let mut table = Store::default();
+    let mut initial = true;
+    loop {
+        let state = TableSource {
+            source,
+            table: Some(&table),
+        };
+        let mut jobs = Vec::new();
+        if initial {
+            for &rule in &program.table_rules {
+                jobs.extend(Job::full(&state, &program.rules[rule], &stage)?);
+            }
+            initial = false;
+        } else {
+            for (rule, atom) in program.variants(&table, &stage)? {
+                if program.table_rules.binary_search(&rule).is_ok() {
+                    jobs.extend(Job::variant(&state, &program.rules[rule], atom, &stage)?);
+                }
+            }
+        }
+        let candidates = run_jobs(
+            &state,
+            &jobs,
+            &|fact, poll| Ok(!state.contains(fact, poll)?),
+            stop,
+        )?;
+        stage.ended()?;
+        if table.advance(candidates).is_empty() {
+            return Ok(Some(Arc::new(table)));
+        }
+    }
 }
 
 /// Maintains the materialisation of `base` under `rules` for a change of the asserted
@@ -637,15 +710,25 @@ fn update_body<B: Base + ?Sized>(
     let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
     // The ground program of the old state: `base` without the inserted facts, plus the
     // deleted ones.
-    let computed: Option<GroundProgram> = cache.is_none().then(|| {
-        let extra = Store::new(deleted.to_vec());
-        rules.program(&Overlay {
-            base,
-            hidden: &inserted_set,
-            extra: &extra,
+    let computed: Option<GroundProgram> = cache
+        .is_none()
+        .then(|| {
+            let extra = Store::new(deleted.to_vec());
+            let before = Overlay {
+                base,
+                hidden: &inserted_set,
+                extra: &extra,
+                table: None,
+            };
+            let mut program = rules.program(&before, Predicates::default());
+            program.table = rebuild_table(&program, &before, stop)?;
+            Ok(program)
         })
-    });
+        .transpose()
+        .map_err(stopped)?;
     let old_program: &GroundProgram = cache.or(computed.as_ref()).expect("one of them");
+    let table = old_program.table.as_deref();
+    let predicates = || old_program.list_predicates.clone();
     // The ground rules that are non-recursive ([`super::recursion`]): a candidate for
     // overdeletion that one of them still derives in one step from what is left keeps
     // that derivation (its premises are below it: if one goes later in the commit, its
@@ -660,6 +743,7 @@ fn update_body<B: Base + ?Sized>(
             base,
             hidden: &inserted_set,
             extra: &Store::new(deleted.to_vec()),
+            table,
         };
         // A partner read a stop cut short ends the update: the keys asked about are the
         // grounded rules', which grow with the schema.
@@ -717,6 +801,7 @@ fn update_body<B: Base + ?Sized>(
                 base,
                 hidden: &inserted_set,
                 extra: &extra,
+                table,
             };
             // Instances through a deleted schema fact, known or not, in full.
             let mut scratch = GroundProgram::default();
@@ -748,9 +833,13 @@ fn update_body<B: Base + ?Sized>(
                     base,
                     hidden: &gone,
                     extra: &empty,
+                    table,
                 };
-                let current: HashSet<RuleKey> =
-                    rules.list_rules(&now).iter().map(rule_key).collect();
+                let current: HashSet<RuleKey> = rules
+                    .list_rules(&now, predicates())
+                    .iter()
+                    .map(rule_key)
+                    .collect();
                 // A stop asked during that extraction is seen before the next one.
                 check_stop()?;
                 let old_lists = old_lists.get_or_insert_with(|| {
@@ -760,9 +849,10 @@ fn update_body<B: Base + ?Sized>(
                         base,
                         hidden: &inserted_set,
                         extra: &at_start,
+                        table,
                     };
                     rules
-                        .list_rules(&old)
+                        .list_rules(&old, predicates())
                         .into_iter()
                         .filter(|r| r.head != Head::Inconsistent)
                         .collect()
@@ -903,10 +993,12 @@ fn update_body<B: Base + ?Sized>(
             }
             // Only inferred facts of the old state are overdeleted; asserted ones stay.
             let overdeletable = |f: Triple, poll: &Poller<'_>| -> Result<bool, Stopped> {
-                Ok(base.contains(f, poll)?
-                    && !base.is_asserted(f, poll)?
-                    && !extra.contains(f, poll)?
-                    && !inserted_set.contains(&f))
+                let inferred = if internal(f[1]) {
+                    table_contains(table, f, poll)?
+                } else {
+                    base.contains(f, poll)? && !base.is_asserted(f, poll)?
+                };
+                Ok(inferred && !extra.contains(f, poll)? && !inserted_set.contains(&f))
             };
             let mut candidates =
                 run_jobs_acyclic(&old, &jobs, &overdeletable, stop).map_err(stopped)?;
@@ -971,6 +1063,7 @@ fn update_body<B: Base + ?Sized>(
                     base,
                     hidden: &gone,
                     extra: &empty,
+                    table,
                 };
                 candidates.sort_unstable();
                 candidates.dedup();
@@ -1052,13 +1145,21 @@ fn update_body<B: Base + ?Sized>(
         .iter()
         .chain(&overdeleted)
         .any(|&f| rules.is_program_fact(f));
+    let mut lists_changed = deleted
+        .iter()
+        .chain(&overdeleted)
+        .any(|&f| rules.is_list_fact(f));
     let settle = |unsettled: &HashSet<Triple>| -> Cow<'_, GroundProgram> {
         if program_changed {
-            Cow::Owned(rules.program(&Overlay {
-                base,
-                hidden: unsettled,
-                extra: &empty,
-            }))
+            Cow::Owned(rules.program(
+                &Overlay {
+                    base,
+                    hidden: unsettled,
+                    extra: &empty,
+                    table,
+                },
+                predicates(),
+            ))
         } else {
             Cow::Borrowed(old_program)
         }
@@ -1086,6 +1187,7 @@ fn update_body<B: Base + ?Sized>(
                 base,
                 hidden: &unsettled,
                 extra: &empty,
+                table,
             };
             let not_equality: Vec<bool> = program
                 .equality
@@ -1163,6 +1265,7 @@ fn update_body<B: Base + ?Sized>(
         base,
         hidden: &unsettled,
         extra: &empty,
+        table,
     };
     let candidates: Vec<Triple> = overdeleted
         .iter()
@@ -1181,7 +1284,7 @@ fn update_body<B: Base + ?Sized>(
             |poll, fact| -> Result<Option<Triple>, Stopped> {
                 let poll = poll.as_ref().ok_or(Stopped)?;
                 let recloses = recloses.contains(&fact[1]);
-                Ok((!base.is_asserted(fact, poll)?
+                Ok(((internal(fact[1]) || !base.is_asserted(fact, poll)?)
                     && settled.derivable_with(&remaining, fact, !recloses, stop)?)
                 .then_some(fact))
             },
@@ -1211,6 +1314,7 @@ fn update_body<B: Base + ?Sized>(
             base,
             hidden: &hidden,
             extra: &extra,
+            table,
         };
         // Instances through new schema facts, and list rules from new list facts. They
         // are appended, so the new ones are `evaluated..`.
@@ -1227,10 +1331,12 @@ fn update_body<B: Base + ?Sized>(
         if delta_facts.iter().any(|&f| schema.is_schema_fact(f)) {
             program.to_mut().ground_delta(&state, schema, &schema_rules);
         }
-        if delta_facts.iter().any(|&f| rules.is_list_fact(f))
-            && let Some((list_rules, premises, diagnostics)) = rules.read_lists(&state, None)
-        {
+        if rules.lists.is_some() && delta_facts.iter().any(|&f| rules.is_list_fact(f)) {
+            lists_changed = true;
             let program = program.to_mut();
+            let (list_rules, premises, diagnostics) = rules
+                .read_lists(&state, &mut program.list_predicates)
+                .expect("list vocabulary");
             program.ground_with_premises(&state, schema, &list_rules, &premises);
             program.list_diagnostics = diagnostics;
         }
@@ -1307,6 +1413,12 @@ fn update_body<B: Base + ?Sized>(
     extra
         .scan([None, None, None], Seg::All, &stage, &mut |f| added.push(f))
         .map_err(stopped)?;
+    let mut internal_added = Vec::new();
+    if !program.table_rules.is_empty() {
+        extra
+            .scan_table(&stage, |fact| internal_added.push(fact))
+            .map_err(stopped)?;
+    }
     added.sort_unstable();
     added.dedup();
     // Two probes per added fact, on the stage's poller; the first that finds it stopped ends
@@ -1331,7 +1443,7 @@ fn update_body<B: Base + ?Sized>(
     result.remove = overdeleted
         .iter()
         .copied()
-        .filter(|f| !kept.contains(f) && !put_back.contains(f))
+        .filter(|f| !internal(f[1]) && !kept.contains(f) && !put_back.contains(f))
         .collect();
     result.remove.sort_unstable();
     result.policy.plan = if region.is_empty() {
@@ -1359,6 +1471,7 @@ fn update_body<B: Base + ?Sized>(
         base,
         hidden: &hidden,
         extra: &fresh,
+        table,
     };
     // When phase 2 borrows the old program, phase 3 only appends instances.
     let first_full = if program_changed {
@@ -1426,13 +1539,40 @@ fn update_body<B: Base + ?Sized>(
         .filter(|d| !old_program.list_diagnostics.contains(d))
         .copied()
         .collect();
-    let reading = |p: &GroundProgram| -> HashSet<(u64, u64, u64, &'static str)> {
+    let reading = |p: &GroundProgram| -> HashSet<(u64, u64, u64)> {
         (p.list_diagnostics.iter())
-            .map(|d| (d.subject, d.predicate, d.head, d.problem.kind()))
+            .map(|d| (d.subject, d.predicate, d.head))
             .collect()
     };
     result.lists_read_otherwise =
         matches!(program, Cow::Owned(_)) && reading(&program) != reading(old_program);
+    if lists_changed {
+        // Temporary programs grow monotonically through insertion rounds.
+        // The cached one uses the final forms and carries only their facts.
+        let state = Overlay {
+            base,
+            hidden: &hidden,
+            extra: &extra,
+            table: None,
+        };
+        let mut current = rules.program(&state, program.list_predicates.clone());
+        current.table = rebuild_table(&current, &state, stop).map_err(stopped)?;
+        program = Cow::Owned(current);
+    } else if !internal_added.is_empty() || overdeleted.iter().any(|fact| internal(fact[1])) {
+        if let Some(table) = table {
+            table
+                .scan_table(&stage, |fact| {
+                    if !overdeleted.contains(&fact) || put_back.contains(&fact) {
+                        internal_added.push(fact);
+                    }
+                })
+                .map_err(stopped)?;
+        }
+        check_stop()?;
+        program.to_mut().table = Some(Arc::new(Store::new(internal_added)));
+    } else if matches!(program, Cow::Owned(_)) {
+        program.to_mut().table = old_program.table.clone();
+    }
     result.program = match program {
         Cow::Owned(program) => Some(program),
         Cow::Borrowed(_) => None,
@@ -1482,11 +1622,15 @@ fn introduced_violations_body<B: Base + ?Sized>(
     let inserted_set: HashSet<Triple> = inserted.iter().copied().collect();
     let empty = Store::default();
     let computed: Option<GroundProgram> = cache.is_none().then(|| {
-        rules.program(&Overlay {
-            base,
-            hidden: &inserted_set,
-            extra: &empty,
-        })
+        rules.program(
+            &Overlay {
+                base,
+                hidden: &inserted_set,
+                extra: &empty,
+                table: None,
+            },
+            Predicates::default(),
+        )
     });
     let old_program: &GroundProgram = cache.or(computed.as_ref()).expect("one of them");
     let settled_consistency = old_program.consistency.len();
@@ -1500,6 +1644,7 @@ fn introduced_violations_body<B: Base + ?Sized>(
         base,
         hidden: &hidden,
         extra: &fresh,
+        table: old_program.table.as_deref(),
     };
     let mut program: Cow<'_, GroundProgram> = Cow::Borrowed(old_program);
     let stage = Poller::new(stop).ok_or_else(Interrupted::default)?;
@@ -1517,10 +1662,11 @@ fn introduced_violations_body<B: Base + ?Sized>(
             .to_mut()
             .ground_delta(&state, rules.schema, &rules.schema_rules());
     }
-    if delta_facts.iter().any(|&f| rules.is_list_fact(f))
-        && let Some((list_rules, premises, diagnostics)) = rules.read_lists(&state, None)
-    {
+    if rules.lists.is_some() && delta_facts.iter().any(|&f| rules.is_list_fact(f)) {
         let program = program.to_mut();
+        let (list_rules, premises, diagnostics) = rules
+            .read_lists(&state, &mut program.list_predicates)
+            .expect("list vocabulary");
         program.ground_with_premises(&state, rules.schema, &list_rules, &premises);
         program.list_diagnostics = diagnostics;
     }

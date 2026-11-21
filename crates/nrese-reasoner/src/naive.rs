@@ -11,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::eval::Poller;
 use super::ir::{Atom, Head, Rule, Term};
-use super::lists::{Facts, ListVocabulary, instantiate_written};
+use super::lists::{Facts, ListVocabulary, Predicates, RuleKind, compile, internal};
 
 pub use super::ir::{Triple, Violation};
 
@@ -117,6 +117,9 @@ fn matches(rule: &Rule, index: &Index, emit: &mut dyn FnMut(&[Option<u64>])) {
         let Atom(terms) = rule.body[atom];
         let bound = terms.map(|t| value(t, bindings));
         for fact in index.candidates(bound[0], bound[1], bound[2]) {
+            if bound[1].is_none() && internal(fact[1]) {
+                continue;
+            }
             // Bind this atom's variables, checking repeated ones and constants.
             let mut newly = Vec::new();
             let mut consistent = true;
@@ -160,16 +163,14 @@ pub fn materialise(input: &[Triple], rules: &[Rule], lists: Option<&ListVocabula
     let input_set: HashSet<Triple> = input.iter().copied().collect();
     let mut facts: HashSet<Triple> = input_set.clone();
     let mut closure = Closure::default();
-    // The input as written: past the cap, a list's clash checks are read from it too, as
-    // every executor reads them ([`super::lists::instantiate_written`]).
-    let written = Index::new(input.iter().copied());
+    let mut predicates = Predicates::default();
     loop {
         closure.rounds += 1;
         let index = Index::new(facts.iter().copied());
         let mut program: Vec<Rule> = rules.to_vec();
         if let Some(vocabulary) = lists {
             let (list_rules, _, diagnostics) =
-                instantiate_written(vocabulary, &index, Some(&written));
+                compile(vocabulary, &index, &mut predicates, RuleKind::All);
             program.extend(list_rules);
             closure.diagnostics = diagnostics;
         }
@@ -205,6 +206,10 @@ pub fn materialise(input: &[Triple], rules: &[Rule], lists: Option<&ListVocabula
         }
         facts.extend(new);
     }
-    closure.derived = facts.difference(&input_set).copied().collect();
+    closure.derived = facts
+        .difference(&input_set)
+        .filter(|fact| !internal(fact[1]))
+        .copied()
+        .collect();
     closure
 }

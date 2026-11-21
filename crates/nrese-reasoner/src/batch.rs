@@ -36,7 +36,7 @@ use super::eval::{
 };
 use super::ir::Triple;
 use super::ir::{Guard, Head, Rule, SharedClasses, Term};
-use super::lists::{ListVocabulary, instantiate};
+use super::lists::{ListVocabulary, Predicates, RuleKind, internal};
 use super::representatives::{EqualityClasses, Guarded, over_classes};
 use super::violations::{Violations, unlimited};
 use nrese_exec::Budget;
@@ -1678,12 +1678,29 @@ impl Store {
         Ok(starts)
     }
 
-    /// The relation of `p`, or every relation where `p` is open, with their predicates.
+    /// The relation of `p`, or every RDF relation where `p` is open.
     fn relations_of(&self, p: Option<u64>) -> Box<dyn Iterator<Item = (u64, &Relation)> + '_> {
         match p {
             Some(p) => Box::new(self.relation(p).map(|r| (p, r)).into_iter()),
-            None => Box::new(self.predicates.iter().copied().zip(&self.relations)),
+            None => Box::new(
+                self.predicates
+                    .iter()
+                    .copied()
+                    .zip(&self.relations)
+                    .filter(|&(p, _)| !internal(p)),
+            ),
         }
+    }
+
+    pub(crate) fn scan_table(
+        &self,
+        poll: &Poller<'_>,
+        mut read: impl FnMut(Triple),
+    ) -> Result<(), Stopped> {
+        for &predicate in self.predicates.iter().filter(|&&p| internal(p)) {
+            self.scan([None, Some(predicate), None], Seg::All, poll, &mut read)?;
+        }
+        poll.ended()
     }
 
     /// Adds `candidates` and makes the new ones the delta; returns the new ones.
@@ -1726,6 +1743,7 @@ impl Store {
             .relations
             .into_iter()
             .zip(self.predicates)
+            .filter(|&(_, p)| !internal(p))
             .map(|(relation, p)| (p, [relation.base.so, relation.recent.so]))
             .collect();
         let mut out = Vec::with_capacity(
@@ -1762,6 +1780,7 @@ impl Store {
             .relations
             .par_iter()
             .zip(self.predicates.par_iter())
+            .filter(|&(_, &p)| !internal(p))
             .flat_map_iter(|(relation, &p)| {
                 relation
                     .input
@@ -1775,6 +1794,7 @@ impl Store {
             .relations
             .into_iter()
             .zip(self.predicates)
+            .filter(|&(_, p)| !internal(p))
             .map(|(relation, p)| (p, [relation.base.so, relation.recent.so]))
             .collect();
         // At most this many, so the list never grows by doubling: exactly, so a caller can
@@ -2054,7 +2074,9 @@ impl Visits for Store {
                     if !visit.skip() {
                         return;
                     }
-                    relation.scan(s, o, seg, &mut |at| on(visit, p, at));
+                    if !internal(p) {
+                        relation.scan(s, o, seg, &mut |at| on(visit, p, at));
+                    }
                 }
             }
         }
@@ -2071,8 +2093,8 @@ impl Visits for Store {
         let size = match p {
             Some(p) => self.relation(p).map_or(0, |r| r.estimate(s, o, seg, probe)),
             None => probe
-                .counted(&self.relations)
-                .map(|r| r.estimate(s, o, seg, probe))
+                .counted(self.relations_of(None))
+                .map(|(_, r)| r.estimate(s, o, seg, probe))
                 .sum(),
         };
         probe.ended()?;
@@ -2347,7 +2369,8 @@ impl Equality {
                     if t[0] != t[2] {
                         merged.push(t[0]);
                     }
-                } else if t.iter().any(|&term| has_partner(term) == Ok(true))
+                } else if !internal(t[1])
+                    && t.iter().any(|&term| has_partner(term) == Ok(true))
                     && !produced.contains(&t)
                 {
                     seeds.push(t);
@@ -2359,7 +2382,7 @@ impl Equality {
         merged.dedup();
         for &a in &merged {
             let mut push = |t: Triple| {
-                if t[1] != same_as {
+                if t[1] != same_as && !internal(t[1]) {
                     seeds.push(t);
                 }
             };
@@ -2519,9 +2542,37 @@ struct Representatives {
     shared: TermSet,
     listing: Listing,
     merges: usize,
+    list_aliases: HashMap<u64, u64>,
 }
 
 impl Representatives {
+    fn rewrite(&self, fact: Triple) -> Triple {
+        let mut fact = self.classes.rewrite(fact);
+        while let Some(&predicate) = self.list_aliases.get(&fact[1]) {
+            fact[1] = predicate;
+        }
+        fact
+    }
+
+    fn remap_list_predicates(
+        &mut self,
+        predicates: &mut Predicates,
+        lost: &mut HashSet<u64>,
+    ) -> bool {
+        let moved: Vec<_> = lost
+            .iter()
+            .filter_map(|&cell| predicates.remap(cell, self.classes.representative(cell)))
+            .flatten()
+            .collect();
+        let remapped = !moved.is_empty();
+        for (from, to) in moved {
+            self.list_aliases.insert(from, to);
+            self.stale.insert(from);
+            lost.insert(from);
+        }
+        remapped
+    }
+
     /// Merges the classes `pairs` equate; returns the terms that lost their place.
     fn merge(&mut self, pairs: &[(u64, u64)]) -> HashSet<u64> {
         let lost: HashSet<u64> = self.classes.union_all(pairs).into_iter().collect();
@@ -2564,7 +2615,7 @@ impl Representatives {
             extra.extend(store.mentioning(lost, stop)?);
             extra
                 .par_iter_mut()
-                .for_each(|fact| *fact = self.classes.rewrite(*fact));
+                .for_each(|fact| *fact = self.rewrite(*fact));
             keep_unheld(store, &mut extra, &Poller::new(stop).ok_or(Stopped)?)?;
             return Ok(segments(extra));
         }
@@ -2574,7 +2625,7 @@ impl Representatives {
         facts.append(&mut extra);
         facts
             .par_iter_mut()
-            .for_each(|fact| *fact = self.classes.rewrite(*fact));
+            .for_each(|fact| *fact = self.rewrite(*fact));
         facts.par_sort_unstable_by_key(|&[s, p, o]| (p, s, o));
         facts.dedup();
         store.retain_new(&mut facts, &Poller::new(stop).ok_or(Stopped)?)?;
@@ -2782,6 +2833,7 @@ pub(crate) fn fact_rules<S: Source + ?Sized>(
     rules: &[Rule],
     lists: Option<&ListVocabulary>,
     diagnostics: &mut Vec<super::lists::ListDiagnostic>,
+    predicates: &mut Predicates,
 ) -> (Vec<Rule>, usize) {
     let mut out: Vec<Rule> = rules
         .iter()
@@ -2790,7 +2842,12 @@ pub(crate) fn fact_rules<S: Source + ?Sized>(
         .collect();
     let templates = out.len();
     if let Some(vocabulary) = lists {
-        let (list_rules, found) = instantiate(vocabulary, &AllFacts(source));
+        let (list_rules, _, found) = super::lists::compile(
+            vocabulary,
+            &AllFacts(source),
+            predicates,
+            RuleKind::Inference,
+        );
         out.extend(
             list_rules
                 .into_iter()
@@ -2801,100 +2858,13 @@ pub(crate) fn fact_rules<S: Source + ?Sized>(
     (out, templates)
 }
 
-/// The input's list cells as written: the runs the store started with, which no round
-/// merges ([`Relation::advance`]), read only for a list past the cap. Named by the final
-/// classes' representatives where the run keeps them: a representative's cells are its
-/// members' (a name that represents nothing has none). Each member read counts on `poll`;
-/// past its stop nothing is read, and the run is interrupted.
-struct Written<'a, 'p> {
-    store: &'a Store,
-    classes: Option<&'a EqualityClasses>,
-    poll: &'a Poller<'p>,
-}
-
-impl Written<'_, '_> {
-    /// `predicate`'s pairs the store started with: apart since the first round, which every
-    /// run has ([`Relation::advance`]).
-    fn run(&self, predicate: u64) -> Option<&Pairs> {
-        let relation = self.store.relation(predicate)?;
-        debug_assert!(!relation.fresh, "a round has run");
-        Some(&*relation.input.so)
-    }
-
-    fn named(&self, x: u64) -> u64 {
-        self.classes.map_or(x, |classes| classes.representative(x))
-    }
-}
-
-impl super::lists::Facts for Written<'_, '_> {
-    fn objects(&self, subject: u64, predicate: u64) -> Vec<u64> {
-        let (Some(run), true) = (self.run(predicate), self.named(subject) == subject) else {
-            return Vec::new();
-        };
-        let one = [subject];
-        let members = (self.classes).and_then(|c| c.class_of(subject));
-        let mut objects = Vec::new();
-        for &member in members.unwrap_or(&one) {
-            if self.poll.tick() {
-                return Vec::new();
-            }
-            let cells = run.range(member).flatten();
-            objects.extend(cells.map(|&(_, o)| self.named(o)));
-        }
-        objects.sort_unstable();
-        objects.dedup();
-        objects
-    }
-
-    fn pairs(&self, predicate: u64) -> Vec<(u64, u64)> {
-        let pairs = self.run(predicate).into_iter().flat_map(Pairs::iter);
-        let named = pairs.map(|&(s, o)| (self.named(s), self.named(o)));
-        let mut pairs: Vec<(u64, u64)> = named.collect();
-        pairs.sort_unstable();
-        pairs.dedup();
-        pairs
-    }
-
-    fn unmerged(&self) -> Option<&dyn super::lists::Unmerged> {
-        self.classes.map(|_| self as &dyn super::lists::Unmerged)
-    }
-}
-
-/// The input's cells by the names the store started with: each node its own, its objects
-/// unrenamed, for a list whose cells as written the final classes merge past the cap.
-impl super::lists::Unmerged for Written<'_, '_> {
-    fn cells(&self, node: u64, predicate: u64) -> Vec<u64> {
-        let Some(run) = self.run(predicate).filter(|_| !self.poll.tick()) else {
-            return Vec::new();
-        };
-        let mut objects: Vec<u64> = run.range(node).flatten().map(|&(_, o)| o).collect();
-        objects.sort_unstable();
-        objects.dedup();
-        objects
-    }
-
-    fn equal(&self, x: u64) -> Option<&[u64]> {
-        (self.classes).and_then(|c| c.class_of(x))
-    }
-
-    fn named(&self, x: u64) -> u64 {
-        Written::named(self, x)
-    }
-
-    fn stopped(&self) -> bool {
-        self.poll.tick()
-    }
-}
-
-/// The consistency rules of `rules`, plus the list ones instantiated over `source`, and
-/// those of a list past the cap over `source` read from `written`, its cells as written
-/// ([`super::lists::instantiate_written`]).
+/// The consistency rules and the pairwise list checks over `source`.
 pub(crate) fn consistency_rules<S: Source + ?Sized>(
     source: &S,
     rules: &[Rule],
     lists: Option<&ListVocabulary>,
     projection: Option<&ListVocabulary>,
-    written: Option<&dyn super::lists::Facts>,
+    diagnostics: &mut Vec<super::lists::ListDiagnostic>,
 ) -> Vec<Rule> {
     let mut out: Vec<Rule> = rules
         .iter()
@@ -2902,8 +2872,13 @@ pub(crate) fn consistency_rules<S: Source + ?Sized>(
         .cloned()
         .collect();
     if let Some(vocabulary) = lists {
-        let (list_rules, _, _) =
-            super::lists::instantiate_projected(vocabulary, projection, &AllFacts(source), written);
+        let (list_rules, _, found) = super::lists::compile(
+            projection.unwrap_or(vocabulary),
+            &AllFacts(source),
+            &mut Predicates::default(),
+            RuleKind::Consistency,
+        );
+        diagnostics.extend(found);
         out.extend(
             list_rules
                 .into_iter()
@@ -3102,6 +3077,7 @@ pub fn materialise_representatives_with(
         shared: TermSet::default(),
         listing,
         merges: 0,
+        list_aliases: HashMap::new(),
     });
     if representatives.is_none() && listing == Listing::Representatives {
         // Every fact: the input's too.
@@ -3338,6 +3314,7 @@ fn run_body(
                 &rules,
                 schema.list_projection().or(lists),
                 &mut result.diagnostics,
+                &mut program.list_predicates,
             );
             // Replacement-rule removal can change the template prefix only without a projection.
             debug_assert!(equality.is_none() || schema.list_projection().is_none());
@@ -3401,9 +3378,8 @@ fn run_body(
         };
         // Heads naming a former representative (constants of rules grounded before it
         // lost its place) derive its representative's fact instead.
-        let classes = representatives.as_ref().map(|r| &r.classes);
-        let rewrite = |fact: Triple| match classes {
-            Some(classes) if stale.mentioned(fact) => classes.rewrite(fact),
+        let rewrite = |fact: Triple| match &representatives {
+            Some(reps) if stale.mentioned(fact) => reps.rewrite(fact),
             _ => fact,
         };
         let rewrite: Option<&(dyn Fn(Triple) -> Triple + Sync)> =
@@ -3529,8 +3505,9 @@ fn run_body(
                 .filter(|(p, _)| *p == same_as)
                 .flat_map(|(_, pairs)| pairs.iter().copied().filter(|(s, o)| s != o))
                 .collect();
-            let lost = reps.merge(&pairs);
+            let mut lost = reps.merge(&pairs);
             if !lost.is_empty() {
+                reground_all |= reps.remap_list_predicates(&mut program.list_predicates, &mut lost);
                 project_list_schema(&mut schema, lists, reps);
                 let mut moved: Vec<Triple> = Vec::new();
                 for (_, list) in &mut candidates {
@@ -3601,17 +3578,12 @@ fn run_body(
             stale,
         };
         let poll = Poller::new(stop).ok_or_else(Interrupted::default)?;
-        let written = Written {
-            store: &store,
-            classes: representatives.as_ref().map(|reps| &reps.classes),
-            poll: &poll,
-        };
         let mut checks = consistency_rules(
             &current,
             &rules,
             lists,
             schema.list_projection(),
-            Some(&written),
+            &mut result.diagnostics,
         );
         poll.ended().map_err(|Stopped| Interrupted::default())?;
         if let Some(reps) = &representatives {
@@ -3783,7 +3755,8 @@ fn list(
             // room for the others before it is handed on. Each class expansion is a product
             // of members, each copy a probe of the input: counted on the thread's poller
             // before it is made, from the same one class lookup per term (sweep M12).
-            let facts = store.facts_where(&|fact| current(fact) && shared.mentioned(fact));
+            let facts = store
+                .facts_where(&|fact| !internal(fact[1]) && current(fact) && shared.mentioned(fact));
             let room = room_budget(operation)?;
             let refused = |_: BudgetExceeded| operation.refuse(MemoryStopCause::OverLimit);
             let stop: super::eval::Stop<'_> = &|| operation.fired();
@@ -3861,7 +3834,9 @@ fn list(
             let others: usize = store
                 .relations
                 .iter()
-                .map(|relation| relation.base.so.len() + relation.recent.so.len())
+                .zip(&store.predicates)
+                .filter(|&(_, &p)| !internal(p))
+                .map(|(relation, _)| relation.base.so.len() + relation.recent.so.len())
                 .sum();
             let grown = expanded.len().checked_add(others);
             if grown.is_none_or(|facts| facts > expanded.capacity()) {

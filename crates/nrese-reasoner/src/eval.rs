@@ -2397,6 +2397,9 @@ pub struct GroundProgram {
     consistency_dispatch: Dispatch,
     /// The list axioms of the program's state that weren't instantiated.
     pub list_diagnostics: Vec<super::lists::ListDiagnostic>,
+    pub(crate) list_predicates: super::lists::Predicates,
+    pub(crate) table_rules: Vec<usize>,
+    pub(crate) table: Option<std::sync::Arc<super::batch::Store>>,
 }
 
 impl std::fmt::Debug for GroundProgram {
@@ -2455,6 +2458,12 @@ impl GroundProgram {
             self.dispatch.push(self.rules.len(), &rule);
             if let Head::Facts(heads) = &rule.head {
                 self.heads.push_atoms(self.rules.len(), heads);
+                if heads
+                    .iter()
+                    .any(|head| matches!(head.0[1], Term::Const(p) if super::lists::internal(p)))
+                {
+                    self.table_rules.push(self.rules.len());
+                }
             }
             let equality = same_as.and_then(|id| super::equality_rules::equality_rule(&rule, id));
             self.rules.push(rule);

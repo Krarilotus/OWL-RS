@@ -801,6 +801,11 @@ fn support_sets_run(
 ) -> Result<HashMap<Triple, Annotation>, Stopped> {
     let fired = || run.fired();
     let all = Store::new(facts.to_vec());
+    let table = program.table.as_deref();
+    let all_facts = super::delta::TableSource {
+        source: &all,
+        table,
+    };
     // Each fact's graphs, a store read, on one poller per parallel task (sweep M16). The first
     // read a stop ended ends them all, with the run's cause.
     let initial: Vec<Option<(Triple, Annotation)>> = facts
@@ -890,6 +895,7 @@ fn support_sets_run(
     }
     // What the round doesn't change: the closure's store and the premise maps.
     let fixed = all.bytes().total()
+        + table.map_or(0, |store| store.bytes().total())
         + table_bytes::<Triple, Vec<Triple>>(bodiless_by_premise.capacity())
         + table_bytes::<Triple, Vec<usize>>(rules_by_premise.capacity())
         + bodiless_by_premise
@@ -919,7 +925,7 @@ fn support_sets_run(
         }
         let delta = Store::new(std::mem::take(&mut changed));
         let source = Changed {
-            all: &all,
+            all: &all_facts,
             changed: &delta,
         };
         // Every instance with a premise among the changed facts, with every premise's
@@ -1104,6 +1110,9 @@ fn support_sets_run(
         }
         run.check(held(&sets, annotations))?;
     }
+    if table.is_some() {
+        sets.retain(|fact, _| !super::lists::internal(fact[1]));
+    }
     Ok(sets)
 }
 
@@ -1209,6 +1218,11 @@ pub fn derived_otherwise<S: Source + ?Sized>(
     fact: Triple,
     poll: &Poller<'_>,
 ) -> Result<bool, ReadStopped> {
+    let all = super::delta::TableSource {
+        source,
+        table: program.table.as_deref(),
+    };
+    let source = &all;
     if poll.attempt(1) {
         return Err(ReadStopped);
     }
@@ -1550,6 +1564,11 @@ fn update_support_sets_run<'r, S: Source + Sync + ?Sized>(
     cap: usize,
     run: &Run<'r>,
 ) -> Result<Option<HashMap<Triple, Annotation>>, Stopped> {
+    // Private annotations are computed within the support pass and left out
+    // of its published result. A later pass cannot reuse them from that result.
+    if program.table.is_some() {
+        return Ok(None);
+    }
     let schema = program.schema_premises();
     let owned = body_rules(program);
     let rules: Vec<(&Rule, Grounding)> =

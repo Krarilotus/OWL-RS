@@ -95,7 +95,11 @@ pub const ALL: [Ruleset; 6] = [
 ///
 /// 8 (19 Nov 2026): an incomplete branch or a side loop no longer hides the
 /// rules of a list's walks to `rdf:nil`. An older store rematerialises once.
-pub const SEMANTICS_VERSION: u32 = 8;
+///
+/// 9 (21 Nov 2026): every accepting list walk contributes its rule conclusions,
+/// including walks through cycles and walks beyond the rule encoder's bounds.
+/// An older store rematerialises once.
+pub const SEMANTICS_VERSION: u32 = 9;
 
 /// A part of the evaluation semantics only some user rulesets use ([`SEMANTICS_VERSION`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

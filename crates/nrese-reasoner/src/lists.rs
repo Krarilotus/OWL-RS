@@ -6,24 +6,23 @@
 //! n becomes one n-atom rule, and an intersection one rule per direction. That removes
 //! the `rdf:first`/`rdf:rest` helper rules that generic rulesets need.
 //!
-//! Lists are read from the facts: each cell on a walk to `rdf:nil` supplies one
-//! `rdf:first` and one `rdf:rest`. Only cells on such a walk contribute enumerated
-//! rules. Past the 64-walk cap, the pairwise fallback still reads cells as written.
-//! A head with no walk is diagnosed. For a cycle the reader marks the axiom
-//! incomplete and keeps the rules of walks previously read up to `rdf:nil`.
+//! Every walk to `rdf:nil` supplies one `rdf:first` and one `rdf:rest` per cell.
+//! The reader grounds short walks directly and uses fixed-arity rules per cell
+//! where the walks are too large or cyclic. A head with no walk is diagnosed.
 //!
 //! Lists of any length are instantiated. The pairwise axioms (`owl:AllDifferent`,
 //! `owl:AllDisjointClasses`, `owl:AllDisjointProperties`) would need a rule per pair, so
 //! their lists longer than [`PAIRWISE_MEMBERS`] become one rule per kind of axiom whose
 //! [`Guard::SameList`] asks an index of the members which lists they share: linear in the
-//! members however many there are. The only length limit left is the rule format's: a
-//! property chain over more than [`MAX_RULE_MEMBERS`] properties, or a key over more than
-//! [`MAX_KEY_MEMBERS`], can't be one rule (variables and atoms are numbered by `u8`) and is
-//! diagnosed.
+//! members however many there are. The rule encoder's bounds select a form;
+//! they leave no accepting walk unread.
 
 use std::collections::{HashMap, HashSet};
 
 use super::ir::{Atom, Guard, Head, OWL, RDF, Rule, Term, Vocabulary};
+
+mod per_cell;
+pub(crate) use per_cell::{Predicates, internal};
 
 /// Read access to facts for instantiation.
 pub trait Facts {
@@ -31,36 +30,6 @@ pub trait Facts {
     fn objects(&self, subject: u64, predicate: u64) -> Vec<u64>;
     /// `(subject, object)` pairs of `(?, predicate, ?)`.
     fn pairs(&self, predicate: u64) -> Vec<(u64, u64)>;
-    /// The same cells with no two names merged, where these facts merge equal names
-    /// ([`instantiate_written`]: a list whose merged cells are past the cap too).
-    fn unmerged(&self) -> Option<&dyn Unmerged> {
-        None
-    }
-}
-
-/// List cells as asserted, each node its own ([`Facts::unmerged`]).
-pub trait Unmerged {
-    /// The objects of `(node, predicate, ?)` as asserted, unrenamed.
-    fn cells(&self, node: u64, predicate: u64) -> Vec<u64>;
-    /// The names equal to `x`, `x` among them, if `x` is the same as another name.
-    fn equal(&self, x: u64) -> Option<&[u64]>;
-    /// The name the closure gives `x`.
-    fn named(&self, x: u64) -> u64;
-    /// Whether the run has stopped: then nothing more is read.
-    fn stopped(&self) -> bool;
-}
-
-/// [`Unmerged`] cells read as [`Facts`] for a walk.
-struct Cells<'a>(&'a dyn Unmerged);
-
-impl Facts for Cells<'_> {
-    fn objects(&self, node: u64, predicate: u64) -> Vec<u64> {
-        self.0.cells(node, predicate)
-    }
-
-    fn pairs(&self, _: u64) -> Vec<(u64, u64)> {
-        Vec::new()
-    }
 }
 
 /// The vocabulary ids the list rules use.
@@ -178,26 +147,56 @@ impl ListVocabulary {
                 .contains(&o))
     }
 
-    /// Walks to `rdf:nil`, with the facts along each and any accepting cycle.
+    pub(crate) fn leaves_out(&self, facts: &impl Facts) -> bool {
+        let nil_is_cell = std::cell::OnceCell::new();
+        [
+            self.property_chain_axiom,
+            self.has_key,
+            self.intersection_of,
+            self.union_of,
+            self.one_of,
+            self.members,
+            self.distinct_members,
+        ]
+        .into_iter()
+        .any(|p| {
+            facts.pairs(p).into_iter().any(|(_, head)| {
+                let nil_is_cell = *nil_is_cell.get_or_init(|| {
+                    !facts.objects(self.nil, self.first).is_empty()
+                        && !facts.objects(self.nil, self.rest).is_empty()
+                });
+                if !nil_is_cell && let Some(linear) = self.linear_list(facts, head) {
+                    return linear.is_err();
+                }
+                self.accepting_cells(facts, head).is_err()
+            })
+        })
+    }
+
+    /// Walks of the enumerated form, or the accepting cells of the other form.
     fn list(
         &self,
         facts: &impl Facts,
         head: u64,
         nil_is_cell: bool,
-    ) -> (Result<Vec<Variant>, ListProblem>, Option<ListProblem>) {
+        kind: ListKind,
+    ) -> Result<List, ListProblem> {
         if !nil_is_cell && let Some(linear) = self.linear_list(facts, head) {
-            return (linear, None);
+            let walks = linear?;
+            if kind.fits(&walks, self.same_as) {
+                return Ok(List::Walks(walks));
+            }
+            return self.accepting_cells(facts, head).map(List::Cells);
         }
-        let cells = match self.accepting_cells(facts, head) {
-            Ok(cells) => cells,
-            Err(problem) => return (Err(problem), None),
-        };
-        let Err(cycle) = check_acyclic(&cells, head) else {
-            return (self.enumerate(&cells, head), None);
-        };
-        // Preserve the previous reader's result and report the accepting
-        // cycle. The previous reader stopped on its first visit to nil.
-        (self.list_as_written(facts, head), Some(cycle))
+        let cells = self.accepting_cells(facts, head)?;
+        let conjunctive = matches!(kind, ListKind::Key | ListKind::Intersection);
+        if (conjunctive || check_acyclic(&cells, head).is_ok())
+            && let Some(walks) = self.enumerate(&cells, head, kind.member_limit())
+            && kind.fits(&walks, self.same_as)
+        {
+            return Ok(List::Walks(walks));
+        }
+        Ok(List::Cells(cells))
     }
 
     /// The one walk when every cell has exactly one first and one rest. In this
@@ -278,144 +277,96 @@ impl ListVocabulary {
         &self,
         cells: &HashMap<u64, Cell>,
         head: u64,
-    ) -> Result<Vec<Variant>, ListProblem> {
+        most: usize,
+    ) -> Option<Vec<Variant>> {
         let mut variants = Vec::new();
         let (mut members, mut used) = (Vec::new(), Vec::new());
+        let mut active = HashSet::from([head]);
         // Each frame is a cell and the next combination of first and rest at it.
         let mut stack = vec![(head, 0, 0)];
         while let Some((node, first, rest)) = stack.last_mut() {
             let cell = &cells[&*node];
-            if *node == self.nil {
-                if variants.len() == MAX_VARIANTS {
-                    return Err(ListProblem::TooManyVariants);
-                }
-                variants.push((members.clone(), used.clone()));
-            } else if let Some(&member) = cell.firsts.get(*first) {
-                let next = cell.rests[*rest];
-                members.push(member);
-                used.extend([[*node, self.first, member], [*node, self.rest, next]]);
+            if let Some(&member) = cell.firsts.get(*first)
+                && let Some(&next) = cell.rests.get(*rest)
+            {
                 *rest += 1;
                 if *rest == cell.rests.len() {
                     *first += 1;
                     *rest = 0;
                 }
-                stack.push((next, 0, 0));
+                if next == self.nil || active.insert(next) {
+                    members.push(member);
+                    used.extend([[*node, self.first, member], [*node, self.rest, next]]);
+                    if next == self.nil {
+                        if variants.len() == MAX_VARIANTS || members.len() > most {
+                            return None;
+                        }
+                        variants.push((members.clone(), used.clone()));
+                        members.pop();
+                        used.truncate(2 * members.len());
+                    } else {
+                        stack.push((next, 0, 0));
+                    }
+                }
                 continue;
             }
+            active.remove(node);
             stack.pop();
             members.pop();
             used.truncate(2 * members.len());
         }
-        Ok(variants)
+        Some(variants)
     }
 
-    /// The earlier reading, for cycles through nil and the asserted pairwise fallback.
-    fn list_as_written(
+    /// One path as first/rest premises, including a first at each position.
+    fn path(
         &self,
-        facts: &(impl Facts + ?Sized),
-        head: u64,
-    ) -> Result<Vec<Variant>, ListProblem> {
-        let mut variants = Vec::new();
-        let mut path = Vec::new();
-        let mut nodes = Vec::new();
-        let mut used = Vec::new();
-        self.walk_as_written(facts, head, &mut nodes, &mut path, &mut used, &mut variants)?;
-        Ok(variants)
-    }
-
-    /// The member sequences of the list of the axiom `(subject predicate head)` over
-    /// `unmerged`: walked from the heads the axiom was asserted with, or, where none of them
-    /// starts a list, from each name equal to `head`; its members named as the closure names
-    /// them; past [`MAX_VARIANTS`] distinct ones, none.
-    fn unmerged_list(
-        &self,
-        unmerged: &dyn Unmerged,
-        [subject, predicate, head]: [u64; 3],
-    ) -> Result<Vec<Variant>, ListProblem> {
-        let (one, other) = ([subject], [head]);
-        let subjects = unmerged.equal(subject).unwrap_or(&one);
-        let asserted: Vec<u64> = subjects
-            .iter()
-            .flat_map(|&s| unmerged.cells(s, predicate))
-            .collect();
-        let variants = self.walks(unmerged, &asserted)?;
-        match variants.is_empty() {
-            true => self.walks(unmerged, unmerged.equal(head).unwrap_or(&other)),
-            false => Ok(variants),
+        cells: &HashMap<u64, Cell>,
+        from: u64,
+        to: u64,
+        nonempty: bool,
+    ) -> Option<Vec<[u64; 3]>> {
+        if from == to && !nonempty {
+            return Some(Vec::new());
         }
-    }
-
-    /// The distinct member sequences of the lists from `starts` over `unmerged`, named as the
-    /// closure names them; past [`MAX_VARIANTS`], none. A start that is no list adds none.
-    fn walks(&self, unmerged: &dyn Unmerged, starts: &[u64]) -> Result<Vec<Variant>, ListProblem> {
-        let mut variants: Vec<Variant> = Vec::new();
-        for &start in starts {
-            if unmerged.stopped() {
-                return Ok(Vec::new());
-            }
-            for (members, used) in self
-                .list_as_written(&Cells(unmerged), start)
-                .unwrap_or_default()
-            {
-                let members: Vec<u64> = members.iter().map(|&m| unmerged.named(m)).collect();
-                if variants.iter().any(|(seen, _)| *seen == members) {
-                    continue;
+        let mut parent = HashMap::from([(from, from)]);
+        let mut pending = std::collections::VecDeque::from([from]);
+        while let Some(node) = pending.pop_front() {
+            for &next in &cells[&node].rests {
+                if next == to {
+                    let mut path = Vec::new();
+                    let (mut prev, mut end) = (node, to);
+                    loop {
+                        path.extend([
+                            [prev, self.rest, end],
+                            [prev, self.first, cells[&prev].firsts[0]],
+                        ]);
+                        if prev == from {
+                            path.reverse();
+                            return Some(path);
+                        }
+                        end = prev;
+                        prev = parent[&prev];
+                    }
                 }
-                if variants.len() == MAX_VARIANTS {
-                    return Err(ListProblem::TooManyVariants);
+                if let std::collections::hash_map::Entry::Vacant(entry) = parent.entry(next) {
+                    entry.insert(node);
+                    pending.push_back(next);
                 }
-                variants.push((members, used));
             }
         }
-        Ok(variants)
-    }
-
-    fn walk_as_written(
-        &self,
-        facts: &(impl Facts + ?Sized),
-        node: u64,
-        nodes: &mut Vec<u64>,
-        path: &mut Vec<u64>,
-        used: &mut Vec<[u64; 3]>,
-        variants: &mut Vec<Variant>,
-    ) -> Result<(), ListProblem> {
-        if node == self.nil {
-            if variants.len() == MAX_VARIANTS {
-                return Err(ListProblem::TooManyVariants);
-            }
-            variants.push((path.clone(), used.clone()));
-            return Ok(());
-        }
-        if nodes.contains(&node) {
-            return Err(ListProblem::Cycle { node });
-        }
-        let (firsts, rests) = (
-            facts.objects(node, self.first),
-            facts.objects(node, self.rest),
-        );
-        if firsts.is_empty() || rests.is_empty() {
-            return Err(ListProblem::Malformed { node });
-        }
-        nodes.push(node);
-        for &first in &firsts {
-            path.push(first);
-            used.push([node, self.first, first]);
-            for &rest in &rests {
-                used.push([node, self.rest, rest]);
-                self.walk_as_written(facts, rest, nodes, path, used, variants)?;
-                used.pop();
-            }
-            used.pop();
-            path.pop();
-        }
-        nodes.pop();
-        Ok(())
+        None
     }
 }
 
 struct Cell {
     firsts: Vec<u64>,
     rests: Vec<u64>,
+}
+
+enum List {
+    Walks(Vec<Variant>),
+    Cells(HashMap<u64, Cell>),
 }
 
 /// With no walk to nil, every branch fails. Report the first failure in the
@@ -462,21 +413,34 @@ type Variant = (Vec<u64>, Vec<[u64; 3]>);
 enum ListKind {
     Chain,
     Key,
-    Class,
-    Pairwise { written_predicate: u64 },
+    Intersection,
+    Union,
+    Pairwise,
 }
 
 impl ListKind {
+    fn fits(self, walks: &[Variant], same_as: u64) -> bool {
+        walks
+            .iter()
+            .all(|(walk, _)| walk.len() <= self.member_limit())
+            && (!matches!(self, Self::Chain)
+                || walks.iter().fold(0usize, |sum, (walk, _)| {
+                    let diagonals = walk.iter().filter(|&&member| member == same_as).count();
+                    sum.saturating_add(1usize.checked_shl(diagonals as u32).unwrap_or(usize::MAX))
+                }) <= MAX_VARIANTS)
+    }
+
     fn member_limit(self) -> usize {
         match self {
             Self::Chain => MAX_RULE_MEMBERS,
             Self::Key => MAX_KEY_MEMBERS,
-            Self::Class | Self::Pairwise { .. } => usize::MAX,
+            Self::Intersection | Self::Union => crate::eval::MAX_RULE_ATOMS,
+            Self::Pairwise => usize::MAX,
         }
     }
 }
 
-/// The most accepting walks one list axiom may have (see `ListVocabulary::list`).
+/// The most accepting walks compiled as ordinary rules for one list axiom.
 pub const MAX_VARIANTS: usize = 64;
 
 /// Lists of pairwise axioms up to this length become a rule per pair; longer ones are
@@ -498,22 +462,14 @@ pub enum ListProblem {
     Malformed { node: u64 },
     /// The list returns to `node`.
     Cycle { node: u64 },
-    /// Equality gives the list more than [`MAX_VARIANTS`] member sequences.
-    TooManyVariants,
-    /// A list with more than `most` members ([`MAX_RULE_MEMBERS`], [`MAX_KEY_MEMBERS`], or
-    /// a rule past [`crate::eval::MAX_RULE_ATOMS`]).
-    TooLong { members: usize, most: usize },
 }
 
 impl ListProblem {
-    /// A stable name for reports: `malformed-list`, `cyclic-list`,
-    /// `too-many-list-variants` or `list-too-long`.
+    /// A stable name for reports of heads with no accepting walk.
     pub const fn kind(self) -> &'static str {
         match self {
             Self::Malformed { .. } => "malformed-list",
             Self::Cycle { .. } => "cyclic-list",
-            Self::TooManyVariants => "too-many-list-variants",
-            Self::TooLong { .. } => "list-too-long",
         }
     }
 
@@ -521,7 +477,6 @@ impl ListProblem {
     pub const fn node(self) -> Option<u64> {
         match self {
             Self::Malformed { node } | Self::Cycle { node } => Some(node),
-            Self::TooManyVariants | Self::TooLong { .. } => None,
         }
     }
 }
@@ -547,12 +502,6 @@ impl ListDiagnostic {
                 format!("node {} has no rdf:first or no rdf:rest", term(node))
             }
             ListProblem::Cycle { node } => format!("the list returns to node {}", term(node)),
-            ListProblem::TooManyVariants => {
-                format!("owl:sameAs gives it more than {MAX_VARIANTS} member sequences")
-            }
-            ListProblem::TooLong { members, most } => {
-                format!("it has {members} members, more than a rule holds ({most})")
-            }
         };
         format!(
             "{} {} {} skipped ({}): {problem}",
@@ -581,6 +530,21 @@ fn rule(name: &str, body: Vec<Atom>, guards: Vec<Guard>, head: Head) -> Rule {
     }
 }
 
+/// An equality operand may use the diagonal even when no other atom binds its
+/// individual. Bind that individual at any position in an RDF fact.
+fn diagonal(predicate: Term) -> impl Iterator<Item = Rule> {
+    (0..3).map(move |position| {
+        let mut occurrence = [v(1), v(2), v(3)];
+        occurrence[position] = v(0);
+        rule(
+            "prp-spo2",
+            vec![Atom(occurrence)],
+            vec![],
+            Head::Facts(vec![Atom([v(0), predicate, v(0)])]),
+        )
+    })
+}
+
 /// Turns one list axiom (its subject and members) into rules.
 type MakeRules<'a> = dyn FnMut(u64, &[u64], &mut Vec<Rule>) + 'a;
 
@@ -600,127 +564,180 @@ pub fn instantiate_with_premises(
     vocabulary: &ListVocabulary,
     facts: &impl Facts,
 ) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>) {
-    instantiate_written(vocabulary, facts, None)
+    compile(vocabulary, facts, &mut Predicates::default(), RuleKind::All)
 }
 
-/// [`instantiate_with_premises`], and a list past [`MAX_VARIANTS`] over `facts` (equality's
-/// `rdf:first` copies multiply its member sequences) read from `written` as well: the facts
-/// as written, a subset of `facts`. Its checks from that reading (rules whose head is
-/// [`Head::Inconsistent`]) are added, never an inference, and it is reported past the cap
-/// all the same: what the rules derive is what they derive over `facts`, the checks only
-/// add to those, and every list left out over `facts` is reported.
+/// All accepting walks, including those through copied list cells.
 pub fn instantiate_written(
     vocabulary: &ListVocabulary,
     facts: &impl Facts,
-    written: Option<&dyn Facts>,
+    _written: Option<&dyn Facts>,
 ) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>) {
-    instantiate_projected(vocabulary, None, facts, written)
+    instantiate_with_premises(vocabulary, facts)
 }
 
-pub(crate) fn instantiate_projected(
-    vocabulary: &ListVocabulary,
-    projection: Option<&ListVocabulary>,
+#[derive(Clone, Copy)]
+pub(crate) enum RuleKind {
+    All,
+    Inference,
+    Consistency,
+}
+
+pub(crate) fn compile(
+    voc: &ListVocabulary,
     facts: &impl Facts,
-    written: Option<&dyn Facts>,
+    predicates: &mut Predicates,
+    rule_kind: RuleKind,
 ) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>) {
-    let voc = projection.unwrap_or(vocabulary);
     let mut rules = Vec::new();
     let mut premises: Vec<Vec<[u64; 3]>> = Vec::new();
     let mut diagnostics: Vec<ListDiagnostic> = Vec::new();
     let nil_is_cell = std::cell::OnceCell::new();
-    let mut lists =
-        |predicate, name: &'static str, kind, rules: &mut Vec<Rule>, make: &mut MakeRules| {
-            debug_assert!(voc.is_list_fact([0, predicate, 0]), "read, not a list fact");
-            for (subject, head) in facts.pairs(predicate) {
-                let mut diagnose = |problem| {
-                    let diagnostic = ListDiagnostic {
+    let mut lists = |predicate,
+                     name: &'static str,
+                     kind,
+                     rules: &mut Vec<Rule>,
+                     make: &mut MakeRules| {
+        debug_assert!(voc.is_list_fact([0, predicate, 0]), "read, not a list fact");
+        match (rule_kind, kind) {
+            (RuleKind::Inference, ListKind::Pairwise)
+            | (
+                RuleKind::Consistency,
+                ListKind::Chain | ListKind::Key | ListKind::Intersection | ListKind::Union,
+            ) => return,
+            _ => {}
+        }
+        for (subject, head) in facts.pairs(predicate) {
+            let axiom = [subject, predicate, head];
+            let nil_is_cell = *nil_is_cell.get_or_init(|| {
+                !facts.objects(voc.nil, voc.first).is_empty()
+                    && !facts.objects(voc.nil, voc.rest).is_empty()
+            });
+            let list = match voc.list(facts, head, nil_is_cell, kind) {
+                Ok(list) => list,
+                Err(problem) => {
+                    diagnostics.push(ListDiagnostic {
                         rules: name,
                         subject,
                         predicate,
                         head,
                         problem,
-                    };
-                    if !diagnostics.contains(&diagnostic) {
-                        diagnostics.push(diagnostic);
-                    }
-                };
-                // Only `owl:members` and `owl:distinctMembers` lists are read as written: their
-                // rules are checks alone, never an inference, and never too long for a rule.
-                let checks = matches!(kind, ListKind::Pairwise { .. });
-                let nil_is_cell = *nil_is_cell.get_or_init(|| {
-                    !facts.objects(voc.nil, voc.first).is_empty()
-                        && !facts.objects(voc.nil, voc.rest).is_empty()
-                });
-                let (walks, cycle) = voc.list(facts, head, nil_is_cell);
-                if let Some(problem) = cycle {
-                    diagnose(problem);
+                    });
+                    continue;
                 }
-                let read = match (walks, written, kind) {
-                    (
-                        Err(ListProblem::TooManyVariants),
-                        Some(written),
-                        ListKind::Pairwise { written_predicate },
-                    ) => {
-                        diagnose(ListProblem::TooManyVariants);
-                        // Where equality merges cells as written past the cap too, each
-                        // node's own cells, as the list was asserted.
-                        let unmerged = |problem: ListProblem| match written.unmerged() {
-                            Some(unmerged) if problem == ListProblem::TooManyVariants => vocabulary
-                                .unmerged_list(unmerged, [subject, written_predicate, head]),
-                            _ => Err(problem),
-                        };
-                        match voc.list_as_written(written, head).or_else(unmerged) {
-                            Ok(variants) => Ok(variants),
-                            Err(_) => continue,
-                        }
+            };
+            let classes = if matches!(kind, ListKind::Pairwise) {
+                facts.objects(subject, voc.rdf_type)
+            } else {
+                Vec::new()
+            };
+            let mut make_walk = |members: &[u64], mut used: Vec<[u64; 3]>, unary: bool| {
+                let before = rules.len();
+                make(subject, members, rules);
+                if unary {
+                    if rules
+                        .get(before)
+                        .is_some_and(|rule| rule.name == "cls-int1")
+                    {
+                        rules.remove(before);
                     }
-                    (read, _, _) => read,
-                };
-                match read {
-                    Ok(variants) => {
-                        let most = kind.member_limit();
-                        for (members, used) in variants {
-                            let before = rules.len();
-                            let limit = if members.len() > most {
-                                Some(most)
-                            } else {
-                                make(subject, &members, rules);
-                                (!rules[before..].iter().all(Rule::fits))
-                                    .then_some(crate::eval::MAX_RULE_ATOMS)
-                            };
-                            if let Some(most) = limit {
-                                diagnose(ListProblem::TooLong {
-                                    members: members.len(),
-                                    most,
-                                });
-                                rules.truncate(before);
+                }
+                used.push(axiom);
+                for class in [
+                    voc.all_disjoint_classes,
+                    voc.all_disjoint_properties,
+                    voc.all_different,
+                ] {
+                    if classes.contains(&class) {
+                        used.push([subject, voc.rdf_type, class]);
+                    }
+                }
+                debug_assert!(rules[before..].iter().all(Rule::fits));
+                for _ in before..rules.len() {
+                    premises.push(used.clone());
+                }
+            };
+            match list {
+                List::Walks(walks) => {
+                    for (members, used) in walks {
+                        make_walk(&members, used, false);
+                    }
+                }
+                List::Cells(cells) => {
+                    if matches!(
+                        kind,
+                        ListKind::Union | ListKind::Intersection | ListKind::Pairwise
+                    ) {
+                        for (&node, cell) in &cells {
+                            let Some(mut prefix) = voc.path(&cells, head, node, false) else {
                                 continue;
-                            }
-                            let mut facts_used = used;
-                            facts_used.push([subject, predicate, head]);
-                            if checks {
-                                for class in [
-                                    voc.all_disjoint_classes,
-                                    voc.all_disjoint_properties,
-                                    voc.all_different,
-                                ] {
-                                    if facts.objects(subject, voc.rdf_type).contains(&class) {
-                                        facts_used.push([subject, voc.rdf_type, class]);
+                            };
+                            let offset = prefix.len();
+                            if matches!(kind, ListKind::Pairwise) {
+                                for (&next, tail) in &cells {
+                                    let Some(mut between) = voc.path(&cells, node, next, true)
+                                    else {
+                                        continue;
+                                    };
+                                    let Some(mut suffix) = voc.path(&cells, next, voc.nil, true)
+                                    else {
+                                        continue;
+                                    };
+                                    for &a in &cell.firsts {
+                                        between[0][2] = a;
+                                        for &b in &tail.firsts {
+                                            suffix[0][2] = b;
+                                            let mut used = prefix.clone();
+                                            used.extend_from_slice(&between);
+                                            used.extend_from_slice(&suffix);
+                                            make_walk(&[a, b], used, false);
+                                        }
                                     }
                                 }
-                            }
-                            for _ in before..rules.len() {
-                                premises.push(facts_used.clone());
+                            } else if let Some(suffix) = voc.path(&cells, node, voc.nil, true) {
+                                prefix.extend(suffix);
+                                for &member in &cell.firsts {
+                                    prefix[offset][2] = member;
+                                    make_walk(&[member], prefix.clone(), true);
+                                }
                             }
                         }
                     }
-                    Err(problem) if cycle.is_none() || problem == ListProblem::TooManyVariants => {
-                        diagnose(problem);
+                    if matches!(kind, ListKind::Chain)
+                        && let Some(cell) = cells
+                            .get(&head)
+                            .filter(|cell| cell.firsts.contains(&subject))
+                    {
+                        for &rest in &cell.rests {
+                            if cells.get(&rest).is_some_and(|tail| {
+                                tail.firsts.contains(&subject) && tail.rests.contains(&voc.nil)
+                            }) {
+                                make_walk(
+                                    &[subject, subject],
+                                    vec![
+                                        [head, voc.first, subject],
+                                        [head, voc.rest, rest],
+                                        [rest, voc.first, subject],
+                                        [rest, voc.rest, voc.nil],
+                                    ],
+                                    false,
+                                );
+                            }
+                        }
                     }
-                    Err(_) => {}
+                    if matches!(
+                        kind,
+                        ListKind::Chain | ListKind::Key | ListKind::Intersection
+                    ) {
+                        per_cell::compile(voc, kind, axiom, &cells, predicates, |rule, used| {
+                            rules.push(rule);
+                            premises.push(used);
+                        });
+                    }
                 }
             }
-        };
+        }
+    };
     let ty = voc.rdf_type;
     // prp-spo2: (x0 p1 x1) … (x(n-1) pn xn) -> (x0 p xn)
     lists(
@@ -732,17 +749,32 @@ pub(crate) fn instantiate_projected(
             if chain.is_empty() {
                 return;
             }
-            let body = chain
-                .iter()
-                .enumerate()
-                .map(|(i, &pi)| Atom([v(i), c(pi), v(i + 1)]))
-                .collect();
-            rules.push(rule(
-                "prp-spo2",
-                body,
-                vec![],
-                Head::Facts(vec![Atom([v(0), c(p), v(chain.len())])]),
-            ));
+            let diagonals = chain.iter().filter(|&&q| q == voc.same_as).count();
+            for mut mask in 0..1usize << diagonals {
+                let mut body = Vec::new();
+                for &q in chain {
+                    if q == voc.same_as {
+                        let reflexive = mask & 1 != 0;
+                        mask >>= 1;
+                        if reflexive {
+                            continue;
+                        }
+                    }
+                    let i = body.len();
+                    body.push(Atom([v(i), c(q), v(i + 1)]));
+                }
+                if body.is_empty() {
+                    rules.extend(diagonal(c(p)));
+                } else {
+                    let last = v(body.len());
+                    rules.push(rule(
+                        "prp-spo2",
+                        body,
+                        vec![],
+                        Head::Facts(vec![Atom([v(0), c(p), last])]),
+                    ));
+                }
+            }
         },
     );
     // prp-key: two instances of c agreeing on every key property are the same.
@@ -752,6 +784,9 @@ pub(crate) fn instantiate_projected(
         ListKind::Key,
         &mut rules,
         &mut |class, keys, rules| {
+            if keys.is_empty() || keys.contains(&voc.same_as) {
+                return;
+            }
             let (x, y) = (v(0), v(1));
             let mut body = vec![Atom([x, c(ty), c(class)]), Atom([y, c(ty), c(class)])];
             for (i, &p) in keys.iter().enumerate() {
@@ -775,7 +810,7 @@ pub(crate) fn instantiate_projected(
     lists(
         voc.intersection_of,
         "cls-int",
-        ListKind::Class,
+        ListKind::Intersection,
         &mut rules,
         &mut |class, members, rules| {
             // With no members, cls-int1 has no atom to bind the instance.
@@ -812,7 +847,7 @@ pub(crate) fn instantiate_projected(
     lists(
         voc.union_of,
         "cls-uni",
-        ListKind::Class,
+        ListKind::Union,
         &mut rules,
         &mut |class, members, rules| {
             for &ci in members {
@@ -835,7 +870,7 @@ pub(crate) fn instantiate_projected(
     lists(
         voc.one_of,
         "cls-oo",
-        ListKind::Class,
+        ListKind::Union,
         &mut rules,
         &mut |class, members, rules| {
             let heads = members
@@ -866,9 +901,7 @@ pub(crate) fn instantiate_projected(
     lists(
         voc.members,
         "cax-adc, prp-adp, eq-diff2",
-        ListKind::Pairwise {
-            written_predicate: vocabulary.members,
-        },
+        ListKind::Pairwise,
         &mut rules,
         &mut |node, members, rules| {
             if members.len() > PAIRWISE_MEMBERS {
@@ -937,9 +970,7 @@ pub(crate) fn instantiate_projected(
     lists(
         voc.distinct_members,
         "eq-diff3",
-        ListKind::Pairwise {
-            written_predicate: vocabulary.distinct_members,
-        },
+        ListKind::Pairwise,
         &mut rules,
         &mut |node, members, rules| {
             if !typed(node, voc.all_different) {

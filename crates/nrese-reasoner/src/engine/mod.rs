@@ -116,7 +116,7 @@ impl Program {
             axioms: &[],
         };
         let facts = crate::eval::AllFacts(&crate::explain::Whole(&base));
-        !crate::lists::instantiate(&lists, &facts).1.is_empty()
+        lists.leaves_out(&facts)
     }
 
     /// Whether one of `quads` (by `at`'s ids) can change what [`Self::leaves_out_a_list`]
@@ -252,17 +252,27 @@ impl Program {
     /// The ground program of the committed state `snapshot`, as the delta executor
     /// builds it.
     pub fn ground_program(&self, snapshot: &Snapshot) -> GroundProgram {
+        self.ground_program_until(snapshot, crate::eval::NEVER)
+            .expect("unbounded grounding")
+    }
+
+    fn ground_program_until(
+        &self,
+        snapshot: &Snapshot,
+        stop: crate::eval::Stop<'_>,
+    ) -> Result<GroundProgram, crate::eval::Stopped> {
         let schema = self.schema_for(snapshot);
         let base = explain::SnapshotBase {
             snapshot,
             axioms: &self.axioms,
         };
-        delta::program(
+        delta::program_until(
             &base,
             delta::Rules {
                 schema: &schema,
                 ..self.rules()
             },
+            stop,
         )
     }
 
@@ -362,11 +372,13 @@ impl<E> Vocabulary for Constants<'_, E> {
 }
 
 /// Whether RDF can store the triple: an IRI or blank node subject and an IRI predicate.
-pub(crate) fn storable([subject, predicate, _]: Triple) -> bool {
-    matches!(
-        TermId::from_raw(subject).kind(),
-        TermKind::Iri | TermKind::BlankNode
-    ) && TermId::from_raw(predicate).kind() == TermKind::Iri
+pub(crate) fn storable(fact @ [subject, predicate, _]: Triple) -> bool {
+    !fact.into_iter().any(crate::lists::internal)
+        && matches!(
+            TermId::from_raw(subject).kind(),
+            TermKind::Iri | TermKind::BlankNode
+        )
+        && TermId::from_raw(predicate).kind() == TermKind::Iri
 }
 
 pub(crate) fn encode([s, p, o]: Triple) -> EncodedTriple {

@@ -13,7 +13,7 @@ use hashbrown::HashMap;
 
 use nrese_owl::ProofGraph;
 
-use super::delta::{Base, Rules};
+use super::delta::{Base, Rules, TableSource};
 use super::eval::{GroundProgram, Poller, Probe, Seg, Stopped, Visit, Visits};
 use super::ir::Triple;
 
@@ -72,7 +72,10 @@ pub fn explain_with<B: Base + ?Sized>(
     fact: Triple,
     budget: usize,
 ) -> Option<Explanation> {
-    let source = Whole(base);
+    let source = TableSource {
+        source: &Whole(base),
+        table: program.table.as_deref(),
+    };
     let poll = to_its_end();
     // Backwards: the derivations of every inferred fact reachable from `fact`.
     let mut derivations: HashMap<Triple, Vec<(String, Vec<Triple>)>> = HashMap::new();
@@ -172,12 +175,23 @@ pub fn explain_with<B: Base + ?Sized>(
             ..
         }) = proved.get(&fact)
         {
-            let premises: Vec<usize> = body
-                .iter()
-                .map(|&premise| add(premise, proved, steps, index))
-                .collect();
+            let mut public = Vec::new();
+            let mut pending = body.clone();
+            pending.reverse();
+            while let Some(premise) = pending.pop() {
+                if crate::lists::internal(premise[1]) {
+                    if let Some((_, body)) = proved[&premise].derivation.as_ref() {
+                        pending.extend(body.iter().rev().copied());
+                    }
+                } else {
+                    let at = add(premise, proved, steps, index);
+                    if !public.contains(&at) {
+                        public.push(at);
+                    }
+                }
+            }
             steps[at].rule = Some(rule.clone());
-            steps[at].premises = premises;
+            steps[at].premises = public;
         }
         at
     }
@@ -207,7 +221,10 @@ pub fn proof_graph<B: Base + ?Sized>(
     if !known(base.contains(fact, &poll)) {
         return None;
     }
-    let source = Whole(base);
+    let source = TableSource {
+        source: &Whole(base),
+        table: program.table.as_deref(),
+    };
     let mut graph = ProofGraph::new(fact);
     let mut seen: hashbrown::HashSet<Triple> = hashbrown::HashSet::new();
     let mut queue = vec![fact];
@@ -275,7 +292,14 @@ pub fn valid_step<B: Base + ?Sized>(
     }
     program
         .unpolled()
-        .every_named_derivation(&Whole(base), inference.conclusion, usize::MAX)
+        .every_named_derivation(
+            &TableSource {
+                source: &Whole(base),
+                table: program.table.as_deref(),
+            },
+            inference.conclusion,
+            usize::MAX,
+        )
         .iter()
         .any(|(rule, body)| *rule == inference.rule && same(body))
 }

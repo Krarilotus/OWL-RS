@@ -50,6 +50,7 @@ pub fn explain_violation(
     };
     let mut withheld = 0usize;
     let mut evidence: Vec<crate::RejectEvidence> = Vec::new();
+    let mut via = Vec::new();
     if let Some(rule) = program
         .rules
         .iter()
@@ -79,6 +80,27 @@ pub fn explain_violation(
                 object: decode(o),
                 origin: if asserted { "asserted" } else { "inferred" }.to_owned(),
             });
+            if !asserted
+                && readable.is_none()
+                && program.lists.is_some()
+                && let Some(steps) = explain_fact(program, &tx.pending_snapshot(), [s, p, o], None)
+                && let Some(name @ ("prp-spo2" | "prp-key" | "cls-int1")) = steps[0].rule.as_deref()
+            {
+                via.push(name.to_owned());
+                for step in steps
+                    .into_iter()
+                    .skip(1)
+                    .filter(|step| step.origin == "asserted")
+                {
+                    evidence.push(crate::RejectEvidence {
+                        role: "premise",
+                        subject: step.subject,
+                        predicate: step.predicate,
+                        object: step.object,
+                        origin: step.origin.to_owned(),
+                    });
+                }
+            }
         }
     }
     // The instance the violation is about: the subject of the last premise shown (OWL 2
@@ -101,6 +123,13 @@ pub fn explain_violation(
         0 => String::new(),
         n => format!(" ({n} premise(s) not shown: inferred, or asserted in graphs you can't read)"),
     };
+    via.sort_unstable();
+    via.dedup();
+    let via = if via.is_empty() {
+        String::new()
+    } else {
+        format!(" via {}", via.join(", "))
+    };
     let summary = if premises.is_empty() && withheld == 0 {
         let bindings: Vec<String> = violation.bindings.iter().map(|&id| decode(id)).collect();
         format!(
@@ -111,7 +140,7 @@ pub fn explain_violation(
         )
     } else {
         format!(
-            "{} ({}): {}{hidden}",
+            "{} ({}): {}{via}{hidden}",
             violation.rule,
             describe(&violation.rule),
             premises.join("; ")
