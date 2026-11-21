@@ -286,11 +286,11 @@ impl Kinds {
         } else if !iri {
             k.data.contains(&p)
                 && !k.objects.contains(&p)
-                && (!deleted || !may_retype(tx, triple))
+                && !may_retype(tx, triple, deleted)
                 && (deleted || rl_literal(tx, o))
         } else {
             let property = k.objects.contains(&p) && !k.data.contains(&p);
-            let property = property && (!deleted || !may_retype(tx, triple));
+            let property = property && !may_retype(tx, triple, deleted);
             !k.names.contains(&o) && (Some(p) == self.same_as || property)
         }
     }
@@ -413,14 +413,16 @@ fn assertions_only(upper: &Upper, tx: &impl PendingView) -> bool {
 /// dictionary: `tx`'s changed triples, inserted and deleted, where none has OWL's, RDF's or
 /// RDFS's vocabulary as predicate but `rdf:type` and `owl:sameAs` ([`vocabulary_predicate`]),
 /// names a reserved name or SHACL property ([`reserved_named`]) or says something about the
-/// ontology's node ([`header`]), no deleted value may retype its property ([`may_retype`]),
+/// ontology's node ([`header`]), no changed value may retype its property ([`may_retype`]),
 /// and none is a reified triple ([`changes_reified`]); `None` otherwise.
 fn probed_assertions(tx: &impl PendingView) -> Option<Vec<Triple>> {
     let triples: Vec<Triple> = tx.inserted().chain(tx.deleted()).map(quad_triple).collect();
+    let retypes = |q, deleted| may_retype(tx, quad_triple(q), deleted);
     let probed = triples
         .iter()
         .all(|&t| !vocabulary_predicate(tx, t[1]) && !reserved_named(tx, t) && !header(tx, t[0]))
-        && !tx.deleted().any(|q| may_retype(tx, quad_triple(q)))
+        && !tx.inserted().any(|q| retypes(q, false))
+        && !tx.deleted().any(|q| retypes(q, true))
         && !changes_reified(tx);
     probed.then_some(triples)
 }
@@ -496,9 +498,10 @@ impl Bounds {
     /// Whether what the reader left out at `tx`'s base, as the base's commit recorded it, is
     /// what it leaves out of the data as `tx`'s changes leave it: where their commit would
     /// take its record without reading the ontology (the commit's record: the RL route kept,
-    /// or the delta executor's change, [`assertions_only`]), by the same tests: the reader's
-    /// own, no second list. `false` where the bounds describe another revision than the
-    /// base's. The list axioms the closure leaves out are no part of the record.
+    /// or the delta executor's change, [`assertions_only`]), and every change is on the short
+    /// list whose effect on the reader the base's declarations fix ([`listed`]). `false`
+    /// where the bounds describe another revision than the base's. The list axioms the
+    /// closure leaves out are no part of the record.
     ///
     /// Taken as the commit takes it ([`Self::keeps_route`]): no bounds guard is held across
     /// the engine or the dictionary (`docs/architecture/contracts.md`). Under the state only
@@ -512,9 +515,9 @@ impl Bounds {
             .filter(|s| s.revision == base)
             .map(|s| s.kinds.clone());
         match kinds {
-            Some(Some(kinds)) => route_kept(&kinds, tx, false),
+            Some(Some(kinds)) => route_kept(&kinds, tx, false) && listed(tx),
             Some(None) => {
-                let Some(triples) = probed_assertions(tx) else {
+                let Some(triples) = probed_assertions(tx).filter(|_| listed(tx)) else {
                     return false;
                 };
                 let state = lock(&self.state);
@@ -527,6 +530,67 @@ impl Bounds {
             None => false,
         }
     }
+}
+
+/// Whether every change of `tx`, inserted or deleted, is on the short list whose effect on
+/// what the reader reads the base's declarations fix, so a read inside the transaction may
+/// take its base's clean record ([`Bounds::keeps_record`], beside the commit's own tests):
+/// `s a C` with `C` declared `owl:Class`, `s p o` with `p` declared `owl:ObjectProperty`
+/// and `o` an IRI, `s p "v"` with `p` declared `owl:DatatypeProperty`; each declared so and
+/// as no other kind (class, object, data or annotation property, datatype), its subject
+/// (and its object, an IRI) named, no reserved or SHACL name ([`reserved_named`]), not the
+/// ontology's node ([`header`]) and not a reification's node (no `owl:annotatedSource`).
+/// The commit's tests already refuse a reified triple ([`changes_reified`]).
+///
+/// Why a list: the commit's tests prove "the reader reads the data as before" from guards
+/// over the syntax, for any change the RL route or the delta takes, and each review of them
+/// found another change that alters what the reader reports. A change on this list alters
+/// nothing the reader reads but an individual's membership or value under a name whose
+/// kind the base declares; any other reads its own ontology, the cost before the record
+/// was taken at all, never another record.
+fn listed(tx: &impl PendingView) -> bool {
+    let base = tx.base();
+    let id = |iri: &str| base.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
+    let owl = |local: &str| id(&format!("http://www.w3.org/2002/07/owl#{local}"));
+    let Some(rdf_type) = id(RDF_TYPE) else {
+        return false;
+    };
+    let source = owl("annotatedSource");
+    // Class, object, data and annotation property, datatype, as `kind` below counts them.
+    let kinds = [
+        owl("Class"),
+        owl("ObjectProperty"),
+        owl("DatatypeProperty"),
+        owl("AnnotationProperty"),
+        id("http://www.w3.org/2000/01/rdf-schema#Datatype"),
+    ];
+    let has = |s: u64, p: TermId, o: Option<TermId>| {
+        let mut pattern = nrese_engine::QuadPattern::all();
+        (pattern.subject, pattern.predicate, pattern.object) =
+            (Some(TermId::from_raw(s)), Some(p), o);
+        let mut found = base.quads_for_pattern_in(ReadModel::Asserted, &pattern);
+        found.next().is_some()
+    };
+    // Whether `t` is declared the `at`th kind and as no other.
+    let only = |t: u64, at: usize| {
+        let declared = kinds.map(|k| k.is_some_and(|k| has(t, rdf_type, Some(k))));
+        declared[at] && declared.iter().filter(|&&d| d).count() == 1
+    };
+    let named = |t: u64| TermId::from_raw(t).kind() == nrese_engine::TermKind::Iri;
+    let plain = |t: u64| !header(tx, t) && !source.is_some_and(|source| has(t, source, None));
+    let mut changed = tx.inserted().chain(tx.deleted()).map(quad_triple);
+    changed.all(|triple @ [s, p, o]| {
+        let kind = || {
+            if TermId::from_raw(p) == rdf_type {
+                named(o) && only(o, 0)
+            } else if named(o) {
+                only(p, 1)
+            } else {
+                TermId::from_raw(o).kind().is_literal() && only(p, 2)
+            }
+        };
+        named(s) && kind() && plain(s) && (!named(o) || plain(o)) && !reserved_named(tx, triple)
+    })
 }
 
 impl std::fmt::Debug for Bounds {
@@ -781,19 +845,20 @@ fn named(tx: &impl PendingView, t: u64, reserved: bool) -> bool {
     }
 }
 
-/// Whether deleting a statement may change its property's kind for the reader, which types
-/// an undeclared property by its uses, every statement of it counted (`nrese_owl::mapping`,
-/// `is_data_property`): a data property while it has a literal value and no other, an
-/// object property otherwise. So a literal value of a property not declared a data property
-/// may be its last, and a value that is no literal, of a property not declared an object
-/// property, may be its last other one where the property has a literal value too (one the
-/// reader reads as no assertion, about the ontology's node for one: [`Kinds::keep`] and
-/// [`Upper::is_assertion`] refuse a property asserted with both). That literal is looked
-/// for among at most [`RETYPE_VALUES`] of its values in the base; past them, it may. Declared
-/// in the base: deleting a declaration is OWL's vocabulary, which both carry-overs refuse;
-/// and inserting a literal value of an object property is no assertion either refuses.
+/// Whether deleting (`deleted`) or inserting a statement may change its property's kind for
+/// the reader, which types an undeclared property by its uses, every statement of it counted
+/// (`nrese_owl::mapping`, `is_data_property`): a data property while it has a literal value
+/// and no other, an object property otherwise. So a deleted literal value of a property not
+/// declared a data property may be its last; and a value that is no literal, of a property
+/// not declared an object property, deleted may be its last other one, inserted its first,
+/// where the property has a literal value too (one the reader reads as no assertion, about
+/// the ontology's node for one: [`Kinds::keep`] and [`Upper::is_assertion`] refuse a
+/// property asserted with both). That literal is looked for among at most [`RETYPE_VALUES`]
+/// of its values in the base; past them, it may. An inserted literal makes a data property
+/// only of one with no value, which neither carry-over knows as one. Declared in the base:
+/// deleting a declaration is OWL's vocabulary, which both carry-overs refuse.
 /// `rdf:type` and `owl:sameAs` type no property.
-pub(crate) fn may_retype(tx: &impl PendingView, [_, p, o]: Triple) -> bool {
+pub(crate) fn may_retype(tx: &impl PendingView, [_, p, o]: Triple, deleted: bool) -> bool {
     let id = |iri: &str| tx.lookup(nrese_rdf::NamedNodeRef::new_unchecked(iri).into());
     let (rdf_type, same_as) = (id(RDF_TYPE), id(OWL_SAME_AS));
     let property = Some(TermId::from_raw(p));
@@ -801,6 +866,9 @@ pub(crate) fn may_retype(tx: &impl PendingView, [_, p, o]: Triple) -> bool {
         return false;
     }
     let literal = TermId::from_raw(o).kind().is_literal();
+    if literal && !deleted {
+        return false;
+    }
     let kind = if literal {
         "http://www.w3.org/2002/07/owl#DatatypeProperty"
     } else {
@@ -827,7 +895,7 @@ pub(crate) fn may_retype(tx: &impl PendingView, [_, p, o]: Triple) -> bool {
 }
 
 /// How many of an undeclared property's values [`may_retype`] looks through for a literal
-/// one, per deleted value: past them a commit reads the ontology, as any other it can't
+/// one, per changed value: past them a commit reads the ontology, as any other it can't
 /// carry over.
 const RETYPE_VALUES: usize = 32;
 
