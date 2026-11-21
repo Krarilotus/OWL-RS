@@ -1420,6 +1420,66 @@ mod tests {
         assert!(engine.snapshot().characteristic_sets_in(model).is_some());
     }
 
+    /// A planner off the pool that plans during the first build helps with its slices, then
+    /// sleeps on it, and has the complete sets: the one build's, after one scan.
+    #[test]
+    fn an_off_pool_planner_helps_a_sliced_build_s_slices_and_gets_its_sets() {
+        let model = ReadModel::default();
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        add(&engine, 0..3_000);
+        let statistics = Arc::clone(&engine.inner.shared.statistics);
+        let snapshot = engine.snapshot();
+        let (found, planned) = std::sync::mpsc::channel();
+        // The build holds back until the planner sleeps on it.
+        holding(&statistics, 1, {
+            let snapshot = snapshot.clone();
+            move || {
+                std::thread::spawn(move || {
+                    let _ = found.send(snapshot.characteristic_sets_in(model));
+                });
+            }
+        });
+        let built = snapshot.characteristic_sets_in(model).expect("built");
+        let planned = planned
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the planner finished")
+            .expect("the planner has the sets");
+        assert!(Arc::ptr_eq(&planned, &built));
+        assert_eq!(statistics.scans(), 1);
+    }
+
+    /// Spec (`characteristic.rs`: a graph with more than `MAX_SETS` sets gets none): a build
+    /// that finds too many keeps none at its size, so the next planner at that size gets none
+    /// at once and starts no build. Statistics' own kept failure, before any claim.
+    #[test]
+    fn too_many_sets_are_kept_as_none_and_the_next_planner_starts_no_build() {
+        let model = ReadModel::default();
+        let engine = Engine::new(EngineConfig::default()).unwrap();
+        // A predicate of its own per subject: one set each, one past the most kept.
+        let mut tx = engine.transaction();
+        let node = |name: String| NamedNode::new_unchecked(format!("http://example.com/{name}"));
+        for i in 0..=super::super::characteristic::MAX_SETS {
+            let quad = Quad::new(
+                node(format!("s{i}")),
+                node(format!("p{i}")),
+                node("o".to_owned()),
+                GraphName::DefaultGraph,
+            );
+            tx.insert(quad.as_ref());
+        }
+        tx.commit().unwrap();
+        let statistics = Arc::clone(&engine.inner.shared.statistics);
+        let snapshot = engine.snapshot();
+        assert!(
+            snapshot.characteristic_sets_in(model).is_none(),
+            "too many sets"
+        );
+        assert_eq!(statistics.scans(), 1);
+        assert!(snapshot.characteristic_sets_in(model).is_none());
+        assert_eq!(statistics.scans(), 1, "the next planner built again");
+        assert!(statistics.building.is_idle());
+    }
+
     /// A pool's only thread that plans during a build started outside it, with no lanes
     /// beside the builder, scans the whole first scan itself and then has the complete
     /// sets: a planner that waits never needs a thread of its own pool to get on.

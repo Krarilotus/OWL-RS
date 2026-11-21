@@ -428,50 +428,5 @@ impl<V> std::fmt::Debug for Kept<V> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// An opaque build in progress: a pool thread is turned away at once, a thread off the
-    /// pool sleeps until the builder finishes, and a builder that ends without a value
-    /// wakes it with none. What's kept is charged until it's dropped.
-    #[test]
-    fn only_threads_off_the_pool_wait_for_an_opaque_build() {
-        let cell: Arc<BuildCell<u64, u64>> = Arc::default();
-        let Claim::Build(builder) = cell.claim(7, Kind::Opaque, || None) else {
-            panic!("the first claim builds");
-        };
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(1)
-            .build()
-            .unwrap();
-        let on_pool = pool.install(|| match cell.claim(7, Kind::Opaque, || None) {
-            Claim::Wait(build) => build.wait().map(|_| ()),
-            Claim::Build(_) => panic!("one build at a time"),
-        });
-        assert_eq!(on_pool, Err(Busy));
-        let (got, woke) = std::sync::mpsc::channel();
-        let waiter = Arc::clone(&cell);
-        std::thread::spawn(move || {
-            let Claim::Wait(build) = waiter.claim(7, Kind::Opaque, || None) else {
-                panic!("one build at a time");
-            };
-            let _ = got.send(build.wait());
-        });
-        let started = std::time::Instant::now();
-        while lock(&cell.building)[&7].waiting() == 0 {
-            assert!(started.elapsed().as_secs() < 30, "the waiter never slept");
-            std::thread::yield_now();
-        }
-        builder.finish(Some(Arc::new(42)));
-        drop(builder);
-        let value = woke.recv_timeout(std::time::Duration::from_secs(30));
-        assert_eq!(value.unwrap().unwrap().as_deref(), Some(&42));
-        assert!(cell.is_idle());
-        let budget = Arc::new(Budget::new(100));
-        let kept = Kept::charge(Arc::new(1u64), 60, Arc::clone(&budget)).unwrap();
-        assert_eq!(budget.used(), 60);
-        assert!(Kept::charge(Arc::new(2u64), 60, Arc::clone(&budget)).is_err());
-        drop(kept);
-        assert_eq!(budget.used(), 0);
-    }
-}
+#[path = "cell_tests.rs"]
+mod tests;

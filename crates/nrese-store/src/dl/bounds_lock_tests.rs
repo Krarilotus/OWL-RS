@@ -524,6 +524,72 @@ fn a_read_whose_time_is_up_before_the_view_answers_without_it() {
     seam::at(&store.dl().bounds, Point::View); // the counting hook, unused, goes
 }
 
+/// Spec: a read whose revision's view build it waited for failed (here: panicked) answers
+/// over the RL closure (`:a1 a :A` is asserted, so `true`), told incomplete because that
+/// build failed, never that a later commit replaced its revision's bounds: none did. Counted,
+/// not timed: the build is held at `Point::View` until the joined read sleeps on it, then
+/// panics.
+#[test]
+fn a_view_build_that_panics_tells_its_waiting_read_the_build_failed_not_a_later_revision() {
+    use std::sync::mpsc;
+    let (store, _pipeline) = pipeline();
+    let revision = store.engine().snapshot().revision();
+    let (held, holding) = mpsc::channel();
+    let (go, panic_now) = mpsc::channel::<()>();
+    seam::set(&store.dl().bounds, Point::View, move || {
+        held.send(()).unwrap();
+        let _ = panic_now.recv_timeout(Duration::from_secs(20));
+        panic!("the view build's injected panic");
+    });
+    // The first read builds the view, held at `Point::View`, and panics there.
+    let builder = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || drop(view(&store)))
+    };
+    holding
+        .recv_timeout(Duration::from_secs(10))
+        .expect("the first read builds the view");
+    let prepared = Arc::new(
+        store
+            .prepare_query(&crate::SparqlQueryRequest::all(QUERY))
+            .unwrap(),
+    );
+    let joined = {
+        let store = Arc::clone(&store);
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            let token = crate::CancellationToken::new();
+            let (status, _) = store
+                .run_query_dl(&prepared, &token, &mut out)
+                .expect("an answer, not an error")
+                .expect("a DL status");
+            let reasons: Vec<String> = status.reasons.iter().map(|r| r.text.to_string()).collect();
+            (String::from_utf8(out).unwrap(), status.complete, reasons)
+        })
+    };
+    until(|| asleep(&store, revision));
+    go.send(()).unwrap();
+    assert!(builder.join().is_err(), "the view build panicked");
+    let (answer, complete, reasons) = joined.join().expect("the joined read answers");
+    assert!(
+        answer.contains("true") && !answer.contains("false"),
+        "{answer}"
+    );
+    assert!(!complete, "{reasons:?}");
+    assert!(
+        reasons
+            .iter()
+            .any(|text| text.starts_with("the bounds' build of this revision's view failed")),
+        "{reasons:?}"
+    );
+    assert!(
+        !reasons
+            .iter()
+            .any(|text| text.starts_with("a later commit's bounds replaced")),
+        "{reasons:?}"
+    );
+}
+
 #[test]
 fn a_joined_query_gives_up_while_the_view_is_built() {
     a_joined_read_gives_up(false);
