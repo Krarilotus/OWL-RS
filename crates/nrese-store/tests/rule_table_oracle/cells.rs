@@ -356,6 +356,43 @@ fn nil_alias_terminates_a_list() {
     );
 }
 
+fn chain_with(extra: &str) -> generator::Write {
+    insert(&format!(
+        "
+        ex:out owl:propertyChainAxiom ex:h
+        ex:h rdf:first ex:p
+        ex:h rdf:rest ex:t
+        ex:t rdf:first ex:q
+        ex:t rdf:rest rdf:nil
+        ex:a ex:p ex:b
+        ex:b ex:q ex:c
+        {extra}
+        "
+    ))
+}
+
+#[test]
+fn accepting_walk_survives_incomplete_branches() {
+    // Spec: Table 3 requires a first and a rest at each position. Table 5
+    // prp-spo2 still derives the row from the branch with both.
+    check(
+        case(
+            "incomplete-branches",
+            ["ex:a", "ex:out", "ex:c"],
+            vec![chain_with(
+                "
+                ex:h rdf:rest ex:noFirst
+                ex:noFirst rdf:rest rdf:nil
+                ex:h rdf:rest ex:noRest
+                ex:noRest rdf:first ex:r
+                ",
+            )],
+        ),
+        &[true],
+        &[true],
+    );
+}
+
 #[test]
 #[ignore = "documented limit reasoning-semantics.md:63-65: asserting an entailed shortcut changes the first load's chain answer"]
 fn redundant_list_premise_leaves_chain_unchanged() {
