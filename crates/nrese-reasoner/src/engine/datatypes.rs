@@ -448,4 +448,66 @@ mod tests {
         assert_eq!(data(typed("NaN", "double")), data(typed("NaN", "double")));
         assert_eq!(data(typed("1.0", "double")), data(typed("1", "double")));
     }
+
+    /// A work guard of the check's cost (in the spirit of `tests/work_guards.rs`: an exact
+    /// count of work, not a time). Spec: dt-not-type binds a literal subject only (OWL 2
+    /// Profiles table 8), so a type row whose subject's class holds no literal needs no
+    /// datatype: its class is decoded 0 times, with every identity listed and with compact
+    /// classes alike. Decoding it for every derived type row doubled the reasoning's
+    /// allocations (7.85 M to 15.85 M on the deep hierarchy) for the same closure. A class
+    /// with a literal member is still decoded and its clash still found.
+    #[test]
+    fn a_type_row_without_a_literal_subject_decodes_no_class() {
+        use nrese_engine::TermKind;
+        use nrese_rdf::BlankNode;
+        use std::cell::Cell;
+        let id = |kind, n: u64| TermId::kind_range(kind).0.raw() + n;
+        let (rdf_type, class) = (id(TermKind::Iri, 1), id(TermKind::Iri, 2));
+        let (a, b, c) = (
+            id(TermKind::Iri, 3),
+            id(TermKind::Iri, 4),
+            id(TermKind::BlankNode, 1),
+        );
+        let text = id(TermKind::String, 1);
+        // The class's decodes, and the violations found.
+        let run = |facts: &[Triple], classes: Option<&EqualityClasses>| {
+            let decodes = Cell::new(0);
+            let decode = |term: u64| {
+                if term == class {
+                    decodes.set(decodes.get() + 1);
+                    return Some(NamedNode::new_unchecked(format!("{XSD}integer")).into());
+                }
+                Some(match TermId::from_raw(term).kind() {
+                    TermKind::String => Literal::new_simple_literal("abc").into(),
+                    TermKind::BlankNode => BlankNode::new_unchecked("c").into(),
+                    _ => NamedNode::new_unchecked(format!("http://example.com/{term}")).into(),
+                })
+            };
+            let memory = crate::violations::unlimited();
+            let found = violations(facts, rdf_type, None, classes, &decode, &memory);
+            let found: Vec<(String, Vec<u64>)> = found
+                .iter()
+                .map(|(rule, bindings)| (rule.to_owned(), bindings.to_vec()))
+                .collect();
+            (decodes.get(), found)
+        };
+        let typed = |s: u64| [s, rdf_type, class];
+        let none: Vec<(String, Vec<u64>)> = Vec::new();
+        // Every identity's facts listed: an IRI subject, a blank-node subject.
+        assert_eq!(run(&[typed(a), typed(c)], None), (0, none.clone()));
+        // Compact classes without a literal member: {a, b}, {a blank node, an IRI}; and a
+        // subject in no class.
+        let mut classes = EqualityClasses::default();
+        classes.union(a, b);
+        classes.union(c, id(TermKind::Iri, 5));
+        let rows = [typed(a), typed(b), typed(c), typed(id(TermKind::Iri, 6))];
+        assert_eq!(run(&rows, Some(&classes)), (0, none.clone()));
+        // A class with a literal member: decoded, and "abc" is no xsd:integer.
+        let mut classes = EqualityClasses::default();
+        classes.union(a, text);
+        let clash = vec![("dt-not-type".to_owned(), vec![text, class])];
+        assert_eq!(run(&[typed(a)], Some(&classes)), (1, clash.clone()));
+        // A literal subject, every identity's facts listed (a generalised fact).
+        assert_eq!(run(&[typed(text)], None), (1, clash));
+    }
 }
