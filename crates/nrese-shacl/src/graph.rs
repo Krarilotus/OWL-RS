@@ -227,7 +227,9 @@ impl<'a, V: ReadView> GraphView<'a, V> {
 /// `2 × max(encoded, 64) + 5 × encoded + 16`, each plus `encoded`. The encoded length is
 /// taken as the text, the datatype IRI and the language tag, and 16 bytes of framing. For a
 /// view that isn't a snapshot, whose lookup has no charged form, and a lookup through a
-/// comparison's frontier, whose state after may be a transaction's overlay.
+/// comparison's frontier (a caller's state after, which may be a private view and so an
+/// overlay; a shared transaction's pending state looks up in the shared dictionary, within
+/// `7 × encoded + 192`).
 pub(crate) fn literal_lookup_bound(literal: &Term) -> usize {
     let encoded = match literal {
         Term::Literal(literal) => {

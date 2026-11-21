@@ -503,14 +503,19 @@ fn a_refused_message_holds_less_than_its_language_tag() {
     assert!(bytes < 1 << 20, "held {bytes} bytes");
 }
 
-/// A change's validation looks a filled message up in the state after's dictionary (its
-/// frontier), there a transaction's overlay on a compressed base: the worst case the
-/// lookup's charge must cover. A 1 MiB message that neither state stores, the same before
-/// and after the change, is looked up in both validations. What they hold beyond their
-/// charge stays under half the message, so a lookup charged less than it allocates (its key
-/// alone is the message's length) fails here.
+/// A change's validation looks the filled message of the state before up in the state
+/// after's dictionary (its frontier), charged by its bound before. The state after is a
+/// transaction's pending state, as every caller passes it: its lookup is the shared
+/// dictionary's, here on a compressed base (the checkpoint maps it so; a failed mapping
+/// would only be logged). A private view's overlay, which makes its own key as well, is
+/// not measured here: no caller validates a change against one. A 1 MiB message that
+/// neither state stores, the same before and after the change. What the validation holds
+/// beyond its charge stays under 64 KiB (2,708 bytes measured), so a lookup charged
+/// nothing, or less than its key (the message's length), fails here. A charge spent later
+/// in the validation can hide less than that much (the measurement is the largest gap
+/// over the whole run).
 #[test]
-fn a_message_looked_up_through_the_frontier_holds_no_more_than_its_charge() {
+fn a_message_looked_up_through_the_frontier_is_charged_for_its_lookup() {
     if !measure::alone() {
         return;
     }
@@ -525,6 +530,8 @@ fn a_message_looked_up_through_the_frontier_holds_no_more_than_its_charge() {
         "nrese-shacl-frontier-measure-{}",
         std::process::id()
     )));
+    // A directory left by a killed run of the same process id is not this test's store.
+    let _ = std::fs::remove_dir_all(&dir.0);
     std::fs::create_dir_all(&dir.0).expect("the test's directory");
     nrese_engine::set_vocabulary_encoding(nrese_engine::VocabularyEncoding::Fsst);
     let config = EngineConfig {
@@ -577,6 +584,21 @@ fn a_message_looked_up_through_the_frontier_holds_no_more_than_its_charge() {
     let changed: Vec<_> = tx.inserted().collect();
     let after = tx.pending_snapshot();
     let data = Selection::of(GraphSelector::Exact(nrese_engine::TermId::DEFAULT_GRAPH));
+    // The state after has the result and its message, so the state before's is looked up.
+    let report = nrese_shacl::validate(&after, &shapes, data, &nrese_sparql::Resources::default())
+        .expect("the state after's validation");
+    let lengths: Vec<_> = report
+        .results
+        .iter()
+        .map(|result| {
+            result
+                .messages
+                .iter()
+                .map(|m| m.value().len())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(lengths, [[(1 << 20) + 1]], "the state after's results");
     let resources = nrese_sparql::Resources::default();
     let (outcome, excess) = measure::measure_within(&resources.memory, || {
         nrese_shacl::validate_changes(&before, &after, &shapes, data, &changed, &resources)
@@ -584,5 +606,5 @@ fn a_message_looked_up_through_the_frontier_holds_no_more_than_its_charge() {
     });
     eprintln!("a change's validation held at most {excess} bytes beyond its charge: {outcome:?}");
     assert!(matches!(outcome, Ok(0)), "{outcome:?}");
-    assert!(excess < 512 << 10, "held {excess} bytes beyond its charge");
+    assert!(excess < 64 << 10, "held {excess} bytes beyond its charge");
 }
