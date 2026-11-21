@@ -177,6 +177,15 @@ impl Evaluator {
             .insert(alias.to_owned(), term);
     }
 
+    /// How many aliases the map has room for.
+    #[cfg(test)]
+    pub(crate) fn alias_room(&self) -> usize {
+        self.aliases
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .capacity()
+    }
+
     /// Lets `alias` go ([`Self::register_alias`]).
     pub(crate) fn forget_alias(&self, alias: &str) {
         self.aliases

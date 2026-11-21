@@ -484,7 +484,10 @@ fn a_restored_save_point_leaves_the_context_as_it_was() {
     let decimal =
         |lexical: &str| -> Term { Literal::new_typed_literal(lexical, xsd::DECIMAL).into() };
     aggregate(&grouped(&wide(), "(SUM(?v + 0) AS ?t)"));
-    assert!(ctx.id(&decimal("0.5")).is_ok());
+    // A thousand terms kept from before the point.
+    for i in 0..1_024 {
+        assert!(ctx.id(&decimal(&format!("{i}.25"))).is_ok());
+    }
     let before = counters(&ctx);
     let point = ctx.save();
     aggregate(&grouped(&wide(), "(SUM(?v * 3) AS ?t)"));
@@ -505,11 +508,10 @@ fn a_restored_save_point_leaves_the_context_as_it_was() {
         "[kept bytes, computed terms, remembered numbers, budget used]"
     );
     // What stays allocated is what the charge of the terms kept covers: two slots of the
-    // list and two of the map per term ([`computed_bytes`]), a hash table's capacity
-    // rounded up to a power of two.
+    // list and two of the map per term ([`computed_bytes`]; a small table has three).
     let (terms, ids) = (ctx.computed.borrow(), ctx.computed_ids.borrow());
     assert!(
-        terms.capacity() <= 2 * terms.len() && ids.capacity() <= 4 * ids.len() + 7,
+        terms.capacity() <= 2 * terms.len() && ids.capacity() <= 2 * ids.len().max(2),
         "{} terms in a list of {} and a map of {}",
         terms.len(),
         terms.capacity(),
@@ -548,6 +550,11 @@ fn a_restore_lets_go_of_the_aliases_of_the_terms_it_lets_go() {
     assert_eq!(alias_of(&alias), Some(triple(named("urn:attempt"))));
     ctx.restore(point);
     assert_eq!(alias_of(&alias), None, "the alias after the restore");
+    assert_eq!(
+        (ctx.aliases.borrow().capacity(), ctx.evaluator.alias_room()),
+        (0, 0),
+        "no alias is left, nor room for one"
+    );
     assert_eq!(
         (counters(&ctx), ctx.aliases.borrow().clone()),
         before,
