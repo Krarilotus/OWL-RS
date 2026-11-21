@@ -146,14 +146,16 @@ def writers_overlay() -> str:
     """For a test module whose tests write fleet jobs, from its setUpModule: the job writers stop
     without the private bench overlay (suitekit/hosts.py overlay_env), so a repository of the
     module's own holds one, its overlay/ named by NRESE_BENCH_PRIVATE until the module's tests end
-    (BENCH_INPUTS_GIT unset); its commit. Set and restored here, not by a started mock patch: a
+    (BENCH_INPUTS_GIT unset); its content identity. Set and restored here, not by a started mock patch: a
     test's patch.stopall would stop that one too."""
     path = Path(tempfile.mkdtemp(prefix="overlay-", dir=OWN))
-    head = overlay_repo(path)
-    names = ("NRESE_BENCH_PRIVATE", "BENCH_INPUTS_GIT", "NRESE_BENCH_HOSTS")
+    overlay_repo(path)
+    names = ("NRESE_BENCH_PRIVATE", "BENCH_INPUTS_GIT", "NRESE_BENCH_HOSTS", "NRESE_BENCH_FLOORS",
+             "NRESE_BENCH_OVERLAY_REV")
     before = {name: os.environ.get(name) for name in names}
-    os.environ.update({"NRESE_BENCH_PRIVATE": (path / "overlay").as_posix(), "BENCH_INPUTS_GIT": "",
-                       "NRESE_BENCH_HOSTS": ""})
+    for name in names:
+        os.environ.pop(name, None)
+    os.environ["NRESE_BENCH_PRIVATE"] = (path / "overlay").as_posix()
 
     def restore() -> None:
         for name, value in before.items():
@@ -162,7 +164,9 @@ def writers_overlay() -> str:
             else:
                 os.environ[name] = value
     unittest.addModuleCleanup(restore)
-    return head
+    import hashlib
+    import json
+    return "sha256:" + hashlib.sha256(json.dumps([OVERLAY_HOSTS, ""]).encode("utf-8")).hexdigest()
 
 
 if __name__ == "__main__":

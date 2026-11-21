@@ -240,6 +240,7 @@ def passes(records_of=None, blocks=2, layouts=None, sides=SIDES, order_of=None):
     runs back to back as a palindrome (`order_of(block)` another order). records_of(side, n) gives
     a run's records, n its pass number (6 (block - 1) + its place)."""
     records_of = records_of or (lambda side, n: [record()])
+    timing = gate_module.round_inputs(MACHINE["fleet_host"])
     out, t = [], 1000
     for b in range(1, blocks + 1):
         layout = layouts[b - 1] if layouts else 1
@@ -255,7 +256,8 @@ def passes(records_of=None, blocks=2, layouts=None, sides=SIDES, order_of=None):
                         rec.update(started_ns=t, finished_ns=t + 10, block=b, layout=layout, side=side, run=run)
                         t += 10
         for (side, run), (n, rep) in runs.items():
-            rep.update(block=b, run=run, layout=layout, side=side,
+            rep.update(block=b, run=run, layout=layout, side=side, timing_inputs=timing,
+                       machine={**rep["machine"], "overlay": timing["overlay"]},
                        started_ns=min(r["started_ns"] for r in rep["records"]),
                        finished_ns=max(r["finished_ns"] for r in rep["records"]))
             if layout > 1:
@@ -269,7 +271,9 @@ def passes(records_of=None, blocks=2, layouts=None, sides=SIDES, order_of=None):
 
 def run_gate(ps, sides=("cand", "base", "main"), require=("base", "main"), **kw):
     kw.setdefault("context", CONTEXT)
-    return gate_module.gate(ps, {s: REVS[s] for s in sides}, "cand", list(require), HARNESS, **kw)
+    summary = gate_module.gate(ps, {s: REVS[s] for s in sides}, "cand", list(require), HARNESS, **kw)
+    summary["timing_inputs"] = gate_module.round_inputs(kw["context"].get("host", ""))
+    return summary
 
 
 def worse(factor, n):
@@ -2010,8 +2014,7 @@ class Parts(unittest.TestCase):
                 {"host": "timed-host", "blocks": 8, "cases": {"lab-olympics": {"time/q06": 0.04}}}, "aa-fixture"),
                 encoding="utf-8", newline="\n")
             isolation.overlay_repo(inputs)
-            folder = {"NRESE_BENCH_PRIVATE": (inputs / "overlay").as_posix(), "NRESE_BENCH_HOSTS": "",
-                      "NRESE_BENCH_FLOORS": ""}
+            folder = {"NRESE_BENCH_PRIVATE": (inputs / "overlay").as_posix()}
             with patch.dict(os.environ, folder):
                 here = report_floor(Path(tmp))
                 job = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics",
@@ -2022,7 +2025,7 @@ class Parts(unittest.TestCase):
             self.assertEqual(there, "timed-host.toml: aa-fixture, 8 blocks")
             self.assertEqual(here, there)
             with patch.dict(os.environ, {**folder, **carried}), self.assertRaises(ValueError):  # two overlays
-                report_floor(Path(tmp))
+                gate_module.host_floor("timed-host")
 
     def test_the_big_cases_run_on_a_linux_host_never_native_windows(self):
         """Round 8: the big job went to the development machine, native Windows, with the build's ELF binaries. It
@@ -3078,9 +3081,8 @@ find "$b" -maxdepth 2 -exec touch -d "$4" {} +'''
 
     def test_a_callers_paths_are_the_launching_checkouts(self):
         """PR #60: the gate runs its code from a checkout of its own, and
-        `jobs HEAD --out jobs` wrote its jobs into that checkout, named it their repository, and
-        left it unclean, so the gate's next start refused it. A caller's paths, and the jobs'
-        repository, are the launching checkout's."""
+        `jobs HEAD --out ../plans` resolved its paths from the worktree that runs the gate.
+        The output is relative to the caller and the jobs name the caller's checkout."""
         if shutil.which("bash") is None:
             self.skipTest("needs bash")
         loop = self.commit({self.PERF_LAB: "fn main() { arm(); }\n"}, "its perf lab", self.side)
@@ -3088,10 +3090,11 @@ find "$b" -maxdepth 2 -exec touch -d "$4" {} +'''
         Path(self.repo, "benches").mkdir(exist_ok=True)
         shutil.copy(ROOT / "benches/hosts.toml", Path(self.repo, "benches/hosts.toml"))
         tmp = self.gate_beside(loop)
+        plans = tmp / "plans"
         for start in ("first", "next"):
             output = self.run_gate(tmp, "jobs", "jobs", "HEAD", "--base", "HEAD", "--main", "HEAD", "--no-checks",
-                                   "--out", "jobs")
-            written = sorted(Path(self.repo, "jobs").glob("*.toml"))
+                                   "--out", os.path.relpath(plans, self.repo))
+            written = sorted(plans.glob("*.toml"))
             self.assertTrue(written, f"SPEC the {start} start writes the jobs where the caller said:\n{output}")
         for file in written:
             repositories = re.findall(r'git = "([^"]+)"', file.read_text(encoding="utf-8"))
@@ -3213,7 +3216,8 @@ exec "{Path(shutil.which("git")).as_posix()}" "$@"
 ''', encoding="utf-8", newline="\n")
         hold.chmod(0o755)
         path = hold.parent.as_posix() + os.pathsep + os.environ.get("PATH", "")
-        jobs = lambda out: ("jobs", "HEAD", "--base", "HEAD", "--main", "HEAD", "--no-checks", "--out", out)
+        jobs = lambda out: ("jobs", "HEAD", "--base", "HEAD", "--main", "HEAD", "--no-checks", "--out",
+                            (tmp / out).as_posix())
         start = lambda out: subprocess.Popen(
             [shutil.which("bash"), "scripts/release-gate.sh", *jobs(out)], cwd=self.repo,
             env=self.gate_env(tmp, "at-once", path), stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -3234,11 +3238,11 @@ exec "{Path(shutil.which("git")).as_posix()}" "$@"
         output = first.communicate(timeout=300)[0]
         self.assertEqual(first.returncode, 0, f"SPEC so does the one paused while making it:\n{output}")
         for out in ("jobs-a", "jobs-b"):
-            self.assertTrue(list(Path(self.repo, out).glob("*.toml")), f"{out}: no jobs written")
+            self.assertTrue(list((tmp / out).glob("*.toml")), f"{out}: no jobs written")
         self.assertEqual(list((tmp / "at-once" / "gate" / "run").glob("*/[0-9]*-*")), [], "SPEC each removes its own")
         self.assertIn("MiB reclaimed", self.run_gate(tmp, "at-once", "clean"), "SPEC a clean after them runs")
         output = self.run_gate(tmp, "at-once", *jobs("jobs-c"))
-        self.assertTrue(list(Path(self.repo, "jobs-c").glob("*.toml")), f"SPEC and a restart:\n{output}")
+        self.assertTrue(list((tmp / "jobs-c").glob("*.toml")), f"SPEC and a restart:\n{output}")
         listed = self.git("worktree", "list", "--porcelain")
         self.assertEqual(listed.count("worktree "), 1, f"SPEC no checkout stays registered:\n{listed}")
 

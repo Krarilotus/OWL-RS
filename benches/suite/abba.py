@@ -282,7 +282,8 @@ def manifest_of(family: dict, harness: str, round_: int, host: str, job: str = "
     family's), whose floor the report takes. `session`: drawn anew by every check, and `job` the
     fleet job that ran it, so that a round is told from any other (rounds_errors())."""
     return {k: family[k] for k in ("path", "sha256", "name", "blocks", "sides", "cases", "hypotheses")} | {
-        "harness": harness, "round": round_, "host": host, "session": uuid.uuid4().hex, "job": job}
+        "harness": harness, "round": round_, "host": host, "session": uuid.uuid4().hex, "job": job,
+        "timing_inputs": rg.round_inputs(host)}
 
 
 def git(repo: Path, *args: str) -> str:
@@ -507,6 +508,12 @@ def judge(family: dict, results: Path) -> tuple[list[str], dict | None, dict | N
         problems = ["the manifest names no host"]
     if problems:
         return problems, None, None, host
+    timing = manifest.get("timing_inputs")
+    if not rg.valid_round_inputs(timing):
+        return ["the manifest does not record a recoverable timing floor and overlay"], None, None, host
+    timing, problems = rg.pass_inputs(passes, timing)
+    if problems:
+        return problems, None, None, host
     a = family["sides"]["a"]
     harness = manifest["harness"]
     context = {"host": host, "round": manifest.get("round", 1) - 1}
@@ -533,13 +540,14 @@ def judge(family: dict, results: Path) -> tuple[list[str], dict | None, dict | N
         return problems, aa, None, host
     # B against A: its spread at least the run's own A-A' floor, or its host's where larger.
     own = rg.noise_floor(aa)["cases"]
-    hosts = (rg.host_floor(host) or {}).get("cases", {})
+    hosts = (timing["floor"] or {}).get("cases", {})
     floor = {"source": f"this round's A-A' arm ({family['blocks']} blocks)"
              + (f", or {host}'s where larger" if hosts else ""),
              "cases": {case: {d: max(sd, hosts.get(case, {}).get(d, 0.0)) for d, sd in dims.items()}
                        for case, dims in own.items()}}
     ab = rg.gate(of("a", "b"), {"b": family["sides"]["b"], "a": a}, "b", ["a"], harness, family["blocks"],
                  catalog=catalog, context=context, family=family["hypotheses"], floor=floor)
+    ab.update(timing_inputs=timing, applied_floor=floor)
     problems += ab["errors"] + ab["blocking"]
     # B's own numbers where a hypothesis wasn't compared: what was measured, though nothing was tested.
     ab["b_numbers"] = {h: b_number(of("b"), h) for h in ab.get("not_compared") or {}}
@@ -619,7 +627,8 @@ def report(family: dict, rounds: list[Path]) -> tuple[int, str, dict]:
     out = {"family": family["path"], "sha256": family["sha256"], "rounds": []}
     for k, (problems, aa, ab, host) in enumerate(judged, 1):
         out["rounds"].append({"problems": problems, "host": host, "pvalues": (ab or {}).get("pvalues"),
-                              "aa_pvalues": (aa or {}).get("pvalues")})
+                              "aa_pvalues": (aa or {}).get("pvalues"), "timing_inputs": (ab or {}).get("timing_inputs"),
+                              "applied_floor": (ab or {}).get("applied_floor")})
         if problems:
             lines += [f"## Round {k}: no verdict", ""] + [f"- {p}" for p in problems] + [""]
     if any(problems for problems, *_ in judged):
@@ -627,7 +636,11 @@ def report(family: dict, rounds: list[Path]) -> tuple[int, str, dict]:
         lines.insert(4, "**No verdict** (exit 3): the evidence is missing, incomplete or failed, or the A-A' arm itself "
                         "differs. A failed experiment, not a pass.\n")
         return NO_VERDICT, "\n".join(lines), out
-    decided = rg.decide([[ab for _, _, ab, _ in judged]])
+    parts = [[ab for _, _, ab, _ in judged]]
+    if errors := rg.round_input_errors(parts):
+        out.update(exit=NO_VERDICT, rounds_errors=errors)
+        return NO_VERDICT, "\n".join([*lines, "**No verdict** (exit 3).", *errors]), out
+    decided = rg.decide(parts)
     out["decided"] = {k: decided[k] for k in ("losses", "pending", "m")}
     # A hypothesis the gate didn't test in some round, for its stated reason: no part of a pass
     # (every hypothesis untested, decided over none, read "no loss"); the
@@ -714,9 +727,10 @@ def run(args) -> int:
     blocks = args.blocks or suggested_blocks(chosen, measure)
     name = run_name(args.name, sides, harness, chosen, blocks, args.min_samples)
     text = family_text(name, sides, chosen, blocks, args.min_samples)
-    out = args.out or ROOT / "benches" / "suite" / "results" / "abba" / f"{name}-{sides['b'][:8]}"
+    out = args.out or rg.hosts_registry.jobs_dir() / f"{name}-{sides['b'][:8]}"
+    out = rg.hosts_registry.private_output(out, checkout)
+    path = rg.hosts_registry.private_output(out / "family.toml", checkout)
     out.mkdir(parents=True, exist_ok=True)
-    path = out / "family.toml"
     path.write_bytes(text.encode("utf-8"))
     try:
         family = load_family(path, checkout, catalog)
@@ -729,8 +743,8 @@ def run(args) -> int:
         print("\n".join(error.args[0]), file=sys.stderr)
         return INVALID
     set_id = next(iter(found))
-    set_path = out / f"{set_id}.set.toml"
-    set_path.write_bytes(set_file(set_id, list(found.values())).encode("utf-8"))
+    set_path = rg.hosts_registry.write_job(out / f"{set_id}.set.toml", set_file(set_id, list(found.values())),
+                                          checkout, found.values())
     print(plan_text(family, found[set_id], harness, measure, f"set:{set_id}"))
     print(f"  family: {path} (sha256 {family['sha256'][:12]}); set file: {set_path}")
     code, said = rg.fleet_call("check", str(set_path))
@@ -793,7 +807,7 @@ def main() -> int:
     s.add_argument("--priority", type=int, default=790)
     s.add_argument("--reason", help="the priority's reason (default: what is timed)")
     s.add_argument("--checkout", default=ROOT.as_posix())
-    s.add_argument("--out", type=Path, help="where the family and set files go (default suite/results/abba/...)")
+    s.add_argument("--out", type=Path, help="private directory for the family and set files (default: overlay/jobs)")
     s.add_argument("--plan", action="store_true", help="the plan and fleet's check only: nothing queued")
     s = sub.add_parser("check")
     s.add_argument("family")
@@ -805,7 +819,7 @@ def main() -> int:
     s.add_argument("--priority", type=int, default=790)
     s.add_argument("--reason")
     s.add_argument("--checkout", default=ROOT.as_posix())
-    s.add_argument("--out", type=Path, default=Path("."))
+    s.add_argument("--out", type=Path, help="private plan directory (default: overlay/jobs)")
     s = sub.add_parser("report")
     s.add_argument("family")
     s.add_argument("results", type=Path, nargs="+", help="each round's results (FLEET_OUT), round 1 first")
@@ -854,10 +868,10 @@ def main() -> int:
         except Invalid as error:  # the harness can't make, or wouldn't declare, its data (data_job())
             print("\n".join(error.args[0]), file=sys.stderr)
             return INVALID
-        args.out.mkdir(parents=True, exist_ok=True)
         set_id = next(iter(found))
-        path = args.out / f"{set_id}.set.toml"
-        path.write_bytes(set_file(set_id, list(found.values())).encode("utf-8"))
+        out = args.out or rg.hosts_registry.jobs_dir()
+        path = rg.hosts_registry.write_job(out / f"{set_id}.set.toml", set_file(set_id, list(found.values())),
+                                         args.checkout, found.values())
         print(plan_text(family, found[set_id], harness, measure_at(args.checkout, harness), f"set:{set_id}"))
         print(f"  submit: fleet submit {path}   wait: fleet wait set:{set_id}")
         return 0

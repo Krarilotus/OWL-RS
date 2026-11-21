@@ -38,9 +38,10 @@ fleet results set:abba-<name>-<b8>     # its member's results hold abba-verdict.
 - The family's cases are the declared harness's registry, in the plan, the job's check and the
   report alike: a case the harness doesn't have is refused before anything is timed.
 - The family travels in the job (`ABBA_FAMILY`); `family.toml` beside the set file (default
-  `benches/suite/results/abba/NAME-B8/`, git-ignored) is the same family, for a combined report:
+  `jobs/NAME-B8/` in the private overlay) is the same family, for a combined report:
   `abba.py report PATH/family.toml R1 R2`.
-- A confirmation round: the same command with `--round 2`.
+- A confirmation round: the same command with `--round 2`. Reports use the floor and overlay
+  recorded in the passes and require matching overlays across rounds.
 - A reviewed recurring family stays possible: `benches/abba/NAME.toml` (format in `abba.py`'s
   docstring; cases of its own allowed there, in the registry's schema), then `abba.py jobs
   benches/abba/NAME.toml --out DIR` and `fleet submit DIR/<set>.set.toml`. A family of registry cases

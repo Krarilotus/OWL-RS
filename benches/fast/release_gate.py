@@ -1071,9 +1071,45 @@ def as_floor(name: str, data: dict) -> dict:
     return {"source": f"{name}: {data.get('source', '?')}", "cases": data.get("cases", {})}
 
 
-# Where `floor` writes a host's floor: the private overlay's noise-floor/ where one is set (our
-# hosts'), else here.
-FLOORS = (hosts_registry.private_dir() or ROOT / "benches" / "fast") / "noise-floor"
+def round_inputs(host: str, environ: dict | None = None) -> dict:
+    """Snapshot the timing inputs before the round is measured."""
+    overlay = hosts_registry.resolve_overlay(environ)
+    found = (overlay.floor(host) if overlay else hosts_registry.public_floor(host)) if host else None
+    return {"overlay": overlay.identity if overlay else None, "floor": as_floor(*found) if found else None}
+
+
+def valid_round_inputs(inputs: object) -> bool:
+    if not isinstance(inputs, dict) or set(inputs) != {"overlay", "floor"}:
+        return False
+    floor = inputs["floor"]
+    return hosts_registry.valid_identity(inputs["overlay"]) and (floor is None or (
+        isinstance(floor, dict) and isinstance(floor.get("source"), str) and isinstance(floor.get("cases"), dict)
+        and all(isinstance(dims, dict) and all(type(value) in (float, int) and math.isfinite(value) and value >= 0
+                                             for value in dims.values()) for dims in floor["cases"].values())))
+
+
+def pass_inputs(passes: list[dict], expected: dict | None = None) -> tuple[dict | None, list[str]]:
+    if not passes:
+        return None, ["no passes with recorded timing inputs"]
+    inputs = passes[0]["report"].get("timing_inputs")
+    if not valid_round_inputs(inputs):
+        return None, ["the passes do not record a recoverable timing floor and overlay"]
+    if (expected is not None and inputs != expected) or any(
+            p["report"].get("timing_inputs") != inputs or
+            (p["report"].get("machine") or {}).get("overlay") != inputs["overlay"] for p in passes):
+        return None, ["the round's timing floor or overlay differs between its evidence"]
+    return inputs, []
+
+
+def round_input_errors(parts: list[list[dict]]) -> list[str]:
+    readings = [[report.get("timing_inputs") for report in rounds] for rounds in parts]
+    if any(not valid_round_inputs(inputs) for rounds in readings for inputs in rounds):
+        return ["a round has no recoverable timing floor and overlay"]
+    if len({inputs["overlay"] for rounds in readings for inputs in rounds}) > 1:
+        return ["the rounds used different private overlays"]
+    if any(any(inputs["floor"] != rounds[0]["floor"] for inputs in rounds[1:]) for rounds in readings):
+        return ["the rounds of a timed part used different floors"]
+    return []
 
 
 def quiet_verdicts(directory: Path) -> tuple[dict, list[str]]:
@@ -1116,7 +1152,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
          min_blocks: int = CAMPAIGN_BLOCKS, diagnostic: bool = False, not_run: dict | None = None,
          catalog: list[dict] | None = None, elsewhere: dict | None = None,
          context: dict | None = None, family: list[str] | None = None, floor: dict | None = None,
-         baseline_candidate: bool = False) -> dict:
+         baseline_candidate: bool = False, timing_errors: list[str] | None = None) -> dict:
     """One round of one timed part: the schedule and provenance checked, every comparison's
     blocks tested; each declared hypothesis's p-value (untested: 1). The decision over the family
     and the rounds is verdict()'s, which alone applies the owner's policy (load_policy()), read
@@ -1146,7 +1182,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                           for p in sorted(passes, key=lambda p: p["n"])],
                "diagnostic": diagnostic or min_blocks < CAMPAIGN_BLOCKS, "required": required,
                "context": context, "flagged": [], "other_blocking": [], "pvalues": {}, "resolution": {}, "emerged": [],
-               "not_run": not_run, "elsewhere": elsewhere, "errors": [],
+               "not_run": not_run, "elsewhere": elsewhere, "errors": list(timing_errors or ()),
                "candidate_failures": {}, "known_issues": {}, "fixed": {}, "comparisons": {}, "blocking": []}
     if missing := [s for s in required if s not in baselines]:
         summary["errors"].append(f"required baselines missing: {', '.join(missing)}")
@@ -1199,7 +1235,7 @@ def gate(passes: list[dict], sides: dict[str, str], candidate: str, required: li
                 # The baseline's product lacks it (the catalogue): no hypothesis, named (verdict()).
                 summary.setdefault("absent", {}).setdefault(side, {})[case] = absent[case][side]
                 continue
-            if cand_state == "failed" or side in aliases:
+            if cand_state == "failed" or side in aliases or timing_errors:
                 continue
             row = compare_case(cand, evidence(by_side[side], case), side, checks.get(case, set()),
                                ((floor or {}).get("cases") or {}).get(case))
@@ -3049,6 +3085,8 @@ CONFIRM_BLOCKS = (2, 30)  # blocks of a confirmation round: its cases' calibrate
 def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) -> dict | None:
     """The next round's fleet job for one timed part: the cases of its pending hypotheses, each
     for its calibrated blocks (measure.toml), layouts rotating; None when nothing is pending."""
+    if errors := round_input_errors([rounds]):
+        raise SystemExit("confirmation refused: " + ", ".join(errors))
     pending = decide([rounds])["pending"]
     if not pending:
         return None
@@ -3057,6 +3095,9 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
     if not ctx.get("host"):
         raise SystemExit(f"{ctx.get('prefix') or 'a timed part'}: its report names no host (GATE_HOST, else FLEET_HOST): "
                          "a confirmation runs where round 1 ran (its binaries, its floor), so none is written")
+    overlay = hosts_registry.overlay_env()
+    if round_inputs(ctx["host"], overlay) != first["timing_inputs"]:
+        raise SystemExit("confirmation refused: its overlay or floor differs from round 1")
     cases = sorted({h.split("|")[1] for h in pending})
     low, high = CONFIRM_BLOCKS
     revs = {"cand": first["candidate"]["revision"], **first["baselines"]}
@@ -3087,7 +3128,7 @@ def confirm_job(rounds: list[dict], checkout: str, measure: dict | None = None) 
                          "ram_gb": ctx.get("ram_gb", 24)},
             "pin_reason": "a confirmation round runs on its first round's host: its builds there, its floor, its rounds combined",
             "inputs": [{"name": "checkout", "source": {"git": checkout,
-                                                       "rev": checkout_rev(checkout, revs["cand"], harness)}}]})
+                                                       "rev": checkout_rev(checkout, revs["cand"], harness)}}]}, overlay)
 
 
 def known_lines(timed: list[dict], policy: Policy) -> tuple[list[str], list[str]]:
@@ -3123,6 +3164,8 @@ def verdict(timed: list[dict], w3c: dict, guards: dict, policy: Policy = NO_POLI
     owner's POLICY (none: nothing the bar forbids is accepted). EVIDENCE: what binding the parts to
     the candidate found (release_verdict(), the command's only way here)."""
     parts = rounds_of(timed)
+    if errors := round_input_errors(parts):
+        return False, "# Release verdict\n\n" + "\n".join(f"- {e}" for e in errors) + "\n\n**NOT PASSED**\n"
     d = decide(parts)
     lines = ["# Release verdict", "",
              f"Family: {d['m']} hypotheses declared (case x series or metric x baseline, every timed part); "
@@ -3445,8 +3488,7 @@ def main() -> int:
     s.add_argument("--context", action="append", default=[], metavar="KEY=VALUE",
                    help="the job: host (fleet's name), round (0 the first run), prefix, gate_name, max_gb, ram_gb, "
                         "layouts")
-    s.add_argument("--floor", type=Path, help="the host's A-A' noise floor (default noise-floor/HOST.toml, "
-                                               "HOST the context's)")
+    s.add_argument("--floor", type=Path, help="check that this file supplies the floor recorded by the passes")
     s.add_argument("--out", type=Path)
     s.add_argument("--json", type=Path)
     s = sub.add_parser("floor", help="a host's noise floor (noise-floor/HOST.toml) from an A-A' gate's report")
@@ -3490,7 +3532,7 @@ def main() -> int:
     s.add_argument("--plan", action="store_true", help="the plan and fleet's check of the set only: nothing queued")
     s.add_argument("--submit", action="store_true", help="submit the set (fleet submit) once fleet's check takes it")
     s.add_argument("--layouts", type=int, default=1, help="builds a side in different layouts (GATE_LAYOUTS)")
-    s.add_argument("--out", type=Path, default=Path("."))
+    s.add_argument("--out", type=Path, help="private plan directory (default: overlay/jobs)")
     s = sub.add_parser("data", help="what this host holds of the cases' frozen inputs (exit 1: something missing)")
     s.add_argument("--cases", help="comma-separated; default every registry case")
     s.add_argument("--make", action="store_true", help="make what benches/sparql/prepare.sh can into SPARQL_DATA first")
@@ -3512,7 +3554,7 @@ def main() -> int:
     s = sub.add_parser("confirm", help="the confirmation job of each host whose run flagged a loss or an undecided case")
     s.add_argument("--reports", type=Path, nargs="+", required=True, help="every timed report so far (release-gate.json)")
     s.add_argument("--checkout", default=ROOT.as_posix())
-    s.add_argument("--out", type=Path, default=Path("."))
+    s.add_argument("--out", type=Path, help="private plan directory (default: overlay/jobs)")
     s = sub.add_parser("verdict", help="every part together, for one candidate (release-gate.sh verdict)")
     s.add_argument("--candidate", required=True, help="the candidate: a revision of --checkout; every part must "
                                                       "be its tree's, and its tree's policy applies")
@@ -3553,11 +3595,15 @@ def main() -> int:
         passes = load_passes(args.passes)
         family = json.loads(args.family.read_text(encoding="utf-8")).get("family") if args.family else None
         context = {k: v for k, v in pairs(args.context, "--context").items()}
-        floor = read_floor(args.floor) if args.floor else host_floor(context["host"]) if context.get("host") else None
+        timing, errors = pass_inputs(passes)
+        floor = timing["floor"] if timing else None
+        if args.floor and (not args.floor.is_file() or read_floor(args.floor) != floor):
+            errors.append("the requested floor differs from the floor recorded by the passes")
         summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
                        args.min_blocks, args.diagnostic, pairs(args.not_run, "--not-run"),
                        cases_registry.load(), pairs(args.elsewhere, "--elsewhere"), context, family,
-                       floor)
+                       floor, timing_errors=errors)
+        summary["timing_inputs"] = timing
         for key in ("round", "max_gb", "ram_gb", "layouts"):
             if key in summary["context"]:
                 summary["context"][key] = float(summary["context"][key]) if "gb" in key else int(summary["context"][key])
@@ -3580,8 +3626,14 @@ def main() -> int:
     if args.command == "floor":
         summary = json.loads(args.report.read_text(encoding="utf-8"))
         floor = noise_floor(summary)
-        FLOORS.mkdir(exist_ok=True)
-        out = FLOORS / f"{args.host}.toml"
+        private = hosts_registry.private_dir()
+        floors = (private or ROOT / "benches" / "fast") / "noise-floor"
+        if (summary.get("timing_inputs") or {}).get("overlay") or private:
+            if private is None:
+                raise SystemExit("a private floor needs a private overlay checkout")
+            hosts_registry.private_output(floors / f"{args.host}.toml")
+        floors.mkdir(exist_ok=True)
+        out = floors / f"{args.host}.toml"
         source = f"{summary['context'].get('gate_name') or args.report.parent.name} round {summary['context'].get('round', 0)}"
         out.write_text(write_floor(floor, source), encoding="utf-8")
         print(f"{out}: {sum(len(d) for d in floor['cases'].values())} dimensions of {len(floor['cases'])} cases, "
@@ -3692,19 +3744,20 @@ def main() -> int:
         return 0
     if args.command == "confirm":
         reports = [json.loads(path.read_text(encoding="utf-8")) for path in args.reports]
-        args.out.mkdir(parents=True, exist_ok=True)
-        written = 0
+        parts = rounds_of(reports)
+        if errors := round_input_errors(parts):
+            raise SystemExit("confirmation refused: " + ", ".join(errors))
         shown = (ROOT / "benches" / "fast" / "measure.toml")
         measure = read_measure(shown.read_text(encoding="utf-8")) if shown.is_file() else {}
-        for rounds in rounds_of(reports):
+        for rounds in parts:
             job = confirm_job(rounds, args.checkout, measure)
             d = decide([rounds])
             print(f"{(rounds[0].get('context') or {}).get('host')}: {len(d['losses'])} losses, "
                   f"{len(d['pending'])} pending of {d['m']}" + (": " + ", ".join(d["pending"][:20]) if d["pending"] else ""))
             if job:
-                (args.out / f"{job['id']}.toml").write_text(toml_job(job), encoding="utf-8")
-                print(f"  {args.out / (job['id'] + '.toml')}: {len(job['steps']) - 3} blocks, est {job['est_min']} min")
-                written += 1
+                out = args.out or hosts_registry.jobs_dir()
+                path = hosts_registry.write_job(out / f"{job['id']}.toml", toml_job(job), args.checkout, [job])
+                print(f"  {path}: {len(job['steps']) - 3} blocks, est {job['est_min']} min")
         return 0
     if args.command == "jobs":
         import subprocess
@@ -3725,9 +3778,10 @@ def main() -> int:
                      checks=not args.no_checks, big_gb=None if args.no_big else args.big_gb,
                      measure=measure, batch=batch, layouts=args.layouts,
                      catalog=cases_registry.load_at(args.checkout, harness))
-        args.out.mkdir(parents=True, exist_ok=True)
-        path = args.out / f"{prefix}.set.toml"
-        path.write_bytes(toml_set({"id": prefix, "fail": "continue"}, list(found.values())).encode("utf-8"))
+        out = args.out or hosts_registry.jobs_dir()
+        path = hosts_registry.write_job(out / f"{prefix}.set.toml",
+                                        toml_set({"id": prefix, "fail": "continue"}, list(found.values())),
+                                        args.checkout, found.values())
         print(set_plan(found, prefix, candidate, harness, rev(args.base), rev(args.main), measure))
         print(f"  set file: {path}")
         if not (args.plan or args.submit):

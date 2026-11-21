@@ -99,12 +99,14 @@ class Abba(unittest.TestCase):
         passes (after round k - 1's), run on `ran_on` (default: that host; None in it: unsaid)."""
         out = Path(self.tmp.name) / name
         (out / "passes").mkdir(parents=True)
+        timing = abba.rg.round_inputs(host)
         for p in fixture.passes(records_of, blocks=6, sides=abba.SIDES):
             later = (k - 1) * 10 ** 9
             for item in [p["report"], *p["report"]["records"]]:
                 item.update(started_ns=item["started_ns"] + later, finished_ns=item["finished_ns"] + later)
             machine = {**p["report"]["machine"], "fleet_host": host if ran_on is None else ran_on(p)}
             p["report"]["machine"] = {k_: v for k_, v in machine.items() if v is not None}
+            p["report"]["timing_inputs"] = timing
             if not drop(p):
                 (out / "passes" / p["path"]).write_text(json.dumps(p["report"]), encoding="utf-8")
         if manifest:
@@ -198,7 +200,7 @@ class Abba(unittest.TestCase):
         exits 1, as a run that wasn't submitted does; a plan the fleet takes still exits 0."""
         catalog = abba.cases_registry.load()
         for code, expected in ((1, 1), (0, 0)):
-            with self.subTest(fleet_check=code), tempfile.TemporaryDirectory(dir=self.repo) as out:
+            with self.subTest(fleet_check=code), tempfile.TemporaryDirectory() as out:
                 args = SimpleNamespace(checkout=self.repo.as_posix(), a=self.commits[0], b=self.commits[-1],
                                        harness=None, cases="lab-olympics", areas="", blocks=3, min_samples=3,
                                        name=None, out=Path(out), host=None, round=1, priority=790, reason="",
@@ -355,11 +357,7 @@ systems = []
         blocks = [s for s in timed["steps"] if "block" in s]
         self.assertEqual(len(blocks), 6)
         self.assertEqual(blocks[0][-3:], [f"a={A}", f"a2={A}", f"b={B}"])
-        # A round its manifest says ran elsewhere takes that host's floor, not the family's.
-        read = []
-        with patch.object(abba.rg, "host_floor", side_effect=lambda host: read.append(host)):
-            self.verdict(self.round_(records(), host="shared-a"))
-        self.assertEqual((timed["env"]["GATE_HOST"], read), ("shared-a", ["shared-a"]))
+        self.assertEqual(timed["env"]["GATE_HOST"], "shared-a")
         self.assertIn("pin_reason", timed)
 
     def test_a_job_asks_for_what_making_its_data_takes(self):

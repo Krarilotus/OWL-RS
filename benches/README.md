@@ -270,7 +270,7 @@ run        suite/batch.sh NAME -- ARGS [-- ARGS]  from a worktree of HEAD; write
                                                   logs/         per pair and repetition
 check      suite.py report suite/results/NAME   tables (restricted systems left out)
            suite.py compare BASE NEW            regressions and changed answers against a baseline run
-record     suite.py ledger suite/results/NAME   writes runs/NAME.toml (the overlay's runs/ when set); then fill in
+record     suite.py ledger suite/results/NAME   writes runs/NAME.toml (the overlay's runs/ for private results); then fill in
                                                 purpose, cases, findings
            suite.py status --write              regenerates STATUS.md (from runs/ here)
 commit     runs/NAME.toml and STATUS.md         never the raw results

@@ -329,11 +329,10 @@ def main(argv, systems, workloads, root):
             if sum(j["est_min"] for j in proposed) + job["est_min"] < args.budget_hours * 60: proposed.append(job)
         _, _, reused = request(proposed)
         if reused is not None: return reused
-        args.out.mkdir(parents=True, exist_ok=True)
         retained = []
         for job in members:
-            probe = args.out / f"{job['id']}.toml"
-            probe.write_text(abba.rg.toml_job({**job, "id": job["id"] + "-placement"}), encoding="utf-8")
+            probe = hosts.write_job(args.out / f"{job['id']}.toml",
+                                    abba.rg.toml_job({**job, "id": job["id"] + "-placement"}), root, [job])
             code, said = abba.rg.fleet_call("check", str(probe), "--json")
             print(f"fleet check {job['id']} (exit {code}):\n{said}")
             reading = json.loads(said) if said.startswith("{") else {}
@@ -354,8 +353,9 @@ def main(argv, systems, workloads, root):
             return 0
         set_id, token, reused = request(members)
         if reused is not None: return reused
-        path = args.out / f"{set_id}.set.toml"
-        path.write_text(abba.rg.toml_set({"id": set_id, "request": token, "fail": "stop-rest"}, members), encoding="utf-8")
+        path = hosts.write_job(args.out / f"{set_id}.set.toml",
+                               abba.rg.toml_set({"id": set_id, "request": token, "fail": "stop-rest"}, members),
+                               root, members)
         print(f"set:{set_id}: {path}; NRESE {args.nrese}, harness {args.harness}")
         for job in members:
             print(f"job:{job['id']}: {job['est_min'] / 60:.2f} host-hours, unmeasured; results {job['results_at']}")

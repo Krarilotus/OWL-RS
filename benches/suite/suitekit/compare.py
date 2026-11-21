@@ -531,15 +531,21 @@ def host_check(base: list[dict | None], new: list[dict | None], allow: bool) -> 
     governors = {i["governor"] for i in known if i.get("governor")}
     if len(governors) > 1:
         problems.append("the runs read different CPU governors: " + ", ".join(sorted(governors)))
-    overlays = {i.get("overlay") or "none" for i in known}
+    overlays = {str(i.get("overlay")) for i in known}
+    bad_overlay = any(not hosts.valid_identity(i.get("overlay")) for i in known)
+    if bad_overlay:
+        problems.append("some runs have no verifiable private overlay identity")
     if len(overlays) > 1:
-        problems.append("the runs' hosts came from different private overlays (trees): " + ", ".join(sorted(overlays)))
+        problems.append("the runs' hosts came from different private overlays: " + ", ".join(sorted(overlays)))
     blocking = [p for p in problems if not p.startswith("unknown host")]
     if not problems:
         return None
     print("## Host configuration\n")
     for problem in problems:
         print(f"- {problem}")
+    if bad_overlay or len(overlays) > 1:
+        print("\nREFUSED: timing comparisons require matching overlay evidence")
+        return 2
     if blocking and not allow:
         print("\nREFUSED: timings of different hosts or host configurations don't compare "
               "(--allow-host-change compares them anyway, flagged)")

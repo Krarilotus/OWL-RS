@@ -2370,11 +2370,15 @@ def timed_block(args, sides: list[dict], catalog: list[dict], cases: list[dict],
                 order: list[tuple[str, int]], place: dict, seed: str | None,
                 absent: dict[tuple[str, str], str] | None = None) -> int:
     """The block's runs; a side ABSENT for a case isn't run: its record says so, in its place."""
+    from release_gate import round_inputs
+
     absent = absent or {}
     by_name = {s["name"]: s for s in sides}
     started = time.time_ns()
+    machine = manifest.machine(RUNTIME)
+    timing_inputs = round_inputs(os.environ.get("GATE_HOST") or machine.get("fleet_host") or machine["host"])
     common = {"started": datetime.datetime.now().isoformat(timespec="seconds"), "git": manifest.git(ROOT),
-              "machine": manifest.machine(RUNTIME), "runtime": RUNTIME, "reps": 1, "block": args.block,
+              "machine": machine, "timing_inputs": timing_inputs, "runtime": RUNTIME, "reps": 1, "block": args.block,
               "layout": args.layout, "planned_cases": [c["name"] for c in cases], "seed": seed,
               "orientation": [name for name, run in order if run == 1],
               "case_manifest": case_manifest(catalog), "host_state": host_state(),

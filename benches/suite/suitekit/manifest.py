@@ -161,8 +161,13 @@ def machine(runtime: str, root: Path | None = None) -> dict:
     # The private overlay the host's entry came from (hosts.py): part of a run's identity, so that
     # compare never sets side by side runs whose hosts two overlays described.
     from . import hosts
-    if overlay := hosts.overlay_identity():
-        out["overlay"] = overlay
+    overlay = hosts.resolve_overlay()
+    out["overlay"] = overlay.identity if overlay else None
+    registry = hosts.public_registry()
+    if overlay:
+        registry = hosts.merged(registry, overlay.registry)
+    host = hosts.run_identity(out, None, registry)
+    out.update(host_key=host["host"], host_config=host["config"])
     # What changes timings on the host, as the run found it (hosts.toml `config` records the
     # intended configuration; compare checks both).
     for key, path in (("governor", "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"),

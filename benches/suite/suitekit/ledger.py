@@ -29,6 +29,7 @@ import re
 import tomllib
 from pathlib import Path
 
+from . import hosts
 from .manifest import read_journal
 from .receipts import unknown
 from .schema import read
@@ -112,9 +113,7 @@ def load_records(runs_dir: Path) -> list[dict]:
 
 
 def records_home(root: Path) -> Path:
-    """Where a run's record is written: the private overlay's runs/ where one is set (a record
-    names its host), else benches/runs/ (its README)."""
-    from . import hosts
+    """Where planners can read additional, private records."""
     private = hosts.private_dir()
     return private / "runs" if private else root / "benches/runs"
 
@@ -148,6 +147,11 @@ def from_results(directory: Path, root: Path) -> dict:
     except ValueError:
         shown = directory.name
     record: dict = {"id": directory.name, "kit": "suite", "results": f"{shown} (local, git-ignored)"}
+    # A newly recorded public run explicitly names no overlay. Older runs, fleet runs and
+    # batches with missing manifests can contain private host information.
+    record["private"] = not invocations or any(not named.get(run) for run in runs) or any(
+        "overlay" not in (m := i.get("machine") or {}) or m["overlay"] is not None or m.get("fleet_host")
+        for i in invocations)
     if invocations:
         invocations = sorted(invocations, key=lambda i: i.get("started") or "")
         first = invocations[0]
@@ -155,9 +159,7 @@ def from_results(directory: Path, root: Path) -> dict:
         finished = [i.get("finished") for i in invocations]
         record["finished"] = max(finished) if all(finished) else "unfinished"
         m = first.get("machine", {})
-        from . import hosts
-        found = hosts.current(name=m.get("host", "")) if m.get("host") else None
-        record["host"] = found[0] if found else m.get("host", "")
+        record["host"] = m.get("host_key") or m.get("host", "")
         docker = m.get("docker")
         record["machine"] = (f"{m.get('cpu')}, {m.get('logical_cores')} threads, {m.get('memory_gib')} GiB; "
                              f"{m.get('os')}" + (f"; Docker {docker['version']} ({docker['cpus']} CPUs, "
@@ -216,9 +218,7 @@ def from_results(directory: Path, root: Path) -> dict:
     return record
 
 
-def refresh(directory: Path, root: Path, runs_dir: Path) -> Path:
-    record = from_results(directory, root)
-    path = runs_dir / f"{record['id']}.toml"
+def write_record(record: dict, path: Path) -> None:
     if path.exists():
         with open(path, "rb") as f:
             old = tomllib.load(f)
@@ -230,9 +230,8 @@ def refresh(directory: Path, root: Path, runs_dir: Path) -> Path:
                 record[key] = old[key]
     for key, default in (("purpose", ""), ("baseline", ""), ("findings", [])):
         record.setdefault(key, default)
-    runs_dir.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(dump(record), encoding="utf-8", newline="\n")
-    return path
 
 
 def main(argv: list[str], root: Path) -> int:
@@ -247,6 +246,24 @@ def main(argv: list[str], root: Path) -> int:
                               if (d / "results.csv").exists())
     if not directories:
         p.error("name results directories, or --all")
-    for directory in directories:
-        print(refresh(directory, root, records_home(root)).as_posix())
+    pending = []
+    try:
+        for directory in directories:
+            record = from_results(directory, root)
+            name = f"{record['id']}.toml"
+            if record["private"]:
+                private = hosts.private_dir()
+                if private is None or not private.is_dir():
+                    raise ValueError(f"{record['id']}: a private result needs a private overlay checkout")
+                path = hosts.private_output(private / "runs" / name, root)
+                if not path.is_relative_to(private.resolve()):
+                    raise ValueError(f"{record['id']}: the record destination escapes the private overlay")
+            else:
+                path = root / "benches/runs" / name
+            pending.append((record, path))
+    except (OSError, ValueError) as error:
+        p.error(str(error))
+    for record, path in pending:
+        write_record(record, path)
+        print(path.as_posix())
     return 0

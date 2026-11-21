@@ -57,14 +57,15 @@ fleet_label="fleet gate"
 start_s=${NRESE_GATE_START_S:-180}
 max_s=${NRESE_GATE_MAX_S:-10800}
 # fleet_hosts NAME: the overlay's [fleet] list NAME, space-separated (none without the overlay).
-fleet_hosts() { python benches/suite/suitekit/hosts.py fleet "$1"; }
-unconfirmed=" ${NRESE_GATE_UNCONFIRMED_HOSTS:-$(fleet_hosts gate_unconfirmed)} "
+fleet_hosts() { uv run --no-project python -I benches/suite/suitekit/hosts.py fleet "$1"; }
 no_verdict() {
   fleet_say "$*: no verdict, so no pass"
   fleet_cancel
   exit 75
 }
 
+unconfirmed=${NRESE_GATE_UNCONFIRMED_HOSTS:-$(fleet_hosts gate_unconfirmed)} || no_verdict "can't read unconfirmed hosts"
+unconfirmed=" $unconfirmed "
 fleet_ready || no_verdict "no fleet to ask"
 [ "$(git rev-parse "$commit^{tree}" 2> /dev/null)" = "$tree" ] || no_verdict "commit $commit isn't tree $tree"
 # shellcheck source=gate-key.sh
@@ -76,7 +77,7 @@ fi
 
 # What a tier asks for (cores also bound its compilers; the step's slice caps its memory on
 # Linux, scripts/cargo-guarded.sh's job object on Windows).
-os=linux kind=owlrs.gate confirm=$(fleet_hosts gate_confirm)
+os=linux kind=owlrs.gate confirm_list=gate_confirm
 reason="the $mode gate of a pushed commit (scripts/check.sh); no push without it"
 deadline=""
 case $mode in
@@ -93,7 +94,7 @@ case $mode in
     # was free.
     # est: the slowest whole 4-core run, 1,547 s, x 1.5 (others took 1,011-1,073 s).
     cores=${NRESE_GATE_CORES:-4} ram=${NRESE_GATE_RAM_GB:-9} est=${NRESE_GATE_EST_MIN:-39}
-    os=windows kind=owlrs.any confirm=$(fleet_hosts gate_confirm_windows) start_s=${NRESE_GATE_START_S:-1800}
+    os=windows kind=owlrs.any confirm_list=gate_confirm_windows start_s=${NRESE_GATE_START_S:-1800}
     # What the tier uses there, in the fleet config's names: `rust`, rustup with its MSVC toolchain
     # and linker (scripts/lib/windows-job.sh installs the tree's pinned release). The rest comes with
     # every Windows host of the fleet, unnamed: Git Bash, a stdlib `python` on PATH (the cache's
@@ -226,9 +227,17 @@ gate "${NRESE_GATE_HOSTS:-}"
 first=$fleet_id first_host=$host recheck=""
 if [[ $verdict == failed* && $unconfirmed == *" $host "* ]]; then
   sed -n '/^=== summary/,$p' "$log"
+  confirm=${NRESE_GATE_CONFIRM_HOSTS:-$(fleet_hosts "$confirm_list")} || no_verdict "can't read confirmation hosts"
+  eligible=""
+  for target in $confirm; do
+    [[ $target =~ ^[A-Za-z0-9_.-]+$ ]] || no_verdict "invalid confirmation host"
+    [[ $unconfirmed == *" $target "* ]] || eligible="${eligible:+$eligible }$target"
+  done
+  [ -n "$eligible" ] || no_verdict "no confirmation host for $host"
   fleet_say "failed on $host: unconfirmed ($host); running it again on another host (log: $log)"
   fleet_id=""
-  gate "${NRESE_GATE_CONFIRM_HOSTS:-$confirm}"
+  gate "$eligible"
+  [[ " $eligible " == *" $host "* ]] || no_verdict "confirmation ran on an ineligible host"
   case $verdict in
     passed*)
       recheck="fleet:$first@$first_host (failed there)"
