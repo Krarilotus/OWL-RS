@@ -1,5 +1,5 @@
 use nrese_rdf::NamedNode;
-use nrese_reasoner::{ReasoningMode, Ruleset, delta::policy::Plan};
+use nrese_reasoner::{ReasoningMode, delta::policy::Plan, rulesets::Ruleset};
 use nrese_store::ReadScope;
 
 use crate::{
