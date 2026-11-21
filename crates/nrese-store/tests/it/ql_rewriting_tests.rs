@@ -2515,7 +2515,7 @@ fn printed_queries_answer_on_a_store_without_reasoning_as_nrese_with_it() {
     );
     // Pure QL prints whole.
     let pure_cases = witnesses.map_or(cases.div_ceil(2), |xs| {
-        xs.iter().filter(|&&case| case % 2 == 0).count()
+        xs.iter().filter(|&&case| case.is_multiple_of(2)).count()
     });
     assert_eq!(pure, pure_cases * 4, "{refused:?}");
     assert!(mixed_printed > 0 && sound_only > 0, "{refused:?}");
