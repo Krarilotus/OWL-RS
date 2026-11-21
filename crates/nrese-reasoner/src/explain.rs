@@ -211,7 +211,7 @@ const DERIVATIONS: usize = 256;
 /// Justifications, cores, unions and proofs are computed on it ([`nrese_owl::proof`]).
 /// `None` if `fact` doesn't hold; at most `budget` facts examined, past which the graph
 /// is marked incomplete.
-pub fn proof_graph<B: Base + ?Sized>(
+pub(crate) fn proof_graph<B: Base + ?Sized>(
     base: &B,
     program: &GroundProgram,
     fact: Triple,
@@ -265,7 +265,7 @@ pub fn proof_graph<B: Base + ?Sized>(
 /// Whether `inference` is a valid step over `base`: an asserted fact taken as itself, or
 /// an instance of its rule whose body (and schema facts) is exactly its premises,
 /// re-derived from the rules (the proof checker's check of a step).
-pub fn valid_step<B: Base + ?Sized>(
+pub(crate) fn valid_step<B: Base + ?Sized>(
     base: &B,
     program: &GroundProgram,
     inference: &nrese_owl::Inference<Triple, Triple>,
