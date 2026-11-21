@@ -2275,3 +2275,149 @@ fn a_shapes_change_compares_results_without_copying_their_messages() {
     .map(|report| (report.results.len(), report.failures.len()));
     assert!(matches!(outcome, Ok((0, 0))), "{outcome:?}");
 }
+
+/// Each result's focus node with its messages as N-Triples terms, sorted.
+fn messages_by_focus(report: &ValidationReport) -> Vec<(String, Vec<String>)> {
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    let mut found: Vec<(String, Vec<String>)> = report
+        .results
+        .iter()
+        .map(|result| {
+            let mut messages: Vec<String> =
+                result.messages.iter().map(ToString::to_string).collect();
+            messages.sort();
+            (result.focus_node.to_string(), messages)
+        })
+        .collect();
+    found.sort();
+    found
+}
+
+/// SHACL 1.0 §5.3.2, `sh:resultMessage`: "The binding for the variable message", then "For
+/// SPARQL-based constraints: The values of sh:message of the SPARQL-based constraint"; "The
+/// rules are meant to be executed from top to bottom, so that the first bound value will be
+/// used." A row that binds `?message` has that message and not the constraint's; a row of
+/// the same query that leaves it unbound has the constraint's.
+#[test]
+fn a_message_the_query_binds_comes_before_the_constraint_s() {
+    let engine = engine(
+        "ex:a ex:p 1 ; ex:m \"from the row\" . ex:b ex:p 1 .",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:a , ex:b ; sh:sparql ex:Q .
+         ex:Q sh:message \"declared\" ; sh:select '''SELECT $this ?message WHERE {
+             $this <http://example.com/p> ?o . OPTIONAL { $this <http://example.com/m> ?message } }''' .",
+    );
+    let snapshot = engine.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert_eq!(
+        messages_by_focus(&report),
+        [
+            (ex("a"), vec!["\"from the row\"".to_owned()]),
+            (ex("b"), vec!["\"declared\"".to_owned()]),
+        ]
+    );
+}
+
+/// SHACL 1.0 §5.3.2, `sh:resultMessage` of a SPARQL-based constraint component: "The values
+/// of sh:message of the validator", which "may include the names of any SELECT result
+/// variables via {?varName} or {$varName}. If the constraint is based on a SPARQL-based
+/// constraint component, then the component's parameter names can also be used. These
+/// {?varName} and {$varName} blocks SHOULD be replaced with suitable string representations
+/// of the values of said variables." A literal is represented by its lexical form (as the
+/// SHACL test suite's `propertyValidator-select-001` expects). The validator's message comes
+/// before the component's.
+#[test]
+fn a_select_validator_s_message_is_filled_from_the_solution_and_the_parameters() {
+    let engine = engine(
+        "ex:a ex:label \"Munich\" .",
+        "ex:Lang a sh:ConstraintComponent ; sh:parameter [ sh:path ex:lang ] ;
+           sh:message \"the component's message\" ;
+           sh:propertyValidator [ a sh:SPARQLSelectValidator ;
+             sh:message \"{?value} has no language {$lang}\" ;
+             sh:select '''SELECT $this ?value WHERE {
+                 $this $PATH ?value . FILTER (!langMatches(lang(?value), $lang)) }''' ] .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+           sh:property [ sh:path ex:label ; ex:lang \"de\" ] .",
+    );
+    let snapshot = engine.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert_eq!(
+        messages_by_focus(&report),
+        [(ex("a"), vec!["\"Munich has no language de\"".to_owned()])]
+    );
+}
+
+/// SHACL 1.0 §6.3: for an ASK-based validator, each value node the query answers false for
+/// is "one solution consisting of the bindings ($this, focus node) and ($value, v)", and "The
+/// production rules for the validation results are identical to those for SPARQL-based
+/// constraints" (§5.3.2): the validator's message has `{$value}` and the parameters filled in.
+#[test]
+fn an_ask_validator_s_message_is_filled_from_the_value_and_the_parameters() {
+    let engine = engine(
+        "ex:a ex:label \"Munich\" .",
+        "ex:Lang a sh:ConstraintComponent ; sh:parameter [ sh:path ex:lang ] ;
+           sh:validator [ a sh:SPARQLAskValidator ;
+             sh:message \"{$value} has no language {?lang}\" ;
+             sh:ask '''ASK { FILTER (langMatches(lang($value), $lang)) }''' ] .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+           sh:property [ sh:path ex:label ; ex:lang \"de\" ] .",
+    );
+    let snapshot = engine.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert_eq!(
+        messages_by_focus(&report),
+        [(ex("a"), vec!["\"Munich has no language de\"".to_owned()])]
+    );
+}
+
+/// SHACL 1.0 §2.1.5: the values of `sh:message` are "xsd:string literals or literals with a
+/// language tag", and §3.6.2.7: `sh:resultMessage` "may have multiple values" with no two of
+/// one language tag. A message keeps its language tag: one the query binds, and each of a
+/// constraint's messages in several languages, each filled in (§5.3.2).
+#[test]
+fn a_message_keeps_its_language_tag() {
+    let engine = engine(
+        "ex:a ex:p 1 ; ex:m \"aus der Zeile\"@de . ex:b ex:p 2 .",
+        "ex:S a sh:NodeShape ; sh:targetNode ex:a , ex:b ; sh:sparql ex:Q .
+         ex:Q sh:message \"{?o} ist falsch\"@de , \"{?o} is wrong\"@en ;
+           sh:select '''SELECT $this ?o ?message WHERE {
+             $this <http://example.com/p> ?o . OPTIONAL { $this <http://example.com/m> ?message } }''' .",
+    );
+    let snapshot = engine.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert_eq!(
+        messages_by_focus(&report),
+        [
+            (ex("a"), vec!["\"aus der Zeile\"@de".to_owned()]),
+            (
+                ex("b"),
+                vec![
+                    "\"2 is wrong\"@en".to_owned(),
+                    "\"2 ist falsch\"@de".to_owned()
+                ]
+            ),
+        ]
+    );
+}
+
+/// SHACL 1.0 §5.3.2 gives `sh:resultMessage` only from `?message` and the `sh:message`s of
+/// the constraint, validator or component; §3.6.2.7 says results "may" have messages. Where
+/// none of those exists (and the shape has no `sh:message`, §2.1.5), the result has no
+/// message: none is made up.
+#[test]
+fn a_constraint_without_messages_reports_none() {
+    let engine = engine(
+        "ex:a ex:label \"Munich\" .",
+        "ex:Lang a sh:ConstraintComponent ; sh:parameter [ sh:path ex:lang ] ;
+           sh:validator [ a sh:SPARQLAskValidator ;
+             sh:ask '''ASK { FILTER (langMatches(lang($value), $lang)) }''' ] .
+         ex:S a sh:NodeShape ; sh:targetNode ex:a ;
+           sh:property [ sh:path ex:label ; ex:lang \"de\" ] ;
+           sh:sparql [ sh:select '''SELECT $this ?o WHERE { $this <http://example.com/label> ?o }''' ] .",
+    );
+    let snapshot = engine.snapshot();
+    let report = validate(&snapshot, &compiled(&snapshot), DEFAULT);
+    assert_eq!(
+        messages_by_focus(&report),
+        [(ex("a"), vec![]), (ex("a"), vec![])]
+    );
+}
