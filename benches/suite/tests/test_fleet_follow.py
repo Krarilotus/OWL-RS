@@ -108,10 +108,11 @@ class FleetFollow(push.Repo):
     def test_no_fleet_call_starts_after_the_cap_or_the_gates_limit(self):
         """A poll longer than what is left of the wait: the next status or results call would start
         after the silence's cap or after MAX_S, so the wait ends there instead, with one cancel,
-        whatever that call would have answered. Neither call reaches the fleet. (MAX_S is 4 s: the
+        whatever that call would have answered. Neither call reaches the fleet. (Whole seconds: the cap
+        of 3 s is well past the silent call itself and well short of the 4 s poll. MAX_S is 4 s: the
         status and the first results call fit in it on a slow host; the 8 s poll runs past it.)"""
         for silent_s, max_s, poll_s, status, results, calls in (
-                ("1", "10800", "2", [state("running"), "", state("done")], [], (2, 0)),
+                ("3", "10800", "4", [state("running"), "", state("done")], [], (2, 0)),
                 ("30", "4", "8", [state("done")], [""], (1, 1))):
             with self.subTest(silent_s=silent_s, max_s=max_s):
                 self.reset()
