@@ -1816,6 +1816,7 @@ impl StoreService {
             },
         )
         .map_err(crate::StoreError::refusal_within)?;
+        self.rebuild_pending_declarations(&mut tx, &budget, cancellation)?;
         let keeps_record = self.dl().bounds.keeps_record(&tx);
         let view = match self.reading(scope.access(), memory, Some(cancellation)) {
             Some(reading) => reading.pending(&tx, &budget)?,
@@ -1842,6 +1843,50 @@ impl StoreService {
         read(&view, keeps_record)
     }
 
+    /// Pending changes aren't reasoned over until the commit, but for one that declares an
+    /// annotation property the rules read, or retracts its declaration
+    /// ([`Program::touches_a_declaration`](crate::reasoning::Program::touches_a_declaration)):
+    /// it changes what they read throughout the closure, so `tx`'s inferred stack is rebuilt
+    /// over its pending state, as its commit's is, and a read inside the transaction answers
+    /// by the transaction's own declarations.
+    fn rebuild_pending_declarations(
+        &self,
+        tx: &mut nrese_engine::PrivateTransaction<'_>,
+        budget: &std::sync::Arc<nrese_exec::Budget>,
+        cancellation: &CancellationToken,
+    ) -> StoreResult<()> {
+        use crate::reasoning::Program;
+        let Some(rules) = self.supports.rules() else {
+            return Ok(());
+        };
+        let changes = tx.inserted().chain(tx.deleted());
+        if !Program::touches_a_declaration(&|term| tx.lookup(term), changes) {
+            return Ok(());
+        }
+        let pending = tx.pending_snapshot_within(budget)?;
+        let program = self.bound_program(&pending, rules)?;
+        if !program.reads_annotations() {
+            return Ok(());
+        }
+        let program = (program.by_representatives(self.config.equality_by_representatives))
+            .storing_representatives(self.config.equality_compact);
+        let memory = self.memory_stop();
+        let stop = || cancellation.is_cancelled() || memory.exceeded();
+        let room = || memory.room();
+        let operation = nrese_reasoner::eval::OperationStop::new(&stop).within(&room);
+        let cancelled = || nrese_sparql::QueryEvaluationError::Cancelled.into();
+        let mut closure =
+            crate::reasoning::materialise_with(&program, &pending, &operation, budget)
+                .map_err(|interrupted| memory.error(interrupted).unwrap_or_else(cancelled))?;
+        nrese_reasoner::engine::install_closure(&pending, &mut closure.inferred, |fact, add| {
+            match add {
+                true => tx.insert_inferred(fact),
+                false => tx.remove_inferred(fact),
+            }
+        });
+        Ok(())
+    }
+
     /// [`run_query`](Self::run_query) on the data as `pending` would leave it.
     pub fn run_query_pending(
         &self,
@@ -1856,8 +1901,9 @@ impl StoreService {
     /// [`Self::run_query_pending`], handing `report` the answers' status as
     /// [`Self::run_query_reporting`] does. A transaction reads the latest revision: with
     /// no operations pending, exactly as a query outside it (under `owl2-dl`, through that
-    /// revision's bounds). Pending operations aren't reasoned over until the commit: the
-    /// status says so, sound only, and not sound where they may delete statements whose
+    /// revision's bounds). Pending operations aren't reasoned over until the commit (but for
+    /// a change of the declarations the rules read, `Self::rebuild_pending_declarations`):
+    /// the status says so, sound only, and not sound where they may delete statements whose
     /// inferences remain.
     pub fn run_query_pending_reporting(
         &self,

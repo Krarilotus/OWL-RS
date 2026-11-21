@@ -21,7 +21,7 @@
 //! | `rdfs-full` | every RDFS entailment rule (RDF 1.1 Semantics §9.2) and the finite RDF and RDFS axiomatic triples |
 //! | `rdfs-plus` | `rdfs` with equality, inverse, symmetric, transitive, functional and inverse functional properties, equivalent classes and properties |
 //! | `owl-horst` | `rdfs-plus` with `hasValue`, `someValuesFrom` and `allValuesFrom` (ter Horst's pD*) |
-//! | `owl2-ql` | what OWL 2 QL axioms entail without inventing individuals: hierarchies, domains, ranges, inverses, reflexive properties, `someValuesFrom owl:Thing`, and checks for disjointness, complements and an empty `owl:Thing` |
+//! | `owl2-ql` | what OWL 2 QL axioms entail without inventing individuals: hierarchies, domains and ranges (an annotation property's entail nothing), inverses, reflexive properties, `someValuesFrom owl:Thing`, and checks for disjointness, complements and an empty `owl:Thing` |
 //! | `owl2-rl` | the OWL 2 RL/RDF rules |
 //!
 //! Every ruleset is validated by the tests: it parses, every rule is safe, and the
@@ -414,6 +414,11 @@ pub const OWL_HORST: &[&str] = &[
 /// subject, a declared named individual. Without them OWL2Bench QL's q01 (`?x :knows ?y`)
 /// missed the 3,677 pairs `a :knows a` (GraphDB's 5,104 rows; office batch B, 5 October
 /// 2026).
+///
+/// And OWL 2 RL's `prp-dom` and `prp-rng` where the property is no annotation property
+/// (`?p !annotation`, as the OWL reader reads the data's): annotations "have no semantic
+/// meaning in OWL 2" (Direct Semantics §1), so an annotation property's domain and range
+/// entail nothing. OWL 2 RL's own keep them, as the RDF-Based Semantics does.
 pub const OWL2_QL_OWN: &str = r#"
 prp-refl-c: (?p rdf:type owl:ReflexiveProperty), (?x rdf:type ?c), (?c rdf:type owl:Class)
             -> (?x ?p ?x)
@@ -423,13 +428,13 @@ prp-refl-d: (?p rdf:type owl:ReflexiveProperty), (?x ?q ?v), (?q rdf:type owl:Da
             -> (?x ?p ?x)
 prp-refl-i: (?p rdf:type owl:ReflexiveProperty), (?x rdf:type owl:NamedIndividual)
             -> (?x ?p ?x)
+prp-dom:    (?p rdfs:domain ?c), (?x ?p ?y), ?p !annotation -> (?x rdf:type ?c)
+prp-rng:    (?p rdfs:range ?c), (?x ?p ?y), ?p !annotation -> (?y rdf:type ?c)
 "#;
 
 /// OWL 2 QL, materialised: its axioms without the existentials on the right of
 /// `SubClassOf` (they would invent individuals), and its consistency checks.
 pub const OWL2_QL: &[&str] = &[
-    "prp-dom",
-    "prp-rng",
     "prp-spo1",
     "prp-eqp1",
     "prp-eqp2",

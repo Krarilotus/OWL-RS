@@ -306,10 +306,6 @@ pub fn maintain_with(
     } else {
         (program.schema.clone(), false)
     };
-    let rules = delta::Rules {
-        schema: &schema,
-        ..program.rules()
-    };
     // Revived memberships must participate in the delta executor's introduced-only
     // consistency checks. Keep the batch result for installation below: no second run.
     let mut rebuilt = if revived {
@@ -356,7 +352,20 @@ pub fn maintain_with(
             &mut unstorable,
         )?);
     }
+    // The annotation properties the rules read, where they do: the state's before the
+    // change, which a change that declares or retracts one doesn't keep (it is rebuilt,
+    // `redeclared` below); a first load's, the state's after it.
+    let annotated = match first_load {
+        true => program.rules_for(&tx.pending_snapshot()),
+        false => program.rules_for(tx.base()),
+    };
+    let rules = delta::Rules {
+        rules: &annotated,
+        schema: &schema,
+        ..program.rules()
+    };
     let unkept: bool;
+    let redeclared: bool;
     let delta_ran: bool;
     let deletes: bool;
     let update = {
@@ -425,7 +434,12 @@ pub fn maintain_with(
         // Facts with an inverse expression as their predicate: the stored closure lacks the
         // base's, so a delta can't read them. Such a change runs its delta, whose consistency
         // check stands, and is then rebuilt: the closure after it is the one a rebuild gives.
-        delta_ran = !(first_load || inserted.is_empty() && deleted.is_empty());
+        // A change that declares an annotation property the rules read, or retracts its
+        // declaration (new to the state, or no longer asserted), changes what they read
+        // throughout the closure: it is rebuilt, and judged by the rebuild's report.
+        let declares = |f: &Triple| program.annotations.as_ref().is_some_and(|a| a.declares(*f));
+        redeclared = !first_load && inserted.iter().chain(&deleted).any(declares);
+        delta_ran = !(first_load || redeclared || inserted.is_empty() && deleted.is_empty());
         deletes = !deleted.is_empty();
         unkept = delta_ran && has_inverse_expression(tx.base(), &prep).map_err(interrupted)?;
         // A rebuild reads the asserted facts and writes the closure, both about the size
@@ -473,6 +487,14 @@ pub fn maintain_with(
                     )?,
                 },
                 insert: derived,
+                policy: delta::policy::Counts {
+                    plan: delta::policy::Plan::Rebuild,
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        } else if redeclared {
+            delta::Update {
                 policy: delta::policy::Counts {
                     plan: delta::policy::Plan::Rebuild,
                     ..Default::default()
@@ -579,34 +601,13 @@ pub fn maintain_with(
                 false => found,
             }
         });
-        // Only the difference is applied: O(stored + rebuilt closure) to sort and walk,
-        // and a transaction update per fact that changed. A stored snapshot shares the old
-        // runs and avoids expanding compact equality.
-        let mut before: Vec<EncodedTriple> = tx
-            .pending_snapshot()
-            .stored()
-            .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
-            .map(EncodedTriple::from)
-            .collect();
-        before.par_sort_unstable();
-        before.dedup();
-        closure.inferred.par_sort_unstable();
-        closure.inferred.dedup();
-        // One merge walk over both (a binary search per fact cost 130 ms of a 1.4 M-fact
-        // stack's rebuild, against 70 for its materialisation).
-        let (old, new) = (&before, &closure.inferred);
-        let (mut i, mut j) = (0, 0);
-        while i < old.len() || j < new.len() {
-            if j == new.len() || (i < old.len() && old[i] < new[j]) {
-                removed += u64::from(tx.remove_inferred(old[i]));
-                i += 1;
-            } else if i == old.len() || new[j] < old[i] {
-                inserted += u64::from(tx.insert_inferred(new[j]));
-                j += 1;
-            } else {
-                (i, j) = (i + 1, j + 1);
-            }
-        }
+        let pending = tx.pending_snapshot();
+        let (added, dropped) =
+            install_closure(&pending, &mut closure.inferred, |fact, add| match add {
+                true => tx.insert_inferred(fact),
+                false => tx.remove_inferred(fact),
+            });
+        (inserted, removed) = (inserted + added, removed + dropped);
         update.rounds += closure.rounds;
         // The delta cache may still contain heads rewritten for a formerly hidden
         // class. Ground the final prospective state, and publish this cache only if
@@ -644,6 +645,42 @@ pub fn maintain_with(
         work: update.policy,
         rebuilt_violations,
     })
+}
+
+/// Makes the inferred stack of `pending` hold `closure` instead, applying only the
+/// difference: `change(fact, add)` adds or removes one fact and says whether that changed
+/// the stack. O(stored + closure) to sort and walk, and an update per fact that changed; a
+/// stored snapshot shares the old runs and avoids expanding compact equality. The facts
+/// added and removed.
+pub fn install_closure(
+    pending: &Snapshot,
+    closure: &mut Vec<EncodedTriple>,
+    mut change: impl FnMut(EncodedTriple, bool) -> bool,
+) -> (u64, u64) {
+    let mut before: Vec<EncodedTriple> = (pending.stored())
+        .quads_for_pattern_in(ReadModel::Inferred, &QuadPattern::all())
+        .map(EncodedTriple::from)
+        .collect();
+    before.par_sort_unstable();
+    before.dedup();
+    closure.par_sort_unstable();
+    closure.dedup();
+    // One merge walk over both (a binary search per fact cost 130 ms of a 1.4 M-fact
+    // stack's rebuild, against 70 for its materialisation).
+    let (old, new) = (&before, &*closure);
+    let (mut i, mut j, mut added, mut removed) = (0, 0, 0, 0);
+    while i < old.len() || j < new.len() {
+        if j == new.len() || (i < old.len() && old[i] < new[j]) {
+            removed += u64::from(change(old[i], false));
+            i += 1;
+        } else if i == old.len() || new[j] < old[i] {
+            added += u64::from(change(new[j], true));
+            j += 1;
+        } else {
+            (i, j) = (i + 1, j + 1);
+        }
+    }
+    (added, removed)
 }
 
 /// Applies `update` (over every identity, as the delta executor reads the expanded stack)
@@ -1743,5 +1780,67 @@ mod tests {
                 assert_eq!(engine.snapshot().revision(), before.revision());
             }
         }
+    }
+
+    /// Spec: annotations "have no semantic meaning in OWL 2" (Direct Semantics §1), so under
+    /// `owl2-ql` an annotation property's domain and range entail no membership; a commit
+    /// that changes no declaration stays incremental (the decided page of D16-1112, mechanism
+    /// A). Over a committed state declaring `:note` an annotation property, a commit giving it
+    /// a domain and a range and using it derives neither `:alice a :Doc` nor `:bob a :Doc`, and
+    /// isn't rebuilt; with `:note` undeclared, the same commit derives both.
+    #[test]
+    fn a_commit_through_an_annotation_propertys_domain_derives_nothing_under_owl2_ql() {
+        use crate::delta::policy::Plan;
+        let mut wrong = Vec::new();
+        for declared in [true, false] {
+            let engine = Engine::new(EngineConfig {
+                background_maintenance: false,
+                ..EngineConfig::default()
+            })
+            .unwrap();
+            let mut tx = engine.transaction();
+            let ruleset = crate::rulesets::Ruleset::Owl2Ql;
+            let program = Program::compile(&ruleset.into(), &|t| tx.intern(t));
+            let iri = |s: &str| tx.intern(NamedNodeRef::new_unchecked(s).into()).raw();
+            let [note, doc, person, alice, bob] = ["note", "Doc", "Person", "alice", "bob"]
+                .map(|local| iri(&format!("http://example.com/{local}")));
+            let [rdf_type, annotation, domain, range] = [
+                "http://www.w3.org/1999/02/22-rdf-syntax-ns#type",
+                "http://www.w3.org/2002/07/owl#AnnotationProperty",
+                "http://www.w3.org/2000/01/rdf-schema#domain",
+                "http://www.w3.org/2000/01/rdf-schema#range",
+            ]
+            .map(iri);
+            let mut before = vec![[alice, rdf_type, person]];
+            if declared {
+                before.push([note, rdf_type, annotation]);
+            }
+            for fact in before {
+                tx.insert_encoded(encode(fact).in_default_graph());
+            }
+            tx.commit().unwrap();
+            let remat = engine.rematerialisation();
+            let closure = super::super::materialise(&program, remat.base());
+            remat.finish(closure.inferred).unwrap();
+            let mut tx = engine.transaction();
+            for fact in [[note, domain, doc], [note, range, doc], [alice, note, bob]] {
+                tx.insert_encoded(encode(fact).in_default_graph());
+            }
+            let done = maintain(&program, None, &mut tx, crate::eval::NEVER).unwrap();
+            let inferred = |fact: Triple| {
+                let pattern = pattern(fact.map(Some), GraphSelector::Any);
+                tx.quads_for_pattern_in(ReadModel::Inferred, &pattern)
+                    .next()
+                    .is_some()
+            };
+            let typed = [alice, bob].map(|x| inferred([x, rdf_type, doc]));
+            if typed != [!declared; 2] || (declared && done.work.plan == Plan::Rebuild) {
+                wrong.push(format!(
+                    "declared {declared}: typed {typed:?}, {:?}",
+                    done.work.plan
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
     }
 }

@@ -12,7 +12,10 @@
 //! prp-fp:  (?p rdf:type owl:FunctionalProperty), (?x ?p ?y1), (?x ?p ?y2), ?y1 != ?y2
 //!          -> (?y1 owl:sameAs ?y2)
 //! cax-dw:  (?c1 owl:disjointWith ?c2), (?x rdf:type ?c1), (?x rdf:type ?c2) -> false
+//! prp-dom: (?p rdfs:domain ?c), (?x ?p ?y), ?p !annotation -> (?x rdf:type ?c)
 //! ```
+//!
+//! `?p !annotation`: `?p` is no annotation property of the data ([`Guard::NotAnnotation`]).
 //!
 //! Prefixes `rdf:`, `rdfs:`, `owl:` and `xsd:` are built in; literals are written
 //! `"lexical"^^xsd:type`. A rule ends at the next line starting with a name and `:`.
@@ -61,6 +64,10 @@ pub enum Guard {
     /// individuals) as one rule whose pairs are checked here, instead of a rule per pair
     /// ([`super::lists`]; its rules are symmetric in the two terms).
     SameList(Term, Term, SharedListIndex),
+    /// The term's id must not be one of the annotation properties: those of the data, read
+    /// as the OWL reader reads them when a run starts and fixed for the run, so the rule
+    /// stays monotone within it (`engine::Program`). As parsed, the set is empty.
+    NotAnnotation(Term, AnnotationIds),
     /// A rule's guards where it runs over representatives of `owl:sameAs` classes: they
     /// hold where members of the classes of their variables' values, and their constants
     /// themselves, satisfy all of them together (`super::representatives::over_classes`).
@@ -88,6 +95,7 @@ impl Guard {
                 (Some(a), Some(b)) => a < b && index.together(a, b),
                 _ => true,
             },
+            Guard::NotAnnotation(term, set) => value(*term).is_none_or(|v| !set.contains(v)),
             Guard::OverClasses {
                 guards,
                 bound,
@@ -115,9 +123,25 @@ impl Guard {
     pub fn terms(&self) -> Vec<Term> {
         match self {
             Guard::NotEqual(a, b) | Guard::SameList(a, b, _) => vec![*a, *b],
-            Guard::NotIn(term, _, _) => vec![*term],
+            Guard::NotIn(term, _, _) | Guard::NotAnnotation(term, _) => vec![*term],
             Guard::OverClasses { guards, .. } => guards.iter().flat_map(Guard::terms).collect(),
         }
+    }
+}
+
+/// The annotation properties' ids a run reads ([`Guard::NotAnnotation`]), sorted.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash)]
+pub struct AnnotationIds(std::sync::Arc<[u64]>);
+
+impl AnnotationIds {
+    pub fn new(mut ids: Vec<u64>) -> Self {
+        ids.sort_unstable();
+        ids.dedup();
+        Self(ids.into())
+    }
+
+    pub fn contains(&self, id: u64) -> bool {
+        self.0.binary_search(&id).is_ok()
     }
 }
 
@@ -424,6 +448,9 @@ fn parse_rule(name: &str, source: &str, vocabulary: &mut impl Vocabulary) -> Res
                 term(a.trim(), &mut variables, vocabulary)?,
                 term(b.trim(), &mut variables, vocabulary)?,
             ));
+        } else if let Some(a) = part.strip_suffix("!annotation") {
+            let a = term(a.trim(), &mut variables, vocabulary)?;
+            guards.push(Guard::NotAnnotation(a, AnnotationIds::default()));
         } else {
             body.push(atom(&part, &mut variables, vocabulary)?);
         }

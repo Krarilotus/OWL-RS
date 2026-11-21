@@ -161,7 +161,12 @@ pub fn explain_fact(
         snapshot,
         axioms: &program.axioms,
     };
-    let explanation = crate::explain::explain(&base, program.rules(), fact, EXPLANATION_BUDGET)?;
+    let rules = program.rules_for(snapshot);
+    let rules = crate::delta::Rules {
+        rules: &rules,
+        ..program.rules()
+    };
+    let explanation = crate::explain::explain(&base, rules, fact, EXPLANATION_BUDGET)?;
     let decode = |id: u64| decoded(snapshot.decode(TermId::from_raw(id)), id);
     Some(
         explanation
@@ -260,7 +265,12 @@ pub fn justify_fact(
         snapshot,
         axioms: &program.axioms,
     };
-    let ground = crate::delta::program(&base, program.rules());
+    let rules = program.rules_for(snapshot);
+    let rules = crate::delta::Rules {
+        rules: &rules,
+        ..program.rules()
+    };
+    let ground = crate::delta::program(&base, rules);
     let graph = crate::explain::proof_graph(&base, &ground, fact, EXPLANATION_BUDGET)?;
     let (sets, complete) = match mode {
         JustificationMode::One => (graph.one().into_iter().collect(), graph.complete),
