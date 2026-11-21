@@ -910,6 +910,78 @@ fn a_deleted_triple_a_surviving_reification_names_is_told_as_a_fresh_read_tells_
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
+/// Spec (*Mapping to RDF* Table 17, as above): a triple that a surviving `owl:Axiom` names,
+/// deleted by one commit and inserted again by the next, gives the node its main triple back.
+/// A committed read after the deletion is told the part left out, and after the insert what a
+/// fresh read of that data tells: nothing. The property is declared an object property, so
+/// the insert only asserts something over U1's signature, and the consistency check is off,
+/// so no check reads the data again. Starting off the rules route and on it: the deletion
+/// leaves a part out, so the insert's commit starts off the route either way.
+#[test]
+fn a_reinserted_triple_a_surviving_reification_names_is_told_as_a_fresh_read_tells_it() {
+    use nrese_reasoner::{ReasonerConfig, ReasonerService, ReasoningMode};
+    let reified = ":owner a owl:ObjectProperty . :tib :owner :ann . [ a owl:Axiom ; \
+                   owl:annotatedSource :tib ; owl:annotatedProperty :owner ; \
+                   owl:annotatedTarget :ann ; rdfs:comment \"since 2020\" ] . ";
+    let mut wrong = Vec::new();
+    for (route, base) in [
+        ("off the route", OFF_ROUTE),
+        ("on the route", ":tib a :Pet . "),
+    ] {
+        let config = crate::StoreConfig {
+            dl: crate::DlConfig {
+                consistency: crate::DlConsistency::Off,
+                ..crate::DlConfig::default()
+            },
+            ..crate::StoreConfig::in_memory()
+        };
+        let store = Arc::new(StoreService::new(config).unwrap());
+        let pipeline = crate::MutationPipeline::new(
+            Arc::clone(&store),
+            Arc::new(ReasonerService::new(ReasonerConfig::for_mode(
+                ReasoningMode::Owl2Dl,
+            ))),
+        );
+        commit(&pipeline, &format!("INSERT DATA {{ {base}{reified} }}"));
+        let marks = || -> Vec<String> {
+            let request =
+                crate::SparqlQueryRequest::all(format!("{MARK_PREFIXES}ASK {{ :tib a :Pet }}"));
+            let prepared = store.prepare_query(&request).unwrap();
+            let (mut status, out) = (None, Vec::<u8>::new());
+            let read =
+                store.run_query_reporting(&prepared, &CancellationToken::new(), out, |s, _| {
+                    status = s;
+                    None
+                });
+            read.unwrap();
+            let reasons = status.expect("a status").reasons.into_iter();
+            reasons
+                .filter(|r| r.text.contains(ONLY))
+                .map(|r| r.text)
+                .collect()
+        };
+        commit(&pipeline, "DELETE DATA { :tib :owner :ann . }");
+        let deleted = marks();
+        if !(deleted.len() == 1 && deleted[0].contains("were left out")) {
+            wrong.push(format!("{route}: setup: after the deletion: {deleted:?}"));
+        }
+        commit(&pipeline, "INSERT DATA { :tib :owner :ann . }");
+        let snapshot = store.engine().snapshot();
+        let whole = read_ontology(&store, &snapshot).expect("the ontology");
+        let fresh = by_ontology(&snapshot, whole.value());
+        let inserted = marks();
+        if fresh.is_some() {
+            wrong.push(format!(
+                "{route}: setup: a fresh read after the insert tells {fresh:?}"
+            ));
+        }
+        if !inserted.is_empty() {
+            wrong.push(format!("{route}: after the insert: {inserted:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
 /// A revision with no record of what the reader left out (as a reopened store has none; a
 /// commit after a delta takes its base's). Committed reads at that revision (a plan, EXPLAIN,
 /// the inferred statements alone), one after another, are each told the same mark, the
