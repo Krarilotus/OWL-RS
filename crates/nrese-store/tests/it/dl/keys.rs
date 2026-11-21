@@ -16,9 +16,8 @@ use super::{ask, insert, pipeline, update};
 /// the ontology off the RL route, to the bounds.
 const OUTSIDE_RL: &str = ":Pet rdfs:subClassOf [ owl:unionOf ( :Dog :Cat ) ] . :tib a :Pet .";
 
-/// Under reasoning-semantics.md, Freshness, version 7 and the new seeds change the
-/// `owl2-rl` program fingerprint, so stores rebuild once at their next start.
-const OWL2_RL_FINGERPRINT: &str = "8373f9bd2f1319f8";
+/// The version 9 semantics change the OWL 2 RL fingerprint and require a rebuild at startup.
+const OWL2_RL_FINGERPRINT: &str = "7fdf7c3a5a98052f";
 
 /// An object key over `z`, `:a` and `:b` sharing it as value, and `more`.
 fn object_key(z: &str, more: &str) -> String {

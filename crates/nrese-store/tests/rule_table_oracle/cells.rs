@@ -472,7 +472,7 @@ fn chain_with(extra: &str) -> generator::Write {
 #[test]
 fn oversized_walks_keep_their_short_alternatives() {
     // Tables 5, 6 and 9 derive the short alternatives' chain, membership and
-    // subclass rows. Diagnose only the oversized walk in each case.
+    // subclass rows. Both walks are accepting, so neither needs a diagnostic.
     use nrese_reasoner::{ReasonerConfig, ReasoningMode};
 
     let rl = ReasoningMode::Owl2Rl;
@@ -520,8 +520,9 @@ fn oversized_walks_keep_their_short_alternatives() {
                 assert!(judges::ask(&store, answer).0, "{mode}: missing {answer:?}");
             }
             assert!(
-                report.diagnostics.iter().any(|d| d.kind == "list-too-long"),
-                "{mode}: {axiom} must report its oversized walk"
+                report.diagnostics.is_empty(),
+                "{mode}: {axiom} has accepting walks: {:?}",
+                report.diagnostics
             );
         }
     }

@@ -4,7 +4,7 @@
 use std::collections::HashSet;
 
 use super::batch::{self, Schema};
-use super::ir::{Violations, Vocabulary};
+use super::ir::{Atom, Term, Violations, Vocabulary};
 use super::lists::ListVocabulary;
 use super::naive::{Triple, Violation, materialise};
 use super::rulesets::Ruleset;
@@ -3424,15 +3424,10 @@ fn replicated_closure(vocabulary: &mut LocalVocabulary, text: &str) -> (Vec<Trip
     (input, every)
 }
 
-/// A list past the cap over its closure is read as written as well, and still reported.
-/// Spec: OWL 2 Profiles §4.3, `eq-diff2` over an `owl:AllDifferent` list's members;
-/// equality's `rdf:first` copies (`eq-rep-o`) name the same members again. Each of three
-/// members has four aliases, so over the replicated closure the list has 5 * 5 * 5 member
-/// sequences, past the cap: no rules, `too-many-list-variants`. Read as written as well, it
-/// gives the rules of the list as written, one `eq-diff2` check per pair of members, and the
-/// same report: the closure's sequences aren't all read.
+/// Table 4 eq-diff2 checks pairs from Table 3 walks, including the aliases
+/// supplied by eq-rep-o. The former 64-walk threshold leaves no diagnostic.
 #[test]
-fn a_list_past_the_cap_over_its_closure_is_read_as_written_too_and_still_reported() {
+fn a_list_reads_member_pairs_across_aliased_walks() {
     let mut text = String::from(
         "_:d rdf:type owl:AllDifferent
          _:d owl:members _:l1
@@ -3449,26 +3444,18 @@ fn a_list_past_the_cap_over_its_closure_is_read_as_written_too_and_still_reporte
         }
     }
     let mut vocabulary = LocalVocabulary::default();
-    let (input, every) = replicated_closure(&mut vocabulary, &text);
+    let (_, every) = replicated_closure(&mut vocabulary, &text);
     let lists = ListVocabulary::new(&mut vocabulary);
-    let kinds = |d: &[super::lists::ListDiagnostic]| -> Vec<&str> {
-        d.iter().map(|d| d.problem.kind()).collect()
-    };
     let (rules, diagnostics) = super::lists::instantiate(&lists, &SliceFacts(&every));
-    assert!(rules.is_empty(), "the base's reading: {rules:?}");
-    assert_eq!(kinds(&diagnostics), ["too-many-list-variants"]);
-    let (rules, _, diagnostics) =
-        super::lists::instantiate_written(&lists, &SliceFacts(&every), Some(&SliceFacts(&input)));
-    let checks = rules.iter().filter(|r| r.name == "eq-diff2").count();
-    assert_eq!(
-        checks, 3,
-        "one eq-diff2 check per pair of members: {rules:?}"
-    );
-    assert_eq!(
-        kinds(&diagnostics),
-        ["too-many-list-variants"],
-        "still reported"
-    );
+    assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    let left = Term::Const(vocabulary.term("ex:m1-alias1"));
+    let right = Term::Const(vocabulary.term("ex:m3-alias4"));
+    assert!(rules.iter().any(|r| {
+        r.name == "eq-diff2"
+            && r.body
+                .iter()
+                .any(|Atom([s, _, o])| (*s, *o) == (left, right) || (*s, *o) == (right, left))
+    }));
 }
 
 /// A list within the cap over its closure is read as the closure gives it, the written
@@ -3488,10 +3475,9 @@ fn a_list_within_the_cap_is_read_as_its_closure_gives_it() {
          _:l2 rdf:rest rdf:nil
          _:l2 ex:altFirst ex:c";
     let mut vocabulary = LocalVocabulary::default();
-    let (input, every) = replicated_closure(&mut vocabulary, text);
+    let (_, every) = replicated_closure(&mut vocabulary, text);
     let lists = ListVocabulary::new(&mut vocabulary);
-    let (rules, _, diagnostics) =
-        super::lists::instantiate_written(&lists, &SliceFacts(&every), Some(&SliceFacts(&input)));
+    let (rules, diagnostics) = super::lists::instantiate(&lists, &SliceFacts(&every));
     let checks = rules.iter().filter(|r| r.name == "eq-diff2").count();
     assert_eq!(
         checks, 2,
@@ -3500,13 +3486,10 @@ fn a_list_within_the_cap_is_read_as_its_closure_gives_it() {
     assert!(diagnostics.is_empty(), "{diagnostics:?}");
 }
 
-/// A list past the cap over its closure gives, read as written, its checks alone: no
-/// inference. Spec: OWL 2 Profiles §4.3, `prp-spo2` over the property chain
-/// `(ex:p1 ex:p2 ex:p3)`, each property with four aliases: over the replicated closure the
-/// chain has 5 * 5 * 5 member sequences, past the cap, so it is left out and reported, as
-/// before; read as written it would infer, so nothing is added and the report stays.
+/// Table 5 prp-spo2 composes the three edges even when eq-rep-o gives
+/// their predicates 125 list walks.
 #[test]
-fn a_chain_past_the_cap_over_its_closure_adds_no_inference() {
+fn a_chain_with_many_aliased_walks_composes_its_edges() {
     let mut text = String::from(
         "ex:p owl:propertyChainAxiom _:l1
          _:l1 rdf:first ex:p1
@@ -3514,36 +3497,27 @@ fn a_chain_past_the_cap_over_its_closure_adds_no_inference() {
          _:l2 rdf:first ex:p2
          _:l2 rdf:rest _:l3
          _:l3 rdf:first ex:p3
-         _:l3 rdf:rest rdf:nil",
+         _:l3 rdf:rest rdf:nil
+         ex:a ex:p1 ex:b
+         ex:b ex:p2 ex:c
+         ex:c ex:p3 ex:d",
     );
     for p in 1..=3 {
         for i in 1..=4 {
             text.push_str(&format!("\nex:p{p} owl:sameAs ex:p{p}-alias{i}"));
         }
     }
-    let mut vocabulary = LocalVocabulary::default();
-    let (input, every) = replicated_closure(&mut vocabulary, &text);
-    let lists = ListVocabulary::new(&mut vocabulary);
-    let written = super::lists::instantiate(&lists, &SliceFacts(&input)).0;
-    assert!(
-        written.iter().any(|r| r.name == "prp-spo2"),
-        "as written alone, the chain infers: {written:?}"
-    );
-    let (rules, _, diagnostics) =
-        super::lists::instantiate_written(&lists, &SliceFacts(&every), Some(&SliceFacts(&input)));
-    assert!(rules.is_empty(), "no inference added: {rules:?}");
-    let kinds: Vec<&str> = diagnostics.iter().map(|d| d.problem.kind()).collect();
-    assert_eq!(kinds, ["too-many-list-variants"], "still reported");
+    let (mut v, derived, _) = closure(&text);
+    assert!(has(&mut v, &derived, "ex:a ex:p ex:d"));
 }
 
-/// A list past the cap over its closure and as written too gets nothing added, and is
-/// reported, as before. Spec: the reading as written adds a list's checks only where it
-/// reads the list within the cap: an `owl:AllDifferent` list of seven cells, each with two
-/// `rdf:first` as written, has 2^7 member sequences as written, past 64, and more over its
-/// closure.
+/// Table 4 eq-diff2 forbids equating members of the same walk, including
+/// a walk that uses an alternative first at either end.
 #[test]
-fn a_list_past_the_cap_as_written_too_gets_nothing_added() {
-    let mut text = String::from("_:d rdf:type owl:AllDifferent\n_:d owl:members _:l1");
+fn all_different_checks_a_walk_of_alternative_members() {
+    let mut text = String::from(
+        "_:d rdf:type owl:AllDifferent\n_:d owl:members _:l1\nex:m1b owl:sameAs ex:m7b",
+    );
     for k in 1..=7 {
         let rest = match k {
             7 => "rdf:nil".to_owned(),
@@ -3553,14 +3527,8 @@ fn a_list_past_the_cap_as_written_too_gets_nothing_added() {
             "\n_:l{k} rdf:first ex:m{k}a\n_:l{k} rdf:first ex:m{k}b\n_:l{k} rdf:rest {rest}"
         ));
     }
-    let mut vocabulary = LocalVocabulary::default();
-    let (input, every) = replicated_closure(&mut vocabulary, &text);
-    let lists = ListVocabulary::new(&mut vocabulary);
-    let (rules, _, diagnostics) =
-        super::lists::instantiate_written(&lists, &SliceFacts(&every), Some(&SliceFacts(&input)));
-    assert!(rules.is_empty(), "nothing added: {rules:?}");
-    let kinds: Vec<&str> = diagnostics.iter().map(|d| d.problem.kind()).collect();
-    assert_eq!(kinds, ["too-many-list-variants"], "reported");
+    let (_, _, violations) = closure(&text);
+    assert!(violations.iter().any(|v| v == "eq-diff2"), "{violations:?}");
 }
 
 /// A list past the cap is checked alike by the batch executor and the naive reference, from
@@ -3625,12 +3593,11 @@ fn a_list_past_the_cap_over_representatives_is_checked_by_its_classes() {
         let lists = ListVocabulary::new(&mut vocabulary);
         let schema = Schema::owl(&mut vocabulary);
         let closure = super::representatives::materialise(&input, &rules, Some(&lists), &schema);
-        let kinds: Vec<&str> = closure
-            .diagnostics
-            .iter()
-            .map(|d| d.problem.kind())
-            .collect();
-        assert_eq!(kinds, ["too-many-list-variants"], "past the cap, {head}");
+        assert!(
+            closure.diagnostics.is_empty(),
+            "{head}: {:?}",
+            closure.diagnostics
+        );
         let rules: Vec<&str> = closure.violations.iter().map(|(rule, _)| rule).collect();
         assert!(rules.contains(&"eq-diff2"), "{head}{rules:?}");
     }
@@ -3689,41 +3656,35 @@ fn a_long_list_past_the_cap_is_checked_as_written_by_its_index() {
         let lists = ListVocabulary::new(&mut vocabulary);
         let schema = Schema::owl(&mut vocabulary);
         let reps = super::representatives::materialise(&input, &rules, Some(&lists), &schema);
-        let kinds: Vec<&str> = reps.diagnostics.iter().map(|d| d.problem.kind()).collect();
-        assert_eq!(kinds, ["too-many-list-variants"], "{first}: past the cap");
+        assert!(
+            reps.diagnostics.is_empty(),
+            "{first}: {:?}",
+            reps.diagnostics
+        );
         let rules: Vec<&str> = reps.violations.iter().map(|(rule, _)| rule).collect();
         assert!(rules.contains(&"cax-adc"), "{first}: {rules:?}");
     }
 }
 
-/// A list past the cap over its closure reports the cap alone, whatever its reading as
-/// written would report. Spec: a key of 128 properties is past the 127 a rule holds
-/// (`list-too-long`), and seven of its properties with an alias each give it 2^7 member
-/// sequences over the replicated closure, past the cap: it is reported past the cap, as
-/// before, and nothing else.
+/// Table 5 prp-key merges the two instances with the same value for
+/// each of their 128 properties, including when key predicates have aliases.
 #[test]
-fn a_list_past_the_cap_reports_the_cap_alone() {
-    let mut text = String::from("ex:C owl:hasKey _:l1");
+fn a_long_aliased_key_matches_shared_values() {
+    let mut text = String::from("ex:C owl:hasKey _:l1\nex:x rdf:type ex:C\nex:y rdf:type ex:C");
     for k in 1..=128 {
         let rest = match k {
             128 => "rdf:nil".to_owned(),
             _ => format!("_:l{}", k + 1),
         };
         text.push_str(&format!(
-            "\n_:l{k} rdf:first ex:k{k}\n_:l{k} rdf:rest {rest}"
+            "\n_:l{k} rdf:first ex:k{k}\n_:l{k} rdf:rest {rest}\nex:x ex:k{k} ex:v{k}\nex:y ex:k{k} ex:v{k}"
         ));
     }
     for k in 1..=7 {
         text.push_str(&format!("\nex:k{k} owl:sameAs ex:k{k}-alias"));
     }
-    let mut vocabulary = LocalVocabulary::default();
-    let (input, every) = replicated_closure(&mut vocabulary, &text);
-    let lists = ListVocabulary::new(&mut vocabulary);
-    let (rules, _, diagnostics) =
-        super::lists::instantiate_written(&lists, &SliceFacts(&every), Some(&SliceFacts(&input)));
-    assert!(rules.is_empty(), "{rules:?}");
-    let kinds: Vec<&str> = diagnostics.iter().map(|d| d.problem.kind()).collect();
-    assert_eq!(kinds, ["too-many-list-variants"]);
+    let (mut v, derived, _) = closure(&text);
+    assert!(has(&mut v, &derived, "ex:x owl:sameAs ex:y"));
 }
 
 /// Over representatives, a list whose cells as written are past the cap once equality merges
@@ -3764,7 +3725,10 @@ fn a_list_whose_merged_cells_are_past_the_cap_is_checked_as_asserted() {
         let reps = super::representatives::materialise(&input, &rules, Some(&lists), &schema);
         let rules: Vec<&str> = reps.violations.iter().map(|(rule, _)| rule).collect();
         assert!(rules.contains(&"cax-adc"), "{head}: {rules:?}");
-        let kinds: Vec<&str> = reps.diagnostics.iter().map(|d| d.problem.kind()).collect();
-        assert_eq!(kinds, ["too-many-list-variants"], "{head}: past the cap");
+        assert!(
+            reps.diagnostics.is_empty(),
+            "{head}: {:?}",
+            reps.diagnostics
+        );
     }
 }

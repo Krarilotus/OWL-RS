@@ -595,15 +595,6 @@ pub fn instantiate_with_premises(
     compile(vocabulary, facts, &mut Predicates::default(), RuleKind::All)
 }
 
-/// All accepting walks, including those through copied list cells.
-pub fn instantiate_written(
-    vocabulary: &ListVocabulary,
-    facts: &impl Facts,
-    _written: Option<&dyn Facts>,
-) -> (Vec<Rule>, Vec<Vec<[u64; 3]>>, Vec<ListDiagnostic>) {
-    instantiate_with_premises(vocabulary, facts)
-}
-
 #[derive(Clone, Copy)]
 pub(crate) enum RuleKind {
     All,
