@@ -728,16 +728,28 @@ pub(crate) fn certify_closure(
 
 /// The QL rewriting's own report as it leaves nrese-sparql (run, EXPLAIN and plan), with
 /// the whole composition ([`certify_closure`]) on it: the answer's status is this report
-/// (`StoreService::status_outside_dl`), so the two are one value.
+/// (`StoreService::status_outside_dl`), so the two are one value. Under `owl2-rl`, where the
+/// closure leaves out a list axiom (`lists_left_out`, asked only of a `complete` report),
+/// whose conclusions an answer may miss, it isn't `complete` ([`LIST`]): an input of the
+/// composition, so the operator rule, its last step, sees it.
 pub(crate) fn certify_report(
     completeness: Option<&mut Completeness>,
     query: (&Query, &Reads),
     snapshot: Option<&Snapshot>,
+    lists_left_out: impl FnOnce() -> bool,
 ) {
     if let Some(completeness) = completeness {
+        let rl = completeness.regime == Some(nrese_sparql::Regime::Owl2Rl);
+        if completeness.complete && rl && lists_left_out() {
+            completeness.incomplete("rules", LIST.to_owned());
+        }
         certify_closure(completeness, query, "ql", snapshot);
     }
 }
+
+/// Why a QL report under `owl2-rl` isn't `complete` where the closure leaves out a list.
+const LIST: &str =
+    "a list axiom the rules can't build is left out of the closure (a list diagnostic)";
 
 /// What [`certify`] reads of a query, which depends on the query and its reader alone, as the
 /// reasons it gives: each found on its first use and kept with the prepared query
