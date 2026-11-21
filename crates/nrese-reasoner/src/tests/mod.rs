@@ -559,7 +559,7 @@ fn a_reflexive_property_relates_every_individual_to_itself_under_ql() {
 
 /// Random small ontologies: the batch executor equals the naive one under every
 /// profile.
-/// By default, this test replays fixed derivations in every profile. With `NRESE_CHECK_TIER=nightly`, it draws 60 per profile.
+/// By default, this test replays fixed derivations in every profile. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 60 per profile.
 #[test]
 fn every_profile_batch_equals_naive() {
     let mut next = rng(0x5851_F42D_4C95_7F2D);
@@ -1195,22 +1195,32 @@ fn equality_gives_lists_several_member_sequences() {
     assert!(violations.is_empty(), "{violations:?}");
 }
 
-pub(super) fn test_cases(default: u64, full: u64) -> u64 {
-    let cases = if nightly() { full } else { default };
-    std::env::var("NRESE_FUZZ_CASES")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(cases)
-}
-
-fn pinned_cases() -> bool {
+/// Whether a random test replays its pinned witnesses: only with no tier, no seed
+/// (`NRESE_FUZZ_SEED`) and no count (`NRESE_FUZZ_CASES`). Any of them gives the full draw.
+pub(super) fn pinned_cases() -> bool {
     !nightly()
         && std::env::var_os("NRESE_FUZZ_CASES").is_none()
         && std::env::var_os("NRESE_FUZZ_SEED").is_none()
 }
 
-// Case 0 gave the profile, hidden-class and representative reds; case 17
-// gave the listing red. Each profile or listing uses these fixed positions.
+/// A random test's count: `default` for its pinned witnesses, else the full one. A seeded
+/// run is the full draw from that seed; `NRESE_FUZZ_CASES` changes nothing here.
+pub(super) fn test_cases(default: u64, full: u64) -> u64 {
+    if pinned_cases() { default } else { full }
+}
+
+/// [`test_cases`], with `NRESE_FUZZ_CASES` setting the count: only for the three tests
+/// that read it before the check tiers.
+fn fuzz_cases(default: u64, full: u64) -> u64 {
+    std::env::var("NRESE_FUZZ_CASES")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| test_cases(default, full))
+}
+
+// Case 0 gave the profile, hidden-class and representative reds; case 17 gave the listing
+// red. They are positions within each ruleset's share of the stream: the default form
+// draws 20 cases per ruleset, so only the first ruleset's are the full form's same cases.
 const ONTOLOGY_WITNESSES: [usize; 14] = [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 16, 17, 19];
 
 /// A xorshift generator: `next(n)` is in `0..n`.
@@ -1275,6 +1285,8 @@ impl OntologyFamilies {
     }
 }
 
+/// [`random_ontology`], telling `witness` each choice between constructors. Every such choice
+/// goes through `choose`: one drawn with a plain `next` is invisible to the family check.
 fn ontology_with(
     next: &mut dyn FnMut(usize) -> usize,
     mut witness: impl FnMut(&'static str, usize, usize),
@@ -1405,7 +1417,7 @@ fn ontology_with(
 /// anonymous unions, some also used where memberships are consumed, the closure with
 /// the hidden classes' memberships left out is the full closure without them, under
 /// every ruleset; classes that are consumed are never hidden.
-/// By default, this test replays fixed hidden-class witnesses in each profile. With `NRESE_CHECK_TIER=nightly`, it draws 60 per ruleset.
+/// By default, this test replays fixed hidden-class witnesses in each profile. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 60 per ruleset.
 #[test]
 fn hidden_unnamed_classes_leave_the_rest_of_the_closure() {
     use super::unnamed::{UnnamedVocabulary, hidden_classes_in};
@@ -1550,7 +1562,7 @@ fn hidden_unnamed_classes_leave_the_rest_of_the_closure() {
 /// Equality by representatives: on random ontologies with extra `sameAs` and data,
 /// under every ruleset with equality, the representative closure expanded is exactly
 /// the replicated closure, and the same consistency rules fire.
-/// By default, this test replays fixed witnesses in each equality profile. With `NRESE_CHECK_TIER=nightly`, it draws 120 per equality ruleset.
+/// By default, this test replays fixed witnesses in each equality profile. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 120 per equality ruleset.
 #[test]
 fn representatives_expand_to_the_replicated_closure() {
     use super::representatives;
@@ -1667,7 +1679,7 @@ fn representatives_expand_to_the_replicated_closure() {
 /// predicates and rule constants lose their place), each listing's facts, the classes, the
 /// violations and the merges are the same both ways, and no listing holds a fact twice (a
 /// held fact let into a round's new facts is listed again). Varied by `NRESE_FUZZ_SEED`.
-/// By default, this test replays fixed merger witnesses in all three listing modes. With `NRESE_CHECK_TIER=nightly`, it checks 150.
+/// By default, this test replays fixed merger witnesses in all three listing modes. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it checks 150.
 #[test]
 fn a_merge_s_rewrites_answer_the_same_scanned_or_looked_up() {
     use super::eval::NEVER;
@@ -2282,7 +2294,7 @@ fn equality_module_equals_the_generic_rules() {
 /// equality-heavy ontology: equal to rematerialisation after every change, under each
 /// plan of the maintenance policy (B3a: classes a deletion splits recomputed, or DRed
 /// over them).
-/// By default, this test replays 20 fixed edits under each policy. With `NRESE_CHECK_TIER=nightly`, it draws 60 per policy.
+/// By default, this test replays 20 fixed edits under each policy. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 60 per policy.
 #[test]
 fn delta_equality_equals_rematerialisation() {
     use super::delta::policy::{Plan, Policy};
@@ -2447,7 +2459,7 @@ fn materialisation_stops_when_asked() {
 }
 
 /// Random small ontologies: the batch executor equals the naive one.
-/// By default, this test checks the first 100 fixed ontologies, witnesses for eight consistency rules and every generator family. With `NRESE_CHECK_TIER=nightly`, it draws 400.
+/// By default, this test checks the first 100 fixed ontologies, witnesses for eight consistency rules and every generator family. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 400.
 #[test]
 fn batch_equals_naive_on_random_ontologies() {
     let mut next = rng(0x9E37_79B9_7F4A_7C15);
@@ -2810,7 +2822,7 @@ fn check_supports(
 ///   bodiless facts and recursion, and the closure decides what they leave open.
 pub(super) fn support_sets_against_closures() {
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
-    let cases = test_cases(30, 150);
+    let cases = fuzz_cases(30, 150);
     let pinned = pinned_cases();
     let mut families = OntologyFamilies::default();
     let witnesses = [0, 2, 5, 6, 8, 10, 15, 21, 24, 28];
@@ -2905,7 +2917,7 @@ pub(super) fn support_set_updates_against_recomputation() {
         support_sets, update_support_sets,
     };
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
-    let cases = test_cases(30, 150);
+    let cases = fuzz_cases(30, 150);
     let pinned = pinned_cases();
     let witnesses = [
         0, 1, 2, 4, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 19, 20, 21, 22, 24, 26, 28, 29,
@@ -3205,7 +3217,7 @@ pub(super) fn support_set_updates_against_recomputation() {
 /// Random ontologies under random insert/delete sequences: after every change, the
 /// inferred facts the delta executor maintains equal a rematerialisation, and the
 /// violations it reports are exactly the new ones.
-/// By default, this test replays the failing case and witnesses for each profile, policy and cache choice. With `NRESE_CHECK_TIER=nightly`, it draws 300.
+/// By default, this test replays the failing case and witnesses for each profile, policy and cache choice. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it draws 300.
 #[test]
 fn delta_equals_rematerialisation_under_random_changes() {
     use super::delta::policy::{Plan, Policy};
@@ -3214,12 +3226,12 @@ fn delta_equals_rematerialisation_under_random_changes() {
     // NRESE_FUZZ_CASES and NRESE_FUZZ_SEED widen the sweep locally.
     let env = |name: &str| std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok());
     const SEED: u64 = 0x2545_F491_4F6C_DD1D;
-    // Case 0 exposed stale memberships. The remaining seeds exercise the same
-    // recipe for each profile, with both policies and both cache paths.
+    // Case 0 exposed stale memberships; it alone is the full form's case 0. The others
+    // are re-seeded (`SEED ^ case`) to cover each profile, policy and cache recipe.
     let witnesses = [0, 1, 2, 3, 4, 5, 6, 9, 12, 13, 15, 18, 21, 24, 27];
     let pinned = pinned_cases();
     let mut families = OntologyFamilies::default();
-    let cases = test_cases(witnesses.len() as u64, 300);
+    let cases = fuzz_cases(witnesses.len() as u64, 300);
     let mut next = rng(env("NRESE_FUZZ_SEED").unwrap_or(SEED));
     let mut witnessed = HashSet::new();
     let recipe = |case: u64| {
@@ -3232,7 +3244,8 @@ fn delta_equals_rematerialisation_under_random_changes() {
         (ruleset, (case / 3) % 2 == 1, case % 2 == 1)
     };
     let (mut changes, mut inserted, mut removed) = (0, 0, 0);
-    let floor = cases.saturating_mul(10) / 3;
+    // The line's floor for any drawn count; the pinned cases scale it.
+    let floor = if pinned { cases * 10 / 3 } else { 1000 };
     let covered = |inserted: u64, removed: u64| inserted > floor && removed > floor;
     for draw in 0.. {
         if (pinned && draw == cases)

@@ -1161,7 +1161,7 @@ mod tests {
     /// functional and inverse-functional properties) leave the inferred stack equal to a
     /// fresh closure, under each plan of the maintenance policy forced and the cheapest, in
     /// both store modes (every copy, or over representatives). Varied by `NRESE_FUZZ_SEED`.
-    /// By default, this test checks 2 seeds for each mode and plan. With `NRESE_CHECK_TIER=nightly`, it checks 6.
+    /// By default, this test checks 2 seeds for each mode and plan, which insert and delete every predicate it draws. With `NRESE_CHECK_TIER=nightly` or `NRESE_FUZZ_SEED` set, it checks 6.
     #[test]
     fn every_maintenance_plan_keeps_the_stack_equal_to_recomputation() {
         use crate::delta::policy::Plan;
@@ -1178,6 +1178,8 @@ mod tests {
         let cases = crate::tests::test_cases(2, 6);
         let mut failures: Vec<String> = Vec::new();
         let mut untaken = Vec::new();
+        // The generator's families: each predicate it draws, inserted and deleted.
+        let mut drawn = HashSet::new();
         for compact in [false, true] {
             for plan in plans {
                 let mut taken: HashSet<Plan> = HashSet::new();
@@ -1259,6 +1261,12 @@ mod tests {
                                 }
                             })
                             .collect();
+                        for &(fact, insert) in &changes {
+                            let slot = [same_as, p, q, f, i, rdf_type]
+                                .iter()
+                                .position(|&predicate| predicate == fact[1]);
+                            drawn.insert((slot, insert));
+                        }
                         let mut tx = engine.transaction();
                         for &(fact, insert) in &changes {
                             let quad = encode(fact).in_default_graph();
@@ -1335,6 +1343,16 @@ mod tests {
             )
         );
         assert!(untaken.is_empty(), "forced plans never taken: {untaken:?}");
+        if crate::tests::pinned_cases() {
+            for slot in 0..6 {
+                for insert in [true, false] {
+                    assert!(
+                        drawn.contains(&(Some(slot), insert)),
+                        "family {slot}, {insert}"
+                    );
+                }
+            }
+        }
     }
 
     /// A rebuild runs no delta, and still reports the list axioms a deletion leaves
