@@ -18,7 +18,3 @@ WebOnt-disjointWith-001 # owl:differentFrom from disjoint classes
 # RL runner lists them too):
 WebOnt-I5.26-010 # an anonymous owl:minCardinality restriction
 WebOnt-I5.5-005 # an anonymous owl:unionOf class
-
-# Inconsistencies the ruleset doesn't detect:
-WebOnt-Thing-003 # owl:Thing equivalent to owl:Nothing, without an individual for a rule to fire on
-WebOnt-description-logic-104 # owl:complementOf on the right of a subclass axiom: owl2-ql has no cls-com
