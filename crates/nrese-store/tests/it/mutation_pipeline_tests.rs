@@ -2443,15 +2443,10 @@ fn long_intersection(n: usize) -> String {
 #[test]
 fn a_negation_over_a_list_left_out_is_unsound() {
     use nrese_sparql::ql::{PrintForm, Printed};
-    let property = "a <http://www.w3.org/2002/07/owl#ObjectProperty> .";
-    let mut chain = long_chain(251);
-    for link in (1..=251).map(|i| format!("p{i}")).chain(["chain".into()]) {
-        chain.push_str(&format!(" <{EX}{link}> {property}"));
-    }
     let (mut wrong, mut printed_any) = (Vec::new(), false);
     for (data, subject, blocker) in [
         (long_key(128), "x", format!("?x <{EX}name> \"Y\"")),
-        (chain, "a0", format!("?x <{EX}chain> <{EX}a251>")),
+        (declared_chain(), "a0", format!("?x <{EX}chain> <{EX}a251>")),
         (long_intersection(257), "x", format!("?x a <{EX}C>")),
     ] {
         let pipeline = ql_pipeline(in_memory_store_config());
@@ -2496,6 +2491,72 @@ fn a_negation_over_a_list_left_out_is_unsound() {
         printed_any,
         "setup: no read printed, so the printed status went unchecked"
     );
+}
+
+/// [`long_chain`] of 251 links, past the rules' cap, with the chain and every link declared an
+/// object property.
+fn declared_chain() -> String {
+    let property = "a <http://www.w3.org/2002/07/owl#ObjectProperty> .";
+    let mut chain = long_chain(251);
+    for link in (1..=251).map(|i| format!("p{i}")).chain(["chain".into()]) {
+        chain.push_str(&format!(" <{EX}{link}> {property}"));
+    }
+    chain
+}
+
+/// Spec: reasoning-semantics.md, what may be complete, "Operators": where answers may be
+/// missing, `EXISTS`, `MINUS` and `OPTIONAL` make them `unsound`. Over [`declared_chain`],
+/// which the rules leave out, `:a0 :chain :a251` is entailed and missing, so each read keeps a
+/// row the certain answers don't have (`:a0` under `NOT EXISTS` and `MINUS`; `:a0` without
+/// `?y` under `OPTIONAL`, where the certain row binds `?y` to `:a251`). Each is `unsound` in
+/// its status, its QL report, its plan, the plan's QL report, EXPLAIN and EXPLAIN's QL report.
+#[test]
+fn each_operator_over_a_list_left_out_is_unsound_on_every_surface() {
+    let pipeline = ql_pipeline(in_memory_store_config());
+    let ticket = MutationTicket::new();
+    let all = nrese_store::Requester::all();
+    (pipeline.apply(insert(&declared_chain()), &all, &ticket)).expect("data");
+    let store = pipeline.store();
+    let (a0, chain, a251) = (
+        format!("<{EX}a0>"),
+        format!("<{EX}chain>"),
+        format!("<{EX}a251>"),
+    );
+    let mut wrong = Vec::new();
+    for read in [
+        format!("FILTER NOT EXISTS {{ ?x {chain} {a251} }}"),
+        format!("MINUS {{ ?x {chain} {a251} }}"),
+        format!("OPTIONAL {{ ?x {chain} ?y }}"),
+    ] {
+        let text = format!("SELECT ?x ?y {{ VALUES ?x {{ {a0} }} {read} }}");
+        let request = nrese_store::SparqlQueryRequest::all(text);
+        let answer = store.execute_query(&request).expect("answered");
+        let prepared = store.prepare_query(&request).expect("prepared");
+        let token = nrese_store::CancellationToken::new();
+        let planned = store.plan_query(&prepared, &token).expect("planned");
+        let explained = store.explain_query(&prepared, &token).expect("explained");
+        let label = |c: Option<&nrese_sparql::Completeness>| c.map(|c| c.as_str());
+        let labels = [
+            label(answer.completeness.as_ref()),
+            label(answer.ql.as_ref().map(|r| &r.completeness)),
+            label(planned.completeness.as_ref()),
+            label(planned.ql.as_ref().map(|r| &r.completeness)),
+            label(explained.completeness.as_ref()),
+            label(explained.ql.as_ref().map(|r| &r.completeness)),
+        ];
+        let json: serde_json::Value = serde_json::from_slice(&answer.payload).expect("json");
+        let rows: Vec<_> = (json["results"]["bindings"].as_array().expect("rows"))
+            .iter()
+            .map(|row| {
+                let value = |v: &str| row[v]["value"].as_str().map(str::to_owned);
+                (value("x"), value("y"))
+            })
+            .collect();
+        if labels != [Some("unsound"); 6] || rows != [(Some(format!("{EX}a0")), None)] {
+            wrong.push((read, labels, rows));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// Spec: the operator rule (reasoning-semantics.md, "Operators") holds once per read: a read
