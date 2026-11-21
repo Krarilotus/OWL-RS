@@ -2187,6 +2187,12 @@ impl<'a> Context<'a> {
             Some(outer) => {
                 merge_numbers(&mut outer.numbers, added.numbers);
                 outer.held.absorb(added.held);
+                // The query memo's limit holds within the outer point too, the memo counted.
+                let memo = self.numbers.borrow();
+                let let_go = past_limit(&mut outer.numbers, |key| {
+                    memo.get(key).map_or(0, |m| m.len())
+                });
+                outer.held.release(let_go.saturating_mul(number_bytes()));
             }
             None => {
                 drop(since);
@@ -6923,14 +6929,7 @@ impl<'a> Context<'a> {
         merge_numbers(&mut numbers, found.numbers);
         let mut kept = self.kept.borrow_mut();
         kept.absorb(found.held);
-        let mut let_go = 0usize;
-        numbers.retain(|_, known| {
-            let keep = known.len() <= NUMBER_MEMO_ENTRIES;
-            if !keep {
-                let_go = let_go.saturating_add(known.len());
-            }
-            keep
-        });
+        let let_go = past_limit(&mut numbers, |_| 0);
         kept.release(let_go.saturating_mul(number_bytes()));
     }
 
@@ -7460,6 +7459,24 @@ fn merge_numbers(
             }
         }
     }
+}
+
+/// Lets go of the numbers of each expression in `numbers` that, with the `held` elsewhere
+/// for it, are more than [`NUMBER_MEMO_ENTRIES`]: a GROUP BY over many distinct values
+/// would hold all their numbers to the end of the query. How many were let go.
+fn past_limit(
+    numbers: &mut HashMap<(Expression, Variable), nrese_exec::IdMap<Number>>,
+    held: impl Fn(&(Expression, Variable)) -> usize,
+) -> usize {
+    let mut let_go = 0usize;
+    numbers.retain(|key, known| {
+        let keep = held(key).saturating_add(known.len()) <= NUMBER_MEMO_ENTRIES;
+        if !keep {
+            let_go = let_go.saturating_add(known.len());
+        }
+        keep
+    });
+    let_go
 }
 
 /// An open save point ([`Context::save`]): the computed terms the context held, how many
