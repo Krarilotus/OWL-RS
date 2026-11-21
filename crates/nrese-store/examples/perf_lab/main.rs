@@ -1277,9 +1277,6 @@ pub(crate) fn tsv_request(text: &str) -> SparqlQueryRequest {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Not dead: the server reads the memory capacity at start (`install_process_memory_policy`);
-    // this embeds the store without that step, so its first budgeted step would read it in a timer.
-    let _ = nrese_store::memory::capacity();
     let raw: Vec<String> = std::env::args().skip(1).collect();
     if raw.first().map(String::as_str) == Some("generate") {
         return generate::main(&raw[1..]);
@@ -1405,6 +1402,9 @@ fn run(args: &Args, report: &mut Report) -> Result<(), Box<dyn std::error::Error
             .push(("kernel", modes::kernel(kernel, args.runs)?));
         return Ok(());
     }
+    // Not dead: the server reads the memory capacity at start (`install_process_memory_policy`);
+    // this embeds the store without that step, so its first budgeted step would read it in a timer.
+    let _ = nrese_store::memory::capacity();
     if let Some(file) = &args.upload {
         let format = args
             .upload_format
