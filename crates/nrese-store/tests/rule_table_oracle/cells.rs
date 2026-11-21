@@ -470,6 +470,51 @@ fn chain_with(extra: &str) -> generator::Write {
 }
 
 #[test]
+fn an_oversized_walk_leaves_out_the_whole_chain() {
+    // The tables derive the one-cell exit. The enumerated form leaves the
+    // whole head out when another accepting walk exceeds the encoder limit.
+    use nrese_reasoner::{ReasonerConfig, ReasoningMode};
+
+    let mut input = generator::long_chain(251).writes.remove(0);
+    input
+        .insert
+        .extend(insert("ex:c0 rdf:rest rdf:nil\nex:a ex:p ex:b").insert);
+    let watch = crate::triple(["ex:a", "ex:out", "ex:b"]);
+    let model = oracle::evaluate(
+        &input.insert.iter().cloned().collect(),
+        oracle::Datatypes::Standard,
+    );
+    assert!(model.facts.contains(&watch));
+
+    let rl = ReasoningMode::Owl2Rl;
+    for &mode in judges::MODES {
+        let store = judges::open(mode, None);
+        let raw = judges::pipeline(&store, ReasoningMode::Disabled);
+        assert!(judges::apply(&raw, &insert("rdf:nil ex:marker ex:seed")));
+        assert!(judges::apply(&raw, &input));
+        let snapshot = store.read_snapshot(None).unwrap();
+        let id = |name| {
+            snapshot
+                .lookup(nrese_rdf::NamedNodeRef::new(name).unwrap().into())
+                .unwrap()
+                .raw()
+        };
+        assert!(id(nrese_rdf::vocab::rdf::NIL.as_str()) < id("http://example.org/c1"));
+        let _reader = judges::pipeline(&store, rl);
+        let program = ReasonerConfig::for_mode(rl).materialised_program().unwrap();
+        let report = store.rematerialise(program).unwrap();
+        assert!(
+            report.diagnostics.iter().any(|d| d.kind == "list-too-long"),
+            "{mode}"
+        );
+        assert!(
+            !judges::ask(&store, &watch).0,
+            "{mode}: short exit survived"
+        );
+    }
+}
+
+#[test]
 fn accepting_walk_survives_incomplete_branches() {
     // Spec: Table 3 requires a first and a rest at each position. Table 5
     // prp-spo2 still derives the row from the branch with both.
