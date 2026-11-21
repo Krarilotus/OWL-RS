@@ -17,7 +17,8 @@
 #                                  changed_crates, below), on the fleet only
 #                                  (scripts/lib/fleet-gate.sh). fmt; clippy on them; all their
 #                                  tests, the dependents' fast tests; random tests on new
-#                                  seeds; the lock check; nrese-exec's unsafe code under Miri
+#                                  seeds; the lock check; each of them and their dependents
+#                                  compiled alone (crates_alone); nrese-exec's unsafe code under Miri
 #                                  and its doc tests when it changed (scripts/miri.sh). By
 #                                  hand: HEAD, from its upstream (else from where it left
 #                                  origin's refactor/engine-v2), so a push then finds the pass;
@@ -47,7 +48,8 @@
 # Tests run under cargo-nextest (every test of every binary in parallel, with the features of
 # the crates the run selects): the fleet's gate jobs install the pinned one
 # (scripts/lib/gate-tools.txt; scripts/lib/gate-job.sh, scripts/lib/windows-job.sh) and give
-# no verdict without it. A local run without it uses cargo test, crate by crate.
+# no verdict without it. A local run without it uses cargo test, crate by crate. So the push
+# tier checks that each crate it tests compiles alone, with its own features (crates_alone).
 # Builds go through scripts/cargo-guarded.sh. Every step runs; the summary lists
 # each one's exit code.
 #
@@ -324,6 +326,17 @@ deny_version() {
   fi
 }
 
+# Each crate compiled alone, with only the features it and its dev-dependencies turn on: a crate's
+# tests run in one run with other crates' (nextest), which unifies features, so a crate that compiles
+# only because another turns a feature on would pass there and fail `cargo test -p` for its developer.
+crates_alone() {
+  local name code=0
+  for name in "$@"; do
+    "$guarded" check --locked -p "$name" --lib --bins --tests || code=$?
+  done
+  return $code
+}
+
 # Whether nrese-exec differs from where this branch left refactor/engine-v2, committed or
 # not (Miri's step): the upstream or the last commit alone would miss earlier commits of a
 # branch that has none. Without that history, it is taken to differ.
@@ -518,6 +531,7 @@ case "$mode" in
       step seeds run_seeds "${changed[@]}"
       step locks bash scripts/check-locks.sh
       step features bash scripts/check-features.sh
+      step "crates alone" crates_alone "${changed[@]}" "${dependents[@]}"
     fi
     # nrese-exec's unsafe primitives under Miri (scripts/miri.sh), and its doc tests: the
     # compile-fail rows that keep their misuse unwritable (a settled region grows).
