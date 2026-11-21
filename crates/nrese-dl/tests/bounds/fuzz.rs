@@ -14,8 +14,10 @@
 //! `NRESE_FUZZ_CASES` and `NRESE_FUZZ_SEED` change the run.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use nrese_dl::bounds::{Bounds, Program};
+use nrese_dl::tableau::{self, Answer, Config};
 use nrese_owl::fuzz::{self, Name, Profile, Rng, Signature, Sizes};
 use nrese_owl::{Axiom, Characteristic, ClassExpr, ExprId, ObjProp, Ontology, Term, Vocabulary};
 
@@ -246,6 +248,8 @@ struct Tally {
     clashes: u64,
     violations: u64,
     too_large: u64,
+    /// L beyond U1 with no L violation, excused: U1 clashes and the case has no model.
+    excused: u64,
 }
 
 #[test]
@@ -302,8 +306,25 @@ fn l_beyond_u1_on_an_ontology_with_no_model_is_no_failure() {
     assert_eq!(tally.clashes, 1, "a case whose U1 clashes: {tally:?}");
 }
 
+/// Whether the hypertableau proves `ontology` has no model, bounded as the classification
+/// tests bound it (nodes and branch points; the clock only as a safety net). An answer it
+/// can't give (a budget, a part left out) is no proof.
+fn no_model(ontology: &Ontology) -> bool {
+    let config = Config {
+        max_nodes: Some(20_000),
+        max_branch_points: Some(100_000),
+        timeout: Some(Duration::from_secs(300)),
+        max_memory: Some(256 << 20),
+        ..Config::default()
+    };
+    tableau::consistency(ontology, &config).answer == Answer::Inconsistent
+}
+
 /// The fuzzed case `case` of `seed`: U1 checked as a model, against L and its violations;
-/// what it came to counted in `tally`, what failed pushed to `failures`.
+/// what it came to counted in `tally`, what failed pushed to `failures`. L beyond U1 is a
+/// failure unless L has a violation, or U1 clashes and the hypertableau finds no model:
+/// an ontology with no model entails everything. A clash on a case with a model, or one the
+/// hypertableau can't decide, excuses nothing.
 fn check(seed: u64, case: u64, tally: &mut Tally, failures: &mut Vec<String>) {
     let mut rng = Rng::new(seed.wrapping_add(case));
     let mut table = Table::default();
@@ -341,22 +362,29 @@ fn check(seed: u64, case: u64, tally: &mut Tally, failures: &mut Vec<String>) {
     let bounds = Bounds::new(&program, &table, lower.facts.clone(), upper.facts.clone());
     tally.cases += 1;
     let render = |a: &Axiom| ontology.functional(a, &|t| table.text(t));
-    // An inconsistent ontology (an RL violation) entails everything, so L may exceed U1.
+    // An inconsistent ontology entails everything, so L may exceed U1: where L has an RL
+    // violation, or where U1 clashes and the hypertableau finds no model. A U1 clash alone
+    // proves nothing (U1 over-approximates), so it excuses nothing.
     let missing = bounds.lower_not_in_upper();
     if !missing.is_empty() && lower.violations.is_empty() {
-        failures.push(format!(
-            "case {case}: L not in U1: {:?}\n  in {:?}",
-            missing
-                .iter()
-                .map(|t| t.map(|x| table.text(x)))
-                .collect::<Vec<_>>(),
-            ontology
-                .axioms
-                .iter()
-                .filter(|a| !matches!(a, Axiom::Declaration(..)))
-                .map(render)
-                .collect::<Vec<_>>()
-        ));
+        if !bounds.clashes().is_empty() && no_model(&ontology) {
+            tally.excused += 1;
+            eprintln!("case {case}: L not in U1, excused: U1 clashes and there is no model");
+        } else {
+            failures.push(format!(
+                "case {case}: L not in U1: {:?}\n  in {:?}",
+                missing
+                    .iter()
+                    .map(|t| t.map(|x| table.text(x)))
+                    .collect::<Vec<_>>(),
+                ontology
+                    .axioms
+                    .iter()
+                    .filter(|a| !matches!(a, Axiom::Declaration(..)))
+                    .map(render)
+                    .collect::<Vec<_>>()
+            ));
+        }
     }
     if !lower.violations.is_empty() {
         tally.violations += 1;
