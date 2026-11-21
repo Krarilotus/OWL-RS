@@ -141,6 +141,17 @@ impl ListVocabulary {
         p == self.rdf_type || self.is_list_predicate(p)
     }
 
+    pub(crate) fn may_derive(
+        &self,
+        [_, predicate, object]: [u64; 3],
+        exists: impl Fn([Option<u64>; 3]) -> bool,
+    ) -> bool {
+        (predicate == self.same_as && exists([None, Some(self.has_key), None]))
+            || (predicate == self.rdf_type
+                && exists([Some(object), Some(self.intersection_of), None]))
+            || exists([Some(predicate), Some(self.property_chain_axiom), None])
+    }
+
     /// Whether `fact` is list structure or a list axiom: the facts [`instantiate`] reads.
     pub fn is_list_fact(&self, [_, p, o]: [u64; 3]) -> bool {
         self.is_list_predicate(p)

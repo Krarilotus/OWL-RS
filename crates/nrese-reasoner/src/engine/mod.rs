@@ -39,7 +39,8 @@ use crate::unnamed::UnnamedVocabulary;
 
 pub use explain::{
     InferenceStep, JUSTIFICATIONS_AT_MOST, JustificationAnswer, JustificationMode,
-    JustifiedStatement, explain_fact, explain_violation, justify_fact,
+    JustifiedStatement, explain_fact, explain_fact_until, explain_violation,
+    explain_violation_until, justify_fact, justify_fact_until,
 };
 pub use maintain::{EngineBase, Maintenance, maintain, maintain_with, maintain_within};
 pub use materialise::{
@@ -257,11 +258,15 @@ impl Program {
             .expect("unbounded grounding")
     }
 
-    fn ground_program_until(
+    /// Grounds the snapshot's rules and private tables under the caller's stop.
+    pub fn ground_program_until(
         &self,
         snapshot: &Snapshot,
         stop: crate::eval::Stop<'_>,
     ) -> Result<GroundProgram, crate::eval::Stopped> {
+        if stop() {
+            return Err(crate::eval::Stopped);
+        }
         let schema = self.schema_for(snapshot);
         let base = explain::SnapshotBase {
             snapshot,

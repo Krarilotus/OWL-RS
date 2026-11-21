@@ -2303,43 +2303,9 @@ impl<'a> Unpolled<'a> {
         fact: Triple,
         limit: usize,
     ) -> Vec<(String, Vec<Triple>)> {
-        let program = self.0;
-        let transitive = program
-            .transitive
-            .contains(&fact[1])
-            .then(|| transitivity(fact[1]));
-        let rules = self
-            .producers(fact)
-            .into_iter()
-            .map(|r| (&program.rules[r], Grounding::Rule(r)))
-            .chain(
-                transitive
-                    .as_ref()
-                    .map(|rule| (rule, Grounding::Transitive(fact[1]))),
-            );
-        let mut bodies = Vec::new();
-        let poll = Poller::never();
-        for (rule, grounding) in rules {
-            let alternatives = self.premise_alternatives(grounding);
-            derivations(source, rule, fact, Seg::All, &poll, &mut |bindings| {
-                let body: Vec<Triple> = rule
-                    .body
-                    .iter()
-                    .map(|atom| instantiate_head(atom, bindings))
-                    .collect();
-                for premises in &alternatives {
-                    let mut full = body.clone();
-                    full.extend_from_slice(premises);
-                    bodies.push((rule.name.clone(), full));
-                }
-                bodies.len() >= limit
-            })
-            .expect("never stopped");
-            if bodies.len() >= limit {
-                break;
-            }
-        }
-        bodies
+        self.0
+            .named_derivations_with(source, fact, limit, &Poller::never(), true)
+            .expect("never stopped")
     }
 
     /// Whether `fact` has a one-step derivation from the facts of `source` (`Seg::All`):
@@ -2810,23 +2776,43 @@ impl GroundProgram {
         limit: usize,
         poll: &Poller<'_>,
     ) -> Result<Vec<(String, Vec<Triple>)>, Stopped> {
+        self.named_derivations_with(source, fact, limit, poll, false)
+    }
+
+    /// A justification reads every schema premise alternative of a derivation.
+    pub(crate) fn named_derivations_with<S: Source + ?Sized>(
+        &self,
+        source: &S,
+        fact: Triple,
+        limit: usize,
+        poll: &Poller<'_>,
+        all_premises: bool,
+    ) -> Result<Vec<(String, Vec<Triple>)>, Stopped> {
         let mut bodies = Vec::new();
-        let mut search =
-            |rule: &Rule, premises: &[Triple], poll: &Poller<'_>| -> Result<bool, Stopped> {
-                derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
-                    let mut body: Vec<Triple> = rule
-                        .body
-                        .iter()
-                        .map(|atom| instantiate_head(atom, bindings))
-                        .collect();
-                    body.extend_from_slice(premises);
-                    bodies.push((rule.name.clone(), body));
-                    bodies.len() >= limit
-                })?;
-                Ok(bodies.len() >= limit)
-            };
+        let mut search = |rule: &Rule, grounding, poll: &Poller<'_>| -> Result<bool, Stopped> {
+            derivations(source, rule, fact, Seg::All, poll, &mut |bindings| {
+                let body: Vec<Triple> = rule
+                    .body
+                    .iter()
+                    .map(|atom| instantiate_head(atom, bindings))
+                    .collect();
+                let alternatives = self.for_each_alternative(grounding, poll, |premises, _| {
+                    let mut full = body.clone();
+                    full.extend_from_slice(premises);
+                    bodies.push((rule.name.clone(), full));
+                    Ok(if all_premises {
+                        ControlFlow::Continue(())
+                    } else {
+                        ControlFlow::Break(())
+                    })
+                });
+                alternatives.is_err() || bodies.len() >= limit
+            })?;
+            poll.ended()?;
+            Ok(bodies.len() >= limit)
+        };
         let full = self.for_each_producer(fact, poll, |r, poll| {
-            Ok(match search(&self.rules[r], &self.premises[r], poll)? {
+            Ok(match search(&self.rules[r], Grounding::Rule(r), poll)? {
                 true => ControlFlow::Break(()),
                 false => ControlFlow::Continue(()),
             })
@@ -2835,11 +2821,7 @@ impl GroundProgram {
             if poll.attempt(1) {
                 return Err(Stopped);
             }
-            search(
-                &transitivity(fact[1]),
-                self.transitive_premises(fact[1]),
-                poll,
-            )?;
+            search(&transitivity(fact[1]), Grounding::Transitive(fact[1]), poll)?;
         }
         Ok(bodies)
     }

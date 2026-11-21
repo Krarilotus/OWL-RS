@@ -435,6 +435,9 @@ pub(crate) fn program_until<B: Base + ?Sized>(
     let mut program = rules.program(&source, Predicates::default(), &stage);
     stage.ended()?;
     program.table = rebuild_table(&program, &source, stop)?;
+    if stop() {
+        return Err(Stopped);
+    }
     Ok(program)
 }
 
@@ -1564,9 +1567,10 @@ fn update_body<B: Base + ?Sized>(
     };
     result.lists_read_otherwise =
         matches!(program, Cow::Owned(_)) && reading(&program) != reading(old_program);
-    if lists_changed {
+    if lists_changed && (!old_program.table_rules.is_empty() || !program.table_rules.is_empty()) {
         // Temporary programs grow monotonically through insertion rounds.
-        // The cached one uses the final forms and carries only their facts.
+        // Reground where a per-cell rule can need retiring or its table can
+        // change. Enumerated additions already grew the program above.
         let state = Overlay {
             base,
             hidden: &hidden,

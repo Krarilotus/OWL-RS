@@ -1,11 +1,13 @@
 //! Explanations over the engine: violations for reject reports, why a statement holds,
 //! its justifications ([`super::explain_fact`], [`super::justify_fact`]).
 
+use std::{borrow::Cow, cell::OnceCell};
+
 use nrese_engine::{GraphSelector, ReadModel, Snapshot, TermId, Transaction};
 
 use super::{Program, decoded, pattern, triple};
-use crate::delta::VisitsBase;
-use crate::eval::{Probe, Stopped, Visit};
+use crate::delta::{Base, VisitsBase};
+use crate::eval::{GroundProgram, NEVER, Poller, Probe, Stop, Stopped, Visit};
 use crate::ir::{Triple, Violation};
 
 /// What an OWL 2 RL consistency rule's violation means, for reject reports.
@@ -42,6 +44,19 @@ pub fn explain_violation(
     tx: &Transaction<'_>,
     readable: Option<&dyn Fn(Triple) -> bool>,
 ) -> crate::RejectExplanation {
+    explain_violation_until(program, violation, tx, readable, None, NEVER)
+}
+
+/// The refusal under the operation's stop, with its prospective ground program
+/// where already available. If enrichment is stopped, the clash still stands.
+pub fn explain_violation_until(
+    program: &Program,
+    violation: &Violation,
+    tx: &Transaction<'_>,
+    readable: Option<&dyn Fn(Triple) -> bool>,
+    ground: Option<&GroundProgram>,
+    stop: Stop<'_>,
+) -> crate::RejectExplanation {
     use crate::ir::{Head, Term};
     let decode = |id: u64| decoded(tx.decode(TermId::from_raw(id)), id);
     let value = |term: Term| match term {
@@ -52,6 +67,7 @@ pub fn explain_violation(
     let mut evidence: Vec<crate::RejectEvidence> = Vec::new();
     let mut list_evidence = Vec::new();
     let mut via = Vec::new();
+    let proof = OnceCell::new();
     if let Some(rule) = program
         .rules
         .iter()
@@ -83,22 +99,52 @@ pub fn explain_violation(
             });
             if !asserted
                 && readable.is_none()
-                && program.lists.is_some()
-                && let Some(steps) = explain_fact(program, &tx.pending_snapshot(), [s, p, o], None)
-                && let Some(name @ ("prp-spo2" | "prp-key" | "cls-int1")) = steps[0].rule.as_deref()
+                && let Some(vocabulary) = &program.lists
+                && !stop()
+                && vocabulary.may_derive([s, p, o], |bound| {
+                    tx.quads_for_pattern_in(
+                        ReadModel::Materialised,
+                        &pattern(bound, GraphSelector::Any),
+                    )
+                    .next()
+                    .is_some()
+                })
+                && let Some((snapshot, ground)) = proof.get_or_init(|| {
+                    let snapshot = tx.pending_snapshot();
+                    let ground = match ground {
+                        Some(ground) => Cow::Borrowed(ground),
+                        None => Cow::Owned(program.ground_program_until(&snapshot, stop).ok()?),
+                    };
+                    Some((snapshot, ground))
+                })
+                && let Some(poll) = Poller::new(stop)
+                && let Some(explanation) = crate::explain::explain_with_until(
+                    &SnapshotBase {
+                        snapshot,
+                        axioms: &program.axioms,
+                    },
+                    ground,
+                    [s, p, o],
+                    EXPLANATION_BUDGET,
+                    &poll,
+                )
+                && let Some(name @ ("prp-spo2" | "prp-key" | "cls-int1")) =
+                    explanation.steps[0].rule.as_deref()
             {
                 via.push(name.to_owned());
-                for step in steps
-                    .into_iter()
+                for step in explanation
+                    .steps
+                    .iter()
                     .skip(1)
-                    .filter(|step| step.origin == "asserted")
+                    .filter(|step| step.rule.is_none())
                 {
+                    let [subject, predicate, object] = step.fact.map(decode);
                     list_evidence.push(crate::RejectEvidence {
                         role: "premise",
-                        subject: step.subject,
-                        predicate: step.predicate,
-                        object: step.object,
-                        origin: step.origin.to_owned(),
+                        subject,
+                        predicate,
+                        object,
+                        origin: "asserted".to_owned(),
                     });
                 }
             }
@@ -187,11 +233,23 @@ pub fn explain_fact(
     fact: Triple,
     readable: Option<&dyn Fn(Triple) -> bool>,
 ) -> Option<Vec<InferenceStep>> {
+    explain_fact_until(program, snapshot, fact, readable, NEVER)
+}
+
+/// [`explain_fact`] under the caller's stop.
+pub fn explain_fact_until(
+    program: &Program,
+    snapshot: &Snapshot,
+    fact: Triple,
+    readable: Option<&dyn Fn(Triple) -> bool>,
+    stop: Stop<'_>,
+) -> Option<Vec<InferenceStep>> {
     let base = SnapshotBase {
         snapshot,
         axioms: &program.axioms,
     };
-    let explanation = crate::explain::explain(&base, program.rules(), fact, EXPLANATION_BUDGET)?;
+    let explanation =
+        crate::explain::explain_until(&base, program.rules(), fact, EXPLANATION_BUDGET, stop)?;
     let decode = |id: u64| decoded(snapshot.decode(TermId::from_raw(id)), id);
     Some(
         explanation
@@ -286,12 +344,28 @@ pub fn justify_fact(
     mode: JustificationMode,
     readable: Option<&dyn Fn(Triple) -> bool>,
 ) -> Option<JustificationAnswer> {
+    justify_fact_until(program, snapshot, fact, mode, readable, NEVER)
+}
+
+/// [`justify_fact`] under the caller's stop.
+pub fn justify_fact_until(
+    program: &Program,
+    snapshot: &Snapshot,
+    fact: Triple,
+    mode: JustificationMode,
+    readable: Option<&dyn Fn(Triple) -> bool>,
+    stop: Stop<'_>,
+) -> Option<JustificationAnswer> {
     let base = SnapshotBase {
         snapshot,
         axioms: &program.axioms,
     };
-    let ground = crate::delta::program(&base, program.rules());
-    let graph = crate::explain::proof_graph(&base, &ground, fact, EXPLANATION_BUDGET)?;
+    let poll = Poller::new(stop)?;
+    if !base.contains(fact, &poll).ok()? {
+        return None;
+    }
+    let ground = crate::delta::program_until(&base, program.rules(), stop).ok()?;
+    let graph = crate::explain::proof_graph(&base, &ground, fact, EXPLANATION_BUDGET, &poll)?;
     let (sets, complete) = match mode {
         JustificationMode::One => (graph.one().into_iter().collect(), graph.complete),
         JustificationMode::Core => (vec![graph.core()], graph.complete),
@@ -318,11 +392,14 @@ pub fn justify_fact(
                 .proof_from(&|a| set.binary_search(a).is_ok())
                 .is_some_and(|proof| {
                     proof
-                        .check(&|step| crate::explain::valid_step(&base, &ground, step))
+                        .check(&|step| crate::explain::valid_step(&base, &ground, step, &poll))
                         .is_ok()
                 })
         })),
     };
+    if poll.stopped() || stop() {
+        return None;
+    }
     let decode = |id: u64| decoded(snapshot.decode(TermId::from_raw(id)), id);
     let statement = |fact: Triple| {
         if readable.is_some_and(|readable| !readable(fact)) {
@@ -373,7 +450,6 @@ impl VisitsBase for SnapshotBase<'_> {
         }
     }
 
-    // Explanations read to their end (`Poller::never()`).
     fn size(&self, bound: [Option<u64>; 3], _: Probe<'_, '_>) -> Result<usize, Stopped> {
         let count = self
             .snapshot

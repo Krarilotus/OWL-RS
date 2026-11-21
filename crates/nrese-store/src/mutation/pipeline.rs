@@ -333,7 +333,14 @@ impl MutationPipeline {
                 // explain; the change is rejected all the same. The operator's record
                 // holds the whole first violation, whoever committed.
                 let explanation = violations.first().map(|violation| {
-                    crate::reasoning::explain_violation(program, &violation, &tx, None)
+                    nrese_reasoner::engine::explain_violation_until(
+                        program,
+                        &violation,
+                        &tx,
+                        None,
+                        changed.as_ref().or(cached),
+                        &|| operation.fired(),
+                    )
                 });
                 let attribution = explanation.as_ref().and_then(|explanation| {
                     attribute_reject_delta(explanation, &MutationDeltaPreview::of(&tx))

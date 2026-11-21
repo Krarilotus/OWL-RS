@@ -2321,18 +2321,21 @@ impl StoreService {
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
         };
+        let explain = |readable| {
+            self.proof_within(|stop| {
+                nrese_reasoner::engine::explain_fact_until(
+                    &program, &snapshot, fact, readable, stop,
+                )
+            })
+        };
         let crate::ReadScope::Graphs(access) = scope else {
-            return Ok(crate::reasoning::explain_fact(
-                &program, &snapshot, fact, None,
-            ));
+            return explain(None);
         };
         let readable = |fact: [u64; 3]| {
             crate::support::asserted(&snapshot, access.as_ref(), fact)
                 == crate::support::Asserted::InReach
         };
-        let Some(steps) =
-            crate::reasoning::explain_fact(&program, &snapshot, fact, Some(&readable))
-        else {
+        let Some(steps) = explain(Some(&readable))? else {
             return Ok(None);
         };
         let visible = match steps.first().map(|step| step.origin) {
@@ -2374,10 +2377,15 @@ impl StoreService {
         let Some(fact) = Self::fact_of(&snapshot, statement) else {
             return Ok(None);
         };
+        let justify = |readable| {
+            self.proof_within(|stop| {
+                nrese_reasoner::engine::justify_fact_until(
+                    &program, &snapshot, fact, mode, readable, stop,
+                )
+            })
+        };
         let crate::ReadScope::Graphs(access) = scope else {
-            return Ok(crate::reasoning::justify_fact(
-                &program, &snapshot, fact, mode, None,
-            ));
+            return justify(None);
         };
         let readable = |fact: [u64; 3]| {
             crate::support::asserted(&snapshot, access.as_ref(), fact)
@@ -2387,13 +2395,16 @@ impl StoreService {
         if !visible {
             return Ok(None);
         }
-        Ok(crate::reasoning::justify_fact(
-            &program,
-            &snapshot,
-            fact,
-            mode,
-            Some(&readable),
-        ))
+        justify(Some(&readable))
+    }
+
+    fn proof_within<T>(
+        &self,
+        read: impl FnOnce(nrese_reasoner::eval::Stop<'_>) -> Option<T>,
+    ) -> StoreResult<Option<T>> {
+        let memory = self.memory_stop();
+        let answer = read(&|| memory.exceeded());
+        memory.error(Default::default()).map_or(Ok(answer), Err)
     }
 
     /// `program` with its constants by the snapshot's ids, without the writer: a constant
