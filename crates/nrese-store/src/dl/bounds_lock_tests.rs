@@ -554,7 +554,8 @@ fn a_view_build_that_panics_tells_its_waiting_read_the_build_failed_not_a_later_
             .prepare_query(&crate::SparqlQueryRequest::all(QUERY))
             .unwrap(),
     );
-    let joined = {
+    let (answer, answered) = mpsc::channel();
+    {
         let store = Arc::clone(&store);
         std::thread::spawn(move || {
             let mut out = Vec::new();
@@ -564,13 +565,15 @@ fn a_view_build_that_panics_tells_its_waiting_read_the_build_failed_not_a_later_
                 .expect("an answer, not an error")
                 .expect("a DL status");
             let reasons: Vec<String> = status.reasons.iter().map(|r| r.text.to_string()).collect();
-            (String::from_utf8(out).unwrap(), status.complete, reasons)
-        })
-    };
+            let _ = answer.send((String::from_utf8(out).unwrap(), status.complete, reasons));
+        });
+    }
     until(|| asleep(&store, revision));
     go.send(()).unwrap();
     assert!(builder.join().is_err(), "the view build panicked");
-    let (answer, complete, reasons) = joined.join().expect("the joined read answers");
+    let (answer, complete, reasons) = answered
+        .recv_timeout(Duration::from_secs(30))
+        .expect("the joined read answers");
     assert!(
         answer.contains("true") && !answer.contains("false"),
         "{answer}"

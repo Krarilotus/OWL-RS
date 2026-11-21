@@ -363,6 +363,48 @@ fn a_waiter_with_a_deadline_leaves_at_it_while_the_build_runs_on() {
     assert_eq!(cell.ends().kept, 1);
 }
 
+/// Spec (`Build::join`): an end recorded by the time a waiter's stop has fired is told, not
+/// left, and the stop is asked with no lock of the build's held. Here the stop itself ends
+/// the build (the end lands between the waiter's first read of it and its stop), and the
+/// waiter is told that end, for an opaque build and for a sliced one. Each case runs on a
+/// thread of its own, its answer bounded: a stop asked under the build's `state` never
+/// returns once it ends the build.
+#[test]
+fn a_waiter_whose_stop_fires_once_the_build_has_ended_is_told_the_end() {
+    let case = |kind: Kind| {
+        let (tell, heard) = mpsc::channel();
+        std::thread::spawn(move || {
+            let cell: BuildCell<u64, u64> = BuildCell::default();
+            let Claim::Build(builder) = cell.claim(7, kind, || None) else {
+                panic!("absent.claim builds");
+            };
+            let Claim::Wait(build) = cell.claim(7, kind, || None) else {
+                panic!("building.claim joins");
+            };
+            let builder = Mutex::new(Some(builder));
+            let stop = || {
+                let taken = lock(&builder).take();
+                if let Some(builder) = taken {
+                    builder.end(End::Kept(Arc::new(5)));
+                }
+                true
+            };
+            let told = match build.join(None, &stop) {
+                Joined::Told(end) => value(&end),
+                Joined::Busy | Joined::Left => None,
+            };
+            let _ = tell.send(told);
+        });
+        (kind, heard.recv_timeout(PATIENCE).ok().flatten())
+    };
+    let told: Vec<_> = [Kind::Opaque, Kind::Sliced].into_iter().map(case).collect();
+    assert_eq!(
+        told,
+        [(Kind::Opaque, Some(5)), (Kind::Sliced, Some(5))],
+        "a waiter left (or hung) though the build had ended when its stop fired"
+    );
+}
+
 /// An opaque build in progress: a pool thread is turned away at once, a thread off the
 /// pool sleeps until the builder finishes, and a builder that ends without a value
 /// wakes it with none. What's kept is charged until it's dropped.

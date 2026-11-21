@@ -781,6 +781,78 @@ fn a_reader_waiting_on_anothers_build_leaves_at_its_cancellation_and_the_build_g
     );
 }
 
+/// Spec (`get_or_build`: a kept value is answered; `None` once `stop` has fired, the caller
+/// then building nothing): with a slot's build held by the test, a reader whose stop has
+/// fired builds nothing where that build is busy to its pool thread, or ends with no value
+/// while it waits; and a kept value is answered without joining a build under way. Three
+/// cases, each run before the test answers.
+#[test]
+fn a_reader_whose_stop_fired_builds_nothing_and_a_kept_value_joins_no_build() {
+    use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
+    let mut wrong = Vec::new();
+    // Case 1: on a pool thread, its stop fired: the build under way is busy to it.
+    {
+        let slot: Slot<u64> = Slot::default();
+        let Claim::Build(_held) = slot.build.claim((), Kind::Opaque, || None) else {
+            panic!("the first claim builds");
+        };
+        let built = AtomicUsize::new(0);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let got = pool.install(|| {
+            get_or_build(&slot, &|| true, || {
+                built.fetch_add(1, SeqCst);
+                3
+            })
+        });
+        if got.is_some() || built.load(SeqCst) > 0 {
+            wrong.push("busy to a pool thread");
+        }
+    }
+    // Case 2: off the pool, the build it waits for ends with no value (abandoned), and its
+    // stop fires with it: the stop reads the cell, so no timing tells the two apart.
+    {
+        let slot: Arc<Slot<u64>> = Arc::default();
+        let built = Arc::new(AtomicUsize::new(0));
+        let Claim::Build(held) = slot.build.claim((), Kind::Opaque, || None) else {
+            panic!("the first claim builds");
+        };
+        let (answer, answered) = std::sync::mpsc::channel();
+        {
+            let (slot, built) = (Arc::clone(&slot), Arc::clone(&built));
+            std::thread::spawn(move || {
+                let stop = || slot.build.is_idle();
+                let got = get_or_build(&slot, &stop, || {
+                    built.fetch_add(1, SeqCst);
+                    3
+                });
+                let _ = answer.send(got);
+            });
+        }
+        until(|| slot.build.waiting(&()) >= 1, "the reader never waited");
+        drop(held);
+        let got = answered.recv_timeout(PATIENCE);
+        if !matches!(got, Ok(None)) || built.load(SeqCst) > 0 {
+            wrong.push("abandoned while it waited");
+        }
+    }
+    // Case 3: a value kept while its build is still under way (kept, not yet ended), off
+    // the pool, its stop fired: the kept value.
+    {
+        let slot: Slot<u64> = Slot::default();
+        let Claim::Build(_held) = slot.build.claim((), Kind::Opaque, || None) else {
+            panic!("the first claim builds");
+        };
+        let _ = slot.kept.set(Arc::new(5));
+        if get_or_build(&slot, &|| true, || 3) != Some(5) {
+            wrong.push("kept, a build under way");
+        }
+    }
+    assert!(wrong.is_empty(), "wrong at: {wrong:?}");
+}
+
 /// Spec (`Supports::view`: a computation it waited for that another reader's cancellation
 /// stopped is made again, by this read): B, joined to A's build of the re-derived facts,
 /// reads again once A's cancellation ends that build, and answers.
