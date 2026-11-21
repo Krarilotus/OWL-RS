@@ -320,26 +320,40 @@ fn nil_alias_terminates_a_list() {
 fn rest_alias_links_list_cells() {
     // Spec: Table 4 eq-rep-p lets an alias of rdf:rest supply the edge
     // in the Table 3 list, so Table 5 prp-spo2 derives the chain row.
-    let fixture = case(
+    check_rest_alias(rest_alias_fixture("ex:r"));
+}
+
+#[test]
+fn mixed_rest_spellings_link_the_same_list() {
+    // Spec: Table 4 eq-rep-p lets the two spellings supply different steps
+    // of the same Table 3 list. Table 5 prp-spo2 derives its chain row.
+    check_rest_alias(rest_alias_fixture("rdf:rest"));
+}
+
+fn check_rest_alias(fixture: Case) {
+    check_vocabulary_alias(fixture, "http://example.org/r", nrese_rdf::vocab::rdf::REST);
+}
+
+fn rest_alias_fixture(head_rest: &str) -> Case {
+    case(
         "rest-alias",
         ["ex:a", "ex:out", "ex:c"],
         vec![
             insert("ex:r ex:marker ex:y"),
-            insert(
+            insert(&format!(
                 "
             rdf:rest owl:sameAs ex:r
             ex:out owl:propertyChainAxiom ex:h
             ex:h rdf:first ex:p
-            ex:h ex:r ex:t
+            ex:h {head_rest} ex:t
             ex:t rdf:first ex:q
             ex:t ex:r rdf:nil
             ex:a ex:p ex:b
             ex:b ex:q ex:c
         ",
-            ),
+            )),
         ],
-    );
-    check_vocabulary_alias(fixture, "http://example.org/r", nrese_rdf::vocab::rdf::REST);
+    )
 }
 
 fn check_vocabulary_alias(fixture: Case, alias: &str, vocabulary: nrese_rdf::NamedNodeRef<'_>) {
