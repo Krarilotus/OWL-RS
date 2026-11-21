@@ -121,7 +121,7 @@ pub fn assert_triples_round_trip(o: &Ontology, table: &mut Table) {
     assert_round_trip(&binary(o), table);
 }
 
-const EVERYTHING: &str = r#"Prefix(:=<http://example.com/>)
+pub const EVERYTHING: &str = r#"Prefix(:=<http://example.com/>)
 Prefix(ex:=<http://example.com/>)
 # A comment; every construct of the grammar once.
 Ontology(<http://example.com/o> <http://example.com/o/1>

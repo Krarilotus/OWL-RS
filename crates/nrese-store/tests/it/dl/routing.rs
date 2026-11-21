@@ -974,10 +974,14 @@ const BUILTIN_ANNOTATIONS: [&str; 9] = [
 /// 16) reads the first three as annotation axioms, which the Direct Semantics give no
 /// meaning (1), and matches the fourth to no pattern, so its graph is no OWL 2 DL ontology.
 /// No read is entailed: an answer `true` is told `unsound` with the annotation reason, on
-/// the RL route and off it.
+/// the RL route and off it. The sub-property axiom names both its properties, so it reads
+/// `:p` as an annotation property, and `:p`'s assertion as a data or object property,
+/// declared or not: a name of two kinds an axiom reads (Structural Specification 5.8.1),
+/// and the reason is that one.
 #[test]
 fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
     let common = ":C a owl:Class . :x a owl:NamedIndividual . :v a owl:NamedIndividual .";
+    let (annotation, two_kinds) = ("annotation-property axioms", "a name used as two kinds");
     let mut cases = Vec::new();
     for a in BUILTIN_ANNOTATIONS.into_iter().chain([":note"]) {
         let declared = format!("{a} a owl:AnnotationProperty . ");
@@ -992,18 +996,22 @@ fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
                 (
                     format!("{decl}{a} rdfs:domain :C . :x {a} \"x\" ."),
                     "ASK { :x a :C }".into(),
+                    annotation,
                 ),
                 (
                     format!("{decl}{a} rdfs:domain :C . :x {a} :v ."),
                     "ASK { :x a :C }".into(),
+                    annotation,
                 ),
                 (
                     format!("{decl}{a} rdfs:range :C . :x {a} :v ."),
                     "ASK { :v a :C }".into(),
+                    annotation,
                 ),
                 (
                     format!("{decl}{a} rdfs:subPropertyOf :sup . {sub} :x {a} :v ."),
                     "ASK { :x :sup :v }".into(),
+                    annotation,
                 ),
             ]);
         }
@@ -1019,20 +1027,20 @@ fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
             (":p a owl:ObjectProperty . ", ":v"),
         ] {
             let data = format!("{note}{kind}:p rdfs:subPropertyOf {a} . :x :p {value} .");
-            cases.push((data, format!("ASK {{ :x {a} {value} }}")));
+            cases.push((data, format!("ASK {{ :x {a} {value} }}"), two_kinds));
         }
     }
     let mut wrong = Vec::new();
-    for (data, read) in &cases {
+    for (data, read, reason) in &cases {
         for extra in ["", OUTSIDE_RL] {
             let dl = pipeline();
             insert(&dl, &format!("{data} {common} {extra}")).expect("committed");
             let (rows, status) = query(&dl, read);
             let (label, reasons) = (status.shared.as_str(), status.reasons());
-            let marked = reasons
-                .iter()
-                .any(|r| r.contains("annotation-property axioms"));
-            if rows == ["true"] && !(label == "unsound" && marked) {
+            let marked = reasons.iter().any(|r| r.contains(reason));
+            // The split: a name only an annotation property is no name of two kinds.
+            let split = *reason == two_kinds || !reasons.iter().any(|r| r.contains(two_kinds));
+            if rows == ["true"] && !(label == "unsound" && marked && split) {
                 wrong.push(format!("{data} {extra} / {read}: {label} {reasons:?}"));
             }
         }
@@ -1569,11 +1577,14 @@ fn a_list_axiom_the_rules_leave_out_leaves_the_rl_route() {
             "ASK { :a0 :p :a7 }",
             false,
         ),
+        // No equality, but its list cells are individuals of an assertion (`:alias`), so
+        // the reader takes them for structures the rules may read more of (`Unused`
+        // `reads_more`), which leave the route as a list left out does.
         (
             "chain 7",
             aliased_chain(false).replace("owl:sameAs _:l", ":alias _:n"),
             "ASK { :a0 :p :a7 }",
-            true,
+            false,
         ),
     ];
     let mut wrong = Vec::new();

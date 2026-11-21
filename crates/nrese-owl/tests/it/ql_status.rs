@@ -5,7 +5,7 @@
 //! each a small ontology that raises it.
 
 use nrese_owl::ql::{Closure, Tbox};
-use nrese_owl::{Diagnostic, Ontology, read, read_functional};
+use nrese_owl::{Diagnostic, EntityKind, Ontology, read, read_functional};
 
 use super::{Table, load};
 
@@ -73,12 +73,54 @@ fn cells() -> Vec<Cell> {
             expect: Expect::Complete,
         },
         Cell {
-            kind: "AmbiguousProperty",
-            is: |d| matches!(d, Diagnostic::AmbiguousProperty { .. }),
+            kind: "TwoKinds (object and data property, by an axiom)",
+            is: |d| {
+                matches!(
+                    d,
+                    Diagnostic::TwoKinds {
+                        kinds: [EntityKind::ObjectProperty, EntityKind::DataProperty],
+                        by_axiom: true,
+                        ..
+                    }
+                )
+            },
             source: Turtle(
                 "ex:p a owl:ObjectProperty , owl:DatatypeProperty . ex:p rdfs:domain ex:C .",
             ),
             expect: Expect::LeftOut,
+        },
+        Cell {
+            kind: "TwoKinds (class and datatype, by an axiom)",
+            is: |d| {
+                matches!(
+                    d,
+                    Diagnostic::TwoKinds {
+                        kinds: [EntityKind::Class, EntityKind::Datatype],
+                        by_axiom: true,
+                        ..
+                    }
+                )
+            },
+            source: Turtle(
+                "ex:T a owl:Class , rdfs:Datatype .
+                 ex:p a owl:DatatypeProperty ; rdfs:range ex:T .",
+            ),
+            expect: Expect::LeftOut,
+        },
+        Cell {
+            kind: "TwoKinds (object and data property, assertions only)",
+            is: |d| {
+                matches!(
+                    d,
+                    Diagnostic::TwoKinds {
+                        kinds: [EntityKind::ObjectProperty, EntityKind::DataProperty],
+                        by_axiom: false,
+                        ..
+                    }
+                )
+            },
+            source: Turtle("ex:a ex:creator \"N\" . ex:b ex:creator ex:n ."),
+            expect: Expect::Complete,
         },
         Cell {
             kind: "Unsupported",
@@ -102,6 +144,23 @@ fn cells() -> Vec<Cell> {
             source: Turtle(
                 "ex:p a owl:ObjectProperty .
                  [ a owl:Restriction ; owl:onProperty ex:p ; owl:someValuesFrom ex:C ] .",
+            ),
+            expect: Expect::Complete,
+        },
+        Cell {
+            kind: "Unused (the rules may read more of it)",
+            is: |d| {
+                matches!(
+                    d,
+                    Diagnostic::Unused {
+                        reads_more: true,
+                        ..
+                    }
+                )
+            },
+            source: Turtle(
+                "_:x owl:intersectionOf ( ex:A ex:B ) ; owl:onProperty ex:p ;
+                     owl:allValuesFrom ex:D .",
             ),
             expect: Expect::Complete,
         },
@@ -175,12 +234,13 @@ fn ontology(table: &mut Table, source: &Source) -> Ontology {
 /// Spec (the rule, `nrese_owl::Diagnostic` and the QL TBox, I24c-2): every diagnostic kind
 /// the reader has, raised by a small ontology under `owl2-ql`'s closure. Where the reader
 /// leaves an axiom out or alters it (a structure it can't read, OWL vocabulary outside the
-/// mapping, text not read, a reserved name used as an entity, a property declared both an
-/// object and a data property, a rule beside the ontology), the TBox's hazard is global and
-/// says the reader's own words for one of them. Where it reads every axiom as the source
-/// states it (a shared blank node, an undeclared property typed by its use, a structure no
-/// axiom uses, a non-simple property, a disjointness repeating an operand), it raises no
-/// global hazard. An anonymous individual stands only in `hasValue` or `oneOf`, outside
+/// mapping, text not read, a reserved name used as an entity, a name of two kinds an axiom
+/// names in one of them, which the reader reads as one name, a rule beside the ontology),
+/// the TBox's hazard is global and says the reader's own words for one of them. Where it
+/// reads every axiom as the source states it (a shared blank node, an undeclared property
+/// typed by its use, a name of two kinds only assertions use, each read by its value, a
+/// structure no axiom uses, whatever the OWL 2 RL rules read of it, a non-simple property,
+/// a disjointness repeating an operand), it raises no global hazard. An anonymous individual stands only in `hasValue` or `oneOf`, outside
 /// OWL 2 QL, whose global hazard is the TBox's own: never the reader's, even beside an
 /// axiom the reader leaves out (the more specific reason comes first).
 #[test]
@@ -214,6 +274,56 @@ fn every_axiom_the_reader_leaves_out_or_alters_lowers_the_rewritings_claim() {
             wrong.push(format!(
                 "{}: the global hazard {global:?}, the reader's diagnostics {:?}",
                 cell.kind, o.diagnostics
+            ));
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Spec (*Mapping to RDF* §3.2.5 and Table 16, as the reader types an undeclared property by
+/// its values; the arm of `TwoKinds` without `by_axiom` above): a property no declaration or
+/// other axiom names, given a literal and an individual, is read assertion by assertion as
+/// the source states each: the literal's a data property assertion, the individual's an
+/// object property assertion, neither left out nor read as the other kind, so it alters no
+/// axiom. Declared an object property, the literal's assertion is left out (`Malformed`),
+/// which alters the ontology.
+#[test]
+fn a_name_of_two_kinds_only_assertions_use_is_read_as_each_states_it() {
+    use nrese_owl::{Axiom, TermKind, Terms};
+    let assertions = "ex:a ex:creator \"N\" . ex:b ex:creator ex:n .";
+    let rows = [
+        ("undeclared", String::new(), true, false),
+        (
+            "declared an object property",
+            "ex:creator a owl:ObjectProperty . ".to_owned(),
+            false,
+            true,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (case, declaration, data_kept, alters) in rows {
+        let mut table = Table::default();
+        let statements = load(&mut table, &format!("{declaration}{assertions}"));
+        let o = read(&statements, &table);
+        let id = |local: &str| table.iri(&format!("{}{local}", super::EX)).expect("a term");
+        let (creator, a, b, n) = (id("creator"), id("a"), id("b"), id("n"));
+        let literal = statements
+            .iter()
+            .map(|s| s.triple[2])
+            .find(|&t| table.kind(t) == TermKind::Literal)
+            .expect("the literal");
+        let data = o
+            .axioms
+            .contains(&Axiom::DataPropertyAssertion(creator, a, literal));
+        let object = o
+            .axioms
+            .contains(&Axiom::ObjectPropertyAssertion(creator, b, n));
+        let altered = o.diagnostics.iter().any(Diagnostic::alters_axioms);
+        if (data, object, altered) != (data_kept, true, alters) {
+            wrong.push(format!(
+                "{case}: the data assertion {data}, the object assertion {object}, altered \
+                 {altered}; the axioms {:?}, the diagnostics {:?}",
+                o.axioms, o.diagnostics
             ));
         }
     }

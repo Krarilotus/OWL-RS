@@ -889,13 +889,15 @@ pub fn punned(o: &Ontology) -> Vec<Term> {
 /// theorem PR1 (OWL 2 Profiles §4.3) excludes, or an empty intersection or union
 /// ([`Ontology::empty_list`]), which they don't read, or a list's cell used outside its list
 /// ([`Ontology::list_cell_outside`]), which they may equate with another and so read
-/// sequences the graph doesn't write. The one detection the route, the answers' status and
-/// the consistency verdicts take.
+/// sequences the graph doesn't write, or a name of two kinds or a structure no axiom uses that
+/// the rules read otherwise ([`crate::Diagnostic::reads_otherwise`]). The one detection the
+/// route, the answers' status and the consistency verdicts take.
 pub fn rules_read_differently(o: &Ontology) -> bool {
     !o.annotation_schema.is_empty()
         || !punned(o).is_empty()
         || o.empty_list.is_some()
         || o.list_cell_outside.is_some()
+        || o.diagnostics.iter().any(crate::Diagnostic::reads_otherwise)
 }
 
 /// The profiles every axiom of `o` is in.

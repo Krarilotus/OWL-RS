@@ -16,13 +16,13 @@
 //!   [`Diagnostic::Rule`].
 //! - **Never silent:** whatever can't be read is a [`Diagnostic::Syntax`] with its line
 //!   and column, and the axiom it is in is left out; reading goes on after it. What OWL 2
-//!   DL forbids is diagnosed as for RDF: a property declared or used as two of object,
-//!   data and annotation property, and the global restrictions.
+//!   DL forbids is diagnosed as for RDF, by the same checks: a name used as two kinds
+//!   ([`crate::typing`]), and the global restrictions.
 
 mod lex;
 mod parse;
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::diagnostics::Diagnostic;
 use crate::mapping::{BuiltinProperties, Ontology, Terms};
@@ -51,14 +51,6 @@ pub struct Document {
     pub imports: Vec<String>,
 }
 
-/// What how a term is used says it is (for the typing diagnostics).
-#[derive(Debug, Clone, Copy, Default)]
-pub(super) struct Uses {
-    object: bool,
-    data: bool,
-    annotation: bool,
-}
-
 /// The model being read, over every document read so far.
 #[derive(Default)]
 pub(super) struct Model {
@@ -68,7 +60,10 @@ pub(super) struct Model {
     pub diagnostics: Vec<Diagnostic>,
     pub annotations: usize,
     pub annotation_schema: Vec<Term>,
-    pub uses: HashMap<Term, Uses>,
+    /// [`Ontology::annotation_uses`].
+    pub annotation_uses: BTreeSet<Term>,
+    /// [`Ontology::annotation_axioms`].
+    pub annotation_axioms: BTreeSet<Term>,
     pub rules: Vec<crate::rules::Rule>,
     pub qualified_data_max: Option<Term>,
 }
@@ -100,18 +95,6 @@ impl<'a> FunctionalReader<'a> {
     pub fn finish(self) -> Ontology {
         let terms: &dyn Terms = &*self.terms;
         let mut model = self.model;
-        let mut ambiguous: Vec<Term> = model
-            .uses
-            .iter()
-            .filter(|(_, u)| (u.object && u.data) || (u.annotation && (u.object || u.data)))
-            .map(|(&t, _)| t)
-            .collect();
-        ambiguous.sort_unstable();
-        for property in ambiguous {
-            model
-                .diagnostics
-                .push(Diagnostic::AmbiguousProperty { property });
-        }
         for rule in 0..model.rules.len() {
             model.diagnostics.push(Diagnostic::Rule { rule });
         }
@@ -120,6 +103,8 @@ impl<'a> FunctionalReader<'a> {
         model.annotation_schema.dedup();
         let mut ontology = Ontology {
             annotation_schema: model.annotation_schema,
+            annotation_uses: model.annotation_uses,
+            annotation_axioms: model.annotation_axioms,
             shacl: BTreeSet::new(),
             classes: model.classes,
             ranges: model.ranges,

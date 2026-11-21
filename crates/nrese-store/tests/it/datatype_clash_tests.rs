@@ -41,6 +41,20 @@ struct Clash {
     name: &'static str,
     writes: Vec<String>,
     pairs: usize,
+    /// The clash runs through a part that isn't OWL 2 DL (a literal under `owl:sameAs`),
+    /// which the reader leaves out: under `owl2-dl` its consistency is undecided, not refuted.
+    left_out: bool,
+}
+
+impl Clash {
+    /// The consistency a full closure under `mode` is told, and a commit's refusal.
+    fn told(&self, mode: ReasoningMode) -> (&'static str, &'static str) {
+        if self.left_out && mode == ReasoningMode::Owl2Dl {
+            ("other", "refused as undecided")
+        } else {
+            ("inconsistent", "refused")
+        }
+    }
 }
 
 /// Every clashing data set the tests read.
@@ -60,6 +74,7 @@ fn clashes() -> Vec<Clash> {
             .chain(values.iter().map(|v| format!(":x :p {v} .")))
             .collect(),
         pairs,
+        left_out: false,
     };
     let first = |name, seed: &str, rest: &str| Clash {
         name,
@@ -68,6 +83,7 @@ fn clashes() -> Vec<Clash> {
             format!("{SCHEMA} :x :p {seed}, {rest} ."),
         ],
         pairs: 1,
+        left_out: false,
     };
     let plus = "\"+42\"^^xsd:integer, \"+43\"^^xsd:integer";
     vec![
@@ -80,6 +96,7 @@ fn clashes() -> Vec<Clash> {
             name: "a",
             writes: vec![":a owl:sameAs 42, 43 .".to_owned()],
             pairs: 1,
+            left_out: true,
         },
         first("b", UNJUDGED, plus),
         first("b-ill-typed", "\"x\"^^xsd:integer", plus),
@@ -89,6 +106,7 @@ fn clashes() -> Vec<Clash> {
                 "{SCHEMA} :p rdfs:range xsd:integer . :x :p 42, \"bad\"^^xsd:integer ."
             )],
             pairs: 1,
+            left_out: false,
         },
     ]
 }
@@ -127,6 +145,9 @@ fn commit(pipeline: &MutationPipeline, data: &str) -> String {
         Ok(_) => "applied".to_owned(),
         Err(MutationError::Rejected(r)) if r.kind == RejectKind::Inconsistent => {
             "refused".to_owned()
+        }
+        Err(MutationError::Rejected(r)) if r.kind == RejectKind::Undecided => {
+            "refused as undecided".to_owned()
         }
         Err(e) => format!("failed: {e:?}"),
     }
@@ -192,9 +213,10 @@ fn rebuilt(setting: &str, mode: ReasoningMode, way: &str, writes: &[String]) -> 
 /// holding two different values or an ill-typed member under a range, is a clash whichever
 /// member of the class is its representative (an IRI, a literal no check judges, an
 /// ill-typed literal): every full closure finds it, under every equality setting, and the
-/// store is inconsistent and in quarantine. Each pair is reported once: a closure listing
-/// every equality reports every clashing pair; a compact one at least one per class, and
-/// never more than there are.
+/// store is inconsistent and in quarantine (under `owl2-dl`, a clash through a part the
+/// reader leaves out is undecided instead, still in quarantine). Each pair is reported once:
+/// a closure listing every equality reports every clashing pair; a compact one at least one
+/// per class, and never more than there are.
 #[test]
 fn a_class_holding_two_different_values_clashes_in_every_full_closure() {
     let mut wrong = Vec::new();
@@ -203,13 +225,14 @@ fn a_class_holding_two_different_values_clashes_in_every_full_closure() {
             for way in WAYS {
                 for clash in clashes() {
                     let found = rebuilt(setting, mode, way, &clash.writes);
+                    let (told, _) = clash.told(mode);
                     let expected: Vec<String> = if setting == "compact" {
                         (1..=clash.pairs).collect()
                     } else {
                         vec![clash.pairs]
                     }
                     .into_iter()
-                    .map(|n| format!("violations {n}, inconsistent, quarantined true"))
+                    .map(|n| format!("violations {n}, {told}, quarantined true"))
                     .collect();
                     if !expected.contains(&found) {
                         wrong.push(format!(
@@ -244,16 +267,18 @@ fn one_value_in_two_lexical_forms_is_no_clash_in_any_full_closure() {
 
 /// Spec (the commits' side of the same rules): a commit that makes a clash is refused, as
 /// one commit or as its writes one after another (each functional value its own commit),
-/// under every equality setting; a second lexical form of the same value is accepted.
+/// under every equality setting (as undecided under `owl2-dl` where the clash runs through a
+/// part the reader leaves out); a second lexical form of the same value is accepted.
 #[test]
 fn a_commit_making_a_datatype_clash_is_refused() {
     let mut wrong = Vec::new();
     for setting in SETTINGS {
         for mode in MODES {
             for clash in clashes() {
+                let (_, refused) = clash.told(mode);
                 let one = store(setting);
                 let outcome = commit(&pipeline(&one, mode), &clash.writes.join(" "));
-                if outcome != "refused" {
+                if outcome != refused {
                     wrong.push(format!(
                         "{setting}, {mode:?}, {}: one commit {outcome}",
                         clash.name
@@ -265,7 +290,7 @@ fn a_commit_making_a_datatype_clash_is_refused() {
                 let writer = pipeline(&each, mode);
                 let outcomes: Vec<String> =
                     clash.writes.iter().map(|w| commit(&writer, w)).collect();
-                let first = outcomes.iter().position(|o| o == "refused");
+                let first = outcomes.iter().position(|o| o == refused);
                 if first.is_none_or(|n| outcomes[..n].iter().any(|o| o != "applied"))
                     || outcomes.iter().any(|o| o.starts_with("failed"))
                 {

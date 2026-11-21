@@ -227,7 +227,7 @@ fn check_with_budget(
         Some(ontology) => ontology,
         None => {
             source::intern_vocabulary(tx);
-            match source::read_pending(tx, memory.clone()) {
+            match source::read_pending(tx, memory.clone(), &store.config().dl.treatments) {
                 Ok(ontology) => ontology,
                 // Unknown, never consistent: the check didn't run.
                 Err(_) => {
@@ -258,6 +258,7 @@ fn check_with_budget(
     }
     // Inconsistent after the commit: rejected unless it was so before (quarantine).
     let before = tx.base().revision();
+    let treatments = &store.config().dl.treatments;
     let was_inconsistent = match store.dl().status() {
         Some(DlStatus {
             revision,
@@ -265,7 +266,7 @@ fn check_with_budget(
             ..
         }) if revision == before => consistency.verdict == Verdict::Inconsistent,
         // Unread, as undecided: not known to have been inconsistent, so rejected.
-        _ => source::read_snapshot(tx.base(), memory).is_ok_and(|ontology| {
+        _ => source::read_snapshot(tx.base(), memory, treatments).is_ok_and(|ontology| {
             let checked = consistency::check(&ontology, &operation.remaining(deadline));
             checked.verdict == Verdict::Inconsistent
         }),
@@ -276,7 +277,9 @@ fn check_with_budget(
             reject: None,
         };
     }
-    rejection(ontology, view, then, checked, operation, deadline)
+    rejection(
+        ontology, view, then, checked, operation, deadline, treatments,
+    )
 }
 
 /// What a restricted committer is told of a rejection ([`crate::mutation::evidence`]),
@@ -298,6 +301,7 @@ fn rejection(
     checked: Checked,
     operation: &Budget,
     deadline: Deadline,
+    treatments: &nrese_owl::Treatments,
 ) -> Gate {
     let full = || {
         // Why: a minimal set of axioms that has no model, each by its source triples. One
@@ -342,7 +346,9 @@ fn rejection(
         }
     };
     let reject = view.reject(full, |view| {
-        then(view, &|view| view_reason(view, operation, deadline))
+        then(view, &|view| {
+            view_reason(view, operation, deadline, treatments)
+        })
     });
     Gate {
         checked,
@@ -463,10 +469,12 @@ fn view_reason(
     view: &EvidenceView<'_, '_>,
     operation: &Budget,
     deadline: Deadline,
+    treatments: &nrese_owl::Treatments,
 ) -> Option<Draft> {
     let memory = operation.memory.clone().unwrap_or_default();
+    let readable = |graph| view.graph(graph);
     let ontology =
-        source::read_pending_where(view.tx(), memory.clone(), |graph| view.graph(graph)).ok()?;
+        source::read_pending_where(view.tx(), memory.clone(), readable, treatments).ok()?;
     let candidates = canonical_candidates(view.tx(), &ontology, memory, deadline)?;
     let justification = super::explain::justify_among(
         &ontology,
@@ -533,7 +541,8 @@ pub(crate) fn view_reason_on_its_budget(
     source::intern_vocabulary(view.tx());
     let deadline = Deadline::after(dl.timeout);
     cancellable(&|| cancelled() || deadline.passed(), |cancel| {
-        view_reason(view, &budget_of(dl, Some(cancel), memory), deadline)
+        let budget = budget_of(dl, Some(cancel), memory);
+        view_reason(view, &budget, deadline, &dl.treatments)
     })
 }
 
@@ -661,7 +670,8 @@ mod tests {
             nrese_rdf::GraphName::DefaultGraph,
         );
         tx.insert(quad.as_ref());
-        let ontology = source::read_pending(&tx, nrese_exec::Envelope::unlimited()).unwrap();
+        let unlimited = nrese_exec::Envelope::unlimited();
+        let ontology = source::read_pending(&tx, unlimited, &Default::default()).unwrap();
         for stop in ["deadline", "cancelled", "running"] {
             let cancel = Cancel::default();
             if stop == "cancelled" {
@@ -685,6 +695,7 @@ mod tests {
                 },
                 &operation,
                 deadline,
+                &Default::default(),
             );
             assert_eq!(gate.checked.verdict, Verdict::Inconsistent);
             let reject = gate.reject.expect("rejected");

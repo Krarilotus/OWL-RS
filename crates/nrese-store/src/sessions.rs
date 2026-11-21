@@ -56,6 +56,9 @@ struct View {
     /// rules had been set when its read began ([`crate::support::Supports::epoch`]).
     epoch: u64,
     snapshot: Snapshot,
+    /// Whether the operations keep their base's record of what the reader left out
+    /// (`dl::bounds::Bounds::keeps_record`).
+    keeps_record: bool,
 }
 
 /// The open sessions of one store.
@@ -242,14 +245,14 @@ impl Sessions {
 
     /// The data as `request` (the session's operations so far, scoped for a reader in
     /// `scope`) leaves the committed data `latest` under the rules set `epoch` times, if a
-    /// read computed it before.
+    /// read computed it before, and whether the operations keep their base's record.
     pub(crate) fn view(
         &self,
         latest: &Snapshot,
         scope: &ReadScope,
         request: &StatementsRequest,
         epoch: u64,
-    ) -> Option<Snapshot> {
+    ) -> Option<(Snapshot, bool)> {
         let id = request.session.as_deref()?;
         let open = self.lock();
         let view = open.get(id)?.view.as_ref()?;
@@ -257,18 +260,19 @@ impl Sessions {
             && view.ops == request.ops.len()
             && view.scope == *scope
             && view.epoch == epoch)
-            .then(|| view.snapshot.clone())
+            .then(|| (view.snapshot.clone(), view.keeps_record))
     }
 
     /// Keeps `snapshot`, the data as `request` leaves `base` under the rules set `epoch`
-    /// times when its read began, for the session's next read; only while those are still
-    /// the rules (`current`): a read that outlived a change of them keeps nothing.
+    /// times when its read began, with whether the operations keep their base's record, for
+    /// the session's next read; only while those are still the rules (`current`): a read
+    /// that outlived a change of them keeps nothing.
     pub(crate) fn keep_view(
         &self,
         base: Snapshot,
         scope: &ReadScope,
         request: &StatementsRequest,
-        snapshot: Snapshot,
+        (snapshot, keeps_record): (Snapshot, bool),
         epoch: u64,
         current: u64,
     ) {
@@ -287,6 +291,7 @@ impl Sessions {
                 scope: scope.clone(),
                 epoch,
                 snapshot,
+                keeps_record,
             });
         }
     }
@@ -350,7 +355,7 @@ mod tests {
                 snapshot.clone(),
                 &ReadScope::All,
                 &request,
-                view,
+                (view, false),
                 epoch,
                 current,
             );
