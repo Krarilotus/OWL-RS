@@ -136,7 +136,8 @@ impl Plan {
     /// - `MIN` and `MAX` (with or without `DISTINCT`, which changes no extreme): the
     ///   extreme of the partial extremes. `ORDER BY`'s order is total over distinct terms
     ///   (`value::order`), so the extreme is the same term either way.
-    /// - `AVG`: a `SUM` and a `COUNT(expr)` per partial group, summed by the group and
+    /// - `AVG`: a `SUM` and a `COUNT(expr)` (`COUNT(*)` of a variable `B` binds in every
+    ///   solution) per partial group, summed by the group and
     ///   divided after it (`0` when the total count of non-error values is zero, per SPARQL
     ///   1.1 §18.5.1.4). SPARQL's division is `AVG`'s own: integers and decimals give a
     ///   decimal, a float or double total its type, a duration total a duration of its type.
@@ -271,12 +272,15 @@ fn pre_aggregated(
     if reads_a {
         return None;
     }
-    if !reads_shared.is_empty() {
-        // What a join binds in every solution is what any of its inputs does.
-        let bound: Vec<Variable> = without
+    // What B binds in every solution: what a join binds is what any of its inputs does.
+    let certain = || -> Vec<Variable> {
+        without
             .iter()
             .flat_map(|p| crate::native::certain(&p.lower()))
-            .collect();
+            .collect()
+    };
+    if !reads_shared.is_empty() {
+        let bound = certain();
         if reads_shared.iter().any(|v| !bound.contains(v)) {
             return None;
         }
@@ -352,14 +356,19 @@ fn pre_aggregated(
                         distinct: false,
                     },
                 ));
-                partials.push((
-                    partial_count.clone(),
-                    AggregateExpression::FunctionCall {
+                // A variable B binds in every solution has a value in every row: its count
+                // is the rows'.
+                let counted = match expr {
+                    Expression::Variable(v) if certain().contains(v) => {
+                        AggregateExpression::CountSolutions { distinct: false }
+                    }
+                    _ => AggregateExpression::FunctionCall {
                         name: AggregateFunction::Count,
                         expr: expr.clone(),
                         distinct: false,
                     },
-                ));
+                };
+                partials.push((partial_count.clone(), counted));
                 let (total, count) = (fresh(), fresh());
                 finals.push((total.clone(), over(AggregateFunction::Sum, &partial)));
                 finals.push((count.clone(), over(AggregateFunction::Sum, &partial_count)));
