@@ -29,7 +29,10 @@
 //!   ([`answering`]), its status chosen at the end and sent with its `Content-Length`, so a
 //!   stop before the end gets its own status. What is held is charged to the request's
 //!   memory envelope (`budgets.query_memory`): past it, 413 ([`too_large`]). Its deadline is
-//!   the first one for all of it, a stall bound's too.
+//!   the first one for all of it, a stall bound's too. Sent, each frame must be taken
+//!   within a stall bound (the read's own, or a query's time) or what is left is let go
+//!   and the body ends short of its length ([`Held`]): a client that stops reading keeps
+//!   no answer charged.
 
 use std::collections::VecDeque;
 use std::io;
@@ -262,6 +265,12 @@ pub async fn stream_blocking(
     produce: impl FnOnce(&mut ChannelWriter) -> Result<(), ApiError> + Send + 'static,
 ) -> Result<Response, ApiError> {
     let whole = WHOLE.try_with(|whole| *whole).unwrap_or(false);
+    // How long an answer held whole waits for its client to take each frame: a stall
+    // bound's own, or the time a query was given.
+    let stall = match pace {
+        Pace::Stall { stall, .. } => stall,
+        Pace::Total(deadline) => deadline.saturating_duration_since(Instant::now()),
+    };
     let (sender, mut receiver) = mpsc::channel::<Message>(CHANNEL_CHUNKS);
     let start = Arc::new(Start::default());
     let outcome = Arc::new(Outcome::default());
@@ -302,7 +311,7 @@ pub async fn stream_blocking(
         // The first deadline bounds all of it: no chunk goes out to start a stall bound. On
         // every exit but the answer's end, `guard` cancels the producer.
         let held = hold(receiver, &outcome, deadline, memory(), timeout_message).await?;
-        return Ok(respond(Body::new(held), media_type));
+        return Ok(respond(Body::new(Held::new(held, stall)), media_type));
     }
     let first = match tokio::time::timeout_at(deadline, receiver.recv()).await {
         Err(_elapsed) => return Err(ApiError::timeout(timeout_message)), // guard cancels
@@ -372,12 +381,14 @@ async fn hold(
     deadline: Instant,
     memory: Envelope,
     timeout_message: &'static str,
-) -> Result<Held, ApiError> {
+) -> Result<Holding, ApiError> {
     let bound = memory.limit();
-    let mut held = Held {
+    let mut held = Holding {
         frames: VecDeque::new(),
         left: 0,
         memory: Reservation::new(memory),
+        moved: Instant::now(),
+        cut: false,
     };
     loop {
         match tokio::time::timeout_at(deadline, receiver.recv()).await {
@@ -417,37 +428,97 @@ fn too_large(refused: BudgetExceeded, bound: usize) -> ApiError {
 }
 
 /// An answer held whole: its frames, the bytes of them left to send (its exact length, so it
-/// goes out with a `Content-Length`), and the memory they hold, returned as they go out and
-/// all of it when the body is dropped (sent, or its client gone).
-struct Held {
+/// goes out with a `Content-Length`), and the memory they hold, returned as they go out.
+struct Holding {
     frames: VecDeque<Message>,
     left: u64,
     memory: Reservation<Envelope>,
+    /// When the client last took a frame (at first: when the answer was ready).
+    moved: Instant,
+    /// The client took no frame for the stall bound: the frames and their memory are gone.
+    cut: bool,
+}
+
+impl Holding {
+    /// Lets go of what is left: the frames and the memory they hold. An answer all sent
+    /// isn't cut: its end stays clean.
+    fn cut(&mut self) {
+        self.cut = !self.frames.is_empty();
+        self.frames.clear();
+        self.memory.release(self.memory.bytes());
+    }
+}
+
+fn lock(holding: &Mutex<Holding>) -> std::sync::MutexGuard<'_, Holding> {
+    holding.lock().unwrap_or_else(|p| p.into_inner())
+}
+
+/// The body of an answer held whole. Its client must take each frame within `stall` of the
+/// one before (of the answer being ready, the first): past it, a timer of its own lets go of
+/// what is left, whether or not the body is polled (a client that stops reading without
+/// leaving doesn't poll it), and the body ends with an error, short of its length. On drop
+/// (sent, or its client gone), it lets go of all it holds.
+struct Held {
+    holding: Arc<Mutex<Holding>>,
+    watch: tokio::task::AbortHandle,
+}
+
+impl Held {
+    fn new(holding: Holding, stall: Duration) -> Self {
+        let holding = Arc::new(Mutex::new(holding));
+        let watched = Arc::clone(&holding);
+        let watch = tokio::spawn(async move {
+            loop {
+                let until = lock(&watched).moved + stall;
+                tokio::time::sleep_until(until).await;
+                let mut holding = lock(&watched);
+                if holding.moved + stall <= Instant::now() {
+                    holding.cut();
+                    return;
+                }
+            }
+        })
+        .abort_handle();
+        Self { holding, watch }
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        self.watch.abort();
+        lock(&self.holding).cut();
+    }
 }
 
 impl http_body::Body for Held {
     type Data = Bytes;
-    type Error = std::convert::Infallible;
+    type Error = io::Error;
 
     fn poll_frame(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         _: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Bytes>, Self::Error>>> {
-        let frame = self.frames.pop_front();
+        let mut holding = lock(&self.holding);
+        if holding.cut {
+            return Poll::Ready(Some(Err(io::Error::from(io::ErrorKind::TimedOut))));
+        }
+        let frame = holding.frames.pop_front();
         if let Some(data) = frame.as_ref().and_then(Frame::data_ref) {
             let bytes = data.len();
-            self.left -= bytes as u64;
-            self.memory.release(bytes);
+            holding.left -= bytes as u64;
+            holding.memory.release(bytes);
         }
+        holding.moved = Instant::now();
         Poll::Ready(frame.map(Ok))
     }
 
     fn is_end_stream(&self) -> bool {
-        self.frames.is_empty()
+        let holding = lock(&self.holding);
+        holding.frames.is_empty() && !holding.cut
     }
 
     fn size_hint(&self) -> SizeHint {
-        SizeHint::with_exact(self.left)
+        SizeHint::with_exact(lock(&self.holding).left)
     }
 }
 
