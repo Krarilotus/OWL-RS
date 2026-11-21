@@ -148,9 +148,10 @@ leave something out.
 - Under `owl2-rl` with the QL rewriting on, over a store holding a list axiom past the
   [list limits](spec/reasoning-semantics.md#list-limits), v1.5.0 tells a read under `NOT EXISTS`,
   `MINUS`, `OPTIONAL` or another operator [the rule](spec/reasoning-semantics.md#what-may-be-complete)
-  names `sound-only`, in its status, its QL report and its plan, where it should be `unsound`: it
-  can return a row that the left-out axiom's conclusions would remove. From v1.5.1 such a read is
-  `unsound`.
+  names `sound-only` in its status and in its plan's status, and `complete` in its QL report
+  (`ql`, in the run, EXPLAIN and the plan) and in the printed query's status, where each should
+  be `unsound`: it can return a row that the left-out axiom's conclusions would remove. From
+  v1.5.1 all of them say `unsound`.
 - Without the OWL 2 QL rewriting, every answer over a
   ruleset's closure is `sound-only`. The rewriting runs by default under `owl2-ql` only;
   under `owl2-rl`, `reasoner.ql_rewriting = "on"` checks each query as under `owl2-ql`.
