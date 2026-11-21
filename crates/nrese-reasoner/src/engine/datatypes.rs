@@ -93,7 +93,9 @@ pub(crate) fn violations(
             let one = [s];
             let class = classes.and_then(|c| c.class_of(s)).unwrap_or(&one);
             let mut members = class.iter().filter(is_literal).peekable();
-            let (Some(_), Some(Term::NamedNode(dt))) = (members.peek(), decode(o)) else {
+            // The datatype only where a literal needs it: most type rows have none.
+            let Some(_) = members.peek() else { continue };
+            let Some(Term::NamedNode(dt)) = decode(o) else {
                 continue;
             };
             for &m in members {
