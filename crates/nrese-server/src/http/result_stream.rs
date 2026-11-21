@@ -871,4 +871,55 @@ mod tests {
         );
         assert_eq!(memory.used(), 0);
     }
+
+    /// Over HTTP/1.0, a client that takes part of a held answer and then stops reading,
+    /// without leaving, keeps none of it once the stall bound has passed: what was held goes
+    /// back, and the body ends with an error, short of its length, never cleanly.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_held_answer_whose_client_stops_reading_releases_its_memory_at_the_stall_bound() {
+        use http_body_util::BodyExt;
+
+        let memory = Envelope::new(Some(1 << 30), None);
+        let held = memory.clone();
+        let stall = Duration::from_millis(500);
+        let response = WHOLE
+            .scope(
+                true,
+                stream_blocking(
+                    Pace::Stall {
+                        first: Instant::now() + Duration::from_secs(120),
+                        stall,
+                    },
+                    CancellationToken::new(),
+                    move || held,
+                    "text/plain",
+                    "timeout",
+                    |writer| {
+                        io::Write::write_all(writer, &vec![b'x'; 3 * CHUNK_BYTES])
+                            .map_err(|error| ApiError::internal(error.to_string()))
+                    },
+                ),
+            )
+            .await
+            .unwrap();
+        let mut body = response.into_body();
+        let first = body.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(first.len(), CHUNK_BYTES);
+        assert_eq!(memory.used(), 2 * CHUNK_BYTES);
+        // The client stops reading. Real time, far past the bound: a guard against a hang.
+        let stopped = std::time::Instant::now();
+        while memory.used() != 0 {
+            assert!(
+                stopped.elapsed() < 20 * stall,
+                "{} bytes still held for a client that stopped reading",
+                memory.used()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let next = body.frame().await;
+        assert!(
+            matches!(next, Some(Err(_))),
+            "a cut answer ends with an error"
+        );
+    }
 }
