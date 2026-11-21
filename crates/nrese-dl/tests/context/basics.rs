@@ -253,11 +253,16 @@ fn assertions_along_named_edges() {
         build(&mut b);
         classify(&b.done(), 1).expect("Horn").consistency == nrese_dl::verdict::Verdict::Consistent
     };
-    // A ⊑ ∀r.B, B ⊓ C ⊑ ⊥, A(a), r(a, b): C(b) clashes.
-    let forward = |b: &mut Build, clash: bool| {
+    // A ⊑ ∀r.B, B ⊓ C ⊑ ⊥, A(a), r(a, b): C(b) clashes. With `included`, the universal is
+    // over `s` and `r ⊑ s`: the clash needs the edge `s(a, b)` the inclusion derives.
+    let forward = |b: &mut Build, clash: bool, included: bool| {
         let (a, bb, cc) = (b.c("A"), b.c("B"), b.c("C"));
         let r = b.r("r");
-        let all = b.all(r, bb);
+        let s = if included { b.r("s") } else { r };
+        if included {
+            b.axiom(Axiom::SubObjectPropertyOf(vec![r], s));
+        }
+        let all = b.all(s, bb);
         b.sub(a, all);
         let both = b.and(&[bb, cc]);
         let bot = b.e(ClassExpr::Nothing);
@@ -269,8 +274,10 @@ fn assertions_along_named_edges() {
             b.axiom(Axiom::ClassAssertion(cc, j));
         }
     };
-    assert!(consistent(&mut table, &|b| forward(b, false)));
-    assert!(!consistent(&mut table, &|b| forward(b, true)));
+    assert!(consistent(&mut table, &|b| forward(b, false, false)));
+    assert!(!consistent(&mut table, &|b| forward(b, true, false)));
+    assert!(consistent(&mut table, &|b| forward(b, false, true)));
+    assert!(!consistent(&mut table, &|b| forward(b, true, true)));
     // ∃r.B ⊑ D at the subject, D ⊓ E ⊑ ⊥; transitivity: s(i, j), s(j, k), B(k), E(i).
     let back = |b: &mut Build, transitive: bool| {
         let (bb, d, e) = (b.c("B"), b.c("D"), b.c("E"));

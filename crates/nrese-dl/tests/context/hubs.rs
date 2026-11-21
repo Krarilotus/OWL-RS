@@ -5,7 +5,7 @@
 use nrese_dl::context::{self, Classification, Options, Strategy};
 use nrese_owl::{Axiom, Ontology};
 
-use crate::support::{Build, Table};
+use crate::support::{Build, Table, holds};
 
 /// `Aᵢ ⊑ ∃r.Cᵢ`, `∃s.Aᵢ ⊑ Pᵢ` with `s = r⁻` (a successor's `Pᵢ` depends on its
 /// predecessor), `Pᵢ ⊑ ∃r.Eᵢ` (so the next successor's filler is uncertain where it is
@@ -271,4 +271,31 @@ fn a_join_past_its_steps_leaves_its_context_incomplete() {
         context::classify(&o, &options),
         Err(context::Unsupported::Budget)
     ));
+}
+
+/// A join left past its steps doesn't make the classification's lower bound exact: with
+/// `∃r.H ⊑ G` added, `W ⊑ G` needs the left join's `H` at `W`'s successor, and the
+/// classification still finds it.
+#[test]
+fn a_left_join_still_classifies_completely() {
+    let mut table = Table::default();
+    let o = products(&mut table, 4, 3);
+    let mut b = Build {
+        table: &mut table,
+        o,
+    };
+    let (r, h, g) = (b.r("r"), b.c("H"), b.c("G"));
+    let to_h = b.some(r, h);
+    b.sub(to_h, g);
+    let o = b.done();
+    let left = nrese_dl::classify::classify(
+        &o,
+        &nrese_dl::classify::Options {
+            max_join_steps: Some(2),
+            ..Default::default()
+        },
+    );
+    assert!(holds(&mut table, &left.classification, "W", "G"));
+    let whole = nrese_dl::classify::classify(&o, &Default::default());
+    assert_eq!(left.classification, whole.classification);
 }
