@@ -682,7 +682,10 @@ fn update_body<B: Base + ?Sized>(
     let mut region_facts: Vec<Triple> = Vec::new();
     let mut region_asserted: HashSet<Triple> = HashSet::new();
     'overdelete: while !deleted.is_empty() {
-        let proof_budget = AtomicUsize::new(PROOF_BUDGET);
+        let capacity = PROOF_BUDGET;
+        #[cfg(test)]
+        let capacity = budget_tests::capacity(capacity);
+        let proof_budget = AtomicUsize::new(capacity);
         overdeleted.clear();
         recloses.clear();
         // The region's facts, overdeleted at once: every inferred fact that mentions one
@@ -1676,6 +1679,8 @@ impl<B: Base + ?Sized> Prover<'_, '_, B> {
             })
             .is_err()
         {
+            #[cfg(test)]
+            budget_tests::record_exhaustion();
             return Ok((false, true));
         }
         #[cfg(test)]
@@ -1829,7 +1834,8 @@ mod budget_tests {
     use super::*;
     use crate::batch::{self, Schema};
     use crate::delta::policy::{Plan, Policy};
-    use crate::ir::{Atom, Term, Vocabulary};
+    use crate::ir::{Atom, Term, Violation, Vocabulary};
+    use crate::lists::{ListVocabulary, PAIRWISE_MEMBERS};
     use crate::vocabulary::LocalVocabulary;
 
     fn implication(name: &str, body: Vec<Atom>, head: Atom) -> Rule {
@@ -1841,37 +1847,132 @@ mod budget_tests {
         }
     }
 
+    const PROOF_CELLS: [usize; 3] = [0, 2, usize::MAX];
+    const POOL_WIDTHS: [usize; 3] = [1, 4, 8];
+
+    struct ProofWork {
+        capacity: usize,
+        expanded: AtomicUsize,
+        exhausted: AtomicUsize,
+    }
+
     thread_local! {
-        static POOL_EXPANSIONS: RefCell<Option<Arc<AtomicUsize>>> = const { RefCell::new(None) };
+        static POOL_PROOF: RefCell<Option<Arc<ProofWork>>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn capacity(default: usize) -> usize {
+        POOL_PROOF.with(|cell| cell.borrow().as_ref().map_or(default, |work| work.capacity))
     }
 
     pub(super) fn record_expansion() {
-        POOL_EXPANSIONS.with(|cell| {
-            if let Some(counter) = cell.borrow().as_ref() {
-                counter.fetch_add(1, Ordering::Relaxed);
+        POOL_PROOF.with(|cell| {
+            if let Some(work) = cell.borrow().as_ref() {
+                work.expanded.fetch_add(1, Ordering::Relaxed);
             }
         });
     }
 
-    /// A cyclic graph with many independent overdelete candidates in one pass must bound
-    /// total proof expansions across all parallel Rayon workers to `PROOF_BUDGET` (not
-    /// `workers * PROOF_BUDGET`), while still producing the exact same maintained closure
-    /// as a full rematerialisation across pool widths.
+    pub(super) fn record_exhaustion() {
+        POOL_PROOF.with(|cell| {
+            if let Some(work) = cell.borrow().as_ref() {
+                work.exhausted.fetch_add(1, Ordering::Relaxed);
+            }
+        });
+    }
+
+    fn run_delete(
+        base: &MemoryBase,
+        inserted: &[Triple],
+        deleted: &[Triple],
+        rules: Rules<'_>,
+        threads: usize,
+        capacity: usize,
+    ) -> (Update, usize, usize) {
+        let work = Arc::new(ProofWork {
+            capacity,
+            expanded: AtomicUsize::new(0),
+            exhausted: AtomicUsize::new(0),
+        });
+        let worker = Arc::clone(&work);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .start_handler(move |_| {
+                POOL_PROOF.with(|cell| *cell.borrow_mut() = Some(Arc::clone(&worker)));
+            })
+            .build()
+            .unwrap();
+        let policy = Policy {
+            force: Some(Plan::Dred),
+            ..Policy::default()
+        };
+        let result = pool
+            .install(|| {
+                update_with(
+                    base,
+                    inserted,
+                    deleted,
+                    rules,
+                    None,
+                    crate::eval::NEVER,
+                    policy,
+                )
+            })
+            .expect("never stopped");
+        (
+            result,
+            work.expanded.load(Ordering::Relaxed),
+            work.exhausted.load(Ordering::Relaxed),
+        )
+    }
+
+    fn maintained(stack: &[Triple], update: &Update) -> Vec<Triple> {
+        let mut closure: Vec<Triple> = stack
+            .iter()
+            .copied()
+            .filter(|f| update.remove.binary_search(f).is_err())
+            .chain(update.insert.iter().copied())
+            .collect();
+        closure.sort_unstable();
+        closure.dedup();
+        closure
+    }
+
+    fn reach(e: u64, p: u64) -> Rule {
+        let [x, y, z] = [0, 1, 2].map(Term::Var);
+        implication(
+            "reach",
+            vec![Atom([x, Term::Const(e), y]), Atom([y, Term::Const(p), z])],
+            Atom([x, Term::Const(p), z]),
+        )
+    }
+
+    fn assert_budget(capacity: usize, used: usize, exhausted: usize, cell: &str) {
+        if capacity == usize::MAX {
+            assert!(
+                used > PROOF_CELLS[1] && exhausted == 0,
+                "{cell}: expected a completed proof search, used={used}, denied={exhausted}"
+            );
+        } else {
+            assert_eq!(
+                used, capacity,
+                "{cell}: proof expansions exceed the shared pass budget or did not spend it"
+            );
+            assert!(exhausted > 0, "{cell}: no proof was denied by the budget");
+        }
+    }
+
+    /// Independent overdelete candidates in a cyclic graph share one proof allowance.
+    /// The maintained closure equals a full rematerialisation even after exhaustion.
     #[test]
     fn shared_proof_budget_caps_total_expansions_and_matches_rematerialisation() {
         let mut vocab = LocalVocabulary::default();
-        // Two mutually recursive rules over a cyclic graph so each candidate triggers a
-        // deep proof search when its root support is deleted.
+        // A recursive reachability rule and its seeds.
         let e = vocab.iri("http://example.com/e");
         let p = vocab.iri("http://example.com/p");
         let seed = vocab.iri("http://example.com/seed");
-        let [x, y, z] = [0, 1, 2].map(Term::Var);
+        let [x, y] = [0, 1].map(Term::Var);
         let rules = [
-            implication(
-                "r1",
-                vec![Atom([x, Term::Const(e), y]), Atom([y, Term::Const(p), z])],
-                Atom([x, Term::Const(p), z]),
-            ),
+            reach(e, p),
             implication(
                 "r2",
                 vec![Atom([x, Term::Const(seed), y])],
@@ -1879,8 +1980,8 @@ mod budget_tests {
             ),
         ];
         let schema = Schema::owl(&mut vocab);
-        let nodes = 40usize;
-        let targets = 60usize;
+        let nodes = 8usize;
+        let targets = 4usize;
         let mut asserted = Vec::new();
         // Dense small cycle among nodes so proof searches branch heavily.
         for i in 0..nodes {
@@ -1914,63 +2015,77 @@ mod budget_tests {
             .filter(|f| after_asserted.binary_search(f).is_err())
             .collect();
 
-        for threads in [1usize, 4, 8] {
-            let counter = Arc::new(AtomicUsize::new(0));
-            let pool = rayon::ThreadPoolBuilder::new()
-                .num_threads(threads)
-                .start_handler({
-                    let counter = Arc::clone(&counter);
-                    move |_| {
-                        POOL_EXPANSIONS.with(|cell| {
-                            *cell.borrow_mut() = Some(Arc::clone(&counter));
-                        });
-                    }
-                })
-                .build()
-                .unwrap();
-            let base = MemoryBase::new(&after_asserted, &stack);
-            let compiled = Rules {
-                rules: &rules,
-                lists: None,
-                schema: &schema,
-                equality: None,
-            };
-            let policy = Policy {
-                force: Some(Plan::Dred),
-                ..Policy::default()
-            };
-            let result = pool
-                .install(|| {
-                    update_with(
-                        &base,
-                        &[],
-                        &deleted,
-                        compiled,
-                        None,
-                        crate::eval::NEVER,
-                        policy,
-                    )
-                })
-                .expect("never stopped");
-            let used = counter.load(Ordering::SeqCst);
-            assert!(
-                used <= PROOF_BUDGET,
-                "threads={threads}: proof expansions {used} exceeded shared pass budget {PROOF_BUDGET}"
-            );
-            let removed: HashSet<Triple> = result.remove.iter().copied().collect();
-            let mut maintained: Vec<Triple> = stack
-                .iter()
-                .copied()
-                .filter(|f| !removed.contains(f))
-                .chain(result.insert)
-                .collect();
-            maintained.sort_unstable();
-            maintained.dedup();
-            assert_eq!(
-                maintained, expected,
-                "threads={threads}: maintained closure diverged from full rematerialisation"
-            );
+        let base = MemoryBase::new(&after_asserted, &stack);
+        let compiled = Rules {
+            rules: &rules,
+            lists: None,
+            schema: &schema,
+            equality: None,
+        };
+        for threads in POOL_WIDTHS {
+            for capacity in PROOF_CELLS {
+                let cell = format!("closure threads={threads} budget={capacity}");
+                let (result, used, exhausted) =
+                    run_delete(&base, &[], &deleted, compiled, threads, capacity);
+                assert_eq!(maintained(&stack, &result), expected, "{cell}");
+                assert_budget(capacity, used, exhausted, &cell);
+                println!("{cell}: expanded={used} denied={exhausted}");
+            }
         }
+    }
+
+    fn check_witnesses(
+        scenario: &str,
+        asserted: &[Triple],
+        inserted: &[Triple],
+        deleted: Triple,
+        rules: Rules<'_>,
+        witness_counts: (usize, usize, usize),
+    ) -> Vec<String> {
+        let full = |facts| batch::materialise(facts, rules.rules, rules.lists, rules.schema);
+        let before = full(asserted);
+        let mut after_asserted: Vec<_> = asserted
+            .iter()
+            .copied()
+            .filter(|&f| f != deleted)
+            .chain(inserted.iter().copied())
+            .collect();
+        after_asserted.sort_unstable();
+        let after = full(&after_asserted);
+        let old: HashSet<Violation> = before.violations.to_vec().into_iter().collect();
+        let now: HashSet<Violation> = after.violations.to_vec().into_iter().collect();
+        let expected: HashSet<_> = now.difference(&old).cloned().collect();
+        assert_eq!(
+            (old.len(), now.len(), expected.len()),
+            witness_counts,
+            "{scenario}: before={old:?} after={now:?}"
+        );
+        let stack: Vec<_> = before
+            .derived
+            .into_iter()
+            .filter(|f| after_asserted.binary_search(f).is_err())
+            .collect();
+        let base = MemoryBase::new(&after_asserted, &stack);
+        let mut mismatches = Vec::new();
+        for threads in POOL_WIDTHS {
+            for capacity in PROOF_CELLS {
+                let cell = format!("{scenario} threads={threads} budget={capacity}");
+                let (result, used, exhausted) =
+                    run_delete(&base, inserted, &[deleted], rules, threads, capacity);
+                assert_eq!(maintained(&stack, &result), after.derived, "{cell}");
+                let reported: HashSet<_> = result.violations.to_vec().into_iter().collect();
+                if reported != expected {
+                    mismatches.push(format!("{cell}: expected {expected:?}, got {reported:?}"));
+                }
+                assert_budget(capacity, used, exhausted, &cell);
+                println!(
+                    "{cell}: expanded={used} denied={exhausted}, expected={} reported={}",
+                    expected.len(),
+                    reported.len()
+                );
+            }
+        }
+        mismatches
     }
 
     /// When shared proof-budget exhaustion forces a still-supported inferred schema fact
@@ -1985,18 +2100,14 @@ mod budget_tests {
         let p = vocab.iri("http://example.com/p");
         let mark = vocab.iri("http://example.com/mark");
         let disjoint = vocab.iri("http://www.w3.org/2002/07/owl#disjointWith");
-        let [x, y, z] = [0, 1, 2].map(Term::Var);
+        let [x, y] = [0, 1].map(Term::Var);
         let mut rules = crate::ir::parse_rules(
             "cax-dw: (?c owl:disjointWith ?d), (?x rdf:type ?c), (?x rdf:type ?d) -> false",
             &mut vocab,
         )
         .unwrap();
         rules.extend([
-            implication(
-                "reach",
-                vec![Atom([x, Term::Const(e), y]), Atom([y, Term::Const(p), z])],
-                Atom([x, Term::Const(p), z]),
-            ),
+            reach(e, p),
             implication(
                 "disjoint",
                 vec![
@@ -2025,117 +2136,120 @@ mod budget_tests {
             [ind, rdf_type, last],
             [ind, rdf_type, target],
         ];
-        let mut l1_first = 0u64;
-        for i in 0..5_000usize {
-            let n = vocab.iri(&format!("http://example.com/l1_{i}"));
-            if i == 0 {
-                l1_first = n;
-            }
-            asserted.push([n, e, root]);
+        let l1 = vocab.iri("http://example.com/l1");
+        let l2 = vocab.iri("http://example.com/l2");
+        asserted.extend([[l1, e, root], [l2, e, l1], [last, e, l2]]);
+        for i in 0..4 {
+            let branch = vocab.iri(&format!("http://example.com/branch{i}"));
+            asserted.push([branch, e, root]);
         }
-        let mut l2_first = 0u64;
-        for i in 0..5_000usize {
-            let n = vocab.iri(&format!("http://example.com/l2_{i}"));
-            if i == 0 {
-                l2_first = n;
-            }
-            asserted.push([n, e, l1_first]);
-        }
-        asserted.push([last, e, l2_first]);
         asserted.sort_unstable();
-        asserted.dedup();
-
-        let before = batch::materialise(&asserted, &rules, None, &schema);
-        assert!(
-            !before.violations.consistent(),
-            "pre-update state must already carry the cax-dw clash"
-        );
-
-        let after_asserted: Vec<Triple> = asserted
-            .iter()
-            .copied()
-            .filter(|&f| f != deleted_fact)
-            .collect();
-        let after = batch::materialise(&after_asserted, &rules, None, &schema);
-        assert_eq!(
-            before.violations, after.violations,
-            "deleting p(root, t) preserves the exact same violation set"
-        );
-
-        let stack: Vec<Triple> = before
-            .derived
-            .iter()
-            .copied()
-            .filter(|f| after_asserted.binary_search(f).is_err())
-            .collect();
-        let base = MemoryBase::new(&after_asserted, &stack);
         let compiled = Rules {
             rules: &rules,
             lists: None,
             schema: &schema,
             equality: None,
         };
-        let policy = Policy {
-            force: Some(Plan::Dred),
-            ..Policy::default()
-        };
-        let result = update_with(
-            &base,
+        let mut mismatches = check_witnesses(
+            "restored axiom",
+            &asserted,
             &[],
-            &[deleted_fact],
+            deleted_fact,
             compiled,
-            None,
-            crate::eval::NEVER,
-            policy,
-        )
-        .expect("never stopped");
-
-        assert!(
-            result.violations.consistent(),
-            "pre-existing clash must not be reported as newly introduced: {:?}",
-            result.violations.to_vec()
+            (1, 1, 0),
         );
-        let removed: HashSet<Triple> = result.remove.iter().copied().collect();
-        let mut maintained: Vec<Triple> = stack
-            .iter()
-            .copied()
-            .filter(|f| !removed.contains(f))
-            .chain(result.insert)
-            .collect();
-        maintained.sort_unstable();
-        maintained.dedup();
-        assert_eq!(
-            maintained, after.derived,
-            "maintained closure after budget exhaustion must restore surviving facts"
-        );
-
         // Control: when the same update also inserts a genuinely new clashing individual,
-        // the restored pre-existing consistency instance must report ONLY the new clash.
-        let inserted = vec![[ind2, rdf_type, last], [ind2, rdf_type, target]];
-        let mut with_new_asserted = after_asserted.clone();
-        with_new_asserted.extend_from_slice(&inserted);
-        with_new_asserted.sort_unstable();
-        with_new_asserted.dedup();
-        let base_with_new = MemoryBase::new(&with_new_asserted, &stack);
-        let result_with_new = update_with(
-            &base_with_new,
-            &inserted,
-            &[deleted_fact],
+        // the restored instance must report only the new clash.
+        mismatches.extend(check_witnesses(
+            "restored axiom with new clash",
+            &asserted,
+            &[[ind2, rdf_type, last], [ind2, rdf_type, target]],
+            deleted_fact,
             compiled,
-            None,
-            crate::eval::NEVER,
-            policy,
-        )
-        .expect("never stopped");
-        let reported = result_with_new.violations.to_vec();
-        assert_eq!(
-            reported.len(),
-            1,
-            "expected only the newly introduced clash on ind2, got {reported:?}"
-        );
-        assert!(
-            reported[0].bindings.contains(&ind2) && !reported[0].bindings.contains(&ind),
-            "expected clash for ind2 (not pre-existing ind), got {reported:?}"
-        );
+            (1, 2, 1),
+        ));
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
+    }
+
+    /// Deletes can both enable a list check and change a long list's guard. Report the
+    /// witnesses introduced by the delete, even when the list's program is rebuilt.
+    #[test]
+    fn list_updates_report_only_introduced_witnesses() {
+        let mut vocab = LocalVocabulary::default();
+        let schema = Schema::owl(&mut vocab);
+        let lists = ListVocabulary::new(&mut vocab);
+        let e = vocab.iri("http://example.com/e");
+        let p = vocab.iri("http://example.com/p");
+        let source = vocab.iri("http://example.com/source");
+        let root = vocab.iri("http://example.com/root");
+        let marker = vocab.iri("http://example.com/marker");
+        let list = vocab.iri("http://example.com/list");
+        let subject = vocab.iri("http://example.com/s");
+        let object = vocab.iri("http://example.com/o");
+        let other_member = vocab.iri("http://example.com/other-member");
+        let first = vocab.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#first");
+        let rest = vocab.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#rest");
+        let nil = vocab.iri("http://www.w3.org/1999/02/22-rdf-syntax-ns#nil");
+        let adp = vocab.iri("http://www.w3.org/2002/07/owl#AllDisjointProperties");
+        let members = vocab.iri("http://www.w3.org/2002/07/owl#members");
+        let deleted = [root, p, marker];
+        let mut mismatches = Vec::new();
+        for (scenario, len, witness_counts) in [
+            ("phase-2 list check", 2, (0, 1, 1)),
+            ("changed long-list guard", PAIRWISE_MEMBERS + 1, (1, 1, 0)),
+        ] {
+            let nodes: Vec<_> = (0..len)
+                .map(|i| vocab.iri(&format!("http://example.com/cell{i}")))
+                .collect();
+            let mut asserted = vec![
+                deleted,
+                [source, e, root],
+                [list, schema.rdf_type(), adp],
+                [list, members, nodes[0]],
+            ];
+            for i in 0..4 {
+                let branch = vocab.iri(&format!("http://example.com/branch{i}"));
+                asserted.push([branch, e, root]);
+            }
+            for (i, &node) in nodes.iter().enumerate() {
+                let member = vocab.iri(&format!("http://example.com/member{i}"));
+                asserted.push([node, first, member]);
+                asserted.push([node, rest, nodes.get(i + 1).copied().unwrap_or(nil)]);
+                if i < 2 {
+                    asserted.push([subject, member, object]);
+                }
+            }
+            asserted.sort_unstable();
+            // Overdeleting the recursive p fact reaches a list fact in the next wave:
+            // a cycle in the short list, or an alternative first member of the long one.
+            let depends_on_proof = if len == 2 {
+                [nodes[1], rest, nodes[0]]
+            } else {
+                [nodes[0], first, other_member]
+            };
+            let rules = [
+                reach(e, p),
+                implication(
+                    "list-edge",
+                    vec![Atom([source, p, marker].map(Term::Const))],
+                    Atom(depends_on_proof.map(Term::Const)),
+                ),
+            ];
+            let compiled = Rules {
+                rules: &rules,
+                lists: Some(&lists),
+                schema: &schema,
+                equality: None,
+            };
+            mismatches.extend(check_witnesses(
+                scenario,
+                &asserted,
+                &[],
+                deleted,
+                compiled,
+                witness_counts,
+            ));
+        }
+        assert!(mismatches.is_empty(), "{}", mismatches.join("\n"));
     }
 }
