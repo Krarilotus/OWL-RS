@@ -112,6 +112,9 @@ fn dl_structural_triples_keep_their_own_graph() {
 #[test]
 fn dl_structural_full_reader_sees_the_restriction() {
     let reject = dl_structural(&Requester::all());
+    // The control on the same words, in the same text the restricted reader's check reads.
+    let full = format!("{reject:?}");
+    assert!(full.contains("SECRET_PROPERTY"), "{full}");
     let evidence = reject.explanation.expect("an explanation").evidence;
     let shown = |e: &&nrese_reasoner::RejectEvidence| e.object.contains("SECRET_PROPERTY");
     assert!(evidence.iter().any(|e| shown(&e)), "{evidence:#?}");
@@ -128,31 +131,48 @@ fn dl_count(requester: &Requester) -> MutationReject {
     rejection(config, mode, DL_COUNT_DATA, DL_COUNT_COMMIT, requester)
 }
 
+/// The context core's case of `dl::consistency` (`dl_count`'s is the hypertableau's), its
+/// Horn schema in `:secret`.
+fn dl_horn(requester: &Requester) -> MutationReject {
+    use crate::dl::consistency::EXISTENTIAL;
+    let data = format!("GRAPH :secret {{ {EXISTENTIAL} }}");
+    let (config, mode) = (StoreConfig::in_memory(), ReasoningMode::Owl2Dl);
+    rejection(config, mode, &data, "GRAPH :open { :x a :A }", requester)
+}
+
 /// SYN-65: the OWL 2 DL rejection text has no number or name that depends on the secret
 /// axioms: no withheld-statement count, no justification size, no engine, no time.
 #[test]
 fn dl_rejection_has_no_hidden_proof_counts() {
     let shown = format!("{:?}", dl_count(&open_reader()));
-    for leak in [
-        "of their statements",
-        "axiom(s)",
-        "hypertableau",
-        "context-core",
-        " ms)",
-    ] {
+    for leak in ["axiom(s)", "hypertableau", " ms)"] {
         assert!(!shown.contains(leak), "{leak:?} in {shown}");
     }
+    let shown = format!("{:?}", dl_horn(&open_reader()));
+    assert!(!shown.contains("context-core"), "{shown}");
 }
 
-/// Control: a reader of every graph keeps the justification's size and the check's time.
+/// Control: a reader of every graph is told the justification's size, each engine and the
+/// check's time, in the same text.
 #[test]
 fn dl_rejection_full_reader_keeps_counts_and_time() {
-    let detail = dl_count(&Requester::all()).detail;
-    assert!(
-        detail.contains("5 axiom(s) have no model together"),
-        "{detail}"
-    );
-    assert!(detail.contains(" ms)"), "{detail}");
+    let reject = dl_count(&Requester::all());
+    let full = format!("{reject:?}");
+    let horn = format!("{:?}", dl_horn(&Requester::all()));
+    let told = [
+        (&full, "axiom(s)"),
+        (&full, "hypertableau"),
+        (&full, " ms)"),
+        (&horn, "context-core"),
+    ];
+    let missing = told.iter().filter(|(text, words)| !text.contains(words));
+    let missing: Vec<_> = missing.map(|(_, words)| words).collect();
+    assert!(missing.is_empty(), "{missing:?} not in {full}\n{horn}");
+    // The justification's size itself: the whole number before the words, 5.
+    let detail = &reject.detail;
+    let size = detail.split_once(" axiom(s) have no model together");
+    let size = size.and_then(|(before, _)| before.rsplit(' ').next());
+    assert_eq!(size, Some("5"), "{detail}");
 }
 
 /// A shape requiring `:p` of every `:B`; `:SECRET_FOCUS a :A` is in `:secret`, and the
@@ -180,12 +200,13 @@ fn shacl_rejection_does_not_name_private_focus() {
     assert!(!shown.contains("1 SHACL result(s)"), "{shown}");
 }
 
-/// Control: a reader of every graph sees the focus node and the count.
+/// Control: a reader of every graph sees the focus node and the count, in the same text.
 #[test]
 fn shacl_rejection_full_reader_sees_the_focus() {
-    let detail = shacl(&Requester::all()).detail;
-    assert!(detail.contains("SECRET_FOCUS"), "{detail}");
-    assert!(detail.contains("1 SHACL result(s)"), "{detail}");
+    let full = format!("{:?}", shacl(&Requester::all()));
+    let told = ["SECRET_FOCUS", "1 SHACL result(s)"];
+    let missing: Vec<_> = told.iter().filter(|words| !full.contains(*words)).collect();
+    assert!(missing.is_empty(), "{missing:?} not in {full}");
 }
 
 // The capability kept: what the committer's own graphs show by themselves is explained to

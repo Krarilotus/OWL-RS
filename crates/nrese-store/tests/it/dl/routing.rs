@@ -1049,11 +1049,7 @@ fn every_annotation_property_axiom_entails_nothing_built_in_or_declared() {
 /// this release refuses the commit as undecided (`WhyUndecided`), not as an inconsistency.
 /// When OWL 2 DL decides these clashes, the tests that call this expect the commit.
 fn refused_as_undecided(data: &str, extra: &str) {
-    let dl = pipeline();
-    let result = insert(&dl, &format!("{data} {extra}"));
-    let Err(MutationError::Rejected(reject)) = &result else {
-        panic!("expected the refusal, got {result:?}");
-    };
+    let reject = refusal(data, extra);
     assert_eq!(reject.kind, RejectKind::Undecided, "{}", reject.detail);
     assert!(
         reject
@@ -1064,7 +1060,27 @@ fn refused_as_undecided(data: &str, extra: &str) {
         "{}",
         reject.detail
     );
+    // The control on the same words: the plain clash with `extra` is told by them.
+    let plain = refusal(PLAIN_CLASH, extra);
+    assert_eq!(plain.kind, RejectKind::Inconsistent, "{}", plain.detail);
+    assert!(
+        plain.detail.contains("consistency check"),
+        "{}",
+        plain.detail
+    );
 }
+
+/// The refusal of `data` (with `extra`) committed on a fresh store.
+fn refusal(data: &str, extra: &str) -> nrese_store::MutationReject {
+    match insert(&pipeline(), &format!("{data} {extra}")) {
+        Err(MutationError::Rejected(reject)) => *reject,
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+}
+
+/// A clash with no annotation axiom and no punned name.
+const PLAIN_CLASH: &str = ":A a owl:Class ; owl:disjointWith :B . :B a owl:Class . \
+     :x a owl:NamedIndividual , :A , :B .";
 
 /// An annotation property's domain says nothing under the OWL 2 Direct Semantics about the
 /// subjects it annotates; the rules' prp-dom puns `:x` into `:C`, disjoint with `:D`.
@@ -1102,22 +1118,26 @@ fn an_equality_of_punned_disjoint_class_names_is_refused_as_undecided_outside_rl
 #[test]
 fn a_plain_clash_is_rejected_as_inconsistent_on_both_routes() {
     for extra in ["", OUTSIDE_RL] {
-        let dl = pipeline();
-        let result = insert(
-            &dl,
-            &format!(
-                ":A a owl:Class ; owl:disjointWith :B . :B a owl:Class . \
-                 :x a owl:NamedIndividual , :A , :B . {extra}"
-            ),
-        );
-        let Err(MutationError::Rejected(reject)) = &result else {
-            panic!("expected a rejection, got {result:?}");
-        };
+        let reject = refusal(PLAIN_CLASH, extra);
         assert_eq!(reject.kind, RejectKind::Inconsistent, "{}", reject.detail);
         assert!(
             !reject.detail.contains("doesn't decide"),
             "{}",
             reject.detail
+        );
+        // The control on the same words: the annotation domain's refusal with `extra` is
+        // told by them.
+        let undecided = refusal(ANNOTATION_DOMAIN, extra);
+        assert_eq!(
+            undecided.kind,
+            RejectKind::Undecided,
+            "{}",
+            undecided.detail
+        );
+        assert!(
+            undecided.detail.contains("doesn't decide"),
+            "{}",
+            undecided.detail
         );
     }
 }
