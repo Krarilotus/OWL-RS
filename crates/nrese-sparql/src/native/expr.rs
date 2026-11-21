@@ -929,7 +929,11 @@ fn cast(name: &str, term: Term) -> Option<Term> {
         let v = match value {
             Value::Float(v) => Value::Integer(v.try_into().ok()?),
             Value::Double(v) => Value::Integer(v.try_into().ok()?),
-            Value::Decimal(v) => Value::Integer(v.try_into().ok()?),
+            Value::Decimal(v) => match v.try_into() {
+                Ok(v) => Value::Integer(v),
+                // Beyond i64: the canonical form's whole digits, its truncation toward zero.
+                Err(_) => parse_integer(v.to_string().split('.').next()?, None, None)?,
+            },
             Value::Boolean(b) => Value::Integer(Boolean::from(b).into()),
             // A cast collapses the string's whitespace first (XPath F&O §17.1.1); an RDF
             // literal's lexical form is never trimmed.
