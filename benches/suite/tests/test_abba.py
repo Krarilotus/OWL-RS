@@ -234,7 +234,7 @@ class Abba(unittest.TestCase):
         between steps when a host's window closes; such a round has no verdict, and so has one whose
         passes don't say which fleet host ran them."""
         read = []
-        with patch.object(abba.rg, "read_floor", side_effect=lambda path: read.append(path.stem)):
+        with patch.object(abba.rg, "host_floor", side_effect=lambda host: read.append(host)):
             code, text = self.verdict(self.round_(records(), name="moved", host="shared-a",
                                                   ran_on=lambda p: "timed-host"))
         self.assertEqual(code, abba.NO_VERDICT, text)
@@ -357,7 +357,7 @@ systems = []
         self.assertEqual(blocks[0][-3:], [f"a={A}", f"a2={A}", f"b={B}"])
         # A round its manifest says ran elsewhere takes that host's floor, not the family's.
         read = []
-        with patch.object(abba.rg, "read_floor", side_effect=lambda path: read.append(path.stem)):
+        with patch.object(abba.rg, "host_floor", side_effect=lambda host: read.append(host)):
             self.verdict(self.round_(records(), host="shared-a"))
         self.assertEqual((timed["env"]["GATE_HOST"], read), ("shared-a", ["shared-a"]))
         self.assertIn("pin_reason", timed)

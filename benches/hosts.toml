@@ -22,7 +22,8 @@
 # each read by the script its comment names (hosts.py fleet NAME); without the overlay, none.
 # A fleet job reads the overlay on its host from its environment: the job writers, on the machine
 # that has the overlay, put its committed hosts.toml in NRESE_BENCH_HOSTS and its commit in
-# NRESE_BENCH_OVERLAY_REV (hosts.py overlay_job), and stop where there is no overlay.
+# NRESE_BENCH_OVERLAY_REV, and the A-A' noise floors of that commit in NRESE_BENCH_FLOORS
+# (hosts.py overlay_env), and stop where there is no overlay.
 
 [inputs]
 data = { env = "BENCH_DATA", what = "the suite's datasets (suite.py run --data)" }

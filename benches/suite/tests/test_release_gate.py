@@ -1983,6 +1983,47 @@ class Parts(unittest.TestCase):
             gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics")
         self.assertIn("private bench overlay", str(stopped.exception))
 
+    def test_on_its_host_a_report_judges_by_the_floor_its_writer_had(self):
+        """The lead's decision of 21 Nov 2026: a host's A-A' noise floor travels with the job as its
+        hosts do. `release_gate.py report` on the timed host, with only the job's environment, judges
+        by the floor the overlay folder gives on the writing machine; without it the host found none,
+        and its verdict fell silently back to the round's own spread."""
+        def report_floor(root: Path) -> str | None:
+            """The floor `report` judged a round on timed-host by (its source), None for none."""
+            directory = root / "passes"
+            directory.mkdir(exist_ok=True)
+            for p in passes():
+                (directory / p["path"]).write_text(json.dumps(p["report"]), encoding="utf-8")
+            argv = ["release_gate.py", "report", "--passes", str(directory), "--candidate", "cand",
+                    *[a for s in SIDES for a in ("--side", f"{s}={REVS[s]}")], "--require", "base,main",
+                    "--harness-revision", HARNESS, "--min-blocks", "2", "--context", "host=timed-host",
+                    "--json", str(root / "release-gate.json")]
+            with patch.object(sys, "argv", argv), \
+                    contextlib.redirect_stdout(io.TextIOWrapper(io.BytesIO(), encoding="utf-8")):
+                gate_module.main()
+            return json.loads((root / "release-gate.json").read_text(encoding="utf-8"))["policy"]["floor"]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            inputs = Path(tmp) / "inputs"
+            (inputs / "overlay" / "noise-floor").mkdir(parents=True)
+            (inputs / "overlay" / "noise-floor" / "timed-host.toml").write_text(gate_module.write_floor(
+                {"host": "timed-host", "blocks": 8, "cases": {"lab-olympics": {"time/q06": 0.04}}}, "aa-fixture"),
+                encoding="utf-8", newline="\n")
+            isolation.overlay_repo(inputs)
+            folder = {"NRESE_BENCH_PRIVATE": (inputs / "overlay").as_posix(), "NRESE_BENCH_HOSTS": "",
+                      "NRESE_BENCH_FLOORS": ""}
+            with patch.dict(os.environ, folder):
+                here = report_floor(Path(tmp))
+                job = gate_module.jobs("c" * 40, "c" * 40, "C:/repo", "rg-test", 2, "lab-olympics",
+                                       big_gb=None)["rg-test-timed"]
+            carried = {k: v for k, v in job["env"].items() if k.startswith("NRESE_BENCH_")}
+            with patch.dict(os.environ, {**folder, "NRESE_BENCH_PRIVATE": "", **carried}):  # the host: no folder
+                there = report_floor(Path(tmp))
+            self.assertEqual(there, "timed-host.toml: aa-fixture, 8 blocks")
+            self.assertEqual(here, there)
+            with patch.dict(os.environ, {**folder, **carried}), self.assertRaises(ValueError):  # two overlays
+                report_floor(Path(tmp))
+
     def test_the_big_cases_run_on_a_linux_host_never_native_windows(self):
         """Round 8: the big job went to the development machine, native Windows, with the build's ELF binaries. It
         asks for Linux and the memory of its cases, and builds its own binaries there."""

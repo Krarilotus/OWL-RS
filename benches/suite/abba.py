@@ -533,7 +533,7 @@ def judge(family: dict, results: Path) -> tuple[list[str], dict | None, dict | N
         return problems, aa, None, host
     # B against A: its spread at least the run's own A-A' floor, or its host's where larger.
     own = rg.noise_floor(aa)["cases"]
-    hosts = (rg.read_floor(rg.FLOORS / f"{host}.toml") or {}).get("cases", {})
+    hosts = (rg.host_floor(host) or {}).get("cases", {})
     floor = {"source": f"this round's A-A' arm ({family['blocks']} blocks)"
              + (f", or {host}'s where larger" if hosts else ""),
              "cases": {case: {d: max(sd, hosts.get(case, {}).get(d, 0.0)) for d, sd in dims.items()}

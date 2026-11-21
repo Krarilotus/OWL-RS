@@ -1057,11 +1057,22 @@ def read_floor(path: Path) -> dict | None:
     """A host's floor (noise-floor/<host>.toml), or None where none was measured."""
     if not path.is_file():
         return None
-    data = tomllib.loads(path.read_text(encoding="utf-8"))
-    return {"source": f"{path.name}: {data.get('source', '?')}", "cases": data.get("cases", {})}
+    return as_floor(path.name, tomllib.loads(path.read_text(encoding="utf-8")))
 
 
-# The hosts' floors: in the private overlay's noise-floor/ where one is set (our hosts'), else here.
+def host_floor(host: str) -> dict | None:
+    """Host `host`'s floor where this process finds it: in a fleet job, the floors the job carries;
+    else the private overlay's noise-floor/ where one is set, else here (suitekit/hosts.py floor())."""
+    found = hosts_registry.floor(host)
+    return as_floor(*found) if found else None
+
+
+def as_floor(name: str, data: dict) -> dict:
+    return {"source": f"{name}: {data.get('source', '?')}", "cases": data.get("cases", {})}
+
+
+# Where `floor` writes a host's floor: the private overlay's noise-floor/ where one is set (our
+# hosts'), else here.
 FLOORS = (hosts_registry.private_dir() or ROOT / "benches" / "fast") / "noise-floor"
 
 
@@ -3542,11 +3553,11 @@ def main() -> int:
         passes = load_passes(args.passes)
         family = json.loads(args.family.read_text(encoding="utf-8")).get("family") if args.family else None
         context = {k: v for k, v in pairs(args.context, "--context").items()}
-        floor_file = args.floor or (FLOORS / f"{context['host']}.toml" if context.get("host") else None)
+        floor = read_floor(args.floor) if args.floor else host_floor(context["host"]) if context.get("host") else None
         summary = gate(passes, sides, args.candidate, [s for s in args.require.split(",") if s], args.harness_revision,
                        args.min_blocks, args.diagnostic, pairs(args.not_run, "--not-run"),
                        cases_registry.load(), pairs(args.elsewhere, "--elsewhere"), context, family,
-                       read_floor(floor_file) if floor_file else None)
+                       floor)
         for key in ("round", "max_gb", "ram_gb", "layouts"):
             if key in summary["context"]:
                 summary["context"][key] = float(summary["context"][key]) if "gb" in key else int(summary["context"][key])

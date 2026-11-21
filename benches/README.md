@@ -255,7 +255,8 @@ The kits' job files were written for the measurement queue that came before the 
 aren't used any more, and are in the private overlay (its `jobs/KIT/`). So are our hosts' run
 records from before the reset (`runs/`), their fast baselines (`baselines/fast/`) and the A-A'
 noise floors (`noise-floor/`): with `NRESE_BENCH_PRIVATE` set, the suite reads and writes them
-there.
+there. A fleet job reads the overlay's hosts and floors from its environment, put there by the
+machine that wrote it.
 
 ## A run, step by step
 

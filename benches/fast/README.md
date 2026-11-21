@@ -182,7 +182,7 @@ Every block times copies of the builds made for it ([PROTOCOL.md §5, "the unit"
 - Catalog cases, through the gate's steps: `release-gate.sh build REV` for each side, then `prepare HARNESS` with `GATE_BASELINES=base GATE_CASES=...`. Then `block N HARNESS 1 - base=REV cand=REV` for N = 1..k (four reports a block), and `report HARNESS cand=REV base=REV`.
 - Directly: `fast.py block --block N --cases C --side base:BINDIR:REV --side cand:BINDIR:REV --seed S --fresh-copies DIR --out PASSES`. This needs the native runtime and prepared data, and a BINDIR laid out like a gate build (`release/examples/perf_lab`, REVISION, SHA256SUMS).
 - A hand-rolled `perf_lab` loop (no catalog case): at each block's start run `cp -a "$BIN" "$W/copy-$k-$side" && sync` for each side, time from the copy, and `rm -rf` it at the block's end. Never time one file in two blocks.
-- The verdict: `release_gate.py report` takes the host's A-A' floor from `noise-floor/HOST.toml` (`release_gate.py floor`; the private overlay's `noise-floor/` when `NRESE_BENCH_PRIVATE` is set), or says the host has none.
+- The verdict: `release_gate.py report` takes the host's A-A' floor from `noise-floor/HOST.toml` (`release_gate.py floor`; the private overlay's `noise-floor/` when `NRESE_BENCH_PRIVATE` is set; in a fleet job, the overlay's floors its writer put in `NRESE_BENCH_FLOORS`), or says the host has none.
 
 ## What is kept
 

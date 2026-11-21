@@ -16,6 +16,7 @@ from a private overlay, the hosts themselves and the verified inputs on those th
     private_dir()        the overlay's folder, or None
     overlay_identity()   which overlay this process reads (its commit or tree), or None
     overlay_job(job, o)  a fleet job that reads the overlay `o` (overlay_env()) on its host
+    floor(host)          a host's A-A' noise floor: the job's NRESE_BENCH_FLOORS, else the folder's
     fleet(name)          a list of host keys the overlay's [fleet] table gives OWL-RS's scripts
 
     python benches/suite/suitekit/hosts.py fleet NAME   that list, space-separated (shell scripts)
@@ -38,6 +39,9 @@ PRIVATE = "NRESE_BENCH_PRIVATE"
 # for a run's identity. The fleet stages one git input, the job's checkout, so the overlay
 # travels in the job's environment. Set together with NRESE_BENCH_PRIVATE, it is an error.
 HOSTS_TEXT, OVERLAY_REV = "NRESE_BENCH_HOSTS", "NRESE_BENCH_OVERLAY_REV"
+# The overlay's A-A' noise floors (noise-floor/HOST.toml) in a fleet job, from the same commit:
+# one TOML text, a table per host (floors_text()). Set together with NRESE_BENCH_PRIVATE, an error.
+FLOORS_TEXT = "NRESE_BENCH_FLOORS"
 
 
 def git(where: Path, *args: str) -> str | None:
@@ -77,16 +81,16 @@ def overlay_env(environ: dict | None = None) -> dict[str, str]:
     and that commit: of the checkout NRESE_BENCH_PRIVATE's folder is in, else of the private bench
     inputs repository (benches/hosts.toml [sources] bench-inputs: its variable). So a change to
     the overlay reaches a job once committed. Stops the writer where there is none, or its HEAD has
-    no hosts.toml there: the job would run without its hosts."""
+    no hosts.toml there: the job would run without its hosts. The hosts' A-A' noise floors of that
+    commit come along (floors_text()), where it has any."""
     environ = os.environ if environ is None else environ
     source = load(environ=environ).get("sources", {}).get("bench-inputs", {})
     named = environ.get(source.get("env") or "BENCH_INPUTS_GIT") or source.get("git")
     folder = private_dir(environ)
-    repo, at = (folder, "HEAD:./hosts.toml") if folder else (
-        Path(os.path.expanduser(named)) if named else None, "HEAD:overlay/hosts.toml")
+    repo, at = (folder, "./") if folder else (Path(os.path.expanduser(named)) if named else None, "overlay/")
     found = repo is not None and repo.is_dir()
     rev = git(repo, "rev-parse", "--verify", "HEAD^{commit}") if found else None
-    text = git(repo, "show", at) if rev else None
+    text = git(repo, "show", f"{rev}:{at}hosts.toml") if rev else None
     if not text:
         raise SystemExit(f"the private bench overlay isn't here ({repo or 'no repository named'}, or its HEAD has "
                          f"no overlay/hosts.toml): a fleet job would run without its hosts. Set {PRIVATE} to the "
@@ -95,7 +99,50 @@ def overlay_env(environ: dict | None = None) -> dict[str, str]:
     kept = "\n".join(line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")) + "\n"
     if tomllib.loads(kept) != tomllib.loads(text):
         raise SystemExit(f"the overlay's hosts.toml at {rev[:12]} reads otherwise without its comment lines")
-    return {HOSTS_TEXT: kept, OVERLAY_REV: rev}
+    floors = floors_text(repo, f"{rev}:{at}noise-floor")
+    return {HOSTS_TEXT: kept, OVERLAY_REV: rev, **({FLOORS_TEXT: floors} if floors else {})}
+
+
+def floors_text(repo: Path, at: str) -> str:
+    """The floors' files in git tree `at` (noise-floor/, one HOST.toml each) as one TOML text, a
+    table per host, their comment lines left out; "" where there are none. Checked to read as the
+    files do."""
+    lines, want = [], {}
+    # --full-tree: from a subfolder (an overlay folder's checkout), ls-tree lists only its paths.
+    for name in sorted((git(repo, "ls-tree", "--full-tree", "--name-only", at) or "").splitlines()):
+        if not name.endswith(".toml"):
+            continue
+        host, text = name[:-len(".toml")], git(repo, "show", f"{at}/{name}") or ""
+        want[host], key = tomllib.loads(text), '"' + host + '"'
+        lines.append(f"[{key}]")
+        for line in text.splitlines():
+            bare = line.strip()
+            if not bare or bare.startswith("#"):
+                continue
+            if bare.startswith("["):  # a table of the file: the host's
+                brackets = "[[" if bare.startswith("[[") else "["
+                line = f"{brackets}{key}.{bare[len(brackets):]}"
+            lines.append(line)
+    out = "\n".join(lines) + "\n" if lines else ""
+    if tomllib.loads(out) != want:
+        raise SystemExit(f"the overlay's noise floors at {at} read otherwise as one text")
+    return out
+
+
+def floor(host: str, environ: dict | None = None) -> tuple[str, dict] | None:
+    """Host `host`'s A-A' noise floor (release_gate.py floor) as its file reads, with the file's
+    name; None where none was measured. In a fleet job, from NRESE_BENCH_FLOORS (overlay_env());
+    else the overlay folder's noise-floor/; else benches/fast/noise-floor/."""
+    environ = os.environ if environ is None else environ
+    text, folder = environ.get(FLOORS_TEXT), private_dir(environ)
+    if text and folder:
+        raise ValueError(f"both {PRIVATE} and {FLOORS_TEXT} are set: one overlay at a time")
+    name = f"{host}.toml"
+    if text:
+        found = tomllib.loads(text).get(host)
+        return (name, found) if found is not None else None
+    path = (folder or ROOT / "benches" / "fast") / "noise-floor" / name
+    return (name, tomllib.loads(path.read_text(encoding="utf-8"))) if path.is_file() else None
 
 
 def overlay_job(job: dict, overlay: dict[str, str]) -> dict:
