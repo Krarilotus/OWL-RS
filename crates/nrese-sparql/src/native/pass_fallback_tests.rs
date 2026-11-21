@@ -146,7 +146,11 @@ fn a_pass_that_does_not_fit_leaves_the_answer_to_the_per_column_route() {
             Err(error) => wrong.push(format!("{shape} at {limit}: {error}")),
         }
     }
-    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+    assert!(
+        wrong.is_empty(),
+        "expected GROUP BY answers:\n{}",
+        wrong.join("\n")
+    );
 }
 
 /// Which route aggregates the groups: the general one, from one pass where it applies and
@@ -448,8 +452,8 @@ fn refuse_direct(ctx: &Context<'_>) -> NativeError {
     QueryEvaluationError::MemoryLimit(refused).into()
 }
 
-const FIRST_CACHED: u64 = 17;
-const ADDED_CACHED: u64 = 18;
+const FIRST_CACHED: u64 = u64::MAX - 17;
+const ADDED_CACHED: u64 = u64::MAX - 18;
 
 fn seed_cache(ctx: &Context<'_>) {
     let term = Some(Literal::from("x".repeat(8_192)).into());
@@ -490,6 +494,13 @@ pub(super) fn direct_output(
     let Some(refusal) = REFUSE_DIRECT.take() else {
         return Ok(solutions);
     };
+    if matches!(refusal, RefuseDirect::AfterGrouping) {
+        let held = counters(ctx);
+        assert!(
+            held[1] > 0 && held[2] > 0,
+            "the direct plan kept terms and numbers"
+        );
+    }
     if matches!(refusal, RefuseDirect::CacheGrowth) {
         plan_count(ctx);
         ctx.decoded.borrow_mut().keep(ADDED_CACHED, &None);
@@ -519,19 +530,21 @@ fn streamed_retry(refusal: RefuseDirect, message: &str) {
         let ctx = Context::new(&snapshot, &options, None, None);
         let mut live = Reservation::new(&*ctx.budget);
         live.charge(65_536).unwrap();
-        seed_cache(&ctx);
-        let result = if retry {
+        let baseline = ctx.budget.used();
+        if matches!(refusal, RefuseDirect::CacheEviction) {
+            seed_cache(&ctx);
+        }
+        let (result, reached_refusal) = if retry {
             REFUSE_DIRECT.set(Some(refusal));
             let result = ctx.group(inner, keys, aggregates, None);
-            REFUSE_DIRECT.set(None);
-            result
+            (result, REFUSE_DIRECT.take().is_none())
         } else {
             match refusal {
                 RefuseDirect::AfterGrouping => {}
                 RefuseDirect::CacheGrowth => plan_count(&ctx),
                 RefuseDirect::CacheEviction => evict_cache(&ctx),
             }
-            ctx.group_streamed(&plan, keys, aggregates)
+            (ctx.group_streamed(&plan, keys, aggregates), true)
         };
         let solutions = result.ok().expect("the adaptive route answers");
         let mut rows: Vec<_> = (0..solutions.table.len())
@@ -552,18 +565,20 @@ fn streamed_retry(refusal: RefuseDirect, message: &str) {
             .collect();
         rows.sort_by_key(|(key, _)| *key);
         ctx.consumed(solutions);
-        let state = (counters(&ctx), ctx.distinct_counts.borrow().charged());
-        // Releasing a live cache must leave the other holders' charge untouched.
-        let before = ctx.budget.used();
-        let decoded = ctx.decoded.borrow().bytes_for_test();
+        let [kept, terms, numbers, used, decoded] = counters(&ctx);
+        let planned = ctx.distinct_counts.borrow().charged();
+        // Sample both live caches, then let the decoder independently give back its room.
         *ctx.decoded.borrow_mut() =
             decode_cache::DecodeCache::new(&ctx.budget, DECODE_CACHE_ENTRIES, 1);
-        let remaining = (before, decoded, ctx.budget.used());
-        assert!(
-            remaining.2 >= live.bytes(),
-            "the live reservation remains charged"
-        );
-        (rows, state, remaining)
+        let remaining = ctx.budget.used();
+        let attributed = baseline + kept + planned;
+        (
+            rows,
+            [kept, terms, numbers],
+            [used, remaining],
+            [attributed + decoded, attributed],
+            reached_refusal,
+        )
     };
     let expected: Vec<_> = (0..1_024).map(|g| (g, g as f64 + 3_584.0)).collect();
     let alone = run(false);
@@ -573,7 +588,10 @@ fn streamed_retry(refusal: RefuseDirect, message: &str) {
         retried.0, expected,
         "retried adaptive streaming answers AVG"
     );
-    assert_eq!((retried.1, retried.2), (alone.1, alone.2), "{message}");
+    assert!(retried.4, "the same direct plan reached the refused charge");
+    assert_eq!(alone.2, alone.3, "adaptive streaming's live charges");
+    assert_eq!(retried.2, retried.3, "{message}");
+    assert_eq!(retried.1, alone.1, "{message}");
 }
 
 #[test]
@@ -672,11 +690,18 @@ fn a_restored_save_point_leaves_the_context_as_it_was() {
         "the attempt made terms and numbers: {before:?}, then {within:?}"
     );
     ctx.restore(point);
+    let after = counters(&ctx);
     assert_eq!(
-        counters(&ctx),
-        before,
-        "[kept bytes, computed terms, remembered numbers, budget used, decode bytes]"
+        after[..3],
+        before[..3],
+        "[kept bytes, computed terms, remembered numbers]"
     );
+    assert_eq!(
+        after[3] - after[4],
+        before[3] - before[4],
+        "live non-cache charges"
+    );
+    assert!(after[4] <= before[4], "no speculative decode bytes survive");
     assert_eq!(ctx.term(older_id), Some(older.clone()));
     assert_eq!(ctx.id(&older).ok(), Some(older_id));
     // What stays allocated is what the charge of the terms kept covers: two slots of the
