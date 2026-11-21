@@ -2607,6 +2607,8 @@ impl GroundProgram {
         poll: &Poller<'_>,
     ) -> Result<bool, Stopped> {
         'instances: for (rule, grounded) in &self.consistency {
+            #[cfg(test)]
+            crate::witness::add(crate::witness::Site::OldWitnessInstance, 1);
             if poll.tick() {
                 return Err(Stopped);
             }

@@ -16,6 +16,83 @@ use crate::vocabulary::LocalVocabulary;
 
 const POLL_UNITS: usize = nrese_exec::POLL_UNITS as usize;
 
+/// A delete that changes a long-list guard preserves its old witnesses. The
+/// old-state lookup visits at most one copy of the unrelated short-list
+/// instances plus bounded work per reported witness.
+#[test]
+fn delete_witness_probes_do_not_rescan_unrelated_instances() {
+    use crate::ir::{OWL, RDF, Vocabulary};
+    use crate::lists::{ListVocabulary, PAIRWISE_MEMBERS};
+    use crate::witness::{self, Site};
+
+    const SHORT_LISTS: usize = 3;
+    const SHORT_MEMBERS: usize = 24;
+    const WITNESSES: u64 = 16;
+
+    let mut vocab = LocalVocabulary::default();
+    let schema = Schema::owl(&mut vocab);
+    let lists = ListVocabulary::new(&mut vocab);
+    let first = vocab.iri(&format!("{RDF}first"));
+    let rest = vocab.iri(&format!("{RDF}rest"));
+    let nil = vocab.iri(&format!("{RDF}nil"));
+    let disjoint = vocab.iri(&format!("{OWL}AllDisjointClasses"));
+    let members = vocab.iri(&format!("{OWL}members"));
+    let ty = schema.rdf_type();
+    let mut after = Vec::new();
+    for group in 0..=SHORT_LISTS {
+        let long = group == SHORT_LISTS;
+        let len = if long {
+            PAIRWISE_MEMBERS + 1
+        } else {
+            SHORT_MEMBERS
+        };
+        let list = vocab.iri(&format!("http://example.com/list/{group}"));
+        let nodes: Vec<_> = (0..len)
+            .map(|i| vocab.iri(&format!("http://example.com/cell/{group}/{i}")))
+            .collect();
+        after.extend([[list, ty, disjoint], [list, members, nodes[0]]]);
+        for (i, &node) in nodes.iter().enumerate() {
+            let class = vocab.iri(&format!("http://example.com/class/{group}/{i}"));
+            after.push([node, first, class]);
+            after.push([node, rest, nodes.get(i + 1).copied().unwrap_or(nil)]);
+            if long && i < 2 {
+                for person in 0..WITNESSES {
+                    let subject = vocab.iri(&format!("http://example.com/subject/{person}"));
+                    after.push([subject, ty, class]);
+                }
+            }
+        }
+    }
+    let head = vocab.iri(&format!("http://example.com/cell/{SHORT_LISTS}/0"));
+    let alternate = vocab.iri("http://example.com/alternate");
+    let delete = [head, first, alternate];
+    let mut before = after.clone();
+    before.push(delete);
+    let before = batch::materialise(&before, &[], Some(&lists), &schema);
+    let oracle = batch::materialise(&after, &[], Some(&lists), &schema);
+    assert_eq!(before.violations, oracle.violations);
+    assert_eq!(oracle.violations.at_least(), WITNESSES as usize);
+    assert_eq!(oracle.derived, before.derived);
+
+    let rules = Rules {
+        rules: &[],
+        lists: Some(&lists),
+        schema: &schema,
+        equality: None,
+    };
+    let base = MemoryBase::new(&after, &before.derived);
+    let start = witness::get(Site::OldWitnessInstance);
+    let update = crate::delta::update(&base, &[], &[delete], rules, None);
+    let probes = witness::get(Site::OldWitnessInstance) - start;
+    assert!(update.violations.consistent(), "{:?}", update.violations);
+    assert!(update.insert.is_empty() && update.remove.is_empty());
+    let bound = (SHORT_LISTS * SHORT_MEMBERS * (SHORT_MEMBERS - 1) / 2) as u64 + 1 + 2 * WITNESSES;
+    assert!(
+        (WITNESSES..=bound).contains(&probes),
+        "old witness instance probes {probes} exceeded one pass plus two per witness ({bound})"
+    );
+}
+
 /// Facts in a store, counting what each kind of read is asked for; the first scan opened
 /// sets `cancel` (the operation's stop reads it).
 struct Asked {

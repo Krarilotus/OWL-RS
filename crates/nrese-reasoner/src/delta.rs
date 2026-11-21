@@ -1977,8 +1977,8 @@ mod budget_tests {
         }
     }
 
-    /// Independent overdelete candidates in a cyclic graph share one proof allowance.
-    /// The maintained closure equals a full rematerialisation even after exhaustion.
+    /// The shared cap bounds total proof expansions in a pass, irrespective of pool width.
+    /// The closure guard separately checks equality with rematerialisation at every budget.
     #[test]
     fn shared_proof_budget_caps_total_expansions_and_matches_rematerialisation() {
         let mut vocab = LocalVocabulary::default();
